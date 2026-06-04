@@ -161,6 +161,51 @@ def test_spawn_module_argument():
     assert "-m eud_agent" in text, "spawn must pass `-m eud_agent`"
 
 
+def test_spawn_passes_data_dir_argument():
+    """The spawn Arguments pass ``--data-dir "<agent dir>"`` (EUD-036-9163).
+
+    The server keys server.ready / heartbeat.txt / inbox/outbox off
+    ``cfg.data_dir``; without a CLI signal it resolves empty and server.ready
+    lands relative to the server cwd, so the bridge never validates readiness.
+    ``__main__.py`` accepts ``--data-dir`` (top precedence via Config.resolve),
+    so the spawn Arguments must carry it.
+
+    Match the ``psi.Arguments`` assignment specifically (not a stray substring),
+    tolerant of Lua string concatenation: ``-m eud_agent --data-dir`` followed by
+    an opening quote and a ``..``-concatenated path expression. The trailing
+    backslash on ``agentDir`` must be stripped before quoting so ``"...\\"`` does
+    not escape the closing quote on the CreateProcess command line.
+    """
+    text = _read_text()
+    arg_assign = re.search(r"\.Arguments\s*=\s*([^\n]*)", text)
+    assert arg_assign, "no `psi.Arguments =` assignment found in the spawn block"
+    rhs = arg_assign.group(1)
+    assert "--data-dir" in rhs, (
+        "spawn Arguments must include `--data-dir` so the server keys "
+        "server.ready/heartbeat/inbox off the editor Data\\agent dir; got: "
+        f"{rhs!r}"
+    )
+    # The command-line literal opens `-m eud_agent --data-dir "` then the Lua
+    # string literal closes (`'` or `"`) and the path is `..`-concatenated in.
+    # Tolerant of the literal quote style: `... --data-dir "' .. <path> .. '"'`
+    # (single-quoted Lua literal) or the double-quoted equivalent. Requires a
+    # concatenation (`..`) so a bare empty `--data-dir ""` cannot satisfy it.
+    assert re.search(
+        r"""-m eud_agent --data-dir "['"]\s*\.\.\s*.+\.\.""", rhs
+    ), (
+        "spawn Arguments must be `-m eud_agent --data-dir \"` concatenated (`..`) "
+        f"with the quoted (trailing-backslash-stripped) agent dir path; got: {rhs!r}"
+    )
+    # The trailing backslash on agentDir must be stripped before quoting (so the
+    # closing quote is not escaped on the CreateProcess command line): the RHS
+    # must NOT concatenate the raw `agentDir` straight into the quotes.
+    assert "agentDir" not in rhs or re.search(r"string\.sub\s*\(\s*agentDir", rhs), (
+        "the trailing backslash on agentDir must be stripped (e.g. "
+        "string.sub(agentDir, 1, -2)) before quoting, else `...\\\"` escapes the "
+        f"closing quote on the CreateProcess command line; got: {rhs!r}"
+    )
+
+
 def test_spawn_process_stored_in_global():
     """The spawned Process object is retained in a GLOBAL (GC guard + pid source).
 

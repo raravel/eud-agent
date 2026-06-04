@@ -161,7 +161,9 @@ local ok, initErr = pcall(function()
             if File.Exists(readyPath) then File.Delete(readyPath) end
             local psi = ProcessStartInfo()
             psi.FileName = cfgPythonExe
-            psi.Arguments = "-m eud_agent"
+            -- agentDir provably ends with "\"; strip it so the closing quote is
+            -- not escaped ("...\" would escape it on the CreateProcess cmd line).
+            psi.Arguments = '-m eud_agent --data-dir "' .. string.sub(agentDir, 1, -2) .. '"'
             psi.UseShellExecute = false
             psi.CreateNoWindow = true
             psi.WorkingDirectory = cfgRepoRoot .. "\\server"
