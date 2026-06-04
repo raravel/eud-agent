@@ -205,7 +205,7 @@
       ]
     },
     "EUD-014-1b4e": {
-      "status": "pending",
+      "status": "in_progress",
       "priority": "high",
       "type": "task",
       "parent": "EUD-003-6e4e",
@@ -217,7 +217,8 @@
       "completed_at": null,
       "path": "active/EUD-014-1b4e.md",
       "scope": [
-        "bridge/ZZZ_10_agent_bridge.lua"
+        "bridge/ZZZ_10_agent_bridge.lua",
+        "server/tests/test_bridge_webview_static.py"
       ]
     },
     "EUD-015-c726": {
@@ -238,7 +239,7 @@
       ]
     },
     "EUD-016-af75": {
-      "status": "pending",
+      "status": "done",
       "priority": "high",
       "type": "task",
       "parent": "EUD-004-16b7",
@@ -247,11 +248,11 @@
       ],
       "title": "Server: codex_client module",
       "updated": "2026-06-04",
-      "completed_at": null,
-      "path": "active/EUD-016-af75.md",
+      "completed_at": "2026-06-04T19:31:17.899297",
+      "path": "done/EUD-016-af75.md",
       "scope": [
         "server/eud_agent/codex_client.py",
-        "server/tests/**"
+        "server/tests/test_codex_client.py"
       ]
     },
     "EUD-017-e827": {
