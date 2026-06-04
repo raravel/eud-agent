@@ -65,6 +65,10 @@ def _selfcheck(cfg: Config) -> int:
         print(f"  port={cfg.port} repo_root={cfg.repo_root}")
         print(f"  codex_cmd={cfg.codex_cmd}")
         print(f"  rag_db={cfg.rag_db}")
+        # Non-fatal config diagnostics (auto-discovered broken cfg, bad port)
+        # are surfaced even on the OK path so the operator sees them (advisory 1).
+        for msg in cfg.warnings:
+            print(f"  ! warning: {msg}")
         return 0
     print("selfcheck: FAILED", file=sys.stderr)
     for msg in messages:

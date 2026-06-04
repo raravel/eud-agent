@@ -38,6 +38,15 @@ def _write_agent_cfg(tmp_path: Path, data: dict) -> Path:
     return cfg_path
 
 
+def _write_raw_agent_cfg(tmp_path: Path, raw: bytes) -> Path:
+    """Write raw (possibly malformed/BOM'd) agent.cfg bytes; return its path."""
+    agent_dir = tmp_path / "agent"
+    agent_dir.mkdir(parents=True, exist_ok=True)
+    cfg_path = agent_dir / "agent.cfg"
+    cfg_path.write_bytes(raw)
+    return cfg_path
+
+
 # --------------------------------------------------------------- precedence
 
 
@@ -225,6 +234,188 @@ def test_selfcheck_reports_all_failures_together(tmp_path):
     assert rc != 0
     joined = "\n".join(messages)
     assert CODEX_MARK in joined and RAG_MARK in joined
+
+
+# ----------------------------------------------- config robustness (EUD-030-75a4)
+#
+# Design (warnings mechanism):
+#   * ``Config`` carries a ``warnings: list[str]`` of NON-fatal diagnostics
+#     gathered during resolve (an auto-discovered cfg that won't parse, an
+#     invalid port). Resolution always proceeds on defaults so the server boots.
+#   * ``Config`` carries a ``cfg_error: str | None`` set ONLY when a cfg that was
+#     EXPLICITLY pointed at (a direct path, or env EUD_DATA_DIR / CLI data_dir)
+#     exists but fails to parse. This is the distinct, FATAL diagnostic.
+#   * ``run_selfcheck`` appends ``cfg.warnings`` to its messages WITHOUT forcing a
+#     non-zero exit, but appends ``cfg.cfg_error`` AND forces non-zero exit (so an
+#     operator who pointed at a broken cfg learns why it was ignored).
+#
+# Auto-discovery seam: ``resolve`` takes ``default_data_dir`` (the sibling/default
+# fallback). A broken cfg found there (no explicit env/CLI signal) is a WARNING.
+
+CFG_UNPARSEABLE_MARK = "agent.cfg present but unparseable"
+PORT_MARK = "port"
+
+# Variants that EXIST as files but must not parse into a usable dict.
+_BOM_CFG = '{"port": 9001}'.encode("utf-8-sig")  # leading UTF-8 BOM (EF BB BF)
+_MALFORMED_CFG = b'{"port": 9001'  # truncated JSON
+_NON_DICT_CFG = b'[1, 2, 3]'  # valid JSON, but not an object
+
+
+def _all_env_clean(monkeypatch):
+    for var in (
+        "EUD_DATA_DIR", "EUD_PORT", "CODEX_CMD",
+        "EUD_RAG_DB", "EUD_REPO_ROOT", "HF_HUB_CACHE", "HF_HOME", "HF_HOME_HUB",
+    ):
+        monkeypatch.delenv(var, raising=False)
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [_BOM_CFG, _MALFORMED_CFG, _NON_DICT_CFG],
+    ids=["bom", "malformed", "non-dict"],
+)
+def test_explicit_unparseable_cfg_falls_back_but_flags_error(
+    monkeypatch, tmp_path, raw
+):
+    """An EXPLICIT cfg that exists but won't parse: resolve on defaults, set
+    cfg_error (distinct), and selfcheck exits non-zero with its own message."""
+    _all_env_clean(monkeypatch)
+    cfg_path = _write_raw_agent_cfg(tmp_path, raw)
+    cfg = Config.resolve(cli={}, agent_cfg_path=cfg_path)
+
+    # Resolution proceeds on defaults (server must boot).
+    assert cfg.port == DEFAULT_PORT
+    # Distinct diagnostic recorded, pointing at the path.
+    assert cfg.cfg_error is not None
+    assert CFG_UNPARSEABLE_MARK in cfg.cfg_error
+    assert str(cfg_path) in cfg.cfg_error
+
+    rc, messages = cfgmod.run_selfcheck(cfg)
+    joined = "\n".join(messages)
+    assert rc != 0, "explicit unparseable cfg must force a non-zero selfcheck"
+    assert CFG_UNPARSEABLE_MARK in joined
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [_BOM_CFG, _MALFORMED_CFG, _NON_DICT_CFG],
+    ids=["bom", "malformed", "non-dict"],
+)
+def test_unparseable_cfg_via_env_data_dir_flags_error(monkeypatch, tmp_path, raw):
+    """Env EUD_DATA_DIR pointing at a dir with a broken cfg counts as EXPLICIT:
+    cfg_error set, selfcheck non-zero."""
+    _all_env_clean(monkeypatch)
+    cfg_path = _write_raw_agent_cfg(tmp_path, raw)
+    monkeypatch.setenv("EUD_DATA_DIR", str(cfg_path.parent))
+    cfg = Config.resolve(cli={})  # auto-locate via EUD_DATA_DIR
+
+    assert cfg.port == DEFAULT_PORT
+    assert cfg.cfg_error is not None
+    assert CFG_UNPARSEABLE_MARK in cfg.cfg_error
+
+    rc, messages = cfgmod.run_selfcheck(cfg)
+    assert rc != 0
+    assert CFG_UNPARSEABLE_MARK in "\n".join(messages)
+
+
+def test_auto_discovered_broken_cfg_warns_but_selfcheck_ok(monkeypatch, tmp_path):
+    """A broken cfg found by AUTO-discovery (no explicit env/CLI signal) is a
+    WARNING: resolution proceeds, and selfcheck (otherwise good) still exits 0
+    but surfaces the warning line."""
+    _all_env_clean(monkeypatch)
+    # Broken cfg sits under the auto/sibling default data dir, not pointed at.
+    _write_raw_agent_cfg(tmp_path, _MALFORMED_CFG)
+    good = _good_config(tmp_path / "good")  # satisfiable prerequisites
+    cfg = Config.resolve(
+        cli={},
+        agent_cfg_path="__auto__",
+        default_data_dir=str(tmp_path / "agent"),
+    )
+
+    # Auto-discovered breakage is a warning, NOT a fatal cfg_error.
+    assert cfg.cfg_error is None
+    assert any(CFG_UNPARSEABLE_MARK in w for w in cfg.warnings)
+    assert cfg.port == DEFAULT_PORT
+
+    # Borrow the satisfiable prereq paths so only the warning would matter.
+    cfg.codex_cmd = good.codex_cmd
+    cfg.rag_db = good.rag_db
+    cfg.repo_root = good.repo_root
+    cfg.hf_cache_dir = good.hf_cache_dir
+
+    rc, messages = cfgmod.run_selfcheck(cfg)
+    joined = "\n".join(messages)
+    assert rc == 0, f"auto-discovered warning must not fail selfcheck: {messages}"
+    assert CFG_UNPARSEABLE_MARK in joined, "the warning must still be surfaced"
+
+
+def test_bad_port_via_env_falls_back_with_diagnostic(monkeypatch, tmp_path):
+    """A non-numeric EUD_PORT must NOT raise: default port + a warning."""
+    _all_env_clean(monkeypatch)
+    monkeypatch.setenv("EUD_PORT", "not-a-number")
+    cfg = Config.resolve(cli={}, agent_cfg_path=None)  # must not raise ValueError
+    assert cfg.port == DEFAULT_PORT
+    assert any(PORT_MARK in w for w in cfg.warnings)
+    assert any("not-a-number" in w for w in cfg.warnings)
+
+    rc, messages = cfgmod.run_selfcheck(cfg)
+    assert PORT_MARK in "\n".join(messages)
+
+
+def test_bad_port_via_cfg_falls_back_with_diagnostic(monkeypatch, tmp_path):
+    """A non-numeric port from agent.cfg must NOT raise: default port + warning."""
+    _all_env_clean(monkeypatch)
+    cfg_path = _write_agent_cfg(tmp_path, {"port": "not-a-number"})
+    cfg = Config.resolve(cli={}, agent_cfg_path=cfg_path)  # must not raise
+    assert cfg.port == DEFAULT_PORT
+    assert any(PORT_MARK in w for w in cfg.warnings)
+
+    rc, messages = cfgmod.run_selfcheck(cfg)
+    assert PORT_MARK in "\n".join(messages)
+
+
+# ----------------------------------------------------- HF cache resolution
+
+
+def test_hf_hub_cache_env_is_full_hub_path(monkeypatch, tmp_path):
+    """HF_HUB_CACHE (highest precedence) is used verbatim as the hub path."""
+    _all_env_clean(monkeypatch)
+    hub = tmp_path / "explicit-hub"
+    monkeypatch.setenv("HF_HUB_CACHE", str(hub))
+    cfg = Config.resolve(cli={}, agent_cfg_path=None)
+    assert Path(cfg.hf_cache_dir) == hub
+
+
+def test_hf_home_env_uses_hub_subdir(monkeypatch, tmp_path):
+    """HF_HOME (no HF_HUB_CACHE) -> <HF_HOME>/hub."""
+    _all_env_clean(monkeypatch)
+    home = tmp_path / "hfhome"
+    monkeypatch.setenv("HF_HOME", str(home))
+    cfg = Config.resolve(cli={}, agent_cfg_path=None)
+    assert Path(cfg.hf_cache_dir) == home / "hub"
+
+
+def test_hf_hub_cache_takes_precedence_over_hf_home(monkeypatch, tmp_path):
+    _all_env_clean(monkeypatch)
+    monkeypatch.setenv("HF_HUB_CACHE", str(tmp_path / "hub"))
+    monkeypatch.setenv("HF_HOME", str(tmp_path / "home"))
+    cfg = Config.resolve(cli={}, agent_cfg_path=None)
+    assert Path(cfg.hf_cache_dir) == tmp_path / "hub"
+
+
+def test_hf_defaults_when_no_env(monkeypatch, tmp_path):
+    _all_env_clean(monkeypatch)
+    cfg = Config.resolve(cli={}, agent_cfg_path=None)
+    assert Path(cfg.hf_cache_dir) == Path(cfgmod.DEFAULT_HF_CACHE)
+
+
+def test_hf_home_hub_legacy_env_is_ignored(monkeypatch, tmp_path):
+    """The invented HF_HOME_HUB is no longer honored: it must not win."""
+    _all_env_clean(monkeypatch)
+    monkeypatch.setenv("HF_HOME_HUB", str(tmp_path / "legacy"))
+    cfg = Config.resolve(cli={}, agent_cfg_path=None)
+    assert Path(cfg.hf_cache_dir) != tmp_path / "legacy"
+    assert Path(cfg.hf_cache_dir) == Path(cfgmod.DEFAULT_HF_CACHE)
 
 
 # ------------------------------------------------------------- entrypoint (subproc)
