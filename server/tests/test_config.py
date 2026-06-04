@@ -138,15 +138,21 @@ CODEX_MARK = "codex"
 RAG_MARK = "RAG DB"
 HF_MARK = "bge-m3"
 PANEL_MARK = "panel"
+# The dist-based panel failure must point the operator at the build command.
+PANEL_BUILD_HINT = "npm --prefix panel run build"
 
 
 def _good_config(tmp_path: Path) -> Config:
     """A Config whose paths all point at satisfiable prerequisites we fake."""
     repo = tmp_path / "repo"
-    panel = repo / "panel"
-    panel.mkdir(parents=True)
-    for name in ("index.html", "app.js", "style.css"):
-        (panel / name).write_text("// ok", encoding="utf-8")
+    # Panel prerequisite is now the BUILT React output (EUD-035): the selfcheck
+    # requires panel/dist/index.html and the panel/dist/assets directory.
+    dist = repo / "panel" / "dist"
+    dist.mkdir(parents=True)
+    (dist / "index.html").write_text("<!doctype html>", encoding="utf-8")
+    assets = dist / "assets"
+    assets.mkdir()
+    (assets / "index.js").write_text("// ok", encoding="utf-8")
 
     rag = tmp_path / "ragdb"
     rag.mkdir()
@@ -201,12 +207,14 @@ def test_selfcheck_unresolvable_codex_distinct_message(tmp_path):
 
 def test_selfcheck_missing_panel_distinct_message(tmp_path):
     cfg = _good_config(tmp_path)
-    # remove one required panel file
-    (Path(cfg.repo_root) / "panel" / "app.js").unlink()
+    # remove the built panel entrypoint (dist not built)
+    (Path(cfg.repo_root) / "panel" / "dist" / "index.html").unlink()
     rc, messages = cfgmod.run_selfcheck(cfg)
     assert rc != 0
     joined = "\n".join(messages)
     assert PANEL_MARK in joined
+    # the failure must carry the build hint so the operator knows the fix
+    assert PANEL_BUILD_HINT in joined
     assert RAG_MARK not in joined
     assert CODEX_MARK not in joined
     assert HF_MARK not in joined

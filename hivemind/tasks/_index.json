@@ -297,7 +297,7 @@
       ]
     },
     "EUD-019-58af": {
-      "status": "pending",
+      "status": "in_progress",
       "priority": "low",
       "type": "task",
       "parent": "EUD-004-16b7",
@@ -310,7 +310,8 @@
       "path": "active/EUD-019-58af.md",
       "scope": [
         "server/eud_agent/lsp_gate.py",
-        "server/tests/**"
+        "server/tests/test_lsp_gate.py",
+        "server/tests/test_orchestrator.py"
       ]
     },
     "EUD-020-4840": {
@@ -415,15 +416,15 @@
       "scope": []
     },
     "EUD-026-4c16": {
-      "status": "pending",
+      "status": "done",
       "priority": "high",
       "type": "story",
       "parent": "EUD-025-865b",
       "depends_on": [],
       "title": "React panel foundation",
       "updated": "2026-06-04",
-      "completed_at": null,
-      "path": "active/EUD-026-4c16.md",
+      "completed_at": "2026-06-04T22:36:45.731353",
+      "path": "done/EUD-026-4c16.md",
       "scope": []
     },
     "EUD-027-ad4f": {
@@ -559,7 +560,7 @@
       ]
     },
     "EUD-035-2262": {
-      "status": "pending",
+      "status": "done",
       "priority": "high",
       "type": "task",
       "parent": "EUD-026-4c16",
@@ -569,8 +570,8 @@
       ],
       "title": "Panel switchover: delete vanilla files, dist-serving selfcheck, revised contract test",
       "updated": "2026-06-04",
-      "completed_at": null,
-      "path": "active/EUD-035-2262.md",
+      "completed_at": "2026-06-04T22:36:45.680815",
+      "path": "done/EUD-035-2262.md",
       "scope": [
         "panel/index.html",
         "panel/app.js",

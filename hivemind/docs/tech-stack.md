@@ -21,17 +21,18 @@ Pinned in `server/pyproject.toml` (uv-managed venv at `server/.venv`, Python 3.1
 - typescript 5.9.3 — TS sources (`panel/src`)
 - vite 7.3.5 + @vitejs/plugin-react 5.2.0 — build tool; output `panel/dist/` (gitignored)
 - tailwindcss / @tailwindcss/vite 4.3.0 — styling, CSS-variables mode (shadcn requirement)
-- shadcn/ui — vendored component SOURCE in `panel/components/ui/` (19 components; registry copy, not a runtime dep; `components.json` aliases point future `npx shadcn add` at the same dirs)
-- Vercel AI Elements — vendored component SOURCE in `panel/components/ai-elements/` (conversation, message, prompt-input, code-block)
+- shadcn/ui — vendored component SOURCE in `panel/components/ui/` (registry copy, not a runtime dep; `components.json` aliases point future `npx shadcn add` at the same dirs)
+- (retired) Vercel AI Elements — vendored in EUD-031, REPLACED by custom lightweight components during EUD-034 pruning (streamdown/shiki inflated the eager entry); the vendored source was deleted in EUD-035 (`panel/components/ai-elements/` guarded ABSENT by the contract test)
 - monaco-editor 0.55.1 + @monaco-editor/react 4.7.0 (+ @monaco-editor/loader 1.7.0) — edit tab; bound to the npm bundle via `loader.config({ monaco })` in `panel/src/editor/monaco.ts` with 5 `?worker` Vite imports (CDN injection path verified unreachable — EUD-031 review)
-- AI-Elements-pulled runtime deps: ai 6.0.196, streamdown 2.5.0, shiki 4.2.0, use-stick-to-bottom 1.1.4, radix-ui 1.4.3, lucide-react 1.17.0, class-variance-authority 0.7.1, clsx 2.1.1, tailwind-merge 3.6.0, nanoid 5.1.11 (+ registry extras currently unused/tree-shaken: @xyflow/react, @rive-app/react-webgl2, embla-carousel-react, media-chrome, motion, cmdk — PRUNE CANDIDATES in EUD-034; @streamdown/mermaid|math|cjk inflate the eager entry to 5.58 MB and must shrink before shipping)
+- Final runtime deps (post EUD-034/035 pruning, package-lock-grounded): @monaco-editor/react ^4.7.0, class-variance-authority ^0.7.1, clsx ^2.1.1, lucide-react ^1.17.0, monaco-editor ^0.55.1, radix-ui ^1.4.3, react/react-dom ^19.2.0, tailwind-merge ^3.6.0 (9 deps; 17 registry/streamdown deps removed in EUD-034, ai + use-stick-to-bottom removed in EUD-035)
+- Test devDeps: vitest ^3.2.6, happy-dom ^16.8.1, @testing-library/react|dom|user-event|jest-dom (panel unit/component suites, 120 tests)
 - npm — package manager (node v24.11.1 system install)
 
 > Decision: see [[decisions/03_react-panel-rebuild]] and [[decisions/05_monaco-editor-adoption]].
 
 ## Build Artifacts
 
-- `panel/dist/` — Vite build output; NEVER committed (gitignored). Dev machines build locally (`npm --prefix panel run build`); distribution is packaged into GitHub Releases by the later release phase. See [[decisions/04_dist-release-distribution]]. Current scaffold dist: 28 MB / 444 chunks, entry 5.58 MB (1.49 MB gzip) — to be reduced in EUD-034 (streamdown grammar/diagram chunks).
+- `panel/dist/` — Vite build output; NEVER committed (gitignored). Dev machines build locally (`npm --prefix panel run build`); distribution is packaged into GitHub Releases by the later release phase. See [[decisions/04_dist-release-distribution]]. Current dist (post EUD-034 pruning): ~14 MB total, eager entry 265.5 kB (84.6 kB gzip); Monaco lazy-split 3.79 MB + 5 local workers.
 - WebView2 SDK 1.0.3800.47 DLLs — `Microsoft.Web.WebView2.Core.dll` (649,840 B), `Microsoft.Web.WebView2.Wpf.dll` (82,544 B), `WebView2Loader.dll` (160,880 B, win-x64) — vendored at `vendor/webview2/`
 - WebView2 Evergreen runtime — installed (Chromium 148 verified by probe)
 - bge-m3 model weights — 4.3 GB in the HF cache (`C:\Users\ifthe\.cache\huggingface\hub\models--BAAI--bge-m3`); setup_env.ps1 checks presence and warns (first query downloads ~4.3 GB otherwise). Measured: load+first-search 12.8s (CUDA), warm search 0.015s (EUD-017).
@@ -45,7 +46,7 @@ Pinned in `server/pyproject.toml` (uv-managed venv at `server/.venv`, Python 3.1
 - node v24.11.1 — system install; runs the optional epscript-lsp AND the panel build toolchain
 - @eps-server/server 1.2.12 (npm) — epscript-lsp language server (MIT, EDAC community); optional advisory diagnostics only; the system must degrade gracefully when absent
 - KopiLua / KopiLuaInterface / luanet — the editor's embedded Lua; not a dependency we install, but the API surface the bridge codes against (editor v0.19.6.0, `C:\Users\ifthe\proj\eud\EUD.Editor.3.0.19.6.0`)
-- (retired 2026-06-04) vanilla panel `panel/app.js|style.css` — verified baseline, replaced by the React panel; dead files kept until EUD-035 (selfcheck continuity), then deleted; retrievable from git history. `panel/index.html` is now the Vite template. See [[decisions/03_react-panel-rebuild]].
+- (retired 2026-06-04) vanilla panel — verified baseline, replaced by the React panel; `panel/app.js`/`panel/style.css` DELETED in EUD-035 (deletion guarded by the contract test); retrievable from git history. `panel/index.html` is the Vite template. Selfcheck now requires the BUILT `panel/dist/`. See [[decisions/03_react-panel-rebuild]].
 
 ## Project Structure
 

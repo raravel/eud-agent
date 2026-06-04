@@ -9,11 +9,10 @@ committed, Monaco adoption), and the rules "Server and panel" section
 This REVISES the former vanilla-panel contract (element ids + app.js message
 handling). Those checks are retired by Decision 03: the vanilla element-id /
 app.js / progress-stage assertions move to runtime verification (EUD-034).
-Per the SEQUENCING NOTE in EUD-031-01ec, ``panel/index.html`` becomes the
-Vite template now, while ``panel/app.js`` / ``panel/style.css`` remain as DEAD
-files until EUD-035 (the ``--selfcheck`` PANEL_FILES gate still requires all
-three). This test therefore neither requires nor forbids app.js/style.css; it
-asserts the React-source contract and the no-CDN / no-BOM invariants.
+The vanilla files ``panel/app.js`` / ``panel/style.css`` are DELETED at the
+EUD-035 switchover; this test now asserts they are GONE (a regression guard
+against resurrection) and the ``--selfcheck`` panel gate is dist-based. It
+otherwise asserts the React-source contract and the no-CDN / no-BOM invariants.
 
 These checks target the *contract* (toolchain manifest, vendored component
 source, gitignore, no external origins) rather than exact markup, so any
@@ -44,6 +43,9 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 
 PANEL_DIR = REPO_ROOT / "panel"
 INDEX_HTML = PANEL_DIR / "index.html"            # Vite template
+# Vanilla-era files deleted at the EUD-035 switchover (regression guard below).
+VANILLA_APP_JS = PANEL_DIR / "app.js"
+VANILLA_STYLE_CSS = PANEL_DIR / "style.css"
 PACKAGE_JSON = PANEL_DIR / "package.json"
 SRC_DIR = PANEL_DIR / "src"
 COMPONENTS_DIR = PANEL_DIR / "components"
@@ -181,19 +183,22 @@ def test_src_dir_present():
     assert SRC_DIR.is_dir(), f"panel/src/ missing (React app sources): {SRC_DIR}"
 
 
-def test_vendored_ai_elements_present():
-    """Vercel AI Elements vendored as SOURCE (no runtime registry/CDN)."""
-    assert AI_ELEMENTS_DIR.is_dir(), (
-        f"panel/components/ai-elements/ missing (vendored AI Elements source): "
+def test_ai_elements_dir_absent():
+    """ai-elements vendoring was dropped; the directory must be GONE.
+
+    History: EUD-031 vendored Vercel AI Elements as source. EUD-034's
+    sanctioned dependency prune left only ``conversation.tsx`` standing, and
+    runtime parity verification showed NO ai-elements component is used — the
+    panel renders the chat with custom lightweight components (ConversationLog)
+    plus shadcn/ui primitives. EUD-035 therefore deletes the lone dead file and
+    the now-empty ``panel/components/ai-elements/`` directory, and drops the
+    ``ai`` + ``use-stick-to-bottom`` deps it alone kept alive. This asserts the
+    directory stays gone (a regression guard against half-resurrection).
+    """
+    assert not AI_ELEMENTS_DIR.exists(), (
+        f"panel/components/ai-elements/ must be ABSENT (vendoring dropped at "
+        f"EUD-035; the panel uses custom components + shadcn/ui only): "
         f"{AI_ELEMENTS_DIR}"
-    )
-    sources = [
-        p
-        for p in AI_ELEMENTS_DIR.rglob("*")
-        if p.is_file() and p.suffix in (".tsx", ".ts", ".jsx", ".js")
-    ]
-    assert sources, (
-        "panel/components/ai-elements/ contains no component source files"
     )
 
 
@@ -281,6 +286,24 @@ def test_vite_template_no_offorigin_script_src():
         if re.match(r"^(?:https?:)?//", url):
             offorigin.append(url)
     assert not offorigin, f"off-origin <script src>: {offorigin}"
+
+
+# --- 5b. vanilla files deleted (regression guard against resurrection) ----
+
+
+def test_vanilla_app_js_deleted():
+    """panel/app.js (dead vanilla file) is removed at the EUD-035 switchover."""
+    assert not VANILLA_APP_JS.exists(), (
+        f"panel/app.js must be deleted (vanilla panel retired): {VANILLA_APP_JS}"
+    )
+
+
+def test_vanilla_style_css_deleted():
+    """panel/style.css (dead vanilla file) is removed at the EUD-035 switchover."""
+    assert not VANILLA_STYLE_CSS.exists(), (
+        f"panel/style.css must be deleted (vanilla panel retired): "
+        f"{VANILLA_STYLE_CSS}"
+    )
 
 
 # --- 6. built dist (skip-aware): no external origins in dist/index.html ----

@@ -58,8 +58,14 @@ DEFAULT_RAG_DB = r"C:\Users\ifthe\proj\eud\ECA\chromadb_bge"
 DEFAULT_HF_CACHE = r"C:\Users\ifthe\.cache\huggingface\hub"
 BGE_M3_DIRNAME = "models--BAAI--bge-m3"
 
-# Panel static files that must be served from one origin (no CDN).
-PANEL_FILES = ("index.html", "app.js", "style.css")
+# Panel prerequisite: the BUILT React output served from one origin (no CDN).
+# The vanilla flat files (app.js/style.css) were retired at the EUD-035
+# switchover; the server now serves panel/dist (index.html + assets/), so the
+# selfcheck requires the built entrypoint plus the assets directory. The fix for
+# a missing/partial build is a single command, surfaced in the failure message.
+PANEL_DIST_INDEX = ("dist", "index.html")  # relative to repo_root/panel
+PANEL_DIST_ASSETS = ("dist", "assets")     # built asset dir (must exist)
+PANEL_BUILD_CMD = "npm --prefix panel run build"
 
 # Env var names (resolution layer 2).
 ENV_DATA_DIR = "EUD_DATA_DIR"
@@ -315,12 +321,16 @@ def run_selfcheck(cfg: Config) -> tuple[int, list[str]]:
             "(first query would download ~4.3 GB)."
         )
 
-    # 4) panel static files present, relative to repo_root.
+    # 4) panel BUILT output present, relative to repo_root: the server serves
+    #    panel/dist (index.html + assets/). A missing/partial build is fixed by
+    #    one command, so the failure message carries it (build hint).
     panel_dir = Path(cfg.repo_root) / "panel"
-    missing_panel = [n for n in PANEL_FILES if not (panel_dir / n).is_file()]
-    if missing_panel:
+    dist_index = panel_dir.joinpath(*PANEL_DIST_INDEX)
+    dist_assets = panel_dir.joinpath(*PANEL_DIST_ASSETS)
+    if not dist_index.is_file() or not dist_assets.is_dir():
         failures.append(
-            f"panel: missing static file(s) {missing_panel} under {panel_dir}"
+            f"panel: built output missing under {panel_dir / 'dist'} "
+            f"(need index.html + assets/); run `{PANEL_BUILD_CMD}`."
         )
 
     # Non-fatal warnings are surfaced in the messages but never change the exit
