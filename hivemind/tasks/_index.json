@@ -432,29 +432,29 @@
       "scope": []
     },
     "EUD-028-a6ce": {
-      "status": "pending",
+      "status": "cancelled",
       "priority": "high",
       "type": "task",
       "parent": "EUD-026-4c16",
       "depends_on": [],
       "title": "Panel WS protocol client + state machine (typed, reconnect, log cap)",
       "updated": "2026-06-04",
-      "completed_at": null,
-      "path": "active/EUD-028-a6ce.md",
+      "completed_at": "2026-06-04T18:48:14.368774",
+      "path": "done/EUD-028-a6ce.md",
       "scope": [
         "panel/src/**"
       ]
     },
     "EUD-029-063b": {
-      "status": "pending",
+      "status": "cancelled",
       "priority": "high",
       "type": "task",
       "parent": "EUD-026-4c16",
       "depends_on": [],
       "title": "Panel UI feature parity (conversation, picker, review tabs, Monaco edit, apply)",
       "updated": "2026-06-04",
-      "completed_at": null,
-      "path": "active/EUD-029-063b.md",
+      "completed_at": "2026-06-04T18:48:14.744350",
+      "path": "done/EUD-029-063b.md",
       "scope": [
         "panel/src/**",
         "panel/components/**"
@@ -488,7 +488,82 @@
       "path": "active/EUD-031-01ec.md",
       "scope": [
         "panel/**",
-        ".gitignore"
+        ".gitignore",
+        "server/tests/test_panel_static.py"
+      ]
+    },
+    "EUD-032-a32b": {
+      "status": "cancelled",
+      "priority": "high",
+      "type": "task",
+      "parent": "EUD-026-4c16",
+      "depends_on": [],
+      "title": "Panel switchover: delete vanilla files, dist-serving selfcheck, revised contract test",
+      "updated": "2026-06-04",
+      "completed_at": "2026-06-04T18:48:15.121288",
+      "path": "done/EUD-032-a32b.md",
+      "scope": [
+        "panel/index.html",
+        "panel/app.js",
+        "panel/style.css",
+        "server/eud_agent/config.py",
+        "server/tests/test_config.py",
+        "server/tests/test_panel_static.py"
+      ]
+    },
+    "EUD-033-a00f": {
+      "status": "pending",
+      "priority": "high",
+      "type": "task",
+      "parent": "EUD-026-4c16",
+      "depends_on": [
+        "EUD-031-01ec"
+      ],
+      "title": "Panel WS protocol client + state machine (typed, reconnect, log cap)",
+      "updated": "2026-06-04",
+      "completed_at": null,
+      "path": "active/EUD-033-a00f.md",
+      "scope": [
+        "panel/src/**"
+      ]
+    },
+    "EUD-034-4043": {
+      "status": "pending",
+      "priority": "high",
+      "type": "task",
+      "parent": "EUD-026-4c16",
+      "depends_on": [
+        "EUD-033-a00f"
+      ],
+      "title": "Panel UI feature parity (conversation, picker, review tabs, Monaco edit, apply)",
+      "updated": "2026-06-04",
+      "completed_at": null,
+      "path": "active/EUD-034-4043.md",
+      "scope": [
+        "panel/src/**",
+        "panel/components/**"
+      ]
+    },
+    "EUD-035-2262": {
+      "status": "pending",
+      "priority": "high",
+      "type": "task",
+      "parent": "EUD-026-4c16",
+      "depends_on": [
+        "EUD-034-4043",
+        "EUD-030-75a4"
+      ],
+      "title": "Panel switchover: delete vanilla files, dist-serving selfcheck, revised contract test",
+      "updated": "2026-06-04",
+      "completed_at": null,
+      "path": "active/EUD-035-2262.md",
+      "scope": [
+        "panel/index.html",
+        "panel/app.js",
+        "panel/style.css",
+        "server/eud_agent/config.py",
+        "server/tests/test_config.py",
+        "server/tests/test_panel_static.py"
       ]
     }
   }
