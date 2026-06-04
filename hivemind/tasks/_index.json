@@ -26,15 +26,15 @@
       "scope": []
     },
     "EUD-003-6e4e": {
-      "status": "pending",
+      "status": "done",
       "priority": "high",
       "type": "story",
       "parent": "EUD-001-584c",
       "depends_on": [],
       "title": "Lua bridge extension",
       "updated": "2026-06-04",
-      "completed_at": null,
-      "path": "active/EUD-003-6e4e.md",
+      "completed_at": "2026-06-04T19:33:10.808922",
+      "path": "done/EUD-003-6e4e.md",
       "scope": []
     },
     "EUD-004-16b7": {
@@ -205,7 +205,7 @@
       ]
     },
     "EUD-014-1b4e": {
-      "status": "in_progress",
+      "status": "done",
       "priority": "high",
       "type": "task",
       "parent": "EUD-003-6e4e",
@@ -214,8 +214,8 @@
       ],
       "title": "Bridge: WebView2 panel hosting (UDF, navigate retry, re-arm)",
       "updated": "2026-06-04",
-      "completed_at": null,
-      "path": "active/EUD-014-1b4e.md",
+      "completed_at": "2026-06-04T19:33:10.775412",
+      "path": "done/EUD-014-1b4e.md",
       "scope": [
         "bridge/ZZZ_10_agent_bridge.lua",
         "server/tests/test_bridge_webview_static.py"

@@ -20,6 +20,10 @@ local ok, initErr = pcall(function()
     luanet.load_assembly("PresentationCore, Version=4.0.0.0, Culture=neutral, PublicKeyToken=31bf3856ad364e35")
     luanet.load_assembly("PresentationFramework, Version=4.0.0.0, Culture=neutral, PublicKeyToken=31bf3856ad364e35")
     luanet.load_assembly("EUD Editor 3")
+    -- WebView2 SDK DLLs are deployed NEXT TO THE EDITOR EXE (install_dropin);
+    -- app-base probing makes load_assembly by simple name resolve them.
+    luanet.load_assembly("Microsoft.Web.WebView2.Core")
+    luanet.load_assembly("Microsoft.Web.WebView2.Wpf")
 
     local AppDomain  = luanet.import_type("System.AppDomain")
     local File       = luanet.import_type("System.IO.File")
@@ -36,6 +40,12 @@ local ok, initErr = pcall(function()
     local TimeSpan   = luanet.import_type("System.TimeSpan")
     local Process    = luanet.import_type("System.Diagnostics.Process")
     local ProcessStartInfo = luanet.import_type("System.Diagnostics.ProcessStartInfo")
+    -- WebView2 panel hosting (v6 WPF control panel replaced). Window reuses the
+    -- v6 showPanel import idiom; WebView2 + CreationProperties from the SDK.
+    local Window     = luanet.import_type("System.Windows.Window")
+    local WebView2   = luanet.import_type("Microsoft.Web.WebView2.Wpf.WebView2")
+    local CoreWebView2CreationProperties =
+        luanet.import_type("Microsoft.Web.WebView2.Core.CoreWebView2CreationProperties")
 
     local baseDir   = tostring(AppDomain.CurrentDomain.BaseDirectory)
     local agentDir  = baseDir .. "Data\\agent\\"
@@ -223,113 +233,141 @@ local ok, initErr = pcall(function()
     end
 
     -- ------------------------------------------------------------------
-    -- PANEL : 에이전트 제어판 (4기능, 한글 UI)
+    -- PANEL : WebView2-hosted web panel (replaces the v6 WPF control panel).
+    -- The Korean UI lives in the web panel (panel/), not in this Lua source --
+    -- the window title stays ASCII. State is kept in PLAIN LUA GLOBALS (no
+    -- `local`), same idiom as agentProc/agentSrv* (rules.md "luanet static
+    -- proxy" caution): a non-member field on a static-type proxy is build-
+    -- dependent. panelWin is the alive-tracking source of truth (re-arm).
     -- ------------------------------------------------------------------
-    local panelShown = false
-    local fileCounter = 0
-    local fileList = {}
+    panelWin       = nil   -- the WebView2-hosting Window (nil => recreate)
+    panelView      = nil   -- the WebView2 control
+    panelCoreReady = false -- CoreWebView2InitializationCompleted succeeded
+    navOk          = false -- last NavigationCompleted IsSuccess
+    lastNavAttempt = nil   -- DateTime of the last Navigate (3s backoff source)
+    lastNavUrl     = nil   -- URL of the last Navigate (respawn freshness source)
+    local NAV_BACKOFF_SECONDS = 3
 
-    local function showPanel()
-        if panelShown then return "패널이 이미 표시됨" end
-        local Window     = luanet.import_type("System.Windows.Window")
-        local Button     = luanet.import_type("System.Windows.Controls.Button")
-        local TextBlock  = luanet.import_type("System.Windows.Controls.TextBlock")
-        local TextBox    = luanet.import_type("System.Windows.Controls.TextBox")
-        local ListBox    = luanet.import_type("System.Windows.Controls.ListBox")
-        local StackPanel = luanet.import_type("System.Windows.Controls.StackPanel")
-        local Thickness  = luanet.import_type("System.Windows.Thickness")
+    local function panelUrl()
+        return "http://127.0.0.1:" .. safestr(agentSrvPort) .. "/?token=" .. safestr(agentSrvToken)
+    end
 
-        local win = Window()
-        win.Title = u8("에이전트 제어판")
-        win.Width = 380; win.Height = 580; win.Topmost = true
-
-        local panel = StackPanel()
-        panel.Margin = Thickness(12)
-        local function add(el) panel.Children:Add(el) end
-        local function head(t) local x = TextBlock(); x.Text = u8(t); x.Margin = Thickness(0, 8, 0, 2); add(x) end
-        local function mkBtn(label, h)
-            local b = Button(); b.Content = u8(label); b.Height = h or 34; b.Margin = Thickness(0, 4, 0, 0); add(b); return b
+    -- Navigate the existing initialized control to the panel URL. Safe to call
+    -- repeatedly; records the attempt time + URL (backoff + respawn freshness).
+    local function navigatePanel()
+        if panelView == nil or not panelCoreReady then return end
+        if not agentSrvReady then return end
+        local url = panelUrl()
+        -- CoreWebView2 is a plain property (dot access; rules.md reserves
+        -- get_X() for parameterized properties).
+        local okNav = pcall(function()
+            panelView.CoreWebView2:Navigate(url)
+        end)
+        lastNavAttempt = DateTime.Now
+        lastNavUrl = url
+        if not okNav then
+            navOk = false
+            logError("panel Navigate failed")
         end
+    end
 
-        head("에이전트 제어판")
+    -- Create the WebView2 window + control. Only when the server is ready (port
+    -- and token are populated). Wraps every .NET call so a failure logs and
+    -- leaves panelWin nil (the Tick re-arm will retry).
+    local function createPanel()
+        if not agentSrvReady then return false end
+        if panelWin ~= nil then return true end
+        local okCreate, cErr = pcall(function()
+            panelCoreReady = false
+            navOk = false
+            local win = Window()
+            win.Title = "EUD Agent"
+            win.Width = 480; win.Height = 720
 
-        -- (1) 트리거 에디터 열기
-        local b1 = mkBtn("1) 트리거 에디터 열기")
-        b1.Click:Add(function(s, e)
-            local okc, err = pcall(function() WMenus.OpenTriggerEdit() end)
-            b1.Content = okc and u8("1) 트리거 에디터 열기 [완료]") or u8("1) 실패")
-        end)
+            local view = WebView2()
+            local cp = CoreWebView2CreationProperties()
+            -- explicit user-data-folder under Data\agent (NEVER the default
+            -- next-to-exe location; rules.md hard rule).
+            cp.UserDataFolder = agentDir .. "webview2"
+            view.CreationProperties = cp
 
-        -- (2) 새 eps 파일 생성 + 코드 삽입
-        local b2 = mkBtn("2) 새 eps 파일 생성 + 코드 삽입")
-        b2.Click:Add(function(s, e)
-            local okc, ret = pcall(function()
-                local pj = GlobalObj.pjData
-                if pj == nil then error("no project") end
-                fileCounter = fileCounter + 1
-                local fname = "AgentGenerated" .. (fileCounter > 1 and tostring(fileCounter) or "")
-                local nf = TEFile(fname, EFileType.CUIEps)
-                nf.Scripter.StringText = "// " .. fname .. "\r\nfunction afterTriggerExec() {\r\n    setdeaths(P1, SetTo, 1, \"Terran Marine\");\r\n}\r\n"
-                pj.TEData.PFIles:FileAdd(nf)
-                WindowControl.TEOpenFile(nf, 0)
-                return fname
-            end)
-            b2.Content = okc and u8("2) 생성됨: " .. tostring(ret)) or u8("2) 실패: " .. tostring(ret))
-        end)
-
-        -- (3) 파일 목록 + 선택 열기
-        head("파일 목록 (새로고침 후 선택)")
-        local list = ListBox(); list.Height = 150; add(list)
-        local bR = mkBtn("목록 새로고침")
-        local b3 = mkBtn("3) 선택 파일 열기")
-        local function refresh()
-            list.Items:Clear(); fileList = {}
-            local pj = GlobalObj.pjData
-            if pj == nil then return end
-            walk(pj.TEData.PFIles, "", function(p, f) fileList[#fileList + 1] = f; list.Items:Add(u8(p)) end)
-        end
-        bR.Click:Add(function(s, e)
-            local okc = pcall(refresh)
-            bR.Content = okc and u8("목록 새로고침 (" .. #fileList .. ")") or u8("새로고침 실패")
-        end)
-        b3.Click:Add(function(s, e)
-            local okc, ret = pcall(function()
-                local idx = list.SelectedIndex
-                if idx < 0 then error("목록에서 선택") end
-                local f = fileList[idx + 1]
-                WindowControl.TEOpenFile(f, 0)
-                return safestr(f.FileName)
-            end)
-            b3.Content = okc and u8("3) 열림: " .. tostring(ret)) or u8("3) " .. tostring(ret))
-        end)
-
-        -- (4) 선택 파일 코드 적용
-        head("코드 입력 -> 선택 파일에 적용")
-        local code = TextBox(); code.Height = 90; code.AcceptsReturn = true
-        code.Text = u8("// 에이전트가 입력한 코드\r\nputs(\"hello agent\");")
-        add(code)
-        local b4 = mkBtn("4) 선택 파일에 코드 적용")
-        b4.Click:Add(function(s, e)
-            local okc, ret = pcall(function()
-                local idx = list.SelectedIndex
-                if idx < 0 then error("목록에서 선택") end
-                local f = fileList[idx + 1]
-                local txt = safestr(code.Text)        -- TextBox 입력(올바른 유니코드)
-                f.Scripter.StringText = txt
-                local page = f.ParentPage
-                if page ~= nil then
-                    pcall(function() page.NewTextEditor.Text = txt end)
-                    pcall(function() page.OldTextEditor.Text = txt end)
+            view.CoreWebView2InitializationCompleted:Add(function(s, e)
+                local okInit = false
+                pcall(function() okInit = e.IsSuccess end)
+                if okInit then
+                    panelCoreReady = true
+                    navigatePanel()
+                else
+                    panelCoreReady = false
+                    logError("CoreWebView2 init failed")
                 end
-                return safestr(f.FileName) .. " (" .. string.len(txt) .. "B)"
             end)
-            b4.Content = okc and u8("4) 적용: " .. tostring(ret)) or u8("4) " .. tostring(ret))
-        end)
+            view.NavigationCompleted:Add(function(s, e)
+                local success = false
+                pcall(function() success = e.IsSuccess end)
+                if success then
+                    navOk = true
+                else
+                    -- WebView2 never auto-retries: flag for the Tick re-navigate
+                    -- (3s backoff via lastNavAttempt).
+                    navOk = false
+                end
+            end)
+            win.Closed:Add(function(s, e)
+                -- handle-tracking source of truth: a closed window must re-arm.
+                panelWin = nil
+                panelView = nil
+                panelCoreReady = false
+            end)
 
-        win.Content = panel
-        win:Show()
-        panelShown = true
-        return "OK: Agent Panel 표시됨"
+            win.Content = view
+            view:EnsureCoreWebView2Async(nil)
+            win:Show()
+            panelView = view
+            panelWin = win
+        end)
+        if not okCreate then
+            logError("createPanel failed: " .. tostring(cErr))
+            panelWin = nil
+            panelView = nil
+            return false
+        end
+        return true
+    end
+
+    -- Show/refocus the panel window (PANEL command); create it if absent + ready.
+    local function showPanel()
+        if not agentSrvReady then return "ERROR: server not ready" end
+        if panelWin == nil then
+            if not createPanel() then return "ERROR: panel create failed" end
+            return "OK: panel"
+        end
+        pcall(function() panelWin:Show(); panelWin:Activate() end)
+        return "OK: panel"
+    end
+
+    -- per-Tick re-arm: recreate the window while "project open AND window not
+    -- alive" (the editor closes auxiliary windows on project switch). Also
+    -- re-navigate (3s backoff) when a previous navigation failed.
+    local function maintainPanel()
+        if not agentSrvReady then return end
+        if GlobalObj.pjData == nil then return end
+        if panelWin == nil then
+            createPanel()
+            return
+        end
+        -- window alive: re-navigate when the last nav FAILED, or when the URL
+        -- changed (server respawn -> new port/token; a WS disconnect is NOT a
+        -- NavigationCompleted failure, so navOk stays true and the panel would
+        -- otherwise sit on the dead old-token URL). 3s backoff either way.
+        if panelCoreReady and (not navOk or panelUrl() ~= lastNavUrl) then
+            local due = true
+            if lastNavAttempt ~= nil then
+                local elapsed = DateTime.Now:Subtract(lastNavAttempt).TotalSeconds
+                if elapsed < NAV_BACKOFF_SECONDS then due = false end
+            end
+            if due then navigatePanel() end
+        end
     end
 
     -- ------------------------------------------------------------------
@@ -451,12 +489,11 @@ local ok, initErr = pcall(function()
                 "time=" .. tostring(DateTime.Now)
                 .. "\r\ncompiling=" .. (pg == nil and "?" or tostring(pg.IsCompilng))
                 .. "\r\nproject=" .. (pj ~= nil and ("'" .. safestr(pj.Filename) .. "'") or "(none)"))
-            -- 프로젝트가 열리면 제어판 자동 표시(1회). 닫히면 재무장 → 다음 프로젝트에서 재표시.
-            if pj ~= nil then
-                if not panelShown then pcall(showPanel) end
-            else
-                panelShown = false
-            end
+            -- WebView2 panel re-arm: recreate while "project open AND window not
+            -- alive" (project switch closes auxiliary windows) + re-navigate on
+            -- a failed nav with a 3s backoff. Handle tracking (panelWin), not a
+            -- pjData==nil-only re-arm (rules.md).
+            pcall(maintainPanel)
             local files = Directory.GetFiles(inboxDir, "*.cmd")
             for i = 0, files.Length - 1 do
                 local cmdPath = tostring(files[i])
