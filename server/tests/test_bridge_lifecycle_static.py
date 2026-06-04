@@ -118,10 +118,12 @@ def test_agent_cfg_read_and_key_extraction():
     # File.ReadAllText applied to an agent.cfg path. Allow any expression in
     # between (path var concatenation), but the read call must exist and the cfg
     # must be the thing read.
-    assert re.search(r"File\.ReadAllText", text), "agent.cfg not read via File.ReadAllText"
-    assert re.search(r"agent\.cfg.*File\.ReadAllText|File\.ReadAllText.*agent\.cfg", text, re.S), (
-        "File.ReadAllText is not associated with the agent.cfg path"
+    assert re.search(r"File\.ReadAllText", text), (
+        "agent.cfg not read via File.ReadAllText"
     )
+    assert re.search(
+        r"agent\.cfg.*File\.ReadAllText|File\.ReadAllText.*agent\.cfg", text, re.S
+    ), "File.ReadAllText is not associated with the agent.cfg path"
     # The three flat JSON keys must be extracted (string-matched) from the cfg.
     for key in ("python_exe", "repo_root", "port"):
         assert key in text, f"agent.cfg key not extracted: {key!r}"
@@ -139,7 +141,9 @@ def test_agent_cfg_read_and_key_extraction():
 def test_spawn_processstartinfo_flags():
     """Spawn uses ProcessStartInfo with the required no-window flags."""
     text = _read_text()
-    assert "ProcessStartInfo" in text, "no ProcessStartInfo (spawn must use luanet Process)"
+    assert "ProcessStartInfo" in text, (
+        "no ProcessStartInfo (spawn must use luanet Process)"
+    )
     # UseShellExecute=false and CreateNoWindow=true (Lua `false`/`true`),
     # tolerant of spacing around `=`.
     assert re.search(r"UseShellExecute\s*=\s*false", text), (
@@ -211,7 +215,9 @@ def test_ready_validation_pid_and_mtime():
     assert "server.ready" in text, "no server.ready reference"
     # pid extracted from the ready JSON text and compared (string compare on the
     # JSON value). Require both a 'pid' mention near server.ready and a compare.
-    assert re.search(r'"?pid"?', text) and "pid" in text, "no pid handling for server.ready"
+    assert re.search(r'"?pid"?', text) and "pid" in text, (
+        "no pid handling for server.ready"
+    )
     # A string match for the pid value out of the ready JSON.
     assert re.search(r'string\.(match|find)\s*\([^)]*pid', text, re.I), (
         "pid is not string-matched out of the server.ready JSON"
