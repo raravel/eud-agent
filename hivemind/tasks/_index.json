@@ -349,7 +349,7 @@
       ]
     },
     "EUD-022-5763": {
-      "status": "pending",
+      "status": "done",
       "priority": "high",
       "type": "task",
       "parent": "EUD-006-50d8",
@@ -359,10 +359,10 @@
       ],
       "title": "Headless integration tests (WS round-trip with fake bridge)",
       "updated": "2026-06-04",
-      "completed_at": null,
-      "path": "active/EUD-022-5763.md",
+      "completed_at": "2026-06-04T20:36:22.634562",
+      "path": "done/EUD-022-5763.md",
       "scope": [
-        "server/tests/**"
+        "server/tests/test_integration_ws.py"
       ]
     },
     "EUD-023-4667": {
@@ -538,7 +538,7 @@
       ]
     },
     "EUD-034-4043": {
-      "status": "pending",
+      "status": "in_progress",
       "priority": "high",
       "type": "task",
       "parent": "EUD-026-4c16",
@@ -551,7 +551,9 @@
       "path": "active/EUD-034-4043.md",
       "scope": [
         "panel/src/**",
-        "panel/components/**"
+        "panel/components/**",
+        "panel/package.json",
+        "panel/package-lock.json"
       ]
     },
     "EUD-035-2262": {
