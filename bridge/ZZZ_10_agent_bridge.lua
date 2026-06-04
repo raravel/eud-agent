@@ -252,6 +252,22 @@ local ok, initErr = pcall(function()
                 pcall(function() page.OldTextEditor.Text = body end)
             end
             return "OK: set '" .. arg .. "' (" .. string.len(body) .. "B)"
+        elseif cmd == "NEWEPS" then
+            local name = string.gsub(arg, "^%s*(.-)%s*$", "%1")
+            if name == "" or body == "" then
+                return "ERROR: usage NEWEPS <name> + body from 2nd line"
+            end
+            local pj = GlobalObj.pjData
+            if pj == nil then return "ERROR: no project" end
+            if findFile(name) ~= nil then return "ERROR: duplicate '" .. name .. "'" end
+            local okNew, err = pcall(function()
+                local nf = TEFile(name, EFileType.CUIEps)
+                nf.Scripter.StringText = body
+                pj.TEData.PFIles:FileAdd(nf)
+                WindowControl.TEOpenFile(nf, 0)
+            end)
+            if not okNew then return "ERROR: neweps failed: " .. tostring(err) end
+            return "OK: neweps '" .. name .. "' (" .. string.len(body) .. "B)"
         elseif cmd == "GETDAT" then
             local a = split(arg, "|")
             if #a < 3 then return "ERROR: 'GETDAT datname|param|objId'" end

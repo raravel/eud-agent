@@ -8,7 +8,8 @@ parent: EUD-002-684a
 priority: high
 scope:
 - scripts/**
-status: pending
+- server/tests/test_deploy_scripts.py
+status: in_progress
 title: 'Deployment scripts: setup_env, install_dropin (agent.cfg), dev_run'
 type: task
 updated: '2026-06-04'
