@@ -4,3 +4,9 @@
 
 # Vendored WebView2 SDK DLLs are binary: never diff or EOL-normalize them.
 vendor/webview2/*.dll binary
+
+# Imported verified artifacts (import-then-extend): keep byte-identical to
+# their LF sources — never EOL-normalize, or a checkout under core.autocrlf
+# would rewrite them and break the byte-identity guarantee.
+bridge/ZZZ_10_agent_bridge.lua -text
+server/eud_agent/runner_legacy.py -text

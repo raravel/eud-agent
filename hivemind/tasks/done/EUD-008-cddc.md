@@ -1,4 +1,5 @@
 ---
+completed_at: '2026-06-04T18:05:57.024058'
 created: '2026-06-04'
 depends_on:
 - EUD-007-761d
@@ -9,7 +10,9 @@ scope:
 - bridge/**
 - vendor/**
 - server/eud_agent/**
-status: pending
+- server/tests/test_imported_artifacts.py
+- .gitattributes
+status: done
 title: Import verified artifacts (bridge v6, runner, WebView2 DLLs)
 type: task
 updated: '2026-06-04'

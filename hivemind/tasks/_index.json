@@ -94,7 +94,7 @@
       ]
     },
     "EUD-008-cddc": {
-      "status": "pending",
+      "status": "done",
       "priority": "high",
       "type": "task",
       "parent": "EUD-002-684a",
@@ -103,12 +103,14 @@
       ],
       "title": "Import verified artifacts (bridge v6, runner, WebView2 DLLs)",
       "updated": "2026-06-04",
-      "completed_at": null,
-      "path": "active/EUD-008-cddc.md",
+      "completed_at": "2026-06-04T18:05:57.024058",
+      "path": "done/EUD-008-cddc.md",
       "scope": [
         "bridge/**",
         "vendor/**",
-        "server/eud_agent/**"
+        "server/eud_agent/**",
+        "server/tests/test_imported_artifacts.py",
+        ".gitattributes"
       ]
     },
     "EUD-009-6aed": {
@@ -317,7 +319,7 @@
       ]
     },
     "EUD-021-6479": {
-      "status": "pending",
+      "status": "in_progress",
       "priority": "high",
       "type": "task",
       "parent": "EUD-005-9d32",
@@ -329,7 +331,8 @@
       "completed_at": null,
       "path": "active/EUD-021-6479.md",
       "scope": [
-        "panel/**"
+        "panel/**",
+        "server/tests/test_panel_static.py"
       ]
     },
     "EUD-022-5763": {
