@@ -37,6 +37,7 @@ local ok, initErr = pcall(function()
     local WindowControl = luanet.import_type("EUD_Editor_3.WindowControl")
     local WMenus     = luanet.import_type("EUD_Editor_3.WindowMenu.WindowMenus")
     local DispatcherTimer = luanet.import_type("System.Windows.Threading.DispatcherTimer")
+    local DispatcherPriority = luanet.import_type("System.Windows.Threading.DispatcherPriority")
     local TimeSpan   = luanet.import_type("System.TimeSpan")
     local Process    = luanet.import_type("System.Diagnostics.Process")
     local ProcessStartInfo = luanet.import_type("System.Diagnostics.ProcessStartInfo")
@@ -484,7 +485,7 @@ local ok, initErr = pcall(function()
     end
 
     -- ------------------------------------------------------------------
-    local timer = DispatcherTimer()
+    local timer = DispatcherTimer(DispatcherPriority.Normal)
     timer.Interval = TimeSpan.FromSeconds(1)
     timer.Tick:Add(function(sender, args)
         local okTick, tickErr = pcall(function()

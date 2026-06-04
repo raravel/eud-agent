@@ -388,6 +388,58 @@ def test_validate_ready_deletes_only_when_neither_pid_nor_ppid_matches():
 
 
 # --------------------------------------------------------------------------
+# 4c. Tick timer priority (EUD-039-eecb)
+# --------------------------------------------------------------------------
+# The heartbeat/IPC DispatcherTimer is constructed with the parameterless ctor
+# (``DispatcherTimer()``), which defaults to ``DispatcherPriority.Background``
+# (4). The live WebView2 panel floods the editor UI thread with
+# ``DispatcherPriority.Render`` (7) work that preempts the Background tick:
+# measured live the tick fired every ~9-10s (stalling up to 54s) instead of 1s,
+# so heartbeat.txt went stale (server self-terminates at 60s) and inbox
+# ``.result`` latency blew past the server's 10s timeout (panel "editor busy").
+# An orchestrator A/B proof showed a second timer at ``DispatcherPriority.Normal``
+# (9) under the same load fired every 0.2-0.3s. The fix constructs the timer with
+# an explicit ``DispatcherPriority.Normal`` argument (Send (10) also acceptable).
+
+
+def test_tick_timer_constructed_at_normal_priority():
+    """The Tick timer ctor passes an explicit DispatcherPriority.Normal argument.
+
+    Bound to the ``DispatcherTimer(...)`` construction (not a stray substring):
+    the parameterless ``DispatcherTimer()`` defaults to Background (4) and is
+    preempted by the panel's Render-priority work. The fix passes
+    ``DispatcherPriority.Normal`` (9) -- Send (10) is also acceptable, but Normal
+    is the planned value. Fails today: the source has the bare ``DispatcherTimer()``.
+    """
+    text = _read_text()
+    ctor = r"DispatcherTimer\(\s*DispatcherPriority\.(Normal|Send)\s*\)"
+    assert re.search(ctor, text), (
+        "the Tick DispatcherTimer must be constructed with an explicit "
+        "`DispatcherPriority.Normal` argument (Send also accepted); the bare "
+        "`DispatcherTimer()` defaults to Background (4) and is preempted by the "
+        "WebView2 panel's Render-priority work, starving the heartbeat/IPC tick"
+    )
+
+
+def test_dispatcher_priority_imported():
+    """DispatcherPriority is imported via import_type from System.Windows.Threading.
+
+    Bound to the ``import_type`` call for the enum's full type name. Fails today:
+    no such import exists yet. ``DispatcherPriority`` lives in WindowsBase, which
+    is already ``load_assembly``'d alongside the existing DispatcherTimer import.
+    """
+    text = _read_text()
+    assert re.search(
+        r'import_type\s*\(\s*"System\.Windows\.Threading\.DispatcherPriority"\s*\)',
+        text,
+    ), (
+        "DispatcherPriority must be imported via "
+        'import_type("System.Windows.Threading.DispatcherPriority") so the Tick '
+        "timer can be constructed at Normal priority"
+    )
+
+
+# --------------------------------------------------------------------------
 # 5. respawn throttle
 # --------------------------------------------------------------------------
 def test_respawn_hasexited_and_throttle():

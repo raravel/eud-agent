@@ -24,6 +24,7 @@ Violations of the EDITOR-* and LUANET-* rules crash or corrupt EUD Editor 3 at r
 - SET/NEWEPS change memory objects only (user saves to disk). Setter exists only for CUI/SCA/RawText file types — GUI files are read-only; LIST must expose the type so callers can avoid them.
 - Auxiliary windows are closed by the editor on project create/switch: ALWAYS re-create the panel via window-handle tracking ("project open AND window not alive" per Tick). NEVER rely on `pjData==nil` re-arm alone.
 - ALWAYS write `heartbeat.txt` before the `IsCompilng` early-return in Tick (unconditional heartbeat).
+- ALWAYS construct the lifecycle `DispatcherTimer` above Render priority — `DispatcherTimer(DispatcherPriority.Normal)`, never the parameterless ctor (which defaults to `DispatcherPriority.Background`). The live WebView2 panel posts continuous `Render` (7) priority work to the editor UI-thread Dispatcher; a `Background` (4) timer is starved by it, freezing the unconditional heartbeat AND inbox processing (measured EUD-039: ~9-10s ticks, 54s stalls → server self-terminates / panel "editor busy"). Pass the enum object, never a raw number.
 
 ## IPC and encoding
 
