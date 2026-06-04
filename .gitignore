@@ -1,0 +1,15 @@
+# Python virtualenv (uv-managed, server/.venv)
+server/.venv/
+.venv/
+
+# Python bytecode / caches
+__pycache__/
+*.pyc
+*.pyo
+
+# Tooling caches
+.ruff_cache/
+.pytest_cache/
+
+# Node (optional epscript-lsp, panel tooling)
+node_modules/

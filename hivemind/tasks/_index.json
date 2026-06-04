@@ -74,18 +74,23 @@
       "scope": []
     },
     "EUD-007-761d": {
-      "status": "pending",
+      "status": "done",
       "priority": "high",
       "type": "task",
       "parent": "EUD-002-684a",
       "depends_on": [],
       "title": "Repo scaffolding (gitignore, gitattributes, directories)",
       "updated": "2026-06-04",
-      "completed_at": null,
-      "path": "active/EUD-007-761d.md",
+      "completed_at": "2026-06-04T17:42:48.126936",
+      "path": "done/EUD-007-761d.md",
       "scope": [
         ".gitignore",
-        ".gitattributes"
+        ".gitattributes",
+        "bridge/**",
+        "server/**",
+        "panel/**",
+        "vendor/**",
+        "scripts/**"
       ]
     },
     "EUD-008-cddc": {

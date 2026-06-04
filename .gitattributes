@@ -1,0 +1,6 @@
+# Normalize text files to LF in the repo; UTF-8 without BOM is required by
+# project rules. Working-tree EOL is left to the user's core.autocrlf.
+* text=auto
+
+# Vendored WebView2 SDK DLLs are binary: never diff or EOL-normalize them.
+vendor/webview2/*.dll binary
