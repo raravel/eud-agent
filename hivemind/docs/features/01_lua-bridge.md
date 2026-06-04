@@ -42,3 +42,4 @@ Replaces the v6 WPF 4-button panel (delete `showPanel` WPF body; `PANEL` command
 - `bridge/ZZZ_10_agent_bridge.lua` — all bridge logic (single drop-in file)
 - `scripts/install_dropin.ps1` — deploys the lua + DLLs + agent.cfg
 - external: `vendor/webview2/*.dll` (loaded from editor exe folder), `Data\agent\agent.cfg` (read at init)
+- [BOUND 2026-06-04 from EUD-010-e3af] `scripts/uninstall_dropin.ps1` — removes lua + Data\agent; -RemoveDlls opt-in (may remove editor-owned WebView2 DLLs — off by default)
