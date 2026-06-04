@@ -314,7 +314,7 @@
       ]
     },
     "EUD-020-4840": {
-      "status": "in_progress",
+      "status": "done",
       "priority": "medium",
       "type": "task",
       "parent": "EUD-004-16b7",
@@ -325,8 +325,8 @@
       ],
       "title": "Server: runner_cli headless retention",
       "updated": "2026-06-04",
-      "completed_at": null,
-      "path": "active/EUD-020-4840.md",
+      "completed_at": "2026-06-04T22:19:11.765828",
+      "path": "done/EUD-020-4840.md",
       "scope": [
         "server/eud_agent/runner_cli.py",
         "server/tests/test_runner_cli.py"
@@ -581,7 +581,7 @@
       ]
     },
     "EUD-036-9163": {
-      "status": "pending",
+      "status": "in_progress",
       "priority": "high",
       "type": "bug",
       "parent": "EUD-026-4c16",
