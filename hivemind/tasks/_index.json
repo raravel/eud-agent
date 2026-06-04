@@ -1,0 +1,384 @@
+{
+  "version": 3,
+  "tasks": {
+    "EUD-001-584c": {
+      "status": "pending",
+      "priority": "high",
+      "type": "epic",
+      "parent": null,
+      "depends_on": [],
+      "title": "External agent integration (panel + server + bridge)",
+      "updated": "2026-06-04",
+      "completed_at": null,
+      "path": "active/EUD-001-584c.md",
+      "scope": []
+    },
+    "EUD-002-684a": {
+      "status": "pending",
+      "priority": "high",
+      "type": "story",
+      "parent": "EUD-001-584c",
+      "depends_on": [],
+      "title": "Scaffolding and artifact import",
+      "updated": "2026-06-04",
+      "completed_at": null,
+      "path": "active/EUD-002-684a.md",
+      "scope": []
+    },
+    "EUD-003-6e4e": {
+      "status": "pending",
+      "priority": "high",
+      "type": "story",
+      "parent": "EUD-001-584c",
+      "depends_on": [],
+      "title": "Lua bridge extension",
+      "updated": "2026-06-04",
+      "completed_at": null,
+      "path": "active/EUD-003-6e4e.md",
+      "scope": []
+    },
+    "EUD-004-16b7": {
+      "status": "pending",
+      "priority": "high",
+      "type": "story",
+      "parent": "EUD-001-584c",
+      "depends_on": [],
+      "title": "Python server",
+      "updated": "2026-06-04",
+      "completed_at": null,
+      "path": "active/EUD-004-16b7.md",
+      "scope": []
+    },
+    "EUD-005-9d32": {
+      "status": "pending",
+      "priority": "high",
+      "type": "story",
+      "parent": "EUD-001-584c",
+      "depends_on": [],
+      "title": "Agent panel UI",
+      "updated": "2026-06-04",
+      "completed_at": null,
+      "path": "active/EUD-005-9d32.md",
+      "scope": []
+    },
+    "EUD-006-50d8": {
+      "status": "pending",
+      "priority": "high",
+      "type": "story",
+      "parent": "EUD-001-584c",
+      "depends_on": [],
+      "title": "Verification and E2E",
+      "updated": "2026-06-04",
+      "completed_at": null,
+      "path": "active/EUD-006-50d8.md",
+      "scope": []
+    },
+    "EUD-007-761d": {
+      "status": "pending",
+      "priority": "high",
+      "type": "task",
+      "parent": "EUD-002-684a",
+      "depends_on": [],
+      "title": "Repo scaffolding (gitignore, gitattributes, directories)",
+      "updated": "2026-06-04",
+      "completed_at": null,
+      "path": "active/EUD-007-761d.md",
+      "scope": [
+        ".gitignore",
+        ".gitattributes"
+      ]
+    },
+    "EUD-008-cddc": {
+      "status": "pending",
+      "priority": "high",
+      "type": "task",
+      "parent": "EUD-002-684a",
+      "depends_on": [
+        "EUD-007-761d"
+      ],
+      "title": "Import verified artifacts (bridge v6, runner, WebView2 DLLs)",
+      "updated": "2026-06-04",
+      "completed_at": null,
+      "path": "active/EUD-008-cddc.md",
+      "scope": [
+        "bridge/**",
+        "vendor/**",
+        "server/eud_agent/**"
+      ]
+    },
+    "EUD-009-6aed": {
+      "status": "pending",
+      "priority": "high",
+      "type": "task",
+      "parent": "EUD-004-16b7",
+      "depends_on": [
+        "EUD-007-761d"
+      ],
+      "title": "Server: pyproject, config, selfcheck entrypoint",
+      "updated": "2026-06-04",
+      "completed_at": null,
+      "path": "active/EUD-009-6aed.md",
+      "scope": [
+        "server/pyproject.toml",
+        "server/eud_agent/config.py",
+        "server/eud_agent/__main__.py"
+      ]
+    },
+    "EUD-010-e3af": {
+      "status": "pending",
+      "priority": "high",
+      "type": "task",
+      "parent": "EUD-002-684a",
+      "depends_on": [
+        "EUD-008-cddc",
+        "EUD-009-6aed"
+      ],
+      "title": "Deployment scripts: setup_env, install_dropin (agent.cfg), dev_run",
+      "updated": "2026-06-04",
+      "completed_at": null,
+      "path": "active/EUD-010-e3af.md",
+      "scope": [
+        "scripts/**"
+      ]
+    },
+    "EUD-011-cb9e": {
+      "status": "pending",
+      "priority": "high",
+      "type": "task",
+      "parent": "EUD-003-6e4e",
+      "depends_on": [
+        "EUD-008-cddc"
+      ],
+      "title": "Bridge: LIST command (paths + file types)",
+      "updated": "2026-06-04",
+      "completed_at": null,
+      "path": "active/EUD-011-cb9e.md",
+      "scope": [
+        "bridge/ZZZ_10_agent_bridge.lua"
+      ]
+    },
+    "EUD-012-241a": {
+      "status": "pending",
+      "priority": "high",
+      "type": "task",
+      "parent": "EUD-003-6e4e",
+      "depends_on": [
+        "EUD-011-cb9e"
+      ],
+      "title": "Bridge: NEWEPS command (duplicate returns ERROR)",
+      "updated": "2026-06-04",
+      "completed_at": null,
+      "path": "active/EUD-012-241a.md",
+      "scope": [
+        "bridge/ZZZ_10_agent_bridge.lua"
+      ]
+    },
+    "EUD-013-6466": {
+      "status": "pending",
+      "priority": "high",
+      "type": "task",
+      "parent": "EUD-003-6e4e",
+      "depends_on": [
+        "EUD-012-241a"
+      ],
+      "title": "Bridge: server lifecycle (agent.cfg, spawn, ready validation, heartbeat)",
+      "updated": "2026-06-04",
+      "completed_at": null,
+      "path": "active/EUD-013-6466.md",
+      "scope": [
+        "bridge/ZZZ_10_agent_bridge.lua"
+      ]
+    },
+    "EUD-014-1b4e": {
+      "status": "pending",
+      "priority": "high",
+      "type": "task",
+      "parent": "EUD-003-6e4e",
+      "depends_on": [
+        "EUD-013-6466"
+      ],
+      "title": "Bridge: WebView2 panel hosting (UDF, navigate retry, re-arm)",
+      "updated": "2026-06-04",
+      "completed_at": null,
+      "path": "active/EUD-014-1b4e.md",
+      "scope": [
+        "bridge/ZZZ_10_agent_bridge.lua"
+      ]
+    },
+    "EUD-015-c726": {
+      "status": "pending",
+      "priority": "high",
+      "type": "task",
+      "parent": "EUD-004-16b7",
+      "depends_on": [
+        "EUD-009-6aed"
+      ],
+      "title": "Server: bridge_io module",
+      "updated": "2026-06-04",
+      "completed_at": null,
+      "path": "active/EUD-015-c726.md",
+      "scope": [
+        "server/eud_agent/bridge_io.py",
+        "server/tests/**"
+      ]
+    },
+    "EUD-016-af75": {
+      "status": "pending",
+      "priority": "high",
+      "type": "task",
+      "parent": "EUD-004-16b7",
+      "depends_on": [
+        "EUD-009-6aed"
+      ],
+      "title": "Server: codex_client module",
+      "updated": "2026-06-04",
+      "completed_at": null,
+      "path": "active/EUD-016-af75.md",
+      "scope": [
+        "server/eud_agent/codex_client.py",
+        "server/tests/**"
+      ]
+    },
+    "EUD-017-e827": {
+      "status": "pending",
+      "priority": "high",
+      "type": "task",
+      "parent": "EUD-004-16b7",
+      "depends_on": [
+        "EUD-009-6aed"
+      ],
+      "title": "Server: rag module (in-process bge-m3)",
+      "updated": "2026-06-04",
+      "completed_at": null,
+      "path": "active/EUD-017-e827.md",
+      "scope": [
+        "server/eud_agent/rag.py",
+        "server/tests/**"
+      ]
+    },
+    "EUD-018-bafb": {
+      "status": "pending",
+      "priority": "high",
+      "type": "task",
+      "parent": "EUD-004-16b7",
+      "depends_on": [
+        "EUD-015-c726",
+        "EUD-016-af75",
+        "EUD-017-e827"
+      ],
+      "title": "Server: orchestrator + FastAPI app + WS",
+      "updated": "2026-06-04",
+      "completed_at": null,
+      "path": "active/EUD-018-bafb.md",
+      "scope": [
+        "server/eud_agent/orchestrator.py",
+        "server/eud_agent/app.py",
+        "server/tests/**"
+      ]
+    },
+    "EUD-019-58af": {
+      "status": "pending",
+      "priority": "low",
+      "type": "task",
+      "parent": "EUD-004-16b7",
+      "depends_on": [
+        "EUD-018-bafb"
+      ],
+      "title": "Server: lsp_gate advisory diagnostics (epscript-lsp)",
+      "updated": "2026-06-04",
+      "completed_at": null,
+      "path": "active/EUD-019-58af.md",
+      "scope": [
+        "server/eud_agent/lsp_gate.py",
+        "server/tests/**"
+      ]
+    },
+    "EUD-020-4840": {
+      "status": "pending",
+      "priority": "medium",
+      "type": "task",
+      "parent": "EUD-004-16b7",
+      "depends_on": [
+        "EUD-015-c726",
+        "EUD-016-af75",
+        "EUD-017-e827"
+      ],
+      "title": "Server: runner_cli headless retention",
+      "updated": "2026-06-04",
+      "completed_at": null,
+      "path": "active/EUD-020-4840.md",
+      "scope": [
+        "server/eud_agent/runner_cli.py"
+      ]
+    },
+    "EUD-021-6479": {
+      "status": "pending",
+      "priority": "high",
+      "type": "task",
+      "parent": "EUD-005-9d32",
+      "depends_on": [
+        "EUD-007-761d"
+      ],
+      "title": "Panel web UI (chat, picker, preview/diff/edit, apply)",
+      "updated": "2026-06-04",
+      "completed_at": null,
+      "path": "active/EUD-021-6479.md",
+      "scope": [
+        "panel/**"
+      ]
+    },
+    "EUD-022-5763": {
+      "status": "pending",
+      "priority": "high",
+      "type": "task",
+      "parent": "EUD-006-50d8",
+      "depends_on": [
+        "EUD-018-bafb",
+        "EUD-021-6479"
+      ],
+      "title": "Headless integration tests (WS round-trip with fake bridge)",
+      "updated": "2026-06-04",
+      "completed_at": null,
+      "path": "active/EUD-022-5763.md",
+      "scope": [
+        "server/tests/**"
+      ]
+    },
+    "EUD-023-4667": {
+      "status": "cancelled",
+      "priority": "high",
+      "type": "task",
+      "parent": "EUD-006-50d8",
+      "depends_on": [
+        "EUD-010-e3af",
+        "EUD-014-1b4e",
+        "EUD-022-5763"
+      ],
+      "title": "Windows E2E checklist with editor (user-assisted)",
+      "updated": "2026-06-04",
+      "completed_at": "2026-06-04T17:24:38.805730",
+      "path": "done/EUD-023-4667.md",
+      "scope": [
+        "ALL"
+      ]
+    },
+    "EUD-024-4002": {
+      "status": "pending",
+      "priority": "high",
+      "type": "task",
+      "parent": "EUD-006-50d8",
+      "depends_on": [
+        "EUD-010-e3af",
+        "EUD-014-1b4e",
+        "EUD-022-5763"
+      ],
+      "title": "Windows E2E checklist with editor (user-assisted)",
+      "updated": "2026-06-04",
+      "completed_at": null,
+      "path": "active/EUD-024-4002.md",
+      "scope": [
+        "*"
+      ]
+    }
+  }
+}

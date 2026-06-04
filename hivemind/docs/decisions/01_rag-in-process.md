@@ -1,0 +1,11 @@
+# Decision 01: RAG search runs in-process in the local Python server
+- Date: 2026-06-04
+- Status: Accepted
+- Context: The local agent server (resident process on the user's PC, spawned by the Lua bridge) needs bge-m3 semantic search over the ECA chromadb_bge DB. Fork hit while planning the server venv composition: where does the embedding model live?
+- Considered:
+  - Server in-process — Pros: model loaded once, <1s queries on a resident server. Cons: ~6GB torch/cu126 duplication in the server venv (model weights are shared via the HF cache, 4.3GB); ~2-4GB resident RAM. Recommendation: ★★★ — one-time disk cost, best runtime UX.
+  - Subprocess delegation to ECA rag_query.py (ECA venv) — Pros: verified runner pattern, zero duplication. Cons: ~10s model load on EVERY query, permanent coupling to ECA paths. Recommendation: ★★☆.
+  - Share ECA venv (+install fastapi into it) — Pros: zero duplication + in-process speed. Cons: mutates another project's venv; ECA rebuilds/cleanups break the server. Recommendation: ★☆☆.
+- Chosen: Server in-process
+- Rationale: A resident server amortizes the one-time model load; disk cost is one-off; user confirmed the recommendation.
+- Impact: tech-stack.md (server venv pins torch cu126 et al.), features/01_python-server.md (rag module: lazy load + background warmup), verify.md (RAG smoke check)
