@@ -73,3 +73,4 @@ Headless retention of the verified runner: `--once/--mock/--no-context`, jobs qu
 - [BOUND 2026-06-04 from EUD-009-6aed] `server/eud_agent/__init__.py` — package marker (empty); enables editable install so python -m eud_agent resolves from repo root
 - [BOUND 2026-06-04 from EUD-009-6aed] `server/uv.lock` — committed uv lockfile pinning the resolved dependency graph (cu126 torch); .venv itself is gitignored
 - [BOUND 2026-06-04 from EUD-010-e3af] `scripts/setup_env.ps1` — uv sync + venv sanity import + bge-m3 HF-cache warn; -Cpu prints the documented pyproject fallback edit
+- [BOUND 2026-06-04 from EUD-010-e3af] `scripts/dev_run.ps1` — standalone dev server runner (temp EUD_DATA_DIR; propagates exit codes honestly)
