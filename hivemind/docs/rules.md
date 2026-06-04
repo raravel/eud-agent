@@ -47,7 +47,12 @@ Violations of the EDITOR-* and LUANET-* rules crash or corrupt EUD Editor 3 at r
 - ALWAYS write `server.ready` atomically (temp + rename) and only after confirming the socket accepts connections. Delete it on graceful shutdown.
 - ALWAYS self-terminate when `heartbeat.txt` is stale (>60s). The server must never outlive the editor.
 - WebView2: ALWAYS set an explicit user-data-folder (`Data\agent\webview2`). NEVER let it default next to the editor exe. ALWAYS subscribe `NavigationCompleted` and re-Navigate on failure (no auto-retry in WebView2).
-- The panel has no code-editor component (no Monaco/CodeMirror; textarea + server-side diff only) and no external CDN dependencies — everything served from the local server.
+- The panel is a React app (Vite + TypeScript + Tailwind + shadcn/ui + Vercel AI Elements) rooted at `panel/`; the server serves ONLY the built output `panel/dist/`. NEVER commit `panel/dist/` or `panel/node_modules/` (gitignored — distribution is release-packaged, later phase).
+- NEVER load panel assets from a CDN at runtime — JS/CSS/fonts/Monaco workers are all bundled locally from npm packages or vendored component source. Monaco MUST load from the `monaco-editor` npm bundle via `loader.config({ monaco })`; the `@monaco-editor/react` default CDN loader is forbidden.
+- Monaco is the edit surface (Decision 05 revoked the old no-code-editor rule). The diff tab renders the SERVER-supplied unified diff with +/- coloring — NEVER switch to Monaco DiffEditor without a protocol change (the server does not ship original file content).
+
+> Decision: see [[decisions/03_react-panel-rebuild]] and [[decisions/05_monaco-editor-adoption]] — the former no-framework/no-build-step/no-code-editor clauses were revoked 2026-06-04.
+
 - RAG model loading must never gate `server.ready` (lazy load + background warmup; report `rag_warmup` progress).
 - epscript-lsp diagnostics are advisory only: they annotate, never block apply; absence of node/the package must not break the flow.
 

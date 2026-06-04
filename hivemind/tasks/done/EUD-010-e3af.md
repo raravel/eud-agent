@@ -1,4 +1,5 @@
 ---
+completed_at: '2026-06-04T18:46:57.177884'
 created: '2026-06-04'
 depends_on:
 - EUD-008-cddc
@@ -9,7 +10,7 @@ priority: high
 scope:
 - scripts/**
 - server/tests/test_deploy_scripts.py
-status: in_progress
+status: done
 title: 'Deployment scripts: setup_env, install_dropin (agent.cfg), dev_run'
 type: task
 updated: '2026-06-04'

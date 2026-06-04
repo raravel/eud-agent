@@ -14,15 +14,15 @@
       "scope": []
     },
     "EUD-002-684a": {
-      "status": "pending",
+      "status": "done",
       "priority": "high",
       "type": "story",
       "parent": "EUD-001-584c",
       "depends_on": [],
       "title": "Scaffolding and artifact import",
       "updated": "2026-06-04",
-      "completed_at": null,
-      "path": "active/EUD-002-684a.md",
+      "completed_at": "2026-06-04T18:46:57.213911",
+      "path": "done/EUD-002-684a.md",
       "scope": []
     },
     "EUD-003-6e4e": {
@@ -135,7 +135,7 @@
       ]
     },
     "EUD-010-e3af": {
-      "status": "in_progress",
+      "status": "done",
       "priority": "high",
       "type": "task",
       "parent": "EUD-002-684a",
@@ -145,8 +145,8 @@
       ],
       "title": "Deployment scripts: setup_env, install_dropin (agent.cfg), dev_run",
       "updated": "2026-06-04",
-      "completed_at": null,
-      "path": "active/EUD-010-e3af.md",
+      "completed_at": "2026-06-04T18:46:57.177884",
+      "path": "done/EUD-010-e3af.md",
       "scope": [
         "scripts/**",
         "server/tests/test_deploy_scripts.py"
@@ -393,6 +393,102 @@
       "path": "active/EUD-024-4002.md",
       "scope": [
         "*"
+      ]
+    },
+    "EUD-025-865b": {
+      "status": "pending",
+      "priority": "high",
+      "type": "epic",
+      "parent": null,
+      "depends_on": [],
+      "title": "React panel rebuild (AI Elements + Monaco)",
+      "updated": "2026-06-04",
+      "completed_at": null,
+      "path": "active/EUD-025-865b.md",
+      "scope": []
+    },
+    "EUD-026-4c16": {
+      "status": "pending",
+      "priority": "high",
+      "type": "story",
+      "parent": "EUD-025-865b",
+      "depends_on": [],
+      "title": "React panel foundation",
+      "updated": "2026-06-04",
+      "completed_at": null,
+      "path": "active/EUD-026-4c16.md",
+      "scope": []
+    },
+    "EUD-027-ad4f": {
+      "status": "pending",
+      "priority": "low",
+      "type": "story",
+      "parent": "EUD-025-865b",
+      "depends_on": [],
+      "title": "Release packaging + updater (GitHub Releases)",
+      "updated": "2026-06-04",
+      "completed_at": null,
+      "path": "active/EUD-027-ad4f.md",
+      "scope": []
+    },
+    "EUD-028-a6ce": {
+      "status": "pending",
+      "priority": "high",
+      "type": "task",
+      "parent": "EUD-026-4c16",
+      "depends_on": [],
+      "title": "Panel WS protocol client + state machine (typed, reconnect, log cap)",
+      "updated": "2026-06-04",
+      "completed_at": null,
+      "path": "active/EUD-028-a6ce.md",
+      "scope": [
+        "panel/src/**"
+      ]
+    },
+    "EUD-029-063b": {
+      "status": "pending",
+      "priority": "high",
+      "type": "task",
+      "parent": "EUD-026-4c16",
+      "depends_on": [],
+      "title": "Panel UI feature parity (conversation, picker, review tabs, Monaco edit, apply)",
+      "updated": "2026-06-04",
+      "completed_at": null,
+      "path": "active/EUD-029-063b.md",
+      "scope": [
+        "panel/src/**",
+        "panel/components/**"
+      ]
+    },
+    "EUD-030-75a4": {
+      "status": "pending",
+      "priority": "medium",
+      "type": "chore",
+      "parent": "EUD-026-4c16",
+      "depends_on": [],
+      "title": "Config robustness: bad agent.cfg diagnostic, port validation, HF env var",
+      "updated": "2026-06-04",
+      "completed_at": null,
+      "path": "active/EUD-030-75a4.md",
+      "scope": [
+        "server/eud_agent/config.py",
+        "server/eud_agent/__main__.py",
+        "server/tests/test_config.py"
+      ]
+    },
+    "EUD-031-01ec": {
+      "status": "pending",
+      "priority": "high",
+      "type": "task",
+      "parent": "EUD-026-4c16",
+      "depends_on": [],
+      "title": "Panel scaffold: Vite + React + TS + Tailwind + shadcn + AI Elements + Monaco wiring",
+      "updated": "2026-06-04",
+      "completed_at": null,
+      "path": "active/EUD-031-01ec.md",
+      "scope": [
+        "panel/**",
+        ".gitignore"
       ]
     }
   }

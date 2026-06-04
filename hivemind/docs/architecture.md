@@ -10,7 +10,7 @@ graph TD
         Bridge["Lua drop-in bridge<br/>bridge/ZZZ_10_agent_bridge.lua"]
         WV["WebView2 panel window"]
     end
-    Panel["Panel web UI<br/>panel/ (HTML/JS/CSS)"]
+    Panel["Panel web UI<br/>panel/ React app (served from panel/dist)"]
     Server["Local Python server (FastAPI)<br/>server/eud_agent/"]
     Codex["codex exec CLI (BYO)"]
     RAG[("ECA RAG DB<br/>chromadb_bge - bge-m3 1024d")]
@@ -85,7 +85,7 @@ Transport: `Data\agent\inbox\<name>.cmd` is processed on the 1s `DispatcherTimer
 |---|---|---|---|
 | PING | — | PONG time | liveness |
 | STATUS | — | compiling / project / version | |
-| LIST | — | one line per file: path TAB EFileType | **new**; walk of pj.TEData.PFIles, names+types only |
+| LIST | — | one line per file: path TAB EFileType | **new**; walk of pj.TEData.PFIles, names+types only; empty (non-ERROR) result = zero files |
 | DUMP | — | writes dump files + index to outbox | heavyweight; debugging only |
 | GET path | — | file text | |
 | SET path + body | body from 2nd line | OK / ERROR | memory-only; syncs open-tab editors; CUI/SCA/RawText only (GUI has no setter) |
@@ -119,11 +119,15 @@ eud-agent/
 +-- hivemind/                        # harness docs + tasks (this plan)
 +-- bridge/ZZZ_10_agent_bridge.lua   # imported v6, extended (LIST/NEWEPS/lifecycle/WebView2)
 +-- server/
-|   +-- pyproject.toml               # uv-managed venv at server/.venv
+|   +-- pyproject.toml               # uv-managed venv at server/.venv (uv.lock committed)
 |   +-- eud_agent/                   # config, bridge_io, codex_client, rag, lsp_gate,
 |   |                                # orchestrator, app (FastAPI), runner_cli, __main__
 |   +-- tests/
-+-- panel/                           # index.html, app.js, style.css (no build step)
++-- panel/                           # React app root (Vite+TS+Tailwind+shadcn/ui+AI Elements)
+|   +-- package.json, vite.config.ts, tsconfig.json, index.html
+|   +-- src/                         # app shell, ws client, state, panel components, monaco wiring
+|   +-- components/                  # vendored shadcn/ui + ai-elements source
+|   +-- dist/                        # build output — gitignored, served by the server
 +-- vendor/webview2/                 # 3 SDK DLLs (Core, Wpf, Loader x64)
 +-- scripts/                         # setup_env.ps1, install_dropin.ps1, dev_run.ps1
 ```
@@ -143,4 +147,6 @@ Runtime state lives in the **editor's** folder, not the repo: `<editor>\Data\age
 
 > Decision: see [[decisions/02_neweps-duplicate-error]] — alternatives evaluated, not pursued.
 
-- Panel has no code editor component: read-only preview + server-side unified diff + a plain textarea toggle for manual tweaks. epscript-lsp is used server-side as an advisory diagnostics gate only.
+- Panel = React + Vercel AI Elements (vendored source, zero runtime CDN) built with Vite to `panel/dist/` (never committed; release-packaged later via GitHub Releases). Monaco editor is the edit surface; the diff tab renders the server-side unified diff. epscript-lsp stays a server-side advisory diagnostics gate only.
+
+> Decision: see [[decisions/03_react-panel-rebuild]], [[decisions/04_dist-release-distribution]], [[decisions/05_monaco-editor-adoption]].
