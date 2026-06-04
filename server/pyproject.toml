@@ -1,0 +1,68 @@
+[project]
+name = "eud-agent"
+version = "0.1.0"
+description = "External AI agent for EUD Editor 3 (local FastAPI server: RAG -> codex -> apply)"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "fastapi>=0.115,<1",
+    "uvicorn==0.49.0",
+    "chromadb==1.5.9",
+    "sentence-transformers==5.5.1",
+    "transformers==5.10.1",
+    "torch==2.12.0",
+    "numpy==2.4.6",
+]
+
+[dependency-groups]
+dev = [
+    "ruff",
+    "pytest",
+    "pytest-asyncio",
+]
+
+# torch must come from the CUDA cu126 wheel index on this machine (CUDA present);
+# plain PyPI torch is CPU-only and the cu124 index lacks a compatible 2.12.0 build
+# (tech-stack.md). uv resolves torch from the named index below.
+#
+# CPU fallback (machines without CUDA): point the torch source at the cpu index
+# instead, i.e. replace the `index = "pytorch-cu126"` line under
+# [tool.uv.sources] with `index = "pytorch-cpu"` and uncomment the cpu index
+# block — torch then resolves to 2.12.0+cpu (run with reduced seq/batch).
+[tool.uv.sources]
+torch = { index = "pytorch-cu126" }
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
+
+# CPU fallback index (uncomment + switch [tool.uv.sources].torch to use it):
+# [[tool.uv.index]]
+# name = "pytorch-cpu"
+# url = "https://download.pytorch.org/whl/cpu"
+# explicit = true
+
+[tool.ruff]
+# runner_legacy.py is a frozen verified reference (import-then-extend rule);
+# never reformatted or linted.
+extend-exclude = ["eud_agent/runner_legacy.py"]
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "UP", "B"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+# server/ on sys.path so `import eud_agent` works during test collection.
+pythonpath = ["."]
+
+# The package is installed (editable) into server/.venv so `python -m eud_agent`
+# resolves regardless of cwd (verify.md runs it from the repo root). runner_legacy
+# ships as a frozen reference module; everything else under eud_agent/ is the app.
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["eud_agent"]

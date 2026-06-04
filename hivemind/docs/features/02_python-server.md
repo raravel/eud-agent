@@ -70,3 +70,4 @@ Headless retention of the verified runner: `--once/--mock/--no-context`, jobs qu
 - `server/tests/` — pytest suite (fake bridge dir, mock codex, stubbed model)
 - external: ECA `chromadb_bge` (read-only path), HF cache bge-m3 weights, codex `.cmd` shim, optional `@eps-server/server`
 - [BOUND 2026-06-04 from EUD-008-cddc] `server/eud_agent/runner_legacy.py` — verified ECA codex-runner draft imported unchanged as a read-only reference; its logic is absorbed into runner_cli.py later
+- [BOUND 2026-06-04 from EUD-009-6aed] `server/eud_agent/__init__.py` — package marker (empty); enables editable install so python -m eud_agent resolves from repo root
