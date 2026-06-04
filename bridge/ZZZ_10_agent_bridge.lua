@@ -34,6 +34,8 @@ local ok, initErr = pcall(function()
     local WMenus     = luanet.import_type("EUD_Editor_3.WindowMenu.WindowMenus")
     local DispatcherTimer = luanet.import_type("System.Windows.Threading.DispatcherTimer")
     local TimeSpan   = luanet.import_type("System.TimeSpan")
+    local Process    = luanet.import_type("System.Diagnostics.Process")
+    local ProcessStartInfo = luanet.import_type("System.Diagnostics.ProcessStartInfo")
 
     local baseDir   = tostring(AppDomain.CurrentDomain.BaseDirectory)
     local agentDir  = baseDir .. "Data\\agent\\"
@@ -71,6 +73,140 @@ local ok, initErr = pcall(function()
         local found = nil
         walk(pj.TEData.PFIles, "", function(p, f) if p == path then found = f end end)
         return found
+    end
+
+    -- ------------------------------------------------------------------
+    -- Server lifecycle: agent.cfg -> spawn python server -> ready/respawn.
+    -- KopiLua has no JSON lib; the cfg/ready files are flat JSON parsed with
+    -- string.match. agent.cfg paths are JSON-escaped (\\), so unescape "\\".
+    -- ------------------------------------------------------------------
+    local cfgPath   = agentDir .. "agent.cfg"
+    local readyPath = agentDir .. "server.ready"
+    local errLogPath = agentDir .. "bridge_error.log"
+    local function nowIso() return tostring(DateTime.Now:ToString("o")) end
+    local function logError(msg)
+        pcall(function()
+            Directory.CreateDirectory(agentDir)
+            File.AppendAllText(errLogPath, nowIso() .. "  " .. tostring(msg) .. "\r\n")
+        end)
+    end
+    -- unescape JSON string body (\\ -> \, \/ -> /) for cfg path values
+    local function jsonUnescape(s)
+        s = string.gsub(s, "\\\\", "\\")
+        s = string.gsub(s, "\\/", "/")
+        return s
+    end
+    local function matchNum(txt, key)
+        -- "key": value  (numeric value, e.g. port)
+        return string.match(txt, '"' .. key .. '"%s*:%s*(%d+)')
+    end
+    local function matchTok(txt, key)
+        -- "key": "value"  (string value, e.g. token from server.ready)
+        local v = string.match(txt, '"' .. key .. '"%s*:%s*"([^"]*)"')
+        if v ~= nil then return jsonUnescape(v) end
+        return nil
+    end
+
+    -- bridge start time: server.ready must be newer than this to be ours.
+    local bridgeStart = DateTime.Now
+
+    -- cfg state (nil when missing/unparseable -> degrade, no spawn)
+    local cfgPythonExe, cfgRepoRoot, cfgPort = nil, nil, nil
+    local cfgOk = false
+    do
+        local okCfg, cfgErr = pcall(function()
+            if not File.Exists(cfgPath) then error("agent.cfg not found: " .. cfgPath) end
+            local txt = safestr(File.ReadAllText(cfgPath))
+            -- flat JSON, 3 keys, plain string.match (no JSON lib in KopiLua)
+            local pe = string.match(txt, '"python_exe"%s*:%s*"([^"]*)"')
+            local rr = string.match(txt, '"repo_root"%s*:%s*"([^"]*)"')
+            cfgPort  = string.match(txt, '"port"%s*:%s*(%d+)')
+            if pe ~= nil then cfgPythonExe = jsonUnescape(pe) end
+            if rr ~= nil then cfgRepoRoot  = jsonUnescape(rr) end
+            if cfgPythonExe == nil or cfgRepoRoot == nil then
+                error("agent.cfg missing python_exe/repo_root")
+            end
+        end)
+        if okCfg then cfgOk = true
+        else logError("agent.cfg unusable; server spawn skipped: " .. tostring(cfgErr)) end
+    end
+
+    -- agentProc: GLOBAL (no `local`) on purpose -- GC guard for the owned handle
+    -- and the only safe pid/HasExited source (the owned handle never throws on a
+    -- dead pid, unlike resolving a pid back into a Process by id).
+    agentProc = nil
+    local lastSpawn = nil
+    local agentReady = false
+    -- WebView2 task consumption surface: PLAIN LUA GLOBALS (no `local`), same
+    -- idiom as agentProc. NEVER stash on the GlobalObj static-type proxy --
+    -- writing non-member fields there is build-dependent (throw vs no-op).
+    agentSrvReady = false
+    agentSrvPort  = nil
+    agentSrvToken = nil
+
+    local function spawnServer()
+        if not cfgOk then return end
+        local okSpawn, spawnErr = pcall(function()
+            -- a stale ready from a previous run must not validate the new proc
+            if File.Exists(readyPath) then File.Delete(readyPath) end
+            local psi = ProcessStartInfo()
+            psi.FileName = cfgPythonExe
+            psi.Arguments = "-m eud_agent"
+            psi.UseShellExecute = false
+            psi.CreateNoWindow = true
+            psi.WorkingDirectory = cfgRepoRoot .. "\\server"
+            agentProc = Process.Start(psi)
+            -- reset both latches so consumers never read a stale ready/port/token
+            -- between server death and the next validation.
+            agentReady = false
+            agentSrvReady = false
+        end)
+        lastSpawn = DateTime.Now
+        if not okSpawn then logError("server spawn failed: " .. tostring(spawnErr)) end
+    end
+
+    -- per-Tick: validate server.ready (owned pid + write time after start).
+    local function validateReady()
+        if agentProc == nil then return end
+        if agentReady then return end
+        if not File.Exists(readyPath) then return end
+        local okV = pcall(function()
+            local txt = safestr(File.ReadAllText(readyPath))
+            local pidStr = string.match(txt, '"pid"%s*:%s*(%d+)')
+            local ownPid = tostring(agentProc.Id)
+            if pidStr ~= nil and pidStr == ownPid then
+                -- write time must be after the bridge started (not a stale file)
+                local wt = File.GetLastWriteTime(readyPath)
+                if DateTime.Compare(wt, bridgeStart) > 0 then
+                    -- expose port+token FIRST, then flip the ready global, then
+                    -- the local latch -- so a consumer that sees agentSrvReady
+                    -- always finds port+token already populated.
+                    agentSrvPort  = matchNum(txt, "port")
+                    agentSrvToken = matchTok(txt, "token")
+                    agentSrvReady = true
+                    agentReady = true
+                end
+            else
+                -- stale ready (pid mismatch from a crash): drop it, respawn recovers
+                File.Delete(readyPath)
+            end
+        end)
+        if not okV then logError("server.ready validation error") end
+    end
+
+    -- per-Tick: respawn an exited server (throttled to once per 30s).
+    local function maybeRespawn()
+        if not cfgOk then return end
+        if agentProc == nil then return end
+        if GlobalObj.pjData == nil then return end
+        local exited = false
+        pcall(function() exited = agentProc.HasExited end) -- safe on an owned handle
+        if not exited then return end
+        if lastSpawn ~= nil then
+            local elapsed = DateTime.Now:Subtract(lastSpawn).TotalSeconds
+            if elapsed < 30 then return end
+        end
+        spawnServer()
     end
 
     -- 데이터 에디터: datname → enum(GetDatFileE). None(255) 차단(아니면 KeyNotFound).
@@ -302,8 +438,14 @@ local ok, initErr = pcall(function()
     timer.Interval = TimeSpan.FromSeconds(1)
     timer.Tick:Add(function(sender, args)
         local okTick, tickErr = pcall(function()
+            -- heartbeat: ALWAYS first, unconditional, before the build early-return
+            -- (rules.md hard rule; the server self-terminates on >60s staleness).
+            pcall(function() File.WriteAllText(agentDir .. "heartbeat.txt", nowIso()) end)
             local pg = GlobalObj.pgData
             if pg ~= nil and pg.IsCompilng then return end
+            -- server lifecycle (skipped during builds with the rest of the work)
+            validateReady()
+            maybeRespawn()
             local pj = GlobalObj.pjData
             File.WriteAllText(agentDir .. "status.txt",
                 "time=" .. tostring(DateTime.Now)
@@ -333,7 +475,9 @@ local ok, initErr = pcall(function()
         end
     end)
     timer:Start()
-    File.WriteAllText(agentDir .. "bridge_loaded.txt", "agent bridge v5 loaded at " .. tostring(DateTime.Now))
+    -- spawn the python server once at init (no-op + logged when cfg is unusable)
+    spawnServer()
+    File.WriteAllText(agentDir .. "bridge_loaded.txt", "agent bridge v7 loaded at " .. tostring(DateTime.Now))
 end)
 
 if not ok then error("agent bridge init failed: " .. tostring(initErr)) end
