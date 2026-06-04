@@ -38,15 +38,15 @@
       "scope": []
     },
     "EUD-004-16b7": {
-      "status": "pending",
+      "status": "done",
       "priority": "high",
       "type": "story",
       "parent": "EUD-001-584c",
       "depends_on": [],
       "title": "Python server",
       "updated": "2026-06-04",
-      "completed_at": null,
-      "path": "active/EUD-004-16b7.md",
+      "completed_at": "2026-06-04T22:37:36.222071",
+      "path": "done/EUD-004-16b7.md",
       "scope": []
     },
     "EUD-005-9d32": {
@@ -297,7 +297,7 @@
       ]
     },
     "EUD-019-58af": {
-      "status": "in_progress",
+      "status": "done",
       "priority": "low",
       "type": "task",
       "parent": "EUD-004-16b7",
@@ -306,8 +306,8 @@
       ],
       "title": "Server: lsp_gate advisory diagnostics (epscript-lsp)",
       "updated": "2026-06-04",
-      "completed_at": null,
-      "path": "active/EUD-019-58af.md",
+      "completed_at": "2026-06-04T22:37:36.178056",
+      "path": "done/EUD-019-58af.md",
       "scope": [
         "server/eud_agent/lsp_gate.py",
         "server/tests/test_lsp_gate.py",

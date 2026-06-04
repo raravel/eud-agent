@@ -210,6 +210,12 @@ def patch_rag(monkeypatch, *, results=None, error=None):
 
 async def test_instruct_happy_with_context_set_target(monkeypatch, rag_results):
     rag_calls = patch_rag(monkeypatch, results=rag_results)
+    # Neutralize epscript-lsp resolution so this orchestrator unit test never
+    # spawns a real LSP (and the diagnostics assertion below is deterministic)
+    # on machines where @eps-server/server happens to be installed. lsp_gate now
+    # exists (EUD-019); its no-resolution path returns [].
+    from eud_agent import lsp_gate
+    monkeypatch.setattr(lsp_gate, "_resolve_lsp", lambda: None)
     bridge = FakeBridge(current="x = 0;\n")
     codex = FakeCodex(code="x = 1;\n")
     rec = Recorder()
@@ -221,14 +227,19 @@ async def test_instruct_happy_with_context_set_target(monkeypatch, rag_results):
     assert len(rag_calls) == 1
     assert rag_calls[0]["rag_db"] == "C:\\fake\\rag"
 
-    # Progress stages in order: rag -> codex -> lsp (skipped, module absent).
+    # Progress stages in order: rag -> codex -> lsp (advisory).
     stages = rec.stages()
     assert stages[:3] == ["rag", "codex", "lsp"]
 
-    # The lsp progress notes it was skipped (lsp_gate.py does not exist yet).
+    # An lsp progress event is emitted. (Before lsp_gate.py existed the lazy
+    # import failed and this carried detail="skipped"; now the module IS present
+    # and degrades by RETURNING [] when epscript-lsp is unresolved, so the
+    # orchestrator emits a bare progress {stage:"lsp"} — see EUD-019 lsp_gate.
+    # The stable, machine-independent contract is: the stage runs and the
+    # diagnostics list below is the observable result.)
     lsp_ev = [e for e in rec.events
               if e.get("type") == "progress" and e.get("stage") == "lsp"][0]
-    assert lsp_ev.get("detail") == "skipped"
+    assert lsp_ev["stage"] == "lsp"
 
     # Terminal code event: the generated code, lang eps, a real diff, empty diags.
     code_ev = rec.first("code")
