@@ -100,6 +100,21 @@ def _tick_region(text: str) -> str:
     return text[start.start(): start.start() + end.start()]
 
 
+def _validate_ready_body(text: str) -> str:
+    """Source body of the ``validateReady`` local function.
+
+    From ``local function validateReady()`` to the next ``local function``
+    declaration (``maybeRespawn``) -- the span that owns the server.ready
+    ownership check (pid/ppid compare + the stale-drop ``File.Delete``).
+    """
+    start = re.search(r"local\s+function\s+validateReady\s*\(", text)
+    assert start, "no `local function validateReady(` definition found"
+    rest = text[start.end():]
+    end = re.search(r"local\s+function\s+\w+\s*\(", rest)
+    assert end, "no following `local function` to bound validateReady"
+    return text[start.start(): start.end() + end.start()]
+
+
 # --------------------------------------------------------------------------
 # baseline
 # --------------------------------------------------------------------------
@@ -280,6 +295,95 @@ def test_never_getprocessbyid():
     assert "GetProcessById" not in text, (
         "GetProcessById is forbidden (uncatchable for dead pids); use the owned "
         "handle's HasExited / pid string-compare instead"
+    )
+
+
+# --------------------------------------------------------------------------
+# 4b. ppid ownership acceptance (EUD-037-897c)
+# --------------------------------------------------------------------------
+# The bridge spawns the server through the venv launcher
+# (server\.venv\Scripts\python.exe), which on Windows re-execs the base
+# interpreter as a CHILD process. The bridge owns the LAUNCHER pid; the server
+# writes its OWN (child) pid into server.ready and now also its parent pid
+# (ppid == launcher). validateReady() must accept ownership when ownPid matches
+# EITHER the ready pid OR the ready ppid, and delete server.ready ONLY when
+# NEITHER matches -- otherwise the launcher-vs-child pid mismatch takes the
+# stale branch, server.ready is deleted, agentSrvReady never flips, and the
+# panel never navigates (the live E2E failure on 2026-06-04).
+
+
+def test_validate_ready_extracts_ppid_from_ready_json():
+    """validateReady() string-matches a ``"ppid"`` value out of the ready JSON.
+
+    Bound to the validateReady body (not a stray substring elsewhere): a
+    ``string.match`` on the ready text whose key literal is ``"ppid"``. The
+    existing ``'"pid"%s*:%s*(%d+)'`` pattern can NEVER match inside ``"ppid"``
+    (its leading quote would have to precede the ``pid`` run, but ``"ppid"``
+    puts a ``p`` there) -- so the ppid is a SEPARATE value that needs its own
+    explicit ``"ppid"``-keyed capture inside a ``string.match`` call.
+    """
+    body = _validate_ready_body(_read_text())
+    assert "ppid" in body, (
+        "validateReady() does not reference a ppid (the bridge owns the venv "
+        "LAUNCHER pid; the ready ppid is the only field that matches it)"
+    )
+    assert re.search(r'string\.match\s*\([^)]*"ppid"', body), (
+        "validateReady() must string-match a `\"ppid\"`-keyed value out of the "
+        "ready JSON (a distinct capture -- the `\"pid\"` pattern cannot reach "
+        "the ppid field, so a second `\"ppid\"`-keyed match is required)"
+    )
+
+
+def test_validate_ready_or_matches_pid_or_ppid_against_own_pid():
+    """Ownership accepts when ownPid matches EITHER the ready pid OR the ready ppid.
+
+    The current pid-only body has a single ``== ownPid`` comparison; the fix
+    adds a second (the ppid var) joined by an ``or``. Require BOTH: two distinct
+    ``== ownPid`` comparisons in the validateReady body AND an ``or`` operator
+    combining the ownership condition. The pid-only body has exactly one
+    ``== ownPid`` and no ownership ``or``, so this fails today.
+    """
+    body = _validate_ready_body(_read_text())
+    own_pid_cmps = re.findall(r"==\s*ownPid\b", body)
+    assert len(own_pid_cmps) >= 2, (
+        "validateReady() must compare ownPid against BOTH the ready pid AND the "
+        "ready ppid (the bridge spawns via the venv launcher: ownPid == ready "
+        f"ppid, not ready pid); found {len(own_pid_cmps)} `== ownPid` compare(s)"
+    )
+    # An `or` joining the two ownership comparisons (accept on either match).
+    assert re.search(r"==\s*ownPid\b[^\n]*\bor\b|\bor\b[^\n]*==\s*ownPid\b", body), (
+        "the pid/ppid ownership comparisons must be joined by `or` (accept when "
+        "ownPid matches EITHER the ready pid OR the ready ppid)"
+    )
+
+
+def test_validate_ready_deletes_only_when_neither_pid_nor_ppid_matches():
+    """server.ready is dropped ONLY when NEITHER pid NOR ppid matches ownPid.
+
+    The stale-drop ``File.Delete(readyPath)`` must be reached only after both
+    the pid AND the ppid comparison fail -- i.e. it sits AFTER both
+    ``== ownPid`` comparisons in the validateReady body (it is the else of the
+    or-combined accept condition). The pid-only body deletes whenever the sole
+    pid compare fails, which wrongly drops a ready owned by the launcher's child.
+    """
+    body = _validate_ready_body(_read_text())
+    delete = re.search(r"File\.Delete\s*\(\s*readyPath\s*\)", body)
+    assert delete, (
+        "validateReady() must keep the stale-drop File.Delete(readyPath) (the "
+        "neither-matches branch); none found in the validateReady body"
+    )
+    own_pid_cmps = list(re.finditer(r"==\s*ownPid\b", body))
+    assert len(own_pid_cmps) >= 2, (
+        "expected two `== ownPid` comparisons (pid AND ppid) before the "
+        f"stale-drop delete; found {len(own_pid_cmps)}"
+    )
+    # The delete must follow BOTH ownership comparisons (it is the else of the
+    # or-combined accept condition -- only when NEITHER pid nor ppid matched).
+    assert delete.start() > own_pid_cmps[1].start(), (
+        "File.Delete(readyPath) must be reached only when NEITHER the pid NOR "
+        "the ppid matches ownPid (it must follow both `== ownPid` comparisons); "
+        "the pid-only body deletes on the sole pid mismatch, dropping a ready "
+        "legitimately owned by the launcher's child process"
     )
 
 

@@ -117,7 +117,9 @@ def wait_for_socket_then_write_ready(
     rules.md: ``server.ready`` is written only AFTER confirming the socket
     accepts connections (the panel availability contract). Returns True when the
     file was written, False on timeout / stop. The write is atomic and carries
-    ``{port, pid, token, started_at}``.
+    ``{port, pid, ppid, token, started_at}`` (``ppid`` lets the bridge accept
+    ownership when it spawned the server through the venv launcher, which
+    re-execs the base interpreter as a child -- the bridge owns the launcher pid).
     """
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -135,6 +137,7 @@ def wait_for_socket_then_write_ready(
             {
                 "port": port,
                 "pid": os.getpid(),
+                "ppid": os.getppid(),
                 "token": token,
                 "started_at": datetime.now(UTC).isoformat(),
             },

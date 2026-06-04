@@ -184,9 +184,18 @@ local ok, initErr = pcall(function()
         if not File.Exists(readyPath) then return end
         local okV = pcall(function()
             local txt = safestr(File.ReadAllText(readyPath))
-            local pidStr = string.match(txt, '"pid"%s*:%s*(%d+)')
+            -- The venv launcher (server\.venv\Scripts\python.exe) re-execs the
+            -- base interpreter as a CHILD: the bridge owns the LAUNCHER pid, but
+            -- server.ready carries the child pid (server os.getpid). The server
+            -- also writes ppid (the launcher), so accept ownership on EITHER.
+            -- '"pid"' cannot match inside '"ppid"' (the leading quote precedes a
+            -- 'p', not the 'pid' run), so the pid extraction is order-independent
+            -- without anchoring; ppid uses its own distinct anchored pattern.
+            local pidStr  = string.match(txt, '"pid"%s*:%s*(%d+)')
+            local ppidStr = string.match(txt, '"ppid"%s*:%s*(%d+)')
             local ownPid = tostring(agentProc.Id)
-            if pidStr ~= nil and pidStr == ownPid then
+            if (pidStr ~= nil and pidStr == ownPid)
+                or (ppidStr ~= nil and ppidStr == ownPid) then
                 -- write time must be after the bridge started (not a stale file)
                 local wt = File.GetLastWriteTime(readyPath)
                 if DateTime.Compare(wt, bridgeStart) > 0 then
@@ -199,7 +208,8 @@ local ok, initErr = pcall(function()
                     agentReady = true
                 end
             else
-                -- stale ready (pid mismatch from a crash): drop it, respawn recovers
+                -- stale ready (neither pid nor ppid matches -- crash leftover):
+                -- drop it, respawn recovers
                 File.Delete(readyPath)
             end
         end)

@@ -19,7 +19,7 @@ Walk `pj.TEData.PFIles` with the existing `walk()` helper; return one line per f
 
 ## Server lifecycle
 
-At init: read `agent.cfg` via `File.ReadAllText` (JSON parsed with simple string matching in Lua — only 3 flat keys; no JSON lib in KopiLua); delete any pre-existing `server.ready`; spawn `"<python_exe>" -m eud_agent` with `ProcessStartInfo` (`UseShellExecute=false`, `CreateNoWindow=true`, `WorkingDirectory=<repo_root>\server`), keep the Process object in a global (GC guard + pid source). Per Tick: if `server.ready` exists, validate `pid` equals the spawned process Id (string compare on the JSON value; never `Process.GetProcessById` — throws uncatchable .NET exception for dead pids) and file write time is after bridge start; on first valid ready, mark navigable. If the spawned process has exited (`proc.HasExited` is safe on an owned handle) and a project is open, respawn (max once per 30s).
+At init: read `agent.cfg` via `File.ReadAllText` (JSON parsed with simple string matching in Lua — only 3 flat keys; no JSON lib in KopiLua); delete any pre-existing `server.ready`; spawn `"<python_exe>" -m eud_agent --data-dir "<Data\agent path>"` with `ProcessStartInfo` (`UseShellExecute=false`, `CreateNoWindow=true`, `WorkingDirectory=<repo_root>\server`; the trailing backslash is stripped from the quoted path so the closing quote is not escaped — EUD-036), keep the Process object in a global (GC guard + pid source). Per Tick: if `server.ready` exists, validate the spawned process Id matches the ready `pid` OR `ppid` (string compare on the JSON values; never `Process.GetProcessById` — throws uncatchable .NET exception for dead pids; the ppid acceptance exists because the venv launcher re-execs the interpreter as a child, so the bridge holds the launcher pid while the server writes its own child pid — EUD-037) and file write time is after bridge start; on first valid ready, mark navigable. If the spawned process has exited (`proc.HasExited` is safe on an owned handle) and a project is open, respawn (max once per 30s).
 
 ## WebView2 panel
 
@@ -34,7 +34,7 @@ Replaces the v6 WPF 4-button panel (delete `showPanel` WPF body; `PANEL` command
 
 - agent.cfg missing/unparseable: write `bridge_error.log` entry, skip server spawn, still serve file IPC commands (bridge degrades to v6 behavior).
 - Server exits immediately (bad venv): respawn throttle (30s) prevents a spawn loop; error logged.
-- Ready file present but pid mismatch (stale from crash): delete it, respawn.
+- Ready file present but neither pid nor ppid matches the spawned Id (stale from crash): delete it, respawn.
 - Build running: heartbeat still written; inbox processing skipped (existing v6 guard).
 
 ## Implementation

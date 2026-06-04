@@ -17,7 +17,7 @@ graph TD
     LSP["epscript-lsp (node, optional)"]
 
     Bridge -- "spawns (luanet Process, CreateNoWindow)" --> Server
-    Server -. "server.ready (port,pid,token)" .-> Bridge
+    Server -. "server.ready (port,pid,ppid,token)" .-> Bridge
     Bridge -- "Navigate http://127.0.0.1:PORT/?token=..." --> WV
     WV --- Panel
     Panel <-- "WebSocket /ws?token=..." --> Server
@@ -62,8 +62,8 @@ flowchart TD
     A[Editor starts, DoFile bridge lua] --> B[Bridge reads Data agent agent.cfg<br/>absolute paths: python.exe, repo root, port]
     B --> C[Delete stale server.ready]
     C --> D[Spawn python -m eud_agent<br/>luanet Process, CreateNoWindow=true]
-    D --> E[Server binds 127.0.0.1, confirms own socket accepts,<br/>writes server.ready with port pid token started_at]
-    E --> F[Bridge Tick: validate ready<br/>mtime newer than bridge start AND pid equals spawned Id]
+    D --> E[Server binds 127.0.0.1, confirms own socket accepts,<br/>writes server.ready with port pid ppid token started_at]
+    E --> F[Bridge Tick: validate ready<br/>mtime newer than bridge start AND pid or ppid equals spawned Id]
     F --> G[Create WebView2 with explicit UDF Data agent webview2<br/>Navigate to http://127.0.0.1:port/?token=...]
     G --> H{NavigationCompleted IsSuccess?}
     H -- no --> G2[re-Navigate next Tick, 3s backoff] --> H
@@ -71,7 +71,7 @@ flowchart TD
 ```
 
 - **agent.cfg** (written by `scripts/install_dropin.ps1` into the editor's `Data\agent\`): JSON `{"python_exe": "<abs path>", "repo_root": "<abs path>", "port": 8765}`. The drop-in lua cannot know repo/venv locations any other way.
-- **server.ready** (written by the server only after a background thread confirms the socket accepts connections): JSON `{"port": <int>, "pid": <int>, "token": "<uuid>", "started_at": "<ISO8601>"}`. Atomic write (temp file + rename). Deleted on graceful shutdown; the bridge also deletes any pre-existing file at init.
+- **server.ready** (written by the server only after a background thread confirms the socket accepts connections): JSON `{"port": <int>, "pid": <int>, "ppid": <int>, "token": "<uuid>", "started_at": "<ISO8601>"}`. Atomic write (temp file + rename). Deleted on graceful shutdown; the bridge also deletes any pre-existing file at init. `ppid` exists because the venv launcher (`server\.venv\Scripts\python.exe`) re-execs the base interpreter as a child: the bridge holds the LAUNCHER pid, so ownership validation accepts when the spawned Id matches `pid` OR `ppid` (EUD-037, found live in the editor E2E).
 - **Port policy**: bind the configured port (default 8765); if taken, bind port 0 (OS-assigned ephemeral). `server.ready` is the single source of truth for the actual port.
 - **Heartbeat / server shutdown**: the bridge writes `Data\agent\heartbeat.txt` (ISO timestamp) on **every** Tick, unconditionally, before the `IsCompilng` early-return. The server checks it every 15s and self-terminates after 60s staleness. This is the only shutdown path; the editor never kills the server.
 - **Re-arm**: the editor closes auxiliary windows on project create/switch (verified trap). The bridge tracks the panel window handle and recreates the WebView2 window every Tick while "project open AND window not alive" (never rely on pjData==nil rearm alone). The Python server stays up across recreations.

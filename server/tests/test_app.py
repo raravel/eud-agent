@@ -296,6 +296,14 @@ def test_server_ready_written_after_socket_accepts(tmp_path):
         ready = _read_ready(ready_path)
         assert set(ready) >= {"port", "pid", "token", "started_at"}
         assert ready["token"] == "ready-tok"
+        # EUD-037: the bridge spawns the server through the venv launcher, which
+        # re-execs the base interpreter as a CHILD. The bridge owns the LAUNCHER
+        # pid, so ownership validation must be able to match the ready PPID too.
+        # The writer runs in THIS process (uvicorn-in-thread), so the advertised
+        # ppid is os.getppid() as seen here.
+        import os
+
+        assert ready["ppid"] == os.getppid()
         # server.ready is the single source of truth for the actual (resolved)
         # port — it must equal the OS-assigned port we pre-bound.
         assert ready["port"] == port

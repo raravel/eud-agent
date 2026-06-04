@@ -49,7 +49,7 @@ Async state machine per instruct request: `rag (optional) -> codex -> lsp -> dif
 ## app.py / __main__.py
 
 - FastAPI: `GET /` -> `panel/dist/index.html`, static mount for the built assets -> `panel/dist/` (the server serves ONLY built output, never `panel/src`), `GET /healthz`, `WS /ws` (token query param + Origin check at accept; close 4403 otherwise). Missing `panel/dist/` (not built yet) -> `GET /` returns a clear 503 message "panel not built — run npm run build in panel/"; selfcheck reports it as the panel prerequisite failure.
-- Startup: bind `127.0.0.1` on cfg port (fall back to port 0); background thread connects to its own socket until accept succeeds, then atomically writes `server.ready {port, pid, token, started_at}`; starts RAG warmup thread and the heartbeat watcher (check every 15s; `heartbeat.txt` older than 60s -> graceful shutdown, delete `server.ready`).
+- Startup: bind `127.0.0.1` on cfg port (fall back to port 0); background thread connects to its own socket until accept succeeds, then atomically writes `server.ready {port, pid, ppid, token, started_at}` (`ppid` = the venv launcher the bridge spawned; ownership matches pid OR ppid — EUD-037); starts RAG warmup thread and the heartbeat watcher (check every 15s; `heartbeat.txt` older than 60s -> graceful shutdown, delete `server.ready`).
 - `python -m eud_agent` runs the server; `--selfcheck` runs config validation and exits.
 
 ## runner_cli.py
