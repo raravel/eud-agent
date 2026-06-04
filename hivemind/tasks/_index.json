@@ -256,7 +256,7 @@
       ]
     },
     "EUD-017-e827": {
-      "status": "pending",
+      "status": "done",
       "priority": "high",
       "type": "task",
       "parent": "EUD-004-16b7",
@@ -265,11 +265,11 @@
       ],
       "title": "Server: rag module (in-process bge-m3)",
       "updated": "2026-06-04",
-      "completed_at": null,
-      "path": "active/EUD-017-e827.md",
+      "completed_at": "2026-06-04T19:48:14.188163",
+      "path": "done/EUD-017-e827.md",
       "scope": [
         "server/eud_agent/rag.py",
-        "server/tests/**"
+        "server/tests/test_rag.py"
       ]
     },
     "EUD-018-bafb": {
@@ -479,7 +479,7 @@
       ]
     },
     "EUD-031-01ec": {
-      "status": "pending",
+      "status": "in_progress",
       "priority": "high",
       "type": "task",
       "parent": "EUD-026-4c16",
