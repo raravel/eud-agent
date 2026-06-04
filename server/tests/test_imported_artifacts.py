@@ -91,7 +91,7 @@ def _assert_identical(dest: Path, src: Path) -> None:
     )
 
 
-def _bridge_branch_re(name: str) -> "re.Pattern[str]":
+def _bridge_branch_re(name: str) -> re.Pattern[str]:
     """Match a dispatcher branch comparing ``cmd`` to a command name."""
     return re.compile(r'cmd\s*==\s*"' + re.escape(name) + r'"')
 
