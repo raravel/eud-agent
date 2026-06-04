@@ -221,7 +221,7 @@
       ]
     },
     "EUD-015-c726": {
-      "status": "in_progress",
+      "status": "done",
       "priority": "high",
       "type": "task",
       "parent": "EUD-004-16b7",
@@ -230,8 +230,8 @@
       ],
       "title": "Server: bridge_io module",
       "updated": "2026-06-04",
-      "completed_at": null,
-      "path": "active/EUD-015-c726.md",
+      "completed_at": "2026-06-04T19:12:24.772484",
+      "path": "done/EUD-015-c726.md",
       "scope": [
         "server/eud_agent/bridge_io.py",
         "server/tests/test_bridge_io.py"
