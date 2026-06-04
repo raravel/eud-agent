@@ -1,17 +1,26 @@
 """Verification artifact for EUD-008-cddc: imported verified artifacts.
 
-Validates that the verified external artifacts have been imported UNCHANGED
+Validates that the verified external artifacts have been imported
 (import-then-extend rule, hivemind/docs/rules.md "Editor integrity") into
 this repo:
 
-  - bridge/ZZZ_10_agent_bridge.lua          (v6 bridge, 16,115 bytes)
+  - bridge/ZZZ_10_agent_bridge.lua          (v6 bridge, now extended)
   - vendor/webview2/*.dll                    (WebView2 SDK 1.0.3800.47, 3 DLLs)
   - server/eud_agent/runner_legacy.py        (legacy runner draft, 7,336 bytes)
 
-Sizes are the ground truth from hivemind/docs/tech-stack.md "Build Artifacts"
-and "Legacy / Vendored". When a source path still exists on this machine the
-import is additionally checked for byte-identity (filecmp.cmp shallow=False);
-on a machine where the source is absent only the size check runs.
+DLL and runner_legacy sizes are the ground truth from
+hivemind/docs/tech-stack.md "Build Artifacts" and "Legacy / Vendored"; they
+remain pure vendored/reference copies and are still checked for exact size and,
+when the source path exists on this machine, byte-identity.
+
+The bridge byte-identity / exact-size checks were dropped at EUD-011: the
+"import-then-extend" phase began there (the LIST command was added in
+``ZZZ_10_agent_bridge.lua``), so the bridge is intentionally no longer
+byte-identical to its verified v6 source. It is now validated structurally
+instead: the file exists and is non-empty, and every v6 dispatcher command
+marker is still present (a regression guard that the extension did not delete a
+verified v6 code path). Crash-rule / LIST-specific checks live in
+``test_bridge_list_static.py``.
 
 This file is pytest-compatible (plain ``test_*`` functions with asserts)
 AND standalone-runnable with system Python::
@@ -24,21 +33,33 @@ The project venv does not exist yet, so only the stdlib is used.
 from __future__ import annotations
 
 import filecmp
+import re
 import sys
 from pathlib import Path
 
 # repo_root: server/tests/test_imported_artifacts.py -> parents[2] == repo root
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
-# Verified source locations (READ-ONLY; never written/moved/deleted).
-SRC_BRIDGE = Path(
-    r"C:\Users\ifthe\eud-agent-analysis\test-lua\ZZZ_10_agent_bridge.lua"
-)
+# Verified source location for runner_legacy (READ-ONLY; never written/moved).
 SRC_RUNNER = Path(r"C:\Users\ifthe\proj\eud\ECA\eud_agent_runner.py")
 
-# Imported destinations, with expected exact sizes in bytes.
+# Bridge destination (no longer size/byte-identity checked; see module docstring).
 BRIDGE_DEST = REPO_ROOT / "bridge" / "ZZZ_10_agent_bridge.lua"
-BRIDGE_SIZE = 16_115
+
+# v6 dispatcher command markers that must survive import-then-extend. Matched as
+# ``cmd == "<NAME>"`` branches so a stray substring elsewhere cannot satisfy it.
+V6_COMMANDS = (
+    "PING",
+    "STATUS",
+    "DUMP",
+    "GET",
+    "SET",
+    "GETDAT",
+    "SETDAT",
+    "BUILD",
+    "LUA",
+    "PANEL",
+)
 
 RUNNER_DEST = REPO_ROOT / "server" / "eud_agent" / "runner_legacy.py"
 RUNNER_SIZE = 7_336
@@ -70,15 +91,27 @@ def _assert_identical(dest: Path, src: Path) -> None:
     )
 
 
-def test_bridge_lua_exists_with_exact_size():
-    """bridge/ZZZ_10_agent_bridge.lua imported at exactly 16,115 bytes."""
-    _assert_exact_size(BRIDGE_DEST, BRIDGE_SIZE)
+def _bridge_branch_re(name: str) -> "re.Pattern[str]":
+    """Match a dispatcher branch comparing ``cmd`` to a command name."""
+    return re.compile(r'cmd\s*==\s*"' + re.escape(name) + r'"')
 
 
-def test_bridge_lua_byte_identical_to_source():
-    """When the verified v6 source exists, the import is byte-identical."""
+def test_bridge_lua_exists_and_nonempty():
+    """bridge/ZZZ_10_agent_bridge.lua is present and non-empty.
+
+    Byte-identity / exact-size checks ended at EUD-011 (import-then-extend
+    began with the LIST command); see the module docstring.
+    """
     assert BRIDGE_DEST.is_file(), f"missing file: {BRIDGE_DEST}"
-    _assert_identical(BRIDGE_DEST, SRC_BRIDGE)
+    assert BRIDGE_DEST.stat().st_size > 0, f"empty file: {BRIDGE_DEST}"
+
+
+def test_bridge_lua_v6_command_markers_present():
+    """Every v6 dispatcher command survives the extension (regression guard)."""
+    # latin-1 round-trips every byte 1:1 (the source carries Korean mojibake).
+    text = BRIDGE_DEST.read_bytes().decode("latin-1")
+    missing = [c for c in V6_COMMANDS if not _bridge_branch_re(c).search(text)]
+    assert not missing, f"missing v6 command branches: {missing}"
 
 
 def test_webview2_core_dll_exact_size():

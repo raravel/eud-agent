@@ -215,6 +215,15 @@ local ok, initErr = pcall(function()
             return "compiling=" .. (pg == nil and "?" or tostring(pg.IsCompilng))
                 .. "\r\nproject=" .. (pj ~= nil and ("'" .. safestr(pj.Filename) .. "'") or "(none)")
                 .. "\r\nversion=" .. (pg == nil and "?" or tostring(pg.Version))
+        elseif cmd == "LIST" then
+            local pj = GlobalObj.pjData
+            if pj == nil then return "ERROR: no project" end
+            local lines = {}
+            walk(pj.TEData.PFIles, "", function(p, f)
+                local okT, ftype = pcall(function() return f.Filetype end)
+                lines[#lines + 1] = p .. "\t" .. (okT and safestr(ftype) or "?")
+            end)
+            return table.concat(lines, "\r\n")
         elseif cmd == "DUMP" then
             local pj = GlobalObj.pjData
             if pj == nil then return "ERROR: 프로젝트 미로드" end

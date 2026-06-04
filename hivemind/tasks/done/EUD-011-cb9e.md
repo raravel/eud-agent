@@ -1,4 +1,5 @@
 ---
+completed_at: '2026-06-04T18:28:44.417396'
 created: '2026-06-04'
 depends_on:
 - EUD-008-cddc
@@ -9,7 +10,7 @@ scope:
 - bridge/ZZZ_10_agent_bridge.lua
 - server/tests/test_bridge_list_static.py
 - server/tests/test_imported_artifacts.py
-status: in_progress
+status: done
 title: 'Bridge: LIST command (paths + file types)'
 type: task
 updated: '2026-06-04'

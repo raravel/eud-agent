@@ -152,7 +152,7 @@
       ]
     },
     "EUD-011-cb9e": {
-      "status": "in_progress",
+      "status": "done",
       "priority": "high",
       "type": "task",
       "parent": "EUD-003-6e4e",
@@ -161,8 +161,8 @@
       ],
       "title": "Bridge: LIST command (paths + file types)",
       "updated": "2026-06-04",
-      "completed_at": null,
-      "path": "active/EUD-011-cb9e.md",
+      "completed_at": "2026-06-04T18:28:44.417396",
+      "path": "done/EUD-011-cb9e.md",
       "scope": [
         "bridge/ZZZ_10_agent_bridge.lua",
         "server/tests/test_bridge_list_static.py",
