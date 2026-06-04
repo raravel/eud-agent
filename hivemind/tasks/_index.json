@@ -114,7 +114,7 @@
       ]
     },
     "EUD-009-6aed": {
-      "status": "in_progress",
+      "status": "done",
       "priority": "high",
       "type": "task",
       "parent": "EUD-004-16b7",
@@ -123,8 +123,8 @@
       ],
       "title": "Server: pyproject, config, selfcheck entrypoint",
       "updated": "2026-06-04",
-      "completed_at": null,
-      "path": "active/EUD-009-6aed.md",
+      "completed_at": "2026-06-04T18:29:59.139330",
+      "path": "done/EUD-009-6aed.md",
       "scope": [
         "server/pyproject.toml",
         "server/eud_agent/config.py",

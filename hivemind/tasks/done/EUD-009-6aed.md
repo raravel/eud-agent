@@ -1,4 +1,5 @@
 ---
+completed_at: '2026-06-04T18:29:59.139330'
 created: '2026-06-04'
 depends_on:
 - EUD-007-761d
@@ -12,7 +13,7 @@ scope:
 - server/tests/test_config.py
 - server/eud_agent/__init__.py
 - server/uv.lock
-status: in_progress
+status: done
 title: 'Server: pyproject, config, selfcheck entrypoint'
 type: task
 updated: '2026-06-04'
