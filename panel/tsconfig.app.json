@@ -30,5 +30,6 @@
       "@/*": ["./src/*"]
     }
   },
-  "include": ["src", "components"]
+  "include": ["src", "components"],
+  "exclude": ["src/**/*.test.ts"]
 }

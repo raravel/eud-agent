@@ -518,7 +518,7 @@
       ]
     },
     "EUD-033-a00f": {
-      "status": "in_progress",
+      "status": "done",
       "priority": "high",
       "type": "task",
       "parent": "EUD-026-4c16",
@@ -527,8 +527,8 @@
       ],
       "title": "Panel WS protocol client + state machine (typed, reconnect, log cap)",
       "updated": "2026-06-04",
-      "completed_at": null,
-      "path": "active/EUD-033-a00f.md",
+      "completed_at": "2026-06-04T20:25:36.997563",
+      "path": "done/EUD-033-a00f.md",
       "scope": [
         "panel/src/**",
         "panel/package.json",
