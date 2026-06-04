@@ -7,7 +7,9 @@ parent: EUD-003-6e4e
 priority: high
 scope:
 - bridge/ZZZ_10_agent_bridge.lua
-status: pending
+- server/tests/test_bridge_list_static.py
+- server/tests/test_imported_artifacts.py
+status: in_progress
 title: 'Bridge: LIST command (paths + file types)'
 type: task
 updated: '2026-06-04'

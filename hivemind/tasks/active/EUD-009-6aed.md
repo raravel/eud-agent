@@ -9,7 +9,10 @@ scope:
 - server/pyproject.toml
 - server/eud_agent/config.py
 - server/eud_agent/__main__.py
-status: pending
+- server/tests/test_config.py
+- server/eud_agent/__init__.py
+- server/uv.lock
+status: in_progress
 title: 'Server: pyproject, config, selfcheck entrypoint'
 type: task
 updated: '2026-06-04'

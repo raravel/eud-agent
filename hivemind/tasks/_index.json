@@ -50,15 +50,15 @@
       "scope": []
     },
     "EUD-005-9d32": {
-      "status": "pending",
+      "status": "done",
       "priority": "high",
       "type": "story",
       "parent": "EUD-001-584c",
       "depends_on": [],
       "title": "Agent panel UI",
       "updated": "2026-06-04",
-      "completed_at": null,
-      "path": "active/EUD-005-9d32.md",
+      "completed_at": "2026-06-04T18:13:12.027627",
+      "path": "done/EUD-005-9d32.md",
       "scope": []
     },
     "EUD-006-50d8": {
@@ -114,7 +114,7 @@
       ]
     },
     "EUD-009-6aed": {
-      "status": "pending",
+      "status": "in_progress",
       "priority": "high",
       "type": "task",
       "parent": "EUD-004-16b7",
@@ -128,7 +128,10 @@
       "scope": [
         "server/pyproject.toml",
         "server/eud_agent/config.py",
-        "server/eud_agent/__main__.py"
+        "server/eud_agent/__main__.py",
+        "server/tests/test_config.py",
+        "server/eud_agent/__init__.py",
+        "server/uv.lock"
       ]
     },
     "EUD-010-e3af": {
@@ -149,7 +152,7 @@
       ]
     },
     "EUD-011-cb9e": {
-      "status": "pending",
+      "status": "in_progress",
       "priority": "high",
       "type": "task",
       "parent": "EUD-003-6e4e",
@@ -161,7 +164,9 @@
       "completed_at": null,
       "path": "active/EUD-011-cb9e.md",
       "scope": [
-        "bridge/ZZZ_10_agent_bridge.lua"
+        "bridge/ZZZ_10_agent_bridge.lua",
+        "server/tests/test_bridge_list_static.py",
+        "server/tests/test_imported_artifacts.py"
       ]
     },
     "EUD-012-241a": {
@@ -319,7 +324,7 @@
       ]
     },
     "EUD-021-6479": {
-      "status": "in_progress",
+      "status": "done",
       "priority": "high",
       "type": "task",
       "parent": "EUD-005-9d32",
@@ -328,8 +333,8 @@
       ],
       "title": "Panel web UI (chat, picker, preview/diff/edit, apply)",
       "updated": "2026-06-04",
-      "completed_at": null,
-      "path": "active/EUD-021-6479.md",
+      "completed_at": "2026-06-04T18:13:11.986099",
+      "path": "done/EUD-021-6479.md",
       "scope": [
         "panel/**",
         "server/tests/test_panel_static.py"
