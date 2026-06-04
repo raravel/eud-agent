@@ -297,7 +297,7 @@ def test_navigation_retry_backoff_and_navok_flag():
 # 5. Navigate URL from agentSrvPort + agentSrvToken (EUD-013 globals)
 # --------------------------------------------------------------------------
 def test_navigate_url_from_lifecycle_globals():
-    """Navigate builds the URL from agentSrvPort + agentSrvToken (127.0.0.1, ?token=)."""
+    """Navigate builds the URL from agentSrvPort + agentSrvToken (?token=)."""
     text = _read_text()
     assert "Navigate" in text, "no Navigate call (the panel never loads the URL)"
     assert "127.0.0.1" in text, (
