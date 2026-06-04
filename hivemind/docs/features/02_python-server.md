@@ -17,12 +17,12 @@ graph LR
 
 ## config.py
 
-Resolution order: CLI args > env vars > `agent.cfg` (located via `EUD_DATA_DIR` env or the cfg sibling convention) > defaults. Keys: `data_dir` (editor `Data\agent`), `port` (default 8765), `codex_cmd` (default: `shutil.which("codex")` resolution at startup — fail fast if absent), `rag_db` (default `C:\Users\ifthe\proj\eud\ECA\chromadb_bge`), `repo_root`. Generates the session `token` (uuid4). `--selfcheck` mode validates every prerequisite (see verify.md smoke) without loading the model.
+Resolution order: CLI args > env vars > `agent.cfg` (located via `EUD_DATA_DIR` env or the cfg sibling convention) > defaults. Keys: `data_dir` (editor `Data\agent`), `port` (default 8765), `codex_cmd` (default: `shutil.which("codex")` resolution at startup — fail fast if absent), `rag_db` (default `C:\Users\ifthe\proj\eud\ECA\chromadb_bge`), `repo_root`. Generates the session `token` (uuid4). `--selfcheck` mode validates every prerequisite (see verify.md smoke) without loading the model. The panel-files prerequisite checks the BUILT output `panel/dist/index.html` (plus built assets dir) — not the React sources. See [[decisions/03_react-panel-rebuild]].
 
 ## bridge_io.py
 
 - `send(command_text) -> result_text`: write `inbox\srv-<uuid8>.cmd` (UTF-8 no BOM), poll `outbox\srv-<uuid8>.result` (0.2s interval); on read, delete the `.result`. Timeout 10s; while `status.txt` reports `compiling=true` extend to 180s and invoke an `on_busy` callback (orchestrator forwards `waiting_build` to the panel). On timeout: leave the `.cmd`, raise `BridgeBusy`.
-- Helpers: `ping() status() list_files() get(path) set(path, code) neweps(name, code)`. `list_files` parses `path\tEFileType` lines into `{path, ftype, settable}` (settable = ftype in CUI/SCA/RawText).
+- Helpers: `ping() status() list_files() get(path) set(path, code) neweps(name, code)`. `list_files` parses `path\tEFileType` lines into `{path, ftype, settable}` (settable = ftype in CUI/SCA/RawText). An empty (non-`ERROR:`) LIST result means zero files — not a failure (verified bridge behavior, EUD-011).
 - `cleanup_stale()` at startup: delete leftover `srv-*.cmd` / `srv-*.result`.
 
 ## codex_client.py
@@ -48,7 +48,7 @@ Async state machine per instruct request: `rag (optional) -> codex -> lsp -> dif
 
 ## app.py / __main__.py
 
-- FastAPI: `GET /` -> `panel/index.html`, `/static` mount -> `panel/`, `GET /healthz`, `WS /ws` (token query param + Origin check at accept; close 4403 otherwise).
+- FastAPI: `GET /` -> `panel/dist/index.html`, static mount for the built assets -> `panel/dist/` (the server serves ONLY built output, never `panel/src`), `GET /healthz`, `WS /ws` (token query param + Origin check at accept; close 4403 otherwise). Missing `panel/dist/` (not built yet) -> `GET /` returns a clear 503 message "panel not built — run npm run build in panel/"; selfcheck reports it as the panel prerequisite failure.
 - Startup: bind `127.0.0.1` on cfg port (fall back to port 0); background thread connects to its own socket until accept succeeds, then atomically writes `server.ready {port, pid, token, started_at}`; starts RAG warmup thread and the heartbeat watcher (check every 15s; `heartbeat.txt` older than 60s -> graceful shutdown, delete `server.ready`).
 - `python -m eud_agent` runs the server; `--selfcheck` runs config validation and exits.
 
@@ -72,3 +72,4 @@ Headless retention of the verified runner: `--once/--mock/--no-context`, jobs qu
 - [BOUND 2026-06-04 from EUD-008-cddc] `server/eud_agent/runner_legacy.py` — verified ECA codex-runner draft imported unchanged as a read-only reference; its logic is absorbed into runner_cli.py later
 - [BOUND 2026-06-04 from EUD-009-6aed] `server/eud_agent/__init__.py` — package marker (empty); enables editable install so python -m eud_agent resolves from repo root
 - [BOUND 2026-06-04 from EUD-009-6aed] `server/uv.lock` — committed uv lockfile pinning the resolved dependency graph (cu126 torch); .venv itself is gitignored
+- [BOUND 2026-06-04 from EUD-010-e3af] `scripts/setup_env.ps1` — uv sync + venv sanity import + bge-m3 HF-cache warn; -Cpu prints the documented pyproject fallback edit
