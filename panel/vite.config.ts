@@ -14,13 +14,16 @@ export default defineConfig({
   base: "./",
   plugins: [react(), tailwindcss()],
   resolve: {
-    // More specific aliases first: vendored shadcn/ui + AI Elements source
-    // lives at the panel root `components/` (the contract dir), while app code
-    // resolves under `src/`.
+    // Order matters (most specific first). The vendored shadcn/ui + AI Elements
+    // source lives at the panel root `components/{ui,ai-elements}/` (the shadcn
+    // contract dirs); panel-specific components live at `src/components/`
+    // (features/03 ## Implementation). Route ONLY the two vendored subtrees to
+    // the root `components/`; everything else under `@/` (incl.
+    // `@/components/<PanelComponent>`, `@/lib/*`, `@/state/*`) resolves to src/.
     alias: [
       {
-        find: /^@\/components\/(.*)$/,
-        replacement: path.resolve(root, "components") + "/$1",
+        find: /^@\/components\/(ui|ai-elements)\/(.*)$/,
+        replacement: path.resolve(root, "components") + "/$1/$2",
       },
       { find: "@", replacement: path.resolve(root, "src") },
     ],

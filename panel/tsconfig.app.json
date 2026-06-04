@@ -23,13 +23,16 @@
     "noFallthroughCasesInSwitch": true,
     "noUncheckedSideEffectImports": true,
 
-    /* Path alias (shadcn convention) */
+    /* Path alias (shadcn convention). Only the vendored shadcn/ui + AI Elements
+       subtrees live at the root `components/`; panel-specific components live at
+       `src/components/`. More specific patterns first. */
     "baseUrl": ".",
     "paths": {
-      "@/components/*": ["./components/*"],
+      "@/components/ui/*": ["./components/ui/*"],
+      "@/components/ai-elements/*": ["./components/ai-elements/*"],
       "@/*": ["./src/*"]
     }
   },
   "include": ["src", "components"],
-  "exclude": ["src/**/*.test.ts"]
+  "exclude": ["src/**/*.test.ts", "src/**/*.test.tsx", "src/test/**"]
 }

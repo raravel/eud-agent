@@ -538,7 +538,7 @@
       ]
     },
     "EUD-034-4043": {
-      "status": "in_progress",
+      "status": "done",
       "priority": "high",
       "type": "task",
       "parent": "EUD-026-4c16",
@@ -547,13 +547,14 @@
       ],
       "title": "Panel UI feature parity (conversation, picker, review tabs, Monaco edit, apply)",
       "updated": "2026-06-04",
-      "completed_at": null,
-      "path": "active/EUD-034-4043.md",
+      "completed_at": "2026-06-04T21:15:56.997814",
+      "path": "done/EUD-034-4043.md",
       "scope": [
         "panel/src/**",
         "panel/components/**",
         "panel/package.json",
-        "panel/package-lock.json"
+        "panel/package-lock.json",
+        "panel/vitest.config.ts"
       ]
     },
     "EUD-035-2262": {
