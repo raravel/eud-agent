@@ -31,14 +31,7 @@ import { ApplyBar, type ApplyPayload } from "@/components/ApplyBar";
 import { createPanelStore } from "@/state/store";
 import { WsClient } from "@/ws/client";
 import type { ServerMessage } from "@/ws/protocol";
-
-const STAGE_LABELS: Record<string, string> = {
-  rag: "RAG 컨텍스트 검색 중…",
-  rag_warmup: "RAG 모델 준비 중…",
-  codex: "codex 코드 생성 중…",
-  lsp: "진단 검사 중…",
-  waiting_build: "에디터 빌드 완료 대기 중…",
-};
+import { progressLabel } from "@/lib/progress";
 
 export default function App() {
   // Store + client live for the lifetime of the app (created once).
@@ -64,10 +57,12 @@ export default function App() {
         case "list":
           store.applyList({ files: msg.files, error: msg.error });
           break;
-        case "progress":
+        case "progress": {
           store.progressReceived(msg.stage);
-          store.log("progress", STAGE_LABELS[msg.stage] ?? msg.stage, msg.stage);
+          const { kind, text } = progressLabel(msg.stage, msg.detail);
+          store.log(kind, text, msg.stage);
           break;
+        }
         case "code":
           store.codeReceived({
             code: msg.code,

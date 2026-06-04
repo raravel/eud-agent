@@ -87,6 +87,7 @@ stateDiagram-v2
 - `panel/src/ws/protocol.ts` / `client.ts` — typed WS protocol + reconnecting client
 - `panel/src/state/store.ts` — state machine + log cap + gating
 - `panel/src/lib/truncate.ts` / `diff.ts` — preview truncation + diff line classification
+- `panel/src/lib/progress.ts` — pure progress→label mapping (`progressLabel(stage, detail)`); reflects `rag_warmup` detail started/done/error so completion is shown (EUD-041)
 - `panel/src/components/` — Header, ConversationLog, TargetPicker, InstructionBox, ReviewTabs, MonacoEditor (lazy), DiagnosticsStrip, ApplyBar
 - `panel/src/editor/monaco.ts` — local-bundle Monaco loader config + workers
 - `panel/components/ui/` — vendored shadcn/ui source
