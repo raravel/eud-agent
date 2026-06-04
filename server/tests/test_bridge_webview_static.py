@@ -242,6 +242,54 @@ def test_creation_properties_set():
     )
 
 
+def test_creation_properties_imported_from_wpf_namespace():
+    """CoreWebView2CreationProperties is imported from the Wpf namespace.
+
+    Reflection over the vendored DLLs (EUD-038): the Core assembly exports NO
+    ``*CreationProperties*`` type; ``Microsoft.Web.WebView2.Wpf.dll`` exports
+    ``Microsoft.Web.WebView2.Wpf.CoreWebView2CreationProperties`` (and the WPF
+    control's ``CreationProperties`` property is typed in that namespace). The
+    bridge MUST import the FULL Wpf-namespaced type name, else ``import_type``
+    returns nil and ``createPanel()`` dies every Tick with "attempt to call
+    upvalue 'CoreWebView2CreationProperties' (a nil value)".
+
+    The ``import_type`` call is line-wrapped (the argument sits on the line
+    after the assignment), so match against comment-stripped, whitespace-
+    collapsed text -- per this file's conventions -- to span both source lines.
+    """
+    code = _strip_comments(_read_text())
+    flat = re.sub(r"\s+", " ", code)
+    assert re.search(
+        r'import_type\s*\(\s*["\']'
+        r"Microsoft\.Web\.WebView2\.Wpf\.CoreWebView2CreationProperties"
+        r'["\']\s*\)',
+        flat,
+    ), (
+        "CoreWebView2CreationProperties must be imported from the Wpf namespace "
+        '(import_type("Microsoft.Web.WebView2.Wpf.CoreWebView2CreationProperties"))'
+        "; the Core assembly does not export this type and import_type returns "
+        "nil there -- createPanel() crashes every Tick (EUD-038)"
+    )
+
+
+def test_creation_properties_not_imported_from_core_namespace():
+    """Regression guard: the Core-namespaced type name must NOT appear.
+
+    ``Microsoft.Web.WebView2.Core.CoreWebView2CreationProperties`` is the broken
+    import that returns nil -- it must not survive anywhere in the bridge (code
+    or comment), or ``createPanel()`` regresses to the per-Tick nil-upvalue
+    crash (EUD-038).
+    """
+    text = _read_text()
+    assert (
+        "Microsoft.Web.WebView2.Core.CoreWebView2CreationProperties" not in text
+    ), (
+        "the Core-namespaced CoreWebView2CreationProperties import is still "
+        "present; import_type returns nil for it (the type lives in the Wpf "
+        "assembly, not Core) -- createPanel() crashes every Tick (EUD-038)"
+    )
+
+
 # --------------------------------------------------------------------------
 # 3. EnsureCoreWebView2Async + CoreWebView2InitializationCompleted
 # --------------------------------------------------------------------------

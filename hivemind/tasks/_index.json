@@ -612,6 +612,21 @@
         "server/tests/test_app.py",
         "server/tests/test_bridge_lifecycle_static.py"
       ]
+    },
+    "EUD-038-1a5c": {
+      "status": "done",
+      "priority": "high",
+      "type": "bug",
+      "parent": "EUD-006-50d8",
+      "depends_on": [],
+      "title": "WebView2 CreationProperties import uses Wpf namespace (panel create fix)",
+      "updated": "2026-06-04",
+      "completed_at": "2026-06-04T23:32:08.917979",
+      "path": "done/EUD-038-1a5c.md",
+      "scope": [
+        "bridge/ZZZ_10_agent_bridge.lua",
+        "server/tests/test_bridge_webview_static.py"
+      ]
     }
   }
 }

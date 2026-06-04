@@ -45,7 +45,7 @@ local ok, initErr = pcall(function()
     local Window     = luanet.import_type("System.Windows.Window")
     local WebView2   = luanet.import_type("Microsoft.Web.WebView2.Wpf.WebView2")
     local CoreWebView2CreationProperties =
-        luanet.import_type("Microsoft.Web.WebView2.Core.CoreWebView2CreationProperties")
+        luanet.import_type("Microsoft.Web.WebView2.Wpf.CoreWebView2CreationProperties")
 
     local baseDir   = tostring(AppDomain.CurrentDomain.BaseDirectory)
     local agentDir  = baseDir .. "Data\\agent\\"
