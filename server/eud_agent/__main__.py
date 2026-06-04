@@ -3,9 +3,12 @@
   * ``--selfcheck`` -> validate every prerequisite (verify.md "Stage: smoke")
     and exit with code 0 (all good) or non-zero (one line per failed check).
     Never loads the embedding model; never raises on a missing prerequisite.
-  * (no flag)       -> would launch the FastAPI server, but ``app.py`` is owned
-    by a separate task (EUD-010). Until it exists we fail fast with a clear
-    message rather than importing a missing module.
+  * (no flag)       -> launch the resident FastAPI server. We bind ``127.0.0.1``
+    on the configured port (falling back to an OS-assigned ephemeral port when
+    taken — ``app.resolve_bound_socket``), record the ACTUAL resolved port on the
+    Config (so the Origin check + ``server.ready`` advertise the real port), and
+    hand the pre-bound socket to uvicorn. The heartbeat watcher gets a handle to
+    the uvicorn ``Server`` so a stale heartbeat self-terminates the process.
 """
 
 from __future__ import annotations
@@ -69,6 +72,33 @@ def _selfcheck(cfg: Config) -> int:
     return rc
 
 
+def _serve(cfg: Config) -> int:
+    """Bind 127.0.0.1 (cfg port, fallback ephemeral) and run uvicorn.
+
+    Imports of ``app`` / ``uvicorn`` are deferred to here so ``--selfcheck`` stays
+    light (it must not pull FastAPI/uvicorn). The pre-bound socket's port becomes
+    ``cfg.port`` BEFORE ``create_app`` so the Origin check and the ``server.ready``
+    writer both advertise the actual resolved port (architecture.md port policy).
+    """
+    import uvicorn
+
+    from .app import create_app, resolve_bound_socket
+
+    # Pre-bind: cfg.port, falling back to an OS-assigned ephemeral port if taken.
+    sock = resolve_bound_socket(cfg.port)
+    cfg.port = sock.getsockname()[1]  # the single source of truth for the port
+
+    app = create_app(cfg, start_lifecycle=True)
+
+    config = uvicorn.Config(app, log_level="info")
+    server = uvicorn.Server(config)
+    # Let the heartbeat watcher self-terminate by flipping should_exit.
+    app.state.shutdown_state["server"] = server
+
+    server.run(sockets=[sock])
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     cfg = Config.resolve(cli=_cli_overrides(args))
@@ -76,14 +106,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.selfcheck:
         return _selfcheck(cfg)
 
-    # Server launch path: app.py is out of scope here (EUD-010). Do NOT create
-    # it; fail fast with a clear, actionable message.
-    print(
-        "server app not implemented yet (EUD-010): "
-        "run `python -m eud_agent --selfcheck` for prerequisite validation.",
-        file=sys.stderr,
-    )
-    return 2
+    return _serve(cfg)
 
 
 if __name__ == "__main__":

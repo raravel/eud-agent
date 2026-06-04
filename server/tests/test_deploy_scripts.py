@@ -311,31 +311,82 @@ def test_setup_env_exists_and_venv_product():
         )
 
 
-# --- 7. dev_run: surfaces the 'app not implemented' state without hanging --
+# --- 7. dev_run: launches the resident server (EUD-018 wired the app) --------
 
 
-def test_dev_run_surfaces_not_implemented_without_hanging():
+def test_dev_run_launches_server():
+    """dev_run.ps1 launches the resident server (was the EUD-010 stub).
+
+    EUD-018 wired ``python -m eud_agent`` (no flag) to actually serve, so
+    dev_run now starts a long-lived server. We prove it LAUNCHES (writes
+    ``server.ready`` into the dev data dir once its own socket accepts) and then
+    terminate it — the entry must not hang BEFORE serving. A fresh worktree
+    without server/.venv is skipped (the script Fails fast there, by design).
+    """
+    import time
+
     assert DEV_RUN.is_file(), f"missing script: {DEV_RUN}"
 
-    # The FastAPI app module does not exist yet: the entry prints
-    # "server app not implemented yet" and exits non-zero. dev_run must
-    # surface that honestly (not mask it) and must not hang. A 60s timeout
-    # guards against a hang; on timeout we fail rather than leak a process.
-    try:
-        proc = _run_script(DEV_RUN, timeout=60)
-    except subprocess.TimeoutExpired as exc:
-        raise AssertionError(
-            "dev_run.ps1 hung (>60s): it must surface the server entry's "
-            f"exit immediately, not block. captured:\n{exc.output or ''}"
-        ) from exc
+    venv_python = REPO_ROOT / "server" / ".venv" / "Scripts" / "python.exe"
+    if not venv_python.is_file():
+        import pytest
 
-    # Either the venv is missing (worktree) or the app is not implemented yet:
-    # in both honest cases dev_run exits non-zero. It must NOT exit 0 while the
-    # app entry is unimplemented.
-    assert proc.returncode != 0, (
-        "dev_run.ps1 exited 0 while the server app is not implemented yet; "
-        f"it must surface the non-zero state. output:\n{proc.stdout}"
-    )
+        pytest.skip("server/.venv absent (gitignored worktree); run setup_env.ps1")
+
+    with tempfile.TemporaryDirectory() as td:
+        data_dir = Path(td) / "devdata"
+        data_dir.mkdir(parents=True, exist_ok=True)
+        ready_path = data_dir / "server.ready"
+
+        cmd = [
+            _pwsh(), "-NoProfile", "-NonInteractive", "-File", str(DEV_RUN),
+            "-DataDir", str(data_dir), "-Port", "0",
+        ]
+        proc = subprocess.Popen(
+            cmd,
+            cwd=str(REPO_ROOT),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        try:
+            # server.ready appears once the server's own socket accepts — proof
+            # the entry launched the server and did not hang at startup.
+            deadline = time.monotonic() + 60.0
+            launched = False
+            while time.monotonic() < deadline:
+                if ready_path.is_file():
+                    launched = True
+                    break
+                if proc.poll() is not None:
+                    break  # the process exited early; fall through to diagnose
+                time.sleep(0.2)
+            assert launched, (
+                "dev_run.ps1 never wrote server.ready (server did not launch); "
+                f"exit={proc.poll()}"
+            )
+            ready = json.loads(ready_path.read_text(encoding="utf-8"))
+            assert ready["port"] > 0 and ready["pid"] > 0
+        finally:
+            # pwsh spawns python as a child; kill the whole tree so the resident
+            # server (still warming the model) cannot be orphaned (Windows).
+            if os.name == "nt":
+                subprocess.run(
+                    ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                )
+            else:  # pragma: no cover - tests run on Windows
+                proc.terminate()
+            try:
+                proc.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=15)
 
 
 # --- standalone runner ----------------------------------------------------

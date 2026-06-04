@@ -1,4 +1,5 @@
 ---
+completed_at: '2026-06-04T20:21:54.652556'
 created: '2026-06-04'
 depends_on:
 - EUD-015-c726
@@ -13,7 +14,9 @@ scope:
 - server/eud_agent/__main__.py
 - server/tests/test_orchestrator.py
 - server/tests/test_app.py
-status: in_progress
+- server/tests/test_config.py
+- server/tests/test_deploy_scripts.py
+status: done
 title: 'Server: orchestrator + FastAPI app + WS'
 type: task
 updated: '2026-06-04'

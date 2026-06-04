@@ -273,7 +273,7 @@
       ]
     },
     "EUD-018-bafb": {
-      "status": "in_progress",
+      "status": "done",
       "priority": "high",
       "type": "task",
       "parent": "EUD-004-16b7",
@@ -284,14 +284,16 @@
       ],
       "title": "Server: orchestrator + FastAPI app + WS",
       "updated": "2026-06-04",
-      "completed_at": null,
-      "path": "active/EUD-018-bafb.md",
+      "completed_at": "2026-06-04T20:21:54.652556",
+      "path": "done/EUD-018-bafb.md",
       "scope": [
         "server/eud_agent/orchestrator.py",
         "server/eud_agent/app.py",
         "server/eud_agent/__main__.py",
         "server/tests/test_orchestrator.py",
-        "server/tests/test_app.py"
+        "server/tests/test_app.py",
+        "server/tests/test_config.py",
+        "server/tests/test_deploy_scripts.py"
       ]
     },
     "EUD-019-58af": {
@@ -516,7 +518,7 @@
       ]
     },
     "EUD-033-a00f": {
-      "status": "pending",
+      "status": "in_progress",
       "priority": "high",
       "type": "task",
       "parent": "EUD-026-4c16",
@@ -528,7 +530,11 @@
       "completed_at": null,
       "path": "active/EUD-033-a00f.md",
       "scope": [
-        "panel/src/**"
+        "panel/src/**",
+        "panel/package.json",
+        "panel/package-lock.json",
+        "panel/vitest.config.ts",
+        "panel/tsconfig.app.json"
       ]
     },
     "EUD-034-4043": {

@@ -44,7 +44,7 @@ If `node` resolves AND `@eps-server/server` is installed (under `server/node_mod
 
 ## orchestrator.py
 
-Async state machine per instruct request: `rag (optional) -> codex -> lsp -> diff -> done`, emitting WS events at each transition. For a `set` target it fetches current content via `bridge_io.get` and produces a unified diff (`difflib.unified_diff`). Apply requests route to `set`/`neweps` with busy/timeout translation to WS events. One in-flight instruct at a time (second request -> error "busy").
+Async state machine per instruct request: `rag (optional) -> codex -> lsp -> diff -> done`, emitting WS events at each transition. For a `set` target it fetches current content via `bridge_io.get` and produces a unified diff (`difflib.unified_diff`). Apply requests route to `set`/`neweps` with busy/timeout translation to WS events. One in-flight instruct at a time (second request -> error "busy"). The instruct `target` must be an EXISTING settable file (the diff stage GETs it first; a missing file surfaces the bridge ERROR before codex runs) — new-file creation happens only via apply mode=neweps.
 
 ## app.py / __main__.py
 

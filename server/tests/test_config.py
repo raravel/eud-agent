@@ -260,21 +260,25 @@ def test_main_selfcheck_exit_code_matches(tmp_path):
     assert RAG_MARK in out or PANEL_MARK in out or CODEX_MARK in out
 
 
-def test_main_without_selfcheck_reports_app_not_implemented():
-    """Without --selfcheck the entrypoint must fail clearly: app is EUD-010."""
-    import subprocess
-    import sys
+def test_main_without_selfcheck_launches_server(monkeypatch):
+    """Without --selfcheck the entrypoint launches the resident server.
 
-    proc = subprocess.run(
-        [sys.executable, "-m", "eud_agent"],
-        capture_output=True,
-        text=True,
-        env=_clean_env(),
-        cwd=str(_server_dir()),
-    )
-    assert proc.returncode != 0
-    out = (proc.stdout + proc.stderr).lower()
-    assert "eud-010" in out or "not implemented" in out
+    EUD-018 wired the no-flag path to ``_serve`` (was an "app not implemented"
+    stub). We patch ``_serve`` so the test stays fast (no real bind / model
+    warmup / hang) and assert main() routes to it with the resolved Config.
+    """
+    from eud_agent import __main__ as entry
+
+    called = {}
+
+    def fake_serve(cfg) -> int:
+        called["cfg"] = cfg
+        return 0
+
+    monkeypatch.setattr(entry, "_serve", fake_serve)
+    rc = entry.main([])
+    assert rc == 0
+    assert "cfg" in called, "main() did not route the no-flag path to _serve"
 
 
 def _server_dir() -> Path:
