@@ -1,26 +1,40 @@
-"""Verification artifact for EUD-021-6479: panel web UI (static contract).
+"""Verification artifact for the React panel scaffold (EUD-031-01ec).
 
-Validates the static/structural contract of the panel web UI per
-hivemind/docs/features/03_agent-panel.md, the architecture "WebSocket
-protocol (panel to server)" section, and the rules "Server and panel"
-section (no framework/CDN, everything served locally).
+Validates the static/structural contract of the React panel toolchain per
+hivemind/docs/features/03_agent-panel.md ("Toolchain / layout",
+"Verification contract"), the decisions 03/04/05 (React rebuild, dist never
+committed, Monaco adoption), and the rules "Server and panel" section
+(no runtime CDN; dist never committed; Monaco from the npm bundle).
 
-These checks intentionally target the *contract* (element ids, message
-types, behaviors) rather than exact markup, so any reasonable
-implementation passes. The element-id contract fixed here is what the
-implementation MUST use.
+This REVISES the former vanilla-panel contract (element ids + app.js message
+handling). Those checks are retired by Decision 03: the vanilla element-id /
+app.js / progress-stage assertions move to runtime verification (EUD-034).
+Per the SEQUENCING NOTE in EUD-031-01ec, ``panel/index.html`` becomes the
+Vite template now, while ``panel/app.js`` / ``panel/style.css`` remain as DEAD
+files until EUD-035 (the ``--selfcheck`` PANEL_FILES gate still requires all
+three). This test therefore neither requires nor forbids app.js/style.css; it
+asserts the React-source contract and the no-CDN / no-BOM invariants.
+
+These checks target the *contract* (toolchain manifest, vendored component
+source, gitignore, no external origins) rather than exact markup, so any
+reasonable implementation passes.
 
 This file is pytest-compatible (plain ``test_*`` functions with asserts)
 AND standalone-runnable with system Python::
 
     python server/tests/test_panel_static.py
 
-The project venv does not exist yet, so only the stdlib is used
-(pathlib, re, sys).
+Only the stdlib is used (json, re, sys, pathlib) so it runs before the
+project venv exists. Checks that require a build (dist content scan) SKIP with
+a note when ``panel/dist/`` is absent.
+
+Before the scaffold lands the React checks FAIL (no package.json yet); the
+no-BOM / gitignore-file checks may partially pass; overall exit is non-zero.
 """
 
 from __future__ import annotations
 
+import json
 import re
 import sys
 from pathlib import Path
@@ -29,46 +43,54 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 PANEL_DIR = REPO_ROOT / "panel"
-INDEX_HTML = PANEL_DIR / "index.html"
-APP_JS = PANEL_DIR / "app.js"
-STYLE_CSS = PANEL_DIR / "style.css"
+INDEX_HTML = PANEL_DIR / "index.html"            # Vite template
+PACKAGE_JSON = PANEL_DIR / "package.json"
+SRC_DIR = PANEL_DIR / "src"
+COMPONENTS_DIR = PANEL_DIR / "components"
+AI_ELEMENTS_DIR = COMPONENTS_DIR / "ai-elements"
+UI_DIR = COMPONENTS_DIR / "ui"
+DIST_DIR = PANEL_DIR / "dist"
+DIST_INDEX_HTML = DIST_DIR / "index.html"
 
-PANEL_FILES = (INDEX_HTML, APP_JS, STYLE_CSS)
+GITIGNORE = REPO_ROOT / ".gitignore"
 
-# --- Element-id contract (the implementation MUST use these ids) ----------
-#
-# Each entry: a logical UI element and the id the implementation must expose.
-# Checks accept id="..." or data-* attribute carrying the same token, so the
-# test fixes the contract without over-fitting the exact attribute used.
-REQUIRED_ELEMENT_IDS = {
-    "target_picker": "target-picker",       # <select> target file dropdown
-    "instruction_input": "instruction-input",  # instruction <textarea>
-    "use_context": "use-context",           # useContext <input type=checkbox>
-    "tab_preview": "tab-preview",            # preview tab control
-    "tab_diff": "tab-diff",                  # diff tab control
-    "tab_edit": "tab-edit",                  # edit tab control
-    "apply_set": "apply-set",                # Apply SET button
-    "apply_neweps": "apply-neweps",          # Apply NEWEPS button
-    "neweps_name": "neweps-name",            # NEWEPS filename input
-    "diagnostics": "diagnostics",            # advisory diagnostics area
-    "event_log": "event-log",                # chat / event-log area
-    "conn_state": "conn-state",              # connection-state indicator
-}
+# npm dependencies the committed React stack must declare (any of
+# dependencies / devDependencies). These are the toolchain anchors:
+# React runtime, the Vite build tool, Tailwind v4, and the Monaco bundle.
+REQUIRED_NPM_DEPS = (
+    "react",
+    "react-dom",
+    "vite",
+    "tailwindcss",
+    "monaco-editor",
+    "@monaco-editor/react",
+)
 
-# The target picker must be a <select> element (GUI types disabled).
-SELECT_IDS = ("target-picker",)
+# npm scripts the scaffold must expose.
+REQUIRED_NPM_SCRIPTS = ("dev", "build", "preview")
 
-# Server -> client WS message types the panel must handle.
-SERVER_MESSAGE_TYPES = ("progress", "code", "applied", "error", "status", "list")
+# Key text files that must not carry a UTF-8 BOM (BOM breaks Vite template
+# parsing / first-line tooling and violates the no-BOM rule).
+NO_BOM_FILES = (INDEX_HTML, PACKAGE_JSON)
 
-# Client -> server WS message types the panel must send.
-CLIENT_MESSAGE_TYPES = ("instruct", "apply", "status", "list")
-
-# Progress stages the panel must render.
-PROGRESS_STAGES = ("rag", "rag_warmup", "codex", "lsp", "waiting_build")
-
-# UTF-8 BOM (must NOT be present at the start of any panel file).
+# UTF-8 BOM (must NOT be present at the start of the listed files).
 UTF8_BOM = b"\xef\xbb\xbf"
+
+
+# --- skip plumbing (dual-mode: pytest skip OR standalone SKIP note) -------
+
+
+class _Skipped(Exception):
+    """Raised to signal a SKIP in standalone mode (dist absent, etc.)."""
+
+
+def _skip(reason: str) -> None:
+    """Skip the current check, recording a note in either run mode."""
+    try:
+        import pytest  # type: ignore
+    except Exception:
+        raise _Skipped(reason) from None
+    pytest.skip(reason)
 
 
 def _read_bytes(path: Path) -> bytes:
@@ -79,59 +101,164 @@ def _read_text(path: Path) -> str:
     return path.read_text(encoding="utf-8")
 
 
-# --- 1. files exist, non-empty, UTF-8 without BOM -------------------------
+def _load_package_json() -> dict:
+    assert PACKAGE_JSON.is_file(), (
+        f"panel/package.json missing (React scaffold not present): {PACKAGE_JSON}"
+    )
+    try:
+        return json.loads(_read_text(PACKAGE_JSON))
+    except json.JSONDecodeError as exc:  # pragma: no cover - corruption guard
+        raise AssertionError(f"panel/package.json is not valid JSON: {exc}") from exc
 
 
-def test_panel_files_exist_and_nonempty():
-    missing = [str(p.relative_to(REPO_ROOT)) for p in PANEL_FILES if not p.is_file()]
-    assert not missing, f"missing panel files: {missing}"
-    empty = [
-        str(p.relative_to(REPO_ROOT))
-        for p in PANEL_FILES
-        if p.is_file() and p.stat().st_size == 0
+def _all_declared_deps(pkg: dict) -> dict:
+    deps: dict = {}
+    for key in ("dependencies", "devDependencies", "peerDependencies"):
+        section = pkg.get(key)
+        if isinstance(section, dict):
+            deps.update(section)
+    return deps
+
+
+def _gitignore_lines() -> list[str]:
+    """Non-empty, non-comment .gitignore lines (stripped, original case)."""
+    lines: list[str] = []
+    for raw in _read_text(GITIGNORE).splitlines():
+        stripped = raw.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        lines.append(stripped)
+    return lines
+
+
+def _ignores(path_fragment: str) -> bool:
+    """True if some .gitignore line targets the given path fragment.
+
+    Accepts the bare fragment, a trailing-slash dir form, and a leading-slash
+    anchored form (e.g. ``panel/dist``, ``panel/dist/``, ``/panel/dist/``).
+    Backslashes are normalized to forward slashes.
+    """
+    target = path_fragment.strip("/")
+    for line in _gitignore_lines():
+        norm = line.replace("\\", "/").strip("/")
+        if norm == target:
+            return True
+    return False
+
+
+# --- 1. package.json: deps + scripts (React toolchain manifest) -----------
+
+
+def test_package_json_exists_and_valid():
+    pkg = _load_package_json()
+    assert isinstance(pkg, dict), "panel/package.json must be a JSON object"
+
+
+def test_package_json_declares_required_deps():
+    """react/react-dom/vite/tailwindcss/monaco-editor/@monaco-editor/react present."""
+    pkg = _load_package_json()
+    deps = _all_declared_deps(pkg)
+    missing = [d for d in REQUIRED_NPM_DEPS if d not in deps]
+    assert not missing, (
+        f"panel/package.json missing required deps: {missing}; declared={sorted(deps)}"
+    )
+
+
+def test_package_json_has_dev_build_preview_scripts():
+    pkg = _load_package_json()
+    scripts = pkg.get("scripts", {})
+    assert isinstance(scripts, dict), "package.json 'scripts' must be an object"
+    missing = [s for s in REQUIRED_NPM_SCRIPTS if s not in scripts]
+    assert not missing, (
+        f"panel/package.json missing scripts: {missing}; have={sorted(scripts)}"
+    )
+
+
+# --- 2. source + vendored component structure -----------------------------
+
+
+def test_src_dir_present():
+    assert SRC_DIR.is_dir(), f"panel/src/ missing (React app sources): {SRC_DIR}"
+
+
+def test_vendored_ai_elements_present():
+    """Vercel AI Elements vendored as SOURCE (no runtime registry/CDN)."""
+    assert AI_ELEMENTS_DIR.is_dir(), (
+        f"panel/components/ai-elements/ missing (vendored AI Elements source): "
+        f"{AI_ELEMENTS_DIR}"
+    )
+    sources = [
+        p
+        for p in AI_ELEMENTS_DIR.rglob("*")
+        if p.is_file() and p.suffix in (".tsx", ".ts", ".jsx", ".js")
     ]
-    assert not empty, f"empty panel files: {empty}"
+    assert sources, (
+        "panel/components/ai-elements/ contains no component source files"
+    )
 
 
-def test_panel_files_no_utf8_bom():
+def test_vendored_shadcn_ui_present():
+    """shadcn/ui primitives vendored as SOURCE under panel/components/ui/."""
+    assert UI_DIR.is_dir(), (
+        f"panel/components/ui/ missing (vendored shadcn/ui source): {UI_DIR}"
+    )
+    sources = [
+        p
+        for p in UI_DIR.rglob("*")
+        if p.is_file() and p.suffix in (".tsx", ".ts", ".jsx", ".js")
+    ]
+    assert sources, "panel/components/ui/ contains no component source files"
+
+
+# --- 3. gitignore: dist + node_modules never committed --------------------
+
+
+def test_gitignore_ignores_panel_dist():
+    assert _ignores("panel/dist"), (
+        ".gitignore must ignore panel/dist/ (build output never committed); "
+        f"lines={_gitignore_lines()}"
+    )
+
+
+def test_gitignore_ignores_panel_node_modules():
+    """panel/node_modules must be ignored (a bare node_modules rule suffices)."""
+    lines = [ln.replace("\\", "/") for ln in _gitignore_lines()]
+    ignored = any(
+        ln.strip("/") in ("panel/node_modules", "node_modules")
+        for ln in lines
+    )
+    assert ignored, (
+        ".gitignore must ignore panel/node_modules/ (or node_modules globally); "
+        f"lines={_gitignore_lines()}"
+    )
+
+
+# --- 4. no-BOM on key text files ------------------------------------------
+
+
+def test_key_text_files_no_utf8_bom():
     leaked = []
-    for p in PANEL_FILES:
+    for p in NO_BOM_FILES:
         if p.is_file() and _read_bytes(p).startswith(UTF8_BOM):
             leaked.append(str(p.relative_to(REPO_ROOT)))
-    assert not leaked, f"panel files start with a UTF-8 BOM (forbidden): {leaked}"
+    assert not leaked, f"files start with a UTF-8 BOM (forbidden): {leaked}"
 
 
-# --- 2. relative local references only, no external origins ---------------
+# --- 5. Vite template (index.html): no external origins -------------------
 
 
-def test_index_references_app_js_and_style_css():
-    html = _read_text(INDEX_HTML)
-    assert re.search(r"""(src|href)\s*=\s*["'][^"']*app\.js["']""", html), (
-        "index.html does not reference app.js"
-    )
-    assert re.search(r"""(src|href)\s*=\s*["'][^"']*style\.css["']""", html), (
-        "index.html does not reference style.css"
+def test_vite_template_present():
+    assert INDEX_HTML.is_file(), (
+        f"panel/index.html (Vite template) missing: {INDEX_HTML}"
     )
 
 
-def test_index_references_are_relative_local():
-    """app.js / style.css references must be relative (not absolute, not external)."""
-    html = _read_text(INDEX_HTML)
-    bad = []
-    for m in re.finditer(
-        r"""(?:src|href)\s*=\s*["']([^"']*(?:app\.js|style\.css))["']""", html
-    ):
-        url = m.group(1)
-        # external origin, protocol-relative, or absolute-from-root are all rejected
-        if re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*:", url) or url.startswith("//"):
-            bad.append(url)
-        elif url.startswith("/"):
-            bad.append(url)
-    assert not bad, f"app.js/style.css must be referenced via relative URLs; bad={bad}"
+def test_vite_template_has_no_external_origins():
+    """No http(s):// or protocol-relative URL in any src/href attribute value.
 
-
-def test_index_has_no_external_origins():
-    """No http:// or https:// anywhere in src/href attribute values (no CDN)."""
+    Every byte must ship from the local server; the Vite template references
+    only local module entrypoints / relative assets.
+    """
     html = _read_text(INDEX_HTML)
     external = []
     for m in re.finditer(r"""(?:src|href)\s*=\s*["']([^"']*)["']""", html):
@@ -139,11 +266,11 @@ def test_index_has_no_external_origins():
         if re.match(r"^(?:https?:)?//", url):
             external.append(url)
     assert not external, (
-        f"index.html references external origins (CDN forbidden): {external}"
+        f"panel/index.html references external origins (CDN forbidden): {external}"
     )
 
 
-def test_index_has_no_offorigin_script_src():
+def test_vite_template_no_offorigin_script_src():
     """No <script src=...> pointing to an http(s) or protocol-relative origin."""
     html = _read_text(INDEX_HTML)
     offorigin = []
@@ -156,159 +283,30 @@ def test_index_has_no_offorigin_script_src():
     assert not offorigin, f"off-origin <script src>: {offorigin}"
 
 
-# --- 3. required UI elements (by id / data-attribute) ---------------------
+# --- 6. built dist (skip-aware): no external origins in dist/index.html ----
 
 
-def _id_present(html: str, token: str) -> bool:
-    """True if the token appears as an id or as a data-* attribute value."""
-    if re.search(rf"""\bid\s*=\s*["']{re.escape(token)}["']""", html):
-        return True
-    # accept data-<anything>="token" so the contract is fixed but not over-fit
-    if re.search(rf"""\bdata-[\w-]+\s*=\s*["']{re.escape(token)}["']""", html):
-        return True
-    return False
+def test_dist_index_has_no_external_origins():
+    """The BUILT dist/index.html must reference zero external origins.
 
-
-def test_index_has_required_elements():
-    html = _read_text(INDEX_HTML)
-    missing = [
-        f"{name} ({token})"
-        for name, token in REQUIRED_ELEMENT_IDS.items()
-        if not _id_present(html, token)
-    ]
-    assert not missing, f"index.html missing required elements: {missing}"
-
-
-def test_target_picker_is_select():
-    """The target picker must be a <select> element (GUI types shown disabled)."""
-    html = _read_text(INDEX_HTML)
-    for token in SELECT_IDS:
-        pat = re.compile(
-            rf"""<select\b[^>]*(?:id|data-[\w-]+)\s*=\s*["']{re.escape(token)}["']""",
-            re.IGNORECASE,
+    Skips with a note when panel/dist/ has not been built yet (dev machines
+    build locally; dist is never committed).
+    """
+    if not DIST_INDEX_HTML.is_file():
+        _skip(
+            "panel/dist/index.html absent (not built yet); dist is gitignored "
+            "and built locally with `npm --prefix panel run build`."
         )
-        assert pat.search(html), (
-            f"element '{token}' must be a <select> in index.html"
-        )
-
-
-def test_usecontext_is_checkbox():
-    """The useContext toggle must be a checkbox input."""
-    html = _read_text(INDEX_HTML)
-    token = REQUIRED_ELEMENT_IDS["use_context"]
-    # find an <input ...> tag carrying the token and assert type=checkbox on it
-    found_checkbox = False
-    for m in re.finditer(r"<input\b[^>]*>", html, re.IGNORECASE):
-        tag = m.group(0)
-        carries_id = re.search(
-            rf"""(?:id|data-[\w-]+)\s*=\s*["']{re.escape(token)}["']""", tag
-        )
-        if carries_id and re.search(
-            r"""type\s*=\s*["']checkbox["']""", tag, re.IGNORECASE
-        ):
-            found_checkbox = True
-            break
-    assert found_checkbox, (
-        f"useContext toggle '{token}' must be <input type=\"checkbox\">"
-    )
-
-
-# --- 4. Korean labels -----------------------------------------------------
-
-
-def test_index_has_korean_labels():
-    html = _read_text(INDEX_HTML)
-    assert re.search(r"[가-힣]", html), (
-        "index.html has no Korean (Hangul) labels"
-    )
-
-
-# --- 5. app.js handles every server->client message type ------------------
-
-
-def test_app_handles_all_server_message_types():
-    js = _read_text(APP_JS)
-    missing = [t for t in SERVER_MESSAGE_TYPES if t not in js]
-    assert not missing, f"app.js does not handle server message types: {missing}"
-
-
-def test_app_has_unknown_message_fallback():
-    """A default/else branch must handle unknown message types without crashing."""
-    js = _read_text(APP_JS)
-    assert "unknown" in js.lower(), (
-        "app.js has no unknown-type fallback (expected a default/else handling "
-        "an 'unknown' message type)"
-    )
-
-
-# --- 6. app.js sends client->server types + connection behavior -----------
-
-
-def test_app_sends_all_client_message_types():
-    js = _read_text(APP_JS)
-    missing = [t for t in CLIENT_MESSAGE_TYPES if t not in js]
-    assert not missing, f"app.js does not send client message types: {missing}"
-
-
-def test_app_reads_token_from_location_search():
-    js = _read_text(APP_JS)
-    assert "URLSearchParams" in js, (
-        "app.js must read the token from location.search via URLSearchParams"
-    )
-    assert "location.search" in js, "app.js must reference location.search"
-
-
-def test_app_builds_ws_url_from_location_host():
-    js = _read_text(APP_JS)
-    assert "location.host" in js, (
-        "app.js must build the WS URL from location.host"
-    )
-
-
-def test_app_has_2s_reconnect_backoff():
-    js = _read_text(APP_JS)
-    assert "2000" in js, "app.js must use a 2s (2000ms) reconnect backoff"
-
-
-def test_app_rerequests_status_and_list_on_reconnect():
-    """On (re)connect the panel re-requests both status and list."""
-    js = _read_text(APP_JS)
-    # heuristic: both message types are referenced as sent requests
-    assert "status" in js and "list" in js, (
-        "app.js must re-request status and list on reconnect"
-    )
-
-
-# --- 7. progress stages ---------------------------------------------------
-
-
-def test_app_references_all_progress_stages():
-    js = _read_text(APP_JS)
-    missing = [s for s in PROGRESS_STAGES if s not in js]
-    assert not missing, f"app.js does not reference progress stages: {missing}"
-
-
-# --- 8. NEWEPS filename validation ----------------------------------------
-
-
-def test_app_validates_neweps_filename():
-    """NEWEPS filename validation: reject empty names and path separators."""
-    js = _read_text(APP_JS)
-    # path-separator rejection: must reference both '/' and '\' as forbidden.
-    # Look for a forward slash and an escaped backslash somewhere in the source.
-    has_fwd_slash = "/" in js
-    has_back_slash = "\\\\" in js or "\\" in js
-    assert has_fwd_slash and has_back_slash, (
-        "app.js NEWEPS validation must reject path separators ('/' and '\\')"
-    )
-    # empty-name rejection: heuristic for a non-empty / trim / length check
-    # tied to the neweps filename handling.
-    empty_check = re.search(
-        r"\.trim\s*\(\s*\)|\.length\b|===?\s*[\"'']\s*[\"'']|!\s*\w+", js
-    )
-    assert empty_check, (
-        "app.js NEWEPS validation must reject empty filenames "
-        "(expected a trim/length/empty-string check)"
+        return  # standalone path falls through after _Skipped is raised
+    html = _read_text(DIST_INDEX_HTML)
+    external = []
+    for m in re.finditer(r"""(?:src|href)\s*=\s*["']([^"']*)["']""", html):
+        url = m.group(1)
+        if re.match(r"^(?:https?:)?//", url):
+            external.append(url)
+    assert not external, (
+        f"built panel/dist/index.html references external origins "
+        f"(CDN forbidden, incl. Monaco workers): {external}"
     )
 
 
@@ -324,12 +322,34 @@ def _all_test_functions():
     ]
 
 
+def _skip_exc_types() -> tuple[type[BaseException], ...]:
+    """Skip exception types to treat as SKIP in the standalone runner.
+
+    Always includes the local ``_Skipped`` sentinel; also includes pytest's
+    ``Skipped`` when pytest is importable, since ``_skip`` defers to
+    ``pytest.skip`` in that case.
+    """
+    types: list[type[BaseException]] = [_Skipped]
+    try:
+        from _pytest.outcomes import Skipped  # type: ignore
+
+        types.append(Skipped)
+    except Exception:
+        pass
+    return tuple(types)
+
+
 def main() -> int:
     failures = 0
+    skipped = 0
+    skip_types = _skip_exc_types()
     tests = _all_test_functions()
     for name, fn in tests:
         try:
             fn()
+        except skip_types as exc:
+            skipped += 1
+            print(f"SKIP {name}: {exc}")
         except AssertionError as exc:
             failures += 1
             print(f"FAIL {name}: {exc}")
@@ -339,7 +359,8 @@ def main() -> int:
         else:
             print(f"PASS {name}")
     total = len(tests)
-    print(f"\n{total - failures}/{total} checks passed")
+    passed = total - failures - skipped
+    print(f"\n{passed}/{total} checks passed ({skipped} skipped, {failures} failed)")
     return 1 if failures else 0
 
 

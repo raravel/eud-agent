@@ -10,8 +10,10 @@ priority: high
 scope:
 - server/eud_agent/orchestrator.py
 - server/eud_agent/app.py
-- server/tests/**
-status: pending
+- server/eud_agent/__main__.py
+- server/tests/test_orchestrator.py
+- server/tests/test_app.py
+status: in_progress
 title: 'Server: orchestrator + FastAPI app + WS'
 type: task
 updated: '2026-06-04'

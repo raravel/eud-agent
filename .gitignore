@@ -13,3 +13,7 @@ __pycache__/
 
 # Node (optional epscript-lsp, panel tooling)
 node_modules/
+panel/node_modules/
+
+# Panel build output (Vite); never committed, release-packaged later
+panel/dist/

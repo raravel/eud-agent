@@ -273,7 +273,7 @@
       ]
     },
     "EUD-018-bafb": {
-      "status": "pending",
+      "status": "in_progress",
       "priority": "high",
       "type": "task",
       "parent": "EUD-004-16b7",
@@ -289,7 +289,9 @@
       "scope": [
         "server/eud_agent/orchestrator.py",
         "server/eud_agent/app.py",
-        "server/tests/**"
+        "server/eud_agent/__main__.py",
+        "server/tests/test_orchestrator.py",
+        "server/tests/test_app.py"
       ]
     },
     "EUD-019-58af": {
@@ -479,15 +481,15 @@
       ]
     },
     "EUD-031-01ec": {
-      "status": "in_progress",
+      "status": "done",
       "priority": "high",
       "type": "task",
       "parent": "EUD-026-4c16",
       "depends_on": [],
       "title": "Panel scaffold: Vite + React + TS + Tailwind + shadcn + AI Elements + Monaco wiring",
       "updated": "2026-06-04",
-      "completed_at": null,
-      "path": "active/EUD-031-01ec.md",
+      "completed_at": "2026-06-04T19:59:28.242636",
+      "path": "done/EUD-031-01ec.md",
       "scope": [
         "panel/**",
         ".gitignore",

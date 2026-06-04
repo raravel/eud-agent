@@ -1,106 +1,12 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="ko">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>EUD Agent</title>
-  <link rel="stylesheet" href="./style.css">
-</head>
-<body>
-  <div id="app">
-    <!-- Header: title, project name, connection state -->
-    <header id="app-header">
-      <span class="app-title">EUD Agent</span>
-      <span id="project-name" class="project-name">프로젝트 없음</span>
-      <span id="conn-state" class="conn-state conn-connecting" title="연결 상태">연결 중…</span>
-    </header>
-
-    <!-- Chat / event log -->
-    <section id="event-log" class="event-log" aria-label="이벤트 로그"></section>
-
-    <!-- Review area: target row + tabs + diagnostics + apply controls -->
-    <section class="review">
-      <!-- Target row: picker + refresh + new-file toggle -->
-      <div class="target-row">
-        <label class="field">
-          <span class="field-label">대상 파일</span>
-          <select id="target-picker" class="target-picker" title="대상 파일 선택">
-            <option value="" disabled selected>파일 목록 불러오는 중…</option>
-          </select>
-        </label>
-        <button id="refresh-list" type="button" class="btn" title="목록 새로고침">새로고침</button>
-        <label class="field field-inline">
-          <input id="new-file-toggle" type="checkbox" class="new-file-toggle">
-          <span class="field-label">새 파일</span>
-        </label>
-      </div>
-
-      <!-- New file (NEWEPS) filename input — shown in new-file mode -->
-      <div id="neweps-row" class="neweps-row" hidden>
-        <label class="field">
-          <span class="field-label">새 파일 이름</span>
-          <input id="neweps-name" type="text" class="neweps-name"
-                 placeholder="예: my_script" autocomplete="off">
-        </label>
-        <span id="neweps-error" class="inline-error" role="alert"></span>
-      </div>
-
-      <!-- Tab toggle: preview / diff / edit -->
-      <div class="tabs" role="tablist">
-        <button id="tab-preview" type="button" class="tab tab-active" role="tab"
-                data-tab="preview">미리보기</button>
-        <button id="tab-diff" type="button" class="tab" role="tab"
-                data-tab="diff">변경 내용</button>
-        <button id="tab-edit" type="button" class="tab" role="tab"
-                data-tab="edit">편집</button>
-        <span id="code-lang" class="code-lang" title="언어"></span>
-      </div>
-
-      <!-- Tab panels -->
-      <div class="tab-panels">
-        <div id="panel-preview" class="tab-panel" role="tabpanel">
-          <div id="preview-notice" class="preview-notice" hidden></div>
-          <pre id="preview-code" class="code-preview"><code></code></pre>
-        </div>
-        <div id="panel-diff" class="tab-panel" role="tabpanel" hidden>
-          <pre id="diff-view" class="diff-view"></pre>
-        </div>
-        <div id="panel-edit" class="tab-panel" role="tabpanel" hidden>
-          <textarea id="edit-code" class="edit-code" spellcheck="false"
-                    placeholder="적용할 코드"></textarea>
-        </div>
-      </div>
-
-      <!-- Diagnostics strip (advisory, dismissible) -->
-      <div id="diagnostics" class="diagnostics" hidden>
-        <button id="diagnostics-dismiss" type="button" class="diag-dismiss"
-                title="진단 닫기">×</button>
-        <div class="diag-title">진단 (참고용)</div>
-        <ul id="diagnostics-list" class="diag-list"></ul>
-      </div>
-
-      <!-- Apply controls -->
-      <div class="apply-row">
-        <button id="apply-set" type="button" class="btn btn-primary"
-                title="현재 파일에 적용">적용 (SET)</button>
-        <button id="apply-neweps" type="button" class="btn btn-primary"
-                title="새 파일로 적용" hidden>적용 (새 파일)</button>
-        <button id="cancel" type="button" class="btn">취소</button>
-      </div>
-    </section>
-
-    <!-- Instruction input row -->
-    <footer class="instruct-row">
-      <textarea id="instruction-input" class="instruction-input" rows="2"
-                placeholder="지시 사항을 입력하세요"></textarea>
-      <label class="field field-inline use-context-field" title="RAG 컨텍스트 사용">
-        <input id="use-context" type="checkbox" class="use-context" checked>
-        <span class="field-label">컨텍스트</span>
-      </label>
-      <button id="send" type="button" class="btn btn-primary" title="지시 전송">전송</button>
-    </footer>
-  </div>
-
-  <script src="./app.js"></script>
-</body>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>EUD Agent</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
 </html>
