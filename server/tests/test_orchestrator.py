@@ -219,6 +219,29 @@ def test_system_prompt_rag_unavailable_degrades(monkeypatch):
     assert "list_files" in sp  # the rest of the prompt still built
 
 
+def test_system_prompt_first_principles_before_rag(monkeypatch):
+    """[first principles] (known crash causes, edac/91492) precedes the RAG context.
+
+    The section is loaded from eud_agent/data/first_principles.md and must sit
+    BEFORE [reference context] so the never-do rules outrank retrieved examples.
+    It must carry the refusal instruction and known item markers (while-loop
+    freeze, ptr/epd misuse).
+    """
+    monkeypatch.setattr(
+        rag_mod, "search",
+        lambda q, k=5, *, rag_db: [{"text": "RAGCHUNK"}],
+    )
+    sp = build_system_prompt(
+        "make a thing", tool_layer=FakeToolLayer(), bridge=FakeBridge(),
+        rag_db="C:\\rag",
+    )
+    assert "[first principles]" in sp
+    assert sp.index("[first principles]") < sp.index("[reference context]")
+    low = sp.lower()
+    assert "refuse" in low  # the agent must refuse bug-inducing requests
+    assert "while" in low and "ptr" in low  # known crash-cause markers
+
+
 def test_system_prompt_bridge_failure_degrades(monkeypatch):
     monkeypatch.setattr(rag_mod, "search", lambda *a, **k: [])
 

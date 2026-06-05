@@ -28,7 +28,9 @@ archives. ``cancel`` interrupts the in-flight turn safely (journal entries persi
 System prompt (first turn)
 --------------------------
 :func:`build_system_prompt` composes the tool catalog (``ToolLayer.tool_specs``),
-the project state (bridge STATUS + LIST, best-effort), the RAG top-k context for
+the project state (bridge STATUS + LIST, best-effort), the first principles
+(never-do crash causes, ahead of the RAG context so they outrank retrieved
+examples), the RAG top-k context for
 the user request (``rag.search``, degrading to none when unavailable), and the
 triage instructions (answer-only -> no write tools; <=2 mutations -> apply
 directly; larger -> ``propose_plan`` first). The same prompt drives the real
@@ -39,11 +41,20 @@ from __future__ import annotations
 
 import asyncio
 import uuid
+from pathlib import Path
 
 from . import rag
 
 # RAG retrieval depth for the system-prompt context (matches v1 orchestrator).
 _RAG_K = 5
+
+# First principles: community-verified crash/EUD-error/drop/freeze causes
+# (Naver cafe edac/91492) the agent must NEVER trigger. Curated English text
+# ships as package data; injected ahead of the RAG context so the never-do
+# rules outrank retrieved examples.
+_FIRST_PRINCIPLES_PATH = (
+    Path(__file__).resolve().parent / "data" / "first_principles.md"
+)
 
 # Triage rules surfaced in the system prompt (features/05, mechanical not advisory).
 _TRIAGE_INSTRUCTIONS = (
@@ -71,7 +82,7 @@ def build_system_prompt(
     bridge,
     rag_db: str,
 ) -> str:
-    """Compose the first-turn system prompt (tool catalog + state + RAG + triage).
+    """Compose the first-turn system prompt (tools + state + principles + RAG + triage).
 
     Best-effort throughout: a bridge/RAG failure degrades that section rather than
     failing the turn (the panel must stay responsive). Called from a worker thread
@@ -86,11 +97,22 @@ def build_system_prompt(
         "",
         _project_state_section(bridge),
         "",
+        _first_principles_section(),
+        "",
         _rag_section(request_text, rag_db),
         "",
         _TRIAGE_INSTRUCTIONS,
     ]
     return "\n".join(parts)
+
+
+def _first_principles_section() -> str:
+    lines = ["[first principles]"]
+    try:
+        lines.append(_FIRST_PRINCIPLES_PATH.read_text(encoding="utf-8").strip())
+    except OSError:  # noqa: B904 - best-effort: a missing data file degrades
+        lines.append("(first principles unavailable)")
+    return "\n".join(lines)
 
 
 def _tool_catalog_section(tool_layer) -> str:

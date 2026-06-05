@@ -57,6 +57,7 @@ Violations of the EDITOR-* and LUANET-* rules crash or corrupt EUD Editor 3 at r
 > Decision: see [[decisions/03_react-panel-rebuild]] and [[decisions/05_monaco-editor-adoption]] — the former no-framework/no-build-step/no-code-editor clauses were revoked 2026-06-04.
 
 - RAG model loading must never gate `server.ready` (lazy load + background warmup; report `rag_warmup` progress).
+- The v2 system prompt ALWAYS carries the `[first principles]` section (known crash/EUD-error/drop/freeze causes, `server/eud_agent/data/first_principles.md`, source: cafe edac/91492) BEFORE the `[reference context]` RAG section — the never-do rules outrank retrieved examples. Requests that would violate one are REFUSED with the item number and a safe alternative; NEVER generate code/dat edits that create those conditions.
 - epscript-lsp diagnostics are advisory only: they annotate, never block apply; absence of node/the package must not break the flow.
 
 ## Process
