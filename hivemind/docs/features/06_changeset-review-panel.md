@@ -21,7 +21,8 @@ Replaces the v1 target-picker/apply-bar flow ENTIRELY (user decision: full repla
 |   plan cards · changeset cards (inline, history)     |
 +----------------------------------------------------+
 | [Plan (ai-elements) - when plan{} active]            |
-|   Streamdown render · 피드백 입력 · [수정요청] [승인]  |
+|   Streamdown render · [승인]                          |
+|   (피드백은 아래 메인 입력창으로 — EUD-074)            |
 +----------------------------------------------------+
 | [ChangesetView - when changeset{} active]           |
 |   Data: unit [76] 마린                               |
@@ -65,7 +66,7 @@ Reconnect during thinking resets to ready with a notice (server cancels the thre
 - **Inline stream placement (EUD-069 — layout-crush fix)**: the live agent stream (Reasoning block + Tool rows + streamed answer bubble) renders INLINE at the END of the Conversation scroll area — NEVER as a fixed band between the log and the input (an unbounded band has no min-height escape and crushes the log/plan card; measured live: log 0px, plan 33px, 승인 button off-viewport). When a turn ends (answer/plan/changeset/error), the tool rows ARCHIVE into the log as a compact entry carrying the rows (`LogEntry.tools` → 도구 호출 n건 — name×k summary + expandable Tool cards) and the live buffer clears.
 - **Decision progress (EUD-070)**: while a `changeset_decision` awaits its `rollback_result`, ChangesetView shows a spinner notice (결정 처리 중…) — a rollback replays inverse ops over the 1s-tick file IPC, so the wait is visible, not just silently-disabled buttons.
 - **Answer prominence**: agent answers are the most visible text in the log (foreground Message bubbles, Streamdown-rendered); system/progress/info rows stay muted. (Inverts the original v2 styling where answers were muted.)
-- **Plan review**: ai-elements **Plan** component; plan markdown renders via Streamdown (replaces the EUD-060 hand-rolled line renderer); 피드백 textarea sends `plan_feedback` (stays in plan_review, next `plan{revision+1}` replaces card); 승인 sends `plan_approve`.
+- **Plan review (EUD-074 — user decision 2026-06-05)**: ai-elements **Plan** component; plan markdown renders via Streamdown. The embedded feedback textarea and the [수정요청] button are REMOVED: **the MAIN prompt input is the feedback channel** — during plan_review it stays ENABLED with a guidance placeholder, and a send routes to `plan_feedback{text}` (App routes by phase; the panel stays in plan_review until the next `plan{revision+1}` replaces the card). [승인] on the plan card sends `plan_approve`. `plan_review` is therefore NOT a send-gated busy phase (only `thinking` is).
 - **New conversation**: a [새 대화] control sends `reset{}` (server drops the codex thread per features/05 EUD-064) and clears the client log/plan/changeset state. Disabled while a turn is in flight.
 - **Changeset review**: restyled with ai-elements primitives; renders `changeset.items[]` grouped: dat per objId (unit name resolved server-side) with property/old→new; files by kind (created → content preview, modified → server unified diff with +/- coloring (unchanged rule: no Monaco DiffEditor), deleted → name); settings/plugins/main as old→new rows. Each item has accept/reject; bulk buttons map to `changeset_decision{all}`. Reject responses (`rollback_result`) flip the row to 되돌림 state; failures surface inline. The `lib/changeset.ts` id-shape helpers (`itemKey`/`itemIds`) remain the single source of dat-group identity.
 - **Diff/preview limits**: reuse v1 truncation (1 MiB UTF-16-consistent) for previews/diffs.

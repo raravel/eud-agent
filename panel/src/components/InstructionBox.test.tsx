@@ -108,6 +108,34 @@ describe("InstructionBox — 새 대화 reset control (EUD-065)", () => {
   });
 });
 
+describe("InstructionBox — plan_review feedback channel (EUD-074)", () => {
+  function planReviewState(): PanelState {
+    const store = createPanelStore();
+    store.wsOpen();
+    store.applyStatus({ compiling: false, project: "MyMap" });
+    store.applyList({
+      files: [{ path: "main.eps", ftype: "CUIEps", settable: true }],
+    });
+    store.chatSent();
+    store.planReceived("# 계획", 1);
+    return store.getState(); // plan_review
+  }
+
+  it("keeps Send ENABLED during plan_review (the input is the feedback channel)", () => {
+    render(<InstructionBox state={planReviewState()} onSend={noop} />);
+    expect(screen.getByRole("button", { name: "전송" })).toBeEnabled();
+  });
+
+  it("switches the placeholder to the plan-feedback guidance", () => {
+    render(<InstructionBox state={planReviewState()} onSend={noop} />);
+    const ta = screen.getByRole("textbox", { name: "지시 입력" });
+    expect(ta).toHaveAttribute(
+      "placeholder",
+      expect.stringContaining("계획"),
+    );
+  });
+});
+
 describe("InstructionBox — chat payload (v2)", () => {
   it("sends the trimmed instruction text as {text}", async () => {
     const user = userEvent.setup();

@@ -175,8 +175,23 @@ export default function App() {
   }, [store, onMessage]);
 
   // ---- user intents ----
+  // The MAIN prompt input routes by phase (EUD-074): during plan_review the
+  // typed text IS the plan feedback (plan_feedback{text} — the PlanView
+  // feedback textarea is removed); otherwise it starts a chat turn.
   const handleSend = useCallback(
     (payload: ChatPayload) => {
+      if (store.getState().phase === "plan_review") {
+        const sent = clientRef.current?.send({
+          type: "plan_feedback",
+          text: payload.text,
+        });
+        if (sent) {
+          store.log("you", payload.text);
+          store.log("agent", "계획 수정을 요청했습니다.");
+          store.planFeedbackSent();
+        }
+        return;
+      }
       const sent = clientRef.current?.send({ type: "chat", text: payload.text });
       if (sent) {
         store.log("you", payload.text);
@@ -194,21 +209,6 @@ export default function App() {
       store.resetSent();
     }
   }, [store]);
-
-  // Plan iteration: send plan_feedback{text}, archive the request into the log,
-  // and start a new turn (the store resets the per-turn buffers). The panel stays
-  // in plan_review until the next plan{revision+1} replaces the card.
-  const handlePlanFeedback = useCallback(
-    (text: string) => {
-      const sent = clientRef.current?.send({ type: "plan_feedback", text });
-      if (sent) {
-        store.log("you", text);
-        store.log("agent", "계획 수정을 요청했습니다.");
-        store.planFeedbackSent();
-      }
-    },
-    [store],
-  );
 
   // Plan approval: send plan_approve{}, archive the approval into the log, and
   // start the apply turn (the store resets the per-turn buffers).
@@ -263,7 +263,6 @@ export default function App() {
         <PlanView
           plan={state.plan}
           pending={state.phase !== "plan_review"}
-          onFeedback={handlePlanFeedback}
           onApprove={handlePlanApprove}
         />
       )}

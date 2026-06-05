@@ -1461,6 +1461,50 @@ def test_classify_tool_result_dict_content_blocks():
     assert "20480" in info["event_data"]["result"]
 
 
+def test_classify_propose_plan_live_result_shape():
+    """EUD-073: the LIVE propose_plan result is an MCP result object whose
+    content blocks are plain dicts with a JSON-string text payload
+    (`{"ends_turn": true, "markdown": "..."}`) — NOT a bare {"markdown"} dict.
+    The live E2E rendered an EMPTY plan card because extraction fell through
+    every branch. Both the typed-model and dict-block shapes must extract."""
+    import types
+
+    from eud_agent.agent_runner import _classify_event
+
+    payload = '{"ends_turn": true, "markdown": "## 변경 계획\\n\\n1. HP 2000"}'
+    result = types.SimpleNamespace(
+        content=[{"type": "text", "text": payload}],
+        structured_content=None,
+    )
+    item = types.SimpleNamespace(
+        type="mcpToolCall", tool="propose_plan", arguments=None,
+        result=result, status=types.SimpleNamespace(value="completed"),
+        error=None,
+    )
+    _, _, info = _classify_event(_item_evt("item/completed", item))
+    assert info.get("plan_markdown", "").startswith("## 변경 계획"), (
+        f"plan markdown must extract from live content blocks; "
+        f"got {info.get('plan_markdown')!r}"
+    )
+
+
+def test_classify_propose_plan_nested_args_fallback():
+    """EUD-073: the call ARGUMENTS arrive shim-wrapped as {"args": {...}} —
+    the fallback extraction must unwrap that nesting."""
+    import types
+
+    from eud_agent.agent_runner import _classify_event
+
+    item = types.SimpleNamespace(
+        type="mcpToolCall", tool="propose_plan",
+        arguments={"args": {"markdown": "## 계획 from args"}},
+        result=None, status=types.SimpleNamespace(value="completed"),
+        error=None,
+    )
+    _, _, info = _classify_event(_item_evt("item/completed", item))
+    assert info.get("plan_markdown") == "## 계획 from args"
+
+
 def test_classify_tool_result_failed_carries_error():
     import types
 

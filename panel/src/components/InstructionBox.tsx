@@ -45,6 +45,12 @@ export function InstructionBox({ state, onSend, onReset }: InstructionBoxProps) 
   const canSend = state.canSend;
   // A turn is in flight while thinking — reset is disabled then.
   const turnInFlight = state.phase === "thinking";
+  // EUD-074: during plan_review the SAME input is the plan-feedback channel
+  // (App routes the send to plan_feedback{}); guide the user accordingly.
+  const placeholder =
+    state.phase === "plan_review"
+      ? "계획 수정 피드백을 입력하세요 (승인은 계획 카드에서)"
+      : "무엇을 만들까요? (예: 게임 시작 시 미네랄 +1000 트리거 추가)";
 
   function handleSend() {
     const text = instruction.trim();
@@ -67,7 +73,7 @@ export function InstructionBox({ state, onSend, onReset }: InstructionBoxProps) 
             aria-label="지시 입력"
             value={instruction}
             onChange={(e) => setInstruction(e.target.value)}
-            placeholder="무엇을 만들까요? (예: 게임 시작 시 미네랄 +1000 트리거 추가)"
+            placeholder={placeholder}
           />
         </PromptInputBody>
         <PromptInputFooter>

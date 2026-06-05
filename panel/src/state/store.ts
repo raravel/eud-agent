@@ -273,15 +273,15 @@ export interface PanelStore {
 }
 
 /**
- * Phases in which sending a chat is blocked because work is in flight or the
- * panel awaits a plan decision. `changeset_review` is NOT busy — a follow-up
- * chat is allowed (the server auto-accepts undecided items). `compiling` is an
- * orthogonal busy signal layered on top in {@link PanelState.canSend}.
+ * Phases in which sending is blocked because a turn is in flight.
+ * `plan_review` is NOT busy (EUD-074): the MAIN prompt input is the plan
+ * feedback channel — typing there sends `plan_feedback{}` (App routes by
+ * phase; the PlanView feedback textarea is removed). `changeset_review` is NOT
+ * busy — a follow-up chat is allowed (the server auto-accepts undecided
+ * items). `compiling` is an orthogonal busy signal layered on top in
+ * {@link PanelState.canSend}.
  */
-const BUSY_PHASES: ReadonlySet<Phase> = new Set<Phase>([
-  "thinking",
-  "plan_review",
-]);
+const BUSY_PHASES: ReadonlySet<Phase> = new Set<Phase>(["thinking"]);
 
 /**
  * Contractual no-project marker. The bridge returns `ERROR: no project` when no

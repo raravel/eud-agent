@@ -416,11 +416,13 @@ describe("send gating v2 = connected && hasProject && !busy (no settable target 
     expect(store.getState().canSend).toBe(false);
   });
 
-  it("blocks send while busy (plan_review awaits feedback/approve, not chat)", () => {
+  it("allows send during plan_review (the main input IS the feedback channel — EUD-074)", () => {
+    // The PlanView feedback textarea is REMOVED (user decision 2026-06-05):
+    // typing in the main prompt during plan_review sends plan_feedback{}.
     const store = readyWithProject();
     store.chatSent();
     store.planReceived("# plan", 1);
-    expect(store.getState().canSend).toBe(false);
+    expect(store.getState().canSend).toBe(true);
   });
 
   it("allows send during changeset_review (follow-up chat auto-accepts)", () => {

@@ -1228,6 +1228,35 @@
         "server/eud_agent/agent_runner.py",
         "server/tests/**"
       ]
+    },
+    "EUD-073-4693": {
+      "status": "done",
+      "priority": "high",
+      "type": "bug",
+      "parent": null,
+      "depends_on": [],
+      "title": "Plan markdown extraction fails on live MCP result shapes (empty plan card)",
+      "updated": "2026-06-05",
+      "completed_at": "2026-06-05T21:03:34.706003",
+      "path": "done/EUD-073-4693.md",
+      "scope": [
+        "server/eud_agent/agent_runner.py",
+        "server/tests/**"
+      ]
+    },
+    "EUD-074-d226": {
+      "status": "done",
+      "priority": "high",
+      "type": "bug",
+      "parent": null,
+      "depends_on": [],
+      "title": "Plan feedback flows through the main prompt input (remove PlanView feedback textarea)",
+      "updated": "2026-06-05",
+      "completed_at": "2026-06-05T21:03:35.265081",
+      "path": "done/EUD-074-d226.md",
+      "scope": [
+        "panel/src/**"
+      ]
     }
   }
 }

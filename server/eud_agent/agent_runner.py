@@ -789,11 +789,28 @@ def _plan_markdown_from(root) -> str:
 
 
 def _dig_markdown(val) -> str:
-    """Pull a ``markdown`` field out of a dict / JSON-string / object."""
+    """Pull a ``markdown`` field out of the shapes a propose_plan call carries.
+
+    Live shapes (EUD-073 — the first cut handled only bare dicts and rendered
+    an EMPTY plan card):
+
+    * the MCP RESULT object: content blocks (plain dicts live, typed models in
+      fakes) whose text is the JSON the tool returned
+      (``{"ends_turn": true, "markdown": "..."}``) — extracted via
+      :func:`_tool_result_text`, then re-dug as a JSON string;
+    * the call ARGUMENTS: shim-wrapped as ``{"args": {"markdown": ...}}`` —
+      the ``args`` nesting is unwrapped;
+    * plus the original bare-dict / JSON-string / ``.markdown``-attr shapes.
+    """
     if val is None:
         return ""
     if isinstance(val, dict):
-        return str(val.get("markdown") or "")
+        md = val.get("markdown")
+        if md:
+            return str(md)
+        # The shim wraps tool args under an "args" key — unwrap one level.
+        inner = val.get("args")
+        return _dig_markdown(inner) if inner is not None else ""
     if isinstance(val, str):
         s = val.strip()
         if s.startswith("{"):
@@ -803,11 +820,17 @@ def _dig_markdown(val) -> str:
                 d = json.loads(s)
             except ValueError:
                 return ""
-            if isinstance(d, dict):
-                return str(d.get("markdown") or "")
+            return _dig_markdown(d)
         return ""
     md = getattr(val, "markdown", None)
-    return str(md) if md else ""
+    if md:
+        return str(md)
+    # An MCP result object: join its content/structured text, then re-dig the
+    # JSON string the tool returned.
+    text = _tool_result_text(val)
+    if text:
+        return _dig_markdown(text)
+    return ""
 
 
 # Mutation tool names (mirror tools.WRITE_TOOLS minus build_run, which the journal
