@@ -715,15 +715,15 @@
       "scope": []
     },
     "EUD-045-38f9": {
-      "status": "pending",
+      "status": "done",
       "priority": "high",
       "type": "story",
       "parent": "EUD-043-1455",
       "depends_on": [],
       "title": "Agent core (server)",
       "updated": "2026-06-05",
-      "completed_at": null,
-      "path": "active/EUD-045-38f9.md",
+      "completed_at": "2026-06-05T15:33:41.008989",
+      "path": "done/EUD-045-38f9.md",
       "scope": []
     },
     "EUD-046-f2c8": {
@@ -920,7 +920,7 @@
       ]
     },
     "EUD-057-e71d": {
-      "status": "pending",
+      "status": "done",
       "priority": "medium",
       "type": "task",
       "parent": "EUD-045-38f9",
@@ -930,8 +930,8 @@
       ],
       "title": "euddraft runner + build self-fix loop",
       "updated": "2026-06-05",
-      "completed_at": null,
-      "path": "active/EUD-057-e71d.md",
+      "completed_at": "2026-06-05T15:33:40.975589",
+      "path": "done/EUD-057-e71d.md",
       "scope": [
         "server/eud_agent/edd_runner.py",
         "server/eud_agent/tools.py",
@@ -939,7 +939,7 @@
       ]
     },
     "EUD-058-babc": {
-      "status": "pending",
+      "status": "in_progress",
       "priority": "high",
       "type": "task",
       "parent": "EUD-046-f2c8",
@@ -954,7 +954,26 @@
         "panel/src/ws/protocol.ts",
         "panel/src/ws/client.ts",
         "panel/src/state/store.ts",
-        "panel/src/state/store.test.ts"
+        "panel/src/state/store.test.ts",
+        "panel/src/App.tsx",
+        "panel/src/components/ConversationLog.tsx",
+        "panel/src/components/InstructionBox.tsx",
+        "panel/src/components/ApplyBar.tsx",
+        "panel/src/components/TargetPicker.tsx",
+        "panel/src/components/ReviewTabs.tsx",
+        "panel/src\\components\\ApplyBar.test.tsx",
+        "panel/src\\components\\ConversationLog.test.tsx",
+        "panel/src\\components\\DiagnosticsStrip.test.tsx",
+        "panel/src\\components\\Header.test.tsx",
+        "panel/src\\components\\InstructionBox.test.tsx",
+        "panel/src\\components\\ReviewTabs.test.tsx",
+        "panel/src\\components\\TargetPicker.test.tsx",
+        "panel/src\\lib\\diff.test.ts",
+        "panel/src\\lib\\progress.test.ts",
+        "panel/src\\lib\\truncate.test.ts",
+        "panel/src\\state\\store.test.ts",
+        "panel/src\\ws\\client.test.ts",
+        "panel/src\\ws\\protocol.test.ts"
       ]
     },
     "EUD-059-e70c": {

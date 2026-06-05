@@ -10,7 +10,26 @@ scope:
 - panel/src/ws/client.ts
 - panel/src/state/store.ts
 - panel/src/state/store.test.ts
-status: pending
+- panel/src/App.tsx
+- panel/src/components/ConversationLog.tsx
+- panel/src/components/InstructionBox.tsx
+- panel/src/components/ApplyBar.tsx
+- panel/src/components/TargetPicker.tsx
+- panel/src/components/ReviewTabs.tsx
+- panel/src\components\ApplyBar.test.tsx
+- panel/src\components\ConversationLog.test.tsx
+- panel/src\components\DiagnosticsStrip.test.tsx
+- panel/src\components\Header.test.tsx
+- panel/src\components\InstructionBox.test.tsx
+- panel/src\components\ReviewTabs.test.tsx
+- panel/src\components\TargetPicker.test.tsx
+- panel/src\lib\diff.test.ts
+- panel/src\lib\progress.test.ts
+- panel/src\lib\truncate.test.ts
+- panel/src\state\store.test.ts
+- panel/src\ws\client.test.ts
+- panel/src\ws\protocol.test.ts
+status: in_progress
 title: Panel WS v2 protocol + store state machine rework
 type: task
 updated: '2026-06-05'

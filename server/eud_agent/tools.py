@@ -34,6 +34,23 @@ takes an optional ``journal_factory``; when present, each WRITE tool snapshots
 BEFORE mutating (after the gate/budget/validation pass) and records ``after``
 AFTER the bridge write. A ToolLayer built without a factory behaves exactly as
 before (reads/flow never journal). See ``journal.py``.
+
+Build self-fix (EUD-057) is wired in the SAME additive way: ``ToolLayer`` takes an
+optional ``runner_factory`` (a zero-arg factory returning an ``EddRunner``-shaped
+object with ``build_run() -> BuildRunResult`` and a ``last_result`` attribute).
+When present, ``build_run`` routes through the runner pipeline (BUILD -> poll ->
+error ladder) instead of the plain ``bridge.build()``, ``build_errors`` returns
+the LAST build's structured ladder errors (kept on the runner's ``last_result``),
+and each ``build_run`` consumes one of the request's 3 build-fix attempts; the 4th
+``build_run`` returns a :class:`ToolError` (the self-fix budget is spent) and sets
+``RequestState.build_fix_exhausted`` so the engine can note the failure on the
+changeset (build_run is never journaled, so it cannot be a changeset item). A real
+build failure or a poll/subprocess timeout consumes an attempt; a STATIC
+misconfiguration (``edd_runner.ConfigError``: unset euddraft / eds path) is
+re-raised as a ToolError WITHOUT consuming an attempt (codex cannot fix it by
+editing eps; 3 misconfigs must not exhaust the budget). A ToolLayer built WITHOUT a
+runner_factory keeps the current plain ``bridge.build()`` behavior (existing
+constructions keep working). See ``edd_runner.py``.
 """
 
 from __future__ import annotations
@@ -142,6 +159,13 @@ class RequestState:
     build_fix_attempts: int = 0
     action_limit: int = ACTION_BUDGET
     build_fix_limit: int = BUILD_FIX_LIMIT
+    # Set when the 4th build_run in a request is rejected (the self-fix budget is
+    # spent). build_run is NOT journaled (EUD-055 decision), so it can never be a
+    # changeset item; this flag is the minimal honest mechanism the engine reads
+    # to surface "build failed; self-fix budget spent" as a changeset note
+    # (features/05: "after which the changeset is presented with the failure
+    # noted"). See ToolLayer's build_run path.
+    build_fix_exhausted: bool = False
 
     def approve_plan(self) -> None:
         """Lift the mutation gate for this request (panel sent ``plan_approve``)."""
@@ -160,6 +184,7 @@ class RequestState:
             "plan_approved": int(self.plan_approved),
             "build_fix_attempts": self.build_fix_attempts,
             "build_fix_limit": self.build_fix_limit,
+            "build_fix_exhausted": int(self.build_fix_exhausted),
         }
 
 
@@ -780,6 +805,7 @@ class ToolLayer:
         *,
         gate: MutationGate | None = None,
         journal_factory: Callable[[str], Any] | None = None,
+        runner_factory: Callable[[], Any] | None = None,
     ) -> None:
         self._bridge = bridge
         self._gate = gate or MutationGate()
@@ -790,6 +816,12 @@ class ToolLayer:
         # (additive integration; existing constructions keep working).
         self._journal_factory = journal_factory
         self._journals: dict[str, Any] = {}
+        # Optional/injectable euddraft runner (EUD-057). A single instance per
+        # ToolLayer (one editor build at a time; ``last_result`` is the LAST
+        # build's errors, shared by build_run + build_errors). A ToolLayer built
+        # WITHOUT a factory keeps the plain ``bridge.build()`` behavior.
+        self._runner_factory = runner_factory
+        self._runner: Any | None = None
 
     # ---- registry introspection (used by the shim/endpoint) ----
     def has_tool(self, name: str) -> bool:
@@ -835,6 +867,21 @@ class ToolLayer:
             self._journals[request_id] = j
         return j
 
+    # ---- runner registry (optional; EUD-057) ----
+    def get_runner(self):
+        """The shared euddraft runner (created lazily from the factory).
+
+        Returns ``None`` when no ``runner_factory`` was injected (the additive
+        no-runner mode -> build_run falls back to the plain ``bridge.build()``).
+        One instance per ToolLayer: ``last_result`` carries the LAST build's
+        ladder errors that ``build_errors`` returns.
+        """
+        if self._runner_factory is None:
+            return None
+        if self._runner is None:
+            self._runner = self._runner_factory()
+        return self._runner
+
     # ---- the call paths ----
     def call_for_request(self, request_id: str, name: str, args: dict) -> Any:
         return self.call(
@@ -842,6 +889,7 @@ class ToolLayer:
             args,
             self.get_request_state(request_id),
             journal=self.get_journal(request_id),
+            runner=self.get_runner(),
         )
 
     def call(
@@ -851,6 +899,7 @@ class ToolLayer:
         state: RequestState,
         *,
         journal: Any | None = None,
+        runner: Any | None = None,
     ) -> Any:
         """Run one tool call under the gate + budget for ``state``.
 
@@ -865,6 +914,12 @@ class ToolLayer:
         the snapshot happens AFTER the gate/budget/validation pass but BEFORE the
         bridge write; the entry is recorded AFTER the write returns successfully.
         Reads and the flow tool never journal.
+
+        ``runner`` (optional, EUD-057) is the euddraft build runner: when present,
+        ``build_run`` routes through its pipeline (consuming a build-fix attempt;
+        the 4th -> ToolError + ``build_fix_exhausted``) and ``build_errors``
+        returns the runner's last ladder result. Both behaviors fall back to the
+        plain bridge when ``runner`` is None.
         """
         args = args or {}
         spec = _REGISTRY.get(name)
@@ -891,6 +946,22 @@ class ToolLayer:
                 "Call propose_plan(markdown) to outline the change for review "
                 "before continuing."
             )
+
+        # build_run via the runner pipeline (EUD-057). The gate/budget above have
+        # already passed (build_run is a write -> it counts as an action/mutation
+        # and obeys the plan gate). The self-fix budget is a SEPARATE cap: the 4th
+        # build_run in a request returns a ToolError (self-fix spent) and sets the
+        # changeset-note flag. A successful (<=3) attempt routes through
+        # ``runner.build_run`` and counts the action + mutation + the attempt. With
+        # NO runner, fall through to the normal plain-bridge path below.
+        if spec.name == "build_run" and runner is not None:
+            return self._build_run_via_runner(state, runner)
+
+        # build_errors via the runner's last ladder result (EUD-057). When a runner
+        # is present the read returns the LAST build's structured errors (dicts);
+        # with no runner, fall through to the plain bridge.builderr() read below.
+        if spec.name == "build_errors" and runner is not None:
+            return self._build_errors_via_runner(state, runner)
 
         # Journaled write path: validate args FIRST (no bridge touch), then
         # snapshot BEFORE the mutation, then write, then record AFTER. A
@@ -933,6 +1004,66 @@ class ToolLayer:
         if spec.mutating:
             state.mutation_count += 1
         return result
+
+    def _build_run_via_runner(self, state: RequestState, runner: Any) -> Any:
+        """Route ``build_run`` through the euddraft runner under the self-fix cap.
+
+        The action budget + mutation gate have already passed in :meth:`call`.
+        Here we enforce the SEPARATE 3-attempt self-fix budget
+        (``RequestState.build_fix_limit``): the 4th build_run in a request raises a
+        :class:`ToolError` telling codex the budget is spent and sets
+        ``build_fix_exhausted`` so the engine notes the failure on the changeset
+        (build_run is never journaled, so it cannot be a changeset item). A
+        permitted attempt runs the pipeline, records the attempt, and counts the
+        action + mutation. The runner's :class:`BuildRunResult` is returned as a
+        dict (``{ok, errors}``) so codex sees the structured outcome directly.
+        """
+        if state.build_fix_attempts >= state.build_fix_limit:
+            state.build_fix_exhausted = True
+            raise ToolError(
+                f"build self-fix budget spent ({state.build_fix_limit} attempts "
+                "per request). The changeset will be presented with the build "
+                "failure noted; stop trying to build and wrap up."
+            )
+        # Lazy import to avoid a tools <- edd_runner <- engine <- tools cycle at
+        # module load. ConfigError is a STATIC misconfiguration codex cannot fix by
+        # editing eps -> it does NOT consume a self-fix attempt (3 misconfigs would
+        # otherwise silently exhaust the budget).
+        from .edd_runner import ConfigError
+
+        try:
+            result = runner.build_run()
+        except ConfigError as exc:
+            # Static misconfiguration: surface as a tool error WITHOUT counting an
+            # action/mutation or a build-fix attempt (nothing codex can fix by
+            # retrying the build; the operator must set the path).
+            raise ToolError(f"build_run misconfigured: {exc}") from exc
+        except (TimeoutError, RuntimeError) as exc:
+            # A real pipeline failure (poll/subprocess timeout, or any other
+            # RuntimeError) is a tool result codex can read, not a transport crash.
+            # The attempt still counts (it consumed a build) and the
+            # action/mutation are counted so the request budgets stay honest.
+            state.action_count += 1
+            state.mutation_count += 1
+            state.record_build_fix_attempt()
+            raise ToolError(f"build_run failed: {exc}") from exc
+        state.action_count += 1
+        state.mutation_count += 1
+        state.record_build_fix_attempt()
+        return {"ok": result.ok, "errors": result.errors_as_dicts()}
+
+    @staticmethod
+    def _build_errors_via_runner(state: RequestState, runner: Any) -> Any:
+        """Return the LAST build's structured ladder errors (runner-backed).
+
+        ``build_errors`` is a READ (no budget/gate/journal). When the runner has a
+        ``last_result`` we return its structured entries (dicts); before any
+        build_run in the request there is nothing -> ``[]``.
+        """
+        last = getattr(runner, "last_result", None)
+        if last is None:
+            return []
+        return last.errors_as_dicts()
 
     def _validate_args(self, spec: ToolSpec, args: dict) -> None:
         """Run the handler's arg validation WITHOUT touching the real bridge.
