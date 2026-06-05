@@ -34,6 +34,11 @@ local ok, initErr = pcall(function()
     local GlobalObj  = luanet.import_type("EUD_Editor_3.GlobalObj")
     local TEFile     = luanet.import_type("EUD_Editor_3.TEFile")
     local EFileType  = luanet.import_type("EUD_Editor_3.TEFile+EFileType")
+    -- DatFiles enum carries EVERY dat name (units..orders, portdata, sfxdata, and
+    -- the extra/require/button entries). The editor's name-resolver whitelists
+    -- only the first 8; we map names to enum OBJECTS directly so portdata/sfxdata
+    -- resolve too (rules.md: enum args ALWAYS as imported objects, never ints).
+    local DatFiles   = luanet.import_type("EUD_Editor_3.SCDatFiles+DatFiles")
     local WindowControl = luanet.import_type("EUD_Editor_3.WindowControl")
     local WMenus     = luanet.import_type("EUD_Editor_3.WindowMenu.WindowMenus")
     local DispatcherTimer = luanet.import_type("System.Windows.Threading.DispatcherTimer")
@@ -232,16 +237,57 @@ local ok, initErr = pcall(function()
         spawnServer()
     end
 
-    -- 데이터 에디터: datname → enum(GetDatFileE). None(255) 차단(아니면 KeyNotFound).
+    -- Data editor: bridge-local name->enum table over SCDatFiles+DatFiles.
+    -- Replaces the editor's 8-name resolver (its whitelist excludes
+    -- portdata/sfxdata). Values are enum OBJECTS (rules.md), built once at init.
+    -- String keys are the command's dat-name tokens.
+    local datNameToEnum = {
+        ["units"]    = DatFiles.units,
+        ["weapons"]  = DatFiles.weapons,
+        ["flingy"]   = DatFiles.flingy,
+        ["sprites"]  = DatFiles.sprites,
+        ["images"]   = DatFiles.images,
+        ["upgrades"] = DatFiles.upgrades,
+        ["techdata"] = DatFiles.techdata,
+        ["orders"]   = DatFiles.orders,
+        ["portdata"] = DatFiles.portdata,
+        ["sfxdata"]  = DatFiles.sfxdata,
+    }
+    -- xdat kinds (ExtraDatBinding key enums) and the require-dat subset.
+    local xdatKindToEnum = {
+        ["statusinfor"] = DatFiles.statusinfor,
+        ["wireframe"]   = DatFiles.wireframe,
+        ["ButtonSet"]   = DatFiles.ButtonSet,
+    }
+    local reqDatToEnum = {
+        ["units"]     = DatFiles.units,
+        ["upgrades"]  = DatFiles.upgrades,
+        ["techdata"]  = DatFiles.techdata,
+        ["Stechdata"] = DatFiles.Stechdata,
+        ["orders"]    = DatFiles.orders,
+    }
+
     local function resolveDatBinding(datname, param, objId)
         local pj = GlobalObj.pjData
-        if pj == nil then return nil, "프로젝트 미로드" end
-        local datEnum = pj.Dat:GetDatFileE(datname)
-        if string.find(safestr(datEnum), "None") then
-            return nil, "invalid datname (units/weapons/flingy/sprites/images/upgrades/techdata/orders)"
+        if pj == nil then return nil, "no project" end
+        local datEnum = datNameToEnum[datname]
+        if datEnum == nil then
+            return nil, "invalid datname (units/weapons/flingy/sprites/images/upgrades/techdata/orders/portdata/sfxdata)"
         end
         local binding = pj.BindingManager:get_DatBinding(datEnum, param, objId)
-        if binding == nil then return nil, "param/index 확인" end
+        if binding == nil then return nil, "param/index" end
+        return binding, nil
+    end
+
+    local function resolveXDatBinding(kind, name, objId)
+        local pj = GlobalObj.pjData
+        if pj == nil then return nil, "no project" end
+        local kindEnum = xdatKindToEnum[kind]
+        if kindEnum == nil then
+            return nil, "invalid xdat kind (statusinfor/wireframe/ButtonSet)"
+        end
+        local binding = pj.BindingManager:get_ExtraDatBinding(kindEnum, name, objId)
+        if binding == nil then return nil, "null binding (name/index out of range)" end
         return binding, nil
     end
 
@@ -470,6 +516,152 @@ local ok, initErr = pcall(function()
             if b == nil then return "ERROR: " .. err end
             local before = safestr(b.Value); b.Value = a[4]
             return "OK: " .. a[1] .. "|" .. a[2] .. "|" .. a[3] .. " : '" .. before .. "' -> '" .. safestr(b.Value) .. "'"
+        elseif cmd == "GETXDAT" then
+            local a = split(arg, "|")
+            if #a < 3 then return "ERROR: 'GETXDAT dat|name|objId'" end
+            local b, err = resolveXDatBinding(a[1], a[2], tonumber(a[3]))
+            if b == nil then return "ERROR: " .. err end
+            return "OK: " .. a[1] .. "|" .. a[2] .. "|" .. a[3] .. " = " .. safestr(b.Value)
+        elseif cmd == "SETXDAT" then
+            local a = split(arg, "|")
+            if #a < 4 then return "ERROR: 'SETXDAT dat|name|objId|value'" end
+            local b, err = resolveXDatBinding(a[1], a[2], tonumber(a[3]))
+            if b == nil then return "ERROR: " .. err end
+            -- Byte-backed setters silently swallow bad values (capability-survey):
+            -- assign then RE-READ .Value and return the read-back so the server
+            -- can verify the write took.
+            local before = safestr(b.Value)
+            local okAssign = pcall(function() b.Value = a[4] end)
+            if not okAssign then return "ERROR: setxdat assign failed" end
+            return "OK: " .. a[1] .. "|" .. a[2] .. "|" .. a[3] .. " : '" .. before .. "' -> '" .. safestr(b.Value) .. "'"
+        elseif cmd == "GETTBL" then
+            local pj = GlobalObj.pjData
+            if pj == nil then return "ERROR: no project" end
+            local index = tonumber(string.gsub(arg, "^%s*(.-)%s*$", "%1"))
+            if index == nil then return "ERROR: 'GETTBL index'" end
+            local b = pj.BindingManager:get_StatTxtBinding(index)
+            if b == nil then return "ERROR: null binding (index out of range)" end
+            return "OK: " .. index .. " = " .. safestr(b.Value)
+        elseif cmd == "SETTBL" then
+            local pj = GlobalObj.pjData
+            if pj == nil then return "ERROR: no project" end
+            local index = tonumber(string.gsub(arg, "^%s*(.-)%s*$", "%1"))
+            if index == nil then return "ERROR: 'SETTBL index' + value from 2nd line" end
+            local b = pj.BindingManager:get_StatTxtBinding(index)
+            if b == nil then return "ERROR: null binding (index out of range)" end
+            -- value travels in the BODY (UTF-8 .NET-safe, Korean ok); never the
+            -- arg line. body == "NULLSTRING" resets to default (StatNullString).
+            local before = safestr(b.Value)
+            local okSet = pcall(function()
+                if body == "NULLSTRING" then b:DataReset() else b.Value = body end
+            end)
+            if not okSet then return "ERROR: settbl failed" end
+            return "OK: " .. index .. " set (" .. string.len(body) .. "B), was '" .. before .. "'"
+        elseif cmd == "RESETDAT" then
+            local a = split(arg, "|")
+            if #a < 4 then return "ERROR: 'RESETDAT kind|dat|param-or-name|objId'" end
+            local kind = a[1]
+            local b, err
+            if kind == "dat" then
+                b, err = resolveDatBinding(a[2], a[3], tonumber(a[4]))
+            elseif kind == "xdat" then
+                b, err = resolveXDatBinding(a[2], a[3], tonumber(a[4]))
+            elseif kind == "tbl" then
+                local pj = GlobalObj.pjData
+                if pj == nil then return "ERROR: no project" end
+                b = pj.BindingManager:get_StatTxtBinding(tonumber(a[4]))
+                if b == nil then err = "null binding (index out of range)" end
+            else
+                return "ERROR: invalid kind (dat/xdat/tbl)"
+            end
+            if b == nil then return "ERROR: " .. (err or "resolve failed") end
+            local okR = pcall(function() b:DataReset() end)
+            if not okR then return "ERROR: reset failed" end
+            return "OK: reset " .. kind .. " " .. a[2] .. "|" .. a[3] .. "|" .. a[4]
+        elseif cmd == "GETREQ" then
+            local a = split(arg, "|")
+            if #a < 2 then return "ERROR: 'GETREQ dat|objId'" end
+            local pj = GlobalObj.pjData
+            if pj == nil then return "ERROR: no project" end
+            local datEnum = reqDatToEnum[a[1]]
+            if datEnum == nil then return "ERROR: invalid req dat (units/upgrades/techdata/Stechdata/orders)" end
+            local objId = tonumber(a[2])
+            local cr = pj.ExtraDat:get_RequireData(datEnum)
+            if cr == nil then return "ERROR: null require data" end
+            local okG, s = pcall(function() return cr:GetCopyString(objId) end)
+            if not okG then return "ERROR: getreq failed" end
+            return "OK: " .. a[1] .. "|" .. a[2] .. " = " .. safestr(s)
+        elseif cmd == "SETREQ" then
+            local a = split(arg, "|")
+            if #a < 2 then return "ERROR: 'SETREQ dat|objId' + payload from 2nd line" end
+            local pj = GlobalObj.pjData
+            if pj == nil then return "ERROR: no project" end
+            local datEnum = reqDatToEnum[a[1]]
+            if datEnum == nil then return "ERROR: invalid req dat (units/upgrades/techdata/Stechdata/orders)" end
+            local objId = tonumber(a[2])
+            -- Defense in depth (LUA-channel callers bypass the server's
+            -- normalization): the first dot-segment MUST be numeric. The editor's
+            -- PasteCopyData coerces it String->Enum (number); a non-numeric first
+            -- segment throws an uncatchable InvalidCastException -> editor dialog.
+            -- Guard BEFORE any .NET call.
+            local firstSeg = string.match(body, "^([^.]*)")
+            if firstSeg == nil or not string.match(firstSeg, "^%d+$") then
+                return "ERROR: payload first segment must be numeric (0-4)"
+            end
+            local cr = pj.ExtraDat:get_RequireData(datEnum)
+            if cr == nil then return "ERROR: null require data" end
+            -- DefaultUse (segment "0") is a SILENT NO-OP in PasteCopyData (no
+            -- DefaultUse branch). Route it through the binding's IsDefaultUse
+            -- setter instead. All other segments ("1"-"4") go via PasteCopyData.
+            if firstSeg == "0" then
+                local okD = pcall(function()
+                    pj.BindingManager:get_RequireDataBinding(objId, datEnum).IsDefaultUse = true
+                end)
+                if not okD then return "ERROR: setreq default failed" end
+            else
+                local okP = pcall(function() cr:PasteCopyData(objId, body) end)
+                if not okP then return "ERROR: setreq failed (bad payload?)" end
+            end
+            local readBack = ""
+            pcall(function() readBack = safestr(cr:GetCopyString(objId)) end)
+            return "OK: " .. a[1] .. "|" .. a[2] .. " = " .. readBack
+        elseif cmd == "GETBTN" then
+            local pj = GlobalObj.pjData
+            if pj == nil then return "ERROR: no project" end
+            local setId = tonumber(string.gsub(arg, "^%s*(.-)%s*$", "%1"))
+            if setId == nil then return "ERROR: 'GETBTN setId'" end
+            local bs = pj.ExtraDat.ButtonData:get_GetButtonSet(setId)
+            if bs == nil then return "ERROR: null button set (id out of range)" end
+            local okG, s = pcall(function() return bs:GetCopyString() end)
+            if not okG then return "ERROR: getbtn failed" end
+            return "OK: " .. setId .. " = " .. safestr(s)
+        elseif cmd == "SETBTN" then
+            local pj = GlobalObj.pjData
+            if pj == nil then return "ERROR: no project" end
+            local setId = tonumber(string.gsub(arg, "^%s*(.-)%s*$", "%1"))
+            if setId == nil then return "ERROR: 'SETBTN setId' + csv from 2nd line" end
+            if body == "" then return "ERROR: empty csv body" end
+            -- 8-field CSV pre-check (pos,icon,con,act,conval,actval,enastr,disstr),
+            -- one button per dot-separated group; reject malformed before Paste.
+            local groups = split(body, ".")
+            for gi = 1, #groups do
+                local fields = split(groups[gi], ",")
+                if #fields < 8 then
+                    return "ERROR: malformed csv (button " .. gi .. " needs 8 fields)"
+                end
+                for fi = 1, 8 do
+                    if tonumber(fields[fi]) == nil then
+                        return "ERROR: malformed csv (button " .. gi .. " field " .. fi .. " not numeric)"
+                    end
+                end
+            end
+            local bs = pj.ExtraDat.ButtonData:get_GetButtonSet(setId)
+            if bs == nil then return "ERROR: null button set (id out of range)" end
+            local okP = pcall(function() bs:PasteFromString(body) end)
+            if not okP then return "ERROR: setbtn failed" end
+            -- direct mutations don't auto-dirty: mark dirty manually.
+            pcall(function() pj:SetDirty(true) end)
+            return "OK: setbtn " .. setId .. " (" .. #groups .. " buttons)"
         elseif cmd == "PANEL" then
             return showPanel()
         elseif cmd == "BUILD" then

@@ -54,6 +54,29 @@ DEFAULT_POLL_INTERVAL = 0.2
 # CUI family (CUIEps/CUIPy/CUITrg/...) is covered without enumerating every member.
 _SETTABLE_FAMILIES = ("CUI", "RAWTEXT")
 
+# DAT surface whitelists (features/04 "DAT surface (B1)"; capability-survey rows
+# 1-8). Validation rejects unknown args BEFORE a .cmd is written, so a typo never
+# round-trips to the editor. The dat-name set bypasses the editor's GetDatFileE
+# 8-name whitelist by including portdata/sfxdata.
+_DAT_NAMES = (
+    "units",
+    "weapons",
+    "flingy",
+    "sprites",
+    "images",
+    "upgrades",
+    "techdata",
+    "orders",
+    "portdata",
+    "sfxdata",
+)
+# ExtraDat kinds for GET/SETXDAT (the ExtraDatBinding key enums).
+_XDAT_KINDS = ("statusinfor", "wireframe", "ButtonSet")
+# require.dat subset for GET/SETREQ (techdata vs Stechdata duality).
+_REQ_DATS = ("units", "upgrades", "techdata", "Stechdata", "orders")
+# RESETDAT routing kinds.
+_RESET_KINDS = ("dat", "xdat", "tbl")
+
 
 class BridgeError(Exception):
     """The bridge returned an ``ERROR:``-prefixed result for a command."""
@@ -70,6 +93,73 @@ def _settable_for(ftype: str) -> bool:
     """Whether a file of this EFileType name accepts SET (memory-only edit)."""
     upper = ftype.upper()
     return any(fam in upper for fam in _SETTABLE_FAMILIES)
+
+
+# ----------------------------------------------------------- DAT arg validation
+# Each helper raises :class:`BridgeError` for an out-of-contract argument BEFORE
+# any command is sent (features/04: "Numeric values validated server-side before
+# send"). Raising the module's own error type keeps the wrapper surface uniform.
+
+
+def _require_in(value: str, allowed: tuple[str, ...], label: str) -> str:
+    if value not in allowed:
+        raise BridgeError(
+            f"ERROR: invalid {label} {value!r} (one of {', '.join(allowed)})"
+        )
+    return value
+
+
+def _require_nonneg_int(value: object, label: str) -> int:
+    try:
+        n = int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError) as exc:
+        raise BridgeError(f"ERROR: {label} must be an integer, got {value!r}") from exc
+    if n < 0:
+        raise BridgeError(f"ERROR: {label} must be non-negative, got {n}")
+    return n
+
+
+def _require_numeric_value(value: object, label: str) -> str:
+    """A dat value must be numeric (the editor's setters are integer-backed)."""
+    try:
+        int(str(value), 0) if isinstance(value, str) else int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError) as exc:
+        raise BridgeError(
+            f"ERROR: {label} must be numeric, got {value!r}"
+        ) from exc
+    return str(value)
+
+
+# RequireUse use-mode keyword -> numeric value (CRequireData.vb:15-21). The
+# editor's PasteCopyData coerces the first dot-segment String->Enum (number), so
+# only a numeric first segment is safe; keywords must be pre-mapped to digits.
+_REQ_USE_KEYWORDS = {
+    "Default": "0",
+    "Dont": "1",
+    "Always": "2",
+    "AlwaysCurrent": "3",
+}
+
+
+def _normalize_req_payload(payload: str) -> str:
+    """Map a use-mode keyword to its numeric value; validate the first segment.
+
+    Accepts a keyword (Default/Dont/Always/AlwaysCurrent), a bare use-mode digit
+    (0-4), or a custom copy-string (``4.<op,val>...``). The first dot-segment of
+    the result MUST be one of 0-4; anything else raises :class:`BridgeError`
+    BEFORE send so a non-numeric first segment never reaches the bridge (where it
+    would throw an uncatchable InvalidCastException in the editor).
+    """
+    if payload in _REQ_USE_KEYWORDS:
+        return _REQ_USE_KEYWORDS[payload]
+    first = payload.split(".", 1)[0]
+    if first not in ("0", "1", "2", "3", "4"):
+        raise BridgeError(
+            "ERROR: setreq payload must be a use-mode keyword "
+            "(Default/Dont/Always/AlwaysCurrent) or a copy-string whose first "
+            f"segment is 0-4, got {payload!r}"
+        )
+    return payload
 
 
 class BridgeIO:
@@ -201,6 +291,142 @@ class BridgeIO:
         auto-suffix), surfaced as :class:`BridgeError`.
         """
         reply = self.send(f"NEWEPS {name}\n{code}", **kw)
+        self._raise_if_error(reply)
+        return reply
+
+    # ----------------------------------------------------------- DAT surface
+    # Wrappers per features/04 "DAT surface (B1)". Args are validated (raising
+    # BridgeError) BEFORE send so a bad name/index never reaches the editor. The
+    # pipe-separated arg line carries identifiers; multi-line / UTF-8 values
+    # (SETTBL/SETREQ/SETBTN) travel in the body (2nd line onward).
+
+    def getdat(self, dat: str, param: str, obj_id: int, **kw) -> str:
+        """Read a standard dat field (``GETDAT dat|param|objId``)."""
+        _require_in(dat, _DAT_NAMES, "dat name")
+        obj_id = _require_nonneg_int(obj_id, "objId")
+        reply = self.send(f"GETDAT {dat}|{param}|{obj_id}", **kw)
+        self._raise_if_error(reply)
+        return reply
+
+    def setdat(self, dat: str, param: str, obj_id: int, value, **kw) -> str:
+        """Write a standard dat field (``SETDAT dat|param|objId|value``).
+
+        ``value`` is validated numeric (the editor's dat setters are integer-
+        backed and clamp out-of-range; a non-numeric value is rejected here).
+        """
+        _require_in(dat, _DAT_NAMES, "dat name")
+        obj_id = _require_nonneg_int(obj_id, "objId")
+        value = _require_numeric_value(value, "value")
+        reply = self.send(f"SETDAT {dat}|{param}|{obj_id}|{value}", **kw)
+        self._raise_if_error(reply)
+        return reply
+
+    def getxdat(self, dat: str, name: str, obj_id: int, **kw) -> str:
+        """Read an ExtraDat field (``GETXDAT dat|name|objId``).
+
+        ``dat`` ∈ {statusinfor, wireframe, ButtonSet}; ``name`` per survey
+        (Status/Display/Joint, wire/grp/tran, ButtonSet).
+        """
+        _require_in(dat, _XDAT_KINDS, "xdat kind")
+        obj_id = _require_nonneg_int(obj_id, "objId")
+        reply = self.send(f"GETXDAT {dat}|{name}|{obj_id}", **kw)
+        self._raise_if_error(reply)
+        return reply
+
+    def setxdat(self, dat: str, name: str, obj_id: int, value, **kw) -> str:
+        """Write an ExtraDat field (``SETXDAT dat|name|objId|value``).
+
+        The bridge re-reads ``.Value`` after assignment (Byte setters swallow bad
+        values) and returns the read-back so the caller can verify the write.
+        """
+        _require_in(dat, _XDAT_KINDS, "xdat kind")
+        obj_id = _require_nonneg_int(obj_id, "objId")
+        value = _require_numeric_value(value, "value")
+        reply = self.send(f"SETXDAT {dat}|{name}|{obj_id}|{value}", **kw)
+        self._raise_if_error(reply)
+        return reply
+
+    def gettbl(self, index: int, **kw) -> str:
+        """Read a stat_txt/tbl string (``GETTBL index``)."""
+        index = _require_nonneg_int(index, "index")
+        reply = self.send(f"GETTBL {index}", **kw)
+        self._raise_if_error(reply)
+        return reply
+
+    def settbl(self, index: int, value: str, **kw) -> str:
+        """Write a stat_txt/tbl string. Value travels in the BODY (UTF-8-safe).
+
+        ``value == "NULLSTRING"`` resets the entry to its default.
+        """
+        index = _require_nonneg_int(index, "index")
+        reply = self.send(f"SETTBL {index}\n{value}", **kw)
+        self._raise_if_error(reply)
+        return reply
+
+    def resetdat(
+        self, kind: str, dat: str, param_or_name: str, obj_id: int, **kw
+    ) -> str:
+        """Reset a field to its stock value (``RESETDAT kind|dat|param-or-name|objId``).
+
+        ``kind`` ∈ {dat, xdat, tbl}; for ``tbl`` the dat/param args are ignored by
+        the bridge (only the index matters) but kept for a uniform arg shape.
+        """
+        _require_in(kind, _RESET_KINDS, "reset kind")
+        obj_id = _require_nonneg_int(obj_id, "objId")
+        if kind == "dat":
+            _require_in(dat, _DAT_NAMES, "dat name")
+        elif kind == "xdat":
+            _require_in(dat, _XDAT_KINDS, "xdat kind")
+        reply = self.send(f"RESETDAT {kind}|{dat}|{param_or_name}|{obj_id}", **kw)
+        self._raise_if_error(reply)
+        return reply
+
+    def getreq(self, dat: str, obj_id: int, **kw) -> str:
+        """Read a requirement as the editor copy-string (``GETREQ dat|objId``).
+
+        ``dat`` ∈ {units, upgrades, techdata, Stechdata, orders}.
+        """
+        _require_in(dat, _REQ_DATS, "req dat")
+        obj_id = _require_nonneg_int(obj_id, "objId")
+        reply = self.send(f"GETREQ {dat}|{obj_id}", **kw)
+        self._raise_if_error(reply)
+        return reply
+
+    def setreq(self, dat: str, obj_id: int, payload: str, **kw) -> str:
+        """Write a requirement (``SETREQ dat|objId`` + payload in BODY).
+
+        ``payload`` is either a use-mode keyword (Default/Dont/Always/
+        AlwaysCurrent) or the editor's own custom copy-string (starts ``4.``).
+        Keywords are mapped to their NUMERIC ``RequireUse`` value BEFORE send
+        (Default→0, Dont→1, Always→2, AlwaysCurrent→3); the bare digit is also
+        accepted. The editor's ``PasteCopyData`` does a String=Enum compare that
+        coerces the first dot-segment to a number — a non-numeric first segment
+        throws ``InvalidCastException`` (uncatchable by lua pcall → editor error
+        dialog), so the first segment MUST be one of 0-4. We validate that here
+        and reject anything else BEFORE send (rules.md: isolate risk in Python).
+        """
+        _require_in(dat, _REQ_DATS, "req dat")
+        obj_id = _require_nonneg_int(obj_id, "objId")
+        payload = _normalize_req_payload(payload)
+        reply = self.send(f"SETREQ {dat}|{obj_id}\n{payload}", **kw)
+        self._raise_if_error(reply)
+        return reply
+
+    def getbtn(self, set_id: int, **kw) -> str:
+        """Read a button set as the editor CSV (``GETBTN setId``)."""
+        set_id = _require_nonneg_int(set_id, "setId")
+        reply = self.send(f"GETBTN {set_id}", **kw)
+        self._raise_if_error(reply)
+        return reply
+
+    def setbtn(self, set_id: int, csv: str, **kw) -> str:
+        """Write a button set (``SETBTN setId`` + CSV in BODY).
+
+        The bridge 8-field-validates each dot-separated button before Paste and
+        dirties the project; a malformed CSV returns ``ERROR:``.
+        """
+        set_id = _require_nonneg_int(set_id, "setId")
+        reply = self.send(f"SETBTN {set_id}\n{csv}", **kw)
         self._raise_if_error(reply)
         return reply
 

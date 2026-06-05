@@ -767,7 +767,7 @@
       ]
     },
     "EUD-049-5d70": {
-      "status": "pending",
+      "status": "done",
       "priority": "high",
       "type": "task",
       "parent": "EUD-044-c735",
@@ -776,8 +776,8 @@
       ],
       "title": "Bridge DAT surface commands (resolver table + XDAT/TBL/RESET/REQ/BTN)",
       "updated": "2026-06-05",
-      "completed_at": null,
-      "path": "active/EUD-049-5d70.md",
+      "completed_at": "2026-06-05T12:23:11.833432",
+      "path": "done/EUD-049-5d70.md",
       "scope": [
         "bridge/ZZZ_10_agent_bridge.lua",
         "server/eud_agent/bridge_io.py",
