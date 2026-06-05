@@ -11,6 +11,8 @@ dependencies = [
     "transformers==5.10.1",
     "torch==2.12.0",
     "numpy==2.4.6",
+    "openai-codex==0.1.0b3",
+    "mcp==1.27.2",
 ]
 
 [dependency-groups]
@@ -28,6 +30,14 @@ dev = [
 # instead, i.e. replace the `index = "pytorch-cu126"` line under
 # [tool.uv.sources] with `index = "pytorch-cpu"` and uncomment the cpu index
 # block — torch then resolves to 2.12.0+cpu (run with reduced seq/batch).
+# openai-codex==0.1.0b3 is a pre-release and pulls in the pre-release
+# openai-codex-cli-bin (the bundled CLI binary); allow pre-releases so
+# `uv sync` resolves without --prerelease=allow on the command line. The SDK
+# is pointed at the BYO authenticated codex CLI via CodexConfig.codex_bin at
+# runtime, so the bundled binary is only a transitive download (EUD-053 spike).
+[tool.uv]
+prerelease = "allow"
+
 [tool.uv.sources]
 torch = { index = "pytorch-cu126" }
 

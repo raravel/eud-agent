@@ -1,4 +1,5 @@
 ---
+completed_at: '2026-06-05T13:03:53.539309'
 created: '2026-06-05'
 depends_on: []
 id: EUD-053-f3ac
@@ -6,7 +7,7 @@ parent: EUD-045-38f9
 priority: high
 scope:
 - '*'
-status: pending
+status: done
 title: 'Spike: codex Python SDK + eud-tools MCP round-trip (Windows)'
 type: task
 updated: '2026-06-05'

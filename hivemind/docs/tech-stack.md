@@ -13,6 +13,8 @@ Pinned in `server/pyproject.toml` (uv-managed venv at `server/.venv`, Python 3.1
 - transformers 5.10.1 — pinned: 5.10 requires torch>=2.8 float8 symbols; older torch fails at import
 - torch 2.12.0+cu126 — **must install from the cu126 index** (`--index-url https://download.pytorch.org/whl/cu126`); plain PyPI torch is CPU-only and the cu124 index lacks a compatible build. CPU fallback for machines without CUDA: torch 2.12.0+cpu with reduced seq/batch (switch documented in pyproject comments).
 - numpy 2.4.6 — transitive pin proven in ECA venv
+- openai-codex 0.1.0b3 — official Codex Python SDK (openai/codex `sdk/python`, module `openai_codex`); codex thread lifecycle + streaming JSONL events for the v2 agent core. Pre-release; pulls in the pre-release `openai-codex-cli-bin` (bundled binary) but pointed at the BYO authenticated CLI via `CodexConfig(codex_bin=...)` at runtime. `[tool.uv] prerelease = "allow"` set so `uv sync` resolves it (EUD-053 spike).
+- mcp 1.27.2 — Model Context Protocol Python SDK; server side of the eud-tools stdio shim codex attaches to (FastMCP, stdio transport) (EUD-053 spike)
 - ruff (dev) — lint; pytest (dev) — test runner; pytest-asyncio (dev) — WS/orchestrator tests
 
 ### Frontend (panel/) — pinned in `panel/package.json` (resolved via package-lock.json, EUD-031)
@@ -29,13 +31,6 @@ Pinned in `server/pyproject.toml` (uv-managed venv at `server/.venv`, Python 3.1
 - npm — package manager (node v24.11.1 system install)
 
 > Decision: see [[decisions/03_react-panel-rebuild]] and [[decisions/05_monaco-editor-adoption]].
-
-### Planned — v2 agent core (NOT yet in any manifest; added to `server/pyproject.toml` when the owning task lands)
-
-- official Codex Python SDK (openai/codex `sdk/python`) — codex thread lifecycle, streaming JSONL events, BYO account; exact PyPI package name and pin are determined by the v2 spike task before any dependent code is written
-- `mcp` (Model Context Protocol Python SDK) — server side of the eud-tools stdio shim that codex attaches to; pinned by the same spike
-
-> These two entries move into Active Dependencies (with pins) the moment the spike task commits them to `server/pyproject.toml`. Until then nothing imports them.
 
 ## Build Artifacts
 

@@ -839,15 +839,15 @@
       ]
     },
     "EUD-053-f3ac": {
-      "status": "pending",
+      "status": "done",
       "priority": "high",
       "type": "task",
       "parent": "EUD-045-38f9",
       "depends_on": [],
       "title": "Spike: codex Python SDK + eud-tools MCP round-trip (Windows)",
       "updated": "2026-06-05",
-      "completed_at": null,
-      "path": "active/EUD-053-f3ac.md",
+      "completed_at": "2026-06-05T13:03:53.539309",
+      "path": "done/EUD-053-f3ac.md",
       "scope": [
         "*"
       ]
