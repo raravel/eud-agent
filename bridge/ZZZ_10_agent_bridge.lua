@@ -39,6 +39,14 @@ local ok, initErr = pcall(function()
     -- only the first 8; we map names to enum OBJECTS directly so portdata/sfxdata
     -- resolve too (rules.md: enum args ALWAYS as imported objects, never ints).
     local DatFiles   = luanet.import_type("EUD_Editor_3.SCDatFiles+DatFiles")
+    -- Settings & plugins (B3). TSetting is the program-settings enum nested in
+    -- ProgramData (verified ProgramData.vb:174 -- members euddraft/starcraft/
+    -- Language). EdsBlockType + EdsBlockItem are nested in BuildData/BuildData.
+    -- EdsBlock (verified WriteedsFile.vb:6/99). Enum args ALWAYS as imported
+    -- objects (rules.md), so import the enum types here at init.
+    local TSetting     = luanet.import_type("EUD_Editor_3.ProgramData+TSetting")
+    local EdsBlockType = luanet.import_type("EUD_Editor_3.BuildData+EdsBlockType")
+    local EdsBlockItem = luanet.import_type("EUD_Editor_3.BuildData+EdsBlock+EdsBlockItem")
     local WindowControl = luanet.import_type("EUD_Editor_3.WindowControl")
     local WMenus     = luanet.import_type("EUD_Editor_3.WindowMenu.WindowMenus")
     local DispatcherTimer = luanet.import_type("System.Windows.Threading.DispatcherTimer")
@@ -232,6 +240,47 @@ local ok, initErr = pcall(function()
         walk(pj.TEData.PFIles, "", function(p, f) if f == main then found = p end end)
         return found
     end
+
+    -- ------------------------------------------------------------------
+    -- Settings & plugins helpers (B3). Two scopes:
+    --   project: plain pjData properties (dot get/set), whitelisted below.
+    --   program: pgData parameterized property Setting(TSetting) -> from KopiLua
+    --            as :get_Setting(enum) / :set_Setting(enum, value) (rules.md:
+    --            parameterized properties ALWAYS get_X/set_X). TSetting members
+    --            are enum OBJECTS (imported above), never ints/strings.
+    -- ANY scope/key outside these whitelists -> ERROR (B3: no theme/UX chrome).
+    -- ------------------------------------------------------------------
+    -- project-scope key -> getter/setter closures over pjData (dot access). The
+    -- whitelist IS the table keys; an unknown key returns nil -> ERROR.
+    local projGetters = {
+        ["OpenMapName"]  = function(pj) return pj.OpenMapName end,
+        ["SaveMapName"]  = function(pj) return pj.SaveMapName end,
+        ["AutoBuild"]    = function(pj) return pj.AutoBuild end,
+        ["UseCustomtbl"] = function(pj) return pj.UseCustomtbl end,
+        ["ViewLog"]      = function(pj) return pj.ViewLog end,
+        ["TempFileLoc"]  = function(pj) return pj.TempFileLoc end,
+    }
+    local projSetters = {
+        ["OpenMapName"]  = function(pj, v) pj.OpenMapName = v end,
+        ["SaveMapName"]  = function(pj, v) pj.SaveMapName = v end,
+        ["AutoBuild"]    = function(pj, v) pj.AutoBuild = v end,
+        ["UseCustomtbl"] = function(pj, v) pj.UseCustomtbl = v end,
+        ["ViewLog"]      = function(pj, v) pj.ViewLog = v end,
+        ["TempFileLoc"]  = function(pj, v) pj.TempFileLoc = v end,
+    }
+    -- program-scope key -> TSetting enum object. euddraft/starcraft are read/
+    -- write; Language is READABLE here but the SETSET branch rejects writes to it
+    -- (read-only per B3). No theme/color/UX keys are exposed.
+    local progKeyToEnum = {
+        ["euddraft"]  = TSetting.euddraft,
+        ["starcraft"] = TSetting.starcraft,
+        ["Language"]  = TSetting.Language,
+    }
+    -- program keys the SETSET branch may WRITE (Language excluded -> read-only).
+    local progWritable = {
+        ["euddraft"]  = true,
+        ["starcraft"] = true,
+    }
 
     -- ------------------------------------------------------------------
     -- Server lifecycle: agent.cfg -> spawn python server -> ready/respawn.
@@ -968,6 +1017,183 @@ local ok, initErr = pcall(function()
             -- direct mutations don't auto-dirty: mark dirty manually.
             pcall(function() pj:SetDirty(true) end)
             return "OK: setbtn " .. setId .. " (" .. #groups .. " buttons)"
+        elseif cmd == "GETSET" then
+            -- GETSET scope|key. scope in {project, program}. project keys read
+            -- plain pjData props; program keys read pgData:get_Setting(TSetting
+            -- enum). Any other scope/key -> ERROR (B3).
+            local a = split(arg, "|")
+            if #a < 2 then return "ERROR: 'GETSET scope|key'" end
+            local scope = string.gsub(a[1], "^%s*(.-)%s*$", "%1")
+            local key   = string.gsub(a[2], "^%s*(.-)%s*$", "%1")
+            local pj = GlobalObj.pjData
+            if scope == "project" then
+                if pj == nil then return "ERROR: no project" end
+                local getter = projGetters[key]
+                if getter == nil then
+                    return "ERROR: invalid project key (OpenMapName/SaveMapName/AutoBuild/UseCustomtbl/ViewLog/TempFileLoc)"
+                end
+                local okG, val = pcall(getter, pj)
+                if not okG then return "ERROR: getset failed" end
+                return "OK: project|" .. key .. " = " .. safestr(val)
+            elseif scope == "program" then
+                local pg = GlobalObj.pgData
+                if pg == nil then return "ERROR: no pgData" end
+                local keyEnum = progKeyToEnum[key]
+                if keyEnum == nil then
+                    return "ERROR: invalid program key (euddraft/starcraft/Language)"
+                end
+                local okG, val = pcall(function() return pg:get_Setting(keyEnum) end)
+                if not okG then return "ERROR: getset failed" end
+                return "OK: program|" .. key .. " = " .. safestr(val)
+            end
+            return "ERROR: invalid scope (project/program)"
+        elseif cmd == "SETSET" then
+            -- SETSET scope|key + value in BODY. project keys set plain pjData
+            -- props; program keys set pgData:set_Setting(TSetting enum, value)
+            -- then flush pgData:SaveSetting(). Language is READ-ONLY -> ERROR.
+            -- Any other scope/key -> ERROR (B3: no theme/UX chrome).
+            local a = split(arg, "|")
+            if #a < 2 then return "ERROR: 'SETSET scope|key' + value from 2nd line" end
+            local scope = string.gsub(a[1], "^%s*(.-)%s*$", "%1")
+            local key   = string.gsub(a[2], "^%s*(.-)%s*$", "%1")
+            local pj = GlobalObj.pjData
+            if scope == "project" then
+                if pj == nil then return "ERROR: no project" end
+                local setter = projSetters[key]
+                if setter == nil then
+                    return "ERROR: invalid project key (OpenMapName/SaveMapName/AutoBuild/UseCustomtbl/ViewLog/TempFileLoc)"
+                end
+                local okS = pcall(setter, pj, body)
+                if not okS then return "ERROR: setset failed" end
+                return "OK: project|" .. key .. " set (" .. string.len(body) .. "B)"
+            elseif scope == "program" then
+                local pg = GlobalObj.pgData
+                if pg == nil then return "ERROR: no pgData" end
+                if progKeyToEnum[key] == nil then
+                    return "ERROR: invalid program key (euddraft/starcraft/Language)"
+                end
+                -- Language is read-only (B3): reject the write structurally.
+                if not progWritable[key] then
+                    return "ERROR: program key '" .. key .. "' is read-only"
+                end
+                local keyEnum = progKeyToEnum[key]
+                local okS = pcall(function()
+                    pg:set_Setting(keyEnum, body)
+                    pg:SaveSetting()
+                end)
+                if not okS then return "ERROR: setset failed" end
+                return "OK: program|" .. key .. " set (" .. string.len(body) .. "B)"
+            end
+            return "ERROR: invalid scope (project/program)"
+        elseif cmd == "PLUGLIST" then
+            -- PLUGLIST (no args). Walk pjData.EdsBlock.Blocks: one line per block
+            -- "index TAB BType TAB first-line-of-Texts". Texts are multi-line eds
+            -- sections; only the FIRST line is emitted (B3).
+            local pj = GlobalObj.pjData
+            if pj == nil then return "ERROR: no project" end
+            local blocks = pj.EdsBlock.Blocks
+            local lines = {}
+            for i = 0, blocks.Count - 1 do
+                local item = blocks:get_Item(i)
+                local btype = safestr(item.BType)
+                -- Texts may be nil (built-in blocks); first line only.
+                local texts = safestr(item.Texts)
+                local nl = string.find(texts, "\n", 1, true)
+                local first = nl and string.sub(texts, 1, nl - 1) or texts
+                first = string.gsub(first, "\r", "")
+                lines[#lines + 1] = i .. "\t" .. btype .. "\t" .. first
+            end
+            return table.concat(lines, "\r\n")
+        elseif cmd == "PLUGADD" then
+            -- PLUGADD index + Texts in BODY. Construct an EdsBlockItem of type
+            -- UserPlugin, set .Texts = body, insert at index (index=-1 appends).
+            -- SetDirty after (direct mutation does not auto-dirty).
+            local index = tonumber(string.gsub(arg, "^%s*(.-)%s*$", "%1"))
+            if index == nil then return "ERROR: 'PLUGADD index' (index=-1 appends) + Texts from 2nd line" end
+            local pj = GlobalObj.pjData
+            if pj == nil then return "ERROR: no project" end
+            local blocks = pj.EdsBlock.Blocks
+            local at = index
+            if at == -1 then at = blocks.Count end
+            if at < 0 or at > blocks.Count then
+                return "ERROR: index out of range (0.." .. blocks.Count .. " or -1)"
+            end
+            local okA, err = pcall(function()
+                local item = EdsBlockItem(EdsBlockType.UserPlugin)
+                item.Texts = body
+                blocks:Insert(at, item)
+                pj:SetDirty(true)
+            end)
+            if not okA then return "ERROR: plugadd failed: " .. tostring(err) end
+            return "OK: plugadd at " .. at .. " (" .. string.len(body) .. "B)"
+        elseif cmd == "PLUGSET" then
+            -- PLUGSET index + Texts in BODY. UserPlugin blocks only (built-ins
+            -- reject -> ERROR). Blocks:get_Item(i).Texts = body; SetDirty.
+            local index = tonumber(string.gsub(arg, "^%s*(.-)%s*$", "%1"))
+            if index == nil then return "ERROR: 'PLUGSET index' + Texts from 2nd line" end
+            local pj = GlobalObj.pjData
+            if pj == nil then return "ERROR: no project" end
+            local blocks = pj.EdsBlock.Blocks
+            if index < 0 or index >= blocks.Count then
+                return "ERROR: index out of range (0.." .. (blocks.Count - 1) .. ")"
+            end
+            local item = blocks:get_Item(index)
+            if item.BType ~= EdsBlockType.UserPlugin then
+                return "ERROR: not a UserPlugin block (built-in, read-only)"
+            end
+            local okS = pcall(function()
+                item.Texts = body
+                pj:SetDirty(true)
+            end)
+            if not okS then return "ERROR: plugset failed" end
+            return "OK: plugset " .. index .. " (" .. string.len(body) .. "B)"
+        elseif cmd == "PLUGDEL" then
+            -- PLUGDEL index. UserPlugin blocks only (built-ins auto-reinsert at
+            -- build, so deletion is meaningless -> ERROR). Blocks:RemoveAt(i);
+            -- SetDirty.
+            local index = tonumber(string.gsub(arg, "^%s*(.-)%s*$", "%1"))
+            if index == nil then return "ERROR: 'PLUGDEL index'" end
+            local pj = GlobalObj.pjData
+            if pj == nil then return "ERROR: no project" end
+            local blocks = pj.EdsBlock.Blocks
+            if index < 0 or index >= blocks.Count then
+                return "ERROR: index out of range (0.." .. (blocks.Count - 1) .. ")"
+            end
+            local item = blocks:get_Item(index)
+            if item.BType ~= EdsBlockType.UserPlugin then
+                return "ERROR: not a UserPlugin block (built-in, cannot delete)"
+            end
+            local okD = pcall(function()
+                blocks:RemoveAt(index)
+                pj:SetDirty(true)
+            end)
+            if not okD then return "ERROR: plugdel failed" end
+            return "OK: plugdel " .. index
+        elseif cmd == "PLUGMOVE" then
+            -- PLUGMOVE from|to. Reorder via RemoveAt(from) + Insert(to, item).
+            -- SetDirty. Works for any block (the user reorders the eds output).
+            local a = split(arg, "|")
+            if #a < 2 then return "ERROR: 'PLUGMOVE from|to'" end
+            local fromIdx = tonumber(string.gsub(a[1], "^%s*(.-)%s*$", "%1"))
+            local toIdx   = tonumber(string.gsub(a[2], "^%s*(.-)%s*$", "%1"))
+            if fromIdx == nil or toIdx == nil then return "ERROR: 'PLUGMOVE from|to' (numeric)" end
+            local pj = GlobalObj.pjData
+            if pj == nil then return "ERROR: no project" end
+            local blocks = pj.EdsBlock.Blocks
+            if fromIdx < 0 or fromIdx >= blocks.Count then
+                return "ERROR: from index out of range (0.." .. (blocks.Count - 1) .. ")"
+            end
+            if toIdx < 0 or toIdx >= blocks.Count then
+                return "ERROR: to index out of range (0.." .. (blocks.Count - 1) .. ")"
+            end
+            local okM, err = pcall(function()
+                local item = blocks:get_Item(fromIdx)
+                blocks:RemoveAt(fromIdx)
+                blocks:Insert(toIdx, item)
+                pj:SetDirty(true)
+            end)
+            if not okM then return "ERROR: plugmove failed: " .. tostring(err) end
+            return "OK: plugmove " .. fromIdx .. " -> " .. toIdx
         elseif cmd == "PANEL" then
             return showPanel()
         elseif cmd == "BUILD" then

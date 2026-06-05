@@ -806,7 +806,7 @@
       ]
     },
     "EUD-051-6657": {
-      "status": "pending",
+      "status": "done",
       "priority": "medium",
       "type": "task",
       "parent": "EUD-044-c735",
@@ -815,8 +815,8 @@
       ],
       "title": "Bridge settings + plugin commands",
       "updated": "2026-06-05",
-      "completed_at": null,
-      "path": "active/EUD-051-6657.md",
+      "completed_at": "2026-06-05T13:34:45.540421",
+      "path": "done/EUD-051-6657.md",
       "scope": [
         "bridge/ZZZ_10_agent_bridge.lua",
         "server/eud_agent/bridge_io.py",

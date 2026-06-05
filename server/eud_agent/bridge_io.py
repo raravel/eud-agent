@@ -82,6 +82,24 @@ _RESET_KINDS = ("dat", "xdat", "tbl")
 # type arg is validated against this whitelist BEFORE send.
 _CREATABLE_TYPES = ("CUIEps", "CUIPy", "RawText")
 
+# Settings scopes/keys (features/04 "Settings & plugins (B3)"; capability-survey
+# rows 17-19). The whitelists MIRROR the bridge's exactly. project keys are plain
+# pjData properties; program keys are TSetting enum members. Language is program-
+# scope READ-ONLY (SETSET on it is rejected here and by the bridge). Validation
+# rejects an out-of-whitelist scope/key BEFORE send so no chrome key round-trips.
+_SETTING_SCOPES = ("project", "program")
+_PROJECT_SETTING_KEYS = (
+    "OpenMapName",
+    "SaveMapName",
+    "AutoBuild",
+    "UseCustomtbl",
+    "ViewLog",
+    "TempFileLoc",
+)
+# program keys readable; only euddraft/starcraft are writable (Language read-only).
+_PROGRAM_SETTING_KEYS = ("euddraft", "starcraft", "Language")
+_PROGRAM_WRITABLE_KEYS = ("euddraft", "starcraft")
+
 
 class BridgeError(Exception):
     """The bridge returned an ``ERROR:``-prefixed result for a command."""
@@ -529,6 +547,121 @@ class BridgeIO:
     def getmain(self, **kw) -> str:
         """Return the current main file path, or ``""`` when none is set."""
         reply = self.send("GETMAIN", **kw)
+        self._raise_if_error(reply)
+        return reply
+
+    # ------------------------------------------------------ settings & plugins
+    # Wrappers per features/04 "Settings & plugins (B3)". scope/key whitelists are
+    # validated (raising BridgeError) BEFORE send so no out-of-contract key ever
+    # round-trips. SETSET's value travels in the BODY; PLUG* Texts travel in the
+    # BODY (multi-line eds sections). plugadd allows index=-1 (append); the other
+    # plug indexes are non-negative.
+
+    @staticmethod
+    def _setting_keys_for(scope: str) -> tuple[str, ...]:
+        return (
+            _PROJECT_SETTING_KEYS if scope == "project" else _PROGRAM_SETTING_KEYS
+        )
+
+    def getset(self, scope: str, key: str, **kw) -> str:
+        """Read a setting (``GETSET scope|key``).
+
+        ``scope`` ∈ {project, program}; ``key`` must be in that scope's whitelist
+        (project: OpenMapName/SaveMapName/AutoBuild/UseCustomtbl/ViewLog/
+        TempFileLoc; program: euddraft/starcraft/Language). The value comes back
+        in the reply text.
+        """
+        _require_in(scope, _SETTING_SCOPES, "scope")
+        _require_in(key, self._setting_keys_for(scope), f"{scope} setting key")
+        reply = self.send(f"GETSET {scope}|{key}", **kw)
+        self._raise_if_error(reply)
+        return reply
+
+    def setset(self, scope: str, key: str, value: str, **kw) -> str:
+        """Write a setting (``SETSET scope|key`` + value in BODY).
+
+        ``scope`` ∈ {project, program}; ``key`` must be writable in that scope.
+        The program ``Language`` key is READ-ONLY (rejected here BEFORE send and by
+        the bridge). The value travels in the body (B3 table). A program-scope
+        write is flushed by the bridge via ``SaveSetting()``.
+        """
+        _require_in(scope, _SETTING_SCOPES, "scope")
+        if scope == "project":
+            _require_in(key, _PROJECT_SETTING_KEYS, "project setting key")
+        else:
+            # validate membership first (clear error for an unknown key), then
+            # reject the read-only Language key (mirror the bridge exactly).
+            _require_in(key, _PROGRAM_SETTING_KEYS, "program setting key")
+            if key not in _PROGRAM_WRITABLE_KEYS:
+                raise BridgeError(
+                    f"ERROR: program setting key {key!r} is read-only"
+                )
+        reply = self.send(f"SETSET {scope}|{key}\n{value}", **kw)
+        self._raise_if_error(reply)
+        return reply
+
+    def pluglist(self, **kw) -> list[dict]:
+        """List eds plugin blocks as ``[{index, btype, first_line}]``.
+
+        Parses the bridge's ``index\\tBType\\tfirst-line-of-Texts`` lines (B3).
+        An empty (non-``ERROR:``) reply means zero blocks.
+        """
+        reply = self.send("PLUGLIST", **kw)
+        self._raise_if_error(reply)
+        blocks: list[dict] = []
+        for line in reply.splitlines():
+            line = line.rstrip("\r")
+            if not line:
+                continue
+            parts = line.split("\t")
+            index = parts[0] if len(parts) > 0 else ""
+            btype = parts[1] if len(parts) > 1 else ""
+            first = parts[2] if len(parts) > 2 else ""
+            blocks.append({"index": index, "btype": btype, "first_line": first})
+        return blocks
+
+    def plugadd(self, index: int, texts: str, **kw) -> str:
+        """Add a UserPlugin block (``PLUGADD index`` + Texts in BODY).
+
+        ``index == -1`` appends; otherwise it must be non-negative. The Texts
+        (a multi-line eds section) travel in the body.
+        """
+        n = int(index)
+        if n < -1:
+            raise BridgeError(
+                f"ERROR: plugadd index must be >= -1 (-1 appends), got {n}"
+            )
+        reply = self.send(f"PLUGADD {n}\n{texts}", **kw)
+        self._raise_if_error(reply)
+        return reply
+
+    def plugset(self, index: int, texts: str, **kw) -> str:
+        """Replace a UserPlugin block's Texts (``PLUGSET index`` + Texts in BODY).
+
+        The bridge rejects a non-UserPlugin (built-in) block. ``index`` is non-
+        negative (only ``plugadd`` allows -1).
+        """
+        index = _require_nonneg_int(index, "index")
+        reply = self.send(f"PLUGSET {index}\n{texts}", **kw)
+        self._raise_if_error(reply)
+        return reply
+
+    def plugdel(self, index: int, **kw) -> str:
+        """Delete a UserPlugin block (``PLUGDEL index``).
+
+        The bridge rejects a built-in block (they auto-reinsert at build). ``index``
+        is non-negative.
+        """
+        index = _require_nonneg_int(index, "index")
+        reply = self.send(f"PLUGDEL {index}", **kw)
+        self._raise_if_error(reply)
+        return reply
+
+    def plugmove(self, from_index: int, to_index: int, **kw) -> str:
+        """Reorder a block (``PLUGMOVE from|to``). Both indexes are non-negative."""
+        from_index = _require_nonneg_int(from_index, "from index")
+        to_index = _require_nonneg_int(to_index, "to index")
+        reply = self.send(f"PLUGMOVE {from_index}|{to_index}", **kw)
         self._raise_if_error(reply)
         return reply
 
