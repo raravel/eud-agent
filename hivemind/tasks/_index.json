@@ -748,21 +748,22 @@
       "scope": []
     },
     "EUD-048-d732": {
-      "status": "pending",
+      "status": "done",
       "priority": "high",
       "type": "chore",
       "parent": "EUD-044-c735",
       "depends_on": [],
       "title": "Drop SCA from settable families and harness docs",
       "updated": "2026-06-05",
-      "completed_at": null,
-      "path": "active/EUD-048-d732.md",
+      "completed_at": "2026-06-05T11:45:21.475801",
+      "path": "done/EUD-048-d732.md",
       "scope": [
         "server/eud_agent/bridge_io.py",
         "server/tests/test_bridge_list_static.py",
         "harness:rules",
         "harness:architecture",
-        "harness:features"
+        "harness:features",
+        "server/tests/test_bridge_io.py"
       ]
     },
     "EUD-049-5d70": {

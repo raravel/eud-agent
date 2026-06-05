@@ -172,6 +172,28 @@ def test_extension_adds_no_raw_nonascii_bytes():
     )
 
 
+def test_settable_families_exclude_sca():
+    """SCA must not be a settable file-type family (capability-survey: defunct).
+
+    Static check against ``server/eud_agent/bridge_io.py``: the
+    ``_SETTABLE_FAMILIES = (...)`` tuple must NOT carry an "SCA" family token.
+    The check normalizes case and asserts no tuple member equals or contains
+    "SCA" as a standalone substring — "RAWTEXT" (which contains no "SCA") is
+    unaffected, and a sneaky "SCAEps"-style member would still be caught.
+    """
+    src = (REPO_ROOT / "server" / "eud_agent" / "bridge_io.py").read_text(
+        encoding="utf-8"
+    )
+    m = re.search(r"_SETTABLE_FAMILIES\s*=\s*\(([^)]*)\)", src)
+    assert m, "could not locate the _SETTABLE_FAMILIES = (...) assignment"
+    members = re.findall(r'["\']([^"\']+)["\']', m.group(1))
+    assert members, "the _SETTABLE_FAMILIES tuple has no string members"
+    offenders = [fam for fam in members if "SCA" in fam.upper()]
+    assert not offenders, (
+        f"SCA is defunct and must not be a settable family; found: {offenders}"
+    )
+
+
 def _all_test_functions():
     module = sys.modules[__name__]
     return [

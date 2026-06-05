@@ -22,7 +22,7 @@ Resolution order: CLI args > env vars > `agent.cfg` (located via `EUD_DATA_DIR` 
 ## bridge_io.py
 
 - `send(command_text) -> result_text`: write `inbox\srv-<uuid8>.cmd` (UTF-8 no BOM), poll `outbox\srv-<uuid8>.result` (0.2s interval); on read, delete the `.result`. Timeout 10s; while `status.txt` reports `compiling=true` extend to 180s and invoke an `on_busy` callback (orchestrator forwards `waiting_build` to the panel). On timeout: leave the `.cmd`, raise `BridgeBusy`.
-- Helpers: `ping() status() list_files() get(path) set(path, code) neweps(name, code)`. `list_files` parses `path\tEFileType` lines into `{path, ftype, settable}` (settable = ftype in CUI/SCA/RawText). An empty (non-`ERROR:`) LIST result means zero files — not a failure (verified bridge behavior, EUD-011).
+- Helpers: `ping() status() list_files() get(path) set(path, code) neweps(name, code)`. `list_files` parses `path\tEFileType` lines into `{path, ftype, settable}` (settable = ftype in CUI/RawText). An empty (non-`ERROR:`) LIST result means zero files — not a failure (verified bridge behavior, EUD-011).
 - `cleanup_stale()` at startup: delete leftover `srv-*.cmd` / `srv-*.result`.
 
 ## codex_client.py

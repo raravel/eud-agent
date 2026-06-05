@@ -46,12 +46,13 @@ DEFAULT_TIMEOUT = 10.0
 DEFAULT_BUSY_TIMEOUT = 180.0
 DEFAULT_POLL_INTERVAL = 0.2
 
-# settable file-type families: SET exists only for CUI/SCA/RawText file types;
+# settable file-type families: SET exists only for CUI/RawText file types;
 # GUI files have no setter (architecture.md SET row; rules.md "SET/NEWEPS").
-# The bridge's LIST emits the EFileType enum NAME (e.g. CUIEps, CUI, SCAEps,
-# SCA, RawText, GUI); membership is by case-insensitive substring so the whole
-# family (CUIEps/CUITrg/SCAEps/...) is covered without enumerating every member.
-_SETTABLE_FAMILIES = ("CUI", "SCA", "RAWTEXT")
+# SCA is fully defunct (capability-survey, 2026-06-05) and is NOT settable.
+# The bridge's LIST emits the EFileType enum NAME (e.g. CUIEps, CUI, CUIPy,
+# CUITrg, RawText, GUI); membership is by case-insensitive substring so the whole
+# CUI family (CUIEps/CUIPy/CUITrg/...) is covered without enumerating every member.
+_SETTABLE_FAMILIES = ("CUI", "RAWTEXT")
 
 
 class BridgeError(Exception):
@@ -157,7 +158,7 @@ class BridgeIO:
         Parses the bridge's ``path\\t<EFileType>`` lines. An EMPTY (non-``ERROR:``)
         reply means ZERO files — an open project with no files, not a failure
         (verified bridge behavior, EUD-011). ``settable`` is derived from the
-        file-type family (CUI/SCA/RawText settable; GUI read-only).
+        file-type family (CUI/RawText settable; GUI read-only).
         """
         reply = self.send("LIST", **kw)
         self._raise_if_error(reply)
@@ -186,7 +187,7 @@ class BridgeIO:
     def set(self, path: str, code: str, **kw) -> str:
         """Replace a file's text (memory-only). ``SET <path>`` + body on line 2.
 
-        Only CUI/SCA/RawText files accept SET; the bridge returns an ``ERROR:``
+        Only CUI/RawText files accept SET; the bridge returns an ``ERROR:``
         for GUI files, surfaced here as :class:`BridgeError`.
         """
         reply = self.send(f"SET {path}\n{code}", **kw)

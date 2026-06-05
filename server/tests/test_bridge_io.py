@@ -271,8 +271,10 @@ def test_on_busy_not_called_when_not_compiling(tmp_path):
 def test_list_files_parses_tab_lines_with_settable(tmp_path):
     """Tab-separated path\\tEFileType lines parse into {path, ftype, settable}.
 
-    A CUI-family type is settable; a GUI type is not (architecture.md SET row:
-    CUI/SCA/RawText only, GUI has no setter; rules.md "SET/NEWEPS").
+    A CUI-family type is settable; GUI and SCA types are not (architecture.md
+    SET row: CUI/RawText only, GUI has no setter, SCA defunct; rules.md
+    "SET/NEWEPS"). The SCA line is kept as a NEGATIVE case so a future change
+    cannot silently re-admit the dead family.
     """
     data_dir = tmp_path / "agent"
 
@@ -299,7 +301,8 @@ def test_list_files_parses_tab_lines_with_settable(tmp_path):
     assert by_path["main.eps"]["settable"] is True
     assert by_path["folder/util.eps"]["settable"] is True
     assert by_path["raw.txt"]["settable"] is True
-    assert by_path["sca/mod.sca"]["settable"] is True
+    assert by_path["sca/mod.sca"]["ftype"] == "SCA"
+    assert by_path["sca/mod.sca"]["settable"] is False  # SCA defunct
     assert by_path["ui/layout.gui"]["ftype"] == "GUI"
     assert by_path["ui/layout.gui"]["settable"] is False
 

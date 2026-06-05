@@ -7,6 +7,7 @@ Violations of the EDITOR-* and LUANET-* rules crash or corrupt EUD Editor 3 at r
 - **NEVER modify EUD Editor 3 source, binaries, or repo** (third-party, Buizz/EUD-Editor-3). Integration = file copies only: `.lua` into `Data\Lua\TriggerEditor\`, DLLs next to the exe, runtime state under `Data\agent\`.
 - **NEVER modify the ECA repo** beyond what its own git-exclude already allows. The RAG DB (`chromadb_bge`) is read-only input; NEVER import it into this repo (chromadb mutates tracked sqlite on every open — proven LFS churn).
 - ALWAYS treat `bridge/ZZZ_10_agent_bridge.lua` as import-then-extend: keep verified v6 code paths intact; extend, do not rewrite.
+- **SCA is fully defunct** (the scarchive.kr publish service is gone, including the SCAScript file type — user decision 2026-06-05). NEVER expose or reintroduce SCA as a settable/creatable type (settable text types are CUI/RawText only). ALWAYS force `pj.TEData.SCArchive.IsUsed = false` before BUILD so a build can't block on the dead SCA login modal.
 
 ## Lua bridge (KopiLua/luanet) — crash rules
 
@@ -21,7 +22,7 @@ Violations of the EDITOR-* and LUANET-* rules crash or corrupt EUD Editor 3 at r
 - Enum arguments: pass enum objects from `import_type("Ns.Outer+EnumName")`, never raw numbers.
 - Empty `StringText` returns nil: ALWAYS `val or ""` when reading.
 - Non-ASCII literals in .lua source are mojibake (KopiLua reads Latin1): ALWAYS restore with the `u8()` helper. Text read via .NET `File.ReadAllText` or typed into WPF controls is fine as-is.
-- SET/NEWEPS change memory objects only (user saves to disk). Setter exists only for CUI/SCA/RawText file types — GUI files are read-only; LIST must expose the type so callers can avoid them.
+- SET/NEWEPS change memory objects only (user saves to disk). Setter exists only for CUI/RawText file types — GUI files are read-only; LIST must expose the type so callers can avoid them.
 - Auxiliary windows are closed by the editor on project create/switch: ALWAYS re-create the panel via window-handle tracking ("project open AND window not alive" per Tick). NEVER rely on `pjData==nil` re-arm alone.
 - ALWAYS write `heartbeat.txt` before the `IsCompilng` early-return in Tick (unconditional heartbeat).
 - ALWAYS construct the lifecycle `DispatcherTimer` above Render priority — `DispatcherTimer(DispatcherPriority.Normal)`, never the parameterless ctor (which defaults to `DispatcherPriority.Background`). The live WebView2 panel posts continuous `Render` (7) priority work to the editor UI-thread Dispatcher; a `Background` (4) timer is starved by it, freezing the unconditional heartbeat AND inbox processing (measured EUD-039: ~9-10s ticks, 54s stalls → server self-terminates / panel "editor busy"). Pass the enum object, never a raw number.

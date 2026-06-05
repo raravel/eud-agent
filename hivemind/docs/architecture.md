@@ -88,7 +88,7 @@ Transport: `Data\agent\inbox\<name>.cmd` is processed on the 1s `DispatcherTimer
 | LIST | — | one line per file: path TAB EFileType | **new**; walk of pj.TEData.PFIles, names+types only; empty (non-ERROR) result = zero files |
 | DUMP | — | writes dump files + index to outbox | heavyweight; debugging only |
 | GET path | — | file text | |
-| SET path + body | body from 2nd line | OK / ERROR | memory-only; syncs open-tab editors; CUI/SCA/RawText only (GUI has no setter) |
+| SET path + body | body from 2nd line | OK / ERROR | memory-only; syncs open-tab editors; CUI/RawText only (GUI has no setter; SCA defunct) |
 | NEWEPS name + body | body from 2nd line | OK / ERROR: duplicate | **new**; root folder, EFileType.CUIEps fixed; duplicate name returns ERROR |
 | GETDAT / SETDAT | dat, param, objId, value (pipe-separated) | value | unchanged from v6 |
 | PANEL | — | OK | redefined: shows/refocuses the WebView2 panel (the v6 WPF control panel is removed) |
