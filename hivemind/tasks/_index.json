@@ -1122,6 +1122,21 @@
         "panel/index.html",
         "server/tests/test_panel_static.py"
       ]
+    },
+    "EUD-066-f7aa": {
+      "status": "done",
+      "priority": "high",
+      "type": "bug",
+      "parent": "EUD-047-fd09",
+      "depends_on": [],
+      "title": "PromptInput layout collapse: footer nested inside body breaks InputGroup has-selectors",
+      "updated": "2026-06-05",
+      "completed_at": "2026-06-05T18:28:38.664167",
+      "path": "done/EUD-066-f7aa.md",
+      "scope": [
+        "panel/src/components/InstructionBox.tsx",
+        "panel/src/components/InstructionBox.test.tsx"
+      ]
     }
   }
 }

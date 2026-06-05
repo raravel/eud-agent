@@ -55,6 +55,12 @@ export function InstructionBox({ state, onSend, onReset }: InstructionBoxProps) 
 
   return (
     <div className="border-t border-border p-3">
+      {/* The footer MUST be a SIBLING of PromptInputBody (a direct child of the
+          InputGroup): the group's column layout comes from CSS `:has(> ...)`
+          direct-child selectors (`has-[>[data-align=block-end]]:flex-col` /
+          `:h-auto`). Nested inside the `display: contents` body, those selectors
+          do not match and the group stays a fixed-height ROW — the textarea
+          collapses to ~24px and the placeholder renders vertically (EUD-066). */}
       <PromptInput onSubmit={handleSend}>
         <PromptInputBody>
           <PromptInputTextarea
@@ -63,24 +69,24 @@ export function InstructionBox({ state, onSend, onReset }: InstructionBoxProps) 
             onChange={(e) => setInstruction(e.target.value)}
             placeholder="무엇을 만들까요? (예: 게임 시작 시 미네랄 +1000 트리거 추가)"
           />
-          <PromptInputFooter>
-            <PromptInputTools>
-              <PromptInputButton
-                type="button"
-                aria-label="새 대화"
-                disabled={turnInFlight || onReset === undefined}
-                onClick={() => onReset?.()}
-              >
-                <RotateCcwIcon className="size-4" />
-                새 대화
-              </PromptInputButton>
-            </PromptInputTools>
-            <PromptInputSubmit aria-label="전송" disabled={!canSend}>
-              <SendIcon className="size-4" />
-              전송
-            </PromptInputSubmit>
-          </PromptInputFooter>
         </PromptInputBody>
+        <PromptInputFooter>
+          <PromptInputTools>
+            <PromptInputButton
+              type="button"
+              aria-label="새 대화"
+              disabled={turnInFlight || onReset === undefined}
+              onClick={() => onReset?.()}
+            >
+              <RotateCcwIcon className="size-4" />
+              새 대화
+            </PromptInputButton>
+          </PromptInputTools>
+          <PromptInputSubmit aria-label="전송" disabled={!canSend}>
+            <SendIcon className="size-4" />
+            전송
+          </PromptInputSubmit>
+        </PromptInputFooter>
       </PromptInput>
     </div>
   );

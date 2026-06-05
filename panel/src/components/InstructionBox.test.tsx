@@ -142,9 +142,13 @@ describe("InstructionBox — InputGroup composition (EUD-066 layout contract)", 
     );
     const group = container.querySelector('[data-slot="input-group"]');
     expect(group).not.toBeNull();
-    const directAddon = group!.querySelector(
-      ':scope > [data-slot="input-group-addon"][data-align="block-end"]',
+    // Iterate direct children instead of `:scope >` (jsdom's selector engine
+    // does not reliably support `:scope` with attribute compounds).
+    const directAddon = Array.from(group!.children).find(
+      (c) =>
+        c.getAttribute("data-slot") === "input-group-addon" &&
+        c.getAttribute("data-align") === "block-end",
     );
-    expect(directAddon).not.toBeNull();
+    expect(directAddon).not.toBeUndefined();
   });
 });
