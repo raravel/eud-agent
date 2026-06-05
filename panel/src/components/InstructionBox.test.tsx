@@ -127,3 +127,24 @@ describe("InstructionBox — chat payload (v2)", () => {
     expect(onSend).not.toHaveBeenCalled();
   });
 });
+
+describe("InstructionBox — InputGroup composition (EUD-066 layout contract)", () => {
+  // The InputGroup column layout depends on CSS `:has(> ...)` DIRECT-child
+  // selectors (`has-[>[data-align=block-end]]:flex-col` / `:h-auto` in
+  // ui/input-group.tsx). `:has(>)` is DOM-structural — a footer nested inside
+  // the `display: contents` PromptInputBody does NOT match, leaving the group
+  // a fixed-height flex ROW: the textarea collapses to ~24px and renders its
+  // placeholder vertically (live defect, EUD-066). jsdom cannot do layout, so
+  // this pins the DOM STRUCTURE the selectors require.
+  it("renders the footer addon as a DIRECT child of the input group", () => {
+    const { container } = render(
+      <InstructionBox state={readyState()} onSend={noop} onReset={noop} />,
+    );
+    const group = container.querySelector('[data-slot="input-group"]');
+    expect(group).not.toBeNull();
+    const directAddon = group!.querySelector(
+      ':scope > [data-slot="input-group-addon"][data-align="block-end"]',
+    );
+    expect(directAddon).not.toBeNull();
+  });
+});
