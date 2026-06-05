@@ -81,3 +81,4 @@ v1 `instruct`/`apply`/`code`/`applied` messages are REMOVED (panel v2 replaces t
 - `server/tests/test_tools.py` / `test_journal.py` / `test_agent_flow.py` / `test_edd_runner.py`
 - external: official Codex Python SDK; `mcp` Python package (server side of the shim)
 - [BOUND 2026-06-05 from EUD-053-f3ac] `server/spikes/spike_codex_sdk.py` + `server/spikes/dummy_mcp_tool.py` — EUD-053 spike artifacts proving codex SDK thread lifecycle + per-thread MCP attachment (config injection) + tool round-trip on Windows; run manually only (spends real codex tokens)
+- [BOUND 2026-06-05 from EUD-064-acf5] `server/eud_agent/engine.py` — WS v2 state machine (AgentEngine: chat/plan/changeset/reset routing, conversation continuity start-vs-resume, live request-id publication) + build_system_prompt
