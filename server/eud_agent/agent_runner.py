@@ -30,6 +30,49 @@ in its env (so it locates ``server.ready`` and pins the per-session request id).
 The thread id is retained per panel session so follow-up turns
 (``thread_resume``) continue the conversation.
 
+codex-environment isolation (EUD-062)
+-------------------------------------
+A live E2E found that agent codex threads INHERIT the operator's entire personal
+codex environment: the global ``~/.codex/config.toml`` MCP servers
+(playwright/pencil/node_repl...), enabled plugins, and personal skills. The agent
+must run with ONLY what THIS project configures. Isolation is composed into the
+spawn at TWO layers (defense-in-depth), driven by :class:`CodexIsolation`:
+
+* **launch-level** ``CodexConfig.config_overrides`` — a tuple the SDK forwards as
+  ``codex --config k=v ... app-server`` (verified in the pinned SDK source,
+  ``client.py`` ``CodexClient.start``: each override is expanded to
+  ``["--config", kv]`` BEFORE the ``app-server`` subcommand). These overrides are
+  per-PROCESS (one ``Codex`` client = one ``app-server``). We pass:
+  (a) ``mcp_servers={...}`` as a WHOLE-TABLE override (codex ``-c`` whole-table
+  replace semantics) so the personal ``mcp_servers`` table is REPLACED, not merged
+  — only ``eud-tools`` remains; and (b) ``features.plugins=false`` (the stable
+  feature flag) to disable plugins.
+* **per-thread** ``thread_start(config={"mcp_servers": {...}})`` — kept from the
+  EUD-053 spike. The eud-tools entry here carries the LIVE ``EUD_REQUEST_ID`` env
+  (it changes per chat-session: a new ``chat`` starts a fresh thread, so the shim
+  re-spawns and re-reads the env). The request id MUST stay in this layer because
+  the launch-level override is fixed at ``Codex`` construction. Both layers name
+  the table ``eud-tools`` so the per-thread layer simply supplies the live env for
+  the same server the launch-level override admits.
+
+What is NOT isolated, and why:
+
+* **Skills** — there is NO documented blanket skills-disable for ``app-server``.
+  ``codex exec --ignore-user-config`` exists but is EXEC-ONLY: probed on this
+  machine's CLI, ``codex --ignore-user-config ...`` and
+  ``codex app-server --ignore-user-config ...`` both error with "unexpected
+  argument", and ``codex app-server --help`` does not list it; the SDK spawns
+  ``app-server``, so that flag is unavailable. Per-skill ``[[skills.config]]
+  enabled=false`` requires enumerating each skill by path (no wildcard). Personal
+  skills therefore remain loadable; this is a documented limitation. The isolation
+  settings are INJECTABLE (``CodexSDKRunner(isolation=...)`` /
+  :data:`CodexIsolation.extra_overrides`) so a future skills mechanism — or the
+  live E2E — can add overrides without touching this module.
+* **Dedicated ``CODEX_HOME`` relocation** was REJECTED: a separate codex home would
+  diverge ``auth.json`` token rotation from the operator's account (the BYO account
+  re-rotates the refresh token), so it is not implemented even though it would
+  isolate skills. Documenting the skills limitation honestly is preferred.
+
 propose_plan ends the turn
 --------------------------
 ``propose_plan`` is a flow tool that ends the codex turn for user review. The runner
@@ -54,9 +97,81 @@ import sys
 import threading
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
 
 # The plan tool name (mirrors tools.PLAN_TOOL) — detected in the stream.
 PLAN_TOOL = "propose_plan"
+
+# The MCP server name the eud-tools shim registers under (both isolation layers
+# name the same table key; see the module docstring).
+EUD_TOOLS_SERVER = "eud-tools"
+# The shim launch command tail (``python -m eud_agent.mcp_shim``).
+MCP_SHIM_ARGS = ["-m", "eud_agent.mcp_shim"]
+
+
+@dataclass(frozen=True)
+class CodexIsolation:
+    """Knobs for isolating an agent codex thread from the operator's codex env.
+
+    Drives the launch-level ``config_overrides`` the runner composes (see the
+    module docstring). Injectable into :class:`CodexSDKRunner` so the live E2E can
+    flip settings (e.g. once a skills-disable mechanism is found) without editing
+    this module.
+
+    * ``replace_mcp_table`` — emit the WHOLE-TABLE ``mcp_servers={...}`` override so
+      the personal MCP table is replaced (only eud-tools survives). Default True.
+    * ``disable_plugins`` — emit ``features.plugins=false``. Default True.
+    * ``extra_overrides`` — additional raw ``key=tomlvalue`` override strings
+      appended verbatim (e.g. a future per-skill disable, or a live-E2E probe).
+    """
+
+    replace_mcp_table: bool = True
+    disable_plugins: bool = True
+    extra_overrides: tuple[str, ...] = field(default_factory=tuple)
+
+
+# The default isolation applied when a runner is constructed without one.
+DEFAULT_ISOLATION = CodexIsolation()
+
+
+def _toml_inline(value) -> str:
+    """Serialize ``value`` as an inline-TOML literal for a ``-c key=<value>`` arg.
+
+    Handles only the shapes the isolation config needs (str / bool / int / list /
+    dict), producing inline tables (``{ k = v }``) and arrays (``[ a, b ]``) that
+    round-trip through ``tomllib``. The codex ``-c`` parser treats the value as
+    TOML, so an inline table for the whole ``mcp_servers`` map yields a whole-table
+    override. ``codex_bin`` paths on Windows contain backslashes, so strings are
+    emitted as TOML *basic* strings with the two TOML escapes that matter here
+    (``\\`` and ``"``).
+    """
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, str):
+        escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+        return f'"{escaped}"'
+    if isinstance(value, (list, tuple)):
+        return "[" + ", ".join(_toml_inline(v) for v in value) + "]"
+    if isinstance(value, dict):
+        items = ", ".join(
+            f"{_toml_key(k)} = {_toml_inline(v)}" for k, v in value.items()
+        )
+        return "{" + items + "}"
+    raise TypeError(f"unsupported TOML value: {type(value).__name__}")
+
+
+def _toml_key(key: str) -> str:
+    """A TOML key: bare when it is a simple identifier, else a quoted key.
+
+    ``eud-tools`` contains a dash, which is NOT a bare-key char, so it must be
+    quoted (``"eud-tools"``) for the value to parse.
+    """
+    if key and all(c.isalnum() or c == "_" for c in key):
+        return key
+    escaped = key.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
 
 # Default model for the codex thread (None -> SDK/account default). Pinned to None
 # so the BYO account's configured default is used (the spike left it default).
@@ -117,6 +232,7 @@ class CodexSDKRunner(AgentRunner):
         codex_bin: str,
         data_dir: str | os.PathLike,
         model: str | None = DEFAULT_MODEL,
+        isolation: CodexIsolation = DEFAULT_ISOLATION,
     ) -> None:
         self.tool_layer = tool_layer
         self._send = send
@@ -124,6 +240,7 @@ class CodexSDKRunner(AgentRunner):
         self._codex_bin = codex_bin
         self._data_dir = str(data_dir)
         self._model = model
+        self._isolation = isolation
         # SDK objects are created lazily on the first turn (so importing this
         # module — and constructing the runner in create_app — never spawns codex).
         self._codex = None
@@ -171,19 +288,60 @@ class CodexSDKRunner(AgentRunner):
 
     # ------------------------------------------------------------- internals
     def _ensure_codex(self):
-        from openai_codex import Codex, CodexConfig
+        from openai_codex import Codex
 
         if self._codex is None:
-            self._codex = Codex(config=CodexConfig(codex_bin=self._codex_bin))
+            self._codex = Codex(config=self._codex_config())
         return self._codex
 
+    def _codex_config(self):
+        """The launch-level ``CodexConfig`` carrying the isolation overrides.
+
+        Composes the per-PROCESS ``config_overrides`` (EUD-062): a whole-table
+        ``mcp_servers`` replacement (only eud-tools) + ``features.plugins=false``,
+        plus any injected ``extra_overrides``. ``launch_args_override`` is left
+        None so the SDK builds the normal ``codex --config ... app-server``
+        invocation (``--ignore-user-config`` is exec-only and rejected by
+        app-server — see the module docstring).
+        """
+        from openai_codex import CodexConfig
+
+        return CodexConfig(
+            codex_bin=self._codex_bin,
+            config_overrides=self._isolation_overrides(),
+        )
+
+    def _isolation_overrides(self) -> tuple[str, ...]:
+        """Build the ``--config k=v`` override tuple from the isolation knobs."""
+        iso = self._isolation
+        overrides: list[str] = []
+        if iso.replace_mcp_table:
+            # Whole-table override: REPLACES the operator's personal mcp_servers
+            # table (codex -c whole-table semantics) so only eud-tools survives.
+            # No per-request env here — that lives in the per-thread config layer.
+            table = {
+                EUD_TOOLS_SERVER: {
+                    "command": sys.executable,
+                    "args": list(MCP_SHIM_ARGS),
+                }
+            }
+            overrides.append(f"mcp_servers={_toml_inline(table)}")
+        if iso.disable_plugins:
+            overrides.append("features.plugins=false")
+        overrides.extend(iso.extra_overrides)
+        return tuple(overrides)
+
     def _thread_config(self, request_id: str) -> dict:
-        """Per-thread MCP injection of the eud-tools shim (EUD-053 spike shape)."""
+        """Per-thread MCP injection of the eud-tools shim (EUD-053 spike shape).
+
+        Carries the LIVE ``EUD_REQUEST_ID`` (per chat-session) — see the module
+        docstring for why this stays in the thread layer, not the launch override.
+        """
         return {
             "mcp_servers": {
-                "eud-tools": {
+                EUD_TOOLS_SERVER: {
                     "command": sys.executable,
-                    "args": ["-m", "eud_agent.mcp_shim"],
+                    "args": list(MCP_SHIM_ARGS),
                     "env": {
                         "EUD_DATA_DIR": self._data_dir,
                         "EUD_REQUEST_ID": request_id,

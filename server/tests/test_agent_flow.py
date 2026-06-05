@@ -535,6 +535,131 @@ def test_system_prompt_has_catalog_state_and_rag(tmp_path, monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
+# 6b. codex-thread isolation (EUD-062): the runner must NOT inherit the user's
+#     personal codex environment. It composes LAUNCH-LEVEL config_overrides that
+#     whole-table-replace mcp_servers (only eud-tools) and disable plugins, plus a
+#     per-thread mcp_servers config carrying the live EUD_REQUEST_ID.
+# --------------------------------------------------------------------------- #
+
+
+def _make_runner(tmp_path):
+    """A CodexSDKRunner built codex-free (no spawn) for composition assertions."""
+    from eud_agent.agent_runner import CodexSDKRunner
+
+    async def _send(_ev):  # pragma: no cover - never awaited in these tests
+        return None
+
+    return CodexSDKRunner(
+        tool_layer=object(),
+        send=_send,
+        build_system_prompt=lambda *a, **k: "",
+        codex_bin=str(tmp_path / "codex.cmd"),
+        data_dir=str(tmp_path / "data"),
+    )
+
+
+def _overrides_dict(overrides):
+    """Parse a tuple of ``key=tomlvalue`` override strings into a dict.
+
+    Each entry is a ``-c`` config override the SDK forwards as ``--config k=v``;
+    the value portion is TOML. ``mcp_servers`` is a whole-table override so its
+    value parses as an (inline) TOML table -> a dict.
+    """
+    import tomllib
+
+    parsed: dict = {}
+    for entry in overrides:
+        key, _, val = entry.partition("=")
+        # Parse "key = value" as a one-line TOML document so inline tables /
+        # bools / strings all decode through the real TOML grammar. A dotted key
+        # (features.plugins) nests in the doc; walk back down to recover the leaf
+        # keyed under the original dotted string.
+        doc = tomllib.loads(f"{key} = {val}")
+        node = doc
+        for part in key.split("."):
+            node = node[part]
+        parsed[key] = node
+    return parsed
+
+
+def test_isolation_config_overrides_replace_mcp_table_and_disable_plugins(tmp_path):
+    """The launch-level CodexConfig carries config_overrides that (a) whole-table
+    replace mcp_servers with ONLY eud-tools and (b) set features.plugins=false."""
+    runner = _make_runner(tmp_path)
+    overrides = runner._codex_config().config_overrides
+    assert isinstance(overrides, tuple)
+    parsed = _overrides_dict(overrides)
+
+    # (a) mcp_servers is a WHOLE-TABLE override (replaces the personal table) and
+    # contains ONLY eud-tools — playwright/pencil/node_repl must be gone.
+    assert "mcp_servers" in parsed, f"no mcp_servers override; got {overrides}"
+    mcp = parsed["mcp_servers"]
+    assert isinstance(mcp, dict)
+    assert set(mcp.keys()) == {"eud-tools"}, (
+        f"the override must replace the whole table with only eud-tools; got {mcp}"
+    )
+    assert mcp["eud-tools"].get("command")
+    assert mcp["eud-tools"].get("args") == ["-m", "eud_agent.mcp_shim"]
+
+    # (b) plugins disabled.
+    assert parsed.get("features.plugins") is False, (
+        f"features.plugins must be False; got {overrides}"
+    )
+
+
+def test_isolation_no_ignore_user_config_launch_arg(tmp_path):
+    """app-server does NOT accept --ignore-user-config (probed live: exec-only).
+
+    The runner must therefore NOT inject it as a launch arg (it would make codex
+    reject the argument and never start). launch_args_override must stay None so
+    the SDK builds the normal ``codex --config ... app-server`` invocation.
+    """
+    runner = _make_runner(tmp_path)
+    cfg = runner._codex_config()
+    assert cfg.launch_args_override is None
+    assert not any(
+        "ignore-user-config" in str(o) for o in cfg.config_overrides
+    ), "ignore-user-config is exec-only; must not appear as an app-server override"
+
+
+def test_thread_config_still_carries_live_request_id(tmp_path):
+    """Per-thread config keeps the eud-tools mcp_servers entry WITH the live
+    EUD_REQUEST_ID (it changes per chat-session; the launch-level override is
+    fixed per process, so the request id MUST live in the thread layer)."""
+    runner = _make_runner(tmp_path)
+    tc = runner._thread_config("req-abc123")
+    eud = tc["mcp_servers"]["eud-tools"]
+    assert eud["env"]["EUD_REQUEST_ID"] == "req-abc123"
+    assert eud["env"]["EUD_DATA_DIR"] == str(tmp_path / "data")
+    assert eud["args"] == ["-m", "eud_agent.mcp_shim"]
+
+
+def test_isolation_is_injectable(tmp_path):
+    """Isolation settings are injectable so the live E2E can flip them (e.g. add a
+    skills mechanism later). Passing isolation=... overrides the defaults."""
+    from eud_agent.agent_runner import CodexIsolation, CodexSDKRunner
+
+    async def _send(_ev):  # pragma: no cover
+        return None
+
+    custom = CodexIsolation(disable_plugins=False, extra_overrides=("foo.bar=true",))
+    runner = CodexSDKRunner(
+        tool_layer=object(),
+        send=_send,
+        build_system_prompt=lambda *a, **k: "",
+        codex_bin=str(tmp_path / "codex.cmd"),
+        data_dir=str(tmp_path / "data"),
+        isolation=custom,
+    )
+    parsed = _overrides_dict(runner._codex_config().config_overrides)
+    # plugins NOT disabled (flipped off) and the extra override is present.
+    assert "features.plugins" not in parsed
+    assert parsed.get("foo.bar") is True
+    # mcp_servers whole-table replacement still applies regardless.
+    assert set(parsed["mcp_servers"].keys()) == {"eud-tools"}
+
+
+# --------------------------------------------------------------------------- #
 # 7. Real-codex smoke (env-flagged; spends real tokens — DO NOT run by default).
 # --------------------------------------------------------------------------- #
 

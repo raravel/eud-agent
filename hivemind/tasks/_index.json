@@ -1027,7 +1027,7 @@
       ]
     },
     "EUD-061-3254": {
-      "status": "pending",
+      "status": "in_progress",
       "priority": "high",
       "type": "task",
       "parent": "EUD-047-fd09",
@@ -1042,6 +1042,43 @@
       "path": "active/EUD-061-3254.md",
       "scope": [
         "*"
+      ]
+    },
+    "EUD-062-644f": {
+      "status": "done",
+      "priority": "high",
+      "type": "bug",
+      "parent": "EUD-047-fd09",
+      "depends_on": [],
+      "title": "Agent codex threads must not inherit personal codex config (MCP/plugins/skills isolation)",
+      "updated": "2026-06-05",
+      "completed_at": "2026-06-05T16:32:17.362743",
+      "path": "done/EUD-062-644f.md",
+      "scope": [
+        "server/eud_agent/agent_runner.py",
+        "server/tests/test_agent_flow.py"
+      ]
+    },
+    "EUD-063-b479": {
+      "status": "pending",
+      "priority": "high",
+      "type": "bug",
+      "parent": "EUD-047-fd09",
+      "depends_on": [
+        "EUD-062-644f"
+      ],
+      "title": "Agent stream UX: surface reasoning, prominent answer, no raw event kinds",
+      "updated": "2026-06-05",
+      "completed_at": null,
+      "path": "active/EUD-063-b479.md",
+      "scope": [
+        "server/eud_agent/agent_runner.py",
+        "server/tests/test_agent_flow.py",
+        "panel/src/components/AgentStream.tsx",
+        "panel/src/components/AgentStream.test.tsx",
+        "panel/src/components/ConversationLog.tsx",
+        "panel/src/components/ConversationLog.test.tsx",
+        "panel/src/App.tsx"
       ]
     }
   }
