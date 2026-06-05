@@ -36,7 +36,7 @@ import time
 from datetime import UTC, datetime
 from pathlib import Path
 
-from fastapi import FastAPI, WebSocket
+from fastapi import FastAPI, Request, WebSocket
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.websockets import WebSocketDisconnect, WebSocketState
@@ -46,6 +46,7 @@ from .bridge_io import BridgeIO
 from .codex_client import CodexClient, CodexNotFound
 from .config import Config
 from .orchestrator import Orchestrator
+from .tools import ToolError, ToolLayer
 
 # Lifecycle defaults (rules.md: heartbeat check 15s, staleness 60s; ready poll is
 # a fast internal confirm). All are injectable via create_app for tests.
@@ -372,10 +373,55 @@ def create_app(
         bridge, codex, rag_db=cfg.rag_db, send=broadcast
     )
 
+    # The eud-tools tool layer (features/05): the policy layer for codex's tool
+    # calls. The MCP shim is dumb transport that forwards to /tools/call below;
+    # ALL validation / gate / budget live here in the FastAPI process. Exposed on
+    # app.state so the v2 agent runner (later task) can read per-request budgets.
+    tool_layer = ToolLayer(bridge)
+    app.state.tool_layer = tool_layer
+
     # ----------------------------------------------------------------- routes
     @app.get("/healthz")
     async def healthz() -> JSONResponse:
         return JSONResponse({"status": "ok"})
+
+    # ----- eud-tools endpoints (token-authenticated, 127.0.0.1 only) -----
+    # The MCP shim forwards here with the server.ready token. rules.md "Server and
+    # panel": token-validated; never 0.0.0.0 (the server binds 127.0.0.1 only, so
+    # these are loopback-only by construction). A wrong/missing token -> 401; a
+    # tool/validation/gate/budget failure is a tool RESULT (ok=false), not an HTTP
+    # 5xx, so codex sees a correctable error rather than a transport crash.
+    @app.get("/tools/list")
+    async def tools_list(token: str | None = None) -> JSONResponse:
+        if token != cfg.token:
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        return JSONResponse({"tools": tool_layer.tool_specs()})
+
+    @app.post("/tools/call")
+    async def tools_call(request: Request) -> JSONResponse:
+        try:
+            payload = await request.json()
+        except Exception:  # noqa: BLE001 - malformed body -> clean 400
+            return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+        if not isinstance(payload, dict) or payload.get("token") != cfg.token:
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        request_id = str(payload.get("request_id") or "default")
+        tool = payload.get("tool")
+        args = payload.get("args") or {}
+        if not isinstance(tool, str):
+            return JSONResponse(
+                {"ok": False, "error": "missing 'tool' name"}
+            )
+        # The handlers do blocking file-IPC (bridge); run off the event loop. A
+        # ToolError (bad args / gate / budget / bridge ERROR) is returned as a
+        # tool result, never raised to a 5xx.
+        try:
+            result = await asyncio.to_thread(
+                tool_layer.call_for_request, request_id, tool, args
+            )
+        except ToolError as exc:
+            return JSONResponse({"ok": False, "error": str(exc)})
+        return JSONResponse({"ok": True, "result": result})
 
     @app.get("/")
     async def root():

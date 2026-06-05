@@ -856,7 +856,7 @@
       ]
     },
     "EUD-054-8c97": {
-      "status": "in_progress",
+      "status": "done",
       "priority": "high",
       "type": "task",
       "parent": "EUD-045-38f9",
@@ -868,8 +868,8 @@
       ],
       "title": "eud-tools MCP server + tool registry + mutation gate/budgets",
       "updated": "2026-06-05",
-      "completed_at": null,
-      "path": "active/EUD-054-8c97.md",
+      "completed_at": "2026-06-05T14:02:16.634582",
+      "path": "done/EUD-054-8c97.md",
       "scope": [
         "server/eud_agent/tools.py",
         "server/eud_agent/mcp_shim.py",
