@@ -25,7 +25,7 @@ describe("ConversationLog — entries", () => {
   it("renders an instruction (you) entry's text", () => {
     const store = createPanelStore();
     store.log("you", "트리거를 추가해줘");
-    render(<ConversationLog log={store.getState().log} phase="working" />);
+    render(<ConversationLog log={store.getState().log} phase="thinking" />);
     expect(screen.getByText("트리거를 추가해줘")).toBeInTheDocument();
   });
 
@@ -48,15 +48,15 @@ describe("ConversationLog — progress spinner on the active stage", () => {
   it("shows a spinner on the latest progress entry while working", () => {
     const store = createPanelStore();
     store.log("progress", "RAG 검색 중…", "rag");
-    render(<ConversationLog log={store.getState().log} phase="working" />);
+    render(<ConversationLog log={store.getState().log} phase="thinking" />);
     const entry = screen.getByTestId("log-entry-rag");
     expect(within(entry).getByRole("status")).toBeInTheDocument();
   });
 
-  it("shows a spinner on a waiting_build progress entry while waiting", () => {
+  it("shows a spinner on a waiting_build progress entry while busy", () => {
     const store = createPanelStore();
     store.log("progress", "빌드 대기 중…", "waiting_build");
-    render(<ConversationLog log={store.getState().log} phase="waiting" />);
+    render(<ConversationLog log={store.getState().log} phase="thinking" />);
     const entry = screen.getByTestId("log-entry-waiting_build");
     expect(within(entry).getByRole("status")).toBeInTheDocument();
   });
@@ -72,7 +72,7 @@ describe("ConversationLog — progress spinner on the active stage", () => {
     const store = createPanelStore();
     store.log("progress", "RAG 검색 중…", "rag");
     store.log("progress", "codex 실행 중…", "codex");
-    render(<ConversationLog log={store.getState().log} phase="working" />);
+    render(<ConversationLog log={store.getState().log} phase="thinking" />);
     expect(
       within(screen.getByTestId("log-entry-codex")).queryByRole("status"),
     ).toBeInTheDocument();

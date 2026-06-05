@@ -245,8 +245,8 @@ describe("inbound dispatch", () => {
     });
     client.connect();
     lastSocket().fireOpen();
-    lastSocket().fireMessage({ type: "applied", target: "main.eps" });
-    expect(received.some((m) => m.type === "applied")).toBe(true);
+    lastSocket().fireMessage({ type: "answer", text: "done" });
+    expect(received.some((m) => m.type === "answer")).toBe(true);
   });
 
   it("surfaces unknown message types via onLog and never throws", () => {

@@ -939,7 +939,7 @@
       ]
     },
     "EUD-058-babc": {
-      "status": "in_progress",
+      "status": "done",
       "priority": "high",
       "type": "task",
       "parent": "EUD-046-f2c8",
@@ -948,8 +948,8 @@
       ],
       "title": "Panel WS v2 protocol + store state machine rework",
       "updated": "2026-06-05",
-      "completed_at": null,
-      "path": "active/EUD-058-babc.md",
+      "completed_at": "2026-06-05T15:35:51.931410",
+      "path": "done/EUD-058-babc.md",
       "scope": [
         "panel/src/ws/protocol.ts",
         "panel/src/ws/client.ts",

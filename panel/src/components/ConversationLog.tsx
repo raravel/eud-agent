@@ -20,17 +20,17 @@ export interface ConversationLogProps {
   phase: Phase;
 }
 
-/** Phases in which a live progress entry should still spin. */
+/** Phases in which a live progress entry should still spin (v2: a turn in flight). */
 const BUSY_PHASES: ReadonlySet<Phase> = new Set<Phase>([
-  "working",
-  "applying",
-  "waiting",
+  "thinking",
+  "plan_review",
 ]);
 
 /** Per-kind text styling for a log row. */
 const KIND_CLASS: Record<LogKind, string> = {
   info: "text-muted-foreground",
   you: "ml-auto rounded-lg bg-secondary px-3 py-2 text-foreground",
+  agent: "text-muted-foreground",
   progress: "text-muted-foreground",
   ok: "text-emerald-400",
   warn: "text-amber-400",

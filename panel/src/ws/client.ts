@@ -1,10 +1,12 @@
 /**
- * WebSocket protocol client (typed messages, reconnect, single-disconnect log).
+ * WebSocket protocol client (typed v2 messages, reconnect, single-disconnect log).
  *
- * features/03_agent-panel.md ## Behaviors → Connection:
+ * features/06_changeset-review-panel.md (reconnect 2s backoff) + features/05
+ * "WS protocol v2" (the message set). Connection behavior:
  *   - token from `location.search` (URLSearchParams); url is
  *     `ws://${location.host}/ws?token=...`.
- *   - auto-reconnect with 2s backoff; on (re)connect re-request `status` + `list`.
+ *   - auto-reconnect with 2s backoff; on (re)connect re-request `status` + `list`
+ *     (both kept in v2 for the header).
  *   - FIX (vanilla advisory): track was-open state so an outage logs ONE
  *     disconnect line, not one per 2s retry cycle.
  *   - unknown WS message types append a log line and NEVER throw.

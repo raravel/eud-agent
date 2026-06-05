@@ -1,33 +1,28 @@
 /**
- * Panel app shell — wires the EUD-033 WS client + state store to the UI
- * components (Header, ConversationLog, TargetPicker, ReviewTabs,
- * DiagnosticsStrip, ApplyBar, InstructionBox).
+ * Panel app shell (v2) — wires the WS v2 client + state store to the UI.
  *
- * Data flow: WsClient (real WebSocket factory + window.location) → store
- * actions + log entries → React snapshot via useSyncExternalStore → components
- * → user intents call client.send + the matching store action.
+ * THIS IS THE PROTOCOL/STORE-LAYER SHELL ONLY (EUD-058). The chat-first v2 UI
+ * components (PlanView / ChangesetView / AgentStream / regated InstructionBox /
+ * status-rich Header / card ConversationLog) are a LATER task (features/06
+ * ## Implementation). This shell keeps the build green and exercises the v2
+ * store end-to-end: it dispatches every v2 server message into the store, sends
+ * `chat` on submit, and renders minimal plan/changeset placeholders so the
+ * review states are visible without the full UI.
  *
- * Notes:
- *  - The client treats any WS close as "retry" (it NEVER branches on close
- *    codes — the pre-accept 4403 surfaces as a 1006 handshake failure; carry-
- *    forward from EUD-033).
- *  - The Monaco buffer (editedCode) is the single source of truth for Apply.
+ * Data flow: WsClient (real WebSocket factory + window.location) → store actions
+ * + log entries → React snapshot via useSyncExternalStore → components → user
+ * intents call client.send + the matching store action.
  */
 import {
   useCallback,
   useEffect,
   useMemo,
   useRef,
-  useState,
   useSyncExternalStore,
 } from "react";
 import { Header } from "@/components/Header";
 import { ConversationLog } from "@/components/ConversationLog";
-import { TargetPicker } from "@/components/TargetPicker";
-import { InstructionBox, type InstructPayload } from "@/components/InstructionBox";
-import { ReviewTabs } from "@/components/ReviewTabs";
-import { DiagnosticsStrip } from "@/components/DiagnosticsStrip";
-import { ApplyBar, type ApplyPayload } from "@/components/ApplyBar";
+import { InstructionBox, type ChatPayload } from "@/components/InstructionBox";
 import { createPanelStore } from "@/state/store";
 import { WsClient } from "@/ws/client";
 import type { ServerMessage } from "@/ws/protocol";
@@ -38,16 +33,10 @@ export default function App() {
   const store = useMemo(() => createPanelStore(), []);
   const clientRef = useRef<WsClient | null>(null);
 
-  // Local UI state not owned by the store: the NEWEPS filename, the Monaco
-  // edit buffer (Apply source of truth), and the diagnostics-dismissed flag.
-  const [newEpsName, setNewEpsName] = useState("");
-  const [editedCode, setEditedCode] = useState("");
-  const [diagDismissed, setDiagDismissed] = useState(false);
-
   // Subscribe React to the framework-agnostic store.
   const state = useSyncExternalStore(store.subscribe, store.getState, store.getState);
 
-  // Dispatch an inbound server message to store actions + log entries.
+  // Dispatch an inbound v2 server message to store actions + log entries.
   const onMessage = useCallback(
     (msg: ServerMessage) => {
       switch (msg.type) {
@@ -63,20 +52,37 @@ export default function App() {
           store.log(kind, text, msg.stage);
           break;
         }
-        case "code":
-          store.codeReceived({
-            code: msg.code,
-            lang: msg.lang,
-            diff: msg.diff,
-            diagnostics: msg.diagnostics,
-          });
-          setEditedCode(msg.code); // seed the Monaco buffer with the new code
-          setDiagDismissed(false); // a fresh review un-dismisses diagnostics
+        case "agent_event":
+          store.agentEvent(msg.kind, msg.detail);
           break;
-        case "applied":
-          store.appliedReceived(msg.target);
-          store.log("ok", `${msg.target}에 적용되었습니다.`);
+        case "answer":
+          store.answerReceived(msg.text);
+          store.log("agent", msg.text);
           break;
+        case "plan":
+          store.planReceived(msg.markdown, msg.revision);
+          store.log("agent", `계획안(rev ${msg.revision})이 도착했습니다.`);
+          break;
+        case "changeset":
+          store.changesetReceived(msg.request_id, msg.items);
+          store.log("agent", `변경사항 ${msg.items.length}건을 검토하세요.`);
+          break;
+        case "rollback_result": {
+          // Read the recorded decision BEFORE rollbackResult() clears it — the
+          // inbound message has no accept/reject discriminator, so the log label
+          // (적용 유지 vs 되돌림) must come from what the user chose.
+          const decision = store.getState().pendingDecision?.decision;
+          const count = msg.ids.length;
+          store.rollbackResult(msg.ids, msg.ok);
+          if (decision === "accept") {
+            store.log("ok", count > 0 ? `적용 유지 (${count}건)` : "적용 유지");
+          } else if (msg.ok) {
+            store.log("ok", `되돌림 (${count}건)`);
+          } else {
+            store.log("warn", `되돌리기 일부 실패 (${count}건)`);
+          }
+          break;
+        }
         case "error":
           store.errorReceived(msg.message);
           store.log("error", `오류: ${msg.message}`);
@@ -95,9 +101,8 @@ export default function App() {
     const client = new WsClient({
       onMessage,
       onLog: (kind, text) => {
-        if (kind === "disconnect") store.log("warn", text);
-        else if (kind === "info") store.log("info", text);
-        else store.log("warn", text); // unknown / badjson
+        if (kind === "info") store.log("info", text);
+        else store.log("warn", text); // disconnect / unknown / badjson
       },
       onOpenChange: (open) => {
         if (open) store.wsOpen();
@@ -114,54 +119,15 @@ export default function App() {
 
   // ---- user intents ----
   const handleSend = useCallback(
-    (payload: InstructPayload) => {
-      const sent = clientRef.current?.send({
-        type: "instruct",
-        instruction: payload.instruction,
-        target: payload.target,
-        useContext: payload.useContext,
-      });
+    (payload: ChatPayload) => {
+      const sent = clientRef.current?.send({ type: "chat", text: payload.text });
       if (sent) {
-        store.log("you", payload.instruction);
-        store.instructSent();
+        store.log("you", payload.text);
+        store.chatSent();
       }
     },
     [store],
   );
-
-  const handleApply = useCallback(
-    (payload: ApplyPayload) => {
-      const sent = clientRef.current?.send({
-        type: "apply",
-        mode: payload.mode,
-        target: payload.target,
-        code: payload.code,
-      });
-      if (sent) {
-        store.log(
-          "info",
-          payload.mode === "set"
-            ? `${payload.target} 적용 중…`
-            : `새 파일 ${payload.target} 생성 중…`,
-        );
-        store.applySent();
-      }
-    },
-    [store],
-  );
-
-  const handleRefresh = useCallback(() => {
-    clientRef.current?.send({ type: "status" });
-    clientRef.current?.send({ type: "list" });
-  }, []);
-
-  const handleCancel = useCallback(() => store.cancelReview(), [store]);
-
-  const reviewing =
-    state.review !== null &&
-    (state.phase === "reviewing" ||
-      state.phase === "applying" ||
-      state.phase === "waiting");
 
   return (
     <div className="flex h-screen flex-col bg-background text-foreground">
@@ -169,35 +135,22 @@ export default function App() {
 
       <ConversationLog log={state.log} phase={state.phase} />
 
-      <TargetPicker
-        state={state}
-        newEpsName={newEpsName}
-        onSelectTarget={(p) => store.selectTarget(p)}
-        onToggleNewFile={(on) => store.setNewFileMode(on)}
-        onRefresh={handleRefresh}
-        onChangeNewEpsName={setNewEpsName}
-      />
-
-      {reviewing && state.review && (
-        <section aria-label="코드 검토" className="flex flex-col gap-2 py-2">
-          <ReviewTabs
-            review={state.review}
-            newFileMode={state.newFileMode}
-            editedCode={editedCode}
-            onEditCode={setEditedCode}
-          />
-          <DiagnosticsStrip
-            diagnostics={state.review.diagnostics}
-            dismissed={diagDismissed}
-            onDismiss={() => setDiagDismissed(true)}
-          />
-          <ApplyBar
-            state={state}
-            editedCode={editedCode}
-            newEpsName={newEpsName}
-            onApply={handleApply}
-            onCancel={handleCancel}
-          />
+      {/* Minimal review placeholders — the full PlanView / ChangesetView UI is a
+          later task (features/06 ## Implementation). */}
+      {state.plan && (
+        <section
+          aria-label="계획 검토"
+          className="border-t border-border px-4 py-2 text-sm text-muted-foreground"
+        >
+          계획안(rev {state.plan.revision})을 검토하세요.
+        </section>
+      )}
+      {state.changeset && state.phase === "changeset_review" && (
+        <section
+          aria-label="변경사항 검토"
+          className="border-t border-border px-4 py-2 text-sm text-muted-foreground"
+        >
+          변경사항 {state.changeset.items.length}건이 검토 대기 중입니다.
         </section>
       )}
 

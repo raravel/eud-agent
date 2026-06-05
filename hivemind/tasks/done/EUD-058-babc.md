@@ -1,4 +1,5 @@
 ---
+completed_at: '2026-06-05T15:35:51.931410'
 created: '2026-06-05'
 depends_on:
 - EUD-056-5ca7
@@ -29,7 +30,7 @@ scope:
 - panel/src\state\store.test.ts
 - panel/src\ws\client.test.ts
 - panel/src\ws\protocol.test.ts
-status: in_progress
+status: done
 title: Panel WS v2 protocol + store state machine rework
 type: task
 updated: '2026-06-05'
