@@ -62,3 +62,14 @@ export function progressLabel(stage: string, detail?: string): ProgressLine {
   }
   return { kind: "progress", text: STAGE_LABELS[stage] ?? stage };
 }
+
+/**
+ * Format an elapsed duration (seconds) for the RAG-loading header pill
+ * (features/06 ## Behaviors → Status visibility: "RAG model state with elapsed
+ * seconds while loading"). Floors to whole seconds and clamps negatives to 0
+ * (a clock-skew / not-yet-started guard), with the Korean 초 suffix.
+ */
+export function formatElapsed(seconds: number): string {
+  const safe = Number.isFinite(seconds) && seconds > 0 ? Math.floor(seconds) : 0;
+  return `${safe}초`;
+}

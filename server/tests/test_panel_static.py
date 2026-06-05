@@ -54,6 +54,23 @@ UI_DIR = COMPONENTS_DIR / "ui"
 DIST_DIR = PANEL_DIR / "dist"
 DIST_INDEX_HTML = DIST_DIR / "index.html"
 
+# Panel v2 component contract (features/06_changeset-review-panel.md). The v1
+# target-picker / apply-bar flow was REPLACED ENTIRELY (the agent chooses
+# files/targets itself); those components are DELETED (EUD-058) and must stay
+# gone. The chat-first v2 review UI adds ChangesetView + AgentStream (EUD-059).
+PANEL_SRC_COMPONENTS = SRC_DIR / "components"
+# v1 components that must be ABSENT (regression guard against resurrection).
+V2_ABSENT_COMPONENTS = (
+    PANEL_SRC_COMPONENTS / "TargetPicker.tsx",
+    PANEL_SRC_COMPONENTS / "ApplyBar.tsx",
+)
+# v2 components that must be PRESENT.
+V2_PRESENT_COMPONENTS = (
+    PANEL_SRC_COMPONENTS / "ChangesetView.tsx",
+    PANEL_SRC_COMPONENTS / "AgentStream.tsx",
+    PANEL_SRC_COMPONENTS / "Header.tsx",
+)
+
 GITIGNORE = REPO_ROOT / ".gitignore"
 
 # npm dependencies the committed React stack must declare (any of
@@ -303,6 +320,33 @@ def test_vanilla_style_css_deleted():
     assert not VANILLA_STYLE_CSS.exists(), (
         f"panel/style.css must be deleted (vanilla panel retired): "
         f"{VANILLA_STYLE_CSS}"
+    )
+
+
+# --- 5c. panel v2 component contract (absence + presence) -----------------
+
+
+def test_v1_target_picker_apply_bar_absent():
+    """TargetPicker.tsx / ApplyBar.tsx are DELETED (panel v2 full replacement).
+
+    features/06: the v1 target-picker / apply-bar flow is replaced ENTIRELY —
+    the agent chooses files/targets itself, so there is no picker and no manual
+    apply bar. EUD-058 removed them; this guards against resurrection.
+    """
+    present = [str(p.relative_to(REPO_ROOT)) for p in V2_ABSENT_COMPONENTS if p.exists()]
+    assert not present, (
+        f"v1 panel components must be ABSENT (panel v2 full replacement, "
+        f"features/06): {present}"
+    )
+
+
+def test_v2_components_present():
+    """ChangesetView / AgentStream / Header v2 components exist (EUD-059)."""
+    missing = [
+        str(p.relative_to(REPO_ROOT)) for p in V2_PRESENT_COMPONENTS if not p.is_file()
+    ]
+    assert not missing, (
+        f"panel v2 components missing (features/06 ## Implementation): {missing}"
     )
 
 

@@ -38,6 +38,12 @@ import type {
   FileEntry,
   ProgressStage,
 } from "@/ws/protocol";
+// itemIds maps an item to its decision-target ids (a dat group has NO
+// item-level id — its ids live on each property; see lib/changeset). The store
+// MUST use the same id-shape helper as ChangesetView so "fully decided" agrees
+// with what the view renders. Value import; the reverse `import type
+// { ItemDecision }` in lib/changeset is type-only, so there is no runtime cycle.
+import { itemIds } from "@/lib/changeset";
 
 /** Max conversation/event-log entries (features/06 ## Behaviors). */
 export const MAX_LOG_ENTRIES = 500;
@@ -219,11 +225,24 @@ const NO_PROJECT_MARKER = "no project";
 /** Notice shown when a reconnect cancels an in-flight turn (features/06 line 52). */
 const RECONNECT_TURN_NOTICE = "재연결로 진행 중이던 작업이 취소되었습니다.";
 
-/** True when every changeset item has a decision (accepted/rejected/failed). */
+/**
+ * True when every changeset item has a decision (accepted/rejected/failed).
+ *
+ * An item is decided when ALL of its decision-target ids are decided — derived
+ * from {@link itemIds}, the SAME id-shape helper ChangesetView uses. This is
+ * load-bearing for dat groups: a dat group carries NO item-level `id` (the ids
+ * live on each property), so the old `decisions[it.id]` test was permanently
+ * undefined for any dat group and a changeset containing one could NEVER reach
+ * "fully decided" — stranding changeset_review and re-opening it on reconnect.
+ * An item with zero ids (defensive) is treated as already decided so it never
+ * blocks completion.
+ */
 function isChangesetFullyDecided(cs: ChangesetState): boolean {
   return (
     cs.items.length > 0 &&
-    cs.items.every((it) => cs.decisions[it.id] !== undefined)
+    cs.items.every((it) =>
+      itemIds(it).every((id) => cs.decisions[id] !== undefined),
+    )
   );
 }
 
@@ -411,9 +430,12 @@ export function createPanelStore(): PanelStore {
       //  - reject (and per-item accept) carry the real ids.
       let targetIds: string[];
       if (pending?.ids === "all" && ids.length === 0) {
+        // Resolve against ALL currently-undecided ids. Derive ids per item via
+        // itemIds (a dat group's ids live on its properties, NOT on it.id), then
+        // keep only the still-undecided ones.
         targetIds = core.changeset.items
-          .filter((it) => core.changeset!.decisions[it.id] === undefined)
-          .map((it) => it.id);
+          .flatMap((it) => itemIds(it))
+          .filter((id) => core.changeset!.decisions[id] === undefined);
       } else {
         targetIds = ids;
       }

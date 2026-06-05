@@ -1,27 +1,30 @@
 /**
- * Panel app shell (v2) — wires the WS v2 client + state store to the UI.
+ * Panel app shell (v2) — wires the WS v2 client + state store to the chat-first
+ * review UI (features/06_changeset-review-panel.md).
  *
- * THIS IS THE PROTOCOL/STORE-LAYER SHELL ONLY (EUD-058). The chat-first v2 UI
- * components (PlanView / ChangesetView / AgentStream / regated InstructionBox /
- * status-rich Header / card ConversationLog) are a LATER task (features/06
- * ## Implementation). This shell keeps the build green and exercises the v2
- * store end-to-end: it dispatches every v2 server message into the store, sends
- * `chat` on submit, and renders minimal plan/changeset placeholders so the
- * review states are visible without the full UI.
+ * Components: a status-rich Header (connection transitions + RAG state/elapsed),
+ * the ConversationLog cards, a live AgentStream under the turn, the ChangesetView
+ * accept/reject surface, and the regated InstructionBox. PlanView is owned by a
+ * separate task — the EUD-058 plan placeholder is kept compiling here.
  *
  * Data flow: WsClient (real WebSocket factory + window.location) → store actions
  * + log entries → React snapshot via useSyncExternalStore → components → user
- * intents call client.send + the matching store action.
+ * intents call client.send + the matching store action. Two pieces of UI-only
+ * state live here (not protocol state): the current turn's agent_event list (for
+ * AgentStream) and the RAG warmup state/timing (for the Header pill).
  */
 import {
   useCallback,
   useEffect,
   useMemo,
   useRef,
+  useState,
   useSyncExternalStore,
 } from "react";
-import { Header } from "@/components/Header";
+import { Header, type RagState } from "@/components/Header";
 import { ConversationLog } from "@/components/ConversationLog";
+import { AgentStream, type AgentActivity } from "@/components/AgentStream";
+import { ChangesetView } from "@/components/ChangesetView";
 import { InstructionBox, type ChatPayload } from "@/components/InstructionBox";
 import { createPanelStore } from "@/state/store";
 import { WsClient } from "@/ws/client";
@@ -35,6 +38,27 @@ export default function App() {
 
   // Subscribe React to the framework-agnostic store.
   const state = useSyncExternalStore(store.subscribe, store.getState, store.getState);
+
+  // ---- UI-only state (not protocol state) ----
+  // The current turn's agent_event stream (AgentStream). Reset when a new turn
+  // starts (chat/plan_feedback/plan_approve sent).
+  const [agentEvents, setAgentEvents] = useState<AgentActivity[]>([]);
+  // RAG warmup visibility for the Header pill. `startedAt` drives the elapsed
+  // counter while loading; a 1s tick re-renders so the seconds advance.
+  const [ragState, setRagState] = useState<RagState>("idle");
+  const ragStartRef = useRef<number | null>(null);
+  const [ragElapsedSec, setRagElapsedSec] = useState(0);
+
+  // Tick the RAG elapsed counter once a second while loading.
+  useEffect(() => {
+    if (ragState !== "loading") return;
+    const id = setInterval(() => {
+      if (ragStartRef.current !== null) {
+        setRagElapsedSec((Date.now() - ragStartRef.current) / 1000);
+      }
+    }, 1000);
+    return () => clearInterval(id);
+  }, [ragState]);
 
   // Dispatch an inbound v2 server message to store actions + log entries.
   const onMessage = useCallback(
@@ -50,10 +74,24 @@ export default function App() {
           store.progressReceived(msg.stage);
           const { kind, text } = progressLabel(msg.stage, msg.detail);
           store.log(kind, text, msg.stage);
+          // RAG warmup drives the Header pill (started → loading w/ elapsed,
+          // done → ready, error → unavailable).
+          if (msg.stage === "rag_warmup") {
+            if (msg.detail === "done") {
+              setRagState("ready");
+            } else if (msg.detail !== undefined && msg.detail.startsWith("error")) {
+              setRagState("unavailable");
+            } else {
+              ragStartRef.current = Date.now();
+              setRagElapsedSec(0);
+              setRagState("loading");
+            }
+          }
           break;
         }
         case "agent_event":
           store.agentEvent(msg.kind, msg.detail);
+          setAgentEvents((prev) => [...prev, { kind: msg.kind, detail: msg.detail }]);
           break;
         case "answer":
           store.answerReceived(msg.text);
@@ -124,19 +162,44 @@ export default function App() {
       if (sent) {
         store.log("you", payload.text);
         store.chatSent();
+        setAgentEvents([]); // a new turn — reset the activity stream.
       }
     },
     [store],
   );
 
+  // Fire a changeset_decision and record it in the store (so the matching
+  // rollback_result is labelled per accept/reject). The ids are the literal
+  // "all" (bulk) or the item's ids (ChangesetView resolves dat group ids).
+  const handleDecide = useCallback(
+    (decision: "accept" | "reject", ids: "all" | string[]) => {
+      const sent = clientRef.current?.send({
+        type: "changeset_decision",
+        decision,
+        ids,
+      });
+      if (sent) store.decisionSent(decision, ids);
+    },
+    [store],
+  );
+
+  const rag = ragState === "idle" ? undefined : { state: ragState, elapsedSec: ragElapsedSec };
+
   return (
     <div className="flex h-screen flex-col bg-background text-foreground">
-      <Header project={state.project} connected={state.connected} phase={state.phase} />
+      <Header
+        project={state.project}
+        connected={state.connected}
+        phase={state.phase}
+        rag={rag}
+      />
 
       <ConversationLog log={state.log} phase={state.phase} />
 
-      {/* Minimal review placeholders — the full PlanView / ChangesetView UI is a
-          later task (features/06 ## Implementation). */}
+      {/* Live agent activity (collapses to a summary when the turn ends). */}
+      <AgentStream events={agentEvents} live={state.phase === "thinking"} />
+
+      {/* Plan placeholder — the full PlanView is a separate task. */}
       {state.plan && (
         <section
           aria-label="계획 검토"
@@ -145,13 +208,13 @@ export default function App() {
           계획안(rev {state.plan.revision})을 검토하세요.
         </section>
       )}
+
       {state.changeset && state.phase === "changeset_review" && (
-        <section
-          aria-label="변경사항 검토"
-          className="border-t border-border px-4 py-2 text-sm text-muted-foreground"
-        >
-          변경사항 {state.changeset.items.length}건이 검토 대기 중입니다.
-        </section>
+        <ChangesetView
+          changeset={state.changeset}
+          pending={state.pendingDecision !== null}
+          onDecide={handleDecide}
+        />
       )}
 
       <InstructionBox state={state} onSend={handleSend} />

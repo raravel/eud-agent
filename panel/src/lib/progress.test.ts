@@ -24,7 +24,7 @@
  *   (other stages)            → existing STAGE_LABELS label, { kind: "progress" }
  */
 import { describe, it, expect } from "vitest";
-import { progressLabel } from "./progress";
+import { progressLabel, formatElapsed } from "./progress";
 
 const WARMUP_PENDING = "RAG 모델 준비 중…";
 
@@ -52,5 +52,23 @@ describe("progressLabel", () => {
     const out = progressLabel("codex", undefined);
     expect(out.text).toBe("codex 코드 생성 중…");
     expect(out.kind).toBe("progress");
+  });
+});
+
+describe("formatElapsed (RAG loading elapsed seconds — features/06 header)", () => {
+  it("formats whole seconds with the 초 suffix", () => {
+    expect(formatElapsed(7)).toBe("7초");
+  });
+
+  it("floors fractional seconds (a sub-second elapsed reads 0초)", () => {
+    expect(formatElapsed(0.9)).toBe("0초");
+  });
+
+  it("clamps a negative elapsed to 0초 (clock skew guard)", () => {
+    expect(formatElapsed(-3)).toBe("0초");
+  });
+
+  it("formats large elapsed values", () => {
+    expect(formatElapsed(125)).toBe("125초");
   });
 });

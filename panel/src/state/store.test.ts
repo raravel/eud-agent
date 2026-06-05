@@ -296,6 +296,94 @@ describe("rollback_result labels items per the RECORDED decision", () => {
   });
 });
 
+describe("dat-group changeset (NO item-level id — completion via property ids)", () => {
+  // REPRESENTATIVE: a server dat group carries no item-level id; its ids live on
+  // properties[]. The store must derive completion via itemIds (lib/changeset),
+  // NOT decisions[it.id] (permanently undefined → never "fully decided").
+  function datGroup(objId: number, propIds: string[]) {
+    return {
+      category: "dat",
+      dat: "unit",
+      objId,
+      properties: propIds.map((id, i) => ({
+        property: `p${i}`,
+        old: "0",
+        new: "1",
+        id,
+        seq: i,
+      })),
+    };
+  }
+
+  /** Drive to changeset_review with the given (id-less) dat groups. */
+  function reviewingDat(groups: Array<ReturnType<typeof datGroup>>) {
+    const store = readyWithProject();
+    store.chatSent();
+    // The ChangesetItem type wants id/seq; production dat groups omit them.
+    store.changesetReceived("req-dat", groups as unknown as Parameters<
+      typeof store.changesetReceived
+    >[1]);
+    return store;
+  }
+
+  it("per-PROPERTY decisions complete a dat group → ready (was unreachable)", () => {
+    const store = reviewingDat([datGroup(76, ["p1", "p2"])]);
+    expect(store.getState().phase).toBe("changeset_review");
+    // Accept the whole group (ChangesetView dispatches BOTH property ids).
+    store.decisionSent("accept", ["p1", "p2"]);
+    store.rollbackResult(["p1", "p2"], true);
+    const s = store.getState();
+    expect(s.changeset?.decisions["p1"]).toBe("accepted");
+    expect(s.changeset?.decisions["p2"]).toBe("accepted");
+    // Critical: a dat-only changeset now reaches "fully decided".
+    expect(s.phase).toBe("ready");
+  });
+
+  it("stays in changeset_review until EVERY property of a dat group is decided", () => {
+    const store = reviewingDat([datGroup(76, ["p1", "p2"])]);
+    store.decisionSent("accept", ["p1"]);
+    store.rollbackResult(["p1"], true);
+    // p2 still undecided → the group (and changeset) is NOT fully decided.
+    expect(store.getState().phase).toBe("changeset_review");
+  });
+
+  it("BULK accept (server ids:[]) resolves an id-less dat group → ready", () => {
+    const store = reviewingDat([
+      datGroup(76, ["p1", "p2"]),
+      datGroup(0, ["q1"]),
+    ]);
+    store.decisionSent("accept", "all");
+    // accept-all echoes EMPTY ids; the store resolves against all undecided
+    // PROPERTY ids (via itemIds), not it.id.
+    store.rollbackResult([], true);
+    const s = store.getState();
+    expect(s.changeset?.decisions["p1"]).toBe("accepted");
+    expect(s.changeset?.decisions["p2"]).toBe("accepted");
+    expect(s.changeset?.decisions["q1"]).toBe("accepted");
+    expect(s.phase).toBe("ready");
+  });
+
+  it("an UNDECIDED dat group stays reviewable across a reconnect", () => {
+    const store = reviewingDat([datGroup(76, ["p1", "p2"])]);
+    store.wsConnecting(); // drop
+    store.wsOpen(); // reconnect: undecided dat group must re-open review
+    const s = store.getState();
+    expect(s.phase).toBe("changeset_review");
+    expect(s.changeset?.request_id).toBe("req-dat");
+  });
+
+  it("a FULLY-DECIDED dat group does NOT re-open review on reconnect", () => {
+    const store = reviewingDat([datGroup(76, ["p1", "p2"])]);
+    store.decisionSent("accept", ["p1", "p2"]);
+    store.rollbackResult(["p1", "p2"], true);
+    expect(store.getState().phase).toBe("ready");
+    store.wsConnecting();
+    store.wsOpen();
+    // Already fully decided → lands on ready, not changeset_review.
+    expect(store.getState().phase).toBe("ready");
+  });
+});
+
 describe("send gating v2 = connected && hasProject && !busy (no settable target req.)", () => {
   it("allows send when connected with a project, even with zero files", () => {
     const store = freshStore();

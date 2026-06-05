@@ -977,7 +977,7 @@
       ]
     },
     "EUD-059-e70c": {
-      "status": "pending",
+      "status": "done",
       "priority": "high",
       "type": "task",
       "parent": "EUD-046-f2c8",
@@ -986,8 +986,8 @@
       ],
       "title": "ChangesetView + AgentStream + header status visibility",
       "updated": "2026-06-05",
-      "completed_at": null,
-      "path": "active/EUD-059-e70c.md",
+      "completed_at": "2026-06-05T15:58:13.431751",
+      "path": "done/EUD-059-e70c.md",
       "scope": [
         "panel/src/components/ChangesetView.tsx",
         "panel/src/components/AgentStream.tsx",
@@ -996,7 +996,17 @@
         "panel/src/components/ApplyBar.tsx",
         "panel/src/App.tsx",
         "panel/src/lib/progress.ts",
-        "server/tests/test_panel_static.py"
+        "server/tests/test_panel_static.py",
+        "panel/src/lib/changeset.ts",
+        "panel/src/components\\ConversationLog.test.tsx",
+        "panel/src/components\\DiagnosticsStrip.test.tsx",
+        "panel/src/components\\Header.test.tsx",
+        "panel/src/components\\InstructionBox.test.tsx",
+        "panel/src/lib\\diff.test.ts",
+        "panel/src/lib\\progress.test.ts",
+        "panel/src/lib\\truncate.test.ts",
+        "panel/src/state/store.ts",
+        "panel/src/state/store.test.ts"
       ]
     },
     "EUD-060-7771": {
