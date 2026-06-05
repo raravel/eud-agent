@@ -1060,7 +1060,7 @@
       ]
     },
     "EUD-063-b479": {
-      "status": "pending",
+      "status": "done",
       "priority": "high",
       "type": "bug",
       "parent": "EUD-047-fd09",
@@ -1070,8 +1070,8 @@
       ],
       "title": "Agent events: forward reasoning + answer delta text (server side)",
       "updated": "2026-06-05",
-      "completed_at": null,
-      "path": "active/EUD-063-b479.md",
+      "completed_at": "2026-06-05T17:20:48.486773",
+      "path": "done/EUD-063-b479.md",
       "scope": [
         "server/eud_agent/agent_runner.py",
         "server/tests/test_agent_flow.py"

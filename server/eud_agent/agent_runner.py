@@ -510,11 +510,31 @@ def _classify_event(event) -> tuple[str, str, dict]:
         return ("thinking", "", info)
     if method == "turn/completed":
         return ("turn_done", "", info)
+    if method.endswith("reasoning/summaryTextDelta") or method.endswith(
+        "reasoning/textDelta"
+    ):
+        # Reasoning-text chunk (EUD-063): ReasoningSummaryTextDelta /
+        # ReasoningTextDelta carry the text in payload.delta. Forward it as the
+        # ``reasoning`` kind so the panel can render the model's thinking.
+        return ("reasoning", _delta_text(event), info)
     if method.endswith("agentMessage/delta"):
-        return ("delta", "", info)
+        # Answer-text chunk (EUD-063): AgentMessageDelta carries the streamed
+        # answer in payload.delta — forward it instead of dropping it.
+        return ("delta", _delta_text(event), info)
     if method.endswith("tokenUsage/updated"):
         return ("token_usage", "", info)
     return ("event", method, info)
+
+
+def _delta_text(event) -> str:
+    """The ``delta`` text on a streamed delta notification, defensively.
+
+    The reasoning/answer delta notifications expose ``delta: str`` directly on the
+    notification payload (``event.payload.delta``). A missing field degrades to an
+    empty string so a model/SDK shape change never crashes the turn loop.
+    """
+    payload = getattr(event, "payload", None)
+    return getattr(payload, "delta", "") or ""
 
 
 def _item_root(event):

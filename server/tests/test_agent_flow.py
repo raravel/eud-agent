@@ -1135,3 +1135,116 @@ def _wire_journal(app, tmp_path, bridge):
     # handle the app exposes for the engine to pick up the swapped layer.
     if hasattr(app.state, "rebind_tool_layer"):
         app.state.rebind_tool_layer(app.state.tool_layer)
+
+
+# --------------------------------------------------------------------------- #
+# EUD-063: _classify_event forwards reasoning + answer delta TEXT.
+#
+# The reasoning delta notifications (ReasoningSummaryTextDeltaNotification /
+# ReasoningTextDeltaNotification) and the answer delta notification
+# (AgentMessageDeltaNotification) all carry the text in payload field
+# ``delta: str`` (pinned openai_codex 0.1.0b3 — v2_all.py:92-99, 2804-2823;
+# notification_registry maps item/agentMessage/delta, item/reasoning/textDelta,
+# item/reasoning/summaryTextDelta). The classifier must surface that text:
+# reasoning -> kind "reasoning", answer chunk -> kind "delta". A missing delta
+# field degrades to empty detail, never raising.
+# --------------------------------------------------------------------------- #
+
+
+def _delta_evt(method, *, delta=None):
+    """A streamed notification whose payload carries (or omits) ``delta``.
+
+    Mirrors the real Notification wrapper: ``event.method`` + ``event.payload``,
+    where the delta notifications expose ``delta`` directly on the payload (NOT
+    under ``payload.item.root`` — that shape is for item/* lifecycle events).
+    Omitting ``delta`` produces a payload with NO ``delta`` attribute, exercising
+    the defensive degrade-to-empty path.
+    """
+    import types
+
+    if delta is None:
+        payload = types.SimpleNamespace()
+    else:
+        payload = types.SimpleNamespace(delta=delta)
+    return types.SimpleNamespace(method=method, payload=payload)
+
+
+def _item_evt(method, item=None):
+    """An item/* lifecycle notification (payload.item.root) — regression helper."""
+    import types
+
+    payload = types.SimpleNamespace(item=types.SimpleNamespace(root=item))
+    return types.SimpleNamespace(method=method, payload=payload)
+
+
+def test_classify_reasoning_summary_text_delta():
+    from eud_agent.agent_runner import _classify_event
+
+    evt = _delta_evt("item/reasoning/summaryTextDelta", delta="먼저 유닛을")
+    assert _classify_event(evt) == ("reasoning", "먼저 유닛을", {})
+
+
+def test_classify_reasoning_text_delta():
+    from eud_agent.agent_runner import _classify_event
+
+    evt = _delta_evt("item/reasoning/textDelta", delta="thinking about marines")
+    assert _classify_event(evt) == ("reasoning", "thinking about marines", {})
+
+
+def test_classify_reasoning_delta_missing_field_is_empty():
+    from eud_agent.agent_runner import _classify_event
+
+    evt = _delta_evt("item/reasoning/textDelta")  # no delta field at all
+    assert _classify_event(evt) == ("reasoning", "", {})
+
+
+def test_classify_agent_message_delta_carries_text():
+    from eud_agent.agent_runner import _classify_event
+
+    evt = _delta_evt("item/agentMessage/delta", delta="마린의 HP는")
+    assert _classify_event(evt) == ("delta", "마린의 HP는", {})
+
+
+def test_classify_agent_message_delta_missing_field_is_empty():
+    from eud_agent.agent_runner import _classify_event
+
+    evt = _delta_evt("item/agentMessage/delta")  # no delta field
+    assert _classify_event(evt) == ("delta", "", {})
+
+
+def test_classify_existing_kinds_unchanged_regression():
+    """Every other mapping the turn loop relies on stays exactly as it was."""
+    from eud_agent.agent_runner import _classify_event
+
+    # turn lifecycle / token usage
+    assert _classify_event(_item_evt("turn/started")) == ("thinking", "", {})
+    assert _classify_event(_item_evt("turn/completed")) == ("turn_done", "", {})
+    assert (
+        _classify_event(_item_evt("thread/tokenUsage/updated"))[0] == "token_usage"
+    )
+
+    # tool_call (item/started, mcpToolCall)
+    import types
+
+    started = types.SimpleNamespace(type="mcpToolCall", tool="dat_set")
+    kind, detail, info = _classify_event(_item_evt("item/started", started))
+    assert (kind, detail) == ("tool_call", "dat_set")
+
+    # tool_result + mutation flag
+    done = types.SimpleNamespace(type="mcpToolCall", tool="dat_set", result=None)
+    kind, detail, info = _classify_event(_item_evt("item/completed", done))
+    assert kind == "tool_result"
+    assert info.get("mutation") is True
+
+    # answer (full agentMessage item)
+    msg = types.SimpleNamespace(type="agentMessage", text="the answer")
+    kind, detail, info = _classify_event(_item_evt("item/completed", msg))
+    assert kind == "answer"
+    assert info["answer_text"] == "the answer"
+
+    # unknown method -> generic event, empty info
+    assert _classify_event(_item_evt("something/weird")) == (
+        "event",
+        "something/weird",
+        {},
+    )
