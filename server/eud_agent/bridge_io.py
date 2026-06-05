@@ -665,6 +665,48 @@ class BridgeIO:
         self._raise_if_error(reply)
         return reply
 
+    # ----------------------------------------------------------------- build
+    # Wrappers per features/04 "Build (B4)". BUILD is fire-and-forget on the
+    # editor (completion = the orchestrator polls status.txt compiling); it may
+    # surface :class:`BridgeBusy` while a prior build is in flight, like any other
+    # command. BUILDERR/EDSPATH are simple reads.
+
+    def build(self, **kw) -> str:
+        """Start an editor build (``BUILD``, no args).
+
+        The bridge forces ``SCArchive.IsUsed = false`` and preflights the
+        OpenMapName/SaveMapName/euddraft paths BEFORE invoking
+        ``EudplibData:Build(false)`` (so a missing path returns ``ERROR:`` instead
+        of popping the editor's modal CheckBuildable dialogs). On success the reply
+        is ``OK: started``; completion is observed by polling ``status.txt``
+        ``compiling`` (architecture.md busy-editor handling).
+        """
+        reply = self.send("BUILD", **kw)
+        self._raise_if_error(reply)
+        return reply
+
+    def builderr(self, **kw) -> str:
+        """Read the last build's macro/eps errors (``BUILDERR``, no args).
+
+        Returns the bridge's ``macro.macroErrorList`` walk -- one error per line.
+        An EMPTY (non-``ERROR:``) reply means zero macro errors recorded, not a
+        failure.
+        """
+        reply = self.send("BUILDERR", **kw)
+        self._raise_if_error(reply)
+        return reply
+
+    def edspath(self, **kw) -> str:
+        """Read the build artifact paths (``EDSPATH``, no args).
+
+        Returns two lines: the temp ``.eds`` path (the editor's
+        ``BuildData.EdsFilePath``) and ``SaveMapName`` -- the server uses these for
+        the euddraft re-run fallback and the output-map existence check.
+        """
+        reply = self.send("EDSPATH", **kw)
+        self._raise_if_error(reply)
+        return reply
+
     # --------------------------------------------------------------- cleanup
     def cleanup_stale(self) -> None:
         """Remove leftover ``srv-*`` IPC files at startup.

@@ -703,15 +703,15 @@
       "scope": []
     },
     "EUD-044-c735": {
-      "status": "pending",
+      "status": "done",
       "priority": "high",
       "type": "story",
       "parent": "EUD-043-1455",
       "depends_on": [],
       "title": "Bridge v2 surface",
       "updated": "2026-06-05",
-      "completed_at": null,
-      "path": "active/EUD-044-c735.md",
+      "completed_at": "2026-06-05T13:51:05.352450",
+      "path": "done/EUD-044-c735.md",
       "scope": []
     },
     "EUD-045-38f9": {
@@ -824,7 +824,7 @@
       ]
     },
     "EUD-052-3993": {
-      "status": "pending",
+      "status": "done",
       "priority": "medium",
       "type": "task",
       "parent": "EUD-044-c735",
@@ -833,8 +833,8 @@
       ],
       "title": "Bridge BUILD hardening + BUILDERR + EDSPATH",
       "updated": "2026-06-05",
-      "completed_at": null,
-      "path": "active/EUD-052-3993.md",
+      "completed_at": "2026-06-05T13:51:05.323251",
+      "path": "done/EUD-052-3993.md",
       "scope": [
         "bridge/ZZZ_10_agent_bridge.lua",
         "server/eud_agent/bridge_io.py",
@@ -856,7 +856,7 @@
       ]
     },
     "EUD-054-8c97": {
-      "status": "pending",
+      "status": "in_progress",
       "priority": "high",
       "type": "task",
       "parent": "EUD-045-38f9",

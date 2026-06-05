@@ -47,6 +47,11 @@ local ok, initErr = pcall(function()
     local TSetting     = luanet.import_type("EUD_Editor_3.ProgramData+TSetting")
     local EdsBlockType = luanet.import_type("EUD_Editor_3.BuildData+EdsBlockType")
     local EdsBlockItem = luanet.import_type("EUD_Editor_3.BuildData+EdsBlock+EdsBlockItem")
+    -- BuildData (B4): EdsFilePath is a SHARED ReadOnly property (BulidPaths.vb --
+    -- the file is named BulidPaths.vb but the class is `Partial Public Class
+    -- BuildData`; pjData.EudplibData is a BuildData INSTANCE). EDSPATH reads the
+    -- Shared property off the imported TYPE proxy (not the instance).
+    local BuildData    = luanet.import_type("EUD_Editor_3.BuildData")
     local WindowControl = luanet.import_type("EUD_Editor_3.WindowControl")
     local WMenus     = luanet.import_type("EUD_Editor_3.WindowMenu.WindowMenus")
     local DispatcherTimer = luanet.import_type("System.Windows.Threading.DispatcherTimer")
@@ -1197,10 +1202,74 @@ local ok, initErr = pcall(function()
         elseif cmd == "PANEL" then
             return showPanel()
         elseif cmd == "BUILD" then
+            -- BUILD (B4, hardened): force SCArchive.IsUsed = false (SCA is
+            -- defunct -- the dead login modal pops during Build when IsUsed is
+            -- true: BulidMain.vb:68-103) and PREFLIGHT the map/euddraft paths
+            -- BEFORE Build, so the editor's modal CheckBuildable dialogs
+            -- (BulidMain.vb:155-200, missing OpenMapName/SaveMap dir/euddraft exe)
+            -- never appear in the headless agent flow. Any missing required path
+            -- returns ERROR WITHOUT invoking Build.
             local pj = GlobalObj.pjData
-            if pj == nil then return "ERROR: 프로젝트 미로드" end
+            if pj == nil then return "ERROR: no project" end
+            -- SCArchive.IsUsed = false MUST precede the Build( call (rules.md SCA
+            -- rule). The .NET assignment is wrapped (a property setter cannot be
+            -- caught by lua pcall once it throws to the Dispatcher, but the
+            -- IsUsed setter is a plain field write -- StarCraftArchive.vb:219).
+            local okSca = pcall(function() pj.TEData.SCArchive.IsUsed = false end)
+            if not okSca then return "ERROR: SCArchive guard failed" end
+            -- Preflight: OpenMapName + SaveMapName must be present on disk, and
+            -- the euddraft path (program setting) must point at an existing exe.
+            -- (CheckBuildable checks the SaveMap DIRECTORY; an empty SaveMapName
+            -- has no directory, so reject an empty value too.)
+            local openMap = safestr(pj.OpenMapName)
+            if openMap == "" or not File.Exists(openMap) then
+                return "ERROR: OpenMapName missing or not found"
+            end
+            local saveMap = safestr(pj.SaveMapName)
+            if saveMap == "" then return "ERROR: SaveMapName empty" end
+            local saveDir = safestr(Path.GetDirectoryName(saveMap))
+            if saveDir == "" or not Directory.Exists(saveDir) then
+                return "ERROR: SaveMapName directory not found"
+            end
+            local pg = GlobalObj.pgData
+            if pg == nil then return "ERROR: no pgData" end
+            local okE, eudPath = pcall(function()
+                return safestr(pg:get_Setting(TSetting.euddraft))
+            end)
+            if not okE then return "ERROR: euddraft setting read failed" end
+            if eudPath == "" or not File.Exists(eudPath) then
+                return "ERROR: euddraft path missing or not found"
+            end
             local okB, err = pcall(function() pj.EudplibData:Build(false) end)
-            return okB and "OK: 빌드 시작" or ("ERROR: " .. tostring(err))
+            return okB and "OK: started" or ("ERROR: " .. tostring(err))
+        elseif cmd == "BUILDERR" then
+            -- BUILDERR (B4): walk GlobalObj.macro.macroErrorList -- one line per
+            -- entry (macro/eps errors accumulated by the last build). `macro` is a
+            -- Public field of the GlobalObj module of type MacroManager
+            -- (GlobalObj.vb:21); macroErrorList is a List(Of String)
+            -- (MacroPluginManager.vb:25), iterated via .Count + :get_Item(i)
+            -- (rules.md: List default Item -> get_Item). An empty (non-ERROR)
+            -- result = no macro errors recorded.
+            local macro = GlobalObj.macro
+            if macro == nil then return "ERROR: no macro manager" end
+            local list = macro.macroErrorList
+            if list == nil then return "" end
+            local lines = {}
+            for i = 0, list.Count - 1 do
+                lines[#lines + 1] = safestr(list:get_Item(i))
+            end
+            return table.concat(lines, "\r\n")
+        elseif cmd == "EDSPATH" then
+            -- EDSPATH (B4): return the BuildData-derived temp .eds path
+            -- (BuildData.EdsFilePath -- a SHARED ReadOnly property on the imported
+            -- TYPE proxy) + pjData.SaveMapName, one per line. Gives the server the
+            -- artifact paths for the euddraft re-run fallback + output-map check.
+            local pj = GlobalObj.pjData
+            if pj == nil then return "ERROR: no project" end
+            local edsPath = ""
+            local okEds = pcall(function() edsPath = safestr(BuildData.EdsFilePath) end)
+            if not okEds then return "ERROR: eds path read failed" end
+            return edsPath .. "\r\n" .. safestr(pj.SaveMapName)
         elseif cmd == "LUA" then
             local chunk, lerr = loadstring(body)
             if chunk == nil then return "ERROR: " .. tostring(lerr) end
