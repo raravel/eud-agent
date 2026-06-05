@@ -674,6 +674,337 @@
         "panel/src/lib/progress.ts",
         "panel/src/lib/progress.test.ts"
       ]
+    },
+    "EUD-042-45cb": {
+      "status": "pending",
+      "priority": "medium",
+      "type": "bug",
+      "parent": "EUD-006-50d8",
+      "depends_on": [],
+      "title": "Superseded server self-terminates (zombie leak on quick editor restart)",
+      "updated": "2026-06-05",
+      "completed_at": null,
+      "path": "active/EUD-042-45cb.md",
+      "scope": []
+    },
+    "EUD-043-1455": {
+      "status": "pending",
+      "priority": "high",
+      "type": "epic",
+      "parent": null,
+      "depends_on": [],
+      "title": "v2 Antigravity-style agentic workflow",
+      "updated": "2026-06-05",
+      "completed_at": null,
+      "path": "active/EUD-043-1455.md",
+      "scope": []
+    },
+    "EUD-044-c735": {
+      "status": "pending",
+      "priority": "high",
+      "type": "story",
+      "parent": "EUD-043-1455",
+      "depends_on": [],
+      "title": "Bridge v2 surface",
+      "updated": "2026-06-05",
+      "completed_at": null,
+      "path": "active/EUD-044-c735.md",
+      "scope": []
+    },
+    "EUD-045-38f9": {
+      "status": "pending",
+      "priority": "high",
+      "type": "story",
+      "parent": "EUD-043-1455",
+      "depends_on": [],
+      "title": "Agent core (server)",
+      "updated": "2026-06-05",
+      "completed_at": null,
+      "path": "active/EUD-045-38f9.md",
+      "scope": []
+    },
+    "EUD-046-f2c8": {
+      "status": "pending",
+      "priority": "high",
+      "type": "story",
+      "parent": "EUD-043-1455",
+      "depends_on": [],
+      "title": "Panel v2 (chat + plan + changeset review)",
+      "updated": "2026-06-05",
+      "completed_at": null,
+      "path": "active/EUD-046-f2c8.md",
+      "scope": []
+    },
+    "EUD-047-fd09": {
+      "status": "pending",
+      "priority": "high",
+      "type": "story",
+      "parent": "EUD-043-1455",
+      "depends_on": [],
+      "title": "v2 acceptance",
+      "updated": "2026-06-05",
+      "completed_at": null,
+      "path": "active/EUD-047-fd09.md",
+      "scope": []
+    },
+    "EUD-048-d732": {
+      "status": "pending",
+      "priority": "high",
+      "type": "chore",
+      "parent": "EUD-044-c735",
+      "depends_on": [],
+      "title": "Drop SCA from settable families and harness docs",
+      "updated": "2026-06-05",
+      "completed_at": null,
+      "path": "active/EUD-048-d732.md",
+      "scope": [
+        "server/eud_agent/bridge_io.py",
+        "server/tests/test_bridge_list_static.py",
+        "harness:rules",
+        "harness:architecture",
+        "harness:features"
+      ]
+    },
+    "EUD-049-5d70": {
+      "status": "pending",
+      "priority": "high",
+      "type": "task",
+      "parent": "EUD-044-c735",
+      "depends_on": [
+        "EUD-048-d732"
+      ],
+      "title": "Bridge DAT surface commands (resolver table + XDAT/TBL/RESET/REQ/BTN)",
+      "updated": "2026-06-05",
+      "completed_at": null,
+      "path": "active/EUD-049-5d70.md",
+      "scope": [
+        "bridge/ZZZ_10_agent_bridge.lua",
+        "server/eud_agent/bridge_io.py",
+        "server/tests/test_bridge_datx_static.py"
+      ]
+    },
+    "EUD-050-2bf4": {
+      "status": "pending",
+      "priority": "high",
+      "type": "task",
+      "parent": "EUD-044-c735",
+      "depends_on": [
+        "EUD-049-5d70"
+      ],
+      "title": "Bridge file-tree CRUD + SETMAIN commands",
+      "updated": "2026-06-05",
+      "completed_at": null,
+      "path": "active/EUD-050-2bf4.md",
+      "scope": [
+        "bridge/ZZZ_10_agent_bridge.lua",
+        "server/eud_agent/bridge_io.py",
+        "server/tests/test_bridge_tree_static.py"
+      ]
+    },
+    "EUD-051-6657": {
+      "status": "pending",
+      "priority": "medium",
+      "type": "task",
+      "parent": "EUD-044-c735",
+      "depends_on": [
+        "EUD-050-2bf4"
+      ],
+      "title": "Bridge settings + plugin commands",
+      "updated": "2026-06-05",
+      "completed_at": null,
+      "path": "active/EUD-051-6657.md",
+      "scope": [
+        "bridge/ZZZ_10_agent_bridge.lua",
+        "server/eud_agent/bridge_io.py",
+        "server/tests/test_bridge_plug_static.py"
+      ]
+    },
+    "EUD-052-3993": {
+      "status": "pending",
+      "priority": "medium",
+      "type": "task",
+      "parent": "EUD-044-c735",
+      "depends_on": [
+        "EUD-051-6657"
+      ],
+      "title": "Bridge BUILD hardening + BUILDERR + EDSPATH",
+      "updated": "2026-06-05",
+      "completed_at": null,
+      "path": "active/EUD-052-3993.md",
+      "scope": [
+        "bridge/ZZZ_10_agent_bridge.lua",
+        "server/eud_agent/bridge_io.py",
+        "server/tests/test_bridge_build_static.py"
+      ]
+    },
+    "EUD-053-f3ac": {
+      "status": "pending",
+      "priority": "high",
+      "type": "task",
+      "parent": "EUD-045-38f9",
+      "depends_on": [],
+      "title": "Spike: codex Python SDK + eud-tools MCP round-trip (Windows)",
+      "updated": "2026-06-05",
+      "completed_at": null,
+      "path": "active/EUD-053-f3ac.md",
+      "scope": [
+        "*"
+      ]
+    },
+    "EUD-054-8c97": {
+      "status": "pending",
+      "priority": "high",
+      "type": "task",
+      "parent": "EUD-045-38f9",
+      "depends_on": [
+        "EUD-053-f3ac",
+        "EUD-049-5d70",
+        "EUD-050-2bf4",
+        "EUD-051-6657"
+      ],
+      "title": "eud-tools MCP server + tool registry + mutation gate/budgets",
+      "updated": "2026-06-05",
+      "completed_at": null,
+      "path": "active/EUD-054-8c97.md",
+      "scope": [
+        "server/eud_agent/tools.py",
+        "server/eud_agent/mcp_shim.py",
+        "server/eud_agent/app.py",
+        "server/tests/test_tools.py"
+      ]
+    },
+    "EUD-055-f4cc": {
+      "status": "pending",
+      "priority": "high",
+      "type": "task",
+      "parent": "EUD-045-38f9",
+      "depends_on": [
+        "EUD-054-8c97"
+      ],
+      "title": "Change journal + rollback engine",
+      "updated": "2026-06-05",
+      "completed_at": null,
+      "path": "active/EUD-055-f4cc.md",
+      "scope": [
+        "server/eud_agent/journal.py",
+        "server/eud_agent/tools.py",
+        "server/tests/test_journal.py"
+      ]
+    },
+    "EUD-056-5ca7": {
+      "status": "pending",
+      "priority": "high",
+      "type": "task",
+      "parent": "EUD-045-38f9",
+      "depends_on": [
+        "EUD-055-f4cc"
+      ],
+      "title": "CodexSDKRunner + plan flow + WS v2 routing",
+      "updated": "2026-06-05",
+      "completed_at": null,
+      "path": "active/EUD-056-5ca7.md",
+      "scope": [
+        "server/eud_agent/agent_runner.py",
+        "server/eud_agent/app.py",
+        "server/eud_agent/orchestrator.py",
+        "server/tests/test_agent_flow.py"
+      ]
+    },
+    "EUD-057-e71d": {
+      "status": "pending",
+      "priority": "medium",
+      "type": "task",
+      "parent": "EUD-045-38f9",
+      "depends_on": [
+        "EUD-056-5ca7",
+        "EUD-052-3993"
+      ],
+      "title": "euddraft runner + build self-fix loop",
+      "updated": "2026-06-05",
+      "completed_at": null,
+      "path": "active/EUD-057-e71d.md",
+      "scope": [
+        "server/eud_agent/edd_runner.py",
+        "server/eud_agent/tools.py",
+        "server/tests/test_edd_runner.py"
+      ]
+    },
+    "EUD-058-babc": {
+      "status": "pending",
+      "priority": "high",
+      "type": "task",
+      "parent": "EUD-046-f2c8",
+      "depends_on": [
+        "EUD-056-5ca7"
+      ],
+      "title": "Panel WS v2 protocol + store state machine rework",
+      "updated": "2026-06-05",
+      "completed_at": null,
+      "path": "active/EUD-058-babc.md",
+      "scope": [
+        "panel/src/ws/protocol.ts",
+        "panel/src/ws/client.ts",
+        "panel/src/state/store.ts",
+        "panel/src/state/store.test.ts"
+      ]
+    },
+    "EUD-059-e70c": {
+      "status": "pending",
+      "priority": "high",
+      "type": "task",
+      "parent": "EUD-046-f2c8",
+      "depends_on": [
+        "EUD-058-babc"
+      ],
+      "title": "ChangesetView + AgentStream + header status visibility",
+      "updated": "2026-06-05",
+      "completed_at": null,
+      "path": "active/EUD-059-e70c.md",
+      "scope": [
+        "panel/src/components/ChangesetView.tsx",
+        "panel/src/components/AgentStream.tsx",
+        "panel/src/components/Header.tsx",
+        "panel/src/components/TargetPicker.tsx",
+        "panel/src/components/ApplyBar.tsx",
+        "panel/src/App.tsx",
+        "panel/src/lib/progress.ts",
+        "server/tests/test_panel_static.py"
+      ]
+    },
+    "EUD-060-7771": {
+      "status": "pending",
+      "priority": "medium",
+      "type": "task",
+      "parent": "EUD-046-f2c8",
+      "depends_on": [
+        "EUD-058-babc"
+      ],
+      "title": "PlanView + feedback iteration UI",
+      "updated": "2026-06-05",
+      "completed_at": null,
+      "path": "active/EUD-060-7771.md",
+      "scope": [
+        "panel/src/components/PlanView.tsx",
+        "panel/src/App.tsx"
+      ]
+    },
+    "EUD-061-3254": {
+      "status": "pending",
+      "priority": "high",
+      "type": "task",
+      "parent": "EUD-047-fd09",
+      "depends_on": [
+        "EUD-057-e71d",
+        "EUD-059-e70c",
+        "EUD-060-7771"
+      ],
+      "title": "Live E2E: three v2 acceptance scenarios",
+      "updated": "2026-06-05",
+      "completed_at": null,
+      "path": "active/EUD-061-3254.md",
+      "scope": [
+        "*"
+      ]
     }
   }
 }

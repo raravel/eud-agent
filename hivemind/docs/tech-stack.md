@@ -1,6 +1,6 @@
 # eud-agent Tech Stack
 
-> Grounding (2026-06-04, refreshed after the EUD-031 scaffold): Python deps grounded in `server/pyproject.toml` + `server/uv.lock`; frontend deps grounded in `panel/package.json` + `panel/package-lock.json` (exact resolved versions below).
+> Grounding (2026-06-04, refreshed after the EUD-031 scaffold; re-checked 2026-06-05 for the v2 plan — manifests unchanged): Python deps grounded in `server/pyproject.toml` + `server/uv.lock`; frontend deps grounded in `panel/package.json` + `panel/package-lock.json` (exact resolved versions below).
 
 ## Active Dependencies
 
@@ -29,6 +29,13 @@ Pinned in `server/pyproject.toml` (uv-managed venv at `server/.venv`, Python 3.1
 - npm — package manager (node v24.11.1 system install)
 
 > Decision: see [[decisions/03_react-panel-rebuild]] and [[decisions/05_monaco-editor-adoption]].
+
+### Planned — v2 agent core (NOT yet in any manifest; added to `server/pyproject.toml` when the owning task lands)
+
+- official Codex Python SDK (openai/codex `sdk/python`) — codex thread lifecycle, streaming JSONL events, BYO account; exact PyPI package name and pin are determined by the v2 spike task before any dependent code is written
+- `mcp` (Model Context Protocol Python SDK) — server side of the eud-tools stdio shim that codex attaches to; pinned by the same spike
+
+> These two entries move into Active Dependencies (with pins) the moment the spike task commits them to `server/pyproject.toml`. Until then nothing imports them.
 
 ## Build Artifacts
 
