@@ -110,6 +110,38 @@ def test_list_walks_pfiles_and_builds_tab_lines():
     )
 
 
+def test_list_reads_filetype_uppercase():
+    """LIST reads the real VB property ``f.FileType`` (uppercase T).
+
+    EUD-040: the VB type exposes ``FileType`` (uppercase); the lowercase
+    ``f.Filetype`` silently yields ``"?"`` (pcall fallback) for every file, so
+    the server marks all files non-settable. Bind the check to the LIST body via
+    the same region-extraction idiom used above.
+    """
+    text = _read_text()
+    m = _branch_re("LIST").search(text)
+    assert m, 'LIST branch missing (see test_list_branch_in_dispatcher)'
+    region = text[m.start():]
+    nxt = re.search(r'\n\s*elseif cmd ==', region[1:])
+    if nxt:
+        region = region[: nxt.start() + 1]
+    assert re.search(r'f\.FileType\b', region), (
+        "LIST handler must read f.FileType (uppercase T), the real VB property"
+    )
+
+
+def test_no_lowercase_filetype_anywhere():
+    """Regression guard: the lowercase ``f.Filetype`` must not appear at all.
+
+    EUD-040: ``f.Filetype`` (lowercase t) is the bug; guarding the whole bridge
+    also catches a revert.
+    """
+    text = _read_text()
+    assert not re.search(r'f\.Filetype\b', text), (
+        "f.Filetype (lowercase t) is the EUD-040 bug; use f.FileType (uppercase)"
+    )
+
+
 def test_v6_command_markers_present():
     """All v6 dispatcher commands survive (import-then-extend regression)."""
     text = _read_text()

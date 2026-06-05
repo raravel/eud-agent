@@ -407,8 +407,10 @@ local ok, initErr = pcall(function()
             if pj == nil then return "ERROR: no project" end
             local lines = {}
             walk(pj.TEData.PFIles, "", function(p, f)
-                local okT, ftype = pcall(function() return f.Filetype end)
-                lines[#lines + 1] = p .. "\t" .. (okT and safestr(ftype) or "?")
+                local okT, ftype = pcall(function()
+                    return string.match(tostring(f.FileType), "^%s*([%w_]+)")
+                end)
+                lines[#lines + 1] = p .. "\t" .. ((okT and ftype) and ftype or "?")
             end)
             return table.concat(lines, "\r\n")
         elseif cmd == "DUMP" then

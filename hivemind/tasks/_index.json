@@ -644,15 +644,15 @@
       ]
     },
     "EUD-040-b8b0": {
-      "status": "in_progress",
+      "status": "done",
       "priority": "high",
       "type": "bug",
       "parent": "EUD-006-50d8",
       "depends_on": [],
       "title": "LIST reads f.FileType (uppercase) + emits bare enum name (settable detection fix)",
       "updated": "2026-06-05",
-      "completed_at": null,
-      "path": "active/EUD-040-b8b0.md",
+      "completed_at": "2026-06-05T10:17:21.682116",
+      "path": "done/EUD-040-b8b0.md",
       "scope": [
         "bridge/ZZZ_10_agent_bridge.lua",
         "server/tests/test_bridge_list_static.py"
