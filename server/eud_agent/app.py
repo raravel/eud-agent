@@ -42,10 +42,10 @@ from fastapi.staticfiles import StaticFiles
 from starlette.websockets import WebSocketDisconnect, WebSocketState
 
 from . import rag
+from .agent_runner import CodexSDKRunner
 from .bridge_io import BridgeIO
-from .codex_client import CodexClient, CodexNotFound
 from .config import Config
-from .orchestrator import Orchestrator
+from .engine import AgentEngine
 from .tools import ToolError, ToolLayer
 
 # Lifecycle defaults (rules.md: heartbeat check 15s, staleness 60s; ready poll is
@@ -331,12 +331,18 @@ def create_app(
     heartbeat_check_interval: float = DEFAULT_HEARTBEAT_CHECK_INTERVAL,
     heartbeat_staleness: float = DEFAULT_HEARTBEAT_STALENESS,
     heartbeat_grace: float = DEFAULT_HEARTBEAT_GRACE,
+    runner_factory=None,
 ) -> FastAPI:
     """Build the FastAPI app for ``cfg``.
 
     ``start_lifecycle`` controls the boot/shutdown threads (the ready-writer,
     RAG warmup, heartbeat watcher): True for a real run, False for in-process
     TestClient HTTP/WS-surface tests. All intervals/thresholds are injectable.
+
+    ``runner_factory`` (v2, EUD-056) builds the per-session ``AgentRunner``; it is
+    injectable so WS tests run with a ``FakeRunner`` (no codex). The default builds
+    a real :class:`CodexSDKRunner`. Its signature is
+    ``factory(*, tool_layer, send, build_system_prompt) -> AgentRunner``.
     """
     data_dir = Path(cfg.data_dir)
     dist_dir = Path(cfg.repo_root) / "panel" / "dist"
@@ -360,25 +366,44 @@ def create_app(
             except Exception:  # noqa: BLE001 - a dead client must not break others
                 pass
 
-    # The bridge + codex are shared singletons (one editor instance per machine).
+    # The bridge is a shared singleton (one editor instance per machine).
     bridge = BridgeIO(cfg.data_dir)
-    try:
-        codex = CodexClient(cfg.codex_cmd, cfg.repo_root)
-    except CodexNotFound:
-        # codex unresolved is a real possibility (selfcheck reports it); keep the
-        # server up so the panel still loads and instruct surfaces a clean error.
-        codex = None
-
-    orchestrator = Orchestrator(
-        bridge, codex, rag_db=cfg.rag_db, send=broadcast
-    )
 
     # The eud-tools tool layer (features/05): the policy layer for codex's tool
     # calls. The MCP shim is dumb transport that forwards to /tools/call below;
-    # ALL validation / gate / budget live here in the FastAPI process. Exposed on
-    # app.state so the v2 agent runner (later task) can read per-request budgets.
-    tool_layer = ToolLayer(bridge)
+    # ALL validation / gate / budget / journaling live here in the FastAPI
+    # process. The journal (EUD-055) snapshots every write so a turn's changeset
+    # can be assembled + rolled back. Exposed on app.state so the WS engine and
+    # the v2 runner read the same per-request state.
+    def _journal_factory(request_id: str):
+        from .journal import Journal
+
+        return Journal(
+            data_dir=cfg.data_dir, request_id=request_id, bridge=bridge
+        )
+
+    tool_layer = ToolLayer(bridge, journal_factory=_journal_factory)
     app.state.tool_layer = tool_layer
+
+    # The WS tests swap app.state.tool_layer (a fake-bridge ToolLayer) AFTER
+    # build; expose a rebind hook so the engine picks up the swapped layer.
+    def _rebind_tool_layer(new_layer) -> None:
+        app.state.tool_layer = new_layer
+
+    app.state.rebind_tool_layer = _rebind_tool_layer
+
+    # v2 agent-runner factory (EUD-056). Injectable for tests (FakeRunner); the
+    # default builds a real CodexSDKRunner over the resolved codex binary.
+    def _default_runner_factory(*, tool_layer, send, build_system_prompt):
+        return CodexSDKRunner(
+            tool_layer=tool_layer,
+            send=send,
+            build_system_prompt=build_system_prompt,
+            codex_bin=cfg.codex_cmd,
+            data_dir=cfg.data_dir,
+        )
+
+    make_runner = runner_factory or _default_runner_factory
 
     # ----------------------------------------------------------------- routes
     @app.get("/healthz")
@@ -451,11 +476,23 @@ def create_app(
         await websocket.accept()
         with clients_lock:
             clients.add(websocket)
+        # Per-connection v2 engine: the WS state machine (idle -> triage ->
+        # answer | apply | plan_review* -> executing -> changeset_review -> idle)
+        # driven by client messages. It owns the per-session AgentRunner and reads
+        # the (possibly test-swapped) tool layer + bridge for project state / RAG.
+        engine = AgentEngine(
+            send=broadcast,
+            make_runner=make_runner,
+            get_tool_layer=lambda: app.state.tool_layer,
+            bridge=bridge,
+            rag_db=cfg.rag_db,
+        )
         try:
-            await _serve_ws(websocket, orchestrator)
+            await _serve_ws(websocket, engine)
         except WebSocketDisconnect:
             pass
         finally:
+            await engine.aclose()
             with clients_lock:
                 clients.discard(websocket)
 
@@ -566,33 +603,15 @@ def _shutdown_cleanup(watcher: HeartbeatWatcher, delete_ready) -> None:
 # --------------------------------------------------------------------------- #
 
 
-async def _serve_ws(websocket: WebSocket, orchestrator: Orchestrator) -> None:
-    """Dispatch client messages to the orchestrator (architecture.md protocol).
+async def _serve_ws(websocket: WebSocket, engine: AgentEngine) -> None:
+    """Dispatch WS v2 client messages to the per-connection engine.
 
-    Client -> server: ``instruct`` / ``apply`` / ``status`` / ``list``. Each
-    handler emits its events through the orchestrator's broadcaster, so both
-    connected clients see them. Unknown types get a clean error (never a crash).
+    Client -> server (features/05 "WS protocol v2"): ``chat`` / ``plan_feedback``
+    / ``plan_approve`` / ``changeset_decision`` / ``cancel`` / ``status`` /
+    ``list``. The v1 ``instruct``/``apply`` messages are REMOVED — they fall
+    through to the unknown-type error (no compat shim). Every event the engine
+    emits flows through the broadcaster so both connected clients see it.
     """
     while True:
         msg = await websocket.receive_json()
-        mtype = msg.get("type")
-        if mtype == "instruct":
-            await orchestrator.instruct(
-                msg.get("instruction", ""),
-                target=msg.get("target", ""),
-                use_context=bool(msg.get("useContext", False)),
-            )
-        elif mtype == "apply":
-            await orchestrator.apply(
-                mode=msg.get("mode", "set"),
-                target=msg.get("target", ""),
-                code=msg.get("code", ""),
-            )
-        elif mtype == "status":
-            await orchestrator.status()
-        elif mtype == "list":
-            await orchestrator.list_files()
-        else:
-            await websocket.send_json(
-                {"type": "error", "message": f"unknown message type: {mtype!r}"}
-            )
+        await engine.handle(msg)

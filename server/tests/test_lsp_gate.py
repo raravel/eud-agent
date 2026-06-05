@@ -448,83 +448,13 @@ def test_module_public_surface():
 
 
 # --------------------------------------------------------------------------- #
-# 9. Integration shape: orchestrator's _lsp_stage with the REAL module present.
-#
-#    NOTE on the seam: the orchestrator emits {stage:"lsp", detail:"skipped"}
-#    ONLY when the lazy import fails (module absent) OR diagnose() RAISES. Once
-#    lsp_gate EXISTS and diagnose() degrades by RETURNING [] (its no-raise
-#    contract), the orchestrator emits a bare progress {stage:"lsp"} and carries
-#    diagnostics=[]. That IS the seamless integration the task wants: the panel
-#    sees zero diagnostics either way, nothing blocks, no error event fires. We
-#    therefore assert the true post-module contract (progress lsp + diags [] +
-#    no error), not the pre-module ImportError "skipped" detail.
+# 9. (RETIRED) The two former tests here exercised the v1 ``orchestrator._lsp_stage``
+#    wiring — but EUD-056 RETIRES orchestrator.py (the v1 instruct/apply flow is
+#    gone). lsp_gate's own behavior (diagnose() no-raise degrade + diagnostic
+#    mapping) is fully covered by the unit tests above (sections 1-8); the v2
+#    engine does not run an LSP stage, so there is no replacement integration
+#    point to assert. Removed rather than left importing a deleted module.
 # --------------------------------------------------------------------------- #
-
-
-async def test_orchestrator_lsp_stage_empty_when_resolution_fails(monkeypatch):
-    from eud_agent.orchestrator import Orchestrator
-
-    # Resolution fails -> diagnose() returns [] WITHOUT raising (advisory degrade).
-    monkeypatch.setattr(lsp_gate, "_resolve_lsp", lambda: None)
-
-    class _Bridge:
-        def get(self, path, **kw):
-            return "x = 0;\n"
-
-    class _Codex:
-        async def generate(self, prompt, *, timeout=None):
-            return "x = 1;\n"
-
-    events: list[dict] = []
-
-    async def send(ev):
-        events.append(ev)
-
-    o = Orchestrator(_Bridge(), _Codex(), rag_db="C:\\fake", send=send)
-    await o.instruct("set x", target="main.eps", use_context=False)
-
-    # The lsp stage ran (a progress event) and the flow did NOT error/block.
-    lsp_progress = [
-        e for e in events
-        if e.get("type") == "progress" and e.get("stage") == "lsp"
-    ]
-    assert lsp_progress, "expected an lsp progress event"
-    assert not [e for e in events if e.get("type") == "error"]
-
-    # Diagnostics are empty: the degrade is invisible to the panel beyond [].
-    code_ev = next(e for e in events if e.get("type") == "code")
-    assert code_ev["diagnostics"] == []
-
-
-async def test_orchestrator_lsp_stage_maps_when_resolution_succeeds(monkeypatch):
-    """With the real module present AND resolution mocked to succeed, the
-    orchestrator's _lsp_stage carries the mapped diagnostics through to the
-    ``code`` event (proves the diagnose() return value flows end to end)."""
-    from eud_agent.orchestrator import Orchestrator
-
-    notif = _frame(_publish_diagnostics([_lsp_diag(0, 2, "warn here")]))
-    _install_proc(monkeypatch, chunks=[notif])
-
-    class _Bridge:
-        def get(self, path, **kw):
-            return "x = 0;\n"
-
-    class _Codex:
-        async def generate(self, prompt, *, timeout=None):
-            return "x = 1;\n"
-
-    events: list[dict] = []
-
-    async def send(ev):
-        events.append(ev)
-
-    o = Orchestrator(_Bridge(), _Codex(), rag_db="C:\\fake", send=send)
-    await o.instruct("set x", target="main.eps", use_context=False)
-
-    code_ev = next(e for e in events if e.get("type") == "code")
-    assert code_ev["diagnostics"] == [
-        {"line": 1, "severity": 2, "message": "warn here"}
-    ]
 
 
 # --------------------------------------------------------------------------- #

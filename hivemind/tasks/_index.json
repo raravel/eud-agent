@@ -896,7 +896,7 @@
       ]
     },
     "EUD-056-5ca7": {
-      "status": "pending",
+      "status": "done",
       "priority": "high",
       "type": "task",
       "parent": "EUD-045-38f9",
@@ -905,13 +905,18 @@
       ],
       "title": "CodexSDKRunner + plan flow + WS v2 routing",
       "updated": "2026-06-05",
-      "completed_at": null,
-      "path": "active/EUD-056-5ca7.md",
+      "completed_at": "2026-06-05T15:10:33.057361",
+      "path": "done/EUD-056-5ca7.md",
       "scope": [
         "server/eud_agent/agent_runner.py",
         "server/eud_agent/app.py",
         "server/eud_agent/orchestrator.py",
-        "server/tests/test_agent_flow.py"
+        "server/tests/test_agent_flow.py",
+        "server/tests/test_orchestrator.py",
+        "server/tests/test_integration_ws.py",
+        "server/tests/test_app.py",
+        "server/eud_agent/engine.py",
+        "server/tests/test_lsp_gate.py"
       ]
     },
     "EUD-057-e71d": {
