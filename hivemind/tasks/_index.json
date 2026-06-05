@@ -676,16 +676,19 @@
       ]
     },
     "EUD-042-45cb": {
-      "status": "pending",
+      "status": "done",
       "priority": "medium",
       "type": "bug",
       "parent": "EUD-006-50d8",
       "depends_on": [],
       "title": "Superseded server self-terminates (zombie leak on quick editor restart)",
       "updated": "2026-06-05",
-      "completed_at": null,
-      "path": "active/EUD-042-45cb.md",
-      "scope": []
+      "completed_at": "2026-06-05T13:17:12.650928",
+      "path": "done/EUD-042-45cb.md",
+      "scope": [
+        "server/eud_agent/app.py",
+        "server/tests/test_app.py"
+      ]
     },
     "EUD-043-1455": {
       "status": "pending",

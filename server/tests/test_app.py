@@ -448,3 +448,224 @@ def test_heartbeat_watcher_survives_on_stale_raising(tmp_path):
         assert len(calls) >= 2
     finally:
         watcher.stop()
+
+
+# --------------------------------------------------------------------------- #
+# Supersede check (EUD-042): a quick editor restart spawns a NEW server that
+# rewrites server.ready with a NEW token. The OLD server keeps seeing the SAME
+# (now restart-refreshed) heartbeat, so staleness alone never fires and the old
+# server leaks (zombie + bge-m3 GPU memory + races the new server for srv-* IPC
+# files). The watcher MUST also self-terminate when server.ready carries a token
+# that differs from THIS process's own token — and on THAT exit path it must NOT
+# delete server.ready (it now belongs to the new server). Token (not pid) is
+# authoritative (EUD-037: launcher vs child pid is ambiguous).
+# --------------------------------------------------------------------------- #
+
+
+def _write_ready(data_dir, *, token, port=1):
+    """Write a server.ready carrying ``token`` (UTF-8 no BOM)."""
+    (data_dir / "server.ready").write_text(
+        json.dumps({"port": port, "token": token}), encoding="utf-8"
+    )
+
+
+def test_supersede_fires_and_keeps_ready_when_token_differs(tmp_path):
+    """A server.ready owned by a NEWER server (different token) self-terminates
+    THIS server even with a perfectly fresh heartbeat — AND the dying server must
+    NOT delete server.ready (it belongs to the new server)."""
+    data_dir = tmp_path / "data"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    # Fresh heartbeat: staleness must NOT be the reason this fires.
+    fresh_heartbeat(data_dir, age_seconds=0.0)
+    _write_ready(data_dir, token="NEW-server-token")
+
+    fired = threading.Event()
+
+    watcher = app_mod.HeartbeatWatcher(
+        data_dir=str(data_dir),
+        check_interval=0.05,
+        staleness=600.0,  # generous: staleness can't be what trips it
+        own_token="OLD-server-token",
+        on_stale=fired.set,
+    )
+    watcher.start()
+    try:
+        assert fired.wait(timeout=3.0), (
+            "watcher never fired when a newer server owned server.ready"
+        )
+    finally:
+        watcher.stop()
+
+    # Watcher-level: the supersede path never deletes ready itself and records
+    # the decision so the lifespan shutdown hook can honor it.
+    ready_path = data_dir / "server.ready"
+    assert ready_path.is_file(), (
+        "superseded server deleted server.ready — it belongs to the new server"
+    )
+    assert watcher.superseded is True, (
+        "watcher did not record the supersede decision for the shutdown hook"
+    )
+
+    # Full production exit path: once uvicorn exits, FastAPI fires the lifespan
+    # shutdown hook, which calls _shutdown_cleanup(watcher, delete_ready). That
+    # MUST stop the watcher but SKIP deleting the new server's ready file when
+    # superseded — exercise the exact conditional the hook runs.
+    deleted = []
+
+    def _delete_ready():
+        deleted.append(True)
+        ready_path.unlink(missing_ok=True)
+
+    app_mod._shutdown_cleanup(watcher, _delete_ready)
+
+    assert not deleted, (
+        "shutdown hook deleted ready on the superseded exit path "
+        "(must be skipped — the file belongs to the new server)"
+    )
+    assert ready_path.is_file(), (
+        "server.ready clobbered by the lifespan shutdown on a superseded exit"
+    )
+    assert json.loads(ready_path.read_text(encoding="utf-8"))["token"] == (
+        "NEW-server-token"
+    )
+
+
+def test_shutdown_cleanup_deletes_ready_on_graceful_exit(tmp_path):
+    """A TRUE graceful shutdown (NOT superseded) still deletes server.ready: the
+    departing server must not leave a stale ready file behind. This guards the
+    EUD-042 conditional from over-firing (skipping deletion only when superseded,
+    never on a normal editor-exit/SIGTERM shutdown)."""
+    data_dir = tmp_path / "data"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    ready_path = data_dir / "server.ready"
+    _write_ready(data_dir, token="MY-token")
+
+    watcher = app_mod.HeartbeatWatcher(
+        data_dir=str(data_dir),
+        check_interval=0.05,
+        staleness=600.0,
+        own_token="MY-token",
+        on_stale=lambda: None,
+    )
+    # Never started/fired: superseded stays False (a graceful exit).
+    assert watcher.superseded is False
+
+    app_mod._shutdown_cleanup(watcher, lambda: ready_path.unlink(missing_ok=True))
+
+    assert not ready_path.is_file(), (
+        "graceful shutdown did not delete server.ready (the supersede skip "
+        "must not apply to a normal exit)"
+    )
+
+
+def test_no_supersede_when_token_is_own(tmp_path):
+    """server.ready carrying THIS server's OWN token must NOT trip the watcher
+    (a fresh heartbeat keeps us alive; we own the data dir)."""
+    data_dir = tmp_path / "data"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    _write_ready(data_dir, token="MY-token")
+
+    fired = threading.Event()
+    stop_refresh = threading.Event()
+
+    def refresher():
+        while not stop_refresh.is_set():
+            fresh_heartbeat(data_dir, age_seconds=0.0)
+            time.sleep(0.05)
+
+    rt = threading.Thread(target=refresher, daemon=True)
+    rt.start()
+
+    watcher = app_mod.HeartbeatWatcher(
+        data_dir=str(data_dir),
+        check_interval=0.05,
+        staleness=2.0,
+        own_token="MY-token",
+        on_stale=fired.set,
+    )
+    watcher.start()
+    try:
+        time.sleep(0.6)
+        assert not fired.is_set(), (
+            "watcher fired on a server.ready carrying our OWN token"
+        )
+    finally:
+        watcher.stop()
+        stop_refresh.set()
+        rt.join(timeout=2.0)
+
+
+def test_no_supersede_when_ready_missing(tmp_path):
+    """A missing server.ready is NO decision (transient: the bridge deletes the
+    stale ready at init before the new server writes one). With a fresh
+    heartbeat, staleness stays the only rule and the watcher does NOT fire."""
+    data_dir = tmp_path / "data"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    # No server.ready at all.
+
+    fired = threading.Event()
+    stop_refresh = threading.Event()
+
+    def refresher():
+        while not stop_refresh.is_set():
+            fresh_heartbeat(data_dir, age_seconds=0.0)
+            time.sleep(0.05)
+
+    rt = threading.Thread(target=refresher, daemon=True)
+    rt.start()
+
+    watcher = app_mod.HeartbeatWatcher(
+        data_dir=str(data_dir),
+        check_interval=0.05,
+        staleness=2.0,
+        own_token="MY-token",
+        on_stale=fired.set,
+    )
+    watcher.start()
+    try:
+        time.sleep(0.6)
+        assert not fired.is_set(), (
+            "watcher fired on a MISSING server.ready (must be no-decision)"
+        )
+    finally:
+        watcher.stop()
+        stop_refresh.set()
+        rt.join(timeout=2.0)
+
+
+def test_no_supersede_when_ready_unparsable(tmp_path):
+    """A corrupt/partial server.ready (mid-write by the new server) is NO
+    decision — staleness remains the fallback. With a fresh heartbeat the watcher
+    does NOT fire."""
+    data_dir = tmp_path / "data"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    (data_dir / "server.ready").write_text("{not valid json", encoding="utf-8")
+
+    fired = threading.Event()
+    stop_refresh = threading.Event()
+
+    def refresher():
+        while not stop_refresh.is_set():
+            fresh_heartbeat(data_dir, age_seconds=0.0)
+            time.sleep(0.05)
+
+    rt = threading.Thread(target=refresher, daemon=True)
+    rt.start()
+
+    watcher = app_mod.HeartbeatWatcher(
+        data_dir=str(data_dir),
+        check_interval=0.05,
+        staleness=2.0,
+        own_token="MY-token",
+        on_stale=fired.set,
+    )
+    watcher.start()
+    try:
+        time.sleep(0.6)
+        assert not fired.is_set(), (
+            "watcher fired on an UNPARSABLE server.ready (must be no-decision)"
+        )
+    finally:
+        watcher.stop()
+        stop_refresh.set()
+        rt.join(timeout=2.0)

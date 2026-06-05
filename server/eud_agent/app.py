@@ -167,11 +167,27 @@ def _read_heartbeat_age(path: Path) -> float | None:
 
 
 class HeartbeatWatcher:
-    """Background thread that fires ``on_stale`` when the heartbeat goes stale.
+    """Background thread that self-terminates the server on two conditions.
 
     The bridge writes ``heartbeat.txt`` every Tick (architecture.md). The server
-    self-terminates when that file is older than ``staleness`` (or stays missing
-    past ``grace`` after the watcher starts) — it must never outlive the editor.
+    self-terminates when EITHER:
+
+      * **stale heartbeat** — ``heartbeat.txt`` is older than ``staleness`` (or
+        stays missing past ``grace`` after the watcher starts); the editor has
+        stopped ticking and the server must never outlive it. On this path the
+        watcher deletes ``server.ready`` (the file belongs to THIS, departing,
+        server) before invoking ``on_stale``.
+      * **superseded** (EUD-042) — ``server.ready`` exists, parses, and carries a
+        ``token`` that differs from this process's ``own_token``: a NEWER server
+        owns the data dir (a quick editor restart re-spawned us). The OLD server
+        keeps seeing the restart-refreshed heartbeat, so staleness alone never
+        fires and zombies leak (bge-m3 GPU memory + racing srv-* IPC files). Here
+        the watcher MUST NOT delete ``server.ready`` — it now belongs to the new
+        server. Token (not pid) is authoritative (EUD-037: launcher vs child pid
+        is ambiguous). A missing/unparsable ready file is NO decision (transient:
+        the bridge deletes a stale ready before the new server writes one;
+        corrupt = a mid-write read) — staleness remains the fallback.
+
     The thread invokes ``on_stale`` exactly once, then exits.
 
     Designed as a testable unit: ``check_interval``/``staleness``/``grace`` are
@@ -187,6 +203,7 @@ class HeartbeatWatcher:
         staleness: float,
         on_stale,
         grace: float = DEFAULT_HEARTBEAT_GRACE,
+        own_token: str | None = None,
     ) -> None:
         self.data_dir = Path(data_dir)
         self.heartbeat_path = self.data_dir / "heartbeat.txt"
@@ -194,6 +211,12 @@ class HeartbeatWatcher:
         self.check_interval = check_interval
         self.staleness = staleness
         self.grace = grace
+        self.own_token = own_token
+        # Set True exactly once, on the superseded exit path, BEFORE on_stale is
+        # invoked (the watcher thread is the only writer). The lifespan shutdown
+        # hook reads it to SKIP deleting server.ready — that file now belongs to
+        # the new server (EUD-042). A true graceful shutdown leaves this False.
+        self.superseded = False
         self._on_stale = on_stale
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -219,20 +242,67 @@ class HeartbeatWatcher:
             return (time.monotonic() - self._started_at) >= self.grace
         return age >= self.staleness
 
+    def _is_superseded(self) -> bool:
+        """True only when server.ready confidently belongs to ANOTHER server.
+
+        Reads ``server.ready``, parses it as JSON, and compares its ``token`` to
+        ``own_token``: a differing token means a NEWER server owns the data dir
+        (EUD-042). Token (not pid) is authoritative. ANY ambiguity is NO decision
+        (return False, staleness stays the fallback): no ``own_token`` set, a
+        missing file (transient — the bridge deletes a stale ready before the new
+        server writes one), an unreadable/unparsable file (a mid-write read), or
+        a payload without a ``token``.
+        """
+        if self.own_token is None:
+            return False
+        try:
+            text = self.ready_path.read_text(encoding="utf-8")
+        except OSError:
+            return False  # missing/unreadable -> no decision
+        try:
+            data = json.loads(text)
+        except ValueError:
+            return False  # corrupt/partial mid-write -> no decision
+        if not isinstance(data, dict):
+            return False
+        other = data.get("token")
+        if other is None:
+            return False
+        return other != self.own_token
+
     def _run(self) -> None:
         while not self._stop.wait(self.check_interval):
             # The watcher must be UNKILLABLE: an unforeseen exception in
-            # _is_stale()/_on_stale() must NEVER silently kill this daemon thread
-            # (that would let the server outlive the editor forever — the exact
-            # rules.md violation, undiagnosable in the field). Swallow + continue
-            # so the next tick re-evaluates staleness.
+            # _is_stale()/_is_superseded()/_on_stale() must NEVER silently kill
+            # this daemon thread (that would let the server outlive the editor
+            # forever — the exact rules.md violation, undiagnosable in the field).
+            # Swallow + continue so the next tick re-evaluates.
             try:
+                # Supersede check FIRST (EUD-042): on a quick editor restart the
+                # new server refreshes the SAME heartbeat, so staleness alone
+                # never fires for the old server. A differing server.ready token
+                # means a newer server owns the data dir -> self-terminate, but
+                # do NOT delete server.ready (it belongs to the new server).
+                if self._is_superseded():
+                    print(
+                        "[heartbeat-watcher] superseded by a newer server "
+                        "(server.ready token differs); self-terminating "
+                        "WITHOUT deleting server.ready.",
+                        file=sys.stderr,
+                    )
+                    # Mark BEFORE on_stale so the lifespan shutdown hook (which
+                    # fires once uvicorn exits) skips deleting the new server's
+                    # ready file.
+                    self.superseded = True
+                    self._on_stale()
+                    return
                 if not self._is_stale():
                     continue
                 # The server must never outlive the editor: delete server.ready
                 # ourselves (so the bridge sees the server gone) BEFORE invoking
                 # the shutdown callback. Deletion is owned by the watcher so the
-                # contract holds regardless of what on_stale does.
+                # contract holds regardless of what on_stale does. (Skipped for
+                # the superseded path above — that ready file is not ours.)
                 try:
                     self.ready_path.unlink(missing_ok=True)
                 except OSError:
@@ -355,8 +425,11 @@ def create_app(
                 pass
 
         def _on_stale() -> None:
-            # Self-terminate: delete the ready file and ask uvicorn to exit.
-            _delete_ready()
+            # Self-terminate: ask uvicorn to exit. Deletion of server.ready is
+            # OWNED BY THE WATCHER (it deletes on the staleness path but MUST
+            # skip it on the superseded path — EUD-042 — where the ready file
+            # belongs to the new server). The callback must therefore NOT delete
+            # it here; doing so would clobber the new server's ready file.
             srv = shutdown_state.get("server")
             if srv is not None:
                 srv.should_exit = True
@@ -367,6 +440,7 @@ def create_app(
             staleness=heartbeat_staleness,
             grace=heartbeat_grace,
             on_stale=_on_stale,
+            own_token=cfg.token,
         )
         # Exposed so the entry point can hand uvicorn's Server in for shutdown
         # and so the lifespan can stop the watcher.
@@ -420,10 +494,25 @@ def create_app(
 
         @app.on_event("shutdown")
         def _shutdown() -> None:  # noqa: D401 - lifecycle hook
-            watcher.stop()
-            _delete_ready()
+            _shutdown_cleanup(watcher, _delete_ready)
 
     return app
+
+
+def _shutdown_cleanup(watcher: HeartbeatWatcher, delete_ready) -> None:
+    """Run the lifespan-shutdown cleanup, honoring the supersede contract.
+
+    ALWAYS stop the watcher thread. Delete ``server.ready`` ONLY when this exit
+    is NOT a supersede (EUD-042): a true graceful shutdown (editor exit ->
+    staleness, or a normal SIGTERM) leaves ``watcher.superseded`` False and the
+    departing server removes its own ready file; a SUPERSEDED exit leaves it True
+    and we MUST NOT delete it — that file belongs to the NEW server that
+    re-spawned us. Factored out so it is testable without driving the FastAPI
+    shutdown event end-to-end.
+    """
+    watcher.stop()
+    if not watcher.superseded:
+        delete_ready()
 
 
 # --------------------------------------------------------------------------- #
