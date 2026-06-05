@@ -17,7 +17,8 @@ graph TD
 
 ## Engine (single path)
 
-- **Official Codex Python SDK** (openai/codex `sdk/python`): `Codex`/`AsyncCodex`, `thread_start()`, `thread.run(prompt)` → TurnResult; streaming JSONL events forwarded to the panel as `agent_event`s; thread id retained per panel session for follow-up turns (conversation continuity). BYO account unchanged; the SDK spawns the same codex binary (resolve via `shutil.which` family rules still apply to any direct spawn).
+- **Official Codex Python SDK** (openai/codex `sdk/python`): `Codex`/`AsyncCodex`, `thread_start()`, `thread.run(prompt)` → TurnResult; streaming JSONL events forwarded to the panel as `agent_event`s. BYO account unchanged; the SDK spawns the same codex binary (resolve via `shutil.which` family rules still apply to any direct spawn).
+- **Conversation continuity (binding — EUD-064, user bug report 2026-06-05)**: the FIRST `chat` of a session starts the codex thread (system prompt as `base_instructions`); EVERY subsequent `chat` RESUMES the same thread (`thread_resume`) so codex retains its own message + tool-call history. A `chat`-per-`thread_start` flow (what v2 initially shipped) is a defect: the agent forgets the previous message. `reset{}` (and a WS reconnect) drops the retained thread id so the next chat starts a fresh conversation. Resumed chats PREPEND refreshed `[project state]` + `[reference context]` (RAG for the new question) to the turn text — `base_instructions` exist only on the first thread.
 - **Spike-first**: the first task proves install name, thread lifecycle, MCP server attachment (per-thread config injection vs `codex mcp add`), streaming, and Windows behavior before anything builds on it.
 - **eud-tools MCP server**: codex attaches a stdio shim (`python -m eud_agent.mcp_shim`) that forwards JSON-RPC to the running FastAPI server over `127.0.0.1` with the `server.ready` token. All tool logic, validation, journaling, and budget live in the FastAPI process — the shim is dumb transport.
 - No LangChain/LangGraph: the outer flow is a small deterministic state machine (`idle → triage → answer | apply | plan_review* → executing → changeset_review → idle`) driven by WS events. Revisit only if v3 needs multi-agent graphs.
@@ -29,6 +30,12 @@ Write (journaled): `dat_set`, `xdat_set`, `tbl_set`, `req_set`, `btn_set`, `dat_
 Flow: `propose_plan(markdown)` — ends the turn for user review (see below).
 
 Every tool validates args server-side (numeric ranges, index bounds, type whitelists, FileType guards) BEFORE the bridge call — the bridge's ERROR is the second line of defense, not the first.
+
+## Request scoping across a continuous thread (EUD-064)
+
+- Each `chat` still mints a fresh `request_id` — the journal/changeset scope, the mutation gate, and the action budget all stay PER-REQUEST. Only the codex THREAD persists across chats.
+- The shim env `EUD_REQUEST_ID` is pinned at thread creation and goes STALE once the second chat resumes the thread. The server therefore resolves the live request id at tool-call time: the tool endpoint stamps the engine's CURRENT request id onto every call from an active panel session, ignoring the shim-supplied id (which remains only a fallback for the legacy headless runner / no-session calls).
+- A `reset{}` arriving in `changeset_review` finalizes the prior request first (undecided items default-accept + archive), exactly like a new `chat`.
 
 ## Triage and plan gating (mechanical, not advisory)
 
@@ -53,8 +60,8 @@ Every tool validates args server-side (numeric ranges, index bounds, type whitel
 
 ## WS protocol v2
 
-Client→server: `chat{text}`, `plan_feedback{text}`, `plan_approve{}`, `changeset_decision{accept|reject, ids|all}`, `cancel{}`, `status{}`, `list{}` (kept for header).
-Server→client: `agent_event{kind, detail}` (streamed: thinking/tool_call/tool_result/turn_done), `answer{text}`, `plan{markdown, revision}`, `changeset{request_id, items[]}`, `rollback_result{ids, ok}`, `error{message}`, `status{...}`, `progress{stage,...}` (kept: rag_warmup etc.).
+Client→server: `chat{text}`, `plan_feedback{text}`, `plan_approve{}`, `changeset_decision{accept|reject, ids|all}`, `cancel{}`, `reset{}` (drop the retained codex thread — next chat starts a fresh conversation; EUD-064), `status{}`, `list{}` (kept for header).
+Server→client: `agent_event{kind, detail}` (streamed: thinking/tool_call/tool_result/turn_done; **`reasoning`** carries a reasoning-text delta in `detail` — `item/reasoning/summaryTextDelta` + `item/reasoning/textDelta`; **`delta`** carries an answer-text delta in `detail` — EUD-063), `answer{text}`, `plan{markdown, revision}`, `changeset{request_id, items[]}`, `rollback_result{ids, ok}`, `error{message}`, `status{...}`, `progress{stage,...}` (kept: rag_warmup etc.).
 v1 `instruct`/`apply`/`code`/`applied` messages are REMOVED (panel v2 replaces the flow; no compat shim).
 
 ## Verification contract

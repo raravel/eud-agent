@@ -1065,20 +1065,62 @@
       "type": "bug",
       "parent": "EUD-047-fd09",
       "depends_on": [
-        "EUD-062-644f"
+        "EUD-062-644f",
+        "EUD-064-acf5"
       ],
-      "title": "Agent stream UX: surface reasoning, prominent answer, no raw event kinds",
+      "title": "Agent events: forward reasoning + answer delta text (server side)",
       "updated": "2026-06-05",
       "completed_at": null,
       "path": "active/EUD-063-b479.md",
       "scope": [
         "server/eud_agent/agent_runner.py",
+        "server/tests/test_agent_flow.py"
+      ]
+    },
+    "EUD-064-acf5": {
+      "status": "in_progress",
+      "priority": "high",
+      "type": "bug",
+      "parent": "EUD-047-fd09",
+      "depends_on": [
+        "EUD-062-644f"
+      ],
+      "title": "Conversation continuity: resume the codex thread across chats; reset{}; live request-id stamping",
+      "updated": "2026-06-05",
+      "completed_at": null,
+      "path": "active/EUD-064-acf5.md",
+      "scope": [
+        "server/eud_agent/engine.py",
+        "server/eud_agent/agent_runner.py",
+        "server/eud_agent/app.py",
+        "server/eud_agent/tools.py",
+        "server/eud_agent/mcp_shim.py",
         "server/tests/test_agent_flow.py",
-        "panel/src/components/AgentStream.tsx",
-        "panel/src/components/AgentStream.test.tsx",
-        "panel/src/components/ConversationLog.tsx",
-        "panel/src/components/ConversationLog.test.tsx",
-        "panel/src/App.tsx"
+        "server/tests/test_app.py",
+        "server/tests/test_integration_ws.py"
+      ]
+    },
+    "EUD-065-3247": {
+      "status": "pending",
+      "priority": "high",
+      "type": "task",
+      "parent": "EUD-047-fd09",
+      "depends_on": [
+        "EUD-063-b479",
+        "EUD-064-acf5"
+      ],
+      "title": "Panel chat surface on AI Elements + Streamdown (Message/PromptInput/Plan/Reasoning/Tool, reset button)",
+      "updated": "2026-06-05",
+      "completed_at": null,
+      "path": "active/EUD-065-3247.md",
+      "scope": [
+        "panel/src",
+        "panel/components",
+        "panel/package.json",
+        "panel/package-lock.json",
+        "panel/vite.config.ts",
+        "panel/index.html",
+        "server/tests/test_panel_static.py"
       ]
     }
   }
