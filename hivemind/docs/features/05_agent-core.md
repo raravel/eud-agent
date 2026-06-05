@@ -73,3 +73,4 @@ v1 `instruct`/`apply`/`code`/`applied` messages are REMOVED (panel v2 replaces t
 - `server/eud_agent/app.py` — WS v2 message routing; `orchestrator.py` v1 flow retired
 - `server/tests/test_tools.py` / `test_journal.py` / `test_agent_flow.py` / `test_edd_runner.py`
 - external: official Codex Python SDK; `mcp` Python package (server side of the shim)
+- [BOUND 2026-06-05 from EUD-053-f3ac] `server/spikes/spike_codex_sdk.py` + `server/spikes/dummy_mcp_tool.py` — EUD-053 spike artifacts proving codex SDK thread lifecycle + per-thread MCP attachment (config injection) + tool round-trip on Windows; run manually only (spends real codex tokens)
