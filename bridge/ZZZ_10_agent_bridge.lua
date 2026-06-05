@@ -92,6 +92,148 @@ local ok, initErr = pcall(function()
     end
 
     -- ------------------------------------------------------------------
+    -- File-tree helpers (B2). Paths use "/" (the LIST/GET convention), split
+    -- into name segments. EFileType + TEFile are imported above.
+    -- ------------------------------------------------------------------
+    -- ftypeName: the normalized EFileType name string for a node (same idiom as
+    -- the LIST branch -- f.FileType is EUD-040, uppercase T). Returns "?" on any
+    -- read failure rather than throwing.
+    local function ftypeName(f)
+        local okT, name = pcall(function()
+            return string.match(tostring(f.FileType), "^%s*([%w_]+)")
+        end)
+        if okT and name then return name end
+        return "?"
+    end
+    -- FileType pre-check (capability-survey row 16): StringText exists ONLY on
+    -- CUIScriptEditor (CUIEps/CUIPy) and RawTextScriptEditor (RawText). The
+    -- GUIEps/GUIPy (GUIScriptEditor) and ClassicTrigger (ClassicTriggerEditor)
+    -- classes have NO StringText member, so assignment THROWS a .NET exception
+    -- lua pcall CANNOT catch (critic-refuted "silent no-op"); SCAScript is defunct
+    -- (rules.md SCA). This guard is checked BEFORE any StringText assignment and
+    -- explicitly rejects the GUI/GUIPy/ClassicTrigger/SCAScript family.
+    local function isSettableType(f)
+        local t = ftypeName(f)
+        if t == "GUIEps" or t == "GUIPy" or t == "ClassicTrigger"
+            or t == "SCAScript" then
+            return false
+        end
+        return t == "CUIEps" or t == "CUIPy" or t == "RawText"
+    end
+    -- isSettableTypeName: same guard keyed on a bare type name string (NEWFILE
+    -- validates the requested type before constructing the node).
+    local function isSettableTypeName(t)
+        if t == "GUIEps" or t == "GUIPy" or t == "ClassicTrigger"
+            or t == "SCAScript" then
+            return false
+        end
+        return t == "CUIEps" or t == "CUIPy" or t == "RawText"
+    end
+    -- creatable type name -> EFileType enum object (whitelist CUIEps/CUIPy/RawText).
+    local typeNameToEnum = {
+        ["CUIEps"]  = EFileType.CUIEps,
+        ["CUIPy"]   = EFileType.CUIPy,
+        ["RawText"] = EFileType.RawText,
+    }
+    -- splitPath: "/"-separated path -> array of non-empty segments.
+    local function splitPath(path)
+        local segs = {}
+        for seg in string.gmatch(path, "([^/]+)") do segs[#segs + 1] = seg end
+        return segs
+    end
+    -- findChildFolder: direct child folder of `parent` by FileName, or nil.
+    local function findChildFolder(parent, name)
+        for i = 0, parent.FolderCount - 1 do
+            local sub = parent:get_Folders(i)
+            if safestr(sub.FileName) == name then return sub end
+        end
+        return nil
+    end
+    -- findChildFile: direct child file of `parent` by FileName, or nil.
+    local function findChildFile(parent, name)
+        for i = 0, parent.FileCount - 1 do
+            local f = parent:get_Files(i)
+            if safestr(f.FileName) == name then return f end
+        end
+        return nil
+    end
+    -- findFolder: navigate "/"-segments from the project root to a folder node.
+    -- Returns the folder node or nil (an empty path resolves to the root).
+    local function findFolder(path)
+        local pj = GlobalObj.pjData
+        if pj == nil then return nil end
+        local node = pj.TEData.PFIles
+        local segs = splitPath(path)
+        for i = 1, #segs do
+            node = findChildFolder(node, segs[i])
+            if node == nil then return nil end
+        end
+        return node
+    end
+    -- ensureFolder: navigate the "/"-segments, auto-creating missing folders via
+    -- parent:FolderAdd(TEFile(name, EFileType.Folder)). Returns the deepest folder
+    -- node, or nil,err if a segment collides with an existing FILE of that name.
+    local function ensureFolder(path)
+        local pj = GlobalObj.pjData
+        if pj == nil then return nil, "no project" end
+        local node = pj.TEData.PFIles
+        local segs = splitPath(path)
+        for i = 1, #segs do
+            local sub = findChildFolder(node, segs[i])
+            if sub == nil then
+                if findChildFile(node, segs[i]) ~= nil then
+                    return nil, "path segment '" .. segs[i] .. "' is a file"
+                end
+                local nf = TEFile(segs[i], EFileType.Folder)
+                node:FolderAdd(nf)
+                sub = nf
+            end
+            node = sub
+        end
+        return node, nil
+    end
+    -- findNode: the file OR folder node at a "/"-path, with its parent folder.
+    -- Returns node, parent (parent is nil for the project root). Used by RENAME/
+    -- DELFILE/MOVEFILE/SETMAIN. The node's own Parent property is authoritative,
+    -- but we resolve the parent by navigation so the root is handled uniformly.
+    local function findNode(path)
+        local pj = GlobalObj.pjData
+        if pj == nil then return nil, nil end
+        local segs = splitPath(path)
+        if #segs == 0 then return pj.TEData.PFIles, nil end
+        local parent = pj.TEData.PFIles
+        for i = 1, #segs - 1 do
+            parent = findChildFolder(parent, segs[i])
+            if parent == nil then return nil, nil end
+        end
+        local leaf = segs[#segs]
+        local file = findChildFile(parent, leaf)
+        if file ~= nil then return file, parent end
+        local folder = findChildFolder(parent, leaf)
+        if folder ~= nil then return folder, parent end
+        return nil, nil
+    end
+    -- isProtectedNode: the top (root) node or the Setting node -- never renamed,
+    -- deleted, or moved (verified guard in ProjectExplorer DeleteItem.vb:5:
+    -- IsTopFolder Or FileType = EFileType.Setting).
+    local function isProtectedNode(f)
+        if f == nil then return false end
+        local okTop, top = pcall(function() return f.IsTopFolder end)
+        if okTop and top then return true end
+        return ftypeName(f) == "Setting"
+    end
+    -- mainFilePath: the "/"-path of the current MainFile node, or "" if unset.
+    local function mainFilePath()
+        local pj = GlobalObj.pjData
+        if pj == nil then return "" end
+        local main = pj.TEData.MainFile
+        if main == nil then return "" end
+        local found = ""
+        walk(pj.TEData.PFIles, "", function(p, f) if f == main then found = p end end)
+        return found
+    end
+
+    -- ------------------------------------------------------------------
     -- Server lifecycle: agent.cfg -> spawn python server -> ready/respawn.
     -- KopiLua has no JSON lib; the cfg/ready files are flat JSON parsed with
     -- string.match. agent.cfg paths are JSON-escaped (\\), so unescape "\\".
@@ -479,6 +621,14 @@ local ok, initErr = pcall(function()
         elseif cmd == "SET" then
             local f = findFile(arg)
             if f == nil then return "ERROR: 파일 없음: '" .. tostring(arg) .. "'" end
+            -- FileType pre-check (isSettableType) runs BEFORE the assignment far
+            -- below: GUI/GUIPy/ClassicTrigger/SCAScript classes lack the text
+            -- setter, so the assignment THROWS uncatchably (capability-survey row
+            -- 16). Reject the unsettable family structurally first.
+            if not isSettableType(f) then
+                return "ERROR: not settable type (" .. ftypeName(f)
+                    .. "); only CUIEps/CUIPy/RawText"
+            end
             local okSet, err = pcall(function() f.Scripter.StringText = body end)
             if not okSet then return "ERROR: set 실패(GUI?): " .. tostring(err) end
             local page = f.ParentPage
@@ -503,6 +653,162 @@ local ok, initErr = pcall(function()
             end)
             if not okNew then return "ERROR: neweps failed: " .. tostring(err) end
             return "OK: neweps '" .. name .. "' (" .. string.len(body) .. "B)"
+        elseif cmd == "NEWFILE" then
+            -- NEWFILE path|type (+ body). Generalizes NEWEPS: type whitelist
+            -- CUIEps/CUIPy/RawText, "/"-path with auto-created parent folders,
+            -- duplicate full path -> ERROR.
+            local a = split(arg, "|")
+            if #a < 2 then return "ERROR: 'NEWFILE path|type' + body from 2nd line" end
+            local path = string.gsub(a[1], "^%s*(.-)%s*$", "%1")
+            local ftype = string.gsub(a[2], "^%s*(.-)%s*$", "%1")
+            if path == "" then return "ERROR: empty path" end
+            -- FileType pre-check BEFORE node construction (only settable/creatable
+            -- types; GUI/GUIPy/ClassicTrigger/SCAScript rejected).
+            if not isSettableTypeName(ftype) then
+                return "ERROR: not creatable type (" .. ftype
+                    .. "); only CUIEps/CUIPy/RawText"
+            end
+            local typeEnum = typeNameToEnum[ftype]
+            if typeEnum == nil then return "ERROR: unknown type '" .. ftype .. "'" end
+            local pj = GlobalObj.pjData
+            if pj == nil then return "ERROR: no project" end
+            if findFile(path) ~= nil then return "ERROR: duplicate '" .. path .. "'" end
+            local segs = splitPath(path)
+            local leaf = segs[#segs]
+            local parentPath = ""
+            for i = 1, #segs - 1 do
+                if parentPath ~= "" then parentPath = parentPath .. "/" end
+                parentPath = parentPath .. segs[i]
+            end
+            -- ensureFolder auto-creates each missing parent folder via the
+            -- editor's parent:FolderAdd(TEFile(name, EFileType.Folder)).
+            local parent, ferr = ensureFolder(parentPath)
+            if parent == nil then return "ERROR: " .. (ferr or "folder resolve failed") end
+            if findChildFile(parent, leaf) ~= nil then
+                return "ERROR: duplicate '" .. path .. "'"
+            end
+            local okNew, err = pcall(function()
+                local nf = TEFile(leaf, typeEnum)
+                nf.Scripter.StringText = body
+                parent:FileAdd(nf)
+                WindowControl.TEOpenFile(nf, 0)
+            end)
+            if not okNew then return "ERROR: newfile failed: " .. tostring(err) end
+            return "OK: newfile '" .. path .. "' (" .. ftype .. ", "
+                .. string.len(body) .. "B)"
+        elseif cmd == "MKDIR" then
+            -- MKDIR path. Nested ok via ensureFolder (each segment created with
+            -- parent:FolderAdd(TEFile(name, EFileType.Folder))); duplicate -> ERROR.
+            local path = string.gsub(arg, "^%s*(.-)%s*$", "%1")
+            if path == "" then return "ERROR: empty path" end
+            local pj = GlobalObj.pjData
+            if pj == nil then return "ERROR: no project" end
+            if findFolder(path) ~= nil then return "ERROR: duplicate '" .. path .. "'" end
+            local node, ferr = ensureFolder(path)
+            if node == nil then return "ERROR: " .. (ferr or "mkdir failed") end
+            return "OK: mkdir '" .. path .. "'"
+        elseif cmd == "RENAME" then
+            -- RENAME path (+ newname in BODY). Reject top/Setting, duplicate
+            -- sibling. f.FileName = newname then parent FileSort/FolderSort.
+            local path = string.gsub(arg, "^%s*(.-)%s*$", "%1")
+            local newname = string.gsub(body, "^%s*(.-)%s*$", "%1")
+            if path == "" then return "ERROR: empty path" end
+            if newname == "" then return "ERROR: empty newname (in body)" end
+            local pj = GlobalObj.pjData
+            if pj == nil then return "ERROR: no project" end
+            local node, parent = findNode(path)
+            if node == nil then return "ERROR: not found '" .. path .. "'" end
+            if isProtectedNode(node) then return "ERROR: cannot rename top/Setting node" end
+            if parent == nil then return "ERROR: cannot rename root" end
+            -- duplicate sibling name (a file or folder already named newname).
+            if findChildFile(parent, newname) ~= nil
+                or findChildFolder(parent, newname) ~= nil then
+                return "ERROR: duplicate sibling '" .. newname .. "'"
+            end
+            local isFolder = (ftypeName(node) == "Folder")
+            local okR, err = pcall(function()
+                node.FileName = newname
+                if isFolder then parent:FolderSort() else parent:FileSort() end
+            end)
+            if not okR then return "ERROR: rename failed: " .. tostring(err) end
+            return "OK: rename '" .. path .. "' -> '" .. newname .. "'"
+        elseif cmd == "DELFILE" then
+            -- DELFILE path. Reject top/Setting; clear a dangling MainFile FIRST
+            -- (note main-cleared); close any open tab via TECloseTabITem; then
+            -- parent FileRemove/FolderRemove + SetDirty (survey row 12).
+            local path = string.gsub(arg, "^%s*(.-)%s*$", "%1")
+            if path == "" then return "ERROR: empty path" end
+            local pj = GlobalObj.pjData
+            if pj == nil then return "ERROR: no project" end
+            local node, parent = findNode(path)
+            if node == nil then return "ERROR: not found '" .. path .. "'" end
+            if isProtectedNode(node) then return "ERROR: cannot delete top/Setting node" end
+            if parent == nil then return "ERROR: cannot delete root" end
+            local mainCleared = false
+            if pj.TEData.MainFile == node then
+                pcall(function() pj.TEData.MainFile = nil end)
+                mainCleared = true
+            end
+            -- close an open tab if present (absence tolerated).
+            pcall(function() WindowControl.TECloseTabITem(node) end)
+            local isFolder = (ftypeName(node) == "Folder")
+            local okD, err = pcall(function()
+                if isFolder then parent:FolderRemove(node) else parent:FileRemove(node) end
+                pj:SetDirty(true)
+            end)
+            if not okD then return "ERROR: delete failed: " .. tostring(err) end
+            local note = mainCleared and " (main-cleared)" or ""
+            return "OK: delete '" .. path .. "'" .. note
+        elseif cmd == "MOVEFILE" then
+            -- MOVEFILE path (+ destFolder in BODY). Locate node + old parent +
+            -- dest folder (must exist); reject moving the top/Setting node and
+            -- moving into Setting/top-as-target. oldParent FileRemove then dest
+            -- FileAdd -- SAME instance, preserving MainFile identity.
+            local path = string.gsub(arg, "^%s*(.-)%s*$", "%1")
+            local destPath = string.gsub(body, "^%s*(.-)%s*$", "%1")
+            if path == "" then return "ERROR: empty path" end
+            local pj = GlobalObj.pjData
+            if pj == nil then return "ERROR: no project" end
+            local node, parent = findNode(path)
+            if node == nil then return "ERROR: not found '" .. path .. "'" end
+            if isProtectedNode(node) then return "ERROR: cannot move top/Setting node" end
+            if parent == nil then return "ERROR: cannot move root" end
+            -- dest folder: an empty body moves to the project root.
+            local dest = findFolder(destPath)
+            if dest == nil then return "ERROR: dest folder not found '" .. destPath .. "'" end
+            if isProtectedNode(dest) and ftypeName(dest) == "Setting" then
+                return "ERROR: cannot move into Setting node"
+            end
+            local isFolder = (ftypeName(node) == "Folder")
+            local okM, err = pcall(function()
+                if isFolder then
+                    parent:FolderRemove(node)
+                    dest:FolderAdd(node)
+                else
+                    parent:FileRemove(node)
+                    dest:FileAdd(node)
+                end
+                pj:SetDirty(true)
+            end)
+            if not okM then return "ERROR: move failed: " .. tostring(err) end
+            return "OK: move '" .. path .. "' -> '" .. destPath .. "/'"
+        elseif cmd == "SETMAIN" then
+            -- SETMAIN path. node must exist (walk); pj.TEData.MainFile = node.
+            local path = string.gsub(arg, "^%s*(.-)%s*$", "%1")
+            if path == "" then return "ERROR: empty path" end
+            local pj = GlobalObj.pjData
+            if pj == nil then return "ERROR: no project" end
+            local node = findFile(path)
+            if node == nil then return "ERROR: not found '" .. path .. "'" end
+            local okS, err = pcall(function() pj.TEData.MainFile = node end)
+            if not okS then return "ERROR: setmain failed: " .. tostring(err) end
+            return "OK: main '" .. path .. "'"
+        elseif cmd == "GETMAIN" then
+            -- GETMAIN (no args). Walk pj.TEData.MainFile to its path via
+            -- mainFilePath(); return the current main path or empty string.
+            local pj = GlobalObj.pjData
+            if pj == nil then return "ERROR: no project" end
+            return mainFilePath()
         elseif cmd == "GETDAT" then
             local a = split(arg, "|")
             if #a < 3 then return "ERROR: 'GETDAT datname|param|objId'" end

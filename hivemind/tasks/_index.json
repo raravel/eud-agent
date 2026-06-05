@@ -785,7 +785,7 @@
       ]
     },
     "EUD-050-2bf4": {
-      "status": "pending",
+      "status": "done",
       "priority": "high",
       "type": "task",
       "parent": "EUD-044-c735",
@@ -794,8 +794,8 @@
       ],
       "title": "Bridge file-tree CRUD + SETMAIN commands",
       "updated": "2026-06-05",
-      "completed_at": null,
-      "path": "active/EUD-050-2bf4.md",
+      "completed_at": "2026-06-05T12:47:58.226343",
+      "path": "done/EUD-050-2bf4.md",
       "scope": [
         "bridge/ZZZ_10_agent_bridge.lua",
         "server/eud_agent/bridge_io.py",

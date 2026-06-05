@@ -77,6 +77,11 @@ _REQ_DATS = ("units", "upgrades", "techdata", "Stechdata", "orders")
 # RESETDAT routing kinds.
 _RESET_KINDS = ("dat", "xdat", "tbl")
 
+# File-tree creatable/settable types (features/04 "File tree (B2)" + "Scope
+# decisions": SCA fully defunct; only the CUI text families + RawText). NEWFILE's
+# type arg is validated against this whitelist BEFORE send.
+_CREATABLE_TYPES = ("CUIEps", "CUIPy", "RawText")
+
 
 class BridgeError(Exception):
     """The bridge returned an ``ERROR:``-prefixed result for a command."""
@@ -160,6 +165,27 @@ def _normalize_req_payload(payload: str) -> str:
             f"segment is 0-4, got {payload!r}"
         )
     return payload
+
+
+def _require_pathlike(value: object, label: str) -> str:
+    """Validate a path/name that rides the pipe-separated ARG line.
+
+    Rejects an empty value and any ``|``/newline/carriage-return character: those
+    would corrupt the bridge's first-line ``<CMD> <arg>`` / pipe-split parse (the
+    EUD-049 review flagged this gap for the arg-line carriers — closed here for the
+    new file-tree wrappers). Multi-line / non-ASCII content travels in the BODY
+    instead, never the arg line.
+    """
+    s = str(value).strip()
+    if not s:
+        raise BridgeError(f"ERROR: {label} must be non-empty")
+    bad = [c for c in ("|", "\n", "\r") if c in str(value)]
+    if bad:
+        raise BridgeError(
+            f"ERROR: {label} must not contain {bad!r} (arg-line delimiters); "
+            "got " + repr(value)
+        )
+    return s
 
 
 class BridgeIO:
@@ -427,6 +453,82 @@ class BridgeIO:
         """
         set_id = _require_nonneg_int(set_id, "setId")
         reply = self.send(f"SETBTN {set_id}\n{csv}", **kw)
+        self._raise_if_error(reply)
+        return reply
+
+    # ----------------------------------------------------------- file tree
+    # Wrappers per features/04 "File tree (B2)". Path-like identifiers ride the
+    # arg line and are validated (empty / ``|`` / newline rejected) BEFORE send;
+    # newname (RENAME) and destFolder (MOVEFILE) and file content (NEWFILE) travel
+    # in the BODY (B2: "Multi-line or non-ASCII values travel in the body").
+
+    def newfile(self, path: str, ftype: str, code: str, **kw) -> str:
+        """Create a file of ``ftype`` at ``path`` (``NEWFILE path|type`` + body).
+
+        ``ftype`` is validated against the creatable whitelist {CUIEps, CUIPy,
+        RawText}; ``path`` may include folders (auto-created by the bridge). A
+        duplicate full path returns ``ERROR:`` (Decision 02 generalized).
+        """
+        path = _require_pathlike(path, "path")
+        _require_in(ftype, _CREATABLE_TYPES, "file type")
+        reply = self.send(f"NEWFILE {path}|{ftype}\n{code}", **kw)
+        self._raise_if_error(reply)
+        return reply
+
+    def mkdir(self, path: str, **kw) -> str:
+        """Create a folder (``MKDIR path``); nested ok, duplicate -> ``ERROR:``."""
+        path = _require_pathlike(path, "path")
+        reply = self.send(f"MKDIR {path}", **kw)
+        self._raise_if_error(reply)
+        return reply
+
+    def rename(self, path: str, newname: str, **kw) -> str:
+        """Rename a node (``RENAME path`` + newname in BODY).
+
+        The new name travels in the body (B2). The bridge rejects the top node,
+        the Setting node, and a duplicate sibling name.
+        """
+        path = _require_pathlike(path, "path")
+        if not str(newname).strip():
+            raise BridgeError("ERROR: newname must be non-empty")
+        reply = self.send(f"RENAME {path}\n{newname}", **kw)
+        self._raise_if_error(reply)
+        return reply
+
+    def delfile(self, path: str, **kw) -> str:
+        """Delete a node (``DELFILE path``).
+
+        The bridge rejects top/Setting nodes, clears a dangling ``MainFile`` (the
+        result then notes ``main-cleared``), closes any open tab, and dirties the
+        project.
+        """
+        path = _require_pathlike(path, "path")
+        reply = self.send(f"DELFILE {path}", **kw)
+        self._raise_if_error(reply)
+        return reply
+
+    def movefile(self, path: str, dest_folder: str, **kw) -> str:
+        """Move a node into ``dest_folder`` (``MOVEFILE path`` + destFolder in BODY).
+
+        The destFolder travels in the body (B2). An empty destFolder moves the
+        node to the project root. The bridge re-adds the SAME instance (preserving
+        MainFile identity) and rejects moving the top/Setting node or into Setting.
+        """
+        path = _require_pathlike(path, "path")
+        reply = self.send(f"MOVEFILE {path}\n{dest_folder}", **kw)
+        self._raise_if_error(reply)
+        return reply
+
+    def setmain(self, path: str, **kw) -> str:
+        """Point ``MainFile`` at the node at ``path`` (``SETMAIN path``)."""
+        path = _require_pathlike(path, "path")
+        reply = self.send(f"SETMAIN {path}", **kw)
+        self._raise_if_error(reply)
+        return reply
+
+    def getmain(self, **kw) -> str:
+        """Return the current main file path, or ``""`` when none is set."""
+        reply = self.send("GETMAIN", **kw)
         self._raise_if_error(reply)
         return reply
 
