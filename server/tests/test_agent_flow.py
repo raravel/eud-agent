@@ -643,22 +643,102 @@ def test_reasoning_visibility_overrides_present(tmp_path):
     )
 
 
-def test_thread_start_kwargs_disable_guardian_reviewer(tmp_path):
-    """EUD-067: thread_start must pass ApprovalMode.deny_all.
+def test_thread_start_params_on_request_no_reviewer(tmp_path):
+    """EUD-067/072: thread params = on-request approvals, NO reviewer.
 
-    The SDK default (``auto_review``) spawns a HIDDEN guardian reviewer thread
-    that runs a full model review turn per MCP tool call (21 review turns in the
-    live E2E) — 10-25s silent gaps between tool calls and ~2x token burn. The
-    eud-agent server is already the policy layer (validation/journal/gate), so
-    the guardian is redundant: deny_all = never ask, no reviewer."""
-    from openai_codex import ApprovalMode
-
+    deny_all (EUD-067's first cut) removed the guardian but its "never" policy
+    AUTO-REJECTED every MCP tool call ("user rejected MCP tool call" — live
+    E2E; the model then fell back to shell_command). The working shape (probed
+    live): approvalPolicy "on-request" with NO approvalsReviewer — MCP
+    approvals route to the SDK approval handler, which accepts eud-tools calls
+    only. The thread also pins a read-only sandbox so non-approval shell
+    commands cannot write."""
     runner = _make_runner(tmp_path)
-    kwargs = runner._thread_start_kwargs("req-x", "system prompt here")
-    assert kwargs.get("approval_mode") is ApprovalMode.deny_all
-    # The existing composition must be preserved alongside.
-    assert kwargs["base_instructions"] == "system prompt here"
-    assert "eud-tools" in kwargs["config"]["mcp_servers"]
+    params = runner._thread_start_params("req-x", "system prompt here")
+    assert params["approvalPolicy"] == "on-request"
+    assert "approvalsReviewer" not in params, "no hidden guardian reviewer"
+    assert params["sandbox"] == "read-only"
+    assert params["baseInstructions"] == "system prompt here"
+    assert "eud-tools" in params["config"]["mcp_servers"]
+    # No system prompt (resume-style start) omits baseInstructions.
+    bare = runner._thread_start_params("req-x", None)
+    assert "baseInstructions" not in bare
+
+
+def test_approval_handler_accepts_only_eud_tools_mcp_calls(tmp_path):
+    """EUD-072: the SDK approval handler is the LAST gate.
+
+    Accept ONLY an mcp_tool_call elicitation from the eud-tools server
+    ({"action": "accept"}); decline every other approval request — including
+    commandExecution/fileChange (the live E2E showed the model falling back to
+    shell_command when MCP was rejected; shell/patch must stay denied)."""
+    from eud_agent.agent_runner import _approval_response
+
+    eud = _approval_response(
+        "mcpServer/elicitation/request",
+        {"serverName": "eud-tools",
+         "_meta": {"codex_approval_kind": "mcp_tool_call"}},
+    )
+    assert eud["action"] == "accept"
+
+    other_server = _approval_response(
+        "mcpServer/elicitation/request",
+        {"serverName": "playwright",
+         "_meta": {"codex_approval_kind": "mcp_tool_call"}},
+    )
+    assert other_server["action"] == "decline"
+
+    other_kind = _approval_response(
+        "mcpServer/elicitation/request",
+        {"serverName": "eud-tools", "_meta": {"codex_approval_kind": "x"}},
+    )
+    assert other_kind["action"] == "decline"
+
+    shell = _approval_response(
+        "item/commandExecution/requestApproval", {"command": "rm -rf"}
+    )
+    assert shell["decision"] == "decline"
+
+    patch = _approval_response("item/fileChange/requestApproval", {})
+    assert patch["decision"] == "decline"
+
+
+def test_skills_disabled_via_include_instructions(tmp_path):
+    """EUD-071: the runner must remove the ENTIRE skill instruction block.
+
+    Personal codex skills load into EVERY thread — the live E2E rollout showed
+    hv-clarify injected into the agent thread with its "MUST be invoked BEFORE
+    any implementation" instruction, which would derail map-edit turns into a
+    clarification questionnaire. Probed live (2026-06-05):
+    ``skills.include_instructions=false`` makes the model report NO skills;
+    the path-keyed ``skills.config=[{path, enabled=false}]`` enumeration is
+    IGNORED both as ``-c`` and as per-thread config (dead end, recorded in the
+    module docstring).
+    """
+    runner = _make_runner(tmp_path)
+    overrides = runner._codex_config().config_overrides
+    assert "skills.include_instructions=false" in overrides, (
+        f"the blanket skill-instruction disable is missing; got {overrides}"
+    )
+
+
+def test_skills_disable_is_injectable(tmp_path):
+    """disable_skills=False omits the override (probe/injection escape hatch)."""
+    from eud_agent.agent_runner import CodexIsolation, CodexSDKRunner
+
+    async def _send(_ev):  # pragma: no cover
+        return None
+
+    runner = CodexSDKRunner(
+        tool_layer=object(),
+        send=_send,
+        build_system_prompt=lambda *a, **k: "",
+        codex_bin=str(tmp_path / "codex.cmd"),
+        data_dir=str(tmp_path / "data"),
+        isolation=CodexIsolation(disable_skills=False),
+    )
+    overrides = runner._codex_config().config_overrides
+    assert "skills.include_instructions=false" not in overrides
 
 
 def test_isolation_no_ignore_user_config_launch_arg(tmp_path):
@@ -1005,22 +1085,32 @@ class _FakeHandle:
 
 
 class _FakeCodex:
-    """A fake SDK ``Codex`` recording thread_start vs thread_resume calls."""
+    """A fake of the runner's ``_ClientFacade`` recording start vs resume.
+
+    Contract (EUD-072): ``thread_start(params)`` / ``thread_resume(thread_id,
+    params)`` take RAW camelCase param dicts and return a thread object with
+    ``.id`` and ``.turn(text) -> handle`` whose ``.stream()`` the turn loop
+    consumes.
+    """
 
     def __init__(self):
         self.starts = 0
         self.resumes: list[str] = []
+        self.start_params: list[dict] = []
+        self.resume_params: list[dict | None] = []
         self._next = 0
 
-    def thread_start(self, **kwargs):
+    def thread_start(self, params):
         self.starts += 1
+        self.start_params.append(params)
         self._next += 1
         t = _FakeThread(f"thread-{self._next}")
         t.turn = lambda text: _FakeHandle()
         return t
 
-    def thread_resume(self, thread_id):
+    def thread_resume(self, thread_id, params=None):
         self.resumes.append(thread_id)
+        self.resume_params.append(params)
         t = _FakeThread(thread_id)
         t.turn = lambda text: _FakeHandle()
         return t
@@ -1350,6 +1440,25 @@ def test_classify_tool_result_carries_text_and_status():
     data = info["event_data"]
     assert "20480" in data["result"]
     assert data["status"] == "completed"
+
+
+def test_classify_tool_result_dict_content_blocks():
+    """Live MCP results deliver content blocks as plain DICTS (probed: the
+    typed-model path left result empty) — both shapes must extract."""
+    import types
+
+    from eud_agent.agent_runner import _classify_event
+
+    result = types.SimpleNamespace(
+        content=[{"type": "text", "text": "OK: units|Hit Points|0 = 20480"}],
+        structured_content=None,
+    )
+    item = types.SimpleNamespace(
+        type="mcpToolCall", tool="dat_get", arguments=None, result=result,
+        status=types.SimpleNamespace(value="completed"), error=None,
+    )
+    _, _, info = _classify_event(_item_evt("item/completed", item))
+    assert "20480" in info["event_data"]["result"]
 
 
 def test_classify_tool_result_failed_carries_error():

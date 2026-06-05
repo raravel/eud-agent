@@ -1198,6 +1198,36 @@
         "server/tests/**",
         "panel/src/**"
       ]
+    },
+    "EUD-071-eae9": {
+      "status": "done",
+      "priority": "high",
+      "type": "bug",
+      "parent": null,
+      "depends_on": [],
+      "title": "Disable personal codex skills in agent threads (skills.config enumeration; closes the EUD-062 skills gap)",
+      "updated": "2026-06-05",
+      "completed_at": "2026-06-05T20:32:52.236725",
+      "path": "done/EUD-071-eae9.md",
+      "scope": [
+        "server/eud_agent/agent_runner.py",
+        "server/tests/**"
+      ]
+    },
+    "EUD-072-3309": {
+      "status": "done",
+      "priority": "high",
+      "type": "bug",
+      "parent": null,
+      "depends_on": [],
+      "title": "MCP tool calls auto-rejected under deny_all: eud-tools default_tools_approval_mode=auto + read-only sandbox (live-E2E defect)",
+      "updated": "2026-06-05",
+      "completed_at": "2026-06-05T20:32:52.576425",
+      "path": "done/EUD-072-3309.md",
+      "scope": [
+        "server/eud_agent/agent_runner.py",
+        "server/tests/**"
+      ]
     }
   }
 }

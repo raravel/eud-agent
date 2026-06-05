@@ -65,19 +65,18 @@ spawn at TWO layers (defense-in-depth), driven by :class:`CodexIsolation`:
   table ``eud-tools`` so the per-thread layer simply supplies the env for the same
   server the launch-level override admits.
 
-What is NOT isolated, and why:
-
-* **Skills** — there is NO documented blanket skills-disable for ``app-server``.
-  ``codex exec --ignore-user-config`` exists but is EXEC-ONLY: probed on this
-  machine's CLI, ``codex --ignore-user-config ...`` and
-  ``codex app-server --ignore-user-config ...`` both error with "unexpected
-  argument", and ``codex app-server --help`` does not list it; the SDK spawns
-  ``app-server``, so that flag is unavailable. Per-skill ``[[skills.config]]
-  enabled=false`` requires enumerating each skill by path (no wildcard). Personal
-  skills therefore remain loadable; this is a documented limitation. The isolation
-  settings are INJECTABLE (``CodexSDKRunner(isolation=...)`` /
-  :data:`CodexIsolation.extra_overrides`) so a future skills mechanism — or the
-  live E2E — can add overrides without touching this module.
+Skills — CLOSED by EUD-071 (the EUD-062 "documented limitation" is retired):
+``skills.include_instructions=false`` removes the ENTIRE skill instruction
+block from the thread (personal + system skills). Probed live 2026-06-05:
+without it the agent thread carried the full personal catalog (hv-clarify with
+its "MUST be invoked BEFORE any implementation" instruction — found in the live
+E2E rollout); with it the model reports NO skills. Two probed dead ends, kept
+for the record: ``skills.config=[{path=..., enabled=false}]`` (path-keyed) is
+IGNORED both as a ``-c`` override and as per-thread config — the honored
+``skills.config`` entry key is ``name`` (openai/codex #20210), usable via
+:data:`CodexIsolation.extra_overrides` if selective filtering is ever wanted.
+The isolation settings remain INJECTABLE (``CodexSDKRunner(isolation=...)``)
+so probes can flip them without touching this module.
 * **Dedicated ``CODEX_HOME`` relocation** was REJECTED: a separate codex home would
   diverge ``auth.json`` token rotation from the operator's account (the BYO account
   re-rotates the refresh token), so it is not implemented even though it would
@@ -144,12 +143,20 @@ class CodexIsolation:
     * ``replace_mcp_table`` — emit the WHOLE-TABLE ``mcp_servers={...}`` override so
       the personal MCP table is replaced (only eud-tools survives). Default True.
     * ``disable_plugins`` — emit ``features.plugins=false``. Default True.
+    * ``disable_skills`` — emit ``skills.include_instructions=false``, removing
+      the ENTIRE skill instruction block (personal + system skills) from the
+      thread (EUD-071: the live E2E rollout showed hv-clarify loaded into the
+      agent thread with its "MUST be invoked BEFORE any implementation"
+      instruction; probed live — with this flag the model reports NO skills).
+      Default True.
     * ``extra_overrides`` — additional raw ``key=tomlvalue`` override strings
-      appended verbatim (e.g. a future per-skill disable, or a live-E2E probe).
+      appended verbatim (e.g. a per-skill ``skills.config=[{name, enabled}]``
+      filter — name-keyed entries are honored via ``-c`` — or a live-E2E probe).
     """
 
     replace_mcp_table: bool = True
     disable_plugins: bool = True
+    disable_skills: bool = True
     extra_overrides: tuple[str, ...] = field(default_factory=tuple)
 
 
@@ -195,6 +202,60 @@ def _toml_key(key: str) -> str:
         return key
     escaped = key.replace("\\", "\\\\").replace('"', '\\"')
     return f'"{escaped}"'
+
+class _ClientFacade:
+    """Minimal thread facade over the low-level ``CodexClient`` (EUD-072).
+
+    Replaces the SDK's high-level ``Codex`` (which hides ``approval_handler``)
+    while keeping the runner's thread surface: ``thread_start(params)`` /
+    ``thread_resume(thread_id, params)`` return an ``openai_codex.api.Thread``
+    whose ``.turn(text)`` yields the streaming ``TurnHandle`` the turn loop
+    consumes. Params are RAW camelCase ``thread/start`` / ``thread/resume``
+    payloads (the high-level facade cannot express on-request-without-reviewer).
+    """
+
+    def __init__(self, client) -> None:
+        self.client = client
+
+    def thread_start(self, params: dict):
+        from openai_codex.api import Thread
+
+        started = self.client.thread_start(params)
+        return Thread(self.client, started.thread.id)
+
+    def thread_resume(self, thread_id: str, params: dict | None = None):
+        from openai_codex.api import Thread
+
+        self.client.thread_resume(thread_id, params)
+        return Thread(self.client, thread_id)
+
+
+def _approval_response(method: str, params: dict | None) -> dict:
+    """Answer an app-server approval request (EUD-072) — the LAST policy gate.
+
+    With ``approvalPolicy: "on-request"`` every MCP tool call raises an
+    ``mcpServer/elicitation/request`` carrying
+    ``_meta.codex_approval_kind == "mcp_tool_call"`` (probed live 2026-06-05;
+    the accepted reply shape is MCP ElicitResult ``{"action", "content"}``).
+    ACCEPT only that, and only for the eud-tools server — every other approval
+    is DECLINED, including ``item/commandExecution/requestApproval`` and
+    ``item/fileChange/requestApproval`` (the SDK default handler auto-accepts
+    those — exactly backwards here: when MCP was being rejected the live model
+    fell back to shell_command; shell/patch must stay denied, the journaled
+    eud-tools are the agent's only legitimate effects).
+    """
+    p = params or {}
+    if method == "mcpServer/elicitation/request":
+        meta = p.get("_meta") or {}
+        if (
+            meta.get("codex_approval_kind") == "mcp_tool_call"
+            and p.get("serverName") == EUD_TOOLS_SERVER
+        ):
+            return {"action": "accept", "content": None}
+        return {"action": "decline", "content": None}
+    # commandExecution / fileChange / anything unknown: decline.
+    return {"decision": "decline"}
+
 
 # Default model for the codex thread (None -> SDK/account default). Pinned to None
 # so the BYO account's configured default is used (the spike left it default).
@@ -338,10 +399,27 @@ class CodexSDKRunner(AgentRunner):
 
     # ------------------------------------------------------------- internals
     def _ensure_codex(self):
-        from openai_codex import Codex
+        """The lazily started codex facade (EUD-072).
+
+        Built over the low-level ``CodexClient`` DIRECTLY (not the SDK's
+        high-level ``Codex``) because only the client exposes
+        ``approval_handler`` — and the approval handler is load-bearing: with
+        approvalPolicy "on-request" every MCP tool call raises an
+        ``mcpServer/elicitation/request`` that the handler must ACCEPT for
+        eud-tools (and decline for everything else, incl. shell / patch
+        approvals). The SDK's default handler auto-accepts shell+patch and
+        rejects MCP — exactly backwards for this agent.
+        """
+        from openai_codex.client import CodexClient
 
         if self._codex is None:
-            self._codex = Codex(config=self._codex_config())
+            client = CodexClient(
+                config=self._codex_config(),
+                approval_handler=_approval_response,
+            )
+            client.start()
+            client.initialize()
+            self._codex = _ClientFacade(client)
         return self._codex
 
     def _codex_config(self):
@@ -380,33 +458,39 @@ class CodexSDKRunner(AgentRunner):
             overrides.append(f"mcp_servers={_toml_inline(table)}")
         if iso.disable_plugins:
             overrides.append("features.plugins=false")
+        if iso.disable_skills:
+            overrides.append("skills.include_instructions=false")
         overrides.extend(REASONING_VISIBILITY_OVERRIDES)
         overrides.extend(iso.extra_overrides)
         return tuple(overrides)
 
-    def _thread_start_kwargs(self, request_id: str, system_prompt: str | None
+    def _thread_start_params(self, request_id: str, system_prompt: str | None
                              ) -> dict:
-        """kwargs for a fresh ``thread_start`` (EUD-067 guardian removal).
+        """Raw ``thread/start`` params (EUD-067 guardian removal + EUD-072).
 
-        ``approval_mode=deny_all`` replaces the SDK default ``auto_review``,
-        which spawns a HIDDEN guardian reviewer thread running a full model
-        review turn per MCP tool call (21 review turns in the live E2E —
-        10-25s silent gaps between tool calls and ~2x token burn). The server
-        is already the policy layer (validation / journal / mutation gate /
-        budget), so the guardian is redundant; ``deny_all`` = never ask for
-        approval escalations, no reviewer thread.
+        ``approvalPolicy: "on-request"`` with NO ``approvalsReviewer``: the SDK
+        default (``auto_review``) spawns a HIDDEN guardian reviewer thread
+        running a full model review turn per MCP tool call (21 review turns in
+        the live E2E — 10-25s silent gaps, ~2x token burn); EUD-067's first cut
+        (``deny_all`` → policy "never") removed the guardian but AUTO-REJECTED
+        every MCP tool call ("user rejected MCP tool call" — live E2E; the
+        model then fell back to shell_command). With "on-request" the MCP
+        approvals route to :func:`_approval_response`, which accepts eud-tools
+        only. ``sandbox: "read-only"`` pins the thread sandbox so non-approval
+        shell commands cannot write (the agent's only legitimate effects go
+        through the journaled eud-tools). Raw camelCase params because the
+        high-level facade cannot express on-request-without-reviewer.
         """
-        from openai_codex import ApprovalMode
-
-        kwargs: dict = {
+        params: dict = {
+            "approvalPolicy": "on-request",
+            "sandbox": "read-only",
             "config": self._thread_config(request_id),
-            "approval_mode": ApprovalMode.deny_all,
         }
         if system_prompt:
-            kwargs["base_instructions"] = system_prompt
+            params["baseInstructions"] = system_prompt
         if self._model:
-            kwargs["model"] = self._model
-        return kwargs
+            params["model"] = self._model
+        return params
 
     def _thread_config(self, request_id: str) -> dict:
         """Per-thread MCP injection of the eud-tools shim (EUD-053 spike shape).
@@ -451,10 +535,15 @@ class CodexSDKRunner(AgentRunner):
         codex = self._ensure_codex()
 
         if self._thread_id is not None:
-            thread = codex.thread_resume(self._thread_id)
+            # Re-assert the approval/sandbox posture on resume (a None override
+            # would also keep the thread settings; explicit is safer — EUD-072).
+            thread = codex.thread_resume(self._thread_id, {
+                "approvalPolicy": "on-request",
+                "sandbox": "read-only",
+            })
         else:
             thread = codex.thread_start(
-                **self._thread_start_kwargs(request_id, system_prompt)
+                self._thread_start_params(request_id, system_prompt)
             )
             self._thread_id = thread.id
         self._thread = thread
@@ -644,7 +733,12 @@ def _tool_result_text(result) -> str:
             return str(result)
     parts: list[str] = []
     for block in getattr(result, "content", None) or []:
-        text = getattr(block, "text", None)
+        # Blocks arrive as plain dicts from the live app-server (probed) or as
+        # typed models in unit fakes — extract text from either shape.
+        if isinstance(block, dict):
+            text = block.get("text")
+        else:
+            text = getattr(block, "text", None)
         if text:
             parts.append(str(text))
     if parts:
