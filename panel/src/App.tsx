@@ -3,9 +3,11 @@
  * review UI (features/06_changeset-review-panel.md).
  *
  * Components: a status-rich Header (connection transitions + RAG state/elapsed),
- * the ConversationLog cards, a live AgentStream under the turn, the ChangesetView
- * accept/reject surface, and the regated InstructionBox. PlanView is owned by a
- * separate task — the EUD-058 plan placeholder is kept compiling here.
+ * the ConversationLog cards, a live AgentStream under the turn, the PlanView
+ * feedback/approve surface, the ChangesetView accept/reject surface, and the
+ * regated InstructionBox. Plan cards are archived into the conversation log as
+ * agent entries when a plan arrives, is superseded by a higher revision, or is
+ * approved.
  *
  * Data flow: WsClient (real WebSocket factory + window.location) → store actions
  * + log entries → React snapshot via useSyncExternalStore → components → user
@@ -25,6 +27,7 @@ import { Header, type RagState } from "@/components/Header";
 import { ConversationLog } from "@/components/ConversationLog";
 import { AgentStream, type AgentActivity } from "@/components/AgentStream";
 import { ChangesetView } from "@/components/ChangesetView";
+import { PlanView } from "@/components/PlanView";
 import { InstructionBox, type ChatPayload } from "@/components/InstructionBox";
 import { createPanelStore } from "@/state/store";
 import { WsClient } from "@/ws/client";
@@ -97,10 +100,18 @@ export default function App() {
           store.answerReceived(msg.text);
           store.log("agent", msg.text);
           break;
-        case "plan":
+        case "plan": {
+          // Archive the prior plan card before it is replaced: a higher revision
+          // supersedes the active card (the store keeps only the latest), so log
+          // the supersession so the iteration history stays in the conversation.
+          const prior = store.getState().plan;
+          if (prior !== null && prior.revision !== msg.revision) {
+            store.log("agent", `계획안(rev ${prior.revision})이 갱신되었습니다.`);
+          }
           store.planReceived(msg.markdown, msg.revision);
           store.log("agent", `계획안(rev ${msg.revision})이 도착했습니다.`);
           break;
+        }
         case "changeset":
           store.changesetReceived(msg.request_id, msg.items);
           store.log("agent", `변경사항 ${msg.items.length}건을 검토하세요.`);
@@ -168,6 +179,34 @@ export default function App() {
     [store],
   );
 
+  // Plan iteration: send plan_feedback{text}, archive the request into the log,
+  // and start a new turn (reset the activity stream). The panel stays in
+  // plan_review until the next plan{revision+1} replaces the card.
+  const handlePlanFeedback = useCallback(
+    (text: string) => {
+      const sent = clientRef.current?.send({ type: "plan_feedback", text });
+      if (sent) {
+        store.log("you", text);
+        store.log("agent", "계획 수정을 요청했습니다.");
+        store.planFeedbackSent();
+        setAgentEvents([]); // a new turn — reset the activity stream.
+      }
+    },
+    [store],
+  );
+
+  // Plan approval: send plan_approve{}, archive the approval into the log, and
+  // start the apply turn (reset the activity stream).
+  const handlePlanApprove = useCallback(() => {
+    const sent = clientRef.current?.send({ type: "plan_approve" });
+    if (sent) {
+      const rev = store.getState().plan?.revision;
+      store.log("agent", rev !== undefined ? `계획안(rev ${rev})을 승인했습니다.` : "계획을 승인했습니다.");
+      store.planApproveSent();
+      setAgentEvents([]); // a new turn — reset the activity stream.
+    }
+  }, [store]);
+
   // Fire a changeset_decision and record it in the store (so the matching
   // rollback_result is labelled per accept/reject). The ids are the literal
   // "all" (bulk) or the item's ids (ChangesetView resolves dat group ids).
@@ -199,14 +238,19 @@ export default function App() {
       {/* Live agent activity (collapses to a summary when the turn ends). */}
       <AgentStream events={agentEvents} live={state.phase === "thinking"} />
 
-      {/* Plan placeholder — the full PlanView is a separate task. */}
-      {state.plan && (
-        <section
-          aria-label="계획 검토"
-          className="border-t border-border px-4 py-2 text-sm text-muted-foreground"
-        >
-          계획안(rev {state.plan.revision})을 검토하세요.
-        </section>
+      {/* Plan review — markdown card + feedback/approve (features/06). The card
+          stays visible across the iteration turn (plan_review while awaiting a
+          decision, thinking while the feedback/approve turn runs) and only
+          disappears when the store clears the plan (chat / reconnect) or a
+          changeset opens. Controls disable (`pending`) once the turn is in
+          flight, i.e. when the phase has left plan_review. */}
+      {state.plan && (state.phase === "plan_review" || state.phase === "thinking") && (
+        <PlanView
+          plan={state.plan}
+          pending={state.phase !== "plan_review"}
+          onFeedback={handlePlanFeedback}
+          onApprove={handlePlanApprove}
+        />
       )}
 
       {state.changeset && state.phase === "changeset_review" && (

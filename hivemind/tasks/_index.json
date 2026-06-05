@@ -727,15 +727,15 @@
       "scope": []
     },
     "EUD-046-f2c8": {
-      "status": "pending",
+      "status": "done",
       "priority": "high",
       "type": "story",
       "parent": "EUD-043-1455",
       "depends_on": [],
       "title": "Panel v2 (chat + plan + changeset review)",
       "updated": "2026-06-05",
-      "completed_at": null,
-      "path": "active/EUD-046-f2c8.md",
+      "completed_at": "2026-06-05T16:08:13.568340",
+      "path": "done/EUD-046-f2c8.md",
       "scope": []
     },
     "EUD-047-fd09": {
@@ -1010,7 +1010,7 @@
       ]
     },
     "EUD-060-7771": {
-      "status": "pending",
+      "status": "done",
       "priority": "medium",
       "type": "task",
       "parent": "EUD-046-f2c8",
@@ -1019,8 +1019,8 @@
       ],
       "title": "PlanView + feedback iteration UI",
       "updated": "2026-06-05",
-      "completed_at": null,
-      "path": "active/EUD-060-7771.md",
+      "completed_at": "2026-06-05T16:08:13.536316",
+      "path": "done/EUD-060-7771.md",
       "scope": [
         "panel/src/components/PlanView.tsx",
         "panel/src/App.tsx"
