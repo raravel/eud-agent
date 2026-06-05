@@ -61,7 +61,9 @@ that build of StarCraft.
   race gas buildings, neutral gas resources, Tank, Goliath, Wraith, Vessel,
   Battlecruiser, and the Unused archon-hit-image entries.
 - [#24] NEVER add a shield to a unit whose image has no shield script (crashes
-  when attacked). (crash)
+  when attacked). This happens ONLY when the image's iscript has just the two
+  entries Init and Death — so to validate this hazard you MUST inspect the
+  image's script entries first; an image with more entries is safe. (crash)
 - [#25] NEVER let a unit with turn radius 0 stop while moving (fix: make it a
   flyer and use the noAirCollision function). (crash)
 - [#26] NEVER alter the Tank's turret subunit if the siege-mode button can be
