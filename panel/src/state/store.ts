@@ -83,6 +83,41 @@ export interface PlanState {
   revision: number;
 }
 
+/**
+ * One tool-call row in the current turn (EUD-065). `tool_call` opens a `running`
+ * row by name; the next `tool_result` flips the latest still-running row to
+ * `done`. The id is monotonic per turn (for stable React keys).
+ */
+export interface AgentTool {
+  id: string;
+  name: string;
+  state: "running" | "done";
+  detail?: string;
+}
+
+/**
+ * Per-turn streaming buffers (EUD-065 / features/06 ## Behaviors → Agent stream).
+ * The EUD-063 streamed `agent_event`s accumulate here so the AI-Elements surfaces
+ * render live and reset per turn:
+ *   - `reasoning` deltas → {@link TurnState.reasoning} (dim/collapsible Reasoning);
+ *   - `delta` answer deltas → {@link TurnState.answer} (prominent Streamdown
+ *     Message; `answerStarted` flips true on the first delta so the Reasoning
+ *     block collapses when the answer begins);
+ *   - `tool_call`/`tool_result` → {@link TurnState.tools} (Tool rows by name).
+ * Raw internal kinds NEVER reach the log (no-raw-kind-leak contract).
+ */
+export interface TurnState {
+  reasoning: string;
+  answer: string;
+  answerStarted: boolean;
+  tools: AgentTool[];
+}
+
+/** A fresh (empty) per-turn buffer. */
+function emptyTurn(): TurnState {
+  return { reasoning: "", answer: "", answerStarted: false, tools: [] };
+}
+
 /** Per-item decision outcome (driven by `rollback_result` + the recorded send). */
 export type ItemDecision = "accepted" | "rejected" | "failed";
 
@@ -141,6 +176,8 @@ export interface PanelState {
    * accept/reject the user chose — the inbound reply carries no discriminator.
    */
   pendingDecision: PendingDecision | null;
+  /** Per-turn streaming buffers (reasoning / answer / tools); reset per turn. */
+  turn: TurnState;
   /** Capped event log (oldest dropped at {@link MAX_LOG_ENTRIES}). */
   log: LogEntry[];
   // ---- derived selectors (computed on every mutation) ----
@@ -169,7 +206,11 @@ export interface PanelStore {
   // ---- inbound server events ----
   applyStatus(msg: { compiling: boolean; project: string }): void;
   applyList(msg: { files?: FileEntry[]; error?: string }): void;
-  /** A streamed `agent_event` — logged as an agent activity line. */
+  /**
+   * A streamed `agent_event` — accumulated into the per-turn {@link TurnState}
+   * buffers (reasoning / answer / tools). Raw internal kind identifiers NEVER
+   * reach the log (no-raw-kind-leak contract, features/06 / decision 06).
+   */
   agentEvent(kind: string, detail: string): void;
   /** `answer` — answer-only turn; back to ready. */
   answerReceived(text: string): void;
@@ -199,6 +240,12 @@ export interface PanelStore {
   decisionSent(decision: "accept" | "reject", ids: "all" | string[]): void;
   /** cancel was sent — return to ready. */
   cancelSent(): void;
+  /**
+   * `reset{}` was sent ([새 대화]) — clear the client log, plan, changeset, and
+   * per-turn buffers, returning to ready (EUD-064/065). The server drops the
+   * retained codex thread; the next chat starts a fresh conversation.
+   */
+  resetSent(): void;
 
   // ---- logging ----
   log(kind: LogKind, text: string, stage?: ProgressStage): void;
@@ -249,6 +296,7 @@ function isChangesetFullyDecided(cs: ChangesetState): boolean {
 /** Create a fresh panel store. */
 export function createPanelStore(): PanelStore {
   let logSeq = 0;
+  let toolSeq = 0;
 
   // ---- mutable core (selectors are recomputed into the snapshot) ----
   const core = {
@@ -259,6 +307,9 @@ export function createPanelStore(): PanelStore {
     compiling: false,
     plan: null as PlanState | null,
     changeset: null as ChangesetState | null,
+    // Per-turn streaming buffers (reasoning / answer / tools). Reset whenever a
+    // new turn starts (chat / plan_feedback / plan_approve / reset).
+    turn: emptyTurn(),
     log: [] as LogEntry[],
     connected: false,
     // A turn is in flight (chat/plan_feedback/plan_approve sent, no turn-end event
@@ -290,6 +341,7 @@ export function createPanelStore(): PanelStore {
       plan: core.plan,
       changeset: core.changeset,
       pendingDecision: core.pendingDecision,
+      turn: core.turn,
       log: core.log,
       connected: core.connected,
       canSend,
@@ -311,6 +363,24 @@ export function createPanelStore(): PanelStore {
       core.log.length >= MAX_LOG_ENTRIES ? core.log.slice(1) : core.log.slice();
     next.push(entry);
     core.log = next;
+  }
+
+  /**
+   * F2: archive the live streamed-answer buffer (`turn.answer`) as a prominent
+   * agent log entry when a turn ends WITHOUT an `answer{}` (plan / changeset /
+   * error). The live AgentAnswer bubble renders `turn.answer` only while the
+   * panel is `thinking`, so prose streamed via `delta` before a plan/changeset/
+   * error would otherwise be shown live then silently discarded at the
+   * transition. The `answer{}` path is authoritative (the server final text) and
+   * supersedes the buffer — `answerReceived` does NOT call this, so there is no
+   * double-log. Empty/whitespace buffer = no-op. The buffer is cleared after
+   * archiving so a later transition in the same turn cannot re-archive it.
+   */
+  function archiveTurnAnswer(): void {
+    if (core.turn.answer.trim().length > 0) {
+      pushLog("agent", core.turn.answer);
+      core.turn = { ...core.turn, answer: "", answerStarted: false };
+    }
   }
 
   return {
@@ -382,9 +452,54 @@ export function createPanelStore(): PanelStore {
     },
 
     agentEvent(kind, detail) {
-      // A streamed activity line under the latest user message (features/06).
-      const text = detail ? `${kind}: ${detail}` : kind;
-      pushLog("agent", text);
+      // Accumulate the streamed agent_event into the per-turn buffers (EUD-065 /
+      // decision 06). Raw internal kind identifiers (delta/answer/token_usage/
+      // turn_done/item_started/item_completed/event) MUST NEVER reach the log —
+      // they drive the Reasoning / Response / Tool surfaces, not a text line.
+      switch (kind) {
+        case "reasoning":
+          core.turn = {
+            ...core.turn,
+            reasoning: core.turn.reasoning + detail,
+          };
+          break;
+        case "delta":
+          // The first answer delta marks the answer as started (so the Reasoning
+          // block collapses); subsequent deltas grow the live answer text.
+          core.turn = {
+            ...core.turn,
+            answer: core.turn.answer + detail,
+            answerStarted: true,
+          };
+          break;
+        case "tool_call": {
+          // Open a running Tool row by name (detail = the tool name / signature).
+          toolSeq += 1;
+          const tool: AgentTool = {
+            id: `tool-${toolSeq}`,
+            name: detail || "tool",
+            state: "running",
+          };
+          core.turn = { ...core.turn, tools: [...core.turn.tools, tool] };
+          break;
+        }
+        case "tool_result": {
+          // Flip the latest still-running Tool row to done; attach the detail.
+          const tools = core.turn.tools.slice();
+          for (let i = tools.length - 1; i >= 0; i -= 1) {
+            if (tools[i].state === "running") {
+              tools[i] = { ...tools[i], state: "done", detail };
+              break;
+            }
+          }
+          core.turn = { ...core.turn, tools };
+          break;
+        }
+        default:
+          // thinking / answer / token_usage / turn_done / item_* / event and any
+          // other kind: no user-facing text. Swallow (no log leak).
+          break;
+      }
       emit();
     },
 
@@ -400,6 +515,8 @@ export function createPanelStore(): PanelStore {
       // propose_plan ENDS the codex turn (the turn is no longer in flight); the
       // panel now awaits feedback/approve. thinking --> plan_review; a higher
       // revision REPLACES the active card.
+      // F2: archive any prose streamed before the plan turn-end.
+      archiveTurnAnswer();
       core.turnInFlight = false;
       core.plan = { markdown, revision };
       core.phase = "plan_review";
@@ -408,6 +525,8 @@ export function createPanelStore(): PanelStore {
 
     changesetReceived(requestId, items) {
       // thinking --> changeset_review. Fresh decisions map (no item decided yet).
+      // F2: archive any prose streamed before the changeset turn-end.
+      archiveTurnAnswer();
       core.turnInFlight = false;
       core.changeset = { request_id: requestId, items, decisions: {} };
       core.phase = "changeset_review";
@@ -477,6 +596,8 @@ export function createPanelStore(): PanelStore {
       // A turn error returns the flow to ready (thinking/plan_review --> ready).
       // changeset_review keeps its reviewable changeset (an error there is about a
       // failed decision, surfaced via rollback_result/log, not a phase reset).
+      // F2: archive any prose streamed before the turn errored out.
+      archiveTurnAnswer();
       if (core.phase !== "changeset_review") {
         core.turnInFlight = false;
         core.phase = "ready";
@@ -507,23 +628,29 @@ export function createPanelStore(): PanelStore {
     chatSent() {
       // ready --> thinking, and changeset_review --> thinking (follow-up chat;
       // the server auto-accepts undecided items). Starting a new turn clears the
-      // prior plan card; the changeset is left intact (server archives it).
+      // prior plan card and the per-turn streaming buffers; the changeset is left
+      // intact (server archives it).
       core.turnInFlight = true;
       core.plan = null;
+      core.turn = emptyTurn();
       core.phase = "thinking";
       emit();
     },
 
     planFeedbackSent() {
       // plan_review --> thinking (iterate; next plan{revision+1} replaces card).
+      // A new turn — reset the per-turn streaming buffers.
       core.turnInFlight = true;
+      core.turn = emptyTurn();
       core.phase = "thinking";
       emit();
     },
 
     planApproveSent() {
-      // plan_review --> thinking (apply the approved plan).
+      // plan_review --> thinking (apply the approved plan). A new turn — reset the
+      // per-turn streaming buffers.
       core.turnInFlight = true;
+      core.turn = emptyTurn();
       core.phase = "thinking";
       emit();
     },
@@ -545,6 +672,28 @@ export function createPanelStore(): PanelStore {
         core.phase = "ready";
         core.plan = null;
       }
+      emit();
+    },
+
+    resetSent() {
+      // [새 대화]: the server drops the retained codex thread (EUD-064); the client
+      // clears the conversation log, plan, changeset, pending decision, and the
+      // per-turn streaming buffers, returning to ready for a fresh conversation.
+      // F3: if an undecided changeset is discarded, the server default-accepts its
+      // undecided items (features/05). Surface that as the FIRST entry of the fresh
+      // log so the discard is not silent.
+      const discardedUndecided =
+        core.changeset !== null && !isChangesetFullyDecided(core.changeset);
+      core.turnInFlight = false;
+      core.plan = null;
+      core.changeset = null;
+      core.pendingDecision = null;
+      core.turn = emptyTurn();
+      core.log = [];
+      if (discardedUndecided) {
+        pushLog("warn", "미결정 변경사항은 자동 적용 처리되었습니다.");
+      }
+      core.phase = "ready";
       emit();
     },
 

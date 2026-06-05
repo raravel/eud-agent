@@ -57,7 +57,7 @@ describe("PlanView — markdown render", () => {
     expect(screen.getByText(/function tp/)).toBeInTheDocument();
   });
 
-  it("never injects raw HTML (no dangerouslySetInnerHTML)", () => {
+  it("never injects a live <script> node (Streamdown sanitizes untrusted markdown)", () => {
     const plan: PlanState = {
       revision: 1,
       markdown: "안전 <script>alert(1)</script> 텍스트",
@@ -65,9 +65,18 @@ describe("PlanView — markdown render", () => {
     const { container } = render(
       <PlanView plan={plan} pending={false} onFeedback={() => {}} onApprove={() => {}} />,
     );
-    // The tag must be rendered as literal text, never as a live <script> node.
+    // Streamdown (rehype-sanitize) renders untrusted markdown safely — no live
+    // <script> node is ever created.
     expect(container.querySelector("script")).toBeNull();
-    expect(screen.getByText(/<script>/)).toBeInTheDocument();
+    // The surrounding safe text still renders.
+    expect(screen.getByText(/텍스트/)).toBeInTheDocument();
+  });
+
+  it("renders via the AI-Elements Plan component (data-slot=plan)", () => {
+    const { container } = render(
+      <PlanView plan={rev1} pending={false} onFeedback={() => {}} onApprove={() => {}} />,
+    );
+    expect(container.querySelector('[data-slot="plan"]')).not.toBeNull();
   });
 });
 

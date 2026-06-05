@@ -1,50 +1,113 @@
 /**
- * Agent activity stream (features/06 ## Behaviors → Agent stream): a live
- * activity line rendered under the latest user message from the current turn's
- * `agent_event`s — "도구 호출 n건 · 현재: <last tool/detail>". When the turn ends
- * (the store phase leaves `thinking`, i.e. `live` goes false) it collapses into
- * a summary row (no spinner). With zero events it renders nothing.
+ * Agent activity stream (features/06 ## Behaviors → Agent stream), rebuilt on the
+ * vendored AI Elements (Reasoning + Tool) + Streamdown (decision 06):
+ *   - `reasoning` text renders into the Reasoning block: dim/secondary, GPT-style,
+ *     collapsible. It auto-opens while reasoning streams (no answer yet) and
+ *     auto-collapses once the answer starts (`answerStarted`); the user can then
+ *     MANUALLY re-expand it by clicking the trigger (GPT-style — F1 review fix).
+ *     A user toggle wins over the auto behavior until the next turn resets it
+ *     (the override clears when the per-turn reasoning buffer empties);
+ *   - `tool_call`/`tool_result` render as Tool rows by tool name, with a
+ *     "도구 호출 n건" summary row;
+ *   - raw internal kind identifiers NEVER appear as literal text — this component
+ *     only ever renders the reasoning text, the tool NAMES, and Korean labels.
  *
- * Kept a plain styled row (no markdown pipeline; the Spinner primitive is the
- * only shared dependency — dep-pruning carry-forward from ConversationLog).
+ * With no reasoning and no tools it renders nothing (null).
  */
-import { Spinner } from "@/components/ui/spinner";
-import { cn } from "@/lib/utils";
+import { useEffect, useState } from "react";
+import {
+  Reasoning,
+  ReasoningContent,
+  ReasoningTrigger,
+} from "@/components/ai-elements/reasoning";
+import {
+  Tool,
+  ToolContent,
+  ToolHeader,
+} from "@/components/ai-elements/tool";
 
-/** One streamed agent activity (mirrors `agent_event {kind, detail}`). */
-export interface AgentActivity {
-  kind: string;
-  detail: string;
+/** One tool-call row (mirrors the store's per-turn AgentTool). */
+export interface AgentTool {
+  id: string;
+  name: string;
+  state: "running" | "done";
+  detail?: string;
 }
 
 export interface AgentStreamProps {
-  /** The current turn's agent_event stream (chronological). */
-  events: AgentActivity[];
+  /** Accumulated reasoning delta text. */
+  reasoning: string;
+  /** True once answer delta text has begun (collapses the Reasoning block). */
+  answerStarted: boolean;
+  /** Tool rows from tool_call/tool_result. */
+  tools: AgentTool[];
   /** True while the turn is in flight (store phase === "thinking"). */
   live: boolean;
 }
 
-/** Tool-call events count toward "도구 호출 n건". */
-const TOOL_CALL_KIND = "tool_call";
+export function AgentStream({
+  reasoning,
+  answerStarted,
+  tools,
+  live,
+}: AgentStreamProps) {
+  // User override of the auto open/collapse behavior (F1): null = follow the
+  // auto behavior; true/false = the user explicitly opened/closed the block.
+  const [userOpen, setUserOpen] = useState<boolean | null>(null);
 
-export function AgentStream({ events, live }: AgentStreamProps) {
-  if (events.length === 0) return null;
+  const hasReasoning = reasoning.length > 0;
 
-  const toolCalls = events.filter((e) => e.kind === TOOL_CALL_KIND).length;
-  const last = events[events.length - 1];
-  const current = last.detail || last.kind;
+  // Reset the override at the start of each turn — a fresh turn empties the
+  // reasoning buffer, so a stale override does not carry across turns.
+  useEffect(() => {
+    if (!hasReasoning) setUserOpen(null);
+  }, [hasReasoning]);
+
+  if (!hasReasoning && tools.length === 0) return null;
+
+  // Auto behavior: open while reasoning streams (the answer has not started yet),
+  // collapse once the answer begins. A user toggle (`userOpen`) overrides it so
+  // the collapsed block can be MANUALLY re-expanded afterwards. `open` is fully
+  // controlled so the collapsed content leaves the DOM (no leaked text).
+  const autoOpen = hasReasoning && !answerStarted;
+  const reasoningOpen = userOpen !== null ? userOpen : autoOpen;
+  const reasoningStreaming = live && !answerStarted;
 
   return (
     <div
-      className={cn(
-        "flex w-fit max-w-[95%] items-center gap-2 px-4 py-1 text-sm text-muted-foreground",
-      )}
+      className="flex w-full max-w-[95%] flex-col gap-2 px-4"
       aria-label="에이전트 활동"
     >
-      {live && <Spinner className="size-3.5 shrink-0" />}
-      <span className="whitespace-pre-wrap break-words">
-        {`도구 호출 ${toolCalls}건 · 현재: ${current}`}
-      </span>
+      {hasReasoning && (
+        <Reasoning
+          isStreaming={reasoningStreaming}
+          open={reasoningOpen}
+          onOpenChange={setUserOpen}
+        >
+          <ReasoningTrigger />
+          <ReasoningContent>{reasoning}</ReasoningContent>
+        </Reasoning>
+      )}
+
+      {tools.length > 0 && (
+        <div className="flex flex-col gap-1">
+          <span className="text-xs text-muted-foreground">
+            도구 호출 {tools.length}건
+          </span>
+          {tools.map((tool) => (
+            <Tool key={tool.id} data-testid={`tool-${tool.id}`}>
+              <ToolHeader title={tool.name} state={tool.state} />
+              {tool.detail && (
+                <ToolContent>
+                  <div className="p-3 text-xs whitespace-pre-wrap break-words text-muted-foreground">
+                    {tool.detail}
+                  </div>
+                </ToolContent>
+              )}
+            </Tool>
+          ))}
+        </div>
+      )}
     </div>
   );
 }

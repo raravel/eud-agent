@@ -78,6 +78,36 @@ describe("InstructionBox — send gating (v2)", () => {
   });
 });
 
+describe("InstructionBox — 새 대화 reset control (EUD-065)", () => {
+  it("renders a [새 대화] button", () => {
+    render(<InstructionBox state={readyState()} onSend={noop} onReset={noop} />);
+    expect(screen.getByRole("button", { name: "새 대화" })).toBeInTheDocument();
+  });
+
+  it("calls onReset when [새 대화] is clicked", async () => {
+    const user = userEvent.setup();
+    const onReset = vi.fn();
+    render(
+      <InstructionBox state={readyState()} onSend={noop} onReset={onReset} />,
+    );
+    await user.click(screen.getByRole("button", { name: "새 대화" }));
+    expect(onReset).toHaveBeenCalledTimes(1);
+  });
+
+  it("disables [새 대화] while a turn is in flight", () => {
+    const store = createPanelStore();
+    store.wsOpen();
+    store.applyList({
+      files: [{ path: "main.eps", ftype: "CUIEps", settable: true }],
+    });
+    store.chatSent(); // thinking — a turn is in flight
+    render(
+      <InstructionBox state={store.getState()} onSend={noop} onReset={noop} />,
+    );
+    expect(screen.getByRole("button", { name: "새 대화" })).toBeDisabled();
+  });
+});
+
 describe("InstructionBox — chat payload (v2)", () => {
   it("sends the trimmed instruction text as {text}", async () => {
     const user = userEvent.setup();

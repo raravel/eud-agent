@@ -117,6 +117,31 @@ describe("v1 message types are removed entirely (no compat shim)", () => {
   });
 });
 
+describe("reset{} client message (features/05 EUD-064)", () => {
+  it("reset is in the client discriminant set", () => {
+    expect(CLIENT_MESSAGE_TYPES).toContain("reset");
+  });
+
+  it("constructs a reset{} client message", () => {
+    const reset: ClientMessage = { type: "reset" };
+    expect(reset.type).toBe("reset");
+  });
+});
+
+describe("reasoning/delta agent_event kinds (features/05 EUD-063)", () => {
+  it("accepts a reasoning agent_event (reasoning-text delta in detail)", () => {
+    const msg = { type: "agent_event", kind: "reasoning", detail: "생각 중" };
+    expect(isAgentEventMessage(msg)).toBe(true);
+    expect(isServerMessage(msg)).toBe(true);
+  });
+
+  it("accepts a delta agent_event (answer-text delta in detail)", () => {
+    const msg = { type: "agent_event", kind: "delta", detail: "안녕" };
+    expect(isAgentEventMessage(msg)).toBe(true);
+    expect(isServerMessage(msg)).toBe(true);
+  });
+});
+
 describe("client message shapes (compile-time + structural)", () => {
   it("constructs every documented v2 client message", () => {
     const chat: ClientMessage = { type: "chat", text: "do it" };
@@ -125,6 +150,8 @@ describe("client message shapes (compile-time + structural)", () => {
       text: "tweak it",
     };
     const planApprove: ClientMessage = { type: "plan_approve" };
+    const reset: ClientMessage = { type: "reset" };
+    expect(reset.type).toBe("reset");
     const decisionAll: ClientMessage = {
       type: "changeset_decision",
       decision: "accept",

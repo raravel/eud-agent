@@ -25,7 +25,8 @@ import {
 } from "react";
 import { Header, type RagState } from "@/components/Header";
 import { ConversationLog } from "@/components/ConversationLog";
-import { AgentStream, type AgentActivity } from "@/components/AgentStream";
+import { AgentStream } from "@/components/AgentStream";
+import { AgentAnswer } from "@/components/AgentAnswer";
 import { ChangesetView } from "@/components/ChangesetView";
 import { PlanView } from "@/components/PlanView";
 import { InstructionBox, type ChatPayload } from "@/components/InstructionBox";
@@ -43,9 +44,9 @@ export default function App() {
   const state = useSyncExternalStore(store.subscribe, store.getState, store.getState);
 
   // ---- UI-only state (not protocol state) ----
-  // The current turn's agent_event stream (AgentStream). Reset when a new turn
-  // starts (chat/plan_feedback/plan_approve sent).
-  const [agentEvents, setAgentEvents] = useState<AgentActivity[]>([]);
+  // The per-turn streaming buffers (reasoning / answer / tools) live in the STORE
+  // (state.turn) now — the AgentStream + live AgentAnswer render from there, and
+  // the store resets them per turn. No App-local agent_event list is needed.
   // RAG warmup visibility for the Header pill. `startedAt` drives the elapsed
   // counter while loading; a 1s tick re-renders so the seconds advance.
   const [ragState, setRagState] = useState<RagState>("idle");
@@ -93,14 +94,21 @@ export default function App() {
           break;
         }
         case "agent_event":
+          // Accumulated into the store's per-turn buffers (reasoning/answer/tools);
+          // raw kinds never reach the log.
           store.agentEvent(msg.kind, msg.detail);
-          setAgentEvents((prev) => [...prev, { kind: msg.kind, detail: msg.detail }]);
           break;
         case "answer":
+          // Archive the final answer as a prominent agent log entry. answerReceived
+          // ends the turn (clears turn.answer next chat); logging it keeps the
+          // answer in the persistent conversation history (Streamdown-rendered).
           store.answerReceived(msg.text);
           store.log("agent", msg.text);
           break;
         case "plan": {
+          // F2: planReceived archives any prose streamed via `delta` before this
+          // turn-end (the live AgentAnswer renders turn.answer only while
+          // thinking, so it would otherwise vanish at the transition).
           // Archive the prior plan card before it is replaced: a higher revision
           // supersedes the active card (the store keeps only the latest), so log
           // the supersession so the iteration history stays in the conversation.
@@ -113,6 +121,7 @@ export default function App() {
           break;
         }
         case "changeset":
+          // F2: changesetReceived archives any prose streamed before this turn-end.
           store.changesetReceived(msg.request_id, msg.items);
           store.log("agent", `변경사항 ${msg.items.length}건을 검토하세요.`);
           break;
@@ -133,6 +142,7 @@ export default function App() {
           break;
         }
         case "error":
+          // F2: errorReceived archives any prose streamed before the turn errored.
           store.errorReceived(msg.message);
           store.log("error", `오류: ${msg.message}`);
           break;
@@ -172,16 +182,24 @@ export default function App() {
       const sent = clientRef.current?.send({ type: "chat", text: payload.text });
       if (sent) {
         store.log("you", payload.text);
-        store.chatSent();
-        setAgentEvents([]); // a new turn — reset the activity stream.
+        store.chatSent(); // a new turn — the store resets the per-turn buffers.
       }
     },
     [store],
   );
 
+  // New conversation: send reset{} (the server drops the retained codex thread,
+  // EUD-064) and clear the client log / plan / changeset / per-turn buffers.
+  const handleReset = useCallback(() => {
+    const sent = clientRef.current?.send({ type: "reset" });
+    if (sent) {
+      store.resetSent();
+    }
+  }, [store]);
+
   // Plan iteration: send plan_feedback{text}, archive the request into the log,
-  // and start a new turn (reset the activity stream). The panel stays in
-  // plan_review until the next plan{revision+1} replaces the card.
+  // and start a new turn (the store resets the per-turn buffers). The panel stays
+  // in plan_review until the next plan{revision+1} replaces the card.
   const handlePlanFeedback = useCallback(
     (text: string) => {
       const sent = clientRef.current?.send({ type: "plan_feedback", text });
@@ -189,21 +207,19 @@ export default function App() {
         store.log("you", text);
         store.log("agent", "계획 수정을 요청했습니다.");
         store.planFeedbackSent();
-        setAgentEvents([]); // a new turn — reset the activity stream.
       }
     },
     [store],
   );
 
   // Plan approval: send plan_approve{}, archive the approval into the log, and
-  // start the apply turn (reset the activity stream).
+  // start the apply turn (the store resets the per-turn buffers).
   const handlePlanApprove = useCallback(() => {
     const sent = clientRef.current?.send({ type: "plan_approve" });
     if (sent) {
       const rev = store.getState().plan?.revision;
       store.log("agent", rev !== undefined ? `계획안(rev ${rev})을 승인했습니다.` : "계획을 승인했습니다.");
       store.planApproveSent();
-      setAgentEvents([]); // a new turn — reset the activity stream.
     }
   }, [store]);
 
@@ -235,8 +251,17 @@ export default function App() {
 
       <ConversationLog log={state.log} phase={state.phase} />
 
-      {/* Live agent activity (collapses to a summary when the turn ends). */}
-      <AgentStream events={agentEvents} live={state.phase === "thinking"} />
+      {/* Live agent activity for the current turn: the reasoning block + tool
+          rows (AgentStream) and the prominent streamed answer bubble
+          (AgentAnswer). Both render from the store's per-turn buffers and reset
+          per turn; the final answer is also archived into the log on answer{}. */}
+      <AgentStream
+        reasoning={state.turn.reasoning}
+        answerStarted={state.turn.answerStarted}
+        tools={state.turn.tools}
+        live={state.phase === "thinking"}
+      />
+      {state.phase === "thinking" && <AgentAnswer text={state.turn.answer} />}
 
       {/* Plan review — markdown card + feedback/approve (features/06). The card
           stays visible across the iteration turn (plan_review while awaiting a
@@ -261,7 +286,7 @@ export default function App() {
         />
       )}
 
-      <InstructionBox state={state} onSend={handleSend} />
+      <InstructionBox state={state} onSend={handleSend} onReset={handleReset} />
     </div>
   );
 }

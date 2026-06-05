@@ -533,6 +533,7 @@ describe("v1 protocol literals are absent (no compat shim)", () => {
         "plan_approve",
         "changeset_decision",
         "cancel",
+        "reset",
         "status",
         "list",
       ]),
@@ -550,6 +551,223 @@ describe("v1 protocol literals are absent (no compat shim)", () => {
         "list",
       ]),
     );
+  });
+});
+
+// ---- EUD-065: per-turn streaming buffers (reasoning / delta / tools) ----
+// The store accumulates the EUD-063 streamed agent_event deltas into a per-turn
+// `turn` buffer so the AI-Elements surfaces (Reasoning / Response / Tool) render
+// live and reset per turn. Raw kind identifiers MUST NOT leak into the log.
+describe("agentEvent streaming buffers (EUD-065 / features/06)", () => {
+  it("accumulates reasoning deltas into turn.reasoning", () => {
+    const store = readyWithProject();
+    store.chatSent();
+    store.agentEvent("reasoning", "먼저 ");
+    store.agentEvent("reasoning", "유닛을 ");
+    store.agentEvent("reasoning", "확인합니다.");
+    expect(store.getState().turn.reasoning).toBe("먼저 유닛을 확인합니다.");
+  });
+
+  it("accumulates delta answer text into turn.answer and marks the answer started", () => {
+    const store = readyWithProject();
+    store.chatSent();
+    expect(store.getState().turn.answerStarted).toBe(false);
+    store.agentEvent("delta", "HP를 ");
+    store.agentEvent("delta", "80으로 변경했습니다.");
+    expect(store.getState().turn.answer).toBe("HP를 80으로 변경했습니다.");
+    expect(store.getState().turn.answerStarted).toBe(true);
+  });
+
+  it("records tool_call events as tool rows with the tool name", () => {
+    const store = readyWithProject();
+    store.chatSent();
+    store.agentEvent("tool_call", "dat_set unit hp");
+    store.agentEvent("tool_call", "file_write main.eps");
+    const tools = store.getState().turn.tools;
+    expect(tools).toHaveLength(2);
+    expect(tools[0].name).toBe("dat_set unit hp");
+    expect(tools[1].name).toBe("file_write main.eps");
+  });
+
+  it("never pushes a raw kind identifier into the log", () => {
+    const store = readyWithProject();
+    store.chatSent();
+    for (const kind of [
+      "delta",
+      "reasoning",
+      "answer",
+      "token_usage",
+      "turn_done",
+      "item_started",
+      "item_completed",
+      "event",
+      "tool_call",
+      "tool_result",
+    ]) {
+      store.agentEvent(kind, "payload");
+    }
+    const logText = store
+      .getState()
+      .log.map((e) => `${e.kind}:${e.text}`)
+      .join("\n");
+    for (const raw of [
+      "delta",
+      "token_usage",
+      "turn_done",
+      "item_started",
+      "item_completed",
+    ]) {
+      expect(logText).not.toContain(raw);
+    }
+  });
+
+  it("resets the per-turn buffers when a new turn starts (chatSent)", () => {
+    const store = readyWithProject();
+    store.chatSent();
+    store.agentEvent("reasoning", "이전 추론");
+    store.agentEvent("delta", "이전 답변");
+    store.agentEvent("tool_call", "dat_set");
+    // a new turn (the changeset auto-accepts server-side; follow-up chat)
+    store.changesetReceived("r1", [
+      { category: "file", id: "e1", seq: 0, kind: "created", path: "a.eps" },
+    ]);
+    store.chatSent();
+    const turn = store.getState().turn;
+    expect(turn.reasoning).toBe("");
+    expect(turn.answer).toBe("");
+    expect(turn.answerStarted).toBe(false);
+    expect(turn.tools).toEqual([]);
+  });
+
+  it("resets the per-turn buffers on plan_feedback / plan_approve", () => {
+    const store = readyWithProject();
+    store.chatSent();
+    store.planReceived("# 계획", 1);
+    // plan_review: feedback starts a fresh turn
+    store.agentEvent("reasoning", "leftover");
+    store.planFeedbackSent();
+    expect(store.getState().turn.reasoning).toBe("");
+  });
+});
+
+describe("resetSent — new conversation (EUD-064/065)", () => {
+  it("clears log, plan, changeset, and the turn buffers, returning to ready", () => {
+    // No undecided changeset here, so the fresh log is empty (the discard notice
+    // — F3 — is covered separately below).
+    const store = readyWithProject();
+    store.chatSent();
+    store.log("you", "이전 메시지");
+    store.planReceived("# 계획", 1);
+    store.agentEvent("delta", "답변");
+    store.resetSent();
+    const s = store.getState();
+    expect(s.log).toEqual([]);
+    expect(s.plan).toBeNull();
+    expect(s.changeset).toBeNull();
+    expect(s.turn.answer).toBe("");
+    expect(s.turn.reasoning).toBe("");
+    expect(s.phase).toBe("ready");
+  });
+
+  // F3: resetting over an undecided changeset logs a notice (the server
+  // default-accepts the undecided items) as the FIRST entry of the fresh log.
+  it("logs a discard notice when an undecided changeset is reset away (F3)", () => {
+    const store = readyWithProject();
+    store.chatSent();
+    store.changesetReceived("r1", [
+      { category: "file", id: "e1", seq: 0, kind: "created", path: "a.eps" },
+    ]);
+    store.resetSent();
+    const log = store.getState().log;
+    expect(log).toHaveLength(1);
+    expect(log[0].kind).toBe("warn");
+    expect(log[0].text).toContain("자동 적용");
+  });
+
+  it("does NOT log a discard notice when no changeset is open (F3)", () => {
+    const store = readyWithProject();
+    store.chatSent();
+    store.resetSent();
+    expect(store.getState().log).toEqual([]);
+  });
+
+  it("does NOT log a discard notice when the changeset is fully decided (F3)", () => {
+    const store = readyWithProject();
+    store.chatSent();
+    store.changesetReceived("r1", [
+      { category: "file", id: "e1", seq: 0, kind: "created", path: "a.eps" },
+    ]);
+    // Decide the single item, then reset — nothing was left undecided. A
+    // per-item accept carries the real id back in the rollback_result reply
+    // (only bulk accept echoes an empty ids array).
+    store.decisionSent("accept", ["e1"]);
+    store.rollbackResult(["e1"], true);
+    store.resetSent();
+    expect(store.getState().log).toEqual([]);
+  });
+});
+
+// F2: prose streamed via `delta` before a non-answer turn-end (plan/changeset/
+// error) is archived as a prominent agent log entry — otherwise the live
+// AgentAnswer bubble's text vanishes at the transition. The answer{} path is
+// authoritative and does NOT double-log.
+describe("streamed-prose archival on turn-end (F2)", () => {
+  function logTexts(store: ReturnType<typeof readyWithProject>): string[] {
+    return store
+      .getState()
+      .log.filter((e) => e.kind === "agent")
+      .map((e) => e.text);
+  }
+
+  it("archives streamed prose when the turn ends with plan{}", () => {
+    const store = readyWithProject();
+    store.chatSent();
+    store.agentEvent("delta", "먼저 계획을 ");
+    store.agentEvent("delta", "세웁니다.");
+    store.planReceived("# 계획", 1);
+    expect(logTexts(store)).toContain("먼저 계획을 세웁니다.");
+    // The buffer is cleared after archiving (no re-archive on a later transition).
+    expect(store.getState().turn.answer).toBe("");
+  });
+
+  it("archives streamed prose when the turn ends with changeset{}", () => {
+    const store = readyWithProject();
+    store.chatSent();
+    store.agentEvent("delta", "변경을 적용했습니다.");
+    store.changesetReceived("r1", [
+      { category: "file", id: "e1", seq: 0, kind: "created", path: "a.eps" },
+    ]);
+    expect(logTexts(store)).toContain("변경을 적용했습니다.");
+  });
+
+  it("archives streamed prose when the turn ends with error{}", () => {
+    const store = readyWithProject();
+    store.chatSent();
+    store.agentEvent("delta", "진행 중이던 설명");
+    store.errorReceived("boom");
+    expect(logTexts(store)).toContain("진행 중이던 설명");
+  });
+
+  it("does not archive an empty/whitespace buffer", () => {
+    const store = readyWithProject();
+    store.chatSent();
+    store.agentEvent("delta", "   ");
+    store.planReceived("# 계획", 1);
+    expect(logTexts(store)).not.toContain("   ");
+  });
+
+  it("the answer{} path does NOT double-log (buffer not separately archived)", () => {
+    // answerReceived ends the turn but does NOT archive the buffer (the App layer
+    // logs the authoritative server text). Simulate the App flow: deltas stream,
+    // then answer{} arrives → answerReceived + a single agent log of the final
+    // text. The buffer must not produce a second agent entry.
+    const store = readyWithProject();
+    store.chatSent();
+    store.agentEvent("delta", "부분 답변");
+    store.answerReceived("최종 답변"); // App then logs the authoritative text
+    store.log("agent", "최종 답변");
+    const agents = logTexts(store);
+    expect(agents).toEqual(["최종 답변"]);
   });
 });
 

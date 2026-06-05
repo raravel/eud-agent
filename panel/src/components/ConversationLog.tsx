@@ -1,14 +1,24 @@
 /**
- * Conversation / event log (features/03 ## Behaviors → Conversation):
- *   instructions, progress entries (spinner on the ACTIVE stage incl.
- *   waiting_build), errors, applied confirmations — driven by the store's
- *   capped log.
+ * Conversation / event log (features/06 ## UI layout + Behaviors), rebuilt on the
+ * vendored AI Elements (Conversation + Message) + Streamdown (decision 06):
+ *   - user instructions render as Message bubbles (secondary);
+ *   - agent answers render as PROMINENT (foreground) Message/Response bubbles via
+ *     Streamdown — the most visible text in the log (answer prominence inverts the
+ *     original v2 styling);
+ *   - system/progress/info/ok/warn/error rows stay muted simple rows; the LATEST
+ *     progress entry spins while the panel is busy (incl. waiting_build).
  *
- * DEP PRUNING (carry-forward): log entries are composed as plain styled rows —
- * NO streamdown / shiki markdown pipeline (which the vendored ai-elements
- * message.tsx would drag in via @streamdown/*). The Spinner primitive is the
- * only shared dependency.
+ * The Conversation container provides auto-scroll-to-bottom (use-stick-to-bottom)
+ * so streamed answers keep the latest content in view. The store caps the log at
+ * 500 entries.
  */
+import {
+  Conversation,
+  ConversationContent,
+  ConversationScrollButton,
+} from "@/components/ai-elements/conversation";
+import { Message, MessageContent } from "@/components/ai-elements/message";
+import { Response } from "@/components/ai-elements/response";
 import { Spinner } from "@/components/ui/spinner";
 import { cn } from "@/lib/utils";
 import type { LogEntry, LogKind, Phase } from "@/state/store";
@@ -26,11 +36,9 @@ const BUSY_PHASES: ReadonlySet<Phase> = new Set<Phase>([
   "plan_review",
 ]);
 
-/** Per-kind text styling for a log row. */
-const KIND_CLASS: Record<LogKind, string> = {
+/** Per-kind text styling for a muted (non-bubble) log row. */
+const MUTED_KIND_CLASS: Record<Exclude<LogKind, "you" | "agent">, string> = {
   info: "text-muted-foreground",
-  you: "ml-auto rounded-lg bg-secondary px-3 py-2 text-foreground",
-  agent: "text-muted-foreground",
   progress: "text-muted-foreground",
   ok: "text-emerald-400",
   warn: "text-amber-400",
@@ -50,25 +58,46 @@ export function ConversationLog({ log, phase }: ConversationLogProps) {
   }
 
   return (
-    <div className="flex flex-1 flex-col gap-2 overflow-y-auto p-4" role="log">
-      {log.map((entry) => {
-        const isActive = entry.id === activeProgressId;
-        const testId = entry.stage ? `log-entry-${entry.stage}` : undefined;
-        return (
-          <div
-            key={entry.id}
-            data-testid={testId}
-            className={cn(
-              "flex w-fit max-w-[95%] items-center gap-2 text-sm",
-              entry.kind === "you" && "self-end",
-              KIND_CLASS[entry.kind],
-            )}
-          >
-            {isActive && <Spinner className="size-3.5 shrink-0" />}
-            <span className="whitespace-pre-wrap break-words">{entry.text}</span>
-          </div>
-        );
-      })}
-    </div>
+    <Conversation className="flex-1">
+      <ConversationContent className="gap-2 p-4">
+        {log.map((entry) => {
+          // Agent answers — PROMINENT foreground Message/Response (Streamdown).
+          if (entry.kind === "agent") {
+            return (
+              <Message key={entry.id} from="assistant" className="text-foreground">
+                <MessageContent>
+                  <Response>{entry.text}</Response>
+                </MessageContent>
+              </Message>
+            );
+          }
+          // User instructions — secondary Message bubble.
+          if (entry.kind === "you") {
+            return (
+              <Message key={entry.id} from="user">
+                <MessageContent>{entry.text}</MessageContent>
+              </Message>
+            );
+          }
+          // System / progress / info rows — muted simple rows.
+          const isActive = entry.id === activeProgressId;
+          const testId = entry.stage ? `log-entry-${entry.stage}` : undefined;
+          return (
+            <div
+              key={entry.id}
+              data-testid={testId}
+              className={cn(
+                "flex w-fit max-w-[95%] items-center gap-2 text-sm",
+                MUTED_KIND_CLASS[entry.kind],
+              )}
+            >
+              {isActive && <Spinner className="size-3.5 shrink-0" />}
+              <span className="whitespace-pre-wrap break-words">{entry.text}</span>
+            </div>
+          );
+        })}
+      </ConversationContent>
+      <ConversationScrollButton />
+    </Conversation>
   );
 }

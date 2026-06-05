@@ -87,8 +87,20 @@ export interface ChangesetItem {
 
 // ---- server → client messages -----------------------------------------
 /**
- * `agent_event {kind, detail}` — streamed turn activity
- * (thinking/tool_call/tool_result/turn_done/…). `detail` is a short string.
+ * `agent_event {kind, detail}` — streamed turn activity. `detail` is a short
+ * string. Known kinds (EUD-063 / features/05 "WS protocol v2"):
+ *   - `thinking` — generic activity (no user-facing text);
+ *   - `reasoning` — a reasoning-text DELTA in `detail`
+ *     (`item/reasoning/summaryTextDelta` + `item/reasoning/textDelta`); the panel
+ *     accumulates it into the dim/collapsible Reasoning surface;
+ *   - `delta` — an answer-text DELTA in `detail`; the panel accumulates it into
+ *     the prominent Streamdown Message/Response;
+ *   - `tool_call` / `tool_result` — a tool call by name → Tool rows;
+ *   - `token_usage` / `turn_done` / `item_started` / `item_completed` / `event` —
+ *     internal bookkeeping; the panel surfaces NONE of these raw kind strings as
+ *     literal UI text (no-raw-kind-leak contract, decision 06).
+ * `kind` is an OPEN string (the server may emit other kinds) — the panel routes
+ * the known ones and swallows the rest.
  */
 export interface AgentEventMessage {
   type: "agent_event";
@@ -210,6 +222,15 @@ export interface CancelMessage {
   type: "cancel";
 }
 
+/**
+ * `reset {}` — new conversation ([새 대화]). The server drops the retained codex
+ * thread so the next `chat` starts a fresh conversation (features/05 EUD-064);
+ * the panel clears its log / plan / changeset / per-turn buffers.
+ */
+export interface ResetMessage {
+  type: "reset";
+}
+
 /** `status {}` — request editor state. */
 export interface StatusRequest {
   type: "status";
@@ -227,6 +248,7 @@ export type ClientMessage =
   | PlanApproveMessage
   | ChangesetDecisionMessage
   | CancelMessage
+  | ResetMessage
   | StatusRequest
   | ListRequest;
 
@@ -237,6 +259,7 @@ export const CLIENT_MESSAGE_TYPES = [
   "plan_approve",
   "changeset_decision",
   "cancel",
+  "reset",
   "status",
   "list",
 ] as const;

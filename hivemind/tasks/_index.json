@@ -1101,7 +1101,7 @@
       ]
     },
     "EUD-065-3247": {
-      "status": "pending",
+      "status": "done",
       "priority": "high",
       "type": "task",
       "parent": "EUD-047-fd09",
@@ -1111,8 +1111,8 @@
       ],
       "title": "Panel chat surface on AI Elements + Streamdown (Message/PromptInput/Plan/Reasoning/Tool, reset button)",
       "updated": "2026-06-05",
-      "completed_at": null,
-      "path": "active/EUD-065-3247.md",
+      "completed_at": "2026-06-05T18:00:13.331602",
+      "path": "done/EUD-065-3247.md",
       "scope": [
         "panel/src",
         "panel/components",

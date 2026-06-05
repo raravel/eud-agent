@@ -16,7 +16,9 @@
  *
  * Diff/preview limits reuse lib/truncate (1 MiB UTF-16-consistent). Korean labels.
  */
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Card, CardContent } from "@/components/ui/card";
 import { cn } from "@/lib/utils";
 import { classifyDiff } from "@/lib/diff";
 import { truncateForDisplay } from "@/lib/truncate";
@@ -192,19 +194,21 @@ export function ChangesetView({ changeset, pending, onDecide }: ChangesetViewPro
         // id, so itemKey falls back to the joined property ids (NEVER undefined).
         const key = itemKey(item);
         return (
-          <div
+          <Card
             key={key}
             data-testid={`cs-item-${key}`}
-            className="flex flex-col gap-2 rounded-lg border border-border p-2"
+            className="gap-2 py-2 shadow-none"
           >
-            <ItemBody item={item} />
-            <div className="flex items-center justify-end gap-2">
+            <CardContent className="flex flex-col gap-2 px-3">
+              <ItemBody item={item} />
+              <div className="flex items-center justify-end gap-2">
               {decided ? (
-                <span
+                <Badge
+                  variant="outline"
                   className={cn("text-xs font-medium", STATE_BADGE[state].tone)}
                 >
                   {STATE_BADGE[state].label}
-                </span>
+                </Badge>
               ) : (
                 <>
                   <Button
@@ -229,8 +233,9 @@ export function ChangesetView({ changeset, pending, onDecide }: ChangesetViewPro
                   </Button>
                 </>
               )}
-            </div>
-          </div>
+              </div>
+            </CardContent>
+          </Card>
         );
       })}
 

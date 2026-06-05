@@ -1,83 +1,147 @@
 /**
- * Agent activity stream (features/06 ## Behaviors → Agent stream): a live
- * activity line rendered under the latest user message from the turn's
- * `agent_event`s — "도구 호출 n건 · 현재: <last tool/detail>". When the turn ends
- * (the store phase leaves `thinking`) it collapses into a summary row.
+ * Agent activity stream (features/06 ## Behaviors → Agent stream), rebuilt on
+ * the vendored AI Elements (Reasoning + Tool) + Streamdown (decision 06):
+ *   - `reasoning` text renders into the AI-Elements Reasoning block: dim,
+ *     collapsible, auto-open while reasoning streams, collapses once the answer
+ *     starts;
+ *   - `tool_call`/`tool_result` render as Tool rows by tool name, with a
+ *     "도구 호출 n건" summary;
+ *   - raw internal kind identifiers (delta/answer/token_usage/turn_done/…) MUST
+ *     NEVER appear as literal UI text.
  *
  * Contract (Step B implements `@/components/AgentStream`):
- *   export interface AgentActivity { kind: string; detail: string; }
+ *   export interface AgentTool { id: string; name: string; state: "running" | "done"; detail?: string; }
  *   export interface AgentStreamProps {
- *     events: AgentActivity[];   // the current turn's agent_event stream
- *     live: boolean;             // true while phase === "thinking"
+ *     reasoning: string;       // accumulated reasoning delta text
+ *     answerStarted: boolean;  // true once answer delta text has begun
+ *     tools: AgentTool[];      // tool_call/tool_result rows
+ *     live: boolean;           // true while the turn is in flight
  *   }
  *   export function AgentStream(props): JSX.Element | null;
- *
- * "도구 호출" counts tool-call events (kind "tool_call"); the "현재" detail is the
- * latest event's detail (or kind when detail is empty). With zero events the
- * component renders nothing (null).
  */
 import { describe, it, expect } from "vitest";
 import { render, screen } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { AgentStream } from "@/components/AgentStream";
 
-describe("AgentStream — live line", () => {
-  it("renders nothing when there are no events", () => {
-    const { container } = render(<AgentStream events={[]} live={true} />);
+describe("AgentStream — reasoning surface", () => {
+  it("renders nothing with no reasoning and no tools", () => {
+    const { container } = render(
+      <AgentStream reasoning="" answerStarted={false} tools={[]} live={true} />,
+    );
     expect(container.firstChild).toBeNull();
   });
 
-  it("shows the tool-call count and the current (latest) detail while live", () => {
+  it("renders accumulated reasoning text (dim/collapsible Reasoning block)", () => {
     render(
       <AgentStream
+        reasoning="유닛 속성을 먼저 확인합니다."
+        answerStarted={false}
+        tools={[]}
         live={true}
-        events={[
-          { kind: "tool_call", detail: "dat_set unit hp" },
-          { kind: "tool_call", detail: "file_write main.eps" },
-        ]}
       />,
     );
-    expect(screen.getByText(/도구 호출 2건/)).toBeInTheDocument();
-    expect(screen.getByText(/file_write main\.eps/)).toBeInTheDocument();
+    expect(
+      screen.getByText(/유닛 속성을 먼저 확인합니다\./),
+    ).toBeInTheDocument();
   });
 
-  it("counts only tool_call kinds toward 도구 호출 n건", () => {
+  it("auto-opens the reasoning block while streaming (content visible)", () => {
     render(
       <AgentStream
+        reasoning="추론 중 텍스트"
+        answerStarted={false}
+        tools={[]}
         live={true}
-        events={[
-          { kind: "thinking", detail: "" },
-          { kind: "tool_call", detail: "dat_set unit hp" },
-          { kind: "tool_result", detail: "ok" },
-        ]}
       />,
     );
-    expect(screen.getByText(/도구 호출 1건/)).toBeInTheDocument();
+    expect(screen.getByText(/추론 중 텍스트/)).toBeInTheDocument();
   });
 
-  it("shows a spinner while live", () => {
+  it("collapses the reasoning block once the answer starts", () => {
     render(
       <AgentStream
+        reasoning="감춰질 추론"
+        answerStarted={true}
+        tools={[]}
         live={true}
-        events={[{ kind: "tool_call", detail: "dat_set unit hp" }]}
       />,
     );
-    expect(screen.getByRole("status")).toBeInTheDocument();
+    // Radix Collapsible removes content from the tree when closed (no
+    // forceMount), so the collapsed reasoning text is absent from the DOM.
+    expect(screen.queryByText("감춰질 추론")).not.toBeInTheDocument();
+  });
+
+  it("lets the user re-expand the collapsed reasoning after the answer starts (F1)", async () => {
+    const user = userEvent.setup();
+    render(
+      <AgentStream
+        reasoning="다시 펼칠 추론"
+        answerStarted={true}
+        tools={[]}
+        live={true}
+      />,
+    );
+    // Auto-collapsed because the answer started — content is hidden.
+    expect(screen.queryByText("다시 펼칠 추론")).not.toBeInTheDocument();
+    // The collapsible trigger stays clickable; clicking it re-expands the block.
+    await user.click(screen.getByRole("button"));
+    expect(screen.getByText(/다시 펼칠 추론/)).toBeInTheDocument();
   });
 });
 
-describe("AgentStream — collapsed summary", () => {
-  it("collapses into a summary row (no spinner) once the turn ends", () => {
+describe("AgentStream — tool rows", () => {
+  it("renders a Tool row per tool with the tool name", () => {
     render(
       <AgentStream
-        live={false}
-        events={[
-          { kind: "tool_call", detail: "dat_set unit hp" },
-          { kind: "tool_call", detail: "file_write main.eps" },
+        reasoning=""
+        answerStarted={false}
+        live={true}
+        tools={[
+          { id: "t1", name: "dat_set unit hp", state: "done" },
+          { id: "t2", name: "file_write main.eps", state: "running" },
         ]}
       />,
     );
-    // Summary still reports the count, but no live spinner.
+    expect(screen.getByText(/dat_set unit hp/)).toBeInTheDocument();
+    expect(screen.getByText(/file_write main\.eps/)).toBeInTheDocument();
+  });
+
+  it("keeps a 도구 호출 n건 summary", () => {
+    render(
+      <AgentStream
+        reasoning=""
+        answerStarted={false}
+        live={true}
+        tools={[
+          { id: "t1", name: "dat_set", state: "done" },
+          { id: "t2", name: "file_write", state: "done" },
+        ]}
+      />,
+    );
     expect(screen.getByText(/도구 호출 2건/)).toBeInTheDocument();
-    expect(screen.queryByRole("status")).not.toBeInTheDocument();
+  });
+});
+
+describe("AgentStream — no raw kind leak", () => {
+  it("never surfaces raw internal kind identifiers as literal text", () => {
+    const { container } = render(
+      <AgentStream
+        reasoning="정상 추론 텍스트"
+        answerStarted={false}
+        live={true}
+        tools={[{ id: "t1", name: "dat_set", state: "running" }]}
+      />,
+    );
+    const text = container.textContent ?? "";
+    for (const raw of [
+      "delta",
+      "token_usage",
+      "turn_done",
+      "item_started",
+      "item_completed",
+    ]) {
+      expect(text).not.toContain(raw);
+    }
   });
 });

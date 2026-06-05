@@ -1,19 +1,29 @@
 /**
- * Instruction box (v2 — features/06 ## Behaviors → Send gating):
- *   chat {text}; Send disabled while busy (a turn in flight / plan awaiting a
- *   decision / editor compiling) and when the store gates it off (no project).
- *   The settable-target requirement is GONE — the agent chooses files/targets
- *   itself, so there is no picker selection and no useContext toggle (the server
- *   builds RAG context for every turn). Gate purely on the store's `canSend`.
+ * Instruction box (v2 — features/06 ## Behaviors → Send gating + New conversation),
+ * rebuilt on the vendored AI-Elements PromptInput (decision 06 — replaces the bare
+ * Textarea + Button):
+ *   - `chat {text}`; Send is disabled while busy (a turn in flight / plan awaiting
+ *     a decision / editor compiling) and when the store gates it off (no project).
+ *     Gating is purely the store's `canSend` (connected && hasProject && !busy) —
+ *     the settable-target requirement is GONE (the agent chooses files/targets).
+ *   - a [새 대화] control sends `reset{}` (App fires the WS message + store action)
+ *     and is disabled while a turn is in flight (phase === "thinking").
  *
- * Composed from plain primitives (Textarea + Button) — NOT the vendored
- * PromptInput, which pulls cmdk/ai/dropdown/hovercard the panel does not need
- * (dep-pruning carry-forward).
+ * The textarea keeps the accessible name "지시 입력"; the send button "전송"; the
+ * reset button "새 대화". Enter (without Shift / IME composition) submits via the
+ * PromptInput form when the submit button is enabled.
  */
 import { useState } from "react";
-import { SendIcon } from "lucide-react";
-import { Button } from "@/components/ui/button";
-import { Textarea } from "@/components/ui/textarea";
+import { RotateCcwIcon, SendIcon } from "lucide-react";
+import {
+  PromptInput,
+  PromptInputBody,
+  PromptInputFooter,
+  PromptInputSubmit,
+  PromptInputTextarea,
+  PromptInputTools,
+} from "@/components/ai-elements/prompt-input";
+import { PromptInputButton } from "@/components/ai-elements/prompt-input";
 import type { PanelState } from "@/state/store";
 
 export interface ChatPayload {
@@ -23,15 +33,18 @@ export interface ChatPayload {
 export interface InstructionBoxProps {
   state: PanelState;
   onSend(msg: ChatPayload): void;
+  /** Send `reset{}` (new conversation). Optional — App wires it. */
+  onReset?(): void;
 }
 
-export function InstructionBox({ state, onSend }: InstructionBoxProps) {
+export function InstructionBox({ state, onSend, onReset }: InstructionBoxProps) {
   const [instruction, setInstruction] = useState("");
 
   // Send gating v2: the store's single `canSend` selector (connected &&
-  // hasProject && !busy). Empty text is guarded at send time (a no-op), not by
-  // disabling the control.
+  // hasProject && !busy). Empty text is guarded at send time (a no-op).
   const canSend = state.canSend;
+  // A turn is in flight while thinking — reset is disabled then.
+  const turnInFlight = state.phase === "thinking";
 
   function handleSend() {
     const text = instruction.trim();
@@ -41,31 +54,34 @@ export function InstructionBox({ state, onSend }: InstructionBoxProps) {
   }
 
   return (
-    <div className="flex flex-col gap-2 border-t border-border p-3">
-      <Textarea
-        aria-label="지시 입력"
-        value={instruction}
-        onChange={(e) => setInstruction(e.target.value)}
-        placeholder="무엇을 만들까요? (예: 게임 시작 시 미네랄 +1000 트리거 추가)"
-        className="max-h-40 min-h-16 resize-none"
-        onKeyDown={(e) => {
-          if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
-            e.preventDefault();
-            handleSend();
-          }
-        }}
-      />
-      <div className="flex items-center justify-end">
-        <Button
-          type="button"
-          onClick={handleSend}
-          disabled={!canSend}
-          aria-label="전송"
-        >
-          <SendIcon className="size-4" />
-          전송
-        </Button>
-      </div>
+    <div className="border-t border-border p-3">
+      <PromptInput onSubmit={handleSend}>
+        <PromptInputBody>
+          <PromptInputTextarea
+            aria-label="지시 입력"
+            value={instruction}
+            onChange={(e) => setInstruction(e.target.value)}
+            placeholder="무엇을 만들까요? (예: 게임 시작 시 미네랄 +1000 트리거 추가)"
+          />
+          <PromptInputFooter>
+            <PromptInputTools>
+              <PromptInputButton
+                type="button"
+                aria-label="새 대화"
+                disabled={turnInFlight || onReset === undefined}
+                onClick={() => onReset?.()}
+              >
+                <RotateCcwIcon className="size-4" />
+                새 대화
+              </PromptInputButton>
+            </PromptInputTools>
+            <PromptInputSubmit aria-label="전송" disabled={!canSend}>
+              <SendIcon className="size-4" />
+              전송
+            </PromptInputSubmit>
+          </PromptInputFooter>
+        </PromptInputBody>
+      </PromptInput>
     </div>
   );
 }

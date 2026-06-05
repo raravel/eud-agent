@@ -83,6 +83,9 @@ REQUIRED_NPM_DEPS = (
     "tailwindcss",
     "monaco-editor",
     "@monaco-editor/react",
+    # Decision 06: agent-authored markdown renders via Streamdown (npm-bundled,
+    # never a runtime CDN). EUD-065 adopts it for the chat surface.
+    "streamdown",
 )
 
 # npm scripts the scaffold must expose.
@@ -200,22 +203,38 @@ def test_src_dir_present():
     assert SRC_DIR.is_dir(), f"panel/src/ missing (React app sources): {SRC_DIR}"
 
 
-def test_ai_elements_dir_absent():
-    """ai-elements vendoring was dropped; the directory must be GONE.
+def test_ai_elements_vendored_present():
+    """AI Elements vendored as SOURCE (decision 06, EUD-065).
 
-    History: EUD-031 vendored Vercel AI Elements as source. EUD-034's
-    sanctioned dependency prune left only ``conversation.tsx`` standing, and
-    runtime parity verification showed NO ai-elements component is used — the
-    panel renders the chat with custom lightweight components (ConversationLog)
-    plus shadcn/ui primitives. EUD-035 therefore deletes the lone dead file and
-    the now-empty ``panel/components/ai-elements/`` directory, and drops the
-    ``ai`` + ``use-stick-to-bottom`` deps it alone kept alive. This asserts the
-    directory stays gone (a regression guard against half-resurrection).
+    History: EUD-031 vendored Vercel AI Elements; EUD-035 dropped them in the
+    dep-pruning carry-forward. Decision 06 (2026-06-05) SUPERSEDES that prune —
+    the panel chat surface is rebuilt on vendored AI Elements + Streamdown to
+    fix the three rendering defects (reasoning invisible / answer faint / raw
+    kind leak). The mandatory components (Message, PromptInput, Plan, Reasoning)
+    plus the adopted set (Conversation, Response, Tool, Loader) are vendored as
+    SOURCE under ``panel/components/ai-elements/`` and committed (never a runtime
+    CDN). This asserts the vendored mandatory + adopted source files exist.
     """
-    assert not AI_ELEMENTS_DIR.exists(), (
-        f"panel/components/ai-elements/ must be ABSENT (vendoring dropped at "
-        f"EUD-035; the panel uses custom components + shadcn/ui only): "
-        f"{AI_ELEMENTS_DIR}"
+    assert AI_ELEMENTS_DIR.is_dir(), (
+        f"panel/components/ai-elements/ must be PRESENT (vendored AI Elements "
+        f"source, decision 06): {AI_ELEMENTS_DIR}"
+    )
+    required = (
+        "message.tsx",
+        "prompt-input.tsx",
+        "plan.tsx",
+        "reasoning.tsx",
+        "conversation.tsx",
+        "response.tsx",
+        "tool.tsx",
+        "loader.tsx",
+    )
+    missing = [
+        name for name in required if not (AI_ELEMENTS_DIR / name).is_file()
+    ]
+    assert not missing, (
+        f"vendored AI Elements source missing (decision 06 mandatory + adopted "
+        f"set): {missing}"
     )
 
 
@@ -350,7 +369,26 @@ def test_v2_components_present():
     )
 
 
-# --- 6. built dist (skip-aware): no external origins in dist/index.html ----
+# --- 6. built dist (skip-aware): no external origins in dist ----
+
+# Forbidden CDN host patterns scanned in the built JS chunks (F4). Matched on the
+# HOSTNAME only (not bare words) so benign substrings — W3C namespace URIs in SVG,
+# example.com placeholders, repository/homepage strings — do not false-positive.
+# Streamdown bundles shiki/mermaid/CJK/math locally; if a future dep regressed to
+# fetching a grammar/theme/font from one of these hosts at runtime, this catches it.
+FORBIDDEN_CDN_HOST_RE = re.compile(
+    r"https?://[A-Za-z0-9.-]*\b("
+    r"cdn\.jsdelivr\.net|"
+    r"unpkg\.com|"
+    r"esm\.sh|"
+    r"cdnjs\.cloudflare\.com|"
+    r"fonts\.googleapis\.com|"
+    r"fonts\.gstatic\.com|"
+    r"esm\.run|"
+    r"skypack\.dev"
+    r")",
+    re.IGNORECASE,
+)
 
 
 def test_dist_index_has_no_external_origins():
@@ -374,6 +412,37 @@ def test_dist_index_has_no_external_origins():
     assert not external, (
         f"built panel/dist/index.html references external origins "
         f"(CDN forbidden, incl. Monaco workers): {external}"
+    )
+
+
+def test_dist_assets_js_has_no_cdn_hosts():
+    """The BUILT dist/assets/*.js must not reference any forbidden CDN host (F4).
+
+    The index.html scan above only covers the entry HTML. Streamdown pulls in
+    shiki/mermaid/CJK/math; this guards against a transitive dep fetching a
+    grammar/theme/font from a CDN at runtime (rules.md: no runtime CDN — every
+    asset npm-bundled). Matches on the CDN HOSTNAME only so benign URLs (W3C SVG
+    namespaces, example.com, package homepage strings) do not false-positive.
+
+    Skips with a note when panel/dist/ has not been built yet.
+    """
+    assets_dir = DIST_DIR / "assets"
+    if not assets_dir.is_dir():
+        _skip(
+            "panel/dist/assets/ absent (not built yet); dist is gitignored and "
+            "built locally with `npm --prefix panel run build`."
+        )
+        return  # standalone path falls through after _Skipped is raised
+    js_files = sorted(assets_dir.rglob("*.js"))
+    assert js_files, "panel/dist/assets/ contains no .js chunks (build incomplete)"
+    offenders: list[str] = []
+    for js in js_files:
+        text = js.read_text(encoding="utf-8", errors="ignore")
+        for m in FORBIDDEN_CDN_HOST_RE.finditer(text):
+            offenders.append(f"{js.name}: {m.group(0)}")
+    assert not offenders, (
+        f"built panel/dist/assets/*.js reference forbidden CDN hosts "
+        f"(runtime CDN forbidden — all assets must be npm-bundled): {offenders}"
     )
 
 
