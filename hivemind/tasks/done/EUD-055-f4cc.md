@@ -1,4 +1,5 @@
 ---
+completed_at: '2026-06-05T14:31:05.081672'
 created: '2026-06-05'
 depends_on:
 - EUD-054-8c97
@@ -9,7 +10,7 @@ scope:
 - server/eud_agent/journal.py
 - server/eud_agent/tools.py
 - server/tests/test_journal.py
-status: pending
+status: done
 title: Change journal + rollback engine
 type: task
 updated: '2026-06-05'

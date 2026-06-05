@@ -29,8 +29,11 @@ What this module owns:
     (tracked on the request state; the loop itself is a later task). The budget is
     queryable (``RequestState.budget_snapshot``) for panel display.
 
-Journaling (snapshots / rollback) is a LATER task (EUD-055): write tools route to
-the bridge and increment the mutation counter here, no snapshotting yet.
+Journaling (snapshots / rollback, EUD-055) is wired in additively: ``ToolLayer``
+takes an optional ``journal_factory``; when present, each WRITE tool snapshots
+BEFORE mutating (after the gate/budget/validation pass) and records ``after``
+AFTER the bridge write. A ToolLayer built without a factory behaves exactly as
+before (reads/flow never journal). See ``journal.py``.
 """
 
 from __future__ import annotations
@@ -745,6 +748,23 @@ FLOW_TOOLS: tuple[str, ...] = tuple(
 # --------------------------------------------------------------------------- #
 
 
+class _ProbeBridge:
+    """A no-op bridge stand-in used ONLY for arg validation (``_validate_args``).
+
+    Every attribute resolves to a callable that ignores its arguments and returns
+    a benign reply string, so a handler's bridge call is absorbed while its
+    BEFORE-the-bridge argument checks (which raise ToolError) still run. It is
+    never used for a real mutation — the actual write goes through ``_dispatch``
+    against the real bridge after a successful validation + snapshot.
+    """
+
+    def __getattr__(self, _name):
+        def _noop(*_a, **_kw):
+            return "OK"
+
+        return _noop
+
+
 class ToolLayer:
     """Validates + gates + budgets + routes tool calls to the bridge.
 
@@ -754,10 +774,22 @@ class ToolLayer:
     agent request and queryable for the panel.
     """
 
-    def __init__(self, bridge, *, gate: MutationGate | None = None) -> None:
+    def __init__(
+        self,
+        bridge,
+        *,
+        gate: MutationGate | None = None,
+        journal_factory: Callable[[str], Any] | None = None,
+    ) -> None:
         self._bridge = bridge
         self._gate = gate or MutationGate()
         self._requests: dict[str, RequestState] = {}
+        # Optional/injectable journal (EUD-055). When present, each WRITE tool
+        # snapshots BEFORE mutating and records ``after`` AFTER; reads/flow never
+        # journal. A ToolLayer built WITHOUT a factory behaves exactly as before
+        # (additive integration; existing constructions keep working).
+        self._journal_factory = journal_factory
+        self._journals: dict[str, Any] = {}
 
     # ---- registry introspection (used by the shim/endpoint) ----
     def has_tool(self, name: str) -> bool:
@@ -788,18 +820,51 @@ class ToolLayer:
     def budget_snapshot(self, request_id: str) -> dict[str, int]:
         return self.get_request_state(request_id).budget_snapshot()
 
+    # ---- journal registry (optional; EUD-055) ----
+    def get_journal(self, request_id: str):
+        """The journal for ``request_id`` (creating it lazily from the factory).
+
+        Returns ``None`` when no ``journal_factory`` was injected (the additive
+        no-journal mode — existing ToolLayer constructions keep working).
+        """
+        if self._journal_factory is None:
+            return None
+        j = self._journals.get(request_id)
+        if j is None:
+            j = self._journal_factory(request_id)
+            self._journals[request_id] = j
+        return j
+
     # ---- the call paths ----
     def call_for_request(self, request_id: str, name: str, args: dict) -> Any:
-        return self.call(name, args, self.get_request_state(request_id))
+        return self.call(
+            name,
+            args,
+            self.get_request_state(request_id),
+            journal=self.get_journal(request_id),
+        )
 
-    def call(self, name: str, args: dict | None, state: RequestState) -> Any:
+    def call(
+        self,
+        name: str,
+        args: dict | None,
+        state: RequestState,
+        *,
+        journal: Any | None = None,
+    ) -> Any:
         """Run one tool call under the gate + budget for ``state``.
 
-        Order (features/05): unknown-tool -> budget -> mutation gate -> validate +
-        bridge. A rejection (unknown tool, bad args, gate, budget) raises a
-        ToolError subtype and does NOT consume the action budget or the mutation
-        counter (codex corrects and retries; a burnt slot would strand the
+        Order (features/05): unknown-tool -> budget -> mutation gate -> validate ->
+        [journal snapshot] -> bridge write -> [journal record]. A rejection
+        (unknown tool, bad args, gate, budget) raises a ToolError subtype and does
+        NOT consume the action budget or the mutation counter, NOR leave a journal
+        entry (codex corrects and retries; a burnt slot/half-entry would strand the
         request). Only a call that actually reaches the bridge counts.
+
+        ``journal`` (optional) is the per-request change journal: for a WRITE tool
+        the snapshot happens AFTER the gate/budget/validation pass but BEFORE the
+        bridge write; the entry is recorded AFTER the write returns successfully.
+        Reads and the flow tool never journal.
         """
         args = args or {}
         spec = _REGISTRY.get(name)
@@ -827,6 +892,32 @@ class ToolLayer:
                 "before continuing."
             )
 
+        # Journaled write path: validate args FIRST (no bridge touch), then
+        # snapshot BEFORE the mutation, then write, then record AFTER. A
+        # validation failure here means nothing was sent AND no snapshot GET was
+        # issued (the snapshot is gated behind a successful arg validation). The
+        # snapshot itself may raise BridgeError (e.g. the pre-write GET fails on an
+        # existing file): we translate it to ToolError (one error family) and the
+        # write is NOT performed and NO entry is recorded — snapshot-before-mutate
+        # is a hard guarantee (a corrupting rollback from an empty snapshot is
+        # worse than a retriable failure). ``snapshot`` returning None marks a tool
+        # the journal SKIPS (build_run): write + count, but record no entry.
+        if spec.mutating and journal is not None:
+            self._validate_args(spec, args)  # ToolError -> nothing sent/recorded
+            try:
+                before = journal.snapshot(spec.name, args)
+            except BridgeError as exc:
+                raise ToolError(str(exc)) from exc
+            result = self._dispatch(spec, args)
+            if before is not None:
+                journal.record(
+                    spec.name, args, before,
+                    journal.compute_after(spec.name, args, result),
+                )
+            state.action_count += 1
+            state.mutation_count += 1
+            return result
+
         # Validate + route. Validation (inside the handler) runs BEFORE the bridge
         # call; a ToolError here means nothing was sent and nothing is counted.
         result = self._dispatch(spec, args)
@@ -842,6 +933,23 @@ class ToolLayer:
         if spec.mutating:
             state.mutation_count += 1
         return result
+
+    def _validate_args(self, spec: ToolSpec, args: dict) -> None:
+        """Run the handler's arg validation WITHOUT touching the real bridge.
+
+        Dispatches the handler against a probe bridge whose methods are no-ops
+        returning a benign string: the handler runs its argument checks (which
+        raise ToolError BEFORE any bridge call in the real path) and the probe
+        absorbs the would-be bridge call. This lets the journal snapshot run only
+        AFTER args are known valid, so an arg-invalid write issues no snapshot GET
+        and leaves no entry (rules.md: a rejection strands nothing).
+        """
+        try:
+            spec.handler(_ProbeBridge(), args)
+        except ToolError:
+            raise
+        except BridgeError as exc:
+            raise ToolError(str(exc)) from exc
 
     def _dispatch(self, spec: ToolSpec, args: dict) -> Any:
         """Run the handler, translating a bridge round-trip BridgeError -> ToolError.

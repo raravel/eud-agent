@@ -878,7 +878,7 @@
       ]
     },
     "EUD-055-f4cc": {
-      "status": "pending",
+      "status": "done",
       "priority": "high",
       "type": "task",
       "parent": "EUD-045-38f9",
@@ -887,8 +887,8 @@
       ],
       "title": "Change journal + rollback engine",
       "updated": "2026-06-05",
-      "completed_at": null,
-      "path": "active/EUD-055-f4cc.md",
+      "completed_at": "2026-06-05T14:31:05.081672",
+      "path": "done/EUD-055-f4cc.md",
       "scope": [
         "server/eud_agent/journal.py",
         "server/eud_agent/tools.py",
