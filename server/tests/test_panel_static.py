@@ -352,7 +352,9 @@ def test_v1_target_picker_apply_bar_absent():
     the agent chooses files/targets itself, so there is no picker and no manual
     apply bar. EUD-058 removed them; this guards against resurrection.
     """
-    present = [str(p.relative_to(REPO_ROOT)) for p in V2_ABSENT_COMPONENTS if p.exists()]
+    present = [
+        str(p.relative_to(REPO_ROOT)) for p in V2_ABSENT_COMPONENTS if p.exists()
+    ]
     assert not present, (
         f"v1 panel components must be ABSENT (panel v2 full replacement, "
         f"features/06): {present}"

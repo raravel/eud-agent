@@ -625,6 +625,42 @@ def test_isolation_config_overrides_replace_mcp_table_and_disable_plugins(tmp_pa
     )
 
 
+def test_reasoning_visibility_overrides_present(tmp_path):
+    """EUD-067: the launch-level overrides MUST force reasoning summaries on.
+
+    codex requests ``reasoning.summary`` from the API only when the MODEL-FAMILY
+    metadata says summaries are supported; gpt-5.5's family ships with it OFF, so
+    without ``model_supports_reasoning_summaries=true`` the panel NEVER receives
+    ``item/reasoning/summaryTextDelta`` (probed live 2026-06-05: forcing the flag
+    produced 79 summaryTextDelta notifications; without it, zero)."""
+    runner = _make_runner(tmp_path)
+    parsed = _overrides_dict(runner._codex_config().config_overrides)
+    assert parsed.get("model_supports_reasoning_summaries") is True, (
+        f"model_supports_reasoning_summaries=true missing; got {parsed.keys()}"
+    )
+    assert parsed.get("model_reasoning_summary") == "detailed", (
+        f"model_reasoning_summary must be 'detailed'; got {parsed!r}"
+    )
+
+
+def test_thread_start_kwargs_disable_guardian_reviewer(tmp_path):
+    """EUD-067: thread_start must pass ApprovalMode.deny_all.
+
+    The SDK default (``auto_review``) spawns a HIDDEN guardian reviewer thread
+    that runs a full model review turn per MCP tool call (21 review turns in the
+    live E2E) — 10-25s silent gaps between tool calls and ~2x token burn. The
+    eud-agent server is already the policy layer (validation/journal/gate), so
+    the guardian is redundant: deny_all = never ask, no reviewer."""
+    from openai_codex import ApprovalMode
+
+    runner = _make_runner(tmp_path)
+    kwargs = runner._thread_start_kwargs("req-x", "system prompt here")
+    assert kwargs.get("approval_mode") is ApprovalMode.deny_all
+    # The existing composition must be preserved alongside.
+    assert kwargs["base_instructions"] == "system prompt here"
+    assert "eud-tools" in kwargs["config"]["mcp_servers"]
+
+
 def test_isolation_no_ignore_user_config_launch_arg(tmp_path):
     """app-server does NOT accept --ignore-user-config (probed live: exec-only).
 
@@ -1248,3 +1284,100 @@ def test_classify_existing_kinds_unchanged_regression():
         "something/weird",
         {},
     )
+
+
+# --------------------------------------------------------------------------- #
+# EUD-068: _classify_event surfaces tool-call ARGUMENTS + RESULT/STATUS.
+#
+# The pinned SDK delivers McpToolCallThreadItem with ``arguments: Any`` on
+# item/started and ``result: McpToolCallResult | None`` (content list of text
+# blocks + structured_content) / ``status`` / ``error`` on item/completed —
+# the official app-server protocol documents the same fields. The classifier
+# must surface them through info["event_data"] so the panel Tool cards can show
+# what was requested and what came back (live-E2E defect 2: the model retried
+# dat_get arg shapes 4 times and the panel showed only bare names).
+# --------------------------------------------------------------------------- #
+
+
+def test_classify_tool_call_carries_arguments():
+    import types
+
+    from eud_agent.agent_runner import _classify_event
+
+    item = types.SimpleNamespace(
+        type="mcpToolCall",
+        tool="dat_set",
+        arguments={"dat": "units", "objId": 0, "param": "Hit Points",
+                   "value": 20480},
+    )
+    kind, detail, info = _classify_event(_item_evt("item/started", item))
+    assert (kind, detail) == ("tool_call", "dat_set")
+    data = info.get("event_data")
+    assert data is not None, "tool_call must carry event_data"
+    # args serialized as compact JSON text for display.
+    assert "units" in data["args"] and "Hit Points" in data["args"]
+
+
+def test_classify_tool_call_arguments_json_string_passthrough():
+    import types
+
+    from eud_agent.agent_runner import _classify_event
+
+    item = types.SimpleNamespace(
+        type="mcpToolCall", tool="dat_get",
+        arguments='{"dat": "units", "objId": 0}',
+    )
+    _, _, info = _classify_event(_item_evt("item/started", item))
+    assert info["event_data"]["args"] == '{"dat": "units", "objId": 0}'
+
+
+def test_classify_tool_result_carries_text_and_status():
+    import types
+
+    from eud_agent.agent_runner import _classify_event
+
+    result = types.SimpleNamespace(
+        content=[types.SimpleNamespace(type="text",
+                                       text="OK: units|Hit Points|0 = 20480")],
+        structured_content=None,
+    )
+    item = types.SimpleNamespace(
+        type="mcpToolCall", tool="dat_get", arguments=None, result=result,
+        status=types.SimpleNamespace(value="completed"), error=None,
+    )
+    kind, detail, info = _classify_event(_item_evt("item/completed", item))
+    assert (kind, detail) == ("tool_result", "dat_get")
+    data = info["event_data"]
+    assert "20480" in data["result"]
+    assert data["status"] == "completed"
+
+
+def test_classify_tool_result_failed_carries_error():
+    import types
+
+    from eud_agent.agent_runner import _classify_event
+
+    item = types.SimpleNamespace(
+        type="mcpToolCall", tool="dat_set", arguments=None, result=None,
+        status=types.SimpleNamespace(value="failed"),
+        error=types.SimpleNamespace(message="ERROR: invalid dat name"),
+    )
+    _, _, info = _classify_event(_item_evt("item/completed", item))
+    data = info["event_data"]
+    assert data["status"] == "failed"
+    assert "invalid dat name" in data["result"]
+
+
+def test_classify_tool_event_data_truncated():
+    """Huge args/results are truncated server-side (panel render safety)."""
+    import types
+
+    from eud_agent.agent_runner import TOOL_DATA_MAX_CHARS, _classify_event
+
+    big = "x" * (TOOL_DATA_MAX_CHARS + 500)
+    item = types.SimpleNamespace(type="mcpToolCall", tool="file_write",
+                                 arguments={"code": big})
+    _, _, info = _classify_event(_item_evt("item/started", item))
+    args = info["event_data"]["args"]
+    assert len(args) <= TOOL_DATA_MAX_CHARS + 16  # marker allowance
+    assert args.endswith("…(잘림)")

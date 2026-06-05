@@ -19,6 +19,7 @@
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
+import { Spinner } from "@/components/ui/spinner";
 import { cn } from "@/lib/utils";
 import { classifyDiff } from "@/lib/diff";
 import { truncateForDisplay } from "@/lib/truncate";
@@ -238,6 +239,16 @@ export function ChangesetView({ changeset, pending, onDecide }: ChangesetViewPro
           </Card>
         );
       })}
+
+      {/* EUD-070: in-flight notice — a rollback waits on the 1s bridge tick per
+          inverse op (2-4s for a dat group), so the wait must be visible, not
+          just silently-disabled buttons. */}
+      {pending && (
+        <div className="flex items-center gap-2 text-sm text-muted-foreground">
+          <Spinner className="size-3.5 shrink-0" />
+          <span>결정 처리 중… (되돌리기는 에디터에 한 건씩 적용됩니다)</span>
+        </div>
+      )}
 
       <div className="flex items-center justify-end gap-2 border-t border-border pt-2">
         <Button

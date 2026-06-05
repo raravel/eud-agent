@@ -21,11 +21,15 @@ import {
   ChevronDownIcon,
   ClockIcon,
   WrenchIcon,
+  XCircleIcon,
 } from "lucide-react";
 import type { ComponentProps, ReactNode } from "react";
 
-/** Coarse tool state forwarded by the server (tool_call → running, tool_result → done). */
-export type ToolState = "running" | "done";
+/**
+ * Coarse tool state forwarded by the server (tool_call → running, tool_result →
+ * done, or failed when the server-reported status is not "completed" — EUD-068).
+ */
+export type ToolState = "running" | "done" | "failed";
 
 export type ToolProps = ComponentProps<typeof Collapsible>;
 
@@ -50,6 +54,10 @@ const STATE_BADGE: Record<ToolState, { label: string; icon: ReactNode }> = {
   done: {
     label: "완료",
     icon: <CheckCircleIcon className="size-4 text-emerald-500" />,
+  },
+  failed: {
+    label: "실패",
+    icon: <XCircleIcon className="size-4 text-destructive" />,
   },
 };
 

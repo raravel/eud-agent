@@ -241,6 +241,11 @@ class AgentEngine:
         # free to accept cancel{} (and reconnect) while codex streams (a turn can
         # run for minutes). None when no turn is running.
         self._turn_task: asyncio.Task | None = None
+        # A changeset decision ALSO runs as a background task (EUD-070): a
+        # rollback replays inverse ops over the 1s-tick file IPC (2-4s for a
+        # 3-property dat group in the live E2E), and awaiting it inline blocked
+        # the WS receive loop — every other click queued behind it.
+        self._decision_task: asyncio.Task | None = None
 
     # ------------------------------------------------------------- dispatch
     async def handle(self, msg: dict) -> None:
@@ -269,6 +274,11 @@ class AgentEngine:
         if self.state in ("executing", "plan_review"):
             await self._error("busy: a turn is already in flight")
             return
+        # EUD-070: a chat arriving during an in-flight changeset decision must
+        # not race the journal — drain the decision first (it finishes with its
+        # rollback_result), then proceed with the new turn.
+        if self._decision_task is not None and not self._decision_task.done():
+            await self._decision_task
         text = str(msg.get("text", ""))
         # A new chat opens a fresh changeset scope. Any prior request whose
         # changeset was left UNDECIDED (the panel moved on without accept/reject)
@@ -436,6 +446,12 @@ class AgentEngine:
         if self.state != "changeset_review":
             await self._error("no changeset awaiting a decision")
             return
+        # EUD-070: one decision at a time — the panel locks its controls until
+        # the rollback_result lands, so a second decision here is a protocol
+        # violation (e.g. a second client), not a queueing request.
+        if self._decision_task is not None and not self._decision_task.done():
+            await self._error("busy: a decision is already in flight")
+            return
         decision = str(msg.get("decision", ""))
         ids_arg = msg.get("ids")
         want_all = ids_arg == "all" or ids_arg is None
@@ -445,27 +461,44 @@ class AgentEngine:
             await self._error("no journal for this request")
             self.state = "idle"
             return
-        if decision == "reject":
-            result = await asyncio.to_thread(
-                journal.rollback, ids=ids, all=want_all
-            )
-            ok = all(item.get("ok") for item in result.get("items", []))
-            await self._send({
-                "type": "rollback_result",
-                "ids": [item["id"] for item in result.get("items", [])],
-                "ok": ok,
-            })
-        elif decision == "accept":
-            await asyncio.to_thread(journal.accept, ids=ids, all=want_all)
-            await self._send({
-                "type": "rollback_result",
-                "ids": ids or [],
-                "ok": True,
-            })
-        else:
+        if decision not in ("reject", "accept"):
             await self._error(f"unknown changeset decision: {decision!r}")
             return
-        self.state = "idle"
+
+        # EUD-070: the journal work is blocking file IPC (a rollback waits on
+        # the 1s bridge tick PER inverse op — 2-4s for a 3-property dat group in
+        # the live E2E). Run it as a BACKGROUND task so the WS receive loop
+        # stays free; the state leaves changeset_review only when it completes.
+        async def _decide() -> None:
+            try:
+                if decision == "reject":
+                    result = await asyncio.to_thread(
+                        journal.rollback, ids=ids, all=want_all
+                    )
+                    ok = all(
+                        item.get("ok") for item in result.get("items", [])
+                    )
+                    await self._send({
+                        "type": "rollback_result",
+                        "ids": [
+                            item["id"] for item in result.get("items", [])
+                        ],
+                        "ok": ok,
+                    })
+                else:
+                    await asyncio.to_thread(
+                        journal.accept, ids=ids, all=want_all
+                    )
+                    await self._send({
+                        "type": "rollback_result",
+                        "ids": ids or [],
+                        "ok": True,
+                    })
+            except Exception as exc:  # noqa: BLE001 - surface, never crash the WS
+                await self._error(f"changeset decision failed: {exc}")
+            self.state = "idle"
+
+        self._decision_task = asyncio.create_task(_decide())
 
     # ------------------------------------------------------------- cancel
     async def _on_cancel(self, msg: dict) -> None:
@@ -515,14 +548,15 @@ class AgentEngine:
         # The session is gone: stop stamping its request id onto tool calls so a
         # later headless call falls back to the shim id (EUD-064).
         self._register_request_id(None)
-        task = self._turn_task
-        self._turn_task = None
-        if task is not None and not task.done():
-            task.cancel()
-            try:
-                await task
-            except (asyncio.CancelledError, Exception):  # noqa: BLE001
-                pass
+        for attr in ("_turn_task", "_decision_task"):
+            task = getattr(self, attr)
+            setattr(self, attr, None)
+            if task is not None and not task.done():
+                task.cancel()
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                    pass
 
     # ------------------------------------------------------------- status/list
     async def _on_status(self, msg: dict) -> None:

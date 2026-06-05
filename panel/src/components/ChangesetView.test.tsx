@@ -271,6 +271,32 @@ describe("ChangesetView — decision dispatch (single vs all)", () => {
     const row = screen.getByTestId("cs-item-fm");
     expect(within(row).getByRole("button", { name: /적용/ })).toBeDisabled();
   });
+
+  // EUD-070: a rollback replays inverse ops over the 1s-tick file IPC (2-4s
+  // for a dat group) — the in-flight wait needs a visible progress notice, not
+  // just silently-disabled buttons (the live-E2E "동기적 렉" perception).
+  it("shows an in-flight notice with a spinner while a decision is pending", () => {
+    render(
+      <ChangesetView
+        changeset={makeChangeset([modifiedFile])}
+        pending={true}
+        onDecide={() => {}}
+      />,
+    );
+    expect(screen.getByRole("status")).toBeInTheDocument();
+    expect(screen.getByText(/처리 중/)).toBeInTheDocument();
+  });
+
+  it("hides the in-flight notice when no decision is pending", () => {
+    render(
+      <ChangesetView
+        changeset={makeChangeset([modifiedFile])}
+        pending={false}
+        onDecide={() => {}}
+      />,
+    );
+    expect(screen.queryByText(/처리 중/)).not.toBeInTheDocument();
+  });
 });
 
 describe("ChangesetView — rollback_result row states", () => {

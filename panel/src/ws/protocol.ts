@@ -106,6 +106,12 @@ export interface AgentEventMessage {
   type: "agent_event";
   kind: string;
   detail: string;
+  /**
+   * EUD-068: optional tool payload — `tool_call` carries `args` (the call's
+   * argument text, server-truncated); `tool_result` carries `result` (the
+   * result/error text) + `status` ("completed" | "failed" | "declined").
+   */
+  data?: { args?: string; result?: string; status?: string };
 }
 
 /** `answer {text}` — answer-only turn (no edits). */

@@ -25,8 +25,6 @@ import {
 } from "react";
 import { Header, type RagState } from "@/components/Header";
 import { ConversationLog } from "@/components/ConversationLog";
-import { AgentStream } from "@/components/AgentStream";
-import { AgentAnswer } from "@/components/AgentAnswer";
 import { ChangesetView } from "@/components/ChangesetView";
 import { PlanView } from "@/components/PlanView";
 import { InstructionBox, type ChatPayload } from "@/components/InstructionBox";
@@ -95,8 +93,8 @@ export default function App() {
         }
         case "agent_event":
           // Accumulated into the store's per-turn buffers (reasoning/answer/tools);
-          // raw kinds never reach the log.
-          store.agentEvent(msg.kind, msg.detail);
+          // raw kinds never reach the log. `data` carries tool args/result (EUD-068).
+          store.agentEvent(msg.kind, msg.detail, msg.data);
           break;
         case "answer":
           // Archive the final answer as a prominent agent log entry. answerReceived
@@ -249,19 +247,11 @@ export default function App() {
         rag={rag}
       />
 
-      <ConversationLog log={state.log} phase={state.phase} />
-
-      {/* Live agent activity for the current turn: the reasoning block + tool
-          rows (AgentStream) and the prominent streamed answer bubble
-          (AgentAnswer). Both render from the store's per-turn buffers and reset
-          per turn; the final answer is also archived into the log on answer{}. */}
-      <AgentStream
-        reasoning={state.turn.reasoning}
-        answerStarted={state.turn.answerStarted}
-        tools={state.turn.tools}
-        live={state.phase === "thinking"}
-      />
-      {state.phase === "thinking" && <AgentAnswer text={state.turn.answer} />}
+      {/* The live agent activity (reasoning / tool rows / streamed answer)
+          renders INLINE inside the conversation scroll area (EUD-069) — a fixed
+          band here grew unbounded and crushed the log + plan card to 0px/33px
+          in the live E2E. ConversationLog owns the placement now. */}
+      <ConversationLog log={state.log} phase={state.phase} turn={state.turn} />
 
       {/* Plan review — markdown card + feedback/approve (features/06). The card
           stays visible across the iteration turn (plan_review while awaiting a

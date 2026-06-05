@@ -1137,6 +1137,67 @@
         "panel/src/components/InstructionBox.tsx",
         "panel/src/components/InstructionBox.test.tsx"
       ]
+    },
+    "EUD-067-961b": {
+      "status": "done",
+      "priority": "high",
+      "type": "bug",
+      "parent": null,
+      "depends_on": [],
+      "title": "Enable codex reasoning summaries + drop hidden auto_review guardian (live-E2E defect 1)",
+      "updated": "2026-06-05",
+      "completed_at": "2026-06-05T19:52:59.318547",
+      "path": "done/EUD-067-961b.md",
+      "scope": [
+        "server/eud_agent/agent_runner.py",
+        "server/tests/**"
+      ]
+    },
+    "EUD-068-124a": {
+      "status": "done",
+      "priority": "high",
+      "type": "bug",
+      "parent": null,
+      "depends_on": [],
+      "title": "Surface tool-call arguments/results/status in agent_event and panel Tool cards (live-E2E defect 2)",
+      "updated": "2026-06-05",
+      "completed_at": "2026-06-05T19:52:59.826310",
+      "path": "done/EUD-068-124a.md",
+      "scope": [
+        "server/eud_agent/agent_runner.py",
+        "server/tests/**",
+        "panel/src/**"
+      ]
+    },
+    "EUD-069-7c7c": {
+      "status": "done",
+      "priority": "high",
+      "type": "bug",
+      "parent": null,
+      "depends_on": [],
+      "title": "Panel layout: render agent stream inline in the conversation scroll (live-E2E defects 3-4)",
+      "updated": "2026-06-05",
+      "completed_at": "2026-06-05T19:53:00.409879",
+      "path": "done/EUD-069-7c7c.md",
+      "scope": [
+        "panel/src/**"
+      ]
+    },
+    "EUD-070-272c": {
+      "status": "done",
+      "priority": "high",
+      "type": "bug",
+      "parent": null,
+      "depends_on": [],
+      "title": "Async changeset decision handling + in-flight progress feedback (live-E2E defect 5)",
+      "updated": "2026-06-05",
+      "completed_at": "2026-06-05T19:53:00.872891",
+      "path": "done/EUD-070-272c.md",
+      "scope": [
+        "server/eud_agent/engine.py",
+        "server/tests/**",
+        "panel/src/**"
+      ]
     }
   }
 }

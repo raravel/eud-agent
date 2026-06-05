@@ -118,6 +118,19 @@ EUD_TOOLS_SERVER = "eud-tools"
 # The shim launch command tail (``python -m eud_agent.mcp_shim``).
 MCP_SHIM_ARGS = ["-m", "eud_agent.mcp_shim"]
 
+# Reasoning visibility (EUD-067): codex asks the API for ``reasoning.summary``
+# ONLY when the model-family metadata marks summaries as supported — gpt-5.5's
+# family ships with it OFF, so the panel never received a single
+# ``item/reasoning/summaryTextDelta`` (live E2E 2026-06-05; probed: forcing the
+# flag produced 79 summary deltas on one turn, without it zero). These launch-
+# level ``-c`` overrides force the flag and pick the detailed summary style.
+# Composed AFTER the isolation overrides and BEFORE ``extra_overrides`` so an
+# injected override can still flip them (later ``-c`` wins).
+REASONING_VISIBILITY_OVERRIDES = (
+    "model_supports_reasoning_summaries=true",
+    'model_reasoning_summary="detailed"',
+)
+
 
 @dataclass(frozen=True)
 class CodexIsolation:
@@ -349,7 +362,9 @@ class CodexSDKRunner(AgentRunner):
         )
 
     def _isolation_overrides(self) -> tuple[str, ...]:
-        """Build the ``--config k=v`` override tuple from the isolation knobs."""
+        """Build the ``--config k=v`` override tuple: isolation knobs, then the
+        reasoning-visibility constants (EUD-067), then ``extra_overrides`` last
+        so an injected override can flip anything (later ``-c`` wins)."""
         iso = self._isolation
         overrides: list[str] = []
         if iso.replace_mcp_table:
@@ -365,8 +380,33 @@ class CodexSDKRunner(AgentRunner):
             overrides.append(f"mcp_servers={_toml_inline(table)}")
         if iso.disable_plugins:
             overrides.append("features.plugins=false")
+        overrides.extend(REASONING_VISIBILITY_OVERRIDES)
         overrides.extend(iso.extra_overrides)
         return tuple(overrides)
+
+    def _thread_start_kwargs(self, request_id: str, system_prompt: str | None
+                             ) -> dict:
+        """kwargs for a fresh ``thread_start`` (EUD-067 guardian removal).
+
+        ``approval_mode=deny_all`` replaces the SDK default ``auto_review``,
+        which spawns a HIDDEN guardian reviewer thread running a full model
+        review turn per MCP tool call (21 review turns in the live E2E —
+        10-25s silent gaps between tool calls and ~2x token burn). The server
+        is already the policy layer (validation / journal / mutation gate /
+        budget), so the guardian is redundant; ``deny_all`` = never ask for
+        approval escalations, no reviewer thread.
+        """
+        from openai_codex import ApprovalMode
+
+        kwargs: dict = {
+            "config": self._thread_config(request_id),
+            "approval_mode": ApprovalMode.deny_all,
+        }
+        if system_prompt:
+            kwargs["base_instructions"] = system_prompt
+        if self._model:
+            kwargs["model"] = self._model
+        return kwargs
 
     def _thread_config(self, request_id: str) -> dict:
         """Per-thread MCP injection of the eud-tools shim (EUD-053 spike shape).
@@ -413,12 +453,9 @@ class CodexSDKRunner(AgentRunner):
         if self._thread_id is not None:
             thread = codex.thread_resume(self._thread_id)
         else:
-            kwargs: dict = {"config": self._thread_config(request_id)}
-            if system_prompt:
-                kwargs["base_instructions"] = system_prompt
-            if self._model:
-                kwargs["model"] = self._model
-            thread = codex.thread_start(**kwargs)
+            thread = codex.thread_start(
+                **self._thread_start_kwargs(request_id, system_prompt)
+            )
             self._thread_id = thread.id
         self._thread = thread
 
@@ -432,9 +469,12 @@ class CodexSDKRunner(AgentRunner):
         try:
             for event in handle.stream():
                 kind, detail, info = _classify_event(event)
-                self._emit_threadsafe(
-                    loop, {"type": "agent_event", "kind": kind, "detail": detail}
-                )
+                ev: dict = {"type": "agent_event", "kind": kind, "detail": detail}
+                # EUD-068: tool args/result/status ride an optional ``data``
+                # field so the panel Tool cards can render them.
+                if info.get("event_data"):
+                    ev["data"] = info["event_data"]
+                self._emit_threadsafe(loop, ev)
                 if info.get("plan_markdown") is not None:
                     plan_markdown = info["plan_markdown"]
                 if info.get("mutation"):
@@ -492,6 +532,9 @@ def _classify_event(event) -> tuple[str, str, dict]:
                 info["plan_markdown"] = _plan_markdown_from(root)
             elif _is_mutation_tool(tool):
                 info["mutation"] = True
+            # EUD-068: surface the tool RESULT text + completion status so the
+            # panel Tool card can show what came back (and flag failures).
+            info["event_data"] = _tool_result_data(root)
             return ("tool_result", tool, info)
         if rtype == "agentMessage":
             text = getattr(root, "text", "") or ""
@@ -503,6 +546,14 @@ def _classify_event(event) -> tuple[str, str, dict]:
         root = _item_root(event)
         rtype = getattr(root, "type", None)
         if rtype == "mcpToolCall":
+            # EUD-068: surface the call ARGUMENTS so the panel Tool card can
+            # show what was requested (the live E2E saw 4 arg-shape retries the
+            # panel rendered as identical bare names).
+            info["event_data"] = {
+                "args": _truncate_tool_text(
+                    _tool_args_text(getattr(root, "arguments", None))
+                )
+            }
             return ("tool_call", getattr(root, "tool", "") or "", info)
         return ("item_started", str(rtype or ""), info)
 
@@ -524,6 +575,89 @@ def _classify_event(event) -> tuple[str, str, dict]:
     if method.endswith("tokenUsage/updated"):
         return ("token_usage", "", info)
     return ("event", method, info)
+
+
+# Max characters for a tool args/result text forwarded to the panel (EUD-068).
+# Large payloads (file_write code bodies, long GET results) are truncated
+# server-side so a single agent_event cannot bloat the WS stream or the panel.
+TOOL_DATA_MAX_CHARS = 4000
+_TRUNCATION_MARKER = "…(잘림)"
+
+
+def _truncate_tool_text(text: str) -> str:
+    if len(text) <= TOOL_DATA_MAX_CHARS:
+        return text
+    return text[: TOOL_DATA_MAX_CHARS - len(_TRUNCATION_MARKER)] + _TRUNCATION_MARKER
+
+
+def _tool_args_text(arguments) -> str:
+    """The tool-call arguments as display text (EUD-068), defensively.
+
+    The SDK types ``arguments: Any`` — in practice a dict (parsed JSON) or a raw
+    JSON string. A string passes through verbatim; anything else serializes as
+    compact JSON (non-serializable values degrade through ``str``); ``None``
+    becomes empty.
+    """
+    if arguments is None:
+        return ""
+    if isinstance(arguments, str):
+        return arguments
+    import json
+
+    try:
+        return json.dumps(arguments, ensure_ascii=False)
+    except (TypeError, ValueError):
+        return str(arguments)
+
+
+def _tool_result_data(root) -> dict:
+    """``{result, status}`` for a completed mcpToolCall item (EUD-068).
+
+    ``result`` is the joined text of the MCP content blocks (falling back to
+    ``structured_content`` / a dict dump); a FAILED call carries the error
+    message instead. ``status`` is the McpToolCallStatus value string
+    (completed/failed/declined) — the panel flags non-completed states. All
+    access is defensive (a shape change degrades to empty, never raises).
+    """
+    status_obj = getattr(root, "status", None)
+    status = str(getattr(status_obj, "value", status_obj) or "completed")
+    error = getattr(root, "error", None)
+    if error is not None:
+        text = str(getattr(error, "message", error) or "")
+    else:
+        text = _tool_result_text(getattr(root, "result", None))
+    return {"result": _truncate_tool_text(text), "status": status}
+
+
+def _tool_result_text(result) -> str:
+    """Joined display text of an ``McpToolCallResult``, defensively."""
+    if result is None:
+        return ""
+    if isinstance(result, str):
+        return result
+    if isinstance(result, dict):
+        import json
+
+        try:
+            return json.dumps(result, ensure_ascii=False)
+        except (TypeError, ValueError):
+            return str(result)
+    parts: list[str] = []
+    for block in getattr(result, "content", None) or []:
+        text = getattr(block, "text", None)
+        if text:
+            parts.append(str(text))
+    if parts:
+        return "\n".join(parts)
+    structured = getattr(result, "structured_content", None)
+    if structured is not None:
+        import json
+
+        try:
+            return json.dumps(structured, ensure_ascii=False)
+        except (TypeError, ValueError):
+            return str(structured)
+    return ""
 
 
 def _delta_text(event) -> str:

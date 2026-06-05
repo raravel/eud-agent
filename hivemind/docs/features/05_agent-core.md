@@ -61,8 +61,14 @@ Every tool validates args server-side (numeric ranges, index bounds, type whitel
 ## WS protocol v2
 
 Client→server: `chat{text}`, `plan_feedback{text}`, `plan_approve{}`, `changeset_decision{accept|reject, ids|all}`, `cancel{}`, `reset{}` (drop the retained codex thread — next chat starts a fresh conversation; EUD-064), `status{}`, `list{}` (kept for header).
-Server→client: `agent_event{kind, detail}` (streamed: thinking/tool_call/tool_result/turn_done; **`reasoning`** carries a reasoning-text delta in `detail` — `item/reasoning/summaryTextDelta` + `item/reasoning/textDelta`; **`delta`** carries an answer-text delta in `detail` — EUD-063), `answer{text}`, `plan{markdown, revision}`, `changeset{request_id, items[]}`, `rollback_result{ids, ok}`, `error{message}`, `status{...}`, `progress{stage,...}` (kept: rag_warmup etc.).
+Server→client: `agent_event{kind, detail, data?}` (streamed: thinking/tool_call/tool_result/turn_done; **`reasoning`** carries a reasoning-text delta in `detail` — `item/reasoning/summaryTextDelta` + `item/reasoning/textDelta`; **`delta`** carries an answer-text delta in `detail` — EUD-063; **`data`** (EUD-068) is an optional tool payload — `tool_call` carries `{args}` (the McpToolCall arguments as display text, server-truncated at 4000 chars), `tool_result` carries `{result, status}` (joined MCP content/error text + completed|failed|declined)), `answer{text}`, `plan{markdown, revision}`, `changeset{request_id, items[]}`, `rollback_result{ids, ok}`, `error{message}`, `status{...}`, `progress{stage,...}` (kept: rag_warmup etc.).
 v1 `instruct`/`apply`/`code`/`applied` messages are REMOVED (panel v2 replaces the flow; no compat shim).
+
+**Reasoning visibility (EUD-067)**: codex requests `reasoning.summary` from the API only when the MODEL-FAMILY metadata marks summaries as supported — gpt-5.5's family ships with it OFF, so no `item/reasoning/*Delta` ever streamed (live E2E 2026-06-05; probed: forcing the flag produced 79 summary deltas on one turn, zero without). The runner's launch-level config_overrides therefore ALWAYS carry `model_supports_reasoning_summaries=true` + `model_reasoning_summary="detailed"` (composed BEFORE `extra_overrides`, so injection can still flip them).
+
+**No guardian reviewer (EUD-067)**: `thread_start` passes `ApprovalMode.deny_all`. The SDK default (`auto_review`) spawns a HIDDEN guardian reviewer thread running a full model review turn per MCP tool call (21 review turns in the live E2E — 10-25s silent gaps between tool calls, ~2x token burn). The server is already the policy layer (validation/journal/gate/budget), so the guardian is redundant.
+
+**Background changeset decisions (EUD-070)**: `changeset_decision` runs as a BACKGROUND task (like turns) — a rollback replays inverse ops over the 1s-tick file IPC (2-4s for a 3-property dat group), and awaiting it inline blocked the WS receive loop (every other click queued). One decision at a time (a second decision while one is in flight → error); a `chat` arriving mid-decision drains the decision first; `aclose` cancels it like the turn task.
 
 ## Verification contract
 

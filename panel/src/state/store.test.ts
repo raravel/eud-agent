@@ -650,6 +650,145 @@ describe("agentEvent streaming buffers (EUD-065 / features/06)", () => {
   });
 });
 
+// ---- EUD-068: tool_call args + tool_result text/status ride agent_event.data.
+// The server now forwards McpToolCall arguments (item/started) and the result
+// text + completion status (item/completed) so the Tool cards can show what was
+// requested and what came back (live-E2E defect 2).
+describe("agentEvent tool args/result (EUD-068)", () => {
+  it("stores tool_call args from the data field", () => {
+    const store = readyWithProject();
+    store.chatSent();
+    store.agentEvent("tool_call", "dat_set", {
+      args: '{"dat":"units","objId":0,"param":"Hit Points","value":20480}',
+    });
+    const t = store.getState().turn.tools[0];
+    expect(t.name).toBe("dat_set");
+    expect(t.args).toContain("Hit Points");
+  });
+
+  it("stores tool_result text and keeps state done on completed", () => {
+    const store = readyWithProject();
+    store.chatSent();
+    store.agentEvent("tool_call", "dat_get", { args: "{}" });
+    store.agentEvent("tool_result", "dat_get", {
+      result: "OK: units|Hit Points|0 = 20480",
+      status: "completed",
+    });
+    const t = store.getState().turn.tools[0];
+    expect(t.state).toBe("done");
+    expect(t.detail).toContain("20480");
+  });
+
+  it("flags a failed tool_result", () => {
+    const store = readyWithProject();
+    store.chatSent();
+    store.agentEvent("tool_call", "dat_set", { args: "{}" });
+    store.agentEvent("tool_result", "dat_set", {
+      result: "ERROR: invalid dat name",
+      status: "failed",
+    });
+    const t = store.getState().turn.tools[0];
+    expect(t.state).toBe("failed");
+    expect(t.detail).toContain("invalid dat name");
+  });
+
+  it("keeps working without a data field (legacy server shape)", () => {
+    const store = readyWithProject();
+    store.chatSent();
+    store.agentEvent("tool_call", "build_run");
+    store.agentEvent("tool_result", "build_run");
+    const t = store.getState().turn.tools[0];
+    expect(t.state).toBe("done");
+    expect(t.args).toBeUndefined();
+  });
+});
+
+// ---- EUD-069: turn-end tool archiving. The live tool rows render INLINE in
+// the conversation; when the turn ends they are archived into the log as a
+// compact entry CARRYING the tool rows (LogEntry.tools) and the buffer clears —
+// stale rows must not occupy the screen into the next phase (the live-E2E
+// layout crush: 14 leftover rows squeezed the plan card to 33px).
+describe("turn-end tool archiving (EUD-069)", () => {
+  function runTools(store: ReturnType<typeof createPanelStore>) {
+    store.agentEvent("tool_call", "dat_get", { args: "{}" });
+    store.agentEvent("tool_result", "dat_get", {
+      result: "OK",
+      status: "completed",
+    });
+    store.agentEvent("tool_call", "dat_set", { args: "{}" });
+    store.agentEvent("tool_result", "dat_set", {
+      result: "OK",
+      status: "completed",
+    });
+  }
+
+  function archivedEntry(store: ReturnType<typeof createPanelStore>) {
+    return store.getState().log.find((e) => e.tools !== undefined);
+  }
+
+  it("archives tool rows into the log and clears them on answerReceived", () => {
+    const store = readyWithProject();
+    store.chatSent();
+    runTools(store);
+    store.answerReceived("끝");
+    expect(store.getState().turn.tools).toEqual([]);
+    const entry = archivedEntry(store);
+    expect(entry).toBeDefined();
+    expect(entry!.text).toContain("도구 호출 2건");
+    expect(entry!.tools).toHaveLength(2);
+  });
+
+  it("archives tool rows when a plan ends the turn", () => {
+    const store = readyWithProject();
+    store.chatSent();
+    runTools(store);
+    store.planReceived("# 계획", 1);
+    expect(store.getState().turn.tools).toEqual([]);
+    expect(archivedEntry(store)).toBeDefined();
+  });
+
+  it("archives tool rows when a changeset ends the turn", () => {
+    const store = readyWithProject();
+    store.chatSent();
+    runTools(store);
+    store.changesetReceived("r1", [
+      { category: "file", id: "e1", seq: 0, kind: "created", path: "a.eps" },
+    ]);
+    expect(store.getState().turn.tools).toEqual([]);
+    expect(archivedEntry(store)).toBeDefined();
+  });
+
+  it("archives tool rows when the turn errors out", () => {
+    const store = readyWithProject();
+    store.chatSent();
+    runTools(store);
+    store.errorReceived("agent turn failed: boom");
+    expect(store.getState().turn.tools).toEqual([]);
+    expect(archivedEntry(store)).toBeDefined();
+  });
+
+  it("adds no archive entry when no tools ran", () => {
+    const store = readyWithProject();
+    store.chatSent();
+    store.answerReceived("끝");
+    expect(archivedEntry(store)).toBeUndefined();
+  });
+
+  it("aggregates repeated tool names in the archive text", () => {
+    const store = readyWithProject();
+    store.chatSent();
+    for (let i = 0; i < 3; i += 1) {
+      store.agentEvent("tool_call", "dat_get", { args: "{}" });
+      store.agentEvent("tool_result", "dat_get", {
+        result: "OK",
+        status: "completed",
+      });
+    }
+    store.answerReceived("끝");
+    expect(archivedEntry(store)!.text).toContain("dat_get×3");
+  });
+});
+
 describe("resetSent — new conversation (EUD-064/065)", () => {
   it("clears log, plan, changeset, and the turn buffers, returning to ready", () => {
     // No undecided changeset here, so the fresh log is empty (the discard notice

@@ -123,6 +123,57 @@ describe("AgentStream — tool rows", () => {
   });
 });
 
+describe("AgentStream — tool args/result (EUD-068)", () => {
+  it("shows the call args and result text when the row is expanded", async () => {
+    const user = userEvent.setup();
+    render(
+      <AgentStream
+        reasoning=""
+        answerStarted={false}
+        live={true}
+        tools={[
+          {
+            id: "t1",
+            name: "dat_set",
+            state: "done",
+            args: '{"dat":"units","param":"Hit Points","value":20480}',
+            detail: "OK: units|Hit Points|0 = 20480",
+          },
+        ]}
+      />,
+    );
+    // Collapsed by default — expand the row.
+    await user.click(screen.getByRole("button", { name: /dat_set/ }));
+    expect(screen.getByText("요청")).toBeInTheDocument();
+    expect(
+      screen.getByText('{"dat":"units","param":"Hit Points","value":20480}'),
+    ).toBeInTheDocument();
+    expect(screen.getByText("결과")).toBeInTheDocument();
+    expect(
+      screen.getByText("OK: units|Hit Points|0 = 20480"),
+    ).toBeInTheDocument();
+  });
+
+  it("renders a 실패 badge for a failed tool row", () => {
+    render(
+      <AgentStream
+        reasoning=""
+        answerStarted={false}
+        live={true}
+        tools={[
+          {
+            id: "t1",
+            name: "dat_set",
+            state: "failed",
+            detail: "ERROR: invalid dat name",
+          },
+        ]}
+      />,
+    );
+    expect(screen.getByText("실패")).toBeInTheDocument();
+  });
+});
+
 describe("AgentStream — no raw kind leak", () => {
   it("never surfaces raw internal kind identifiers as literal text", () => {
     const { container } = render(

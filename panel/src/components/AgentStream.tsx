@@ -30,7 +30,10 @@ import {
 export interface AgentTool {
   id: string;
   name: string;
-  state: "running" | "done";
+  state: "running" | "done" | "failed";
+  /** Tool-call argument text (EUD-068). */
+  args?: string;
+  /** Tool-result text (EUD-068). */
   detail?: string;
 }
 
@@ -75,7 +78,9 @@ export function AgentStream({
 
   return (
     <div
-      className="flex w-full max-w-[95%] flex-col gap-2 px-4"
+      // No horizontal padding of its own — rendered INLINE inside the
+      // conversation scroll content (which already pads, EUD-069).
+      className="flex w-full max-w-[95%] flex-col gap-2"
       aria-label="에이전트 활동"
     >
       {hasReasoning && (
@@ -94,20 +99,49 @@ export function AgentStream({
           <span className="text-xs text-muted-foreground">
             도구 호출 {tools.length}건
           </span>
-          {tools.map((tool) => (
-            <Tool key={tool.id} data-testid={`tool-${tool.id}`}>
-              <ToolHeader title={tool.name} state={tool.state} />
-              {tool.detail && (
-                <ToolContent>
-                  <div className="p-3 text-xs whitespace-pre-wrap break-words text-muted-foreground">
-                    {tool.detail}
-                  </div>
-                </ToolContent>
-              )}
-            </Tool>
-          ))}
+          <ToolList tools={tools} />
         </div>
       )}
     </div>
+  );
+}
+
+/**
+ * The expandable Tool card rows (shared, EUD-069): rendered live by
+ * {@link AgentStream} and again by ConversationLog for ARCHIVED tool entries
+ * (`LogEntry.tools`), so past turns' tool activity stays inspectable in the
+ * conversation history.
+ */
+export function ToolList({ tools }: { tools: AgentTool[] }) {
+  return (
+    <>
+      {tools.map((tool) => (
+        <Tool key={tool.id} data-testid={`tool-${tool.id}`}>
+          <ToolHeader title={tool.name} state={tool.state} />
+          {(tool.args || tool.detail) && (
+            <ToolContent>
+              <div className="flex flex-col gap-2 p-3 text-xs text-muted-foreground">
+                {tool.args && (
+                  <div>
+                    <div className="mb-1 font-medium">요청</div>
+                    <pre className="overflow-x-auto whitespace-pre-wrap break-words rounded bg-muted/40 p-2">
+                      {tool.args}
+                    </pre>
+                  </div>
+                )}
+                {tool.detail && (
+                  <div>
+                    <div className="mb-1 font-medium">결과</div>
+                    <pre className="overflow-x-auto whitespace-pre-wrap break-words rounded bg-muted/40 p-2">
+                      {tool.detail}
+                    </pre>
+                  </div>
+                )}
+              </div>
+            </ToolContent>
+          )}
+        </Tool>
+      ))}
+    </>
   );
 }

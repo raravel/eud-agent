@@ -75,6 +75,13 @@ export interface LogEntry {
   text: string;
   /** Progress stage if this line is a live progress entry (spinner target). */
   stage?: ProgressStage;
+  /**
+   * Archived tool rows (EUD-069): when a turn ends, its tool rows move from the
+   * live per-turn buffer into a compact log entry carrying the rows, so past
+   * tool activity stays expandable in the conversation history instead of
+   * occupying the live surface into the next phase.
+   */
+  tools?: AgentTool[];
 }
 
 /** Active plan card (from a `plan` event); replaced by a higher revision. */
@@ -86,13 +93,26 @@ export interface PlanState {
 /**
  * One tool-call row in the current turn (EUD-065). `tool_call` opens a `running`
  * row by name; the next `tool_result` flips the latest still-running row to
- * `done`. The id is monotonic per turn (for stable React keys).
+ * `done` (or `failed` when the server-reported status is not "completed",
+ * EUD-068). `args` is the call's argument text (server-truncated JSON) and
+ * `detail` the result text — both ride `agent_event.data` and render inside the
+ * Tool card. The id is monotonic per turn (for stable React keys).
  */
 export interface AgentTool {
   id: string;
   name: string;
-  state: "running" | "done";
+  state: "running" | "done" | "failed";
+  /** Tool-call argument text (agent_event.data.args, EUD-068). */
+  args?: string;
+  /** Tool-result text (agent_event.data.result, EUD-068). */
   detail?: string;
+}
+
+/** Optional payload on a streamed agent_event (EUD-068 tool args/result). */
+export interface AgentEventData {
+  args?: string;
+  result?: string;
+  status?: string;
 }
 
 /**
@@ -210,8 +230,9 @@ export interface PanelStore {
    * A streamed `agent_event` — accumulated into the per-turn {@link TurnState}
    * buffers (reasoning / answer / tools). Raw internal kind identifiers NEVER
    * reach the log (no-raw-kind-leak contract, features/06 / decision 06).
+   * `data` is the optional EUD-068 payload (tool args / result / status).
    */
-  agentEvent(kind: string, detail: string): void;
+  agentEvent(kind: string, detail: string, data?: AgentEventData): void;
   /** `answer` — answer-only turn; back to ready. */
   answerReceived(text: string): void;
   /** `plan` — enter/refresh plan_review (revision replaces the active card). */
@@ -353,16 +374,41 @@ export function createPanelStore(): PanelStore {
     for (const listener of listeners) listener(snapshot);
   }
 
-  function pushLog(kind: LogKind, text: string, stage?: ProgressStage): void {
+  function pushLog(
+    kind: LogKind,
+    text: string,
+    stage?: ProgressStage,
+    tools?: AgentTool[],
+  ): void {
     logSeq += 1;
-    const entry: LogEntry = stage
-      ? { id: logSeq, kind, text, stage }
-      : { id: logSeq, kind, text };
+    const entry: LogEntry = { id: logSeq, kind, text };
+    if (stage) entry.stage = stage;
+    if (tools) entry.tools = tools;
     // Drop oldest beyond the cap (features/06 ## Behaviors).
     const next =
       core.log.length >= MAX_LOG_ENTRIES ? core.log.slice(1) : core.log.slice();
     next.push(entry);
     core.log = next;
+  }
+
+  /**
+   * EUD-069: archive the live tool rows as a compact log entry (carrying the
+   * rows for expandable history) and clear the buffer when a turn ends. Without
+   * this, leftover rows occupy the live surface into the next phase — the
+   * live-E2E layout crush (14 stale rows squeezed the plan card to 33px).
+   * Called BEFORE archiveTurnAnswer so the order reads tools → prose.
+   */
+  function archiveTurnTools(): void {
+    const tools = core.turn.tools;
+    if (tools.length === 0) return;
+    const counts = new Map<string, number>();
+    for (const t of tools) counts.set(t.name, (counts.get(t.name) ?? 0) + 1);
+    const parts = [...counts].map(([name, c]) =>
+      c > 1 ? `${name}×${c}` : name,
+    );
+    pushLog("info", `도구 호출 ${tools.length}건 — ${parts.join(", ")}`,
+      undefined, tools);
+    core.turn = { ...core.turn, tools: [] };
   }
 
   /**
@@ -451,7 +497,7 @@ export function createPanelStore(): PanelStore {
       emit();
     },
 
-    agentEvent(kind, detail) {
+    agentEvent(kind, detail, data) {
       // Accumulate the streamed agent_event into the per-turn buffers (EUD-065 /
       // decision 06). Raw internal kind identifiers (delta/answer/token_usage/
       // turn_done/item_started/item_completed/event) MUST NEVER reach the log —
@@ -473,22 +519,31 @@ export function createPanelStore(): PanelStore {
           };
           break;
         case "tool_call": {
-          // Open a running Tool row by name (detail = the tool name / signature).
+          // Open a running Tool row by name; carry the call args (EUD-068).
           toolSeq += 1;
           const tool: AgentTool = {
             id: `tool-${toolSeq}`,
             name: detail || "tool",
             state: "running",
           };
+          if (data?.args) tool.args = data.args;
           core.turn = { ...core.turn, tools: [...core.turn.tools, tool] };
           break;
         }
         case "tool_result": {
-          // Flip the latest still-running Tool row to done; attach the detail.
+          // Flip the latest still-running Tool row to done/failed; attach the
+          // result text (EUD-068). A non-"completed" server status (failed /
+          // declined) flags the row; absence of data keeps the legacy done flip.
+          const failed =
+            data?.status !== undefined && data.status !== "completed";
           const tools = core.turn.tools.slice();
           for (let i = tools.length - 1; i >= 0; i -= 1) {
             if (tools[i].state === "running") {
-              tools[i] = { ...tools[i], state: "done", detail };
+              tools[i] = {
+                ...tools[i],
+                state: failed ? "failed" : "done",
+                ...(data?.result ? { detail: data.result } : {}),
+              };
               break;
             }
           }
@@ -505,7 +560,10 @@ export function createPanelStore(): PanelStore {
 
     answerReceived(_text) {
       // answer-only turn (no edits): thinking --> ready. (The text is logged by
-      // the App layer so the bubble carries the right styling.)
+      // the App layer so the bubble carries the right styling.) EUD-069: the
+      // tool rows archive BEFORE the App logs the answer text, so the history
+      // reads tools → answer.
+      archiveTurnTools();
       core.turnInFlight = false;
       core.phase = "ready";
       emit();
@@ -515,7 +573,9 @@ export function createPanelStore(): PanelStore {
       // propose_plan ENDS the codex turn (the turn is no longer in flight); the
       // panel now awaits feedback/approve. thinking --> plan_review; a higher
       // revision REPLACES the active card.
-      // F2: archive any prose streamed before the plan turn-end.
+      // EUD-069: archive the tool rows, THEN (F2) any prose streamed before the
+      // plan turn-end — history order tools → prose.
+      archiveTurnTools();
       archiveTurnAnswer();
       core.turnInFlight = false;
       core.plan = { markdown, revision };
@@ -525,7 +585,9 @@ export function createPanelStore(): PanelStore {
 
     changesetReceived(requestId, items) {
       // thinking --> changeset_review. Fresh decisions map (no item decided yet).
-      // F2: archive any prose streamed before the changeset turn-end.
+      // EUD-069: archive the tool rows, THEN (F2) any prose streamed before the
+      // changeset turn-end.
+      archiveTurnTools();
       archiveTurnAnswer();
       core.turnInFlight = false;
       core.changeset = { request_id: requestId, items, decisions: {} };
@@ -596,7 +658,9 @@ export function createPanelStore(): PanelStore {
       // A turn error returns the flow to ready (thinking/plan_review --> ready).
       // changeset_review keeps its reviewable changeset (an error there is about a
       // failed decision, surfaced via rollback_result/log, not a phase reset).
-      // F2: archive any prose streamed before the turn errored out.
+      // EUD-069: archive the tool rows; F2: archive any prose streamed before
+      // the turn errored out.
+      archiveTurnTools();
       archiveTurnAnswer();
       if (core.phase !== "changeset_review") {
         core.turnInFlight = false;

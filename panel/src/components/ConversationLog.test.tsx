@@ -81,3 +81,59 @@ describe("ConversationLog — progress spinner on the active stage", () => {
     ).not.toBeInTheDocument();
   });
 });
+
+// ---- EUD-069: the live agent stream renders INLINE inside the conversation
+// scroll area (no fixed band between the log and the input — the live-E2E
+// layout crush: an unbounded AgentStream band squeezed the log to 0px and the
+// plan card to 33px). ConversationLog receives the per-turn buffers and renders
+// the Reasoning/Tool surfaces + the live answer bubble INSIDE [role="log"];
+// archived tool entries (LogEntry.tools) render as expandable Tool cards.
+describe("ConversationLog — inline agent stream (EUD-069)", () => {
+  const liveTurn = {
+    reasoning: "유닛을 확인 중",
+    answer: "부분 답변입니다",
+    answerStarted: true,
+    tools: [{ id: "t1", name: "dat_get", state: "running" as const }],
+  };
+
+  it("renders the live turn activity INSIDE the scrollable conversation", () => {
+    const store = createPanelStore();
+    store.log("you", "마린 체력 2배");
+    const { container } = render(
+      <ConversationLog
+        log={store.getState().log}
+        phase="thinking"
+        turn={liveTurn}
+      />,
+    );
+    const log = container.querySelector('[role="log"]');
+    expect(log).not.toBeNull();
+    // The agent activity block is INSIDE the conversation scroll container.
+    expect(log!.querySelector('[aria-label="에이전트 활동"]')).not.toBeNull();
+    // The live streamed answer bubble is inside too.
+    expect(within(log as HTMLElement).getByText("부분 답변입니다")).toBeInTheDocument();
+  });
+
+  it("renders the live answer bubble only while thinking", () => {
+    const { container } = render(
+      <ConversationLog log={[]} phase="ready" turn={liveTurn} />,
+    );
+    expect(container.textContent).not.toContain("부분 답변입니다");
+  });
+
+  it("renders an archived tools entry as expandable Tool cards", () => {
+    const store = createPanelStore();
+    store.chatSent();
+    store.agentEvent("tool_call", "dat_set", { args: "{}" });
+    store.agentEvent("tool_result", "dat_set", {
+      result: "OK",
+      status: "completed",
+    });
+    store.answerReceived("끝");
+    render(<ConversationLog log={store.getState().log} phase="ready" />);
+    expect(screen.getByText(/도구 호출 1건/)).toBeInTheDocument();
+    // The archived row keeps its Tool card (name + state badge).
+    expect(screen.getByText("dat_set")).toBeInTheDocument();
+    expect(screen.getByText("완료")).toBeInTheDocument();
+  });
+});

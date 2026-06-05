@@ -170,6 +170,13 @@ async def _drain(engine):
         await task
 
 
+async def _drain_decision(engine):
+    """Await the in-flight changeset-decision task (EUD-070 background)."""
+    task = getattr(engine, "_decision_task", None)
+    if task is not None:
+        await task
+
+
 # --------------------------------------------------------------------------- #
 # parse_status.
 # --------------------------------------------------------------------------- #
@@ -339,6 +346,8 @@ async def test_changeset_reject_rolls_back(monkeypatch):
 
     await engine.handle({"type": "changeset_decision", "decision": "reject",
                          "ids": "all"})
+    # EUD-070: the decision runs as a BACKGROUND task — drain it first.
+    await _drain_decision(engine)
     assert journal.rolled_back is True
     rr = rec.first("rollback_result")
     assert rr["ok"] is True
@@ -361,8 +370,113 @@ async def test_changeset_accept_archives(monkeypatch):
 
     await engine.handle({"type": "changeset_decision", "decision": "accept",
                          "ids": "all"})
+    # EUD-070: the decision runs as a BACKGROUND task — drain it first.
+    await _drain_decision(engine)
     assert journal.accepted is True
     assert journal.rolled_back is False
+    assert engine.state == "idle"
+
+
+# --------------------------------------------------------------------------- #
+# EUD-070: a changeset decision runs as a BACKGROUND task. The live E2E showed a
+# rollback of a 3-property dat group taking 2-4s of sequential file IPC (1s
+# bridge tick each) while `await engine.handle(...)` blocked the WS receive
+# loop — every other click queued behind it ("동기적 렉"). The handler must
+# return immediately and the engine must keep serving other messages.
+# --------------------------------------------------------------------------- #
+
+
+class _BlockingJournal(FakeJournal):
+    """A journal whose rollback blocks until the test releases it."""
+
+    def __init__(self, items=None):
+        super().__init__(items=items)
+        import threading
+
+        self.release = threading.Event()
+
+    def rollback(self, *, ids=None, all=False):
+        self.release.wait(timeout=10.0)
+        return super().rollback(ids=ids, all=all)
+
+
+async def _drive_to_changeset_review(engine, created):
+    async def apply(send, tools, request_id):
+        return {"kind": "apply"}
+
+    created["runner"].queue(apply)
+    await engine.handle({"type": "chat", "text": "edit"})
+    await _drain(engine)
+    assert engine.state == "changeset_review"
+
+
+async def test_changeset_decision_does_not_block_the_receive_loop(monkeypatch):
+    monkeypatch.setattr(rag_mod, "search", lambda *a, **k: [])
+    journal = _BlockingJournal(items=[{"category": "dat", "id": "e1"}])
+    tl = FakeToolLayer()
+    tl.set_journal(journal)
+    engine, rec, created, _ = make_engine(tool_layer=tl)
+    await _drive_to_changeset_review(engine, created)
+
+    # handle() returns while the rollback is STILL blocked in its thread.
+    await engine.handle({"type": "changeset_decision", "decision": "reject",
+                         "ids": "all"})
+    assert not rec.has("rollback_result"), (
+        "the decision must run in the background, not inline"
+    )
+    assert engine.state == "changeset_review"
+
+    # The receive loop is free: another message processes immediately.
+    await engine.handle({"type": "status"})
+    assert rec.has("status")
+
+    journal.release.set()
+    await _drain_decision(engine)
+    assert rec.has("rollback_result")
+    assert engine.state == "idle"
+
+
+async def test_second_decision_while_in_flight_errors(monkeypatch):
+    monkeypatch.setattr(rag_mod, "search", lambda *a, **k: [])
+    journal = _BlockingJournal(items=[{"category": "dat", "id": "e1"}])
+    tl = FakeToolLayer()
+    tl.set_journal(journal)
+    engine, rec, created, _ = make_engine(tool_layer=tl)
+    await _drive_to_changeset_review(engine, created)
+
+    await engine.handle({"type": "changeset_decision", "decision": "reject",
+                         "ids": "all"})
+    await engine.handle({"type": "changeset_decision", "decision": "accept",
+                         "ids": "all"})
+    assert "decision" in rec.first("error")["message"].lower()
+
+    journal.release.set()
+    await _drain_decision(engine)
+    assert engine.state == "idle"
+
+
+async def test_new_chat_waits_for_inflight_decision(monkeypatch):
+    """A chat arriving during an in-flight decision must not race the journal:
+    the engine drains the decision first, then proceeds with the new turn."""
+    monkeypatch.setattr(rag_mod, "search", lambda *a, **k: [])
+    journal = _BlockingJournal(items=[{"category": "dat", "id": "e1"}])
+    tl = FakeToolLayer()
+    tl.set_journal(journal)
+    engine, rec, created, _ = make_engine(tool_layer=tl)
+    await _drive_to_changeset_review(engine, created)
+
+    await engine.handle({"type": "changeset_decision", "decision": "reject",
+                         "ids": "all"})
+    journal.release.set()  # let the decision finish once the chat drains it
+
+    async def answer(send, tools, request_id):
+        return {"kind": "answer"}
+
+    created["runner"].queue(answer)
+    await engine.handle({"type": "chat", "text": "next thing"})
+    await _drain(engine)
+    # The decision completed (rollback_result emitted) before the new turn.
+    assert rec.has("rollback_result")
     assert engine.state == "idle"
 
 
