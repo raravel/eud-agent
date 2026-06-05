@@ -62,6 +62,13 @@ class FakeRunner:
         self.captured_prompts: list[str] = []
         self.cancelled = False
         self.thread_id: str | None = None
+        # EUD-064 continuity instrumentation: record the ORDER of start/resume
+        # calls (the engine must start the FIRST chat then resume every later one),
+        # every system prompt seen (only the first thread gets one), and how many
+        # times the engine dropped the thread (reset{}).
+        self.turn_calls: list[str] = []
+        self.captured_system_prompts: list[str | None] = []
+        self.reset_count = 0
 
     def queue(self, script) -> None:
         self.scripts.append(script)
@@ -72,12 +79,23 @@ class FakeRunner:
     async def start_turn(self, text, *, request_id, system_prompt) -> dict:
         self.thread_id = self.thread_id or "fake-thread"
         self.captured_system_prompt = system_prompt
+        self.captured_system_prompts.append(system_prompt)
         self.captured_prompts.append(text)
+        self.turn_calls.append("start")
         return await self._run_script(request_id, text)
 
     async def resume_turn(self, text, *, request_id) -> dict:
         self.captured_prompts.append(text)
+        self.captured_system_prompts.append(None)
+        self.turn_calls.append("resume")
         return await self._run_script(request_id, text)
+
+    def has_thread(self) -> bool:
+        return self.thread_id is not None
+
+    def reset_thread(self) -> None:
+        self.thread_id = None
+        self.reset_count += 1
 
     async def _run_script(self, request_id, text) -> dict:
         if not self.scripts:
@@ -657,6 +675,383 @@ def test_isolation_is_injectable(tmp_path):
     assert parsed.get("foo.bar") is True
     # mcp_servers whole-table replacement still applies regardless.
     assert set(parsed["mcp_servers"].keys()) == {"eud-tools"}
+
+
+# --------------------------------------------------------------------------- #
+# 6c. Conversation continuity across chats (EUD-064): the FIRST chat starts the
+#     codex thread (system prompt as base_instructions); EVERY later chat RESUMES
+#     it so codex keeps its message + tool-call history. The agent-forgets bug
+#     (chat-per-thread_start) is the defect this asserts against.
+# --------------------------------------------------------------------------- #
+
+
+def test_second_chat_resumes_same_thread(tmp_path, monkeypatch):
+    """Two chats in one session -> exactly one start_turn then one resume_turn
+    (NOT two start_turns). The retained codex thread carries the history."""
+    from fastapi.testclient import TestClient
+
+    cfg, app, created = build_app(tmp_path, monkeypatch)
+    _wire_journal(app, tmp_path, _JournalBridge())
+
+    with TestClient(app) as client:
+        with _connect(client, cfg) as ws:
+            r = created["runner"]
+            r.queue(answer_script("first"))
+            ws.send_json({"type": "chat", "text": "first message"})
+            _recv_until(ws, "answer")
+
+            r.queue(answer_script("second"))
+            ws.send_json({"type": "chat", "text": "do you remember?"})
+            _recv_until(ws, "answer")
+
+    assert r.turn_calls == ["start", "resume"], (
+        f"second chat must RESUME the thread, not start a new one; "
+        f"got {r.turn_calls}"
+    )
+    # Only the FIRST thread carries base_instructions; the resume gets none.
+    assert r.captured_system_prompts[0] is not None
+    assert r.captured_system_prompts[1] is None
+
+
+def test_resumed_chat_carries_refreshed_state_and_rag_plus_user_text(
+    tmp_path, monkeypatch
+):
+    """The resumed turn text PREPENDS a refreshed [project state] + [reference
+    context] (RAG for the new question) ahead of the original user text."""
+    from fastapi.testclient import TestClient
+
+    rag_marker = "RESUME_RAG_MARKER"
+
+    def fake_search(query, k=5, *, rag_db):
+        return [{"text": rag_marker, "title": "t", "url": "u", "distance": 0.1}]
+
+    monkeypatch.setattr(rag_mod, "search", fake_search)
+
+    cfg, app, created = build_app(tmp_path, monkeypatch)
+    _wire_journal(app, tmp_path, _JournalBridge())
+
+    with TestClient(app) as client:
+        with _connect(client, cfg) as ws:
+            r = created["runner"]
+            r.queue(answer_script("first"))
+            ws.send_json({"type": "chat", "text": "first message"})
+            _recv_until(ws, "answer")
+
+            r.queue(answer_script("second"))
+            ws.send_json({"type": "chat", "text": "SECOND_USER_TEXT please"})
+            _recv_until(ws, "answer")
+
+    # captured_prompts[1] is the SECOND chat's resume text.
+    resume_text = r.captured_prompts[1]
+    assert "SECOND_USER_TEXT please" in resume_text, (
+        f"original user text must be intact; got {resume_text!r}"
+    )
+    assert "[project state]" in resume_text, (
+        f"resumed turn must carry refreshed project state; got {resume_text!r}"
+    )
+    assert "[reference context]" in resume_text, (
+        f"resumed turn must carry refreshed reference context; got {resume_text!r}"
+    )
+    assert rag_marker in resume_text, (
+        f"RAG must run against the NEW question for the resume; got {resume_text!r}"
+    )
+
+
+def test_reset_drops_thread_next_chat_starts_fresh(tmp_path, monkeypatch):
+    """reset{} drops the retained thread; the NEXT chat starts a fresh thread
+    (start_turn with a new system prompt), not a resume."""
+    from fastapi.testclient import TestClient
+
+    cfg, app, created = build_app(tmp_path, monkeypatch)
+    _wire_journal(app, tmp_path, _JournalBridge())
+
+    with TestClient(app) as client:
+        with _connect(client, cfg) as ws:
+            r = created["runner"]
+            r.queue(answer_script("first"))
+            ws.send_json({"type": "chat", "text": "first message"})
+            _recv_until(ws, "answer")
+
+            ws.send_json({"type": "reset"})
+
+            r.queue(answer_script("fresh start"))
+            ws.send_json({"type": "chat", "text": "brand new conversation"})
+            _recv_until(ws, "answer")
+
+    assert r.reset_count >= 1, "reset{} must drop the retained thread"
+    # First chat started; after reset the next chat STARTS again (not resume).
+    assert r.turn_calls == ["start", "start"], (
+        f"chat after reset must start a fresh thread; got {r.turn_calls}"
+    )
+    assert r.captured_system_prompts[0] is not None
+    assert r.captured_system_prompts[1] is not None, (
+        "the post-reset chat must carry a fresh system prompt"
+    )
+
+
+def test_reset_in_changeset_review_finalizes_prior_journal(tmp_path, monkeypatch):
+    """reset{} arriving while a prior changeset is UNDECIDED finalizes it
+    (default-accept + archive note), exactly like a new chat does."""
+    import json
+
+    from fastapi.testclient import TestClient
+
+    jbridge = _JournalBridge()
+    cfg, app, created = build_app(tmp_path, monkeypatch)
+    _wire_journal(app, tmp_path, jbridge)
+
+    with TestClient(app) as client:
+        with _connect(client, cfg) as ws:
+            r = created["runner"]
+            r.queue(edit_script(value="100"))
+            ws.send_json({"type": "chat", "text": "an edit"})
+            request_id = _recv_until(ws, "changeset")[-1]["request_id"]
+
+            ws.send_json({"type": "reset"})
+            # Give the reset a beat to finalize the journal before teardown.
+            import time as _t
+            _t.sleep(0.1)
+
+    journal_dir = tmp_path / "data" / "journal"
+    archived = journal_dir / f"{request_id}.accepted.json"
+    live = journal_dir / f"{request_id}.json"
+    assert archived.is_file(), "reset in changeset_review must archive the journal"
+    assert not live.is_file(), "the prior live journal must not leak"
+    payload = json.loads(archived.read_text(encoding="utf-8"))
+    assert payload.get("note"), "the archive must carry a defaulted-to-accepted note"
+    # Default-accept, NOT rollback: no inverse setdat of the old value 50.
+    assert not any(
+        c[0] == "setdat" and str(c[-1]) == "50" for c in jbridge.calls
+    ), f"reset must default-accept, not roll back; calls={jbridge.calls}"
+
+
+def test_reset_during_executing_is_error(tmp_path, monkeypatch):
+    """reset{} while a turn is in flight (executing) is rejected with error{}."""
+    from fastapi.testclient import TestClient
+
+    cfg, app, created = build_app(tmp_path, monkeypatch)
+    _wire_journal(app, tmp_path, _JournalBridge())
+
+    def slow_script(emit, tools, request_id):
+        async def _run(emit, tools, request_id):
+            import asyncio as _aio
+
+            await emit({"type": "agent_event", "kind": "thinking",
+                        "detail": "started"})
+            runner = created["runner"]
+            for _ in range(300):
+                if runner.cancelled:
+                    return {"kind": "answer"}
+                await _aio.sleep(0.02)
+            await emit({"type": "answer", "text": "late"})
+            return {"kind": "answer"}
+        return _run(emit, tools, request_id)
+
+    with TestClient(app) as client:
+        with _connect(client, cfg) as ws:
+            r = created["runner"]
+            r.queue(slow_script)
+            ws.send_json({"type": "chat", "text": "long task"})
+            _recv_until(ws, "agent_event", max_msgs=5)
+            ws.send_json({"type": "reset"})
+            err = _recv_until(ws, "error", max_msgs=5)[-1]
+            ws.send_json({"type": "cancel"})
+            import time as _t
+            for _ in range(100):
+                if r.cancelled:
+                    break
+                _t.sleep(0.02)
+    assert "error" == err["type"]
+    assert r.reset_count == 0, "reset during executing must NOT drop the thread"
+
+
+def test_reset_when_idle_is_idempotent(tmp_path, monkeypatch):
+    """reset{} when idle is a no-op-safe drop: it never errors, and a repeated
+    reset stays safe (idempotent)."""
+    from fastapi.testclient import TestClient
+
+    cfg, app, created = build_app(tmp_path, monkeypatch)
+    _wire_journal(app, tmp_path, _JournalBridge())
+
+    with TestClient(app) as client:
+        with _connect(client, cfg) as ws:
+            r = created["runner"]
+            # reset with no thread yet -> safe.
+            ws.send_json({"type": "reset"})
+            # then a chat + two resets back-to-back -> still safe.
+            r.queue(answer_script("ok"))
+            ws.send_json({"type": "chat", "text": "hello"})
+            _recv_until(ws, "answer")
+            ws.send_json({"type": "reset"})
+            ws.send_json({"type": "reset"})
+            # a following chat still works (starts fresh).
+            r.queue(answer_script("again"))
+            ws.send_json({"type": "chat", "text": "hi again"})
+            _recv_until(ws, "answer")
+
+    # No error{} surfaced for idle resets; the post-reset chat started fresh.
+    assert r.turn_calls == ["start", "start"], (
+        f"idle resets must not break the next chat's fresh start; got {r.turn_calls}"
+    )
+
+
+def test_budgets_and_gate_reset_per_request_across_continuous_thread(
+    tmp_path, monkeypatch
+):
+    """Regression (EUD-064): the codex THREAD persists across chats, but each chat
+    still mints a FRESH request_id, so the mutation gate + 30-action budget reset
+    PER REQUEST. Two chats -> two distinct request ids, each with a fresh count."""
+    from fastapi.testclient import TestClient
+
+    jbridge = _JournalBridge()
+    cfg, app, created = build_app(tmp_path, monkeypatch)
+    _wire_journal(app, tmp_path, jbridge)
+
+    seen_request_ids: list[str] = []
+
+    def capture_edit_script():
+        async def _script(emit, tools, request_id):
+            seen_request_ids.append(request_id)
+            tools.call_for_request(request_id, "dat_set",
+                                   {"dat": "units", "param": "MaxHP",
+                                    "objId": 0, "value": "100"})
+            await emit({"type": "agent_event", "kind": "tool_call",
+                        "detail": "dat_set"})
+            return {"kind": "apply"}
+        return _script
+
+    with TestClient(app) as client:
+        with _connect(client, cfg) as ws:
+            r = created["runner"]
+            r.queue(capture_edit_script())
+            ws.send_json({"type": "chat", "text": "edit one"})
+            _recv_until(ws, "changeset")
+
+            r.queue(capture_edit_script())
+            ws.send_json({"type": "chat", "text": "edit two"})
+            _recv_until(ws, "changeset")
+
+            tl = app.state.tool_layer
+            assert len(seen_request_ids) == 2
+            assert seen_request_ids[0] != seen_request_ids[1], (
+                "each chat must mint a fresh request_id"
+            )
+            # Each per-request state has exactly ONE mutation + ONE action — the
+            # gate/budget did NOT accumulate across the continuous thread.
+            for rid in seen_request_ids:
+                st = tl.get_request_state(rid)
+                assert st.mutation_count == 1, (
+                    f"per-request mutation count must reset; {rid} -> "
+                    f"{st.mutation_count}"
+                )
+                assert st.action_count == 1, (
+                    f"per-request action budget must reset; {rid} -> "
+                    f"{st.action_count}"
+                )
+
+
+# --------------------------------------------------------------------------- #
+# 6d. CodexSDKRunner-level thread retention (EUD-064): a non-resume turn must NOT
+#     discard a retained thread (the engine routes start-vs-resume, but a stray
+#     start_turn after a thread exists must reuse it, not nuke history). reset_thread
+#     is the ONLY thing that drops it.
+# --------------------------------------------------------------------------- #
+
+
+class _FakeThread:
+    def __init__(self, thread_id):
+        self.id = thread_id
+
+
+class _FakeHandle:
+    def stream(self):
+        return iter(())
+
+
+class _FakeCodex:
+    """A fake SDK ``Codex`` recording thread_start vs thread_resume calls."""
+
+    def __init__(self):
+        self.starts = 0
+        self.resumes: list[str] = []
+        self._next = 0
+
+    def thread_start(self, **kwargs):
+        self.starts += 1
+        self._next += 1
+        t = _FakeThread(f"thread-{self._next}")
+        t.turn = lambda text: _FakeHandle()
+        return t
+
+    def thread_resume(self, thread_id):
+        self.resumes.append(thread_id)
+        t = _FakeThread(thread_id)
+        t.turn = lambda text: _FakeHandle()
+        return t
+
+
+def _runner_with_fake_codex(tmp_path):
+    from eud_agent.agent_runner import CodexSDKRunner
+
+    async def _send(_ev):  # pragma: no cover - never awaited (empty stream)
+        return None
+
+    runner = CodexSDKRunner(
+        tool_layer=object(),
+        send=_send,
+        build_system_prompt=lambda *a, **k: "",
+        codex_bin=str(tmp_path / "codex.cmd"),
+        data_dir=str(tmp_path / "data"),
+    )
+    fake = _FakeCodex()
+    runner._codex = fake  # inject (skips the real SDK spawn)
+    return runner, fake
+
+
+def test_runner_second_nonresume_turn_keeps_retained_thread(tmp_path):
+    """A second start_turn after a thread is retained must REUSE it (resume), not
+    discard it with a fresh thread_start — history must survive a stray start."""
+    import asyncio
+
+    runner, fake = _runner_with_fake_codex(tmp_path)
+
+    asyncio.run(
+        runner.start_turn("first", request_id="r1", system_prompt="SYS")
+    )
+    assert fake.starts == 1
+    assert runner.has_thread() is True
+    first_id = runner._thread_id
+
+    # A SECOND non-resume turn must NOT start a new thread (the retained one wins).
+    asyncio.run(
+        runner.start_turn("second", request_id="r2", system_prompt="SYS2")
+    )
+    assert fake.starts == 1, (
+        f"a retained thread must not be discarded by a second start_turn; "
+        f"thread_start called {fake.starts} times"
+    )
+    assert fake.resumes == [first_id], (
+        f"the second turn must resume the retained thread; resumes={fake.resumes}"
+    )
+
+
+def test_runner_reset_thread_drops_retention(tmp_path):
+    """reset_thread() drops the retained id so the NEXT turn starts fresh."""
+    import asyncio
+
+    runner, fake = _runner_with_fake_codex(tmp_path)
+    asyncio.run(
+        runner.start_turn("first", request_id="r1", system_prompt="SYS")
+    )
+    assert runner.has_thread() is True
+
+    runner.reset_thread()
+    assert runner.has_thread() is False
+
+    asyncio.run(
+        runner.start_turn("after reset", request_id="r2", system_prompt="SYS2")
+    )
+    assert fake.starts == 2, "after reset_thread a fresh thread_start must fire"
 
 
 # --------------------------------------------------------------------------- #

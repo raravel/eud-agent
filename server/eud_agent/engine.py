@@ -12,7 +12,8 @@ One :class:`AgentEngine` is created per panel WS connection. It owns the per-ses
 :class:`AgentRunner` (codex thread continuity) and routes the WS v2 messages:
 
   client -> server: ``chat`` / ``plan_feedback`` / ``plan_approve`` /
-                    ``changeset_decision`` / ``cancel`` / ``status`` / ``list``
+                    ``changeset_decision`` / ``cancel`` / ``reset`` /
+                    ``status`` / ``list``
   server -> client: ``agent_event`` / ``answer`` / ``plan`` / ``changeset`` /
                     ``rollback_result`` / ``error`` / ``status`` / ``progress``
 
@@ -185,11 +186,26 @@ class AgentEngine:
     ToolLayer; ``bridge`` + ``rag_db`` feed the system prompt's state / RAG sections.
     """
 
-    def __init__(self, *, send, make_runner, get_tool_layer, bridge, rag_db):
+    def __init__(
+        self,
+        *,
+        send,
+        make_runner,
+        get_tool_layer,
+        bridge,
+        rag_db,
+        register_request_id=None,
+    ):
         self._send = send
         self._get_tool_layer = get_tool_layer
         self._bridge = bridge
         self._rag_db = rag_db
+        # Live request-id stamping (EUD-064): the engine publishes its CURRENT
+        # request id through this callback so the tool endpoint can stamp it onto
+        # tool calls from this active session (overriding the stale shim env id).
+        # ``None`` (no active session) restores the shim id as the fallback. A
+        # no-op default keeps the engine usable without the registry (unit tests).
+        self._register_request_id = register_request_id or (lambda _rid: None)
 
         self.state = "idle"
         self._runner = make_runner(
@@ -213,6 +229,7 @@ class AgentEngine:
             "plan_approve": self._on_plan_approve,
             "changeset_decision": self._on_changeset_decision,
             "cancel": self._on_cancel,
+            "reset": self._on_reset,
             "status": self._on_status,
             "list": self._on_list,
         }.get(mtype)
@@ -239,7 +256,27 @@ class AgentEngine:
         await self._finalize_prior_request()
         self._request_id = f"req-{uuid.uuid4().hex[:8]}"
         self._plan_revision = 0
+        # Publish the live request id so the tool endpoint stamps it onto this
+        # session's tool calls (the shim env id is pinned at thread creation and
+        # goes stale from the second chat — EUD-064).
+        self._register_request_id(self._request_id)
         runner = self._runner
+        # Conversation continuity (EUD-064): the FIRST chat STARTS the codex thread
+        # (system prompt as base_instructions); every later chat RESUMES the
+        # retained thread so codex keeps its message + tool-call history. A resumed
+        # chat carries no base_instructions, so the refreshed [project state] +
+        # [reference context] (RAG for the NEW question) are PREPENDED to the turn
+        # text instead (reusing build_system_prompt's section builders).
+        # Defensive access: a runner predating the continuity interface (some unit
+        # test fakes) has no has_thread -> treat as "no thread" so it keeps the old
+        # always-start behavior. The real CodexSDKRunner + the v2 FakeRunner expose
+        # has_thread/reset_thread (AgentRunner ABC, EUD-064).
+        if getattr(self._runner, "has_thread", lambda: False)():
+            turn_text = await asyncio.to_thread(self._resume_turn_text, text)
+            self._launch_turn(
+                runner.resume_turn(turn_text, request_id=self._request_id)
+            )
+            return
         system_prompt = await asyncio.to_thread(
             build_system_prompt,
             text,
@@ -252,6 +289,23 @@ class AgentEngine:
                 text, request_id=self._request_id, system_prompt=system_prompt
             )
         )
+
+    def _resume_turn_text(self, text: str) -> str:
+        """Refreshed [project state] + [reference context] prepended to ``text``.
+
+        A resumed chat gets no ``base_instructions`` (those exist only on the first
+        thread), so the current project state and the RAG context for the NEW
+        question are prepended ahead of the original user text. Reuses the same
+        section builders ``build_system_prompt`` uses. Called from a worker thread
+        (the bridge/RAG calls are synchronous, best-effort).
+        """
+        return "\n".join([
+            _project_state_section(self._bridge),
+            "",
+            _rag_section(text, self._rag_db),
+            "",
+            text,
+        ])
 
     # ------------------------------------------------------------- plan flow
     async def _on_plan_feedback(self, msg: dict) -> None:
@@ -397,6 +451,35 @@ class AgentEngine:
         # The runner's cancel interrupts the live turn; the journal entries
         # already written PERSIST by design (the user still reviews them).
 
+    # ------------------------------------------------------------- reset
+    async def _on_reset(self, msg: dict) -> None:
+        """Drop the retained codex thread so the next chat starts fresh (EUD-064).
+
+        Semantics (features/05 "Request scoping across a continuous thread"):
+
+          * ``executing`` / ``plan_review`` (a turn is in flight) -> error; the
+            user must ``cancel`` first (resetting mid-turn would strand the runner).
+          * ``changeset_review`` (a prior changeset is UNDECIDED) -> finalize it
+            first (undecided items default to accepted, journal archived with a
+            note) exactly like a new ``chat`` does, THEN drop the thread.
+          * ``idle`` -> just drop the thread (idempotent: a no-thread reset is a
+            harmless no-op).
+
+        Dropping the thread also clears the published live request id (no active
+        request until the next chat) and returns the engine to ``idle``.
+        """
+        if self.state in ("executing", "plan_review"):
+            await self._error("busy: cancel the in-flight turn before reset")
+            return
+        await self._finalize_prior_request()
+        reset_thread = getattr(self._runner, "reset_thread", None)
+        if callable(reset_thread):
+            reset_thread()
+        self._request_id = None
+        self._plan_revision = 0
+        self._register_request_id(None)
+        self.state = "idle"
+
     async def aclose(self) -> None:
         """A WS reconnect/close cancels the in-flight turn and reaps its task.
 
@@ -407,6 +490,9 @@ class AgentEngine:
         written persist by design.
         """
         self._runner.cancel()
+        # The session is gone: stop stamping its request id onto tool calls so a
+        # later headless call falls back to the shim id (EUD-064).
+        self._register_request_id(None)
         task = self._turn_task
         self._turn_task = None
         if task is not None and not task.done():

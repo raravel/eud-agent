@@ -28,7 +28,12 @@ eud-tools MCP server per-thread via ``thread_start(config={"mcp_servers": {...}}
 ``sys.executable -m eud_agent.mcp_shim`` with ``EUD_DATA_DIR`` + ``EUD_REQUEST_ID``
 in its env (so it locates ``server.ready`` and pins the per-session request id).
 The thread id is retained per panel session so follow-up turns
-(``thread_resume``) continue the conversation.
+(``thread_resume``) continue the conversation: the FIRST chat starts the thread,
+every later chat resumes it (conversation continuity, EUD-064 — the engine routes
+start-vs-resume). The retained id is dropped only by ``reset_thread`` (panel
+``reset{}``); even a stray ``start_turn`` while a thread is retained REUSES it
+rather than discarding the history. ``has_thread`` lets the engine query whether a
+thread is live.
 
 codex-environment isolation (EUD-062)
 -------------------------------------
@@ -48,12 +53,17 @@ spawn at TWO layers (defense-in-depth), driven by :class:`CodexIsolation`:
   — only ``eud-tools`` remains; and (b) ``features.plugins=false`` (the stable
   feature flag) to disable plugins.
 * **per-thread** ``thread_start(config={"mcp_servers": {...}})`` — kept from the
-  EUD-053 spike. The eud-tools entry here carries the LIVE ``EUD_REQUEST_ID`` env
-  (it changes per chat-session: a new ``chat`` starts a fresh thread, so the shim
-  re-spawns and re-reads the env). The request id MUST stay in this layer because
-  the launch-level override is fixed at ``Codex`` construction. Both layers name
-  the table ``eud-tools`` so the per-thread layer simply supplies the live env for
-  the same server the launch-level override admits.
+  EUD-053 spike. The eud-tools entry here carries an ``EUD_REQUEST_ID`` env value
+  pinned at thread creation. With conversation continuity (EUD-064) the codex
+  thread now PERSISTS across chats (only the FIRST chat starts it; later chats
+  resume), so this pinned id goes STALE from the second chat on — the shim re-reads
+  it only once, at thread spawn. The server therefore resolves the LIVE request id
+  at tool-call time (the tool endpoint stamps the engine's CURRENT id, ignoring the
+  shim-supplied one for an active session); this layer's env id is the legacy
+  headless fallback only. The request id stays in this layer because the
+  launch-level override is fixed at ``Codex`` construction. Both layers name the
+  table ``eud-tools`` so the per-thread layer simply supplies the env for the same
+  server the launch-level override admits.
 
 What is NOT isolated, and why:
 
@@ -190,6 +200,11 @@ class AgentRunner(ABC):
     (``{"kind": "answer"|"apply"|"plan", "markdown"?: str}``) so the WS state machine
     can route to ``answer``/``changeset``/``plan``. ``cancel`` interrupts the
     in-flight turn without stranding the journal.
+
+    Conversation continuity (EUD-064): ``has_thread`` reports whether a codex
+    thread is already retained (the engine starts the FIRST chat then resumes every
+    later one); ``reset_thread`` drops the retained id so the next chat starts a
+    fresh conversation (panel ``reset{}``).
     """
 
     @abstractmethod
@@ -200,6 +215,14 @@ class AgentRunner(ABC):
 
     @abstractmethod
     async def resume_turn(self, text: str, *, request_id: str) -> dict:
+        ...
+
+    @abstractmethod
+    def has_thread(self) -> bool:
+        ...
+
+    @abstractmethod
+    def reset_thread(self) -> None:
         ...
 
     @abstractmethod
@@ -286,6 +309,20 @@ class CodexSDKRunner(AgentRunner):
         except Exception:  # noqa: BLE001 - cancel is best-effort; never raise
             pass
 
+    def has_thread(self) -> bool:
+        """Whether a codex thread is retained (continuity, EUD-064)."""
+        return self._thread_id is not None
+
+    def reset_thread(self) -> None:
+        """Drop the retained thread so the next turn starts a fresh conversation.
+
+        Panel ``reset{}`` (EUD-064). Only the thread id is cleared — the lazily
+        built ``Codex`` client (and its isolated ``app-server`` process) is kept so
+        the next ``thread_start`` reuses it without a respawn.
+        """
+        self._thread_id = None
+        self._thread = None
+
     # ------------------------------------------------------------- internals
     def _ensure_codex(self):
         from openai_codex import Codex
@@ -363,10 +400,17 @@ class CodexSDKRunner(AgentRunner):
 
         Starts (or resumes) the thread, then consumes ``turn.stream()`` forwarding
         each event to the WS loop as ``agent_event``. Returns the turn-end dict.
+
+        Continuity (EUD-064): a RETAINED thread is always resumed — even on a
+        ``resume=False`` call — so a stray ``start_turn`` cannot discard the
+        conversation history; a fresh ``thread_start`` happens ONLY when no thread
+        is retained (the first chat, or after ``reset_thread``). ``resume`` from the
+        engine still signals "no system prompt"; the retention check is what guards
+        the history. ``base_instructions`` therefore apply only to the first thread.
         """
         codex = self._ensure_codex()
 
-        if resume and self._thread_id is not None:
+        if self._thread_id is not None:
             thread = codex.thread_resume(self._thread_id)
         else:
             kwargs: dict = {"config": self._thread_config(request_id)}

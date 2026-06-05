@@ -240,6 +240,177 @@ def test_ws_list_roundtrip(tmp_path, monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
+# Live request-id stamping (EUD-064): the tool endpoint stamps the ENGINE's
+# CURRENT request id onto every tool call from an active panel session, ignoring
+# the (possibly stale) shim-supplied id. The shim env id is pinned at thread
+# creation and goes stale once the second chat resumes the thread; the server
+# resolves the live id at tool-call time. With NO active session (legacy headless
+# runner), the shim-supplied id remains the fallback.
+# --------------------------------------------------------------------------- #
+
+
+class _StampFakeRunner:
+    """A codex-free AgentRunner used only for the request-id stamping tests.
+
+    Its turns do nothing (no tool calls); the tests drive ``/tools/call`` directly
+    (simulating the shim) so the SERVER-side stamping seam is exercised in
+    isolation. ``has_thread``/``reset_thread`` round out the EUD-064 interface.
+    """
+
+    def __init__(self, *, tool_layer, send, build_system_prompt) -> None:
+        self.tool_layer = tool_layer
+        self._send = send
+        self.thread_id = None
+
+    async def start_turn(self, text, *, request_id, system_prompt) -> dict:
+        self.thread_id = self.thread_id or "fake-thread"
+        await self._send({"type": "answer", "text": "ok"})
+        return {"kind": "answer"}
+
+    async def resume_turn(self, text, *, request_id) -> dict:
+        await self._send({"type": "answer", "text": "ok"})
+        return {"kind": "answer"}
+
+    def has_thread(self) -> bool:
+        return self.thread_id is not None
+
+    def reset_thread(self) -> None:
+        self.thread_id = None
+
+    def cancel(self) -> None:
+        pass
+
+
+def _build_stamp_app(tmp_path, monkeypatch, *, token="stamp-tok"):
+    """An app with a journal-wired ToolLayer + a _StampFakeRunner factory.
+
+    The journal records writes under the request id the ENDPOINT resolves, so a
+    stale shim id vs the engine's current id is observable on disk.
+    """
+    from eud_agent import rag as rag_mod
+    from eud_agent.journal import Journal
+    from eud_agent.tools import ToolLayer
+
+    monkeypatch.setattr(
+        rag_mod, "start_warmup",
+        lambda *a, **k: threading.Thread(target=lambda: None),
+    )
+    monkeypatch.setattr(rag_mod, "search", lambda *a, **k: [])
+
+    class _Bridge:
+        def status(self, **kw):
+            return "compiling=false\nproject=demo\n"
+
+        def list_files(self, **kw):
+            return []
+
+        def getdat(self, dat, param, obj_id):
+            return f"OK: {dat} {param} {obj_id} = 50"
+
+        def setdat(self, dat, param, obj_id, value):
+            return "OK"
+
+    from eud_agent import app as _app_mod
+    monkeypatch.setattr(_app_mod, "BridgeIO", lambda *a, **k: _Bridge())
+
+    cfg = make_config(tmp_path, token=token)
+    bridge = _Bridge()
+    data_dir = str(tmp_path / "data")
+
+    created: dict = {}
+
+    def runner_factory(*, tool_layer, send, build_system_prompt):
+        r = _StampFakeRunner(
+            tool_layer=tool_layer, send=send,
+            build_system_prompt=build_system_prompt,
+        )
+        created["runner"] = r
+        return r
+
+    app = app_mod.create_app(
+        cfg, start_lifecycle=False, runner_factory=runner_factory
+    )
+
+    def journal_factory(request_id):
+        return Journal(data_dir=data_dir, request_id=request_id, bridge=bridge)
+
+    app.state.tool_layer = ToolLayer(bridge, journal_factory=journal_factory)
+    app.state.rebind_tool_layer(app.state.tool_layer)
+    return cfg, app, created
+
+
+def _origin_url(cfg):
+    return f"http://127.0.0.1:{cfg.port}"
+
+
+def test_tool_call_stamps_engine_request_id_over_stale_shim_id(tmp_path, monkeypatch):
+    """A stale shim request_id is OVERRIDDEN by the engine's current one for an
+    active session: the journaled write lands under the engine's id, not the shim's."""
+    from fastapi.testclient import TestClient
+
+    cfg, app, created = _build_stamp_app(tmp_path, monkeypatch)
+
+    with TestClient(app) as client:
+        with client.websocket_connect(
+            f"/ws?token={cfg.token}", headers={"origin": _origin_url(cfg)}
+        ) as ws:
+            # Start a session: the engine mints + registers its CURRENT request id.
+            ws.send_json({"type": "chat", "text": "hello"})
+            # Drain the turn (answer-only) so the engine settled on its request id.
+            for _ in range(10):
+                msg = ws.receive_json()
+                if msg.get("type") in ("answer", "error", "changeset"):
+                    break
+
+            # Simulate the shim forwarding a journaled write with a STALE id.
+            r = client.post("/tools/call", json={
+                "token": cfg.token,
+                "request_id": "shim-STALE",
+                "tool": "dat_set",
+                "args": {"dat": "units", "param": "MaxHP", "objId": 0,
+                         "value": "100"},
+            })
+            assert r.status_code == 200
+            assert r.json().get("ok") is True
+
+    journal_dir = tmp_path / "data" / "journal"
+    # The write must NOT have journaled under the stale shim id.
+    assert not (journal_dir / "shim-STALE.json").is_file(), (
+        "the stale shim id must be ignored for an active session"
+    )
+    # It must have journaled under the engine's CURRENT request id (a req-* id).
+    live = list(journal_dir.glob("req-*.json"))
+    assert live, (
+        f"the write must journal under the engine's current request id; "
+        f"journal dir={[p.name for p in journal_dir.glob('*.json')]}"
+    )
+
+
+def test_tool_call_uses_shim_id_when_no_active_session(tmp_path, monkeypatch):
+    """With NO active panel session (legacy headless runner), the shim-supplied
+    request id remains the fallback — it is honored, not overridden."""
+    from fastapi.testclient import TestClient
+
+    cfg, app, created = _build_stamp_app(tmp_path, monkeypatch)
+
+    with TestClient(app) as client:
+        # No WS connection -> no active session.
+        r = client.post("/tools/call", json={
+            "token": cfg.token,
+            "request_id": "headless-job-1",
+            "tool": "dat_set",
+            "args": {"dat": "units", "param": "MaxHP", "objId": 0, "value": "100"},
+        })
+        assert r.status_code == 200
+        assert r.json().get("ok") is True
+
+    journal_dir = tmp_path / "data" / "journal"
+    assert (journal_dir / "headless-job-1.json").is_file(), (
+        "with no active session the shim id must be the journal key (fallback)"
+    )
+
+
+# --------------------------------------------------------------------------- #
 # server.ready written ONLY after a real TCP connect succeeds (integration).
 # --------------------------------------------------------------------------- #
 

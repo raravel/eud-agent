@@ -1,4 +1,5 @@
 ---
+completed_at: '2026-06-05T17:12:11.625799'
 created: '2026-06-05'
 depends_on:
 - EUD-062-644f
@@ -14,7 +15,7 @@ scope:
 - server/tests/test_agent_flow.py
 - server/tests/test_app.py
 - server/tests/test_integration_ws.py
-status: in_progress
+status: done
 title: 'Conversation continuity: resume the codex thread across chats; reset{}; live
   request-id stamping'
 type: bug

@@ -1078,7 +1078,7 @@
       ]
     },
     "EUD-064-acf5": {
-      "status": "in_progress",
+      "status": "done",
       "priority": "high",
       "type": "bug",
       "parent": "EUD-047-fd09",
@@ -1087,8 +1087,8 @@
       ],
       "title": "Conversation continuity: resume the codex thread across chats; reset{}; live request-id stamping",
       "updated": "2026-06-05",
-      "completed_at": null,
-      "path": "active/EUD-064-acf5.md",
+      "completed_at": "2026-06-05T17:12:11.625799",
+      "path": "done/EUD-064-acf5.md",
       "scope": [
         "server/eud_agent/engine.py",
         "server/eud_agent/agent_runner.py",

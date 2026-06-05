@@ -392,6 +392,16 @@ def create_app(
 
     app.state.rebind_tool_layer = _rebind_tool_layer
 
+    # Live request-id stamping (EUD-064): the ACTIVE panel session publishes its
+    # CURRENT request id here. The tool endpoint stamps it onto every tool call,
+    # overriding the (stale) shim-supplied id; None means no active session, so the
+    # shim id is the fallback (legacy headless runner). One editor instance per
+    # machine (a single supported session at a time), so a plain holder suffices.
+    app.state.active_request_id = None
+
+    def _register_request_id(request_id: str | None) -> None:
+        app.state.active_request_id = request_id
+
     # v2 agent-runner factory (EUD-056). Injectable for tests (FakeRunner); the
     # default builds a real CodexSDKRunner over the resolved codex binary.
     def _default_runner_factory(*, tool_layer, send, build_system_prompt):
@@ -430,19 +440,31 @@ def create_app(
             return JSONResponse({"error": "invalid JSON body"}, status_code=400)
         if not isinstance(payload, dict) or payload.get("token") != cfg.token:
             return JSONResponse({"error": "unauthorized"}, status_code=401)
-        request_id = str(payload.get("request_id") or "default")
+        # Live request-id stamping (EUD-064): for an ACTIVE panel session the
+        # engine's CURRENT request id wins, ignoring the shim-supplied id (pinned
+        # at thread creation, stale from the second resumed chat). With NO active
+        # session (active_request_id is None) the shim id is the fallback (legacy
+        # headless runner / no-session calls).
+        active_request_id = app.state.active_request_id
+        if active_request_id is not None:
+            request_id = active_request_id
+        else:
+            request_id = str(payload.get("request_id") or "default")
         tool = payload.get("tool")
         args = payload.get("args") or {}
         if not isinstance(tool, str):
             return JSONResponse(
                 {"ok": False, "error": "missing 'tool' name"}
             )
+        # Read the (possibly test-swapped) tool layer from app.state so the same
+        # per-request journal/gate the engine uses backs these forwarded calls.
+        active_tool_layer = app.state.tool_layer
         # The handlers do blocking file-IPC (bridge); run off the event loop. A
         # ToolError (bad args / gate / budget / bridge ERROR) is returned as a
         # tool result, never raised to a 5xx.
         try:
             result = await asyncio.to_thread(
-                tool_layer.call_for_request, request_id, tool, args
+                active_tool_layer.call_for_request, request_id, tool, args
             )
         except ToolError as exc:
             return JSONResponse({"ok": False, "error": str(exc)})
@@ -486,6 +508,7 @@ def create_app(
             get_tool_layer=lambda: app.state.tool_layer,
             bridge=bridge,
             rag_db=cfg.rag_db,
+            register_request_id=_register_request_id,
         )
         try:
             await _serve_ws(websocket, engine)
