@@ -1,6 +1,6 @@
 # eud-agent Tech Stack
 
-> Grounding (2026-06-04, refreshed after the EUD-031 scaffold; re-checked 2026-06-05 for the v2 plan — manifests unchanged): Python deps grounded in `server/pyproject.toml` + `server/uv.lock`; frontend deps grounded in `panel/package.json` + `panel/package-lock.json` (exact resolved versions below).
+> Grounding (2026-06-04, refreshed after the EUD-031 scaffold; re-checked 2026-06-05 for the v2 plan; re-checked 2026-06-06 for the project-memory plan — Python manifest unchanged, frontend section updated to the Decision-06 reality): Python deps grounded in `server/pyproject.toml` + `server/uv.lock`; frontend deps grounded in `panel/package.json` + `panel/package-lock.json` (exact resolved versions below).
 
 ## Active Dependencies
 
@@ -17,24 +17,24 @@ Pinned in `server/pyproject.toml` (uv-managed venv at `server/.venv`, Python 3.1
 - mcp 1.27.2 — Model Context Protocol Python SDK; server side of the eud-tools stdio shim codex attaches to (FastMCP, stdio transport) (EUD-053 spike)
 - ruff (dev) — lint; pytest (dev) — test runner; pytest-asyncio (dev) — WS/orchestrator tests
 
-### Frontend (panel/) — pinned in `panel/package.json` (resolved via package-lock.json, EUD-031)
+### Frontend (panel/) — pinned in `panel/package.json` (resolved via package-lock.json; re-grounded 2026-06-06)
 
-- react / react-dom 19.2.7 — panel UI runtime
+- react / react-dom 19.2.x (^19.2.0) — panel UI runtime
 - typescript 5.9.3 — TS sources (`panel/src`)
-- vite 7.3.5 + @vitejs/plugin-react 5.2.0 — build tool; output `panel/dist/` (gitignored)
-- tailwindcss / @tailwindcss/vite 4.3.0 — styling, CSS-variables mode (shadcn requirement)
+- vite 7.x (^7.1.12) + @vitejs/plugin-react ^5.0.4 — build tool; output `panel/dist/` (gitignored)
+- tailwindcss / @tailwindcss/vite 4.3.0 — styling, CSS-variables mode (shadcn requirement); tw-animate-css 1.4.0 (dev) — animation utilities
 - shadcn/ui — vendored component SOURCE in `panel/components/ui/` (registry copy, not a runtime dep; `components.json` aliases point future `npx shadcn add` at the same dirs)
-- (retired) Vercel AI Elements — vendored in EUD-031, REPLACED by custom lightweight components during EUD-034 pruning (streamdown/shiki inflated the eager entry); the vendored source was deleted in EUD-035 (`panel/components/ai-elements/` guarded ABSENT by the contract test)
-- monaco-editor 0.55.1 + @monaco-editor/react 4.7.0 (+ @monaco-editor/loader 1.7.0) — edit tab; bound to the npm bundle via `loader.config({ monaco })` in `panel/src/editor/monaco.ts` with 5 `?worker` Vite imports (CDN injection path verified unreachable — EUD-031 review)
-- Final runtime deps (post EUD-034/035 pruning, package-lock-grounded): @monaco-editor/react ^4.7.0, class-variance-authority ^0.7.1, clsx ^2.1.1, lucide-react ^1.17.0, monaco-editor ^0.55.1, radix-ui ^1.4.3, react/react-dom ^19.2.0, tailwind-merge ^3.6.0 (9 deps; 17 registry/streamdown deps removed in EUD-034, ai + use-stick-to-bottom removed in EUD-035)
-- Test devDeps: vitest ^3.2.6, happy-dom ^16.8.1, @testing-library/react|dom|user-event|jest-dom (panel unit/component suites, 120 tests)
+- Vercel AI Elements — vendored component SOURCE in `panel/components/ai-elements/` (conversation/loader/message/plan/prompt-input/reasoning/response/shimmer/tool), RE-ADOPTED by Decision 06 for the v2 agent-text pipeline (supersedes the EUD-034/035 pruning, which had removed the EUD-031 vendoring); runtime deps streamdown 2.5.0 (markdown/agent-text renderer, local assets only) + use-stick-to-bottom 1.1.6 (conversation autoscroll)
+- monaco-editor 0.55.1 + @monaco-editor/react 4.7.0 (+ @monaco-editor/loader 1.7.0) — edit surface; bound to the npm bundle via `loader.config({ monaco })` in `panel/src/editor/monaco.ts` with 5 `?worker` Vite imports (CDN injection path verified unreachable — EUD-031 review)
+- Full runtime dep list (package.json-grounded, 2026-06-06, 11 deps): @monaco-editor/react ^4.7.0, class-variance-authority ^0.7.1, clsx ^2.1.1, lucide-react ^1.17.0, monaco-editor ^0.55.1, radix-ui ^1.4.3, react/react-dom ^19.2.0, streamdown ^2.5.0, tailwind-merge ^3.6.0, use-stick-to-bottom ^1.1.6
+- Test devDeps: vitest ^3.2.6, happy-dom ^16.8.1, @testing-library/react|dom|user-event|jest-dom (panel unit/component suites)
 - npm — package manager (node v24.11.1 system install)
 
-> Decision: see [[decisions/03_react-panel-rebuild]] and [[decisions/05_monaco-editor-adoption]].
+> Decision: see [[decisions/03_react-panel-rebuild]], [[decisions/05_monaco-editor-adoption]] and [[decisions/06_ai-elements-streamdown-adoption]].
 
 ## Build Artifacts
 
-- `panel/dist/` — Vite build output; NEVER committed (gitignored). Dev machines build locally (`npm --prefix panel run build`); distribution is packaged into GitHub Releases by the later release phase. See [[decisions/04_dist-release-distribution]]. Current dist (post EUD-034 pruning): ~14 MB total, eager entry 265.5 kB (84.6 kB gzip); Monaco lazy-split 3.79 MB + 5 local workers.
+- `panel/dist/` — Vite build output; NEVER committed (gitignored). Dev machines build locally (`npm --prefix panel run build`); distribution is packaged into GitHub Releases by the later release phase. See [[decisions/04_dist-release-distribution]]. Monaco stays lazy-split with 5 local workers (no CDN).
 - WebView2 SDK 1.0.3800.47 DLLs — `Microsoft.Web.WebView2.Core.dll` (649,840 B), `Microsoft.Web.WebView2.Wpf.dll` (82,544 B), `WebView2Loader.dll` (160,880 B, win-x64) — vendored at `vendor/webview2/`
 - WebView2 Evergreen runtime — installed (Chromium 148 verified by probe)
 - bge-m3 model weights — 4.3 GB in the HF cache (`C:\Users\ifthe\.cache\huggingface\hub\models--BAAI--bge-m3`); setup_env.ps1 checks presence and warns (first query downloads ~4.3 GB otherwise). Measured: load+first-search 12.8s (CUDA), warm search 0.015s (EUD-017).
@@ -52,7 +52,7 @@ Pinned in `server/pyproject.toml` (uv-managed venv at `server/.venv`, Python 3.1
 
 ## Project Structure
 
-See architecture.md "Repository layout". Tooling: uv for venv + installs, PowerShell 7 for scripts/, Vite/npm for panel/ (build output `panel/dist/` served by the server; dist and node_modules gitignored).
+See architecture.md "Repository layout". Tooling: uv for venv + installs, PowerShell 7 for scripts/, Vite/npm for panel/ (build output `panel/dist/` served by the server; dist and node_modules gitignored). Per-map-project runtime memory lives under the editor's `Data\agent\harness\<project>\` (see [[features/07_project-memory|07_project-memory]]).
 
 ## Rationale
 

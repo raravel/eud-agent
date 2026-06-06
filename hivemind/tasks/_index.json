@@ -1257,6 +1257,130 @@
       "scope": [
         "panel/src/**"
       ]
+    },
+    "EUD-075-43ae": {
+      "status": "pending",
+      "priority": "high",
+      "type": "epic",
+      "parent": null,
+      "depends_on": [],
+      "title": "Project memory harness (per-map-project codex memory)",
+      "updated": "2026-06-06",
+      "completed_at": null,
+      "path": "active/EUD-075-43ae.md",
+      "scope": []
+    },
+    "EUD-076-d2c2": {
+      "status": "pending",
+      "priority": "high",
+      "type": "story",
+      "parent": "EUD-075-43ae",
+      "depends_on": [],
+      "title": "Server memory core (store, tool, injection)",
+      "updated": "2026-06-06",
+      "completed_at": null,
+      "path": "active/EUD-076-d2c2.md",
+      "scope": []
+    },
+    "EUD-077-de1e": {
+      "status": "pending",
+      "priority": "medium",
+      "type": "story",
+      "parent": "EUD-075-43ae",
+      "depends_on": [
+        "EUD-076-d2c2"
+      ],
+      "title": "Memory WS endpoints + panel view",
+      "updated": "2026-06-06",
+      "completed_at": null,
+      "path": "active/EUD-077-de1e.md",
+      "scope": []
+    },
+    "EUD-078-3b29": {
+      "status": "pending",
+      "priority": "high",
+      "type": "task",
+      "parent": "EUD-076-d2c2",
+      "depends_on": [],
+      "title": "ProjectMemory store module (paths, IO, episodes, section renderer)",
+      "updated": "2026-06-06",
+      "completed_at": null,
+      "path": "active/EUD-078-3b29.md",
+      "scope": [
+        "server/eud_agent/memory.py",
+        "server/tests/test_memory.py"
+      ]
+    },
+    "EUD-079-15f5": {
+      "status": "pending",
+      "priority": "high",
+      "type": "task",
+      "parent": "EUD-076-d2c2",
+      "depends_on": [
+        "EUD-078-3b29"
+      ],
+      "title": "memory_write tool + journal snapshot/inverse + changeset memory items",
+      "updated": "2026-06-06",
+      "completed_at": null,
+      "path": "active/EUD-079-15f5.md",
+      "scope": [
+        "server/eud_agent/tools.py",
+        "server/eud_agent/journal.py",
+        "server/tests/test_tools.py",
+        "server/tests/test_journal.py"
+      ]
+    },
+    "EUD-080-ecb0": {
+      "status": "pending",
+      "priority": "high",
+      "type": "task",
+      "parent": "EUD-076-d2c2",
+      "depends_on": [
+        "EUD-079-15f5"
+      ],
+      "title": "[project memory] prompt injection + episode recording at finalization",
+      "updated": "2026-06-06",
+      "completed_at": null,
+      "path": "active/EUD-080-ecb0.md",
+      "scope": [
+        "server/eud_agent/engine.py",
+        "server/tests/test_agent_flow.py"
+      ]
+    },
+    "EUD-081-cd4a": {
+      "status": "pending",
+      "priority": "medium",
+      "type": "task",
+      "parent": "EUD-077-de1e",
+      "depends_on": [
+        "EUD-078-3b29"
+      ],
+      "title": "memory_get/memory_save WS endpoints + integration test",
+      "updated": "2026-06-06",
+      "completed_at": null,
+      "path": "active/EUD-081-cd4a.md",
+      "scope": [
+        "server/eud_agent/app.py",
+        "server/tests/test_app.py",
+        "server/tests/test_integration_ws.py"
+      ]
+    },
+    "EUD-082-fa35": {
+      "status": "pending",
+      "priority": "medium",
+      "type": "task",
+      "parent": "EUD-077-de1e",
+      "depends_on": [
+        "EUD-081-cd4a"
+      ],
+      "title": "Panel memory view (tabs, Monaco edit, episodes, changeset memory items)",
+      "updated": "2026-06-06",
+      "completed_at": null,
+      "path": "active/EUD-082-fa35.md",
+      "scope": [
+        "panel/src/**",
+        "panel/components/**"
+      ]
     }
   }
 }
