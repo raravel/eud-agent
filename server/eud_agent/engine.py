@@ -30,7 +30,9 @@ System prompt (first turn)
 :func:`build_system_prompt` composes the tool catalog (``ToolLayer.tool_specs``),
 the project state (bridge STATUS + LIST, best-effort), the first principles
 (never-do crash causes, ahead of the RAG context so they outrank retrieved
-examples), the RAG top-k context for
+examples), the per-map-project memory (features/07, between the first principles
+and the RAG context so project-specific truth outranks generic examples but the
+never-do rules outrank both), the RAG top-k context for
 the user request (``rag.search``, degrading to none when unavailable), and the
 triage instructions (answer-only -> no write tools; <=2 mutations -> apply
 directly; larger -> ``propose_plan`` first). The same prompt drives the real
@@ -40,10 +42,15 @@ CodexSDKRunner and the test FakeRunner.
 from __future__ import annotations
 
 import asyncio
+import logging
 import uuid
+from datetime import datetime
 from pathlib import Path
 
 from . import rag
+from .memory import ProjectMemory
+
+_log = logging.getLogger(__name__)
 
 # RAG retrieval depth for the system-prompt context (matches v1 orchestrator).
 _RAG_K = 5
@@ -81,13 +88,23 @@ def build_system_prompt(
     tool_layer,
     bridge,
     rag_db: str,
+    data_dir=None,
 ) -> str:
-    """Compose the first-turn system prompt (tools + state + principles + RAG + triage).
+    """Compose the first-turn system prompt (tools + state + principles + memory
+    + RAG + triage).
 
     Best-effort throughout: a bridge/RAG failure degrades that section rather than
     failing the turn (the panel must stay responsive). Called from a worker thread
     (the bridge/RAG calls are synchronous).
+
+    ``data_dir`` (features/07) enables the ``[project memory]`` section, placed
+    BETWEEN ``[first principles]`` and ``[reference context]`` (project-specific
+    truth outranks generic RAG; never-do rules outrank both). The project name is
+    REUSED from the same STATUS fetch that builds ``[project state]`` (no second
+    round-trip). ``None`` (the default) preserves callers that predate the memory
+    seam (app.py wires it in EUD-081).
     """
+    state_section, project = _fetch_project_state(bridge)
     parts: list[str] = [
         "You are the EUD Editor 3 agent. You edit a StarCraft EUD map project by "
         "calling the eud-tools below; the server validates, journals, and can roll "
@@ -95,9 +112,13 @@ def build_system_prompt(
         "",
         _tool_catalog_section(tool_layer),
         "",
-        _project_state_section(bridge),
+        state_section,
         "",
         _first_principles_section(),
+    ]
+    if data_dir is not None:
+        parts += ["", _project_memory_section(data_dir, project)]
+    parts += [
         "",
         _rag_section(request_text, rag_db),
         "",
@@ -126,8 +147,18 @@ def _tool_catalog_section(tool_layer) -> str:
     return "\n".join(lines)
 
 
-def _project_state_section(bridge) -> str:
+def _fetch_project_state(bridge) -> tuple[str, str]:
+    """Build the ``[project state]`` section AND resolve the project name in one
+    STATUS+LIST fetch.
+
+    Returns ``(section_text, project_name)``. The project name (parsed from the
+    SAME STATUS reply, features/07) is reused by the ``[project memory]`` section
+    so memory never costs a second bridge round-trip. Best-effort: a STATUS/LIST
+    failure degrades that line and yields an EMPTY project name (-> the memory
+    store degrades to ``(no project memory)``).
+    """
     lines = ["[project state]"]
+    project = ""
     try:
         status_reply = bridge.status()
         compiling, project = parse_status(status_reply)
@@ -145,7 +176,32 @@ def _project_state_section(bridge) -> str:
             lines.append("files: (none)")
     except Exception:  # noqa: BLE001 - best-effort state
         lines.append("files: (unavailable)")
-    return "\n".join(lines)
+    return "\n".join(lines), project
+
+
+def _project_state_section(bridge) -> str:
+    return _fetch_project_state(bridge)[0]
+
+
+def _project_memory_section(data_dir, project_name: str) -> str:
+    """Build the ``[project memory]`` section for ``project_name`` (features/07).
+
+    Rendered via :meth:`ProjectMemory.render_section`. The store self-degrades to
+    ``[project memory]\\n(no project memory)`` for an empty/unknown project; any
+    unexpected error here is swallowed to the same degraded body so memory NEVER
+    blocks the turn (the same best-effort contract as RAG). ``list_reply`` is
+    omitted: the prompt assembly only has the PARSED file list, not the raw LIST
+    reply the staleness hash is computed from, and reconstructing it would risk a
+    spurious "outdated" suffix — staleness is refreshed via ``memory_write`` on
+    ``structure`` instead (features/07 "Prompt injection").
+    """
+    try:
+        return ProjectMemory(
+            data_dir=data_dir, project_name=project_name
+        ).render_section()
+    except Exception:  # noqa: BLE001 - best-effort: never block the turn
+        _log.warning("project memory section render failed", exc_info=True)
+        return "[project memory]\n(no project memory)"
 
 
 def _rag_section(request_text: str, rag_db: str) -> str:
@@ -188,6 +244,32 @@ def parse_status(reply: str) -> tuple[bool, str]:
     return compiling, project
 
 
+def _journal_tools_and_files(journal) -> tuple[list[str], list[str]]:
+    """Distinct journaled tool names + entry targets for an episode (features/07).
+
+    ``journal`` is a :class:`eud_agent.journal.Journal` (or ``None`` for an
+    answer-only turn). Both lists preserve first-seen order and drop duplicates;
+    a journal without entries (or ``None``) yields two empty lists. Best-effort:
+    any introspection failure degrades to empties rather than breaking finalization.
+    """
+    if journal is None:
+        return [], []
+    tools: list[str] = []
+    files: list[str] = []
+    try:
+        entries = list(journal.entries)
+    except Exception:  # noqa: BLE001 - never break finalization on introspection
+        return [], []
+    for e in entries:
+        tool = getattr(e, "tool", None)
+        if tool and tool not in tools:
+            tools.append(tool)
+        target = getattr(e, "target", None)
+        if target and target not in files:
+            files.append(target)
+    return tools, files
+
+
 # --------------------------------------------------------------------------- #
 # The state machine.
 # --------------------------------------------------------------------------- #
@@ -217,11 +299,18 @@ class AgentEngine:
         bridge,
         rag_db,
         register_request_id=None,
+        data_dir=None,
     ):
         self._send = send
         self._get_tool_layer = get_tool_layer
         self._bridge = bridge
         self._rag_db = rag_db
+        # Per-map-project memory root (features/07). ``None`` disables both the
+        # refreshed [project memory] in resumed turns and episode recording — the
+        # engine stays usable for unit tests that predate the memory seam (app.py
+        # wires data_dir in EUD-081). Project name is re-resolved per turn from the
+        # bridge STATUS so a mid-session project switch follows on the next chat.
+        self._data_dir = data_dir
         # Live request-id stamping (EUD-064): the engine publishes its CURRENT
         # request id through this callback so the tool endpoint can stamp it onto
         # tool calls from this active session (overriding the stale shim env id).
@@ -237,6 +326,11 @@ class AgentEngine:
         )
         self._request_id: str | None = None
         self._plan_revision = 0
+        # The current request's chat text, retained for the episode ``instruction``
+        # (features/07 Episodes — first 200 chars). Spans the whole request: a
+        # default-accept of the PRIOR request fires before the new chat overwrites
+        # it, so each finalization sees its own request's text.
+        self._chat_text: str = ""
         # The in-flight turn runs as a BACKGROUND task so the WS receive loop stays
         # free to accept cancel{} (and reconnect) while codex streams (a turn can
         # run for minutes). None when no turn is running.
@@ -288,6 +382,9 @@ class AgentEngine:
         await self._finalize_prior_request()
         self._request_id = f"req-{uuid.uuid4().hex[:8]}"
         self._plan_revision = 0
+        # Retain AFTER finalizing the prior request (its episode used the OLD
+        # text) so this request's episode carries its own instruction (features/07).
+        self._chat_text = text
         # Publish the live request id so the tool endpoint stamps it onto this
         # session's tool calls (the shim env id is pinned at thread creation and
         # goes stale from the second chat — EUD-064).
@@ -323,21 +420,28 @@ class AgentEngine:
         )
 
     def _resume_turn_text(self, text: str) -> str:
-        """Refreshed [project state] + [reference context] prepended to ``text``.
+        """Refreshed [project state] + [project memory] + [reference context]
+        prepended to ``text``.
 
         A resumed chat gets no ``base_instructions`` (those exist only on the first
-        thread), so the current project state and the RAG context for the NEW
-        question are prepended ahead of the original user text. Reuses the same
-        section builders ``build_system_prompt`` uses. Called from a worker thread
-        (the bridge/RAG calls are synchronous, best-effort).
+        thread), so the current project state, the per-map-project memory, and the
+        RAG context for the NEW question are prepended ahead of the original user
+        text. Memory changes between chats, so it is refreshed every turn; the
+        project name is re-resolved from the SAME STATUS fetch (features/07 — a
+        mid-session project switch follows on this turn). Reuses the same section
+        builders ``build_system_prompt`` uses. Called from a worker thread (the
+        bridge/RAG calls are synchronous, best-effort).
         """
-        return "\n".join([
-            _project_state_section(self._bridge),
-            "",
+        state_section, project = _fetch_project_state(self._bridge)
+        parts = [state_section, ""]
+        if self._data_dir is not None:
+            parts += [_project_memory_section(self._data_dir, project), ""]
+        parts += [
             _rag_section(text, self._rag_db),
             "",
             text,
-        ])
+        ]
+        return "\n".join(parts)
 
     # ------------------------------------------------------------- plan flow
     async def _on_plan_feedback(self, msg: dict) -> None:
@@ -405,7 +509,9 @@ class AgentEngine:
         if kind == "apply":
             await self._emit_changeset()
             return
-        # answer-only: nothing journaled, no changeset; back to idle.
+        # answer-only: nothing journaled, no changeset; back to idle. Record the
+        # turn as an episode (features/07 — answer-only finalization).
+        await self._record_episode(kind="answer", decision="answer", journal=None)
         self.state = "idle"
 
     async def _emit_changeset(self) -> None:
@@ -440,6 +546,68 @@ class AgentEngine:
             journal.finalize,
             note="superseded by a new request; undecided items default to accepted",
         )
+        # features/07 Episodes: a default-accept of undecided items records a
+        # ``defaulted`` episode (the journal entries are still readable post-archive).
+        await self._record_episode(
+            kind="changeset", decision="defaulted", journal=journal
+        )
+
+    # ------------------------------------------------------------- episodes
+    async def _record_episode(self, *, kind: str, decision: str, journal) -> None:
+        """Append ONE request-history episode to the project's ``episodes.jsonl``.
+
+        features/07 "Episodes" — server-written, zero token cost. Called at every
+        finalization point (answer-only end, changeset accept/reject/partial,
+        default-accept of a prior undecided changeset). The episode is recorded
+        ONLY when a project name is known (the store self-disables otherwise) and
+        when a memory root is configured (``data_dir``). ``journal`` supplies the
+        distinct journaled tool names + file targets (``None`` for an answer-only
+        turn -> empty lists).
+
+        Best-effort throughout: a missing data_dir, an empty project, or ANY error
+        (STATUS fetch, journal read, append) is logged and SWALLOWED — memory must
+        NEVER break the request flow (RAG-style degradation). Runs the synchronous
+        bridge/disk IO off the event loop via ``asyncio.to_thread`` like the
+        surrounding finalization code.
+        """
+        if self._data_dir is None:
+            return
+        try:
+            await asyncio.to_thread(
+                self._append_episode, kind, decision, journal,
+                self._request_id, self._chat_text,
+            )
+        except Exception:  # noqa: BLE001 - best-effort: never break the request
+            _log.warning("episode recording failed", exc_info=True)
+
+    def _append_episode(
+        self, kind: str, decision: str, journal, request_id, chat_text: str
+    ) -> None:
+        """The synchronous body of :meth:`_record_episode` (runs in a worker).
+
+        Resolves the project name from a fresh bridge STATUS (a mid-session
+        project switch is honored), builds the episode dict, and appends it. The
+        store's :meth:`ProjectMemory.append_episode` already swallows IO failures;
+        an empty/unknown project disables the store so no file is written.
+        """
+        try:
+            _, project = parse_status(self._bridge.status())
+        except Exception:  # noqa: BLE001 - no project resolvable -> skip episode
+            return
+        store = ProjectMemory(data_dir=self._data_dir, project_name=project)
+        if not store.enabled:
+            return
+        tools, files = _journal_tools_and_files(journal)
+        episode = {
+            "ts": datetime.now().isoformat(timespec="seconds"),
+            "request_id": request_id,
+            "instruction": (chat_text or "")[:200],
+            "kind": kind,
+            "tools": tools,
+            "files": files,
+            "decision": decision,
+        }
+        store.append_episode(episode)
 
     # ------------------------------------------------------------- changeset
     async def _on_changeset_decision(self, msg: dict) -> None:
@@ -494,6 +662,16 @@ class AgentEngine:
                         "ids": ids or [],
                         "ok": True,
                     })
+                # features/07 Episodes: record the decision. A whole-changeset
+                # accept/reject is ``accepted``/``rejected``; a partial (subset of
+                # ids) decision is ``partial``.
+                if not want_all:
+                    ep_decision = "partial"
+                else:
+                    ep_decision = "accepted" if decision == "accept" else "rejected"
+                await self._record_episode(
+                    kind="changeset", decision=ep_decision, journal=journal
+                )
             except Exception as exc:  # noqa: BLE001 - surface, never crash the WS
                 await self._error(f"changeset decision failed: {exc}")
             self.state = "idle"

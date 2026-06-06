@@ -1,4 +1,5 @@
 ---
+completed_at: '2026-06-06T14:45:23.497606'
 created: '2026-06-06'
 depends_on:
 - EUD-079-15f5
@@ -8,7 +9,7 @@ priority: high
 scope:
 - server/eud_agent/engine.py
 - server/tests/test_agent_flow.py
-status: pending
+status: done
 title: '[project memory] prompt injection + episode recording at finalization'
 type: task
 updated: '2026-06-06'

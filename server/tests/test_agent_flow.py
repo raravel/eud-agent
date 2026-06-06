@@ -1534,3 +1534,351 @@ def test_classify_tool_event_data_truncated():
     args = info["event_data"]["args"]
     assert len(args) <= TOOL_DATA_MAX_CHARS + 16  # marker allowance
     assert args.endswith("…(잘림)")
+
+
+# --------------------------------------------------------------------------- #
+# EUD-080: project-memory injection into the system prompt + resume turn text,
+# and one episode appended per finalization point.
+#
+# Seam pinned by these tests (the implementation MUST satisfy it):
+#   * ``build_system_prompt(request_text, *, tool_layer, bridge, rag_db,
+#     data_dir=None)`` gains a ``data_dir`` keyword. When given, it inserts a
+#     ``[project memory]`` section (from ``ProjectMemory(data_dir=...,
+#     project_name=<parse_status(bridge.status()) project>).render_section(...)``)
+#     BETWEEN ``[first principles]`` and ``[reference context]``. ``data_dir=None``
+#     preserves every existing call (no memory section).
+#   * ``AgentEngine(..., data_dir=None)`` gains a ``data_dir`` keyword stored on the
+#     engine; the resume turn text refreshes ``[project memory]`` alongside
+#     ``[project state]`` + ``[reference context]``, and every finalization path
+#     appends ONE episode via ``ProjectMemory.append_episode`` (only when the
+#     project name is non-empty). The default ``None`` keeps the existing
+#     create_app construction (which does not pass data_dir yet — EUD-081) working.
+#
+# These run the REAL engine.build_system_prompt + a directly-constructed
+# AgentEngine (no create_app), so the seam is exercised without touching app.py.
+# --------------------------------------------------------------------------- #
+
+
+class _MemoryBridge:
+    """A bridge stand-in whose STATUS reports a configurable project name."""
+
+    def __init__(self, project="demo-map"):
+        self._project = project
+        self.calls = []
+
+    def status(self):
+        return f"compiling=false\nproject={self._project}\n"
+
+    def list_files(self):
+        return [{"path": "main.eps", "ftype": "CUIEps", "settable": True}]
+
+    # journal-facing dat IPC (so an edit turn can journal a write).
+    def getdat(self, dat, param, obj_id):
+        return f"OK: {dat} {param} {obj_id} = 50"
+
+    def setdat(self, dat, param, obj_id, value):
+        self.calls.append(("setdat", dat, param, obj_id, value))
+        return "OK"
+
+    def resetdat(self, *a):
+        self.calls.append(("resetdat", *a))
+        return "OK"
+
+
+def _seed_memory(data_dir, project, *, resources="death counter 42 = boss HP"):
+    """Write a resources.md into a project's harness dir so render is non-empty."""
+    from eud_agent.memory import ProjectMemory
+
+    mem = ProjectMemory(data_dir=str(data_dir), project_name=project)
+    res = mem.write("resources", resources)
+    assert res.ok, res.reason
+    return mem
+
+
+def test_build_system_prompt_injects_memory_between_principles_and_rag(tmp_path):
+    """[project memory] sits BETWEEN [first principles] and [reference context],
+    and carries the seeded project memory content (features/07 Prompt injection)."""
+    from eud_agent.engine import build_system_prompt
+    from eud_agent.tools import ToolLayer
+
+    data_dir = tmp_path / "data"
+    _seed_memory(data_dir, "demo-map", resources="death counter 42 = boss HP")
+
+    bridge = _MemoryBridge(project="demo-map")
+    sp = build_system_prompt(
+        "edit the boss",
+        tool_layer=ToolLayer(bridge),
+        bridge=bridge,
+        rag_db=str(tmp_path / "rag"),
+        data_dir=str(data_dir),
+    )
+    assert "[project memory]" in sp, "the memory section must be injected"
+    assert "death counter 42 = boss HP" in sp, "seeded memory content must appear"
+    # Ordering: first principles, then memory, then reference context.
+    i_fp = sp.index("[first principles]")
+    i_mem = sp.index("[project memory]")
+    i_rag = sp.index("[reference context]")
+    assert i_fp < i_mem < i_rag, (
+        f"memory must sit between principles and RAG; "
+        f"fp={i_fp} mem={i_mem} rag={i_rag}"
+    )
+
+
+def test_build_system_prompt_no_project_degrades_to_no_memory(tmp_path):
+    """Empty STATUS project -> [project memory]\\n(no project memory); the prompt
+    still builds normally (best-effort, same contract as RAG)."""
+    from eud_agent.engine import build_system_prompt
+    from eud_agent.tools import ToolLayer
+
+    bridge = _MemoryBridge(project="")  # no project open
+    sp = build_system_prompt(
+        "anything",
+        tool_layer=ToolLayer(bridge),
+        bridge=bridge,
+        rag_db=str(tmp_path / "rag"),
+        data_dir=str(tmp_path / "data"),
+    )
+    assert "[project memory]\n(no project memory)" in sp
+    # The rest of the prompt is intact (degradation does not abort assembly).
+    assert "[first principles]" in sp
+    assert "[reference context]" in sp
+
+
+def test_build_system_prompt_without_data_dir_preserves_existing_callers(tmp_path):
+    """data_dir omitted (the default) keeps the legacy prompt shape: no
+    [project memory] section is injected (EUD-081 wires data_dir in app.py)."""
+    from eud_agent.engine import build_system_prompt
+    from eud_agent.tools import ToolLayer
+
+    bridge = _MemoryBridge(project="demo-map")
+    sp = build_system_prompt(
+        "hello",
+        tool_layer=ToolLayer(bridge),
+        bridge=bridge,
+        rag_db=str(tmp_path / "rag"),
+    )
+    assert "[project memory]" not in sp, (
+        "with no data_dir the memory section must be absent (existing callers)"
+    )
+
+
+# ---- direct AgentEngine harness (no create_app; pins the engine seam) ----
+
+
+def _run(engine, *steps):
+    """Run a sequence of engine handler coroutines on ONE event loop, draining
+    the engine's background turn/decision task after each step.
+
+    The engine spawns the turn (``_launch_turn``) and the changeset decision
+    (``_on_changeset_decision``) as background asyncio tasks bound to the live
+    loop; they must be awaited on that SAME loop, so the whole driver runs under
+    a single ``asyncio.run``.
+    """
+    import asyncio
+
+    async def _go():
+        for make in steps:
+            await make()
+            for attr in ("_turn_task", "_decision_task"):
+                task = getattr(engine, attr)
+                if task is not None and not task.done():
+                    try:
+                        await task
+                    except Exception:  # noqa: BLE001 - surfaced via send
+                        pass
+
+    asyncio.run(_go())
+
+
+class _CollectingSend:
+    def __init__(self):
+        self.events = []
+
+    async def __call__(self, event):
+        self.events.append(event)
+
+
+def _make_engine(tmp_path, *, project="demo-map", bridge=None, data_dir=None):
+    """Construct a real AgentEngine with a FakeRunner + fake-bridge ToolLayer.
+
+    The ToolLayer carries a journal_factory bound to ``bridge`` so an edit turn
+    journals a real write (the changeset/finalization episode paths need it).
+    ``data_dir`` is the NEW engine seam (defaults to ``tmp_path/data``).
+    """
+    from eud_agent.engine import AgentEngine
+    from eud_agent.journal import Journal
+    from eud_agent.tools import ToolLayer
+
+    if bridge is None:
+        bridge = _MemoryBridge(project=project)
+    ddir = str(data_dir if data_dir is not None else (tmp_path / "data"))
+
+    def journal_factory(request_id):
+        return Journal(data_dir=ddir, request_id=request_id, bridge=bridge)
+
+    tool_layer = ToolLayer(bridge, journal_factory=journal_factory)
+    send = _CollectingSend()
+    created = {}
+
+    def make_runner(*, tool_layer, send, build_system_prompt):
+        r = FakeRunner(tool_layer=tool_layer, send=send,
+                       build_system_prompt=build_system_prompt)
+        created["runner"] = r
+        return r
+
+    engine = AgentEngine(
+        send=send,
+        make_runner=make_runner,
+        get_tool_layer=lambda: tool_layer,
+        bridge=bridge,
+        rag_db=str(tmp_path / "rag"),
+        data_dir=ddir,
+    )
+    return engine, created["runner"], send, ddir
+
+
+def _read_episodes(data_dir, project):
+    from eud_agent.memory import ProjectMemory
+
+    return ProjectMemory(
+        data_dir=str(data_dir), project_name=project
+    ).read_episodes(-1)
+
+
+def test_resume_turn_text_refreshes_project_memory(tmp_path):
+    """A resumed chat's turn text carries a REFRESHED [project memory] copy
+    alongside [project state] + [reference context] (features/07)."""
+    data_dir = tmp_path / "data"
+    _seed_memory(data_dir, "demo-map", resources="switch 7 = quest flag")
+
+    engine, runner, _send, _ddir = _make_engine(tmp_path, data_dir=data_dir)
+    # _resume_turn_text is the resume seam build_system_prompt's sections reuse.
+    resume_text = engine._resume_turn_text("do the next thing")
+    assert "[project state]" in resume_text
+    assert "[reference context]" in resume_text
+    assert "[project memory]" in resume_text, (
+        f"resumed turn must refresh project memory; got {resume_text!r}"
+    )
+    assert "switch 7 = quest flag" in resume_text, (
+        "the refreshed memory must carry the project's current content"
+    )
+    assert "do the next thing" in resume_text
+
+
+def test_episode_recorded_on_answer_only_turn_end(tmp_path):
+    """An answer-only chat (no journal entries) appends ONE episode with
+    decision 'answer' and kind 'answer'."""
+    data_dir = tmp_path / "data"
+    engine, runner, send, ddir = _make_engine(tmp_path, data_dir=data_dir)
+    runner.queue(answer_script("hello"))
+
+    _run(engine, lambda: engine._on_chat(
+        {"type": "chat", "text": "explain death counters"}))
+
+    eps = _read_episodes(ddir, "demo-map")
+    assert len(eps) == 1, f"exactly one episode expected; got {eps}"
+    ep = eps[0]
+    assert ep["kind"] == "answer"
+    assert ep["decision"] == "answer"
+    assert ep["instruction"] == "explain death counters"
+    assert ep["request_id"]
+    assert ep["tools"] == [] and ep["files"] == []
+    # ISO8601 timestamp present.
+    from datetime import datetime
+
+    datetime.fromisoformat(ep["ts"])
+
+
+def test_episode_recorded_on_changeset_accept(tmp_path):
+    """changeset_decision{accept} appends ONE episode: kind 'changeset',
+    decision 'accepted', with the distinct journaled tool + file/target."""
+    data_dir = tmp_path / "data"
+    engine, runner, send, ddir = _make_engine(tmp_path, data_dir=data_dir)
+    runner.queue(edit_script())  # journals a dat_set on units|MaxHP|0
+
+    _run(
+        engine,
+        lambda: engine._on_chat({"type": "chat", "text": "set maxhp"}),
+    )
+    assert engine.state == "changeset_review"
+
+    _run(engine, lambda: engine._on_changeset_decision(
+        {"type": "changeset_decision", "decision": "accept", "ids": "all"}
+    ))
+
+    eps = _read_episodes(ddir, "demo-map")
+    assert len(eps) == 1, f"exactly one episode expected; got {eps}"
+    ep = eps[0]
+    assert ep["kind"] == "changeset"
+    assert ep["decision"] == "accepted"
+    assert "dat_set" in ep["tools"]
+    assert ep["files"], "the journaled target must appear in files"
+    assert ep["instruction"] == "set maxhp"
+
+
+def test_episode_recorded_on_changeset_reject(tmp_path):
+    """changeset_decision{reject} appends ONE episode with decision 'rejected'."""
+    data_dir = tmp_path / "data"
+    engine, runner, send, ddir = _make_engine(tmp_path, data_dir=data_dir)
+    runner.queue(edit_script(value="999"))
+
+    _run(
+        engine,
+        lambda: engine._on_chat({"type": "chat", "text": "set maxhp to 999"}),
+    )
+    _run(engine, lambda: engine._on_changeset_decision(
+        {"type": "changeset_decision", "decision": "reject", "ids": "all"}
+    ))
+
+    eps = _read_episodes(ddir, "demo-map")
+    assert len(eps) == 1, f"exactly one episode expected; got {eps}"
+    assert eps[0]["decision"] == "rejected"
+    assert eps[0]["kind"] == "changeset"
+
+
+def test_episode_recorded_on_default_accept_of_prior_undecided(tmp_path):
+    """A new chat while the prior changeset is UNDECIDED records the prior
+    request's episode with decision 'defaulted' (features/07 Episodes)."""
+    data_dir = tmp_path / "data"
+    engine, runner, send, ddir = _make_engine(tmp_path, data_dir=data_dir)
+
+    # Turn 1: an edit, left undecided (state -> changeset_review).
+    runner.queue(edit_script())
+    _run(engine, lambda: engine._on_chat({"type": "chat", "text": "first edit"}))
+    assert engine.state == "changeset_review"
+
+    # Turn 2: a new chat finalizes the prior undecided changeset (default-accept).
+    runner.queue(answer_script("moved on"))
+    _run(engine, lambda: engine._on_chat(
+        {"type": "chat", "text": "second thing"}))
+
+    eps = _read_episodes(ddir, "demo-map")
+    decisions = [e["decision"] for e in eps]
+    assert "defaulted" in decisions, (
+        f"the prior undecided changeset must record a 'defaulted' episode; "
+        f"got {decisions}"
+    )
+    # The defaulted episode is the changeset one (kind changeset).
+    defaulted = next(e for e in eps if e["decision"] == "defaulted")
+    assert defaulted["kind"] == "changeset"
+    assert "dat_set" in defaulted["tools"]
+
+
+def test_no_episode_recorded_when_no_project_open(tmp_path):
+    """No project open (empty STATUS project) -> the store is disabled and NO
+    episode is written (episodes recorded only when a project name is known)."""
+    data_dir = tmp_path / "data"
+    bridge = _MemoryBridge(project="")  # no project
+    engine, runner, send, ddir = _make_engine(
+        tmp_path, bridge=bridge, data_dir=data_dir
+    )
+    runner.queue(answer_script("hi"))
+
+    _run(engine, lambda: engine._on_chat(
+        {"type": "chat", "text": "no project here"}))
+
+    # The disabled store has no harness dir / episodes at all.
+    from eud_agent.memory import ProjectMemory
+
+    mem = ProjectMemory(data_dir=str(ddir), project_name="")
+    assert mem.read_episodes(-1) == []

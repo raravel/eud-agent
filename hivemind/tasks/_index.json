@@ -1271,15 +1271,15 @@
       "scope": []
     },
     "EUD-076-d2c2": {
-      "status": "pending",
+      "status": "done",
       "priority": "high",
       "type": "story",
       "parent": "EUD-075-43ae",
       "depends_on": [],
       "title": "Server memory core (store, tool, injection)",
       "updated": "2026-06-06",
-      "completed_at": null,
-      "path": "active/EUD-076-d2c2.md",
+      "completed_at": "2026-06-06T14:45:23.529457",
+      "path": "done/EUD-076-d2c2.md",
       "scope": []
     },
     "EUD-077-de1e": {
@@ -1331,7 +1331,7 @@
       ]
     },
     "EUD-080-ecb0": {
-      "status": "pending",
+      "status": "done",
       "priority": "high",
       "type": "task",
       "parent": "EUD-076-d2c2",
@@ -1340,8 +1340,8 @@
       ],
       "title": "[project memory] prompt injection + episode recording at finalization",
       "updated": "2026-06-06",
-      "completed_at": null,
-      "path": "active/EUD-080-ecb0.md",
+      "completed_at": "2026-06-06T14:45:23.497606",
+      "path": "done/EUD-080-ecb0.md",
       "scope": [
         "server/eud_agent/engine.py",
         "server/tests/test_agent_flow.py"
