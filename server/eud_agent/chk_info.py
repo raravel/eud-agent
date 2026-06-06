@@ -47,9 +47,13 @@ how stale the snapshot is.
 
 from __future__ import annotations
 
+import ctypes
 import json
+import os
+import re
 import struct
 import subprocess
+import sys
 import tempfile
 from collections.abc import Callable
 from datetime import datetime
@@ -66,6 +70,12 @@ _MAX_SECTIONS = 4096
 # Cap on the units list a single ``mode="units"`` reply may carry (use-map UNIT
 # sections run to thousands; an uncapped list would blow the codex context).
 UNITS_LIST_CAP = 200
+
+# Pixels per tile: the grid format / LLM-facing tool speak tiles; CHK stores px.
+TILE_PX = 32
+
+# location_write actions (tool enum value -> locedit op verb).
+LOCATION_ACTIONS = {"add": "add", "set": "set", "rename": "rename", "delete": "del"}
 
 _TILESET_NAMES = (
     "badlands", "platform", "installation", "ashworld",
@@ -467,6 +477,81 @@ def slice_digest(
 
 
 # --------------------------------------------------------------------------- #
+# Write-path helpers: lock probe, encoding detection, backup restore.
+# --------------------------------------------------------------------------- #
+
+
+def windows_file_locked(path: str | Path) -> bool:
+    """True when another process holds ``path`` open (Windows share probe).
+
+    Opens the file with dwShareMode=0 (no sharing): SCMDraft or any editor
+    holding the map open makes CreateFileW fail with ERROR_SHARING_VIOLATION
+    (32). The probe handle is closed immediately. On non-Windows (CI) the probe
+    reports unlocked — the locedit spawn itself still fails safely if needed.
+    """
+    if sys.platform != "win32":
+        return False
+    GENERIC_READ = 0x80000000
+    OPEN_EXISTING = 3
+    INVALID_HANDLE = ctypes.c_void_p(-1).value
+    handle = ctypes.windll.kernel32.CreateFileW(
+        str(path), GENERIC_READ, 0, None, OPEN_EXISTING, 0, None
+    )
+    if handle == INVALID_HANDLE:
+        return ctypes.GetLastError() == 32  # ERROR_SHARING_VIOLATION
+    ctypes.windll.kernel32.CloseHandle(handle)
+    return False
+
+
+def detect_str_encoding(chk_data: bytes) -> str:
+    """Pick the byte encoding for a NEW location name from the map's own strings.
+
+    ``STRx`` maps are SC:R-era -> utf-8. Otherwise: any existing string whose
+    bytes are not valid utf-8 marks a cp949 (Korean SCMDraft) string table.
+    All-ASCII/empty tables are ambiguous -> cp949, the safe default for this
+    machine's SCMDraft locale (ASCII bytes are identical in both encodings).
+    """
+    resolved = assemble_sections(walk_sections(chk_data))
+    if "STRx" in resolved:
+        return "utf-8"
+    body = resolved.get("STR ", b"")
+    if len(body) >= 2:
+        (count,) = struct.unpack_from("<H", body, 0)
+        count = min(count, max(0, (len(body) - 2) // 2))
+        for i in range(count):
+            (off,) = struct.unpack_from("<H", body, 2 + i * 2)
+            if 0 < off < len(body):
+                end = body.find(b"\x00", off)
+                raw = body[off:] if end < 0 else body[off:end]
+                try:
+                    raw.decode("utf-8")
+                except UnicodeDecodeError:
+                    return "cp949"
+    return "cp949"
+
+
+def restore_map_backup(map_path: str, backup_path: str) -> None:
+    """Roll a ``location_write`` back: copy the backed-up map bytes over the map.
+
+    Used by the journal's rollback (changeset reject). Refuses while the map is
+    locked (the same share probe as the write path) and writes via temp +
+    ``os.replace`` so a crash cannot leave a half-written map.
+    """
+    backup = Path(backup_path)
+    if not backup.is_file():
+        raise MapInfoError(f"map backup not found: {backup}")
+    target = Path(map_path)
+    if windows_file_locked(target):
+        raise MapInfoError(
+            f"cannot restore map: {target} is open in another program "
+            "(close SCMDraft and retry)."
+        )
+    tmp = target.with_suffix(target.suffix + ".restoretmp")
+    tmp.write_bytes(backup.read_bytes())
+    os.replace(tmp, target)
+
+
+# --------------------------------------------------------------------------- #
 # The service: bridge path lookup -> IsomTerrain chk extraction -> digest.
 # --------------------------------------------------------------------------- #
 
@@ -483,10 +568,11 @@ def _parse_setting_value(reply: str) -> str:
 
 
 class MapInfoService:
-    """Reads the connected map's CHK data via the IsomTerrain.exe extractor.
+    """Reads (and edits, features/09) the connected map via the IsomTerrain CLI.
 
-    ``bridge`` is the shared :class:`bridge_io.BridgeIO` (only ``GETSET
-    project|OpenMapName`` is used). ``isomterrain_cmd`` is the ABSOLUTE exe
+    ``bridge`` is the shared :class:`bridge_io.BridgeIO` (``GETSET
+    project|OpenMapName`` for the path; ``STATUS`` for the write path's
+    compiling guard). ``isomterrain_cmd`` is the ABSOLUTE exe
     path from config (env ``ISOMTERRAIN_CMD`` > agent.cfg ``isomterrain_cmd``
     > built-in default); empty/missing makes every call a clear
     :class:`MapInfoError` — advisory shape, nothing else breaks. ``spawn`` and
@@ -500,11 +586,19 @@ class MapInfoService:
         isomterrain_cmd: str,
         spawn: Callable | None = None,
         subprocess_timeout: float = DEFAULT_SUBPROCESS_TIMEOUT,
+        data_dir: str | None = None,
+        lock_probe: Callable[[str], bool] | None = None,
     ) -> None:
         self._bridge = bridge
         self._isomterrain_cmd = isomterrain_cmd
         self._spawn = spawn or subprocess.run
         self._subprocess_timeout = subprocess_timeout
+        # Write-path collaborators (location_write, features/09): backups land
+        # under ``<data_dir>/map_backups`` (or next to the map when no data_dir
+        # is wired — tests/standalone); ``lock_probe`` is injectable so tests
+        # exercise the locked-map refusal without a real second process.
+        self._data_dir = data_dir
+        self._lock_probe = lock_probe or windows_file_locked
 
     # ------------------------------------------------------------------ api
     def map_info(
@@ -526,7 +620,193 @@ class MapInfoService:
         }
         return reply
 
+    def location_write(
+        self,
+        action: str,
+        *,
+        name: str = "",
+        location_id: int = 0,
+        left: int = 0,
+        top: int = 0,
+        right: int = 0,
+        bottom: int = 0,
+    ) -> dict:
+        """Apply ONE location edit to the connected map IN PLACE (features/09).
+
+        ``action`` ∈ ``add|set|rename|delete``; coordinates are TILE units
+        (converted to px here — the locedit CLI is a dumb px applier). Safety
+        rails, in order: editor not compiling -> map file not locked (SCMDraft
+        share probe) -> full-file backup -> ``IsomTerrain.exe locedit`` (which
+        itself aborts BEFORE saving on any bad op, never renumbers ids, and
+        protects #64 Anywhere). Returns the applied op (with the assigned id
+        for ``add``), the post-edit location list, and the backup path the
+        journal stores for changeset rollback.
+        """
+        op = LOCATION_ACTIONS.get(action)
+        if op is None:
+            raise MapInfoError(
+                f"location_write action must be one of "
+                f"{', '.join(LOCATION_ACTIONS)}; got {action!r}"
+            )
+        map_path = self._resolve_map_path()
+        if self._editor_compiling():
+            raise MapInfoError(
+                "the editor is building right now; retry after the build "
+                "finishes (writing the map mid-build risks a corrupt read)."
+            )
+        if self._lock_probe(str(map_path)):
+            raise MapInfoError(
+                f"map file is open in another program: {map_path} "
+                "(close it in SCMDraft and retry)."
+            )
+
+        line = self._ops_line(op, map_path, name, location_id,
+                              left, top, right, bottom)
+        backup_path = self._backup_map(map_path)
+        stdout = self._run_locedit(map_path, line)
+
+        result: dict = {
+            "ok": True,
+            "action": action,
+            "mapPath": str(map_path),
+            "backupPath": str(backup_path),
+        }
+        m = re.search(r"OK \w+ #(\d+)", stdout)
+        if m:
+            result["locationId"] = int(m.group(1))
+        # Post-edit verification: re-digest and return the live location list so
+        # codex sees the applied state. The edit ALREADY saved — a verify failure
+        # must not read as "not applied", so it degrades to a warning.
+        try:
+            digest = digest_chk(self._extract_chk(map_path))
+            result["locations"] = digest["locations"]
+        except MapInfoError as exc:
+            result["verifyWarning"] = str(exc)
+        return result
+
     # ------------------------------------------------------------- internals
+    def _editor_compiling(self) -> bool:
+        """Best-effort ``compiling`` flag from the bridge STATUS reply.
+
+        Mirrors ``engine.parse_status``'s flag handling (lowercased value;
+        VB.NET emits ``True``) — duplicated tiny to keep chk_info free of an
+        engine import (tools.py imports chk_info; engine imports tools). A
+        bridge without ``status`` (tests) reads as not-compiling.
+        """
+        try:
+            reply = str(self._bridge.status())
+        except AttributeError:
+            return False
+        m = re.search(r"compiling\s*=\s*['\"]?(\w+)", reply)
+        return bool(m) and m.group(1).lower() in ("true", "1")
+
+    def _ops_line(
+        self, op: str, map_path: Path, name: str, location_id: int,
+        left: int, top: int, right: int, bottom: int,
+    ) -> bytes:
+        """Validate + render one locedit ops line (px coords, raw name bytes)."""
+        needs_name = op in ("add", "rename")
+        needs_rect = op in ("add", "set")
+        needs_id = op in ("set", "rename", "del")
+        if needs_name:
+            if not name.strip():
+                raise MapInfoError(f"location {op}: name must be non-empty")
+            if "|" in name or "\n" in name or "\r" in name:
+                raise MapInfoError(
+                    "location name must not contain '|' or line breaks"
+                )
+        if needs_rect and (right <= left or bottom <= top):
+            raise MapInfoError(
+                "location rect needs tileRight > tileLeft and "
+                f"tileBottom > tileTop; got ({left},{top})-({right},{bottom})"
+            )
+        if needs_id and location_id < 1:
+            raise MapInfoError(
+                f"location {op}: locationId must be >= 1, got {location_id}"
+            )
+
+        name_bytes = b""
+        if needs_name:
+            # Match the map's OWN string-table encoding so SCMDraft renders the
+            # name correctly (ASCII names are encoding-invariant -> skip the
+            # extra chk extraction).
+            try:
+                name_bytes = name.encode("ascii")
+            except UnicodeEncodeError:
+                enc = detect_str_encoding(self._extract_chk(map_path))
+                try:
+                    name_bytes = name.encode(enc)
+                except UnicodeEncodeError as exc:
+                    raise MapInfoError(
+                        f"location name {name!r} cannot be encoded as {enc} "
+                        "(the map's string-table encoding)."
+                    ) from exc
+
+        px = [v * TILE_PX for v in (left, top, right, bottom)]
+        if op == "add":
+            fields = [b"add"] + [str(v).encode() for v in px] + [name_bytes]
+        elif op == "set":
+            fields = [b"set", str(location_id).encode()] + [
+                str(v).encode() for v in px
+            ]
+        elif op == "rename":
+            fields = [b"rename", str(location_id).encode(), name_bytes]
+        else:  # del
+            fields = [b"del", str(location_id).encode()]
+        return b"|".join(fields) + b"\n"
+
+    def _backup_map(self, map_path: Path) -> Path:
+        """Full-file backup BEFORE the edit (the journal's rollback source).
+
+        Lands under ``<data_dir>/map_backups`` (or next to the map without a
+        data_dir), timestamped — every write keeps its own restore point.
+        """
+        backup_dir = (
+            Path(self._data_dir) / "map_backups"
+            if self._data_dir else map_path.parent
+        )
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+        backup = backup_dir / f"{map_path.name}.{stamp}.bak"
+        backup.write_bytes(map_path.read_bytes())
+        return backup
+
+    def _run_locedit(self, map_path: Path, ops_line: bytes) -> str:
+        """Spawn ``IsomTerrain.exe locedit <map> <ops>`` (rules.md subprocess)."""
+        exe = self._isomterrain_cmd
+        if not exe or not Path(exe).is_file():
+            raise MapInfoError(
+                "location_write unavailable: IsomTerrain.exe not found "
+                f"(configured: {exe or '<unset>'}). Set the ISOMTERRAIN_CMD "
+                "env var or the agent.cfg 'isomterrain_cmd' key to the built "
+                "isom-poc CLI."
+            )
+        with tempfile.TemporaryDirectory(prefix="eud_locedit_") as tmp:
+            ops_path = Path(tmp) / "ops.txt"
+            ops_path.write_bytes(ops_line)  # raw bytes; no BOM, no re-encode
+            try:
+                proc = self._spawn(
+                    [exe, "locedit", str(map_path), str(ops_path)],
+                    stdin=subprocess.DEVNULL,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    cwd=str(Path(exe).parent),
+                    timeout=self._subprocess_timeout,
+                )
+            except subprocess.TimeoutExpired as exc:
+                raise MapInfoError(
+                    f"IsomTerrain.exe locedit did not finish within "
+                    f"{self._subprocess_timeout:.0f}s (process killed)."
+                ) from exc
+            stdout = (getattr(proc, "stdout", "") or "").strip()
+            stderr = (getattr(proc, "stderr", "") or "").strip()
+            if getattr(proc, "returncode", 1) != 0:
+                detail = stderr or stdout or "no output"
+                raise MapInfoError(f"location edit failed: {detail}")
+            return stdout
+
     def _resolve_map_path(self) -> Path:
         reply = self._bridge.getset("project", "OpenMapName")
         map_path = _parse_setting_value(reply)

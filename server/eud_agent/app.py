@@ -441,8 +441,9 @@ def create_app(
     # IsomTerrain.exe extractor. Always constructed — an unresolvable exe path
     # degrades ONLY the map_info tool (clear ToolError at call time, the same
     # advisory shape as epscript-lsp), never the boot.
+    # data_dir hosts the location_write map backups (features/09 rollback).
     map_info_service = MapInfoService(
-        bridge, isomterrain_cmd=cfg.isomterrain_cmd
+        bridge, isomterrain_cmd=cfg.isomterrain_cmd, data_dir=cfg.data_dir
     )
 
     tool_layer = ToolLayer(

@@ -605,6 +605,10 @@ class Journal:
         # memory_write inverses target the ProjectMemory STORE, not the bridge.
         if e.tool == "memory_write":
             return self._rollback_memory(e)
+        # location_write inverses target the MAP FILE on disk (features/09):
+        # restore the full-file backup the service took before the edit.
+        if e.tool == "location_write":
+            return self._rollback_location(e)
         try:
             op = self._inverse_op(e)
         except _RefuseRollback as exc:
@@ -637,6 +641,32 @@ class Journal:
         path = store.store_dir / f"{name}.md" if store.store_dir else None
         if path is not None:
             path.unlink(missing_ok=True)
+        return {"id": e.id, "ok": True}
+
+    def _rollback_location(self, e: JournalEntry) -> dict[str, Any]:
+        """Inverse of a ``location_write``: restore the backed-up map bytes.
+
+        ``before`` carries ``{mapPath, backupPath}`` (recorded by the tool
+        layer from the service result). The restore refuses while the map is
+        locked (same share probe as the write path) and replaces atomically —
+        see :func:`chk_info.restore_map_backup`. NOTE: restoring rolls the map
+        back to the state BEFORE that edit, which also undoes any LATER
+        location_write in the same request — rollback runs in reverse seq
+        order, so a full rollback lands on the original map.
+        """
+        # Lazy import: journal <- chk_info only on this path (tools.py already
+        # imports chk_info; keep module-load graphs unchanged).
+        from .chk_info import MapInfoError, restore_map_backup
+
+        map_path = e.before.get("mapPath", "")
+        backup_path = e.before.get("backupPath", "")
+        if not map_path or not backup_path:
+            return {"id": e.id, "ok": False,
+                    "error": "cannot roll back location_write: no backup recorded"}
+        try:
+            restore_map_backup(map_path, backup_path)
+        except MapInfoError as exc:
+            return {"id": e.id, "ok": False, "error": str(exc)}
         return {"id": e.id, "ok": True}
 
     def _inverse_op(self, e: JournalEntry) -> dict:
@@ -781,6 +811,8 @@ def _category_for(entry: JournalEntry) -> str:
     tool = entry.tool
     if tool == "memory_write":
         return "memory"
+    if tool == "location_write":
+        return "map"  # flat item; the panel renders tool/target/old/new
     if tool in _FILE_TOOLS:
         return "file"
     if tool == "dat_set":
@@ -801,6 +833,9 @@ def _target_for(tool: str, args: dict) -> str:
     """A human-facing subject string for the entry/changeset."""
     if tool == "memory_write":
         return f"memory/{args.get('file', '')}"
+    if tool == "location_write":
+        subject = args.get("name") or f"#{args.get('locationId', '?')}"
+        return f"location:{args.get('action', '')} {subject}"
     if tool in _FILE_TOOLS:
         return str(args.get("path", ""))
     if tool in ("dat_set", "xdat_set"):

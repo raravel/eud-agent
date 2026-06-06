@@ -96,7 +96,7 @@ from .bridge_io import (
     _require_numeric_value,
     _require_pathlike,
 )
-from .chk_info import MapInfoError
+from .chk_info import LOCATION_ACTIONS, MapInfoError
 from .memory import CONTENT_CAP_BYTES, MEMORY_FILES
 
 # Budgets (features/05 "Triage and plan gating"). Pinned constants; the request
@@ -118,6 +118,10 @@ MEMORY_TOOL = "memory_write"
 # editor exposes only the OpenMapName path string — the CHK is read from disk).
 MAP_INFO_TOOL = "map_info"
 _MAP_INFO_MODES = ("summary", "locations", "units", "players")
+
+# Location write tool (features/09). A REAL write: plan-gated, budgeted, and
+# journaled (snapshot = the service's full-file map backup; reject restores it).
+LOCATION_TOOL = "location_write"
 
 
 # --------------------------------------------------------------------------- #
@@ -616,6 +620,48 @@ def _h_memory_write(bridge, args):
     return {"file": file, "content": content}
 
 
+def _h_location_write(bridge, args):
+    """Validate ``location_write`` args; the service call is routed in ``call``.
+
+    First line of defense (features/09): the ``action`` enum and the per-action
+    required fields are checked here (the service re-validates rect/name rules
+    as the second line; the locedit CLI is the third). Coordinates stay in TILE
+    units — the service converts to px. No bridge call.
+    """
+    action = str(_req(args, "action"))
+    if action not in LOCATION_ACTIONS:
+        raise ToolError(
+            f"location_write action must be one of "
+            f"{', '.join(LOCATION_ACTIONS)}; got {action!r}"
+        )
+    needs_name = action in ("add", "rename")
+    needs_rect = action in ("add", "set")
+    needs_id = action in ("set", "rename", "delete")
+    name = str(_opt(args, "name", ""))
+    if needs_name and not name.strip():
+        raise ToolError(f"location_write {action}: 'name' is required")
+    location_id = 0
+    if needs_id:
+        location_id = _as_bridge_error_tool_error(
+            lambda: _require_nonneg_int(_req(args, "locationId"), "locationId")
+        )
+    rect = {}
+    if needs_rect:
+        for key in ("tileLeft", "tileTop", "tileRight", "tileBottom"):
+            rect[key] = _as_bridge_error_tool_error(
+                lambda k=key: _require_nonneg_int(_req(args, k), k)
+            )
+    return {
+        "action": action,
+        "name": name,
+        "location_id": location_id,
+        "left": rect.get("tileLeft", 0),
+        "top": rect.get("tileTop", 0),
+        "right": rect.get("tileRight", 0),
+        "bottom": rect.get("tileBottom", 0),
+    }
+
+
 # ----- flow handler -----
 def _h_propose_plan(bridge, args):
     """End the turn for user review (features/05). No bridge call; no mutation.
@@ -837,6 +883,30 @@ def _build_registry() -> dict[str, ToolSpec]:
             "build_run", "write",
             "Run the editor build (SCArchive forced off, preflight paths).",
             _schema({}, []), _h_build_run,
+        ),
+        ToolSpec(
+            LOCATION_TOOL, "write",
+            "Edit the connected map's locations IN PLACE (saved to the "
+            "OpenMapName .scx; visible in SCMDraft after reopen). action: "
+            "add (name + tile rect, returns the assigned id) | set (locationId "
+            "+ tile rect) | rename (locationId + name) | delete (locationId). "
+            "Ids are never renumbered; #64 Anywhere is protected; a full-file "
+            "backup is taken before every edit.",
+            _schema(
+                {
+                    "action": {
+                        "type": "string", "enum": list(LOCATION_ACTIONS),
+                    },
+                    "name": _STR,
+                    "locationId": _INT,
+                    "tileLeft": _INT,
+                    "tileTop": _INT,
+                    "tileRight": _INT,
+                    "tileBottom": _INT,
+                },
+                ["action"],
+            ),
+            _h_location_write,
         ),
         ToolSpec(
             MEMORY_TOOL, "write",
@@ -1090,6 +1160,14 @@ class ToolLayer:
                 "before continuing."
             )
 
+        # location_write (features/09) is a WRITE routed to the injected map
+        # service AFTER the gate above passed. Its snapshot is the service's own
+        # full-file map backup (taken atomically with the lock/compiling checks,
+        # BEFORE the locedit spawn), so it bypasses the generic journal.snapshot
+        # path below and records the entry itself.
+        if spec.name == LOCATION_TOOL:
+            return self._location_write_via_service(spec, args, state, journal)
+
         # build_run via the runner pipeline (EUD-057). The gate/budget above have
         # already passed (build_run is a write -> it counts as an action/mutation
         # and obeys the plan gate). The self-fix budget is a SEPARATE cap: the 4th
@@ -1223,6 +1301,58 @@ class ToolLayer:
         except BridgeError as exc:
             raise ToolError(str(exc)) from exc
         state.action_count += 1
+        return result
+
+    def _location_write_via_service(
+        self,
+        spec: ToolSpec,
+        args: dict,
+        state: RequestState,
+        journal: Any | None,
+    ) -> Any:
+        """Apply one map-location edit through the injected MapInfoService.
+
+        Order (features/09): validate args (ToolError -> nothing runs, nothing
+        counted) -> service call, which INTERNALLY enforces snapshot-before-
+        mutate (compiling guard -> lock probe -> full-file backup -> locedit,
+        which aborts pre-save on any bad op) -> journal the entry with the
+        backup pointer as ``before`` (rollback = restore the backed-up bytes;
+        see ``journal._rollback_location``). A MapInfoError/BridgeError at any
+        rail is a ToolError; nothing is counted or journaled. The gate/budget
+        already passed in :meth:`call` (this is a REAL write: it advances both
+        the action and mutation counters).
+        """
+        validated = _h_location_write(_ProbeBridge(), args)
+        service = self._map_info
+        if service is None:
+            raise ToolError(
+                "location_write unavailable: no map service is configured "
+                "(set ISOMTERRAIN_CMD or the agent.cfg 'isomterrain_cmd' key)."
+            )
+        action = validated.pop("action")
+        try:
+            result = service.location_write(action, **validated)
+        except MapInfoError as exc:
+            raise ToolError(str(exc)) from exc
+        except BridgeError as exc:
+            raise ToolError(str(exc)) from exc
+
+        if journal is not None:
+            before = {
+                "mapPath": result.get("mapPath", ""),
+                "backupPath": result.get("backupPath", ""),
+            }
+            after = {
+                "action": action,
+                "name": validated.get("name", ""),
+                "locationId": result.get(
+                    "locationId", validated.get("location_id", 0)
+                ),
+            }
+            journal.record(spec.name, args, before, after)
+
+        state.action_count += 1
+        state.mutation_count += 1
         return result
 
     def _memory_write_via_store(

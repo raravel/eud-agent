@@ -28,6 +28,7 @@ What this suite pins:
 from __future__ import annotations
 
 import struct
+from pathlib import Path
 
 import pytest
 
@@ -38,15 +39,20 @@ from eud_agent.chk_info import (
     MapInfoService,
     assemble_sections,
     decode_text,
+    detect_str_encoding,
     digest_chk,
     owner_label,
     parse_strings,
+    restore_map_backup,
     slice_digest,
     unit_name,
     walk_sections,
 )
+from eud_agent.journal import Journal
 from eud_agent.tools import (
     READ_TOOLS,
+    WRITE_TOOLS,
+    PlanRequired,
     RequestState,
     ToolError,
     ToolLayer,
@@ -322,15 +328,19 @@ def test_slice_locations_and_players_modes(digest):
 
 
 class FakeBridge:
-    """GETSET-only bridge fake returning the configured OpenMapName."""
+    """GETSET/STATUS bridge fake returning the configured OpenMapName."""
 
-    def __init__(self, open_map: str):
+    def __init__(self, open_map: str, compiling: str = "False"):
         self.open_map = open_map
+        self.compiling = compiling
         self.calls: list[tuple] = []
 
     def getset(self, scope, key, **kw):
         self.calls.append(("getset", scope, key))
         return f"OK: {scope}|{key} = {self.open_map}"
+
+    def status(self, **kw):
+        return f"compiling={self.compiling} project='demo'"
 
 
 def make_service(tmp_path, *, chk: bytes | None = None, returncode=0,
@@ -408,6 +418,271 @@ def test_service_no_output_chk_is_a_clear_error(tmp_path):
     svc, *_ = make_service(tmp_path, write_output=False)
     with pytest.raises(MapInfoError, match="produced no CHK"):
         svc.map_info()
+
+
+# --------------------------------------------------------------------------- #
+# location_write service (features/09): fake spawn handles BOTH locedit + chk.
+# --------------------------------------------------------------------------- #
+
+
+def make_locedit_service(tmp_path, *, returncode=0, stderr="",
+                         lock_probe=None, compiling="False"):
+    """A MapInfoService whose fake spawn records the locedit ops bytes."""
+    exe = tmp_path / "IsomTerrain.exe"
+    exe.write_bytes(b"MZ")
+    map_path = tmp_path / "demo.scx"
+    map_path.write_bytes(b"ORIGINAL-MAP-BYTES")
+    bridge = FakeBridge(str(map_path), compiling=compiling)
+    recorded: dict = {"ops": [], "argv": []}
+
+    def fake_spawn(argv, **kwargs):
+        from pathlib import Path as _P
+        recorded["argv"].append(argv)
+        assert kwargs["stdin"] is not None and kwargs["cwd"]
+
+        class _R:
+            pass
+
+        p = _R()
+        p.returncode = returncode
+        p.stdout = ""
+        p.stderr = stderr
+        if returncode != 0:
+            return p
+        if argv[1] == "locedit":
+            recorded["ops"].append(_P(argv[3]).read_bytes())
+            p.stdout = "OK add #1\nSAVED 1 ops"
+        elif argv[1] == "chk":
+            _P(argv[3]).write_bytes(build_fixture_chk())
+        return p
+
+    svc = MapInfoService(
+        bridge,
+        isomterrain_cmd=str(exe),
+        spawn=fake_spawn,
+        data_dir=str(tmp_path / "data"),
+        lock_probe=lock_probe or (lambda p: False),
+    )
+    return svc, map_path, recorded
+
+
+def test_location_write_add_converts_tiles_backs_up_and_verifies(tmp_path):
+    svc, map_path, recorded = make_locedit_service(tmp_path)
+    out = svc.location_write("add", name="TestZone",
+                             left=10, top=10, right=20, bottom=20)
+    assert out["ok"] is True and out["locationId"] == 1
+    assert out["mapPath"] == str(map_path)
+    # tiles * 32 -> px in the ops line; name passed as raw bytes.
+    assert recorded["ops"] == [b"add|320|320|640|640|TestZone\n"]
+    # Full-file backup under data_dir/map_backups, holding the PRE-edit bytes.
+    backup = Path(out["backupPath"])
+    assert backup.is_file() and backup.read_bytes() == b"ORIGINAL-MAP-BYTES"
+    assert str(tmp_path / "data") in str(backup)
+    # Post-edit verification re-digested the map (fixture: 3 locations).
+    assert len(out["locations"]) == 3
+
+
+def test_location_write_korean_name_follows_map_string_encoding(tmp_path):
+    # Fixture STR holds a cp949 string -> a Korean name must encode cp949.
+    svc, _, recorded = make_locedit_service(tmp_path)
+    svc.location_write("add", name="한글존", left=0, top=0, right=4, bottom=4)
+    assert recorded["ops"][-1].endswith("한글존".encode("cp949") + b"\n")
+
+
+def test_location_write_set_rename_delete_op_lines(tmp_path):
+    svc, _, recorded = make_locedit_service(tmp_path)
+    svc.location_write("set", location_id=2, left=1, top=1, right=3, bottom=3)
+    svc.location_write("rename", location_id=2, name="NewName")
+    svc.location_write("delete", location_id=5)
+    assert recorded["ops"] == [
+        b"set|2|32|32|96|96\n",
+        b"rename|2|NewName\n",
+        b"del|5\n",
+    ]
+
+
+def test_location_write_refuses_while_compiling(tmp_path):
+    svc, *_ = make_locedit_service(tmp_path, compiling="True")
+    with pytest.raises(MapInfoError, match="building right now"):
+        svc.location_write("delete", location_id=1)
+
+
+def test_location_write_refuses_locked_map(tmp_path):
+    svc, *_ = make_locedit_service(tmp_path, lock_probe=lambda p: True)
+    with pytest.raises(MapInfoError, match="open in another program"):
+        svc.location_write("delete", location_id=1)
+
+
+def test_location_write_arg_validation(tmp_path):
+    svc, _, recorded = make_locedit_service(tmp_path)
+    with pytest.raises(MapInfoError, match="action must be one of"):
+        svc.location_write("explode")
+    with pytest.raises(MapInfoError, match="tileRight > tileLeft"):
+        svc.location_write("add", name="X", left=5, top=0, right=5, bottom=4)
+    with pytest.raises(MapInfoError, match="must not contain"):
+        svc.location_write("add", name="a|b", left=0, top=0, right=1, bottom=1)
+    with pytest.raises(MapInfoError, match="name must be non-empty"):
+        svc.location_write("rename", location_id=1, name="  ")
+    with pytest.raises(MapInfoError, match="locationId must be >= 1"):
+        svc.location_write("delete", location_id=0)
+    assert recorded["ops"] == []  # nothing reached the CLI
+
+
+def test_location_write_cli_failure_surfaces_stderr(tmp_path):
+    svc, map_path, _ = make_locedit_service(
+        tmp_path, returncode=1, stderr="location #64 (Anywhere) is protected"
+    )
+    with pytest.raises(MapInfoError, match="Anywhere"):
+        svc.location_write("delete", location_id=64)
+    # The map is untouched (locedit aborts pre-save; our fake wrote nothing).
+    assert map_path.read_bytes() == b"ORIGINAL-MAP-BYTES"
+
+
+def test_detect_str_encoding_variants():
+    assert detect_str_encoding(build_fixture_chk()) == "cp949"  # Korean STR
+    ascii_only = sec("STR ", str_section([b"abc"]))
+    assert detect_str_encoding(ascii_only) == "cp949"  # ambiguous -> cp949
+    strx = sec("STRx", str_section([b"abc"], extended=True))
+    assert detect_str_encoding(strx) == "utf-8"  # SC:R table
+
+
+def test_restore_map_backup_roundtrip(tmp_path):
+    target = tmp_path / "m.scx"
+    target.write_bytes(b"EDITED")
+    backup = tmp_path / "m.bak"
+    backup.write_bytes(b"ORIGINAL")
+    restore_map_backup(str(target), str(backup))
+    assert target.read_bytes() == b"ORIGINAL"
+    with pytest.raises(MapInfoError, match="backup not found"):
+        restore_map_backup(str(target), str(tmp_path / "gone.bak"))
+
+
+# --------------------------------------------------------------------------- #
+# location_write tool routing + journal/changeset (features/09).
+# --------------------------------------------------------------------------- #
+
+
+class FakeLocService:
+    def __init__(self, *, error: MapInfoError | None = None):
+        self.calls: list[tuple] = []
+        self.error = error
+
+    def location_write(self, action, **kwargs):
+        self.calls.append((action, kwargs))
+        if self.error:
+            raise self.error
+        return {
+            "ok": True, "action": action, "locationId": 7,
+            "mapPath": "C:/maps/demo.scx", "backupPath": "C:/bk/demo.bak",
+            "locations": [],
+        }
+
+
+def test_location_write_is_a_registered_write_tool():
+    assert "location_write" in WRITE_TOOLS
+    layer = ToolLayer(object())
+    spec = next(s for s in layer.tool_specs() if s["name"] == "location_write")
+    assert spec["parameters"]["required"] == ["action"]
+    assert set(spec["parameters"]["properties"]["action"]["enum"]) == {
+        "add", "set", "rename", "delete",
+    }
+
+
+def test_location_write_routes_and_counts_action_and_mutation():
+    svc = FakeLocService()
+    layer = ToolLayer(object(), map_info=svc)
+    state = RequestState(request_id="r1")
+    out = layer.call("location_write", {
+        "action": "add", "name": "Zone",
+        "tileLeft": 1, "tileTop": 2, "tileRight": 3, "tileBottom": 4,
+    }, state)
+    assert out["locationId"] == 7
+    assert svc.calls == [("add", {
+        "name": "Zone", "location_id": 0,
+        "left": 1, "top": 2, "right": 3, "bottom": 4,
+    })]
+    assert state.action_count == 1 and state.mutation_count == 1
+
+
+def test_location_write_invalid_args_rejected_before_the_service():
+    svc = FakeLocService()
+    layer = ToolLayer(object(), map_info=svc)
+    state = RequestState(request_id="r1")
+    with pytest.raises(ToolError, match="action must be one of"):
+        layer.call("location_write", {"action": "nuke"}, state)
+    with pytest.raises(ToolError, match="'name' is required"):
+        layer.call("location_write", {"action": "add", "tileLeft": 0,
+                                      "tileTop": 0, "tileRight": 1,
+                                      "tileBottom": 1}, state)
+    with pytest.raises(ToolError, match="locationId"):
+        layer.call("location_write", {"action": "delete"}, state)
+    assert svc.calls == [] and state.action_count == 0
+
+
+def test_location_write_obeys_the_mutation_gate():
+    svc = FakeLocService()
+    layer = ToolLayer(object(), map_info=svc)
+    state = RequestState(request_id="r1")
+    for _ in range(2):
+        layer.call("location_write", {"action": "delete", "locationId": 1},
+                   state)
+    with pytest.raises(PlanRequired):
+        layer.call("location_write", {"action": "delete", "locationId": 1},
+                   state)
+    state.approve_plan()
+    layer.call("location_write", {"action": "delete", "locationId": 1}, state)
+    assert len(svc.calls) == 3
+
+
+def test_location_write_without_service_or_on_error_is_a_tool_error():
+    state = RequestState(request_id="r1")
+    with pytest.raises(ToolError, match="location_write unavailable"):
+        ToolLayer(object()).call(
+            "location_write", {"action": "delete", "locationId": 1}, state
+        )
+    svc = FakeLocService(error=MapInfoError("map file is open in another program"))
+    layer = ToolLayer(object(), map_info=svc)
+    with pytest.raises(ToolError, match="another program"):
+        layer.call("location_write", {"action": "delete", "locationId": 1},
+                   state)
+    assert state.action_count == 0
+
+
+def test_location_write_journal_entry_and_rollback_restores_backup(tmp_path):
+    # Real files: the journal entry's before carries the backup pointer and a
+    # rollback restores the pre-edit bytes over the edited map.
+    map_file = tmp_path / "demo.scx"
+    map_file.write_bytes(b"EDITED-MAP")
+    backup = tmp_path / "demo.scx.bak"
+    backup.write_bytes(b"ORIGINAL-MAP")
+
+    class _Svc(FakeLocService):
+        def location_write(self, action, **kwargs):
+            self.calls.append((action, kwargs))
+            return {
+                "ok": True, "action": action, "locationId": 1,
+                "mapPath": str(map_file), "backupPath": str(backup),
+                "locations": [],
+            }
+
+    journal = Journal(data_dir=str(tmp_path / "data"), request_id="rq",
+                      bridge=object())
+    layer = ToolLayer(object(), map_info=_Svc())
+    state = RequestState(request_id="rq")
+    layer.call("location_write", {
+        "action": "add", "name": "Zone",
+        "tileLeft": 0, "tileTop": 0, "tileRight": 1, "tileBottom": 1,
+    }, state, journal=journal)
+
+    assert len(journal.entries) == 1
+    entry = journal.entries[0]
+    assert entry.before["backupPath"] == str(backup)
+    item = journal.changeset()["items"][0]
+    assert item["category"] == "map" and "location:add" in item["target"]
+
+    result = journal.rollback(all=True)
+    assert result["items"][0]["ok"] is True
+    assert map_file.read_bytes() == b"ORIGINAL-MAP"
 
 
 # --------------------------------------------------------------------------- #

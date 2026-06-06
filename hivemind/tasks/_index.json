@@ -1403,6 +1403,25 @@
         "server/tests/test_chk_info.py",
         "hivemind/docs/"
       ]
+    },
+    "EUD-084-1bff": {
+      "status": "done",
+      "priority": "medium",
+      "type": "task",
+      "parent": null,
+      "depends_on": [],
+      "title": "location_write tool: agent-driven MRGN CRUD on the source map via IsomTerrain locedit (backup + plan gate + lock check)",
+      "updated": "2026-06-06",
+      "completed_at": "2026-06-06T18:12:32.752699",
+      "path": "done/EUD-084-1bff.md",
+      "scope": [
+        "server/eud_agent/chk_info.py",
+        "server/eud_agent/tools.py",
+        "server/eud_agent/journal.py",
+        "server/eud_agent/app.py",
+        "server/tests/test_chk_info.py",
+        "hivemind/docs/"
+      ]
     }
   }
 }
