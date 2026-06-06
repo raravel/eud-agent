@@ -10,8 +10,11 @@ the mutation gate, budgets, and (later) journaling live in the FastAPI process �
 this file holds NO tool logic, NO validation, NO whitelist. It only:
 
   1. reads ``server.ready`` (port + token) from the editor's ``Data\agent``;
-  2. fetches the tool specs from ``GET /tools/list?token=...`` and registers one
-     FastMCP tool per spec (name + description + params schema as advertised);
+  2. fetches the tool specs from ``GET /tools/list?token=...`` and advertises one
+     MCP tool per spec — name + description + the server's params JSON schema
+     VERBATIM as ``inputSchema`` (lowlevel server, EUD-087: FastMCP derived the
+     schema from the wrapper signature, hiding the real parameter names from
+     codex);
   3. forwards each invocation to ``POST /tools/call`` with the token and a stable
      ``request_id`` (one per shim process = one codex thread/turn session), and
      returns the server's ``result`` (or raises the server's ``error`` so codex
@@ -119,39 +122,58 @@ def forward_call(
     return body.get("result")
 
 
-def build_server():  # pragma: no cover - exercised only at real shim runtime
-    """Construct the FastMCP stdio server with one tool per server-advertised spec.
+def build_server():
+    """Construct the lowlevel MCP stdio server advertising the REAL tool schemas.
 
-    Kept out of unit-test coverage (it spawns a real loopback HTTP client against
-    the running server); the unit tests exercise ``read_ready`` / the URL builders
-    / ``forward_call`` (the transport seam) directly, and the round-trip is proven
-    by the EUD-053 spike.
+    EUD-087: the previous FastMCP registration wrapped every tool as
+    ``_tool(args: dict | None)`` — FastMCP derives the inputSchema from the
+    function SIGNATURE, so codex only ever saw a single untyped ``args`` object
+    and invented its own parameter names (``{"table", "field", "id"}`` instead
+    of ``{"dat", "name", "objId"}``), failing server-side validation over and
+    over. The lowlevel :class:`mcp.server.lowlevel.Server` lets the shim
+    advertise the server's ``parameters`` JSON schema VERBATIM (dumb transport,
+    now for the schema too); ``call_tool`` validates incoming args against that
+    schema before forwarding (``validate_input`` defaults to True).
+
+    The loopback HTTP forward runs in a worker thread (``anyio.to_thread``) so
+    a long tool call (build_run up to 300s) never blocks the MCP session loop.
     """
-    from mcp.server.fastmcp import FastMCP
+    import anyio
+    import mcp.types as types
+    from mcp.server.lowlevel import Server
 
     ready_path = _ready_path_from_env()
     port, token = read_ready(ready_path)
     request_id = os.environ.get("EUD_REQUEST_ID") or f"shim-{uuid.uuid4().hex[:8]}"
 
-    server = FastMCP("eud-tools")
-
+    server = Server("eud-tools")
     specs = fetch_tool_specs(port, token)
-    for spec in specs:
-        name = spec["name"]
-        description = spec.get("description", "")
 
-        def _make(tool_name: str, tool_doc: str):
-            def _tool(args: dict | None = None) -> object:
-                # DUMB TRANSPORT: forward verbatim; the server validates + gates.
-                return forward_call(port, token, request_id, tool_name, args or {})
+    @server.list_tools()
+    async def _list_tools() -> list[types.Tool]:
+        return [
+            types.Tool(
+                name=s["name"],
+                description=s.get("description", ""),
+                inputSchema=s.get("parameters")
+                or {"type": "object", "properties": {}},
+            )
+            for s in specs
+        ]
 
-            _tool.__name__ = tool_name
-            _tool.__doc__ = tool_doc
-            return _tool
-
-        # Register the forwarder under the advertised tool name. The server's
-        # params schema is the source of truth; the shim passes args through.
-        server.add_tool(_make(name, description), name=name, description=description)
+    @server.call_tool()
+    async def _call_tool(name: str, arguments: dict | None):
+        # DUMB TRANSPORT: forward verbatim; the server validates + gates. An
+        # exception (the server's ok=false error) is converted by the lowlevel
+        # server into an isError tool result codex can read and correct.
+        result = await anyio.to_thread.run_sync(
+            lambda: forward_call(port, token, request_id, name, arguments or {})
+        )
+        return [
+            types.TextContent(
+                type="text", text=json.dumps(result, ensure_ascii=False)
+            )
+        ]
 
     return server
 
@@ -162,7 +184,17 @@ def main() -> None:  # pragma: no cover - real stdio runtime only
     except Exception as exc:  # noqa: BLE001 - surface a clear startup error
         print(f"[eud-tools shim] startup failed: {exc}", file=sys.stderr)
         raise SystemExit(1) from exc
-    server.run(transport="stdio")
+
+    import anyio
+    from mcp.server.stdio import stdio_server
+
+    async def _run() -> None:
+        async with stdio_server() as (read, write):
+            await server.run(
+                read, write, server.create_initialization_options()
+            )
+
+    anyio.run(_run)
 
 
 if __name__ == "__main__":  # pragma: no cover

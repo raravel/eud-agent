@@ -534,6 +534,29 @@ def test_debug_log_records_tool_call_and_result_untruncated(tmp_path, monkeypatc
     assert "result" in results[0]["data"], "result text logged"
 
 
+def test_tools_call_unexpected_exception_is_ok_false_not_500(
+    tmp_path, monkeypatch
+):
+    """EUD-087: an untranslated exception (here: the fake bridge has no
+    ``builderr`` -> AttributeError) must surface as a READABLE ok=false tool
+    result, never the HTTP 500 the shim renders as 'Server error 500 ...'."""
+    from fastapi.testclient import TestClient
+
+    cfg, app, created = _build_stamp_app(tmp_path, monkeypatch)
+
+    with TestClient(app) as client:
+        r = client.post("/tools/call", json={
+            "token": cfg.token,
+            "request_id": "headless-job-err",
+            "tool": "build_errors",
+            "args": {},
+        })
+        assert r.status_code == 200
+        body = r.json()
+        assert body["ok"] is False
+        assert "build_errors" in body["error"]
+
+
 def test_debug_log_records_chat_and_turn_end_answer(tmp_path, monkeypatch):
     from fastapi.testclient import TestClient
 

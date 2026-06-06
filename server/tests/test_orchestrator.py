@@ -249,6 +249,11 @@ def test_system_prompt_first_principles_before_rag(monkeypatch):
     low = sp.lower()
     assert "refuse" in low  # the agent must refuse bug-inducing requests
     assert "while" in low and "ptr" in low  # known crash-cause markers
+    # [epscript] (EUD-087): the target language is PINNED before the RAG
+    # context (codex previously defaulted to SCMDraft classic text triggers).
+    assert "[epscript]" in sp
+    assert sp.index("[epscript]") < sp.index("[reference context]")
+    assert "NOT epScript" in sp  # the classic Trigger{} ban is explicit
 
 
 def test_system_prompt_bridge_failure_degrades(monkeypatch):

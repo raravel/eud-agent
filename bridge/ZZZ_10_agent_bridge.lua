@@ -897,7 +897,7 @@ local ok, initErr = pcall(function()
         elseif cmd == "GETTBL" then
             local pj = GlobalObj.pjData
             if pj == nil then return "ERROR: no project" end
-            local index = tonumber(string.gsub(arg, "^%s*(.-)%s*$", "%1"))
+            local index = tonumber((string.gsub(arg, "^%s*(.-)%s*$", "%1")))
             if index == nil then return "ERROR: 'GETTBL index'" end
             local b = pj.BindingManager:get_StatTxtBinding(index)
             if b == nil then return "ERROR: null binding (index out of range)" end
@@ -905,7 +905,7 @@ local ok, initErr = pcall(function()
         elseif cmd == "SETTBL" then
             local pj = GlobalObj.pjData
             if pj == nil then return "ERROR: no project" end
-            local index = tonumber(string.gsub(arg, "^%s*(.-)%s*$", "%1"))
+            local index = tonumber((string.gsub(arg, "^%s*(.-)%s*$", "%1")))
             if index == nil then return "ERROR: 'SETTBL index' + value from 2nd line" end
             local b = pj.BindingManager:get_StatTxtBinding(index)
             if b == nil then return "ERROR: null binding (index out of range)" end
@@ -988,7 +988,7 @@ local ok, initErr = pcall(function()
         elseif cmd == "GETBTN" then
             local pj = GlobalObj.pjData
             if pj == nil then return "ERROR: no project" end
-            local setId = tonumber(string.gsub(arg, "^%s*(.-)%s*$", "%1"))
+            local setId = tonumber((string.gsub(arg, "^%s*(.-)%s*$", "%1")))
             if setId == nil then return "ERROR: 'GETBTN setId'" end
             local bs = pj.ExtraDat.ButtonData:get_GetButtonSet(setId)
             if bs == nil then return "ERROR: null button set (id out of range)" end
@@ -998,7 +998,7 @@ local ok, initErr = pcall(function()
         elseif cmd == "SETBTN" then
             local pj = GlobalObj.pjData
             if pj == nil then return "ERROR: no project" end
-            local setId = tonumber(string.gsub(arg, "^%s*(.-)%s*$", "%1"))
+            local setId = tonumber((string.gsub(arg, "^%s*(.-)%s*$", "%1")))
             if setId == nil then return "ERROR: 'SETBTN setId' + csv from 2nd line" end
             if body == "" then return "ERROR: empty csv body" end
             -- 8-field CSV pre-check (pos,icon,con,act,conval,actval,enastr,disstr),
@@ -1113,7 +1113,7 @@ local ok, initErr = pcall(function()
             -- PLUGADD index + Texts in BODY. Construct an EdsBlockItem of type
             -- UserPlugin, set .Texts = body, insert at index (index=-1 appends).
             -- SetDirty after (direct mutation does not auto-dirty).
-            local index = tonumber(string.gsub(arg, "^%s*(.-)%s*$", "%1"))
+            local index = tonumber((string.gsub(arg, "^%s*(.-)%s*$", "%1")))
             if index == nil then return "ERROR: 'PLUGADD index' (index=-1 appends) + Texts from 2nd line" end
             local pj = GlobalObj.pjData
             if pj == nil then return "ERROR: no project" end
@@ -1134,7 +1134,7 @@ local ok, initErr = pcall(function()
         elseif cmd == "PLUGSET" then
             -- PLUGSET index + Texts in BODY. UserPlugin blocks only (built-ins
             -- reject -> ERROR). Blocks:get_Item(i).Texts = body; SetDirty.
-            local index = tonumber(string.gsub(arg, "^%s*(.-)%s*$", "%1"))
+            local index = tonumber((string.gsub(arg, "^%s*(.-)%s*$", "%1")))
             if index == nil then return "ERROR: 'PLUGSET index' + Texts from 2nd line" end
             local pj = GlobalObj.pjData
             if pj == nil then return "ERROR: no project" end
@@ -1156,7 +1156,7 @@ local ok, initErr = pcall(function()
             -- PLUGDEL index. UserPlugin blocks only (built-ins auto-reinsert at
             -- build, so deletion is meaningless -> ERROR). Blocks:RemoveAt(i);
             -- SetDirty.
-            local index = tonumber(string.gsub(arg, "^%s*(.-)%s*$", "%1"))
+            local index = tonumber((string.gsub(arg, "^%s*(.-)%s*$", "%1")))
             if index == nil then return "ERROR: 'PLUGDEL index'" end
             local pj = GlobalObj.pjData
             if pj == nil then return "ERROR: no project" end
@@ -1179,8 +1179,8 @@ local ok, initErr = pcall(function()
             -- SetDirty. Works for any block (the user reorders the eds output).
             local a = split(arg, "|")
             if #a < 2 then return "ERROR: 'PLUGMOVE from|to'" end
-            local fromIdx = tonumber(string.gsub(a[1], "^%s*(.-)%s*$", "%1"))
-            local toIdx   = tonumber(string.gsub(a[2], "^%s*(.-)%s*$", "%1"))
+            local fromIdx = tonumber((string.gsub(a[1], "^%s*(.-)%s*$", "%1")))
+            local toIdx   = tonumber((string.gsub(a[2], "^%s*(.-)%s*$", "%1")))
             if fromIdx == nil or toIdx == nil then return "ERROR: 'PLUGMOVE from|to' (numeric)" end
             local pj = GlobalObj.pjData
             if pj == nil then return "ERROR: no project" end

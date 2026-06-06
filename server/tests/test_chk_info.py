@@ -749,6 +749,10 @@ def test_location_write_journal_entry_and_rollback_restores_backup(tmp_path):
     assert entry.before["backupPath"] == str(backup)
     item = journal.changeset()["items"][0]
     assert item["category"] == "map" and "location:add" in item["target"]
+    # Display fix (EUD-087): the item carries a human summary, NOT the entry's
+    # rollback bookkeeping ({mapPath, backupPath}) the panel rendered verbatim.
+    assert item["old"] == ""
+    assert item["new"] == "location #1 'Zone' created in demo.scx"
 
     result = journal.rollback(all=True)
     assert result["items"][0]["ok"] is True

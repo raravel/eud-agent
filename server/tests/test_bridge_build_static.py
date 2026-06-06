@@ -469,6 +469,24 @@ def test_build_raises_bridge_error_on_error_reply():
     assert raised, "build() must raise BridgeError on an ERROR: reply"
 
 
+def test_no_unparenthesized_tonumber_gsub():
+    """EUD-087 regression: ``tonumber(string.gsub(...))`` crashes at runtime.
+
+    ``string.gsub`` returns TWO values (string, substitution count); as the
+    last argument of a call ALL results are passed, so the count lands in
+    ``tonumber``'s second parameter (the BASE) -> "bad argument #2 to
+    'tonumber' (base out of range)" (measured live on GETBTN). Every numeric
+    trim must truncate to one value: ``tonumber((string.gsub(...)))``.
+    """
+    text = _read_bridge()
+    bad = re.findall(r"tonumber\(string\.gsub", text)
+    assert not bad, (
+        f"{len(bad)} unparenthesized tonumber(string.gsub(...)) call(s): "
+        "gsub's substitution count becomes tonumber's base -> runtime error. "
+        "Wrap as tonumber((string.gsub(...)))."
+    )
+
+
 def test_builderr_sends_builderr_command_and_returns_reply():
     """``builderr()`` sends ``BUILDERR`` (no args) and returns the reply text."""
     FakeBridge = _fake_bridge()

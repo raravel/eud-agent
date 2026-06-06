@@ -332,6 +332,38 @@ def test_search_docs_rejects_missing_query():
         layer.call("search_docs", {}, fresh_state())
 
 
+def test_missing_args_error_carries_usage_line():
+    """EUD-087: a misnamed call (codex invented table/field/id) gets a
+    SELF-CORRECTING error carrying the tool's real usage line."""
+    bridge, layer = make_layer()
+    with pytest.raises(
+        ToolError, match=r"Usage: xdat_get\(dat, name, objId\)"
+    ) as ei:
+        layer.call(
+            "xdat_get",
+            {"table": "units", "field": "ButtonSet", "id": 65},
+            fresh_state(),
+        )
+    assert "'dat'" in str(ei.value)  # names every missing required arg
+    assert bridge.calls == []  # rejected before any bridge touch
+
+
+def test_bridge_busy_translates_to_tool_error_not_crash():
+    """EUD-087: BridgeBusy (timeout, NOT a BridgeError subclass) escaped
+    _dispatch untranslated and became an HTTP 500 at /tools/call."""
+    from eud_agent.bridge_io import BridgeBusy
+
+    class BusyBridge(FakeBridge):
+        def builderr(self, **kw):
+            raise BridgeBusy("editor busy: no .result before timeout")
+
+    layer = ToolLayer(BusyBridge())
+    state = fresh_state()
+    with pytest.raises(ToolError, match="editor busy"):
+        layer.call("build_errors", {}, state)
+    assert state.action_count == 0  # a failed call counts nothing
+
+
 def test_search_docs_translates_rag_failure_to_tool_error():
     """RagUnavailable (and any search crash) surfaces as a correctable
     ToolError that counts nothing — search is an advisory read."""
@@ -825,6 +857,103 @@ def test_mcp_shim_build_url_targets_loopback():
     url = mcp_shim.tools_call_url(8765)
     assert url.startswith("http://127.0.0.1:8765")
     assert "0.0.0.0" not in url
+
+
+async def test_mcp_shim_advertises_server_schema_verbatim(tmp_path, monkeypatch):
+    """EUD-087 regression: the shim must advertise the server's params JSON
+    schema as the MCP inputSchema. The old FastMCP wrapper derived the schema
+    from its ``_tool(args: dict)`` signature, so codex never saw the real
+    parameter names and invented its own (table/field/id for xdat_get)."""
+    import json
+
+    import mcp.types as types
+
+    from eud_agent import mcp_shim
+
+    ready = tmp_path / "server.ready"
+    ready.write_text(
+        json.dumps({"port": 9999, "token": "tok"}), encoding="utf-8"
+    )
+    monkeypatch.setenv("EUD_DATA_DIR", str(tmp_path))
+    params = {
+        "type": "object",
+        "properties": {
+            "dat": {"type": "string"},
+            "name": {"type": "string"},
+            "objId": {"type": "integer"},
+        },
+        "required": ["dat", "name", "objId"],
+        "additionalProperties": False,
+    }
+    monkeypatch.setattr(
+        mcp_shim, "fetch_tool_specs",
+        lambda port, token: [
+            {"name": "xdat_get", "description": "desc", "parameters": params}
+        ],
+    )
+    server = mcp_shim.build_server()
+    handler = server.request_handlers[types.ListToolsRequest]
+    result = await handler(types.ListToolsRequest(method="tools/list"))
+    tools = result.root.tools
+    assert [t.name for t in tools] == ["xdat_get"]
+    assert tools[0].inputSchema == params  # VERBATIM, not a generic args:dict
+
+
+async def test_mcp_shim_call_tool_forwards_and_validates(tmp_path, monkeypatch):
+    """The lowlevel call path: args forwarded verbatim (no {'args': ...}
+    wrapper), result wrapped as text content; schema-invalid args are
+    rejected SHIM-SIDE (validate_input) as an isError tool result."""
+    import json
+
+    import mcp.types as types
+
+    from eud_agent import mcp_shim
+
+    ready = tmp_path / "server.ready"
+    ready.write_text(
+        json.dumps({"port": 9999, "token": "tok"}), encoding="utf-8"
+    )
+    monkeypatch.setenv("EUD_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(
+        mcp_shim, "fetch_tool_specs",
+        lambda port, token: [{
+            "name": "tbl_get", "description": "d",
+            "parameters": {
+                "type": "object",
+                "properties": {"index": {"type": "integer"}},
+                "required": ["index"],
+                "additionalProperties": False,
+            },
+        }],
+    )
+    seen = {}
+
+    def fake_forward(port, token, request_id, tool, args, **kw):
+        seen["call"] = (tool, args)
+        return "OK: 5 = text"
+
+    monkeypatch.setattr(mcp_shim, "forward_call", fake_forward)
+    server = mcp_shim.build_server()
+    handler = server.request_handlers[types.CallToolRequest]
+
+    ok = await handler(types.CallToolRequest(
+        method="tools/call",
+        params=types.CallToolRequestParams(
+            name="tbl_get", arguments={"index": 5}
+        ),
+    ))
+    assert seen["call"] == ("tbl_get", {"index": 5})
+    assert not ok.root.isError
+    assert "OK: 5 = text" in ok.root.content[0].text
+
+    bad = await handler(types.CallToolRequest(
+        method="tools/call",
+        params=types.CallToolRequestParams(
+            name="tbl_get", arguments={"idx": "five"}
+        ),
+    ))
+    assert bad.root.isError  # rejected by the advertised schema, shim-side
+    assert seen["call"] == ("tbl_get", {"index": 5})  # never forwarded
 
 
 # --------------------------------------------------------------------------- #

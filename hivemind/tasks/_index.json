@@ -1455,6 +1455,22 @@
         "server/",
         "hivemind/docs/"
       ]
+    },
+    "EUD-087-8751": {
+      "status": "done",
+      "priority": "medium",
+      "type": "task",
+      "parent": null,
+      "depends_on": [],
+      "title": "Live-session tool reliability: shim schema, lua tonumber, 500s, changeset display, eps prompt",
+      "updated": "2026-06-06",
+      "completed_at": "2026-06-06T19:24:24.150264",
+      "path": "done/EUD-087-8751.md",
+      "scope": [
+        "server/",
+        "bridge/",
+        "hivemind/docs/"
+      ]
     }
   }
 }

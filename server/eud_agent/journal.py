@@ -499,6 +499,8 @@ class Journal:
                 items.append(self._file_item(e))
             elif cat == "memory":
                 items.append(self._memory_item(e))
+            elif cat == "map":
+                items.append(self._map_item(e))
             elif cat == "dat":
                 self._add_dat_to_group(dat_groups, e)
             else:
@@ -565,6 +567,41 @@ class Journal:
             "id": e.id,
             "seq": e.seq,
         })
+
+    @staticmethod
+    def _map_item(e: JournalEntry) -> dict[str, Any]:
+        """A ``location_write`` changeset item (features/09; display fix EUD-087).
+
+        The journal entry's ``before`` is rollback BOOKKEEPING ({mapPath,
+        backupPath} — exactly what ``_rollback_location`` needs), NOT a
+        reviewable previous state; rendered verbatim by the panel's generic
+        old → new row it read as a nonsense diff. The item carries a human
+        summary instead: ``old`` is empty (the pre-edit state lives in the
+        backup file) and ``new`` describes the applied edit. The entry itself
+        is unchanged — rollback keys stay intact.
+        """
+        action = e.after.get("action", "")
+        name = e.after.get("name", "")
+        loc_id = e.after.get("locationId", 0)
+        label = f"location #{loc_id}" + (f" '{name}'" if name else "")
+        summary = {
+            "add": f"{label} created",
+            "set": f"{label} bounds changed",
+            "rename": f"{label} renamed",
+            "delete": f"{label} deleted",
+        }.get(action, f"{label} ({action})")
+        map_name = Path(e.before.get("mapPath", "")).name
+        if map_name:
+            summary += f" in {map_name}"
+        return {
+            "category": "map",
+            "tool": e.tool,
+            "target": e.target,
+            "old": "",
+            "new": summary,
+            "id": e.id,
+            "seq": e.seq,
+        }
 
     @staticmethod
     def _flat_item(e: JournalEntry, category: str) -> dict[str, Any]:

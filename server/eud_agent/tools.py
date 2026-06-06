@@ -97,6 +97,7 @@ from .bridge_io import (
     _RESET_KINDS,
     _SETTING_SCOPES,
     _XDAT_KINDS,
+    BridgeBusy,
     BridgeError,
     _normalize_req_payload,
     _require_in,
@@ -276,6 +277,37 @@ def _req(args: dict, key: str) -> Any:
     if key not in args or args[key] is None:
         raise ToolError(f"missing required argument {key!r}")
     return args[key]
+
+
+def _usage_line(spec: ToolSpec) -> str:
+    """Render ``name(required, optional?)`` from the spec's JSON schema.
+
+    Embedded in argument-shape errors (EUD-087) so codex can correct a
+    misnamed call from the error text alone.
+    """
+    props = spec.parameters.get("properties", {})
+    required = set(spec.parameters.get("required", []))
+    parts = [k if k in required else f"{k}?" for k in props]
+    return f"{spec.name}({', '.join(parts)})"
+
+
+def _check_args_shape(spec: ToolSpec, args: dict) -> None:
+    """Reject missing required args with a SELF-CORRECTING usage message.
+
+    The shim advertises the same schema (EUD-087), but a model can still call
+    with invented parameter names (``{"table", "field", "id"}`` for xdat_get's
+    ``{"dat", "name", "objId"}``); a bare "missing required argument 'dat'"
+    gives it nothing to correct FROM. This runs before any routing/handler in
+    :meth:`ToolLayer.call`; per features/05 a rejection counts nothing.
+    """
+    required = spec.parameters.get("required", [])
+    missing = [k for k in required if k not in args or args[k] is None]
+    if missing:
+        raise ToolError(
+            f"{spec.name}: missing required argument(s) "
+            f"{', '.join(repr(k) for k in missing)}. "
+            f"Usage: {_usage_line(spec)}"
+        )
 
 
 def _opt(args: dict, key: str, default: Any) -> Any:
@@ -1174,6 +1206,13 @@ class ToolLayer:
                 "wrap up and ask the user whether to continue with a fresh budget."
             )
 
+        # Argument-shape gate (EUD-087): missing/misnamed args raise a
+        # SELF-CORRECTING ToolError carrying the tool's full usage line, so a
+        # model that guessed parameter names (table/field/id instead of
+        # dat/name/objId) can fix the call from the error alone. Checked before
+        # any routing/handler; a rejection counts nothing (features/05).
+        _check_args_shape(spec, args)
+
         # memory_write (EUD-079) is a WRITE for journaling/budget but PLAN-GATE
         # EXEMPT: recording a durable fact must never force a propose_plan, so it
         # bypasses the mutation gate below and does NOT advance the mutation
@@ -1247,7 +1286,7 @@ class ToolLayer:
             self._validate_args(spec, args)  # ToolError -> nothing sent/recorded
             try:
                 before = journal.snapshot(spec.name, args)
-            except BridgeError as exc:
+            except (BridgeError, BridgeBusy) as exc:
                 raise ToolError(str(exc)) from exc
             result = self._dispatch(spec, args)
             if before is not None:
@@ -1377,7 +1416,7 @@ class ToolLayer:
             result = service.map_info(**validated)
         except MapInfoError as exc:
             raise ToolError(str(exc)) from exc
-        except BridgeError as exc:
+        except (BridgeError, BridgeBusy) as exc:
             raise ToolError(str(exc)) from exc
         state.action_count += 1
         return result
@@ -1413,7 +1452,7 @@ class ToolLayer:
             result = service.location_write(action, **validated)
         except MapInfoError as exc:
             raise ToolError(str(exc)) from exc
-        except BridgeError as exc:
+        except (BridgeError, BridgeBusy) as exc:
             raise ToolError(str(exc)) from exc
 
         if journal is not None:
@@ -1525,16 +1564,18 @@ class ToolLayer:
             raise ToolError(str(exc)) from exc
 
     def _dispatch(self, spec: ToolSpec, args: dict) -> Any:
-        """Run the handler, translating a bridge round-trip BridgeError -> ToolError.
+        """Run the handler, translating a bridge round-trip failure -> ToolError.
 
         The handler validates args (raising ToolError) then calls the bridge; the
         bridge wrapper may raise BridgeError (its own pre-check OR the editor's
-        ERROR reply — the second line of defense). Either way codex must see a
+        ERROR reply — the second line of defense) or BridgeBusy (no .result
+        before the timeout — EUD-087: NOT a BridgeError subclass; untranslated
+        it escaped to an HTTP 500 at /tools/call). Either way codex must see a
         ToolError, never an unhandled exception.
         """
         try:
             return spec.handler(self._bridge, args)
         except ToolError:
             raise
-        except BridgeError as exc:
+        except (BridgeError, BridgeBusy) as exc:
             raise ToolError(str(exc)) from exc

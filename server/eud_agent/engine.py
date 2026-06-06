@@ -63,6 +63,33 @@ _FIRST_PRINCIPLES_PATH = (
     Path(__file__).resolve().parent / "data" / "first_principles.md"
 )
 
+# Target-language rules (EUD-087). The prompt previously never STATED the
+# language; codex defaulted to the SCMDraft classic text-trigger format
+# (`Trigger { players = ..., conditions = ..., actions = ... }`) it knows from
+# pretraining — which does not compile in this pipeline at all. Pinned AFTER
+# [first principles] and BEFORE [reference context] so it outranks any
+# classic-trigger examples quoted inside retrieved community posts.
+_EPSCRIPT_GUIDE = (
+    "[epscript]\n"
+    "- ALL code you write is epScript (*.eps, the C-like language compiled "
+    "by euddraft's epscript->eudplib pipeline). Write epScript ONLY.\n"
+    "- NEVER write SCMDraft classic text-trigger blocks — `Trigger { players "
+    "= {...}, conditions = {...}, actions = {...} }` is NOT epScript and "
+    "does not compile here.\n"
+    "- Structure: code runs from entry functions — `function onPluginStart() "
+    "{ }` (once at map start), `function beforeTriggerExec() { }` / "
+    "`function afterTriggerExec() { }` (every game loop). Repeating logic "
+    "goes INSIDE a loop function; there is no PreserveTrigger.\n"
+    '- Syntax essentials: statements end with ";"; variables `var x = 0;`, '
+    'constants `const marine = $U("Terran Marine");` (names map via '
+    '$U(unit)/$L(location)); conditions are if-expressions and actions are '
+    "statements — `if (Deaths(P1, AtLeast, 1, marine)) { SetDeaths(P1, "
+    'Subtract, 1, marine); CreateUnit(1, marine, $L("spawn"), P1); }`\n'
+    "- Unsure about eps syntax or an API name? search_docs (Korean query) "
+    "BEFORE writing code; follow eps examples from the reference-context "
+    "section and ignore classic-trigger examples quoted in posts."
+)
+
 # Map-location workflow guidance (features/08+09). Grounded in the ECA corpus:
 # 음수(Inverted) location semantics + the MoveLocation/Bring precision pattern
 # from cafe edac/126985 and the 강낭땅콩 editor course edac/76715.
@@ -126,15 +153,18 @@ def build_system_prompt(
     """
     state_section, project = _fetch_project_state(bridge)
     parts: list[str] = [
-        "You are the EUD Editor 3 agent. You edit a StarCraft EUD map project by "
-        "calling the eud-tools below; the server validates, journals, and can roll "
-        "back every change.",
+        "You are the EUD Editor 3 agent. You edit a StarCraft EUD map project — "
+        "epScript (eps) code, dat settings, map locations — by calling the "
+        "eud-tools below; the server validates, journals, and can roll back "
+        "every change.",
         "",
         _tool_catalog_section(tool_layer),
         "",
         state_section,
         "",
         _first_principles_section(),
+        "",
+        _EPSCRIPT_GUIDE,
         "",
         _MAP_LOCATION_GUIDE,
     ]

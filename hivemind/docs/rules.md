@@ -21,6 +21,7 @@ Violations of the EDITOR-* and LUANET-* rules crash or corrupt EUD Editor 3 at r
 - `load_assembly` BEFORE `import_type`; `System.dll` and WPF assemblies need full names (`System, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089`).
 - Enum arguments: pass enum objects from `import_type("Ns.Outer+EnumName")`, never raw numbers.
 - Empty `StringText` returns nil: ALWAYS `val or ""` when reading.
+- NEVER pass a multi-value call (`string.gsub`, `string.find`) directly as the LAST argument of another call — ALL its return values are forwarded (gsub's substitution count became `tonumber`'s base → "bad argument #2 to 'tonumber' (base out of range)", measured live on GETBTN, EUD-087). ALWAYS truncate with extra parentheses: `tonumber((string.gsub(...)))`.
 - Non-ASCII literals in .lua source are mojibake (KopiLua reads Latin1): ALWAYS restore with the `u8()` helper. Text read via .NET `File.ReadAllText` or typed into WPF controls is fine as-is.
 - SET/NEWEPS change memory objects only (user saves to disk). Setter exists only for CUI/RawText file types — GUI files are read-only; LIST must expose the type so callers can avoid them.
 - Auxiliary windows are closed by the editor on project create/switch: ALWAYS re-create the panel via window-handle tracking ("project open AND window not alive" per Tick). NEVER rely on `pjData==nil` re-arm alone.

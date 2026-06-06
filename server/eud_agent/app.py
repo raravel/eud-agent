@@ -565,6 +565,22 @@ def create_app(
                 },
             )
             return JSONResponse({"ok": False, "error": str(exc)})
+        except Exception as exc:  # noqa: BLE001 - last resort (EUD-087)
+            # An unexpected exception (a bug, or an untranslated bridge/runner
+            # failure) must reach codex as a READABLE tool result, not an HTTP
+            # 500 the shim renders as "Server error '500 ...' for url ...".
+            debug_log.log(
+                "tool_result",
+                {
+                    "request_id": request_id,
+                    "tool": tool,
+                    "ok": False,
+                    "error": f"internal: {exc!r}",
+                },
+            )
+            return JSONResponse(
+                {"ok": False, "error": f"{tool} failed internally: {exc}"}
+            )
         debug_log.log(
             "tool_result",
             {"request_id": request_id, "tool": tool, "ok": True,
