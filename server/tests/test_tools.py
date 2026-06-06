@@ -777,3 +777,194 @@ def test_mcp_shim_build_url_targets_loopback():
     url = mcp_shim.tools_call_url(8765)
     assert url.startswith("http://127.0.0.1:8765")
     assert "0.0.0.0" not in url
+
+
+# --------------------------------------------------------------------------- #
+# memory_write tool (features/07 "MCP tool: memory_write", Decision 07). The tool
+# is a JOURNALED write that records a durable project-memory fact, but it is
+# PLAN-GATE EXEMPT (recording a fact must never force propose_plan) while still
+# consuming the 30-action budget like any other tool call. The store is injected
+# into the ToolLayer the SAME way the journal is (an additive, optional seam):
+# ``ToolLayer(bridge, memory=<ProjectMemory>)``. A layer built WITHOUT a memory
+# store still rejects memory_write with a ToolError (no project open).
+#
+# These tests fail in Step A because memory_write is not in the registry yet.
+# --------------------------------------------------------------------------- #
+
+
+def make_memory_layer(tmp_path, *, project_name="MyMap"):
+    """A ToolLayer wired to a real ProjectMemory store rooted under tmp_path.
+
+    Mirrors make_layer() but injects a ProjectMemory the same additive way the
+    journal is injected, so memory_write has a real store to write through.
+    """
+    from eud_agent.memory import ProjectMemory
+
+    bridge = FakeBridge()
+    mem = ProjectMemory(data_dir=str(tmp_path / "data"), project_name=project_name)
+    layer = ToolLayer(bridge, memory=mem)
+    return bridge, layer, mem
+
+
+def test_registry_has_memory_write_tool():
+    _, layer = make_layer()
+    assert layer.has_tool("memory_write")
+    # memory_write is a write tool (journaled) — it IS mutating for journaling,
+    # but the plan gate exempts it (asserted separately below).
+    assert layer.is_mutating("memory_write")
+
+
+def test_memory_write_spec_advertises_file_enum_and_content():
+    _, layer = make_layer()
+    spec = next(s for s in layer.tool_specs() if s["name"] == "memory_write")
+    assert spec.get("description")
+    params = spec["parameters"]
+    props = params["properties"]
+    # file: enum of the four memory files; content: a string (full replacement).
+    assert set(props["file"].get("enum", [])) == {
+        "resources", "structure", "conventions", "lessons"
+    }
+    assert props["content"]["type"] == "string"
+    assert set(params["required"]) == {"file", "content"}
+
+
+def test_memory_write_rejects_unknown_file_enum_nothing_written(tmp_path):
+    bridge, layer, mem = make_memory_layer(tmp_path)
+    st = fresh_state()
+    with pytest.raises(ToolError):
+        layer.call("memory_write", {"file": "nope", "content": "x"}, st)
+    # nothing reached the disk store (no markdown file created).
+    assert mem.read("nope") == ""
+    assert not (mem.store_dir / "nope.md").exists()
+    # the rejected call did not touch the bridge nor count an action.
+    assert bridge.calls == []
+    assert st.action_count == 0
+
+
+def test_memory_write_rejects_over_cap_content_nothing_written(tmp_path):
+    from eud_agent.memory import CONTENT_CAP_BYTES
+
+    bridge, layer, mem = make_memory_layer(tmp_path)
+    st = fresh_state()
+    oversize = "a" * (CONTENT_CAP_BYTES + 1)
+    with pytest.raises(ToolError) as ei:
+        layer.call("memory_write", {"file": "resources", "content": oversize}, st)
+    # the error tells codex to condense.
+    assert "condense" in str(ei.value).lower()
+    # the prior (absent) file content is intact: nothing written.
+    assert mem.read("resources") == ""
+    assert st.action_count == 0
+
+
+def test_memory_write_no_project_open_is_tool_error(tmp_path):
+    """A ToolLayer whose memory store is DISABLED (no project open -> empty name)
+    rejects memory_write with a ToolError explaining no project is open."""
+    from eud_agent.memory import ProjectMemory
+
+    bridge = FakeBridge()
+    disabled = ProjectMemory(data_dir=str(tmp_path / "data"), project_name="")
+    assert disabled.enabled is False
+    layer = ToolLayer(bridge, memory=disabled)
+    with pytest.raises(ToolError) as ei:
+        layer.call(
+            "memory_write", {"file": "lessons", "content": "x"}, fresh_state()
+        )
+    assert "project" in str(ei.value).lower()
+
+
+def test_memory_write_without_injected_store_is_tool_error():
+    """A ToolLayer built WITHOUT a memory store rejects memory_write (no project
+    open) rather than crashing — same degradation contract as the disabled store."""
+    _, layer = make_layer()  # no memory= injection
+    with pytest.raises(ToolError):
+        layer.call(
+            "memory_write", {"file": "lessons", "content": "x"}, fresh_state()
+        )
+
+
+def test_memory_write_valid_call_writes_via_store(tmp_path):
+    import json
+
+    bridge, layer, mem = make_memory_layer(tmp_path)
+    st = fresh_state()
+    out = layer.call(
+        "memory_write",
+        {"file": "resources", "content": "switch 12 = doorOpen\n"},
+        st,
+    )
+    # the content landed in the injected store's file.
+    assert mem.read("resources") == "switch 12 = doorOpen\n"
+    # memory_write is not a bridge command — the fake bridge saw nothing.
+    assert bridge.calls == []
+    # the return is a plain JSON-serializable dict (NOT the WriteResult dataclass):
+    # the /tools/call endpoint json-dumps the result, so this boundary must hold.
+    assert out == {"ok": True, "file": "resources"}
+    assert json.dumps(out)  # must not raise (TypeError on a non-serializable value)
+
+
+def test_memory_write_does_not_trip_plan_gate(tmp_path):
+    """Three consecutive memory_write calls must NOT trip the 3-mutation plan gate
+    (recording a fact must never force propose_plan), but each DOES consume the
+    30-action budget."""
+    bridge, layer, mem = make_memory_layer(tmp_path)
+    st = fresh_state()
+    layer.call("memory_write", {"file": "resources", "content": "r1"}, st)
+    layer.call("memory_write", {"file": "structure", "content": "s1"}, st)
+    # the THIRD write would be gated for a normal write tool; memory_write is
+    # exempt, so it succeeds without a PlanRequired.
+    layer.call("memory_write", {"file": "conventions", "content": "c1"}, st)
+    assert mem.read("conventions") == "c1"
+    # plan gate untouched: mutation_count did not advance toward the gate.
+    assert st.mutation_count == 0
+    # but each call consumed an action-budget slot.
+    assert st.action_count == 3
+
+
+def test_memory_write_counts_toward_action_budget(tmp_path):
+    """memory_write is exempt from the plan gate but NOT from the 30-action budget:
+    after the budget is spent the next memory_write is rejected with BudgetExceeded."""
+    bridge, layer, mem = make_memory_layer(tmp_path)
+    st = fresh_state()
+    for _ in range(30):
+        layer.call("project_status", {}, st)
+    assert st.action_count == 30
+    with pytest.raises(BudgetExceeded):
+        layer.call("memory_write", {"file": "lessons", "content": "x"}, st)
+
+
+def test_memory_write_structure_refreshes_list_hash(tmp_path):
+    """Per the staleness rule, a memory_write targeting ``structure`` refreshes the
+    stored LIST hash so is_stale() goes false against the current LIST reply."""
+    from eud_agent.memory import list_hash
+
+    bridge, layer, mem = make_memory_layer(tmp_path)
+    st = fresh_state()
+    # bridge.list_files() is canned; the staleness signal is keyed on the LIST
+    # reply text, so drive the layer with the same LIST text the store will hash.
+    list_reply = "a.eps\tCUIEps\nb.eps\tCUIEps\n"
+    # before the write the store has no hash -> stale.
+    assert mem.is_stale(list_reply) is True
+    layer.call(
+        "memory_write",
+        {"file": "structure", "content": "a.eps: entry point\n"},
+        st,
+        list_reply=list_reply,
+    )
+    assert mem.read_meta().get("list_hash") == list_hash(list_reply)
+    assert mem.is_stale(list_reply) is False
+
+
+def test_memory_write_non_structure_does_not_refresh_list_hash(tmp_path):
+    """Only a ``structure`` write refreshes the LIST hash; a write to another file
+    leaves the staleness signal unchanged."""
+    bridge, layer, mem = make_memory_layer(tmp_path)
+    st = fresh_state()
+    list_reply = "a.eps\tCUIEps\n"
+    layer.call(
+        "memory_write",
+        {"file": "resources", "content": "r"},
+        st,
+        list_reply=list_reply,
+    )
+    # no structure write happened -> no recorded hash.
+    assert mem.read_meta().get("list_hash") in (None, "")

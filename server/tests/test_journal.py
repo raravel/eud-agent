@@ -976,3 +976,155 @@ def test_btn_set_roundtrip(tmp_path):
     j.rollback(all=True)
     assert ("setbtn", (2, old_csv)) in bridge.calls
     assert bridge.btn[2] == old_csv
+
+
+# --------------------------------------------------------------------------- #
+# memory_write journaling (features/07 "MCP tool: memory_write" -> "Journaled" +
+# "Changeset item"). The memory write goes to the ProjectMemory STORE (not the
+# bridge), so the journal is constructed with a ``memory=`` store the same way it
+# already holds ``bridge=``; snapshot/inverse operate on that store:
+#
+#   * snapshot before  = {content: <old or "">, existed: <bool>};
+#   * changeset item   = kind "memory", target "memory/<file>", server-side
+#     unified diff old -> new (same diff styling as a modified file);
+#   * inverse op       = restore old content, OR DELETE the file when
+#     existed=false, wired into the SAME reverse-seq replay as the other tools;
+#   * accept           = archives the journal normally (no rollback).
+#
+# These fail in Step A: memory_write is not a journaled tool yet.
+# --------------------------------------------------------------------------- #
+
+
+def _layer_with_journal_and_memory(tmp_path, bridge, *, project_name="MyMap"):
+    """A ToolLayer wired to BOTH a journal (per-request) and a ProjectMemory store.
+
+    Mirrors _layer_with_journal but additionally injects a ProjectMemory the same
+    additive way and threads it into every per-request Journal so the memory
+    snapshot/inverse can read+restore the store.
+    """
+    from eud_agent.memory import ProjectMemory
+    from eud_agent.tools import ToolLayer
+
+    mem = ProjectMemory(data_dir=str(tmp_path / "mdata"), project_name=project_name)
+    layer = ToolLayer(
+        bridge,
+        memory=mem,
+        journal_factory=lambda rid: Journal(
+            data_dir=str(tmp_path), request_id=rid, bridge=bridge, memory=mem
+        ),
+    )
+    return layer, mem
+
+
+def test_memory_write_journaled_snapshot_records_old_and_existed(tmp_path):
+    bridge = FakeBridge()
+    layer, mem = _layer_with_journal_and_memory(tmp_path, bridge)
+    # seed an existing resources.md so the snapshot captures the OLD content.
+    mem.write("resources", "old facts\n")
+    layer.call_for_request(
+        "R", "memory_write", {"file": "resources", "content": "new facts\n"}
+    )
+    assert mem.read("resources") == "new facts\n"
+    j = layer.get_journal("R")
+    entry = j.entries[-1]
+    assert entry.tool == "memory_write"
+    # snapshot before = {content: <old>, existed: True}.
+    assert entry.before["content"] == "old facts\n"
+    assert entry.before["existed"] is True
+    # after recorded the new content.
+    assert entry.after.get("content") == "new facts\n"
+
+
+def test_memory_write_snapshot_marks_absent_file_not_existed(tmp_path):
+    bridge = FakeBridge()
+    layer, mem = _layer_with_journal_and_memory(tmp_path, bridge)
+    # lessons.md does NOT exist yet.
+    layer.call_for_request(
+        "R", "memory_write", {"file": "lessons", "content": "first\n"}
+    )
+    j = layer.get_journal("R")
+    entry = j.entries[-1]
+    assert entry.before["content"] == ""
+    assert entry.before["existed"] is False
+
+
+def test_memory_write_changeset_item_kind_and_diff(tmp_path):
+    bridge = FakeBridge()
+    layer, mem = _layer_with_journal_and_memory(tmp_path, bridge)
+    mem.write("structure", "a.eps: old role\n")
+    layer.call_for_request(
+        "R", "memory_write", {"file": "structure", "content": "a.eps: new role\n"}
+    )
+    cs = layer.get_journal("R").changeset()
+    mem_items = [i for i in cs["items"] if i.get("kind") == "memory"]
+    assert len(mem_items) == 1
+    item = mem_items[0]
+    # target labelled memory/<file> (same convention as memory/<file> in the spec).
+    assert item["target"] == "memory/structure"
+    # server-side unified diff old -> new.
+    assert "diff" in item
+    assert "new role" in item["diff"]
+    assert "old role" in item["diff"]
+
+
+def test_memory_write_rollback_restores_old_content(tmp_path):
+    bridge = FakeBridge()
+    layer, mem = _layer_with_journal_and_memory(tmp_path, bridge)
+    mem.write("conventions", "old conv\n")
+    layer.call_for_request(
+        "R", "memory_write", {"file": "conventions", "content": "new conv\n"}
+    )
+    assert mem.read("conventions") == "new conv\n"
+    j = layer.get_journal("R")
+    j.rollback(all=True)
+    # inverse restored the OLD content (existed=True case).
+    assert mem.read("conventions") == "old conv\n"
+
+
+def test_memory_write_rollback_deletes_file_when_not_existed(tmp_path):
+    bridge = FakeBridge()
+    layer, mem = _layer_with_journal_and_memory(tmp_path, bridge)
+    # resources.md did NOT exist before this write.
+    layer.call_for_request(
+        "R", "memory_write", {"file": "resources", "content": "created\n"}
+    )
+    assert (mem.store_dir / "resources.md").exists()
+    j = layer.get_journal("R")
+    j.rollback(all=True)
+    # inverse of a create-from-absent == delete the file.
+    assert not (mem.store_dir / "resources.md").exists()
+    assert mem.read("resources") == ""
+
+
+def test_memory_write_rollback_in_reverse_seq_with_other_writes(tmp_path):
+    """A memory_write inverse is wired into the SAME reverse-seq replay: a request
+    mixing a file_write and a memory_write rolls back both, memory included."""
+    bridge = FakeBridge()
+    bridge.files["a.eps"] = "A0"
+    layer, mem = _layer_with_journal_and_memory(tmp_path, bridge)
+    mem.write("lessons", "L0\n")
+    layer.call_for_request("R", "file_write", {"path": "a.eps", "code": "A1"})
+    layer.call_for_request(
+        "R", "memory_write", {"file": "lessons", "content": "L1\n"}
+    )
+    j = layer.get_journal("R")
+    j.rollback(all=True)
+    # both restored.
+    assert bridge.files["a.eps"] == "A0"
+    assert mem.read("lessons") == "L0\n"
+
+
+def test_memory_write_accept_archives_journal(tmp_path):
+    bridge = FakeBridge()
+    layer, mem = _layer_with_journal_and_memory(tmp_path, bridge)
+    layer.call_for_request(
+        "R", "memory_write", {"file": "lessons", "content": "keep me\n"}
+    )
+    j = layer.get_journal("R")
+    j.accept(all=True)
+    live = tmp_path / "journal" / "R.json"
+    archived = tmp_path / "journal" / "R.accepted.json"
+    assert not live.is_file()
+    assert archived.is_file()
+    # accept does NOT roll back: the memory write stays applied.
+    assert mem.read("lessons") == "keep me\n"

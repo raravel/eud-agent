@@ -51,6 +51,21 @@ re-raised as a ToolError WITHOUT consuming an attempt (codex cannot fix it by
 editing eps; 3 misconfigs must not exhaust the budget). A ToolLayer built WITHOUT a
 runner_factory keeps the current plain ``bridge.build()`` behavior (existing
 constructions keep working). See ``edd_runner.py``.
+
+Project memory (EUD-079, features/07 "MCP tool: memory_write") is wired in the SAME
+additive way: ``ToolLayer`` takes an optional ``memory`` (a :class:`ProjectMemory`
+store). When present the ``memory_write`` tool records a durable project-memory
+fact (a full-file replacement of one of resources/structure/conventions/lessons)
+THROUGH that store. ``memory_write`` is ``kind="write"`` so it is journaled and
+consumes the 30-action budget, but it is PLAN-GATE EXEMPT (recording a fact must
+never force ``propose_plan``): it never raises :class:`PlanRequired` and does NOT
+advance the mutation counter. The tool layer is the FIRST line of defense — it
+checks the ``file`` enum, the 8 192-byte UTF-8 cap, and the disabled/missing store
+BEFORE any disk write (the store re-validates as the second line). A ``structure``
+write also refreshes the store's LIST hash (the staleness signal) from the
+``list_reply`` the engine threads through. A ToolLayer built WITHOUT a ``memory``
+store rejects ``memory_write`` with a ToolError ("no project is open"). See
+``memory.py``.
 """
 
 from __future__ import annotations
@@ -74,6 +89,7 @@ from .bridge_io import (
     _require_numeric_value,
     _require_pathlike,
 )
+from .memory import CONTENT_CAP_BYTES, MEMORY_FILES
 
 # Budgets (features/05 "Triage and plan gating"). Pinned constants; the request
 # state exposes them in budget_snapshot for the panel.
@@ -85,6 +101,10 @@ MUTATION_GATE_THRESHOLD = 3
 
 # Flow tool name (ends the codex turn for plan review).
 PLAN_TOOL = "propose_plan"
+
+# Project-memory write tool (EUD-079). A WRITE (journaled + budgeted) that is
+# PLAN-GATE EXEMPT: recording a durable fact must never force a propose_plan.
+MEMORY_TOOL = "memory_write"
 
 
 # --------------------------------------------------------------------------- #
@@ -537,6 +557,30 @@ def _h_build_run(bridge, args):
     return bridge.build()
 
 
+def _h_memory_write(bridge, args):
+    """Validate a ``memory_write`` (enum + cap); the store write is routed in ``call``.
+
+    This is the FIRST line of defense (features/07): the ``file`` must be one of
+    :data:`MEMORY_FILES` and ``content`` must be within the
+    :data:`CONTENT_CAP_BYTES` UTF-8 budget. No bridge call — memory_write targets
+    the injected :class:`ProjectMemory` store, not the editor bridge; the actual
+    write happens in :meth:`ToolLayer._memory_write_via_store` after this passes.
+    The probe-bridge ``_validate_args`` path runs exactly these checks, so an
+    arg-invalid call leaves no journal snapshot/entry behind.
+    """
+    file = _as_bridge_error_tool_error(
+        lambda: _require_in(_req(args, "file"), MEMORY_FILES, "memory file")
+    )
+    content = str(_req(args, "content"))
+    encoded = content.encode("utf-8")
+    if len(encoded) > CONTENT_CAP_BYTES:
+        raise ToolError(
+            f"memory content is {len(encoded)} bytes, over the "
+            f"{CONTENT_CAP_BYTES}-byte budget; condense it."
+        )
+    return {"file": file, "content": content}
+
+
 # ----- flow handler -----
 def _h_propose_plan(bridge, args):
     """End the turn for user review (features/05). No bridge call; no mutation.
@@ -742,6 +786,19 @@ def _build_registry() -> dict[str, ToolSpec]:
             "Run the editor build (SCArchive forced off, preflight paths).",
             _schema({}, []), _h_build_run,
         ),
+        ToolSpec(
+            MEMORY_TOOL, "write",
+            "Record a durable project-memory fact (full replacement of one memory "
+            "file). Plan-gate exempt; journaled so the user can review/reject it.",
+            _schema(
+                {
+                    "file": {"type": "string", "enum": list(MEMORY_FILES)},
+                    "content": _STR,
+                },
+                ["file", "content"],
+            ),
+            _h_memory_write,
+        ),
         # ---- flow ----
         ToolSpec(
             PLAN_TOOL, "flow",
@@ -806,10 +863,16 @@ class ToolLayer:
         gate: MutationGate | None = None,
         journal_factory: Callable[[str], Any] | None = None,
         runner_factory: Callable[[], Any] | None = None,
+        memory: Any | None = None,
     ) -> None:
         self._bridge = bridge
         self._gate = gate or MutationGate()
         self._requests: dict[str, RequestState] = {}
+        # Optional/injectable project-memory store (EUD-079). When present the
+        # ``memory_write`` tool records a durable fact through it; absent (or a
+        # disabled store) makes ``memory_write`` a ToolError ("no project is
+        # open"). Additive: existing constructions keep working unchanged.
+        self._memory = memory
         # Optional/injectable journal (EUD-055). When present, each WRITE tool
         # snapshots BEFORE mutating and records ``after`` AFTER; reads/flow never
         # journal. A ToolLayer built WITHOUT a factory behaves exactly as before
@@ -883,13 +946,17 @@ class ToolLayer:
         return self._runner
 
     # ---- the call paths ----
-    def call_for_request(self, request_id: str, name: str, args: dict) -> Any:
+    def call_for_request(
+        self, request_id: str, name: str, args: dict, *,
+        list_reply: str | None = None,
+    ) -> Any:
         return self.call(
             name,
             args,
             self.get_request_state(request_id),
             journal=self.get_journal(request_id),
             runner=self.get_runner(),
+            list_reply=list_reply,
         )
 
     def call(
@@ -900,6 +967,7 @@ class ToolLayer:
         *,
         journal: Any | None = None,
         runner: Any | None = None,
+        list_reply: str | None = None,
     ) -> Any:
         """Run one tool call under the gate + budget for ``state``.
 
@@ -933,6 +1001,17 @@ class ToolLayer:
             raise BudgetExceeded(
                 f"action budget exhausted ({state.action_limit} per request); "
                 "wrap up and ask the user whether to continue with a fresh budget."
+            )
+
+        # memory_write (EUD-079) is a WRITE for journaling/budget but PLAN-GATE
+        # EXEMPT: recording a durable fact must never force a propose_plan, so it
+        # bypasses the mutation gate below and does NOT advance the mutation
+        # counter. It still consumed the action budget (checked above) and is
+        # journaled (with snapshot/inverse on the memory store). Routed here so the
+        # gate check never sees it.
+        if spec.name == MEMORY_TOOL:
+            return self._memory_write_via_store(
+                spec, args, state, journal, list_reply
             )
 
         # Mutation gate: the Nth mutating call WITHOUT an approved plan is blocked
@@ -1051,6 +1130,66 @@ class ToolLayer:
         state.mutation_count += 1
         state.record_build_fix_attempt()
         return {"ok": result.ok, "errors": result.errors_as_dicts()}
+
+    def _memory_write_via_store(
+        self,
+        spec: ToolSpec,
+        args: dict,
+        state: RequestState,
+        journal: Any | None,
+        list_reply: str | None,
+    ) -> Any:
+        """Record a durable project-memory fact through the injected store.
+
+        First line of defense (features/07): :func:`_h_memory_write` validates the
+        ``file`` enum + the 8 192-byte cap (raising ToolError -> nothing written).
+        A missing or DISABLED store (no project open) is a ToolError "no project is
+        open". The write is JOURNALED like any other write (snapshot BEFORE, record
+        AFTER) so the user can review/reject it; the snapshot reads the OLD content
+        through the journal's own memory handle. A ``structure`` write also
+        refreshes the store's LIST hash from ``list_reply`` (staleness rule). The
+        call consumes the action budget but NOT the mutation counter (plan-gate
+        exempt — handled by the caller routing here before the gate).
+        """
+        # Validate enum + cap (no disk touch) BEFORE anything else.
+        validated = _h_memory_write(_ProbeBridge(), args)
+        file, content = validated["file"], validated["content"]
+
+        store = self._memory
+        if store is None or not getattr(store, "enabled", False):
+            raise ToolError(
+                "no project is open; project memory is disabled (open a map "
+                "project before recording memory)."
+            )
+
+        # Snapshot BEFORE the write (journaled path only). The journal reads the
+        # old content via its own memory handle.
+        before = None
+        if journal is not None:
+            before = journal.snapshot(spec.name, args)
+
+        write_result = store.write(file, content)
+        if not write_result.ok:
+            # The store re-validates (second line of defense); surface its reason.
+            raise ToolError(write_result.reason)
+
+        # A structure write refreshes the LIST-hash staleness signal when the
+        # engine threaded the current LIST reply through.
+        if file == "structure" and list_reply is not None:
+            store.update_list_hash(list_reply)
+
+        if journal is not None and before is not None:
+            journal.record(
+                spec.name, args, before,
+                journal.compute_after(spec.name, args, write_result),
+            )
+
+        state.action_count += 1
+        # Return a plain JSON-serializable dict: the /tools/call endpoint
+        # json-dumps the result, and the WriteResult dataclass is NOT
+        # JSON-serializable (matches the {ok, ...} shape of the runner build_run
+        # return).
+        return {"ok": True, "file": file}
 
     @staticmethod
     def _build_errors_via_runner(state: RequestState, runner: Any) -> Any:

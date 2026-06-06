@@ -61,6 +61,19 @@ SKIPS it entirely: no snapshot, no entry, no changeset item, and it can never
 appear in a rollback selection. (See :func:`Journal.snapshot` returning ``None``
 for build_run and the tool layer's skip.)
 
+memory_write targets the ProjectMemory store
+---------------------------------------------
+``memory_write`` (EUD-079, features/07) records a durable project-memory fact —
+a full-file replacement of one of resources/structure/conventions/lessons. Unlike
+every other journaled write it touches the injected :class:`ProjectMemory` STORE,
+not the editor bridge. Its snapshot is ``{content: <old or "">, existed: <bool>}``;
+the changeset item is ``{kind: memory, target: memory/<file>, diff}`` (a server-
+side unified diff old -> new, same styling as a modified file); and its inverse
+restores the old content when the file pre-existed, or DELETES the file when it
+did not — wired into the same reverse-seq rollback replay (the store IO replaces
+the bridge for that one tool). A journal with no memory store refuses a
+memory_write rollback per item.
+
 Snapshot-before-mutate is a hard guarantee
 ------------------------------------------
 ``file_write``/``file_delete`` read the existing content BEFORE mutating; if that
@@ -233,13 +246,21 @@ class Journal:
 
     Constructed with the editor ``data_dir`` (state lives under
     ``data_dir/journal/``), the ``request_id``, and the shared ``bridge`` (used
-    BOTH for snapshot GETs and for inverse-op writes during rollback).
+    BOTH for snapshot GETs and for inverse-op writes during rollback). The
+    optional ``memory`` (a :class:`ProjectMemory` store) is the target of
+    ``memory_write`` snapshots/inverses — its file IO replaces the bridge for that
+    one tool (memory writes never touch the editor). Absent when no project memory
+    is wired; a ``memory_write`` entry then cannot be rolled back (refused).
     """
 
-    def __init__(self, *, data_dir: str | os.PathLike, request_id: str, bridge):
+    def __init__(
+        self, *, data_dir: str | os.PathLike, request_id: str, bridge,
+        memory=None,
+    ):
         self.data_dir = Path(data_dir)
         self.request_id = request_id
         self._bridge = bridge
+        self._memory = memory
         self.journal_dir = self.data_dir / "journal"
         self.entries: list[JournalEntry] = []
         self._decided: set[str] = set()  # ids already rolled back or accepted
@@ -270,6 +291,13 @@ class Journal:
         """
         if tool == "build_run":
             return None  # builds have no reversible state; never journaled
+        if tool == "memory_write":
+            # memory_write targets the ProjectMemory STORE, not the bridge. Capture
+            # the OLD content + whether the file already existed, so the inverse can
+            # restore old content (existed) or DELETE the file (not existed).
+            name = args["file"]
+            old, existed = self._read_memory(name)
+            return {"content": old, "existed": existed}
         if tool == "dat_set":
             reply = self._bridge.getdat(
                 args["dat"], args["param"], int(args["objId"])
@@ -362,6 +390,21 @@ class Journal:
             return parse_get_value(self._bridge.gettbl(obj_id))
         return ""
 
+    def _read_memory(self, name: str) -> tuple[str, bool]:
+        """Read a memory file's OLD content + whether it existed (memory_write).
+
+        Returns ``(content, existed)``: the current store content (``""`` when
+        absent/disabled) and a flag for whether the ``<name>.md`` file is on disk
+        (drives the inverse: restore old content vs DELETE the file). When no
+        memory store is wired, reports ``("", False)`` (the inverse will refuse).
+        """
+        store = self._memory
+        if store is None:
+            return "", False
+        path = store.store_dir / f"{name}.md" if store.store_dir else None
+        existed = bool(path and path.is_file())
+        return store.read(name), existed
+
     # ------------------------------------------------------------- record
     def record(
         self, tool: str, args: dict, before: dict, after: dict
@@ -424,10 +467,11 @@ class Journal:
         os.replace(tmp, self._live_path)
 
     @classmethod
-    def load(cls, *, data_dir: str | os.PathLike, request_id: str, bridge
-             ) -> Journal:
+    def load(cls, *, data_dir: str | os.PathLike, request_id: str, bridge,
+             memory=None) -> Journal:
         """Reconstruct a journal from its persisted JSON (server-restart safe)."""
-        j = cls(data_dir=data_dir, request_id=request_id, bridge=bridge)
+        j = cls(data_dir=data_dir, request_id=request_id, bridge=bridge,
+                memory=memory)
         path = j._live_path
         if path.is_file():
             data = json.loads(path.read_text(encoding="utf-8"))
@@ -453,6 +497,8 @@ class Journal:
             cat = _category_for(e)
             if cat == "file":
                 items.append(self._file_item(e))
+            elif cat == "memory":
+                items.append(self._memory_item(e))
             elif cat == "dat":
                 self._add_dat_to_group(dat_groups, e)
             else:
@@ -479,6 +525,27 @@ class Journal:
                 e.before.get("content", ""), e.after.get("content", ""), path
             )
         return item
+
+    @staticmethod
+    def _memory_item(e: JournalEntry) -> dict[str, Any]:
+        """A ``memory_write`` changeset item (features/07 "Changeset item").
+
+        ``kind: memory``, ``target: memory/<file>``, and a server-side unified diff
+        old -> new so the user reviews a memory change with the SAME diff styling as
+        a modified file.
+        """
+        file = e.after.get("file") or e.before.get("file") or ""
+        target = f"memory/{file}"
+        return {
+            "category": "memory",
+            "kind": "memory",
+            "target": target,
+            "id": e.id,
+            "seq": e.seq,
+            "diff": _unified_diff(
+                e.before.get("content", ""), e.after.get("content", ""), target
+            ),
+        }
 
     @staticmethod
     def _add_dat_to_group(groups: dict, e: JournalEntry) -> None:
@@ -535,6 +602,9 @@ class Journal:
         return {"request_id": self.request_id, "items": results}
 
     def _rollback_one(self, e: JournalEntry) -> dict[str, Any]:
+        # memory_write inverses target the ProjectMemory STORE, not the bridge.
+        if e.tool == "memory_write":
+            return self._rollback_memory(e)
         try:
             op = self._inverse_op(e)
         except _RefuseRollback as exc:
@@ -543,6 +613,30 @@ class Journal:
             getattr(self._bridge, op["method"])(*op["args"])
         except BridgeError as exc:
             return {"id": e.id, "ok": False, "error": str(exc)}
+        return {"id": e.id, "ok": True}
+
+    def _rollback_memory(self, e: JournalEntry) -> dict[str, Any]:
+        """Inverse of a ``memory_write``: restore old content, or DELETE the file.
+
+        When ``before['existed']`` the file pre-existed -> write the snapshotted old
+        content back. Otherwise the write CREATED the file -> delete it (its prior
+        state was "absent"). Operates on the injected store; a missing store or a
+        store write rejection is reported as a per-item rollback failure.
+        """
+        store = self._memory
+        if store is None or not getattr(store, "enabled", False):
+            return {"id": e.id, "ok": False,
+                    "error": "cannot roll back memory_write: no memory store"}
+        name = e.after.get("file") or e.before.get("file") or ""
+        if e.before.get("existed"):
+            result = store.write(name, e.before.get("content", ""))
+            if not result.ok:
+                return {"id": e.id, "ok": False, "error": result.reason}
+            return {"id": e.id, "ok": True}
+        # Created from absent -> delete the file (best-effort; missing_ok).
+        path = store.store_dir / f"{name}.md" if store.store_dir else None
+        if path is not None:
+            path.unlink(missing_ok=True)
         return {"id": e.id, "ok": True}
 
     def _inverse_op(self, e: JournalEntry) -> dict:
@@ -685,6 +779,8 @@ def _category_for(entry: JournalEntry) -> str:
     grouping key would be ill-formed under the dat group).
     """
     tool = entry.tool
+    if tool == "memory_write":
+        return "memory"
     if tool in _FILE_TOOLS:
         return "file"
     if tool == "dat_set":
@@ -703,6 +799,8 @@ def _category_for(entry: JournalEntry) -> str:
 
 def _target_for(tool: str, args: dict) -> str:
     """A human-facing subject string for the entry/changeset."""
+    if tool == "memory_write":
+        return f"memory/{args.get('file', '')}"
     if tool in _FILE_TOOLS:
         return str(args.get("path", ""))
     if tool in ("dat_set", "xdat_set"):
@@ -805,4 +903,6 @@ def after_for(tool: str, args: dict, reply: Any) -> dict[str, Any]:
         return {"index": int(args["index"])}
     if tool == "plugin_move":
         return {"from": int(args["from"]), "to": int(args["to"])}
+    if tool == "memory_write":
+        return {"file": args["file"], "content": str(args["content"])}
     return {}
