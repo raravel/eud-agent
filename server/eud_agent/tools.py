@@ -52,6 +52,13 @@ editing eps; 3 misconfigs must not exhaust the budget). A ToolLayer built WITHOU
 runner_factory keeps the current plain ``bridge.build()`` behavior (existing
 constructions keep working). See ``edd_runner.py``.
 
+Map info (features/08) is wired in the SAME additive way: ``ToolLayer`` takes an
+optional ``map_info`` (a :class:`chk_info.MapInfoService`). When present the
+``map_info`` READ tool returns the connected map's SCMD2-set data (locations /
+units / forces) by extracting + parsing the raw CHK; absent (or a misconfigured
+IsomTerrain.exe) makes the tool a clear ToolError while NOTHING else in the flow
+changes (the same advisory shape as epscript-lsp). See ``chk_info.py``.
+
 Project memory (EUD-079, features/07 "MCP tool: memory_write") is wired in the SAME
 additive way: ``ToolLayer`` takes an optional ``memory`` (a :class:`ProjectMemory`
 store). When present the ``memory_write`` tool records a durable project-memory
@@ -89,6 +96,7 @@ from .bridge_io import (
     _require_numeric_value,
     _require_pathlike,
 )
+from .chk_info import MapInfoError
 from .memory import CONTENT_CAP_BYTES, MEMORY_FILES
 
 # Budgets (features/05 "Triage and plan gating"). Pinned constants; the request
@@ -105,6 +113,11 @@ PLAN_TOOL = "propose_plan"
 # Project-memory write tool (EUD-079). A WRITE (journaled + budgeted) that is
 # PLAN-GATE EXEMPT: recording a durable fact must never force a propose_plan.
 MEMORY_TOOL = "memory_write"
+
+# Map-info read tool (features/08). Routed to the injected MapInfoService (the
+# editor exposes only the OpenMapName path string — the CHK is read from disk).
+MAP_INFO_TOOL = "map_info"
+_MAP_INFO_MODES = ("summary", "locations", "units", "players")
 
 
 # --------------------------------------------------------------------------- #
@@ -377,6 +390,28 @@ def _h_plugins_list(bridge, args):
 
 def _h_build_errors(bridge, args):
     return bridge.builderr()
+
+
+def _h_map_info(bridge, args):
+    """Validate ``map_info`` args; the service call is routed in ``call``.
+
+    First line of defense (features/08): ``mode`` must be one of
+    :data:`_MAP_INFO_MODES`; the filters are free strings (the service matches
+    them loosely). No bridge call here — map_info targets the injected
+    :class:`MapInfoService`, not the editor bridge; the actual read happens in
+    :meth:`ToolLayer._map_info_via_service` after this passes.
+    """
+    mode = str(_opt(args, "mode", "summary"))
+    if mode not in _MAP_INFO_MODES:
+        raise ToolError(
+            f"map_info mode must be one of {', '.join(_MAP_INFO_MODES)}; "
+            f"got {mode!r}"
+        )
+    return {
+        "mode": mode,
+        "owner": str(_opt(args, "owner", "")),
+        "unit_type": str(_opt(args, "unitType", "")),
+    }
 
 
 def _h_search_docs(bridge, args):
@@ -673,6 +708,23 @@ def _build_registry() -> dict[str, ToolSpec]:
             "RAG top-k search over the ECA epScript document store.",
             _schema({"query": _STR, "k": _INT}, ["query"]), _h_search_docs,
         ),
+        ToolSpec(
+            MAP_INFO_TOOL, "read",
+            "Read the connected map's SCMD2-set data from the OpenMapName file "
+            "on disk (last saved state): locations, unit placement, "
+            "forces/teams, players. mode: summary|locations|units|players; "
+            "units mode accepts owner (P1..P12|neutral) and unitType "
+            "(id or name substring) filters.",
+            _schema(
+                {
+                    "mode": {"type": "string", "enum": list(_MAP_INFO_MODES)},
+                    "owner": _STR,
+                    "unitType": _STR,
+                },
+                [],
+            ),
+            _h_map_info,
+        ),
         # ---- write ----
         ToolSpec(
             "dat_set", "write",
@@ -864,10 +916,16 @@ class ToolLayer:
         journal_factory: Callable[[str], Any] | None = None,
         runner_factory: Callable[[], Any] | None = None,
         memory: Any | None = None,
+        map_info: Any | None = None,
     ) -> None:
         self._bridge = bridge
         self._gate = gate or MutationGate()
         self._requests: dict[str, RequestState] = {}
+        # Optional/injectable map-info service (features/08). When present the
+        # ``map_info`` READ tool digests the connected map's CHK through it;
+        # absent makes ``map_info`` a clear ToolError (advisory shape, like
+        # epscript-lsp). Additive: existing constructions keep working.
+        self._map_info = map_info
         # Optional/injectable project-memory store (EUD-079). When present the
         # ``memory_write`` tool records a durable fact through it; absent (or a
         # disabled store) makes ``memory_write`` a ToolError ("no project is
@@ -1014,6 +1072,12 @@ class ToolLayer:
                 spec, args, state, journal, list_reply
             )
 
+        # map_info (features/08) is a READ routed to the injected service (no
+        # bridge method maps to it beyond the OpenMapName lookup the service
+        # does itself). Routed here so the plain _dispatch path never sees it.
+        if spec.name == MAP_INFO_TOOL:
+            return self._map_info_via_service(spec, args, state)
+
         # Mutation gate: the Nth mutating call WITHOUT an approved plan is blocked
         # and directs codex to propose_plan. Checked BEFORE incrementing anything.
         if spec.mutating and not self._gate.allow(
@@ -1130,6 +1194,36 @@ class ToolLayer:
         state.mutation_count += 1
         state.record_build_fix_attempt()
         return {"ok": result.ok, "errors": result.errors_as_dicts()}
+
+    def _map_info_via_service(
+        self, spec: ToolSpec, args: dict, state: RequestState
+    ) -> Any:
+        """Digest the connected map through the injected MapInfoService.
+
+        First line of defense (features/08): :func:`_h_map_info` validates the
+        ``mode`` enum (ToolError -> nothing runs, nothing counted). A missing
+        service means IsomTerrain.exe was never configured — a clear ToolError
+        codex can relay, never a crash. A :class:`MapInfoError` (unconfigured
+        exe, no map connected, extraction failure) is translated the same way;
+        the bridge GETSET inside the service may raise BridgeError, translated
+        to the SAME family. A successful read counts one action (READ: no
+        mutation counter, no journal, no plan gate).
+        """
+        validated = _h_map_info(_ProbeBridge(), args)
+        service = self._map_info
+        if service is None:
+            raise ToolError(
+                "map_info unavailable: no map-info service is configured "
+                "(set ISOMTERRAIN_CMD or the agent.cfg 'isomterrain_cmd' key)."
+            )
+        try:
+            result = service.map_info(**validated)
+        except MapInfoError as exc:
+            raise ToolError(str(exc)) from exc
+        except BridgeError as exc:
+            raise ToolError(str(exc)) from exc
+        state.action_count += 1
+        return result
 
     def _memory_write_via_store(
         self,

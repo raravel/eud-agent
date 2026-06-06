@@ -44,6 +44,7 @@ from starlette.websockets import WebSocketDisconnect, WebSocketState
 from . import rag
 from .agent_runner import CodexSDKRunner
 from .bridge_io import BridgeIO
+from .chk_info import MapInfoService
 from .config import Config
 from .debuglog import DebugLog
 from .engine import AgentEngine
@@ -436,8 +437,17 @@ def create_app(
             memory=live_memory,
         )
 
+    # map_info service (features/08): digests the connected map's CHK via the
+    # IsomTerrain.exe extractor. Always constructed — an unresolvable exe path
+    # degrades ONLY the map_info tool (clear ToolError at call time, the same
+    # advisory shape as epscript-lsp), never the boot.
+    map_info_service = MapInfoService(
+        bridge, isomterrain_cmd=cfg.isomterrain_cmd
+    )
+
     tool_layer = ToolLayer(
-        bridge, journal_factory=_journal_factory, memory=live_memory
+        bridge, journal_factory=_journal_factory, memory=live_memory,
+        map_info=map_info_service,
     )
     app.state.tool_layer = tool_layer
 

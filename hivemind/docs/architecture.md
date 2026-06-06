@@ -15,6 +15,7 @@ graph TD
     Codex["codex exec CLI (BYO)"]
     RAG[("ECA RAG DB<br/>chromadb_bge - bge-m3 1024d")]
     LSP["epscript-lsp (node, optional)"]
+    Isom["IsomTerrain.exe (isom-poc build, optional)"]
 
     Bridge -- "spawns (luanet Process, CreateNoWindow)" --> Server
     Server -. "server.ready (port,pid,ppid,token)" .-> Bridge
@@ -25,6 +26,7 @@ graph TD
     Server --> Codex
     Server --> RAG
     Server -. "advisory diagnostics" .-> LSP
+    Server -. "map_info: chk extract of OpenMapName" .-> Isom
 ```
 
 Dependency direction: `panel -> server -> bridge -> editor`. The bridge never calls the server (except spawning it); the server never touches editor objects directly; the panel only speaks WebSocket to the server. Heavy work (LLM, RAG, orchestration, diffing) lives in Python; Lua stays a thin tool-call layer.
@@ -150,3 +152,5 @@ Runtime state lives in the **editor's** folder, not the repo: `<editor>\Data\age
 - Panel = React + Vercel AI Elements (vendored source, zero runtime CDN) built with Vite to `panel/dist/` (never committed; release-packaged later via GitHub Releases). Monaco editor is the edit surface; the diff tab renders the server-side unified diff. epscript-lsp stays a server-side advisory diagnostics gate only.
 
 > Decision: see [[decisions/03_react-panel-rebuild]], [[decisions/04_dist-release-distribution]], [[decisions/05_monaco-editor-adoption]].
+
+- `map_info` tool (features/08): the editor exposes only the `OpenMapName` path string, so the connected map's SCMD2-set data (locations/units/forces/players) is read from DISK — `IsomTerrain.exe chk` (the verified isom-poc CLI, zero C++ changes) extracts the raw CHK and `server/eud_agent/chk_info.py` parses it in Python. Advisory like epscript-lsp: a missing exe degrades only this tool, never boot/selfcheck. Path resolution: `ISOMTERRAIN_CMD` env > agent.cfg `isomterrain_cmd` > built-in isom-poc build path. The digest is the last-SAVED disk state (`map.savedAt` carries the mtime).

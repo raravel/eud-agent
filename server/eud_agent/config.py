@@ -57,6 +57,13 @@ DEFAULT_PORT = 8765
 DEFAULT_RAG_DB = r"C:\Users\ifthe\proj\eud\ECA\chromadb_bge"
 DEFAULT_HF_CACHE = r"C:\Users\ifthe\.cache\huggingface\hub"
 BGE_M3_DIRNAME = "models--BAAI--bge-m3"
+# IsomTerrain CLI (isom-poc build artifact) — the map_info tool's CHK extractor
+# (features/08). ADVISORY prerequisite: a missing exe degrades only map_info
+# (clear ToolError), so selfcheck does NOT fail on it (same policy as
+# epscript-lsp). Grounded in the isom-poc build output on this machine.
+DEFAULT_ISOMTERRAIN = (
+    r"C:\Users\ifthe\proj\eud\isom-poc\IsomTerrain\x64\ReleaseUS\IsomTerrain.exe"
+)
 
 # Panel prerequisite: the BUILT React output served from one origin (no CDN).
 # The vanilla flat files (app.js/style.css) were retired at the EUD-035
@@ -73,6 +80,7 @@ ENV_PORT = "EUD_PORT"
 ENV_CODEX = "CODEX_CMD"
 ENV_RAG_DB = "EUD_RAG_DB"
 ENV_REPO_ROOT = "EUD_REPO_ROOT"
+ENV_ISOMTERRAIN = "ISOMTERRAIN_CMD"
 # Standard HuggingFace cache env vars (advisory 3): HF_HUB_CACHE is the full hub
 # path; HF_HOME's hub lives at <HF_HOME>/hub. The invented HF_HOME_HUB is gone.
 ENV_HF_HUB_CACHE = "HF_HUB_CACHE"
@@ -89,6 +97,11 @@ class Config:
     rag_db: str
     repo_root: str
     hf_cache_dir: str
+    # IsomTerrain.exe path for the map_info tool (features/08). Defaulted so
+    # existing direct Config(...) constructions keep working; resolve() fills
+    # it from ISOMTERRAIN_CMD env > agent.cfg 'isomterrain_cmd' > the built-in
+    # isom-poc build path. An unresolvable path degrades only map_info.
+    isomterrain_cmd: str = DEFAULT_ISOMTERRAIN
     token: str = field(default_factory=lambda: str(uuid.uuid4()))
     # Non-fatal diagnostics gathered during resolve (auto-discovered broken cfg,
     # non-numeric port). Resolution proceeds on defaults; selfcheck prints these
@@ -171,6 +184,9 @@ class Config:
         repo_root = str(pick("repo_root", ENV_REPO_ROOT, str(_REPO_ROOT)))
         rag_db = str(pick("rag_db", ENV_RAG_DB, DEFAULT_RAG_DB))
         hf_cache_dir = cls._resolve_hf_cache(env)
+        isomterrain_cmd = str(
+            pick("isomterrain_cmd", ENV_ISOMTERRAIN, DEFAULT_ISOMTERRAIN)
+        )
 
         codex_cmd = cls._resolve_codex(cli, env, file_cfg)
 
@@ -181,6 +197,7 @@ class Config:
             rag_db=rag_db,
             repo_root=repo_root,
             hf_cache_dir=hf_cache_dir,
+            isomterrain_cmd=isomterrain_cmd,
             warnings=warnings,
             cfg_error=cfg_error,
         )

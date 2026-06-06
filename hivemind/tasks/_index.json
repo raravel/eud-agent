@@ -1383,6 +1383,26 @@
         "panel/src/**",
         "panel/components/**"
       ]
+    },
+    "EUD-083-1bfd": {
+      "status": "done",
+      "priority": "medium",
+      "type": "task",
+      "parent": null,
+      "depends_on": [],
+      "title": "map_info tool: locations/units/forces digest of the connected map via IsomTerrain chk + Python CHK parser",
+      "updated": "2026-06-06",
+      "completed_at": "2026-06-06T17:45:00.389775",
+      "path": "done/EUD-083-1bfd.md",
+      "scope": [
+        "server/eud_agent/chk_info.py",
+        "server/eud_agent/tools.py",
+        "server/eud_agent/config.py",
+        "server/eud_agent/app.py",
+        "server/eud_agent/data/unit_names.json",
+        "server/tests/test_chk_info.py",
+        "hivemind/docs/"
+      ]
     }
   }
 }
