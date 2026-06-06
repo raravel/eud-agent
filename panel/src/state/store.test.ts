@@ -912,6 +912,48 @@ describe("streamed-prose archival on turn-end (F2)", () => {
   });
 });
 
+// ---- RAG warmup send gate: the server replays the current rag_warmup state to
+// a newly connected client; while the model loads (~19s) sending is blocked so
+// a turn does not silently park on the warmup lock. Fail-open everywhere else:
+// "unknown" (old server / tests — no snapshot) and "unavailable" (warmup error)
+// must NEVER lock the panel.
+describe("RAG warmup send gate", () => {
+  it("defaults to 'unknown' and does NOT block send (fail-open)", () => {
+    const store = readyWithProject();
+    expect(store.getState().rag).toBe("unknown");
+    expect(store.getState().canSend).toBe(true);
+  });
+
+  it("blocks send while the RAG model is loading", () => {
+    const store = readyWithProject();
+    store.ragWarmupChanged("loading");
+    const s = store.getState();
+    expect(s.rag).toBe("loading");
+    expect(s.canSend).toBe(false);
+  });
+
+  it("unblocks send when warmup completes", () => {
+    const store = readyWithProject();
+    store.ragWarmupChanged("loading");
+    store.ragWarmupChanged("ready");
+    expect(store.getState().canSend).toBe(true);
+  });
+
+  it("unblocks send when warmup fails (fail-open — never lock forever)", () => {
+    const store = readyWithProject();
+    store.ragWarmupChanged("loading");
+    store.ragWarmupChanged("unavailable");
+    expect(store.getState().canSend).toBe(true);
+  });
+
+  it("keeps the other gates: rag ready does not bypass the project gate", () => {
+    const store = freshStore();
+    store.wsOpen();
+    store.ragWarmupChanged("ready");
+    expect(store.getState().canSend).toBe(false); // no project open
+  });
+});
+
 // Type-only: PanelState carries the v2 fields the (future) UI renders from.
 const _typecheck: PanelState = createPanelStore().getState();
 void _typecheck;

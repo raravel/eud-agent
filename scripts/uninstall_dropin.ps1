@@ -1,7 +1,9 @@
-#Requires -Version 7
+#Requires -Version 5.1
 <#
 .SYNOPSIS
     Remove the EUD Editor 3 agent drop-in: bridge lua, agent.cfg, Data\agent runtime.
+    Runs on Windows PowerShell 5.1 (builtin) and PowerShell 7+; keep the
+    source ASCII-only (5.1 reads BOM-less files as ANSI/CP949).
 
 .DESCRIPTION
     Reverses scripts\install_dropin.ps1. Removes:

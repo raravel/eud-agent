@@ -45,8 +45,13 @@ from . import rag
 from .agent_runner import CodexSDKRunner
 from .bridge_io import BridgeIO
 from .config import Config
+from .debuglog import DebugLog
 from .engine import AgentEngine
 from .tools import ToolError, ToolLayer
+
+#: Outbound event types the debug trail records (turn ends). Streaming
+#: `agent_event` deltas and progress chatter are deliberately excluded.
+_DEBUG_TURN_END_TYPES = frozenset({"answer", "plan", "changeset", "error"})
 
 # Lifecycle defaults (rules.md: heartbeat check 15s, staleness 60s; ready poll is
 # a fast internal confirm). All are injectable via create_app for tests.
@@ -350,12 +355,21 @@ def create_app(
 
     app = FastAPI(title="eud-agent")
 
+    # Persistent debug trail (chat inputs / tool calls / turn ends) under
+    # <data_dir>/logs/agent-YYYYMMDD.jsonl. Construction runs the retention
+    # cleanup; logging is best-effort and never breaks the serving flow.
+    debug_log = DebugLog(cfg.data_dir)
+    app.state.debug_log = debug_log
+
     # ----- shared connection registry (broadcast to all WS clients) -----
     clients: set[WebSocket] = set()
     clients_lock = threading.Lock()
 
     async def broadcast(event: dict) -> None:
         """Deliver an event dict to every connected, open WS client."""
+        # Debug trail: record turn-end events only (no streaming deltas).
+        if event.get("type") in _DEBUG_TURN_END_TYPES:
+            debug_log.log("server", event)
         with clients_lock:
             targets = list(clients)
         for ws in targets:
@@ -401,6 +415,14 @@ def create_app(
 
     def _register_request_id(request_id: str | None) -> None:
         app.state.active_request_id = request_id
+
+    # RAG warmup state holder. Warmup progress is broadcast-only, but "started"
+    # usually fires BEFORE the panel connects (server boot) and a reloaded panel
+    # misses "done" entirely — the warmup callback maintains the CURRENT state
+    # here and the WS endpoint replays it to every newly accepted client (the
+    # panel gates its send on it). None = no warmup ran (tests / in-process):
+    # nothing is replayed, the panel fails open.
+    app.state.rag_warmup_state = None
 
     # v2 agent-runner factory (EUD-056). Injectable for tests (FakeRunner); the
     # default builds a real CodexSDKRunner over the resolved codex binary.
@@ -456,6 +478,12 @@ def create_app(
             return JSONResponse(
                 {"ok": False, "error": "missing 'tool' name"}
             )
+        # Debug trail: the full (untruncated) call — the panel's agent_event
+        # payloads are truncated, this is the authoritative record.
+        debug_log.log(
+            "tool_call",
+            {"request_id": request_id, "tool": tool, "args": args},
+        )
         # Read the (possibly test-swapped) tool layer from app.state so the same
         # per-request journal/gate the engine uses backs these forwarded calls.
         active_tool_layer = app.state.tool_layer
@@ -467,7 +495,21 @@ def create_app(
                 active_tool_layer.call_for_request, request_id, tool, args
             )
         except ToolError as exc:
+            debug_log.log(
+                "tool_result",
+                {
+                    "request_id": request_id,
+                    "tool": tool,
+                    "ok": False,
+                    "error": str(exc),
+                },
+            )
             return JSONResponse({"ok": False, "error": str(exc)})
+        debug_log.log(
+            "tool_result",
+            {"request_id": request_id, "tool": tool, "ok": True,
+             "result": result},
+        )
         return JSONResponse({"ok": True, "result": result})
 
     @app.get("/")
@@ -498,6 +540,16 @@ def create_app(
         await websocket.accept()
         with clients_lock:
             clients.add(websocket)
+        # Replay the current RAG warmup state to the new client (broadcasts
+        # alone miss late joiners — the panel send-gate needs the snapshot).
+        warm = getattr(app.state, "rag_warmup_state", None)
+        if warm is not None:
+            try:
+                await websocket.send_json(
+                    {"type": "progress", "stage": "rag_warmup", "detail": warm}
+                )
+            except Exception:  # noqa: BLE001 - snapshot is best-effort
+                pass
         # Per-connection v2 engine: the WS state machine (idle -> triage ->
         # answer | apply | plan_review* -> executing -> changeset_review -> idle)
         # driven by client messages. It owns the per-session AgentRunner and reads
@@ -511,7 +563,7 @@ def create_app(
             register_request_id=_register_request_id,
         )
         try:
-            await _serve_ws(websocket, engine)
+            await _serve_ws(websocket, engine, debug_log=debug_log)
         except WebSocketDisconnect:
             pass
         finally:
@@ -588,6 +640,9 @@ def create_app(
                 ev: dict = {"type": "progress", "stage": stage, "detail": state}
                 if detail:
                     ev["detail"] = f"{state}: {detail}"
+                # Keep the holder in sync so the WS endpoint can replay the
+                # CURRENT state to clients that connect after this broadcast.
+                app.state.rag_warmup_state = ev["detail"]
                 try:
                     asyncio.run_coroutine_threadsafe(broadcast(ev), loop)
                 except Exception:  # noqa: BLE001 - progress is best-effort
@@ -626,7 +681,12 @@ def _shutdown_cleanup(watcher: HeartbeatWatcher, delete_ready) -> None:
 # --------------------------------------------------------------------------- #
 
 
-async def _serve_ws(websocket: WebSocket, engine: AgentEngine) -> None:
+async def _serve_ws(
+    websocket: WebSocket,
+    engine: AgentEngine,
+    *,
+    debug_log: DebugLog | None = None,
+) -> None:
     """Dispatch WS v2 client messages to the per-connection engine.
 
     Client -> server (features/05 "WS protocol v2"): ``chat`` / ``plan_feedback``
@@ -637,4 +697,8 @@ async def _serve_ws(websocket: WebSocket, engine: AgentEngine) -> None:
     """
     while True:
         msg = await websocket.receive_json()
+        # Debug trail: every inbound client message, verbatim (chat text,
+        # plan feedback/approve, decisions, status/list).
+        if debug_log is not None:
+            debug_log.log("client", msg)
         await engine.handle(msg)

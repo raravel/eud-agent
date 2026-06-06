@@ -137,3 +137,82 @@ describe("ConversationLog — inline agent stream (EUD-069)", () => {
     expect(screen.getByText("완료")).toBeInTheDocument();
   });
 });
+
+// ---- Waiting shimmer: between chat send (phase → thinking, fresh empty turn)
+// and the FIRST streamed agent_event there is no visual feedback that the input
+// was received. A Shimmer "생각하는 중…" row renders inline in the live turn
+// area while thinking with an EMPTY turn, and disappears as soon as any turn
+// content (reasoning / tool / answer) arrives.
+describe("ConversationLog — waiting shimmer before the first stream event", () => {
+  const emptyTurn = {
+    reasoning: "",
+    answer: "",
+    answerStarted: false,
+    tools: [],
+  };
+
+  it("shows the shimmer while thinking with an empty turn", () => {
+    render(<ConversationLog log={[]} phase="thinking" turn={emptyTurn} />);
+    const waiting = screen.getByTestId("turn-waiting");
+    expect(waiting).toBeInTheDocument();
+    expect(waiting).toHaveTextContent("생각하는 중…");
+  });
+
+  it("hides the shimmer once reasoning starts streaming", () => {
+    render(
+      <ConversationLog
+        log={[]}
+        phase="thinking"
+        turn={{ ...emptyTurn, reasoning: "유닛을 확인" }}
+      />,
+    );
+    expect(screen.queryByTestId("turn-waiting")).not.toBeInTheDocument();
+  });
+
+  it("hides the shimmer once a tool call arrives", () => {
+    render(
+      <ConversationLog
+        log={[]}
+        phase="thinking"
+        turn={{
+          ...emptyTurn,
+          tools: [{ id: "t1", name: "dat_get", state: "running" as const }],
+        }}
+      />,
+    );
+    expect(screen.queryByTestId("turn-waiting")).not.toBeInTheDocument();
+  });
+
+  it("hides the shimmer once the answer starts", () => {
+    render(
+      <ConversationLog
+        log={[]}
+        phase="thinking"
+        turn={{ ...emptyTurn, answer: "답", answerStarted: true }}
+      />,
+    );
+    expect(screen.queryByTestId("turn-waiting")).not.toBeInTheDocument();
+  });
+
+  it("does NOT show the shimmer outside thinking", () => {
+    render(<ConversationLog log={[]} phase="ready" turn={emptyTurn} />);
+    expect(screen.queryByTestId("turn-waiting")).not.toBeInTheDocument();
+  });
+});
+
+// ---- RAG warmup shimmer: while the RAG model loads (~19s after server boot)
+// sending is blocked (store gate), and the conversation area shows a Shimmer
+// "RAG 모델 준비 중…" row so the locked input is explained.
+describe("ConversationLog — RAG warmup shimmer", () => {
+  it("shows the RAG waiting shimmer while the model loads", () => {
+    render(<ConversationLog log={[]} phase="ready" ragLoading />);
+    const waiting = screen.getByTestId("rag-waiting");
+    expect(waiting).toBeInTheDocument();
+    expect(waiting).toHaveTextContent("RAG 모델 준비 중…");
+  });
+
+  it("does not show it when loading is over (prop absent)", () => {
+    render(<ConversationLog log={[]} phase="ready" />);
+    expect(screen.queryByTestId("rag-waiting")).not.toBeInTheDocument();
+  });
+});

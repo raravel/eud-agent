@@ -1,11 +1,14 @@
-#Requires -Version 7
+#Requires -Version 5.1
 <#
 .SYNOPSIS
     Create/sync the server venv (server\.venv) via uv and sanity-check it.
+    Runs on Windows PowerShell 5.1 (builtin) and PowerShell 7+; keep the
+    source ASCII-only (5.1 reads BOM-less files as ANSI/CP949).
 
 .DESCRIPTION
-    Runs `uv sync` inside server\ (uv-managed venv at server\.venv per
-    tech-stack.md), then:
+    Checks the shared prerequisites (uv + codex via scripts\check_prereqs.ps1,
+    fail fast before any work), then runs `uv sync` inside server\ (uv-managed
+    venv at server\.venv per tech-stack.md), then:
       - sanity-imports the core deps through the venv python;
       - checks for the bge-m3 weights in the HF cache and WARNS (does not fail)
         about the ~4.3 GB first-query download when absent (tech-stack.md
@@ -44,12 +47,11 @@ function Fail([string]$msg) {
     exit 1
 }
 
-# --- uv must be resolvable ------------------------------------------------
-$uv = Get-Command uv -ErrorAction SilentlyContinue
-if (-not $uv) {
-    Fail ("uv not found on PATH. Install uv (https://docs.astral.sh/uv/) — this " +
-        "project uses uv for the venv + installs (the ECA venv has no pip; same " +
-        "convention here).")
+# --- shared prerequisite checks (uv + codex, before any work) -------------
+. (Join-Path $PSScriptRoot 'check_prereqs.ps1')
+$prereqFailures = @(Get-PrereqFailures -Require 'uv', 'codex')
+if ($prereqFailures.Count -gt 0) {
+    Fail ($prereqFailures -join "`n")
 }
 
 if (-not (Test-Path -LiteralPath (Join-Path $ServerDir 'pyproject.toml') -PathType Leaf)) {
@@ -98,7 +100,7 @@ if (Test-Path -LiteralPath $hfModelDir -PathType Container) {
 } else {
     Write-Warning ("bge-m3 weights NOT found in the HF cache " +
         "($hfModelDir). The first RAG query will download ~4.3 GB. This is a " +
-        "warning, not a failure — setup can proceed.")
+        "warning, not a failure - setup can proceed.")
 }
 
 Write-Output 'setup_env: done'

@@ -45,10 +45,15 @@ export function InstructionBox({ state, onSend, onReset }: InstructionBoxProps) 
   const canSend = state.canSend;
   // A turn is in flight while thinking — reset is disabled then.
   const turnInFlight = state.phase === "thinking";
+  // RAG warmup gate: while the model loads the store gates canSend off AND the
+  // textarea is disabled (no typing before the model is ready); the placeholder
+  // explains why. Fail-open for unknown/unavailable (never lock forever).
+  const ragLoading = state.rag === "loading";
   // EUD-074: during plan_review the SAME input is the plan-feedback channel
   // (App routes the send to plan_feedback{}); guide the user accordingly.
-  const placeholder =
-    state.phase === "plan_review"
+  const placeholder = ragLoading
+    ? "RAG 모델 준비 중… 준비가 끝나면 입력할 수 있습니다"
+    : state.phase === "plan_review"
       ? "계획 수정 피드백을 입력하세요 (승인은 계획 카드에서)"
       : "무엇을 만들까요? (예: 게임 시작 시 미네랄 +1000 트리거 추가)";
 
@@ -74,6 +79,7 @@ export function InstructionBox({ state, onSend, onReset }: InstructionBoxProps) 
             value={instruction}
             onChange={(e) => setInstruction(e.target.value)}
             placeholder={placeholder}
+            disabled={ragLoading}
           />
         </PromptInputBody>
         <PromptInputFooter>

@@ -1,16 +1,22 @@
-#Requires -Version 7
+#Requires -Version 5.1
 <#
 .SYNOPSIS
     Drop-in install of the EUD Editor 3 agent: bridge lua, WebView2 DLLs, agent.cfg.
+    Runs on Windows PowerShell 5.1 (builtin) and PowerShell 7+; keep the
+    source ASCII-only (5.1 reads BOM-less files as ANSI/CP949).
 
 .DESCRIPTION
     Integration with EUD Editor 3 is file copies only (rules.md "Editor
     integrity"). This script:
       1. validates -EditorPath points at a real editor (the editor exe AND the
          Data\Lua\TriggerEditor folder must exist) BEFORE copying anything;
-      2. copies bridge\ZZZ_10_agent_bridge.lua -> <editor>\Data\Lua\TriggerEditor\;
-      3. copies vendor\webview2\*.dll -> next to the editor exe;
-      4. creates <editor>\Data\agent\ and writes agent.cfg as
+      2. checks the shared prerequisites (uv + codex + venv python via
+         scripts\check_prereqs.ps1) and fails BEFORE copying when one is
+         missing (a drop-in pointing at a missing venv/codex only surfaces as
+         a runtime failure inside the editor);
+      3. copies bridge\ZZZ_10_agent_bridge.lua -> <editor>\Data\Lua\TriggerEditor\;
+      4. copies vendor\webview2\*.dll -> next to the editor exe;
+      5. creates <editor>\Data\agent\ and writes agent.cfg as
          { "python_exe": <abs server\.venv python>, "repo_root": <abs repo root>,
            "port": 8765 } in UTF-8 WITHOUT BOM (architecture.md "Boot and
          lifecycle"; the drop-in lua parses the first line, so a BOM corrupts it).
@@ -26,7 +32,12 @@
 #>
 [CmdletBinding()]
 param(
-    [string]$EditorPath = 'C:\Users\ifthe\proj\eud\EUD.Editor.3.0.19.6.0'
+    [string]$EditorPath = 'C:\Users\ifthe\proj\eud\EUD.Editor.3.0.19.6.0',
+    # RAG DB folder to record in agent.cfg as "rag_db". When omitted, a
+    # release-bundled DB at <repo>\rag\chromadb_bge is auto-detected; when
+    # neither exists the key is left out and the server uses its default
+    # (the dev-machine ECA path).
+    [string]$RagDb = ''
 )
 
 Set-StrictMode -Version Latest
@@ -68,6 +79,15 @@ if (-not ($exeOk -and $triggerOk)) {
         "the editor install folder.")
 }
 
+# --- shared prerequisite checks (uv + codex + venv python) ----------------
+# Fail BEFORE copying anything: a drop-in pointing at a missing venv/codex
+# would only surface as a runtime failure inside the editor.
+. (Join-Path $PSScriptRoot 'check_prereqs.ps1')
+$prereqFailures = @(Get-PrereqFailures -Require 'uv', 'codex', 'venv-python' -RepoRoot $RepoRoot)
+if ($prereqFailures.Count -gt 0) {
+    Fail ($prereqFailures -join "`n")
+}
+
 # --- locate the artifacts we copy from this repo --------------------------
 $luaSrc = Join-Path $RepoRoot ('bridge\' + $LuaName)
 if (-not (Test-Path -LiteralPath $luaSrc -PathType Leaf)) {
@@ -105,18 +125,32 @@ $cfg = [ordered]@{
     repo_root  = $RepoRoot
     port       = 8765
 }
+
+# rag_db: explicit -RagDb wins; else auto-detect the release-bundled DB at
+# <repo>\rag\chromadb_bge (package_release.ps1 puts it there). Without either,
+# the key is omitted and the server falls back to its built-in default.
+$ragDbResolved = $RagDb
+if (-not $ragDbResolved) {
+    $bundledRag = Join-Path $RepoRoot 'rag\chromadb_bge'
+    if (Test-Path -LiteralPath (Join-Path $bundledRag 'chroma.sqlite3') -PathType Leaf) {
+        $ragDbResolved = $bundledRag
+    }
+}
+if ($ragDbResolved) {
+    if (-not (Test-Path -LiteralPath (Join-Path $ragDbResolved 'chroma.sqlite3') -PathType Leaf)) {
+        Fail ("rag_db '$ragDbResolved' does not look like a chromadb store " +
+            "(chroma.sqlite3 missing)")
+    }
+    $cfg['rag_db'] = (Resolve-Path -LiteralPath $ragDbResolved).Path
+    Write-Output "agent.cfg rag_db -> $($cfg['rag_db'])"
+}
+
 $json = $cfg | ConvertTo-Json -Depth 4
 
 $cfgPath = Join-Path $agentDir 'agent.cfg'
 $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
 [System.IO.File]::WriteAllText($cfgPath, $json, $utf8NoBom)
 Write-Output "wrote agent.cfg -> $cfgPath (UTF-8 no BOM)"
-
-if (-not (Test-Path -LiteralPath $venvPython -PathType Leaf)) {
-    Write-Warning ("agent.cfg points python_exe at '$venvPython' which does not " +
-        "exist yet; run scripts\setup_env.ps1 to create the venv before starting " +
-        "the editor.")
-}
 
 Write-Output 'install_dropin: done'
 exit 0

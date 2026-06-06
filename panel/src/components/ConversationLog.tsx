@@ -24,6 +24,7 @@ import {
 } from "@/components/ai-elements/conversation";
 import { Message, MessageContent } from "@/components/ai-elements/message";
 import { Response } from "@/components/ai-elements/response";
+import { Shimmer } from "@/components/ai-elements/shimmer";
 import { Spinner } from "@/components/ui/spinner";
 import { cn } from "@/lib/utils";
 import { AgentStream, ToolList } from "@/components/AgentStream";
@@ -40,6 +41,11 @@ export interface ConversationLogProps {
    * and the live answer bubble render INLINE at the end of the conversation.
    */
   turn?: TurnState;
+  /**
+   * RAG model warmup in progress (store.rag === "loading"): sending is blocked
+   * by the store gate, and a Shimmer "RAG 모델 준비 중…" row explains why.
+   */
+  ragLoading?: boolean;
 }
 
 /** Phases in which a live progress entry should still spin (v2: a turn in flight). */
@@ -57,8 +63,23 @@ const MUTED_KIND_CLASS: Record<Exclude<LogKind, "you" | "agent">, string> = {
   error: "text-destructive",
 };
 
-export function ConversationLog({ log, phase, turn }: ConversationLogProps) {
+export function ConversationLog({
+  log,
+  phase,
+  turn,
+  ragLoading,
+}: ConversationLogProps) {
   const busy = BUSY_PHASES.has(phase);
+  // Waiting shimmer: between chat send (phase → thinking, fresh empty turn) and
+  // the FIRST streamed agent_event nothing renders, so the user cannot tell the
+  // input was received. While thinking with an EMPTY turn buffer, show a
+  // Shimmer label inline; the first reasoning/tool/answer content replaces it.
+  const waiting =
+    turn !== undefined &&
+    phase === "thinking" &&
+    turn.reasoning.length === 0 &&
+    !turn.answerStarted &&
+    turn.tools.length === 0;
   // The active spinner target: the LATEST progress entry, but only while busy.
   let activeProgressId: number | null = null;
   if (busy) {
@@ -121,6 +142,30 @@ export function ConversationLog({ log, phase, turn }: ConversationLogProps) {
             </div>
           );
         })}
+
+        {/* RAG warmup shimmer — while the model loads the send gate is closed;
+            this row explains the locked input. */}
+        {ragLoading && (
+          <div
+            data-testid="rag-waiting"
+            role="status"
+            className="flex w-fit max-w-[95%] items-center text-sm"
+          >
+            <Shimmer>RAG 모델 준비 중…</Shimmer>
+          </div>
+        )}
+
+        {/* Waiting shimmer — feedback that the input was received, before the
+            first stream event arrives. */}
+        {waiting && (
+          <div
+            data-testid="turn-waiting"
+            role="status"
+            className="flex w-fit max-w-[95%] items-center text-sm"
+          >
+            <Shimmer>생각하는 중…</Shimmer>
+          </div>
+        )}
 
         {/* Live agent activity for the current turn — INLINE in the scroll area
             (EUD-069): the reasoning block + running tool rows, then the live

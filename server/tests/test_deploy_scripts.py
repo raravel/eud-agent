@@ -7,10 +7,12 @@ uv convention), hivemind/docs/verify.md (e2e step 1, what install enables),
 and hivemind/docs/rules.md ("Editor integrity" -- file copies are the only
 editor touch; "IPC and encoding" -- agent.cfg is UTF-8 WITHOUT BOM).
 
-The four scripts under test:
+The scripts under test:
 
   - scripts/setup_env.ps1        (uv sync server/.venv + bge-m3 cache warn)
   - scripts/install_dropin.ps1   (copy lua + DLLs, write agent.cfg BOM-free)
+  - scripts/check_prereqs.ps1    (shared uv/codex/venv-python checks,
+                                  dot-sourced by both installers)
   - scripts/dev_run.ps1          (run the server standalone for panel work)
   - scripts/uninstall_dropin.ps1 (remove lua + agent.cfg + runtime files)
 
@@ -88,15 +90,28 @@ def _pwsh() -> str:
     return found
 
 
-def _run_script(
-    script: Path, *args: str, timeout: int = 120
-) -> subprocess.CompletedProcess:
-    """Run a deployment script via ``pwsh -NoProfile -File`` and capture output.
+def _windows_powershell() -> str:
+    """Resolve builtin Windows PowerShell 5.1 (always present on Windows)."""
+    found = shutil.which("powershell")
+    assert found, "powershell (Windows PowerShell 5.1) not found on PATH"
+    return found
 
+
+def _run_script(
+    script: Path, *args: str, timeout: int = 120, env: dict | None = None,
+    host: str | None = None,
+) -> subprocess.CompletedProcess:
+    """Run a deployment script via ``<host> -NoProfile -File`` and capture output.
+
+    ``host`` defaults to pwsh (PowerShell 7); pass ``_windows_powershell()`` to
+    prove 5.1 compatibility (the bats fall back to it when pwsh is absent).
     An explicit stdin (DEVNULL) is always given so a console-less invocation
     never hangs waiting on input (mirrors the codex stdin rule structurally).
+    ``env`` entries overlay ``os.environ`` (e.g. CODEX_CMD to steer the shared
+    prerequisite check deterministically).
     """
-    cmd = [_pwsh(), "-NoProfile", "-NonInteractive", "-File", str(script), *args]
+    cmd = [host or _pwsh(), "-NoProfile", "-NonInteractive", "-File", str(script), *args]
+    merged_env = {**os.environ, **env} if env else None
     return subprocess.run(
         cmd,
         cwd=str(REPO_ROOT),
@@ -107,7 +122,42 @@ def _run_script(
         encoding="utf-8",
         errors="replace",
         timeout=timeout,
+        env=merged_env,
     )
+
+
+def _run_bat(
+    bat: Path, stdin_text: str, timeout: int = 300, env: dict | None = None
+) -> subprocess.CompletedProcess:
+    """Run a double-clickable .bat via ``cmd /d /c`` feeding its prompts.
+
+    The bats read two lines: the editor path prompt (empty line = the ps1
+    default) and the final "Press Enter to close..." pause — both must be in
+    ``stdin_text`` or the bat blocks until the timeout.
+    """
+    merged_env = {**os.environ, **env} if env else None
+    return subprocess.run(
+        ["cmd.exe", "/d", "/c", str(bat)],
+        cwd=str(REPO_ROOT),
+        input=stdin_text,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=timeout,
+        env=merged_env,
+    )
+
+
+def _hermetic_codex_env() -> dict:
+    """Point CODEX_CMD at a file that certainly exists (this interpreter).
+
+    The install scripts' shared prerequisite check honors CODEX_CMD before
+    PATH (mirroring config.py), so success-path tests stay deterministic on
+    machines without a codex install.
+    """
+    return {"CODEX_CMD": sys.executable}
 
 
 # --- fake editor layout ---------------------------------------------------
@@ -196,7 +246,10 @@ def test_install_dropin_against_fake_editor():
         editor_root = Path(tmp)
         _make_fake_editor(editor_root)
 
-        proc = _run_script(INSTALL_DROPIN, "-EditorPath", str(editor_root))
+        proc = _run_script(
+            INSTALL_DROPIN, "-EditorPath", str(editor_root),
+            env=_hermetic_codex_env(),
+        )
         assert proc.returncode == 0, (
             f"install_dropin.ps1 exited {proc.returncode}; output:\n{proc.stdout}"
         )
@@ -211,13 +264,19 @@ def test_install_dropin_idempotent():
         editor_root = Path(tmp)
         _make_fake_editor(editor_root)
 
-        first = _run_script(INSTALL_DROPIN, "-EditorPath", str(editor_root))
+        first = _run_script(
+            INSTALL_DROPIN, "-EditorPath", str(editor_root),
+            env=_hermetic_codex_env(),
+        )
         assert first.returncode == 0, (
             f"first install exited {first.returncode}; output:\n{first.stdout}"
         )
         _assert_install_products_ok(editor_root)
 
-        second = _run_script(INSTALL_DROPIN, "-EditorPath", str(editor_root))
+        second = _run_script(
+            INSTALL_DROPIN, "-EditorPath", str(editor_root),
+            env=_hermetic_codex_env(),
+        )
         assert second.returncode == 0, (
             f"second (idempotent) install exited {second.returncode}; "
             f"output:\n{second.stdout}"
@@ -258,7 +317,10 @@ def test_uninstall_dropin_removes_lua_and_cfg_keeps_dlls():
         editor_root = Path(tmp)
         _make_fake_editor(editor_root)
 
-        installed = _run_script(INSTALL_DROPIN, "-EditorPath", str(editor_root))
+        installed = _run_script(
+            INSTALL_DROPIN, "-EditorPath", str(editor_root),
+            env=_hermetic_codex_env(),
+        )
         assert installed.returncode == 0, (
             f"install (pre-uninstall) exited {installed.returncode}; "
             f"output:\n{installed.stdout}"
@@ -311,7 +373,314 @@ def test_setup_env_exists_and_venv_product():
         )
 
 
-# --- 7. dev_run: launches the resident server (EUD-018 wired the app) --------
+# --- 7. shared prerequisite checks (uv/codex/venv python) ------------------
+
+
+CHECK_PREREQS = SCRIPTS_DIR / "check_prereqs.ps1"
+
+
+def test_check_prereqs_is_shared_by_both_installers():
+    """Both install-path scripts dot-source the single shared check file."""
+    assert CHECK_PREREQS.is_file(), f"missing shared check file: {CHECK_PREREQS}"
+    for script in (SETUP_ENV, INSTALL_DROPIN):
+        text = script.read_text(encoding="utf-8")
+        assert "check_prereqs.ps1" in text, (
+            f"{script.name} does not reference the shared check file "
+            "(check_prereqs.ps1 must be dot-sourced by both installers)"
+        )
+
+
+def test_install_dropin_fails_on_unresolvable_codex():
+    """A CODEX_CMD pointing at a nonexistent file must abort the install
+    BEFORE anything is copied (resolve order mirrors config.py: env > PATH)."""
+    with tempfile.TemporaryDirectory(prefix="eud_fake_editor_") as tmp:
+        editor_root = Path(tmp)
+        _make_fake_editor(editor_root)
+        bogus = str(Path(tmp) / "nope" / "codex.cmd")
+
+        proc = _run_script(
+            INSTALL_DROPIN, "-EditorPath", str(editor_root),
+            env={"CODEX_CMD": bogus},
+        )
+        assert proc.returncode != 0, (
+            "install_dropin.ps1 must fail when codex is unresolvable; "
+            f"output:\n{proc.stdout}"
+        )
+        assert "codex" in proc.stdout.lower(), (
+            "install_dropin.ps1 must name codex as the missing prerequisite; "
+            f"output:\n{proc.stdout}"
+        )
+
+        # Nothing must have been copied before the prerequisite failure.
+        assert not (editor_root / LUA_DEST_REL).exists(), (
+            "install copied the lua despite a failed prerequisite check"
+        )
+        assert not (editor_root / AGENT_CFG_REL).exists(), (
+            "install wrote agent.cfg despite a failed prerequisite check"
+        )
+
+
+def test_setup_env_fails_fast_on_unresolvable_codex():
+    """setup_env.ps1 must fail on a bad CODEX_CMD BEFORE running uv sync."""
+    with tempfile.TemporaryDirectory(prefix="eud_codex_") as tmp:
+        bogus = str(Path(tmp) / "nope" / "codex.cmd")
+
+        proc = _run_script(SETUP_ENV, env={"CODEX_CMD": bogus}, timeout=60)
+        assert proc.returncode != 0, (
+            "setup_env.ps1 must fail when codex is unresolvable; "
+            f"output:\n{proc.stdout}"
+        )
+        assert "codex" in proc.stdout.lower(), (
+            "setup_env.ps1 must name codex as the missing prerequisite; "
+            f"output:\n{proc.stdout}"
+        )
+        assert "uv sync" not in proc.stdout, (
+            "setup_env.ps1 must fail fast, before starting uv sync; "
+            f"output:\n{proc.stdout}"
+        )
+
+
+# --- 8. double-clickable .bat wrappers --------------------------------------
+
+
+INSTALL_BAT = SCRIPTS_DIR / "install.bat"
+UNINSTALL_BAT = SCRIPTS_DIR / "uninstall.bat"
+
+
+def test_install_bat_full_install_against_fake_editor():
+    """install.bat = setup_env + install_dropin, prompted editor path.
+
+    stdin feeds the editor-path prompt and the final Enter-to-close pause.
+    """
+    with tempfile.TemporaryDirectory(prefix="eud_fake_editor_") as tmp:
+        editor_root = Path(tmp)
+        _make_fake_editor(editor_root)
+
+        proc = _run_bat(
+            INSTALL_BAT, f"{editor_root}\n\n",
+            env=_hermetic_codex_env(), timeout=600,
+        )
+        assert proc.returncode == 0, (
+            f"install.bat exited {proc.returncode}; output:\n{proc.stdout}"
+        )
+        _assert_install_products_ok(editor_root)
+
+
+def test_install_bat_propagates_failure_and_still_pauses():
+    """A failing step must surface as a non-zero bat exit code, and the final
+    Enter-to-close pause must still be reached (the window never auto-closes
+    on failure). A bogus CODEX_CMD makes setup_env fail fast."""
+    with tempfile.TemporaryDirectory(prefix="eud_codex_") as tmp:
+        bogus = str(Path(tmp) / "nope" / "codex.cmd")
+
+        proc = _run_bat(
+            INSTALL_BAT, "\n\n", env={"CODEX_CMD": bogus}, timeout=120,
+        )
+        assert proc.returncode != 0, (
+            "install.bat must propagate the setup_env failure as a non-zero "
+            f"exit code; output:\n{proc.stdout}"
+        )
+        assert "Press Enter to close" in proc.stdout, (
+            "install.bat must still reach the Enter-to-close pause on "
+            f"failure; output:\n{proc.stdout}"
+        )
+
+
+def test_uninstall_bat_against_fake_editor():
+    with tempfile.TemporaryDirectory(prefix="eud_fake_editor_") as tmp:
+        editor_root = Path(tmp)
+        _make_fake_editor(editor_root)
+
+        installed = _run_script(
+            INSTALL_DROPIN, "-EditorPath", str(editor_root),
+            env=_hermetic_codex_env(),
+        )
+        assert installed.returncode == 0, (
+            f"install (pre-uninstall) exited {installed.returncode}; "
+            f"output:\n{installed.stdout}"
+        )
+
+        proc = _run_bat(UNINSTALL_BAT, f"{editor_root}\n\n")
+        assert proc.returncode == 0, (
+            f"uninstall.bat exited {proc.returncode}; output:\n{proc.stdout}"
+        )
+        assert not (editor_root / LUA_DEST_REL).exists(), (
+            "uninstall.bat did not remove the drop-in lua"
+        )
+        assert not (editor_root / AGENT_CFG_REL).exists(), (
+            "uninstall.bat did not remove agent.cfg"
+        )
+        for dll in WEBVIEW2_DLLS:
+            assert (editor_root / dll).is_file(), (
+                f"uninstall.bat removed a DLL (default must keep them): {dll}"
+            )
+
+
+# --- 9. Windows PowerShell 5.1 compatibility ---------------------------------
+# The bats fall back to builtin powershell.exe when pwsh is absent, so the
+# deploy scripts must run under 5.1 too (they declare #Requires -Version 5.1
+# and stay ASCII-only: 5.1 reads BOM-less sources as ANSI/CP949).
+
+
+def test_install_uninstall_under_windows_powershell_51():
+    ps51 = _windows_powershell()
+    with tempfile.TemporaryDirectory(prefix="eud_fake_editor_") as tmp:
+        editor_root = Path(tmp)
+        _make_fake_editor(editor_root)
+
+        installed = _run_script(
+            INSTALL_DROPIN, "-EditorPath", str(editor_root),
+            env=_hermetic_codex_env(), host=ps51,
+        )
+        assert installed.returncode == 0, (
+            f"install under powershell 5.1 exited {installed.returncode}; "
+            f"output:\n{installed.stdout}"
+        )
+        _assert_install_products_ok(editor_root)
+
+        removed = _run_script(
+            UNINSTALL_DROPIN, "-EditorPath", str(editor_root), host=ps51,
+        )
+        assert removed.returncode == 0, (
+            f"uninstall under powershell 5.1 exited {removed.returncode}; "
+            f"output:\n{removed.stdout}"
+        )
+        assert not (editor_root / LUA_DEST_REL).exists()
+        assert not (editor_root / AGENT_CFG_REL).exists()
+
+
+def test_setup_env_prereq_check_under_windows_powershell_51():
+    """The shared check_prereqs.ps1 must parse and fail fast under 5.1."""
+    with tempfile.TemporaryDirectory(prefix="eud_codex_") as tmp:
+        bogus = str(Path(tmp) / "nope" / "codex.cmd")
+        proc = _run_script(
+            SETUP_ENV, env={"CODEX_CMD": bogus}, timeout=60,
+            host=_windows_powershell(),
+        )
+        assert proc.returncode != 0, (
+            "setup_env under powershell 5.1 must fail on a bad CODEX_CMD; "
+            f"output:\n{proc.stdout}"
+        )
+        assert "codex" in proc.stdout.lower(), (
+            f"failure must name codex; output:\n{proc.stdout}"
+        )
+        assert "uv sync" not in proc.stdout, (
+            f"must fail before uv sync; output:\n{proc.stdout}"
+        )
+
+
+# --- 10. release packaging ----------------------------------------------------
+
+
+PACKAGE_RELEASE = SCRIPTS_DIR / "package_release.ps1"
+README_RELEASE = SCRIPTS_DIR / "README.release.md"
+
+
+def _make_fake_rag_db(root: Path) -> Path:
+    """Minimal chromadb-store shape: a folder holding chroma.sqlite3."""
+    rag = root / "chromadb_bge"
+    rag.mkdir(parents=True, exist_ok=True)
+    (rag / "chroma.sqlite3").write_bytes(b"SQLite format 3\x00 fake")
+    return rag
+
+
+def test_install_dropin_writes_rag_db_when_bundled():
+    """-RagDb (or the auto-detected release bundle) lands in agent.cfg as
+    'rag_db'; without it the key is omitted (server default applies)."""
+    with tempfile.TemporaryDirectory(prefix="eud_fake_editor_") as tmp:
+        editor_root = Path(tmp) / "editor"
+        editor_root.mkdir()
+        _make_fake_editor(editor_root)
+        rag = _make_fake_rag_db(Path(tmp))
+
+        proc = _run_script(
+            INSTALL_DROPIN, "-EditorPath", str(editor_root),
+            "-RagDb", str(rag), env=_hermetic_codex_env(),
+        )
+        assert proc.returncode == 0, (
+            f"install with -RagDb exited {proc.returncode}; output:\n{proc.stdout}"
+        )
+        cfg = json.loads((editor_root / AGENT_CFG_REL).read_text(encoding="utf-8"))
+        assert cfg.get("rag_db") == str(rag), (
+            f"agent.cfg rag_db mismatch: {cfg.get('rag_db')!r} != {str(rag)!r}"
+        )
+
+        # Re-install WITHOUT -RagDb: no bundled rag\ in the dev repo, so the
+        # key must be absent (the server falls back to its built-in default).
+        proc2 = _run_script(
+            INSTALL_DROPIN, "-EditorPath", str(editor_root),
+            env=_hermetic_codex_env(),
+        )
+        assert proc2.returncode == 0, (
+            f"re-install exited {proc2.returncode}; output:\n{proc2.stdout}"
+        )
+        cfg2 = json.loads((editor_root / AGENT_CFG_REL).read_text(encoding="utf-8"))
+        assert "rag_db" not in cfg2, (
+            f"agent.cfg must omit rag_db without a bundle; got {cfg2.get('rag_db')!r}"
+        )
+
+
+def test_package_release_zip_structure():
+    """package_release.ps1 produces a zip mirroring the repo layout with the
+    runtime-minimal set: no tests/.venv/hivemind, bundled rag, root README."""
+    import zipfile
+
+    assert PACKAGE_RELEASE.is_file(), f"missing script: {PACKAGE_RELEASE}"
+    assert README_RELEASE.is_file(), f"missing README template: {README_RELEASE}"
+
+    dist_index = REPO_ROOT / "panel" / "dist" / "index.html"
+    if not dist_index.is_file():
+        import pytest
+
+        pytest.skip("panel/dist absent (gitignored); build the panel first")
+
+    with tempfile.TemporaryDirectory(prefix="eud_pkg_") as tmp:
+        rag = _make_fake_rag_db(Path(tmp))
+        out_dir = Path(tmp) / "out"
+
+        proc = _run_script(
+            PACKAGE_RELEASE,
+            "-OutDir", str(out_dir),
+            "-RagDb", str(rag),
+            "-SkipPanelBuild",
+            timeout=300,
+        )
+        assert proc.returncode == 0, (
+            f"package_release.ps1 exited {proc.returncode}; output:\n{proc.stdout}"
+        )
+
+        zips = list(out_dir.glob("eud-agent-*.zip"))
+        assert len(zips) == 1, f"expected exactly one zip, got {zips}"
+
+        names = set(zipfile.ZipFile(zips[0]).namelist())
+        required = (
+            "eud-agent/README.md",
+            "eud-agent/bridge/ZZZ_10_agent_bridge.lua",
+            "eud-agent/server/pyproject.toml",
+            "eud-agent/server/uv.lock",
+            "eud-agent/server/eud_agent/__main__.py",
+            "eud-agent/panel/dist/index.html",
+            "eud-agent/vendor/webview2/WebView2Loader.dll",
+            "eud-agent/rag/chromadb_bge/chroma.sqlite3",
+            "eud-agent/scripts/install.bat",
+            "eud-agent/scripts/uninstall.bat",
+            "eud-agent/scripts/setup_env.ps1",
+            "eud-agent/scripts/install_dropin.ps1",
+            "eud-agent/scripts/uninstall_dropin.ps1",
+            "eud-agent/scripts/check_prereqs.ps1",
+        )
+        missing = [n for n in required if n not in names]
+        assert not missing, f"zip is missing required entries: {missing}"
+
+        leaked = [
+            n for n in names
+            if "/tests/" in n or "/.venv/" in n or "/hivemind/" in n
+            or "__pycache__" in n or "/spikes/" in n or "/node_modules/" in n
+        ]
+        assert not leaked, f"zip leaked non-runtime files: {leaked[:10]}"
+
+
+# --- 11. dev_run: launches the resident server (EUD-018 wired the app) -------
 
 
 def test_dev_run_launches_server():

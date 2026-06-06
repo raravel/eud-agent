@@ -1312,7 +1312,7 @@
       ]
     },
     "EUD-079-15f5": {
-      "status": "pending",
+      "status": "in_progress",
       "priority": "high",
       "type": "task",
       "parent": "EUD-076-d2c2",

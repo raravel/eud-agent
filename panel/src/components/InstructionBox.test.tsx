@@ -180,3 +180,42 @@ describe("InstructionBox — InputGroup composition (EUD-066 layout contract)", 
     expect(directAddon).not.toBeUndefined();
   });
 });
+
+describe("InstructionBox — RAG warmup gate", () => {
+  // While the RAG model loads the store gates canSend off; the box must also
+  // disable the TEXTAREA (no typing before the model is ready — user decision)
+  // and explain why via the placeholder.
+  function loadingState(): PanelState {
+    const store = createPanelStore();
+    store.wsOpen();
+    store.applyList({
+      files: [{ path: "main.eps", ftype: "CUIEps", settable: true }],
+    });
+    store.ragWarmupChanged("loading");
+    return store.getState();
+  }
+
+  it("disables Send + the textarea with a guide placeholder while loading", () => {
+    render(<InstructionBox state={loadingState()} onSend={noop} />);
+    expect(screen.getByRole("button", { name: "전송" })).toBeDisabled();
+    const textarea = screen.getByRole("textbox", { name: "지시 입력" });
+    expect(textarea).toBeDisabled();
+    expect(textarea).toHaveAttribute(
+      "placeholder",
+      expect.stringContaining("RAG 모델 준비 중"),
+    );
+  });
+
+  it("re-enables once warmup completes", () => {
+    const store = createPanelStore();
+    store.wsOpen();
+    store.applyList({
+      files: [{ path: "main.eps", ftype: "CUIEps", settable: true }],
+    });
+    store.ragWarmupChanged("loading");
+    store.ragWarmupChanged("ready");
+    render(<InstructionBox state={store.getState()} onSend={noop} />);
+    expect(screen.getByRole("button", { name: "전송" })).toBeEnabled();
+    expect(screen.getByRole("textbox", { name: "지시 입력" })).toBeEnabled();
+  });
+});

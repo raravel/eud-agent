@@ -17,3 +17,12 @@ panel/node_modules/
 
 # Panel build output (Vite); never committed, release-packaged later
 panel/dist/
+
+# Distribution zips (scripts/package_release.ps1 output)
+release/
+
+# Playwright MCP debugging artifacts (console logs, page snapshots)
+.playwright-mcp/
+
+# Claude Code agent worktrees
+.claude/worktrees/

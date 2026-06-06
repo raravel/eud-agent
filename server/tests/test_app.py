@@ -240,6 +240,147 @@ def test_ws_list_roundtrip(tmp_path, monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
+# WS /ws : RAG warmup snapshot replay on connect. Warmup progress is broadcast,
+# but "started" usually fires BEFORE the panel connects (server boot), and a
+# reloaded panel misses "done" entirely — so the endpoint replays the CURRENT
+# warmup state (app.state.rag_warmup_state, maintained by the warmup callback)
+# to every newly accepted client. The panel gates its send on it.
+# --------------------------------------------------------------------------- #
+
+
+def test_ws_replays_rag_warmup_state_on_connect(tmp_path):
+    from fastapi.testclient import TestClient
+
+    cfg = make_config(tmp_path, token="right")
+    app = build_test_app(cfg)
+    app.state.rag_warmup_state = "started"
+    with TestClient(app) as client:
+        with client.websocket_connect(
+            "/ws?token=right", headers={"origin": _origin_for(cfg)}
+        ) as ws:
+            msg = ws.receive_json()  # unsolicited snapshot, first message
+    assert msg == {"type": "progress", "stage": "rag_warmup", "detail": "started"}
+
+
+def test_ws_no_snapshot_when_warmup_state_unknown(tmp_path, monkeypatch):
+    """No lifecycle warmup ran (state None) → nothing unsolicited; the first
+    inbound frame is the reply to the client's own message (fail-open for the
+    panel: it never blocks on a missing snapshot)."""
+    from fastapi.testclient import TestClient
+
+    cfg = make_config(tmp_path, token="right")
+    from eud_agent import bridge_io as bio_mod
+
+    def fake_status(self, **kw):
+        return "compiling=false\nproject=myproj\n"
+
+    monkeypatch.setattr(bio_mod.BridgeIO, "status", fake_status)
+
+    with TestClient(build_test_app(cfg)) as client:
+        with client.websocket_connect(
+            "/ws?token=right", headers={"origin": _origin_for(cfg)}
+        ) as ws:
+            ws.send_json({"type": "status"})
+            msg = ws.receive_json()
+    assert msg["type"] == "status"
+
+
+# --------------------------------------------------------------------------- #
+# Debug trail wiring: every inbound WS client message, every /tools/call (full
+# args/result), and the turn-end events (answer/plan/changeset/error) land in
+# <data_dir>/logs/agent-YYYYMMDD.jsonl via app.state.debug_log. Streaming
+# deltas are NOT logged. (DebugLog itself is unit-tested in test_debuglog.py.)
+# --------------------------------------------------------------------------- #
+
+
+def _debug_entries(tmp_path):
+    """All parsed JSONL entries across the app's debug log files."""
+    out = []
+    for p in sorted((tmp_path / "data" / "logs").glob("agent-*.jsonl")):
+        for ln in p.read_text(encoding="utf-8").splitlines():
+            out.append(json.loads(ln))
+    return out
+
+
+def test_debug_log_records_inbound_client_messages(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+
+    cfg = make_config(tmp_path, token="right")
+    from eud_agent import bridge_io as bio_mod
+
+    def fake_status(self, **kw):
+        return "compiling=false\nproject=myproj\n"
+
+    monkeypatch.setattr(bio_mod.BridgeIO, "status", fake_status)
+
+    with TestClient(build_test_app(cfg)) as client:
+        with client.websocket_connect(
+            "/ws?token=right", headers={"origin": _origin_for(cfg)}
+        ) as ws:
+            ws.send_json({"type": "status"})
+            ws.receive_json()
+
+    entries = _debug_entries(tmp_path)
+    assert any(
+        e["event"] == "client" and e["data"] == {"type": "status"}
+        for e in entries
+    ), f"inbound client message must be logged; got {entries}"
+
+
+def test_debug_log_records_tool_call_and_result_untruncated(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+
+    cfg, app, created = _build_stamp_app(tmp_path, monkeypatch)
+    args = {"dat": "units", "param": "MaxHP", "objId": 0, "value": "100"}
+
+    with TestClient(app) as client:
+        r = client.post("/tools/call", json={
+            "token": cfg.token,
+            "request_id": "headless-job-1",
+            "tool": "dat_set",
+            "args": args,
+        })
+        assert r.status_code == 200
+
+    entries = _debug_entries(tmp_path)
+    calls = [e for e in entries if e["event"] == "tool_call"]
+    results = [e for e in entries if e["event"] == "tool_result"]
+    assert calls and calls[0]["data"]["tool"] == "dat_set"
+    assert calls[0]["data"]["args"] == args, "args logged in full"
+    assert results and results[0]["data"]["tool"] == "dat_set"
+    assert results[0]["data"]["ok"] is True
+    assert "result" in results[0]["data"], "result text logged"
+
+
+def test_debug_log_records_chat_and_turn_end_answer(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+
+    cfg, app, created = _build_stamp_app(tmp_path, monkeypatch)
+
+    with TestClient(app) as client:
+        with client.websocket_connect(
+            f"/ws?token={cfg.token}", headers={"origin": _origin_url(cfg)}
+        ) as ws:
+            ws.send_json({"type": "chat", "text": "마린 체력 2배"})
+            for _ in range(10):
+                msg = ws.receive_json()
+                if msg.get("type") in ("answer", "error", "changeset"):
+                    break
+
+    entries = _debug_entries(tmp_path)
+    assert any(
+        e["event"] == "client"
+        and e["data"].get("type") == "chat"
+        and e["data"].get("text") == "마린 체력 2배"
+        for e in entries
+    ), "the chat input must be logged verbatim"
+    assert any(
+        e["event"] == "server" and e["data"].get("type") == "answer"
+        for e in entries
+    ), "the turn-end answer event must be logged"
+
+
+# --------------------------------------------------------------------------- #
 # Live request-id stamping (EUD-064): the tool endpoint stamps the ENGINE's
 # CURRENT request id onto every tool call from an active panel session, ignoring
 # the (possibly stale) shim-supplied id. The shim env id is pinned at thread

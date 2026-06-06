@@ -74,21 +74,36 @@ export default function App() {
           break;
         case "progress": {
           store.progressReceived(msg.stage);
-          const { kind, text } = progressLabel(msg.stage, msg.detail);
-          store.log(kind, text, msg.stage);
           // RAG warmup drives the Header pill (started → loading w/ elapsed,
-          // done → ready, error → unavailable).
+          // done → ready, error → unavailable) AND the store send gate. The
+          // server replays the current warmup state to every new connection,
+          // so transitions are logged only on a real change (a reconnect's
+          // "done" snapshot must not re-log completion), and the loading state
+          // is NOT logged at all — the ConversationLog shimmer row covers it.
           if (msg.stage === "rag_warmup") {
+            const prev = store.getState().rag;
+            let next: "loading" | "ready" | "unavailable";
             if (msg.detail === "done") {
-              setRagState("ready");
+              next = "ready";
             } else if (msg.detail !== undefined && msg.detail.startsWith("error")) {
-              setRagState("unavailable");
+              next = "unavailable";
             } else {
+              next = "loading";
+            }
+            store.ragWarmupChanged(next);
+            if (next !== prev && next !== "loading") {
+              const { kind, text } = progressLabel(msg.stage, msg.detail);
+              store.log(kind, text, msg.stage);
+            }
+            if (next === "loading") {
               ragStartRef.current = Date.now();
               setRagElapsedSec(0);
-              setRagState("loading");
             }
+            setRagState(next);
+            break;
           }
+          const { kind, text } = progressLabel(msg.stage, msg.detail);
+          store.log(kind, text, msg.stage);
           break;
         }
         case "agent_event":
@@ -251,7 +266,12 @@ export default function App() {
           renders INLINE inside the conversation scroll area (EUD-069) — a fixed
           band here grew unbounded and crushed the log + plan card to 0px/33px
           in the live E2E. ConversationLog owns the placement now. */}
-      <ConversationLog log={state.log} phase={state.phase} turn={state.turn} />
+      <ConversationLog
+        log={state.log}
+        phase={state.phase}
+        turn={state.turn}
+        ragLoading={state.rag === "loading"}
+      />
 
       {/* Plan review — markdown card + feedback/approve (features/06). The card
           stays visible across the iteration turn (plan_review while awaiting a

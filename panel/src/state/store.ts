@@ -57,6 +57,15 @@ export type Phase =
   | "plan_review"
   | "changeset_review";
 
+/**
+ * RAG warmup gate state. The server replays the current `rag_warmup` progress
+ * state to every newly connected client (broadcast alone misses late joiners);
+ * while the model loads (~19s) sending is BLOCKED so a turn does not silently
+ * park on the warmup lock. Fail-open everywhere else: "unknown" (no snapshot —
+ * old server / tests) and "unavailable" (warmup error) never lock the panel.
+ */
+export type RagGateState = "unknown" | "loading" | "ready" | "unavailable";
+
 /** Kind of a log line (drives styling in the UI layer). */
 export type LogKind =
   | "info"
@@ -198,6 +207,8 @@ export interface PanelState {
   pendingDecision: PendingDecision | null;
   /** Per-turn streaming buffers (reasoning / answer / tools); reset per turn. */
   turn: TurnState;
+  /** RAG warmup gate — "loading" blocks {@link PanelState.canSend}. */
+  rag: RagGateState;
   /** Capped event log (oldest dropped at {@link MAX_LOG_ENTRIES}). */
   log: LogEntry[];
   // ---- derived selectors (computed on every mutation) ----
@@ -245,6 +256,11 @@ export interface PanelStore {
   errorReceived(message: string): void;
   /** `progress` — logged only; no phase change in v2. */
   progressReceived(stage: ProgressStage): void;
+  /**
+   * `progress {stage: rag_warmup}` mapped by the App layer — gates canSend
+   * while "loading". "unknown" is the initial state only (never dispatched).
+   */
+  ragWarmupChanged(state: Exclude<RagGateState, "unknown">): void;
 
   // ---- user intents (UI drives these after a successful send) ----
   /** A chat was sent → thinking (from ready or changeset_review). */
@@ -331,6 +347,9 @@ export function createPanelStore(): PanelStore {
     // Per-turn streaming buffers (reasoning / answer / tools). Reset whenever a
     // new turn starts (chat / plan_feedback / plan_approve / reset).
     turn: emptyTurn(),
+    // RAG warmup gate (server snapshot + broadcasts). "unknown" until the first
+    // rag_warmup progress arrives — fail-open (no snapshot = no blocking).
+    rag: "unknown" as RagGateState,
     log: [] as LogEntry[],
     connected: false,
     // A turn is in flight (chat/plan_feedback/plan_approve sent, no turn-end event
@@ -352,7 +371,9 @@ export function createPanelStore(): PanelStore {
 
   function computeSnapshot(): PanelState {
     const busy = BUSY_PHASES.has(core.phase) || core.compiling;
-    const canSend = core.connected && core.hasProject && !busy;
+    // RAG gate: ONLY "loading" blocks (fail-open for unknown/unavailable).
+    const canSend =
+      core.connected && core.hasProject && !busy && core.rag !== "loading";
     return {
       phase: core.phase,
       hasProject: core.hasProject,
@@ -363,6 +384,7 @@ export function createPanelStore(): PanelStore {
       changeset: core.changeset,
       pendingDecision: core.pendingDecision,
       turn: core.turn,
+      rag: core.rag,
       log: core.log,
       connected: core.connected,
       canSend,
@@ -685,6 +707,11 @@ export function createPanelStore(): PanelStore {
       // v2 has no progress-driven phase (no waiting/applying). Progress is logged
       // by the App layer via the labeller; this hook is kept for symmetry + future
       // use and intentionally does not change phase.
+      emit();
+    },
+
+    ragWarmupChanged(state) {
+      core.rag = state;
       emit();
     },
 
