@@ -501,6 +501,75 @@ def test_location_write_set_rename_delete_op_lines(tmp_path):
     ]
 
 
+def test_location_write_inverted_swaps_bounds_after_validation(tmp_path):
+    """invertX/invertY produce 음수 로케이션 bounds (edac/76715: the same bytes
+    SCMDraft's Invert buttons store) — the INPUT rect stays a normal rectangle
+    so the sanity validation still applies."""
+    svc, _, recorded = make_locedit_service(tmp_path)
+    svc.location_write("add", name="Hit", left=10, top=10, right=12, bottom=11,
+                       invert_x=True, invert_y=True)
+    svc.location_write("set", location_id=3, left=1, top=1, right=2, bottom=2,
+                       invert_x=True)
+    assert recorded["ops"] == [
+        b"add|384|352|320|320|Hit\n",   # l/r and t/b swapped
+        b"set|3|64|32|32|64\n",         # only x swapped
+    ]
+    # An inverted rect must still be SUPPLIED as a normal rect.
+    with pytest.raises(MapInfoError, match="tileRight > tileLeft"):
+        svc.location_write("add", name="X", left=12, top=10, right=10,
+                           bottom=11, invert_x=True)
+
+
+def test_parse_locations_flags_inverted_axes():
+    mrgn = (
+        mrgn_entry(96, 96, 32, 32, 1)    # both axes inverted
+        + mrgn_entry(96, 32, 32, 96, 0)  # x only
+    )
+    strings = str_section([b"Hit"])
+    digest = digest_chk(
+        sec("DIM ", struct.pack("<HH", 64, 64))
+        + sec("MRGN", mrgn) + sec("STR ", strings)
+    )
+    locs = digest["locations"]
+    assert locs[0]["inverted"] == "xy" and locs[0]["name"] == "Hit"
+    assert locs[1]["inverted"] == "x"
+    # Normal locations (the other fixtures) carry NO inverted key.
+    assert "inverted" not in digest_chk(build_fixture_chk())["locations"][0]
+
+
+def test_location_write_tool_passes_invert_flags():
+    svc = FakeLocService()
+    layer = ToolLayer(object(), map_info=svc)
+    state = RequestState(request_id="r1")
+    layer.call("location_write", {
+        "action": "add", "name": "Hit",
+        "tileLeft": 0, "tileTop": 0, "tileRight": 1, "tileBottom": 1,
+        "invertX": True, "invertY": True,
+    }, state)
+    _, kwargs = svc.calls[0]
+    assert kwargs["invert_x"] is True and kwargs["invert_y"] is True
+    # Defaults stay False; flags are ignored for id-only actions.
+    layer.call("location_write", {"action": "delete", "locationId": 2,
+                                  "invertX": True}, state)
+    _, kwargs = svc.calls[1]
+    assert kwargs["invert_x"] is False and kwargs["invert_y"] is False
+
+
+def test_system_prompt_carries_map_location_guide(tmp_path):
+    from eud_agent.engine import build_system_prompt
+
+    sp = build_system_prompt(
+        "anything",
+        tool_layer=ToolLayer(object()),
+        bridge=object(),  # state/RAG degrade best-effort
+        rag_db=str(tmp_path / "no-rag"),
+    )
+    assert "[map locations]" in sp
+    assert "invertX" in sp and "map_info(mode=locations)" in sp
+    # Never-do rules outrank workflow guidance.
+    assert sp.index("[first principles]") < sp.index("[map locations]")
+
+
 def test_location_write_refuses_while_compiling(tmp_path):
     svc, *_ = make_locedit_service(tmp_path, compiling="True")
     with pytest.raises(MapInfoError, match="building right now"):
@@ -600,6 +669,7 @@ def test_location_write_routes_and_counts_action_and_mutation():
     assert svc.calls == [("add", {
         "name": "Zone", "location_id": 0,
         "left": 1, "top": 2, "right": 3, "bottom": 4,
+        "invert_x": False, "invert_y": False,
     })]
     assert state.action_count == 1 and state.mutation_count == 1
 

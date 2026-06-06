@@ -270,6 +270,12 @@ def parse_locations(body: bytes, strings: list[str]) -> list[dict]:
             "tileRect": [left // 32, top // 32, right // 32, bottom // 32],
             "elevationFlags": elevation,
         }
+        # 음수(Inverted) 로케이션: swapped bounds change Bring semantics (the
+        # location must sit fully INSIDE the unit's collision box) — flag the
+        # axis so the LLM recognizes precision-detection locations.
+        inverted = ("x" if left > right else "") + ("y" if top > bottom else "")
+        if inverted:
+            loc["inverted"] = inverted
         if is_anywhere:
             loc["anywhere"] = True
         locations.append(loc)
@@ -630,11 +636,19 @@ class MapInfoService:
         top: int = 0,
         right: int = 0,
         bottom: int = 0,
+        invert_x: bool = False,
+        invert_y: bool = False,
     ) -> dict:
         """Apply ONE location edit to the connected map IN PLACE (features/09).
 
         ``action`` ∈ ``add|set|rename|delete``; coordinates are TILE units
-        (converted to px here — the locedit CLI is a dumb px applier). Safety
+        (converted to px here — the locedit CLI is a dumb px applier).
+        ``invert_x``/``invert_y`` (add/set) produce a 음수(Inverted) location —
+        the rect is given as a NORMAL rectangle and the bounds are swapped per
+        axis AFTER validation/px conversion, exactly what SCMDraft's Invert
+        X/Y buttons store in MRGN (edac/76715). NOTE: ``set`` writes the
+        bounds it is given — re-pass the invert flags when moving an inverted
+        location, or it reverts to normal. Safety
         rails, in order: editor not compiling -> map file not locked (SCMDraft
         share probe) -> full-file backup -> ``IsomTerrain.exe locedit`` (which
         itself aborts BEFORE saving on any bad op, never renumbers ids, and
@@ -661,7 +675,8 @@ class MapInfoService:
             )
 
         line = self._ops_line(op, map_path, name, location_id,
-                              left, top, right, bottom)
+                              left, top, right, bottom,
+                              invert_x=invert_x, invert_y=invert_y)
         backup_path = self._backup_map(map_path)
         stdout = self._run_locedit(map_path, line)
 
@@ -703,8 +718,14 @@ class MapInfoService:
     def _ops_line(
         self, op: str, map_path: Path, name: str, location_id: int,
         left: int, top: int, right: int, bottom: int,
+        *, invert_x: bool = False, invert_y: bool = False,
     ) -> bytes:
-        """Validate + render one locedit ops line (px coords, raw name bytes)."""
+        """Validate + render one locedit ops line (px coords, raw name bytes).
+
+        Inversion happens LAST: the caller supplies a normal rectangle (so the
+        sanity check below stays meaningful) and the px bounds are swapped per
+        inverted axis — the exact bytes SCMDraft's Invert buttons would store.
+        """
         needs_name = op in ("add", "rename")
         needs_rect = op in ("add", "set")
         needs_id = op in ("set", "rename", "del")
@@ -743,6 +764,10 @@ class MapInfoService:
                     ) from exc
 
         px = [v * TILE_PX for v in (left, top, right, bottom)]
+        if invert_x:
+            px[0], px[2] = px[2], px[0]
+        if invert_y:
+            px[1], px[3] = px[3], px[1]
         if op == "add":
             fields = [b"add"] + [str(v).encode() for v in px] + [name_bytes]
         elif op == "set":

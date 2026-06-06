@@ -43,7 +43,8 @@ graph LR
   controllers, races), `FORC` (teams; legally-short section zero-padded; flag
   bits randomStartLocation/allies/alliedVictory/sharedVision), `MRGN`
   (locations: 1-based trigger ids, pixel + tile rects, names; index 63 flagged
-  `anywhere`; all-zero entries skipped), `UNIT` (36-byte entries: type, owner
+  `anywhere`; all-zero entries skipped; swapped bounds flagged
+  `inverted: "x"|"y"|"xy"` — 음수 로케이션, features/09), `UNIT` (36-byte entries: type, owner
   label `P1..P12 (neutral)`, pixel + tile coords, hp/shield/energy %,
   resources; start locations = type 214), `STR `/`STRx` (1-based ids; `STRx`
   wins when both exist).

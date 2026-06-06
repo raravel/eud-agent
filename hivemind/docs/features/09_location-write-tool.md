@@ -59,7 +59,20 @@ journaled. Routed (memory_write precedent) to the injected `MapInfoService`:
 - Params: `action` enum `add|set|rename|delete` (required); `name` (add/
   rename); `locationId` (set/rename/delete); `tileLeft/tileTop/tileRight/
   tileBottom` (add/set, TILE units — converted to px in the service; sub-tile
-  precision of an existing location is overwritten at tile granularity).
+  precision of an existing location is overwritten at tile granularity);
+  `invertX`/`invertY` (add/set, optional booleans).
+- **음수(Inverted) locations** (corpus grounding: edac/126985 + edac/76715):
+  an inverted location's bounds are SWAPPED (left>right and/or top>bottom) —
+  Bring then matches only when the location sits fully INSIDE the unit's
+  collision box, the community-standard precision-detection technique
+  (1px-movement, 피탄판정, bunker containment). SCMDraft authors these with
+  its native Invert X/Y buttons; `invertX`/`invertY` store the identical
+  bytes. The caller supplies a NORMAL rect (validation stays meaningful);
+  the service swaps the px bounds per axis afterwards. `set` writes exactly
+  the bounds given — re-pass the flags when moving an inverted location.
+  `map_info` flags such locations with `inverted: "x"|"y"|"xy"`. The
+  standard runtime pattern stays in epScript: MoveLocation onto the unit +
+  Bring (an inverted location LARGER than the unit never matches).
 - Validation ladder: tool handler (enum + per-action required fields) →
   service (rect sanity, name charset `|`/newline ban, id ≥ 1) → locedit CLI
   (range/Anywhere/empty-slot/in-use) — three independent lines of defense.
@@ -79,6 +92,15 @@ journaled. Routed (memory_write precedent) to the injected `MapInfoService`:
 4. **Name encoding follows the map**: `detect_str_encoding` — `STRx` → utf-8;
    any existing non-utf-8 string → cp949; ambiguous/ASCII-only → cp949 (this
    machine's SCMDraft locale). ASCII names skip the extra chk extraction.
+
+## Prompt guidance
+
+`engine.build_system_prompt` injects a `[map locations]` section (after
+`[first principles]`, before project memory): check-then-create (map_info →
+location_write add → reference by name), stable ids / #64 Anywhere, the
+inverted-location precision pattern (≤ unit size, MoveLocation + Bring), and
+prefer-reuse-over-duplicates. This pins the workflow instead of relying on
+tool descriptions alone.
 
 ## Journal / changeset integration
 

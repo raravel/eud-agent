@@ -63,6 +63,26 @@ _FIRST_PRINCIPLES_PATH = (
     Path(__file__).resolve().parent / "data" / "first_principles.md"
 )
 
+# Map-location workflow guidance (features/08+09). Grounded in the ECA corpus:
+# 음수(Inverted) location semantics + the MoveLocation/Bring precision pattern
+# from cafe edac/126985 and the 강낭땅콩 editor course edac/76715.
+_MAP_LOCATION_GUIDE = (
+    "[map locations]\n"
+    "- BEFORE generating code that references a location by name, call "
+    "map_info(mode=locations) to confirm it exists; if it is missing, create "
+    "it with location_write(action=add) and use the returned id/name.\n"
+    "- Location ids are stable (never renumbered); #64 is the engine "
+    "'Anywhere' location. The map data is the last-SAVED file on disk.\n"
+    "- For precise hit/movement detection use an INVERTED (음수) location: "
+    "location_write with invertX+invertY, sized AT OR BELOW the target "
+    "unit's collision box (an inverted location larger than the unit never "
+    "matches Bring). At runtime MoveLocation it onto the unit and test "
+    "Bring; locations flagged 'inverted' in map_info are these.\n"
+    "- location_write edits the real map file (backed up + reviewable in the "
+    "changeset); prefer reusing an existing suitable location over adding "
+    "duplicates."
+)
+
 # Triage rules surfaced in the system prompt (features/05, mechanical not advisory).
 _TRIAGE_INSTRUCTIONS = (
     "[triage]\n"
@@ -115,6 +135,8 @@ def build_system_prompt(
         state_section,
         "",
         _first_principles_section(),
+        "",
+        _MAP_LOCATION_GUIDE,
     ]
     if data_dir is not None:
         parts += ["", _project_memory_section(data_dir, project)]

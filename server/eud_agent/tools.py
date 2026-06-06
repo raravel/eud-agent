@@ -659,6 +659,10 @@ def _h_location_write(bridge, args):
         "top": rect.get("tileTop", 0),
         "right": rect.get("tileRight", 0),
         "bottom": rect.get("tileBottom", 0),
+        # 음수(Inverted) location flags — meaningful for add/set only; the
+        # service swaps the bounds per axis after validation (features/09).
+        "invert_x": bool(_opt(args, "invertX", False)) and needs_rect,
+        "invert_y": bool(_opt(args, "invertY", False)) and needs_rect,
     }
 
 
@@ -890,8 +894,11 @@ def _build_registry() -> dict[str, ToolSpec]:
             "OpenMapName .scx; visible in SCMDraft after reopen). action: "
             "add (name + tile rect, returns the assigned id) | set (locationId "
             "+ tile rect) | rename (locationId + name) | delete (locationId). "
-            "Ids are never renumbered; #64 Anywhere is protected; a full-file "
-            "backup is taken before every edit.",
+            "invertX/invertY (add/set) make a 음수(Inverted) location for "
+            "precise Bring detection — pass a NORMAL rect, the bounds are "
+            "swapped for you; re-pass the flags on set or the location "
+            "reverts to normal. Ids are never renumbered; #64 Anywhere is "
+            "protected; a full-file backup is taken before every edit.",
             _schema(
                 {
                     "action": {
@@ -903,6 +910,8 @@ def _build_registry() -> dict[str, ToolSpec]:
                     "tileTop": _INT,
                     "tileRight": _INT,
                     "tileBottom": _INT,
+                    "invertX": {"type": "boolean"},
+                    "invertY": {"type": "boolean"},
                 },
                 ["action"],
             ),
