@@ -286,6 +286,188 @@ def test_ws_no_snapshot_when_warmup_state_unknown(tmp_path, monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
+# WS /ws : project-memory surface (features/07 "WS protocol additions" + "Edge
+# cases"). memory_get returns the four files + recent episodes (last 50, NEWEST
+# FIRST — ProjectMemory.read_episodes returns newest LAST, so the handler must
+# reverse). memory_save is a DIRECT ProjectMemory write (NOT journaled — a user
+# editing their own memory is not an agent mutation), same file enum + 8 KB cap.
+# The project name is resolved from the LIVE bridge STATUS at use time (no project
+# is open at boot; the project can switch mid-session), so a fake-status bridge
+# fixes which <data_dir>/harness/<project>/ the surface reads/writes.
+# --------------------------------------------------------------------------- #
+
+
+def _fake_status_project(monkeypatch, project="myproj"):
+    """Make BridgeIO.status() report ``project`` (live STATUS the surface parses)."""
+    from eud_agent import bridge_io as bio_mod
+
+    def fake_status(self, **kw):
+        return f"compiling=false\nproject={project}\n"
+
+    monkeypatch.setattr(bio_mod.BridgeIO, "status", fake_status)
+
+
+def _store_for(tmp_path, project="myproj"):
+    """A ProjectMemory rooted at the app's data_dir for direct disk assertions."""
+    from eud_agent.memory import ProjectMemory
+
+    return ProjectMemory(
+        data_dir=str(tmp_path / "data"), project_name=project
+    )
+
+
+def test_ws_memory_get_returns_files_and_episodes_newest_first(tmp_path, monkeypatch):
+    """memory_get replies memory{project, files{...}, episodes:[...]} with episodes
+    newest FIRST (read_episodes is newest LAST -> the handler reverses)."""
+    from fastapi.testclient import TestClient
+
+    cfg = make_config(tmp_path, token="right")
+    _fake_status_project(monkeypatch, "myproj")
+
+    # Seed the store on disk: file content + two episodes (oldest then newest).
+    store = _store_for(tmp_path, "myproj")
+    store.write("resources", "switch 5 = quest flag")
+    store.append_episode({"ts": "2026-06-06T00:00:00", "instruction": "first",
+                          "kind": "answer", "decision": "answer"})
+    store.append_episode({"ts": "2026-06-06T00:01:00", "instruction": "second",
+                          "kind": "changeset", "decision": "accepted"})
+
+    with TestClient(build_test_app(cfg)) as client:
+        with client.websocket_connect(
+            "/ws?token=right", headers={"origin": _origin_for(cfg)}
+        ) as ws:
+            ws.send_json({"type": "memory_get"})
+            msg = ws.receive_json()
+    assert msg["type"] == "memory"
+    assert msg["project"] == "myproj"
+    assert set(msg["files"]) == {"resources", "structure", "conventions", "lessons"}
+    assert msg["files"]["resources"] == "switch 5 = quest flag"
+    assert msg["files"]["structure"] == ""
+    # newest FIRST: the "second" episode precedes "first".
+    instrs = [e["instruction"] for e in msg["episodes"]]
+    assert instrs == ["second", "first"], (
+        f"episodes must be newest-first; got {instrs}"
+    )
+
+
+def test_ws_memory_get_no_project_errors(tmp_path, monkeypatch):
+    """No project open (STATUS project empty) -> memory_get returns error."""
+    from fastapi.testclient import TestClient
+
+    cfg = make_config(tmp_path, token="right")
+    _fake_status_project(monkeypatch, "")  # empty project name
+
+    with TestClient(build_test_app(cfg)) as client:
+        with client.websocket_connect(
+            "/ws?token=right", headers={"origin": _origin_for(cfg)}
+        ) as ws:
+            ws.send_json({"type": "memory_get"})
+            msg = ws.receive_json()
+    assert msg["type"] == "error"
+    # The handler must EXIST and reject for the real reason (no project), NOT fall
+    # through to the engine's unknown-type fallback — that distinguishes a wired
+    # handler from today's unhandled message (the Step-A failing condition).
+    assert "unknown message type" not in msg["message"].lower()
+    assert msg["message"]
+
+
+def test_ws_memory_save_persists_and_replies_saved(tmp_path, monkeypatch):
+    """memory_save writes the file DIRECTLY (no journal) and replies memory_saved;
+    a following memory_get reflects the persisted content."""
+    from fastapi.testclient import TestClient
+
+    cfg = make_config(tmp_path, token="right")
+    _fake_status_project(monkeypatch, "myproj")
+
+    with TestClient(build_test_app(cfg)) as client:
+        with client.websocket_connect(
+            "/ws?token=right", headers={"origin": _origin_for(cfg)}
+        ) as ws:
+            ws.send_json({"type": "memory_save", "file": "conventions",
+                          "content": "triggers prefixed t_"})
+            saved = ws.receive_json()
+            assert saved["type"] == "memory_saved"
+            assert saved["file"] == "conventions"
+
+            ws.send_json({"type": "memory_get"})
+            got = ws.receive_json()
+    assert got["type"] == "memory"
+    assert got["files"]["conventions"] == "triggers prefixed t_"
+    # Persisted on disk under <data_dir>/harness/<project>/ (DIRECT store write).
+    assert _store_for(tmp_path, "myproj").read("conventions") == "triggers prefixed t_"
+    # No journal entry was created (a user edit is not an agent mutation).
+    journal_dir = tmp_path / "data" / "journal"
+    assert not journal_dir.exists() or not list(journal_dir.glob("*.json")), (
+        "memory_save must NOT journal (direct write)"
+    )
+
+
+def test_ws_memory_save_unknown_file_errors(tmp_path, monkeypatch):
+    """An unknown file name -> error (the file enum guard)."""
+    from fastapi.testclient import TestClient
+
+    cfg = make_config(tmp_path, token="right")
+    _fake_status_project(monkeypatch, "myproj")
+
+    with TestClient(build_test_app(cfg)) as client:
+        with client.websocket_connect(
+            "/ws?token=right", headers={"origin": _origin_for(cfg)}
+        ) as ws:
+            ws.send_json({"type": "memory_save", "file": "bogus", "content": "x"})
+            msg = ws.receive_json()
+    assert msg["type"] == "error"
+    # A wired handler rejects the unknown FILE name; it must not fall through to
+    # the engine's unknown-MESSAGE-type fallback (Step-A failing condition).
+    assert "unknown message type" not in msg["message"].lower()
+    assert msg["message"]
+
+
+def test_ws_memory_save_oversize_content_errors(tmp_path, monkeypatch):
+    """Content over the 8 KB cap -> error; nothing persisted."""
+    from fastapi.testclient import TestClient
+
+    cfg = make_config(tmp_path, token="right")
+    _fake_status_project(monkeypatch, "myproj")
+
+    oversize = "a" * 8193  # one byte over CONTENT_CAP_BYTES (8192)
+    with TestClient(build_test_app(cfg)) as client:
+        with client.websocket_connect(
+            "/ws?token=right", headers={"origin": _origin_for(cfg)}
+        ) as ws:
+            ws.send_json({"type": "memory_save", "file": "lessons",
+                          "content": oversize})
+            msg = ws.receive_json()
+    assert msg["type"] == "error"
+    # A wired handler rejects the over-cap content; not the unknown-type fallback.
+    assert "unknown message type" not in msg["message"].lower()
+    assert msg["message"]
+    assert _store_for(tmp_path, "myproj").read("lessons") == "", (
+        "an over-cap save must not persist"
+    )
+
+
+def test_ws_memory_save_no_project_errors(tmp_path, monkeypatch):
+    """No project open -> memory_save returns error."""
+    from fastapi.testclient import TestClient
+
+    cfg = make_config(tmp_path, token="right")
+    _fake_status_project(monkeypatch, "")
+
+    with TestClient(build_test_app(cfg)) as client:
+        with client.websocket_connect(
+            "/ws?token=right", headers={"origin": _origin_for(cfg)}
+        ) as ws:
+            ws.send_json({"type": "memory_save", "file": "resources",
+                          "content": "x"})
+            msg = ws.receive_json()
+    assert msg["type"] == "error"
+    # A wired handler rejects because no project is open; not the unknown-type
+    # fallback (Step-A failing condition).
+    assert "unknown message type" not in msg["message"].lower()
+    assert msg["message"]
+
+
+# --------------------------------------------------------------------------- #
 # Debug trail wiring: every inbound WS client message, every /tools/call (full
 # args/result), and the turn-end events (answer/plan/changeset/error) land in
 # <data_dir>/logs/agent-YYYYMMDD.jsonl via app.state.debug_log. Streaming

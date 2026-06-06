@@ -511,8 +511,14 @@ class AgentEngine:
             return
         # answer-only: nothing journaled, no changeset; back to idle. Record the
         # turn as an episode (features/07 — answer-only finalization).
-        await self._record_episode(kind="answer", decision="answer", journal=None)
+        # State -> idle BEFORE recording the episode: the episode write is a
+        # best-effort, zero-cost finalization that must NEVER gate the state
+        # machine (features/07 "memory must never break the request flow"). It
+        # runs via asyncio.to_thread, which yields the event loop; if state were
+        # still "executing" across that yield, the client's next chat (already
+        # holding the runner-emitted answer) would race in and hit the busy guard.
         self.state = "idle"
+        await self._record_episode(kind="answer", decision="answer", journal=None)
 
     async def _emit_changeset(self) -> None:
         journal = self._get_tool_layer().get_journal(self._request_id)
@@ -548,6 +554,12 @@ class AgentEngine:
         )
         # features/07 Episodes: a default-accept of undecided items records a
         # ``defaulted`` episode (the journal entries are still readable post-archive).
+        # No state reorder here (unlike _finish_turn / _on_changeset_decision): this
+        # runs INLINE inside _on_chat (and _on_reset) BEFORE the new request id is
+        # minted, with no state transition coupled to the episode write — the caller
+        # owns the subsequent transition. The episode `to_thread` yield is harmless
+        # because the caller has already passed its busy gate and has not yet started
+        # the new turn. (Audited EUD-081: no race window at this site.)
         await self._record_episode(
             kind="changeset", decision="defaulted", journal=journal
         )
@@ -669,12 +681,21 @@ class AgentEngine:
                     ep_decision = "partial"
                 else:
                     ep_decision = "accepted" if decision == "accept" else "rejected"
+                # State -> idle BEFORE recording the episode: same rule as the
+                # answer-only finalization above — the episode write is a
+                # best-effort, zero-cost step that must NEVER gate the state
+                # machine (features/07 "memory must never break the request
+                # flow"). It runs via asyncio.to_thread (yields the loop); leaving
+                # state at "changeset_review" across that yield would let the next
+                # client message race the decided changeset. The rollback_result
+                # was already sent, so the panel can proceed once idle.
+                self.state = "idle"
                 await self._record_episode(
                     kind="changeset", decision=ep_decision, journal=journal
                 )
             except Exception as exc:  # noqa: BLE001 - surface, never crash the WS
                 await self._error(f"changeset decision failed: {exc}")
-            self.state = "idle"
+                self.state = "idle"
 
         self._decision_task = asyncio.create_task(_decide())
 

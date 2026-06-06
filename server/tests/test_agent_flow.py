@@ -1836,6 +1836,71 @@ def test_episode_recorded_on_changeset_reject(tmp_path):
     assert eps[0]["kind"] == "changeset"
 
 
+def test_state_idle_before_episode_on_answer_turn_end(tmp_path):
+    """EUD-081 finalization ordering: on an answer-only turn end the engine sets
+    ``state = "idle"`` BEFORE recording the episode.
+
+    The episode write is a best-effort, zero-cost step that must NEVER gate the
+    state machine (features/07 "memory must never break the request flow"); it
+    runs via ``asyncio.to_thread`` which yields the loop, so if state were still
+    ``executing`` across that yield, the client's next chat would race into the
+    busy guard. Spying on ``_record_episode`` captures ``self.state`` at call time
+    — it must already be ``idle``. Without the reorder this is ``executing``."""
+    data_dir = tmp_path / "data"
+    engine, runner, send, ddir = _make_engine(tmp_path, data_dir=data_dir)
+    runner.queue(answer_script("hi"))
+
+    seen = {}
+    orig = engine._record_episode
+
+    async def _spy(*, kind, decision, journal):
+        seen["state"] = engine.state
+        return await orig(kind=kind, decision=decision, journal=journal)
+
+    engine._record_episode = _spy
+
+    _run(engine, lambda: engine._on_chat({"type": "chat", "text": "explain"}))
+
+    assert seen.get("state") == "idle", (
+        f"state must be idle BEFORE the episode write; was {seen.get('state')!r}"
+    )
+    assert engine.state == "idle"
+
+
+def test_state_idle_before_episode_on_changeset_decision(tmp_path):
+    """EUD-081 finalization ordering (changeset path): after a changeset decision
+    the engine sets ``state = "idle"`` BEFORE recording the episode — same
+    best-effort rule as the answer-only path. Spying on ``_record_episode``
+    captures ``self.state`` at call time; it must already be ``idle`` (the
+    ``rollback_result`` was already sent). Without the reorder it is
+    ``changeset_review``."""
+    data_dir = tmp_path / "data"
+    engine, runner, send, ddir = _make_engine(tmp_path, data_dir=data_dir)
+    runner.queue(edit_script(value="999"))
+
+    _run(engine, lambda: engine._on_chat({"type": "chat", "text": "set maxhp"}))
+    assert engine.state == "changeset_review"
+
+    seen = {}
+    orig = engine._record_episode
+
+    async def _spy(*, kind, decision, journal):
+        seen["state"] = engine.state
+        return await orig(kind=kind, decision=decision, journal=journal)
+
+    engine._record_episode = _spy
+
+    _run(engine, lambda: engine._on_changeset_decision(
+        {"type": "changeset_decision", "decision": "reject", "ids": "all"}
+    ))
+
+    assert seen.get("state") == "idle", (
+        f"state must be idle BEFORE the changeset episode write; "
+        f"was {seen.get('state')!r}"
+    )
+    assert engine.state == "idle"
+
+
 def test_episode_recorded_on_default_accept_of_prior_undecided(tmp_path):
     """A new chat while the prior changeset is UNDECIDED records the prior
     request's episode with decision 'defaulted' (features/07 Episodes)."""

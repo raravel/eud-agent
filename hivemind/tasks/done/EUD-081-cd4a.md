@@ -1,4 +1,5 @@
 ---
+completed_at: '2026-06-06T17:11:40.462276'
 created: '2026-06-06'
 depends_on:
 - EUD-078-3b29
@@ -9,7 +10,9 @@ scope:
 - server/eud_agent/app.py
 - server/tests/test_app.py
 - server/tests/test_integration_ws.py
-status: pending
+- server/eud_agent/engine.py
+- server/tests/test_agent_flow.py
+status: done
 title: memory_get/memory_save WS endpoints + integration test
 type: task
 updated: '2026-06-06'

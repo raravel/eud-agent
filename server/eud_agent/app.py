@@ -383,6 +383,45 @@ def create_app(
     # The bridge is a shared singleton (one editor instance per machine).
     bridge = BridgeIO(cfg.data_dir)
 
+    # Per-map-project memory (features/07). The project name comes from the LIVE
+    # bridge STATUS and can change mid-session (no project is open at boot), so the
+    # store must be re-resolved on every access rather than constructed once.
+    # ``_resolve_memory`` parses the current STATUS and builds a fresh
+    # :class:`ProjectMemory` (an empty project name -> a DISABLED store that reads
+    # ``""`` / rejects writes / renders "(no project memory)"). It is best-effort:
+    # a STATUS failure resolves to a disabled store so memory never breaks a turn.
+    def _resolve_memory():
+        from .engine import parse_status
+        from .memory import ProjectMemory
+
+        try:
+            _, project = parse_status(bridge.status())
+        except Exception:  # noqa: BLE001 - no project resolvable -> disabled store
+            project = ""
+        return ProjectMemory(data_dir=cfg.data_dir, project_name=project)
+
+    # ToolLayer (tools.py) and Journal (journal.py) take a STATIC ``memory``
+    # reference, but the project resolves PER USE — so they get this thin proxy
+    # that forwards every attribute/method access (``enabled`` / ``write`` /
+    # ``read`` / ``store_dir`` / ``update_list_hash`` — the surface those consumers
+    # touch) to a store resolved AT THAT MOMENT from the live STATUS. This is the
+    # only app.py-local seam that keeps the project name live without editing
+    # tools.py / journal.py (EUD-081 scope: app.py only).
+    class _LiveProjectMemory:
+        """Delegates the ProjectMemory surface to a freshly resolved store.
+
+        Each attribute access constructs a new :class:`ProjectMemory` for the
+        CURRENT project (live STATUS), so a mid-session project switch is followed
+        without any cached state. Covers both the codex ``memory_write`` path
+        (``enabled`` / ``write`` / ``update_list_hash``) and the journal
+        snapshot/rollback path (``enabled`` / ``read`` / ``write`` / ``store_dir``).
+        """
+
+        def __getattr__(self, name):
+            return getattr(_resolve_memory(), name)
+
+    live_memory = _LiveProjectMemory()
+
     # The eud-tools tool layer (features/05): the policy layer for codex's tool
     # calls. The MCP shim is dumb transport that forwards to /tools/call below;
     # ALL validation / gate / budget / journaling live here in the FastAPI
@@ -393,10 +432,13 @@ def create_app(
         from .journal import Journal
 
         return Journal(
-            data_dir=cfg.data_dir, request_id=request_id, bridge=bridge
+            data_dir=cfg.data_dir, request_id=request_id, bridge=bridge,
+            memory=live_memory,
         )
 
-    tool_layer = ToolLayer(bridge, journal_factory=_journal_factory)
+    tool_layer = ToolLayer(
+        bridge, journal_factory=_journal_factory, memory=live_memory
+    )
     app.state.tool_layer = tool_layer
 
     # The WS tests swap app.state.tool_layer (a fake-bridge ToolLayer) AFTER
@@ -561,9 +603,16 @@ def create_app(
             bridge=bridge,
             rag_db=cfg.rag_db,
             register_request_id=_register_request_id,
+            # features/07: enables the [project memory] prompt section (resumed
+            # turns) and episode recording at finalization. The project name is
+            # re-resolved per turn from the bridge STATUS inside the engine.
+            data_dir=cfg.data_dir,
         )
         try:
-            await _serve_ws(websocket, engine, debug_log=debug_log)
+            await _serve_ws(
+                websocket, engine, bridge=bridge, data_dir=cfg.data_dir,
+                debug_log=debug_log,
+            )
         except WebSocketDisconnect:
             pass
         finally:
@@ -685,6 +734,8 @@ async def _serve_ws(
     websocket: WebSocket,
     engine: AgentEngine,
     *,
+    bridge=None,
+    data_dir: str | os.PathLike | None = None,
     debug_log: DebugLog | None = None,
 ) -> None:
     """Dispatch WS v2 client messages to the per-connection engine.
@@ -694,11 +745,113 @@ async def _serve_ws(
     ``list``. The v1 ``instruct``/``apply`` messages are REMOVED — they fall
     through to the unknown-type error (no compat shim). Every event the engine
     emits flows through the broadcaster so both connected clients see it.
+
+    The project-memory surface (features/07 "WS protocol additions") —
+    ``memory_get`` / ``memory_save`` — is handled HERE, before delegating to the
+    engine. Deviation note: ``status``/``list`` route through the engine's
+    ``handle()`` dispatch, but engine.py is out of EUD-081 scope, so these two are
+    handled in this loop instead; the spec's "route like status/list" is satisfied
+    at the protocol level (same WS message family), not the dispatch site. The
+    reply is sent directly on this socket (memory replies are not turn-end events,
+    so they skip the broadcast/debug-trail turn-end path).
     """
     while True:
         msg = await websocket.receive_json()
         # Debug trail: every inbound client message, verbatim (chat text,
-        # plan feedback/approve, decisions, status/list).
+        # plan feedback/approve, decisions, status/list, memory_get/save).
         if debug_log is not None:
             debug_log.log("client", msg)
+        mtype = msg.get("type")
+        if mtype == "memory_get":
+            await _handle_memory_get(websocket, bridge, data_dir)
+            continue
+        if mtype == "memory_save":
+            await _handle_memory_save(websocket, bridge, data_dir, msg)
+            continue
         await engine.handle(msg)
+
+
+#: Episodes returned in a ``memory_get`` reply (the prompt section uses its own
+#: smaller limit). features/07 "WS protocol additions": last 50, newest FIRST.
+_MEMORY_WS_EPISODE_LIMIT = 50
+
+
+def _resolve_ws_memory(bridge, data_dir):
+    """Build a :class:`ProjectMemory` for the CURRENT project (live STATUS).
+
+    Mirrors ``create_app``'s in-process resolver for the WS handlers: parse the
+    bridge STATUS for the project name and construct a fresh store (an empty name
+    -> a DISABLED store). Best-effort: a STATUS failure yields a disabled store.
+    Runs the blocking bridge IO off the event loop at the call site.
+    """
+    from .engine import parse_status
+    from .memory import ProjectMemory
+
+    try:
+        _, project = parse_status(bridge.status())
+    except Exception:  # noqa: BLE001 - no project resolvable -> disabled store
+        project = ""
+    return ProjectMemory(data_dir=data_dir, project_name=project)
+
+
+async def _handle_memory_get(websocket: WebSocket, bridge, data_dir) -> None:
+    """``memory_get {}`` -> ``memory {project, files, episodes}`` (features/07).
+
+    ``files`` is the four markdown files (absent -> ``""``); ``episodes`` is the
+    last 50, NEWEST FIRST (the store returns newest LAST, so reverse). No project
+    open (disabled store) -> ``error``. File IO runs off the event loop.
+    """
+    from .memory import MEMORY_FILES
+
+    def _read():
+        store = _resolve_ws_memory(bridge, data_dir)
+        if not store.enabled:
+            return None
+        files = {name: store.read(name) for name in MEMORY_FILES}
+        # read_episodes returns newest LAST; the WS payload is newest FIRST.
+        episodes = list(reversed(store.read_episodes(_MEMORY_WS_EPISODE_LIMIT)))
+        return store.project_name, files, episodes
+
+    try:
+        result = await asyncio.to_thread(_read)
+    except Exception as exc:  # noqa: BLE001 - surface as a clean WS error
+        await websocket.send_json({"type": "error", "message": str(exc)})
+        return
+    if result is None:
+        await websocket.send_json(
+            {"type": "error", "message": "no project is open; memory is disabled"}
+        )
+        return
+    project, files, episodes = result
+    await websocket.send_json(
+        {"type": "memory", "project": project, "files": files,
+         "episodes": episodes}
+    )
+
+
+async def _handle_memory_save(
+    websocket: WebSocket, bridge, data_dir, msg: dict
+) -> None:
+    """``memory_save {file, content}`` -> ``memory_saved {file}`` (features/07).
+
+    A DIRECT store write (NOT journaled — a user editing their own memory is not
+    an agent mutation), same file enum + 8 KB cap as ``memory_write``. A disabled
+    store / unknown file / oversize content -> ``error`` carrying the store's
+    ``WriteResult.reason``. File IO runs off the event loop.
+    """
+    file = str(msg.get("file", ""))
+    content = str(msg.get("content", ""))
+
+    def _write():
+        store = _resolve_ws_memory(bridge, data_dir)
+        return store.write(file, content)
+
+    try:
+        result = await asyncio.to_thread(_write)
+    except Exception as exc:  # noqa: BLE001 - surface as a clean WS error
+        await websocket.send_json({"type": "error", "message": str(exc)})
+        return
+    if not result.ok:
+        await websocket.send_json({"type": "error", "message": result.reason})
+        return
+    await websocket.send_json({"type": "memory_saved", "file": file})

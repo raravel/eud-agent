@@ -47,6 +47,7 @@ pytestmark = pytest.mark.filterwarnings("ignore::DeprecationWarning")
 OBSERVED: set[str] = set()
 EXPECTED_SERVER_TYPES = {
     "agent_event", "changeset", "rollback_result", "error", "status", "list",
+    "memory", "memory_saved",
 }
 
 
@@ -103,6 +104,21 @@ def dat_edit_script(*, value="999"):
             {"dat": "units", "param": "MaxHP", "objId": 0, "value": value},
         )
         await emit({"type": "agent_event", "kind": "tool_call", "detail": "dat_set"})
+        return {"kind": "apply"}
+    return _script
+
+
+def memory_write_script(*, file="resources", content="switch 7 = boss flag"):
+    async def _script(emit, tools, request_id):
+        # A real journaled memory_write through the app's wired ProjectMemory store
+        # (features/07) — kind="write", so it journals + appears in the changeset
+        # as a `memory` item, and a reject rolls the file back to its pre-write
+        # content (the same inverse-op discipline as a dat/file write).
+        tools.call_for_request(
+            request_id, "memory_write", {"file": file, "content": content},
+        )
+        await emit({"type": "agent_event", "kind": "tool_call",
+                    "detail": "memory_write"})
         return {"kind": "apply"}
     return _script
 
@@ -200,6 +216,55 @@ def _recv_until(ws, etype, *, max_msgs=30):
     return collected
 
 
+def _recv_expecting(ws, etype):
+    """Receive EXACTLY ONE message and assert it is ``etype``.
+
+    Hang-proof by construction: the server replies to every WS message with at
+    least one frame (the engine answers an unhandled type with ``error``), so a
+    SINGLE bounded ``receive_json`` always returns. An ``error`` (or any other
+    type) when ``etype`` was expected fails the assertion IMMEDIATELY rather than
+    looping into a second ``receive_json`` that would block forever (starlette's
+    TestClient has no receive timeout and pytest-timeout is not installed). This
+    is the Step-A failing-state path: today ``memory_get``/``memory_save`` are
+    unhandled, so the reply is ``error`` and these tests fail fast.
+    """
+    msg = ws.receive_json()
+    _record([msg])
+    assert msg.get("type") == etype, (
+        f"expected {etype!r}, got {msg.get('type')!r}: {msg}"
+    )
+    return msg
+
+
+#: Streaming frames a turn may emit BEFORE its terminal result — skipped while
+#: waiting for a turn-end type, but bounded so a hang is impossible.
+_STREAM_TYPES = {"agent_event", "progress"}
+
+
+def _recv_turn_end(ws, etype, *, max_msgs=10):
+    """Wait for ``etype``, skipping streaming frames, treating ``error`` as fatal.
+
+    Bounded by ``max_msgs`` AND short-circuited on ``error`` (a turn that failed
+    — e.g. memory_write rejected because no memory store is wired today — emits
+    ``error`` and NO further frames; continuing to receive would block forever).
+    Any non-streaming, non-``etype`` message fails immediately. This keeps Step-A
+    runs finishing fast while still passing in Step B (skips the one ``agent_event``
+    the FakeRunner streams before the changeset).
+    """
+    for _ in range(max_msgs):
+        msg = ws.receive_json()
+        _record([msg])
+        t = msg.get("type")
+        if t == etype:
+            return msg
+        if t in _STREAM_TYPES:
+            continue
+        raise AssertionError(
+            f"expected {etype!r}, got terminal {t!r}: {msg}"
+        )
+    raise AssertionError(f"never received {etype!r} within {max_msgs} messages")
+
+
 # --------------------------------------------------------------------------- #
 # 1. Full v2 happy path: chat -> changeset -> reject -> inverse SETDAT .cmd.
 # --------------------------------------------------------------------------- #
@@ -279,6 +344,93 @@ def test_chat_changeset_accept_archives(tmp_path, monkeypatch):
     )
     archived = data_dir / "journal" / f"{request_id}.accepted.json"
     assert archived.is_file(), "accept must archive the journal"
+
+
+# --------------------------------------------------------------------------- #
+# 2b. Project memory (features/07): chat -> memory_write -> changeset carries a
+# `memory` item -> reject -> the file is rolled back to its PRE-write content
+# (the journal inverse for memory_write restores the snapshotted old content).
+# The project name is resolved from the LIVE bridge STATUS, so the fake bridge
+# reports one; the memory itself lives on disk under <data_dir>/harness/<proj>/.
+# Then a direct memory_save round-trip (save -> get).
+# --------------------------------------------------------------------------- #
+
+
+def _memory_store(tmp_path, project="demo"):
+    from eud_agent.memory import ProjectMemory
+
+    return ProjectMemory(data_dir=str(tmp_path / "data"), project_name=project)
+
+
+def _status_responder(first_line, body):
+    # Only STATUS is needed for project resolution; memory IO never hits the bridge.
+    if first_line == "STATUS":
+        return "compiling=false\nproject=demo\nversion=0.19.6.0"
+    return "ERROR: unexpected " + first_line
+
+
+def test_chat_memory_write_changeset_reject_restores(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+
+    cfg, app, created = build_app(tmp_path, monkeypatch)
+    data_dir = tmp_path / "data"
+
+    # Seed a PRE-write value so reject is observable as a restore (not a delete).
+    _memory_store(tmp_path, "demo").write("resources", "switch 1 = original")
+
+    with FakeBridge(data_dir, _status_responder), TestClient(app) as client:
+        with _connect(client, cfg) as ws:
+            created["runner"].queue(
+                memory_write_script(file="resources", content="switch 7 = boss flag")
+            )
+            ws.send_json({"type": "chat", "text": "remember boss switch"})
+            # Bounded + error-terminal: today no memory store is wired, so the
+            # memory_write turn errors and never reaches a changeset (fast fail).
+            cs = _recv_turn_end(ws, "changeset")
+            mem_items = [
+                it for it in cs["items"] if it.get("kind") == "memory"
+            ]
+            assert mem_items, (
+                f"the journaled memory_write must appear as a memory item; "
+                f"items={cs['items']}"
+            )
+            assert mem_items[0]["target"] == "memory/resources"
+
+            ws.send_json({"type": "changeset_decision", "decision": "reject",
+                          "ids": "all"})
+            rr = _recv_turn_end(ws, "rollback_result")
+            assert rr["ok"] is True
+
+            # memory_get now shows the RESTORED (pre-write) content.
+            ws.send_json({"type": "memory_get"})
+            mem = _recv_expecting(ws, "memory")
+    assert mem["files"]["resources"] == "switch 1 = original", (
+        f"reject must restore the pre-write memory content; got "
+        f"{mem['files']['resources']!r}"
+    )
+    # On disk too (the inverse op wrote the old content back atomically).
+    assert _memory_store(tmp_path, "demo").read("resources") == "switch 1 = original"
+
+
+def test_memory_save_then_get_roundtrip(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+
+    cfg, app, created = build_app(tmp_path, monkeypatch)
+    data_dir = tmp_path / "data"
+
+    with FakeBridge(data_dir, _status_responder), TestClient(app) as client:
+        with _connect(client, cfg) as ws:
+            ws.send_json({"type": "memory_save", "file": "lessons",
+                          "content": "never reuse switch 12"})
+            # Single bounded receive: today this is an `error` (unhandled type),
+            # which fails the assertion fast instead of blocking.
+            saved = _recv_expecting(ws, "memory_saved")
+            assert saved["file"] == "lessons"
+
+            ws.send_json({"type": "memory_get"})
+            mem = _recv_expecting(ws, "memory")
+    assert mem["files"]["lessons"] == "never reuse switch 12"
+    assert _memory_store(tmp_path, "demo").read("lessons") == "never reuse switch 12"
 
 
 # --------------------------------------------------------------------------- #
