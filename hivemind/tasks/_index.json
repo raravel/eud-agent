@@ -1440,6 +1440,21 @@
         "server/tests/test_chk_info.py",
         "hivemind/docs/"
       ]
+    },
+    "EUD-086-6118": {
+      "status": "done",
+      "priority": "medium",
+      "type": "task",
+      "parent": null,
+      "depends_on": [],
+      "title": "search_docs RAG wiring + Korean-query guidance",
+      "updated": "2026-06-06",
+      "completed_at": "2026-06-06T18:59:52.330128",
+      "path": "done/EUD-086-6118.md",
+      "scope": [
+        "server/",
+        "hivemind/docs/"
+      ]
     }
   }
 }

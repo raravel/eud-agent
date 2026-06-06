@@ -25,7 +25,7 @@ graph TD
 
 ## Tools (registry)
 
-Read: `project_status`, `list_files`, `read_file`, `dat_get`, `xdat_get`, `tbl_get`, `req_get`, `btn_get`, `settings_get`, `plugins_list`, `build_errors`, `search_docs` (RAG top-k over the ECA store).
+Read: `project_status`, `list_files`, `read_file`, `dat_get`, `xdat_get`, `tbl_get`, `req_get`, `btn_get`, `settings_get`, `plugins_list`, `build_errors`, `search_docs` (RAG top-k over the ECA store — wired EUD-086 to the injected in-process `rag.search`; the corpus is KOREAN, so the tool description AND a pinned `[tools]` prompt note instruct codex to query in Korean while keeping eps/API identifiers as-is; `k` clamped to 10; absent/failed RAG → clear ToolError, the same advisory shape as `map_info`).
 Write (journaled): `dat_set`, `xdat_set`, `tbl_set`, `req_set`, `btn_set`, `dat_reset`, `file_create`, `file_write`, `file_rename`, `file_delete`, `file_move`, `mkdir`, `set_main`, `settings_set`, `plugin_add`, `plugin_edit`, `plugin_remove`, `plugin_move`, `build_run`.
 Flow: `propose_plan(markdown)` — ends the turn for user review (see below).
 

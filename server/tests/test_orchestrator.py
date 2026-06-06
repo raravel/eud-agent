@@ -211,6 +211,8 @@ def test_system_prompt_has_catalog_state_triage(monkeypatch):
     assert "main.eps" in sp  # file listing
     assert "RAGCHUNK" in sp  # RAG context
     assert "triage" in sp.lower()
+    # search_docs language rule (EUD-086): Korean-corpus note pinned in [tools].
+    assert "search_docs queries MUST be written in Korean" in sp
 
 
 def test_system_prompt_rag_unavailable_degrades(monkeypatch):

@@ -73,6 +73,14 @@ write also refreshes the store's LIST hash (the staleness signal) from the
 ``list_reply`` the engine threads through. A ToolLayer built WITHOUT a ``memory``
 store rejects ``memory_write`` with a ToolError ("no project is open"). See
 ``memory.py``.
+
+RAG search (EUD-086) is wired in the SAME additive way: ``ToolLayer`` takes an
+optional ``rag_search`` callable (``(query, k) -> list[dict]``; app.py wires
+``rag.search`` with the configured rag_db). When present the ``search_docs``
+READ tool returns top-k hits from the ECA store; absent (or a failed RAG load)
+makes the tool a clear ToolError while nothing else changes (the same advisory
+shape as map_info). The ECA corpus is Korean — the tool description instructs
+codex to query in Korean. See ``rag.py``.
 """
 
 from __future__ import annotations
@@ -98,6 +106,7 @@ from .bridge_io import (
 )
 from .chk_info import LOCATION_ACTIONS, MapInfoError
 from .memory import CONTENT_CAP_BYTES, MEMORY_FILES
+from .rag import RagUnavailable  # light import (heavy deps load lazily)
 
 # Budgets (features/05 "Triage and plan gating"). Pinned constants; the request
 # state exposes them in budget_snapshot for the panel.
@@ -122,6 +131,17 @@ _MAP_INFO_MODES = ("summary", "locations", "units", "players")
 # Location write tool (features/09). A REAL write: plan-gated, budgeted, and
 # journaled (snapshot = the service's full-file map backup; reject restores it).
 LOCATION_TOOL = "location_write"
+
+# RAG search tool (EUD-086). Routed to the injected ``rag_search`` callable
+# (in-process bge-m3 over the ECA store; no bridge involvement). The corpus is
+# KOREAN community material — the tool description tells codex to query in
+# Korean (bge-m3 is cross-lingual but jargon like 음수 로케이션 has no English
+# equivalent; English queries lose recall).
+SEARCH_DOCS_TOOL = "search_docs"
+# Retrieval depth: default + hard cap (each hit injects a full document chunk
+# into the codex context — the reply must stay context-sized).
+SEARCH_DOCS_DEFAULT_K = 5
+SEARCH_DOCS_MAX_K = 10
 
 
 # --------------------------------------------------------------------------- #
@@ -419,18 +439,21 @@ def _h_map_info(bridge, args):
 
 
 def _h_search_docs(bridge, args):
-    """RAG top-k over the ECA store.
+    """Validate ``search_docs`` args; the RAG call is routed in ``call``.
 
-    TODO(EUD-055+): wire the in-process RAG (rag.search) once the tool layer has a
-    handle to the rag_db path; the tool layer is constructed with only a bridge
-    today. The tool EXISTS and validates its args now (features/05 guidance: do
-    NOT block the whole task on RAG plumbing). Returns [] until wired.
+    First line of defense (same probe pattern as :func:`_h_map_info`): a
+    non-empty ``query`` and a positive-int ``k`` clamped to
+    :data:`SEARCH_DOCS_MAX_K`. No bridge call here — search_docs targets the
+    injected ``rag_search`` callable, not the editor bridge; the actual search
+    happens in :meth:`ToolLayer._search_docs_via_rag` after this passes.
     """
-    query = _req(args, "query")
-    if not str(query).strip():
+    query = str(_req(args, "query"))
+    if not query.strip():
         raise ToolError("search_docs: query must be non-empty")
-    _ = _opt(args, "k", 5)  # validated shape; depth used once RAG is wired
-    return []
+    k = _opt(args, "k", SEARCH_DOCS_DEFAULT_K)
+    if isinstance(k, bool) or not isinstance(k, int) or k < 1:
+        raise ToolError(f"search_docs: k must be a positive integer; got {k!r}")
+    return {"query": query, "k": min(k, SEARCH_DOCS_MAX_K)}
 
 
 # ----- write handlers -----
@@ -754,8 +777,12 @@ def _build_registry() -> dict[str, ToolSpec]:
             _schema({}, []), _h_build_errors,
         ),
         ToolSpec(
-            "search_docs", "read",
-            "RAG top-k search over the ECA epScript document store.",
+            SEARCH_DOCS_TOOL, "read",
+            "RAG top-k semantic search over the ECA epScript document store. "
+            "The corpus is KOREAN community material: write the query in "
+            "Korean (English queries lose recall — community jargon such as "
+            "음수 로케이션/피탄판정 has no English form); keep eps/API "
+            "identifiers (MoveLocation, EPD, dat names, ...) as-is.",
             _schema({"query": _STR, "k": _INT}, ["query"]), _h_search_docs,
         ),
         ToolSpec(
@@ -996,10 +1023,17 @@ class ToolLayer:
         runner_factory: Callable[[], Any] | None = None,
         memory: Any | None = None,
         map_info: Any | None = None,
+        rag_search: Callable[[str, int], Any] | None = None,
     ) -> None:
         self._bridge = bridge
         self._gate = gate or MutationGate()
         self._requests: dict[str, RequestState] = {}
+        # Optional/injectable RAG search callable (EUD-086):
+        # ``rag_search(query, k) -> list[dict]``. When present the
+        # ``search_docs`` READ tool returns top-k hits from the ECA store;
+        # absent makes the tool a clear ToolError (advisory shape, like
+        # map_info). app.py wires ``rag.search`` with the configured rag_db.
+        self._rag_search = rag_search
         # Optional/injectable map-info service (features/08). When present the
         # ``map_info`` READ tool digests the connected map's CHK through it;
         # absent makes ``map_info`` a clear ToolError (advisory shape, like
@@ -1157,6 +1191,12 @@ class ToolLayer:
         if spec.name == MAP_INFO_TOOL:
             return self._map_info_via_service(spec, args, state)
 
+        # search_docs (EUD-086) is a READ routed to the injected rag_search
+        # callable (in-process bge-m3; no bridge involvement at all). Routed
+        # here so the plain _dispatch path never sees it.
+        if spec.name == SEARCH_DOCS_TOOL:
+            return self._search_docs_via_rag(spec, args, state)
+
         # Mutation gate: the Nth mutating call WITHOUT an approved plan is blocked
         # and directs codex to propose_plan. Checked BEFORE incrementing anything.
         if spec.mutating and not self._gate.allow(
@@ -1281,6 +1321,36 @@ class ToolLayer:
         state.mutation_count += 1
         state.record_build_fix_attempt()
         return {"ok": result.ok, "errors": result.errors_as_dicts()}
+
+    def _search_docs_via_rag(
+        self, spec: ToolSpec, args: dict, state: RequestState
+    ) -> Any:
+        """Run one RAG search through the injected ``rag_search`` callable.
+
+        First line of defense: :func:`_h_search_docs` validates query/k
+        (ToolError -> nothing runs, nothing counted). A missing callable means
+        the layer was built without RAG (a clear ToolError codex can relay,
+        never a crash). ``rag.RagUnavailable`` (bad DB path, failed model
+        load) — and ANY other search failure (chromadb/model internals) — is
+        translated to ToolError: search is an advisory read and must never
+        kill the agent turn (the same degrade-don't-crash policy as the
+        engine's ``[reference context]`` section). A successful search counts
+        one action (READ: no mutation counter, no journal, no plan gate).
+        """
+        validated = _h_search_docs(_ProbeBridge(), args)
+        if self._rag_search is None:
+            raise ToolError(
+                "search_docs unavailable: no RAG search is configured "
+                "(the server wires rag.search with the rag_db path)."
+            )
+        try:
+            result = self._rag_search(validated["query"], validated["k"])
+        except RagUnavailable as exc:
+            raise ToolError(f"search_docs: RAG unavailable: {exc}") from exc
+        except Exception as exc:  # noqa: BLE001 - advisory read, degrade
+            raise ToolError(f"search_docs failed: {exc}") from exc
+        state.action_count += 1
+        return result
 
     def _map_info_via_service(
         self, spec: ToolSpec, args: dict, state: RequestState

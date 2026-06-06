@@ -283,20 +283,68 @@ def test_settings_get_routes_to_getset():
     assert ("getset", ("project", "OpenMapName"), {}) in bridge.calls
 
 
-def test_search_docs_exists_and_validates_without_bridge_call():
-    """search_docs is the RAG tool. RAG plumbing is not required here (stub ->
-    []), but the tool MUST exist and validate its args; it never hits the bridge."""
-    bridge, layer = make_layer()
-    out = layer.call("search_docs", {"query": "trigger loop", "k": 3}, fresh_state())
-    # No bridge call — RAG is a separate subsystem (stub allowed).
-    assert all(c[0] != "get" for c in bridge.calls)
-    assert isinstance(out, (list, dict, str))
+def test_search_docs_routes_to_injected_rag_search():
+    """search_docs is the RAG tool (EUD-086): routed to the injected callable,
+    never the bridge; the query/k pass through (k defaulting to 5)."""
+    calls = []
+
+    def fake_rag(query, k):
+        calls.append((query, k))
+        return [{"title": "t", "url": "u", "distance": 0.1, "text": "본문"}]
+
+    bridge = FakeBridge()
+    layer = ToolLayer(bridge, rag_search=fake_rag)
+    state = fresh_state()
+    out = layer.call("search_docs", {"query": "음수 로케이션", "k": 3}, state)
+    assert calls == [("음수 로케이션", 3)]
+    assert out[0]["text"] == "본문"
+    assert bridge.calls == []  # RAG is a separate subsystem
+    assert state.action_count == 1  # a READ: one action, no mutation
+    assert state.mutation_count == 0
+
+    layer.call("search_docs", {"query": "유닛 체력"}, state)
+    assert calls[-1] == ("유닛 체력", 5)  # default k
+
+
+def test_search_docs_clamps_k_and_rejects_bad_k():
+    calls = []
+    _bridge = FakeBridge()
+    layer = ToolLayer(_bridge, rag_search=lambda q, k: calls.append((q, k)) or [])
+    layer.call("search_docs", {"query": "디텍터", "k": 99}, fresh_state())
+    assert calls == [("디텍터", 10)]  # SEARCH_DOCS_MAX_K cap
+    for bad in (0, -1, "five", True):
+        with pytest.raises(ToolError):
+            layer.call("search_docs", {"query": "x", "k": bad}, fresh_state())
+    assert len(calls) == 1  # rejected args never reach the callable
+
+
+def test_search_docs_without_injection_is_tool_error():
+    """A layer built WITHOUT rag_search rejects clearly (advisory shape, like
+    map_info without a service) — never a silent empty result."""
+    _, layer = make_layer()
+    with pytest.raises(ToolError, match="search_docs unavailable"):
+        layer.call("search_docs", {"query": "trigger loop"}, fresh_state())
 
 
 def test_search_docs_rejects_missing_query():
     _, layer = make_layer()
     with pytest.raises(ToolError):
         layer.call("search_docs", {}, fresh_state())
+
+
+def test_search_docs_translates_rag_failure_to_tool_error():
+    """RagUnavailable (and any search crash) surfaces as a correctable
+    ToolError that counts nothing — search is an advisory read."""
+    from eud_agent.rag import RagUnavailable
+
+    def broken(query, k):
+        raise RagUnavailable("RAG DB directory not found: nope")
+
+    layer = ToolLayer(FakeBridge(), rag_search=broken)
+    state = fresh_state()
+    with pytest.raises(ToolError, match="RAG unavailable"):
+        layer.call("search_docs", {"query": "질문"}, state)
+    assert state.action_count == 0
 
 
 # --------------------------------------------------------------------------- #

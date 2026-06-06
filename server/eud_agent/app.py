@@ -446,9 +446,16 @@ def create_app(
         bridge, isomterrain_cmd=cfg.isomterrain_cmd, data_dir=cfg.data_dir
     )
 
+    # search_docs RAG seam (EUD-086): the same lazy in-process rag.search the
+    # system-prompt [reference context] uses — first call waits on the warmup
+    # singleton; a failed load surfaces as a ToolError at call time, never at
+    # boot (rules.md: RAG never gates readiness).
+    def _rag_search(query: str, k: int):
+        return rag.search(query, k, rag_db=cfg.rag_db)
+
     tool_layer = ToolLayer(
         bridge, journal_factory=_journal_factory, memory=live_memory,
-        map_info=map_info_service,
+        map_info=map_info_service, rag_search=_rag_search,
     )
     app.state.tool_layer = tool_layer
 

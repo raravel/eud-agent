@@ -166,6 +166,13 @@ def _tool_catalog_section(tool_layer) -> str:
         specs = []
     for s in specs:
         lines.append(f"- {s['name']}: {s.get('description', '')}")
+    # search_docs language rule (EUD-086): the ECA corpus is Korean; an
+    # English query loses recall on community jargon. Pinned here in addition
+    # to the tool description so the rule survives catalog truncation.
+    lines.append(
+        "NOTE: search_docs queries MUST be written in Korean (the document "
+        "store is Korean community material); keep eps/API identifiers as-is."
+    )
     return "\n".join(lines)
 
 
