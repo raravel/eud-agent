@@ -105,9 +105,9 @@ _BUILD_GUIDE = (
     "report the remaining errors to the user verbatim.\n"
     "- build_errors re-reads the LAST build's errors without building.\n"
     "- A failure whose message says no matching player exists (e.g. "
-    "\"연결맵에 조건에 맞는 플레이어가 없습니다\") is a MAP setup problem "
-    "(player slots/start locations), not an eps bug — report it instead of "
-    "rewriting code."
+    "\"연결맵에 조건에 맞는 플레이어가 없습니다\") is a MAP setup problem, "
+    "not an eps bug — fix it with player_setup (a Human controller AND a "
+    "start location for at least one player), then rebuild."
 )
 
 # Map-location workflow guidance (features/08+09). Grounded in the ECA corpus:
@@ -127,7 +127,11 @@ _MAP_LOCATION_GUIDE = (
     "Bring; locations flagged 'inverted' in map_info are these.\n"
     "- location_write edits the real map file (backed up + reviewable in the "
     "changeset); prefer reusing an existing suitable location over adding "
-    "duplicates."
+    "duplicates.\n"
+    "- Player slots: eudplib only compiles when the map has at least one "
+    "HUMAN player WITH a start location. Check map_info(mode=players); fix "
+    "gaps with player_setup — action=controller (player, controller=human) "
+    "and action=start (player, tileX/tileY). player is 1-based (1-8)."
 )
 
 # Triage rules surfaced in the system prompt (features/05, mechanical not advisory).

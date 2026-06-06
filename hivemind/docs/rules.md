@@ -43,14 +43,15 @@ Violations of the EDITOR-* and LUANET-* rules crash or corrupt EUD Editor 3 at r
 - ALWAYS give every subprocess an explicit stdin (the prompt pipe, or `subprocess.DEVNULL`) — an inherited console-less stdin makes codex hang until timeout.
 - Treat codex stdout as noisy: extract fenced code blocks; if none, fail with the raw output in the error message rather than applying noise to the editor.
 
-## Map file writes (location_write, features/09)
+## Map file writes (location_write / player_setup, features/09)
 
 - NEVER save a map with location auto-defragmentation: ALWAYS pass `autoDefragmentLocations=false` (and `lockAnywhere=true`) to `MapFile::save` — defragmenting RENUMBERS MRGN slots and silently re-points every existing trigger's location reference. Location ids must stay stable across edits; "delete" = zero the slot in place.
 - NEVER edit location #64 (Anywhere) — engine-defined, protected at the CLI.
 - ALWAYS take a full-file backup BEFORE any map write (`data_dir/map_backups`, timestamped) — it is the journal's rollback source (`restore_map_backup`, temp + `os.replace`).
 - ALWAYS refuse the write while the map file is open elsewhere (CreateFileW no-share probe → sharing violation = SCMDraft has it) or while STATUS reports `compiling=true` (the build reads OpenMapName).
 - Location NAME bytes follow the map's OWN string-table encoding (`STRx` → utf-8; existing non-utf-8 strings → cp949; ambiguous → cp949). Pass them through the ops file as raw bytes — never re-encode in the CLI.
-- The locedit ops apply all-or-nothing: any invalid op aborts BEFORE save. Results are verified by re-digesting the map after the write.
+- The locedit/playeredit ops apply all-or-nothing: any invalid op aborts BEFORE save. Results are verified by re-digesting the map after the write.
+- player_setup (EUD-089) edits start-location units (214) + OWNR controllers through the SAME rails (backup, lock probe, compiling guard, journal/rollback); its save also keeps `autoDefragmentLocations=false` — a player edit must never renumber locations as a side effect.
 
 ## Server and panel
 

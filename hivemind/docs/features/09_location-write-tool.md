@@ -123,9 +123,39 @@ tool descriptions alone.
 - User-assisted E2E remaining: open an edited map in SCMDraft 2 and visually
   confirm the location + Korean name rendering.
 
+## player_setup (EUD-089 — same rails, playeredit CLI)
+
+A eudplib build fails with "연결맵에 조건에 맞는 플레이어가 없습니다: 플레이어
+종류 Human" when the connected map has no HUMAN slot with a start location —
+`EUDLoopPlayer("Human")` reads the CHK's OWNR + start-location units. The
+`player_setup` tool closes that gap through the SAME service/rails/journal
+path as `location_write`:
+
+- CLI: `IsomTerrain.exe playeredit <map.scx> <ops.txt>` (MapGenCli.cpp, same
+  all-or-nothing + in-place save, `autoDefragmentLocations=false` retained so
+  a player edit can never renumber locations as a side effect). Ops (slots
+  0-based, px coords): `start|slot|xc|yc` (move the slot's start-location
+  unit 214, or add one), `delstart|slot`, `controller|slot|<name>` (OWNR+IOWN
+  via `setSlotType`, names `human|computer|rescuable|neutral|inactive|closed`).
+- Tool params: `action` enum `start|delstart|controller` + `player` (1-based
+  1-8 = P1..P8, matching the digest labels) required; `tileX`/`tileY` (start;
+  the service converts to the TILE-CENTER px like the editor); `controller`
+  enum (controller action).
+- Returns `{ok, action, player, mapPath, backupPath, players[],
+  startLocations[]}` (post-edit re-digest).
+- Journal: same backup-pointer entry (`_rollback_location` restores the
+  bytes); changeset summaries "P1 controller = human in demo.scx" / "P1 start
+  location placed at tile (4,8) in demo.scx"; target `player:<action> P<n>`.
+- Prompt: `[map locations]` carries the Human-player requirement +
+  check-then-fix workflow (`map_info(mode=players)` → `player_setup`); the
+  `[build]` section routes the "no matching player" build failure here.
+- Verified with the REAL exe (2026-06-06): test.scx copy — controller human
+  (P1/P2) + computer (P5), start add/move/delstart, bad-slot/missing-start
+  refusals pre-save, digest round-trip after every step.
+
 ## Out of scope
 
-- Unit/terrain/force writes (same locedit pattern when wanted).
+- General unit/terrain/force writes (same playeredit pattern when wanted).
 - Auto-expanding an original-SC 64-slot MRGN to 255 (`addLocation` errors
   clearly; expansion changes the map version — a separate decision).
 - Multi-op batching per tool call (one op = one journal entry = one reviewable

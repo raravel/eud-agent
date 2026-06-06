@@ -105,7 +105,12 @@ from .bridge_io import (
     _require_numeric_value,
     _require_pathlike,
 )
-from .chk_info import LOCATION_ACTIONS, MapInfoError
+from .chk_info import (
+    LOCATION_ACTIONS,
+    PLAYER_ACTIONS,
+    PLAYER_CONTROLLERS,
+    MapInfoError,
+)
 from .memory import CONTENT_CAP_BYTES, MEMORY_FILES
 from .rag import RagUnavailable  # light import (heavy deps load lazily)
 
@@ -132,6 +137,13 @@ _MAP_INFO_MODES = ("summary", "locations", "units", "players")
 # Location write tool (features/09). A REAL write: plan-gated, budgeted, and
 # journaled (snapshot = the service's full-file map backup; reject restores it).
 LOCATION_TOOL = "location_write"
+
+# Player setup tool (EUD-089). Same write shape as location_write (plan-gated,
+# budgeted, journaled with the full-file map backup) routed through the SAME
+# MapInfoService — it edits start-location units (214) + OWNR controllers,
+# which eudplib needs ("연결맵에 조건에 맞는 플레이어가 없습니다" = no Human
+# slot with a start location).
+PLAYER_TOOL = "player_setup"
 
 # RAG search tool (EUD-086). Routed to the injected ``rag_search`` callable
 # (in-process bge-m3 over the ECA store; no bridge involvement). The corpus is
@@ -721,6 +733,51 @@ def _h_location_write(bridge, args):
     }
 
 
+def _h_player_setup(bridge, args):
+    """Validate ``player_setup`` args; the service call is routed in ``call``.
+
+    First line of defense (EUD-089): the ``action`` enum, the 1-based player
+    range, and the per-action required fields are checked here (the service
+    re-validates as the second line; the playeredit CLI is the third).
+    Coordinates stay in TILE units — the service converts to px (tile center).
+    No bridge call.
+    """
+    action = str(_req(args, "action"))
+    if action not in PLAYER_ACTIONS:
+        raise ToolError(
+            f"player_setup action must be one of "
+            f"{', '.join(PLAYER_ACTIONS)}; got {action!r}"
+        )
+    player = _as_bridge_error_tool_error(
+        lambda: _require_nonneg_int(_req(args, "player"), "player")
+    )
+    if not 1 <= player <= 8:
+        raise ToolError(
+            f"player_setup: 'player' is 1-based (1-8 = P1..P8), got {player}"
+        )
+    tile = {}
+    if action == "start":
+        for key in ("tileX", "tileY"):
+            tile[key] = _as_bridge_error_tool_error(
+                lambda k=key: _require_nonneg_int(_req(args, k), k)
+            )
+    controller = ""
+    if action == "controller":
+        controller = str(_req(args, "controller"))
+        if controller not in PLAYER_CONTROLLERS:
+            raise ToolError(
+                f"player_setup controller must be one of "
+                f"{', '.join(PLAYER_CONTROLLERS)}; got {controller!r}"
+            )
+    return {
+        "action": action,
+        "player": player,
+        "tile_x": tile.get("tileX", 0),
+        "tile_y": tile.get("tileY", 0),
+        "controller": controller,
+    }
+
+
 # ----- flow handler -----
 def _h_propose_plan(bridge, args):
     """End the turn for user review (features/05). No bridge call; no mutation.
@@ -977,6 +1034,33 @@ def _build_registry() -> dict[str, ToolSpec]:
                 ["action"],
             ),
             _h_location_write,
+        ),
+        ToolSpec(
+            PLAYER_TOOL, "write",
+            "Set up the connected map's PLAYERS in place (saved to the "
+            "OpenMapName .scx). action: start (player + tileX/tileY — place "
+            "or move the player's start-location unit) | delstart (player) | "
+            "controller (player + controller human/computer/rescuable/"
+            "neutral/inactive/closed — the OWNR slot byte). player is 1-based "
+            "(1-8 = P1..P8). eudplib requires at least one HUMAN player WITH "
+            "a start location or the build fails ('연결맵에 조건에 맞는 "
+            "플레이어가 없습니다'); check map_info(mode=players) first. A "
+            "full-file backup is taken before every edit.",
+            _schema(
+                {
+                    "action": {
+                        "type": "string", "enum": list(PLAYER_ACTIONS),
+                    },
+                    "player": _INT,
+                    "tileX": _INT,
+                    "tileY": _INT,
+                    "controller": {
+                        "type": "string", "enum": list(PLAYER_CONTROLLERS),
+                    },
+                },
+                ["action", "player"],
+            ),
+            _h_player_setup,
         ),
         ToolSpec(
             MEMORY_TOOL, "write",
@@ -1258,6 +1342,11 @@ class ToolLayer:
         if spec.name == LOCATION_TOOL:
             return self._location_write_via_service(spec, args, state, journal)
 
+        # player_setup (EUD-089) shares location_write's shape exactly: same
+        # service, same backup-as-snapshot journal contract, same gate order.
+        if spec.name == PLAYER_TOOL:
+            return self._player_setup_via_service(spec, args, state, journal)
+
         # build_run via the runner pipeline (EUD-057). The gate/budget above have
         # already passed (build_run is a write -> it counts as an action/mutation
         # and obeys the plan gate). The self-fix budget is a SEPARATE cap: the 4th
@@ -1468,6 +1557,55 @@ class ToolLayer:
                 "locationId": result.get(
                     "locationId", validated.get("location_id", 0)
                 ),
+            }
+            journal.record(spec.name, args, before, after)
+
+        state.action_count += 1
+        state.mutation_count += 1
+        return result
+
+    def _player_setup_via_service(
+        self,
+        spec: ToolSpec,
+        args: dict,
+        state: RequestState,
+        journal: Any | None,
+    ) -> Any:
+        """Apply one player edit through the injected MapInfoService (EUD-089).
+
+        Mirrors :meth:`_location_write_via_service` exactly: validate args
+        (ToolError -> nothing runs, nothing counted) -> service call (compiling
+        guard -> lock probe -> full-file backup -> playeredit, which aborts
+        pre-save on any bad op) -> journal the entry with the backup pointer as
+        ``before`` (rollback = restore the backed-up bytes — the same
+        ``journal._rollback_location`` path).
+        """
+        validated = _h_player_setup(_ProbeBridge(), args)
+        service = self._map_info
+        if service is None:
+            raise ToolError(
+                "player_setup unavailable: no map service is configured "
+                "(set ISOMTERRAIN_CMD or the agent.cfg 'isomterrain_cmd' key)."
+            )
+        action = validated.pop("action")
+        try:
+            result = service.player_setup(action, **validated)
+        except MapInfoError as exc:
+            raise ToolError(str(exc)) from exc
+        except (BridgeError, BridgeBusy) as exc:
+            raise ToolError(str(exc)) from exc
+
+        if journal is not None:
+            before = {
+                "mapPath": result.get("mapPath", ""),
+                "backupPath": result.get("backupPath", ""),
+            }
+            after = {
+                "action": action,
+                "player": result.get("player", f"P{validated['player']}"),
+                "controller": validated.get("controller", ""),
+                "tileX": validated.get("tile_x", 0),
+                "tileY": validated.get("tile_y", 0),
             }
             journal.record(spec.name, args, before, after)
 

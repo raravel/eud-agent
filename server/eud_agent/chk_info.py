@@ -77,6 +77,13 @@ TILE_PX = 32
 # location_write actions (tool enum value -> locedit op verb).
 LOCATION_ACTIONS = {"add": "add", "set": "set", "rename": "rename", "delete": "del"}
 
+# player_setup actions (tool enum value -> playeredit op verb, EUD-089) and the
+# controller names the playeredit CLI accepts (OWNR+IOWN via setSlotType).
+PLAYER_ACTIONS = {"start": "start", "delstart": "delstart",
+                  "controller": "controller"}
+PLAYER_CONTROLLERS = ("human", "computer", "rescuable", "neutral",
+                      "inactive", "closed")
+
 _TILESET_NAMES = (
     "badlands", "platform", "installation", "ashworld",
     "jungle", "desert", "ice", "twilight",
@@ -678,7 +685,8 @@ class MapInfoService:
                               left, top, right, bottom,
                               invert_x=invert_x, invert_y=invert_y)
         backup_path = self._backup_map(map_path)
-        stdout = self._run_locedit(map_path, line)
+        stdout = self._run_map_edit("locedit", map_path, line,
+                                    tool="location_write")
 
         result: dict = {
             "ok": True,
@@ -695,6 +703,94 @@ class MapInfoService:
         try:
             digest = digest_chk(self._extract_chk(map_path))
             result["locations"] = digest["locations"]
+        except MapInfoError as exc:
+            result["verifyWarning"] = str(exc)
+        return result
+
+    def player_setup(
+        self,
+        action: str,
+        *,
+        player: int = 0,
+        tile_x: int = 0,
+        tile_y: int = 0,
+        controller: str = "",
+    ) -> dict:
+        """Apply ONE player edit to the connected map IN PLACE (EUD-089).
+
+        ``action`` ∈ ``start|delstart|controller``; ``player`` is 1-based
+        (1..8 = P1..P8, matching the digest's "P1" labels — the playeredit CLI
+        speaks 0-based slots). ``start`` places (or moves) the player's
+        start-location unit (type 214) at the CENTER of the given tile;
+        ``controller`` writes the OWNR+IOWN slot byte (``human`` is what
+        eudplib's EUDLoopPlayer("Human") requires, together with a start
+        location). Safety rails are IDENTICAL to :meth:`location_write`:
+        editor not compiling -> map not locked -> full-file backup ->
+        ``IsomTerrain.exe playeredit`` (all-or-nothing, aborts before save).
+        Returns the applied op, the post-edit players + start-location list,
+        and the backup path the journal stores for changeset rollback.
+        """
+        op = PLAYER_ACTIONS.get(action)
+        if op is None:
+            raise MapInfoError(
+                f"player_setup action must be one of "
+                f"{', '.join(PLAYER_ACTIONS)}; got {action!r}"
+            )
+        if not 1 <= player <= 8:
+            raise MapInfoError(
+                f"player_setup: player must be 1-8 (P1..P8), got {player}"
+            )
+        if op == "controller" and controller not in PLAYER_CONTROLLERS:
+            raise MapInfoError(
+                f"player_setup controller must be one of "
+                f"{', '.join(PLAYER_CONTROLLERS)}; got {controller!r}"
+            )
+        if op == "start" and (tile_x < 0 or tile_y < 0):
+            raise MapInfoError(
+                f"player_setup start: tileX/tileY must be >= 0, "
+                f"got ({tile_x},{tile_y})"
+            )
+        map_path = self._resolve_map_path()
+        if self._editor_compiling():
+            raise MapInfoError(
+                "the editor is building right now; retry after the build "
+                "finishes (writing the map mid-build risks a corrupt read)."
+            )
+        if self._lock_probe(str(map_path)):
+            raise MapInfoError(
+                f"map file is open in another program: {map_path} "
+                "(close it in SCMDraft and retry)."
+            )
+
+        slot = player - 1
+        if op == "start":
+            # Tile center, like the editor places start locations.
+            px = (tile_x * TILE_PX + TILE_PX // 2,
+                  tile_y * TILE_PX + TILE_PX // 2)
+            line = f"start|{slot}|{px[0]}|{px[1]}\n".encode()
+        elif op == "delstart":
+            line = f"delstart|{slot}\n".encode()
+        else:  # controller
+            line = f"controller|{slot}|{controller}\n".encode()
+        backup_path = self._backup_map(map_path)
+        self._run_map_edit("playeredit", map_path, line, tool="player_setup")
+
+        result: dict = {
+            "ok": True,
+            "action": action,
+            "player": f"P{player}",
+            "mapPath": str(map_path),
+            "backupPath": str(backup_path),
+        }
+        # Post-edit verification: re-digest and return the live player slots +
+        # start locations so codex sees the applied state. The edit ALREADY
+        # saved — a verify failure degrades to a warning (same as locations).
+        try:
+            digest = digest_chk(self._extract_chk(map_path))
+            result["players"] = digest["players"]
+            result["startLocations"] = [
+                u for u in digest["units"] if u.get("typeId") == 214
+            ]
         except MapInfoError as exc:
             result["verifyWarning"] = str(exc)
         return result
@@ -796,22 +892,30 @@ class MapInfoService:
         backup.write_bytes(map_path.read_bytes())
         return backup
 
-    def _run_locedit(self, map_path: Path, ops_line: bytes) -> str:
-        """Spawn ``IsomTerrain.exe locedit <map> <ops>`` (rules.md subprocess)."""
+    def _run_map_edit(
+        self, subcommand: str, map_path: Path, ops_line: bytes, *, tool: str
+    ) -> str:
+        """Spawn ``IsomTerrain.exe <locedit|playeredit> <map> <ops>``.
+
+        Shared by location_write and player_setup (EUD-089) — the rules.md
+        subprocess shape (explicit stdin, captured output, absolute exe, cwd,
+        timeout) and the error translation are identical; only the subcommand
+        and the tool name in the messages differ.
+        """
         exe = self._isomterrain_cmd
         if not exe or not Path(exe).is_file():
             raise MapInfoError(
-                "location_write unavailable: IsomTerrain.exe not found "
+                f"{tool} unavailable: IsomTerrain.exe not found "
                 f"(configured: {exe or '<unset>'}). Set the ISOMTERRAIN_CMD "
                 "env var or the agent.cfg 'isomterrain_cmd' key to the built "
                 "isom-poc CLI."
             )
-        with tempfile.TemporaryDirectory(prefix="eud_locedit_") as tmp:
+        with tempfile.TemporaryDirectory(prefix=f"eud_{subcommand}_") as tmp:
             ops_path = Path(tmp) / "ops.txt"
             ops_path.write_bytes(ops_line)  # raw bytes; no BOM, no re-encode
             try:
                 proc = self._spawn(
-                    [exe, "locedit", str(map_path), str(ops_path)],
+                    [exe, subcommand, str(map_path), str(ops_path)],
                     stdin=subprocess.DEVNULL,
                     capture_output=True,
                     text=True,
@@ -822,14 +926,15 @@ class MapInfoService:
                 )
             except subprocess.TimeoutExpired as exc:
                 raise MapInfoError(
-                    f"IsomTerrain.exe locedit did not finish within "
+                    f"IsomTerrain.exe {subcommand} did not finish within "
                     f"{self._subprocess_timeout:.0f}s (process killed)."
                 ) from exc
             stdout = (getattr(proc, "stdout", "") or "").strip()
             stderr = (getattr(proc, "stderr", "") or "").strip()
             if getattr(proc, "returncode", 1) != 0:
                 detail = stderr or stdout or "no output"
-                raise MapInfoError(f"location edit failed: {detail}")
+                kind = "location" if subcommand == "locedit" else "player"
+                raise MapInfoError(f"{kind} edit failed: {detail}")
             return stdout
 
     def _resolve_map_path(self) -> Path:

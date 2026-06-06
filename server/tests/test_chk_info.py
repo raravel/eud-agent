@@ -452,6 +452,9 @@ def make_locedit_service(tmp_path, *, returncode=0, stderr="",
         if argv[1] == "locedit":
             recorded["ops"].append(_P(argv[3]).read_bytes())
             p.stdout = "OK add #1\nSAVED 1 ops"
+        elif argv[1] == "playeredit":
+            recorded["ops"].append(_P(argv[3]).read_bytes())
+            p.stdout = "OK controller P1 = human\nSAVED 1 ops"
         elif argv[1] == "chk":
             _P(argv[3]).write_bytes(build_fixture_chk())
         return p
@@ -607,6 +610,66 @@ def test_location_write_cli_failure_surfaces_stderr(tmp_path):
     assert map_path.read_bytes() == b"ORIGINAL-MAP-BYTES"
 
 
+# --------------------------------------------------------------------------- #
+# player_setup service (EUD-089): same rails as location_write, playeredit CLI.
+# --------------------------------------------------------------------------- #
+
+
+def test_player_setup_ops_lines_backup_and_verify(tmp_path):
+    svc, map_path, recorded = make_locedit_service(tmp_path)
+    out = svc.player_setup("controller", player=1, controller="human")
+    svc.player_setup("start", player=2, tile_x=10, tile_y=20)
+    svc.player_setup("delstart", player=5)
+    # 1-based player -> 0-based slot; start coords land on the TILE CENTER px.
+    assert recorded["ops"] == [
+        b"controller|0|human\n",
+        b"start|1|336|656\n",
+        b"delstart|4\n",
+    ]
+    assert out["ok"] is True and out["player"] == "P1"
+    assert out["mapPath"] == str(map_path)
+    # Full-file backup holding the PRE-edit bytes (the rollback source).
+    backup = Path(out["backupPath"])
+    assert backup.is_file() and backup.read_bytes() == b"ORIGINAL-MAP-BYTES"
+    # Post-edit verification: players + start locations from the re-digest.
+    assert out["players"][0]["controller"] == "Human (Open Slot)"
+    assert len(out["startLocations"]) == 2  # fixture: P1 + P2 start points
+
+
+def test_player_setup_arg_validation(tmp_path):
+    svc, _, recorded = make_locedit_service(tmp_path)
+    with pytest.raises(MapInfoError, match="action must be one of"):
+        svc.player_setup("explode", player=1)
+    with pytest.raises(MapInfoError, match="player must be 1-8"):
+        svc.player_setup("delstart", player=0)
+    with pytest.raises(MapInfoError, match="player must be 1-8"):
+        svc.player_setup("start", player=9, tile_x=1, tile_y=1)
+    with pytest.raises(MapInfoError, match="controller must be one of"):
+        svc.player_setup("controller", player=1, controller="overlord")
+    with pytest.raises(MapInfoError, match="must be >= 0"):
+        svc.player_setup("start", player=1, tile_x=-1, tile_y=0)
+    assert recorded["ops"] == []  # nothing reached the CLI
+
+
+def test_player_setup_refuses_compiling_and_locked_map(tmp_path):
+    svc, *_ = make_locedit_service(tmp_path, compiling="True")
+    with pytest.raises(MapInfoError, match="building right now"):
+        svc.player_setup("controller", player=1, controller="human")
+    svc, *_ = make_locedit_service(tmp_path, lock_probe=lambda p: True)
+    with pytest.raises(MapInfoError, match="open in another program"):
+        svc.player_setup("controller", player=1, controller="human")
+
+
+def test_player_setup_cli_failure_surfaces_stderr(tmp_path):
+    svc, map_path, _ = make_locedit_service(
+        tmp_path, returncode=1, stderr="no start location for P4"
+    )
+    with pytest.raises(MapInfoError, match="no start location for P4"):
+        svc.player_setup("delstart", player=4)
+    # The map is untouched (playeredit aborts pre-save; the fake wrote nothing).
+    assert map_path.read_bytes() == b"ORIGINAL-MAP-BYTES"
+
+
 def test_detect_str_encoding_variants():
     assert detect_str_encoding(build_fixture_chk()) == "cp949"  # Korean STR
     ascii_only = sec("STR ", str_section([b"abc"]))
@@ -757,6 +820,137 @@ def test_location_write_journal_entry_and_rollback_restores_backup(tmp_path):
     result = journal.rollback(all=True)
     assert result["items"][0]["ok"] is True
     assert map_file.read_bytes() == b"ORIGINAL-MAP"
+
+
+# --------------------------------------------------------------------------- #
+# player_setup tool routing + journal/changeset (EUD-089).
+# --------------------------------------------------------------------------- #
+
+
+class FakePlayerService:
+    def __init__(self, *, error: MapInfoError | None = None):
+        self.calls: list[tuple] = []
+        self.error = error
+
+    def player_setup(self, action, **kwargs):
+        self.calls.append((action, kwargs))
+        if self.error:
+            raise self.error
+        return {
+            "ok": True, "action": action, "player": f"P{kwargs['player']}",
+            "mapPath": "C:/maps/demo.scx", "backupPath": "C:/bk/demo.bak",
+            "players": [], "startLocations": [],
+        }
+
+
+def test_player_setup_is_a_registered_write_tool():
+    assert "player_setup" in WRITE_TOOLS
+    layer = ToolLayer(object())
+    spec = next(s for s in layer.tool_specs() if s["name"] == "player_setup")
+    assert spec["parameters"]["required"] == ["action", "player"]
+    assert set(spec["parameters"]["properties"]["action"]["enum"]) == {
+        "start", "delstart", "controller",
+    }
+    assert "human" in spec["parameters"]["properties"]["controller"]["enum"]
+
+
+def test_player_setup_routes_and_counts_action_and_mutation():
+    svc = FakePlayerService()
+    layer = ToolLayer(object(), map_info=svc)
+    state = RequestState(request_id="r1")
+    out = layer.call("player_setup", {
+        "action": "start", "player": 3, "tileX": 5, "tileY": 6,
+    }, state)
+    assert out["player"] == "P3"
+    assert svc.calls == [("start", {
+        "player": 3, "tile_x": 5, "tile_y": 6, "controller": "",
+    })]
+    assert state.action_count == 1 and state.mutation_count == 1
+
+
+def test_player_setup_invalid_args_rejected_before_the_service():
+    svc = FakePlayerService()
+    layer = ToolLayer(object(), map_info=svc)
+    state = RequestState(request_id="r1")
+    with pytest.raises(ToolError, match="action must be one of"):
+        layer.call("player_setup", {"action": "nuke", "player": 1}, state)
+    with pytest.raises(ToolError, match="1-based"):
+        layer.call("player_setup", {"action": "delstart", "player": 0}, state)
+    with pytest.raises(ToolError, match="tileX"):
+        layer.call("player_setup", {"action": "start", "player": 1}, state)
+    with pytest.raises(ToolError, match="controller must be one of"):
+        layer.call("player_setup", {"action": "controller", "player": 1,
+                                    "controller": "zerg"}, state)
+    with pytest.raises(ToolError, match="missing required argument"):
+        layer.call("player_setup", {"action": "delstart"}, state)
+    assert svc.calls == [] and state.action_count == 0
+
+
+def test_player_setup_without_service_or_on_error_is_a_tool_error():
+    state = RequestState(request_id="r1")
+    with pytest.raises(ToolError, match="player_setup unavailable"):
+        ToolLayer(object()).call(
+            "player_setup", {"action": "delstart", "player": 1}, state
+        )
+    svc = FakePlayerService(error=MapInfoError("the editor is building"))
+    layer = ToolLayer(object(), map_info=svc)
+    with pytest.raises(ToolError, match="building"):
+        layer.call("player_setup", {"action": "delstart", "player": 1}, state)
+    assert state.action_count == 0
+
+
+def test_player_setup_journal_entry_and_rollback_restores_backup(tmp_path):
+    map_file = tmp_path / "demo.scx"
+    map_file.write_bytes(b"EDITED-MAP")
+    backup = tmp_path / "demo.scx.bak"
+    backup.write_bytes(b"ORIGINAL-MAP")
+
+    class _Svc(FakePlayerService):
+        def player_setup(self, action, **kwargs):
+            self.calls.append((action, kwargs))
+            return {
+                "ok": True, "action": action, "player": f"P{kwargs['player']}",
+                "mapPath": str(map_file), "backupPath": str(backup),
+                "players": [], "startLocations": [],
+            }
+
+    journal = Journal(data_dir=str(tmp_path / "data"), request_id="rq",
+                      bridge=object())
+    layer = ToolLayer(object(), map_info=_Svc())
+    state = RequestState(request_id="rq")
+    layer.call("player_setup", {"action": "controller", "player": 1,
+                                "controller": "human"}, state, journal=journal)
+    layer.call("player_setup", {"action": "start", "player": 1,
+                                "tileX": 4, "tileY": 8}, state,
+               journal=journal)
+
+    assert len(journal.entries) == 2
+    assert journal.entries[0].before["backupPath"] == str(backup)
+    items = journal.changeset()["items"]
+    # Human summaries (the EUD-087 display contract extends to player edits).
+    assert items[0]["category"] == "map"
+    assert "player:controller P1" in items[0]["target"]
+    assert items[0]["old"] == ""
+    assert items[0]["new"] == "P1 controller = human in demo.scx"
+    assert items[1]["new"] == "P1 start location placed at tile (4,8) in demo.scx"
+
+    result = journal.rollback(all=True)
+    assert all(r["ok"] for r in result["items"])
+    assert map_file.read_bytes() == b"ORIGINAL-MAP"
+
+
+def test_system_prompt_carries_player_setup_guide(tmp_path):
+    from eud_agent.engine import build_system_prompt
+
+    sp = build_system_prompt(
+        "anything",
+        tool_layer=ToolLayer(object()),
+        bridge=object(),
+        rag_db=str(tmp_path / "no-rag"),
+    )
+    # [map locations] points codex at the Human-player requirement + the tool.
+    assert "player_setup" in sp
+    assert "map_info(mode=players)" in sp
 
 
 # --------------------------------------------------------------------------- #

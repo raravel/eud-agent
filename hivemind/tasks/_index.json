@@ -1487,15 +1487,15 @@
       ]
     },
     "EUD-089-149c": {
-      "status": "pending",
+      "status": "done",
       "priority": "medium",
       "type": "task",
       "parent": null,
       "depends_on": [],
       "title": "player_setup tool: start locations + OWNR controllers via IsomTerrain playeredit",
       "updated": "2026-06-06",
-      "completed_at": null,
-      "path": "active/EUD-089-149c.md",
+      "completed_at": "2026-06-06T20:12:40.844055",
+      "path": "done/EUD-089-149c.md",
       "scope": [
         "server/**",
         "hivemind/docs/**"

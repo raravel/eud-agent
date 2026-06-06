@@ -570,26 +570,40 @@ class Journal:
 
     @staticmethod
     def _map_item(e: JournalEntry) -> dict[str, Any]:
-        """A ``location_write`` changeset item (features/09; display fix EUD-087).
+        """A map-write changeset item (features/09; display fix EUD-087).
 
-        The journal entry's ``before`` is rollback BOOKKEEPING ({mapPath,
-        backupPath} — exactly what ``_rollback_location`` needs), NOT a
-        reviewable previous state; rendered verbatim by the panel's generic
-        old → new row it read as a nonsense diff. The item carries a human
-        summary instead: ``old`` is empty (the pre-edit state lives in the
-        backup file) and ``new`` describes the applied edit. The entry itself
-        is unchanged — rollback keys stay intact.
+        Covers ``location_write`` AND ``player_setup`` (EUD-089). The journal
+        entry's ``before`` is rollback BOOKKEEPING ({mapPath, backupPath} —
+        exactly what ``_rollback_location`` needs), NOT a reviewable previous
+        state; rendered verbatim by the panel's generic old → new row it read
+        as a nonsense diff. The item carries a human summary instead: ``old``
+        is empty (the pre-edit state lives in the backup file) and ``new``
+        describes the applied edit. The entry itself is unchanged — rollback
+        keys stay intact.
         """
         action = e.after.get("action", "")
-        name = e.after.get("name", "")
-        loc_id = e.after.get("locationId", 0)
-        label = f"location #{loc_id}" + (f" '{name}'" if name else "")
-        summary = {
-            "add": f"{label} created",
-            "set": f"{label} bounds changed",
-            "rename": f"{label} renamed",
-            "delete": f"{label} deleted",
-        }.get(action, f"{label} ({action})")
+        if e.tool == "player_setup":
+            player = e.after.get("player", "P?")
+            summary = {
+                "start": (
+                    f"{player} start location placed at tile "
+                    f"({e.after.get('tileX', 0)},{e.after.get('tileY', 0)})"
+                ),
+                "delstart": f"{player} start location removed",
+                "controller": (
+                    f"{player} controller = {e.after.get('controller', '')}"
+                ),
+            }.get(action, f"{player} ({action})")
+        else:
+            name = e.after.get("name", "")
+            loc_id = e.after.get("locationId", 0)
+            label = f"location #{loc_id}" + (f" '{name}'" if name else "")
+            summary = {
+                "add": f"{label} created",
+                "set": f"{label} bounds changed",
+                "rename": f"{label} renamed",
+                "delete": f"{label} deleted",
+            }.get(action, f"{label} ({action})")
         map_name = Path(e.before.get("mapPath", "")).name
         if map_name:
             summary += f" in {map_name}"
@@ -642,9 +656,10 @@ class Journal:
         # memory_write inverses target the ProjectMemory STORE, not the bridge.
         if e.tool == "memory_write":
             return self._rollback_memory(e)
-        # location_write inverses target the MAP FILE on disk (features/09):
-        # restore the full-file backup the service took before the edit.
-        if e.tool == "location_write":
+        # location_write/player_setup inverses target the MAP FILE on disk
+        # (features/09, EUD-089): restore the full-file backup the service
+        # took before the edit.
+        if e.tool in ("location_write", "player_setup"):
             return self._rollback_location(e)
         try:
             op = self._inverse_op(e)
@@ -681,15 +696,16 @@ class Journal:
         return {"id": e.id, "ok": True}
 
     def _rollback_location(self, e: JournalEntry) -> dict[str, Any]:
-        """Inverse of a ``location_write``: restore the backed-up map bytes.
+        """Inverse of a map write (location_write/player_setup): restore the
+        backed-up map bytes.
 
         ``before`` carries ``{mapPath, backupPath}`` (recorded by the tool
         layer from the service result). The restore refuses while the map is
         locked (same share probe as the write path) and replaces atomically —
         see :func:`chk_info.restore_map_backup`. NOTE: restoring rolls the map
-        back to the state BEFORE that edit, which also undoes any LATER
-        location_write in the same request — rollback runs in reverse seq
-        order, so a full rollback lands on the original map.
+        back to the state BEFORE that edit, which also undoes any LATER map
+        write in the same request — rollback runs in reverse seq order, so a
+        full rollback lands on the original map.
         """
         # Lazy import: journal <- chk_info only on this path (tools.py already
         # imports chk_info; keep module-load graphs unchanged).
@@ -699,7 +715,7 @@ class Journal:
         backup_path = e.before.get("backupPath", "")
         if not map_path or not backup_path:
             return {"id": e.id, "ok": False,
-                    "error": "cannot roll back location_write: no backup recorded"}
+                    "error": f"cannot roll back {e.tool}: no backup recorded"}
         try:
             restore_map_backup(map_path, backup_path)
         except MapInfoError as exc:
@@ -848,8 +864,8 @@ def _category_for(entry: JournalEntry) -> str:
     tool = entry.tool
     if tool == "memory_write":
         return "memory"
-    if tool == "location_write":
-        return "map"  # flat item; the panel renders tool/target/old/new
+    if tool in ("location_write", "player_setup"):
+        return "map"  # human-summary item via _map_item
     if tool in _FILE_TOOLS:
         return "file"
     if tool == "dat_set":
@@ -873,6 +889,8 @@ def _target_for(tool: str, args: dict) -> str:
     if tool == "location_write":
         subject = args.get("name") or f"#{args.get('locationId', '?')}"
         return f"location:{args.get('action', '')} {subject}"
+    if tool == "player_setup":
+        return f"player:{args.get('action', '')} P{args.get('player', '?')}"
     if tool in _FILE_TOOLS:
         return str(args.get("path", ""))
     if tool in ("dat_set", "xdat_set"):
