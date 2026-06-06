@@ -1297,15 +1297,15 @@
       "scope": []
     },
     "EUD-078-3b29": {
-      "status": "pending",
+      "status": "done",
       "priority": "high",
       "type": "task",
       "parent": "EUD-076-d2c2",
       "depends_on": [],
       "title": "ProjectMemory store module (paths, IO, episodes, section renderer)",
       "updated": "2026-06-06",
-      "completed_at": null,
-      "path": "active/EUD-078-3b29.md",
+      "completed_at": "2026-06-06T13:52:41.249968",
+      "path": "done/EUD-078-3b29.md",
       "scope": [
         "server/eud_agent/memory.py",
         "server/tests/test_memory.py"
