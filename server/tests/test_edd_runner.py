@@ -166,6 +166,34 @@ def test_parse_traceback_format_basename_without_ext():
     assert "something went very wrong" in e.message
 
 
+def test_parse_traceback_multiline_description_is_kept():
+    # Measured live (EUD-088): eudplib emits the [Error] description across
+    # MULTIPLE lines before "Traceback (most recent call last):" — the
+    # single-line desc regex matched nothing, so the entire human message was
+    # dropped and codex only saw file/line with an empty message.
+    blob = (
+        "[Error] 연결맵에 조건에 맞는 플레이어가 없습니다: 플레이어 종류 Human\n"
+        "스타트 로케이션을 제대로 배치했는지 확인해보세요. "
+        "Traceback (most recent call last):\n"
+        '  File "C:\\editor\\Data\\temp\\BuildData_test\\eudplibData'
+        '\\TriggerEditor\\main.eps.eps", line 311, in onPluginStart\n'
+        "    function onPluginStart() {\n"
+        '  File "euddraft\\.venv\\Lib\\site-packages\\eudplib\\eudlib\\utilf'
+        '\\pexist.py", line 100, in EUDLoopPlayer\n'
+        "eudplib.utils.eperror.EPError: 연결맵에 조건에 맞는 플레이어가 "
+        "없습니다: 플레이어 종류 Human\n"
+    )
+    errors = parse_euddraft_output(blob, "")
+    assert len(errors) == 1
+    e = errors[0]
+    # The FULL multi-line description must survive into the message.
+    assert "연결맵에 조건에 맞는 플레이어가 없습니다" in e.message
+    assert "스타트 로케이션" in e.message
+    # file/line still come from the FIRST traceback frame (editor mirror).
+    assert e.file == "main"
+    assert e.line == 311
+
+
 def test_parse_module_form_takes_precedence_over_traceback():
     # The editor only falls back to the traceback form when the module form
     # matched ZERO lines (mcol.Count == 0). A mixed blob with module matches

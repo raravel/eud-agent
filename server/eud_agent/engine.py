@@ -90,6 +90,26 @@ _EPSCRIPT_GUIDE = (
     "section and ignore classic-trigger examples quoted in posts."
 )
 
+# Build discipline (EUD-088). The 3-attempt self-fix budget has existed since
+# EUD-057, but the prompt never INSTRUCTED codex to build after applying code —
+# so a compile failure surfaced only when the USER built in the editor, with no
+# feedback path to the agent. Pinned so every code change is verified in-turn.
+_BUILD_GUIDE = (
+    "[build]\n"
+    "- After you APPLY eps/file changes (file_write/file_create/plugin_*), "
+    "ALWAYS run build_run in the SAME turn to verify the project compiles. "
+    "Code you never built is NOT done.\n"
+    "- If build_run fails it returns structured errors (file/line/message): "
+    "read them, fix the code, and build again. The server enforces a "
+    "3-attempt self-fix budget per request; when it is spent, STOP and "
+    "report the remaining errors to the user verbatim.\n"
+    "- build_errors re-reads the LAST build's errors without building.\n"
+    "- A failure whose message says no matching player exists (e.g. "
+    "\"연결맵에 조건에 맞는 플레이어가 없습니다\") is a MAP setup problem "
+    "(player slots/start locations), not an eps bug — report it instead of "
+    "rewriting code."
+)
+
 # Map-location workflow guidance (features/08+09). Grounded in the ECA corpus:
 # 음수(Inverted) location semantics + the MoveLocation/Bring precision pattern
 # from cafe edac/126985 and the 강낭땅콩 editor course edac/76715.
@@ -165,6 +185,8 @@ def build_system_prompt(
         _first_principles_section(),
         "",
         _EPSCRIPT_GUIDE,
+        "",
+        _BUILD_GUIDE,
         "",
         _MAP_LOCATION_GUIDE,
     ]

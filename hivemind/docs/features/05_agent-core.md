@@ -55,8 +55,9 @@ Every tool validates args server-side (numeric ranges, index bounds, type whitel
 ## Build error retrieval and self-fix
 
 1. `build_run` → bridge BUILD (SCArchive forced off, preflight paths) → poll `status.txt` compiling until false (timeout 300s).
-2. Errors: bridge `BUILDERR` (macro.macroErrorList). If the build failed with no macro errors, the server re-runs `euddraft.exe <eds>` directly (paths from bridge `EDSPATH`, euddraft path from `settings_get program euddraft`) with captured stdout/stderr — explicit stdin per codex rules — and parses with the editor's documented BuildErrorHandling regex formats.
+2. Errors: bridge `BUILDERR` (macro.macroErrorList). If the build failed with no macro errors, the server re-runs `euddraft.exe <eds>` directly (paths from bridge `EDSPATH`, euddraft path from `settings_get program euddraft`) with captured stdout/stderr — explicit stdin per codex rules — and parses with the editor's documented BuildErrorHandling regex formats. ONE deliberate divergence from the editor regexes (EUD-088): the `[Error] ... Traceback` description regex runs with DOTALL/non-greedy, because eudplib emits the description across MULTIPLE lines (measured live) and the editor's single-line form drops the whole message.
 3. Parsed errors are returned via `build_errors` so codex can self-fix (≤3 attempts), after which the changeset is presented with the failure noted.
+4. Build discipline is PINNED in the system prompt (`[build]` section, EUD-088 — the budget existed since EUD-057 but nothing ever INSTRUCTED codex to build): after applying eps/file changes codex must run `build_run` in the SAME turn, fix-and-rebuild on failure, and report errors verbatim when the budget is spent. Map-setup failures (no Human player/start location) are flagged as map problems, not eps bugs.
 
 ## WS protocol v2
 

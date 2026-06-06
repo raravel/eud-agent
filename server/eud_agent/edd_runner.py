@@ -71,7 +71,11 @@ euddraft error-format grounding (editor source, READ-ONLY)
     The editor's description loop overwrites on each match and ends on the LAST
     ``[Error]...Traceback`` match (vb:45-47); the file/line uses ``mcol(0)`` --
     the FIRST traceback frame (vb:54). We mirror both (one BuildError for the
-    traceback form: last-match description, first-match file/line).
+    traceback form: last-match description, first-match file/line) with ONE
+    deliberate divergence (EUD-088): the description regex runs with DOTALL
+    (non-greedy) because eudplib emits the description across MULTIPLE lines
+    before the Traceback marker — the editor's single-line regex drops the
+    whole message in that case.
 
 This module is stdlib-only and synchronous (the orchestrator runs ``build_run``
 in a thread executor, like the bridge ``send``). ``spawn`` / ``read_status`` /
@@ -119,9 +123,15 @@ class ConfigError(RuntimeError):
 # MODULE/LINE form (BuildErrorHandling.vb:23).
 _MODULE_LINE_RE = re.compile(r'\[Error.*\] Module "(.*)" Line (\d+) : (.+)')
 # PYTHON-TRACEBACK form (BuildErrorHandling.vb:42 + :49). The description regex
-# is greedy on (.*) up to "Traceback (most recent call last):" within one line;
-# the file/line regex captures the FIRST traceback frame.
-_TRACEBACK_DESC_RE = re.compile(r"\[Error\](.*)Traceback \(most recent call last\):")
+# DELIBERATELY diverges from the editor's single-line original: eudplib emits
+# the [Error] description across MULTIPLE lines before "Traceback ..."
+# (measured live, EUD-088), and the editor's regex then matches nothing — the
+# whole human message is lost. DOTALL + non-greedy captures the full multi-line
+# description up to the NEAREST following Traceback marker. The file/line regex
+# still captures the FIRST traceback frame (editor mirror).
+_TRACEBACK_DESC_RE = re.compile(
+    r"\[Error\](.*?)Traceback \(most recent call last\):", re.DOTALL
+)
 _TRACEBACK_FILE_RE = re.compile(r'File "(.*)", line (\d+), in ([\w_]+)')
 
 

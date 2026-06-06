@@ -254,6 +254,12 @@ def test_system_prompt_first_principles_before_rag(monkeypatch):
     assert "[epscript]" in sp
     assert sp.index("[epscript]") < sp.index("[reference context]")
     assert "NOT epScript" in sp  # the classic Trigger{} ban is explicit
+    # [build] (EUD-088): build discipline is PINNED — apply -> build_run in the
+    # same turn, self-fix on failure, report when the budget is spent.
+    assert "[build]" in sp
+    assert sp.index("[build]") < sp.index("[reference context]")
+    assert "build_run in the SAME turn" in sp
+    assert "self-fix budget" in sp
 
 
 def test_system_prompt_bridge_failure_degrades(monkeypatch):

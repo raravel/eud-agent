@@ -944,7 +944,9 @@ def _build_registry() -> dict[str, ToolSpec]:
         ),
         ToolSpec(
             "build_run", "write",
-            "Run the editor build (SCArchive forced off, preflight paths).",
+            "Run the editor build and return ok + structured errors. ALWAYS "
+            "call this after applying eps changes (3 self-fix attempts per "
+            "request).",
             _schema({}, []), _h_build_run,
         ),
         ToolSpec(
