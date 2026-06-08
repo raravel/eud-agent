@@ -691,15 +691,15 @@
       ]
     },
     "EUD-043-1455": {
-      "status": "pending",
+      "status": "done",
       "priority": "high",
       "type": "epic",
       "parent": null,
       "depends_on": [],
       "title": "v2 Antigravity-style agentic workflow",
-      "updated": "2026-06-05",
-      "completed_at": null,
-      "path": "active/EUD-043-1455.md",
+      "updated": "2026-06-08",
+      "completed_at": "2026-06-08T13:58:16.427578",
+      "path": "done/EUD-043-1455.md",
       "scope": []
     },
     "EUD-044-c735": {
@@ -739,15 +739,15 @@
       "scope": []
     },
     "EUD-047-fd09": {
-      "status": "pending",
+      "status": "done",
       "priority": "high",
       "type": "story",
       "parent": "EUD-043-1455",
       "depends_on": [],
       "title": "v2 acceptance",
-      "updated": "2026-06-05",
-      "completed_at": null,
-      "path": "active/EUD-047-fd09.md",
+      "updated": "2026-06-08",
+      "completed_at": "2026-06-08T13:58:16.402491",
+      "path": "done/EUD-047-fd09.md",
       "scope": []
     },
     "EUD-048-d732": {
@@ -1027,7 +1027,7 @@
       ]
     },
     "EUD-061-3254": {
-      "status": "in_progress",
+      "status": "cancelled",
       "priority": "high",
       "type": "task",
       "parent": "EUD-047-fd09",
@@ -1037,9 +1037,9 @@
         "EUD-060-7771"
       ],
       "title": "Live E2E: three v2 acceptance scenarios",
-      "updated": "2026-06-05",
-      "completed_at": null,
-      "path": "active/EUD-061-3254.md",
+      "updated": "2026-06-08",
+      "completed_at": "2026-06-08T13:58:16.367428",
+      "path": "done/EUD-061-3254.md",
       "scope": [
         "*"
       ]
