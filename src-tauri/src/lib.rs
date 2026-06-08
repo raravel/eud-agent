@@ -14,6 +14,7 @@ pub mod engine;
 pub mod ipc;
 pub mod mapsafe;
 pub mod rag;
+pub mod tools;
 
 /// Build and run the Tauri application.
 ///

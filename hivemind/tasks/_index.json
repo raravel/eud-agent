@@ -1880,7 +1880,7 @@
       ]
     },
     "EUD-114-57dd": {
-      "status": "pending",
+      "status": "done",
       "priority": "high",
       "type": "task",
       "parent": "EUD-094-e9ee",
@@ -1888,12 +1888,13 @@
         "EUD-113-ba2a"
       ],
       "title": "tools layer (evidence gate, first_principles, btn/xdat rails)",
-      "updated": "2026-06-08",
-      "completed_at": null,
-      "path": "active/EUD-114-57dd.md",
+      "updated": "2026-06-09",
+      "completed_at": "2026-06-09T00:18:10.764923",
+      "path": "done/EUD-114-57dd.md",
       "scope": [
         "src-tauri/src/tools.rs",
-        "src-tauri/src/data/first_principles.md"
+        "src-tauri/src/data/first_principles.md",
+        "src-tauri/src/lib.rs"
       ]
     },
     "EUD-115-7e3f": {
