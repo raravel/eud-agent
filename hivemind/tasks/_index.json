@@ -1970,12 +1970,14 @@
         "EUD-110-def0"
       ],
       "title": "Panel Tauri IPC client + store wiring (replace ws-client)",
-      "updated": "2026-06-08",
+      "updated": "2026-06-09",
       "completed_at": null,
       "path": "active/EUD-119-bc27.md",
       "scope": [
         "panel/src/lib/ipc.ts",
-        "panel/src/state"
+        "panel/src/state",
+        "panel/src/App.tsx",
+        "panel/src/ws"
       ]
     },
     "EUD-120-ecca": {
@@ -2009,6 +2011,83 @@
       "path": "active/EUD-121-8ff9.md",
       "scope": [
         "server"
+      ]
+    },
+    "EUD-122-7745": {
+      "status": "pending",
+      "priority": "high",
+      "type": "task",
+      "parent": "EUD-094-e9ee",
+      "depends_on": [],
+      "title": "Rust IPC v2 chat surface (commands + events)",
+      "updated": "2026-06-09",
+      "completed_at": null,
+      "path": "active/EUD-122-7745.md",
+      "scope": [
+        "src-tauri/src/ipc.rs",
+        "src-tauri/src/lib.rs"
+      ]
+    },
+    "EUD-123-bab1": {
+      "status": "pending",
+      "priority": "high",
+      "type": "task",
+      "parent": "EUD-094-e9ee",
+      "depends_on": [],
+      "title": "Codex app-server JSON-RPC transport (thread start/resume, streaming, approvals)",
+      "updated": "2026-06-09",
+      "completed_at": null,
+      "path": "active/EUD-123-bab1.md",
+      "scope": [
+        "src-tauri/src/codex_client.rs"
+      ]
+    },
+    "EUD-124-9090": {
+      "status": "pending",
+      "priority": "high",
+      "type": "task",
+      "parent": "EUD-094-e9ee",
+      "depends_on": [],
+      "title": "eud-tools MCP server + tool registry, mutation gate, budgets",
+      "updated": "2026-06-09",
+      "completed_at": null,
+      "path": "active/EUD-124-9090.md",
+      "scope": [
+        "src-tauri/src/tools.rs"
+      ]
+    },
+    "EUD-125-6cf7": {
+      "status": "pending",
+      "priority": "high",
+      "type": "task",
+      "parent": "EUD-094-e9ee",
+      "depends_on": [],
+      "title": "Change journal + changeset rollback (inverse ops, persistence)",
+      "updated": "2026-06-09",
+      "completed_at": null,
+      "path": "active/EUD-125-6cf7.md",
+      "scope": [
+        "src-tauri/src/journal.rs"
+      ]
+    },
+    "EUD-126-0e23": {
+      "status": "pending",
+      "priority": "high",
+      "type": "task",
+      "parent": "EUD-094-e9ee",
+      "depends_on": [
+        "EUD-122-7745",
+        "EUD-123-bab1",
+        "EUD-124-9090",
+        "EUD-125-6cf7"
+      ],
+      "title": "Agentic engine turn loop (chat/plan/changeset/answer state machine)",
+      "updated": "2026-06-09",
+      "completed_at": null,
+      "path": "active/EUD-126-0e23.md",
+      "scope": [
+        "src-tauri/src/engine.rs",
+        "src-tauri/src/lib.rs"
       ]
     }
   }
