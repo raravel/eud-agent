@@ -463,6 +463,37 @@ local ok, initErr = pcall(function()
         ["orders"]    = DatFiles.orders,
     }
 
+    -- Valid GETDAT/SETDAT param names for a dat, for self-correcting errors:
+    -- a wrong param name ("Gas Cost", "HitPoints") used to return a bare
+    -- "param/index" with no way to discover the editor's display names.
+    -- Walk: pj.Dat.GetDatFile(enum).ParameterList -> GetParamname.
+    -- GetDatFile is a PARAMETERIZED ReadOnly Property -> :get_GetDatFile(enum)
+    -- (rules.md); ParameterList is a plain List(Of CParamater) -> .Count +
+    -- :get_Item(i); GetParamname is a parameterless property -> dot access.
+    -- DatfileDic holds ALL ten datNameToEnum keys (SCDatFiles.vb:74 loops
+    -- 0..9), so the dictionary lookup cannot throw for a whitelisted dat.
+    local function datParamNames(datEnum)
+        local pj = GlobalObj.pjData
+        if pj == nil then return "" end
+        local names = {}
+        local okWalk = pcall(function()
+            local plist = pj.Dat:get_GetDatFile(datEnum).ParameterList
+            for i = 0, plist.Count - 1 do
+                names[#names + 1] = safestr(plist:get_Item(i).GetParamname)
+            end
+        end)
+        if not okWalk then return "" end
+        return table.concat(names, ", ")
+    end
+
+    -- Valid GETXDAT/SETXDAT names per kind: a FIXED set, hardcoded from the
+    -- editor's ExtraDatBinding dispatch (BindingManager.vb:340-380).
+    local xdatNamesByKind = {
+        ["statusinfor"] = "Status, Display, Joint",
+        ["wireframe"]   = "wire, grp, tran",
+        ["ButtonSet"]   = "ButtonSet",
+    }
+
     local function resolveDatBinding(datname, param, objId)
         local pj = GlobalObj.pjData
         if pj == nil then return nil, "no project" end
@@ -471,7 +502,11 @@ local ok, initErr = pcall(function()
             return nil, "invalid datname (units/weapons/flingy/sprites/images/upgrades/techdata/orders/portdata/sfxdata)"
         end
         local binding = pj.BindingManager:get_DatBinding(datEnum, param, objId)
-        if binding == nil then return nil, "param/index" end
+        if binding == nil then
+            local valid = datParamNames(datEnum)
+            local hint = (valid ~= "") and ("; valid params for " .. datname .. ": " .. valid) or ""
+            return nil, "param/index (unknown param '" .. tostring(param) .. "' or objId out of range)" .. hint
+        end
         return binding, nil
     end
 
@@ -483,7 +518,10 @@ local ok, initErr = pcall(function()
             return nil, "invalid xdat kind (statusinfor/wireframe/ButtonSet)"
         end
         local binding = pj.BindingManager:get_ExtraDatBinding(kindEnum, name, objId)
-        if binding == nil then return nil, "null binding (name/index out of range)" end
+        if binding == nil then
+            return nil, "null binding (name/index out of range); valid names for "
+                .. kind .. ": " .. (xdatNamesByKind[kind] or "?")
+        end
         return binding, nil
     end
 
@@ -551,6 +589,30 @@ local ok, initErr = pcall(function()
                 pcall(function() okInit = e.IsSuccess end)
                 if okInit then
                     panelCoreReady = true
+                    -- Citation links (EUD-090): the panel renders evidence links
+                    -- as <a target="_blank">, which raises NewWindowRequested.
+                    -- Route them to the user's DEFAULT BROWSER (shell-open) and
+                    -- mark Handled so WebView2 never spawns its own popup; the
+                    -- panel window itself must never navigate away. http(s)
+                    -- only; anything else is dropped.
+                    pcall(function()
+                        view.CoreWebView2.NewWindowRequested:Add(function(s2, e2)
+                            local uri = nil
+                            pcall(function()
+                                e2.Handled = true
+                                uri = tostring(e2.Uri)
+                            end)
+                            if uri ~= nil and (string.sub(uri, 1, 7) == "http://"
+                                    or string.sub(uri, 1, 8) == "https://") then
+                                pcall(function()
+                                    local psi = ProcessStartInfo()
+                                    psi.FileName = uri
+                                    psi.UseShellExecute = true
+                                    Process.Start(psi)
+                                end)
+                            end
+                        end)
+                    end)
                     navigatePanel()
                 else
                     panelCoreReady = false
@@ -1019,6 +1081,12 @@ local ok, initErr = pcall(function()
             if bs == nil then return "ERROR: null button set (id out of range)" end
             local okP = pcall(function() bs:PasteFromString(body) end)
             if not okP then return "ERROR: setbtn failed" end
+            -- PasteFromString never clears IsDefault; WriteButtonData.vb skips
+            -- Db bytebuffer emission for IsDefault sets, so the runtime patch
+            -- table keeps a stale default address with the new button count ->
+            -- wild pointer -> SC hard-crash on unit selection (measured
+            -- 2026-06-07). Clear it so the edited set gets emitted.
+            bs.IsDefault = false
             -- direct mutations don't auto-dirty: mark dirty manually.
             pcall(function() pj:SetDirty(true) end)
             return "OK: setbtn " .. setId .. " (" .. #groups .. " buttons)"
@@ -1280,6 +1348,11 @@ local ok, initErr = pcall(function()
     end
 
     -- ------------------------------------------------------------------
+    -- Last idle-Tick project line, reused by the BUSY status write below:
+    -- while IsCompilng the Tick must not touch pjData (rules.md), so the
+    -- compiling status.txt carries the project string cached on the previous
+    -- idle Tick. Plain global (luanet static-proxy idiom, same as panelWin).
+    lastProjectLine = "(none)"
     local timer = DispatcherTimer(DispatcherPriority.Normal)
     timer.Interval = TimeSpan.FromSeconds(1)
     timer.Tick:Add(function(sender, args)
@@ -1288,15 +1361,31 @@ local ok, initErr = pcall(function()
             -- (rules.md hard rule; the server self-terminates on >60s staleness).
             pcall(function() File.WriteAllText(agentDir .. "heartbeat.txt", nowIso()) end)
             local pg = GlobalObj.pgData
-            if pg ~= nil and pg.IsCompilng then return end
+            if pg ~= nil and pg.IsCompilng then
+                -- status: ALSO unconditional, BEFORE the build early-return.
+                -- status.txt is the server's ONLY busy signal (the 10s->180s
+                -- poll-timeout extension + the panel's waiting_build notice);
+                -- writing it only on idle Ticks left it permanently
+                -- compiling=false, so every command during a build timed out
+                -- at 10s with a misleading compiling=False. No pjData access
+                -- here (rules.md): the project line is the cached idle value.
+                pcall(function()
+                    File.WriteAllText(agentDir .. "status.txt",
+                        "time=" .. tostring(DateTime.Now)
+                        .. "\r\ncompiling=True"
+                        .. "\r\nproject=" .. lastProjectLine)
+                end)
+                return
+            end
             -- server lifecycle (skipped during builds with the rest of the work)
             validateReady()
             maybeRespawn()
             local pj = GlobalObj.pjData
+            lastProjectLine = (pj ~= nil and ("'" .. safestr(pj.Filename) .. "'") or "(none)")
             File.WriteAllText(agentDir .. "status.txt",
                 "time=" .. tostring(DateTime.Now)
                 .. "\r\ncompiling=" .. (pg == nil and "?" or tostring(pg.IsCompilng))
-                .. "\r\nproject=" .. (pj ~= nil and ("'" .. safestr(pj.Filename) .. "'") or "(none)"))
+                .. "\r\nproject=" .. lastProjectLine)
             -- WebView2 panel re-arm: recreate while "project open AND window not
             -- alive" (project switch closes auxiliary windows) + re-navigate on
             -- a failed nav with a 3s backoff. Handle tracking (panelWin), not a

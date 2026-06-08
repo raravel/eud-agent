@@ -1,6 +1,12 @@
 @import "tailwindcss";
 @import "tw-animate-css";
 
+/* Streamdown components carry Tailwind utility classes (e.g. the citation
+   link's `text-primary underline`, EUD-090), but Tailwind v4 does not scan
+   node_modules — without this @source those classes are never generated and
+   links render as unstyled body text (streamdown README "Tailwind setup"). */
+@source "../node_modules/streamdown/dist/*.js";
+
 @custom-variant dark (&:is(.dark *));
 
 :root {

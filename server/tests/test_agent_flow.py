@@ -873,6 +873,55 @@ def test_resumed_chat_carries_refreshed_state_and_rag_plus_user_text(
     )
 
 
+def test_resumed_chat_labels_user_text_after_context(tmp_path, monkeypatch):
+    """The resumed turn text marks the user's text with a ``[user message]``
+    header AFTER the prepended context sections (EUD-092).
+
+    Without the label the trailing user text reads as part of the LAST
+    [reference context] chunk — the RAG corpus is cafe posts that are
+    themselves bug-report-shaped, so a live bug report ("프로그램이 꺼져") was
+    answered with "no new request" instead of being investigated (measured
+    2026-06-06, two consecutive turns)."""
+    from fastapi.testclient import TestClient
+
+    # A RAG chunk that LOOKS like a user bug report (the live failure shape).
+    decoy = "맵 열려고하면 프로그램이 저절로꺼짐"
+
+    def fake_search(query, k=5, *, rag_db):
+        return [{"text": decoy, "title": "t", "url": "u", "distance": 0.1}]
+
+    monkeypatch.setattr(rag_mod, "search", fake_search)
+
+    cfg, app, created = build_app(tmp_path, monkeypatch)
+    _wire_journal(app, tmp_path, _JournalBridge())
+
+    with TestClient(app) as client:
+        with _connect(client, cfg) as ws:
+            r = created["runner"]
+            r.queue(answer_script("first"))
+            ws.send_json({"type": "chat", "text": "first message"})
+            _recv_until(ws, "answer")
+
+            r.queue(answer_script("second"))
+            ws.send_json(
+                {"type": "chat", "text": "히어로 선택하면 프로그램이 꺼져"}
+            )
+            _recv_until(ws, "answer")
+
+    resume_text = r.captured_prompts[1]
+    assert "[user message]" in resume_text, (
+        f"resumed user text must be labeled; got {resume_text!r}"
+    )
+    # The label sits AFTER the reference context, IMMEDIATELY before the text.
+    assert resume_text.index("[reference context]") < resume_text.index(
+        "[user message]"
+    )
+    marker_end = resume_text.index("[user message]") + len("[user message]")
+    assert resume_text[marker_end:].strip() == "히어로 선택하면 프로그램이 꺼져", (
+        f"user text must directly follow the label; got {resume_text!r}"
+    )
+
+
 def test_reset_drops_thread_next_chat_starts_fresh(tmp_path, monkeypatch):
     """reset{} drops the retained thread; the NEXT chat starts a fresh thread
     (start_turn with a new system prompt), not a resume."""
@@ -1660,6 +1709,74 @@ def test_build_system_prompt_without_data_dir_preserves_existing_callers(tmp_pat
     assert "[project memory]" not in sp, (
         "with no data_dir the memory section must be absent (existing callers)"
     )
+
+
+def test_build_system_prompt_carries_evidence_guide_below_first_principles(
+    tmp_path,
+):
+    """[evidence] (EUD-090) sits BELOW [first principles] (never-do rules
+    outrank citations) and ABOVE the [reference context] it tells the agent
+    to cite, instructing source links on plan steps AND the final answer."""
+    from eud_agent.engine import build_system_prompt
+    from eud_agent.tools import ToolLayer
+
+    bridge = _MemoryBridge(project="demo-map")
+    sp = build_system_prompt(
+        "마린 체력 2배",
+        tool_layer=ToolLayer(bridge),
+        bridge=bridge,
+        rag_db=str(tmp_path / "rag"),
+    )
+    assert "[evidence]" in sp, "the evidence discipline section must be injected"
+    i_fp = sp.index("[first principles]")
+    i_ev = sp.index("[evidence]")
+    i_rag = sp.index("[reference context]")
+    assert i_fp < i_ev < i_rag, (
+        f"evidence must sit between principles and RAG; "
+        f"fp={i_fp} ev={i_ev} rag={i_rag}"
+    )
+    guide = sp[i_ev:i_rag]
+    assert "search_docs" in guide, "the guide must direct to search_docs"
+    assert "propose_plan" in guide, "plan steps must carry citations"
+    assert "근거 없음" in guide, "the no-source marking must be instructed"
+    # Crash-report diagnosis protocol: a crash/EUD-error/drop/freeze report must
+    # be matched against [first principles] (cite the item number, or state none
+    # matches) BEFORE any fix; speculative fixes are forbidden.
+    assert "[first principles]" in guide, (
+        "a crash report must be diagnosed against [first principles] first"
+    )
+    assert "BEFORE proposing" in guide, "the fix must follow the diagnosis"
+
+
+def test_rag_section_carries_source_links(tmp_path):
+    """Each [reference context] chunk carries a ``source: [title](url)`` header
+    the agent can cite verbatim (EUD-090; the autouse fake search returns
+    title=t url=u)."""
+    from eud_agent.engine import build_system_prompt
+    from eud_agent.tools import ToolLayer
+
+    bridge = _MemoryBridge(project="demo-map")
+    sp = build_system_prompt(
+        "마린 체력 2배",
+        tool_layer=ToolLayer(bridge),
+        bridge=bridge,
+        rag_db=str(tmp_path / "rag"),
+    )
+    assert "--- source: [t](u) ---" in sp, (
+        f"the chunk's source link header must be injected; got {sp!r}"
+    )
+    assert "DEFAULT_RAG" in sp, "the chunk text itself must still be injected"
+
+
+def test_rag_source_header_degrades_without_metadata():
+    """Missing title/url degrade the header (bare url -> still linkable; bare
+    title -> named; neither -> unknown) — the chunk is injected regardless."""
+    from eud_agent.engine import _source_header
+
+    assert _source_header({"title": "t", "url": "u"}) == "--- source: [t](u) ---"
+    assert _source_header({"title": "", "url": "u"}) == "--- source: [u](u) ---"
+    assert _source_header({"title": "t", "url": ""}) == "--- source: t ---"
+    assert _source_header({}) == "--- source: (unknown) ---"
 
 
 # ---- direct AgentEngine harness (no create_app; pins the engine seam) ----

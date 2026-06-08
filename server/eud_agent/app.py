@@ -47,6 +47,7 @@ from .bridge_io import BridgeIO
 from .chk_info import MapInfoService
 from .config import Config
 from .debuglog import DebugLog
+from .edd_runner import EddRunner
 from .engine import AgentEngine
 from .tools import ToolError, ToolLayer
 
@@ -453,9 +454,21 @@ def create_app(
     def _rag_search(query: str, k: int):
         return rag.search(query, k, rag_db=cfg.rag_db)
 
+    # euddraft build runner (EUD-057/088): routes build_run through the
+    # BUILD -> poll-completion -> error-ladder pipeline and gives build_errors
+    # the LAST build's structured errors. Without this factory the ToolLayer
+    # falls back to the plain bridge BUILD ("OK: started", returns before the
+    # build finishes) + BUILDERR (macroErrorList only — eps/eudplib compile
+    # errors never land there, so build_errors came back empty on every
+    # compile failure). NOTE: create_app's ``runner_factory`` parameter is the
+    # UNRELATED AgentRunner (codex session) factory — do not conflate.
+    def _edd_runner_factory():
+        return EddRunner(bridge)
+
     tool_layer = ToolLayer(
         bridge, journal_factory=_journal_factory, memory=live_memory,
         map_info=map_info_service, rag_search=_rag_search,
+        runner_factory=_edd_runner_factory,
     )
     app.state.tool_layer = tool_layer
 

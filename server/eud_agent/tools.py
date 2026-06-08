@@ -151,6 +151,16 @@ PLAYER_TOOL = "player_setup"
 # Korean (bge-m3 is cross-lingual but jargon like 음수 로케이션 has no English
 # equivalent; English queries lose recall).
 SEARCH_DOCS_TOOL = "search_docs"
+
+# Evidence gate (EUD-090): every request that WRITES must have grounded its
+# work in the docs first — mutating calls are rejected until one search_docs
+# has RUN in this request, so each work item can cite why + a source link
+# (the [evidence] prompt section instructs the citations; this gate is the
+# mechanical backstop). Exemptions: memory_write (recording a durable fact
+# needs no community citation; it is already plan-gate exempt) and build_run
+# (verifying a build creates no new content — the writes it compiles already
+# passed this gate).
+EVIDENCE_GATE_EXEMPT = frozenset({MEMORY_TOOL, "build_run"})
 # Retrieval depth: default + hard cap (each hit injects a full document chunk
 # into the codex context — the reply must stay context-sized).
 SEARCH_DOCS_DEFAULT_K = 5
@@ -175,6 +185,15 @@ class PlanRequired(ToolError):
     """The mutation gate blocked a write because no plan is approved yet.
 
     The message directs codex to ``propose_plan`` (features/05).
+    """
+
+
+class EvidenceRequired(ToolError):
+    """The evidence gate blocked a write because no search_docs ran yet (EUD-090).
+
+    The message directs codex to ``search_docs`` first so every work item can
+    cite its source; a search that finds nothing still lifts the gate (the
+    agent then marks the item 근거 없음 instead of fabricating a source).
     """
 
 
@@ -229,6 +248,10 @@ class RequestState:
     build_fix_attempts: int = 0
     action_limit: int = ACTION_BUDGET
     build_fix_limit: int = BUILD_FIX_LIMIT
+    # Evidence gate (EUD-090): set when ONE search_docs ran successfully in
+    # this request (even with zero hits — the gate forces the search, not a
+    # hit). Mutating calls are rejected while False on a RAG-wired layer.
+    docs_searched: bool = False
     # Set when the 4th build_run in a request is rejected (the self-fix budget is
     # spent). build_run is NOT journaled (EUD-055 decision), so it can never be a
     # changeset item; this flag is the minimal honest mechanism the engine reads
@@ -255,6 +278,7 @@ class RequestState:
             "build_fix_attempts": self.build_fix_attempts,
             "build_fix_limit": self.build_fix_limit,
             "build_fix_exhausted": int(self.build_fix_exhausted),
+            "docs_searched": int(self.docs_searched),
         }
 
 
@@ -377,6 +401,17 @@ _INT = {"type": "integer"}
 _NUM = {"type": ["integer", "string"]}
 
 
+def _enum_str(values) -> dict:
+    """A string property constrained to a whitelist, advertised in the schema.
+
+    The live sessions showed codex inventing values for plain-string args
+    (xdat kind 'units', setting key 'MainFile') and burning 4-5 calls per
+    request rediscovering the whitelist from error text; an explicit JSON
+    ``enum`` lets the model (and the shim) constrain the value up front.
+    """
+    return {"type": "string", "enum": list(values)}
+
+
 # --------------------------------------------------------------------------- #
 # Handlers. Each validates (reusing bridge_io helpers) then calls the mapped
 # BridgeIO method. Validation runs BEFORE the bridge call (features/05).
@@ -407,9 +442,27 @@ def _h_dat_get(bridge, args):
     return bridge.getdat(dat, str(_req(args, "param")), obj_id)
 
 
+def _require_xdat_kind(value) -> str:
+    """``_require_in`` over the xdat kinds, with the units-confusion hint.
+
+    The live sessions showed codex repeatedly passing dat='units' (the
+    dat_get namespace) to the xdat tools — every fresh request re-made the
+    mistake because the bare one-of error never said WHERE a unit's button
+    set lives. The hint makes the rejection self-correcting in one step.
+    """
+    try:
+        return _require_in(value, _XDAT_KINDS, "xdat kind")
+    except BridgeError as exc:
+        raise BridgeError(
+            f"{exc} — a UNIT's button set: dat='ButtonSet', "
+            "name='ButtonSet', objId=<unit id>; unit dat fields "
+            "('Hit Points', ...) live in dat_get/dat_set"
+        ) from exc
+
+
 def _h_xdat_get(bridge, args):
     dat = _as_bridge_error_tool_error(
-        lambda: _require_in(_req(args, "dat"), _XDAT_KINDS, "xdat kind")
+        lambda: _require_xdat_kind(_req(args, "dat"))
     )
     obj_id = _as_bridge_error_tool_error(
         lambda: _require_nonneg_int(_req(args, "objId"), "objId")
@@ -514,9 +567,34 @@ def _h_dat_set(bridge, args):
     return bridge.setdat(dat, str(_req(args, "param")), obj_id, value)
 
 
+def _validate_buttonset_xdat(dat: str, name: str, obj_id, value) -> None:
+    """Reject reassigning a unit's ButtonSet to another set id (hard crash).
+
+    Measured 2026-06-07 (EUD Editor 3 v0.19.6.0 + SC:R): SETXDAT
+    ButtonSet|ButtonSet|<unit>|<setId> with a setId != the unit's own id
+    reassigns the unit's ButtonSet xdat to a different set and hard-crashes
+    StarCraft (32-bit AND 64-bit) the moment the unit is selected — no EUD
+    error dialog. The safe pattern is in-place editing of the unit's OWN button
+    set (objId == value), which the ``btn_set`` tool does. Only the
+    ButtonSet/ButtonSet xdat is guarded; other xdat writes are unaffected.
+
+    ``value`` arrives as the numeric-validated string from
+    :func:`_require_numeric_value` and ``obj_id`` as an int; compare them as
+    ints so "65" and 65 match (same-set in-place edit, allowed).
+    """
+    if dat == "ButtonSet" and name == "ButtonSet" and int(value) != int(obj_id):
+        raise ToolError(
+            f"measured hard-crash (2026-06-07): reassigning unit {obj_id}'s "
+            f"ButtonSet to set id {value} (another set) crashes StarCraft "
+            "(32-bit and 64-bit) on unit selection. Edit the unit's OWN button "
+            "set in place with the btn_set tool instead (its set id equals the "
+            f"unit id, {obj_id})."
+        )
+
+
 def _h_xdat_set(bridge, args):
     dat = _as_bridge_error_tool_error(
-        lambda: _require_in(_req(args, "dat"), _XDAT_KINDS, "xdat kind")
+        lambda: _require_xdat_kind(_req(args, "dat"))
     )
     obj_id = _as_bridge_error_tool_error(
         lambda: _require_nonneg_int(_req(args, "objId"), "objId")
@@ -524,6 +602,7 @@ def _h_xdat_set(bridge, args):
     value = _as_bridge_error_tool_error(
         lambda: _require_numeric_value(_req(args, "value"), "value")
     )
+    _validate_buttonset_xdat(dat, str(_req(args, "name")), obj_id, value)
     return bridge.setxdat(dat, str(_req(args, "name")), obj_id, value)
 
 
@@ -547,11 +626,48 @@ def _h_req_set(bridge, args):
     return bridge.setreq(dat, obj_id, payload)
 
 
+def _validate_btn_csv(csv: str) -> None:
+    """Reject a button set that would crash 64-bit SC (first principles #15).
+
+    SETBTN CSV: dot-separated button groups, each 8 comma fields
+    ``pos,icon,con,act,conval,actval,enastr,disstr``. The last two are the
+    requirement strings (enastr=enabled-state, disstr=disabled-state). A
+    disableable button — train/tech, which carries the trained-unit/tech id in
+    ``actval`` (field 6, nonzero) — renders its disabled state when the
+    requirement is unmet (e.g. insufficient resources at game start); rendering a
+    0/None disstr crashes 64-bit StarCraft on first selection. Always-enabled
+    command buttons (actval == 0) never render disabled, so disstr 0 is exempt.
+
+    Non-numeric / short segments are left for the bridge to surface — this rail
+    only guards the #15 crash condition, deterministically, before send.
+    """
+    for pos, group in enumerate(csv.split(".")):
+        fields = group.split(",")
+        if len(fields) < 8:
+            continue  # malformed shape: not this rail's job (bridge validates)
+        try:
+            actval = int(fields[5])
+            disstr = int(fields[7])
+        except ValueError:
+            continue  # non-numeric: bridge surfaces it
+        if actval != 0 and disstr == 0:
+            raise ToolError(
+                f"first principles #15: button at position {pos} is disableable "
+                f"(actval={actval}, a train/tech button) but its disabled-state "
+                "requirement string (disstr, field 8) is 0 — rendering a 0/None "
+                "requirement string crashes 64-bit StarCraft when the unit is "
+                "selected. Set disstr to a valid TBL string id, e.g. reuse "
+                f"enastr ({fields[6]})."
+            )
+
+
 def _h_btn_set(bridge, args):
     set_id = _as_bridge_error_tool_error(
         lambda: _require_nonneg_int(_req(args, "setId"), "setId")
     )
-    return bridge.setbtn(set_id, str(_req(args, "csv")))
+    csv = str(_req(args, "csv"))
+    _validate_btn_csv(csv)
+    return bridge.setbtn(set_id, csv)
 
 
 def _h_dat_reset(bridge, args):
@@ -822,15 +938,25 @@ def _build_registry() -> dict[str, ToolSpec]:
         ),
         ToolSpec(
             "dat_get", "read",
-            "Read a standard dat field (units/weapons/... param) for an object id.",
-            _schema({"dat": _STR, "param": _STR, "objId": _INT},
+            "Read a standard dat field (units/weapons/... param) for an "
+            "object id. param is the editor DISPLAY name, usually with "
+            "spaces ('Hit Points', 'Mineral Cost'); a wrong param returns "
+            "the dat's valid param list in the error.",
+            _schema({"dat": _enum_str(_DAT_NAMES), "param": _STR,
+                     "objId": _INT},
                     ["dat", "param", "objId"]),
             _h_dat_get,
         ),
         ToolSpec(
             "xdat_get", "read",
-            "Read an ExtraDat field (statusinfor/wireframe/ButtonSet).",
-            _schema({"dat": _STR, "name": _STR, "objId": _INT},
+            "Read an ExtraDat field. Kinds and their valid names: "
+            "statusinfor (Status/Display/Joint), wireframe (wire/grp/tran), "
+            "ButtonSet (ButtonSet). objId is the UNIT id. A unit's button "
+            "set: xdat_get(dat='ButtonSet', name='ButtonSet', objId=<unit "
+            "id>) — 'units' is NOT an xdat kind (unit fields live in "
+            "dat_get).",
+            _schema({"dat": _enum_str(_XDAT_KINDS), "name": _STR,
+                     "objId": _INT},
                     ["dat", "name", "objId"]),
             _h_xdat_get,
         ),
@@ -842,7 +968,9 @@ def _build_registry() -> dict[str, ToolSpec]:
         ToolSpec(
             "req_get", "read",
             "Read a requirement as the editor copy-string.",
-            _schema({"dat": _STR, "objId": _INT}, ["dat", "objId"]), _h_req_get,
+            _schema({"dat": _enum_str(_REQ_DATS), "objId": _INT},
+                    ["dat", "objId"]),
+            _h_req_get,
         ),
         ToolSpec(
             "btn_get", "read",
@@ -851,8 +979,12 @@ def _build_registry() -> dict[str, ToolSpec]:
         ),
         ToolSpec(
             "settings_get", "read",
-            "Read a project/program setting value.",
-            _schema({"scope": _STR, "key": _STR}, ["scope", "key"]),
+            "Read a project/program setting value. Keys — project: "
+            "OpenMapName, SaveMapName, AutoBuild, UseCustomtbl, ViewLog, "
+            "TempFileLoc; program: euddraft, starcraft, Language. (The main "
+            "eps file is set_main, not a setting.)",
+            _schema({"scope": _enum_str(_SETTING_SCOPES), "key": _STR},
+                    ["scope", "key"]),
             _h_settings_get,
         ),
         ToolSpec(
@@ -871,7 +1003,9 @@ def _build_registry() -> dict[str, ToolSpec]:
             "The corpus is KOREAN community material: write the query in "
             "Korean (English queries lose recall — community jargon such as "
             "음수 로케이션/피탄판정 has no English form); keep eps/API "
-            "identifiers (MoveLocation, EPD, dat names, ...) as-is.",
+            "identifiers (MoveLocation, EPD, dat names, ...) as-is. Each hit "
+            "carries title+url — cite them per work item (evidence section); "
+            "one successful search also lifts the evidence gate on writes.",
             _schema({"query": _STR, "k": _INT}, ["query"]), _h_search_docs,
         ),
         ToolSpec(
@@ -894,15 +1028,22 @@ def _build_registry() -> dict[str, ToolSpec]:
         # ---- write ----
         ToolSpec(
             "dat_set", "write",
-            "Write a standard dat field (numeric value).",
-            _schema({"dat": _STR, "param": _STR, "objId": _INT, "value": _NUM},
+            "Write a standard dat field (numeric value). param is the "
+            "editor DISPLAY name, usually with spaces ('Hit Points'); a "
+            "wrong param returns the dat's valid param list in the error.",
+            _schema({"dat": _enum_str(_DAT_NAMES), "param": _STR,
+                     "objId": _INT, "value": _NUM},
                     ["dat", "param", "objId", "value"]),
             _h_dat_set,
         ),
         ToolSpec(
             "xdat_set", "write",
-            "Write an ExtraDat field (numeric value).",
-            _schema({"dat": _STR, "name": _STR, "objId": _INT, "value": _NUM},
+            "Write an ExtraDat field (numeric value). Kinds and their valid "
+            "names: statusinfor (Status/Display/Joint), wireframe "
+            "(wire/grp/tran), ButtonSet (ButtonSet). objId is the UNIT id; "
+            "for dat='ButtonSet' the value is the button-set id to assign.",
+            _schema({"dat": _enum_str(_XDAT_KINDS), "name": _STR,
+                     "objId": _INT, "value": _NUM},
                     ["dat", "name", "objId", "value"]),
             _h_xdat_set,
         ),
@@ -915,7 +1056,8 @@ def _build_registry() -> dict[str, ToolSpec]:
         ToolSpec(
             "req_set", "write",
             "Write a requirement (use-mode keyword or copy-string).",
-            _schema({"dat": _STR, "objId": _INT, "payload": _STR},
+            _schema({"dat": _enum_str(_REQ_DATS), "objId": _INT,
+                     "payload": _STR},
                     ["dat", "objId", "payload"]),
             _h_req_set,
         ),
@@ -928,7 +1070,8 @@ def _build_registry() -> dict[str, ToolSpec]:
             "dat_reset", "write",
             "Reset a dat/xdat/tbl field to its stock value.",
             _schema(
-                {"kind": _STR, "dat": _STR, "param": _STR, "objId": _INT},
+                {"kind": _enum_str(_RESET_KINDS), "dat": _STR,
+                 "param": _STR, "objId": _INT},
                 ["kind", "objId"],
             ),
             _h_dat_reset,
@@ -936,7 +1079,8 @@ def _build_registry() -> dict[str, ToolSpec]:
         ToolSpec(
             "file_create", "write",
             "Create a file of type CUIEps/CUIPy/RawText at a project path.",
-            _schema({"path": _STR, "ftype": _STR, "code": _STR},
+            _schema({"path": _STR, "ftype": _enum_str(_CREATABLE_TYPES),
+                     "code": _STR},
                     ["path", "ftype"]),
             _h_file_create,
         ),
@@ -974,8 +1118,11 @@ def _build_registry() -> dict[str, ToolSpec]:
         ),
         ToolSpec(
             "settings_set", "write",
-            "Write a project/program setting (Language is read-only).",
-            _schema({"scope": _STR, "key": _STR, "value": _STR},
+            "Write a project/program setting (Language is read-only). Keys "
+            "— project: OpenMapName, SaveMapName, AutoBuild, UseCustomtbl, "
+            "ViewLog, TempFileLoc; program: euddraft, starcraft.",
+            _schema({"scope": _enum_str(_SETTING_SCOPES), "key": _STR,
+                     "value": _STR},
                     ["scope", "key", "value"]),
             _h_settings_set,
         ),
@@ -1322,6 +1469,27 @@ class ToolLayer:
         if spec.name == SEARCH_DOCS_TOOL:
             return self._search_docs_via_rag(spec, args, state)
 
+        # Evidence gate (EUD-090): a request that never searched the docs may
+        # not write — every work unit must cite why + a source link (or an
+        # explicit 근거 없음 after searching). Enforced only when RAG is wired:
+        # rag_search is an advisory subsystem, and without it the agent CANNOT
+        # satisfy the gate, so blocking would brick all writes (degrade, don't
+        # gate). A rejection counts nothing, like every other gate here.
+        if (
+            spec.mutating
+            and spec.name not in EVIDENCE_GATE_EXEMPT
+            and self._rag_search is not None
+            and not state.docs_searched
+        ):
+            raise EvidenceRequired(
+                "evidence gate: no search_docs has run in this request. "
+                "Ground the change first — call search_docs (Korean query), "
+                "cite each work item's reason with its source link "
+                "([제목](url)), then retry this call. A search that finds "
+                "nothing relevant still lifts the gate; mark such items "
+                "근거 없음 instead of fabricating a source."
+            )
+
         # Mutation gate: the Nth mutating call WITHOUT an approved plan is blocked
         # and directs codex to propose_plan. Checked BEFORE incrementing anything.
         if spec.mutating and not self._gate.allow(
@@ -1465,7 +1633,9 @@ class ToolLayer:
         translated to ToolError: search is an advisory read and must never
         kill the agent turn (the same degrade-don't-crash policy as the
         engine's ``[reference context]`` section). A successful search counts
-        one action (READ: no mutation counter, no journal, no plan gate).
+        one action (READ: no mutation counter, no journal, no plan gate) and
+        lifts the evidence gate for this request (EUD-090) — zero hits
+        included: the gate forces the search, not a hit.
         """
         validated = _h_search_docs(_ProbeBridge(), args)
         if self._rag_search is None:
@@ -1480,6 +1650,7 @@ class ToolLayer:
         except Exception as exc:  # noqa: BLE001 - advisory read, degrade
             raise ToolError(f"search_docs failed: {exc}") from exc
         state.action_count += 1
+        state.docs_searched = True
         return result
 
     def _map_info_via_service(

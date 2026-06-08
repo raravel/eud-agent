@@ -1186,3 +1186,32 @@ def test_no_supersede_when_ready_unparsable(tmp_path):
         watcher.stop()
         stop_refresh.set()
         rt.join(timeout=2.0)
+
+
+# --------------------------------------------------------------------------- #
+# EddRunner wiring (EUD-091)
+# --------------------------------------------------------------------------- #
+
+
+def test_create_app_wires_edd_runner_into_tool_layer(tmp_path):
+    """EUD-091: the live ToolLayer gets the euddraft build runner.
+
+    EUD-057/088 implemented the build pipeline (BUILD -> poll-completion ->
+    error ladder) but only tests ever constructed a ToolLayer with it — the
+    live app fell back to plain BUILD/BUILDERR, so build_run returned before
+    the build finished and build_errors came back EMPTY on every eps/eudplib
+    compile failure (macroErrorList never carries those).
+    """
+    from eud_agent.edd_runner import EddRunner
+
+    cfg = make_config(tmp_path)
+    app = build_test_app(cfg)
+    runner = app.state.tool_layer.get_runner()
+    assert isinstance(runner, EddRunner), (
+        "create_app must inject an EddRunner factory into the ToolLayer; "
+        "without it build_run/build_errors silently degrade to the plain "
+        "bridge BUILD/BUILDERR"
+    )
+    # Per-layer singleton: last_result (the LAST build's ladder errors) is
+    # shared by build_run and build_errors.
+    assert app.state.tool_layer.get_runner() is runner

@@ -31,6 +31,7 @@ from eud_agent.tools import (
     READ_TOOLS,
     WRITE_TOOLS,
     BudgetExceeded,
+    EvidenceRequired,
     MutationGate,
     PlanRequired,
     RequestState,
@@ -348,6 +349,64 @@ def test_missing_args_error_carries_usage_line():
     assert bridge.calls == []  # rejected before any bridge touch
 
 
+def test_value_whitelists_advertised_as_schema_enums():
+    """EUD-091: plain-string args with server-side whitelists advertise them
+    as JSON-schema enums. The live sessions showed codex inventing values
+    (xdat kind 'units', dat names) and burning 4-5 calls per request
+    rediscovering each whitelist from error text alone."""
+    _, layer = make_layer()
+    props = {
+        s["name"]: s["parameters"]["properties"] for s in layer.tool_specs()
+    }
+    dat_names = {
+        "units", "weapons", "flingy", "sprites", "images",
+        "upgrades", "techdata", "orders", "portdata", "sfxdata",
+    }
+    xdat_kinds = {"statusinfor", "wireframe", "ButtonSet"}
+    req_dats = {"units", "upgrades", "techdata", "Stechdata", "orders"}
+    assert set(props["dat_get"]["dat"]["enum"]) == dat_names
+    assert set(props["dat_set"]["dat"]["enum"]) == dat_names
+    assert set(props["xdat_get"]["dat"]["enum"]) == xdat_kinds
+    assert set(props["xdat_set"]["dat"]["enum"]) == xdat_kinds
+    assert set(props["req_get"]["dat"]["enum"]) == req_dats
+    assert set(props["req_set"]["dat"]["enum"]) == req_dats
+    assert set(props["settings_get"]["scope"]["enum"]) == {
+        "project", "program",
+    }
+    assert set(props["settings_set"]["scope"]["enum"]) == {
+        "project", "program",
+    }
+    assert set(props["dat_reset"]["kind"]["enum"]) == {"dat", "xdat", "tbl"}
+    assert set(props["file_create"]["ftype"]["enum"]) == {
+        "CUIEps", "CUIPy", "RawText",
+    }
+
+
+def test_xdat_kind_units_error_carries_buttonset_hint():
+    """EUD-091: dat='units' against the xdat tools was the top live repeat
+    failure (every fresh request re-made it); the rejection must say WHERE a
+    unit's button set actually lives so one retry suffices."""
+    bridge, layer = make_layer()
+    with pytest.raises(ToolError) as ei:
+        layer.call(
+            "xdat_get",
+            {"dat": "units", "name": "ButtonSet", "objId": 65},
+            fresh_state(),
+        )
+    msg = str(ei.value)
+    assert "dat='ButtonSet'" in msg  # the corrected call shape
+    assert "dat_get" in msg  # unit dat fields live in dat_get
+    assert bridge.calls == []  # rejected before any bridge touch
+    # Same hint on the write side.
+    with pytest.raises(ToolError, match=r"dat='ButtonSet'"):
+        layer.call(
+            "xdat_set",
+            {"dat": "units", "name": "ButtonSet", "objId": 65, "value": 1},
+            fresh_state(),
+        )
+    assert bridge.calls == []
+
+
 def test_bridge_busy_translates_to_tool_error_not_crash():
     """EUD-087: BridgeBusy (timeout, NOT a BridgeError subclass) escaped
     _dispatch untranslated and became an HTTP 500 at /tools/call."""
@@ -503,6 +562,106 @@ def test_build_run_routes_to_build():
     assert ("build", (), {}) in bridge.calls
 
 
+# --------------------------------------------------------------------------- #
+# btn_set requirement-string rail (first principles #15): a disableable button
+# (actval != 0, train/tech) MUST carry a nonzero disstr — rendering a 0/None
+# requirement string crashes 64-bit StarCraft the moment the unit is selected.
+# CSV: dot-separated button groups, each 8 comma fields
+# pos,icon,con,act,conval,actval,enastr,disstr.
+# --------------------------------------------------------------------------- #
+
+
+def test_btn_set_rejects_train_button_with_zero_disstr():
+    bridge, layer = make_layer()
+    st = fresh_state()
+    # A train button: actval carries the trained-unit id (nonzero) but disstr=0.
+    csv = "0,228,4,2,0,7,100,0"
+    with pytest.raises(ToolError) as ei:
+        layer.call("btn_set", {"setId": 200, "csv": csv}, st)
+    # The error names first principles #15 and the offending button position.
+    assert "#15" in str(ei.value)
+    assert "position 0" in str(ei.value)
+    # The remedy is spelled out (reuse enastr).
+    assert "enastr" in str(ei.value)
+    # Rejected: it must NOT have reached the bridge nor counted a mutation.
+    assert not any(c[0] == "setbtn" for c in bridge.calls)
+    assert st.mutation_count == 0
+
+
+def test_btn_set_accepts_train_button_with_disstr_equal_enastr():
+    bridge, layer = make_layer()
+    st = fresh_state()
+    # Same train button, but disstr reuses enastr (100) -> valid.
+    csv = "0,228,4,2,0,7,100,100"
+    layer.call("btn_set", {"setId": 200, "csv": csv}, st)
+    assert ("setbtn", (200, csv), {}) in bridge.calls
+    assert st.mutation_count == 1
+
+
+def test_btn_set_accepts_command_button_with_zero_actval_and_disstr():
+    bridge, layer = make_layer()
+    st = fresh_state()
+    # An always-enabled command button (move): actval=0 -> disstr 0 is exempt.
+    csv = "0,228,4,2,0,0,100,0"
+    layer.call("btn_set", {"setId": 200, "csv": csv}, st)
+    assert ("setbtn", (200, csv), {}) in bridge.calls
+    assert st.mutation_count == 1
+
+
+# --------------------------------------------------------------------------- #
+# xdat_set ButtonSet-reassignment rail (measured 2026-06-07): reassigning a
+# unit's ButtonSet xdat to ANOTHER set id hard-crashes StarCraft on unit
+# selection (32-bit and 64-bit). In-place editing of the unit's own set is the
+# safe pattern (btn_set). Only ButtonSet/ButtonSet is guarded.
+# --------------------------------------------------------------------------- #
+
+
+def test_xdat_set_rejects_buttonset_reassignment_to_other_id():
+    bridge, layer = make_layer()
+    st = fresh_state()
+    # Reassign unit 65's ButtonSet to set id 200 (another set) -> crash class.
+    with pytest.raises(ToolError) as ei:
+        layer.call(
+            "xdat_set",
+            {"dat": "ButtonSet", "name": "ButtonSet", "objId": 65, "value": 200},
+            st,
+        )
+    msg = str(ei.value)
+    assert "hard-crash" in msg
+    assert "2026-06-07" in msg
+    assert "btn_set" in msg  # the safe in-place alternative
+    # Rejected before any bridge touch / mutation count.
+    assert not any(c[0] == "setxdat" for c in bridge.calls)
+    assert st.mutation_count == 0
+
+
+def test_xdat_set_allows_buttonset_same_id_in_place():
+    bridge, layer = make_layer()
+    st = fresh_state()
+    # value == objId: editing the unit's OWN set in place is the safe pattern.
+    layer.call(
+        "xdat_set",
+        {"dat": "ButtonSet", "name": "ButtonSet", "objId": 65, "value": 65},
+        st,
+    )
+    assert ("setxdat", ("ButtonSet", "ButtonSet", 65, "65"), {}) in bridge.calls
+    assert st.mutation_count == 1
+
+
+def test_xdat_set_other_kinds_unaffected_by_buttonset_rail():
+    bridge, layer = make_layer()
+    st = fresh_state()
+    # A wireframe xdat write with value != objId must NOT be blocked (the rail
+    # only guards ButtonSet/ButtonSet).
+    layer.call(
+        "xdat_set",
+        {"dat": "wireframe", "name": "grp", "objId": 65, "value": 200},
+        st,
+    )
+    assert ("setxdat", ("wireframe", "grp", 65, "200"), {}) in bridge.calls
+    assert st.mutation_count == 1
+
+
 def test_read_tool_does_not_count_as_mutation():
     _, layer = make_layer()
     st = fresh_state()
@@ -567,6 +726,103 @@ def test_propose_plan_does_not_consume_gate_and_ends_turn():
     assert st.plan_proposed is True or (
         isinstance(result, dict) and result.get("ends_turn")
     )
+
+
+# --------------------------------------------------------------------------- #
+# Evidence gate (EUD-090): on a RAG-wired layer, mutating calls are rejected
+# until ONE search_docs has run in the request (zero hits included); without
+# RAG the gate never fires (degrade, don't brick writes); memory_write and
+# build_run are exempt.
+# --------------------------------------------------------------------------- #
+
+
+def make_rag_layer(hits=None):
+    bridge = FakeBridge()
+    layer = ToolLayer(bridge, rag_search=lambda q, k: list(hits or []))
+    return bridge, layer
+
+
+def test_write_without_search_docs_is_evidence_gated():
+    bridge, layer = make_rag_layer()
+    st = fresh_state()
+    with pytest.raises(EvidenceRequired) as ei:
+        layer.call("file_write", {"path": "a.eps", "code": "1"}, st)
+    # The error must direct codex to search_docs (with the citation contract).
+    assert "search_docs" in str(ei.value)
+    # EvidenceRequired is a ToolError subtype (a correctable tool result).
+    assert isinstance(ei.value, ToolError)
+    # The gated call counts NOTHING and never reached the bridge.
+    assert st.action_count == 0
+    assert st.mutation_count == 0
+    assert bridge.calls == []
+
+
+def test_search_docs_lifts_evidence_gate():
+    bridge, layer = make_rag_layer(
+        [{"title": "t", "url": "u", "distance": 0.1, "text": "본문"}]
+    )
+    st = fresh_state()
+    layer.call("search_docs", {"query": "유닛 체력"}, st)
+    assert st.docs_searched is True
+    layer.call("file_write", {"path": "a.eps", "code": "1"}, st)
+    assert st.mutation_count == 1
+    assert any(c[0] == "set" for c in bridge.calls)
+    # Exposed for panel display alongside the other budget flags.
+    assert st.budget_snapshot()["docs_searched"] == 1
+
+
+def test_zero_hit_search_still_lifts_evidence_gate():
+    """The gate forces the SEARCH, not a hit — an empty result must not
+    deadlock the request (the agent marks the item 근거 없음 and proceeds)."""
+    _, layer = make_rag_layer([])
+    st = fresh_state()
+    layer.call("search_docs", {"query": "없는 주제"}, st)
+    layer.call("file_write", {"path": "a.eps", "code": "1"}, st)
+    assert st.mutation_count == 1
+
+
+def test_evidence_gate_absent_without_rag_wiring():
+    """A layer built WITHOUT rag_search cannot satisfy the gate, so it must not
+    fire (advisory subsystem: degrade, don't brick all writes)."""
+    bridge, layer = make_layer()
+    st = fresh_state()
+    layer.call("file_write", {"path": "a.eps", "code": "1"}, st)
+    assert st.mutation_count == 1
+
+
+def test_evidence_gate_is_per_request():
+    _, layer = make_rag_layer()
+    layer.call_for_request("rid-A", "search_docs", {"query": "근거"})
+    # rid-A searched; rid-B did not — only rid-B's write is gated.
+    layer.call_for_request("rid-A", "file_write", {"path": "a.eps", "code": "1"})
+    with pytest.raises(EvidenceRequired):
+        layer.call_for_request("rid-B", "file_write", {"path": "b.eps", "code": "2"})
+
+
+def test_build_run_exempt_from_evidence_gate():
+    """build_run verifies existing writes (which already passed the gate) and
+    creates no new content — a bare rebuild request must not force a search."""
+    bridge, layer = make_rag_layer()
+    st = fresh_state()
+    layer.call("build_run", {}, st)
+    assert any(c[0] == "build" for c in bridge.calls)
+    assert st.mutation_count == 1
+
+
+def test_failed_search_does_not_lift_evidence_gate():
+    """A search that ERRORED (RAG down) never ran — the gate stays."""
+    from eud_agent.rag import RagUnavailable
+
+    def broken(query, k):
+        raise RagUnavailable("RAG DB directory not found: nope")
+
+    layer = ToolLayer(FakeBridge(), rag_search=broken)
+    st = fresh_state()
+    with pytest.raises(ToolError, match="RAG unavailable"):
+        layer.call("search_docs", {"query": "질문"}, st)
+    assert st.docs_searched is False
+    with pytest.raises(EvidenceRequired):
+        layer.call("file_write", {"path": "a.eps", "code": "1"}, st)
 
 
 def test_mutation_gate_standalone_logic():

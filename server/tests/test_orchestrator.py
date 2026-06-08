@@ -262,6 +262,26 @@ def test_system_prompt_first_principles_before_rag(monkeypatch):
     assert "self-fix budget" in sp
 
 
+def test_system_prompt_has_message_format_section(monkeypatch):
+    """[message format] (EUD-092) tells codex that on resumed chats ONLY the
+    [user message] section is the instruction — [reference context] is
+    retrieved material — and that a bug report there is a work request."""
+    monkeypatch.setattr(
+        rag_mod, "search",
+        lambda q, k=5, *, rag_db: [{"text": "RAGCHUNK"}],
+    )
+    sp = build_system_prompt(
+        "make a thing", tool_layer=FakeToolLayer(), bridge=FakeBridge(),
+        rag_db="C:\\rag",
+    )
+    assert "[message format]" in sp
+    assert "[user message]" in sp
+    low = sp.lower()
+    assert "bug report" in low
+    # Pinned before triage so the instruction-vs-context rule frames triage.
+    assert sp.index("[message format]") < sp.index("[triage]")
+
+
 def test_system_prompt_bridge_failure_degrades(monkeypatch):
     monkeypatch.setattr(rag_mod, "search", lambda *a, **k: [])
 

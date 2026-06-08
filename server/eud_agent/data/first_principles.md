@@ -56,7 +56,10 @@ that build of StarCraft.
   single-entity property checked disappear (trigger Remove/Kill or combat
   death all crash). Known fix: edac/126815.
 - [#15] NEVER leave a button set's requirement string empty (0 / None).
-  (64-bit, crash)
+  (64-bit, crash) In the btn_set / SETBTN CSV the requirement strings are
+  fields 7-8 (enastr, disstr); any disableable button (actval != 0, i.e.
+  train/tech) MUST have a nonzero disstr — always-enabled command buttons
+  (actval == 0) are exempt.
 - [#21] NEVER attach a subunit to units other than: the 3 race workers, the 3
   race gas buildings, neutral gas resources, Tank, Goliath, Wraith, Vessel,
   Battlecruiser, and the Unused archon-hit-image entries.
@@ -121,3 +124,43 @@ that build of StarCraft.
 (Excluded as out of scope for this agent's tools: #11 EUD Editor 2 requirement
 override, #20 old SCM Draft 2 re-save of Remastered terrain, and the appendix
 SCM Draft .scx / EUD Editor 2 interop error.)
+
+## eps idioms (frequently miscoded — ALWAYS/NEVER)
+
+- ALWAYS read 0x628438 (First Empty Unit) IMMEDIATELY BEFORE CreateUnit, never
+  after — it holds the address of the unit ABOUT TO BE created; reading it after
+  the create points at the wrong (next) slot.
+  source: https://armoha.github.io/eud-book/offsets/FirstEmptyUnit.html ,
+  https://cafe.naver.com/f-e/cafes/17046257/articles/123974
+- ALWAYS back death counters (flags/timers/HP storage) with unit IDs that can
+  NEVER die in game for that player; NEVER reuse the unit id of a live unit that
+  player owns — in-game deaths and KillUnit/KillUnitAt increment the counter
+  (RemoveUnit does not). Especially NEVER store a boss's HP in the boss unit's
+  own death counter.
+- unitType lives in the low 16 bits of CUnit+0x64: ALWAYS compare it with
+  MemoryXEPD(epd + 0x64/4, ..., 0xFFFF), never an unmasked MemoryEPD dword
+  compare. source: https://cafe.naver.com/f-e/cafes/17046257/articles/140550
+- After setcurpl() in a loop, ALWAYS restore CP before any subsequent non-shared
+  action (DisplayText/CenterView) — save it with getcurpl() first or reset to a
+  known player. source: https://cafe.naver.com/f-e/cafes/17046257/articles/79225
+- Production-token button skills: ALWAYS edit the unit's OWN button set in place;
+  NEVER reassign the ButtonSet xdat to another set id (measured hard crash on
+  unit selection, 32-bit and 64-bit). Detect/reset the production queue via
+  BuildCheckXEPD/BuildResetXEPD. Token units need Mineral/Gas/Supply cost = 0 (a
+  click otherwise fails with resource errors). A non-building trainer can NEVER
+  actually produce a unit (only buildings, or the Reaver/Carrier lines, can), so
+  a token in a hero's queue never spawns — use it as a click trigger only.
+  Requirements for shared multi-hero tokens: AlwaysUse ("2") is the
+  measured-working visibility config, but keep the AlwaysUse count LOW — many
+  AlwaysUse entries risk requirement-table corruption and computer-AI side
+  effects; prefer per-unit "Current unit is" where a single owner suffices.
+  source: https://cafe.naver.com/f-e/cafes/17046257/articles/87852 ,
+  https://cafe.naver.com/edac/book5095361/88929 ,
+  https://cafe.naver.com/f-e/cafes/17046257/articles/139138
+- Button label tbl format: ALWAYS write labels as `[hotkey char][qualifier]<text>`
+  with the qualifier byte <00> general command / <01> unit production / <02>
+  research; a MISSING qualifier byte silently kills the hotkey (measured:
+  "w[W] Skill" dead, "w<00>[W] Skill" works). The editor stores <NN> bracket
+  escapes as text and converts them to \xNN bytes at build
+  (StringTool.BraketToHex). source:
+  https://cafe.naver.com/f-e/cafes/17046257/articles/81544

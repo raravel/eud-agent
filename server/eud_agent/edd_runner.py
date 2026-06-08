@@ -97,6 +97,13 @@ from .engine import parse_status
 # Default build-completion poll timeout (features/05 line 50: "timeout 300s").
 DEFAULT_BUILD_TIMEOUT = 300.0
 DEFAULT_POLL_INTERVAL = 0.5
+# Start grace (EUD-091): the FIRST status reads after BUILD's "OK: started" can
+# still be the PRE-build idle Tick's compiling=false — the bridge updates
+# status.txt on its 1s Tick, so the busy flag appears up to ~1s later. Until
+# the flag was SEEN once, a not-compiling read within this window must keep
+# polling instead of declaring the build done (and racing the error ladder
+# against a build still in flight). 3s covers the Tick cadence with margin.
+DEFAULT_START_GRACE = 3.0
 # Wall-clock cap on the euddraft.exe re-run spawn. rules.md forbids any unbounded
 # wait: a hung euddraft would block the runner thread forever. Defaults to the
 # same 300s budget as the build poll; injectable for tests.
@@ -322,17 +329,15 @@ class EddRunner:
     ``last_result`` holds the most recent build's :class:`BuildRunResult` so the
     ``build_errors`` tool can return the last ladder result.
 
-    LIVE-EDITOR RISK (flagged for the E2E, no behavior change here): the bridge
-    runs ``EudplibData:Build`` SYNCHRONOUSLY inside the 1s DispatcherTimer Tick
-    handler, and the ``status.txt`` write happens BEHIND the ``IsCompilng``
-    early-return. So a server poll of ``status.txt`` may NEVER observe
-    ``compiling=True`` — the whole build can begin and finish within one Tick
-    while ``status.txt`` still reads the pre-build state. ``_poll_until_done`` may
-    therefore return immediately (not-compiling on the first read). The ladder
-    still resolves correctly afterwards (BUILDERR + the fresh-output-map check do
-    not depend on having seen the compiling flag), but the "wait for the build to
-    finish" guarantee is best-effort against this synchronous-Tick reality and
-    must be confirmed in the live E2E.
+    LIVE-EDITOR REALITY (EUD-091): the bridge now writes ``status.txt``
+    BEFORE the ``IsCompilng`` early-return, so the busy flag IS observable —
+    but only from the first busy Tick, up to ~1s AFTER ``BUILD`` replies
+    "OK: started". ``_poll_until_done`` covers that gap with ``start_grace``:
+    a not-compiling read returns only once the flag was seen compiling or the
+    grace lapsed. A build that begins and finishes entirely within one Tick
+    never shows the flag; the ladder still resolves correctly (BUILDERR is
+    serialized behind the build by the bridge's busy inbox-skip, and the
+    fresh-output-map check does not depend on having seen the flag).
     """
 
     def __init__(
@@ -346,6 +351,7 @@ class EddRunner:
         poll_interval: float = DEFAULT_POLL_INTERVAL,
         timeout: float = DEFAULT_BUILD_TIMEOUT,
         subprocess_timeout: float = DEFAULT_SUBPROCESS_TIMEOUT,
+        start_grace: float = DEFAULT_START_GRACE,
     ) -> None:
         self._bridge = bridge
         self._spawn = spawn or subprocess.run
@@ -355,6 +361,7 @@ class EddRunner:
         self._poll_interval = poll_interval
         self._timeout = timeout
         self._subprocess_timeout = subprocess_timeout
+        self._start_grace = start_grace
         self.last_result: BuildRunResult | None = None
 
     @staticmethod
@@ -439,15 +446,27 @@ class EddRunner:
 
         The ``compiling`` flag is parsed with :func:`engine.parse_status` (the
         same parse the engine uses; it lowercases the value so VB's
-        ``compiling=True`` is handled). A first poll already showing not-compiling
-        returns immediately. On the deadline a :class:`TimeoutError` is raised
-        (the .cmd-style "leave it" semantics do not apply here -- BUILD already
-        returned ``OK: started``; this only waits for the flag to clear).
+        ``compiling=True`` is handled). On the deadline a :class:`TimeoutError`
+        is raised (the .cmd-style "leave it" semantics do not apply here --
+        BUILD already returned ``OK: started``; this only waits for the flag to
+        clear).
+
+        Start grace (EUD-091): the first reads after BUILD can still be the
+        PRE-build idle Tick's compiling=false (the bridge refreshes status.txt
+        on its 1s Tick). A not-compiling read returns only once the flag was
+        SEEN compiling, or after ``start_grace`` — otherwise the ladder would
+        race a build still in flight.
         """
         start = time.monotonic()
+        seen_compiling = False
         while True:
             compiling, _ = parse_status(self._read_status())
-            if not compiling:
+            if compiling:
+                seen_compiling = True
+            elif (
+                seen_compiling
+                or time.monotonic() - start >= self._start_grace
+            ):
                 return
             if time.monotonic() - start >= self._timeout:
                 raise TimeoutError(

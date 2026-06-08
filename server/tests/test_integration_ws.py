@@ -98,6 +98,13 @@ class FakeRunner:
 
 def dat_edit_script(*, value="999"):
     async def _script(emit, tools, request_id):
+        # Evidence gate (EUD-090): the app's REAL ToolLayer is RAG-wired, so a
+        # write without a prior search_docs in this request is rejected — the
+        # script searches first exactly like a real codex turn must (the
+        # patched rag.search returns []; zero hits still lift the gate).
+        tools.call_for_request(
+            request_id, "search_docs", {"query": "유닛 체력"},
+        )
         # A real journaled write through the real bridge (SETDAT round-trip).
         tools.call_for_request(
             request_id, "dat_set",

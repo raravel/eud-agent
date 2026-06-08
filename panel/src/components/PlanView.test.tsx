@@ -66,6 +66,33 @@ describe("PlanView — markdown render", () => {
     );
     expect(container.querySelector('[data-slot="plan"]')).not.toBeNull();
   });
+
+  it("renders evidence citation links as real anchors with href (EUD-090)", () => {
+    // Streamdown's default linkSafety renders links as href-LESS buttons +
+    // confirm modal — the live session showed citations as dead text. The
+    // Response wrapper disables it: links must be <a href target="_blank">
+    // (the WebView2 host routes the new-window request to the default browser).
+    const plan: PlanState = {
+      revision: 1,
+      markdown:
+        "- 이유: 대기열 인식 패턴이 검증되어 있습니다. " +
+        "(근거: [EPS로 배쉬 스킬을 만들어보자.](https://cafe.naver.com/f-e/cafes/17046257/articles/137536))",
+    };
+    const { container } = render(
+      <PlanView plan={plan} pending={false} onApprove={() => {}} />,
+    );
+    const anchor = container.querySelector('a[data-streamdown="link"]');
+    expect(anchor).not.toBeNull();
+    expect(anchor?.getAttribute("href")).toBe(
+      "https://cafe.naver.com/f-e/cafes/17046257/articles/137536",
+    );
+    expect(anchor?.getAttribute("target")).toBe("_blank");
+    expect(anchor?.textContent).toBe("EPS로 배쉬 스킬을 만들어보자.");
+    // The href-less link-safety BUTTON shape must be gone.
+    expect(
+      container.querySelector('button[data-streamdown="link"]'),
+    ).toBeNull();
+  });
 });
 
 describe("PlanView — revision replacement (store-driven)", () => {

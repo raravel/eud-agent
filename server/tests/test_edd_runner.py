@@ -254,6 +254,9 @@ def make_runner(
         _calls[p] = n + 1
         return None if n == 0 else 100.0
 
+    # start_grace=0 by default: these fakes feed the FINAL status directly;
+    # the stale-first-read grace is exercised by its own test below.
+    kw.setdefault("start_grace", 0.0)
     return EddRunner(
         bridge,
         spawn=spawn or RecordingSpawn(),
@@ -326,6 +329,40 @@ def test_poll_timeout_raises():
     )
     with pytest.raises(TimeoutError):
         runner.build_run()
+
+
+def test_poll_outlasts_stale_first_not_compiling_read():
+    """EUD-091: the FIRST status reads after BUILD's "OK: started" can still
+    be the PRE-build idle Tick's compiling=false (the bridge refreshes
+    status.txt on its 1s Tick). Within start_grace a not-compiling read must
+    KEEP polling until the flag was seen compiling — returning immediately
+    would race the error ladder against a build still in flight."""
+    bridge = FakeBridge(builderr="")
+    statuses = ["compiling=False", "compiling=True", "compiling=False"]
+    reads: list[str] = []
+
+    def read_status():
+        s = statuses.pop(0) if len(statuses) > 1 else statuses[0]
+        reads.append(s)
+        return s
+
+    runner = EddRunner(
+        bridge,
+        spawn=RecordingSpawn(),
+        read_status=read_status,
+        path_exists=lambda p: True,
+        path_mtime=lambda p: None,
+        poll_interval=0.0,
+        timeout=5.0,
+        start_grace=5.0,
+    )
+    result = runner.build_run()
+    # All three statuses were consumed: the stale first compiling=false did
+    # NOT end the poll; only the false AFTER compiling=true was seen did.
+    assert reads[:3] == [
+        "compiling=False", "compiling=True", "compiling=False",
+    ]
+    assert result.ok is True  # output map exists + absent-before -> fresh
 
 
 # --------------------------------------------------------------------------- #

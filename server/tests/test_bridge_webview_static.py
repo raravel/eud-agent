@@ -311,6 +311,26 @@ def test_core_init_completed_subscription():
     )
 
 
+def test_new_window_requested_opens_default_browser():
+    """Citation links (EUD-090) raise NewWindowRequested; the bridge must mark
+    it Handled (no WebView2 popup; the panel never navigates away) and
+    shell-open the http(s) uri in the user's default browser."""
+    text = _read_text()
+    assert "NewWindowRequested" in text, (
+        "no NewWindowRequested subscription (evidence citation links render "
+        "target=_blank; without a handler WebView2 spawns its own popup)"
+    )
+    assert re.search(r"Handled\s*=\s*true", text), (
+        "NewWindowRequested must set Handled=true (suppress the WebView2 popup)"
+    )
+    assert re.search(r"UseShellExecute\s*=\s*true", text), (
+        "the uri must be shell-opened (UseShellExecute=true -> default browser)"
+    )
+    assert '"http://' in text and '"https://' in text, (
+        "the handler must whitelist http(s) uris only"
+    )
+
+
 # --------------------------------------------------------------------------
 # 4. NavigationCompleted subscription + re-navigate backoff + navOk flag
 # --------------------------------------------------------------------------
@@ -592,6 +612,162 @@ def test_extension_adds_no_raw_nonascii_bytes():
         f"non-ASCII byte count grew to {nonascii} (baseline "
         f"{BASELINE_NONASCII_BYTES}); the WebView2 extension must not add raw "
         f"non-ASCII bytes (ASCII window title; Korean UI lives in the web panel)"
+    )
+
+
+# --------------------------------------------------------------------------
+# 9. busy status write + self-correcting dat/xdat errors (EUD-091)
+# --------------------------------------------------------------------------
+def test_busy_status_written_before_compiling_early_return():
+    """status.txt is written INSIDE the IsCompilng branch, before its return.
+
+    status.txt is the server's only busy signal (the 10s->180s poll-timeout
+    extension + the panel's waiting_build notice). Writing it only on idle
+    Ticks left it permanently compiling=false, so every command during a
+    build timed out at 10s with a misleading compiling=False.
+    """
+    text = _read_text()
+    region = _strip_comments(_tick_region(text))
+    # The busy branch: from the IsCompilng test to its early `return`.
+    m = re.search(r"IsCompilng\s+then\b", region)
+    assert m, "no `IsCompilng then` early-return branch in the Tick"
+    ret = re.search(r"\breturn\b", region[m.end():])
+    assert ret, "no `return` after the IsCompilng test"
+    busy = region[m.end(): m.end() + ret.start()]
+    assert "status.txt" in busy, (
+        "the IsCompilng branch does not write status.txt before its early "
+        "return; the server can then never observe compiling=true (10s "
+        "timeouts during every build)"
+    )
+    assert "compiling=True" in busy, (
+        "the busy status write does not report the literal compiling=True"
+    )
+    # heartbeat stays FIRST (rules.md): its write precedes the IsCompilng test.
+    hb = region.find("heartbeat.txt")
+    assert 0 <= hb < m.start(), (
+        "heartbeat.txt is not written before the IsCompilng early-return"
+    )
+
+
+def test_busy_status_does_not_touch_pjdata():
+    """The busy status write reuses a cached project line (no pjData access).
+
+    Editor objects must not be touched while IsCompilng (rules.md: the build
+    shares the lua_State from a BackgroundWorker) — the busy write may only
+    use the `lastProjectLine` bare global cached on the previous idle Tick.
+    """
+    text = _read_text()
+    region = _strip_comments(_tick_region(text))
+    m = re.search(r"IsCompilng\s+then\b", region)
+    assert m, "no `IsCompilng then` early-return branch in the Tick"
+    ret = re.search(r"\breturn\b", region[m.end():])
+    busy = region[m.end(): m.end() + ret.start()]
+    assert "lastProjectLine" in busy, (
+        "the busy status write does not use the cached lastProjectLine"
+    )
+    assert "pjData" not in busy and "pj.Filename" not in busy, (
+        "the busy status write touches pjData while IsCompilng (forbidden: "
+        "the build shares the lua_State from a BackgroundWorker)"
+    )
+    # The cache is a bare global (luanet static-proxy idiom) refreshed on the
+    # idle path, where pjData access is legal.
+    code = _strip_comments(text)
+    assert re.search(r"(?m)^(?!\s*local\b)\s*lastProjectLine\s*=", code), (
+        "no `lastProjectLine` bare-global tracking"
+    )
+    idle = region[m.end() + ret.end():]
+    assert re.search(r"lastProjectLine\s*=", idle), (
+        "the idle Tick path does not refresh lastProjectLine"
+    )
+
+
+def test_datbinding_error_lists_valid_params():
+    """A failed GETDAT/SETDAT resolve names the valid params (self-correcting).
+
+    The live sessions burned 4-5 calls per request guessing display names
+    ('Gas Cost', 'HitPoints') against a bare 'param/index' error; the error
+    must enumerate the dat's valid param names.
+    """
+    text = _read_text()
+    body = _function_body(text, "resolveDatBinding")
+    assert "datParamNames" in body, (
+        "resolveDatBinding() does not consult datParamNames() for the error"
+    )
+    assert "valid params for" in body, (
+        "the param/index error does not carry the valid-param list"
+    )
+    # The walker uses the rules.md-safe accessors: parameterized property
+    # get_GetDatFile, List get_Item, parameterless GetParamname via dot.
+    walker = _function_body(text, "datParamNames")
+    assert re.search(r":get_GetDatFile\s*\(", walker), (
+        "datParamNames() does not use :get_GetDatFile( (VB parameterized "
+        "property; plain access throws TargetParameterCountException)"
+    )
+    assert re.search(r":get_Item\s*\(", walker), (
+        "datParamNames() does not use :get_Item( for the List walk"
+    )
+    assert ".GetParamname" in walker, (
+        "datParamNames() does not read .GetParamname"
+    )
+
+
+def test_xdatbinding_error_lists_valid_names():
+    """A failed GETXDAT/SETXDAT resolve names the kind's valid names.
+
+    The xdat name sets are FIXED (editor BindingManager.vb:340-380):
+    statusinfor Status/Display/Joint, wireframe wire/grp/tran, ButtonSet
+    ButtonSet. The null-binding error must enumerate them.
+    """
+    text = _read_text()
+    body = _function_body(text, "resolveXDatBinding")
+    assert "valid names for" in body, (
+        "the null-binding error does not carry the kind's valid names"
+    )
+    assert "Status, Display, Joint" in text, (
+        "statusinfor's valid names (Status, Display, Joint) are not listed"
+    )
+    assert "wire, grp, tran" in text, (
+        "wireframe's valid names (wire, grp, tran) are not listed"
+    )
+
+
+def _setbtn_branch_region(text: str) -> str:
+    """Source region of the ``cmd == "SETBTN"`` dispatcher branch body.
+
+    From the SETBTN branch to the next ``elseif cmd ==`` so the markers are
+    attributable to SETBTN rather than a neighboring branch.
+    """
+    m = _branch_re("SETBTN").search(text)
+    assert m, "SETBTN branch missing"
+    region = text[m.start():]
+    nxt = re.search(r"\n\s*elseif cmd ==", region[1:])
+    if nxt:
+        region = region[: nxt.start() + 1]
+    return region
+
+
+def test_setbtn_clears_isdefault():
+    """SETBTN clears the button set's IsDefault flag after PasteFromString.
+
+    Measured 2026-06-07 (EUD Editor 3 v0.19.6.0 + SC:R): PasteFromString never
+    clears IsDefault; WriteButtonData.vb skips Db bytebuffer emission for
+    IsDefault sets, so the runtime patch table keeps a stale default address
+    with the new button count -> wild pointer -> StarCraft hard-crash on unit
+    selection (32-bit and 64-bit, no EUD error dialog). The branch MUST set the
+    set's IsDefault to false (plain dot-property assignment) so the edited set
+    is emitted.
+    """
+    text = _read_text()
+    region = _strip_comments(_setbtn_branch_region(text))
+    assert "PasteFromString" in region, (
+        "SETBTN branch does not call PasteFromString (precondition for the "
+        "IsDefault-clear rail)"
+    )
+    assert re.search(r"\bIsDefault\s*=\s*false\b", region), (
+        "SETBTN branch does not clear IsDefault after PasteFromString; "
+        "WriteButtonData.vb skips Db emission for IsDefault sets -> stale "
+        "default address -> SC hard-crash on unit selection (measured "
+        "2026-06-07)"
     )
 
 

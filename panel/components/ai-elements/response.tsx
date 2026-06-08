@@ -21,6 +21,13 @@ export const Response = memo(
         "size-full [&>*:first-child]:mt-0 [&>*:last-child]:mb-0",
         className,
       )}
+      // Citation links (EUD-090): streamdown's default linkSafety renders every
+      // markdown link as an href-LESS button + confirm modal — in the panel the
+      // agent's evidence citations looked like dead text. Disabled so links are
+      // plain <a href target="_blank">; the WebView2 host (bridge) routes the
+      // resulting NewWindowRequested to the user's default browser, so the
+      // panel itself never navigates away. Callers can still override via props.
+      linkSafety={{ enabled: false }}
       {...props}
     />
   ),
