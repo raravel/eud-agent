@@ -37,12 +37,19 @@ The corpus index and the runtime query MUST share an embedding space, or retriev
   L2 normalization** so the at-rest index and the runtime query share the embedding space.
 
 ## Index format (at-rest, downloaded from GitHub Release)
-A read-only sqlite (`rag/index.sqlite`, rusqlite) built in CI:
+A read-only self-contained binary blob (`rag/rag-index.bin`, `bootstrap::RAG_INDEX_FILENAME`)
+built in CI and parsed with std only — **no `rusqlite`/sqlite dependency** (the index is
+loaded fully into RAM and brute-force scanned, so a queryable container buys nothing; EUD-109
+decision). Little-endian layout:
 ```
-docs(id INTEGER PK, text TEXT, source TEXT, meta JSON, vector BLOB /* 1024 f32 LE */)
+magic b"ERAG" [4] | version u32 = 1 | count u32 |
+  count records: id u64 | vector EMBED_DIM(1024) * f32 (4096 bytes) |
+  text_len u32 + text utf8 | source_len u32 + source utf8
 ```
-4,974 rows (~20MB). Loaded fully into memory at warmup into `Vec<(id, [f32;1024], text,
-source)>`. `source` carries the `[reference context]` link header used by the evidence gate.
+4,974 rows (~20MB). Loaded fully into memory at warmup into `Vec<IndexEntry { id, vector:
+[f32;1024], text, source }>`. `source` carries the `[reference context]` link header used by
+the evidence gate. `load_index` rejects bad magic/version, truncation, non-utf8, or a
+non-`EMBED_DIM` vector as a typed `RagError::Index` (never panics).
 
 ## Query path
 ```mermaid
@@ -61,8 +68,9 @@ sequenceDiagram
 
 ## CI index builder
 `ci/build_rag_index.*` re-embeds the ECA corpus (read-only input) with fastembed bge-m3 and
-writes `index.sqlite` + a sha256; published as a versioned GitHub Release asset. The ECA
-repo and its chromadb are never modified or imported.
+writes `rag-index.bin` (the exact `ERAG`/v1 layout above, so the at-rest index and the
+runtime query share the embedding space) + a sha256; published as a versioned GitHub Release
+asset. The ECA repo and its chromadb are never modified or imported.
 
 ## Edge cases
 - Model still warming when a query arrives -> await warmup or return `rag_warmup` progress,
@@ -70,7 +78,9 @@ repo and its chromadb are never modified or imported.
 - Index version mismatch vs config -> bootstrap re-downloads (feature 10).
 
 ## Implementation
-- `src-tauri/src/rag.rs` — fastembed init, warmup, in-memory cosine search
-- `ci/build_rag_index.rs` (or script) — corpus re-embed + sqlite writer + sha256
-- `src-tauri/tests/rag_parity.rs` — `#[ignore]` parity test vs Python baseline fixtures
-- external: `fastembed` (bge-m3 ONNX + HF cache), `rusqlite`, `ort` (transitive)
+- `src-tauri/src/rag.rs` — fastembed init, warmup, in-memory cosine search; `.bin`
+  `write_index`/`load_index` (`ERAG`/v1, std-only); `Rag::{new,from_index_file,warmup,
+  rank,search}` (EUD-109)
+- `ci/build_rag_index.rs` (or script) — corpus re-embed + `.bin` (`ERAG`/v1) writer + sha256
+- `src-tauri/src/rag.rs` `#[cfg(test)] mod parity` — `#[ignore]` parity test vs Python baseline fixtures
+- external: `fastembed` (bge-m3 ONNX + HF cache), `ort` (transitive) — **no `rusqlite`**
