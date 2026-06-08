@@ -1790,7 +1790,7 @@
       ]
     },
     "EUD-109-b35b": {
-      "status": "pending",
+      "status": "done",
       "priority": "high",
       "type": "task",
       "parent": "EUD-093-65b1",
@@ -1799,8 +1799,8 @@
       ],
       "title": "rag.rs query path: fastembed init + warmup + brute-force cosine",
       "updated": "2026-06-08",
-      "completed_at": null,
-      "path": "active/EUD-109-b35b.md",
+      "completed_at": "2026-06-08T16:33:51.884481",
+      "path": "done/EUD-109-b35b.md",
       "scope": [
         "src-tauri/src/rag.rs"
       ]
