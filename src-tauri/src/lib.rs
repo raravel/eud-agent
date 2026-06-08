@@ -7,6 +7,7 @@
 //! later tasks.
 
 pub mod bootstrap;
+pub mod bridge_io;
 pub mod config;
 pub mod ipc;
 pub mod mapsafe;

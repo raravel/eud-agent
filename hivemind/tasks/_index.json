@@ -1823,7 +1823,7 @@
       ]
     },
     "EUD-111-7740": {
-      "status": "pending",
+      "status": "done",
       "priority": "high",
       "type": "task",
       "parent": "EUD-094-e9ee",
@@ -1832,10 +1832,11 @@
       ],
       "title": "bridge_io file-IPC client port",
       "updated": "2026-06-08",
-      "completed_at": null,
-      "path": "active/EUD-111-7740.md",
+      "completed_at": "2026-06-08T17:33:46.232065",
+      "path": "done/EUD-111-7740.md",
       "scope": [
-        "src-tauri/src/bridge_io.rs"
+        "src-tauri/src/bridge_io.rs",
+        "src-tauri/src/lib.rs"
       ]
     },
     "EUD-112-4f01": {
