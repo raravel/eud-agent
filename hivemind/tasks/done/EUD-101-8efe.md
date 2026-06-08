@@ -1,4 +1,5 @@
 ---
+completed_at: '2026-06-08T11:51:11.712100'
 created: '2026-06-08'
 depends_on: []
 id: EUD-101-8efe
@@ -6,7 +7,7 @@ parent: EUD-092-121b
 priority: high
 scope:
 - native/isom/**
-status: pending
+status: done
 title: Vendor isom-poc C++ + MSBuild static-lib target
 type: task
 updated: '2026-06-08'

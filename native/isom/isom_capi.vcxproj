@@ -1,0 +1,171 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  isom_capi.vcxproj — static-library target for the eud-agent C ABI shim.
+
+  Produces ONE static library (isom_capi.lib) that contains:
+    * the C ABI shim (isom_capi.cpp), and
+    * the verified isom-poc engine entry surface it drives
+      (IsomTerrain\MapGenCli.cpp = mapGenMain + chk/locedit/playeredit;
+       IsomTerrain\IsomTests.cpp = the `logger`/`terrainDat` global definitions
+       those routines reference). Main.cpp is intentionally NOT compiled (it owns
+       `int main` and would clash when this is linked into the Tauri/Rust binary).
+
+  The five buildable dependency subprojects (CascLib, CrossCutLib, IcuLib,
+  MappingCoreLib, StormLib) are wired via <ProjectReference> for build ordering,
+  and their output .libs are folded into isom_capi.lib by the librarian
+  (<Lib><AdditionalDependencies>) so downstream Rust links a single archive.
+  RareCpp is header-only (../RareCpp/include) and needs no project.
+
+  Configurations mirror the upstream solution names. The "US" set is Unicode
+  (CharacterSet=Unicode -> UNICODE/_UNICODE), matching the verified Release/Debug
+  build of IsomTerrain. The downstream isom-sys build.rs targets ReleaseUS|x64.
+
+  PlatformToolset is left as $(PlatformToolset) with a v143 default; pass
+  /p:PlatformToolset=v143 (or install v142) on the MSBuild command line. The
+  vendored subproject files are kept verbatim (import-then-extend) and inherit
+  the same override.
+-->
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="DebugAS|x64">
+      <Configuration>DebugAS</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="DebugUS|x64">
+      <Configuration>DebugUS</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="ReleaseAS|x64">
+      <Configuration>ReleaseAS</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="ReleaseUS|x64">
+      <Configuration>ReleaseUS</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <VCProjectVersion>16.0</VCProjectVersion>
+    <Keyword>Win32Proj</Keyword>
+    <ProjectGuid>{B2D7E3A1-1C44-4F6E-9A21-7C0E5A9F1D31}</ProjectGuid>
+    <RootNamespace>isom_capi</RootNamespace>
+    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Condition="'$(PlatformToolset)'==''">
+    <PlatformToolset>v143</PlatformToolset>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='DebugUS|x64'" Label="Configuration">
+    <ConfigurationType>StaticLibrary</ConfigurationType>
+    <UseDebugLibraries>true</UseDebugLibraries>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='DebugAS|x64'" Label="Configuration">
+    <ConfigurationType>StaticLibrary</ConfigurationType>
+    <UseDebugLibraries>true</UseDebugLibraries>
+    <CharacterSet>MultiByte</CharacterSet>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='ReleaseUS|x64'" Label="Configuration">
+    <ConfigurationType>StaticLibrary</ConfigurationType>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <WholeProgramOptimization>true</WholeProgramOptimization>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='ReleaseAS|x64'" Label="Configuration">
+    <ConfigurationType>StaticLibrary</ConfigurationType>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <WholeProgramOptimization>true</WholeProgramOptimization>
+    <CharacterSet>MultiByte</CharacterSet>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <ImportGroup Label="ExtensionSettings">
+  </ImportGroup>
+  <ImportGroup Label="Shared">
+  </ImportGroup>
+  <ImportGroup Label="PropertySheets" Condition="'$(Platform)'=='x64'">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <PropertyGroup Label="UserMacros" />
+  <PropertyGroup>
+    <OutDir>$(SolutionDir)$(Platform)\$(Configuration)\</OutDir>
+    <IntDir>$(Platform)\$(Configuration)\$(ProjectName)\</IntDir>
+    <LibraryPath>$(SolutionDir)$(Platform)\$(Configuration)\;$(VC_LibraryPath_x64);$(WindowsSDK_LibraryPath_x64)</LibraryPath>
+  </PropertyGroup>
+  <!-- Common compile/lib settings; per-config Optimization/RuntimeLibrary below. -->
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <WarningLevel>Level3</WarningLevel>
+      <SDLCheck>true</SDLCheck>
+      <ConformanceMode>true</ConformanceMode>
+      <LanguageStandard>stdcpp17</LanguageStandard>
+      <MultiProcessorCompilation>true</MultiProcessorCompilation>
+      <!-- Match MappingCoreLib's consumer-relevant defines: suppress CASc/Storm
+           auto-link pragmas and the Windows min/max macros (Chk.h uses std::min/max),
+           plus the usual CRT-secure relax. The engine headers are included via the
+           IsomTerrain subfolder; IcuLib is on the path for icu headers if pulled. -->
+      <PreprocessorDefinitions>STORMLIB_NO_AUTO_LINK;CASCLIB_NO_AUTO_LINK_LIBRARY;NOMINMAX;_CRT_SECURE_NO_WARNINGS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>$(ProjectDir)IsomTerrain;$(ProjectDir)IcuLib;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <!-- Force UTF-8 source decoding: the vendored engine .cpp files (MapGenCli.cpp,
+           IsomTests.cpp) carry UTF-8 comments; without /utf-8 MSVC falls back to the
+           system codepage (e.g. CP949) and mis-parses multibyte bytes. -->
+      <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
+    </ClCompile>
+    <Lib>
+      <!-- Fold the dependency static libs (built by the referenced projects into
+           the shared OutDir) into this one archive so Rust links a single .lib. -->
+      <AdditionalDependencies>CascLib.lib;CrossCutLib.lib;IcuLib.lib;MappingCoreLib.lib;StormLib.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalLibraryDirectories>$(SolutionDir)$(Platform)\$(Configuration)\;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+    </Lib>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)'=='DebugUS' or '$(Configuration)'=='DebugAS'">
+    <ClCompile>
+      <RuntimeLibrary>MultiThreadedDebug</RuntimeLibrary>
+      <PreprocessorDefinitions>_DEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)'=='ReleaseUS' or '$(Configuration)'=='ReleaseAS'">
+    <ClCompile>
+      <FunctionLevelLinking>true</FunctionLevelLinking>
+      <IntrinsicFunctions>true</IntrinsicFunctions>
+      <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
+      <PreprocessorDefinitions>NDEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+  </ItemDefinitionGroup>
+  <ItemGroup>
+    <ClInclude Include="isom_capi.h" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="isom_capi.cpp" />
+    <!-- Verified engine entry surface (import-then-extend; NOT Main.cpp). -->
+    <ClCompile Include="IsomTerrain\MapGenCli.cpp" />
+    <ClCompile Include="IsomTerrain\IsomTests.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <!-- Build-order dependencies. Their .libs are merged via <Lib> above; we do
+         not let the reference auto-link (LinkLibraryDependencies=false) because a
+         StaticLibrary target uses the librarian, not the linker. -->
+    <ProjectReference Include="CascLib\CascLib_vs22.vcxproj">
+      <Project>{4f9b8768-0cc1-4249-b135-46c1eead8191}</Project>
+      <LinkLibraryDependencies>false</LinkLibraryDependencies>
+    </ProjectReference>
+    <ProjectReference Include="CrossCutLib\CrossCutLib.vcxproj">
+      <Project>{6c146ac6-2ec2-45c5-82cd-4fbcdf1cbc9d}</Project>
+      <LinkLibraryDependencies>false</LinkLibraryDependencies>
+    </ProjectReference>
+    <ProjectReference Include="IcuLib\common.vcxproj">
+      <Project>{73c0a65b-d1f2-4de1-b3a6-15dad2c23f3d}</Project>
+      <LinkLibraryDependencies>false</LinkLibraryDependencies>
+    </ProjectReference>
+    <ProjectReference Include="MappingCoreLib\MappingCoreLib.vcxproj">
+      <Project>{0b7f9d23-a773-4ea5-80a5-c141d3e884ec}</Project>
+      <LinkLibraryDependencies>false</LinkLibraryDependencies>
+    </ProjectReference>
+    <ProjectReference Include="StormLib\StormLib_vs22.vcxproj">
+      <Project>{78424708-1f6e-4d4b-920c-fb6d26847055}</Project>
+      <LinkLibraryDependencies>false</LinkLibraryDependencies>
+    </ProjectReference>
+  </ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <ImportGroup Label="ExtensionTargets">
+  </ImportGroup>
+</Project>

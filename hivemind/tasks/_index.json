@@ -1650,15 +1650,15 @@
       ]
     },
     "EUD-101-8efe": {
-      "status": "in_progress",
+      "status": "done",
       "priority": "high",
       "type": "task",
       "parent": "EUD-092-121b",
       "depends_on": [],
       "title": "Vendor isom-poc C++ + MSBuild static-lib target",
       "updated": "2026-06-08",
-      "completed_at": null,
-      "path": "active/EUD-101-8efe.md",
+      "completed_at": "2026-06-08T11:51:11.712100",
+      "path": "done/EUD-101-8efe.md",
       "scope": [
         "native/isom/**"
       ]

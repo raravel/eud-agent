@@ -1,0 +1,35 @@
+# MSBuild intermediates and outputs for the vendored isom static-lib target.
+# The built .lib is a regenerable artifact (the Rust isom-sys build.rs rebuilds
+# it); only the vendored C++ source + shim + project files are committed.
+
+# Per-config build output / intermediate dirs (any depth)
+x64/
+Win32/
+Debug/
+Release/
+DebugAS/
+DebugUS/
+ReleaseAS/
+ReleaseUS/
+
+# VS local state
+.vs/
+
+# Compiler / linker artifacts
+*.obj
+*.lib
+*.pdb
+*.ilk
+*.exp
+*.idb
+*.tlog
+*.log
+*.lastbuildstate
+*.recipe
+
+# User-specific project state
+*.user
+*.aps
+*.suo
+*.VC.db
+*.VC.opendb
