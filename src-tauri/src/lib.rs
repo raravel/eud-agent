@@ -9,6 +9,7 @@
 pub mod bootstrap;
 pub mod config;
 pub mod mapsafe;
+pub mod rag;
 
 /// Build and run the Tauri application.
 ///

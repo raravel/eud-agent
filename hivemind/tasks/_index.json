@@ -1754,7 +1754,7 @@
       ]
     },
     "EUD-107-c55c": {
-      "status": "pending",
+      "status": "done",
       "priority": "high",
       "type": "task",
       "parent": "EUD-093-65b1",
@@ -1763,11 +1763,14 @@
       ],
       "title": "Embedding parity spike (fastembed bge-m3 vs Python top-k)",
       "updated": "2026-06-08",
-      "completed_at": null,
-      "path": "active/EUD-107-c55c.md",
+      "completed_at": "2026-06-08T15:17:19.457988",
+      "path": "done/EUD-107-c55c.md",
       "scope": [
         "src-tauri/tests/rag_parity.rs",
-        "src-tauri/src/rag.rs"
+        "src-tauri/src/rag.rs",
+        "src-tauri/tests/fixtures/rag_parity.json",
+        "ci/gen_rag_parity_fixture.py",
+        "src-tauri/src/lib.rs"
       ]
     },
     "EUD-108-6439": {
