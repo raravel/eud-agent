@@ -6,14 +6,15 @@ coding_retries: 0
 verify_retries: 0
 review_rounds: 0
 verification_required: true
-verification_passed: false
-blocking_issues: true
-status: blocked
+verification_passed: true
+blocking_issues: false
+status: done
+revived_at: 2026-06-08T14:45:00
 review_scores:
-  correctness: null
-  spec_compliance: null
-  safety: null
-  clarity: null
+  correctness: 9
+  spec_compliance: 7
+  safety: 9
+  clarity: 9
 tokens:
   estimated: true
   input: 97533
@@ -91,3 +92,33 @@ MSVC 14.40.33807 does not provide.
    fetch the DLL).
 4. **Switch embedding backend to `candle`** (the rejected alternative in Decision 10) — largest
    change.
+
+## Revival (2026-06-08)
+
+Resolution option 1 happened: the local MSVC toolset is now **14.44.35207** (≥ the 14.41 the ort
+prebuilt needs). The blocker is gone — confirmed empirically (a fastembed-referencing
+`cargo test -p eud-agent --no-run` links cleanly).
+
+Revival steps (orchestrator):
+- Cherry-picked the two preserved bootstrap commits (`4fea4da` test, `3f95678` impl, kept on
+  branch `eud-100-bootstrap`) onto current `main` via a fresh worktree — auto-merged with no
+  conflicts (lib.rs gained `pub mod bootstrap;` alongside the later `pub mod config;`/`pub mod
+  mapsafe;`).
+- Provisioned the gitignored `panel/dist` into the fresh worktree (required by
+  `tauri::generate_context!()`), then re-verified: **`cargo test -p eud-agent` → 26 passed / 0
+  failed** (the previously-unlinkable `bootstrap::manifest` smoke now links + passes), clippy
+  `-D warnings` clean, fmt clean.
+- First review (the task was originally BLOCKED before review): no blocking findings; rubric
+  correctness 9 / spec_compliance 7 / safety 9 / clarity 9. Atomic-place + sha256 +
+  tmp-cleanup verified correct (no half-install / corrupt-model risk).
+
+Carried-forward advisories (for the bootstrap-WIRING task, not blocking the merge):
+- **Model sha256**: `ensure_model` delegates integrity to hf-hub's etag and ignores
+  `config.model.sha256` / `config.model.name` (the model is multi-file, so a single hash does
+  not map cleanly). Decide at wiring time: hash `model_quantized.onnx` against
+  `config.model.sha256`, OR document the hf-hub delegation in feature 10 so spec and code agree.
+- **`block_in_place`** in `bootstrap_assets` requires the multi-threaded tokio runtime (Tauri's
+  default) — the init wiring must not call it from a current-thread runtime (or switch to
+  `spawn_blocking`).
+
+Merged to `main`; task moved to done.

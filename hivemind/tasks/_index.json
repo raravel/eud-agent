@@ -1514,15 +1514,15 @@
       "scope": []
     },
     "EUD-091-4cb2": {
-      "status": "pending",
+      "status": "done",
       "priority": "high",
       "type": "story",
       "parent": "EUD-090-b768",
       "depends_on": [],
       "title": "S1 Tauri shell + first-run bootstrap",
       "updated": "2026-06-08",
-      "completed_at": null,
-      "path": "active/EUD-091-4cb2.md",
+      "completed_at": "2026-06-08T14:45:55.286289",
+      "path": "done/EUD-091-4cb2.md",
       "scope": []
     },
     "EUD-092-121b": {
@@ -1635,7 +1635,7 @@
       ]
     },
     "EUD-100-b403": {
-      "status": "blocked",
+      "status": "done",
       "priority": "high",
       "type": "task",
       "parent": "EUD-091-4cb2",
@@ -1644,8 +1644,8 @@
       ],
       "title": "First-run bootstrap downloader (sha256, atomic, progress)",
       "updated": "2026-06-08",
-      "completed_at": null,
-      "path": "active/EUD-100-b403.md",
+      "completed_at": "2026-06-08T14:45:55.249719",
+      "path": "done/EUD-100-b403.md",
       "scope": [
         "src-tauri/src/bootstrap.rs",
         "src-tauri/Cargo.toml",

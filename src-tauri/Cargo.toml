@@ -25,3 +25,7 @@ serde_json = "1"
 anyhow = "1"
 thiserror = "1"
 fastembed = "5.15"
+# Bootstrap downloader (EUD-100): rustls-tls avoids OpenSSL so it builds cleanly on the
+# MSVC toolchain; `stream` yields the chunked body for byte-progress reporting.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+sha2 = "0.10"

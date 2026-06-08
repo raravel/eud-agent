@@ -6,6 +6,7 @@
 //! tools, codex_client, rag, isom, mapsafe, bridge_io, memory, config, bootstrap) are
 //! added by later tasks — no custom IPC commands are registered yet.
 
+pub mod bootstrap;
 pub mod config;
 pub mod mapsafe;
 
