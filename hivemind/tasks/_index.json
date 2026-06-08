@@ -1500,6 +1500,490 @@
         "server/**",
         "hivemind/docs/**"
       ]
+    },
+    "EUD-090-b768": {
+      "status": "pending",
+      "priority": "high",
+      "type": "epic",
+      "parent": null,
+      "depends_on": [],
+      "title": "Tauri + Rust standalone rewrite (v2 architecture)",
+      "updated": "2026-06-08",
+      "completed_at": null,
+      "path": "active/EUD-090-b768.md",
+      "scope": []
+    },
+    "EUD-091-4cb2": {
+      "status": "pending",
+      "priority": "high",
+      "type": "story",
+      "parent": "EUD-090-b768",
+      "depends_on": [],
+      "title": "S1 Tauri shell + first-run bootstrap",
+      "updated": "2026-06-08",
+      "completed_at": null,
+      "path": "active/EUD-091-4cb2.md",
+      "scope": []
+    },
+    "EUD-092-121b": {
+      "status": "pending",
+      "priority": "high",
+      "type": "story",
+      "parent": "EUD-090-b768",
+      "depends_on": [],
+      "title": "S2 isom C++ FFI engine",
+      "updated": "2026-06-08",
+      "completed_at": null,
+      "path": "active/EUD-092-121b.md",
+      "scope": []
+    },
+    "EUD-093-65b1": {
+      "status": "pending",
+      "priority": "high",
+      "type": "story",
+      "parent": "EUD-090-b768",
+      "depends_on": [],
+      "title": "S3 Rust RAG (fastembed + brute-force)",
+      "updated": "2026-06-08",
+      "completed_at": null,
+      "path": "active/EUD-093-65b1.md",
+      "scope": []
+    },
+    "EUD-094-e9ee": {
+      "status": "pending",
+      "priority": "high",
+      "type": "story",
+      "parent": "EUD-090-b768",
+      "depends_on": [],
+      "title": "S4 Rust backend core",
+      "updated": "2026-06-08",
+      "completed_at": null,
+      "path": "active/EUD-094-e9ee.md",
+      "scope": []
+    },
+    "EUD-095-fbc3": {
+      "status": "pending",
+      "priority": "medium",
+      "type": "story",
+      "parent": "EUD-090-b768",
+      "depends_on": [],
+      "title": "S5 Slim Lua bridge",
+      "updated": "2026-06-08",
+      "completed_at": null,
+      "path": "active/EUD-095-fbc3.md",
+      "scope": []
+    },
+    "EUD-096-4eb3": {
+      "status": "pending",
+      "priority": "medium",
+      "type": "story",
+      "parent": "EUD-090-b768",
+      "depends_on": [],
+      "title": "S6 Panel transport migration",
+      "updated": "2026-06-08",
+      "completed_at": null,
+      "path": "active/EUD-096-4eb3.md",
+      "scope": []
+    },
+    "EUD-097-7931": {
+      "status": "pending",
+      "priority": "medium",
+      "type": "story",
+      "parent": "EUD-090-b768",
+      "depends_on": [],
+      "title": "S7 Distribution & CI packaging",
+      "updated": "2026-06-08",
+      "completed_at": null,
+      "path": "active/EUD-097-7931.md",
+      "scope": []
+    },
+    "EUD-098-fe34": {
+      "status": "pending",
+      "priority": "high",
+      "type": "task",
+      "parent": "EUD-091-4cb2",
+      "depends_on": [],
+      "title": "Scaffold Tauri 2 app + Cargo workspace",
+      "updated": "2026-06-08",
+      "completed_at": null,
+      "path": "active/EUD-098-fe34.md",
+      "scope": [
+        "src-tauri/Cargo.toml",
+        "src-tauri/src/main.rs",
+        "src-tauri/tauri.conf.json",
+        "Cargo.toml"
+      ]
+    },
+    "EUD-099-8f10": {
+      "status": "pending",
+      "priority": "high",
+      "type": "task",
+      "parent": "EUD-091-4cb2",
+      "depends_on": [
+        "EUD-098-fe34"
+      ],
+      "title": "Data-dir resolution + config.json + editor-path picker",
+      "updated": "2026-06-08",
+      "completed_at": null,
+      "path": "active/EUD-099-8f10.md",
+      "scope": [
+        "src-tauri/src/config.rs"
+      ]
+    },
+    "EUD-100-b403": {
+      "status": "pending",
+      "priority": "high",
+      "type": "task",
+      "parent": "EUD-091-4cb2",
+      "depends_on": [
+        "EUD-099-8f10"
+      ],
+      "title": "First-run bootstrap downloader (sha256, atomic, progress)",
+      "updated": "2026-06-08",
+      "completed_at": null,
+      "path": "active/EUD-100-b403.md",
+      "scope": [
+        "src-tauri/src/bootstrap.rs"
+      ]
+    },
+    "EUD-101-8efe": {
+      "status": "pending",
+      "priority": "high",
+      "type": "task",
+      "parent": "EUD-092-121b",
+      "depends_on": [],
+      "title": "Vendor isom-poc C++ + MSBuild static-lib target",
+      "updated": "2026-06-08",
+      "completed_at": null,
+      "path": "active/EUD-101-8efe.md",
+      "scope": [
+        "native/isom/**"
+      ]
+    },
+    "EUD-102-c6a8": {
+      "status": "pending",
+      "priority": "high",
+      "type": "task",
+      "parent": "EUD-092-121b",
+      "depends_on": [
+        "EUD-101-8efe"
+      ],
+      "title": "C ABI shim (isom_capi.h/.cpp) over chk/locedit/playeredit",
+      "updated": "2026-06-08",
+      "completed_at": null,
+      "path": "active/EUD-102-c6a8.md",
+      "scope": [
+        "native/isom/isom_capi.h",
+        "native/isom/isom_capi.cpp"
+      ]
+    },
+    "EUD-103-b1f5": {
+      "status": "pending",
+      "priority": "high",
+      "type": "task",
+      "parent": "EUD-092-121b",
+      "depends_on": [
+        "EUD-102-c6a8"
+      ],
+      "title": "isom-sys crate: build.rs msbuild+link + bindgen",
+      "updated": "2026-06-08",
+      "completed_at": null,
+      "path": "active/EUD-103-b1f5.md",
+      "scope": [
+        "crates/isom-sys/**"
+      ]
+    },
+    "EUD-104-0ae7": {
+      "status": "pending",
+      "priority": "high",
+      "type": "task",
+      "parent": "EUD-092-121b",
+      "depends_on": [
+        "EUD-103-b1f5"
+      ],
+      "title": "isom safe wrapper crate",
+      "updated": "2026-06-08",
+      "completed_at": null,
+      "path": "active/EUD-104-0ae7.md",
+      "scope": [
+        "crates/isom/**"
+      ]
+    },
+    "EUD-105-dba3": {
+      "status": "pending",
+      "priority": "medium",
+      "type": "task",
+      "parent": "EUD-092-121b",
+      "depends_on": [
+        "EUD-104-0ae7"
+      ],
+      "title": "CHK parse port (chk_info.py -> chk.rs)",
+      "updated": "2026-06-08",
+      "completed_at": null,
+      "path": "active/EUD-105-dba3.md",
+      "scope": [
+        "src-tauri/src/chk.rs"
+      ]
+    },
+    "EUD-106-e10d": {
+      "status": "pending",
+      "priority": "high",
+      "type": "task",
+      "parent": "EUD-092-121b",
+      "depends_on": [
+        "EUD-104-0ae7"
+      ],
+      "title": "mapsafe rails + journal (backup/lock/compiling/rollback)",
+      "updated": "2026-06-08",
+      "completed_at": null,
+      "path": "active/EUD-106-e10d.md",
+      "scope": [
+        "src-tauri/src/mapsafe.rs"
+      ]
+    },
+    "EUD-107-c55c": {
+      "status": "pending",
+      "priority": "high",
+      "type": "task",
+      "parent": "EUD-093-65b1",
+      "depends_on": [
+        "EUD-098-fe34"
+      ],
+      "title": "Embedding parity spike (fastembed bge-m3 vs Python top-k)",
+      "updated": "2026-06-08",
+      "completed_at": null,
+      "path": "active/EUD-107-c55c.md",
+      "scope": [
+        "src-tauri/tests/rag_parity.rs",
+        "src-tauri/src/rag.rs"
+      ]
+    },
+    "EUD-108-6439": {
+      "status": "pending",
+      "priority": "medium",
+      "type": "task",
+      "parent": "EUD-093-65b1",
+      "depends_on": [
+        "EUD-107-c55c"
+      ],
+      "title": "CI RAG index builder (re-embed ECA corpus -> sqlite + sha256)",
+      "updated": "2026-06-08",
+      "completed_at": null,
+      "path": "active/EUD-108-6439.md",
+      "scope": [
+        "ci/**"
+      ]
+    },
+    "EUD-109-b35b": {
+      "status": "pending",
+      "priority": "high",
+      "type": "task",
+      "parent": "EUD-093-65b1",
+      "depends_on": [
+        "EUD-107-c55c"
+      ],
+      "title": "rag.rs query path: fastembed init + warmup + brute-force cosine",
+      "updated": "2026-06-08",
+      "completed_at": null,
+      "path": "active/EUD-109-b35b.md",
+      "scope": [
+        "src-tauri/src/rag.rs"
+      ]
+    },
+    "EUD-110-def0": {
+      "status": "pending",
+      "priority": "high",
+      "type": "task",
+      "parent": "EUD-094-e9ee",
+      "depends_on": [
+        "EUD-098-fe34"
+      ],
+      "title": "Tauri IPC surface (commands + events)",
+      "updated": "2026-06-08",
+      "completed_at": null,
+      "path": "active/EUD-110-def0.md",
+      "scope": [
+        "src-tauri/src/ipc.rs"
+      ]
+    },
+    "EUD-111-7740": {
+      "status": "pending",
+      "priority": "high",
+      "type": "task",
+      "parent": "EUD-094-e9ee",
+      "depends_on": [
+        "EUD-098-fe34"
+      ],
+      "title": "bridge_io file-IPC client port",
+      "updated": "2026-06-08",
+      "completed_at": null,
+      "path": "active/EUD-111-7740.md",
+      "scope": [
+        "src-tauri/src/bridge_io.rs"
+      ]
+    },
+    "EUD-112-4f01": {
+      "status": "pending",
+      "priority": "high",
+      "type": "task",
+      "parent": "EUD-094-e9ee",
+      "depends_on": [
+        "EUD-098-fe34"
+      ],
+      "title": "codex_client port (which/stdin/fenced extract)",
+      "updated": "2026-06-08",
+      "completed_at": null,
+      "path": "active/EUD-112-4f01.md",
+      "scope": [
+        "src-tauri/src/codex_client.rs"
+      ]
+    },
+    "EUD-113-ba2a": {
+      "status": "pending",
+      "priority": "high",
+      "type": "task",
+      "parent": "EUD-094-e9ee",
+      "depends_on": [
+        "EUD-110-def0"
+      ],
+      "title": "engine/orchestrator + prompt assembly + tool loop",
+      "updated": "2026-06-08",
+      "completed_at": null,
+      "path": "active/EUD-113-ba2a.md",
+      "scope": [
+        "src-tauri/src/engine.rs"
+      ]
+    },
+    "EUD-114-57dd": {
+      "status": "pending",
+      "priority": "high",
+      "type": "task",
+      "parent": "EUD-094-e9ee",
+      "depends_on": [
+        "EUD-113-ba2a"
+      ],
+      "title": "tools layer (evidence gate, first_principles, btn/xdat rails)",
+      "updated": "2026-06-08",
+      "completed_at": null,
+      "path": "active/EUD-114-57dd.md",
+      "scope": [
+        "src-tauri/src/tools.rs",
+        "src-tauri/src/data/first_principles.md"
+      ]
+    },
+    "EUD-115-7e3f": {
+      "status": "pending",
+      "priority": "medium",
+      "type": "task",
+      "parent": "EUD-094-e9ee",
+      "depends_on": [
+        "EUD-098-fe34"
+      ],
+      "title": "memory port",
+      "updated": "2026-06-08",
+      "completed_at": null,
+      "path": "active/EUD-115-7e3f.md",
+      "scope": [
+        "src-tauri/src/memory.rs"
+      ]
+    },
+    "EUD-116-e052": {
+      "status": "pending",
+      "priority": "medium",
+      "type": "task",
+      "parent": "EUD-095-fbc3",
+      "depends_on": [],
+      "title": "Slim Lua bridge (drop WebView2/spawn; keep IPC + reversed heartbeat)",
+      "updated": "2026-06-08",
+      "completed_at": null,
+      "path": "active/EUD-116-e052.md",
+      "scope": [
+        "bridge/ZZZ_10_agent_bridge.lua",
+        "scripts/install_bridge.ps1"
+      ]
+    },
+    "EUD-117-015a": {
+      "status": "pending",
+      "priority": "medium",
+      "type": "task",
+      "parent": "EUD-097-7931",
+      "depends_on": [
+        "EUD-114-57dd"
+      ],
+      "title": "Tauri bundle config + packaging",
+      "updated": "2026-06-08",
+      "completed_at": null,
+      "path": "active/EUD-117-015a.md",
+      "scope": [
+        "src-tauri/tauri.conf.json"
+      ]
+    },
+    "EUD-118-1729": {
+      "status": "pending",
+      "priority": "medium",
+      "type": "task",
+      "parent": "EUD-097-7931",
+      "depends_on": [
+        "EUD-108-6439"
+      ],
+      "title": "CI: build RAG index, publish Release asset + manifest",
+      "updated": "2026-06-08",
+      "completed_at": null,
+      "path": "active/EUD-118-1729.md",
+      "scope": [
+        ".github/**",
+        "ci/**"
+      ]
+    },
+    "EUD-119-bc27": {
+      "status": "pending",
+      "priority": "high",
+      "type": "task",
+      "parent": "EUD-096-4eb3",
+      "depends_on": [
+        "EUD-110-def0"
+      ],
+      "title": "Panel Tauri IPC client + store wiring (replace ws-client)",
+      "updated": "2026-06-08",
+      "completed_at": null,
+      "path": "active/EUD-119-bc27.md",
+      "scope": [
+        "panel/src/lib/ipc.ts",
+        "panel/src/state"
+      ]
+    },
+    "EUD-120-ecca": {
+      "status": "pending",
+      "priority": "medium",
+      "type": "task",
+      "parent": "EUD-096-4eb3",
+      "depends_on": [
+        "EUD-119-bc27"
+      ],
+      "title": "Panel setup + connection-state UI",
+      "updated": "2026-06-08",
+      "completed_at": null,
+      "path": "active/EUD-120-ecca.md",
+      "scope": [
+        "panel/src/setup",
+        "panel/src/components"
+      ]
+    },
+    "EUD-121-8ff9": {
+      "status": "pending",
+      "priority": "low",
+      "type": "chore",
+      "parent": "EUD-097-7931",
+      "depends_on": [
+        "EUD-114-57dd"
+      ],
+      "title": "Remove server/ Python stack after Rust parity",
+      "updated": "2026-06-08",
+      "completed_at": null,
+      "path": "active/EUD-121-8ff9.md",
+      "scope": [
+        "server"
+      ]
     }
   }
 }

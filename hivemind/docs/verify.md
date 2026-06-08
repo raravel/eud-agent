@@ -1,50 +1,39 @@
-# eud-agent Verification
+# eud-agent Verify (v2 — Tauri + Rust)
 
-All commands run from the repo root on Windows (PowerShell 7). Stages lint/test/smoke/panel are headless (the orchestrator runs them to confirm task completion). Stage e2e needs the editor GUI and is user-assisted.
+What the orchestrator runs to confirm a task is complete. Commands are Windows/PowerShell.
+Rust stages activate once `src-tauri/` exists; panel stages are live today. The Python
+stages from v1 are retired as `server/` is removed.
 
-## Stage: lint
+## lint
+- `cargo fmt --manifest-path src-tauri/Cargo.toml -- --check` — Rust formatting is clean.
+- `cargo clippy --workspace --all-targets -- -D warnings` — no clippy warnings across the
+  Rust workspace (`src-tauri` + `crates/isom-sys` + `crates/isom`).
+- `cd panel && npx tsc -b --noEmit` — panel TypeScript typechecks (no separate eslint).
 
-```
-server\.venv\Scripts\python.exe -m ruff check server
-```
+## type
+- Covered by `cargo clippy` (Rust is type-checked at compile) and `tsc -b` above. No
+  additional step.
 
-Proves: no syntax/static errors or banned patterns in server code.
+## test
+- `cargo test --workspace` — Rust unit + integration tests (ipc protocol, bridge_io file
+  round-trip, codex fenced-block extraction, rag cosine ranking, mapsafe rails, chk parse).
+- `cd panel && npx vitest run` — panel component/unit tests (PlanView, transport client).
 
-## Stage: test
+## build
+- `cd panel && npm run build` — `tsc -b && vite build` produces `panel/dist`.
+- `cargo build --manifest-path src-tauri/Cargo.toml` — Rust core compiles **and links the
+  isom static lib** (proves the FFI + MSBuild integration). On a release/packaging task:
+  `cargo tauri build` produces the bundled exe.
 
-```
-server\.venv\Scripts\python.exe -m pytest server/tests -q
-```
+## smoke (task-specific, run when the touched area supports it)
+- RAG parity (feature 12): `cargo test -p eud-agent rag::parity -- --ignored` — top-k for a
+  fixed query set matches the Python `sentence-transformers` baseline within tolerance.
+- isom FFI (feature 13): `cargo test -p isom ffi_smoke -- --ignored` — chk extract on a
+  sample map returns a parseable CHK; a no-op locedit round-trips byte-identical.
+- bootstrap (feature 10): `cargo test -p eud-agent bootstrap::manifest` — missing/corrupt
+  asset triggers re-download; sha256 mismatch refuses to install.
 
-Proves: unit + integration behavior of config, bridge_io (tmp-dir fake bridge), codex_client (mock subprocess), rag (stubbed model), orchestrator state machine, WS protocol incl. token/Origin rejection, bridge/panel/scripts static contracts — all without the editor or real codex.
-
-## Stage: smoke
-
-```
-server\.venv\Scripts\python.exe -m eud_agent --selfcheck
-```
-
-Proves: config resolution (agent.cfg schema), codex shim resolution via shutil.which, RAG DB path exists and opens read-only, bge-m3 weights present in HF cache, built panel present (`panel/dist/index.html`). Exits non-zero with a specific message per missing prerequisite. Must NOT load the embedding model (fast).
-
-## Stage: panel
-
-```
-npm --prefix panel run build
-```
-
-Proves: the React panel typechecks (tsc via the build) and bundles to `panel/dist/` with zero runtime CDN references. Requires `npm --prefix panel install` once per machine (node v24, npm). `panel/dist/` is gitignored — built locally during development; release-packaged later (Decision 04).
-
-## Stage: e2e (manual, Windows, editor v0.19.6.0 — user-assisted)
-
-Run `scripts\install_dropin.ps1`, build the panel (`npm --prefix panel run build`), start the editor, then walk this checklist:
-
-1. Boot handshake: bridge spawns server (no console window), `server.ready` appears, WebView2 panel shows the UI (token accepted).
-2. `PING`/`STATUS`/`LIST` round-trip via inbox; LIST shows paths + file types (confirm the `f.Filetype` member yields enum NAMES — EUD-011 deferred check).
-3. Instruct flow: natural-language request produces progress (rag, codex), then code preview with diff (for SET target) and advisory diagnostics.
-4. Apply SET on an open CUI file: content and open-tab editor update together; Korean text round-trips intact.
-5. Apply NEWEPS: file created at root, tab opens; duplicate name returns ERROR shown in panel; Korean body intact (EUD-012 deferred check); memory-only until user saves.
-6. Regression (v6 features): GET/DUMP, GETDAT/SETDAT on units, LUA command, BUILD guard.
-7. Re-arm: create/switch project — panel window is recreated automatically; server survives.
-8. Busy editor: trigger a build, send apply — panel shows waiting_build, apply lands after build.
-9. Stale-ready recovery: kill the server process, wait — bridge respawns it (or next editor start cleans the stale ready and respawns); kill the editor — server self-terminates within ~60s (heartbeat).
-10. UDF check: WebView2 profile data lands under `Data\agent\webview2`, not next to the exe.
+## E2E (user-assisted, GUI)
+- Editor live test: install the slim bridge, launch the editor + app, run an instruct →
+  apply cycle, confirm SET/NEWEPS land and the diff renders. Documented in the task; not
+  headless.

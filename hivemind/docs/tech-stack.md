@@ -1,62 +1,73 @@
-# eud-agent Tech Stack
+# eud-agent Tech Stack (v2 — Tauri + Rust)
 
-> Grounding (2026-06-04, refreshed after the EUD-031 scaffold; re-checked 2026-06-05 for the v2 plan; re-checked 2026-06-06 for the project-memory plan — Python manifest unchanged, frontend section updated to the Decision-06 reality): Python deps grounded in `server/pyproject.toml` + `server/uv.lock`; frontend deps grounded in `panel/package.json` + `panel/package-lock.json` (exact resolved versions below).
+Grounded against the repo on 2026-06-08. The v2 migration **removes the Python stack**,
+**keeps the React panel**, and **adds a Rust/Tauri stack**. No `Cargo.toml` exists yet;
+the Rust entries below are the target floor versions to pin at `cargo add` time.
 
-## Active Dependencies
+## Active Dependencies (panel — kept, from `panel/package.json`)
+- react 19.2.0 — panel UI
+- react-dom 19.2.0 — DOM renderer
+- @monaco-editor/react ^4.7.0 — Monaco React wrapper (CDN loader forbidden; bundled)
+- monaco-editor ^0.55.1 — edit surface, loaded from npm bundle
+- streamdown ^2.5.0 — agent markdown/stream rendering (AI Elements pipeline)
+- radix-ui ^1.4.3 — shadcn/ui primitives
+- lucide-react ^1.17.0 — icons
+- class-variance-authority ^0.7.1, clsx ^2.1.1, tailwind-merge ^3.6.0 — styling utils
+- use-stick-to-bottom ^1.1.6 — chat autoscroll
+- (new) @tauri-apps/api ^2 — Tauri IPC client (invoke + event)
 
-Pinned in `server/pyproject.toml` (uv-managed venv at `server/.venv`, Python 3.12.x):
+Dev: vite ^7.1.12, vitest ^3.2.6, typescript ~5.9.3, @vitejs/plugin-react ^5.0.4,
+tailwindcss ^4.3.0, @tailwindcss/vite ^4.3.0, @testing-library/react ^16.3.2,
+happy-dom ^16.8.1.
 
-- fastapi >=0.115,<1 — HTTP + WebSocket server (panel serving, /ws endpoint)
-- uvicorn 0.49.0 — ASGI server (version proven in ECA venv)
-- chromadb 1.5.9 — vector DB client for the bge RAG store (matches the DB built by ECA)
-- sentence-transformers 5.5.1 — bge-m3 embedding loader (matches ECA venv)
-- transformers 5.10.1 — pinned: 5.10 requires torch>=2.8 float8 symbols; older torch fails at import
-- torch 2.12.0+cu126 — **must install from the cu126 index** (`--index-url https://download.pytorch.org/whl/cu126`); plain PyPI torch is CPU-only and the cu124 index lacks a compatible build. CPU fallback for machines without CUDA: torch 2.12.0+cpu with reduced seq/batch (switch documented in pyproject comments).
-- numpy 2.4.6 — transitive pin proven in ECA venv
-- openai-codex 0.1.0b3 — official Codex Python SDK (openai/codex `sdk/python`, module `openai_codex`); codex thread lifecycle + streaming JSONL events for the v2 agent core. Pre-release; pulls in the pre-release `openai-codex-cli-bin` (bundled binary) but pointed at the BYO authenticated CLI via `CodexConfig(codex_bin=...)` at runtime. `[tool.uv] prerelease = "allow"` set so `uv sync` resolves it (EUD-053 spike).
-- mcp 1.27.2 — Model Context Protocol Python SDK; server side of the eud-tools stdio shim codex attaches to (FastMCP, stdio transport) (EUD-053 spike)
-- ruff (dev) — lint; pytest (dev) — test runner; pytest-asyncio (dev) — WS/orchestrator tests
-
-### Frontend (panel/) — pinned in `panel/package.json` (resolved via package-lock.json; re-grounded 2026-06-06)
-
-- react / react-dom 19.2.x (^19.2.0) — panel UI runtime
-- typescript 5.9.3 — TS sources (`panel/src`)
-- vite 7.x (^7.1.12) + @vitejs/plugin-react ^5.0.4 — build tool; output `panel/dist/` (gitignored)
-- tailwindcss / @tailwindcss/vite 4.3.0 — styling, CSS-variables mode (shadcn requirement); tw-animate-css 1.4.0 (dev) — animation utilities
-- shadcn/ui — vendored component SOURCE in `panel/components/ui/` (registry copy, not a runtime dep; `components.json` aliases point future `npx shadcn add` at the same dirs)
-- Vercel AI Elements — vendored component SOURCE in `panel/components/ai-elements/` (conversation/loader/message/plan/prompt-input/reasoning/response/shimmer/tool), RE-ADOPTED by Decision 06 for the v2 agent-text pipeline (supersedes the EUD-034/035 pruning, which had removed the EUD-031 vendoring); runtime deps streamdown 2.5.0 (markdown/agent-text renderer, local assets only) + use-stick-to-bottom 1.1.6 (conversation autoscroll)
-- monaco-editor 0.55.1 + @monaco-editor/react 4.7.0 (+ @monaco-editor/loader 1.7.0) — edit surface; bound to the npm bundle via `loader.config({ monaco })` in `panel/src/editor/monaco.ts` with 5 `?worker` Vite imports (CDN injection path verified unreachable — EUD-031 review)
-- Full runtime dep list (package.json-grounded, 2026-06-06, 11 deps): @monaco-editor/react ^4.7.0, class-variance-authority ^0.7.1, clsx ^2.1.1, lucide-react ^1.17.0, monaco-editor ^0.55.1, radix-ui ^1.4.3, react/react-dom ^19.2.0, streamdown ^2.5.0, tailwind-merge ^3.6.0, use-stick-to-bottom ^1.1.6
-- Test devDeps: vitest ^3.2.6, happy-dom ^16.8.1, @testing-library/react|dom|user-event|jest-dom (panel unit/component suites)
-- npm — package manager (node v24.11.1 system install)
-
-> Decision: see [[decisions/03_react-panel-rebuild]], [[decisions/05_monaco-editor-adoption]] and [[decisions/06_ai-elements-streamdown-adoption]].
+## Target Rust Stack (new — `src-tauri/Cargo.toml`, pin at add-time)
+- tauri 2 (stable) — desktop shell, WebView2 host, IPC, bundler/updater
+- tauri-plugin-shell 2 — spawn the codex CLI subprocess
+- tauri-plugin-dialog 2 — first-run editor-path picker
+- tokio 1 — async runtime (codex subprocess, file-IPC polling, downloads)
+- fastembed 5.15 — bge-m3 ONNX embeddings (query-time); pulls `ort` (pykeio ONNX RT)
+- rusqlite 0.32 — read the prebuilt RAG index (vectors + text + source metadata)
+- reqwest 0.12 — first-run downloads (RAG index from GitHub Release)
+- sha2 0.10 — download integrity verification
+- similar 2 — unified diff (replaces Python difflib)
+- which 7 — resolve the codex CLI shim path (replaces shutil.which)
+- serde 1 + serde_json 1 — config/IPC/manifest (de)serialization
+- anyhow 1 + thiserror 1 — error handling
+- bindgen 0.70 — generate FFI from `native/isom/isom_capi.h` (in `isom-sys`)
 
 ## Build Artifacts
-
-- `panel/dist/` — Vite build output; NEVER committed (gitignored). Dev machines build locally (`npm --prefix panel run build`); distribution is packaged into GitHub Releases by the later release phase. See [[decisions/04_dist-release-distribution]]. Monaco stays lazy-split with 5 local workers (no CDN).
-- WebView2 SDK 1.0.3800.47 DLLs — `Microsoft.Web.WebView2.Core.dll` (649,840 B), `Microsoft.Web.WebView2.Wpf.dll` (82,544 B), `WebView2Loader.dll` (160,880 B, win-x64) — vendored at `vendor/webview2/`
-- WebView2 Evergreen runtime — installed (Chromium 148 verified by probe)
-- bge-m3 model weights — 4.3 GB in the HF cache (`C:\Users\ifthe\.cache\huggingface\hub\models--BAAI--bge-m3`); setup_env.ps1 checks presence and warns (first query downloads ~4.3 GB otherwise). Measured: load+first-search 12.8s (CUDA), warm search 0.015s (EUD-017).
-- ECA RAG DB — `C:\Users\ifthe\proj\eud\ECA\chromadb_bge` (111 MB, collection `eud_docs_bge`, 1024d cosine, 4,974 docs incl. comments + 54 EPS manual pages). Referenced by path; never imported into this repo.
+- tailwindcss v4.x (from `panel/dist` build via `@tailwindcss/vite`) — ground truth for
+  the running panel CSS.
 
 ## Legacy / Vendored
+- isom-poc C++ (`native/isom/`, vendored from `isom-poc/IsomTerrain/`) — MSBuild
+  solution: IsomTerrain (lib) + CrossCutLib + IcuLib (vendored ICU) + CascLib. Built to a
+  static `.lib` with a C ABI shim and linked into the Rust binary (Decision 09). Our repo
+  is the source of truth; the editor's own C++ is never touched.
+- vendor/webview2 — 3 WebView2 SDK DLLs from the POC; under Tauri the WebView2 runtime is
+  the system Evergreen runtime, so these are retained only as a fallback reference.
 
-- `bridge/ZZZ_10_agent_bridge.lua` — verified v6 bridge imported from `C:\Users\ifthe\eud-agent-analysis\test-lua\`; extended in place (import-then-extend; LIST EUD-011, NEWEPS EUD-012, server lifecycle EUD-013, WebView2 hosting EUD-014 — WPF panel removed per spec)
-- `server/eud_agent/runner_legacy.py` — verified runner draft imported from ECA (read-only reference); absorbed into `server/eud_agent/runner_cli.py` later
-- codex CLI — BYO npm shim; on this machine `C:\Program Files\nodejs\codex.cmd` (also `codex.ps1`). Never spawn bare `codex` without `shutil.which` resolution. Direct asyncio exec of the .CMD shim works on Windows ProactorEventLoop (proven live, EUD-016).
-- node v24.11.1 — system install; runs the optional epscript-lsp AND the panel build toolchain
-- @eps-server/server 1.2.12 (npm) — epscript-lsp language server (MIT, EDAC community); optional advisory diagnostics only; the system must degrade gracefully when absent
-- KopiLua / KopiLuaInterface / luanet — the editor's embedded Lua; not a dependency we install, but the API surface the bridge codes against (editor v0.19.6.0, `C:\Users\ifthe\proj\eud\EUD.Editor.3.0.19.6.0`)
-- (retired 2026-06-04) vanilla panel — verified baseline, replaced by the React panel; `panel/app.js`/`panel/style.css` DELETED in EUD-035 (deletion guarded by the contract test); retrievable from git history. `panel/index.html` is the Vite template. Selfcheck now requires the BUILT `panel/dist/`. See [[decisions/03_react-panel-rebuild]].
+## Removed / Superseded (deleted in v2)
+- Python server stack (`server/`): fastapi, uvicorn, chromadb 1.5.9,
+  sentence-transformers 5.5.1, transformers 5.10.1, torch 2.12.0, numpy 2.4.6,
+  openai-codex 0.1.0b3, mcp 1.27.2 — all replaced by the Rust core. uv venv retired.
+- In-editor WebView2 hosting + server-spawn lifecycle in the Lua bridge.
 
 ## Project Structure
-
-See architecture.md "Repository layout". Tooling: uv for venv + installs, PowerShell 7 for scripts/, Vite/npm for panel/ (build output `panel/dist/` served by the server; dist and node_modules gitignored). Per-map-project runtime memory lives under the editor's `Data\agent\harness\<project>\` (see [[features/07_project-memory|07_project-memory]]).
+- `src-tauri/` — Tauri Rust app (core modules: ipc, engine, tools, codex_client, rag,
+  isom, mapsafe, bridge_io, memory, config, bootstrap, chk).
+- `crates/isom-sys`, `crates/isom` — FFI bindings + safe wrapper for the C++ engine.
+- `native/isom/` — vendored C++ + C ABI shim.
+- `panel/` — React app (reused), Tauri IPC transport; built to `panel/dist`.
+- `ci/` — RAG index builder (re-embeds the ECA corpus with the runtime fastembed
+  pipeline; output published to GitHub Releases).
 
 ## Rationale
-
-- **FastAPI over reusing ECA's Flask-less app.py stack**: the panel needs WebSocket push (progress events) and static serving from one origin; FastAPI/uvicorn gives both natively, and uvicorn 0.49.0 is already proven on this machine.
-- **uv over pip**: the proven ECA venv is uv-managed (pip is absent there); one toolchain for both projects, and uv handles the cu126 index pin cleanly.
-- **Vendored WebView2 DLLs over NuGet restore**: the drop-in install has no build step on the user machine; copying 3 DLLs next to the editor exe is the verified load path (app-base probing).
-- **React + Vercel AI Elements over vanilla JS** (supersedes the original no-framework rationale): the user chose an AI-chat-native, visually polished UI; AI Elements ships vendored component source (no runtime CDN), and the no-build-on-user-machine principle moves to the release phase (GitHub Releases packaging + updater). The verified vanilla panel remains in git history as the fallback baseline. See [[decisions/03_react-panel-rebuild]] / [[decisions/04_dist-release-distribution]].
+- **Rust over Node/TS** (Decision 08): the small-distributable goal and the safety of the
+  map binary path outweigh Node's more mature ML ecosystem; Electron's only edge
+  (in-process node for the advisory LSP) does not justify a ~150MB bundle.
+- **fastembed over candle** for embeddings: fastembed ships first-class bge-m3 ONNX with
+  HF auto-download and quantized CPU models — less hand-rolling than candle for the same
+  result.
+- **rusqlite read-only index over chromadb**: chromadb is Python and mutates tracked
+  sqlite on open (proven LFS churn); a CI-built read-only index avoids both.
