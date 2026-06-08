@@ -60,3 +60,4 @@ evidence-gate-exempt.
 - `src-tauri/src/data/first_principles.md` — bundled prompt asset (ported)
 - external: `tokio`, `which`, `similar`, `tauri-plugin-shell`, `serde_json`
 - [BOUND 2026-06-08 from EUD-113-ba2a] src-tauri/src/lib.rs — Tauri app shell; registers core modules (wires pub mod engine; for the orchestrator)
+- [BOUND 2026-06-08 from EUD-113-ba2a] src-tauri/src/engine.rs — orchestrator prompt assembly + single-shot instruct seam (run_instruct, build_system_prompt, resume_turn_text, unified_diff)
