@@ -72,3 +72,4 @@ happy-dom ^16.8.1.
 - **rusqlite read-only index over chromadb**: chromadb is Python and mutates tracked
   sqlite on open (proven LFS churn); a CI-built read-only index avoids both.
 - [BOUND 2026-06-08 from EUD-112-4f01] which 8.0.3 -- resolve the codex CLI shim path in codex_client (replaces Python shutil.which); honors CODEX_CMD override
+- [BOUND 2026-06-08 from EUD-113-ba2a] similar 2 — TextDiff unified-diff generation for the engine instruct code/diff seam
