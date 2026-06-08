@@ -64,3 +64,6 @@ flowchart TD
 - `src-tauri/tauri.conf.json` — bundle, capabilities (shell/dialog/fs), window config
 - `panel/src/setup/` — first-run setup + download-progress UI
 - external: `tauri-plugin-dialog`, `reqwest`, `sha2`, `fastembed` (HF cache dir)
+- [BOUND 2026-06-08 from EUD-098-fe34] `src-tauri/src/lib.rs` — Tauri 2 builder + shell/dialog plugin registration; app entry (`run()`), reused by main.rs shim
+- [BOUND 2026-06-08 from EUD-098-fe34] `src-tauri/build.rs` — runs `tauri_build::build()` (codegen + config validation at compile time)
+- [BOUND 2026-06-08 from EUD-098-fe34] `src-tauri/capabilities/default.json` — main-window capability granting core/shell/dialog plugin permissions

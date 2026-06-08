@@ -1598,20 +1598,23 @@
       "scope": []
     },
     "EUD-098-fe34": {
-      "status": "pending",
+      "status": "done",
       "priority": "high",
       "type": "task",
       "parent": "EUD-091-4cb2",
       "depends_on": [],
       "title": "Scaffold Tauri 2 app + Cargo workspace",
       "updated": "2026-06-08",
-      "completed_at": null,
-      "path": "active/EUD-098-fe34.md",
+      "completed_at": "2026-06-08T11:39:38.313936",
+      "path": "done/EUD-098-fe34.md",
       "scope": [
         "src-tauri/Cargo.toml",
         "src-tauri/src/main.rs",
         "src-tauri/tauri.conf.json",
-        "Cargo.toml"
+        "Cargo.toml",
+        "src-tauri/**",
+        ".gitignore",
+        "Cargo.lock"
       ]
     },
     "EUD-099-8f10": {
@@ -1647,7 +1650,7 @@
       ]
     },
     "EUD-101-8efe": {
-      "status": "pending",
+      "status": "in_progress",
       "priority": "high",
       "type": "task",
       "parent": "EUD-092-121b",
