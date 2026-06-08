@@ -1618,7 +1618,7 @@
       ]
     },
     "EUD-099-8f10": {
-      "status": "pending",
+      "status": "done",
       "priority": "high",
       "type": "task",
       "parent": "EUD-091-4cb2",
@@ -1627,10 +1627,11 @@
       ],
       "title": "Data-dir resolution + config.json + editor-path picker",
       "updated": "2026-06-08",
-      "completed_at": null,
-      "path": "active/EUD-099-8f10.md",
+      "completed_at": "2026-06-08T12:25:25.596559",
+      "path": "done/EUD-099-8f10.md",
       "scope": [
-        "src-tauri/src/config.rs"
+        "src-tauri/src/config.rs",
+        "src-tauri/src/lib.rs"
       ]
     },
     "EUD-100-b403": {
@@ -1681,7 +1682,7 @@
       ]
     },
     "EUD-103-b1f5": {
-      "status": "pending",
+      "status": "in_progress",
       "priority": "high",
       "type": "task",
       "parent": "EUD-092-121b",
@@ -1693,7 +1694,8 @@
       "completed_at": null,
       "path": "active/EUD-103-b1f5.md",
       "scope": [
-        "crates/isom-sys/**"
+        "crates/isom-sys/**",
+        "Cargo.toml"
       ]
     },
     "EUD-104-0ae7": {
