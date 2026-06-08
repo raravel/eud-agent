@@ -8,6 +8,7 @@
 
 pub mod bootstrap;
 pub mod bridge_io;
+pub mod codex_client;
 pub mod config;
 pub mod ipc;
 pub mod mapsafe;

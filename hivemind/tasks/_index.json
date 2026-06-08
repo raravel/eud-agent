@@ -1840,7 +1840,7 @@
       ]
     },
     "EUD-112-4f01": {
-      "status": "pending",
+      "status": "done",
       "priority": "high",
       "type": "task",
       "parent": "EUD-094-e9ee",
@@ -1849,10 +1849,14 @@
       ],
       "title": "codex_client port (which/stdin/fenced extract)",
       "updated": "2026-06-08",
-      "completed_at": null,
-      "path": "active/EUD-112-4f01.md",
+      "completed_at": "2026-06-08T18:16:42.875553",
+      "path": "done/EUD-112-4f01.md",
       "scope": [
-        "src-tauri/src/codex_client.rs"
+        "src-tauri/src/codex_client.rs",
+        "src-tauri/Cargo.toml",
+        "src-tauri/src/lib.rs",
+        "src-tauri/Cargo.lock",
+        "Cargo.lock"
       ]
     },
     "EUD-113-ba2a": {
