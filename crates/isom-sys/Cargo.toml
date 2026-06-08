@@ -1,0 +1,16 @@
+[package]
+name = "isom-sys"
+version = "0.1.0"
+edition = "2021"
+publish = false
+# Cargo links-key: declares that this crate links the native `isom_capi` static
+# lib, so only one crate in the graph may provide it (and downstream crates can
+# read the metadata build.rs emits via cargo:KEY=VALUE).
+links = "isom_capi"
+build = "build.rs"
+
+[lib]
+name = "isom_sys"
+
+[build-dependencies]
+bindgen = "0.70"

@@ -1682,7 +1682,7 @@
       ]
     },
     "EUD-103-b1f5": {
-      "status": "in_progress",
+      "status": "done",
       "priority": "high",
       "type": "task",
       "parent": "EUD-092-121b",
@@ -1691,11 +1691,13 @@
       ],
       "title": "isom-sys crate: build.rs msbuild+link + bindgen",
       "updated": "2026-06-08",
-      "completed_at": null,
-      "path": "active/EUD-103-b1f5.md",
+      "completed_at": "2026-06-08T12:32:56.418619",
+      "path": "done/EUD-103-b1f5.md",
       "scope": [
         "crates/isom-sys/**",
-        "Cargo.toml"
+        "Cargo.toml",
+        "Cargo.lock",
+        ".gitignore"
       ]
     },
     "EUD-104-0ae7": {
