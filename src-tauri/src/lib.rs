@@ -7,6 +7,7 @@
 //! added by later tasks — no custom IPC commands are registered yet.
 
 pub mod config;
+pub mod mapsafe;
 
 /// Build and run the Tauri application.
 ///

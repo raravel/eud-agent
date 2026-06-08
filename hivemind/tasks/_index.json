@@ -1737,7 +1737,7 @@
       ]
     },
     "EUD-106-e10d": {
-      "status": "pending",
+      "status": "done",
       "priority": "high",
       "type": "task",
       "parent": "EUD-092-121b",
@@ -1746,10 +1746,11 @@
       ],
       "title": "mapsafe rails + journal (backup/lock/compiling/rollback)",
       "updated": "2026-06-08",
-      "completed_at": null,
-      "path": "active/EUD-106-e10d.md",
+      "completed_at": "2026-06-08T14:30:00.141442",
+      "path": "done/EUD-106-e10d.md",
       "scope": [
-        "src-tauri/src/mapsafe.rs"
+        "src-tauri/src/mapsafe.rs",
+        "src-tauri/src/lib.rs"
       ]
     },
     "EUD-107-c55c": {
