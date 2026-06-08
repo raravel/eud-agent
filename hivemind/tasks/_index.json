@@ -1806,7 +1806,7 @@
       ]
     },
     "EUD-110-def0": {
-      "status": "pending",
+      "status": "done",
       "priority": "high",
       "type": "task",
       "parent": "EUD-094-e9ee",
@@ -1815,10 +1815,11 @@
       ],
       "title": "Tauri IPC surface (commands + events)",
       "updated": "2026-06-08",
-      "completed_at": null,
-      "path": "active/EUD-110-def0.md",
+      "completed_at": "2026-06-08T17:06:18.490837",
+      "path": "done/EUD-110-def0.md",
       "scope": [
-        "src-tauri/src/ipc.rs"
+        "src-tauri/src/ipc.rs",
+        "src-tauri/src/lib.rs"
       ]
     },
     "EUD-111-7740": {

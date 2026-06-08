@@ -1,4 +1,5 @@
 ---
+completed_at: '2026-06-08T17:06:18.490837'
 created: '2026-06-08'
 depends_on:
 - EUD-098-fe34
@@ -7,7 +8,8 @@ parent: EUD-094-e9ee
 priority: high
 scope:
 - src-tauri/src/ipc.rs
-status: pending
+- src-tauri/src/lib.rs
+status: done
 title: Tauri IPC surface (commands + events)
 type: task
 updated: '2026-06-08'
