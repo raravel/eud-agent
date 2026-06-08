@@ -1635,7 +1635,7 @@
       ]
     },
     "EUD-100-b403": {
-      "status": "in_progress",
+      "status": "blocked",
       "priority": "high",
       "type": "task",
       "parent": "EUD-091-4cb2",
