@@ -1664,7 +1664,7 @@
       ]
     },
     "EUD-102-c6a8": {
-      "status": "pending",
+      "status": "done",
       "priority": "high",
       "type": "task",
       "parent": "EUD-092-121b",
@@ -1673,8 +1673,8 @@
       ],
       "title": "C ABI shim (isom_capi.h/.cpp) over chk/locedit/playeredit",
       "updated": "2026-06-08",
-      "completed_at": null,
-      "path": "active/EUD-102-c6a8.md",
+      "completed_at": "2026-06-08T11:56:01.198908",
+      "path": "done/EUD-102-c6a8.md",
       "scope": [
         "native/isom/isom_capi.h",
         "native/isom/isom_capi.cpp"
