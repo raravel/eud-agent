@@ -59,3 +59,4 @@ evidence-gate-exempt.
 - `src-tauri/src/memory.rs` — project memory
 - `src-tauri/src/data/first_principles.md` — bundled prompt asset (ported)
 - external: `tokio`, `which`, `similar`, `tauri-plugin-shell`, `serde_json`
+- [BOUND 2026-06-08 from EUD-113-ba2a] src-tauri/src/lib.rs — Tauri app shell; registers core modules (wires pub mod engine; for the orchestrator)
