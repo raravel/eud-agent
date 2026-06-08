@@ -1,4 +1,5 @@
 ---
+completed_at: '2026-06-08T22:35:08.906160'
 created: '2026-06-08'
 depends_on:
 - EUD-110-def0
@@ -7,7 +8,11 @@ parent: EUD-094-e9ee
 priority: high
 scope:
 - src-tauri/src/engine.rs
-status: pending
+- src-tauri/src/lib.rs
+- src-tauri/Cargo.toml
+- src-tauri/src/data/first_principles.md
+- Cargo.lock
+status: done
 title: engine/orchestrator + prompt assembly + tool loop
 type: task
 updated: '2026-06-08'

@@ -1860,7 +1860,7 @@
       ]
     },
     "EUD-113-ba2a": {
-      "status": "pending",
+      "status": "done",
       "priority": "high",
       "type": "task",
       "parent": "EUD-094-e9ee",
@@ -1869,10 +1869,14 @@
       ],
       "title": "engine/orchestrator + prompt assembly + tool loop",
       "updated": "2026-06-08",
-      "completed_at": null,
-      "path": "active/EUD-113-ba2a.md",
+      "completed_at": "2026-06-08T22:35:08.906160",
+      "path": "done/EUD-113-ba2a.md",
       "scope": [
-        "src-tauri/src/engine.rs"
+        "src-tauri/src/engine.rs",
+        "src-tauri/src/lib.rs",
+        "src-tauri/Cargo.toml",
+        "src-tauri/src/data/first_principles.md",
+        "Cargo.lock"
       ]
     },
     "EUD-114-57dd": {
