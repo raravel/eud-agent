@@ -1635,7 +1635,7 @@
       ]
     },
     "EUD-100-b403": {
-      "status": "pending",
+      "status": "in_progress",
       "priority": "high",
       "type": "task",
       "parent": "EUD-091-4cb2",
@@ -1647,7 +1647,9 @@
       "completed_at": null,
       "path": "active/EUD-100-b403.md",
       "scope": [
-        "src-tauri/src/bootstrap.rs"
+        "src-tauri/src/bootstrap.rs",
+        "src-tauri/Cargo.toml",
+        "src-tauri/src/lib.rs"
       ]
     },
     "EUD-101-8efe": {
@@ -1701,7 +1703,7 @@
       ]
     },
     "EUD-104-0ae7": {
-      "status": "pending",
+      "status": "done",
       "priority": "high",
       "type": "task",
       "parent": "EUD-092-121b",
@@ -1710,10 +1712,12 @@
       ],
       "title": "isom safe wrapper crate",
       "updated": "2026-06-08",
-      "completed_at": null,
-      "path": "active/EUD-104-0ae7.md",
+      "completed_at": "2026-06-08T12:52:05.778155",
+      "path": "done/EUD-104-0ae7.md",
       "scope": [
-        "crates/isom/**"
+        "crates/isom/**",
+        "Cargo.toml",
+        "Cargo.lock"
       ]
     },
     "EUD-105-dba3": {

@@ -1,0 +1,11 @@
+[package]
+name = "isom"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.77.2"
+publish = false
+build = "build.rs"
+
+[dependencies]
+isom-sys = { path = "../isom-sys" }
+thiserror = "1"

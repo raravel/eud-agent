@@ -2204,6 +2204,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "isom"
+version = "0.1.0"
+dependencies = [
+ "isom-sys",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "isom-sys"
 version = "0.1.0"
 dependencies = [
