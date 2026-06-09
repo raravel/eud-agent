@@ -4,8 +4,8 @@
  * features/06_changeset-review-panel.md ## State machine (the spec mermaid):
  *
  *   [*] --> connecting
- *   connecting --> ready          : WS open
- *   connecting --> retry          : 2s backoff
+ *   connecting --> ready          : transport ready
+ *   connecting --> retry          : transport unavailable
  *   retry      --> connecting
  *   ready      --> thinking       : chat sent
  *   thinking   --> ready          : answer (no edits)
@@ -16,10 +16,10 @@
  *   changeset_review --> thinking : follow-up chat (undecided auto-accept server-side)
  *
  * features/06 ## Behaviors (encoded here):
- *   - Reconnect during thinking/plan_review resets to ready WITH a notice — the
- *     server cancels the thread turn. The LAST changeset stays reviewable across
- *     a reconnect (the journal is server-persisted), so a reconnect must NOT drop
- *     `changeset`; it only resets an in-flight TURN.
+ *   - A transport re-open during thinking/plan_review resets to ready WITH a
+ *     notice — the core cancels the thread turn. The LAST changeset stays
+ *     reviewable across a transport re-open (the journal is core-persisted), so
+ *     a re-open must NOT drop `changeset`; it only resets an in-flight TURN.
  *   - Send gating v2: `connected && hasProject && !busy` — the settable-target
  *     requirement is GONE (the agent creates files itself). No `canSendSet` /
  *     `canSendNewEps`. `busy` = a turn is in flight (thinking) OR a plan awaits a
@@ -37,7 +37,7 @@ import type {
   ChangesetItem,
   FileEntry,
   ProgressStage,
-} from "@/ws/protocol";
+} from "@/lib/ipc";
 // itemIds maps an item to its decision-target ids (a dat group has NO
 // item-level id — its ids live on each property; see lib/changeset). The store
 // MUST use the same id-shape helper as ChangesetView so "fully decided" agrees
@@ -158,10 +158,10 @@ export type ItemDecision = "accepted" | "rejected" | "failed";
  * engine.py routes BOTH accept and reject through it (accept → `ids:[]`,`ok:true`;
  * reject → the real journal ids,`ok:true|false`). So the inbound message alone
  * cannot tell a KEPT item from a 되돌림 one, and accept-all sends an EMPTY ids
- * array. The store records what it sent (it is the SOLE decision sender, the WS is
- * ordered, and exactly one decision is in flight at a time) and reconciles on the
- * reply. `ids:"all"` is kept verbatim so an empty inbound ids array on accept-all
- * still resolves to "apply to all undecided items".
+ * array. The store records what it sent (it is the SOLE decision sender, the
+ * transport is ordered, and exactly one decision is in flight at a time) and
+ * reconciles on the reply. `ids:"all"` is kept verbatim so an empty inbound ids
+ * array on accept-all still resolves to "apply to all undecided items".
  *
  * Candidate server-side amendment (later task): have `rollback_result` echo the
  * decision (or the accepted ids) so the panel need not infer it. Until then the
@@ -226,12 +226,12 @@ export interface PanelStore {
   getState(): PanelState;
   subscribe(listener: Listener): () => void;
 
-  // ---- connection lifecycle (WS client drives these) ----
-  /** WS started connecting (initial or after a retry tick). */
+  // ---- connection lifecycle (transport client drives these) ----
+  /** Transport started connecting. */
   wsConnecting(): void;
-  /** WS opened: ready; reset any in-flight turn with a notice (reconnect). */
+  /** Transport ready: reset any in-flight turn with a notice on re-open. */
   wsOpen(): void;
-  /** WS errored: enter retry. */
+  /** Transport errored: enter retry. */
   wsError(): void;
 
   // ---- inbound server events ----
@@ -353,11 +353,11 @@ export function createPanelStore(): PanelStore {
     log: [] as LogEntry[],
     connected: false,
     // A turn is in flight (chat/plan_feedback/plan_approve sent, no turn-end event
-    // yet). Tracked SEPARATELY from `phase` because a reconnect drives
+    // yet). Tracked SEPARATELY from `phase` because a transport re-open drives
     // wsConnecting() -> wsOpen(): by the time wsOpen runs, `phase` has already left
     // thinking/plan_review for connecting. The server cancels the thread turn on
-    // disconnect, so wsOpen uses this flag (not the transient phase) to decide
-    // whether to emit the reconnect notice (features/06 line 52).
+    // disconnect/cancel, so wsOpen uses this flag (not the transient phase) to
+    // decide whether to emit the re-open notice (features/06 line 52).
     turnInFlight: false,
     // The changeset_decision last sent, awaiting its rollback_result. The inbound
     // reply carries no accept/reject discriminator, so this is how the store knows
@@ -472,9 +472,9 @@ export function createPanelStore(): PanelStore {
 
     wsOpen() {
       core.connected = true;
-      // Reconnect cancels any in-flight TURN (the server cancels the thread on
-      // disconnect): a reconnect mid thinking/plan_review resets the turn WITH a
-      // notice, dropping the in-flight plan card. `turnInFlight` survives the
+      // A transport re-open cancels any in-flight TURN (the core cancels the
+      // thread on disconnect): a re-open mid thinking/plan_review resets the
+      // turn WITH a notice, dropping the in-flight plan card. `turnInFlight` survives the
       // intervening wsConnecting() so the notice fires even though `phase` already
       // moved to connecting.
       if (core.turnInFlight) {
@@ -482,7 +482,7 @@ export function createPanelStore(): PanelStore {
         core.plan = null;
         pushLog("warn", RECONNECT_TURN_NOTICE);
       }
-      // The last changeset STAYS reviewable across a reconnect (journal is
+      // The last changeset STAYS reviewable across a transport re-open (journal is
       // server-persisted; features/06 line 52): if an undecided changeset is
       // present, restore changeset_review even though the intermediate
       // connecting/retry phases passed through. Otherwise land on ready.

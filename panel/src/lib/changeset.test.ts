@@ -19,7 +19,7 @@
  */
 import { describe, it, expect } from "vitest";
 import { itemIds, itemKey, itemState } from "./changeset";
-import type { ChangesetItem } from "@/ws/protocol";
+import type { ChangesetItem } from "@/lib/ipc";
 
 const fileItem: ChangesetItem = {
   category: "file",

@@ -15,7 +15,7 @@ export type RagState = "idle" | "loading" | "ready" | "unavailable";
 export interface HeaderProps {
   /** Editor project name from the `status` event ("" when unknown). */
   project: string;
-  /** Whether the WS connection is currently open (store.connected). */
+  /** Whether the transport connection is currently open (store.connected). */
   connected: boolean;
   /** Panel phase — distinguishes "connecting" from "retry" wording. */
   phase: Phase;

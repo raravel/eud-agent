@@ -27,7 +27,7 @@ export interface PlanViewProps {
   plan: PlanState;
   /** A turn is in flight (approve already sent / feedback running) — disable. */
   pending: boolean;
-  /** Send plan_approve{}; the App fires the WS message + store action. */
+  /** Send plan_approve{}; the App invokes the command + store action. */
   onApprove(): void;
 }
 

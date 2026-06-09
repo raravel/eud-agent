@@ -6,7 +6,7 @@
  *     a decision / editor compiling) and when the store gates it off (no project).
  *     Gating is purely the store's `canSend` (connected && hasProject && !busy) —
  *     the settable-target requirement is GONE (the agent chooses files/targets).
- *   - a [새 대화] control sends `reset{}` (App fires the WS message + store action)
+ *   - a [새 대화] control sends `reset{}` (App invokes the command + store action)
  *     and is disabled while a turn is in flight (phase === "thinking").
  *
  * The textarea keeps the accessible name "지시 입력"; the send button "전송"; the

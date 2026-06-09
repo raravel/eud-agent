@@ -1,6 +1,6 @@
 /**
- * Panel app shell (v2) — wires the WS v2 client + state store to the chat-first
- * review UI (features/06_changeset-review-panel.md).
+ * Panel app shell (v2) - wires the Tauri IPC v2 client + state store to the
+ * chat-first review UI (features/06_changeset-review-panel.md).
  *
  * Components: a status-rich Header (connection transitions + RAG state/elapsed),
  * the ConversationLog cards, a live AgentStream under the turn, the PlanView
@@ -9,11 +9,11 @@
  * agent entries when a plan arrives, is superseded by a higher revision, or is
  * approved.
  *
- * Data flow: WsClient (real WebSocket factory + window.location) → store actions
- * + log entries → React snapshot via useSyncExternalStore → components → user
- * intents call client.send + the matching store action. Two pieces of UI-only
- * state live here (not protocol state): the current turn's agent_event list (for
- * AgentStream) and the RAG warmup state/timing (for the Header pill).
+ * Data flow: IpcClient (Tauri invoke + listen) -> store actions + log entries
+ * -> React snapshot via useSyncExternalStore -> components -> user intents call
+ * client.send + the matching store action. Two pieces of UI-only state live here
+ * (not protocol state): the current turn's agent_event list (for AgentStream)
+ * and the RAG warmup state/timing (for the Header pill).
  */
 import {
   useCallback,
@@ -29,14 +29,13 @@ import { ChangesetView } from "@/components/ChangesetView";
 import { PlanView } from "@/components/PlanView";
 import { InstructionBox, type ChatPayload } from "@/components/InstructionBox";
 import { createPanelStore } from "@/state/store";
-import { WsClient } from "@/ws/client";
-import type { ServerMessage } from "@/ws/protocol";
+import { IpcClient, type ServerMessage } from "@/lib/ipc";
 import { progressLabel } from "@/lib/progress";
 
 export default function App() {
   // Store + client live for the lifetime of the app (created once).
   const store = useMemo(() => createPanelStore(), []);
-  const clientRef = useRef<WsClient | null>(null);
+  const clientRef = useRef<IpcClient | null>(null);
 
   // Subscribe React to the framework-agnostic store.
   const state = useSyncExternalStore(store.subscribe, store.getState, store.getState);
@@ -76,9 +75,9 @@ export default function App() {
           store.progressReceived(msg.stage);
           // RAG warmup drives the Header pill (started → loading w/ elapsed,
           // done → ready, error → unavailable) AND the store send gate. The
-          // server replays the current warmup state to every new connection,
-          // so transitions are logged only on a real change (a reconnect's
-          // "done" snapshot must not re-log completion), and the loading state
+          // core replays the current warmup state to every new client,
+          // so transitions are logged only on a real change (a fresh "done"
+          // snapshot must not re-log completion), and the loading state
           // is NOT logged at all — the ConversationLog shimmer row covers it.
           if (msg.stage === "rag_warmup") {
             const prev = store.getState().rag;
@@ -166,15 +165,15 @@ export default function App() {
     [store],
   );
 
-  // Boot the WS client once. Lifecycle maps to the store phases; logs flow
+  // Boot the IPC client once. Lifecycle maps to the store phases; logs flow
   // through store.log so they render in the conversation.
   useEffect(() => {
     store.wsConnecting();
-    const client = new WsClient({
+    const client = new IpcClient({
       onMessage,
       onLog: (kind, text) => {
         if (kind === "info") store.log("info", text);
-        else store.log("warn", text); // disconnect / unknown / badjson
+        else store.log("warn", text); // unknown / bad payload
       },
       onOpenChange: (open) => {
         if (open) store.wsOpen();
@@ -182,7 +181,7 @@ export default function App() {
       },
     });
     clientRef.current = client;
-    client.connect();
+    void client.connect();
     return () => {
       client.stop();
       clientRef.current = null;
@@ -194,9 +193,9 @@ export default function App() {
   // typed text IS the plan feedback (plan_feedback{text} — the PlanView
   // feedback textarea is removed); otherwise it starts a chat turn.
   const handleSend = useCallback(
-    (payload: ChatPayload) => {
+    async (payload: ChatPayload) => {
       if (store.getState().phase === "plan_review") {
-        const sent = clientRef.current?.send({
+        const sent = await clientRef.current?.send({
           type: "plan_feedback",
           text: payload.text,
         });
@@ -207,7 +206,7 @@ export default function App() {
         }
         return;
       }
-      const sent = clientRef.current?.send({ type: "chat", text: payload.text });
+      const sent = await clientRef.current?.send({ type: "chat", text: payload.text });
       if (sent) {
         store.log("you", payload.text);
         store.chatSent(); // a new turn — the store resets the per-turn buffers.
@@ -218,8 +217,8 @@ export default function App() {
 
   // New conversation: send reset{} (the server drops the retained codex thread,
   // EUD-064) and clear the client log / plan / changeset / per-turn buffers.
-  const handleReset = useCallback(() => {
-    const sent = clientRef.current?.send({ type: "reset" });
+  const handleReset = useCallback(async () => {
+    const sent = await clientRef.current?.send({ type: "reset" });
     if (sent) {
       store.resetSent();
     }
@@ -227,8 +226,8 @@ export default function App() {
 
   // Plan approval: send plan_approve{}, archive the approval into the log, and
   // start the apply turn (the store resets the per-turn buffers).
-  const handlePlanApprove = useCallback(() => {
-    const sent = clientRef.current?.send({ type: "plan_approve" });
+  const handlePlanApprove = useCallback(async () => {
+    const sent = await clientRef.current?.send({ type: "plan_approve" });
     if (sent) {
       const rev = store.getState().plan?.revision;
       store.log("agent", rev !== undefined ? `계획안(rev ${rev})을 승인했습니다.` : "계획을 승인했습니다.");
@@ -240,8 +239,8 @@ export default function App() {
   // rollback_result is labelled per accept/reject). The ids are the literal
   // "all" (bulk) or the item's ids (ChangesetView resolves dat group ids).
   const handleDecide = useCallback(
-    (decision: "accept" | "reject", ids: "all" | string[]) => {
-      const sent = clientRef.current?.send({
+    async (decision: "accept" | "reject", ids: "all" | string[]) => {
+      const sent = await clientRef.current?.send({
         type: "changeset_decision",
         decision,
         ids,
@@ -276,7 +275,7 @@ export default function App() {
       {/* Plan review — markdown card + feedback/approve (features/06). The card
           stays visible across the iteration turn (plan_review while awaiting a
           decision, thinking while the feedback/approve turn runs) and only
-          disappears when the store clears the plan (chat / reconnect) or a
+          disappears when the store clears the plan (chat / transport re-open) or a
           changeset opens. Controls disable (`pending`) once the turn is in
           flight, i.e. when the phase has left plan_review. */}
       {state.plan && (state.phase === "plan_review" || state.phase === "thinking") && (

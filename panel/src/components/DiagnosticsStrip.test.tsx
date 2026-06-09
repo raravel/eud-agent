@@ -20,7 +20,7 @@
 import { describe, it, expect, vi } from "vitest";
 import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import type { Diagnostic } from "@/ws/protocol";
+import type { Diagnostic } from "@/lib/ipc";
 import { DiagnosticsStrip } from "@/components/DiagnosticsStrip";
 
 describe("DiagnosticsStrip", () => {

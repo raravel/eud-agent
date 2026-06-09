@@ -15,14 +15,14 @@
  *   export function ChangesetView(props): JSX.Element;
  *
  * onDecide receives the SAME (decision, ids) the store's decisionSent() records,
- * and the App layer fires the WS `changeset_decision` from it.
+ * and the App layer invokes `changeset_decision` from it.
  */
 import { describe, it, expect, vi } from "vitest";
 import { render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { ChangesetView } from "@/components/ChangesetView";
 import type { ChangesetState } from "@/state/store";
-import type { ChangesetItem } from "@/ws/protocol";
+import type { ChangesetItem } from "@/lib/ipc";
 
 // REPRESENTATIVE: a server-assembled dat group carries NO item-level id/seq —
 // the ids live only on properties[] (journal.changeset()). The ChangesetItem

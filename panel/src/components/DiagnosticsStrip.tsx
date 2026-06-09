@@ -7,7 +7,7 @@
  */
 import { XIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import type { Diagnostic } from "@/ws/protocol";
+import type { Diagnostic } from "@/lib/ipc";
 
 export interface DiagnosticsStripProps {
   diagnostics: Diagnostic[];

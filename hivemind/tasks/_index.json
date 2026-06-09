@@ -1962,7 +1962,7 @@
       ]
     },
     "EUD-119-bc27": {
-      "status": "pending",
+      "status": "done",
       "priority": "high",
       "type": "task",
       "parent": "EUD-096-4eb3",
@@ -1971,13 +1971,17 @@
       ],
       "title": "Panel Tauri IPC client + store wiring (replace ws-client)",
       "updated": "2026-06-09",
-      "completed_at": null,
-      "path": "active/EUD-119-bc27.md",
+      "completed_at": "2026-06-09T09:04:28.356034",
+      "path": "done/EUD-119-bc27.md",
       "scope": [
         "panel/src/lib/ipc.ts",
         "panel/src/state",
         "panel/src/App.tsx",
-        "panel/src/ws"
+        "panel/src/ws",
+        "panel/src/lib",
+        "panel/src/components",
+        "panel/package.json",
+        "panel/package-lock.json"
       ]
     },
     "EUD-120-ecca": {

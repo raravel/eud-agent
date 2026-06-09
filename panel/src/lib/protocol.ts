@@ -1,31 +1,31 @@
 /**
- * Typed WebSocket protocol v2 — both directions.
+ * Typed Tauri IPC protocol v2, both directions.
  *
- * Mirrors features/05_agent-core.md "WS protocol v2" and the SERVER emissions
- * (engine.py / agent_runner.py / journal.py). The panel speaks ONLY this
- * protocol to the local server over `ws://${location.host}/ws?token=...`.
+ * Mirrors features/05_agent-core.md v2 chat schema and the core emissions,
+ * retargeted to in-process Tauri IPC. The panel speaks ONLY this protocol to
+ * the local core through `invoke` commands and Tauri `listen` events.
  *
  * v2 replaces the v1 single-shot flow (instruct -> rag -> codex -> code event ->
- * manual apply). The v1 `instruct`/`apply`/`code`/`applied` messages are REMOVED
- * ENTIRELY (no compat shim — features/05 line 58).
+ * manual apply). The v1 `instruct`/`apply`/`code`/`applied` messages are
+ * REMOVED ENTIRELY (no compat shim - features/05 line 58).
  *
- *   client -> server: chat / plan_feedback / plan_approve / changeset_decision /
- *                     cancel / status / list
- *   server -> client: agent_event / answer / plan / changeset / rollback_result /
- *                     error / status / progress / list
+ *   panel -> core: chat / plan_feedback / plan_approve /
+ *                  changeset_decision / cancel / reset / status / list
+ *   core -> panel: agent_event / answer / plan / changeset /
+ *                  rollback_result / error / status / progress / list
  *
  * Discriminated unions (on the `type` field) drive narrowing; the runtime type
- * guards below are the gate for inbound dispatch — anything that fails
+ * guards below are the gate for inbound dispatch. Anything that fails
  * {@link isServerMessage} is an "unknown type" the client surfaces as a log
  * entry and NEVER throws on.
  */
 
-// ---- progress stages (server → client) --------------------------------
+// ---- progress stages (core -> panel) ----------------------------------
 /**
- * Progress stages the server may report. `rag_warmup` is kept (features/05:
- * "progress{stage,...} (kept: rag_warmup etc.)"); the warmup callback in app.py
- * emits a free `stage` string, so the panel treats stage as an open string and
- * only special-cases the known ones for labelling.
+ * Progress stages the core may report. `rag_warmup` is kept (features/05:
+ * "progress{stage,...} (kept: rag_warmup etc.)"); the warmup callback emits a
+ * free `stage` string, so the panel treats stage as an open string and only
+ * special-cases the known ones for labelling.
  */
 export const PROGRESS_STAGES = [
   "rag",
@@ -35,7 +35,7 @@ export const PROGRESS_STAGES = [
   "waiting_build",
 ] as const;
 export type KnownProgressStage = (typeof PROGRESS_STAGES)[number];
-/** Open string — the server may emit warmup/other stages not in the closed set. */
+/** Open string - the core may emit warmup/other stages not in the closed set. */
 export type ProgressStage = string;
 
 // ---- shared shapes -----------------------------------------------------
@@ -54,8 +54,8 @@ export interface FileEntry {
 
 /**
  * Advisory diagnostic from the epscript-lsp gate (rules.md: advisory only). In
- * v2 the server attaches diagnostics per modified/created eps changeset item
- * (features/06 ## Behaviors → Diagnostics). Free-form by design; rendered
+ * v2 the core attaches diagnostics per modified/created eps changeset item
+ * (features/06 ## Behaviors -> Diagnostics). Free-form by design; rendered
  * best-effort and never blocks a decision.
  */
 export type Diagnostic =
@@ -69,37 +69,37 @@ export type Diagnostic =
     };
 
 /**
- * One changeset item (server `journal.changeset()` shape). The category drives
+ * One changeset item (core journal.changeset() shape). The category drives
  * rendering (ChangesetView is a LATER task); the panel keeps the raw shape so a
- * field addition server-side does not break parsing. Every item carries an `id`
+ * field addition core-side does not break parsing. Every item carries an `id`
  * + `seq` so per-item accept/reject can target it.
  */
 export interface ChangesetItem {
   /** "file" | "dat" | tbl/req/btn/settings/plugin/main (flat). */
   category: string;
-  /** Stable per-item id (journal entry id) — the decision target. */
+  /** Stable per-item id (journal entry id) - the decision target. */
   id: string;
   /** Journal sequence (reverse-seq rollback order, render order hint). */
   seq: number;
-  /** Remaining server fields (kind/path/diff/dat/objId/properties/old/new/…). */
+  /** Remaining core fields (kind/path/diff/dat/objId/properties/old/new/...). */
   [k: string]: unknown;
 }
 
-// ---- server → client messages -----------------------------------------
+// ---- core -> panel messages -------------------------------------------
 /**
- * `agent_event {kind, detail}` — streamed turn activity. `detail` is a short
- * string. Known kinds (EUD-063 / features/05 "WS protocol v2"):
- *   - `thinking` — generic activity (no user-facing text);
- *   - `reasoning` — a reasoning-text DELTA in `detail`
+ * `agent_event {kind, detail}` - streamed turn activity. `detail` is a short
+ * string. Known kinds (EUD-063 / features/05 v2 chat schema):
+ *   - `thinking` - generic activity (no user-facing text);
+ *   - `reasoning` - a reasoning-text DELTA in `detail`
  *     (`item/reasoning/summaryTextDelta` + `item/reasoning/textDelta`); the panel
  *     accumulates it into the dim/collapsible Reasoning surface;
- *   - `delta` — an answer-text DELTA in `detail`; the panel accumulates it into
+ *   - `delta` - an answer-text DELTA in `detail`; the panel accumulates it into
  *     the prominent Streamdown Message/Response;
- *   - `tool_call` / `tool_result` — a tool call by name → Tool rows;
- *   - `token_usage` / `turn_done` / `item_started` / `item_completed` / `event` —
+ *   - `tool_call` / `tool_result` - a tool call by name -> Tool rows;
+ *   - `token_usage` / `turn_done` / `item_started` / `item_completed` / `event` -
  *     internal bookkeeping; the panel surfaces NONE of these raw kind strings as
  *     literal UI text (no-raw-kind-leak contract, decision 06).
- * `kind` is an OPEN string (the server may emit other kinds) — the panel routes
+ * `kind` is an OPEN string (the core may emit other kinds) - the panel routes
  * the known ones and swallows the rest.
  */
 export interface AgentEventMessage {
@@ -107,54 +107,54 @@ export interface AgentEventMessage {
   kind: string;
   detail: string;
   /**
-   * EUD-068: optional tool payload — `tool_call` carries `args` (the call's
-   * argument text, server-truncated); `tool_result` carries `result` (the
+   * EUD-068: optional tool payload - `tool_call` carries `args` (the call's
+   * argument text, core-truncated); `tool_result` carries `result` (the
    * result/error text) + `status` ("completed" | "failed" | "declined").
    */
   data?: { args?: string; result?: string; status?: string };
 }
 
-/** `answer {text}` — answer-only turn (no edits). */
+/** `answer {text}` - answer-only turn (no edits). */
 export interface AnswerMessage {
   type: "answer";
   text: string;
 }
 
-/** `plan {markdown, revision}` — propose_plan ended the turn; revision replaces. */
+/** `plan {markdown, revision}` - propose_plan ended the turn; revision replaces. */
 export interface PlanMessage {
   type: "plan";
   markdown: string;
   revision: number;
 }
 
-/** `changeset {request_id, items}` — journaled writes awaiting accept/reject. */
+/** `changeset {request_id, items}` - journaled writes awaiting accept/reject. */
 export interface ChangesetMessage {
   type: "changeset";
   request_id: string;
   items: ChangesetItem[];
 }
 
-/** `rollback_result {ids, ok}` — outcome of a changeset_decision. */
+/** `rollback_result {ids, ok}` - outcome of a changeset_decision. */
 export interface RollbackResultMessage {
   type: "rollback_result";
   ids: string[];
   ok: boolean;
 }
 
-/** `progress {stage, detail?}` — render as a conversation entry. */
+/** `progress {stage, detail?}` - render as a conversation entry. */
 export interface ProgressMessage {
   type: "progress";
   stage: ProgressStage;
   detail?: string;
 }
 
-/** `error {message}` — flow returns to ready. */
+/** `error {message}` - flow returns to ready. */
 export interface ErrorMessage {
   type: "error";
   message: string;
 }
 
-/** `status {compiling, project}` — editor state for the header. */
+/** `status {compiling, project}` - editor state for the header. */
 export interface StatusMessage {
   type: "status";
   compiling: boolean;
@@ -168,7 +168,7 @@ export interface ListMessage {
   error?: string;
 }
 
-/** Discriminated union of every documented server → client message. */
+/** Discriminated union of every documented core -> panel message. */
 export type ServerMessage =
   | AgentEventMessage
   | AnswerMessage
@@ -194,28 +194,27 @@ export const SERVER_MESSAGE_TYPES = [
 ] as const;
 export type ServerMessageType = (typeof SERVER_MESSAGE_TYPES)[number];
 
-// ---- client → server messages ------------------------------------------
-/** `chat {text}` — start a turn (the agent picks files/targets itself). */
+// ---- panel -> core messages -------------------------------------------
+/** `chat {text}` - start a turn (the agent picks files/targets itself). */
 export interface ChatMessage {
   type: "chat";
   text: string;
 }
 
-/** `plan_feedback {text}` — iterate the plan; resumes the codex thread. */
+/** `plan_feedback {text}` - iterate the plan; resumes the codex thread. */
 export interface PlanFeedbackMessage {
   type: "plan_feedback";
   text: string;
 }
 
-/** `plan_approve {}` — approve the plan; lifts the mutation gate + resumes. */
+/** `plan_approve {}` - approve the plan; lifts the mutation gate + resumes. */
 export interface PlanApproveMessage {
   type: "plan_approve";
 }
 
 /**
- * `changeset_decision {decision, ids}` — accept/reject changeset items. `ids` is
- * the literal "all" (bulk) or a list of item ids. Matches engine.py
- * `_on_changeset_decision` (field `decision`, `ids` = "all" | list).
+ * `changeset_decision {decision, ids}` - accept/reject changeset items. `ids`
+ * is the literal "all" (bulk) or a list of item ids.
  */
 export interface ChangesetDecisionMessage {
   type: "changeset_decision";
@@ -223,13 +222,13 @@ export interface ChangesetDecisionMessage {
   ids: "all" | string[];
 }
 
-/** `cancel {}` — interrupt the in-flight turn (journal entries persist). */
+/** `cancel {}` - interrupt the in-flight turn (journal entries persist). */
 export interface CancelMessage {
   type: "cancel";
 }
 
 /**
- * `reset {}` — new conversation ([새 대화]). The server drops the retained codex
+ * `reset {}` - new conversation. The core drops the retained codex
  * thread so the next `chat` starts a fresh conversation (features/05 EUD-064);
  * the panel clears its log / plan / changeset / per-turn buffers.
  */
@@ -237,17 +236,17 @@ export interface ResetMessage {
   type: "reset";
 }
 
-/** `status {}` — request editor state. */
+/** `status {}` - request editor state. */
 export interface StatusRequest {
   type: "status";
 }
 
-/** `list {}` — request the project file tree. */
+/** `list {}` - request the project file tree. */
 export interface ListRequest {
   type: "list";
 }
 
-/** Discriminated union of every documented client → server message. */
+/** Discriminated union of every documented panel -> core message. */
 export type ClientMessage =
   | ChatMessage
   | PlanFeedbackMessage

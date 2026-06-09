@@ -9,7 +9,7 @@
  *
  * Each item exposes [✓ 적용]/[✗ 되돌리기]; bulk [전체 적용 유지]/[전체 되돌리기]
  * dispatch the literal "all". Decisions flow through `onDecide(decision, ids)`
- * (the App fires the WS `changeset_decision`; the store records it so the
+ * (the App invokes `changeset_decision`; the store records it so the
  * inbound `rollback_result` is labelled per accept/reject). The per-item ids
  * come from {@link itemIds} (a dat group targets every property id). Resolved
  * rows show 적용 유지 / 되돌림 / 실패 (inline failure) from the store decisions.
@@ -31,7 +31,7 @@ import {
   type ItemState,
 } from "@/lib/changeset";
 import type { ChangesetState } from "@/state/store";
-import type { ChangesetItem } from "@/ws/protocol";
+import type { ChangesetItem } from "@/lib/ipc";
 
 export interface ChangesetViewProps {
   /** The active changeset under review (items + per-id decisions). */

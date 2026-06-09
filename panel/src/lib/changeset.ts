@@ -14,7 +14,7 @@
  * `changeset_decision{ids}` payload and (b) the aggregate decision STATE of an
  * item from the per-id decisions map, so ChangesetView stays a thin renderer.
  */
-import type { ChangesetItem } from "@/ws/protocol";
+import type { ChangesetItem } from "@/lib/ipc";
 import type { ItemDecision } from "@/state/store";
 
 /** Aggregate decision state of a rendered changeset item. */

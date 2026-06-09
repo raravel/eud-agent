@@ -4,7 +4,7 @@ import {
   MAX_LOG_ENTRIES,
   type PanelState,
 } from "@/state/store";
-import { CLIENT_MESSAGE_TYPES, SERVER_MESSAGE_TYPES } from "@/ws/protocol";
+import { CLIENT_MESSAGE_TYPES, SERVER_MESSAGE_TYPES } from "@/lib/ipc";
 
 function freshStore() {
   return createPanelStore();

@@ -9,7 +9,7 @@
  *   export interface PlanViewProps {
  *     plan: PlanState;     // { markdown, revision }
  *     pending: boolean;    // a turn is in flight (disable 승인)
- *     onApprove(): void;   // App fires WS plan_approve{}
+ *     onApprove(): void;   // App invokes plan_approve{}
  *   }
  *
  * Revision replacement is owned by the STORE (a higher revision replaces the
