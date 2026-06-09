@@ -70,6 +70,8 @@ const PUSH_EVENT_TYPES = [
   "progress",
   "error",
   "status",
+  "memory",
+  "memory_saved",
 ] as const satisfies readonly ServerMessageType[];
 
 function isObject(value: unknown): value is Record<string, unknown> {
@@ -189,6 +191,10 @@ export class IpcClient {
         return {};
       case "list":
         return {};
+      case "memory_get":
+        return {};
+      case "memory_save":
+        return { file: msg.file, content: msg.content };
       default: {
         const _exhaustive: never = msg;
         return _exhaustive;
@@ -206,6 +212,10 @@ export class IpcClient {
       const result = await this.invoke(msg.type, this.commandArgs(msg));
       if (msg.type === "status" || msg.type === "list") {
         this.dispatchPayload(msg.type, result);
+      } else if (msg.type === "memory_get") {
+        this.dispatchPayload("memory", result);
+      } else if (msg.type === "memory_save") {
+        this.dispatchPayload("memory_saved", result);
       }
       return true;
     } catch (error) {

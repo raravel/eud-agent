@@ -1,14 +1,15 @@
 ---
+completed_at: '2026-06-09T15:49:57.546412'
 created: '2026-06-06'
 depends_on:
 - EUD-076-d2c2
 id: EUD-077-de1e
 parent: EUD-075-43ae
 priority: medium
-status: pending
+status: done
 title: Memory WS endpoints + panel view
 type: story
-updated: '2026-06-06'
+updated: '2026-06-09'
 ---
 
 ## Description

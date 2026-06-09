@@ -118,6 +118,24 @@ function ContentPreview({ content }: { content: string }) {
 
 /** The body of one changeset item, by category/kind. */
 function ItemBody({ item }: { item: ChangesetItem }) {
+  if (item.category === "memory" || item.kind === "memory") {
+    const target = asText(item.target);
+    const file = asText(item.file);
+    const label = target.startsWith("memory/")
+      ? target
+      : `memory/${target || file}`;
+    return (
+      <div className="flex flex-col gap-1">
+        <div className="text-sm">
+          <span className="text-amber-400">~수정</span> {label}
+        </div>
+        {typeof item.diff === "string" && item.diff !== "" && (
+          <DiffBlock diff={item.diff} />
+        )}
+      </div>
+    );
+  }
+
   if (item.category === "dat") {
     const dat = asText(item.dat);
     const objId = asText(item.objId);

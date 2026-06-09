@@ -35,7 +35,9 @@
 
 import type {
   ChangesetItem,
+  Episode,
   FileEntry,
+  MemoryFile,
   ProgressStage,
 } from "@/lib/ipc";
 // itemIds maps an item to its decision-target ids (a dat group has NO
@@ -185,6 +187,32 @@ export interface ChangesetState {
   decisions: Record<string, ItemDecision>;
 }
 
+/** Editable project memory snapshot + per-tab draft state. */
+export interface MemoryViewState {
+  project: string;
+  files: Record<MemoryFile, string>;
+  episodes: Episode[];
+  activeTab: MemoryFile;
+  drafts: Partial<Record<MemoryFile, string>>;
+  dirty: Record<MemoryFile, boolean>;
+}
+
+const MEMORY_FILE_ORDER: readonly MemoryFile[] = [
+  "resources",
+  "structure",
+  "conventions",
+  "lessons",
+];
+
+function cleanMemoryDirty(): Record<MemoryFile, boolean> {
+  return {
+    resources: false,
+    structure: false,
+    conventions: false,
+    lessons: false,
+  };
+}
+
 /** Immutable snapshot the UI renders from. */
 export interface PanelState {
   phase: Phase;
@@ -199,6 +227,10 @@ export interface PanelState {
   plan: PlanState | null;
   /** Active changeset under review (null until a `changeset`; survives reconnect). */
   changeset: ChangesetState | null;
+  /** Whether the project-memory overlay is open. */
+  memoryOpen: boolean;
+  /** Project memory snapshot/drafts (null until `memory` arrives). */
+  memory: MemoryViewState | null;
   /**
    * The changeset_decision in flight (recorded on send, cleared when its
    * `rollback_result` lands). Exposed so the UI can label the result per the
@@ -261,6 +293,14 @@ export interface PanelStore {
    * while "loading". "unknown" is the initial state only (never dispatched).
    */
   ragWarmupChanged(state: Exclude<RagGateState, "unknown">): void;
+  /** `memory` - populate the memory view and clear local drafts. */
+  memoryReceived(
+    project: string,
+    files: Record<MemoryFile, string>,
+    episodes: Episode[],
+  ): void;
+  /** `memory_saved` - commit the saved draft and clear that tab's dirty flag. */
+  memorySaved(file: MemoryFile): void;
 
   // ---- user intents (UI drives these after a successful send) ----
   /** A chat was sent → thinking (from ready or changeset_review). */
@@ -283,6 +323,16 @@ export interface PanelStore {
    * retained codex thread; the next chat starts a fresh conversation.
    */
   resetSent(): void;
+  /** Open the project-memory overlay. */
+  memoryOpened(): void;
+  /** Close the project-memory overlay. */
+  memoryClosed(): void;
+  /** Select a project-memory tab. */
+  memoryTabSelected(file: MemoryFile): void;
+  /** Update a memory tab draft and dirty flag. */
+  memoryEdited(file: MemoryFile, content: string): void;
+  /** A memory_save command was sent; await memory_saved. */
+  memorySaveSent(file: MemoryFile): void;
 
   // ---- logging ----
   log(kind: LogKind, text: string, stage?: ProgressStage): void;
@@ -344,6 +394,8 @@ export function createPanelStore(): PanelStore {
     compiling: false,
     plan: null as PlanState | null,
     changeset: null as ChangesetState | null,
+    memoryOpen: false,
+    memory: null as MemoryViewState | null,
     // Per-turn streaming buffers (reasoning / answer / tools). Reset whenever a
     // new turn starts (chat / plan_feedback / plan_approve / reset).
     turn: emptyTurn(),
@@ -382,6 +434,8 @@ export function createPanelStore(): PanelStore {
       compiling: core.compiling,
       plan: core.plan,
       changeset: core.changeset,
+      memoryOpen: core.memoryOpen,
+      memory: core.memory,
       pendingDecision: core.pendingDecision,
       turn: core.turn,
       rag: core.rag,
@@ -715,6 +769,42 @@ export function createPanelStore(): PanelStore {
       emit();
     },
 
+    memoryReceived(project, files, episodes) {
+      core.memory = {
+        project,
+        files,
+        episodes,
+        activeTab:
+          core.memory?.activeTab && MEMORY_FILE_ORDER.includes(core.memory.activeTab)
+            ? core.memory.activeTab
+            : "resources",
+        drafts: {},
+        dirty: cleanMemoryDirty(),
+      };
+      emit();
+    },
+
+    memorySaved(file) {
+      if (core.memory === null) {
+        emit();
+        return;
+      }
+      const draft = core.memory.drafts[file];
+      const files =
+        draft === undefined
+          ? core.memory.files
+          : { ...core.memory.files, [file]: draft };
+      const drafts = { ...core.memory.drafts };
+      delete drafts[file];
+      core.memory = {
+        ...core.memory,
+        files,
+        drafts,
+        dirty: { ...core.memory.dirty, [file]: false },
+      };
+      emit();
+    },
+
     // ---- user intents ----
     chatSent() {
       // ready --> thinking, and changeset_review --> thinking (follow-up chat;
@@ -785,6 +875,43 @@ export function createPanelStore(): PanelStore {
         pushLog("warn", "미결정 변경사항은 자동 적용 처리되었습니다.");
       }
       core.phase = "ready";
+      emit();
+    },
+
+    memoryOpened() {
+      core.memoryOpen = true;
+      emit();
+    },
+
+    memoryClosed() {
+      core.memoryOpen = false;
+      emit();
+    },
+
+    memoryTabSelected(file) {
+      if (core.memory !== null) {
+        core.memory = { ...core.memory, activeTab: file };
+      }
+      emit();
+    },
+
+    memoryEdited(file, content) {
+      if (core.memory === null) {
+        emit();
+        return;
+      }
+      core.memory = {
+        ...core.memory,
+        drafts: { ...core.memory.drafts, [file]: content },
+        dirty: {
+          ...core.memory.dirty,
+          [file]: content !== core.memory.files[file],
+        },
+      };
+      emit();
+    },
+
+    memorySaveSent(_file) {
       emit();
     },
 

@@ -85,6 +85,26 @@ export interface ChangesetItem {
   [k: string]: unknown;
 }
 
+/** Project-memory markdown files editable in the panel memory view. */
+export const MEMORY_FILES = [
+  "resources",
+  "structure",
+  "conventions",
+  "lessons",
+] as const;
+export type MemoryFile = (typeof MEMORY_FILES)[number];
+
+/** One read-only project-memory episode entry. All fields are defensive. */
+export interface Episode {
+  ts?: string;
+  request_id?: string;
+  instruction?: string;
+  kind?: string;
+  tools?: string[];
+  files?: string[];
+  decision?: string;
+}
+
 // ---- core -> panel messages -------------------------------------------
 /**
  * `agent_event {kind, detail}` - streamed turn activity. `detail` is a short
@@ -168,6 +188,20 @@ export interface ListMessage {
   error?: string;
 }
 
+/** `memory {project, files, episodes}` - project memory snapshot. */
+export interface MemoryMessage {
+  type: "memory";
+  project: string;
+  files: Record<MemoryFile, string>;
+  episodes: Episode[];
+}
+
+/** `memory_saved {file}` - acknowledgement for a saved memory file. */
+export interface MemorySavedMessage {
+  type: "memory_saved";
+  file: MemoryFile;
+}
+
 /** Discriminated union of every documented core -> panel message. */
 export type ServerMessage =
   | AgentEventMessage
@@ -178,7 +212,9 @@ export type ServerMessage =
   | ProgressMessage
   | ErrorMessage
   | StatusMessage
-  | ListMessage;
+  | ListMessage
+  | MemoryMessage
+  | MemorySavedMessage;
 
 /** All server message `type` discriminants (closed set). */
 export const SERVER_MESSAGE_TYPES = [
@@ -191,6 +227,8 @@ export const SERVER_MESSAGE_TYPES = [
   "error",
   "status",
   "list",
+  "memory",
+  "memory_saved",
 ] as const;
 export type ServerMessageType = (typeof SERVER_MESSAGE_TYPES)[number];
 
@@ -246,6 +284,18 @@ export interface ListRequest {
   type: "list";
 }
 
+/** `memory_get {}` - request the project memory snapshot. */
+export interface MemoryGetMessage {
+  type: "memory_get";
+}
+
+/** `memory_save {file, content}` - save one project memory markdown file. */
+export interface MemorySaveMessage {
+  type: "memory_save";
+  file: MemoryFile;
+  content: string;
+}
+
 /** Discriminated union of every documented panel -> core message. */
 export type ClientMessage =
   | ChatMessage
@@ -255,7 +305,9 @@ export type ClientMessage =
   | CancelMessage
   | ResetMessage
   | StatusRequest
-  | ListRequest;
+  | ListRequest
+  | MemoryGetMessage
+  | MemorySaveMessage;
 
 /** All client message `type` discriminants (closed set). */
 export const CLIENT_MESSAGE_TYPES = [
@@ -267,12 +319,44 @@ export const CLIENT_MESSAGE_TYPES = [
   "reset",
   "status",
   "list",
+  "memory_get",
+  "memory_save",
 ] as const;
 export type ClientMessageType = (typeof CLIENT_MESSAGE_TYPES)[number];
 
 // ---- runtime type guards (inbound dispatch gate) -----------------------
 function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
+}
+
+function isMemoryFile(value: unknown): value is MemoryFile {
+  return typeof value === "string" && MEMORY_FILES.includes(value as MemoryFile);
+}
+
+function isStringArray(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every((item) => typeof item === "string");
+}
+
+function isEpisode(value: unknown): value is Episode {
+  return (
+    isObject(value) &&
+    (value.ts === undefined || typeof value.ts === "string") &&
+    (value.request_id === undefined ||
+      typeof value.request_id === "string") &&
+    (value.instruction === undefined ||
+      typeof value.instruction === "string") &&
+    (value.kind === undefined || typeof value.kind === "string") &&
+    (value.tools === undefined || isStringArray(value.tools)) &&
+    (value.files === undefined || isStringArray(value.files)) &&
+    (value.decision === undefined || typeof value.decision === "string")
+  );
+}
+
+function isMemoryFiles(value: unknown): value is Record<MemoryFile, string> {
+  return (
+    isObject(value) &&
+    MEMORY_FILES.every((file) => typeof value[file] === "string")
+  );
 }
 
 /** True if `value` is an `agent_event` message. */
@@ -364,6 +448,29 @@ export function isListMessage(value: unknown): value is ListMessage {
   );
 }
 
+/** True if `value` is a `memory` message. */
+export function isMemoryMessage(value: unknown): value is MemoryMessage {
+  return (
+    isObject(value) &&
+    value.type === "memory" &&
+    typeof value.project === "string" &&
+    isMemoryFiles(value.files) &&
+    Array.isArray(value.episodes) &&
+    value.episodes.every(isEpisode)
+  );
+}
+
+/** True if `value` is a `memory_saved` message. */
+export function isMemorySavedMessage(
+  value: unknown,
+): value is MemorySavedMessage {
+  return (
+    isObject(value) &&
+    value.type === "memory_saved" &&
+    isMemoryFile(value.file)
+  );
+}
+
 /**
  * Gate for inbound dispatch: true only for a structurally valid server message
  * of a known type. Anything else is treated as an "unknown type" and surfaced
@@ -379,6 +486,8 @@ export function isServerMessage(value: unknown): value is ServerMessage {
     isProgressMessage(value) ||
     isErrorMessage(value) ||
     isStatusMessage(value) ||
-    isListMessage(value)
+    isListMessage(value) ||
+    isMemoryMessage(value) ||
+    isMemorySavedMessage(value)
   );
 }

@@ -5,6 +5,9 @@
  * (`rag_warmup` started → done, elapsed formatted via lib/progress). Korean
  * labels throughout.
  */
+import { BookText } from "lucide-react";
+
+import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { formatElapsed } from "@/lib/progress";
 import type { Phase } from "@/state/store";
@@ -21,6 +24,10 @@ export interface HeaderProps {
   phase: Phase;
   /** RAG model state + elapsed seconds (App tracks rag_warmup timing). */
   rag?: { state: RagState; elapsedSec?: number };
+  /** Open the project-memory overlay. */
+  onMemoryOpen?: () => void;
+  /** Whether the project-memory overlay is currently visible. */
+  memoryOpen?: boolean;
 }
 
 /** Connection-state label + pill color from connected/phase. */
@@ -55,7 +62,14 @@ function ragPill(
   }
 }
 
-export function Header({ project, connected, phase, rag }: HeaderProps) {
+export function Header({
+  project,
+  connected,
+  phase,
+  rag,
+  onMemoryOpen,
+  memoryOpen = false,
+}: HeaderProps) {
   const conn = connState(connected, phase);
   const ragInfo = ragPill(rag);
   return (
@@ -85,6 +99,18 @@ export function Header({ project, connected, phase, rag }: HeaderProps) {
         >
           {conn.label}
         </span>
+        {onMemoryOpen && (
+          <Button
+            type="button"
+            size="icon"
+            variant="ghost"
+            aria-label="메모리"
+            aria-pressed={memoryOpen}
+            onClick={onMemoryOpen}
+          >
+            <BookText className="size-4" aria-hidden="true" />
+          </Button>
+        )}
       </div>
     </header>
   );

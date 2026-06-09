@@ -27,9 +27,10 @@ import { Header, type RagState } from "@/components/Header";
 import { ConversationLog } from "@/components/ConversationLog";
 import { ChangesetView } from "@/components/ChangesetView";
 import { PlanView } from "@/components/PlanView";
+import { MemoryView } from "@/components/MemoryView";
 import { InstructionBox, type ChatPayload } from "@/components/InstructionBox";
 import { createPanelStore } from "@/state/store";
-import { IpcClient, type ServerMessage } from "@/lib/ipc";
+import { IpcClient, type MemoryFile, type ServerMessage } from "@/lib/ipc";
 import { progressLabel } from "@/lib/progress";
 
 export default function App() {
@@ -70,6 +71,13 @@ export default function App() {
           break;
         case "list":
           store.applyList({ files: msg.files, error: msg.error });
+          break;
+        case "memory":
+          store.memoryReceived(msg.project, msg.files, msg.episodes);
+          break;
+        case "memory_saved":
+          store.memorySaved(msg.file);
+          store.log("ok", "메모리를 저장했습니다.");
           break;
         case "progress": {
           store.progressReceived(msg.stage);
@@ -250,6 +258,23 @@ export default function App() {
     [store],
   );
 
+  const handleMemoryOpen = useCallback(async () => {
+    store.memoryOpened();
+    await clientRef.current?.send({ type: "memory_get" });
+  }, [store]);
+
+  const handleMemorySave = useCallback(
+    async ({ file, content }: { file: MemoryFile; content: string }) => {
+      const sent = await clientRef.current?.send({
+        type: "memory_save",
+        file,
+        content,
+      });
+      if (sent) store.memorySaveSent(file);
+    },
+    [store],
+  );
+
   const rag = ragState === "idle" ? undefined : { state: ragState, elapsedSec: ragElapsedSec };
 
   return (
@@ -259,6 +284,8 @@ export default function App() {
         connected={state.connected}
         phase={state.phase}
         rag={rag}
+        memoryOpen={state.memoryOpen}
+        onMemoryOpen={handleMemoryOpen}
       />
 
       {/* The live agent activity (reasoning / tool rows / streamed answer)
@@ -292,6 +319,25 @@ export default function App() {
           pending={state.pendingDecision !== null}
           onDecide={handleDecide}
         />
+      )}
+
+      {state.memoryOpen && state.memory && (
+        <MemoryView
+          memory={state.memory}
+          onClose={store.memoryClosed}
+          onTabSelected={store.memoryTabSelected}
+          onEdited={store.memoryEdited}
+          onSave={handleMemorySave}
+        />
+      )}
+
+      {state.memoryOpen && !state.memory && (
+        <section
+          aria-label="프로젝트 메모리"
+          className="border-t border-border p-4 text-sm text-muted-foreground"
+        >
+          메모리를 여는 중…
+        </section>
       )}
 
       <InstructionBox state={state} onSend={handleSend} onReset={handleReset} />

@@ -1259,15 +1259,15 @@
       ]
     },
     "EUD-075-43ae": {
-      "status": "pending",
+      "status": "done",
       "priority": "high",
       "type": "epic",
       "parent": null,
       "depends_on": [],
       "title": "Project memory harness (per-map-project codex memory)",
-      "updated": "2026-06-06",
-      "completed_at": null,
-      "path": "active/EUD-075-43ae.md",
+      "updated": "2026-06-09",
+      "completed_at": "2026-06-09T15:49:57.574091",
+      "path": "done/EUD-075-43ae.md",
       "scope": []
     },
     "EUD-076-d2c2": {
@@ -1283,7 +1283,7 @@
       "scope": []
     },
     "EUD-077-de1e": {
-      "status": "pending",
+      "status": "done",
       "priority": "medium",
       "type": "story",
       "parent": "EUD-075-43ae",
@@ -1291,9 +1291,9 @@
         "EUD-076-d2c2"
       ],
       "title": "Memory WS endpoints + panel view",
-      "updated": "2026-06-06",
-      "completed_at": null,
-      "path": "active/EUD-077-de1e.md",
+      "updated": "2026-06-09",
+      "completed_at": "2026-06-09T15:49:57.546412",
+      "path": "done/EUD-077-de1e.md",
       "scope": []
     },
     "EUD-078-3b29": {
@@ -1368,7 +1368,7 @@
       ]
     },
     "EUD-082-fa35": {
-      "status": "pending",
+      "status": "done",
       "priority": "medium",
       "type": "task",
       "parent": "EUD-077-de1e",
@@ -1376,9 +1376,9 @@
         "EUD-081-cd4a"
       ],
       "title": "Panel memory view (tabs, Monaco edit, episodes, changeset memory items)",
-      "updated": "2026-06-06",
-      "completed_at": null,
-      "path": "active/EUD-082-fa35.md",
+      "updated": "2026-06-09",
+      "completed_at": "2026-06-09T15:49:57.510553",
+      "path": "done/EUD-082-fa35.md",
       "scope": [
         "panel/src/**",
         "panel/components/**"

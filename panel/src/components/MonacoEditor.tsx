@@ -19,13 +19,19 @@ export interface MonacoEditorProps {
   /** Current edit buffer (Apply source of truth). */
   value: string;
   onChange(next: string): void;
+  /** Monaco language id. Defaults to plaintext for existing callers. */
+  language?: string;
 }
 
-export default function MonacoEditor({ value, onChange }: MonacoEditorProps) {
+export default function MonacoEditor({
+  value,
+  onChange,
+  language = "plaintext",
+}: MonacoEditorProps) {
   return (
     <Editor
       height="288px"
-      defaultLanguage="plaintext"
+      defaultLanguage={language}
       value={value}
       onChange={(v) => onChange(v ?? "")}
       theme="vs-dark"
