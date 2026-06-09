@@ -1,0 +1,93 @@
+name: Build RAG Index
+
+# Runnable from a tag: push a tag like rag-index-v1, or run manually from a tag
+# and optionally provide the version input.
+on:
+  push:
+    tags:
+      - "rag-index-v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "RAG index version. Defaults to the rag-index-v* tag suffix, then 1."
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build-rag-index:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Configure vars.ECA_REPO, for example owner/ECA, and secrets.ECA_TOKEN,
+      # a PAT with read access to that private read-only corpus repository.
+      - name: Checkout ECA corpus
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.ECA_REPO }}
+          token: ${{ secrets.ECA_TOKEN }}
+          path: eca
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ci -> target
+          key: rag-index-ci-${{ hashFiles('ci/Cargo.toml', 'ci/**/*.rs') }}
+
+      - name: Build index builder
+        run: cargo build --release --manifest-path ci/Cargo.toml --bin build_rag_index
+
+      - name: Build RAG index
+        # The first run downloads fastembed's BGEM3Q model, about 570 MB, so this
+        # step can take several minutes before embedding starts.
+        run: .\ci\target\release\build_rag_index.exe --eca eca --out rag-index.bin
+
+      - name: Generate release manifest
+        id: manifest
+        env:
+          DISPATCH_VERSION: ${{ inputs.version }}
+        run: |
+          $version = $env:DISPATCH_VERSION
+          if ([string]::IsNullOrWhiteSpace($version) -and "${{ github.ref_name }}" -like "rag-index-v*") {
+            $version = "${{ github.ref_name }}".Substring("rag-index-v".Length)
+          }
+          if ([string]::IsNullOrWhiteSpace($version)) {
+            $version = "1"
+          }
+
+          $tag = "rag-index-v$version"
+          $sha256 = (Get-Content -Raw -Path "rag-index.bin.sha256").Trim()
+          $assetUrl = "https://github.com/${{ github.repository }}/releases/download/$tag/rag-index.bin"
+          $manifest = [ordered]@{
+            rag_index = [ordered]@{
+              url = $assetUrl
+              sha256 = $sha256
+              version = $version
+            }
+          }
+
+          $json = $manifest | ConvertTo-Json -Depth 4
+          [System.IO.File]::WriteAllText(
+            (Join-Path $PWD "rag-index.manifest.json"),
+            $json,
+            [System.Text.UTF8Encoding]::new($false)
+          )
+
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+
+      - name: Publish RAG index release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.manifest.outputs.tag }}
+          files: |
+            rag-index.bin
+            rag-index.bin.sha256
+            rag-index.manifest.json

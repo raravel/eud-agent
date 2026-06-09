@@ -1949,7 +1949,7 @@
       ]
     },
     "EUD-118-1729": {
-      "status": "pending",
+      "status": "done",
       "priority": "medium",
       "type": "task",
       "parent": "EUD-097-7931",
@@ -1957,9 +1957,9 @@
         "EUD-108-6439"
       ],
       "title": "CI: build RAG index, publish Release asset + manifest",
-      "updated": "2026-06-08",
-      "completed_at": null,
-      "path": "active/EUD-118-1729.md",
+      "updated": "2026-06-10",
+      "completed_at": "2026-06-10T02:10:50.425149",
+      "path": "done/EUD-118-1729.md",
       "scope": [
         ".github/**",
         "ci/**"
