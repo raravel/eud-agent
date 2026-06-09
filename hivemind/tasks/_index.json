@@ -1784,8 +1784,8 @@
       "depends_on": [
         "EUD-107-c55c"
       ],
-      "title": "CI RAG index builder (re-embed ECA corpus -> sqlite + sha256)",
-      "updated": "2026-06-08",
+      "title": "CI RAG index builder (re-embed ECA corpus -> rag-index.bin ERAG/v1 + sha256)",
+      "updated": "2026-06-09",
       "completed_at": null,
       "path": "active/EUD-108-6439.md",
       "scope": [
@@ -2096,6 +2096,101 @@
       "scope": [
         "src-tauri/src/engine.rs",
         "src-tauri/src/lib.rs"
+      ]
+    },
+    "EUD-127-e1a7": {
+      "status": "pending",
+      "priority": "high",
+      "type": "story",
+      "parent": "EUD-090-b768",
+      "depends_on": [
+        "EUD-092-121b"
+      ],
+      "title": "S8 Rust map tools (map_info/location_write/player_setup + isom MapEngine)",
+      "updated": "2026-06-09",
+      "completed_at": null,
+      "path": "active/EUD-127-e1a7.md",
+      "scope": []
+    },
+    "EUD-128-daea": {
+      "status": "pending",
+      "priority": "high",
+      "type": "task",
+      "parent": "EUD-127-e1a7",
+      "depends_on": [],
+      "title": "isom-backed MapEngine: wire mapsafe to isom FFI (locedit/playeredit/chk_extract)",
+      "updated": "2026-06-09",
+      "completed_at": null,
+      "path": "active/EUD-128-daea.md",
+      "scope": [
+        "src-tauri/src/mapsafe.rs",
+        "src-tauri/Cargo.toml",
+        "src-tauri/Cargo.lock"
+      ]
+    },
+    "EUD-129-a747": {
+      "status": "pending",
+      "priority": "high",
+      "type": "task",
+      "parent": "EUD-127-e1a7",
+      "depends_on": [
+        "EUD-128-daea"
+      ],
+      "title": "map_info Rust tool handler (register + isom chk_extract -> chk::digest_chk -> mode slicing)",
+      "updated": "2026-06-09",
+      "completed_at": null,
+      "path": "active/EUD-129-a747.md",
+      "scope": [
+        "src-tauri/src/tools.rs"
+      ]
+    },
+    "EUD-130-b4eb": {
+      "status": "pending",
+      "priority": "medium",
+      "type": "task",
+      "parent": "EUD-127-e1a7",
+      "depends_on": [
+        "EUD-128-daea"
+      ],
+      "title": "location_write Rust tool handler (MRGN CRUD via mapsafe + changeset/journal)",
+      "updated": "2026-06-09",
+      "completed_at": null,
+      "path": "active/EUD-130-b4eb.md",
+      "scope": [
+        "src-tauri/src/tools.rs"
+      ]
+    },
+    "EUD-131-6134": {
+      "status": "pending",
+      "priority": "medium",
+      "type": "task",
+      "parent": "EUD-127-e1a7",
+      "depends_on": [
+        "EUD-128-daea"
+      ],
+      "title": "player_setup Rust tool handler (start locations + OWNR via playeredit)",
+      "updated": "2026-06-09",
+      "completed_at": null,
+      "path": "active/EUD-131-6134.md",
+      "scope": [
+        "src-tauri/src/tools.rs"
+      ]
+    },
+    "EUD-132-0829": {
+      "status": "pending",
+      "priority": "medium",
+      "type": "task",
+      "parent": "EUD-091-4cb2",
+      "depends_on": [
+        "EUD-100-b403"
+      ],
+      "title": "Wire bootstrap into app startup (lib.rs setup: ensure model/RAG, gate readiness, emit progress)",
+      "updated": "2026-06-09",
+      "completed_at": null,
+      "path": "active/EUD-132-0829.md",
+      "scope": [
+        "src-tauri/src/lib.rs",
+        "src-tauri/src/bootstrap.rs"
       ]
     }
   }
