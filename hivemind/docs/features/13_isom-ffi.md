@@ -60,3 +60,4 @@ Wraps every mutating call (location_write/player_setup):
 - `src-tauri/src/mapsafe.rs` — rails + journal (ports journal.py)
 - external: vendored ICU + CascLib (static), `bindgen`
 - [BOUND 2026-06-09 from EUD-133-f076] `crates/isom/build.rs` — re-supplies the engine-archive link directives (search path + raw `isom_capi.lib` link-arg) that rustc dedups away for the isom crate's own test binaries; built on /MD (no static-CRT forcing) per Decision 14
+- [BOUND 2026-06-09 from EUD-128-daea] `src-tauri/build.rs` — re-supplies the `isom_capi.lib` static-archive link directive (search path + raw `rustc-link-arg`) that rustc dedups away from the eud-agent final link (isom-sys declares links="isom_capi"); mirror of crates/isom/build.rs, alongside tauri_build::build()
