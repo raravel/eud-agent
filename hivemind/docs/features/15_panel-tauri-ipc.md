@@ -84,3 +84,4 @@ raw `agent_event` kind identifiers as user-facing text.
 - `panel/src/App.tsx` — swap `WsClient` for the IPC client; remove WS lifecycle wiring.
 - removed: `panel/src/ws/client.ts`, `panel/src/ws/protocol.ts` (+ tests) once types move.
 - external: `@tauri-apps/api` ^2 (core `invoke` + `event`).
+- [BOUND 2026-06-09 from EUD-119-bc27] `panel/src/lib/protocol.ts` — sibling types module re-homed from `ws/protocol.ts` (ClientMessage/ServerMessage discriminated unions, type guards, and shared shapes FileEntry/ChangesetItem/Diagnostic/ProgressStage); re-exported by `lib/ipc.ts`.
