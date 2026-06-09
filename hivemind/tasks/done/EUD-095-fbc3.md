@@ -1,13 +1,14 @@
 ---
+completed_at: '2026-06-10T01:27:26.226390'
 created: '2026-06-08'
 depends_on: []
 id: EUD-095-fbc3
 parent: EUD-090-b768
 priority: medium
-status: pending
+status: done
 title: S5 Slim Lua bridge
 type: story
-updated: '2026-06-08'
+updated: '2026-06-10'
 ---
 
 ## Description

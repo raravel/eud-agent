@@ -1562,15 +1562,15 @@
       "scope": []
     },
     "EUD-095-fbc3": {
-      "status": "pending",
+      "status": "done",
       "priority": "medium",
       "type": "story",
       "parent": "EUD-090-b768",
       "depends_on": [],
       "title": "S5 Slim Lua bridge",
-      "updated": "2026-06-08",
-      "completed_at": null,
-      "path": "active/EUD-095-fbc3.md",
+      "updated": "2026-06-10",
+      "completed_at": "2026-06-10T01:27:26.226390",
+      "path": "done/EUD-095-fbc3.md",
       "scope": []
     },
     "EUD-096-4eb3": {
@@ -1918,15 +1918,15 @@
       ]
     },
     "EUD-116-e052": {
-      "status": "pending",
+      "status": "done",
       "priority": "medium",
       "type": "task",
       "parent": "EUD-095-fbc3",
       "depends_on": [],
       "title": "Slim Lua bridge (drop WebView2/spawn; keep IPC + reversed heartbeat)",
-      "updated": "2026-06-08",
-      "completed_at": null,
-      "path": "active/EUD-116-e052.md",
+      "updated": "2026-06-10",
+      "completed_at": "2026-06-10T01:27:26.194807",
+      "path": "done/EUD-116-e052.md",
       "scope": [
         "bridge/ZZZ_10_agent_bridge.lua",
         "scripts/install_bridge.ps1"

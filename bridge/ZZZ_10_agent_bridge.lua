@@ -1,14 +1,11 @@
 -- ============================================================================
 -- ZZZ_10_agent_bridge.lua : 외부 에이전트 <-> EUD Editor 3 파일 IPC 브리지 (v6)
---   v5: u8() 한글 UI 복원 + PANEL을 4기능 제어판으로 확장
---       (트리거 에디터 열기 / 새 eps 생성 / 목록 선택 열기 / 코드 적용)
---   v6: 프로젝트가 열리면(pjData nil->존재) 제어판 자동 표시. 닫히면 재무장.
 --
 -- 설치: <에디터>\Data\Lua\TriggerEditor\ 복사 후 재시작.
 -- 통신: Data\agent\inbox\<n>.cmd  ->  outbox\<n>.result  ,  status.txt
 -- 명령: PING STATUS DUMP / GET <경로> / SET <경로>\n<본문>
 --       GETDAT <datname>|<param>|<objId> / SETDAT <datname>|<param>|<objId>|<value>
---       PANEL / BUILD / LUA
+--       BUILD / LUA
 -- 규칙: UI 스레드(Tick) 전용 / 인덱스 프로퍼티 get_*() / enum 객체 / Array는 [i]
 --       / 한글 표시는 u8() / 빌드중 skip
 -- ============================================================================
@@ -20,10 +17,6 @@ local ok, initErr = pcall(function()
     luanet.load_assembly("PresentationCore, Version=4.0.0.0, Culture=neutral, PublicKeyToken=31bf3856ad364e35")
     luanet.load_assembly("PresentationFramework, Version=4.0.0.0, Culture=neutral, PublicKeyToken=31bf3856ad364e35")
     luanet.load_assembly("EUD Editor 3")
-    -- WebView2 SDK DLLs are deployed NEXT TO THE EDITOR EXE (install_dropin);
-    -- app-base probing makes load_assembly by simple name resolve them.
-    luanet.load_assembly("Microsoft.Web.WebView2.Core")
-    luanet.load_assembly("Microsoft.Web.WebView2.Wpf")
 
     local AppDomain  = luanet.import_type("System.AppDomain")
     local File       = luanet.import_type("System.IO.File")
@@ -57,14 +50,6 @@ local ok, initErr = pcall(function()
     local DispatcherTimer = luanet.import_type("System.Windows.Threading.DispatcherTimer")
     local DispatcherPriority = luanet.import_type("System.Windows.Threading.DispatcherPriority")
     local TimeSpan   = luanet.import_type("System.TimeSpan")
-    local Process    = luanet.import_type("System.Diagnostics.Process")
-    local ProcessStartInfo = luanet.import_type("System.Diagnostics.ProcessStartInfo")
-    -- WebView2 panel hosting (v6 WPF control panel replaced). Window reuses the
-    -- v6 showPanel import idiom; WebView2 + CreationProperties from the SDK.
-    local Window     = luanet.import_type("System.Windows.Window")
-    local WebView2   = luanet.import_type("Microsoft.Web.WebView2.Wpf.WebView2")
-    local CoreWebView2CreationProperties =
-        luanet.import_type("Microsoft.Web.WebView2.Wpf.CoreWebView2CreationProperties")
 
     local baseDir   = tostring(AppDomain.CurrentDomain.BaseDirectory)
     local agentDir  = baseDir .. "Data\\agent\\"
@@ -72,6 +57,17 @@ local ok, initErr = pcall(function()
     local outboxDir = agentDir .. "outbox\\"
     Directory.CreateDirectory(inboxDir)
     Directory.CreateDirectory(outboxDir)
+    -- Clear stale inbox/outbox from a previous run; prevents replay of leftover commands.
+    pcall(function()
+        local staleCmds = Directory.GetFiles(inboxDir, "*.cmd")
+        for i = 0, staleCmds.Length - 1 do
+            File.Delete(tostring(staleCmds[i]))
+        end
+        local staleResults = Directory.GetFiles(outboxDir, "*.result")
+        for i = 0, staleResults.Length - 1 do
+            File.Delete(tostring(staleResults[i]))
+        end
+    end)
 
     -- u8: .lua 소스의 한글(Latin1 mojibake)을 올바른 유니코드로 복원
     local latin1 = Encoding.GetEncoding("iso-8859-1")
@@ -287,151 +283,7 @@ local ok, initErr = pcall(function()
         ["starcraft"] = true,
     }
 
-    -- ------------------------------------------------------------------
-    -- Server lifecycle: agent.cfg -> spawn python server -> ready/respawn.
-    -- KopiLua has no JSON lib; the cfg/ready files are flat JSON parsed with
-    -- string.match. agent.cfg paths are JSON-escaped (\\), so unescape "\\".
-    -- ------------------------------------------------------------------
-    local cfgPath   = agentDir .. "agent.cfg"
-    local readyPath = agentDir .. "server.ready"
-    local errLogPath = agentDir .. "bridge_error.log"
     local function nowIso() return tostring(DateTime.Now:ToString("o")) end
-    local function logError(msg)
-        pcall(function()
-            Directory.CreateDirectory(agentDir)
-            File.AppendAllText(errLogPath, nowIso() .. "  " .. tostring(msg) .. "\r\n")
-        end)
-    end
-    -- unescape JSON string body (\\ -> \, \/ -> /) for cfg path values
-    local function jsonUnescape(s)
-        s = string.gsub(s, "\\\\", "\\")
-        s = string.gsub(s, "\\/", "/")
-        return s
-    end
-    local function matchNum(txt, key)
-        -- "key": value  (numeric value, e.g. port)
-        return string.match(txt, '"' .. key .. '"%s*:%s*(%d+)')
-    end
-    local function matchTok(txt, key)
-        -- "key": "value"  (string value, e.g. token from server.ready)
-        local v = string.match(txt, '"' .. key .. '"%s*:%s*"([^"]*)"')
-        if v ~= nil then return jsonUnescape(v) end
-        return nil
-    end
-
-    -- bridge start time: server.ready must be newer than this to be ours.
-    local bridgeStart = DateTime.Now
-
-    -- cfg state (nil when missing/unparseable -> degrade, no spawn)
-    local cfgPythonExe, cfgRepoRoot, cfgPort = nil, nil, nil
-    local cfgOk = false
-    do
-        local okCfg, cfgErr = pcall(function()
-            if not File.Exists(cfgPath) then error("agent.cfg not found: " .. cfgPath) end
-            local txt = safestr(File.ReadAllText(cfgPath))
-            -- flat JSON, 3 keys, plain string.match (no JSON lib in KopiLua)
-            local pe = string.match(txt, '"python_exe"%s*:%s*"([^"]*)"')
-            local rr = string.match(txt, '"repo_root"%s*:%s*"([^"]*)"')
-            cfgPort  = string.match(txt, '"port"%s*:%s*(%d+)')
-            if pe ~= nil then cfgPythonExe = jsonUnescape(pe) end
-            if rr ~= nil then cfgRepoRoot  = jsonUnescape(rr) end
-            if cfgPythonExe == nil or cfgRepoRoot == nil then
-                error("agent.cfg missing python_exe/repo_root")
-            end
-        end)
-        if okCfg then cfgOk = true
-        else logError("agent.cfg unusable; server spawn skipped: " .. tostring(cfgErr)) end
-    end
-
-    -- agentProc: GLOBAL (no `local`) on purpose -- GC guard for the owned handle
-    -- and the only safe pid/HasExited source (the owned handle never throws on a
-    -- dead pid, unlike resolving a pid back into a Process by id).
-    agentProc = nil
-    local lastSpawn = nil
-    local agentReady = false
-    -- WebView2 task consumption surface: PLAIN LUA GLOBALS (no `local`), same
-    -- idiom as agentProc. NEVER stash on the GlobalObj static-type proxy --
-    -- writing non-member fields there is build-dependent (throw vs no-op).
-    agentSrvReady = false
-    agentSrvPort  = nil
-    agentSrvToken = nil
-
-    local function spawnServer()
-        if not cfgOk then return end
-        local okSpawn, spawnErr = pcall(function()
-            -- a stale ready from a previous run must not validate the new proc
-            if File.Exists(readyPath) then File.Delete(readyPath) end
-            local psi = ProcessStartInfo()
-            psi.FileName = cfgPythonExe
-            -- agentDir provably ends with "\"; strip it so the closing quote is
-            -- not escaped ("...\" would escape it on the CreateProcess cmd line).
-            psi.Arguments = '-m eud_agent --data-dir "' .. string.sub(agentDir, 1, -2) .. '"'
-            psi.UseShellExecute = false
-            psi.CreateNoWindow = true
-            psi.WorkingDirectory = cfgRepoRoot .. "\\server"
-            agentProc = Process.Start(psi)
-            -- reset both latches so consumers never read a stale ready/port/token
-            -- between server death and the next validation.
-            agentReady = false
-            agentSrvReady = false
-        end)
-        lastSpawn = DateTime.Now
-        if not okSpawn then logError("server spawn failed: " .. tostring(spawnErr)) end
-    end
-
-    -- per-Tick: validate server.ready (owned pid + write time after start).
-    local function validateReady()
-        if agentProc == nil then return end
-        if agentReady then return end
-        if not File.Exists(readyPath) then return end
-        local okV = pcall(function()
-            local txt = safestr(File.ReadAllText(readyPath))
-            -- The venv launcher (server\.venv\Scripts\python.exe) re-execs the
-            -- base interpreter as a CHILD: the bridge owns the LAUNCHER pid, but
-            -- server.ready carries the child pid (server os.getpid). The server
-            -- also writes ppid (the launcher), so accept ownership on EITHER.
-            -- '"pid"' cannot match inside '"ppid"' (the leading quote precedes a
-            -- 'p', not the 'pid' run), so the pid extraction is order-independent
-            -- without anchoring; ppid uses its own distinct anchored pattern.
-            local pidStr  = string.match(txt, '"pid"%s*:%s*(%d+)')
-            local ppidStr = string.match(txt, '"ppid"%s*:%s*(%d+)')
-            local ownPid = tostring(agentProc.Id)
-            if (pidStr ~= nil and pidStr == ownPid)
-                or (ppidStr ~= nil and ppidStr == ownPid) then
-                -- write time must be after the bridge started (not a stale file)
-                local wt = File.GetLastWriteTime(readyPath)
-                if DateTime.Compare(wt, bridgeStart) > 0 then
-                    -- expose port+token FIRST, then flip the ready global, then
-                    -- the local latch -- so a consumer that sees agentSrvReady
-                    -- always finds port+token already populated.
-                    agentSrvPort  = matchNum(txt, "port")
-                    agentSrvToken = matchTok(txt, "token")
-                    agentSrvReady = true
-                    agentReady = true
-                end
-            else
-                -- stale ready (neither pid nor ppid matches -- crash leftover):
-                -- drop it, respawn recovers
-                File.Delete(readyPath)
-            end
-        end)
-        if not okV then logError("server.ready validation error") end
-    end
-
-    -- per-Tick: respawn an exited server (throttled to once per 30s).
-    local function maybeRespawn()
-        if not cfgOk then return end
-        if agentProc == nil then return end
-        if GlobalObj.pjData == nil then return end
-        local exited = false
-        pcall(function() exited = agentProc.HasExited end) -- safe on an owned handle
-        if not exited then return end
-        if lastSpawn ~= nil then
-            local elapsed = DateTime.Now:Subtract(lastSpawn).TotalSeconds
-            if elapsed < 30 then return end
-        end
-        spawnServer()
-    end
 
     -- Data editor: bridge-local name->enum table over SCDatFiles+DatFiles.
     -- Replaces the editor's 8-name resolver (its whitelist excludes
@@ -525,169 +377,6 @@ local ok, initErr = pcall(function()
         return binding, nil
     end
 
-    -- ------------------------------------------------------------------
-    -- PANEL : WebView2-hosted web panel (replaces the v6 WPF control panel).
-    -- The Korean UI lives in the web panel (panel/), not in this Lua source --
-    -- the window title stays ASCII. State is kept in PLAIN LUA GLOBALS (no
-    -- `local`), same idiom as agentProc/agentSrv* (rules.md "luanet static
-    -- proxy" caution): a non-member field on a static-type proxy is build-
-    -- dependent. panelWin is the alive-tracking source of truth (re-arm).
-    -- ------------------------------------------------------------------
-    panelWin       = nil   -- the WebView2-hosting Window (nil => recreate)
-    panelView      = nil   -- the WebView2 control
-    panelCoreReady = false -- CoreWebView2InitializationCompleted succeeded
-    navOk          = false -- last NavigationCompleted IsSuccess
-    lastNavAttempt = nil   -- DateTime of the last Navigate (3s backoff source)
-    lastNavUrl     = nil   -- URL of the last Navigate (respawn freshness source)
-    local NAV_BACKOFF_SECONDS = 3
-
-    local function panelUrl()
-        return "http://127.0.0.1:" .. safestr(agentSrvPort) .. "/?token=" .. safestr(agentSrvToken)
-    end
-
-    -- Navigate the existing initialized control to the panel URL. Safe to call
-    -- repeatedly; records the attempt time + URL (backoff + respawn freshness).
-    local function navigatePanel()
-        if panelView == nil or not panelCoreReady then return end
-        if not agentSrvReady then return end
-        local url = panelUrl()
-        -- CoreWebView2 is a plain property (dot access; rules.md reserves
-        -- get_X() for parameterized properties).
-        local okNav = pcall(function()
-            panelView.CoreWebView2:Navigate(url)
-        end)
-        lastNavAttempt = DateTime.Now
-        lastNavUrl = url
-        if not okNav then
-            navOk = false
-            logError("panel Navigate failed")
-        end
-    end
-
-    -- Create the WebView2 window + control. Only when the server is ready (port
-    -- and token are populated). Wraps every .NET call so a failure logs and
-    -- leaves panelWin nil (the Tick re-arm will retry).
-    local function createPanel()
-        if not agentSrvReady then return false end
-        if panelWin ~= nil then return true end
-        local okCreate, cErr = pcall(function()
-            panelCoreReady = false
-            navOk = false
-            local win = Window()
-            win.Title = "EUD Agent"
-            win.Width = 480; win.Height = 720
-
-            local view = WebView2()
-            local cp = CoreWebView2CreationProperties()
-            -- explicit user-data-folder under Data\agent (NEVER the default
-            -- next-to-exe location; rules.md hard rule).
-            cp.UserDataFolder = agentDir .. "webview2"
-            view.CreationProperties = cp
-
-            view.CoreWebView2InitializationCompleted:Add(function(s, e)
-                local okInit = false
-                pcall(function() okInit = e.IsSuccess end)
-                if okInit then
-                    panelCoreReady = true
-                    -- Citation links (EUD-090): the panel renders evidence links
-                    -- as <a target="_blank">, which raises NewWindowRequested.
-                    -- Route them to the user's DEFAULT BROWSER (shell-open) and
-                    -- mark Handled so WebView2 never spawns its own popup; the
-                    -- panel window itself must never navigate away. http(s)
-                    -- only; anything else is dropped.
-                    pcall(function()
-                        view.CoreWebView2.NewWindowRequested:Add(function(s2, e2)
-                            local uri = nil
-                            pcall(function()
-                                e2.Handled = true
-                                uri = tostring(e2.Uri)
-                            end)
-                            if uri ~= nil and (string.sub(uri, 1, 7) == "http://"
-                                    or string.sub(uri, 1, 8) == "https://") then
-                                pcall(function()
-                                    local psi = ProcessStartInfo()
-                                    psi.FileName = uri
-                                    psi.UseShellExecute = true
-                                    Process.Start(psi)
-                                end)
-                            end
-                        end)
-                    end)
-                    navigatePanel()
-                else
-                    panelCoreReady = false
-                    logError("CoreWebView2 init failed")
-                end
-            end)
-            view.NavigationCompleted:Add(function(s, e)
-                local success = false
-                pcall(function() success = e.IsSuccess end)
-                if success then
-                    navOk = true
-                else
-                    -- WebView2 never auto-retries: flag for the Tick re-navigate
-                    -- (3s backoff via lastNavAttempt).
-                    navOk = false
-                end
-            end)
-            win.Closed:Add(function(s, e)
-                -- handle-tracking source of truth: a closed window must re-arm.
-                panelWin = nil
-                panelView = nil
-                panelCoreReady = false
-            end)
-
-            win.Content = view
-            view:EnsureCoreWebView2Async(nil)
-            win:Show()
-            panelView = view
-            panelWin = win
-        end)
-        if not okCreate then
-            logError("createPanel failed: " .. tostring(cErr))
-            panelWin = nil
-            panelView = nil
-            return false
-        end
-        return true
-    end
-
-    -- Show/refocus the panel window (PANEL command); create it if absent + ready.
-    local function showPanel()
-        if not agentSrvReady then return "ERROR: server not ready" end
-        if panelWin == nil then
-            if not createPanel() then return "ERROR: panel create failed" end
-            return "OK: panel"
-        end
-        pcall(function() panelWin:Show(); panelWin:Activate() end)
-        return "OK: panel"
-    end
-
-    -- per-Tick re-arm: recreate the window while "project open AND window not
-    -- alive" (the editor closes auxiliary windows on project switch). Also
-    -- re-navigate (3s backoff) when a previous navigation failed.
-    local function maintainPanel()
-        if not agentSrvReady then return end
-        if GlobalObj.pjData == nil then return end
-        if panelWin == nil then
-            createPanel()
-            return
-        end
-        -- window alive: re-navigate when the last nav FAILED, or when the URL
-        -- changed (server respawn -> new port/token; a WS disconnect is NOT a
-        -- NavigationCompleted failure, so navOk stays true and the panel would
-        -- otherwise sit on the dead old-token URL). 3s backoff either way.
-        if panelCoreReady and (not navOk or panelUrl() ~= lastNavUrl) then
-            local due = true
-            if lastNavAttempt ~= nil then
-                local elapsed = DateTime.Now:Subtract(lastNavAttempt).TotalSeconds
-                if elapsed < NAV_BACKOFF_SECONDS then due = false end
-            end
-            if due then navigatePanel() end
-        end
-    end
-
-    -- ------------------------------------------------------------------
     local function handleCommand(cmdText)
         local nl = string.find(cmdText, "\n", 1, true)
         local firstLine, body
@@ -950,7 +639,7 @@ local ok, initErr = pcall(function()
             local b, err = resolveXDatBinding(a[1], a[2], tonumber(a[3]))
             if b == nil then return "ERROR: " .. err end
             -- Byte-backed setters silently swallow bad values (capability-survey):
-            -- assign then RE-READ .Value and return the read-back so the server
+            -- assign then RE-READ .Value and return the read-back so the app
             -- can verify the write took.
             local before = safestr(b.Value)
             local okAssign = pcall(function() b.Value = a[4] end)
@@ -1021,7 +710,7 @@ local ok, initErr = pcall(function()
             local datEnum = reqDatToEnum[a[1]]
             if datEnum == nil then return "ERROR: invalid req dat (units/upgrades/techdata/Stechdata/orders)" end
             local objId = tonumber(a[2])
-            -- Defense in depth (LUA-channel callers bypass the server's
+            -- Defense in depth (LUA-channel callers bypass the app's
             -- normalization): the first dot-segment MUST be numeric. The editor's
             -- PasteCopyData coerces it String->Enum (number); a non-numeric first
             -- segment throws an uncatchable InvalidCastException -> editor dialog.
@@ -1267,8 +956,6 @@ local ok, initErr = pcall(function()
             end)
             if not okM then return "ERROR: plugmove failed: " .. tostring(err) end
             return "OK: plugmove " .. fromIdx .. " -> " .. toIdx
-        elseif cmd == "PANEL" then
-            return showPanel()
         elseif cmd == "BUILD" then
             -- BUILD (B4, hardened): force SCArchive.IsUsed = false (SCA is
             -- defunct -- the dead login modal pops during Build when IsUsed is
@@ -1330,7 +1017,7 @@ local ok, initErr = pcall(function()
         elseif cmd == "EDSPATH" then
             -- EDSPATH (B4): return the BuildData-derived temp .eds path
             -- (BuildData.EdsFilePath -- a SHARED ReadOnly property on the imported
-            -- TYPE proxy) + pjData.SaveMapName, one per line. Gives the server the
+            -- TYPE proxy) + pjData.SaveMapName, one per line. Gives the app the
             -- artifact paths for the euddraft re-run fallback + output-map check.
             local pj = GlobalObj.pjData
             if pj == nil then return "ERROR: no project" end
@@ -1351,20 +1038,20 @@ local ok, initErr = pcall(function()
     -- Last idle-Tick project line, reused by the BUSY status write below:
     -- while IsCompilng the Tick must not touch pjData (rules.md), so the
     -- compiling status.txt carries the project string cached on the previous
-    -- idle Tick. Plain global (luanet static-proxy idiom, same as panelWin).
+    -- idle Tick.
     lastProjectLine = "(none)"
     local timer = DispatcherTimer(DispatcherPriority.Normal)
     timer.Interval = TimeSpan.FromSeconds(1)
     timer.Tick:Add(function(sender, args)
         local okTick, tickErr = pcall(function()
             -- heartbeat: ALWAYS first, unconditional, before the build early-return
-            -- (rules.md hard rule; the server self-terminates on >60s staleness).
+            -- (rules.md hard rule; the app reads it as the editor liveness signal).
             pcall(function() File.WriteAllText(agentDir .. "heartbeat.txt", nowIso()) end)
             local pg = GlobalObj.pgData
             if pg ~= nil and pg.IsCompilng then
                 -- status: ALSO unconditional, BEFORE the build early-return.
-                -- status.txt is the server's ONLY busy signal (the 10s->180s
-                -- poll-timeout extension + the panel's waiting_build notice);
+                -- status.txt is the app's busy signal (the 10s->180s
+                -- poll-timeout extension);
                 -- writing it only on idle Ticks left it permanently
                 -- compiling=false, so every command during a build timed out
                 -- at 10s with a misleading compiling=False. No pjData access
@@ -1377,20 +1064,12 @@ local ok, initErr = pcall(function()
                 end)
                 return
             end
-            -- server lifecycle (skipped during builds with the rest of the work)
-            validateReady()
-            maybeRespawn()
             local pj = GlobalObj.pjData
             lastProjectLine = (pj ~= nil and ("'" .. safestr(pj.Filename) .. "'") or "(none)")
             File.WriteAllText(agentDir .. "status.txt",
                 "time=" .. tostring(DateTime.Now)
                 .. "\r\ncompiling=" .. (pg == nil and "?" or tostring(pg.IsCompilng))
                 .. "\r\nproject=" .. lastProjectLine)
-            -- WebView2 panel re-arm: recreate while "project open AND window not
-            -- alive" (project switch closes auxiliary windows) + re-navigate on
-            -- a failed nav with a 3s backoff. Handle tracking (panelWin), not a
-            -- pjData==nil-only re-arm (rules.md).
-            pcall(maintainPanel)
             local files = Directory.GetFiles(inboxDir, "*.cmd")
             for i = 0, files.Length - 1 do
                 local cmdPath = tostring(files[i])
@@ -1409,8 +1088,6 @@ local ok, initErr = pcall(function()
         end
     end)
     timer:Start()
-    -- spawn the python server once at init (no-op + logged when cfg is unusable)
-    spawnServer()
     File.WriteAllText(agentDir .. "bridge_loaded.txt", "agent bridge v7 loaded at " .. tostring(DateTime.Now))
 end)
 
