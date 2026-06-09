@@ -2113,7 +2113,7 @@
       "scope": []
     },
     "EUD-128-daea": {
-      "status": "pending",
+      "status": "blocked",
       "priority": "high",
       "type": "task",
       "parent": "EUD-127-e1a7",

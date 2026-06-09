@@ -1,4 +1,9 @@
 ---
+blocked_reason: 'build blocked: isom_capi.lib (/MT,/GL static CRT) vs ort_sys (/MD
+  dynamic CRT, from fastembed) cannot coexist in one binary; cargo build/test -p eud-agent
+  cannot link without /MD rebuild of native/isom/** vcxproj + crates/isom-sys/build.rs
+  CRT change, outside the declared scope (src-tauri/**). Worker code (OpKind threading
+  + IsomEngine) is correct. Re-plan CRT reconciliation as its own task.'
 created: '2026-06-09'
 depends_on: []
 id: EUD-128-daea
@@ -8,7 +13,7 @@ scope:
 - src-tauri/src/mapsafe.rs
 - src-tauri/Cargo.toml
 - src-tauri/Cargo.lock
-status: pending
+status: blocked
 title: 'isom-backed MapEngine: wire mapsafe to isom FFI (locedit/playeredit/chk_extract)'
 type: task
 updated: '2026-06-09'
