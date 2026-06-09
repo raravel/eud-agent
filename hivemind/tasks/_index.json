@@ -2047,15 +2047,15 @@
       ]
     },
     "EUD-124-9090": {
-      "status": "pending",
+      "status": "done",
       "priority": "high",
       "type": "task",
       "parent": "EUD-094-e9ee",
       "depends_on": [],
       "title": "eud-tools MCP server + tool registry, mutation gate, budgets",
       "updated": "2026-06-09",
-      "completed_at": null,
-      "path": "active/EUD-124-9090.md",
+      "completed_at": "2026-06-09T12:09:45.418631",
+      "path": "done/EUD-124-9090.md",
       "scope": [
         "src-tauri/src/tools.rs"
       ]
