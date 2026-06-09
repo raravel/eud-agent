@@ -10,15 +10,10 @@
 //! 3. Runs bindgen over `native/isom/isom_capi.h` to generate the Rust FFI into
 //!    `$OUT_DIR/bindings.rs`.
 //!
-//! CRT (load-bearing for downstream): `isom_capi.lib` (ReleaseUS) is built `/MT`
-//! (static CRT) + `/GL` (WPO). Rust MSVC links `/MD` (dynamic CRT) by default,
-//! which conflicts (LNK4098 / multiply-defined CRT symbols). We match Rust to the
-//! static CRT by emitting `cargo:rustc-link-arg`s that exclude the dynamic-CRT
-//! default libs and force the static ones. NOTE: `rustc-link-arg` applies only to
-//! the binary/test/cdylib being linked, NOT transitively — so `src-tauri` (and any
-//! other final-link target consuming this) MUST re-supply the same four link args
-//! (or build with `-C target-feature=+crt-static`). The `/GL` objects make link.exe
-//! emit a benign "specify /LTCG" note; the link still succeeds.
+//! CRT (load-bearing for downstream): `isom_capi.lib` (ReleaseUS) is built `/MD`
+//! (dynamic CRT), matching Rust MSVC's default and the prebuilt `ort_sys` library
+//! used by `fastembed`. No CRT-forcing link args are emitted here, and downstream
+//! final-link targets such as `src-tauri` require no special CRT handling.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -184,13 +179,6 @@ fn emit_link_directives(native_dir: &Path) {
     for lib in SYSTEM_LIBS {
         println!("cargo:rustc-link-lib=dylib={lib}");
     }
-
-    // CRT match: isom_capi.lib is /MT (static CRT). Force the Rust link onto the
-    // static CRT too, and drop the dynamic-CRT default libs Rust would otherwise
-    // request, so the two halves agree on one CRT (no LNK4098/LNK2005).
-    for arg in CRT_STATIC_LINK_ARGS {
-        println!("cargo:rustc-link-arg={arg}");
-    }
 }
 
 /// Win32 libs required by the folded engine archive. Add only what the link needs.
@@ -205,14 +193,6 @@ const SYSTEM_LIBS: &[&str] = &[
     "bcrypt",
     "wininet",
     "comdlg32", // GetOpenFileNameW / GetSaveFileNameW (MappingCoreLib SystemIO)
-];
-
-/// Link args that put the Rust side on the static CRT to match isom_capi.lib (/MT).
-const CRT_STATIC_LINK_ARGS: &[&str] = &[
-    "/NODEFAULTLIB:msvcrt.lib",
-    "/NODEFAULTLIB:msvcprt.lib",
-    "/DEFAULTLIB:libcmt.lib",
-    "/DEFAULTLIB:libcpmt.lib",
 ];
 
 fn generate_bindings(header: &Path) {

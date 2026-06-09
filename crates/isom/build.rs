@@ -3,12 +3,8 @@
 //! Re-supplies the native link directives that do NOT reach this crate's
 //! final-link targets (its `cargo test -p isom` binaries) automatically:
 //!
-//! 1. The four `cargo:rustc-link-arg` directives `isom-sys/build.rs` emits to
-//!    put the link on the STATIC CRT (`isom_capi.lib` is built `/MT`).
-//!    `rustc-link-arg` applies ONLY to the final-link target it is emitted for
-//!    (isom-sys's own rlib never links an exe), never transitively — so every
-//!    consumer must re-supply them or the link fails on a CRT mismatch
-//!    (LNK2005 multiply-defined CRT symbols / LNK4098 default-lib conflict).
+//! 1. `isom_capi.lib` is built `/MD`, matching Rust MSVC's default dynamic CRT.
+//!    No CRT-forcing link args are needed here.
 //!
 //! 2. The `rustc-link-search` path to, and `rustc-link-lib=static=isom_capi`
 //!    for, the engine archive. MEASURED: the `static=isom_capi` directive from
@@ -23,15 +19,6 @@
 //! Keep these in lockstep with `crates/isom-sys/build.rs`.
 
 use std::path::PathBuf;
-
-/// Link args that put the Rust side on the static CRT to match `isom_capi.lib`
-/// (`/MT`). Mirror of `isom-sys/build.rs::CRT_STATIC_LINK_ARGS`.
-const CRT_STATIC_LINK_ARGS: &[&str] = &[
-    "/NODEFAULTLIB:msvcrt.lib",
-    "/NODEFAULTLIB:msvcprt.lib",
-    "/DEFAULTLIB:libcmt.lib",
-    "/DEFAULTLIB:libcpmt.lib",
-];
 
 /// MSBuild Platform / Configuration the engine archive lands under. Mirror of
 /// `isom-sys/build.rs::{MSBUILD_PLATFORM, MSBUILD_CONFIG}`.
@@ -84,8 +71,4 @@ fn main() {
     // and (unlike `rustc-link-lib`) it applies to THIS final-link target.
     let lib_file = lib_dir.join("isom_capi.lib");
     println!("cargo:rustc-link-arg={}", lib_file.display());
-
-    for arg in CRT_STATIC_LINK_ARGS {
-        println!("cargo:rustc-link-arg={arg}");
-    }
 }

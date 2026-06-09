@@ -33,3 +33,20 @@
     CRT note in the module doc comment.
   - feature 13 (isom-ffi) Implementation map gains the CRT requirement; rules.md Rust/C++
     FFI section notes the single-CRT (/MD) constraint.
+
+## Addendum (EUD-133, 2026-06-09): /GL is RETAINED, not removed
+
+The original Impact bullet "remove WholeProgramOptimization (/GL)" was a measured error and
+is superseded: **/GL (LTCG) is load-bearing for the vendored MappingCoreLib and must be kept.**
+`Chk::Action::stringUsed` / `briefingStringUsed` are declared `inline` in `Chk.h` and DEFINED
+`inline` in `Chk.cpp`, yet ODR-used cross-TU from `Scenario.cpp` (`appendTriggerStrUsage`). No
+out-of-line definition is emitted, so a non-LTCG build leaves them unresolved (`LNK2019`); only
+/GL's whole-program cross-TU inlining resolves them. Removing /GL would require editing vendored
+C++ (forbidden by rules.md "keep verified code paths intact"). /GL is orthogonal to the CRT, so
+the CRT-coexistence goal is met by the RuntimeLibrary `/MD` switch alone. Measured (EUD-133):
+`cargo test -p isom` (incl. `ffi_smoke`) and the isom+ort `eud-agent` coexistence link both pass
+with `/MD` + `/GL` on the MSVC `link.exe` toolchain (the only toolchain rules.md supports). A
+codex review [P2] re-raised /GL removal on toolchain-fragility grounds (lld-link / mismatched
+toolset); overridden as not applicable to the mandated MSVC toolchain and infeasible without
+vendor edits. Net change in EUD-133: RuntimeLibrary `/MT`->`/MD` (+ drop static-CRT forcing in
+`isom-sys`/`isom` build.rs); WholeProgramOptimization left `true`.
