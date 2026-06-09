@@ -3,7 +3,10 @@
 //! The functions here are small, deterministic backstops for crash-critical
 //! first principles and the EUD-090 evidence requirement.
 
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
+use std::collections::BTreeMap;
+use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
 /// Durable project-memory write tool name, exempt from the evidence gate.
@@ -14,6 +17,9 @@ pub const BUILD_RUN_TOOL: &str = "build_run";
 
 /// Documentation search tool name.
 pub const SEARCH_DOCS_TOOL: &str = "search_docs";
+
+/// Connected source-map digest tool name.
+pub const MAP_INFO_TOOL: &str = "map_info";
 
 /// Result type used by tool-layer validation and gate checks.
 pub type ToolResult<T> = Result<T, ToolError>;
@@ -173,6 +179,10 @@ fn numeric_value_schema() -> Value {
     json!({"type": ["integer", "string"]})
 }
 
+fn integer_or_string_schema() -> Value {
+    json!({"type": ["integer", "string"], "x-eud-allowAnyString": true})
+}
+
 fn enum_string_schema(values: &[&str]) -> Value {
     json!({"type": "string", "enum": values})
 }
@@ -194,6 +204,12 @@ fn req_dats_schema() -> Value {
 
 fn settings_scopes_schema() -> Value {
     enum_string_schema(&["project", "program"])
+}
+
+fn map_info_owner_schema() -> Value {
+    enum_string_schema(&[
+        "P1", "P2", "P3", "P4", "P5", "P6", "P7", "P8", "P9", "P10", "P11", "P12", "neutral",
+    ])
 }
 
 /// Registry of the EUD tool API exposed to Codex and MCP.
@@ -277,6 +293,19 @@ pub fn tool_registry() -> Vec<ToolSpec> {
                     "key": string_schema(),
                 }),
                 &["scope", "key"],
+            ),
+        ),
+        tool_spec(
+            MAP_INFO_TOOL,
+            "Read connected source-map locations, units, players, and forces.",
+            false,
+            schema(
+                json!({
+                    "mode": enum_string_schema(&["summary", "locations", "units", "players"]),
+                    "owner": map_info_owner_schema(),
+                    "unitType": integer_or_string_schema(),
+                }),
+                &[],
             ),
         ),
         tool_spec(
@@ -779,7 +808,7 @@ fn validate_arg_value(
         Some(Value::String(kind)) if kind == "string" => validate_string(spec, name, value),
         Some(Value::String(kind)) if kind == "integer" => validate_integer(spec, name, value),
         Some(Value::String(kind)) if kind == "boolean" => validate_boolean(spec, name, value),
-        Some(Value::Array(kinds)) => validate_union_type(spec, name, value, kinds),
+        Some(Value::Array(kinds)) => validate_union_type(spec, name, value, kinds, property_schema),
         _ => admission_error(&format!(
             "tool schema for {}.{} has an unsupported type",
             spec.name, name
@@ -834,6 +863,7 @@ fn validate_union_type(
     name: &str,
     value: &Value,
     kinds: &[Value],
+    property_schema: &Value,
 ) -> ToolResult<()> {
     let accepts_integer = kinds.iter().any(|kind| kind.as_str() == Some("integer"));
     let accepts_string = kinds.iter().any(|kind| kind.as_str() == Some("string"));
@@ -844,6 +874,13 @@ fn validate_union_type(
 
     if accepts_string {
         if let Some(text) = value.as_str() {
+            if property_schema
+                .get("x-eud-allowAnyString")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                return Ok(());
+            }
             if text.parse::<i64>().is_ok() {
                 return Ok(());
             }
@@ -940,6 +977,250 @@ the unit id ({obj_id})."
     }
 
     Ok(())
+}
+
+/// Resolve the connected source map through the bridge, extract its CHK, and return a
+/// sliced JSON view of the digest. This is intentionally thin; map parsing, filtering,
+/// and truncation are in [`map_info_view`] for headless tests.
+pub fn map_info(bridge: &crate::bridge_io::BridgeIo, args: &Value) -> ToolResult<Value> {
+    let map_path_reply = bridge
+        .send(
+            "GETSET project|OpenMapName",
+            &crate::bridge_io::SendOpts::default(),
+            None,
+        )
+        .map_err(|error| map_info_error(format!("bridge GETSET OpenMapName failed: {error}")))?;
+    let map_path = parse_open_map_name_reply(&map_path_reply);
+    if map_path.is_empty() {
+        return Err(map_info_error(
+            "bridge returned an empty project OpenMapName; open or configure a source map",
+        ));
+    }
+
+    let path = Path::new(map_path);
+    let metadata = std::fs::metadata(path).map_err(|error| {
+        map_info_error(format!(
+            "source map file is missing or unreadable: {map_path} ({error})"
+        ))
+    })?;
+    if !metadata.is_file() {
+        return Err(map_info_error(format!(
+            "source map path is not a file: {map_path}"
+        )));
+    }
+    let saved_at = metadata
+        .modified()
+        .map(saved_at_epoch_seconds)
+        .map_err(|error| map_info_error(format!("could not read map mtime: {error}")))?;
+
+    let chk = isom::chk_extract(path).map_err(|error| {
+        map_info_error(format!("CHK extraction failed for {map_path}: {error}"))
+    })?;
+    let digest = crate::chk::digest_chk(&chk);
+    map_info_view(&digest, args, map_path, saved_at)
+}
+
+/// Pure view builder for `map_info`: slices a precomputed CHK digest by mode, applies
+/// filters, caps unit output, and attaches the map path/mtime envelope.
+pub fn map_info_view(
+    digest: &crate::chk::Digest,
+    args: &Value,
+    map_path: &str,
+    saved_at: u64,
+) -> ToolResult<Value> {
+    let Some(object) = args.as_object() else {
+        return Err(map_info_error("map_info arguments must be a JSON object"));
+    };
+
+    let mode = object
+        .get("mode")
+        .and_then(Value::as_str)
+        .unwrap_or("summary");
+    let map = json!({
+        "path": map_path,
+        "savedAt": saved_at,
+    });
+
+    match mode {
+        "summary" => Ok(json!({
+            "map": map,
+            "mode": "summary",
+            "summary": {
+                "header": &digest.map,
+                "activePlayers": active_players(digest),
+                "forces": &digest.forces,
+                "startLocations": {
+                    "count": digest.start_locations.len(),
+                    "items": &digest.start_locations,
+                },
+                "locations": {
+                    "count": digest.locations.len(),
+                    "names": digest.locations.iter().map(|location| location.name.clone()).collect::<Vec<_>>(),
+                },
+                "unitsByOwner": units_by_owner(digest),
+            },
+        })),
+        "locations" => Ok(json!({
+            "map": map,
+            "mode": "locations",
+            "locations": &digest.locations,
+        })),
+        "units" => units_view(digest, object, map),
+        "players" => Ok(json!({
+            "map": map,
+            "mode": "players",
+            "players": &digest.players,
+            "forces": &digest.forces,
+        })),
+        other => Err(map_info_error(format!(
+            "invalid map_info mode {other:?}; expected summary, locations, units, or players"
+        ))),
+    }
+}
+
+fn active_players(digest: &crate::chk::Digest) -> Vec<crate::chk::Player> {
+    digest
+        .players
+        .iter()
+        .filter(|player| is_active_controller(&player.controller))
+        .cloned()
+        .collect()
+}
+
+fn is_active_controller(controller: &str) -> bool {
+    matches!(
+        controller,
+        "Computer (game)"
+            | "Occupied by Human"
+            | "Rescue Passive"
+            | "Computer"
+            | "Human (Open Slot)"
+    )
+}
+
+fn units_by_owner(digest: &crate::chk::Digest) -> BTreeMap<String, BTreeMap<String, usize>> {
+    let mut owners = BTreeMap::<String, BTreeMap<String, usize>>::new();
+    for unit in &digest.units {
+        *owners
+            .entry(unit.owner.clone())
+            .or_default()
+            .entry(unit.type_name.clone())
+            .or_default() += 1;
+    }
+    owners
+}
+
+fn units_view(
+    digest: &crate::chk::Digest,
+    args: &Map<String, Value>,
+    map: Value,
+) -> ToolResult<Value> {
+    const UNIT_LIMIT: usize = 200;
+
+    let owner_filter = args.get("owner").and_then(Value::as_str);
+    let unit_type_filter = args.get("unitType").map(parse_unit_type_filter);
+
+    let mut filtered = Vec::new();
+    for unit in &digest.units {
+        if let Some(owner) = &owner_filter {
+            if !unit_owner_matches_filter(&unit.owner, owner) {
+                continue;
+            }
+        }
+        if let Some(filter) = &unit_type_filter {
+            if !unit_matches_type_filter(unit, filter) {
+                continue;
+            }
+        }
+        filtered.push(unit);
+    }
+
+    let total = filtered.len();
+    let units = filtered
+        .into_iter()
+        .take(UNIT_LIMIT)
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut value = json!({
+        "map": map,
+        "mode": "units",
+        "filters": {
+            "owner": args.get("owner").cloned().unwrap_or(Value::Null),
+            "unitType": args.get("unitType").cloned().unwrap_or(Value::Null),
+        },
+        "count": total,
+        "units": units,
+    });
+
+    if total > UNIT_LIMIT {
+        value["truncated"] = Value::Bool(true);
+        value["dropped"] = json!(total - UNIT_LIMIT);
+        value["hint"] = json!(format!(
+            "showing first {UNIT_LIMIT} units after filters owner={:?}, unitType={:?}",
+            args.get("owner"),
+            args.get("unitType")
+        ));
+    }
+
+    Ok(value)
+}
+
+fn unit_owner_matches_filter(unit_owner: &str, filter: &str) -> bool {
+    unit_owner == filter
+        || unit_owner.starts_with(&format!("{filter} "))
+        || (filter.eq_ignore_ascii_case("neutral") && unit_owner.contains("(neutral)"))
+}
+
+enum UnitTypeFilter {
+    Id(u64),
+    Name(String),
+}
+
+fn parse_unit_type_filter(value: &Value) -> UnitTypeFilter {
+    if let Some(id) = value.as_u64() {
+        return UnitTypeFilter::Id(id);
+    }
+    if value.as_i64().is_some() {
+        return UnitTypeFilter::Id(u64::MAX);
+    }
+    if let Some(text) = value.as_str() {
+        if let Ok(id) = text.trim().parse::<u64>() {
+            return UnitTypeFilter::Id(id);
+        }
+        return UnitTypeFilter::Name(text.to_lowercase());
+    }
+    UnitTypeFilter::Name(String::new())
+}
+
+fn unit_matches_type_filter(unit: &crate::chk::Unit, filter: &UnitTypeFilter) -> bool {
+    match filter {
+        UnitTypeFilter::Id(id) => u64::from(unit.type_id) == *id,
+        UnitTypeFilter::Name(text) => unit.type_name.to_lowercase().contains(text),
+    }
+}
+
+fn saved_at_epoch_seconds(time: SystemTime) -> u64 {
+    time.duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+}
+
+fn parse_open_map_name_reply(reply: &str) -> &str {
+    let trimmed = reply.trim();
+    let Some((prefix, value)) = trimmed.split_once(" = ") else {
+        return trimmed;
+    };
+    if prefix.trim() == "OK: project|OpenMapName" {
+        value.trim()
+    } else {
+        trimmed
+    }
+}
+
+fn map_info_error(message: impl Into<String>) -> ToolError {
+    ToolError::AdmissionRejected {
+        message: format!("map_info: {}", message.into()),
+    }
 }
 
 #[cfg(test)]
@@ -1104,6 +1385,10 @@ mod tests {
         serde_json::json!({"type": ["integer", "string"]})
     }
 
+    fn integer_or_string_schema() -> serde_json::Value {
+        serde_json::json!({"type": ["integer", "string"], "x-eud-allowAnyString": true})
+    }
+
     fn enum_string_schema(values: &[&str]) -> serde_json::Value {
         serde_json::json!({"type": "string", "enum": values})
     }
@@ -1125,6 +1410,103 @@ mod tests {
 
     fn settings_scopes_schema() -> serde_json::Value {
         enum_string_schema(&["project", "program"])
+    }
+
+    fn map_info_owner_schema() -> serde_json::Value {
+        enum_string_schema(&[
+            "P1", "P2", "P3", "P4", "P5", "P6", "P7", "P8", "P9", "P10", "P11", "P12", "neutral",
+        ])
+    }
+
+    fn sample_digest(units: Vec<crate::chk::Unit>) -> crate::chk::Digest {
+        crate::chk::Digest {
+            map: crate::chk::MapHeader {
+                width: 64,
+                height: 128,
+                tileset: "jungle".to_string(),
+            },
+            players: vec![
+                crate::chk::Player {
+                    player: "P1".to_string(),
+                    controller: "Occupied by Human".to_string(),
+                    race: "Terran".to_string(),
+                    force: Some(1),
+                },
+                crate::chk::Player {
+                    player: "P2".to_string(),
+                    controller: "Computer".to_string(),
+                    race: "Protoss".to_string(),
+                    force: Some(1),
+                },
+                crate::chk::Player {
+                    player: "P3".to_string(),
+                    controller: "Inactive".to_string(),
+                    race: "Zerg".to_string(),
+                    force: Some(2),
+                },
+            ],
+            forces: vec![crate::chk::Force {
+                force: 1,
+                name: "Allies".to_string(),
+                players: vec!["P1".to_string(), "P2".to_string()],
+                flags: crate::chk::ForceFlags {
+                    random_start_location: false,
+                    allies: true,
+                    allied_victory: true,
+                    shared_vision: false,
+                },
+            }],
+            locations: vec![
+                crate::chk::Location {
+                    id: 1,
+                    name: "Main".to_string(),
+                    left: 64,
+                    top: 96,
+                    right: 160,
+                    bottom: 224,
+                    tile_rect: [2, 3, 5, 7],
+                    elevation_flags: 3,
+                    inverted: None,
+                    anywhere: None,
+                },
+                crate::chk::Location {
+                    id: 64,
+                    name: "Anywhere".to_string(),
+                    left: 0,
+                    top: 0,
+                    right: 2048,
+                    bottom: 4096,
+                    tile_rect: [0, 0, 64, 128],
+                    elevation_flags: 0,
+                    inverted: None,
+                    anywhere: Some(true),
+                },
+            ],
+            start_locations: vec![crate::chk::StartLocation {
+                player: "P1".to_string(),
+                x: 96,
+                y: 160,
+                tile_x: 3,
+                tile_y: 5,
+            }],
+            units,
+        }
+    }
+
+    fn unit(type_id: u16, type_name: &str, owner: &str, x: u16, y: u16) -> crate::chk::Unit {
+        crate::chk::Unit {
+            type_name: type_name.to_string(),
+            type_id,
+            owner: owner.to_string(),
+            x,
+            y,
+            tile_x: x / 32,
+            tile_y: y / 32,
+            hp_percent: 100,
+            shield_percent: 100,
+            energy_percent: 100,
+            resources: 0,
+        }
     }
 
     fn expected_registry_contract() -> Vec<(&'static str, bool, serde_json::Value)> {
@@ -1190,6 +1572,18 @@ mod tests {
                         "key": string_schema(),
                     }),
                     &["scope", "key"],
+                ),
+            ),
+            (
+                MAP_INFO_TOOL,
+                false,
+                schema(
+                    serde_json::json!({
+                        "mode": enum_string_schema(&["summary", "locations", "units", "players"]),
+                        "owner": map_info_owner_schema(),
+                        "unitType": integer_or_string_schema(),
+                    }),
+                    &[],
                 ),
             ),
             ("plugins_list", false, schema(serde_json::json!({}), &[])),
@@ -1486,6 +1880,217 @@ mod tests {
                 "{name} must advertise the exact parameter schema"
             );
         }
+    }
+
+    #[test]
+    fn map_info_is_registered_read_only_and_invalid_mode_rejects_before_counting() {
+        let spec = tool_registry()
+            .into_iter()
+            .find(|spec| spec.name == MAP_INFO_TOOL)
+            .expect("map_info must be registered");
+        assert!(!spec.mutating, "map_info must be read-only");
+
+        let mut state = RequestState::for_request("req-map-info");
+        let error = admit_tool_call(
+            &mut state,
+            MAP_INFO_TOOL,
+            &serde_json::json!({"mode": "terrain"}),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("invalid value for 'mode'"));
+        assert_eq!(
+            state.action_count, 0,
+            "invalid map_info mode must be rejected before counting"
+        );
+        assert_eq!(state.mutation_count, 0);
+    }
+
+    #[test]
+    fn map_info_summary_returns_aggregates_without_raw_units() {
+        let digest = sample_digest(vec![
+            unit(0, "Terran Marine", "P1", 96, 160),
+            unit(0, "Terran Marine", "P1", 128, 160),
+            unit(65, "Protoss Zealot", "P2", 320, 160),
+        ]);
+
+        let value = map_info_view(
+            &digest,
+            &serde_json::json!({}),
+            "C:/maps/demo.scx",
+            1_781_000_000,
+        )
+        .unwrap();
+
+        assert_eq!(value["map"]["path"], "C:/maps/demo.scx");
+        assert_eq!(value["map"]["savedAt"], 1_781_000_000u64);
+        assert_eq!(value["mode"], "summary");
+        assert!(
+            value.get("units").is_none(),
+            "summary must not return raw units"
+        );
+        assert_eq!(
+            value["summary"]["activePlayers"].as_array().unwrap().len(),
+            2
+        );
+        assert_eq!(value["summary"]["locations"]["count"], 2);
+        assert_eq!(
+            value["summary"]["locations"]["names"],
+            serde_json::json!(["Main", "Anywhere"])
+        );
+        assert_eq!(value["summary"]["unitsByOwner"]["P1"]["Terran Marine"], 2);
+        assert_eq!(value["summary"]["unitsByOwner"]["P2"]["Protoss Zealot"], 1);
+    }
+
+    #[test]
+    fn map_info_locations_units_and_players_shapes() {
+        let digest = sample_digest(vec![
+            unit(0, "Terran Marine", "P1", 96, 160),
+            unit(65, "Protoss Zealot", "P2", 320, 160),
+        ]);
+
+        let locations = map_info_view(
+            &digest,
+            &serde_json::json!({"mode": "locations"}),
+            "demo.scx",
+            10,
+        )
+        .unwrap();
+        assert_eq!(locations["map"]["savedAt"], 10);
+        assert_eq!(locations["mode"], "locations");
+        assert_eq!(locations["locations"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            locations["locations"][0]["tileRect"],
+            serde_json::json!([2, 3, 5, 7])
+        );
+
+        let units = map_info_view(
+            &digest,
+            &serde_json::json!({"mode": "units"}),
+            "demo.scx",
+            10,
+        )
+        .unwrap();
+        assert_eq!(units["mode"], "units");
+        assert_eq!(units["count"], 2);
+        assert_eq!(units["units"][0]["type"], "Terran Marine");
+        assert!(units.get("truncated").is_none());
+
+        let players = map_info_view(
+            &digest,
+            &serde_json::json!({"mode": "players"}),
+            "demo.scx",
+            10,
+        )
+        .unwrap();
+        assert_eq!(players["mode"], "players");
+        assert_eq!(players["players"].as_array().unwrap().len(), 3);
+        assert_eq!(players["forces"][0]["name"], "Allies");
+    }
+
+    #[test]
+    fn map_info_units_filters_owner_numeric_id_and_name_substring() {
+        let digest = sample_digest(vec![
+            unit(0, "Terran Marine", "P1", 96, 160),
+            unit(65, "Protoss Zealot", "P2", 320, 160),
+            unit(214, "Start Location", "P12 (neutral)", 32, 32),
+        ]);
+
+        let owner = map_info_view(
+            &digest,
+            &serde_json::json!({"mode": "units", "owner": "P2"}),
+            "demo.scx",
+            10,
+        )
+        .unwrap();
+        assert_eq!(owner["count"], 1);
+        assert_eq!(owner["units"][0]["owner"], "P2");
+
+        let neutral = map_info_view(
+            &digest,
+            &serde_json::json!({"mode": "units", "owner": "neutral"}),
+            "demo.scx",
+            10,
+        )
+        .unwrap();
+        assert_eq!(neutral["count"], 1);
+        assert_eq!(neutral["units"][0]["typeId"], 214);
+
+        let p12 = map_info_view(
+            &digest,
+            &serde_json::json!({"mode": "units", "owner": "P12"}),
+            "demo.scx",
+            10,
+        )
+        .unwrap();
+        assert_eq!(p12["count"], 1);
+        assert_eq!(p12["units"][0]["owner"], "P12 (neutral)");
+
+        let p1 = map_info_view(
+            &digest,
+            &serde_json::json!({"mode": "units", "owner": "P1"}),
+            "demo.scx",
+            10,
+        )
+        .unwrap();
+        assert_eq!(p1["count"], 1);
+        assert_eq!(p1["units"][0]["owner"], "P1");
+
+        let numeric = map_info_view(
+            &digest,
+            &serde_json::json!({"mode": "units", "unitType": "65"}),
+            "demo.scx",
+            10,
+        )
+        .unwrap();
+        assert_eq!(numeric["count"], 1);
+        assert_eq!(numeric["units"][0]["type"], "Protoss Zealot");
+
+        let substring = map_info_view(
+            &digest,
+            &serde_json::json!({"mode": "units", "unitType": "marine"}),
+            "demo.scx",
+            10,
+        )
+        .unwrap();
+        assert_eq!(substring["count"], 1);
+        assert_eq!(substring["units"][0]["typeId"], 0);
+    }
+
+    #[test]
+    fn map_info_units_caps_at_200_and_reports_truncation() {
+        let units = (0..205)
+            .map(|idx| unit(0, "Terran Marine", "P1", idx, 160))
+            .collect();
+        let digest = sample_digest(units);
+
+        let value = map_info_view(
+            &digest,
+            &serde_json::json!({"mode": "units", "owner": "P1", "unitType": "Marine"}),
+            "demo.scx",
+            10,
+        )
+        .unwrap();
+
+        assert_eq!(value["count"], 205);
+        assert_eq!(value["units"].as_array().unwrap().len(), 200);
+        assert_eq!(value["truncated"], true);
+        assert_eq!(value["dropped"], 5);
+        assert!(value["hint"].as_str().unwrap().contains("owner"));
+        assert_eq!(value["filters"]["owner"], "P1");
+        assert_eq!(value["filters"]["unitType"], "Marine");
+    }
+
+    #[test]
+    fn map_info_open_map_reply_accepts_bridge_ok_line_and_raw_path() {
+        assert_eq!(
+            parse_open_map_name_reply("OK: project|OpenMapName = C:/maps/demo.scx\r\n"),
+            "C:/maps/demo.scx"
+        );
+        assert_eq!(
+            parse_open_map_name_reply("C:/maps/demo.scx\n"),
+            "C:/maps/demo.scx"
+        );
     }
 
     #[test]

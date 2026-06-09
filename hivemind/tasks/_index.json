@@ -2131,7 +2131,7 @@
       ]
     },
     "EUD-129-a747": {
-      "status": "pending",
+      "status": "done",
       "priority": "high",
       "type": "task",
       "parent": "EUD-127-e1a7",
@@ -2140,8 +2140,8 @@
       ],
       "title": "map_info Rust tool handler (register + isom chk_extract -> chk::digest_chk -> mode slicing)",
       "updated": "2026-06-09",
-      "completed_at": null,
-      "path": "active/EUD-129-a747.md",
+      "completed_at": "2026-06-09T23:09:01.746794",
+      "path": "done/EUD-129-a747.md",
       "scope": [
         "src-tauri/src/tools.rs"
       ]
