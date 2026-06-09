@@ -2192,6 +2192,21 @@
         "src-tauri/src/lib.rs",
         "src-tauri/src/bootstrap.rs"
       ]
+    },
+    "EUD-133-f076": {
+      "status": "pending",
+      "priority": "high",
+      "type": "task",
+      "parent": "EUD-127-e1a7",
+      "depends_on": [],
+      "title": "Rebuild native/isom as /MD (dynamic CRT) to coexist with ort_sys in eud-agent",
+      "updated": "2026-06-09",
+      "completed_at": null,
+      "path": "active/EUD-133-f076.md",
+      "scope": [
+        "native/isom/**",
+        "crates/isom-sys/build.rs"
+      ]
     }
   }
 }
