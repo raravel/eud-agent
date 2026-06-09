@@ -59,3 +59,4 @@ Wraps every mutating call (location_write/player_setup):
 - `src-tauri/src/chk.rs` — CHK parse (port of chk_info.py)
 - `src-tauri/src/mapsafe.rs` — rails + journal (ports journal.py)
 - external: vendored ICU + CascLib (static), `bindgen`
+- [BOUND 2026-06-09 from EUD-133-f076] `crates/isom/build.rs` — re-supplies the engine-archive link directives (search path + raw `isom_capi.lib` link-arg) that rustc dedups away for the isom crate's own test binaries; built on /MD (no static-CRT forcing) per Decision 14
