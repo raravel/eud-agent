@@ -2113,19 +2113,21 @@
       "scope": []
     },
     "EUD-128-daea": {
-      "status": "blocked",
+      "status": "done",
       "priority": "high",
       "type": "task",
       "parent": "EUD-127-e1a7",
       "depends_on": [],
       "title": "isom-backed MapEngine: wire mapsafe to isom FFI (locedit/playeredit/chk_extract)",
       "updated": "2026-06-09",
-      "completed_at": null,
-      "path": "active/EUD-128-daea.md",
+      "completed_at": "2026-06-09T22:43:48.456416",
+      "path": "done/EUD-128-daea.md",
       "scope": [
         "src-tauri/src/mapsafe.rs",
         "src-tauri/Cargo.toml",
-        "src-tauri/Cargo.lock"
+        "src-tauri/Cargo.lock",
+        "src-tauri/build.rs",
+        "Cargo.lock"
       ]
     },
     "EUD-129-a747": {

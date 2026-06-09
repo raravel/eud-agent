@@ -29,10 +29,10 @@
 //!
 //! External collaborators (the compiling-status source, the lock probe, and the
 //! map engine) are abstracted behind traits so the full rail sequence is
-//! testable with NO live editor, NO real map, and WITHOUT the `isom` crate. The
-//! real isom-backed [`MapEngine`] is wired in a later task; here the trait is
-//! the only contract. The backup (rail 3) and restore (rail 7) are REAL
-//! filesystem ops and are tested for real against temp dirs.
+//! testable with NO live editor and NO real map. Production uses the isom-backed
+//! [`IsomEngine`] [`MapEngine`]; tests use a fake. The backup (rail 3) and
+//! restore (rail 7) are REAL filesystem ops and are tested for real against temp
+//! dirs.
 
 use std::path::{Path, PathBuf};
 
@@ -90,20 +90,46 @@ pub trait LockProbe {
     fn is_locked(&self, path: &Path) -> bool;
 }
 
+/// Which isom op family a write routes to (rail 4). Locedit -> isom::locedit,
+/// PlayerEdit -> isom::playeredit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpKind {
+    Locedit,
+    PlayerEdit,
+}
+
 /// The map engine: all-or-nothing apply (rail 4) + re-digest verify (rail 5).
-///
-/// Mirrors the `isom` wrapper conceptually (`locedit`/`playeredit` + `chk_extract`)
-/// but is abstracted so mapsafe does NOT depend on the `isom` crate. The real
-/// isom-backed impl is wired in a later task; tests use a fake.
 pub trait MapEngine {
-    /// Apply the RAW op buffer to `map`, saved IN PLACE. The engine aborts BEFORE
-    /// save on any bad op (`Err` ⇒ the on-disk map is untouched). `ops` is passed
-    /// through raw — location NAME bytes are NEVER re-encoded here.
-    fn apply(&self, map: &Path, ops: &[u8]) -> Result<(), String>;
+    /// Apply the RAW op buffer to `map`, saved IN PLACE, routing by `kind`. The
+    /// engine aborts BEFORE save on any bad op (`Err` ⇒ the on-disk map is
+    /// untouched). `ops` is passed through raw — location NAME bytes are NEVER
+    /// re-encoded here.
+    fn apply(&self, map: &Path, kind: OpKind, ops: &[u8]) -> Result<(), String>;
 
     /// Re-extract/parse `map` to confirm it is still readable (rail 5). The bytes
     /// are the verify digest; an `Err` signals corruption.
     fn digest(&self, map: &Path) -> Result<Vec<u8>, String>;
+}
+
+/// Production [`MapEngine`] backed by the vendored isom static lib (feature 13).
+/// `digest` re-extracts the CHK; `apply` routes by [`OpKind`] to the matching
+/// isom op. `isom::IsomError` is mapped to its `Display` string (the rails in
+/// `MapSafe` turn it into the typed `MapSafeError`). The map-write SAFETY RAILS
+/// stay in `MapSafe`, never here (rules.md).
+pub struct IsomEngine;
+
+impl MapEngine for IsomEngine {
+    fn apply(&self, map: &Path, kind: OpKind, ops: &[u8]) -> Result<(), String> {
+        match kind {
+            OpKind::Locedit => isom::locedit(map, ops),
+            OpKind::PlayerEdit => isom::playeredit(map, ops),
+        }
+        .map_err(|e| e.to_string())
+    }
+
+    fn digest(&self, map: &Path) -> Result<Vec<u8>, String> {
+        isom::chk_extract(map).map_err(|e| e.to_string())
+    }
 }
 
 /// A journal record for one map write (rail 6) — the rollback bookkeeping the
@@ -242,8 +268,14 @@ where
     /// [`MapSafeError::Verify`] for recovery — auto-restore is intentionally NOT
     /// done (it could overwrite forensic state and can itself fail).
     ///
-    /// `ops` is passed to the engine RAW (never re-encoded here).
-    pub fn write(&self, map_path: &Path, ops: &[u8]) -> Result<JournalEntry, MapSafeError> {
+    /// `kind` selects the isom op family for rail 4. `ops` is passed to the
+    /// engine RAW (never re-encoded here).
+    pub fn write(
+        &self,
+        map_path: &Path,
+        kind: OpKind,
+        ops: &[u8],
+    ) -> Result<JournalEntry, MapSafeError> {
         // Rail 1 — compiling guard. Refuse BEFORE any backup/apply: writing the
         // map mid-build races the editor's read.
         if self.status.is_compiling() {
@@ -263,7 +295,7 @@ where
         // so on `Err` the on-disk map is untouched: no restore is needed, just
         // surface the error.
         self.engine
-            .apply(map_path, ops)
+            .apply(map_path, kind, ops)
             .map_err(MapSafeError::Apply)?;
 
         // Rail 5 — re-digest verify. A digest failure after a successful save
@@ -379,6 +411,7 @@ mod tests {
         digest_result: Result<Vec<u8>, String>,
         /// Set true the moment `apply` is invoked (rail-ordering assertions).
         apply_called: Cell<bool>,
+        last_kind: Cell<Option<OpKind>>,
     }
 
     impl FakeEngine {
@@ -388,6 +421,7 @@ mod tests {
                 applied_bytes: applied_bytes.to_vec(),
                 digest_result: Ok(vec![0xDE, 0xAD]),
                 apply_called: Cell::new(false),
+                last_kind: Cell::new(None),
             }
         }
 
@@ -398,6 +432,7 @@ mod tests {
                 applied_bytes: Vec::new(),
                 digest_result: Ok(vec![0xDE, 0xAD]),
                 apply_called: Cell::new(false),
+                last_kind: Cell::new(None),
             }
         }
 
@@ -408,13 +443,15 @@ mod tests {
                 applied_bytes: applied_bytes.to_vec(),
                 digest_result: Err("unreadable CHK".into()),
                 apply_called: Cell::new(false),
+                last_kind: Cell::new(None),
             }
         }
     }
 
     impl MapEngine for FakeEngine {
-        fn apply(&self, map: &Path, _ops: &[u8]) -> Result<(), String> {
+        fn apply(&self, map: &Path, kind: OpKind, _ops: &[u8]) -> Result<(), String> {
             self.apply_called.set(true);
+            self.last_kind.set(Some(kind));
             self.apply_result.clone()?;
             // A successful in-place save replaces the map bytes.
             fs::write(map, &self.applied_bytes).unwrap();
@@ -462,7 +499,7 @@ mod tests {
         let svc = MapSafe::new(base.clone(), FakeStatus(true), FakeLock(false), engine);
 
         let err = svc
-            .write(&map, OPS)
+            .write(&map, OpKind::Locedit, OPS)
             .expect_err("must refuse while compiling");
         assert!(matches!(err, MapSafeError::Compiling));
 
@@ -495,7 +532,9 @@ mod tests {
             FakeEngine::ok(EDITED),
         );
 
-        let err = svc.write(&map, OPS).expect_err("must refuse while locked");
+        let err = svc
+            .write(&map, OpKind::Locedit, OPS)
+            .expect_err("must refuse while locked");
         assert!(matches!(err, MapSafeError::MapLocked(p) if p == map));
 
         assert!(
@@ -525,7 +564,9 @@ mod tests {
             FakeEngine::ok(EDITED),
         );
 
-        let entry = svc.write(&map, OPS).expect("happy path must succeed");
+        let entry = svc
+            .write(&map, OpKind::Locedit, OPS)
+            .expect("happy path must succeed");
 
         // Rail 6: journal entry points at the map + its backup.
         assert_eq!(entry.map_path, map);
@@ -567,7 +608,7 @@ mod tests {
         );
 
         let err = svc
-            .write(&map, OPS)
+            .write(&map, OpKind::Locedit, OPS)
             .expect_err("apply failure must surface");
         assert!(matches!(err, MapSafeError::Apply(_)));
 
@@ -593,7 +634,7 @@ mod tests {
         );
 
         let err = svc
-            .write(&map, OPS)
+            .write(&map, OpKind::Locedit, OPS)
             .expect_err("verify failure must surface");
 
         // The verify error must surface the backup path so recovery is possible:
@@ -630,7 +671,9 @@ mod tests {
         );
 
         // Apply: map now holds EDITED, journal points at the ORIGINAL backup.
-        let entry = svc.write(&map, OPS).expect("write must succeed");
+        let entry = svc
+            .write(&map, OpKind::Locedit, OPS)
+            .expect("write must succeed");
         assert_eq!(fs::read(&map).unwrap(), EDITED);
 
         // Roll back: the map is restored byte-for-byte to ORIGINAL.
@@ -641,6 +684,35 @@ mod tests {
             "rollback must restore the exact original bytes"
         );
 
+        fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn write_routes_opkind_to_engine() {
+        let base = unique_temp_dir("opkind-playeredit");
+        let map = make_map(&base, ORIGINAL);
+        let svc = MapSafe::new(
+            base.clone(),
+            FakeStatus(false),
+            FakeLock(false),
+            FakeEngine::ok(EDITED),
+        );
+        svc.write(&map, OpKind::PlayerEdit, OPS)
+            .expect("write must succeed");
+        assert_eq!(svc.engine.last_kind.get(), Some(OpKind::PlayerEdit));
+        fs::remove_dir_all(&base).ok();
+
+        let base = unique_temp_dir("opkind-locedit");
+        let map = make_map(&base, ORIGINAL);
+        let svc = MapSafe::new(
+            base.clone(),
+            FakeStatus(false),
+            FakeLock(false),
+            FakeEngine::ok(EDITED),
+        );
+        svc.write(&map, OpKind::Locedit, OPS)
+            .expect("write must succeed");
+        assert_eq!(svc.engine.last_kind.get(), Some(OpKind::Locedit));
         fs::remove_dir_all(&base).ok();
     }
 

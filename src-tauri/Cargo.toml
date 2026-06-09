@@ -25,6 +25,7 @@ serde_json = "1"
 anyhow = "1"
 thiserror = "1"
 which = "8"
+isom = { path = "../crates/isom" }
 fastembed = "5.15"
 similar = "2"
 # Bootstrap downloader (EUD-100): rustls-tls avoids OpenSSL so it builds cleanly on the
