@@ -7,51 +7,72 @@
 use serde::{Deserialize, Serialize};
 use tauri::Emitter;
 
-const ENGINE_NOT_WIRED: &str = "engine IPC handler is not wired yet";
-
-/// `instruct` command input.
+/// `chat` command input.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct InstructRequest {
-    /// User instruction from the panel.
-    pub instruction: String,
-    /// Target editor file/path.
-    pub target: String,
-    /// Whether to use RAG/project context.
-    #[serde(rename = "useContext")]
-    pub use_context: bool,
+pub struct ChatRequest {
+    /// User message from the panel.
+    pub text: String,
 }
 
-/// `apply` command input.
+/// `plan_feedback` command input.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ApplyRequest {
-    /// Apply mode: replace an existing settable file or create a new EPS file.
-    pub mode: ApplyMode,
-    /// Target editor file/path.
-    pub target: String,
-    /// Code to apply through the editor bridge.
-    pub code: String,
+pub struct PlanFeedbackRequest {
+    /// User feedback for the current plan.
+    pub text: String,
 }
 
-/// `apply` mode wire values.
+/// `changeset_decision.decision` wire values.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum ApplyMode {
-    /// Replace the target content.
-    #[serde(rename = "set")]
-    Set,
-    /// Create a new EPS file.
-    #[serde(rename = "neweps")]
-    NewEps,
+pub enum Decision {
+    /// Accept the targeted changeset items.
+    #[serde(rename = "accept")]
+    Accept,
+    /// Reject and roll back the targeted changeset items.
+    #[serde(rename = "reject")]
+    Reject,
 }
 
-/// `status` command input.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StatusRequest {}
+/// Marker that (de)serializes only as the exact literal `all`.
+#[derive(Debug, Clone)]
+pub struct AllLiteral;
 
-/// `list` command input.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ListRequest {}
+impl Serialize for AllLiteral {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str("all")
+    }
+}
 
-/// `status` command output.
+impl<'de> Deserialize<'de> for AllLiteral {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        if value == "all" {
+            Ok(AllLiteral)
+        } else {
+            Err(serde::de::Error::custom("expected the literal \"all\""))
+        }
+    }
+}
+
+/// `changeset_decision.ids` wire values.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum DecisionIds {
+    /// The literal `all` for every pending changeset item.
+    All(AllLiteral),
+    /// Specific changeset item ids.
+    List(Vec<String>),
+}
+
+/// `changeset_decision` command input.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChangesetDecisionRequest {
+    /// Accept or reject the targeted changeset items.
+    pub decision: Decision,
+    /// Target all items or a specific list of item ids.
+    pub ids: DecisionIds,
+}
+
+/// `status` command output and push event payload.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatusResponse {
     /// True while EUD Editor is compiling.
@@ -78,27 +99,92 @@ pub struct FileEntry {
     pub settable: bool,
 }
 
-/// `apply` command success output.
+/// `agent_event.data` payload.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ApplyResponse {
-    /// Applied target editor file/path.
-    pub target: String,
+pub struct AgentEventData {
+    /// Tool call argument text.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub args: Option<String>,
+    /// Tool result or error text.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<String>,
+    /// Tool result status.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+}
+
+/// `agent_event` payload.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentEvent {
+    /// Agent event kind; the panel must not render this raw string as user-facing text.
+    pub kind: String,
+    /// Short event detail or streamed delta text.
+    pub detail: String,
+    /// Optional tool call/result payload.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<AgentEventData>,
+}
+
+/// `answer` event payload.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AnswerEvent {
+    /// Answer-only turn text.
+    pub text: String,
+}
+
+/// `plan` event payload.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlanEvent {
+    /// Proposed plan markdown.
+    pub markdown: String,
+    /// Plan revision number.
+    pub revision: u32,
+}
+
+/// One changeset item emitted for user accept/reject.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChangesetItem {
+    /// Changeset category, such as `file`, `dat`, or a flat editor object type.
+    pub category: String,
+    /// Stable per-item id.
+    pub id: String,
+    /// Journal sequence number.
+    pub seq: u32,
+    /// Remaining core fields, preserved for panel rendering.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+/// `changeset` event payload.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChangesetEvent {
+    /// Request id shared by the emitted changeset.
+    pub request_id: String,
+    /// Journaled changeset items awaiting a decision.
+    pub items: Vec<ChangesetItem>,
+}
+
+/// `rollback_result` event payload.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RollbackResultEvent {
+    /// Item ids accepted or rolled back.
+    pub ids: Vec<String>,
+    /// True when the requested rollback/decision succeeded.
+    pub ok: bool,
 }
 
 /// `progress` event payload.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProgressEvent {
     /// Current orchestration stage.
     pub stage: ProgressStage,
     /// Human-readable progress detail.
-    pub detail: String,
-    /// Optional percentage, omitted from the wire payload when absent.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub pct: Option<u8>,
+    pub detail: Option<String>,
 }
 
 /// `progress.stage` wire values.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ProgressStage {
     /// RAG lookup.
     #[serde(rename = "rag")]
@@ -120,97 +206,62 @@ pub enum ProgressStage {
     Bootstrap,
 }
 
-/// `code` event payload.
-#[derive(Debug, Clone, Serialize)]
-pub struct CodeEvent {
-    /// Proposed code.
-    pub code: String,
-    /// Proposed code language.
-    pub lang: CodeLang,
-    /// Unified diff string.
-    pub diff: String,
-    /// Advisory diagnostics; empty when absent.
-    pub diagnostics: Vec<serde_json::Value>,
-}
-
-/// `code.lang` wire values.
-#[derive(Debug, Clone, Serialize)]
-pub enum CodeLang {
-    /// EPScript code.
-    #[serde(rename = "eps")]
-    Eps,
-}
-
-/// `agent_event` payload.
-#[derive(Debug, Clone, Serialize)]
-pub struct AgentEvent {
-    /// Agent event kind; the panel must not render this raw string as user-facing text.
-    pub kind: String,
-    /// Arbitrary additional event fields from the agent stream.
-    #[serde(flatten)]
-    pub extra: serde_json::Value,
-}
-
-/// `applied` event payload.
-#[derive(Debug, Clone, Serialize)]
-pub struct AppliedEvent {
-    /// Applied target editor file/path.
-    pub target: String,
-}
-
 /// `error` event payload.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ErrorEvent {
     /// User-facing error message.
     pub message: String,
 }
 
-/// Run RAG, Codex, diff, and diagnostics for an instruction.
+/// Start a chat turn.
 ///
 /// The engine task replaces this placeholder body with the real orchestration.
 #[tauri::command]
-pub async fn instruct<R: tauri::Runtime>(
-    app: tauri::AppHandle<R>,
-    instruction: String,
-    target: String,
-    use_context: bool,
-) -> Result<(), String> {
-    let request = InstructRequest {
-        instruction,
-        target,
-        use_context,
-    };
-    let _ = request;
-    emit_error(
-        &app,
-        ErrorEvent {
-            message: ENGINE_NOT_WIRED.to_string(),
-        },
-    )
-    .map_err(|e| e.to_string())?;
-    Err(ENGINE_NOT_WIRED.to_string())
+pub async fn chat(text: String) -> Result<(), String> {
+    let _request = ChatRequest { text };
+    Ok(())
 }
 
-/// Apply proposed code through the editor bridge.
+/// Send feedback for the current plan.
 ///
-/// The engine/bridge task replaces this placeholder body with the real apply flow.
+/// The engine task replaces this placeholder body with the real orchestration.
 #[tauri::command]
-pub async fn apply<R: tauri::Runtime>(
-    app: tauri::AppHandle<R>,
-    mode: ApplyMode,
-    target: String,
-    code: String,
-) -> Result<ApplyResponse, String> {
-    let request = ApplyRequest { mode, target, code };
-    let _ = request;
-    emit_error(
-        &app,
-        ErrorEvent {
-            message: ENGINE_NOT_WIRED.to_string(),
-        },
-    )
-    .map_err(|e| e.to_string())?;
-    Err(ENGINE_NOT_WIRED.to_string())
+pub async fn plan_feedback(text: String) -> Result<(), String> {
+    let _request = PlanFeedbackRequest { text };
+    Ok(())
+}
+
+/// Approve the current plan.
+///
+/// The engine task replaces this placeholder body with the real orchestration.
+#[tauri::command]
+pub async fn plan_approve() -> Result<(), String> {
+    Ok(())
+}
+
+/// Accept or reject pending changeset items.
+///
+/// The engine task replaces this placeholder body with the real orchestration.
+#[tauri::command]
+pub async fn changeset_decision(decision: Decision, ids: DecisionIds) -> Result<(), String> {
+    let _request = ChangesetDecisionRequest { decision, ids };
+    Ok(())
+}
+
+/// Cancel the in-flight turn.
+///
+/// The engine task replaces this placeholder body with the real orchestration.
+#[tauri::command]
+pub async fn cancel() -> Result<(), String> {
+    Ok(())
+}
+
+/// Reset the conversation.
+///
+/// The engine task replaces this placeholder body with the real orchestration.
+#[tauri::command]
+pub async fn reset() -> Result<(), String> {
+    Ok(())
 }
 
 /// Read editor compile/project status.
@@ -232,22 +283,6 @@ pub async fn list() -> Result<ListResponse, String> {
     Ok(ListResponse { files: Vec::new() })
 }
 
-/// Emit a `progress` event.
-pub fn emit_progress<R: tauri::Runtime>(
-    emitter: &impl Emitter<R>,
-    payload: ProgressEvent,
-) -> tauri::Result<()> {
-    emitter.emit("progress", payload)
-}
-
-/// Emit a `code` event.
-pub fn emit_code<R: tauri::Runtime>(
-    emitter: &impl Emitter<R>,
-    payload: CodeEvent,
-) -> tauri::Result<()> {
-    emitter.emit("code", payload)
-}
-
 /// Emit an `agent_event` event.
 pub fn emit_agent_event<R: tauri::Runtime>(
     emitter: &impl Emitter<R>,
@@ -256,12 +291,44 @@ pub fn emit_agent_event<R: tauri::Runtime>(
     emitter.emit("agent_event", payload)
 }
 
-/// Emit an `applied` event.
-pub fn emit_applied<R: tauri::Runtime>(
+/// Emit an `answer` event.
+pub fn emit_answer<R: tauri::Runtime>(
     emitter: &impl Emitter<R>,
-    payload: AppliedEvent,
+    payload: AnswerEvent,
 ) -> tauri::Result<()> {
-    emitter.emit("applied", payload)
+    emitter.emit("answer", payload)
+}
+
+/// Emit a `plan` event.
+pub fn emit_plan<R: tauri::Runtime>(
+    emitter: &impl Emitter<R>,
+    payload: PlanEvent,
+) -> tauri::Result<()> {
+    emitter.emit("plan", payload)
+}
+
+/// Emit a `changeset` event.
+pub fn emit_changeset<R: tauri::Runtime>(
+    emitter: &impl Emitter<R>,
+    payload: ChangesetEvent,
+) -> tauri::Result<()> {
+    emitter.emit("changeset", payload)
+}
+
+/// Emit a `rollback_result` event.
+pub fn emit_rollback_result<R: tauri::Runtime>(
+    emitter: &impl Emitter<R>,
+    payload: RollbackResultEvent,
+) -> tauri::Result<()> {
+    emitter.emit("rollback_result", payload)
+}
+
+/// Emit a `progress` event.
+pub fn emit_progress<R: tauri::Runtime>(
+    emitter: &impl Emitter<R>,
+    payload: ProgressEvent,
+) -> tauri::Result<()> {
+    emitter.emit("progress", payload)
 }
 
 /// Emit an `error` event.
@@ -270,6 +337,14 @@ pub fn emit_error<R: tauri::Runtime>(
     payload: ErrorEvent,
 ) -> tauri::Result<()> {
     emitter.emit("error", payload)
+}
+
+/// Emit a `status` event.
+pub fn emit_status<R: tauri::Runtime>(
+    emitter: &impl Emitter<R>,
+    payload: StatusResponse,
+) -> tauri::Result<()> {
+    emitter.emit("status", payload)
 }
 
 #[cfg(test)]
@@ -282,51 +357,63 @@ mod tests {
     }
 
     #[test]
-    fn command_inputs_serialize_to_documented_wire_schema() {
-        let instruct = ipc::InstructRequest {
-            instruction: "Create a countdown trigger.".to_string(),
-            target: "triggers/main.eps".to_string(),
-            use_context: true,
-        };
+    fn command_inputs_serialize_to_v2_wire_schema() {
+        let chat: ipc::ChatRequest = serde_json::from_value(json!({ "text": "hi" })).unwrap();
+        assert_json(&chat, json!({ "text": "hi" }));
+
+        let feedback: ipc::PlanFeedbackRequest =
+            serde_json::from_value(json!({ "text": "Please revise it." })).unwrap();
+        assert_json(&feedback, json!({ "text": "Please revise it." }));
+
+        assert_json(&ipc::Decision::Accept, json!("accept"));
+        assert_json(&ipc::Decision::Reject, json!("reject"));
+
+        let all_ids: ipc::DecisionIds = serde_json::from_value(json!("all")).unwrap();
+        assert_json(&all_ids, json!("all"));
+
+        let selected_ids: ipc::DecisionIds = serde_json::from_value(json!(["a", "b"])).unwrap();
+        assert_json(&selected_ids, json!(["a", "b"]));
+
+        let accept_all: ipc::ChangesetDecisionRequest =
+            serde_json::from_value(json!({ "decision": "accept", "ids": "all" })).unwrap();
         assert_json(
-            &instruct,
+            &accept_all,
             json!({
-                "instruction": "Create a countdown trigger.",
-                "target": "triggers/main.eps",
-                "useContext": true
+                "decision": "accept",
+                "ids": "all"
             }),
         );
 
-        let apply = ipc::ApplyRequest {
-            mode: ipc::ApplyMode::NewEps,
-            target: "triggers/generated.eps".to_string(),
-            code: "function main() {}".to_string(),
-        };
+        let reject_selected: ipc::ChangesetDecisionRequest =
+            serde_json::from_value(json!({ "decision": "reject", "ids": ["a", "b"] })).unwrap();
         assert_json(
-            &apply,
+            &reject_selected,
             json!({
-                "mode": "neweps",
-                "target": "triggers/generated.eps",
-                "code": "function main() {}"
+                "decision": "reject",
+                "ids": ["a", "b"]
             }),
         );
-
-        assert_json(&ipc::StatusRequest {}, json!({}));
-        assert_json(&ipc::ListRequest {}, json!({}));
     }
 
     #[test]
-    fn apply_mode_uses_documented_string_values() {
-        assert_json(&ipc::ApplyMode::Set, json!("set"));
-        assert_json(&ipc::ApplyMode::NewEps, json!("neweps"));
+    fn changeset_decision_ids_reject_non_all_bare_strings() {
+        assert!(serde_json::from_value::<ipc::DecisionIds>(json!("a")).is_err());
+        assert!(serde_json::from_value::<ipc::DecisionIds>(json!("")).is_err());
+        assert!(serde_json::from_value::<ipc::DecisionIds>(json!("All")).is_err());
+        assert!(
+            serde_json::from_value::<ipc::ChangesetDecisionRequest>(json!({
+                "decision": "accept",
+                "ids": "nope"
+            }))
+            .is_err()
+        );
     }
 
     #[test]
-    fn command_outputs_serialize_to_documented_wire_schema() {
-        let status = ipc::StatusResponse {
-            compiling: false,
-            project: "ExampleProject".to_string(),
-        };
+    fn status_and_list_outputs_match_v2_wire_schema() {
+        let status: ipc::StatusResponse =
+            serde_json::from_value(json!({ "compiling": false, "project": "ExampleProject" }))
+                .unwrap();
         assert_json(
             &status,
             json!({
@@ -335,20 +422,13 @@ mod tests {
             }),
         );
 
-        let list = ipc::ListResponse {
-            files: vec![
-                ipc::FileEntry {
-                    path: "triggers/main.eps".to_string(),
-                    ftype: "eps".to_string(),
-                    settable: true,
-                },
-                ipc::FileEntry {
-                    path: "ui/layout.cui".to_string(),
-                    ftype: "cui".to_string(),
-                    settable: true,
-                },
-            ],
-        };
+        let list: ipc::ListResponse = serde_json::from_value(json!({
+            "files": [
+                { "path": "triggers/main.eps", "ftype": "eps", "settable": true },
+                { "path": "ui/layout.cui", "ftype": "cui", "settable": true }
+            ]
+        }))
+        .unwrap();
         assert_json(
             &list,
             json!({
@@ -358,44 +438,30 @@ mod tests {
                 ]
             }),
         );
-
-        let applied = ipc::ApplyResponse {
-            target: "triggers/generated.eps".to_string(),
-        };
-        assert_json(
-            &applied,
-            json!({
-                "target": "triggers/generated.eps"
-            }),
-        );
     }
 
     #[test]
-    fn progress_events_serialize_stages_and_skip_absent_pct() {
-        let with_pct = ipc::ProgressEvent {
+    fn progress_events_serialize_stages_and_skip_absent_detail() {
+        let with_detail = ipc::ProgressEvent {
             stage: ipc::ProgressStage::RagWarmup,
-            detail: "Loading embeddings".to_string(),
-            pct: Some(25),
+            detail: Some("Loading embeddings".to_string()),
         };
         assert_json(
-            &with_pct,
+            &with_detail,
             json!({
                 "stage": "rag_warmup",
-                "detail": "Loading embeddings",
-                "pct": 25
+                "detail": "Loading embeddings"
             }),
         );
 
-        let without_pct = ipc::ProgressEvent {
+        let without_detail = ipc::ProgressEvent {
             stage: ipc::ProgressStage::WaitingBuild,
-            detail: "Editor build is still running".to_string(),
-            pct: None,
+            detail: None,
         };
         assert_json(
-            &without_pct,
+            &without_detail,
             json!({
-                "stage": "waiting_build",
-                "detail": "Editor build is still running"
+                "stage": "waiting_build"
             }),
         );
 
@@ -406,59 +472,185 @@ mod tests {
     }
 
     #[test]
-    fn code_and_agent_events_serialize_to_documented_wire_schema() {
-        let code = ipc::CodeEvent {
-            code: "function main() {}".to_string(),
-            lang: ipc::CodeLang::Eps,
-            diff: "--- old\n+++ new\n@@\n-function old() {}\n+function main() {}\n".to_string(),
-            diagnostics: Vec::new(),
-        };
+    fn error_events_match_v2_wire_schema() {
+        let error: ipc::ErrorEvent =
+            serde_json::from_value(json!({ "message": "editor not connected" })).unwrap();
         assert_json(
-            &code,
+            &error,
             json!({
-                "code": "function main() {}",
-                "lang": "eps",
-                "diff": "--- old\n+++ new\n@@\n-function old() {}\n+function main() {}\n",
-                "diagnostics": []
-            }),
-        );
-
-        let agent_event = ipc::AgentEvent {
-            kind: "reasoning_delta".to_string(),
-            extra: json!({
-                "text": "Checking the target.",
-                "sequence": 7
-            }),
-        };
-        assert_json(
-            &agent_event,
-            json!({
-                "kind": "reasoning_delta",
-                "text": "Checking the target.",
-                "sequence": 7
+                "message": "editor not connected"
             }),
         );
     }
 
     #[test]
-    fn applied_and_error_events_serialize_to_documented_wire_schema() {
-        let applied = ipc::AppliedEvent {
-            target: "triggers/main.eps".to_string(),
-        };
+    fn v2_payloads_match_panel_wire_schema() {
+        let chat: ipc::ChatRequest = serde_json::from_value(json!({ "text": "hi" })).unwrap();
+        assert_json(&chat, json!({ "text": "hi" }));
+
+        assert_json(&ipc::Decision::Accept, json!("accept"));
+        assert_json(&ipc::Decision::Reject, json!("reject"));
+
+        let all_ids: ipc::DecisionIds = serde_json::from_value(json!("all")).unwrap();
+        assert_json(&all_ids, json!("all"));
+
+        let selected_ids: ipc::DecisionIds = serde_json::from_value(json!(["a", "b"])).unwrap();
+        assert_json(&selected_ids, json!(["a", "b"]));
+
+        let accept_all: ipc::ChangesetDecisionRequest =
+            serde_json::from_value(json!({ "decision": "accept", "ids": "all" })).unwrap();
         assert_json(
-            &applied,
+            &accept_all,
             json!({
-                "target": "triggers/main.eps"
+                "decision": "accept",
+                "ids": "all"
             }),
         );
 
-        let error = ipc::ErrorEvent {
-            message: "editor not connected".to_string(),
+        let reject_selected: ipc::ChangesetDecisionRequest =
+            serde_json::from_value(json!({ "decision": "reject", "ids": ["a", "b"] })).unwrap();
+        assert_json(
+            &reject_selected,
+            json!({
+                "decision": "reject",
+                "ids": ["a", "b"]
+            }),
+        );
+
+        let agent_event_without_data = ipc::AgentEvent {
+            kind: "thinking".to_string(),
+            detail: "Checking context".to_string(),
+            data: None,
         };
         assert_json(
-            &error,
+            &agent_event_without_data,
             json!({
-                "message": "editor not connected"
+                "kind": "thinking",
+                "detail": "Checking context"
+            }),
+        );
+
+        let agent_event_with_args = ipc::AgentEvent {
+            kind: "tool_call".to_string(),
+            detail: "search_docs".to_string(),
+            data: Some(ipc::AgentEventData {
+                args: Some("{\"query\":\"countdown\"}".to_string()),
+                result: None,
+                status: None,
+            }),
+        };
+        assert_json(
+            &agent_event_with_args,
+            json!({
+                "kind": "tool_call",
+                "detail": "search_docs",
+                "data": {
+                    "args": "{\"query\":\"countdown\"}"
+                }
+            }),
+        );
+
+        let agent_event_with_result = ipc::AgentEvent {
+            kind: "tool_result".to_string(),
+            detail: "search_docs".to_string(),
+            data: Some(ipc::AgentEventData {
+                args: None,
+                result: Some("2 hits".to_string()),
+                status: Some("completed".to_string()),
+            }),
+        };
+        assert_json(
+            &agent_event_with_result,
+            json!({
+                "kind": "tool_result",
+                "detail": "search_docs",
+                "data": {
+                    "result": "2 hits",
+                    "status": "completed"
+                }
+            }),
+        );
+
+        let answer = ipc::AnswerEvent {
+            text: "No edits are needed.".to_string(),
+        };
+        assert_json(
+            &answer,
+            json!({
+                "text": "No edits are needed."
+            }),
+        );
+
+        let plan = ipc::PlanEvent {
+            markdown: "- Update the trigger\n- Verify compile".to_string(),
+            revision: 2,
+        };
+        assert_json(
+            &plan,
+            json!({
+                "markdown": "- Update the trigger\n- Verify compile",
+                "revision": 2
+            }),
+        );
+
+        let changeset = ipc::ChangesetEvent {
+            request_id: "req-1".to_string(),
+            items: vec![ipc::ChangesetItem {
+                category: "file".to_string(),
+                id: "a".to_string(),
+                seq: 1,
+                extra: [("path".to_string(), json!("triggers/main.eps"))]
+                    .into_iter()
+                    .collect(),
+            }],
+        };
+        assert_json(
+            &changeset,
+            json!({
+                "request_id": "req-1",
+                "items": [
+                    {
+                        "category": "file",
+                        "id": "a",
+                        "seq": 1,
+                        "path": "triggers/main.eps"
+                    }
+                ]
+            }),
+        );
+
+        let rollback = ipc::RollbackResultEvent {
+            ids: vec!["a".to_string(), "b".to_string()],
+            ok: true,
+        };
+        assert_json(
+            &rollback,
+            json!({
+                "ids": ["a", "b"],
+                "ok": true
+            }),
+        );
+
+        let progress_with_detail = ipc::ProgressEvent {
+            stage: ipc::ProgressStage::Codex,
+            detail: Some("Generating patch".to_string()),
+        };
+        assert_json(
+            &progress_with_detail,
+            json!({
+                "stage": "codex",
+                "detail": "Generating patch"
+            }),
+        );
+
+        let progress_without_detail = ipc::ProgressEvent {
+            stage: ipc::ProgressStage::Bootstrap,
+            detail: None,
+        };
+        assert_json(
+            &progress_without_detail,
+            json!({
+                "stage": "bootstrap"
             }),
         );
     }

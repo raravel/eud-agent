@@ -2018,15 +2018,15 @@
       ]
     },
     "EUD-122-7745": {
-      "status": "pending",
+      "status": "done",
       "priority": "high",
       "type": "task",
       "parent": "EUD-094-e9ee",
       "depends_on": [],
       "title": "Rust IPC v2 chat surface (commands + events)",
       "updated": "2026-06-09",
-      "completed_at": null,
-      "path": "active/EUD-122-7745.md",
+      "completed_at": "2026-06-09T10:27:08.326301",
+      "path": "done/EUD-122-7745.md",
       "scope": [
         "src-tauri/src/ipc.rs",
         "src-tauri/src/lib.rs"

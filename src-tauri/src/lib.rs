@@ -26,8 +26,12 @@ pub fn run() {
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
-            ipc::instruct,
-            ipc::apply,
+            ipc::chat,
+            ipc::plan_feedback,
+            ipc::plan_approve,
+            ipc::changeset_decision,
+            ipc::cancel,
+            ipc::reset,
             ipc::status,
             ipc::list,
         ])
