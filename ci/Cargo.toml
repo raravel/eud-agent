@@ -1,0 +1,17 @@
+[package]
+name = "eud-rag-index-builder"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[[bin]]
+name = "build_rag_index"
+path = "build_rag_index.rs"
+
+[dependencies]
+anyhow = "1"
+fastembed = "5.15"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"

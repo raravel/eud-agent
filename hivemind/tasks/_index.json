@@ -1538,15 +1538,15 @@
       "scope": []
     },
     "EUD-093-65b1": {
-      "status": "pending",
+      "status": "done",
       "priority": "high",
       "type": "story",
       "parent": "EUD-090-b768",
       "depends_on": [],
       "title": "S3 Rust RAG (fastembed + brute-force)",
-      "updated": "2026-06-08",
-      "completed_at": null,
-      "path": "active/EUD-093-65b1.md",
+      "updated": "2026-06-10",
+      "completed_at": "2026-06-10T00:43:55.599255",
+      "path": "done/EUD-093-65b1.md",
       "scope": []
     },
     "EUD-094-e9ee": {
@@ -1777,7 +1777,7 @@
       ]
     },
     "EUD-108-6439": {
-      "status": "pending",
+      "status": "done",
       "priority": "medium",
       "type": "task",
       "parent": "EUD-093-65b1",
@@ -1785,9 +1785,9 @@
         "EUD-107-c55c"
       ],
       "title": "CI RAG index builder (re-embed ECA corpus -> rag-index.bin ERAG/v1 + sha256)",
-      "updated": "2026-06-09",
-      "completed_at": null,
-      "path": "active/EUD-108-6439.md",
+      "updated": "2026-06-10",
+      "completed_at": "2026-06-10T00:43:55.567190",
+      "path": "done/EUD-108-6439.md",
       "scope": [
         "ci/**"
       ]
