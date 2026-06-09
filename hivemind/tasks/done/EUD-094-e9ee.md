@@ -1,13 +1,14 @@
 ---
+completed_at: '2026-06-10T01:08:53.499347'
 created: '2026-06-08'
 depends_on: []
 id: EUD-094-e9ee
 parent: EUD-090-b768
 priority: high
-status: pending
+status: done
 title: S4 Rust backend core
 type: story
-updated: '2026-06-08'
+updated: '2026-06-10'
 ---
 
 ## Description

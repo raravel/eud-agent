@@ -1550,15 +1550,15 @@
       "scope": []
     },
     "EUD-094-e9ee": {
-      "status": "pending",
+      "status": "done",
       "priority": "high",
       "type": "story",
       "parent": "EUD-090-b768",
       "depends_on": [],
       "title": "S4 Rust backend core",
-      "updated": "2026-06-08",
-      "completed_at": null,
-      "path": "active/EUD-094-e9ee.md",
+      "updated": "2026-06-10",
+      "completed_at": "2026-06-10T01:08:53.499347",
+      "path": "done/EUD-094-e9ee.md",
       "scope": []
     },
     "EUD-095-fbc3": {
@@ -1901,7 +1901,7 @@
       ]
     },
     "EUD-115-7e3f": {
-      "status": "pending",
+      "status": "done",
       "priority": "medium",
       "type": "task",
       "parent": "EUD-094-e9ee",
@@ -1909,11 +1909,12 @@
         "EUD-098-fe34"
       ],
       "title": "memory port",
-      "updated": "2026-06-08",
-      "completed_at": null,
-      "path": "active/EUD-115-7e3f.md",
+      "updated": "2026-06-10",
+      "completed_at": "2026-06-10T01:08:53.469640",
+      "path": "done/EUD-115-7e3f.md",
       "scope": [
-        "src-tauri/src/memory.rs"
+        "src-tauri/src/memory.rs",
+        "src-tauri/src/lib.rs"
       ]
     },
     "EUD-116-e052": {

@@ -17,6 +17,7 @@ pub mod engine;
 pub mod ipc;
 pub mod journal;
 pub mod mapsafe;
+pub mod memory;
 pub mod rag;
 pub mod tools;
 
