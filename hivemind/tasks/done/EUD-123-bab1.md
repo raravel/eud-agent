@@ -1,4 +1,5 @@
 ---
+completed_at: '2026-06-09T11:14:10.596420'
 created: '2026-06-09'
 depends_on: []
 id: EUD-123-bab1
@@ -6,7 +7,7 @@ parent: EUD-094-e9ee
 priority: high
 scope:
 - src-tauri/src/codex_client.rs
-status: pending
+status: done
 title: Codex app-server JSON-RPC transport (thread start/resume, streaming, approvals)
 type: task
 updated: '2026-06-09'

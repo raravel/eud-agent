@@ -333,3 +333,833 @@ mod tests {
         assert!(prompt.ends_with("[epScript 코드]"));
     }
 }
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AppServerEvent {
+    ThreadStarted { thread_id: String },
+    TurnStarted,
+    ReasoningDelta(String),
+    AnswerDelta(String),
+    ItemStarted { item_id: Option<String> },
+    ItemCompleted { item_id: Option<String> },
+    TurnComplete,
+    Error(String),
+}
+
+#[derive(Debug, Clone)]
+pub struct AppServerError {
+    pub message: String,
+}
+
+impl AppServerError {
+    fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for AppServerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl std::error::Error for AppServerError {}
+
+type AppServerRequestResult = Result<serde_json::Value, AppServerError>;
+type AppServerPending = std::sync::Arc<
+    tokio::sync::Mutex<
+        std::collections::HashMap<u64, tokio::sync::oneshot::Sender<AppServerRequestResult>>,
+    >,
+>;
+type AppServerWriter<W> = std::sync::Arc<tokio::sync::Mutex<W>>;
+
+pub struct CodexAppServerClient<R, W> {
+    _reader: std::marker::PhantomData<R>,
+    writer: AppServerWriter<W>,
+    pending: AppServerPending,
+    next_id: u64,
+    initialized: bool,
+    thread_id: std::sync::Arc<tokio::sync::Mutex<Option<String>>>,
+    thread_started: std::sync::Arc<tokio::sync::Notify>,
+    turn_completed: tokio::sync::broadcast::Sender<()>,
+    _child: Option<tokio::process::Child>,
+}
+
+impl<R, W> CodexAppServerClient<R, W>
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    pub fn new_with_stdio(
+        reader: R,
+        writer: W,
+    ) -> (Self, tokio::sync::mpsc::Receiver<AppServerEvent>) {
+        let writer = std::sync::Arc::new(tokio::sync::Mutex::new(writer));
+        let pending =
+            std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        let thread_id = std::sync::Arc::new(tokio::sync::Mutex::new(None));
+        let thread_started = std::sync::Arc::new(tokio::sync::Notify::new());
+        let (events_tx, events_rx) = tokio::sync::mpsc::channel(128);
+        let (turn_completed, _) = tokio::sync::broadcast::channel(16);
+
+        tokio::spawn(read_app_server_stdout(
+            reader,
+            std::sync::Arc::clone(&writer),
+            std::sync::Arc::clone(&pending),
+            events_tx,
+            std::sync::Arc::clone(&thread_id),
+            std::sync::Arc::clone(&thread_started),
+            turn_completed.clone(),
+        ));
+
+        (
+            Self {
+                _reader: std::marker::PhantomData,
+                writer,
+                pending,
+                next_id: 1,
+                initialized: false,
+                thread_id,
+                thread_started,
+                turn_completed,
+                _child: None,
+            },
+            events_rx,
+        )
+    }
+
+    pub async fn run_turn(&mut self, prompt: String) -> Result<(), AppServerError> {
+        if !self.initialized {
+            self.send_request(
+                "initialize",
+                serde_json::json!({
+                    "clientInfo": {
+                        "name": "eud-agent",
+                        "title": null,
+                        "version": env!("CARGO_PKG_VERSION"),
+                    },
+                    "capabilities": null,
+                }),
+            )
+            .await?;
+            self.initialized = true;
+        }
+
+        let mut turn_completed = self.turn_completed.subscribe();
+
+        let thread_id = match self.current_thread_id().await {
+            Some(thread_id) => {
+                self.send_request(
+                    "thread/resume",
+                    serde_json::json!({ "threadId": thread_id.clone() }),
+                )
+                .await?;
+                thread_id
+            }
+            None => {
+                self.send_request(
+                    "thread/start",
+                    serde_json::json!({ "approvalPolicy": "on-request" }),
+                )
+                .await?;
+                self.await_thread_started().await?
+            }
+        };
+
+        self.send_request(
+            "turn/start",
+            serde_json::json!({
+                "threadId": thread_id,
+                "input": [{
+                    "type": "text",
+                    "text": prompt,
+                    "text_elements": [],
+                }],
+            }),
+        )
+        .await?;
+
+        turn_completed
+            .recv()
+            .await
+            .map_err(|err| AppServerError::new(format!("turn completion wait failed: {err}")))?;
+        Ok(())
+    }
+
+    async fn current_thread_id(&self) -> Option<String> {
+        self.thread_id.lock().await.clone()
+    }
+
+    async fn await_thread_started(&self) -> Result<String, AppServerError> {
+        loop {
+            if let Some(thread_id) = self.current_thread_id().await {
+                return Ok(thread_id);
+            }
+            self.thread_started.notified().await;
+        }
+    }
+
+    async fn send_request(
+        &mut self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, AppServerError> {
+        let id = self.next_id;
+        self.next_id = self
+            .next_id
+            .checked_add(1)
+            .ok_or_else(|| AppServerError::new("JSON-RPC request id overflow"))?;
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.pending.lock().await.insert(id, tx);
+
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": params,
+        });
+
+        if let Err(err) = write_json_rpc_line(&self.writer, request).await {
+            self.pending.lock().await.remove(&id);
+            return Err(err);
+        }
+
+        rx.await
+            .map_err(|err| AppServerError::new(format!("response channel closed: {err}")))?
+    }
+}
+
+impl CodexAppServerClient<tokio::process::ChildStdout, tokio::process::ChildStdin> {
+    pub async fn spawn_app_server(
+        cwd: impl AsRef<std::path::Path>,
+    ) -> Result<(Self, tokio::sync::mpsc::Receiver<AppServerEvent>), AppServerError> {
+        let codex_cmd = resolve_codex_cmd().map_err(|err| AppServerError::new(err.to_string()))?;
+        let mut command = tokio::process::Command::new(codex_cmd);
+        command
+            .arg("app-server")
+            .arg("-c")
+            .arg("skills.include_instructions=false")
+            .arg("-c")
+            .arg("model_supports_reasoning_summaries=true")
+            .arg("-c")
+            .arg("model_reasoning_summary=\"detailed\"")
+            .current_dir(cwd.as_ref())
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+
+        let mut child = command.spawn().map_err(|err| {
+            AppServerError::new(format!("failed to spawn codex app-server: {err}"))
+        })?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| AppServerError::new("codex app-server stdout was not piped"))?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| AppServerError::new("codex app-server stdin was not piped"))?;
+
+        let (mut client, events) = Self::new_with_stdio(stdout, stdin);
+        client._child = Some(child);
+        Ok((client, events))
+    }
+}
+
+async fn read_app_server_stdout<R, W>(
+    reader: R,
+    writer: AppServerWriter<W>,
+    pending: AppServerPending,
+    events_tx: tokio::sync::mpsc::Sender<AppServerEvent>,
+    thread_id: std::sync::Arc<tokio::sync::Mutex<Option<String>>>,
+    thread_started: std::sync::Arc<tokio::sync::Notify>,
+    turn_completed: tokio::sync::broadcast::Sender<()>,
+) where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    use tokio::io::AsyncBufReadExt as _;
+
+    let mut lines = tokio::io::BufReader::new(reader).lines();
+    loop {
+        let line = match lines.next_line().await {
+            Ok(Some(line)) => line,
+            Ok(None) => break,
+            Err(err) => {
+                let _ = events_tx
+                    .send(AppServerEvent::Error(format!(
+                        "failed reading app-server stdout: {err}"
+                    )))
+                    .await;
+                break;
+            }
+        };
+
+        let message = match serde_json::from_str::<serde_json::Value>(&line) {
+            Ok(message) => message,
+            Err(err) => {
+                if events_tx
+                    .send(AppServerEvent::Error(format!(
+                        "failed parsing app-server JSON-RPC line: {err}"
+                    )))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+                continue;
+            }
+        };
+
+        let method = message.get("method").and_then(serde_json::Value::as_str);
+        let id = message.get("id").cloned();
+
+        match (method, id) {
+            (Some(method), Some(id)) => {
+                if handle_server_request(&writer, method, id, message.get("params"))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            (Some(method), None) => {
+                let should_continue = handle_notification(
+                    method,
+                    message.get("params"),
+                    &events_tx,
+                    &thread_id,
+                    &thread_started,
+                    &turn_completed,
+                )
+                .await;
+                if !should_continue {
+                    break;
+                }
+            }
+            (None, Some(id)) => {
+                complete_pending_request(&pending, id, &message).await;
+            }
+            (None, None) => {}
+        }
+    }
+
+    let mut pending = pending.lock().await;
+    for (_, tx) in pending.drain() {
+        let _ = tx.send(Err(AppServerError::new("app-server stdout closed")));
+    }
+}
+
+async fn complete_pending_request(
+    pending: &AppServerPending,
+    id: serde_json::Value,
+    message: &serde_json::Value,
+) {
+    let Some(id) = id.as_u64() else {
+        return;
+    };
+    let result = if let Some(error) = message.get("error") {
+        Err(AppServerError::new(format!(
+            "app-server request failed: {error}"
+        )))
+    } else {
+        Ok(message
+            .get("result")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null))
+    };
+
+    if let Some(tx) = pending.lock().await.remove(&id) {
+        let _ = tx.send(result);
+    }
+}
+
+async fn handle_server_request<W>(
+    writer: &AppServerWriter<W>,
+    method: &str,
+    id: serde_json::Value,
+    params: Option<&serde_json::Value>,
+) -> Result<(), AppServerError>
+where
+    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let result = if should_accept_mcp_elicitation(method, params) {
+        serde_json::json!({ "action": "accept", "content": null })
+    } else {
+        decline_approval_result(method)
+    };
+
+    write_json_rpc_line(
+        writer,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": result,
+        }),
+    )
+    .await
+}
+
+fn decline_approval_result(method: &str) -> serde_json::Value {
+    match method {
+        "mcpServer/elicitation/request" => {
+            serde_json::json!({ "action": "decline", "content": null })
+        }
+        "item/commandExecution/requestApproval"
+        | "item/fileChange/requestApproval"
+        | "item/permissions/requestApproval" => serde_json::json!({ "decision": "decline" }),
+        "execCommandApproval" | "applyPatchApproval" => {
+            serde_json::json!({ "decision": "denied" })
+        }
+        _ => serde_json::json!({ "decision": "decline" }),
+    }
+}
+
+fn should_accept_mcp_elicitation(method: &str, params: Option<&serde_json::Value>) -> bool {
+    if method != "mcpServer/elicitation/request" {
+        return false;
+    }
+
+    let Some(params) = params else {
+        return false;
+    };
+
+    let approval_kind = params
+        .get("_meta")
+        .and_then(|meta| meta.get("codex_approval_kind"))
+        .and_then(serde_json::Value::as_str);
+    if approval_kind != Some("mcp_tool_call") {
+        return false;
+    }
+
+    ["server", "serverName", "server_name", "name"]
+        .iter()
+        .any(|key| params.get(*key).and_then(serde_json::Value::as_str) == Some("eud-tools"))
+}
+
+async fn handle_notification(
+    method: &str,
+    params: Option<&serde_json::Value>,
+    events_tx: &tokio::sync::mpsc::Sender<AppServerEvent>,
+    thread_id: &std::sync::Arc<tokio::sync::Mutex<Option<String>>>,
+    thread_started: &std::sync::Arc<tokio::sync::Notify>,
+    turn_completed: &tokio::sync::broadcast::Sender<()>,
+) -> bool {
+    match method {
+        "thread/started" => {
+            let Some(id) = params
+                .and_then(|params| params.get("thread"))
+                .and_then(|thread| thread.get("id"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+                .or_else(|| string_param(params, &["threadId", "thread_id", "id"]))
+            else {
+                return true;
+            };
+            *thread_id.lock().await = Some(id.clone());
+            thread_started.notify_waiters();
+            send_event(events_tx, AppServerEvent::ThreadStarted { thread_id: id }).await
+        }
+        "turn/started" => send_event(events_tx, AppServerEvent::TurnStarted).await,
+        "item/agentMessage/delta" => {
+            if let Some(delta) = string_param(params, &["delta"]) {
+                send_event(events_tx, AppServerEvent::AnswerDelta(delta)).await
+            } else {
+                true
+            }
+        }
+        "item/reasoning/summaryTextDelta" | "item/reasoning/textDelta" => {
+            if let Some(delta) = string_param(params, &["delta"]) {
+                send_event(events_tx, AppServerEvent::ReasoningDelta(delta)).await
+            } else {
+                true
+            }
+        }
+        "item/started" => {
+            send_event(
+                events_tx,
+                AppServerEvent::ItemStarted {
+                    item_id: string_param(params, &["itemId", "item_id", "id"]),
+                },
+            )
+            .await
+        }
+        "item/completed" => {
+            send_event(
+                events_tx,
+                AppServerEvent::ItemCompleted {
+                    item_id: string_param(params, &["itemId", "item_id", "id"]),
+                },
+            )
+            .await
+        }
+        "turn/completed" => {
+            let should_continue = send_event(events_tx, AppServerEvent::TurnComplete).await;
+            let _ = turn_completed.send(());
+            should_continue
+        }
+        "error" => {
+            let message = string_param(params, &["message"])
+                .or_else(|| {
+                    params
+                        .and_then(|params| params.get("error"))
+                        .and_then(|error| error.get("message"))
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string)
+                })
+                .unwrap_or_else(|| "app-server error".to_string());
+            send_event(events_tx, AppServerEvent::Error(message)).await
+        }
+        _ => true,
+    }
+}
+
+async fn send_event(
+    events_tx: &tokio::sync::mpsc::Sender<AppServerEvent>,
+    event: AppServerEvent,
+) -> bool {
+    events_tx.send(event).await.is_ok()
+}
+
+fn string_param(params: Option<&serde_json::Value>, keys: &[&str]) -> Option<String> {
+    let params = params?;
+    keys.iter()
+        .find_map(|key| params.get(*key).and_then(serde_json::Value::as_str))
+        .map(str::to_string)
+}
+
+async fn write_json_rpc_line<W>(
+    writer: &AppServerWriter<W>,
+    value: serde_json::Value,
+) -> Result<(), AppServerError>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::AsyncWriteExt as _;
+
+    let mut writer = writer.lock().await;
+    writer
+        .write_all(value.to_string().as_bytes())
+        .await
+        .map_err(|err| AppServerError::new(format!("failed writing JSON-RPC line: {err}")))?;
+    writer
+        .write_all(b"\n")
+        .await
+        .map_err(|err| AppServerError::new(format!("failed writing JSON-RPC newline: {err}")))?;
+    writer
+        .flush()
+        .await
+        .map_err(|err| AppServerError::new(format!("failed flushing JSON-RPC line: {err}")))?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod appserver_tests {
+    use super::{AppServerEvent, CodexAppServerClient};
+    use serde_json::{json, Value};
+    use std::time::Duration;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream, Lines};
+
+    async fn read_json_line(lines: &mut Lines<BufReader<DuplexStream>>) -> Value {
+        let line = tokio::time::timeout(Duration::from_secs(2), lines.next_line())
+            .await
+            .expect("timed out waiting for JSON-RPC line")
+            .expect("failed reading JSON-RPC line")
+            .expect("peer closed before sending JSON-RPC line");
+
+        serde_json::from_str(&line).expect("line must be valid JSON")
+    }
+
+    async fn write_json_line(writer: &mut DuplexStream, value: Value) {
+        writer
+            .write_all(value.to_string().as_bytes())
+            .await
+            .expect("failed writing JSON-RPC line");
+        writer
+            .write_all(b"\n")
+            .await
+            .expect("failed writing JSON-RPC newline");
+        writer.flush().await.expect("failed flushing JSON-RPC line");
+    }
+
+    fn assert_client_request(value: &Value, method: &str) -> Value {
+        assert_eq!(value.get("jsonrpc").and_then(Value::as_str), Some("2.0"));
+        assert_eq!(value.get("method").and_then(Value::as_str), Some(method));
+        assert!(
+            value.get("id").is_some(),
+            "{method} must be sent as a JSON-RPC request"
+        );
+        assert!(
+            value.get("params").is_some(),
+            "{method} must include params"
+        );
+        value["id"].clone()
+    }
+
+    fn assert_initialize_params(value: &Value) {
+        assert_eq!(
+            value
+                .pointer("/params/clientInfo/name")
+                .and_then(Value::as_str),
+            Some("eud-agent")
+        );
+    }
+
+    fn assert_prompt(value: &Value, expected: &str) {
+        let params = value
+            .get("params")
+            .and_then(Value::as_object)
+            .expect("request params must be an object");
+        let serialized = serde_json::to_string(params).expect("params serialize");
+        assert!(
+            serialized.contains(expected),
+            "request params should carry prompt {expected:?}, got {serialized}"
+        );
+        assert_eq!(
+            value
+                .pointer("/params/input/0/type")
+                .and_then(Value::as_str),
+            Some("text")
+        );
+    }
+
+    fn assert_thread_id(value: &Value, expected: &str) {
+        let params = value
+            .get("params")
+            .and_then(Value::as_object)
+            .expect("request params must be an object");
+        let serialized = serde_json::to_string(params).expect("params serialize");
+        assert!(
+            serialized.contains(expected),
+            "thread/resume params should reuse thread id {expected:?}, got {serialized}"
+        );
+    }
+
+    fn assert_turn_thread_id(value: &Value, expected: &str) {
+        assert_eq!(
+            value.pointer("/params/threadId").and_then(Value::as_str),
+            Some(expected)
+        );
+    }
+
+    fn assert_accepts_eud_tools_mcp_approval(reply: &Value, expected_id: &Value) {
+        assert_eq!(reply.get("jsonrpc").and_then(Value::as_str), Some("2.0"));
+        assert_eq!(reply.get("id"), Some(expected_id));
+        assert_eq!(
+            reply.pointer("/result/action").and_then(Value::as_str),
+            Some("accept")
+        );
+        assert_eq!(reply.pointer("/result/content"), Some(&Value::Null));
+    }
+
+    fn assert_declines_approval(reply: &Value, expected_id: &Value) {
+        assert_eq!(reply.get("jsonrpc").and_then(Value::as_str), Some("2.0"));
+        assert_eq!(reply.get("id"), Some(expected_id));
+        assert_eq!(
+            reply.pointer("/result/decision").and_then(Value::as_str),
+            Some("decline")
+        );
+    }
+
+    async fn next_event(
+        events: &mut tokio::sync::mpsc::Receiver<AppServerEvent>,
+    ) -> AppServerEvent {
+        tokio::time::timeout(Duration::from_secs(2), events.recv())
+            .await
+            .expect("timed out waiting for app-server event")
+            .expect("app-server event channel closed")
+    }
+
+    #[tokio::test]
+    async fn app_server_json_rpc_stdio_streaming_thread_reuse_and_approvals() {
+        let (client_write, server_read) = tokio::io::duplex(32 * 1024);
+        let (server_write, client_read) = tokio::io::duplex(32 * 1024);
+
+        let stub = tokio::spawn(async move {
+            let mut client_requests = BufReader::new(server_read).lines();
+            let mut server_responses = server_write;
+
+            let initialize = read_json_line(&mut client_requests).await;
+            let initialize_id = assert_client_request(&initialize, "initialize");
+            assert_initialize_params(&initialize);
+            write_json_line(
+                &mut server_responses,
+                json!({"jsonrpc":"2.0","id":initialize_id,"result":{"protocolVersion":1}}),
+            )
+            .await;
+
+            let thread_start = read_json_line(&mut client_requests).await;
+            let thread_start_id = assert_client_request(&thread_start, "thread/start");
+            write_json_line(
+                &mut server_responses,
+                json!({"jsonrpc":"2.0","id":thread_start_id,"result":{}}),
+            )
+            .await;
+
+            write_json_line(
+                &mut server_responses,
+                json!({
+                    "jsonrpc":"2.0",
+                    "method":"thread/started",
+                    "params":{"thread":{"id":"thread-123"}}
+                }),
+            )
+            .await;
+
+            let turn_start = read_json_line(&mut client_requests).await;
+            let turn_start_id = assert_client_request(&turn_start, "turn/start");
+            assert_prompt(&turn_start, "first prompt");
+            assert_turn_thread_id(&turn_start, "thread-123");
+            write_json_line(
+                &mut server_responses,
+                json!({"jsonrpc":"2.0","id":turn_start_id,"result":{}}),
+            )
+            .await;
+
+            write_json_line(
+                &mut server_responses,
+                json!({
+                    "jsonrpc":"2.0",
+                    "id":"approval-mcp",
+                    "method":"mcpServer/elicitation/request",
+                    "params":{
+                        "server":"eud-tools",
+                        "serverName":"eud-tools",
+                        "_meta":{"codex_approval_kind":"mcp_tool_call"},
+                        "message":"Allow eud-tools MCP call?"
+                    }
+                }),
+            )
+            .await;
+            let mcp_reply = read_json_line(&mut client_requests).await;
+            assert_accepts_eud_tools_mcp_approval(&mcp_reply, &json!("approval-mcp"));
+
+            write_json_line(
+                &mut server_responses,
+                json!({
+                    "jsonrpc":"2.0",
+                    "id":"approval-command",
+                    "method":"item/commandExecution/requestApproval",
+                    "params":{"command":"cargo test"}
+                }),
+            )
+            .await;
+            let command_reply = read_json_line(&mut client_requests).await;
+            assert_declines_approval(&command_reply, &json!("approval-command"));
+
+            write_json_line(
+                &mut server_responses,
+                json!({
+                    "jsonrpc":"2.0",
+                    "id":"approval-file-change",
+                    "method":"item/fileChange/requestApproval",
+                    "params":{"changes":[{"path":"src-tauri/src/codex_client.rs"}]}
+                }),
+            )
+            .await;
+            let file_change_reply = read_json_line(&mut client_requests).await;
+            assert_declines_approval(&file_change_reply, &json!("approval-file-change"));
+
+            write_json_line(
+                &mut server_responses,
+                json!({"jsonrpc":"2.0","method":"turn/started","params":{"turnId":"turn-1"}}),
+            )
+            .await;
+            write_json_line(
+                &mut server_responses,
+                json!({
+                    "jsonrpc":"2.0",
+                    "method":"item/agentMessage/delta",
+                    "params":{"delta":"hello "}
+                }),
+            )
+            .await;
+            write_json_line(
+                &mut server_responses,
+                json!({
+                    "jsonrpc":"2.0",
+                    "method":"item/reasoning/summaryTextDelta",
+                    "params":{"delta":"summary "}
+                }),
+            )
+            .await;
+            write_json_line(
+                &mut server_responses,
+                json!({
+                    "jsonrpc":"2.0",
+                    "method":"item/reasoning/textDelta",
+                    "params":{"delta":"detail"}
+                }),
+            )
+            .await;
+            write_json_line(
+                &mut server_responses,
+                json!({"jsonrpc":"2.0","method":"turn/completed","params":{"turnId":"turn-1"}}),
+            )
+            .await;
+
+            let thread_resume = read_json_line(&mut client_requests).await;
+            let thread_resume_id = assert_client_request(&thread_resume, "thread/resume");
+            assert_thread_id(&thread_resume, "thread-123");
+            write_json_line(
+                &mut server_responses,
+                json!({"jsonrpc":"2.0","id":thread_resume_id,"result":{}}),
+            )
+            .await;
+
+            let second_turn_start = read_json_line(&mut client_requests).await;
+            let second_turn_start_id = assert_client_request(&second_turn_start, "turn/start");
+            assert_prompt(&second_turn_start, "second prompt");
+            assert_turn_thread_id(&second_turn_start, "thread-123");
+            write_json_line(
+                &mut server_responses,
+                json!({"jsonrpc":"2.0","id":second_turn_start_id,"result":{}}),
+            )
+            .await;
+            write_json_line(
+                &mut server_responses,
+                json!({"jsonrpc":"2.0","method":"turn/completed","params":{"turnId":"turn-2"}}),
+            )
+            .await;
+        });
+
+        let (mut client, mut events) =
+            CodexAppServerClient::new_with_stdio(client_read, client_write);
+
+        client
+            .run_turn("first prompt".to_string())
+            .await
+            .expect("first app-server turn should complete");
+        assert_eq!(
+            next_event(&mut events).await,
+            AppServerEvent::ThreadStarted {
+                thread_id: "thread-123".to_string()
+            }
+        );
+        assert_eq!(next_event(&mut events).await, AppServerEvent::TurnStarted);
+        assert_eq!(
+            next_event(&mut events).await,
+            AppServerEvent::AnswerDelta("hello ".to_string())
+        );
+        assert_eq!(
+            next_event(&mut events).await,
+            AppServerEvent::ReasoningDelta("summary ".to_string())
+        );
+        assert_eq!(
+            next_event(&mut events).await,
+            AppServerEvent::ReasoningDelta("detail".to_string())
+        );
+        assert_eq!(next_event(&mut events).await, AppServerEvent::TurnComplete);
+
+        client
+            .run_turn("second prompt".to_string())
+            .await
+            .expect("second app-server turn should complete");
+        assert_eq!(next_event(&mut events).await, AppServerEvent::TurnComplete);
+
+        stub.await.expect("stub server task should not panic");
+    }
+}

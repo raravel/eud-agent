@@ -2033,15 +2033,15 @@
       ]
     },
     "EUD-123-bab1": {
-      "status": "pending",
+      "status": "done",
       "priority": "high",
       "type": "task",
       "parent": "EUD-094-e9ee",
       "depends_on": [],
       "title": "Codex app-server JSON-RPC transport (thread start/resume, streaming, approvals)",
       "updated": "2026-06-09",
-      "completed_at": null,
-      "path": "active/EUD-123-bab1.md",
+      "completed_at": "2026-06-09T11:14:10.596420",
+      "path": "done/EUD-123-bab1.md",
       "scope": [
         "src-tauri/src/codex_client.rs"
       ]
