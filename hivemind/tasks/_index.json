@@ -2076,7 +2076,7 @@
       ]
     },
     "EUD-126-0e23": {
-      "status": "pending",
+      "status": "done",
       "priority": "high",
       "type": "task",
       "parent": "EUD-094-e9ee",
@@ -2088,8 +2088,8 @@
       ],
       "title": "Agentic engine turn loop (chat/plan/changeset/answer state machine)",
       "updated": "2026-06-09",
-      "completed_at": null,
-      "path": "active/EUD-126-0e23.md",
+      "completed_at": "2026-06-09T14:30:06.254753",
+      "path": "done/EUD-126-0e23.md",
       "scope": [
         "src-tauri/src/engine.rs",
         "src-tauri/src/lib.rs"

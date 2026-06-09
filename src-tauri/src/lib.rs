@@ -6,6 +6,8 @@
 //! registered here; engine, tools, codex_client, isom, bridge_io, and memory are wired by
 //! later tasks.
 
+use tauri::Manager;
+
 pub mod bootstrap;
 pub mod bridge_io;
 pub mod codex_client;
@@ -26,13 +28,26 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
+        .setup(|app| {
+            let app_handle = app.handle().clone();
+            let sink = engine::TauriEventSink::new(app_handle.clone());
+            let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+            let driver = engine::ProductionCodexDriver::new(cwd, sink.clone());
+            let config =
+                engine::AgentEngineConfig::new("[project state]\n(unavailable)", None, Vec::new());
+
+            app.manage(tokio::sync::Mutex::new(engine::AgentEngine::new(
+                driver, sink, config,
+            )));
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
-            ipc::chat,
-            ipc::plan_feedback,
-            ipc::plan_approve,
-            ipc::changeset_decision,
-            ipc::cancel,
-            ipc::reset,
+            engine::engine_chat,
+            engine::engine_plan_feedback,
+            engine::engine_plan_approve,
+            engine::engine_changeset_decision,
+            engine::engine_cancel,
+            engine::engine_reset,
             ipc::status,
             ipc::list,
         ])
