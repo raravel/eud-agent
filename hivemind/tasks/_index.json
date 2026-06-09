@@ -2061,17 +2061,18 @@
       ]
     },
     "EUD-125-6cf7": {
-      "status": "pending",
+      "status": "done",
       "priority": "high",
       "type": "task",
       "parent": "EUD-094-e9ee",
       "depends_on": [],
       "title": "Change journal + changeset rollback (inverse ops, persistence)",
       "updated": "2026-06-09",
-      "completed_at": null,
-      "path": "active/EUD-125-6cf7.md",
+      "completed_at": "2026-06-09T12:46:38.031487",
+      "path": "done/EUD-125-6cf7.md",
       "scope": [
-        "src-tauri/src/journal.rs"
+        "src-tauri/src/journal.rs",
+        "src-tauri/src/lib.rs"
       ]
     },
     "EUD-126-0e23": {

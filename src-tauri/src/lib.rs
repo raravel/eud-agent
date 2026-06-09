@@ -12,6 +12,7 @@ pub mod codex_client;
 pub mod config;
 pub mod engine;
 pub mod ipc;
+pub mod journal;
 pub mod mapsafe;
 pub mod rag;
 pub mod tools;
