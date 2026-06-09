@@ -1933,7 +1933,7 @@
       ]
     },
     "EUD-117-015a": {
-      "status": "pending",
+      "status": "done",
       "priority": "medium",
       "type": "task",
       "parent": "EUD-097-7931",
@@ -1941,9 +1941,9 @@
         "EUD-114-57dd"
       ],
       "title": "Tauri bundle config + packaging",
-      "updated": "2026-06-08",
-      "completed_at": null,
-      "path": "active/EUD-117-015a.md",
+      "updated": "2026-06-10",
+      "completed_at": "2026-06-10T01:39:42.527210",
+      "path": "done/EUD-117-015a.md",
       "scope": [
         "src-tauri/tauri.conf.json"
       ]
