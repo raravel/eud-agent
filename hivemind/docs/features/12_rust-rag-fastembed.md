@@ -84,3 +84,4 @@ asset. The ECA repo and its chromadb are never modified or imported.
 - `ci/build_rag_index.rs` (or script) — corpus re-embed + `.bin` (`ERAG`/v1) writer + sha256
 - `src-tauri/src/rag.rs` `#[cfg(test)] mod parity` — `#[ignore]` parity test vs Python baseline fixtures
 - external: `fastembed` (bge-m3 ONNX + HF cache), `ort` (transitive) — **no `rusqlite`**
+- [BOUND 2026-06-10 from EUD-118-1729] `.github/workflows/build-rag-index.yml` — CI workflow (tag `rag-index-v*` / manual): builds the `ci/build_rag_index` standalone builder, runs it against the checked-out ECA corpus, and publishes `rag-index.bin` + `.sha256` + a `rag_index{url,sha256,version}` manifest as a GitHub Release asset for the bootstrap (feature 10). Requires repo `vars.ECA_REPO` + `secrets.ECA_TOKEN`.
