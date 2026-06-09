@@ -1526,15 +1526,15 @@
       "scope": []
     },
     "EUD-092-121b": {
-      "status": "pending",
+      "status": "done",
       "priority": "high",
       "type": "story",
       "parent": "EUD-090-b768",
       "depends_on": [],
       "title": "S2 isom C++ FFI engine",
-      "updated": "2026-06-08",
-      "completed_at": null,
-      "path": "active/EUD-092-121b.md",
+      "updated": "2026-06-09",
+      "completed_at": "2026-06-09T16:46:22.405714",
+      "path": "done/EUD-092-121b.md",
       "scope": []
     },
     "EUD-093-65b1": {
@@ -1721,7 +1721,7 @@
       ]
     },
     "EUD-105-dba3": {
-      "status": "pending",
+      "status": "done",
       "priority": "medium",
       "type": "task",
       "parent": "EUD-092-121b",
@@ -1729,11 +1729,14 @@
         "EUD-104-0ae7"
       ],
       "title": "CHK parse port (chk_info.py -> chk.rs)",
-      "updated": "2026-06-08",
-      "completed_at": null,
-      "path": "active/EUD-105-dba3.md",
+      "updated": "2026-06-09",
+      "completed_at": "2026-06-09T16:46:22.369346",
+      "path": "done/EUD-105-dba3.md",
       "scope": [
-        "src-tauri/src/chk.rs"
+        "src-tauri/src/chk.rs",
+        "src-tauri/src/lib.rs",
+        "src-tauri/Cargo.toml",
+        "src-tauri/Cargo.lock"
       ]
     },
     "EUD-106-e10d": {

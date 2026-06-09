@@ -1171,6 +1171,7 @@ name = "eud-agent"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "encoding_rs",
  "fastembed",
  "reqwest 0.12.28",
  "serde",

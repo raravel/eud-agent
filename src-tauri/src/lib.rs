@@ -10,6 +10,7 @@ use tauri::Manager;
 
 pub mod bootstrap;
 pub mod bridge_io;
+pub mod chk;
 pub mod codex_client;
 pub mod config;
 pub mod engine;
