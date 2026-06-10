@@ -67,3 +67,4 @@ flowchart TD
 - [BOUND 2026-06-08 from EUD-098-fe34] `src-tauri/src/lib.rs` — Tauri 2 builder + shell/dialog plugin registration; app entry (`run()`), reused by main.rs shim
 - [BOUND 2026-06-08 from EUD-098-fe34] `src-tauri/build.rs` — runs `tauri_build::build()` (codegen + config validation at compile time)
 - [BOUND 2026-06-08 from EUD-098-fe34] `src-tauri/capabilities/default.json` — main-window capability granting core/shell/dialog plugin permissions
+- [BOUND 2026-06-10 from EUD-120-ecca] `panel/src/setup/bootstrap.ts` — pure bootstrapView(pct, detail) mapping the {stage,pct,detail} bootstrap progress payload to setup-screen view state (phase/label/pct)
