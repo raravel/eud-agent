@@ -78,3 +78,4 @@ happy-dom ^16.8.1.
 - [BOUND 2026-06-08 from EUD-112-4f01] which 8.0.3 -- resolve the codex CLI shim path in codex_client (replaces Python shutil.which); honors CODEX_CMD override
 - [BOUND 2026-06-08 from EUD-113-ba2a] similar 2 — TextDiff unified-diff generation for the engine instruct code/diff seam
 - [BOUND 2026-06-09 from EUD-105-dba3] encoding_rs 0.8 — CHK string-table decode in src-tauri/src/chk.rs; EUC_KR == cp949 (WHATWG euc-kr index = unified hangul code), matching chk_info.py utf-8->cp949->latin-1 fallback for Korean map names
+- [BOUND 2026-06-10 from EUD-138-db9b] undici ^7.16.0 — Naver-Cafe scraper HTTP client (tools/scraper, local-only cookie-gated; EUD-138)
