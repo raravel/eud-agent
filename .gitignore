@@ -43,3 +43,13 @@ src-tauri/gen/
 # ICU header-staging output from the isom-sys MSBuild (IcuLib copies its public
 # headers here, OUTSIDE native/isom/; regenerated every build, never committed)
 native/include/
+
+# RAG index builder is a separate cargo workspace under ci/; the root /target/
+# rule above is anchored and does not cover ci/target/. Build output, never committed.
+ci/target/
+
+# RAG index Release artifacts — built in CI, published to a GitHub Release, NEVER
+# committed (rules.md / Decision 15: rag-index.bin is a static read-only CI artifact)
+/rag-index.bin
+/rag-index.bin.sha256
+/rag-index.manifest.json
