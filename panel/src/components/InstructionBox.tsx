@@ -49,12 +49,15 @@ export function InstructionBox({ state, onSend, onReset }: InstructionBoxProps) 
   // textarea is disabled (no typing before the model is ready); the placeholder
   // explains why. Fail-open for unknown/unavailable (never lock forever).
   const ragLoading = state.rag === "loading";
+  const editorDisconnected = !state.editorConnected;
   // EUD-074: during plan_review the SAME input is the plan-feedback channel
   // (App routes the send to plan_feedback{}); guide the user accordingly.
-  const placeholder = ragLoading
-    ? "RAG 모델 준비 중… 준비가 끝나면 입력할 수 있습니다"
-    : state.phase === "plan_review"
-      ? "계획 수정 피드백을 입력하세요 (승인은 계획 카드에서)"
+  const placeholder = editorDisconnected
+    ? "에디터가 연결되지 않았습니다. EUD Editor 3을 실행하세요"
+    : ragLoading
+      ? "RAG 모델 준비 중… 준비가 끝나면 입력할 수 있습니다"
+      : state.phase === "plan_review"
+        ? "계획 수정 피드백을 입력하세요 (승인은 계획 카드에서)"
       : "무엇을 만들까요? (예: 게임 시작 시 미네랄 +1000 트리거 추가)";
 
   function handleSend() {

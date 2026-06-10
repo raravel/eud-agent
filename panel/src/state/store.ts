@@ -223,6 +223,13 @@ export interface PanelState {
   project: string;
   /** Editor build-in-progress flag, from the `status` event. */
   compiling: boolean;
+  /**
+   * Editor bridge heartbeat alive. The bridge writes heartbeat.txt/status.txt
+   * and the core reads them; stale/absent heartbeat is reported to the panel.
+   * Defaults true (fail-open) so an old core that never reports editor-down
+   * never locks the panel.
+   */
+  editorConnected: boolean;
   /** Active plan card (null until a `plan` event; replaced by higher revision). */
   plan: PlanState | null;
   /** Active changeset under review (null until a `changeset`; survives reconnect). */
@@ -246,7 +253,7 @@ export interface PanelState {
   // ---- derived selectors (computed on every mutation) ----
   /** Whether the connection is currently open. */
   connected: boolean;
-  /** Send gating v2: connected && hasProject && !busy (no settable-target gate). */
+  /** Send gating v2: connected && hasProject && editorConnected && !busy. */
   canSend: boolean;
 }
 
@@ -293,6 +300,8 @@ export interface PanelStore {
    * while "loading". "unknown" is the initial state only (never dispatched).
    */
   ragWarmupChanged(state: Exclude<RagGateState, "unknown">): void;
+  /** Explicit editor bridge heartbeat setter (App/backend can drive this). */
+  editorConnectionChanged(connected: boolean): void;
   /** `memory` - populate the memory view and clear local drafts. */
   memoryReceived(
     project: string,
@@ -356,6 +365,13 @@ const BUSY_PHASES: ReadonlySet<Phase> = new Set<Phase>(["thinking"]);
  */
 const NO_PROJECT_MARKER = "no project";
 
+/**
+ * Contractual editor-disconnected marker from the core. Matched as a
+ * case-insensitive substring (kept lowercase) and used only for state, not
+ * rendered raw to the user.
+ */
+const EDITOR_DISCONNECTED_MARKER = "editor not connected";
+
 /** Notice shown when a reconnect cancels an in-flight turn (features/06 line 52). */
 const RECONNECT_TURN_NOTICE = "재연결로 진행 중이던 작업이 취소되었습니다.";
 
@@ -392,6 +408,7 @@ export function createPanelStore(): PanelStore {
     files: [] as FileEntry[],
     project: "",
     compiling: false,
+    editorConnected: true,
     plan: null as PlanState | null,
     changeset: null as ChangesetState | null,
     memoryOpen: false,
@@ -425,13 +442,18 @@ export function createPanelStore(): PanelStore {
     const busy = BUSY_PHASES.has(core.phase) || core.compiling;
     // RAG gate: ONLY "loading" blocks (fail-open for unknown/unavailable).
     const canSend =
-      core.connected && core.hasProject && !busy && core.rag !== "loading";
+      core.connected &&
+      core.hasProject &&
+      core.editorConnected &&
+      !busy &&
+      core.rag !== "loading";
     return {
       phase: core.phase,
       hasProject: core.hasProject,
       files: core.files,
       project: core.project,
       compiling: core.compiling,
+      editorConnected: core.editorConnected,
       plan: core.plan,
       changeset: core.changeset,
       memoryOpen: core.memoryOpen,
@@ -556,6 +578,8 @@ export function createPanelStore(): PanelStore {
 
     // ---- inbound server events ----
     applyStatus(msg) {
+      // A status push means the bridge heartbeat is alive.
+      core.editorConnected = true;
       core.project = msg.project ?? "";
       core.compiling = msg.compiling ?? false;
       emit();
@@ -754,6 +778,12 @@ export function createPanelStore(): PanelStore {
         core.hasProject = false;
         core.files = [];
       }
+      if (
+        typeof message === "string" &&
+        message.toLowerCase().includes(EDITOR_DISCONNECTED_MARKER)
+      ) {
+        core.editorConnected = false;
+      }
       emit();
     },
 
@@ -766,6 +796,11 @@ export function createPanelStore(): PanelStore {
 
     ragWarmupChanged(state) {
       core.rag = state;
+      emit();
+    },
+
+    editorConnectionChanged(connected) {
+      core.editorConnected = connected;
       emit();
     },
 

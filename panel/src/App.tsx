@@ -29,9 +29,21 @@ import { ChangesetView } from "@/components/ChangesetView";
 import { PlanView } from "@/components/PlanView";
 import { MemoryView } from "@/components/MemoryView";
 import { InstructionBox, type ChatPayload } from "@/components/InstructionBox";
+import { ConnectionNotice } from "@/components/ConnectionNotice";
 import { createPanelStore } from "@/state/store";
 import { IpcClient, type MemoryFile, type ServerMessage } from "@/lib/ipc";
 import { progressLabel } from "@/lib/progress";
+import {
+  bootstrapView,
+  type BootstrapView,
+} from "@/setup/bootstrap";
+import { SetupScreen } from "@/setup/SetupScreen";
+
+interface BootstrapState {
+  active: boolean;
+  view: BootstrapView;
+  error: string | null;
+}
 
 export default function App() {
   // Store + client live for the lifetime of the app (created once).
@@ -50,6 +62,16 @@ export default function App() {
   const [ragState, setRagState] = useState<RagState>("idle");
   const ragStartRef = useRef<number | null>(null);
   const [ragElapsedSec, setRagElapsedSec] = useState(0);
+  const [bootstrap, setBootstrap] = useState<BootstrapState>(() => ({
+    active: false,
+    view: bootstrapView(null, undefined),
+    error: null,
+  }));
+  const bootstrapActiveRef = useRef(false);
+
+  useEffect(() => {
+    bootstrapActiveRef.current = bootstrap.active;
+  }, [bootstrap.active]);
 
   // Tick the RAG elapsed counter once a second while loading.
   useEffect(() => {
@@ -80,6 +102,20 @@ export default function App() {
           store.log("ok", "메모리를 저장했습니다.");
           break;
         case "progress": {
+          if (msg.stage === "bootstrap") {
+            const view = bootstrapView(msg.pct, msg.detail);
+            bootstrapActiveRef.current = true;
+            setBootstrap({
+              active: true,
+              view,
+              error: view.phase === "error" ? view.label : null,
+            });
+            break;
+          }
+          if (bootstrapActiveRef.current) {
+            bootstrapActiveRef.current = false;
+            setBootstrap((prev) => ({ ...prev, active: false }));
+          }
           store.progressReceived(msg.stage);
           // RAG warmup drives the Header pill (started → loading w/ elapsed,
           // done → ready, error → unavailable) AND the store send gate. The
@@ -163,6 +199,13 @@ export default function App() {
         }
         case "error":
           // F2: errorReceived archives any prose streamed before the turn errored.
+          if (bootstrapActiveRef.current) {
+            setBootstrap((prev) => ({
+              ...prev,
+              active: true,
+              error: msg.message,
+            }));
+          }
           store.errorReceived(msg.message);
           store.log("error", `오류: ${msg.message}`);
           break;
@@ -232,6 +275,13 @@ export default function App() {
     }
   }, [store]);
 
+  const handleBootstrapRetry = useCallback(() => {
+    // Feature 10 recovery is "resume on next launch"; reload re-runs app init
+    // and the first-run manifest check. A bootstrap-retry IPC command is future
+    // backend work, not part of the v2 IPC contract.
+    window.location.reload();
+  }, []);
+
   // Plan approval: send plan_approve{}, archive the approval into the log, and
   // start the apply turn (the store resets the per-turn buffers).
   const handlePlanApprove = useCallback(async () => {
@@ -277,6 +327,16 @@ export default function App() {
 
   const rag = ragState === "idle" ? undefined : { state: ragState, elapsedSec: ragElapsedSec };
 
+  if (bootstrap.active) {
+    return (
+      <SetupScreen
+        view={bootstrap.view}
+        error={bootstrap.error}
+        onRetry={handleBootstrapRetry}
+      />
+    );
+  }
+
   return (
     <div className="flex h-screen flex-col bg-background text-foreground">
       <Header
@@ -287,6 +347,8 @@ export default function App() {
         memoryOpen={state.memoryOpen}
         onMemoryOpen={handleMemoryOpen}
       />
+
+      {!state.editorConnected && <ConnectionNotice />}
 
       {/* The live agent activity (reasoning / tool rows / streamed answer)
           renders INLINE inside the conversation scroll area (EUD-069) — a fixed

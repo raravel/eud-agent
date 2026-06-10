@@ -161,11 +161,17 @@ export interface RollbackResultMessage {
   ok: boolean;
 }
 
-/** `progress {stage, detail?}` - render as a conversation entry. */
+/** `progress {stage, detail?, pct?}` - render as a conversation entry. */
 export interface ProgressMessage {
   type: "progress";
   stage: ProgressStage;
   detail?: string;
+  /**
+   * Optional percent for bootstrap progress. The Rust bootstrap emitter sends
+   * this as a separate field (`progress {stage:"bootstrap", detail, pct}`),
+   * matching feature 10 and `src-tauri/src/bootstrap.rs`.
+   */
+  pct?: number;
 }
 
 /** `error {message}` - flow returns to ready. */

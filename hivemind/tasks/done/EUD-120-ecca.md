@@ -1,4 +1,5 @@
 ---
+completed_at: '2026-06-10T10:53:20.539139'
 created: '2026-06-08'
 depends_on:
 - EUD-119-bc27
@@ -8,10 +9,13 @@ priority: medium
 scope:
 - panel/src/setup
 - panel/src/components
-status: pending
+- panel/src/state
+- panel/src/App.tsx
+- panel/src/lib/protocol.ts
+status: done
 title: Panel setup + connection-state UI
 type: task
-updated: '2026-06-08'
+updated: '2026-06-10'
 ---
 
 ## Description

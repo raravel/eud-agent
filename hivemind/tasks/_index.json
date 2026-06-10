@@ -1574,15 +1574,15 @@
       "scope": []
     },
     "EUD-096-4eb3": {
-      "status": "pending",
+      "status": "done",
       "priority": "medium",
       "type": "story",
       "parent": "EUD-090-b768",
       "depends_on": [],
       "title": "S6 Panel transport migration",
-      "updated": "2026-06-08",
-      "completed_at": null,
-      "path": "active/EUD-096-4eb3.md",
+      "updated": "2026-06-10",
+      "completed_at": "2026-06-10T10:53:20.571201",
+      "path": "done/EUD-096-4eb3.md",
       "scope": []
     },
     "EUD-097-7931": {
@@ -1989,7 +1989,7 @@
       ]
     },
     "EUD-120-ecca": {
-      "status": "pending",
+      "status": "done",
       "priority": "medium",
       "type": "task",
       "parent": "EUD-096-4eb3",
@@ -1997,12 +1997,15 @@
         "EUD-119-bc27"
       ],
       "title": "Panel setup + connection-state UI",
-      "updated": "2026-06-08",
-      "completed_at": null,
-      "path": "active/EUD-120-ecca.md",
+      "updated": "2026-06-10",
+      "completed_at": "2026-06-10T10:53:20.539139",
+      "path": "done/EUD-120-ecca.md",
       "scope": [
         "panel/src/setup",
-        "panel/src/components"
+        "panel/src/components",
+        "panel/src/state",
+        "panel/src/App.tsx",
+        "panel/src/lib/protocol.ts"
       ]
     },
     "EUD-121-8ff9": {
