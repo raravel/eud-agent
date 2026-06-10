@@ -2219,6 +2219,107 @@
         "crates/isom-sys/build.rs",
         "crates/isom/build.rs"
       ]
+    },
+    "EUD-134-0351": {
+      "status": "pending",
+      "priority": "medium",
+      "type": "epic",
+      "parent": null,
+      "depends_on": [],
+      "title": "In-house RAG corpus pipeline (decouple ECA)",
+      "updated": "2026-06-10",
+      "completed_at": null,
+      "path": "active/EUD-134-0351.md",
+      "scope": []
+    },
+    "EUD-135-2f41": {
+      "status": "pending",
+      "priority": "medium",
+      "type": "story",
+      "parent": "EUD-134-0351",
+      "depends_on": [],
+      "title": "RAG corpus pipeline",
+      "updated": "2026-06-10",
+      "completed_at": null,
+      "path": "active/EUD-135-2f41.md",
+      "scope": []
+    },
+    "EUD-136-ea37": {
+      "status": "pending",
+      "priority": "medium",
+      "type": "task",
+      "parent": "EUD-135-2f41",
+      "depends_on": [],
+      "title": "build_rag_index reads in-repo corpus (--corpus, drop ECA default)",
+      "updated": "2026-06-10",
+      "completed_at": null,
+      "path": "active/EUD-136-ea37.md",
+      "scope": [
+        "ci/build_rag_index.rs"
+      ]
+    },
+    "EUD-137-dcbc": {
+      "status": "pending",
+      "priority": "medium",
+      "type": "chore",
+      "parent": "EUD-135-2f41",
+      "depends_on": [],
+      "title": "Vendor RAG corpus JSONL into ci/corpus",
+      "updated": "2026-06-10",
+      "completed_at": null,
+      "path": "active/EUD-137-dcbc.md",
+      "scope": [
+        "ci/corpus"
+      ]
+    },
+    "EUD-138-db9b": {
+      "status": "pending",
+      "priority": "medium",
+      "type": "task",
+      "parent": "EUD-135-2f41",
+      "depends_on": [],
+      "title": "Node/TS Naver-Cafe scraper -> corpus JSONL (local, cookie)",
+      "updated": "2026-06-10",
+      "completed_at": null,
+      "path": "active/EUD-138-db9b.md",
+      "scope": [
+        "tools/scraper",
+        "manifest:node"
+      ]
+    },
+    "EUD-139-66d8": {
+      "status": "pending",
+      "priority": "medium",
+      "type": "chore",
+      "parent": "EUD-135-2f41",
+      "depends_on": [],
+      "title": "Align harness docs to in-house corpus (Decision 15)",
+      "updated": "2026-06-10",
+      "completed_at": null,
+      "path": "active/EUD-139-66d8.md",
+      "scope": [
+        "hivemind/docs/rules.md",
+        "hivemind/docs/architecture.md",
+        "hivemind/docs/tech-stack.md",
+        "hivemind/docs/features/12_rust-rag-fastembed.md"
+      ]
+    },
+    "EUD-140-c28a": {
+      "status": "pending",
+      "priority": "medium",
+      "type": "task",
+      "parent": "EUD-135-2f41",
+      "depends_on": [
+        "EUD-136-ea37",
+        "EUD-137-dcbc"
+      ],
+      "title": "Drop ECA from build-rag-index CI workflow",
+      "updated": "2026-06-10",
+      "completed_at": null,
+      "path": "active/EUD-140-c28a.md",
+      "scope": [
+        ".github/workflows/build-rag-index.yml"
+      ]
     }
   }
 }
