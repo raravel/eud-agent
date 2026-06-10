@@ -3,6 +3,7 @@
 //! The functions here are small, deterministic backstops for crash-critical
 //! first principles and the EUD-090 evidence requirement.
 
+use encoding_rs::EUC_KR;
 use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -979,6 +980,452 @@ the unit id ({obj_id})."
     Ok(())
 }
 
+/// Parsed `location_write` operation. Coordinates are tile units until encoded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LocWrite {
+    Add {
+        left: i64,
+        top: i64,
+        right: i64,
+        bottom: i64,
+        name: String,
+        invert_x: bool,
+        invert_y: bool,
+    },
+    Set {
+        id: i64,
+        left: i64,
+        top: i64,
+        right: i64,
+        bottom: i64,
+        invert_x: bool,
+        invert_y: bool,
+    },
+    Rename {
+        id: i64,
+        name: String,
+    },
+    Delete {
+        id: i64,
+    },
+}
+
+pub fn parse_location_write(args: &Value) -> ToolResult<LocWrite> {
+    let Some(object) = args.as_object() else {
+        return Err(location_write_error(
+            "arguments must be a JSON object with action add|set|rename|delete",
+        ));
+    };
+    let action = object
+        .get("action")
+        .and_then(Value::as_str)
+        .ok_or_else(|| location_write_error("missing required field action"))?;
+
+    match action {
+        "add" => {
+            let name = required_location_name(object, "name")?;
+            let (left, top, right, bottom) = required_tile_rect(object)?;
+            validate_tile_rect(left, top, right, bottom)?;
+            Ok(LocWrite::Add {
+                left,
+                top,
+                right,
+                bottom,
+                name,
+                invert_x: optional_bool(object, "invertX"),
+                invert_y: optional_bool(object, "invertY"),
+            })
+        }
+        "set" => {
+            let id = required_location_id(object)?;
+            reject_anywhere(id)?;
+            let (left, top, right, bottom) = required_tile_rect(object)?;
+            validate_tile_rect(left, top, right, bottom)?;
+            Ok(LocWrite::Set {
+                id,
+                left,
+                top,
+                right,
+                bottom,
+                invert_x: optional_bool(object, "invertX"),
+                invert_y: optional_bool(object, "invertY"),
+            })
+        }
+        "rename" => {
+            let id = required_location_id(object)?;
+            reject_anywhere(id)?;
+            let name = required_location_name(object, "name")?;
+            Ok(LocWrite::Rename { id, name })
+        }
+        "delete" => {
+            let id = required_location_id(object)?;
+            reject_anywhere(id)?;
+            Ok(LocWrite::Delete { id })
+        }
+        other => Err(location_write_error(format!(
+            "invalid action {other:?}; expected add, set, rename, or delete"
+        ))),
+    }
+}
+
+pub fn encode_locedit_ops(op: &LocWrite, name_bytes: &[u8]) -> Vec<u8> {
+    match op {
+        LocWrite::Add {
+            left,
+            top,
+            right,
+            bottom,
+            invert_x,
+            invert_y,
+            ..
+        } => {
+            let (left, top, right, bottom) =
+                pixel_rect(*left, *top, *right, *bottom, *invert_x, *invert_y);
+            let mut ops = format!("add|{left}|{top}|{right}|{bottom}|").into_bytes();
+            ops.extend_from_slice(name_bytes);
+            ops
+        }
+        LocWrite::Set {
+            id,
+            left,
+            top,
+            right,
+            bottom,
+            invert_x,
+            invert_y,
+        } => {
+            let (left, top, right, bottom) =
+                pixel_rect(*left, *top, *right, *bottom, *invert_x, *invert_y);
+            format!("set|{id}|{left}|{top}|{right}|{bottom}").into_bytes()
+        }
+        LocWrite::Rename { id, .. } => {
+            let mut ops = format!("rename|{id}|").into_bytes();
+            ops.extend_from_slice(name_bytes);
+            ops
+        }
+        LocWrite::Delete { id } => format!("del|{id}").into_bytes(),
+    }
+}
+
+pub fn encode_location_name(name: &str, chk: &[u8]) -> Vec<u8> {
+    if name.is_ascii() {
+        return name.as_bytes().to_vec();
+    }
+    if chk.windows(4).any(|window| window == b"STRx") {
+        return name.as_bytes().to_vec();
+    }
+
+    EUC_KR.encode(name).0.into_owned()
+}
+
+pub fn location_write_apply<S, L, E>(
+    map_safe: &crate::mapsafe::MapSafe<S, L, E>,
+    journal: &crate::journal::JournalStore,
+    request_id: &str,
+    map_path: &Path,
+    chk: &[u8],
+    args: &Value,
+    ts: u64,
+) -> ToolResult<Value>
+where
+    S: crate::mapsafe::CompilingStatus,
+    L: crate::mapsafe::LockProbe,
+    E: crate::mapsafe::MapEngine,
+{
+    let op = parse_location_write(args)?;
+    let name_bytes = op
+        .name()
+        .map(|name| encode_location_name(name, chk))
+        .unwrap_or_default();
+    let ops = encode_locedit_ops(&op, &name_bytes);
+    let backup = match map_safe.write(map_path, crate::mapsafe::OpKind::Locedit, &ops) {
+        Ok(entry) => entry,
+        Err(error) => {
+            return Err(location_write_mapsafe_error(map_safe, map_path, error));
+        }
+    };
+
+    let post_chk = match isom::chk_extract(map_path) {
+        Ok(chk) => chk,
+        Err(isom_error) => std::fs::read(map_path).map_err(|read_error| {
+            location_write_error(format!(
+                "post-edit CHK extraction failed for {}: {isom_error}; raw CHK fallback failed: {read_error}",
+                map_path.display()
+            ))
+        })?,
+    };
+    let pre_digest = crate::chk::digest_chk(chk);
+    let post_digest = crate::chk::digest_chk(&post_chk);
+    let location_id = assigned_location_id(&op, &pre_digest.locations, &post_digest.locations);
+
+    let existing = match journal.changeset(request_id) {
+        Ok(changeset) => changeset.items.len() as u64,
+        Err(crate::journal::JournalError::MissingJournal { .. }) => 0,
+        Err(error) => return Err(location_write_error(error.to_string())),
+    };
+    let seq = existing + 1;
+    let entry = crate::journal::JournalEntry {
+        id: format!("loc-{seq}"),
+        seq,
+        tool: crate::journal::WriteTool::LocationWrite,
+        target: crate::journal::JournalTarget::Map {
+            path: map_path.to_string_lossy().to_string(),
+            summary: location_write_summary(&op),
+        },
+        before: crate::journal::Snapshot::MapBackup {
+            map_path: backup.map_path.to_string_lossy().to_string(),
+            backup_path: backup.backup_path.to_string_lossy().to_string(),
+        },
+        after: crate::journal::Snapshot::MapEdit {
+            action: op.action().to_string(),
+            location_id,
+            name: op.name().map(str::to_owned),
+        },
+        ts,
+    };
+    journal
+        .record(request_id, entry)
+        .map_err(|error| location_write_error(error.to_string()))?;
+
+    Ok(json!({
+        "ok": true,
+        "action": op.action(),
+        "locationId": location_id,
+        "mapPath": map_path.to_string_lossy().to_string(),
+        "backupPath": backup.backup_path.to_string_lossy().to_string(),
+        "locations": post_digest.locations,
+    }))
+}
+
+pub fn location_write<S, L, E>(
+    bridge: &crate::bridge_io::BridgeIo,
+    map_safe: &crate::mapsafe::MapSafe<S, L, E>,
+    journal: &crate::journal::JournalStore,
+    request_id: &str,
+    args: &Value,
+) -> ToolResult<Value>
+where
+    S: crate::mapsafe::CompilingStatus,
+    L: crate::mapsafe::LockProbe,
+    E: crate::mapsafe::MapEngine,
+{
+    let map_path_reply = bridge
+        .send(
+            "GETSET project|OpenMapName",
+            &crate::bridge_io::SendOpts::default(),
+            None,
+        )
+        .map_err(|error| {
+            location_write_error(format!("bridge GETSET OpenMapName failed: {error}"))
+        })?;
+    let map_path = parse_open_map_name_reply(&map_path_reply);
+    if map_path.is_empty() {
+        return Err(location_write_error(
+            "bridge returned an empty project OpenMapName; open or configure a source map",
+        ));
+    }
+
+    let path = Path::new(map_path);
+    let metadata = std::fs::metadata(path).map_err(|error| {
+        location_write_error(format!(
+            "source map file is missing or unreadable: {map_path} ({error})"
+        ))
+    })?;
+    if !metadata.is_file() {
+        return Err(location_write_error(format!(
+            "source map path is not a file: {map_path}"
+        )));
+    }
+
+    let chk = isom::chk_extract(path).map_err(|error| {
+        location_write_error(format!("CHK extraction failed for {map_path}: {error}"))
+    })?;
+    let ts = saved_at_epoch_seconds(SystemTime::now());
+    location_write_apply(map_safe, journal, request_id, path, &chk, args, ts)
+}
+
+impl LocWrite {
+    fn action(&self) -> &'static str {
+        match self {
+            Self::Add { .. } => "add",
+            Self::Set { .. } => "set",
+            Self::Rename { .. } => "rename",
+            Self::Delete { .. } => "delete",
+        }
+    }
+
+    fn name(&self) -> Option<&str> {
+        match self {
+            Self::Add { name, .. } | Self::Rename { name, .. } => Some(name),
+            Self::Set { .. } | Self::Delete { .. } => None,
+        }
+    }
+
+    fn explicit_id(&self) -> Option<i64> {
+        match self {
+            Self::Add { .. } => None,
+            Self::Set { id, .. } | Self::Rename { id, .. } | Self::Delete { id } => Some(*id),
+        }
+    }
+}
+
+fn required_location_name(object: &Map<String, Value>, field: &str) -> ToolResult<String> {
+    let name = object
+        .get(field)
+        .and_then(Value::as_str)
+        .ok_or_else(|| location_write_error(format!("missing required field {field}")))?;
+    if name.is_empty() {
+        return Err(location_write_error(format!("{field} must be non-empty")));
+    }
+    if name.contains('|') || name.contains('\n') || name.contains('\r') {
+        return Err(location_write_error(format!(
+            "{field} must not contain '|', newline, or carriage return"
+        )));
+    }
+    Ok(name.to_string())
+}
+
+fn required_location_id(object: &Map<String, Value>) -> ToolResult<i64> {
+    let id = required_i64(object, "locationId")?;
+    if id < 1 {
+        return Err(location_write_error(
+            "locationId must be an integer greater than or equal to 1",
+        ));
+    }
+    Ok(id)
+}
+
+fn reject_anywhere(id: i64) -> ToolResult<()> {
+    if id == 64 {
+        return Err(location_write_error(
+            "locationId 64 is Anywhere and is protected by hivemind/docs/rules.md; refusing set/rename/delete",
+        ));
+    }
+    Ok(())
+}
+
+fn required_tile_rect(object: &Map<String, Value>) -> ToolResult<(i64, i64, i64, i64)> {
+    Ok((
+        required_i64(object, "tileLeft")?,
+        required_i64(object, "tileTop")?,
+        required_i64(object, "tileRight")?,
+        required_i64(object, "tileBottom")?,
+    ))
+}
+
+fn required_i64(object: &Map<String, Value>, field: &str) -> ToolResult<i64> {
+    let value = object
+        .get(field)
+        .ok_or_else(|| location_write_error(format!("missing required field {field}")))?;
+    if let Some(value) = value.as_i64() {
+        return Ok(value);
+    }
+    if let Some(value) = value.as_u64().and_then(|value| i64::try_from(value).ok()) {
+        return Ok(value);
+    }
+    Err(location_write_error(format!("{field} must be an integer")))
+}
+
+fn optional_bool(object: &Map<String, Value>, field: &str) -> bool {
+    object.get(field).and_then(Value::as_bool).unwrap_or(false)
+}
+
+fn validate_tile_rect(left: i64, top: i64, right: i64, bottom: i64) -> ToolResult<()> {
+    if right <= left || bottom <= top {
+        return Err(location_write_error(
+            "tile rect must be normal before inversion: tileRight > tileLeft and tileBottom > tileTop",
+        ));
+    }
+    Ok(())
+}
+
+fn pixel_rect(
+    left: i64,
+    top: i64,
+    right: i64,
+    bottom: i64,
+    invert_x: bool,
+    invert_y: bool,
+) -> (i64, i64, i64, i64) {
+    let (mut left, mut top, mut right, mut bottom) = (left * 32, top * 32, right * 32, bottom * 32);
+    if invert_x {
+        std::mem::swap(&mut left, &mut right);
+    }
+    if invert_y {
+        std::mem::swap(&mut top, &mut bottom);
+    }
+    (left, top, right, bottom)
+}
+
+fn assigned_location_id(
+    op: &LocWrite,
+    pre_locations: &[crate::chk::Location],
+    post_locations: &[crate::chk::Location],
+) -> Option<i64> {
+    match op {
+        LocWrite::Add { name, .. } => {
+            let pre_ids_for_name = pre_locations
+                .iter()
+                .filter(|location| location.name == *name)
+                .map(|location| location.id)
+                .collect::<Vec<_>>();
+            post_locations
+                .iter()
+                .find(|location| location.name == *name && !pre_ids_for_name.contains(&location.id))
+                .or_else(|| {
+                    post_locations
+                        .iter()
+                        .find(|location| location.name == *name)
+                })
+                .and_then(|location| i64::try_from(location.id).ok())
+        }
+        _ => op.explicit_id(),
+    }
+}
+
+fn location_write_summary(op: &LocWrite) -> String {
+    match op {
+        LocWrite::Add { name, .. } => format!("add {name}"),
+        LocWrite::Set { id, .. } => format!("set #{id}"),
+        LocWrite::Rename { id, name } => format!("rename #{id} -> {name}"),
+        LocWrite::Delete { id } => format!("delete #{id}"),
+    }
+}
+
+fn location_write_mapsafe_error<S, L, E>(
+    map_safe: &crate::mapsafe::MapSafe<S, L, E>,
+    map_path: &Path,
+    error: crate::mapsafe::MapSafeError,
+) -> ToolError
+where
+    S: crate::mapsafe::CompilingStatus,
+    L: crate::mapsafe::LockProbe,
+    E: crate::mapsafe::MapEngine,
+{
+    match error {
+        crate::mapsafe::MapSafeError::Verify { detail, backup } => {
+            let entry = crate::mapsafe::JournalEntry {
+                map_path: map_path.to_path_buf(),
+                backup_path: backup.clone(),
+            };
+            match map_safe.restore(&entry) {
+                Ok(()) => location_write_error(format!(
+                    "post-edit verification failed ({detail}); the map was restored from backup {}",
+                    backup.display()
+                )),
+                Err(restore_error) => location_write_error(format!(
+                    "post-edit verification failed ({detail}); restore from backup {} also failed: {restore_error}. Recover manually from this backup.",
+                    backup.display()
+                )),
+            }
+        }
+        crate::mapsafe::MapSafeError::Compiling => location_write_error(
+            "compiling guard refused: the editor is building right now; retry after the build finishes",
+        ),
+        _ => location_write_error(error.to_string()),
+    }
+}
+
 /// Resolve the connected source map through the bridge, extract its CHK, and return a
 /// sliced JSON view of the digest. This is intentionally thin; map parsing, filtering,
 /// and truncation are in [`map_info_view`] for headless tests.
@@ -1223,9 +1670,152 @@ fn map_info_error(message: impl Into<String>) -> ToolError {
     }
 }
 
+fn location_write_error(message: impl Into<String>) -> ToolError {
+    ToolError::AdmissionRejected {
+        message: format!("location_write: {}", message.into()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use encoding_rs::EUC_KR;
+    use std::cell::Cell;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    struct LocationWriteFakeStatus(bool);
+
+    impl crate::mapsafe::CompilingStatus for LocationWriteFakeStatus {
+        fn is_compiling(&self) -> bool {
+            self.0
+        }
+    }
+
+    struct LocationWriteFakeLock(bool);
+
+    impl crate::mapsafe::LockProbe for LocationWriteFakeLock {
+        fn is_locked(&self, _path: &Path) -> bool {
+            self.0
+        }
+    }
+
+    struct LocationWriteFakeEngine {
+        applied_bytes: Vec<u8>,
+        digest_result: Result<Vec<u8>, String>,
+        apply_called: Cell<bool>,
+    }
+
+    impl LocationWriteFakeEngine {
+        fn ok(chk_after_apply: Vec<u8>) -> Self {
+            Self {
+                applied_bytes: chk_after_apply.clone(),
+                digest_result: Ok(chk_after_apply),
+                apply_called: Cell::new(false),
+            }
+        }
+
+        fn verify_fails(applied_bytes: Vec<u8>) -> Self {
+            Self {
+                applied_bytes,
+                digest_result: Err("unreadable post-edit CHK".to_owned()),
+                apply_called: Cell::new(false),
+            }
+        }
+    }
+
+    impl crate::mapsafe::MapEngine for LocationWriteFakeEngine {
+        fn apply(
+            &self,
+            map: &Path,
+            kind: crate::mapsafe::OpKind,
+            ops: &[u8],
+        ) -> Result<(), String> {
+            assert_eq!(kind, crate::mapsafe::OpKind::Locedit);
+            assert!(
+                ops.starts_with(b"add|"),
+                "location_write add should encode a locedit add op"
+            );
+            self.apply_called.set(true);
+            fs::write(map, &self.applied_bytes).map_err(|error| error.to_string())
+        }
+
+        fn digest(&self, _map: &Path) -> Result<Vec<u8>, String> {
+            self.digest_result.clone()
+        }
+    }
+
+    const TOOL_TEST_MRGN_ENTRY_SIZE: usize = 20;
+
+    fn tool_test_temp_dir(test_name: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock should be after epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("eud-agent-tools-{test_name}-{nanos}"));
+        fs::create_dir_all(&dir).expect("temp data dir should be creatable");
+        dir
+    }
+
+    fn tool_test_section(name: &str, body: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(name.as_bytes());
+        out.extend_from_slice(&(body.len() as i32).to_le_bytes());
+        out.extend_from_slice(body);
+        out
+    }
+
+    fn tool_test_strx(values: &[&[u8]]) -> Vec<u8> {
+        let count = values.len();
+        let table_len = 4 * (count + 1);
+        let mut out = vec![0; table_len];
+        out[0..4].copy_from_slice(&(count as u32).to_le_bytes());
+
+        let mut cursor = table_len;
+        for (idx, value) in values.iter().enumerate() {
+            out[4 * (idx + 1)..4 * (idx + 2)].copy_from_slice(&(cursor as u32).to_le_bytes());
+            out.extend_from_slice(value);
+            out.push(0);
+            cursor = out.len();
+        }
+        out
+    }
+
+    fn tool_test_mrgn_entry(
+        left: i32,
+        top: i32,
+        right: i32,
+        bottom: i32,
+        string_id: u16,
+    ) -> [u8; TOOL_TEST_MRGN_ENTRY_SIZE] {
+        let mut out = [0u8; TOOL_TEST_MRGN_ENTRY_SIZE];
+        out[0..4].copy_from_slice(&left.to_le_bytes());
+        out[4..8].copy_from_slice(&top.to_le_bytes());
+        out[8..12].copy_from_slice(&right.to_le_bytes());
+        out[12..16].copy_from_slice(&bottom.to_le_bytes());
+        out[16..18].copy_from_slice(&string_id.to_le_bytes());
+        out
+    }
+
+    fn tool_test_chk_with_location(name: &[u8]) -> Vec<u8> {
+        let dim = [64u16.to_le_bytes(), 128u16.to_le_bytes()].concat();
+        let era = 3u16.to_le_bytes();
+        let strx = tool_test_strx(&[name, b"Anywhere"]);
+
+        let mut mrgn = Vec::new();
+        mrgn.extend_from_slice(&tool_test_mrgn_entry(32, 64, 96, 128, 1));
+        while mrgn.len() < crate::chk::_ANYWHERE_INDEX * TOOL_TEST_MRGN_ENTRY_SIZE {
+            mrgn.extend_from_slice(&tool_test_mrgn_entry(0, 0, 0, 0, 0));
+        }
+        mrgn.extend_from_slice(&tool_test_mrgn_entry(0, 0, 2048, 4096, 2));
+
+        let mut chk = Vec::new();
+        chk.extend_from_slice(&tool_test_section("DIM ", &dim));
+        chk.extend_from_slice(&tool_test_section("ERA ", &era));
+        chk.extend_from_slice(&tool_test_section("STRx", &strx));
+        chk.extend_from_slice(&tool_test_section("MRGN", &mrgn));
+        chk
+    }
 
     fn write_tool(name: &'static str) -> ToolSpec {
         ToolSpec::mutating(name)
@@ -1361,6 +1951,370 @@ mod tests {
         assert_eq!(
             validate_buttonset_xdat("ButtonSet", "Other", 65, 66),
             Ok(())
+        );
+    }
+
+    #[test]
+    fn location_write_parse_accepts_valid_action_shapes() {
+        assert_eq!(
+            parse_location_write(&serde_json::json!({
+                "action": "add",
+                "name": "spot",
+                "tileLeft": 1,
+                "tileTop": 2,
+                "tileRight": 3,
+                "tileBottom": 4,
+                "invertX": true,
+            }))
+            .unwrap(),
+            LocWrite::Add {
+                left: 1,
+                top: 2,
+                right: 3,
+                bottom: 4,
+                name: "spot".to_string(),
+                invert_x: true,
+                invert_y: false,
+            }
+        );
+        assert_eq!(
+            parse_location_write(&serde_json::json!({
+                "action": "set",
+                "locationId": 5,
+                "tileLeft": 1,
+                "tileTop": 2,
+                "tileRight": 3,
+                "tileBottom": 4,
+                "invertY": true,
+            }))
+            .unwrap(),
+            LocWrite::Set {
+                id: 5,
+                left: 1,
+                top: 2,
+                right: 3,
+                bottom: 4,
+                invert_x: false,
+                invert_y: true,
+            }
+        );
+        assert_eq!(
+            parse_location_write(&serde_json::json!({
+                "action": "rename",
+                "locationId": 5,
+                "name": "new spot",
+            }))
+            .unwrap(),
+            LocWrite::Rename {
+                id: 5,
+                name: "new spot".to_string(),
+            }
+        );
+        assert_eq!(
+            parse_location_write(&serde_json::json!({
+                "action": "delete",
+                "locationId": 7,
+            }))
+            .unwrap(),
+            LocWrite::Delete { id: 7 }
+        );
+    }
+
+    #[test]
+    fn location_write_parse_rejects_missing_or_invalid_fields() {
+        for args in [
+            serde_json::json!({}),
+            serde_json::json!({"action": "copy"}),
+            serde_json::json!({"action": "add", "tileLeft": 1, "tileTop": 2, "tileRight": 3, "tileBottom": 4}),
+            serde_json::json!({"action": "set", "locationId": 1, "tileLeft": 1, "tileTop": 2, "tileRight": 3}),
+            serde_json::json!({"action": "rename", "locationId": 1}),
+            serde_json::json!({"action": "delete"}),
+        ] {
+            assert!(
+                matches!(
+                    parse_location_write(&args),
+                    Err(ToolError::AdmissionRejected { .. })
+                ),
+                "expected location_write parse rejection for {args}"
+            );
+        }
+    }
+
+    #[test]
+    fn location_write_parse_rejects_bad_names_ids_anywhere_and_rects() {
+        for args in [
+            serde_json::json!({
+                "action": "add",
+                "name": "bad|name",
+                "tileLeft": 1,
+                "tileTop": 2,
+                "tileRight": 3,
+                "tileBottom": 4,
+            }),
+            serde_json::json!({"action": "rename", "locationId": 1, "name": ""}),
+            serde_json::json!({"action": "delete", "locationId": 0}),
+            serde_json::json!({"action": "delete", "locationId": 64}),
+            serde_json::json!({
+                "action": "set",
+                "locationId": 64,
+                "tileLeft": 1,
+                "tileTop": 2,
+                "tileRight": 3,
+                "tileBottom": 4,
+            }),
+            serde_json::json!({"action": "rename", "locationId": 64, "name": "Anywhere2"}),
+            serde_json::json!({
+                "action": "add",
+                "name": "bad rect",
+                "tileLeft": 3,
+                "tileTop": 2,
+                "tileRight": 3,
+                "tileBottom": 4,
+            }),
+            serde_json::json!({
+                "action": "add",
+                "name": "bad rect",
+                "tileLeft": 1,
+                "tileTop": 4,
+                "tileRight": 3,
+                "tileBottom": 4,
+            }),
+        ] {
+            assert!(
+                matches!(
+                    parse_location_write(&args),
+                    Err(ToolError::AdmissionRejected { .. })
+                ),
+                "expected location_write parse rejection for {args}"
+            );
+        }
+    }
+
+    #[test]
+    fn encode_locedit_ops_renders_pixels_and_inverted_axes_without_newline() {
+        assert_eq!(
+            encode_locedit_ops(
+                &LocWrite::Add {
+                    left: 1,
+                    top: 2,
+                    right: 3,
+                    bottom: 4,
+                    name: "spot".to_string(),
+                    invert_x: false,
+                    invert_y: false,
+                },
+                b"spot",
+            ),
+            b"add|32|64|96|128|spot".to_vec()
+        );
+        assert_eq!(
+            encode_locedit_ops(
+                &LocWrite::Add {
+                    left: 1,
+                    top: 2,
+                    right: 3,
+                    bottom: 4,
+                    name: "spot".to_string(),
+                    invert_x: true,
+                    invert_y: false,
+                },
+                b"spot",
+            ),
+            b"add|96|64|32|128|spot".to_vec()
+        );
+        assert_eq!(
+            encode_locedit_ops(
+                &LocWrite::Add {
+                    left: 1,
+                    top: 2,
+                    right: 3,
+                    bottom: 4,
+                    name: "spot".to_string(),
+                    invert_x: false,
+                    invert_y: true,
+                },
+                b"spot",
+            ),
+            b"add|32|128|96|64|spot".to_vec()
+        );
+        assert_eq!(
+            encode_locedit_ops(
+                &LocWrite::Set {
+                    id: 5,
+                    left: 1,
+                    top: 2,
+                    right: 3,
+                    bottom: 4,
+                    invert_x: false,
+                    invert_y: false,
+                },
+                b"",
+            ),
+            b"set|5|32|64|96|128".to_vec()
+        );
+        assert_eq!(
+            encode_locedit_ops(
+                &LocWrite::Rename {
+                    id: 5,
+                    name: "n".to_string(),
+                },
+                b"n",
+            ),
+            b"rename|5|n".to_vec()
+        );
+        assert_eq!(
+            encode_locedit_ops(&LocWrite::Delete { id: 7 }, b""),
+            b"del|7".to_vec()
+        );
+    }
+
+    #[test]
+    fn encode_location_name_matches_ascii_strx_utf8_and_legacy_cp949_rules() {
+        let korean = "공격지점";
+        let strx_chk = tool_test_section("STRx", &[]);
+        let str_chk = tool_test_section("STR ", &[]);
+        let (cp949, _, had_errors) = EUC_KR.encode(korean);
+        assert!(!had_errors);
+
+        assert_eq!(encode_location_name("spot", &strx_chk), b"spot".to_vec());
+        assert_eq!(
+            encode_location_name(korean, &strx_chk),
+            korean.as_bytes().to_vec()
+        );
+        assert_eq!(encode_location_name(korean, &str_chk), cp949.to_vec());
+    }
+
+    #[test]
+    fn location_write_apply_records_journal_and_returns_post_edit_digest() {
+        let data_dir = tool_test_temp_dir("location-write-apply");
+        let map_path = data_dir.join("demo.scx");
+        let pre_edit_chk = tool_test_chk_with_location(b"Existing");
+        let post_edit_chk = tool_test_chk_with_location(b"spot");
+        fs::write(&map_path, &pre_edit_chk).expect("temp map should be writable");
+
+        let map_safe = crate::mapsafe::MapSafe::new(
+            data_dir.clone(),
+            LocationWriteFakeStatus(false),
+            LocationWriteFakeLock(false),
+            LocationWriteFakeEngine::ok(post_edit_chk),
+        );
+        let journal = crate::journal::JournalStore::new(&data_dir);
+        let request_id = "req-location-write";
+
+        let result = location_write_apply(
+            &map_safe,
+            &journal,
+            request_id,
+            &map_path,
+            &pre_edit_chk,
+            &serde_json::json!({
+                "action": "add",
+                "name": "spot",
+                "tileLeft": 1,
+                "tileTop": 2,
+                "tileRight": 3,
+                "tileBottom": 4,
+            }),
+            1_781_000_000,
+        )
+        .expect("location_write add should apply through mapsafe and journal");
+
+        let expected_map_path = map_path.to_string_lossy().to_string();
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["action"], "add");
+        assert_eq!(result["mapPath"].as_str(), Some(expected_map_path.as_str()));
+        assert!(result["backupPath"]
+            .as_str()
+            .is_some_and(|path| !path.is_empty()));
+        assert!(result["locations"].is_array());
+        assert_eq!(journal.changeset(request_id).unwrap().items.len(), 1);
+    }
+
+    #[test]
+    fn location_write_apply_refuses_while_compiling() {
+        let data_dir = tool_test_temp_dir("location-write-compiling");
+        let map_path = data_dir.join("demo.scx");
+        let pre_edit_chk = tool_test_chk_with_location(b"Existing");
+        fs::write(&map_path, &pre_edit_chk).expect("temp map should be writable");
+
+        let map_safe = crate::mapsafe::MapSafe::new(
+            data_dir.clone(),
+            LocationWriteFakeStatus(true),
+            LocationWriteFakeLock(false),
+            LocationWriteFakeEngine::ok(pre_edit_chk.clone()),
+        );
+        let journal = crate::journal::JournalStore::new(&data_dir);
+
+        let error = location_write_apply(
+            &map_safe,
+            &journal,
+            "req-location-write-compiling",
+            &map_path,
+            &pre_edit_chk,
+            &serde_json::json!({
+                "action": "add",
+                "name": "spot",
+                "tileLeft": 1,
+                "tileTop": 2,
+                "tileRight": 3,
+                "tileBottom": 4,
+            }),
+            1_781_000_001,
+        )
+        .expect_err("location_write must reuse mapsafe compiling guard");
+
+        assert!(error.to_string().to_lowercase().contains("compil"));
+    }
+
+    #[test]
+    fn location_write_apply_restores_backup_on_verify_failure() {
+        let data_dir = tool_test_temp_dir("location-write-verify-fails");
+        let map_path = data_dir.join("demo.scx");
+        let pre_edit_chk = tool_test_chk_with_location(b"Existing");
+        let post_edit_chk = tool_test_chk_with_location(b"spot");
+        fs::write(&map_path, &pre_edit_chk).expect("temp map should be writable");
+
+        let map_safe = crate::mapsafe::MapSafe::new(
+            data_dir.clone(),
+            LocationWriteFakeStatus(false),
+            LocationWriteFakeLock(false),
+            LocationWriteFakeEngine::verify_fails(post_edit_chk),
+        );
+        let journal = crate::journal::JournalStore::new(&data_dir);
+        let request_id = "req-location-write-verify-fails";
+
+        let error = location_write_apply(
+            &map_safe,
+            &journal,
+            request_id,
+            &map_path,
+            &pre_edit_chk,
+            &serde_json::json!({
+                "action": "add",
+                "name": "spot",
+                "tileLeft": 1,
+                "tileTop": 2,
+                "tileRight": 3,
+                "tileBottom": 4,
+            }),
+            1_781_000_002,
+        )
+        .expect_err("verify failure must reject the location_write call");
+
+        let message = error.to_string();
+        assert!(message.contains("post-edit verification failed"));
+        assert!(message.contains("restored from backup"));
+        assert_eq!(
+            fs::read(&map_path).expect("map should remain readable"),
+            pre_edit_chk,
+            "verify failure must restore the pre-edit map bytes"
+        );
+        assert!(
+            matches!(
+                journal.changeset(request_id),
+                Err(crate::journal::JournalError::MissingJournal { .. })
+            ),
+            "reverted verify failures must not record a journal entry"
         );
     }
 

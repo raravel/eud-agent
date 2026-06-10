@@ -59,6 +59,8 @@ pub trait JournalBridge {
     fn plugin_remove(&self, plugin_id: &str) -> Result<(), Self::Error>;
 
     fn plugin_move(&self, plugin_id: &str, index: usize) -> Result<(), Self::Error>;
+
+    fn restore_map_backup(&self, map_path: &str, backup_path: &str) -> Result<(), Self::Error>;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -101,6 +103,7 @@ pub enum WriteTool {
     PluginEdit,
     PluginRemove,
     PluginMove,
+    LocationWrite,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -122,6 +125,10 @@ pub enum JournalTarget {
     },
     Plugin {
         plugin_id: String,
+    },
+    Map {
+        path: String,
+        summary: String,
     },
 }
 
@@ -154,6 +161,15 @@ pub enum Snapshot {
         index: usize,
     },
     PluginAbsent,
+    MapBackup {
+        map_path: String,
+        backup_path: String,
+    },
+    MapEdit {
+        action: String,
+        location_id: Option<i64>,
+        name: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -504,6 +520,12 @@ fn file_changeset_item(entry: &JournalEntry) -> Result<Option<ChangesetItem>, Jo
             properties: Vec::new(),
             diff: None,
         },
+        WriteTool::LocationWrite => ChangesetItem {
+            id: entry.id.clone(),
+            kind: location_write_changeset_kind(entry)?,
+            properties: location_write_changeset_properties(entry)?,
+            diff: None,
+        },
         WriteTool::DatSet
         | WriteTool::XdatSet
         | WriteTool::TblSet
@@ -513,6 +535,38 @@ fn file_changeset_item(entry: &JournalEntry) -> Result<Option<ChangesetItem>, Jo
         }
     };
     Ok(Some(item))
+}
+
+fn location_write_changeset_kind(entry: &JournalEntry) -> Result<ChangesetItemKind, JournalError> {
+    let Snapshot::MapEdit { action, .. } = &entry.after else {
+        return Err(invalid_entry(entry, "expected map edit after snapshot"));
+    };
+    match action.as_str() {
+        "add" => Ok(ChangesetItemKind::Created),
+        "delete" => Ok(ChangesetItemKind::Deleted),
+        "set" | "rename" => Ok(ChangesetItemKind::Modified),
+        _ => Err(invalid_entry(entry, "expected location_write action")),
+    }
+}
+
+fn location_write_changeset_properties(
+    entry: &JournalEntry,
+) -> Result<Vec<PropertyChange>, JournalError> {
+    let JournalTarget::Map { path, summary } = &entry.target else {
+        return Err(invalid_entry(entry, "expected map target"));
+    };
+    Ok(vec![
+        PropertyChange {
+            property: "summary".to_owned(),
+            old: serde_json::Value::Null,
+            new: serde_json::json!(summary),
+        },
+        PropertyChange {
+            property: "map".to_owned(),
+            old: serde_json::Value::Null,
+            new: serde_json::json!(path),
+        },
+    ])
 }
 
 fn unified_diff(path: &str, old: &str, new: &str) -> String {
@@ -625,6 +679,7 @@ fn reject_targets(entry: &JournalEntry) -> Result<Vec<RejectTarget>, JournalErro
         }
         JournalTarget::Setting { key } => vec![RejectTarget::Setting(key.clone())],
         JournalTarget::Plugin { .. } => plugin_targets(entry)?,
+        JournalTarget::Map { path, .. } => vec![RejectTarget::Path(path.clone())],
     };
     targets.dedup();
     Ok(targets)
@@ -778,6 +833,15 @@ where
                 )),
             }
         }
+        WriteTool::LocationWrite => match &entry.before {
+            Snapshot::MapBackup {
+                map_path,
+                backup_path,
+            } => bridge
+                .restore_map_backup(map_path, backup_path)
+                .map_err(bridge_error),
+            _ => Err(invalid_entry(entry, "expected map backup before snapshot")),
+        },
     }
 }
 
@@ -901,6 +965,10 @@ mod tests {
         PluginMove {
             plugin_id: String,
             index: usize,
+        },
+        RestoreMapBackup {
+            map_path: String,
+            backup_path: String,
         },
     }
 
@@ -1042,6 +1110,16 @@ mod tests {
             });
             Ok(())
         }
+
+        fn restore_map_backup(&self, map_path: &str, backup_path: &str) -> Result<(), Self::Error> {
+            self.ops
+                .borrow_mut()
+                .push(AppliedInverse::RestoreMapBackup {
+                    map_path: map_path.to_owned(),
+                    backup_path: backup_path.to_owned(),
+                });
+            Ok(())
+        }
     }
 
     fn temp_data_dir(test_name: &str) -> PathBuf {
@@ -1085,6 +1163,93 @@ mod tests {
         JournalTarget::Path {
             path: path.to_owned(),
         }
+    }
+
+    fn location_write_entry(
+        id: &str,
+        action: &str,
+        location_id: Option<i64>,
+        name: Option<&str>,
+    ) -> JournalEntry {
+        entry(
+            id,
+            1,
+            WriteTool::LocationWrite,
+            JournalTarget::Map {
+                path: "C:/maps/demo.scx".to_owned(),
+                summary: format!(
+                    "{} {}",
+                    action,
+                    name.map(str::to_owned)
+                        .or_else(|| location_id.map(|id| format!("#{id}")))
+                        .unwrap_or_else(|| "location".to_owned())
+                ),
+            },
+            Snapshot::MapBackup {
+                map_path: "C:/maps/demo.scx".to_owned(),
+                backup_path: "C:/Users/me/AppData/Roaming/eud-agent/map_backups/demo.bak"
+                    .to_owned(),
+            },
+            Snapshot::MapEdit {
+                action: action.to_owned(),
+                location_id,
+                name: name.map(str::to_owned),
+            },
+        )
+    }
+
+    #[test]
+    fn location_write_changeset_kind_follows_map_edit_action() {
+        for (action, expected_kind) in [
+            ("add", ChangesetItemKind::Created),
+            ("delete", ChangesetItemKind::Deleted),
+            ("set", ChangesetItemKind::Modified),
+            ("rename", ChangesetItemKind::Modified),
+        ] {
+            let journal = Journal {
+                request_id: format!("req-location-{action}"),
+                entries: vec![location_write_entry(
+                    &format!("loc-{action}"),
+                    action,
+                    Some(5),
+                    Some("spot"),
+                )],
+            };
+
+            let changeset = changeset_from_journal(&journal).unwrap();
+
+            assert_eq!(changeset.items.len(), 1);
+            assert_eq!(changeset.items[0].id, format!("loc-{action}"));
+            assert_eq!(changeset.items[0].kind, expected_kind);
+            assert!(changeset.items[0].properties.contains(&PropertyChange {
+                property: "summary".to_owned(),
+                old: serde_json::Value::Null,
+                new: json!(format!("{action} spot")),
+            }));
+            assert!(changeset.items[0].properties.contains(&PropertyChange {
+                property: "map".to_owned(),
+                old: serde_json::Value::Null,
+                new: json!("C:/maps/demo.scx"),
+            }));
+            assert!(changeset.items[0].diff.is_none());
+        }
+    }
+
+    #[test]
+    fn location_write_inverse_restores_recorded_map_backup() {
+        let entry = location_write_entry("loc-rename", "rename", Some(5), Some("spot"));
+        let bridge = FakeBridge::default();
+
+        apply_inverse(&entry, &bridge).expect("location_write inverse should restore backup");
+
+        assert_eq!(
+            bridge.ops(),
+            vec![AppliedInverse::RestoreMapBackup {
+                map_path: "C:/maps/demo.scx".to_owned(),
+                backup_path: "C:/Users/me/AppData/Roaming/eud-agent/map_backups/demo.bak"
+                    .to_owned(),
+            }]
+        );
     }
 
     #[test]

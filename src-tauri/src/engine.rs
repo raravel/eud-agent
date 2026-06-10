@@ -861,6 +861,10 @@ impl journal::JournalBridge for UnsupportedJournalBridge {
     fn plugin_move(&self, _plugin_id: &str, _index: usize) -> Result<(), Self::Error> {
         unsupported_rollback()
     }
+
+    fn restore_map_backup(&self, _map_path: &str, _backup_path: &str) -> Result<(), Self::Error> {
+        unsupported_rollback()
+    }
 }
 
 fn unsupported_rollback() -> Result<(), AgentEngineError> {

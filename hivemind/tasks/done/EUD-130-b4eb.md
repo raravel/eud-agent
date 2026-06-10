@@ -1,4 +1,5 @@
 ---
+completed_at: '2026-06-10T11:36:25.745571'
 created: '2026-06-09'
 depends_on:
 - EUD-128-daea
@@ -7,10 +8,12 @@ parent: EUD-127-e1a7
 priority: medium
 scope:
 - src-tauri/src/tools.rs
-status: pending
+- src-tauri/src/journal.rs
+- src-tauri/src/engine.rs
+status: done
 title: location_write Rust tool handler (MRGN CRUD via mapsafe + changeset/journal)
 type: task
-updated: '2026-06-09'
+updated: '2026-06-10'
 ---
 
 ## Description
