@@ -2245,15 +2245,15 @@
       "scope": []
     },
     "EUD-136-ea37": {
-      "status": "pending",
+      "status": "done",
       "priority": "medium",
       "type": "task",
       "parent": "EUD-135-2f41",
       "depends_on": [],
       "title": "build_rag_index reads in-repo corpus (--corpus, drop ECA default)",
       "updated": "2026-06-10",
-      "completed_at": null,
-      "path": "active/EUD-136-ea37.md",
+      "completed_at": "2026-06-10T14:33:48.895152",
+      "path": "done/EUD-136-ea37.md",
       "scope": [
         "ci/build_rag_index.rs"
       ]

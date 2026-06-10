@@ -15,14 +15,13 @@ const EMBED_DIM: usize = 1024;
 const INDEX_MAGIC: &[u8; 4] = b"ERAG";
 const INDEX_VERSION: u32 = 1;
 const INPUT_FILES: [&str; 3] = ["articles.jsonl", "eud_book.jsonl", "cafebook.jsonl"];
-const DEFAULT_ECA_DIR: &str = r"C:\Users\ifthe\proj\eud\ECA";
 const EMBED_BATCH_SIZE: usize = 16;
 const CHUNK_CHARS: usize = 2000;
 const CHUNK_OVERLAP: usize = 200;
 
 #[derive(Debug)]
 struct Args {
-    eca_dir: PathBuf,
+    corpus_dir: PathBuf,
     out: PathBuf,
     cache_dir: Option<PathBuf>,
 }
@@ -56,7 +55,7 @@ struct JsonlRow {
 
 fn main() -> Result<()> {
     let args = parse_args()?;
-    let docs = read_corpus(&args.eca_dir)?;
+    let docs = read_corpus(&args.corpus_dir)?;
     let entries = embed_docs(docs, args.cache_dir)?;
     write_index(&args.out, &entries)?;
     let digest = write_sha256_sidecar(&args.out)?;
@@ -71,19 +70,24 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+fn resolve_corpus_dir(cli: Option<PathBuf>, env: Option<PathBuf>) -> PathBuf {
+    cli.or(env).unwrap_or_else(|| PathBuf::from("ci/corpus"))
+}
+
 fn parse_args() -> Result<Args> {
-    let mut eca_dir = env::var_os("ECA_DIR").map(PathBuf::from);
+    let mut corpus_dir_cli = None;
+    let corpus_dir_env = env::var_os("CORPUS_DIR").map(PathBuf::from);
     let mut out = None;
     let mut cache_dir = None;
 
     let mut args = env::args_os().skip(1);
     while let Some(arg) = args.next() {
         match arg.to_string_lossy().as_ref() {
-            "--eca" => {
-                eca_dir = Some(PathBuf::from(
-                    args.next()
-                        .ok_or_else(|| anyhow!("--eca requires a directory path"))?,
-                ));
+            "--corpus" => {
+                corpus_dir_cli =
+                    Some(PathBuf::from(args.next().ok_or_else(|| {
+                        anyhow!("--corpus requires a directory path")
+                    })?));
             }
             "--out" => {
                 out =
@@ -106,7 +110,7 @@ fn parse_args() -> Result<Args> {
     }
 
     Ok(Args {
-        eca_dir: eca_dir.unwrap_or_else(|| PathBuf::from(DEFAULT_ECA_DIR)),
+        corpus_dir: resolve_corpus_dir(corpus_dir_cli, corpus_dir_env),
         out: out.unwrap_or_else(|| PathBuf::from("rag-index.bin")),
         cache_dir,
     })
@@ -114,16 +118,16 @@ fn parse_args() -> Result<Args> {
 
 fn print_usage() {
     eprintln!(
-        "usage: build_rag_index [--eca <dir>] [--out <file>] [--cache <dir>]\n\
-         defaults: --eca %ECA_DIR% or {DEFAULT_ECA_DIR}; --out rag-index.bin"
+        "usage: build_rag_index [--corpus <dir>] [--out <file>] [--cache <dir>]\n\
+         defaults: --corpus %CORPUS_DIR% or ci/corpus; --out rag-index.bin"
     );
 }
 
-fn read_corpus(eca_dir: &Path) -> Result<Vec<CorpusDoc>> {
+fn read_corpus(corpus_dir: &Path) -> Result<Vec<CorpusDoc>> {
     let mut docs = Vec::new();
 
     for file_name in INPUT_FILES {
-        let path = eca_dir.join(file_name);
+        let path = corpus_dir.join(file_name);
         let file =
             File::open(&path).with_context(|| format!("open JSONL input {}", path.display()))?;
         let reader = BufReader::new(file);
@@ -355,4 +359,17 @@ fn sha256_sidecar_path(path: &Path) -> PathBuf {
     let mut out = OsString::from(path.as_os_str());
     out.push(".sha256");
     PathBuf::from(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    #[test]
+    fn default_corpus_dir_is_repo_relative_ci_corpus() {
+        assert_eq!(
+            super::resolve_corpus_dir(None, None),
+            PathBuf::from("ci/corpus")
+        );
+    }
 }
