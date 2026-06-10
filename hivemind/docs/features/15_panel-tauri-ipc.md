@@ -85,3 +85,4 @@ raw `agent_event` kind identifiers as user-facing text.
 - removed: `panel/src/ws/client.ts`, `panel/src/ws/protocol.ts` (+ tests) once types move.
 - external: `@tauri-apps/api` ^2 (core `invoke` + `event`).
 - [BOUND 2026-06-09 from EUD-119-bc27] `panel/src/lib/protocol.ts` — sibling types module re-homed from `ws/protocol.ts` (ClientMessage/ServerMessage discriminated unions, type guards, and shared shapes FileEntry/ChangesetItem/Diagnostic/ProgressStage); re-exported by `lib/ipc.ts`.
+- [BOUND 2026-06-10 from EUD-120-ecca] `panel/src/components/ConnectionNotice.tsx` — editor-not-connected banner shown when store.editorConnected is false (stale bridge heartbeat); send is gated off via canSend
