@@ -2320,6 +2320,58 @@
       "scope": [
         ".github/workflows/build-rag-index.yml"
       ]
+    },
+    "EUD-141-46f1": {
+      "status": "pending",
+      "priority": "medium",
+      "type": "epic",
+      "parent": null,
+      "depends_on": [],
+      "title": "RAG index CI build performance",
+      "updated": "2026-06-10",
+      "completed_at": null,
+      "path": "active/EUD-141-46f1.md",
+      "scope": []
+    },
+    "EUD-142-784e": {
+      "status": "pending",
+      "priority": "medium",
+      "type": "story",
+      "parent": "EUD-141-46f1",
+      "depends_on": [],
+      "title": "Speed up build-rag-index workflow",
+      "updated": "2026-06-10",
+      "completed_at": null,
+      "path": "active/EUD-142-784e.md",
+      "scope": []
+    },
+    "EUD-143-b639": {
+      "status": "pending",
+      "priority": "medium",
+      "type": "task",
+      "parent": "EUD-142-784e",
+      "depends_on": [],
+      "title": "Migrate build-rag-index workflow to ubuntu-latest + cache fastembed model",
+      "updated": "2026-06-10",
+      "completed_at": null,
+      "path": "active/EUD-143-b639.md",
+      "scope": [
+        ".github/workflows/build-rag-index.yml"
+      ]
+    },
+    "EUD-144-013d": {
+      "status": "pending",
+      "priority": "low",
+      "type": "task",
+      "parent": "EUD-142-784e",
+      "depends_on": [],
+      "title": "Tune embedding batch/thread settings in build_rag_index",
+      "updated": "2026-06-10",
+      "completed_at": null,
+      "path": "active/EUD-144-013d.md",
+      "scope": [
+        "ci/build_rag_index.rs"
+      ]
     }
   }
 }
