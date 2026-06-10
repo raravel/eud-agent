@@ -164,3 +164,7 @@ and server spawning are REMOVED.
 - Single editor instance per machine is the supported topology (documented limitation).
 - Windows E2E steps needing the editor GUI are user-assisted; everything else verifiable
   headless via verify.md.
+
+## Learned rules
+
+- [LEARNED 2026-06-10 from EUD-144-013d] NEVER change `DEFAULT_BATCH_SIZE` (16) in `ci/build_rag_index.rs` and NEVER pass `--batch`/`BATCH_SIZE` in the CI index build: BGEM3Q int8 embeddings shift ~2% with batch size (measured EUD-144, cosine ~0.98), so any other batch breaks byte-equivalence with the published rag-index v1 and the EUD-107-verified embedding space. `--batch` exists only for local throughput experiments whose output is discarded. ORT intra-op threads are output-neutral (safe).
