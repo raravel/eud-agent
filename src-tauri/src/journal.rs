@@ -104,6 +104,7 @@ pub enum WriteTool {
     PluginRemove,
     PluginMove,
     LocationWrite,
+    PlayerSetup,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -526,6 +527,12 @@ fn file_changeset_item(entry: &JournalEntry) -> Result<Option<ChangesetItem>, Jo
             properties: location_write_changeset_properties(entry)?,
             diff: None,
         },
+        WriteTool::PlayerSetup => ChangesetItem {
+            id: entry.id.clone(),
+            kind: ChangesetItemKind::Modified,
+            properties: location_write_changeset_properties(entry)?,
+            diff: None,
+        },
         WriteTool::DatSet
         | WriteTool::XdatSet
         | WriteTool::TblSet
@@ -833,7 +840,7 @@ where
                 )),
             }
         }
-        WriteTool::LocationWrite => match &entry.before {
+        WriteTool::LocationWrite | WriteTool::PlayerSetup => match &entry.before {
             Snapshot::MapBackup {
                 map_path,
                 backup_path,
@@ -1198,6 +1205,28 @@ mod tests {
         )
     }
 
+    fn player_setup_entry(id: &str, action: &str, summary: &str) -> JournalEntry {
+        entry(
+            id,
+            1,
+            WriteTool::PlayerSetup,
+            JournalTarget::Map {
+                path: "C:/maps/demo.scx".to_owned(),
+                summary: summary.to_owned(),
+            },
+            Snapshot::MapBackup {
+                map_path: "C:/maps/demo.scx".to_owned(),
+                backup_path: "C:/Users/me/AppData/Roaming/eud-agent/map_backups/demo.bak"
+                    .to_owned(),
+            },
+            Snapshot::MapEdit {
+                action: action.to_owned(),
+                location_id: None,
+                name: None,
+            },
+        )
+    }
+
     #[test]
     fn location_write_changeset_kind_follows_map_edit_action() {
         for (action, expected_kind) in [
@@ -1241,6 +1270,52 @@ mod tests {
         let bridge = FakeBridge::default();
 
         apply_inverse(&entry, &bridge).expect("location_write inverse should restore backup");
+
+        assert_eq!(
+            bridge.ops(),
+            vec![AppliedInverse::RestoreMapBackup {
+                map_path: "C:/maps/demo.scx".to_owned(),
+                backup_path: "C:/Users/me/AppData/Roaming/eud-agent/map_backups/demo.bak"
+                    .to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn player_setup_changeset_reuses_map_summary_and_marks_modified() {
+        let journal = Journal {
+            request_id: "req-player-setup".to_owned(),
+            entries: vec![player_setup_entry(
+                "plr-1",
+                "controller",
+                "P1 controller = human",
+            )],
+        };
+
+        let changeset = changeset_from_journal(&journal).unwrap();
+
+        assert_eq!(changeset.items.len(), 1);
+        assert_eq!(changeset.items[0].id, "plr-1");
+        assert_eq!(changeset.items[0].kind, ChangesetItemKind::Modified);
+        assert!(changeset.items[0].properties.contains(&PropertyChange {
+            property: "summary".to_owned(),
+            old: serde_json::Value::Null,
+            new: json!("P1 controller = human"),
+        }));
+        assert!(changeset.items[0].properties.contains(&PropertyChange {
+            property: "map".to_owned(),
+            old: serde_json::Value::Null,
+            new: json!("C:/maps/demo.scx"),
+        }));
+        assert!(changeset.items[0].diff.is_none());
+    }
+
+    #[test]
+    fn player_setup_inverse_restores_recorded_map_backup() {
+        let entry = player_setup_entry("plr-1", "controller", "P1 controller = human");
+        let bridge = FakeBridge::default();
+
+        apply_inverse(&entry, &bridge).expect("player_setup inverse should restore backup");
 
         assert_eq!(
             bridge.ops(),

@@ -1118,6 +1118,96 @@ pub fn encode_location_name(name: &str, chk: &[u8]) -> Vec<u8> {
     EUC_KR.encode(name).0.into_owned()
 }
 
+/// Parsed `player_setup` operation. Players are 1-based P1..P8 until encoded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlayerEdit {
+    Start {
+        player: i64,
+        tile_x: i64,
+        tile_y: i64,
+    },
+    DelStart {
+        player: i64,
+    },
+    Controller {
+        player: i64,
+        controller: String,
+    },
+}
+
+pub fn parse_player_setup(args: &Value) -> ToolResult<PlayerEdit> {
+    let Some(object) = args.as_object() else {
+        return Err(player_setup_error(
+            "arguments must be a JSON object with action start|delstart|controller",
+        ));
+    };
+    let action = object
+        .get("action")
+        .and_then(Value::as_str)
+        .ok_or_else(|| player_setup_error("missing required field action"))?;
+    let player = required_player_setup_player(object)?;
+
+    match action {
+        "start" => {
+            let tile_x = required_player_setup_i64(object, "tileX")?;
+            let tile_y = required_player_setup_i64(object, "tileY")?;
+            if tile_x < 0 || tile_y < 0 {
+                return Err(player_setup_error("tileX and tileY must be >= 0"));
+            }
+            Ok(PlayerEdit::Start {
+                player,
+                tile_x,
+                tile_y,
+            })
+        }
+        "delstart" => Ok(PlayerEdit::DelStart { player }),
+        "controller" => {
+            let controller = object
+                .get("controller")
+                .and_then(Value::as_str)
+                .ok_or_else(|| player_setup_error("missing required field controller"))?;
+            if !matches!(
+                controller,
+                "human" | "computer" | "rescuable" | "neutral" | "inactive" | "closed"
+            ) {
+                return Err(player_setup_error(
+                    "controller must be one of human, computer, rescuable, neutral, inactive, or closed",
+                ));
+            }
+            Ok(PlayerEdit::Controller {
+                player,
+                controller: controller.to_owned(),
+            })
+        }
+        other => Err(player_setup_error(format!(
+            "invalid action {other:?}; expected start, delstart, or controller"
+        ))),
+    }
+}
+
+pub fn encode_playeredit_ops(op: &PlayerEdit) -> Vec<u8> {
+    match op {
+        PlayerEdit::Start {
+            player,
+            tile_x,
+            tile_y,
+        } => {
+            let slot = player - 1;
+            let x = tile_x * 32 + 16;
+            let y = tile_y * 32 + 16;
+            format!("start|{slot}|{x}|{y}").into_bytes()
+        }
+        PlayerEdit::DelStart { player } => {
+            let slot = player - 1;
+            format!("delstart|{slot}").into_bytes()
+        }
+        PlayerEdit::Controller { player, controller } => {
+            let slot = player - 1;
+            format!("controller|{slot}|{controller}").into_bytes()
+        }
+    }
+}
+
 pub fn location_write_apply<S, L, E>(
     map_safe: &crate::mapsafe::MapSafe<S, L, E>,
     journal: &crate::journal::JournalStore,
@@ -1244,6 +1334,123 @@ where
     location_write_apply(map_safe, journal, request_id, path, &chk, args, ts)
 }
 
+pub fn player_setup_apply<S, L, E>(
+    map_safe: &crate::mapsafe::MapSafe<S, L, E>,
+    journal: &crate::journal::JournalStore,
+    request_id: &str,
+    map_path: &Path,
+    args: &Value,
+    ts: u64,
+) -> ToolResult<Value>
+where
+    S: crate::mapsafe::CompilingStatus,
+    L: crate::mapsafe::LockProbe,
+    E: crate::mapsafe::MapEngine,
+{
+    let op = parse_player_setup(args)?;
+    let ops = encode_playeredit_ops(&op);
+    let backup = match map_safe.write(map_path, crate::mapsafe::OpKind::PlayerEdit, &ops) {
+        Ok(entry) => entry,
+        Err(error) => {
+            return Err(player_setup_mapsafe_error(map_safe, map_path, error));
+        }
+    };
+
+    let post_chk = match isom::chk_extract(map_path) {
+        Ok(chk) => chk,
+        Err(isom_error) => std::fs::read(map_path).map_err(|read_error| {
+            player_setup_error(format!(
+                "post-edit CHK extraction failed for {}: {isom_error}; raw CHK fallback failed: {read_error}",
+                map_path.display()
+            ))
+        })?,
+    };
+    let post_digest = crate::chk::digest_chk(&post_chk);
+
+    let existing = match journal.changeset(request_id) {
+        Ok(changeset) => changeset.items.len() as u64,
+        Err(crate::journal::JournalError::MissingJournal { .. }) => 0,
+        Err(error) => return Err(player_setup_error(error.to_string())),
+    };
+    let seq = existing + 1;
+    let entry = crate::journal::JournalEntry {
+        id: format!("plr-{seq}"),
+        seq,
+        tool: crate::journal::WriteTool::PlayerSetup,
+        target: crate::journal::JournalTarget::Map {
+            path: map_path.to_string_lossy().to_string(),
+            summary: player_setup_summary(&op),
+        },
+        before: crate::journal::Snapshot::MapBackup {
+            map_path: backup.map_path.to_string_lossy().to_string(),
+            backup_path: backup.backup_path.to_string_lossy().to_string(),
+        },
+        after: crate::journal::Snapshot::MapEdit {
+            action: op.action().to_string(),
+            location_id: None,
+            name: None,
+        },
+        ts,
+    };
+    journal
+        .record(request_id, entry)
+        .map_err(|error| player_setup_error(error.to_string()))?;
+
+    Ok(json!({
+        "ok": true,
+        "action": op.action(),
+        "player": op.player(),
+        "mapPath": map_path.to_string_lossy().to_string(),
+        "backupPath": backup.backup_path.to_string_lossy().to_string(),
+        "players": post_digest.players,
+        "startLocations": post_digest.start_locations,
+    }))
+}
+
+pub fn player_setup<S, L, E>(
+    bridge: &crate::bridge_io::BridgeIo,
+    map_safe: &crate::mapsafe::MapSafe<S, L, E>,
+    journal: &crate::journal::JournalStore,
+    request_id: &str,
+    args: &Value,
+) -> ToolResult<Value>
+where
+    S: crate::mapsafe::CompilingStatus,
+    L: crate::mapsafe::LockProbe,
+    E: crate::mapsafe::MapEngine,
+{
+    let map_path_reply = bridge
+        .send(
+            "GETSET project|OpenMapName",
+            &crate::bridge_io::SendOpts::default(),
+            None,
+        )
+        .map_err(|error| {
+            player_setup_error(format!("bridge GETSET OpenMapName failed: {error}"))
+        })?;
+    let map_path = parse_open_map_name_reply(&map_path_reply);
+    if map_path.is_empty() {
+        return Err(player_setup_error(
+            "bridge returned an empty project OpenMapName; open or configure a source map",
+        ));
+    }
+
+    let path = Path::new(map_path);
+    let metadata = std::fs::metadata(path).map_err(|error| {
+        player_setup_error(format!(
+            "source map file is missing or unreadable: {map_path} ({error})"
+        ))
+    })?;
+    if !metadata.is_file() {
+        return Err(player_setup_error(format!(
+            "source map path is not a file: {map_path}"
+        )));
+    }
+
+    let ts = saved_at_epoch_seconds(SystemTime::now());
+    player_setup_apply(map_safe, journal, request_id, path, args, ts)
+}
+
 impl LocWrite {
     fn action(&self) -> &'static str {
         match self {
@@ -1265,6 +1472,24 @@ impl LocWrite {
         match self {
             Self::Add { .. } => None,
             Self::Set { id, .. } | Self::Rename { id, .. } | Self::Delete { id } => Some(*id),
+        }
+    }
+}
+
+impl PlayerEdit {
+    fn action(&self) -> &'static str {
+        match self {
+            Self::Start { .. } => "start",
+            Self::DelStart { .. } => "delstart",
+            Self::Controller { .. } => "controller",
+        }
+    }
+
+    fn player(&self) -> i64 {
+        match self {
+            Self::Start { player, .. }
+            | Self::DelStart { player }
+            | Self::Controller { player, .. } => *player,
         }
     }
 }
@@ -1324,6 +1549,27 @@ fn required_i64(object: &Map<String, Value>, field: &str) -> ToolResult<i64> {
         return Ok(value);
     }
     Err(location_write_error(format!("{field} must be an integer")))
+}
+
+fn required_player_setup_i64(object: &Map<String, Value>, field: &str) -> ToolResult<i64> {
+    let value = object
+        .get(field)
+        .ok_or_else(|| player_setup_error(format!("missing required field {field}")))?;
+    if let Some(value) = value.as_i64() {
+        return Ok(value);
+    }
+    if let Some(value) = value.as_u64().and_then(|value| i64::try_from(value).ok()) {
+        return Ok(value);
+    }
+    Err(player_setup_error(format!("{field} must be an integer")))
+}
+
+fn required_player_setup_player(object: &Map<String, Value>) -> ToolResult<i64> {
+    let player = required_player_setup_i64(object, "player")?;
+    if !(1..=8).contains(&player) {
+        return Err(player_setup_error("player must be 1..8 (P1..P8)"));
+    }
+    Ok(player)
 }
 
 fn optional_bool(object: &Map<String, Value>, field: &str) -> bool {
@@ -1392,6 +1638,20 @@ fn location_write_summary(op: &LocWrite) -> String {
     }
 }
 
+fn player_setup_summary(op: &PlayerEdit) -> String {
+    match op {
+        PlayerEdit::Start {
+            player,
+            tile_x,
+            tile_y,
+        } => format!("P{player} start at tile ({tile_x},{tile_y})"),
+        PlayerEdit::DelStart { player } => format!("P{player} start removed"),
+        PlayerEdit::Controller { player, controller } => {
+            format!("P{player} controller = {controller}")
+        }
+    }
+}
+
 fn location_write_mapsafe_error<S, L, E>(
     map_safe: &crate::mapsafe::MapSafe<S, L, E>,
     map_path: &Path,
@@ -1423,6 +1683,40 @@ where
             "compiling guard refused: the editor is building right now; retry after the build finishes",
         ),
         _ => location_write_error(error.to_string()),
+    }
+}
+
+fn player_setup_mapsafe_error<S, L, E>(
+    map_safe: &crate::mapsafe::MapSafe<S, L, E>,
+    map_path: &Path,
+    error: crate::mapsafe::MapSafeError,
+) -> ToolError
+where
+    S: crate::mapsafe::CompilingStatus,
+    L: crate::mapsafe::LockProbe,
+    E: crate::mapsafe::MapEngine,
+{
+    match error {
+        crate::mapsafe::MapSafeError::Verify { detail, backup } => {
+            let entry = crate::mapsafe::JournalEntry {
+                map_path: map_path.to_path_buf(),
+                backup_path: backup.clone(),
+            };
+            match map_safe.restore(&entry) {
+                Ok(()) => player_setup_error(format!(
+                    "post-edit verification failed ({detail}); the map was restored from backup {}",
+                    backup.display()
+                )),
+                Err(restore_error) => player_setup_error(format!(
+                    "post-edit verification failed ({detail}); restore from backup {} also failed: {restore_error}. Recover manually from this backup.",
+                    backup.display()
+                )),
+            }
+        }
+        crate::mapsafe::MapSafeError::Compiling => player_setup_error(
+            "compiling guard refused: the editor is building right now; retry after the build finishes",
+        ),
+        _ => player_setup_error(error.to_string()),
     }
 }
 
@@ -1676,6 +1970,12 @@ fn location_write_error(message: impl Into<String>) -> ToolError {
     }
 }
 
+fn player_setup_error(message: impl Into<String>) -> ToolError {
+    ToolError::AdmissionRejected {
+        message: format!("player_setup: {}", message.into()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1721,6 +2021,67 @@ mod tests {
                 digest_result: Err("unreadable post-edit CHK".to_owned()),
                 apply_called: Cell::new(false),
             }
+        }
+    }
+
+    struct PlayerSetupFakeStatus(bool);
+
+    impl crate::mapsafe::CompilingStatus for PlayerSetupFakeStatus {
+        fn is_compiling(&self) -> bool {
+            self.0
+        }
+    }
+
+    struct PlayerSetupFakeLock(bool);
+
+    impl crate::mapsafe::LockProbe for PlayerSetupFakeLock {
+        fn is_locked(&self, _path: &Path) -> bool {
+            self.0
+        }
+    }
+
+    struct PlayerSetupFakeEngine {
+        applied_bytes: Vec<u8>,
+        digest_result: Result<Vec<u8>, String>,
+        apply_called: Cell<bool>,
+    }
+
+    impl PlayerSetupFakeEngine {
+        fn ok(chk_after_apply: Vec<u8>) -> Self {
+            Self {
+                applied_bytes: chk_after_apply.clone(),
+                digest_result: Ok(chk_after_apply),
+                apply_called: Cell::new(false),
+            }
+        }
+
+        fn verify_fails(applied_bytes: Vec<u8>) -> Self {
+            Self {
+                applied_bytes,
+                digest_result: Err("unreadable post-edit CHK".to_owned()),
+                apply_called: Cell::new(false),
+            }
+        }
+    }
+
+    impl crate::mapsafe::MapEngine for PlayerSetupFakeEngine {
+        fn apply(
+            &self,
+            map: &Path,
+            kind: crate::mapsafe::OpKind,
+            ops: &[u8],
+        ) -> Result<(), String> {
+            assert_eq!(kind, crate::mapsafe::OpKind::PlayerEdit);
+            assert!(
+                ops.starts_with(b"controller|"),
+                "player_setup controller should encode a playeredit controller op"
+            );
+            self.apply_called.set(true);
+            fs::write(map, &self.applied_bytes).map_err(|error| error.to_string())
+        }
+
+        fn digest(&self, _map: &Path) -> Result<Vec<u8>, String> {
+            self.digest_result.clone()
         }
     }
 
@@ -1814,6 +2175,43 @@ mod tests {
         chk.extend_from_slice(&tool_test_section("ERA ", &era));
         chk.extend_from_slice(&tool_test_section("STRx", &strx));
         chk.extend_from_slice(&tool_test_section("MRGN", &mrgn));
+        chk
+    }
+
+    fn tool_test_unit_entry(
+        x: u16,
+        y: u16,
+        type_id: u16,
+        owner: u8,
+    ) -> [u8; crate::chk::UNIT_ENTRY_SIZE] {
+        let mut out = [0u8; crate::chk::UNIT_ENTRY_SIZE];
+        out[4..6].copy_from_slice(&x.to_le_bytes());
+        out[6..8].copy_from_slice(&y.to_le_bytes());
+        out[8..10].copy_from_slice(&type_id.to_le_bytes());
+        out[16] = owner;
+        out[17] = 100;
+        out[18] = 100;
+        out[19] = 100;
+        out
+    }
+
+    fn tool_test_chk_with_player(controller: u8, start_x: u16, start_y: u16) -> Vec<u8> {
+        let dim = [64u16.to_le_bytes(), 128u16.to_le_bytes()].concat();
+        let era = 3u16.to_le_bytes();
+        let mut ownr = vec![0u8; 12];
+        ownr[0] = controller;
+        let mut side = vec![7u8; 12];
+        side[0] = 1;
+        let forc = vec![0u8; 20];
+        let units = tool_test_unit_entry(start_x, start_y, crate::chk::_START_LOCATION_TYPE, 0);
+
+        let mut chk = Vec::new();
+        chk.extend_from_slice(&tool_test_section("DIM ", &dim));
+        chk.extend_from_slice(&tool_test_section("ERA ", &era));
+        chk.extend_from_slice(&tool_test_section("OWNR", &ownr));
+        chk.extend_from_slice(&tool_test_section("SIDE", &side));
+        chk.extend_from_slice(&tool_test_section("FORC", &forc));
+        chk.extend_from_slice(&tool_test_section("UNIT", &units));
         chk
     }
 
@@ -2300,6 +2698,213 @@ mod tests {
             1_781_000_002,
         )
         .expect_err("verify failure must reject the location_write call");
+
+        let message = error.to_string();
+        assert!(message.contains("post-edit verification failed"));
+        assert!(message.contains("restored from backup"));
+        assert_eq!(
+            fs::read(&map_path).expect("map should remain readable"),
+            pre_edit_chk,
+            "verify failure must restore the pre-edit map bytes"
+        );
+        assert!(
+            matches!(
+                journal.changeset(request_id),
+                Err(crate::journal::JournalError::MissingJournal { .. })
+            ),
+            "reverted verify failures must not record a journal entry"
+        );
+    }
+
+    #[test]
+    fn player_setup_parse_accepts_valid_action_shapes() {
+        assert_eq!(
+            parse_player_setup(&serde_json::json!({
+                "action": "start",
+                "player": 1,
+                "tileX": 4,
+                "tileY": 8,
+            }))
+            .unwrap(),
+            PlayerEdit::Start {
+                player: 1,
+                tile_x: 4,
+                tile_y: 8,
+            }
+        );
+        assert_eq!(
+            parse_player_setup(&serde_json::json!({
+                "action": "delstart",
+                "player": 3,
+            }))
+            .unwrap(),
+            PlayerEdit::DelStart { player: 3 }
+        );
+        assert_eq!(
+            parse_player_setup(&serde_json::json!({
+                "action": "controller",
+                "player": 2,
+                "controller": "human",
+            }))
+            .unwrap(),
+            PlayerEdit::Controller {
+                player: 2,
+                controller: "human".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn player_setup_parse_rejects_missing_or_invalid_fields() {
+        for args in [
+            serde_json::json!({}),
+            serde_json::json!({"action": "bogus", "player": 1}),
+            serde_json::json!({"action": "start", "player": 0, "tileX": 4, "tileY": 8}),
+            serde_json::json!({"action": "start", "player": 9, "tileX": 4, "tileY": 8}),
+            serde_json::json!({"action": "start", "player": 1, "tileY": 8}),
+            serde_json::json!({"action": "start", "player": 1, "tileX": 4}),
+            serde_json::json!({"action": "controller", "player": 1}),
+            serde_json::json!({"action": "controller", "player": 1, "controller": "bogus"}),
+        ] {
+            assert!(
+                matches!(
+                    parse_player_setup(&args),
+                    Err(ToolError::AdmissionRejected { .. })
+                ),
+                "expected player_setup parse rejection for {args}"
+            );
+        }
+    }
+
+    #[test]
+    fn encode_playeredit_ops_renders_zero_based_slots_and_tile_center_pixels() {
+        assert_eq!(
+            encode_playeredit_ops(&PlayerEdit::Start {
+                player: 1,
+                tile_x: 4,
+                tile_y: 8,
+            }),
+            b"start|0|144|272".to_vec()
+        );
+        assert_eq!(
+            encode_playeredit_ops(&PlayerEdit::DelStart { player: 3 }),
+            b"delstart|2".to_vec()
+        );
+        assert_eq!(
+            encode_playeredit_ops(&PlayerEdit::Controller {
+                player: 2,
+                controller: "human".to_owned(),
+            }),
+            b"controller|1|human".to_vec()
+        );
+    }
+
+    #[test]
+    fn player_setup_apply_records_journal_and_returns_post_edit_digest() {
+        let data_dir = tool_test_temp_dir("player-setup-apply");
+        let map_path = data_dir.join("demo.scx");
+        let pre_edit_chk = tool_test_chk_with_player(0, 80, 80);
+        let post_edit_chk = tool_test_chk_with_player(6, 80, 80);
+        fs::write(&map_path, &pre_edit_chk).expect("temp map should be writable");
+
+        let map_safe = crate::mapsafe::MapSafe::new(
+            data_dir.clone(),
+            PlayerSetupFakeStatus(false),
+            PlayerSetupFakeLock(false),
+            PlayerSetupFakeEngine::ok(post_edit_chk),
+        );
+        let journal = crate::journal::JournalStore::new(&data_dir);
+        let request_id = "req-player-setup";
+
+        let result = player_setup_apply(
+            &map_safe,
+            &journal,
+            request_id,
+            &map_path,
+            &serde_json::json!({
+                "action": "controller",
+                "player": 1,
+                "controller": "human",
+            }),
+            1_781_000_003,
+        )
+        .expect("player_setup controller should apply through mapsafe and journal");
+
+        let expected_map_path = map_path.to_string_lossy().to_string();
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["action"], "controller");
+        assert_eq!(result["player"], 1);
+        assert_eq!(result["mapPath"].as_str(), Some(expected_map_path.as_str()));
+        assert!(result["backupPath"]
+            .as_str()
+            .is_some_and(|path| !path.is_empty()));
+        assert!(result["players"].is_array());
+        assert!(result["startLocations"].is_array());
+        assert_eq!(journal.changeset(request_id).unwrap().items.len(), 1);
+    }
+
+    #[test]
+    fn player_setup_apply_refuses_while_compiling() {
+        let data_dir = tool_test_temp_dir("player-setup-compiling");
+        let map_path = data_dir.join("demo.scx");
+        let pre_edit_chk = tool_test_chk_with_player(0, 80, 80);
+        fs::write(&map_path, &pre_edit_chk).expect("temp map should be writable");
+
+        let map_safe = crate::mapsafe::MapSafe::new(
+            data_dir.clone(),
+            PlayerSetupFakeStatus(true),
+            PlayerSetupFakeLock(false),
+            PlayerSetupFakeEngine::ok(pre_edit_chk.clone()),
+        );
+        let journal = crate::journal::JournalStore::new(&data_dir);
+
+        let error = player_setup_apply(
+            &map_safe,
+            &journal,
+            "req-player-setup-compiling",
+            &map_path,
+            &serde_json::json!({
+                "action": "controller",
+                "player": 1,
+                "controller": "human",
+            }),
+            1_781_000_004,
+        )
+        .expect_err("player_setup must reuse mapsafe compiling guard");
+
+        assert!(error.to_string().to_lowercase().contains("compil"));
+    }
+
+    #[test]
+    fn player_setup_apply_restores_backup_on_verify_failure() {
+        let data_dir = tool_test_temp_dir("player-setup-verify-fails");
+        let map_path = data_dir.join("demo.scx");
+        let pre_edit_chk = tool_test_chk_with_player(0, 80, 80);
+        let post_edit_chk = tool_test_chk_with_player(6, 80, 80);
+        fs::write(&map_path, &pre_edit_chk).expect("temp map should be writable");
+
+        let map_safe = crate::mapsafe::MapSafe::new(
+            data_dir.clone(),
+            PlayerSetupFakeStatus(false),
+            PlayerSetupFakeLock(false),
+            PlayerSetupFakeEngine::verify_fails(post_edit_chk),
+        );
+        let journal = crate::journal::JournalStore::new(&data_dir);
+        let request_id = "req-player-setup-verify-fails";
+
+        let error = player_setup_apply(
+            &map_safe,
+            &journal,
+            request_id,
+            &map_path,
+            &serde_json::json!({
+                "action": "controller",
+                "player": 1,
+                "controller": "human",
+            }),
+            1_781_000_005,
+        )
+        .expect_err("verify failure must reject the player_setup call");
 
         let message = error.to_string();
         assert!(message.contains("post-edit verification failed"));

@@ -2103,7 +2103,7 @@
       ]
     },
     "EUD-127-e1a7": {
-      "status": "pending",
+      "status": "done",
       "priority": "high",
       "type": "story",
       "parent": "EUD-090-b768",
@@ -2111,9 +2111,9 @@
         "EUD-092-121b"
       ],
       "title": "S8 Rust map tools (map_info/location_write/player_setup + isom MapEngine)",
-      "updated": "2026-06-09",
-      "completed_at": null,
-      "path": "active/EUD-127-e1a7.md",
+      "updated": "2026-06-10",
+      "completed_at": "2026-06-10T12:02:01.378885",
+      "path": "done/EUD-127-e1a7.md",
       "scope": []
     },
     "EUD-128-daea": {
@@ -2169,7 +2169,7 @@
       ]
     },
     "EUD-131-6134": {
-      "status": "pending",
+      "status": "done",
       "priority": "medium",
       "type": "task",
       "parent": "EUD-127-e1a7",
@@ -2177,11 +2177,12 @@
         "EUD-128-daea"
       ],
       "title": "player_setup Rust tool handler (start locations + OWNR via playeredit)",
-      "updated": "2026-06-09",
-      "completed_at": null,
-      "path": "active/EUD-131-6134.md",
+      "updated": "2026-06-10",
+      "completed_at": "2026-06-10T12:02:01.345690",
+      "path": "done/EUD-131-6134.md",
       "scope": [
-        "src-tauri/src/tools.rs"
+        "src-tauri/src/tools.rs",
+        "src-tauri/src/journal.rs"
       ]
     },
     "EUD-132-0829": {
