@@ -2374,27 +2374,27 @@
       ]
     },
     "EUD-145-d77d": {
-      "status": "pending",
+      "status": "done",
       "priority": "high",
       "type": "epic",
       "parent": null,
       "depends_on": [],
       "title": "v2 core runtime wiring (bridge IPC + project memory)",
       "updated": "2026-06-10",
-      "completed_at": null,
-      "path": "active/EUD-145-d77d.md",
+      "completed_at": "2026-06-10T22:29:51.754301",
+      "path": "done/EUD-145-d77d.md",
       "scope": []
     },
     "EUD-146-dd74": {
-      "status": "pending",
+      "status": "done",
       "priority": "high",
       "type": "story",
       "parent": "EUD-145-d77d",
       "depends_on": [],
       "title": "Wire status/list and memory IPC into the live core",
       "updated": "2026-06-10",
-      "completed_at": null,
-      "path": "active/EUD-146-dd74.md",
+      "completed_at": "2026-06-10T22:29:51.725802",
+      "path": "done/EUD-146-dd74.md",
       "scope": []
     },
     "EUD-147-4c22": {
@@ -2415,7 +2415,7 @@
       ]
     },
     "EUD-148-358a": {
-      "status": "pending",
+      "status": "done",
       "priority": "high",
       "type": "task",
       "parent": "EUD-146-dd74",
@@ -2424,8 +2424,8 @@
       ],
       "title": "memory_get/memory_save commands + per-turn [project memory] injection + episodes",
       "updated": "2026-06-10",
-      "completed_at": null,
-      "path": "active/EUD-148-358a.md",
+      "completed_at": "2026-06-10T22:29:51.689239",
+      "path": "done/EUD-148-358a.md",
       "scope": [
         "src-tauri/src/ipc.rs",
         "src-tauri/src/memory.rs",

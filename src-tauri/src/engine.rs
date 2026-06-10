@@ -7,7 +7,10 @@
 use std::{
     fmt,
     path::PathBuf,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -25,6 +28,7 @@ eud-tools below; the server validates, journals, and can roll back \
 every change.";
 
 const TOOL_CATALOG_PLACEHOLDER: &str = "[tools]\n(tool catalog pending EUD-114)";
+const EPISODE_INSTRUCTION_CHARS: usize = 200;
 
 const EPSCRIPT_GUIDE: &str = r#"[epscript]
 - ALL code you write is epScript (*.eps, the C-like language compiled by euddraft's epscript->eudplib pipeline). Write epScript ONLY.
@@ -113,11 +117,21 @@ pub(crate) trait EventSink {
     fn emit(&self, event: EngineEvent) -> Result<(), AgentEngineError>;
 }
 
-#[derive(Debug, Clone)]
+/// Provides per-turn project memory rendering and best-effort episode recording.
+pub trait MemoryProvider: Send + Sync {
+    /// Render the `[project memory]` prompt section for the current project state.
+    fn render_section(&self) -> String;
+
+    /// Append one episode JSON value. Returns `false` when the append was skipped or failed.
+    fn append_episode(&self, episode: &serde_json::Value) -> bool;
+}
+
+#[derive(Clone)]
 pub struct AgentEngineConfig {
     project_state: String,
     project_memory: Option<String>,
     rag_hits: Vec<crate::rag::Hit>,
+    memory_provider: Option<Arc<dyn MemoryProvider>>,
 }
 
 impl AgentEngineConfig {
@@ -130,6 +144,7 @@ impl AgentEngineConfig {
             project_state: project_state.into(),
             project_memory,
             rag_hits,
+            memory_provider: None,
         }
     }
 
@@ -139,6 +154,26 @@ impl AgentEngineConfig {
         rag_hits: Vec<crate::rag::Hit>,
     ) -> Self {
         Self::new(project_state, project_memory, rag_hits)
+    }
+
+    pub fn with_memory_provider(mut self, provider: Arc<dyn MemoryProvider>) -> Self {
+        self.memory_provider = Some(provider);
+        self
+    }
+
+    fn project_memory_for_prompt(&self) -> Option<String> {
+        self.memory_provider
+            .as_ref()
+            .map(|provider| provider.render_section())
+            .or_else(|| self.project_memory.clone())
+    }
+
+    fn append_episode(&self, episode: &serde_json::Value) {
+        if let Some(provider) = &self.memory_provider {
+            if !provider.append_episode(episode) {
+                eprintln!("project memory episode append was skipped or failed");
+            }
+        }
     }
 }
 
@@ -161,11 +196,14 @@ pub(crate) struct AgentEngine<D: CodexDriver, S: EventSink> {
     plan_revision: u32,
     request_state: Option<tools::RequestState>,
     current_request_id: Option<String>,
+    current_instruction_head: Option<String>,
     journal_store: journal::JournalStore,
+    journal_data_dir: PathBuf,
 }
 
 impl<D: CodexDriver, S: EventSink> AgentEngine<D, S> {
     pub fn new(driver: D, sink: S, config: AgentEngineConfig) -> Self {
+        let journal_data_dir = default_data_dir();
         Self {
             driver,
             sink,
@@ -175,7 +213,9 @@ impl<D: CodexDriver, S: EventSink> AgentEngine<D, S> {
             plan_revision: 0,
             request_state: None,
             current_request_id: None,
-            journal_store: journal::JournalStore::new(default_data_dir()),
+            current_instruction_head: None,
+            journal_store: journal::JournalStore::new(&journal_data_dir),
+            journal_data_dir,
         }
     }
 
@@ -186,15 +226,16 @@ impl<D: CodexDriver, S: EventSink> AgentEngine<D, S> {
         request_state.start_request(&request_id);
         self.request_state = Some(request_state);
         self.current_request_id = Some(request_id);
+        self.current_instruction_head = Some(take_chars(&req.text, EPISODE_INSTRUCTION_CHARS));
         self.phase = Phase::Triage;
 
-        let memory = self.config.project_memory.as_deref();
+        let memory = self.config.project_memory_for_prompt();
         let turn_text = if self.thread_active {
             resume_turn_text(
                 &req.text,
                 &self.config.rag_hits,
                 &self.config.project_state,
-                memory,
+                memory.as_deref(),
             )
         } else {
             format!(
@@ -203,7 +244,7 @@ impl<D: CodexDriver, S: EventSink> AgentEngine<D, S> {
                     &req.text,
                     &self.config.rag_hits,
                     &self.config.project_state,
-                    memory,
+                    memory.as_deref(),
                 ),
                 req.text
             )
@@ -223,6 +264,7 @@ impl<D: CodexDriver, S: EventSink> AgentEngine<D, S> {
         self.phase = Phase::Idle;
         self.request_state = None;
         self.current_request_id = None;
+        self.current_instruction_head = None;
         Ok(())
     }
 
@@ -233,6 +275,7 @@ impl<D: CodexDriver, S: EventSink> AgentEngine<D, S> {
     fn finalize_pending_changeset(&mut self) {
         if self.phase == Phase::ChangesetReview {
             if let Some(prev) = self.current_request_id.as_deref() {
+                self.append_changeset_episode(prev, "defaulted");
                 let _ = self.journal_store.finalize_undecided_as_accepted(prev);
             }
         }
@@ -243,7 +286,8 @@ impl<D: CodexDriver, S: EventSink> AgentEngine<D, S> {
         req: ipc::PlanFeedbackRequest,
     ) -> Result<(), AgentEngineError> {
         self.phase = Phase::PlanReview;
-        let result = self.driver.run_turn(self.resume_text(&req.text)).await?;
+        let turn_text = self.resume_text(&req.text);
+        let result = self.driver.run_turn(turn_text).await?;
         self.thread_active = true;
         self.handle_turn_result(result)
     }
@@ -256,12 +300,10 @@ impl<D: CodexDriver, S: EventSink> AgentEngine<D, S> {
         state.approve_plan();
         self.phase = Phase::Executing;
 
-        let result = self
-            .driver
-            .run_turn(self.resume_text(
-                "The user approved the current plan. Proceed with the approved changes now.",
-            ))
-            .await?;
+        let turn_text = self.resume_text(
+            "The user approved the current plan. Proceed with the approved changes now.",
+        );
+        let result = self.driver.run_turn(turn_text).await?;
         self.thread_active = true;
         self.handle_turn_result(result)?;
         self.emit_current_changeset_if_any()?;
@@ -288,6 +330,8 @@ impl<D: CodexDriver, S: EventSink> AgentEngine<D, S> {
             (&req.decision, &req.ids),
             (ipc::Decision::Accept, ipc::DecisionIds::List(_))
         );
+        let episode_decision = changeset_episode_decision(&req);
+        let episode_summary = self.journal_summary(&request_id);
         let ok = if partial_accept {
             true
         } else {
@@ -303,6 +347,13 @@ impl<D: CodexDriver, S: EventSink> AgentEngine<D, S> {
                 ids,
                 ok,
             }))?;
+        if ok {
+            self.append_changeset_episode_with_summary(
+                &request_id,
+                episode_decision,
+                episode_summary,
+            );
+        }
         self.phase = Phase::Idle;
         Ok(())
     }
@@ -313,11 +364,12 @@ impl<D: CodexDriver, S: EventSink> AgentEngine<D, S> {
     }
 
     fn resume_text(&self, text: &str) -> String {
+        let memory = self.config.project_memory_for_prompt();
         resume_turn_text(
             text,
             &self.config.rag_hits,
             &self.config.project_state,
-            self.config.project_memory.as_deref(),
+            memory.as_deref(),
         )
     }
 
@@ -327,6 +379,7 @@ impl<D: CodexDriver, S: EventSink> AgentEngine<D, S> {
                 self.phase = Phase::Answer;
                 self.sink
                     .emit(EngineEvent::Answer(ipc::AnswerEvent { text }))?;
+                self.append_answer_episode_if_no_changeset();
                 self.phase = Phase::Idle;
             }
             CodexTurnResult::Plan { markdown } => {
@@ -365,6 +418,62 @@ impl<D: CodexDriver, S: EventSink> AgentEngine<D, S> {
                 .map(|(index, item)| ipc_changeset_item(index, item))
                 .collect(),
         }))
+    }
+
+    fn append_answer_episode_if_no_changeset(&self) {
+        let Some(request_id) = self.current_request_id.as_deref() else {
+            return;
+        };
+        let summary = self.journal_summary(request_id);
+        if summary.has_entries {
+            return;
+        }
+        self.append_episode(request_id, "answer", "answer", summary);
+    }
+
+    fn append_changeset_episode(&self, request_id: &str, decision: &str) {
+        let summary = self.journal_summary(request_id);
+        self.append_changeset_episode_with_summary(request_id, decision, summary);
+    }
+
+    fn append_changeset_episode_with_summary(
+        &self,
+        request_id: &str,
+        decision: &str,
+        summary: JournalSummary,
+    ) {
+        if !summary.has_entries {
+            return;
+        }
+        self.append_episode(request_id, "changeset", decision, summary);
+    }
+
+    fn append_episode(
+        &self,
+        request_id: &str,
+        kind: &str,
+        decision: &str,
+        summary: JournalSummary,
+    ) {
+        let episode = serde_json::json!({
+            "ts": iso8601_utc_now(),
+            "request_id": request_id,
+            "instruction": self.current_instruction_head.as_deref().unwrap_or_default(),
+            "kind": kind,
+            "tools": summary.tools,
+            "files": summary.files,
+            "decision": decision,
+        });
+        self.config.append_episode(&episode);
+    }
+
+    fn journal_summary(&self, request_id: &str) -> JournalSummary {
+        if let Ok(changeset) = self.journal_store.changeset(request_id) {
+            return JournalSummary::from_changeset(&changeset);
+        }
+        journal::JournalStore::load(&self.journal_data_dir, request_id)
+            .map(|journal| JournalSummary::from_entries(&journal.entries))
+            .unwrap_or_default()
     }
 }
 
@@ -731,6 +840,45 @@ fn default_data_dir() -> PathBuf {
         .join("eud-agent")
 }
 
+fn take_chars(s: &str, limit: usize) -> String {
+    s.chars().take(limit).collect()
+}
+
+fn iso8601_utc_now() -> String {
+    let seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or_default();
+    iso8601_utc_from_unix_seconds(seconds)
+}
+
+fn iso8601_utc_from_unix_seconds(seconds: i64) -> String {
+    let days = seconds.div_euclid(86_400);
+    let seconds_of_day = seconds.rem_euclid(86_400);
+    let (year, month, day) = civil_from_days(days);
+    let hour = seconds_of_day / 3_600;
+    let minute = (seconds_of_day % 3_600) / 60;
+    let second = seconds_of_day % 60;
+
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
+}
+
+fn civil_from_days(days_since_epoch: i64) -> (i64, i64, i64) {
+    let z = days_since_epoch + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let day_of_era = z - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
+    let year = year + if month <= 2 { 1 } else { 0 };
+
+    (year, month, day)
+}
+
 fn journal_decision(req: ipc::ChangesetDecisionRequest) -> journal::ChangesetDecision {
     match req.decision {
         ipc::Decision::Accept => journal::ChangesetDecision::accept(),
@@ -739,6 +887,150 @@ fn journal_decision(req: ipc::ChangesetDecisionRequest) -> journal::ChangesetDec
             ipc::DecisionIds::List(ids) => journal::DecisionIds::Items(ids),
         }),
     }
+}
+
+fn changeset_episode_decision(req: &ipc::ChangesetDecisionRequest) -> &'static str {
+    match (&req.decision, &req.ids) {
+        (ipc::Decision::Accept, ipc::DecisionIds::All(_)) => "accepted",
+        (ipc::Decision::Accept, ipc::DecisionIds::List(_)) => "partial",
+        (ipc::Decision::Reject, _) => "rejected",
+    }
+}
+
+#[derive(Default)]
+struct JournalSummary {
+    has_entries: bool,
+    tools: Vec<String>,
+    files: Vec<String>,
+}
+
+impl JournalSummary {
+    fn from_entries(entries: &[journal::JournalEntry]) -> Self {
+        let mut summary = Self {
+            has_entries: !entries.is_empty(),
+            tools: Vec::new(),
+            files: Vec::new(),
+        };
+
+        for entry in entries {
+            push_unique(&mut summary.tools, write_tool_name(entry.tool).to_string());
+            for file in journal_target_files(&entry.target) {
+                push_unique(&mut summary.files, file);
+            }
+        }
+
+        summary
+    }
+
+    fn from_changeset(changeset: &journal::Changeset) -> Self {
+        let mut summary = Self {
+            has_entries: !changeset.items.is_empty(),
+            tools: Vec::new(),
+            files: Vec::new(),
+        };
+
+        for item in &changeset.items {
+            if let Some(tool) = changeset_item_tool(item) {
+                push_unique(&mut summary.tools, tool.to_string());
+            }
+            for file in changeset_item_files(item) {
+                push_unique(&mut summary.files, file);
+            }
+        }
+
+        summary
+    }
+}
+
+fn push_unique(values: &mut Vec<String>, value: String) {
+    if !values.iter().any(|existing| existing == &value) {
+        values.push(value);
+    }
+}
+
+fn write_tool_name(tool: journal::WriteTool) -> &'static str {
+    match tool {
+        journal::WriteTool::DatSet => "dat_set",
+        journal::WriteTool::XdatSet => "xdat_set",
+        journal::WriteTool::TblSet => "tbl_set",
+        journal::WriteTool::ReqSet => "req_set",
+        journal::WriteTool::BtnSet => "btn_set",
+        journal::WriteTool::FileWrite => "file_write",
+        journal::WriteTool::FileCreate => "file_create",
+        journal::WriteTool::Mkdir => "mkdir",
+        journal::WriteTool::FileDelete => "file_delete",
+        journal::WriteTool::FileRename => "file_rename",
+        journal::WriteTool::FileMove => "file_move",
+        journal::WriteTool::SetMain => "set_main",
+        journal::WriteTool::SettingsSet => "settings_set",
+        journal::WriteTool::PluginAdd => "plugin_add",
+        journal::WriteTool::PluginEdit => "plugin_edit",
+        journal::WriteTool::PluginRemove => "plugin_remove",
+        journal::WriteTool::PluginMove => "plugin_move",
+        journal::WriteTool::LocationWrite => "location_write",
+        journal::WriteTool::PlayerSetup => "player_setup",
+    }
+}
+
+fn journal_target_files(target: &journal::JournalTarget) -> Vec<String> {
+    match target {
+        journal::JournalTarget::Path { path } => vec![path.clone()],
+        journal::JournalTarget::Rename { from, to } => vec![from.clone(), to.clone()],
+        journal::JournalTarget::Map { path, .. } => vec![path.clone()],
+        journal::JournalTarget::Dat { .. }
+        | journal::JournalTarget::Setting { .. }
+        | journal::JournalTarget::Plugin { .. } => Vec::new(),
+    }
+}
+
+fn changeset_item_tool(item: &journal::ChangesetItem) -> Option<&'static str> {
+    if item.id.starts_with("dat:Dat:") {
+        return Some("dat_set");
+    }
+    if item.id.starts_with("dat:Xdat:") {
+        return Some("xdat_set");
+    }
+    if item.id.starts_with("dat:Tbl:") {
+        return Some("tbl_set");
+    }
+    if item.id.starts_with("dat:Req:") {
+        return Some("req_set");
+    }
+    if item.id.starts_with("dat:Btn:") {
+        return Some("btn_set");
+    }
+    if item.diff.is_some() {
+        return Some("file_write");
+    }
+    if item
+        .properties
+        .iter()
+        .any(|property| property.property == "map")
+    {
+        return Some("location_write");
+    }
+    match item.kind {
+        journal::ChangesetItemKind::Created => Some("file_create"),
+        journal::ChangesetItemKind::Deleted => Some("file_delete"),
+        journal::ChangesetItemKind::Modified => None,
+        journal::ChangesetItemKind::Dat => None,
+    }
+}
+
+fn changeset_item_files(item: &journal::ChangesetItem) -> Vec<String> {
+    if let Some(diff) = item.diff.as_deref().and_then(diff_new_path) {
+        return vec![diff];
+    }
+    item.properties
+        .iter()
+        .filter(|property| property.property == "map")
+        .filter_map(|property| property.new.as_str().map(ToOwned::to_owned))
+        .collect()
+}
+
+fn diff_new_path(diff: &str) -> Option<String> {
+    diff.lines()
+        .find_map(|line| line.strip_prefix("+++ new/").map(ToOwned::to_owned))
 }
 
 fn rollback_ids(
@@ -876,7 +1168,11 @@ fn unsupported_rollback() -> Result<(), AgentEngineError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory::ProjectMemory;
+    use serde_json::{json, Value};
     use std::collections::VecDeque;
+    use std::fs;
+    use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
 
     fn sample_hits() -> Vec<crate::rag::Hit> {
@@ -948,6 +1244,142 @@ mod tests {
             self.events.lock().expect("events lock").push(event);
             Ok(())
         }
+    }
+
+    #[derive(Clone)]
+    struct StoreMemoryProvider {
+        memory: ProjectMemory,
+    }
+
+    impl StoreMemoryProvider {
+        fn new(memory: ProjectMemory) -> Self {
+            Self { memory }
+        }
+    }
+
+    impl MemoryProvider for StoreMemoryProvider {
+        fn render_section(&self) -> String {
+            self.memory.render_section(None)
+        }
+
+        fn append_episode(&self, episode: &Value) -> bool {
+            self.memory.append_episode(episode)
+        }
+    }
+
+    fn unique_temp_dir(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("eud-agent-engine-test-{tag}-{nanos}"));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn memory_store(tag: &str) -> (PathBuf, ProjectMemory) {
+        let base = unique_temp_dir(tag);
+        let memory = ProjectMemory::new(base.join("memory"), "ExampleProject");
+        (base, memory)
+    }
+
+    fn config_with_memory(memory: ProjectMemory) -> AgentEngineConfig {
+        AgentEngineConfig::for_tests(
+            "[project state]\nproject=Sample compiling=false",
+            None,
+            sample_hits(),
+        )
+        .with_memory_provider(Arc::new(StoreMemoryProvider::new(memory)))
+    }
+
+    fn test_engine_with_memory<D: CodexDriver, S: EventSink>(
+        driver: D,
+        sink: S,
+        memory: ProjectMemory,
+        data_dir: &std::path::Path,
+    ) -> AgentEngine<D, S> {
+        let mut engine = AgentEngine::new(driver, sink, config_with_memory(memory));
+        engine.journal_store = journal::JournalStore::new(data_dir);
+        engine.journal_data_dir = data_dir.to_path_buf();
+        engine
+    }
+
+    fn record_file_write(
+        store: &journal::JournalStore,
+        request_id: &str,
+        id: &str,
+        seq: u64,
+        path: &str,
+    ) {
+        record_file_write_in_memory(store, request_id, id, seq, path);
+        store
+            .persist(request_id)
+            .expect("journal entry should persist");
+    }
+
+    fn record_file_write_in_memory(
+        store: &journal::JournalStore,
+        request_id: &str,
+        id: &str,
+        seq: u64,
+        path: &str,
+    ) {
+        store
+            .record(
+                request_id,
+                journal::JournalEntry {
+                    id: id.to_string(),
+                    seq,
+                    tool: journal::WriteTool::FileWrite,
+                    target: journal::JournalTarget::Path {
+                        path: path.to_string(),
+                    },
+                    before: journal::Snapshot::FileContent {
+                        content: "old\n".to_string(),
+                    },
+                    after: journal::Snapshot::FileContent {
+                        content: "new\n".to_string(),
+                    },
+                    ts: 1,
+                },
+            )
+            .expect("journal entry should record");
+    }
+
+    fn latest_episode(memory: &ProjectMemory) -> Value {
+        memory
+            .read_episodes(10)
+            .pop()
+            .expect("expected an episode to be recorded")
+    }
+
+    fn assert_common_episode_fields(
+        episode: &Value,
+        decision: &str,
+        kind: &str,
+        instruction_prefix: &str,
+    ) {
+        assert_eq!(episode["decision"], decision);
+        assert_eq!(episode["kind"], kind);
+        assert!(
+            episode["ts"].as_str().is_some_and(|ts| ts.contains('T')),
+            "episode ts must be an ISO8601 string, got {episode:?}"
+        );
+        assert!(
+            episode["request_id"]
+                .as_str()
+                .is_some_and(|request_id| request_id.starts_with("req-")),
+            "episode request_id must be populated, got {episode:?}"
+        );
+        let instruction = episode["instruction"]
+            .as_str()
+            .expect("episode instruction must be a string");
+        assert!(instruction.starts_with(instruction_prefix));
+        assert!(
+            instruction.chars().count() <= 200,
+            "episode instruction head must be capped at 200 chars, got {}",
+            instruction.chars().count()
+        );
     }
 
     fn test_engine<D: CodexDriver, S: EventSink>(driver: D, sink: S) -> AgentEngine<D, S> {
@@ -1058,6 +1490,329 @@ mod tests {
             ),
             "answer-only turns emit answer; propose_plan turns emit plan"
         );
+    }
+
+    #[tokio::test]
+    async fn agentic_engine_refreshes_project_memory_for_each_chat_turn() {
+        let (base, memory) = memory_store("memory-refresh");
+        assert!(memory.write("resources", "Switch 1 = first value").ok);
+        let driver = FakeCodexDriver::scripted([
+            CodexTurnResult::Answer {
+                text: "First answer.".to_string(),
+            },
+            CodexTurnResult::Answer {
+                text: "Second answer.".to_string(),
+            },
+        ]);
+        let driver_handle = driver.clone();
+        let sink = CapturingEventSink::default();
+        let mut engine = test_engine_with_memory(driver, sink, memory.clone(), &base.join("data"));
+
+        engine
+            .chat(crate::ipc::ChatRequest {
+                text: "first request".to_string(),
+            })
+            .await
+            .expect("first chat should run");
+        assert!(memory.write("resources", "Switch 2 = refreshed value").ok);
+        engine
+            .chat(crate::ipc::ChatRequest {
+                text: "second request".to_string(),
+            })
+            .await
+            .expect("second chat should run");
+
+        let prompts = driver_handle.prompts();
+        assert_eq!(prompts.len(), 2);
+        assert!(prompts[0].contains("[project memory]"));
+        assert!(prompts[0].contains("Switch 1 = first value"));
+        assert!(
+            !prompts[0].contains("Switch 2 = refreshed value"),
+            "first prompt must reflect the memory visible at the first turn"
+        );
+        assert!(prompts[1].contains("[project memory]"));
+        assert!(prompts[1].contains("Switch 2 = refreshed value"));
+        assert!(
+            !prompts[1].contains("Switch 1 = first value"),
+            "resumed prompt must refresh memory instead of reusing startup config"
+        );
+
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[tokio::test]
+    async fn answer_only_turn_appends_answer_episode() {
+        let (base, memory) = memory_store("episode-answer");
+        let driver = FakeCodexDriver::scripted([CodexTurnResult::Answer {
+            text: "No edits are needed.".to_string(),
+        }]);
+        let sink = CapturingEventSink::default();
+        let mut engine = test_engine_with_memory(driver, sink, memory.clone(), &base.join("data"));
+        let instruction = format!("{}{}", "explain behavior ", "x".repeat(240));
+
+        engine
+            .chat(crate::ipc::ChatRequest { text: instruction })
+            .await
+            .expect("answer-only chat should still complete after episode append");
+
+        let episode = latest_episode(&memory);
+        assert_common_episode_fields(&episode, "answer", "answer", "explain behavior ");
+        assert_eq!(episode["tools"], json!([]));
+        assert_eq!(episode["files"], json!([]));
+
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[tokio::test]
+    async fn changeset_decision_appends_accepted_episode_with_tools_and_files() {
+        let (base, memory) = memory_store("episode-accepted");
+        let driver = FakeCodexDriver::scripted([CodexTurnResult::Plan {
+            markdown: "- Write file".to_string(),
+        }]);
+        let sink = CapturingEventSink::default();
+        let mut engine = test_engine_with_memory(driver, sink, memory.clone(), &base.join("data"));
+
+        engine
+            .chat(crate::ipc::ChatRequest {
+                text: "write the trigger".to_string(),
+            })
+            .await
+            .expect("chat should run");
+        let request_id = engine
+            .current_request_id
+            .clone()
+            .expect("chat should create a request id");
+        record_file_write(
+            &engine.journal_store,
+            &request_id,
+            "file-write",
+            1,
+            "scripts/main.eps",
+        );
+        engine.phase = Phase::ChangesetReview;
+
+        engine
+            .changeset_decision(crate::ipc::ChangesetDecisionRequest {
+                decision: crate::ipc::Decision::Accept,
+                ids: crate::ipc::DecisionIds::All(crate::ipc::AllLiteral),
+            })
+            .await
+            .expect("accept-all decision should finalize");
+
+        let episode = latest_episode(&memory);
+        assert_common_episode_fields(&episode, "accepted", "changeset", "write the trigger");
+        assert_eq!(episode["tools"], json!(["file_write"]));
+        assert_eq!(episode["files"], json!(["scripts/main.eps"]));
+
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[tokio::test]
+    async fn accepted_episode_summarizes_live_unpersisted_journal_entries() {
+        let (base, memory) = memory_store("episode-live-journal");
+        let driver = FakeCodexDriver::scripted([CodexTurnResult::Plan {
+            markdown: "- Write file".to_string(),
+        }]);
+        let sink = CapturingEventSink::default();
+        let mut engine = test_engine_with_memory(driver, sink, memory.clone(), &base.join("data"));
+
+        engine
+            .chat(crate::ipc::ChatRequest {
+                text: "write the live trigger".to_string(),
+            })
+            .await
+            .expect("chat should run");
+        let request_id = engine
+            .current_request_id
+            .clone()
+            .expect("chat should create a request id");
+        record_file_write_in_memory(
+            &engine.journal_store,
+            &request_id,
+            "live-file-write",
+            1,
+            "scripts/live.eps",
+        );
+        engine.phase = Phase::ChangesetReview;
+
+        engine
+            .changeset_decision(crate::ipc::ChangesetDecisionRequest {
+                decision: crate::ipc::Decision::Accept,
+                ids: crate::ipc::DecisionIds::All(crate::ipc::AllLiteral),
+            })
+            .await
+            .expect("accept-all decision should finalize");
+
+        let episode = latest_episode(&memory);
+        assert_common_episode_fields(&episode, "accepted", "changeset", "write the live trigger");
+        assert_eq!(episode["tools"], json!(["file_write"]));
+        assert_eq!(episode["files"], json!(["scripts/live.eps"]));
+
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[tokio::test]
+    async fn failed_reject_does_not_append_rejected_episode() {
+        let (base, memory) = memory_store("episode-failed-reject");
+        let driver = FakeCodexDriver::scripted([CodexTurnResult::Plan {
+            markdown: "- Write file".to_string(),
+        }]);
+        let sink = CapturingEventSink::default();
+        let sink_handle = sink.clone();
+        let mut engine = test_engine_with_memory(driver, sink, memory.clone(), &base.join("data"));
+
+        engine
+            .chat(crate::ipc::ChatRequest {
+                text: "write then reject".to_string(),
+            })
+            .await
+            .expect("chat should run");
+        let request_id = engine
+            .current_request_id
+            .clone()
+            .expect("chat should create a request id");
+        record_file_write_in_memory(
+            &engine.journal_store,
+            &request_id,
+            "reject-file-write",
+            1,
+            "scripts/reject.eps",
+        );
+        engine.phase = Phase::ChangesetReview;
+
+        engine
+            .changeset_decision(crate::ipc::ChangesetDecisionRequest {
+                decision: crate::ipc::Decision::Reject,
+                ids: crate::ipc::DecisionIds::All(crate::ipc::AllLiteral),
+            })
+            .await
+            .expect("failed rollback still emits rollback_result");
+
+        let events = sink_handle.events();
+        assert!(
+            matches!(
+                events.last(),
+                Some(EngineEvent::RollbackResult(
+                    crate::ipc::RollbackResultEvent { ok: false, .. }
+                ))
+            ),
+            "unsupported rollback should report ok=false"
+        );
+        assert!(
+            memory
+                .read_episodes(10)
+                .iter()
+                .all(|episode| episode["decision"] != "rejected"),
+            "failed reject must not leave a rejected project-memory episode"
+        );
+
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[tokio::test]
+    async fn selected_accept_appends_partial_changeset_episode() {
+        let (base, memory) = memory_store("episode-partial");
+        let driver = FakeCodexDriver::scripted([CodexTurnResult::Plan {
+            markdown: "- Write files".to_string(),
+        }]);
+        let sink = CapturingEventSink::default();
+        let mut engine = test_engine_with_memory(driver, sink, memory.clone(), &base.join("data"));
+
+        engine
+            .chat(crate::ipc::ChatRequest {
+                text: "write two triggers".to_string(),
+            })
+            .await
+            .expect("chat should run");
+        let request_id = engine
+            .current_request_id
+            .clone()
+            .expect("chat should create a request id");
+        record_file_write(
+            &engine.journal_store,
+            &request_id,
+            "first-write",
+            1,
+            "scripts/first.eps",
+        );
+        record_file_write(
+            &engine.journal_store,
+            &request_id,
+            "second-write",
+            2,
+            "scripts/second.eps",
+        );
+        engine.phase = Phase::ChangesetReview;
+
+        engine
+            .changeset_decision(crate::ipc::ChangesetDecisionRequest {
+                decision: crate::ipc::Decision::Accept,
+                ids: crate::ipc::DecisionIds::List(vec!["first-write".to_string()]),
+            })
+            .await
+            .expect("selected accept should be recorded as partial");
+
+        let episode = latest_episode(&memory);
+        assert_common_episode_fields(&episode, "partial", "changeset", "write two triggers");
+        assert_eq!(episode["tools"], json!(["file_write"]));
+        assert_eq!(
+            episode["files"],
+            json!(["scripts/first.eps", "scripts/second.eps"])
+        );
+
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[tokio::test]
+    async fn next_chat_default_accepts_pending_changeset_and_appends_defaulted_episode() {
+        let (base, memory) = memory_store("episode-defaulted");
+        let driver = FakeCodexDriver::scripted([
+            CodexTurnResult::Plan {
+                markdown: "- Write file".to_string(),
+            },
+            CodexTurnResult::Answer {
+                text: "Next answer.".to_string(),
+            },
+        ]);
+        let sink = CapturingEventSink::default();
+        let mut engine = test_engine_with_memory(driver, sink, memory.clone(), &base.join("data"));
+
+        engine
+            .chat(crate::ipc::ChatRequest {
+                text: "write a trigger".to_string(),
+            })
+            .await
+            .expect("first chat should run");
+        let request_id = engine
+            .current_request_id
+            .clone()
+            .expect("chat should create a request id");
+        record_file_write_in_memory(
+            &engine.journal_store,
+            &request_id,
+            "default-write",
+            1,
+            "scripts/defaulted.eps",
+        );
+        engine.phase = Phase::ChangesetReview;
+
+        engine
+            .chat(crate::ipc::ChatRequest {
+                text: "new request".to_string(),
+            })
+            .await
+            .expect("new chat should not be blocked by episode append");
+
+        let episodes = memory.read_episodes(10);
+        let defaulted = episodes
+            .iter()
+            .find(|episode| episode["decision"] == "defaulted")
+            .expect("pending changeset should record a defaulted episode");
+        assert_common_episode_fields(defaulted, "defaulted", "changeset", "write a trigger");
+        assert_eq!(defaulted["tools"], json!(["file_write"]));
+        assert_eq!(defaulted["files"], json!(["scripts/defaulted.eps"]));
+
+        fs::remove_dir_all(base).ok();
     }
 
     #[test]

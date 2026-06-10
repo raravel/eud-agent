@@ -21,6 +21,34 @@ pub mod memory;
 pub mod rag;
 pub mod tools;
 
+#[derive(Clone)]
+struct AppMemoryProvider {
+    dirs: config::DataDirs,
+}
+
+impl AppMemoryProvider {
+    fn current_memory(&self) -> memory::ProjectMemory {
+        match ipc::bridge_from_config(&self.dirs).and_then(|bridge| {
+            bridge
+                .read_status_snapshot(bridge_io::HEARTBEAT_STALE_AFTER)
+                .map_err(|error| error.to_string())
+        }) {
+            Ok(snapshot) => memory::ProjectMemory::new(self.dirs.memory_dir(), snapshot.project),
+            Err(_) => memory::ProjectMemory::new(self.dirs.memory_dir(), ""),
+        }
+    }
+}
+
+impl engine::MemoryProvider for AppMemoryProvider {
+    fn render_section(&self) -> String {
+        self.current_memory().render_section(None)
+    }
+
+    fn append_episode(&self, episode: &serde_json::Value) -> bool {
+        self.current_memory().append_episode(episode)
+    }
+}
+
 /// Build and run the Tauri application.
 ///
 /// Kept out of `main.rs` so the same setup is reusable by mobile targets and
@@ -35,14 +63,17 @@ pub fn run() {
             if let Ok(bridge) = ipc::bridge_from_config(&data_dirs) {
                 bridge.cleanup_stale();
             }
-            app.manage(ipc::BridgeManaged::new(data_dirs));
+            app.manage(ipc::BridgeManaged::new(data_dirs.clone()));
 
             let app_handle = app.handle().clone();
             let sink = engine::TauriEventSink::new(app_handle.clone());
             let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
             let driver = engine::ProductionCodexDriver::new(cwd, sink.clone());
             let config =
-                engine::AgentEngineConfig::new("[project state]\n(unavailable)", None, Vec::new());
+                engine::AgentEngineConfig::new("[project state]\n(unavailable)", None, Vec::new())
+                    .with_memory_provider(std::sync::Arc::new(AppMemoryProvider {
+                        dirs: data_dirs,
+                    }));
 
             app.manage(tokio::sync::Mutex::new(engine::AgentEngine::new(
                 driver, sink, config,
@@ -58,6 +89,8 @@ pub fn run() {
             engine::engine_reset,
             ipc::status,
             ipc::list,
+            ipc::memory_get,
+            ipc::memory_save,
         ])
         .run(tauri::generate_context!())
         .expect("error while running eud-agent application");

@@ -8,6 +8,7 @@ use std::path::Path;
 
 use crate::bridge_io::{BridgeIo, SendOpts, HEARTBEAT_STALE_AFTER};
 use crate::config::{self, DataDirs};
+use crate::memory::ProjectMemory;
 use serde::{Deserialize, Serialize};
 use tauri::Emitter;
 
@@ -125,6 +126,46 @@ pub struct StatusResponse {
 pub struct ListResponse {
     /// Editor files exposed by the bridge LIST command.
     pub files: Vec<FileEntry>,
+}
+
+/// `memory_get` command output.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryGetResponse {
+    /// Current project name from editor STATUS.
+    pub project: String,
+    /// Project memory markdown files.
+    pub files: MemoryFiles,
+    /// Recent episodes, newest first.
+    pub episodes: Vec<serde_json::Value>,
+}
+
+/// Project memory markdown file payloads.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryFiles {
+    /// Resource ledger.
+    pub resources: String,
+    /// Project/file structure notes.
+    pub structure: String,
+    /// Naming and trigger conventions.
+    pub conventions: String,
+    /// User corrections and durable lessons.
+    pub lessons: String,
+}
+
+/// `memory_save` command input.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemorySaveRequest {
+    /// Memory file name (`resources`, `structure`, `conventions`, or `lessons`).
+    pub file: String,
+    /// Full replacement markdown content.
+    pub content: String,
+}
+
+/// `memory_save` command output.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemorySaveResponse {
+    /// Saved memory file name.
+    pub file: String,
 }
 
 /// A file entry returned by `list`.
@@ -358,6 +399,79 @@ pub async fn list(
     Ok(ListResponse { files })
 }
 
+/// Build the `memory_get` payload for an already-resolved project name.
+pub fn memory_get_payload(dirs: &DataDirs, project: &str) -> Result<MemoryGetResponse, String> {
+    let memory = ProjectMemory::new(dirs.memory_dir(), project);
+    if !memory.enabled() {
+        return Err("no project is open; memory is disabled".to_string());
+    }
+
+    let mut episodes = memory.read_episodes(50);
+    episodes.reverse();
+
+    Ok(MemoryGetResponse {
+        project: project.to_string(),
+        files: MemoryFiles {
+            resources: memory.read("resources"),
+            structure: memory.read("structure"),
+            conventions: memory.read("conventions"),
+            lessons: memory.read("lessons"),
+        },
+        episodes,
+    })
+}
+
+/// Save one project memory file for an already-resolved project name.
+pub fn memory_save_payload(
+    dirs: &DataDirs,
+    project: &str,
+    file: &str,
+    content: &str,
+) -> Result<MemorySaveResponse, String> {
+    let memory = ProjectMemory::new(dirs.memory_dir(), project);
+    let result = memory.write(file, content);
+    if !result.ok {
+        return Err(result.reason);
+    }
+
+    Ok(MemorySaveResponse {
+        file: file.to_string(),
+    })
+}
+
+/// Read project memory for the current editor project.
+#[tauri::command]
+pub async fn memory_get(
+    state: tauri::State<'_, BridgeManaged>,
+) -> Result<MemoryGetResponse, String> {
+    let project = current_project_from_status(state.dirs()).await?;
+    memory_get_payload(state.dirs(), &project)
+}
+
+/// Save one memory file for the current editor project.
+#[tauri::command]
+pub async fn memory_save(
+    state: tauri::State<'_, BridgeManaged>,
+    file: String,
+    content: String,
+) -> Result<MemorySaveResponse, String> {
+    let request = MemorySaveRequest { file, content };
+    let project = current_project_from_status(state.dirs()).await?;
+    memory_save_payload(state.dirs(), &project, &request.file, &request.content)
+}
+
+async fn current_project_from_status(dirs: &DataDirs) -> Result<String, String> {
+    let bridge = bridge_from_config(dirs)?;
+    let snapshot = tauri::async_runtime::spawn_blocking(move || {
+        bridge.read_status_snapshot(HEARTBEAT_STALE_AFTER)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+    .map_err(|error| error.to_string())?;
+
+    Ok(snapshot.project)
+}
+
 /// Emit an `agent_event` event.
 pub fn emit_agent_event<R: tauri::Runtime>(
     emitter: &impl Emitter<R>,
@@ -426,6 +540,7 @@ pub fn emit_status<R: tauri::Runtime>(
 mod tests {
     use crate::config::{Config, DataDirs};
     use crate::ipc;
+    use crate::memory::{ProjectMemory, CONTENT_CAP_BYTES};
     use serde_json::json;
     use std::fs;
     use std::path::PathBuf;
@@ -571,6 +686,163 @@ mod tests {
                 "message": "editor not connected"
             }),
         );
+    }
+
+    #[test]
+    fn memory_payloads_match_panel_wire_schema() {
+        let memory: ipc::MemoryGetResponse = serde_json::from_value(json!({
+            "project": "ExampleProject",
+            "files": {
+                "resources": "Switch 1 = boss phase",
+                "structure": "main.eps: entry point",
+                "conventions": "Use dc_ prefix for counters",
+                "lessons": "Build after eps edits"
+            },
+            "episodes": [
+                {
+                    "ts": "2026-06-10T12:00:00Z",
+                    "request_id": "req-1",
+                    "instruction": "Add a boss phase",
+                    "kind": "changeset",
+                    "tools": ["file_write"],
+                    "files": ["main.eps"],
+                    "decision": "accepted"
+                }
+            ]
+        }))
+        .unwrap();
+        assert_json(
+            &memory,
+            json!({
+                "project": "ExampleProject",
+                "files": {
+                    "resources": "Switch 1 = boss phase",
+                    "structure": "main.eps: entry point",
+                    "conventions": "Use dc_ prefix for counters",
+                    "lessons": "Build after eps edits"
+                },
+                "episodes": [
+                    {
+                        "ts": "2026-06-10T12:00:00Z",
+                        "request_id": "req-1",
+                        "instruction": "Add a boss phase",
+                        "kind": "changeset",
+                        "tools": ["file_write"],
+                        "files": ["main.eps"],
+                        "decision": "accepted"
+                    }
+                ]
+            }),
+        );
+
+        let save: ipc::MemorySaveRequest =
+            serde_json::from_value(json!({ "file": "resources", "content": "Switch 2" })).unwrap();
+        assert_json(
+            &save,
+            json!({
+                "file": "resources",
+                "content": "Switch 2"
+            }),
+        );
+
+        let saved: ipc::MemorySaveResponse =
+            serde_json::from_value(json!({ "file": "resources" })).unwrap();
+        assert_json(&saved, json!({ "file": "resources" }));
+    }
+
+    #[test]
+    fn memory_get_payload_reads_all_files_and_returns_last_50_episodes_newest_first() {
+        let base = unique_temp_dir("memory-get");
+        let dirs = DataDirs::from_bases(&base.join("roaming"), &base.join("local"));
+        let memory = ProjectMemory::new(dirs.memory_dir(), "ExampleProject");
+        assert!(memory.write("resources", "Switch 1 = boss phase").ok);
+        assert!(memory.write("structure", "main.eps: entry point").ok);
+        assert!(
+            memory
+                .write("conventions", "Use dc_ prefix for counters")
+                .ok
+        );
+        assert!(memory.write("lessons", "Build after eps edits").ok);
+        for index in 0..55 {
+            assert!(memory.append_episode(&json!({
+                "ts": format!("2026-06-10T12:{index:02}:00Z"),
+                "request_id": format!("req-{index}"),
+                "instruction": format!("instruction {index}"),
+                "kind": if index % 2 == 0 { "answer" } else { "changeset" },
+                "tools": ["file_write"],
+                "files": ["main.eps"],
+                "decision": if index % 2 == 0 { "answer" } else { "accepted" }
+            })));
+        }
+
+        let payload = ipc::memory_get_payload(&dirs, "ExampleProject")
+            .expect("memory_get should return the open project's memory");
+
+        assert_eq!(payload.project, "ExampleProject");
+        assert_eq!(payload.files.resources, "Switch 1 = boss phase");
+        assert_eq!(payload.files.structure, "main.eps: entry point");
+        assert_eq!(payload.files.conventions, "Use dc_ prefix for counters");
+        assert_eq!(payload.files.lessons, "Build after eps edits");
+        assert_eq!(payload.episodes.len(), 50);
+
+        let value = serde_json::to_value(&payload).unwrap();
+        let episodes = value["episodes"].as_array().unwrap();
+        assert_eq!(episodes[0]["request_id"], "req-54");
+        assert_eq!(episodes[49]["request_id"], "req-5");
+
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn memory_save_payload_round_trips_without_journal_and_rejects_invalid_requests() {
+        let base = unique_temp_dir("memory-save");
+        let dirs = DataDirs::from_bases(&base.join("roaming"), &base.join("local"));
+        let memory = ProjectMemory::new(dirs.memory_dir(), "ExampleProject");
+        assert!(memory.write("resources", "prior").ok);
+
+        let saved = ipc::memory_save_payload(
+            &dirs,
+            "ExampleProject",
+            "resources",
+            "Switch 1 = boss phase",
+        )
+        .expect("memory_save should write a known file for the open project");
+        assert_json(&saved, json!({ "file": "resources" }));
+        assert_eq!(memory.read("resources"), "Switch 1 = boss phase");
+        assert!(
+            !dirs.journal_dir().exists(),
+            "panel memory_save writes directly and must not create a journal entry"
+        );
+
+        let err = ipc::memory_get_payload(&dirs, "   ").unwrap_err();
+        assert!(
+            err.contains("no project"),
+            "empty project should return a no-project error, got {err:?}"
+        );
+
+        let err = ipc::memory_save_payload(&dirs, "   ", "resources", "new").unwrap_err();
+        assert!(
+            err.contains("no project"),
+            "empty project should return a no-project error, got {err:?}"
+        );
+
+        let err = ipc::memory_save_payload(&dirs, "ExampleProject", "unknown", "new").unwrap_err();
+        assert!(
+            err.contains("unknown memory file"),
+            "unknown file should preserve store validation wording, got {err:?}"
+        );
+        assert_eq!(memory.read("resources"), "Switch 1 = boss phase");
+
+        let oversize = "x".repeat(CONTENT_CAP_BYTES + 1);
+        let err =
+            ipc::memory_save_payload(&dirs, "ExampleProject", "resources", &oversize).unwrap_err();
+        assert!(
+            err.contains(&format!("{CONTENT_CAP_BYTES}-byte budget")),
+            "oversize content should preserve store cap wording, got {err:?}"
+        );
+        assert_eq!(memory.read("resources"), "Switch 1 = boss phase");
+
+        fs::remove_dir_all(base).ok();
     }
 
     #[test]
