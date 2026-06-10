@@ -127,6 +127,10 @@ describe("request/response messages", () => {
     });
 
     await client.connect();
+    // connect() only registers listeners; the snapshot is an explicit refresh
+    // (App calls it after the first-run setup check).
+    expect(received).toEqual([]);
+    await client.refresh();
 
     expect(received).toContainEqual({
       type: "status",
@@ -158,10 +162,13 @@ describe("readiness", () => {
       onOpenChange: (open) => openChanges.push(open),
     });
 
-    const connecting = client.connect();
-    await flushMicrotasks();
-
+    await client.connect();
     expect(listen).toHaveBeenCalled();
+    // Listeners alone never report readiness — that needs the snapshot.
+    expect(openChanges).toEqual([]);
+
+    const refreshing = client.refresh();
+    await flushMicrotasks();
     expect(openChanges).toEqual([]);
 
     status.resolve({ compiling: false, project: "map.scx" });
@@ -169,7 +176,7 @@ describe("readiness", () => {
     expect(openChanges).toEqual([]);
 
     list.resolve({ files: [] });
-    await connecting;
+    await refreshing;
     expect(openChanges).toEqual([true]);
 
     const listenCalls = listen.mock.calls.length;
@@ -181,9 +188,10 @@ describe("readiness", () => {
     expect(invoke).toHaveBeenCalledTimes(invokeCalls);
   });
 
-  it("keeps push listeners alive when the initial snapshot fails, and refresh() recovers", async () => {
-    // First-run flow (EUD-132): status/list fail while setup is pending, but
-    // bootstrap progress must still arrive, and refresh() succeeds afterwards.
+  it("keeps push listeners alive when a refresh fails, and a later refresh() recovers", async () => {
+    // Fallback path (EUD-132): a refresh against an unconfigured/parked app
+    // fails without tearing listeners down — bootstrap progress must still
+    // arrive, and refresh() succeeds after setup completes.
     const { invoke, listen, listeners, unlisteners } = makeHarness();
     let setupDone = false;
     invoke.mockImplementation(async (command: string) => {
@@ -207,6 +215,7 @@ describe("readiness", () => {
     });
 
     await client.connect();
+    expect(await client.refresh()).toBe(false);
 
     expect(openChanges).toEqual([false]);
     expect(client.isOpen()).toBe(false);

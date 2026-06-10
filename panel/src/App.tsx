@@ -261,9 +261,18 @@ export default function App() {
       },
     });
     clientRef.current = client;
-    // The first-run manifest check rides behind connect() so the push listeners
-    // (bootstrap progress) are registered before any download can start.
-    void client.connect().then(() => client.send({ type: "setup_status" }));
+    // Register push listeners first (bootstrap progress must not be missed),
+    // then route by the first-run manifest check: setup_required renders the
+    // SetupScreen without ever requesting the doomed status/list snapshot (no
+    // misleading "connect failed" log); the ready path pulls the snapshot via
+    // refresh() from the `setup` handler below.
+    void client.connect().then(() =>
+      client.send({ type: "setup_status" }).then((ok) => {
+        // Unexpected setup_status failure: fall back to the direct snapshot so
+        // an already-configured app still comes up.
+        if (!ok) void client.refresh();
+      }),
+    );
     return () => {
       client.stop();
       clientRef.current = null;

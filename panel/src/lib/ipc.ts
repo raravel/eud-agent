@@ -112,12 +112,11 @@ export class IpcClient {
   }
 
   /**
-   * Register push-event listeners, request the initial status/list snapshots,
-   * then report readiness. There is no reconnect loop for in-process IPC.
-   *
-   * A failed snapshot (editor not running / first-run setup pending) does NOT
-   * tear the listeners down — push events (e.g. bootstrap progress) must keep
-   * flowing so the setup screen can drive {@link IpcClient.refresh} later.
+   * Register push-event listeners. The status/list snapshot is NOT requested
+   * here: the App first checks the first-run setup state (`setup_status`) and
+   * calls {@link IpcClient.refresh} only when setup is not required — so an
+   * unconfigured first run never logs a connect failure for an expected state,
+   * while bootstrap progress events still flow from the very start.
    */
   async connect(): Promise<void> {
     if (this.active) return;
@@ -129,10 +128,7 @@ export class IpcClient {
       this.stop();
       this.onOpenChange(false);
       this.onLog("unknown", `IPC connect failed: ${formatError(error)}`);
-      return;
     }
-    if (!this.active) return;
-    await this.refresh();
   }
 
   /**
