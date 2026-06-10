@@ -20,6 +20,13 @@ turn result arrives as events:
 - `reset {}` — drop the retained codex thread; next `chat` starts a fresh conversation (EUD-064).
 - `status {}` -> `{ compiling, project }` (read from editor status.txt).
 - `list {}` -> `{ files: [{ path, ftype, settable }] }` (bridge LIST).
+- `memory_get {}` -> `{ project, files: { resources, structure, conventions, lessons },
+  episodes }` (episodes: last 50, newest first). Error when no project is open (STATUS
+  project empty). Request/response: the payload is the command return value.
+- `memory_save { file, content }` -> `{ file }` — panel edit of one memory file (same file
+  enum + 8 KB cap as `memory_write`); writes directly via the store, NO journal entry (a
+  user editing their own memory is not an agent mutation). Error: no project open / unknown
+  file / oversize content.
 
 Events (core -> panel, `emit`):
 - `agent_event { kind, detail, data? }` — streamed turn activity. `reasoning` = reasoning
@@ -104,10 +111,24 @@ Port of `bridge_io.py`: write `srv-<uuid8>.cmd` to `<editor>\Data\agent\inbox` (
 BOM), poll `outbox\<name>.result` with 10s timeout (180s when status.txt compiling=true, emit
 `waiting_build`), delete consumed `.result`, clear stale inbox/outbox at startup.
 Commands: PING/STATUS/LIST/GET/SET/NEWEPS/GETDAT/SETDAT/BUILD/LUA.
+The `status`/`list` Tauri commands are served BY this client (status.txt read / LIST
+round-trip) — never placeholder constants. The editor install path comes from `config.json`
+(config.rs DataDirs); an unset path or absent/stale editor heartbeat returns the friendly
+"editor not connected" error, never a panic.
 
 ## memory
-Port of `memory.py`: project memory under `%appdata%\eud-agent\memory\`; `memory_write` is
-evidence-gate-exempt.
+Port of `memory.py` (semantics: [[features/07_project-memory|07_project-memory]] — files,
+caps, staleness, episodes; that spec's WS/server-path sections are superseded by THIS
+feature's Tauri surface): project memory under `%appdata%\eud-agent\memory\<sanitized>\`;
+`memory_write` is evidence-gate-exempt. v2 wiring contract:
+- The project name is resolved per turn from bridge STATUS (the same fetch that feeds
+  `[project state]`); an empty project disables the store for that turn.
+- `build_system_prompt` / `resume_turn_text` receive a freshly rendered
+  `ProjectMemory::render_section(list_reply)` EVERY turn (first + resumed) — never a
+  construction-time constant.
+- The engine appends one episode line at each request finalization point (changeset decided /
+  default-accept on next chat / answer-only turn end), per feature 07.
+- The `memory_get`/`memory_save` commands (IPC surface above) are served by the same store.
 
 ## Edge cases
 - codex CLI unresolved -> fast clear error (no bare spawn).

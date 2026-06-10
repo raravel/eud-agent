@@ -24,6 +24,8 @@ Commands (panel -> core, `invoke`):
 | `reset {}` | `invoke("reset")` |
 | `status {}` | `invoke("status")` |
 | `list {}` | `invoke("list")` |
+| `memory_get {}` | `invoke("memory_get")` |
+| `memory_save {file, content}` | `invoke("memory_save", { file, content })` |
 
 Events (core -> panel, `listen`):
 | v2 WS message (server->client) | New Tauri event |
@@ -37,11 +39,14 @@ Events (core -> panel, `listen`):
 | `error {message}` | `listen("error", ...)` |
 | `status {compiling, project}` | `listen("status", ...)` (push) or command return |
 | `list {files?, error?}` | command return value of `invoke("list")` |
+| `memory {project, files, episodes}` | command return value of `invoke("memory_get")` |
+| `memory_saved {file}` | command return value of `invoke("memory_save")` |
 
-`status`/`list` are request/response commands (return the payload from `invoke`); the
-remaining server messages are push events delivered via `listen`. `chat`/`plan_feedback`/
-`plan_approve`/`changeset_decision`/`cancel`/`reset` start background work and resolve when
-accepted — the turn result arrives later as events.
+`status`/`list`/`memory_get`/`memory_save` are request/response commands (return the payload
+from `invoke`; the IPC client dispatches `memory`/`memory_saved` payloads to the store from
+the command return); the remaining server messages are push events delivered via `listen`.
+`chat`/`plan_feedback`/`plan_approve`/`changeset_decision`/`cancel`/`reset` start background
+work and resolve when accepted — the turn result arrives later as events.
 
 ## Removed from the panel
 - WebSocket connect/reconnect logic, `?token=` handshake, Origin assumptions, and the

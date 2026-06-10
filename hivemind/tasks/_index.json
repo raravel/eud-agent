@@ -2360,7 +2360,7 @@
       ]
     },
     "EUD-144-013d": {
-      "status": "pending",
+      "status": "in_progress",
       "priority": "low",
       "type": "task",
       "parent": "EUD-142-784e",
@@ -2371,6 +2371,66 @@
       "path": "active/EUD-144-013d.md",
       "scope": [
         "ci/build_rag_index.rs"
+      ]
+    },
+    "EUD-145-d77d": {
+      "status": "pending",
+      "priority": "high",
+      "type": "epic",
+      "parent": null,
+      "depends_on": [],
+      "title": "v2 core runtime wiring (bridge IPC + project memory)",
+      "updated": "2026-06-10",
+      "completed_at": null,
+      "path": "active/EUD-145-d77d.md",
+      "scope": []
+    },
+    "EUD-146-dd74": {
+      "status": "pending",
+      "priority": "high",
+      "type": "story",
+      "parent": "EUD-145-d77d",
+      "depends_on": [],
+      "title": "Wire status/list and memory IPC into the live core",
+      "updated": "2026-06-10",
+      "completed_at": null,
+      "path": "active/EUD-146-dd74.md",
+      "scope": []
+    },
+    "EUD-147-4c22": {
+      "status": "pending",
+      "priority": "high",
+      "type": "task",
+      "parent": "EUD-146-dd74",
+      "depends_on": [],
+      "title": "Wire status/list Tauri commands to bridge_io file-IPC",
+      "updated": "2026-06-10",
+      "completed_at": null,
+      "path": "active/EUD-147-4c22.md",
+      "scope": [
+        "src-tauri/src/ipc.rs",
+        "src-tauri/src/bridge_io.rs",
+        "src-tauri/src/config.rs",
+        "src-tauri/src/lib.rs"
+      ]
+    },
+    "EUD-148-358a": {
+      "status": "pending",
+      "priority": "high",
+      "type": "task",
+      "parent": "EUD-146-dd74",
+      "depends_on": [
+        "EUD-147-4c22"
+      ],
+      "title": "memory_get/memory_save commands + per-turn [project memory] injection + episodes",
+      "updated": "2026-06-10",
+      "completed_at": null,
+      "path": "active/EUD-148-358a.md",
+      "scope": [
+        "src-tauri/src/ipc.rs",
+        "src-tauri/src/memory.rs",
+        "src-tauri/src/engine.rs",
+        "src-tauri/src/lib.rs"
       ]
     }
   }
