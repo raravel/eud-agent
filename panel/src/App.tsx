@@ -296,24 +296,37 @@ export default function App() {
   // The MAIN prompt input routes by phase (EUD-074): during plan_review the
   // typed text IS the plan feedback (plan_feedback{text} — the PlanView
   // feedback textarea is removed); otherwise it starts a chat turn.
+  //
+  // Turn-starting commands resolve only when the WHOLE codex turn ends, while
+  // its progress/answer events stream in the meantime — so the user bubble and
+  // the thinking phase are recorded BEFORE awaiting, or the answer would render
+  // above the user's own message and the late phase flip would strand the UI
+  // in "생각하는 중…" after the turn already finished.
   const handleSend = useCallback(
     async (payload: ChatPayload) => {
       if (store.getState().phase === "plan_review") {
+        store.log("you", payload.text);
+        store.log("agent", "계획 수정을 요청했습니다.");
+        store.planFeedbackSent();
         const sent = await clientRef.current?.send({
           type: "plan_feedback",
           text: payload.text,
         });
-        if (sent) {
-          store.log("you", payload.text);
-          store.log("agent", "계획 수정을 요청했습니다.");
-          store.planFeedbackSent();
+        if (!sent) {
+          store.errorReceived("계획 수정 요청을 처리하지 못했습니다.");
         }
         return;
       }
-      const sent = await clientRef.current?.send({ type: "chat", text: payload.text });
-      if (sent) {
-        store.log("you", payload.text);
-        store.chatSent(); // a new turn — the store resets the per-turn buffers.
+      store.log("you", payload.text);
+      store.chatSent(); // a new turn — the store resets the per-turn buffers.
+      const sent = await clientRef.current?.send({
+        type: "chat",
+        text: payload.text,
+      });
+      if (!sent) {
+        // The send failure detail is already logged by the client (onLog);
+        // this returns the phase to ready so the input is usable again.
+        store.errorReceived("요청을 처리하지 못했습니다.");
       }
     },
     [store],
@@ -348,14 +361,16 @@ export default function App() {
     void clientRef.current?.send({ type: "setup_pick_editor_path" });
   }, []);
 
-  // Plan approval: send plan_approve{}, archive the approval into the log, and
-  // start the apply turn (the store resets the per-turn buffers).
+  // Plan approval: archive the approval into the log and start the apply turn
+  // BEFORE awaiting (plan_approve also resolves only at turn end — see
+  // handleSend); a failed send returns the flow to ready.
   const handlePlanApprove = useCallback(async () => {
+    const rev = store.getState().plan?.revision;
+    store.log("agent", rev !== undefined ? `계획안(rev ${rev})을 승인했습니다.` : "계획을 승인했습니다.");
+    store.planApproveSent();
     const sent = await clientRef.current?.send({ type: "plan_approve" });
-    if (sent) {
-      const rev = store.getState().plan?.revision;
-      store.log("agent", rev !== undefined ? `계획안(rev ${rev})을 승인했습니다.` : "계획을 승인했습니다.");
-      store.planApproveSent();
+    if (!sent) {
+      store.errorReceived("계획 승인 요청을 처리하지 못했습니다.");
     }
   }, [store]);
 
