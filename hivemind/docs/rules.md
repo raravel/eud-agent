@@ -10,9 +10,12 @@ in-editor WebView2 hosting and Python server.
 - **NEVER modify EUD Editor 3 source, binaries, or repo** (third-party, Buizz). Integration
   = file copies only: `bridge/*.lua` into `Data\Lua\TriggerEditor\`; runtime state under
   `Data\agent\`.
-- **NEVER modify the ECA repo.** The RAG corpus there is read-only input; NEVER import its
-  `chromadb_bge` into this repo (chromadb mutates tracked sqlite on open — proven LFS
-  churn). The distributed RAG index is a CI artifact, not committed.
+- **The RAG corpus lives in-repo at `ci/corpus/*.jsonl`** (committed, plain git — NOT LFS),
+  produced locally by the Node/TS Naver-Cafe scraper (`tools/scraper`, cookie-gated, never in CI).
+  The legacy `chromadb_bge` sqlite (v1, formerly in the ECA repo) is unused and NEVER imported —
+  chromadb mutates tracked sqlite on open (proven LFS churn); that caveat is chromadb-specific. The
+  distributed RAG index (`rag-index.bin`) is a static read-only CI artifact published to a GitHub
+  Release, NOT committed. See [[decisions/15_in-house-rag-corpus]].
 - The isom-poc C++ is **vendored** under `native/isom/` and edited only there (our repo is
   source of truth). Add the C ABI shim; keep the verified IsomTerrain/ICU/CascLib code
   paths intact (import-then-extend).

@@ -59,8 +59,12 @@ happy-dom ^16.8.1.
 - `crates/isom-sys`, `crates/isom` — FFI bindings + safe wrapper for the C++ engine.
 - `native/isom/` — vendored C++ + C ABI shim.
 - `panel/` — React app (reused), Tauri IPC transport; built to `panel/dist`.
-- `ci/` — RAG index builder (re-embeds the ECA corpus with the runtime fastembed
-  pipeline; output published to GitHub Releases).
+- `ci/` — RAG index builder + the committed corpus `ci/corpus/*.jsonl` (re-embeds the in-repo
+  corpus with the runtime fastembed pipeline; output published to GitHub Releases).
+- `tools/scraper/` — Node.js + TypeScript Naver-Cafe scraper (local-only, cookie-gated) that
+  produces `ci/corpus/*.jsonl`; its own package.json/tsconfig (TypeScript ~5.9, matching panel).
+  Scraping deps (HTTP client + HTML parser + cookie handling) are pinned when EUD-138 lands and
+  bound here under Active Dependencies then. See [[decisions/15_in-house-rag-corpus]].
 
 ## Rationale
 - **Rust over Node/TS** (Decision 08): the small-distributable goal and the safety of the

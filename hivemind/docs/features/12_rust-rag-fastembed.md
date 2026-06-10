@@ -7,8 +7,8 @@ fastembed embeds the query, an in-memory brute-force cosine scan ranks a prebuil
 
 ## Embedding parity (do this FIRST — gating spike)
 The corpus index and the runtime query MUST share an embedding space, or retrieval breaks.
-- Build the index by re-embedding the ECA corpus with the SAME fastembed bge-m3 pipeline
-  used at query time — NOT a raw export of chromadb vectors.
+- Build the index by re-embedding the in-repo corpus (`ci/corpus/*.jsonl`) with the SAME fastembed
+  bge-m3 pipeline used at query time — NOT a raw export of chromadb vectors.
 - Validate: for a fixed query set, top-k (k=5) from the Rust path matches the Python
   `sentence-transformers` baseline within tolerance (e.g. >=4/5 overlap and rank
   correlation). Record the chosen fastembed model variant + normalization in the spec.
@@ -22,7 +22,7 @@ The corpus index and the runtime query MUST share an embedding space, or retriev
   L2-normalize it (cosine == dot). Baseline: Python `sentence-transformers`
   `SentenceTransformer("BAAI/bge-m3", normalize_embeddings=True)` (ECA `rag_query.py --bge`).
 - **Method**: `ci/gen_rag_parity_fixture.py` re-embeds a deterministic 167-doc subset of the
-  ECA corpus + 10 fixed Korean queries → `src-tauri/tests/fixtures/rag_parity.json`; the
+  corpus + 10 fixed Korean queries → `src-tauri/tests/fixtures/rag_parity.json`; the
   `#[ignore]` test `rag::parity` (run: `cargo test -p eud-agent rag::parity -- --ignored`)
   re-embeds the SAME texts with fastembed and compares per-query top-5.
 - **Result**: **set parity CONFIRMED** — 9/10 queries ≥4/5 top-5 overlap, mean 3.90/5 (only
@@ -67,10 +67,11 @@ sequenceDiagram
   evidence gate lifts on zero hits).
 
 ## CI index builder
-`ci/build_rag_index.*` re-embeds the ECA corpus (read-only input) with fastembed bge-m3 and
-writes `rag-index.bin` (the exact `ERAG`/v1 layout above, so the at-rest index and the
-runtime query share the embedding space) + a sha256; published as a versioned GitHub Release
-asset. The ECA repo and its chromadb are never modified or imported.
+`ci/build_rag_index.*` re-embeds the in-repo corpus (`ci/corpus/*.jsonl`, via the `--corpus` flag)
+with fastembed bge-m3 and writes `rag-index.bin` (the exact `ERAG`/v1 layout above, so the at-rest
+index and the runtime query share the embedding space) + a sha256; published as a versioned GitHub
+Release asset. The corpus is produced locally by `tools/scraper` (see [[decisions/15_in-house-rag-corpus]]);
+the legacy chromadb is never imported.
 
 ## Edge cases
 - Model still warming when a query arrives -> await warmup or return `rag_warmup` progress,
@@ -84,4 +85,4 @@ asset. The ECA repo and its chromadb are never modified or imported.
 - `ci/build_rag_index.rs` (or script) — corpus re-embed + `.bin` (`ERAG`/v1) writer + sha256
 - `src-tauri/src/rag.rs` `#[cfg(test)] mod parity` — `#[ignore]` parity test vs Python baseline fixtures
 - external: `fastembed` (bge-m3 ONNX + HF cache), `ort` (transitive) — **no `rusqlite`**
-- [BOUND 2026-06-10 from EUD-118-1729] `.github/workflows/build-rag-index.yml` — CI workflow (tag `rag-index-v*` / manual): builds the `ci/build_rag_index` standalone builder, runs it against the checked-out ECA corpus, and publishes `rag-index.bin` + `.sha256` + a `rag_index{url,sha256,version}` manifest as a GitHub Release asset for the bootstrap (feature 10). Requires repo `vars.ECA_REPO` + `secrets.ECA_TOKEN`.
+- [BOUND 2026-06-10 from EUD-118-1729; revised by Decision 15] `.github/workflows/build-rag-index.yml` — CI workflow (tag `rag-index-v*` / manual): builds the `ci/build_rag_index` standalone builder, runs it against the in-repo corpus (`ci/corpus`), and publishes `rag-index.bin` + `.sha256` + a `rag_index{url,sha256,version}` manifest as a GitHub Release asset for the bootstrap (feature 10). The ECA checkout + `vars.ECA_REPO`/`secrets.ECA_TOKEN` are removed (EUD-140).

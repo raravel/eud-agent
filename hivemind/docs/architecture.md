@@ -151,13 +151,15 @@ eud-agent/
 ├── native/isom/                    # vendored isom-poc C++ + C ABI shim
 ├── panel/                          # React app (reused); Tauri IPC client
 │   └── dist/                       # build output — bundled by Tauri (gitignored)
-├── ci/                             # RAG index builder (re-embeds ECA corpus)
+├── ci/                             # RAG index builder + committed corpus (ci/corpus/*.jsonl)
+├── tools/scraper/                  # Node/TS Naver-Cafe scraper (local, cookie) -> corpus
 └── scripts/                        # install_bridge.ps1, dev_run.ps1
 ```
 
-The RAG corpus source stays in the ECA repo (`C:\Users\ifthe\proj\eud\ECA`); the
-distributed RAG index is a CI artifact published to GitHub Releases, never committed
-here (chromadb sqlite churn — see rules.md).
+The RAG corpus lives in-repo at `ci/corpus/*.jsonl` (scraped locally by `tools/scraper`, committed
+in plain git — not LFS); the CI re-embeds it and publishes the static `rag-index.bin` as a GitHub
+Release asset, never committed here (see [[decisions/15_in-house-rag-corpus]]; the chromadb-sqlite
+churn caveat in rules.md applies only to the legacy chromadb, not the static `.bin`).
 
 ## Key design decisions (carry-over, still in force)
 

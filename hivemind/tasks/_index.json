@@ -2288,15 +2288,15 @@
       ]
     },
     "EUD-139-66d8": {
-      "status": "pending",
+      "status": "done",
       "priority": "medium",
       "type": "chore",
       "parent": "EUD-135-2f41",
       "depends_on": [],
       "title": "Align harness docs to in-house corpus (Decision 15)",
       "updated": "2026-06-10",
-      "completed_at": null,
-      "path": "active/EUD-139-66d8.md",
+      "completed_at": "2026-06-10T14:12:57.263761",
+      "path": "done/EUD-139-66d8.md",
       "scope": [
         "hivemind/docs/rules.md",
         "hivemind/docs/architecture.md",
