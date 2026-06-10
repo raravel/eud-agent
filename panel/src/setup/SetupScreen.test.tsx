@@ -110,6 +110,25 @@ describe("SetupScreen", () => {
     expect(screen.queryByText("invalid_editor_folder")).not.toBeInTheDocument();
   });
 
+  it("marks step 1 current while picking and step 2 current while downloading", () => {
+    const { unmount } = renderScreen({ editorValid: false });
+    expect(
+      screen.getByText("에디터 폴더").closest("li"),
+    ).toHaveAttribute("aria-current", "step");
+    expect(
+      screen.getByText("에셋 다운로드").closest("li"),
+    ).not.toHaveAttribute("aria-current");
+    unmount();
+
+    renderScreen({ editorValid: true });
+    expect(
+      screen.getByText("에셋 다운로드").closest("li"),
+    ).toHaveAttribute("aria-current", "step");
+    expect(
+      screen.getByText("에디터 폴더").closest("li"),
+    ).not.toHaveAttribute("aria-current");
+  });
+
   it("prefers the pick step over download UI while the path is invalid", () => {
     // A stale bootstrap error must not hide the picker (the pick step is the
     // prerequisite; retry without a valid path would fail again).
