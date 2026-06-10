@@ -15,7 +15,11 @@ const EMBED_DIM: usize = 1024;
 const INDEX_MAGIC: &[u8; 4] = b"ERAG";
 const INDEX_VERSION: u32 = 1;
 const INPUT_FILES: [&str; 3] = ["articles.jsonl", "eud_book.jsonl", "cafebook.jsonl"];
-const EMBED_BATCH_SIZE: usize = 16;
+// The int8 BGEM3Q model's embeddings are batch-size-dependent (measured:
+// batch 64 drifts cosine to ~0.98 vs batch 16), so this default MUST stay
+// 16 to keep the index byte-equivalent to the verified embedding space.
+// The --batch/BATCH_SIZE override is for CI throughput experiments only.
+const DEFAULT_BATCH_SIZE: usize = 16;
 const CHUNK_CHARS: usize = 2000;
 const CHUNK_OVERLAP: usize = 200;
 
@@ -24,6 +28,7 @@ struct Args {
     corpus_dir: PathBuf,
     out: PathBuf,
     cache_dir: Option<PathBuf>,
+    batch_size: usize,
 }
 
 #[derive(Debug)]
@@ -56,7 +61,7 @@ struct JsonlRow {
 fn main() -> Result<()> {
     let args = parse_args()?;
     let docs = read_corpus(&args.corpus_dir)?;
-    let entries = embed_docs(docs, args.cache_dir)?;
+    let entries = embed_docs(docs, args.cache_dir, args.batch_size)?;
     write_index(&args.out, &entries)?;
     let digest = write_sha256_sidecar(&args.out)?;
 
@@ -74,11 +79,16 @@ fn resolve_corpus_dir(cli: Option<PathBuf>, env: Option<PathBuf>) -> PathBuf {
     cli.or(env).unwrap_or_else(|| PathBuf::from("ci/corpus"))
 }
 
+fn resolve_batch_size(cli: Option<usize>, env: Option<usize>) -> usize {
+    cli.or(env).unwrap_or(DEFAULT_BATCH_SIZE)
+}
+
 fn parse_args() -> Result<Args> {
     let mut corpus_dir_cli = None;
     let corpus_dir_env = env::var_os("CORPUS_DIR").map(PathBuf::from);
     let mut out = None;
     let mut cache_dir = None;
+    let mut batch_size_cli = None;
 
     let mut args = env::args_os().skip(1);
     while let Some(arg) = args.next() {
@@ -101,6 +111,12 @@ fn parse_args() -> Result<Args> {
                         anyhow!("--cache requires a cache directory path")
                     })?));
             }
+            "--batch" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| anyhow!("--batch requires a positive integer"))?;
+                batch_size_cli = Some(parse_batch_size("--batch", &value.to_string_lossy())?);
+            }
             "--help" | "-h" => {
                 print_usage();
                 std::process::exit(0);
@@ -109,17 +125,38 @@ fn parse_args() -> Result<Args> {
         }
     }
 
+    let batch_size_env = if batch_size_cli.is_none() {
+        match env::var("BATCH_SIZE") {
+            Ok(value) => Some(parse_batch_size("BATCH_SIZE", &value)?),
+            Err(env::VarError::NotPresent) => None,
+            Err(env::VarError::NotUnicode(_)) => bail!("BATCH_SIZE must be valid UTF-8"),
+        }
+    } else {
+        None
+    };
+
     Ok(Args {
         corpus_dir: resolve_corpus_dir(corpus_dir_cli, corpus_dir_env),
         out: out.unwrap_or_else(|| PathBuf::from("rag-index.bin")),
         cache_dir,
+        batch_size: resolve_batch_size(batch_size_cli, batch_size_env),
     })
+}
+
+fn parse_batch_size(name: &str, value: &str) -> Result<usize> {
+    let batch_size = value
+        .parse::<usize>()
+        .map_err(|_| anyhow!("{name} must be a positive integer, got {value:?}"))?;
+    if batch_size == 0 {
+        bail!("{name} must be greater than 0");
+    }
+    Ok(batch_size)
 }
 
 fn print_usage() {
     eprintln!(
-        "usage: build_rag_index [--corpus <dir>] [--out <file>] [--cache <dir>]\n\
-         defaults: --corpus %CORPUS_DIR% or ci/corpus; --out rag-index.bin"
+        "usage: build_rag_index [--corpus <dir>] [--out <file>] [--cache <dir>] [--batch <n>]\n\
+         defaults: --corpus %CORPUS_DIR% or ci/corpus; --out rag-index.bin; --batch %BATCH_SIZE% or 16"
     );
 }
 
@@ -235,8 +272,15 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
     hash
 }
 
-fn embed_docs(docs: Vec<CorpusDoc>, cache_dir: Option<PathBuf>) -> Result<Vec<IndexEntry>> {
-    let mut opts = Bgem3InitOptions::new(Bgem3Model::BGEM3Q);
+fn embed_docs(
+    docs: Vec<CorpusDoc>,
+    cache_dir: Option<PathBuf>,
+    batch_size: usize,
+) -> Result<Vec<IndexEntry>> {
+    let intra_threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    let mut opts = Bgem3InitOptions::new(Bgem3Model::BGEM3Q).with_intra_threads(intra_threads);
     if let Some(dir) = cache_dir {
         opts = opts.with_cache_dir(dir);
     }
@@ -245,10 +289,10 @@ fn embed_docs(docs: Vec<CorpusDoc>, cache_dir: Option<PathBuf>) -> Result<Vec<In
         Bgem3Embedding::try_new(opts).map_err(|e| anyhow!("model init failed: {e}"))?;
     let mut entries = Vec::with_capacity(docs.len());
 
-    for chunk in docs.chunks(EMBED_BATCH_SIZE) {
+    for chunk in docs.chunks(batch_size) {
         let texts: Vec<String> = chunk.iter().map(|doc| doc.text.clone()).collect();
         let output = embedder
-            .embed(&texts, None)
+            .embed(&texts, Some(batch_size))
             .map_err(|e| anyhow!("embedding batch failed: {e}"))?;
 
         if output.dense.len() != chunk.len() {
@@ -371,5 +415,15 @@ mod tests {
             super::resolve_corpus_dir(None, None),
             PathBuf::from("ci/corpus")
         );
+    }
+
+    #[test]
+    fn resolve_batch_size_uses_cli_then_env_then_default() {
+        assert_eq!(
+            super::resolve_batch_size(None, None),
+            super::DEFAULT_BATCH_SIZE
+        );
+        assert_eq!(super::resolve_batch_size(Some(128), Some(64)), 128);
+        assert_eq!(super::resolve_batch_size(None, Some(64)), 64);
     }
 }
