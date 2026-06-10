@@ -31,6 +31,12 @@ pub fn run() {
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
+            let data_dirs = config::DataDirs::resolve(&*app)?;
+            if let Ok(bridge) = ipc::bridge_from_config(&data_dirs) {
+                bridge.cleanup_stale();
+            }
+            app.manage(ipc::BridgeManaged::new(data_dirs));
+
             let app_handle = app.handle().clone();
             let sink = engine::TauriEventSink::new(app_handle.clone());
             let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));

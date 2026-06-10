@@ -2398,15 +2398,15 @@
       "scope": []
     },
     "EUD-147-4c22": {
-      "status": "pending",
+      "status": "done",
       "priority": "high",
       "type": "task",
       "parent": "EUD-146-dd74",
       "depends_on": [],
       "title": "Wire status/list Tauri commands to bridge_io file-IPC",
       "updated": "2026-06-10",
-      "completed_at": null,
-      "path": "active/EUD-147-4c22.md",
+      "completed_at": "2026-06-10T21:29:16.472241",
+      "path": "done/EUD-147-4c22.md",
       "scope": [
         "src-tauri/src/ipc.rs",
         "src-tauri/src/bridge_io.rs",

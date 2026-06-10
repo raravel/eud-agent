@@ -4,8 +4,47 @@
 //! are emitted as typed Tauri events. The command bodies are placeholders until the engine
 //! orchestration task wires RAG, Codex, LSP, and editor bridge calls into this surface.
 
+use std::path::Path;
+
+use crate::bridge_io::{BridgeIo, SendOpts, HEARTBEAT_STALE_AFTER};
+use crate::config::{self, DataDirs};
 use serde::{Deserialize, Serialize};
 use tauri::Emitter;
+
+const EDITOR_NOT_CONNECTED: &str = "editor not connected";
+
+/// Managed app data-dir state used by bridge-backed IPC commands.
+///
+/// Commands resolve `config.json` on every call so first-run/editor-path edits take effect
+/// without restarting the Tauri app.
+#[derive(Debug, Clone)]
+pub struct BridgeManaged {
+    dirs: DataDirs,
+}
+
+impl BridgeManaged {
+    /// Create managed bridge state from resolved app data directories.
+    pub fn new(dirs: DataDirs) -> Self {
+        Self { dirs }
+    }
+
+    /// Resolved app data directories.
+    pub fn dirs(&self) -> &DataDirs {
+        &self.dirs
+    }
+}
+
+/// Resolve a bridge client from `config.json`.
+pub fn bridge_from_config(dirs: &DataDirs) -> Result<BridgeIo, String> {
+    let config = dirs.load_config().map_err(|error| error.to_string())?;
+    let editor_path = config.editor_path.trim();
+    if editor_path.is_empty() {
+        return Err(EDITOR_NOT_CONNECTED.to_string());
+    }
+    Ok(BridgeIo::new(config::editor_ipc_dir(Path::new(
+        editor_path,
+    ))))
+}
 
 /// `chat` command input.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -265,22 +304,58 @@ pub async fn reset() -> Result<(), String> {
 }
 
 /// Read editor compile/project status.
-///
-/// The bridge task replaces this placeholder body with status.txt parsing.
 #[tauri::command]
-pub async fn status() -> Result<StatusResponse, String> {
+pub async fn status(state: tauri::State<'_, BridgeManaged>) -> Result<StatusResponse, String> {
+    let bridge = bridge_from_config(state.dirs())?;
+    let snapshot = tauri::async_runtime::spawn_blocking(move || {
+        bridge.read_status_snapshot(HEARTBEAT_STALE_AFTER)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+    .map_err(|error| error.to_string())?;
+
     Ok(StatusResponse {
-        compiling: false,
-        project: String::new(),
+        compiling: snapshot.compiling,
+        project: snapshot.project,
     })
 }
 
 /// List editor files available through the bridge.
 ///
-/// The bridge task replaces this placeholder body with the LIST command.
+/// While the editor is compiling the bridge round-trip extends to the busy timeout; the
+/// `on_busy` hook emits `progress {stage: waiting_build}` so the panel can surface the
+/// build wait instead of appearing stuck (rules.md IPC timeout/progress contract).
 #[tauri::command]
-pub async fn list() -> Result<ListResponse, String> {
-    Ok(ListResponse { files: Vec::new() })
+pub async fn list(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, BridgeManaged>,
+) -> Result<ListResponse, String> {
+    let bridge = bridge_from_config(state.dirs())?;
+    let files = tauri::async_runtime::spawn_blocking(move || {
+        let opts = SendOpts::default();
+        let on_busy = || {
+            let _ = emit_progress(
+                &app,
+                ProgressEvent {
+                    stage: ProgressStage::WaitingBuild,
+                    detail: Some("editor build in progress".to_string()),
+                },
+            );
+        };
+        bridge.list_connected(&opts, Some(&on_busy), HEARTBEAT_STALE_AFTER)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+    .map_err(|error| error.to_string())?
+    .into_iter()
+    .map(|entry| FileEntry {
+        path: entry.path,
+        ftype: entry.ftype,
+        settable: entry.settable,
+    })
+    .collect();
+
+    Ok(ListResponse { files })
 }
 
 /// Emit an `agent_event` event.
@@ -349,8 +424,23 @@ pub fn emit_status<R: tauri::Runtime>(
 
 #[cfg(test)]
 mod tests {
+    use crate::config::{Config, DataDirs};
     use crate::ipc;
     use serde_json::json;
+    use std::fs;
+    use std::path::PathBuf;
+
+    /// Unique temp base dir for a test, avoiding a `tempfile` dev-dependency
+    /// (Cargo.toml is out of scope for this task).
+    fn unique_temp_dir(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("eud-agent-ipc-test-{tag}-{nanos}"));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
 
     fn assert_json<T: serde::Serialize>(value: &T, expected: serde_json::Value) {
         assert_eq!(serde_json::to_value(value).unwrap(), expected);
@@ -481,6 +571,19 @@ mod tests {
                 "message": "editor not connected"
             }),
         );
+    }
+
+    #[test]
+    fn bridge_state_from_config_rejects_unset_editor_path() {
+        let base = unique_temp_dir("unset-editor");
+        let dirs = DataDirs::from_bases(&base.join("roaming"), &base.join("local"));
+        dirs.save_config(&Config::default()).unwrap();
+
+        let err = ipc::bridge_from_config(&dirs).unwrap_err();
+
+        assert_eq!(err, "editor not connected");
+
+        fs::remove_dir_all(&base).ok();
     }
 
     #[test]

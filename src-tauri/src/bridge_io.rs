@@ -16,6 +16,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_BUSY_TIMEOUT: Duration = Duration::from_secs(180);
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(200);
+/// Heartbeat freshness window used by app-facing editor liveness checks.
+///
+/// The Lua bridge writes `heartbeat.txt` on roughly every 1s UI tick, so a 3s window
+/// tolerates short scheduling delays while still surfacing a disconnected editor quickly.
+pub const HEARTBEAT_STALE_AFTER: Duration = Duration::from_secs(3);
+const EDITOR_NOT_CONNECTED_MESSAGE: &str = "editor not connected";
 const SETTABLE_FAMILIES: [&str; 2] = ["CUI", "RAWTEXT"];
 const DAT_NAMES: [&str; 10] = [
     "units", "weapons", "flingy", "sprites", "images", "upgrades", "techdata", "orders",
@@ -31,6 +37,7 @@ pub struct BridgeIo {
     inbox: PathBuf,
     outbox: PathBuf,
     status_file: PathBuf,
+    heartbeat_file: PathBuf,
 }
 
 /// Polling and busy-editor timeout settings for a bridge request.
@@ -59,9 +66,20 @@ pub struct FileEntry {
     pub settable: bool,
 }
 
+/// Editor status read directly from `status.txt`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatusSnapshot {
+    /// True while EUD Editor is compiling.
+    pub compiling: bool,
+    /// Current project line from the editor status file.
+    pub project: String,
+}
+
 /// Errors returned by the file-IPC bridge client.
 #[derive(Debug)]
 pub enum BridgeError {
+    /// The editor bridge heartbeat is absent or stale.
+    EditorNotConnected,
     /// The bridge returned an `ERROR:`-prefixed reply.
     Error(String),
     /// The bridge did not answer before the selected timeout window.
@@ -73,6 +91,7 @@ pub enum BridgeError {
 impl fmt::Display for BridgeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::EditorNotConnected => f.write_str(EDITOR_NOT_CONNECTED_MESSAGE),
             Self::Error(message) | Self::Busy(message) => f.write_str(message),
             Self::Io(error) => write!(f, "{error}"),
         }
@@ -83,7 +102,7 @@ impl Error for BridgeError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Io(error) => Some(error),
-            Self::Error(_) | Self::Busy(_) => None,
+            Self::EditorNotConnected | Self::Error(_) | Self::Busy(_) => None,
         }
     }
 }
@@ -102,6 +121,7 @@ impl BridgeIo {
             inbox: data_dir.join("inbox"),
             outbox: data_dir.join("outbox"),
             status_file: data_dir.join("status.txt"),
+            heartbeat_file: data_dir.join("heartbeat.txt"),
             data_dir,
         }
     }
@@ -183,6 +203,39 @@ impl BridgeIo {
         self.send("STATUS", opts, on_busy)
     }
 
+    /// Read editor status directly from `status.txt` after validating heartbeat freshness.
+    pub fn read_status_snapshot(
+        &self,
+        stale_after: Duration,
+    ) -> Result<StatusSnapshot, BridgeError> {
+        self.read_status_snapshot_at(SystemTime::now(), stale_after)
+    }
+
+    /// Read editor status directly from `status.txt` using an injected clock for tests.
+    pub fn read_status_snapshot_at(
+        &self,
+        now: SystemTime,
+        stale_after: Duration,
+    ) -> Result<StatusSnapshot, BridgeError> {
+        self.ensure_heartbeat_fresh_at(now, stale_after)?;
+
+        let text = fs::read_to_string(&self.status_file)?;
+        let mut compiling = false;
+        let mut project = String::new();
+        for line in text.lines() {
+            let Some((key, value)) = line.split_once('=') else {
+                continue;
+            };
+            if key.trim().eq_ignore_ascii_case("compiling") {
+                compiling = value.trim().eq_ignore_ascii_case("true");
+            } else if key.trim().eq_ignore_ascii_case("project") {
+                project = value.trim().to_string();
+            }
+        }
+
+        Ok(StatusSnapshot { compiling, project })
+    }
+
     /// Project file tree parsed from `path\t<EFileType>` bridge lines.
     pub fn list(
         &self,
@@ -207,6 +260,28 @@ impl BridgeIo {
             });
         }
         Ok(files)
+    }
+
+    /// List project files only when the editor heartbeat is fresh.
+    pub fn list_connected(
+        &self,
+        opts: &SendOpts,
+        on_busy: Option<&dyn Fn()>,
+        stale_after: Duration,
+    ) -> Result<Vec<FileEntry>, BridgeError> {
+        self.list_connected_at(opts, on_busy, SystemTime::now(), stale_after)
+    }
+
+    /// List project files only when the editor heartbeat is fresh, using an injected clock.
+    pub fn list_connected_at(
+        &self,
+        opts: &SendOpts,
+        on_busy: Option<&dyn Fn()>,
+        now: SystemTime,
+        stale_after: Duration,
+    ) -> Result<Vec<FileEntry>, BridgeError> {
+        self.ensure_heartbeat_fresh_at(now, stale_after)?;
+        self.list(opts, on_busy)
     }
 
     /// Read a project file by path.
@@ -313,6 +388,22 @@ impl BridgeIo {
         fs::write(&tmp_path, command_text.as_bytes())?;
         fs::rename(&tmp_path, cmd_path)?;
         Ok(())
+    }
+
+    fn ensure_heartbeat_fresh_at(
+        &self,
+        now: SystemTime,
+        stale_after: Duration,
+    ) -> Result<(), BridgeError> {
+        let modified = fs::metadata(&self.heartbeat_file)
+            .and_then(|metadata| metadata.modified())
+            .map_err(|_| BridgeError::EditorNotConnected)?;
+        let age = now.duration_since(modified).unwrap_or(Duration::ZERO);
+        if age > stale_after {
+            Err(BridgeError::EditorNotConnected)
+        } else {
+            Ok(())
+        }
     }
 
     fn consume_result(
@@ -548,6 +639,12 @@ mod tests {
         match command {
             "PING" => "PONG 123".to_string(),
             "STATUS" => "compiling=false\nproject=Demo\nversion=3".to_string(),
+            "LIST" => [
+                "triggers/main.eps\tRawText",
+                "ui/dialog.cui\tCUI",
+                "scenario.chk\tCHK",
+            ]
+            .join("\n"),
             "GET scripts/main.eps" => "function main()\n    // file body\nend".to_string(),
             "SET scripts/main.eps\nline1\nline2" => "OK".to_string(),
             other => format!("ERROR: unexpected command {other}"),
@@ -622,6 +719,119 @@ mod tests {
                 handle.join().unwrap();
             }
         }
+    }
+
+    // Target contract for EUD-147: the Lua bridge writes heartbeat.txt roughly every UI
+    // tick (~1s), so app-side liveness should treat a heartbeat older than 3s as stale.
+    const TARGET_HEARTBEAT_STALE_AFTER: Duration = Duration::from_secs(3);
+    const EDITOR_NOT_CONNECTED: &str = "editor not connected";
+
+    fn write_live_status_files(data_dir: &Path, compiling: bool, project: &str) -> SystemTime {
+        fs::create_dir_all(data_dir).unwrap();
+        fs::write(
+            data_dir.join("status.txt"),
+            format!("compiling={compiling}\nproject={project}\n"),
+        )
+        .unwrap();
+        fs::write(data_dir.join("heartbeat.txt"), b"alive\n").unwrap();
+        SystemTime::now()
+    }
+
+    fn assert_editor_not_connected(error: BridgeError) {
+        assert_eq!(error.to_string(), EDITOR_NOT_CONNECTED);
+    }
+
+    #[test]
+    fn status_snapshot_reads_status_txt_when_heartbeat_is_fresh() {
+        let data_dir = unique_temp_dir("status-fresh");
+        let now = write_live_status_files(&data_dir, true, "DemoProject");
+        let bridge = BridgeIo::new(&data_dir);
+
+        let status = bridge
+            .read_status_snapshot_at(now, TARGET_HEARTBEAT_STALE_AFTER)
+            .unwrap();
+
+        assert!(status.compiling);
+        assert_eq!(status.project, "DemoProject");
+
+        fs::remove_dir_all(&data_dir).ok();
+    }
+
+    #[test]
+    fn status_snapshot_rejects_stale_or_absent_heartbeat() {
+        let data_dir = unique_temp_dir("status-stale");
+        let heartbeat_time = write_live_status_files(&data_dir, false, "DemoProject");
+        let bridge = BridgeIo::new(&data_dir);
+
+        let stale_now = heartbeat_time + TARGET_HEARTBEAT_STALE_AFTER + Duration::from_millis(1);
+        assert_editor_not_connected(
+            bridge
+                .read_status_snapshot_at(stale_now, TARGET_HEARTBEAT_STALE_AFTER)
+                .unwrap_err(),
+        );
+
+        fs::remove_file(data_dir.join("heartbeat.txt")).unwrap();
+        assert_editor_not_connected(
+            bridge
+                .read_status_snapshot_at(SystemTime::now(), TARGET_HEARTBEAT_STALE_AFTER)
+                .unwrap_err(),
+        );
+
+        fs::remove_dir_all(&data_dir).ok();
+    }
+
+    #[test]
+    fn connected_list_round_trip_derives_settable_from_file_type() {
+        let data_dir = unique_temp_dir("list-connected");
+        let now = write_live_status_files(&data_dir, false, "DemoProject");
+        let seen: SeenLog = Arc::new(Mutex::new(Vec::new()));
+        let _fake = FakeBridge::spawn(&data_dir, 1, Arc::clone(&seen));
+        let bridge = BridgeIo::new(&data_dir);
+        let opts = fast_opts();
+
+        let files = bridge
+            .list_connected_at(&opts, None, now, TARGET_HEARTBEAT_STALE_AFTER)
+            .unwrap();
+
+        assert_eq!(files.len(), 3);
+        assert_eq!(files[0].path, "triggers/main.eps");
+        assert_eq!(files[0].ftype, "RawText");
+        assert!(files[0].settable);
+        assert_eq!(files[1].path, "ui/dialog.cui");
+        assert_eq!(files[1].ftype, "CUI");
+        assert!(files[1].settable);
+        assert_eq!(files[2].path, "scenario.chk");
+        assert_eq!(files[2].ftype, "CHK");
+        assert!(!files[2].settable);
+
+        let commands: Vec<String> = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(command, _)| command.clone())
+            .collect();
+        assert_eq!(commands, vec!["LIST".to_string()]);
+        assert!(
+            srv_entries(&data_dir.join("outbox"), ".result").is_empty(),
+            "BridgeIo should delete consumed LIST .result files"
+        );
+
+        fs::remove_dir_all(&data_dir).ok();
+    }
+
+    #[test]
+    fn connected_list_returns_editor_not_connected_without_heartbeat_or_data_dir() {
+        let data_dir = unique_temp_dir("list-disconnected");
+        let bridge = BridgeIo::new(data_dir.join("missing-agent-dir"));
+        let opts = fast_opts();
+
+        assert_editor_not_connected(
+            bridge
+                .list_connected_at(&opts, None, SystemTime::now(), TARGET_HEARTBEAT_STALE_AFTER)
+                .unwrap_err(),
+        );
+
+        fs::remove_dir_all(&data_dir).ok();
     }
 
     #[test]
