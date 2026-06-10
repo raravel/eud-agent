@@ -22,7 +22,7 @@ permissions:
 
 jobs:
   build-rag-index:
-    runs-on: windows-latest
+    runs-on: ubuntu-latest
 
     steps:
       - name: Checkout repository
@@ -40,43 +40,41 @@ jobs:
       - name: Build index builder
         run: cargo build --release --manifest-path ci/Cargo.toml --bin build_rag_index
 
+      - name: Cache fastembed model
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/fastembed
+          key: fastembed-bgem3-${{ runner.os }}
+
       - name: Build RAG index
         # The first run downloads fastembed's BGEM3Q model, about 570 MB, so this
         # step can take several minutes before embedding starts.
-        run: .\ci\target\release\build_rag_index.exe --corpus ci/corpus --out rag-index.bin
+        run: ./ci/target/release/build_rag_index --corpus ci/corpus --cache "$RUNNER_TEMP/fastembed" --out rag-index.bin
 
       - name: Generate release manifest
         id: manifest
         env:
           DISPATCH_VERSION: ${{ inputs.version }}
+          REF_NAME: ${{ github.ref_name }}
+        shell: bash
         run: |
-          $version = $env:DISPATCH_VERSION
-          if ([string]::IsNullOrWhiteSpace($version) -and "${{ github.ref_name }}" -like "rag-index-v*") {
-            $version = "${{ github.ref_name }}".Substring("rag-index-v".Length)
-          }
-          if ([string]::IsNullOrWhiteSpace($version)) {
-            $version = "1"
-          }
+          version="${DISPATCH_VERSION:-}"
+          if [[ -z "$version" && "$REF_NAME" == rag-index-v* ]]; then
+            version="${REF_NAME#rag-index-v}"
+          fi
+          if [[ -z "$version" ]]; then
+            version="1"
+          fi
 
-          $tag = "rag-index-v$version"
-          $sha256 = (Get-Content -Raw -Path "rag-index.bin.sha256").Trim()
-          $assetUrl = "https://github.com/${{ github.repository }}/releases/download/$tag/rag-index.bin"
-          $manifest = [ordered]@{
-            rag_index = [ordered]@{
-              url = $assetUrl
-              sha256 = $sha256
-              version = $version
-            }
-          }
+          tag="rag-index-v$version"
+          sha256="$(awk '{print $1; exit}' rag-index.bin.sha256)"
+          jq -n \
+            --arg url "https://github.com/${{ github.repository }}/releases/download/$tag/rag-index.bin" \
+            --arg sha256 "$sha256" \
+            --arg version "$version" \
+            '{rag_index:{url:$url,sha256:$sha256,version:$version}}' > rag-index.manifest.json
 
-          $json = $manifest | ConvertTo-Json -Depth 4
-          [System.IO.File]::WriteAllText(
-            (Join-Path $PWD "rag-index.manifest.json"),
-            $json,
-            [System.Text.UTF8Encoding]::new($false)
-          )
-
-          "tag=$tag" >> $env:GITHUB_OUTPUT
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
       - name: Publish RAG index release
         uses: softprops/action-gh-release@v2
