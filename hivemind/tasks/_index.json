@@ -2221,27 +2221,27 @@
       ]
     },
     "EUD-134-0351": {
-      "status": "pending",
+      "status": "done",
       "priority": "medium",
       "type": "epic",
       "parent": null,
       "depends_on": [],
       "title": "In-house RAG corpus pipeline (decouple ECA)",
       "updated": "2026-06-10",
-      "completed_at": null,
-      "path": "active/EUD-134-0351.md",
+      "completed_at": "2026-06-10T15:18:12.579238",
+      "path": "done/EUD-134-0351.md",
       "scope": []
     },
     "EUD-135-2f41": {
-      "status": "pending",
+      "status": "done",
       "priority": "medium",
       "type": "story",
       "parent": "EUD-134-0351",
       "depends_on": [],
       "title": "RAG corpus pipeline",
       "updated": "2026-06-10",
-      "completed_at": null,
-      "path": "active/EUD-135-2f41.md",
+      "completed_at": "2026-06-10T15:18:12.557202",
+      "path": "done/EUD-135-2f41.md",
       "scope": []
     },
     "EUD-136-ea37": {
@@ -2305,7 +2305,7 @@
       ]
     },
     "EUD-140-c28a": {
-      "status": "pending",
+      "status": "done",
       "priority": "medium",
       "type": "task",
       "parent": "EUD-135-2f41",
@@ -2315,8 +2315,8 @@
       ],
       "title": "Drop ECA from build-rag-index CI workflow",
       "updated": "2026-06-10",
-      "completed_at": null,
-      "path": "active/EUD-140-c28a.md",
+      "completed_at": "2026-06-10T15:18:12.522830",
+      "path": "done/EUD-140-c28a.md",
       "scope": [
         ".github/workflows/build-rag-index.yml"
       ]

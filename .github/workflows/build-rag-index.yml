@@ -4,8 +4,12 @@ name: Build RAG Index
 # and optionally provide the version input.
 on:
   push:
+    branches:
+      - main
     tags:
       - "rag-index-v*"
+    paths:
+      - "ci/corpus/**"
   workflow_dispatch:
     inputs:
       version:
@@ -24,15 +28,6 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # Configure vars.ECA_REPO, for example owner/ECA, and secrets.ECA_TOKEN,
-      # a PAT with read access to that private read-only corpus repository.
-      - name: Checkout ECA corpus
-        uses: actions/checkout@v4
-        with:
-          repository: ${{ vars.ECA_REPO }}
-          token: ${{ secrets.ECA_TOKEN }}
-          path: eca
-
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
@@ -48,7 +43,7 @@ jobs:
       - name: Build RAG index
         # The first run downloads fastembed's BGEM3Q model, about 570 MB, so this
         # step can take several minutes before embedding starts.
-        run: .\ci\target\release\build_rag_index.exe --eca eca --out rag-index.bin
+        run: .\ci\target\release\build_rag_index.exe --corpus ci/corpus --out rag-index.bin
 
       - name: Generate release manifest
         id: manifest
