@@ -1502,15 +1502,15 @@
       ]
     },
     "EUD-090-b768": {
-      "status": "pending",
+      "status": "done",
       "priority": "high",
       "type": "epic",
       "parent": null,
       "depends_on": [],
       "title": "Tauri + Rust standalone rewrite (v2 architecture)",
-      "updated": "2026-06-08",
-      "completed_at": null,
-      "path": "active/EUD-090-b768.md",
+      "updated": "2026-06-10",
+      "completed_at": "2026-06-10T13:33:38.090047",
+      "path": "done/EUD-090-b768.md",
       "scope": []
     },
     "EUD-091-4cb2": {
@@ -1586,15 +1586,15 @@
       "scope": []
     },
     "EUD-097-7931": {
-      "status": "pending",
+      "status": "done",
       "priority": "medium",
       "type": "story",
       "parent": "EUD-090-b768",
       "depends_on": [],
       "title": "S7 Distribution & CI packaging",
-      "updated": "2026-06-08",
-      "completed_at": null,
-      "path": "active/EUD-097-7931.md",
+      "updated": "2026-06-10",
+      "completed_at": "2026-06-10T13:33:38.068519",
+      "path": "done/EUD-097-7931.md",
       "scope": []
     },
     "EUD-098-fe34": {
@@ -2009,7 +2009,7 @@
       ]
     },
     "EUD-121-8ff9": {
-      "status": "pending",
+      "status": "done",
       "priority": "low",
       "type": "chore",
       "parent": "EUD-097-7931",
@@ -2017,11 +2017,13 @@
         "EUD-114-57dd"
       ],
       "title": "Remove server/ Python stack after Rust parity",
-      "updated": "2026-06-08",
-      "completed_at": null,
-      "path": "active/EUD-121-8ff9.md",
+      "updated": "2026-06-10",
+      "completed_at": "2026-06-10T13:33:38.037265",
+      "path": "done/EUD-121-8ff9.md",
       "scope": [
-        "server"
+        "server",
+        "scripts",
+        ".gitignore"
       ]
     },
     "EUD-122-7745": {

@@ -6,23 +6,19 @@
     source ASCII-only (5.1 reads BOM-less files as ANSI/CP949).
 
 .DESCRIPTION
-    Dot-sourced by setup_env.ps1 and install_dropin.ps1 so both ends of the
-    install path agree on what a working environment needs:
-      - uv          : creates/syncs server\.venv (tech-stack.md convention)
-      - codex       : the LLM CLI the server spawns. Resolve order mirrors
-                      server/eud_agent/config.py _resolve_codex (CODEX_CMD env
-                      override first, then PATH). NEVER spawn bare "codex"
-                      (rules.md) -- we resolve to a real file path and fail
-                      with install guidance otherwise.
-      - venv python : server\.venv\Scripts\python.exe, the product of
-                      setup_env.ps1 (agent.cfg points the bridge at it).
+    The v2 Tauri/Rust app has no Python venv: the old `uv` + `venv-python`
+    checks are gone with the `server/` stack. The one remaining runtime
+    prerequisite is the codex CLI the Rust core spawns:
+      - codex : the LLM CLI. Resolve order is CODEX_CMD env override first,
+                then PATH. NEVER spawn bare "codex" (rules.md) -- we resolve to
+                a real file path and fail with install guidance otherwise.
 
     Defines functions only -- no work happens at dot-source time.
 #>
 
 function Resolve-CodexCmd {
-    # Mirrors config.py _resolve_codex: CODEX_CMD env override first, then the
-    # PATH shim (the npm .cmd, or any codex binary the user put on PATH).
+    # CODEX_CMD env override first, then the PATH shim (the npm .cmd, or any
+    # codex binary the user put on PATH).
     if ($env:CODEX_CMD) { return $env:CODEX_CMD }
     $cmd = Get-Command codex -ErrorAction SilentlyContinue
     if ($cmd) { return $cmd.Source }
@@ -37,22 +33,11 @@ function Get-PrereqFailures {
     #>
     param(
         [Parameter(Mandatory)]
-        [ValidateSet('uv', 'codex', 'venv-python')]
-        [string[]]$Require,
-
-        # Repo root; required only when 'venv-python' is in -Require.
-        [string]$RepoRoot
+        [ValidateSet('codex')]
+        [string[]]$Require
     )
 
     $failures = @()
-
-    if ($Require -contains 'uv') {
-        if (-not (Get-Command uv -ErrorAction SilentlyContinue)) {
-            $failures += ("uv not found on PATH. Install uv " +
-                "(https://docs.astral.sh/uv/) - this project uses uv for the " +
-                "venv + installs (the ECA venv has no pip; same convention here).")
-        }
-    }
 
     if ($Require -contains 'codex') {
         $codex = Resolve-CodexCmd
@@ -71,14 +56,6 @@ function Get-PrereqFailures {
             }
         } elseif (-not (Test-Path -LiteralPath $codex -PathType Leaf)) {
             $failures += "codex: resolved path does not exist: '$codex'"
-        }
-    }
-
-    if ($Require -contains 'venv-python') {
-        $venvPython = Join-Path $RepoRoot 'server\.venv\Scripts\python.exe'
-        if (-not (Test-Path -LiteralPath $venvPython -PathType Leaf)) {
-            $failures += ("venv python missing: '$venvPython'. Run " +
-                "scripts\setup_env.ps1 first to create the server venv.")
         }
     }
 

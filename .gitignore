@@ -1,5 +1,4 @@
-# Python virtualenv (uv-managed, server/.venv)
-server/.venv/
+# Python virtualenv
 .venv/
 
 # Python bytecode / caches
@@ -18,7 +17,7 @@ panel/node_modules/
 # Panel build output (Vite); never committed, release-packaged later
 panel/dist/
 
-# Distribution zips (scripts/package_release.ps1 output)
+# Distribution / release staging output
 release/
 
 # Playwright MCP debugging artifacts (console logs, page snapshots)

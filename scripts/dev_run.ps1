@@ -1,33 +1,28 @@
 #Requires -Version 7
 <#
 .SYNOPSIS
-    Run the agent server standalone for browser-based panel development.
+    Run the v2 Tauri app in dev mode (Rust core + panel dev server).
 
 .DESCRIPTION
-    Runs `server\.venv\Scripts\python.exe -m eud_agent` with dev-friendly env
-    vars, so the panel can be opened in a normal browser (no editor / WebView2).
-    A local temp data dir is created and exported as EUD_DATA_DIR (the editor
-    would normally provide Data\agent; in dev we point at a throwaway dir).
+    The v1 standalone Python server is gone (see EUD-121: `server/` removed). The
+    v2 app is a single Tauri 2 desktop binary, so dev = `cargo tauri dev`, which
+    builds the Rust core, links the isom static lib, and serves the React panel
+    with hot-reload in the app's own WebView2 window.
 
-    The FastAPI app module does not exist yet (a later task): the entry currently
-    prints "server app not implemented yet" and exits non-zero. This script
-    surfaces that exit code HONESTLY — it does not mask it — and returns the same
-    non-zero code. It becomes fully functional when the app task lands.
+    Requires the tauri CLI (`cargo install tauri-cli` / `cargo-tauri`) and the
+    codex CLI on PATH (checked below). The app resolves its own data dirs
+    (%appdata%/%localappdata%\eud-agent) -- there is no dev port or socket.
 
-.PARAMETER DataDir
-    Override the dev data directory. Default: a fresh temp dir under
-    $env:TEMP\eud-agent-dev.
-
-.PARAMETER Port
-    Dev port for the server (exported as EUD_PORT). Default 8765.
+.PARAMETER TauriArgs
+    Extra arguments passed through to `cargo tauri dev` (e.g. -- --release).
 
 .EXAMPLE
     pwsh -NoProfile -File scripts\dev_run.ps1
 #>
 [CmdletBinding()]
 param(
-    [string]$DataDir,
-    [int]$Port = 8765
+    [Parameter(ValueFromRemainingArguments = $true)]
+    [string[]]$TauriArgs
 )
 
 Set-StrictMode -Version Latest
@@ -39,47 +34,39 @@ $ErrorActionPreference = 'Stop'
 $OutputEncoding = [System.Text.UTF8Encoding]::new($false)
 
 $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
-$ServerDir = Join-Path $RepoRoot 'server'
-$venvPython = Join-Path $ServerDir '.venv\Scripts\python.exe'
 
 function Fail([string]$msg) {
     [Console]::Error.WriteLine("ERROR: $msg")
     exit 1
 }
 
-if (-not (Test-Path -LiteralPath $venvPython -PathType Leaf)) {
-    Fail ("venv python not found: '$venvPython'. Run scripts\setup_env.ps1 first " +
-        "to create server\.venv.")
+# --- prerequisite: codex CLI (the Rust core spawns it) --------------------
+. (Join-Path $PSScriptRoot 'check_prereqs.ps1')
+$prereqFailures = @(Get-PrereqFailures -Require 'codex')
+if ($prereqFailures.Count -gt 0) {
+    Fail ("prerequisite check failed:`n  - " + ($prereqFailures -join "`n  - "))
 }
 
-# --- dev data dir ---------------------------------------------------------
-if (-not $DataDir) {
-    $DataDir = Join-Path $env:TEMP 'eud-agent-dev'
+# --- prerequisite: tauri CLI ----------------------------------------------
+# `cargo tauri` resolves through cargo; a missing cargo-tauri surfaces as a
+# cargo error. Probe cargo itself so the guidance is actionable.
+if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
+    Fail "cargo not found on PATH. Install the Rust toolchain (https://rustup.rs)."
 }
-if (-not (Test-Path -LiteralPath $DataDir -PathType Container)) {
-    New-Item -ItemType Directory -Path $DataDir -Force | Out-Null
-}
-Write-Output "dev data dir: $DataDir"
 
-# --- dev env vars ---------------------------------------------------------
-$env:EUD_DATA_DIR = $DataDir
-$env:EUD_PORT = "$Port"
-$env:EUD_DEV = '1'
+Write-Output "running: cargo tauri dev (cwd=$RepoRoot)"
 
-Write-Output "running: $venvPython -m eud_agent (EUD_DATA_DIR=$DataDir, EUD_PORT=$Port)"
-
-# Run the server entry from the server dir so `python -m eud_agent` resolves.
-# Surface its exit code verbatim — do NOT mask the current "not implemented"
-# non-zero state (it becomes functional when the app task lands).
-Push-Location -LiteralPath $ServerDir
+# `cargo tauri dev` discovers src-tauri\tauri.conf.json from the repo root.
+Push-Location -LiteralPath $RepoRoot
 try {
-    & $venvPython -m eud_agent
+    if ($TauriArgs) {
+        & cargo tauri dev @TauriArgs
+    } else {
+        & cargo tauri dev
+    }
     $code = $LASTEXITCODE
 } finally {
     Pop-Location
 }
 
-if ($code -ne 0) {
-    Write-Warning "server exited non-zero ($code) — surfacing it honestly."
-}
 exit $code
