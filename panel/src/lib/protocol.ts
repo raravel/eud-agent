@@ -208,6 +208,26 @@ export interface MemorySavedMessage {
   file: MemoryFile;
 }
 
+/**
+ * `setup {...}` - first-run manifest-check snapshot (response to `setup_status`
+ * and `setup_pick_editor_path`). `setup_required` gates the setup screen;
+ * `error` is a stable code (e.g. "invalid_editor_folder") the panel maps to
+ * user-facing text (never rendered raw).
+ */
+export interface SetupMessage {
+  type: "setup";
+  /** Configured editor install root ("" until picked). */
+  editor_path: string;
+  /** True when editor_path points at a real EUD Editor 3 install. */
+  editor_valid: boolean;
+  /** True when the model + RAG index pass the manifest check. */
+  assets_ready: boolean;
+  /** True when the setup screen must run before normal operation. */
+  setup_required: boolean;
+  /** Stable error code from a rejected folder pick. */
+  error?: string;
+}
+
 /** Discriminated union of every documented core -> panel message. */
 export type ServerMessage =
   | AgentEventMessage
@@ -220,7 +240,8 @@ export type ServerMessage =
   | StatusMessage
   | ListMessage
   | MemoryMessage
-  | MemorySavedMessage;
+  | MemorySavedMessage
+  | SetupMessage;
 
 /** All server message `type` discriminants (closed set). */
 export const SERVER_MESSAGE_TYPES = [
@@ -235,6 +256,7 @@ export const SERVER_MESSAGE_TYPES = [
   "list",
   "memory",
   "memory_saved",
+  "setup",
 ] as const;
 export type ServerMessageType = (typeof SERVER_MESSAGE_TYPES)[number];
 
@@ -302,6 +324,27 @@ export interface MemorySaveMessage {
   content: string;
 }
 
+/** `setup_status {}` - request the first-run manifest-check snapshot. */
+export interface SetupStatusRequest {
+  type: "setup_status";
+}
+
+/**
+ * `setup_pick_editor_path {}` - open the native folder picker, validate the
+ * selection as an EUD Editor 3 install, persist it. Responds with `setup`.
+ */
+export interface SetupPickEditorPathMessage {
+  type: "setup_pick_editor_path";
+}
+
+/**
+ * `bootstrap_run {}` - run the first-run asset download (also the setup
+ * screen's retry action). Progress streams as `progress {stage: "bootstrap"}`.
+ */
+export interface BootstrapRunMessage {
+  type: "bootstrap_run";
+}
+
 /** Discriminated union of every documented panel -> core message. */
 export type ClientMessage =
   | ChatMessage
@@ -313,7 +356,10 @@ export type ClientMessage =
   | StatusRequest
   | ListRequest
   | MemoryGetMessage
-  | MemorySaveMessage;
+  | MemorySaveMessage
+  | SetupStatusRequest
+  | SetupPickEditorPathMessage
+  | BootstrapRunMessage;
 
 /** All client message `type` discriminants (closed set). */
 export const CLIENT_MESSAGE_TYPES = [
@@ -327,6 +373,9 @@ export const CLIENT_MESSAGE_TYPES = [
   "list",
   "memory_get",
   "memory_save",
+  "setup_status",
+  "setup_pick_editor_path",
+  "bootstrap_run",
 ] as const;
 export type ClientMessageType = (typeof CLIENT_MESSAGE_TYPES)[number];
 
@@ -477,6 +526,19 @@ export function isMemorySavedMessage(
   );
 }
 
+/** True if `value` is a `setup` message. */
+export function isSetupMessage(value: unknown): value is SetupMessage {
+  return (
+    isObject(value) &&
+    value.type === "setup" &&
+    typeof value.editor_path === "string" &&
+    typeof value.editor_valid === "boolean" &&
+    typeof value.assets_ready === "boolean" &&
+    typeof value.setup_required === "boolean" &&
+    (value.error === undefined || typeof value.error === "string")
+  );
+}
+
 /**
  * Gate for inbound dispatch: true only for a structurally valid server message
  * of a known type. Anything else is treated as an "unknown type" and surfaced
@@ -494,6 +556,7 @@ export function isServerMessage(value: unknown): value is ServerMessage {
     isStatusMessage(value) ||
     isListMessage(value) ||
     isMemoryMessage(value) ||
-    isMemorySavedMessage(value)
+    isMemorySavedMessage(value) ||
+    isSetupMessage(value)
   );
 }

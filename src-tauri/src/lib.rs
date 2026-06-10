@@ -19,6 +19,7 @@ pub mod journal;
 pub mod mapsafe;
 pub mod memory;
 pub mod rag;
+pub mod setup;
 pub mod tools;
 
 #[derive(Clone)]
@@ -60,10 +61,36 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let data_dirs = config::DataDirs::resolve(&*app)?;
+            // Non-fatal: a failed dir create resurfaces on first write with context.
+            if let Err(error) = data_dirs.ensure_dirs() {
+                eprintln!("eud-agent: cannot create data dirs: {error}");
+            }
             if let Ok(bridge) = ipc::bridge_from_config(&data_dirs) {
                 bridge.cleanup_stale();
             }
             app.manage(ipc::BridgeManaged::new(data_dirs.clone()));
+
+            // Feature 10 boot flow (EUD-132): on later launches where the editor
+            // path is already configured but an asset went missing/corrupt,
+            // re-download in the background. The very first run is panel-driven
+            // (setup screen -> pick folder -> bootstrap_run), and readiness is
+            // never gated on this task — failures surface to the panel as
+            // `progress {stage: bootstrap, detail: "error: ..."}` with retry.
+            let boot_handle = app.handle().clone();
+            let boot_dirs = data_dirs.clone();
+            tauri::async_runtime::spawn(async move {
+                let check_dirs = boot_dirs.clone();
+                // The manifest check hashes the RAG index; keep it off the runtime.
+                let auto = tauri::async_runtime::spawn_blocking(move || {
+                    setup::should_auto_bootstrap(&check_dirs)
+                })
+                .await
+                .unwrap_or(false);
+                if auto {
+                    // run_bootstrap already emitted the failure to the panel.
+                    let _ = setup::run_bootstrap(&boot_handle, &boot_dirs).await;
+                }
+            });
 
             let app_handle = app.handle().clone();
             let sink = engine::TauriEventSink::new(app_handle.clone());
@@ -91,6 +118,9 @@ pub fn run() {
             ipc::list,
             ipc::memory_get,
             ipc::memory_save,
+            setup::setup_status,
+            setup::setup_pick_editor_path,
+            setup::bootstrap_run,
         ])
         .run(tauri::generate_context!())
         .expect("error while running eud-agent application");

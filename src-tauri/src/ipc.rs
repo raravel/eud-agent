@@ -12,7 +12,10 @@ use crate::memory::ProjectMemory;
 use serde::{Deserialize, Serialize};
 use tauri::Emitter;
 
-const EDITOR_NOT_CONNECTED: &str = "editor not connected";
+/// Distinct from bridge_io's "editor not connected" (stale heartbeat): an empty
+/// `config.json` editor path means first-run setup has not happened — the panel
+/// routes this to the setup screen, not the reconnect notice.
+const EDITOR_PATH_NOT_CONFIGURED: &str = "editor path not configured";
 
 /// Managed app data-dir state used by bridge-backed IPC commands.
 ///
@@ -40,7 +43,7 @@ pub fn bridge_from_config(dirs: &DataDirs) -> Result<BridgeIo, String> {
     let config = dirs.load_config().map_err(|error| error.to_string())?;
     let editor_path = config.editor_path.trim();
     if editor_path.is_empty() {
-        return Err(EDITOR_NOT_CONNECTED.to_string());
+        return Err(EDITOR_PATH_NOT_CONFIGURED.to_string());
     }
     Ok(BridgeIo::new(config::editor_ipc_dir(Path::new(
         editor_path,
@@ -853,7 +856,9 @@ mod tests {
 
         let err = ipc::bridge_from_config(&dirs).unwrap_err();
 
-        assert_eq!(err, "editor not connected");
+        // First-run signal, distinct from the stale-heartbeat "editor not
+        // connected" — the panel routes it to the setup screen.
+        assert_eq!(err, "editor path not configured");
 
         fs::remove_dir_all(&base).ok();
     }

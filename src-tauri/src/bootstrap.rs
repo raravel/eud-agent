@@ -31,6 +31,16 @@ use crate::config::{AssetSpec, DataDirs};
 /// is downloaded to it after sha256 verification).
 pub const RAG_INDEX_FILENAME: &str = "rag-index.bin";
 
+/// HF model id installed on first run when `config.json` carries none (feature 10).
+pub const DEFAULT_MODEL_NAME: &str = "BAAI/bge-m3";
+
+/// Published release manifest for the RAG index, uploaded next to `rag-index.bin`
+/// by `.github/workflows/build-rag-index.yml` (`{"rag_index":{url,sha256,version}}`).
+/// Fetched when `config.json` has no pinned spec yet (first run); the sha256 inside
+/// pins the asset bytes that `verify_and_place` enforces.
+pub const RAG_MANIFEST_URL: &str =
+    "https://github.com/raravel/eud-agent/releases/latest/download/rag-index.manifest.json";
+
 /// On-disk state of an asset relative to its expected [`AssetSpec`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AssetStatus {
@@ -176,7 +186,7 @@ impl<R: tauri::Runtime> ProgressEmitter for TauriEmitter<R> {
 pub async fn ensure_rag_index(
     dirs: &DataDirs,
     spec: &AssetSpec,
-    emitter: &dyn ProgressEmitter,
+    emitter: &(dyn ProgressEmitter + Send + Sync),
 ) -> anyhow::Result<PathBuf> {
     let rag_dir = dirs.rag_dir();
     fs::create_dir_all(&rag_dir)
@@ -237,7 +247,7 @@ async fn download_to_tmp(
     url: &str,
     tmp: &Path,
     label: &str,
-    emitter: &dyn ProgressEmitter,
+    emitter: &(dyn ProgressEmitter + Send + Sync),
 ) -> anyhow::Result<()> {
     let client = reqwest::Client::builder()
         .user_agent("eud-agent-bootstrap")
@@ -277,6 +287,55 @@ fn with_tmp_suffix(path: &Path) -> PathBuf {
     let mut name = path.file_name().unwrap_or_default().to_os_string();
     name.push(".tmp");
     path.with_file_name(name)
+}
+
+/// Parse the CI release manifest into the config [`AssetSpec`] (`url` -> `name`).
+///
+/// Pure so it is unit-testable without network; [`fetch_release_manifest`] is the
+/// thin HTTP wrapper around it.
+pub fn parse_release_manifest(bytes: &[u8]) -> anyhow::Result<AssetSpec> {
+    #[derive(serde::Deserialize)]
+    struct Manifest {
+        rag_index: ManifestSpec,
+    }
+    #[derive(serde::Deserialize)]
+    struct ManifestSpec {
+        url: String,
+        sha256: String,
+        #[serde(default)]
+        version: String,
+    }
+
+    let manifest: Manifest =
+        serde_json::from_slice(bytes).context("invalid rag-index release manifest")?;
+    let spec = manifest.rag_index;
+    if spec.url.trim().is_empty() || spec.sha256.trim().is_empty() {
+        bail!("rag-index release manifest is missing url/sha256");
+    }
+    Ok(AssetSpec {
+        name: spec.url,
+        sha256: spec.sha256,
+        version: spec.version,
+    })
+}
+
+/// Fetch + parse [`RAG_MANIFEST_URL`]. NOT unit-tested (real HTTP); the parse logic
+/// is covered by the `parse_release_manifest` tests.
+pub async fn fetch_release_manifest() -> anyhow::Result<AssetSpec> {
+    let client = reqwest::Client::builder()
+        .user_agent("eud-agent-bootstrap")
+        .build()?;
+    let bytes = client
+        .get(RAG_MANIFEST_URL)
+        .send()
+        .await
+        .context("GET rag-index release manifest failed")?
+        .error_for_status()
+        .context("rag-index release manifest returned an error status")?
+        .bytes()
+        .await
+        .context("rag-index release manifest read failed")?;
+    parse_release_manifest(&bytes)
 }
 
 /// True when either asset is missing/corrupt and a first-run install is required.
@@ -427,6 +486,44 @@ mod manifest {
             "no final file from a failed/short write"
         );
         fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn release_manifest_parses_into_asset_spec() {
+        let json = br#"{
+            "rag_index": {
+                "url": "https://github.com/raravel/eud-agent/releases/download/rag-index-v1/rag-index.bin",
+                "sha256": "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
+                "version": "1"
+            }
+        }"#;
+
+        let spec = parse_release_manifest(json).unwrap();
+
+        // The manifest's `url` maps onto AssetSpec.name (the release asset URL).
+        assert_eq!(
+            spec.name,
+            "https://github.com/raravel/eud-agent/releases/download/rag-index-v1/rag-index.bin"
+        );
+        assert_eq!(spec.sha256, HELLO_SHA);
+        assert_eq!(spec.version, "1");
+    }
+
+    #[test]
+    fn release_manifest_rejects_missing_or_empty_fields() {
+        assert!(parse_release_manifest(b"not json").is_err());
+        assert!(parse_release_manifest(b"{}").is_err());
+        assert!(
+            parse_release_manifest(br#"{ "rag_index": { "url": "", "sha256": "abc" } }"#).is_err(),
+            "empty url must refuse (nothing to download)"
+        );
+        assert!(
+            parse_release_manifest(
+                br#"{ "rag_index": { "url": "https://x/y.bin", "sha256": "" } }"#
+            )
+            .is_err(),
+            "empty sha256 must refuse (nothing to verify against)"
+        );
     }
 
     #[test]

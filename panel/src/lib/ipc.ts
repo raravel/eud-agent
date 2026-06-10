@@ -114,28 +114,51 @@ export class IpcClient {
   /**
    * Register push-event listeners, request the initial status/list snapshots,
    * then report readiness. There is no reconnect loop for in-process IPC.
+   *
+   * A failed snapshot (editor not running / first-run setup pending) does NOT
+   * tear the listeners down — push events (e.g. bootstrap progress) must keep
+   * flowing so the setup screen can drive {@link IpcClient.refresh} later.
    */
   async connect(): Promise<void> {
     if (this.active) return;
     this.active = true;
     try {
       await this.registerListeners();
-      if (!this.active) return;
-      const [status, list] = await Promise.all([
-        this.invoke("status"),
-        this.invoke("list"),
-      ]);
-      if (!this.active) return;
-      this.dispatchPayload("status", status);
-      this.dispatchPayload("list", list);
-      this.open = true;
-      this.onOpenChange(true);
-      this.onLog("info", "IPC client ready.");
     } catch (error) {
       if (!this.active) return;
       this.stop();
       this.onOpenChange(false);
       this.onLog("unknown", `IPC connect failed: ${formatError(error)}`);
+      return;
+    }
+    if (!this.active) return;
+    await this.refresh();
+  }
+
+  /**
+   * (Re)request the initial status/list snapshots and report readiness.
+   * Callable again after first-run setup completes or the editor comes up.
+   */
+  async refresh(): Promise<boolean> {
+    if (!this.active) return false;
+    try {
+      const [status, list] = await Promise.all([
+        this.invoke("status"),
+        this.invoke("list"),
+      ]);
+      if (!this.active) return false;
+      this.dispatchPayload("status", status);
+      this.dispatchPayload("list", list);
+      this.open = true;
+      this.onOpenChange(true);
+      this.onLog("info", "IPC client ready.");
+      return true;
+    } catch (error) {
+      if (!this.active) return false;
+      this.open = false;
+      this.onOpenChange(false);
+      this.onLog("unknown", `IPC connect failed: ${formatError(error)}`);
+      return false;
     }
   }
 
@@ -195,6 +218,12 @@ export class IpcClient {
         return {};
       case "memory_save":
         return { file: msg.file, content: msg.content };
+      case "setup_status":
+        return {};
+      case "setup_pick_editor_path":
+        return {};
+      case "bootstrap_run":
+        return {};
       default: {
         const _exhaustive: never = msg;
         return _exhaustive;
@@ -216,6 +245,11 @@ export class IpcClient {
         this.dispatchPayload("memory", result);
       } else if (msg.type === "memory_save") {
         this.dispatchPayload("memory_saved", result);
+      } else if (
+        msg.type === "setup_status" ||
+        msg.type === "setup_pick_editor_path"
+      ) {
+        this.dispatchPayload("setup", result);
       }
       return true;
     } catch (error) {

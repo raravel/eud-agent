@@ -31,7 +31,12 @@ import { MemoryView } from "@/components/MemoryView";
 import { InstructionBox, type ChatPayload } from "@/components/InstructionBox";
 import { ConnectionNotice } from "@/components/ConnectionNotice";
 import { createPanelStore } from "@/state/store";
-import { IpcClient, type MemoryFile, type ServerMessage } from "@/lib/ipc";
+import {
+  IpcClient,
+  type MemoryFile,
+  type ServerMessage,
+  type SetupMessage,
+} from "@/lib/ipc";
 import { progressLabel } from "@/lib/progress";
 import {
   bootstrapView,
@@ -68,6 +73,10 @@ export default function App() {
     error: null,
   }));
   const bootstrapActiveRef = useRef(false);
+  // First-run manifest check (EUD-132). null until the first `setup` snapshot
+  // arrives; setup_required routes the whole panel to the SetupScreen.
+  const [setup, setSetup] = useState<SetupMessage | null>(null);
+  const bootstrapRunningRef = useRef(false);
 
   useEffect(() => {
     bootstrapActiveRef.current = bootstrap.active;
@@ -101,8 +110,28 @@ export default function App() {
           store.memorySaved(msg.file);
           store.log("ok", "메모리를 저장했습니다.");
           break;
+        case "setup":
+          setSetup(msg);
+          if (!msg.setup_required) {
+            // Setup finished (or was never needed): drop the overlay and pull
+            // the status/list snapshots if the pre-setup attempt failed.
+            bootstrapActiveRef.current = false;
+            setBootstrap((prev) =>
+              prev.active ? { ...prev, active: false } : prev,
+            );
+            if (!clientRef.current?.isOpen()) void clientRef.current?.refresh();
+          }
+          break;
         case "progress": {
           if (msg.stage === "bootstrap") {
+            // Final "done" closes the overlay; the fresh setup snapshot flips
+            // setup_required off and refreshes the status/list snapshots.
+            if (msg.detail === "done") {
+              bootstrapActiveRef.current = false;
+              setBootstrap((prev) => ({ ...prev, active: false, error: null }));
+              void clientRef.current?.send({ type: "setup_status" });
+              break;
+            }
             const view = bootstrapView(msg.pct, msg.detail);
             bootstrapActiveRef.current = true;
             setBootstrap({
@@ -232,12 +261,27 @@ export default function App() {
       },
     });
     clientRef.current = client;
-    void client.connect();
+    // The first-run manifest check rides behind connect() so the push listeners
+    // (bootstrap progress) are registered before any download can start.
+    void client.connect().then(() => client.send({ type: "setup_status" }));
     return () => {
       client.stop();
       clientRef.current = null;
     };
   }, [store, onMessage]);
+
+  // Setup flow, download step: once the editor folder is picked (or was already
+  // configured) and assets are still missing, start the bootstrap download.
+  // Progress streams in as `progress {stage: "bootstrap"}`; the final "done"
+  // re-queries setup_status, which dismisses the SetupScreen.
+  useEffect(() => {
+    if (!setup?.setup_required || !setup.editor_valid || setup.assets_ready) return;
+    if (bootstrapRunningRef.current) return;
+    bootstrapRunningRef.current = true;
+    void clientRef.current?.send({ type: "bootstrap_run" }).then(() => {
+      bootstrapRunningRef.current = false;
+    });
+  }, [setup]);
 
   // ---- user intents ----
   // The MAIN prompt input routes by phase (EUD-074): during plan_review the
@@ -275,11 +319,24 @@ export default function App() {
     }
   }, [store]);
 
+  // Retry re-runs the backend download command (it re-fetches the release
+  // manifest and skips already-verified assets), replacing the old full-reload
+  // fallback from before bootstrap_run existed.
   const handleBootstrapRetry = useCallback(() => {
-    // Feature 10 recovery is "resume on next launch"; reload re-runs app init
-    // and the first-run manifest check. A bootstrap-retry IPC command is future
-    // backend work, not part of the v2 IPC contract.
-    window.location.reload();
+    if (bootstrapRunningRef.current) return;
+    setBootstrap((prev) => ({
+      ...prev,
+      error: null,
+      view: bootstrapView(null, undefined),
+    }));
+    bootstrapRunningRef.current = true;
+    void clientRef.current?.send({ type: "bootstrap_run" }).then(() => {
+      bootstrapRunningRef.current = false;
+    });
+  }, []);
+
+  const handlePickEditorPath = useCallback(() => {
+    void clientRef.current?.send({ type: "setup_pick_editor_path" });
   }, []);
 
   // Plan approval: send plan_approve{}, archive the approval into the log, and
@@ -327,9 +384,12 @@ export default function App() {
 
   const rag = ragState === "idle" ? undefined : { state: ragState, elapsedSec: ragElapsedSec };
 
-  if (bootstrap.active) {
+  if (setup?.setup_required || bootstrap.active) {
     return (
       <SetupScreen
+        editorValid={setup?.editor_valid ?? true}
+        pickError={setup?.error ?? null}
+        onPick={handlePickEditorPath}
         view={bootstrap.view}
         error={bootstrap.error}
         onRetry={handleBootstrapRetry}

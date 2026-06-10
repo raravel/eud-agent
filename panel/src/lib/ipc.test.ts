@@ -180,4 +180,142 @@ describe("readiness", () => {
     expect(listen).toHaveBeenCalledTimes(listenCalls);
     expect(invoke).toHaveBeenCalledTimes(invokeCalls);
   });
+
+  it("keeps push listeners alive when the initial snapshot fails, and refresh() recovers", async () => {
+    // First-run flow (EUD-132): status/list fail while setup is pending, but
+    // bootstrap progress must still arrive, and refresh() succeeds afterwards.
+    const { invoke, listen, listeners, unlisteners } = makeHarness();
+    let setupDone = false;
+    invoke.mockImplementation(async (command: string) => {
+      if (command === "status") {
+        if (!setupDone) throw new Error("editor path not configured");
+        return { compiling: false, project: "map.scx" };
+      }
+      if (command === "list") {
+        if (!setupDone) throw new Error("editor path not configured");
+        return { files: [] };
+      }
+      return undefined;
+    });
+    const received: ServerMessage[] = [];
+    const openChanges: boolean[] = [];
+    const client = new IpcClient({
+      invoke,
+      listen,
+      onMessage: (m) => received.push(m),
+      onOpenChange: (open) => openChanges.push(open),
+    });
+
+    await client.connect();
+
+    expect(openChanges).toEqual([false]);
+    expect(client.isOpen()).toBe(false);
+    for (const unlisten of unlisteners) {
+      expect(unlisten).not.toHaveBeenCalled();
+    }
+
+    // Push events still flow while not "open".
+    listeners.get("progress")?.({
+      payload: { stage: "bootstrap", pct: 10, detail: "downloading rag index" },
+    });
+    expect(received).toContainEqual({
+      type: "progress",
+      stage: "bootstrap",
+      pct: 10,
+      detail: "downloading rag index",
+    });
+
+    setupDone = true;
+    expect(await client.refresh()).toBe(true);
+    expect(client.isOpen()).toBe(true);
+    expect(openChanges).toEqual([false, true]);
+    expect(received).toContainEqual({
+      type: "status",
+      compiling: false,
+      project: "map.scx",
+    });
+  });
+});
+
+describe("setup commands", () => {
+  it("dispatches the setup_status response as a setup message", async () => {
+    const { invoke, listen } = makeHarness();
+    invoke.mockImplementation(async (command: string) => {
+      if (command === "setup_status") {
+        return {
+          editor_path: "",
+          editor_valid: false,
+          assets_ready: false,
+          setup_required: true,
+        };
+      }
+      return undefined;
+    });
+    const received: ServerMessage[] = [];
+    const client = new IpcClient({
+      invoke,
+      listen,
+      onMessage: (m) => received.push(m),
+    });
+
+    await client.send({ type: "setup_status" });
+
+    expect(invoke).toHaveBeenCalledWith("setup_status", {});
+    expect(received).toContainEqual({
+      type: "setup",
+      editor_path: "",
+      editor_valid: false,
+      assets_ready: false,
+      setup_required: true,
+    });
+  });
+
+  it("dispatches the setup_pick_editor_path response as a setup message", async () => {
+    const { invoke, listen } = makeHarness();
+    invoke.mockImplementation(async (command: string) => {
+      if (command === "setup_pick_editor_path") {
+        return {
+          editor_path: "C:\\Games\\NotTheEditor",
+          editor_valid: false,
+          assets_ready: false,
+          setup_required: true,
+          error: "invalid_editor_folder",
+        };
+      }
+      return undefined;
+    });
+    const received: ServerMessage[] = [];
+    const client = new IpcClient({
+      invoke,
+      listen,
+      onMessage: (m) => received.push(m),
+    });
+
+    await client.send({ type: "setup_pick_editor_path" });
+
+    expect(received).toContainEqual({
+      type: "setup",
+      editor_path: "C:\\Games\\NotTheEditor",
+      editor_valid: false,
+      assets_ready: false,
+      setup_required: true,
+      error: "invalid_editor_folder",
+    });
+  });
+
+  it("sends bootstrap_run without expecting a response payload", async () => {
+    const { invoke, listen } = makeHarness();
+    invoke.mockResolvedValue(undefined);
+    const received: ServerMessage[] = [];
+    const client = new IpcClient({
+      invoke,
+      listen,
+      onMessage: (m) => received.push(m),
+    });
+
+    expect(await client.send({ type: "bootstrap_run" })).toBe(true);
+
+    expect(invoke).toHaveBeenCalledWith("bootstrap_run", {});
+    expect(received).toEqual([]);
+  });
 });
