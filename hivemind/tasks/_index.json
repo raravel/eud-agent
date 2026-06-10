@@ -2322,27 +2322,27 @@
       ]
     },
     "EUD-141-46f1": {
-      "status": "pending",
+      "status": "done",
       "priority": "medium",
       "type": "epic",
       "parent": null,
       "depends_on": [],
       "title": "RAG index CI build performance",
       "updated": "2026-06-10",
-      "completed_at": null,
-      "path": "active/EUD-141-46f1.md",
+      "completed_at": "2026-06-10T19:01:30.925874",
+      "path": "done/EUD-141-46f1.md",
       "scope": []
     },
     "EUD-142-784e": {
-      "status": "pending",
+      "status": "done",
       "priority": "medium",
       "type": "story",
       "parent": "EUD-141-46f1",
       "depends_on": [],
       "title": "Speed up build-rag-index workflow",
       "updated": "2026-06-10",
-      "completed_at": null,
-      "path": "active/EUD-142-784e.md",
+      "completed_at": "2026-06-10T19:01:27.703703",
+      "path": "done/EUD-142-784e.md",
       "scope": []
     },
     "EUD-143-b639": {
@@ -2360,15 +2360,15 @@
       ]
     },
     "EUD-144-013d": {
-      "status": "in_progress",
+      "status": "cancelled",
       "priority": "low",
       "type": "task",
       "parent": "EUD-142-784e",
       "depends_on": [],
       "title": "Tune embedding batch/thread settings in build_rag_index",
       "updated": "2026-06-10",
-      "completed_at": null,
-      "path": "active/EUD-144-013d.md",
+      "completed_at": "2026-06-10T19:00:54.158692",
+      "path": "done/EUD-144-013d.md",
       "scope": [
         "ci/build_rag_index.rs"
       ]
