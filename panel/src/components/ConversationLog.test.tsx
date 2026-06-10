@@ -94,6 +94,7 @@ describe("ConversationLog — inline agent stream (EUD-069)", () => {
     answer: "부분 답변입니다",
     answerStarted: true,
     tools: [{ id: "t1", name: "dat_get", state: "running" as const }],
+    blocks: [],
   };
 
   it("renders the live turn activity INSIDE the scrollable conversation", () => {
@@ -119,6 +120,31 @@ describe("ConversationLog — inline agent stream (EUD-069)", () => {
       <ConversationLog log={[]} phase="ready" turn={liveTurn} />,
     );
     expect(container.textContent).not.toContain("부분 답변입니다");
+  });
+
+  it("renders the live turn blocks in chronological order (text/tools interleaved)", () => {
+    const store = createPanelStore();
+    store.chatSent();
+    store.agentEvent("item_started", "item_1");
+    store.agentEvent("delta", "먼저 확인합니다.");
+    store.agentEvent("tool_call", "search_docs", { args: "{}" });
+    store.agentEvent("item_started", "item_3");
+    store.agentEvent("delta", "적용했습니다.");
+    const { container } = render(
+      <ConversationLog
+        log={store.getState().log}
+        phase="thinking"
+        turn={store.getState().turn}
+      />,
+    );
+    // DOM order: first prose bubble → tool group → second prose bubble.
+    const text = container.textContent ?? "";
+    const first = text.indexOf("먼저 확인합니다.");
+    const tools = text.indexOf("도구 호출 1건");
+    const second = text.indexOf("적용했습니다.");
+    expect(first).toBeGreaterThanOrEqual(0);
+    expect(tools).toBeGreaterThan(first);
+    expect(second).toBeGreaterThan(tools);
   });
 
   it("renders an archived tools entry as expandable Tool cards", () => {
@@ -149,6 +175,7 @@ describe("ConversationLog — waiting shimmer before the first stream event", ()
     answer: "",
     answerStarted: false,
     tools: [],
+    blocks: [],
   };
 
   it("shows the shimmer while thinking with an empty turn", () => {

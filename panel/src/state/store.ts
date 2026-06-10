@@ -127,6 +127,20 @@ export interface AgentEventData {
 }
 
 /**
+ * One chronological block of the current turn's activity. The codex turn is a
+ * SEQUENCE of items (message → tool calls → message → …); bucketing the whole
+ * turn into "one tools list + one answer string" lost that order (all tool
+ * rows rendered above all prose). Blocks keep arrival order: a `delta` extends
+ * the trailing text block (or opens one after a tool/item boundary), a
+ * `tool_call` extends the trailing tools block (or opens one), and the
+ * turn-end archive walks the blocks in order so the history reads exactly as
+ * the live stream did.
+ */
+export type TurnBlock =
+  | { id: number; type: "text"; text: string }
+  | { id: number; type: "tools"; tools: AgentTool[] };
+
+/**
  * Per-turn streaming buffers (EUD-065 / features/06 ## Behaviors → Agent stream).
  * The EUD-063 streamed `agent_event`s accumulate here so the AI-Elements surfaces
  * render live and reset per turn:
@@ -142,11 +156,13 @@ export interface TurnState {
   answer: string;
   answerStarted: boolean;
   tools: AgentTool[];
+  /** Chronological activity blocks (text/tools in arrival order). */
+  blocks: TurnBlock[];
 }
 
 /** A fresh (empty) per-turn buffer. */
 function emptyTurn(): TurnState {
-  return { reasoning: "", answer: "", answerStarted: false, tools: [] };
+  return { reasoning: "", answer: "", answerStarted: false, tools: [], blocks: [] };
 }
 
 /** Per-item decision outcome (driven by `rollback_result` + the recorded send). */
@@ -400,6 +416,12 @@ function isChangesetFullyDecided(cs: ChangesetState): boolean {
 export function createPanelStore(): PanelStore {
   let logSeq = 0;
   let toolSeq = 0;
+  let blockSeq = 0;
+  // True when the next answer delta belongs to a NEW message item — set on an
+  // item boundary (`item_started` of any non-tool item, or a tool call). codex
+  // sends each agent message as a separate thread item; without the boundary
+  // its prose would glue onto the previous message with no break.
+  let nextTextBlockBreak = false;
 
   // ---- mutable core (selectors are recomputed into the snapshot) ----
   const core = {
@@ -490,23 +512,43 @@ export function createPanelStore(): PanelStore {
   }
 
   /**
-   * EUD-069: archive the live tool rows as a compact log entry (carrying the
-   * rows for expandable history) and clear the buffer when a turn ends. Without
-   * this, leftover rows occupy the live surface into the next phase — the
-   * live-E2E layout crush (14 stale rows squeezed the plan card to 33px).
-   * Called BEFORE archiveTurnAnswer so the order reads tools → prose.
+   * EUD-069 (+ blocks): archive the live turn activity into the log when a
+   * turn ends, walking the blocks timeline IN ORDER so the history reads
+   * exactly as the live stream did (tools and prose interleaved
+   * chronologically — not all tools above all prose). Tools blocks become a
+   * compact entry carrying the rows (expandable history); text blocks become
+   * prominent agent entries (skipping whitespace-only ones). The buffers clear
+   * so stale rows never occupy the live surface into the next phase (the
+   * live-E2E layout crush: 14 leftover rows squeezed the plan card to 33px).
    */
-  function archiveTurnTools(): void {
-    const tools = core.turn.tools;
-    if (tools.length === 0) return;
-    const counts = new Map<string, number>();
-    for (const t of tools) counts.set(t.name, (counts.get(t.name) ?? 0) + 1);
-    const parts = [...counts].map(([name, c]) =>
-      c > 1 ? `${name}×${c}` : name,
-    );
-    pushLog("info", `도구 호출 ${tools.length}건 — ${parts.join(", ")}`,
-      undefined, tools);
-    core.turn = { ...core.turn, tools: [] };
+  function archiveTurnBlocks(): void {
+    for (const block of core.turn.blocks) {
+      if (block.type === "tools") {
+        const counts = new Map<string, number>();
+        for (const t of block.tools) {
+          counts.set(t.name, (counts.get(t.name) ?? 0) + 1);
+        }
+        const parts = [...counts].map(([name, c]) =>
+          c > 1 ? `${name}×${c}` : name,
+        );
+        pushLog(
+          "info",
+          `도구 호출 ${block.tools.length}건 — ${parts.join(", ")}`,
+          undefined,
+          block.tools,
+        );
+      } else if (block.text.trim().length > 0) {
+        pushLog("agent", block.text);
+      }
+    }
+    core.turn = {
+      ...core.turn,
+      tools: [],
+      blocks: [],
+      answer: "",
+      answerStarted: false,
+    };
+    nextTextBlockBreak = false;
   }
 
   /**
@@ -523,21 +565,15 @@ export function createPanelStore(): PanelStore {
   }
 
   /**
-   * F2: archive the live streamed-answer buffer (`turn.answer`) as a prominent
-   * agent log entry when a turn ends WITHOUT an `answer{}` (plan / changeset /
-   * error). The live AgentAnswer bubble renders `turn.answer` only while the
-   * panel is `thinking`, so prose streamed via `delta` before a plan/changeset/
-   * error would otherwise be shown live then silently discarded at the
-   * transition. The `answer{}` path is authoritative (the server final text) and
-   * supersedes the buffer — `answerReceived` does NOT call this, so there is no
-   * double-log. Empty/whitespace buffer = no-op. The buffer is cleared after
-   * archiving so a later transition in the same turn cannot re-archive it.
+   * True when the blocks timeline carries any non-whitespace streamed prose.
+   * Decides whether `answerReceived` archives the streamed blocks as-is or
+   * falls back to logging the final `answer{}` text (answer-only turns whose
+   * prose was never streamed via deltas).
    */
-  function archiveTurnAnswer(): void {
-    if (core.turn.answer.trim().length > 0) {
-      pushLog("agent", core.turn.answer);
-      core.turn = { ...core.turn, answer: "", answerStarted: false };
-    }
+  function turnHasStreamedText(): boolean {
+    return core.turn.blocks.some(
+      (block) => block.type === "text" && block.text.trim().length > 0,
+    );
   }
 
   return {
@@ -622,15 +658,28 @@ export function createPanelStore(): PanelStore {
             reasoning: core.turn.reasoning + detail,
           };
           break;
-        case "delta":
+        case "delta": {
           // The first answer delta marks the answer as started (so the Reasoning
-          // block collapses); subsequent deltas grow the live answer text.
+          // block collapses); subsequent deltas grow the live answer text. The
+          // blocks timeline extends the trailing text block, or opens a new one
+          // after an item boundary (new message item) or a tools block.
+          const blocks = core.turn.blocks.slice();
+          const last = blocks[blocks.length - 1];
+          if (last !== undefined && last.type === "text" && !nextTextBlockBreak) {
+            blocks[blocks.length - 1] = { ...last, text: last.text + detail };
+          } else {
+            blockSeq += 1;
+            blocks.push({ id: blockSeq, type: "text", text: detail });
+          }
+          nextTextBlockBreak = false;
           core.turn = {
             ...core.turn,
             answer: core.turn.answer + detail,
             answerStarted: true,
+            blocks,
           };
           break;
+        }
         case "tool_call": {
           // Open a running Tool row by name; carry the call args (EUD-068).
           toolSeq += 1;
@@ -640,7 +689,17 @@ export function createPanelStore(): PanelStore {
             state: "running",
           };
           if (data?.args) tool.args = data.args;
-          core.turn = { ...core.turn, tools: [...core.turn.tools, tool] };
+          const blocks = core.turn.blocks.slice();
+          const last = blocks[blocks.length - 1];
+          if (last !== undefined && last.type === "tools") {
+            blocks[blocks.length - 1] = { ...last, tools: [...last.tools, tool] };
+          } else {
+            blockSeq += 1;
+            blocks.push({ id: blockSeq, type: "tools", tools: [tool] });
+          }
+          // Prose after a tool call belongs to a NEW message item.
+          nextTextBlockBreak = true;
+          core.turn = { ...core.turn, tools: [...core.turn.tools, tool], blocks };
           break;
         }
         case "tool_result": {
@@ -649,35 +708,65 @@ export function createPanelStore(): PanelStore {
           // declined) flags the row; absence of data keeps the legacy done flip.
           const failed =
             data?.status !== undefined && data.status !== "completed";
+          const flip = (tool: AgentTool): AgentTool => ({
+            ...tool,
+            state: failed ? "failed" : "done",
+            ...(data?.result ? { detail: data.result } : {}),
+          });
           const tools = core.turn.tools.slice();
           for (let i = tools.length - 1; i >= 0; i -= 1) {
             if (tools[i].state === "running") {
-              tools[i] = {
-                ...tools[i],
-                state: failed ? "failed" : "done",
-                ...(data?.result ? { detail: data.result } : {}),
-              };
+              tools[i] = flip(tools[i]);
               break;
             }
           }
-          core.turn = { ...core.turn, tools };
+          // Mirror the flip into the blocks timeline (block tools are separate
+          // row objects from turn.tools).
+          const blocks = core.turn.blocks.slice();
+          let flipped = false;
+          for (let b = blocks.length - 1; b >= 0 && !flipped; b -= 1) {
+            const block = blocks[b];
+            if (block.type !== "tools") continue;
+            for (let i = block.tools.length - 1; i >= 0; i -= 1) {
+              if (block.tools[i].state === "running") {
+                const blockTools = block.tools.slice();
+                blockTools[i] = flip(blockTools[i]);
+                blocks[b] = { ...block, tools: blockTools };
+                flipped = true;
+                break;
+              }
+            }
+          }
+          core.turn = { ...core.turn, tools, blocks };
           break;
         }
+        case "item_started":
+          // A new thread item begins (codex items are sequential): any answer
+          // delta that follows belongs to a different message item, so the next
+          // text starts its own block. No user-facing text (no log leak).
+          nextTextBlockBreak = true;
+          break;
         default:
-          // thinking / answer / token_usage / turn_done / item_* / event and any
-          // other kind: no user-facing text. Swallow (no log leak).
+          // thinking / answer / token_usage / turn_done / item_completed /
+          // event and any other kind: no user-facing text. Swallow (no log leak).
           break;
       }
       emit();
     },
 
-    answerReceived(_text) {
-      // answer-only turn (no edits): thinking --> ready. (The text is logged by
-      // the App layer so the bubble carries the right styling.) EUD-069: the
-      // tool rows archive BEFORE the App logs the answer text, so the history
-      // reads tools → answer.
+    answerReceived(text) {
+      // answer-only turn (no edits): thinking --> ready. The store archives the
+      // turn itself, walking the blocks IN ORDER (tools/prose interleaved as
+      // streamed). When prose streamed via deltas, the blocks ARE the answer
+      // (the final answer{} text is the same deltas concatenated) — logging
+      // `text` again would duplicate it; with no streamed prose (answer-only
+      // turn without deltas) the final text is logged as the single bubble.
       clearLiveProgress();
-      archiveTurnTools();
+      const streamed = turnHasStreamedText();
+      archiveTurnBlocks();
+      if (!streamed && typeof text === "string" && text.trim().length > 0) {
+        pushLog("agent", text);
+      }
       core.turnInFlight = false;
       core.phase = "ready";
       emit();
@@ -687,11 +776,9 @@ export function createPanelStore(): PanelStore {
       // propose_plan ENDS the codex turn (the turn is no longer in flight); the
       // panel now awaits feedback/approve. thinking --> plan_review; a higher
       // revision REPLACES the active card.
-      // EUD-069: archive the tool rows, THEN (F2) any prose streamed before the
-      // plan turn-end — history order tools → prose.
+      // EUD-069 + F2: archive the turn blocks in stream order (tools + prose).
       clearLiveProgress();
-      archiveTurnTools();
-      archiveTurnAnswer();
+      archiveTurnBlocks();
       core.turnInFlight = false;
       core.plan = { markdown, revision };
       core.phase = "plan_review";
@@ -700,11 +787,9 @@ export function createPanelStore(): PanelStore {
 
     changesetReceived(requestId, items) {
       // thinking --> changeset_review. Fresh decisions map (no item decided yet).
-      // EUD-069: archive the tool rows, THEN (F2) any prose streamed before the
-      // changeset turn-end.
+      // EUD-069 + F2: archive the turn blocks in stream order (tools + prose).
       clearLiveProgress();
-      archiveTurnTools();
-      archiveTurnAnswer();
+      archiveTurnBlocks();
       core.turnInFlight = false;
       core.changeset = { request_id: requestId, items, decisions: {} };
       core.phase = "changeset_review";
@@ -774,11 +859,9 @@ export function createPanelStore(): PanelStore {
       // A turn error returns the flow to ready (thinking/plan_review --> ready).
       // changeset_review keeps its reviewable changeset (an error there is about a
       // failed decision, surfaced via rollback_result/log, not a phase reset).
-      // EUD-069: archive the tool rows; F2: archive any prose streamed before
-      // the turn errored out.
+      // EUD-069 + F2: archive the turn blocks in stream order (tools + prose).
       clearLiveProgress();
-      archiveTurnTools();
-      archiveTurnAnswer();
+      archiveTurnBlocks();
       if (core.phase !== "changeset_review") {
         core.turnInFlight = false;
         core.phase = "ready";
@@ -866,6 +949,7 @@ export function createPanelStore(): PanelStore {
       core.turnInFlight = true;
       core.plan = null;
       core.turn = emptyTurn();
+      nextTextBlockBreak = false;
       core.phase = "thinking";
       emit();
     },
@@ -875,6 +959,7 @@ export function createPanelStore(): PanelStore {
       // A new turn — reset the per-turn streaming buffers.
       core.turnInFlight = true;
       core.turn = emptyTurn();
+      nextTextBlockBreak = false;
       core.phase = "thinking";
       emit();
     },
@@ -884,6 +969,7 @@ export function createPanelStore(): PanelStore {
       // per-turn streaming buffers.
       core.turnInFlight = true;
       core.turn = emptyTurn();
+      nextTextBlockBreak = false;
       core.phase = "thinking";
       emit();
     },
@@ -923,6 +1009,7 @@ export function createPanelStore(): PanelStore {
       core.changeset = null;
       core.pendingDecision = null;
       core.turn = emptyTurn();
+      nextTextBlockBreak = false;
       core.log = [];
       if (discardedUndecided) {
         pushLog("warn", "미결정 변경사항은 자동 적용 처리되었습니다.");

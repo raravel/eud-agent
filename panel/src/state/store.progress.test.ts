@@ -22,8 +22,9 @@ describe("live progress rows clear when the turn ends", () => {
     store.log("progress", "codex 실행 중…", "codex");
     store.log("ok", "RAG 모델 준비 완료", "rag_warmup");
 
+    // answerReceived archives the turn itself (logs the final text when no
+    // prose was streamed) — the App layer no longer double-logs it.
     store.answerReceived("안녕하세요!");
-    store.log("agent", "안녕하세요!");
 
     expect(logTexts(store)).toEqual([
       "IPC client ready.",

@@ -897,18 +897,109 @@ describe("streamed-prose archival on turn-end (F2)", () => {
     expect(logTexts(store)).not.toContain("   ");
   });
 
-  it("the answer{} path does NOT double-log (buffer not separately archived)", () => {
-    // answerReceived ends the turn but does NOT archive the buffer (the App layer
-    // logs the authoritative server text). Simulate the App flow: deltas stream,
-    // then answer{} arrives → answerReceived + a single agent log of the final
-    // text. The buffer must not produce a second agent entry.
+  it("the answer{} path does NOT double-log (streamed prose IS the answer)", () => {
+    // answerReceived archives the streamed blocks itself (the App no longer
+    // logs msg.text — the final answer{} text is the same deltas concatenated,
+    // so logging it again would duplicate the prose). The final text is used
+    // only when nothing streamed.
     const store = readyWithProject();
     store.chatSent();
     store.agentEvent("delta", "부분 답변");
-    store.answerReceived("최종 답변"); // App then logs the authoritative text
-    store.log("agent", "최종 답변");
-    const agents = logTexts(store);
-    expect(agents).toEqual(["최종 답변"]);
+    store.answerReceived("최종 답변");
+    expect(logTexts(store)).toEqual(["부분 답변"]);
+  });
+
+  it("answerReceived logs the final text when no prose was streamed", () => {
+    const store = readyWithProject();
+    store.chatSent();
+    store.answerReceived("최종 답변");
+    expect(logTexts(store)).toEqual(["최종 답변"]);
+  });
+});
+
+// ---- Turn activity blocks: the codex turn is a SEQUENCE of items (message →
+// tool calls → message → …). The blocks timeline keeps arrival order so the
+// live surface and the archived history interleave tools and prose
+// chronologically (regression: all tool rows rendered above all prose), and an
+// item boundary (item_started / a tool call) starts a NEW text block so
+// separate messages don't glue into one paragraph.
+describe("turn activity blocks (chronological interleave)", () => {
+  function blockShape(store: ReturnType<typeof readyWithProject>) {
+    return store.getState().turn.blocks.map((b) =>
+      b.type === "text" ? `text:${b.text}` : `tools:${b.tools.map((t) => t.name).join(",")}`,
+    );
+  }
+
+  it("interleaves text and tools blocks in arrival order", () => {
+    const store = readyWithProject();
+    store.chatSent();
+    store.agentEvent("item_started", "item_1");
+    store.agentEvent("delta", "먼저 ");
+    store.agentEvent("delta", "확인합니다.");
+    store.agentEvent("tool_call", "search_docs", { args: "{}" });
+    store.agentEvent("tool_result", "search_docs", {
+      result: "2 hits",
+      status: "completed",
+    });
+    store.agentEvent("item_started", "item_3");
+    store.agentEvent("delta", "결과를 적용했습니다.");
+    expect(blockShape(store)).toEqual([
+      "text:먼저 확인합니다.",
+      "tools:search_docs",
+      "text:결과를 적용했습니다.",
+    ]);
+  });
+
+  it("starts a new text block per message item even without tools between", () => {
+    const store = readyWithProject();
+    store.chatSent();
+    store.agentEvent("item_started", "item_1");
+    store.agentEvent("delta", "첫 번째 메시지.");
+    store.agentEvent("item_started", "item_2");
+    store.agentEvent("delta", "두 번째 메시지.");
+    expect(blockShape(store)).toEqual([
+      "text:첫 번째 메시지.",
+      "text:두 번째 메시지.",
+    ]);
+  });
+
+  it("flips the tool state inside the blocks timeline on tool_result", () => {
+    const store = readyWithProject();
+    store.chatSent();
+    store.agentEvent("tool_call", "dat_set", { args: "{}" });
+    store.agentEvent("tool_result", "dat_set", {
+      result: "ERROR",
+      status: "failed",
+    });
+    const block = store.getState().turn.blocks[0];
+    if (block.type !== "tools") throw new Error("expected a tools block");
+    expect(block.tools[0].state).toBe("failed");
+    expect(block.tools[0].detail).toBe("ERROR");
+  });
+
+  it("archives the blocks in chronological order at turn end", () => {
+    const store = readyWithProject();
+    store.chatSent();
+    store.agentEvent("item_started", "item_1");
+    store.agentEvent("delta", "확인 중입니다.");
+    store.agentEvent("tool_call", "search_docs", { args: "{}" });
+    store.agentEvent("tool_result", "search_docs", {
+      result: "OK",
+      status: "completed",
+    });
+    store.agentEvent("item_started", "item_3");
+    store.agentEvent("delta", "적용했습니다.");
+    store.answerReceived("확인 중입니다.\n\n적용했습니다.");
+    const entries = store
+      .getState()
+      .log.filter((e) => e.kind === "agent" || e.tools !== undefined)
+      .map((e) => (e.tools !== undefined ? `tools:${e.text}` : `agent:${e.text}`));
+    expect(entries).toEqual([
+      "agent:확인 중입니다.",
+      "tools:도구 호출 1건 — search_docs",
+      "agent:적용했습니다.",
+    ]);
+    expect(store.getState().turn.blocks).toEqual([]);
   });
 });
 

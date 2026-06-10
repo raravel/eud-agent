@@ -184,11 +184,11 @@ export default function App() {
           store.agentEvent(msg.kind, msg.detail, msg.data);
           break;
         case "answer":
-          // Archive the final answer as a prominent agent log entry. answerReceived
-          // ends the turn (clears turn.answer next chat); logging it keeps the
-          // answer in the persistent conversation history (Streamdown-rendered).
+          // answerReceived archives the turn itself: the streamed blocks land
+          // in the log in arrival order (tools/prose interleaved), and the
+          // final text is logged only when no prose was streamed — logging
+          // msg.text here again would duplicate the streamed prose.
           store.answerReceived(msg.text);
-          store.log("agent", msg.text);
           break;
         case "plan": {
           // F2: planReceived archives any prose streamed via `delta` before this

@@ -231,17 +231,39 @@ export function ConversationLog({
         )}
 
         {/* Live agent activity for the current turn — INLINE in the scroll area
-            (EUD-069): the reasoning block + running tool rows, then the live
-            streamed answer bubble while the turn is in flight. */}
+            (EUD-069): the reasoning block first, then the turn's activity
+            blocks IN ARRIVAL ORDER (tool groups and prose bubbles interleaved
+            chronologically — not all tools above all prose). Turns from older
+            fixtures without blocks fall back to the legacy tools+answer pair. */}
         {turn && (
           <AgentStream
             reasoning={turn.reasoning}
             answerStarted={turn.answerStarted}
-            tools={turn.tools}
+            tools={turn.blocks.length > 0 ? [] : turn.tools}
             live={phase === "thinking"}
           />
         )}
-        {turn && phase === "thinking" && <AgentAnswer text={turn.answer} />}
+        {turn &&
+          phase === "thinking" &&
+          turn.blocks.map((block) =>
+            block.type === "tools" ? (
+              <div
+                key={`turn-block-${block.id}`}
+                className="flex w-full max-w-[95%] flex-col gap-1"
+              >
+                <span className="flex items-center gap-1.5 text-xs text-muted-foreground">
+                  <WrenchIcon aria-hidden className="size-3.5 shrink-0" />
+                  도구 호출 {block.tools.length}건
+                </span>
+                <ToolList tools={block.tools} />
+              </div>
+            ) : block.text.trim().length > 0 ? (
+              <AgentAnswer key={`turn-block-${block.id}`} text={block.text} />
+            ) : null,
+          )}
+        {turn && phase === "thinking" && turn.blocks.length === 0 && (
+          <AgentAnswer text={turn.answer} />
+        )}
       </ConversationContent>
       <ConversationScrollButton />
     </Conversation>

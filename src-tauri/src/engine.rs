@@ -549,6 +549,10 @@ impl CodexDriver for ProductionCodexDriver {
             .ok_or_else(|| AgentEngineError::new("codex app-server event stream is unavailable"))?;
 
         let mut answer = String::new();
+        // Set on an item boundary (a new thread item / tool call): codex sends
+        // each agent message as a separate item, so the accumulated answer
+        // needs a paragraph break between them or the messages glue together.
+        let mut answer_break_pending = false;
         let mut turn_complete_seen = false;
         let mut run_finished = false;
         let run_turn = client.run_turn(turn_text);
@@ -596,6 +600,8 @@ impl CodexDriver for ProductionCodexDriver {
                         AppServerEvent::AnswerDelta(delta) => {
                             // Accumulate for the final answer AND stream kind `delta` so the
                             // panel's live answer surface updates during the turn (EUD-063).
+                            answer.push_str(message_break(&answer, answer_break_pending));
+                            answer_break_pending = false;
                             answer.push_str(&delta);
                             self.sink.emit(EngineEvent::Agent(ipc::AgentEvent {
                                 kind: "delta".to_string(),
@@ -604,6 +610,7 @@ impl CodexDriver for ProductionCodexDriver {
                             }))?;
                         }
                         AppServerEvent::ItemStarted { item_id } => {
+                            answer_break_pending = true;
                             self.sink.emit(EngineEvent::Agent(ipc::AgentEvent {
                                 kind: "item_started".to_string(),
                                 detail: item_id.unwrap_or_default(),
@@ -620,6 +627,7 @@ impl CodexDriver for ProductionCodexDriver {
                         AppServerEvent::ToolCallStarted { name, args } => {
                             // Panel opens a running Tool card by name; `data.args`
                             // renders in the expandable 요청 block (EUD-068).
+                            answer_break_pending = true;
                             self.sink.emit(EngineEvent::Agent(ipc::AgentEvent {
                                 kind: "tool_call".to_string(),
                                 detail: name,
@@ -869,6 +877,18 @@ fn default_data_dir() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir)
         .join("eud-agent")
+}
+
+/// Paragraph break for the accumulated answer when an item boundary was seen:
+/// codex streams each agent message as a separate thread item, so without a
+/// break two messages would concatenate into one unbroken paragraph. No break
+/// before the first message (empty accumulator).
+fn message_break(answer: &str, boundary_seen: bool) -> &'static str {
+    if boundary_seen && !answer.is_empty() {
+        "\n\n"
+    } else {
+        ""
+    }
 }
 
 fn take_chars(s: &str, limit: usize) -> String {
@@ -1257,6 +1277,16 @@ mod tests {
             *self.reset_count.lock().expect("reset count lock") += 1;
             Ok(())
         }
+    }
+
+    #[test]
+    fn message_break_separates_messages_only_after_a_boundary() {
+        // No boundary seen → glue (same message item's deltas).
+        assert_eq!(super::message_break("이전 텍스트", false), "");
+        // Boundary seen mid-answer → paragraph break between message items.
+        assert_eq!(super::message_break("이전 텍스트", true), "\n\n");
+        // Boundary before the FIRST message (empty accumulator) → no break.
+        assert_eq!(super::message_break("", true), "");
     }
 
     #[derive(Clone, Default)]
