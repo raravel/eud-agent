@@ -1,4 +1,5 @@
 ---
+completed_at: '2026-06-10T15:02:51.959283'
 created: '2026-06-10'
 depends_on: []
 id: EUD-138-db9b
@@ -7,7 +8,7 @@ priority: medium
 scope:
 - tools/scraper
 - manifest:node
-status: pending
+status: done
 title: Node/TS Naver-Cafe scraper -> corpus JSONL (local, cookie)
 type: task
 updated: '2026-06-10'

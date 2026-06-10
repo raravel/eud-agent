@@ -2273,15 +2273,15 @@
       ]
     },
     "EUD-138-db9b": {
-      "status": "pending",
+      "status": "done",
       "priority": "medium",
       "type": "task",
       "parent": "EUD-135-2f41",
       "depends_on": [],
       "title": "Node/TS Naver-Cafe scraper -> corpus JSONL (local, cookie)",
       "updated": "2026-06-10",
-      "completed_at": null,
-      "path": "active/EUD-138-db9b.md",
+      "completed_at": "2026-06-10T15:02:51.959283",
+      "path": "done/EUD-138-db9b.md",
       "scope": [
         "tools/scraper",
         "manifest:node"
