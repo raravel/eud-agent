@@ -510,6 +510,19 @@ export function createPanelStore(): PanelStore {
   }
 
   /**
+   * Drop live progress rows (kind "progress") when a turn ends. They are
+   * transient in-flight indicators ("codex 실행 중…", "RAG 컨텍스트 검색 중…"),
+   * not history — leaving them after the answer reads as a still-running stage.
+   * Stages with a meaningful completion log their own ok/warn line instead
+   * (e.g. rag_warmup → "RAG 모델 준비 완료"), which this never touches.
+   */
+  function clearLiveProgress(): void {
+    if (core.log.some((entry) => entry.kind === "progress")) {
+      core.log = core.log.filter((entry) => entry.kind !== "progress");
+    }
+  }
+
+  /**
    * F2: archive the live streamed-answer buffer (`turn.answer`) as a prominent
    * agent log entry when a turn ends WITHOUT an `answer{}` (plan / changeset /
    * error). The live AgentAnswer bubble renders `turn.answer` only while the
@@ -663,6 +676,7 @@ export function createPanelStore(): PanelStore {
       // the App layer so the bubble carries the right styling.) EUD-069: the
       // tool rows archive BEFORE the App logs the answer text, so the history
       // reads tools → answer.
+      clearLiveProgress();
       archiveTurnTools();
       core.turnInFlight = false;
       core.phase = "ready";
@@ -675,6 +689,7 @@ export function createPanelStore(): PanelStore {
       // revision REPLACES the active card.
       // EUD-069: archive the tool rows, THEN (F2) any prose streamed before the
       // plan turn-end — history order tools → prose.
+      clearLiveProgress();
       archiveTurnTools();
       archiveTurnAnswer();
       core.turnInFlight = false;
@@ -687,6 +702,7 @@ export function createPanelStore(): PanelStore {
       // thinking --> changeset_review. Fresh decisions map (no item decided yet).
       // EUD-069: archive the tool rows, THEN (F2) any prose streamed before the
       // changeset turn-end.
+      clearLiveProgress();
       archiveTurnTools();
       archiveTurnAnswer();
       core.turnInFlight = false;
@@ -760,6 +776,7 @@ export function createPanelStore(): PanelStore {
       // failed decision, surfaced via rollback_result/log, not a phase reset).
       // EUD-069: archive the tool rows; F2: archive any prose streamed before
       // the turn errored out.
+      clearLiveProgress();
       archiveTurnTools();
       archiveTurnAnswer();
       if (core.phase !== "changeset_review") {
@@ -883,6 +900,7 @@ export function createPanelStore(): PanelStore {
     cancelSent() {
       // cancel interrupts the in-flight turn; the journal entries persist, but no
       // changeset has been emitted yet (the turn was cut short) → back to ready.
+      clearLiveProgress();
       core.turnInFlight = false;
       if (core.phase !== "changeset_review") {
         core.phase = "ready";
