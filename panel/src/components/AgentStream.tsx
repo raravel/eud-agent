@@ -15,6 +15,7 @@
  * With no reasoning and no tools it renders nothing (null).
  */
 import { useEffect, useState } from "react";
+import { WrenchIcon } from "lucide-react";
 import {
   Reasoning,
   ReasoningContent,
@@ -96,7 +97,8 @@ export function AgentStream({
 
       {tools.length > 0 && (
         <div className="flex flex-col gap-1">
-          <span className="text-xs text-muted-foreground">
+          <span className="flex items-center gap-1.5 text-xs text-muted-foreground">
+            <WrenchIcon aria-hidden className="size-3.5 shrink-0" />
             도구 호출 {tools.length}건
           </span>
           <ToolList tools={tools} />

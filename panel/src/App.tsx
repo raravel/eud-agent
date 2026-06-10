@@ -332,6 +332,18 @@ export default function App() {
     [store],
   );
 
+  // Empty-conversation suggestion chip → the same chat path as the
+  // InstructionBox (the chips render only in the ready phase, so this never
+  // routes to plan_feedback). Guarded by canSend in case gating flipped
+  // between render and click.
+  const handleSuggestion = useCallback(
+    (text: string) => {
+      if (!store.getState().canSend) return;
+      void handleSend({ text });
+    },
+    [store, handleSend],
+  );
+
   // New conversation: send reset{} (the server drops the retained codex thread,
   // EUD-064) and clear the client log / plan / changeset / per-turn buffers.
   const handleReset = useCallback(async () => {
@@ -443,6 +455,8 @@ export default function App() {
         phase={state.phase}
         turn={state.turn}
         ragLoading={state.rag === "loading"}
+        onSuggestion={handleSuggestion}
+        suggestionsEnabled={state.canSend}
       />
 
       {/* Plan review — markdown card + feedback/approve (features/06). The card

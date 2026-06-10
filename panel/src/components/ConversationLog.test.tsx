@@ -16,8 +16,8 @@
  * spinner (role="status"); resolved entries (ok/error) do not. Each entry's
  * text is rendered.
  */
-import { describe, it, expect } from "vitest";
-import { render, screen, within } from "@testing-library/react";
+import { describe, it, expect, vi } from "vitest";
+import { fireEvent, render, screen, within } from "@testing-library/react";
 import { createPanelStore } from "@/state/store";
 import { ConversationLog } from "@/components/ConversationLog";
 
@@ -197,6 +197,54 @@ describe("ConversationLog — waiting shimmer before the first stream event", ()
   it("does NOT show the shimmer outside thinking", () => {
     render(<ConversationLog log={[]} phase="ready" turn={emptyTurn} />);
     expect(screen.queryByTestId("turn-waiting")).not.toBeInTheDocument();
+  });
+});
+
+// ---- Empty-conversation hero: an empty log in the ready phase shows guidance
+// + clickable example chips (the same chat path as the InstructionBox). Any
+// log entry, RAG warmup, or non-ready phase replaces it.
+describe("ConversationLog — empty-conversation hero", () => {
+  it("shows the hero with suggestion chips while ready with an empty log", () => {
+    const onSuggestion = vi.fn();
+    render(
+      <ConversationLog log={[]} phase="ready" onSuggestion={onSuggestion} />,
+    );
+    const hero = screen.getByTestId("conversation-empty");
+    expect(within(hero).getByText("무엇을 만들까요?")).toBeInTheDocument();
+    const chip = within(hero).getAllByRole("button")[0];
+    fireEvent.click(chip);
+    expect(onSuggestion).toHaveBeenCalledWith(chip.textContent);
+  });
+
+  it("disables the chips while sending is gated off", () => {
+    render(
+      <ConversationLog
+        log={[]}
+        phase="ready"
+        onSuggestion={() => {}}
+        suggestionsEnabled={false}
+      />,
+    );
+    for (const chip of screen.getAllByRole("button")) {
+      expect(chip).toBeDisabled();
+    }
+  });
+
+  it("hides the hero once the log has entries, while busy, or during warmup", () => {
+    const store = createPanelStore();
+    store.log("you", "안녕?");
+    const withLog = render(
+      <ConversationLog log={store.getState().log} phase="ready" />,
+    );
+    expect(withLog.queryByTestId("conversation-empty")).not.toBeInTheDocument();
+    withLog.unmount();
+
+    const thinking = render(<ConversationLog log={[]} phase="thinking" />);
+    expect(thinking.queryByTestId("conversation-empty")).not.toBeInTheDocument();
+    thinking.unmount();
+
+    render(<ConversationLog log={[]} phase="ready" ragLoading />);
+    expect(screen.queryByTestId("conversation-empty")).not.toBeInTheDocument();
   });
 });
 
