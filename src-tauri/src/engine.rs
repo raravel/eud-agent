@@ -617,6 +617,37 @@ impl CodexDriver for ProductionCodexDriver {
                                 data: None,
                             }))?;
                         }
+                        AppServerEvent::ToolCallStarted { name, args } => {
+                            // Panel opens a running Tool card by name; `data.args`
+                            // renders in the expandable 요청 block (EUD-068).
+                            self.sink.emit(EngineEvent::Agent(ipc::AgentEvent {
+                                kind: "tool_call".to_string(),
+                                detail: name,
+                                data: args.map(|args| ipc::AgentEventData {
+                                    args: Some(args),
+                                    result: None,
+                                    status: None,
+                                }),
+                            }))?;
+                        }
+                        AppServerEvent::ToolCallCompleted { name, result, status } => {
+                            // Flips the latest running Tool card; a non-"completed"
+                            // status renders the 실패 badge (EUD-068).
+                            let data = if result.is_some() || status.is_some() {
+                                Some(ipc::AgentEventData {
+                                    args: None,
+                                    result,
+                                    status,
+                                })
+                            } else {
+                                None
+                            };
+                            self.sink.emit(EngineEvent::Agent(ipc::AgentEvent {
+                                kind: "tool_result".to_string(),
+                                detail: name,
+                                data,
+                            }))?;
+                        }
                         AppServerEvent::TurnComplete => {
                             turn_complete_seen = true;
                         }

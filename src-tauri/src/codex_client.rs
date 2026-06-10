@@ -335,12 +335,32 @@ mod tests {
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AppServerEvent {
-    ThreadStarted { thread_id: String },
+    ThreadStarted {
+        thread_id: String,
+    },
     TurnStarted,
     ReasoningDelta(String),
     AnswerDelta(String),
-    ItemStarted { item_id: Option<String> },
-    ItemCompleted { item_id: Option<String> },
+    ItemStarted {
+        item_id: Option<String>,
+    },
+    ItemCompleted {
+        item_id: Option<String>,
+    },
+    /// A tool-like thread item opened (mcpToolCall / commandExecution /
+    /// webSearch) — carries the tool name + argument text so the panel can
+    /// render a live Tool card (EUD-068 classification, ported from v1).
+    ToolCallStarted {
+        name: String,
+        args: Option<String>,
+    },
+    /// The matching tool-like thread item completed — result text + status
+    /// ("completed" vs failed/declined) for the Tool card flip.
+    ToolCallCompleted {
+        name: String,
+        result: Option<String>,
+        status: Option<String>,
+    },
     TurnComplete,
     Error(String),
 }
@@ -779,22 +799,23 @@ async fn handle_notification(
             }
         }
         "item/started" => {
-            send_event(
-                events_tx,
+            // Tool-like items (mcpToolCall / commandExecution / webSearch) map to a
+            // ToolCallStarted carrying the tool name + args so the panel renders a
+            // Tool card (EUD-068); everything else keeps the bare item signal.
+            let event = tool_event_from_item(params, false).unwrap_or_else(|| {
                 AppServerEvent::ItemStarted {
                     item_id: string_param(params, &["itemId", "item_id", "id"]),
-                },
-            )
-            .await
+                }
+            });
+            send_event(events_tx, event).await
         }
         "item/completed" => {
-            send_event(
-                events_tx,
+            let event = tool_event_from_item(params, true).unwrap_or_else(|| {
                 AppServerEvent::ItemCompleted {
                     item_id: string_param(params, &["itemId", "item_id", "id"]),
-                },
-            )
-            .await
+                }
+            });
+            send_event(events_tx, event).await
         }
         "turn/completed" => {
             let should_continue = send_event(events_tx, AppServerEvent::TurnComplete).await;
@@ -831,6 +852,129 @@ fn string_param(params: Option<&serde_json::Value>, keys: &[&str]) -> Option<Str
         .map(str::to_string)
 }
 
+/// Cap on tool args/result text relayed to the panel (panel render safety,
+/// EUD-068 — same budget + marker as the verified v1 server).
+const TOOL_DATA_MAX_CHARS: usize = 4000;
+
+fn truncate_tool_text(text: String) -> String {
+    if text.chars().count() <= TOOL_DATA_MAX_CHARS {
+        return text;
+    }
+    let mut out: String = text.chars().take(TOOL_DATA_MAX_CHARS).collect();
+    out.push_str(" …(잘림)");
+    out
+}
+
+/// Read a field accepting both the official camelCase key and a snake_case
+/// fallback (the SDK observed camelCase, EUD-053; defensive on both).
+fn item_field<'a>(item: &'a serde_json::Value, keys: &[&str]) -> Option<&'a serde_json::Value> {
+    keys.iter().find_map(|key| item.get(*key))
+}
+
+/// Tool-call argument text: a string value passes through; anything else is
+/// dumped as compact JSON (EUD-068 `_tool_args_text`).
+fn tool_args_text(value: &serde_json::Value) -> String {
+    let text = match value.as_str() {
+        Some(s) => s.to_string(),
+        None => value.to_string(),
+    };
+    truncate_tool_text(text)
+}
+
+/// Tool result text: the error message on failure, else the joined MCP content
+/// text blocks, else the compact JSON of the result (EUD-068
+/// `_tool_result_data`).
+fn tool_result_text(item: &serde_json::Value) -> Option<String> {
+    if let Some(error) = item_field(item, &["error"]) {
+        if !error.is_null() {
+            let message = error
+                .get("message")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+                .unwrap_or_else(|| match error.as_str() {
+                    Some(s) => s.to_string(),
+                    None => error.to_string(),
+                });
+            return Some(truncate_tool_text(message));
+        }
+    }
+    let result = item_field(item, &["result"])?;
+    if result.is_null() {
+        return None;
+    }
+    let joined = result
+        .get("content")
+        .and_then(serde_json::Value::as_array)
+        .map(|blocks| {
+            blocks
+                .iter()
+                .filter_map(|block| block.get("text").and_then(serde_json::Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .filter(|joined| !joined.is_empty());
+    let text = joined.unwrap_or_else(|| match result.as_str() {
+        Some(s) => s.to_string(),
+        None => result.to_string(),
+    });
+    Some(truncate_tool_text(text))
+}
+
+/// Classify a thread item from `item/started|completed` params as a
+/// user-visible tool call (EUD-068 v1 `_classify_event`, ported to v2): an
+/// `mcpToolCall` renders by its MCP tool name with the call arguments; a
+/// `commandExecution` by its command line; a `webSearch` by its query. Any
+/// other item type returns None and keeps the bare item_started/item_completed
+/// signal (which the panel intentionally ignores).
+fn tool_event_from_item(
+    params: Option<&serde_json::Value>,
+    completed: bool,
+) -> Option<AppServerEvent> {
+    let item = params?.get("item")?;
+    let item_type = item.get("type").and_then(serde_json::Value::as_str)?;
+    let (name, args, result) = match item_type {
+        "mcpToolCall" | "mcp_tool_call" => {
+            let name = item_field(item, &["tool"])
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("tool")
+                .to_string();
+            let args = item_field(item, &["arguments"])
+                .filter(|value| !value.is_null())
+                .map(tool_args_text);
+            (name, args, tool_result_text(item))
+        }
+        "commandExecution" | "command_execution" => {
+            let args = item_field(item, &["command"])
+                .and_then(serde_json::Value::as_str)
+                .map(|command| truncate_tool_text(command.to_string()));
+            let result = item_field(item, &["aggregatedOutput", "aggregated_output"])
+                .and_then(serde_json::Value::as_str)
+                .filter(|output| !output.is_empty())
+                .map(|output| truncate_tool_text(output.to_string()))
+                .or_else(|| tool_result_text(item));
+            ("command".to_string(), args, result)
+        }
+        "webSearch" | "web_search" => {
+            let args = item_field(item, &["query"])
+                .and_then(serde_json::Value::as_str)
+                .map(|query| truncate_tool_text(query.to_string()));
+            ("web_search".to_string(), args, tool_result_text(item))
+        }
+        _ => return None,
+    };
+    if completed {
+        Some(AppServerEvent::ToolCallCompleted {
+            name,
+            result,
+            status: item_field(item, &["status"])
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+        })
+    } else {
+        Some(AppServerEvent::ToolCallStarted { name, args })
+    }
+}
+
 async fn write_json_rpc_line<W>(
     writer: &AppServerWriter<W>,
     value: serde_json::Value,
@@ -854,6 +998,146 @@ where
         .await
         .map_err(|err| AppServerError::new(format!("failed flushing JSON-RPC line: {err}")))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tool_item_tests {
+    //! EUD-068 classification port (v2 regression: item/started|completed
+    //! dropped the item payload, so MCP tool calls never rendered as Tool
+    //! cards). Pins the item → ToolCallStarted/Completed mapping.
+    use super::{tool_event_from_item, AppServerEvent, TOOL_DATA_MAX_CHARS};
+    use serde_json::json;
+
+    #[test]
+    fn mcp_tool_call_started_maps_to_tool_call_with_args() {
+        let params = json!({
+            "item": {
+                "id": "item_1",
+                "type": "mcpToolCall",
+                "server": "eud-tools",
+                "tool": "search_docs",
+                "arguments": {"query": "countdown"},
+                "status": "inProgress"
+            }
+        });
+        let event = tool_event_from_item(Some(&params), false);
+        assert_eq!(
+            event,
+            Some(AppServerEvent::ToolCallStarted {
+                name: "search_docs".to_string(),
+                args: Some("{\"query\":\"countdown\"}".to_string()),
+            })
+        );
+    }
+
+    #[test]
+    fn mcp_tool_call_completed_joins_content_text_and_keeps_status() {
+        let params = json!({
+            "item": {
+                "id": "item_1",
+                "type": "mcpToolCall",
+                "tool": "search_docs",
+                "status": "completed",
+                "result": {"content": [
+                    {"type": "text", "text": "hit 1"},
+                    {"type": "text", "text": "hit 2"}
+                ]}
+            }
+        });
+        let event = tool_event_from_item(Some(&params), true);
+        assert_eq!(
+            event,
+            Some(AppServerEvent::ToolCallCompleted {
+                name: "search_docs".to_string(),
+                result: Some("hit 1\nhit 2".to_string()),
+                status: Some("completed".to_string()),
+            })
+        );
+    }
+
+    #[test]
+    fn mcp_tool_call_failure_prefers_the_error_message() {
+        let params = json!({
+            "item": {
+                "type": "mcpToolCall",
+                "tool": "dat_set",
+                "status": "failed",
+                "error": {"message": "EvidenceRequired"},
+                "result": {"content": []}
+            }
+        });
+        let event = tool_event_from_item(Some(&params), true);
+        assert_eq!(
+            event,
+            Some(AppServerEvent::ToolCallCompleted {
+                name: "dat_set".to_string(),
+                result: Some("EvidenceRequired".to_string()),
+                status: Some("failed".to_string()),
+            })
+        );
+    }
+
+    #[test]
+    fn command_execution_maps_command_and_aggregated_output() {
+        let started = json!({
+            "item": {"type": "commandExecution", "command": "cargo test", "status": "inProgress"}
+        });
+        assert_eq!(
+            tool_event_from_item(Some(&started), false),
+            Some(AppServerEvent::ToolCallStarted {
+                name: "command".to_string(),
+                args: Some("cargo test".to_string()),
+            })
+        );
+
+        let completed = json!({
+            "item": {
+                "type": "commandExecution",
+                "command": "cargo test",
+                "aggregatedOutput": "ok. 12 passed",
+                "exitCode": 0,
+                "status": "completed"
+            }
+        });
+        assert_eq!(
+            tool_event_from_item(Some(&completed), true),
+            Some(AppServerEvent::ToolCallCompleted {
+                name: "command".to_string(),
+                result: Some("ok. 12 passed".to_string()),
+                status: Some("completed".to_string()),
+            })
+        );
+    }
+
+    #[test]
+    fn non_tool_items_return_none_so_the_bare_item_signal_is_kept() {
+        for item_type in ["agentMessage", "reasoning", "fileChange", "todoList"] {
+            let params = json!({ "item": {"type": item_type, "id": "item_9"} });
+            assert_eq!(tool_event_from_item(Some(&params), false), None);
+            assert_eq!(tool_event_from_item(Some(&params), true), None);
+        }
+        assert_eq!(tool_event_from_item(None, false), None);
+        assert_eq!(tool_event_from_item(Some(&json!({})), false), None);
+    }
+
+    #[test]
+    fn oversized_args_truncate_with_the_marker() {
+        let big = "x".repeat(TOOL_DATA_MAX_CHARS + 10);
+        let params = json!({
+            "item": {"type": "mcpToolCall", "tool": "t", "arguments": big}
+        });
+        let Some(AppServerEvent::ToolCallStarted {
+            args: Some(args), ..
+        }) = tool_event_from_item(Some(&params), false)
+        else {
+            panic!("expected a ToolCallStarted with args");
+        };
+        assert_eq!(
+            args.chars().count(),
+            TOOL_DATA_MAX_CHARS + " …(잘림)".chars().count()
+        );
+        assert!(args.ends_with("…(잘림)"));
+    }
 }
 
 #[cfg(test)]
@@ -1097,6 +1381,38 @@ mod appserver_tests {
             .await;
             write_json_line(
                 &mut server_responses,
+                json!({
+                    "jsonrpc":"2.0",
+                    "method":"item/started",
+                    "params":{"item":{
+                        "id":"item_1",
+                        "type":"mcpToolCall",
+                        "server":"eud-tools",
+                        "tool":"search_docs",
+                        "arguments":{"query":"countdown"},
+                        "status":"inProgress"
+                    }}
+                }),
+            )
+            .await;
+            write_json_line(
+                &mut server_responses,
+                json!({
+                    "jsonrpc":"2.0",
+                    "method":"item/completed",
+                    "params":{"item":{
+                        "id":"item_1",
+                        "type":"mcpToolCall",
+                        "server":"eud-tools",
+                        "tool":"search_docs",
+                        "status":"completed",
+                        "result":{"content":[{"type":"text","text":"2 hits"}]}
+                    }}
+                }),
+            )
+            .await;
+            write_json_line(
+                &mut server_responses,
                 json!({"jsonrpc":"2.0","method":"turn/completed","params":{"turnId":"turn-1"}}),
             )
             .await;
@@ -1151,6 +1467,21 @@ mod appserver_tests {
         assert_eq!(
             next_event(&mut events).await,
             AppServerEvent::ReasoningDelta("detail".to_string())
+        );
+        assert_eq!(
+            next_event(&mut events).await,
+            AppServerEvent::ToolCallStarted {
+                name: "search_docs".to_string(),
+                args: Some("{\"query\":\"countdown\"}".to_string()),
+            }
+        );
+        assert_eq!(
+            next_event(&mut events).await,
+            AppServerEvent::ToolCallCompleted {
+                name: "search_docs".to_string(),
+                result: Some("2 hits".to_string()),
+                status: Some("completed".to_string()),
+            }
         );
         assert_eq!(next_event(&mut events).await, AppServerEvent::TurnComplete);
 
