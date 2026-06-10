@@ -50,7 +50,8 @@ describe("progressLabel", () => {
 
   it("other stages keep the existing label unchanged (codex, kind progress)", () => {
     const out = progressLabel("codex", undefined);
-    expect(out.text).toBe("codex 코드 생성 중…");
+    // Turn-agnostic wording: the codex stage also covers answer-only turns.
+    expect(out.text).toBe("codex 실행 중…");
     expect(out.kind).toBe("progress");
   });
 });

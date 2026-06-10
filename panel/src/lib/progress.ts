@@ -26,7 +26,9 @@ import type { LogKind } from "@/state/store";
 export const STAGE_LABELS: Record<string, string> = {
   rag: "RAG 컨텍스트 검색 중…",
   rag_warmup: "RAG 모델 준비 중…",
-  codex: "codex 코드 생성 중…",
+  // The codex stage covers ANY turn (greetings/answers included), so the label
+  // must not claim code generation specifically.
+  codex: "codex 실행 중…",
   lsp: "진단 검사 중…",
   waiting_build: "에디터 빌드 완료 대기 중…",
 };

@@ -4,7 +4,10 @@
   "version": "0.1.0",
   "identifier": "dev.tree-some.eud-agent",
   "build": {
-    "frontendDist": "../panel/dist"
+    "frontendDist": "../panel/dist",
+    "devUrl": "http://localhost:5173",
+    "beforeDevCommand": "npm --prefix panel run dev",
+    "beforeBuildCommand": "npm --prefix panel run build"
   },
   "app": {
     "windows": [

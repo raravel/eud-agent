@@ -32,4 +32,10 @@ export default defineConfig({
     // No source maps: keeps the build CDN-free and avoids shipping map URLs.
     sourcemap: false,
   },
+  server: {
+    // tauri.conf.json devUrl points here; strictPort so `cargo tauri dev`
+    // never silently attaches to a different port's stale server.
+    port: 5173,
+    strictPort: true,
+  },
 });
