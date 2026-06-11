@@ -551,20 +551,34 @@ where
     }
 }
 
+/// Config overrides for every spawned codex app-server. The agent's turns must
+/// stay hermetic — only OUR system prompt steers them:
+/// - `skills.include_instructions=false` suppresses the skills catalog/
+///   instructions block (user-local skills must not leak in);
+/// - `project_doc_max_bytes=0` disables AGENTS.md injection entirely — codex
+///   walks the cwd and its PARENTS for project docs, so even the app-owned
+///   workspace cwd is not enough on its own (measured 2026-06-11: a dev run
+///   from the repo injected the hivemind AGENTS.md and codex analyzed the Rust
+///   repo instead of the map project);
+/// - reasoning summaries enabled for the gpt-5.5 reasoning surface.
+pub(crate) const APP_SERVER_CONFIG_OVERRIDES: [&str; 4] = [
+    "skills.include_instructions=false",
+    "project_doc_max_bytes=0",
+    "model_supports_reasoning_summaries=true",
+    "model_reasoning_summary=\"detailed\"",
+];
+
 impl CodexAppServerClient<tokio::process::ChildStdout, tokio::process::ChildStdin> {
     pub async fn spawn_app_server(
         cwd: impl AsRef<std::path::Path>,
     ) -> Result<(Self, tokio::sync::mpsc::Receiver<AppServerEvent>), AppServerError> {
         let codex_cmd = resolve_codex_cmd().map_err(|err| AppServerError::new(err.to_string()))?;
         let mut command = tokio::process::Command::new(codex_cmd);
+        command.arg("app-server");
+        for override_arg in APP_SERVER_CONFIG_OVERRIDES {
+            command.arg("-c").arg(override_arg);
+        }
         command
-            .arg("app-server")
-            .arg("-c")
-            .arg("skills.include_instructions=false")
-            .arg("-c")
-            .arg("model_supports_reasoning_summaries=true")
-            .arg("-c")
-            .arg("model_reasoning_summary=\"detailed\"")
             .current_dir(cwd.as_ref())
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
@@ -998,6 +1012,20 @@ where
         .await
         .map_err(|err| AppServerError::new(format!("failed flushing JSON-RPC line: {err}")))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod app_server_override_tests {
+    //! Pins the hermetic-turn config overrides: user-local skills and any
+    //! AGENTS.md found at/above the cwd must never steer the agent's codex
+    //! turns (only our system prompt does).
+    use super::APP_SERVER_CONFIG_OVERRIDES;
+
+    #[test]
+    fn overrides_block_skills_and_project_docs() {
+        assert!(APP_SERVER_CONFIG_OVERRIDES.contains(&"skills.include_instructions=false"));
+        assert!(APP_SERVER_CONFIG_OVERRIDES.contains(&"project_doc_max_bytes=0"));
+    }
 }
 
 #[cfg(test)]

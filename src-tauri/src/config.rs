@@ -148,6 +148,15 @@ impl DataDirs {
         self.app_local_data.join("logs")
     }
 
+    /// `%localappdata%\eud-agent\codex_workspace` — the STABLE, app-owned cwd
+    /// for spawned codex processes (rules.md: never the launch dir). Kept empty
+    /// so codex finds no AGENTS.md/repo there: launching from the dev repo
+    /// otherwise injected the repo's hivemind instructions and made codex
+    /// analyze the Rust repo instead of the map project (measured 2026-06-11).
+    pub fn codex_workspace_dir(&self) -> PathBuf {
+        self.app_local_data.join("codex_workspace")
+    }
+
     /// Create every data subdir if missing. Idempotent (`create_dir_all`).
     pub fn ensure_dirs(&self) -> std::io::Result<()> {
         for dir in [
@@ -159,6 +168,7 @@ impl DataDirs {
             self.models_dir(),
             self.rag_dir(),
             self.logs_dir(),
+            self.codex_workspace_dir(),
         ] {
             fs::create_dir_all(dir)?;
         }

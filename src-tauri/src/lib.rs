@@ -94,7 +94,11 @@ pub fn run() {
 
             let app_handle = app.handle().clone();
             let sink = engine::TauriEventSink::new(app_handle.clone());
-            let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+            // Stable app-owned cwd for codex (rules.md), NOT the launch dir:
+            // `tauri dev` runs from the repo, so current_dir made codex pick up
+            // the repo's AGENTS.md (hivemind instructions) and treat the Rust
+            // repo as its workspace instead of the EUD map project.
+            let cwd = data_dirs.codex_workspace_dir();
             let driver = engine::ProductionCodexDriver::new(cwd, sink.clone());
             let config =
                 engine::AgentEngineConfig::new("[project state]\n(unavailable)", None, Vec::new())
