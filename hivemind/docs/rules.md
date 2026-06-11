@@ -163,6 +163,13 @@ and server spawning are REMOVED.
   gates the panel — offline / no-release / a check error simply shows no banner. The banner
   requires user consent before downloading; raw updater errors render in the banner, never as
   silent failures.
+- The NSIS installer is `installMode: currentUser` — KEEP it: a perMachine installer would
+  make the updater's self-replace require UAC elevation on every update. Installer branding
+  (header 150x57 / sidebar 164x314, 24-bit BMP) is regenerated from the app icon by
+  `scripts/gen_installer_assets.ps1`; a Desktop shortcut is added/removed via the
+  `NSIS_HOOK_POSTINSTALL`/`POSTUNINSTALL` macros in `src-tauri/installer/hooks.nsh`.
+  `languages: [Korean, English]` with `displayLanguageSelector` (Korean is the primary
+  distribution target).
 
 ## System prompt, evidence, first principles (PORTED verbatim intent)
 
