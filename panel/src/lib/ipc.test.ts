@@ -145,7 +145,7 @@ describe("request/response messages", () => {
 });
 
 describe("readiness", () => {
-  it("reports open after listeners register and initial status + list resolve, without a reconnect loop", async () => {
+  it("opens the transport on listener registration, independent of the editor snapshot, without a reconnect loop", async () => {
     const { invoke, listen } = makeHarness();
     const status = deferred<{ compiling: boolean; project: string }>();
     const list = deferred<{ files: [] }>();
@@ -155,75 +155,88 @@ describe("readiness", () => {
       return Promise.resolve(undefined);
     });
     const openChanges: boolean[] = [];
+    const editorChanges: boolean[] = [];
     const client = new IpcClient({
       invoke,
       listen,
       onMessage: () => {},
       onOpenChange: (open) => openChanges.push(open),
+      onEditorChange: (connected) => editorChanges.push(connected),
     });
 
     await client.connect();
     expect(listen).toHaveBeenCalled();
-    // Listeners alone never report readiness — that needs the snapshot.
-    expect(openChanges).toEqual([]);
+    // Transport open the moment listeners register — NOT gated on the editor.
+    expect(openChanges).toEqual([true]);
+    expect(client.isOpen()).toBe(true);
+    expect(editorChanges).toEqual([]);
 
     const refreshing = client.refresh();
     await flushMicrotasks();
-    expect(openChanges).toEqual([]);
+    // The editor edge fires only once both the status probe and the edge-driven
+    // list round-trip resolve.
+    expect(editorChanges).toEqual([]);
 
     status.resolve({ compiling: false, project: "map.scx" });
     await flushMicrotasks();
-    expect(openChanges).toEqual([]);
+    expect(editorChanges).toEqual([]);
 
     list.resolve({ files: [] });
-    await refreshing;
+    expect(await refreshing).toBe(true);
+    expect(editorChanges).toEqual([true]);
+    // refresh() never re-touches the transport.
     expect(openChanges).toEqual([true]);
 
     const listenCalls = listen.mock.calls.length;
-    const invokeCalls = invoke.mock.calls.length;
     vi.advanceTimersByTime(10_000);
     await flushMicrotasks();
-
+    // No transport-level reconnect loop: listeners are registered exactly once.
     expect(listen).toHaveBeenCalledTimes(listenCalls);
-    expect(invoke).toHaveBeenCalledTimes(invokeCalls);
   });
 
-  it("keeps push listeners alive when a refresh fails, and a later refresh() recovers", async () => {
-    // Fallback path (EUD-132): a refresh against an unconfigured/parked app
-    // fails without tearing listeners down — bootstrap progress must still
-    // arrive, and refresh() succeeds after setup completes.
+  it("treats a failed editor probe as editor-down (transport stays open) and recovers on a later refresh()", async () => {
+    // The editor heartbeat being stale/absent must NOT read as a dead transport:
+    // listeners stay alive (bootstrap progress still flows), the transport stays
+    // open, and only editor liveness flips — recovering automatically when a
+    // later poll succeeds.
     const { invoke, listen, listeners, unlisteners } = makeHarness();
-    let setupDone = false;
+    let editorUp = false;
     invoke.mockImplementation(async (command: string) => {
       if (command === "status") {
-        if (!setupDone) throw new Error("editor path not configured");
+        if (!editorUp) throw new Error("editor not connected");
         return { compiling: false, project: "map.scx" };
       }
       if (command === "list") {
-        if (!setupDone) throw new Error("editor path not configured");
+        if (!editorUp) throw new Error("editor not connected");
         return { files: [] };
       }
       return undefined;
     });
     const received: ServerMessage[] = [];
     const openChanges: boolean[] = [];
+    const editorChanges: boolean[] = [];
     const client = new IpcClient({
       invoke,
       listen,
       onMessage: (m) => received.push(m),
       onOpenChange: (open) => openChanges.push(open),
+      onEditorChange: (connected) => editorChanges.push(connected),
     });
 
     await client.connect();
+    // Transport open from connect; the first editor probe fails -> editor-down.
+    expect(openChanges).toEqual([true]);
+    expect(client.isOpen()).toBe(true);
     expect(await client.refresh()).toBe(false);
-
-    expect(openChanges).toEqual([false]);
-    expect(client.isOpen()).toBe(false);
+    expect(editorChanges).toEqual([false]);
+    // Transport untouched by the editor probe; listeners intact.
+    expect(openChanges).toEqual([true]);
+    expect(client.isOpen()).toBe(true);
     for (const unlisten of unlisteners) {
       expect(unlisten).not.toHaveBeenCalled();
     }
 
-    // Push events still flow while not "open".
+    // Push events still flow while the editor is down.
     listeners.get("progress")?.({
       payload: { stage: "bootstrap", pct: 10, detail: "downloading rag index" },
     });
@@ -234,10 +247,14 @@ describe("readiness", () => {
       detail: "downloading rag index",
     });
 
-    setupDone = true;
+    // A steady-state repeat failure stays quiet (no edge) — the poll never spams.
+    expect(await client.refresh()).toBe(false);
+    expect(editorChanges).toEqual([false]);
+
+    editorUp = true;
     expect(await client.refresh()).toBe(true);
-    expect(client.isOpen()).toBe(true);
-    expect(openChanges).toEqual([false, true]);
+    expect(editorChanges).toEqual([false, true]);
+    expect(openChanges).toEqual([true]);
     expect(received).toContainEqual({
       type: "status",
       compiling: false,

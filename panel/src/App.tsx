@@ -58,6 +58,14 @@ interface CodexAuthState {
 const CODEX_POLL_MS = 2000;
 const CODEX_POLL_TIMEOUT_MS = 180000;
 
+/**
+ * Editor-liveness poll cadence. The bridge writes heartbeat.txt every ~1s and
+ * the core treats a >3s-old heartbeat as stale, so a 2s probe recovers a downed
+ * editor within ~1 cycle without churning the file IPC (the probe is the cheap
+ * status-only path; the heavier `list` round-trip runs only on edges).
+ */
+const EDITOR_POLL_MS = 2000;
+
 interface BootstrapState {
   active: boolean;
   view: BootstrapView;
@@ -94,6 +102,11 @@ export default function App() {
   // arrives; setup_required routes the whole panel to the SetupScreen.
   const [setup, setSetup] = useState<SetupMessage | null>(null);
   const bootstrapRunningRef = useRef(false);
+  // Editor-liveness poll gate. Flips true once first-run setup is satisfied (or
+  // a failed setup_status falls back to "assume configured"); the poll effect
+  // then probes the editor every EDITOR_POLL_MS so a stale heartbeat at boot or
+  // a mid-session editor restart recovers automatically.
+  const [editorPollEnabled, setEditorPollEnabled] = useState(false);
   // codex login step (setup screen step 3). The OAuth path spawns the browser
   // flow in the backend and polls codex_login_status until it flips.
   const [codexBusy, setCodexBusy] = useState(false);
@@ -140,13 +153,13 @@ export default function App() {
         case "setup":
           setSetup(msg);
           if (!msg.setup_required) {
-            // Setup finished (or was never needed): drop the overlay and pull
-            // the status/list snapshots if the pre-setup attempt failed.
+            // Setup finished (or was never needed): drop the overlay and arm the
+            // editor-liveness poll (which pulls the first status/list snapshot).
             bootstrapActiveRef.current = false;
             setBootstrap((prev) =>
               prev.active ? { ...prev, active: false } : prev,
             );
-            if (!clientRef.current?.isOpen()) void clientRef.current?.refresh();
+            setEditorPollEnabled(true);
           }
           break;
         case "progress": {
@@ -286,6 +299,18 @@ export default function App() {
         if (open) store.wsOpen();
         else store.wsError();
       },
+      onEditorChange: (connected) => {
+        // Editor liveness is separate from the transport: this only flips the
+        // send gate + ConnectionNotice banner, never the reconnect UI. Log just
+        // the recovery edge (the down state is shown by the banner, and logging
+        // it would misleadingly read as "disconnected" when the editor simply
+        // was not up yet at boot).
+        const wasConnected = store.getState().editorConnected;
+        store.editorConnectionChanged(connected);
+        if (connected && !wasConnected) {
+          store.log("ok", "에디터에 다시 연결되었습니다.");
+        }
+      },
     });
     clientRef.current = client;
     // Register push listeners first (bootstrap progress must not be missed),
@@ -295,9 +320,9 @@ export default function App() {
     // refresh() from the `setup` handler below.
     void client.connect().then(() =>
       client.send({ type: "setup_status" }).then((ok) => {
-        // Unexpected setup_status failure: fall back to the direct snapshot so
-        // an already-configured app still comes up.
-        if (!ok) void client.refresh();
+        // Unexpected setup_status failure: assume an already-configured app and
+        // arm the editor poll so it still comes up.
+        if (!ok) setEditorPollEnabled(true);
       }),
     );
     return () => {
@@ -305,6 +330,26 @@ export default function App() {
       clientRef.current = null;
     };
   }, [store, onMessage]);
+
+  // Editor-liveness poll. Once armed (first-run setup satisfied), probe the
+  // editor every EDITOR_POLL_MS. The transport stays open throughout, so this
+  // only drives editorConnected (send gate + ConnectionNotice) and recovers a
+  // stale-heartbeat-at-boot or a mid-session editor restart with no user action.
+  useEffect(() => {
+    if (!editorPollEnabled) return;
+    const client = clientRef.current;
+    if (!client) return;
+    let cancelled = false;
+    const probe = () => {
+      if (!cancelled) void client.refresh();
+    };
+    probe(); // immediate — no EDITOR_POLL_MS dead window before the first probe
+    const id = window.setInterval(probe, EDITOR_POLL_MS);
+    return () => {
+      cancelled = true;
+      window.clearInterval(id);
+    };
+  }, [editorPollEnabled]);
 
   // Setup flow, download step: once the editor folder is picked (or was already
   // configured) and assets are still missing, start the bootstrap download.
