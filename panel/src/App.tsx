@@ -43,6 +43,8 @@ import {
   type BootstrapView,
 } from "@/setup/bootstrap";
 import { SetupScreen } from "@/setup/SetupScreen";
+import { UpdateNotice } from "@/components/UpdateNotice";
+import { createUpdater, type UpdateHandle } from "@/setup/update";
 import { invoke } from "@tauri-apps/api/core";
 
 /** codex login probe result (mirrors the Rust `CodexAuthState`). */
@@ -66,6 +68,9 @@ export default function App() {
   // Store + client live for the lifetime of the app (created once).
   const store = useMemo(() => createPanelStore(), []);
   const clientRef = useRef<IpcClient | null>(null);
+  // Self-update seam (Decision 04). Created once; the real plugin in prod, swappable
+  // in tests. The check runs once after first-run setup is satisfied.
+  const updater = useMemo(() => createUpdater(), []);
 
   // Subscribe React to the framework-agnostic store.
   const state = useSyncExternalStore(store.subscribe, store.getState, store.getState);
@@ -94,6 +99,11 @@ export default function App() {
   const [codexBusy, setCodexBusy] = useState(false);
   const [codexError, setCodexError] = useState<string | null>(null);
   const codexPollRef = useRef<number | null>(null);
+  // Self-update banner state: the pending update (null until found) and a
+  // session-scoped "나중에" dismissal. The check fires once (guarded by the ref).
+  const [update, setUpdate] = useState<UpdateHandle | null>(null);
+  const [updateDismissed, setUpdateDismissed] = useState(false);
+  const updateCheckedRef = useRef(false);
 
   useEffect(() => {
     bootstrapActiveRef.current = bootstrap.active;
@@ -308,6 +318,23 @@ export default function App() {
       bootstrapRunningRef.current = false;
     });
   }, [setup]);
+
+  // Once first-run setup is satisfied, check for an app self-update exactly once.
+  // Non-blocking: an updater error (offline, no release yet) just leaves the banner
+  // hidden — it never gates the panel.
+  useEffect(() => {
+    if (!setup || setup.setup_required) return;
+    if (updateCheckedRef.current) return;
+    updateCheckedRef.current = true;
+    void updater
+      .check()
+      .then((found) => {
+        if (found) setUpdate(found);
+      })
+      .catch(() => {
+        /* no release / offline — no banner */
+      });
+  }, [setup, updater]);
 
   // ---- user intents ----
   // The MAIN prompt input routes by phase (EUD-074): during plan_review the
@@ -562,6 +589,14 @@ export default function App() {
         memoryOpen={state.memoryOpen}
         onMemoryOpen={handleMemoryOpen}
       />
+
+      {update && !updateDismissed && (
+        <UpdateNotice
+          update={update}
+          relaunch={updater.relaunch}
+          onLater={() => setUpdateDismissed(true)}
+        />
+      )}
 
       {!state.editorConnected && <ConnectionNotice />}
 

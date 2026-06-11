@@ -1,7 +1,7 @@
 # Decision 04: Built panel output distributed via GitHub Releases; dist never committed
 
 - Date: 2026-06-04
-- Status: Accepted (release/updater implementation deferred to a later phase)
+- Status: Accepted; release/updater phase implemented in [[decisions/17_updater-implementation]] (2026-06-11)
 - Context: The React panel introduces a build step, conflicting with the original "user machine needs no build" drop-in principle. The distribution model had to be decided before adopting the toolchain.
 - Considered:
   - Commit `panel/dist/` to git — Pros: install needs no Node, simplest drop-in. Cons: large generated diffs every build, churn. Recommendation: ★★☆.

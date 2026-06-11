@@ -136,6 +136,34 @@ and server spawning are REMOVED.
 - RAG model loading must NEVER gate app readiness (lazy load + background warmup; report
   `rag_warmup` progress). The panel is usable before the model finishes loading.
 
+## Release & self-update (NEW — Decision 17)
+
+- The updater uses **minisign** signing (`createUpdaterArtifacts: true`, bundle target
+  `["nsis"]`). The minisign **private key is NEVER committed** — keep it under
+  `%USERPROFILE%\.tauri\` and inject via `TAURI_SIGNING_PRIVATE_KEY` /
+  `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` at build time. Only the **public** key lives in
+  `tauri.conf.json` (`plugins.updater.pubkey`). This minisign signing is SEPARATE from
+  Windows Authenticode (intentionally absent; SmartScreen warning is an accepted trade-off).
+- A local `tauri build` does NOT emit `latest.json` (only tauri-action does). The release
+  script (`scripts/release.ps1`) ALWAYS **synthesizes it from the `.sig`** and uploads it to
+  the GitHub Release. The updater endpoint is the static
+  `releases/latest/download/latest.json`, so publishing this asset on the newest release is
+  what makes installed apps see the update. Write `latest.json` (and the bumped manifests)
+  as UTF-8 **without BOM**.
+- The self-update replaces ONLY the app binary. `%localappdata%` assets (model/RAG) and
+  `%appdata%` config are preserved and NEVER re-downloaded by an update — RAG/model asset
+  *versioning* stays the `bootstrap` manifest's job, decoupled from the app updater.
+- The bridge Lua is bundled as a Tauri **resource** and re-installed on EVERY app start via
+  `bridge_install::sync_bridge` (Rust port of `install_bridge.ps1`): overwrite the editor's
+  `Data\Lua\TriggerEditor\ZZZ_10_agent_bridge.lua` only when bytes differ, copied **verbatim**
+  (KopiLua reads Latin1 — never re-encode). It is best-effort: a downed/moved editor NEVER
+  blocks startup (log + continue). Editor integrity rule still holds — this is a file copy,
+  not an editor modification.
+- The update check runs ONCE per session, only after first-run setup is satisfied, and NEVER
+  gates the panel — offline / no-release / a check error simply shows no banner. The banner
+  requires user consent before downloading; raw updater errors render in the banner, never as
+  silent failures.
+
 ## System prompt, evidence, first principles (PORTED verbatim intent)
 
 - The system prompt ALWAYS carries the `[first principles]` section (known crash/EUD-error/

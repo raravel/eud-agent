@@ -6,9 +6,11 @@
 //! registered here; engine, tools, codex_client, isom, bridge_io, and memory are wired by
 //! later tasks.
 
+use tauri::path::BaseDirectory;
 use tauri::Manager;
 
 pub mod bootstrap;
+pub mod bridge_install;
 pub mod bridge_io;
 pub mod chk;
 pub mod codex_auth;
@@ -93,6 +95,8 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
         .setup(|app| {
             let data_dirs = config::DataDirs::resolve(&*app)?;
             // Non-fatal: a failed dir create resurfaces on first write with context.
@@ -102,6 +106,39 @@ pub fn run() {
             if let Ok(bridge) = ipc::bridge_from_config(&data_dirs) {
                 bridge.cleanup_stale();
             }
+
+            // Keep the editor's installed Lua bridge in sync with the copy bundled in
+            // this app: a self-update may ship a newer bridge, re-installed here on the
+            // next launch (no manual `install_bridge.ps1` re-run). Best-effort — a downed
+            // or moved editor must never block startup.
+            if let Ok(config) = data_dirs.load_config() {
+                let editor_path = config.editor_path.trim();
+                if !editor_path.is_empty()
+                    && config::validate_editor_path(std::path::Path::new(editor_path))
+                {
+                    match app
+                        .path()
+                        .resolve("bridge/ZZZ_10_agent_bridge.lua", BaseDirectory::Resource)
+                    {
+                        Ok(bundled) => {
+                            match bridge_install::sync_bridge(
+                                &bundled,
+                                std::path::Path::new(editor_path),
+                            ) {
+                                Ok(true) => eprintln!("eud-agent: bridge re-installed to editor"),
+                                Ok(false) => {}
+                                Err(error) => {
+                                    eprintln!("eud-agent: bridge sync skipped: {error}")
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            eprintln!("eud-agent: cannot resolve bundled bridge resource: {error}")
+                        }
+                    }
+                }
+            }
+
             app.manage(ipc::BridgeManaged::new(data_dirs.clone()));
 
             // Feature 10 boot flow (EUD-132): on later launches where the editor

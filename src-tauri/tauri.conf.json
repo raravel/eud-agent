@@ -27,7 +27,11 @@
   },
   "bundle": {
     "active": true,
-    "targets": "all",
+    "targets": ["nsis"],
+    "createUpdaterArtifacts": true,
+    "resources": {
+      "../bridge/ZZZ_10_agent_bridge.lua": "bridge/ZZZ_10_agent_bridge.lua"
+    },
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
@@ -39,6 +43,14 @@
       "webviewInstallMode": {
         "type": "downloadBootstrapper"
       }
+    }
+  },
+  "plugins": {
+    "updater": {
+      "endpoints": [
+        "https://github.com/raravel/eud-agent/releases/latest/download/latest.json"
+      ],
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDlERTA4QTdENjRGRDAzMTMKUldRVEEvMWtmWXJnblJRbVJlcXN1UCs5VGlCaHgvVWRVczNOd1pGam80MjBIQzJmQUNmSTdLV00K"
     }
   }
 }
