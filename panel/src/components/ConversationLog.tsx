@@ -174,7 +174,7 @@ export function ConversationLog({
           // Archived tool entry (EUD-069): summary line + expandable Tool cards.
           if (entry.tools !== undefined) {
             return (
-              <div key={entry.id} className="flex w-full flex-col gap-1">
+              <div key={entry.id} className="flex w-full flex-col gap-1 my-3">
                 <span
                   className={cn(
                     "flex items-center gap-1.5 text-sm",
@@ -249,7 +249,7 @@ export function ConversationLog({
             block.type === "tools" ? (
               <div
                 key={`turn-block-${block.id}`}
-                className="flex w-full max-w-[95%] flex-col gap-1"
+                className="flex w-full max-w-[95%] flex-col gap-1 my-3"
               >
                 <span className="flex items-center gap-1.5 text-xs text-muted-foreground">
                   <WrenchIcon aria-hidden className="size-3.5 shrink-0" />

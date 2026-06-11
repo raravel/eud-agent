@@ -96,7 +96,7 @@ export function AgentStream({
       )}
 
       {tools.length > 0 && (
-        <div className="flex flex-col gap-1">
+        <div className="flex flex-col gap-1 my-3">
           <span className="flex items-center gap-1.5 text-xs text-muted-foreground">
             <WrenchIcon aria-hidden className="size-3.5 shrink-0" />
             도구 호출 {tools.length}건
