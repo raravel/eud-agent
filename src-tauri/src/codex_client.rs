@@ -478,11 +478,8 @@ where
                 thread_id
             }
             None => {
-                self.send_request(
-                    "thread/start",
-                    serde_json::json!({ "approvalPolicy": "on-request" }),
-                )
-                .await?;
+                self.send_request("thread/start", thread_start_params())
+                    .await?;
                 self.await_thread_started().await?
             }
         };
@@ -567,6 +564,25 @@ pub(crate) const APP_SERVER_CONFIG_OVERRIDES: [&str; 4] = [
     "model_supports_reasoning_summaries=true",
     "model_reasoning_summary=\"detailed\"",
 ];
+
+/// Params for the `thread/start` request that opens a fresh codex thread.
+///
+/// `sandboxPolicy: readOnly` blocks the codex subprocess's OWN filesystem
+/// tools (shell writes / apply_patch) — the agent's "project" is the editor's
+/// open map reached via the eud-tools MCP, never the cwd, so codex must not
+/// edit the disk. The harness (memory / journal / RAG / the mapsafe map write)
+/// runs in OUR parent process, entirely outside this sandbox, so it is
+/// unaffected. `networkAccess:false` keeps the sandboxed shell offline (the
+/// model API + RAG are not sandbox-network paths). readOnly is the strongest
+/// available mode — the codex sandbox enum has no read-blocking variant; reads
+/// land on the empty workspace cwd. `approvalPolicy: on-request` is retained so
+/// the eud-tools MCP elicitation accept flow still routes through our handler.
+fn thread_start_params() -> serde_json::Value {
+    serde_json::json!({
+        "approvalPolicy": "on-request",
+        "sandboxPolicy": { "type": "readOnly", "networkAccess": false },
+    })
+}
 
 impl CodexAppServerClient<tokio::process::ChildStdout, tokio::process::ChildStdin> {
     pub async fn spawn_app_server(
@@ -1026,6 +1042,24 @@ mod app_server_override_tests {
         assert!(APP_SERVER_CONFIG_OVERRIDES.contains(&"skills.include_instructions=false"));
         assert!(APP_SERVER_CONFIG_OVERRIDES.contains(&"project_doc_max_bytes=0"));
     }
+
+    #[test]
+    fn thread_start_clamps_to_a_readonly_offline_sandbox() {
+        // The codex subprocess must not edit the disk with its own tools — the
+        // project is the editor's map via eud-tools, the harness runs in our
+        // parent process. readOnly + offline; approval stays on-request so the
+        // eud-tools MCP elicitation accept flow still routes through us.
+        let params = super::thread_start_params();
+        assert_eq!(
+            params["sandboxPolicy"]["type"],
+            serde_json::json!("readOnly")
+        );
+        assert_eq!(
+            params["sandboxPolicy"]["networkAccess"],
+            serde_json::json!(false)
+        );
+        assert_eq!(params["approvalPolicy"], serde_json::json!("on-request"));
+    }
 }
 
 #[cfg(test)]
@@ -1211,6 +1245,31 @@ mod appserver_tests {
         value["id"].clone()
     }
 
+    /// thread/start MUST clamp the codex subprocess to a read-only, offline
+    /// sandbox so its own shell/apply_patch tools cannot write the disk (the
+    /// project is the editor's map via eud-tools, never the cwd).
+    fn assert_thread_start_sandbox(value: &Value) {
+        let sandbox = &value["params"]["sandboxPolicy"];
+        assert_eq!(
+            sandbox.get("type").and_then(Value::as_str),
+            Some("readOnly"),
+            "thread/start must request the readOnly sandbox, got {sandbox:?}"
+        );
+        assert_eq!(
+            sandbox.get("networkAccess").and_then(Value::as_bool),
+            Some(false),
+            "thread/start sandbox must keep the shell offline, got {sandbox:?}"
+        );
+        // The eud-tools MCP elicitation accept flow rides the approval handler.
+        assert_eq!(
+            value["params"]
+                .get("approvalPolicy")
+                .and_then(Value::as_str),
+            Some("on-request"),
+            "thread/start must keep approvalPolicy on-request for MCP elicitations"
+        );
+    }
+
     fn assert_initialize_params(value: &Value) {
         assert_eq!(
             value
@@ -1305,6 +1364,7 @@ mod appserver_tests {
 
             let thread_start = read_json_line(&mut client_requests).await;
             let thread_start_id = assert_client_request(&thread_start, "thread/start");
+            assert_thread_start_sandbox(&thread_start);
             write_json_line(
                 &mut server_responses,
                 json!({"jsonrpc":"2.0","id":thread_start_id,"result":{}}),
