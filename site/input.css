@@ -1,0 +1,40 @@
+@import "tailwindcss";
+
+/* Scan the published page for utility classes (run from the repo root or site/). */
+@source "../docs/index.html";
+@source "../docs/assets/download.js";
+
+/* Self-hosted Pretendard (Korean-first), no runtime CDN. The url() is resolved
+   relative to the OUTPUT file: docs/assets/app.css -> docs/assets/fonts/... */
+@font-face {
+  font-family: "Pretendard Variable";
+  font-weight: 45 920;
+  font-style: normal;
+  font-display: swap;
+  src: url("./fonts/PretendardVariable.woff2") format("woff2-variations");
+}
+
+@theme {
+  --font-sans:
+    "Pretendard Variable", ui-sans-serif, system-ui, -apple-system,
+    "Segoe UI", Roboto, "Apple SD Gothic Neo", "Noto Sans KR", sans-serif;
+}
+
+@layer base {
+  body {
+    font-family: var(--font-sans);
+  }
+  /* Respect reduced-motion: kill smooth scroll + transitions/animations. */
+  @media (prefers-reduced-motion: reduce) {
+    html {
+      scroll-behavior: auto;
+    }
+    *,
+    *::before,
+    *::after {
+      animation-duration: 0.001ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.001ms !important;
+    }
+  }
+}

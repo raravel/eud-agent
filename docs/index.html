@@ -1,0 +1,230 @@
+<!doctype html>
+<html lang="ko" class="scroll-smooth">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>eud-agent — EUD Editor 3 외부 AI 에이전트</title>
+    <meta
+      name="description"
+      content="자연어 지시를 epScript 코드로 변환해 EUD Editor 3에 안전하게 적용하는 Windows 데스크톱 AI 에이전트. 지금 다운로드하세요."
+    />
+    <meta name="theme-color" content="#0f172a" />
+    <meta property="og:title" content="eud-agent — EUD Editor 3 외부 AI 에이전트" />
+    <meta
+      property="og:description"
+      content="자연어로 epScript를 작성하고 에디터에 바로 적용하세요. Windows 10/11 · 무료 · 자동 업데이트."
+    />
+    <meta property="og:type" content="website" />
+    <link rel="preload" href="./assets/fonts/PretendardVariable.woff2" as="font" type="font/woff2" crossorigin />
+    <link rel="stylesheet" href="./assets/app.css" />
+    <link rel="icon" href="./assets/favicon.svg" type="image/svg+xml" />
+  </head>
+  <body class="bg-slate-950 text-slate-100 antialiased selection:bg-green-500/30">
+    <!-- skip link -->
+    <a
+      href="#main"
+      class="sr-only focus:not-sr-only focus:fixed focus:left-4 focus:top-4 focus:z-50 focus:rounded-md focus:bg-green-500 focus:px-4 focus:py-2 focus:text-slate-950 focus:font-semibold"
+      >본문으로 건너뛰기</a
+    >
+
+    <!-- header -->
+    <header
+      class="sticky top-0 z-40 border-b border-slate-800/70 bg-slate-950/80 backdrop-blur supports-[backdrop-filter]:bg-slate-950/60"
+    >
+      <div class="mx-auto flex max-w-6xl items-center justify-between px-5 py-3.5">
+        <a href="#" class="flex items-center gap-2.5 font-semibold tracking-tight">
+          <span class="grid h-8 w-8 place-items-center rounded-lg bg-green-500/15 ring-1 ring-green-500/30">
+            <svg class="h-4.5 w-4.5 text-green-400" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m18 16 4-4-4-4"/><path d="m6 8-4 4 4 4"/><path d="m14.5 4-5 16"/></svg>
+          </span>
+          <span class="text-[15px]">eud-agent</span>
+        </a>
+        <nav class="flex items-center gap-1.5 text-sm">
+          <a href="#install" class="rounded-md px-3 py-2 text-slate-300 transition-colors hover:bg-slate-800/70 hover:text-white">설치 방법</a>
+          <a
+            href="https://github.com/raravel/eud-agent"
+            class="flex items-center gap-1.5 rounded-md px-3 py-2 text-slate-300 transition-colors hover:bg-slate-800/70 hover:text-white"
+          >
+            <svg class="h-4 w-4" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 .5C5.37.5 0 5.87 0 12.5c0 5.3 3.44 9.8 8.21 11.39.6.11.82-.26.82-.58v-2.03c-3.34.73-4.04-1.61-4.04-1.61-.55-1.39-1.34-1.76-1.34-1.76-1.09-.75.08-.73.08-.73 1.21.09 1.84 1.24 1.84 1.24 1.07 1.84 2.81 1.31 3.5 1 .11-.78.42-1.31.76-1.61-2.67-.3-5.47-1.34-5.47-5.95 0-1.31.47-2.39 1.24-3.23-.13-.31-.54-1.53.12-3.18 0 0 1.01-.32 3.3 1.23a11.5 11.5 0 0 1 6 0c2.29-1.55 3.3-1.23 3.3-1.23.66 1.65.25 2.87.12 3.18.77.84 1.24 1.92 1.24 3.23 0 4.62-2.81 5.64-5.49 5.94.43.37.81 1.1.81 2.22v3.29c0 .32.22.7.83.58A12.01 12.01 0 0 0 24 12.5C24 5.87 18.63.5 12 .5Z"/></svg>
+            <span class="hidden sm:inline">GitHub</span>
+          </a>
+        </nav>
+      </div>
+    </header>
+
+    <main id="main">
+      <!-- hero -->
+      <section class="relative overflow-hidden">
+        <div
+          class="pointer-events-none absolute inset-x-0 -top-40 h-[28rem] bg-[radial-gradient(60%_60%_at_50%_0%,rgba(34,197,94,0.14),transparent_70%)]"
+          aria-hidden="true"
+        ></div>
+        <div class="mx-auto max-w-6xl px-5 pb-20 pt-16 sm:pt-24 text-center">
+          <p class="mb-5 inline-flex items-center gap-2 rounded-full border border-slate-700/70 bg-slate-900/60 px-3.5 py-1.5 text-xs font-medium text-slate-300">
+            <span class="h-1.5 w-1.5 rounded-full bg-green-400"></span>
+            EUD Editor 3 외부 AI 에이전트
+          </p>
+          <h1 class="mx-auto max-w-3xl text-4xl font-bold leading-[1.15] tracking-tight sm:text-5xl md:text-6xl">
+            자연어로 epScript를 작성하고<br class="hidden sm:block" />
+            <span class="bg-gradient-to-r from-green-300 to-green-500 bg-clip-text text-transparent">에디터에 바로 적용</span>하세요
+          </h1>
+          <p class="mx-auto mt-6 max-w-2xl text-pretty text-base leading-relaxed text-slate-300 sm:text-lg">
+            eud-agent는 StarCraft EUD 맵 제작을 위한 데스크톱 AI 에이전트입니다.
+            지시를 epScript(eps) 코드로 변환하고, RAG 근거와 함께 EUD Editor 3에 안전하게 적용합니다.
+          </p>
+
+          <div class="mt-9 flex flex-col items-center justify-center gap-3 sm:flex-row">
+            <a
+              id="download-btn"
+              href="https://github.com/raravel/eud-agent/releases/latest"
+              class="group inline-flex w-full items-center justify-center gap-2.5 rounded-xl bg-green-500 px-6 py-3.5 text-base font-semibold text-slate-950 shadow-lg shadow-green-500/20 transition-all duration-200 hover:bg-green-400 hover:shadow-green-400/30 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-green-300 sm:w-auto"
+            >
+              <svg class="h-5 w-5 transition-transform duration-200 group-hover:translate-y-0.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" x2="12" y1="15" y2="3"/></svg>
+              Windows용 다운로드
+              <span class="rounded-md bg-slate-950/15 px-2 py-0.5 text-sm font-medium" data-version>…</span>
+            </a>
+            <a
+              href="https://github.com/raravel/eud-agent"
+              class="inline-flex w-full items-center justify-center gap-2 rounded-xl border border-slate-700 bg-slate-900/50 px-6 py-3.5 text-base font-semibold text-slate-200 transition-colors duration-200 hover:bg-slate-800 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-slate-500 sm:w-auto"
+            >
+              GitHub에서 보기
+            </a>
+          </div>
+          <p class="mt-4 text-sm text-slate-400">Windows 10/11 (64-bit) · 무료 · 자동 업데이트</p>
+        </div>
+      </section>
+
+      <!-- prerequisites -->
+      <section class="mx-auto max-w-6xl px-5 py-16" aria-labelledby="prereq-title">
+        <div class="mb-10 text-center">
+          <h2 id="prereq-title" class="text-2xl font-bold tracking-tight sm:text-3xl">시작하기 전에</h2>
+          <p class="mt-3 text-slate-400">설치 전 아래 항목을 확인하세요.</p>
+        </div>
+        <div class="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+          <!-- card -->
+          <div class="rounded-2xl border border-slate-800 bg-slate-900/40 p-5">
+            <span class="grid h-10 w-10 place-items-center rounded-lg bg-slate-800 text-green-400">
+              <svg class="h-5 w-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect width="20" height="14" x="2" y="3" rx="2"/><line x1="8" x2="16" y1="21" y2="21"/><line x1="12" x2="12" y1="17" y2="21"/></svg>
+            </span>
+            <h3 class="mt-4 font-semibold">Windows 10/11</h3>
+            <p class="mt-1.5 text-sm leading-relaxed text-slate-400">64-bit 데스크톱 환경에서 동작합니다.</p>
+          </div>
+          <div class="rounded-2xl border border-slate-800 bg-slate-900/40 p-5">
+            <span class="grid h-10 w-10 place-items-center rounded-lg bg-slate-800 text-green-400">
+              <svg class="h-5 w-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><path d="M2 12h20"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>
+            </span>
+            <h3 class="mt-4 font-semibold">WebView2 런타임</h3>
+            <p class="mt-1.5 text-sm leading-relaxed text-slate-400">
+              보통 Windows에 기본 포함됩니다. 없을 경우
+              <a class="text-green-400 underline-offset-2 hover:underline" href="https://developer.microsoft.com/microsoft-edge/webview2/">여기서 설치</a>하세요.
+            </p>
+          </div>
+          <div class="rounded-2xl border border-slate-800 bg-slate-900/40 p-5">
+            <span class="grid h-10 w-10 place-items-center rounded-lg bg-slate-800 text-green-400">
+              <svg class="h-5 w-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 19.5v-15A2.5 2.5 0 0 1 6.5 2H20v20H6.5a2.5 2.5 0 0 1 0-5H20"/></svg>
+            </span>
+            <h3 class="mt-4 font-semibold">EUD Editor 3</h3>
+            <p class="mt-1.5 text-sm leading-relaxed text-slate-400">
+              별도로 보유한 EUD Editor 3가 필요합니다. 설치 후 에디터를 실행하면 자동으로 연결됩니다.
+            </p>
+          </div>
+          <div class="rounded-2xl border border-slate-800 bg-slate-900/40 p-5">
+            <span class="grid h-10 w-10 place-items-center rounded-lg bg-slate-800 text-green-400">
+              <svg class="h-5 w-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="4 17 10 11 4 5"/><line x1="12" x2="20" y1="19" y2="19"/></svg>
+            </span>
+            <h3 class="mt-4 font-semibold">codex CLI</h3>
+            <p class="mt-1.5 text-sm leading-relaxed text-slate-400">
+              코드 생성에 codex CLI를 사용합니다. 직접 설치·로그인(BYO)이 필요합니다.
+            </p>
+          </div>
+        </div>
+        <p class="mt-6 flex items-start gap-2.5 rounded-xl border border-slate-800 bg-slate-900/30 p-4 text-sm text-slate-400">
+          <svg class="mt-0.5 h-4.5 w-4.5 shrink-0 text-slate-500" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4"/><path d="M12 8h.01"/></svg>
+          <span>최초 실행 시 임베딩 모델(bge-m3)과 RAG 인덱스를 자동으로 내려받습니다(1회, 약 600MB 이상). 다운로드가 끝나면 이후 실행은 즉시 시작됩니다.</span>
+        </p>
+      </section>
+
+      <!-- install steps -->
+      <section id="install" class="mx-auto max-w-3xl px-5 py-16" aria-labelledby="install-title">
+        <div class="mb-10 text-center">
+          <h2 id="install-title" class="text-2xl font-bold tracking-tight sm:text-3xl">설치 방법</h2>
+          <p class="mt-3 text-slate-400">네 단계면 끝납니다.</p>
+        </div>
+        <ol class="space-y-4">
+          <li class="flex gap-4 rounded-2xl border border-slate-800 bg-slate-900/40 p-5">
+            <span class="grid h-9 w-9 shrink-0 place-items-center rounded-full bg-green-500/15 font-semibold text-green-400 ring-1 ring-green-500/30">1</span>
+            <div>
+              <h3 class="font-semibold">설치 파일 다운로드</h3>
+              <p class="mt-1.5 text-sm leading-relaxed text-slate-400">
+                위의 <span class="text-slate-200">Windows용 다운로드</span> 버튼으로 최신 <code class="rounded bg-slate-800 px-1.5 py-0.5 text-[13px] text-green-300">-setup.exe</code> 설치 프로그램을 받습니다.
+              </p>
+            </div>
+          </li>
+          <li class="flex gap-4 rounded-2xl border border-slate-800 bg-slate-900/40 p-5">
+            <span class="grid h-9 w-9 shrink-0 place-items-center rounded-full bg-green-500/15 font-semibold text-green-400 ring-1 ring-green-500/30">2</span>
+            <div>
+              <h3 class="font-semibold">설치 프로그램 실행</h3>
+              <p class="mt-1.5 text-sm leading-relaxed text-slate-400">
+                내려받은 파일을 실행합니다. 사용자 단위(현재 사용자) 설치라 관리자 권한이 필요 없습니다.
+              </p>
+              <p class="mt-2.5 flex items-start gap-2 rounded-lg border border-amber-500/20 bg-amber-500/5 p-3 text-[13px] leading-relaxed text-amber-200/90">
+                <svg class="mt-0.5 h-4 w-4 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3Z"/><path d="M12 9v4"/><path d="M12 17h.01"/></svg>
+                <span>코드 서명이 적용되지 않아 Windows SmartScreen 경고가 나타날 수 있습니다. <strong class="font-semibold text-amber-100">추가 정보 → 실행</strong>을 눌러 진행하세요.</span>
+              </p>
+            </div>
+          </li>
+          <li class="flex gap-4 rounded-2xl border border-slate-800 bg-slate-900/40 p-5">
+            <span class="grid h-9 w-9 shrink-0 place-items-center rounded-full bg-green-500/15 font-semibold text-green-400 ring-1 ring-green-500/30">3</span>
+            <div>
+              <h3 class="font-semibold">최초 실행 설정</h3>
+              <p class="mt-1.5 text-sm leading-relaxed text-slate-400">
+                앱을 처음 켜면 설정 화면에서 임베딩 모델과 RAG 인덱스를 자동으로 내려받습니다. 완료될 때까지 잠시 기다리세요.
+              </p>
+            </div>
+          </li>
+          <li class="flex gap-4 rounded-2xl border border-slate-800 bg-slate-900/40 p-5">
+            <span class="grid h-9 w-9 shrink-0 place-items-center rounded-full bg-green-500/15 font-semibold text-green-400 ring-1 ring-green-500/30">4</span>
+            <div>
+              <h3 class="font-semibold">에디터 연결</h3>
+              <p class="mt-1.5 text-sm leading-relaxed text-slate-400">
+                EUD Editor 3를 실행하면 브리지가 자동으로 설치·연결됩니다. 이제 패널에서 지시를 입력하고 코드를 적용할 수 있습니다.
+              </p>
+            </div>
+          </li>
+        </ol>
+      </section>
+
+      <!-- auto update -->
+      <section class="mx-auto max-w-3xl px-5 py-16" aria-labelledby="update-title">
+        <div class="flex flex-col items-center gap-5 rounded-3xl border border-slate-800 bg-gradient-to-b from-slate-900/60 to-slate-900/20 p-8 text-center sm:flex-row sm:text-left">
+          <span class="grid h-14 w-14 shrink-0 place-items-center rounded-2xl bg-green-500/15 text-green-400 ring-1 ring-green-500/30">
+            <svg class="h-7 w-7" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/><path d="M3 21v-5h5"/></svg>
+          </span>
+          <div>
+            <h2 id="update-title" class="text-xl font-bold tracking-tight">자동 업데이트</h2>
+            <p class="mt-2 text-sm leading-relaxed text-slate-400">
+              설치 후에는 앱이 서명된 업데이트를 자동으로 확인하고 적용합니다. 내려받은 모델과 설정은 업데이트 시에도 그대로 보존됩니다.
+            </p>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <!-- footer -->
+    <footer class="border-t border-slate-800/70">
+      <div class="mx-auto flex max-w-6xl flex-col items-center justify-between gap-4 px-5 py-8 text-sm text-slate-400 sm:flex-row">
+        <div class="flex items-center gap-2">
+          <span class="font-semibold text-slate-300">eud-agent</span>
+          <span class="text-slate-600">·</span>
+          <span><span data-version>…</span> <span class="text-slate-600">(<span id="pubdate">—</span>)</span></span>
+        </div>
+        <nav class="flex items-center gap-5">
+          <a class="transition-colors hover:text-white" href="https://github.com/raravel/eud-agent">GitHub</a>
+          <a class="transition-colors hover:text-white" href="https://github.com/raravel/eud-agent/issues">이슈 신고</a>
+          <a class="transition-colors hover:text-white" href="https://github.com/raravel/eud-agent/releases">모든 릴리스</a>
+        </nav>
+      </div>
+    </footer>
+
+    <script src="./assets/download.js" defer></script>
+  </body>
+</html>
