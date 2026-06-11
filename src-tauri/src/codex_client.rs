@@ -19,7 +19,13 @@
 //! the Python layering where `engine.py` wraps `codex_client.build_prompt`. Callers wiring
 //! generation must go through the engine so those guardrails apply.
 
-use std::{env, io::ErrorKind, path::PathBuf, process::Stdio, time::Duration};
+use std::{
+    env,
+    io::ErrorKind,
+    path::{Path, PathBuf},
+    process::Stdio,
+    time::Duration,
+};
 
 use thiserror::Error;
 use tokio::{io::AsyncWriteExt, process::Command, time};
@@ -52,11 +58,31 @@ pub fn resolve_codex_cmd() -> Result<PathBuf, CodexError> {
         return Ok(PathBuf::from(cmd));
     }
 
+    // The app-installed standalone binary (bootstrap `ensure_codex` places it
+    // here). Resolved BEFORE PATH so a freshly installed codex is found without a
+    // restart and without depending on the user's PATH. Self-contained: derived
+    // from %LOCALAPPDATA% so this fn needs no DataDirs handle.
+    if let Some(local) = env::var_os("LOCALAPPDATA").filter(|value| !value.is_empty()) {
+        let candidate = well_known_codex_path(Path::new(&local));
+        if candidate.is_file() {
+            return Ok(candidate);
+        }
+    }
+
     which::which("codex").map_err(|err| {
         CodexError::NotFound(format!(
-            "could not resolve codex.cmd via PATH: {err}. Install codex or set CODEX_CMD to the codex.cmd shim path."
+            "could not resolve codex via CODEX_CMD, the app bin dir, or PATH: {err}. Install codex (the setup screen can do this) or set CODEX_CMD to the codex binary path."
         ))
     })
+}
+
+/// The app-installed codex binary path under `<local_app_data>\eud-agent\bin`
+/// (matches [`DataDirs::bin_dir`](crate::config::DataDirs::bin_dir)).
+fn well_known_codex_path(local_app_data: &Path) -> PathBuf {
+    local_app_data
+        .join("eud-agent")
+        .join("bin")
+        .join(crate::bootstrap::CODEX_BIN_FILENAME)
 }
 
 pub fn extract_code(text: &str) -> Result<String, CodexError> {
@@ -584,9 +610,19 @@ fn thread_start_params() -> serde_json::Value {
     })
 }
 
+/// The dotted-key `-c` override that registers the in-process eud-tools MCP
+/// server with codex over loopback streamable HTTP (decision A2). The value is a
+/// TOML string, so it is quoted; the `eud-tools` key segment is a valid TOML
+/// bare key (hyphens allowed). codex's `RawMcpServerConfig` selects the HTTP
+/// transport from the presence of `url`.
+pub(crate) fn mcp_server_override(port: u16) -> String {
+    format!("mcp_servers.eud-tools.url=\"http://127.0.0.1:{port}/mcp\"")
+}
+
 impl CodexAppServerClient<tokio::process::ChildStdout, tokio::process::ChildStdin> {
     pub async fn spawn_app_server(
         cwd: impl AsRef<std::path::Path>,
+        mcp_port: u16,
     ) -> Result<(Self, tokio::sync::mpsc::Receiver<AppServerEvent>), AppServerError> {
         let codex_cmd = resolve_codex_cmd().map_err(|err| AppServerError::new(err.to_string()))?;
         let mut command = tokio::process::Command::new(codex_cmd);
@@ -594,6 +630,9 @@ impl CodexAppServerClient<tokio::process::ChildStdout, tokio::process::ChildStdi
         for override_arg in APP_SERVER_CONFIG_OVERRIDES {
             command.arg("-c").arg(override_arg);
         }
+        // Attach the eud-tools MCP server so codex's turns can actually call the
+        // tool registry (without this the agent has no map/file/search tools).
+        command.arg("-c").arg(mcp_server_override(mcp_port));
         command
             .current_dir(cwd.as_ref())
             .stdin(std::process::Stdio::piped())
@@ -1038,9 +1077,30 @@ mod app_server_override_tests {
     use super::APP_SERVER_CONFIG_OVERRIDES;
 
     #[test]
+    fn well_known_codex_path_is_under_the_local_app_data_bin_dir() {
+        let path =
+            super::well_known_codex_path(std::path::Path::new("C:\\Users\\x\\AppData\\Local"));
+        assert!(
+            path.ends_with("eud-agent\\bin\\codex.exe")
+                || path.ends_with("eud-agent/bin/codex.exe")
+        );
+    }
+
+    #[test]
     fn overrides_block_skills_and_project_docs() {
         assert!(APP_SERVER_CONFIG_OVERRIDES.contains(&"skills.include_instructions=false"));
         assert!(APP_SERVER_CONFIG_OVERRIDES.contains(&"project_doc_max_bytes=0"));
+    }
+
+    #[test]
+    fn mcp_server_override_is_a_loopback_dotted_key_with_a_quoted_url() {
+        // codex selects the streamable-HTTP transport from `url`; the value is a
+        // TOML string (quoted), the key segment `eud-tools` is a valid bare key.
+        let arg = super::mcp_server_override(54321);
+        assert_eq!(
+            arg,
+            "mcp_servers.eud-tools.url=\"http://127.0.0.1:54321/mcp\""
+        );
     }
 
     #[test]

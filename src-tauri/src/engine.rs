@@ -16,7 +16,8 @@ use std::{
 
 use crate::{
     codex_client::{AppServerEvent, CodexAppServerClient},
-    ipc, journal, tools,
+    ipc, journal,
+    tool_exec::ToolRuntime,
 };
 use tokio::process::{ChildStdin, ChildStdout};
 
@@ -27,7 +28,6 @@ epScript (eps) code, dat settings, map locations — by calling the \
 eud-tools below; the server validates, journals, and can roll back \
 every change.";
 
-const TOOL_CATALOG_PLACEHOLDER: &str = "[tools]\n(tool catalog pending EUD-114)";
 const EPISODE_INSTRUCTION_CHARS: usize = 200;
 
 const EPSCRIPT_GUIDE: &str = r#"[epscript]
@@ -126,12 +126,19 @@ pub trait MemoryProvider: Send + Sync {
     fn append_episode(&self, episode: &serde_json::Value) -> bool;
 }
 
+/// Renders the `[project state]` section fresh each turn (project name + build
+/// state from the editor), so a resumed thread never carries a stale snapshot.
+pub trait ProjectStateProvider: Send + Sync {
+    fn render_section(&self) -> String;
+}
+
 #[derive(Clone)]
 pub struct AgentEngineConfig {
     project_state: String,
     project_memory: Option<String>,
     rag_hits: Vec<crate::rag::Hit>,
     memory_provider: Option<Arc<dyn MemoryProvider>>,
+    project_state_provider: Option<Arc<dyn ProjectStateProvider>>,
 }
 
 impl AgentEngineConfig {
@@ -145,6 +152,7 @@ impl AgentEngineConfig {
             project_memory,
             rag_hits,
             memory_provider: None,
+            project_state_provider: None,
         }
     }
 
@@ -159,6 +167,20 @@ impl AgentEngineConfig {
     pub fn with_memory_provider(mut self, provider: Arc<dyn MemoryProvider>) -> Self {
         self.memory_provider = Some(provider);
         self
+    }
+
+    pub fn with_project_state_provider(mut self, provider: Arc<dyn ProjectStateProvider>) -> Self {
+        self.project_state_provider = Some(provider);
+        self
+    }
+
+    /// The `[project state]` text for the prompt: a live render when a provider
+    /// is wired, otherwise the construction-time constant (tests).
+    fn project_state_for_prompt(&self) -> String {
+        self.project_state_provider
+            .as_ref()
+            .map(|provider| provider.render_section())
+            .unwrap_or_else(|| self.project_state.clone())
     }
 
     fn project_memory_for_prompt(&self) -> Option<String> {
@@ -194,16 +216,21 @@ pub(crate) struct AgentEngine<D: CodexDriver, S: EventSink> {
     phase: Phase,
     thread_active: bool,
     plan_revision: u32,
-    request_state: Option<tools::RequestState>,
     current_request_id: Option<String>,
     current_instruction_head: Option<String>,
     journal_store: journal::JournalStore,
     journal_data_dir: PathBuf,
+    runtime: ToolRuntime,
 }
 
 impl<D: CodexDriver, S: EventSink> AgentEngine<D, S> {
-    pub fn new(driver: D, sink: S, config: AgentEngineConfig) -> Self {
-        let journal_data_dir = default_data_dir();
+    /// Construct the engine over the SHARED tool runtime. The per-request gate
+    /// state and the change journal live in `runtime` (not in the engine) so the
+    /// MCP tool handler can reach them WHILE this engine holds its mutex across
+    /// `run_turn().await` — the codex turn during which tool calls arrive.
+    pub fn new(driver: D, sink: S, config: AgentEngineConfig, runtime: ToolRuntime) -> Self {
+        let journal_store = runtime.journal().clone();
+        let journal_data_dir = runtime.app_data_dir();
         Self {
             driver,
             sink,
@@ -211,30 +238,29 @@ impl<D: CodexDriver, S: EventSink> AgentEngine<D, S> {
             phase: Phase::Idle,
             thread_active: false,
             plan_revision: 0,
-            request_state: None,
             current_request_id: None,
             current_instruction_head: None,
-            journal_store: journal::JournalStore::new(&journal_data_dir),
+            journal_store,
             journal_data_dir,
+            runtime,
         }
     }
 
     pub async fn chat(&mut self, req: ipc::ChatRequest) -> Result<(), AgentEngineError> {
         self.finalize_pending_changeset();
         let request_id = next_request_id();
-        let mut request_state = self.request_state.take().unwrap_or_default();
-        request_state.start_request(&request_id);
-        self.request_state = Some(request_state);
+        self.runtime.begin_request(&request_id);
         self.current_request_id = Some(request_id);
         self.current_instruction_head = Some(take_chars(&req.text, EPISODE_INSTRUCTION_CHARS));
         self.phase = Phase::Triage;
 
         let memory = self.config.project_memory_for_prompt();
+        let project_state = self.config.project_state_for_prompt();
         let turn_text = if self.thread_active {
             resume_turn_text(
                 &req.text,
                 &self.config.rag_hits,
-                &self.config.project_state,
+                &project_state,
                 memory.as_deref(),
             )
         } else {
@@ -243,7 +269,7 @@ impl<D: CodexDriver, S: EventSink> AgentEngine<D, S> {
                 build_system_prompt(
                     &req.text,
                     &self.config.rag_hits,
-                    &self.config.project_state,
+                    &project_state,
                     memory.as_deref(),
                 ),
                 req.text
@@ -252,6 +278,7 @@ impl<D: CodexDriver, S: EventSink> AgentEngine<D, S> {
 
         let result = self.driver.run_turn(turn_text).await?;
         self.thread_active = true;
+        let result = self.reinterpret_plan(result);
         self.handle_turn_result(result)?;
         self.emit_current_changeset_if_any()?;
         Ok(())
@@ -262,10 +289,22 @@ impl<D: CodexDriver, S: EventSink> AgentEngine<D, S> {
         self.driver.reset_thread().await?;
         self.thread_active = false;
         self.phase = Phase::Idle;
-        self.request_state = None;
+        self.runtime.clear_current();
         self.current_request_id = None;
         self.current_instruction_head = None;
         Ok(())
+    }
+
+    /// A `propose_plan` tool call during the turn parks its markdown on the
+    /// runtime; if the open request left one, the turn ends as a plan review
+    /// rather than a plain answer (feature 11: propose_plan ends the turn).
+    fn reinterpret_plan(&self, result: CodexTurnResult) -> CodexTurnResult {
+        if let Some(request_id) = self.current_request_id.as_deref() {
+            if let Some(markdown) = self.runtime.take_pending_plan(request_id) {
+                return CodexTurnResult::Plan { markdown };
+            }
+        }
+        result
     }
 
     /// Default-accept + archive the prior request's undecided changeset items before a new
@@ -289,15 +328,17 @@ impl<D: CodexDriver, S: EventSink> AgentEngine<D, S> {
         let turn_text = self.resume_text(&req.text);
         let result = self.driver.run_turn(turn_text).await?;
         self.thread_active = true;
+        let result = self.reinterpret_plan(result);
         self.handle_turn_result(result)
     }
 
     pub async fn plan_approve(&mut self) -> Result<(), AgentEngineError> {
-        let state = self
-            .request_state
-            .as_mut()
-            .ok_or_else(|| AgentEngineError::new("no request is awaiting plan approval"))?;
-        state.approve_plan();
+        if self.runtime.current_request_id().is_none() {
+            return Err(AgentEngineError::new(
+                "no request is awaiting plan approval",
+            ));
+        }
+        self.runtime.approve_current_plan();
         self.phase = Phase::Executing;
 
         let turn_text = self.resume_text(
@@ -305,6 +346,7 @@ impl<D: CodexDriver, S: EventSink> AgentEngine<D, S> {
         );
         let result = self.driver.run_turn(turn_text).await?;
         self.thread_active = true;
+        let result = self.reinterpret_plan(result);
         self.handle_turn_result(result)?;
         self.emit_current_changeset_if_any()?;
         Ok(())
@@ -368,7 +410,7 @@ impl<D: CodexDriver, S: EventSink> AgentEngine<D, S> {
         resume_turn_text(
             text,
             &self.config.rag_hits,
-            &self.config.project_state,
+            &self.config.project_state_for_prompt(),
             memory.as_deref(),
         )
     }
@@ -507,15 +549,17 @@ impl EventSink for TauriEventSink {
 pub(crate) struct ProductionCodexDriver {
     cwd: PathBuf,
     sink: TauriEventSink,
+    mcp_port: u16,
     client: Option<CodexAppServerClient<ChildStdout, ChildStdin>>,
     events: Option<tokio::sync::mpsc::Receiver<AppServerEvent>>,
 }
 
 impl ProductionCodexDriver {
-    pub(crate) fn new(cwd: impl Into<PathBuf>, sink: TauriEventSink) -> Self {
+    pub(crate) fn new(cwd: impl Into<PathBuf>, sink: TauriEventSink, mcp_port: u16) -> Self {
         Self {
             cwd: cwd.into(),
             sink,
+            mcp_port,
             client: None,
             events: None,
         }
@@ -526,7 +570,7 @@ impl ProductionCodexDriver {
             return Ok(());
         }
 
-        let (client, events) = CodexAppServerClient::spawn_app_server(&self.cwd)
+        let (client, events) = CodexAppServerClient::spawn_app_server(&self.cwd, self.mcp_port)
             .await
             .map_err(|err| AgentEngineError::new(err.to_string()))?;
         self.client = Some(client);
@@ -761,7 +805,7 @@ pub fn build_system_prompt(
     let mut parts = vec![
         INTRO.to_string(),
         String::new(),
-        TOOL_CATALOG_PLACEHOLDER.to_string(),
+        tool_catalog_section(),
         String::new(),
         project_state_section(project_state),
         String::new(),
@@ -820,6 +864,29 @@ pub fn resume_turn_text(
     parts.join("\n")
 }
 
+/// Render the `[tools]` catalog from the live registry so the system prompt
+/// always matches what the eud-tools MCP server actually exposes (read vs
+/// journaled-write split). The agent invokes these through that MCP server.
+fn tool_catalog_section() -> String {
+    let mut read = Vec::new();
+    let mut write = Vec::new();
+    for spec in crate::tools::tool_registry() {
+        let line = format!("- {} — {}", spec.name, spec.description);
+        if spec.mutating {
+            write.push(line);
+        } else {
+            read.push(line);
+        }
+    }
+    format!(
+        "[tools]\nYou act ONLY by calling these eud-tools (exposed over the eud-tools MCP \
+server); every call and its result is shown to the user.\nRead-only:\n{}\nWrite (validated, \
+journaled, and reviewable/reversible as a changeset):\n{}",
+        read.join("\n"),
+        write.join("\n")
+    )
+}
+
 fn first_principles_section() -> String {
     format!("[first principles]\n{}", FIRST_PRINCIPLES.trim())
 }
@@ -870,13 +937,6 @@ fn next_request_id() -> String {
         .unwrap_or_default();
     let value = nanos ^ COUNTER.fetch_add(1, Ordering::Relaxed);
     format!("req-{value:08x}", value = value as u32)
-}
-
-fn default_data_dir() -> PathBuf {
-    std::env::var_os("APPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir)
-        .join("eud-agent")
 }
 
 /// Paragraph break for the accumulated answer when an item boundary was seen:
@@ -1359,7 +1419,12 @@ mod tests {
         memory: ProjectMemory,
         data_dir: &std::path::Path,
     ) -> AgentEngine<D, S> {
-        let mut engine = AgentEngine::new(driver, sink, config_with_memory(memory));
+        let mut engine = AgentEngine::new(
+            driver,
+            sink,
+            config_with_memory(memory),
+            ToolRuntime::for_tests(),
+        );
         engine.journal_store = journal::JournalStore::new(data_dir);
         engine.journal_data_dir = data_dir.to_path_buf();
         engine
@@ -1452,6 +1517,7 @@ mod tests {
                 None,
                 sample_hits(),
             ),
+            ToolRuntime::for_tests(),
         )
     }
 

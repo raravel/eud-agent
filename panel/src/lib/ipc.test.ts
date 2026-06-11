@@ -255,6 +255,8 @@ describe("setup commands", () => {
           editor_path: "",
           editor_valid: false,
           assets_ready: false,
+          codex_resolved: true,
+          codex_authed: false,
           setup_required: true,
         };
       }
@@ -275,6 +277,8 @@ describe("setup commands", () => {
       editor_path: "",
       editor_valid: false,
       assets_ready: false,
+      codex_resolved: true,
+      codex_authed: false,
       setup_required: true,
     });
   });
@@ -287,6 +291,8 @@ describe("setup commands", () => {
           editor_path: "C:\\Games\\NotTheEditor",
           editor_valid: false,
           assets_ready: false,
+          codex_resolved: true,
+          codex_authed: false,
           setup_required: true,
           error: "invalid_editor_folder",
         };
@@ -307,6 +313,8 @@ describe("setup commands", () => {
       editor_path: "C:\\Games\\NotTheEditor",
       editor_valid: false,
       assets_ready: false,
+      codex_resolved: true,
+      codex_authed: false,
       setup_required: true,
       error: "invalid_editor_folder",
     });

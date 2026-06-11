@@ -140,3 +140,75 @@ describe("SetupScreen", () => {
     expect(screen.queryByRole("button", { name: "다시 시도" })).not.toBeInTheDocument();
   });
 });
+
+// ---- step 3: codex login (editor + assets done, codex not yet authed) ------
+describe("SetupScreen — codex login step", () => {
+  const codexProps = {
+    editorValid: true,
+    assetsReady: true,
+    codexResolved: true,
+    codexAuthed: false,
+  };
+
+  it("shows the codex login step with both auth paths once assets are ready", () => {
+    renderScreen(codexProps);
+
+    expect(
+      screen.getByRole("button", { name: "ChatGPT로 로그인" }),
+    ).toBeInTheDocument();
+    expect(screen.getByLabelText("OpenAI API 키")).toBeInTheDocument();
+    // The download progressbar must NOT be shown (assets are done).
+    expect(screen.queryByRole("progressbar")).not.toBeInTheDocument();
+    // Step 3 is the current step.
+    expect(
+      screen.getByText("codex 로그인").closest("li"),
+    ).toHaveAttribute("aria-current", "step");
+  });
+
+  it("launches OAuth and submits the API key through the callbacks", () => {
+    const onCodexOAuth = vi.fn();
+    const onCodexApiKey = vi.fn();
+    renderScreen({ ...codexProps, onCodexOAuth, onCodexApiKey });
+
+    fireEvent.click(screen.getByRole("button", { name: "ChatGPT로 로그인" }));
+    expect(onCodexOAuth).toHaveBeenCalledTimes(1);
+
+    fireEvent.change(screen.getByLabelText("OpenAI API 키"), {
+      target: { value: "  sk-test-key  " },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "API 키로 로그인" }));
+    // The key is trimmed before it reaches the backend (stdin-only contract).
+    expect(onCodexApiKey).toHaveBeenCalledWith("sk-test-key");
+  });
+
+  it("offers an install button (not manual guidance) when codex is not found", () => {
+    const onCodexInstall = vi.fn();
+    renderScreen({ ...codexProps, codexResolved: false, onCodexInstall });
+
+    const install = screen.getByRole("button", { name: "codex 설치" });
+    expect(install).toBeInTheDocument();
+    // The login controls are hidden until codex is installed/resolved.
+    expect(
+      screen.queryByRole("button", { name: "ChatGPT로 로그인" }),
+    ).not.toBeInTheDocument();
+
+    fireEvent.click(install);
+    expect(onCodexInstall).toHaveBeenCalledTimes(1);
+  });
+
+  it("shows an installing spinner while the codex download is in flight", () => {
+    renderScreen({ ...codexProps, codexResolved: false, codexBusy: true });
+
+    expect(
+      screen.getByRole("button", { name: "codex 설치 중…" }),
+    ).toBeDisabled();
+  });
+
+  it("disables the login controls while a login attempt is in flight", () => {
+    renderScreen({ ...codexProps, codexBusy: true });
+
+    expect(
+      screen.getByRole("button", { name: "로그인 진행 중…" }),
+    ).toBeDisabled();
+  });
+});

@@ -31,6 +31,10 @@ pub struct SetupStatusResponse {
     pub editor_valid: bool,
     /// True when the model + RAG index pass the manifest check (no download needed).
     pub assets_ready: bool,
+    /// True when the codex CLI was found (PATH / `CODEX_CMD`).
+    pub codex_resolved: bool,
+    /// True when `codex login status` reports a logged-in session.
+    pub codex_authed: bool,
     /// True when the panel must show the setup screen before normal operation.
     pub setup_required: bool,
     /// Optional stable error code (e.g. a rejected folder pick).
@@ -38,26 +42,35 @@ pub struct SetupStatusResponse {
     pub error: Option<String>,
 }
 
-/// Build the setup/manifest snapshot for the panel (pure filesystem probe + hash).
+/// Build the setup/manifest snapshot for the panel (filesystem probe + hash +
+/// codex login probe). Probes the ambient codex login state; see
+/// [`status_from_config`] for the injectable form used by tests.
 pub fn setup_status_payload(dirs: &DataDirs) -> Result<SetupStatusResponse, String> {
     let config = dirs.load_config().map_err(|error| error.to_string())?;
-    Ok(status_from_config(dirs, &config, None))
+    let codex = crate::codex_auth::login_status();
+    Ok(status_from_config(dirs, &config, &codex, None))
 }
 
 fn status_from_config(
     dirs: &DataDirs,
     config: &Config,
+    codex: &crate::codex_auth::CodexAuthState,
     error: Option<String>,
 ) -> SetupStatusResponse {
     let editor_path = config.editor_path.trim().to_string();
     let editor_valid =
         !editor_path.is_empty() && config::validate_editor_path(Path::new(&editor_path));
     let assets_ready = !bootstrap::needs_bootstrap(dirs, config);
+    // codex must be installed AND logged in before any turn can run; an
+    // unauthenticated codex fails every turn, so it gates setup like the editor
+    // path and the assets do.
     SetupStatusResponse {
         editor_path,
         editor_valid,
         assets_ready,
-        setup_required: !editor_valid || !assets_ready,
+        codex_resolved: codex.resolved,
+        codex_authed: codex.authed,
+        setup_required: !editor_valid || !assets_ready || !codex.authed,
         error,
     }
 }
@@ -147,17 +160,19 @@ pub async fn setup_pick_editor_path(
         };
         let picked = picked.into_path().map_err(|error| error.to_string())?;
         let mut config = dirs.load_config().map_err(|error| error.to_string())?;
+        let codex = crate::codex_auth::login_status();
         if !config::validate_editor_path(&picked) {
             return Ok(status_from_config(
                 &dirs,
                 &config,
+                &codex,
                 Some(INVALID_EDITOR_FOLDER.to_string()),
             ));
         }
         config.editor_path = picked.to_string_lossy().into_owned();
         dirs.save_config(&config)
             .map_err(|error| error.to_string())?;
-        Ok(status_from_config(&dirs, &config, None))
+        Ok(status_from_config(&dirs, &config, &codex, None))
     })
     .await
     .map_err(|error| error.to_string())?
@@ -198,6 +213,22 @@ mod tests {
 
     fn make_dirs(base: &Path) -> DataDirs {
         DataDirs::from_bases(&base.join("roaming"), &base.join("local"))
+    }
+
+    fn codex_authed() -> crate::codex_auth::CodexAuthState {
+        crate::codex_auth::CodexAuthState {
+            resolved: true,
+            authed: true,
+            detail: "logged in".to_string(),
+        }
+    }
+
+    fn codex_unauthed() -> crate::codex_auth::CodexAuthState {
+        crate::codex_auth::CodexAuthState {
+            resolved: true,
+            authed: false,
+            detail: "not logged in".to_string(),
+        }
     }
 
     /// A fake EUD Editor 3 install root (`Data\Lua\TriggerEditor` marker present).
@@ -270,11 +301,42 @@ mod tests {
         };
         dirs.save_config(&config).unwrap();
 
-        let status = setup_status_payload(&dirs).unwrap();
+        // Inject an authed codex so the assertion isolates editor + assets from
+        // the ambient codex login state of the test host.
+        let status = status_from_config(&dirs, &config, &codex_authed(), None);
 
         assert!(status.editor_valid);
         assert!(status.assets_ready);
+        assert!(status.codex_authed);
         assert!(!status.setup_required);
+
+        fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn setup_required_when_codex_not_logged_in() {
+        // Editor + assets ready, but codex is unauthenticated: still gated, since
+        // every agent turn would otherwise fail on a codex auth error.
+        let base = unique_temp_dir("codex-unauthed");
+        let dirs = make_dirs(&base);
+        let editor = make_editor_root(&base);
+        let rag_spec = place_rag_asset(&dirs);
+        let config = Config {
+            editor_path: editor.to_string_lossy().into_owned(),
+            model: AssetSpec {
+                name: "BAAI/bge-m3".to_string(),
+                ..Default::default()
+            },
+            rag_index: rag_spec,
+            ..Default::default()
+        };
+
+        let status = status_from_config(&dirs, &config, &codex_unauthed(), None);
+
+        assert!(status.editor_valid);
+        assert!(status.assets_ready);
+        assert!(!status.codex_authed);
+        assert!(status.setup_required);
 
         fs::remove_dir_all(&base).ok();
     }
@@ -331,7 +393,12 @@ mod tests {
         let dirs = make_dirs(&base);
         let config = Config::default();
 
-        let status = status_from_config(&dirs, &config, Some(INVALID_EDITOR_FOLDER.to_string()));
+        let status = status_from_config(
+            &dirs,
+            &config,
+            &codex_authed(),
+            Some(INVALID_EDITOR_FOLDER.to_string()),
+        );
 
         assert_eq!(status.error.as_deref(), Some(INVALID_EDITOR_FOLDER));
         assert!(status.setup_required);

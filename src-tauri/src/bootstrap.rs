@@ -241,6 +241,71 @@ pub fn ensure_model(dirs: &DataDirs, emitter: &dyn ProgressEmitter) -> anyhow::R
     Ok(())
 }
 
+/// The app-installed codex binary filename under [`DataDirs::bin_dir`].
+pub const CODEX_BIN_FILENAME: &str = "codex.exe";
+
+/// The codex standalone Windows x64 binary, always the latest release (the user
+/// opted for latest-tracking over a pinned version). GitHub redirects
+/// `releases/latest/download/<asset>` to the newest release's asset.
+pub const CODEX_LATEST_EXE_URL: &str =
+    "https://github.com/openai/codex/releases/latest/download/codex-x86_64-pc-windows-msvc.exe";
+
+/// Sanity floor for the downloaded codex binary (a real build is tens of MB); a
+/// smaller body means a truncated download or an HTML error page, not the exe.
+const CODEX_MIN_BYTES: u64 = 1_000_000;
+
+/// Download and install the standalone codex binary into [`DataDirs::bin_dir`].
+///
+/// Streams the latest Windows release asset to a temp file, sanity-checks its
+/// size, then atomically renames it to `bin/codex.exe` where
+/// [`resolve_codex_cmd`](crate::codex_client::resolve_codex_cmd) finds it without
+/// a restart. The bare `.exe` asset has NO published per-file sha256 (the release
+/// checksums cover only the packaged tarball), so integrity rests on GitHub TLS
+/// plus the size floor — this is the trade-off of latest-tracking a moving
+/// target. NOT unit-tested (real HTTP download). Returns the placed path.
+pub async fn ensure_codex(
+    dirs: &DataDirs,
+    emitter: &(dyn ProgressEmitter + Send + Sync),
+) -> anyhow::Result<PathBuf> {
+    let bin_dir = dirs.bin_dir();
+    fs::create_dir_all(&bin_dir)
+        .with_context(|| format!("cannot create bin dir {}", bin_dir.display()))?;
+    let final_path = bin_dir.join(CODEX_BIN_FILENAME);
+
+    let tmp = with_tmp_suffix(&final_path);
+    let _ = fs::remove_file(&tmp);
+
+    emitter.emit("codex_install", 0, "downloading codex");
+    download_to_tmp(CODEX_LATEST_EXE_URL, &tmp, "codex", emitter)
+        .await
+        .inspect_err(|_| {
+            let _ = fs::remove_file(&tmp);
+        })?;
+
+    let size = fs::metadata(&tmp).map(|meta| meta.len()).unwrap_or(0);
+    if size < CODEX_MIN_BYTES {
+        let _ = fs::remove_file(&tmp);
+        anyhow::bail!(
+            "downloaded codex binary is implausibly small ({size} bytes); the download likely \
+failed or returned an error page"
+        );
+    }
+
+    // Atomic place: rename over any prior install (Windows rename replaces only
+    // when the target is not locked; codex is not running during setup).
+    if final_path.exists() {
+        let _ = fs::remove_file(&final_path);
+    }
+    fs::rename(&tmp, &final_path).with_context(|| {
+        format!(
+            "cannot place codex binary at {} (in use?)",
+            final_path.display()
+        )
+    })?;
+    emitter.emit("codex_install", 100, "done");
+    Ok(final_path)
+}
+
 /// Stream `url` to `tmp`, emitting `bootstrap` byte-progress. Caller owns tmp cleanup on
 /// error (we only write; verify+place happens after). NOT unit-tested (real HTTP).
 async fn download_to_tmp(

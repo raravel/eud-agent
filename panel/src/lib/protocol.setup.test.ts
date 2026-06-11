@@ -18,6 +18,8 @@ describe("setup message guard", () => {
       editor_path: "C:\\Games\\EUDEditor3",
       editor_valid: true,
       assets_ready: false,
+      codex_resolved: true,
+      codex_authed: false,
       setup_required: true,
     };
     expect(isSetupMessage(msg)).toBe(true);
@@ -31,6 +33,8 @@ describe("setup message guard", () => {
         editor_path: "",
         editor_valid: false,
         assets_ready: false,
+        codex_resolved: true,
+        codex_authed: false,
         setup_required: true,
         error: "invalid_editor_folder",
       }),
@@ -45,6 +49,8 @@ describe("setup message guard", () => {
         editor_path: "",
         editor_valid: "yes", // wrong type
         assets_ready: false,
+        codex_resolved: true,
+        codex_authed: false,
         setup_required: true,
       }),
     ).toBe(false);
@@ -54,8 +60,20 @@ describe("setup message guard", () => {
         editor_path: "",
         editor_valid: false,
         assets_ready: false,
+        codex_resolved: true,
+        codex_authed: false,
         setup_required: true,
         error: 42, // wrong type
+      }),
+    ).toBe(false);
+    // The codex gate fields are required (the setup screen blocks ready on them).
+    expect(
+      isSetupMessage({
+        type: "setup",
+        editor_path: "",
+        editor_valid: false,
+        assets_ready: false,
+        setup_required: true,
       }),
     ).toBe(false);
   });

@@ -59,8 +59,15 @@ commands: `idle -> triage -> answer | plan_review* -> executing -> changeset_rev
   patch/file-change approvals; `model_supports_reasoning_summaries=true` +
   `model_reasoning_summary="detailed"`. Streamed JSONL events are forwarded as `agent_event`s.
 - **eud-tools as an MCP server**: codex attaches an MCP server that exposes the tool registry.
-  In-process Rust (no localhost HTTP shim needed under Tauri) — the MCP server and the tool
-  layer share the process. MCP result content blocks are plain dicts.
+  codex's MCP transport accepts only `command` (stdio) or `url` (HTTP), so attaching an
+  in-process Rust server directly is NOT possible (decision A2). The app instead hosts a
+  **127.0.0.1-only streamable-HTTP MCP server** (rmcp, ephemeral port) and registers codex
+  with `-c mcp_servers.eud-tools.url="http://127.0.0.1:<port>/mcp"`. The server still runs IN
+  the app process, so the MCP handler shares the live tool runtime (request state, journal,
+  bridge, RAG, mapsafe) directly — the loopback HTTP is only codex's required transport, not
+  an out-of-process shim. rules.md's "panel ↔ core is Tauri IPC only — NO localhost socket"
+  bounds the PANEL boundary and does not apply to this codex ↔ core channel; the bind is
+  loopback-only and no bearer token is layered on. MCP result content blocks are plain dicts.
 - **Triage + plan gating (mechanical):** answer-only requests use no write tools; <=2
   mutations may apply directly; the 3rd mutating call WITHOUT an approved plan returns a tool
   error directing codex to `propose_plan`. `plan_approve` lifts the gate for that request.

@@ -143,6 +143,12 @@ impl DataDirs {
         self.app_local_data.join("rag")
     }
 
+    /// `%localappdata%\eud-agent\bin` — app-installed executables (the codex
+    /// standalone binary). NEVER in Roaming; resolved by [`resolve_codex_cmd`].
+    pub fn bin_dir(&self) -> PathBuf {
+        self.app_local_data.join("bin")
+    }
+
     /// `%localappdata%\eud-agent\logs`.
     pub fn logs_dir(&self) -> PathBuf {
         self.app_local_data.join("logs")
@@ -167,6 +173,7 @@ impl DataDirs {
             self.app_local_data.clone(),
             self.models_dir(),
             self.rag_dir(),
+            self.bin_dir(),
             self.logs_dir(),
             self.codex_workspace_dir(),
         ] {

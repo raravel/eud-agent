@@ -43,6 +43,18 @@ import {
   type BootstrapView,
 } from "@/setup/bootstrap";
 import { SetupScreen } from "@/setup/SetupScreen";
+import { invoke } from "@tauri-apps/api/core";
+
+/** codex login probe result (mirrors the Rust `CodexAuthState`). */
+interface CodexAuthState {
+  resolved: boolean;
+  authed: boolean;
+  detail: string;
+}
+
+/** OAuth poll cadence + ceiling: codex's browser flow rarely exceeds a minute. */
+const CODEX_POLL_MS = 2000;
+const CODEX_POLL_TIMEOUT_MS = 180000;
 
 interface BootstrapState {
   active: boolean;
@@ -77,6 +89,11 @@ export default function App() {
   // arrives; setup_required routes the whole panel to the SetupScreen.
   const [setup, setSetup] = useState<SetupMessage | null>(null);
   const bootstrapRunningRef = useRef(false);
+  // codex login step (setup screen step 3). The OAuth path spawns the browser
+  // flow in the backend and polls codex_login_status until it flips.
+  const [codexBusy, setCodexBusy] = useState(false);
+  const [codexError, setCodexError] = useState<string | null>(null);
+  const codexPollRef = useRef<number | null>(null);
 
   useEffect(() => {
     bootstrapActiveRef.current = bootstrap.active;
@@ -373,6 +390,100 @@ export default function App() {
     void clientRef.current?.send({ type: "setup_pick_editor_path" });
   }, []);
 
+  // Re-query the setup gate after a login attempt so codex_authed (and thus
+  // setup_required) refreshes and the SetupScreen dismisses on success.
+  const refreshSetup = useCallback(() => {
+    void clientRef.current?.send({ type: "setup_status" });
+  }, []);
+
+  const stopCodexPoll = useCallback(() => {
+    if (codexPollRef.current !== null) {
+      window.clearInterval(codexPollRef.current);
+      codexPollRef.current = null;
+    }
+  }, []);
+
+  // Install: the backend downloads the standalone codex binary and places it
+  // where resolve_codex_cmd finds it; refreshing the gate flips codex_resolved
+  // and the login controls take over.
+  const handleCodexInstall = useCallback(() => {
+    stopCodexPoll();
+    setCodexError(null);
+    setCodexBusy(true);
+    void invoke<CodexAuthState>("codex_install")
+      .then((state) => {
+        setCodexBusy(false);
+        refreshSetup();
+        if (!state.resolved) {
+          setCodexError("codex 설치 후에도 실행 파일을 찾지 못했습니다.");
+        }
+      })
+      .catch((error) => {
+        setCodexBusy(false);
+        setCodexError(String(error));
+      });
+  }, [refreshSetup, stopCodexPoll]);
+
+  // OAuth: the backend launches `codex login` (opens the browser); we poll
+  // codex_login_status until it reports authed, then refresh the gate.
+  const handleCodexOAuth = useCallback(() => {
+    stopCodexPoll();
+    setCodexError(null);
+    setCodexBusy(true);
+    void invoke("codex_login_start")
+      .then(() => {
+        const startedAt = Date.now();
+        codexPollRef.current = window.setInterval(() => {
+          void invoke<CodexAuthState>("codex_login_status")
+            .then((state) => {
+              if (state.authed) {
+                stopCodexPoll();
+                setCodexBusy(false);
+                refreshSetup();
+              } else if (Date.now() - startedAt > CODEX_POLL_TIMEOUT_MS) {
+                stopCodexPoll();
+                setCodexBusy(false);
+                setCodexError(
+                  "로그인이 완료되지 않았습니다. 브라우저에서 인증을 마친 뒤 다시 시도해 주세요.",
+                );
+              }
+            })
+            .catch((error) => {
+              stopCodexPoll();
+              setCodexBusy(false);
+              setCodexError(String(error));
+            });
+        }, CODEX_POLL_MS);
+      })
+      .catch((error) => {
+        setCodexBusy(false);
+        setCodexError(String(error));
+      });
+  }, [refreshSetup, stopCodexPoll]);
+
+  // API key: piped to the backend (stdin), awaited; success refreshes the gate.
+  const handleCodexApiKey = useCallback(
+    (key: string) => {
+      stopCodexPoll();
+      setCodexError(null);
+      setCodexBusy(true);
+      void invoke<CodexAuthState>("codex_login_with_api_key", { key })
+        .then((state) => {
+          setCodexBusy(false);
+          if (state.authed) refreshSetup();
+          else setCodexError(state.detail || "API 키 로그인에 실패했습니다.");
+        })
+        .catch((error) => {
+          setCodexBusy(false);
+          setCodexError(String(error));
+        });
+    },
+    [refreshSetup, stopCodexPoll],
+  );
+
+  // Stop any in-flight OAuth poll on unmount.
+  useEffect(() => stopCodexPoll, [stopCodexPoll]);
+
   // Plan approval: archive the approval into the log and start the apply turn
   // BEFORE awaiting (plan_approve also resolves only at turn end — see
   // handleSend); a failed send returns the flow to ready.
@@ -429,6 +540,14 @@ export default function App() {
         view={bootstrap.view}
         error={bootstrap.error}
         onRetry={handleBootstrapRetry}
+        assetsReady={setup?.assets_ready ?? false}
+        codexResolved={setup?.codex_resolved ?? true}
+        codexAuthed={setup?.codex_authed ?? true}
+        codexBusy={codexBusy}
+        codexError={codexError}
+        onCodexInstall={handleCodexInstall}
+        onCodexOAuth={handleCodexOAuth}
+        onCodexApiKey={handleCodexApiKey}
       />
     );
   }

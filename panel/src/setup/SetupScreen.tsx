@@ -13,13 +13,15 @@
  * accent matching the Header status pills); icons are bundled lucide SVGs and
  * animations respect prefers-reduced-motion (rules.md: no CDN assets).
  */
-import type { ReactNode } from "react";
+import { useState, type ReactNode } from "react";
 import {
   CheckIcon,
   CircleAlertIcon,
   DownloadIcon,
   FolderOpenIcon,
+  KeyRoundIcon,
   Loader2Icon,
+  LogInIcon,
   SparklesIcon,
 } from "lucide-react";
 
@@ -43,6 +45,22 @@ export interface SetupScreenProps {
   view: BootstrapView;
   error: string | null;
   onRetry: () => void;
+  /** True once the model + RAG index are verified (drives the codex step). */
+  assetsReady?: boolean;
+  /** True when the codex CLI was found (PATH / CODEX_CMD). */
+  codexResolved?: boolean;
+  /** True once `codex login status` reports a logged-in session. */
+  codexAuthed?: boolean;
+  /** A login attempt is in flight (OAuth poll or API-key submit). */
+  codexBusy?: boolean;
+  /** Last login/install error, already mapped to user-facing text. */
+  codexError?: string | null;
+  /** Download + install the codex binary (backend), shown when not resolved. */
+  onCodexInstall?: () => void;
+  /** Launch the ChatGPT OAuth login (backend opens the browser). */
+  onCodexOAuth?: () => void;
+  /** Log in with an API key (passed to the backend over stdin). */
+  onCodexApiKey?: (key: string) => void;
 }
 
 /** One entry of the two-step indicator. */
@@ -96,6 +114,137 @@ function ErrorNotice({ children }: { children: ReactNode }) {
   );
 }
 
+/** Step 3: codex login. ChatGPT OAuth (launches the browser) or an API key. */
+function CodexStep({
+  resolved,
+  busy,
+  error,
+  onInstall,
+  onOAuth,
+  onApiKey,
+}: {
+  resolved: boolean;
+  busy: boolean;
+  error: string | null;
+  onInstall?: () => void;
+  onOAuth?: () => void;
+  onApiKey?: (key: string) => void;
+}) {
+  const [apiKey, setApiKey] = useState("");
+
+  // codex is not installed yet: the app downloads and installs it (no manual
+  // step). Resolution flips on success and the login controls take over.
+  if (!resolved) {
+    return (
+      <div className="grid gap-4">
+        <div className="flex items-start gap-3 rounded-lg border border-dashed border-border bg-muted/30 p-4">
+          <DownloadIcon
+            aria-hidden
+            className="mt-0.5 size-5 shrink-0 text-muted-foreground"
+          />
+          <div className="grid gap-1">
+            <p className="text-sm">codex CLI가 필요합니다. 앱이 자동으로 설치합니다.</p>
+            <p className="text-xs text-muted-foreground">
+              최신 codex 실행 파일(수십 MB)을 내려받아 설치합니다.
+            </p>
+          </div>
+        </div>
+        {error !== null && <ErrorNotice>{error}</ErrorNotice>}
+        <Button
+          type="button"
+          size="lg"
+          className="w-full"
+          onClick={onInstall}
+          disabled={busy}
+        >
+          {busy ? (
+            <Loader2Icon
+              aria-hidden
+              className="size-4 animate-spin motion-reduce:animate-none"
+            />
+          ) : (
+            <DownloadIcon aria-hidden />
+          )}
+          {busy ? "codex 설치 중…" : "codex 설치"}
+        </Button>
+      </div>
+    );
+  }
+
+  const trimmed = apiKey.trim();
+
+  return (
+    <div className="grid gap-4">
+      <div className="flex items-start gap-3 rounded-lg border border-dashed border-border bg-muted/30 p-4">
+        <LogInIcon
+          aria-hidden
+          className="mt-0.5 size-5 shrink-0 text-muted-foreground"
+        />
+        <div className="grid gap-1">
+          <p className="text-sm">에이전트 실행에 사용할 codex 로그인이 필요합니다.</p>
+          <p className="text-xs text-muted-foreground">
+            ChatGPT로 로그인하면 브라우저 창이 열립니다. 인증을 마치면 자동으로
+            진행됩니다.
+          </p>
+        </div>
+      </div>
+
+      {error !== null && <ErrorNotice>{error}</ErrorNotice>}
+
+      <Button
+        type="button"
+        size="lg"
+        className="w-full"
+        onClick={onOAuth}
+        disabled={busy}
+      >
+        {busy ? (
+          <Loader2Icon
+            aria-hidden
+            className="size-4 animate-spin motion-reduce:animate-none"
+          />
+        ) : (
+          <LogInIcon aria-hidden />
+        )}
+        {busy ? "로그인 진행 중…" : "ChatGPT로 로그인"}
+      </Button>
+
+      <div className="flex items-center gap-3 text-xs text-muted-foreground">
+        <span className="h-px flex-1 bg-border" />
+        또는 API 키로 로그인
+        <span className="h-px flex-1 bg-border" />
+      </div>
+
+      <form
+        className="grid gap-2"
+        onSubmit={(event) => {
+          event.preventDefault();
+          if (trimmed.length > 0) onApiKey?.(trimmed);
+        }}
+      >
+        <input
+          type="password"
+          value={apiKey}
+          onChange={(event) => setApiKey(event.target.value)}
+          placeholder="OpenAI API 키 (sk-…)"
+          disabled={busy}
+          aria-label="OpenAI API 키"
+          className="h-9 rounded-md border border-border bg-background px-3 text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50"
+        />
+        <Button
+          type="submit"
+          variant="secondary"
+          className="w-full"
+          disabled={busy || trimmed.length === 0}
+        >
+          <KeyRoundIcon aria-hidden />
+          API 키로 로그인
+        </Button>
+      </form>
+    </div>
+  );
+}
+
 export function SetupScreen({
   editorValid,
   pickError,
@@ -103,12 +252,23 @@ export function SetupScreen({
   view,
   error,
   onRetry,
+  assetsReady = false,
+  codexResolved = true,
+  codexAuthed = true,
+  codexBusy = false,
+  codexError = null,
+  onCodexInstall,
+  onCodexOAuth,
+  onCodexApiKey,
 }: SetupScreenProps) {
   const errorText = error?.trim() || (view.phase === "error" ? view.label : "");
   const errorMode = errorText.length > 0 || view.phase === "error";
   const determinate = view.pct !== null;
   const pct = view.pct === null ? undefined : view.pct;
   const pickMode = !editorValid;
+  // The codex login step runs LAST: editor picked + assets verified, but codex
+  // is not yet logged in. Until then the download step owns the non-pick screen.
+  const codexMode = !pickMode && assetsReady && !codexAuthed;
 
   return (
     <main
@@ -151,7 +311,13 @@ export function SetupScreen({
             <Step
               index={2}
               label="에셋 다운로드"
-              state={pickMode ? "pending" : "current"}
+              state={pickMode ? "pending" : assetsReady ? "done" : "current"}
+            />
+            <span aria-hidden className="h-px min-w-6 flex-1 bg-border" />
+            <Step
+              index={3}
+              label="codex 로그인"
+              state={codexMode ? "current" : codexAuthed ? "done" : "pending"}
             />
           </ol>
 
@@ -182,6 +348,15 @@ export function SetupScreen({
                 에디터 폴더 선택
               </Button>
             </div>
+          ) : codexMode ? (
+            <CodexStep
+              resolved={codexResolved}
+              busy={codexBusy}
+              error={codexError}
+              onInstall={onCodexInstall}
+              onOAuth={onCodexOAuth}
+              onApiKey={onCodexApiKey}
+            />
           ) : errorMode ? (
             <div className="grid gap-4">
               <ErrorNotice>{errorText || view.label}</ErrorNotice>

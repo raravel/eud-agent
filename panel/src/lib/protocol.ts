@@ -222,6 +222,10 @@ export interface SetupMessage {
   editor_valid: boolean;
   /** True when the model + RAG index pass the manifest check. */
   assets_ready: boolean;
+  /** True when the codex CLI was found (PATH / CODEX_CMD). */
+  codex_resolved: boolean;
+  /** True when `codex login status` reports a logged-in session. */
+  codex_authed: boolean;
   /** True when the setup screen must run before normal operation. */
   setup_required: boolean;
   /** Stable error code from a rejected folder pick. */
@@ -534,6 +538,8 @@ export function isSetupMessage(value: unknown): value is SetupMessage {
     typeof value.editor_path === "string" &&
     typeof value.editor_valid === "boolean" &&
     typeof value.assets_ready === "boolean" &&
+    typeof value.codex_resolved === "boolean" &&
+    typeof value.codex_authed === "boolean" &&
     typeof value.setup_required === "boolean" &&
     (value.error === undefined || typeof value.error === "string")
   );

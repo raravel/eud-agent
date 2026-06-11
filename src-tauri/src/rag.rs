@@ -401,10 +401,13 @@ impl Rag {
     }
 
     /// Initialize the embedder (blocking ONNX load ~570MB on first run). Emits
-    /// `rag_warmup` progress (0 -> 100) via `emitter`. Idempotent: if already ready,
-    /// emits 100 and returns early. The CALLER runs this on a background thread (e.g.
-    /// `tokio::task::spawn_blocking`) — it is NOT called on construction, so readiness
-    /// never gates app start.
+    /// `rag_warmup` progress via `emitter` on the PANEL's gate contract: the
+    /// terminal detail is `"done"` on success (moves the gate to ready / unlocks
+    /// send) or `"error: …"` on failure (fails the gate OPEN to unavailable); any
+    /// other detail (e.g. the initial "loading …") keeps it on loading. Idempotent:
+    /// if already ready, emits `"done"` and returns early. The CALLER runs this on a
+    /// background thread (e.g. `tokio::task::spawn_blocking`) — it is NOT called on
+    /// construction, so readiness never gates app start.
     pub fn warmup(&self, emitter: &dyn crate::bootstrap::ProgressEmitter) -> Result<(), RagError> {
         // Poisoned mutex shouldn't happen (the guard holds only an Option), but treat it
         // as an embed failure rather than panicking.
@@ -413,13 +416,23 @@ impl Rag {
             .lock()
             .map_err(|_| RagError::Embed("embedder mutex poisoned".to_string()))?;
         if guard.is_some() {
-            emitter.emit("rag_warmup", 100, "rag model already loaded");
+            emitter.emit("rag_warmup", 100, "done");
             return Ok(());
         }
         emitter.emit("rag_warmup", 0, "loading bge-m3 model");
-        let embedder = Embedder::new(self.cache_dir.clone())?;
+        let embedder = match Embedder::new(self.cache_dir.clone()) {
+            Ok(embedder) => embedder,
+            Err(error) => {
+                // Signal failure on the SAME contract the panel reads: a
+                // `rag_warmup` detail starting with "error" fails the send gate
+                // OPEN (unavailable) instead of leaving it stuck on "loading"
+                // forever when the model never loads.
+                emitter.emit("rag_warmup", 100, &format!("error: {error}"));
+                return Err(error);
+            }
+        };
         *guard = Some(embedder);
-        emitter.emit("rag_warmup", 100, "rag model ready");
+        emitter.emit("rag_warmup", 100, "done");
         Ok(())
     }
 

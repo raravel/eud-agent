@@ -328,6 +328,17 @@ impl JournalStore {
         changeset_from_journal(&journal)
     }
 
+    /// Number of raw journal entries recorded for a request (0 when none exist).
+    ///
+    /// Unlike [`Self::changeset`] (which GROUPS dat writes per objId), this counts
+    /// individual entries — the executor uses it as the monotonic `seq` source so
+    /// distinct writes never collide on a sequence number.
+    pub fn entry_count(&self, request_id: &str) -> usize {
+        self.journal(request_id)
+            .map(|journal| journal.entries.len())
+            .unwrap_or(0)
+    }
+
     pub fn decide<B>(
         &self,
         request_id: &str,

@@ -35,3 +35,5 @@ sha2 = "0.10"
 # CHK string-table decode (EUD-105): EUC_KR == cp949 (WHATWG euc-kr index = unified hangul
 # code), matching chk_info.py's utf-8 -> cp949 -> latin-1 fallback for Korean map names.
 encoding_rs = "0.8"
+rmcp = { version = "1.7.0", features = ["server", "transport-streamable-http-server"] }
+axum = "0.8.4"
