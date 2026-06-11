@@ -72,6 +72,35 @@ describe("AgentStream — reasoning surface", () => {
     expect(screen.queryByText("감춰질 추론")).not.toBeInTheDocument();
   });
 
+  it("keeps completed reasoning CLOSED by default (live=false, post-archive answerStarted reset)", () => {
+    // The store's turn-end archive resets answerStarted to false while keeping the
+    // reasoning text; a completed (not-live) reasoning block must NOT re-open.
+    render(
+      <AgentStream
+        reasoning="완료된 추론"
+        answerStarted={false}
+        tools={[]}
+        live={false}
+      />,
+    );
+    expect(screen.queryByText("완료된 추론")).not.toBeInTheDocument();
+  });
+
+  it("lets the user open completed reasoning on demand (live=false)", async () => {
+    const user = userEvent.setup();
+    render(
+      <AgentStream
+        reasoning="펼칠 완료 추론"
+        answerStarted={false}
+        tools={[]}
+        live={false}
+      />,
+    );
+    expect(screen.queryByText("펼칠 완료 추론")).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button"));
+    expect(screen.getByText(/펼칠 완료 추론/)).toBeInTheDocument();
+  });
+
   it("lets the user re-expand the collapsed reasoning after the answer starts (F1)", async () => {
     const user = userEvent.setup();
     render(

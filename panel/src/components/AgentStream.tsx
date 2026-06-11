@@ -69,11 +69,15 @@ export function AgentStream({
 
   if (!hasReasoning && tools.length === 0) return null;
 
-  // Auto behavior: open while reasoning streams (the answer has not started yet),
-  // collapse once the answer begins. A user toggle (`userOpen`) overrides it so
-  // the collapsed block can be MANUALLY re-expanded afterwards. `open` is fully
+  // Auto behavior: open ONLY while reasoning actively streams (live turn, answer
+  // not started yet); collapse once the answer begins AND once the turn completes
+  // (`live` false). A completed reasoning block ("추론 완료") therefore defaults
+  // CLOSED — the store's turn-end archive resets `answerStarted` to false while
+  // keeping the reasoning text, so without the `live` gate the finished block
+  // would spuriously re-open. A user toggle (`userOpen`) overrides it so the
+  // collapsed block can still be MANUALLY re-expanded afterwards. `open` is fully
   // controlled so the collapsed content leaves the DOM (no leaked text).
-  const autoOpen = hasReasoning && !answerStarted;
+  const autoOpen = live && hasReasoning && !answerStarted;
   const reasoningOpen = userOpen !== null ? userOpen : autoOpen;
   const reasoningStreaming = live && !answerStarted;
 
