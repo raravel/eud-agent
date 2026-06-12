@@ -513,11 +513,18 @@ impl ToolRuntime {
     fn file_create(&self, request_id: &str, args: &Value) -> Result<Value, String> {
         let (path, ftype) = (str_arg(args, "path")?, str_arg(args, "ftype")?);
         let code = args.get("code").and_then(Value::as_str).unwrap_or("");
+        // The editor stores a script's name WITHOUT its type extension (a
+        // natively-created CUIEps `test` has FileName `test`; the editor adds
+        // `.eps` for display and at build time). The model, mirroring the
+        // LIST/GET paths it reads (e.g. main.eps), passes a path WITH the
+        // extension, which would persist as FileName `main.eps` and build to
+        // `main.eps.eps`. Strip it so the stored name matches a native file.
+        let path = normalize_create_path(path, ftype);
         let reply = self.send(&format!("NEWFILE {path}|{ftype}\n{code}"))?;
         self.record_file(
             request_id,
             WriteTool::FileCreate,
-            path,
+            &path,
             Snapshot::Created,
             Snapshot::Created,
         )?;
@@ -941,6 +948,34 @@ fn json_num_or_str(text: &str) -> Value {
 }
 
 /// New full path for a rename: keep the source's parent folder, swap the leaf.
+// Type extension the editor appends to a script's base name for display and at
+// build time, so file_create must strip it from the leaf to avoid a doubled
+// name (CUIEps `main.eps` -> stored FileName `main.eps` -> built `main.eps.eps`;
+// a native `test` stores FileName `test`). Only CUIEps is confirmed against an
+// editor-native file. CUIPy is almost certainly symmetric (`.py`) but the
+// editor exposes no native-create path to verify it, so it stays untouched
+// until a build check confirms. RawText keeps its extension — it is part of the
+// user-chosen name (e.g. notes.txt), not a fixed type marker.
+fn auto_extension(ftype: &str) -> Option<&'static str> {
+    match ftype {
+        "CUIEps" => Some(".eps"),
+        _ => None,
+    }
+}
+
+// Drop the type's extension from the path's leaf when present, keeping any
+// parent folders. Idempotent: a leaf without the extension passes through. A
+// leaf that is only the extension (".eps", "folder/.eps") is left intact.
+fn normalize_create_path(path: &str, ftype: &str) -> String {
+    let Some(ext) = auto_extension(ftype) else {
+        return path.to_string();
+    };
+    match path.strip_suffix(ext) {
+        Some(stripped) if !stripped.is_empty() && !stripped.ends_with('/') => stripped.to_string(),
+        _ => path.to_string(),
+    }
+}
+
 fn sibling_path(path: &str, newname: &str) -> String {
     match path.rsplit_once('/') {
         Some((parent, _)) => format!("{parent}/{newname}"),
@@ -1069,6 +1104,27 @@ mod tests {
         assert_eq!(sibling_path("a.eps", "b.eps"), "b.eps");
         assert_eq!(moved_path("folder/a.eps", "dest"), "dest/a.eps");
         assert_eq!(moved_path("folder/a.eps", ""), "a.eps");
+    }
+
+    #[test]
+    fn normalize_create_path_strips_a_doubled_eps_extension() {
+        // CUIEps leaf the model suffixed: strip so FileName matches a native
+        // file (`test`), which the editor displays/builds as `test.eps`.
+        assert_eq!(normalize_create_path("main.eps", "CUIEps"), "main");
+        assert_eq!(
+            normalize_create_path("folder/main.eps", "CUIEps"),
+            "folder/main"
+        );
+        // Idempotent: no extension to strip passes through unchanged.
+        assert_eq!(normalize_create_path("main", "CUIEps"), "main");
+        // A leaf that is only the extension is left intact.
+        assert_eq!(normalize_create_path(".eps", "CUIEps"), ".eps");
+        assert_eq!(normalize_create_path("folder/.eps", "CUIEps"), "folder/.eps");
+        // RawText keeps its extension (part of the user-chosen name); CUIPy is
+        // left untouched until verified.
+        assert_eq!(normalize_create_path("notes.txt", "RawText"), "notes.txt");
+        assert_eq!(normalize_create_path("raw.eps", "RawText"), "raw.eps");
+        assert_eq!(normalize_create_path("script.py", "CUIPy"), "script.py");
     }
 
     #[test]
