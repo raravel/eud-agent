@@ -183,6 +183,63 @@ describe("AgentStream — tool args/result (EUD-068)", () => {
     ).toBeInTheDocument();
   });
 
+  it("renders file_write as a code block (filename + code), not raw JSON", async () => {
+    const user = userEvent.setup();
+    const { container } = render(
+      <AgentStream
+        reasoning=""
+        answerStarted={false}
+        live={true}
+        tools={[
+          {
+            id: "t1",
+            name: "file_write",
+            state: "done",
+            args: JSON.stringify({
+              path: "triggers/main.eps",
+              code: "function main() {\n  foo();\n}",
+            }),
+            detail: '{"ok":true,"result":"saved"}',
+          },
+        ]}
+      />,
+    );
+    await user.click(screen.getByRole("button", { name: /file_write/ }));
+    expect(screen.getByText("triggers/main.eps")).toBeInTheDocument();
+    expect(screen.getByText("쓰기")).toBeInTheDocument();
+    expect(container.textContent).toContain("function main()");
+    // The raw JSON request/result rows are replaced for file tools.
+    expect(screen.queryByText("요청")).toBeNull();
+    expect(screen.queryByText("결과")).toBeNull();
+  });
+
+  it("renders read_file content (from the result) as a code block", async () => {
+    const user = userEvent.setup();
+    const { container } = render(
+      <AgentStream
+        reasoning=""
+        answerStarted={false}
+        live={true}
+        tools={[
+          {
+            id: "t1",
+            name: "read_file",
+            state: "done",
+            args: '{"path":"ui/layout.cui"}',
+            detail: JSON.stringify({
+              path: "ui/layout.cui",
+              content: "hello layout content",
+            }),
+          },
+        ]}
+      />,
+    );
+    await user.click(screen.getByRole("button", { name: /read_file/ }));
+    expect(screen.getByText("ui/layout.cui")).toBeInTheDocument();
+    expect(screen.getByText("읽기")).toBeInTheDocument();
+    expect(container.textContent).toContain("hello layout content");
+  });
+
   it("renders a 실패 badge for a failed tool row", () => {
     render(
       <AgentStream

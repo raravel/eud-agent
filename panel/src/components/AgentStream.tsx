@@ -15,7 +15,7 @@
  * With no reasoning and no tools it renders nothing (null).
  */
 import { useEffect, useState } from "react";
-import { WrenchIcon } from "lucide-react";
+import { FileIcon, FilePenLineIcon, WrenchIcon } from "lucide-react";
 import {
   Reasoning,
   ReasoningContent,
@@ -26,6 +26,12 @@ import {
   ToolContent,
   ToolHeader,
 } from "@/components/ai-elements/tool";
+import {
+  CodeBlock,
+  CodeBlockCopyButton,
+} from "@/components/ai-elements/code-block";
+import { parseFileTool, type FileToolView } from "@/lib/fileTool";
+import { cn } from "@/lib/utils";
 
 /** One tool-call row (mirrors the store's per-turn AgentTool). */
 export interface AgentTool {
@@ -121,33 +127,90 @@ export function AgentStream({
 export function ToolList({ tools }: { tools: AgentTool[] }) {
   return (
     <>
-      {tools.map((tool) => (
-        <Tool key={tool.id} data-testid={`tool-${tool.id}`}>
-          <ToolHeader title={tool.name} state={tool.state} />
-          {(tool.args || tool.detail) && (
-            <ToolContent>
-              <div className="flex flex-col gap-2 p-3 text-xs text-muted-foreground">
-                {tool.args && (
-                  <div>
-                    <div className="mb-1 font-medium">요청</div>
-                    <pre className="overflow-x-auto whitespace-pre-wrap break-words rounded bg-muted/40 p-2">
-                      {tool.args}
-                    </pre>
+      {tools.map((tool) => {
+        // read_file / file_write render their payload as a real code block
+        // (filename header + syntax-highlighted code) instead of raw JSON.
+        const fileView = parseFileTool(tool);
+        return (
+          <Tool key={tool.id} data-testid={`tool-${tool.id}`}>
+            <ToolHeader title={tool.name} state={tool.state} />
+            {fileView ? (
+              <ToolContent>
+                <div className="p-3">
+                  <FileToolBlock view={fileView} />
+                </div>
+              </ToolContent>
+            ) : (
+              (tool.args || tool.detail) && (
+                <ToolContent>
+                  <div className="flex flex-col gap-2 p-3 text-xs text-muted-foreground">
+                    {tool.args && (
+                      <div>
+                        <div className="mb-1 font-medium">요청</div>
+                        <pre className="overflow-x-auto whitespace-pre-wrap break-words rounded bg-muted/40 p-2">
+                          {tool.args}
+                        </pre>
+                      </div>
+                    )}
+                    {tool.detail && (
+                      <div>
+                        <div className="mb-1 font-medium">결과</div>
+                        <pre className="overflow-x-auto whitespace-pre-wrap break-words rounded bg-muted/40 p-2">
+                          {tool.detail}
+                        </pre>
+                      </div>
+                    )}
                   </div>
-                )}
-                {tool.detail && (
-                  <div>
-                    <div className="mb-1 font-medium">결과</div>
-                    <pre className="overflow-x-auto whitespace-pre-wrap break-words rounded bg-muted/40 p-2">
-                      {tool.detail}
-                    </pre>
-                  </div>
-                )}
-              </div>
-            </ToolContent>
-          )}
-        </Tool>
-      ))}
+                </ToolContent>
+              )
+            )}
+          </Tool>
+        );
+      })}
     </>
+  );
+}
+
+/**
+ * A read_file / file_write payload as a code-editor block: a filename title bar
+ * (file icon + path + 읽기/쓰기 tag) on top of the syntax-highlighted code with a
+ * copy button. The path may be empty (older payloads); the code may be truncated
+ * by the core (a notice is shown). See {@link FileToolView} (lib/fileTool).
+ */
+function FileToolBlock({ view }: { view: FileToolView }) {
+  const Icon = view.mode === "write" ? FilePenLineIcon : FileIcon;
+  return (
+    <div className="flex flex-col">
+      <div
+        data-testid="file-tool-header"
+        className="flex items-center gap-1.5 rounded-t-md border border-b-0 border-border bg-muted/60 px-2 py-1.5 text-xs"
+      >
+        <Icon aria-hidden className="size-3.5 shrink-0 text-muted-foreground" />
+        <span className="break-all font-medium">
+          {view.path || "(이름 없는 파일)"}
+        </span>
+        <span
+          className={cn(
+            "ml-auto shrink-0 font-medium",
+            view.mode === "write" ? "text-amber-400" : "text-sky-400",
+          )}
+        >
+          {view.mode === "write" ? "쓰기" : "읽기"}
+        </span>
+      </div>
+      <CodeBlock
+        code={view.code}
+        language={view.language}
+        showLineNumbers
+        className="rounded-t-none"
+      >
+        <CodeBlockCopyButton />
+      </CodeBlock>
+      {view.truncated && (
+        <p className="mt-1 text-xs text-amber-400">
+          내용이 길어 일부만 표시됩니다.
+        </p>
+      )}
+    </div>
   );
 }
