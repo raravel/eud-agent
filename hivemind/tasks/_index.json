@@ -2432,6 +2432,191 @@
         "src-tauri/src/engine.rs",
         "src-tauri/src/lib.rs"
       ]
+    },
+    "EUD-149-fcc8": {
+      "status": "pending",
+      "priority": "high",
+      "type": "epic",
+      "parent": null,
+      "depends_on": [],
+      "title": "RAG knowledge tiering (L1 resident idioms + L2 source-tier weighting)",
+      "updated": "2026-06-12",
+      "completed_at": null,
+      "path": "active/EUD-149-fcc8.md",
+      "scope": []
+    },
+    "EUD-150-9296": {
+      "status": "pending",
+      "priority": "high",
+      "type": "story",
+      "parent": "EUD-149-fcc8",
+      "depends_on": [],
+      "title": "L1 resident eps idioms",
+      "updated": "2026-06-12",
+      "completed_at": null,
+      "path": "active/EUD-150-9296.md",
+      "scope": []
+    },
+    "EUD-151-e190": {
+      "status": "pending",
+      "priority": "high",
+      "type": "story",
+      "parent": "EUD-149-fcc8",
+      "depends_on": [],
+      "title": "L2 v2 index format and weighted ranking",
+      "updated": "2026-06-12",
+      "completed_at": null,
+      "path": "active/EUD-151-e190.md",
+      "scope": []
+    },
+    "EUD-152-0709": {
+      "status": "pending",
+      "priority": "high",
+      "type": "story",
+      "parent": "EUD-149-fcc8",
+      "depends_on": [],
+      "title": "v1 to v2 migration and bootstrap/CI republish",
+      "updated": "2026-06-12",
+      "completed_at": null,
+      "path": "active/EUD-152-0709.md",
+      "scope": []
+    },
+    "EUD-153-7163": {
+      "status": "pending",
+      "priority": "low",
+      "type": "story",
+      "parent": "EUD-149-fcc8",
+      "depends_on": [],
+      "title": "GPU differential-test track (gated, separate)",
+      "updated": "2026-06-12",
+      "completed_at": null,
+      "path": "active/EUD-153-7163.md",
+      "scope": []
+    },
+    "EUD-154-91b9": {
+      "status": "pending",
+      "priority": "high",
+      "type": "task",
+      "parent": "EUD-150-9296",
+      "depends_on": [],
+      "title": "Add resident EPS_IDIOMS section to system prompt",
+      "updated": "2026-06-12",
+      "completed_at": null,
+      "path": "active/EUD-154-91b9.md",
+      "scope": [
+        "src-tauri/src/engine.rs"
+      ]
+    },
+    "EUD-155-2da4": {
+      "status": "pending",
+      "priority": "high",
+      "type": "task",
+      "parent": "EUD-151-e190",
+      "depends_on": [],
+      "title": "v2 index format: tier_level field in rag.rs write/load",
+      "updated": "2026-06-12",
+      "completed_at": null,
+      "path": "active/EUD-155-2da4.md",
+      "scope": [
+        "src-tauri/src/rag.rs"
+      ]
+    },
+    "EUD-156-ade9": {
+      "status": "pending",
+      "priority": "high",
+      "type": "task",
+      "parent": "EUD-151-e190",
+      "depends_on": [
+        "EUD-155-2da4"
+      ],
+      "title": "build_rag_index: source to tier_level + v2 write",
+      "updated": "2026-06-12",
+      "completed_at": null,
+      "path": "active/EUD-156-ade9.md",
+      "scope": [
+        "ci/build_rag_index.rs"
+      ]
+    },
+    "EUD-157-c7ef": {
+      "status": "pending",
+      "priority": "high",
+      "type": "task",
+      "parent": "EUD-151-e190",
+      "depends_on": [
+        "EUD-155-2da4"
+      ],
+      "title": "Weighted rank() with TIER_WEIGHT table",
+      "updated": "2026-06-12",
+      "completed_at": null,
+      "path": "active/EUD-157-c7ef.md",
+      "scope": [
+        "src-tauri/src/rag.rs"
+      ]
+    },
+    "EUD-158-1146": {
+      "status": "pending",
+      "priority": "high",
+      "type": "task",
+      "parent": "EUD-152-0709",
+      "depends_on": [
+        "EUD-155-2da4",
+        "EUD-156-ade9"
+      ],
+      "title": "v1 to v2 migration binary (id-join, vector-preservation)",
+      "updated": "2026-06-12",
+      "completed_at": null,
+      "path": "active/EUD-158-1146.md",
+      "scope": [
+        "ci/migrate_rag_index.rs",
+        "ci/Cargo.toml"
+      ]
+    },
+    "EUD-159-22ba": {
+      "status": "pending",
+      "priority": "high",
+      "type": "task",
+      "parent": "EUD-152-0709",
+      "depends_on": [
+        "EUD-155-2da4"
+      ],
+      "title": "Bootstrap manifest v2 + loader requires v2",
+      "updated": "2026-06-12",
+      "completed_at": null,
+      "path": "active/EUD-159-22ba.md",
+      "scope": [
+        "src-tauri/src/bootstrap.rs"
+      ]
+    },
+    "EUD-160-2d77": {
+      "status": "pending",
+      "priority": "high",
+      "type": "task",
+      "parent": "EUD-152-0709",
+      "depends_on": [
+        "EUD-156-ade9"
+      ],
+      "title": "CI workflow v2 build + republish + version bump",
+      "updated": "2026-06-12",
+      "completed_at": null,
+      "path": "active/EUD-160-2d77.md",
+      "scope": [
+        ".github/workflows/build-rag-index.yml"
+      ]
+    },
+    "EUD-161-5726": {
+      "status": "pending",
+      "priority": "low",
+      "type": "task",
+      "parent": "EUD-153-7163",
+      "depends_on": [],
+      "title": "GPU differential-test fixture + adoption gate (local-only)",
+      "updated": "2026-06-12",
+      "completed_at": null,
+      "path": "active/EUD-161-5726.md",
+      "scope": [
+        "ci/gpu_diff_test.rs",
+        "ci/Cargo.toml"
+      ]
     }
   }
 }
