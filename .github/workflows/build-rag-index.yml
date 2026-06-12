@@ -13,7 +13,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "RAG index version. Defaults to the rag-index-v* tag suffix, then 1."
+        description: "RAG index version. Defaults to the rag-index-v* tag suffix, then 2."
         required: false
         type: string
 
@@ -63,7 +63,7 @@ jobs:
             version="${REF_NAME#rag-index-v}"
           fi
           if [[ -z "$version" ]]; then
-            version="1"
+            version="2"
           fi
 
           tag="rag-index-v$version"

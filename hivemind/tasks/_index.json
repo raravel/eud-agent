@@ -2470,15 +2470,15 @@
       "scope": []
     },
     "EUD-152-0709": {
-      "status": "pending",
+      "status": "done",
       "priority": "high",
       "type": "story",
       "parent": "EUD-149-fcc8",
       "depends_on": [],
       "title": "v1 to v2 migration and bootstrap/CI republish",
       "updated": "2026-06-12",
-      "completed_at": null,
-      "path": "active/EUD-152-0709.md",
+      "completed_at": "2026-06-12T17:53:45.150804",
+      "path": "done/EUD-152-0709.md",
       "scope": []
     },
     "EUD-153-7163": {
@@ -2589,7 +2589,7 @@
       ]
     },
     "EUD-160-2d77": {
-      "status": "pending",
+      "status": "done",
       "priority": "high",
       "type": "task",
       "parent": "EUD-152-0709",
@@ -2598,8 +2598,8 @@
       ],
       "title": "CI workflow v2 build + republish + version bump",
       "updated": "2026-06-12",
-      "completed_at": null,
-      "path": "active/EUD-160-2d77.md",
+      "completed_at": "2026-06-12T17:53:45.115526",
+      "path": "done/EUD-160-2d77.md",
       "scope": [
         ".github/workflows/build-rag-index.yml"
       ]
