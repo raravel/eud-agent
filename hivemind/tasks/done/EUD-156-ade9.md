@@ -1,4 +1,5 @@
 ---
+completed_at: '2026-06-12T16:44:34.556651'
 created: '2026-06-12'
 depends_on:
 - EUD-155-2da4
@@ -7,7 +8,7 @@ parent: EUD-151-e190
 priority: high
 scope:
 - ci/build_rag_index.rs
-status: pending
+status: done
 title: 'build_rag_index: source to tier_level + v2 write'
 type: task
 updated: '2026-06-12'

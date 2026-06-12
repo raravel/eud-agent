@@ -13,7 +13,7 @@ use sha2::{Digest, Sha256};
 
 const EMBED_DIM: usize = 1024;
 const INDEX_MAGIC: &[u8; 4] = b"ERAG";
-const INDEX_VERSION: u32 = 1;
+const INDEX_VERSION: u32 = 2;
 const INPUT_FILES: [&str; 3] = ["articles.jsonl", "eud_book.jsonl", "cafebook.jsonl"];
 // The int8 BGEM3Q model's embeddings are batch-size-dependent (measured:
 // batch 64 drifts cosine to ~0.98 vs batch 16), so this default MUST stay
@@ -34,6 +34,7 @@ struct Args {
 #[derive(Debug)]
 struct CorpusDoc {
     id: u64,
+    tier_level: u8,
     text: String,
     source: String,
 }
@@ -42,6 +43,7 @@ struct CorpusDoc {
 struct IndexEntry {
     id: u64,
     vector: Vec<f32>,
+    tier_level: u8,
     text: String,
     source: String,
 }
@@ -186,12 +188,43 @@ fn read_corpus(corpus_dir: &Path) -> Result<Vec<CorpusDoc>> {
     Ok(docs)
 }
 
+/// Derive the v2 source-trust tier code from a corpus row's raw `source` field.
+///
+/// The `source` values carry the original board filename WITH a `.jsonl` suffix; the
+/// suffix is stripped before matching. Mapping (see features/17_rag-knowledge-tiering.md):
+///
+/// | source                              | tier | meaning              |
+/// |-------------------------------------|------|----------------------|
+/// | `eud_book`, `cafebook`              | 3    | official             |
+/// | `board_강좌팁`, `board_연구칼럼`     | 2    | lecture / research   |
+/// | `board_유틸리티툴`, `board_Lua자료실`, `user_*` | 1 | general       |
+/// | `board_질문답변`                     | 0    | Q&A (may be wrong)   |
+///
+/// An unknown/unmapped source falls back to tier 1 (general) — the conservative neutral
+/// default so an unrecognized source is neither trusted as official nor demoted to Q&A.
+/// `user_*` is matched as a PREFIX (the username varies per row).
+fn tier_level_for_source(source: &str) -> u8 {
+    let stem = source.strip_suffix(".jsonl").unwrap_or(source);
+    match stem {
+        "eud_book" | "cafebook" => 3,
+        "board_강좌팁" | "board_연구칼럼" => 2,
+        "board_유틸리티툴" | "board_Lua자료실" => 1,
+        "board_질문답변" => 0,
+        _ if stem.starts_with("user_") => 1,
+        // Unknown source: conservative neutral default (general).
+        _ => 1,
+    }
+}
+
 fn corpus_docs_from_row(row: JsonlRow, file_name: &str, line_number: usize) -> Vec<CorpusDoc> {
     let content = row.content.trim();
     let comments = row.comments.as_deref().unwrap_or("").trim();
     if content.is_empty() && comments.is_empty() {
         return Vec::new();
     }
+
+    // All chunks of a row share the row's source tier.
+    let tier_level = tier_level_for_source(&row.source);
 
     let title = row.title.trim();
     let url = row.url.as_deref().unwrap_or("").trim();
@@ -234,6 +267,7 @@ fn corpus_docs_from_row(row: JsonlRow, file_name: &str, line_number: usize) -> V
                 // input id if present, else URL, else source + file + 1-based
                 // line number, plus #<chunk_index> so chunks stay unique.
                 id: fnv1a64(chunk_key.as_bytes()),
+                tier_level,
                 text: chunk_text,
                 source: chunk_source,
             }
@@ -315,6 +349,7 @@ fn embed_docs(
             entries.push(IndexEntry {
                 id: doc.id,
                 vector,
+                tier_level: doc.tier_level,
                 text: doc.text.clone(),
                 source: doc.source.clone(),
             });
@@ -336,7 +371,7 @@ fn l2_normalize(v: &mut [f32]) {
 fn write_index(path: &Path, entries: &[IndexEntry]) -> Result<()> {
     if entries.len() > u32::MAX as usize {
         bail!(
-            "index has {} entries; v1 format count is u32",
+            "index has {} entries; v2 format count is u32",
             entries.len()
         );
     }
@@ -368,6 +403,8 @@ fn write_index(path: &Path, entries: &[IndexEntry]) -> Result<()> {
         for value in &entry.vector {
             w.write_all(&value.to_le_bytes())?;
         }
+        // v2: one tier byte AFTER the full vector, BEFORE the text length prefix.
+        w.write_all(&[entry.tier_level])?;
         write_len_prefixed(&mut w, entry.text.as_bytes(), "text")?;
         write_len_prefixed(&mut w, entry.source.as_bytes(), "source")?;
     }
@@ -378,7 +415,7 @@ fn write_index(path: &Path, entries: &[IndexEntry]) -> Result<()> {
 
 fn write_len_prefixed(w: &mut BufWriter<File>, bytes: &[u8], field: &str) -> Result<()> {
     if bytes.len() > u32::MAX as usize {
-        bail!("{field} is {} bytes; v1 format length is u32", bytes.len());
+        bail!("{field} is {} bytes; v2 format length is u32", bytes.len());
     }
     w.write_all(&(bytes.len() as u32).to_le_bytes())?;
     w.write_all(bytes)?;
@@ -425,5 +462,42 @@ mod tests {
         );
         assert_eq!(super::resolve_batch_size(Some(128), Some(64)), 128);
         assert_eq!(super::resolve_batch_size(None, Some(64)), 64);
+    }
+
+    #[test]
+    fn tier_level_maps_official_sources_to_3() {
+        assert_eq!(super::tier_level_for_source("eud_book.jsonl"), 3);
+        assert_eq!(super::tier_level_for_source("cafebook.jsonl"), 3);
+    }
+
+    #[test]
+    fn tier_level_maps_lecture_and_research_to_2() {
+        assert_eq!(super::tier_level_for_source("board_강좌팁.jsonl"), 2);
+        assert_eq!(super::tier_level_for_source("board_연구칼럼.jsonl"), 2);
+    }
+
+    #[test]
+    fn tier_level_maps_general_sources_to_1() {
+        assert_eq!(super::tier_level_for_source("board_유틸리티툴.jsonl"), 1);
+        assert_eq!(super::tier_level_for_source("board_Lua자료실.jsonl"), 1);
+    }
+
+    #[test]
+    fn tier_level_maps_user_prefix_to_1() {
+        assert_eq!(super::tier_level_for_source("user_Artanis.jsonl"), 1);
+        assert_eq!(super::tier_level_for_source("user_Dtime.jsonl"), 1);
+        assert_eq!(super::tier_level_for_source("user_갈대.jsonl"), 1);
+        assert_eq!(super::tier_level_for_source("user_맛있는 빙수.jsonl"), 1);
+        assert_eq!(super::tier_level_for_source("user_버터쿠키.jsonl"), 1);
+    }
+
+    #[test]
+    fn tier_level_maps_board_qna_to_0() {
+        assert_eq!(super::tier_level_for_source("board_질문답변.jsonl"), 0);
+    }
+
+    #[test]
+    fn tier_level_unknown_source_falls_back_to_general_1() {
+        assert_eq!(super::tier_level_for_source("something_else.jsonl"), 1);
     }
 }

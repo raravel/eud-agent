@@ -2522,7 +2522,7 @@
       ]
     },
     "EUD-156-ade9": {
-      "status": "pending",
+      "status": "done",
       "priority": "high",
       "type": "task",
       "parent": "EUD-151-e190",
@@ -2531,8 +2531,8 @@
       ],
       "title": "build_rag_index: source to tier_level + v2 write",
       "updated": "2026-06-12",
-      "completed_at": null,
-      "path": "active/EUD-156-ade9.md",
+      "completed_at": "2026-06-12T16:44:34.556651",
+      "path": "done/EUD-156-ade9.md",
       "scope": [
         "ci/build_rag_index.rs"
       ]
