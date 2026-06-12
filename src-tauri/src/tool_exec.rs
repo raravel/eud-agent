@@ -379,7 +379,7 @@ impl ToolRuntime {
 
         let old = json_num_or_str(&reply_value(&self.send(&get_cmd)?));
         let reply = self.send(&set_cmd)?;
-        self.record_dat(request_id, tool, table, obj_id, property, old, value)?;
+        self.record_dat(request_id, tool, table, dat, obj_id, property, old, value)?;
         Ok(json!({ "ok": true, "result": reply.trim() }))
     }
 
@@ -392,6 +392,7 @@ impl ToolRuntime {
             request_id,
             WriteTool::TblSet,
             DatTable::Tbl,
+            "",
             index,
             "text",
             old,
@@ -412,6 +413,7 @@ impl ToolRuntime {
             request_id,
             WriteTool::ReqSet,
             DatTable::Req,
+            dat,
             obj_id,
             "payload",
             old,
@@ -428,6 +430,7 @@ impl ToolRuntime {
             request_id,
             WriteTool::BtnSet,
             DatTable::Btn,
+            "",
             set_id,
             "csv",
             old,
@@ -462,7 +465,8 @@ impl ToolRuntime {
         // The inverse restores the captured old value (was_default:false), so a
         // later real rollback re-sets it rather than resetting again.
         let property = if kind == "tbl" { "text" } else { param };
-        self.record_dat(request_id, tool, table, obj_id, property, old, Value::Null)?;
+        let dat = if kind == "tbl" { "" } else { dat };
+        self.record_dat(request_id, tool, table, dat, obj_id, property, old, Value::Null)?;
         Ok(json!({ "ok": true, "result": reply.trim() }))
     }
 
@@ -475,6 +479,7 @@ impl ToolRuntime {
         request_id: &str,
         tool: WriteTool,
         table: DatTable,
+        dat: &str,
         obj_id: i64,
         property: &str,
         old: Value,
@@ -489,6 +494,7 @@ impl ToolRuntime {
             tool,
             target: JournalTarget::Dat {
                 table,
+                dat: dat.to_owned(),
                 obj_id,
                 property: property.to_owned(),
             },

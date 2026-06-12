@@ -111,6 +111,13 @@ pub enum WriteTool {
 pub enum JournalTarget {
     Dat {
         table: DatTable,
+        /// The dat-file identifier the agent addressed (e.g. `units`, `weapons`)
+        /// for dat/xdat/req; empty for tbl/btn (index/set keyed). Part of the
+        /// changeset identity so `units #5` and `weapons #5` never merge, and so
+        /// the panel can label the edit by its real table. `#[serde(default)]`
+        /// keeps journals written before this field deserializable.
+        #[serde(default)]
+        dat: String,
         obj_id: u32,
         property: String,
     },
@@ -222,8 +229,26 @@ pub struct Changeset {
 pub struct ChangesetItem {
     pub id: String,
     pub kind: ChangesetItemKind,
+    /// Editor-relative path for file content ops (write/create/delete); `None`
+    /// for dat/settings/plugin/location items. Drives the panel's `file`
+    /// category + title bar (created/deleted carry no diff to parse it from).
+    pub path: Option<String>,
+    /// Identity of a grouped dat/xdat/tbl/req/btn edit (table + dat-file + objId);
+    /// `None` for file/flat items. Drives the panel's dat-change card header.
+    pub dat_ref: Option<DatRef>,
     pub properties: Vec<PropertyChange>,
     pub diff: Option<String>,
+}
+
+/// Identity of a grouped dat-family changeset item (units #5, weapons #3, …).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DatRef {
+    /// The dat family (Dat/Xdat/Tbl/Req/Btn).
+    pub table: DatTable,
+    /// The dat-file identifier (e.g. `units`); empty for tbl/btn.
+    pub dat: String,
+    /// The object index within the table.
+    pub obj_id: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -239,6 +264,11 @@ pub struct PropertyChange {
     pub property: String,
     pub old: serde_json::Value,
     pub new: serde_json::Value,
+    /// The originating journal entry id — the per-property decision target the
+    /// panel dispatches (a dat group decides every property's id together).
+    pub id: String,
+    /// The originating entry's journal sequence (stable render order).
+    pub seq: u64,
 }
 
 #[derive(Debug, Error)]
@@ -436,17 +466,20 @@ fn write_journal(data_dir: &Path, journal: &Journal) -> Result<(), JournalError>
 
 fn changeset_from_journal(journal: &Journal) -> Result<Changeset, JournalError> {
     let mut items = Vec::new();
-    let mut dat_items: HashMap<(DatTable, u32), usize> = HashMap::new();
+    let mut dat_items: HashMap<(DatTable, String, u32), usize> = HashMap::new();
 
     for entry in &journal.entries {
         match &entry.target {
             JournalTarget::Dat {
                 table,
+                dat,
                 obj_id,
                 property,
             } => {
                 let (old, new) = dat_values(entry)?;
-                let key = (*table, *obj_id);
+                // Group by (family, dat-file, objId) so units #5 and weapons #5
+                // are distinct items, never a silently-merged "Dat #5".
+                let key = (*table, dat.clone(), *obj_id);
                 let item_index = match dat_items.get(&key) {
                     Some(index) => *index,
                     None => {
@@ -455,6 +488,12 @@ fn changeset_from_journal(journal: &Journal) -> Result<Changeset, JournalError> 
                         items.push(ChangesetItem {
                             id: changeset_item_id(entry),
                             kind: ChangesetItemKind::Dat,
+                            path: None,
+                            dat_ref: Some(DatRef {
+                                table: *table,
+                                dat: dat.clone(),
+                                obj_id: *obj_id,
+                            }),
                             properties: Vec::new(),
                             diff: None,
                         });
@@ -465,6 +504,8 @@ fn changeset_from_journal(journal: &Journal) -> Result<Changeset, JournalError> 
                     property: property.clone(),
                     old,
                     new,
+                    id: entry.id.clone(),
+                    seq: entry.seq,
                 });
             }
             _ => {
@@ -497,12 +538,16 @@ fn file_changeset_item(entry: &JournalEntry) -> Result<Option<ChangesetItem>, Jo
         WriteTool::FileCreate | WriteTool::Mkdir => ChangesetItem {
             id: entry.id.clone(),
             kind: ChangesetItemKind::Created,
+            path: Some(entry_path(entry)?),
+            dat_ref: None,
             properties: Vec::new(),
             diff: None,
         },
         WriteTool::FileDelete => ChangesetItem {
             id: entry.id.clone(),
             kind: ChangesetItemKind::Deleted,
+            path: Some(entry_path(entry)?),
+            dat_ref: None,
             properties: Vec::new(),
             diff: None,
         },
@@ -512,13 +557,17 @@ fn file_changeset_item(entry: &JournalEntry) -> Result<Option<ChangesetItem>, Jo
             ChangesetItem {
                 id: entry.id.clone(),
                 kind: ChangesetItemKind::Modified,
-                properties: Vec::new(),
                 diff: Some(unified_diff(&path, &old, &new)),
+                path: Some(path),
+                dat_ref: None,
+                properties: Vec::new(),
             }
         }
         WriteTool::FileRename | WriteTool::FileMove | WriteTool::SetMain => ChangesetItem {
             id: entry.id.clone(),
             kind: ChangesetItemKind::Modified,
+            path: None,
+            dat_ref: None,
             properties: Vec::new(),
             diff: None,
         },
@@ -529,18 +578,24 @@ fn file_changeset_item(entry: &JournalEntry) -> Result<Option<ChangesetItem>, Jo
         | WriteTool::PluginMove => ChangesetItem {
             id: entry.id.clone(),
             kind: ChangesetItemKind::Modified,
+            path: None,
+            dat_ref: None,
             properties: Vec::new(),
             diff: None,
         },
         WriteTool::LocationWrite => ChangesetItem {
             id: entry.id.clone(),
             kind: location_write_changeset_kind(entry)?,
+            path: None,
+            dat_ref: None,
             properties: location_write_changeset_properties(entry)?,
             diff: None,
         },
         WriteTool::PlayerSetup => ChangesetItem {
             id: entry.id.clone(),
             kind: ChangesetItemKind::Modified,
+            path: None,
+            dat_ref: None,
             properties: location_write_changeset_properties(entry)?,
             diff: None,
         },
@@ -578,11 +633,15 @@ fn location_write_changeset_properties(
             property: "summary".to_owned(),
             old: serde_json::Value::Null,
             new: serde_json::json!(summary),
+            id: entry.id.clone(),
+            seq: entry.seq,
         },
         PropertyChange {
             property: "map".to_owned(),
             old: serde_json::Value::Null,
             new: serde_json::json!(path),
+            id: entry.id.clone(),
+            seq: entry.seq,
         },
     ])
 }
@@ -621,6 +680,7 @@ fn rejected_entries<'a>(journal: &'a Journal, ids: &DecisionIds) -> Vec<&'a Jour
 enum RejectTarget {
     Dat {
         table: DatTable,
+        dat: String,
         obj_id: u32,
         property: String,
     },
@@ -634,9 +694,10 @@ impl fmt::Display for RejectTarget {
         match self {
             Self::Dat {
                 table,
+                dat,
                 obj_id,
                 property,
-            } => write!(f, "dat:{table}:{obj_id}:{property}"),
+            } => write!(f, "dat:{table}:{dat}:{obj_id}:{property}"),
             Self::Path(path) => write!(f, "path:{path}"),
             Self::Setting(key) => write!(f, "setting:{key}"),
             Self::PluginIndex(index) => write!(f, "plugin-index:{index}"),
@@ -681,10 +742,12 @@ fn reject_targets(entry: &JournalEntry) -> Result<Vec<RejectTarget>, JournalErro
     let mut targets = match &entry.target {
         JournalTarget::Dat {
             table,
+            dat,
             obj_id,
             property,
         } => vec![RejectTarget::Dat {
             table: *table,
+            dat: dat.clone(),
             obj_id: *obj_id,
             property: property.clone(),
         }],
@@ -733,7 +796,9 @@ fn plugin_snapshot_index(
 
 fn changeset_item_id(entry: &JournalEntry) -> String {
     match &entry.target {
-        JournalTarget::Dat { table, obj_id, .. } => format!("dat:{table}:{obj_id}"),
+        JournalTarget::Dat {
+            table, dat, obj_id, ..
+        } => format!("dat:{table}:{dat}:{obj_id}"),
         _ => entry.id.clone(),
     }
 }
@@ -863,12 +928,17 @@ where
     }
 }
 
+// The `dat`-file name is intentionally ignored here: the inverse-op replay keys
+// on (family, objId, property) via the JournalBridge, whose `set_dat_value` does
+// not yet take the dat-file name. When a real rollback bridge needs it, thread
+// `dat` from the target through here and into the bridge signature.
 fn dat_target_parts(entry: &JournalEntry) -> Result<(DatTable, u32, &str), JournalError> {
     match &entry.target {
         JournalTarget::Dat {
             table,
             obj_id,
             property,
+            ..
         } => Ok((*table, *obj_id, property.as_str())),
         _ => Err(invalid_entry(entry, "expected dat target")),
     }
@@ -1170,8 +1240,18 @@ mod tests {
     }
 
     fn dat_target(table: DatTable, obj_id: u32, property: &str) -> JournalTarget {
+        dat_target_named(table, "", obj_id, property)
+    }
+
+    fn dat_target_named(
+        table: DatTable,
+        dat: &str,
+        obj_id: u32,
+        property: &str,
+    ) -> JournalTarget {
         JournalTarget::Dat {
             table,
+            dat: dat.to_owned(),
             obj_id,
             property: property.to_owned(),
         }
@@ -1265,11 +1345,15 @@ mod tests {
                 property: "summary".to_owned(),
                 old: serde_json::Value::Null,
                 new: json!(format!("{action} spot")),
+                id: format!("loc-{action}"),
+                seq: 1,
             }));
             assert!(changeset.items[0].properties.contains(&PropertyChange {
                 property: "map".to_owned(),
                 old: serde_json::Value::Null,
                 new: json!("C:/maps/demo.scx"),
+                id: format!("loc-{action}"),
+                seq: 1,
             }));
             assert!(changeset.items[0].diff.is_none());
         }
@@ -1312,11 +1396,15 @@ mod tests {
             property: "summary".to_owned(),
             old: serde_json::Value::Null,
             new: json!("P1 controller = human"),
+            id: "plr-1".to_owned(),
+            seq: 1,
         }));
         assert!(changeset.items[0].properties.contains(&PropertyChange {
             property: "map".to_owned(),
             old: serde_json::Value::Null,
             new: json!("C:/maps/demo.scx"),
+            id: "plr-1".to_owned(),
+            seq: 1,
         }));
         assert!(changeset.items[0].diff.is_none());
     }
@@ -1778,7 +1866,7 @@ mod tests {
                     "dat-name",
                     1,
                     WriteTool::DatSet,
-                    dat_target(DatTable::Dat, 5, "Name"),
+                    dat_target_named(DatTable::Dat, "units", 5, "Name"),
                     Snapshot::DatValue {
                         value: json!("Marine"),
                         was_default: false,
@@ -1797,7 +1885,7 @@ mod tests {
                     "dat-hp",
                     2,
                     WriteTool::DatSet,
-                    dat_target(DatTable::Dat, 5, "HitPoints"),
+                    dat_target_named(DatTable::Dat, "units", 5, "HitPoints"),
                     Snapshot::DatValue {
                         value: json!(40),
                         was_default: false,
@@ -1834,9 +1922,17 @@ mod tests {
         let dat_item = changeset
             .items
             .iter()
-            .find(|item| item.id == "dat:Dat:5")
-            .expect("dat properties for the same objId should be grouped");
+            .find(|item| item.id == "dat:Dat:units:5")
+            .expect("dat properties for the same (table, dat, objId) should be grouped");
         assert_eq!(dat_item.kind, ChangesetItemKind::Dat);
+        assert_eq!(
+            dat_item.dat_ref,
+            Some(DatRef {
+                table: DatTable::Dat,
+                dat: "units".to_owned(),
+                obj_id: 5,
+            })
+        );
         assert_eq!(
             dat_item.properties,
             vec![
@@ -1844,11 +1940,15 @@ mod tests {
                     property: "Name".to_owned(),
                     old: json!("Marine"),
                     new: json!("Veteran Marine"),
+                    id: "dat-name".to_owned(),
+                    seq: 1,
                 },
                 PropertyChange {
                     property: "HitPoints".to_owned(),
                     old: json!(40),
                     new: json!(45),
+                    id: "dat-hp".to_owned(),
+                    seq: 2,
                 },
             ]
         );
@@ -1867,6 +1967,63 @@ mod tests {
         assert!(diff.contains("+++ new/scripts/main.eps"));
         assert!(diff.contains("-    old_call();"));
         assert!(diff.contains("+    new_call();"));
+    }
+
+    #[test]
+    fn changeset_keeps_same_objid_in_different_dat_files_as_separate_items() {
+        let data_dir = temp_data_dir("changeset-dat-disambig");
+        let store = JournalStore::new(&data_dir);
+        let request_id = "req-dat-disambig";
+
+        // units #5 and weapons #5 share the family + objId but are DIFFERENT
+        // edits — they must not collapse into one "Dat #5" group.
+        store
+            .record(
+                request_id,
+                entry(
+                    "dat-units",
+                    1,
+                    WriteTool::DatSet,
+                    dat_target_named(DatTable::Dat, "units", 5, "HitPoints"),
+                    Snapshot::DatValue {
+                        value: json!(40),
+                        was_default: false,
+                    },
+                    Snapshot::DatValue {
+                        value: json!(80),
+                        was_default: false,
+                    },
+                ),
+            )
+            .expect("units entry should record");
+        store
+            .record(
+                request_id,
+                entry(
+                    "dat-weapons",
+                    2,
+                    WriteTool::DatSet,
+                    dat_target_named(DatTable::Dat, "weapons", 5, "DamageAmount"),
+                    Snapshot::DatValue {
+                        value: json!(6),
+                        was_default: false,
+                    },
+                    Snapshot::DatValue {
+                        value: json!(12),
+                        was_default: false,
+                    },
+                ),
+            )
+            .expect("weapons entry should record");
+
+        let changeset = store
+            .changeset(request_id)
+            .expect("changeset should be emitted");
+
+        assert_eq!(changeset.items.len(), 2, "distinct dat files stay separate");
+        let ids: Vec<&str> = changeset.items.iter().map(|i| i.id.as_str()).collect();
+        assert!(ids.contains(&"dat:Dat:units:5"));
+        assert!(ids.contains(&"dat:Dat:weapons:5"));
     }
 
     #[test]

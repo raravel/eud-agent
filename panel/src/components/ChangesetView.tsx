@@ -2,9 +2,10 @@
  * Changeset review (features/06 ## UI layout + Behaviors). Renders the
  * server-assembled `changeset.items[]`:
  *   - dat per objId: "{dat} [{objId}] {name?}" header + property old → new rows;
- *   - files by kind: created → content preview, modified → the SERVER unified
- *     diff with +/- coloring (NEVER Monaco DiffEditor — rules.md), deleted →
- *     name row;
+ *   - files by kind render as a file-editing card — a filename title bar
+ *     ({@link FileTitleBar}) on top of the code: created → content preview,
+ *     modified → the SERVER unified diff with +/- coloring (NEVER Monaco
+ *     DiffEditor — rules.md), deleted/body-less → the title bar alone;
  *   - settings/plugins/main and any other flat item → old → new rows.
  *
  * Each item exposes [✓ 적용]/[✗ 되돌리기]; bulk [전체 적용 유지]/[전체 되돌리기]
@@ -16,6 +17,8 @@
  *
  * Diff/preview limits reuse lib/truncate (1 MiB UTF-16-consistent). Korean labels.
  */
+import type { ReactNode } from "react";
+import { FilePenLineIcon } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
@@ -71,13 +74,47 @@ function OldNewRow({ label, old, next }: { label: string; old: unknown; next: un
   );
 }
 
-/** Server unified diff rendered with +/- coloring (no Monaco DiffEditor). */
-function DiffBlock({ diff }: { diff: string }) {
+/** Korean tag + tone for a file item's change kind (shown in the title bar). */
+const FILE_KIND_TAG: Record<string, { label: string; tone: string }> = {
+  created: { label: "생성", tone: "text-emerald-400" },
+  modified: { label: "수정", tone: "text-amber-400" },
+  deleted: { label: "삭제", tone: "text-destructive" },
+};
+
+/**
+ * The file-editing title bar: a filename/path header that sits directly ON TOP
+ * of the code/diff block (one bordered card), with the change-kind tag. Used by
+ * {@link DiffBlock}/{@link ContentPreview} and standalone for body-less items
+ * (a created file with no stored content, or a deleted file).
+ */
+function FileTitleBar({ path, kind }: { path: string; kind: string }) {
+  const tag = FILE_KIND_TAG[kind] ?? { label: kind, tone: "text-muted-foreground" };
+  return (
+    <div className="flex items-center gap-1.5 bg-muted/60 px-2 py-1.5 text-xs">
+      <FilePenLineIcon aria-hidden className="size-3.5 shrink-0 text-muted-foreground" />
+      <span className="break-all font-medium">{path}</span>
+      <span className={cn("ml-auto shrink-0 font-medium", tag.tone)}>{tag.label}</span>
+    </div>
+  );
+}
+
+/**
+ * Server unified diff rendered with +/- coloring (no Monaco DiffEditor). With a
+ * `header` (file title bar) the diff renders as ONE bordered card, title on top
+ * of the code (file-editing view); without it, a plain rounded block.
+ */
+function DiffBlock({ diff, header }: { diff: string; header?: ReactNode }) {
   const { text, truncated } = truncateForDisplay(diff);
   const lines = classifyDiff(text);
   return (
-    <div>
-      <pre className="overflow-x-auto rounded bg-muted/40 p-2 text-xs">
+    <div className={header ? "overflow-hidden rounded border border-border" : undefined}>
+      {header}
+      <pre
+        className={cn(
+          "overflow-x-auto bg-muted/40 p-2 text-xs",
+          header ? "border-t border-border" : "rounded",
+        )}
+      >
         {lines.map((ln, i) => (
           <div
             key={i}
@@ -101,17 +138,61 @@ function DiffBlock({ diff }: { diff: string }) {
   );
 }
 
-/** Content preview for a created file (truncated for display). */
-function ContentPreview({ content }: { content: string }) {
+/** Content preview for a created file (truncated for display); see {@link DiffBlock} for `header`. */
+function ContentPreview({ content, header }: { content: string; header?: ReactNode }) {
   const { text, truncated } = truncateForDisplay(content);
   return (
-    <div>
-      <pre className="overflow-x-auto rounded bg-muted/40 p-2 text-xs whitespace-pre-wrap break-words">
+    <div className={header ? "overflow-hidden rounded border border-border" : undefined}>
+      {header}
+      <pre
+        className={cn(
+          "overflow-x-auto whitespace-pre-wrap break-words bg-muted/40 p-2 text-xs",
+          header ? "border-t border-border" : "rounded",
+        )}
+      >
         {text}
       </pre>
       {truncated && (
         <p className="text-xs text-amber-400">표시가 1 MiB에서 잘렸습니다.</p>
       )}
+    </div>
+  );
+}
+
+/**
+ * A grouped dat/xdat/tbl/req/btn edit rendered as a single card: a header bar
+ * (family badge + dat-file label + object index + optional resolved name) on top
+ * of one `field: old → new` row per changed property. Replaces the previous bare
+ * "{dat} [{objId}]" line that — when the server sent no identity/properties —
+ * collapsed to an empty "[]". Properties come from {@link datProperties}.
+ */
+function DatChangeBlock({ item }: { item: ChangesetItem }) {
+  const dat = asText(item.dat);
+  const objId = asText(item.objId);
+  const name = asText(item.name);
+  const datTable = asText(item.datTable);
+  const properties = datProperties(item);
+  return (
+    <div className="overflow-hidden rounded border border-border">
+      <div className="flex flex-wrap items-center gap-1.5 bg-muted/60 px-2 py-1.5 text-xs">
+        {datTable && (
+          <span className="rounded bg-sky-500/15 px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-wide text-sky-400">
+            {datTable}
+          </span>
+        )}
+        {dat && <span className="font-semibold break-all">{dat}</span>}
+        {objId !== "" && <span className="text-muted-foreground">#{objId}</span>}
+        {name && <span className="text-muted-foreground">{name}</span>}
+      </div>
+      <div className="flex flex-col gap-0.5 border-t border-border p-2">
+        {properties.length > 0 ? (
+          properties.map((p) => (
+            <OldNewRow key={p.id} label={p.property} old={p.old} next={p.new} />
+          ))
+        ) : (
+          <span className="text-xs text-muted-foreground">변경된 속성이 없습니다.</span>
+        )}
+      </div>
     </div>
   );
 }
@@ -137,53 +218,24 @@ function ItemBody({ item }: { item: ChangesetItem }) {
   }
 
   if (item.category === "dat") {
-    const dat = asText(item.dat);
-    const objId = asText(item.objId);
-    const name = asText(item.name);
-    return (
-      <div className="flex flex-col gap-1">
-        <div className="text-sm font-semibold">
-          {dat} [{objId}]{name && <span className="ml-1 font-normal">{name}</span>}
-        </div>
-        {datProperties(item).map((p) => (
-          <OldNewRow key={p.id} label={p.property} old={p.old} next={p.new} />
-        ))}
-      </div>
-    );
+    return <DatChangeBlock item={item} />;
   }
 
   if (item.category === "file") {
     const path = asText(item.path);
     const kind = asText(item.kind);
-    if (kind === "created") {
-      return (
-        <div className="flex flex-col gap-1">
-          <div className="text-sm">
-            <span className="text-emerald-400">+생성</span> {path}
-          </div>
-          {typeof item.content === "string" && (
-            <ContentPreview content={item.content} />
-          )}
-        </div>
-      );
+    const header = <FileTitleBar path={path} kind={kind} />;
+    // The title bar sits on top of the code (file-editing card). Created files
+    // carry no stored content and deleted files have no body, so those render
+    // the title bar alone in the same bordered card.
+    if (kind === "created" && typeof item.content === "string" && item.content !== "") {
+      return <ContentPreview content={item.content} header={header} />;
     }
-    if (kind === "deleted") {
-      return (
-        <div className="text-sm">
-          <span className="text-destructive">-삭제</span> {path}
-        </div>
-      );
+    if (kind === "modified" && typeof item.diff === "string" && item.diff !== "") {
+      return <DiffBlock diff={item.diff} header={header} />;
     }
-    // modified
     return (
-      <div className="flex flex-col gap-1">
-        <div className="text-sm">
-          <span className="text-amber-400">~수정</span> {path}
-        </div>
-        {typeof item.diff === "string" && item.diff !== "" && (
-          <DiffBlock diff={item.diff} />
-        )}
-      </div>
+      <div className="overflow-hidden rounded border border-border">{header}</div>
     );
   }
 

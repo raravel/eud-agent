@@ -128,6 +128,54 @@ describe("ChangesetView — dat grouping", () => {
     expect(screen.getByText(/Gas/)).toBeInTheDocument();
     expect(screen.getByText(/25/)).toBeInTheDocument();
   });
+
+  // SERVER-SHAPED: the real engine sends an item-level id, a family badge
+  // (datTable), the dat-file label, the object index, and per-row property ids.
+  const datCard = {
+    category: "dat",
+    id: "dat:Dat:units:5",
+    datTable: "dat",
+    dat: "units",
+    objId: 5,
+    seq: 1,
+    properties: [
+      { property: "HitPoints", old: "40", new: "80", id: "dat-1", seq: 1 },
+    ],
+  } as unknown as ChangesetItem;
+
+  it("renders the family badge, dat-file label and #objId in the card header", () => {
+    render(
+      <ChangesetView
+        changeset={makeChangeset([datCard])}
+        pending={false}
+        onDecide={() => {}}
+      />,
+    );
+    expect(screen.getByText("dat")).toBeInTheDocument(); // family badge
+    expect(screen.getByText("units")).toBeInTheDocument(); // dat-file label
+    expect(screen.getByText(/#5/)).toBeInTheDocument(); // object index
+    expect(screen.getByText(/HitPoints/)).toBeInTheDocument();
+  });
+
+  it("shows a fallback line when a dat item carries no changed properties", () => {
+    const empty = {
+      category: "dat",
+      id: "dat:Dat:units:9",
+      datTable: "dat",
+      dat: "units",
+      objId: 9,
+      seq: 1,
+      properties: [],
+    } as unknown as ChangesetItem;
+    render(
+      <ChangesetView
+        changeset={makeChangeset([empty])}
+        pending={false}
+        onDecide={() => {}}
+      />,
+    );
+    expect(screen.getByText(/변경된 속성이 없습니다/)).toBeInTheDocument();
+  });
 });
 
 describe("ChangesetView — files by kind", () => {

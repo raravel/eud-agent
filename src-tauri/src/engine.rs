@@ -361,7 +361,7 @@ impl<D: CodexDriver, S: EventSink> AgentEngine<D, S> {
             .current_request_id
             .clone()
             .ok_or_else(|| AgentEngineError::new("no active request has a changeset"))?;
-        let ids = rollback_ids(&req.ids, &self.journal_store, &request_id);
+        let ids = rollback_ids(&req.ids);
 
         // A per-item accept must NOT archive the whole journal. The journal only supports
         // accept-all (archive) or reject(ids); so a partial accept is recorded as a no-op
@@ -1144,23 +1144,65 @@ fn diff_new_path(diff: &str) -> Option<String> {
         .find_map(|line| line.strip_prefix("+++ new/").map(ToOwned::to_owned))
 }
 
-fn rollback_ids(
-    ids: &ipc::DecisionIds,
-    store: &journal::JournalStore,
-    request_id: &str,
-) -> Vec<String> {
+/// The `ids` echoed back to the panel in `rollback_result`. A per-item decision
+/// echoes the exact ids it targeted; a bulk (`all`) decision echoes EMPTY, which
+/// the panel resolves against its OWN still-undecided item ids (a dat group's ids
+/// live on its properties, NOT on a single group id — so the server must not echo
+/// group ids here or dat groups would never mark as decided under bulk).
+fn rollback_ids(ids: &ipc::DecisionIds) -> Vec<String> {
     match ids {
         ipc::DecisionIds::List(ids) => ids.clone(),
-        ipc::DecisionIds::All(_) => store
-            .changeset(request_id)
-            .map(|changeset| changeset.items.into_iter().map(|item| item.id).collect())
-            .unwrap_or_default(),
+        ipc::DecisionIds::All(_) => Vec::new(),
+    }
+}
+
+/// Lowercase family slug for the panel's dat type badge.
+fn dat_table_slug(table: journal::DatTable) -> &'static str {
+    match table {
+        journal::DatTable::Dat => "dat",
+        journal::DatTable::Xdat => "xdat",
+        journal::DatTable::Tbl => "tbl",
+        journal::DatTable::Req => "req",
+        journal::DatTable::Btn => "btn",
     }
 }
 
 fn ipc_changeset_item(index: usize, item: journal::ChangesetItem) -> ipc::ChangesetItem {
+    // The panel renders by `category` and reads a LOWERCASE `kind`
+    // (created/modified/deleted) — never the PascalCase journal variant.
+    let kind = match item.kind {
+        journal::ChangesetItemKind::Dat => "dat",
+        journal::ChangesetItemKind::Created => "created",
+        journal::ChangesetItemKind::Modified => "modified",
+        journal::ChangesetItemKind::Deleted => "deleted",
+    };
+    // A file content op carries a `path`; that drives the panel's `file`
+    // category (title bar + diff). Path-less items keep their kind as category
+    // so dat/flat rendering is unchanged.
+    let category = if item.path.is_some() { "file" } else { kind };
+
     let mut extra = serde_json::Map::new();
-    extra.insert("kind".to_string(), serde_json::json!(item.kind));
+    extra.insert("kind".to_string(), serde_json::Value::String(kind.to_string()));
+    if let Some(path) = item.path {
+        extra.insert("path".to_string(), serde_json::Value::String(path));
+    }
+    // dat identity → the panel's dat-change card header: `dat` is the table label
+    // (the dat-file name like `units`, or the family for index-keyed tbl/btn),
+    // `datTable` the family badge, `objId` the object index.
+    if let Some(dat_ref) = &item.dat_ref {
+        let family = dat_table_slug(dat_ref.table);
+        let label = if dat_ref.dat.is_empty() {
+            family.to_string()
+        } else {
+            dat_ref.dat.clone()
+        };
+        extra.insert("dat".to_string(), serde_json::Value::String(label));
+        extra.insert(
+            "datTable".to_string(),
+            serde_json::Value::String(family.to_string()),
+        );
+        extra.insert("objId".to_string(), serde_json::json!(dat_ref.obj_id));
+    }
     if let Some(diff) = item.diff {
         extra.insert("diff".to_string(), serde_json::Value::String(diff));
     }
@@ -1169,13 +1211,7 @@ fn ipc_changeset_item(index: usize, item: journal::ChangesetItem) -> ipc::Change
     }
 
     ipc::ChangesetItem {
-        category: match item.kind {
-            journal::ChangesetItemKind::Dat => "dat",
-            journal::ChangesetItemKind::Created => "created",
-            journal::ChangesetItemKind::Modified => "modified",
-            journal::ChangesetItemKind::Deleted => "deleted",
-        }
-        .to_string(),
+        category: category.to_string(),
         id: item.id,
         seq: u32::try_from(index + 1).unwrap_or(u32::MAX),
         extra,
@@ -1285,6 +1321,76 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn ipc_changeset_item_maps_file_write_to_file_category_with_path() {
+        let item = journal::ChangesetItem {
+            id: "fm".to_string(),
+            kind: journal::ChangesetItemKind::Modified,
+            path: Some("triggers/main.eps".to_string()),
+            dat_ref: None,
+            properties: Vec::new(),
+            diff: Some("--- old/triggers/main.eps\n+++ new/triggers/main.eps\n".to_string()),
+        };
+
+        let emitted = ipc_changeset_item(0, item);
+
+        // The panel renders by `category` and a LOWERCASE `kind`; a file content
+        // op MUST surface as `file` with its `path` so the file-editing title bar
+        // + diff render (regression: it leaked as category "modified", no path —
+        // the panel then fell through to the flat row and showed "modified →").
+        assert_eq!(emitted.category, "file");
+        assert_eq!(emitted.extra.get("kind").and_then(Value::as_str), Some("modified"));
+        assert_eq!(
+            emitted.extra.get("path").and_then(Value::as_str),
+            Some("triggers/main.eps")
+        );
+        assert!(emitted.extra.contains_key("diff"));
+    }
+
+    #[test]
+    fn ipc_changeset_item_emits_dat_identity_and_property_ids() {
+        let item = journal::ChangesetItem {
+            id: "dat:Dat:units:5".to_string(),
+            kind: journal::ChangesetItemKind::Dat,
+            path: None,
+            dat_ref: Some(journal::DatRef {
+                table: journal::DatTable::Dat,
+                dat: "units".to_string(),
+                obj_id: 5,
+            }),
+            properties: vec![journal::PropertyChange {
+                property: "HitPoints".to_string(),
+                old: json!(40),
+                new: json!(45),
+                id: "dat-1".to_string(),
+                seq: 1,
+            }],
+            diff: None,
+        };
+
+        let emitted = ipc_changeset_item(0, item);
+
+        // The panel's dat-change card reads category "dat" + a label (`dat`),
+        // the family badge (`datTable`), the object index (`objId`), and per-row
+        // ids on `properties` (the decision targets a dat group dispatches).
+        assert_eq!(emitted.category, "dat");
+        assert_eq!(emitted.extra.get("kind").and_then(Value::as_str), Some("dat"));
+        assert_eq!(emitted.extra.get("dat").and_then(Value::as_str), Some("units"));
+        assert_eq!(
+            emitted.extra.get("datTable").and_then(Value::as_str),
+            Some("dat")
+        );
+        assert_eq!(emitted.extra.get("objId").and_then(Value::as_u64), Some(5));
+        assert!(!emitted.extra.contains_key("path"));
+        let props = emitted
+            .extra
+            .get("properties")
+            .and_then(Value::as_array)
+            .expect("dat item carries properties");
+        assert_eq!(props[0].get("id").and_then(Value::as_str), Some("dat-1"));
+        assert_eq!(props[0].get("property").and_then(Value::as_str), Some("HitPoints"));
+    }
 
     fn sample_hits() -> Vec<crate::rag::Hit> {
         vec![crate::rag::Hit {
