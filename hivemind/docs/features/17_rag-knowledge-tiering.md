@@ -129,3 +129,4 @@ critical path and NOT wired into CI (the `ubuntu-latest` runner has no GPU).
 - `.github/workflows/build-rag-index.yml` — v2 build + republish, version bump
 - `ci/` GPU differential-test fixture + test (local-only, gated)
 - external: `fastembed 5.15` (BGEM3Q), `sha2` (manifest digest)
+- [BOUND 2026-06-12 from EUD-159-22ba] `src-tauri/src/setup.rs` — run_bootstrap_inner re-fetches the release manifest when the pinned rag_index version != REQUIRED_RAG_INDEX_VERSION, so a stale v1 install upgrades to v2

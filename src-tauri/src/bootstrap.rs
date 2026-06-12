@@ -31,6 +31,12 @@ use crate::config::{AssetSpec, DataDirs};
 /// is downloaded to it after sha256 verification).
 pub const RAG_INDEX_FILENAME: &str = "rag-index.bin";
 
+/// The RAG index binary format version the runtime requires (feature 17). v1 had no
+/// `tier_level`; v2 adds it, so the loader rejects v1. A config pinned to any other
+/// version (a stale v1 install) re-downloads through the existing atomic + sha256 path,
+/// and only a manifest at this version is adopted.
+pub const REQUIRED_RAG_INDEX_VERSION: &str = "2";
+
 /// HF model id installed on first run when `config.json` carries none (feature 10).
 pub const DEFAULT_MODEL_NAME: &str = "BAAI/bge-m3";
 
@@ -377,6 +383,15 @@ pub fn parse_release_manifest(bytes: &[u8]) -> anyhow::Result<AssetSpec> {
     if spec.url.trim().is_empty() || spec.sha256.trim().is_empty() {
         bail!("rag-index release manifest is missing url/sha256");
     }
+    // Only the required index format is adopted; an older (or unexpected) version would
+    // pin the loader to an index the runtime cannot read (v1 has no `tier_level`).
+    if spec.version != REQUIRED_RAG_INDEX_VERSION {
+        bail!(
+            "rag-index release manifest version {:?} is not the required {:?}",
+            spec.version,
+            REQUIRED_RAG_INDEX_VERSION
+        );
+    }
     Ok(AssetSpec {
         name: spec.url,
         sha256: spec.sha256,
@@ -410,6 +425,9 @@ pub async fn fetch_release_manifest() -> anyhow::Result<AssetSpec> {
 pub fn needs_bootstrap(dirs: &DataDirs, config: &crate::config::Config) -> bool {
     asset_status(&dirs.rag_dir(), RAG_INDEX_FILENAME, &config.rag_index).needs_download()
         || config.rag_index.sha256.is_empty()
+        // A stale v1-pinned config re-downloads even when the asset is present and its
+        // sha256 matches — the runtime loader requires the v2 format (feature 17).
+        || config.rag_index.version != REQUIRED_RAG_INDEX_VERSION
         || config.model.name.is_empty()
 }
 
@@ -557,9 +575,9 @@ mod manifest {
     fn release_manifest_parses_into_asset_spec() {
         let json = br#"{
             "rag_index": {
-                "url": "https://github.com/raravel/eud-agent/releases/download/rag-index-v1/rag-index.bin",
+                "url": "https://github.com/raravel/eud-agent/releases/download/rag-index-v2/rag-index.bin",
                 "sha256": "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
-                "version": "1"
+                "version": "2"
             }
         }"#;
 
@@ -568,10 +586,105 @@ mod manifest {
         // The manifest's `url` maps onto AssetSpec.name (the release asset URL).
         assert_eq!(
             spec.name,
-            "https://github.com/raravel/eud-agent/releases/download/rag-index-v1/rag-index.bin"
+            "https://github.com/raravel/eud-agent/releases/download/rag-index-v2/rag-index.bin"
         );
         assert_eq!(spec.sha256, HELLO_SHA);
-        assert_eq!(spec.version, "1");
+        assert_eq!(spec.version, REQUIRED_RAG_INDEX_VERSION);
+    }
+
+    // ---- EUD-159: v2 manifest + loader-requires-v2 (STEP A failing artifact) ----
+    //
+    // The RAG index moved v1 -> v2 (adds `tier_level`). These tests pin the new
+    // contract: only a v2 manifest is adopted, and a stale v1-pinned config (asset
+    // present + sha256 matches, but version=="1") must re-download. They use the
+    // literal "2" (not a yet-unwritten constant) so they FAIL on assertion against
+    // current code, not on a compile error.
+
+    /// A config whose rag_index asset is Present on disk (sha256 matches) but pinned
+    /// to v1 must still report `needs_bootstrap == true` — the stale v1 index has no
+    /// `tier_level` and must be re-downloaded through the existing atomic path.
+    #[test]
+    fn needs_bootstrap_true_for_stale_v1_present_asset() {
+        let base = unique_temp_dir("needs-v1-stale");
+        let dirs = crate::config::DataDirs::from_bases(&base.join("roaming"), &base.join("local"));
+        dirs.ensure_dirs().unwrap();
+        // Place the asset so its sha256 matches the spec -> AssetStatus::Present.
+        fs::write(dirs.rag_dir().join(RAG_INDEX_FILENAME), b"hello").unwrap();
+
+        let config = crate::config::Config {
+            model: AssetSpec {
+                name: DEFAULT_MODEL_NAME.to_string(),
+                ..Default::default()
+            },
+            rag_index: AssetSpec {
+                name: "https://example.com/rag.bin".to_string(),
+                sha256: HELLO_SHA.to_string(),
+                version: "1".to_string(),
+            },
+            ..Default::default()
+        };
+
+        assert!(
+            needs_bootstrap(&dirs, &config),
+            "a v1-pinned config must re-download even when the asset is present + sha256 matches"
+        );
+        fs::remove_dir_all(&base).ok();
+    }
+
+    /// Everything present AND pinned to the required v2 version (model name set) ->
+    /// no bootstrap needed.
+    #[test]
+    fn needs_bootstrap_false_when_present_and_v2() {
+        let base = unique_temp_dir("needs-v2-ok");
+        let dirs = crate::config::DataDirs::from_bases(&base.join("roaming"), &base.join("local"));
+        dirs.ensure_dirs().unwrap();
+        fs::write(dirs.rag_dir().join(RAG_INDEX_FILENAME), b"hello").unwrap();
+
+        let config = crate::config::Config {
+            model: AssetSpec {
+                name: DEFAULT_MODEL_NAME.to_string(),
+                ..Default::default()
+            },
+            rag_index: AssetSpec {
+                name: "https://example.com/rag.bin".to_string(),
+                sha256: HELLO_SHA.to_string(),
+                version: "2".to_string(),
+            },
+            ..Default::default()
+        };
+
+        assert!(
+            !needs_bootstrap(&dirs, &config),
+            "present asset pinned to v2 with a model name must not need bootstrap"
+        );
+        fs::remove_dir_all(&base).ok();
+    }
+
+    /// Only a v2 manifest is acceptable: a v1 manifest is rejected, a v2 manifest is
+    /// adopted (and its version flows into the AssetSpec).
+    #[test]
+    fn release_manifest_requires_v2() {
+        let v1 = br#"{
+            "rag_index": {
+                "url": "https://x/y.bin",
+                "sha256": "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
+                "version": "1"
+            }
+        }"#;
+        assert!(
+            parse_release_manifest(v1).is_err(),
+            "a v1 manifest must be rejected once v2 ships"
+        );
+
+        let v2 = br#"{
+            "rag_index": {
+                "url": "https://x/y.bin",
+                "sha256": "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
+                "version": "2"
+            }
+        }"#;
+        let spec = parse_release_manifest(v2).expect("a v2 manifest must be accepted");
+        assert_eq!(spec.version, "2");
     }
 
     #[test]

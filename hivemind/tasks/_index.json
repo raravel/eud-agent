@@ -2572,7 +2572,7 @@
       ]
     },
     "EUD-159-22ba": {
-      "status": "pending",
+      "status": "done",
       "priority": "high",
       "type": "task",
       "parent": "EUD-152-0709",
@@ -2581,10 +2581,11 @@
       ],
       "title": "Bootstrap manifest v2 + loader requires v2",
       "updated": "2026-06-12",
-      "completed_at": null,
-      "path": "active/EUD-159-22ba.md",
+      "completed_at": "2026-06-12T17:47:51.181743",
+      "path": "done/EUD-159-22ba.md",
       "scope": [
-        "src-tauri/src/bootstrap.rs"
+        "src-tauri/src/bootstrap.rs",
+        "src-tauri/src/setup.rs"
       ]
     },
     "EUD-160-2d77": {

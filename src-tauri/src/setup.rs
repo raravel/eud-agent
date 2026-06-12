@@ -121,7 +121,9 @@ async fn run_bootstrap_inner(
     if config.model.name.trim().is_empty() {
         config.model.name = bootstrap::DEFAULT_MODEL_NAME.to_string();
     }
-    if config.rag_index.sha256.trim().is_empty() {
+    if config.rag_index.sha256.trim().is_empty()
+        || config.rag_index.version != bootstrap::REQUIRED_RAG_INDEX_VERSION
+    {
         emitter.emit("bootstrap", 0, "fetching release manifest");
         config.rag_index = bootstrap::fetch_release_manifest().await?;
     }
@@ -245,7 +247,7 @@ mod tests {
         AssetSpec {
             name: "https://example.com/rag-index.bin".to_string(),
             sha256: HELLO_SHA.to_string(),
-            version: "1".to_string(),
+            version: bootstrap::REQUIRED_RAG_INDEX_VERSION.to_string(),
         }
     }
 
