@@ -13,9 +13,28 @@ path = "build_rag_index.rs"
 name = "migrate_rag_index"
 path = "migrate_rag_index.rs"
 
+# Local-only, gated GPU differential test. Discovered by `cargo test` so its
+# headless decision-logic unit tests run, but the model+GPU differential test
+# itself is `#[ignore]`d. The `cuda` feature is opt-in and never built in CI.
+[[test]]
+name = "gpu_diff_test"
+path = "gpu_diff_test.rs"
+
+[features]
+# Opt-in GPU/CUDA EP investigation track (local-only, never built in CI). It
+# pulls the optional `ort` dep and turns on `ort/cuda` so the
+# `#[cfg(feature = "cuda")]` branch in gpu_diff_test.rs can register the CUDA
+# execution provider. The default build stays CPU-only (no ort/cuda code).
+cuda = ["dep:ort", "ort/cuda"]
+
 [dependencies]
 anyhow = "1"
 fastembed = "5.15"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
+# Optional, gated by the `cuda` feature ONLY. Pinned to EXACTLY the version
+# fastembed 5.16 pulls transitively so cargo unifies the two (features are
+# additive) instead of splitting the ort graph; the default build never enables
+# it, so build_rag_index/migrate_rag_index are unaffected.
+ort = { version = "=2.0.0-rc.12", optional = true }

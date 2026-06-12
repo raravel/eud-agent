@@ -2482,15 +2482,15 @@
       "scope": []
     },
     "EUD-153-7163": {
-      "status": "pending",
+      "status": "done",
       "priority": "low",
       "type": "story",
       "parent": "EUD-149-fcc8",
       "depends_on": [],
       "title": "GPU differential-test track (gated, separate)",
       "updated": "2026-06-12",
-      "completed_at": null,
-      "path": "active/EUD-153-7163.md",
+      "completed_at": "2026-06-12T18:17:40.001192",
+      "path": "done/EUD-153-7163.md",
       "scope": []
     },
     "EUD-154-91b9": {
@@ -2605,18 +2605,19 @@
       ]
     },
     "EUD-161-5726": {
-      "status": "pending",
+      "status": "done",
       "priority": "low",
       "type": "task",
       "parent": "EUD-153-7163",
       "depends_on": [],
       "title": "GPU differential-test fixture + adoption gate (local-only)",
       "updated": "2026-06-12",
-      "completed_at": null,
-      "path": "active/EUD-161-5726.md",
+      "completed_at": "2026-06-12T18:17:39.963995",
+      "path": "done/EUD-161-5726.md",
       "scope": [
         "ci/gpu_diff_test.rs",
-        "ci/Cargo.toml"
+        "ci/Cargo.toml",
+        "ci/Cargo.lock"
       ]
     }
   }
