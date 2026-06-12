@@ -23,6 +23,8 @@ import {
   useState,
   useSyncExternalStore,
 } from "react";
+import { toast } from "sonner";
+import { Toaster } from "@/components/ui/sonner";
 import { Header, type RagState } from "@/components/Header";
 import { ConversationLog } from "@/components/ConversationLog";
 import { ChangesetView } from "@/components/ChangesetView";
@@ -133,6 +135,24 @@ export default function App() {
     return () => clearInterval(id);
   }, [ragState]);
 
+  // Every error/warn log entry ALSO pops a toast so a problem is noticeable even
+  // when the conversation is scrolled away or the user is on the input. The log
+  // line stays for history; the toast is the transient alert. Log ids are
+  // monotonic (they survive a `새 대화` reset), so the last-toasted id guards
+  // each entry against re-toasting on later renders.
+  const lastToastedLogId = useRef(0);
+  useEffect(() => {
+    for (const entry of state.log) {
+      if (entry.id <= lastToastedLogId.current) continue;
+      if (entry.kind === "error") toast.error(entry.text);
+      else if (entry.kind === "warn") toast.warning(entry.text);
+    }
+    const latest = state.log.at(-1);
+    if (latest && latest.id > lastToastedLogId.current) {
+      lastToastedLogId.current = latest.id;
+    }
+  }, [state.log]);
+
   // Dispatch an inbound v2 server message to store actions + log entries.
   const onMessage = useCallback(
     (msg: ServerMessage) => {
@@ -188,10 +208,11 @@ export default function App() {
           store.progressReceived(msg.stage);
           // RAG warmup drives the Header pill (started → loading w/ elapsed,
           // done → ready, error → unavailable) AND the store send gate. The
-          // core replays the current warmup state to every new client,
-          // so transitions are logged only on a real change (a fresh "done"
-          // snapshot must not re-log completion), and the loading state
-          // is NOT logged at all — the ConversationLog shimmer row covers it.
+          // pill IS the status surface (top-right), so readiness is NOT logged
+          // to the conversation — a "준비 완료" line would evict the empty-state
+          // hero before the user has typed anything. Only the error transition
+          // logs (a warn line → also toasted by the error/warn effect); the
+          // loading state is covered by the ConversationLog shimmer row.
           if (msg.stage === "rag_warmup") {
             const prev = store.getState().rag;
             let next: "loading" | "ready" | "unavailable";
@@ -203,7 +224,7 @@ export default function App() {
               next = "loading";
             }
             store.ragWarmupChanged(next);
-            if (next !== prev && next !== "loading") {
+            if (next !== prev && next === "unavailable") {
               const { kind, text } = progressLabel(msg.stage, msg.detail);
               store.log(kind, text, msg.stage);
             }
@@ -301,15 +322,11 @@ export default function App() {
       },
       onEditorChange: (connected) => {
         // Editor liveness is separate from the transport: this only flips the
-        // send gate + ConnectionNotice banner, never the reconnect UI. Log just
-        // the recovery edge (the down state is shown by the banner, and logging
-        // it would misleadingly read as "disconnected" when the editor simply
-        // was not up yet at boot).
-        const wasConnected = store.getState().editorConnected;
+        // send gate + ConnectionNotice banner, never the reconnect UI. The
+        // connection state is shown by the Header pill + ConnectionNotice banner
+        // (it disappears on recovery), so the recovery edge is NOT logged — a
+        // boot-time "연결되었습니다" status line would evict the empty-state hero.
         store.editorConnectionChanged(connected);
-        if (connected && !wasConnected) {
-          store.log("ok", "에디터에 다시 연결되었습니다.");
-        }
       },
     });
     clientRef.current = client;
@@ -634,6 +651,9 @@ export default function App() {
 
   return (
     <div className="flex h-screen flex-col bg-background text-foreground">
+      {/* Transient problem alerts (error/warn log entries). Bottom-right so it
+          never covers the Header status pills (top-right). */}
+      <Toaster position="bottom-right" richColors closeButton />
       <Header
         project={state.project}
         connected={state.connected}
