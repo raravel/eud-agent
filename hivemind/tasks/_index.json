@@ -2458,15 +2458,15 @@
       "scope": []
     },
     "EUD-151-e190": {
-      "status": "pending",
+      "status": "done",
       "priority": "high",
       "type": "story",
       "parent": "EUD-149-fcc8",
       "depends_on": [],
       "title": "L2 v2 index format and weighted ranking",
       "updated": "2026-06-12",
-      "completed_at": null,
-      "path": "active/EUD-151-e190.md",
+      "completed_at": "2026-06-12T17:01:56.749591",
+      "path": "done/EUD-151-e190.md",
       "scope": []
     },
     "EUD-152-0709": {
@@ -2538,7 +2538,7 @@
       ]
     },
     "EUD-157-c7ef": {
-      "status": "pending",
+      "status": "done",
       "priority": "high",
       "type": "task",
       "parent": "EUD-151-e190",
@@ -2547,8 +2547,8 @@
       ],
       "title": "Weighted rank() with TIER_WEIGHT table",
       "updated": "2026-06-12",
-      "completed_at": null,
-      "path": "active/EUD-157-c7ef.md",
+      "completed_at": "2026-06-12T17:01:56.712100",
+      "path": "done/EUD-157-c7ef.md",
       "scope": [
         "src-tauri/src/rag.rs"
       ]

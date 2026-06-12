@@ -153,6 +153,12 @@ pub fn top_k(query: &[f32], corpus: &[Embedding], k: usize) -> Vec<usize> {
 /// clamped k to 10). A larger requested `k` is clamped down to this.
 pub const MAX_TOP_K: usize = 10;
 
+/// Per-tier ranking multiplier indexed by `IndexEntry.tier_level` (0=Q&A … 3=official).
+/// A narrow band near 1.0 so source tier NUDGES but never DOMINATES the cosine signal
+/// (bge-m3 cosines cluster ~0.3–0.9). Retunable in code without rebuilding the index
+/// (features/17_rag-knowledge-tiering.md, Decision 18). Pinned by `rank_is_tier_weighted`.
+const TIER_WEIGHT: [f32; 4] = [1.00, 1.05, 1.10, 1.15];
+
 /// v1 `search_docs` guidance preserved as a single source of truth (surfaced by the
 /// future tools layer): the ECA corpus is Korean, so queries should be phrased in
 /// Korean while keeping eps/API identifiers as-is, and `k` is clamped to
@@ -201,7 +207,8 @@ pub struct Hit {
     pub text: String,
     /// The citation link header (`[title](url)`).
     pub source: String,
-    /// Cosine similarity to the query (== dot on L2-normalized vectors).
+    /// Weighted ranking score: `cosine(query, entry) * TIER_WEIGHT[tier_level]`
+    /// (cosine == dot on L2-normalized vectors; the tier weight nudges by source trust).
     pub score: f32,
 }
 
@@ -452,14 +459,22 @@ impl Rag {
         Ok(())
     }
 
-    /// Pure brute-force ranking: cosine(`query_vec`, each entry), top-k by score desc
-    /// (tie: lower `id`). `k` is clamped to [`MAX_TOP_K`]. Assumes `query_vec` is
-    /// L2-normalized. No model needed — testable. Empty index -> empty Vec.
+    /// Brute-force tier-weighted ranking: `cosine(query_vec, each entry) *
+    /// TIER_WEIGHT[tier_level]`, top-k by score desc (tie: lower `id`). `k` is clamped to
+    /// [`MAX_TOP_K`]. Assumes `query_vec` is L2-normalized. No model needed — testable.
+    /// Empty index -> empty Vec. The tier index is looked up DEFENSIVELY so a corrupt
+    /// `tier_level` >= 4 falls back to a 1.0 weight instead of panicking (rules.md).
     pub fn rank(&self, query_vec: &[f32], k: usize) -> Vec<Hit> {
         let mut scored: Vec<(&IndexEntry, f32)> = self
             .index
             .iter()
-            .map(|e| (e, cosine(query_vec, &e.vector)))
+            .map(|e| {
+                let w = TIER_WEIGHT
+                    .get(e.tier_level as usize)
+                    .copied()
+                    .unwrap_or(1.0);
+                (e, cosine(query_vec, &e.vector) * w)
+            })
             .collect();
         // Score desc; deterministic tie-break by lower id (matches `top_k`'s intent).
         scored.sort_by(|a, b| {
@@ -828,17 +843,117 @@ mod query {
             "third (orthogonal) is id=3"
         );
 
-        // Scores descend and the top score matches the expected cosine to id=2.
+        // Scores descend and the top score matches the WEIGHTED cosine to id=2
+        // (id=2 is tier 2, so its weight is TIER_WEIGHT[2]).
         assert!(hits[0].score >= hits[1].score && hits[1].score >= hits[2].score);
-        let expected_top = cosine(&q, &vec_with(&[(1, 1.0)]));
+        let expected_top = cosine(&q, &vec_with(&[(1, 1.0)])) * super::TIER_WEIGHT[2];
         assert!(
             (hits[0].score - expected_top).abs() < 1e-5,
-            "top score {} should match cosine {}",
+            "top score {} should match weighted cosine {}",
             hits[0].score,
             expected_top
         );
-        // id=3 is orthogonal to the query -> ~0 cosine.
+        // id=3 is orthogonal to the query -> ~0 cosine (0 * TIER_WEIGHT[0] still ~0).
         assert!(hits[2].score.abs() < 1e-5, "orthogonal entry scores ~0");
+    }
+
+    /// EUD-157 verify-first (STEP A): pin the tier-weighted ranking contract.
+    ///
+    /// `score = cosine(query, entry) * TIER_WEIGHT[entry.tier_level]`, where
+    /// [`super::TIER_WEIGHT`] is a narrow band near 1.0 so a higher tier NUDGES a
+    /// near-tie but can NEVER flip a large cosine gap. This references
+    /// `super::TIER_WEIGHT` (which does not exist until STEP B), so it FAILS TO
+    /// COMPILE — that IS the verify-first gate failure.
+    #[test]
+    fn rank_is_tier_weighted() {
+        // --- Documented case 1: tier NUDGES a near-tie. ---
+        // Two entries with nearly-equal cosine to the query but different tiers:
+        // a tier-0 entry (weight TIER_WEIGHT[0]) almost perfectly aligned, and a
+        // tier-3 entry (weight TIER_WEIGHT[3]) very slightly less aligned. The
+        // tier-3 weight must overcome the tiny cosine deficit and rank first.
+        let low_tier_high_cos = IndexEntry {
+            id: 10,
+            // Almost on the query axis (index 0) with a tiny off-axis component.
+            vector: vec_with(&[(0, 1.0), (1, 0.02)]),
+            tier_level: 0,
+            text: "low tier, near-perfect cosine".to_string(),
+            source: "[low](https://cafe/edac/10)".to_string(),
+        };
+        let high_tier_near_cos = IndexEntry {
+            id: 11,
+            // Slightly LESS aligned to the query axis than id=10.
+            vector: vec_with(&[(0, 1.0), (1, 0.05)]),
+            tier_level: 3,
+            text: "high tier, slightly lower cosine".to_string(),
+            source: "[high](https://cafe/edac/11)".to_string(),
+        };
+        let q = vec_with(&[(0, 1.0)]);
+
+        // Sanity: the raw cosines are a near-tie, with the LOW-tier entry strictly
+        // higher (so any reordering is attributable to the tier weight, not cosine).
+        let cos_low = cosine(&q, &low_tier_high_cos.vector);
+        let cos_high = cosine(&q, &high_tier_near_cos.vector);
+        assert!(
+            cos_low > cos_high,
+            "fixture sanity: low-tier entry must have the higher raw cosine ({cos_low} vs {cos_high})"
+        );
+
+        let rag = Rag::new(
+            vec![low_tier_high_cos.clone(), high_tier_near_cos.clone()],
+            None,
+        );
+        let hits = rag.rank(&q, 5);
+        assert_eq!(hits.len(), 2);
+        assert_eq!(
+            hits[0].text, "high tier, slightly lower cosine",
+            "tier weight must nudge the higher-tier entry past a near-tie"
+        );
+
+        // The top hit's score is the WEIGHTED score of the tier-3 entry.
+        let expected_high = cos_high * super::TIER_WEIGHT[3];
+        assert!(
+            (hits[0].score - expected_high).abs() < 1e-5,
+            "top score {} should equal cosine * TIER_WEIGHT[3] ({expected_high})",
+            hits[0].score
+        );
+
+        // --- Documented case 2: tier NEVER overpowers a large cosine gap. ---
+        // A tier-0 entry strongly aligned to the query vs a tier-3 entry only
+        // weakly aligned. The narrow weight band cannot flip the large cosine gap,
+        // so the high-cosine low-tier entry still ranks first.
+        let strong_low_tier = IndexEntry {
+            id: 20,
+            vector: vec_with(&[(0, 1.0)]),
+            tier_level: 0,
+            text: "strong cosine, low tier".to_string(),
+            source: "[strong](https://cafe/edac/20)".to_string(),
+        };
+        let weak_high_tier = IndexEntry {
+            id: 21,
+            // Mostly off-axis: a much smaller cosine to the query.
+            vector: vec_with(&[(0, 0.3), (1, 1.0)]),
+            tier_level: 3,
+            text: "weak cosine, high tier".to_string(),
+            source: "[weak](https://cafe/edac/21)".to_string(),
+        };
+
+        // Sanity: even after the BEST possible tier boost, the weak entry's weighted
+        // score stays below the strong entry's — the gap is large enough that the
+        // band near 1.0 cannot flip it.
+        let cos_strong = cosine(&q, &strong_low_tier.vector);
+        let cos_weak = cosine(&q, &weak_high_tier.vector);
+        assert!(
+            cos_strong * super::TIER_WEIGHT[0] > cos_weak * super::TIER_WEIGHT[3],
+            "fixture sanity: weighted strong-cosine entry must outrank weighted weak-cosine entry"
+        );
+
+        let rag2 = Rag::new(vec![strong_low_tier, weak_high_tier], None);
+        let hits2 = rag2.rank(&q, 5);
+        assert_eq!(hits2.len(), 2);
+        assert_eq!(
+            hits2[0].text, "strong cosine, low tier",
+            "tier weight must NOT flip a large cosine gap"
+        );
     }
 
     #[test]

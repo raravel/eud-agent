@@ -1,4 +1,5 @@
 ---
+completed_at: '2026-06-12T17:01:56.712100'
 created: '2026-06-12'
 depends_on:
 - EUD-155-2da4
@@ -7,7 +8,7 @@ parent: EUD-151-e190
 priority: high
 scope:
 - src-tauri/src/rag.rs
-status: pending
+status: done
 title: Weighted rank() with TIER_WEIGHT table
 type: task
 updated: '2026-06-12'
