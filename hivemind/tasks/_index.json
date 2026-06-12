@@ -2446,15 +2446,15 @@
       "scope": []
     },
     "EUD-150-9296": {
-      "status": "pending",
+      "status": "done",
       "priority": "high",
       "type": "story",
       "parent": "EUD-149-fcc8",
       "depends_on": [],
       "title": "L1 resident eps idioms",
       "updated": "2026-06-12",
-      "completed_at": null,
-      "path": "active/EUD-150-9296.md",
+      "completed_at": "2026-06-12T15:28:06.909958",
+      "path": "done/EUD-150-9296.md",
       "scope": []
     },
     "EUD-151-e190": {
@@ -2494,15 +2494,15 @@
       "scope": []
     },
     "EUD-154-91b9": {
-      "status": "pending",
+      "status": "done",
       "priority": "high",
       "type": "task",
       "parent": "EUD-150-9296",
       "depends_on": [],
       "title": "Add resident EPS_IDIOMS section to system prompt",
       "updated": "2026-06-12",
-      "completed_at": null,
-      "path": "active/EUD-154-91b9.md",
+      "completed_at": "2026-06-12T15:28:06.852440",
+      "path": "done/EUD-154-91b9.md",
       "scope": [
         "src-tauri/src/engine.rs"
       ]

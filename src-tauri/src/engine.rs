@@ -37,6 +37,36 @@ const EPSCRIPT_GUIDE: &str = r#"[epscript]
 - Syntax essentials: statements end with ";"; variables `var x = 0;`, constants `const marine = $U("Terran Marine");` (names map via $U(unit)/$L(location)); conditions are if-expressions and actions are statements — `if (Deaths(P1, AtLeast, 1, marine)) { SetDeaths(P1, Subtract, 1, marine); CreateUnit(1, marine, $L("spawn"), P1); }`
 - Unsure about eps syntax or an API name? search_docs (Korean query) BEFORE writing code; follow eps examples from the reference-context section and ignore classic-trigger examples quoted in posts."#;
 
+// Resident "write eps like THIS" anchor (L1, search-independent). It always sits
+// between the first-principles section (L0, the NEVER rules) and [reference
+// context] (L2, retrieved chunks), so the model has a positive idiom cheat-sheet
+// even when retrieval misses. It states the CORRECT eps pattern for the
+// most-miscoded constructs and cross-references the first-principles item number
+// instead of restating a prohibition. Feature 17 / decision 18.
+//
+// NOTE: this body intentionally never contains the literal `[first principles]`
+// header substring — cross-references read "first-principles item #NN" — so the
+// resume-turn prompt (which carries [eps idioms] but NOT the L0 section) stays
+// free of that header, the invariant the engine resume/system-prompt tests rely
+// on.
+const EPS_IDIOMS: &str = r#"[eps idioms]
+The correct eps way to write the constructs people most often miscode. These are positive patterns; where one borders a crash cause, the matching first-principles item is cited rather than restated.
+
+- Entry functions are the ONLY way code runs: `function onPluginStart() { ... }` runs once at map start (init/const setup); `function beforeTriggerExec() { ... }` and `function afterTriggerExec() { ... }` run every game loop. Put repeating logic INSIDE a loop function — there is no PreserveTrigger to "keep" a trigger alive. Call `SetPName(...)` only from `afterTriggerExec()` (see first-principles item #31).
+- Map names to ids with the `$U` / `$L` intrinsics and freeze them in a `const`: `const marine = $U("Terran Marine"); const spawn = $L("spawn");`. Use the `const` everywhere afterwards instead of a raw numeric id, so a unit/location rename stays a one-line change.
+- Conditions are if-expressions; actions are plain statements in the body — no classic `Trigger { conditions = ...; actions = ... }` block:
+  `if (Deaths(P1, AtLeast, 1, marine)) { SetDeaths(P1, Subtract, 1, marine); CreateUnit(1, marine, spawn, P1); }`
+- Use a death counter as per-player storage for flags/timers/HP, backed by a unit id that can NEVER die in game for that player (a unit type that is never placed/spawned for them). Read with `Deaths(player, ...)`, write with `SetDeaths(player, SetTo|Add|Subtract, n, unitId)`. Never store a boss's HP in the boss's own death counter (see the first-principles death-counter rule in the eps-idioms list).
+- Read `0x628438` (First Empty Unit) freshly IMMEDIATELY BEFORE EACH `CreateUnit` — it holds the address of the unit ABOUT TO be created, so it must be re-read every time, never cached/hoisted across creates. Right before each create: `var ptr = f_dwread_epd(EPD(0x628438)); CreateUnit(1, marine, spawn, P1); // ptr/EPD(ptr) now addresses the just-created unit`. In a loop, re-read it inside the loop body before every create — a value cached across creates points at the wrong slot, and reading it AFTER the create points at the next (wrong) slot.
+- Compare a unit's `unitType` (low 16 bits of CUnit+0x64) with a MASKED EPD read, never an unmasked dword compare: `if (MemoryXEPD(epd + 0x64/4, Exactly, marine, 0xFFFF)) { ... }`. The high 16 bits hold other state, so an unmasked compare silently never matches.
+- Verify a unit/ptr is valid and alive before dereferencing it (see first-principles items #8, #9): guard with the alive check, then read offsets via `f_dwread_epd(epd + offset/4)` and write via `f_dwwrite_epd(...)` / `MemoryEPD(...)`.
+- For precise hit/move detection use an INVERTED (음수) location sized at or below the target's collision box: at runtime `MoveLocation` it onto the unit, then test `Bring(player, AtLeast, 1, unit, loc)`. An inverted location larger than the unit never matches.
+- When you change the current player to fire per-player actions, save and restore CP: `const cp = getcurpl(); setcurpl(player); /* non-shared action, e.g. DisplayText */ setcurpl(cp);`. Restore before any subsequent non-shared action (DisplayText/CenterView) so it lands on the intended player.
+- Fire shared (synchronized) actions only from shared conditions; keep local detection (chat/key/local click) driving LOCAL-only effects (see first-principles item #13). Mixing them desyncs and drops players.
+- Every loop needs a guaranteed exit (see first-principles item #27): bound it with a counter or a real break condition — `var i = 0; while (i < n) { ...; i = i + 1; }` — never an unconditionally-true loop with no break.
+- Production-token button skills: edit the unit's OWN button set in place (never reassign its `ButtonSet` xdat to another set id — measured hard crash on selection). Give the token unit Mineral/Gas/Supply cost 0 (otherwise the click fails with a resource error). A token in a non-building/hero queue never actually spawns a unit — treat it purely as a click trigger and detect/reset the queue via `BuildCheckXEPD` / `BuildResetXEPD`. Keep any AlwaysUse requirement count LOW.
+- Button label tbl format is `[hotkey char]<qualifier>[bracketed text]` with a REQUIRED qualifier byte: `<00>` general command, `<01>` unit production, `<02>` research. A missing qualifier byte silently kills the hotkey (e.g. `w<00>[W] Skill` works; `w[W] Skill` does not). The editor stores `<NN>` escapes as text and converts them to `\xNN` at build."#;
+
 const BUILD_GUIDE: &str = r#"[build]
 - After you APPLY eps/file changes (file_write/file_create/plugin_*), ALWAYS run build_run in the SAME turn to verify the project compiles. Code you never built is NOT done.
 - If build_run fails it returns structured errors (file/line/message): read them, fix the code, and build again. The server enforces a 3-attempt self-fix budget per request; when it is spent, STOP and report the remaining errors to the user verbatim.
@@ -811,6 +841,8 @@ pub fn build_system_prompt(
         String::new(),
         first_principles_section(),
         String::new(),
+        EPS_IDIOMS.to_string(),
+        String::new(),
         EPSCRIPT_GUIDE.to_string(),
         String::new(),
         BUILD_GUIDE.to_string(),
@@ -855,6 +887,8 @@ pub fn resume_turn_text(
     }
 
     parts.extend([
+        EPS_IDIOMS.to_string(),
+        String::new(),
         reference_context_section(rag_hits),
         String::new(),
         "[user message]".to_string(),
@@ -2068,6 +2102,36 @@ mod tests {
         assert!(
             first_principles < reference_context,
             "[first principles] must appear before [reference context]"
+        );
+    }
+
+    #[test]
+    fn system_prompt_orders_eps_idioms_between_first_principles_and_reference_context() {
+        let hits = sample_hits();
+        let prompt = build_system_prompt(
+            "How do I write a death-counter loop in eps?",
+            &hits,
+            "[project state]\nproject=Sample compiling=false",
+            None,
+        );
+
+        let first_principles = prompt
+            .find("[first principles]")
+            .expect("system prompt must contain [first principles]");
+        let eps_idioms = prompt
+            .find("[eps idioms]")
+            .expect("system prompt must contain [eps idioms]");
+        let reference_context = prompt
+            .find("[reference context]")
+            .expect("system prompt must contain [reference context]");
+
+        assert!(
+            first_principles < eps_idioms,
+            "[first principles] must appear before [eps idioms]"
+        );
+        assert!(
+            eps_idioms < reference_context,
+            "[eps idioms] must appear before [reference context]"
         );
     }
 
