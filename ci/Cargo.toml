@@ -9,6 +9,10 @@ edition = "2021"
 name = "build_rag_index"
 path = "build_rag_index.rs"
 
+[[bin]]
+name = "migrate_rag_index"
+path = "migrate_rag_index.rs"
+
 [dependencies]
 anyhow = "1"
 fastembed = "5.15"

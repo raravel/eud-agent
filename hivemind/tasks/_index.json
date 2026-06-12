@@ -2554,7 +2554,7 @@
       ]
     },
     "EUD-158-1146": {
-      "status": "pending",
+      "status": "done",
       "priority": "high",
       "type": "task",
       "parent": "EUD-152-0709",
@@ -2564,8 +2564,8 @@
       ],
       "title": "v1 to v2 migration binary (id-join, vector-preservation)",
       "updated": "2026-06-12",
-      "completed_at": null,
-      "path": "active/EUD-158-1146.md",
+      "completed_at": "2026-06-12T17:27:27.771637",
+      "path": "done/EUD-158-1146.md",
       "scope": [
         "ci/migrate_rag_index.rs",
         "ci/Cargo.toml"
