@@ -574,12 +574,20 @@ export default function App() {
   // "all" (bulk) or the item's ids (ChangesetView resolves dat group ids).
   const handleDecide = useCallback(
     async (decision: "accept" | "reject", ids: "all" | string[]) => {
+      // Record the pending decision BEFORE issuing the command: the core emits
+      // `rollback_result` WHILE the changeset_decision invoke is in flight, so
+      // setting pendingDecision after `await send` lets the event arrive first
+      // (found with no pending decision, it no-ops) and the "결정 처리 중…"
+      // spinner would never clear. Mirrors handleSend/handlePlanApprove.
+      store.decisionSent(decision, ids);
       const sent = await clientRef.current?.send({
         type: "changeset_decision",
         decision,
         ids,
       });
-      if (sent) store.decisionSent(decision, ids);
+      // The command never ran → no rollback_result will arrive; unlock the
+      // controls so the review is not stranded mid-spinner.
+      if (!sent) store.decisionFailed();
     },
     [store],
   );

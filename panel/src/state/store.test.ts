@@ -382,6 +382,18 @@ describe("dat-group changeset (NO item-level id — completion via property ids)
     // Already fully decided → lands on ready, not changeset_review.
     expect(store.getState().phase).toBe("ready");
   });
+
+  it("decisionFailed clears the pending decision so the controls unlock", () => {
+    const store = reviewingDat([datGroup(76, ["p1", "p2"])]);
+    store.decisionSent("accept", "all");
+    expect(store.getState().pendingDecision).not.toBeNull();
+    // The command never reached the core (send failed): no rollback_result will
+    // arrive, so the optimistic pending decision must be cleared explicitly.
+    store.decisionFailed();
+    expect(store.getState().pendingDecision).toBeNull();
+    // The changeset stays reviewable (still undecided) — controls are usable.
+    expect(store.getState().phase).toBe("changeset_review");
+  });
 });
 
 describe("send gating v2 = connected && hasProject && !busy (no settable target req.)", () => {

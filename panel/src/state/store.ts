@@ -340,6 +340,12 @@ export interface PanelStore {
    * message carries no discriminator). Awaits `rollback_result`.
    */
   decisionSent(decision: "accept" | "reject", ids: "all" | string[]): void;
+  /**
+   * The changeset_decision command never reached the core (send failed) — clear
+   * the optimistic pending decision so the review controls unlock again (no
+   * `rollback_result` will arrive to clear it).
+   */
+  decisionFailed(): void;
   /** cancel was sent — return to ready. */
   cancelSent(): void;
   /**
@@ -980,6 +986,11 @@ export function createPanelStore(): PanelStore {
       // accept-all echoes an empty ids array). The phase change waits on
       // rollback_result (so a slow bridge does not strand the UI mid-review).
       core.pendingDecision = { decision, ids };
+      emit();
+    },
+
+    decisionFailed() {
+      core.pendingDecision = null;
       emit();
     },
 
