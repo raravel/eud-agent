@@ -164,7 +164,7 @@ and type names) verbatim as-is. Results are clamped to the top 10 (MAX_TOP_K).";
 /// `.bin` index magic — first 4 bytes of the persisted index file.
 const INDEX_MAGIC: &[u8; 4] = b"ERAG";
 /// `.bin` index format version (bumped on any layout change).
-const INDEX_VERSION: u32 = 1;
+const INDEX_VERSION: u32 = 2;
 
 /// Upper bound on the `Vec::with_capacity` HINT used when loading the index. This is
 /// only a pre-allocation cap (NOT a hard entry limit — the loop still reads exactly the
@@ -182,6 +182,11 @@ pub struct IndexEntry {
     pub id: u64,
     /// The L2-normalized dense bge-m3 embedding (length [`EMBED_DIM`]).
     pub vector: Embedding,
+    /// v2 source-trust tier code (0=Q&A … 3=official) that EUD-157's weighted
+    /// [`Rag::rank`] will consume to bias higher-trust chunks. Only the tier CODE is
+    /// stored in the index; the per-tier multiplier lives in code, not the index, so
+    /// it can be retuned without rebuilding (Decision 18).
+    pub tier_level: u8,
     /// The chunk text shown to the model as `[reference context]`.
     pub text: String,
     /// The citation link header (`[title](url)`) the evidence gate requires.
@@ -204,11 +209,12 @@ pub struct Hit {
 /// builder later). Layout (little-endian):
 ///
 /// ```text
-/// magic b"ERAG" [4] | version u32 = 1 | count u32 |
+/// magic b"ERAG" [4] | version u32 = 2 | count u32 |
 ///   count records: id u64 | vector EMBED_DIM*f32 (4096 bytes) |
-///   text_len u32 + text utf8 | source_len u32 + source utf8
+///   tier_level u8 (1 byte) | text_len u32 + text utf8 | source_len u32 + source utf8
 /// ```
 ///
+/// The single `tier_level` byte sits AFTER the full vector and BEFORE the text length.
 /// A vector whose length is not [`EMBED_DIM`] is rejected as [`RagError::Index`] before
 /// any bytes are written.
 pub fn write_index(path: &std::path::Path, entries: &[IndexEntry]) -> Result<(), RagError> {
@@ -239,6 +245,8 @@ pub fn write_index(path: &std::path::Path, entries: &[IndexEntry]) -> Result<(),
         for f in &entry.vector {
             write(&mut w, &f.to_le_bytes())?;
         }
+        // v2: one tier byte AFTER the full vector, BEFORE the text length prefix.
+        write(&mut w, &[entry.tier_level])?;
         let text = entry.text.as_bytes();
         write(&mut w, &(text.len() as u32).to_le_bytes())?;
         write(&mut w, text)?;
@@ -254,7 +262,8 @@ pub fn write_index(path: &std::path::Path, entries: &[IndexEntry]) -> Result<(),
 
 /// Load the `.bin` index fully into memory. Rejects bad magic/version, truncation, an
 /// I/O error, and any vector whose length is not [`EMBED_DIM`] — all as
-/// [`RagError::Index`]. NEVER panics on a malformed file.
+/// [`RagError::Index`]. NEVER panics on a malformed file. The `version != INDEX_VERSION`
+/// guard rejects the v1 layout (no `tier_level` byte) as [`RagError::Index`].
 pub fn load_index(path: &std::path::Path) -> Result<Vec<IndexEntry>, RagError> {
     let bytes = std::fs::read(path)
         .map_err(|e| RagError::Index(format!("read {}: {e}", path.display())))?;
@@ -291,6 +300,8 @@ pub fn load_index(path: &std::path::Path) -> Result<Vec<IndexEntry>, RagError> {
                 vector.len()
             )));
         }
+        // v2: one tier byte AFTER the vector, BEFORE the text length prefix.
+        let tier_level = cur.take_u8()?;
         let text_len = cur.take_u32()? as usize;
         let text = String::from_utf8(cur.take(text_len)?.to_vec())
             .map_err(|e| RagError::Index(format!("entry id {id} text not utf8: {e}")))?;
@@ -300,6 +311,7 @@ pub fn load_index(path: &std::path::Path) -> Result<Vec<IndexEntry>, RagError> {
         entries.push(IndexEntry {
             id,
             vector,
+            tier_level,
             text,
             source,
         });
@@ -336,6 +348,10 @@ impl<'a> Cursor<'a> {
         let out = &self.buf[self.pos..end];
         self.pos = end;
         Ok(out)
+    }
+
+    fn take_u8(&mut self) -> Result<u8, RagError> {
+        Ok(self.take(1)?[0])
     }
 
     fn take_u32(&mut self) -> Result<u32, RagError> {
@@ -657,24 +673,29 @@ mod query {
         std::env::temp_dir().join(format!("eud-agent-rag-test-{tag}-{nanos}.bin"))
     }
 
-    /// Three entries with distinct ids/text/source and distinct (separable) vectors.
+    /// Three entries with distinct ids/text/source/tier and distinct (separable)
+    /// vectors. The `tier_level` values are spread across the L1/L2 source-tier range
+    /// (and a 0) so the v2 layout/round-trip tests exercise a non-trivial tier byte.
     fn sample_entries() -> Vec<IndexEntry> {
         vec![
             IndexEntry {
                 id: 1,
                 vector: vec_with(&[(0, 1.0)]),
+                tier_level: 1,
                 text: "trigger location idiom".to_string(),
                 source: "[ECA chunk 1](https://cafe/edac/1)".to_string(),
             },
             IndexEntry {
                 id: 2,
                 vector: vec_with(&[(1, 1.0)]),
+                tier_level: 2,
                 text: "button set disstr rule".to_string(),
                 source: "[ECA chunk 2](https://cafe/edac/2)".to_string(),
             },
             IndexEntry {
                 id: 3,
                 vector: vec_with(&[(2, 1.0)]),
+                tier_level: 0,
                 text: "eps print idiom".to_string(),
                 source: "[ECA chunk 3](https://cafe/edac/3)".to_string(),
             },
@@ -695,6 +716,11 @@ mod query {
             assert_eq!(got.id, want.id);
             assert_eq!(got.text, want.text);
             assert_eq!(got.source, want.source);
+            // The v2 tier byte must survive write->load (it weights ranking in EUD-157).
+            assert_eq!(
+                got.tier_level, want.tier_level,
+                "tier_level must round-trip exactly"
+            );
             // Vectors must survive bit-for-bit (little-endian f32 records).
             assert_eq!(got.vector, want.vector, "vector must round-trip exactly");
         }
@@ -712,6 +738,74 @@ mod query {
         assert!(
             matches!(err, Err(RagError::Index(_))),
             "a bad/truncated .bin must be RagError::Index, got {err:?}"
+        );
+    }
+
+    /// Golden/differential v2 layout test: hand-build the EXACT expected byte vector
+    /// from first principles (NEVER from `write_index`) and assert `write_index`
+    /// reproduces it byte-for-byte. This independent reference IS the v2 wire-format
+    /// parity contract that the CI index builder (EUD-156) must later match
+    /// byte-for-byte — if this and the builder ever diverge, the published
+    /// `rag-index.bin` becomes unloadable. Authoritative v2 layout (little-endian):
+    ///   header: magic b"ERAG" | version u32 = 2 | count u32
+    ///   entry:  id u64 | vector f32 x EMBED_DIM | tier_level u8 (1 byte)
+    ///           | text(len u32 + utf8) | source(len u32 + utf8)
+    /// The single `tier_level` byte sits AFTER the full vector and BEFORE the text
+    /// length prefix.
+    #[test]
+    fn v2_byte_layout_is_exact() {
+        let entries = sample_entries();
+        let path = unique_temp_file("v2-layout");
+
+        // Build the expected bytes BY HAND (do NOT call write_index to produce these).
+        let mut expected: Vec<u8> = Vec::new();
+        expected.extend_from_slice(b"ERAG");
+        expected.extend_from_slice(&2u32.to_le_bytes()); // INDEX_VERSION = 2
+        expected.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+        for e in &entries {
+            expected.extend_from_slice(&e.id.to_le_bytes());
+            for f in &e.vector {
+                expected.extend_from_slice(&f.to_le_bytes());
+            }
+            // tier_level: exactly one byte, AFTER the vector, BEFORE the text len.
+            expected.push(e.tier_level);
+            let text = e.text.as_bytes();
+            expected.extend_from_slice(&(text.len() as u32).to_le_bytes());
+            expected.extend_from_slice(text);
+            let source = e.source.as_bytes();
+            expected.extend_from_slice(&(source.len() as u32).to_le_bytes());
+            expected.extend_from_slice(source);
+        }
+
+        write_index(&path, &entries).expect("write_index");
+        let actual = std::fs::read(&path).expect("read back written index");
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(
+            actual, expected,
+            "write_index must emit the exact hand-built v2 wire layout"
+        );
+    }
+
+    /// A v1-format file (well-formed header, version=1) must be REJECTED as a typed
+    /// `RagError::Index` (never a panic) now that `INDEX_VERSION` is 2 — the existing
+    /// `version != INDEX_VERSION` guard does this once the constant is bumped.
+    #[test]
+    fn load_index_rejects_v1() {
+        let path = unique_temp_file("v1-reject");
+        // Minimal but well-formed v1 header: magic + version=1 + count=0 (no records).
+        let mut v1: Vec<u8> = Vec::new();
+        v1.extend_from_slice(b"ERAG");
+        v1.extend_from_slice(&1u32.to_le_bytes());
+        v1.extend_from_slice(&0u32.to_le_bytes());
+        std::fs::write(&path, &v1).unwrap();
+
+        let err = load_index(&path);
+        std::fs::remove_file(&path).ok();
+
+        assert!(
+            matches!(err, Err(RagError::Index(_))),
+            "a v1 index must surface as RagError::Index (typed, no panic), got {err:?}"
         );
     }
 
@@ -760,6 +854,7 @@ mod query {
             .map(|i| IndexEntry {
                 id: i,
                 vector: vec_with(&[((i as usize) % EMBED_DIM, 1.0)]),
+                tier_level: 0,
                 text: format!("doc {i}"),
                 source: format!("[doc {i}](https://cafe/edac/{i})"),
             })

@@ -2508,15 +2508,15 @@
       ]
     },
     "EUD-155-2da4": {
-      "status": "pending",
+      "status": "done",
       "priority": "high",
       "type": "task",
       "parent": "EUD-151-e190",
       "depends_on": [],
       "title": "v2 index format: tier_level field in rag.rs write/load",
       "updated": "2026-06-12",
-      "completed_at": null,
-      "path": "active/EUD-155-2da4.md",
+      "completed_at": "2026-06-12T15:59:00.619329",
+      "path": "done/EUD-155-2da4.md",
       "scope": [
         "src-tauri/src/rag.rs"
       ]
