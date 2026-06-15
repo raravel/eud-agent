@@ -9,13 +9,29 @@
 //! picks the editor folder before anything downloads.
 
 use std::path::Path;
+use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
 use tauri_plugin_dialog::DialogExt;
+use tokio::sync::Mutex;
 
 use crate::bootstrap::{self, ProgressEmitter};
 use crate::config::{self, Config, DataDirs};
 use crate::ipc::BridgeManaged;
+
+/// Process-wide bootstrap serialization lock.
+///
+/// Bootstrap has two entry points that can fire concurrently: the startup
+/// auto-bootstrap (`lib.rs`, when an asset is missing but the editor path is set) and
+/// the panel-driven [`bootstrap_run`] command. Both download each asset to a FIXED
+/// `<asset>.tmp` path, so an overlap races on the same tmp — one entrant renames it into
+/// place while the other's `verify_and_place` rename then hits `os error 2` (tmp gone).
+/// Holding this lock for the whole run serializes them; the second entrant re-checks and
+/// finds the asset already `Present`, so it no-ops instead of re-downloading.
+fn bootstrap_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
 
 /// Stable error code for a picked folder that is not an EUD Editor 3 install.
 /// The panel maps codes to user-facing text (rules.md: raw identifiers are never
@@ -100,6 +116,10 @@ pub async fn run_bootstrap<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     dirs: &DataDirs,
 ) -> anyhow::Result<()> {
+    // Serialize concurrent bootstrap runs (auto + panel) so they never race on the
+    // shared `<asset>.tmp` download path. Held for the whole run; the waiter then sees
+    // the asset already placed and no-ops.
+    let _guard = bootstrap_lock().lock().await;
     let emitter = bootstrap::TauriEmitter(app.clone());
     match run_bootstrap_inner(dirs, &emitter).await {
         Ok(()) => {
@@ -406,5 +426,42 @@ mod tests {
         assert!(status.setup_required);
 
         fs::remove_dir_all(&base).ok();
+    }
+
+    /// Regression (concurrent-bootstrap race): `run_bootstrap`'s `bootstrap_lock` must
+    /// serialize overlapping runs so the auto + panel entry points never download to the
+    /// shared `<asset>.tmp` at the same time (the overlap raced one rename into `os error
+    /// 2`). Each task increments an in-flight counter inside the lock and yields, giving
+    /// any unguarded peer a chance to overlap; the peak concurrency must stay 1. Remove
+    /// the lock and the counter climbs to 8 at the yield, failing this assertion.
+    #[tokio::test]
+    async fn bootstrap_lock_serializes_concurrent_runs() {
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        use std::sync::Arc;
+
+        let inflight = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let inflight = inflight.clone();
+            let peak = peak.clone();
+            handles.push(tokio::spawn(async move {
+                let _guard = bootstrap_lock().lock().await;
+                let now = inflight.fetch_add(1, SeqCst) + 1;
+                peak.fetch_max(now, SeqCst);
+                tokio::task::yield_now().await;
+                inflight.fetch_sub(1, SeqCst);
+            }));
+        }
+        for handle in handles {
+            handle.await.unwrap();
+        }
+
+        assert_eq!(
+            peak.load(SeqCst),
+            1,
+            "bootstrap runs must be serialized by bootstrap_lock"
+        );
     }
 }

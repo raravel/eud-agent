@@ -44,8 +44,18 @@ pub const DEFAULT_MODEL_NAME: &str = "BAAI/bge-m3";
 /// by `.github/workflows/build-rag-index.yml` (`{"rag_index":{url,sha256,version}}`).
 /// Fetched when `config.json` has no pinned spec yet (first run); the sha256 inside
 /// pins the asset bytes that `verify_and_place` enforces.
-pub const RAG_MANIFEST_URL: &str =
-    "https://github.com/raravel/eud-agent/releases/latest/download/rag-index.manifest.json";
+///
+/// Resolved against the **dedicated RAG release tag** `rag-index-v<version>`, NOT
+/// `releases/latest`. The RAG index ships on its own tag, decoupled from the app-binary
+/// release (`v*` / the updater's `releases/latest`): `releases/latest` tracks the newest
+/// release overall, so once an app-binary release is published it shadows the RAG release
+/// and the manifest 404s. Pinning the URL to the required index version keeps the two
+/// distributions independent and the URL in lock-step with [`REQUIRED_RAG_INDEX_VERSION`].
+pub fn rag_manifest_url() -> String {
+    format!(
+        "https://github.com/raravel/eud-agent/releases/download/rag-index-v{REQUIRED_RAG_INDEX_VERSION}/rag-index.manifest.json"
+    )
+}
 
 /// On-disk state of an asset relative to its expected [`AssetSpec`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -399,14 +409,14 @@ pub fn parse_release_manifest(bytes: &[u8]) -> anyhow::Result<AssetSpec> {
     })
 }
 
-/// Fetch + parse [`RAG_MANIFEST_URL`]. NOT unit-tested (real HTTP); the parse logic
+/// Fetch + parse [`rag_manifest_url`]. NOT unit-tested (real HTTP); the parse logic
 /// is covered by the `parse_release_manifest` tests.
 pub async fn fetch_release_manifest() -> anyhow::Result<AssetSpec> {
     let client = reqwest::Client::builder()
         .user_agent("eud-agent-bootstrap")
         .build()?;
     let bytes = client
-        .get(RAG_MANIFEST_URL)
+        .get(rag_manifest_url())
         .send()
         .await
         .context("GET rag-index release manifest failed")?
@@ -569,6 +579,23 @@ mod manifest {
             "no final file from a failed/short write"
         );
         fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn rag_manifest_url_targets_dedicated_rag_tag() {
+        // The manifest must resolve against the RAG index's own `rag-index-v<version>`
+        // release tag, NOT `releases/latest` (which the app-binary release shadows -> 404).
+        let url = rag_manifest_url();
+        assert_eq!(
+            url,
+            format!(
+                "https://github.com/raravel/eud-agent/releases/download/rag-index-v{REQUIRED_RAG_INDEX_VERSION}/rag-index.manifest.json"
+            )
+        );
+        assert!(
+            !url.contains("releases/latest"),
+            "RAG manifest must not resolve via releases/latest (app-binary release shadows it)"
+        );
     }
 
     #[test]
