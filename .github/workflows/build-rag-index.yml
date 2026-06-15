@@ -80,6 +80,12 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.manifest.outputs.tag }}
+          # The RAG index is a side-channel artifact, NOT an app release. Never let it
+          # become GitHub's "latest": the updater (releases/latest/download/latest.json)
+          # and the download site both resolve "latest", and a RAG-index-only release
+          # there shadows the app release (latest.json 404 / no installer asset). The app
+          # bootstrap fetches the index by its dedicated rag-index-v* tag, unaffected.
+          make_latest: false
           files: |
             rag-index.bin
             rag-index.bin.sha256

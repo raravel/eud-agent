@@ -152,10 +152,14 @@ try {
 
     # --- Publish ------------------------------------------------------------------------
     Write-Output "creating GitHub release v$Version…"
+    # --latest: explicitly claim "Latest" so the updater endpoint
+    # (releases/latest/download/latest.json) and the download site resolve THIS app
+    # release, never a side-channel rag-index-v* release.
     & gh release create "v$Version" `
         --repo $Repo `
         --title "v$Version" `
         --notes $Notes `
+        --latest `
         $installer.FullName `
         $latestPath
     if ($LASTEXITCODE -ne 0) {
