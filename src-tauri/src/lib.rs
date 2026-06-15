@@ -222,6 +222,7 @@ pub fn run() {
             engine::engine_cancel,
             engine::engine_reset,
             ipc::status,
+            ipc::launch_editor,
             ipc::list,
             ipc::memory_get,
             ipc::memory_save,

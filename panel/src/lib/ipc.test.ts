@@ -142,6 +142,63 @@ describe("request/response messages", () => {
       files: [{ path: "main.eps", ftype: "CUIEps", settable: true }],
     });
   });
+
+  it("treats a no-project list error as state, not a logged failure", async () => {
+    // Editor is up (status ok) but no project is open: `list` returns the
+    // contractual "ERROR: no project". This must NOT log "IPC command failed
+    // (list)"; instead it dispatches a list{error} so the store gates send and
+    // the header chip reads "프로젝트 없음".
+    const { invoke, listen } = makeHarness();
+    invoke.mockImplementation(async (command: string) => {
+      if (command === "status") return { compiling: false, project: "" };
+      if (command === "list") throw new Error("ERROR: no project");
+      return undefined;
+    });
+    const received: ServerMessage[] = [];
+    const logs: { kind: string; text: string }[] = [];
+    const client = new IpcClient({
+      invoke,
+      listen,
+      onMessage: (m) => received.push(m),
+      onLog: (kind, text) => logs.push({ kind, text }),
+    });
+
+    await client.connect();
+    expect(await client.refresh()).toBe(true);
+
+    expect(
+      logs.find((l) => l.text.includes("IPC command failed (list)")),
+    ).toBeUndefined();
+    expect(received).toContainEqual({
+      type: "list",
+      error: "ERROR: no project",
+    });
+  });
+
+  it("still logs a genuine (non-no-project) list failure", async () => {
+    const { invoke, listen } = makeHarness();
+    invoke.mockImplementation(async (command: string) => {
+      if (command === "status") return { compiling: false, project: "map.scx" };
+      if (command === "list") throw new Error("bridge timeout");
+      return undefined;
+    });
+    const logs: { kind: string; text: string }[] = [];
+    const client = new IpcClient({
+      invoke,
+      listen,
+      onMessage: () => {},
+      onLog: (kind, text) => logs.push({ kind, text }),
+    });
+
+    await client.connect();
+    await client.refresh();
+
+    expect(
+      logs.some((l) =>
+        l.text.includes("IPC command failed (list): bridge timeout"),
+      ),
+    ).toBe(true);
+  });
 });
 
 describe("readiness", () => {

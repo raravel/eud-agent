@@ -114,6 +114,9 @@ export default function App() {
   const [codexBusy, setCodexBusy] = useState(false);
   const [codexError, setCodexError] = useState<string | null>(null);
   const codexPollRef = useRef<number | null>(null);
+  // "에디터 켜기": true while the launch_editor command is in flight. The button
+  // re-enables once the editor connects (editorConnected) or the spawn resolves/fails.
+  const [launchPending, setLaunchPending] = useState(false);
   // Self-update banner state: the pending update (null until found) and a
   // session-scoped "나중에" dismissal. The check fires once (guarded by the ref).
   const [update, setUpdate] = useState<UpdateHandle | null>(null);
@@ -614,6 +617,30 @@ export default function App() {
     await clientRef.current?.send({ type: "memory_get" });
   }, [store]);
 
+  // Launch the configured EUD Editor 3 (Header button). The backend spawns the exe;
+  // the existing editor-heartbeat poll flips editorConnected once the bridge is up, so
+  // success needs no extra signal here. Stable error codes map to Korean (raw codes are
+  // never shown). The pending flag clears on resolve/reject; if the spawn succeeds the
+  // button stays disabled anyway once editorConnected turns true.
+  const handleLaunchEditor = useCallback(() => {
+    setLaunchPending(true);
+    void invoke("launch_editor")
+      .then(() => {
+        setLaunchPending(false);
+      })
+      .catch((error) => {
+        setLaunchPending(false);
+        const code = String(error);
+        const message =
+          code === "editor path not configured"
+            ? "에디터 경로가 설정되지 않았습니다. 설정에서 에디터 폴더를 먼저 지정해 주세요."
+            : code === "editor executable not found"
+              ? "에디터 실행 파일을 찾지 못했습니다. 에디터 폴더 경로를 확인해 주세요."
+              : "에디터를 실행하지 못했습니다.";
+        store.log("error", message);
+      });
+  }, [store]);
+
   const handleMemorySave = useCallback(
     async ({ file, content }: { file: MemoryFile; content: string }) => {
       const sent = await clientRef.current?.send({
@@ -659,6 +686,10 @@ export default function App() {
         connected={state.connected}
         phase={state.phase}
         rag={rag}
+        editorConnected={state.editorConnected}
+        hasProject={state.hasProject}
+        launchPending={launchPending}
+        onLaunchEditor={handleLaunchEditor}
         memoryOpen={state.memoryOpen}
         onMemoryOpen={handleMemoryOpen}
       />

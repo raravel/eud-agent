@@ -96,6 +96,15 @@ function formatError(error: unknown): string {
 }
 
 /**
+ * Contractual no-project marker. The bridge returns `ERROR: no project` from `list`
+ * when no project is open. This is an expected steady state, not a failure, so the poll
+ * routes it to the store's no-project path (gates send + drives the header connection
+ * chip) instead of logging a "IPC command failed" line. Case-insensitive substring,
+ * mirroring the store's matcher.
+ */
+const NO_PROJECT_MARKER = "no project";
+
+/**
  * Stateful IPC client. Construct, then call {@link IpcClient.connect}. The
  * client owns listener registration; callers drive commands via
  * {@link IpcClient.send}.
@@ -201,10 +210,14 @@ export class IpcClient {
         if (this.active) this.dispatchPayload("list", list);
       } catch (error) {
         if (this.active) {
-          this.onLog(
-            "unknown",
-            `IPC command failed (list): ${formatError(error)}`,
-          );
+          const detail = formatError(error);
+          if (detail.toLowerCase().includes(NO_PROJECT_MARKER)) {
+            // No open project: feed the store's no-project state (chip + send gate)
+            // and stay silent — never surface it as a failed-command log line.
+            this.dispatchPayload("list", { error: detail });
+          } else {
+            this.onLog("unknown", `IPC command failed (list): ${detail}`);
+          }
         }
       }
     }

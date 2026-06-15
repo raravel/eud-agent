@@ -17,6 +17,33 @@ use tauri::Emitter;
 /// routes this to the setup screen, not the reconnect notice.
 const EDITOR_PATH_NOT_CONFIGURED: &str = "editor path not configured";
 
+/// The single shipped EUD Editor 3 binary at the install root. `editor_path` is
+/// validated to contain `Data\Lua\TriggerEditor` (config::validate_editor_path), and the
+/// install ships exactly one top-level exe by this name, so `launch_editor` resolves it by
+/// a fixed name rather than scanning.
+const EDITOR_EXE_NAME: &str = "EUD Editor 3.exe";
+
+/// Stable error code: the editor path is configured but the expected exe is absent (a
+/// moved/renamed install). The panel maps this to Korean text, never rendering the code.
+const EDITOR_EXE_NOT_FOUND: &str = "editor executable not found";
+
+/// Resolve the launchable editor exe under `editor_path`, or a stable error code.
+///
+/// Pure (string + filesystem-probe only) so the launch command's path/validation logic is
+/// unit-testable without spawning the real editor: empty path → [`EDITOR_PATH_NOT_CONFIGURED`],
+/// missing exe → [`EDITOR_EXE_NOT_FOUND`], otherwise the absolute exe path.
+fn resolve_editor_exe(editor_path: &str) -> Result<std::path::PathBuf, String> {
+    let editor_path = editor_path.trim();
+    if editor_path.is_empty() {
+        return Err(EDITOR_PATH_NOT_CONFIGURED.to_string());
+    }
+    let exe = Path::new(editor_path).join(EDITOR_EXE_NAME);
+    if !exe.is_file() {
+        return Err(EDITOR_EXE_NOT_FOUND.to_string());
+    }
+    Ok(exe)
+}
+
 /// Managed app data-dir state used by bridge-backed IPC commands.
 ///
 /// Commands resolve `config.json` on every call so first-run/editor-path edits take effect
@@ -362,6 +389,40 @@ pub async fn status(state: tauri::State<'_, BridgeManaged>) -> Result<StatusResp
         compiling: snapshot.compiling,
         project: snapshot.project,
     })
+}
+
+/// Launch the configured EUD Editor 3 install.
+///
+/// Resolves `<editor_path>\EUD Editor 3.exe` and spawns it detached, with the install root
+/// as the working directory (mirroring a double-click so the editor finds its `Data\`).
+/// We never wait on or keep the child handle: the app's lifecycle is independent of the
+/// editor (architecture.md), and the panel's existing heartbeat poll flips
+/// `editorConnected` once the bridge comes up — that is the "connected" half of done.
+/// Errors return a stable code (`editor path not configured` / `editor executable not
+/// found`) the panel maps to Korean. The editor is third-party and only ever launched,
+/// never modified.
+#[tauri::command]
+pub async fn launch_editor(state: tauri::State<'_, BridgeManaged>) -> Result<(), String> {
+    let config = state
+        .dirs()
+        .load_config()
+        .map_err(|error| error.to_string())?;
+    let exe = resolve_editor_exe(&config.editor_path)?;
+    // The install root is the exe's parent; use it as cwd.
+    let cwd = exe
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| Path::new(".").to_path_buf());
+    // Spawn off the IPC thread; we drop the child so it runs independently of the app.
+    tauri::async_runtime::spawn_blocking(move || {
+        std::process::Command::new(&exe)
+            .current_dir(&cwd)
+            .spawn()
+            .map(|_child| ())
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 /// List editor files available through the bridge.
@@ -1033,5 +1094,31 @@ mod tests {
                 "stage": "bootstrap"
             }),
         );
+    }
+
+    #[test]
+    fn resolve_editor_exe_maps_unset_missing_and_present() {
+        // Unset editor path -> the first-run code (panel routes to setup).
+        assert_eq!(
+            ipc::resolve_editor_exe("   ").unwrap_err(),
+            "editor path not configured"
+        );
+
+        // Configured path but the exe is absent (moved/renamed install).
+        let base = unique_temp_dir("launch-editor");
+        assert_eq!(
+            ipc::resolve_editor_exe(&base.to_string_lossy()).unwrap_err(),
+            "editor executable not found"
+        );
+
+        // The exe present at the install root resolves to its absolute path.
+        let exe = base.join("EUD Editor 3.exe");
+        fs::write(&exe, b"stub").unwrap();
+        assert_eq!(
+            ipc::resolve_editor_exe(&base.to_string_lossy()).unwrap(),
+            exe
+        );
+
+        fs::remove_dir_all(&base).ok();
     }
 }

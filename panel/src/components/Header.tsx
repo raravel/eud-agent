@@ -5,7 +5,7 @@
  * (`rag_warmup` started → done, elapsed formatted via lib/progress). Korean
  * labels throughout.
  */
-import { BookText, SparklesIcon } from "lucide-react";
+import { BookText, MonitorPlay, SparklesIcon } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
@@ -24,6 +24,18 @@ export interface HeaderProps {
   phase: Phase;
   /** RAG model state + elapsed seconds (App tracks rag_warmup timing). */
   rag?: { state: RagState; elapsedSec?: number };
+  /** Whether the EUD Editor bridge is currently connected (store.editorConnected).
+   *  Drives the "에디터 켜기" button's disabled state — a connected editor must not be
+   *  re-launched (single-instance topology) — and the connection chip's no-project
+   *  suffix. */
+  editorConnected?: boolean;
+  /** Whether a project is open in the editor (store.hasProject). When the editor is
+   *  connected but this is false, the connection chip reads "연결됨 · 프로젝트 없음". */
+  hasProject?: boolean;
+  /** Whether a launch request is in flight (App awaits `launch_editor`). */
+  launchPending?: boolean;
+  /** Launch the configured EUD Editor 3 install. */
+  onLaunchEditor?: () => void;
   /** Open the project-memory overlay. */
   onMemoryOpen?: () => void;
   /** Whether the project-memory overlay is currently visible. */
@@ -38,11 +50,22 @@ interface Pill {
   busy?: boolean;
 }
 
-/** Connection-state label + pill tone from connected/phase. */
-function connState(connected: boolean, phase: Phase): Pill {
+/** Connection-state label + pill tone from connected/phase.
+ *
+ * When the editor is connected but no project is open (`editorConnected && !hasProject`),
+ * the connected label carries a "· 프로젝트 없음" suffix — the no-project state is shown
+ * here rather than as a failed-`list` log line. The suffix is gated on `editorConnected`
+ * so a downed editor (handled by the ConnectionNotice banner) is not mislabeled. */
+function connState(
+  connected: boolean,
+  phase: Phase,
+  editorConnected: boolean,
+  hasProject: boolean,
+): Pill {
   if (connected) {
     return {
-      label: "연결됨",
+      label:
+        editorConnected && !hasProject ? "연결됨 · 프로젝트 없음" : "연결됨",
       tone: "border-emerald-500/30 bg-emerald-500/15 text-emerald-400",
     };
   }
@@ -110,10 +133,14 @@ export function Header({
   connected,
   phase,
   rag,
+  editorConnected = false,
+  hasProject = true,
+  launchPending = false,
+  onLaunchEditor,
   onMemoryOpen,
   memoryOpen = false,
 }: HeaderProps) {
-  const conn = connState(connected, phase);
+  const conn = connState(connected, phase, editorConnected, hasProject);
   const ragInfo = ragPill(rag);
   return (
     <header className="flex items-center justify-between gap-3 border-b border-border bg-card/60 px-4 py-2.5 backdrop-blur">
@@ -138,6 +165,21 @@ export function Header({
         </div>
       </div>
       <div className="flex shrink-0 items-center gap-2">
+        {onLaunchEditor && (
+          <Button
+            type="button"
+            size="sm"
+            variant="outline"
+            className="gap-1.5"
+            // A connected editor must not be re-launched (single-instance topology);
+            // stays visible-but-disabled so the control's home in the header is stable.
+            disabled={editorConnected || launchPending}
+            onClick={onLaunchEditor}
+          >
+            <MonitorPlay className="size-4" aria-hidden="true" />
+            {launchPending ? "여는 중…" : "에디터 켜기"}
+          </Button>
+        )}
         {ragInfo && <StatusPill pill={ragInfo} />}
         <StatusPill pill={conn} />
         {onMemoryOpen && (
