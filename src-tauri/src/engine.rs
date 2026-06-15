@@ -141,6 +141,7 @@ pub enum EngineEvent {
     Progress(ipc::ProgressEvent),
     Error(ipc::ErrorEvent),
     Status(ipc::StatusResponse),
+    Wiki(ipc::WikiResponse),
 }
 
 pub(crate) trait EventSink {
@@ -162,6 +163,21 @@ pub trait ProjectStateProvider: Send + Sync {
     fn render_section(&self) -> String;
 }
 
+/// Provides the dat-edit WIKI `[wiki facts]` prompt section and records accepted
+/// dat edits to the per-project ledger.
+pub trait WikiProvider: Send + Sync {
+    /// Render the `[wiki facts]` prompt section for the current project, or `None`
+    /// when the ledger is empty/disabled (the section is skipped). `query` is the
+    /// current turn text, used to select the most relevant items when the ledger
+    /// exceeds the token budget.
+    fn render_section(&self, query: &str) -> Option<String>;
+
+    /// Upsert the accepted dat edits into the project ledger, persist it, and return
+    /// the updated ledger for emission. Returns `None` when nothing was recorded
+    /// (no accepted dat edits, or the wiki is disabled / the write failed).
+    fn record_accepted(&self, entries: Vec<crate::wiki::LedgerEntry>) -> Option<ipc::WikiResponse>;
+}
+
 #[derive(Clone)]
 pub struct AgentEngineConfig {
     project_state: String,
@@ -169,6 +185,7 @@ pub struct AgentEngineConfig {
     rag_hits: Vec<crate::rag::Hit>,
     memory_provider: Option<Arc<dyn MemoryProvider>>,
     project_state_provider: Option<Arc<dyn ProjectStateProvider>>,
+    wiki_provider: Option<Arc<dyn WikiProvider>>,
 }
 
 impl AgentEngineConfig {
@@ -183,6 +200,7 @@ impl AgentEngineConfig {
             rag_hits,
             memory_provider: None,
             project_state_provider: None,
+            wiki_provider: None,
         }
     }
 
@@ -202,6 +220,20 @@ impl AgentEngineConfig {
     pub fn with_project_state_provider(mut self, provider: Arc<dyn ProjectStateProvider>) -> Self {
         self.project_state_provider = Some(provider);
         self
+    }
+
+    pub fn with_wiki_provider(mut self, provider: Arc<dyn WikiProvider>) -> Self {
+        self.wiki_provider = Some(provider);
+        self
+    }
+
+    /// The `[wiki facts]` section for the prompt, when a provider is wired and the
+    /// ledger is non-empty. `query` (the current turn text) drives query-aware item
+    /// selection when the ledger exceeds the token budget.
+    fn wiki_section_for_prompt(&self, query: &str) -> Option<String> {
+        self.wiki_provider
+            .as_ref()
+            .and_then(|provider| provider.render_section(query))
     }
 
     /// The `[project state]` text for the prompt: a live render when a provider
@@ -286,12 +318,14 @@ impl<D: CodexDriver, S: EventSink> AgentEngine<D, S> {
 
         let memory = self.config.project_memory_for_prompt();
         let project_state = self.config.project_state_for_prompt();
+        let wiki = self.config.wiki_section_for_prompt(&req.text);
         let turn_text = if self.thread_active {
             resume_turn_text(
                 &req.text,
                 &self.config.rag_hits,
                 &project_state,
                 memory.as_deref(),
+                wiki.as_deref(),
             )
         } else {
             format!(
@@ -301,6 +335,7 @@ impl<D: CodexDriver, S: EventSink> AgentEngine<D, S> {
                     &self.config.rag_hits,
                     &project_state,
                     memory.as_deref(),
+                    wiki.as_deref(),
                 ),
                 req.text
             )
@@ -343,11 +378,36 @@ impl<D: CodexDriver, S: EventSink> AgentEngine<D, S> {
     /// answer-only turns leave no journal to archive.
     fn finalize_pending_changeset(&mut self) {
         if self.phase == Phase::ChangesetReview {
-            if let Some(prev) = self.current_request_id.as_deref() {
-                self.append_changeset_episode(prev, "defaulted");
-                let _ = self.journal_store.finalize_undecided_as_accepted(prev);
+            if let Some(prev) = self.current_request_id.clone() {
+                self.append_changeset_episode(&prev, "defaulted");
+                // EUD-070 default-accepts the still-undecided items; mirror the
+                // changeset_decision accept-hook so those applied dat edits reach
+                // the wiki ledger. Collect BEFORE the journal is archived (which
+                // removes it from the in-memory store). Items rejected via partial
+                // reject are already gone from the journal, and explicitly accepted
+                // items carry the same value, so the last-value upsert never records
+                // a rolled-back value nor double-counts.
+                let undecided_wiki_entries = self.collect_undecided_wiki_entries(&prev);
+                let _ = self.journal_store.finalize_undecided_as_accepted(&prev);
+                if let Some(payload) = self.record_accepted_wiki_edits(undecided_wiki_entries) {
+                    let _ = self.sink.emit(EngineEvent::Wiki(payload));
+                }
             }
         }
+    }
+
+    /// Collect the still-undecided dat property changes of a request as wiki ledger
+    /// entries (scope = all, since default-accept applies them all). Returns an empty
+    /// vec when there is no journal/changeset or no dat edits. Must be called BEFORE
+    /// the journal is archived.
+    fn collect_undecided_wiki_entries(&self, request_id: &str) -> Vec<crate::wiki::LedgerEntry> {
+        let Ok(changeset) = self.journal_store.changeset(request_id) else {
+            return Vec::new();
+        };
+        let Some(journal) = self.load_journal(request_id) else {
+            return Vec::new();
+        };
+        crate::wiki::accepted_ledger_entries(&changeset, &journal, &crate::wiki::AcceptedScope::All)
     }
 
     pub async fn plan_feedback(
@@ -404,6 +464,9 @@ impl<D: CodexDriver, S: EventSink> AgentEngine<D, S> {
         );
         let episode_decision = changeset_episode_decision(&req);
         let episode_summary = self.journal_summary(&request_id);
+        // Capture accepted dat edits for the wiki BEFORE a full accept archives the
+        // journal (which removes it from the in-memory store).
+        let accepted_wiki_entries = self.collect_accepted_wiki_entries(&request_id, &req);
         let ok = if partial_accept {
             true
         } else {
@@ -425,9 +488,69 @@ impl<D: CodexDriver, S: EventSink> AgentEngine<D, S> {
                 episode_decision,
                 episode_summary,
             );
+            // Record ONLY accepted dat edits to the per-project wiki ledger, then
+            // emit the updated ledger so the panel stays in sync. Rejects never
+            // reach here with an Accept decision, so the ledger never sees a
+            // rolled-back value. The changeset/journal are read BEFORE this point
+            // (the full-accept archive above already removed the in-memory journal,
+            // so they were captured into `accepted_wiki_entries` earlier).
+            if let Some(payload) = self.record_accepted_wiki_edits(accepted_wiki_entries) {
+                self.sink.emit(EngineEvent::Wiki(payload))?;
+            }
         }
         self.phase = Phase::Idle;
         Ok(())
+    }
+
+    /// Collect the ACCEPTED dat property changes of the current changeset as wiki
+    /// ledger entries. Returns an empty vec when there is no journal/changeset, no
+    /// dat edits, or the decision is a reject (the wiki records accepted dat edits
+    /// only). Must be called BEFORE a full-accept archives the journal.
+    fn collect_accepted_wiki_entries(
+        &self,
+        request_id: &str,
+        req: &ipc::ChangesetDecisionRequest,
+    ) -> Vec<crate::wiki::LedgerEntry> {
+        let scope = match (&req.decision, &req.ids) {
+            (ipc::Decision::Accept, ipc::DecisionIds::All(_)) => crate::wiki::AcceptedScope::All,
+            (ipc::Decision::Accept, ipc::DecisionIds::List(ids)) => {
+                crate::wiki::AcceptedScope::Ids(ids.clone())
+            }
+            // A reject records nothing.
+            (ipc::Decision::Reject, _) => return Vec::new(),
+        };
+        let Ok(changeset) = self.journal_store.changeset(request_id) else {
+            return Vec::new();
+        };
+        let Some(journal) = self.load_journal(request_id) else {
+            return Vec::new();
+        };
+        crate::wiki::accepted_ledger_entries(&changeset, &journal, &scope)
+    }
+
+    /// Load the raw journal for a request so the wiki hook can read each property's
+    /// `ts`. The journal may live only in the in-memory store, so persist it first
+    /// (idempotent and cheap; the executor already persists on each write) and read
+    /// it back through the same loader the summary fallback uses.
+    fn load_journal(&self, request_id: &str) -> Option<journal::Journal> {
+        let _ = self.journal_store.persist(request_id);
+        journal::JournalStore::load(&self.journal_data_dir, request_id).ok()
+    }
+
+    /// Upsert the collected accepted dat edits to the project ledger via the wiki
+    /// provider, returning the updated ledger for emission (or `None` when nothing
+    /// was recorded / no provider is wired).
+    fn record_accepted_wiki_edits(
+        &self,
+        entries: Vec<crate::wiki::LedgerEntry>,
+    ) -> Option<ipc::WikiResponse> {
+        if entries.is_empty() {
+            return None;
+        }
+        self.config
+            .wiki_provider
+            .as_ref()
+            .and_then(|provider| provider.record_accepted(entries))
     }
 
     pub async fn cancel(&mut self) -> Result<(), AgentEngineError> {
@@ -437,11 +560,13 @@ impl<D: CodexDriver, S: EventSink> AgentEngine<D, S> {
 
     fn resume_text(&self, text: &str) -> String {
         let memory = self.config.project_memory_for_prompt();
+        let wiki = self.config.wiki_section_for_prompt(text);
         resume_turn_text(
             text,
             &self.config.rag_hits,
             &self.config.project_state_for_prompt(),
             memory.as_deref(),
+            wiki.as_deref(),
         )
     }
 
@@ -571,6 +696,7 @@ impl EventSink for TauriEventSink {
             EngineEvent::Progress(payload) => ipc::emit_progress(&self.app, payload),
             EngineEvent::Error(payload) => ipc::emit_error(&self.app, payload),
             EngineEvent::Status(payload) => ipc::emit_status(&self.app, payload),
+            EngineEvent::Wiki(payload) => ipc::emit_wiki(&self.app, payload),
         };
         result.map_err(|err| AgentEngineError::new(format!("failed to emit event: {err}")))
     }
@@ -830,6 +956,7 @@ pub fn build_system_prompt(
     rag_hits: &[crate::rag::Hit],
     project_state: &str,
     project_memory: Option<&str>,
+    wiki_facts: Option<&str>,
 ) -> String {
     let _ = request_text;
     let mut parts = vec![
@@ -856,6 +983,10 @@ pub fn build_system_prompt(
         parts.extend([String::new(), memory]);
     }
 
+    if let Some(wiki) = wiki_facts_section(wiki_facts) {
+        parts.extend([String::new(), wiki]);
+    }
+
     parts.extend([
         String::new(),
         reference_context_section(rag_hits),
@@ -879,11 +1010,16 @@ pub fn resume_turn_text(
     rag_hits: &[crate::rag::Hit],
     project_state: &str,
     project_memory: Option<&str>,
+    wiki_facts: Option<&str>,
 ) -> String {
     let mut parts = vec![project_state_section(project_state), String::new()];
 
     if let Some(memory) = project_memory_section(project_memory) {
         parts.extend([memory, String::new()]);
+    }
+
+    if let Some(wiki) = wiki_facts_section(wiki_facts) {
+        parts.extend([wiki, String::new()]);
     }
 
     parts.extend([
@@ -943,6 +1079,22 @@ fn project_memory_section(project_memory: Option<&str>) -> Option<String> {
         Some(memory.to_string())
     } else {
         Some(format!("[project memory]\n{memory}"))
+    }
+}
+
+/// Normalize the dynamic `[wiki facts]` section: skipped when empty, and given the
+/// `[wiki facts]` header if the provider passed a bare body (mirrors
+/// [`project_memory_section`]). Placed BEFORE `[reference context]` so the agent's
+/// last-applied dat values are reference facts, never a mutation trigger.
+fn wiki_facts_section(wiki_facts: Option<&str>) -> Option<String> {
+    let wiki = wiki_facts?.trim();
+    if wiki.is_empty() {
+        return None;
+    }
+    if wiki.starts_with("[wiki facts]") {
+        Some(wiki.to_string())
+    } else {
+        Some(format!("[wiki facts]\n{wiki}"))
     }
 }
 
@@ -1216,7 +1368,10 @@ fn ipc_changeset_item(index: usize, item: journal::ChangesetItem) -> ipc::Change
     let category = if item.path.is_some() { "file" } else { kind };
 
     let mut extra = serde_json::Map::new();
-    extra.insert("kind".to_string(), serde_json::Value::String(kind.to_string()));
+    extra.insert(
+        "kind".to_string(),
+        serde_json::Value::String(kind.to_string()),
+    );
     if let Some(path) = item.path {
         extra.insert("path".to_string(), serde_json::Value::String(path));
     }
@@ -1374,7 +1529,10 @@ mod tests {
         // + diff render (regression: it leaked as category "modified", no path —
         // the panel then fell through to the flat row and showed "modified →").
         assert_eq!(emitted.category, "file");
-        assert_eq!(emitted.extra.get("kind").and_then(Value::as_str), Some("modified"));
+        assert_eq!(
+            emitted.extra.get("kind").and_then(Value::as_str),
+            Some("modified")
+        );
         assert_eq!(
             emitted.extra.get("path").and_then(Value::as_str),
             Some("triggers/main.eps")
@@ -1409,8 +1567,14 @@ mod tests {
         // the family badge (`datTable`), the object index (`objId`), and per-row
         // ids on `properties` (the decision targets a dat group dispatches).
         assert_eq!(emitted.category, "dat");
-        assert_eq!(emitted.extra.get("kind").and_then(Value::as_str), Some("dat"));
-        assert_eq!(emitted.extra.get("dat").and_then(Value::as_str), Some("units"));
+        assert_eq!(
+            emitted.extra.get("kind").and_then(Value::as_str),
+            Some("dat")
+        );
+        assert_eq!(
+            emitted.extra.get("dat").and_then(Value::as_str),
+            Some("units")
+        );
         assert_eq!(
             emitted.extra.get("datTable").and_then(Value::as_str),
             Some("dat")
@@ -1423,7 +1587,10 @@ mod tests {
             .and_then(Value::as_array)
             .expect("dat item carries properties");
         assert_eq!(props[0].get("id").and_then(Value::as_str), Some("dat-1"));
-        assert_eq!(props[0].get("property").and_then(Value::as_str), Some("HitPoints"));
+        assert_eq!(
+            props[0].get("property").and_then(Value::as_str),
+            Some("HitPoints")
+        );
     }
 
     fn sample_hits() -> Vec<crate::rag::Hit> {
@@ -1528,6 +1695,34 @@ mod tests {
         }
     }
 
+    /// A wiki provider backed by a file-backed [`crate::wiki::WikiStore`], so the
+    /// accept-hook's write path is exercised end-to-end (load -> upsert -> save).
+    #[derive(Clone)]
+    struct StoreWikiProvider {
+        wiki_dir: PathBuf,
+    }
+
+    impl WikiProvider for StoreWikiProvider {
+        fn render_section(&self, query: &str) -> Option<String> {
+            crate::wiki::WikiStore::load(Some(self.wiki_dir.clone())).render_section(query)
+        }
+
+        fn record_accepted(
+            &self,
+            entries: Vec<crate::wiki::LedgerEntry>,
+        ) -> Option<ipc::WikiResponse> {
+            let mut store = crate::wiki::WikiStore::load(Some(self.wiki_dir.clone()));
+            if entries.is_empty() {
+                return None;
+            }
+            for entry in entries {
+                store.upsert(entry);
+            }
+            store.save().ok()?;
+            Some(ipc::WikiResponse::from(store.ledger()))
+        }
+    }
+
     fn unique_temp_dir(tag: &str) -> PathBuf {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1610,6 +1805,61 @@ mod tests {
                 },
             )
             .expect("journal entry should record");
+    }
+
+    /// `target` is the `(dat, objId, property)` tuple of a units/weapons/... dat edit.
+    fn record_dat_set_in_memory(
+        store: &journal::JournalStore,
+        request_id: &str,
+        id: &str,
+        seq: u64,
+        target: (&str, u32, &str),
+        new: Value,
+    ) {
+        let (dat, obj_id, property) = target;
+        store
+            .record(
+                request_id,
+                journal::JournalEntry {
+                    id: id.to_string(),
+                    seq,
+                    tool: journal::WriteTool::DatSet,
+                    target: journal::JournalTarget::Dat {
+                        table: journal::DatTable::Dat,
+                        dat: dat.to_string(),
+                        obj_id,
+                        property: property.to_string(),
+                    },
+                    before: journal::Snapshot::DatValue {
+                        value: Value::Null,
+                        was_default: true,
+                    },
+                    after: journal::Snapshot::DatValue {
+                        value: new,
+                        was_default: false,
+                    },
+                    ts: 1_718_000_000 + seq,
+                },
+            )
+            .expect("dat journal entry should record");
+    }
+
+    /// Build an engine wired with BOTH a memory provider and a file-backed wiki
+    /// provider rooted at `wiki_dir`, sharing the on-disk journal at `data_dir`.
+    fn test_engine_with_wiki<D: CodexDriver, S: EventSink>(
+        driver: D,
+        sink: S,
+        memory: ProjectMemory,
+        data_dir: &std::path::Path,
+        wiki_dir: &std::path::Path,
+    ) -> AgentEngine<D, S> {
+        let config = config_with_memory(memory).with_wiki_provider(Arc::new(StoreWikiProvider {
+            wiki_dir: wiki_dir.to_path_buf(),
+        }));
+        let mut engine = AgentEngine::new(driver, sink, config, ToolRuntime::for_tests());
+        engine.journal_store = journal::JournalStore::new(data_dir);
+        engine.journal_data_dir = data_dir.to_path_buf();
+        engine
     }
 
     fn latest_episode(memory: &ProjectMemory) -> Value {
@@ -1875,6 +2125,365 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn accept_records_dat_edits_to_wiki_and_emits_wiki_event() {
+        let base = unique_temp_dir("wiki-accept");
+        let memory = ProjectMemory::new(base.join("memory"), "ExampleProject");
+        let wiki_dir = base.join("wiki");
+        let driver = FakeCodexDriver::scripted([CodexTurnResult::Plan {
+            markdown: "- Buff the marine".to_string(),
+        }]);
+        let sink = CapturingEventSink::default();
+        let sink_handle = sink.clone();
+        let mut engine = test_engine_with_wiki(driver, sink, memory, &base.join("data"), &wiki_dir);
+
+        engine
+            .chat(crate::ipc::ChatRequest {
+                text: "set marine HP to 80".to_string(),
+            })
+            .await
+            .expect("chat should run");
+        let request_id = engine
+            .current_request_id
+            .clone()
+            .expect("chat should create a request id");
+        // A units dat edit (recorded) and a file write (out of wiki scope).
+        record_dat_set_in_memory(
+            &engine.journal_store,
+            &request_id,
+            "dat-hp",
+            1,
+            ("units", 0, "HP"),
+            json!(80),
+        );
+        record_file_write_in_memory(
+            &engine.journal_store,
+            &request_id,
+            "file-write",
+            2,
+            "scripts/main.eps",
+        );
+        engine.phase = Phase::ChangesetReview;
+
+        engine
+            .changeset_decision(crate::ipc::ChangesetDecisionRequest {
+                decision: crate::ipc::Decision::Accept,
+                ids: crate::ipc::DecisionIds::All(crate::ipc::AllLiteral),
+            })
+            .await
+            .expect("accept-all decision should finalize");
+
+        // The ledger persisted exactly the dat edit (file write is out of scope).
+        let store = crate::wiki::WikiStore::load(Some(wiki_dir));
+        assert_eq!(
+            store.ledger().entries.len(),
+            1,
+            "only the dat edit recorded"
+        );
+        let entry = &store.ledger().entries["dat:units:0:HP"];
+        assert_eq!(entry.value, json!(80));
+        assert_eq!(entry.item_name.as_deref(), Some("Terran Marine"));
+        assert!(
+            !entry.edited_by_user,
+            "accept-hook writes editedByUser=false"
+        );
+
+        // A `wiki` event carried the updated ledger to the panel.
+        let wiki_event = sink_handle
+            .events()
+            .into_iter()
+            .find_map(|event| match event {
+                EngineEvent::Wiki(payload) => Some(payload),
+                _ => None,
+            })
+            .expect("accept should emit a wiki event");
+        assert!(wiki_event.entries.contains_key("dat:units:0:HP"));
+
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[tokio::test]
+    async fn reject_does_not_record_dat_edits_to_wiki() {
+        let base = unique_temp_dir("wiki-reject");
+        let memory = ProjectMemory::new(base.join("memory"), "ExampleProject");
+        let wiki_dir = base.join("wiki");
+        let driver = FakeCodexDriver::scripted([CodexTurnResult::Plan {
+            markdown: "- Buff the marine".to_string(),
+        }]);
+        let sink = CapturingEventSink::default();
+        let sink_handle = sink.clone();
+        let mut engine = test_engine_with_wiki(driver, sink, memory, &base.join("data"), &wiki_dir);
+
+        engine
+            .chat(crate::ipc::ChatRequest {
+                text: "set marine HP to 80".to_string(),
+            })
+            .await
+            .expect("chat should run");
+        let request_id = engine
+            .current_request_id
+            .clone()
+            .expect("chat should create a request id");
+        record_dat_set_in_memory(
+            &engine.journal_store,
+            &request_id,
+            "dat-hp",
+            1,
+            ("units", 0, "HP"),
+            json!(80),
+        );
+        engine.phase = Phase::ChangesetReview;
+
+        engine
+            .changeset_decision(crate::ipc::ChangesetDecisionRequest {
+                decision: crate::ipc::Decision::Reject,
+                ids: crate::ipc::DecisionIds::All(crate::ipc::AllLiteral),
+            })
+            .await
+            .expect("reject decision should run");
+
+        // Rejected edits never reach the ledger, and no wiki event is emitted.
+        let store = crate::wiki::WikiStore::load(Some(wiki_dir));
+        assert!(
+            store.ledger().is_empty(),
+            "rejected dat edit must not record"
+        );
+        assert!(
+            !sink_handle
+                .events()
+                .iter()
+                .any(|event| matches!(event, EngineEvent::Wiki(_))),
+            "reject must not emit a wiki event"
+        );
+
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[tokio::test]
+    async fn partial_reject_then_accept_all_keeps_rejected_value_out_of_wiki() {
+        let base = unique_temp_dir("wiki-reject-then-accept");
+        let memory = ProjectMemory::new(base.join("memory"), "ExampleProject");
+        let wiki_dir = base.join("wiki");
+        let driver = FakeCodexDriver::scripted([CodexTurnResult::Plan {
+            markdown: "- Tune two stats".to_string(),
+        }]);
+        let sink = CapturingEventSink::default();
+        let mut engine = test_engine_with_wiki(driver, sink, memory, &base.join("data"), &wiki_dir);
+
+        engine
+            .chat(crate::ipc::ChatRequest {
+                text: "set marine HP to 80 and weapon damage to 6".to_string(),
+            })
+            .await
+            .expect("chat should run");
+        let request_id = engine
+            .current_request_id
+            .clone()
+            .expect("chat should create a request id");
+        // Two dat edits on distinct objIds: HP (will be rejected) and Damage (kept).
+        record_dat_set_in_memory(
+            &engine.journal_store,
+            &request_id,
+            "dat-hp",
+            1,
+            ("units", 0, "HP"),
+            json!(80),
+        );
+        record_dat_set_in_memory(
+            &engine.journal_store,
+            &request_id,
+            "dat-dmg",
+            2,
+            ("weapons", 5, "Damage"),
+            json!(6),
+        );
+        engine
+            .journal_store
+            .persist(&request_id)
+            .expect("journal should persist");
+
+        // Reject only the HP edit. The production reject bridge is a stub, so drive
+        // a genuine partial reject through the journal store with a no-op bridge: the
+        // inverse op "succeeds" and `forget_entries` drops the HP entry. This isolates
+        // the wiki contract (a rolled-back value never re-enters via accept-all) from
+        // the not-yet-wired rollback bridge.
+        struct NoopRollbackBridge;
+        impl journal::JournalBridge for NoopRollbackBridge {
+            type Error = AgentEngineError;
+            fn set_dat_value(
+                &self,
+                _table: journal::DatTable,
+                _obj_id: u32,
+                _property: &str,
+                _value: Value,
+            ) -> Result<(), Self::Error> {
+                Ok(())
+            }
+            fn reset_dat_value(
+                &self,
+                _table: journal::DatTable,
+                _obj_id: u32,
+                _property: &str,
+            ) -> Result<(), Self::Error> {
+                Ok(())
+            }
+            fn write_file(&self, _path: &str, _content: &str) -> Result<(), Self::Error> {
+                Ok(())
+            }
+            fn delete_file(&self, _path: &str) -> Result<(), Self::Error> {
+                Ok(())
+            }
+            fn create_file(
+                &self,
+                _path: &str,
+                _content: &str,
+                _position: Option<usize>,
+            ) -> Result<(), Self::Error> {
+                Ok(())
+            }
+            fn rename_path(&self, _from: &str, _to: &str) -> Result<(), Self::Error> {
+                Ok(())
+            }
+            fn set_main(&self, _path: Option<&str>) -> Result<(), Self::Error> {
+                Ok(())
+            }
+            fn set_setting(&self, _key: &str, _value: Value) -> Result<(), Self::Error> {
+                Ok(())
+            }
+            fn plugin_add(
+                &self,
+                _plugin_id: &str,
+                _texts: Vec<String>,
+                _index: usize,
+            ) -> Result<(), Self::Error> {
+                Ok(())
+            }
+            fn plugin_edit(
+                &self,
+                _plugin_id: &str,
+                _texts: Vec<String>,
+                _index: usize,
+            ) -> Result<(), Self::Error> {
+                Ok(())
+            }
+            fn plugin_remove(&self, _plugin_id: &str) -> Result<(), Self::Error> {
+                Ok(())
+            }
+            fn plugin_move(&self, _plugin_id: &str, _index: usize) -> Result<(), Self::Error> {
+                Ok(())
+            }
+            fn restore_map_backup(
+                &self,
+                _map_path: &str,
+                _backup_path: &str,
+            ) -> Result<(), Self::Error> {
+                Ok(())
+            }
+        }
+        engine
+            .journal_store
+            .decide(
+                &request_id,
+                journal::ChangesetDecision::reject(journal::DecisionIds::Items(vec![
+                    "dat-hp".to_string()
+                ])),
+                &NoopRollbackBridge,
+            )
+            .expect("partial reject should roll back and forget the HP edit");
+
+        // Then accept everything still pending (panel sends "all").
+        engine.phase = Phase::ChangesetReview;
+        engine
+            .changeset_decision(crate::ipc::ChangesetDecisionRequest {
+                decision: crate::ipc::Decision::Accept,
+                ids: crate::ipc::DecisionIds::All(crate::ipc::AllLiteral),
+            })
+            .await
+            .expect("accept-all decision should finalize");
+
+        let store = crate::wiki::WikiStore::load(Some(wiki_dir));
+        assert!(
+            !store.ledger().entries.contains_key("dat:units:0:HP"),
+            "rolled-back HP must never enter the ledger via a later accept-all"
+        );
+        let kept = store
+            .ledger()
+            .entries
+            .get("dat:weapons:5:Damage")
+            .expect("the kept dat edit is recorded");
+        assert_eq!(kept.value, json!(6));
+
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[tokio::test]
+    async fn default_accept_on_finalize_records_undecided_dat_edit_to_wiki() {
+        let base = unique_temp_dir("wiki-default-accept");
+        let memory = ProjectMemory::new(base.join("memory"), "ExampleProject");
+        let wiki_dir = base.join("wiki");
+        let driver = FakeCodexDriver::scripted([
+            CodexTurnResult::Plan {
+                markdown: "- Buff the marine".to_string(),
+            },
+            CodexTurnResult::Answer {
+                text: "Next answer.".to_string(),
+            },
+        ]);
+        let sink = CapturingEventSink::default();
+        let sink_handle = sink.clone();
+        let mut engine = test_engine_with_wiki(driver, sink, memory, &base.join("data"), &wiki_dir);
+
+        engine
+            .chat(crate::ipc::ChatRequest {
+                text: "set marine HP to 80".to_string(),
+            })
+            .await
+            .expect("first chat should run");
+        let request_id = engine
+            .current_request_id
+            .clone()
+            .expect("chat should create a request id");
+        record_dat_set_in_memory(
+            &engine.journal_store,
+            &request_id,
+            "dat-hp",
+            1,
+            ("units", 0, "HP"),
+            json!(80),
+        );
+        engine
+            .journal_store
+            .persist(&request_id)
+            .expect("journal should persist");
+        // Leave the item UNDECIDED: a second chat triggers finalize (EUD-070).
+        engine.phase = Phase::ChangesetReview;
+
+        engine
+            .chat(crate::ipc::ChatRequest {
+                text: "anything else".to_string(),
+            })
+            .await
+            .expect("second chat should default-accept and run");
+
+        // The default-accepted dat edit reached the ledger and emitted a wiki event.
+        let store = crate::wiki::WikiStore::load(Some(wiki_dir));
+        let entry = store
+            .ledger()
+            .entries
+            .get("dat:units:0:HP")
+            .expect("default-accepted dat edit must be recorded");
+        assert_eq!(entry.value, json!(80));
+        assert!(
+            sink_handle
+                .events()
+                .iter()
+                .any(|event| matches!(event, EngineEvent::Wiki(_))),
+            "default-accept must emit a wiki event"
+        );
+
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[tokio::test]
     async fn accepted_episode_summarizes_live_unpersisted_journal_entries() {
         let (base, memory) = memory_store("episode-live-journal");
         let driver = FakeCodexDriver::scripted([CodexTurnResult::Plan {
@@ -2090,6 +2699,7 @@ mod tests {
             &hits,
             "[project state]\nproject=Sample compiling=false",
             None,
+            None,
         );
 
         let first_principles = prompt
@@ -2112,6 +2722,7 @@ mod tests {
             "How do I write a death-counter loop in eps?",
             &hits,
             "[project state]\nproject=Sample compiling=false",
+            None,
             None,
         );
 
@@ -2136,12 +2747,69 @@ mod tests {
     }
 
     #[test]
+    fn wiki_facts_render_after_memory_and_before_reference_context_when_present() {
+        let hits = sample_hits();
+        let wiki = "[wiki facts]\nNOTE: agent-applied last values; may differ from the live map.\n## dat units\n- Terran Marine\n  - HP = 80";
+        let prompt = build_system_prompt(
+            "buff the marine",
+            &hits,
+            "[project state]\nproject=Sample compiling=false",
+            Some("[project memory]\n## resources\nSwitch 1 = boss"),
+            Some(wiki),
+        );
+
+        let memory = prompt
+            .find("[project memory]")
+            .expect("memory section present");
+        let wiki_facts = prompt.find("[wiki facts]").expect("wiki section present");
+        let reference = prompt
+            .find("[reference context]")
+            .expect("reference section present");
+        assert!(memory < wiki_facts, "[project memory] before [wiki facts]");
+        assert!(
+            wiki_facts < reference,
+            "[wiki facts] before [reference context]"
+        );
+        assert!(prompt.contains("may differ from the live map"));
+
+        // Omitted -> no section, no header.
+        let without = build_system_prompt(
+            "buff the marine",
+            &hits,
+            "[project state]\nproject=Sample compiling=false",
+            None,
+            None,
+        );
+        assert!(!without.contains("[wiki facts]"));
+    }
+
+    #[test]
+    fn resume_turn_text_injects_wiki_facts_before_reference_context() {
+        let hits = sample_hits();
+        let turn = resume_turn_text(
+            "what is the marine HP?",
+            &hits,
+            "[project state]\nproject=Sample compiling=false",
+            None,
+            Some("## dat units\n- Terran Marine\n  - HP = 80"),
+        );
+        let wiki_facts = turn
+            .find("[wiki facts]")
+            .expect("bare wiki body gets the [wiki facts] header");
+        let reference = turn
+            .find("[reference context]")
+            .expect("reference section present");
+        assert!(wiki_facts < reference);
+    }
+
+    #[test]
     fn system_prompt_contains_required_sections() {
         let hits = sample_hits();
         let prompt = build_system_prompt(
             "Explain a safe location workflow",
             &hits,
             "[project state]\nproject=Sample compiling=false",
+            None,
             None,
         );
 
@@ -2166,6 +2834,7 @@ mod tests {
             user_text,
             &hits,
             "[project state]\nproject=Sample compiling=false",
+            None,
             None,
         );
 

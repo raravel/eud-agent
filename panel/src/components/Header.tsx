@@ -5,9 +5,15 @@
  * (`rag_warmup` started → done, elapsed formatted via lib/progress). Korean
  * labels throughout.
  */
-import { BookText, MonitorPlay, SparklesIcon } from "lucide-react";
+import { BookText, Database, MonitorPlay, SparklesIcon } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
 import { formatElapsed } from "@/lib/progress";
 import type { Phase } from "@/state/store";
@@ -40,6 +46,10 @@ export interface HeaderProps {
   onMemoryOpen?: () => void;
   /** Whether the project-memory overlay is currently visible. */
   memoryOpen?: boolean;
+  /** Open the dat-edit wiki overlay. */
+  onWikiOpen?: () => void;
+  /** Whether the dat-edit wiki overlay is currently visible. */
+  wikiOpen?: boolean;
 }
 
 /** One status pill descriptor: label + tone classes + whether it is in flight. */
@@ -139,10 +149,13 @@ export function Header({
   onLaunchEditor,
   onMemoryOpen,
   memoryOpen = false,
+  onWikiOpen,
+  wikiOpen = false,
 }: HeaderProps) {
   const conn = connState(connected, phase, editorConnected, hasProject);
   const ragInfo = ragPill(rag);
   return (
+    <TooltipProvider delayDuration={300}>
     <header className="flex items-center justify-between gap-3 border-b border-border bg-card/60 px-4 py-2.5 backdrop-blur">
       {/* Branding tile + title + project context (same identity tile as the
           SetupScreen, scaled down). */}
@@ -182,19 +195,42 @@ export function Header({
         )}
         {ragInfo && <StatusPill pill={ragInfo} />}
         <StatusPill pill={conn} />
+        {onWikiOpen && (
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                type="button"
+                size="icon"
+                variant="ghost"
+                aria-label="dat 편집 위키"
+                aria-pressed={wikiOpen}
+                onClick={onWikiOpen}
+              >
+                <Database className="size-4" aria-hidden="true" />
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent>dat 편집 위키</TooltipContent>
+          </Tooltip>
+        )}
         {onMemoryOpen && (
-          <Button
-            type="button"
-            size="icon"
-            variant="ghost"
-            aria-label="메모리"
-            aria-pressed={memoryOpen}
-            onClick={onMemoryOpen}
-          >
-            <BookText className="size-4" aria-hidden="true" />
-          </Button>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                type="button"
+                size="icon"
+                variant="ghost"
+                aria-label="메모리"
+                aria-pressed={memoryOpen}
+                onClick={onMemoryOpen}
+              >
+                <BookText className="size-4" aria-hidden="true" />
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent>메모리</TooltipContent>
+          </Tooltip>
         )}
       </div>
     </header>
+    </TooltipProvider>
   );
 }

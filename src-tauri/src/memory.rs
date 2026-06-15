@@ -357,7 +357,11 @@ fn is_invalid_windows_filename_char(ch: char) -> bool {
     matches!(ch, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*') || (ch as u32) <= 0x1f
 }
 
-fn write_atomic_bytes(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+/// Atomically write `bytes` to `path` (temp + rename) as raw bytes (no BOM).
+///
+/// Shared with [`crate::wiki`] so the dat-edit ledger lands beside the project's
+/// memory dir with the SAME write semantics (UTF-8 without BOM, crash-safe rename).
+pub(crate) fn write_atomic_bytes(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }

@@ -392,6 +392,15 @@ impl JournalStore {
 
                 if matches!(ids, DecisionIds::All) {
                     self.archive(request_id)?;
+                } else {
+                    // A partial reject rolled the rejected entries back via the
+                    // inverse ops above; drop them from the journal so the rebuilt
+                    // changeset (and any later default-accept / accept-all) never
+                    // resurrects a rolled-back value into the wiki ledger. The
+                    // still-undecided entries stay for EUD-070 default-accept.
+                    let rejected_ids: Vec<String> =
+                        rejected.iter().map(|entry| entry.id.clone()).collect();
+                    self.forget_entries(request_id, &rejected_ids)?;
                 }
                 Ok(())
             }
@@ -400,6 +409,23 @@ impl JournalStore {
 
     pub fn finalize_undecided_as_accepted(&self, request_id: &str) -> Result<(), JournalError> {
         self.archive(request_id)
+    }
+
+    /// Drop the listed entry ids from the in-memory journal and re-persist it, so a
+    /// rebuilt changeset omits them. Used by partial reject after its inverse ops
+    /// have rolled the rejected entries back. A no-op (returns `Ok`) when no journal
+    /// is loaded for the request.
+    fn forget_entries(&self, request_id: &str, ids: &[String]) -> Result<(), JournalError> {
+        {
+            let mut journals = lock(&self.journals)?;
+            let Some(journal) = journals.get_mut(request_id) else {
+                return Ok(());
+            };
+            journal
+                .entries
+                .retain(|entry| !ids.iter().any(|id| id == &entry.id));
+        }
+        self.persist(request_id)
     }
 
     pub fn begin_decision(&self, request_id: &str) -> Result<DecisionGuard, JournalError> {
@@ -1243,12 +1269,7 @@ mod tests {
         dat_target_named(table, "", obj_id, property)
     }
 
-    fn dat_target_named(
-        table: DatTable,
-        dat: &str,
-        obj_id: u32,
-        property: &str,
-    ) -> JournalTarget {
+    fn dat_target_named(table: DatTable, dat: &str, obj_id: u32, property: &str) -> JournalTarget {
         JournalTarget::Dat {
             table,
             dat: dat.to_owned(),
@@ -1851,6 +1872,94 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn partial_reject_removes_rejected_entry_from_journal_so_changeset_omits_it() {
+        let data_dir = temp_data_dir("partial-reject-forget");
+        let store = JournalStore::new(&data_dir);
+        let request_id = "req-partial-reject";
+
+        // Two dat props on distinct objIds: reject one, keep the other.
+        store
+            .record(
+                request_id,
+                entry(
+                    "dat-hp",
+                    1,
+                    WriteTool::DatSet,
+                    dat_target_named(DatTable::Dat, "units", 0, "HP"),
+                    Snapshot::DatValue {
+                        value: json!(40),
+                        was_default: false,
+                    },
+                    Snapshot::DatValue {
+                        value: json!(80),
+                        was_default: false,
+                    },
+                ),
+            )
+            .expect("hp entry should record");
+        store
+            .record(
+                request_id,
+                entry(
+                    "dat-dmg",
+                    2,
+                    WriteTool::DatSet,
+                    dat_target_named(DatTable::Dat, "weapons", 5, "Damage"),
+                    Snapshot::DatValue {
+                        value: json!(5),
+                        was_default: false,
+                    },
+                    Snapshot::DatValue {
+                        value: json!(6),
+                        was_default: false,
+                    },
+                ),
+            )
+            .expect("dmg entry should record");
+        store.persist(request_id).expect("journal should persist");
+
+        let bridge = FakeBridge::default();
+        store
+            .decide(
+                request_id,
+                ChangesetDecision::reject(DecisionIds::Items(vec!["dat-hp".to_owned()])),
+                &bridge,
+            )
+            .expect("partial reject should roll back the HP edit");
+
+        // The inverse re-set the rejected HP to its old value.
+        assert_eq!(
+            bridge.ops(),
+            vec![AppliedInverse::DatSet {
+                table: DatTable::Dat,
+                obj_id: 0,
+                property: "HP".to_owned(),
+                value: json!(40),
+            }]
+        );
+
+        // The rebuilt changeset (the source a later accept-all reads) must no longer
+        // contain the rolled-back HP entry, only the kept Damage entry.
+        let changeset = store
+            .changeset(request_id)
+            .expect("changeset should rebuild after partial reject");
+        assert!(
+            changeset
+                .items
+                .iter()
+                .all(|item| item.id != "dat:Dat:units:0"),
+            "rejected dat entry must be gone from the journal/changeset"
+        );
+        let kept = changeset
+            .items
+            .iter()
+            .find(|item| item.id == "dat:Dat:weapons:5")
+            .expect("kept entry remains");
+        assert_eq!(kept.properties.len(), 1);
+        assert_eq!(kept.properties[0].new, json!(6));
     }
 
     #[test]

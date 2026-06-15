@@ -26,6 +26,7 @@ pub mod rag;
 pub mod setup;
 pub mod tool_exec;
 pub mod tools;
+pub mod wiki;
 
 #[derive(Clone)]
 struct AppMemoryProvider {
@@ -52,6 +53,52 @@ impl engine::MemoryProvider for AppMemoryProvider {
 
     fn append_episode(&self, episode: &serde_json::Value) -> bool {
         self.current_memory().append_episode(episode)
+    }
+}
+
+/// Resolves the current project from the editor STATUS and reads/writes its
+/// dat-edit wiki ledger, so `[wiki facts]` and the accept-hook always target the
+/// project the editor currently has open (like [`AppMemoryProvider`]).
+#[derive(Clone)]
+struct AppWikiProvider {
+    dirs: config::DataDirs,
+}
+
+impl AppWikiProvider {
+    fn current_project(&self) -> String {
+        match ipc::bridge_from_config(&self.dirs).and_then(|bridge| {
+            bridge
+                .read_status_snapshot(bridge_io::HEARTBEAT_STALE_AFTER)
+                .map_err(|error| error.to_string())
+        }) {
+            Ok(snapshot) => snapshot.project,
+            Err(_) => String::new(),
+        }
+    }
+
+    fn current_store(&self) -> wiki::WikiStore {
+        wiki::WikiStore::load(self.dirs.wiki_dir(&self.current_project()))
+    }
+}
+
+impl engine::WikiProvider for AppWikiProvider {
+    fn render_section(&self, query: &str) -> Option<String> {
+        self.current_store().render_section(query)
+    }
+
+    fn record_accepted(&self, entries: Vec<wiki::LedgerEntry>) -> Option<ipc::WikiResponse> {
+        let mut store = self.current_store();
+        if !store.enabled() || entries.is_empty() {
+            return None;
+        }
+        for entry in entries {
+            store.upsert(entry);
+        }
+        if let Err(error) = store.save() {
+            eprintln!("eud-agent: wiki ledger save failed: {error}");
+            return None;
+        }
+        Some(ipc::WikiResponse::from(store.ledger()))
     }
 }
 
@@ -205,6 +252,9 @@ pub fn run() {
                     .with_memory_provider(std::sync::Arc::new(AppMemoryProvider {
                         dirs: data_dirs.clone(),
                     }))
+                    .with_wiki_provider(std::sync::Arc::new(AppWikiProvider {
+                        dirs: data_dirs.clone(),
+                    }))
                     .with_project_state_provider(std::sync::Arc::new(AppProjectStateProvider {
                         dirs: data_dirs,
                     }));
@@ -226,6 +276,8 @@ pub fn run() {
             ipc::list,
             ipc::memory_get,
             ipc::memory_save,
+            ipc::wiki_get,
+            ipc::wiki_save,
             setup::setup_status,
             setup::setup_pick_editor_path,
             setup::bootstrap_run,

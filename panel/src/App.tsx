@@ -30,11 +30,15 @@ import { ConversationLog } from "@/components/ConversationLog";
 import { ChangesetView } from "@/components/ChangesetView";
 import { PlanView } from "@/components/PlanView";
 import { MemoryView } from "@/components/MemoryView";
+import { WikiView } from "@/components/WikiView";
 import { InstructionBox, type ChatPayload } from "@/components/InstructionBox";
 import { ConnectionNotice } from "@/components/ConnectionNotice";
 import { createPanelStore } from "@/state/store";
 import {
   IpcClient,
+  wikiGet,
+  wikiSave,
+  type LedgerEntry,
   type MemoryFile,
   type ServerMessage,
   type SetupMessage,
@@ -117,6 +121,9 @@ export default function App() {
   // "에디터 켜기": true while the launch_editor command is in flight. The button
   // re-enables once the editor connects (editorConnected) or the spawn resolves/fails.
   const [launchPending, setLaunchPending] = useState(false);
+  // dat-edit wiki overlay (App-local UI state, like the memory overlay but the
+  // ledger flows over the dedicated wiki_get/wiki_save commands + `wiki` push).
+  const [wikiOpen, setWikiOpen] = useState(false);
   // Self-update banner state: the pending update (null until found) and a
   // session-scoped "나중에" dismissal. The check fires once (guarded by the ref).
   const [update, setUpdate] = useState<UpdateHandle | null>(null);
@@ -172,6 +179,11 @@ export default function App() {
         case "memory_saved":
           store.memorySaved(msg.file);
           store.log("ok", "메모리를 저장했습니다.");
+          break;
+        case "wiki":
+          // Push after every accept that records a dat edit — keep the ledger
+          // snapshot in sync whether or not the overlay is open.
+          store.wikiReceived(msg.version, msg.entries);
           break;
         case "setup":
           setSetup(msg);
@@ -612,10 +624,53 @@ export default function App() {
     [store],
   );
 
+  // Toggle the project-memory overlay (mutually exclusive with the wiki
+  // sidebar). Opening pulls the memory snapshot; clicking again closes it.
   const handleMemoryOpen = useCallback(async () => {
+    if (store.getState().memoryOpen) {
+      store.memoryClosed();
+      return;
+    }
     store.memoryOpened();
+    setWikiOpen(false);
     await clientRef.current?.send({ type: "memory_get" });
   }, [store]);
+
+  // Toggle the dat-edit wiki sidebar (mutually exclusive with the memory
+  // overlay). Opening pulls the current ledger via wiki_get so WikiView renders
+  // the live tree; closing just hides the sidebar (the store keeps the snapshot
+  // for the next open).
+  const handleWikiOpen = useCallback(async () => {
+    if (wikiOpen) {
+      setWikiOpen(false);
+      return;
+    }
+    setWikiOpen(true);
+    store.memoryClosed();
+    try {
+      const msg = await wikiGet();
+      store.wikiReceived(msg.version, msg.entries);
+    } catch (error) {
+      // No open project (or a wiki_get error): surface it as a log line; the
+      // sidebar still opens showing the last known / empty ledger.
+      store.log("warn", `위키를 불러오지 못했습니다: ${String(error)}`);
+    }
+  }, [store, wikiOpen]);
+
+  // Persist user-corrected wiki entries; the core flips editedByUser=true and
+  // pushes the refreshed ledger (also returned here) which re-syncs the store.
+  const handleWikiSave = useCallback(
+    async (entries: Record<string, LedgerEntry>) => {
+      try {
+        const msg = await wikiSave(entries);
+        store.wikiReceived(msg.version, msg.entries);
+        store.log("ok", "위키를 저장했습니다.");
+      } catch (error) {
+        store.log("error", `위키 저장에 실패했습니다: ${String(error)}`);
+      }
+    },
+    [store],
+  );
 
   // Launch the configured EUD Editor 3 (Header button). The backend spawns the exe;
   // the existing editor-heartbeat poll flips editorConnected once the bridge is up, so
@@ -677,10 +732,21 @@ export default function App() {
   }
 
   return (
-    <div className="flex h-screen flex-col bg-background text-foreground">
+    <div className="flex h-screen bg-background text-foreground">
       {/* Transient problem alerts (error/warn log entries). Bottom-right so it
           never covers the Header status pills (top-right). */}
       <Toaster position="bottom-right" richColors closeButton />
+      {/* dat-edit wiki: a permanent, drag-resizable LEFT sidebar with a
+          mobile-style category → item → editor drilldown. Toggled by the
+          Header wiki button; the rest of the app is the right column. */}
+      {wikiOpen && (
+        <WikiView
+          wiki={state.wikiData ?? { version: 1, entries: {} }}
+          onClose={() => setWikiOpen(false)}
+          onSave={handleWikiSave}
+        />
+      )}
+      <div className="flex min-w-0 flex-1 flex-col">
       <Header
         project={state.project}
         connected={state.connected}
@@ -692,6 +758,8 @@ export default function App() {
         onLaunchEditor={handleLaunchEditor}
         memoryOpen={state.memoryOpen}
         onMemoryOpen={handleMemoryOpen}
+        wikiOpen={wikiOpen}
+        onWikiOpen={handleWikiOpen}
       />
 
       {update && !updateDismissed && (
@@ -759,6 +827,7 @@ export default function App() {
       )}
 
       <InstructionBox state={state} onSend={handleSend} onReset={handleReset} />
+      </div>
     </div>
   );
 }

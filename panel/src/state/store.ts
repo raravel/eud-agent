@@ -37,6 +37,7 @@ import type {
   ChangesetItem,
   Episode,
   FileEntry,
+  LedgerEntry,
   MemoryFile,
   ProgressStage,
 } from "@/lib/ipc";
@@ -203,6 +204,17 @@ export interface ChangesetState {
   decisions: Record<string, ItemDecision>;
 }
 
+/**
+ * The dat-edit wiki ledger snapshot (last-value entries the agent applied and
+ * the user accepted). Mirrors the Rust `WikiResponse` (`{version, entries}`);
+ * `entries` is keyed by `"{table}:{dat}:{objId}:{property}"`. Pushed after every
+ * accept that records >= 1 dat edit and on `wiki_get`/`wiki_save`.
+ */
+export interface WikiState {
+  version: number;
+  entries: Record<string, LedgerEntry>;
+}
+
 /** Editable project memory snapshot + per-tab draft state. */
 export interface MemoryViewState {
   project: string;
@@ -254,6 +266,11 @@ export interface PanelState {
   memoryOpen: boolean;
   /** Project memory snapshot/drafts (null until `memory` arrives). */
   memory: MemoryViewState | null;
+  /**
+   * The dat-edit wiki ledger (null until the first `wiki` event / `wiki_get`).
+   * Kept in sync by the server's push after every accept that records a dat edit.
+   */
+  wikiData: WikiState | null;
   /**
    * The changeset_decision in flight (recorded on send, cleared when its
    * `rollback_result` lands). Exposed so the UI can label the result per the
@@ -326,6 +343,11 @@ export interface PanelStore {
   ): void;
   /** `memory_saved` - commit the saved draft and clear that tab's dirty flag. */
   memorySaved(file: MemoryFile): void;
+  /**
+   * `wiki` (push event, or the resolved value of `wiki_get`/`wiki_save`) -
+   * replace the dat-edit ledger snapshot.
+   */
+  wikiReceived(version: number, entries: Record<string, LedgerEntry>): void;
 
   // ---- user intents (UI drives these after a successful send) ----
   /** A chat was sent → thinking (from ready or changeset_review). */
@@ -441,6 +463,9 @@ export function createPanelStore(): PanelStore {
     changeset: null as ChangesetState | null,
     memoryOpen: false,
     memory: null as MemoryViewState | null,
+    // The dat-edit wiki ledger snapshot (null until the first `wiki` event /
+    // wiki_get). Replaced wholesale by wikiReceived.
+    wikiData: null as WikiState | null,
     // Per-turn streaming buffers (reasoning / answer / tools). Reset whenever a
     // new turn starts (chat / plan_feedback / plan_approve / reset).
     turn: emptyTurn(),
@@ -486,6 +511,7 @@ export function createPanelStore(): PanelStore {
       changeset: core.changeset,
       memoryOpen: core.memoryOpen,
       memory: core.memory,
+      wikiData: core.wikiData,
       pendingDecision: core.pendingDecision,
       turn: core.turn,
       rag: core.rag,
@@ -943,6 +969,11 @@ export function createPanelStore(): PanelStore {
         drafts,
         dirty: { ...core.memory.dirty, [file]: false },
       };
+      emit();
+    },
+
+    wikiReceived(version, entries) {
+      core.wikiData = { version, entries };
       emit();
     },
 

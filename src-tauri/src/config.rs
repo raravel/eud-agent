@@ -128,6 +128,19 @@ impl DataDirs {
         self.app_data.join("map_backups")
     }
 
+    /// `%appdata%\eud-agent\memory\<sanitized-project>\wiki` — the dat-edit ledger
+    /// dir for `project`. Derived from [`Self::memory_dir`] + the SAME
+    /// [`crate::memory::sanitize_project_name`] so the wiki lands beside the
+    /// project's memory dir. Returns `None` for an empty/whitespace project name
+    /// (mirrors the disabled-store behavior of [`crate::memory::ProjectMemory`]).
+    pub fn wiki_dir(&self, project: &str) -> Option<PathBuf> {
+        let sanitized = crate::memory::sanitize_project_name(project);
+        if sanitized.is_empty() {
+            return None;
+        }
+        Some(self.memory_dir().join(sanitized).join("wiki"))
+    }
+
     /// `%appdata%\eud-agent\journal`.
     pub fn journal_dir(&self) -> PathBuf {
         self.app_data.join("journal")
@@ -332,6 +345,21 @@ mod tests {
             dirs.config_path(),
             PathBuf::from("C:\\roam\\eud-agent\\config.json")
         );
+    }
+
+    #[test]
+    fn wiki_dir_lives_beside_project_memory_and_disables_on_empty_name() {
+        let dirs = DataDirs::from_bases(&PathBuf::from("C:\\roam"), &PathBuf::from("C:\\loc"));
+        // Sanitized project name + `wiki` under the memory dir (beside memory/<project>).
+        assert_eq!(
+            dirs.wiki_dir("My<Project>"),
+            Some(PathBuf::from(
+                "C:\\roam\\eud-agent\\memory\\My_Project_\\wiki"
+            ))
+        );
+        // Empty/whitespace project name disables the wiki (mirrors memory).
+        assert_eq!(dirs.wiki_dir("   "), None);
+        assert_eq!(dirs.wiki_dir(""), None);
     }
 
     #[test]

@@ -466,7 +466,16 @@ impl ToolRuntime {
         // later real rollback re-sets it rather than resetting again.
         let property = if kind == "tbl" { "text" } else { param };
         let dat = if kind == "tbl" { "" } else { dat };
-        self.record_dat(request_id, tool, table, dat, obj_id, property, old, Value::Null)?;
+        self.record_dat(
+            request_id,
+            tool,
+            table,
+            dat,
+            obj_id,
+            property,
+            old,
+            Value::Null,
+        )?;
         Ok(json!({ "ok": true, "result": reply.trim() }))
     }
 
@@ -1119,7 +1128,10 @@ mod tests {
         assert_eq!(normalize_create_path("main", "CUIEps"), "main");
         // A leaf that is only the extension is left intact.
         assert_eq!(normalize_create_path(".eps", "CUIEps"), ".eps");
-        assert_eq!(normalize_create_path("folder/.eps", "CUIEps"), "folder/.eps");
+        assert_eq!(
+            normalize_create_path("folder/.eps", "CUIEps"),
+            "folder/.eps"
+        );
         // RawText keeps its extension (part of the user-chosen name); CUIPy is
         // left untouched until verified.
         assert_eq!(normalize_create_path("notes.txt", "RawText"), "notes.txt");

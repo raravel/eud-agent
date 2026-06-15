@@ -16,8 +16,10 @@ import { listen as tauriListen } from "@tauri-apps/api/event";
 import {
   isServerMessage,
   type ClientMessage,
+  type LedgerEntry,
   type ServerMessage,
   type ServerMessageType,
+  type WikiMessage,
 } from "./protocol";
 
 export * from "./protocol";
@@ -84,6 +86,7 @@ const PUSH_EVENT_TYPES = [
   "status",
   "memory",
   "memory_saved",
+  "wiki",
 ] as const satisfies readonly ServerMessageType[];
 
 function isObject(value: unknown): value is Record<string, unknown> {
@@ -351,4 +354,40 @@ export class IpcClient {
       }
     }
   }
+}
+
+/**
+ * Normalize a `WikiResponse` (`{version, entries}`) into a `WikiMessage` (adds
+ * the `type` discriminant). The Rust `wiki_get`/`wiki_save` commands and the
+ * pushed `wiki` event carry the same shape; tagging it lets the App route it
+ * through the same `onMessage`/store path as the push event.
+ */
+function toWikiMessage(value: unknown): WikiMessage {
+  const obj = isObject(value) ? value : {};
+  const version = typeof obj.version === "number" ? obj.version : 1;
+  const entries =
+    isObject(obj.entries) && obj.entries !== null
+      ? (obj.entries as Record<string, LedgerEntry>)
+      : {};
+  return { type: "wiki", version, entries };
+}
+
+/**
+ * `wiki_get` command: fetch the current dat-edit ledger for the open project.
+ * Resolves to a `WikiMessage` (the App feeds it to `store.wikiReceived`). The
+ * default `invoke` is used unless one is injected (tests).
+ */
+export async function wikiGet(invoke: InvokeFn = tauriInvoke): Promise<WikiMessage> {
+  return toWikiMessage(await invoke("wiki_get"));
+}
+
+/**
+ * `wiki_save` command: persist user-corrected ledger entries (the core flips
+ * `editedByUser=true`) and resolve to the refreshed `WikiMessage`.
+ */
+export async function wikiSave(
+  entries: Record<string, LedgerEntry>,
+  invoke: InvokeFn = tauriInvoke,
+): Promise<WikiMessage> {
+  return toWikiMessage(await invoke("wiki_save", { entries }));
 }

@@ -198,6 +198,35 @@ pub struct MemorySaveResponse {
     pub file: String,
 }
 
+/// `wiki` event payload AND the `wiki_get` command output: the dat-edit ledger.
+///
+/// `entries` is a key -> entry map mirroring the on-disk `ledger.json`
+/// (`"{table}:{dat}:{objId}:{property}"` keys). The panel keeps its WikiView in sync
+/// from this after every accept that changes the ledger.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WikiResponse {
+    /// Ledger schema version (currently 1).
+    pub version: u32,
+    /// Key -> ledger entry.
+    pub entries: std::collections::BTreeMap<String, crate::wiki::LedgerEntry>,
+}
+
+impl From<&crate::wiki::Ledger> for WikiResponse {
+    fn from(ledger: &crate::wiki::Ledger) -> Self {
+        Self {
+            version: ledger.version,
+            entries: ledger.entries.clone(),
+        }
+    }
+}
+
+/// `wiki_save` command input: user-corrected ledger entries.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WikiSaveRequest {
+    /// Key -> entry, as edited in the panel. Persisted with `editedByUser=true`.
+    pub entries: std::collections::BTreeMap<String, crate::wiki::LedgerEntry>,
+}
+
 /// A file entry returned by `list`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileEntry {
@@ -524,6 +553,57 @@ pub async fn memory_save(
     memory_save_payload(state.dirs(), &project, &request.file, &request.content)
 }
 
+/// Build the `wiki_get` payload (the current ledger) for a resolved project name.
+pub fn wiki_get_payload(dirs: &DataDirs, project: &str) -> Result<WikiResponse, String> {
+    let store = crate::wiki::WikiStore::load(dirs.wiki_dir(project));
+    if !store.enabled() {
+        return Err("no project is open; the wiki is disabled".to_string());
+    }
+    Ok(WikiResponse::from(store.ledger()))
+}
+
+/// Persist user-corrected ledger entries (sets `editedByUser=true`) for a project.
+pub fn wiki_save_payload(
+    dirs: &DataDirs,
+    project: &str,
+    entries: std::collections::BTreeMap<String, crate::wiki::LedgerEntry>,
+) -> Result<WikiResponse, String> {
+    let mut store = crate::wiki::WikiStore::load(dirs.wiki_dir(project));
+    if !store.enabled() {
+        return Err("no project is open; the wiki is disabled".to_string());
+    }
+    for mut entry in entries.into_values() {
+        // Mirror the accept-hook invariant (wiki::accepted_ledger_entries): never
+        // persist a null-valued entry. The panel's isLedgerEntry guard rejects
+        // null, which would silently drop the whole wiki payload on the next sync.
+        if entry.value.is_null() {
+            continue;
+        }
+        entry.edited_by_user = true;
+        store.upsert(entry);
+    }
+    store.save().map_err(|error| error.to_string())?;
+    Ok(WikiResponse::from(store.ledger()))
+}
+
+/// Read the dat-edit wiki ledger for the current editor project.
+#[tauri::command]
+pub async fn wiki_get(state: tauri::State<'_, BridgeManaged>) -> Result<WikiResponse, String> {
+    let project = current_project_from_status(state.dirs()).await?;
+    wiki_get_payload(state.dirs(), &project)
+}
+
+/// Save user-corrected wiki entries for the current editor project.
+#[tauri::command]
+pub async fn wiki_save(
+    state: tauri::State<'_, BridgeManaged>,
+    entries: std::collections::BTreeMap<String, crate::wiki::LedgerEntry>,
+) -> Result<WikiResponse, String> {
+    let request = WikiSaveRequest { entries };
+    let project = current_project_from_status(state.dirs()).await?;
+    wiki_save_payload(state.dirs(), &project, request.entries)
+}
+
 async fn current_project_from_status(dirs: &DataDirs) -> Result<String, String> {
     let bridge = bridge_from_config(dirs)?;
     let snapshot = tauri::async_runtime::spawn_blocking(move || {
@@ -566,6 +646,14 @@ pub fn emit_changeset<R: tauri::Runtime>(
     payload: ChangesetEvent,
 ) -> tauri::Result<()> {
     emitter.emit("changeset", payload)
+}
+
+/// Emit a `wiki` event carrying the dat-edit ledger after an accept changed it.
+pub fn emit_wiki<R: tauri::Runtime>(
+    emitter: &impl Emitter<R>,
+    payload: WikiResponse,
+) -> tauri::Result<()> {
+    emitter.emit("wiki", payload)
 }
 
 /// Emit a `rollback_result` event.
@@ -907,6 +995,97 @@ mod tests {
         assert_eq!(memory.read("resources"), "Switch 1 = boss phase");
 
         fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn wiki_get_and_save_payloads_round_trip_and_mark_user_edits() {
+        use crate::wiki::{LedgerEntry, WikiStore};
+        use std::collections::BTreeMap;
+
+        let base = unique_temp_dir("wiki-payload");
+        let dirs = DataDirs::from_bases(&base.join("roaming"), &base.join("local"));
+
+        // Seed a ledger via the store (as the accept-hook would).
+        let mut store = WikiStore::load(dirs.wiki_dir("ExampleProject"));
+        store.upsert(LedgerEntry {
+            table: "dat".to_string(),
+            dat: "units".to_string(),
+            obj_id: 0,
+            property: "HP".to_string(),
+            value: json!(80),
+            item_name: Some("Terran Marine".to_string()),
+            applied_at: 1_718_000_000,
+            edited_by_user: false,
+        });
+        store.save().unwrap();
+
+        let got = ipc::wiki_get_payload(&dirs, "ExampleProject").expect("wiki_get");
+        assert_eq!(got.version, 1);
+        assert_eq!(got.entries["dat:units:0:HP"].value, json!(80));
+        assert!(!got.entries["dat:units:0:HP"].edited_by_user);
+
+        // wiki_save flips editedByUser=true and persists the correction.
+        let mut entries: BTreeMap<String, LedgerEntry> = BTreeMap::new();
+        let mut corrected = got.entries["dat:units:0:HP"].clone();
+        corrected.value = json!(100);
+        entries.insert(corrected.key(), corrected);
+
+        let saved = ipc::wiki_save_payload(&dirs, "ExampleProject", entries).expect("wiki_save");
+        assert_eq!(saved.entries["dat:units:0:HP"].value, json!(100));
+        assert!(saved.entries["dat:units:0:HP"].edited_by_user);
+
+        // Persisted to disk.
+        let reloaded = WikiStore::load(dirs.wiki_dir("ExampleProject"));
+        assert_eq!(
+            reloaded.ledger().entries["dat:units:0:HP"].value,
+            json!(100)
+        );
+
+        // Empty project name disables both commands.
+        assert!(ipc::wiki_get_payload(&dirs, "   ")
+            .unwrap_err()
+            .contains("no project"));
+        assert!(ipc::wiki_save_payload(&dirs, "   ", BTreeMap::new())
+            .unwrap_err()
+            .contains("no project"));
+
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn wiki_response_serializes_with_camelcase_entry_fields() {
+        use crate::wiki::{Ledger, LedgerEntry};
+
+        let mut ledger = Ledger::default();
+        ledger.upsert(LedgerEntry {
+            table: "dat".to_string(),
+            dat: "units".to_string(),
+            obj_id: 0,
+            property: "HP".to_string(),
+            value: json!(80),
+            item_name: Some("Terran Marine".to_string()),
+            applied_at: 1_718_000_000,
+            edited_by_user: false,
+        });
+        let response = ipc::WikiResponse::from(&ledger);
+        assert_json(
+            &response,
+            json!({
+                "version": 1,
+                "entries": {
+                    "dat:units:0:HP": {
+                        "table": "dat",
+                        "dat": "units",
+                        "objId": 0,
+                        "property": "HP",
+                        "value": 80,
+                        "itemName": "Terran Marine",
+                        "appliedAt": 1_718_000_000,
+                        "editedByUser": false
+                    }
+                }
+            }),
+        );
     }
 
     #[test]

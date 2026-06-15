@@ -208,6 +208,49 @@ export interface MemorySavedMessage {
   file: MemoryFile;
 }
 
+/** Dat-edit wiki table family (the on-disk `table` field). */
+export const WIKI_TABLES = ["dat", "xdat", "tbl", "req", "btn"] as const;
+export type WikiTable = (typeof WIKI_TABLES)[number];
+
+/**
+ * One dat-edit wiki ledger entry — the LAST value the agent applied via the
+ * DATA EDITOR (GETDAT/SETDAT) and the user APPROVED. Mirrors the Rust
+ * `wiki::LedgerEntry` wire shape EXACTLY (camelCase: `objId`/`itemName`/
+ * `appliedAt`/`editedByUser`). The ledger key is `"{table}:{dat}:{objId}:{property}"`.
+ * `value` is a number or string (the applied new value); `itemName` is present
+ * only for `table=dat` & `dat="units"` (the resolved unit name).
+ */
+export interface LedgerEntry {
+  /** Dat family: "dat" | "xdat" | "tbl" | "req" | "btn" (open string, defensive). */
+  table: string;
+  /** Dat-family name (e.g. "units","weapons"); empty for tbl/btn. */
+  dat: string;
+  /** Numeric object index. */
+  objId: number;
+  /** Property name as used on the bridge wire (e.g. "HP","Armor"). */
+  property: string;
+  /** The last applied new value (number or string). */
+  value: number | string;
+  /** Unit name for table=dat & dat="units"; omitted otherwise. */
+  itemName?: string;
+  /** Unix seconds from the originating journal entry. */
+  appliedAt: number;
+  /** false when written by the accept-hook, true when corrected via wiki_save. */
+  editedByUser: boolean;
+}
+
+/**
+ * `wiki {version, entries}` - the dat-edit ledger snapshot. Pushed after every
+ * changeset accept that records >= 1 dat edit (engine accept-hook), and also the
+ * resolved value of the `wiki_get`/`wiki_save` commands. `entries` is a
+ * key -> entry map mirroring the on-disk `ledger.json`.
+ */
+export interface WikiMessage {
+  type: "wiki";
+  version: number;
+  entries: Record<string, LedgerEntry>;
+}
+
 /**
  * `setup {...}` - first-run manifest-check snapshot (response to `setup_status`
  * and `setup_pick_editor_path`). `setup_required` gates the setup screen;
@@ -245,6 +288,7 @@ export type ServerMessage =
   | ListMessage
   | MemoryMessage
   | MemorySavedMessage
+  | WikiMessage
   | SetupMessage;
 
 /** All server message `type` discriminants (closed set). */
@@ -260,6 +304,7 @@ export const SERVER_MESSAGE_TYPES = [
   "list",
   "memory",
   "memory_saved",
+  "wiki",
   "setup",
 ] as const;
 export type ServerMessageType = (typeof SERVER_MESSAGE_TYPES)[number];
@@ -530,6 +575,31 @@ export function isMemorySavedMessage(
   );
 }
 
+function isLedgerEntry(value: unknown): value is LedgerEntry {
+  return (
+    isObject(value) &&
+    typeof value.table === "string" &&
+    typeof value.dat === "string" &&
+    typeof value.objId === "number" &&
+    typeof value.property === "string" &&
+    (typeof value.value === "number" || typeof value.value === "string") &&
+    (value.itemName === undefined || typeof value.itemName === "string") &&
+    typeof value.appliedAt === "number" &&
+    typeof value.editedByUser === "boolean"
+  );
+}
+
+/** True if `value` is a `wiki` message (version + entry map of ledger entries). */
+export function isWikiMessage(value: unknown): value is WikiMessage {
+  return (
+    isObject(value) &&
+    value.type === "wiki" &&
+    typeof value.version === "number" &&
+    isObject(value.entries) &&
+    Object.values(value.entries).every(isLedgerEntry)
+  );
+}
+
 /** True if `value` is a `setup` message. */
 export function isSetupMessage(value: unknown): value is SetupMessage {
   return (
@@ -563,6 +633,7 @@ export function isServerMessage(value: unknown): value is ServerMessage {
     isListMessage(value) ||
     isMemoryMessage(value) ||
     isMemorySavedMessage(value) ||
+    isWikiMessage(value) ||
     isSetupMessage(value)
   );
 }
