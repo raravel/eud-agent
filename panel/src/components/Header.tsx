@@ -5,7 +5,7 @@
  * (`rag_warmup` started → done, elapsed formatted via lib/progress). Korean
  * labels throughout.
  */
-import { BookText, Database, MonitorPlay, SparklesIcon } from "lucide-react";
+import { BookText, Database, MonitorPlay } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import {
@@ -162,9 +162,13 @@ export function Header({
       <div className="flex min-w-0 items-center gap-2.5">
         <span
           aria-hidden
-          className="flex size-8 shrink-0 items-center justify-center rounded-lg border border-emerald-500/30 bg-emerald-500/15 text-emerald-400"
+          className="flex size-8 shrink-0 items-center justify-center overflow-hidden rounded-lg border border-emerald-500/30 bg-emerald-500/15"
         >
-          <SparklesIcon className="size-4" />
+          <img
+            src="/eud-agent.png"
+            alt=""
+            className="size-6 rounded-md object-contain"
+          />
         </span>
         <div className="grid min-w-0">
           <span className="truncate text-sm font-semibold leading-tight">

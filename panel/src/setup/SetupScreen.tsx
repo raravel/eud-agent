@@ -22,7 +22,6 @@ import {
   KeyRoundIcon,
   Loader2Icon,
   LogInIcon,
-  SparklesIcon,
 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
@@ -289,8 +288,13 @@ export function SetupScreen({
         <div className="flex flex-col gap-6 rounded-xl border border-border bg-card/80 p-8 shadow-2xl backdrop-blur">
           {/* Branding + title */}
           <div className="flex items-center gap-3">
-            <span className="flex size-11 shrink-0 items-center justify-center rounded-xl border border-emerald-500/30 bg-emerald-500/15 text-emerald-400">
-              <SparklesIcon aria-hidden className="size-5" />
+            <span className="flex size-11 shrink-0 items-center justify-center overflow-hidden rounded-xl border border-emerald-500/30 bg-emerald-500/15">
+              <img
+                src="/eud-agent.png"
+                alt=""
+                aria-hidden
+                className="size-8 rounded-lg object-contain"
+              />
             </span>
             <div className="grid gap-0.5">
               <p className="text-xs font-medium tracking-wide text-muted-foreground">
