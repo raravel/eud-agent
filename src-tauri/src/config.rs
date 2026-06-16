@@ -146,6 +146,12 @@ impl DataDirs {
         self.app_data.join("journal")
     }
 
+    /// `%appdata%\eud-agent\sessions` — named conversation records (Roaming so they
+    /// survive a self-update, decision D). Small + user-owned.
+    pub fn sessions_dir(&self) -> PathBuf {
+        self.app_data.join("sessions")
+    }
+
     /// `%localappdata%\eud-agent\models` — NEVER in Roaming (the model is ~570MB).
     pub fn models_dir(&self) -> PathBuf {
         self.app_local_data.join("models")
@@ -183,6 +189,7 @@ impl DataDirs {
             self.memory_dir(),
             self.map_backups_dir(),
             self.journal_dir(),
+            self.sessions_dir(),
             self.app_local_data.clone(),
             self.models_dir(),
             self.rag_dir(),
@@ -323,6 +330,7 @@ mod tests {
         assert!(dirs.memory_dir().is_dir());
         assert!(dirs.map_backups_dir().is_dir());
         assert!(dirs.journal_dir().is_dir());
+        assert!(dirs.sessions_dir().is_dir());
         // Local subtree — model/rag/logs NEVER in Roaming.
         assert!(dirs.app_local_data().is_dir());
         assert!(dirs.models_dir().is_dir());

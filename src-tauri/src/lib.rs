@@ -23,6 +23,7 @@ pub mod mapsafe;
 pub mod mcp;
 pub mod memory;
 pub mod rag;
+pub mod session;
 pub mod setup;
 pub mod tool_exec;
 pub mod tools;
@@ -247,6 +248,12 @@ pub fn run() {
             // repo as its workspace instead of the EUD map project.
             let cwd = data_dirs.codex_workspace_dir();
             let driver = engine::ProductionCodexDriver::new(cwd, sink.clone(), mcp_port);
+
+            // Session restore: Rust owns every session file under
+            // `%appdata%\eud-agent\sessions\` (decision A/D). Built before the
+            // config builder moves `data_dirs` into the project-state provider.
+            let session_store = session::SessionStore::new(&data_dirs);
+
             let config =
                 engine::AgentEngineConfig::new("[project state]\n(unavailable)", None, Vec::new())
                     .with_memory_provider(std::sync::Arc::new(AppMemoryProvider {
@@ -260,7 +267,11 @@ pub fn run() {
                     }));
 
             app.manage(tokio::sync::Mutex::new(engine::AgentEngine::new(
-                driver, sink, config, runtime,
+                driver,
+                sink,
+                config,
+                runtime,
+                session_store,
             )));
             Ok(())
         })
@@ -271,6 +282,11 @@ pub fn run() {
             engine::engine_changeset_decision,
             engine::engine_cancel,
             engine::engine_reset,
+            engine::engine_session_list,
+            engine::engine_session_save,
+            engine::engine_session_open,
+            engine::engine_session_rename,
+            engine::engine_session_delete,
             ipc::status,
             ipc::launch_editor,
             ipc::list,

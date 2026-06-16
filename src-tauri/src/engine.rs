@@ -30,6 +30,12 @@ every change.";
 
 const EPISODE_INSTRUCTION_CHARS: usize = 200;
 
+/// Bound on the first post-open `thread/resume` turn before the session-restore
+/// fallback (decision E) drops to a fresh `thread/start`. codex may never signal a
+/// missing rollout, so this timeout is the defensive backstop alongside the error
+/// catch. Generous so a slow-but-valid resume is not aborted.
+const RESUME_FALLBACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
 const EPSCRIPT_GUIDE: &str = r#"[epscript]
 - ALL code you write is epScript (*.eps, the C-like language compiled by euddraft's epscript->eudplib pipeline). Write epScript ONLY.
 - NEVER write SCMDraft classic text-trigger blocks — `Trigger { players = {...}, conditions = {...}, actions = ... }` is NOT epScript and does not compile here.
@@ -129,6 +135,14 @@ pub(crate) trait CodexDriver {
     async fn run_turn(&mut self, turn_text: String) -> Result<CodexTurnResult, AgentEngineError>;
 
     async fn reset_thread(&mut self) -> Result<(), AgentEngineError>;
+
+    /// The live codex thread id, captured once `ThreadStarted` has arrived (session
+    /// restore: the engine persists this so a later `open_session` can resume it).
+    async fn current_thread_id(&self) -> Option<String>;
+
+    /// Seed a saved thread id so the next `run_turn` issues `thread/resume` instead
+    /// of `thread/start` (session restore primary path, decision E).
+    async fn seed_thread_id(&mut self, id: String) -> Result<(), AgentEngineError>;
 }
 
 #[derive(Debug, Clone)]
@@ -142,6 +156,10 @@ pub enum EngineEvent {
     Error(ipc::ErrorEvent),
     Status(ipc::StatusResponse),
     Wiki(ipc::WikiResponse),
+    /// A saved session finished loading (session restore): a signal only, so the
+    /// panel can flip out of its connecting state. Carries nothing rendered raw
+    /// (rules.md forbids raw kind identifiers as user-facing text).
+    SessionLoaded(ipc::SessionLoadedEvent),
 }
 
 pub(crate) trait EventSink {
@@ -280,6 +298,13 @@ pub(crate) struct AgentEngine<D: CodexDriver, S: EventSink> {
     plan_revision: u32,
     current_request_id: Option<String>,
     current_instruction_head: Option<String>,
+    current_session_id: Option<String>,
+    /// Condensed prior transcript staged by `open_session` when a saved thread was
+    /// seeded: the resume fallback (decision E) prepends it via `resume_turn_text`
+    /// if the first post-open turn's `thread/resume` errors or times out. Cleared
+    /// once the first post-open turn settles.
+    pending_resume_transcript: Option<String>,
+    session_store: crate::session::SessionStore,
     journal_store: journal::JournalStore,
     journal_data_dir: PathBuf,
     runtime: ToolRuntime,
@@ -290,7 +315,13 @@ impl<D: CodexDriver, S: EventSink> AgentEngine<D, S> {
     /// state and the change journal live in `runtime` (not in the engine) so the
     /// MCP tool handler can reach them WHILE this engine holds its mutex across
     /// `run_turn().await` — the codex turn during which tool calls arrive.
-    pub fn new(driver: D, sink: S, config: AgentEngineConfig, runtime: ToolRuntime) -> Self {
+    pub fn new(
+        driver: D,
+        sink: S,
+        config: AgentEngineConfig,
+        runtime: ToolRuntime,
+        session_store: crate::session::SessionStore,
+    ) -> Self {
         let journal_store = runtime.journal().clone();
         let journal_data_dir = runtime.app_data_dir();
         Self {
@@ -302,6 +333,9 @@ impl<D: CodexDriver, S: EventSink> AgentEngine<D, S> {
             plan_revision: 0,
             current_request_id: None,
             current_instruction_head: None,
+            current_session_id: None,
+            pending_resume_transcript: None,
+            session_store,
             journal_store,
             journal_data_dir,
             runtime,
@@ -341,12 +375,78 @@ impl<D: CodexDriver, S: EventSink> AgentEngine<D, S> {
             )
         };
 
-        let result = self.driver.run_turn(turn_text).await?;
+        let result = self
+            .run_first_turn_with_resume_fallback(turn_text, &req.text)
+            .await?;
         self.thread_active = true;
         let result = self.reinterpret_plan(result);
         self.handle_turn_result(result)?;
         self.emit_current_changeset_if_any()?;
+        self.update_active_session().await;
         Ok(())
+    }
+
+    /// Run the turn, applying the session-restore resume fallback (decision E) when a
+    /// saved thread was seeded by `open_session`. Defensive-by-construction: if the
+    /// FIRST post-open turn's `thread/resume` errors OR does not complete within a
+    /// bounded timeout (codex may never signal a missing rollout), reset to a fresh
+    /// `thread/start` and re-run with a condensed transcript prepended via the
+    /// `resume_turn_text` path so the model still sees prior context. A normal turn
+    /// (no staged transcript) runs unchanged with no timeout wrapper.
+    async fn run_first_turn_with_resume_fallback(
+        &mut self,
+        turn_text: String,
+        user_text: &str,
+    ) -> Result<CodexTurnResult, AgentEngineError> {
+        let Some(transcript) = self.pending_resume_transcript.take() else {
+            return self.driver.run_turn(turn_text).await;
+        };
+
+        // Primary path: the saved thread is already seeded, so this is a resume.
+        let resume =
+            tokio::time::timeout(RESUME_FALLBACK_TIMEOUT, self.driver.run_turn(turn_text)).await;
+        match resume {
+            Ok(Ok(result)) => Ok(result),
+            Ok(Err(error)) => {
+                eprintln!("eud-agent: thread resume failed, replaying transcript: {error}");
+                self.fresh_start_with_transcript(&transcript, user_text)
+                    .await
+            }
+            Err(_) => {
+                eprintln!("eud-agent: thread resume timed out, replaying transcript");
+                self.fresh_start_with_transcript(&transcript, user_text)
+                    .await
+            }
+        }
+    }
+
+    /// Drop the seeded thread, start fresh, and re-run with the condensed prior
+    /// transcript injected into the first turn's prompt via the existing
+    /// `resume_turn_text` prepend path (resume fallback body, decision E). The
+    /// transcript is folded into the `[user message]` text so the fresh thread
+    /// still sees prior context.
+    async fn fresh_start_with_transcript(
+        &mut self,
+        transcript: &str,
+        user_text: &str,
+    ) -> Result<CodexTurnResult, AgentEngineError> {
+        self.driver.reset_thread().await?;
+        self.thread_active = false;
+        let memory = self.config.project_memory_for_prompt();
+        let project_state = self.config.project_state_for_prompt();
+        let replayed = format!("{transcript}\n\n{user_text}");
+        let wiki = self.config.wiki_section_for_prompt(user_text);
+        let turn_text = resume_turn_text(
+            &replayed,
+            &self.config.rag_hits,
+            &project_state,
+            memory.as_deref(),
+            wiki.as_deref(),
+        );
+        let result = self.driver.run_turn(turn_text).await?;
+        // The fresh thread is now live; subsequent turns resume normally.
+        self.thread_active = true;
+        Ok(result)
     }
 
     pub async fn reset(&mut self) -> Result<(), AgentEngineError> {
@@ -357,7 +457,47 @@ impl<D: CodexDriver, S: EventSink> AgentEngine<D, S> {
         self.runtime.clear_current();
         self.current_request_id = None;
         self.current_instruction_head = None;
+        // A `새 대화` detaches from the saved session (decision B).
+        self.current_session_id = None;
         Ok(())
+    }
+
+    /// After a successful turn, refresh the active session record (decision B:
+    /// once a session is open, every completed `chat` auto-updates it). Captures
+    /// the live thread_id and the still-pending changeset req-id; the `panelLog`
+    /// is panel-driven via `session_save`, so it is preserved verbatim here.
+    /// Best-effort: a missing/corrupt record or a failed write is logged, never
+    /// surfaced as a chat error.
+    async fn update_active_session(&mut self) {
+        let Some(session_id) = self.current_session_id.clone() else {
+            return;
+        };
+        let mut record = match self.session_store.load(&session_id) {
+            Ok(record) => record,
+            Err(error) => {
+                eprintln!("eud-agent: active session reload failed: {error}");
+                return;
+            }
+        };
+        record.thread_id = self.driver.current_thread_id().await;
+        record.pending_request_ids = self.live_pending_request_ids();
+        record.meta.updated_at = crate::session::now_unix_seconds();
+        if let Err(error) = self.session_store.save(&record) {
+            eprintln!("eud-agent: active session update failed: {error}");
+        }
+    }
+
+    /// The single live (un-archived) changeset req-id, if the current request still
+    /// has journaled items (decision C: at most one is reconnected). Returns empty
+    /// otherwise so a settled session drops its pending list.
+    fn live_pending_request_ids(&self) -> Vec<String> {
+        let Some(request_id) = self.current_request_id.clone() else {
+            return Vec::new();
+        };
+        match self.journal_store.changeset(&request_id) {
+            Ok(changeset) if !changeset.items.is_empty() => vec![request_id],
+            _ => Vec::new(),
+        }
     }
 
     /// A `propose_plan` tool call during the turn parks its markdown on the
@@ -499,7 +639,37 @@ impl<D: CodexDriver, S: EventSink> AgentEngine<D, S> {
             }
         }
         self.phase = Phase::Idle;
+        // A finalized (archived) journal is no longer a reconnect target: drop its
+        // req-id from the active session record so a later open does not try to
+        // rehydrate a gone changeset. A partial accept leaves the journal live, so
+        // skip it; an `ok` accept-all / reject finalized it.
+        if ok && !partial_accept {
+            self.drop_pending_request_from_session(&request_id);
+        }
         Ok(())
+    }
+
+    /// Remove `request_id` from the active session record's `pendingRequestIds`
+    /// (decision C: the reconnect list). Best-effort and a no-op when no session is
+    /// active or the record is gone.
+    fn drop_pending_request_from_session(&mut self, request_id: &str) {
+        let Some(session_id) = self.current_session_id.clone() else {
+            return;
+        };
+        let Ok(mut record) = self.session_store.load(&session_id) else {
+            return;
+        };
+        let before = record.pending_request_ids.len();
+        record
+            .pending_request_ids
+            .retain(|pending| pending != request_id);
+        if record.pending_request_ids.len() == before {
+            return;
+        }
+        record.meta.updated_at = crate::session::now_unix_seconds();
+        if let Err(error) = self.session_store.save(&record) {
+            eprintln!("eud-agent: session pending-id drop failed: {error}");
+        }
     }
 
     /// Collect the ACCEPTED dat property changes of the current changeset as wiki
@@ -556,6 +726,178 @@ impl<D: CodexDriver, S: EventSink> AgentEngine<D, S> {
     pub async fn cancel(&mut self) -> Result<(), AgentEngineError> {
         self.phase = Phase::Idle;
         Ok(())
+    }
+
+    /// The saved session list, most-recently-updated first (session restore).
+    pub fn list_sessions(&self) -> Result<Vec<crate::session::SessionMeta>, AgentEngineError> {
+        self.session_store
+            .list()
+            .map_err(|error| AgentEngineError::new(error.to_string()))
+    }
+
+    /// Create or update a session record (decision A/B): creates a new record when
+    /// no session is active, else updates the active one. Captures the live
+    /// thread_id, the single live changeset req-id, and the current project; the
+    /// `panelLog` is stored verbatim from the panel. Returns the session id.
+    pub async fn save_session(
+        &mut self,
+        req: ipc::SessionSaveRequest,
+    ) -> Result<String, AgentEngineError> {
+        let now = crate::session::now_unix_seconds();
+        let thread_id = self.driver.current_thread_id().await;
+        let pending_request_ids = self.live_pending_request_ids();
+        let project = self.current_project_name();
+
+        let record = match self
+            .current_session_id
+            .clone()
+            .and_then(|id| self.session_store.load(&id).ok())
+        {
+            Some(mut existing) => {
+                existing.meta.name = req.name;
+                existing.meta.project = project;
+                existing.meta.updated_at = now;
+                existing.thread_id = thread_id;
+                existing.pending_request_ids = pending_request_ids;
+                existing.panel_log = req.panel_log;
+                existing
+            }
+            None => {
+                let id = crate::session::new_session_id();
+                self.current_session_id = Some(id.clone());
+                crate::session::SessionRecord {
+                    meta: crate::session::SessionMeta {
+                        id,
+                        name: req.name,
+                        project,
+                        created_at: now,
+                        updated_at: now,
+                    },
+                    thread_id,
+                    pending_request_ids,
+                    panel_log: req.panel_log,
+                }
+            }
+        };
+
+        self.session_store
+            .save(&record)
+            .map_err(|error| AgentEngineError::new(error.to_string()))?;
+        Ok(record.meta.id)
+    }
+
+    /// Open a saved session (session restore): reset the live thread, seed the saved
+    /// thread_id (primary resume path; on error stay fresh + staged replay), set the
+    /// active session, reconnect the single pending changeset, and return the record
+    /// so the panel hydrates from its `panelLog`.
+    pub async fn open_session(
+        &mut self,
+        id: &str,
+    ) -> Result<crate::session::SessionRecord, AgentEngineError> {
+        let record = self
+            .session_store
+            .load(id)
+            .map_err(|error| AgentEngineError::new(error.to_string()))?;
+
+        // Drop any live thread/request first (also detaches the prior session).
+        self.reset().await?;
+
+        // Primary path: seed the saved thread_id so the next chat resumes it. On
+        // success arm `thread_active` + stage a condensed transcript so the first
+        // post-open turn can fall back to a fresh start (decision E). On a seed
+        // error, leave the thread fresh and replay the transcript on the next turn.
+        if let Some(thread_id) = record.thread_id.clone() {
+            match self.driver.seed_thread_id(thread_id).await {
+                Ok(()) => {
+                    self.thread_active = true;
+                    self.pending_resume_transcript = Some(condense_transcript(&record.panel_log));
+                }
+                Err(error) => {
+                    eprintln!("eud-agent: thread seed failed, will replay transcript: {error}");
+                    self.thread_active = false;
+                    self.pending_resume_transcript = Some(condense_transcript(&record.panel_log));
+                }
+            }
+        }
+
+        self.current_session_id = Some(record.meta.id.clone());
+
+        // Reconnect at most one pending changeset (decision C).
+        self.reconnect_pending_changeset(&record);
+
+        self.sink
+            .emit(EngineEvent::SessionLoaded(ipc::SessionLoadedEvent {
+                id: record.meta.id.clone(),
+            }))?;
+
+        Ok(record)
+    }
+
+    /// Rename a saved session.
+    pub fn rename_session(&self, id: &str, name: &str) -> Result<(), AgentEngineError> {
+        self.session_store
+            .rename(id, name)
+            .map_err(|error| AgentEngineError::new(error.to_string()))
+    }
+
+    /// Delete a saved session; if it is the active session, detach.
+    pub fn delete_session(&mut self, id: &str) -> Result<(), AgentEngineError> {
+        self.session_store
+            .delete(id)
+            .map_err(|error| AgentEngineError::new(error.to_string()))?;
+        if self.current_session_id.as_deref() == Some(id) {
+            self.current_session_id = None;
+        }
+        Ok(())
+    }
+
+    /// Reconnect the single pending (un-archived) changeset for an opened session
+    /// (decision C). Rehydrates the journal by id, points `current_request_id` at it
+    /// (so a later `changeset_decision` guard passes), and re-emits the existing
+    /// `changeset` event. A missing journal / empty changeset degrades gracefully
+    /// (skip + log), never panics.
+    fn reconnect_pending_changeset(&mut self, record: &crate::session::SessionRecord) {
+        let Some(request_id) = record.pending_request_ids.first().cloned() else {
+            return;
+        };
+        let journal = match journal::JournalStore::load(&self.journal_data_dir, &request_id) {
+            Ok(journal) => journal,
+            Err(error) => {
+                eprintln!("eud-agent: pending changeset journal '{request_id}' missing: {error}");
+                return;
+            }
+        };
+        // Reseat the journal into the live store so a decision can finalize it.
+        for entry in journal.entries {
+            if let Err(error) = self.journal_store.record(&request_id, entry) {
+                eprintln!("eud-agent: changeset reconnect record failed: {error}");
+                return;
+            }
+        }
+        let changeset = match self.journal_store.changeset(&request_id) {
+            Ok(changeset) if !changeset.items.is_empty() => changeset,
+            _ => return,
+        };
+
+        self.current_request_id = Some(request_id);
+        self.phase = Phase::ChangesetReview;
+        if let Err(error) = self.sink.emit(EngineEvent::Changeset(ipc::ChangesetEvent {
+            request_id: changeset.request_id,
+            items: changeset
+                .items
+                .into_iter()
+                .enumerate()
+                .map(|(index, item)| ipc_changeset_item(index, item))
+                .collect(),
+        })) {
+            eprintln!("eud-agent: changeset reconnect emit failed: {error}");
+        }
+    }
+
+    /// The current editor project name, parsed from the live `[project state]`
+    /// render (`project=<name>`). Empty when no project / no provider is wired.
+    fn current_project_name(&self) -> String {
+        project_name_from_state(&self.config.project_state_for_prompt())
     }
 
     fn resume_text(&self, text: &str) -> String {
@@ -697,6 +1039,7 @@ impl EventSink for TauriEventSink {
             EngineEvent::Error(payload) => ipc::emit_error(&self.app, payload),
             EngineEvent::Status(payload) => ipc::emit_status(&self.app, payload),
             EngineEvent::Wiki(payload) => ipc::emit_wiki(&self.app, payload),
+            EngineEvent::SessionLoaded(payload) => ipc::emit_session_loaded(&self.app, payload),
         };
         result.map_err(|err| AgentEngineError::new(format!("failed to emit event: {err}")))
     }
@@ -876,6 +1219,23 @@ impl CodexDriver for ProductionCodexDriver {
         self.events = None;
         Ok(())
     }
+
+    async fn current_thread_id(&self) -> Option<String> {
+        let client = self.client.as_ref()?;
+        client.current_thread_id().await
+    }
+
+    async fn seed_thread_id(&mut self, id: String) -> Result<(), AgentEngineError> {
+        // The client is lazily spawned; ensure it exists before seeding so the
+        // saved id is in place for the next run_turn's thread/resume.
+        self.ensure_client().await?;
+        let client = self
+            .client
+            .as_ref()
+            .ok_or_else(|| AgentEngineError::new("codex app-server client is unavailable"))?;
+        client.set_thread_id(id).await;
+        Ok(())
+    }
 }
 
 pub(crate) type ManagedAgentEngine =
@@ -945,6 +1305,69 @@ pub(crate) async fn engine_reset(
     state: tauri::State<'_, ManagedAgentEngine>,
 ) -> Result<(), String> {
     state.lock().await.reset().await.map_err(|err| err.message)
+}
+
+#[tauri::command(rename = "session_list")]
+pub(crate) async fn engine_session_list(
+    state: tauri::State<'_, ManagedAgentEngine>,
+) -> Result<Vec<crate::session::SessionMeta>, String> {
+    state
+        .lock()
+        .await
+        .list_sessions()
+        .map_err(|err| err.message)
+}
+
+#[tauri::command(rename = "session_save")]
+pub(crate) async fn engine_session_save(
+    state: tauri::State<'_, ManagedAgentEngine>,
+    name: String,
+    panel_log: serde_json::Value,
+) -> Result<String, String> {
+    state
+        .lock()
+        .await
+        .save_session(ipc::SessionSaveRequest { name, panel_log })
+        .await
+        .map_err(|err| err.message)
+}
+
+#[tauri::command(rename = "session_open")]
+pub(crate) async fn engine_session_open(
+    state: tauri::State<'_, ManagedAgentEngine>,
+    id: String,
+) -> Result<crate::session::SessionRecord, String> {
+    state
+        .lock()
+        .await
+        .open_session(&id)
+        .await
+        .map_err(|err| err.message)
+}
+
+#[tauri::command(rename = "session_rename")]
+pub(crate) async fn engine_session_rename(
+    state: tauri::State<'_, ManagedAgentEngine>,
+    id: String,
+    name: String,
+) -> Result<(), String> {
+    state
+        .lock()
+        .await
+        .rename_session(&id, &name)
+        .map_err(|err| err.message)
+}
+
+#[tauri::command(rename = "session_delete")]
+pub(crate) async fn engine_session_delete(
+    state: tauri::State<'_, ManagedAgentEngine>,
+    id: String,
+) -> Result<(), String> {
+    state
+        .lock()
+        .await
+        .delete_session(&id)
+        .map_err(|err| err.message)
 }
 
 /// Build the first-turn system prompt from already-fetched request context.
@@ -1139,6 +1562,62 @@ fn message_break(answer: &str, boundary_seen: bool) -> &'static str {
 
 fn take_chars(s: &str, limit: usize) -> String {
     s.chars().take(limit).collect()
+}
+
+/// Cap on the condensed replay transcript (chars), kept well under prompt limits.
+const CONDENSED_TRANSCRIPT_CAP_CHARS: usize = 8000;
+
+/// Parse the editor project name out of a `[project state]` render
+/// (`project=<name>` line). Returns `""` when absent / `(no project open)`.
+fn project_name_from_state(project_state: &str) -> String {
+    let name = project_state
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("project="))
+        .unwrap_or("")
+        .trim();
+    if name.is_empty() || name == "(no project open)" {
+        String::new()
+    } else {
+        name.to_string()
+    }
+}
+
+/// Build a condensed prior-conversation transcript from the panel-owned `panelLog`
+/// blob for the resume fallback (decision E). Keeps you/agent text and decision
+/// lines, drops tool-arg dumps and transient detail, and caps the total well under
+/// prompt limits. The `panelLog` is opaque to Rust, so this reads it defensively:
+/// any missing/odd shape simply yields fewer lines (never panics).
+fn condense_transcript(panel_log: &serde_json::Value) -> String {
+    let entries = panel_log
+        .get("log")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+
+    let mut lines = vec!["[prior conversation]".to_string()];
+    for entry in &entries {
+        let kind = entry.get("kind").and_then(serde_json::Value::as_str);
+        let text = entry
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .trim();
+        // Drop tool-arg dumps and transient/empty rows; keep conversational text
+        // (you/agent) and terminal decision rows (ok/error/info).
+        let label = match kind {
+            Some("you") => "user",
+            Some("agent") => "assistant",
+            Some("ok") | Some("error") | Some("info") => "note",
+            _ => continue,
+        };
+        if text.is_empty() {
+            continue;
+        }
+        lines.push(format!("{label}: {text}"));
+    }
+
+    let joined = lines.join("\n");
+    take_chars(&joined, CONDENSED_TRANSCRIPT_CAP_CHARS)
 }
 
 fn iso8601_utc_now() -> String {
@@ -1606,6 +2085,10 @@ mod tests {
         prompts: Arc<Mutex<Vec<String>>>,
         scripted_turns: Arc<Mutex<VecDeque<CodexTurnResult>>>,
         reset_count: Arc<Mutex<usize>>,
+        /// The mock's live thread id; `reset_thread` clears it, `seed_thread_id`
+        /// sets it, mirroring the production client's thread_id mutex.
+        thread_id: Arc<Mutex<Option<String>>>,
+        seeded: Arc<Mutex<Vec<String>>>,
     }
 
     impl FakeCodexDriver {
@@ -1614,6 +2097,8 @@ mod tests {
                 prompts: Arc::new(Mutex::new(Vec::new())),
                 scripted_turns: Arc::new(Mutex::new(turns.into_iter().collect())),
                 reset_count: Arc::new(Mutex::new(0)),
+                thread_id: Arc::new(Mutex::new(None)),
+                seeded: Arc::new(Mutex::new(Vec::new())),
             }
         }
 
@@ -1624,6 +2109,10 @@ mod tests {
         fn reset_count(&self) -> usize {
             *self.reset_count.lock().expect("reset count lock")
         }
+
+        fn seeded_ids(&self) -> Vec<String> {
+            self.seeded.lock().expect("seeded lock").clone()
+        }
     }
 
     impl CodexDriver for FakeCodexDriver {
@@ -1632,6 +2121,15 @@ mod tests {
             turn_text: String,
         ) -> Result<CodexTurnResult, AgentEngineError> {
             self.prompts.lock().expect("prompts lock").push(turn_text);
+            // A fresh turn (no seeded/live thread) mints a thread id so
+            // `current_thread_id` returns one by turn completion (matches the
+            // production driver capturing `ThreadStarted`).
+            {
+                let mut thread = self.thread_id.lock().expect("thread id lock");
+                if thread.is_none() {
+                    *thread = Some("thread-fake".to_string());
+                }
+            }
             Ok(self
                 .scripted_turns
                 .lock()
@@ -1642,6 +2140,17 @@ mod tests {
 
         async fn reset_thread(&mut self) -> Result<(), AgentEngineError> {
             *self.reset_count.lock().expect("reset count lock") += 1;
+            *self.thread_id.lock().expect("thread id lock") = None;
+            Ok(())
+        }
+
+        async fn current_thread_id(&self) -> Option<String> {
+            self.thread_id.lock().expect("thread id lock").clone()
+        }
+
+        async fn seed_thread_id(&mut self, id: String) -> Result<(), AgentEngineError> {
+            self.seeded.lock().expect("seeded lock").push(id.clone());
+            *self.thread_id.lock().expect("thread id lock") = Some(id);
             Ok(())
         }
     }
@@ -1748,6 +2257,13 @@ mod tests {
         .with_memory_provider(Arc::new(StoreMemoryProvider::new(memory)))
     }
 
+    /// A SessionStore rooted under `data_dir/sessions` so engine tests that wire a
+    /// real on-disk journal also get a real on-disk session store beside it.
+    fn session_store_at(data_dir: &std::path::Path) -> crate::session::SessionStore {
+        let dirs = crate::config::DataDirs::from_bases(data_dir, data_dir);
+        crate::session::SessionStore::new(&dirs)
+    }
+
     fn test_engine_with_memory<D: CodexDriver, S: EventSink>(
         driver: D,
         sink: S,
@@ -1759,6 +2275,7 @@ mod tests {
             sink,
             config_with_memory(memory),
             ToolRuntime::for_tests(),
+            session_store_at(data_dir),
         );
         engine.journal_store = journal::JournalStore::new(data_dir);
         engine.journal_data_dir = data_dir.to_path_buf();
@@ -1856,7 +2373,13 @@ mod tests {
         let config = config_with_memory(memory).with_wiki_provider(Arc::new(StoreWikiProvider {
             wiki_dir: wiki_dir.to_path_buf(),
         }));
-        let mut engine = AgentEngine::new(driver, sink, config, ToolRuntime::for_tests());
+        let mut engine = AgentEngine::new(
+            driver,
+            sink,
+            config,
+            ToolRuntime::for_tests(),
+            session_store_at(data_dir),
+        );
         engine.journal_store = journal::JournalStore::new(data_dir);
         engine.journal_data_dir = data_dir.to_path_buf();
         engine
@@ -1908,6 +2431,7 @@ mod tests {
                 sample_hits(),
             ),
             ToolRuntime::for_tests(),
+            session_store_at(&unique_temp_dir("engine-sessions")),
         )
     }
 
@@ -2859,5 +3383,208 @@ mod tests {
             reference_context < user_text_index,
             "user text must appear after the [reference context] section"
         );
+    }
+
+    #[tokio::test]
+    async fn mock_driver_seed_sets_current_thread_id_and_reset_clears_it() {
+        let mut driver = FakeCodexDriver::scripted([]);
+        assert_eq!(driver.current_thread_id().await, None);
+
+        driver
+            .seed_thread_id("thread-seeded".to_string())
+            .await
+            .expect("seed should succeed");
+        assert_eq!(
+            driver.current_thread_id().await,
+            Some("thread-seeded".to_string())
+        );
+        assert_eq!(driver.seeded_ids(), vec!["thread-seeded".to_string()]);
+
+        driver.reset_thread().await.expect("reset should succeed");
+        assert_eq!(driver.current_thread_id().await, None);
+    }
+
+    #[tokio::test]
+    async fn chat_captures_thread_id_into_active_session_record() {
+        let base = unique_temp_dir("session-capture");
+        let memory = ProjectMemory::new(base.join("memory"), "ExampleProject");
+        let driver = FakeCodexDriver::scripted([
+            CodexTurnResult::Answer {
+                text: "Saved-session answer.".to_string(),
+            },
+            CodexTurnResult::Answer {
+                text: "Follow-up answer.".to_string(),
+            },
+        ]);
+        let sink = CapturingEventSink::default();
+        let mut engine = test_engine_with_memory(driver, sink, memory, &base.join("data"));
+
+        // A fresh chat mints a thread id (mock mirrors ThreadStarted by completion).
+        engine
+            .chat(crate::ipc::ChatRequest {
+                text: "first instruction".to_string(),
+            })
+            .await
+            .expect("first chat should run");
+
+        // Explicit save creates the active session record.
+        let id = engine
+            .save_session(crate::ipc::SessionSaveRequest {
+                name: "내 세션".to_string(),
+                panel_log: serde_json::json!({ "schemaVersion": 1, "logSeq": 1, "log": [] }),
+            })
+            .await
+            .expect("save should create a session");
+        assert_eq!(engine.current_session_id.as_deref(), Some(id.as_str()));
+
+        // A subsequent completed chat auto-updates the record's thread_id.
+        engine
+            .chat(crate::ipc::ChatRequest {
+                text: "follow-up".to_string(),
+            })
+            .await
+            .expect("second chat should run and auto-update the session");
+
+        let record = engine.session_store.load(&id).expect("record should load");
+        assert_eq!(record.thread_id, Some("thread-fake".to_string()));
+
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[tokio::test]
+    async fn open_session_seeds_thread_id_and_next_chat_takes_resume_branch() {
+        let base = unique_temp_dir("session-open-seed");
+        let memory = ProjectMemory::new(base.join("memory"), "ExampleProject");
+        let driver = FakeCodexDriver::scripted([CodexTurnResult::Answer {
+            text: "Resumed answer.".to_string(),
+        }]);
+        let driver_handle = driver.clone();
+        let sink = CapturingEventSink::default();
+        let sink_handle = sink.clone();
+        let mut engine = test_engine_with_memory(driver, sink, memory, &base.join("data"));
+
+        // Persist a record carrying a saved thread id and no pending changeset.
+        let id = crate::session::new_session_id();
+        engine
+            .session_store
+            .save(&crate::session::SessionRecord {
+                meta: crate::session::SessionMeta {
+                    id: id.clone(),
+                    name: "이전 대화".to_string(),
+                    project: "ExampleProject".to_string(),
+                    created_at: 1,
+                    updated_at: 1,
+                },
+                thread_id: Some("thread-saved".to_string()),
+                pending_request_ids: Vec::new(),
+                panel_log: serde_json::json!({
+                    "schemaVersion": 1,
+                    "logSeq": 2,
+                    "log": [
+                        { "id": 1, "kind": "you", "text": "마린 HP 올려줘" },
+                        { "id": 2, "kind": "agent", "text": "적용했습니다." }
+                    ]
+                }),
+            })
+            .expect("seed record should save");
+
+        let record = engine.open_session(&id).await.expect("open should succeed");
+        assert_eq!(record.meta.id, id);
+        // The saved thread id was seeded into the driver and the engine armed
+        // `thread_active` so the next chat resumes.
+        assert_eq!(driver_handle.seeded_ids(), vec!["thread-saved".to_string()]);
+        assert!(engine.thread_active, "open_session must arm thread_active");
+        assert_eq!(engine.current_session_id.as_deref(), Some(id.as_str()));
+
+        // A `session_loaded` signal was emitted.
+        assert!(
+            sink_handle
+                .events()
+                .iter()
+                .any(|event| matches!(event, EngineEvent::SessionLoaded(_))),
+            "open_session must emit SessionLoaded"
+        );
+
+        // The next chat takes the resume_turn_text branch (carries [user message],
+        // not the first-turn [first principles] system prompt).
+        engine
+            .chat(crate::ipc::ChatRequest {
+                text: "이어서 작업해줘".to_string(),
+            })
+            .await
+            .expect("post-open chat should resume");
+        let prompts = driver_handle.prompts();
+        let last = prompts.last().expect("a prompt was sent");
+        assert!(
+            last.lines().any(|line| line == "[user message]"),
+            "resumed turn uses resume_turn_text"
+        );
+        assert!(
+            !last.contains("[first principles]"),
+            "resumed turn is not the first-turn system prompt"
+        );
+
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[tokio::test]
+    async fn open_session_reconnects_pending_changeset_from_written_journal() {
+        let base = unique_temp_dir("session-reconnect");
+        let memory = ProjectMemory::new(base.join("memory"), "ExampleProject");
+        let data_dir = base.join("data");
+        let driver = FakeCodexDriver::scripted([]);
+        let sink = CapturingEventSink::default();
+        let sink_handle = sink.clone();
+        let mut engine = test_engine_with_memory(driver, sink, memory, &data_dir);
+
+        // Write a journal file for a pending request (the executor would have done
+        // this during the prior session's turn).
+        let request_id = "req-deadbeef";
+        record_file_write(
+            &engine.journal_store,
+            request_id,
+            "pending-write",
+            1,
+            "scripts/pending.eps",
+        );
+        // Drop it from the live in-memory store so the reconnect path must reload it
+        // from disk (mirrors a fresh app start).
+        engine.journal_store = journal::JournalStore::new(&data_dir);
+
+        let id = crate::session::new_session_id();
+        engine
+            .session_store
+            .save(&crate::session::SessionRecord {
+                meta: crate::session::SessionMeta {
+                    id: id.clone(),
+                    name: "보류된 변경".to_string(),
+                    project: "ExampleProject".to_string(),
+                    created_at: 1,
+                    updated_at: 1,
+                },
+                thread_id: None,
+                pending_request_ids: vec![request_id.to_string()],
+                panel_log: serde_json::json!({ "schemaVersion": 1, "logSeq": 0, "log": [] }),
+            })
+            .expect("seed record should save");
+
+        engine.open_session(&id).await.expect("open should succeed");
+
+        // The pending changeset was re-emitted to the panel and the engine points at
+        // the request so a later decision can finalize it.
+        let changeset = sink_handle
+            .events()
+            .into_iter()
+            .find_map(|event| match event {
+                EngineEvent::Changeset(payload) => Some(payload),
+                _ => None,
+            })
+            .expect("reconnect must re-emit a changeset event");
+        assert_eq!(changeset.request_id, request_id);
+        assert!(!changeset.items.is_empty());
+        assert_eq!(engine.current_request_id.as_deref(), Some(request_id));
+        assert_eq!(engine.phase, Phase::ChangesetReview);
+
+        fs::remove_dir_all(base).ok();
     }
 }

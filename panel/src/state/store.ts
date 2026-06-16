@@ -39,6 +39,7 @@ import type {
   FileEntry,
   LedgerEntry,
   MemoryFile,
+  PanelLog,
   ProgressStage,
 } from "@/lib/ipc";
 // itemIds maps an item to its decision-target ids (a dat group has NO
@@ -389,6 +390,17 @@ export interface PanelStore {
 
   // ---- logging ----
   log(kind: LogKind, text: string, stage?: ProgressStage): void;
+
+  /**
+   * Session restore: seed `core.log` from a saved {@link PanelLog} and ADVANCE
+   * the closure-private id counters (`logSeq`/`toolSeq`/`blockSeq`) past every
+   * restored id so freshly minted ids never collide with restored React keys.
+   * Transient state (turn/plan/changeset/pendingDecision/wiki + connection
+   * flags) is left UNTOUCHED — it re-arrives from the core on reconnect; the
+   * phase stays `connecting`. Returns the max restored log id (the App seeds
+   * `lastToastedLogId` with it to avoid re-toasting historical warn/error rows).
+   */
+  hydrate(panelLog: PanelLog): number;
 }
 
 /**
@@ -1101,6 +1113,72 @@ export function createPanelStore(): PanelStore {
     log(kind, text, stage) {
       pushLog(kind, text, stage);
       emit();
+    },
+
+    hydrate(panelLog) {
+      // Rebuild the durable log entries (LogEntry subset: id/kind/text + optional
+      // stage/tools). Restored tools are always terminal (done/failed) per the
+      // session contract; the subset shapes are widened (string kind/state) on
+      // the wire, so coerce back into the store's literal unions.
+      const restored: LogEntry[] = panelLog.log.map((entry) => {
+        const next: LogEntry = {
+          id: entry.id,
+          kind: entry.kind as LogKind,
+          text: entry.text,
+        };
+        if (entry.stage) next.stage = entry.stage;
+        if (entry.tools) {
+          next.tools = entry.tools.map((tool) => {
+            const t: AgentTool = {
+              id: tool.id,
+              name: tool.name,
+              state: tool.state as AgentTool["state"],
+            };
+            if (tool.args !== undefined) t.args = tool.args;
+            if (tool.detail !== undefined) t.detail = tool.detail;
+            return t;
+          });
+        }
+        return next;
+      });
+      // Cap to the same MAX_LOG_ENTRIES bound the live log obeys (keep the tail).
+      core.log =
+        restored.length > MAX_LOG_ENTRIES
+          ? restored.slice(restored.length - MAX_LOG_ENTRIES)
+          : restored;
+
+      // Advance the closure-private id counters PAST every restored id so the
+      // next pushLog/tool_call/delta never reuses a key React already rendered.
+      // logSeq: honor the saved high-water mark AND the max entry id (defensive
+      // against a stale logSeq); toolSeq: max numeric suffix of any "tool-N" id;
+      // blockSeq: past the restored tools-blocks so a hydrate-then-stream turn
+      // cannot collide (restored entries live in the log, not turn.blocks, but
+      // the contract advances it for safety).
+      let maxLogId = panelLog.logSeq ?? 0;
+      let maxTool = 0;
+      let restoredToolBlocks = 0;
+      for (const entry of restored) {
+        if (entry.id > maxLogId) maxLogId = entry.id;
+        if (entry.tools) {
+          restoredToolBlocks += 1;
+          for (const tool of entry.tools) {
+            const m = /^tool-(\d+)$/.exec(tool.id);
+            if (m) {
+              const n = Number(m[1]);
+              if (n > maxTool) maxTool = n;
+            }
+          }
+        }
+      }
+      if (maxLogId > logSeq) logSeq = maxLogId;
+      if (maxTool > toolSeq) toolSeq = maxTool;
+      blockSeq += restoredToolBlocks;
+
+      // Transient state (turn/plan/changeset/pendingDecision/wiki + connection
+      // flags) is deliberately untouched — it re-arrives from the core; phase
+      // stays connecting (the connect flow drives it onward).
+      emit();
+      return maxLogId;
     },
   };
 }

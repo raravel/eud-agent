@@ -84,6 +84,17 @@ pub struct ChatRequest {
     pub text: String,
 }
 
+/// `session_save` command input (session restore). The `panelLog` is opaque to
+/// Rust — stored and returned verbatim; the panel owns its schema.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionSaveRequest {
+    /// User-chosen session name.
+    pub name: String,
+    /// The panel's serialized log blob, stored verbatim.
+    pub panel_log: serde_json::Value,
+}
+
 /// `plan_feedback` command input.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlanFeedbackRequest {
@@ -301,6 +312,15 @@ pub struct ChangesetEvent {
     pub request_id: String,
     /// Journaled changeset items awaiting a decision.
     pub items: Vec<ChangesetItem>,
+}
+
+/// `session_loaded` event payload (session restore): a signal only. Carries the
+/// loaded session id so the panel can correlate, never a rendered-raw kind string.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionLoadedEvent {
+    /// The id of the session that just finished loading.
+    pub id: String,
 }
 
 /// `rollback_result` event payload.
@@ -686,6 +706,14 @@ pub fn emit_status<R: tauri::Runtime>(
     payload: StatusResponse,
 ) -> tauri::Result<()> {
     emitter.emit("status", payload)
+}
+
+/// Emit a `session_loaded` event (session restore signal).
+pub fn emit_session_loaded<R: tauri::Runtime>(
+    emitter: &impl Emitter<R>,
+    payload: SessionLoadedEvent,
+) -> tauri::Result<()> {
+    emitter.emit("session_loaded", payload)
 }
 
 #[cfg(test)]

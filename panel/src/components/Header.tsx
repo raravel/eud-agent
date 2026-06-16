@@ -5,7 +5,7 @@
  * (`rag_warmup` started → done, elapsed formatted via lib/progress). Korean
  * labels throughout.
  */
-import { BookText, Database, MonitorPlay } from "lucide-react";
+import { BookText, Database, History, MonitorPlay } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import {
@@ -50,6 +50,10 @@ export interface HeaderProps {
   onWikiOpen?: () => void;
   /** Whether the dat-edit wiki overlay is currently visible. */
   wikiOpen?: boolean;
+  /** Open the saved-sessions (대화 목록) overlay. */
+  onSessionsOpen?: () => void;
+  /** Whether the saved-sessions overlay is currently visible. */
+  sessionsOpen?: boolean;
 }
 
 /** One status pill descriptor: label + tone classes + whether it is in flight. */
@@ -151,6 +155,8 @@ export function Header({
   memoryOpen = false,
   onWikiOpen,
   wikiOpen = false,
+  onSessionsOpen,
+  sessionsOpen = false,
 }: HeaderProps) {
   const conn = connState(connected, phase, editorConnected, hasProject);
   const ragInfo = ragPill(rag);
@@ -199,6 +205,23 @@ export function Header({
         )}
         {ragInfo && <StatusPill pill={ragInfo} />}
         <StatusPill pill={conn} />
+        {onSessionsOpen && (
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                type="button"
+                size="icon"
+                variant="ghost"
+                aria-label="대화 목록"
+                aria-pressed={sessionsOpen}
+                onClick={onSessionsOpen}
+              >
+                <History className="size-4" aria-hidden="true" />
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent>대화 목록</TooltipContent>
+          </Tooltip>
+        )}
         {onWikiOpen && (
           <Tooltip>
             <TooltipTrigger asChild>
