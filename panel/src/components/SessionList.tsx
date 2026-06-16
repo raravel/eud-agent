@@ -30,10 +30,10 @@ export interface SessionListProps {
   onList(): Promise<SessionMeta[]>;
   /** Open a saved session by id (App hydrates from the returned record). */
   onOpen(id: string): void;
-  /** Rename a session. */
-  onRename(id: string, name: string): void;
-  /** Delete a session. */
-  onDelete(id: string): void;
+  /** Rename a session; the resolved promise reconciles the optimistic row. */
+  onRename(id: string, name: string): void | Promise<void>;
+  /** Delete a session; the resolved promise reconciles the optimistic row. */
+  onDelete(id: string): void | Promise<void>;
   /** Save the current conversation under `name` (creates or updates the active). */
   onSave(name: string): void;
 }
@@ -102,16 +102,18 @@ export function SessionList({
     const name = window.prompt("새 이름을 입력하세요.", session.name);
     const trimmed = name?.trim();
     if (!trimmed || trimmed === session.name) return;
-    onRename(session.id, trimmed);
+    // Optimistic; reconcile with the authoritative core list on settle so a
+    // failed rename reverts instead of silently diverging.
     setSessions((prev) =>
       prev.map((s) => (s.id === session.id ? { ...s, name: trimmed } : s)),
     );
+    void Promise.resolve(onRename(session.id, trimmed)).finally(refresh);
   };
 
   const handleDelete = (session: SessionMeta) => {
     if (!window.confirm(`'${session.name}' 대화를 삭제할까요?`)) return;
-    onDelete(session.id);
     setSessions((prev) => prev.filter((s) => s.id !== session.id));
+    void Promise.resolve(onDelete(session.id)).finally(refresh);
   };
 
   return (

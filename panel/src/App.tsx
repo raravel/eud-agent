@@ -576,9 +576,8 @@ export default function App() {
           const maxId = store.hydrate(record.panelLog);
           lastToastedLogId.current = maxId;
           setSessionListOpen(false);
-          // Pull a fresh editor snapshot so the header/files reflect the
-          // session's project once the live state repopulates.
-          void clientRef.current?.refresh();
+          // The editor snapshot is settled by the `session_loaded` listener the
+          // core emits at the end of the reconnect (above); no inline refresh.
         })
         .catch((error) => {
           store.log("error", `대화를 여는 데 실패했습니다: ${String(error)}`);
@@ -587,18 +586,24 @@ export default function App() {
     [store],
   );
 
-  const handleSessionRename = useCallback((id: string, name: string) => {
-    void invoke("session_rename", { id, name }).catch(() => {
-      /* surfaced by a failed list refresh; no toast storm */
-    });
-  }, []);
+  // Returns the invoke promise so SessionList can reconcile its optimistic row
+  // with the core on settle (and surface a failure rather than leaving the list
+  // silently diverged from the core).
+  const handleSessionRename = useCallback(
+    (id: string, name: string) =>
+      invoke<void>("session_rename", { id, name }).catch((error) => {
+        store.log("error", `이름 변경에 실패했습니다: ${String(error)}`);
+        throw error;
+      }),
+    [store],
+  );
 
   const handleSessionDelete = useCallback(
-    (id: string) => {
-      void invoke("session_delete", { id }).catch((error) => {
+    (id: string) =>
+      invoke<void>("session_delete", { id }).catch((error) => {
         store.log("warn", `대화 삭제에 실패했습니다: ${String(error)}`);
-      });
-    },
+        throw error;
+      }),
     [store],
   );
 

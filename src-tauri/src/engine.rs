@@ -402,7 +402,19 @@ impl<D: CodexDriver, S: EventSink> AgentEngine<D, S> {
             return self.driver.run_turn(turn_text).await;
         };
 
-        // Primary path: the saved thread is already seeded, so this is a resume.
+        // No resumable thread was seeded (the saved record had no thread id, or the
+        // seed failed in `open_session`): there is nothing to resume, so start fresh
+        // and inject the transcript directly rather than waiting out a resume that
+        // cannot happen.
+        if !self.thread_active {
+            return self
+                .fresh_start_with_transcript(&transcript, user_text)
+                .await;
+        }
+
+        // Primary path: the saved thread is already seeded, so this is a resume. If
+        // it errors OR does not complete within the bounded timeout (codex may never
+        // signal a missing rollout), fall back to a fresh start + transcript replay.
         let resume =
             tokio::time::timeout(RESUME_FALLBACK_TIMEOUT, self.driver.run_turn(turn_text)).await;
         match resume {
@@ -421,10 +433,12 @@ impl<D: CodexDriver, S: EventSink> AgentEngine<D, S> {
     }
 
     /// Drop the seeded thread, start fresh, and re-run with the condensed prior
-    /// transcript injected into the first turn's prompt via the existing
-    /// `resume_turn_text` prepend path (resume fallback body, decision E). The
-    /// transcript is folded into the `[user message]` text so the fresh thread
-    /// still sees prior context.
+    /// transcript folded into the first turn's user text (resume fallback body,
+    /// decision E). This is a genuinely NEW codex thread, so it MUST carry the
+    /// full `build_system_prompt` — including the `[first principles]` never-do
+    /// guardrails the new thread has never seen — exactly like a cold start.
+    /// Using `resume_turn_text` here would omit those guardrails (rules.md: the
+    /// system prompt ALWAYS carries `[first principles]`).
     async fn fresh_start_with_transcript(
         &mut self,
         transcript: &str,
@@ -436,12 +450,16 @@ impl<D: CodexDriver, S: EventSink> AgentEngine<D, S> {
         let project_state = self.config.project_state_for_prompt();
         let replayed = format!("{transcript}\n\n{user_text}");
         let wiki = self.config.wiki_section_for_prompt(user_text);
-        let turn_text = resume_turn_text(
-            &replayed,
-            &self.config.rag_hits,
-            &project_state,
-            memory.as_deref(),
-            wiki.as_deref(),
+        let turn_text = format!(
+            "{}\n\n{}",
+            build_system_prompt(
+                &replayed,
+                &self.config.rag_hits,
+                &project_state,
+                memory.as_deref(),
+                wiki.as_deref(),
+            ),
+            replayed
         );
         let result = self.driver.run_turn(turn_text).await?;
         // The fresh thread is now live; subsequent turns resume normally.
@@ -748,12 +766,25 @@ impl<D: CodexDriver, S: EventSink> AgentEngine<D, S> {
         let pending_request_ids = self.live_pending_request_ids();
         let project = self.current_project_name();
 
-        let record = match self
-            .current_session_id
-            .clone()
-            .and_then(|id| self.session_store.load(&id).ok())
-        {
-            Some(mut existing) => {
+        let record = match self.current_session_id.clone() {
+            Some(id) => {
+                // Update the active session in place. If its record is unreadable
+                // (deleted or corrupted out-of-band), rebuild under the SAME id
+                // rather than minting a new one and losing the stable session id.
+                let mut existing = self.session_store.load(&id).unwrap_or_else(|_| {
+                    crate::session::SessionRecord {
+                        meta: crate::session::SessionMeta {
+                            id: id.clone(),
+                            name: String::new(),
+                            project: String::new(),
+                            created_at: now,
+                            updated_at: now,
+                        },
+                        thread_id: None,
+                        pending_request_ids: Vec::new(),
+                        panel_log: serde_json::Value::Null,
+                    }
+                });
                 existing.meta.name = req.name;
                 existing.meta.project = project;
                 existing.meta.updated_at = now;
@@ -806,18 +837,31 @@ impl<D: CodexDriver, S: EventSink> AgentEngine<D, S> {
         // success arm `thread_active` + stage a condensed transcript so the first
         // post-open turn can fall back to a fresh start (decision E). On a seed
         // error, leave the thread fresh and replay the transcript on the next turn.
+        // Stage the condensed prior conversation so it can be replayed into a fresh
+        // thread when a real resume is unavailable (decision E). Empty when there is
+        // no conversation to replay.
+        let transcript = condense_transcript(&record.panel_log);
+        let staged = (!transcript.is_empty()).then_some(transcript);
         if let Some(thread_id) = record.thread_id.clone() {
             match self.driver.seed_thread_id(thread_id).await {
                 Ok(()) => {
+                    // Resume on the next chat; the transcript is the fallback payload.
                     self.thread_active = true;
-                    self.pending_resume_transcript = Some(condense_transcript(&record.panel_log));
+                    self.pending_resume_transcript = staged;
                 }
                 Err(error) => {
+                    // No usable thread: the next chat starts fresh and replays directly.
                     eprintln!("eud-agent: thread seed failed, will replay transcript: {error}");
                     self.thread_active = false;
-                    self.pending_resume_transcript = Some(condense_transcript(&record.panel_log));
+                    self.pending_resume_transcript = staged;
                 }
             }
+        } else if staged.is_some() {
+            // The record was saved before a thread id was captured (e.g. mid-first
+            // turn): there is no thread to resume, but replay the prior conversation
+            // into a fresh thread so the model still keeps prior context.
+            self.thread_active = false;
+            self.pending_resume_transcript = staged;
         }
 
         self.current_session_id = Some(record.meta.id.clone());
@@ -2089,6 +2133,9 @@ mod tests {
         /// sets it, mirroring the production client's thread_id mutex.
         thread_id: Arc<Mutex<Option<String>>>,
         seeded: Arc<Mutex<Vec<String>>>,
+        /// Number of upcoming `run_turn` calls that should return Err (to exercise
+        /// the resume fallback). Decremented per failed call.
+        fail_runs: Arc<Mutex<usize>>,
     }
 
     impl FakeCodexDriver {
@@ -2099,7 +2146,13 @@ mod tests {
                 reset_count: Arc::new(Mutex::new(0)),
                 thread_id: Arc::new(Mutex::new(None)),
                 seeded: Arc::new(Mutex::new(Vec::new())),
+                fail_runs: Arc::new(Mutex::new(0)),
             }
+        }
+
+        /// Make the next `n` `run_turn` calls fail, forcing the resume fallback.
+        fn fail_next_runs(&self, n: usize) {
+            *self.fail_runs.lock().expect("fail runs lock") = n;
         }
 
         fn prompts(&self) -> Vec<String> {
@@ -2121,6 +2174,15 @@ mod tests {
             turn_text: String,
         ) -> Result<CodexTurnResult, AgentEngineError> {
             self.prompts.lock().expect("prompts lock").push(turn_text);
+            // Scripted resume failure: return Err without consuming a turn so the
+            // engine's resume fallback (decision E) can be exercised.
+            {
+                let mut fail = self.fail_runs.lock().expect("fail runs lock");
+                if *fail > 0 {
+                    *fail -= 1;
+                    return Err(AgentEngineError::new("scripted resume failure".to_string()));
+                }
+            }
             // A fresh turn (no seeded/live thread) mints a thread id so
             // `current_thread_id` returns one by turn completion (matches the
             // production driver capturing `ThreadStarted`).
@@ -3437,6 +3499,16 @@ mod tests {
             .expect("save should create a session");
         assert_eq!(engine.current_session_id.as_deref(), Some(id.as_str()));
 
+        // Force the on-disk record's thread_id stale so the post-chat assertion can
+        // ONLY pass if the second chat's auto-update actually re-captures the live
+        // thread id (isolates decision B from the prior save_session capture).
+        let mut stale = engine.session_store.load(&id).expect("record should load");
+        stale.thread_id = None;
+        engine
+            .session_store
+            .save(&stale)
+            .expect("stale record should save");
+
         // A subsequent completed chat auto-updates the record's thread_id.
         engine
             .chat(crate::ipc::ChatRequest {
@@ -3447,6 +3519,77 @@ mod tests {
 
         let record = engine.session_store.load(&id).expect("record should load");
         assert_eq!(record.thread_id, Some("thread-fake".to_string()));
+
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[tokio::test]
+    async fn open_session_resume_failure_falls_back_to_fresh_start_with_guardrails() {
+        let base = unique_temp_dir("session-resume-fallback");
+        let memory = ProjectMemory::new(base.join("memory"), "ExampleProject");
+        let driver = FakeCodexDriver::scripted([CodexTurnResult::Answer {
+            text: "Fresh-start replay answer.".to_string(),
+        }]);
+        // The seeded resume attempt fails, forcing the fresh-start replay path.
+        driver.fail_next_runs(1);
+        let driver_handle = driver.clone();
+        let sink = CapturingEventSink::default();
+        let mut engine = test_engine_with_memory(driver, sink, memory, &base.join("data"));
+
+        let id = crate::session::new_session_id();
+        engine
+            .session_store
+            .save(&crate::session::SessionRecord {
+                meta: crate::session::SessionMeta {
+                    id: id.clone(),
+                    name: "이전 대화".to_string(),
+                    project: "ExampleProject".to_string(),
+                    created_at: 1,
+                    updated_at: 1,
+                },
+                thread_id: Some("thread-stale".to_string()),
+                pending_request_ids: Vec::new(),
+                panel_log: serde_json::json!({
+                    "schemaVersion": 1,
+                    "logSeq": 2,
+                    "log": [
+                        { "id": 1, "kind": "you", "text": "마린 HP 올려줘" },
+                        { "id": 2, "kind": "agent", "text": "적용했습니다." }
+                    ]
+                }),
+            })
+            .expect("seed record should save");
+
+        engine.open_session(&id).await.expect("open should succeed");
+        assert!(engine.thread_active, "seeded open arms thread_active");
+
+        // The post-open chat attempts the resume, it fails, and the engine falls
+        // back to a fresh thread/start that replays the transcript.
+        engine
+            .chat(crate::ipc::ChatRequest {
+                text: "이어서 작업해줘".to_string(),
+            })
+            .await
+            .expect("post-open chat should fall back and succeed");
+
+        // reset_thread fired twice: once in open_session's reset(), once dropping
+        // the stale thread in the fresh-start fallback.
+        assert_eq!(driver_handle.reset_count(), 2);
+
+        let prompts = driver_handle.prompts();
+        let last = prompts.last().expect("a prompt was sent");
+        // The fresh-start fallback turn MUST carry the never-do guardrails (a brand
+        // new thread has never seen them) — the core of finding #1.
+        assert!(
+            last.contains("[first principles]"),
+            "fallback fresh thread must seed the first-principles guardrails"
+        );
+        // ...and the condensed prior conversation so the model keeps context.
+        assert!(
+            last.contains("마린 HP 올려줘"),
+            "fallback turn replays the prior transcript"
+        );
+        assert!(engine.thread_active, "fresh thread is live after fallback");
 
         fs::remove_dir_all(base).ok();
     }

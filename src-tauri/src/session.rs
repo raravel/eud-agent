@@ -105,6 +105,12 @@ impl SessionStore {
 
     /// Write the `<id>.json` record and rewrite `index.json` (most-recently-updated
     /// first). Both via [`write_atomic_bytes`] (temp + rename, UTF-8 no BOM).
+    ///
+    /// Each write is individually atomic but the pair is not transactional: if the
+    /// index rewrite fails after the record write succeeds, the record exists but is
+    /// not listed (an invisible orphan). This is an accepted, rare partial-failure
+    /// window — the engine Mutex serializes callers (no concurrent-write race) and
+    /// the next successful `save` of the same id rewrites both files, self-healing.
     pub fn save(&self, rec: &SessionRecord) -> anyhow::Result<()> {
         let bytes = serde_json::to_vec_pretty(rec)?;
         write_atomic_bytes(&self.record_path(&rec.meta.id), &bytes)?;
