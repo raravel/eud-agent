@@ -530,8 +530,14 @@ where
         Ok(())
     }
 
-    async fn current_thread_id(&self) -> Option<String> {
+    pub async fn current_thread_id(&self) -> Option<String> {
         self.thread_id.lock().await.clone()
+    }
+
+    /// Seed the client's thread id so the NEXT `run_turn` issues `thread/resume`
+    /// against `id` (session restore: the driver injects the saved thread id).
+    pub async fn set_thread_id(&self, id: String) {
+        *self.thread_id.lock().await = Some(id);
     }
 
     async fn await_thread_started(&self) -> Result<String, AppServerError> {

@@ -275,6 +275,68 @@ export interface SetupMessage {
   error?: string;
 }
 
+// ---- sessions (session restore feature) ------------------------------
+/**
+ * Saved-session list metadata (the `session_list` result rows and the
+ * flattened head of a `SessionRecord`). Field names are camelCase to match the
+ * Rust `SessionMeta` (`#[serde(rename_all = "camelCase")]`); `createdAt` /
+ * `updatedAt` are Unix seconds. The list is ordered most-recently-updated first.
+ */
+export interface SessionMeta {
+  id: string;
+  name: string;
+  /** Editor project name captured at session creation. */
+  project: string;
+  createdAt: number;
+  updatedAt: number;
+}
+
+/**
+ * The panel-owned durable conversation snapshot persisted inside a session
+ * record. Opaque to Rust (stored/returned verbatim); its schema is owned here.
+ * `logSeq` is the closure-private monotonic id high-water mark the store must
+ * advance past on hydrate so restored ids never collide with fresh ones. Each
+ * `log` entry is the DURABLE {@link LogEntry} subset (id/kind/text + optional
+ * stage/tools); transient turn/plan/changeset state is NOT persisted.
+ */
+export interface PanelLog {
+  schemaVersion: number;
+  logSeq: number;
+  log: PanelLogEntry[];
+}
+
+/** Durable log entry persisted in {@link PanelLog} (subset of the store LogEntry). */
+export interface PanelLogEntry {
+  id: number;
+  kind: string;
+  text: string;
+  stage?: string;
+  tools?: PanelLogTool[];
+}
+
+/** Durable archived-tool row persisted in a {@link PanelLogEntry} (subset of AgentTool). */
+export interface PanelLogTool {
+  id: string;
+  name: string;
+  /** Always terminal (done/failed) for an archived tool. */
+  state: string;
+  args?: string;
+  detail?: string;
+}
+
+/**
+ * The full saved session as returned by `session_open` — {@link SessionMeta}
+ * (flattened) plus the resume/reconnect fields. Field names are camelCase to
+ * match the Rust `SessionRecord`. `threadId` is null until the first turn emits
+ * `ThreadStarted`; `pendingRequestIds` holds the (≤1, decision C) live changeset
+ * journal ids reconnected on open; `panelLog` seeds {@link PanelStore.hydrate}.
+ */
+export interface SessionRecord extends SessionMeta {
+  threadId: string | null;
+  pendingRequestIds: string[];
+  panelLog: PanelLog;
+}
+
 /** Discriminated union of every documented core -> panel message. */
 export type ServerMessage =
   | AgentEventMessage

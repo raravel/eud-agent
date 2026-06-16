@@ -33,14 +33,20 @@ import { MemoryView } from "@/components/MemoryView";
 import { WikiView } from "@/components/WikiView";
 import { InstructionBox, type ChatPayload } from "@/components/InstructionBox";
 import { ConnectionNotice } from "@/components/ConnectionNotice";
+import { SessionList } from "@/components/SessionList";
 import { createPanelStore } from "@/state/store";
+import type { LogEntry } from "@/state/store";
 import {
   IpcClient,
   wikiGet,
   wikiSave,
   type LedgerEntry,
   type MemoryFile,
+  type PanelLog,
+  type PanelLogEntry,
   type ServerMessage,
+  type SessionMeta,
+  type SessionRecord,
   type SetupMessage,
 } from "@/lib/ipc";
 import { progressLabel } from "@/lib/progress";
@@ -52,6 +58,7 @@ import { SetupScreen } from "@/setup/SetupScreen";
 import { UpdateNotice } from "@/components/UpdateNotice";
 import { createUpdater, type UpdateHandle } from "@/setup/update";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 
 /** codex login probe result (mirrors the Rust `CodexAuthState`). */
 interface CodexAuthState {
@@ -76,6 +83,39 @@ interface BootstrapState {
   active: boolean;
   view: BootstrapView;
   error: string | null;
+}
+
+/** panelLog schema version (features/sessions.md ## panelLog schema). */
+const PANEL_LOG_SCHEMA_VERSION = 1;
+
+/**
+ * Serialize the live conversation log into the DURABLE {@link PanelLog} subset
+ * pushed via `session_update_log` (features/sessions.md): only `id/kind/text` + optional
+ * `stage`/`tools` survive; transient turn/plan/changeset/wiki state is dropped
+ * (it re-arrives from the core on reconnect). `logSeq` is the max entry id so
+ * the store can advance its counters past the restored ids on hydrate.
+ */
+function serializePanelLog(log: readonly LogEntry[]): PanelLog {
+  const entries: PanelLogEntry[] = log.map((entry) => {
+    const next: PanelLogEntry = {
+      id: entry.id,
+      kind: entry.kind,
+      text: entry.text,
+    };
+    if (entry.stage) next.stage = entry.stage;
+    if (entry.tools) {
+      next.tools = entry.tools.map((tool) => ({
+        id: tool.id,
+        name: tool.name,
+        state: tool.state,
+        ...(tool.args !== undefined ? { args: tool.args } : {}),
+        ...(tool.detail !== undefined ? { detail: tool.detail } : {}),
+      }));
+    }
+    return next;
+  });
+  const logSeq = log.reduce((max, entry) => (entry.id > max ? entry.id : max), 0);
+  return { schemaVersion: PANEL_LOG_SCHEMA_VERSION, logSeq, log: entries };
 }
 
 export default function App() {
@@ -129,6 +169,14 @@ export default function App() {
   const [update, setUpdate] = useState<UpdateHandle | null>(null);
   const [updateDismissed, setUpdateDismissed] = useState(false);
   const updateCheckedRef = useRef(false);
+  // Session-restore overlay (App-local UI state). The list is fetched lazily by
+  // SessionList each time it opens; open/rename/delete are Tauri commands. A
+  // conversation auto-saves (no save button): the core auto-creates a session on
+  // the first turn and the panel pushes its log after each change.
+  const [sessionListOpen, setSessionListOpen] = useState(false);
+  // The active session id (auto-created on the first turn or opened), tracked from
+  // the `session_active` event so the list can highlight the current row.
+  const [currentSessionId, setCurrentSessionId] = useState<string | null>(null);
 
   useEffect(() => {
     bootstrapActiveRef.current = bootstrap.active;
@@ -363,6 +411,60 @@ export default function App() {
     };
   }, [store, onMessage]);
 
+  // `session_loaded` is a SIGNAL only (features/sessions.md): the core emits it
+  // after a session_open reconnect completes. Its payload carries nothing
+  // rendered raw (rules.md forbids raw kind identifiers as user text); the panel
+  // already hydrated from the session_open return value, so this just pulls a
+  // fresh editor snapshot to settle live state. Registered outside the IpcClient
+  // because it is not part of the closed ServerMessage push set.
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    let cancelled = false;
+    void listen("session_loaded", () => {
+      void clientRef.current?.refresh();
+    }).then((fn) => {
+      if (cancelled) fn();
+      else unlisten = fn;
+    });
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, []);
+
+  // `session_active`: the core auto-created (first turn) or opened a session.
+  // Track its id so the list can highlight the current conversation.
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    let cancelled = false;
+    void listen<{ id: string; name: string }>("session_active", (event) => {
+      setCurrentSessionId(event.payload.id);
+    }).then((fn) => {
+      if (cancelled) fn();
+      else unlisten = fn;
+    });
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, []);
+
+  // Auto-persist the conversation (no save button): whenever the durable log
+  // changes, push the serialized subset to the active session shortly after
+  // (debounced to coalesce a turn's rapid updates). No-op server-side until the
+  // first turn auto-creates a session, so this never makes a junk session.
+  useEffect(() => {
+    if (state.log.length === 0) return;
+    const handle = window.setTimeout(() => {
+      void invoke("session_update_log", {
+        panelLog: serializePanelLog(store.getState().log),
+      }).catch(() => {
+        /* background sync; the core logs any write failure */
+      });
+    }, 500);
+    return () => window.clearTimeout(handle);
+  }, [state.log, store]);
+
   // Editor-liveness poll. Once armed (first-run setup satisfied), probe the
   // editor every EDITOR_POLL_MS. The transport stays open throughout, so this
   // only drives editorConnected (send gate + ConnectionNotice) and recovers a
@@ -471,8 +573,63 @@ export default function App() {
     const sent = await clientRef.current?.send({ type: "reset" });
     if (sent) {
       store.resetSent();
+      // The core detaches its active session on reset; the next turn auto-creates
+      // a fresh one. Drop the highlight so the list shows no current row meanwhile.
+      setCurrentSessionId(null);
     }
   }, [store]);
+
+  // ---- session restore (features/sessions.md) ----
+  // List the saved sessions (most-recently-updated first; Rust orders them).
+  const handleSessionList = useCallback(
+    () => invoke<SessionMeta[]>("session_list"),
+    [],
+  );
+
+  // Open a saved session: the core resets the live thread, seeds the saved
+  // thread_id, and reconnects ≤1 pending changeset (which arrives as a live
+  // `changeset` event). The panel hydrates the conversation from the returned
+  // record BEFORE the live connect flow repopulates transient state, and seeds
+  // lastToastedLogId to the restored max id so historical warn/error rows do
+  // NOT pop a toast storm. The transient review surfaces are NOT re-opened from
+  // the log — they gate on the live `changeset`/`plan` the core re-emits.
+  const handleSessionOpen = useCallback(
+    (id: string) => {
+      void invoke<SessionRecord>("session_open", { id })
+        .then((record) => {
+          const maxId = store.hydrate(record.panelLog);
+          lastToastedLogId.current = maxId;
+          setSessionListOpen(false);
+          // The editor snapshot is settled by the `session_loaded` listener the
+          // core emits at the end of the reconnect (above); no inline refresh.
+        })
+        .catch((error) => {
+          store.log("error", `대화를 여는 데 실패했습니다: ${String(error)}`);
+        });
+    },
+    [store],
+  );
+
+  // Returns the invoke promise so SessionList can reconcile its optimistic row
+  // with the core on settle (and surface a failure rather than leaving the list
+  // silently diverged from the core).
+  const handleSessionRename = useCallback(
+    (id: string, name: string) =>
+      invoke<void>("session_rename", { id, name }).catch((error) => {
+        store.log("error", `이름 변경에 실패했습니다: ${String(error)}`);
+        throw error;
+      }),
+    [store],
+  );
+
+  const handleSessionDelete = useCallback(
+    (id: string) =>
+      invoke<void>("session_delete", { id }).catch((error) => {
+        store.log("warn", `대화 삭제에 실패했습니다: ${String(error)}`);
+        throw error;
+      }),
+    [store],
+  );
 
   // Retry re-runs the backend download command (it re-fetches the release
   // manifest and skips already-verified assets), replacing the old full-reload
@@ -760,6 +917,8 @@ export default function App() {
         onMemoryOpen={handleMemoryOpen}
         wikiOpen={wikiOpen}
         onWikiOpen={handleWikiOpen}
+        sessionsOpen={sessionListOpen}
+        onSessionsOpen={() => setSessionListOpen((open) => !open)}
       />
 
       {update && !updateDismissed && (
@@ -828,6 +987,15 @@ export default function App() {
 
       <InstructionBox state={state} onSend={handleSend} onReset={handleReset} />
       </div>
+      <SessionList
+        open={sessionListOpen}
+        onClose={() => setSessionListOpen(false)}
+        currentId={currentSessionId}
+        onList={handleSessionList}
+        onOpen={handleSessionOpen}
+        onRename={handleSessionRename}
+        onDelete={handleSessionDelete}
+      />
     </div>
   );
 }

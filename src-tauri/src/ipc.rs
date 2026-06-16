@@ -303,6 +303,27 @@ pub struct ChangesetEvent {
     pub items: Vec<ChangesetItem>,
 }
 
+/// `session_loaded` event payload (session restore): a signal only. Carries the
+/// loaded session id so the panel can correlate, never a rendered-raw kind string.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionLoadedEvent {
+    /// The id of the session that just finished loading.
+    pub id: String,
+}
+
+/// `session_active` event payload (session restore): the active session changed
+/// (auto-created on a first turn, or opened). Lets the panel highlight the current
+/// session and target rename. `name` is a label, never a rendered-raw kind string.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionActiveEvent {
+    /// The id of the now-active session.
+    pub id: String,
+    /// Its current (auto-derived or renamed) title.
+    pub name: String,
+}
+
 /// `rollback_result` event payload.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RollbackResultEvent {
@@ -686,6 +707,22 @@ pub fn emit_status<R: tauri::Runtime>(
     payload: StatusResponse,
 ) -> tauri::Result<()> {
     emitter.emit("status", payload)
+}
+
+/// Emit a `session_loaded` event (session restore signal).
+pub fn emit_session_loaded<R: tauri::Runtime>(
+    emitter: &impl Emitter<R>,
+    payload: SessionLoadedEvent,
+) -> tauri::Result<()> {
+    emitter.emit("session_loaded", payload)
+}
+
+/// Emit a `session_active` event (active session changed).
+pub fn emit_session_active<R: tauri::Runtime>(
+    emitter: &impl Emitter<R>,
+    payload: SessionActiveEvent,
+) -> tauri::Result<()> {
+    emitter.emit("session_active", payload)
 }
 
 #[cfg(test)]
