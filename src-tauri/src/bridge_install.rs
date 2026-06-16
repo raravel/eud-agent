@@ -25,10 +25,7 @@ pub const BRIDGE_LUA_NAME: &str = "ZZZ_10_agent_bridge.lua";
 /// Mirrors `install_bridge.ps1` (`$TriggerEditorRel`) and `config::validate_editor_path`,
 /// which uses the same folder as the marker that a path is a real editor install.
 pub fn trigger_editor_dir(editor_path: &Path) -> PathBuf {
-    editor_path
-        .join("Data")
-        .join("Lua")
-        .join("TriggerEditor")
+    editor_path.join("Data").join("Lua").join("TriggerEditor")
 }
 
 /// Copy `bundled_lua` over the editor's bridge copy when their bytes differ.
