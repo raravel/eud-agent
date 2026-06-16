@@ -46,6 +46,10 @@ $hb = New-Object System.Drawing.Bitmap($hw, $hh, [System.Drawing.Imaging.PixelFo
 $g = [System.Drawing.Graphics]::FromImage($hb)
 $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
 $g.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+# PixelOffsetMode.Half: without it, AntiAlias + bicubic DrawImage antialiases the image
+# rectangle edge at a half-pixel offset and bleeds a 1px fringe (a stray yellow column)
+# down the logo's right edge against the white background. Half pixel offset removes it.
+$g.PixelOffsetMode = [System.Drawing.Drawing2D.PixelOffsetMode]::Half
 $g.TextRenderingHint = [System.Drawing.Text.TextRenderingHint]::AntiAliasGridFit
 $g.Clear([System.Drawing.Color]::White)
 $logo = 41
@@ -67,6 +71,8 @@ $sb = New-Object System.Drawing.Bitmap($sw, $sh, [System.Drawing.Imaging.PixelFo
 $g = [System.Drawing.Graphics]::FromImage($sb)
 $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
 $g.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+# See header note: prevents the 1px DrawImage edge fringe on the logo.
+$g.PixelOffsetMode = [System.Drawing.Drawing2D.PixelOffsetMode]::Half
 $g.TextRenderingHint = [System.Drawing.Text.TextRenderingHint]::AntiAliasGridFit
 $grad = New-Object System.Drawing.Drawing2D.LinearGradientBrush(
     (New-Object System.Drawing.Point(0, 0)),
