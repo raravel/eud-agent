@@ -141,8 +141,22 @@ async fn run_bootstrap_inner(
     if config.model.name.trim().is_empty() {
         config.model.name = bootstrap::DEFAULT_MODEL_NAME.to_string();
     }
+    // Re-fetch the release manifest whenever we are about to (re)download the RAG
+    // index, not only when the pin is empty/wrong-version. A pinned sha256 goes
+    // stale if the `rag-index.bin` under the same version tag was republished with
+    // new content (the version field did not change), which would otherwise leave
+    // existing installs verifying a freshly-downloaded binary against a dead hash
+    // forever. When the asset is already Present on disk this branch is skipped, so
+    // a healthy install pays no extra network cost.
+    let rag_needs_download = bootstrap::asset_status(
+        &dirs.rag_dir(),
+        bootstrap::RAG_INDEX_FILENAME,
+        &config.rag_index,
+    )
+    .needs_download();
     if config.rag_index.sha256.trim().is_empty()
         || config.rag_index.version != bootstrap::REQUIRED_RAG_INDEX_VERSION
+        || rag_needs_download
     {
         emitter.emit("bootstrap", 0, "fetching release manifest");
         config.rag_index = bootstrap::fetch_release_manifest().await?;

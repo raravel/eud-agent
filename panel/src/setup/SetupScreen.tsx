@@ -108,7 +108,9 @@ function ErrorNotice({ children }: { children: ReactNode }) {
   return (
     <p className="flex items-start gap-2 rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
       <CircleAlertIcon aria-hidden className="mt-0.5 size-4 shrink-0" />
-      <span>{children}</span>
+      {/* min-w-0 + break-words so a long unbroken token (e.g. a 64-char sha256
+          in an error) wraps inside the box instead of overflowing the card. */}
+      <span className="min-w-0 break-words [overflow-wrap:anywhere]">{children}</span>
     </p>
   );
 }
