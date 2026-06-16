@@ -11,12 +11,16 @@ independently; do not drift from the command names, JSON shapes, or event names 
 
 ## Confirmed decisions
 
-- **A. Rust owns all session files.** The panel never touches the filesystem; it POSTs its
-  serialized log through `session_save` and Rust writes the whole record. (Matches the
+- **A. Rust owns all session files.** The panel never touches the filesystem; it pushes its
+  serialized log through `session_update_log` and Rust writes the whole record. (Matches the
   `panel ↔ core is Tauri IPC only` rule.)
-- **B. Explicit create + auto-update.** A brand-new conversation is NOT persisted until the
-  user names and saves it. Once a session is open/active, every completed `chat` turn
-  auto-updates that session record (thread_id, panel log, pending req-ids).
+- **B. Auto-save (no save button).** A conversation IS a session, persisted continuously —
+  exactly like codex's rollout or a ChatGPT chat. The core auto-creates the active session on
+  the conversation's FIRST turn (auto-named from the first user message; rename later from the
+  list), and every completed `chat` turn auto-updates the record (thread_id, pending req-ids).
+  The panel pushes its serialized log after each change via `session_update_log`. `새 대화`
+  (reset) detaches the active session so the next turn starts a fresh one. There is no
+  "save" action and no name prompt.
 - **C. Single live changeset invariant.** At most ONE pending (un-archived) changeset is
   reconnected per session — the latest. Matches the existing EUD-070 single-live-changeset
   behavior; do NOT replace `current_request_id: Option` with a registry.
@@ -105,10 +109,15 @@ All registered in `lib.rs` `generate_handler!`. Engine-command shape:
 | rename (panel `invoke` name) | args | returns | notes |
 |---|---|---|---|
 | `session_list` | — | `Vec<SessionMeta>` | most-recently-updated first |
-| `session_save` | `{ name: String, panelLog: Value }` | `String` (session id) | creates if no active session, else updates the active one; captures live thread_id + pending req-ids + current project |
+| `session_update_log` | `{ panelLog: Value }` | `()` | the panel pushes its serialized log after each turn; updates the active record's `panelLog` (no-op if no active session) |
 | `session_open` | `{ id: String }` | `SessionRecord` | resets live thread, seeds saved thread_id, reconnects ≤1 pending changeset, sets active session; panel hydrates from the returned `panelLog` |
 | `session_rename` | `{ id: String, name: String }` | `()` | |
 | `session_delete` | `{ id: String }` | `()` | also removes from index; if it is the active session, detach (`current_session_id=None`) |
+
+The core auto-creates the active session inside `chat()` on the first turn (there is no
+`session_save` command). Two panel events: `session_loaded` (signal after a reconnect on
+open) and `session_active` (`{ id, name }` — emitted on auto-create and on open so the panel
+highlights the current row).
 
 `SessionMeta` = `{ id, name, project, createdAt, updatedAt }`.
 `SessionRecord` = `SessionMeta` (flattened) + `{ threadId, pendingRequestIds, panelLog }`.
@@ -162,22 +171,27 @@ impl SessionStore {
    `pub async fn set_thread_id(&self, id: String)`.
 3. `AgentEngine` gains `current_session_id: Option<String>` and a `SessionStore` (injected in
    `lib.rs` construction next to the existing providers).
-4. `chat()`: after a successful turn, if a session is active, update its record
-   (thread_id from `driver.current_thread_id().await`, refresh `panelLog` is panel-driven via
-   `session_save`, append/refresh pending req-ids). thread_id capture relies on `ThreadStarted`
-   having arrived by turn completion — verify in a unit test.
-5. `reset()`: set `current_session_id = None` (a `새 대화` detaches from the saved session).
+4. `chat()`: `ensure_active_session(&req.text)` at the start auto-creates the session on the
+   first turn (auto-named from the first message), emitting `SessionActive`. After a successful
+   turn, `update_active_session()` refreshes the record (thread_id from
+   `driver.current_thread_id().await`, pending req-ids). The `panelLog` is pushed separately by
+   the panel via `session_update_log`. thread_id capture relies on `ThreadStarted` having arrived
+   by turn completion — verified in a unit test.
+5. `reset()`: set `current_session_id = None` (a `새 대화` detaches from the active session;
+   the next turn auto-creates a fresh one).
 6. New `open_session(id) -> SessionRecord`:
    - `self.reset()` first (drop live thread),
    - if `threadId` present: `driver.seed_thread_id(tid)`; on Ok set `thread_active = true` so the
-     next `chat()` uses `resume_turn_text`; on Err leave `thread_active=false` (fresh + replay),
+     next `chat()` resumes; on Err leave `thread_active=false` (fresh + replay). When there is no
+     `threadId` but a non-empty log, stage the transcript for a fresh-start replay too,
    - `current_session_id = Some(id)`,
    - reconnect ≤1 pending changeset (below),
-   - return the record.
+   - emit `SessionActive` then `SessionLoaded`; return the record.
 7. `changeset_decision()`: after a decision archives a journal, drop that req-id from the active
    session record's `pendingRequestIds`.
-8. New `EngineEvent::SessionLoaded` → `ipc::emit_*` → panel event `session_loaded` (a signal
-   only; carries nothing rendered raw — rules.md forbids raw kind identifiers as user text).
+8. `EngineEvent::SessionLoaded` → panel `session_loaded` (signal after reconnect) and
+   `EngineEvent::SessionActive { id, name }` → panel `session_active` (current-session highlight).
+   Neither is rendered raw — rules.md forbids raw kind identifiers as user text.
 
 ### Changeset reconnect
 The changeset is derived from the journal (`journal::changeset_from_journal`) and
@@ -190,9 +204,11 @@ gracefully (skip reconnect, log), never panic.
 ### Resume fallback (decision E)
 Wrap the seed+first-resume so that (a) a `seed_thread_id` error, or (b) the first post-open
 `run_turn` not reaching `thread/started`/completion within a bounded timeout, drops to a fresh
-`thread/start`. When falling back, prepend a **condensed** transcript (you/agent text +
-decisions; drop tool-arg dumps; cap well under prompt limits) using the `resume_turn_text`
-path so the model still sees prior context.
+`thread/start`. A non-resumable open (no `threadId`, or seed failed) goes straight to the fresh
+start. When falling back, fold a **condensed** transcript (you/agent text + decisions; drop
+tool-arg dumps; cap well under prompt limits) into the first turn — and that turn MUST use the
+full `build_system_prompt` (a brand-new thread has never seen the `[first principles]`
+guardrails), NOT `resume_turn_text`.
 
 ## Panel changes (`panel/src`)
 
@@ -203,13 +219,16 @@ path so the model still sees prior context.
   Leave `phase=connecting`; transient state stays empty and re-arrives from the core.
 - `state/protocol.ts`: add `SessionMeta`, `SessionRecord`, `PanelLog` types matching the camelCase
   JSON above.
-- `App.tsx`: add a serializer that maps `state.log` → `PanelLog` (durable subset only) and calls
-  `invoke('session_save', { name, panelLog })`; on `session_open`, take the returned record, call
-  `store.hydrate(record.panelLog)` BEFORE the normal connect flow repopulates live state.
-- `components/SessionList.tsx` (new): sidebar/modal listing `session_list` results (name, project,
-  updatedAt) with open / rename / delete actions and a "현재 대화 저장" button. Do NOT re-open a
-  review surface from the log — review surfaces gate on live `state.changeset`/`state.plan`; a
-  reconnected changeset arrives as a live `changeset` event.
+- `App.tsx`: add a serializer that maps `state.log` → `PanelLog` (durable subset only); a
+  debounced effect on `state.log` pushes it via `invoke('session_update_log', { panelLog })`
+  after each change (no save button). On `session_open`, take the returned record, call
+  `store.hydrate(record.panelLog)` BEFORE the normal connect flow repopulates live state. Track
+  the active session id from the `session_active` event (cleared on `reset`).
+- `components/SessionList.tsx` (new): modal listing `session_list` results (name, project,
+  updatedAt) with open / rename / delete actions; the active session (`currentId`) is
+  highlighted. No save button. Do NOT re-open a review surface from the log — review surfaces
+  gate on live `state.changeset`/`state.plan`; a reconnected changeset arrives as a live
+  `changeset` event.
 
 ## Verification
 

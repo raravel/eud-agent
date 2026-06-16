@@ -283,7 +283,7 @@ pub fn run() {
             engine::engine_cancel,
             engine::engine_reset,
             engine::engine_session_list,
-            engine::engine_session_save,
+            engine::engine_session_update_log,
             engine::engine_session_open,
             engine::engine_session_rename,
             engine::engine_session_delete,

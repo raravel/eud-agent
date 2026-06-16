@@ -90,7 +90,7 @@ const PANEL_LOG_SCHEMA_VERSION = 1;
 
 /**
  * Serialize the live conversation log into the DURABLE {@link PanelLog} subset
- * for `session_save` (features/sessions.md): only `id/kind/text` + optional
+ * pushed via `session_update_log` (features/sessions.md): only `id/kind/text` + optional
  * `stage`/`tools` survive; transient turn/plan/changeset/wiki state is dropped
  * (it re-arrives from the core on reconnect). `logSeq` is the max entry id so
  * the store can advance its counters past the restored ids on hydrate.
@@ -170,8 +170,13 @@ export default function App() {
   const [updateDismissed, setUpdateDismissed] = useState(false);
   const updateCheckedRef = useRef(false);
   // Session-restore overlay (App-local UI state). The list is fetched lazily by
-  // SessionList each time it opens; save/open/rename/delete are Tauri commands.
+  // SessionList each time it opens; open/rename/delete are Tauri commands. A
+  // conversation auto-saves (no save button): the core auto-creates a session on
+  // the first turn and the panel pushes its log after each change.
   const [sessionListOpen, setSessionListOpen] = useState(false);
+  // The active session id (auto-created on the first turn or opened), tracked from
+  // the `session_active` event so the list can highlight the current row.
+  const [currentSessionId, setCurrentSessionId] = useState<string | null>(null);
 
   useEffect(() => {
     bootstrapActiveRef.current = bootstrap.active;
@@ -427,6 +432,39 @@ export default function App() {
     };
   }, []);
 
+  // `session_active`: the core auto-created (first turn) or opened a session.
+  // Track its id so the list can highlight the current conversation.
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    let cancelled = false;
+    void listen<{ id: string; name: string }>("session_active", (event) => {
+      setCurrentSessionId(event.payload.id);
+    }).then((fn) => {
+      if (cancelled) fn();
+      else unlisten = fn;
+    });
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, []);
+
+  // Auto-persist the conversation (no save button): whenever the durable log
+  // changes, push the serialized subset to the active session shortly after
+  // (debounced to coalesce a turn's rapid updates). No-op server-side until the
+  // first turn auto-creates a session, so this never makes a junk session.
+  useEffect(() => {
+    if (state.log.length === 0) return;
+    const handle = window.setTimeout(() => {
+      void invoke("session_update_log", {
+        panelLog: serializePanelLog(store.getState().log),
+      }).catch(() => {
+        /* background sync; the core logs any write failure */
+      });
+    }, 500);
+    return () => window.clearTimeout(handle);
+  }, [state.log, store]);
+
   // Editor-liveness poll. Once armed (first-run setup satisfied), probe the
   // editor every EDITOR_POLL_MS. The transport stays open throughout, so this
   // only drives editorConnected (send gate + ConnectionNotice) and recovers a
@@ -535,6 +573,9 @@ export default function App() {
     const sent = await clientRef.current?.send({ type: "reset" });
     if (sent) {
       store.resetSent();
+      // The core detaches its active session on reset; the next turn auto-creates
+      // a fresh one. Drop the highlight so the list shows no current row meanwhile.
+      setCurrentSessionId(null);
     }
   }, [store]);
 
@@ -543,23 +584,6 @@ export default function App() {
   const handleSessionList = useCallback(
     () => invoke<SessionMeta[]>("session_list"),
     [],
-  );
-
-  // Save the current conversation: serialize the durable log subset and POST it
-  // (the core creates a new record or updates the active session, capturing the
-  // live thread_id + pending changeset req-ids + project).
-  const handleSessionSave = useCallback(
-    (name: string) => {
-      const panelLog = serializePanelLog(store.getState().log);
-      void invoke<string>("session_save", { name, panelLog })
-        .then(() => {
-          store.log("ok", "대화를 저장했습니다.");
-        })
-        .catch((error) => {
-          store.log("error", `대화 저장에 실패했습니다: ${String(error)}`);
-        });
-    },
-    [store],
   );
 
   // Open a saved session: the core resets the live thread, seeds the saved
@@ -966,11 +990,11 @@ export default function App() {
       <SessionList
         open={sessionListOpen}
         onClose={() => setSessionListOpen(false)}
+        currentId={currentSessionId}
         onList={handleSessionList}
         onOpen={handleSessionOpen}
         onRename={handleSessionRename}
         onDelete={handleSessionDelete}
-        onSave={handleSessionSave}
       />
     </div>
   );

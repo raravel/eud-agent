@@ -1,8 +1,9 @@
 //! Named conversation sessions that survive a full app restart.
 //!
-//! Rust owns every session file (feature: session restore, decision A): the panel
-//! POSTs its serialized log through `session_save` and Rust writes the whole record;
-//! the panel never touches the filesystem. Files live under
+//! Rust owns every session file (feature: session restore, decision A): a session
+//! is auto-created on a conversation's first turn (no save button) and its log is
+//! pushed by the panel via `session_update_log` after each turn; the panel never
+//! touches the filesystem. Files live under
 //! `%appdata%\eud-agent\sessions\` (Roaming, decision D — small, user-owned, preserved
 //! by the self-update). Every file is written via [`crate::memory::write_atomic_bytes`]
 //! (temp + rename, UTF-8 **without BOM**), the same write semantics as memory/wiki.

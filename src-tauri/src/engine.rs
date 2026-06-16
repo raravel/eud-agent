@@ -160,6 +160,10 @@ pub enum EngineEvent {
     /// panel can flip out of its connecting state. Carries nothing rendered raw
     /// (rules.md forbids raw kind identifiers as user-facing text).
     SessionLoaded(ipc::SessionLoadedEvent),
+    /// The active session changed (auto-created on a first turn, or opened): lets
+    /// the panel track/highlight the current session and target rename. Carries
+    /// the id + auto-derived name (a label, never rendered as a raw kind).
+    SessionActive(ipc::SessionActiveEvent),
 }
 
 pub(crate) trait EventSink {
@@ -349,6 +353,9 @@ impl<D: CodexDriver, S: EventSink> AgentEngine<D, S> {
         self.current_request_id = Some(request_id);
         self.current_instruction_head = Some(take_chars(&req.text, EPISODE_INSTRUCTION_CHARS));
         self.phase = Phase::Triage;
+        // A conversation auto-becomes a saved session on its first turn (no save
+        // button); subsequent turns just update it.
+        self.ensure_active_session(&req.text);
 
         let memory = self.config.project_memory_for_prompt();
         let project_state = self.config.project_state_for_prompt();
@@ -483,7 +490,8 @@ impl<D: CodexDriver, S: EventSink> AgentEngine<D, S> {
     /// After a successful turn, refresh the active session record (decision B:
     /// once a session is open, every completed `chat` auto-updates it). Captures
     /// the live thread_id and the still-pending changeset req-id; the `panelLog`
-    /// is panel-driven via `session_save`, so it is preserved verbatim here.
+    /// is pushed separately by the panel via `session_update_log`, so it is left
+    /// untouched here.
     /// Best-effort: a missing/corrupt record or a failed write is logged, never
     /// surfaced as a chat error.
     async fn update_active_session(&mut self) {
@@ -753,68 +761,63 @@ impl<D: CodexDriver, S: EventSink> AgentEngine<D, S> {
             .map_err(|error| AgentEngineError::new(error.to_string()))
     }
 
-    /// Create or update a session record (decision A/B): creates a new record when
-    /// no session is active, else updates the active one. Captures the live
-    /// thread_id, the single live changeset req-id, and the current project; the
-    /// `panelLog` is stored verbatim from the panel. Returns the session id.
-    pub async fn save_session(
-        &mut self,
-        req: ipc::SessionSaveRequest,
-    ) -> Result<String, AgentEngineError> {
+    /// Auto-create the active session on the first turn of a conversation (no save
+    /// button: a conversation IS a session, persisted continuously, like codex's
+    /// rollout). Names it from the first user message; the record exists from turn
+    /// one so it appears in the list immediately. Best-effort — a write failure is
+    /// logged and the turn proceeds (the next `update_session_log` retries).
+    fn ensure_active_session(&mut self, first_text: &str) {
+        if self.current_session_id.is_some() {
+            return;
+        }
         let now = crate::session::now_unix_seconds();
-        let thread_id = self.driver.current_thread_id().await;
-        let pending_request_ids = self.live_pending_request_ids();
-        let project = self.current_project_name();
+        let id = crate::session::new_session_id();
+        let record = crate::session::SessionRecord {
+            meta: crate::session::SessionMeta {
+                id: id.clone(),
+                name: auto_session_name(first_text),
+                project: self.current_project_name(),
+                created_at: now,
+                updated_at: now,
+            },
+            thread_id: None,
+            pending_request_ids: Vec::new(),
+            panel_log: serde_json::Value::Null,
+        };
+        if let Err(error) = self.session_store.save(&record) {
+            eprintln!("eud-agent: session auto-create failed: {error}");
+            return;
+        }
+        self.current_session_id = Some(id.clone());
+        // Tell the panel which session is now active (list highlight + rename target).
+        let _ = self
+            .sink
+            .emit(EngineEvent::SessionActive(ipc::SessionActiveEvent {
+                id,
+                name: record.meta.name,
+            }));
+    }
 
-        let record = match self.current_session_id.clone() {
-            Some(id) => {
-                // Update the active session in place. If its record is unreadable
-                // (deleted or corrupted out-of-band), rebuild under the SAME id
-                // rather than minting a new one and losing the stable session id.
-                let mut existing = self.session_store.load(&id).unwrap_or_else(|_| {
-                    crate::session::SessionRecord {
-                        meta: crate::session::SessionMeta {
-                            id: id.clone(),
-                            name: String::new(),
-                            project: String::new(),
-                            created_at: now,
-                            updated_at: now,
-                        },
-                        thread_id: None,
-                        pending_request_ids: Vec::new(),
-                        panel_log: serde_json::Value::Null,
-                    }
-                });
-                existing.meta.name = req.name;
-                existing.meta.project = project;
-                existing.meta.updated_at = now;
-                existing.thread_id = thread_id;
-                existing.pending_request_ids = pending_request_ids;
-                existing.panel_log = req.panel_log;
-                existing
-            }
-            None => {
-                let id = crate::session::new_session_id();
-                self.current_session_id = Some(id.clone());
-                crate::session::SessionRecord {
-                    meta: crate::session::SessionMeta {
-                        id,
-                        name: req.name,
-                        project,
-                        created_at: now,
-                        updated_at: now,
-                    },
-                    thread_id,
-                    pending_request_ids,
-                    panel_log: req.panel_log,
-                }
+    /// Persist the panel's conversation log into the active session record
+    /// (decision A: Rust owns the file; the panel pushes its serialized log after
+    /// each turn). No-op when no session is active. Best-effort — never surfaced as
+    /// an error to the panel, since it is a background sync.
+    pub fn update_session_log(&mut self, panel_log: serde_json::Value) {
+        let Some(id) = self.current_session_id.clone() else {
+            return;
+        };
+        let mut record = match self.session_store.load(&id) {
+            Ok(record) => record,
+            Err(error) => {
+                eprintln!("eud-agent: session log reload failed: {error}");
+                return;
             }
         };
-
-        self.session_store
-            .save(&record)
-            .map_err(|error| AgentEngineError::new(error.to_string()))?;
-        Ok(record.meta.id)
+        record.panel_log = panel_log;
+        record.meta.updated_at = crate::session::now_unix_seconds();
+        if let Err(error) = self.session_store.save(&record) {
+            eprintln!("eud-agent: session log update failed: {error}");
+        }
     }
 
     /// Open a saved session (session restore): reset the live thread, seed the saved
@@ -868,6 +871,13 @@ impl<D: CodexDriver, S: EventSink> AgentEngine<D, S> {
 
         // Reconnect at most one pending changeset (decision C).
         self.reconnect_pending_changeset(&record);
+
+        // Mark it active so the panel highlights it (id + current name).
+        self.sink
+            .emit(EngineEvent::SessionActive(ipc::SessionActiveEvent {
+                id: record.meta.id.clone(),
+                name: record.meta.name.clone(),
+            }))?;
 
         self.sink
             .emit(EngineEvent::SessionLoaded(ipc::SessionLoadedEvent {
@@ -1084,6 +1094,7 @@ impl EventSink for TauriEventSink {
             EngineEvent::Status(payload) => ipc::emit_status(&self.app, payload),
             EngineEvent::Wiki(payload) => ipc::emit_wiki(&self.app, payload),
             EngineEvent::SessionLoaded(payload) => ipc::emit_session_loaded(&self.app, payload),
+            EngineEvent::SessionActive(payload) => ipc::emit_session_active(&self.app, payload),
         };
         result.map_err(|err| AgentEngineError::new(format!("failed to emit event: {err}")))
     }
@@ -1362,18 +1373,13 @@ pub(crate) async fn engine_session_list(
         .map_err(|err| err.message)
 }
 
-#[tauri::command(rename = "session_save")]
-pub(crate) async fn engine_session_save(
+#[tauri::command(rename = "session_update_log")]
+pub(crate) async fn engine_session_update_log(
     state: tauri::State<'_, ManagedAgentEngine>,
-    name: String,
     panel_log: serde_json::Value,
-) -> Result<String, String> {
-    state
-        .lock()
-        .await
-        .save_session(ipc::SessionSaveRequest { name, panel_log })
-        .await
-        .map_err(|err| err.message)
+) -> Result<(), String> {
+    state.lock().await.update_session_log(panel_log);
+    Ok(())
 }
 
 #[tauri::command(rename = "session_open")]
@@ -1606,6 +1612,27 @@ fn message_break(answer: &str, boundary_seen: bool) -> &'static str {
 
 fn take_chars(s: &str, limit: usize) -> String {
     s.chars().take(limit).collect()
+}
+
+/// Auto-derive a session title from the first user message (ChatGPT/codex style:
+/// no manual naming). First non-empty line, trimmed and capped; the user can
+/// rename later from the list.
+fn auto_session_name(first_text: &str) -> String {
+    const SESSION_NAME_CHARS: usize = 40;
+    let first_line = first_text
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("");
+    if first_line.is_empty() {
+        return "새 대화".to_string();
+    }
+    let name = take_chars(first_line, SESSION_NAME_CHARS);
+    if first_line.chars().count() > SESSION_NAME_CHARS {
+        format!("{name}…")
+    } else {
+        name
+    }
 }
 
 /// Cap on the condensed replay transcript (chars), kept well under prompt limits.
@@ -2581,7 +2608,12 @@ mod tests {
             .await
             .expect("propose_plan turn should run");
 
-        let events = sink_handle.events();
+        // Ignore the session-lifecycle signal the first turn emits on auto-create.
+        let events: Vec<_> = sink_handle
+            .events()
+            .into_iter()
+            .filter(|event| !matches!(event, EngineEvent::SessionActive(_)))
+            .collect();
         assert!(
             matches!(
                 events.as_slice(),
@@ -3467,7 +3499,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn chat_captures_thread_id_into_active_session_record() {
+    async fn first_chat_auto_creates_session_and_captures_thread_id() {
         let base = unique_temp_dir("session-capture");
         let memory = ProjectMemory::new(base.join("memory"), "ExampleProject");
         let driver = FakeCodexDriver::scripted([
@@ -3481,27 +3513,26 @@ mod tests {
         let sink = CapturingEventSink::default();
         let mut engine = test_engine_with_memory(driver, sink, memory, &base.join("data"));
 
-        // A fresh chat mints a thread id (mock mirrors ThreadStarted by completion).
+        // The FIRST chat auto-creates the active session (no save button) and mints
+        // a thread id (mock mirrors ThreadStarted by completion).
         engine
             .chat(crate::ipc::ChatRequest {
-                text: "first instruction".to_string(),
+                text: "마린 HP 올려줘".to_string(),
             })
             .await
             .expect("first chat should run");
 
-        // Explicit save creates the active session record.
         let id = engine
-            .save_session(crate::ipc::SessionSaveRequest {
-                name: "내 세션".to_string(),
-                panel_log: serde_json::json!({ "schemaVersion": 1, "logSeq": 1, "log": [] }),
-            })
-            .await
-            .expect("save should create a session");
-        assert_eq!(engine.current_session_id.as_deref(), Some(id.as_str()));
+            .current_session_id
+            .clone()
+            .expect("first chat must auto-create an active session");
+        // The session is auto-named from the first user message.
+        let created = engine.session_store.load(&id).expect("record should load");
+        assert_eq!(created.meta.name, "마린 HP 올려줘");
 
         // Force the on-disk record's thread_id stale so the post-chat assertion can
         // ONLY pass if the second chat's auto-update actually re-captures the live
-        // thread id (isolates decision B from the prior save_session capture).
+        // thread id (isolates decision B from the auto-create capture).
         let mut stale = engine.session_store.load(&id).expect("record should load");
         stale.thread_id = None;
         engine

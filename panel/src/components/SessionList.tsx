@@ -2,8 +2,10 @@
  * Session restore UI (features/sessions.md ## Panel changes).
  *
  * A modal listing the saved sessions (`session_list`, most-recently-updated
- * first) with open / rename / delete actions, plus a "현재 대화 저장" button that
- * prompts for a name and POSTs the serialized panel log through `session_save`.
+ * first) with open / rename / delete actions. Conversations auto-save (the core
+ * auto-creates a session on the first turn and the panel pushes its log after
+ * each change) — there is no save button. The currently-active session is
+ * highlighted.
  *
  * The list is the ONLY entry point to a saved conversation: opening calls
  * `session_open` (App hydrates the store from the returned record BEFORE the
@@ -26,6 +28,8 @@ export interface SessionListProps {
   open: boolean;
   /** Close the overlay. */
   onClose(): void;
+  /** The active session id (highlighted in the list), or null if none. */
+  currentId: string | null;
   /** Fetch the session list (resolves the `session_list` result). */
   onList(): Promise<SessionMeta[]>;
   /** Open a saved session by id (App hydrates from the returned record). */
@@ -34,8 +38,6 @@ export interface SessionListProps {
   onRename(id: string, name: string): void | Promise<void>;
   /** Delete a session; the resolved promise reconciles the optimistic row. */
   onDelete(id: string): void | Promise<void>;
-  /** Save the current conversation under `name` (creates or updates the active). */
-  onSave(name: string): void;
 }
 
 /** Format a Unix-seconds timestamp as a short local date-time, defensively. */
@@ -49,11 +51,11 @@ function formatUpdated(updatedAt: number): string {
 export function SessionList({
   open,
   onClose,
+  currentId,
   onList,
   onOpen,
   onRename,
   onDelete,
-  onSave,
 }: SessionListProps) {
   const [sessions, setSessions] = useState<SessionMeta[]>([]);
   const [loading, setLoading] = useState(false);
@@ -86,16 +88,6 @@ export function SessionList({
     onList()
       .then(setSessions)
       .catch((err) => setError(String(err)));
-  };
-
-  const handleSave = () => {
-    const name = window.prompt("저장할 대화 이름을 입력하세요.");
-    const trimmed = name?.trim();
-    if (!trimmed) return;
-    onSave(trimmed);
-    // The save is async on the core side; refresh shortly so the new/updated
-    // row surfaces without forcing the user to reopen the overlay.
-    setTimeout(refresh, 200);
   };
 
   const handleRename = (session: SessionMeta) => {
@@ -133,20 +125,15 @@ export function SessionList({
       >
         <div className="flex items-center justify-between gap-3">
           <h2 className="text-sm font-semibold">대화 목록</h2>
-          <div className="flex items-center gap-2">
-            <Button type="button" size="sm" onClick={handleSave}>
-              현재 대화 저장
-            </Button>
-            <Button
-              type="button"
-              size="icon"
-              variant="ghost"
-              aria-label="닫기"
-              onClick={onClose}
-            >
-              <X className="size-4" aria-hidden="true" />
-            </Button>
-          </div>
+          <Button
+            type="button"
+            size="icon"
+            variant="ghost"
+            aria-label="닫기"
+            onClick={onClose}
+          >
+            <X className="size-4" aria-hidden="true" />
+          </Button>
         </div>
 
         {error && (
@@ -162,10 +149,16 @@ export function SessionList({
             <ul className="grid gap-2">
               {sessions.map((session) => {
                 const updated = formatUpdated(session.updatedAt);
+                const isCurrent = session.id === currentId;
                 return (
                   <li
                     key={session.id}
-                    className="flex items-center gap-2 rounded border border-border/60 px-3 py-2"
+                    className={cn(
+                      "flex items-center gap-2 rounded border px-3 py-2",
+                      isCurrent
+                        ? "border-primary/60 bg-primary/5"
+                        : "border-border/60",
+                    )}
                   >
                     <button
                       type="button"
@@ -175,8 +168,13 @@ export function SessionList({
                         "rounded outline-none focus-visible:ring-2 focus-visible:ring-ring",
                       )}
                     >
-                      <span className="block truncate text-sm font-medium text-foreground">
-                        {session.name}
+                      <span className="flex items-center gap-1.5 truncate text-sm font-medium text-foreground">
+                        <span className="truncate">{session.name}</span>
+                        {isCurrent && (
+                          <span className="shrink-0 rounded bg-primary/15 px-1 text-[10px] font-normal text-primary">
+                            현재
+                          </span>
+                        )}
                       </span>
                       <span className="block truncate text-xs text-muted-foreground">
                         {[session.project, updated].filter(Boolean).join(" · ")}
