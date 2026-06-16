@@ -39,6 +39,12 @@ const SYSTEM_PROMPT: &str =
 const RAW_SNIPPET_LIMIT: usize = 500;
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(600);
 
+/// Windows `CREATE_NO_WINDOW` process-creation flag. The GUI app is windowless,
+/// so spawning the `codex.cmd` batch shim would otherwise flash a console window
+/// for every turn; applied at each codex spawn to keep the agent headless.
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum CodexError {
     #[error("codex command not found: {0}")]
@@ -198,6 +204,8 @@ impl CodexClient {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        #[cfg(windows)]
+        command.creation_flags(CREATE_NO_WINDOW);
 
         let mut child = command
             .spawn()
@@ -645,6 +653,8 @@ impl CodexAppServerClient<tokio::process::ChildStdout, tokio::process::ChildStdi
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
+        #[cfg(windows)]
+        command.creation_flags(CREATE_NO_WINDOW);
 
         let mut child = command.spawn().map_err(|err| {
             AppServerError::new(format!("failed to spawn codex app-server: {err}"))

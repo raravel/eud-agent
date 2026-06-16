@@ -12,11 +12,22 @@
 //! call in `spawn_blocking` to keep the IPC thread free.
 
 use std::io::Write;
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 use std::process::{Command, Stdio};
 
 use serde::{Deserialize, Serialize};
 
 use crate::codex_client::resolve_codex_cmd;
+
+/// Suppress the console window when spawning the `codex.cmd` batch shim from the
+/// windowless GUI app. Without `CREATE_NO_WINDOW` (0x0800_0000) Windows opens a
+/// terminal for each codex invocation; no-op on other platforms.
+#[allow(unused_variables)]
+fn hide_console(command: &mut Command) {
+    #[cfg(windows)]
+    command.creation_flags(0x0800_0000);
+}
 
 /// codex login state surfaced to the setup screen.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -47,11 +58,10 @@ pub fn login_status() -> CodexAuthState {
         Err(error) => return CodexAuthState::unresolved(error.to_string()),
     };
 
-    match Command::new(&codex)
-        .args(["login", "status"])
-        .stdin(Stdio::null())
-        .output()
-    {
+    let mut command = Command::new(&codex);
+    command.args(["login", "status"]).stdin(Stdio::null());
+    hide_console(&mut command);
+    match command.output() {
         Ok(output) => {
             let authed = output.status.success();
             let stream = if authed {
@@ -87,11 +97,14 @@ pub fn login_status() -> CodexAuthState {
 /// awaited and not killed on drop.
 pub fn login_oauth() -> Result<(), String> {
     let codex = resolve_codex_cmd().map_err(|error| error.to_string())?;
-    Command::new(&codex)
+    let mut command = Command::new(&codex);
+    command
         .arg("login")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::null());
+    hide_console(&mut command);
+    command
         .spawn()
         .map(|_child| ())
         .map_err(|error| format!("failed to launch codex login: {error}"))
@@ -107,11 +120,14 @@ pub fn login_api_key(api_key: &str) -> Result<CodexAuthState, String> {
     }
     let codex = resolve_codex_cmd().map_err(|error| error.to_string())?;
 
-    let mut child = Command::new(&codex)
+    let mut command = Command::new(&codex);
+    command
         .args(["login", "--with-api-key"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    hide_console(&mut command);
+    let mut child = command
         .spawn()
         .map_err(|error| format!("failed to spawn codex login: {error}"))?;
 
