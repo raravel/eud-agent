@@ -419,6 +419,44 @@ impl std::fmt::Display for AppServerError {
 }
 
 impl std::error::Error for AppServerError {}
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexReasoningEffortOption {
+    pub reasoning_effort: String,
+    pub description: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexModel {
+    pub model: String,
+    pub display_name: String,
+    pub description: String,
+    pub supported_reasoning_efforts: Vec<CodexReasoningEffortOption>,
+    pub default_reasoning_effort: String,
+    pub is_default: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexModelSettings {
+    pub models: Vec<CodexModel>,
+    pub selected_model: String,
+    pub selected_reasoning_effort: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CodexModelSelection {
+    pub model: String,
+    pub reasoning_effort: String,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexModelListPage {
+    data: Vec<CodexModel>,
+    next_cursor: Option<String>,
+}
 
 type AppServerRequestResult = Result<serde_json::Value, AppServerError>;
 type AppServerPending = std::sync::Arc<
@@ -434,6 +472,7 @@ pub struct CodexAppServerClient<R, W> {
     pending: AppServerPending,
     next_id: u64,
     initialized: bool,
+    model_selection: Option<CodexModelSelection>,
     thread_id: std::sync::Arc<tokio::sync::Mutex<Option<String>>>,
     thread_started: std::sync::Arc<tokio::sync::Notify>,
     turn_completed: tokio::sync::broadcast::Sender<()>,
@@ -474,6 +513,7 @@ where
                 pending,
                 next_id: 1,
                 initialized: false,
+                model_selection: None,
                 thread_id,
                 thread_started,
                 turn_completed,
@@ -483,22 +523,70 @@ where
         )
     }
 
-    pub async fn run_turn(&mut self, prompt: String) -> Result<(), AppServerError> {
-        if !self.initialized {
-            self.send_request(
-                "initialize",
-                serde_json::json!({
-                    "clientInfo": {
-                        "name": "eud-agent",
-                        "title": null,
-                        "version": env!("CARGO_PKG_VERSION"),
-                    },
-                    "capabilities": null,
-                }),
-            )
-            .await?;
-            self.initialized = true;
+    async fn ensure_initialized(&mut self) -> Result<(), AppServerError> {
+        if self.initialized {
+            return Ok(());
         }
+
+        self.send_request(
+            "initialize",
+            serde_json::json!({
+                "clientInfo": {
+                    "name": "eud-agent",
+                    "title": null,
+                    "version": env!("CARGO_PKG_VERSION"),
+                },
+                "capabilities": null,
+            }),
+        )
+        .await?;
+        // Complete the app-server handshake before issuing model/thread
+        // requests. The notification intentionally has no `id` or `params`.
+        write_json_rpc_line(&self.writer, serde_json::json!({ "method": "initialized" })).await?;
+        self.initialized = true;
+        Ok(())
+    }
+
+    pub async fn list_models(&mut self) -> Result<Vec<CodexModel>, AppServerError> {
+        self.ensure_initialized().await?;
+
+        let mut models = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let result = self
+                .send_request(
+                    "model/list",
+                    serde_json::json!({
+                        "cursor": cursor,
+                        "limit": 100,
+                        "includeHidden": false,
+                    }),
+                )
+                .await?;
+            let page: CodexModelListPage = serde_json::from_value(result).map_err(|err| {
+                AppServerError::new(format!("invalid model/list response: {err}"))
+            })?;
+            models.extend(page.data);
+
+            match page.next_cursor {
+                Some(next) if cursor.as_deref() != Some(next.as_str()) => cursor = Some(next),
+                Some(_) => {
+                    return Err(AppServerError::new(
+                        "model/list returned a repeated pagination cursor",
+                    ));
+                }
+                None => break,
+            }
+        }
+        Ok(models)
+    }
+
+    pub(crate) fn set_model_selection(&mut self, selection: Option<CodexModelSelection>) {
+        self.model_selection = selection;
+    }
+
+    pub async fn run_turn(&mut self, prompt: String) -> Result<(), AppServerError> {
+        self.ensure_initialized().await?;
 
         let mut turn_completed = self.turn_completed.subscribe();
 
@@ -518,18 +606,19 @@ where
             }
         };
 
-        self.send_request(
-            "turn/start",
-            serde_json::json!({
-                "threadId": thread_id,
-                "input": [{
-                    "type": "text",
-                    "text": prompt,
-                    "text_elements": [],
-                }],
-            }),
-        )
-        .await?;
+        let mut params = serde_json::json!({
+            "threadId": thread_id,
+            "input": [{
+                "type": "text",
+                "text": prompt,
+                "text_elements": [],
+            }],
+        });
+        if let Some(selection) = &self.model_selection {
+            params["model"] = serde_json::json!(selection.model);
+            params["effort"] = serde_json::json!(selection.reasoning_effort);
+        }
+        self.send_request("turn/start", params).await?;
 
         turn_completed
             .recv()
@@ -1280,7 +1369,7 @@ mod tool_item_tests {
 
 #[cfg(test)]
 mod appserver_tests {
-    use super::{AppServerEvent, CodexAppServerClient};
+    use super::{AppServerEvent, CodexAppServerClient, CodexModelSelection};
     use serde_json::{json, Value};
     use std::time::Duration;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream, Lines};
@@ -1354,6 +1443,9 @@ mod appserver_tests {
             Some("eud-agent")
         );
     }
+    fn assert_initialized_notification(value: &Value) {
+        assert_eq!(value, &json!({ "method": "initialized" }));
+    }
 
     fn assert_prompt(value: &Value, expected: &str) {
         let params = value
@@ -1391,6 +1483,16 @@ mod appserver_tests {
             Some(expected)
         );
     }
+    fn assert_turn_settings(value: &Value, model: &str, effort: &str) {
+        assert_eq!(
+            value.pointer("/params/model").and_then(Value::as_str),
+            Some(model)
+        );
+        assert_eq!(
+            value.pointer("/params/effort").and_then(Value::as_str),
+            Some(effort)
+        );
+    }
 
     fn assert_accepts_eud_tools_mcp_approval(reply: &Value, expected_id: &Value) {
         assert_eq!(reply.get("jsonrpc").and_then(Value::as_str), Some("2.0"));
@@ -1421,6 +1523,98 @@ mod appserver_tests {
     }
 
     #[tokio::test]
+    async fn model_list_collects_all_visible_pages_in_server_order() {
+        let (client_write, server_read) = tokio::io::duplex(16 * 1024);
+        let (server_write, client_read) = tokio::io::duplex(16 * 1024);
+
+        let stub = tokio::spawn(async move {
+            let mut client_requests = BufReader::new(server_read).lines();
+            let mut server_responses = server_write;
+
+            let initialize = read_json_line(&mut client_requests).await;
+            let initialize_id = assert_client_request(&initialize, "initialize");
+            write_json_line(
+                &mut server_responses,
+                json!({"jsonrpc":"2.0","id":initialize_id,"result":{"protocolVersion":1}}),
+            )
+            .await;
+            let initialized = read_json_line(&mut client_requests).await;
+            assert_initialized_notification(&initialized);
+
+            let first = read_json_line(&mut client_requests).await;
+            let first_id = assert_client_request(&first, "model/list");
+            assert_eq!(first.pointer("/params/includeHidden"), Some(&json!(false)));
+            assert_eq!(first.pointer("/params/cursor"), Some(&Value::Null));
+            write_json_line(
+                &mut server_responses,
+                json!({
+                    "jsonrpc":"2.0",
+                    "id":first_id,
+                    "result":{
+                        "data":[{
+                            "model":"gpt-5.5-codex",
+                            "displayName":"GPT-5.5 Codex",
+                            "description":"Most capable",
+                            "supportedReasoningEfforts":[{
+                                "reasoningEffort":"medium",
+                                "description":"Balanced"
+                            }],
+                            "defaultReasoningEffort":"medium",
+                            "isDefault":true
+                        }],
+                        "nextCursor":"page-2"
+                    }
+                }),
+            )
+            .await;
+
+            let second = read_json_line(&mut client_requests).await;
+            let second_id = assert_client_request(&second, "model/list");
+            assert_eq!(second.pointer("/params/cursor"), Some(&json!("page-2")));
+            write_json_line(
+                &mut server_responses,
+                json!({
+                    "jsonrpc":"2.0",
+                    "id":second_id,
+                    "result":{
+                        "data":[{
+                            "model":"gpt-5.4-mini",
+                            "displayName":"GPT-5.4 Mini",
+                            "description":"Fast",
+                            "supportedReasoningEfforts":[{
+                                "reasoningEffort":"low",
+                                "description":"Fast"
+                            }],
+                            "defaultReasoningEffort":"low",
+                            "isDefault":false
+                        }],
+                        "nextCursor":null
+                    }
+                }),
+            )
+            .await;
+        });
+
+        let (mut client, _events) = CodexAppServerClient::new_with_stdio(client_read, client_write);
+        let models = client
+            .list_models()
+            .await
+            .expect("model/list should collect every page");
+        assert_eq!(
+            models
+                .iter()
+                .map(|model| model.model.as_str())
+                .collect::<Vec<_>>(),
+            vec!["gpt-5.5-codex", "gpt-5.4-mini"]
+        );
+        assert_eq!(
+            models[0].supported_reasoning_efforts[0].reasoning_effort,
+            "medium"
+        );
+        stub.await.expect("stub server task should not panic");
+    }
+
+    #[tokio::test]
     async fn app_server_json_rpc_stdio_streaming_thread_reuse_and_approvals() {
         let (client_write, server_read) = tokio::io::duplex(32 * 1024);
         let (server_write, client_read) = tokio::io::duplex(32 * 1024);
@@ -1437,6 +1631,8 @@ mod appserver_tests {
                 json!({"jsonrpc":"2.0","id":initialize_id,"result":{"protocolVersion":1}}),
             )
             .await;
+            let initialized = read_json_line(&mut client_requests).await;
+            assert_initialized_notification(&initialized);
 
             let thread_start = read_json_line(&mut client_requests).await;
             let thread_start_id = assert_client_request(&thread_start, "thread/start");
@@ -1461,6 +1657,7 @@ mod appserver_tests {
             let turn_start_id = assert_client_request(&turn_start, "turn/start");
             assert_prompt(&turn_start, "first prompt");
             assert_turn_thread_id(&turn_start, "thread-123");
+            assert_turn_settings(&turn_start, "gpt-5.5-codex", "high");
             write_json_line(
                 &mut server_responses,
                 json!({"jsonrpc":"2.0","id":turn_start_id,"result":{}}),
@@ -1594,6 +1791,7 @@ mod appserver_tests {
             let second_turn_start_id = assert_client_request(&second_turn_start, "turn/start");
             assert_prompt(&second_turn_start, "second prompt");
             assert_turn_thread_id(&second_turn_start, "thread-123");
+            assert_turn_settings(&second_turn_start, "gpt-5.5-codex", "high");
             write_json_line(
                 &mut server_responses,
                 json!({"jsonrpc":"2.0","id":second_turn_start_id,"result":{}}),
@@ -1608,6 +1806,10 @@ mod appserver_tests {
 
         let (mut client, mut events) =
             CodexAppServerClient::new_with_stdio(client_read, client_write);
+        client.set_model_selection(Some(CodexModelSelection {
+            model: "gpt-5.5-codex".to_string(),
+            reasoning_effort: "high".to_string(),
+        }));
 
         client
             .run_turn("first prompt".to_string())

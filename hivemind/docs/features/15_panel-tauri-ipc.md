@@ -26,6 +26,8 @@ Commands (panel -> core, `invoke`):
 | `list {}` | `invoke("list")` |
 | `memory_get {}` | `invoke("memory_get")` |
 | `memory_save {file, content}` | `invoke("memory_save", { file, content })` |
+| model settings | `invoke("codex_model_settings")` |
+| save model settings | `invoke("codex_model_settings_save", { model, reasoningEffort })` |
 
 Events (core -> panel, `listen`):
 | v2 WS message (server->client) | New Tauri event |
@@ -42,9 +44,10 @@ Events (core -> panel, `listen`):
 | `memory {project, files, episodes}` | command return value of `invoke("memory_get")` |
 | `memory_saved {file}` | command return value of `invoke("memory_save")` |
 
-`status`/`list`/`memory_get`/`memory_save` are request/response commands (return the payload
-from `invoke`; the IPC client dispatches `memory`/`memory_saved` payloads to the store from
-the command return); the remaining server messages are push events delivered via `listen`.
+`status`/`list`/`memory_get`/`memory_save` and both `codex_model_settings*` calls are
+request/response commands (return the payload from `invoke`; the IPC client dispatches
+`memory`/`memory_saved` payloads to the store from the command return); the remaining server
+messages are push events delivered via `listen`.
 `chat`/`plan_feedback`/`plan_approve`/`changeset_decision`/`cancel`/`reset` start background
 work and resolve when accepted — the turn result arrives later as events.
 

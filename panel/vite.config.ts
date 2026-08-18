@@ -35,7 +35,7 @@ export default defineConfig({
   server: {
     // tauri.conf.json devUrl points here; strictPort so `cargo tauri dev`
     // never silently attaches to a different port's stale server.
-    port: 5173,
+    port: 6173,
     strictPort: true,
   },
 });

@@ -5,7 +5,7 @@
   "identifier": "dev.tree-some.eud-agent",
   "build": {
     "frontendDist": "../panel/dist",
-    "devUrl": "http://localhost:5173",
+    "devUrl": "http://localhost:6173",
     "beforeDevCommand": "npm run dev",
     "beforeBuildCommand": "npm run build"
   },

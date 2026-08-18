@@ -1,5 +1,9 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { IpcClient } from "@/lib/ipc";
+import {
+  IpcClient,
+  codexModelSettingsGet,
+  codexModelSettingsSave,
+} from "@/lib/ipc";
 import type { ClientMessage, ServerMessage } from "@/lib/ipc";
 
 type UnlistenFn = () => void;
@@ -408,5 +412,51 @@ describe("setup commands", () => {
 
     expect(invoke).toHaveBeenCalledWith("bootstrap_run", {});
     expect(received).toEqual([]);
+  });
+});
+
+describe("Codex model settings commands", () => {
+  const response = {
+    models: [
+      {
+        model: "gpt-5.5-codex",
+        displayName: "GPT-5.5 Codex",
+        description: "Most capable",
+        supportedReasoningEfforts: [
+          { reasoningEffort: "high", description: "Deep reasoning" },
+        ],
+        defaultReasoningEffort: "high",
+        isDefault: true,
+      },
+    ],
+    selectedModel: "gpt-5.5-codex",
+    selectedReasoningEffort: "high",
+  };
+
+  it("fetches the current authenticated model catalog", async () => {
+    const invoke = vi.fn().mockResolvedValue(response);
+
+    await expect(codexModelSettingsGet(invoke)).resolves.toEqual(response);
+    expect(invoke).toHaveBeenCalledWith("codex_model_settings");
+  });
+
+  it("saves a coherent model and reasoning pair", async () => {
+    const invoke = vi.fn().mockResolvedValue(response);
+
+    await expect(
+      codexModelSettingsSave("gpt-5.5-codex", "high", invoke),
+    ).resolves.toEqual(response);
+    expect(invoke).toHaveBeenCalledWith("codex_model_settings_save", {
+      model: "gpt-5.5-codex",
+      reasoningEffort: "high",
+    });
+  });
+
+  it("rejects malformed backend responses", async () => {
+    const invoke = vi.fn().mockResolvedValue({ models: [] });
+
+    await expect(codexModelSettingsGet(invoke)).rejects.toThrow(
+      "invalid codex model settings response",
+    );
   });
 });

@@ -49,6 +49,12 @@ pub struct Config {
     /// Optional explicit path to the `codex` `.cmd` shim (overrides PATH resolution).
     #[serde(default)]
     pub codex_cmd: Option<String>,
+    /// Codex model selected in the panel. `None` follows Codex's current default.
+    #[serde(default)]
+    pub codex_model: Option<String>,
+    /// Reasoning effort selected for [`Self::codex_model`].
+    #[serde(default)]
+    pub codex_reasoning_effort: Option<String>,
     /// The embedding model asset.
     #[serde(default)]
     pub model: AssetSpec,
@@ -252,6 +258,8 @@ mod tests {
         let cfg = Config {
             editor_path: "C:\\Games\\EUDEditor3".to_string(),
             codex_cmd: Some("C:\\tools\\codex.cmd".to_string()),
+            codex_model: Some("gpt-5.5-codex".to_string()),
+            codex_reasoning_effort: Some("high".to_string()),
             model: AssetSpec {
                 name: "BAAI/bge-m3".to_string(),
                 sha256: "deadbeef".to_string(),

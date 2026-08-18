@@ -247,7 +247,8 @@ pub fn run() {
             // the repo's AGENTS.md (hivemind instructions) and treat the Rust
             // repo as its workspace instead of the EUD map project.
             let cwd = data_dirs.codex_workspace_dir();
-            let driver = engine::ProductionCodexDriver::new(cwd, sink.clone(), mcp_port);
+            let driver =
+                engine::ProductionCodexDriver::new(cwd, sink.clone(), mcp_port, data_dirs.clone());
 
             // Session restore: Rust owns every session file under
             // `%appdata%\eud-agent\sessions\` (decision A/D). Built before the
@@ -276,6 +277,8 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            engine::engine_codex_model_settings,
+            engine::engine_codex_model_settings_save,
             engine::engine_chat,
             engine::engine_plan_feedback,
             engine::engine_plan_approve,

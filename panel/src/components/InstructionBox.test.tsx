@@ -31,6 +31,34 @@ function readyState(): PanelState {
 }
 
 const noop = () => {};
+const codexSettings = {
+  models: [
+    {
+      model: "gpt-default",
+      displayName: "GPT Default",
+      description: "기본 모델",
+      supportedReasoningEfforts: [
+        { reasoningEffort: "medium", description: "균형" },
+        { reasoningEffort: "high", description: "깊게 추론" },
+      ],
+      defaultReasoningEffort: "medium",
+      isDefault: true,
+    },
+    {
+      model: "gpt-fast",
+      displayName: "GPT Fast",
+      description: "빠른 모델",
+      supportedReasoningEfforts: [
+        { reasoningEffort: "low", description: "빠른 추론" },
+      ],
+      defaultReasoningEffort: "low",
+      isDefault: false,
+    },
+  ],
+  selectedModel: "gpt-default",
+  selectedReasoningEffort: "medium",
+};
+
 
 describe("InstructionBox — send gating (v2)", () => {
   it("enables Send when connected with an open project (ready)", () => {
@@ -153,6 +181,93 @@ describe("InstructionBox — chat payload (v2)", () => {
     await user.type(screen.getByRole("textbox", { name: "지시 입력" }), "   ");
     await user.click(screen.getByRole("button", { name: "전송" }));
     expect(onSend).not.toHaveBeenCalled();
+  });
+});
+
+describe("InstructionBox — Codex model settings", () => {
+  it("renders the current model and reasoning effort inline", () => {
+    render(
+      <InstructionBox
+        state={readyState()}
+        onSend={noop}
+        codexSettings={codexSettings}
+        onCodexSettingsChange={noop}
+      />,
+    );
+
+    expect(
+      screen.getByRole("combobox", { name: "Codex 모델" }),
+    ).toHaveTextContent("GPT Default");
+    expect(
+      screen.getByRole("combobox", { name: "추론 단계" }),
+    ).toHaveTextContent("추론 보통");
+  });
+
+  it("changes models with that model's default reasoning effort", async () => {
+    const user = userEvent.setup();
+    const onChange = vi.fn();
+    render(
+      <InstructionBox
+        state={readyState()}
+        onSend={noop}
+        codexSettings={codexSettings}
+        onCodexSettingsChange={onChange}
+      />,
+    );
+
+    await user.click(screen.getByRole("combobox", { name: "Codex 모델" }));
+    await user.click(screen.getByRole("option", { name: "GPT Fast" }));
+    expect(onChange).toHaveBeenCalledWith("gpt-fast", "low");
+  });
+
+  it("changes reasoning effort without changing the selected model", async () => {
+    const user = userEvent.setup();
+    const onChange = vi.fn();
+    render(
+      <InstructionBox
+        state={readyState()}
+        onSend={noop}
+        codexSettings={codexSettings}
+        onCodexSettingsChange={onChange}
+      />,
+    );
+
+    await user.click(screen.getByRole("combobox", { name: "추론 단계" }));
+    await user.click(screen.getByRole("option", { name: "추론 높음" }));
+    expect(onChange).toHaveBeenCalledWith("gpt-default", "high");
+  });
+
+  it("offers a retry control when the catalog could not be loaded", async () => {
+    const user = userEvent.setup();
+    const onReload = vi.fn();
+    render(
+      <InstructionBox
+        state={readyState()}
+        onSend={noop}
+        codexSettings={null}
+        onCodexSettingsReload={onReload}
+      />,
+    );
+
+    await user.click(
+      screen.getByRole("button", { name: "Codex 모델 다시 불러오기" }),
+    );
+    expect(onReload).toHaveBeenCalledTimes(1);
+  });
+
+  it("locks both selectors while a settings save is in flight", () => {
+    render(
+      <InstructionBox
+        state={readyState()}
+        onSend={noop}
+        codexSettings={codexSettings}
+        codexSettingsBusy
+        onCodexSettingsChange={noop}
+      />,
+    );
+
+    expect(screen.getByRole("combobox", { name: "Codex 모델" })).toBeDisabled();
+    expect(screen.getByRole("combobox", { name: "추론 단계" })).toBeDisabled();
   });
 });
 

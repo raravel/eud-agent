@@ -38,9 +38,12 @@ import { createPanelStore } from "@/state/store";
 import type { LogEntry } from "@/state/store";
 import {
   IpcClient,
+  codexModelSettingsGet,
+  codexModelSettingsSave,
   wikiGet,
   wikiSave,
   type LedgerEntry,
+  type CodexModelSettings,
   type MemoryFile,
   type PanelLog,
   type PanelLogEntry,
@@ -177,6 +180,44 @@ export default function App() {
   // The active session id (auto-created on the first turn or opened), tracked from
   // the `session_active` event so the list can highlight the current row.
   const [currentSessionId, setCurrentSessionId] = useState<string | null>(null);
+  // Authenticated Codex model catalog + persisted global selection. The catalog
+  // comes from app-server `model/list`; changing either select applies to the
+  // next eud-agent turn and is saved by the Rust core.
+  const [codexSettings, setCodexSettings] =
+    useState<CodexModelSettings | null>(null);
+  const [codexSettingsBusy, setCodexSettingsBusy] = useState(false);
+
+  const loadCodexModelSettings = useCallback(async () => {
+    setCodexSettingsBusy(true);
+    try {
+      setCodexSettings(await codexModelSettingsGet());
+    } catch {
+      setCodexSettings(null);
+      toast.error("Codex 모델 목록을 불러오지 못했습니다.");
+    } finally {
+      setCodexSettingsBusy(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (editorPollEnabled) void loadCodexModelSettings();
+  }, [editorPollEnabled, loadCodexModelSettings]);
+
+  const handleCodexSettingsChange = useCallback(
+    async (model: string, reasoningEffort: string) => {
+      setCodexSettingsBusy(true);
+      try {
+        setCodexSettings(
+          await codexModelSettingsSave(model, reasoningEffort),
+        );
+      } catch {
+        toast.error("Codex 모델 설정을 저장하지 못했습니다.");
+      } finally {
+        setCodexSettingsBusy(false);
+      }
+    },
+    [],
+  );
 
   useEffect(() => {
     bootstrapActiveRef.current = bootstrap.active;
@@ -985,7 +1026,15 @@ export default function App() {
         </section>
       )}
 
-      <InstructionBox state={state} onSend={handleSend} onReset={handleReset} />
+      <InstructionBox
+        state={state}
+        onSend={handleSend}
+        onReset={handleReset}
+        codexSettings={codexSettings}
+        codexSettingsBusy={!editorPollEnabled || codexSettingsBusy}
+        onCodexSettingsChange={handleCodexSettingsChange}
+        onCodexSettingsReload={loadCodexModelSettings}
+      />
       </div>
       <SessionList
         open={sessionListOpen}

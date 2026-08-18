@@ -15,7 +15,9 @@ use std::{
 };
 
 use crate::{
-    codex_client::{AppServerEvent, CodexAppServerClient},
+    codex_client::{
+        AppServerEvent, CodexAppServerClient, CodexModel, CodexModelSelection, CodexModelSettings,
+    },
     ipc, journal,
     tool_exec::ToolRuntime,
 };
@@ -91,6 +93,7 @@ const EVIDENCE_GUIDE: &str = r#"[evidence]
 - Cite on BOTH review surfaces: every propose_plan step carries its evidence link(s), and the final answer explains each applied change with its link(s). The reference-context chunks below carry their own `source:` links — cite those the same way.
 - The server enforces this: mutating tool calls are rejected until at least one search_docs has run in the request.
 - If searching finds NO relevant document for an item, mark it explicitly as 근거 없음 (일반 EUD 지식) and proceed — NEVER fabricate a source or url.
+- For EUD / StarCraft / epScript(eps) / eud3 domain knowledge, the in-house corpus (search_docs) and [first principles] are the ONLY authoritative sources: NEVER use web_search for this domain — public web results for this niche are unreliable/outdated and MUST NOT be cited. If search_docs returns nothing, fall back to 근거 없음 (일반 EUD 지식), NOT to a web search.
 - When the user reports a crash / EUD error / drop / freeze, FIRST match the symptom against the [first principles] list and cite the matching item number (or state explicitly that no item matches) BEFORE proposing or applying any fix. A speculative fix without a named suspected cause is forbidden.
 - [first principles] always outrank retrieved documents."#;
 
@@ -1104,16 +1107,38 @@ pub(crate) struct ProductionCodexDriver {
     cwd: PathBuf,
     sink: TauriEventSink,
     mcp_port: u16,
+    dirs: crate::config::DataDirs,
+    model_selection: Option<CodexModelSelection>,
     client: Option<CodexAppServerClient<ChildStdout, ChildStdin>>,
     events: Option<tokio::sync::mpsc::Receiver<AppServerEvent>>,
 }
 
 impl ProductionCodexDriver {
-    pub(crate) fn new(cwd: impl Into<PathBuf>, sink: TauriEventSink, mcp_port: u16) -> Self {
+    pub(crate) fn new(
+        cwd: impl Into<PathBuf>,
+        sink: TauriEventSink,
+        mcp_port: u16,
+        dirs: crate::config::DataDirs,
+    ) -> Self {
+        let model_selection = dirs.load_config().ok().and_then(|config| {
+            match (config.codex_model, config.codex_reasoning_effort) {
+                (Some(model), Some(reasoning_effort))
+                    if !model.trim().is_empty() && !reasoning_effort.trim().is_empty() =>
+                {
+                    Some(CodexModelSelection {
+                        model,
+                        reasoning_effort,
+                    })
+                }
+                _ => None,
+            }
+        });
         Self {
             cwd: cwd.into(),
             sink,
             mcp_port,
+            dirs,
+            model_selection,
             client: None,
             events: None,
         }
@@ -1124,13 +1149,120 @@ impl ProductionCodexDriver {
             return Ok(());
         }
 
-        let (client, events) = CodexAppServerClient::spawn_app_server(&self.cwd, self.mcp_port)
+        let (mut client, events) = CodexAppServerClient::spawn_app_server(&self.cwd, self.mcp_port)
             .await
             .map_err(|err| AgentEngineError::new(err.to_string()))?;
+        client.set_model_selection(self.model_selection.clone());
         self.client = Some(client);
         self.events = Some(events);
         Ok(())
     }
+
+    async fn fetch_models(&mut self) -> Result<Vec<CodexModel>, AgentEngineError> {
+        self.ensure_client().await?;
+        self.client
+            .as_mut()
+            .ok_or_else(|| AgentEngineError::new("codex app-server client is unavailable"))?
+            .list_models()
+            .await
+            .map_err(|err| AgentEngineError::new(err.to_string()))
+    }
+
+    fn persist_selection(&self, selection: &CodexModelSelection) -> Result<(), AgentEngineError> {
+        let mut config = self
+            .dirs
+            .load_config()
+            .map_err(|err| AgentEngineError::new(format!("failed to load config: {err}")))?;
+        config.codex_model = Some(selection.model.clone());
+        config.codex_reasoning_effort = Some(selection.reasoning_effort.clone());
+        self.dirs
+            .save_config(&config)
+            .map_err(|err| AgentEngineError::new(format!("failed to save config: {err}")))
+    }
+
+    async fn model_settings(&mut self) -> Result<CodexModelSettings, AgentEngineError> {
+        let models = self.fetch_models().await?;
+        let selection = resolve_model_selection(&models, self.model_selection.as_ref())?;
+
+        if self.model_selection.as_ref() != Some(&selection) {
+            if self.model_selection.is_some() {
+                self.persist_selection(&selection)?;
+            }
+            self.model_selection = Some(selection.clone());
+            if let Some(client) = self.client.as_mut() {
+                client.set_model_selection(Some(selection.clone()));
+            }
+        }
+
+        Ok(CodexModelSettings {
+            models,
+            selected_model: selection.model,
+            selected_reasoning_effort: selection.reasoning_effort,
+        })
+    }
+
+    async fn save_model_settings(
+        &mut self,
+        model: String,
+        reasoning_effort: String,
+    ) -> Result<CodexModelSettings, AgentEngineError> {
+        let models = self.fetch_models().await?;
+        let selected_model = models
+            .iter()
+            .find(|candidate| candidate.model == model)
+            .ok_or_else(|| AgentEngineError::new(format!("model is not available: {model}")))?;
+        if !selected_model
+            .supported_reasoning_efforts
+            .iter()
+            .any(|option| option.reasoning_effort == reasoning_effort)
+        {
+            return Err(AgentEngineError::new(format!(
+                "reasoning effort {reasoning_effort} is not available for {model}"
+            )));
+        }
+
+        let selection = CodexModelSelection {
+            model: model.clone(),
+            reasoning_effort: reasoning_effort.clone(),
+        };
+        self.persist_selection(&selection)?;
+        self.model_selection = Some(selection.clone());
+        if let Some(client) = self.client.as_mut() {
+            client.set_model_selection(Some(selection));
+        }
+
+        Ok(CodexModelSettings {
+            models,
+            selected_model: model,
+            selected_reasoning_effort: reasoning_effort,
+        })
+    }
+}
+
+fn resolve_model_selection(
+    models: &[CodexModel],
+    configured: Option<&CodexModelSelection>,
+) -> Result<CodexModelSelection, AgentEngineError> {
+    let model = configured
+        .and_then(|selection| models.iter().find(|model| model.model == selection.model))
+        .or_else(|| models.iter().find(|model| model.is_default))
+        .or_else(|| models.first())
+        .ok_or_else(|| AgentEngineError::new("codex returned no available models"))?;
+    let reasoning_effort = configured
+        .filter(|selection| selection.model == model.model)
+        .and_then(|selection| {
+            model
+                .supported_reasoning_efforts
+                .iter()
+                .find(|option| option.reasoning_effort == selection.reasoning_effort)
+                .map(|_| selection.reasoning_effort.clone())
+        })
+        .unwrap_or_else(|| model.default_reasoning_effort.clone());
+
+    Ok(CodexModelSelection {
+        model: model.model.clone(),
+        reasoning_effort,
+    })
 }
 
 impl CodexDriver for ProductionCodexDriver {
@@ -1293,8 +1425,50 @@ impl CodexDriver for ProductionCodexDriver {
     }
 }
 
+impl<S: EventSink> AgentEngine<ProductionCodexDriver, S> {
+    async fn codex_model_settings(&mut self) -> Result<CodexModelSettings, AgentEngineError> {
+        self.driver.model_settings().await
+    }
+
+    async fn save_codex_model_settings(
+        &mut self,
+        model: String,
+        reasoning_effort: String,
+    ) -> Result<CodexModelSettings, AgentEngineError> {
+        self.driver
+            .save_model_settings(model, reasoning_effort)
+            .await
+    }
+}
+
 pub(crate) type ManagedAgentEngine =
     tokio::sync::Mutex<AgentEngine<ProductionCodexDriver, TauriEventSink>>;
+
+#[tauri::command(rename = "codex_model_settings")]
+pub(crate) async fn engine_codex_model_settings(
+    state: tauri::State<'_, ManagedAgentEngine>,
+) -> Result<CodexModelSettings, String> {
+    state
+        .lock()
+        .await
+        .codex_model_settings()
+        .await
+        .map_err(|err| err.message)
+}
+
+#[tauri::command(rename = "codex_model_settings_save")]
+pub(crate) async fn engine_codex_model_settings_save(
+    state: tauri::State<'_, ManagedAgentEngine>,
+    model: String,
+    reasoning_effort: String,
+) -> Result<CodexModelSettings, String> {
+    state
+        .lock()
+        .await
+        .save_codex_model_settings(model, reasoning_effort)
+        .await
+        .map_err(|err| err.message)
+}
 
 #[tauri::command(rename = "chat")]
 pub(crate) async fn engine_chat(
@@ -2060,6 +2234,68 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
+    fn model_option(
+        model: &str,
+        default_reasoning_effort: &str,
+        efforts: &[&str],
+        is_default: bool,
+    ) -> CodexModel {
+        CodexModel {
+            model: model.to_string(),
+            display_name: model.to_string(),
+            description: String::new(),
+            supported_reasoning_efforts: efforts
+                .iter()
+                .map(|effort| crate::codex_client::CodexReasoningEffortOption {
+                    reasoning_effort: (*effort).to_string(),
+                    description: String::new(),
+                })
+                .collect(),
+            default_reasoning_effort: default_reasoning_effort.to_string(),
+            is_default,
+        }
+    }
+
+    #[test]
+    fn model_selection_preserves_valid_choice_and_repairs_stale_values() {
+        let models = vec![
+            model_option("gpt-default", "medium", &["low", "medium", "high"], true),
+            model_option("gpt-fast", "low", &["low", "medium"], false),
+        ];
+
+        let valid = resolve_model_selection(
+            &models,
+            Some(&CodexModelSelection {
+                model: "gpt-fast".to_string(),
+                reasoning_effort: "medium".to_string(),
+            }),
+        )
+        .unwrap();
+        assert_eq!(valid.model, "gpt-fast");
+        assert_eq!(valid.reasoning_effort, "medium");
+
+        let stale_effort = resolve_model_selection(
+            &models,
+            Some(&CodexModelSelection {
+                model: "gpt-fast".to_string(),
+                reasoning_effort: "ultra".to_string(),
+            }),
+        )
+        .unwrap();
+        assert_eq!(stale_effort.model, "gpt-fast");
+        assert_eq!(stale_effort.reasoning_effort, "low");
+
+        let stale_model = resolve_model_selection(
+            &models,
+            Some(&CodexModelSelection {
+                model: "retired".to_string(),
+                reasoning_effort: "high".to_string(),
+            }),
+        )
+        .unwrap();
+        assert_eq!(stale_model.model, "gpt-default");
+        assert_eq!(stale_model.reasoning_effort, "medium");
+    }
 
     #[test]
     fn ipc_changeset_item_maps_file_write_to_file_category_with_path() {
@@ -3330,6 +3566,33 @@ mod tests {
         assert!(
             first_principles < reference_context,
             "[first principles] must appear before [reference context]"
+        );
+    }
+
+    #[test]
+    fn system_prompt_forbids_web_search_for_eud_domain() {
+        let prompt = build_system_prompt(
+            "chatEvent 에 대해 알려줘",
+            &sample_hits(),
+            "[project state]\nproject=Sample compiling=false",
+            None,
+            None,
+        );
+        assert!(
+            prompt.contains("web_search"),
+            "system prompt must instruct the model about web_search"
+        );
+        // The instruction lives in the [evidence] section and forbids web search for
+        // the EUD domain, steering the model to search_docs / [first principles].
+        let evidence = prompt
+            .find("[evidence]")
+            .expect("system prompt must contain [evidence]");
+        let web_search = prompt
+            .find("web_search")
+            .expect("system prompt must mention web_search");
+        assert!(
+            evidence < web_search,
+            "the web_search prohibition must sit within the [evidence] guidance"
         );
     }
 

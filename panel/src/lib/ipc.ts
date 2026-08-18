@@ -35,6 +35,26 @@ export type InvokeFn = (
   cmd: string,
   args?: Record<string, unknown>,
 ) => Promise<unknown>;
+export interface CodexReasoningEffortOption {
+  reasoningEffort: string;
+  description: string;
+}
+
+export interface CodexModel {
+  model: string;
+  displayName: string;
+  description: string;
+  supportedReasoningEfforts: CodexReasoningEffortOption[];
+  defaultReasoningEffort: string;
+  isDefault: boolean;
+}
+
+export interface CodexModelSettings {
+  models: CodexModel[];
+  selectedModel: string;
+  selectedReasoningEffort: string;
+}
+
 
 /** Unlisten callback returned by Tauri event registration. */
 export type UnlistenFn = () => void;
@@ -390,4 +410,34 @@ export async function wikiSave(
   invoke: InvokeFn = tauriInvoke,
 ): Promise<WikiMessage> {
   return toWikiMessage(await invoke("wiki_save", { entries }));
+}
+
+function toCodexModelSettings(value: unknown): CodexModelSettings {
+  if (
+    !isObject(value) ||
+    !Array.isArray(value.models) ||
+    typeof value.selectedModel !== "string" ||
+    typeof value.selectedReasoningEffort !== "string"
+  ) {
+    throw new Error("invalid codex model settings response");
+  }
+  return value as unknown as CodexModelSettings;
+}
+
+/** Fetch the authenticated account's current visible Codex model catalog. */
+export async function codexModelSettingsGet(
+  invoke: InvokeFn = tauriInvoke,
+): Promise<CodexModelSettings> {
+  return toCodexModelSettings(await invoke("codex_model_settings"));
+}
+
+/** Validate, persist, and apply a model + reasoning effort to subsequent turns. */
+export async function codexModelSettingsSave(
+  model: string,
+  reasoningEffort: string,
+  invoke: InvokeFn = tauriInvoke,
+): Promise<CodexModelSettings> {
+  return toCodexModelSettings(
+    await invoke("codex_model_settings_save", { model, reasoningEffort }),
+  );
 }
