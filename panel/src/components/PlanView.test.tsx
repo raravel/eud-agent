@@ -122,12 +122,33 @@ describe("PlanView — no embedded feedback input (EUD-074)", () => {
   });
 });
 
-describe("PlanView — approve dispatch", () => {
-  it("[승인] calls onApprove with no payload", async () => {
+describe("PlanView — approve dispatch and collapse", () => {
+  it("[승인] calls onApprove, collapses the plan, and still allows manual re-open", async () => {
     const onApprove = vi.fn();
     render(<PlanView plan={rev1} pending={false} onApprove={onApprove} />);
+    expect(screen.getByText("첫 번째 단계")).toBeInTheDocument();
+
     await userEvent.click(screen.getByRole("button", { name: "승인" }));
+
     expect(onApprove).toHaveBeenCalledWith();
+    expect(screen.queryByText("첫 번째 단계")).not.toBeInTheDocument();
+    await userEvent.click(
+      screen.getByRole("button", { name: "계획안 펼치기" }),
+    );
+    expect(screen.getByText("첫 번째 단계")).toBeInTheDocument();
+  });
+
+  it("opens a new revision after the approved revision was collapsed", async () => {
+    const { rerender } = render(
+      <PlanView plan={rev1} pending={false} onApprove={() => {}} />,
+    );
+    await userEvent.click(screen.getByRole("button", { name: "승인" }));
+    expect(screen.queryByText("첫 번째 단계")).not.toBeInTheDocument();
+
+    rerender(<PlanView plan={rev2} pending={false} onApprove={() => {}} />);
+
+    expect(await screen.findByText("수정된 내용입니다.")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "계획안 접기" })).toBeInTheDocument();
   });
 });
 

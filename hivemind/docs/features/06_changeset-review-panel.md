@@ -91,3 +91,6 @@ Reconnect during thinking resets to ready with a notice (server cancels the thre
 - `panel/src/lib/changeset.ts` — dat-group id-shape helpers (itemKey/itemIds) shared by view + store
 - removed: `TargetPicker.tsx`, `ApplyBar.tsx`, ReviewTabs apply wiring
 - external: `streamdown` (npm, bundled — real-time markdown); served by `server/eud_agent/app.py`; protocol per [[features/05_agent-core|05_agent-core]] `05_agent-core.md`
+  Clicking [승인] immediately collapses the approved revision while its execution turn runs;
+  the accessible Plan trigger can reopen it manually. A later plan revision always opens
+  automatically so new review content is never hidden by the previous revision's state.

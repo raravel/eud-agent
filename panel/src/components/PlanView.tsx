@@ -20,6 +20,7 @@ import {
 } from "@/components/ai-elements/plan";
 import { Response } from "@/components/ai-elements/response";
 import { Button } from "@/components/ui/button";
+import { useEffect, useState } from "react";
 import type { PlanState } from "@/state/store";
 
 export interface PlanViewProps {
@@ -32,16 +33,30 @@ export interface PlanViewProps {
 }
 
 export function PlanView({ plan, pending, onApprove }: PlanViewProps) {
+  const [open, setOpen] = useState(true);
+
+  // A revised plan is new review content, so it opens even if the previously
+  // approved revision was collapsed. Approval itself collapses immediately;
+  // the trigger remains available for manual re-open while execution runs.
+  useEffect(() => {
+    setOpen(true);
+  }, [plan.revision]);
+
+  const handleApprove = () => {
+    setOpen(false);
+    onApprove();
+  };
+
   return (
     <section
       aria-label="계획 검토"
       className="flex max-h-[40vh] flex-col gap-3 overflow-y-auto border-t border-border p-4"
     >
-      <Plan defaultOpen className="gap-3 py-3">
+      <Plan open={open} onOpenChange={setOpen} className="gap-3 py-3">
         <PlanHeader className="px-3">
           <PlanTitle className="text-sm">{`계획안 (rev ${plan.revision})`}</PlanTitle>
           <PlanAction>
-            <PlanTrigger />
+            <PlanTrigger aria-label={open ? "계획안 접기" : "계획안 펼치기"} />
           </PlanAction>
         </PlanHeader>
         <PlanContent className="px-3 text-sm">
@@ -56,7 +71,7 @@ export function PlanView({ plan, pending, onApprove }: PlanViewProps) {
         <span className="text-xs text-muted-foreground">
           수정하려면 아래 입력창에 피드백을 입력하세요.
         </span>
-        <Button type="button" disabled={pending} onClick={() => onApprove()}>
+        <Button type="button" disabled={pending} onClick={handleApprove}>
           승인
         </Button>
       </div>
