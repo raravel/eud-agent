@@ -204,6 +204,25 @@ pub struct MemorySaveResponse {
     pub file: String,
 }
 
+/// `workspace_list` command output for the current editor project.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceListResponse {
+    pub project: String,
+    pub workspace_id: String,
+    pub files: Vec<crate::workspace::WorkspaceFileEntry>,
+}
+
+/// `workspace_read` command output.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceReadResponse {
+    pub workspace_id: String,
+    pub path: String,
+    pub source: bool,
+    pub content: String,
+}
+
 /// `wiki` event payload AND the `wiki_get` command output: the dat-edit ledger.
 ///
 /// `entries` is a key -> entry map mirroring the on-disk `ledger.json`
@@ -361,6 +380,9 @@ pub enum ProgressStage {
     /// Codex subprocess execution.
     #[serde(rename = "codex")]
     Codex,
+    /// Per-project filesystem + exact-root Windows sandbox setup.
+    #[serde(rename = "workspace")]
+    Workspace,
     /// Advisory epscript-lsp diagnostics.
     #[serde(rename = "lsp")]
     Lsp,
@@ -629,6 +651,52 @@ pub async fn wiki_save(
     let request = WikiSaveRequest { entries };
     let project = current_project_from_status(state.dirs()).await?;
     wiki_save_payload(state.dirs(), &project, request.entries)
+}
+
+/// Refresh and list the current project's real Codex workspace.
+#[tauri::command]
+pub async fn workspace_list(
+    state: tauri::State<'_, BridgeManaged>,
+) -> Result<WorkspaceListResponse, String> {
+    let manager = crate::workspace::WorkspaceManager::new(state.dirs().clone());
+    tauri::async_runtime::spawn_blocking(move || {
+        let workspace = manager.prepare_current()?;
+        let files = manager
+            .list_files(&workspace)
+            .map_err(|error| error.to_string())?;
+        Ok(WorkspaceListResponse {
+            project: workspace.project,
+            workspace_id: workspace.id,
+            files,
+        })
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+/// Read one UTF-8 workspace file by opaque workspace id + confined relative path.
+#[tauri::command]
+pub async fn workspace_read(
+    state: tauri::State<'_, BridgeManaged>,
+    workspace_id: String,
+    path: String,
+) -> Result<WorkspaceReadResponse, String> {
+    let manager = crate::workspace::WorkspaceManager::new(state.dirs().clone());
+    tauri::async_runtime::spawn_blocking(move || {
+        let content = manager
+            .read_file(&workspace_id, &path)
+            .map_err(|error| error.to_string())?;
+        let source = path == crate::workspace::SOURCE_DIR
+            || path.starts_with(&format!("{}/", crate::workspace::SOURCE_DIR));
+        Ok(WorkspaceReadResponse {
+            workspace_id,
+            path,
+            source,
+            content,
+        })
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 async fn current_project_from_status(dirs: &DataDirs) -> Result<String, String> {

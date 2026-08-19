@@ -18,7 +18,7 @@
  * Diff/preview limits reuse lib/truncate (1 MiB UTF-16-consistent). Korean labels.
  */
 import type { ReactNode } from "react";
-import { FilePenLineIcon } from "lucide-react";
+import { FilePenLineIcon, FolderTreeIcon } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
@@ -87,11 +87,25 @@ const FILE_KIND_TAG: Record<string, { label: string; tone: string }> = {
  * {@link DiffBlock}/{@link ContentPreview} and standalone for body-less items
  * (a created file with no stored content, or a deleted file).
  */
-function FileTitleBar({ path, kind }: { path: string; kind: string }) {
+function FileTitleBar({
+  path,
+  kind,
+  workspace = false,
+}: {
+  path: string;
+  kind: string;
+  workspace?: boolean;
+}) {
   const tag = FILE_KIND_TAG[kind] ?? { label: kind, tone: "text-muted-foreground" };
+  const Icon = workspace ? FolderTreeIcon : FilePenLineIcon;
   return (
     <div className="flex items-center gap-1.5 bg-muted/60 px-2 py-1.5 text-xs">
-      <FilePenLineIcon aria-hidden className="size-3.5 shrink-0 text-muted-foreground" />
+      <Icon aria-hidden className="size-3.5 shrink-0 text-muted-foreground" />
+      {workspace && (
+        <span className="rounded bg-emerald-500/15 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-emerald-400">
+          Workspace
+        </span>
+      )}
       <span className="break-all font-medium">{path}</span>
       <span className={cn("ml-auto shrink-0 font-medium", tag.tone)}>{tag.label}</span>
     </div>
@@ -221,17 +235,19 @@ function ItemBody({ item }: { item: ChangesetItem }) {
     return <DatChangeBlock item={item} />;
   }
 
-  if (item.category === "file") {
+  if (item.category === "file" || item.category === "workspace") {
     const path = asText(item.path);
     const kind = asText(item.kind);
-    const header = <FileTitleBar path={path} kind={kind} />;
+    const header = (
+      <FileTitleBar path={path} kind={kind} workspace={item.category === "workspace"} />
+    );
     // The title bar sits on top of the code (file-editing card). Created files
     // carry no stored content and deleted files have no body, so those render
     // the title bar alone in the same bordered card.
     if (kind === "created" && typeof item.content === "string" && item.content !== "") {
       return <ContentPreview content={item.content} header={header} />;
     }
-    if (kind === "modified" && typeof item.diff === "string" && item.diff !== "") {
+    if (typeof item.diff === "string" && item.diff !== "") {
       return <DiffBlock diff={item.diff} header={header} />;
     }
     return (

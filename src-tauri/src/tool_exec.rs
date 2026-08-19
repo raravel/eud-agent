@@ -115,6 +115,12 @@ impl ToolRuntime {
         self.dirs.app_data().to_path_buf()
     }
 
+    /// Resolved app data roots for parent-owned services such as the Codex
+    /// project workspace. The clone contains paths only.
+    pub fn data_dirs(&self) -> DataDirs {
+        self.dirs.clone()
+    }
+
     /// The shared RAG handle, for a background warmup that does not gate startup.
     pub fn rag(&self) -> Arc<Rag> {
         Arc::clone(&self.rag)

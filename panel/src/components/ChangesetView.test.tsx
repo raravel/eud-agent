@@ -74,6 +74,15 @@ const modifiedFile: ChangesetItem = {
   diff: "--- a/main.eps\n+++ b/main.eps\n@@ -1 +1 @@\n-old line\n+new line\n",
 };
 
+const workspaceDocument: ChangesetItem = {
+  category: "workspace",
+  kind: "modified",
+  path: "specs/combat.md",
+  id: "workspace-1",
+  seq: 2,
+  diff: "--- old/specs/combat.md\n+++ new/specs/combat.md\n@@ -1 +1 @@\n-draft\n+accepted candidate\n",
+};
+
 const deletedFile: ChangesetItem = {
   category: "file",
   kind: "deleted",
@@ -203,6 +212,20 @@ describe("ChangesetView — files by kind", () => {
     // it renders at least once.
     expect(screen.getAllByText(/main\.eps/).length).toBeGreaterThan(0);
     // diff lines classified: at least one add + one del line element.
+    expect(container.querySelector('[data-diff="add"]')).not.toBeNull();
+    expect(container.querySelector('[data-diff="del"]')).not.toBeNull();
+  });
+
+  it("renders Workspace documents as distinct reviewable file diffs", () => {
+    const { container } = render(
+      <ChangesetView
+        changeset={makeChangeset([workspaceDocument])}
+        pending={false}
+        onDecide={() => {}}
+      />,
+    );
+    expect(screen.getByText("Workspace")).toBeInTheDocument();
+    expect(screen.getAllByText(/specs\/combat\.md/).length).toBeGreaterThan(0);
     expect(container.querySelector('[data-diff="add"]')).not.toBeNull();
     expect(container.querySelector('[data-diff="del"]')).not.toBeNull();
   });

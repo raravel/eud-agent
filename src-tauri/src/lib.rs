@@ -30,6 +30,7 @@ pub mod setup;
 pub mod tool_exec;
 pub mod tools;
 pub mod wiki;
+pub mod workspace;
 
 #[derive(Clone)]
 struct AppMemoryProvider {

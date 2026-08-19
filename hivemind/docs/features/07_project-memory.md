@@ -9,6 +9,12 @@ edit (panel)**.
 
 > Decision: see [[decisions/07_project-memory-mcp-tool]] — alternatives evaluated, not pursued.
 
+> Scope boundary: Project Memory is deliberately a small, fully prompt-injected “hot”
+> summary (four files, 8 KiB each). Long-lived specifications, approved plans, decisions,
+> and detailed work logs belong in the real per-project Codex workspace described in
+> [[features/05_agent-core#Native project workspace]]. Codex retrieves those files with
+> native glob/grep/read instead of injecting the full project archive every turn.
+
 ```mermaid
 graph TD
     Codex[codex thread] -- "memory_write(file, content)" --> Tools[ToolLayer]

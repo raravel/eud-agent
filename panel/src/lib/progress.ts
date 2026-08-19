@@ -29,6 +29,7 @@ export const STAGE_LABELS: Record<string, string> = {
   // The codex stage covers ANY turn (greetings/answers included), so the label
   // must not claim code generation specifically.
   codex: "codex 실행 중…",
+  workspace: "프로젝트 워크스페이스 보안 환경 준비 중…",
   lsp: "진단 검사 중…",
   waiting_build: "에디터 빌드 완료 대기 중…",
 };

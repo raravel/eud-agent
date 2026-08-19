@@ -29,6 +29,19 @@ pub trait JournalBridge {
 
     fn delete_file(&self, path: &str) -> Result<(), Self::Error>;
 
+    fn write_workspace_file(
+        &self,
+        _workspace_id: &str,
+        path: &str,
+        content: &str,
+    ) -> Result<(), Self::Error> {
+        self.write_file(path, content)
+    }
+
+    fn delete_workspace_file(&self, _workspace_id: &str, path: &str) -> Result<(), Self::Error> {
+        self.delete_file(path)
+    }
+
     fn create_file(
         &self,
         path: &str,
@@ -105,6 +118,9 @@ pub enum WriteTool {
     PluginMove,
     LocationWrite,
     PlayerSetup,
+    WorkspaceWrite,
+    WorkspaceCreate,
+    WorkspaceDelete,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -122,6 +138,10 @@ pub enum JournalTarget {
         property: String,
     },
     Path {
+        path: String,
+    },
+    WorkspacePath {
+        workspace_id: String,
         path: String,
     },
     Rename {
@@ -257,6 +277,9 @@ pub enum ChangesetItemKind {
     Created,
     Modified,
     Deleted,
+    WorkspaceCreated,
+    WorkspaceModified,
+    WorkspaceDeleted,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -589,6 +612,46 @@ fn file_changeset_item(entry: &JournalEntry) -> Result<Option<ChangesetItem>, Jo
                 properties: Vec::new(),
             }
         }
+        WriteTool::WorkspaceCreate => {
+            let path = workspace_entry_path(entry)?;
+            let Snapshot::FileContent { content } = &entry.after else {
+                return Err(invalid_entry(entry, "expected created workspace content"));
+            };
+            ChangesetItem {
+                id: entry.id.clone(),
+                kind: ChangesetItemKind::WorkspaceCreated,
+                diff: Some(unified_diff(&path, "", content)),
+                path: Some(path),
+                dat_ref: None,
+                properties: Vec::new(),
+            }
+        }
+        WriteTool::WorkspaceDelete => {
+            let path = workspace_entry_path(entry)?;
+            let Snapshot::DeletedFile { content, .. } = &entry.before else {
+                return Err(invalid_entry(entry, "expected deleted workspace content"));
+            };
+            ChangesetItem {
+                id: entry.id.clone(),
+                kind: ChangesetItemKind::WorkspaceDeleted,
+                diff: Some(unified_diff(&path, content, "")),
+                path: Some(path),
+                dat_ref: None,
+                properties: Vec::new(),
+            }
+        }
+        WriteTool::WorkspaceWrite => {
+            let path = workspace_entry_path(entry)?;
+            let (old, new) = file_contents(entry)?;
+            ChangesetItem {
+                id: entry.id.clone(),
+                kind: ChangesetItemKind::WorkspaceModified,
+                diff: Some(unified_diff(&path, &old, &new)),
+                path: Some(path),
+                dat_ref: None,
+                properties: Vec::new(),
+            }
+        }
         WriteTool::FileRename | WriteTool::FileMove | WriteTool::SetMain => ChangesetItem {
             id: entry.id.clone(),
             kind: ChangesetItemKind::Modified,
@@ -629,11 +692,16 @@ fn file_changeset_item(entry: &JournalEntry) -> Result<Option<ChangesetItem>, Jo
         | WriteTool::XdatSet
         | WriteTool::TblSet
         | WriteTool::ReqSet
-        | WriteTool::BtnSet => {
-            return Ok(None);
-        }
+        | WriteTool::BtnSet => return Ok(None),
     };
     Ok(Some(item))
+}
+
+fn workspace_entry_path(entry: &JournalEntry) -> Result<String, JournalError> {
+    match &entry.target {
+        JournalTarget::WorkspacePath { path, .. } => Ok(path.clone()),
+        _ => Err(invalid_entry(entry, "expected workspace path target")),
+    }
 }
 
 fn location_write_changeset_kind(entry: &JournalEntry) -> Result<ChangesetItemKind, JournalError> {
@@ -712,6 +780,10 @@ enum RejectTarget {
     },
     Path(String),
     Setting(String),
+    WorkspacePath {
+        workspace_id: String,
+        path: String,
+    },
     PluginIndex(usize),
 }
 
@@ -725,6 +797,9 @@ impl fmt::Display for RejectTarget {
                 property,
             } => write!(f, "dat:{table}:{dat}:{obj_id}:{property}"),
             Self::Path(path) => write!(f, "path:{path}"),
+            Self::WorkspacePath { workspace_id, path } => {
+                write!(f, "workspace:{workspace_id}:{path}")
+            }
             Self::Setting(key) => write!(f, "setting:{key}"),
             Self::PluginIndex(index) => write!(f, "plugin-index:{index}"),
         }
@@ -778,6 +853,12 @@ fn reject_targets(entry: &JournalEntry) -> Result<Vec<RejectTarget>, JournalErro
             property: property.clone(),
         }],
         JournalTarget::Path { path } => vec![RejectTarget::Path(path.clone())],
+        JournalTarget::WorkspacePath { workspace_id, path } => {
+            vec![RejectTarget::WorkspacePath {
+                workspace_id: workspace_id.clone(),
+                path: path.clone(),
+            }]
+        }
         JournalTarget::Rename { from, to } => {
             vec![
                 RejectTarget::Path(from.clone()),
@@ -885,6 +966,24 @@ where
                 )),
             }
         }
+        WriteTool::WorkspaceWrite | WriteTool::WorkspaceDelete => {
+            let (workspace_id, path) = workspace_target_parts(entry)?;
+            match &entry.before {
+                Snapshot::FileContent { content } | Snapshot::DeletedFile { content, .. } => bridge
+                    .write_workspace_file(workspace_id, path, content)
+                    .map_err(bridge_error),
+                _ => Err(invalid_entry(
+                    entry,
+                    "expected workspace file content before snapshot",
+                )),
+            }
+        }
+        WriteTool::WorkspaceCreate => {
+            let (workspace_id, path) = workspace_target_parts(entry)?;
+            bridge
+                .delete_workspace_file(workspace_id, path)
+                .map_err(bridge_error)
+        }
         WriteTool::FileRename | WriteTool::FileMove => {
             let (from, to) = rename_inverse(entry)?;
             bridge.rename_path(&from, &to).map_err(bridge_error)
@@ -951,6 +1050,12 @@ where
                 .map_err(bridge_error),
             _ => Err(invalid_entry(entry, "expected map backup before snapshot")),
         },
+    }
+}
+fn workspace_target_parts(entry: &JournalEntry) -> Result<(&str, &str), JournalError> {
+    match &entry.target {
+        JournalTarget::WorkspacePath { workspace_id, path } => Ok((workspace_id, path)),
+        _ => Err(invalid_entry(entry, "expected workspace path target")),
     }
 }
 

@@ -129,6 +129,23 @@ impl DataDirs {
         self.app_data.join("memory")
     }
 
+    /// `%appdata%\eud-agent\workspaces` — durable, per-project Codex workspaces.
+    ///
+    /// Each project directory is the Codex thread cwd: agent-authored project
+    /// documents are writable, while the generated `source/` mirror is read-only
+    /// under the Codex split-filesystem permission profile.
+    pub fn workspaces_dir(&self) -> PathBuf {
+        self.app_data.join("workspaces")
+    }
+
+    /// Parent-owned workspace state (turn baselines and trusted metadata).
+    ///
+    /// This is a sibling of project cwd directories, never a descendant, so a
+    /// sandboxed Codex process cannot rewrite acceptance state or rollback data.
+    pub fn workspace_state_dir(&self) -> PathBuf {
+        self.workspaces_dir().join(".state")
+    }
+
     /// `%appdata%\eud-agent\map_backups`.
     pub fn map_backups_dir(&self) -> PathBuf {
         self.app_data.join("map_backups")
@@ -204,6 +221,8 @@ impl DataDirs {
         for dir in [
             self.app_data.clone(),
             self.memory_dir(),
+            self.workspaces_dir(),
+            self.workspace_state_dir(),
             self.map_backups_dir(),
             self.journal_dir(),
             self.sessions_dir(),
@@ -360,9 +379,17 @@ mod tests {
         assert!(dirs.attachments_dir().is_dir());
         assert!(dirs.lsp_workspaces_dir().is_dir());
 
+        assert!(dirs.workspaces_dir().is_dir());
+        assert!(dirs.workspace_state_dir().is_dir());
         // The model dir must live under local, not roaming.
         assert!(dirs.models_dir().starts_with(dirs.app_local_data()));
         assert!(!dirs.models_dir().starts_with(dirs.app_data()));
+        assert!(dirs.lsp_workspaces_dir().starts_with(dirs.app_local_data()));
+        assert!(dirs.attachments_dir().starts_with(dirs.app_local_data()));
+        assert!(!dirs.attachments_dir().starts_with(dirs.app_data()));
+        assert!(dirs.workspaces_dir().starts_with(dirs.app_data()));
+        assert!(!dirs.workspaces_dir().starts_with(dirs.app_local_data()));
+        assert!(!dirs.lsp_workspaces_dir().starts_with(dirs.app_data()));
 
         fs::remove_dir_all(&base).ok();
     }
