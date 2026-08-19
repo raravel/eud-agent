@@ -9,14 +9,19 @@ matches the v1 features 02/05/06 (kept as behavioral source).
 > (the v1 single-shot instruct/apply surface is superseded by the v2 chat schema).
 
 ## Tauri IPC surface (v2 chat schema — replaces the WebSocket protocol)
-Commands (panel -> core, `invoke`). These start background work and resolve on accept; the
-turn result arrives as events:
+Commands (panel -> core, `invoke`). Turn-starting commands remain pending while streamed
+events arrive and resolve when that turn settles:
 - `chat { text }` — start/resume an agentic turn (the agent picks files/targets itself).
 - `plan_feedback { text }` — iterate the current plan (resumes the codex thread).
 - `plan_approve {}` — approve the plan; lifts the per-request mutation gate; resumes.
 - `changeset_decision { decision: "accept"|"reject", ids: "all"|string[] }` — accept/reject
   journaled items; runs as a background rollback task (EUD-070).
 - `cancel {}` — interrupt the in-flight turn (journal entries persist).
+  `cancel` advances a shared cancellation generation without waiting for the engine mutex;
+  the production driver sends app-server `turn/interrupt {threadId, turnId}`, waits for the
+  interrupted `turn/completed`, finalizes the workspace recorder, then releases the mutex.
+- `conversation_rewind { panelLog }` — retain the active saved session, reset its Codex
+  thread, persist the surviving panel-log prefix, and replay that prefix on the next `chat`.
 - `reset {}` — drop the retained codex thread; next `chat` starts a fresh conversation (EUD-064).
 - `status {}` -> `{ compiling, project }` (read from editor status.txt).
 - `list {}` -> `{ files: [{ path, ftype, settable }] }` (bridge LIST).
@@ -72,10 +77,17 @@ commands: `idle -> triage -> answer | plan_review* -> executing -> changeset_rev
   mutations may apply directly; the 3rd mutating call WITHOUT an approved plan returns a tool
   error directing codex to `propose_plan`. `plan_approve` lifts the gate for that request.
   `propose_plan(markdown)` ends the turn -> `plan` event.
+- **Approved-plan project wiki:** approval persists the exact plan at
+  `plans/<request-id>.md` before execution. An answer cannot complete normally until
+  `specs/index.md` links a non-empty canonical topic spec and
+  `worklog/<request-id>.md` records actual verification and links that spec. The engine
+  supplies exact gaps for at most two repair turns; direct <=2-mutation requests are
+  unchanged.
 - **Request scoping (EUD-064):** each `chat` mints a fresh `request_id` (journal/changeset
   scope, mutation gate, budget are PER-REQUEST); only the codex thread persists. The live
   request id is resolved at tool-call time.
-- **Budgets:** 30 tool actions per request; 3 build self-fix attempts.
+- **Budgets:** 30 non-search tool actions plus 120 `search_docs` calls per request;
+  `eps_check` is exempt from both; 3 build self-fix attempts.
 
 ## Tools (registry, MCP-exposed)
 Read: `project_status`, `list_files`, `read_file`, `dat_get`, `xdat_get`, `tbl_get`,
@@ -148,6 +160,9 @@ feature's Tauri surface): project memory under `%appdata%\eud-agent\memory\<sani
   validation (bounds/whitelists/guards); journal inverse-op correctness per tool kind
   (snapshot->rollback round-trips against a fake bridge); mutation gate (3rd write without
   plan -> error); evidence gate; budgets.
+- Approved-plan workspace contract: exact app-owned plan persistence, authoritative
+  `approved` viewer metadata, linked spec-index/topic/worklog validation, bounded repair
+  turns, and persistent-gap failure.
 - Integration: fake-bridge IPC responder driving chat -> changeset -> reject-single -> verify
   inverse .cmd sequence. App-server JSON-RPC framing test with a stub server.
 - `cargo test --workspace` + `cargo clippy --workspace --all-targets -- -D warnings`.

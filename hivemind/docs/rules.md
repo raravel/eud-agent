@@ -11,8 +11,9 @@ in-editor WebView2 hosting and Python server.
   = file copies only: `bridge/*.lua` into `Data\Lua\TriggerEditor\`; runtime state under
   `Data\agent\`.
 - **The RAG corpus lives in-repo at `ci/corpus/*.jsonl`** (committed, plain git — NOT LFS),
-  produced locally by the Node/TS Naver-Cafe scraper (`tools/scraper`, cookie-gated, never in CI).
-  The legacy `chromadb_bge` sqlite (v1, formerly in the ECA repo) is unused and NEVER imported —
+  produced locally by `tools/scraper` from authenticated Naver data and commit-pinned public
+  repositories; corpus refresh never runs in CI and secrets are never committed. The legacy
+  `chromadb_bge` sqlite (v1, formerly in the ECA repo) is unused and NEVER imported —
   chromadb mutates tracked sqlite on open (proven LFS churn); that caveat is chromadb-specific. The
   distributed RAG index (`rag-index.bin`) is a static read-only CI artifact published to a GitHub
   Release, NOT committed. See [[decisions/15_in-house-rag-corpus]].
@@ -28,8 +29,8 @@ in-editor WebView2 hosting and Python server.
 ## Lua bridge (KopiLua/luanet) — crash rules (RETAINED)
 
 The slim v2 bridge keeps only the file-IPC tool layer (PING/STATUS/LIST/GET/SET/NEWEPS/
-GETDAT/SETDAT/BUILD/LUA) on the `DispatcherTimer.Tick`. WebView2 hosting, panel re-arm,
-and server spawning are REMOVED.
+GETDAT/SETDAT/BUILD/LUA plus additive EPSNAPSHOT) on the `DispatcherTimer.Tick`. WebView2
+hosting, panel re-arm, and server spawning are REMOVED.
 
 - NEVER use `os.execute` (KopiLua corrupts it). NEVER use sockets or `io.popen`. Bridge↔app
   IPC is file-based only.
@@ -58,6 +59,9 @@ and server spawning are REMOVED.
   project line CACHED from the last idle Tick — NEVER touch `pjData` while compiling. In
   v2 these are read by the APP (editor-liveness + build-busy signals), not a self-spawned
   server.
+- EPSNAPSHOT MUST enumerate/read `.eps` project objects in one idle Tick, write
+  request-scoped ordinal files as UTF-8 without BOM, and write `manifest.tsv` last.
+  Unreadable files are individual manifest rows. NEVER repurpose the existing DUMP path.
 - **DROPPED in v2** (cause removed with in-editor WebView2): panel re-arm via window-handle
   tracking, and the `DispatcherPriority.Normal` mandate against Render-starvation (EUD-039
   — the external panel no longer posts Render work to the editor Dispatcher). The default
@@ -65,25 +69,65 @@ and server spawning are REMOVED.
 
 ## IPC and encoding (RETAINED)
 
-- ALWAYS write IPC files (`.cmd`/`.result`/config/heartbeat/status) as UTF-8 **without
-  BOM** (Rust: write bytes / `encoding=utf-8` equivalent; never a BOM — first-line command
-  parsing breaks). `File.ReadAllText` strips an incoming BOM, so bridge reads are safe.
+- ALWAYS write IPC files (`.cmd`/`.result`/config/heartbeat/status and EPSNAPSHOT
+  manifest/content) as UTF-8 **without BOM** (Rust: write bytes; Lua snapshot:
+  `UTF8Encoding(false)` — a BOM breaks first-line parsing).
 - The app deletes each `.result` after consuming and clears stale inbox/outbox at startup.
   The bridge deletes `.cmd` after processing.
 - App command files are named `srv-<uuid8>.cmd`; a consumer polls only its own basenames.
 - NEVER poll `.result` without a timeout. Default 10s; extend to 180s when `status.txt`
   says `compiling=true` and emit `progress {stage: waiting_build}` to the panel.
 
+## Agent epScript preflight process
+
+- `eps_check` is read-only and advisory: NEVER journal it, consume mutation/action budget,
+  gate a write, change evidence/plan/build state, or emit panel diagnostics state.
+- Candidate paths MUST be normalized project-relative `.eps` paths, collision-checked
+  case-insensitively, and confined beneath `%localappdata%\eud-agent\lsp_workspaces`.
+  Candidate batches overlay atomically in a disposable analysis directory; never copy
+  candidate data back to editor state.
+- The adapter resource, checksum, MIT license, and provenance are bundled from the pinned
+  upstream commit. Verify SHA-256 before lazy startup. NEVER install npm packages,
+  download code, invoke a shell, execute project code, or bundle a Node runtime at runtime.
+- Spawn resolved `node.exe` directly with piped stdio, no shell/window, bounded stderr,
+  Content-Length framed JSON, finite cold/warm deadlines, and process-tree reaping.
+  Calls are serialized. Retry a crash/timeout/protocol failure at most once per check and
+  suppress repeated starts for the rest of that request.
+- Missing Node/resource, snapshot failure, startup failure, crash, timeout, or malformed
+  protocol MUST return the stable successful `skipped` result. All other tools remain usable.
+- `EUDLSP001` missing import is an error; `EUDLSP002` cycle is an advisory warning;
+  `EUDLSP003` is a case-insensitive path collision; `EUDLSP004` is an imported unreadable
+  snapshot file. Final correctness always comes from the existing mandatory `build_run`.
+
 ## codex invocation (Rust, Windows) (PORTED)
 
-- NEVER spawn bare `"codex"`. ALWAYS resolve via the `which` crate to the `.cmd` shim path
-  (fail fast if unresolved). A `CODEX_CMD` env/config override may supply a full path.
-- ALWAYS pass `--skip-git-repo-check`; set cwd to a stable working dir.
-- ALWAYS pass the prompt via **stdin** (write then close). NEVER as argv (32,767-char
-  CreateProcess limit; RAG context exceeds it). ALWAYS give every subprocess an explicit
-  stdin (the prompt pipe). Use `tauri-plugin-shell` / tokio with piped stdio.
-- Treat codex stdout as noisy: extract fenced code blocks; if none, fail with the raw
-  output in the error rather than applying noise to the editor.
+- NEVER spawn bare `"codex"`. ALWAYS resolve the app-managed executable first and
+  fall back to the `which` crate (fail fast if unresolved).
+- App-server launch cwd is app-owned, never the repository or process launch dir. Project
+  turns set the thread/turn cwd to `%appdata%\eud-agent\workspaces\<project-id>` so native
+  glob/grep/shell/patch operate on the real project workspace without discovering repository
+  instructions.
+- Project turns MUST use the strict `eud_workspace` split-filesystem profile: `:minimal`
+  read, current workspace write, `source/**` read-only, network disabled, elevated Windows
+  backend. If exact-root setup is unavailable or denied, fail closed; NEVER downgrade to
+  legacy Windows workspace-write (which grants full-filesystem reads).
+- Only the current project workspace is model-writable. Trusted baselines and acceptance
+  metadata stay in sibling `workspaces/.state/`, outside the thread cwd. `source/` is replaced
+  from one coherent EPSNAPSHOT before each turn and is NEVER a live-editor write path.
+- Native filesystem changes MUST be scanned and journaled at turn end (including timeout
+  cancellation); accept archives them, reject restores the prior UTF-8 text snapshot.
+- `plan_approve` MUST atomically write the exact approved Markdown to
+  `plans/<request-id>.md` before the execution baseline and record authoritative approval
+  metadata outside the workspace. Codex MUST NEVER edit, rename, or delete that plan file.
+- An approved-plan execution MUST NOT report normal completion until the backend verifies
+  all project-wiki postconditions: the exact plan snapshot; non-empty `specs/index.md`
+  linking a non-empty `specs/*.md` topic page; and `worklog/<request-id>.md` recording the
+  actual result/verification and linking a canonical topic spec. Specs describe implemented
+  reality, NEVER merely intended work. Missing artifacts get at most two focused repair
+  turns, then a visible error; they are never silently waived.
+- App-server permission/file/command escalation requests remain declined; only the
+  `eud-tools` MCP elicitation is accepted. Live editor/map/DAT/build operations MUST still
+  use eud-tools.
 
 ## Map file writes (mapsafe + isom FFI) (RETAINED)
 
@@ -127,8 +171,9 @@ and server spawning are REMOVED.
 - Monaco is the edit surface; the diff tab renders the Rust-supplied unified diff with +/-
   coloring (NEVER Monaco DiffEditor — the core does not ship original file content).
 - Data dirs (Decision 12): IPC under the editor's `Data\agent\`; app user data under
-  `%appdata%\eud-agent\`; large/regenerable assets (model, RAG index, logs) under
-  `%localappdata%\eud-agent\` (NEVER put the 570MB model in Roaming).
+  `%appdata%\eud-agent\`, including durable per-project `workspaces/`; large/regenerable
+  assets and analyzer mirrors (model, RAG index, logs, `lsp_workspaces`) under
+  `%localappdata%\eud-agent\` (NEVER Roaming).
 - Bootstrap: every downloaded asset is **sha256-verified** and placed **atomically** (temp
   + rename). A missing/corrupt asset re-downloads; it must never half-install.
 - WebView2 uses the system Evergreen runtime; if absent, guide the user to install it
@@ -190,8 +235,11 @@ and server spawning are REMOVED.
 - Resumed turn text ALWAYS labels the user's text with a `[user message]` header after the
   prepended context; the system prompt carries the `[message format]` section (only
   `[user message]` is the instruction; a bug report there is a work request) (EUD-092).
-- epscript-lsp diagnostics are advisory only — annotate, never block apply; absence must
-  not break the flow.
+- The `[eps preflight]` section precedes `[build]`: submit the complete candidate batch,
+  fix error diagnostics, and re-check before `.eps` writes; mutually dependent new files
+  travel together. A skipped check falls through to writes and mandatory `build_run`.
+  epscript-lsp diagnostics are advisory only — annotate, never block apply; absence must
+  not break the flow. There is intentionally no mechanical “eps_check required” gate.
 
 ## Process
 

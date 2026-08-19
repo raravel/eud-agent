@@ -29,19 +29,27 @@ import { Header, type RagState } from "@/components/Header";
 import { ConversationLog } from "@/components/ConversationLog";
 import { ChangesetView } from "@/components/ChangesetView";
 import { PlanView } from "@/components/PlanView";
-import { MemoryView } from "@/components/MemoryView";
-import { WikiView } from "@/components/WikiView";
 import { InstructionBox, type ChatPayload } from "@/components/InstructionBox";
 import { ConnectionNotice } from "@/components/ConnectionNotice";
-import { SessionList } from "@/components/SessionList";
+import {
+  SessionSidebar,
+  type SessionActivity,
+  type SessionSidebarRow,
+} from "@/components/SessionSidebar";
+import {
+  ProjectSidebar,
+  type ProjectPanelTab,
+} from "@/components/ProjectSidebar";
 import { createPanelStore } from "@/state/store";
-import type { LogEntry } from "@/state/store";
+import type { LogEntry, PanelStore } from "@/state/store";
 import {
   IpcClient,
   codexModelSettingsGet,
   codexModelSettingsSave,
   wikiGet,
   wikiSave,
+  workspaceList,
+  workspaceRead,
   type LedgerEntry,
   type CodexModelSettings,
   type MemoryFile,
@@ -50,9 +58,12 @@ import {
   type ServerMessage,
   type SessionMeta,
   type SessionRecord,
+  type WorkspaceFileEntry,
+  type WorkspaceListResponse,
   type SetupMessage,
 } from "@/lib/ipc";
 import { progressLabel } from "@/lib/progress";
+import { useProjectIdentityEffect } from "@/lib/projectIdentity";
 import {
   bootstrapView,
   type BootstrapView,
@@ -62,6 +73,10 @@ import { UpdateNotice } from "@/components/UpdateNotice";
 import { createUpdater, type UpdateHandle } from "@/setup/update";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import {
+  discardAttachment,
+  stageAttachment,
+} from "@/lib/attachments";
 
 /** codex login probe result (mirrors the Rust `CodexAuthState`). */
 interface CodexAuthState {
@@ -89,14 +104,13 @@ interface BootstrapState {
 }
 
 /** panelLog schema version (features/sessions.md ## panelLog schema). */
-const PANEL_LOG_SCHEMA_VERSION = 1;
+const PANEL_LOG_SCHEMA_VERSION = 2;
 
 /**
- * Serialize the live conversation log into the DURABLE {@link PanelLog} subset
- * pushed via `session_update_log` (features/sessions.md): only `id/kind/text` + optional
- * `stage`/`tools` survive; transient turn/plan/changeset/wiki state is dropped
- * (it re-arrives from the core on reconnect). `logSeq` is the max entry id so
- * the store can advance its counters past the restored ids on hydrate.
+ * Serialize the live conversation log into the durable {@link PanelLog} subset
+ * pushed via `session_update_log`: `id/kind/text` plus optional
+ * `stage`/`tools`/`attachments` survive; transient turn/plan/changeset/wiki state
+ * is dropped. `logSeq` advances restored store counters past existing ids.
  */
 function serializePanelLog(log: readonly LogEntry[]): PanelLog {
   const entries: PanelLogEntry[] = log.map((entry) => {
@@ -115,22 +129,96 @@ function serializePanelLog(log: readonly LogEntry[]): PanelLog {
         ...(tool.detail !== undefined ? { detail: tool.detail } : {}),
       }));
     }
+    if (entry.attachments) next.attachments = entry.attachments;
     return next;
   });
   const logSeq = log.reduce((max, entry) => (entry.id > max ? entry.id : max), 0);
   return { schemaVersion: PANEL_LOG_SCHEMA_VERSION, logSeq, log: entries };
 }
 
+interface SessionSlot {
+  id: string;
+  meta: SessionRecord;
+  store: PanelStore;
+  persisted: boolean;
+  activity: SessionActivity;
+  queuePosition?: number;
+  unsubscribe?: () => void;
+  saveTimer?: number;
+}
+
+interface QueuedChat {
+  slot: SessionSlot;
+  payload: ChatPayload;
+}
+
+let draftSequence = 0;
+
+function emptyPanelLog(): PanelLog {
+  return { schemaVersion: PANEL_LOG_SCHEMA_VERSION, logSeq: 0, log: [] };
+}
+
+function draftSession(project: string): SessionRecord {
+  draftSequence += 1;
+  const now = Math.floor(Date.now() / 1000);
+  return {
+    id: `draft-${draftSequence}`,
+    name: "새 대화",
+    project,
+    createdAt: now,
+    updatedAt: now,
+    threadId: null,
+    pendingRequestIds: [],
+    panelLog: emptyPanelLog(),
+  };
+}
+
+function syncProjectState(target: PanelStore, source: PanelStore): void {
+  const state = source.getState();
+  if (state.connected) target.wsOpen();
+  else target.wsConnecting();
+  target.applyStatus({ compiling: state.compiling, project: state.project });
+  target.applyList({ files: state.hasProject ? state.files : undefined });
+  target.editorConnectionChanged(state.editorConnected);
+  if (state.rag !== "unknown") target.ragWarmupChanged(state.rag);
+  if (state.memory) {
+    target.memoryReceived(state.memory.project, state.memory.files, state.memory.episodes);
+  }
+  if (state.wikiData) {
+    target.wikiReceived(state.wikiData.version, state.wikiData.entries);
+  }
+}
+
 export default function App() {
-  // Store + client live for the lifetime of the app (created once).
-  const store = useMemo(() => createPanelStore(), []);
+  const projectStore = useMemo(() => createPanelStore(), []);
+  const sessionsRef = useRef(new Map<string, SessionSlot>());
+  const queueRef = useRef<QueuedChat[]>([]);
+  const runningSlotRef = useRef<SessionSlot | null>(null);
+  const reviewOwnerRef = useRef<SessionSlot | null>(null);
+  const eventSessionIdRef = useRef<string | null>(null);
+  const drainQueueRef = useRef<() => void>(() => {});
+  const [sessionRevision, setSessionRevision] = useState(0);
+  const toastedLogBySessionRef = useRef(new Map<string, number>());
+  const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null);
+  const selectedSessionIdRef = useRef<string | null>(null);
+  const loadedProjectRef = useRef<string | null>(null);
   const clientRef = useRef<IpcClient | null>(null);
-  // Self-update seam (Decision 04). Created once; the real plugin in prod, swappable
-  // in tests. The check runs once after first-run setup is satisfied.
   const updater = useMemo(() => createUpdater(), []);
 
-  // Subscribe React to the framework-agnostic store.
-  const state = useSyncExternalStore(store.subscribe, store.getState, store.getState);
+  const selectedSlot = useMemo(
+    () =>
+      (selectedSessionId
+        ? sessionsRef.current.get(selectedSessionId)
+        : undefined) ?? null,
+    [selectedSessionId, sessionRevision],
+  );
+  const store = selectedSlot?.store ?? projectStore;
+  const state = store.getState();
+  const projectState = useSyncExternalStore(
+    projectStore.subscribe,
+    projectStore.getState,
+    projectStore.getState,
+  );
 
   // ---- UI-only state (not protocol state) ----
   // The per-turn streaming buffers (reasoning / answer / tools) live in the STORE
@@ -164,28 +252,121 @@ export default function App() {
   // "에디터 켜기": true while the launch_editor command is in flight. The button
   // re-enables once the editor connects (editorConnected) or the spawn resolves/fails.
   const [launchPending, setLaunchPending] = useState(false);
-  // dat-edit wiki overlay (App-local UI state, like the memory overlay but the
-  // ledger flows over the dedicated wiki_get/wiki_save commands + `wiki` push).
-  const [wikiOpen, setWikiOpen] = useState(false);
+  const [sessionSidebarCollapsed, setSessionSidebarCollapsed] = useState(false);
+  const [projectSidebarOpen, setProjectSidebarOpen] = useState(true);
+  const [projectPanelTab, setProjectPanelTab] =
+    useState<ProjectPanelTab>("wiki");
+  const [workspaceData, setWorkspaceData] =
+    useState<WorkspaceListResponse | null>(null);
+  const [workspacePath, setWorkspacePath] = useState<string | null>(null);
+  const [workspaceContent, setWorkspaceContent] = useState<string | null>(null);
+  const [workspaceLoading, setWorkspaceLoading] = useState(false);
+  const [workspaceError, setWorkspaceError] = useState<string | null>(null);
   // Self-update banner state: the pending update (null until found) and a
   // session-scoped "나중에" dismissal. The check fires once (guarded by the ref).
   const [update, setUpdate] = useState<UpdateHandle | null>(null);
   const [updateDismissed, setUpdateDismissed] = useState(false);
   const updateCheckedRef = useRef(false);
-  // Session-restore overlay (App-local UI state). The list is fetched lazily by
-  // SessionList each time it opens; open/rename/delete are Tauri commands. A
-  // conversation auto-saves (no save button): the core auto-creates a session on
-  // the first turn and the panel pushes its log after each change.
-  const [sessionListOpen, setSessionListOpen] = useState(false);
-  // The active session id (auto-created on the first turn or opened), tracked from
-  // the `session_active` event so the list can highlight the current row.
-  const [currentSessionId, setCurrentSessionId] = useState<string | null>(null);
   // Authenticated Codex model catalog + persisted global selection. The catalog
   // comes from app-server `model/list`; changing either select applies to the
   // next eud-agent turn and is saved by the Rust core.
   const [codexSettings, setCodexSettings] =
     useState<CodexModelSettings | null>(null);
   const [codexSettingsBusy, setCodexSettingsBusy] = useState(false);
+  // Message undo/edit flow: the core must finish cancellation/rewind before the
+  // input unlocks. `editDraft` is applied by InstructionBox without controlling
+  // subsequent typing.
+  const [editDraft, setEditDraft] = useState<ChatPayload | null>(null);
+  const [messageActionBusy, setMessageActionBusy] = useState(false);
+  const messageActionBusyRef = useRef(false);
+
+  const bumpSessions = useCallback(() => {
+    setSessionRevision((revision) => revision + 1);
+  }, []);
+
+  const attachSlot = useCallback(
+    (slot: SessionSlot) => {
+      if (slot.unsubscribe) return;
+      slot.unsubscribe = slot.store.subscribe((snapshot) => {
+        bumpSessions();
+        if (!slot.persisted || snapshot.log.length === 0) return;
+        if (slot.saveTimer !== undefined) window.clearTimeout(slot.saveTimer);
+        slot.saveTimer = window.setTimeout(() => {
+          void invoke("session_update_log", {
+            id: slot.id,
+            panelLog: serializePanelLog(slot.store.getState().log),
+          }).catch(() => {
+            // Session autosave is best-effort; the durable store reports failures.
+          });
+        }, 500);
+      });
+    },
+    [bumpSessions],
+  );
+
+  const registerSession = useCallback(
+    (record: SessionRecord): SessionSlot => {
+      const existing = sessionsRef.current.get(record.id);
+      if (existing) {
+        existing.meta = record;
+        existing.persisted = true;
+        bumpSessions();
+        return existing;
+      }
+      const sessionStore = createPanelStore();
+      syncProjectState(sessionStore, projectStore);
+      sessionStore.hydrate(record.panelLog ?? emptyPanelLog());
+      const slot: SessionSlot = {
+        id: record.id,
+        meta: record,
+        store: sessionStore,
+        persisted: true,
+        activity: record.pendingRequestIds.length > 0 ? "review" : "idle",
+      };
+      sessionsRef.current.set(slot.id, slot);
+      attachSlot(slot);
+      toastedLogBySessionRef.current.set(
+        slot.id,
+        record.panelLog?.logSeq ?? 0,
+      );
+      bumpSessions();
+      return slot;
+    },
+    [attachSlot, bumpSessions, projectStore],
+  );
+
+  const createDraftSlot = useCallback((): SessionSlot => {
+    const meta = draftSession(projectStore.getState().project);
+    const sessionStore = createPanelStore();
+    syncProjectState(sessionStore, projectStore);
+    const slot: SessionSlot = {
+      id: meta.id,
+      meta,
+      store: sessionStore,
+      persisted: false,
+      activity: "idle",
+    };
+    sessionsRef.current.set(slot.id, slot);
+    attachSlot(slot);
+    setSelectedSessionId(slot.id);
+    selectedSessionIdRef.current = slot.id;
+    bumpSessions();
+    return slot;
+  }, [attachSlot, bumpSessions, projectStore]);
+
+  useEffect(() => {
+    selectedSessionIdRef.current = selectedSessionId;
+  }, [selectedSessionId]);
+
+  useEffect(
+    () => () => {
+      for (const slot of sessionsRef.current.values()) {
+        slot.unsubscribe?.();
+        if (slot.saveTimer !== undefined) window.clearTimeout(slot.saveTimer);
+      }
+    },
+    [],
+  );
 
   const loadCodexModelSettings = useCallback(async () => {
     setCodexSettingsBusy(true);
@@ -236,49 +417,67 @@ export default function App() {
 
   // Every error/warn log entry ALSO pops a toast so a problem is noticeable even
   // when the conversation is scrolled away or the user is on the input. The log
-  // line stays for history; the toast is the transient alert. Log ids are
-  // monotonic (they survive a `새 대화` reset), so the last-toasted id guards
-  // each entry against re-toasting on later renders.
-  const lastToastedLogId = useRef(0);
+  // Toast high-water marks are session-scoped so selecting an old conversation
+  // neither replays its historical alerts nor suppresses a newer session's ids.
   useEffect(() => {
+    const sessionId = selectedSlot?.id;
+    if (!sessionId) return;
+    let highWater = toastedLogBySessionRef.current.get(sessionId) ?? 0;
     for (const entry of state.log) {
-      if (entry.id <= lastToastedLogId.current) continue;
+      if (entry.id <= highWater) continue;
       if (entry.kind === "error") toast.error(entry.text);
       else if (entry.kind === "warn") toast.warning(entry.text);
+      highWater = Math.max(highWater, entry.id);
     }
-    const latest = state.log.at(-1);
-    if (latest && latest.id > lastToastedLogId.current) {
-      lastToastedLogId.current = latest.id;
-    }
-  }, [state.log]);
+    toastedLogBySessionRef.current.set(sessionId, highWater);
+  }, [selectedSlot?.id, state.log]);
 
-  // Dispatch an inbound v2 server message to store actions + log entries.
+  // Global editor/project events fan out to every session store. Turn events
+  // route to the backend execution owner, not whichever sidebar row is visible.
   const onMessage = useCallback(
     (msg: ServerMessage) => {
+      const scopedId =
+        "sessionId" in msg && typeof msg.sessionId === "string"
+          ? msg.sessionId
+          : null;
+      const sessionStore = () => {
+        const id =
+          scopedId ?? eventSessionIdRef.current ?? selectedSessionIdRef.current;
+        return (id ? sessionsRef.current.get(id)?.store : undefined) ?? projectStore;
+      };
+      const forEveryStore = (apply: (target: PanelStore) => void) => {
+        apply(projectStore);
+        for (const slot of sessionsRef.current.values()) apply(slot.store);
+      };
+
       switch (msg.type) {
         case "status":
-          store.applyStatus({ compiling: msg.compiling, project: msg.project });
+          forEveryStore((target) =>
+            target.applyStatus({ compiling: msg.compiling, project: msg.project }),
+          );
           break;
         case "list":
-          store.applyList({ files: msg.files, error: msg.error });
+          forEveryStore((target) =>
+            target.applyList({ files: msg.files, error: msg.error }),
+          );
           break;
         case "memory":
-          store.memoryReceived(msg.project, msg.files, msg.episodes);
+          forEveryStore((target) =>
+            target.memoryReceived(msg.project, msg.files, msg.episodes),
+          );
           break;
         case "memory_saved":
-          store.memorySaved(msg.file);
-          store.log("ok", "메모리를 저장했습니다.");
+          forEveryStore((target) => target.memorySaved(msg.file));
+          sessionStore().log("ok", "메모리를 저장했습니다.");
           break;
         case "wiki":
-          // Push after every accept that records a dat edit — keep the ledger
-          // snapshot in sync whether or not the overlay is open.
-          store.wikiReceived(msg.version, msg.entries);
+          forEveryStore((target) =>
+            target.wikiReceived(msg.version, msg.entries),
+          );
           break;
         case "setup":
           setSetup(msg);
           if (!msg.setup_required) {
-            // Setup finished (or was never needed): drop the overlay and arm the
-            // editor-liveness poll (which pulls the first status/list snapshot).
             bootstrapActiveRef.current = false;
             setBootstrap((prev) =>
               prev.active ? { ...prev, active: false } : prev,
@@ -288,8 +487,6 @@ export default function App() {
           break;
         case "progress": {
           if (msg.stage === "bootstrap") {
-            // Final "done" closes the overlay; the fresh setup snapshot flips
-            // setup_required off and refreshes the status/list snapshots.
             if (msg.detail === "done") {
               bootstrapActiveRef.current = false;
               setBootstrap((prev) => ({ ...prev, active: false, error: null }));
@@ -309,28 +506,18 @@ export default function App() {
             bootstrapActiveRef.current = false;
             setBootstrap((prev) => ({ ...prev, active: false }));
           }
-          store.progressReceived(msg.stage);
-          // RAG warmup drives the Header pill (started → loading w/ elapsed,
-          // done → ready, error → unavailable) AND the store send gate. The
-          // pill IS the status surface (top-right), so readiness is NOT logged
-          // to the conversation — a "준비 완료" line would evict the empty-state
-          // hero before the user has typed anything. Only the error transition
-          // logs (a warn line → also toasted by the error/warn effect); the
-          // loading state is covered by the ConversationLog shimmer row.
           if (msg.stage === "rag_warmup") {
-            const prev = store.getState().rag;
-            let next: "loading" | "ready" | "unavailable";
-            if (msg.detail === "done") {
-              next = "ready";
-            } else if (msg.detail !== undefined && msg.detail.startsWith("error")) {
-              next = "unavailable";
-            } else {
-              next = "loading";
-            }
-            store.ragWarmupChanged(next);
-            if (next !== prev && next === "unavailable") {
+            const previous = projectStore.getState().rag;
+            const next =
+              msg.detail === "done"
+                ? "ready"
+                : msg.detail?.startsWith("error")
+                  ? "unavailable"
+                  : "loading";
+            forEveryStore((target) => target.ragWarmupChanged(next));
+            if (next !== previous && next === "unavailable") {
               const { kind, text } = progressLabel(msg.stage, msg.detail);
-              store.log(kind, text, msg.stage);
+              sessionStore().log(kind, text, msg.stage);
             }
             if (next === "loading") {
               ragStartRef.current = Date.now();
@@ -339,60 +526,49 @@ export default function App() {
             setRagState(next);
             break;
           }
+          const target = sessionStore();
+          target.progressReceived(msg.stage);
           const { kind, text } = progressLabel(msg.stage, msg.detail);
-          store.log(kind, text, msg.stage);
+          target.log(kind, text, msg.stage);
           break;
         }
         case "agent_event":
-          // Accumulated into the store's per-turn buffers (reasoning/answer/tools);
-          // raw kinds never reach the log. `data` carries tool args/result (EUD-068).
-          store.agentEvent(msg.kind, msg.detail, msg.data);
+          sessionStore().agentEvent(msg.kind, msg.detail, msg.data);
           break;
         case "answer":
-          // answerReceived archives the turn itself: the streamed blocks land
-          // in the log in arrival order (tools/prose interleaved), and the
-          // final text is logged only when no prose was streamed — logging
-          // msg.text here again would duplicate the streamed prose.
-          store.answerReceived(msg.text);
+          sessionStore().answerReceived(msg.text);
           break;
         case "plan": {
-          // F2: planReceived archives any prose streamed via `delta` before this
-          // turn-end (the live AgentAnswer renders turn.answer only while
-          // thinking, so it would otherwise vanish at the transition).
-          // Archive the prior plan card before it is replaced: a higher revision
-          // supersedes the active card (the store keeps only the latest), so log
-          // the supersession so the iteration history stays in the conversation.
-          const prior = store.getState().plan;
+          const target = sessionStore();
+          const prior = target.getState().plan;
           if (prior !== null && prior.revision !== msg.revision) {
-            store.log("agent", `계획안(rev ${prior.revision})이 갱신되었습니다.`);
+            target.log("agent", `계획안(rev ${prior.revision})이 갱신되었습니다.`);
           }
-          store.planReceived(msg.markdown, msg.revision);
-          store.log("agent", `계획안(rev ${msg.revision})이 도착했습니다.`);
+          target.planReceived(msg.markdown, msg.revision);
+          target.log("agent", `계획안(rev ${msg.revision})이 도착했습니다.`);
           break;
         }
-        case "changeset":
-          // F2: changesetReceived archives any prose streamed before this turn-end.
-          store.changesetReceived(msg.request_id, msg.items);
-          store.log("agent", `변경사항 ${msg.items.length}건을 검토하세요.`);
+        case "changeset": {
+          const target = sessionStore();
+          target.changesetReceived(msg.request_id, msg.items);
+          target.log("agent", `변경사항 ${msg.items.length}건을 검토하세요.`);
           break;
+        }
         case "rollback_result": {
-          // Read the recorded decision BEFORE rollbackResult() clears it — the
-          // inbound message has no accept/reject discriminator, so the log label
-          // (적용 유지 vs 되돌림) must come from what the user chose.
-          const decision = store.getState().pendingDecision?.decision;
+          const target = sessionStore();
+          const decision = target.getState().pendingDecision?.decision;
           const count = msg.ids.length;
-          store.rollbackResult(msg.ids, msg.ok);
+          target.rollbackResult(msg.ids, msg.ok);
           if (decision === "accept") {
-            store.log("ok", count > 0 ? `적용 유지 (${count}건)` : "적용 유지");
+            target.log("ok", count > 0 ? `적용 유지 (${count}건)` : "적용 유지");
           } else if (msg.ok) {
-            store.log("ok", `되돌림 (${count}건)`);
+            target.log("ok", `되돌림 (${count}건)`);
           } else {
-            store.log("warn", `되돌리기 일부 실패 (${count}건)`);
+            target.log("warn", `되돌리기 일부 실패 (${count}건)`);
           }
           break;
         }
-        case "error":
-          // F2: errorReceived archives any prose streamed before the turn errored.
+        case "error": {
           if (bootstrapActiveRef.current) {
             setBootstrap((prev) => ({
               ...prev,
@@ -400,49 +576,49 @@ export default function App() {
               error: msg.message,
             }));
           }
-          store.errorReceived(msg.message);
-          store.log("error", `오류: ${msg.message}`);
+          const target = sessionStore();
+          target.errorReceived(msg.message);
+          target.log("error", `오류: ${msg.message}`);
           break;
+        }
         default:
           break;
       }
     },
-    [store],
+    [projectStore],
   );
 
-  // Boot the IPC client once. Lifecycle maps to the store phases; logs flow
-  // through store.log so they render in the conversation.
+  // Boot the IPC client once. Project lifecycle state fans out to all session
+  // stores; switching the visible row never reconnects the transport.
   useEffect(() => {
-    store.wsConnecting();
+    projectStore.wsConnecting();
     const client = new IpcClient({
       onMessage,
       onLog: (kind, text) => {
-        if (kind === "info") store.log("info", text);
-        else store.log("warn", text); // unknown / bad payload
+        const id = eventSessionIdRef.current ?? selectedSessionIdRef.current;
+        const target =
+          (id ? sessionsRef.current.get(id)?.store : undefined) ?? projectStore;
+        if (kind === "info") target.log("info", text);
+        else target.log("warn", text);
       },
       onOpenChange: (open) => {
-        if (open) store.wsOpen();
-        else store.wsError();
+        if (open) projectStore.wsOpen();
+        else projectStore.wsError();
+        for (const slot of sessionsRef.current.values()) {
+          if (open) slot.store.wsOpen();
+          else slot.store.wsError();
+        }
       },
       onEditorChange: (connected) => {
-        // Editor liveness is separate from the transport: this only flips the
-        // send gate + ConnectionNotice banner, never the reconnect UI. The
-        // connection state is shown by the Header pill + ConnectionNotice banner
-        // (it disappears on recovery), so the recovery edge is NOT logged — a
-        // boot-time "연결되었습니다" status line would evict the empty-state hero.
-        store.editorConnectionChanged(connected);
+        projectStore.editorConnectionChanged(connected);
+        for (const slot of sessionsRef.current.values()) {
+          slot.store.editorConnectionChanged(connected);
+        }
       },
     });
     clientRef.current = client;
-    // Register push listeners first (bootstrap progress must not be missed),
-    // then route by the first-run manifest check: setup_required renders the
-    // SetupScreen without ever requesting the doomed status/list snapshot (no
-    // misleading "connect failed" log); the ready path pulls the snapshot via
-    // refresh() from the `setup` handler below.
     void client.connect().then(() =>
       client.send({ type: "setup_status" }).then((ok) => {
-        // Unexpected setup_status failure: assume an already-configured app and
-        // arm the editor poll so it still comes up.
         if (!ok) setEditorPollEnabled(true);
       }),
     );
@@ -450,7 +626,7 @@ export default function App() {
       client.stop();
       clientRef.current = null;
     };
-  }, [store, onMessage]);
+  }, [onMessage, projectStore]);
 
   // `session_loaded` is a SIGNAL only (features/sessions.md): the core emits it
   // after a session_open reconnect completes. Its payload carries nothing
@@ -473,13 +649,18 @@ export default function App() {
     };
   }, []);
 
-  // `session_active`: the core auto-created (first turn) or opened a session.
-  // Track its id so the list can highlight the current conversation.
+  // The backend execution owner is distinct from the sidebar selection. This
+  // signal only establishes routing for streamed turn events.
   useEffect(() => {
     let unlisten: (() => void) | undefined;
     let cancelled = false;
     void listen<{ id: string; name: string }>("session_active", (event) => {
-      setCurrentSessionId(event.payload.id);
+      eventSessionIdRef.current = event.payload.id;
+      const slot = sessionsRef.current.get(event.payload.id);
+      if (slot) {
+        slot.meta = { ...slot.meta, name: event.payload.name };
+        bumpSessions();
+      }
     }).then((fn) => {
       if (cancelled) fn();
       else unlisten = fn;
@@ -488,23 +669,7 @@ export default function App() {
       cancelled = true;
       unlisten?.();
     };
-  }, []);
-
-  // Auto-persist the conversation (no save button): whenever the durable log
-  // changes, push the serialized subset to the active session shortly after
-  // (debounced to coalesce a turn's rapid updates). No-op server-side until the
-  // first turn auto-creates a session, so this never makes a junk session.
-  useEffect(() => {
-    if (state.log.length === 0) return;
-    const handle = window.setTimeout(() => {
-      void invoke("session_update_log", {
-        panelLog: serializePanelLog(store.getState().log),
-      }).catch(() => {
-        /* background sync; the core logs any write failure */
-      });
-    }, 500);
-    return () => window.clearTimeout(handle);
-  }, [state.log, store]);
+  }, [bumpSessions]);
 
   // Editor-liveness poll. Once armed (first-run setup satisfied), probe the
   // editor every EDITOR_POLL_MS. The transport stays open throughout, so this
@@ -525,6 +690,58 @@ export default function App() {
       window.clearInterval(id);
     };
   }, [editorPollEnabled]);
+
+  // Populate the persistent left sidebar with sessions owned by the current
+  // editor project. Loading a row is read-only and never steals the execution lane.
+  useEffect(() => {
+    const project = projectState.project.trim();
+    if (!projectState.hasProject || !project || loadedProjectRef.current === project) {
+      return;
+    }
+    if (runningSlotRef.current || reviewOwnerRef.current) return;
+    loadedProjectRef.current = project;
+    let cancelled = false;
+    void invoke<SessionMeta[]>("session_list")
+      .then((rows) =>
+        Promise.all(
+          rows
+            .filter((row) => row.project === project)
+            .map((row) => invoke<SessionRecord>("session_load", { id: row.id })),
+        ),
+      )
+      .then((records) => {
+        if (cancelled) return;
+        for (const slot of sessionsRef.current.values()) {
+          slot.unsubscribe?.();
+          if (slot.saveTimer !== undefined) window.clearTimeout(slot.saveTimer);
+        }
+        sessionsRef.current.clear();
+        const slots = records.map(registerSession);
+        const first = slots[0] ?? createDraftSlot();
+        setSelectedSessionId(first.id);
+        selectedSessionIdRef.current = first.id;
+        bumpSessions();
+      })
+      .catch((error) => {
+        loadedProjectRef.current = null;
+        const fallback =
+          sessionsRef.current.get(selectedSessionIdRef.current ?? "") ??
+          createDraftSlot();
+        fallback.store.log(
+          "error",
+          `세션을 불러오지 못했습니다: ${String(error)}`,
+        );
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    bumpSessions,
+    createDraftSlot,
+    projectState.hasProject,
+    projectState.project,
+    registerSession,
+  ]);
 
   // Setup flow, download step: once the editor folder is picked (or was already
   // configured) and assets are still missing, start the bootstrap download.
@@ -557,9 +774,85 @@ export default function App() {
   }, [setup, updater]);
 
   // ---- user intents ----
-  // The MAIN prompt input routes by phase (EUD-074): during plan_review the
-  // typed text IS the plan feedback (plan_feedback{text} — the PlanView
-  // feedback textarea is removed); otherwise it starts a chat turn.
+  const refreshQueuePositions = useCallback(() => {
+    queueRef.current.forEach((item, index) => {
+      item.slot.activity = "queued";
+      item.slot.queuePosition = index + 1;
+    });
+    bumpSessions();
+  }, [bumpSessions]);
+
+  const settleExecution = useCallback(
+    (slot: SessionSlot) => {
+      runningSlotRef.current = null;
+      slot.queuePosition = undefined;
+      const phase = slot.store.getState().phase;
+      if (phase === "plan_review" || phase === "changeset_review") {
+        slot.activity = "review";
+        reviewOwnerRef.current = slot;
+      } else {
+        slot.activity = phase === "retry" ? "error" : "idle";
+        if (reviewOwnerRef.current === slot) reviewOwnerRef.current = null;
+        queueMicrotask(() => drainQueueRef.current());
+      }
+      bumpSessions();
+    },
+    [bumpSessions],
+  );
+
+  drainQueueRef.current = () => {
+    if (runningSlotRef.current || reviewOwnerRef.current) return;
+    const item = queueRef.current.shift();
+    if (!item) return;
+    refreshQueuePositions();
+    const { slot, payload } = item;
+    runningSlotRef.current = slot;
+    slot.activity = "running";
+    slot.queuePosition = undefined;
+    bumpSessions();
+
+    void (async () => {
+      try {
+        if (!slot.persisted) {
+          const oldId = slot.id;
+          const seed = payload.text.trim() || "첨부 파일 분석";
+          const record = await invoke<SessionRecord>("session_create", {
+            firstText: seed,
+          });
+          sessionsRef.current.delete(oldId);
+          slot.id = record.id;
+          slot.meta = record;
+          slot.persisted = true;
+          sessionsRef.current.set(slot.id, slot);
+          const toasted = toastedLogBySessionRef.current.get(oldId) ?? 0;
+          toastedLogBySessionRef.current.delete(oldId);
+          toastedLogBySessionRef.current.set(slot.id, toasted);
+          if (selectedSessionIdRef.current === oldId) {
+            selectedSessionIdRef.current = slot.id;
+            setSelectedSessionId(slot.id);
+          }
+        }
+        eventSessionIdRef.current = slot.id;
+        slot.store.chatSent();
+        const sent = await clientRef.current?.send({
+          type: "chat",
+          sessionId: slot.id,
+          text: payload.text,
+          attachments: payload.attachments.map((attachment) => attachment.id),
+        });
+        if (!sent) {
+          slot.store.errorReceived("요청을 처리하지 못했습니다.");
+        }
+      } catch (error) {
+        slot.store.errorReceived(String(error));
+        slot.store.log("error", `요청을 처리하지 못했습니다: ${String(error)}`);
+      } finally {
+        settleExecution(slot);
+      }
+    })();
+  };
+  // The MAIN prompt input routes by phase (EUD-074): during plan_review its text
+  // and attachment ids go to plan_feedback; otherwise they start a chat turn.
   //
   // Turn-starting commands resolve only when the WHOLE codex turn ends, while
   // its progress/answer events stream in the meantime — so the user bubble and
@@ -568,32 +861,136 @@ export default function App() {
   // in "생각하는 중…" after the turn already finished.
   const handleSend = useCallback(
     async (payload: ChatPayload) => {
-      if (store.getState().phase === "plan_review") {
-        store.log("you", payload.text);
-        store.log("agent", "계획 수정을 요청했습니다.");
-        store.planFeedbackSent();
+      const slot = selectedSlot ?? createDraftSlot();
+      setEditDraft(null);
+      if (slot.store.getState().phase === "plan_review") {
+        if (reviewOwnerRef.current !== slot) {
+          slot.store.log("warn", "다른 세션이 프로젝트 실행 레인을 사용 중입니다.");
+          return;
+        }
+        slot.store.log("you", payload.text, undefined, payload.attachments);
+        slot.store.log("agent", "계획 수정을 요청했습니다.");
+        slot.store.planFeedbackSent();
+        slot.activity = "running";
+        runningSlotRef.current = slot;
+        eventSessionIdRef.current = slot.id;
+        bumpSessions();
         const sent = await clientRef.current?.send({
           type: "plan_feedback",
+          sessionId: slot.id,
           text: payload.text,
+          attachments: payload.attachments.map((attachment) => attachment.id),
         });
         if (!sent) {
-          store.errorReceived("계획 수정 요청을 처리하지 못했습니다.");
+          slot.store.errorReceived("계획 수정 요청을 처리하지 못했습니다.");
         }
+        settleExecution(slot);
         return;
       }
-      store.log("you", payload.text);
-      store.chatSent(); // a new turn — the store resets the per-turn buffers.
+      if (slot.store.getState().phase === "changeset_review") {
+        slot.store.log("warn", "변경사항 검토를 완료한 뒤 새 요청을 보내세요.");
+        return;
+      }
+      slot.store.log("you", payload.text, undefined, payload.attachments);
+      slot.activity = "queued";
+      queueRef.current.push({ slot, payload });
+      refreshQueuePositions();
+      drainQueueRef.current();
+    },
+    [
+      bumpSessions,
+      createDraftSlot,
+      refreshQueuePositions,
+      selectedSlot,
+      settleExecution,
+    ],
+  );
+
+  const handleCancel = useCallback(async () => {
+    const slot = selectedSlot;
+    if (
+      !slot ||
+      messageActionBusyRef.current ||
+      runningSlotRef.current !== slot ||
+      slot.store.getState().phase !== "thinking"
+    ) {
+      return;
+    }
+    messageActionBusyRef.current = true;
+    setMessageActionBusy(true);
+    try {
       const sent = await clientRef.current?.send({
-        type: "chat",
-        text: payload.text,
+        type: "cancel",
+        sessionId: slot.id,
       });
-      if (!sent) {
-        // The send failure detail is already logged by the client (onLog);
-        // this returns the phase to ready so the input is usable again.
-        store.errorReceived("요청을 처리하지 못했습니다.");
+      if (sent) {
+        slot.store.cancelSent();
+      } else {
+        slot.store.errorReceived("작업을 중단하지 못했습니다.");
+        slot.store.log("error", "작업을 중단하지 못했습니다.");
+      }
+    } finally {
+      messageActionBusyRef.current = false;
+      setMessageActionBusy(false);
+    }
+  }, [selectedSlot]);
+
+  const handleEditMessage = useCallback(
+    async (entry: LogEntry) => {
+      const slot = selectedSlot;
+      if (
+        !slot ||
+        eventSessionIdRef.current !== slot.id ||
+        entry.kind !== "you" ||
+        messageActionBusyRef.current
+      ) {
+        return;
+      }
+      messageActionBusyRef.current = true;
+      setMessageActionBusy(true);
+      try {
+        if (slot.store.getState().phase === "thinking") {
+          const cancelled = await clientRef.current?.send({
+            type: "cancel",
+            sessionId: slot.id,
+          });
+          if (!cancelled) {
+            slot.store.errorReceived("작업을 중단하지 못했습니다.");
+            slot.store.log("error", "메시지 수정을 위해 작업을 중단하지 못했습니다.");
+            return;
+          }
+          slot.store.cancelSent();
+        }
+
+        const currentLog = slot.store.getState().log;
+        const selected = currentLog.find(
+          (candidate) => candidate.id === entry.id && candidate.kind === "you",
+        );
+        if (selected === undefined) return;
+        const prefix = currentLog.filter((candidate) => candidate.id < entry.id);
+        const rewound = await clientRef.current?.send({
+          type: "conversation_rewind",
+          sessionId: slot.id,
+          panelLog: serializePanelLog(prefix),
+        });
+        if (!rewound) {
+          slot.store.log("error", "메시지 수정 지점으로 대화를 되돌리지 못했습니다.");
+          return;
+        }
+
+        const restored = slot.store.rewindTo(entry.id);
+        if (restored !== null) {
+          setEditDraft({
+            text: restored.text,
+            attachments: restored.attachments ?? [],
+          });
+        }
+      } finally {
+        messageActionBusyRef.current = false;
+        setMessageActionBusy(false);
       }
     },
-    [store],
+    [selectedSlot],
   );
 
   // Empty-conversation suggestion chip → the same chat path as the
@@ -603,73 +1000,114 @@ export default function App() {
   const handleSuggestion = useCallback(
     (text: string) => {
       if (!store.getState().canSend) return;
-      void handleSend({ text });
+      void handleSend({ text, attachments: [] });
     },
     [store, handleSend],
   );
 
-  // New conversation: send reset{} (the server drops the retained codex thread,
-  // EUD-064) and clear the client log / plan / changeset / per-turn buffers.
-  const handleReset = useCallback(async () => {
-    const sent = await clientRef.current?.send({ type: "reset" });
-    if (sent) {
-      store.resetSent();
-      // The core detaches its active session on reset; the next turn auto-creates
-      // a fresh one. Drop the highlight so the list shows no current row meanwhile.
-      setCurrentSessionId(null);
-    }
-  }, [store]);
+  const handleNewSession = useCallback(() => {
+    createDraftSlot();
+    setEditDraft(null);
+  }, [createDraftSlot]);
 
-  // ---- session restore (features/sessions.md) ----
-  // List the saved sessions (most-recently-updated first; Rust orders them).
-  const handleSessionList = useCallback(
-    () => invoke<SessionMeta[]>("session_list"),
-    [],
-  );
-
-  // Open a saved session: the core resets the live thread, seeds the saved
-  // thread_id, and reconnects ≤1 pending changeset (which arrives as a live
-  // `changeset` event). The panel hydrates the conversation from the returned
-  // record BEFORE the live connect flow repopulates transient state, and seeds
-  // lastToastedLogId to the restored max id so historical warn/error rows do
-  // NOT pop a toast storm. The transient review surfaces are NOT re-opened from
-  // the log — they gate on the live `changeset`/`plan` the core re-emits.
-  const handleSessionOpen = useCallback(
+  const handleSessionSelect = useCallback(
     (id: string) => {
-      void invoke<SessionRecord>("session_open", { id })
-        .then((record) => {
-          const maxId = store.hydrate(record.panelLog);
-          lastToastedLogId.current = maxId;
-          setSessionListOpen(false);
-          // The editor snapshot is settled by the `session_loaded` listener the
-          // core emits at the end of the reconnect (above); no inline refresh.
-        })
-        .catch((error) => {
-          store.log("error", `대화를 여는 데 실패했습니다: ${String(error)}`);
-        });
+      const slot = sessionsRef.current.get(id);
+      if (!slot) return;
+      setSelectedSessionId(id);
+      selectedSessionIdRef.current = id;
+      setEditDraft(null);
+      if (
+        slot.persisted &&
+        slot.meta.pendingRequestIds?.length > 0 &&
+        !runningSlotRef.current &&
+        !reviewOwnerRef.current
+      ) {
+        slot.activity = "running";
+        runningSlotRef.current = slot;
+        eventSessionIdRef.current = slot.id;
+        bumpSessions();
+        void invoke<SessionRecord>("session_open", { id: slot.id })
+          .then((record) => {
+            slot.meta = record;
+            slot.activity = "review";
+            reviewOwnerRef.current = slot;
+          })
+          .catch((error) => {
+            slot.activity = "error";
+            slot.store.log("error", `변경사항을 다시 열지 못했습니다: ${String(error)}`);
+          })
+          .finally(() => {
+            runningSlotRef.current = null;
+            bumpSessions();
+          });
+      }
     },
-    [store],
+    [bumpSessions],
   );
 
-  // Returns the invoke promise so SessionList can reconcile its optimistic row
-  // with the core on settle (and surface a failure rather than leaving the list
-  // silently diverged from the core).
   const handleSessionRename = useCallback(
-    (id: string, name: string) =>
-      invoke<void>("session_rename", { id, name }).catch((error) => {
-        store.log("error", `이름 변경에 실패했습니다: ${String(error)}`);
-        throw error;
-      }),
-    [store],
+    (id: string, name: string) => {
+      const slot = sessionsRef.current.get(id);
+      if (!slot) return;
+      const previous = slot.meta.name;
+      slot.meta = { ...slot.meta, name };
+      bumpSessions();
+      if (!slot.persisted) return;
+      void invoke<void>("session_rename", { id, name }).catch((error) => {
+        slot.meta = { ...slot.meta, name: previous };
+        slot.store.log("error", `이름 변경에 실패했습니다: ${String(error)}`);
+        bumpSessions();
+      });
+    },
+    [bumpSessions],
   );
 
   const handleSessionDelete = useCallback(
-    (id: string) =>
-      invoke<void>("session_delete", { id }).catch((error) => {
-        store.log("warn", `대화 삭제에 실패했습니다: ${String(error)}`);
-        throw error;
-      }),
-    [store],
+    (id: string) => {
+      const slot = sessionsRef.current.get(id);
+      if (!slot || slot.activity === "running" || slot.activity === "review") return;
+      const remove = () => {
+        slot.unsubscribe?.();
+        if (slot.saveTimer !== undefined) window.clearTimeout(slot.saveTimer);
+        sessionsRef.current.delete(id);
+        if (selectedSessionIdRef.current === id) {
+          const next = sessionsRef.current.values().next().value as
+            | SessionSlot
+            | undefined;
+          if (next) {
+            setSelectedSessionId(next.id);
+            selectedSessionIdRef.current = next.id;
+          } else {
+            createDraftSlot();
+          }
+        }
+        bumpSessions();
+      };
+      if (!slot.persisted) {
+        remove();
+        return;
+      }
+      void invoke<void>("session_delete", { id })
+        .then(remove)
+        .catch((error) => {
+          slot.store.log("warn", `대화 삭제에 실패했습니다: ${String(error)}`);
+        });
+    },
+    [bumpSessions, createDraftSlot],
+  );
+
+  const handleCancelQueued = useCallback(
+    (id: string) => {
+      const slot = sessionsRef.current.get(id);
+      if (!slot || slot.activity !== "queued") return;
+      queueRef.current = queueRef.current.filter((item) => item.slot !== slot);
+      slot.activity = "idle";
+      slot.queuePosition = undefined;
+      slot.store.log("info", "대기 중인 요청을 취소했습니다.");
+      refreshQueuePositions();
+    },
+    [refreshQueuePositions],
   );
 
   // Retry re-runs the backend download command (it re-fetches the release
@@ -786,89 +1224,172 @@ export default function App() {
   // Stop any in-flight OAuth poll on unmount.
   useEffect(() => stopCodexPoll, [stopCodexPoll]);
 
-  // Plan approval: archive the approval into the log and start the apply turn
-  // BEFORE awaiting (plan_approve also resolves only at turn end — see
-  // handleSend); a failed send returns the flow to ready.
   const handlePlanApprove = useCallback(async () => {
-    const rev = store.getState().plan?.revision;
-    store.log("agent", rev !== undefined ? `계획안(rev ${rev})을 승인했습니다.` : "계획을 승인했습니다.");
-    store.planApproveSent();
-    const sent = await clientRef.current?.send({ type: "plan_approve" });
+    const slot = selectedSlot;
+    if (!slot || reviewOwnerRef.current !== slot) return;
+    const rev = slot.store.getState().plan?.revision;
+    slot.store.log(
+      "agent",
+      rev !== undefined ? `계획안(rev ${rev})을 승인했습니다.` : "계획을 승인했습니다.",
+    );
+    slot.store.planApproveSent();
+    slot.activity = "running";
+    runningSlotRef.current = slot;
+    eventSessionIdRef.current = slot.id;
+    bumpSessions();
+    const sent = await clientRef.current?.send({
+      type: "plan_approve",
+      sessionId: slot.id,
+    });
     if (!sent) {
-      store.errorReceived("계획 승인 요청을 처리하지 못했습니다.");
+      slot.store.errorReceived("계획 승인 요청을 처리하지 못했습니다.");
     }
-  }, [store]);
+    settleExecution(slot);
+  }, [bumpSessions, selectedSlot, settleExecution]);
 
-  // Fire a changeset_decision and record it in the store (so the matching
-  // rollback_result is labelled per accept/reject). The ids are the literal
-  // "all" (bulk) or the item's ids (ChangesetView resolves dat group ids).
   const handleDecide = useCallback(
     async (decision: "accept" | "reject", ids: "all" | string[]) => {
-      // Record the pending decision BEFORE issuing the command: the core emits
-      // `rollback_result` WHILE the changeset_decision invoke is in flight, so
-      // setting pendingDecision after `await send` lets the event arrive first
-      // (found with no pending decision, it no-ops) and the "결정 처리 중…"
-      // spinner would never clear. Mirrors handleSend/handlePlanApprove.
-      store.decisionSent(decision, ids);
+      const slot = selectedSlot;
+      if (!slot || reviewOwnerRef.current !== slot) return;
+      slot.store.decisionSent(decision, ids);
+      slot.activity = "running";
+      runningSlotRef.current = slot;
+      eventSessionIdRef.current = slot.id;
+      bumpSessions();
       const sent = await clientRef.current?.send({
         type: "changeset_decision",
+        sessionId: slot.id,
         decision,
         ids,
       });
-      // The command never ran → no rollback_result will arrive; unlock the
-      // controls so the review is not stranded mid-spinner.
-      if (!sent) store.decisionFailed();
+      if (!sent) slot.store.decisionFailed();
+      settleExecution(slot);
     },
-    [store],
+    [bumpSessions, selectedSlot, settleExecution],
   );
 
-  // Toggle the project-memory overlay (mutually exclusive with the wiki
-  // sidebar). Opening pulls the memory snapshot; clicking again closes it.
-  const handleMemoryOpen = useCallback(async () => {
-    if (store.getState().memoryOpen) {
-      store.memoryClosed();
-      return;
-    }
-    store.memoryOpened();
-    setWikiOpen(false);
-    await clientRef.current?.send({ type: "memory_get" });
-  }, [store]);
+  const handleWorkspaceSelect = useCallback(
+    async (file: WorkspaceFileEntry, data = workspaceData) => {
+      if (!data) return;
+      setWorkspacePath(file.path);
+      setWorkspaceContent(null);
+      setWorkspaceError(null);
+      setWorkspaceLoading(true);
+      try {
+        const response = await workspaceRead(data.workspaceId, file.path);
+        setWorkspaceContent(response.content);
+      } catch (error) {
+        setWorkspaceError(`파일을 열지 못했습니다: ${String(error)}`);
+      } finally {
+        setWorkspaceLoading(false);
+      }
+    },
+    [workspaceData],
+  );
 
-  // Toggle the dat-edit wiki sidebar (mutually exclusive with the memory
-  // overlay). Opening pulls the current ledger via wiki_get so WikiView renders
-  // the live tree; closing just hides the sidebar (the store keeps the snapshot
-  // for the next open).
-  const handleWikiOpen = useCallback(async () => {
-    if (wikiOpen) {
-      setWikiOpen(false);
-      return;
-    }
-    setWikiOpen(true);
-    store.memoryClosed();
+  const handleWorkspaceRefresh = useCallback(async () => {
+    setWorkspaceLoading(true);
+    setWorkspaceError(null);
     try {
-      const msg = await wikiGet();
-      store.wikiReceived(msg.version, msg.entries);
+      const data = await workspaceList();
+      setWorkspaceData(data);
+      const selected =
+        data.files.find((file) => file.path === workspacePath) ??
+        data.files.find((file) => file.path === "specs/index.md") ??
+        data.files.find((file) => !file.source && file.path.toLowerCase().endsWith(".md")) ??
+        data.files[0] ??
+        null;
+      if (selected) {
+        setWorkspacePath(selected.path);
+        const response = await workspaceRead(data.workspaceId, selected.path);
+        setWorkspaceContent(response.content);
+      } else {
+        setWorkspacePath(null);
+        setWorkspaceContent(null);
+      }
     } catch (error) {
-      // No open project (or a wiki_get error): surface it as a log line; the
-      // sidebar still opens showing the last known / empty ledger.
-      store.log("warn", `위키를 불러오지 못했습니다: ${String(error)}`);
+      setWorkspaceError(`워크스페이스를 불러오지 못했습니다: ${String(error)}`);
+    } finally {
+      setWorkspaceLoading(false);
     }
-  }, [store, wikiOpen]);
+  }, [workspacePath]);
 
-  // Persist user-corrected wiki entries; the core flips editedByUser=true and
-  // pushes the refreshed ledger (also returned here) which re-syncs the store.
+  const handleProjectPanelTab = useCallback(
+    async (tab: ProjectPanelTab) => {
+      setProjectSidebarOpen(true);
+      setProjectPanelTab(tab);
+      if (tab === "workspace") {
+        await handleWorkspaceRefresh();
+        return;
+      }
+      if (tab === "memory") {
+        projectStore.memoryOpened();
+        await clientRef.current?.send({ type: "memory_get" });
+        return;
+      }
+      try {
+        const msg = await wikiGet();
+        projectStore.wikiReceived(msg.version, msg.entries);
+        for (const slot of sessionsRef.current.values()) {
+          slot.store.wikiReceived(msg.version, msg.entries);
+        }
+      } catch (error) {
+        store.log("warn", `위키를 불러오지 못했습니다: ${String(error)}`);
+      }
+    },
+    [handleWorkspaceRefresh, projectStore, store],
+  );
+
+  const handleWorkspaceOpen = useCallback(() => {
+    void handleProjectPanelTab("workspace");
+  }, [handleProjectPanelTab]);
+
+  const handleMemoryOpen = useCallback(() => {
+    void handleProjectPanelTab("memory");
+  }, [handleProjectPanelTab]);
+
+  const handleWikiOpen = useCallback(() => {
+    void handleProjectPanelTab("wiki");
+  }, [handleProjectPanelTab]);
+
   const handleWikiSave = useCallback(
     async (entries: Record<string, LedgerEntry>) => {
       try {
         const msg = await wikiSave(entries);
-        store.wikiReceived(msg.version, msg.entries);
+        projectStore.wikiReceived(msg.version, msg.entries);
+        for (const slot of sessionsRef.current.values()) {
+          slot.store.wikiReceived(msg.version, msg.entries);
+        }
         store.log("ok", "위키를 저장했습니다.");
       } catch (error) {
         store.log("error", `위키 저장에 실패했습니다: ${String(error)}`);
       }
     },
-    [store],
+    [projectStore, store],
   );
+
+  useProjectIdentityEffect(
+    projectState.hasProject && projectState.project ? projectState.project : null,
+    (projectIdentity) => {
+      setWorkspaceData(null);
+      setWorkspacePath(null);
+      setWorkspaceContent(null);
+      setWorkspaceError(null);
+      if (projectIdentity && projectPanelTab === "wiki") {
+        void handleProjectPanelTab("wiki");
+      }
+    },
+  );
+
+  useEffect(() => {
+    const media = window.matchMedia("(max-width: 1040px)");
+    const adaptSessionSidebar = () => {
+      setSessionSidebarCollapsed(media.matches);
+    };
+    adaptSessionSidebar();
+    media.addEventListener("change", adaptSessionSidebar);
+    return () => media.removeEventListener("change", adaptSessionSidebar);
+  }, []);
 
   // Launch the configured EUD Editor 3 (Header button). The backend spawns the exe;
   // the existing editor-heartbeat poll flips editorConnected once the bridge is up, so
@@ -901,12 +1422,39 @@ export default function App() {
         file,
         content,
       });
-      if (sent) store.memorySaveSent(file);
+      if (sent) {
+        projectStore.memorySaveSent(file);
+        for (const slot of sessionsRef.current.values()) {
+          slot.store.memorySaveSent(file);
+        }
+      }
     },
-    [store],
+    [projectStore],
   );
 
   const rag = ragState === "idle" ? undefined : { state: ragState, elapsedSec: ragElapsedSec };
+
+  const sessionRows = useMemo<SessionSidebarRow[]>(
+    () =>
+      Array.from(sessionsRef.current.values())
+        .sort((left, right) => {
+          if (left.persisted !== right.persisted) return left.persisted ? 1 : -1;
+          return right.meta.updatedAt - left.meta.updatedAt;
+        })
+        .map((slot) => ({
+          id: slot.id,
+          name: slot.meta.name,
+          updatedAt: slot.meta.updatedAt,
+          activity: slot.activity,
+          queuePosition: slot.queuePosition,
+          persisted: slot.persisted,
+        })),
+    [sessionRevision],
+  );
+  const selectedActionBusy =
+    messageActionBusy ||
+    selectedSlot?.activity === "queued" ||
+    state.phase === "changeset_review";
 
   if (setup?.setup_required || bootstrap.active) {
     return (
@@ -930,120 +1478,137 @@ export default function App() {
   }
 
   return (
-    <div className="flex h-screen bg-background text-foreground">
-      {/* Transient problem alerts (error/warn log entries). Bottom-right so it
-          never covers the Header status pills (top-right). */}
+    <div className="flex h-screen min-w-0 overflow-hidden bg-background text-foreground">
       <Toaster position="bottom-right" richColors closeButton />
-      {/* dat-edit wiki: a permanent, drag-resizable LEFT sidebar with a
-          mobile-style category → item → editor drilldown. Toggled by the
-          Header wiki button; the rest of the app is the right column. */}
-      {wikiOpen && (
-        <WikiView
-          wiki={state.wikiData ?? { version: 1, entries: {} }}
-          onClose={() => setWikiOpen(false)}
-          onSave={handleWikiSave}
-        />
-      )}
-      <div className="flex min-w-0 flex-1 flex-col">
-      <Header
-        project={state.project}
-        connected={state.connected}
-        phase={state.phase}
-        rag={rag}
-        editorConnected={state.editorConnected}
-        hasProject={state.hasProject}
-        launchPending={launchPending}
-        onLaunchEditor={handleLaunchEditor}
-        memoryOpen={state.memoryOpen}
-        onMemoryOpen={handleMemoryOpen}
-        wikiOpen={wikiOpen}
-        onWikiOpen={handleWikiOpen}
-        sessionsOpen={sessionListOpen}
-        onSessionsOpen={() => setSessionListOpen((open) => !open)}
-      />
-
-      {update && !updateDismissed && (
-        <UpdateNotice
-          update={update}
-          relaunch={updater.relaunch}
-          onLater={() => setUpdateDismissed(true)}
-        />
-      )}
-
-      {!state.editorConnected && <ConnectionNotice />}
-
-      {/* The live agent activity (reasoning / tool rows / streamed answer)
-          renders INLINE inside the conversation scroll area (EUD-069) — a fixed
-          band here grew unbounded and crushed the log + plan card to 0px/33px
-          in the live E2E. ConversationLog owns the placement now. */}
-      <ConversationLog
-        log={state.log}
-        phase={state.phase}
-        turn={state.turn}
-        ragLoading={state.rag === "loading"}
-        onSuggestion={handleSuggestion}
-        suggestionsEnabled={state.canSend}
-      />
-
-      {/* Plan review — markdown card + feedback/approve (features/06). The card
-          stays visible across the iteration turn (plan_review while awaiting a
-          decision, thinking while the feedback/approve turn runs) and only
-          disappears when the store clears the plan (chat / transport re-open) or a
-          changeset opens. Controls disable (`pending`) once the turn is in
-          flight, i.e. when the phase has left plan_review. */}
-      {state.plan && (state.phase === "plan_review" || state.phase === "thinking") && (
-        <PlanView
-          plan={state.plan}
-          pending={state.phase !== "plan_review"}
-          onApprove={handlePlanApprove}
-        />
-      )}
-
-      {state.changeset && state.phase === "changeset_review" && (
-        <ChangesetView
-          changeset={state.changeset}
-          pending={state.pendingDecision !== null}
-          onDecide={handleDecide}
-        />
-      )}
-
-      {state.memoryOpen && state.memory && (
-        <MemoryView
-          memory={state.memory}
-          onClose={store.memoryClosed}
-          onTabSelected={store.memoryTabSelected}
-          onEdited={store.memoryEdited}
-          onSave={handleMemorySave}
-        />
-      )}
-
-      {state.memoryOpen && !state.memory && (
-        <section
-          aria-label="프로젝트 메모리"
-          className="border-t border-border p-4 text-sm text-muted-foreground"
-        >
-          메모리를 여는 중…
-        </section>
-      )}
-
-      <InstructionBox
-        state={state}
-        onSend={handleSend}
-        onReset={handleReset}
-        codexSettings={codexSettings}
-        codexSettingsBusy={!editorPollEnabled || codexSettingsBusy}
-        onCodexSettingsChange={handleCodexSettingsChange}
-        onCodexSettingsReload={loadCodexModelSettings}
-      />
-      </div>
-      <SessionList
-        open={sessionListOpen}
-        onClose={() => setSessionListOpen(false)}
-        currentId={currentSessionId}
-        onList={handleSessionList}
-        onOpen={handleSessionOpen}
+      <SessionSidebar
+        project={projectState.project}
+        rows={sessionRows}
+        selectedId={selectedSessionId}
+        collapsed={sessionSidebarCollapsed}
+        onCollapsedChange={setSessionSidebarCollapsed}
+        onNew={handleNewSession}
+        onSelect={handleSessionSelect}
         onRename={handleSessionRename}
         onDelete={handleSessionDelete}
+        onCancelQueued={handleCancelQueued}
+      />
+
+      <main className="flex min-w-[32rem] flex-1 flex-col overflow-hidden">
+        <Header
+          project={projectState.project}
+          connected={projectState.connected}
+          phase={state.phase}
+          rag={rag}
+          editorConnected={projectState.editorConnected}
+          hasProject={projectState.hasProject}
+          launchPending={launchPending}
+          onLaunchEditor={handleLaunchEditor}
+          memoryOpen={projectSidebarOpen && projectPanelTab === "memory"}
+          onMemoryOpen={handleMemoryOpen}
+          workspaceOpen={projectSidebarOpen && projectPanelTab === "workspace"}
+          onWorkspaceOpen={handleWorkspaceOpen}
+          wikiOpen={projectSidebarOpen && projectPanelTab === "wiki"}
+          onWikiOpen={handleWikiOpen}
+        />
+
+        {update && !updateDismissed && (
+          <UpdateNotice
+            update={update}
+            relaunch={updater.relaunch}
+            onLater={() => setUpdateDismissed(true)}
+          />
+        )}
+
+        {!projectState.editorConnected && <ConnectionNotice />}
+
+        {selectedSlot && (
+          <div className="flex min-h-10 items-center gap-2 border-b border-border bg-card/20 px-4 text-xs">
+            <span className="min-w-0 flex-1 truncate font-medium text-foreground">
+              {selectedSlot.meta.name}
+            </span>
+            {selectedSlot.activity === "queued" && (
+              <span className="text-sky-400">대기 {selectedSlot.queuePosition ?? ""}</span>
+            )}
+            {selectedSlot.activity === "running" && (
+              <span className="text-primary">실행 중</span>
+            )}
+            {selectedSlot.activity === "review" && (
+              <span className="text-amber-400">검토 필요</span>
+            )}
+          </div>
+        )}
+
+        <ConversationLog
+          key={selectedSessionId ?? "no-session"}
+          log={state.log}
+          phase={state.phase}
+          turn={state.turn}
+          ragLoading={state.rag === "loading"}
+          onSuggestion={handleSuggestion}
+          suggestionsEnabled={
+            state.canSend &&
+            !selectedActionBusy &&
+            selectedSlot?.activity !== "queued"
+          }
+          onEditMessage={handleEditMessage}
+          editDisabled={
+            messageActionBusy ||
+            !selectedSlot ||
+            eventSessionIdRef.current !== selectedSlot.id
+          }
+        />
+
+        {state.plan &&
+          (state.phase === "plan_review" || state.phase === "thinking") && (
+            <PlanView
+              plan={state.plan}
+              pending={state.phase !== "plan_review"}
+              onApprove={handlePlanApprove}
+            />
+          )}
+
+        {state.changeset && state.phase === "changeset_review" && (
+          <ChangesetView
+            changeset={state.changeset}
+            pending={state.pendingDecision !== null}
+            onDecide={handleDecide}
+          />
+        )}
+
+        <InstructionBox
+          state={state}
+          onSend={handleSend}
+          onStageAttachment={stageAttachment}
+          onDiscardAttachment={discardAttachment}
+          onCancel={handleCancel}
+          draft={editDraft}
+          actionBusy={selectedActionBusy}
+          codexSettings={codexSettings}
+          codexSettingsBusy={!editorPollEnabled || codexSettingsBusy}
+          onCodexSettingsChange={handleCodexSettingsChange}
+          onCodexSettingsReload={loadCodexModelSettings}
+        />
+      </main>
+
+      <ProjectSidebar
+        open={projectSidebarOpen}
+        project={projectState.project}
+        activeTab={projectPanelTab}
+        wiki={projectState.wikiData ?? { version: 1, entries: {} }}
+        memory={projectState.memory}
+        workspace={workspaceData}
+        workspacePath={workspacePath}
+        workspaceContent={workspaceContent}
+        workspaceLoading={workspaceLoading}
+        workspaceError={workspaceError}
+        onTabChange={(tab) => void handleProjectPanelTab(tab)}
+        onClose={() => setProjectSidebarOpen(false)}
+        onWikiSave={handleWikiSave}
+        onMemoryTabSelected={projectStore.memoryTabSelected}
+        onMemoryEdited={projectStore.memoryEdited}
+        onMemorySave={handleMemorySave}
+        onWorkspaceSelect={handleWorkspaceSelect}
+        onWorkspaceRefresh={handleWorkspaceRefresh}
       />
     </div>
   );

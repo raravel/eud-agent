@@ -31,6 +31,41 @@ Flow: `propose_plan(markdown)` — ends the turn for user review (see below).
 
 Every tool validates args server-side (numeric ranges, index bounds, type whitelists, FileType guards) BEFORE the bridge call — the bridge's ERROR is the second line of defense, not the first.
 
+## Native project workspace
+
+- Every project identity owns a real `%appdata%\eud-agent\workspaces\<sha256>\` Codex cwd.
+  Native filesystem tools are enabled there, so Codex can glob/grep, run sandboxed shell
+  commands, and patch multiple project documents without MCP CRUD indirection.
+- Writable durable directories: `specs/`, `plans/`, `decisions/`, `worklog/`. `source/` is
+  atomically refreshed from one EPSNAPSHOT before every turn and is a read-only subtree;
+  editor mutations continue exclusively through eud-tools.
+- `specs/index.md` is the canonical project-wiki entry point. Linked `specs/*.md` topic
+  pages describe current implemented behavior; `plans/`, `decisions/`, and `worklog/`
+  retain history without duplicating the canonical facts.
+- `plan_approve` atomically writes the exact approved Markdown to
+  `plans/<request-id>.md` before the execution baseline and records its revision in trusted
+  `.state/` metadata. Codex cannot authoritatively approve a plan and must never mutate
+  this app-owned snapshot.
+- Before an approved execution answer becomes a normal changeset, the engine validates the
+  exact plan, a non-empty topic linked from `specs/index.md`, and
+  `worklog/<request-id>.md` with actual verification plus a canonical-spec link. It resumes
+  Codex with the precise gaps for at most two repair turns. Persistent failure emits an
+  error and preserves any journaled changes for review instead of claiming completion.
+- Codex CodeGraph may create a top-level `.codegraph` link to its external index. The app
+  treats that reserved runtime path as inaccessible metadata: it is excluded from baselines,
+  diffs, and the workspace viewer before symlink validation; all other symlinks still fail.
+- Windows uses a named split-filesystem permission profile (`:minimal` read, current workspace
+  write, `source/**` read-only, network off) with the elevated exact-root backend. Readiness is
+  checked before a turn; setup is requested once and failure/denial aborts the turn rather than
+  downgrading to legacy full-read workspace-write.
+- A baseline outside the Codex cwd is captured before every turn. RAII finalization diffs UTF-8
+  text create/modify/delete changes even when the turn future is cancelled, appends Workspace
+  journal items, and deletes the baseline only after journal persistence. Plan-review turns
+  retain those entries but defer the changeset surface until approval/execution finishes.
+- Workspace document status text is not authoritative. App-recorded user plan approval
+  supplies the `approved` plan state; changeset outcomes remain the only source of accepted
+  document revisions and completed implementation state.
+
 ## Request scoping across a continuous thread (EUD-064)
 
 - Each `chat` still mints a fresh `request_id` — the journal/changeset scope, the mutation gate, and the action budget all stay PER-REQUEST. Only the codex THREAD persists across chats.
@@ -42,7 +77,10 @@ Every tool validates args server-side (numeric ranges, index bounds, type whitel
 - The system prompt instructs: answer-only requests use no write tools; small edits (≤2 mutations) may apply directly; larger work must `propose_plan` first.
 - Enforcement: the tool layer counts mutations per request. The 3rd mutating call WITHOUT an approved plan returns a tool error directing codex to `propose_plan`. After `plan_approve`, the mutation gate lifts for that request.
 - `propose_plan` ends the codex turn; the panel renders the plan; `plan_feedback{text}` resumes the thread with the feedback (iterate, re-propose); `plan_approve{}` resumes with the approval instruction.
-- Budgets: **30 tool actions per request** (31st rejected; agent told to wrap up; panel asked whether to continue with a fresh budget) and **3 build self-fix attempts** (build_run → errors → fixes → retry counts as one attempt).
+- Budgets: **30 non-search tool actions per request** (31st rejected) plus a separate
+  **120 `search_docs` calls per request** (121st rejected); either exhaustion tells the
+  agent to wrap up. `eps_check` consumes neither budget. The panel can continue with a
+  fresh per-request budget. `build_run` retains its separate **3 self-fix attempts**.
 - Evidence gate (EUD-090): the `[evidence]` prompt section requires every work unit to cite why + a source link (`[제목](url)`) on plan steps AND the final answer; `[reference context]` chunks carry `source:` link headers to cite verbatim. Enforcement: on a RAG-wired layer, a mutating call is rejected (`EvidenceRequired`) until ONE `search_docs` has run in the request (`RequestState.docs_searched`; zero hits lift it too — such items are marked 근거 없음, never a fabricated source). Exempt: `memory_write`, `build_run`. Without `rag_search` the gate never fires (the agent could not satisfy it).
 
 ## Change journal and rollback
@@ -62,7 +100,7 @@ Every tool validates args server-side (numeric ranges, index bounds, type whitel
 
 ## WS protocol v2
 
-Client→server: `chat{text}`, `plan_feedback{text}`, `plan_approve{}`, `changeset_decision{accept|reject, ids|all}`, `cancel{}`, `reset{}` (drop the retained codex thread — next chat starts a fresh conversation; EUD-064), `status{}`, `list{}` (kept for header).
+Client→server: `chat{text}`, `plan_feedback{text}`, `plan_approve{}`, `changeset_decision{accept|reject, ids|all}`, `cancel{}`, `conversation_rewind{panelLog}`, `reset{}` (drop the retained codex thread — next chat starts a fresh conversation; EUD-064), `status{}`, `list{}` (kept for header). `cancel` maps to app-server `turn/interrupt` and settles only after interrupted `turn/completed`; `conversation_rewind` retains the saved session but starts a fresh thread seeded from the surviving panel-log prefix.
 Server→client: `agent_event{kind, detail, data?}` (streamed: thinking/tool_call/tool_result/turn_done; **`reasoning`** carries a reasoning-text delta in `detail` — `item/reasoning/summaryTextDelta` + `item/reasoning/textDelta`; **`delta`** carries an answer-text delta in `detail` — EUD-063; **`data`** (EUD-068) is an optional tool payload — `tool_call` carries `{args}` (the McpToolCall arguments as display text, server-truncated at 4000 chars), `tool_result` carries `{result, status}` (joined MCP content/error text + completed|failed|declined)), `answer{text}`, `plan{markdown, revision}`, `changeset{request_id, items[]}`, `rollback_result{ids, ok}`, `error{message}`, `status{...}`, `progress{stage,...}` (kept: rag_warmup etc.).
 v1 `instruct`/`apply`/`code`/`applied` messages are REMOVED (panel v2 replaces the flow; no compat shim).
 

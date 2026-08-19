@@ -29,7 +29,9 @@ graph TD
             Rag["rag (fastembed bge-m3 + brute-force cosine)"]
             Map["isom (FFI) + mapsafe (rails+journal)"]
             Bio["bridge_io (file-IPC to editor)"]
+            Eps["eps_preflight (LocalAppData mirror<br/>+ framed Node client)"]
             Mem["memory"]
+            Work["workspace (durable docs +<br/>read-only EPS source mirror)"]
             Boot["bootstrap (first-run download)"]
         end
     end
@@ -40,22 +42,26 @@ graph TD
     CodexCLI["codex exec CLI (BYO)"]
     HF[("HuggingFace<br/>bge-m3 ONNX")]
     GHR[("GitHub Release<br/>RAG index asset")]
+    EpsAdapter["pinned epscript-lsp agent adapter<br/>(system Node, bundled CJS)"]
 
     Panel <-- "invoke / emit" --> IPC
     IPC --> Orch --> Tools
-    Tools --> Codex & Rag & Map & Mem
-    Codex --> CodexCLI
+    Tools --> Codex & Rag & Map & Mem & Eps
+    Codex --> CodexCLI & Work
     Map --> Isom
     Orch <-- "file IPC: inbox/*.cmd to outbox/*.result" --> Bio
     Bio <-- "editor Data\\agent\\" --> Bridge
+    Eps --> EpsAdapter
     Boot -. "first run" .-> HF & GHR
 ```
 
 Dependency direction: `panel -> core -> {isom .lib, editor bridge, codex, data dir}`.
-The Lua bridge never calls the app (it no longer even spawns it); the C++ engine is a
-pure library with no knowledge of the app; the panel only speaks Tauri IPC. Heavy work
-(LLM, RAG, orchestration, map binary I/O) stays in Rust/C++; Lua stays a thin file-IPC
-tool layer.
+The optional agent-only preflight adds
+`Codex -> eud-tools -> ToolRuntime -> EpsPreflight -> bundled adapter`; it has no panel
+or editor-LSP dependency. The Lua bridge never calls the app (it no longer even spawns
+it); the C++ engine is a pure library with no knowledge of the app; the panel only
+speaks Tauri IPC. Heavy work (LLM, RAG, orchestration, map binary I/O, analyzer process
+containment) stays outside Lua; Lua remains a thin file-IPC tool layer.
 
 ## Runtime flow (instruct then apply)
 
@@ -114,12 +120,41 @@ Runtime state is split by size and ownership (Decision 12):
 | Location | Contents | Who accesses |
 |---|---|---|
 | editor `Data\agent\` | `inbox/`, `outbox/`, `status.txt`, `heartbeat.txt` | bridge (writes/reads) + app (file-IPC) |
-| `%appdata%\eud-agent\` | `config.json` (editor path, settings), `memory/`, `map_backups/`, `journal/` | app only |
-| `%localappdata%\eud-agent\` | `models/` (bge-m3 ONNX), `rag/` (index), `logs/` | app only |
+| `%appdata%\eud-agent\` | `config.json` (editor path, settings), `memory/`, durable `workspaces/`, `map_backups/`, `journal/`, `sessions/` | app; Codex can access only its current project workspace through the strict sandbox |
+| `%localappdata%\eud-agent\` | `models/`, `rag/`, `bin/` (Codex CLI + Code Mode host + Windows sandbox setup helper), `logs/`, session-owned `attachments/`, regenerable `lsp_workspaces/` mirrors | app only |
 
 The bridge finds `Data\agent\` editor-relative (no absolute path baked into the .lua —
 KopiLua reads source as Latin1, so a non-ASCII path literal would corrupt). The app
 reads the editor path from `config.json` (UTF-8-safe) written at install time.
+
+## Per-project Codex workspace
+
+Each editor project identity hashes to `%appdata%\eud-agent\workspaces\<sha256>\`, the
+real `cwd` of that project's Codex thread. `specs/`, `plans/`, `decisions/`, and
+`worklog/` are durable writable documents. Before every turn, one coherent EPSNAPSHOT
+atomically replaces `source/`; the split-filesystem permission profile makes that subtree
+read-only while native Codex filesystem operations (glob/grep/shell/patch) remain usable
+elsewhere in the workspace.
+
+`specs/index.md` is the canonical project-wiki entry point; it links concise topic pages
+under `specs/`. On `plan_approve`, the app atomically persists the exact approved Markdown
+as `plans/<request-id>.md` before the execution baseline and records its authoritative
+`approved` revision under `.state/`. The plan file therefore survives implementation
+rejection and is immutable during execution.
+
+Before an approved-plan execution can report normal completion, the backend verifies the
+plan snapshot, a non-empty linked topic spec from `specs/index.md`, and
+`worklog/<request-id>.md` with actual verification plus a canonical-spec link. Missing
+artifacts trigger at most two focused Codex repair turns; persistent failure is surfaced
+instead of silently declaring the work complete. Small direct edits remain outside this
+completion contract.
+
+Trusted turn baselines live under the sibling `workspaces/.state/`, outside the Codex
+workspace root. At turn end the app scans UTF-8 text changes, journals create/modify/delete
+items, and emits them through the normal changeset review. Reject restores the baseline;
+accept archives it. The Windows profile grants only minimal runtime reads plus the current
+workspace, disables network, and requires the elevated exact-root backend. Unsupported or
+denied setup fails closed; it never falls back to legacy Windows full-read workspace-write.
 
 ## File IPC protocol (app to bridge)
 
@@ -128,9 +163,24 @@ the 1s UI-thread `DispatcherTimer.Tick`, reply to `outbox\<name>.result`. Files 
 UTF-8 **without BOM**. The app writes `srv-<uuid8>.cmd` and polls only its own basenames;
 it deletes each `.result` after consuming and clears stale inbox/outbox at startup.
 
-Commands retained: PING, STATUS, LIST, GET, SET, NEWEPS, GETDAT/SETDAT, BUILD, LUA.
+Commands retained: PING, STATUS, LIST, GET, SET, NEWEPS, GETDAT/SETDAT, BUILD, LUA,
+and the additive `EPSNAPSHOT <uuid>` command. EPSNAPSHOT writes collision-safe ordinal
+`.eps` files plus a last-written base64-path manifest in one idle Tick; unreadable files
+remain individual manifest rows. Heartbeat/status and the compiling early-return still
+precede all inbox work, so no project object is touched while compiling.
 Removed: the WebView2/panel-hosting commands and server-spawn handshake (PANEL is gone;
 the app is the panel). SET/NEWEPS remain memory-only and CUI/RawText-only.
+
+## Agent-only epScript preflight
+
+`eps_check` overlays one complete candidate batch onto the request-local project mirror,
+then asks the checksum-verified `vendor/epscript-lsp-agent/adapter.cjs` process for syntax,
+import-graph, dependency, and reverse-dependent diagnostics. The adapter uses the pinned
+upstream generated ANTLR parser for imports and returns 1-based, bounded diagnostics.
+It is advisory and non-mutating: no journal entry, admission gate, changeset, or panel
+state is created. Missing Node/resource, snapshot failure, crash, malformed framing, and
+timeout return a successful stable `skipped` result; the normal write and mandatory
+`build_run` path remains available and authoritative.
 
 ## Repository layout (v2)
 
@@ -143,7 +193,7 @@ eud-agent/
 │   ├── tauri.conf.json             # bundle/resources/capabilities
 │   ├── build.rs                    # links native/isom static lib
 │   └── src/                        # ipc, engine, tools, codex_client, rag,
-│                                   # isom (FFI wrapper), mapsafe, bridge_io,
+│                                   # isom, mapsafe, bridge_io, eps_preflight,
 │                                   # memory, config, bootstrap, chk
 ├── crates/
 │   ├── isom-sys/                   # FFI bindings + build.rs (msbuild + link)
@@ -152,13 +202,17 @@ eud-agent/
 ├── panel/                          # React app (reused); Tauri IPC client
 │   └── dist/                       # build output — bundled by Tauri (gitignored)
 ├── ci/                             # RAG index builder + committed corpus (ci/corpus/*.jsonl)
-├── tools/scraper/                  # Node/TS Naver-Cafe scraper (local, cookie) -> corpus
-└── scripts/                        # install_bridge.ps1, dev_run.ps1
+├── tools/
+│   ├── epscript-lsp-agent/         # adapter source, exact npm lock, Node tests
+│   └── scraper/                    # corpus refresh tooling
+├── vendor/epscript-lsp-agent/      # generated bundle, checksum, MIT license, provenance
+└── scripts/                        # bridge/dev scripts + deterministic adapter regeneration
 ```
 
-The RAG corpus lives in-repo at `ci/corpus/*.jsonl` (scraped locally by `tools/scraper`, committed
-in plain git — not LFS); the CI re-embeds it and publishes the static `rag-index.bin` as a GitHub
-Release asset, never committed here (see [[decisions/15_in-house-rag-corpus]]; the chromadb-sqlite
+The RAG corpus lives in-repo at `ci/corpus/*.jsonl` (refreshed locally from authenticated Naver
+data and commit-pinned public repositories, then committed in plain git — not LFS); CI re-embeds it
+and publishes the static `rag-index.bin` as a GitHub Release asset, never committed here (see
+[[decisions/15_in-house-rag-corpus]]; the chromadb-sqlite
 churn caveat in rules.md applies only to the legacy chromadb, not the static `.bin`).
 
 ## Key design decisions (carry-over, still in force)
