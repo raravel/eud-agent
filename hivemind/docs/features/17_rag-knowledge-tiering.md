@@ -44,7 +44,7 @@ the L0 item number rather than restating the prohibition.
 
 | Source files | Tier label | `tier_level` (u8) | role |
 |---|---|---|---|
-| `eud_book.jsonl`, `cafebook.jsonl` | official | 3 | verified manuals |
+| `eud_book.jsonl`, `cafebook.jsonl`, `scrmapdocs_en.jsonl`, `eudplib_api.jsonl`, `eudplib_examples.jsonl`, `eud_editor_schema.jsonl` | primary reference | 3 | verified manuals, APIs, examples, and editor schema |
 | `board_강좌팁`, `board_연구칼럼` | lecture/research | 2 | curated write-ups |
 | `board_유틸리티툴`, `board_Lua자료실`, `user_*` | general | 1 | general posts |
 | `board_질문답변` | Q&A | 0 | questions; may contain wrong/unsolved code |
@@ -98,12 +98,12 @@ flowchart TD
 
 ## Bootstrap + CI republish
 
-- `src-tauri/src/bootstrap.rs`: the index manifest gains the v2 version + new sha256; the
-  loader requires version 2. A stale v1 asset re-downloads (existing atomic + sha256 path).
-- `.github/workflows/build-rag-index.yml`: the builder now emits v2 directly (tier derived from
-  `source`); the release manifest version bumps. UTF-8 without BOM throughout. Runner stays
-  `ubuntu-latest`.
-- Republished assets: `rag-index.bin` (v2), `.sha256`, `rag-index.manifest.json`.
+- `src-tauri/src/bootstrap.rs`: the persisted index loader requires binary layout v2; the
+  distribution contract now requires release generation v3 so healthy v2 installations refresh.
+- `.github/workflows/build-rag-index.yml`: the canonical CPU builder emits binary layout v2 from
+  the seven-source corpus and publishes a manifest with version `3`. UTF-8 without BOM throughout;
+  the runner remains `ubuntu-latest`.
+- Published under `rag-index-v3`: `rag-index.bin`, `.sha256`, `rag-index.manifest.json`.
 
 ## GPU differential-test track (separate, gated)
 
@@ -125,8 +125,9 @@ critical path and NOT wired into CI (the `ubuntu-latest` runner has no GPU).
 - `src-tauri/src/rag.rs` — `IndexEntry.tier_level`, v2 write/load (MAGIC unchanged, VERSION=2), `TIER_WEIGHT`, weighted `rank()`
 - `ci/build_rag_index.rs` — `source`→`tier_level` derivation, v2 write
 - `ci/` migration binary (e.g. `migrate_rag_index.rs`) — v1 bin + corpus → v2 bin, vector-preservation test
-- `src-tauri/src/bootstrap.rs` — manifest version/sha256, loader requires v2
-- `.github/workflows/build-rag-index.yml` — v2 build + republish, version bump
+- `src-tauri/src/bootstrap.rs` — persisted index loader still requires binary layout v2; release
+  generation v3 forces installed v2 corpus assets to refresh through the manifest/sha256 path
+- `.github/workflows/build-rag-index.yml` — canonical CPU build published as `rag-index-v3`
 - `ci/` GPU differential-test fixture + test (local-only, gated)
 - external: `fastembed 5.15` (BGEM3Q), `sha2` (manifest digest)
-- [BOUND 2026-06-12 from EUD-159-22ba] `src-tauri/src/setup.rs` — run_bootstrap_inner re-fetches the release manifest when the pinned rag_index version != REQUIRED_RAG_INDEX_VERSION, so a stale v1 install upgrades to v2
+- [BOUND 2026-06-12 from EUD-159-22ba; advanced to release generation v3] `src-tauri/src/setup.rs` — `run_bootstrap_inner` re-fetches the release manifest when the pinned `rag_index.version` differs from `REQUIRED_RAG_INDEX_VERSION`, so stale v1/v2 installations upgrade to v3

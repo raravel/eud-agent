@@ -1,7 +1,7 @@
 name: Build RAG Index
 
-# Runnable from a tag: push a tag like rag-index-v1, or run manually from a tag
-# and optionally provide the version input.
+# Runnable from a tag such as `rag-index-v3`, or manually with an explicit release
+# generation.
 on:
   push:
     branches:
@@ -13,7 +13,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "RAG index version. Defaults to the rag-index-v* tag suffix, then 2."
+        description: "RAG index version. Defaults to the rag-index-v* tag suffix, then 3."
         required: false
         type: string
 
@@ -63,7 +63,7 @@ jobs:
             version="${REF_NAME#rag-index-v}"
           fi
           if [[ -z "$version" ]]; then
-            version="2"
+            version="3"
           fi
 
           tag="rag-index-v$version"

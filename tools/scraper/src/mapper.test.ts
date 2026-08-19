@@ -7,7 +7,7 @@ describe("postToCorpusRow", () => {
       id: "141465",
       title: "채팅출력utf8.lua (수정3)",
       url: "https://cafe.naver.com/f-e/cafes/17046257/articles/141465",
-      board: "Lua자료실",
+      source: "board_Lua자료실.jsonl",
       contentHtml: `
         <article>
           <p>기존 글은 구버전 카페글 에디터에서 작성했습니다.</p>
@@ -17,6 +17,7 @@ describe("postToCorpusRow", () => {
     });
 
     expect(row).toEqual({
+      id: "141465",
       title: "채팅출력utf8.lua (수정3)",
       content:
         "기존 글은 구버전 카페글 에디터에서 작성했습니다.\n\nprint_utf8(line, offset, string)",
@@ -30,7 +31,7 @@ describe("postToCorpusRow", () => {
       id: "126461",
       title: "Multiline code",
       url: "https://cafe.naver.com/edac/book5103106/126461",
-      board: "cafebook",
+      source: "cafebook.jsonl",
       contentHtml: `
         <article>
           <p>Example:</p>

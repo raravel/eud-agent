@@ -152,13 +152,14 @@ eud-agent/
 ├── panel/                          # React app (reused); Tauri IPC client
 │   └── dist/                       # build output — bundled by Tauri (gitignored)
 ├── ci/                             # RAG index builder + committed corpus (ci/corpus/*.jsonl)
-├── tools/scraper/                  # Node/TS Naver-Cafe scraper (local, cookie) -> corpus
+├── tools/scraper/                  # Node/TS Naver + pinned public-source sync -> corpus
 └── scripts/                        # install_bridge.ps1, dev_run.ps1
 ```
 
-The RAG corpus lives in-repo at `ci/corpus/*.jsonl` (scraped locally by `tools/scraper`, committed
-in plain git — not LFS); the CI re-embeds it and publishes the static `rag-index.bin` as a GitHub
-Release asset, never committed here (see [[decisions/15_in-house-rag-corpus]]; the chromadb-sqlite
+The RAG corpus lives in-repo at `ci/corpus/*.jsonl` (refreshed locally from authenticated Naver
+data and commit-pinned public repositories, then committed in plain git — not LFS); CI re-embeds it
+and publishes the static `rag-index.bin` as a GitHub Release asset, never committed here (see
+[[decisions/15_in-house-rag-corpus]]; the chromadb-sqlite
 churn caveat in rules.md applies only to the legacy chromadb, not the static `.bin`).
 
 ## Key design decisions (carry-over, still in force)

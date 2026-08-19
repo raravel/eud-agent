@@ -17,6 +17,9 @@ import type { ParsedPost } from "./mapper.js";
 import { postToCorpusRow } from "./mapper.js";
 import type { NaverClient } from "./naverClient.js";
 
+const cafeId = "17046257";
+const articlePageSize = 50;
+
 export type ScrapeOptions = {
   client: NaverClient;
   boards?: string[];
@@ -39,70 +42,115 @@ type ArticleRef = {
   title?: string;
 };
 
-type BoardWritePlan = {
-  board: BoardConfig;
+type ArticleCollection = {
+  refs: ArticleRef[];
+  skipped: number;
+};
+
+type OutputState = {
   outputPath: string;
   rows: CorpusJsonRow[];
+  existingIds: Set<string>;
   newRows: CorpusJsonRow[];
-  skipped: number;
+};
+
+type BoardListResponse = {
+  result?: {
+    articleList?: Array<{
+      type?: string;
+      item?: {
+        articleId?: number;
+        menuId?: number;
+        subject?: string;
+      };
+    }>;
+  };
+};
+
+type ArticleResponse = {
+  result?: {
+    article?: {
+      id?: number;
+      subject?: string;
+      contentHtml?: string;
+      isReadable?: boolean;
+      menu?: {
+        id?: number;
+        name?: string;
+      };
+    };
+    comments?: {
+      items?: Array<{
+        content?: string;
+        writer?: { nick?: string };
+      }>;
+    };
+  };
 };
 
 export async function scrape(options: ScrapeOptions): Promise<ScrapeSummary[]> {
   const selectedBoards = getBoards(options.boards);
-  const plans: BoardWritePlan[] = [];
+  const outputStates = new Map<string, OutputState>();
+  const summaries: ScrapeSummary[] = [];
   const dryRun = options.dryRun ?? false;
   const delayMs = options.delayMs ?? defaultDelayMs;
   const limit = dryRun && options.limit === undefined ? 3 : options.limit;
 
   for (const board of selectedBoards) {
     const outputPath = join(corpusOutputDir, board.outputFile);
-    const existingRows = await readCorpusRows(outputPath);
-    const existingIds = dryRun ? new Set<string>() : collectExistingIds(existingRows);
-    const articleRefs = await collectArticleRefs(
+    let state = outputStates.get(outputPath);
+    if (!state) {
+      const rows = await readCorpusRows(outputPath);
+      state = {
+        outputPath,
+        rows,
+        existingIds: dryRun ? new Set<string>() : collectExistingIds(rows),
+        newRows: []
+      };
+      outputStates.set(outputPath, state);
+    }
+
+    const collection = await collectArticleRefs(
       options.client,
       board,
-      existingIds,
+      state.existingIds,
       delayMs,
       limit
     );
-    const newRows: CorpusJsonRow[] = [];
+    const boardRows: CorpusJsonRow[] = [];
 
-    for (const articleRef of articleRefs) {
+    for (const articleRef of collection.refs) {
       await sleep(delayMs);
-      const html = await options.client.fetchText(articleRef.url);
-      const parsed = parsePostHtml(html, board, articleRef);
-      newRows.push(postToCorpusRow(parsed));
+      const parsed = await fetchPost(options.client, board, articleRef);
+      const row = postToCorpusRow(parsed);
+      boardRows.push(row);
+      state.newRows.push(row);
+      state.rows.push(row);
+      state.existingIds.add(parsed.id);
     }
 
-    const rows = sortRowsByPostId([...existingRows, ...newRows]);
-    plans.push({
-      board,
+    summaries.push({
+      board: board.name,
       outputPath,
-      rows,
-      newRows,
-      skipped: existingIds.size
+      fetched: boardRows.length,
+      skipped: collection.skipped,
+      totalRows: state.rows.length
     });
   }
 
   if (dryRun) {
-    for (const plan of plans) {
-      for (const row of plan.newRows) {
+    for (const state of outputStates.values()) {
+      for (const row of state.newRows) {
         console.log(serializeCorpusRow(row));
       }
     }
   } else {
-    for (const plan of plans) {
-      await writeCorpusJsonlAtomic(plan.outputPath, plan.rows);
+    for (const state of outputStates.values()) {
+      await writeCorpusJsonlAtomic(state.outputPath, sortRowsByPostId(state.rows));
     }
   }
 
-  return plans.map((plan) => ({
-    board: plan.board.name,
-    outputPath: plan.outputPath,
-    fetched: plan.newRows.length,
-    skipped: plan.skipped,
-    totalRows: plan.rows.length
-  }));
+  return summaries;
 }
 
 async function collectArticleRefs(
@@ -111,41 +159,143 @@ async function collectArticleRefs(
   existingIds: Set<string>,
   delayMs: number,
   limit?: number
-): Promise<ArticleRef[]> {
+): Promise<ArticleCollection> {
+  const list = board.list;
+  if (list.kind === "api-menu") {
+    return collectMenuArticleRefs(
+      client,
+      board,
+      list.menuId,
+      existingIds,
+      delayMs,
+      limit
+    );
+  }
+  return collectHtmlArticleRefs(
+    client,
+    board,
+    list.urlTemplate,
+    existingIds,
+    delayMs,
+    limit
+  );
+}
+
+async function collectMenuArticleRefs(
+  client: NaverClient,
+  board: BoardConfig,
+  menuId: number,
+  existingIds: Set<string>,
+  delayMs: number,
+  limit?: number
+): Promise<ArticleCollection> {
   const refs = new Map<string, ArticleRef>();
+  let skipped = 0;
 
   for (let page = 1; page <= board.maxPages; page += 1) {
     if (limit !== undefined && refs.size >= limit) {
       break;
     }
-
     if (page > 1) {
       await sleep(delayMs);
     }
 
-    const url = renderTemplate(board.listUrlTemplate, { page: String(page) });
-    const html = await client.fetchText(url);
-    const pageRefs = parseArticleListHtml(html, board);
-
-    if (pageRefs.length === 0) {
+    const url =
+      `https://apis.naver.com/cafe-web/cafe-boardlist-api/v1/cafes/${cafeId}` +
+      `/menus/${menuId}/articles?page=${page}&pageSize=${articlePageSize}` +
+      "&sortBy=TIME&viewType=L";
+    const payload = await client.fetchJson<BoardListResponse>(url);
+    const items = payload.result?.articleList ?? [];
+    if (items.length === 0) {
       break;
     }
 
-    for (const ref of pageRefs) {
-      if (!existingIds.has(ref.id) && !refs.has(ref.id)) {
-        refs.set(ref.id, ref);
+    let newOnPage = 0;
+    for (const wrapper of items) {
+      const item = wrapper.item;
+      if (
+        wrapper.type !== "ARTICLE" ||
+        !item?.articleId ||
+        item.menuId !== menuId
+      ) {
+        continue;
       }
 
+      const id = String(item.articleId);
+      if (existingIds.has(id)) {
+        skipped += 1;
+        continue;
+      }
+      if (!refs.has(id)) {
+        refs.set(id, {
+          id,
+          title: item.subject?.trim(),
+          url: canonicalArticleUrl(id)
+        });
+        newOnPage += 1;
+      }
       if (limit !== undefined && refs.size >= limit) {
         break;
       }
     }
+
+    if (newOnPage === 0) {
+      break;
+    }
   }
 
-  return [...refs.values()].sort(compareArticleRefs);
+  return { refs: [...refs.values()].sort(compareArticleRefs), skipped };
 }
 
-function parseArticleListHtml(html: string, board: BoardConfig): ArticleRef[] {
+async function collectHtmlArticleRefs(
+  client: NaverClient,
+  board: BoardConfig,
+  urlTemplate: string,
+  existingIds: Set<string>,
+  delayMs: number,
+  limit?: number
+): Promise<ArticleCollection> {
+  const refs = new Map<string, ArticleRef>();
+  let skipped = 0;
+
+  for (let page = 1; page <= board.maxPages; page += 1) {
+    if (limit !== undefined && refs.size >= limit) {
+      break;
+    }
+    if (page > 1) {
+      await sleep(delayMs);
+    }
+
+    const url = renderTemplate(urlTemplate, { page: String(page) });
+    const pageRefs = parseArticleListHtml(await client.fetchText(url));
+    if (pageRefs.length === 0) {
+      break;
+    }
+
+    let newOnPage = 0;
+    for (const ref of pageRefs) {
+      if (existingIds.has(ref.id)) {
+        skipped += 1;
+        continue;
+      }
+      if (!refs.has(ref.id)) {
+        refs.set(ref.id, ref);
+        newOnPage += 1;
+      }
+      if (limit !== undefined && refs.size >= limit) {
+        break;
+      }
+    }
+
+    if (newOnPage === 0) {
+      break;
+    }
+  }
+
+  return { refs: [...refs.values()].sort(compareArticleRefs), skipped };
+}
+
+function parseArticleListHtml(html: string): ArticleRef[] {
   const $ = load(html);
   const refs = new Map<string, ArticleRef>();
 
@@ -161,62 +311,64 @@ function parseArticleListHtml(html: string, board: BoardConfig): ArticleRef[] {
       return;
     }
 
-    const url = normalizeArticleUrl(href, board, id);
     const title = anchor.text().replace(/\s+/g, " ").trim();
-    refs.set(id, { id, url, title: title.length > 0 ? title : undefined });
+    refs.set(id, {
+      id,
+      url: canonicalArticleUrl(id),
+      title: title.length > 0 ? title : undefined
+    });
   });
 
   return [...refs.values()].sort(compareArticleRefs);
 }
 
-function parsePostHtml(html: string, board: BoardConfig, ref: ArticleRef): ParsedPost {
-  const $ = load(html);
-  $("script, style, noscript, template").remove();
+async function fetchPost(
+  client: NaverClient,
+  board: BoardConfig,
+  ref: ArticleRef
+): Promise<ParsedPost> {
+  const url =
+    `https://article.cafe.naver.com/gw/v4/cafes/${cafeId}/articles/${ref.id}` +
+    "?query=&useCafeId=true&requestFrom=A";
+  const payload = await client.fetchJson<ArticleResponse>(url);
+  const article = payload.result?.article;
 
-  const title =
-    textFromMeta($, 'meta[property="og:title"]') ??
-    firstText($, [
-      ".title_text",
-      ".ArticleTitle",
-      ".article_title",
-      "h1",
-      "h2",
-      "title"
-    ]) ??
-    ref.title ??
-    ref.id;
-
-  const contentHtml =
-    firstHtml($, [
-      ".se-main-container",
-      ".article_viewer",
-      ".ArticleContentBox",
-      ".ContentRenderer",
-      "#postContent",
-      "article"
-    ]) ??
-    $("body").html() ??
-    html;
+  if (!article || article.isReadable === false || !article.contentHtml) {
+    throw new Error(`Naver article ${ref.id} is missing or not readable`);
+  }
+  if (board.list.kind === "api-menu" && article.menu?.id !== board.list.menuId) {
+    throw new Error(
+      `Naver article ${ref.id} moved from menu ${board.list.menuId} to ${article.menu?.id ?? "unknown"}`
+    );
+  }
 
   return {
-    id: ref.id,
-    title,
-    url: ref.url,
-    board: board.name,
-    contentHtml
+    id: String(article.id ?? ref.id),
+    title: article.subject?.trim() || ref.title || ref.id,
+    url: canonicalArticleUrl(ref.id),
+    source: board.source,
+    contentHtml: article.contentHtml,
+    comments: renderComments(payload.result?.comments?.items ?? [])
   };
 }
 
-function normalizeArticleUrl(href: string, board: BoardConfig, id: string): string {
-  if (/^https?:\/\//i.test(href)) {
-    return href;
+function renderComments(
+  comments: Array<{ content?: string; writer?: { nick?: string } }>
+): string | undefined {
+  const lines: string[] = [];
+  for (const comment of comments) {
+    const content = comment.content?.replace(/\s+/g, " ").trim();
+    if (!content) {
+      continue;
+    }
+    const nick = comment.writer?.nick?.trim();
+    lines.push(nick ? `- ${nick}: ${content}` : `- ${content}`);
   }
+  return lines.length > 0 ? lines.join("\n") : undefined;
+}
 
-  if (href.startsWith("/")) {
-    return new URL(href, "https://cafe.naver.com").toString();
-  }
-
-  return renderTemplate(board.articleUrlTemplate, { id });
+function canonicalArticleUrl(id: string): string {
+  return `https://cafe.naver.com/f-e/cafes/${cafeId}/articles/${id}`;
 }
 
 function extractArticleId(value: string): string | undefined {
@@ -226,7 +378,6 @@ function extractArticleId(value: string): string | undefined {
     decoded.match(/[?&]articleid=(\d+)/i) ??
     decoded.match(/[?&]articleId=(\d+)/) ??
     decoded.match(/\/book\d+\/(\d+)/i);
-
   return match?.[1];
 }
 
@@ -237,7 +388,6 @@ function collectExistingIds(rows: CorpusJsonRow[]): Set<string> {
     if (typeof row.id === "string" && row.id.trim().length > 0) {
       ids.add(row.id.trim());
     }
-
     if (typeof row.url === "string") {
       const id = extractArticleId(row.url);
       if (id) {
@@ -253,11 +403,17 @@ function sortRowsByPostId(rows: CorpusJsonRow[]): CorpusJsonRow[] {
   return [...rows].sort((left, right) => {
     const leftId = rowNumericId(left);
     const rightId = rowNumericId(right);
-
     if (leftId !== rightId) {
       return leftId - rightId;
     }
 
+    const sourceOrder = String(left.source ?? "").localeCompare(
+      String(right.source ?? ""),
+      "ko"
+    );
+    if (sourceOrder !== 0) {
+      return sourceOrder;
+    }
     return String(left.title ?? "").localeCompare(String(right.title ?? ""), "ko");
   });
 }
@@ -269,14 +425,12 @@ function rowNumericId(row: CorpusJsonRow): number {
       return parsed;
     }
   }
-
   if (typeof row.url === "string") {
     const id = extractArticleId(row.url);
     if (id) {
       return Number.parseInt(id, 10);
     }
   }
-
   return Number.MAX_SAFE_INTEGER;
 }
 
@@ -284,49 +438,12 @@ function compareArticleRefs(left: ArticleRef, right: ArticleRef): number {
   return Number.parseInt(left.id, 10) - Number.parseInt(right.id, 10);
 }
 
-function textFromMeta(
-  $: ReturnType<typeof load>,
-  selector: string
-): string | undefined {
-  const value = $(selector).first().attr("content")?.trim();
-  return value && value.length > 0 ? value : undefined;
-}
-
-function firstText(
-  $: ReturnType<typeof load>,
-  selectors: string[]
-): string | undefined {
-  for (const selector of selectors) {
-    const text = $(selector).first().text().replace(/\s+/g, " ").trim();
-    if (text.length > 0) {
-      return text;
-    }
-  }
-
-  return undefined;
-}
-
-function firstHtml(
-  $: ReturnType<typeof load>,
-  selectors: string[]
-): string | undefined {
-  for (const selector of selectors) {
-    const element = $(selector).first();
-    const html = element.html();
-    if (html && element.text().trim().length > 0) {
-      return html;
-    }
-  }
-
-  return undefined;
-}
-
 function sleep(ms: number): Promise<void> {
   if (ms <= 0) {
     return Promise.resolve();
   }
 
-  return new Promise((resolve) => {
-    setTimeout(resolve, ms);
-  });
+  const { promise, resolve } = Promise.withResolvers<void>();
+  setTimeout(resolve, ms);
+  return promise;
 }

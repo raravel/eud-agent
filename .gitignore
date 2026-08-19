@@ -10,6 +10,9 @@ __pycache__/
 .ruff_cache/
 .pytest_cache/
 
+# Local scraper credentials; contain an active Naver login session
+/naver_cookie.txt
+
 # Node (optional epscript-lsp, panel tooling)
 node_modules/
 panel/node_modules/

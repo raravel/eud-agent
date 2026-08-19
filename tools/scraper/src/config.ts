@@ -3,10 +3,11 @@ import { fileURLToPath } from "node:url";
 
 export type BoardConfig = {
   name: string;
-  cafeId: string;
+  source: string;
   outputFile: string;
-  listUrlTemplate: string;
-  articleUrlTemplate: string;
+  list:
+    | { kind: "api-menu"; menuId: number }
+    | { kind: "html"; urlTemplate: string };
   maxPages: number;
 };
 
@@ -20,31 +21,48 @@ export const defaultDelayMs = 750;
 
 export const boards: BoardConfig[] = [
   {
-    name: "articles",
-    cafeId,
+    name: "lua",
+    source: "board_Lua자료실.jsonl",
     outputFile: "articles.jsonl",
-    listUrlTemplate:
-      "https://cafe.naver.com/ArticleList.nhn?search.clubid=17046257&search.boardtype=L&search.page={page}",
-    articleUrlTemplate:
-      "https://cafe.naver.com/f-e/cafes/17046257/articles/{id}",
+    list: { kind: "api-menu", menuId: 229 },
+    maxPages: 20
+  },
+  {
+    name: "lectures",
+    source: "board_강좌팁.jsonl",
+    outputFile: "articles.jsonl",
+    list: { kind: "api-menu", menuId: 15 },
+    maxPages: 20
+  },
+  {
+    name: "research",
+    source: "board_연구칼럼.jsonl",
+    outputFile: "articles.jsonl",
+    list: { kind: "api-menu", menuId: 33 },
+    maxPages: 20
+  },
+  {
+    name: "utilities",
+    source: "board_유틸리티툴.jsonl",
+    outputFile: "articles.jsonl",
+    list: { kind: "api-menu", menuId: 20 },
+    maxPages: 20
+  },
+  {
+    name: "qna",
+    source: "board_질문답변.jsonl",
+    outputFile: "articles.jsonl",
+    list: { kind: "api-menu", menuId: 12 },
     maxPages: 20
   },
   {
     name: "cafebook",
-    cafeId,
+    source: "cafebook.jsonl",
     outputFile: "cafebook.jsonl",
-    listUrlTemplate: "https://cafe.naver.com/edac/book5103106?page={page}",
-    articleUrlTemplate: "https://cafe.naver.com/edac/book5103106/{id}",
-    maxPages: 20
-  },
-  {
-    name: "eud_book",
-    cafeId,
-    outputFile: "eud_book.jsonl",
-    listUrlTemplate:
-      "https://cafe.naver.com/ArticleList.nhn?search.clubid=17046257&search.query=eud%20book&search.page={page}",
-    articleUrlTemplate:
-      "https://cafe.naver.com/f-e/cafes/17046257/articles/{id}",
+    list: {
+      kind: "html",
+      urlTemplate: "https://cafe.naver.com/edac/book5103106?page={page}"
+    },
     maxPages: 20
   }
 ];
@@ -54,9 +72,16 @@ export function getBoards(names?: string[]): BoardConfig[] {
     return boards;
   }
 
-  const requested = new Set(names);
+  const expandedNames = names.flatMap((name) =>
+    name === "articles"
+      ? boards.filter((board) => board.outputFile === "articles.jsonl").map((board) => board.name)
+      : [name]
+  );
+  const requested = new Set(expandedNames);
   const selected = boards.filter((board) => requested.has(board.name));
-  const missing = names.filter((name) => !boards.some((board) => board.name === name));
+  const missing = names.filter(
+    (name) => name !== "articles" && !boards.some((board) => board.name === name)
+  );
 
   if (missing.length > 0) {
     throw new Error(

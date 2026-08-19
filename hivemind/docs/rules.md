@@ -11,8 +11,9 @@ in-editor WebView2 hosting and Python server.
   = file copies only: `bridge/*.lua` into `Data\Lua\TriggerEditor\`; runtime state under
   `Data\agent\`.
 - **The RAG corpus lives in-repo at `ci/corpus/*.jsonl`** (committed, plain git — NOT LFS),
-  produced locally by the Node/TS Naver-Cafe scraper (`tools/scraper`, cookie-gated, never in CI).
-  The legacy `chromadb_bge` sqlite (v1, formerly in the ECA repo) is unused and NEVER imported —
+  produced locally by `tools/scraper` from authenticated Naver data and commit-pinned public
+  repositories; corpus refresh never runs in CI and secrets are never committed. The legacy
+  `chromadb_bge` sqlite (v1, formerly in the ECA repo) is unused and NEVER imported —
   chromadb mutates tracked sqlite on open (proven LFS churn); that caveat is chromadb-specific. The
   distributed RAG index (`rag-index.bin`) is a static read-only CI artifact published to a GitHub
   Release, NOT committed. See [[decisions/15_in-house-rag-corpus]].

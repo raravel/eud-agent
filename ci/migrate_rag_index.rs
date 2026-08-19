@@ -36,7 +36,15 @@ const V2_VERSION: u32 = 2;
 // come from the v1 entry, not re-derived here.
 // ---------------------------------------------------------------------------
 
-const INPUT_FILES: [&str; 3] = ["articles.jsonl", "eud_book.jsonl", "cafebook.jsonl"];
+const INPUT_FILES: [&str; 7] = [
+    "articles.jsonl",
+    "eud_book.jsonl",
+    "cafebook.jsonl",
+    "scrmapdocs_en.jsonl",
+    "eudplib_api.jsonl",
+    "eudplib_examples.jsonl",
+    "eud_editor_schema.jsonl",
+];
 const CHUNK_CHARS: usize = 2000;
 const CHUNK_OVERLAP: usize = 200;
 
@@ -88,7 +96,8 @@ fn chunk_text(text: String) -> Vec<String> {
 fn tier_level_for_source(source: &str) -> u8 {
     let stem = source.strip_suffix(".jsonl").unwrap_or(source);
     match stem {
-        "eud_book" | "cafebook" => 3,
+        "eud_book" | "cafebook" | "scrmapdocs_en" | "eudplib_api" | "eudplib_examples"
+        | "eud_editor_schema" => 3,
         "board_강좌팁" | "board_연구칼럼" => 2,
         "board_유틸리티툴" | "board_Lua자료실" => 1,
         "board_질문답변" => 0,
