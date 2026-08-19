@@ -17,6 +17,7 @@
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -75,6 +76,7 @@ impl Default for SessionIndex {
 #[derive(Debug, Clone)]
 pub struct SessionStore {
     sessions_dir: PathBuf,
+    write_lock: Arc<Mutex<()>>,
 }
 
 impl SessionStore {
@@ -82,26 +84,21 @@ impl SessionStore {
     pub fn new(dirs: &DataDirs) -> Self {
         Self {
             sessions_dir: dirs.sessions_dir(),
+            write_lock: Arc::new(Mutex::new(())),
         }
     }
 
     /// The session list, most-recently-updated first. A missing or corrupt
     /// `index.json` yields `[]` (never crash startup).
     pub fn list(&self) -> anyhow::Result<Vec<SessionMeta>> {
+        let _guard = self.lock()?;
         Ok(self.read_index().sessions)
     }
 
     /// Load one full record by id. A corrupt/missing record is a graceful `Err`.
     pub fn load(&self, id: &str) -> anyhow::Result<SessionRecord> {
-        let path = self.record_path(id);
-        let bytes = std::fs::read(&path)
-            .map_err(|err| anyhow::anyhow!("session '{id}' not found: {err}"))?;
-        // `File.ReadAllText` strips a BOM; serde_json does not. Strip a UTF-8 BOM
-        // defensively so a hand-edited file still parses.
-        let bytes = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(&bytes);
-        let record: SessionRecord = serde_json::from_slice(bytes)
-            .map_err(|err| anyhow::anyhow!("session '{id}' is corrupt: {err}"))?;
-        Ok(record)
+        let _guard = self.lock()?;
+        self.load_unlocked(id)
     }
 
     /// Write the `<id>.json` record and rewrite `index.json` (most-recently-updated
@@ -109,18 +106,17 @@ impl SessionStore {
     ///
     /// Each write is individually atomic but the pair is not transactional: if the
     /// index rewrite fails after the record write succeeds, the record exists but is
-    /// not listed (an invisible orphan). This is an accepted, rare partial-failure
-    /// window — the engine Mutex serializes callers (no concurrent-write race) and
-    /// the next successful `save` of the same id rewrites both files, self-healing.
+    /// not listed (an invisible orphan). The shared store lock serializes the engine
+    /// and panel-side session commands; the next successful save self-heals the index.
     pub fn save(&self, rec: &SessionRecord) -> anyhow::Result<()> {
-        let bytes = serde_json::to_vec_pretty(rec)?;
-        write_atomic_bytes(&self.record_path(&rec.meta.id), &bytes)?;
-        self.upsert_index(rec.meta.clone())
+        let _guard = self.lock()?;
+        self.save_unlocked(rec)
     }
 
     /// Delete the record file and remove it from the index. A missing record file is
     /// tolerated (the index entry is still dropped).
     pub fn delete(&self, id: &str) -> anyhow::Result<()> {
+        let _guard = self.lock()?;
         let path = self.record_path(id);
         match std::fs::remove_file(&path) {
             Ok(()) => {}
@@ -134,10 +130,45 @@ impl SessionStore {
 
     /// Rename a session: update the record's `name` + `updatedAt` and the index.
     pub fn rename(&self, id: &str, name: &str) -> anyhow::Result<()> {
-        let mut record = self.load(id)?;
+        let _guard = self.lock()?;
+        let mut record = self.load_unlocked(id)?;
         record.meta.name = name.to_string();
         record.meta.updated_at = now_unix_seconds();
-        self.save(&record)
+        self.save_unlocked(&record)
+    }
+
+    /// Replace one session's opaque panel log without making it the executing
+    /// session. Multi-session tabs autosave independently while another turn runs.
+    pub fn update_panel_log(&self, id: &str, panel_log: serde_json::Value) -> anyhow::Result<()> {
+        let _guard = self.lock()?;
+        let mut record = self.load_unlocked(id)?;
+        record.panel_log = panel_log;
+        record.meta.updated_at = now_unix_seconds();
+        self.save_unlocked(&record)
+    }
+
+    fn lock(&self) -> anyhow::Result<MutexGuard<'_, ()>> {
+        self.write_lock
+            .lock()
+            .map_err(|_| anyhow::anyhow!("session store lock poisoned"))
+    }
+
+    fn load_unlocked(&self, id: &str) -> anyhow::Result<SessionRecord> {
+        let path = self.record_path(id);
+        let bytes = std::fs::read(&path)
+            .map_err(|err| anyhow::anyhow!("session '{id}' not found: {err}"))?;
+        // `File.ReadAllText` strips a BOM; serde_json does not. Strip a UTF-8 BOM
+        // defensively so a hand-edited file still parses.
+        let bytes = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(&bytes);
+        let record: SessionRecord = serde_json::from_slice(bytes)
+            .map_err(|err| anyhow::anyhow!("session '{id}' is corrupt: {err}"))?;
+        Ok(record)
+    }
+
+    fn save_unlocked(&self, rec: &SessionRecord) -> anyhow::Result<()> {
+        let bytes = serde_json::to_vec_pretty(rec)?;
+        write_atomic_bytes(&self.record_path(&rec.meta.id), &bytes)?;
+        self.upsert_index(rec.meta.clone())
     }
 
     /// Read `index.json`, yielding [`SessionIndex::default`] on any missing/corrupt

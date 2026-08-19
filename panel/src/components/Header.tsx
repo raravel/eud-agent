@@ -5,7 +5,7 @@
  * (`rag_warmup` started → done, elapsed formatted via lib/progress). Korean
  * labels throughout.
  */
-import { BookText, Database, History, MonitorPlay } from "lucide-react";
+import { BookText, Database, FolderTree, MonitorPlay } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import {
@@ -46,14 +46,14 @@ export interface HeaderProps {
   onMemoryOpen?: () => void;
   /** Whether the project-memory overlay is currently visible. */
   memoryOpen?: boolean;
+  /** Open the real per-project Codex filesystem workspace. */
+  onWorkspaceOpen?: () => void;
+  /** Whether the Workspace explorer is visible. */
+  workspaceOpen?: boolean;
   /** Open the dat-edit wiki overlay. */
   onWikiOpen?: () => void;
   /** Whether the dat-edit wiki overlay is currently visible. */
   wikiOpen?: boolean;
-  /** Open the saved-sessions (대화 목록) overlay. */
-  onSessionsOpen?: () => void;
-  /** Whether the saved-sessions overlay is currently visible. */
-  sessionsOpen?: boolean;
 }
 
 /** One status pill descriptor: label + tone classes + whether it is in flight. */
@@ -153,10 +153,10 @@ export function Header({
   onLaunchEditor,
   onMemoryOpen,
   memoryOpen = false,
+  onWorkspaceOpen,
+  workspaceOpen = false,
   onWikiOpen,
   wikiOpen = false,
-  onSessionsOpen,
-  sessionsOpen = false,
 }: HeaderProps) {
   const conn = connState(connected, phase, editorConnected, hasProject);
   const ragInfo = ragPill(rag);
@@ -205,21 +205,21 @@ export function Header({
         )}
         {ragInfo && <StatusPill pill={ragInfo} />}
         <StatusPill pill={conn} />
-        {onSessionsOpen && (
+        {onWorkspaceOpen && (
           <Tooltip>
             <TooltipTrigger asChild>
               <Button
                 type="button"
                 size="icon"
                 variant="ghost"
-                aria-label="대화 목록"
-                aria-pressed={sessionsOpen}
-                onClick={onSessionsOpen}
+                aria-label="프로젝트 워크스페이스"
+                aria-pressed={workspaceOpen}
+                onClick={onWorkspaceOpen}
               >
-                <History className="size-4" aria-hidden="true" />
+                <FolderTree className="size-4" aria-hidden="true" />
               </Button>
             </TooltipTrigger>
-            <TooltipContent>대화 목록</TooltipContent>
+            <TooltipContent>프로젝트 워크스페이스</TooltipContent>
           </Tooltip>
         )}
         {onWikiOpen && (

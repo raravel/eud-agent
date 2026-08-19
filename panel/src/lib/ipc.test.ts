@@ -3,6 +3,8 @@ import {
   IpcClient,
   codexModelSettingsGet,
   codexModelSettingsSave,
+  workspaceList,
+  workspaceRead,
 } from "@/lib/ipc";
 import type { ClientMessage, ServerMessage } from "@/lib/ipc";
 
@@ -53,11 +55,20 @@ describe("send", () => {
       listen,
       onMessage: () => {},
     });
-    const msg: ClientMessage = { type: "chat", text: "hello" };
+    const msg: ClientMessage = {
+      type: "chat",
+      sessionId: "session-a",
+      text: "hello",
+      attachments: ["image-1"],
+    };
 
     await client.send(msg);
 
-    expect(invoke).toHaveBeenCalledWith("chat", { text: "hello" });
+    expect(invoke).toHaveBeenCalledWith("chat", {
+      sessionId: "session-a",
+      text: "hello",
+      attachments: ["image-1"],
+    });
   });
 
   it("sends changeset_decision via invoke", async () => {
@@ -70,6 +81,7 @@ describe("send", () => {
     });
     const msg: ClientMessage = {
       type: "changeset_decision",
+      sessionId: "session-a",
       decision: "reject",
       ids: ["a", "b"],
     };
@@ -77,8 +89,35 @@ describe("send", () => {
     await client.send(msg);
 
     expect(invoke).toHaveBeenCalledWith("changeset_decision", {
+      sessionId: "session-a",
       decision: "reject",
       ids: ["a", "b"],
+    });
+  });
+
+  it("sends conversation_rewind with the durable log prefix", async () => {
+    const { invoke, listen } = makeHarness();
+    invoke.mockResolvedValue(undefined);
+    const client = new IpcClient({
+      invoke,
+      listen,
+      onMessage: () => {},
+    });
+    const panelLog = {
+      schemaVersion: 2,
+      logSeq: 1,
+      log: [{ id: 1, kind: "you", text: "첫 요청" }],
+    };
+
+    await client.send({
+      type: "conversation_rewind",
+      sessionId: "session-a",
+      panelLog,
+    });
+
+    expect(invoke).toHaveBeenCalledWith("conversation_rewind", {
+      sessionId: "session-a",
+      panelLog,
     });
   });
 });
@@ -100,11 +139,12 @@ describe("inbound events", () => {
 
     await client.connect();
     listeners.get("agent_event")?.({
-      payload: { kind: "reasoning", detail: "checking" },
+      payload: { sessionId: "session-a", kind: "reasoning", detail: "checking" },
     });
 
     expect(received).toContainEqual({
       type: "agent_event",
+      sessionId: "session-a",
       kind: "reasoning",
       detail: "checking",
     });
@@ -457,6 +497,47 @@ describe("Codex model settings commands", () => {
 
     await expect(codexModelSettingsGet(invoke)).rejects.toThrow(
       "invalid codex model settings response",
+    );
+  });
+});
+
+describe("Workspace commands", () => {
+  const workspace = {
+    project: "Example",
+    workspaceId: "a".repeat(64),
+    files: [{ path: "specs/game.md", source: false, size: 12 }],
+  };
+
+  it("lists the current project workspace", async () => {
+    const invoke = vi.fn().mockResolvedValue(workspace);
+    await expect(workspaceList(invoke)).resolves.toEqual(workspace);
+    expect(invoke).toHaveBeenCalledWith("workspace_list");
+  });
+
+  it("reads a confined workspace file by id and relative path", async () => {
+    const response = {
+      workspaceId: workspace.workspaceId,
+      path: "specs/game.md",
+      source: false,
+      content: "# Game",
+    };
+    const invoke = vi.fn().mockResolvedValue(response);
+    await expect(
+      workspaceRead(workspace.workspaceId, "specs/game.md", invoke),
+    ).resolves.toEqual(response);
+    expect(invoke).toHaveBeenCalledWith("workspace_read", {
+      workspaceId: workspace.workspaceId,
+      path: "specs/game.md",
+    });
+  });
+
+  it("rejects malformed file entries", async () => {
+    const invoke = vi.fn().mockResolvedValue({
+      ...workspace,
+      files: [{ path: "source/main.eps", source: "yes", size: 1 }],
+    });
+    await expect(workspaceList(invoke)).rejects.toThrow(
+      "invalid workspace file entry",
     );
   });
 });

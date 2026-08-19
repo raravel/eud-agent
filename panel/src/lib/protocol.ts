@@ -31,6 +31,7 @@ export const PROGRESS_STAGES = [
   "rag",
   "rag_warmup",
   "codex",
+  "workspace",
   "lsp",
   "waiting_build",
 ] as const;
@@ -50,6 +51,32 @@ export interface FileEntry {
   ftype: string;
   /** Whether SET is allowed (CUI/RawText true; GUI false). Display only in v2. */
   settable: boolean;
+}
+
+/** One file in the real per-project Codex workspace. */
+export interface WorkspaceFileEntry {
+  path: string;
+  /** True for the generated, read-only `source/` EPS mirror. */
+  source: boolean;
+  size: number;
+  /** Parent-owned authoritative acceptance state; absent for unreviewed/source files. */
+  state?: string;
+  revision?: number;
+}
+
+/** `workspace_list` command output. */
+export interface WorkspaceListResponse {
+  project: string;
+  workspaceId: string;
+  files: WorkspaceFileEntry[];
+}
+
+/** `workspace_read` command output. */
+export interface WorkspaceReadResponse {
+  workspaceId: string;
+  path: string;
+  source: boolean;
+  content: string;
 }
 
 /**
@@ -122,7 +149,12 @@ export interface Episode {
  * `kind` is an OPEN string (the core may emit other kinds) - the panel routes
  * the known ones and swallows the rest.
  */
-export interface AgentEventMessage {
+interface SessionScopedMessage {
+  /** Present for conversation events; absent for global bootstrap/project events. */
+  sessionId?: string;
+}
+
+export interface AgentEventMessage extends SessionScopedMessage {
   type: "agent_event";
   kind: string;
   detail: string;
@@ -135,34 +167,34 @@ export interface AgentEventMessage {
 }
 
 /** `answer {text}` - answer-only turn (no edits). */
-export interface AnswerMessage {
+export interface AnswerMessage extends SessionScopedMessage {
   type: "answer";
   text: string;
 }
 
 /** `plan {markdown, revision}` - propose_plan ended the turn; revision replaces. */
-export interface PlanMessage {
+export interface PlanMessage extends SessionScopedMessage {
   type: "plan";
   markdown: string;
   revision: number;
 }
 
 /** `changeset {request_id, items}` - journaled writes awaiting accept/reject. */
-export interface ChangesetMessage {
+export interface ChangesetMessage extends SessionScopedMessage {
   type: "changeset";
   request_id: string;
   items: ChangesetItem[];
 }
 
 /** `rollback_result {ids, ok}` - outcome of a changeset_decision. */
-export interface RollbackResultMessage {
+export interface RollbackResultMessage extends SessionScopedMessage {
   type: "rollback_result";
   ids: string[];
   ok: boolean;
 }
 
 /** `progress {stage, detail?, pct?}` - render as a conversation entry. */
-export interface ProgressMessage {
+export interface ProgressMessage extends SessionScopedMessage {
   type: "progress";
   stage: ProgressStage;
   detail?: string;
@@ -175,7 +207,7 @@ export interface ProgressMessage {
 }
 
 /** `error {message}` - flow returns to ready. */
-export interface ErrorMessage {
+export interface ErrorMessage extends SessionScopedMessage {
   type: "error";
   message: string;
 }
@@ -334,7 +366,7 @@ export interface PanelLogTool {
 export interface SessionRecord extends SessionMeta {
   threadId: string | null;
   pendingRequestIds: string[];
-  panelLog: PanelLog;
+  panelLog: PanelLog | null;
 }
 
 /** Discriminated union of every documented core -> panel message. */
@@ -372,46 +404,48 @@ export const SERVER_MESSAGE_TYPES = [
 export type ServerMessageType = (typeof SERVER_MESSAGE_TYPES)[number];
 
 // ---- panel -> core messages -------------------------------------------
-/** `chat {text}` - start a turn (the agent picks files/targets itself). */
-export interface ChatMessage {
+/** Session-scoped command base. Every conversation mutation names its owner. */
+interface SessionCommand {
+  sessionId: string;
+}
+
+/** `chat {sessionId, text, attachments}` - queue/start one session turn. */
+export interface ChatMessage extends SessionCommand {
   type: "chat";
   text: string;
+  attachments: string[];
 }
 
-/** `plan_feedback {text}` - iterate the plan; resumes the codex thread. */
-export interface PlanFeedbackMessage {
+/** `plan_feedback` iterates the plan owned by one active session. */
+export interface PlanFeedbackMessage extends SessionCommand {
   type: "plan_feedback";
   text: string;
+  attachments: string[];
 }
 
-/** `plan_approve {}` - approve the plan; lifts the mutation gate + resumes. */
-export interface PlanApproveMessage {
+/** `plan_approve` resumes the plan owned by one active session. */
+export interface PlanApproveMessage extends SessionCommand {
   type: "plan_approve";
 }
 
-/**
- * `changeset_decision {decision, ids}` - accept/reject changeset items. `ids`
- * is the literal "all" (bulk) or a list of item ids.
- */
-export interface ChangesetDecisionMessage {
+/** Accept or reject changeset items belonging to one session. */
+export interface ChangesetDecisionMessage extends SessionCommand {
   type: "changeset_decision";
   decision: "accept" | "reject";
   ids: "all" | string[];
 }
 
-/** `cancel {}` - interrupt the in-flight turn (journal entries persist). */
-export interface CancelMessage {
+/** Interrupt the in-flight turn for one session. */
+export interface CancelMessage extends SessionCommand {
   type: "cancel";
 }
 
-/**
- * `reset {}` - new conversation. The core drops the retained codex
- * thread so the next `chat` starts a fresh conversation (features/05 EUD-064);
- * the panel clears its log / plan / changeset / per-turn buffers.
- */
-export interface ResetMessage {
-  type: "reset";
+/** Replace one session's model-visible history with a panel-log prefix. */
+export interface ConversationRewindMessage extends SessionCommand {
+  type: "conversation_rewind";
+  panelLog: PanelLog;
 }
+
 
 /** `status {}` - request editor state. */
 export interface StatusRequest {
@@ -463,7 +497,7 @@ export type ClientMessage =
   | PlanApproveMessage
   | ChangesetDecisionMessage
   | CancelMessage
-  | ResetMessage
+  | ConversationRewindMessage
   | StatusRequest
   | ListRequest
   | MemoryGetMessage
@@ -479,7 +513,7 @@ export const CLIENT_MESSAGE_TYPES = [
   "plan_approve",
   "changeset_decision",
   "cancel",
-  "reset",
+  "conversation_rewind",
   "status",
   "list",
   "memory_get",

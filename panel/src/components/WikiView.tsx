@@ -43,6 +43,8 @@ export interface WikiViewProps {
   /** The current dat-edit ledger snapshot. */
   wiki: WikiState;
   onClose(): void;
+  /** Fill a parent-owned project sidebar instead of owning left-side width. */
+  embedded?: boolean;
   /** Persist the full (patched) entries map; the core flips editedByUser=true. */
   onSave(entries: Record<string, LedgerEntry>): void;
 }
@@ -224,7 +226,7 @@ function PropertyRow({
   );
 }
 
-export function WikiView({ wiki, onClose, onSave }: WikiViewProps) {
+export function WikiView({ wiki, onClose, onSave, embedded = false }: WikiViewProps) {
   const groups = useMemo(() => buildGroups(wiki.entries), [wiki.entries]);
 
   // Drilldown selection. depth derives from what is still resolvable, so a
@@ -300,8 +302,11 @@ export function WikiView({ wiki, onClose, onSave }: WikiViewProps) {
         if (depth > 0) back();
         else onClose();
       }}
-      style={{ width }}
-      className="relative flex h-full shrink-0 flex-col border-r border-border bg-card/40"
+      style={embedded ? undefined : { width }}
+      className={cn(
+        "relative flex h-full min-w-0 flex-col bg-card/40",
+        embedded ? "w-full flex-1" : "shrink-0 border-r border-border",
+      )}
     >
       {/* Drilldown nav bar: back (or wiki glyph) + current title + close. */}
       <div className="flex items-center gap-1 border-b border-border px-2 py-2">
@@ -419,32 +424,33 @@ export function WikiView({ wiki, onClose, onSave }: WikiViewProps) {
         </div>
       </div>
 
-      {/* Drag-to-resize handle straddling the right edge. */}
-      <div
-        role="separator"
-        aria-orientation="vertical"
-        aria-label="사이드바 너비 조절"
-        onPointerDown={(event) => {
-          dragRef.current = { startX: event.clientX, startW: width };
-          event.currentTarget.setPointerCapture(event.pointerId);
-          event.preventDefault();
-        }}
-        onPointerMove={(event) => {
-          const drag = dragRef.current;
-          if (!drag) return;
-          const next = Math.min(
-            MAX_WIDTH,
-            Math.max(MIN_WIDTH, drag.startW + (event.clientX - drag.startX)),
-          );
-          setWidth(next);
-        }}
-        onPointerUp={(event) => {
-          if (!dragRef.current) return;
-          dragRef.current = null;
-          event.currentTarget.releasePointerCapture(event.pointerId);
-        }}
-        className="absolute inset-y-0 right-0 z-10 w-1.5 translate-x-1/2 cursor-col-resize transition-colors hover:bg-primary/40 active:bg-primary/60"
-      />
+      {!embedded && (
+        <div
+          role="separator"
+          aria-orientation="vertical"
+          aria-label="사이드바 너비 조절"
+          onPointerDown={(event) => {
+            dragRef.current = { startX: event.clientX, startW: width };
+            event.currentTarget.setPointerCapture(event.pointerId);
+            event.preventDefault();
+          }}
+          onPointerMove={(event) => {
+            const drag = dragRef.current;
+            if (!drag) return;
+            const next = Math.min(
+              MAX_WIDTH,
+              Math.max(MIN_WIDTH, drag.startW + (event.clientX - drag.startX)),
+            );
+            setWidth(next);
+          }}
+          onPointerUp={(event) => {
+            if (!dragRef.current) return;
+            dragRef.current = null;
+            event.currentTarget.releasePointerCapture(event.pointerId);
+          }}
+          className="absolute inset-y-0 right-0 z-10 w-1.5 translate-x-1/2 cursor-col-resize transition-colors hover:bg-primary/40 active:bg-primary/60"
+        />
+      )}
     </aside>
   );
 }

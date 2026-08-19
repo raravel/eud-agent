@@ -1,36 +1,39 @@
-# Feature: Session restore
+# Feature: Multi-active sessions
 
-External AI conversations in eud-agent currently live only in (a) the codex in-process
-thread and (b) the panel's in-memory `log`. Closing the app loses everything. This feature
-persists conversations as **named sessions** that survive a full app restart: opening a
-saved session re-renders its conversation, **resumes the codex thread** (so the model keeps
-prior context), and reconnects any un-applied changeset so the user can keep deciding.
+eud-agent persists named Codex conversations and keeps multiple conversations active in the
+panel at once. Every session owns an independent panel store, conversation log, Codex
+`threadId`, turn/review state, and autosave stream. The current editor project owns one
+execution lane: sessions may be viewed and queued concurrently, but Codex turns and changeset
+decisions run serially so rollback can never overwrite a later session's edit.
 
-This file is the shared contract. The Rust backend and the React panel are built to it
-independently; do not drift from the command names, JSON shapes, or event names below.
+This file is the shared Rust/panel contract. Do not drift from the command names, JSON shapes,
+project-lane rules, or event routing below.
 
 ## Confirmed decisions
 
-- **A. Rust owns all session files.** The panel never touches the filesystem; it pushes its
-  serialized log through `session_update_log` and Rust writes the whole record. (Matches the
-  `panel ↔ core is Tauri IPC only` rule.)
-- **B. Auto-save (no save button).** A conversation IS a session, persisted continuously —
-  exactly like codex's rollout or a ChatGPT chat. The core auto-creates the active session on
-  the conversation's FIRST turn (auto-named from the first user message; rename later from the
-  list), and every completed `chat` turn auto-updates the record (thread_id, pending req-ids).
-  The panel pushes its serialized log after each change via `session_update_log`. `새 대화`
-  (reset) detaches the active session so the next turn starts a fresh one. There is no
-  "save" action and no name prompt.
-- **C. Single live changeset invariant.** At most ONE pending (un-archived) changeset is
-  reconnected per session — the latest. Matches the existing EUD-070 single-live-changeset
-  behavior; do NOT replace `current_request_id: Option` with a registry.
-- **D. Location: `%appdata%\eud-agent\sessions\`** (Roaming — small, user-owned, must survive
-  self-update; the updater preserves `%appdata%`).
-- **E. Resume-first, replay-fallback.** Primary path seeds the saved `thread_id` so codex
-  issues `thread/resume`. If resume fails OR does not complete within a timeout, fall back to
-  a fresh `thread/start` and inject a condensed transcript into the first turn's prompt via
-  the existing `resume_turn_text` prepend mechanism. The fallback is defensive-by-construction
-  (timeout + error catch) so it is safe regardless of how codex signals a missing rollout.
+- **A. Rust owns durable session files.** The panel creates local unsaved draft tabs, but a draft
+  becomes a Rust-minted persisted session before its first queued turn. The panel never writes
+  session files directly.
+- **B. Multiple active panel sessions.** Selecting a left-sidebar row only changes the visible
+  conversation. It MUST NOT reset the executing Codex thread, archive a changeset, or steal the
+  project lane. Each row retains its own log, streaming buffers, plan, changeset, and status.
+- **C. One execution lane per editor project.** Initial chats queue FIFO. The lane remains owned
+  through `plan_review` and `changeset_review`; another session starts only after the owner
+  reaches `ready` or is cancelled. A new chat MUST NOT default-accept a pending changeset.
+- **D. One live changeset per session.** `pendingRequestIds` reconnects at most the latest
+  unarchived request for that session. A reopened pending review acquires the project lane before
+  any queued turn.
+- **E. Session-scoped IPC.** Every conversation mutation includes `sessionId`. Turn events carry
+  optional `sessionId`; global status, memory, wiki, setup, and bootstrap events remain
+  project/app scoped.
+- **F. Current-project sidebar.** The left sidebar lists only sessions whose `project` matches
+  the editor's current project. Other-project sessions stay durable but are not executable or
+  shown in that project.
+- **G. Location.** Durable records remain under `%appdata%\eud-agent\sessions\`; attachment bytes
+  remain under `%localappdata%\eud-agent\attachments\objects\`.
+- **H. Resume-first, replay-fallback.** Activation seeds the saved `threadId` for
+  `thread/resume`. A seed/resume error or timeout starts a fresh thread with a condensed
+  transcript and the full first-turn guardrails.
 
 ## On-disk layout
 
@@ -102,96 +105,75 @@ it re-arrives from the core on reconnect.
 
 ## Tauri IPC commands
 
-All registered in `lib.rs` `generate_handler!`. Engine-command shape:
-`#[tauri::command(rename = "...")] async fn session_*(state: State<'_, ManagedAgentEngine>, ...)
--> Result<T, String>` delegating to an `AgentEngine` method, `.map_err(|e| e.message)`.
+All commands are registered in `lib.rs` `generate_handler!`.
 
-| rename (panel `invoke` name) | args | returns | notes |
+| panel `invoke` name | args | returns | notes |
 |---|---|---|---|
-| `session_list` | — | `Vec<SessionMeta>` | most-recently-updated first |
-| `session_update_log` | `{ panelLog: Value }` | `()` | the panel pushes its serialized log after each turn; updates the active record's `panelLog` (no-op if no active session) |
-| `session_open` | `{ id: String }` | `SessionRecord` | resets live thread, seeds saved thread_id, reconnects ≤1 pending changeset, sets active session; panel hydrates from the returned `panelLog` |
-| `session_rename` | `{ id: String, name: String }` | `()` | |
-| `session_delete` | `{ id: String }` | `()` | also removes from index; if it is the active session, detach (`current_session_id=None`) |
+| `session_list` | — | `Vec<SessionMeta>` | all durable rows, most-recently-updated first; panel filters current project |
+| `session_load` | `{ id }` | `SessionRecord` | read-only; selecting a row uses this and never activates Codex |
+| `session_create` | `{ firstText }` | `SessionRecord` | Rust id + first-message-derived name; called when a draft reaches the queue head |
+| `session_update_log` | `{ id, panelLog }` | `()` | autosaves any active/inactive row without changing the execution owner |
+| `session_open` | `{ id }` | `SessionRecord` | internal lane activation/resume; reconnects ≤1 pending changeset |
+| `session_rename` | `{ id, name }` | `()` | updates record + index |
+| `session_delete` | `{ id }` | `()` | removes record, index row, and bound attachment objects |
+| `chat` | `{ sessionId, text, attachments }` | `()` | activates/resumes that session only when it owns the queue head |
+| `plan_feedback`, `plan_approve`, `changeset_decision`, `conversation_rewind`, `cancel` | each includes `sessionId` | `()` | rejected when the id does not own the current execution lane |
 
-The core auto-creates the active session inside `chat()` on the first turn (there is no
-`session_save` command). Two panel events: `session_loaded` (signal after a reconnect on
-open) and `session_active` (`{ id, name }` — emitted on auto-create and on open so the panel
-highlights the current row).
+`session_active {id,name}` establishes the backend event-routing owner; it does not select the
+sidebar row. `session_loaded {id}` signals that activation/reconnect completed. `agent_event`,
+`answer`, `plan`, `changeset`, `rollback_result`, turn `progress`, and turn `error` are flattened
+with `sessionId`. Global project/app events omit it.
 
 `SessionMeta` = `{ id, name, project, createdAt, updatedAt }`.
-`SessionRecord` = `SessionMeta` (flattened) + `{ threadId, pendingRequestIds, panelLog }`.
-Field names in the JSON crossing IPC are **camelCase** (`#[serde(rename_all = "camelCase")]`)
-to match panel expectations.
+`SessionRecord` = `SessionMeta` + `{ threadId, pendingRequestIds, panelLog }`.
+All crossing fields are camelCase.
 
-## Rust module: `src-tauri/src/session.rs` (new)
+Attachment bytes are never embedded in roaming JSON. Draft attachment cleanup and
+session-delete ownership rules are unchanged.
+
+## Rust module: `src-tauri/src/session.rs`
+
+`SessionStore` owns the directory plus a clone-shared process mutex. Record + index writes remain
+individually atomic; the mutex serializes engine completion, sidebar rename/delete, and inactive
+session autosave read-modify-write operations.
 
 ```rust
-pub struct SessionStore { sessions_dir: PathBuf }
-
-#[derive(Serialize, Deserialize, Clone)]
-#[serde(rename_all = "camelCase")]
-pub struct SessionMeta { pub id, name, project: String; pub created_at, updated_at: u64 }
-
-#[derive(Serialize, Deserialize, Clone)]
-#[serde(rename_all = "camelCase")]
-pub struct SessionRecord {
-    #[serde(flatten)] pub meta: SessionMeta,
-    pub thread_id: Option<String>,
-    pub pending_request_ids: Vec<String>,
-    pub panel_log: serde_json::Value,
+pub struct SessionStore {
+    sessions_dir: PathBuf,
+    write_lock: Arc<Mutex<()>>,
 }
 
 impl SessionStore {
-    pub fn new(dirs: &DataDirs) -> Self;
-    pub fn list(&self) -> anyhow::Result<Vec<SessionMeta>>;          // read index.json (empty → [])
+    pub fn list(&self) -> anyhow::Result<Vec<SessionMeta>>;
     pub fn load(&self, id: &str) -> anyhow::Result<SessionRecord>;
-    pub fn save(&self, rec: &SessionRecord) -> anyhow::Result<()>;   // write <id>.json + rewrite index.json
-    pub fn delete(&self, id: &str) -> anyhow::Result<()>;
+    pub fn save(&self, record: &SessionRecord) -> anyhow::Result<()>;
+    pub fn update_panel_log(&self, id: &str, panel_log: Value) -> anyhow::Result<()>;
     pub fn rename(&self, id: &str, name: &str) -> anyhow::Result<()>;
+    pub fn delete(&self, id: &str) -> anyhow::Result<()>;
 }
 ```
-- `config.rs`: add `sessions_dir()` and include it in `ensure_dirs()`.
-- Reuse `memory::write_atomic_bytes` (same crate, `pub(crate)`); note the coupling, do not add
-  a new fs module.
-- A corrupt/missing `index.json` yields `[]` (never crash startup); a corrupt `<id>.json` on
-  open is a graceful `Err` surfaced to the panel.
 
-## Engine + driver changes (`engine.rs`, `codex_client.rs`)
+A missing/corrupt index yields `[]`; a missing/corrupt record is a surfaced error. Every file is
+UTF-8 without BOM through `memory::write_atomic_bytes`.
 
-1. `CodexDriver` trait gains:
-   ```rust
-   async fn current_thread_id(&self) -> Option<String>;
-   async fn seed_thread_id(&mut self, id: String) -> Result<(), AgentEngineError>;
-   ```
-   Implement on `ProductionCodexDriver` AND the in-file mock/test driver. On the production
-   driver, `seed_thread_id` must `ensure_client().await` first (the client is lazily spawned),
-   then set the client's thread_id mutex.
-2. `CodexAppServerClient`: make `current_thread_id` `pub`; add
-   `pub async fn set_thread_id(&self, id: String)`.
-3. `AgentEngine` gains `current_session_id: Option<String>` and a `SessionStore` (injected in
-   `lib.rs` construction next to the existing providers).
-4. `chat()`: `ensure_active_session(&req.text)` at the start auto-creates the session on the
-   first turn (auto-named from the first message), emitting `SessionActive`. After a successful
-   turn, `update_active_session()` refreshes the record (thread_id from
-   `driver.current_thread_id().await`, pending req-ids). The `panelLog` is pushed separately by
-   the panel via `session_update_log`. thread_id capture relies on `ThreadStarted` having arrived
-   by turn completion — verified in a unit test.
-5. `reset()`: set `current_session_id = None` (a `새 대화` detaches from the active session;
-   the next turn auto-creates a fresh one).
-6. New `open_session(id) -> SessionRecord`:
-   - `self.reset()` first (drop live thread),
-   - if `threadId` present: `driver.seed_thread_id(tid)`; on Ok set `thread_active = true` so the
-     next `chat()` resumes; on Err leave `thread_active=false` (fresh + replay). When there is no
-     `threadId` but a non-empty log, stage the transcript for a fresh-start replay too,
-   - `current_session_id = Some(id)`,
-   - reconnect ≤1 pending changeset (below),
-   - emit `SessionActive` then `SessionLoaded`; return the record.
-7. `changeset_decision()`: after a decision archives a journal, drop that req-id from the active
-   session record's `pendingRequestIds`.
-8. `EngineEvent::SessionLoaded` → panel `session_loaded` (signal after reconnect) and
-   `EngineEvent::SessionActive { id, name }` → panel `session_active` (current-session highlight).
-   Neither is rendered raw — rules.md forbids raw kind identifiers as user text.
+## Engine + driver contract
+
+- `AgentEngine` still has one live `ProductionCodexDriver`, `current_session_id`, and
+  `current_request_id`: the project queue intentionally serializes turns.
+- `chat_in_session(sessionId, req)` activates the requested record when the lane is free, then
+  calls the existing turn loop. `PlanReview`, `ChangesetReview`, or any live journal blocks a
+  session switch with a user-facing review-first error.
+- `open_session(id)` is lane activation, not sidebar selection. Switching saves the prior
+  record, resets the driver thread, seeds the target `threadId`, stages replay fallback, and
+  reconnects its pending changeset. Reopening the current owner is idempotent.
+- Successful chat, plan continuation, approval, and changeset decisions refresh the owning
+  record's thread id and pending request ids.
+- `ManagedAgentEngine` holds a clone of `SessionStore`, allowing list/load/log autosave without
+  waiting for the long-running engine mutex. The store's shared mutex preserves file ordering.
+- `TauriEventSink` holds a clone-shared current session id and wraps conversation events in a
+  flattened `{sessionId,...payload}` envelope. Test sinks remain payload-only.
+- There is no reset endpoint. “새 세션” creates a separate draft tab; lane activation performs
+  the required driver reset only when switching between persisted sessions.
 
 ### Changeset reconnect
 The changeset is derived from the journal (`journal::changeset_from_journal`) and
@@ -210,35 +192,37 @@ tool-arg dumps; cap well under prompt limits) into the first turn — and that t
 full `build_system_prompt` (a brand-new thread has never seen the `[first principles]`
 guardrails), NOT `resume_turn_text`.
 
-## Panel changes (`panel/src`)
+## Panel contract
 
-- `state/store.ts`: add a `hydrate(panelLog)` action (or `createPanelStore(initial?)`). It must
-  run at/just-after store creation so `useSyncExternalStore` sees it, and must advance the
-  closure-private `logSeq` (and `toolSeq`/`blockSeq`) past the restored ids, or React keys
-  collide. Set `App.tsx` `lastToastedLogId` to the restored max id to avoid a toast storm.
-  Leave `phase=connecting`; transient state stays empty and re-arrives from the core.
-- `state/protocol.ts`: add `SessionMeta`, `SessionRecord`, `PanelLog` types matching the camelCase
-  JSON above.
-- `App.tsx`: add a serializer that maps `state.log` → `PanelLog` (durable subset only); a
-  debounced effect on `state.log` pushes it via `invoke('session_update_log', { panelLog })`
-  after each change (no save button). On `session_open`, take the returned record, call
-  `store.hydrate(record.panelLog)` BEFORE the normal connect flow repopulates live state. Track
-  the active session id from the `session_active` event (cleared on `reset`).
-- `components/SessionList.tsx` (new): modal listing `session_list` results (name, project,
-  updatedAt) with open / rename / delete actions; the active session (`currentId`) is
-  highlighted. No save button. Do NOT re-open a review surface from the log — review surfaces
-  gate on live `state.changeset`/`state.plan`; a reconnected changeset arrives as a live
-  `changeset` event.
+- `App.tsx` owns a dynamic `Map<sessionId, SessionSlot>`. Each slot has its own `PanelStore`,
+  metadata, persisted/draft flag, and `idle|queued|running|review|error` activity.
+- Global project events fan out to every slot. Conversation events route by payload
+  `sessionId`, falling back to the current backend owner only for compatibility.
+- The FIFO queue persists the project owner through plan/changeset review. Queued rows expose
+  their position and can be cancelled before execution.
+- `SessionSidebar` is permanent left primary navigation. It is drag/keyboard resizable from
+  220–420px, persists width in `eud.session-sidebar.width`, and collapses to a 56px rail.
+  Selected/running/queued/review states use icon + text. Every horizontal container clips
+  overflow; long session names use single-line ellipsis with the full name in `title`.
+- The center conversation is keyed by selected session id so sticky-scroll internals never
+  retain the prior row's rendered log.
+- `ProjectSidebar` is the right contextual inspector with DAT wiki, project memory, and
+  workspace tabs. It is resizable; below 1140px it overlays the center, and below 1040px the
+  session sidebar collapses to a rail. The center never introduces horizontal scrolling at the
+  configured 960px minimum window width.
+- Autosave subscriptions debounce each persisted slot independently through
+  `session_update_log {id,panelLog}`. Toast high-water marks are also session scoped.
+- The prompt no longer duplicates “새 대화”; new-session creation lives in the left sidebar.
 
 ## Verification
 
-- Rust: `cargo fmt --check`, `cargo clippy`, `cargo test` (unit tests for SessionStore
-  round-trip, driver seed/current thread_id on the mock, open_session seeding + thread_active,
-  changeset reconnect via a written journal file). Use the shared `CARGO_TARGET_DIR` to avoid
-  cold ort/tauri compiles.
-- Panel: `npm run build` (tsc + vite) clean; hydrate advances counters with no key collision.
-- E2E (user-assisted, editor GUI): create conversation → 저장 → restart app → open → conversation
-  re-renders, follow-up instruction keeps prior context, pending changeset still decidable.
+- Rust: full `cargo test`; dedicated coverage pins project-lane review blocking and flattened
+  session event serialization.
+- Panel: full Vitest suite + `npm run build`; component coverage pins session activity labels,
+  selection, queued cancellation, splitter keyboard sizing, and long-name clipping.
+- Browser-driven mock-Tauri smoke: two current-project sessions retain isolated logs; the
+  second chat invocation occurs only after the first resolves. Splitter drag persisted
+  `272px → 368px`; long-name ellipsis and 1280px/960px layouts produced no horizontal scroll.
 
 ## Constraints (rules.md)
 

@@ -20,6 +20,9 @@ import {
   type ServerMessage,
   type ServerMessageType,
   type WikiMessage,
+  type WorkspaceFileEntry,
+  type WorkspaceListResponse,
+  type WorkspaceReadResponse,
 } from "./protocol";
 
 export * from "./protocol";
@@ -288,17 +291,29 @@ export class IpcClient {
   private commandArgs(msg: ClientMessage): Record<string, unknown> {
     switch (msg.type) {
       case "chat":
-        return { text: msg.text };
+        return {
+          sessionId: msg.sessionId,
+          text: msg.text,
+          attachments: msg.attachments,
+        };
       case "plan_feedback":
-        return { text: msg.text };
+        return {
+          sessionId: msg.sessionId,
+          text: msg.text,
+          attachments: msg.attachments,
+        };
       case "plan_approve":
-        return {};
+        return { sessionId: msg.sessionId };
       case "changeset_decision":
-        return { decision: msg.decision, ids: msg.ids };
+        return {
+          sessionId: msg.sessionId,
+          decision: msg.decision,
+          ids: msg.ids,
+        };
       case "cancel":
-        return {};
-      case "reset":
-        return {};
+        return { sessionId: msg.sessionId };
+      case "conversation_rewind":
+        return { sessionId: msg.sessionId, panelLog: msg.panelLog };
       case "status":
         return {};
       case "list":
@@ -410,6 +425,60 @@ export async function wikiSave(
   invoke: InvokeFn = tauriInvoke,
 ): Promise<WikiMessage> {
   return toWikiMessage(await invoke("wiki_save", { entries }));
+}
+
+function toWorkspaceList(value: unknown): WorkspaceListResponse {
+  if (
+    !isObject(value) ||
+    typeof value.project !== "string" ||
+    typeof value.workspaceId !== "string" ||
+    !Array.isArray(value.files)
+  ) {
+    throw new Error("invalid workspace list response");
+  }
+  const files = value.files.filter(
+    (entry): entry is WorkspaceFileEntry =>
+      isObject(entry) &&
+      typeof entry.path === "string" &&
+      typeof entry.source === "boolean" &&
+      typeof entry.size === "number" &&
+      (entry.state === undefined || typeof entry.state === "string") &&
+      (entry.revision === undefined || typeof entry.revision === "number"),
+  );
+  if (files.length !== value.files.length) {
+    throw new Error("invalid workspace file entry");
+  }
+  return {
+    project: value.project,
+    workspaceId: value.workspaceId,
+    files,
+  };
+}
+
+/** Refresh the source mirror and list the current project's real Codex workspace. */
+export async function workspaceList(
+  invoke: InvokeFn = tauriInvoke,
+): Promise<WorkspaceListResponse> {
+  return toWorkspaceList(await invoke("workspace_list"));
+}
+
+/** Read one confined UTF-8 workspace file. */
+export async function workspaceRead(
+  workspaceId: string,
+  path: string,
+  invoke: InvokeFn = tauriInvoke,
+): Promise<WorkspaceReadResponse> {
+  const value = await invoke("workspace_read", { workspaceId, path });
+  if (
+    !isObject(value) ||
+    value.workspaceId !== workspaceId ||
+    value.path !== path ||
+    typeof value.source !== "boolean" ||
+    typeof value.content !== "string"
+  ) {
+    throw new Error("invalid workspace read response");
+  }
+  return value as unknown as WorkspaceReadResponse;
 }
 
 function toCodexModelSettings(value: unknown): CodexModelSettings {

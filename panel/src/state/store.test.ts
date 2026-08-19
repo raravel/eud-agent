@@ -529,9 +529,10 @@ describe("subscribe / notify", () => {
 // protocol's exported discriminant sets (features/05: instruct/apply/code/applied
 // REMOVED entirely; no compat shim).
 describe("v1 protocol literals are absent (no compat shim)", () => {
-  it("client message types exclude instruct/apply", () => {
+  it("client message types exclude removed instruct/apply/reset commands", () => {
     expect(CLIENT_MESSAGE_TYPES).not.toContain("instruct");
     expect(CLIENT_MESSAGE_TYPES).not.toContain("apply");
+    expect(CLIENT_MESSAGE_TYPES).not.toContain("reset");
   });
 
   it("server message types exclude code/applied", () => {
@@ -547,7 +548,7 @@ describe("v1 protocol literals are absent (no compat shim)", () => {
         "plan_approve",
         "changeset_decision",
         "cancel",
-        "reset",
+        "conversation_rewind",
         "status",
         "list",
       ]),

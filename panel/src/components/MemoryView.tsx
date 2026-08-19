@@ -18,6 +18,7 @@ const TABS: ReadonlyArray<{ file: MemoryFile; label: string }> = [
 export interface MemoryViewProps {
   memory: MemoryViewState;
   onClose(): void;
+  embedded?: boolean;
   onTabSelected(file: MemoryFile): void;
   onEdited(file: MemoryFile, content: string): void;
   onSave(payload: { file: MemoryFile; content: string }): void;
@@ -57,6 +58,7 @@ function EpisodeLine({ episode }: { episode: Episode }) {
 export function MemoryView({
   memory,
   onClose,
+  embedded = false,
   onTabSelected,
   onEdited,
   onSave,
@@ -76,7 +78,10 @@ export function MemoryView({
       onKeyDown={(event) => {
         if (event.key === "Escape") onClose();
       }}
-      className="flex max-h-[62vh] flex-col gap-3 overflow-hidden border-t border-border bg-background p-4"
+      className={cn(
+        "flex flex-col gap-3 overflow-hidden bg-background p-3",
+        embedded ? "h-full min-h-0 flex-1" : "max-h-[62vh] border-t border-border p-4",
+      )}
     >
       <div className="flex items-center justify-between gap-3">
         <div className="min-w-0">
@@ -136,10 +141,10 @@ export function MemoryView({
         })}
       </div>
 
-      <div className="min-h-[288px] overflow-hidden rounded border border-border">
+      <div className={cn("overflow-hidden rounded border border-border", embedded ? "min-h-[220px] flex-1" : "min-h-[288px]")}>
         <Suspense
           fallback={
-            <div className="flex h-[288px] items-center justify-center text-sm text-muted-foreground">
+            <div className={cn("flex items-center justify-center text-sm text-muted-foreground", embedded ? "h-[220px]" : "h-[288px]")}>
               편집기를 여는 중…
             </div>
           }
