@@ -50,6 +50,10 @@ flowchart TD
 - Download progress emitted to the panel as `progress {stage: bootstrap, detail, pct}`.
 - The model is fetched through fastembed's HF cache (cache dir = `models/`); the RAG index
   is a direct `reqwest` GET of the Release asset.
+- Guided Codex install resolves one official GitHub release, downloads `codex.exe` plus its
+  matching `codex-code-mode-host.exe` and `codex-windows-sandbox-setup.exe`, verifies every
+  release sha256, and places them under `%localappdata%\eud-agent\bin\`. An app-managed CLI
+  missing either runtime helper is incomplete and returns to the setup install step.
 
 ## Edge cases
 - Offline on first run: setup screen shows a clear "network required for first-run

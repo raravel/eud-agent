@@ -1,11 +1,10 @@
-//! codex CLI login state + the guided first-run login flow.
+//! Codex CLI distribution login state + the guided first-run install/login flow.
 //!
-//! codex must be both RESOLVABLE (on PATH / `CODEX_CMD`) and AUTHENTICATED before
-//! the agent can run a turn — an unauthenticated codex fails every turn with an
-//! auth error. This module probes auth via `codex login status` (exit 0 = logged
-//! in) and drives the two login paths the setup screen offers: ChatGPT OAuth
-//! (`codex login`, opens a browser) and an API key (`codex login --with-api-key`,
-//! read from stdin — NEVER argv).
+//! Codex must be RESOLVABLE with both runtime-helper siblings and AUTHENTICATED before the
+//! agent can run a turn — an incomplete distribution fails Code Mode or elevated-sandbox
+//! setup, while an unauthenticated CLI fails every turn with an auth error. This module probes
+//! `codex login status` and drives the setup screen's install, ChatGPT OAuth (`codex login`),
+//! and API-key (`codex login --with-api-key`, key read from stdin — NEVER argv) paths.
 //!
 //! Everything here is synchronous (`std::process`) so it composes into the
 //! existing `setup_status` `spawn_blocking` probe; the Tauri commands wrap each
@@ -162,7 +161,7 @@ fn first_line(text: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-/// Progress sink for the codex download: the setup screen shows a spinner
+/// Progress sink for the Codex distribution download: the setup screen shows a spinner
 /// (`codexBusy`) rather than a progress bar, so install progress is dropped.
 struct NoopEmitter;
 
@@ -170,10 +169,9 @@ impl crate::bootstrap::ProgressEmitter for NoopEmitter {
     fn emit(&self, _stage: &str, _pct: u8, _detail: &str) {}
 }
 
-/// Download + install the standalone codex binary, then report the refreshed
-/// login state. After placement `resolve_codex_cmd` finds it (well-known path),
-/// so the returned state has `resolved: true` (and `authed: false` until the
-/// user logs in).
+/// Download + install the version-matched Codex CLI and runtime helpers, then report the
+/// refreshed login state. After placement `resolve_codex_cmd` finds the complete
+/// distribution without a restart.
 #[tauri::command]
 pub async fn codex_install(
     state: tauri::State<'_, crate::ipc::BridgeManaged>,

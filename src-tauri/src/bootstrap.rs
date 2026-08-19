@@ -134,26 +134,20 @@ pub fn asset_status(dir: &Path, filename: &str, spec: &AssetSpec) -> AssetStatus
     }
 }
 
-/// Verify `tmp` against `expected_sha`, then atomically rename it over `final_path`.
+/// Verify `tmp` against `expected_sha` without changing the final path.
 ///
-/// On a sha256 mismatch (or a missing/unreadable tmp) the tmp is removed and an error is
-/// returned — the final path is NEVER written. This is the single chokepoint every
-/// download funnels through, so no code path can place an unverified or partial file.
-pub fn verify_and_place(tmp: &Path, final_path: &Path, expected_sha: &str) -> anyhow::Result<()> {
-    // Hash the tmp; any read failure (e.g. a failed/short write left no tmp) is an error
-    // and leaves the final path untouched.
+/// A failure removes the staged file so an unverified download can never be placed later.
+fn verify_downloaded_tmp(tmp: &Path, final_path: &Path, expected_sha: &str) -> anyhow::Result<()> {
     let actual = match sha256_file(tmp) {
-        Ok(h) => h,
-        Err(e) => {
-            // Best-effort cleanup of a partial tmp; ignore if it never existed.
+        Ok(hash) => hash,
+        Err(error) => {
             let _ = fs::remove_file(tmp);
-            return Err(anyhow::Error::new(e)
+            return Err(anyhow::Error::new(error)
                 .context(format!("cannot hash downloaded tmp {}", tmp.display())));
         }
     };
 
     if !actual.eq_ignore_ascii_case(expected_sha) {
-        // Mismatch: refuse to install. Remove the tmp; never touch the final path.
         let _ = fs::remove_file(tmp);
         bail!(
             "sha256 mismatch for {}: expected {}, got {} — refusing to install",
@@ -163,14 +157,27 @@ pub fn verify_and_place(tmp: &Path, final_path: &Path, expected_sha: &str) -> an
         );
     }
 
-    // Verified. Ensure the parent dir exists, then atomically rename over the final path.
+    Ok(())
+}
+
+/// Atomically place a file already accepted by [`verify_downloaded_tmp`].
+fn place_verified_tmp(tmp: &Path, final_path: &Path) -> anyhow::Result<()> {
     if let Some(parent) = final_path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("cannot create dir {}", parent.display()))?;
     }
     fs::rename(tmp, final_path)
-        .with_context(|| format!("cannot place {} -> {}", tmp.display(), final_path.display()))?;
-    Ok(())
+        .with_context(|| format!("cannot place {} -> {}", tmp.display(), final_path.display()))
+}
+
+/// Verify `tmp` against `expected_sha`, then atomically rename it over `final_path`.
+///
+/// On a sha256 mismatch (or a missing/unreadable tmp) the tmp is removed and an error is
+/// returned — the final path is NEVER written. This is the single chokepoint every
+/// single-asset download funnels through.
+pub fn verify_and_place(tmp: &Path, final_path: &Path, expected_sha: &str) -> anyhow::Result<()> {
+    verify_downloaded_tmp(tmp, final_path, expected_sha)?;
+    place_verified_tmp(tmp, final_path)
 }
 
 // ---------------------------------------------------------------------------------------
@@ -260,25 +267,131 @@ pub fn ensure_model(dirs: &DataDirs, emitter: &dyn ProgressEmitter) -> anyhow::R
 /// The app-installed codex binary filename under [`DataDirs::bin_dir`].
 pub const CODEX_BIN_FILENAME: &str = "codex.exe";
 
-/// The codex standalone Windows x64 binary, always the latest release (the user
-/// opted for latest-tracking over a pinned version). GitHub redirects
-/// `releases/latest/download/<asset>` to the newest release's asset.
-pub const CODEX_LATEST_EXE_URL: &str =
-    "https://github.com/openai/codex/releases/latest/download/codex-x86_64-pc-windows-msvc.exe";
+/// The Code Mode process host shipped alongside [`CODEX_BIN_FILENAME`].
+///
+/// Codex resolves this fixed sibling name when an `exec` tool call needs the V8-backed
+/// Code Mode runtime. An app-managed Codex install is incomplete without it.
+pub const CODEX_CODE_MODE_HOST_FILENAME: &str = "codex-code-mode-host.exe";
 
-/// Sanity floor for the downloaded codex binary (a real build is tens of MB); a
-/// smaller body means a truncated download or an HTML error page, not the exe.
+/// The elevated Windows sandbox installer shipped alongside [`CODEX_BIN_FILENAME`].
+///
+/// Codex launches this fixed sibling when the sandbox setup marker is absent or stale.
+pub const CODEX_SANDBOX_SETUP_FILENAME: &str = "codex-windows-sandbox-setup.exe";
+
+/// GitHub's metadata for the newest official Codex release. We resolve this once per
+/// install so the CLI and both runtime helpers always come from the same concrete tag.
+const CODEX_RELEASE_API_URL: &str = "https://api.github.com/repos/openai/codex/releases/latest";
+const CODEX_RELEASE_EXE_ASSET_NAME: &str = "codex-x86_64-pc-windows-msvc.exe";
+const CODEX_RELEASE_HOST_ASSET_NAME: &str = "codex-code-mode-host-x86_64-pc-windows-msvc.exe";
+const CODEX_RELEASE_SANDBOX_SETUP_ASSET_NAME: &str =
+    "codex-windows-sandbox-setup-x86_64-pc-windows-msvc.exe";
+
+/// Sanity floor for each executable. The release digest is authoritative; this catches
+/// malformed metadata before any large download starts.
 const CODEX_MIN_BYTES: u64 = 1_000_000;
 
-/// Download and install the standalone codex binary into [`DataDirs::bin_dir`].
+#[derive(Debug)]
+struct CodexReleaseSpec {
+    version: String,
+    codex: AssetSpec,
+    code_mode_host: AssetSpec,
+    sandbox_setup: AssetSpec,
+}
+
+#[derive(serde::Deserialize)]
+struct GitHubRelease {
+    tag_name: String,
+    assets: Vec<GitHubReleaseAsset>,
+}
+
+#[derive(serde::Deserialize)]
+struct GitHubReleaseAsset {
+    name: String,
+    browser_download_url: String,
+    digest: Option<String>,
+    size: u64,
+}
+
+fn codex_release_asset(
+    release: &GitHubRelease,
+    asset_name: &str,
+    version: &str,
+) -> anyhow::Result<AssetSpec> {
+    let asset = release
+        .assets
+        .iter()
+        .find(|asset| asset.name == asset_name)
+        .with_context(|| format!("Codex release {version} is missing asset {asset_name}"))?;
+    if asset.browser_download_url.trim().is_empty() {
+        bail!("Codex release {version} asset {asset_name} has no download URL");
+    }
+    if asset.size < CODEX_MIN_BYTES {
+        bail!(
+            "Codex release {version} asset {asset_name} is implausibly small ({} bytes)",
+            asset.size
+        );
+    }
+
+    let digest = asset
+        .digest
+        .as_deref()
+        .and_then(|digest| digest.strip_prefix("sha256:"))
+        .filter(|digest| digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .with_context(|| {
+            format!("Codex release {version} asset {asset_name} has no valid sha256 digest")
+        })?;
+
+    Ok(AssetSpec {
+        name: asset.browser_download_url.clone(),
+        sha256: digest.to_ascii_lowercase(),
+        version: version.to_string(),
+    })
+}
+
+/// Parse the official GitHub release metadata into a version-locked CLI + runtime helpers.
+fn parse_codex_release(bytes: &[u8]) -> anyhow::Result<CodexReleaseSpec> {
+    let release: GitHubRelease =
+        serde_json::from_slice(bytes).context("invalid Codex release metadata")?;
+    let version = release.tag_name.trim();
+    if version.is_empty() {
+        bail!("Codex release metadata has no tag_name");
+    }
+
+    Ok(CodexReleaseSpec {
+        version: version.to_string(),
+        codex: codex_release_asset(&release, CODEX_RELEASE_EXE_ASSET_NAME, version)?,
+        code_mode_host: codex_release_asset(&release, CODEX_RELEASE_HOST_ASSET_NAME, version)?,
+        sandbox_setup: codex_release_asset(
+            &release,
+            CODEX_RELEASE_SANDBOX_SETUP_ASSET_NAME,
+            version,
+        )?,
+    })
+}
+
+async fn fetch_codex_release() -> anyhow::Result<CodexReleaseSpec> {
+    let bytes = reqwest::Client::builder()
+        .user_agent("eud-agent-bootstrap")
+        .build()?
+        .get(CODEX_RELEASE_API_URL)
+        .send()
+        .await
+        .context("failed to fetch latest Codex release metadata")?
+        .error_for_status()
+        .context("latest Codex release metadata returned an error status")?
+        .bytes()
+        .await
+        .context("failed to read latest Codex release metadata")?;
+    parse_codex_release(&bytes)
+}
+
+/// Download and install the latest version-matched Codex CLI and runtime helpers.
 ///
-/// Streams the latest Windows release asset to a temp file, sanity-checks its
-/// size, then atomically renames it to `bin/codex.exe` where
-/// [`resolve_codex_cmd`](crate::codex_client::resolve_codex_cmd) finds it without
-/// a restart. The bare `.exe` asset has NO published per-file sha256 (the release
-/// checksums cover only the packaged tarball), so integrity rests on GitHub TLS
-/// plus the size floor — this is the trade-off of latest-tracking a moving
-/// target. NOT unit-tested (real HTTP download). Returns the placed path.
+/// GitHub release metadata is resolved once, and all three official sha256 digests are
+/// verified before any staged file is placed. Files already matching that concrete release
+/// are retained, so an existing app-managed `codex.exe` downloads only missing siblings.
+/// A placement failure removes newly placed distribution files so the setup gate cannot
+/// mistake a mixed-version installation for ready.
 pub async fn ensure_codex(
     dirs: &DataDirs,
     emitter: &(dyn ProgressEmitter + Send + Sync),
@@ -286,40 +399,147 @@ pub async fn ensure_codex(
     let bin_dir = dirs.bin_dir();
     fs::create_dir_all(&bin_dir)
         .with_context(|| format!("cannot create bin dir {}", bin_dir.display()))?;
-    let final_path = bin_dir.join(CODEX_BIN_FILENAME);
+    let codex_path = bin_dir.join(CODEX_BIN_FILENAME);
+    let host_path = bin_dir.join(CODEX_CODE_MODE_HOST_FILENAME);
+    let sandbox_setup_path = bin_dir.join(CODEX_SANDBOX_SETUP_FILENAME);
 
-    let tmp = with_tmp_suffix(&final_path);
-    let _ = fs::remove_file(&tmp);
+    emitter.emit("codex_install", 0, "checking latest codex release");
+    let release = fetch_codex_release().await?;
+    let codex_needed =
+        asset_status(&bin_dir, CODEX_BIN_FILENAME, &release.codex) != AssetStatus::Present;
+    let host_needed = asset_status(
+        &bin_dir,
+        CODEX_CODE_MODE_HOST_FILENAME,
+        &release.code_mode_host,
+    ) != AssetStatus::Present;
+    let sandbox_setup_needed = asset_status(
+        &bin_dir,
+        CODEX_SANDBOX_SETUP_FILENAME,
+        &release.sandbox_setup,
+    ) != AssetStatus::Present;
 
-    emitter.emit("codex_install", 0, "downloading codex");
-    download_to_tmp(CODEX_LATEST_EXE_URL, &tmp, "codex", emitter)
-        .await
-        .inspect_err(|_| {
-            let _ = fs::remove_file(&tmp);
-        })?;
+    if !codex_needed && !host_needed && !sandbox_setup_needed {
+        emitter.emit("codex_install", 100, "codex already installed");
+        return Ok(codex_path);
+    }
 
-    let size = fs::metadata(&tmp).map(|meta| meta.len()).unwrap_or(0);
-    if size < CODEX_MIN_BYTES {
-        let _ = fs::remove_file(&tmp);
-        anyhow::bail!(
-            "downloaded codex binary is implausibly small ({size} bytes); the download likely \
-failed or returned an error page"
+    let codex_tmp = with_tmp_suffix(&codex_path);
+    let host_tmp = with_tmp_suffix(&host_path);
+    let sandbox_setup_tmp = with_tmp_suffix(&sandbox_setup_path);
+    let cleanup_staged = || {
+        let _ = fs::remove_file(&codex_tmp);
+        let _ = fs::remove_file(&host_tmp);
+        let _ = fs::remove_file(&sandbox_setup_tmp);
+    };
+    cleanup_staged();
+
+    if codex_needed {
+        emitter.emit(
+            "codex_install",
+            0,
+            &format!("downloading codex {}", release.version),
         );
+        if let Err(error) = download_to_tmp(&release.codex.name, &codex_tmp, "codex", emitter).await
+        {
+            cleanup_staged();
+            return Err(error);
+        }
+    }
+    if host_needed {
+        emitter.emit(
+            "codex_install",
+            0,
+            &format!("downloading codex code mode host {}", release.version),
+        );
+        if let Err(error) = download_to_tmp(
+            &release.code_mode_host.name,
+            &host_tmp,
+            "codex code mode host",
+            emitter,
+        )
+        .await
+        {
+            cleanup_staged();
+            return Err(error);
+        }
+    }
+    if sandbox_setup_needed {
+        emitter.emit(
+            "codex_install",
+            0,
+            &format!("downloading codex sandbox setup helper {}", release.version),
+        );
+        if let Err(error) = download_to_tmp(
+            &release.sandbox_setup.name,
+            &sandbox_setup_tmp,
+            "codex sandbox setup helper",
+            emitter,
+        )
+        .await
+        {
+            cleanup_staged();
+            return Err(error);
+        }
     }
 
-    // Atomic place: rename over any prior install (Windows rename replaces only
-    // when the target is not locked; codex is not running during setup).
-    if final_path.exists() {
-        let _ = fs::remove_file(&final_path);
+    if codex_needed {
+        if let Err(error) = verify_downloaded_tmp(&codex_tmp, &codex_path, &release.codex.sha256) {
+            cleanup_staged();
+            return Err(error);
+        }
     }
-    fs::rename(&tmp, &final_path).with_context(|| {
-        format!(
-            "cannot place codex binary at {} (in use?)",
-            final_path.display()
-        )
-    })?;
+    if host_needed {
+        if let Err(error) =
+            verify_downloaded_tmp(&host_tmp, &host_path, &release.code_mode_host.sha256)
+        {
+            cleanup_staged();
+            return Err(error);
+        }
+    }
+    if sandbox_setup_needed {
+        if let Err(error) = verify_downloaded_tmp(
+            &sandbox_setup_tmp,
+            &sandbox_setup_path,
+            &release.sandbox_setup.sha256,
+        ) {
+            cleanup_staged();
+            return Err(error);
+        }
+    }
+
+    if codex_needed {
+        if let Err(error) = place_verified_tmp(&codex_tmp, &codex_path) {
+            let _ = fs::remove_file(&codex_path);
+            cleanup_staged();
+            return Err(error);
+        }
+    }
+    if host_needed {
+        if let Err(error) = place_verified_tmp(&host_tmp, &host_path) {
+            let _ = fs::remove_file(&host_path);
+            if codex_needed {
+                let _ = fs::remove_file(&codex_path);
+            }
+            cleanup_staged();
+            return Err(error);
+        }
+    }
+    if sandbox_setup_needed {
+        if let Err(error) = place_verified_tmp(&sandbox_setup_tmp, &sandbox_setup_path) {
+            let _ = fs::remove_file(&sandbox_setup_path);
+            if host_needed {
+                let _ = fs::remove_file(&host_path);
+            }
+            if codex_needed {
+                let _ = fs::remove_file(&codex_path);
+            }
+            cleanup_staged();
+            return Err(error);
+        }
+    }
+
     emitter.emit("codex_install", 100, "done");
-    Ok(final_path)
+    Ok(codex_path)
 }
 
 /// Stream `url` to `tmp`, emitting `bootstrap` byte-progress. Caller owns tmp cleanup on
@@ -727,6 +947,123 @@ mod manifest {
             .is_err(),
             "empty sha256 must refuse (nothing to verify against)"
         );
+    }
+
+    #[test]
+    fn codex_release_parses_version_locked_distribution() {
+        let json = format!(
+            r#"{{
+                "tag_name": "rust-v0.147.0",
+                "assets": [
+                    {{
+                        "name": "{CODEX_RELEASE_HOST_ASSET_NAME}",
+                        "browser_download_url": "https://example.com/host.exe",
+                        "digest": "sha256:{HELLO_SHA}",
+                        "size": 57450288
+                    }},
+                    {{
+                        "name": "{CODEX_RELEASE_SANDBOX_SETUP_ASSET_NAME}",
+                        "browser_download_url": "https://example.com/sandbox-setup.exe",
+                        "digest": "sha256:{HELLO_SHA}",
+                        "size": 8852272
+                    }},
+                    {{
+                        "name": "{CODEX_RELEASE_EXE_ASSET_NAME}",
+                        "browser_download_url": "https://example.com/codex.exe",
+                        "digest": "sha256:{HELLO_SHA}",
+                        "size": 298668336
+                    }}
+                ]
+            }}"#
+        );
+
+        let release = parse_codex_release(json.as_bytes()).unwrap();
+        assert_eq!(release.version, "rust-v0.147.0");
+        assert_eq!(release.codex.name, "https://example.com/codex.exe");
+        assert_eq!(release.code_mode_host.name, "https://example.com/host.exe");
+        assert_eq!(
+            release.sandbox_setup.name,
+            "https://example.com/sandbox-setup.exe"
+        );
+        assert_eq!(release.codex.sha256, HELLO_SHA);
+        assert_eq!(release.code_mode_host.sha256, HELLO_SHA);
+        assert_eq!(release.sandbox_setup.sha256, HELLO_SHA);
+        assert_eq!(release.codex.version, release.code_mode_host.version);
+        assert_eq!(
+            release.code_mode_host.version,
+            release.sandbox_setup.version
+        );
+    }
+
+    #[test]
+    fn codex_release_rejects_missing_runtime_sibling_or_digest() {
+        let missing_sandbox_setup = format!(
+            r#"{{
+                "tag_name": "rust-v0.147.0",
+                "assets": [
+                    {{
+                        "name": "{CODEX_RELEASE_EXE_ASSET_NAME}",
+                        "browser_download_url": "https://example.com/codex.exe",
+                        "digest": "sha256:{HELLO_SHA}",
+                        "size": 298668336
+                    }},
+                    {{
+                        "name": "{CODEX_RELEASE_HOST_ASSET_NAME}",
+                        "browser_download_url": "https://example.com/host.exe",
+                        "digest": "sha256:{HELLO_SHA}",
+                        "size": 57450288
+                    }}
+                ]
+            }}"#
+        );
+        assert!(parse_codex_release(missing_sandbox_setup.as_bytes()).is_err());
+
+        let missing_digest = format!(
+            r#"{{
+                "tag_name": "rust-v0.147.0",
+                "assets": [
+                    {{
+                        "name": "{CODEX_RELEASE_EXE_ASSET_NAME}",
+                        "browser_download_url": "https://example.com/codex.exe",
+                        "digest": null,
+                        "size": 298668336
+                    }},
+                    {{
+                        "name": "{CODEX_RELEASE_HOST_ASSET_NAME}",
+                        "browser_download_url": "https://example.com/host.exe",
+                        "digest": "sha256:{HELLO_SHA}",
+                        "size": 57450288
+                    }},
+                    {{
+                        "name": "{CODEX_RELEASE_SANDBOX_SETUP_ASSET_NAME}",
+                        "browser_download_url": "https://example.com/sandbox-setup.exe",
+                        "digest": "sha256:{HELLO_SHA}",
+                        "size": 8852272
+                    }}
+                ]
+            }}"#
+        );
+        assert!(parse_codex_release(missing_digest.as_bytes()).is_err());
+    }
+
+    #[tokio::test]
+    #[ignore = "downloads the current official Codex CLI and runtime helpers"]
+    async fn codex_distribution_download_smoke() {
+        struct Silent;
+        impl ProgressEmitter for Silent {
+            fn emit(&self, _stage: &str, _pct: u8, _detail: &str) {}
+        }
+
+        let base = unique_temp_dir("codex-download-smoke");
+        let dirs = crate::config::DataDirs::from_bases(&base.join("roaming"), &base.join("local"));
+        dirs.ensure_dirs().unwrap();
+
+        let codex_path = ensure_codex(&dirs, &Silent).await.unwrap();
+        assert!(codex_path.is_file());
+        assert!(dirs.bin_dir().join(CODEX_CODE_MODE_HOST_FILENAME).is_file());
+        assert!(dirs.bin_dir().join(CODEX_SANDBOX_SETUP_FILENAME).is_file());
+
+        fs::remove_dir_all(&base).ok();
     }
 
     #[test]

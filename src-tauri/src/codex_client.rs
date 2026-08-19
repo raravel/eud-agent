@@ -55,40 +55,83 @@ pub enum CodexError {
     NoCode(String),
 }
 
-/// Resolve the codex `.cmd` shim path.
+/// Resolve the Codex command path.
 ///
-/// Honors a `CODEX_CMD` env override (full path to the shim); otherwise locates `codex`
-/// on PATH via the `which` crate. This never returns a bare `"codex"` command.
+/// Honors a `CODEX_CMD` env override (full path to the shim); otherwise prefers the
+/// app-managed distribution and finally locates `codex` on PATH via the `which` crate.
+/// The app-managed distribution is usable only when both fixed-name runtime helpers exist.
+/// This never returns a bare `"codex"` command.
 pub fn resolve_codex_cmd() -> Result<PathBuf, CodexError> {
     if let Some(cmd) = env::var_os("CODEX_CMD").filter(|cmd| !cmd.is_empty()) {
         return Ok(PathBuf::from(cmd));
     }
 
-    // The app-installed standalone binary (bootstrap `ensure_codex` places it
-    // here). Resolved BEFORE PATH so a freshly installed codex is found without a
-    // restart and without depending on the user's PATH. Self-contained: derived
-    // from %LOCALAPPDATA% so this fn needs no DataDirs handle.
+    // The app-installed distribution is resolved BEFORE PATH so a fresh setup install is
+    // found without a restart. A CLI without either fixed-name runtime helper can start but
+    // fails Code Mode execution or elevated sandbox initialization, so keep that partial
+    // install behind the setup gate.
+    let mut missing_app_component = None;
     if let Some(local) = env::var_os("LOCALAPPDATA").filter(|value| !value.is_empty()) {
-        let candidate = well_known_codex_path(Path::new(&local));
-        if candidate.is_file() {
-            return Ok(candidate);
+        match app_managed_codex(Path::new(&local)) {
+            Ok(Some(candidate)) => return Ok(candidate),
+            Ok(None) => {}
+            Err(missing_component) => missing_app_component = Some(missing_component),
         }
     }
 
     which::which("codex").map_err(|err| {
-        CodexError::NotFound(format!(
-            "could not resolve codex via CODEX_CMD, the app bin dir, or PATH: {err}. Install codex (the setup screen can do this) or set CODEX_CMD to the codex binary path."
-        ))
+        let detail = match missing_app_component {
+            Some(component) => format!(
+                "app-installed Codex is incomplete: missing {}. Reinstall Codex from the setup screen",
+                component.display()
+            ),
+            None => format!(
+                "could not resolve codex via CODEX_CMD, the app bin dir, or PATH: {err}. Install codex (the setup screen can do this) or set CODEX_CMD to the codex binary path"
+            ),
+        };
+        CodexError::NotFound(detail)
     })
 }
 
-/// The app-installed codex binary path under `<local_app_data>\eud-agent\bin`
+/// The app-installed Codex binary path under `<local_app_data>\eud-agent\bin`
 /// (matches [`DataDirs::bin_dir`](crate::config::DataDirs::bin_dir)).
 fn well_known_codex_path(local_app_data: &Path) -> PathBuf {
     local_app_data
         .join("eud-agent")
         .join("bin")
         .join(crate::bootstrap::CODEX_BIN_FILENAME)
+}
+
+fn well_known_codex_host_path(local_app_data: &Path) -> PathBuf {
+    local_app_data
+        .join("eud-agent")
+        .join("bin")
+        .join(crate::bootstrap::CODEX_CODE_MODE_HOST_FILENAME)
+}
+
+fn well_known_codex_sandbox_setup_path(local_app_data: &Path) -> PathBuf {
+    local_app_data
+        .join("eud-agent")
+        .join("bin")
+        .join(crate::bootstrap::CODEX_SANDBOX_SETUP_FILENAME)
+}
+
+/// `Ok(None)` means no app-managed CLI; `Err(path)` means the CLI exists but a required
+/// fixed-name runtime helper is missing.
+fn app_managed_codex(local_app_data: &Path) -> Result<Option<PathBuf>, PathBuf> {
+    let codex = well_known_codex_path(local_app_data);
+    if !codex.is_file() {
+        return Ok(None);
+    }
+    let host = well_known_codex_host_path(local_app_data);
+    if !host.is_file() {
+        return Err(host);
+    }
+    let sandbox_setup = well_known_codex_sandbox_setup_path(local_app_data);
+    if !sandbox_setup.is_file() {
+        return Err(sandbox_setup);
+    }
+    Ok(Some(codex))
 }
 
 pub fn extract_code(text: &str) -> Result<String, CodexError> {
