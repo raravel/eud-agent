@@ -3,8 +3,8 @@
 //! Data dirs (feature 10 / Decision 12):
 //! - `app_data` -> `%appdata%\eud-agent\` : `config.json`, `memory/`, `map_backups/`,
 //!   `journal/`.
-//! - `app_local_data` -> `%localappdata%\eud-agent\` : `models/`, `rag/`, `logs/`.
-//!   The model (~570MB) and RAG index NEVER live in Roaming.
+//! - `app_local_data` -> `%localappdata%\eud-agent\` : `models/`, `rag/`, `logs/`,
+//!   session-owned `attachments/`. Large/regenerable data NEVER lives in Roaming.
 //! - editor IPC dir: `<editor_path>\Data\agent\`.
 //!
 //! `config.json` is written UTF-8 **without BOM** (rules.md: a BOM breaks first-line

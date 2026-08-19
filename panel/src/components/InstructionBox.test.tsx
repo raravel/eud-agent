@@ -1,18 +1,8 @@
 /**
- * Instruction box v2 (features/06 ## Behaviors → Send gating):
- *   chat {text}; Send disabled while busy (turn in flight / plan awaiting a
- *   decision / compiling) and when the store gates it off (no project). The
- *   settable-target requirement is GONE — the agent picks files/targets, so
- *   there is no picker selection and no useContext toggle. Gate on `canSend`.
- *
- * Contract (`@/components/InstructionBox`):
- *   export interface InstructionBoxProps {
- *     state: PanelState;            // gating: canSend
- *     onSend(msg: ChatPayload): void;
- *   }
- *   export interface ChatPayload { text: string; }
- *
- * The instruction textarea has accessible name "지시 입력"; the send button "전송".
+ * Main PromptInput contracts: store-driven send gating, reset/model controls,
+ * `chat {text, attachments}`, and picker/drop/paste attachment drafts. The
+ * instruction textarea, attachment input, and visible controls retain stable
+ * Korean accessible names used below.
  */
 import { describe, it, expect, vi } from "vitest";
 import { fireEvent, render, screen } from "@testing-library/react";
@@ -123,33 +113,64 @@ describe("InstructionBox — send gating (v2)", () => {
   });
 });
 
-describe("InstructionBox — 새 대화 reset control (EUD-065)", () => {
-  it("renders a [새 대화] button", () => {
-    render(<InstructionBox state={readyState()} onSend={noop} onReset={noop} />);
-    expect(screen.getByRole("button", { name: "새 대화" })).toBeInTheDocument();
-  });
 
-  it("calls onReset when [새 대화] is clicked", async () => {
+describe("InstructionBox — persistent active-turn feedback", () => {
+  it("shows the real activity stage and keeps a stop action beside the prompt", async () => {
     const user = userEvent.setup();
-    const onReset = vi.fn();
-    render(
-      <InstructionBox state={readyState()} onSend={noop} onReset={onReset} />,
-    );
-    await user.click(screen.getByRole("button", { name: "새 대화" }));
-    expect(onReset).toHaveBeenCalledTimes(1);
-  });
-
-  it("disables [새 대화] while a turn is in flight", () => {
     const store = createPanelStore();
     store.wsOpen();
-    store.applyList({
-      files: [{ path: "main.eps", ftype: "CUIEps", settable: true }],
-    });
-    store.chatSent(); // thinking — a turn is in flight
-    render(
-      <InstructionBox state={store.getState()} onSend={noop} onReset={noop} />,
+    store.applyList({ files: [] });
+    store.chatSent();
+    const onCancel = vi.fn();
+    const view = render(
+      <InstructionBox
+        state={store.getState()}
+        onSend={noop}
+        onCancel={onCancel}
+      />,
     );
-    expect(screen.getByRole("button", { name: "새 대화" })).toBeDisabled();
+
+    expect(screen.getByTestId("active-turn-status")).toHaveTextContent(
+      "작업 준비 중",
+    );
+
+    store.agentEvent("reasoning", "확인합니다.");
+    view.rerender(
+      <InstructionBox
+        state={store.getState()}
+        onSend={noop}
+        onCancel={onCancel}
+      />,
+    );
+    expect(screen.getByTestId("active-turn-status")).toHaveTextContent("추론 중");
+
+    store.agentEvent("tool_call", "search_docs");
+    view.rerender(
+      <InstructionBox
+        state={store.getState()}
+        onSend={noop}
+        onCancel={onCancel}
+      />,
+    );
+    expect(screen.getByTestId("active-turn-status")).toHaveTextContent(
+      "도구 실행 중 · search_docs",
+    );
+    await user.click(screen.getByRole("button", { name: "작업 중단" }));
+    expect(onCancel).toHaveBeenCalledTimes(1);
+  });
+
+  it("restores a rewound message into the editable prompt", () => {
+    render(
+      <InstructionBox
+        state={readyState()}
+        onSend={noop}
+        draft={{ text: "수정할 요청", attachments: [] }}
+      />,
+    );
+
+    expect(screen.getByRole("textbox", { name: "지시 입력" })).toHaveValue(
+      "수정할 요청",
+    );
   });
 });
 
@@ -188,7 +209,10 @@ describe("InstructionBox — chat payload (v2)", () => {
     render(<InstructionBox state={readyState()} onSend={onSend} />);
     await user.type(screen.getByRole("textbox", { name: "지시 입력" }), "트리거 추가");
     await user.click(screen.getByRole("button", { name: "전송" }));
-    expect(onSend).toHaveBeenCalledWith({ text: "트리거 추가" });
+    expect(onSend).toHaveBeenCalledWith({
+      text: "트리거 추가",
+      attachments: [],
+    });
   });
 
   it("does not send empty / whitespace-only text", async () => {
@@ -198,6 +222,130 @@ describe("InstructionBox — chat payload (v2)", () => {
     await user.type(screen.getByRole("textbox", { name: "지시 입력" }), "   ");
     await user.click(screen.getByRole("button", { name: "전송" }));
     expect(onSend).not.toHaveBeenCalled();
+  });
+});
+
+describe("InstructionBox — attachments", () => {
+  const imageAttachment = {
+    id: "image-1",
+    name: "screenshot.png",
+    mime: "image/png",
+    kind: "image" as const,
+    size: 4,
+    previewUrl: "data:image/png;base64,iVBORw0KGgo=",
+  };
+
+  it("stages a picked image, renders a removable chip, and sends it with the text", async () => {
+    const user = userEvent.setup();
+    const onSend = vi.fn<(p: ChatPayload) => void>();
+    const onStageAttachment = vi.fn().mockResolvedValue(imageAttachment);
+    const onDiscardAttachment = vi.fn().mockResolvedValue(undefined);
+    render(
+      <InstructionBox
+        state={readyState()}
+        onSend={onSend}
+        onStageAttachment={onStageAttachment}
+        onDiscardAttachment={onDiscardAttachment}
+      />,
+    );
+
+    const file = new File(["png!"], "screenshot.png", { type: "image/png" });
+    await user.upload(screen.getByLabelText("파일 첨부"), file);
+
+    expect(onStageAttachment).toHaveBeenCalledWith(file);
+    expect(screen.getByText("screenshot.png")).toBeInTheDocument();
+
+    await user.type(screen.getByRole("textbox", { name: "지시 입력" }), "이 화면을 봐줘");
+    await user.click(screen.getByRole("button", { name: "전송" }));
+    expect(onSend).toHaveBeenCalledWith({
+      text: "이 화면을 봐줘",
+      attachments: [imageAttachment],
+    });
+  });
+
+  it("allows an attachment-only message", async () => {
+    const user = userEvent.setup();
+    const onSend = vi.fn<(p: ChatPayload) => void>();
+    render(
+      <InstructionBox
+        state={readyState()}
+        onSend={onSend}
+        onStageAttachment={vi.fn().mockResolvedValue(imageAttachment)}
+      />,
+    );
+
+    await user.upload(
+      screen.getByLabelText("파일 첨부"),
+      new File(["png!"], "screenshot.png", { type: "image/png" }),
+    );
+    await user.click(screen.getByRole("button", { name: "전송" }));
+
+    expect(onSend).toHaveBeenCalledWith({
+      text: "",
+      attachments: [imageAttachment],
+    });
+  });
+
+  it("accepts dropped files and pasted clipboard images", async () => {
+    const stagedText = {
+      id: "text-1",
+      name: "notes.txt",
+      mime: "text/plain",
+      kind: "text" as const,
+      size: 5,
+    };
+    const onStageAttachment = vi
+      .fn()
+      .mockResolvedValueOnce(stagedText)
+      .mockResolvedValueOnce(imageAttachment);
+    render(
+      <InstructionBox
+        state={readyState()}
+        onSend={noop}
+        onStageAttachment={onStageAttachment}
+      />,
+    );
+
+    const dropFile = new File(["notes"], "notes.txt", { type: "text/plain" });
+    fireEvent.drop(screen.getByTestId("prompt-drop-zone"), {
+      dataTransfer: { files: [dropFile] },
+    });
+    await screen.findByText("notes.txt");
+
+    const pastedImage = new File(["png!"], "clipboard.png", {
+      type: "image/png",
+    });
+    fireEvent.paste(screen.getByRole("textbox", { name: "지시 입력" }), {
+      clipboardData: { files: [pastedImage] },
+    });
+    await screen.findByText("screenshot.png");
+
+    expect(onStageAttachment).toHaveBeenNthCalledWith(1, dropFile);
+    expect(onStageAttachment).toHaveBeenNthCalledWith(2, pastedImage);
+  });
+
+  it("removes a staged attachment and deletes its draft", async () => {
+    const user = userEvent.setup();
+    const onDiscardAttachment = vi.fn().mockResolvedValue(undefined);
+    render(
+      <InstructionBox
+        state={readyState()}
+        onSend={noop}
+        onStageAttachment={vi.fn().mockResolvedValue(imageAttachment)}
+        onDiscardAttachment={onDiscardAttachment}
+      />,
+    );
+    await user.upload(
+      screen.getByLabelText("파일 첨부"),
+      new File(["png!"], "screenshot.png", { type: "image/png" }),
+    );
+
+    await user.click(
+      screen.getByRole("button", { name: "screenshot.png 첨부 제거" }),
+    );
+
+    expect(onDiscardAttachment).toHaveBeenCalledWith("image-1");
+    expect(screen.queryByText("screenshot.png")).not.toBeInTheDocument();
   });
 });
 
@@ -298,7 +446,7 @@ describe("InstructionBox — InputGroup composition (EUD-066 layout contract)", 
   // this pins the DOM STRUCTURE the selectors require.
   it("renders the footer addon as a DIRECT child of the input group", () => {
     const { container } = render(
-      <InstructionBox state={readyState()} onSend={noop} onReset={noop} />,
+      <InstructionBox state={readyState()} onSend={noop} />,
     );
     const group = container.querySelector('[data-slot="input-group"]');
     expect(group).not.toBeNull();

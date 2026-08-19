@@ -323,6 +323,22 @@ export interface SessionMeta {
   updatedAt: number;
 }
 
+export type AttachmentKind = "image" | "text";
+
+/** App-owned attachment metadata returned by `attachment_stage`. */
+export interface AttachmentDescriptor {
+  id: string;
+  name: string;
+  mime: string;
+  kind: AttachmentKind;
+  size: number;
+}
+
+/** Attachment metadata retained in the panel log; image previews are small data URLs. */
+export interface ChatAttachment extends AttachmentDescriptor {
+  previewUrl?: string;
+}
+
 /**
  * The panel-owned durable conversation snapshot persisted inside a session
  * record. Opaque to Rust (stored/returned verbatim); its schema is owned here.
@@ -344,6 +360,7 @@ export interface PanelLogEntry {
   text: string;
   stage?: string;
   tools?: PanelLogTool[];
+  attachments?: ChatAttachment[];
 }
 
 /** Durable archived-tool row persisted in a {@link PanelLogEntry} (subset of AgentTool). */

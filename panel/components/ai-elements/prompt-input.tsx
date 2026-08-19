@@ -1,17 +1,15 @@
 // Vendored from Vercel AI Elements (registry.ai-sdk.dev/prompt-input.json), decision 06.
 //
 // ADAPTATION (minimal subset): the upstream prompt-input.tsx is ~1000 lines and
-// bundles file attachments (nanoid + `FileUIPart` from `ai`), speech recognition,
-// a command palette (cmdk), model selects, dropdown action menus, hover cards and
-// tabs — none of which the eud-agent panel uses (it sends a single `chat{text}`).
-// Pulling all of that in would add several deps for zero benefit and bloat the
-// no-runtime-CDN bundle. So only the chat-relevant primitives are vendored, each
-// kept FAITHFUL to the upstream implementation:
+// bundles its attachment state through nanoid + `FileUIPart` from `ai`, plus speech,
+// cmdk, model selects, action menus, hover cards and tabs. EUD Agent keeps attachment
+// bytes/session ownership in Rust and renders its lightweight tray in InstructionBox,
+// so none of those upstream dependencies are needed. Only these primitives remain:
 //   PromptInput (form), PromptInputBody, PromptInputTextarea (Enter-to-submit with
 //   IME-composition guard + disabled-submit guard), PromptInputFooter,
 //   PromptInputTools, PromptInputButton, PromptInputSubmit.
-// Dropped: attachments / speech / select / command / action-menu / hovercard /
-//   tabs / the controller provider. (Reported in the task summary.)
+// Dropped upstream subsystems: attachment controller/provider (not attachment support),
+// speech, select, command, action-menu, hovercard and tabs.
 "use client";
 
 import { cn } from "@/lib/utils";

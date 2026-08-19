@@ -80,8 +80,11 @@ pub fn bridge_from_config(dirs: &DataDirs) -> Result<BridgeIo, String> {
 /// `chat` command input.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatRequest {
-    /// User message from the panel.
+    /// User message from the panel. May be empty when at least one attachment exists.
     pub text: String,
+    /// Opaque app-owned attachment ids staged before this turn.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<String>,
 }
 
 /// `plan_feedback` command input.
@@ -89,6 +92,9 @@ pub struct ChatRequest {
 pub struct PlanFeedbackRequest {
     /// User feedback for the current plan.
     pub text: String,
+    /// Opaque app-owned attachment ids staged before this turn.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<String>,
 }
 
 /// `changeset_decision.decision` wire values.
@@ -377,8 +383,8 @@ pub struct ErrorEvent {
 ///
 /// The engine task replaces this placeholder body with the real orchestration.
 #[tauri::command]
-pub async fn chat(text: String) -> Result<(), String> {
-    let _request = ChatRequest { text };
+pub async fn chat(text: String, attachments: Vec<String>) -> Result<(), String> {
+    let _request = ChatRequest { text, attachments };
     Ok(())
 }
 
@@ -386,8 +392,8 @@ pub async fn chat(text: String) -> Result<(), String> {
 ///
 /// The engine task replaces this placeholder body with the real orchestration.
 #[tauri::command]
-pub async fn plan_feedback(text: String) -> Result<(), String> {
-    let _request = PlanFeedbackRequest { text };
+pub async fn plan_feedback(text: String, attachments: Vec<String>) -> Result<(), String> {
+    let _request = PlanFeedbackRequest { text, attachments };
     Ok(())
 }
 
@@ -752,12 +758,31 @@ mod tests {
 
     #[test]
     fn command_inputs_serialize_to_v2_wire_schema() {
-        let chat: ipc::ChatRequest = serde_json::from_value(json!({ "text": "hi" })).unwrap();
-        assert_json(&chat, json!({ "text": "hi" }));
+        let chat: ipc::ChatRequest = serde_json::from_value(json!({
+            "text": "hi",
+            "attachments": ["d61bb417-728e-4db9-8d81-2b366201aa89"]
+        }))
+        .unwrap();
+        assert_json(
+            &chat,
+            json!({
+                "text": "hi",
+                "attachments": ["d61bb417-728e-4db9-8d81-2b366201aa89"]
+            }),
+        );
 
-        let feedback: ipc::PlanFeedbackRequest =
-            serde_json::from_value(json!({ "text": "Please revise it." })).unwrap();
-        assert_json(&feedback, json!({ "text": "Please revise it." }));
+        let feedback: ipc::PlanFeedbackRequest = serde_json::from_value(json!({
+            "text": "Please revise it.",
+            "attachments": ["bf93c8d0-76de-45bd-b118-2d004d71126e"]
+        }))
+        .unwrap();
+        assert_json(
+            &feedback,
+            json!({
+                "text": "Please revise it.",
+                "attachments": ["bf93c8d0-76de-45bd-b118-2d004d71126e"]
+            }),
+        );
 
         assert_json(&ipc::Decision::Accept, json!("accept"));
         assert_json(&ipc::Decision::Reject, json!("reject"));

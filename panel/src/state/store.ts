@@ -35,6 +35,7 @@
 
 import type {
   ChangesetItem,
+  ChatAttachment,
   Episode,
   FileEntry,
   LedgerEntry,
@@ -95,6 +96,8 @@ export interface LogEntry {
    * occupying the live surface into the next phase.
    */
   tools?: AgentTool[];
+  /** Files/images attached to this user message. */
+  attachments?: ChatAttachment[];
 }
 
 /** Active plan card (from a `plan` event); replaced by a higher revision. */
@@ -389,7 +392,12 @@ export interface PanelStore {
   memorySaveSent(file: MemoryFile): void;
 
   // ---- logging ----
-  log(kind: LogKind, text: string, stage?: ProgressStage): void;
+  log(
+    kind: LogKind,
+    text: string,
+    stage?: ProgressStage,
+    attachments?: ChatAttachment[],
+  ): void;
 
   /**
    * Session restore: seed `core.log` from a saved {@link PanelLog} and ADVANCE
@@ -543,11 +551,13 @@ export function createPanelStore(): PanelStore {
     text: string,
     stage?: ProgressStage,
     tools?: AgentTool[],
+    attachments?: ChatAttachment[],
   ): void {
     logSeq += 1;
     const entry: LogEntry = { id: logSeq, kind, text };
     if (stage) entry.stage = stage;
     if (tools) entry.tools = tools;
+    if (attachments && attachments.length > 0) entry.attachments = attachments;
     // Drop oldest beyond the cap (features/06 ## Behaviors).
     const next =
       core.log.length >= MAX_LOG_ENTRIES ? core.log.slice(1) : core.log.slice();
@@ -1110,8 +1120,8 @@ export function createPanelStore(): PanelStore {
     },
 
     // ---- logging ----
-    log(kind, text, stage) {
-      pushLog(kind, text, stage);
+    log(kind, text, stage, attachments) {
+      pushLog(kind, text, stage, undefined, attachments);
       emit();
     },
 
@@ -1138,6 +1148,18 @@ export function createPanelStore(): PanelStore {
             if (tool.detail !== undefined) t.detail = tool.detail;
             return t;
           });
+        }
+        if (entry.attachments) {
+          next.attachments = entry.attachments.map((attachment) => ({
+            id: attachment.id,
+            name: attachment.name,
+            mime: attachment.mime,
+            kind: attachment.kind,
+            size: attachment.size,
+            ...(attachment.previewUrl?.startsWith("data:image/") === true
+              ? { previewUrl: attachment.previewUrl }
+              : {}),
+          }));
         }
         return next;
       });

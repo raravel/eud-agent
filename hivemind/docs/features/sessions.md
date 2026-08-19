@@ -70,7 +70,7 @@ do NOT use `Math.random`/panel-side ids).
   "updatedAt": 1718009999,
   "threadId": "019ece1c-...-f86f5b119d40",
   "pendingRequestIds": ["req-1a2b3c4d"],
-  "panelLog": { "schemaVersion": 1, "logSeq": 4, "log": [ ... ] }
+  "panelLog": { "schemaVersion": 2, "logSeq": 4, "log": [ ... ] }
 }
 ```
 - `threadId` is `null` until the first turn emits `ThreadStarted`.
@@ -84,12 +84,17 @@ do NOT use `Math.random`/panel-side ids).
 
 ```json
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "logSeq": 4,
   "log": [
-    { "id": 1, "kind": "you",   "text": "유닛 HP 올려줘" },
+    { "id": 1, "kind": "you", "text": "이 화면을 확인해 줘",
+      "attachments": [
+        { "id": "<uuid>", "name": "screen.png", "mime": "image/png",
+          "kind": "image", "size": 2048,
+          "previewUrl": "data:image/webp;base64,..." }
+      ] },
     { "id": 2, "kind": "agent", "text": "...streamdown markdown..." },
-    { "id": 3, "kind": "info",  "text": "도구 호출 2건",
+    { "id": 3, "kind": "info", "text": "도구 호출 2건",
       "tools": [
         { "id": "tool-1", "name": "file_create", "state": "done", "args": "{...}", "detail": "ok" }
       ] },
@@ -98,10 +103,15 @@ do NOT use `Math.random`/panel-side ids).
 }
 ```
 Durable `LogEntry` subset: `id`(number), `kind`(LogKind), `text`(string), optional
-`stage`(string), optional `tools[]`. Durable `AgentTool` subset: `id, name, state, args?,
-detail?` (archived tools are always terminal `done`/`failed`). Transient state
-(`turn`, `plan`, `changeset`, `pendingDecision`, `wiki`, connection flags) is NOT persisted —
-it re-arrives from the core on reconnect.
+`stage`(string), optional `tools[]`, optional `attachments[]`. Each attachment keeps
+`id, name, mime, kind, size` and an optional panel-generated `data:image/*` thumbnail;
+hydration discards any non-data preview URL. Durable `AgentTool` subset:
+`id, name, state, args?, detail?` (archived tools are always terminal `done`/`failed`).
+Transient state (`turn`, `plan`, `changeset`, `pendingDecision`, `wiki`, connection
+flags) is NOT persisted — it re-arrives from the core on reconnect.
+`conversation_rewind` replaces this blob with the prefix before the edited user message,
+sets `threadId=null`, clears pending request ids, and stages `condense_transcript(panelLog)`
+for the next fresh thread. The active session id and its attachment ownership are retained.
 
 ## Tauri IPC commands
 

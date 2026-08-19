@@ -1058,6 +1058,45 @@ describe("RAG warmup send gate", () => {
   });
 });
 
+describe("saved attachment log hydration", () => {
+  it("restores attachment metadata and keeps only generated image data URLs", () => {
+    const store = freshStore();
+    store.hydrate({
+      schemaVersion: 2,
+      logSeq: 1,
+      log: [
+        {
+          id: 1,
+          kind: "you",
+          text: "",
+          attachments: [
+            {
+              id: "safe-image",
+              name: "screen.png",
+              mime: "image/png",
+              kind: "image",
+              size: 10,
+              previewUrl: "data:image/png;base64,safe",
+            },
+            {
+              id: "unsafe-preview",
+              name: "notes.txt",
+              mime: "text/plain",
+              kind: "text",
+              size: 5,
+              previewUrl: "https://example.test/tracker.png",
+            },
+          ],
+        },
+      ],
+    });
+
+    const restored = store.getState().log[0].attachments;
+    expect(restored?.[0].previewUrl).toBe("data:image/png;base64,safe");
+    expect(restored?.[1].previewUrl).toBeUndefined();
+  });
+});
+
 // Type-only: PanelState carries the v2 fields the (future) UI renders from.
 const _typecheck: PanelState = createPanelStore().getState();
 void _typecheck;

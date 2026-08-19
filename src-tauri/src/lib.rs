@@ -9,6 +9,7 @@
 use tauri::path::BaseDirectory;
 use tauri::Manager;
 
+pub mod attachment;
 pub mod bootstrap;
 pub mod bridge_install;
 pub mod bridge_io;
@@ -152,6 +153,8 @@ pub fn run() {
             if let Err(error) = data_dirs.ensure_dirs() {
                 eprintln!("eud-agent: cannot create data dirs: {error}");
             }
+            let attachment_store = attachment::AttachmentStore::new(data_dirs.attachments_dir());
+            attachment_store.cleanup_stale_drafts();
             if let Ok(bridge) = ipc::bridge_from_config(&data_dirs) {
                 bridge.cleanup_stale();
             }
@@ -189,6 +192,7 @@ pub fn run() {
             }
 
             app.manage(ipc::BridgeManaged::new(data_dirs.clone()));
+            app.manage(attachment::AttachmentManaged::new(attachment_store.clone()));
 
             // Feature 10 boot flow (EUD-132): on later launches where the editor
             // path is already configured but an asset went missing/corrupt,
