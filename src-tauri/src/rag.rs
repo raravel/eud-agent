@@ -125,6 +125,62 @@ pub fn cosine(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
 }
 
+/// Split a query into lexical search terms for substring matching.
+///
+/// Maximal runs of ASCII identifier chars (`[A-Za-z0-9_]`) and maximal runs of
+/// Hangul are extracted as separate terms; every other char is a separator. This
+/// splits an identifier from an attached Korean particle (`chatEvent에` ->
+/// `chatevent`) and keeps hex/underscored tokens intact (`0x58D900`, `__addr__`).
+/// ASCII terms are lowercased (case-insensitive matching); runs shorter than
+/// [`MIN_LEXICAL_TERM`] chars are dropped. Duplicate terms are removed, order kept.
+pub fn tokenize_lexical(query: &str) -> Vec<String> {
+    #[derive(PartialEq, Clone, Copy)]
+    enum Class {
+        Ascii,
+        Hangul,
+        Other,
+    }
+    fn classify(ch: char) -> Class {
+        if ch.is_ascii_alphanumeric() || ch == '_' {
+            Class::Ascii
+        } else if ('\u{AC00}'..='\u{D7A3}').contains(&ch) // Hangul syllables
+            || ('\u{1100}'..='\u{11FF}').contains(&ch) // Hangul Jamo
+            || ('\u{3130}'..='\u{318F}').contains(&ch)
+        // Hangul Compatibility Jamo
+        {
+            Class::Hangul
+        } else {
+            Class::Other
+        }
+    }
+    fn push_term(cur: &mut String, terms: &mut Vec<String>) {
+        if cur.chars().count() >= MIN_LEXICAL_TERM {
+            let term = cur.to_lowercase();
+            if !terms.iter().any(|existing| existing == &term) {
+                terms.push(term);
+            }
+        }
+        cur.clear();
+    }
+
+    let mut terms: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut cur_class = Class::Other;
+    for ch in query.chars() {
+        let class = classify(ch);
+        // A separator, or a switch between Ascii/Hangul, closes the current run.
+        if class == Class::Other || class != cur_class {
+            push_term(&mut cur, &mut terms);
+        }
+        if class != Class::Other {
+            cur.push(ch);
+            cur_class = class;
+        }
+    }
+    push_term(&mut cur, &mut terms);
+    terms
+}
+
 /// Rank `corpus` by cosine similarity to `query` and return the top-`k` corpus
 /// indices, best first. All vectors are assumed L2-normalized (cosine == dot), so
 /// ranking is a brute-force dot product per corpus entry (Decision 10). Ties break
@@ -152,6 +208,11 @@ pub fn top_k(query: &[f32], corpus: &[Embedding], k: usize) -> Vec<usize> {
 /// Max top-k returned by [`Rag::rank`] / [`Rag::search`] (v1 Korean-query guidance
 /// clamped k to 10). A larger requested `k` is clamped down to this.
 pub const MAX_TOP_K: usize = 10;
+
+/// Minimum length (in chars) of a lexical query term. Runs shorter than this are
+/// dropped by [`tokenize_lexical`] so a bare Korean particle (`에`, `의`) or a
+/// single letter does not substring-match nearly every chunk.
+const MIN_LEXICAL_TERM: usize = 2;
 
 /// Per-tier ranking multiplier indexed by `IndexEntry.tier_level` (0=Q&A … 3=official).
 /// A narrow band near 1.0 so source tier NUDGES but never DOMINATES the cosine signal
@@ -491,6 +552,86 @@ impl Rag {
                 score,
             })
             .collect()
+    }
+
+    /// Case-insensitive substring ("lexical") ranking over the in-memory index.
+    ///
+    /// Complements the dense-embedding [`Self::rank`] so exact identifiers and
+    /// Korean terms (e.g. `chatEvent`, `0x58D900`, `버튼셋`) are found even when
+    /// their dense-vector cosine does not reach the top-k. Needs NO embedding model,
+    /// so it works during warmup. The query is split by [`tokenize_lexical`]; an
+    /// entry matches when any term is a substring of its (lowercased) text. Ranked
+    /// by distinct terms matched (desc), then total occurrences (desc), then `id`
+    /// (asc, deterministic). `Hit::score` carries the occurrence count — a lexical
+    /// relevance signal, NOT a cosine (hybrid places these ahead of cosine hits, so
+    /// the two score scales never need to be comparable). `k` is clamped to
+    /// [`MAX_TOP_K`]; no terms / empty index -> empty Vec.
+    pub fn lexical_rank(&self, query: &str, k: usize) -> Vec<Hit> {
+        let terms = tokenize_lexical(query);
+        if terms.is_empty() {
+            return Vec::new();
+        }
+        let mut scored: Vec<(&IndexEntry, usize, usize)> = Vec::new();
+        for entry in &self.index {
+            let haystack = entry.text.to_lowercase();
+            let mut distinct = 0usize;
+            let mut occurrences = 0usize;
+            for term in &terms {
+                let count = haystack.matches(term.as_str()).count();
+                if count > 0 {
+                    distinct += 1;
+                    occurrences += count;
+                }
+            }
+            if distinct > 0 {
+                scored.push((entry, distinct, occurrences));
+            }
+        }
+        // More distinct terms first, then more occurrences, then lower id (stable).
+        scored.sort_by(|a, b| b.1.cmp(&a.1).then(b.2.cmp(&a.2)).then(a.0.id.cmp(&b.0.id)));
+        scored
+            .into_iter()
+            .take(k.min(MAX_TOP_K))
+            .map(|(entry, _distinct, occurrences)| Hit {
+                text: entry.text.clone(),
+                source: entry.source.clone(),
+                score: occurrences as f32,
+            })
+            .collect()
+    }
+
+    /// Hybrid retrieval: [`Self::lexical_rank`] first, then dense [`Self::search`]
+    /// fills the remaining slots, deduped by chunk text, clamped to [`MAX_TOP_K`].
+    ///
+    /// This is what `search_docs` uses so a bare identifier query (`chatEvent`) is
+    /// found by substring match even though its dense cosine misses the top-k, while
+    /// conceptual Korean queries still get semantic hits. The lexical pass needs no
+    /// model, so hits still surface while the embedder is warming up (the semantic
+    /// pass then degrades to empty via `unwrap_or_default` rather than erroring).
+    pub fn search_hybrid(&self, query: &str, k: usize) -> Vec<Hit> {
+        let k = k.min(MAX_TOP_K);
+        let mut out: Vec<Hit> = Vec::with_capacity(k);
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        // Lexical hits take the leading slots (exact-match wins for identifiers).
+        for hit in self.lexical_rank(query, k) {
+            if out.len() >= k {
+                break;
+            }
+            if seen.insert(hit.text.clone()) {
+                out.push(hit);
+            }
+        }
+        // Semantic hits fill what remains; a warming/failed embedder yields none.
+        for hit in self.search(query, k).unwrap_or_default() {
+            if out.len() >= k {
+                break;
+            }
+            if seen.insert(hit.text.clone()) {
+                out.push(hit);
+            }
+        }
+        out
     }
 
     /// Embed the query with the model then [`Self::rank`]. Returns
@@ -1026,6 +1167,79 @@ mod query {
         assert!(
             matches!(res, Err(RagError::Warming)),
             "search during warmup must be RagError::Warming (non-blocking), got {res:?}"
+        );
+    }
+
+    /// One index entry with arbitrary text on a fixed (shared) vector — the vector is
+    /// irrelevant to the lexical/hybrid tests, which never touch the embedder.
+    fn entry_with_text(id: u64, text: &str) -> IndexEntry {
+        IndexEntry {
+            id,
+            vector: vec_with(&[(0, 1.0)]),
+            tier_level: 1,
+            text: text.to_string(),
+            source: format!("[doc {id}](https://cafe/edac/{id})"),
+        }
+    }
+
+    #[test]
+    fn tokenize_lexical_splits_and_filters() {
+        // A Korean particle glued to an identifier must not defeat the substring match.
+        assert_eq!(
+            tokenize_lexical("chatEvent에 대해"),
+            vec!["chatevent".to_string(), "대해".to_string()]
+        );
+        // Single-char runs (particles, stray letters) are dropped.
+        assert!(tokenize_lexical("a 의 b").is_empty());
+        // Hex + underscored identifiers survive intact (and lowercase ASCII).
+        assert_eq!(
+            tokenize_lexical("0x58D900 __addr__"),
+            vec!["0x58d900".to_string(), "__addr__".to_string()]
+        );
+        // Duplicate terms are removed, first-seen order kept.
+        assert_eq!(
+            tokenize_lexical("chatEvent chatevent"),
+            vec!["chatevent".to_string()]
+        );
+    }
+
+    #[test]
+    fn lexical_rank_finds_identifier_substring() {
+        let entries = vec![
+            entry_with_text(
+                1,
+                "제목: 미궁\n\n[chatEvent]\n__addr__: 0x58D900 chatEvent 사용",
+            ),
+            entry_with_text(2, "제목: 무관\n\n버튼셋 이야기"),
+        ];
+        let rag = Rag::new(entries, None);
+
+        let hits = rag.lexical_rank("chatEvent", 5);
+        assert_eq!(hits.len(), 1, "only the chatEvent chunk matches");
+        assert!(hits[0].text.contains("chatEvent"));
+        // score is the occurrence count: "chatevent" appears twice in entry 1.
+        assert_eq!(hits[0].score, 2.0);
+
+        // A query with no usable terms (all sub-min-length) returns nothing.
+        assert!(rag.lexical_rank("a 의", 5).is_empty());
+    }
+
+    #[test]
+    fn search_hybrid_surfaces_lexical_before_warmup() {
+        // Acceptance mirror: search_docs("chatEvent") must return >= 1 hit even though
+        // the embedder is not warmed. The semantic pass returns Warming -> empty, but
+        // the lexical pass still finds the chatEvent chunk (no model needed).
+        let entries = vec![
+            entry_with_text(1, "제목: 미궁 퍼즐맵\n\n[chatEvent] __addr__: 0x58D900"),
+            entry_with_text(2, "제목: 다른 글\n\n관계 없는 내용"),
+        ];
+        let rag = Rag::new(entries, None);
+        assert!(!rag.is_ready(), "construction must not load the model");
+
+        let hits = rag.search_hybrid("chatEvent", 5);
+        assert!(
+            hits.iter().any(|hit| hit.text.contains("chatEvent")),
+            "hybrid must surface the chatEvent chunk via lexical match, got {hits:?}"
         );
     }
 }

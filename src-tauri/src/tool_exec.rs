@@ -860,12 +860,15 @@ impl ToolRuntime {
             .unwrap_or(SEARCH_DOCS_DEFAULT_K)
             .clamp(1, SEARCH_DOCS_MAX_K) as usize;
 
-        // Empty index (no asset yet) or a model still warming returns zero hits
-        // rather than blocking — zero hits still lift the evidence gate.
+        // Empty index (no asset yet) returns zero hits. Otherwise hybrid search:
+        // lexical substring hits (exact identifiers/Korean terms, no model needed)
+        // first, then dense semantic hits fill the rest. A model still warming
+        // yields no semantic hits but lexical still works; zero hits either way
+        // still lift the evidence gate.
         let hits = if self.rag.is_empty() {
             Vec::new()
         } else {
-            self.rag.search(query, k).unwrap_or_default()
+            self.rag.search_hybrid(query, k)
         };
 
         let items: Vec<Value> = hits

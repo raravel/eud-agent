@@ -5,7 +5,8 @@
   "scripts": {
     "build": "tsc --noEmit",
     "test": "vitest run",
-    "scrape": "tsx src/index.ts"
+    "scrape": "tsx src/index.ts",
+    "sync-public": "tsx src/syncPublic.ts"
   },
   "dependencies": {
     "cheerio": "^1.1.2",

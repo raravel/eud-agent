@@ -71,10 +71,13 @@ happy-dom ^16.8.1.
 - `panel/` — React app (reused), Tauri IPC transport; built to `panel/dist`.
 - `ci/` — RAG index builder + the committed corpus `ci/corpus/*.jsonl` (re-embeds the in-repo
   corpus with the runtime fastembed pipeline; output published to GitHub Releases).
-- `tools/scraper/` — Node.js + TypeScript Naver-Cafe scraper (local-only, cookie-gated) that
-  produces `ci/corpus/*.jsonl`; its own package.json/tsconfig (TypeScript ~5.9, matching panel).
-  Scraping deps (HTTP client + HTML parser + cookie handling) are pinned when EUD-138 lands and
-  bound here under Active Dependencies then. See [[decisions/15_in-house-rag-corpus]].
+- `tools/scraper/` — Node.js + TypeScript corpus tooling (local-only): authenticated Naver-Cafe
+  API refresh plus commit-pinned SCRMapDocs/eudplib/eud-book/EUD Editor 3 extraction into
+  `ci/corpus/*.jsonl`; its own package.json/tsconfig (TypeScript ~5.9, matching panel).
+  HTTP, HTML parsing, cookie handling, and local Git snapshot dependencies are bound below.
+- `tools/epscript-lsp-agent/` — TypeScript adapter surface, exact dependency lock,
+  deterministic esbuild entry, and Node fixtures. `scripts/build_epscript_lsp_agent.ps1`
+  fetches only the pinned/hash-verified archive and reproduces the committed vendor bytes.
 
 ## Rationale
 - **Rust over Node/TS** remains the application decision: no Electron or in-process Node.

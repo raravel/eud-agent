@@ -4,15 +4,18 @@ export type ParsedPost = {
   id: string;
   title: string;
   url: string;
-  board: string;
+  source: string;
   contentHtml: string;
+  comments?: string;
 };
 
 export type CorpusRow = {
+  id?: string;
   title: string;
   content: string;
   url?: string;
   source: string;
+  comments?: string;
 };
 
 const blockSelector = "p, pre, li, div, h1, h2, h3, h4, h5, h6";
@@ -20,16 +23,21 @@ const nonVisibleSelector =
   'script, style, noscript, template, [hidden], [aria-hidden="true"]';
 
 export function postToCorpusRow(post: ParsedPost): CorpusRow {
-  const content = htmlToVisibleBlocks(post.contentHtml);
   const row: CorpusRow = {
+    id: post.id.trim(),
     title: post.title.trim(),
-    content,
-    source: `board_${post.board}.jsonl`
+    content: htmlToVisibleBlocks(post.contentHtml),
+    source: post.source
   };
 
   const url = post.url.trim();
   if (url.length > 0) {
     row.url = url;
+  }
+
+  const comments = post.comments?.trim();
+  if (comments) {
+    row.comments = comments;
   }
 
   return row;

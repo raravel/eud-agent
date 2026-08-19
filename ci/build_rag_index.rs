@@ -14,7 +14,15 @@ use sha2::{Digest, Sha256};
 const EMBED_DIM: usize = 1024;
 const INDEX_MAGIC: &[u8; 4] = b"ERAG";
 const INDEX_VERSION: u32 = 2;
-const INPUT_FILES: [&str; 3] = ["articles.jsonl", "eud_book.jsonl", "cafebook.jsonl"];
+const INPUT_FILES: [&str; 7] = [
+    "articles.jsonl",
+    "eud_book.jsonl",
+    "cafebook.jsonl",
+    "scrmapdocs_en.jsonl",
+    "eudplib_api.jsonl",
+    "eudplib_examples.jsonl",
+    "eud_editor_schema.jsonl",
+];
 // The int8 BGEM3Q model's embeddings are batch-size-dependent (measured:
 // batch 64 drifts cosine to ~0.98 vs batch 16), so this default MUST stay
 // 16 to keep the index byte-equivalent to the verified embedding space.
@@ -193,12 +201,13 @@ fn read_corpus(corpus_dir: &Path) -> Result<Vec<CorpusDoc>> {
 /// The `source` values carry the original board filename WITH a `.jsonl` suffix; the
 /// suffix is stripped before matching. Mapping (see features/17_rag-knowledge-tiering.md):
 ///
-/// | source                              | tier | meaning              |
-/// |-------------------------------------|------|----------------------|
-/// | `eud_book`, `cafebook`              | 3    | official             |
-/// | `board_강좌팁`, `board_연구칼럼`     | 2    | lecture / research   |
-/// | `board_유틸리티툴`, `board_Lua자료실`, `user_*` | 1 | general       |
-/// | `board_질문답변`                     | 0    | Q&A (may be wrong)   |
+/// | source                                                         | tier | meaning            |
+/// |----------------------------------------------------------------|------|--------------------|
+/// | `eud_book`, `cafebook`, `scrmapdocs_en`, `eudplib_*`,           | 3    | primary reference  |
+/// | `eud_editor_schema`                                            |      |                    |
+/// | `board_강좌팁`, `board_연구칼럼`                                | 2    | lecture / research |
+/// | `board_유틸리티툴`, `board_Lua자료실`, `user_*`                  | 1    | general            |
+/// | `board_질문답변`                                                | 0    | Q&A (may be wrong) |
 ///
 /// An unknown/unmapped source falls back to tier 1 (general) — the conservative neutral
 /// default so an unrecognized source is neither trusted as official nor demoted to Q&A.
@@ -206,7 +215,8 @@ fn read_corpus(corpus_dir: &Path) -> Result<Vec<CorpusDoc>> {
 fn tier_level_for_source(source: &str) -> u8 {
     let stem = source.strip_suffix(".jsonl").unwrap_or(source);
     match stem {
-        "eud_book" | "cafebook" => 3,
+        "eud_book" | "cafebook" | "scrmapdocs_en" | "eudplib_api" | "eudplib_examples"
+        | "eud_editor_schema" => 3,
         "board_강좌팁" | "board_연구칼럼" => 2,
         "board_유틸리티툴" | "board_Lua자료실" => 1,
         "board_질문답변" => 0,
@@ -468,6 +478,10 @@ mod tests {
     fn tier_level_maps_official_sources_to_3() {
         assert_eq!(super::tier_level_for_source("eud_book.jsonl"), 3);
         assert_eq!(super::tier_level_for_source("cafebook.jsonl"), 3);
+        assert_eq!(super::tier_level_for_source("scrmapdocs_en.jsonl"), 3);
+        assert_eq!(super::tier_level_for_source("eudplib_api.jsonl"), 3);
+        assert_eq!(super::tier_level_for_source("eudplib_examples.jsonl"), 3);
+        assert_eq!(super::tier_level_for_source("eud_editor_schema.jsonl"), 3);
     }
 
     #[test]

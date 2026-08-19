@@ -1,4 +1,4 @@
-import { request } from "undici";
+import { fetch } from "undici";
 
 export class CookieExpiredError extends Error {
   constructor(message = "Naver login cookie is expired or invalid.") {
@@ -30,21 +30,24 @@ export class NaverClient {
   }
 
   async fetchText(url: string): Promise<string> {
-    const response = await request(url, {
+    const response = await fetch(url, {
       method: "GET",
+      redirect: "follow",
       headers: {
         accept:
-          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+          "application/json,text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "accept-language": "ko-KR,ko;q=0.9,en-US;q=0.7,en;q=0.6",
         cookie: this.cookie,
+        origin: "https://cafe.naver.com",
+        referer: "https://cafe.naver.com/",
         "user-agent": this.userAgent
       }
     });
 
-    const location = headerValue(response.headers.location);
-    const text = await response.body.text();
+    const location = response.headers.get("location") ?? response.url;
+    const text = await response.text();
 
-    if (isLoginRequiredResponse(response.statusCode, location, text)) {
+    if (isLoginRequiredResponse(response.status, location)) {
       throw new CookieExpiredError(
         `Naver login cookie was rejected while fetching ${url}. Cookie=${redactCookie(
           this.cookie
@@ -52,15 +55,24 @@ export class NaverClient {
       );
     }
 
-    if (response.statusCode >= 300 && response.statusCode < 400) {
-      throw new Error(`Unexpected redirect while fetching ${url}: ${location ?? "(none)"}`);
+    if (response.status >= 300 && response.status < 400) {
+      throw new Error(`Unexpected redirect while fetching ${url}: ${location}`);
     }
 
-    if (response.statusCode >= 400) {
-      throw new Error(`HTTP ${response.statusCode} while fetching ${url}`);
+    if (response.status >= 400) {
+      throw new Error(`HTTP ${response.status} while fetching ${url}`);
     }
 
     return text;
+  }
+
+  async fetchJson<T>(url: string): Promise<T> {
+    const text = await this.fetchText(url);
+    try {
+      return JSON.parse(text) as T;
+    } catch {
+      throw new Error(`Expected JSON while fetching ${url}`);
+    }
   }
 }
 
@@ -68,32 +80,10 @@ export function redactCookie(cookie: string): string {
   return cookie.trim().length > 0 ? "***" : "";
 }
 
-function isLoginRequiredResponse(
-  statusCode: number,
-  location: string | undefined,
-  body: string
-): boolean {
+function isLoginRequiredResponse(statusCode: number, location: string | undefined): boolean {
   if (statusCode === 401) {
     return true;
   }
 
-  if (location && /nid\.naver\.com\/nidlogin|nidlogin\.login/i.test(location)) {
-    return true;
-  }
-
-  return [
-    "nidlogin.login",
-    "로그인 후 이용",
-    "로그인이 필요",
-    "CafeLogin",
-    "login_required"
-  ].some((marker) => body.includes(marker));
-}
-
-function headerValue(value: string | string[] | undefined): string | undefined {
-  if (Array.isArray(value)) {
-    return value.join(", ");
-  }
-
-  return value;
+  return Boolean(location && /nid\.naver\.com\/nidlogin|nidlogin\.login/i.test(location));
 }
