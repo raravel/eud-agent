@@ -14,6 +14,7 @@ user/system `node.exe`; no Node runtime is bundled.
 - lucide-react ^1.17.0 — icons
 - class-variance-authority ^0.7.1, clsx ^2.1.1, tailwind-merge ^3.6.0 — styling utils
 - use-stick-to-bottom ^1.1.6 — chat autoscroll
+- @tanstack/react-virtual ^3.14.10 — variable-height conversation row virtualization
 - (new) @tauri-apps/api ^2 — Tauri IPC client (invoke + event)
 
 Dev: vite ^7.1.12, vitest ^3.2.6, typescript ~5.9.3, @vitejs/plugin-react ^5.0.4,

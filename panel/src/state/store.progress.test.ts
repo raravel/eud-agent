@@ -60,6 +60,6 @@ describe("live progress rows clear when the turn ends", () => {
     store.chatSent();
     store.log("progress", "codex 실행 중…", "codex");
     store.cancelSent();
-    expect(logTexts(store)).toEqual([]);
+    expect(logTexts(store)).toEqual(["작업을 중단했습니다."]);
   });
 });

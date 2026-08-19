@@ -368,6 +368,25 @@ mod tests {
     }
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexTurnInput {
+    pub text: String,
+    pub image_paths: Vec<PathBuf>,
+    /// Real per-project Codex cwd. `None` retains the hermetic read-only mode
+    /// used by isolated protocol tests and non-project operations.
+    pub workspace_root: Option<PathBuf>,
+}
+
+impl CodexTurnInput {
+    pub fn text(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            image_paths: Vec::new(),
+            workspace_root: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AppServerEvent {
     ThreadStarted {
         thread_id: String,
@@ -542,9 +561,54 @@ where
         .await?;
         // Complete the app-server handshake before issuing model/thread
         // requests. The notification intentionally has no `id` or `params`.
+
         write_json_rpc_line(&self.writer, serde_json::json!({ "method": "initialized" })).await?;
         self.initialized = true;
         Ok(())
+    }
+    /// Ensure the exact-root Windows sandbox backend is installed before a
+    /// project thread can run. The custom profile requires the elevated backend;
+    /// unsupported/denied setup fails closed instead of falling back to
+    /// full-filesystem-read legacy workspace-write.
+    #[cfg(windows)]
+    pub async fn ensure_workspace_sandbox(&mut self, cwd: &Path) -> Result<(), AppServerError> {
+        self.ensure_initialized().await?;
+        if self.windows_sandbox_ready().await? {
+            return Ok(());
+        }
+
+        self.send_request(
+            "windowsSandbox/setupStart",
+            serde_json::json!({
+                "mode": "elevated",
+                "cwd": path_text(cwd)?,
+            }),
+        )
+        .await?;
+
+        let deadline = time::Instant::now() + Duration::from_secs(120);
+        while time::Instant::now() < deadline {
+            time::sleep(Duration::from_millis(500)).await;
+            if self.windows_sandbox_ready().await? {
+                return Ok(());
+            }
+        }
+        Err(AppServerError::new(
+            "strict Windows workspace sandbox setup did not complete; approve the elevation prompt and retry",
+        ))
+    }
+
+    #[cfg(not(windows))]
+    pub async fn ensure_workspace_sandbox(&mut self, _cwd: &Path) -> Result<(), AppServerError> {
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    async fn windows_sandbox_ready(&mut self) -> Result<bool, AppServerError> {
+        let value = self
+            .send_request("windowsSandbox/readiness", serde_json::Value::Null)
+            .await?;
+        Ok(value.get("status").and_then(serde_json::Value::as_str) == Some("ready"))
     }
 
     pub async fn list_models(&mut self) -> Result<Vec<CodexModel>, AppServerError> {
@@ -585,7 +649,25 @@ where
         self.model_selection = selection;
     }
 
-    pub async fn run_turn(&mut self, prompt: String) -> Result<(), AppServerError> {
+    pub async fn run_turn(&mut self, input: CodexTurnInput) -> Result<(), AppServerError> {
+        let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(0_u64);
+        let interrupted = self.run_turn_cancellable(input, cancel_rx, 0).await?;
+        debug_assert!(!interrupted);
+        Ok(())
+    }
+
+    /// Run one turn and interrupt it when `cancellation` advances past the
+    /// generation captured by the caller. The app-server requires both ids for
+    /// `turn/interrupt`; `turn/start` returns the authoritative turn id.
+    ///
+    /// Returns `true` only after the interrupted turn emits `turn/completed`, so
+    /// callers can safely unlock their UI and start the next turn.
+    pub async fn run_turn_cancellable(
+        &mut self,
+        input: CodexTurnInput,
+        mut cancellation: tokio::sync::watch::Receiver<u64>,
+        cancellation_generation: u64,
+    ) -> Result<bool, AppServerError> {
         self.ensure_initialized().await?;
 
         let mut turn_completed = self.turn_completed.subscribe();
@@ -594,37 +676,98 @@ where
             Some(thread_id) => {
                 self.send_request(
                     "thread/resume",
-                    serde_json::json!({ "threadId": thread_id.clone() }),
+                    thread_resume_params(&thread_id, input.workspace_root.as_deref())?,
                 )
                 .await?;
                 thread_id
             }
             None => {
-                self.send_request("thread/start", thread_start_params())
-                    .await?;
+                self.send_request(
+                    "thread/start",
+                    thread_start_params(input.workspace_root.as_deref())?,
+                )
+                .await?;
                 self.await_thread_started().await?
             }
         };
 
+        let mut user_input = Vec::with_capacity(1 + input.image_paths.len());
+        user_input.push(serde_json::json!({
+            "type": "text",
+            "text": input.text,
+            "text_elements": [],
+        }));
+        user_input.extend(input.image_paths.into_iter().map(|path| {
+            serde_json::json!({
+                "type": "localImage",
+                "path": path,
+            })
+        }));
+
         let mut params = serde_json::json!({
             "threadId": thread_id,
-            "input": [{
-                "type": "text",
-                "text": prompt,
-                "text_elements": [],
-            }],
+            "input": user_input,
         });
         if let Some(selection) = &self.model_selection {
             params["model"] = serde_json::json!(selection.model);
             params["effort"] = serde_json::json!(selection.reasoning_effort);
         }
-        self.send_request("turn/start", params).await?;
+        if let Some(workspace_root) = input.workspace_root.as_deref() {
+            params["cwd"] = serde_json::json!(path_text(workspace_root)?);
+        }
+        let started = self.send_request("turn/start", params).await?;
+        let turn_id = started
+            .pointer("/turn/id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
 
-        turn_completed
-            .recv()
-            .await
-            .map_err(|err| AppServerError::new(format!("turn completion wait failed: {err}")))?;
-        Ok(())
+        if *cancellation.borrow() != cancellation_generation {
+            if turn_completed.try_recv().is_ok() {
+                return Ok(false);
+            }
+            let turn_id = turn_id.as_deref().ok_or_else(|| {
+                AppServerError::new("turn/start response omitted turn.id; cannot interrupt")
+            })?;
+            self.send_request(
+                "turn/interrupt",
+                serde_json::json!({"threadId": thread_id, "turnId": turn_id}),
+            )
+            .await?;
+            turn_completed.recv().await.map_err(|err| {
+                AppServerError::new(format!("interrupted turn completion wait failed: {err}"))
+            })?;
+            return Ok(true);
+        }
+
+        tokio::select! {
+            biased;
+            completed = turn_completed.recv() => {
+                completed.map_err(|err| {
+                    AppServerError::new(format!("turn completion wait failed: {err}"))
+                })?;
+                Ok(false)
+            }
+            changed = cancellation.changed() => {
+                if changed.is_err() {
+                    turn_completed.recv().await.map_err(|err| {
+                        AppServerError::new(format!("turn completion wait failed: {err}"))
+                    })?;
+                    return Ok(false);
+                }
+                let turn_id = turn_id.as_deref().ok_or_else(|| {
+                    AppServerError::new("turn/start response omitted turn.id; cannot interrupt")
+                })?;
+                self.send_request(
+                    "turn/interrupt",
+                    serde_json::json!({"threadId": thread_id, "turnId": turn_id}),
+                )
+                .await?;
+                turn_completed.recv().await.map_err(|err| {
+                    AppServerError::new(format!("interrupted turn completion wait failed: {err}"))
+                })?;
+                Ok(true)
+            }
+        }
     }
 
     pub async fn current_thread_id(&self) -> Option<String> {
@@ -677,40 +820,48 @@ where
     }
 }
 
-/// Config overrides for every spawned codex app-server. The agent's turns must
-/// stay hermetic — only OUR system prompt steers them:
-/// - `skills.include_instructions=false` suppresses the skills catalog/
-///   instructions block (user-local skills must not leak in);
-/// - `project_doc_max_bytes=0` disables AGENTS.md injection entirely — codex
-///   walks the cwd and its PARENTS for project docs, so even the app-owned
-///   workspace cwd is not enough on its own (measured 2026-06-11: a dev run
-///   from the repo injected the hivemind AGENTS.md and codex analyzed the Rust
-///   repo instead of the map project);
-/// - reasoning summaries enabled for the gpt-5.5 reasoning surface.
-pub(crate) const APP_SERVER_CONFIG_OVERRIDES: [&str; 4] = [
+/// Config overrides for every spawned codex app-server. User-local skills and
+/// project docs stay disabled; the only writable execution context is the
+/// app-owned per-project workspace selected by the strict `eud_workspace`
+/// permission profile.
+pub(crate) const APP_SERVER_CONFIG_OVERRIDES: [&str; 7] = [
     "skills.include_instructions=false",
     "project_doc_max_bytes=0",
     "model_supports_reasoning_summaries=true",
     "model_reasoning_summary=\"detailed\"",
+    "default_permissions=\"eud_workspace\"",
+    "windows.sandbox=\"elevated\"",
+    "permissions.eud_workspace={description=\"eud-agent project workspace\",filesystem={\":minimal\"=\"read\",\":workspace_roots\"={\".\"=\"write\",\"source/**\"=\"read\"}},network={enabled=false}}",
 ];
 
-/// Params for the `thread/start` request that opens a fresh codex thread.
-///
-/// `sandboxPolicy: readOnly` blocks the codex subprocess's OWN filesystem
-/// tools (shell writes / apply_patch) — the agent's "project" is the editor's
-/// open map reached via the eud-tools MCP, never the cwd, so codex must not
-/// edit the disk. The harness (memory / journal / RAG / the mapsafe map write)
-/// runs in OUR parent process, entirely outside this sandbox, so it is
-/// unaffected. `networkAccess:false` keeps the sandboxed shell offline (the
-/// model API + RAG are not sandbox-network paths). readOnly is the strongest
-/// available mode — the codex sandbox enum has no read-blocking variant; reads
-/// land on the empty workspace cwd. `approvalPolicy: on-request` is retained so
-/// the eud-tools MCP elicitation accept flow still routes through our handler.
-fn thread_start_params() -> serde_json::Value {
-    serde_json::json!({
-        "approvalPolicy": "on-request",
-        "sandboxPolicy": { "type": "readOnly", "networkAccess": false },
-    })
+/// Params for a fresh thread. Project turns use the custom split-filesystem
+/// profile selected at app-server launch; tests/non-project callers retain the
+/// previous read-only policy.
+fn thread_start_params(workspace_root: Option<&Path>) -> Result<serde_json::Value, AppServerError> {
+    let mut params = serde_json::json!({ "approvalPolicy": "on-request" });
+    if let Some(workspace_root) = workspace_root {
+        params["cwd"] = serde_json::json!(path_text(workspace_root)?);
+    } else {
+        params["sandboxPolicy"] = serde_json::json!({ "type": "readOnly", "networkAccess": false });
+    }
+    Ok(params)
+}
+
+fn thread_resume_params(
+    thread_id: &str,
+    workspace_root: Option<&Path>,
+) -> Result<serde_json::Value, AppServerError> {
+    let mut params = serde_json::json!({ "threadId": thread_id });
+    if let Some(workspace_root) = workspace_root {
+        params["cwd"] = serde_json::json!(path_text(workspace_root)?);
+    }
+    Ok(params)
+}
+
+fn path_text(path: &Path) -> Result<String, AppServerError> {
+    path.to_str()
+        .map(str::to_string)
+        .ok_or_else(|| AppServerError::new("Codex workspace path is not UTF-8"))
 }
 
 /// The dotted-key `-c` override that registers the in-process eud-tools MCP
@@ -736,6 +887,10 @@ impl CodexAppServerClient<tokio::process::ChildStdout, tokio::process::ChildStdi
         // Attach the eud-tools MCP server so codex's turns can actually call the
         // tool registry (without this the agent has no map/file/search tools).
         command.arg("-c").arg(mcp_server_override(mcp_port));
+        let private_tmp = cwd.as_ref().join(crate::workspace::TEMP_DIR);
+        if private_tmp.is_dir() {
+            command.env("TEMP", &private_tmp).env("TMP", &private_tmp);
+        }
         command
             .current_dir(cwd.as_ref())
             .stdin(std::process::Stdio::piped())
@@ -1182,19 +1337,67 @@ mod app_server_override_tests {
     use super::APP_SERVER_CONFIG_OVERRIDES;
 
     #[test]
-    fn well_known_codex_path_is_under_the_local_app_data_bin_dir() {
-        let path =
-            super::well_known_codex_path(std::path::Path::new("C:\\Users\\x\\AppData\\Local"));
+    fn well_known_codex_distribution_is_under_the_local_app_data_bin_dir() {
+        let local = std::path::Path::new("C:\\Users\\x\\AppData\\Local");
+        let codex = super::well_known_codex_path(local);
+        let host = super::well_known_codex_host_path(local);
+        let sandbox_setup = super::well_known_codex_sandbox_setup_path(local);
         assert!(
-            path.ends_with("eud-agent\\bin\\codex.exe")
-                || path.ends_with("eud-agent/bin/codex.exe")
+            codex.ends_with("eud-agent\\bin\\codex.exe")
+                || codex.ends_with("eud-agent/bin/codex.exe")
+        );
+        assert!(
+            host.ends_with("eud-agent\\bin\\codex-code-mode-host.exe")
+                || host.ends_with("eud-agent/bin/codex-code-mode-host.exe")
+        );
+        assert!(
+            sandbox_setup.ends_with("eud-agent\\bin\\codex-windows-sandbox-setup.exe")
+                || sandbox_setup.ends_with("eud-agent/bin/codex-windows-sandbox-setup.exe")
         );
     }
 
     #[test]
-    fn overrides_block_skills_and_project_docs() {
+    fn app_managed_codex_requires_its_runtime_siblings() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let local = std::env::temp_dir().join(format!("eud-agent-codex-path-test-{nanos}"));
+        let bin = local.join("eud-agent").join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join("codex.exe"), b"codex").unwrap();
+
+        assert_eq!(
+            super::app_managed_codex(&local),
+            Err(bin.join("codex-code-mode-host.exe"))
+        );
+
+        std::fs::write(bin.join("codex-code-mode-host.exe"), b"host").unwrap();
+        assert_eq!(
+            super::app_managed_codex(&local),
+            Err(bin.join("codex-windows-sandbox-setup.exe"))
+        );
+
+        std::fs::write(
+            bin.join("codex-windows-sandbox-setup.exe"),
+            b"sandbox setup",
+        )
+        .unwrap();
+        assert_eq!(
+            super::app_managed_codex(&local),
+            Ok(Some(bin.join("codex.exe")))
+        );
+        std::fs::remove_dir_all(local).ok();
+    }
+
+    #[test]
+    fn overrides_define_strict_project_workspace_profile() {
         assert!(APP_SERVER_CONFIG_OVERRIDES.contains(&"skills.include_instructions=false"));
         assert!(APP_SERVER_CONFIG_OVERRIDES.contains(&"project_doc_max_bytes=0"));
+        assert!(APP_SERVER_CONFIG_OVERRIDES.contains(&"windows.sandbox=\"elevated\""));
+        assert!(APP_SERVER_CONFIG_OVERRIDES
+            .iter()
+            .any(|value| value.starts_with("permissions.eud_workspace=")));
     }
 
     #[test]
@@ -1209,12 +1412,8 @@ mod app_server_override_tests {
     }
 
     #[test]
-    fn thread_start_clamps_to_a_readonly_offline_sandbox() {
-        // The codex subprocess must not edit the disk with its own tools — the
-        // project is the editor's map via eud-tools, the harness runs in our
-        // parent process. readOnly + offline; approval stays on-request so the
-        // eud-tools MCP elicitation accept flow still routes through us.
-        let params = super::thread_start_params();
+    fn thread_start_uses_readonly_without_a_project_workspace() {
+        let params = super::thread_start_params(None).unwrap();
         assert_eq!(
             params["sandboxPolicy"]["type"],
             serde_json::json!("readOnly")
@@ -1224,6 +1423,14 @@ mod app_server_override_tests {
             serde_json::json!(false)
         );
         assert_eq!(params["approvalPolicy"], serde_json::json!("on-request"));
+    }
+
+    #[test]
+    fn thread_start_uses_custom_profile_for_project_workspace() {
+        let params =
+            super::thread_start_params(Some(std::path::Path::new("C:\\workspace"))).unwrap();
+        assert_eq!(params["cwd"], serde_json::json!("C:\\workspace"));
+        assert!(params.get("sandboxPolicy").is_none());
     }
 }
 
@@ -1369,8 +1576,9 @@ mod tool_item_tests {
 
 #[cfg(test)]
 mod appserver_tests {
-    use super::{AppServerEvent, CodexAppServerClient, CodexModelSelection};
+    use super::{AppServerEvent, CodexAppServerClient, CodexModelSelection, CodexTurnInput};
     use serde_json::{json, Value};
+    use std::path::PathBuf;
     use std::time::Duration;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream, Lines};
 
@@ -1462,6 +1670,21 @@ mod appserver_tests {
                 .pointer("/params/input/0/type")
                 .and_then(Value::as_str),
             Some("text")
+        );
+    }
+
+    fn assert_local_image(value: &Value, expected_path: &str) {
+        assert_eq!(
+            value
+                .pointer("/params/input/1/type")
+                .and_then(Value::as_str),
+            Some("localImage")
+        );
+        assert_eq!(
+            value
+                .pointer("/params/input/1/path")
+                .and_then(Value::as_str),
+            Some(expected_path)
         );
     }
 
@@ -1656,6 +1879,7 @@ mod appserver_tests {
             let turn_start = read_json_line(&mut client_requests).await;
             let turn_start_id = assert_client_request(&turn_start, "turn/start");
             assert_prompt(&turn_start, "first prompt");
+            assert_local_image(&turn_start, "C:/tmp/screenshot.png");
             assert_turn_thread_id(&turn_start, "thread-123");
             assert_turn_settings(&turn_start, "gpt-5.5-codex", "high");
             write_json_line(
@@ -1812,7 +2036,11 @@ mod appserver_tests {
         }));
 
         client
-            .run_turn("first prompt".to_string())
+            .run_turn(CodexTurnInput {
+                text: "first prompt".to_string(),
+                image_paths: vec![PathBuf::from("C:/tmp/screenshot.png")],
+                workspace_root: None,
+            })
             .await
             .expect("first app-server turn should complete");
         assert_eq!(
@@ -1852,11 +2080,105 @@ mod appserver_tests {
         assert_eq!(next_event(&mut events).await, AppServerEvent::TurnComplete);
 
         client
-            .run_turn("second prompt".to_string())
+            .run_turn(CodexTurnInput::text("second prompt"))
             .await
             .expect("second app-server turn should complete");
         assert_eq!(next_event(&mut events).await, AppServerEvent::TurnComplete);
 
+        stub.await.expect("stub server task should not panic");
+    }
+
+    #[tokio::test]
+    async fn cancellable_turn_sends_interrupt_and_waits_for_completion() {
+        let (client_write, server_read) = tokio::io::duplex(16 * 1024);
+        let (server_write, client_read) = tokio::io::duplex(16 * 1024);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+
+        let stub = tokio::spawn(async move {
+            let mut client_requests = BufReader::new(server_read).lines();
+            let mut server_responses = server_write;
+
+            let initialize = read_json_line(&mut client_requests).await;
+            let initialize_id = assert_client_request(&initialize, "initialize");
+            write_json_line(
+                &mut server_responses,
+                json!({"jsonrpc":"2.0","id":initialize_id,"result":{"protocolVersion":1}}),
+            )
+            .await;
+            assert_initialized_notification(&read_json_line(&mut client_requests).await);
+
+            let thread_start = read_json_line(&mut client_requests).await;
+            let thread_start_id = assert_client_request(&thread_start, "thread/start");
+            write_json_line(
+                &mut server_responses,
+                json!({"jsonrpc":"2.0","id":thread_start_id,"result":{}}),
+            )
+            .await;
+            write_json_line(
+                &mut server_responses,
+                json!({
+                    "jsonrpc":"2.0",
+                    "method":"thread/started",
+                    "params":{"thread":{"id":"thread-cancel"}}
+                }),
+            )
+            .await;
+
+            let turn_start = read_json_line(&mut client_requests).await;
+            let turn_start_id = assert_client_request(&turn_start, "turn/start");
+            write_json_line(
+                &mut server_responses,
+                json!({
+                    "jsonrpc":"2.0",
+                    "id":turn_start_id,
+                    "result":{"turn":{"id":"turn-cancel"}}
+                }),
+            )
+            .await;
+            started_tx.send(()).expect("test receiver should remain");
+
+            let interrupt = read_json_line(&mut client_requests).await;
+            let interrupt_id = assert_client_request(&interrupt, "turn/interrupt");
+            assert_eq!(
+                interrupt
+                    .pointer("/params/threadId")
+                    .and_then(Value::as_str),
+                Some("thread-cancel")
+            );
+            assert_eq!(
+                interrupt.pointer("/params/turnId").and_then(Value::as_str),
+                Some("turn-cancel")
+            );
+            write_json_line(
+                &mut server_responses,
+                json!({"jsonrpc":"2.0","id":interrupt_id,"result":{}}),
+            )
+            .await;
+            write_json_line(
+                &mut server_responses,
+                json!({
+                    "jsonrpc":"2.0",
+                    "method":"turn/completed",
+                    "params":{"turn":{"id":"turn-cancel","status":"interrupted"}}
+                }),
+            )
+            .await;
+        });
+
+        let (mut client, _events) = CodexAppServerClient::new_with_stdio(client_read, client_write);
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(0_u64);
+        let run = tokio::spawn(async move {
+            client
+                .run_turn_cancellable(CodexTurnInput::text("cancel this turn"), cancel_rx, 0)
+                .await
+        });
+
+        started_rx.await.expect("turn/start should resolve");
+        cancel_tx.send(1).expect("turn should still be running");
+        assert!(run
+            .await
+            .expect("client task should not panic")
+            .expect("interrupt should complete"));
         stub.await.expect("stub server task should not panic");
     }
 }

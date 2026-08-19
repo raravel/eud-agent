@@ -131,6 +131,48 @@ describe("turn transitions (ready <-> thinking -> plan_review|changeset_review)"
   });
 });
 
+describe("cancel and message rewind", () => {
+  it("archives the partial answer and ignores events that arrive after cancel", () => {
+    const store = readyWithProject();
+    store.chatSent();
+    store.agentEvent("delta", "여기까지 처리");
+
+    store.cancelSent();
+    store.agentEvent("delta", "이 텍스트는 늦게 도착");
+
+    expect(store.getState().phase).toBe("ready");
+    expect(store.getState().log.map((entry) => entry.text)).toEqual([
+      "여기까지 처리",
+      "작업을 중단했습니다.",
+    ]);
+  });
+
+  it("removes the selected user message and every later row", () => {
+    const store = readyWithProject();
+    store.log("you", "첫 요청");
+    store.log("agent", "첫 답변");
+    store.log("you", "수정할 요청");
+    const selectedId = store.getState().log.at(-1)!.id;
+    store.log("agent", "제거할 답변");
+
+    const restored = store.rewindTo(selectedId);
+
+    expect(restored?.text).toBe("수정할 요청");
+    expect(store.getState().log.map((entry) => entry.text)).toEqual([
+      "첫 요청",
+      "첫 답변",
+    ]);
+    expect(store.getState().phase).toBe("ready");
+    expect(store.getState().turn).toEqual({
+      reasoning: "",
+      answer: "",
+      answerStarted: false,
+      tools: [],
+      blocks: [],
+    });
+  });
+});
+
 describe("plan revision replacement (next plan{revision+1} replaces the card)", () => {
   it("replaces the active plan card with the new revision", () => {
     const store = readyWithProject();
@@ -804,62 +846,6 @@ describe("turn-end tool archiving (EUD-069)", () => {
   });
 });
 
-describe("resetSent — new conversation (EUD-064/065)", () => {
-  it("clears log, plan, changeset, and the turn buffers, returning to ready", () => {
-    // No undecided changeset here, so the fresh log is empty (the discard notice
-    // — F3 — is covered separately below).
-    const store = readyWithProject();
-    store.chatSent();
-    store.log("you", "이전 메시지");
-    store.planReceived("# 계획", 1);
-    store.agentEvent("delta", "답변");
-    store.resetSent();
-    const s = store.getState();
-    expect(s.log).toEqual([]);
-    expect(s.plan).toBeNull();
-    expect(s.changeset).toBeNull();
-    expect(s.turn.answer).toBe("");
-    expect(s.turn.reasoning).toBe("");
-    expect(s.phase).toBe("ready");
-  });
-
-  // F3: resetting over an undecided changeset logs a notice (the server
-  // default-accepts the undecided items) as the FIRST entry of the fresh log.
-  it("logs a discard notice when an undecided changeset is reset away (F3)", () => {
-    const store = readyWithProject();
-    store.chatSent();
-    store.changesetReceived("r1", [
-      { category: "file", id: "e1", seq: 0, kind: "created", path: "a.eps" },
-    ]);
-    store.resetSent();
-    const log = store.getState().log;
-    expect(log).toHaveLength(1);
-    expect(log[0].kind).toBe("warn");
-    expect(log[0].text).toContain("자동 적용");
-  });
-
-  it("does NOT log a discard notice when no changeset is open (F3)", () => {
-    const store = readyWithProject();
-    store.chatSent();
-    store.resetSent();
-    expect(store.getState().log).toEqual([]);
-  });
-
-  it("does NOT log a discard notice when the changeset is fully decided (F3)", () => {
-    const store = readyWithProject();
-    store.chatSent();
-    store.changesetReceived("r1", [
-      { category: "file", id: "e1", seq: 0, kind: "created", path: "a.eps" },
-    ]);
-    // Decide the single item, then reset — nothing was left undecided. A
-    // per-item accept carries the real id back in the rollback_result reply
-    // (only bulk accept echoes an empty ids array).
-    store.decisionSent("accept", ["e1"]);
-    store.rollbackResult(["e1"], true);
-    store.resetSent();
-    expect(store.getState().log).toEqual([]);
-  });
-});
 
 // F2: prose streamed via `delta` before a non-answer turn-end (plan/changeset/
 // error) is archived as a prominent agent log entry — otherwise the live

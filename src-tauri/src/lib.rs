@@ -277,8 +277,15 @@ pub fn run() {
             // the repo's AGENTS.md (hivemind instructions) and treat the Rust
             // repo as its workspace instead of the EUD map project.
             let cwd = data_dirs.codex_workspace_dir();
-            let driver =
-                engine::ProductionCodexDriver::new(cwd, sink.clone(), mcp_port, data_dirs.clone());
+            let (turn_cancel_tx, turn_cancel_rx) = tokio::sync::watch::channel(0_u64);
+            let driver = engine::ProductionCodexDriver::new(
+                cwd,
+                sink.clone(),
+                mcp_port,
+                data_dirs.clone(),
+                runtime.clone(),
+                turn_cancel_rx,
+            );
 
             // Session restore: Rust owns every session file under
             // `%appdata%\eud-agent\sessions\` (decision A/D). Built before the
@@ -297,13 +304,17 @@ pub fn run() {
                         dirs: data_dirs,
                     }));
 
-            app.manage(tokio::sync::Mutex::new(engine::AgentEngine::new(
-                driver,
-                sink,
-                config,
-                runtime,
-                session_store,
-            )));
+            app.manage(engine::ManagedAgentEngine::new(
+                engine::AgentEngine::new(
+                    driver,
+                    sink,
+                    config,
+                    runtime,
+                    session_store,
+                    attachment_store,
+                ),
+                turn_cancel_tx,
+            ));
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

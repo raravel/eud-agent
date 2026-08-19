@@ -21,6 +21,7 @@ Commands (panel -> core, `invoke`):
 | `plan_approve {}` | `invoke("plan_approve")` |
 | `changeset_decision {decision, ids}` | `invoke("changeset_decision", { decision, ids })` |
 | `cancel {}` | `invoke("cancel")` |
+| `conversation_rewind {panelLog}` | `invoke("conversation_rewind", { panelLog })` |
 | `reset {}` | `invoke("reset")` |
 | `status {}` | `invoke("status")` |
 | `list {}` | `invoke("list")` |
@@ -48,8 +49,10 @@ Events (core -> panel, `listen`):
 request/response commands (return the payload from `invoke`; the IPC client dispatches
 `memory`/`memory_saved` payloads to the store from the command return); the remaining server
 messages are push events delivered via `listen`.
-`chat`/`plan_feedback`/`plan_approve`/`changeset_decision`/`cancel`/`reset` start background
-work and resolve when accepted — the turn result arrives later as events.
+`chat`/`plan_feedback`/`plan_approve` remain pending while their turn streams and resolve
+when it settles. `cancel` signals interruption immediately but resolves only after the
+app-server's interrupted `turn/completed`; `conversation_rewind` then replaces the active
+session's model-visible history. `changeset_decision`/`reset` retain their command semantics.
 
 ## Removed from the panel
 - WebSocket connect/reconnect logic, `?token=` handshake, Origin assumptions, and the

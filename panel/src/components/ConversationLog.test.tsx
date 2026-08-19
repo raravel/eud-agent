@@ -29,6 +29,35 @@ describe("ConversationLog — entries", () => {
     expect(screen.getByText("트리거를 추가해줘")).toBeInTheDocument();
   });
 
+  it("renders persisted image previews and file chips on a user message", () => {
+    const store = createPanelStore();
+    store.log("you", "", undefined, [
+      {
+        id: "image-1",
+        name: "screen.png",
+        mime: "image/png",
+        kind: "image",
+        size: 2048,
+        previewUrl: "data:image/png;base64,iVBORw0KGgo=",
+      },
+      {
+        id: "text-1",
+        name: "notes.eps",
+        mime: "text/plain",
+        kind: "text",
+        size: 12,
+      },
+    ]);
+
+    render(<ConversationLog log={store.getState().log} phase="thinking" />);
+
+    expect(
+      screen.getByRole("img", { name: "첨부 이미지: screen.png" }),
+    ).toBeInTheDocument();
+    expect(screen.getByText("notes.eps")).toBeInTheDocument();
+    expect(screen.getByText("2 KB")).toBeInTheDocument();
+  });
+
   it("renders an applied confirmation entry", () => {
     const store = createPanelStore();
     store.log("ok", "main.eps에 적용되었습니다.");
@@ -41,6 +70,24 @@ describe("ConversationLog — entries", () => {
     store.log("error", "오류: editor busy");
     render(<ConversationLog log={store.getState().log} phase="ready" />);
     expect(screen.getByText("오류: editor busy")).toBeInTheDocument();
+  });
+
+  it("offers an edit action for user messages", () => {
+    const store = createPanelStore();
+    store.log("you", "수정할 요청");
+    const onEditMessage = vi.fn();
+    render(
+      <ConversationLog
+        log={store.getState().log}
+        phase="ready"
+        onEditMessage={onEditMessage}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "메시지 수정" }));
+    expect(onEditMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ kind: "you", text: "수정할 요청" }),
+    );
   });
 });
 
@@ -164,68 +211,6 @@ describe("ConversationLog — inline agent stream (EUD-069)", () => {
   });
 });
 
-// ---- Waiting shimmer: between chat send (phase → thinking, fresh empty turn)
-// and the FIRST streamed agent_event there is no visual feedback that the input
-// was received. A Shimmer "생각하는 중…" row renders inline in the live turn
-// area while thinking with an EMPTY turn, and disappears as soon as any turn
-// content (reasoning / tool / answer) arrives.
-describe("ConversationLog — waiting shimmer before the first stream event", () => {
-  const emptyTurn = {
-    reasoning: "",
-    answer: "",
-    answerStarted: false,
-    tools: [],
-    blocks: [],
-  };
-
-  it("shows the shimmer while thinking with an empty turn", () => {
-    render(<ConversationLog log={[]} phase="thinking" turn={emptyTurn} />);
-    const waiting = screen.getByTestId("turn-waiting");
-    expect(waiting).toBeInTheDocument();
-    expect(waiting).toHaveTextContent("생각하는 중…");
-  });
-
-  it("hides the shimmer once reasoning starts streaming", () => {
-    render(
-      <ConversationLog
-        log={[]}
-        phase="thinking"
-        turn={{ ...emptyTurn, reasoning: "유닛을 확인" }}
-      />,
-    );
-    expect(screen.queryByTestId("turn-waiting")).not.toBeInTheDocument();
-  });
-
-  it("hides the shimmer once a tool call arrives", () => {
-    render(
-      <ConversationLog
-        log={[]}
-        phase="thinking"
-        turn={{
-          ...emptyTurn,
-          tools: [{ id: "t1", name: "dat_get", state: "running" as const }],
-        }}
-      />,
-    );
-    expect(screen.queryByTestId("turn-waiting")).not.toBeInTheDocument();
-  });
-
-  it("hides the shimmer once the answer starts", () => {
-    render(
-      <ConversationLog
-        log={[]}
-        phase="thinking"
-        turn={{ ...emptyTurn, answer: "답", answerStarted: true }}
-      />,
-    );
-    expect(screen.queryByTestId("turn-waiting")).not.toBeInTheDocument();
-  });
-
-  it("does NOT show the shimmer outside thinking", () => {
-    render(<ConversationLog log={[]} phase="ready" turn={emptyTurn} />);
-    expect(screen.queryByTestId("turn-waiting")).not.toBeInTheDocument();
-  });
-});
 
 // ---- Empty-conversation hero: an empty log in the ready phase shows guidance
 // + clickable example chips (the same chat path as the InstructionBox). Any
@@ -272,6 +257,24 @@ describe("ConversationLog — empty-conversation hero", () => {
 
     render(<ConversationLog log={[]} phase="ready" ragLoading />);
     expect(screen.queryByTestId("conversation-empty")).not.toBeInTheDocument();
+  });
+});
+
+describe("ConversationLog — message virtualization", () => {
+  it("keeps only the viewport window mounted for a long conversation", () => {
+    const store = createPanelStore();
+    for (let index = 0; index < 200; index += 1) {
+      store.log(index % 2 === 0 ? "you" : "agent", `메시지 ${index}`);
+    }
+
+    const { container } = render(
+      <ConversationLog log={store.getState().log} phase="ready" />,
+    );
+
+    expect(store.getState().log).toHaveLength(200);
+    const mounted = container.querySelectorAll("[data-virtual-row]");
+    expect(mounted.length).toBeGreaterThan(0);
+    expect(mounted.length).toBeLessThan(50);
   });
 });
 

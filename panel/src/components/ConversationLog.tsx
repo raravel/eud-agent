@@ -17,7 +17,20 @@
  * so streamed answers keep the latest content in view. The store caps the log at
  * 500 entries.
  */
-import { SparklesIcon, WrenchIcon } from "lucide-react";
+import {
+  FileTextIcon,
+  ImageIcon,
+  PencilLineIcon,
+  SparklesIcon,
+  WrenchIcon,
+} from "lucide-react";
+import { useMemo } from "react";
+import {
+  measureElement as measureVirtualElement,
+  observeElementRect as observeVirtualElementRect,
+  useVirtualizer,
+} from "@tanstack/react-virtual";
+import { useStickToBottomContext } from "use-stick-to-bottom";
 import {
   Conversation,
   ConversationContent,
@@ -31,6 +44,7 @@ import { cn } from "@/lib/utils";
 import { AgentStream, ToolList } from "@/components/AgentStream";
 import { AgentAnswer } from "@/components/AgentAnswer";
 import type { LogEntry, LogKind, Phase, TurnState } from "@/state/store";
+import { formatAttachmentSize } from "@/lib/attachments";
 
 export interface ConversationLogProps {
   /** Store log entries (kind / text / optional stage). */
@@ -55,6 +69,10 @@ export interface ConversationLogProps {
   onSuggestion?: (text: string) => void;
   /** Send gating for the suggestion chips (store.canSend). */
   suggestionsEnabled?: boolean;
+  /** Rewind from a user message and restore it into the prompt for editing. */
+  onEditMessage?: (entry: LogEntry) => void;
+  /** Disable edit actions while cancel/rewind is settling in the core. */
+  editDisabled?: boolean;
 }
 
 /** Example instructions shown in the empty conversation (click → send). */
@@ -79,6 +97,22 @@ const MUTED_KIND_CLASS: Record<Exclude<LogKind, "you" | "agent">, string> = {
   error: "text-destructive",
 };
 
+type ConversationRow =
+  | { key: string; type: "log"; entry: LogEntry }
+  | { key: "empty"; type: "empty" }
+  | { key: "rag"; type: "rag" }
+  | { key: "live"; type: "live" };
+
+interface RowRenderContext {
+  phase: Phase;
+  turn?: TurnState;
+  activeProgressId: number | null;
+  onSuggestion?: (text: string) => void;
+  suggestionsEnabled: boolean;
+  onEditMessage?: (entry: LogEntry) => void;
+  editDisabled: boolean;
+}
+
 export function ConversationLog({
   log,
   phase,
@@ -86,186 +120,323 @@ export function ConversationLog({
   ragLoading,
   onSuggestion,
   suggestionsEnabled = true,
+  onEditMessage,
+  editDisabled = false,
 }: ConversationLogProps) {
   const busy = BUSY_PHASES.has(phase);
-  // Waiting shimmer: between chat send (phase → thinking, fresh empty turn) and
-  // the FIRST streamed agent_event nothing renders, so the user cannot tell the
-  // input was received. While thinking with an EMPTY turn buffer, show a
-  // Shimmer label inline; the first reasoning/tool/answer content replaces it.
-  const waiting =
-    turn !== undefined &&
-    phase === "thinking" &&
-    turn.reasoning.length === 0 &&
-    !turn.answerStarted &&
-    turn.tools.length === 0;
-  // The active spinner target: the LATEST progress entry, but only while busy.
-  let activeProgressId: number | null = null;
-  if (busy) {
+  const activeProgressId = useMemo(() => {
+    if (!busy) return null;
+    let latest: number | null = null;
     for (const entry of log) {
-      if (entry.kind === "progress" && entry.stage) {
-        activeProgressId = entry.id;
-      }
+      if (entry.kind === "progress" && entry.stage) latest = entry.id;
     }
-  }
+    return latest;
+  }, [busy, log]);
 
-  // Empty-conversation hero (UX: empty states carry guidance + an action):
-  // only while idle-ready with nothing logged — any log entry, warmup shimmer,
-  // or in-flight turn replaces it.
   const empty = log.length === 0 && phase === "ready" && !ragLoading;
+  const hasLiveTurn =
+    turn !== undefined &&
+    (turn.reasoning.length > 0 ||
+      turn.answerStarted ||
+      turn.tools.length > 0 ||
+      turn.blocks.length > 0);
+  const rows = useMemo<ConversationRow[]>(() => {
+    const next: ConversationRow[] = log.map((entry) => ({
+      key: `log-${entry.id}`,
+      type: "log",
+      entry,
+    }));
+    if (empty) next.push({ key: "empty", type: "empty" });
+    if (ragLoading) next.push({ key: "rag", type: "rag" });
+    if (hasLiveTurn) next.push({ key: "live", type: "live" });
+    return next;
+  }, [empty, hasLiveTurn, log, ragLoading]);
 
   return (
     <Conversation className="flex-1">
-      <ConversationContent className="gap-2 p-4">
-        {empty && (
-          <div
-            data-testid="conversation-empty"
-            className="flex flex-col items-center gap-5 px-4 py-14 text-center animate-in fade-in duration-300 motion-reduce:animate-none"
-          >
-            <span
-              aria-hidden
-              className="flex size-12 items-center justify-center rounded-2xl border border-emerald-500/30 bg-emerald-500/15 text-emerald-400"
-            >
-              <SparklesIcon className="size-6" />
-            </span>
-            <div className="grid gap-1">
-              <p className="text-base font-semibold">무엇을 만들까요?</p>
-              <p className="text-sm text-muted-foreground">
-                자연어로 지시하면 epScript 코드를 만들어 에디터에 적용합니다.
-              </p>
-            </div>
-            {onSuggestion && (
-              <ul className="flex w-full max-w-sm flex-col gap-2">
-                {SUGGESTIONS.map((text) => (
-                  <li key={text}>
-                    <button
-                      type="button"
-                      disabled={!suggestionsEnabled}
-                      onClick={() => onSuggestion(text)}
-                      className="w-full cursor-pointer rounded-lg border border-border bg-card/60 px-3 py-2 text-left text-sm text-muted-foreground transition-colors duration-200 hover:border-emerald-500/40 hover:bg-emerald-500/10 hover:text-foreground focus-visible:outline-2 focus-visible:outline-ring disabled:cursor-default disabled:opacity-50"
-                    >
-                      {text}
-                    </button>
-                  </li>
-                ))}
-              </ul>
-            )}
-          </div>
-        )}
-
-        {log.map((entry) => {
-          // Agent answers — PROMINENT foreground Message/Response (Streamdown).
-          if (entry.kind === "agent") {
-            return (
-              <Message key={entry.id} from="assistant" className="text-foreground">
-                <MessageContent>
-                  <Response>{entry.text}</Response>
-                </MessageContent>
-              </Message>
-            );
-          }
-          // User instructions — secondary Message bubble.
-          if (entry.kind === "you") {
-            return (
-              <Message key={entry.id} from="user">
-                <MessageContent>{entry.text}</MessageContent>
-              </Message>
-            );
-          }
-          // Archived tool entry (EUD-069): summary line + expandable Tool cards.
-          if (entry.tools !== undefined) {
-            return (
-              <div key={entry.id} className="flex w-full flex-col gap-1 my-3">
-                <span
-                  className={cn(
-                    "flex items-center gap-1.5 text-sm",
-                    MUTED_KIND_CLASS[entry.kind],
-                  )}
-                >
-                  <WrenchIcon aria-hidden className="size-3.5 shrink-0" />
-                  {entry.text}
-                </span>
-                <ToolList tools={entry.tools} />
-              </div>
-            );
-          }
-          // System / progress / info rows — muted simple rows.
-          const isActive = entry.id === activeProgressId;
-          const testId = entry.stage ? `log-entry-${entry.stage}` : undefined;
-          return (
-            <div
-              key={entry.id}
-              data-testid={testId}
-              className={cn(
-                "flex w-fit max-w-[95%] items-center gap-2 text-sm",
-                MUTED_KIND_CLASS[entry.kind],
-              )}
-            >
-              {isActive && <Spinner className="size-3.5 shrink-0" />}
-              <span className="whitespace-pre-wrap break-words">{entry.text}</span>
-            </div>
-          );
-        })}
-
-        {/* RAG warmup shimmer — while the model loads the send gate is closed;
-            this row explains the locked input. */}
-        {ragLoading && (
-          <div
-            data-testid="rag-waiting"
-            role="status"
-            className="flex w-fit max-w-[95%] items-center text-sm"
-          >
-            <Shimmer>RAG 모델 준비 중…</Shimmer>
-          </div>
-        )}
-
-        {/* Waiting shimmer — feedback that the input was received, before the
-            first stream event arrives. */}
-        {waiting && (
-          <div
-            data-testid="turn-waiting"
-            role="status"
-            className="flex w-fit max-w-[95%] items-center text-sm"
-          >
-            <Shimmer>생각하는 중…</Shimmer>
-          </div>
-        )}
-
-        {/* Live agent activity for the current turn — INLINE in the scroll area
-            (EUD-069): the reasoning block first, then the turn's activity
-            blocks IN ARRIVAL ORDER (tool groups and prose bubbles interleaved
-            chronologically — not all tools above all prose). Turns from older
-            fixtures without blocks fall back to the legacy tools+answer pair. */}
-        {turn && (
-          <AgentStream
-            reasoning={turn.reasoning}
-            answerStarted={turn.answerStarted}
-            tools={turn.blocks.length > 0 ? [] : turn.tools}
-            live={phase === "thinking"}
-          />
-        )}
-        {turn &&
-          phase === "thinking" &&
-          turn.blocks.map((block) =>
-            block.type === "tools" ? (
-              <div
-                key={`turn-block-${block.id}`}
-                className="flex w-full max-w-[95%] flex-col gap-1 my-3"
-              >
-                <span className="flex items-center gap-1.5 text-xs text-muted-foreground">
-                  <WrenchIcon aria-hidden className="size-3.5 shrink-0" />
-                  도구 호출 {block.tools.length}건
-                </span>
-                <ToolList tools={block.tools} />
-              </div>
-            ) : block.text.trim().length > 0 ? (
-              <AgentAnswer key={`turn-block-${block.id}`} text={block.text} />
-            ) : null,
-          )}
-        {turn && phase === "thinking" && turn.blocks.length === 0 && (
-          <AgentAnswer text={turn.answer} />
-        )}
+      <ConversationContent className="block p-4">
+        <VirtualizedConversationRows
+          rows={rows}
+          context={{
+            phase,
+            turn,
+            activeProgressId,
+            onSuggestion,
+            suggestionsEnabled,
+            onEditMessage,
+            editDisabled,
+          }}
+        />
       </ConversationContent>
       <ConversationScrollButton />
     </Conversation>
+  );
+}
+
+function VirtualizedConversationRows({
+  rows,
+  context,
+}: {
+  rows: ConversationRow[];
+  context: RowRenderContext;
+}) {
+  const { scrollRef } = useStickToBottomContext();
+  const virtualizer = useVirtualizer<HTMLElement, HTMLDivElement>({
+    count: rows.length,
+    getScrollElement: () => scrollRef.current,
+    getItemKey: (index) => rows[index]?.key ?? index,
+    estimateSize: (index) => estimateRowSize(rows[index]),
+    overscan: 8,
+    initialRect: { width: 800, height: 600 },
+    observeElementRect: (instance, callback) =>
+      observeVirtualElementRect(instance, (rect) =>
+        callback({
+          width: rect.width || 800,
+          height: rect.height || 600,
+        }),
+      ),
+    measureElement: (element, entry, instance) => {
+      const measured = measureVirtualElement(element, entry, instance);
+      const index = Number(element.dataset.index);
+      return measured > 0 ? measured : estimateRowSize(rows[index]);
+    },
+  });
+
+  return (
+    <div
+      data-testid="virtualized-conversation"
+      className="relative w-full"
+      style={{ height: virtualizer.getTotalSize() }}
+    >
+      {virtualizer.getVirtualItems().map((item) => {
+        const row = rows[item.index];
+        if (row === undefined) return null;
+        return (
+          <div
+            key={item.key}
+            ref={virtualizer.measureElement}
+            data-index={item.index}
+            data-virtual-row
+            className="absolute left-0 top-0 w-full pb-2"
+            style={{ transform: `translateY(${item.start}px)` }}
+          >
+            {renderRow(row, context)}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function estimateRowSize(row: ConversationRow | undefined): number {
+  if (row === undefined) return 72;
+  if (row.type === "empty") return 300;
+  if (row.type === "rag") return 32;
+  if (row.type === "live") return 160;
+  if (row.entry.kind === "agent") return 140;
+  if (row.entry.kind === "you") return 120;
+  if (row.entry.tools !== undefined) return 96;
+  return 40;
+}
+
+function renderRow(row: ConversationRow, context: RowRenderContext) {
+  switch (row.type) {
+    case "empty":
+      return (
+        <div
+          data-testid="conversation-empty"
+          className="flex flex-col items-center gap-5 px-4 py-14 text-center animate-in fade-in duration-300 motion-reduce:animate-none"
+        >
+          <span
+            aria-hidden
+            className="flex size-12 items-center justify-center rounded-2xl border border-emerald-500/30 bg-emerald-500/15 text-emerald-400"
+          >
+            <SparklesIcon className="size-6" />
+          </span>
+          <div className="grid gap-1">
+            <p className="text-base font-semibold">무엇을 만들까요?</p>
+            <p className="text-sm text-muted-foreground">
+              자연어로 지시하면 epScript 코드를 만들어 에디터에 적용합니다.
+            </p>
+          </div>
+          {context.onSuggestion && (
+            <ul className="flex w-full max-w-sm flex-col gap-2">
+              {SUGGESTIONS.map((text) => (
+                <li key={text}>
+                  <button
+                    type="button"
+                    disabled={!context.suggestionsEnabled}
+                    onClick={() => context.onSuggestion?.(text)}
+                    className="w-full cursor-pointer rounded-lg border border-border bg-card/60 px-3 py-2 text-left text-sm text-muted-foreground transition-colors duration-200 hover:border-emerald-500/40 hover:bg-emerald-500/10 hover:text-foreground focus-visible:outline-2 focus-visible:outline-ring disabled:cursor-default disabled:opacity-50"
+                  >
+                    {text}
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      );
+    case "rag":
+      return (
+        <div
+          data-testid="rag-waiting"
+          role="status"
+          className="flex w-fit max-w-[95%] items-center text-sm"
+        >
+          <Shimmer>RAG 모델 준비 중…</Shimmer>
+        </div>
+      );
+    case "live":
+      return renderLiveTurn(context.turn, context.phase);
+    case "log":
+      return renderLogEntry(row.entry, context);
+  }
+}
+
+function renderLogEntry(entry: LogEntry, context: RowRenderContext) {
+  if (entry.kind === "agent") {
+    return (
+      <Message from="assistant" className="text-foreground">
+        <MessageContent>
+          <Response>{entry.text}</Response>
+        </MessageContent>
+      </Message>
+    );
+  }
+
+  if (entry.kind === "you") {
+    return (
+      <Message from="user">
+        <MessageContent>
+          {entry.attachments && entry.attachments.length > 0 && (
+            <div className="mb-2 flex max-w-md flex-wrap justify-end gap-2">
+              {entry.attachments.map((attachment) => {
+                const preview =
+                  attachment.previewUrl?.startsWith("data:image/") === true
+                    ? attachment.previewUrl
+                    : null;
+                return preview !== null ? (
+                  <figure
+                    key={attachment.id}
+                    className="overflow-hidden rounded-lg border border-border/70 bg-background/40"
+                  >
+                    <img
+                      src={preview}
+                      alt={`첨부 이미지: ${attachment.name}`}
+                      className="max-h-40 max-w-56 object-contain"
+                    />
+                    <figcaption className="flex items-center gap-1.5 px-2 py-1 text-[11px] text-muted-foreground">
+                      <ImageIcon className="size-3" />
+                      <span className="max-w-40 truncate">{attachment.name}</span>
+                      <span>{formatAttachmentSize(attachment.size)}</span>
+                    </figcaption>
+                  </figure>
+                ) : (
+                  <div
+                    key={attachment.id}
+                    className="flex max-w-56 items-center gap-2 rounded-lg border border-border/70 bg-background/40 px-2.5 py-2"
+                    title={attachment.name}
+                  >
+                    {attachment.kind === "image" ? (
+                      <ImageIcon className="size-4 shrink-0 text-muted-foreground" />
+                    ) : (
+                      <FileTextIcon className="size-4 shrink-0 text-muted-foreground" />
+                    )}
+                    <span className="min-w-0">
+                      <span className="block truncate text-xs">{attachment.name}</span>
+                      <span className="block text-[11px] text-muted-foreground">
+                        {formatAttachmentSize(attachment.size)}
+                      </span>
+                    </span>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+          {entry.text.length > 0 && (
+            <span className="whitespace-pre-wrap">{entry.text}</span>
+          )}
+        </MessageContent>
+        {context.onEditMessage && (
+          <button
+            type="button"
+            aria-label="메시지 수정"
+            disabled={context.editDisabled}
+            onClick={() => context.onEditMessage?.(entry)}
+            className="ml-auto flex min-h-11 cursor-pointer items-center gap-1.5 rounded-md px-3 text-xs text-muted-foreground transition-colors duration-200 hover:bg-accent hover:text-foreground focus-visible:outline-2 focus-visible:outline-ring disabled:cursor-default disabled:opacity-50"
+          >
+            <PencilLineIcon aria-hidden className="size-3.5" />
+            수정
+          </button>
+        )}
+      </Message>
+    );
+  }
+
+  if (entry.tools !== undefined) {
+    return (
+      <div className="my-3 flex w-full flex-col gap-1">
+        <span
+          className={cn(
+            "flex items-center gap-1.5 text-sm",
+            MUTED_KIND_CLASS[entry.kind],
+          )}
+        >
+          <WrenchIcon aria-hidden className="size-3.5 shrink-0" />
+          {entry.text}
+        </span>
+        <ToolList tools={entry.tools} />
+      </div>
+    );
+  }
+
+  const isActive = entry.id === context.activeProgressId;
+  const testId = entry.stage ? `log-entry-${entry.stage}` : undefined;
+  return (
+    <div
+      data-testid={testId}
+      className={cn(
+        "flex w-fit max-w-[95%] items-center gap-2 text-sm",
+        MUTED_KIND_CLASS[entry.kind],
+      )}
+    >
+      {isActive && <Spinner className="size-3.5 shrink-0" />}
+      <span className="whitespace-pre-wrap break-words">{entry.text}</span>
+    </div>
+  );
+}
+
+function renderLiveTurn(turn: TurnState | undefined, phase: Phase) {
+  if (turn === undefined) return null;
+  return (
+    <>
+      <AgentStream
+        reasoning={turn.reasoning}
+        answerStarted={turn.answerStarted}
+        tools={turn.blocks.length > 0 ? [] : turn.tools}
+        live={phase === "thinking"}
+      />
+      {phase === "thinking" &&
+        turn.blocks.map((block) =>
+          block.type === "tools" ? (
+            <div
+              key={`turn-block-${block.id}`}
+              className="my-3 flex w-full max-w-[95%] flex-col gap-1"
+            >
+              <span className="flex items-center gap-1.5 text-xs text-muted-foreground">
+                <WrenchIcon aria-hidden className="size-3.5 shrink-0" />
+                도구 호출 {block.tools.length}건
+              </span>
+              <ToolList tools={block.tools} />
+            </div>
+          ) : block.text.trim().length > 0 ? (
+            <AgentAnswer key={`turn-block-${block.id}`} text={block.text} />
+          ) : null,
+        )}
+      {phase === "thinking" && turn.blocks.length === 0 && (
+        <AgentAnswer text={turn.answer} />
+      )}
+    </>
   );
 }

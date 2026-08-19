@@ -375,11 +375,10 @@ export interface PanelStore {
   /** cancel was sent — return to ready. */
   cancelSent(): void;
   /**
-   * `reset{}` was sent ([새 대화]) — clear the client log, plan, changeset, and
-   * per-turn buffers, returning to ready (EUD-064/065). The server drops the
-   * retained codex thread; the next chat starts a fresh conversation.
+   * Remove the selected user message and every later row before re-submitting
+   * an edited draft. Returns the removed user entry for input restoration.
    */
-  resetSent(): void;
+  rewindTo(logEntryId: number): LogEntry | null;
   /** Open the project-memory overlay. */
   memoryOpened(): void;
   /** Close the project-memory overlay. */
@@ -701,6 +700,10 @@ export function createPanelStore(): PanelStore {
     },
 
     agentEvent(kind, detail, data) {
+      // A cancel request marks the turn inactive before app-server's final
+      // interrupted-turn events drain. Ignore those trailing deltas/results so
+      // stopped work cannot reappear after the UI returns to ready.
+      if (!core.turnInFlight) return;
       // Accumulate the streamed agent_event into the per-turn buffers (EUD-065 /
       // decision 06). Raw internal kind identifiers (delta/answer/token_usage/
       // turn_done/item_started/item_completed/event) MUST NEVER reach the log —
@@ -1048,10 +1051,10 @@ export function createPanelStore(): PanelStore {
     },
 
     cancelSent() {
-      // cancel interrupts the in-flight turn; the journal entries persist, but no
-      // changeset has been emitted yet (the turn was cut short) → back to ready.
       clearLiveProgress();
       core.turnInFlight = false;
+      archiveTurnBlocks();
+      pushLog("info", "작업을 중단했습니다.");
       if (core.phase !== "changeset_review") {
         core.phase = "ready";
         core.plan = null;
@@ -1059,28 +1062,25 @@ export function createPanelStore(): PanelStore {
       emit();
     },
 
-    resetSent() {
-      // [새 대화]: the server drops the retained codex thread (EUD-064); the client
-      // clears the conversation log, plan, changeset, pending decision, and the
-      // per-turn streaming buffers, returning to ready for a fresh conversation.
-      // F3: if an undecided changeset is discarded, the server default-accepts its
-      // undecided items (features/05). Surface that as the FIRST entry of the fresh
-      // log so the discard is not silent.
-      const discardedUndecided =
-        core.changeset !== null && !isChangesetFullyDecided(core.changeset);
+    rewindTo(logEntryId) {
+      const index = core.log.findIndex(
+        (entry) => entry.id === logEntryId && entry.kind === "you",
+      );
+      if (index < 0) return null;
+
+      const entry = core.log[index];
+      core.log = core.log.slice(0, index);
       core.turnInFlight = false;
       core.plan = null;
       core.changeset = null;
       core.pendingDecision = null;
       core.turn = emptyTurn();
       nextTextBlockBreak = false;
-      core.log = [];
-      if (discardedUndecided) {
-        pushLog("warn", "미결정 변경사항은 자동 적용 처리되었습니다.");
-      }
       core.phase = "ready";
       emit();
+      return entry;
     },
+
 
     memoryOpened() {
       core.memoryOpen = true;
