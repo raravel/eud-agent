@@ -105,7 +105,7 @@ export const PromptInputTextarea = ({
 
   return (
     <InputGroupTextarea
-      className={cn(className)}
+      className={cn("max-h-48 overflow-y-auto", className)}
       onCompositionEnd={() => setIsComposing(false)}
       onCompositionStart={() => setIsComposing(true)}
       onKeyDown={handleKeyDown}

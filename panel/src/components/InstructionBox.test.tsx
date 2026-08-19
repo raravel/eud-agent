@@ -15,7 +15,7 @@
  * The instruction textarea has accessible name "지시 입력"; the send button "전송".
  */
 import { describe, it, expect, vi } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { fireEvent, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { createPanelStore, type PanelState } from "@/state/store";
 import { InstructionBox, type ChatPayload } from "@/components/InstructionBox";
@@ -58,6 +58,23 @@ const codexSettings = {
   selectedModel: "gpt-default",
   selectedReasoningEffort: "medium",
 };
+
+describe("InstructionBox — textarea sizing", () => {
+  it("caps long input and scrolls overflow inside the textarea", () => {
+    render(<InstructionBox state={readyState()} onSend={noop} />);
+    const textarea = screen.getByRole("textbox", { name: "지시 입력" });
+
+    fireEvent.change(textarea, {
+      target: {
+        value: Array.from({ length: 80 }, (_, index) => `긴 입력 ${index + 1}`).join(
+          "\n",
+        ),
+      },
+    });
+
+    expect(textarea).toHaveClass("max-h-48", "overflow-y-auto");
+  });
+});
 
 
 describe("InstructionBox — send gating (v2)", () => {
