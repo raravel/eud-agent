@@ -1,8 +1,8 @@
 # eud-agent Tech Stack (v2 — Tauri + Rust)
 
-Grounded against the repo on 2026-06-08. The v2 migration **removes the Python stack**,
-**keeps the React panel**, and **adds a Rust/Tauri stack**. No `Cargo.toml` exists yet;
-the Rust entries below are the target floor versions to pin at `cargo add` time.
+The v2 runtime removes Python, keeps the React panel, and runs the backend in Rust/Tauri.
+The only Node runtime path is the optional agent-only epScript analyzer, which uses the
+user/system `node.exe`; no Node runtime is bundled.
 
 ## Active Dependencies (panel — kept, from `panel/package.json`)
 - react 19.2.0 — panel UI
@@ -20,24 +20,31 @@ Dev: vite ^7.1.12, vitest ^3.2.6, typescript ~5.9.3, @vitejs/plugin-react ^5.0.4
 tailwindcss ^4.3.0, @tailwindcss/vite ^4.3.0, @testing-library/react ^16.3.2,
 happy-dom ^16.8.1.
 
-## Target Rust Stack (new — `src-tauri/Cargo.toml`, pin at add-time)
+## Active Rust Stack (`src-tauri/Cargo.toml`)
 - tauri 2 (stable) — desktop shell, WebView2 host, IPC, bundler/updater
 - tauri-plugin-shell 2 — spawn the codex CLI subprocess
 - tauri-plugin-dialog 2 — first-run editor-path picker
 - tokio 1 — async runtime (codex subprocess, file-IPC polling, downloads)
 - fastembed 5.15 — bge-m3 ONNX embeddings (query-time); pulls `ort` (pykeio ONNX RT)
 - rusqlite 0.32 — read the prebuilt RAG index (vectors + text + source metadata)
-- reqwest 0.12 — first-run downloads (RAG index from GitHub Release)
-- sha2 0.10 — download integrity verification
+- reqwest 0.12 — bootstrap downloads (RAG index and version-matched Codex CLI/runtime helpers)
+- sha2 0.10 — download and bundled adapter integrity verification
+- base64 0.22 — EPSNAPSHOT UTF-8 project-path manifest decoding
+- uuid 1 — collision-safe snapshot and analysis-directory request ownership
+- parking_lot 0.12 — serialized preflight/analyzer process state
+- windows-sys 0.59 — Job Object process-tree containment for the Node adapter
 - similar 2 — unified diff (replaces Python difflib)
-- which 7 — resolve the codex CLI shim path (replaces shutil.which)
-- serde 1 + serde_json 1 — config/IPC/manifest (de)serialization
+- which 8 — resolve codex and optional analyzer `node.exe` executables
+- serde 1 + serde_json 1 — config/IPC/manifest/framed adapter payloads
 - anyhow 1 + thiserror 1 — error handling
 - bindgen 0.70 — generate FFI from `native/isom/isom_capi.h` (in `isom-sys`)
 
 ## Build Artifacts
 - tailwindcss v4.x (from `panel/dist` build via `@tailwindcss/vite`) — ground truth for
   the running panel CSS.
+- `vendor/epscript-lsp-agent/adapter.cjs` — self-contained CommonJS adapter built with
+  esbuild from `zuhanit/epscript-lsp@7f175df06ae57e9da65b8add25d084b5f5df0e1f`.
+  Its SHA-256, MIT license, and provenance are separate bundled resources.
 
 ## Legacy / Vendored
 - isom-poc C++ (`native/isom/`, vendored from `isom-poc/IsomTerrain/`) — MSBuild
@@ -46,6 +53,9 @@ happy-dom ^16.8.1.
   is the source of truth; the editor's own C++ is never touched.
 - vendor/webview2 — 3 WebView2 SDK DLLs from the POC; under Tauri the WebView2 runtime is
   the system Evergreen runtime, so these are retained only as a fallback reference.
+- `vendor/epscript-lsp-agent` — generated, reviewable analyzer distribution. The build
+  uses an exact npm lock and explicitly includes `@epscript-lsp/types@1.0.0`, omitted by
+  the published server package metadata. Node core modules are the only externals.
 
 ## Removed / Superseded (deleted in v2)
 - Python server stack (`server/`): fastapi, uvicorn, chromadb 1.5.9,
@@ -67,9 +77,9 @@ happy-dom ^16.8.1.
   bound here under Active Dependencies then. See [[decisions/15_in-house-rag-corpus]].
 
 ## Rationale
-- **Rust over Node/TS** (Decision 08): the small-distributable goal and the safety of the
-  map binary path outweigh Node's more mature ML ecosystem; Electron's only edge
-  (in-process node for the advisory LSP) does not justify a ~150MB bundle.
+- **Rust over Node/TS** remains the application decision: no Electron or in-process Node.
+  The optional analyzer is a checksum-pinned, process-isolated adapter using an already
+  installed `node.exe`; absence returns `skipped` and does not affect app readiness.
 - **fastembed over candle** for embeddings: fastembed ships first-class bge-m3 ONNX with
   HF auto-download and quantized CPU models — less hand-rolling than candle for the same
   result.

@@ -1,0 +1,10 @@
+{
+  "repository": "https://github.com/zuhanit/epscript-lsp",
+  "commit": "7f175df06ae57e9da65b8add25d084b5f5df0e1f",
+  "tag": "v1.2.14",
+  "archive": "https://github.com/zuhanit/epscript-lsp/archive/7f175df06ae57e9da65b8add25d084b5f5df0e1f.zip",
+  "archiveSha256": "46a6d89d5c7ba6ac40d8b5114d409f231409d56b37a610168d0e32a7b4637f46",
+  "serverVersion": "1.2.14",
+  "typesDependency": "@epscript-lsp/types@1.0.0",
+  "license": "MIT"
+}

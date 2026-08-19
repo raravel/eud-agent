@@ -1269,9 +1269,11 @@ version = "0.2.0"
 dependencies = [
  "anyhow",
  "axum",
+ "base64 0.22.1",
  "encoding_rs",
  "fastembed",
  "isom",
+ "parking_lot",
  "reqwest 0.12.28",
  "rmcp",
  "serde",
@@ -1286,7 +1288,9 @@ dependencies = [
  "tauri-plugin-updater",
  "thiserror 1.0.69",
  "tokio",
+ "uuid",
  "which",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

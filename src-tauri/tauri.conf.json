@@ -30,7 +30,11 @@
     "targets": ["nsis"],
     "createUpdaterArtifacts": true,
     "resources": {
-      "../bridge/ZZZ_10_agent_bridge.lua": "bridge/ZZZ_10_agent_bridge.lua"
+      "../bridge/ZZZ_10_agent_bridge.lua": "bridge/ZZZ_10_agent_bridge.lua",
+      "../vendor/epscript-lsp-agent/adapter.cjs": "vendor/epscript-lsp-agent/adapter.cjs",
+      "../vendor/epscript-lsp-agent/adapter.sha256": "vendor/epscript-lsp-agent/adapter.sha256",
+      "../vendor/epscript-lsp-agent/LICENSE.md": "vendor/epscript-lsp-agent/LICENSE.md",
+      "../vendor/epscript-lsp-agent/provenance.json": "vendor/epscript-lsp-agent/provenance.json"
     },
     "icon": [
       "icons/32x32.png",

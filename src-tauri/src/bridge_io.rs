@@ -4,6 +4,7 @@
 //! `outbox` for the matching `.result` file. Files are raw UTF-8 bytes without a BOM,
 //! and command writes are atomic so the Lua bridge never reads a partial `.cmd`.
 
+use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
 use std::fs;
@@ -12,6 +13,10 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use base64::Engine;
+use uuid::Uuid;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_BUSY_TIMEOUT: Duration = Duration::from_secs(180);
@@ -27,6 +32,8 @@ const DAT_NAMES: [&str; 10] = [
     "units", "weapons", "flingy", "sprites", "images", "upgrades", "techdata", "orders",
     "portdata", "sfxdata",
 ];
+const EPSNAPSHOT_MANIFEST_MAX_BYTES: u64 = 8 * 1024 * 1024;
+const BRIDGE_SESSION_MARKER_MAX_BYTES: u64 = 4 * 1024;
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -74,6 +81,23 @@ pub struct StatusSnapshot {
     /// Current project line from the editor status file.
     pub project: String,
 }
+/// One `.eps` project entry from a coherent editor snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EpsSnapshotFile {
+    pub path: String,
+    pub ftype: String,
+    /// `None` means the bridge could enumerate the file but could not read it.
+    pub content: Option<String>,
+}
+
+/// Coherent `.eps` project snapshot produced by one editor UI-thread Tick.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EpsSnapshot {
+    pub project: String,
+    /// Full project identity used only for stable mirror ownership.
+    pub identity: String,
+    pub files: Vec<EpsSnapshotFile>,
+}
 
 /// Errors returned by the file-IPC bridge client.
 #[derive(Debug)]
@@ -86,13 +110,17 @@ pub enum BridgeError {
     Busy(String),
     /// Filesystem error while writing, polling, or cleaning IPC files.
     Io(io::Error),
+    /// Snapshot manifest or ordinal content failed validation.
+    InvalidSnapshot(String),
 }
 
 impl fmt::Display for BridgeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::EditorNotConnected => f.write_str(EDITOR_NOT_CONNECTED_MESSAGE),
-            Self::Error(message) | Self::Busy(message) => f.write_str(message),
+            Self::Error(message) | Self::Busy(message) | Self::InvalidSnapshot(message) => {
+                f.write_str(message)
+            }
             Self::Io(error) => write!(f, "{error}"),
         }
     }
@@ -102,7 +130,10 @@ impl Error for BridgeError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Io(error) => Some(error),
-            Self::EditorNotConnected | Self::Error(_) | Self::Busy(_) => None,
+            Self::EditorNotConnected
+            | Self::Error(_)
+            | Self::Busy(_)
+            | Self::InvalidSnapshot(_) => None,
         }
     }
 }
@@ -293,6 +324,28 @@ impl BridgeIo {
     ) -> Result<String, BridgeError> {
         self.send(&format!("GET {path}"), opts, on_busy)
     }
+    /// Snapshot every `.eps` file in one idle editor Tick and consume the
+    /// request-owned ordinal directory after validating its manifest.
+    pub fn snapshot_eps(
+        &self,
+        opts: &SendOpts,
+        on_busy: Option<&dyn Fn()>,
+    ) -> Result<EpsSnapshot, BridgeError> {
+        let token = Uuid::new_v4().hyphenated().to_string();
+        let snapshot_dir = self.outbox.join(format!("epsnapshot-{token}"));
+        if let Err(error) = self.send(&format!("EPSNAPSHOT {token}"), opts, on_busy) {
+            let _ = fs::remove_dir_all(&snapshot_dir);
+            return Err(error);
+        }
+
+        let decoded = decode_eps_snapshot(&self.outbox, &snapshot_dir, &token);
+        let cleanup = fs::remove_dir_all(&snapshot_dir);
+        match (decoded, cleanup) {
+            (Ok(snapshot), Ok(())) => Ok(snapshot),
+            (Ok(_), Err(error)) => Err(BridgeError::Io(error)),
+            (Err(error), _) => Err(error),
+        }
+    }
 
     /// Replace a CUI/RawText file's in-memory text.
     pub fn set(
@@ -369,13 +422,15 @@ impl BridgeIo {
         self.send(&format!("LUA\n{code}"), opts, on_busy)
     }
 
-    /// Remove stale server-owned IPC files from startup.
+    /// Remove stale server-owned IPC files and snapshot directories at startup.
     ///
-    /// Only `srv-*.cmd` and `srv-*.result` are removed. Legacy `agent_*` files are never
-    /// touched, and missing inbox/outbox dirs are tolerated.
+    /// Only `srv-*.cmd`, `srv-*.result`, and immediate `epsnapshot-*`
+    /// directories are removed. Legacy `agent_*` files are never touched, and
+    /// missing inbox/outbox dirs are tolerated.
     pub fn cleanup_stale(&self) {
         remove_matching(&self.inbox, "srv-", ".cmd");
         remove_matching(&self.outbox, "srv-", ".result");
+        remove_snapshot_dirs(&self.outbox);
     }
 
     fn write_cmd(&self, cmd_path: &Path, command_text: &str) -> Result<(), BridgeError> {
@@ -469,6 +524,213 @@ impl BridgeIo {
         }
         false
     }
+}
+fn decode_eps_snapshot(
+    outbox: &Path,
+    snapshot_dir: &Path,
+    expected_token: &str,
+) -> Result<EpsSnapshot, BridgeError> {
+    let parsed_token = Uuid::parse_str(expected_token)
+        .map_err(|_| invalid_snapshot("request token is not a UUID"))?;
+    if parsed_token.hyphenated().to_string() != expected_token {
+        return Err(invalid_snapshot(
+            "request token is not normalized lowercase",
+        ));
+    }
+
+    let outbox_root = fs::canonicalize(outbox)?;
+    let snapshot_root = fs::canonicalize(snapshot_dir)?;
+    let expected_directory_name = format!("epsnapshot-{expected_token}");
+    if snapshot_root.parent() != Some(outbox_root.as_path())
+        || snapshot_root.file_name().and_then(|name| name.to_str())
+            != Some(expected_directory_name.as_str())
+    {
+        return Err(invalid_snapshot(
+            "snapshot directory escapes the bridge outbox",
+        ));
+    }
+
+    let manifest_path = fs::canonicalize(snapshot_root.join("manifest.tsv"))?;
+    if manifest_path.parent() != Some(snapshot_root.as_path()) {
+        return Err(invalid_snapshot(
+            "snapshot manifest escapes its request directory",
+        ));
+    }
+    let metadata = fs::metadata(&manifest_path)?;
+    if metadata.len() > EPSNAPSHOT_MANIFEST_MAX_BYTES {
+        return Err(invalid_snapshot("snapshot manifest exceeds its size limit"));
+    }
+    let manifest_bytes = fs::read(&manifest_path)?;
+    if manifest_bytes.starts_with(&[0xef, 0xbb, 0xbf]) {
+        return Err(invalid_snapshot(
+            "snapshot manifest must be UTF-8 without BOM",
+        ));
+    }
+    let manifest = String::from_utf8(manifest_bytes)
+        .map_err(|_| invalid_snapshot("snapshot manifest is not valid UTF-8"))?;
+    let lines: Vec<&str> = manifest.lines().collect();
+    if lines.len() < 4 || lines[0].trim_end_matches('\r') != "EUD-EPSNAPSHOT\t1" {
+        return Err(invalid_snapshot("snapshot manifest header is invalid"));
+    }
+
+    let token_fields: Vec<&str> = lines[1].trim_end_matches('\r').split('\t').collect();
+    if token_fields.as_slice() != ["token", expected_token] {
+        return Err(invalid_snapshot(
+            "snapshot manifest token does not match the request",
+        ));
+    }
+    let project_fields: Vec<&str> = lines[2].trim_end_matches('\r').split('\t').collect();
+    if project_fields.len() != 2 || project_fields[0] != "project" {
+        return Err(invalid_snapshot(
+            "snapshot project display name is malformed",
+        ));
+    }
+    let mut project = decode_base64_utf8(project_fields[1], "project display name")?;
+    let identity_fields: Vec<&str> = lines[3].trim_end_matches('\r').split('\t').collect();
+    if identity_fields.len() != 2 || identity_fields[0] != "identity" {
+        return Err(invalid_snapshot("snapshot project identity is malformed"));
+    }
+    let mut identity = decode_base64_utf8(identity_fields[1], "project identity")?;
+    let used_legacy_untitled_identity = identity.trim().is_empty();
+    if used_legacy_untitled_identity {
+        identity = legacy_untitled_identity(&outbox_root)?;
+    }
+    if project.trim().is_empty() {
+        if used_legacy_untitled_identity {
+            project = "Untitled".to_string();
+        } else {
+            project = identity
+                .split('\n')
+                .find(|value| !value.trim().is_empty())
+                .map(str::trim)
+                .unwrap_or_default()
+                .to_string();
+        }
+    }
+    if project.is_empty() {
+        return Err(invalid_snapshot("snapshot project display name is empty"));
+    }
+
+    let mut paths = HashMap::<String, String>::new();
+    let mut files = Vec::new();
+    for (index, line) in lines.iter().skip(4).enumerate() {
+        let fields: Vec<&str> = line.trim_end_matches('\r').split('\t').collect();
+        if fields.len() != 6 || fields[0] != "file" {
+            return Err(invalid_snapshot("snapshot file row is malformed"));
+        }
+        let ordinal = fields[1]
+            .parse::<usize>()
+            .map_err(|_| invalid_snapshot("snapshot ordinal is not numeric"))?;
+        if ordinal != index + 1 || ordinal > 999_999 {
+            return Err(invalid_snapshot(
+                "snapshot ordinals must be unique and contiguous from one",
+            ));
+        }
+        if fields[2].is_empty() {
+            return Err(invalid_snapshot("snapshot file type is empty"));
+        }
+        let project_path = decode_base64_utf8(fields[3], "project path")?;
+        let project_path = crate::eps_preflight::normalize_project_path(&project_path)
+            .map_err(|error| invalid_snapshot(&error))?;
+        let key = project_path.to_lowercase();
+        if let Some(previous) = paths.insert(key, project_path.clone()) {
+            return Err(invalid_snapshot(&format!(
+                "snapshot paths collide case-insensitively: {previous} and {project_path}"
+            )));
+        }
+        let declared_length = fields[4]
+            .parse::<usize>()
+            .map_err(|_| invalid_snapshot("snapshot byte length is not numeric"))?;
+        let content = match fields[5] {
+            "ok" => {
+                let ordinal_path = snapshot_root.join(format!("{ordinal:06}.eps"));
+                let canonical = fs::canonicalize(&ordinal_path)?;
+                if canonical.parent() != Some(snapshot_root.as_path()) {
+                    return Err(invalid_snapshot(
+                        "snapshot ordinal escapes its request directory",
+                    ));
+                }
+                let bytes = fs::read(canonical)?;
+                if bytes.len() != declared_length {
+                    return Err(invalid_snapshot(
+                        "snapshot ordinal byte length does not match",
+                    ));
+                }
+                if bytes.starts_with(&[0xef, 0xbb, 0xbf]) {
+                    return Err(invalid_snapshot(
+                        "snapshot content must be UTF-8 without BOM",
+                    ));
+                }
+                Some(
+                    String::from_utf8(bytes)
+                        .map_err(|_| invalid_snapshot("snapshot content is not valid UTF-8"))?,
+                )
+            }
+            "unreadable" if declared_length == 0 => None,
+            "unreadable" => {
+                return Err(invalid_snapshot(
+                    "unreadable snapshot rows must declare zero bytes",
+                ))
+            }
+            _ => return Err(invalid_snapshot("snapshot read status is invalid")),
+        };
+        files.push(EpsSnapshotFile {
+            path: project_path,
+            ftype: fields[2].to_string(),
+            content,
+        });
+    }
+
+    Ok(EpsSnapshot {
+        project,
+        identity,
+        files,
+    })
+}
+
+fn legacy_untitled_identity(outbox_root: &Path) -> Result<String, BridgeError> {
+    let data_dir = outbox_root
+        .parent()
+        .ok_or_else(|| invalid_snapshot("bridge outbox has no data directory"))?;
+    let marker_path = fs::canonicalize(data_dir.join("bridge_loaded.txt")).map_err(|_| {
+        invalid_snapshot(
+            "snapshot project identity is empty and bridge session marker is unavailable",
+        )
+    })?;
+    if marker_path.parent() != Some(data_dir) {
+        return Err(invalid_snapshot(
+            "bridge session marker escapes the bridge data directory",
+        ));
+    }
+    let metadata = fs::metadata(&marker_path)?;
+    if metadata.len() == 0 || metadata.len() > BRIDGE_SESSION_MARKER_MAX_BYTES {
+        return Err(invalid_snapshot(
+            "bridge session marker has an invalid size",
+        ));
+    }
+    let marker = String::from_utf8(fs::read(marker_path)?)
+        .map_err(|_| invalid_snapshot("bridge session marker is not valid UTF-8"))?;
+    let marker = marker.trim();
+    if marker.is_empty() {
+        return Err(invalid_snapshot("bridge session marker is empty"));
+    }
+
+    Ok(format!(
+        "legacy-untitled\n{}\n{marker}",
+        data_dir.to_string_lossy()
+    ))
+}
+
+fn decode_base64_utf8(value: &str, label: &str) -> Result<String, BridgeError> {
+    let bytes = BASE64_STANDARD
+        .decode(value)
+        .map_err(|_| invalid_snapshot(&format!("snapshot {label} is not valid base64")))?;
+    String::from_utf8(bytes)
+        .map_err(|_| invalid_snapshot(&format!("snapshot {label} is not valid UTF-8")))
+}
+
+fn invalid_snapshot(message: &str) -> BridgeError {
+    BridgeError::InvalidSnapshot(format!("invalid EPSNAPSHOT: {message}"))
 }
 
 enum ConsumeResult {
@@ -569,6 +831,25 @@ fn remove_matching(dir: &Path, prefix: &str, suffix: &str) {
     }
 }
 
+fn remove_snapshot_dirs(outbox: &Path) {
+    let Ok(entries) = fs::read_dir(outbox) else {
+        return;
+    };
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let is_directory = entry
+            .file_type()
+            .map(|file_type| file_type.is_dir())
+            .unwrap_or(false);
+        if is_directory && name.starts_with("epsnapshot-") {
+            let _ = fs::remove_dir_all(path);
+        }
+    }
+}
+
 fn is_transient_read_error(kind: io::ErrorKind) -> bool {
     matches!(
         kind,
@@ -581,7 +862,11 @@ fn is_transient_read_error(kind: io::ErrorKind) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{BridgeError, BridgeIo, ConsumePollState, ConsumeResult, SendOpts};
+    use super::{
+        decode_eps_snapshot, BridgeError, BridgeIo, ConsumePollState, ConsumeResult, SendOpts,
+        BASE64_STANDARD,
+    };
+    use base64::Engine;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -981,12 +1266,16 @@ mod tests {
         fs::write(inbox.join("agent_legacy.cmd"), "legacy").unwrap();
         fs::write(outbox.join("srv-deadbeef.result"), "PONG").unwrap();
         fs::write(outbox.join("agent_legacy.result"), "legacy").unwrap();
+        fs::create_dir(outbox.join("epsnapshot-stale")).unwrap();
+        fs::write(outbox.join("epsnapshot-foreign-file"), "keep").unwrap();
 
         let bridge = BridgeIo::new(&data_dir);
         bridge.cleanup_stale();
 
         assert!(!inbox.join("srv-deadbeef.cmd").exists());
         assert!(!outbox.join("srv-deadbeef.result").exists());
+        assert!(!outbox.join("epsnapshot-stale").exists());
+        assert!(outbox.join("epsnapshot-foreign-file").exists());
         assert!(
             inbox.join("agent_legacy.cmd").exists(),
             "cleanup_stale must never touch legacy agent_* inbox files"
@@ -1024,5 +1313,347 @@ mod tests {
         );
 
         fs::remove_dir_all(&data_dir).ok();
+    }
+
+    fn write_snapshot_fixture(
+        outbox: &Path,
+        token: &str,
+        project: &str,
+        rows: &[(&str, &str, Option<&str>)],
+    ) -> PathBuf {
+        let snapshot_dir = outbox.join(format!("epsnapshot-{token}"));
+        fs::create_dir_all(&snapshot_dir).unwrap();
+        let mut manifest = vec![
+            "EUD-EPSNAPSHOT\t1".to_string(),
+            format!("token\t{token}"),
+            format!("project\t{}", BASE64_STANDARD.encode(project.as_bytes())),
+            format!(
+                "identity\t{}",
+                BASE64_STANDARD.encode(format!("{project}\nmap.scx").as_bytes())
+            ),
+        ];
+        for (index, (project_path, ftype, content)) in rows.iter().enumerate() {
+            let ordinal = index + 1;
+            let (length, status) = match content {
+                Some(content) => {
+                    fs::write(
+                        snapshot_dir.join(format!("{ordinal:06}.eps")),
+                        content.as_bytes(),
+                    )
+                    .unwrap();
+                    (content.len(), "ok")
+                }
+                None => (0, "unreadable"),
+            };
+            manifest.push(format!(
+                "file\t{ordinal}\t{ftype}\t{}\t{length}\t{status}",
+                BASE64_STANDARD.encode(project_path.as_bytes())
+            ));
+        }
+        fs::write(
+            snapshot_dir.join("manifest.tsv"),
+            manifest.join("\n").as_bytes(),
+        )
+        .unwrap();
+        snapshot_dir
+    }
+
+    #[test]
+    fn eps_snapshot_manifest_preserves_nested_unicode_empty_and_unreadable_files() {
+        let data_dir = unique_temp_dir("snapshot-valid");
+        let outbox = data_dir.join("outbox");
+        fs::create_dir_all(&outbox).unwrap();
+        let token = "00000000-0000-4000-8000-000000000001";
+        let snapshot_dir = write_snapshot_fixture(
+            &outbox,
+            token,
+            "프로젝트/Example",
+            &[
+                ("lib/한글.eps", "CUIEps", Some("object 상태 { var 체력; };")),
+                ("empty.eps", "RawText", Some("")),
+                ("closed.eps", "CUIEps", None),
+            ],
+        );
+
+        let snapshot = decode_eps_snapshot(&outbox, &snapshot_dir, token).unwrap();
+        assert_eq!(snapshot.project, "프로젝트/Example");
+        assert_eq!(snapshot.files[0].path, "lib/한글.eps");
+        assert_eq!(
+            snapshot.files[0].content.as_deref(),
+            Some("object 상태 { var 체력; };")
+        );
+        assert_eq!(snapshot.files[1].content.as_deref(), Some(""));
+        assert_eq!(snapshot.files[2].content, None);
+        assert!(!fs::read(snapshot_dir.join("manifest.tsv"))
+            .unwrap()
+            .starts_with(&[0xef, 0xbb, 0xbf]));
+
+        fs::remove_dir_all(&data_dir).ok();
+    }
+
+    #[test]
+    fn eps_snapshot_manifest_uses_map_name_when_project_filename_is_empty() {
+        let data_dir = unique_temp_dir("snapshot-empty-project-filename");
+        let outbox = data_dir.join("outbox");
+        fs::create_dir_all(&outbox).unwrap();
+        let token = "00000000-0000-4000-8000-000000000002";
+        let snapshot_dir = write_snapshot_fixture(
+            &outbox,
+            token,
+            "",
+            &[("main.eps", "CUIEps", Some("function onPluginStart() {}"))],
+        );
+
+        let snapshot = decode_eps_snapshot(&outbox, &snapshot_dir, token).unwrap();
+        assert_eq!(snapshot.project, "map.scx");
+        assert_eq!(snapshot.identity, "\nmap.scx");
+
+        fs::remove_dir_all(&data_dir).ok();
+    }
+
+    #[test]
+    fn eps_snapshot_manifest_uses_bridge_session_when_all_project_names_are_empty() {
+        let data_dir = unique_temp_dir("snapshot-untitled-legacy");
+        let outbox = data_dir.join("outbox");
+        fs::create_dir_all(&outbox).unwrap();
+        fs::write(
+            data_dir.join("bridge_loaded.txt"),
+            "agent bridge v7 loaded at session-1",
+        )
+        .unwrap();
+        let token = "00000000-0000-4000-8000-000000000003";
+        let snapshot_dir = write_snapshot_fixture(
+            &outbox,
+            token,
+            "",
+            &[("main.eps", "CUIEps", Some("function onPluginStart() {}"))],
+        );
+        let manifest_path = snapshot_dir.join("manifest.tsv");
+        let mut manifest: Vec<String> = fs::read_to_string(&manifest_path)
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect();
+        manifest[3] = format!("identity\t{}", BASE64_STANDARD.encode(""));
+        fs::write(&manifest_path, manifest.join("\n")).unwrap();
+
+        let snapshot = decode_eps_snapshot(&outbox, &snapshot_dir, token).unwrap();
+        assert_eq!(snapshot.project, "Untitled");
+        assert!(snapshot.identity.starts_with("legacy-untitled\n"));
+        assert!(snapshot
+            .identity
+            .ends_with("\nagent bridge v7 loaded at session-1"));
+
+        fs::remove_dir_all(&data_dir).ok();
+    }
+
+    #[test]
+    fn eps_snapshot_manifest_rejects_bad_base64_lengths_ordinals_tokens_and_containment() {
+        let data_dir = unique_temp_dir("snapshot-invalid");
+        let outbox = data_dir.join("outbox");
+        fs::create_dir_all(&outbox).unwrap();
+
+        let token = "00000000-0000-4000-8000-000000000010";
+        let snapshot_dir = write_snapshot_fixture(
+            &outbox,
+            token,
+            "Project",
+            &[("main.eps", "CUIEps", Some("a"))],
+        );
+        fs::write(snapshot_dir.join("000001.eps"), b"too long").unwrap();
+        assert!(decode_eps_snapshot(&outbox, &snapshot_dir, token).is_err());
+
+        let token = "00000000-0000-4000-8000-000000000011";
+        let snapshot_dir = write_snapshot_fixture(
+            &outbox,
+            token,
+            "Project",
+            &[("main.eps", "CUIEps", Some("a"))],
+        );
+        let manifest_path = snapshot_dir.join("manifest.tsv");
+        let manifest = fs::read_to_string(&manifest_path)
+            .unwrap()
+            .replace("file\t1\t", "file\t2\t");
+        fs::write(&manifest_path, manifest).unwrap();
+        assert!(decode_eps_snapshot(&outbox, &snapshot_dir, token).is_err());
+
+        let token = "00000000-0000-4000-8000-000000000012";
+        let snapshot_dir = write_snapshot_fixture(
+            &outbox,
+            token,
+            "Project",
+            &[("main.eps", "CUIEps", Some("a"))],
+        );
+        let manifest_path = snapshot_dir.join("manifest.tsv");
+        let manifest = fs::read_to_string(&manifest_path).unwrap().replace(
+            &BASE64_STANDARD.encode("main.eps".as_bytes()),
+            "not-base64!",
+        );
+        fs::write(&manifest_path, manifest).unwrap();
+        assert!(decode_eps_snapshot(&outbox, &snapshot_dir, token).is_err());
+
+        let token = "00000000-0000-4000-8000-000000000013";
+        let snapshot_dir = write_snapshot_fixture(
+            &outbox,
+            token,
+            "Project",
+            &[("main.eps", "CUIEps", Some("a"))],
+        );
+        let manifest_path = snapshot_dir.join("manifest.tsv");
+        let manifest = fs::read_to_string(&manifest_path)
+            .unwrap()
+            .replace(token, "00000000-0000-4000-8000-000000000099");
+        fs::write(&manifest_path, manifest).unwrap();
+        assert!(decode_eps_snapshot(&outbox, &snapshot_dir, token).is_err());
+
+        let outside = data_dir.join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        let token = "00000000-0000-4000-8000-000000000014";
+        let outside_dir = write_snapshot_fixture(
+            &outside,
+            token,
+            "Project",
+            &[("main.eps", "CUIEps", Some("a"))],
+        );
+        assert!(decode_eps_snapshot(&outbox, &outside_dir, token).is_err());
+
+        fs::remove_dir_all(&data_dir).ok();
+    }
+
+    #[test]
+    fn eps_snapshot_manifest_rejects_case_insensitive_path_collisions() {
+        let data_dir = unique_temp_dir("snapshot-collision");
+        let outbox = data_dir.join("outbox");
+        fs::create_dir_all(&outbox).unwrap();
+        let token = "00000000-0000-4000-8000-000000000020";
+        let snapshot_dir = write_snapshot_fixture(
+            &outbox,
+            token,
+            "Project",
+            &[
+                ("Lib/Main.eps", "CUIEps", Some("a")),
+                ("lib/main.eps", "CUIEps", Some("b")),
+            ],
+        );
+        assert!(decode_eps_snapshot(&outbox, &snapshot_dir, token).is_err());
+        fs::remove_dir_all(&data_dir).ok();
+    }
+
+    #[test]
+    fn snapshot_eps_uses_one_request_token_and_removes_consumed_directory() {
+        let data_dir = unique_temp_dir("snapshot-roundtrip");
+        let inbox = data_dir.join("inbox");
+        let outbox = data_dir.join("outbox");
+        fs::create_dir_all(&inbox).unwrap();
+        fs::create_dir_all(&outbox).unwrap();
+        let responder_data = data_dir.clone();
+        let responder = thread::spawn(move || {
+            let inbox = responder_data.join("inbox");
+            let outbox = responder_data.join("outbox");
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                for entry in fs::read_dir(&inbox).unwrap().filter_map(Result::ok) {
+                    let file_name = entry.file_name().to_string_lossy().to_string();
+                    if !file_name.starts_with("srv-") || !file_name.ends_with(".cmd") {
+                        continue;
+                    }
+                    let command = fs::read_to_string(entry.path()).unwrap();
+                    let Some(token) = command.strip_prefix("EPSNAPSHOT ") else {
+                        continue;
+                    };
+                    let token = token.trim().to_string();
+                    write_snapshot_fixture(
+                        &outbox,
+                        &token,
+                        "Project",
+                        &[
+                            ("main.eps", "CUIEps", Some("import lib.units;")),
+                            ("lib/units.eps", "CUIEps", Some("object Unit {};")),
+                        ],
+                    );
+                    let name = file_name.trim_end_matches(".cmd").to_string();
+                    fs::remove_file(entry.path()).unwrap();
+                    fs::write(
+                        outbox.join(format!("{name}.result")),
+                        b"OK: epsnapshot 2 files",
+                    )
+                    .unwrap();
+                    return token;
+                }
+                assert!(Instant::now() < deadline, "snapshot request did not arrive");
+                thread::sleep(Duration::from_millis(5));
+            }
+        });
+
+        let bridge = BridgeIo::new(&data_dir);
+        let snapshot = bridge.snapshot_eps(&fast_opts(), None).unwrap();
+        let token = responder.join().unwrap();
+        assert_eq!(snapshot.project, "Project");
+        assert_eq!(snapshot.files.len(), 2);
+        assert!(!outbox.join(format!("epsnapshot-{token}")).exists());
+        assert!(srv_entries(&outbox, ".result").is_empty());
+
+        fs::remove_dir_all(&data_dir).ok();
+    }
+
+    #[test]
+    fn lua_eps_snapshot_falls_back_when_project_filename_is_empty() {
+        let source = include_str!("../../bridge/ZZZ_10_agent_bridge.lua");
+        let metadata = source
+            .split("local function snapshotProjectMetadata")
+            .nth(1)
+            .unwrap()
+            .split("local function split")
+            .next()
+            .unwrap();
+        assert!(metadata.contains("if filename == \"\" and openMapName == \"\" then"));
+        assert!(metadata.contains("\"untitled\\n\" .. bridgeSessionId"));
+        assert!(metadata.contains("return openMapName, filename .. \"\\n\" .. openMapName"));
+
+        let snapshot = source
+            .split("local function writeEpsSnapshot")
+            .nth(1)
+            .unwrap()
+            .split("local function handleCommand")
+            .next()
+            .unwrap();
+        assert!(snapshot
+            .contains("local projectDisplay, projectIdentity = snapshotProjectMetadata(pj)"));
+        assert!(snapshot.contains("\"project\\t\" .. base64Utf8(projectDisplay)"));
+        assert!(snapshot.contains("\"identity\\t\" .. base64Utf8(projectIdentity)"));
+        assert_eq!(source.matches("snapshotProjectMetadata(pj)").count(), 4);
+    }
+
+    #[test]
+    fn lua_eps_snapshot_contract_preserves_tick_compiling_and_dump_invariants() {
+        let source = include_str!("../../bridge/ZZZ_10_agent_bridge.lua");
+        assert!(source.contains("elseif cmd == \"EPSNAPSHOT\" then"));
+        assert!(source.contains("elseif cmd == \"DUMP\" then"));
+        assert!(source.contains("UTF8Encoding(false)"));
+        let snapshot = source
+            .split("local function writeEpsSnapshot")
+            .nth(1)
+            .unwrap()
+            .split("local function handleCommand")
+            .next()
+            .unwrap();
+        assert!(
+            snapshot.find("ordinalName").unwrap() < snapshot.find("manifest.tsv").unwrap(),
+            "ordinal content must be written before the last-written manifest"
+        );
+
+        let tick = source.split("timer.Tick:Add").nth(1).unwrap();
+        let heartbeat = tick.find("heartbeat.txt").unwrap();
+        let compiling = tick.find("if pg ~= nil and pg.IsCompilng then").unwrap();
+        let busy_status = tick[compiling..].find("status.txt").unwrap() + compiling;
+        let early_return = tick[busy_status..].find("return").unwrap() + busy_status;
+        let project_access = tick.find("local pj = GlobalObj.pjData").unwrap();
+        assert!(heartbeat < compiling);
+        assert!(compiling < busy_status);
+        assert!(busy_status < early_return);
+        assert!(
+            early_return < project_access,
+            "compiling Tick must return before any project-object access"
+        );
     }
 }

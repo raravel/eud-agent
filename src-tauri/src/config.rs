@@ -179,6 +179,17 @@ impl DataDirs {
         self.app_local_data.join("logs")
     }
 
+    /// `%localappdata%\eud-agent\attachments` — session-owned images and text/code
+    /// files. Attachments can be large and therefore never live in Roaming.
+    pub fn attachments_dir(&self) -> PathBuf {
+        self.app_local_data.join("attachments")
+    }
+    /// `%localappdata%\eud-agent\lsp_workspaces` — regenerable, app-owned
+    /// epScript snapshots and candidate analysis directories. Never Roaming.
+    pub fn lsp_workspaces_dir(&self) -> PathBuf {
+        self.app_local_data.join("lsp_workspaces")
+    }
+
     /// `%localappdata%\eud-agent\codex_workspace` — the STABLE, app-owned cwd
     /// for spawned codex processes (rules.md: never the launch dir). Kept empty
     /// so codex finds no AGENTS.md/repo there: launching from the dev repo
@@ -201,6 +212,8 @@ impl DataDirs {
             self.rag_dir(),
             self.bin_dir(),
             self.logs_dir(),
+            self.attachments_dir(),
+            self.lsp_workspaces_dir(),
             self.codex_workspace_dir(),
         ] {
             fs::create_dir_all(dir)?;
@@ -344,6 +357,8 @@ mod tests {
         assert!(dirs.models_dir().is_dir());
         assert!(dirs.rag_dir().is_dir());
         assert!(dirs.logs_dir().is_dir());
+        assert!(dirs.attachments_dir().is_dir());
+        assert!(dirs.lsp_workspaces_dir().is_dir());
 
         // The model dir must live under local, not roaming.
         assert!(dirs.models_dir().starts_with(dirs.app_local_data()));

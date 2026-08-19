@@ -24,6 +24,7 @@ use serde_json::{json, Value};
 
 use crate::bridge_io::{BridgeIo, SendOpts, HEARTBEAT_STALE_AFTER};
 use crate::config::DataDirs;
+use crate::eps_preflight::{EpsAnalyzer, EpsCandidate, EpsPreflight};
 use crate::journal::{DatTable, JournalEntry, JournalStore, JournalTarget, Snapshot, WriteTool};
 use crate::mapsafe::{CompilingStatus, IsomEngine, MapSafe, WindowsLockProbe};
 use crate::memory::ProjectMemory;
@@ -68,6 +69,7 @@ pub struct ToolRuntime {
     journal: JournalStore,
     rag: Arc<Rag>,
     map_safe: Arc<ProductionMapSafe>,
+    eps_preflight: Arc<EpsPreflight>,
     /// request_id -> live per-request gate/budget state (the registry).
     registry: Arc<Mutex<HashMap<String, RequestState>>>,
     /// The request id tool calls resolve against (set by the engine per turn).
@@ -78,12 +80,10 @@ pub struct ToolRuntime {
 }
 
 impl ToolRuntime {
-    /// Build the runtime from resolved data dirs. Loads the RAG index from
-    /// `rag_dir()` if present (an empty index otherwise — `search_docs` then
-    /// returns zero hits, which still lifts the evidence gate). The embedding
-    /// model is NOT loaded here (readiness never gates startup); warm it in the
-    /// background via [`Self::rag`].
-    pub fn new(dirs: DataDirs) -> Self {
+    /// Build the runtime from resolved data dirs and an optional-process
+    /// epScript analyzer. RAG remains lazy; analyzer startup is deferred until
+    /// the first `eps_check`.
+    pub fn new(dirs: DataDirs, analyzer: Arc<dyn EpsAnalyzer>) -> Self {
         let journal = JournalStore::new(dirs.app_data());
         let rag = Arc::new(load_rag(&dirs));
         let map_safe = Arc::new(MapSafe::new(
@@ -92,11 +92,13 @@ impl ToolRuntime {
             WindowsLockProbe,
             IsomEngine,
         ));
+        let eps_preflight = Arc::new(EpsPreflight::new(dirs.clone(), analyzer));
         Self {
             dirs,
             journal,
             rag,
             map_safe,
+            eps_preflight,
             registry: Arc::new(Mutex::new(HashMap::new())),
             current: Arc::new(Mutex::new(None)),
             pending_plan: Arc::new(Mutex::new(None)),
@@ -129,6 +131,7 @@ impl ToolRuntime {
         if let Ok(mut current) = self.current.lock() {
             *current = Some(request_id.to_owned());
         }
+        self.eps_preflight.begin_request(request_id);
     }
 
     /// The request id tool calls currently resolve against, if a turn is open.
@@ -229,6 +232,17 @@ impl ToolRuntime {
                 let path = str_arg(args, "path")?;
                 let content = self.bridge()?.get(path, &opts, None).map_err(stringify)?;
                 Ok(json!({ "path": path, "content": content }))
+            }
+            tools::EPS_CHECK_TOOL => {
+                let files: Vec<EpsCandidate> = serde_json::from_value(
+                    args.get("files")
+                        .cloned()
+                        .ok_or_else(|| "missing argument 'files'".to_string())?,
+                )
+                .map_err(|error| format!("invalid eps_check files: {error}"))?;
+                let result = self.eps_preflight.check(request_id, files)?;
+                serde_json::to_value(result)
+                    .map_err(|error| format!("failed to serialize eps_check result: {error}"))
             }
             "dat_get" => {
                 let (dat, param, obj_id) = (
@@ -520,7 +534,7 @@ impl ToolRuntime {
     }
 
     fn file_create(&self, request_id: &str, args: &Value) -> Result<Value, String> {
-        let (path, ftype) = (str_arg(args, "path")?, str_arg(args, "ftype")?);
+        let (requested_path, ftype) = (str_arg(args, "path")?, str_arg(args, "ftype")?);
         let code = args.get("code").and_then(Value::as_str).unwrap_or("");
         // The editor stores a script's name WITHOUT its type extension (a
         // natively-created CUIEps `test` has FileName `test`; the editor adds
@@ -528,8 +542,11 @@ impl ToolRuntime {
         // LIST/GET paths it reads (e.g. main.eps), passes a path WITH the
         // extension, which would persist as FileName `main.eps` and build to
         // `main.eps.eps`. Strip it so the stored name matches a native file.
-        let path = normalize_create_path(path, ftype);
+        let path = normalize_create_path(requested_path, ftype);
         let reply = self.send(&format!("NEWFILE {path}|{ftype}\n{code}"))?;
+        let mirror_path = created_project_path(requested_path, ftype);
+        self.eps_preflight
+            .write_applied(request_id, &mirror_path, code);
         self.record_file(
             request_id,
             WriteTool::FileCreate,
@@ -550,6 +567,7 @@ impl ToolRuntime {
             .bridge()?
             .set(path, code, &SendOpts::default(), None)
             .map_err(stringify)?;
+        self.eps_preflight.write_applied(request_id, path, code);
         self.record_file(
             request_id,
             WriteTool::FileWrite,
@@ -571,6 +589,7 @@ impl ToolRuntime {
             .get(path, &SendOpts::default(), None)
             .unwrap_or_default();
         let reply = self.send(&format!("DELFILE {path}"))?;
+        self.eps_preflight.delete_applied(request_id, path);
         self.record_file(
             request_id,
             WriteTool::FileDelete,
@@ -601,6 +620,7 @@ impl ToolRuntime {
         let (path, newname) = (str_arg(args, "path")?, str_arg(args, "newname")?);
         let to = sibling_path(path, newname);
         let reply = self.send(&format!("RENAME {path}\n{newname}"))?;
+        self.eps_preflight.rename_applied(request_id, path, &to);
         self.record_rename(request_id, WriteTool::FileRename, path, &to)?;
         Ok(json!({ "ok": true, "result": reply.trim() }))
     }
@@ -610,6 +630,7 @@ impl ToolRuntime {
         let dest = args.get("destFolder").and_then(Value::as_str).unwrap_or("");
         let to = moved_path(path, dest);
         let reply = self.send(&format!("MOVEFILE {path}\n{dest}"))?;
+        self.eps_preflight.rename_applied(request_id, path, &to);
         self.record_rename(request_id, WriteTool::FileMove, path, &to)?;
         Ok(json!({ "ok": true, "result": reply.trim() }))
     }
@@ -895,7 +916,12 @@ impl ToolRuntime {
             .map(|duration| duration.as_nanos())
             .unwrap_or_default();
         let base = std::env::temp_dir().join(format!("eud-agent-runtime-test-{nanos}"));
-        Self::new(DataDirs::from_bases(&base, &base))
+        let dirs = DataDirs::from_bases(&base, &base);
+        let analyzer = Arc::new(crate::eps_preflight::NodeEpsAnalyzer::unavailable(
+            crate::eps_preflight::SkipReason::AdapterMissing,
+            "test runtime has no adapter resource",
+        ));
+        Self::new(dirs, analyzer)
     }
 }
 
@@ -985,6 +1011,17 @@ fn normalize_create_path(path: &str, ftype: &str) -> String {
     }
 }
 
+fn created_project_path(path: &str, ftype: &str) -> String {
+    let Some(extension) = auto_extension(ftype) else {
+        return path.to_string();
+    };
+    if path.ends_with(extension) {
+        path.to_string()
+    } else {
+        format!("{path}{extension}")
+    }
+}
+
 fn sibling_path(path: &str, newname: &str) -> String {
     match path.rsplit_once('/') {
         Some((parent, _)) => format!("{parent}/{newname}"),
@@ -1019,7 +1056,15 @@ fn epoch_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::eps_preflight::{
+        AnalyzerError, AnalyzerRequest, AnalyzerSuccess, EpsDiagnostic, EpsImport,
+    };
+    use base64::Engine;
     use serde_json::json;
+    use std::fs;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::thread;
+    use std::time::{Duration, Instant};
 
     fn open_runtime(request_id: &str) -> ToolRuntime {
         let runtime = ToolRuntime::for_tests();
@@ -1086,6 +1131,129 @@ mod tests {
             Some("# Plan\n1. do it")
         );
         assert_eq!(runtime.take_pending_plan("req-plan"), None);
+    }
+
+    struct ReturningAnalyzer {
+        calls: AtomicUsize,
+    }
+
+    impl EpsAnalyzer for ReturningAnalyzer {
+        fn analyze(&self, request: &AnalyzerRequest) -> Result<AnalyzerSuccess, AnalyzerError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(request.candidates.len(), 1);
+            assert_eq!(request.candidates[0].path, "main.eps");
+            Ok(AnalyzerSuccess {
+                checked_files: vec!["main.eps".to_string()],
+                diagnostics: Vec::<EpsDiagnostic>::new(),
+                imports: Vec::<EpsImport>::new(),
+                truncated: false,
+                omitted_diagnostics: 0,
+                omitted_message_bytes: 0,
+            })
+        }
+
+        fn reset_project(&self) {}
+    }
+
+    #[test]
+    fn eps_check_returns_fake_analyzer_result_without_journal_or_budget_changes() {
+        let base = std::env::temp_dir().join(format!(
+            "eud-agent-runtime-eps-check-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let dirs = DataDirs::from_bases(&base.join("roaming"), &base.join("local"));
+        dirs.ensure_dirs().unwrap();
+        let editor = base.join("editor");
+        let agent_dir = editor.join("Data").join("agent");
+        let inbox = agent_dir.join("inbox");
+        let outbox = agent_dir.join("outbox");
+        fs::create_dir_all(&inbox).unwrap();
+        fs::create_dir_all(&outbox).unwrap();
+        let config = crate::config::Config {
+            editor_path: editor.to_string_lossy().to_string(),
+            ..Default::default()
+        };
+        dirs.save_config(&config).unwrap();
+
+        let responder_outbox = outbox.clone();
+        let responder = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                for entry in fs::read_dir(&inbox).unwrap().filter_map(Result::ok) {
+                    let file_name = entry.file_name().to_string_lossy().to_string();
+                    if !file_name.starts_with("srv-") || !file_name.ends_with(".cmd") {
+                        continue;
+                    }
+                    let command = fs::read_to_string(entry.path()).unwrap();
+                    let Some(token) = command.strip_prefix("EPSNAPSHOT ") else {
+                        continue;
+                    };
+                    let token = token.trim();
+                    let snapshot_dir = responder_outbox.join(format!("epsnapshot-{token}"));
+                    fs::create_dir_all(&snapshot_dir).unwrap();
+                    let code = "function onPluginStart() {}";
+                    fs::write(snapshot_dir.join("000001.eps"), code.as_bytes()).unwrap();
+                    let manifest = [
+                        "EUD-EPSNAPSHOT\t1".to_string(),
+                        format!("token\t{token}"),
+                        format!(
+                            "project\t{}",
+                            base64::engine::general_purpose::STANDARD.encode("Project".as_bytes())
+                        ),
+                        format!(
+                            "identity\t{}",
+                            base64::engine::general_purpose::STANDARD
+                                .encode("Project\nmap.scx".as_bytes())
+                        ),
+                        format!(
+                            "file\t1\tCUIEps\t{}\t{}\tok",
+                            base64::engine::general_purpose::STANDARD.encode("main.eps".as_bytes()),
+                            code.len()
+                        ),
+                    ]
+                    .join("\n");
+                    fs::write(snapshot_dir.join("manifest.tsv"), manifest.as_bytes()).unwrap();
+                    let stem = file_name.trim_end_matches(".cmd").to_string();
+                    fs::remove_file(entry.path()).unwrap();
+                    fs::write(
+                        responder_outbox.join(format!("{stem}.result")),
+                        b"OK: epsnapshot 1 files",
+                    )
+                    .unwrap();
+                    return;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "eps snapshot command did not arrive"
+                );
+                thread::sleep(Duration::from_millis(5));
+            }
+        });
+
+        let analyzer = Arc::new(ReturningAnalyzer {
+            calls: AtomicUsize::new(0),
+        });
+        let runtime = ToolRuntime::new(dirs, analyzer.clone());
+        runtime.begin_request("req-eps");
+        let result = runtime
+            .execute(
+                tools::EPS_CHECK_TOOL,
+                &json!({
+                    "files": [{"path": "main.eps", "code": "function onPluginStart() {}"}]
+                }),
+            )
+            .unwrap();
+        responder.join().unwrap();
+
+        assert_eq!(result["status"], "diagnosed");
+        assert_eq!(result["checkedFiles"], json!(["main.eps"]));
+        assert_eq!(analyzer.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(runtime.journal().entry_count("req-eps"), 0);
+        let registry = runtime.registry.lock().unwrap();
+        let state = registry.get("req-eps").unwrap();
+        assert_eq!(state.action_count, 0);
+        assert_eq!(state.mutation_count, 0);
+        fs::remove_dir_all(base).ok();
     }
 
     #[test]

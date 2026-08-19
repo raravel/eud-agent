@@ -17,6 +17,7 @@ pub mod codex_auth;
 pub mod codex_client;
 pub mod config;
 pub mod engine;
+pub mod eps_preflight;
 pub mod ipc;
 pub mod journal;
 pub mod mapsafe;
@@ -214,11 +215,36 @@ pub fn run() {
             let app_handle = app.handle().clone();
             let sink = engine::TauriEventSink::new(app_handle.clone());
 
+            // Resolve and checksum-verify the pinned adapter before constructing
+            // the shared runtime. Failure is represented by an unavailable
+            // analyzer and never blocks application startup or other tools.
+            let adapter = app.path().resolve(
+                "vendor/epscript-lsp-agent/adapter.cjs",
+                BaseDirectory::Resource,
+            );
+            let checksum = app.path().resolve(
+                "vendor/epscript-lsp-agent/adapter.sha256",
+                BaseDirectory::Resource,
+            );
+            let analyzer = match (adapter, checksum) {
+                (Ok(adapter), Ok(checksum)) => eps_preflight::NodeEpsAnalyzer::from_resource(
+                    adapter,
+                    checksum,
+                    data_dirs.logs_dir(),
+                    data_dirs.lsp_workspaces_dir(),
+                ),
+                (Err(error), _) | (_, Err(error)) => eps_preflight::NodeEpsAnalyzer::unavailable(
+                    eps_preflight::SkipReason::AdapterMissing,
+                    format!("cannot resolve bundled epscript adapter: {error}"),
+                ),
+            };
+
             // Shared tool runtime: the eud-tools MCP handler and the engine both
             // hold a clone of the SAME runtime, so journal entries the handler
             // records during a turn are the changeset the engine reviews, and the
             // handler resolves the live request id the engine opened.
-            let runtime = tool_exec::ToolRuntime::new(data_dirs.clone());
+            let runtime =
+                tool_exec::ToolRuntime::new(data_dirs.clone(), std::sync::Arc::new(analyzer));
 
             // Start the loopback eud-tools MCP server and resolve its ephemeral
             // port BEFORE codex is spawned (the port is injected into codex's

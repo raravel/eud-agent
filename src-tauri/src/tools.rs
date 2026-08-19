@@ -18,6 +18,14 @@ pub const BUILD_RUN_TOOL: &str = "build_run";
 
 /// Documentation search tool name.
 pub const SEARCH_DOCS_TOOL: &str = "search_docs";
+/// Read-only epScript candidate preflight tool name.
+pub const EPS_CHECK_TOOL: &str = "eps_check";
+
+/// Maximum admitted non-search tool actions in one user request.
+const MAX_TOOL_ACTIONS: usize = 120;
+
+/// Maximum admitted documentation searches in one user request.
+const MAX_SEARCH_DOCS_CALLS: usize = 120;
 
 /// Connected source-map digest tool name.
 pub const MAP_INFO_TOOL: &str = "map_info";
@@ -60,6 +68,9 @@ pub struct RequestState {
     /// Number of admitted tool actions in this request.
     pub action_count: usize,
 
+    /// Number of admitted `search_docs` calls in this request.
+    pub search_docs_count: usize,
+
     /// Number of admitted mutating tool actions in this request.
     pub mutation_count: usize,
 
@@ -80,6 +91,7 @@ impl RequestState {
             docs_searched: false,
             plan_approved: false,
             action_count: 0,
+            search_docs_count: 0,
             mutation_count: 0,
             build_fix_attempts: 0,
         }
@@ -188,6 +200,22 @@ fn enum_string_schema(values: &[&str]) -> Value {
     json!({"type": "string", "enum": values})
 }
 
+fn eps_candidates_schema() -> Value {
+    json!({
+        "type": "array",
+        "minItems": 1,
+        "items": {
+            "type": "object",
+            "properties": {
+                "path": string_schema(),
+                "code": string_schema(),
+            },
+            "required": ["path", "code"],
+            "additionalProperties": false,
+        },
+    })
+}
+
 fn dat_names_schema() -> Value {
     enum_string_schema(&[
         "units", "weapons", "flingy", "sprites", "images", "upgrades", "techdata", "orders",
@@ -233,6 +261,12 @@ pub fn tool_registry() -> Vec<ToolSpec> {
             "Read an editable project file.",
             false,
             schema(json!({"path": string_schema()}), &["path"]),
+        ),
+        tool_spec(
+            EPS_CHECK_TOOL,
+            "Analyze complete epScript candidate files against the current project snapshot.",
+            false,
+            schema(json!({"files": eps_candidates_schema()}), &["files"]),
         ),
         tool_spec(
             "dat_get",
@@ -661,11 +695,19 @@ pub fn admit_tool_call(state: &mut RequestState, tool: &str, args: &Value) -> To
 
     validate_tool_args(&spec, args)?;
 
-    if state.action_count >= 30 {
-        return admission_error(
-            "action budget exhausted: this request is limited to 30 tool calls. Wrap up with the \
-current findings instead of continuing to call tools.",
-        );
+    if spec.name == SEARCH_DOCS_TOOL {
+        if state.search_docs_count >= MAX_SEARCH_DOCS_CALLS {
+            return admission_error(&format!(
+                "search_docs budget exhausted: this request is limited to \
+{MAX_SEARCH_DOCS_CALLS} documentation searches. Wrap up with the current findings instead of \
+continuing to search."
+            ));
+        }
+    } else if state.action_count >= MAX_TOOL_ACTIONS && spec.name != EPS_CHECK_TOOL {
+        return admission_error(&format!(
+            "action budget exhausted: this request is limited to {MAX_TOOL_ACTIONS} non-search \
+tool calls. Wrap up with the current findings instead of continuing to call tools."
+        ));
     }
 
     check_evidence_gate(state, &spec, true)?;
@@ -686,7 +728,11 @@ Summarize the remaining build issue instead of running build again.",
 
     validate_first_principles(&spec, args)?;
 
-    state.action_count += 1;
+    if spec.name == SEARCH_DOCS_TOOL {
+        state.search_docs_count += 1;
+    } else if spec.name != EPS_CHECK_TOOL {
+        state.action_count += 1;
+    }
     if counts_against_mutation_gate(&spec) {
         state.mutation_count += 1;
     }
@@ -809,12 +855,96 @@ fn validate_arg_value(
         Some(Value::String(kind)) if kind == "string" => validate_string(spec, name, value),
         Some(Value::String(kind)) if kind == "integer" => validate_integer(spec, name, value),
         Some(Value::String(kind)) if kind == "boolean" => validate_boolean(spec, name, value),
+        Some(Value::String(kind)) if kind == "array" => {
+            validate_array(spec, name, value, property_schema)
+        }
+        Some(Value::String(kind)) if kind == "object" => {
+            validate_object(spec, name, value, property_schema)
+        }
         Some(Value::Array(kinds)) => validate_union_type(spec, name, value, kinds, property_schema),
         _ => admission_error(&format!(
             "tool schema for {}.{} has an unsupported type",
             spec.name, name
         )),
     }
+}
+
+fn validate_array(
+    spec: &ToolSpec,
+    name: &str,
+    value: &Value,
+    property_schema: &Value,
+) -> ToolResult<()> {
+    let Some(items) = value.as_array() else {
+        return usage_error(spec, &[name], "invalid argument type; expected array");
+    };
+    let minimum = property_schema
+        .get("minItems")
+        .and_then(Value::as_u64)
+        .unwrap_or_default() as usize;
+    if items.len() < minimum {
+        return admission_error(&format!(
+            "invalid value for '{name}': expected at least {minimum} item(s)"
+        ));
+    }
+    let item_schema = property_schema
+        .get("items")
+        .ok_or_else(|| ToolError::AdmissionRejected {
+            message: format!(
+                "tool schema for {}.{name} is missing array items",
+                spec.name
+            ),
+        })?;
+    for (index, item) in items.iter().enumerate() {
+        validate_arg_value(spec, &format!("{name}[{index}]"), item, item_schema)?;
+    }
+    Ok(())
+}
+
+fn validate_object(
+    spec: &ToolSpec,
+    name: &str,
+    value: &Value,
+    property_schema: &Value,
+) -> ToolResult<()> {
+    let Some(object) = value.as_object() else {
+        return usage_error(spec, &[name], "invalid argument type; expected object");
+    };
+    let properties = property_schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .ok_or_else(|| ToolError::AdmissionRejected {
+            message: format!(
+                "tool schema for {}.{name} is missing object properties",
+                spec.name
+            ),
+        })?;
+    let required = property_schema
+        .get("required")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str);
+    for field in required {
+        if !object.contains_key(field) {
+            return usage_error(
+                spec,
+                &[name],
+                &format!("missing required nested argument '{name}.{field}'"),
+            );
+        }
+    }
+    for (field, nested) in object {
+        let Some(nested_schema) = properties.get(field) else {
+            return usage_error(
+                spec,
+                &[name],
+                &format!("unexpected nested argument '{name}.{field}'"),
+            );
+        };
+        validate_arg_value(spec, &format!("{name}.{field}"), nested, nested_schema)?;
+    }
+    Ok(())
 }
 
 fn validate_string(spec: &ToolSpec, name: &str, value: &Value) -> ToolResult<()> {
@@ -3078,6 +3208,14 @@ mod tests {
                 schema(serde_json::json!({"path": string_schema()}), &["path"]),
             ),
             (
+                EPS_CHECK_TOOL,
+                false,
+                schema(
+                    serde_json::json!({"files": eps_candidates_schema()}),
+                    &["files"],
+                ),
+            ),
+            (
                 "dat_get",
                 false,
                 schema(
@@ -3466,6 +3604,76 @@ mod tests {
     }
 
     #[test]
+    fn eps_check_is_read_only_and_does_not_consume_action_or_mutation_budgets() {
+        let spec = tool_registry()
+            .into_iter()
+            .find(|spec| spec.name == EPS_CHECK_TOOL)
+            .expect("eps_check must be registered");
+        assert!(!spec.mutating);
+
+        let mut state = RequestState::for_request("req-eps-check");
+        state.action_count = MAX_TOOL_ACTIONS;
+        state.search_docs_count = MAX_SEARCH_DOCS_CALLS;
+        state.mutation_count = 2;
+        state.build_fix_attempts = 3;
+        admit_tool_call(
+            &mut state,
+            EPS_CHECK_TOOL,
+            &serde_json::json!({
+                "files": [
+                    {"path": "main.eps", "code": "import lib.units;"},
+                    {"path": "lib/units.eps", "code": "object UnitState {};"}
+                ]
+            }),
+        )
+        .unwrap();
+        assert_eq!(state.action_count, MAX_TOOL_ACTIONS);
+        assert_eq!(state.search_docs_count, MAX_SEARCH_DOCS_CALLS);
+        assert_eq!(state.mutation_count, 2);
+        assert_eq!(state.build_fix_attempts, 3);
+        assert!(!state.docs_searched);
+        assert!(!state.plan_approved);
+    }
+
+    #[test]
+    fn eps_check_nested_schema_rejects_empty_or_incomplete_candidate_batches() {
+        for args in [
+            serde_json::json!({"files": []}),
+            serde_json::json!({"files": [{"path": "main.eps"}]}),
+            serde_json::json!({"files": [{"path": "main.eps", "code": "", "extra": true}]}),
+        ] {
+            let mut state = RequestState::for_request("req-invalid-eps-check");
+            assert!(admit_tool_call(&mut state, EPS_CHECK_TOOL, &args).is_err());
+            assert_eq!(state.action_count, 0);
+            assert_eq!(state.mutation_count, 0);
+        }
+    }
+
+    #[test]
+    fn preflight_outcome_cannot_gate_later_write_or_build_admission() {
+        let mut state = RequestState::for_request("req-eps-fallthrough");
+        state.record_search_docs();
+        admit_tool_call(
+            &mut state,
+            EPS_CHECK_TOOL,
+            &serde_json::json!({
+                "files": [{"path": "main.eps", "code": "function onPluginStart() {}"}]
+            }),
+        )
+        .unwrap();
+        admit_tool_call(
+            &mut state,
+            "file_write",
+            &serde_json::json!({"path": "main.eps", "code": "function onPluginStart() {}"}),
+        )
+        .unwrap();
+        admit_tool_call(&mut state, BUILD_RUN_TOOL, &serde_json::json!({})).unwrap();
+        assert_eq!(state.action_count, 2);
+        assert_eq!(state.mutation_count, 2);
+        assert_eq!(state.build_fix_attempts, 1);
+    }
+
+    #[test]
     fn map_info_summary_returns_aggregates_without_raw_units() {
         let digest = sample_digest(vec![
             unit(0, "Terran Marine", "P1", 96, 160),
@@ -3725,7 +3933,7 @@ mod tests {
     }
 
     #[test]
-    fn admission_does_not_record_search_docs_before_execution() {
+    fn admission_tracks_search_budget_without_recording_evidence_or_general_actions() {
         let mut state = RequestState::for_request("req-search");
 
         admit_tool_call(
@@ -3736,7 +3944,8 @@ mod tests {
         .unwrap();
 
         assert!(!state.docs_searched);
-        assert_eq!(state.action_count, 1);
+        assert_eq!(state.search_docs_count, 1);
+        assert_eq!(state.action_count, 0);
     }
 
     #[test]
@@ -3779,10 +3988,10 @@ mod tests {
     }
 
     #[test]
-    fn admission_rejects_thirty_first_action_with_wrapup_message() {
+    fn admission_rejects_121st_action_with_wrapup_message() {
         let mut state = RequestState::for_request("req-budget");
 
-        for _ in 0..30 {
+        for _ in 0..MAX_TOOL_ACTIONS {
             admit_tool_call(&mut state, "project_status", &serde_json::json!({})).unwrap();
         }
 
@@ -3790,14 +3999,55 @@ mod tests {
             admit_tool_call(&mut state, "project_status", &serde_json::json!({})).unwrap_err();
         let message = error.to_string().to_lowercase();
         assert!(
-            message.contains("30"),
+            message.contains("120"),
             "budget error should state the limit"
         );
         assert!(
             message.contains("wrap"),
-            "31st action should tell codex to wrap up"
+            "121st action should tell codex to wrap up"
         );
-        assert_eq!(state.action_count, 30, "rejected action must not count");
+        assert_eq!(
+            state.action_count, MAX_TOOL_ACTIONS,
+            "rejected action must not count"
+        );
+        admit_tool_call(
+            &mut state,
+            SEARCH_DOCS_TOOL,
+            &serde_json::json!({"query": "search budget remains independent"}),
+        )
+        .unwrap();
+        assert_eq!(state.action_count, MAX_TOOL_ACTIONS);
+        assert_eq!(state.search_docs_count, 1);
+    }
+
+    #[test]
+    fn admission_allows_120_searches_without_spending_general_actions_then_rejects_121st() {
+        let mut state = RequestState::for_request("req-search-budget");
+
+        for _ in 0..MAX_SEARCH_DOCS_CALLS {
+            admit_tool_call(
+                &mut state,
+                SEARCH_DOCS_TOOL,
+                &serde_json::json!({"query": "wave growth boss"}),
+            )
+            .unwrap();
+        }
+
+        let error = admit_tool_call(
+            &mut state,
+            SEARCH_DOCS_TOOL,
+            &serde_json::json!({"query": "one search too many"}),
+        )
+        .unwrap_err();
+        let message = error.to_string().to_lowercase();
+        assert!(message.contains("search_docs"));
+        assert!(message.contains("120"));
+        assert!(message.contains("wrap"));
+        assert_eq!(state.search_docs_count, MAX_SEARCH_DOCS_CALLS);
+        assert_eq!(state.action_count, 0);
+        admit_tool_call(&mut state, "project_status", &serde_json::json!({})).unwrap();
+        assert_eq!(state.search_docs_count, MAX_SEARCH_DOCS_CALLS);
+        assert_eq!(state.action_count, 1);
     }
 
     #[test]
@@ -3842,6 +4092,12 @@ mod tests {
     #[test]
     fn fresh_request_id_resets_per_request_gate_evidence_and_budgets() {
         let mut state = RequestState::for_request("req-A");
+        admit_tool_call(
+            &mut state,
+            SEARCH_DOCS_TOOL,
+            &serde_json::json!({"query": "request-scoped evidence"}),
+        )
+        .unwrap();
         state.record_search_docs();
         state.approve_plan();
         admit_tool_call(
@@ -3855,6 +4111,7 @@ mod tests {
         assert_eq!(state.request_id, "req-A");
         assert!(state.docs_searched);
         assert!(state.plan_approved);
+        assert_eq!(state.search_docs_count, 1);
         assert_eq!(state.action_count, 2);
         assert_eq!(state.mutation_count, 2);
         assert_eq!(state.build_fix_attempts, 1);
@@ -3864,6 +4121,7 @@ mod tests {
         assert_eq!(state.request_id, "req-B");
         assert!(!state.docs_searched, "evidence gate is per-request");
         assert!(!state.plan_approved, "plan approval is per-request");
+        assert_eq!(state.search_docs_count, 0);
         assert_eq!(state.action_count, 0);
         assert_eq!(state.mutation_count, 0);
         assert_eq!(state.build_fix_attempts, 0);

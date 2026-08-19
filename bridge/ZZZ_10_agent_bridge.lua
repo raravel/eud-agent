@@ -3,7 +3,7 @@
 --
 -- 설치: <에디터>\Data\Lua\TriggerEditor\ 복사 후 재시작.
 -- 통신: Data\agent\inbox\<n>.cmd  ->  outbox\<n>.result  ,  status.txt
--- 명령: PING STATUS DUMP / GET <경로> / SET <경로>\n<본문>
+-- 명령: PING STATUS DUMP EPSNAPSHOT / GET <경로> / SET <경로>\n<본문>
 --       GETDAT <datname>|<param>|<objId> / SETDAT <datname>|<param>|<objId>|<value>
 --       BUILD / LUA
 -- 규칙: UI 스레드(Tick) 전용 / 인덱스 프로퍼티 get_*() / enum 객체 / Array는 [i]
@@ -23,7 +23,10 @@ local ok, initErr = pcall(function()
     local Directory  = luanet.import_type("System.IO.Directory")
     local Path       = luanet.import_type("System.IO.Path")
     local DateTime   = luanet.import_type("System.DateTime")
+    local Guid       = luanet.import_type("System.Guid")
     local Encoding   = luanet.import_type("System.Text.Encoding")
+    local UTF8Encoding = luanet.import_type("System.Text.UTF8Encoding")
+    local Convert    = luanet.import_type("System.Convert")
     local GlobalObj  = luanet.import_type("EUD_Editor_3.GlobalObj")
     local TEFile     = luanet.import_type("EUD_Editor_3.TEFile")
     local EFileType  = luanet.import_type("EUD_Editor_3.TEFile+EFileType")
@@ -67,14 +70,33 @@ local ok, initErr = pcall(function()
         for i = 0, staleResults.Length - 1 do
             File.Delete(tostring(staleResults[i]))
         end
+        local staleSnapshots = Directory.GetDirectories(outboxDir, "epsnapshot-*")
+        for i = 0, staleSnapshots.Length - 1 do
+            Directory.Delete(tostring(staleSnapshots[i]), true)
+        end
     end)
 
     -- u8: .lua 소스의 한글(Latin1 mojibake)을 올바른 유니코드로 복원
     local latin1 = Encoding.GetEncoding("iso-8859-1")
     local utf8   = Encoding.UTF8
     local function u8(s) return utf8:GetString(latin1:GetBytes(s)) end
+    local utf8NoBom = UTF8Encoding(false)
+    local function base64Utf8(s) return Convert.ToBase64String(utf8NoBom:GetBytes(s)) end
+    local bridgeSessionId = tostring(Guid.NewGuid())
 
     local function safestr(v) if v == nil then return "" end return tostring(v) end
+    local function snapshotProjectMetadata(pj)
+        local filename = safestr(pj.Filename)
+        local openMapName = safestr(pj.OpenMapName)
+        if filename == "" and openMapName == "" then
+            return "Untitled (" .. string.sub(bridgeSessionId, 1, 8) .. ")",
+                "untitled\n" .. bridgeSessionId
+        end
+        if filename ~= "" then
+            return filename, filename .. "\n" .. openMapName
+        end
+        return openMapName, filename .. "\n" .. openMapName
+    end
     local function split(s, sep)
         local parts = {}
         for part in string.gmatch(s .. sep, "([^" .. sep .. "]*)" .. sep) do parts[#parts + 1] = part end
@@ -376,6 +398,63 @@ local ok, initErr = pcall(function()
         end
         return binding, nil
     end
+    local function validSnapshotToken(token)
+        return string.match(token,
+            "^[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]%-"
+            .. "[0-9a-f][0-9a-f][0-9a-f][0-9a-f]%-"
+            .. "[0-9a-f][0-9a-f][0-9a-f][0-9a-f]%-"
+            .. "[0-9a-f][0-9a-f][0-9a-f][0-9a-f]%-"
+            .. "[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]"
+            .. "[0-9a-f][0-9a-f][0-9a-f][0-9a-f]$") ~= nil
+    end
+
+    local function writeEpsSnapshot(token)
+        if not validSnapshotToken(token) then return "ERROR: invalid EPSNAPSHOT token" end
+        local pj = GlobalObj.pjData
+        if pj == nil then return "ERROR: no project" end
+        local snapshotDir = outboxDir .. "epsnapshot-" .. token .. "\\"
+        if Directory.Exists(snapshotDir) then return "ERROR: EPSNAPSHOT token already exists" end
+        Directory.CreateDirectory(snapshotDir)
+        local projectDisplay, projectIdentity = snapshotProjectMetadata(pj)
+
+        local manifest = {
+            "EUD-EPSNAPSHOT\t1",
+            "token\t" .. token,
+            "project\t" .. base64Utf8(projectDisplay),
+            "identity\t" .. base64Utf8(projectIdentity)
+        }
+        local ordinal = 0
+        walk(pj.TEData.PFIles, "", function(p, f)
+            if string.lower(string.sub(p, -4)) == ".eps" then
+                ordinal = ordinal + 1
+                local ordinalName = string.format("%06d.eps", ordinal)
+                local ftype = ftypeName(f)
+                local status = "unreadable"
+                local byteLength = 0
+                local okRead, text = pcall(getText, f)
+                if okRead then
+                    text = text or ""
+                    local okWrite = pcall(function()
+                        File.WriteAllText(snapshotDir .. ordinalName, text, utf8NoBom)
+                    end)
+                    if okWrite then
+                        status = "ok"
+                        byteLength = utf8NoBom:GetByteCount(text)
+                    else
+                        pcall(function() File.Delete(snapshotDir .. ordinalName) end)
+                    end
+                end
+                manifest[#manifest + 1] = "file\t" .. tostring(ordinal)
+                    .. "\t" .. ftype
+                    .. "\t" .. base64Utf8(p)
+                    .. "\t" .. tostring(byteLength)
+                    .. "\t" .. status
+            end
+        end)
+        File.WriteAllText(snapshotDir .. "manifest.tsv", table.concat(manifest, "\n"), utf8NoBom)
+        return "OK: epsnapshot " .. tostring(ordinal) .. " files"
+    end
+
 
     local function handleCommand(cmdText)
         local nl = string.find(cmdText, "\n", 1, true)
@@ -392,8 +471,13 @@ local ok, initErr = pcall(function()
         elseif cmd == "STATUS" then
             local pg = GlobalObj.pgData
             local pj = GlobalObj.pjData
+            local projectLine = "(none)"
+            if pj ~= nil then
+                local projectDisplay = snapshotProjectMetadata(pj)
+                projectLine = "'" .. projectDisplay .. "'"
+            end
             return "compiling=" .. (pg == nil and "?" or tostring(pg.IsCompilng))
-                .. "\r\nproject=" .. (pj ~= nil and ("'" .. safestr(pj.Filename) .. "'") or "(none)")
+                .. "\r\nproject=" .. projectLine
                 .. "\r\nversion=" .. (pg == nil and "?" or tostring(pg.Version))
         elseif cmd == "LIST" then
             local pj = GlobalObj.pjData
@@ -406,6 +490,8 @@ local ok, initErr = pcall(function()
                 lines[#lines + 1] = p .. "\t" .. ((okT and ftype) and ftype or "?")
             end)
             return table.concat(lines, "\r\n")
+        elseif cmd == "EPSNAPSHOT" then
+            return writeEpsSnapshot(arg)
         elseif cmd == "DUMP" then
             local pj = GlobalObj.pjData
             if pj == nil then return "ERROR: 프로젝트 미로드" end
@@ -1065,7 +1151,12 @@ local ok, initErr = pcall(function()
                 return
             end
             local pj = GlobalObj.pjData
-            lastProjectLine = (pj ~= nil and ("'" .. safestr(pj.Filename) .. "'") or "(none)")
+            if pj ~= nil then
+                local projectDisplay = snapshotProjectMetadata(pj)
+                lastProjectLine = "'" .. projectDisplay .. "'"
+            else
+                lastProjectLine = "(none)"
+            end
             File.WriteAllText(agentDir .. "status.txt",
                 "time=" .. tostring(DateTime.Now)
                 .. "\r\ncompiling=" .. (pg == nil and "?" or tostring(pg.IsCompilng))
