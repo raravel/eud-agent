@@ -38,6 +38,8 @@ const SYSTEM_PROMPT: &str =
 
 const RAW_SNIPPET_LIMIT: usize = 500;
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(600);
+const APP_SERVER_STDERR_TAIL_LIMIT: usize = 4 * 1024;
+const APP_SERVER_EXIT_DIAGNOSTIC_WAIT: Duration = Duration::from_millis(50);
 
 /// Windows `CREATE_NO_WINDOW` process-creation flag. The GUI app is windowless,
 /// so spawning the `codex.cmd` batch shim would otherwise flash a console window
@@ -541,6 +543,124 @@ type AppServerPending = std::sync::Arc<
 >;
 type AppServerWriter<W> = std::sync::Arc<tokio::sync::Mutex<W>>;
 
+struct AppServerReadContext<W> {
+    writer: AppServerWriter<W>,
+    pending: AppServerPending,
+    events_tx: tokio::sync::mpsc::Sender<AppServerEvent>,
+    thread_id: std::sync::Arc<tokio::sync::Mutex<Option<String>>>,
+    thread_started: std::sync::Arc<tokio::sync::Notify>,
+    turn_completed: tokio::sync::broadcast::Sender<()>,
+    transport: std::sync::Arc<AppServerTransportState>,
+}
+#[derive(Default)]
+struct AppServerTransportState {
+    closed: std::sync::atomic::AtomicBool,
+    exit_detail: std::sync::Mutex<Option<String>>,
+    stderr_tail: std::sync::Mutex<Vec<u8>>,
+    exit_observed: tokio::sync::Notify,
+}
+
+impl AppServerTransportState {
+    fn is_closed(&self) -> bool {
+        self.closed.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn mark_closed(&self) {
+        self.closed
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    fn record_exit(&self, result: std::io::Result<std::process::ExitStatus>) {
+        let detail = match result {
+            Ok(status) => format!("app-server exited with {status}"),
+            Err(error) => format!("failed waiting for app-server exit: {error}"),
+        };
+        *self
+            .exit_detail
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(detail);
+        self.mark_closed();
+        self.exit_observed.notify_waiters();
+    }
+
+    fn append_stderr(&self, bytes: &[u8]) {
+        let mut tail = self
+            .stderr_tail
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if bytes.len() >= APP_SERVER_STDERR_TAIL_LIMIT {
+            tail.clear();
+            tail.extend_from_slice(&bytes[bytes.len() - APP_SERVER_STDERR_TAIL_LIMIT..]);
+            return;
+        }
+        let overflow = tail
+            .len()
+            .saturating_add(bytes.len())
+            .saturating_sub(APP_SERVER_STDERR_TAIL_LIMIT);
+        if overflow > 0 {
+            tail.drain(..overflow);
+        }
+        tail.extend_from_slice(bytes);
+    }
+
+    async fn wait_for_exit_detail(&self) {
+        if self
+            .exit_detail
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some()
+        {
+            return;
+        }
+        let _ = time::timeout(
+            APP_SERVER_EXIT_DIAGNOSTIC_WAIT,
+            self.exit_observed.notified(),
+        )
+        .await;
+    }
+
+    fn failure_message(&self, reason: &str) -> String {
+        let exit_detail = self
+            .exit_detail
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let stderr_tail = self
+            .stderr_tail
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let stderr_tail = String::from_utf8_lossy(&stderr_tail);
+        let stderr_tail = stderr_tail.trim();
+
+        let mut message = reason.to_string();
+        if let Some(detail) = exit_detail {
+            if detail != reason {
+                message.push_str("; ");
+                message.push_str(&detail);
+            }
+        }
+        if !stderr_tail.is_empty() {
+            message.push_str("; stderr: ");
+            message.push_str(stderr_tail);
+        }
+        message.push_str("; app-server will restart automatically on the next request");
+        message
+    }
+}
+
+struct AppServerProcess {
+    waiter: tokio::task::JoinHandle<()>,
+    stderr_reader: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for AppServerProcess {
+    fn drop(&mut self) {
+        self.waiter.abort();
+        self.stderr_reader.abort();
+    }
+}
+
 pub struct CodexAppServerClient<R, W> {
     _reader: std::marker::PhantomData<R>,
     writer: AppServerWriter<W>,
@@ -551,7 +671,8 @@ pub struct CodexAppServerClient<R, W> {
     thread_id: std::sync::Arc<tokio::sync::Mutex<Option<String>>>,
     thread_started: std::sync::Arc<tokio::sync::Notify>,
     turn_completed: tokio::sync::broadcast::Sender<()>,
-    _child: Option<tokio::process::Child>,
+    transport: std::sync::Arc<AppServerTransportState>,
+    _process: Option<AppServerProcess>,
 }
 
 impl<R, W> CodexAppServerClient<R, W>
@@ -568,17 +689,21 @@ where
             std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
         let thread_id = std::sync::Arc::new(tokio::sync::Mutex::new(None));
         let thread_started = std::sync::Arc::new(tokio::sync::Notify::new());
+        let transport = std::sync::Arc::new(AppServerTransportState::default());
         let (events_tx, events_rx) = tokio::sync::mpsc::channel(128);
         let (turn_completed, _) = tokio::sync::broadcast::channel(16);
 
         tokio::spawn(read_app_server_stdout(
             reader,
-            std::sync::Arc::clone(&writer),
-            std::sync::Arc::clone(&pending),
-            events_tx,
-            std::sync::Arc::clone(&thread_id),
-            std::sync::Arc::clone(&thread_started),
-            turn_completed.clone(),
+            AppServerReadContext {
+                writer: std::sync::Arc::clone(&writer),
+                pending: std::sync::Arc::clone(&pending),
+                events_tx,
+                thread_id: std::sync::Arc::clone(&thread_id),
+                thread_started: std::sync::Arc::clone(&thread_started),
+                turn_completed: turn_completed.clone(),
+                transport: std::sync::Arc::clone(&transport),
+            },
         ));
 
         (
@@ -592,10 +717,25 @@ where
                 thread_id,
                 thread_started,
                 turn_completed,
-                _child: None,
+                transport,
+                _process: None,
             },
             events_rx,
         )
+    }
+
+    pub(crate) fn is_transport_closed(&self) -> bool {
+        self.transport.is_closed()
+    }
+
+    async fn write_message(&self, value: serde_json::Value) -> Result<(), AppServerError> {
+        if let Err(error) = write_json_rpc_line(&self.writer, value).await {
+            self.transport.mark_closed();
+            return Err(AppServerError::new(
+                self.transport.failure_message(&error.message),
+            ));
+        }
+        Ok(())
     }
 
     async fn ensure_initialized(&mut self) -> Result<(), AppServerError> {
@@ -618,7 +758,8 @@ where
         // Complete the app-server handshake before issuing model/thread
         // requests. The notification intentionally has no `id` or `params`.
 
-        write_json_rpc_line(&self.writer, serde_json::json!({ "method": "initialized" })).await?;
+        self.write_message(serde_json::json!({ "method": "initialized" }))
+            .await?;
         self.initialized = true;
         Ok(())
     }
@@ -866,13 +1007,18 @@ where
             "params": params,
         });
 
-        if let Err(err) = write_json_rpc_line(&self.writer, request).await {
+        if let Err(err) = self.write_message(request).await {
             self.pending.lock().await.remove(&id);
             return Err(err);
         }
 
-        rx.await
-            .map_err(|err| AppServerError::new(format!("response channel closed: {err}")))?
+        rx.await.map_err(|err| {
+            self.transport.mark_closed();
+            AppServerError::new(
+                self.transport
+                    .failure_message(&format!("response channel closed: {err}")),
+            )
+        })?
     }
 }
 
@@ -979,38 +1125,50 @@ impl CodexAppServerClient<tokio::process::ChildStdout, tokio::process::ChildStdi
             .stdin
             .take()
             .ok_or_else(|| AppServerError::new("codex app-server stdin was not piped"))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| AppServerError::new("codex app-server stderr was not piped"))?;
 
         let (mut client, events) = Self::new_with_stdio(stdout, stdin);
-        client._child = Some(child);
+        let waiter_transport = std::sync::Arc::clone(&client.transport);
+        let waiter = tokio::spawn(async move {
+            waiter_transport.record_exit(child.wait().await);
+        });
+        let stderr_transport = std::sync::Arc::clone(&client.transport);
+        let stderr_reader = tokio::spawn(read_app_server_stderr(stderr, stderr_transport));
+        client._process = Some(AppServerProcess {
+            waiter,
+            stderr_reader,
+        });
         Ok((client, events))
     }
 }
 
-async fn read_app_server_stdout<R, W>(
-    reader: R,
-    writer: AppServerWriter<W>,
-    pending: AppServerPending,
-    events_tx: tokio::sync::mpsc::Sender<AppServerEvent>,
-    thread_id: std::sync::Arc<tokio::sync::Mutex<Option<String>>>,
-    thread_started: std::sync::Arc<tokio::sync::Notify>,
-    turn_completed: tokio::sync::broadcast::Sender<()>,
-) where
+async fn read_app_server_stdout<R, W>(reader: R, context: AppServerReadContext<W>)
+where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
+    let AppServerReadContext {
+        writer,
+        pending,
+        events_tx,
+        thread_id,
+        thread_started,
+        turn_completed,
+        transport,
+    } = context;
     use tokio::io::AsyncBufReadExt as _;
 
+    let mut close_reason = "app-server stdout closed".to_string();
     let mut lines = tokio::io::BufReader::new(reader).lines();
     loop {
         let line = match lines.next_line().await {
             Ok(Some(line)) => line,
             Ok(None) => break,
             Err(err) => {
-                let _ = events_tx
-                    .send(AppServerEvent::Error(format!(
-                        "failed reading app-server stdout: {err}"
-                    )))
-                    .await;
+                close_reason = format!("failed reading app-server stdout: {err}");
                 break;
             }
         };
@@ -1025,6 +1183,7 @@ async fn read_app_server_stdout<R, W>(
                     .await
                     .is_err()
                 {
+                    close_reason = "app-server event receiver closed".to_string();
                     break;
                 }
                 continue;
@@ -1036,10 +1195,10 @@ async fn read_app_server_stdout<R, W>(
 
         match (method, id) {
             (Some(method), Some(id)) => {
-                if handle_server_request(&writer, method, id, message.get("params"))
-                    .await
-                    .is_err()
+                if let Err(error) =
+                    handle_server_request(&writer, method, id, message.get("params")).await
                 {
+                    close_reason = error.message;
                     break;
                 }
             }
@@ -1054,6 +1213,7 @@ async fn read_app_server_stdout<R, W>(
                 )
                 .await;
                 if !should_continue {
+                    close_reason = "app-server event receiver closed".to_string();
                     break;
                 }
             }
@@ -1064,9 +1224,32 @@ async fn read_app_server_stdout<R, W>(
         }
     }
 
+    transport.mark_closed();
+    transport.wait_for_exit_detail().await;
+    let failure = transport.failure_message(&close_reason);
+    let _ = events_tx.try_send(AppServerEvent::Error(failure.clone()));
     let mut pending = pending.lock().await;
     for (_, tx) in pending.drain() {
-        let _ = tx.send(Err(AppServerError::new("app-server stdout closed")));
+        let _ = tx.send(Err(AppServerError::new(failure.clone())));
+    }
+}
+
+async fn read_app_server_stderr(
+    mut stderr: tokio::process::ChildStderr,
+    transport: std::sync::Arc<AppServerTransportState>,
+) {
+    use tokio::io::AsyncReadExt as _;
+
+    let mut buffer = [0_u8; 1024];
+    loop {
+        match stderr.read(&mut buffer).await {
+            Ok(0) => return,
+            Ok(read) => transport.append_stderr(&buffer[..read]),
+            Err(error) => {
+                transport.append_stderr(format!("stderr read failed: {error}").as_bytes());
+                return;
+            }
+        }
     }
 }
 
@@ -1914,6 +2097,44 @@ mod appserver_tests {
         assert_eq!(
             models[0].supported_reasoning_efforts[0].reasoning_effort,
             "medium"
+        );
+        stub.await.expect("stub server task should not panic");
+    }
+
+    #[tokio::test]
+    async fn stdout_eof_marks_transport_closed_for_next_request_recovery() {
+        let (client_write, server_read) = tokio::io::duplex(16 * 1024);
+        let (server_write, client_read) = tokio::io::duplex(16 * 1024);
+
+        let stub = tokio::spawn(async move {
+            let mut client_requests = BufReader::new(server_read).lines();
+            let mut server_responses = server_write;
+
+            let initialize = read_json_line(&mut client_requests).await;
+            let initialize_id = assert_client_request(&initialize, "initialize");
+            write_json_line(
+                &mut server_responses,
+                json!({"jsonrpc":"2.0","id":initialize_id,"result":{"protocolVersion":1}}),
+            )
+            .await;
+            assert_initialized_notification(&read_json_line(&mut client_requests).await);
+
+            let model_list = read_json_line(&mut client_requests).await;
+            assert_client_request(&model_list, "model/list");
+        });
+
+        let (mut client, mut events) =
+            CodexAppServerClient::new_with_stdio(client_read, client_write);
+        let error = client
+            .list_models()
+            .await
+            .expect_err("stdout EOF must fail the pending request");
+        assert!(error.message.contains("app-server stdout closed"));
+        assert!(error.message.contains("restart automatically"));
+        assert!(client.is_transport_closed());
+        assert_eq!(
+            next_event(&mut events).await,
+            AppServerEvent::Error(error.message)
         );
         stub.await.expect("stub server task should not panic");
     }

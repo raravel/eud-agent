@@ -7,7 +7,7 @@
 use std::{
     collections::{HashMap, HashSet},
     fmt,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
@@ -1258,6 +1258,18 @@ pub(crate) struct ProductionCodexDriver {
     cancellation: tokio::sync::watch::Receiver<u64>,
 }
 
+fn app_server_client_is_reusable(
+    transport_closed: bool,
+    client_cwd: Option<&Path>,
+    client_access: Option<WorkspaceAccess>,
+    requested_cwd: &Path,
+    requested_access: WorkspaceAccess,
+) -> bool {
+    !transport_closed
+        && client_cwd == Some(requested_cwd)
+        && client_access == Some(requested_access)
+}
+
 impl ProductionCodexDriver {
     pub(crate) fn new(
         session_id: impl Into<String>,
@@ -1304,10 +1316,16 @@ impl ProductionCodexDriver {
         cwd: PathBuf,
         access: WorkspaceAccess,
     ) -> Result<(), AgentEngineError> {
-        if self.client.is_some()
-            && self.client_cwd.as_ref() == Some(&cwd)
-            && self.client_access == Some(access)
-        {
+        let reusable = self.client.as_ref().is_some_and(|client| {
+            app_server_client_is_reusable(
+                client.is_transport_closed(),
+                self.client_cwd.as_deref(),
+                self.client_access,
+                &cwd,
+                access,
+            )
+        });
+        if reusable {
             return Ok(());
         }
         let retained_thread_id = match self.client.as_ref() {
@@ -2922,6 +2940,25 @@ mod tests {
             default_reasoning_effort: default_reasoning_effort.to_string(),
             is_default,
         }
+    }
+
+    #[test]
+    fn closed_app_server_transport_is_never_reused() {
+        let cwd = Path::new("C:/app/session");
+        assert!(app_server_client_is_reusable(
+            false,
+            Some(cwd),
+            Some(WorkspaceAccess::Read),
+            cwd,
+            WorkspaceAccess::Read,
+        ));
+        assert!(!app_server_client_is_reusable(
+            true,
+            Some(cwd),
+            Some(WorkspaceAccess::Read),
+            cwd,
+            WorkspaceAccess::Read,
+        ));
     }
 
     #[test]

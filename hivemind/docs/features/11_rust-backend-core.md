@@ -123,6 +123,9 @@ The single-shot `codex exec` fenced-extraction path (codex_client.rs) is RETIRED
 agentic flow (decision 13). codex resolution rules from rules.md still apply: resolve the
 `.cmd` shim via `which` (honor `CODEX_CMD`), `--skip-git-repo-check`, explicit piped stdio,
 stable cwd. The app-server is driven over stdin/stdout JSON-RPC (tokio piped stdio).
+Unexpected stdout closure marks the client dead, reports bounded stderr and child exit status,
+and interrupts the in-flight turn without replaying side effects. The next command respawns the
+same worker endpoint and resumes its retained thread id automatically.
 
 ## bridge_io (file-IPC to editor)
 Port of `bridge_io.py`: write `srv-<uuid8>.cmd` to `<editor>\Data\agent\inbox` (UTF-8 no

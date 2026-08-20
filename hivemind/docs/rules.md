@@ -131,6 +131,9 @@ hosting, panel re-arm, and server spawning are REMOVED.
   turns, then a visible error; they are never silently waived.
 - Different sessions MAY overlap read-only Codex turns; commands within one session MUST stay
   serialized. Conversation submission MUST NOT be globally queued.
+- Unexpected app-server exit or stdio closure MUST interrupt the current turn without replaying
+  it, retain the thread id, capture bounded stderr/exit diagnostics, and respawn before the next
+  command. A dead client MUST NEVER be reused.
 - Project mutations MUST register FIFO write intent and retain one lease through mutation,
   build, review, and complete decision work. Partial decisions, rollback failure, undecided
   journals, or unpromoted workspace changes MUST NOT release it.
