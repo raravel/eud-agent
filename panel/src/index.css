@@ -42,6 +42,10 @@
   --sidebar-accent-foreground: oklch(0.205 0 0);
   --sidebar-border: oklch(0.922 0 0);
   --sidebar-ring: oklch(0.708 0 0);
+  --scrollbar-track: color-mix(in oklch, var(--muted) 42%, transparent);
+  --scrollbar-thumb: color-mix(in oklch, var(--primary) 32%, transparent);
+  --scrollbar-thumb-hover: color-mix(in oklch, var(--primary) 58%, transparent);
+  --scrollbar-thumb-active: color-mix(in oklch, var(--primary) 78%, transparent);
 }
 
 /* Agent design system (dark-only OLED, deep-slate surfaces + emerald accent —
@@ -139,4 +143,68 @@
   body {
     @apply bg-background text-foreground;
   }
+}
+
+/* One themed scrollbar language for every native WebView2 scroll container.
+   The transparent border keeps the thumb compact without shrinking its hitbox. */
+*::-webkit-scrollbar {
+  width: 0.625rem;
+  height: 0.625rem;
+}
+
+*::-webkit-scrollbar-track {
+  background: var(--scrollbar-track);
+  border-radius: 999px;
+}
+
+*::-webkit-scrollbar-thumb {
+  min-height: 2.5rem;
+  border: 2px solid transparent;
+  border-radius: 999px;
+  background-color: var(--scrollbar-thumb);
+  background-clip: padding-box;
+}
+
+*::-webkit-scrollbar-thumb:hover {
+  background-color: var(--scrollbar-thumb-hover);
+}
+
+*::-webkit-scrollbar-thumb:active {
+  background-color: var(--scrollbar-thumb-active);
+}
+
+*::-webkit-scrollbar-button {
+  width: 0;
+  height: 0;
+}
+
+*::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+@supports not selector(::-webkit-scrollbar) {
+  * {
+    scrollbar-color: var(--scrollbar-thumb) var(--scrollbar-track);
+    scrollbar-width: thin;
+  }
+}
+
+/* Monaco draws DIV-based scrollbars, so mirror the native tokens explicitly. */
+.monaco-editor {
+  --vscode-scrollbar-shadow: transparent !important;
+  --vscode-scrollbarSlider-background: var(--scrollbar-thumb) !important;
+  --vscode-scrollbarSlider-hoverBackground: var(--scrollbar-thumb-hover) !important;
+  --vscode-scrollbarSlider-activeBackground: var(--scrollbar-thumb-active) !important;
+}
+
+.monaco-editor .monaco-scrollable-element > .scrollbar {
+  border-radius: 999px;
+  background: var(--scrollbar-track) !important;
+}
+
+.monaco-editor .monaco-scrollable-element > .scrollbar > .slider {
+  box-sizing: border-box;
+  border: 2px solid transparent;
+  border-radius: 999px;
+  background-clip: padding-box !important;
 }
