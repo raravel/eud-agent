@@ -1256,17 +1256,9 @@ export default function App() {
     [handleWorkspaceRefresh, projectStore, store],
   );
 
-  const handleWorkspaceOpen = useCallback(() => {
-    void handleProjectPanelTab("workspace");
-  }, [handleProjectPanelTab]);
-
-  const handleMemoryOpen = useCallback(() => {
-    void handleProjectPanelTab("memory");
-  }, [handleProjectPanelTab]);
-
-  const handleWikiOpen = useCallback(() => {
-    void handleProjectPanelTab("wiki");
-  }, [handleProjectPanelTab]);
+  const handleProjectPanelToggle = useCallback(() => {
+    setProjectSidebarOpen((open) => !open);
+  }, []);
 
   const handleWikiSave = useCallback(
     async (entries: Record<string, LedgerEntry>) => {
@@ -1417,12 +1409,8 @@ export default function App() {
           hasProject={projectState.hasProject}
           launchPending={launchPending}
           onLaunchEditor={handleLaunchEditor}
-          memoryOpen={projectSidebarOpen && projectPanelTab === "memory"}
-          onMemoryOpen={handleMemoryOpen}
-          workspaceOpen={projectSidebarOpen && projectPanelTab === "workspace"}
-          onWorkspaceOpen={handleWorkspaceOpen}
-          wikiOpen={projectSidebarOpen && projectPanelTab === "wiki"}
-          onWikiOpen={handleWikiOpen}
+          projectPanelOpen={projectSidebarOpen}
+          onProjectPanelToggle={handleProjectPanelToggle}
         />
 
         {update && !updateDismissed && (

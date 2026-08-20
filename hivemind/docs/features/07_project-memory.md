@@ -127,15 +127,15 @@ Server → client:
 ```mermaid
 stateDiagram-v2
     [*] --> hidden
-    hidden --> open: header memory button
-    open --> hidden: close button / Esc
-    open --> open: select file tab, edit, save
+    hidden --> open: header project tools toggle
+    open --> hidden: header toggle / sidebar close button / Esc
+    open --> open: select sidebar tab, select memory file, edit, save
 ```
 
-- A header toggle button (lucide `BookText` icon, next to the existing status pills) opens
-  the memory view; it overlays the conversation column like PlanView/ChangesetView do.
-- On open the panel sends `memory_get` and renders four file tabs (resources / structure /
-  conventions / lessons).
+- One header toggle opens the right-side project tools panel. Destination selection lives
+  only in its `DAT 위키` / `메모리` / `파일` tabs; the header has no per-destination buttons.
+- Selecting the memory tab sends `memory_get` and renders four file tabs (resources /
+  structure / conventions / lessons).
 - The edit surface is the existing Monaco wiring (`panel/src/editor/monaco.ts`, language
   `markdown`) — Decision 05 makes Monaco the panel's edit surface; Save sends `memory_save`,
   a `memory_saved` reply clears the dirty flag.
@@ -185,7 +185,8 @@ stateDiagram-v2
 - `panel/src/ws/protocol.ts` — new client/server message types
 - `panel/src/state/store.ts` — memory view state + reducers
 - `panel/src/components/MemoryView.tsx` — NEW: tabs + Monaco edit
-- `panel/src/App.tsx` — header toggle + view wiring
+- `panel/src/components/ProjectSidebar.tsx` — project-tool destination tabs
+- `panel/src/App.tsx` — single header toggle + sidebar view wiring
 - `server/tests/test_memory.py` — NEW: store/render tests
 - `server/tests/test_tools.py`, `server/tests/test_journal.py`, `server/tests/test_app.py`,
   `server/tests/test_integration_ws.py` — extended

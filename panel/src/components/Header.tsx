@@ -5,7 +5,7 @@
  * (`rag_warmup` started → done, elapsed formatted via lib/progress). Korean
  * labels throughout.
  */
-import { BookText, Database, FolderTree, MonitorPlay } from "lucide-react";
+import { MonitorPlay, PanelRightClose, PanelRightOpen } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import {
@@ -42,18 +42,10 @@ export interface HeaderProps {
   launchPending?: boolean;
   /** Launch the configured EUD Editor 3 install. */
   onLaunchEditor?: () => void;
-  /** Open the project-memory overlay. */
-  onMemoryOpen?: () => void;
-  /** Whether the project-memory overlay is currently visible. */
-  memoryOpen?: boolean;
-  /** Open the real per-project Codex filesystem workspace. */
-  onWorkspaceOpen?: () => void;
-  /** Whether the Workspace explorer is visible. */
-  workspaceOpen?: boolean;
-  /** Open the dat-edit wiki overlay. */
-  onWikiOpen?: () => void;
-  /** Whether the dat-edit wiki overlay is currently visible. */
-  wikiOpen?: boolean;
+  /** Toggle the project tools sidebar. */
+  onProjectPanelToggle?: () => void;
+  /** Whether the project tools sidebar is currently visible. */
+  projectPanelOpen?: boolean;
 }
 
 /** One status pill descriptor: label + tone classes + whether it is in flight. */
@@ -151,12 +143,8 @@ export function Header({
   hasProject = true,
   launchPending = false,
   onLaunchEditor,
-  onMemoryOpen,
-  memoryOpen = false,
-  onWorkspaceOpen,
-  workspaceOpen = false,
-  onWikiOpen,
-  wikiOpen = false,
+  onProjectPanelToggle,
+  projectPanelOpen = false,
 }: HeaderProps) {
   const conn = connState(connected, phase, editorConnected, hasProject);
   const ragInfo = ragPill(rag);
@@ -205,55 +193,27 @@ export function Header({
         )}
         {ragInfo && <StatusPill pill={ragInfo} />}
         <StatusPill pill={conn} />
-        {onWorkspaceOpen && (
+        {onProjectPanelToggle && (
           <Tooltip>
             <TooltipTrigger asChild>
               <Button
                 type="button"
                 size="icon"
                 variant="ghost"
-                aria-label="프로젝트 워크스페이스"
-                aria-pressed={workspaceOpen}
-                onClick={onWorkspaceOpen}
+                aria-label={`프로젝트 도구 ${projectPanelOpen ? "닫기" : "열기"}`}
+                aria-pressed={projectPanelOpen}
+                onClick={onProjectPanelToggle}
               >
-                <FolderTree className="size-4" aria-hidden="true" />
+                {projectPanelOpen ? (
+                  <PanelRightClose className="size-4" aria-hidden="true" />
+                ) : (
+                  <PanelRightOpen className="size-4" aria-hidden="true" />
+                )}
               </Button>
             </TooltipTrigger>
-            <TooltipContent>프로젝트 워크스페이스</TooltipContent>
-          </Tooltip>
-        )}
-        {onWikiOpen && (
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <Button
-                type="button"
-                size="icon"
-                variant="ghost"
-                aria-label="dat 편집 위키"
-                aria-pressed={wikiOpen}
-                onClick={onWikiOpen}
-              >
-                <Database className="size-4" aria-hidden="true" />
-              </Button>
-            </TooltipTrigger>
-            <TooltipContent>dat 편집 위키</TooltipContent>
-          </Tooltip>
-        )}
-        {onMemoryOpen && (
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <Button
-                type="button"
-                size="icon"
-                variant="ghost"
-                aria-label="메모리"
-                aria-pressed={memoryOpen}
-                onClick={onMemoryOpen}
-              >
-                <BookText className="size-4" aria-hidden="true" />
-              </Button>
-            </TooltipTrigger>
-            <TooltipContent>메모리</TooltipContent>
+            <TooltipContent>
+              프로젝트 도구 {projectPanelOpen ? "닫기" : "열기"}
+            </TooltipContent>
           </Tooltip>
         )}
       </div>

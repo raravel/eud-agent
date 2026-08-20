@@ -284,3 +284,30 @@ describe("App concurrent sessions", () => {
     ).toBeInTheDocument();
   });
 });
+
+describe("App project tools sidebar", () => {
+  it("closes and reopens the tabbed sidebar with one header toggle", async () => {
+    render(<App />);
+
+    expect(
+      await screen.findByRole("complementary", { name: "프로젝트 도구" }),
+    ).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: "DAT 위키" })).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: "메모리" })).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: "파일" })).toBeInTheDocument();
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "프로젝트 도구 닫기" }),
+    );
+    expect(
+      screen.queryByRole("complementary", { name: "프로젝트 도구" }),
+    ).not.toBeInTheDocument();
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "프로젝트 도구 열기" }),
+    );
+    expect(
+      screen.getByRole("complementary", { name: "프로젝트 도구" }),
+    ).toBeInTheDocument();
+  });
+});

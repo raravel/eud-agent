@@ -194,3 +194,35 @@ describe("Header — 에디터 켜기 button", () => {
     ).toBeDisabled();
   });
 });
+
+describe("Header — project tools sidebar", () => {
+  it("renders one toggle for the sidebar and calls its handler", async () => {
+    const onProjectPanelToggle = vi.fn();
+    render(
+      <Header
+        project="MyMap"
+        connected={true}
+        phase="ready"
+        projectPanelOpen={true}
+        onProjectPanelToggle={onProjectPanelToggle}
+      />,
+    );
+
+    const button = screen.getByRole("button", {
+      name: "프로젝트 도구 닫기",
+    });
+    expect(button).toHaveAttribute("aria-pressed", "true");
+    expect(
+      screen.queryByRole("button", { name: "프로젝트 워크스페이스" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "dat 편집 위키" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "메모리" }),
+    ).not.toBeInTheDocument();
+
+    await userEvent.click(button);
+    expect(onProjectPanelToggle).toHaveBeenCalledTimes(1);
+  });
+});
