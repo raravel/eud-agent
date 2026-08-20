@@ -187,8 +187,9 @@ cargo tauri build
 ```
 
 `scripts\dev_run.ps1`은 `cargo tauri dev` 실행 전에 사전 요구 사항(codex CLI, cargo)을
-점검합니다. 로컬 `tauri build`는 `latest.json`을 생성하지 않습니다. 릴리스 플로우
-(`scripts\release.ps1`)가 `.sig`로부터 이를 합성하여 GitHub Release에 게시합니다.
+점검합니다. 커밋된 `v*` 태그를 푸시하면 `.github/workflows/publish-app.yml`이 NSIS
+설치 파일을 빌드·서명하고 업데이터용 `latest.json`을 게시합니다. 로컬 `tauri build`는
+이를 생성하지 않으므로 `scripts\release.ps1`은 로컬 대체 릴리스 경로로 유지됩니다.
 
 ---
 

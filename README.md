@@ -188,8 +188,9 @@ cargo tauri build
 ```
 
 `scripts\dev_run.ps1` checks prerequisites (codex CLI, cargo) before launching
-`cargo tauri dev`. A local `tauri build` does not emit `latest.json`; the release flow
-(`scripts\release.ps1`) synthesizes it from the `.sig` and publishes it to the GitHub Release.
+`cargo tauri dev`. Pushing a committed `v*` tag runs `.github/workflows/publish-app.yml`,
+which builds and signs the NSIS installer and publishes the updater `latest.json`.
+`scripts\release.ps1` remains the local fallback because a local `tauri build` does not emit it.
 
 ---
 

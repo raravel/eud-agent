@@ -1,0 +1,90 @@
+name: Publish App Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag matching the committed app version, for example v0.3.1."
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: app-release-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  publish-windows:
+    runs-on: windows-latest
+    env:
+      RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Verify release version
+        id: release
+        shell: pwsh
+        run: |
+          $tag = $env:RELEASE_TAG
+          if ($tag -notmatch '^v(\d+\.\d+\.\d+)$') {
+            throw "Release tag must be v<semver>; got '$tag'."
+          }
+          $version = $Matches[1]
+          $tauriVersion = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
+          $cargoText = Get-Content src-tauri/Cargo.toml -Raw
+          $cargoMatch = [regex]::Match($cargoText, '(?m)^version\s*=\s*"([^"]+)"')
+          $lockText = Get-Content Cargo.lock -Raw
+          $lockMatch = [regex]::Match($lockText, '(?ms)\[\[package\]\]\s*name\s*=\s*"eud-agent"\s*version\s*=\s*"([^"]+)"')
+          if (-not $cargoMatch.Success -or -not $lockMatch.Success) {
+            throw 'Could not read the eud-agent version from Cargo.toml or Cargo.lock.'
+          }
+          foreach ($actual in @($tauriVersion, $cargoMatch.Groups[1].Value, $lockMatch.Groups[1].Value)) {
+            if ($actual -ne $version) {
+              throw "Release tag $tag does not match committed version $actual."
+            }
+          }
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+          cache: npm
+          cache-dependency-path: panel/package-lock.json
+
+      - name: Install panel dependencies
+        run: npm ci --prefix panel
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install Tauri CLI
+        run: cargo install tauri-cli --version "^2.0.0" --locked
+
+      - name: Build, sign, and publish
+        uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          tauriScript: cargo tauri
+          tagName: ${{ steps.release.outputs.tag }}
+          releaseName: "v__VERSION__"
+          releaseBody: "복원된 Codex 세션에도 eud-tools MCP 설정을 다시 주입해 프로젝트 도구 누락을 수정했습니다."
+          releaseDraft: false
+          prerelease: false
+          generateReleaseNotes: true
+          uploadUpdaterJson: true
+          updaterJsonPreferNsis: true
+          retryAttempts: 1

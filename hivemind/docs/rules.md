@@ -242,12 +242,14 @@ hosting, panel re-arm, and server spawning are REMOVED.
   `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` at build time. Only the **public** key lives in
   `tauri.conf.json` (`plugins.updater.pubkey`). This minisign signing is SEPARATE from
   Windows Authenticode (intentionally absent; SmartScreen warning is an accepted trade-off).
-- A local `tauri build` does NOT emit `latest.json` (only tauri-action does). The release
-  script (`scripts/release.ps1`) ALWAYS **synthesizes it from the `.sig`** and uploads it to
-  the GitHub Release. The updater endpoint is the static
-  `releases/latest/download/latest.json`, so publishing this asset on the newest release is
-  what makes installed apps see the update. Write `latest.json` (and the bumped manifests)
-  as UTF-8 **without BOM**.
+- A `v*` tag runs `.github/workflows/publish-app.yml` on Windows. The workflow MUST verify
+  the tag against `tauri.conf.json`, `src-tauri/Cargo.toml`, and `Cargo.lock`, then use
+  `tauri-action` to build, minisign-sign, publish the NSIS installer, and generate/upload
+  `latest.json`. Repository secrets hold the private key and password.
+- A local `tauri build` does NOT emit `latest.json`. The fallback release script
+  (`scripts/release.ps1`) MUST synthesize it from the `.sig` and upload it. The updater endpoint
+  is the static `releases/latest/download/latest.json`, so the app release must remain GitHub's
+  latest release. Write locally generated `latest.json` and bumped manifests as UTF-8 without BOM.
 - The self-update replaces ONLY the app binary. `%localappdata%` assets (model/RAG) and
   `%appdata%` config are preserved and NEVER re-downloaded by an update — RAG/model asset
   *versioning* stays the `bootstrap` manifest's job, decoupled from the app updater.

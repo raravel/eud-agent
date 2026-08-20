@@ -60,6 +60,9 @@ sandbox setup failure aborts the turn; no legacy fallback is permitted.
 handles. `SessionToolRuntime` owns the request id, evidence/mutation/action/search/build counters,
 pending plan, preflight request state, write ticket, and execution lock. Each worker has its own
 ephemeral MCP endpoint and shutdown handle; no global current-request pointer exists.
+The endpoint URL is registered at app-server launch and injected again in every
+`thread/start` and `thread/resume` config. A restored Codex thread therefore cannot retain an
+older tool-less MCP configuration.
 
 Global Codex model settings are handled behind a separate short settings lock and temporary
 app-server, not an arbitrary session mutex.

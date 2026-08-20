@@ -674,6 +674,7 @@ pub struct CodexAppServerClient<R, W> {
     next_id: u64,
     initialized: bool,
     model_selection: Option<CodexModelSelection>,
+    mcp_server_url: Option<String>,
     thread_id: std::sync::Arc<tokio::sync::Mutex<Option<String>>>,
     thread_started: std::sync::Arc<tokio::sync::Notify>,
     turn_completed: tokio::sync::broadcast::Sender<()>,
@@ -720,6 +721,7 @@ where
                 next_id: 1,
                 initialized: false,
                 model_selection: None,
+                mcp_server_url: None,
                 thread_id,
                 thread_started,
                 turn_completed,
@@ -879,7 +881,11 @@ where
             Some(thread_id) => {
                 self.send_request(
                     "thread/resume",
-                    thread_resume_params(&thread_id, input.workspace_root.as_deref())?,
+                    thread_resume_params(
+                        &thread_id,
+                        input.workspace_root.as_deref(),
+                        self.mcp_server_url.as_deref(),
+                    )?,
                 )
                 .await?;
                 thread_id
@@ -887,7 +893,10 @@ where
             None => {
                 self.send_request(
                     "thread/start",
-                    thread_start_params(input.workspace_root.as_deref())?,
+                    thread_start_params(
+                        input.workspace_root.as_deref(),
+                        self.mcp_server_url.as_deref(),
+                    )?,
                 )
                 .await?;
                 self.await_thread_started().await?
@@ -1055,13 +1064,20 @@ pub(crate) fn app_server_config_overrides(access: WorkspaceAccess) -> Vec<String
 
 /// Params for a fresh thread. Project turns use the custom split-filesystem
 /// profile selected at app-server launch; tests/non-project callers retain the
-/// previous read-only policy.
-fn thread_start_params(workspace_root: Option<&Path>) -> Result<serde_json::Value, AppServerError> {
+/// previous read-only policy. The session MCP config is repeated here because a
+/// resumed Codex thread can retain the config stored when that thread was created.
+fn thread_start_params(
+    workspace_root: Option<&Path>,
+    mcp_server_url: Option<&str>,
+) -> Result<serde_json::Value, AppServerError> {
     let mut params = serde_json::json!({ "approvalPolicy": "on-request" });
     if let Some(workspace_root) = workspace_root {
         params["cwd"] = serde_json::json!(path_text(workspace_root)?);
     } else {
         params["sandboxPolicy"] = serde_json::json!({ "type": "readOnly", "networkAccess": false });
+    }
+    if let Some(url) = mcp_server_url {
+        params["config"] = eud_tools_thread_config(url);
     }
     Ok(params)
 }
@@ -1069,12 +1085,26 @@ fn thread_start_params(workspace_root: Option<&Path>) -> Result<serde_json::Valu
 fn thread_resume_params(
     thread_id: &str,
     workspace_root: Option<&Path>,
+    mcp_server_url: Option<&str>,
 ) -> Result<serde_json::Value, AppServerError> {
     let mut params = serde_json::json!({ "threadId": thread_id });
     if let Some(workspace_root) = workspace_root {
         params["cwd"] = serde_json::json!(path_text(workspace_root)?);
     }
+    if let Some(url) = mcp_server_url {
+        params["config"] = eud_tools_thread_config(url);
+    }
     Ok(params)
+}
+
+fn eud_tools_thread_config(url: &str) -> serde_json::Value {
+    serde_json::json!({
+        "mcp_servers": {
+            "eud-tools": {
+                "url": url,
+            },
+        },
+    })
 }
 
 fn path_text(path: &Path) -> Result<String, AppServerError> {
@@ -1083,13 +1113,17 @@ fn path_text(path: &Path) -> Result<String, AppServerError> {
         .ok_or_else(|| AppServerError::new("Codex workspace path is not UTF-8"))
 }
 
+fn mcp_server_url(port: u16) -> String {
+    format!("http://127.0.0.1:{port}/mcp")
+}
+
 /// The dotted-key `-c` override that registers the in-process eud-tools MCP
 /// server with codex over loopback streamable HTTP (decision A2). The value is a
 /// TOML string, so it is quoted; the `eud-tools` key segment is a valid TOML
 /// bare key (hyphens allowed). codex's `RawMcpServerConfig` selects the HTTP
 /// transport from the presence of `url`.
-pub(crate) fn mcp_server_override(port: u16) -> String {
-    format!("mcp_servers.eud-tools.url=\"http://127.0.0.1:{port}/mcp\"")
+pub(crate) fn mcp_server_override(url: &str) -> String {
+    format!("mcp_servers.eud-tools.url=\"{url}\"")
 }
 
 impl CodexAppServerClient<tokio::process::ChildStdout, tokio::process::ChildStdin> {
@@ -1099,14 +1133,16 @@ impl CodexAppServerClient<tokio::process::ChildStdout, tokio::process::ChildStdi
         access: WorkspaceAccess,
     ) -> Result<(Self, tokio::sync::mpsc::Receiver<AppServerEvent>), AppServerError> {
         let codex_cmd = resolve_codex_cmd().map_err(|err| AppServerError::new(err.to_string()))?;
+        let mcp_server_url = mcp_server_url(mcp_port);
         let mut command = tokio::process::Command::new(codex_cmd);
         command.arg("app-server");
         for override_arg in app_server_config_overrides(access) {
             command.arg("-c").arg(override_arg);
         }
-        // Attach the eud-tools MCP server so codex's turns can actually call the
-        // tool registry (without this the agent has no map/file/search tools).
-        command.arg("-c").arg(mcp_server_override(mcp_port));
+        // Launch-level registration covers fresh threads; thread/start and
+        // thread/resume repeat it so restored threads cannot retain a tool-less
+        // historical config.
+        command.arg("-c").arg(mcp_server_override(&mcp_server_url));
         let private_tmp = cwd.as_ref().join(crate::workspace::TEMP_DIR);
         if private_tmp.is_dir() {
             command.env("TEMP", &private_tmp).env("TMP", &private_tmp);
@@ -1137,6 +1173,7 @@ impl CodexAppServerClient<tokio::process::ChildStdout, tokio::process::ChildStdi
             .ok_or_else(|| AppServerError::new("codex app-server stderr was not piped"))?;
 
         let (mut client, events) = Self::new_with_stdio(stdout, stdin);
+        client.mcp_server_url = Some(mcp_server_url);
         let waiter_transport = std::sync::Arc::clone(&client.transport);
         let waiter = tokio::spawn(async move {
             waiter_transport.record_exit(child.wait().await);
@@ -1693,7 +1730,8 @@ mod app_server_override_tests {
     fn mcp_server_override_is_a_loopback_dotted_key_with_a_quoted_url() {
         // codex selects the streamable-HTTP transport from `url`; the value is a
         // TOML string (quoted), the key segment `eud-tools` is a valid bare key.
-        let arg = super::mcp_server_override(54321);
+        let url = super::mcp_server_url(54321);
+        let arg = super::mcp_server_override(&url);
         assert_eq!(
             arg,
             "mcp_servers.eud-tools.url=\"http://127.0.0.1:54321/mcp\""
@@ -1702,7 +1740,7 @@ mod app_server_override_tests {
 
     #[test]
     fn thread_start_uses_readonly_without_a_project_workspace() {
-        let params = super::thread_start_params(None).unwrap();
+        let params = super::thread_start_params(None, None).unwrap();
         assert_eq!(
             params["sandboxPolicy"]["type"],
             serde_json::json!("readOnly")
@@ -1717,7 +1755,7 @@ mod app_server_override_tests {
     #[test]
     fn thread_start_uses_custom_profile_for_project_workspace() {
         let params =
-            super::thread_start_params(Some(std::path::Path::new("C:\\workspace"))).unwrap();
+            super::thread_start_params(Some(std::path::Path::new("C:\\workspace")), None).unwrap();
         assert_eq!(params["cwd"], serde_json::json!("C:\\workspace"));
         assert!(params.get("sandboxPolicy").is_none());
     }
@@ -2004,6 +2042,16 @@ mod appserver_tests {
         );
     }
 
+    fn assert_eud_tools_config(value: &Value, expected_url: &str) {
+        assert_eq!(
+            value
+                .pointer("/params/config/mcp_servers/eud-tools/url")
+                .and_then(Value::as_str),
+            Some(expected_url),
+            "thread start/resume must inject the live session MCP endpoint"
+        );
+    }
+
     fn assert_initialize_params(value: &Value) {
         assert_eq!(
             value
@@ -2268,6 +2316,7 @@ mod appserver_tests {
             let thread_start = read_json_line(&mut client_requests).await;
             let thread_start_id = assert_client_request(&thread_start, "thread/start");
             assert_thread_start_sandbox(&thread_start);
+            assert_eud_tools_config(&thread_start, "http://127.0.0.1:54321/mcp");
             write_json_line(
                 &mut server_responses,
                 json!({"jsonrpc":"2.0","id":thread_start_id,"result":{}}),
@@ -2426,6 +2475,7 @@ mod appserver_tests {
             let thread_resume = read_json_line(&mut client_requests).await;
             let thread_resume_id = assert_client_request(&thread_resume, "thread/resume");
             assert_thread_id(&thread_resume, "thread-123");
+            assert_eud_tools_config(&thread_resume, "http://127.0.0.1:54321/mcp");
             write_json_line(
                 &mut server_responses,
                 json!({"jsonrpc":"2.0","id":thread_resume_id,"result":{}}),
@@ -2451,6 +2501,7 @@ mod appserver_tests {
 
         let (mut client, mut events) =
             CodexAppServerClient::new_with_stdio(client_read, client_write);
+        client.mcp_server_url = Some("http://127.0.0.1:54321/mcp".to_string());
         client.set_model_selection(Some(CodexModelSelection {
             model: "gpt-5.5-codex".to_string(),
             reasoning_effort: "high".to_string(),

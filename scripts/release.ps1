@@ -5,12 +5,13 @@
     updater manifest (latest.json).
 
 .DESCRIPTION
-    Local manual release pipeline (Decision 04; GitHub Actions CI is a later phase).
-    Steps: preflight (signing key + gh + clean tree) -> bump version in tauri.conf.json
-    and src-tauri/Cargo.toml -> `tauri build` (signs the NSIS updater bundle) -> collect
-    the nsis artifacts -> synthesize latest.json from the .sig (a local build does NOT
-    emit it; only tauri-action does) -> `gh release create` and upload the installer,
-    the updater bundle, and latest.json.
+    Local fallback release pipeline. The primary path is the tag-triggered
+    `.github/workflows/publish-app.yml` workflow. This script remains available for
+    an operator-hosted release: preflight (signing key + gh + clean tree) -> bump
+    version in tauri.conf.json and src-tauri/Cargo.toml -> `tauri build` (signs the
+    NSIS updater bundle) -> collect the nsis artifacts -> synthesize latest.json from
+    the .sig (a local build does NOT emit it; tauri-action does) -> `gh release create`
+    and upload the installer, updater bundle, and latest.json.
 
     The updater endpoint in tauri.conf.json points at
     releases/latest/download/latest.json, so publishing this asset on the newest release
