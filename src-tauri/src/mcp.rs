@@ -2,11 +2,10 @@
 //!
 //! Topology (decision A2): codex's MCP transport accepts only `command` (stdio)
 //! or `url` (HTTP) — it cannot attach an in-process Rust server directly. So the
-//! agent process hosts a **127.0.0.1-only** streamable-HTTP MCP server on an
-//! ephemeral port and registers codex against `http://127.0.0.1:<port>/mcp`. The
-//! handler runs in the SAME process as the engine, so it shares the live
-//! [`ToolRuntime`] (request state, journal, bridge, RAG, mapsafe) directly — the
-//! whole point of A2 over an out-of-process shim.
+//! agent process hosts one **127.0.0.1-only** streamable-HTTP server per session
+//! on an ephemeral port and registers it as `http://127.0.0.1:<port>/mcp`.
+//! The handler shares only that worker's [`SessionToolRuntime`]; no mutable
+//! global request pointer identifies callers.
 //!
 //! rules.md's "panel ↔ core is Tauri IPC only — NO localhost socket" bounds the
 //! PANEL boundary; it does not apply to this codex ↔ core MCP channel. The server
@@ -27,20 +26,20 @@ use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, Stream
 use rmcp::{ErrorData as McpError, RoleServer, ServerHandler};
 use serde_json::Value;
 
-use crate::tool_exec::ToolRuntime;
+use crate::tool_exec::SessionToolRuntime;
 use crate::tools::mcp_tool_descriptors;
 
 /// The MCP server name codex registers (matched by the approval handler).
 pub const SERVER_NAME: &str = "eud-tools";
 
-/// MCP handler bridging codex tool calls to the shared [`ToolRuntime`].
+/// MCP handler bridging Codex tool calls to one session's runtime.
 #[derive(Clone)]
 pub struct EudToolHandler {
-    runtime: ToolRuntime,
+    runtime: SessionToolRuntime,
 }
 
 impl EudToolHandler {
-    pub fn new(runtime: ToolRuntime) -> Self {
+    pub fn new(runtime: SessionToolRuntime) -> Self {
         Self { runtime }
     }
 }
@@ -122,11 +121,30 @@ fn render_value(value: &Value) -> String {
     }
 }
 
-/// Start the loopback MCP server on an ephemeral port and return the bound port.
-///
-/// The server runs as a background task for the app's lifetime; the returned
-/// port is injected into codex as `mcp_servers.eud-tools.url`.
-pub async fn serve(runtime: ToolRuntime) -> Result<u16, String> {
+/// Lifetime handle for one session's loopback MCP endpoint.
+pub struct McpServerHandle {
+    port: u16,
+    shutdown: Option<tokio::sync::oneshot::Sender<()>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl McpServerHandle {
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+}
+
+impl Drop for McpServerHandle {
+    fn drop(&mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        self.task.abort();
+    }
+}
+
+/// Start one session-bound loopback MCP server on an ephemeral port.
+pub async fn serve(runtime: SessionToolRuntime) -> Result<McpServerHandle, String> {
     let service = StreamableHttpService::new(
         move || Ok(EudToolHandler::new(runtime.clone())),
         Arc::new(LocalSessionManager::default()),
@@ -141,14 +159,21 @@ pub async fn serve(runtime: ToolRuntime) -> Result<u16, String> {
         .local_addr()
         .map_err(|error| format!("eud-tools MCP server has no local address: {error}"))?
         .port();
-
-    tokio::spawn(async move {
-        if let Err(error) = axum::serve(listener, app).await {
+    let (shutdown, stopped) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(async move {
+        let server = axum::serve(listener, app).with_graceful_shutdown(async move {
+            let _ = stopped.await;
+        });
+        if let Err(error) = server.await {
             eprintln!("eud-tools MCP server stopped: {error}");
         }
     });
 
-    Ok(port)
+    Ok(McpServerHandle {
+        port,
+        shutdown: Some(shutdown),
+        task,
+    })
 }
 
 #[cfg(test)]
@@ -184,10 +209,11 @@ mod tests {
 
     #[tokio::test]
     async fn loopback_server_binds_and_serves_the_mcp_endpoint() {
-        let runtime = ToolRuntime::for_tests();
-        let port = serve(runtime)
+        let runtime = SessionToolRuntime::for_tests();
+        let server = serve(runtime)
             .await
             .expect("MCP server should bind loopback");
+        let port = server.port();
 
         // A streamable-HTTP MCP initialize round-trip over loopback: the server
         // must accept the handshake (proving the /mcp endpoint is live, routed,

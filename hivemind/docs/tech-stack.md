@@ -40,9 +40,10 @@ happy-dom ^16.8.1.
 - anyhow 1 + thiserror 1 — error handling
 - bindgen 0.70 — generate FFI from `native/isom/isom_capi.h` (in `isom-sys`)
 
-Runtime toolchain: the app-managed official Codex CLI/app-server supplies native filesystem
-tools and the elevated Windows split-filesystem sandbox. eud-agent selects a strict named
-permission profile; no second shell, search library, or workspace database is added.
+Runtime toolchain: each saved session owns an official Codex CLI app-server client and ephemeral
+loopback eud-tools MCP endpoint. Two strict elevated Windows profiles select read-only or
+lease-owner write access to that session's isolated workspace; both disable network and avoid
+repository instructions.
 
 ## Build Artifacts
 - tailwindcss v4.x (from `panel/dist` build via `@tailwindcss/vite`) — ground truth for
@@ -69,8 +70,9 @@ permission profile; no second shell, search library, or workspace database is ad
 - In-editor WebView2 hosting + server-spawn lifecycle in the Lua bridge.
 
 ## Project Structure
-- `src-tauri/` — Tauri Rust app (core modules: ipc, engine, tools, codex_client, workspace,
-  journal, rag, isom, mapsafe, bridge_io, eps_preflight, memory, config, bootstrap, chk).
+- `src-tauri/` — Tauri app: session engine manager, project write coordinator, per-session tools/
+  MCP/Codex drivers, canonical/session workspaces, journal, RAG, mapsafe, bridge I/O, preflight,
+  memory, config, bootstrap, and CHK.
 - `crates/isom-sys`, `crates/isom` — FFI bindings + safe wrapper for the C++ engine.
 - `native/isom/` — vendored C++ + C ABI shim.
 - `panel/` — React app (reused), Tauri IPC transport; built to `panel/dist`.

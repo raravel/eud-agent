@@ -181,8 +181,8 @@ struct PreflightState {
     suppressed: Option<SkipReason>,
 }
 
-/// Request-aware snapshot/mirror owner. Calls are serialized by one mutex because
-/// the application supports one editor and one active Codex request.
+/// Request-aware snapshot/mirror owner. Each session owns one instance; the
+/// shared analyzer process provides its own serialization.
 pub struct EpsPreflight {
     dirs: DataDirs,
     analyzer: Arc<dyn EpsAnalyzer>,

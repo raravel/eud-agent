@@ -7,7 +7,7 @@
 //! later tasks.
 
 use tauri::path::BaseDirectory;
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 
 pub mod attachment;
 pub mod bootstrap;
@@ -17,6 +17,7 @@ pub mod chk;
 pub mod codex_auth;
 pub mod codex_client;
 pub mod config;
+pub mod edd_runner;
 pub mod engine;
 pub mod eps_preflight;
 pub mod ipc;
@@ -31,6 +32,7 @@ pub mod tool_exec;
 pub mod tools;
 pub mod wiki;
 pub mod workspace;
+pub mod write_coordinator;
 
 #[derive(Clone)]
 struct AppMemoryProvider {
@@ -218,7 +220,6 @@ pub fn run() {
             });
 
             let app_handle = app.handle().clone();
-            let sink = engine::TauriEventSink::new(app_handle.clone());
 
             // Resolve and checksum-verify the pinned adapter before constructing
             // the shared runtime. Failure is represented by an unavailable
@@ -244,49 +245,28 @@ pub fn run() {
                 ),
             };
 
-            // Shared tool runtime: the eud-tools MCP handler and the engine both
-            // hold a clone of the SAME runtime, so journal entries the handler
-            // records during a turn are the changeset the engine reviews, and the
-            // handler resolves the live request id the engine opened.
-            let runtime =
-                tool_exec::ToolRuntime::new(data_dirs.clone(), std::sync::Arc::new(analyzer));
-
-            // Start the loopback eud-tools MCP server and resolve its ephemeral
-            // port BEFORE codex is spawned (the port is injected into codex's
-            // config). Bind failure is fatal — without tools codex cannot act.
-            let mcp_port = match tauri::async_runtime::block_on(mcp::serve(runtime.clone())) {
-                Ok(port) => port,
-                Err(error) => {
-                    eprintln!("eud-agent: eud-tools MCP server failed to start: {error}");
-                    return Err(error.into());
+            let activity_handle = app_handle.clone();
+            let writes = write_coordinator::ProjectWriteCoordinator::new(move |event| {
+                if let Err(error) = activity_handle.emit("session_activity", event) {
+                    eprintln!("eud-agent: session activity emit failed: {error}");
                 }
-            };
+            });
+            let services = tool_exec::ToolServices::new(
+                data_dirs.clone(),
+                std::sync::Arc::new(analyzer),
+                writes,
+            );
 
             // Warm the RAG embedding model in the background; readiness NEVER
             // gates startup (search_docs returns zero hits until it is ready,
             // which still lifts the evidence gate).
-            let warm_rag = runtime.rag();
+            let warm_rag = services.rag();
             let warm_handle = app_handle.clone();
             tauri::async_runtime::spawn_blocking(move || {
                 if let Err(error) = warm_rag.warmup(&bootstrap::TauriEmitter(warm_handle)) {
                     eprintln!("eud-agent: RAG warmup skipped: {error}");
                 }
             });
-
-            // Stable app-owned cwd for codex (rules.md), NOT the launch dir:
-            // `tauri dev` runs from the repo, so current_dir made codex pick up
-            // the repo's AGENTS.md (hivemind instructions) and treat the Rust
-            // repo as its workspace instead of the EUD map project.
-            let cwd = data_dirs.codex_workspace_dir();
-            let (turn_cancel_tx, turn_cancel_rx) = tokio::sync::watch::channel(0_u64);
-            let driver = engine::ProductionCodexDriver::new(
-                cwd,
-                sink.clone(),
-                mcp_port,
-                data_dirs.clone(),
-                runtime.clone(),
-                turn_cancel_rx,
-            );
 
             // Session restore: Rust owns every session file under
             // `%appdata%\eud-agent\sessions\` (decision A/D). Built before the
@@ -302,19 +282,17 @@ pub fn run() {
                         dirs: data_dirs.clone(),
                     }))
                     .with_project_state_provider(std::sync::Arc::new(AppProjectStateProvider {
-                        dirs: data_dirs,
+                        dirs: data_dirs.clone(),
                     }));
 
-            app.manage(engine::ManagedAgentEngine::new(
-                engine::AgentEngine::new(
-                    driver,
-                    sink,
-                    config,
-                    runtime,
-                    session_store,
-                    attachment_store,
-                ),
-                turn_cancel_tx,
+            app.manage(engine::SessionEngineManager::new(
+                session_store,
+                attachment_store,
+                services,
+                config,
+                app_handle,
+                data_dirs.clone(),
+                data_dirs.codex_workspace_dir(),
             ));
             Ok(())
         })

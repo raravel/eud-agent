@@ -46,12 +46,14 @@ pub struct PreparedWorkspace {
     pub id: String,
     pub project: String,
     pub root: PathBuf,
+    pub session_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspaceBaseline {
     pub request_id: String,
     pub workspace_id: String,
+    pub session_id: Option<String>,
     pub workspace_root: PathBuf,
     pub baseline_root: PathBuf,
 }
@@ -175,6 +177,54 @@ impl WorkspaceManager {
             id,
             project: snapshot.project.clone(),
             root,
+            session_id: None,
+        })
+    }
+
+    /// Prepare one session-owned Codex cwd from the latest coherent editor
+    /// snapshot and the canonical accepted document tree.
+    pub fn prepare_session_current(&self, session_id: &str) -> Result<PreparedWorkspace, String> {
+        let config = self.dirs.load_config().map_err(|error| error.to_string())?;
+        let editor_path = config.editor_path.trim();
+        if editor_path.is_empty() {
+            return Err("editor path is not configured".to_string());
+        }
+        let bridge = BridgeIo::new(config::editor_ipc_dir(Path::new(editor_path)));
+        bridge
+            .read_status_snapshot(HEARTBEAT_STALE_AFTER)
+            .map_err(|error| error.to_string())?;
+        let snapshot = bridge
+            .snapshot_eps(&Default::default(), None)
+            .map_err(|error| error.to_string())?;
+        self.prepare_session_snapshot(&snapshot, session_id)
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn prepare_session_snapshot(
+        &self,
+        snapshot: &EpsSnapshot,
+        session_id: &str,
+    ) -> io::Result<PreparedWorkspace> {
+        let canonical = self.prepare_snapshot(snapshot)?;
+        let session_id = normalize_token(session_id, "session id")?;
+        let root = self.session_workspace_root(&canonical.id, &session_id)?;
+        fs::create_dir_all(&root)?;
+        ensure_plain_directory(&root)?;
+        for directory in DOCUMENT_DIRS {
+            let path = root.join(directory);
+            fs::create_dir_all(&path)?;
+            ensure_plain_directory(&path)?;
+        }
+        let temp = root.join(TEMP_DIR);
+        fs::create_dir_all(&temp)?;
+        ensure_plain_directory(&temp)?;
+        sync_documents(&canonical.root, &root)?;
+        self.refresh_source(&root, &canonical.id, snapshot)?;
+        Ok(PreparedWorkspace {
+            id: canonical.id,
+            project: canonical.project,
+            root,
+            session_id: Some(session_id),
         })
     }
 
@@ -213,6 +263,7 @@ impl WorkspaceManager {
         Ok(WorkspaceBaseline {
             request_id,
             workspace_id: workspace.id.clone(),
+            session_id: workspace.session_id.clone(),
             workspace_root: workspace.root.clone(),
             baseline_root,
         })
@@ -288,43 +339,58 @@ impl WorkspaceManager {
         request_id: &str,
         entries: &[JournalEntry],
     ) -> io::Result<()> {
-        let mut grouped = BTreeMap::<String, BTreeMap<String, String>>::new();
-        let mut ordered = entries.iter().collect::<Vec<_>>();
-        ordered.sort_by_key(|entry| entry.seq);
-        for entry in ordered {
-            let JournalTarget::WorkspacePath { workspace_id, path } = &entry.target else {
-                continue;
-            };
-            let state = if matches!(entry.tool, WriteTool::WorkspaceDelete) {
-                "deleted"
-            } else {
-                "accepted"
-            };
-            grouped
-                .entry(workspace_id.clone())
-                .or_default()
-                .insert(path.clone(), state.to_string());
-        }
-
-        for (workspace_id, documents) in grouped {
-            let mut state = self.load_state(&workspace_id)?;
-            for (path, accepted_state) in documents {
-                let revision = match state.documents.get(&path) {
-                    Some(entry) if entry.request_id == request_id => entry.revision,
-                    Some(entry) => entry.revision.saturating_add(1),
-                    None => 1,
+        let promoted = self.promote_entries(entries)?;
+        let metadata = (|| {
+            let mut grouped = BTreeMap::<String, BTreeMap<String, String>>::new();
+            let mut ordered = entries.iter().collect::<Vec<_>>();
+            ordered.sort_by_key(|entry| entry.seq);
+            for entry in ordered {
+                let JournalTarget::WorkspacePath {
+                    workspace_id, path, ..
+                } = &entry.target
+                else {
+                    continue;
                 };
-                state.documents.insert(
-                    path,
-                    TrustedDocumentState {
-                        revision,
-                        state: accepted_state,
-                        accepted_at: epoch_seconds(),
-                        request_id: request_id.to_string(),
-                    },
-                );
+                let state = if matches!(entry.tool, WriteTool::WorkspaceDelete) {
+                    "deleted"
+                } else {
+                    "accepted"
+                };
+                grouped
+                    .entry(workspace_id.clone())
+                    .or_default()
+                    .insert(path.clone(), state.to_string());
             }
-            self.save_state(&state)?;
+
+            for (workspace_id, documents) in grouped {
+                let mut state = self.load_state(&workspace_id)?;
+                for (path, accepted_state) in documents {
+                    let revision = match state.documents.get(&path) {
+                        Some(entry) if entry.request_id == request_id => entry.revision,
+                        Some(entry) => entry.revision.saturating_add(1),
+                        None => 1,
+                    };
+                    state.documents.insert(
+                        path,
+                        TrustedDocumentState {
+                            revision,
+                            state: accepted_state,
+                            accepted_at: epoch_seconds(),
+                            request_id: request_id.to_string(),
+                        },
+                    );
+                }
+                self.save_state(&state)?;
+            }
+            Ok::<(), io::Error>(())
+        })();
+        if let Err(error) = metadata {
+            if let Err(rollback) = restore_promotions(&promoted) {
+                return Err(io::Error::other(format!(
+                    "acceptance metadata failed: {error}; canonical rollback failed: {rollback}"
+                )));
+            }
+            return Err(error);
         }
         Ok(())
     }
@@ -382,10 +448,28 @@ impl WorkspaceManager {
         request_id: &str,
         approved_markdown: &str,
     ) -> io::Result<Vec<String>> {
+        let root = self.workspace_root(workspace_id)?;
+        self.completion_doc_gaps_at(&root, request_id, approved_markdown)
+    }
+
+    pub fn completion_doc_gaps_for_workspace(
+        &self,
+        workspace: &PreparedWorkspace,
+        request_id: &str,
+        approved_markdown: &str,
+    ) -> io::Result<Vec<String>> {
+        self.completion_doc_gaps_at(&workspace.root, request_id, approved_markdown)
+    }
+
+    fn completion_doc_gaps_at(
+        &self,
+        root: &Path,
+        request_id: &str,
+        approved_markdown: &str,
+    ) -> io::Result<Vec<String>> {
         let plan_path = approved_plan_path(request_id)?;
         let worklog_path = completion_worklog_path(request_id)?;
-        let root = self.workspace_root(workspace_id)?;
-        let files = scan_text_tree(&root, ScanMode::Writable)?;
+        let files = scan_text_tree(root, ScanMode::Writable)?;
         let mut gaps = Vec::new();
 
         match files.get(&plan_path) {
@@ -466,10 +550,14 @@ impl WorkspaceManager {
     pub fn restore_file(
         &self,
         workspace_id: &str,
+        session_id: Option<&str>,
         relative: &str,
         content: Option<&str>,
     ) -> io::Result<()> {
-        let root = self.workspace_root(workspace_id)?;
+        let root = match session_id {
+            Some(session_id) => self.session_workspace_root(workspace_id, session_id)?,
+            None => self.workspace_root(workspace_id)?,
+        };
         let path = confined_path(&root, relative, false)?;
         match content {
             Some(content) => atomic_write(&path, content.as_bytes()),
@@ -481,9 +569,89 @@ impl WorkspaceManager {
         }
     }
 
+    fn promote_entries(
+        &self,
+        entries: &[JournalEntry],
+    ) -> io::Result<Vec<(PathBuf, Option<Vec<u8>>)>> {
+        let mut pending = BTreeMap::<PathBuf, (Option<Vec<u8>>, Option<Vec<u8>>)>::new();
+        let mut ordered = entries.iter().collect::<Vec<_>>();
+        ordered.sort_by_key(|entry| entry.seq);
+        for entry in ordered {
+            let JournalTarget::WorkspacePath {
+                workspace_id,
+                session_id: Some(_),
+                path,
+            } = &entry.target
+            else {
+                continue;
+            };
+            let canonical_root = self.workspace_root(workspace_id)?;
+            let canonical_path = confined_path(&canonical_root, path, false)?;
+            let trusted = self.load_state(workspace_id)?;
+            if let Some(plan) = approved_plan_for_path(&trusted.approved_plans, path) {
+                let content = match &entry.after {
+                    Snapshot::FileContent { content } => content,
+                    _ => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            format!("approved plan `{path}` is immutable"),
+                        ))
+                    }
+                };
+                if project_id(content) != plan.markdown_sha256 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        format!("approved plan `{path}` is immutable"),
+                    ));
+                }
+                continue;
+            }
+            let after = match &entry.after {
+                Snapshot::FileContent { content } => Some(content.as_bytes().to_vec()),
+                Snapshot::Deleted => None,
+                _ => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("workspace journal `{path}` has no promotable after snapshot"),
+                    ))
+                }
+            };
+            let before = match pending.get(&canonical_path) {
+                Some((before, _)) => before.clone(),
+                None => optional_regular_file_bytes(&canonical_path)?,
+            };
+            pending.insert(canonical_path, (before, after));
+        }
+
+        let mut promoted = Vec::new();
+        for (path, (before, after)) in pending {
+            let applied = restore_optional_file_bytes(&path, after.as_deref());
+            if let Err(error) = applied {
+                if let Err(rollback) = restore_promotions(&promoted) {
+                    return Err(io::Error::other(format!(
+                        "canonical promotion failed: {error}; rollback failed: {rollback}"
+                    )));
+                }
+                return Err(error);
+            }
+            promoted.push((path, before));
+        }
+        Ok(promoted)
+    }
+
     fn workspace_root(&self, workspace_id: &str) -> io::Result<PathBuf> {
         let workspace_id = normalize_workspace_id(workspace_id)?;
         Ok(self.dirs.workspaces_dir().join(workspace_id))
+    }
+
+    fn session_workspace_root(&self, workspace_id: &str, session_id: &str) -> io::Result<PathBuf> {
+        let workspace_id = normalize_workspace_id(workspace_id)?;
+        let session_id = normalize_token(session_id, "session id")?;
+        Ok(self
+            .dirs
+            .session_workspaces_dir()
+            .join(workspace_id)
+            .join(session_id))
     }
 
     fn state_path(&self, workspace_id: &str) -> io::Result<PathBuf> {
@@ -638,6 +806,7 @@ impl WorkspaceTurnRecorder {
                         tool,
                         target: JournalTarget::WorkspacePath {
                             workspace_id: baseline.workspace_id.clone(),
+                            session_id: baseline.session_id.clone(),
                             path: change.path.clone(),
                         },
                         before,
@@ -735,6 +904,13 @@ fn restore_optional_file_bytes(path: &Path, content: Option<&[u8]>) -> io::Resul
             Err(error) => Err(error),
         },
     }
+}
+
+fn restore_promotions(promoted: &[(PathBuf, Option<Vec<u8>>)]) -> io::Result<()> {
+    for (path, before) in promoted.iter().rev() {
+        restore_optional_file_bytes(path, before.as_deref())?;
+    }
+    Ok(())
 }
 
 fn markdown_links_to_any(markdown: &str, source_path: &str, candidates: &BTreeSet<&str>) -> bool {
@@ -1016,6 +1192,29 @@ fn write_tree(root: &Path, files: &BTreeMap<String, String>) -> io::Result<()> {
     Ok(())
 }
 
+/// Delta-sync accepted canonical documents into a session root. Generated
+/// `source/` is refreshed separately from one coherent editor snapshot.
+fn sync_documents(canonical_root: &Path, session_root: &Path) -> io::Result<()> {
+    let canonical = scan_text_tree(canonical_root, ScanMode::Writable)?;
+    let current = scan_text_tree(session_root, ScanMode::Writable)?;
+    for relative in current.keys().filter(|path| !canonical.contains_key(*path)) {
+        let target = confined_path(session_root, relative, false)?;
+        match fs::remove_file(target) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    for (relative, content) in canonical {
+        if current.get(&relative) == Some(&content) {
+            continue;
+        }
+        let target = confined_path(session_root, &relative, false)?;
+        atomic_write(&target, content.as_bytes())?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1095,10 +1294,10 @@ mod tests {
             change.path == "plans/next.md" && change.kind == WorkspaceChangeKind::Created
         }));
         manager
-            .restore_file(&workspace.id, "specs/game.md", Some("old"))
+            .restore_file(&workspace.id, None, "specs/game.md", Some("old"))
             .unwrap();
         manager
-            .restore_file(&workspace.id, "plans/next.md", None)
+            .restore_file(&workspace.id, None, "plans/next.md", None)
             .unwrap();
         assert_eq!(
             fs::read_to_string(workspace.root.join("specs/game.md")).unwrap(),
@@ -1257,13 +1456,13 @@ mod tests {
         let workspace = manager.prepare_snapshot(&snapshot()).unwrap();
 
         assert!(manager
-            .restore_file(&workspace.id, "../outside.md", Some("x"))
+            .restore_file(&workspace.id, None, "../outside.md", Some("x"))
             .is_err());
         assert!(manager
-            .restore_file(&workspace.id, "source/main.eps", Some("x"))
+            .restore_file(&workspace.id, None, "source/main.eps", Some("x"))
             .is_err());
         assert!(manager
-            .restore_file(&workspace.id, "C:/outside.md", Some("x"))
+            .restore_file(&workspace.id, None, "C:/outside.md", Some("x"))
             .is_err());
         fs::remove_dir_all(base).ok();
     }
@@ -1283,8 +1482,98 @@ mod tests {
             .iter()
             .all(|file| file.path != CODEGRAPH_RUNTIME_PATH));
         assert!(manager
-            .restore_file(&workspace.id, ".codegraph/index.db", Some("x"))
+            .restore_file(&workspace.id, None, ".codegraph/index.db", Some("x"))
             .is_err());
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn session_snapshots_stay_independent_and_accept_promotes_to_canonical() {
+        let (base, manager) = manager("session-promote");
+        let initial = snapshot();
+        let canonical = manager.prepare_snapshot(&initial).unwrap();
+        write_atomic_bytes(&canonical.root.join("specs/game.md"), b"accepted").unwrap();
+
+        let session_a = manager
+            .prepare_session_snapshot(&initial, "session-a")
+            .unwrap();
+        let baseline = manager.begin_turn(&session_a, "req-session-a").unwrap();
+        write_atomic_bytes(&session_a.root.join("specs/game.md"), b"session-a change").unwrap();
+
+        let mut changed_snapshot = initial.clone();
+        changed_snapshot.files[0].content = Some("function changed() {}".to_string());
+        let session_b = manager
+            .prepare_session_snapshot(&changed_snapshot, "session-b")
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(session_a.root.join("source/main.eps")).unwrap(),
+            "function onPluginStart() {}"
+        );
+        assert_eq!(
+            fs::read_to_string(session_b.root.join("source/main.eps")).unwrap(),
+            "function changed() {}"
+        );
+
+        let journal = JournalStore::new(base.join("roaming"));
+        let mut recorder = WorkspaceTurnRecorder::new(manager.clone(), baseline, journal.clone());
+        assert_eq!(recorder.finish().unwrap(), 1);
+        let entries = JournalStore::load(base.join("roaming"), "req-session-a")
+            .unwrap()
+            .entries;
+        assert!(entries.iter().all(|entry| matches!(
+            &entry.target,
+            JournalTarget::WorkspacePath {
+                session_id: Some(session_id),
+                ..
+            } if session_id == "session-a"
+        )));
+        manager
+            .record_accepted_entries("req-session-a", &entries)
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(canonical.root.join("specs/game.md")).unwrap(),
+            "session-a change"
+        );
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn session_reject_leaves_canonical_bytes_and_approved_plan_unchanged() {
+        let (base, manager) = manager("session-reject");
+        let canonical = manager.prepare_snapshot(&snapshot()).unwrap();
+        write_atomic_bytes(&canonical.root.join("specs/game.md"), b"accepted").unwrap();
+        manager
+            .record_plan_approval(&canonical.id, "req-approved", 1, "# Approved")
+            .unwrap();
+        let session = manager
+            .prepare_session_snapshot(&snapshot(), "session-c")
+            .unwrap();
+
+        manager
+            .restore_file(
+                &session.id,
+                session.session_id.as_deref(),
+                "specs/game.md",
+                Some("rejected change"),
+            )
+            .unwrap();
+        manager
+            .restore_file(
+                &session.id,
+                session.session_id.as_deref(),
+                "specs/game.md",
+                Some("accepted"),
+            )
+            .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(canonical.root.join("specs/game.md")).unwrap(),
+            "accepted"
+        );
+        assert_eq!(
+            fs::read_to_string(canonical.root.join("plans/req-approved.md")).unwrap(),
+            "# Approved"
+        );
         fs::remove_dir_all(base).ok();
     }
 }

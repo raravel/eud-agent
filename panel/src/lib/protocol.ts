@@ -150,7 +150,12 @@ export interface Episode {
  * the known ones and swallows the rest.
  */
 interface SessionScopedMessage {
-  /** Present for conversation events; absent for global bootstrap/project events. */
+  /** Immutable owner of every conversation event. */
+  sessionId: string;
+}
+
+interface OptionalSessionScopedMessage {
+  /** Turn progress is scoped; bootstrap/RAG progress remains global. */
   sessionId?: string;
 }
 
@@ -194,7 +199,7 @@ export interface RollbackResultMessage extends SessionScopedMessage {
 }
 
 /** `progress {stage, detail?, pct?}` - render as a conversation entry. */
-export interface ProgressMessage extends SessionScopedMessage {
+export interface ProgressMessage extends OptionalSessionScopedMessage {
   type: "progress";
   stage: ProgressStage;
   detail?: string;
@@ -210,6 +215,22 @@ export interface ProgressMessage extends SessionScopedMessage {
 export interface ErrorMessage extends SessionScopedMessage {
   type: "error";
   message: string;
+}
+
+export type BackendSessionActivity =
+  | "idle"
+  | "running_read"
+  | "waiting_write"
+  | "running_write"
+  | "review"
+  | "error";
+
+/** Backend-authoritative session execution/write-queue activity. */
+export interface SessionActivityMessage extends SessionScopedMessage {
+  type: "session_activity";
+  activity: BackendSessionActivity;
+  queuePosition?: number;
+  blockingSessionId?: string;
 }
 
 /** `status {compiling, project}` - editor state for the header. */
@@ -395,6 +416,7 @@ export type ServerMessage =
   | RollbackResultMessage
   | ProgressMessage
   | ErrorMessage
+  | SessionActivityMessage
   | StatusMessage
   | ListMessage
   | MemoryMessage
@@ -411,6 +433,7 @@ export const SERVER_MESSAGE_TYPES = [
   "rollback_result",
   "progress",
   "error",
+  "session_activity",
   "status",
   "list",
   "memory",
@@ -576,11 +599,16 @@ function isMemoryFiles(value: unknown): value is Record<MemoryFile, string> {
   );
 }
 
+function hasSessionId(value: Record<string, unknown>): boolean {
+  return typeof value.sessionId === "string" && value.sessionId.length > 0;
+}
+
 /** True if `value` is an `agent_event` message. */
 export function isAgentEventMessage(value: unknown): value is AgentEventMessage {
   return (
     isObject(value) &&
     value.type === "agent_event" &&
+    hasSessionId(value) &&
     typeof value.kind === "string" &&
     typeof value.detail === "string"
   );
@@ -591,6 +619,7 @@ export function isAnswerMessage(value: unknown): value is AnswerMessage {
   return (
     isObject(value) &&
     value.type === "answer" &&
+    hasSessionId(value) &&
     typeof value.text === "string"
   );
 }
@@ -600,6 +629,7 @@ export function isPlanMessage(value: unknown): value is PlanMessage {
   return (
     isObject(value) &&
     value.type === "plan" &&
+    hasSessionId(value) &&
     typeof value.markdown === "string" &&
     typeof value.revision === "number"
   );
@@ -610,6 +640,7 @@ export function isChangesetMessage(value: unknown): value is ChangesetMessage {
   return (
     isObject(value) &&
     value.type === "changeset" &&
+    hasSessionId(value) &&
     typeof value.request_id === "string" &&
     Array.isArray(value.items)
   );
@@ -622,6 +653,7 @@ export function isRollbackResultMessage(
   return (
     isObject(value) &&
     value.type === "rollback_result" &&
+    hasSessionId(value) &&
     Array.isArray(value.ids) &&
     typeof value.ok === "boolean"
   );
@@ -641,7 +673,31 @@ export function isErrorMessage(value: unknown): value is ErrorMessage {
   return (
     isObject(value) &&
     value.type === "error" &&
+    hasSessionId(value) &&
     typeof value.message === "string"
+  );
+}
+
+export function isSessionActivityMessage(
+  value: unknown,
+): value is SessionActivityMessage {
+  return (
+    isObject(value) &&
+    value.type === "session_activity" &&
+    hasSessionId(value) &&
+    [
+      "idle",
+      "running_read",
+      "waiting_write",
+      "running_write",
+      "review",
+      "error",
+    ].includes(String(value.activity)) &&
+    (value.queuePosition === undefined ||
+      (typeof value.queuePosition === "number" && value.queuePosition > 0)) &&
+    (value.blockingSessionId === undefined ||
+      (typeof value.blockingSessionId === "string" &&
+        value.blockingSessionId.length > 0))
   );
 }
 
@@ -742,6 +798,7 @@ export function isServerMessage(value: unknown): value is ServerMessage {
     isRollbackResultMessage(value) ||
     isProgressMessage(value) ||
     isErrorMessage(value) ||
+    isSessionActivityMessage(value) ||
     isStatusMessage(value) ||
     isListMessage(value) ||
     isMemoryMessage(value) ||

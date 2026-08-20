@@ -11,8 +11,8 @@ Replaces the v1 target-picker/apply-bar flow ENTIRELY (user decision: full repla
 | SessionSidebar    | selected session               | ProjectSidebar       |
 | + 새 세션          | Header + conversation          | DAT wiki / memory /  |
 | current project   | plan + changeset + PromptInput | workspace tabs       |
-| running / queued  |                                |                      |
-| review / idle     |                                |                      |
+| read / write wait  |                                |                      |
+| write / review     |                                |                      |
 +-------------------+--------------------------------+----------------------+
 ```
 
@@ -21,27 +21,31 @@ currently running. The center is keyed by selected session id and owns all sessi
 The right sidebar is project-scoped contextual data. At narrow widths the left collapses to a
 rail and the right becomes an overlay, preserving the center chat width.
 
-## State machine
+## Conversation and project-write state
+
+Each `PanelStore` keeps its existing conversation phase:
 
 ```mermaid
 stateDiagram-v2
-    [*] --> connecting
-    connecting --> ready: transport open
-    connecting --> retry: transport error
-    retry --> connecting
-    ready --> queued: another session owns project lane
-    queued --> thinking: queue head
-    ready --> thinking: lane free + chat sent
-    thinking --> ready: answer (no edits)
-    thinking --> plan_review: plan{}
-    plan_review --> thinking: plan_feedback / plan_approve
-    thinking --> changeset_review: changeset{}
-    changeset_review --> ready: all decisions completed
+    [*] --> ready
+    ready --> thinking: chat
+    thinking --> ready: answer
+    thinking --> plan_review: plan
+    plan_review --> thinking: feedback / approve
+    thinking --> changeset_review: changeset
+    changeset_review --> ready: all decisions settled
 ```
 
-The project execution lane remains owned throughout plan and changeset review. New chats queue;
-they never default-accept another session's undecided changes. Reconnect during a running turn
-cancels that turn; a persisted pending changeset remains reviewable.
+Backend `session_activity` is orthogonal:
+
+```text
+idle | running_read | waiting_write(N) | running_write | review | error
+```
+
+Chats are invoked immediately and different rows may be `running_read` together. Only declared
+project writes queue. A changeset review keeps the project write lease and blocks later writers,
+while ready sessions remain usable for read-only turns. Reconnect restores a pending review before
+new writers.
 
 ## Behaviors
 
@@ -64,15 +68,13 @@ cancels that turn; a persisted pending changeset remains reviewable.
 - **Inline stream placement (EUD-069 — layout-crush fix)**: the live agent stream (Reasoning block + Tool rows + streamed answer bubble) renders INLINE at the END of the Conversation scroll area — NEVER as a fixed band between the log and the input (an unbounded band has no min-height escape and crushes the log/plan card; measured live: log 0px, plan 33px, 승인 button off-viewport). When a turn ends (answer/plan/changeset/error), the tool rows ARCHIVE into the log as a compact entry carrying the rows (`LogEntry.tools` → 도구 호출 n건 — name×k summary + expandable Tool cards) and the live buffer clears.
 - **Persistent turn status + stop**: while `phase === "thinking"`, a compact status bar stays
   attached to the bottom PromptInput instead of scrolling away. It derives the current label
-  from the live turn (`작업 준비 중` / `추론 중` / `도구 실행 중 · <name>` /
-  `도구 결과 확인 중` / `응답 작성 중`), uses the bundled CSS Shimmer with
-  `prefers-reduced-motion` respected, and exposes a visible `작업 중단` control.
-- **Cancel and edit history**: `cancel{}` sends app-server `turn/interrupt` and does not
-  resolve until the interrupted `turn/completed` arrives. Each user bubble exposes `수정`;
-  editing cancels an active turn if needed, removes that message and every later panel row,
-  restores its text/attachments to PromptInput, and calls `conversation_rewind{panelLog}` so
-  the retained session starts a fresh Codex thread replaying only the surviving prefix.
-  Already-applied editor/map changes are not rolled back by a chat-history edit.
+  from the live turn and exposes `작업 중단`. Cancel names the selected `sessionId`; it interrupts
+  only that turn or removes only that session's waiting write ticket.
+- **Edit history**: each idle user bubble exposes `수정`. Editing removes that message and every
+  later panel row, restores its text/attachments, and calls
+  `conversation_rewind{sessionId,panelLog}`. Rewind is disabled for running-read,
+  waiting-write, running-write, and review rows. Already-applied editor/map changes are not
+  rolled back by chat-history editing.
 - **Long-chat virtualization**: `ConversationLog` uses `@tanstack/react-virtual` with measured
   variable-height rows and overscan; only viewport-near message/activity rows stay mounted.
   The virtual height remains inside `use-stick-to-bottom`, preserving stream autoscroll and
@@ -84,12 +86,17 @@ cancels that turn; a persisted pending changeset remains reviewable.
   the accessible Plan trigger can reopen it manually. A later plan revision always opens
   automatically so new review content is never hidden by the previous revision's state.
 - **New session**: the permanent left `SessionSidebar` creates an unsaved draft tab. Its first
-  queued message calls `session_create`; there is no duplicate reset control in `PromptInput`.
-- **Multi-active state**: every row owns a `PanelStore` and an
-  `idle|queued|running|review|error` activity. Turn events route by `sessionId`; project events
-  fan out to all rows.
-- **Changeset review**: grouped DAT/file/settings/plugin/main entries retain the project lane
-  until all decisions complete; incomplete/failed decisions keep it owned by that session.
+  message calls `session_create`, replaces the draft id with the Rust id, and invokes `chat`
+  immediately.
+- **Multi-active state**: every row owns a `PanelStore` and backend-owned
+  `idle|running_read|waiting_write|running_write|review|error` activity. Labels are `분석 중`,
+  `쓰기 대기 N`, `변경 중`, and `검토 필요`. Conversation events route only by required immutable
+  `sessionId`; project events fan out to every row. Sidebar selection never calls backend
+  activation and never changes execution ownership.
+- **Changeset review**: grouped DAT/file/settings/plugin/main/workspace entries retain the
+  project write lease until all decisions complete. Partial decisions and rollback failures keep
+  the row in review. A successful complete decision releases the lease and the next writer
+  resumes automatically.
 - **Workspace explorer / project wiki**: the right project sidebar's Files tab opens the
   viewer-only workspace explorer. `workspace_list` refreshes the EPS source mirror and
   returns durable documents plus `source/`; selecting a file calls confined
@@ -111,20 +118,23 @@ cancels that turn; a persisted pending changeset remains reviewable.
 
 ## Verification contract
 
-- vitest unit suites: state machine transitions (incl. reconnect mid-thinking and changeset persistence), changeset grouping/rendering logic, plan revision replacement, decision dispatch payloads, status header (elapsed-time formatting), reasoning/answer-delta accumulation + reset-per-turn, and a no-raw-kind-leak test (a noise-kind event sequence must not surface literal kind strings).
-- `npm --prefix panel run build` exits 0; static contract test updated (target-picker/apply-bar components ABSENT guards replacing the v1 presence checks); the built-dist external-origin scan stays green with Streamdown (all highlighter/math assets npm-bundled — no runtime CDN).
-- Live E2E: the three v2 acceptance scenarios (see plan) drive this UI in the editor.
+- App integration tests prove A/B `chat` promises overlap and interleaved events update only the
+  addressed `PanelStore`.
+- Sidebar tests pin `분석 중`, `쓰기 대기 N`, `변경 중`, review, waiting cancellation, splitter
+  keyboard sizing, collapsed rail, and long-name clipping.
+- Full Vitest, TypeScript, and production build remain required.
+- Mock-Tauri browser smoke observes concurrent read, waiting write, active write, and review rows
+  at 1280 px and 960 px with no horizontal overflow.
 
 ## Implementation
 
-- `panel/src/ws/protocol.ts` / `client.ts` — WS v2 message types (v1 instruct/apply removed; + `reset{}`, `reasoning`/`delta` agent_event kinds)
-- `panel/src/state/store.ts` — state machine v2 + changeset/plan state
-- `panel/src/components/` — InstructionBox→PromptInput wrapper, AgentStream, PlanView,
-  ChangesetView (including Workspace diffs), WorkspaceView (file explorer + Markdown/source
-  viewer), Header, and ConversationLog.
-- `panel/components/ai-elements/` — vendored AI Elements source (Conversation, Message, Response, PromptInput, Plan, Reasoning, Tool, Loader)
-- `panel/src/lib/progress.ts` — extended labels (elapsed time)
-- `panel/src/lib/changeset.ts` — dat-group id-shape helpers (itemKey/itemIds) shared by view + store
-- `panel/src/lib/attachments.ts` — raw binary Tauri upload, client-side image thumbnails, limits/size labels
-- removed: `TargetPicker.tsx`, `ApplyBar.tsx`, ReviewTabs apply wiring
-- external: `streamdown` (npm, bundled — real-time markdown); served by `server/eud_agent/app.py`; protocol per [[features/05_agent-core|05_agent-core]] `05_agent-core.md`
+- `panel/src/App.tsx` — immediate per-session invocation, immutable event routing, backend activity
+  handling, pending-review reconnect.
+- `panel/src/lib/protocol.ts` / `ipc.ts` — required conversation `sessionId` and
+  `session_activity`.
+- `panel/src/state/store.ts` — independent conversation state per row.
+- `panel/src/components/SessionSidebar.tsx` — backend activity labels, waiting cancellation,
+  clipping, collapse, and splitter behavior.
+- `panel/src/App.test.tsx` — overlapping invokes and interleaved store routing.
+- Existing AI Elements, Streamdown, attachment, workspace, plan, changeset, and virtualization
+  components remain the rendering implementation.

@@ -20,6 +20,8 @@ pub const BUILD_RUN_TOOL: &str = "build_run";
 pub const SEARCH_DOCS_TOOL: &str = "search_docs";
 /// Read-only epScript candidate preflight tool name.
 pub const EPS_CHECK_TOOL: &str = "eps_check";
+/// Flow-control tool that records write intent without mutating the project.
+pub const REQUEST_WRITE_LANE_TOOL: &str = "request_write_lane";
 
 /// Maximum admitted non-search tool actions in one user request.
 const MAX_TOOL_ACTIONS: usize = 120;
@@ -350,12 +352,6 @@ pub fn tool_registry() -> Vec<ToolSpec> {
             empty_schema(),
         ),
         tool_spec(
-            "build_errors",
-            "Read the latest build errors.",
-            false,
-            empty_schema(),
-        ),
-        tool_spec(
             SEARCH_DOCS_TOOL,
             "Search the project reference corpus.",
             false,
@@ -366,6 +362,12 @@ pub fn tool_registry() -> Vec<ToolSpec> {
                 }),
                 &["query"],
             ),
+        ),
+        tool_spec(
+            REQUEST_WRITE_LANE_TOOL,
+            "Declare project write intent and park this read-only turn until the FIFO write lease is granted.",
+            false,
+            schema(json!({"reason": string_schema()}), &["reason"]),
         ),
         tool_spec(
             "dat_set",
@@ -570,7 +572,7 @@ pub fn tool_registry() -> Vec<ToolSpec> {
         ),
         tool_spec(
             BUILD_RUN_TOOL,
-            "Run the project build.",
+            "Run the editor build. Returns {ok, errors}; on an editor failure without macro errors, re-runs euddraft once to capture structured diagnostics.",
             true,
             empty_schema(),
         ),
@@ -657,6 +659,14 @@ pub fn mcp_tool_descriptors() -> Vec<Value> {
             })
         })
         .collect()
+}
+
+/// Whether a registered tool can mutate project-owned state.
+pub fn is_mutating_tool(tool_name: &str) -> bool {
+    tool_registry()
+        .into_iter()
+        .find(|spec| spec.name == tool_name)
+        .is_some_and(|spec| spec.mutating)
 }
 
 /// Return whether a tool is exempt from the EUD-090 evidence gate.
@@ -3284,7 +3294,6 @@ mod tests {
                 ),
             ),
             ("plugins_list", false, schema(serde_json::json!({}), &[])),
-            ("build_errors", false, schema(serde_json::json!({}), &[])),
             (
                 SEARCH_DOCS_TOOL,
                 false,
@@ -3295,6 +3304,11 @@ mod tests {
                     }),
                     &["query"],
                 ),
+            ),
+            (
+                REQUEST_WRITE_LANE_TOOL,
+                false,
+                schema(serde_json::json!({"reason": string_schema()}), &["reason"]),
             ),
             (
                 "dat_set",

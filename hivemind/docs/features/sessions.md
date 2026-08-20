@@ -1,242 +1,254 @@
-# Feature: Multi-active sessions
+# Feature: Concurrent multi-active sessions
 
-eud-agent persists named Codex conversations and keeps multiple conversations active in the
-panel at once. Every session owns an independent panel store, conversation log, Codex
-`threadId`, turn/review state, and autosave stream. The current editor project owns one
-execution lane: sessions may be viewed and queued concurrently, but Codex turns and changeset
-decisions run serially so rollback can never overwrite a later session's edit.
+eud-agent persists named Codex conversations and runs independent sessions concurrently. Each
+session owns its panel store, log, Codex thread/client, cancellation generation, MCP endpoint,
+request/preflight state, working workspace, and immutable event route. Commands within one
+session are serialized; different sessions may overlap read-only turns.
 
-This file is the shared Rust/panel contract. Do not drift from the command names, JSON shapes,
-project-lane rules, or event routing below.
+Only project write transactions are serialized. The FIFO lease begins at declared write intent
+and remains owned through mutation, build, changeset review, and complete accept/reject rollback.
+Review blocks later writers, not read-only conversations.
 
-## Confirmed decisions
+## Durable session records
 
-- **A. Rust owns durable session files.** The panel creates local unsaved draft tabs, but a draft
-  becomes a Rust-minted persisted session before its first queued turn. The panel never writes
-  session files directly.
-- **B. Multiple active panel sessions.** Selecting a left-sidebar row only changes the visible
-  conversation. It MUST NOT reset the executing Codex thread, archive a changeset, or steal the
-  project lane. Each row retains its own log, streaming buffers, plan, changeset, and status.
-- **C. One execution lane per editor project.** Initial chats queue FIFO. The lane remains owned
-  through `plan_review` and `changeset_review`; another session starts only after the owner
-  reaches `ready` or is cancelled. A new chat MUST NOT default-accept a pending changeset.
-- **D. One live changeset per session.** `pendingRequestIds` reconnects at most the latest
-  unarchived request for that session. A reopened pending review acquires the project lane before
-  any queued turn.
-- **E. Session-scoped IPC.** Every conversation mutation includes `sessionId`. Turn events carry
-  optional `sessionId`; global status, memory, wiki, setup, and bootstrap events remain
-  project/app scoped.
-- **F. Current-project sidebar.** The left sidebar lists only sessions whose `project` matches
-  the editor's current project. Other-project sessions stay durable but are not executable or
-  shown in that project.
-- **G. Location.** Durable records remain under `%appdata%\eud-agent\sessions\`; attachment bytes
-  remain under `%localappdata%\eud-agent\attachments\objects\`.
-- **H. Resume-first, replay-fallback.** Activation seeds the saved `threadId` for
-  `thread/resume`. A seed/resume error or timeout starts a fresh thread with a condensed
-  transcript and the full first-turn guardrails.
+Rust owns `%appdata%\eud-agent\sessions\`:
 
-## On-disk layout
-
-```
-%appdata%\eud-agent\sessions\
-├── index.json              # ordered session list (drives the list UI)
-└── <session-id>.json       # one full record per session
+```text
+sessions/
+├── index.json
+└── <session-id>.json
 ```
 
-All files written via `memory::write_atomic_bytes` (temp + rename, UTF-8 **without BOM**).
-`<session-id>` is a v4-style UUID minted in Rust (reuse the project's existing uuid path;
-do NOT use `Math.random`/panel-side ids).
+All writes use `memory::write_atomic_bytes` and UTF-8 without BOM. `index.json` contains
+most-recently-updated `SessionMeta` rows:
 
-### index.json
 ```json
 {
   "schemaVersion": 1,
   "sessions": [
-    { "id": "<uuid>", "name": "유닛 HP 작업", "project": "mymap",
-      "createdAt": 1718000000, "updatedAt": 1718009999 }
+    {
+      "id": "<rust UUID>",
+      "name": "유닛 HP 작업",
+      "project": "mymap",
+      "createdAt": 1718000000,
+      "updatedAt": 1718009999
+    }
   ]
 }
 ```
-`sessions` is ordered most-recently-updated first. Rewritten atomically on every mutation.
 
-### <session-id>.json
+Each session file contains the flattened metadata plus:
+
 ```json
 {
-  "schemaVersion": 1,
-  "id": "<uuid>",
-  "name": "유닛 HP 작업",
-  "project": "<editor project name captured at session creation>",
-  "createdAt": 1718000000,
-  "updatedAt": 1718009999,
-  "threadId": "019ece1c-...-f86f5b119d40",
+  "threadId": "019ece1c-...",
   "pendingRequestIds": ["req-1a2b3c4d"],
-  "panelLog": { "schemaVersion": 2, "logSeq": 4, "log": [ ... ] }
+  "panelLog": { "schemaVersion": 2, "logSeq": 4, "log": [] }
 }
 ```
-- `threadId` is `null` until the first turn emits `ThreadStarted`.
-- `pendingRequestIds` ⊆ `journal/<req>.json` files still live (un-archived) at save time.
-  Per decision C this list has at most one entry that will be reconnected; older live
-  journals are default-accepted/archived on save.
-- `panelLog` is **opaque to Rust** — stored and returned verbatim as `serde_json::Value`.
-  Its schema is owned solely by the panel (see below).
 
-## panelLog schema (panel-owned)
+`threadId` is null before the first Codex thread starts. `pendingRequestIds` names unarchived
+journals; recovery requires zero or one project writer. Startup removes stale ids only when the
+matching journal is already in the accepted archive. A missing live journal without that archive
+and multiple pending writers remain explicit errors. `panelLog` is opaque to Rust.
+
+Attachment bytes remain under `%localappdata%\eud-agent\attachments\objects\` and are bound to
+the session on send.
+
+## Panel log
+
+The panel persists only conversation history:
 
 ```json
 {
   "schemaVersion": 2,
   "logSeq": 4,
   "log": [
-    { "id": 1, "kind": "you", "text": "이 화면을 확인해 줘",
-      "attachments": [
-        { "id": "<uuid>", "name": "screen.png", "mime": "image/png",
-          "kind": "image", "size": 2048,
-          "previewUrl": "data:image/webp;base64,..." }
-      ] },
-    { "id": 2, "kind": "agent", "text": "...streamdown markdown..." },
-    { "id": 3, "kind": "info", "text": "도구 호출 2건",
-      "tools": [
-        { "id": "tool-1", "name": "file_create", "state": "done", "args": "{...}", "detail": "ok" }
-      ] },
-    { "id": 4, "kind": "ok", "text": "적용 유지 (2건)" }
+    { "id": 1, "kind": "you", "text": "이 화면을 확인해 줘", "attachments": [] },
+    { "id": 2, "kind": "agent", "text": "..." },
+    { "id": 3, "kind": "info", "text": "도구 호출 2건", "tools": [] },
+    { "id": 4, "kind": "ok", "text": "적용 유지" }
   ]
 }
 ```
-Durable `LogEntry` subset: `id`(number), `kind`(LogKind), `text`(string), optional
-`stage`(string), optional `tools[]`, optional `attachments[]`. Each attachment keeps
-`id, name, mime, kind, size` and an optional panel-generated `data:image/*` thumbnail;
-hydration discards any non-data preview URL. Durable `AgentTool` subset:
-`id, name, state, args?, detail?` (archived tools are always terminal `done`/`failed`).
-Transient state (`turn`, `plan`, `changeset`, `pendingDecision`, `wiki`, connection
-flags) is NOT persisted — it re-arrives from the core on reconnect.
-`conversation_rewind` replaces this blob with the prefix before the edited user message,
-sets `threadId=null`, clears pending request ids, and stages `condense_transcript(panelLog)`
-for the next fresh thread. The active session id and its attachment ownership are retained.
 
-## Tauri IPC commands
+Transient turn, plan, changeset, activity, wiki, and connection state is not persisted.
+`conversation_rewind` replaces the log with the selected prefix, clears the thread id and pending
+request ids, and stages a condensed replay for the next fresh thread. Rewind is rejected while
+the session is running, waiting for write, or in review.
 
-All commands are registered in `lib.rs` `generate_handler!`.
+## Backend activity
 
-| panel `invoke` name | args | returns | notes |
-|---|---|---|---|
-| `session_list` | — | `Vec<SessionMeta>` | all durable rows, most-recently-updated first; panel filters current project |
-| `session_load` | `{ id }` | `SessionRecord` | read-only; selecting a row uses this and never activates Codex |
-| `session_create` | `{ firstText }` | `SessionRecord` | Rust id + first-message-derived name; called when a draft reaches the queue head |
-| `session_update_log` | `{ id, panelLog }` | `()` | autosaves any active/inactive row without changing the execution owner |
-| `session_open` | `{ id }` | `SessionRecord` | internal lane activation/resume; reconnects ≤1 pending changeset |
-| `session_rename` | `{ id, name }` | `()` | updates record + index |
-| `session_delete` | `{ id }` | `()` | removes record, index row, and bound attachment objects |
-| `chat` | `{ sessionId, text, attachments }` | `()` | activates/resumes that session only when it owns the queue head |
-| `plan_feedback`, `plan_approve`, `changeset_decision`, `conversation_rewind`, `cancel` | each includes `sessionId` | `()` | rejected when the id does not own the current execution lane |
+The backend is authoritative for each session:
 
-`session_active {id,name}` establishes the backend event-routing owner; it does not select the
-sidebar row. `session_loaded {id}` signals that activation/reconnect completed. `agent_event`,
-`answer`, `plan`, `changeset`, `rollback_result`, turn `progress`, and turn `error` are flattened
-with `sessionId`. Global project/app events omit it.
-
-`SessionMeta` = `{ id, name, project, createdAt, updatedAt }`.
-`SessionRecord` = `SessionMeta` + `{ threadId, pendingRequestIds, panelLog }`.
-All crossing fields are camelCase.
-
-Attachment bytes are never embedded in roaming JSON. Draft attachment cleanup and
-session-delete ownership rules are unchanged.
-
-## Rust module: `src-tauri/src/session.rs`
-
-`SessionStore` owns the directory plus a clone-shared process mutex. Record + index writes remain
-individually atomic; the mutex serializes engine completion, sidebar rename/delete, and inactive
-session autosave read-modify-write operations.
-
-```rust
-pub struct SessionStore {
-    sessions_dir: PathBuf,
-    write_lock: Arc<Mutex<()>>,
-}
-
-impl SessionStore {
-    pub fn list(&self) -> anyhow::Result<Vec<SessionMeta>>;
-    pub fn load(&self, id: &str) -> anyhow::Result<SessionRecord>;
-    pub fn save(&self, record: &SessionRecord) -> anyhow::Result<()>;
-    pub fn update_panel_log(&self, id: &str, panel_log: Value) -> anyhow::Result<()>;
-    pub fn rename(&self, id: &str, name: &str) -> anyhow::Result<()>;
-    pub fn delete(&self, id: &str) -> anyhow::Result<()>;
-}
+```text
+idle
+running_read
+waiting_write(queuePosition)
+running_write
+review
+error
 ```
 
-A missing/corrupt index yields `[]`; a missing/corrupt record is a surfaced error. Every file is
-UTF-8 without BOM through `memory::write_atomic_bytes`.
+`queuePosition` means only position in the project write queue. A waiting activity also carries
+`blockingSessionId`, the current project write owner. Neither field describes conversation order.
 
-## Engine + driver contract
+Typical transitions:
 
-- `AgentEngine` still has one live `ProductionCodexDriver`, `current_session_id`, and
-  `current_request_id`: the project queue intentionally serializes turns.
-- `chat_in_session(sessionId, req)` activates the requested record when the lane is free, then
-  calls the existing turn loop. `PlanReview`, `ChangesetReview`, or any live journal blocks a
-  session switch with a user-facing review-first error.
-- `open_session(id)` is lane activation, not sidebar selection. Switching saves the prior
-  record, resets the driver thread, seeds the target `threadId`, stages replay fallback, and
-  reconnects its pending changeset. Reopening the current owner is idempotent.
-- Successful chat, plan continuation, approval, and changeset decisions refresh the owning
-  record's thread id and pending request ids.
-- `ManagedAgentEngine` holds a clone of `SessionStore`, allowing list/load/log autosave without
-  waiting for the long-running engine mutex. The store's shared mutex preserves file ordering.
-- `TauriEventSink` holds a clone-shared current session id and wraps conversation events in a
-  flattened `{sessionId,...payload}` envelope. Test sinks remain payload-only.
-- There is no reset endpoint. “새 세션” creates a separate draft tab; lane activation performs
-  the required driver reset only when switching between persisted sessions.
+```text
+idle -> running_read -> idle
+running_read -> waiting_write -> running_write
+running_write -> review -> idle
+running_write -> idle
+```
 
-### Changeset reconnect
-The changeset is derived from the journal (`journal::changeset_from_journal`) and
-`JournalStore::load(data_dir, request_id)` rehydrates one journal by id. In `open_session`,
-for the single reconnect target req-id: `journal_store.load(...)`, set
-`self.current_request_id = Some(req)` (so `changeset_decision`'s guard passes), then re-emit the
-existing `changeset` event to the panel. Resume failure / missing journal must degrade
-gracefully (skip reconnect, log), never panic.
+Plan review uses `review` presentation but does not own the write lease until approval. A
+changeset review owns the lease. Partial decisions and failed rollback remain `review`.
 
-### Resume fallback (decision E)
-Wrap the seed+first-resume so that (a) a `seed_thread_id` error, or (b) the first post-open
-`run_turn` not reaching `thread/started`/completion within a bounded timeout, drops to a fresh
-`thread/start`. A non-resumable open (no `threadId`, or seed failed) goes straight to the fresh
-start. When falling back, fold a **condensed** transcript (you/agent text + decisions; drop
-tool-arg dumps; cap well under prompt limits) into the first turn — and that turn MUST use the
-full `build_system_prompt` (a brand-new thread has never seen the `[first principles]`
-guardrails), NOT `resume_turn_text`.
+## Session workers
+
+`SessionEngineManager` lazily owns `HashMap<SessionId, Arc<SessionWorker>>`. Each worker contains:
+
+- a session-bound `AgentEngine` behind its own Tokio mutex;
+- `ProductionCodexDriver` with its own app-server client and event receiver;
+- a session-bound loopback MCP server and `SessionToolRuntime`;
+- a per-worker cancellation watch channel;
+- `SessionEventSink(app, sessionId)`.
+
+The worker mutex is the same-session command sequencer. There is no global `ManagedAgentEngine`
+mutex and no mutable session-switching path. `session_open` hydrates only the named worker and is
+idempotent. Selecting a sidebar row never calls it.
+
+Resume seeds the saved thread id. A seed error or bounded first-resume failure resets only that
+worker and starts a fresh thread with a condensed transcript plus the full safety prompt.
+
+Global model settings use a separate settings lock and temporary app-server; they are not stored
+inside any conversation worker.
+
+## Project write coordinator
+
+`ProjectWriteCoordinator` provides:
+
+```rust
+request(project_id, session_id, request_id) -> WriteTicket
+cancel(request_id)
+release(request_id)
+restore_review(project_id, session_id, request_id)
+owner(project_id) -> Option<WriteOwner>
+```
+
+One project has at most one owner. Tickets are ordered when `request_write_lane` or
+`plan_approve` registers intent. Waiting is process state, not a sleeping MCP request. A granted
+ticket automatically resumes the same thread in write mode.
+
+The coordinator releases only after:
+
+- no live journal entry remains;
+- every workspace promotion or rollback completed;
+- build and changeset decision processing settled.
+
+Cancellation removes only a waiting ticket or interrupts only that worker. Journaled active
+writes become review and retain ownership.
+
+If a read turn fails after declaring write intent but before write continuation, the manager
+cancels a waiting ticket or releases an unmutated granted ticket before allowing another request.
+`SessionToolRuntime::begin_request` refuses to overwrite any active ticket. This prevents a
+single session from queueing behind its own stale owner as `쓰기 대기 1`.
+
+At startup, current-project session records are scanned before admitting any writer. A valid
+pending journal is restored as owner before new tickets. Read turns and unfinished tickets are
+not persisted; journaled writes are.
+
+## Session tool/runtime isolation
+
+`ToolServices` shares the journal store, RAG, map rails, analyzer, data dirs, and coordinator.
+Every `SessionToolRuntime` separately owns the live request id, evidence/mutation/action/search/
+build state, pending plan, epScript preflight state, write ticket, and tool execution lock.
+
+One ephemeral MCP endpoint is created per worker. No global current-request pointer infers the
+caller. Mutating tools and `build_run` require that runtime's exact `(project, session, request)`
+ownership.
+
+## Workspace isolation
+
+Canonical accepted files remain panel-visible at:
+
+`workspaces/<project-id>/`
+
+Codex uses:
+
+`workspaces/.sessions/<project-id>/<session-id>/`
+
+Before every read turn, canonical documents are delta-synced and a coherent session source
+snapshot is refreshed. Read mode makes the whole root read-only. Before a granted write
+continuation, the sync and snapshot run again, Codex is told to re-read targets, and a trusted
+baseline is captured.
+
+Workspace accept promotes selected bytes to canonical storage under the lease. Promotion and
+trusted metadata update roll back together on failure. Reject restores/discards only the session
+copy. Approved plan snapshots are app-owned canonical files, synced before execution, immutable,
+and preserved after implementation rejection.
+
+## Tauri IPC
+
+All conversation commands include `sessionId`:
+
+| command | purpose |
+|---|---|
+| `chat` | start/resume a read turn immediately |
+| `plan_feedback` | revise that session's plan in read mode |
+| `plan_approve` | register write intent and execute after grant |
+| `changeset_decision` | accept/reject that session's journal |
+| `cancel` | interrupt that turn or remove that write ticket |
+| `conversation_rewind` | reset that idle session to a log prefix |
+| `session_open` | hydrate/reconnect one persisted worker |
+
+`session_list`, `session_load`, `session_create`, `session_update_log`, `session_rename`, and
+`session_delete` remain outside the project write queue. `memory_save` and `wiki_save` use short
+coordinated project writes.
+
+Every conversation event has a required immutable `sessionId`:
+
+- `agent_event`, `answer`, `plan`, `changeset`, `rollback_result`;
+- turn `progress` and turn `error`;
+- `session_activity`.
+
+Project status, list, memory/wiki snapshots, setup, bootstrap, and RAG warmup remain global.
+`session_active` and selected-row event-routing fallbacks do not exist.
 
 ## Panel contract
 
-- `App.tsx` owns a dynamic `Map<sessionId, SessionSlot>`. Each slot has its own `PanelStore`,
-  metadata, persisted/draft flag, and `idle|queued|running|review|error` activity.
-- Global project events fan out to every slot. Conversation events route by payload
-  `sessionId`, falling back to the current backend owner only for compatibility.
-- The FIFO queue persists the project owner through plan/changeset review. Queued rows expose
-  their position and can be cancelled before execution.
-- `SessionSidebar` is permanent left primary navigation. It is drag/keyboard resizable from
-  220–420px, persists width in `eud.session-sidebar.width`, and collapses to a 56px rail.
-  Selected/running/queued/review states use icon + text. Every horizontal container clips
-  overflow; long session names use single-line ellipsis with the full name in `title`.
-- The center conversation is keyed by selected session id so sticky-scroll internals never
-  retain the prior row's rendered log.
-- `ProjectSidebar` is the right contextual inspector with DAT wiki, project memory, and
-  workspace tabs. It is resizable; below 1140px it overlays the center, and below 1040px the
-  session sidebar collapses to a rail. The center never introduces horizontal scrolling at the
-  configured 960px minimum window width.
-- Autosave subscriptions debounce each persisted slot independently through
-  `session_update_log {id,panelLog}`. Toast high-water marks are also session scoped.
-- The prompt no longer duplicates “새 대화”; new-session creation lives in the left sidebar.
+`App.tsx` owns `Map<sessionId, SessionSlot>`, with one `PanelStore` per row. Drafts are persisted
+before their first chat, then invoked immediately. There is no frontend conversation queue,
+running slot, review owner, or event-owner fallback.
+
+`session_activity` drives explicit ownership labels:
+
+- `running_read` -> `분석 중`;
+- `waiting_write` -> `쓰기 대기 N · <blocker> 검토 결정/변경 완료 대기 · 경과 초`;
+- `running_write` -> `변경 중 · 쓰기 권한 획득`;
+- `review` -> `검토 필요`.
+
+The transition into `running_write` also appends
+`쓰기 권한을 획득했습니다. 변경을 시작합니다.` to that session log. A user can therefore
+distinguish a legitimate review wait, elapsed waiting, and an actual granted write turn.
+
+Two rows may show activity simultaneously. Review in one row does not disable a ready row.
+Selection only changes the rendered store. Delete/rewind remains disabled for running, waiting,
+and review rows. Waiting cancellation invokes backend `cancel`.
+
+The left sidebar remains 220–420 px, collapses to a 56 px rail, and ellipsizes long names with a
+title. The center and both sidebars keep `min-width: 0`/horizontal clipping so the configured
+960 px minimum surface has no horizontal overflow.
 
 ## Verification
 
-- Rust: full `cargo test`; dedicated coverage pins project-lane review blocking and flattened
-  session event serialization.
-- Panel: full Vitest suite + `npm run build`; component coverage pins session activity labels,
-  selection, queued cancellation, splitter keyboard sizing, and long-name clipping.
-- Browser-driven mock-Tauri smoke: two current-project sessions retain isolated logs; the
-  second chat invocation occurs only after the first resolves. Splitter drag persisted
-  `272px → 368px`; long-name ellipsis and 1280px/960px layouts produced no horizontal scroll.
-
-## Constraints (rules.md)
-
-- Editor/third-party never modified. IPC/config/session files UTF-8 **no BOM**, atomic writes.
-- codex invocation rules unchanged (stdin, `.cmd` shim, no persistence-disable flag).
-- Existing `memory/`, `journal/`, `wiki/` contracts unchanged — sessions are a layer above project.
-- Panel ↔ core is Tauri IPC only; never render raw `agent_event` kind identifiers as user text.
+- Rust barrier tests: different-session overlap and same-session serialization.
+- Runtime tests: request/evidence/budget/preflight isolation.
+- Coordinator tests: FIFO, one owner, waiting cancellation, queue-position updates, review
+  retention, and restored-review priority.
+- Workspace tests: stable source snapshots, promotion, rejection invariance, approved plans.
+- Panel integration: overlapping `chat` invokes, simultaneous activities, immutable event
+  routing, and selection independence.
+- Browser mock-Tauri smoke: concurrent read, waiting write, active write, review, and 1280/960 px
+  horizontal-overflow checks.

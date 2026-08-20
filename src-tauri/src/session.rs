@@ -48,8 +48,8 @@ pub struct SessionRecord {
     pub meta: SessionMeta,
     /// `null` until the first turn emits `ThreadStarted`.
     pub thread_id: Option<String>,
-    /// Un-archived journal req-ids to reconnect on open (decision C: at most one is
-    /// reconnected — the latest; older live journals are default-accepted on save).
+    /// Unarchived journal request ids. The concurrent writer contract restores
+    /// exactly one pending project writer and reports conflicting records.
     pub pending_request_ids: Vec<String>,
     /// Opaque to Rust — stored and returned verbatim; the panel owns its schema.
     pub panel_log: serde_json::Value,

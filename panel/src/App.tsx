@@ -143,14 +143,12 @@ interface SessionSlot {
   persisted: boolean;
   activity: SessionActivity;
   queuePosition?: number;
+  blockingSessionId?: string;
+  activitySince: number;
   unsubscribe?: () => void;
   saveTimer?: number;
 }
 
-interface QueuedChat {
-  slot: SessionSlot;
-  payload: ChatPayload;
-}
 
 let draftSequence = 0;
 
@@ -189,15 +187,31 @@ function syncProjectState(target: PanelStore, source: PanelStore): void {
   }
 }
 
+function waitingActivityDetail(
+  slot: SessionSlot,
+  sessions: Map<string, SessionSlot>,
+  now: number,
+): string {
+  const blocker = slot.blockingSessionId
+    ? sessions.get(slot.blockingSessionId)
+    : undefined;
+  const reason =
+    blocker?.activity === "review"
+      ? `${blocker.meta.name} 검토 결정 대기`
+      : blocker?.activity === "running_write"
+        ? `${blocker.meta.name} 변경 완료 대기`
+        : blocker
+          ? `${blocker.meta.name} 쓰기 권한 해제 대기`
+          : "앞 작업 완료 대기";
+  const seconds = Math.max(0, Math.floor((now - slot.activitySince) / 1000));
+  return `${reason} · ${seconds}초`;
+}
+
 export default function App() {
   const projectStore = useMemo(() => createPanelStore(), []);
   const sessionsRef = useRef(new Map<string, SessionSlot>());
-  const queueRef = useRef<QueuedChat[]>([]);
-  const runningSlotRef = useRef<SessionSlot | null>(null);
-  const reviewOwnerRef = useRef<SessionSlot | null>(null);
-  const eventSessionIdRef = useRef<string | null>(null);
-  const drainQueueRef = useRef<() => void>(() => {});
   const [sessionRevision, setSessionRevision] = useState(0);
+  const [activityClock, setActivityClock] = useState(() => Date.now());
   const toastedLogBySessionRef = useRef(new Map<string, number>());
   const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null);
   const selectedSessionIdRef = useRef<string | null>(null);
@@ -322,6 +336,7 @@ export default function App() {
         store: sessionStore,
         persisted: true,
         activity: record.pendingRequestIds.length > 0 ? "review" : "idle",
+        activitySince: Date.now(),
       };
       sessionsRef.current.set(slot.id, slot);
       attachSlot(slot);
@@ -345,6 +360,7 @@ export default function App() {
       store: sessionStore,
       persisted: false,
       activity: "idle",
+      activitySince: Date.now(),
     };
     sessionsRef.current.set(slot.id, slot);
     attachSlot(slot);
@@ -357,6 +373,16 @@ export default function App() {
   useEffect(() => {
     selectedSessionIdRef.current = selectedSessionId;
   }, [selectedSessionId]);
+
+  useEffect(() => {
+    const hasWaitingWriter = Array.from(sessionsRef.current.values()).some(
+      (slot) => slot.activity === "waiting_write",
+    );
+    if (!hasWaitingWriter) return;
+    setActivityClock(Date.now());
+    const id = window.setInterval(() => setActivityClock(Date.now()), 1000);
+    return () => window.clearInterval(id);
+  }, [sessionRevision]);
 
   useEffect(
     () => () => {
@@ -440,11 +466,8 @@ export default function App() {
         "sessionId" in msg && typeof msg.sessionId === "string"
           ? msg.sessionId
           : null;
-      const sessionStore = () => {
-        const id =
-          scopedId ?? eventSessionIdRef.current ?? selectedSessionIdRef.current;
-        return (id ? sessionsRef.current.get(id)?.store : undefined) ?? projectStore;
-      };
+      const sessionStore = () =>
+        scopedId ? (sessionsRef.current.get(scopedId)?.store ?? null) : null;
       const forEveryStore = (apply: (target: PanelStore) => void) => {
         apply(projectStore);
         for (const slot of sessionsRef.current.values()) apply(slot.store);
@@ -468,7 +491,7 @@ export default function App() {
           break;
         case "memory_saved":
           forEveryStore((target) => target.memorySaved(msg.file));
-          sessionStore().log("ok", "메모리를 저장했습니다.");
+          projectStore.log("ok", "메모리를 저장했습니다.");
           break;
         case "wiki":
           forEveryStore((target) =>
@@ -517,7 +540,7 @@ export default function App() {
             forEveryStore((target) => target.ragWarmupChanged(next));
             if (next !== previous && next === "unavailable") {
               const { kind, text } = progressLabel(msg.stage, msg.detail);
-              sessionStore().log(kind, text, msg.stage);
+              projectStore.log(kind, text, msg.stage);
             }
             if (next === "loading") {
               ragStartRef.current = Date.now();
@@ -527,19 +550,22 @@ export default function App() {
             break;
           }
           const target = sessionStore();
-          target.progressReceived(msg.stage);
-          const { kind, text } = progressLabel(msg.stage, msg.detail);
-          target.log(kind, text, msg.stage);
+          if (target) {
+            target.progressReceived(msg.stage);
+            const { kind, text } = progressLabel(msg.stage, msg.detail);
+            target.log(kind, text, msg.stage);
+          }
           break;
         }
         case "agent_event":
-          sessionStore().agentEvent(msg.kind, msg.detail, msg.data);
+          sessionStore()?.agentEvent(msg.kind, msg.detail, msg.data);
           break;
         case "answer":
-          sessionStore().answerReceived(msg.text);
+          sessionStore()?.answerReceived(msg.text);
           break;
         case "plan": {
           const target = sessionStore();
+          if (!target) break;
           const prior = target.getState().plan;
           if (prior !== null && prior.revision !== msg.revision) {
             target.log("agent", `계획안(rev ${prior.revision})이 갱신되었습니다.`);
@@ -550,12 +576,14 @@ export default function App() {
         }
         case "changeset": {
           const target = sessionStore();
+          if (!target) break;
           target.changesetReceived(msg.request_id, msg.items);
           target.log("agent", `변경사항 ${msg.items.length}건을 검토하세요.`);
           break;
         }
         case "rollback_result": {
           const target = sessionStore();
+          if (!target) break;
           const decision = target.getState().pendingDecision?.decision;
           const count = msg.ids.length;
           target.rollbackResult(msg.ids, msg.ok);
@@ -569,16 +597,42 @@ export default function App() {
           break;
         }
         case "error": {
-          if (bootstrapActiveRef.current) {
-            setBootstrap((prev) => ({
-              ...prev,
-              active: true,
-              error: msg.message,
-            }));
-          }
           const target = sessionStore();
+          if (!target) break;
           target.errorReceived(msg.message);
           target.log("error", `오류: ${msg.message}`);
+          break;
+        }
+        case "session_activity": {
+          const slot = sessionsRef.current.get(msg.sessionId);
+          if (!slot) break;
+          const previous = slot.activity;
+          if (previous !== msg.activity) slot.activitySince = Date.now();
+          slot.activity = msg.activity;
+          slot.queuePosition =
+            msg.activity === "waiting_write" ? msg.queuePosition : undefined;
+          slot.blockingSessionId =
+            msg.activity === "waiting_write"
+              ? msg.blockingSessionId
+              : undefined;
+          if (previous !== msg.activity && msg.activity === "waiting_write") {
+            const blockerName = msg.blockingSessionId
+              ? sessionsRef.current.get(msg.blockingSessionId)?.meta.name
+              : undefined;
+            slot.store.log(
+              "info",
+              blockerName
+                ? `쓰기 권한 대기 시작 · ${blockerName} 작업 완료 대기`
+                : "쓰기 권한 대기 시작",
+            );
+          }
+          if (previous !== msg.activity && msg.activity === "running_write") {
+            slot.store.log(
+              "ok",
+              "쓰기 권한을 획득했습니다. 변경을 시작합니다.",
+            );
+          }
+          bumpSessions();
           break;
         }
         default:
@@ -595,7 +649,7 @@ export default function App() {
     const client = new IpcClient({
       onMessage,
       onLog: (kind, text) => {
-        const id = eventSessionIdRef.current ?? selectedSessionIdRef.current;
+        const id = selectedSessionIdRef.current;
         const target =
           (id ? sessionsRef.current.get(id)?.store : undefined) ?? projectStore;
         if (kind === "info") target.log("info", text);
@@ -649,27 +703,6 @@ export default function App() {
     };
   }, []);
 
-  // The backend execution owner is distinct from the sidebar selection. This
-  // signal only establishes routing for streamed turn events.
-  useEffect(() => {
-    let unlisten: (() => void) | undefined;
-    let cancelled = false;
-    void listen<{ id: string; name: string }>("session_active", (event) => {
-      eventSessionIdRef.current = event.payload.id;
-      const slot = sessionsRef.current.get(event.payload.id);
-      if (slot) {
-        slot.meta = { ...slot.meta, name: event.payload.name };
-        bumpSessions();
-      }
-    }).then((fn) => {
-      if (cancelled) fn();
-      else unlisten = fn;
-    });
-    return () => {
-      cancelled = true;
-      unlisten?.();
-    };
-  }, [bumpSessions]);
 
   // Editor-liveness poll. Once armed (first-run setup satisfied), probe the
   // editor every EDITOR_POLL_MS. The transport stays open throughout, so this
@@ -698,7 +731,6 @@ export default function App() {
     if (!projectState.hasProject || !project || loadedProjectRef.current === project) {
       return;
     }
-    if (runningSlotRef.current || reviewOwnerRef.current) return;
     loadedProjectRef.current = project;
     let cancelled = false;
     void invoke<SessionMeta[]>("session_list")
@@ -717,6 +749,23 @@ export default function App() {
         }
         sessionsRef.current.clear();
         const slots = records.map(registerSession);
+        for (const slot of slots) {
+          if (slot.meta.pendingRequestIds.length === 0) continue;
+          slot.activity = "review";
+          void invoke<SessionRecord>("session_open", { id: slot.id })
+            .then((record) => {
+              slot.meta = record;
+              bumpSessions();
+            })
+            .catch((error) => {
+              slot.activity = "error";
+              slot.store.log(
+                "error",
+                `변경사항을 복구하지 못했습니다: ${String(error)}`,
+              );
+              bumpSessions();
+            });
+        }
         const first = slots[0] ?? createDraftSlot();
         setSelectedSessionId(first.id);
         selectedSessionIdRef.current = first.id;
@@ -774,44 +823,17 @@ export default function App() {
   }, [setup, updater]);
 
   // ---- user intents ----
-  const refreshQueuePositions = useCallback(() => {
-    queueRef.current.forEach((item, index) => {
-      item.slot.activity = "queued";
-      item.slot.queuePosition = index + 1;
-    });
-    bumpSessions();
-  }, [bumpSessions]);
-
-  const settleExecution = useCallback(
-    (slot: SessionSlot) => {
-      runningSlotRef.current = null;
-      slot.queuePosition = undefined;
-      const phase = slot.store.getState().phase;
-      if (phase === "plan_review" || phase === "changeset_review") {
-        slot.activity = "review";
-        reviewOwnerRef.current = slot;
-      } else {
-        slot.activity = phase === "retry" ? "error" : "idle";
-        if (reviewOwnerRef.current === slot) reviewOwnerRef.current = null;
-        queueMicrotask(() => drainQueueRef.current());
+  // Every session invokes immediately. The backend serializes commands only
+  // within that session and queues only declared project write transactions.
+  const handleSend = useCallback(
+    async (payload: ChatPayload) => {
+      const slot = selectedSlot ?? createDraftSlot();
+      setEditDraft(null);
+      if (slot.store.getState().phase === "changeset_review") {
+        slot.store.log("warn", "변경사항 검토를 완료한 뒤 새 요청을 보내세요.");
+        return;
       }
-      bumpSessions();
-    },
-    [bumpSessions],
-  );
 
-  drainQueueRef.current = () => {
-    if (runningSlotRef.current || reviewOwnerRef.current) return;
-    const item = queueRef.current.shift();
-    if (!item) return;
-    refreshQueuePositions();
-    const { slot, payload } = item;
-    runningSlotRef.current = slot;
-    slot.activity = "running";
-    slot.queuePosition = undefined;
-    bumpSessions();
-
-    void (async () => {
       try {
         if (!slot.persisted) {
           const oldId = slot.id;
@@ -831,8 +853,26 @@ export default function App() {
             selectedSessionIdRef.current = slot.id;
             setSelectedSessionId(slot.id);
           }
+          bumpSessions();
         }
-        eventSessionIdRef.current = slot.id;
+
+        if (slot.store.getState().phase === "plan_review") {
+          slot.store.log("you", payload.text, undefined, payload.attachments);
+          slot.store.log("agent", "계획 수정을 요청했습니다.");
+          slot.store.planFeedbackSent();
+          const sent = await clientRef.current?.send({
+            type: "plan_feedback",
+            sessionId: slot.id,
+            text: payload.text,
+            attachments: payload.attachments.map((attachment) => attachment.id),
+          });
+          if (!sent) {
+            slot.store.errorReceived("계획 수정 요청을 처리하지 못했습니다.");
+          }
+          return;
+        }
+
+        slot.store.log("you", payload.text, undefined, payload.attachments);
         slot.store.chatSent();
         const sent = await clientRef.current?.send({
           type: "chat",
@@ -846,74 +886,20 @@ export default function App() {
       } catch (error) {
         slot.store.errorReceived(String(error));
         slot.store.log("error", `요청을 처리하지 못했습니다: ${String(error)}`);
-      } finally {
-        settleExecution(slot);
       }
-    })();
-  };
-  // The MAIN prompt input routes by phase (EUD-074): during plan_review its text
-  // and attachment ids go to plan_feedback; otherwise they start a chat turn.
-  //
-  // Turn-starting commands resolve only when the WHOLE codex turn ends, while
-  // its progress/answer events stream in the meantime — so the user bubble and
-  // the thinking phase are recorded BEFORE awaiting, or the answer would render
-  // above the user's own message and the late phase flip would strand the UI
-  // in "생각하는 중…" after the turn already finished.
-  const handleSend = useCallback(
-    async (payload: ChatPayload) => {
-      const slot = selectedSlot ?? createDraftSlot();
-      setEditDraft(null);
-      if (slot.store.getState().phase === "plan_review") {
-        if (reviewOwnerRef.current !== slot) {
-          slot.store.log("warn", "다른 세션이 프로젝트 실행 레인을 사용 중입니다.");
-          return;
-        }
-        slot.store.log("you", payload.text, undefined, payload.attachments);
-        slot.store.log("agent", "계획 수정을 요청했습니다.");
-        slot.store.planFeedbackSent();
-        slot.activity = "running";
-        runningSlotRef.current = slot;
-        eventSessionIdRef.current = slot.id;
-        bumpSessions();
-        const sent = await clientRef.current?.send({
-          type: "plan_feedback",
-          sessionId: slot.id,
-          text: payload.text,
-          attachments: payload.attachments.map((attachment) => attachment.id),
-        });
-        if (!sent) {
-          slot.store.errorReceived("계획 수정 요청을 처리하지 못했습니다.");
-        }
-        settleExecution(slot);
-        return;
-      }
-      if (slot.store.getState().phase === "changeset_review") {
-        slot.store.log("warn", "변경사항 검토를 완료한 뒤 새 요청을 보내세요.");
-        return;
-      }
-      slot.store.log("you", payload.text, undefined, payload.attachments);
-      slot.activity = "queued";
-      queueRef.current.push({ slot, payload });
-      refreshQueuePositions();
-      drainQueueRef.current();
     },
-    [
-      bumpSessions,
-      createDraftSlot,
-      refreshQueuePositions,
-      selectedSlot,
-      settleExecution,
-    ],
+    [bumpSessions, createDraftSlot, selectedSlot],
   );
 
   const handleCancel = useCallback(async () => {
     const slot = selectedSlot;
-    if (
-      !slot ||
-      messageActionBusyRef.current ||
-      runningSlotRef.current !== slot ||
-      slot.store.getState().phase !== "thinking"
-    ) {
+    const cancellable =
+      slot &&
+      (slot.store.getState().phase === "thinking" ||
+        slot.activity === "running_read" ||
+        slot.activity === "waiting_write" ||
+        slot.activity === "running_write");
+    if (!slot || !cancellable || messageActionBusyRef.current) {
       return;
     }
     messageActionBusyRef.current = true;
@@ -940,7 +926,7 @@ export default function App() {
       const slot = selectedSlot;
       if (
         !slot ||
-        eventSessionIdRef.current !== slot.id ||
+        (slot.activity !== "idle" && slot.activity !== "error") ||
         entry.kind !== "you" ||
         messageActionBusyRef.current
       ) {
@@ -949,18 +935,7 @@ export default function App() {
       messageActionBusyRef.current = true;
       setMessageActionBusy(true);
       try {
-        if (slot.store.getState().phase === "thinking") {
-          const cancelled = await clientRef.current?.send({
-            type: "cancel",
-            sessionId: slot.id,
-          });
-          if (!cancelled) {
-            slot.store.errorReceived("작업을 중단하지 못했습니다.");
-            slot.store.log("error", "메시지 수정을 위해 작업을 중단하지 못했습니다.");
-            return;
-          }
-          slot.store.cancelSent();
-        }
+        if (slot.store.getState().phase !== "ready") return;
 
         const currentLog = slot.store.getState().log;
         const selected = currentLog.find(
@@ -1017,33 +992,8 @@ export default function App() {
       setSelectedSessionId(id);
       selectedSessionIdRef.current = id;
       setEditDraft(null);
-      if (
-        slot.persisted &&
-        slot.meta.pendingRequestIds?.length > 0 &&
-        !runningSlotRef.current &&
-        !reviewOwnerRef.current
-      ) {
-        slot.activity = "running";
-        runningSlotRef.current = slot;
-        eventSessionIdRef.current = slot.id;
-        bumpSessions();
-        void invoke<SessionRecord>("session_open", { id: slot.id })
-          .then((record) => {
-            slot.meta = record;
-            slot.activity = "review";
-            reviewOwnerRef.current = slot;
-          })
-          .catch((error) => {
-            slot.activity = "error";
-            slot.store.log("error", `변경사항을 다시 열지 못했습니다: ${String(error)}`);
-          })
-          .finally(() => {
-            runningSlotRef.current = null;
-            bumpSessions();
-          });
-      }
     },
-    [bumpSessions],
+    [],
   );
 
   const handleSessionRename = useCallback(
@@ -1066,7 +1016,14 @@ export default function App() {
   const handleSessionDelete = useCallback(
     (id: string) => {
       const slot = sessionsRef.current.get(id);
-      if (!slot || slot.activity === "running" || slot.activity === "review") return;
+      if (
+        !slot ||
+        slot.activity === "running_read" ||
+        slot.activity === "waiting_write" ||
+        slot.activity === "running_write" ||
+        slot.activity === "review"
+      )
+        return;
       const remove = () => {
         slot.unsubscribe?.();
         if (slot.saveTimer !== undefined) window.clearTimeout(slot.saveTimer);
@@ -1097,18 +1054,20 @@ export default function App() {
     [bumpSessions, createDraftSlot],
   );
 
-  const handleCancelQueued = useCallback(
-    (id: string) => {
-      const slot = sessionsRef.current.get(id);
-      if (!slot || slot.activity !== "queued") return;
-      queueRef.current = queueRef.current.filter((item) => item.slot !== slot);
-      slot.activity = "idle";
-      slot.queuePosition = undefined;
-      slot.store.log("info", "대기 중인 요청을 취소했습니다.");
-      refreshQueuePositions();
-    },
-    [refreshQueuePositions],
-  );
+  const handleCancelQueued = useCallback((id: string) => {
+    const slot = sessionsRef.current.get(id);
+    if (!slot || slot.activity !== "waiting_write") return;
+    void clientRef.current
+      ?.send({ type: "cancel", sessionId: slot.id })
+      .then((sent) => {
+        if (sent) {
+          slot.store.cancelSent();
+          slot.store.log("info", "쓰기 대기를 취소했습니다.");
+        } else {
+          slot.store.log("error", "쓰기 대기를 취소하지 못했습니다.");
+        }
+      });
+  }, []);
 
   // Retry re-runs the backend download command (it re-fetches the release
   // manifest and skips already-verified assets), replacing the old full-reload
@@ -1226,17 +1185,13 @@ export default function App() {
 
   const handlePlanApprove = useCallback(async () => {
     const slot = selectedSlot;
-    if (!slot || reviewOwnerRef.current !== slot) return;
+    if (!slot || slot.store.getState().phase !== "plan_review") return;
     const rev = slot.store.getState().plan?.revision;
     slot.store.log(
       "agent",
       rev !== undefined ? `계획안(rev ${rev})을 승인했습니다.` : "계획을 승인했습니다.",
     );
     slot.store.planApproveSent();
-    slot.activity = "running";
-    runningSlotRef.current = slot;
-    eventSessionIdRef.current = slot.id;
-    bumpSessions();
     const sent = await clientRef.current?.send({
       type: "plan_approve",
       sessionId: slot.id,
@@ -1244,18 +1199,13 @@ export default function App() {
     if (!sent) {
       slot.store.errorReceived("계획 승인 요청을 처리하지 못했습니다.");
     }
-    settleExecution(slot);
-  }, [bumpSessions, selectedSlot, settleExecution]);
+  }, [selectedSlot]);
 
   const handleDecide = useCallback(
     async (decision: "accept" | "reject", ids: "all" | string[]) => {
       const slot = selectedSlot;
-      if (!slot || reviewOwnerRef.current !== slot) return;
+      if (!slot || slot.store.getState().phase !== "changeset_review") return;
       slot.store.decisionSent(decision, ids);
-      slot.activity = "running";
-      runningSlotRef.current = slot;
-      eventSessionIdRef.current = slot.id;
-      bumpSessions();
       const sent = await clientRef.current?.send({
         type: "changeset_decision",
         sessionId: slot.id,
@@ -1263,9 +1213,8 @@ export default function App() {
         ids,
       });
       if (!sent) slot.store.decisionFailed();
-      settleExecution(slot);
     },
-    [bumpSessions, selectedSlot, settleExecution],
+    [selectedSlot],
   );
 
   const handleWorkspaceSelect = useCallback(
@@ -1447,14 +1396,31 @@ export default function App() {
           updatedAt: slot.meta.updatedAt,
           activity: slot.activity,
           queuePosition: slot.queuePosition,
+          activityDetail:
+            slot.activity === "waiting_write"
+              ? waitingActivityDetail(
+                  slot,
+                  sessionsRef.current,
+                  activityClock,
+                )
+              : undefined,
           persisted: slot.persisted,
         })),
-    [sessionRevision],
+    [activityClock, sessionRevision],
   );
   const selectedActionBusy =
     messageActionBusy ||
-    selectedSlot?.activity === "queued" ||
+    selectedSlot?.activity === "waiting_write" ||
+    selectedSlot?.activity === "running_write" ||
     state.phase === "changeset_review";
+  const selectedWaitingDetail =
+    selectedSlot?.activity === "waiting_write"
+      ? waitingActivityDetail(
+          selectedSlot,
+          sessionsRef.current,
+          activityClock,
+        )
+      : null;
 
   if (setup?.setup_required || bootstrap.active) {
     return (
@@ -1526,11 +1492,20 @@ export default function App() {
             <span className="min-w-0 flex-1 truncate font-medium text-foreground">
               {selectedSlot.meta.name}
             </span>
-            {selectedSlot.activity === "queued" && (
-              <span className="text-sky-400">대기 {selectedSlot.queuePosition ?? ""}</span>
+            {selectedSlot.activity === "waiting_write" && (
+              <span
+                className="min-w-0 max-w-[65%] truncate text-right text-sky-400"
+                title={`쓰기 대기 ${selectedSlot.queuePosition ?? ""} · ${selectedWaitingDetail ?? "앞 작업 완료 대기"}`}
+              >
+                쓰기 대기 {selectedSlot.queuePosition ?? ""} ·{" "}
+                {selectedWaitingDetail ?? "앞 작업 완료 대기"}
+              </span>
             )}
-            {selectedSlot.activity === "running" && (
-              <span className="text-primary">실행 중</span>
+            {selectedSlot.activity === "running_read" && (
+              <span className="text-primary">분석 중</span>
+            )}
+            {selectedSlot.activity === "running_write" && (
+              <span className="text-primary">변경 중 · 쓰기 권한 획득</span>
             )}
             {selectedSlot.activity === "review" && (
               <span className="text-amber-400">검토 필요</span>
@@ -1548,13 +1523,14 @@ export default function App() {
           suggestionsEnabled={
             state.canSend &&
             !selectedActionBusy &&
-            selectedSlot?.activity !== "queued"
+            selectedSlot?.activity !== "waiting_write"
           }
           onEditMessage={handleEditMessage}
           editDisabled={
             messageActionBusy ||
             !selectedSlot ||
-            eventSessionIdRef.current !== selectedSlot.id
+            (selectedSlot.activity !== "idle" &&
+              selectedSlot.activity !== "error")
           }
         />
 

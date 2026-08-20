@@ -17,7 +17,13 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { cn } from "@/lib/utils";
 
-export type SessionActivity = "idle" | "queued" | "running" | "review" | "error";
+export type SessionActivity =
+  | "idle"
+  | "running_read"
+  | "waiting_write"
+  | "running_write"
+  | "review"
+  | "error";
 
 export interface SessionSidebarRow {
   id: string;
@@ -25,6 +31,7 @@ export interface SessionSidebarRow {
   updatedAt: number;
   activity: SessionActivity;
   queuePosition?: number;
+  activityDetail?: string;
   persisted: boolean;
 }
 
@@ -59,10 +66,16 @@ function readStoredWidth(): number {
 
 function activityLabel(row: SessionSidebarRow): string {
   switch (row.activity) {
-    case "queued":
-      return row.queuePosition ? `대기 ${row.queuePosition}` : "대기 중";
-    case "running":
-      return "실행 중";
+    case "waiting_write": {
+      const waiting = row.queuePosition
+        ? `쓰기 대기 ${row.queuePosition}`
+        : "쓰기 대기";
+      return row.activityDetail ? `${waiting} · ${row.activityDetail}` : waiting;
+    }
+    case "running_read":
+      return "분석 중";
+    case "running_write":
+      return "변경 중";
     case "review":
       return "검토 필요";
     case "error":
@@ -74,9 +87,10 @@ function activityLabel(row: SessionSidebarRow): string {
 
 function ActivityIcon({ activity }: { activity: SessionActivity }) {
   switch (activity) {
-    case "queued":
+    case "waiting_write":
       return <Clock3 className="size-3.5 text-sky-400" aria-hidden="true" />;
-    case "running":
+    case "running_read":
+    case "running_write":
       return (
         <LoaderCircle
           className="size-3.5 animate-spin text-primary motion-reduce:animate-none"
@@ -141,7 +155,13 @@ export function SessionSidebar({
   };
 
   const handleDelete = (row: SessionSidebarRow) => {
-    if (row.activity === "running" || row.activity === "review") return;
+    if (
+      row.activity === "running_read" ||
+      row.activity === "waiting_write" ||
+      row.activity === "running_write" ||
+      row.activity === "review"
+    )
+      return;
     if (window.confirm(`'${row.name}' 대화를 삭제할까요?`)) onDelete(row.id);
   };
 
@@ -303,9 +323,11 @@ export function SessionSidebar({
                           <span className="flex min-w-0 max-w-full items-center gap-1.5 overflow-hidden text-[10px] leading-4">
                             <span
                               className={cn(
-                                "shrink-0",
-                                row.activity === "running" && "text-primary",
-                                row.activity === "queued" && "text-sky-400",
+                                "min-w-0 truncate",
+                                (row.activity === "running_read" ||
+                                  row.activity === "running_write") &&
+                                  "text-primary",
+                                row.activity === "waiting_write" && "text-sky-400",
                                 row.activity === "review" && "text-amber-400",
                                 row.activity === "error" && "text-destructive",
                               )}
@@ -323,7 +345,7 @@ export function SessionSidebar({
                     )}
                   </button>
 
-                  {!collapsed && row.activity === "queued" && (
+                  {!collapsed && row.activity === "waiting_write" && (
                     <Button
                       type="button"
                       size="icon-sm"
@@ -336,7 +358,7 @@ export function SessionSidebar({
                     </Button>
                   )}
 
-                  {!collapsed && row.activity !== "queued" && (
+                  {!collapsed && row.activity !== "waiting_write" && (
                     <>
                       <Button
                         type="button"
@@ -354,7 +376,11 @@ export function SessionSidebar({
                         variant="ghost"
                         className="absolute right-1.5 top-1.5 size-8 opacity-0 focus-visible:opacity-100 group-hover:opacity-100"
                         aria-label={`${row.name} 삭제`}
-                        disabled={row.activity === "running" || row.activity === "review"}
+                        disabled={
+                          row.activity === "running_read" ||
+                          row.activity === "running_write" ||
+                          row.activity === "review"
+                        }
                         onClick={() => handleDelete(row)}
                       >
                         <Trash2 className="size-3.5" aria-hidden="true" />

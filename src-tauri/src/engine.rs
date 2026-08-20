@@ -5,6 +5,7 @@
 //! unit-testable without bridge, RAG, or Codex I/O.
 
 use std::{
+    collections::{HashMap, HashSet},
     fmt,
     path::PathBuf,
     sync::{
@@ -18,14 +19,16 @@ use crate::{
     attachment::{AttachmentContext, AttachmentStore},
     codex_client::{
         AppServerEvent, CodexAppServerClient, CodexModel, CodexModelSelection, CodexModelSettings,
-        CodexTurnInput,
+        CodexTurnInput, WorkspaceAccess,
     },
     ipc, journal,
-    tool_exec::ToolRuntime,
+    tool_exec::SessionToolRuntime,
     workspace::{
-        approved_plan_path, completion_worklog_path, WorkspaceManager, WorkspaceTurnRecorder,
+        approved_plan_path, completion_worklog_path, PreparedWorkspace, WorkspaceManager,
+        WorkspaceTurnRecorder,
     },
 };
+use parking_lot::Mutex as SyncMutex;
 use tauri::Emitter;
 use tokio::process::{ChildStdin, ChildStdout};
 
@@ -100,8 +103,7 @@ const EPS_PREFLIGHT_GUIDE: &str = r#"[eps preflight]
 
 const BUILD_GUIDE: &str = r#"[build]
 - After you APPLY eps/file changes (file_write/file_create/plugin_*), ALWAYS run build_run in the SAME turn to verify the project compiles. Code you never built is NOT done.
-- If build_run fails it returns structured errors (file/line/message): read them, fix the code, and build again. The server enforces a 3-attempt self-fix budget per request; when it is spent, STOP and report the remaining errors to the user verbatim.
-- build_errors re-reads the LAST build's errors without building.
+- build_run returns the complete structured result ({ok, errors with source/file/line/message/raw}); read it directly, fix the code, and build again on failure. The server enforces a 3-attempt self-fix budget per request; when it is spent, STOP and report the remaining errors to the user verbatim.
 - A failure whose message says no matching player exists (e.g. "연결맵에 조건에 맞는 플레이어가 없습니다") is a MAP setup problem, not an eps bug — fix it with player_setup (a Human controller AND a start location for at least one player), then rebuild."#;
 
 const MAP_LOCATION_GUIDE: &str = r#"[map locations]
@@ -179,8 +181,8 @@ pub(crate) trait CodexDriver {
     /// of `thread/start` (session restore primary path, decision E).
     async fn seed_thread_id(&mut self, id: String) -> Result<(), AgentEngineError>;
 
-    /// Current per-project workspace id, when the production driver prepared one.
-    fn current_workspace_id(&self) -> Option<String> {
+    /// Current session workspace prepared by the production driver.
+    fn current_workspace(&self) -> Option<PreparedWorkspace> {
         None
     }
 }
@@ -200,16 +202,10 @@ pub enum EngineEvent {
     /// panel can flip out of its connecting state. Carries nothing rendered raw
     /// (rules.md forbids raw kind identifiers as user-facing text).
     SessionLoaded(ipc::SessionLoadedEvent),
-    /// The active session changed (auto-created on a first turn, or opened): lets
-    /// the panel track/highlight the current session and target rename. Carries
-    /// the id + auto-derived name (a label, never rendered as a raw kind).
-    SessionActive(ipc::SessionActiveEvent),
 }
 
 pub(crate) trait EventSink {
     fn emit(&self, event: EngineEvent) -> Result<(), AgentEngineError>;
-
-    fn set_session_id(&self, _session_id: Option<String>) {}
 }
 
 /// Provides per-turn project memory rendering and best-effort episode recording.
@@ -331,8 +327,15 @@ enum Phase {
     Triage,
     Answer,
     PlanReview,
+    WaitingWrite,
     Executing,
     ChangesetReview,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WriteContinuation {
+    Direct,
+    ApprovedPlan,
 }
 
 pub(crate) struct AgentEngine<D: CodexDriver, S: EventSink> {
@@ -341,35 +344,30 @@ pub(crate) struct AgentEngine<D: CodexDriver, S: EventSink> {
     config: AgentEngineConfig,
     phase: Phase,
     thread_active: bool,
+    hydrated: bool,
     plan_revision: u32,
     current_plan_markdown: Option<String>,
     current_request_id: Option<String>,
     current_instruction_head: Option<String>,
-    current_session_id: Option<String>,
-    /// Condensed prior transcript staged by `open_session` when a saved thread was
-    /// seeded: the resume fallback (decision E) prepends it via `resume_turn_text`
-    /// if the first post-open turn's `thread/resume` errors or times out. Cleared
-    /// once the first post-open turn settles.
+    session_id: String,
+    project_id: String,
+    pending_write: Option<WriteContinuation>,
     pending_resume_transcript: Option<String>,
     session_store: crate::session::SessionStore,
     attachment_store: AttachmentStore,
     journal_store: journal::JournalStore,
     journal_data_dir: PathBuf,
-    runtime: ToolRuntime,
+    runtime: SessionToolRuntime,
 }
-
 impl<D: CodexDriver, S: EventSink> AgentEngine<D, S> {
-    /// Construct the engine over the SHARED tool runtime. The per-request gate
-    /// state and the change journal live in `runtime` (not in the engine) so the
-    /// MCP tool handler can reach them WHILE this engine holds its mutex across
-    /// `run_turn().await` — the codex turn during which tool calls arrive.
     pub fn new(
         driver: D,
         sink: S,
         config: AgentEngineConfig,
-        runtime: ToolRuntime,
+        runtime: SessionToolRuntime,
         session_store: crate::session::SessionStore,
         attachment_store: AttachmentStore,
+        session: crate::session::SessionRecord,
     ) -> Self {
         let journal_store = runtime.journal().clone();
         let journal_data_dir = runtime.app_data_dir();
@@ -379,11 +377,14 @@ impl<D: CodexDriver, S: EventSink> AgentEngine<D, S> {
             config,
             phase: Phase::Idle,
             thread_active: false,
+            hydrated: false,
             plan_revision: 0,
             current_plan_markdown: None,
             current_request_id: None,
             current_instruction_head: None,
-            current_session_id: None,
+            session_id: session.meta.id,
+            project_id: session.meta.project,
+            pending_write: None,
             pending_resume_transcript: None,
             session_store,
             attachment_store,
@@ -393,30 +394,19 @@ impl<D: CodexDriver, S: EventSink> AgentEngine<D, S> {
         }
     }
 
-    pub async fn chat_in_session(
-        &mut self,
-        session_id: &str,
-        req: ipc::ChatRequest,
-    ) -> Result<(), AgentEngineError> {
-        if self.current_session_id.as_deref() != Some(session_id) {
-            self.open_session(session_id).await?;
-        }
-        if matches!(self.phase, Phase::PlanReview | Phase::ChangesetReview) {
-            return Err(AgentEngineError::new(
-                "현재 세션의 계획 또는 변경사항 검토를 먼저 완료해 주세요.",
-            ));
-        }
-        self.chat(req).await
-    }
-
     pub async fn chat(&mut self, req: ipc::ChatRequest) -> Result<(), AgentEngineError> {
-        if matches!(self.phase, Phase::PlanReview | Phase::ChangesetReview) {
+        if matches!(
+            self.phase,
+            Phase::PlanReview | Phase::WaitingWrite | Phase::Executing | Phase::ChangesetReview
+        ) {
             return Err(AgentEngineError::new(
-                "현재 세션의 계획 또는 변경사항 검토를 먼저 완료해 주세요.",
+                "현재 세션의 진행 중인 요청 또는 검토를 먼저 완료해 주세요.",
             ));
         }
         let request_id = next_request_id();
-        self.runtime.begin_request(&request_id);
+        self.runtime
+            .begin_request(&request_id, &self.project_id)
+            .map_err(AgentEngineError::new)?;
         self.current_plan_markdown = None;
         self.current_request_id = Some(request_id);
         let session_seed = if req.text.trim().is_empty() && !req.attachments.is_empty() {
@@ -426,9 +416,6 @@ impl<D: CodexDriver, S: EventSink> AgentEngine<D, S> {
         };
         self.current_instruction_head = Some(take_chars(session_seed, EPISODE_INSTRUCTION_CHARS));
         self.phase = Phase::Triage;
-        // A conversation auto-becomes a saved session on its first turn (no save
-        // button); subsequent turns just update it.
-        self.ensure_active_session(session_seed);
         let attachment_context = self.resolve_attachments(&req.attachments)?;
         let plain_user_text = if req.text.trim().is_empty() && !req.attachments.is_empty() {
             "첨부한 파일을 분석해 주세요."
@@ -468,6 +455,7 @@ impl<D: CodexDriver, S: EventSink> AgentEngine<D, S> {
                     text: turn_text,
                     image_paths: attachment_context.image_paths,
                     workspace_root: None,
+                    workspace_access: WorkspaceAccess::Read,
                 },
                 &user_text,
             )
@@ -478,8 +466,17 @@ impl<D: CodexDriver, S: EventSink> AgentEngine<D, S> {
             true
         };
         let result = self.reinterpret_plan(result);
+        if let Some(ticket) = self.runtime.write_ticket() {
+            self.pending_write = Some(WriteContinuation::Direct);
+            self.phase = match ticket.state() {
+                crate::write_coordinator::TicketState::Granted => Phase::Executing,
+                crate::write_coordinator::TicketState::Waiting(_) => Phase::WaitingWrite,
+                crate::write_coordinator::TicketState::Cancelled => Phase::Idle,
+            };
+            self.update_active_session().await;
+            return Ok(());
+        }
         self.handle_turn_result(result)?;
-        self.emit_current_changeset_if_any()?;
         self.update_active_session().await;
         Ok(())
     }
@@ -567,6 +564,7 @@ impl<D: CodexDriver, S: EventSink> AgentEngine<D, S> {
                 text: turn_text,
                 image_paths,
                 workspace_root: None,
+                workspace_access: WorkspaceAccess::Read,
             })
             .await?;
         // The fresh thread is now live; subsequent turns resume normally.
@@ -582,10 +580,7 @@ impl<D: CodexDriver, S: EventSink> AgentEngine<D, S> {
     /// Best-effort: a missing/corrupt record or a failed write is logged, never
     /// surfaced as a chat error.
     async fn update_active_session(&mut self) {
-        let Some(session_id) = self.current_session_id.clone() else {
-            return;
-        };
-        let mut record = match self.session_store.load(&session_id) {
+        let mut record = match self.session_store.load(&self.session_id) {
             Ok(record) => record,
             Err(error) => {
                 eprintln!("eud-agent: active session reload failed: {error}");
@@ -650,6 +645,7 @@ impl<D: CodexDriver, S: EventSink> AgentEngine<D, S> {
                 text: turn_text,
                 image_paths: attachment_context.image_paths,
                 workspace_root: None,
+                workspace_access: WorkspaceAccess::Read,
             })
             .await?;
         self.thread_active = true;
@@ -658,47 +654,126 @@ impl<D: CodexDriver, S: EventSink> AgentEngine<D, S> {
     }
 
     pub async fn plan_approve(&mut self) -> Result<(), AgentEngineError> {
-        if self.runtime.current_request_id().is_none() {
+        if self.runtime.current_request_id().is_none() || self.current_plan_markdown.is_none() {
             return Err(AgentEngineError::new(
                 "no request is awaiting plan approval",
             ));
         }
+        let ticket = self
+            .runtime
+            .request_write_lane("approved plan execution")
+            .map_err(AgentEngineError::new)?;
+        self.pending_write = Some(WriteContinuation::ApprovedPlan);
+        self.phase = match ticket.state() {
+            crate::write_coordinator::TicketState::Granted => Phase::Executing,
+            crate::write_coordinator::TicketState::Waiting(_) => Phase::WaitingWrite,
+            crate::write_coordinator::TicketState::Cancelled => Phase::Idle,
+        };
+        Ok(())
+    }
+
+    pub async fn continue_pending_write(&mut self) -> Result<(), AgentEngineError> {
+        let ticket = self
+            .runtime
+            .write_ticket()
+            .ok_or_else(|| AgentEngineError::new("no write ticket is pending"))?;
+        if ticket.state() != crate::write_coordinator::TicketState::Granted
+            || !self.runtime.owns_write_lease()
+        {
+            return Err(AgentEngineError::new(
+                "the project write lease has not been granted",
+            ));
+        }
+        let continuation = self
+            .pending_write
+            .ok_or_else(|| AgentEngineError::new("no write continuation is pending"))?;
         let request_id = self
             .current_request_id
             .clone()
-            .ok_or_else(|| AgentEngineError::new("no request is awaiting plan approval"))?;
-        let markdown = self
-            .current_plan_markdown
-            .clone()
-            .ok_or_else(|| AgentEngineError::new("no plan is awaiting approval"))?;
-        if let Some(workspace_id) = self.driver.current_workspace_id() {
-            WorkspaceManager::new(self.runtime.data_dirs())
-                .record_plan_approval(&workspace_id, &request_id, self.plan_revision, &markdown)
-                .map_err(|error| AgentEngineError::new(error.to_string()))?;
-        }
-        self.runtime.approve_current_plan();
+            .ok_or_else(|| AgentEngineError::new("no request is awaiting write execution"))?;
         self.phase = Phase::Executing;
 
-        let instruction = approved_plan_execution_instruction(&request_id)?;
+        let (instruction, approved_markdown) = match continuation {
+            WriteContinuation::Direct => (
+                format!(
+                    "The FIFO project write lease is now granted for request `{request_id}`. \
+Re-read every mutation target because accepted project state may have changed while waiting. \
+Continue the requested change now, run the mandatory build, and stop only after verification."
+                ),
+                None,
+            ),
+            WriteContinuation::ApprovedPlan => {
+                let markdown = self
+                    .current_plan_markdown
+                    .clone()
+                    .ok_or_else(|| AgentEngineError::new("no plan is awaiting approval"))?;
+                let workspace = self.driver.current_workspace().ok_or_else(|| {
+                    AgentEngineError::new("the approved plan has no prepared project workspace")
+                })?;
+                WorkspaceManager::new(self.runtime.data_dirs())
+                    .record_plan_approval(&workspace.id, &request_id, self.plan_revision, &markdown)
+                    .map_err(|error| AgentEngineError::new(error.to_string()))?;
+                self.runtime.approve_current_plan();
+                (
+                    approved_plan_execution_instruction(&request_id)?,
+                    Some(markdown),
+                )
+            }
+        };
+
         let turn_text = self.resume_text(&instruction);
         let result = self
             .driver
-            .run_turn(CodexTurnInput::text(turn_text))
+            .run_turn(CodexTurnInput::text(turn_text).with_access(WorkspaceAccess::Write))
             .await?;
         self.thread_active = true;
         let result = self.reinterpret_plan(result);
-        let result = match self
-            .enforce_approved_plan_completion(&request_id, &markdown, result)
-            .await
-        {
-            Ok(result) => result,
-            Err(error) => {
-                self.emit_current_changeset_if_any()?;
-                return Err(error);
-            }
+        let result = if let Some(markdown) = approved_markdown.as_deref() {
+            self.enforce_approved_plan_completion(&request_id, markdown, result)
+                .await?
+        } else {
+            result
         };
         self.handle_turn_result(result)?;
-        self.emit_current_changeset_if_any()?;
+        self.pending_write = None;
+        self.settle_write_lifecycle()?;
+        self.update_active_session().await;
+        Ok(())
+    }
+
+    pub fn recover_write_failure(&mut self) -> Result<(), AgentEngineError> {
+        self.pending_write = None;
+        self.settle_write_lifecycle()
+    }
+
+    fn recover_read_failure(&mut self) -> Result<(), AgentEngineError> {
+        self.pending_write = None;
+        if self.emit_current_changeset_if_any()? {
+            self.phase = Phase::ChangesetReview;
+            self.runtime
+                .emit_activity(crate::write_coordinator::SessionActivity::Review, None);
+            return Ok(());
+        }
+        self.runtime
+            .abort_unmutated_write_intent()
+            .map_err(AgentEngineError::new)?;
+        self.runtime.clear_current();
+        self.current_request_id = None;
+        self.phase = Phase::Idle;
+        Ok(())
+    }
+
+    fn settle_write_lifecycle(&mut self) -> Result<(), AgentEngineError> {
+        if self.emit_current_changeset_if_any()? {
+            self.phase = Phase::ChangesetReview;
+            self.runtime
+                .emit_activity(crate::write_coordinator::SessionActivity::Review, None);
+        } else {
+            self.runtime
+                .release_write_lease()
+                .map_err(AgentEngineError::new)?;
+            self.phase = Phase::Idle;
+        }
         Ok(())
     }
 
@@ -708,7 +783,7 @@ impl<D: CodexDriver, S: EventSink> AgentEngine<D, S> {
         approved_markdown: &str,
         mut result: CodexTurnResult,
     ) -> Result<CodexTurnResult, AgentEngineError> {
-        let Some(workspace_id) = self.driver.current_workspace_id() else {
+        let Some(workspace) = self.driver.current_workspace() else {
             return Ok(result);
         };
         let manager = WorkspaceManager::new(self.runtime.data_dirs());
@@ -718,7 +793,7 @@ impl<D: CodexDriver, S: EventSink> AgentEngine<D, S> {
                 return Ok(result);
             }
             let gaps = manager
-                .completion_doc_gaps(&workspace_id, request_id, approved_markdown)
+                .completion_doc_gaps_for_workspace(&workspace, request_id, approved_markdown)
                 .map_err(|error| {
                     AgentEngineError::new(format!(
                         "project wiki completion validation failed: {error}"
@@ -738,7 +813,7 @@ impl<D: CodexDriver, S: EventSink> AgentEngine<D, S> {
             let turn_text = self.resume_text(&instruction);
             result = self
                 .driver
-                .run_turn(CodexTurnInput::text(turn_text))
+                .run_turn(CodexTurnInput::text(turn_text).with_access(WorkspaceAccess::Write))
                 .await?;
             self.thread_active = true;
             result = self.reinterpret_plan(result);
@@ -757,66 +832,77 @@ impl<D: CodexDriver, S: EventSink> AgentEngine<D, S> {
             .clone()
             .ok_or_else(|| AgentEngineError::new("no active request has a changeset"))?;
         let ids = rollback_ids(&req.ids);
-
-        // A per-item accept must NOT archive the whole journal. The journal only supports
-        // accept-all (archive) or reject(ids); so a partial accept is recorded as a no-op
-        // here, leaving the remaining items pending and still rejectable (undecided items
-        // default-accept on the next request — EUD-070). Only accept-all and rejects
-        // finalize the journal.
-        let partial_accept = matches!(
-            (&req.decision, &req.ids),
-            (ipc::Decision::Accept, ipc::DecisionIds::List(_))
-        );
+        let decision_ids = match &req.ids {
+            ipc::DecisionIds::All(_) => journal::DecisionIds::All,
+            ipc::DecisionIds::List(ids) => journal::DecisionIds::Items(ids.clone()),
+        };
         let episode_decision = changeset_episode_decision(&req);
         let episode_summary = self.journal_summary(&request_id);
-        // Capture accepted dat edits for the wiki BEFORE a full accept archives the
-        // journal (which removes it from the in-memory store).
         let accepted_wiki_entries = self.collect_accepted_wiki_entries(&request_id, &req);
         let accepted_workspace_entries = self.collect_accepted_workspace_entries(&request_id, &req);
-        let ok = if partial_accept {
-            true
-        } else {
-            let decision = journal_decision(req);
-            let bridge = WorkspaceJournalBridge {
-                workspace: crate::workspace::WorkspaceManager::new(self.runtime.data_dirs()),
-            };
-            self.journal_store
-                .decide(&request_id, decision, &bridge)
-                .is_ok()
-        };
+
+        let outcome: Result<bool, AgentEngineError> = (|| match req.decision {
+            ipc::Decision::Accept => {
+                WorkspaceManager::new(self.runtime.data_dirs())
+                    .record_accepted_entries(&request_id, &accepted_workspace_entries)
+                    .map_err(|error| AgentEngineError::new(error.to_string()))?;
+                if let Some(payload) = self.record_accepted_wiki_edits(accepted_wiki_entries) {
+                    self.sink.emit(EngineEvent::Wiki(payload))?;
+                }
+                self.journal_store
+                    .accept_entries(&request_id, &decision_ids)
+                    .map_err(|error| AgentEngineError::new(error.to_string()))
+            }
+            ipc::Decision::Reject => {
+                let bridge = WorkspaceJournalBridge {
+                    workspace: WorkspaceManager::new(self.runtime.data_dirs()),
+                };
+                self.journal_store
+                    .decide(
+                        &request_id,
+                        journal::ChangesetDecision::Reject(decision_ids.clone()),
+                        &bridge,
+                    )
+                    .map_err(|error| AgentEngineError::new(error.to_string()))?;
+                if matches!(decision_ids, journal::DecisionIds::All) {
+                    Ok(true)
+                } else {
+                    self.journal_store
+                        .archive_if_empty(&request_id)
+                        .map_err(|error| AgentEngineError::new(error.to_string()))
+                }
+            }
+        })();
+        let settled = outcome.as_ref().copied().unwrap_or(false);
+        let ok = outcome.is_ok();
 
         self.sink
             .emit(EngineEvent::RollbackResult(ipc::RollbackResultEvent {
                 ids,
                 ok,
             }))?;
-        if ok {
-            self.append_changeset_episode_with_summary(
-                &request_id,
-                episode_decision,
-                episode_summary,
-            );
-            // Record ONLY accepted dat edits to the per-project wiki ledger, then
-            // emit the updated ledger so the panel stays in sync. Rejects never
-            // reach here with an Accept decision, so the ledger never sees a
-            // rolled-back value. The changeset/journal are read BEFORE this point
-            // (the full-accept archive above already removed the in-memory journal,
-            // so they were captured into `accepted_wiki_entries` earlier).
-            if let Some(payload) = self.record_accepted_wiki_edits(accepted_wiki_entries) {
-                self.sink.emit(EngineEvent::Wiki(payload))?;
-            }
-            WorkspaceManager::new(self.runtime.data_dirs())
-                .record_accepted_entries(&request_id, &accepted_workspace_entries)
-                .map_err(|error| AgentEngineError::new(error.to_string()))?;
+        if outcome.is_err() {
+            self.phase = Phase::ChangesetReview;
+            self.runtime
+                .emit_activity(crate::write_coordinator::SessionActivity::Review, None);
+            self.update_active_session().await;
+            return Ok(());
         }
-        self.phase = Phase::Idle;
-        // A finalized (archived) journal is no longer a reconnect target: drop its
-        // req-id from the active session record so a later open does not try to
-        // rehydrate a gone changeset. A partial accept leaves the journal live, so
-        // skip it; an `ok` accept-all / reject finalized it.
-        if ok && !partial_accept {
+
+        self.append_changeset_episode_with_summary(&request_id, episode_decision, episode_summary);
+        if settled {
+            self.runtime
+                .release_write_lease()
+                .map_err(AgentEngineError::new)?;
+            self.phase = Phase::Idle;
             self.drop_pending_request_from_session(&request_id);
+            self.current_request_id = None;
+        } else {
+            self.phase = Phase::ChangesetReview;
+            self.runtime
+                .emit_activity(crate::write_coordinator::SessionActivity::Review, None);
         }
+        self.update_active_session().await;
         Ok(())
     }
 
@@ -824,10 +910,7 @@ impl<D: CodexDriver, S: EventSink> AgentEngine<D, S> {
     /// (decision C: the reconnect list). Best-effort and a no-op when no session is
     /// active or the record is gone.
     fn drop_pending_request_from_session(&mut self, request_id: &str) {
-        let Some(session_id) = self.current_session_id.clone() else {
-            return;
-        };
-        let Ok(mut record) = self.session_store.load(&session_id) else {
+        let Ok(mut record) = self.session_store.load(&self.session_id) else {
             return;
         };
         let before = record.pending_request_ids.len();
@@ -875,18 +958,19 @@ impl<D: CodexDriver, S: EventSink> AgentEngine<D, S> {
         req: &ipc::ChangesetDecisionRequest,
     ) -> Vec<journal::JournalEntry> {
         let ids = match (&req.decision, &req.ids) {
-            (ipc::Decision::Accept, ipc::DecisionIds::All(_)) => None,
-            (ipc::Decision::Accept, ipc::DecisionIds::List(ids)) => Some(ids),
+            (ipc::Decision::Accept, ipc::DecisionIds::All(_)) => journal::DecisionIds::All,
+            (ipc::Decision::Accept, ipc::DecisionIds::List(ids)) => {
+                journal::DecisionIds::Items(ids.clone())
+            }
             (ipc::Decision::Reject, _) => return Vec::new(),
         };
-        self.load_journal(request_id)
-            .map(|journal| {
-                journal
-                    .entries
+        self.journal_store
+            .selected_entries(request_id, &ids)
+            .map(|entries| {
+                entries
                     .into_iter()
                     .filter(|entry| {
                         matches!(entry.target, journal::JournalTarget::WorkspacePath { .. })
-                            && ids.map_or(true, |ids| ids.iter().any(|id| id == &entry.id))
                     })
                     .collect()
             })
@@ -922,9 +1006,12 @@ impl<D: CodexDriver, S: EventSink> AgentEngine<D, S> {
     /// selected by a message edit. The active saved session is retained, while
     /// the next chat starts a fresh Codex thread seeded from that prefix.
     pub async fn rewind(&mut self, panel_log: serde_json::Value) -> Result<(), AgentEngineError> {
-        if matches!(self.phase, Phase::PlanReview | Phase::ChangesetReview) {
+        if matches!(
+            self.phase,
+            Phase::PlanReview | Phase::WaitingWrite | Phase::Executing | Phase::ChangesetReview
+        ) {
             return Err(AgentEngineError::new(
-                "현재 세션의 계획 또는 변경사항 검토를 먼저 완료해 주세요.",
+                "현재 세션의 진행 중인 요청 또는 검토를 먼저 완료해 주세요.",
             ));
         }
         self.driver.reset_thread().await?;
@@ -938,79 +1025,18 @@ impl<D: CodexDriver, S: EventSink> AgentEngine<D, S> {
         let transcript = condense_transcript(&panel_log);
         self.pending_resume_transcript = (!transcript.trim().is_empty()).then_some(transcript);
 
-        if let Some(session_id) = self.current_session_id.clone() {
-            let mut record = self
-                .session_store
-                .load(&session_id)
-                .map_err(|error| AgentEngineError::new(error.to_string()))?;
-            record.thread_id = None;
-            record.pending_request_ids.clear();
-            record.panel_log = panel_log;
-            record.meta.updated_at = crate::session::now_unix_seconds();
-            self.session_store
-                .save(&record)
-                .map_err(|error| AgentEngineError::new(error.to_string()))?;
-        }
-        Ok(())
-    }
-
-    /// Create a persisted, inactive conversation for the session sidebar. The
-    /// first queued turn activates it; creating a tab never interrupts another
-    /// session's running turn or review.
-    pub fn create_session(
-        &self,
-        first_text: &str,
-    ) -> Result<crate::session::SessionRecord, AgentEngineError> {
-        let now = crate::session::now_unix_seconds();
-        let record = crate::session::SessionRecord {
-            meta: crate::session::SessionMeta {
-                id: crate::session::new_session_id(),
-                name: auto_session_name(first_text),
-                project: self.current_project_name(),
-                created_at: now,
-                updated_at: now,
-            },
-            thread_id: None,
-            pending_request_ids: Vec::new(),
-            panel_log: serde_json::Value::Null,
-        };
+        let mut record = self
+            .session_store
+            .load(&self.session_id)
+            .map_err(|error| AgentEngineError::new(error.to_string()))?;
+        record.thread_id = None;
+        record.pending_request_ids.clear();
+        record.panel_log = panel_log;
+        record.meta.updated_at = crate::session::now_unix_seconds();
         self.session_store
             .save(&record)
             .map_err(|error| AgentEngineError::new(error.to_string()))?;
-        Ok(record)
-    }
-
-    fn require_current_session(&self, id: &str) -> Result<(), AgentEngineError> {
-        if self.current_session_id.as_deref() == Some(id) {
-            Ok(())
-        } else {
-            Err(AgentEngineError::new(
-                "선택한 세션은 현재 프로젝트 실행 레인을 소유하지 않습니다.",
-            ))
-        }
-    }
-
-    /// Backward-compatible first-turn creation for direct engine callers. The
-    /// multi-session panel creates the record before queueing the turn.
-    fn ensure_active_session(&mut self, first_text: &str) {
-        if self.current_session_id.is_some() {
-            return;
-        }
-        let record = match self.create_session(first_text) {
-            Ok(record) => record,
-            Err(error) => {
-                eprintln!("eud-agent: session auto-create failed: {error}");
-                return;
-            }
-        };
-        self.current_session_id = Some(record.meta.id.clone());
-        self.sink.set_session_id(Some(record.meta.id.clone()));
-        let _ = self
-            .sink
-            .emit(EngineEvent::SessionActive(ipc::SessionActiveEvent {
-                id: record.meta.id,
-                name: record.meta.name,
-            }));
+        Ok(())
     }
 
     fn resolve_attachments(&self, ids: &[String]) -> Result<AttachmentContext, AgentEngineError> {
@@ -1020,122 +1046,59 @@ impl<D: CodexDriver, S: EventSink> AgentEngine<D, S> {
                 text_files: Vec::new(),
             });
         }
-        let session_id = self
-            .current_session_id
-            .as_deref()
-            .ok_or_else(|| AgentEngineError::new("첨부 파일을 저장할 대화를 만들지 못했습니다."))?;
         self.attachment_store
-            .bind_and_resolve(ids, session_id)
+            .bind_and_resolve(ids, &self.session_id)
             .map_err(AgentEngineError::new)
     }
 
-    /// Activate a saved session for the project's single execution lane. Merely
-    /// selecting a sidebar row uses `session_load` and never calls this method.
-    /// A different session cannot take the lane while the current owner has a
-    /// plan or live changeset awaiting review.
-    pub async fn open_session(
-        &mut self,
-        id: &str,
-    ) -> Result<crate::session::SessionRecord, AgentEngineError> {
+    /// Hydrate this worker's persisted thread and pending review exactly once.
+    /// No other session is reset or activated.
+    pub async fn hydrate(&mut self) -> Result<crate::session::SessionRecord, AgentEngineError> {
         let record = self
             .session_store
-            .load(id)
+            .load(&self.session_id)
             .map_err(|error| AgentEngineError::new(error.to_string()))?;
-
-        if self.current_session_id.as_deref() == Some(id) {
-            self.sink.set_session_id(Some(record.meta.id.clone()));
-            self.sink
-                .emit(EngineEvent::SessionActive(ipc::SessionActiveEvent {
-                    id: record.meta.id.clone(),
-                    name: record.meta.name.clone(),
-                }))?;
+        if self.hydrated {
             self.sink
                 .emit(EngineEvent::SessionLoaded(ipc::SessionLoadedEvent {
-                    id: record.meta.id.clone(),
+                    id: self.session_id.clone(),
                 }))?;
             return Ok(record);
         }
-        if matches!(self.phase, Phase::PlanReview | Phase::ChangesetReview)
-            || !self.live_pending_request_ids().is_empty()
-        {
-            return Err(AgentEngineError::new(
-                "현재 세션의 계획 또는 변경사항 검토를 먼저 완료해 주세요.",
-            ));
-        }
 
-        self.update_active_session().await;
-        self.driver.reset_thread().await?;
-        self.thread_active = false;
-        self.phase = Phase::Idle;
-        self.current_plan_markdown = None;
-        self.runtime.clear_current();
-        self.current_request_id = None;
-        self.current_instruction_head = None;
-        self.current_session_id = None;
-        self.sink.set_session_id(None);
-        self.pending_resume_transcript = None;
-
-        // Primary path: seed the saved thread_id so the next chat resumes it. On
-        // success arm `thread_active` + stage a condensed transcript so the first
-        // post-open turn can fall back to a fresh start (decision E). On a seed
-        // error, leave the thread fresh and replay the transcript on the next turn.
-        // Stage the condensed prior conversation so it can be replayed into a fresh
-        // thread when a real resume is unavailable (decision E). Empty when there is
-        // no conversation to replay.
         let transcript = condense_transcript(&record.panel_log);
         let staged = (!transcript.is_empty()).then_some(transcript);
         if let Some(thread_id) = record.thread_id.clone() {
             match self.driver.seed_thread_id(thread_id).await {
                 Ok(()) => {
-                    // Resume on the next chat; the transcript is the fallback payload.
                     self.thread_active = true;
                     self.pending_resume_transcript = staged;
                 }
                 Err(error) => {
-                    // No usable thread: the next chat starts fresh and replays directly.
                     eprintln!("eud-agent: thread seed failed, will replay transcript: {error}");
                     self.thread_active = false;
                     self.pending_resume_transcript = staged;
                 }
             }
         } else if staged.is_some() {
-            // No persisted codex thread exists, but the panel log can still seed a
-            // fresh conversation on the next turn.
-            self.thread_active = false;
             self.pending_resume_transcript = staged;
         }
-        self.current_session_id = Some(record.meta.id.clone());
-        self.sink.set_session_id(Some(record.meta.id.clone()));
-        self.reconnect_pending_changeset(&record);
 
-        // Mark it active so the panel highlights it (id + current name).
-        self.sink
-            .emit(EngineEvent::SessionActive(ipc::SessionActiveEvent {
-                id: record.meta.id.clone(),
-                name: record.meta.name.clone(),
-            }))?;
-
+        if let Some(request_id) = record.pending_request_ids.first() {
+            self.runtime
+                .begin_request(request_id, &self.project_id)
+                .map_err(AgentEngineError::new)?;
+            self.runtime
+                .restore_review(&self.project_id, request_id)
+                .map_err(AgentEngineError::new)?;
+            self.reconnect_pending_changeset(&record);
+        }
+        self.hydrated = true;
         self.sink
             .emit(EngineEvent::SessionLoaded(ipc::SessionLoadedEvent {
-                id: record.meta.id.clone(),
+                id: self.session_id.clone(),
             }))?;
-
         Ok(record)
-    }
-
-    /// Delete a saved session; if it is the active session, detach.
-    pub fn delete_session(&mut self, id: &str) -> Result<(), AgentEngineError> {
-        self.session_store
-            .delete(id)
-            .map_err(|error| AgentEngineError::new(error.to_string()))?;
-        if let Err(error) = self.attachment_store.delete_session(id) {
-            eprintln!("eud-agent: session attachment cleanup failed: {error}");
-        }
-        if self.current_session_id.as_deref() == Some(id) {
-            self.current_session_id = None;
-            self.sink.set_session_id(None);
-        }
-        Ok(())
     }
 
     /// Reconnect the single pending (un-archived) changeset for an opened session
@@ -1181,12 +1144,6 @@ impl<D: CodexDriver, S: EventSink> AgentEngine<D, S> {
         }
     }
 
-    /// The current editor project name, parsed from the live `[project state]`
-    /// render (`project=<name>`). Empty when no project / no provider is wired.
-    fn current_project_name(&self) -> String {
-        project_name_from_state(&self.config.project_state_for_prompt())
-    }
-
     fn resume_text(&self, text: &str) -> String {
         let memory = self.config.project_memory_for_prompt();
         let wiki = self.config.wiki_section_for_prompt(text);
@@ -1227,18 +1184,18 @@ impl<D: CodexDriver, S: EventSink> AgentEngine<D, S> {
         Ok(())
     }
 
-    fn emit_current_changeset_if_any(&mut self) -> Result<(), AgentEngineError> {
+    fn emit_current_changeset_if_any(&mut self) -> Result<bool, AgentEngineError> {
         if self.phase == Phase::PlanReview {
-            return Ok(());
+            return Ok(false);
         }
         let Some(request_id) = self.current_request_id.as_deref() else {
-            return Ok(());
+            return Ok(false);
         };
         let Ok(changeset) = self.journal_store.changeset(request_id) else {
-            return Ok(());
+            return Ok(false);
         };
         if changeset.items.is_empty() {
-            return Ok(());
+            return Ok(false);
         }
 
         self.phase = Phase::ChangesetReview;
@@ -1250,7 +1207,8 @@ impl<D: CodexDriver, S: EventSink> AgentEngine<D, S> {
                 .enumerate()
                 .map(|(index, item)| ipc_changeset_item(index, item))
                 .collect(),
-        }))
+        }))?;
+        Ok(true)
     }
 
     fn append_answer_episode_if_no_changeset(&self) {
@@ -1308,23 +1266,22 @@ impl<D: CodexDriver, S: EventSink> AgentEngine<D, S> {
 #[derive(Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct SessionEvent<T> {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    session_id: Option<String>,
+    session_id: String,
     #[serde(flatten)]
     payload: T,
 }
 
 #[derive(Clone)]
-pub(crate) struct TauriEventSink {
+pub(crate) struct SessionEventSink {
     app: tauri::AppHandle,
-    session_id: Arc<std::sync::RwLock<Option<String>>>,
+    session_id: String,
 }
 
-impl TauriEventSink {
-    pub(crate) fn new(app: tauri::AppHandle) -> Self {
+impl SessionEventSink {
+    pub(crate) fn new(app: tauri::AppHandle, session_id: impl Into<String>) -> Self {
         Self {
             app,
-            session_id: Arc::new(std::sync::RwLock::new(None)),
+            session_id: session_id.into(),
         }
     }
 
@@ -1332,22 +1289,17 @@ impl TauriEventSink {
     where
         T: serde::Serialize + Clone,
     {
-        let session_id = self
-            .session_id
-            .read()
-            .ok()
-            .and_then(|current| current.clone());
         self.app.emit(
             name,
             SessionEvent {
-                session_id,
+                session_id: self.session_id.clone(),
                 payload,
             },
         )
     }
 }
 
-impl EventSink for TauriEventSink {
+impl EventSink for SessionEventSink {
     fn emit(&self, event: EngineEvent) -> Result<(), AgentEngineError> {
         let result = match event {
             EngineEvent::Agent(payload) => self.emit_scoped("agent_event", payload),
@@ -1360,28 +1312,23 @@ impl EventSink for TauriEventSink {
             EngineEvent::Status(payload) => ipc::emit_status(&self.app, payload),
             EngineEvent::Wiki(payload) => ipc::emit_wiki(&self.app, payload),
             EngineEvent::SessionLoaded(payload) => ipc::emit_session_loaded(&self.app, payload),
-            EngineEvent::SessionActive(payload) => ipc::emit_session_active(&self.app, payload),
         };
         result.map_err(|err| AgentEngineError::new(format!("failed to emit event: {err}")))
-    }
-
-    fn set_session_id(&self, session_id: Option<String>) {
-        if let Ok(mut current) = self.session_id.write() {
-            *current = session_id;
-        }
     }
 }
 
 pub(crate) struct ProductionCodexDriver {
     fallback_cwd: PathBuf,
     client_cwd: Option<PathBuf>,
-    sink: TauriEventSink,
+    client_access: Option<WorkspaceAccess>,
+    session_id: String,
+    sink: SessionEventSink,
     mcp_port: u16,
     dirs: crate::config::DataDirs,
-    runtime: ToolRuntime,
+    runtime: SessionToolRuntime,
     workspace: WorkspaceManager,
     model_selection: Option<CodexModelSelection>,
-    active_workspace_id: Option<String>,
+    active_workspace: Option<PreparedWorkspace>,
     client: Option<CodexAppServerClient<ChildStdout, ChildStdin>>,
     events: Option<tokio::sync::mpsc::Receiver<AppServerEvent>>,
     cancellation: tokio::sync::watch::Receiver<u64>,
@@ -1389,11 +1336,12 @@ pub(crate) struct ProductionCodexDriver {
 
 impl ProductionCodexDriver {
     pub(crate) fn new(
+        session_id: impl Into<String>,
         cwd: impl Into<PathBuf>,
-        sink: TauriEventSink,
+        sink: SessionEventSink,
         mcp_port: u16,
         dirs: crate::config::DataDirs,
-        runtime: ToolRuntime,
+        runtime: SessionToolRuntime,
         cancellation: tokio::sync::watch::Receiver<u64>,
     ) -> Self {
         let model_selection = dirs.load_config().ok().and_then(|config| {
@@ -1412,12 +1360,14 @@ impl ProductionCodexDriver {
         Self {
             fallback_cwd: cwd.into(),
             client_cwd: None,
+            client_access: None,
+            session_id: session_id.into(),
             sink,
             mcp_port,
             workspace: WorkspaceManager::new(dirs.clone()),
             dirs,
             runtime,
-            active_workspace_id: None,
+            active_workspace: None,
             model_selection,
             client: None,
             events: None,
@@ -1425,8 +1375,15 @@ impl ProductionCodexDriver {
         }
     }
 
-    async fn ensure_client_at(&mut self, cwd: PathBuf) -> Result<(), AgentEngineError> {
-        if self.client.is_some() && self.client_cwd.as_ref() == Some(&cwd) {
+    async fn ensure_client_at(
+        &mut self,
+        cwd: PathBuf,
+        access: WorkspaceAccess,
+    ) -> Result<(), AgentEngineError> {
+        if self.client.is_some()
+            && self.client_cwd.as_ref() == Some(&cwd)
+            && self.client_access == Some(access)
+        {
             return Ok(());
         }
         let retained_thread_id = match self.client.as_ref() {
@@ -1436,21 +1393,24 @@ impl ProductionCodexDriver {
         self.client = None;
         self.events = None;
 
-        let (mut client, events) = CodexAppServerClient::spawn_app_server(&cwd, self.mcp_port)
-            .await
-            .map_err(|err| AgentEngineError::new(err.to_string()))?;
+        let (mut client, events) =
+            CodexAppServerClient::spawn_app_server(&cwd, self.mcp_port, access)
+                .await
+                .map_err(|err| AgentEngineError::new(err.to_string()))?;
         client.set_model_selection(self.model_selection.clone());
         if let Some(thread_id) = retained_thread_id {
             client.set_thread_id(thread_id).await;
         }
         self.client_cwd = Some(cwd);
+        self.client_access = Some(access);
         self.client = Some(client);
         self.events = Some(events);
         Ok(())
     }
 
     async fn ensure_client(&mut self) -> Result<(), AgentEngineError> {
-        self.ensure_client_at(self.fallback_cwd.clone()).await
+        self.ensure_client_at(self.fallback_cwd.clone(), WorkspaceAccess::Read)
+            .await
     }
 
     async fn fetch_models(&mut self) -> Result<Vec<CodexModel>, AgentEngineError> {
@@ -1575,26 +1535,42 @@ impl CodexDriver for ProductionCodexDriver {
             .runtime
             .current_request_id()
             .ok_or_else(|| AgentEngineError::new("no request is open for the Codex workspace"))?;
+        let access = input.workspace_access;
+        if access == WorkspaceAccess::Write && !self.runtime.owns_write_lease() {
+            return Err(AgentEngineError::new(
+                "write-mode Codex execution requires the project write lease",
+            ));
+        }
         let workspace_manager = self.workspace.clone();
         let baseline_request = request_id.clone();
+        let session_id = self.session_id.clone();
         let (workspace, baseline) = tokio::task::spawn_blocking(move || {
-            let workspace = workspace_manager.prepare_current()?;
-            let baseline = workspace_manager
-                .begin_turn(&workspace, &baseline_request)
-                .map_err(|error| error.to_string())?;
+            let workspace = workspace_manager.prepare_session_current(&session_id)?;
+            let baseline = if access == WorkspaceAccess::Write {
+                Some(
+                    workspace_manager
+                        .begin_turn(&workspace, &baseline_request)
+                        .map_err(|error| error.to_string())?,
+                )
+            } else {
+                None
+            };
             Ok::<_, String>((workspace, baseline))
         })
         .await
         .map_err(|error| AgentEngineError::new(error.to_string()))?
         .map_err(AgentEngineError::new)?;
-        self.active_workspace_id = Some(workspace.id.clone());
-        let mut workspace_recorder = WorkspaceTurnRecorder::new(
-            self.workspace.clone(),
-            baseline,
-            self.runtime.journal().clone(),
-        );
+        self.active_workspace = Some(workspace.clone());
+        let mut workspace_recorder = baseline.map(|baseline| {
+            WorkspaceTurnRecorder::new(
+                self.workspace.clone(),
+                baseline,
+                self.runtime.journal().clone(),
+            )
+        });
 
-        self.ensure_client_at(workspace.root.clone()).await?;
+        self.ensure_client_at(workspace.root.clone(), access)
+            .await?;
         if *cancellation.borrow() != cancellation_generation {
             return Ok(CodexTurnResult::Cancelled);
         }
@@ -1644,9 +1620,11 @@ impl CodexDriver for ProductionCodexDriver {
 
         loop {
             if run_finished && turn_complete_seen {
-                workspace_recorder
-                    .finish()
-                    .map_err(|error| AgentEngineError::new(error.to_string()))?;
+                if let Some(recorder) = workspace_recorder.as_mut() {
+                    recorder
+                        .finish()
+                        .map_err(|error| AgentEngineError::new(error.to_string()))?;
+                }
                 return if interrupted {
                     Ok(CodexTurnResult::Cancelled)
                 } else {
@@ -1761,6 +1739,7 @@ impl CodexDriver for ProductionCodexDriver {
         self.client = None;
         self.events = None;
         self.client_cwd = None;
+        self.client_access = None;
         Ok(())
     }
 
@@ -1781,216 +1760,661 @@ impl CodexDriver for ProductionCodexDriver {
         Ok(())
     }
 
-    fn current_workspace_id(&self) -> Option<String> {
-        self.active_workspace_id.clone()
+    fn current_workspace(&self) -> Option<PreparedWorkspace> {
+        self.active_workspace.clone()
     }
 }
 
-impl<S: EventSink> AgentEngine<ProductionCodexDriver, S> {
-    async fn codex_model_settings(&mut self) -> Result<CodexModelSettings, AgentEngineError> {
-        self.driver.model_settings().await
-    }
-
-    async fn save_codex_model_settings(
-        &mut self,
-        model: String,
-        reasoning_effort: String,
-    ) -> Result<CodexModelSettings, AgentEngineError> {
-        self.driver
-            .save_model_settings(model, reasoning_effort)
-            .await
-    }
-}
-
-pub(crate) struct ManagedAgentEngine {
-    engine: tokio::sync::Mutex<AgentEngine<ProductionCodexDriver, TauriEventSink>>,
-    sessions: crate::session::SessionStore,
+pub(crate) struct SessionWorker {
+    engine: tokio::sync::Mutex<AgentEngine<ProductionCodexDriver, SessionEventSink>>,
     cancellation: tokio::sync::watch::Sender<u64>,
+    runtime: SessionToolRuntime,
+    _mcp: crate::mcp::McpServerHandle,
 }
 
-impl ManagedAgentEngine {
+fn cancel_worker_generation(
+    cancellation: &tokio::sync::watch::Sender<u64>,
+) -> Result<(), AgentEngineError> {
+    let generation = (*cancellation.borrow())
+        .checked_add(1)
+        .ok_or_else(|| AgentEngineError::new("turn cancellation generation overflow"))?;
+    cancellation.send_replace(generation);
+    Ok(())
+}
+
+#[derive(Clone)]
+pub(crate) struct SessionEngineManager {
+    inner: Arc<SessionEngineManagerInner>,
+}
+
+struct SessionEngineManagerInner {
+    workers: tokio::sync::Mutex<HashMap<String, Arc<SessionWorker>>>,
+    sessions: crate::session::SessionStore,
+    attachments: AttachmentStore,
+    services: crate::tool_exec::ToolServices,
+    config: AgentEngineConfig,
+    app: tauri::AppHandle,
+    dirs: crate::config::DataDirs,
+    fallback_cwd: PathBuf,
+    recovered_projects: SyncMutex<HashMap<String, Result<(), String>>>,
+    scheduled_writes: SyncMutex<HashSet<String>>,
+    settings_lock: tokio::sync::Mutex<()>,
+}
+
+fn restore_pending_review(
+    sessions: &crate::session::SessionStore,
+    dirs: &crate::config::DataDirs,
+    writes: &crate::write_coordinator::ProjectWriteCoordinator,
+    project_id: &str,
+) -> Result<(), String> {
+    let mut pending = Vec::new();
+    for meta in sessions
+        .list()
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .filter(|meta| meta.project == project_id)
+    {
+        let mut record = sessions.load(&meta.id).map_err(|error| error.to_string())?;
+        let pending_before = record.pending_request_ids.len();
+        record.pending_request_ids.retain(|request_id| {
+            let live_journal_missing = matches!(
+                journal::JournalStore::load(dirs.app_data(), request_id),
+                Err(journal::JournalError::Io(error))
+                    if error.kind() == std::io::ErrorKind::NotFound
+            );
+            !(live_journal_missing
+                && journal::JournalStore::archived_exists(dirs.app_data(), request_id))
+        });
+        if record.pending_request_ids.len() != pending_before {
+            sessions.save(&record).map_err(|error| error.to_string())?;
+        }
+        for request_id in record.pending_request_ids {
+            pending.push((record.meta.id.clone(), request_id));
+        }
+    }
+    if pending.len() > 1 {
+        return Err(format!(
+            "project `{project_id}` has {} conflicting pending writers; recovery requires exactly one",
+            pending.len()
+        ));
+    }
+    if let Some((session_id, request_id)) = pending.pop() {
+        let journal =
+            journal::JournalStore::load(dirs.app_data(), &request_id).map_err(|error| {
+                format!("pending review `{request_id}` cannot be recovered: {error}")
+            })?;
+        if journal.entries.is_empty() {
+            return Err(format!(
+                "pending review `{request_id}` has an empty undecided journal"
+            ));
+        }
+        writes.restore_review(project_id, &session_id, &request_id)?;
+    }
+    Ok(())
+}
+
+impl SessionEngineManager {
     pub(crate) fn new(
-        engine: AgentEngine<ProductionCodexDriver, TauriEventSink>,
-        cancellation: tokio::sync::watch::Sender<u64>,
+        sessions: crate::session::SessionStore,
+        attachments: AttachmentStore,
+        services: crate::tool_exec::ToolServices,
+        config: AgentEngineConfig,
+        app: tauri::AppHandle,
+        dirs: crate::config::DataDirs,
+        fallback_cwd: PathBuf,
     ) -> Self {
-        let sessions = engine.session_store.clone();
         Self {
-            engine: tokio::sync::Mutex::new(engine),
-            sessions,
-            cancellation,
+            inner: Arc::new(SessionEngineManagerInner {
+                workers: tokio::sync::Mutex::new(HashMap::new()),
+                sessions,
+                attachments,
+                services,
+                config,
+                app,
+                dirs,
+                fallback_cwd,
+                recovered_projects: SyncMutex::new(HashMap::new()),
+                scheduled_writes: SyncMutex::new(HashSet::new()),
+                settings_lock: tokio::sync::Mutex::new(()),
+            }),
+        }
+    }
+    pub(crate) async fn direct_project_write<T>(
+        &self,
+        project_id: &str,
+        operation: impl FnOnce() -> Result<T, String>,
+    ) -> Result<T, String> {
+        let request_id = format!("panel-{}", uuid::Uuid::new_v4());
+        let mut ticket =
+            self.inner
+                .services
+                .writes()
+                .request(project_id, "__project_panel__", &request_id)?;
+        ticket.wait_for_grant().await?;
+        let result = operation();
+        let release = self.inner.services.writes().release(&request_id);
+        match (result, release) {
+            (Ok(value), Ok(true)) => Ok(value),
+            (Ok(_), Ok(false)) => Err("direct project write lost its lease".to_string()),
+            (Ok(_), Err(error)) => Err(error),
+            (Err(error), Ok(_)) => Err(error),
+            (Err(error), Err(release_error)) => Err(format!(
+                "{error}; write lease release failed: {release_error}"
+            )),
         }
     }
 
-    async fn lock(
-        &self,
-    ) -> tokio::sync::MutexGuard<'_, AgentEngine<ProductionCodexDriver, TauriEventSink>> {
-        self.engine.lock().await
+    fn ensure_project_recovery(&self, project_id: &str) -> Result<(), String> {
+        if let Some(result) = self.inner.recovered_projects.lock().get(project_id) {
+            return result.clone();
+        }
+        let result = restore_pending_review(
+            &self.inner.sessions,
+            &self.inner.dirs,
+            self.inner.services.writes(),
+            project_id,
+        );
+        self.inner
+            .recovered_projects
+            .lock()
+            .insert(project_id.to_string(), result.clone());
+        result
     }
 
-    async fn cancel_turn(&self) -> Result<(), AgentEngineError> {
-        let generation = (*self.cancellation.borrow())
-            .checked_add(1)
-            .ok_or_else(|| AgentEngineError::new("turn cancellation generation overflow"))?;
-        self.cancellation.send_replace(generation);
-
-        // The turn holds the engine mutex. Waiting for it here means the command
-        // resolves only after app-server acknowledged turn/interrupt and emitted
-        // turn/completed; a subsequent send cannot race the cancelled turn.
-        let mut engine = self.engine.lock().await;
-        engine.phase = Phase::Idle;
+    fn recover_all_projects(&self) -> Result<(), String> {
+        let projects = self
+            .inner
+            .sessions
+            .list()
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .map(|meta| meta.project)
+            .collect::<HashSet<_>>();
+        for project in projects {
+            self.ensure_project_recovery(&project)?;
+        }
         Ok(())
+    }
+
+    async fn worker(&self, session_id: &str) -> Result<Arc<SessionWorker>, AgentEngineError> {
+        if let Some(worker) = self.inner.workers.lock().await.get(session_id).cloned() {
+            return Ok(worker);
+        }
+        let record = self
+            .inner
+            .sessions
+            .load(session_id)
+            .map_err(|error| AgentEngineError::new(error.to_string()))?;
+        self.ensure_project_recovery(&record.meta.project)
+            .map_err(AgentEngineError::new)?;
+
+        let current_project =
+            project_name_from_state(&self.inner.config.project_state_for_prompt());
+        if !current_project.is_empty() && current_project != record.meta.project {
+            return Err(AgentEngineError::new(
+                "이 세션은 현재 에디터 프로젝트에 속하지 않습니다.",
+            ));
+        }
+
+        let runtime = self.inner.services.session(session_id.to_string());
+        let mcp = crate::mcp::serve(runtime.clone())
+            .await
+            .map_err(AgentEngineError::new)?;
+        let sink = SessionEventSink::new(self.inner.app.clone(), session_id.to_string());
+        let (cancellation, cancellation_rx) = tokio::sync::watch::channel(0_u64);
+        let driver = ProductionCodexDriver::new(
+            session_id.to_string(),
+            self.inner.fallback_cwd.clone(),
+            sink.clone(),
+            mcp.port(),
+            self.inner.dirs.clone(),
+            runtime.clone(),
+            cancellation_rx,
+        );
+        let worker = Arc::new(SessionWorker {
+            engine: tokio::sync::Mutex::new(AgentEngine::new(
+                driver,
+                sink,
+                self.inner.config.clone(),
+                runtime.clone(),
+                self.inner.sessions.clone(),
+                self.inner.attachments.clone(),
+                record,
+            )),
+            cancellation,
+            runtime,
+            _mcp: mcp,
+        });
+
+        let worker = {
+            let mut workers = self.inner.workers.lock().await;
+            workers
+                .entry(session_id.to_string())
+                .or_insert_with(|| Arc::clone(&worker))
+                .clone()
+        };
+        worker.engine.lock().await.hydrate().await?;
+        Ok(worker)
+    }
+
+    async fn execute_granted_write(
+        &self,
+        worker: Arc<SessionWorker>,
+    ) -> Result<(), AgentEngineError> {
+        let mut engine = worker.engine.lock().await;
+        match engine.continue_pending_write().await {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                let _ = engine.recover_write_failure();
+                let activity = if engine.phase == Phase::ChangesetReview {
+                    crate::write_coordinator::SessionActivity::Review
+                } else {
+                    crate::write_coordinator::SessionActivity::Error
+                };
+                worker.runtime.emit_activity(activity, None);
+                let _ = engine.sink.emit(EngineEvent::Error(ipc::ErrorEvent {
+                    message: error.message.clone(),
+                }));
+                engine.update_active_session().await;
+                Err(error)
+            }
+        }
+    }
+
+    async fn drive_pending_write(
+        &self,
+        worker: Arc<SessionWorker>,
+    ) -> Result<(), AgentEngineError> {
+        let Some(mut ticket) = worker.runtime.write_ticket() else {
+            return Ok(());
+        };
+        match ticket.state() {
+            crate::write_coordinator::TicketState::Granted => {
+                self.execute_granted_write(worker).await
+            }
+            crate::write_coordinator::TicketState::Waiting(_) => {
+                let request_id = ticket.request_id().to_string();
+                if !self
+                    .inner
+                    .scheduled_writes
+                    .lock()
+                    .insert(request_id.clone())
+                {
+                    return Ok(());
+                }
+                let manager = self.clone();
+                tauri::async_runtime::spawn(async move {
+                    let granted = ticket.wait_for_grant().await;
+                    manager.inner.scheduled_writes.lock().remove(&request_id);
+                    if granted.is_ok() {
+                        let _ = manager.execute_granted_write(worker).await;
+                    }
+                });
+                Ok(())
+            }
+            crate::write_coordinator::TicketState::Cancelled => Ok(()),
+        }
+    }
+
+    async fn finish_read_command(
+        &self,
+        worker: &Arc<SessionWorker>,
+        result: Result<(), AgentEngineError>,
+    ) -> Result<(), AgentEngineError> {
+        if let Err(error) = result {
+            let mut engine = worker.engine.lock().await;
+            let cleanup = engine.recover_read_failure();
+            let activity = if engine.phase == Phase::ChangesetReview {
+                crate::write_coordinator::SessionActivity::Review
+            } else {
+                crate::write_coordinator::SessionActivity::Error
+            };
+            worker.runtime.emit_activity(activity, None);
+            let message = match cleanup {
+                Ok(()) => error.message.clone(),
+                Err(cleanup_error) => format!(
+                    "{}; failed to settle write intent: {}",
+                    error.message, cleanup_error.message
+                ),
+            };
+            let _ = engine
+                .sink
+                .emit(EngineEvent::Error(ipc::ErrorEvent { message }));
+            engine.update_active_session().await;
+            return Err(error);
+        }
+        if worker.runtime.write_ticket().is_some() {
+            return self.drive_pending_write(Arc::clone(worker)).await;
+        }
+        let phase = worker.engine.lock().await.phase;
+        let activity = match phase {
+            Phase::PlanReview | Phase::ChangesetReview => {
+                crate::write_coordinator::SessionActivity::Review
+            }
+            _ => crate::write_coordinator::SessionActivity::Idle,
+        };
+        worker.runtime.emit_activity(activity, None);
+        Ok(())
+    }
+
+    async fn chat(
+        &self,
+        session_id: &str,
+        request: ipc::ChatRequest,
+    ) -> Result<(), AgentEngineError> {
+        let worker = self.worker(session_id).await?;
+        worker
+            .runtime
+            .emit_activity(crate::write_coordinator::SessionActivity::RunningRead, None);
+        let result = {
+            let mut engine = worker.engine.lock().await;
+            engine.chat(request).await
+        };
+        self.finish_read_command(&worker, result).await
+    }
+
+    async fn plan_feedback(
+        &self,
+        session_id: &str,
+        request: ipc::PlanFeedbackRequest,
+    ) -> Result<(), AgentEngineError> {
+        let worker = self.worker(session_id).await?;
+        worker
+            .runtime
+            .emit_activity(crate::write_coordinator::SessionActivity::RunningRead, None);
+        let result = {
+            let mut engine = worker.engine.lock().await;
+            let result = engine.plan_feedback(request).await;
+            if result.is_ok() {
+                engine.update_active_session().await;
+            }
+            result
+        };
+        self.finish_read_command(&worker, result).await
+    }
+
+    async fn plan_approve(&self, session_id: &str) -> Result<(), AgentEngineError> {
+        let worker = self.worker(session_id).await?;
+        {
+            let mut engine = worker.engine.lock().await;
+            engine.plan_approve().await?;
+            engine.update_active_session().await;
+        }
+        self.drive_pending_write(worker).await
+    }
+
+    async fn changeset_decision(
+        &self,
+        session_id: &str,
+        request: ipc::ChangesetDecisionRequest,
+    ) -> Result<(), AgentEngineError> {
+        let worker = self.worker(session_id).await?;
+        let result = worker.engine.lock().await.changeset_decision(request).await;
+        result
+    }
+
+    async fn rewind(
+        &self,
+        session_id: &str,
+        panel_log: serde_json::Value,
+    ) -> Result<(), AgentEngineError> {
+        let worker = self.worker(session_id).await?;
+        let result = worker.engine.lock().await.rewind(panel_log).await;
+        result
+    }
+
+    async fn cancel(&self, session_id: &str) -> Result<(), AgentEngineError> {
+        let worker = self.worker(session_id).await?;
+        if worker
+            .runtime
+            .cancel_waiting_write()
+            .map_err(AgentEngineError::new)?
+        {
+            let mut engine = worker.engine.lock().await;
+            engine.pending_write = None;
+            engine.phase = Phase::Idle;
+            return Ok(());
+        }
+        if let Ok(engine) = worker.engine.try_lock() {
+            if matches!(engine.phase, Phase::PlanReview | Phase::ChangesetReview) {
+                return Err(AgentEngineError::new(
+                    "검토 중인 변경사항은 accept 또는 reject로 결정해 주세요.",
+                ));
+            }
+        }
+        cancel_worker_generation(&worker.cancellation)?;
+        let mut engine = worker.engine.lock().await;
+        if worker.runtime.write_ticket().is_some() {
+            if engine.phase != Phase::ChangesetReview {
+                engine.recover_write_failure()?;
+            }
+        } else {
+            engine.phase = Phase::Idle;
+            worker
+                .runtime
+                .emit_activity(crate::write_coordinator::SessionActivity::Idle, None);
+        }
+        engine.update_active_session().await;
+        Ok(())
+    }
+
+    fn create_session(
+        &self,
+        first_text: &str,
+    ) -> Result<crate::session::SessionRecord, AgentEngineError> {
+        let now = crate::session::now_unix_seconds();
+        let record = crate::session::SessionRecord {
+            meta: crate::session::SessionMeta {
+                id: crate::session::new_session_id(),
+                name: auto_session_name(first_text),
+                project: project_name_from_state(&self.inner.config.project_state_for_prompt()),
+                created_at: now,
+                updated_at: now,
+            },
+            thread_id: None,
+            pending_request_ids: Vec::new(),
+            panel_log: serde_json::Value::Null,
+        };
+        self.inner
+            .sessions
+            .save(&record)
+            .map_err(|error| AgentEngineError::new(error.to_string()))?;
+        Ok(record)
+    }
+
+    async fn open_session(
+        &self,
+        id: &str,
+    ) -> Result<crate::session::SessionRecord, AgentEngineError> {
+        let worker = self.worker(id).await?;
+        let result = worker.engine.lock().await.hydrate().await;
+        result
+    }
+
+    async fn delete_session(&self, id: &str) -> Result<(), AgentEngineError> {
+        if let Some(worker) = self.inner.workers.lock().await.get(id).cloned() {
+            let engine = worker.engine.lock().await;
+            if engine.phase != Phase::Idle {
+                return Err(AgentEngineError::new(
+                    "실행, 쓰기 대기 또는 검토 중인 세션은 삭제할 수 없습니다.",
+                ));
+            }
+        }
+        self.inner.workers.lock().await.remove(id);
+        self.inner
+            .sessions
+            .delete(id)
+            .map_err(|error| AgentEngineError::new(error.to_string()))?;
+        self.inner
+            .attachments
+            .delete_session(id)
+            .map_err(AgentEngineError::new)
+    }
+
+    async fn model_settings(
+        &self,
+        selection: Option<(String, String)>,
+    ) -> Result<CodexModelSettings, AgentEngineError> {
+        let _guard = self.inner.settings_lock.lock().await;
+        let runtime = self.inner.services.session("__model_settings");
+        let mcp = crate::mcp::serve(runtime.clone())
+            .await
+            .map_err(AgentEngineError::new)?;
+        let sink = SessionEventSink::new(self.inner.app.clone(), "__model_settings");
+        let (_cancel, cancel_rx) = tokio::sync::watch::channel(0_u64);
+        let mut driver = ProductionCodexDriver::new(
+            "__model_settings",
+            self.inner.fallback_cwd.clone(),
+            sink,
+            mcp.port(),
+            self.inner.dirs.clone(),
+            runtime,
+            cancel_rx,
+        );
+        match selection {
+            Some((model, effort)) => driver.save_model_settings(model, effort).await,
+            None => driver.model_settings().await,
+        }
     }
 }
 
 #[tauri::command(rename = "codex_model_settings")]
 pub(crate) async fn engine_codex_model_settings(
-    state: tauri::State<'_, ManagedAgentEngine>,
+    state: tauri::State<'_, SessionEngineManager>,
 ) -> Result<CodexModelSettings, String> {
     state
-        .lock()
+        .model_settings(None)
         .await
-        .codex_model_settings()
-        .await
-        .map_err(|err| err.message)
+        .map_err(|error| error.message)
 }
 
 #[tauri::command(rename = "codex_model_settings_save")]
 pub(crate) async fn engine_codex_model_settings_save(
-    state: tauri::State<'_, ManagedAgentEngine>,
+    state: tauri::State<'_, SessionEngineManager>,
     model: String,
     reasoning_effort: String,
 ) -> Result<CodexModelSettings, String> {
     state
-        .lock()
+        .model_settings(Some((model, reasoning_effort)))
         .await
-        .save_codex_model_settings(model, reasoning_effort)
-        .await
-        .map_err(|err| err.message)
+        .map_err(|error| error.message)
 }
 
 #[tauri::command(rename = "chat")]
 pub(crate) async fn engine_chat(
-    state: tauri::State<'_, ManagedAgentEngine>,
+    state: tauri::State<'_, SessionEngineManager>,
     session_id: String,
     text: String,
     attachments: Vec<String>,
 ) -> Result<(), String> {
     state
-        .lock()
+        .chat(&session_id, ipc::ChatRequest { text, attachments })
         .await
-        .chat_in_session(&session_id, ipc::ChatRequest { text, attachments })
-        .await
-        .map_err(|err| err.message)
+        .map_err(|error| error.message)
 }
 
 #[tauri::command(rename = "plan_feedback")]
 pub(crate) async fn engine_plan_feedback(
-    state: tauri::State<'_, ManagedAgentEngine>,
+    state: tauri::State<'_, SessionEngineManager>,
     session_id: String,
     text: String,
     attachments: Vec<String>,
 ) -> Result<(), String> {
-    let mut engine = state.lock().await;
-    engine
-        .require_current_session(&session_id)
-        .map_err(|err| err.message)?;
-    engine
-        .plan_feedback(ipc::PlanFeedbackRequest { text, attachments })
+    state
+        .plan_feedback(&session_id, ipc::PlanFeedbackRequest { text, attachments })
         .await
-        .map_err(|err| err.message)?;
-    engine.update_active_session().await;
-    Ok(())
+        .map_err(|error| error.message)
 }
 
 #[tauri::command(rename = "plan_approve")]
 pub(crate) async fn engine_plan_approve(
-    state: tauri::State<'_, ManagedAgentEngine>,
+    state: tauri::State<'_, SessionEngineManager>,
     session_id: String,
 ) -> Result<(), String> {
-    let mut engine = state.lock().await;
-    engine
-        .require_current_session(&session_id)
-        .map_err(|err| err.message)?;
-    engine.plan_approve().await.map_err(|err| err.message)?;
-    engine.update_active_session().await;
-    Ok(())
+    state
+        .plan_approve(&session_id)
+        .await
+        .map_err(|error| error.message)
 }
 
 #[tauri::command(rename = "changeset_decision")]
 pub(crate) async fn engine_changeset_decision(
-    state: tauri::State<'_, ManagedAgentEngine>,
+    state: tauri::State<'_, SessionEngineManager>,
     session_id: String,
     decision: ipc::Decision,
     ids: ipc::DecisionIds,
 ) -> Result<(), String> {
-    let mut engine = state.lock().await;
-    engine
-        .require_current_session(&session_id)
-        .map_err(|err| err.message)?;
-    engine
-        .changeset_decision(ipc::ChangesetDecisionRequest { decision, ids })
+    state
+        .changeset_decision(&session_id, ipc::ChangesetDecisionRequest { decision, ids })
         .await
-        .map_err(|err| err.message)?;
-    engine.update_active_session().await;
-    Ok(())
+        .map_err(|error| error.message)
 }
 
 #[tauri::command(rename = "cancel")]
 pub(crate) async fn engine_cancel(
-    state: tauri::State<'_, ManagedAgentEngine>,
+    state: tauri::State<'_, SessionEngineManager>,
     session_id: String,
 ) -> Result<(), String> {
-    let _ = session_id;
-    state.cancel_turn().await.map_err(|err| err.message)
+    state
+        .cancel(&session_id)
+        .await
+        .map_err(|error| error.message)
 }
 
 #[tauri::command(rename = "conversation_rewind")]
 pub(crate) async fn engine_conversation_rewind(
-    state: tauri::State<'_, ManagedAgentEngine>,
+    state: tauri::State<'_, SessionEngineManager>,
     session_id: String,
     panel_log: serde_json::Value,
 ) -> Result<(), String> {
-    let mut engine = state.lock().await;
-    engine
-        .require_current_session(&session_id)
-        .map_err(|err| err.message)?;
-    engine.rewind(panel_log).await.map_err(|err| err.message)
+    state
+        .rewind(&session_id, panel_log)
+        .await
+        .map_err(|error| error.message)
 }
 
 #[tauri::command(rename = "session_list")]
 pub(crate) async fn engine_session_list(
-    state: tauri::State<'_, ManagedAgentEngine>,
+    state: tauri::State<'_, SessionEngineManager>,
 ) -> Result<Vec<crate::session::SessionMeta>, String> {
-    state.sessions.list().map_err(|error| error.to_string())
+    state.recover_all_projects()?;
+    state
+        .inner
+        .sessions
+        .list()
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command(rename = "session_load")]
 pub(crate) async fn engine_session_load(
-    state: tauri::State<'_, ManagedAgentEngine>,
+    state: tauri::State<'_, SessionEngineManager>,
     id: String,
 ) -> Result<crate::session::SessionRecord, String> {
-    state.sessions.load(&id).map_err(|error| error.to_string())
+    state
+        .inner
+        .sessions
+        .load(&id)
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command(rename = "session_create")]
 pub(crate) async fn engine_session_create(
-    state: tauri::State<'_, ManagedAgentEngine>,
+    state: tauri::State<'_, SessionEngineManager>,
     first_text: String,
 ) -> Result<crate::session::SessionRecord, String> {
     state
-        .lock()
-        .await
         .create_session(&first_text)
-        .map_err(|err| err.message)
+        .map_err(|error| error.message)
 }
 
 #[tauri::command(rename = "session_update_log")]
 pub(crate) async fn engine_session_update_log(
-    state: tauri::State<'_, ManagedAgentEngine>,
+    state: tauri::State<'_, SessionEngineManager>,
     id: String,
     panel_log: serde_json::Value,
 ) -> Result<(), String> {
     state
+        .inner
         .sessions
         .update_panel_log(&id, panel_log)
         .map_err(|error| error.to_string())
@@ -1998,24 +2422,20 @@ pub(crate) async fn engine_session_update_log(
 
 #[tauri::command(rename = "session_open")]
 pub(crate) async fn engine_session_open(
-    state: tauri::State<'_, ManagedAgentEngine>,
+    state: tauri::State<'_, SessionEngineManager>,
     id: String,
 ) -> Result<crate::session::SessionRecord, String> {
-    state
-        .lock()
-        .await
-        .open_session(&id)
-        .await
-        .map_err(|err| err.message)
+    state.open_session(&id).await.map_err(|error| error.message)
 }
 
 #[tauri::command(rename = "session_rename")]
 pub(crate) async fn engine_session_rename(
-    state: tauri::State<'_, ManagedAgentEngine>,
+    state: tauri::State<'_, SessionEngineManager>,
     id: String,
     name: String,
 ) -> Result<(), String> {
     state
+        .inner
         .sessions
         .rename(&id, &name)
         .map_err(|error| error.to_string())
@@ -2023,14 +2443,13 @@ pub(crate) async fn engine_session_rename(
 
 #[tauri::command(rename = "session_delete")]
 pub(crate) async fn engine_session_delete(
-    state: tauri::State<'_, ManagedAgentEngine>,
+    state: tauri::State<'_, SessionEngineManager>,
     id: String,
 ) -> Result<(), String> {
     state
-        .lock()
-        .await
         .delete_session(&id)
-        .map_err(|err| err.message)
+        .await
+        .map_err(|error| error.message)
 }
 
 fn approved_plan_execution_instruction(request_id: &str) -> Result<String, AgentEngineError> {
@@ -2382,16 +2801,6 @@ fn civil_from_days(days_since_epoch: i64) -> (i64, i64, i64) {
     (year, month, day)
 }
 
-fn journal_decision(req: ipc::ChangesetDecisionRequest) -> journal::ChangesetDecision {
-    match req.decision {
-        ipc::Decision::Accept => journal::ChangesetDecision::accept(),
-        ipc::Decision::Reject => journal::ChangesetDecision::reject(match req.ids {
-            ipc::DecisionIds::All(_) => journal::DecisionIds::All,
-            ipc::DecisionIds::List(ids) => journal::DecisionIds::Items(ids),
-        }),
-    }
-}
-
 fn changeset_episode_decision(req: &ipc::ChangesetDecisionRequest) -> &'static str {
     match (&req.decision, &req.ids) {
         (ipc::Decision::Accept, ipc::DecisionIds::All(_)) => "accepted",
@@ -2676,17 +3085,23 @@ impl journal::JournalBridge for WorkspaceJournalBridge {
     fn write_workspace_file(
         &self,
         workspace_id: &str,
+        session_id: Option<&str>,
         path: &str,
         content: &str,
     ) -> Result<(), Self::Error> {
         self.workspace
-            .restore_file(workspace_id, path, Some(content))
+            .restore_file(workspace_id, session_id, path, Some(content))
             .map_err(|error| AgentEngineError::new(error.to_string()))
     }
 
-    fn delete_workspace_file(&self, workspace_id: &str, path: &str) -> Result<(), Self::Error> {
+    fn delete_workspace_file(
+        &self,
+        workspace_id: &str,
+        session_id: Option<&str>,
+        path: &str,
+    ) -> Result<(), Self::Error> {
         self.workspace
-            .restore_file(workspace_id, path, None)
+            .restore_file(workspace_id, session_id, path, None)
             .map_err(|error| AgentEngineError::new(error.to_string()))
     }
 
@@ -2782,7 +3197,7 @@ mod tests {
     #[test]
     fn session_event_flattens_payload_with_session_id() {
         let value = serde_json::to_value(SessionEvent {
-            session_id: Some("session-a".to_string()),
+            session_id: "session-a".to_string(),
             payload: ipc::AnswerEvent {
                 text: "done".to_string(),
             },
@@ -2933,10 +3348,7 @@ mod tests {
         /// sets it, mirroring the production client's thread_id mutex.
         thread_id: Arc<Mutex<Option<String>>>,
         seeded: Arc<Mutex<Vec<String>>>,
-        /// Number of upcoming `run_turn` calls that should return Err (to exercise
-        /// the resume fallback). Decremented per failed call.
-        fail_runs: Arc<Mutex<usize>>,
-        workspace_id: Arc<Mutex<Option<String>>>,
+        workspace: Arc<Mutex<Option<PreparedWorkspace>>>,
     }
 
     impl FakeCodexDriver {
@@ -2948,14 +3360,8 @@ mod tests {
                 reset_count: Arc::new(Mutex::new(0)),
                 thread_id: Arc::new(Mutex::new(None)),
                 seeded: Arc::new(Mutex::new(Vec::new())),
-                fail_runs: Arc::new(Mutex::new(0)),
-                workspace_id: Arc::new(Mutex::new(None)),
+                workspace: Arc::new(Mutex::new(None)),
             }
-        }
-
-        /// Make the next `n` `run_turn` calls fail, forcing the resume fallback.
-        fn fail_next_runs(&self, n: usize) {
-            *self.fail_runs.lock().expect("fail runs lock") = n;
         }
 
         fn prompts(&self) -> Vec<String> {
@@ -2966,16 +3372,12 @@ mod tests {
             self.image_paths.lock().expect("image paths lock").clone()
         }
 
-        fn reset_count(&self) -> usize {
-            *self.reset_count.lock().expect("reset count lock")
-        }
-
         fn seeded_ids(&self) -> Vec<String> {
             self.seeded.lock().expect("seeded lock").clone()
         }
 
-        fn set_workspace_id(&self, workspace_id: String) {
-            *self.workspace_id.lock().expect("workspace id lock") = Some(workspace_id);
+        fn set_workspace(&self, workspace: PreparedWorkspace) {
+            *self.workspace.lock().expect("workspace lock") = Some(workspace);
         }
     }
 
@@ -2989,15 +3391,6 @@ mod tests {
                 .lock()
                 .expect("image paths lock")
                 .push(input.image_paths);
-            // Scripted resume failure: return Err without consuming a turn so the
-            // engine's resume fallback (decision E) can be exercised.
-            {
-                let mut fail = self.fail_runs.lock().expect("fail runs lock");
-                if *fail > 0 {
-                    *fail -= 1;
-                    return Err(AgentEngineError::new("scripted resume failure".to_string()));
-                }
-            }
             // A fresh turn (no seeded/live thread) mints a thread id so
             // `current_thread_id` returns one by turn completion (matches the
             // production driver capturing `ThreadStarted`).
@@ -3031,8 +3424,69 @@ mod tests {
             Ok(())
         }
 
-        fn current_workspace_id(&self) -> Option<String> {
-            self.workspace_id.lock().expect("workspace id lock").clone()
+        fn current_workspace(&self) -> Option<PreparedWorkspace> {
+            self.workspace.lock().expect("workspace lock").clone()
+        }
+    }
+
+    #[derive(Clone)]
+    struct GateCodexDriver {
+        label: &'static str,
+        entered: tokio::sync::mpsc::UnboundedSender<&'static str>,
+        release: Arc<tokio::sync::Notify>,
+        wait_once: Arc<std::sync::atomic::AtomicBool>,
+        thread_id: Arc<Mutex<Option<String>>>,
+    }
+
+    impl GateCodexDriver {
+        fn new(
+            label: &'static str,
+            entered: tokio::sync::mpsc::UnboundedSender<&'static str>,
+            release: Arc<tokio::sync::Notify>,
+            wait: bool,
+        ) -> Self {
+            Self {
+                label,
+                entered,
+                release,
+                wait_once: Arc::new(std::sync::atomic::AtomicBool::new(wait)),
+                thread_id: Arc::new(Mutex::new(None)),
+            }
+        }
+    }
+
+    impl CodexDriver for GateCodexDriver {
+        async fn run_turn(
+            &mut self,
+            _input: CodexTurnInput,
+        ) -> Result<CodexTurnResult, AgentEngineError> {
+            self.entered
+                .send(self.label)
+                .map_err(|_| AgentEngineError::new("test entry receiver closed"))?;
+            if self
+                .wait_once
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                self.release.notified().await;
+            }
+            *self.thread_id.lock().unwrap() = Some(format!("thread-{}", self.label));
+            Ok(CodexTurnResult::Answer {
+                text: format!("{} done", self.label),
+            })
+        }
+
+        async fn reset_thread(&mut self) -> Result<(), AgentEngineError> {
+            *self.thread_id.lock().unwrap() = None;
+            Ok(())
+        }
+
+        async fn current_thread_id(&self) -> Option<String> {
+            self.thread_id.lock().unwrap().clone()
+        }
+
+        async fn seed_thread_id(&mut self, id: String) -> Result<(), AgentEngineError> {
+            *self.thread_id.lock().unwrap() = Some(id);
+            Ok(())
         }
     }
 
@@ -3142,11 +3596,30 @@ mod tests {
     /// real on-disk journal also get a real on-disk session store beside it.
     fn session_store_at(data_dir: &std::path::Path) -> crate::session::SessionStore {
         let dirs = crate::config::DataDirs::from_bases(data_dir, data_dir);
+        dirs.ensure_dirs().unwrap();
         crate::session::SessionStore::new(&dirs)
     }
 
     fn attachment_store_at(data_dir: &std::path::Path) -> AttachmentStore {
         AttachmentStore::new(data_dir.join("attachments"))
+    }
+
+    fn test_session(store: &crate::session::SessionStore) -> crate::session::SessionRecord {
+        let now = crate::session::now_unix_seconds();
+        let record = crate::session::SessionRecord {
+            meta: crate::session::SessionMeta {
+                id: crate::session::new_session_id(),
+                name: "test session".to_string(),
+                project: "Sample".to_string(),
+                created_at: now,
+                updated_at: now,
+            },
+            thread_id: None,
+            pending_request_ids: Vec::new(),
+            panel_log: serde_json::Value::Null,
+        };
+        store.save(&record).unwrap();
+        record
     }
 
     fn test_engine_with_memory<D: CodexDriver, S: EventSink>(
@@ -3155,13 +3628,16 @@ mod tests {
         memory: ProjectMemory,
         data_dir: &std::path::Path,
     ) -> AgentEngine<D, S> {
+        let sessions = session_store_at(data_dir);
+        let session = test_session(&sessions);
         let mut engine = AgentEngine::new(
             driver,
             sink,
             config_with_memory(memory),
-            ToolRuntime::for_tests(),
-            session_store_at(data_dir),
+            SessionToolRuntime::for_tests(),
+            sessions,
             attachment_store_at(data_dir),
+            session,
         );
         engine.journal_store = journal::JournalStore::new(data_dir);
         engine.journal_data_dir = data_dir.to_path_buf();
@@ -3259,13 +3735,16 @@ mod tests {
         let config = config_with_memory(memory).with_wiki_provider(Arc::new(StoreWikiProvider {
             wiki_dir: wiki_dir.to_path_buf(),
         }));
+        let sessions = session_store_at(data_dir);
+        let session = test_session(&sessions);
         let mut engine = AgentEngine::new(
             driver,
             sink,
             config,
-            ToolRuntime::for_tests(),
-            session_store_at(data_dir),
+            SessionToolRuntime::for_tests(),
+            sessions,
             attachment_store_at(data_dir),
+            session,
         );
         engine.journal_store = journal::JournalStore::new(data_dir);
         engine.journal_data_dir = data_dir.to_path_buf();
@@ -3309,6 +3788,9 @@ mod tests {
     }
 
     fn test_engine<D: CodexDriver, S: EventSink>(driver: D, sink: S) -> AgentEngine<D, S> {
+        let data_dir = unique_temp_dir("engine-sessions");
+        let sessions = session_store_at(&data_dir);
+        let session = test_session(&sessions);
         AgentEngine::new(
             driver,
             sink,
@@ -3317,76 +3799,59 @@ mod tests {
                 None,
                 sample_hits(),
             ),
-            ToolRuntime::for_tests(),
-            session_store_at(&unique_temp_dir("engine-sessions")),
+            SessionToolRuntime::for_tests(),
+            sessions,
             attachment_store_at(&unique_temp_dir("engine-attachments")),
+            session,
         )
     }
 
     #[tokio::test]
-    async fn agentic_engine_uses_fresh_prompt_after_switching_to_a_new_session() {
-        let driver = FakeCodexDriver::scripted([
+    async fn session_bound_engines_keep_independent_thread_prompt_state() {
+        let driver_a = FakeCodexDriver::scripted([
             CodexTurnResult::Answer {
                 text: "First answer.".to_string(),
             },
             CodexTurnResult::Answer {
                 text: "Second answer.".to_string(),
             },
-            CodexTurnResult::Answer {
-                text: "Fresh answer.".to_string(),
-            },
         ]);
-        let driver_handle = driver.clone();
-        let sink = CapturingEventSink::default();
-        let mut engine = test_engine(driver, sink);
+        let driver_b = FakeCodexDriver::scripted([CodexTurnResult::Answer {
+            text: "Fresh answer.".to_string(),
+        }]);
+        let handle_a = driver_a.clone();
+        let handle_b = driver_b.clone();
+        let mut engine_a = test_engine(driver_a, CapturingEventSink::default());
+        let mut engine_b = test_engine(driver_b, CapturingEventSink::default());
 
-        engine
+        engine_a
             .chat(crate::ipc::ChatRequest {
                 text: "first user message".to_string(),
                 attachments: Vec::new(),
             })
             .await
-            .expect("first chat turn should run");
-        engine
+            .unwrap();
+        engine_a
             .chat(crate::ipc::ChatRequest {
                 text: "follow-up user message".to_string(),
                 attachments: Vec::new(),
             })
             .await
-            .expect("second chat turn should resume");
-        let fresh = engine
-            .create_session("fresh user message")
-            .expect("fresh session");
-        engine
-            .open_session(&fresh.meta.id)
-            .await
-            .expect("new session should take the free project lane");
-        engine
+            .unwrap();
+        engine_b
             .chat(crate::ipc::ChatRequest {
                 text: "fresh user message".to_string(),
                 attachments: Vec::new(),
             })
             .await
-            .expect("new session chat should start fresh");
+            .unwrap();
 
-        let prompts = driver_handle.prompts();
-        assert_eq!(prompts.len(), 3);
-        assert!(prompts[0].contains("[first principles]"));
-        assert!(
-            !prompts[0].lines().any(|line| line == "[user message]"),
-            "fresh first turn uses build_system_prompt, not resume_turn_text"
-        );
-        assert!(prompts[1].lines().any(|line| line == "[user message]"));
-        assert!(
-            !prompts[1].contains("[first principles]"),
-            "resumed chat sends resume_turn_text, not the first-turn system prompt"
-        );
-        assert!(prompts[2].contains("[first principles]"));
-        assert!(
-            !prompts[2].lines().any(|line| line == "[user message]"),
-            "new session makes the next chat a fresh build_system_prompt turn"
-        );
-        assert_eq!(driver_handle.reset_count(), 1);
+        let prompts_a = handle_a.prompts();
+        let prompts_b = handle_b.prompts();
+        assert!(prompts_a[0].contains("[first principles]"));
+        assert!(prompts_a[1].lines().any(|line| line == "[user message]"));
+        assert!(prompts_b[0].contains("[first principles]"));
+        assert!(!prompts_b[0].lines().any(|line| line == "[user message]"));
     }
 
     #[tokio::test]
@@ -3418,12 +3883,7 @@ mod tests {
             .await
             .expect("propose_plan turn should run");
 
-        // Ignore the session-lifecycle signal the first turn emits on auto-create.
-        let events: Vec<_> = sink_handle
-            .events()
-            .into_iter()
-            .filter(|event| !matches!(event, EngineEvent::SessionActive(_)))
-            .collect();
+        let events = sink_handle.events();
         assert!(
             matches!(
                 events.as_slice(),
@@ -3466,7 +3926,7 @@ mod tests {
                 files: Vec::new(),
             })
             .unwrap();
-        driver_handle.set_workspace_id(workspace.id.clone());
+        driver_handle.set_workspace(workspace.clone());
 
         engine
             .chat(crate::ipc::ChatRequest {
@@ -3476,8 +3936,12 @@ mod tests {
             .await
             .expect("plan turn should run");
         let request_id = engine.current_request_id.clone().unwrap();
-        let error = engine
+        engine
             .plan_approve()
+            .await
+            .expect("plan approval should acquire the test write lease");
+        let error = engine
+            .continue_pending_write()
             .await
             .expect_err("missing project wiki must block completion after bounded repair turns");
 
@@ -4249,6 +4713,8 @@ mod tests {
         assert!(prompt.contains("Fix error diagnostics and re-check before writing"));
         assert!(prompt.contains("If eps_check returns skipped"));
         assert!(prompt.contains("eps_check never replaces build_run"));
+        assert!(prompt.contains("complete structured result"));
+        assert!(!prompt.contains("build_errors"));
     }
 
     #[test]
@@ -4306,419 +4772,362 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn first_chat_auto_creates_session_and_captures_thread_id() {
-        let base = unique_temp_dir("session-capture");
-        let memory = ProjectMemory::new(base.join("memory"), "ExampleProject");
-        let driver = FakeCodexDriver::scripted([
-            CodexTurnResult::Answer {
-                text: "Saved-session answer.".to_string(),
-            },
-            CodexTurnResult::Answer {
-                text: "Follow-up answer.".to_string(),
-            },
-        ]);
-        let sink = CapturingEventSink::default();
-        let mut engine = test_engine_with_memory(driver, sink, memory, &base.join("data"));
+    async fn different_session_read_turns_overlap_and_short_turn_finishes_first() {
+        let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
+        let release_a = Arc::new(tokio::sync::Notify::new());
+        let release_b = Arc::new(tokio::sync::Notify::new());
+        let mut engine_a = test_engine(
+            GateCodexDriver::new("a", entered_tx.clone(), Arc::clone(&release_a), true),
+            CapturingEventSink::default(),
+        );
+        let mut engine_b = test_engine(
+            GateCodexDriver::new("b", entered_tx, release_b, false),
+            CapturingEventSink::default(),
+        );
 
-        // The FIRST chat auto-creates the active session (no save button) and mints
-        // a thread id (mock mirrors ThreadStarted by completion).
-        engine
-            .chat(crate::ipc::ChatRequest {
-                text: "마린 HP 올려줘".to_string(),
-                attachments: Vec::new(),
-            })
-            .await
-            .expect("first chat should run");
-
-        let id = engine
-            .current_session_id
-            .clone()
-            .expect("first chat must auto-create an active session");
-        // The session is auto-named from the first user message.
-        let created = engine.session_store.load(&id).expect("record should load");
-        assert_eq!(created.meta.name, "마린 HP 올려줘");
-
-        // Force the on-disk record's thread_id stale so the post-chat assertion can
-        // ONLY pass if the second chat's auto-update actually re-captures the live
-        // thread id (isolates decision B from the auto-create capture).
-        let mut stale = engine.session_store.load(&id).expect("record should load");
-        stale.thread_id = None;
-        engine
-            .session_store
-            .save(&stale)
-            .expect("stale record should save");
-
-        // A subsequent completed chat auto-updates the record's thread_id.
-        engine
-            .chat(crate::ipc::ChatRequest {
-                text: "follow-up".to_string(),
-                attachments: Vec::new(),
-            })
-            .await
-            .expect("second chat should run and auto-update the session");
-
-        let record = engine.session_store.load(&id).expect("record should load");
-        assert_eq!(record.thread_id, Some("thread-fake".to_string()));
-
-        fs::remove_dir_all(base).ok();
-    }
-
-    #[tokio::test]
-    async fn project_lane_blocks_session_switch_until_changeset_is_decided() {
-        let base = unique_temp_dir("session-project-lane");
-        let memory = ProjectMemory::new(base.join("memory"), "ExampleProject");
-        let driver = FakeCodexDriver::scripted([
-            CodexTurnResult::Answer {
-                text: "First answer.".to_string(),
-            },
-            CodexTurnResult::Answer {
-                text: "Second answer.".to_string(),
-            },
-        ]);
-        let sink = CapturingEventSink::default();
-        let mut engine = test_engine_with_memory(driver, sink, memory, &base.join("data"));
-        let first = engine.create_session("first").expect("first session");
-        let second = engine.create_session("second").expect("second session");
-
-        engine
-            .chat_in_session(
-                &first.meta.id,
-                crate::ipc::ChatRequest {
-                    text: "first request".to_string(),
+        let long = tokio::spawn(async move {
+            engine_a
+                .chat(ipc::ChatRequest {
+                    text: "long read".to_string(),
                     attachments: Vec::new(),
-                },
-            )
-            .await
-            .expect("first session should run");
-        let request_id = engine.current_request_id.clone().expect("first request id");
-        record_file_write_in_memory(
-            &engine.journal_store,
-            &request_id,
-            "lane-write",
-            1,
-            "scripts/lane.eps",
-        );
-        engine.phase = Phase::ChangesetReview;
-
-        let blocked = engine
-            .chat_in_session(
-                &second.meta.id,
-                crate::ipc::ChatRequest {
-                    text: "second request".to_string(),
-                    attachments: Vec::new(),
-                },
-            )
-            .await
-            .expect_err("another session must wait for review");
-        assert!(blocked.message.contains("검토"));
-        assert_eq!(
-            engine.current_session_id.as_deref(),
-            Some(first.meta.id.as_str())
-        );
-
-        engine
-            .changeset_decision(crate::ipc::ChangesetDecisionRequest {
-                decision: crate::ipc::Decision::Accept,
-                ids: crate::ipc::DecisionIds::All(crate::ipc::AllLiteral),
-            })
-            .await
-            .expect("accept should release the project lane");
-        engine
-            .chat_in_session(
-                &second.meta.id,
-                crate::ipc::ChatRequest {
-                    text: "second request".to_string(),
-                    attachments: Vec::new(),
-                },
-            )
-            .await
-            .expect("second session should run after review");
-        assert_eq!(
-            engine.current_session_id.as_deref(),
-            Some(second.meta.id.as_str())
-        );
-
-        fs::remove_dir_all(base).ok();
-    }
-
-    #[tokio::test]
-    async fn open_session_resume_failure_falls_back_to_fresh_start_with_guardrails() {
-        let base = unique_temp_dir("session-resume-fallback");
-        let memory = ProjectMemory::new(base.join("memory"), "ExampleProject");
-        let driver = FakeCodexDriver::scripted([CodexTurnResult::Answer {
-            text: "Fresh-start replay answer.".to_string(),
-        }]);
-        // The seeded resume attempt fails, forcing the fresh-start replay path.
-        driver.fail_next_runs(1);
-        let driver_handle = driver.clone();
-        let sink = CapturingEventSink::default();
-        let mut engine = test_engine_with_memory(driver, sink, memory, &base.join("data"));
-
-        let id = crate::session::new_session_id();
-        engine
-            .session_store
-            .save(&crate::session::SessionRecord {
-                meta: crate::session::SessionMeta {
-                    id: id.clone(),
-                    name: "이전 대화".to_string(),
-                    project: "ExampleProject".to_string(),
-                    created_at: 1,
-                    updated_at: 1,
-                },
-                thread_id: Some("thread-stale".to_string()),
-                pending_request_ids: Vec::new(),
-                panel_log: serde_json::json!({
-                    "schemaVersion": 1,
-                    "logSeq": 2,
-                    "log": [
-                        { "id": 1, "kind": "you", "text": "마린 HP 올려줘" },
-                        { "id": 2, "kind": "agent", "text": "적용했습니다." }
-                    ]
-                }),
-            })
-            .expect("seed record should save");
-
-        engine.open_session(&id).await.expect("open should succeed");
-        assert!(engine.thread_active, "seeded open arms thread_active");
-
-        // The post-open chat attempts the resume, it fails, and the engine falls
-        // back to a fresh thread/start that replays the transcript.
-        engine
-            .chat(crate::ipc::ChatRequest {
-                text: "이어서 작업해줘".to_string(),
-                attachments: Vec::new(),
-            })
-            .await
-            .expect("post-open chat should fall back and succeed");
-
-        // reset_thread fired twice: once in open_session's reset(), once dropping
-        // the stale thread in the fresh-start fallback.
-        assert_eq!(driver_handle.reset_count(), 2);
-
-        let prompts = driver_handle.prompts();
-        let last = prompts.last().expect("a prompt was sent");
-        // The fresh-start fallback turn MUST carry the never-do guardrails (a brand
-        // new thread has never seen them) — the core of finding #1.
-        assert!(
-            last.contains("[first principles]"),
-            "fallback fresh thread must seed the first-principles guardrails"
-        );
-        // ...and the condensed prior conversation so the model keeps context.
-        assert!(
-            last.contains("마린 HP 올려줘"),
-            "fallback turn replays the prior transcript"
-        );
-        assert!(engine.thread_active, "fresh thread is live after fallback");
-
-        fs::remove_dir_all(base).ok();
-    }
-
-    #[tokio::test]
-    async fn open_session_seeds_thread_id_and_next_chat_takes_resume_branch() {
-        let base = unique_temp_dir("session-open-seed");
-        let memory = ProjectMemory::new(base.join("memory"), "ExampleProject");
-        let driver = FakeCodexDriver::scripted([CodexTurnResult::Answer {
-            text: "Resumed answer.".to_string(),
-        }]);
-        let driver_handle = driver.clone();
-        let sink = CapturingEventSink::default();
-        let sink_handle = sink.clone();
-        let mut engine = test_engine_with_memory(driver, sink, memory, &base.join("data"));
-
-        // Persist a record carrying a saved thread id and no pending changeset.
-        let id = crate::session::new_session_id();
-        engine
-            .session_store
-            .save(&crate::session::SessionRecord {
-                meta: crate::session::SessionMeta {
-                    id: id.clone(),
-                    name: "이전 대화".to_string(),
-                    project: "ExampleProject".to_string(),
-                    created_at: 1,
-                    updated_at: 1,
-                },
-                thread_id: Some("thread-saved".to_string()),
-                pending_request_ids: Vec::new(),
-                panel_log: serde_json::json!({
-                    "schemaVersion": 1,
-                    "logSeq": 2,
-                    "log": [
-                        { "id": 1, "kind": "you", "text": "마린 HP 올려줘" },
-                        { "id": 2, "kind": "agent", "text": "적용했습니다." }
-                    ]
-                }),
-            })
-            .expect("seed record should save");
-
-        let record = engine.open_session(&id).await.expect("open should succeed");
-        assert_eq!(record.meta.id, id);
-        // The saved thread id was seeded into the driver and the engine armed
-        // `thread_active` so the next chat resumes.
-        assert_eq!(driver_handle.seeded_ids(), vec!["thread-saved".to_string()]);
-        assert!(engine.thread_active, "open_session must arm thread_active");
-        assert_eq!(engine.current_session_id.as_deref(), Some(id.as_str()));
-
-        // A `session_loaded` signal was emitted.
-        assert!(
-            sink_handle
-                .events()
-                .iter()
-                .any(|event| matches!(event, EngineEvent::SessionLoaded(_))),
-            "open_session must emit SessionLoaded"
-        );
-
-        // The next chat takes the resume_turn_text branch (carries [user message],
-        // not the first-turn [first principles] system prompt).
-        engine
-            .chat(crate::ipc::ChatRequest {
-                text: "이어서 작업해줘".to_string(),
-                attachments: Vec::new(),
-            })
-            .await
-            .expect("post-open chat should resume");
-        let prompts = driver_handle.prompts();
-        let last = prompts.last().expect("a prompt was sent");
-        assert!(
-            last.lines().any(|line| line == "[user message]"),
-            "resumed turn uses resume_turn_text"
-        );
-        assert!(
-            !last.contains("[first principles]"),
-            "resumed turn is not the first-turn system prompt"
-        );
-
-        fs::remove_dir_all(base).ok();
-    }
-
-    #[tokio::test]
-    async fn rewind_keeps_session_and_replays_only_the_selected_log_prefix() {
-        let base = unique_temp_dir("session-rewind");
-        let memory = ProjectMemory::new(base.join("memory"), "ExampleProject");
-        let driver = FakeCodexDriver::scripted([
-            CodexTurnResult::Answer {
-                text: "첫 답변".to_string(),
-            },
-            CodexTurnResult::Answer {
-                text: "수정된 답변".to_string(),
-            },
-        ]);
-        let driver_handle = driver.clone();
-        let sink = CapturingEventSink::default();
-        let mut engine = test_engine_with_memory(driver, sink, memory, &base.join("data"));
-
-        engine
-            .chat(crate::ipc::ChatRequest {
-                text: "첫 요청".to_string(),
-                attachments: Vec::new(),
-            })
-            .await
-            .expect("first turn should create the active session");
-        let session_id = engine
-            .current_session_id
-            .clone()
-            .expect("chat should create a session");
-        let prefix = json!({
-            "schemaVersion": 2,
-            "logSeq": 2,
-            "log": [
-                {"id": 1, "kind": "you", "text": "첫 요청"},
-                {"id": 2, "kind": "agent", "text": "첫 답변"}
-            ]
+                })
+                .await
         });
+        assert_eq!(entered_rx.recv().await, Some("a"));
 
-        engine
-            .rewind(prefix.clone())
+        let short = tokio::spawn(async move {
+            engine_b
+                .chat(ipc::ChatRequest {
+                    text: "short read".to_string(),
+                    attachments: Vec::new(),
+                })
+                .await
+        });
+        assert_eq!(entered_rx.recv().await, Some("b"));
+        tokio::time::timeout(std::time::Duration::from_secs(1), short)
             .await
-            .expect("rewind should reset the thread and retain the session");
-        assert_eq!(
-            engine.current_session_id.as_deref(),
-            Some(session_id.as_str())
+            .expect("session B must finish while A is blocked")
+            .unwrap()
+            .unwrap();
+        assert!(!long.is_finished());
+        release_a.notify_waiters();
+        long.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn commands_in_one_session_remain_serialized() {
+        let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
+        let release = Arc::new(tokio::sync::Notify::new());
+        let engine = Arc::new(tokio::sync::Mutex::new(test_engine(
+            GateCodexDriver::new("same", entered_tx, Arc::clone(&release), true),
+            CapturingEventSink::default(),
+        )));
+
+        let first_engine = Arc::clone(&engine);
+        let first = tokio::spawn(async move {
+            first_engine
+                .lock()
+                .await
+                .chat(ipc::ChatRequest {
+                    text: "first".to_string(),
+                    attachments: Vec::new(),
+                })
+                .await
+        });
+        assert_eq!(entered_rx.recv().await, Some("same"));
+
+        let second_engine = Arc::clone(&engine);
+        let second = tokio::spawn(async move {
+            second_engine
+                .lock()
+                .await
+                .chat(ipc::ChatRequest {
+                    text: "second".to_string(),
+                    attachments: Vec::new(),
+                })
+                .await
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), entered_rx.recv())
+                .await
+                .is_err(),
+            "the second same-session command entered before the first settled"
         );
-        assert!(!engine.thread_active);
-        let saved = engine
-            .session_store
-            .load(&session_id)
-            .expect("rewound session should persist");
-        assert_eq!(saved.thread_id, None);
-        assert_eq!(saved.panel_log, prefix);
+        release.notify_waiters();
+        first.await.unwrap().unwrap();
+        assert_eq!(entered_rx.recv().await, Some("same"));
+        second.await.unwrap().unwrap();
+    }
+
+    #[test]
+    fn cancellation_generation_is_scoped_to_one_worker_channel() {
+        let (cancel_a, mut watch_a) = tokio::sync::watch::channel(0_u64);
+        let (cancel_b, mut watch_b) = tokio::sync::watch::channel(0_u64);
+
+        cancel_worker_generation(&cancel_a).unwrap();
+
+        assert!(watch_a.has_changed().unwrap());
+        assert_eq!(*watch_a.borrow_and_update(), 1);
+        assert!(!watch_b.has_changed().unwrap());
+        assert_eq!(*watch_b.borrow_and_update(), 0);
+        drop(cancel_b);
+    }
+
+    #[test]
+    fn failed_read_recovery_releases_granted_intent_before_retry() {
+        let mut engine = test_engine(FakeCodexDriver::scripted([]), CapturingEventSink::default());
+        engine
+            .runtime
+            .begin_request("request-old", "Sample")
+            .unwrap();
+        engine
+            .runtime
+            .request_write_lane("write after read")
+            .unwrap();
+        engine.current_request_id = Some("request-old".to_string());
+        engine.phase = Phase::Triage;
+
+        engine.recover_read_failure().unwrap();
+
+        assert_eq!(engine.phase, Phase::Idle);
+        assert!(!engine.runtime.owns_write_lease());
+        engine
+            .runtime
+            .begin_request("request-new", "Sample")
+            .unwrap();
+        let next = engine.runtime.request_write_lane("retry write").unwrap();
+        assert_eq!(next.state(), crate::write_coordinator::TicketState::Granted);
+    }
+
+    #[tokio::test]
+    async fn partial_decision_keeps_write_lease_until_every_item_settles() {
+        let mut engine = test_engine(FakeCodexDriver::scripted([]), CapturingEventSink::default());
+        let request_id = "req-partial";
+        engine.runtime.begin_request(request_id, "Sample").unwrap();
+        engine.runtime.request_write_lane("test review").unwrap();
+        engine.current_request_id = Some(request_id.to_string());
+        engine.phase = Phase::ChangesetReview;
+        record_file_write_in_memory(&engine.journal_store, request_id, "write-1", 1, "one.eps");
+        record_file_write_in_memory(&engine.journal_store, request_id, "write-2", 2, "two.eps");
 
         engine
-            .chat(crate::ipc::ChatRequest {
-                text: "수정된 요청".to_string(),
-                attachments: Vec::new(),
+            .changeset_decision(ipc::ChangesetDecisionRequest {
+                decision: ipc::Decision::Accept,
+                ids: ipc::DecisionIds::List(vec!["write-1".to_string()]),
             })
             .await
-            .expect("edited turn should start from the replayed prefix");
-        let prompts = driver_handle.prompts();
-        let replay = prompts.last().expect("edited prompt should be sent");
-        assert!(replay.contains("[first principles]"));
-        assert!(replay.contains("첫 요청"));
-        assert!(replay.contains("첫 답변"));
-        assert!(replay.contains("수정된 요청"));
+            .unwrap();
+        assert_eq!(engine.phase, Phase::ChangesetReview);
+        assert!(engine.runtime.owns_write_lease());
+        assert_eq!(
+            engine.journal_store.entry_count(request_id),
+            1,
+            "only the undecided item remains live"
+        );
 
+        engine
+            .changeset_decision(ipc::ChangesetDecisionRequest {
+                decision: ipc::Decision::Accept,
+                ids: ipc::DecisionIds::All(ipc::AllLiteral),
+            })
+            .await
+            .unwrap();
+        assert_eq!(engine.phase, Phase::Idle);
+        assert!(!engine.runtime.owns_write_lease());
+    }
+
+    #[tokio::test]
+    async fn reject_restores_session_then_grants_next_writer_without_touching_canonical() {
+        let services = crate::tool_exec::ToolServices::for_tests();
+        let runtime_c = services.session("session-c");
+        let runtime_e = services.session("session-e");
+        let dirs = runtime_c.data_dirs();
+        dirs.ensure_dirs().unwrap();
+        let workspace_manager = WorkspaceManager::new(dirs.clone());
+        let snapshot = crate::bridge_io::EpsSnapshot {
+            project: "Sample".to_string(),
+            identity: "C:/maps/sample.scx".to_string(),
+            files: Vec::new(),
+        };
+        let canonical = workspace_manager.prepare_snapshot(&snapshot).unwrap();
+        fs::write(canonical.root.join("specs/state.md"), b"accepted").unwrap();
+        let session_workspace = workspace_manager
+            .prepare_session_snapshot(&snapshot, "session-c")
+            .unwrap();
+        fs::write(
+            session_workspace.root.join("specs/state.md"),
+            b"pending change",
+        )
+        .unwrap();
+
+        let sessions = crate::session::SessionStore::new(&dirs);
+        let record = crate::session::SessionRecord {
+            meta: crate::session::SessionMeta {
+                id: "session-c".to_string(),
+                name: "C".to_string(),
+                project: "Sample".to_string(),
+                created_at: 1,
+                updated_at: 1,
+            },
+            thread_id: None,
+            pending_request_ids: Vec::new(),
+            panel_log: serde_json::Value::Null,
+        };
+        sessions.save(&record).unwrap();
+        let request_c = "req-c";
+        runtime_c.begin_request(request_c, "Sample").unwrap();
+        runtime_c.request_write_lane("C mutation").unwrap();
+        runtime_c
+            .journal()
+            .record(
+                request_c,
+                journal::JournalEntry {
+                    id: "workspace-1".to_string(),
+                    seq: 1,
+                    tool: journal::WriteTool::WorkspaceWrite,
+                    target: journal::JournalTarget::WorkspacePath {
+                        workspace_id: session_workspace.id.clone(),
+                        session_id: Some("session-c".to_string()),
+                        path: "specs/state.md".to_string(),
+                    },
+                    before: journal::Snapshot::FileContent {
+                        content: "accepted".to_string(),
+                    },
+                    after: journal::Snapshot::FileContent {
+                        content: "pending change".to_string(),
+                    },
+                    ts: 1,
+                },
+            )
+            .unwrap();
+        runtime_c.journal().persist(request_c).unwrap();
+
+        let mut engine = AgentEngine::new(
+            FakeCodexDriver::scripted([]),
+            CapturingEventSink::default(),
+            AgentEngineConfig::for_tests(
+                "[project state]\nproject=Sample compiling=false",
+                None,
+                sample_hits(),
+            ),
+            runtime_c,
+            sessions,
+            AttachmentStore::new(dirs.attachments_dir()),
+            record,
+        );
+        engine.current_request_id = Some(request_c.to_string());
+        engine.phase = Phase::Executing;
+        engine.settle_write_lifecycle().unwrap();
+        assert_eq!(engine.phase, Phase::ChangesetReview);
+        assert!(engine.runtime.owns_write_lease());
+
+        runtime_e.begin_request("req-e", "Sample").unwrap();
+        let next = runtime_e.request_write_lane("E mutation").unwrap();
+        assert_eq!(
+            next.state(),
+            crate::write_coordinator::TicketState::Waiting(1)
+        );
+
+        engine
+            .changeset_decision(ipc::ChangesetDecisionRequest {
+                decision: ipc::Decision::Reject,
+                ids: ipc::DecisionIds::All(ipc::AllLiteral),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(next.state(), crate::write_coordinator::TicketState::Granted);
+        assert_eq!(
+            fs::read_to_string(session_workspace.root.join("specs/state.md")).unwrap(),
+            "accepted"
+        );
+        assert_eq!(
+            fs::read_to_string(canonical.root.join("specs/state.md")).unwrap(),
+            "accepted"
+        );
+        fs::remove_dir_all(dirs.app_data()).ok();
+    }
+    #[test]
+    fn pending_review_recovery_precedes_new_writer_ticket() {
+        let base = unique_temp_dir("pending-review-recovery");
+        let dirs = crate::config::DataDirs::from_bases(&base, &base);
+        dirs.ensure_dirs().unwrap();
+        let sessions = crate::session::SessionStore::new(&dirs);
+        let mut record = test_session(&sessions);
+        let request_id = "req-restored";
+        let journal = journal::JournalStore::new(dirs.app_data());
+        record_file_write_in_memory(&journal, request_id, "write-1", 1, "one.eps");
+        journal.persist(request_id).unwrap();
+        record.pending_request_ids = vec![request_id.to_string()];
+        sessions.save(&record).unwrap();
+        let writes = crate::write_coordinator::ProjectWriteCoordinator::silent();
+
+        restore_pending_review(&sessions, &dirs, &writes, "Sample").unwrap();
+        let next = writes
+            .request("Sample", "session-next", "req-next")
+            .unwrap();
+
+        assert_eq!(writes.owner("Sample").unwrap().request_id, request_id);
+        assert_eq!(
+            next.state(),
+            crate::write_coordinator::TicketState::Waiting(1)
+        );
         fs::remove_dir_all(base).ok();
     }
+
+    #[test]
+    fn archived_pending_review_is_removed_from_stale_session_record() {
+        let base = unique_temp_dir("archived-pending-review");
+        let dirs = crate::config::DataDirs::from_bases(&base, &base);
+        dirs.ensure_dirs().unwrap();
+        let sessions = crate::session::SessionStore::new(&dirs);
+        let mut record = test_session(&sessions);
+        let request_id = "req-archived";
+        let journal = journal::JournalStore::new(dirs.app_data());
+        record_file_write_in_memory(&journal, request_id, "write-1", 1, "one.eps");
+        journal.persist(request_id).unwrap();
+        journal.archive(request_id).unwrap();
+        record.pending_request_ids = vec![request_id.to_string()];
+        sessions.save(&record).unwrap();
+        let writes = crate::write_coordinator::ProjectWriteCoordinator::silent();
+
+        restore_pending_review(&sessions, &dirs, &writes, "Sample").unwrap();
+
+        let repaired = sessions.load(&record.meta.id).unwrap();
+        assert!(repaired.pending_request_ids.is_empty());
+        let next = writes
+            .request("Sample", "session-next", "req-next")
+            .unwrap();
+        assert_eq!(next.state(), crate::write_coordinator::TicketState::Granted);
+        fs::remove_dir_all(base).ok();
+    }
+
     #[tokio::test]
-    async fn open_session_reconnects_pending_changeset_from_written_journal() {
-        let base = unique_temp_dir("session-reconnect");
-        let memory = ProjectMemory::new(base.join("memory"), "ExampleProject");
-        let data_dir = base.join("data");
-        let driver = FakeCodexDriver::scripted([]);
+    async fn rollback_failure_keeps_review_owner_and_live_journal() {
         let sink = CapturingEventSink::default();
         let sink_handle = sink.clone();
-        let mut engine = test_engine_with_memory(driver, sink, memory, &data_dir);
+        let mut engine = test_engine(FakeCodexDriver::scripted([]), sink);
+        let request_id = "req-rollback-failure";
+        engine.runtime.begin_request(request_id, "Sample").unwrap();
+        engine.runtime.request_write_lane("test rollback").unwrap();
+        engine.current_request_id = Some(request_id.to_string());
+        record_file_write_in_memory(&engine.journal_store, request_id, "write-1", 1, "one.eps");
 
-        // Write a journal file for a pending request (the executor would have done
-        // this during the prior session's turn).
-        let request_id = "req-deadbeef";
-        record_file_write(
-            &engine.journal_store,
-            request_id,
-            "pending-write",
-            1,
-            "scripts/pending.eps",
-        );
-        // Drop it from the live in-memory store so the reconnect path must reload it
-        // from disk (mirrors a fresh app start).
-        engine.journal_store = journal::JournalStore::new(&data_dir);
-
-        let id = crate::session::new_session_id();
         engine
-            .session_store
-            .save(&crate::session::SessionRecord {
-                meta: crate::session::SessionMeta {
-                    id: id.clone(),
-                    name: "보류된 변경".to_string(),
-                    project: "ExampleProject".to_string(),
-                    created_at: 1,
-                    updated_at: 1,
-                },
-                thread_id: None,
-                pending_request_ids: vec![request_id.to_string()],
-                panel_log: serde_json::json!({ "schemaVersion": 1, "logSeq": 0, "log": [] }),
+            .changeset_decision(ipc::ChangesetDecisionRequest {
+                decision: ipc::Decision::Reject,
+                ids: ipc::DecisionIds::All(ipc::AllLiteral),
             })
-            .expect("seed record should save");
-
-        engine.open_session(&id).await.expect("open should succeed");
-
-        // The pending changeset was re-emitted to the panel and the engine points at
-        // the request so a later decision can finalize it.
-        let changeset = sink_handle
-            .events()
-            .into_iter()
-            .find_map(|event| match event {
-                EngineEvent::Changeset(payload) => Some(payload),
-                _ => None,
-            })
-            .expect("reconnect must re-emit a changeset event");
-        assert_eq!(changeset.request_id, request_id);
-        assert!(!changeset.items.is_empty());
-        assert_eq!(engine.current_request_id.as_deref(), Some(request_id));
+            .await
+            .expect("rollback failure is reported through scoped events");
+        assert!(sink_handle.events().iter().any(|event| matches!(
+            event,
+            EngineEvent::RollbackResult(ipc::RollbackResultEvent { ok: false, .. })
+        )));
         assert_eq!(engine.phase, Phase::ChangesetReview);
-
-        fs::remove_dir_all(base).ok();
+        assert!(engine.runtime.owns_write_lease());
+        assert_eq!(engine.journal_store.entry_count(request_id), 1);
     }
-
     #[tokio::test]
     async fn chat_injects_text_attachments_and_forwards_images_to_codex() {
         let base = unique_temp_dir("chat-attachments");
@@ -4734,6 +5143,8 @@ mod tests {
         }]);
         let driver_handle = driver.clone();
         let sink = CapturingEventSink::default();
+        let sessions = session_store_at(&base);
+        let session = test_session(&sessions);
         let mut engine = AgentEngine::new(
             driver,
             sink,
@@ -4742,9 +5153,10 @@ mod tests {
                 None,
                 sample_hits(),
             ),
-            ToolRuntime::for_tests(),
-            session_store_at(&base),
+            SessionToolRuntime::for_tests(),
+            sessions,
             attachment_store.clone(),
+            session,
         );
 
         engine
@@ -4764,12 +5176,8 @@ mod tests {
         assert!(image_paths[0][0].is_file());
         assert!(attachment_store.discard_draft(&text.id).is_err());
 
-        let session_id = engine
-            .current_session_id
-            .clone()
-            .expect("chat should create a session");
-        engine
-            .delete_session(&session_id)
+        attachment_store
+            .delete_session(&engine.session_id)
             .expect("session delete should clean attachments");
         assert!(!image_paths[0][0].exists());
         fs::remove_dir_all(base).ok();

@@ -410,13 +410,20 @@ mod tests {
         assert!(prompt.ends_with("[epScript 코드]"));
     }
 }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkspaceAccess {
+    Read,
+    Write,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CodexTurnInput {
     pub text: String,
     pub image_paths: Vec<PathBuf>,
-    /// Real per-project Codex cwd. `None` retains the hermetic read-only mode
-    /// used by isolated protocol tests and non-project operations.
+    /// Session-owned per-project Codex cwd. `None` retains the hermetic
+    /// read-only mode used by isolated protocol tests and non-project operations.
     pub workspace_root: Option<PathBuf>,
+    pub workspace_access: WorkspaceAccess,
 }
 
 impl CodexTurnInput {
@@ -425,7 +432,13 @@ impl CodexTurnInput {
             text: text.into(),
             image_paths: Vec::new(),
             workspace_root: None,
+            workspace_access: WorkspaceAccess::Read,
         }
+    }
+
+    pub fn with_access(mut self, access: WorkspaceAccess) -> Self {
+        self.workspace_access = access;
+        self
     }
 }
 
@@ -863,19 +876,30 @@ where
     }
 }
 
-/// Config overrides for every spawned codex app-server. User-local skills and
-/// project docs stay disabled; the only writable execution context is the
-/// app-owned per-project workspace selected by the strict `eud_workspace`
-/// permission profile.
+/// Config overrides shared by read and write app-server processes. The active
+/// default profile is appended by [`app_server_config_overrides`].
 pub(crate) const APP_SERVER_CONFIG_OVERRIDES: [&str; 7] = [
     "skills.include_instructions=false",
     "project_doc_max_bytes=0",
     "model_supports_reasoning_summaries=true",
     "model_reasoning_summary=\"detailed\"",
-    "default_permissions=\"eud_workspace\"",
     "windows.sandbox=\"elevated\"",
-    "permissions.eud_workspace={description=\"eud-agent project workspace\",filesystem={\":minimal\"=\"read\",\":workspace_roots\"={\".\"=\"write\",\"source/**\"=\"read\"}},network={enabled=false}}",
+    "permissions.eud_workspace_read={description=\"eud-agent read-only session workspace\",filesystem={\":minimal\"=\"read\",\":workspace_roots\"={\".\"=\"read\"}},network={enabled=false}}",
+    "permissions.eud_workspace_write={description=\"eud-agent write-owner session workspace\",filesystem={\":minimal\"=\"read\",\":workspace_roots\"={\".\"=\"write\",\"source/**\"=\"read\"}},network={enabled=false}}",
 ];
+
+pub(crate) fn app_server_config_overrides(access: WorkspaceAccess) -> Vec<String> {
+    let mut overrides = APP_SERVER_CONFIG_OVERRIDES
+        .iter()
+        .map(|value| (*value).to_string())
+        .collect::<Vec<_>>();
+    let profile = match access {
+        WorkspaceAccess::Read => "eud_workspace_read",
+        WorkspaceAccess::Write => "eud_workspace_write",
+    };
+    overrides.push(format!("default_permissions=\"{profile}\""));
+    overrides
+}
 
 /// Params for a fresh thread. Project turns use the custom split-filesystem
 /// profile selected at app-server launch; tests/non-project callers retain the
@@ -920,11 +944,12 @@ impl CodexAppServerClient<tokio::process::ChildStdout, tokio::process::ChildStdi
     pub async fn spawn_app_server(
         cwd: impl AsRef<std::path::Path>,
         mcp_port: u16,
+        access: WorkspaceAccess,
     ) -> Result<(Self, tokio::sync::mpsc::Receiver<AppServerEvent>), AppServerError> {
         let codex_cmd = resolve_codex_cmd().map_err(|err| AppServerError::new(err.to_string()))?;
         let mut command = tokio::process::Command::new(codex_cmd);
         command.arg("app-server");
-        for override_arg in APP_SERVER_CONFIG_OVERRIDES {
+        for override_arg in app_server_config_overrides(access) {
             command.arg("-c").arg(override_arg);
         }
         // Attach the eud-tools MCP server so codex's turns can actually call the
@@ -1377,7 +1402,7 @@ mod app_server_override_tests {
     //! Pins the hermetic-turn config overrides: user-local skills and any
     //! AGENTS.md found at/above the cwd must never steer the agent's codex
     //! turns (only our system prompt does).
-    use super::APP_SERVER_CONFIG_OVERRIDES;
+    use super::{app_server_config_overrides, WorkspaceAccess, APP_SERVER_CONFIG_OVERRIDES};
 
     #[test]
     fn well_known_codex_distribution_is_under_the_local_app_data_bin_dir() {
@@ -1434,13 +1459,24 @@ mod app_server_override_tests {
     }
 
     #[test]
-    fn overrides_define_strict_project_workspace_profile() {
+    fn overrides_define_distinct_strict_workspace_profiles() {
         assert!(APP_SERVER_CONFIG_OVERRIDES.contains(&"skills.include_instructions=false"));
         assert!(APP_SERVER_CONFIG_OVERRIDES.contains(&"project_doc_max_bytes=0"));
         assert!(APP_SERVER_CONFIG_OVERRIDES.contains(&"windows.sandbox=\"elevated\""));
         assert!(APP_SERVER_CONFIG_OVERRIDES
             .iter()
-            .any(|value| value.starts_with("permissions.eud_workspace=")));
+            .any(|value| value.starts_with("permissions.eud_workspace_read=")));
+        assert!(APP_SERVER_CONFIG_OVERRIDES
+            .iter()
+            .any(|value| value.starts_with("permissions.eud_workspace_write=")));
+        let read = app_server_config_overrides(WorkspaceAccess::Read);
+        let write = app_server_config_overrides(WorkspaceAccess::Write);
+        assert!(read
+            .iter()
+            .any(|value| value == "default_permissions=\"eud_workspace_read\""));
+        assert!(write
+            .iter()
+            .any(|value| value == "default_permissions=\"eud_workspace_write\""));
     }
 
     #[test]
@@ -1619,7 +1655,9 @@ mod tool_item_tests {
 
 #[cfg(test)]
 mod appserver_tests {
-    use super::{AppServerEvent, CodexAppServerClient, CodexModelSelection, CodexTurnInput};
+    use super::{
+        AppServerEvent, CodexAppServerClient, CodexModelSelection, CodexTurnInput, WorkspaceAccess,
+    };
     use serde_json::{json, Value};
     use std::path::PathBuf;
     use std::time::Duration;
@@ -2083,6 +2121,7 @@ mod appserver_tests {
                 text: "first prompt".to_string(),
                 image_paths: vec![PathBuf::from("C:/tmp/screenshot.png")],
                 workspace_root: None,
+                workspace_access: WorkspaceAccess::Read,
             })
             .await
             .expect("first app-server turn should complete");

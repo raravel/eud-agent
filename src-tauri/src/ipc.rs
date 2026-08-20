@@ -337,18 +337,6 @@ pub struct SessionLoadedEvent {
     pub id: String,
 }
 
-/// `session_active` event payload (session restore): the active session changed
-/// (auto-created on a first turn, or opened). Lets the panel highlight the current
-/// session and target rename. `name` is a label, never a rendered-raw kind string.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SessionActiveEvent {
-    /// The id of the now-active session.
-    pub id: String,
-    /// Its current (auto-derived or renamed) title.
-    pub name: String,
-}
-
 /// `rollback_result` event payload.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RollbackResultEvent {
@@ -592,14 +580,21 @@ pub async fn memory_get(
 
 /// Save one memory file for the current editor project.
 #[tauri::command]
-pub async fn memory_save(
+pub(crate) async fn memory_save(
     state: tauri::State<'_, BridgeManaged>,
+    engines: tauri::State<'_, crate::engine::SessionEngineManager>,
     file: String,
     content: String,
 ) -> Result<MemorySaveResponse, String> {
     let request = MemorySaveRequest { file, content };
     let project = current_project_from_status(state.dirs()).await?;
-    memory_save_payload(state.dirs(), &project, &request.file, &request.content)
+    let dirs = state.dirs().clone();
+    let project_for_write = project.clone();
+    engines
+        .direct_project_write(&project, move || {
+            memory_save_payload(&dirs, &project_for_write, &request.file, &request.content)
+        })
+        .await
 }
 
 /// Build the `wiki_get` payload (the current ledger) for a resolved project name.
@@ -644,13 +639,20 @@ pub async fn wiki_get(state: tauri::State<'_, BridgeManaged>) -> Result<WikiResp
 
 /// Save user-corrected wiki entries for the current editor project.
 #[tauri::command]
-pub async fn wiki_save(
+pub(crate) async fn wiki_save(
     state: tauri::State<'_, BridgeManaged>,
+    engines: tauri::State<'_, crate::engine::SessionEngineManager>,
     entries: std::collections::BTreeMap<String, crate::wiki::LedgerEntry>,
 ) -> Result<WikiResponse, String> {
     let request = WikiSaveRequest { entries };
     let project = current_project_from_status(state.dirs()).await?;
-    wiki_save_payload(state.dirs(), &project, request.entries)
+    let dirs = state.dirs().clone();
+    let project_for_write = project.clone();
+    engines
+        .direct_project_write(&project, move || {
+            wiki_save_payload(&dirs, &project_for_write, request.entries)
+        })
+        .await
 }
 
 /// Refresh and list the current project's real Codex workspace.
@@ -767,14 +769,6 @@ pub fn emit_progress<R: tauri::Runtime>(
     emitter.emit("progress", payload)
 }
 
-/// Emit an `error` event.
-pub fn emit_error<R: tauri::Runtime>(
-    emitter: &impl Emitter<R>,
-    payload: ErrorEvent,
-) -> tauri::Result<()> {
-    emitter.emit("error", payload)
-}
-
 /// Emit a `status` event.
 pub fn emit_status<R: tauri::Runtime>(
     emitter: &impl Emitter<R>,
@@ -789,14 +783,6 @@ pub fn emit_session_loaded<R: tauri::Runtime>(
     payload: SessionLoadedEvent,
 ) -> tauri::Result<()> {
     emitter.emit("session_loaded", payload)
-}
-
-/// Emit a `session_active` event (active session changed).
-pub fn emit_session_active<R: tauri::Runtime>(
-    emitter: &impl Emitter<R>,
-    payload: SessionActiveEvent,
-) -> tauri::Result<()> {
-    emitter.emit("session_active", payload)
 }
 
 #[cfg(test)]

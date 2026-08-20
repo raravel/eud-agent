@@ -138,6 +138,12 @@ impl DataDirs {
         self.app_data.join("workspaces")
     }
 
+    /// Session-owned working roots. Canonical accepted project workspaces remain
+    /// direct children of `workspaces/` and are never used as a writable Codex cwd.
+    pub fn session_workspaces_dir(&self) -> PathBuf {
+        self.workspaces_dir().join(".sessions")
+    }
+
     /// Parent-owned workspace state (turn baselines and trusted metadata).
     ///
     /// This is a sibling of project cwd directories, never a descendant, so a
@@ -223,6 +229,7 @@ impl DataDirs {
             self.memory_dir(),
             self.workspaces_dir(),
             self.workspace_state_dir(),
+            self.session_workspaces_dir(),
             self.map_backups_dir(),
             self.journal_dir(),
             self.sessions_dir(),

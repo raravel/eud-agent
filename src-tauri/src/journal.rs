@@ -32,13 +32,19 @@ pub trait JournalBridge {
     fn write_workspace_file(
         &self,
         _workspace_id: &str,
+        _session_id: Option<&str>,
         path: &str,
         content: &str,
     ) -> Result<(), Self::Error> {
         self.write_file(path, content)
     }
 
-    fn delete_workspace_file(&self, _workspace_id: &str, path: &str) -> Result<(), Self::Error> {
+    fn delete_workspace_file(
+        &self,
+        _workspace_id: &str,
+        _session_id: Option<&str>,
+        path: &str,
+    ) -> Result<(), Self::Error> {
         self.delete_file(path)
     }
 
@@ -142,6 +148,8 @@ pub enum JournalTarget {
     },
     WorkspacePath {
         workspace_id: String,
+        #[serde(default)]
+        session_id: Option<String>,
         path: String,
     },
     Rename {
@@ -336,6 +344,15 @@ impl JournalStore {
         Ok(serde_json::from_slice(&bytes)?)
     }
 
+    pub fn archived_exists(data_dir: impl AsRef<Path>, request_id: &str) -> bool {
+        data_dir
+            .as_ref()
+            .join("journal")
+            .join("accepted")
+            .join(format!("{request_id}.json"))
+            .is_file()
+    }
+
     pub fn record(&self, request_id: &str, entry: JournalEntry) -> Result<(), JournalError> {
         let mut journals = lock(&self.journals)?;
         let journal = journals
@@ -392,6 +409,17 @@ impl JournalStore {
             .unwrap_or(0)
     }
 
+    pub fn selected_entries(
+        &self,
+        request_id: &str,
+        ids: &DecisionIds,
+    ) -> Result<Vec<JournalEntry>, JournalError> {
+        let journal = self.journal(request_id)?;
+        Ok(rejected_entries(&journal, ids)
+            .into_iter()
+            .cloned()
+            .collect())
+    }
     pub fn decide<B>(
         &self,
         request_id: &str,
@@ -418,9 +446,9 @@ impl JournalStore {
                 } else {
                     // A partial reject rolled the rejected entries back via the
                     // inverse ops above; drop them from the journal so the rebuilt
-                    // changeset (and any later default-accept / accept-all) never
-                    // resurrects a rolled-back value into the wiki ledger. The
-                    // still-undecided entries stay for EUD-070 default-accept.
+                    // changeset and a later accept-all never resurrect a rolled-back
+                    // value into the wiki ledger. Still-undecided entries remain live
+                    // and retain the project write lease.
                     let rejected_ids: Vec<String> =
                         rejected.iter().map(|entry| entry.id.clone()).collect();
                     self.forget_entries(request_id, &rejected_ids)?;
@@ -430,8 +458,43 @@ impl JournalStore {
         }
     }
 
-    pub fn finalize_undecided_as_accepted(&self, request_id: &str) -> Result<(), JournalError> {
-        self.archive(request_id)
+    /// Mark selected entries accepted without archiving still-undecided items.
+    /// The caller must promote any session-workspace bytes before this removal.
+    /// Returns `true` only when the request is fully settled and archived.
+    pub fn accept_entries(
+        &self,
+        request_id: &str,
+        ids: &DecisionIds,
+    ) -> Result<bool, JournalError> {
+        if matches!(ids, DecisionIds::All) {
+            self.archive(request_id)?;
+            return Ok(true);
+        }
+        let journal = self.journal(request_id)?;
+        let accepted_ids = rejected_entries(&journal, ids)
+            .into_iter()
+            .map(|entry| entry.id.clone())
+            .collect::<Vec<_>>();
+        self.forget_entries(request_id, &accepted_ids)?;
+        let settled = self
+            .journal(request_id)
+            .map(|journal| journal.entries.is_empty())
+            .unwrap_or(true);
+        if settled {
+            self.archive(request_id)?;
+        }
+        Ok(settled)
+    }
+
+    /// Archive a live empty journal after a partial reject removed its last item.
+    pub fn archive_if_empty(&self, request_id: &str) -> Result<bool, JournalError> {
+        let empty = self
+            .journal(request_id)
+            .map(|journal| journal.entries.is_empty())?;
+        if empty {
+            self.archive(request_id)?;
+        }
+        Ok(empty)
     }
 
     /// Drop the listed entry ids from the in-memory journal and re-persist it, so a
@@ -782,6 +845,7 @@ enum RejectTarget {
     Setting(String),
     WorkspacePath {
         workspace_id: String,
+        session_id: Option<String>,
         path: String,
     },
     PluginIndex(usize),
@@ -797,8 +861,16 @@ impl fmt::Display for RejectTarget {
                 property,
             } => write!(f, "dat:{table}:{dat}:{obj_id}:{property}"),
             Self::Path(path) => write!(f, "path:{path}"),
-            Self::WorkspacePath { workspace_id, path } => {
-                write!(f, "workspace:{workspace_id}:{path}")
+            Self::WorkspacePath {
+                workspace_id,
+                session_id,
+                path,
+            } => {
+                write!(
+                    f,
+                    "workspace:{workspace_id}:{}:{path}",
+                    session_id.as_deref().unwrap_or("legacy")
+                )
             }
             Self::Setting(key) => write!(f, "setting:{key}"),
             Self::PluginIndex(index) => write!(f, "plugin-index:{index}"),
@@ -853,9 +925,14 @@ fn reject_targets(entry: &JournalEntry) -> Result<Vec<RejectTarget>, JournalErro
             property: property.clone(),
         }],
         JournalTarget::Path { path } => vec![RejectTarget::Path(path.clone())],
-        JournalTarget::WorkspacePath { workspace_id, path } => {
+        JournalTarget::WorkspacePath {
+            workspace_id,
+            session_id,
+            path,
+        } => {
             vec![RejectTarget::WorkspacePath {
                 workspace_id: workspace_id.clone(),
+                session_id: session_id.clone(),
                 path: path.clone(),
             }]
         }
@@ -967,10 +1044,10 @@ where
             }
         }
         WriteTool::WorkspaceWrite | WriteTool::WorkspaceDelete => {
-            let (workspace_id, path) = workspace_target_parts(entry)?;
+            let (workspace_id, session_id, path) = workspace_target_parts(entry)?;
             match &entry.before {
                 Snapshot::FileContent { content } | Snapshot::DeletedFile { content, .. } => bridge
-                    .write_workspace_file(workspace_id, path, content)
+                    .write_workspace_file(workspace_id, session_id, path, content)
                     .map_err(bridge_error),
                 _ => Err(invalid_entry(
                     entry,
@@ -979,9 +1056,9 @@ where
             }
         }
         WriteTool::WorkspaceCreate => {
-            let (workspace_id, path) = workspace_target_parts(entry)?;
+            let (workspace_id, session_id, path) = workspace_target_parts(entry)?;
             bridge
-                .delete_workspace_file(workspace_id, path)
+                .delete_workspace_file(workspace_id, session_id, path)
                 .map_err(bridge_error)
         }
         WriteTool::FileRename | WriteTool::FileMove => {
@@ -1052,9 +1129,15 @@ where
         },
     }
 }
-fn workspace_target_parts(entry: &JournalEntry) -> Result<(&str, &str), JournalError> {
+fn workspace_target_parts(
+    entry: &JournalEntry,
+) -> Result<(&str, Option<&str>, &str), JournalError> {
     match &entry.target {
-        JournalTarget::WorkspacePath { workspace_id, path } => Ok((workspace_id, path)),
+        JournalTarget::WorkspacePath {
+            workspace_id,
+            session_id,
+            path,
+        } => Ok((workspace_id, session_id.as_deref(), path)),
         _ => Err(invalid_entry(entry, "expected workspace path target")),
     }
 }
@@ -2375,73 +2458,6 @@ mod tests {
             .join("journal")
             .join("accepted")
             .join("req-accept.json")
-            .exists());
-    }
-
-    #[test]
-    fn mixed_decision_rejects_selected_ids_and_defaults_undecided_to_accepted_on_next_request() {
-        let data_dir = temp_data_dir("mixed");
-        let store = JournalStore::new(&data_dir);
-        let request_id = "req-mixed";
-
-        store
-            .record(
-                request_id,
-                entry(
-                    "reject-me",
-                    1,
-                    WriteTool::FileWrite,
-                    path_target("reject.eps"),
-                    Snapshot::FileContent {
-                        content: "old reject\n".to_owned(),
-                    },
-                    Snapshot::FileContent {
-                        content: "new reject\n".to_owned(),
-                    },
-                ),
-            )
-            .expect("first entry should record");
-        store
-            .record(
-                request_id,
-                entry(
-                    "accept-by-default",
-                    2,
-                    WriteTool::FileWrite,
-                    path_target("accept.eps"),
-                    Snapshot::FileContent {
-                        content: "old accept\n".to_owned(),
-                    },
-                    Snapshot::FileContent {
-                        content: "new accept\n".to_owned(),
-                    },
-                ),
-            )
-            .expect("second entry should record");
-
-        let bridge = FakeBridge::default();
-        store
-            .decide(
-                request_id,
-                ChangesetDecision::reject(DecisionIds::Items(vec!["reject-me".to_owned()])),
-                &bridge,
-            )
-            .expect("selected rejection should apply only selected inverse");
-        store
-            .finalize_undecided_as_accepted(request_id)
-            .expect("next request should accept undecided entries");
-
-        assert_eq!(
-            bridge.ops(),
-            vec![AppliedInverse::WriteFile {
-                path: "reject.eps".to_owned(),
-                content: "old reject\n".to_owned(),
-            }]
-        );
-        assert!(data_dir
-            .join("journal")
-            .join("accepted")
-            .join("req-mixed.json")
             .exists());
     }
 

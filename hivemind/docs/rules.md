@@ -104,27 +104,41 @@ hosting, panel re-arm, and server spawning are REMOVED.
 - NEVER spawn bare `"codex"`. ALWAYS resolve the app-managed executable first and
   fall back to the `which` crate (fail fast if unresolved).
 - App-server launch cwd is app-owned, never the repository or process launch dir. Project
-  turns set the thread/turn cwd to `%appdata%\eud-agent\workspaces\<project-id>` so native
-  glob/grep/shell/patch operate on the real project workspace without discovering repository
-  instructions.
-- Project turns MUST use the strict `eud_workspace` split-filesystem profile: `:minimal`
-  read, current workspace write, `source/**` read-only, network disabled, elevated Windows
-  backend. If exact-root setup is unavailable or denied, fail closed; NEVER downgrade to
-  legacy Windows workspace-write (which grants full-filesystem reads).
-- Only the current project workspace is model-writable. Trusted baselines and acceptance
-  metadata stay in sibling `workspaces/.state/`, outside the thread cwd. `source/` is replaced
-  from one coherent EPSNAPSHOT before each turn and is NEVER a live-editor write path.
-- Native filesystem changes MUST be scanned and journaled at turn end (including timeout
-  cancellation); accept archives them, reject restores the prior UTF-8 text snapshot.
-- `plan_approve` MUST atomically write the exact approved Markdown to
-  `plans/<request-id>.md` before the execution baseline and record authoritative approval
-  metadata outside the workspace. Codex MUST NEVER edit, rename, or delete that plan file.
+  turns use `%appdata%\eud-agent\workspaces\.sessions\<project-id>\<session-id>`; the
+  canonical accepted workspace is never a writable Codex cwd.
+- Read turns MUST use `eud_workspace_read`: `:minimal` runtime reads, current session root
+  read-only, network disabled, elevated exact-root Windows backend.
+- Write turns MUST use `eud_workspace_write`: `:minimal` runtime reads, only the current
+  session root writable, `source/**` read-only, network disabled, elevated exact-root backend.
+  Write mode is available only to the exact project/session/request lease owner. Unsupported
+  setup fails closed; NEVER downgrade to legacy Windows workspace-write.
+- Trusted baselines and acceptance metadata stay in `workspaces/.state/`, outside every Codex
+  cwd. Each session `source/` is replaced from one coherent EPSNAPSHOT and is NEVER a
+  live-editor write path.
+- Native filesystem changes MUST be scanned and journaled at write-turn end, including timeout
+  cancellation. Accept promotes selected session bytes to canonical storage under the lease;
+  promotion and metadata failure MUST restore canonical bytes. Reject restores only the session
+  root.
+- `plan_approve` MUST acquire the project write lease before atomically writing the exact
+  approved Markdown to canonical `plans/<request-id>.md`. The plan is synced before the
+  execution baseline and survives implementation rejection. Codex MUST NEVER edit, rename, or
+  delete that authoritative file.
 - An approved-plan execution MUST NOT report normal completion until the backend verifies
   all project-wiki postconditions: the exact plan snapshot; non-empty `specs/index.md`
   linking a non-empty `specs/*.md` topic page; and `worklog/<request-id>.md` recording the
   actual result/verification and linking a canonical topic spec. Specs describe implemented
   reality, NEVER merely intended work. Missing artifacts get at most two focused repair
   turns, then a visible error; they are never silently waived.
+- Different sessions MAY overlap read-only Codex turns; commands within one session MUST stay
+  serialized. Conversation submission MUST NOT be globally queued.
+- Project mutations MUST register FIFO write intent and retain one lease through mutation,
+  build, review, and complete decision work. Partial decisions, rollback failure, undecided
+  journals, or unpromoted workspace changes MUST NOT release it.
+- On restart, one valid pending journal MUST restore its review lease before any new writer.
+  Conflicting pending writers are an explicit error. Session selection MUST NOT change backend
+  ownership.
+- Every conversation event and cancellation target MUST carry the immutable session id. A
+  mutable global session fallback is forbidden.
 - App-server permission/file/command escalation requests remain declined; only the
   `eud-tools` MCP elicitation is accepted. Live editor/map/DAT/build operations MUST still
   use eud-tools.

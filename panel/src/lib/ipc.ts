@@ -106,6 +106,7 @@ const PUSH_EVENT_TYPES = [
   "rollback_result",
   "progress",
   "error",
+  "session_activity",
   "status",
   "memory",
   "memory_saved",

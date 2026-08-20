@@ -11,14 +11,14 @@ function props(overrides: Partial<SessionSidebarProps> = {}): SessionSidebarProp
         id: "running",
         name: "유닛 밸런스",
         updatedAt: 10,
-        activity: "running",
+        activity: "running_read",
         persisted: true,
       },
       {
         id: "queued",
         name: "트리거 수정",
         updatedAt: 9,
-        activity: "queued",
+        activity: "waiting_write",
         queuePosition: 2,
         persisted: true,
       },
@@ -50,12 +50,11 @@ describe("SessionSidebar", () => {
   it("distinguishes selected, running, queued, and review states", () => {
     render(<SessionSidebar {...props()} />);
 
-    expect(screen.getByRole("button", { name: "트리거 수정, 대기 2" })).toHaveAttribute(
-      "aria-current",
-      "page",
-    );
-    expect(screen.getByText("실행 중")).toBeInTheDocument();
-    expect(screen.getByText("대기 2")).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "트리거 수정, 쓰기 대기 2" }),
+    ).toHaveAttribute("aria-current", "page");
+    expect(screen.getByText("분석 중")).toBeInTheDocument();
+    expect(screen.getByText("쓰기 대기 2")).toBeInTheDocument();
     expect(screen.getByText("검토 필요")).toBeInTheDocument();
   });
 
@@ -63,7 +62,7 @@ describe("SessionSidebar", () => {
     const handlers = props();
     render(<SessionSidebar {...handlers} />);
 
-    fireEvent.click(screen.getByRole("button", { name: "유닛 밸런스, 실행 중" }));
+    fireEvent.click(screen.getByRole("button", { name: "유닛 밸런스, 분석 중" }));
     expect(handlers.onSelect).toHaveBeenCalledWith("running");
 
     fireEvent.click(screen.getByRole("button", { name: "트리거 수정 대기 취소" }));

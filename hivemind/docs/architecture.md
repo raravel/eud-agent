@@ -127,34 +127,46 @@ The bridge finds `Data\agent\` editor-relative (no absolute path baked into the 
 KopiLua reads source as Latin1, so a non-ASCII path literal would corrupt). The app
 reads the editor path from `config.json` (UTF-8-safe) written at install time.
 
-## Per-project Codex workspace
+## Concurrent sessions and project workspaces
 
-Each editor project identity hashes to `%appdata%\eud-agent\workspaces\<sha256>\`, the
-real `cwd` of that project's Codex thread. `specs/`, `plans/`, `decisions/`, and
-`worklog/` are durable writable documents. Before every turn, one coherent EPSNAPSHOT
-atomically replaces `source/`; the split-filesystem permission profile makes that subtree
-read-only while native Codex filesystem operations (glob/grep/shell/patch) remain usable
-elsewhere in the workspace.
+`SessionEngineManager` owns lazily created workers keyed by durable session id. Each worker has
+its own agent state machine, Codex app-server client/event stream, loopback MCP endpoint,
+cancellation generation, request/preflight state, and immutable session event sink. A worker
+mutex serializes only that session's commands, so read-only turns in different sessions overlap.
 
-`specs/index.md` is the canonical project-wiki entry point; it links concise topic pages
-under `specs/`. On `plan_approve`, the app atomically persists the exact approved Markdown
-as `plans/<request-id>.md` before the execution baseline and records its authoritative
-`approved` revision under `.state/`. The plan file therefore survives implementation
-rejection and is immutable during execution.
+Projects share one `ProjectWriteCoordinator`. It queues declared write transactions FIFO and
+holds the lease through mutation, build, changeset review, and complete accept/reject. Review
+therefore blocks later writers without blocking unrelated read turns. Pending journals restore
+their review lease before new writers after restart.
 
-Before an approved-plan execution can report normal completion, the backend verifies the
-plan snapshot, a non-empty linked topic spec from `specs/index.md`, and
-`worklog/<request-id>.md` with actual verification plus a canonical-spec link. Missing
-artifacts trigger at most two focused Codex repair turns; persistent failure is surfaced
-instead of silently declaring the work complete. Small direct edits remain outside this
-completion contract.
+Each project identity hashes to a canonical accepted root:
 
-Trusted turn baselines live under the sibling `workspaces/.state/`, outside the Codex
-workspace root. At turn end the app scans UTF-8 text changes, journals create/modify/delete
-items, and emits them through the normal changeset review. Reject restores the baseline;
-accept archives it. The Windows profile grants only minimal runtime reads plus the current
-workspace, disables network, and requires the elevated exact-root backend. Unsupported or
-denied setup fails closed; it never falls back to legacy Windows full-read workspace-write.
+`%appdata%\eud-agent\workspaces\<sha256>\`
+
+Codex runs from session roots:
+
+`%appdata%\eud-agent\workspaces\.sessions\<sha256>\<session-id>\`
+
+Before a read turn, canonical `specs/`, `plans/`, `decisions/`, and `worklog/` documents are
+delta-synced into the session root and a coherent session-owned `source/` EPSNAPSHOT is refreshed.
+The read sandbox makes the root read-only. Before write mode, the root is rebased again, targets
+must be re-read, a trusted baseline is captured outside the Codex cwd, and the write sandbox
+enables documents while keeping `source/**` read-only.
+
+Workspace accept promotes selected session bytes to the canonical root under the lease and
+records trusted revisions. Promotion and metadata persistence roll back together on failure.
+Reject restores only the session root, so canonical accepted bytes remain unchanged.
+
+`specs/index.md` remains the canonical project-wiki entry point. `plan_approve` writes the exact
+approved Markdown to canonical `plans/<request-id>.md` only after lease grant and before the
+execution baseline. It is synced to the session root, immutable, and survives implementation
+rejection. Approved execution still requires a linked non-empty topic spec and verified linked
+worklog, with at most two focused repair turns.
+
+The named Windows profiles `eud_workspace_read` and `eud_workspace_write` both use minimal
+runtime reads, exact-root elevated sandboxing, and disabled network. The write profile grants
+only the current session root and keeps `source/**` read-only. Unsupported or denied setup fails
+closed.
 
 ## File IPC protocol (app to bridge)
 

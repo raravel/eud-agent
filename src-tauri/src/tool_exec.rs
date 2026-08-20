@@ -1,29 +1,24 @@
-//! Tool executor and the shared per-request runtime.
+//! Shared tool services and one request runtime per conversation session.
 //!
-//! [`ToolRuntime`] is the state that the agentic engine and the MCP tool handler
-//! BOTH touch. The engine holds its mutex across `run_turn().await` (the whole
-//! codex turn), which is exactly when codex issues MCP tool calls — so the live
-//! [`RequestState`] and the change journal cannot live behind the engine mutex or
-//! every tool call would deadlock. They live here instead, keyed by request id
-//! (the "per-request registry" topology): the engine opens a request, the MCP
-//! handler resolves the live request id at tool-call time, and both share one
-//! [`JournalStore`].
+//! [`ToolServices`] owns app-wide immutable/shared services. Each
+//! [`SessionToolRuntime`] is cloned only by one session engine and its MCP
+//! handler, so request ids, evidence/plan/budget gates, preflight state, and
+//! write tickets cannot overwrite another session.
 //!
-//! [`ToolRuntime::execute`] is the single tool entry point: it admits the call
-//! through [`tools::admit_tool_call`] (arg validation + evidence gate + mutation
-//! gate + budgets + btn/xdat first principles), then dispatches to bridge_io /
-//! RAG / mapsafe, snapshotting every write into the journal so the turn's edits
-//! surface as a reviewable changeset. Errors are returned as the verbatim,
-//! correctable tool-error text (EvidenceRequired / admission / bridge message).
+//! [`SessionToolRuntime::execute`] is the single tool entry point. It verifies
+//! write-lease ownership before admitting mutations, applies the existing
+//! validation and safety gates, dispatches bridge/RAG/mapsafe operations, and
+//! journals every project write for changeset review.
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use parking_lot::Mutex;
 use serde_json::{json, Value};
 
 use crate::bridge_io::{BridgeIo, SendOpts, HEARTBEAT_STALE_AFTER};
 use crate::config::DataDirs;
+use crate::edd_runner;
 use crate::eps_preflight::{EpsAnalyzer, EpsCandidate, EpsPreflight};
 use crate::journal::{DatTable, JournalEntry, JournalStore, JournalTarget, Snapshot, WriteTool};
 use crate::mapsafe::{CompilingStatus, IsomEngine, MapSafe, WindowsLockProbe};
@@ -58,32 +53,25 @@ impl CompilingStatus for BridgeCompilingStatus {
 /// probe, isom static-lib engine.
 pub type ProductionMapSafe = MapSafe<BridgeCompilingStatus, WindowsLockProbe, IsomEngine>;
 
-/// Shared mutable tool state spanning the engine and the MCP handler.
-///
-/// Cloning is cheap (everything is `Arc` / `DataDirs`); both the engine and the
-/// MCP server hold a clone of the SAME runtime so journal entries the handler
-/// records are the changeset the engine emits.
+/// Shared, immutable production services. Session workers clone these handles,
+/// while every request gate, plan, preflight snapshot, and write ticket remains
+/// inside a [`SessionToolRuntime`].
 #[derive(Clone)]
-pub struct ToolRuntime {
+pub struct ToolServices {
     dirs: DataDirs,
     journal: JournalStore,
     rag: Arc<Rag>,
     map_safe: Arc<ProductionMapSafe>,
-    eps_preflight: Arc<EpsPreflight>,
-    /// request_id -> live per-request gate/budget state (the registry).
-    registry: Arc<Mutex<HashMap<String, RequestState>>>,
-    /// The request id tool calls resolve against (set by the engine per turn).
-    current: Arc<Mutex<Option<String>>>,
-    /// A `propose_plan` markdown captured during the turn, read by the engine
-    /// after `run_turn` so the turn ends as a plan review rather than an answer.
-    pending_plan: Arc<Mutex<Option<(String, String)>>>,
+    analyzer: Arc<dyn EpsAnalyzer>,
+    writes: crate::write_coordinator::ProjectWriteCoordinator,
 }
 
-impl ToolRuntime {
-    /// Build the runtime from resolved data dirs and an optional-process
-    /// epScript analyzer. RAG remains lazy; analyzer startup is deferred until
-    /// the first `eps_check`.
-    pub fn new(dirs: DataDirs, analyzer: Arc<dyn EpsAnalyzer>) -> Self {
+impl ToolServices {
+    pub fn new(
+        dirs: DataDirs,
+        analyzer: Arc<dyn EpsAnalyzer>,
+        writes: crate::write_coordinator::ProjectWriteCoordinator,
+    ) -> Self {
         let journal = JournalStore::new(dirs.app_data());
         let rag = Arc::new(load_rag(&dirs));
         let map_safe = Arc::new(MapSafe::new(
@@ -92,128 +80,312 @@ impl ToolRuntime {
             WindowsLockProbe,
             IsomEngine,
         ));
-        let eps_preflight = Arc::new(EpsPreflight::new(dirs.clone(), analyzer));
         Self {
             dirs,
             journal,
             rag,
             map_safe,
-            eps_preflight,
-            registry: Arc::new(Mutex::new(HashMap::new())),
-            current: Arc::new(Mutex::new(None)),
-            pending_plan: Arc::new(Mutex::new(None)),
+            analyzer,
+            writes,
         }
     }
 
-    /// The shared change journal (the engine emits/decides changesets from this).
-    pub fn journal(&self) -> &JournalStore {
-        &self.journal
+    pub fn session(&self, session_id: impl Into<String>) -> SessionToolRuntime {
+        SessionToolRuntime::new(self.clone(), session_id.into())
     }
 
-    /// `%appdata%\eud-agent` — the journal data root (engine load-fallback path).
-    pub fn app_data_dir(&self) -> std::path::PathBuf {
-        self.dirs.app_data().to_path_buf()
-    }
-
-    /// Resolved app data roots for parent-owned services such as the Codex
-    /// project workspace. The clone contains paths only.
-    pub fn data_dirs(&self) -> DataDirs {
-        self.dirs.clone()
-    }
-
-    /// The shared RAG handle, for a background warmup that does not gate startup.
     pub fn rag(&self) -> Arc<Rag> {
         Arc::clone(&self.rag)
     }
 
-    /// Open a fresh request: reset the registry to a single clean state for
-    /// `request_id` and point tool calls at it. Past requests' gate state is not
-    /// needed once their turn ends (single editor, single active turn).
-    pub fn begin_request(&self, request_id: &str) {
-        if let Ok(mut registry) = self.registry.lock() {
-            registry.clear();
-            registry.insert(request_id.to_owned(), RequestState::for_request(request_id));
+    pub fn writes(&self) -> &crate::write_coordinator::ProjectWriteCoordinator {
+        &self.writes
+    }
+}
+
+#[derive(Debug, Clone)]
+struct SessionRequest {
+    request_id: String,
+    project_id: String,
+}
+
+#[derive(Debug, Default)]
+struct SessionWriteState {
+    ticket: Option<crate::write_coordinator::WriteTicket>,
+    reason: Option<String>,
+}
+
+/// One session's MCP request state. Clones are shared only by that session's
+/// engine and loopback MCP handler.
+#[derive(Clone)]
+pub struct SessionToolRuntime {
+    services: ToolServices,
+    session_id: String,
+    eps_preflight: Arc<EpsPreflight>,
+    request: Arc<Mutex<Option<SessionRequest>>>,
+    request_state: Arc<Mutex<Option<RequestState>>>,
+    pending_plan: Arc<Mutex<Option<(String, String)>>>,
+    write_state: Arc<Mutex<SessionWriteState>>,
+    execution_lock: Arc<Mutex<()>>,
+}
+
+impl SessionToolRuntime {
+    pub fn new(services: ToolServices, session_id: String) -> Self {
+        let eps_preflight = Arc::new(EpsPreflight::new(
+            services.dirs.clone(),
+            Arc::clone(&services.analyzer),
+        ));
+        Self {
+            services,
+            session_id,
+            eps_preflight,
+            request: Arc::new(Mutex::new(None)),
+            request_state: Arc::new(Mutex::new(None)),
+            pending_plan: Arc::new(Mutex::new(None)),
+            write_state: Arc::new(Mutex::new(SessionWriteState::default())),
+            execution_lock: Arc::new(Mutex::new(())),
         }
-        if let Ok(mut current) = self.current.lock() {
-            *current = Some(request_id.to_owned());
+    }
+
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    pub fn journal(&self) -> &JournalStore {
+        &self.services.journal
+    }
+
+    pub fn app_data_dir(&self) -> std::path::PathBuf {
+        self.services.dirs.app_data().to_path_buf()
+    }
+
+    pub fn data_dirs(&self) -> DataDirs {
+        self.services.dirs.clone()
+    }
+
+    pub fn begin_request(&self, request_id: &str, project_id: &str) -> Result<(), String> {
+        if let Some(ticket) = self.write_state.lock().ticket.as_ref() {
+            return Err(format!(
+                "previous write ticket {} is still active; settle or abort it before opening {request_id}",
+                ticket.request_id()
+            ));
         }
+        *self.request.lock() = Some(SessionRequest {
+            request_id: request_id.to_owned(),
+            project_id: project_id.to_owned(),
+        });
+        *self.request_state.lock() = Some(RequestState::for_request(request_id));
+        *self.pending_plan.lock() = None;
         self.eps_preflight.begin_request(request_id);
+        Ok(())
     }
 
-    /// The request id tool calls currently resolve against, if a turn is open.
     pub fn current_request_id(&self) -> Option<String> {
-        self.current.lock().ok().and_then(|current| current.clone())
+        self.request
+            .lock()
+            .as_ref()
+            .map(|request| request.request_id.clone())
     }
 
-    /// Lift the mutation gate for the open request (plan approved).
+    pub fn current_project_id(&self) -> Option<String> {
+        self.request
+            .lock()
+            .as_ref()
+            .map(|request| request.project_id.clone())
+    }
+
     pub fn approve_current_plan(&self) {
-        let Some(request_id) = self.current_request_id() else {
-            return;
-        };
-        if let Ok(mut registry) = self.registry.lock() {
-            if let Some(state) = registry.get_mut(&request_id) {
-                state.approve_plan();
-            }
+        if let Some(state) = self.request_state.lock().as_mut() {
+            state.approve_plan();
         }
     }
 
-    /// Drop the open-request pointer (turn fully settled / thread reset).
     pub fn clear_current(&self) {
-        if let Ok(mut current) = self.current.lock() {
-            *current = None;
-        }
+        *self.request.lock() = None;
+        *self.request_state.lock() = None;
+        *self.pending_plan.lock() = None;
     }
 
-    /// Take a `propose_plan` markdown captured for `request_id` during the turn.
     pub fn take_pending_plan(&self, request_id: &str) -> Option<String> {
-        let mut guard = self.pending_plan.lock().ok()?;
-        match guard.as_ref() {
-            Some((id, _)) if id == request_id => guard.take().map(|(_, markdown)| markdown),
+        let mut pending = self.pending_plan.lock();
+        match pending.as_ref() {
+            Some((id, _)) if id == request_id => pending.take().map(|(_, markdown)| markdown),
             _ => None,
         }
     }
 
-    /// Admit and execute one tool call for the open request.
-    ///
-    /// Returns the tool result `Value` on success, or the verbatim corrective
-    /// tool-error text on failure (the MCP layer relays it back to codex as a
-    /// tool error so it can self-correct). Blocking bridge/map I/O runs OUTSIDE
-    /// the registry lock; the caller runs this off the async runtime.
+    pub fn request_write_lane(
+        &self,
+        reason: impl Into<String>,
+    ) -> Result<crate::write_coordinator::WriteTicket, String> {
+        let request = self
+            .request
+            .lock()
+            .clone()
+            .ok_or_else(|| "no agent request is open".to_string())?;
+        let mut write = self.write_state.lock();
+        if let Some(ticket) = &write.ticket {
+            return Ok(ticket.clone());
+        }
+        let ticket = self.services.writes.request(
+            &request.project_id,
+            &self.session_id,
+            &request.request_id,
+        )?;
+        write.reason = Some(reason.into());
+        write.ticket = Some(ticket.clone());
+        Ok(ticket)
+    }
+
+    pub fn restore_review(
+        &self,
+        project_id: &str,
+        request_id: &str,
+    ) -> Result<crate::write_coordinator::WriteTicket, String> {
+        let ticket =
+            self.services
+                .writes
+                .restore_review(project_id, &self.session_id, request_id)?;
+        *self.write_state.lock() = SessionWriteState {
+            ticket: Some(ticket.clone()),
+            reason: Some("restored pending review".to_string()),
+        };
+        Ok(ticket)
+    }
+
+    pub fn write_ticket(&self) -> Option<crate::write_coordinator::WriteTicket> {
+        self.write_state.lock().ticket.clone()
+    }
+
+    pub fn write_reason(&self) -> Option<String> {
+        self.write_state.lock().reason.clone()
+    }
+
+    pub fn owns_write_lease(&self) -> bool {
+        let Some(ticket) = self.write_ticket() else {
+            return false;
+        };
+        self.services.writes.owns(
+            ticket.project_id(),
+            ticket.session_id(),
+            ticket.request_id(),
+        )
+    }
+
+    pub fn release_write_lease(&self) -> Result<bool, String> {
+        let ticket = self.write_state.lock().ticket.clone();
+        let Some(ticket) = ticket else {
+            return Ok(false);
+        };
+        let released = self.services.writes.release(ticket.request_id())?;
+        if released {
+            *self.write_state.lock() = SessionWriteState::default();
+        }
+        Ok(released)
+    }
+
+    pub fn cancel_waiting_write(&self) -> Result<bool, String> {
+        let ticket = self.write_state.lock().ticket.clone();
+        let Some(ticket) = ticket else {
+            return Ok(false);
+        };
+        if !matches!(
+            ticket.state(),
+            crate::write_coordinator::TicketState::Waiting(_)
+        ) {
+            return Ok(false);
+        }
+        let cancelled = self.services.writes.cancel(ticket.request_id())?;
+        if cancelled {
+            *self.write_state.lock() = SessionWriteState::default();
+        }
+        Ok(cancelled)
+    }
+
+    /// Release a read turn's write intent after the turn itself failed. Read mode
+    /// cannot mutate the session workspace or call mutating MCP tools, so a
+    /// journal entry here is an invariant violation and must retain the lease.
+    pub fn abort_unmutated_write_intent(&self) -> Result<(), String> {
+        let Some(ticket) = self.write_ticket() else {
+            return Ok(());
+        };
+        if let Some(request_id) = self.current_request_id() {
+            if self.services.journal.entry_count(&request_id) > 0 {
+                return Err(format!(
+                    "cannot abort write ticket {}; request has journaled mutations",
+                    ticket.request_id()
+                ));
+            }
+        }
+        if self.owns_write_lease() && self.release_write_lease()? {
+            return Ok(());
+        }
+        if self.services.writes.cancel(ticket.request_id())? {
+            *self.write_state.lock() = SessionWriteState::default();
+            return Ok(());
+        }
+        if self.owns_write_lease() && self.release_write_lease()? {
+            return Ok(());
+        }
+        if ticket.state() == crate::write_coordinator::TicketState::Cancelled {
+            *self.write_state.lock() = SessionWriteState::default();
+            return Ok(());
+        }
+        Err(format!(
+            "failed to abort stale write ticket {}",
+            ticket.request_id()
+        ))
+    }
+
+    pub fn emit_activity(
+        &self,
+        activity: crate::write_coordinator::SessionActivity,
+        queue_position: Option<usize>,
+    ) {
+        self.services
+            .writes
+            .emit_activity(self.session_id.clone(), activity, queue_position);
+    }
+
     pub fn execute(&self, tool: &str, args: &Value) -> Result<Value, String> {
+        let _execution = self.execution_lock.lock();
         let request_id = self.current_request_id().ok_or_else(|| {
             "no agent request is open; tool calls are only valid during a turn".to_string()
         })?;
 
-        // Admission (validation + gates + budgets + first principles) mutates the
-        // per-request counters under the lock; execution must not hold it.
+        if tools::is_mutating_tool(tool) && !self.owns_write_lease() {
+            return Err(
+                "WriteLeaseRequired: call request_write_lane with the reason for the change, \
+stop this turn, and wait for the backend to resume the same thread in write mode."
+                    .to_string(),
+            );
+        }
+
         {
-            let mut registry = self
-                .registry
-                .lock()
-                .map_err(|_| "tool registry lock poisoned".to_string())?;
-            let state = registry
-                .get_mut(&request_id)
+            let mut state = self.request_state.lock();
+            let state = state
+                .as_mut()
+                .filter(|state| state.request_id == request_id)
                 .ok_or_else(|| format!("request state for {request_id} is missing"))?;
             tools::admit_tool_call(state, tool, args).map_err(|error| error.to_string())?;
         }
 
         let result = self.dispatch(&request_id, tool, args);
-
-        // A successful search lifts the evidence gate for the rest of the request
-        // (zero hits still count — admission records it, execution flags it).
         if result.is_ok() && tool == tools::SEARCH_DOCS_TOOL {
-            if let Ok(mut registry) = self.registry.lock() {
-                if let Some(state) = registry.get_mut(&request_id) {
-                    state.record_search_docs();
-                }
+            if let Some(state) = self.request_state.lock().as_mut() {
+                state.record_search_docs();
             }
         }
-
         result
     }
 
+    #[cfg(test)]
+    fn request_state_snapshot(&self) -> Option<RequestState> {
+        self.request_state.lock().clone()
+    }
+
     fn bridge(&self) -> Result<BridgeIo, String> {
-        crate::ipc::bridge_from_config(&self.dirs)
+        crate::ipc::bridge_from_config(&self.services.dirs)
     }
 
     fn dispatch(&self, request_id: &str, tool: &str, args: &Value) -> Result<Value, String> {
@@ -295,15 +467,28 @@ impl ToolRuntime {
                 let reply = self.send("PLUGLIST")?;
                 Ok(json!({ "plugins": reply.trim() }))
             }
-            "build_errors" => {
-                let reply = self.send("BUILDERR")?;
-                Ok(json!({ "errors": reply.trim() }))
-            }
             tools::MAP_INFO_TOOL => {
                 let bridge = self.bridge()?;
                 tools::map_info(&bridge, args).map_err(stringify)
             }
             tools::SEARCH_DOCS_TOOL => Ok(self.search_docs(args)),
+            tools::REQUEST_WRITE_LANE_TOOL => {
+                let reason = str_arg(args, "reason")?;
+                let ticket = self.request_write_lane(reason)?;
+                let (status, queue_position) = match ticket.state() {
+                    crate::write_coordinator::TicketState::Granted => ("granted", None),
+                    crate::write_coordinator::TicketState::Waiting(position) => {
+                        ("waiting", Some(position))
+                    }
+                    crate::write_coordinator::TicketState::Cancelled => ("cancelled", None),
+                };
+                Ok(json!({
+                    "ok": true,
+                    "status": status,
+                    "queuePosition": queue_position,
+                    "note": "Write intent recorded. Stop this turn now; the backend will resume this thread after the project write lease is granted."
+                }))
+            }
 
             // ---- write tools (journaled) ----
             "dat_set" => self.dat_family_set(
@@ -339,25 +524,37 @@ impl ToolRuntime {
             "plugin_remove" => self.plugin_remove(request_id, args),
             "plugin_move" => self.plugin_move(request_id, args),
             tools::BUILD_RUN_TOOL => {
-                let reply = self.bridge()?.build(&opts, None).map_err(stringify)?;
-                Ok(json!({ "ok": true, "build": reply.trim() }))
+                let bridge = self.bridge()?;
+                let result = edd_runner::build_run(&bridge)?;
+                serde_json::to_value(result)
+                    .map_err(|error| format!("failed to serialize build result: {error}"))
             }
             "location_write" => {
                 let bridge = self.bridge()?;
-                tools::location_write(&bridge, &self.map_safe, &self.journal, request_id, args)
-                    .map_err(stringify)
+                tools::location_write(
+                    &bridge,
+                    &self.services.map_safe,
+                    &self.services.journal,
+                    request_id,
+                    args,
+                )
+                .map_err(stringify)
             }
             "player_setup" => {
                 let bridge = self.bridge()?;
-                tools::player_setup(&bridge, &self.map_safe, &self.journal, request_id, args)
-                    .map_err(stringify)
+                tools::player_setup(
+                    &bridge,
+                    &self.services.map_safe,
+                    &self.services.journal,
+                    request_id,
+                    args,
+                )
+                .map_err(stringify)
             }
             tools::MEMORY_WRITE_TOOL => self.memory_write(args),
             "propose_plan" => {
                 let markdown = str_arg(args, "markdown")?.to_string();
-                if let Ok(mut guard) = self.pending_plan.lock() {
-                    *guard = Some((request_id.to_owned(), markdown));
-                }
+                *self.pending_plan.lock() = Some((request_id.to_owned(), markdown));
                 Ok(json!({
                     "ok": true,
                     "note": "Plan recorded for user review. Stop this turn now and wait for the user to approve before applying any change."
@@ -849,7 +1046,7 @@ impl ToolRuntime {
         if project.is_empty() {
             return Err("no project is open; memory_write needs a connected project".to_string());
         }
-        let memory = ProjectMemory::new(self.dirs.memory_dir(), project);
+        let memory = ProjectMemory::new(self.services.dirs.memory_dir(), project);
         let result = memory.write(file, content);
         if result.ok {
             Ok(json!({ "ok": true, "file": file }))
@@ -871,10 +1068,10 @@ impl ToolRuntime {
         // first, then dense semantic hits fill the rest. A model still warming
         // yields no semantic hits but lexical still works; zero hits either way
         // still lift the evidence gate.
-        let hits = if self.rag.is_empty() {
+        let hits = if self.services.rag.is_empty() {
             Vec::new()
         } else {
-            self.rag.search_hybrid(query, k)
+            self.services.rag.search_hybrid(query, k)
         };
 
         let items: Vec<Value> = hits
@@ -904,21 +1101,22 @@ impl ToolRuntime {
     }
 
     fn next_seq(&self, request_id: &str) -> u64 {
-        self.journal.entry_count(request_id) as u64 + 1
+        self.services.journal.entry_count(request_id) as u64 + 1
     }
 
     fn record(&self, entry: JournalEntry) -> Result<(), String> {
         let request_id = self
             .current_request_id()
             .ok_or_else(|| "no open request to journal against".to_string())?;
-        self.journal.record(&request_id, entry).map_err(stringify)
+        self.services
+            .journal
+            .record(&request_id, entry)
+            .map_err(stringify)
     }
 }
 
 #[cfg(test)]
-impl ToolRuntime {
-    /// Build a runtime rooted at a unique temp dir (no editor, empty RAG) for
-    /// engine/executor tests that never touch a real editor or asset.
+impl ToolServices {
     pub fn for_tests() -> Self {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -930,7 +1128,18 @@ impl ToolRuntime {
             crate::eps_preflight::SkipReason::AdapterMissing,
             "test runtime has no adapter resource",
         ));
-        Self::new(dirs, analyzer)
+        Self::new(
+            dirs,
+            analyzer,
+            crate::write_coordinator::ProjectWriteCoordinator::silent(),
+        )
+    }
+}
+
+#[cfg(test)]
+impl SessionToolRuntime {
+    pub fn for_tests() -> Self {
+        ToolServices::for_tests().session("test-session")
     }
 }
 
@@ -1075,20 +1284,95 @@ mod tests {
     use std::thread;
     use std::time::{Duration, Instant};
 
-    fn open_runtime(request_id: &str) -> ToolRuntime {
-        let runtime = ToolRuntime::for_tests();
-        runtime.begin_request(request_id);
+    fn open_runtime(request_id: &str) -> SessionToolRuntime {
+        let runtime = SessionToolRuntime::for_tests();
+        runtime.begin_request(request_id, "test-project").unwrap();
+        runtime.request_write_lane("test mutation").unwrap();
         runtime
     }
 
     #[test]
     fn execute_without_open_request_is_rejected() {
         // No begin_request -> no live request id to resolve against.
-        let runtime = ToolRuntime::for_tests();
+        let runtime = SessionToolRuntime::for_tests();
         let error = runtime
             .execute("project_status", &json!({}))
             .expect_err("a tool call outside a turn must be rejected");
         assert!(error.contains("no agent request is open"), "got: {error}");
+    }
+
+    #[test]
+    fn failed_read_write_intent_cannot_become_a_ghost_owner() {
+        let services = ToolServices::for_tests();
+        let runtime = services.session("only-session");
+        runtime.begin_request("request-old", "project").unwrap();
+        let old = runtime.request_write_lane("write after read").unwrap();
+        assert_eq!(old.state(), crate::write_coordinator::TicketState::Granted);
+
+        let error = runtime
+            .begin_request("request-new", "project")
+            .expect_err("an active ticket must never be silently discarded");
+        assert!(error.contains("request-old"));
+
+        runtime.abort_unmutated_write_intent().unwrap();
+        runtime.clear_current();
+        runtime.begin_request("request-new", "project").unwrap();
+        let next = runtime.request_write_lane("retry write").unwrap();
+        assert_eq!(
+            next.state(),
+            crate::write_coordinator::TicketState::Granted,
+            "the only session must not queue behind its failed stale request"
+        );
+    }
+
+    #[test]
+    fn every_mutating_tool_requires_the_exact_session_write_lease() {
+        let runtime = SessionToolRuntime::for_tests();
+        runtime.begin_request("req-read-only", "project").unwrap();
+
+        for spec in tools::tool_registry()
+            .into_iter()
+            .filter(|spec| spec.mutating)
+        {
+            let error = runtime
+                .execute(spec.name, &json!({}))
+                .expect_err("read mode must reject every project mutation");
+            assert!(
+                error.starts_with("WriteLeaseRequired:"),
+                "{} bypassed the write lease: {error}",
+                spec.name
+            );
+        }
+    }
+
+    #[test]
+    fn opening_one_session_request_does_not_clear_another_sessions_state() {
+        let services = ToolServices::for_tests();
+        let session_a = services.session("session-a");
+        let session_b = services.session("session-b");
+        session_a.begin_request("request-a", "project").unwrap();
+        {
+            let mut state = session_a.request_state.lock();
+            let state = state.as_mut().expect("session A state");
+            state.record_search_docs();
+            state.approve_plan();
+            state.mutation_count = 2;
+            state.build_fix_attempts = 1;
+        }
+
+        session_b.begin_request("request-b", "project").unwrap();
+
+        let state_a = session_a
+            .request_state_snapshot()
+            .expect("session B must not clear session A");
+        assert!(state_a.docs_searched);
+        assert!(state_a.plan_approved);
+        assert_eq!(state_a.mutation_count, 2);
+        assert_eq!(state_a.build_fix_attempts, 1);
+        assert_eq!(
+            session_b.request_state_snapshot().unwrap().request_id,
+            "request-b"
+        );
     }
 
     #[test]
@@ -1242,8 +1526,13 @@ mod tests {
         let analyzer = Arc::new(ReturningAnalyzer {
             calls: AtomicUsize::new(0),
         });
-        let runtime = ToolRuntime::new(dirs, analyzer.clone());
-        runtime.begin_request("req-eps");
+        let services = ToolServices::new(
+            dirs,
+            analyzer.clone(),
+            crate::write_coordinator::ProjectWriteCoordinator::silent(),
+        );
+        let runtime = services.session("eps-session");
+        runtime.begin_request("req-eps", "project").unwrap();
         let result = runtime
             .execute(
                 tools::EPS_CHECK_TOOL,
@@ -1258,8 +1547,7 @@ mod tests {
         assert_eq!(result["checkedFiles"], json!(["main.eps"]));
         assert_eq!(analyzer.calls.load(Ordering::SeqCst), 1);
         assert_eq!(runtime.journal().entry_count("req-eps"), 0);
-        let registry = runtime.registry.lock().unwrap();
-        let state = registry.get("req-eps").unwrap();
+        let state = runtime.request_state_snapshot().unwrap();
         assert_eq!(state.action_count, 0);
         assert_eq!(state.mutation_count, 0);
         fs::remove_dir_all(base).ok();

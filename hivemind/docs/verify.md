@@ -59,16 +59,28 @@ stages from v1 are retired as `server/` is removed.
   runtime-metadata exclusion, UTF-8/size limits, turn baseline diffing, Workspace journal
   kinds, restore behavior, exact approved-plan persistence/state, and linked
   spec-index/topic/worklog completion checks.
-- Windows sandbox probe: with the installed Codex version and named `eud_workspace`
-  profile, verify workspace write succeeds, `source/` write fails, an unrelated user file
-  cannot be read, an outside write fails, and network stays unavailable. Any unsupported
-  exact-root profile must fail closed.
+- Windows sandbox probe: with the installed Codex version, verify `eud_workspace_read`
+  can read the session root but cannot write it, and `eud_workspace_write` can write documents
+  while `source/**` remains read-only. Both profiles must deny unrelated user reads, outside
+  writes, and network. Unsupported exact-root setup must fail closed.
 - Panel workspace: `npm --prefix panel test -- --run WorkspaceView ChangesetView ipc`
   covers explorer/viewer states, canonical wiki-home ordering, safe relative Markdown
   navigation, approved-plan badges, confined IPC shapes, and category `workspace` diffs.
 - Panel chat control/performance: `npm --prefix panel test -- --run ConversationLog InstructionBox store ipc`
   covers edit-prefix truncation, cancel feedback, live-stage labels, and a 200-entry
   conversation mounting fewer than 50 viewport/overscan rows.
+
+- Concurrent sessions: `cargo test -p eud-agent different_session_read_turns_overlap_and_short_turn_finishes_first`,
+  `cargo test -p eud-agent write_coordinator::tests`,
+  `cargo test -p eud-agent opening_one_session_request_does_not_clear_another_sessions_state`,
+  and `cargo test -p eud-agent workspace::tests::session_`.
+- Panel concurrency: `npm --prefix panel test -- --run App SessionSidebar ipc` proves overlapping
+  chat invokes, immutable event routing, backend activity labels, write-wait cancellation, and
+  selection independence.
+- Mock-Tauri browser smoke: use five sessions. Keep A in a long read while B completes; put C in
+  review; complete D read during C review; show E as `쓰기 대기 1`; reject C and observe E enter
+  `변경 중` only after rollback. Repeat at 1280×800 and 960×720 and require
+  `document.documentElement.scrollWidth === document.documentElement.clientWidth`.
 
 ## E2E (user-assisted, GUI)
 - Editor live test: install the slim bridge, launch the editor + app, and run an agent

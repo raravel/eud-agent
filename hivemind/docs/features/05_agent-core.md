@@ -1,135 +1,139 @@
-# Agent Core (server: codex SDK runner + eud-tools MCP + journal)
+# Agent Core (Rust session workers + eud-tools MCP + project write transactions)
 
-The v2 brain: replaces the v1 single-shot instruct flow (RAG → one codex exec → code event → manual apply) with an agentic loop where codex autonomously calls editor tools in real time. The server stays the policy layer: tool validation, change journal, budgets, plan gating, rollback.
+The in-process Rust backend runs one persistent Codex conversation per saved session. Sessions
+have independent drivers, loopback MCP endpoints, cancellation generations, request gates,
+preflight state, and immutable event sinks. There is no conversation-wide or application-wide
+turn mutex: different sessions may read, search, reason, plan, and answer concurrently.
 
-```mermaid
-graph TD
-    Panel[Panel v2] -- "WS: chat / plan_feedback / plan_approve / changeset_decision" --> App[FastAPI app]
-    App --> Agent[AgentRunner - CodexSDKRunner]
-    Agent -- "thread_start / run / resume, streaming events" --> Codex[codex CLI - official Python SDK]
-    Codex -- "MCP stdio" --> Shim[eud-tools MCP shim]
-    Shim -- "localhost HTTP + token" --> Tools[Tool layer in app]
-    Tools --> Journal[(Change journal)]
-    Tools --> Bridge[bridge_io file IPC]
-    Tools --> RAG[(RAG search_docs)]
-    Tools --> Edd[euddraft runner]
-```
+## Session execution
 
-## Engine (single path)
+`SessionEngineManager` lazily creates one `SessionWorker` for each session id. A worker owns:
 
-- **Official Codex Python SDK** (openai/codex `sdk/python`): `Codex`/`AsyncCodex`, `thread_start()`, `thread.run(prompt)` → TurnResult; streaming JSONL events forwarded to the panel as `agent_event`s. BYO account unchanged; the SDK spawns the same codex binary (resolve via `shutil.which` family rules still apply to any direct spawn).
-- **Conversation continuity (binding — EUD-064, user bug report 2026-06-05)**: the FIRST `chat` of a session starts the codex thread (system prompt as `base_instructions`); EVERY subsequent `chat` RESUMES the same thread (`thread_resume`) so codex retains its own message + tool-call history. A `chat`-per-`thread_start` flow (what v2 initially shipped) is a defect: the agent forgets the previous message. `reset{}` (and a WS reconnect) drops the retained thread id so the next chat starts a fresh conversation. Resumed chats PREPEND refreshed `[project state]` + `[reference context]` (RAG for the new question) to the turn text — `base_instructions` exist only on the first thread. The user's text is labeled with a `[user message]` header after the context sections (EUD-092, live failure 2026-06-06): unlabeled, it read as part of the LAST RAG chunk (the cafe corpus is itself bug-report-shaped) and bug reports were twice dismissed as "no new request"; the system prompt's `[message format]` section pins that ONLY `[user message]` is the instruction and a bug report there is a work request.
-- **Spike-first**: the first task proves install name, thread lifecycle, MCP server attachment (per-thread config injection vs `codex mcp add`), streaming, and Windows behavior before anything builds on it.
-- **eud-tools MCP server**: codex attaches a stdio shim (`python -m eud_agent.mcp_shim`) that forwards JSON-RPC to the running FastAPI server over `127.0.0.1` with the `server.ready` token. All tool logic, validation, journaling, and budget live in the FastAPI process — the shim is dumb transport. EUD-087: the shim is a LOWLEVEL `mcp.server.lowlevel.Server` that advertises the server's params JSON schema VERBATIM as each tool's `inputSchema` and validates incoming args against it shim-side (the prior FastMCP wrapper derived the schema from its `_tool(args: dict)` signature, so codex never saw the real parameter names and invented its own — `{"table","field","id"}` instead of `{"dat","name","objId"}`). Server-side, a missing required arg raises a self-correcting ToolError carrying the usage line (`xdat_get(dat, name, objId)`), and `BridgeBusy` (plus any unexpected exception, via a `/tools/call` last-resort catch) surfaces as an `ok=false` tool result, never an HTTP 500.
-- No LangChain/LangGraph: the outer flow is a small deterministic state machine (`idle → triage → answer | apply | plan_review* → executing → changeset_review → idle`) driven by WS events. Revisit only if v3 needs multi-agent graphs.
+- `AgentEngine<ProductionCodexDriver, SessionEventSink>`;
+- one `CodexAppServerClient` and event receiver while active;
+- one `SessionToolRuntime` and ephemeral loopback eud-tools MCP server;
+- one cancellation generation;
+- the fixed session id used by every conversation event.
 
-## Tools (registry)
+The worker mutex serializes commands in that session only. Selecting a panel row only changes
+the visible `PanelStore`; it never opens, resets, cancels, or transfers backend execution.
+`session_open` hydrates one worker's saved thread and pending review without touching any other
+worker. Resume failure starts a fresh thread with a condensed transcript and the full first-turn
+safety prompt.
 
-Read: `project_status`, `list_files`, `read_file`, `dat_get`, `xdat_get`, `tbl_get`, `req_get`, `btn_get`, `settings_get`, `plugins_list`, `build_errors`, `search_docs` (RAG top-k over the ECA store — wired EUD-086 to the injected in-process `rag.search`; the corpus is KOREAN, so the tool description AND a pinned `[tools]` prompt note instruct codex to query in Korean while keeping eps/API identifiers as-is; `k` clamped to 10; absent/failed RAG → clear ToolError, the same advisory shape as `map_info`).
-Write (journaled): `dat_set`, `xdat_set`, `tbl_set`, `req_set`, `btn_set`, `dat_reset`, `file_create`, `file_write`, `file_rename`, `file_delete`, `file_move`, `mkdir`, `set_main`, `settings_set`, `plugin_add`, `plugin_edit`, `plugin_remove`, `plugin_move`, `build_run`, `location_write` (features/09), `player_setup` (EUD-089 — start locations + OWNR controllers, same map-write rails).
-Flow: `propose_plan(markdown)` — ends the turn for user review (see below).
+## Read and write execution modes
 
-Every tool validates args server-side (numeric ranges, index bounds, type whitelists, FileType guards) BEFORE the bridge call — the bridge's ERROR is the second line of defense, not the first.
+Every Codex turn has explicit `WorkspaceAccess::Read` or `WorkspaceAccess::Write`.
 
-## Native project workspace
+- Read turns use `eud_workspace_read`: minimal runtime reads, the session workspace read-only,
+  and network disabled.
+- Write turns use `eud_workspace_write`: minimal runtime reads, the session workspace writable,
+  `source/**` read-only, and network disabled.
+- Both require the elevated exact-root Windows sandbox. Unsupported or denied setup fails closed.
+- Switching mode respawns the session's app-server when necessary, retains the thread id, and
+  resumes the same conversation.
 
-- Every project identity owns a real `%appdata%\eud-agent\workspaces\<sha256>\` Codex cwd.
-  Native filesystem tools are enabled there, so Codex can glob/grep, run sandboxed shell
-  commands, and patch multiple project documents without MCP CRUD indirection.
-- Writable durable directories: `specs/`, `plans/`, `decisions/`, `worklog/`. `source/` is
-  atomically refreshed from one EPSNAPSHOT before every turn and is a read-only subtree;
-  editor mutations continue exclusively through eud-tools.
-- `specs/index.md` is the canonical project-wiki entry point. Linked `specs/*.md` topic
-  pages describe current implemented behavior; `plans/`, `decisions/`, and `worklog/`
-  retain history without duplicating the canonical facts.
-- `plan_approve` atomically writes the exact approved Markdown to
-  `plans/<request-id>.md` before the execution baseline and records its revision in trusted
-  `.state/` metadata. Codex cannot authoritatively approve a plan and must never mutate
-  this app-owned snapshot.
-- Before an approved execution answer becomes a normal changeset, the engine validates the
-  exact plan, a non-empty topic linked from `specs/index.md`, and
-  `worklog/<request-id>.md` with actual verification plus a canonical-spec link. It resumes
-  Codex with the precise gaps for at most two repair turns. Persistent failure emits an
-  error and preserves any journaled changes for review instead of claiming completion.
-- Codex CodeGraph may create a top-level `.codegraph` link to its external index. The app
-  treats that reserved runtime path as inaccessible metadata: it is excluded from baselines,
-  diffs, and the workspace viewer before symlink validation; all other symlinks still fail.
-- Windows uses a named split-filesystem permission profile (`:minimal` read, current workspace
-  write, `source/**` read-only, network off) with the elevated exact-root backend. Readiness is
-  checked before a turn; setup is requested once and failure/denial aborts the turn rather than
-  downgrading to legacy full-read workspace-write.
-- A baseline outside the Codex cwd is captured before every turn. RAII finalization diffs UTF-8
-  text create/modify/delete changes even when the turn future is cancelled, appends Workspace
-  journal items, and deletes the baseline only after journal persistence. Plan-review turns
-  retain those entries but defer the changeset surface until approval/execution finishes.
-- Workspace document status text is not authoritative. App-recorded user plan approval
-  supplies the `approved` plan state; changeset outcomes remain the only source of accepted
-  document revisions and completed implementation state.
+All initial chats and plan-feedback turns start in read mode. A direct edit calls
+`request_write_lane(reason)`, which records write intent and parks the turn. `plan_approve`
+submits the same request directly in the backend. Mutating tools called without ownership return
+`WriteLeaseRequired`; the read sandbox independently denies native filesystem writes.
 
-## Request scoping across a continuous thread (EUD-064)
+## Project write transaction
 
-- Each `chat` still mints a fresh `request_id` — the journal/changeset scope, the mutation gate, and the action budget all stay PER-REQUEST. Only the codex THREAD persists across chats.
-- The shim env `EUD_REQUEST_ID` is pinned at thread creation and goes STALE once the second chat resumes the thread. The server therefore resolves the live request id at tool-call time: the tool endpoint stamps the engine's CURRENT request id onto every call from an active panel session, ignoring the shim-supplied id (which remains only a fallback for the legacy headless runner / no-session calls).
-- A `reset{}` arriving in `changeset_review` finalizes the prior request first (undecided items default-accept + archive), exactly like a new `chat`.
+`ProjectWriteCoordinator` owns a fair FIFO queue per project. FIFO order is the time write intent
+is registered, not chat submission time. The lease covers the complete transaction:
 
-## Triage and plan gating (mechanical, not advisory)
+1. write intent;
+2. latest accepted state rebase and trusted baseline;
+3. editor/map/memory/native-workspace mutations;
+4. mandatory build and any repair;
+5. changeset review;
+6. complete accept or rollback.
 
-- The system prompt instructs: answer-only requests use no write tools; small edits (≤2 mutations) may apply directly; larger work must `propose_plan` first.
-- Enforcement: the tool layer counts mutations per request. The 3rd mutating call WITHOUT an approved plan returns a tool error directing codex to `propose_plan`. After `plan_approve`, the mutation gate lifts for that request.
-- `propose_plan` ends the codex turn; the panel renders the plan; `plan_feedback{text}` resumes the thread with the feedback (iterate, re-propose); `plan_approve{}` resumes with the approval instruction.
-- Budgets: **30 non-search tool actions per request** (31st rejected) plus a separate
-  **120 `search_docs` calls per request** (121st rejected); either exhaustion tells the
-  agent to wrap up. `eps_check` consumes neither budget. The panel can continue with a
-  fresh per-request budget. `build_run` retains its separate **3 self-fix attempts**.
-- Evidence gate (EUD-090): the `[evidence]` prompt section requires every work unit to cite why + a source link (`[제목](url)`) on plan steps AND the final answer; `[reference context]` chunks carry `source:` link headers to cite verbatim. Enforcement: on a RAG-wired layer, a mutating call is rejected (`EvidenceRequired`) until ONE `search_docs` has run in the request (`RequestState.docs_searched`; zero hits lift it too — such items are marked 근거 없음, never a fabricated source). Exempt: `memory_write`, `build_run`. Without `rag_search` the gate never fires (the agent could not satisfy it).
+The lease is not released for partial decisions, an undecided journal, rollback failure, or a
+cancelled writer that has journaled changes. A review blocks later writers only; read turns in
+other sessions continue. On release the next ticket is granted automatically and its saved thread
+resumes in write mode. Panel `memory_save` and `wiki_save` use the same coordinator through short
+synthetic transactions; session persistence and autosave do not.
 
-## Change journal and rollback
+Backend activities are `idle`, `running_read`, `waiting_write`, `running_write`, `review`, and
+`error`. `queuePosition` exists only for `waiting_write`.
 
-- Every write tool snapshots BEFORE mutating: dat/xdat/tbl/req/btn → old value (+ `was_default` flag); file_write → old content; file_create/mkdir → created marker; file_delete → full content + position; file_rename/move → old path; set_main → old main path; settings/plugins → old value/Texts/index.
-- Entries: `{id, seq, tool, target, before, after, ts}` accumulated per request; persisted as JSON to `<data-dir>/journal/<request-id>.json` (UTF-8 no BOM) so a server crash cannot strand un-reviewable changes.
-- On turn completion the server emits `changeset{request_id, items[]}` (dat items grouped per objId with property/old/new; file items with kind created|modified|deleted and server-side unified diff for modified).
-- `changeset_decision{reject, ids|all}` → inverse ops via the bridge in reverse seq order (dat_set old / RESETDAT when was_default / file_write old / DELFILE created / NEWFILE+content for deleted / RENAME back / SETMAIN old / SETSET old / PLUG inverse). `accept` → journal archived. Mixed per-item decisions supported; un-decided items default to accepted on next request (journal archived with a note).
-- Editor-side risk: the user can save/build between apply and reject — rollback still applies inverse values (memory-only model, same as any edit); the panel warns that reject after a manual save still requires a re-save by the user.
+## Tool state and MCP
 
-## Build error retrieval and self-fix
+`ToolServices` shares immutable/app-wide services: data directories, journal store, RAG, map
+rails, analyzer, and write coordinator. Each `SessionToolRuntime` separately owns:
 
-1. `build_run` → bridge BUILD (SCArchive forced off, preflight paths) → poll `status.txt` compiling until false (timeout 300s).
-2. Errors: bridge `BUILDERR` (macro.macroErrorList). If the build failed with no macro errors, the server re-runs `euddraft.exe <eds>` directly (paths from bridge `EDSPATH`, euddraft path from `settings_get program euddraft`) with captured stdout/stderr — explicit stdin per codex rules — and parses with the editor's documented BuildErrorHandling regex formats. ONE deliberate divergence from the editor regexes (EUD-088): the `[Error] ... Traceback` description regex runs with DOTALL/non-greedy, because eudplib emits the description across MULTIPLE lines (measured live) and the editor's single-line form drops the whole message.
-3. Parsed errors are returned via `build_errors` so codex can self-fix (≤3 attempts), after which the changeset is presented with the failure noted.
-4. Build discipline is PINNED in the system prompt (`[build]` section, EUD-088 — the budget existed since EUD-057 but nothing ever INSTRUCTED codex to build): after applying eps/file changes codex must run `build_run` in the SAME turn, fix-and-rebuild on failure, and report errors verbatim when the budget is spent. Map-setup failures (no Human player/start location) are flagged as map problems, not eps bugs.
+- current request/project id;
+- evidence, mutation, action, search, and build budgets;
+- pending plan;
+- epScript preflight snapshot/suppression state;
+- write ticket and execution lock.
 
-## WS protocol v2
+Each worker hosts its own `127.0.0.1` streamable-HTTP MCP endpoint and shuts it down when the
+worker is discarded. No mutable global request pointer identifies MCP callers.
 
-Client→server: `chat{text}`, `plan_feedback{text}`, `plan_approve{}`, `changeset_decision{accept|reject, ids|all}`, `cancel{}`, `conversation_rewind{panelLog}`, `reset{}` (drop the retained codex thread — next chat starts a fresh conversation; EUD-064), `status{}`, `list{}` (kept for header). `cancel` maps to app-server `turn/interrupt` and settles only after interrupted `turn/completed`; `conversation_rewind` retains the saved session but starts a fresh thread seeded from the surviving panel-log prefix.
-Server→client: `agent_event{kind, detail, data?}` (streamed: thinking/tool_call/tool_result/turn_done; **`reasoning`** carries a reasoning-text delta in `detail` — `item/reasoning/summaryTextDelta` + `item/reasoning/textDelta`; **`delta`** carries an answer-text delta in `detail` — EUD-063; **`data`** (EUD-068) is an optional tool payload — `tool_call` carries `{args}` (the McpToolCall arguments as display text, server-truncated at 4000 chars), `tool_result` carries `{result, status}` (joined MCP content/error text + completed|failed|declined)), `answer{text}`, `plan{markdown, revision}`, `changeset{request_id, items[]}`, `rollback_result{ids, ok}`, `error{message}`, `status{...}`, `progress{stage,...}` (kept: rag_warmup etc.).
-v1 `instruct`/`apply`/`code`/`applied` messages are REMOVED (panel v2 replaces the flow; no compat shim).
+Read tools: `project_status`, `list_files`, `read_file`, `eps_check`, `dat_get`, `xdat_get`,
+`tbl_get`, `req_get`, `btn_get`, `settings_get`, `plugins_list`, `map_info`, `search_docs`.
 
-**Reasoning visibility (EUD-067)**: codex requests `reasoning.summary` from the API only when the MODEL-FAMILY metadata marks summaries as supported — gpt-5.5's family ships with it OFF, so no `item/reasoning/*Delta` ever streamed (live E2E 2026-06-05; probed: forcing the flag produced 79 summary deltas on one turn, zero without). The runner's launch-level config_overrides therefore ALWAYS carry `model_supports_reasoning_summaries=true` + `model_reasoning_summary="detailed"` (composed BEFORE `extra_overrides`, so injection can still flip them).
+Flow tools: `propose_plan(markdown)`, `request_write_lane(reason)`.
 
-**Dynamic Codex model settings**: the Rust app-server client calls paginated `model/list` after authentication and exposes only the current visible picker catalog. The catalog's `supportedReasoningEfforts` order is authoritative. The selected model and effort are validated as a pair, stored in Roaming `config.json` (`codex_model` + `codex_reasoning_effort`), and sent on every subsequent `turn/start` as `model` + `effort`, including an already-retained thread. A retired model falls back to the catalog default; a retired effort falls back to that model's advertised default.
+Write tools: `dat_set`, `xdat_set`, `tbl_set`, `req_set`, `btn_set`, `dat_reset`, `file_create`,
+`file_write`, `file_rename`, `file_delete`, `file_move`, `mkdir`, `set_main`, `settings_set`,
+`plugin_add`, `plugin_edit`, `plugin_remove`, `plugin_move`, `build_run`, `location_write`,
+`player_setup`, `memory_write`.
 
+Evidence, first-principles, mutation-count, action-count, search, and three-build-attempt rails
+remain request scoped. `request_write_lane` is non-mutating and consumes no mutation budget.
 
-**No guardian reviewer; on-request approvals (EUD-067 → EUD-072)**: the SDK default (`auto_review`) spawns a HIDDEN guardian reviewer thread running a full model review turn per MCP tool call (21 review turns in the live E2E — 10-25s silent gaps, ~2x token burn); EUD-067's first cut (`deny_all` → policy "never") removed the guardian but AUTO-REJECTED every MCP tool call ("user rejected MCP tool call" — the model then fell back to `shell_command`). The working shape (probed live 2026-06-05): the runner builds the low-level `CodexClient` directly (the high-level facade hides `approval_handler`) with raw thread params `approvalPolicy: "on-request"`, NO `approvalsReviewer`, `sandbox: "read-only"`; every MCP tool call raises an `mcpServer/elicitation/request` (`_meta.codex_approval_kind == "mcp_tool_call"`) that the approval handler ACCEPTS for the eud-tools server only (`{"action": "accept"}`) and DECLINES for everything else — including `item/commandExecution/requestApproval` / `item/fileChange/requestApproval`, so shell/patch stay denied and the journaled eud-tools remain the agent's only effects. (`default_tools_approval_mode="auto"` on the MCP server entry was probed and does NOT bypass the rejection — dead end, recorded.)
+## Session workspaces
 
-**No skills (EUD-071)**: the launch overrides carry `skills.include_instructions=false`, removing the ENTIRE skill instruction block (personal + system skills) from agent threads — the live E2E rollout showed the operator's hv-clarify skill injected with its "MUST be invoked BEFORE any implementation" instruction. Probed live: with the flag the model reports NO skills. (Path-keyed `skills.config=[{path, enabled=false}]` is IGNORED via `-c` and per-thread config; the honored per-skill entry key is `name` — usable through `CodexIsolation.extra_overrides` if selective filtering is ever wanted.)
+The canonical accepted project workspace remains:
 
-**Background changeset decisions (EUD-070)**: `changeset_decision` runs as a BACKGROUND task (like turns) — a rollback replays inverse ops over the 1s-tick file IPC (2-4s for a 3-property dat group), and awaiting it inline blocked the WS receive loop (every other click queued). One decision at a time (a second decision while one is in flight → error); a `chat` arriving mid-decision drains the decision first; `aclose` cancels it like the turn task.
+`%appdata%\eud-agent\workspaces\<project-id>\`
 
-## Verification contract
+Codex runs from:
 
-- Unit tests: tool validation (bounds/whitelists/guards), journal inverse-op correctness per tool kind (property-based on snapshot→rollback round-trips against a fake bridge), mutation gate (3rd write without plan → error), budgets, euddraft output parser fixtures.
-- Integration: fake-bridge IPC responder + real WS client driving chat→changeset→reject-single→verify inverse .cmd sequence (pattern proven in EUD-034).
-- Spike artifact: a transcript proving codex SDK thread + eud-tools MCP round-trip on Windows.
+`%appdata%\eud-agent\workspaces\.sessions\<project-id>\<session-id>\`
 
-## Implementation
+Before every read turn, accepted canonical documents are delta-synced and a coherent session-owned
+`source/` snapshot is refreshed. Before write mode, the same sync runs again, then the trusted
+baseline is captured. Workspace changes are journaled with both project and session ownership.
+Accept promotes selected session bytes to canonical storage under the lease; promotion and trusted
+metadata update roll back together on failure. Reject restores only the session root, leaving
+canonical bytes unchanged. The app-owned approved plan is written canonical before the execution
+baseline, synced into the session root, remains immutable, and survives implementation rejection.
 
-- `server/eud_agent/agent_runner.py` — AgentRunner interface + CodexSDKRunner
-- `server/eud_agent/mcp_shim.py` — stdio MCP server shim (spawned by codex)
-- `server/eud_agent/tools.py` — registry, validation, mutation gate, budgets
-- `server/eud_agent/journal.py` — snapshots, persistence, inverse ops
-- `server/eud_agent/edd_runner.py` — euddraft direct runner + error regexes
-- `server/eud_agent/app.py` — WS v2 message routing; `orchestrator.py` v1 flow retired
-- `server/tests/test_tools.py` / `test_journal.py` / `test_agent_flow.py` / `test_edd_runner.py`
-- external: official Codex Python SDK; `mcp` Python package (server side of the shim)
-- [BOUND 2026-06-05 from EUD-053-f3ac] `server/spikes/spike_codex_sdk.py` + `server/spikes/dummy_mcp_tool.py` — EUD-053 spike artifacts proving codex SDK thread lifecycle + per-thread MCP attachment (config injection) + tool round-trip on Windows; run manually only (spends real codex tokens)
-- [BOUND 2026-06-05 from EUD-064-acf5] `server/eud_agent/engine.py` — WS v2 state machine (AgentEngine: chat/plan/changeset/reset routing, conversation continuity start-vs-resume, live request-id publication) + build_system_prompt
+## Journal and recovery
+
+Every project mutation is journaled before review. Partial accept removes only accepted entries;
+partial reject rolls back and removes only rejected entries. Remaining entries stay live and keep
+the lease. Accept/reject-all archives only after all required work succeeds.
+
+On startup, session records for a project are scanned before admitting a new writer. One pending
+journal is restored as the project review owner. Multiple legacy pending writers, a missing
+journal, or an empty pending journal is an explicit recovery error; the backend never chooses
+silently. Read turns and unfinished queue tickets are process-local, while journaled writes
+survive restart as review.
+
+## Event and cancellation isolation
+
+`SessionEventSink` is constructed with one immutable session id. `agent_event`, `answer`, `plan`,
+`changeset`, `rollback_result`, turn `progress`, and turn `error` always carry that id. Global
+project/setup/bootstrap/RAG events remain unscoped. There is no `session_active` routing event or
+fallback to the selected panel row.
+
+`cancel {sessionId}` advances only that worker's cancellation generation or removes only its
+waiting write ticket. A writer with journal entries transitions to review and retains ownership.
+
+## Verification
+
+- Barrier-based Rust tests prove overlapping different-session reads and same-session
+  serialization.
+- Coordinator tests prove one writer, write-intent FIFO, queue-position updates, scoped queued
+  cancellation, review retention, and pending-review restoration priority.
+- Runtime tests prove request/evidence/budget/preflight isolation.
+- Workspace tests prove stable session snapshots, accepted promotion, canonical rejection
+  invariance, and approved-plan preservation.
+- Panel integration tests prove overlapping `chat` invokes and strict event-to-`PanelStore`
+  routing.
