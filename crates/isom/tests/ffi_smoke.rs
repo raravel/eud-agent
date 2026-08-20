@@ -5,12 +5,13 @@
 //! because it requires the COLD ~10-15 min isom-sys MSBuild of ICU/CascLib and a
 //! real sample map; run it explicitly with `-- --ignored`.
 
+use std::fs;
 use std::path::PathBuf;
 
-/// The linked static lib reports ABI version 1 (and matches the -sys const).
+/// The linked static lib reports ABI version 2 (and matches the -sys const).
 #[test]
-fn abi_version_is_one() {
-    assert_eq!(isom::abi_version(), 1);
+fn abi_version_is_two() {
+    assert_eq!(isom::abi_version(), 2);
     assert_eq!(isom::abi_version(), isom_sys::ISOM_ABI_VERSION as i32);
 }
 
@@ -23,15 +24,17 @@ fn embedded_nul_path_is_invalid_arg() {
     assert!(matches!(err, isom::IsomError::InvalidArg), "got {err:?}");
 }
 
-/// Extract the CHK from a real EUD map fixture and assert a non-empty buffer
-/// comes back (proving the alloc-copy-free round trip through the C ABI).
+/// Exercise CHK extraction, switch rename, and terrain render against a real map.
 #[test]
-#[ignore = "needs the cold isom-sys MSBuild + sample.scx fixture"]
+#[ignore = "needs the cold isom-sys MSBuild + sample.scx fixture + StarCraft data"]
 fn ffi_smoke() {
     let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
         .join("fixtures")
         .join("sample.scx");
+    let render_fixture = std::env::var_os("ISOM_SMOKE_MAP")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| fixture.clone());
     assert!(
         fixture.is_file(),
         "missing fixture {} — copy a real .scx there",
@@ -43,5 +46,31 @@ fn ffi_smoke() {
     assert!(!chk.is_empty(), "extracted CHK must be non-empty");
     // A real CHK always carries the mandatory sections; a few bytes would mean a
     // truncated/empty extract slipped past. Guard against a degenerate buffer.
-    assert!(chk.len() > 16, "CHK suspiciously small: {} bytes", chk.len());
+    assert!(
+        chk.len() > 16,
+        "CHK suspiciously small: {} bytes",
+        chk.len()
+    );
+
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let edited = std::env::temp_dir().join(format!("isom-switch-smoke-{stamp}.scx"));
+    fs::copy(&fixture, &edited).expect("fixture copy should succeed");
+    isom::switchedit(&edited, b"rename|1|EUD Agent FFI Smoke")
+        .expect("switchedit should rename switch #1 on a copied map");
+    let edited_chk = isom::chk_extract(&edited).expect("edited map should remain readable");
+    assert_ne!(edited_chk, chk, "switch rename should change the CHK");
+    fs::remove_file(&edited).ok();
+
+    assert!(render_fixture.is_file(), "render fixture must exist");
+    let starcraft = PathBuf::from(r"C:\Program Files (x86)\StarCraft");
+    let bmp = isom::render_map(&render_fixture, &starcraft, 8)
+        .expect("render_map should produce terrain pixels from installed game data");
+    assert!(bmp.len() > 54, "rendered BMP must contain pixels");
+    assert_eq!(&bmp[0..2], b"BM");
+    if let Some(output) = std::env::var_os("ISOM_SMOKE_BMP_OUT") {
+        fs::write(output, &bmp).expect("requested smoke BMP should be writable");
+    }
 }

@@ -471,6 +471,10 @@ stop this turn, and wait for the backend to resume the same thread in write mode
                 let bridge = self.bridge()?;
                 tools::map_info(&bridge, args).map_err(stringify)
             }
+            tools::MAP_MINIMAP_TOOL => {
+                let bridge = self.bridge()?;
+                tools::map_minimap(&bridge, args).map_err(stringify)
+            }
             tools::SEARCH_DOCS_TOOL => Ok(self.search_docs(args)),
             tools::REQUEST_WRITE_LANE_TOOL => {
                 let reason = str_arg(args, "reason")?;
@@ -543,6 +547,17 @@ stop this turn, and wait for the backend to resume the same thread in write mode
             "player_setup" => {
                 let bridge = self.bridge()?;
                 tools::player_setup(
+                    &bridge,
+                    &self.services.map_safe,
+                    &self.services.journal,
+                    request_id,
+                    args,
+                )
+                .map_err(stringify)
+            }
+            tools::SWITCH_WRITE_TOOL => {
+                let bridge = self.bridge()?;
+                tools::switch_write(
                     &bridge,
                     &self.services.map_safe,
                     &self.services.journal,

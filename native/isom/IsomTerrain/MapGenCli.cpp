@@ -1665,6 +1665,83 @@ namespace
         return 0;
     }
 
+    // Switch-name editor for an EXISTING map, saved IN PLACE (eud-agent switch_write).
+    // Ops file: rename|<1-based switch id>|<raw name bytes>. Trigger conditions/actions
+    // reference the numeric id, so renaming never rewrites or invalidates trigger logic.
+    int switchEdit(const std::string & mapPath, const std::string & opsPath)
+    {
+        auto mapFile = std::make_unique<MapFile>(mapPath);
+        if ( !mapFile || mapFile->empty() )
+        {
+            std::cerr << "Failed to open map: " << mapPath << std::endl;
+            return 1;
+        }
+        std::ifstream ops(opsPath, std::ios::binary);
+        if ( !ops )
+        {
+            std::cerr << "Failed to open ops file: " << opsPath << std::endl;
+            return 1;
+        }
+
+        size_t applied = 0;
+        std::string line {};
+        try
+        {
+            while ( std::getline(ops, line) )
+            {
+                if ( !line.empty() && line.back() == '\r' )
+                    line.pop_back();
+                if ( line.empty() )
+                    continue;
+
+                const size_t firstPipe = line.find('|');
+                const size_t secondPipe = firstPipe == std::string::npos
+                    ? std::string::npos : line.find('|', firstPipe + 1);
+                if ( firstPipe == std::string::npos || secondPipe == std::string::npos
+                     || line.substr(0, firstPipe) != "rename" )
+                {
+                    std::cerr << "bad op line: " << line << std::endl;
+                    return 1;
+                }
+                const size_t id = std::stoul(line.substr(firstPipe + 1, secondPipe - firstPipe - 1));
+                if ( id < 1 || id > Chk::TotalSwitches )
+                {
+                    std::cerr << "switch #" << id << " is out of range (1-"
+                              << Chk::TotalSwitches << ")" << std::endl;
+                    return 1;
+                }
+                const std::string name = line.substr(secondPipe + 1);
+                if ( name.empty() )
+                {
+                    std::cerr << "switch name must not be empty" << std::endl;
+                    return 1;
+                }
+
+                mapFile->setSwitchName<RawString>(id - 1, RawString(name),
+                    Chk::StrScope::Game, false);
+                std::cout << "OK rename switch #" << id << std::endl;
+                ++applied;
+            }
+        }
+        catch ( const std::exception & e )
+        {
+            std::cerr << "bad op line: " << line << " (" << e.what() << ")" << std::endl;
+            return 1;
+        }
+        if ( applied == 0 )
+        {
+            std::cerr << "ops file contained no operations" << std::endl;
+            return 1;
+        }
+        if ( !mapFile->save(mapPath, true, true, true, false) )
+        {
+            std::cerr << "Failed to save map to: " << mapPath << std::endl;
+            return 1;
+        }
+        std::cout << "SAVED " << applied << " ops" << std::endl;
+        return 0;
+    }
+
     // Standalone seam repair: scan an existing map for adjacency link mismatches and replace
     // offending tiles with same-terrainType, same-height candidates that match neighbors best,
     // never reducing walkable minitiles. Without a rect, scans the whole map; with [x y w h],
@@ -1776,6 +1853,8 @@ int mapGenMain(int argc, char* argv[])
         return locEdit(argv[2], argv[3]);
     else if ( argc >= 4 && std::string(argv[1]) == "playeredit" )
         return playerEdit(argv[2], argv[3]);
+    else if ( argc >= 4 && std::string(argv[1]) == "switchedit" )
+        return switchEdit(argv[2], argv[3]);
     else if ( argc >= 4 && std::string(argv[1]) == "extract" )
         return extractGrid(argv[2], argv[3], argc >= 5 ? argv[4] : defaultScPath);
     else if ( argc >= 8 && std::string(argv[1]) == "clip" )
@@ -1796,6 +1875,7 @@ int mapGenMain(int argc, char* argv[])
               << "  IsomTerrain chk <map.scx> <output.chk>   (extract raw chk)" << std::endl
               << "  IsomTerrain locedit <map.scx> <ops.txt>  (edit MRGN locations in place)" << std::endl
               << "  IsomTerrain playeredit <map.scx> <ops.txt>  (start locations + OWNR controllers in place)" << std::endl
+              << "  IsomTerrain switchedit <map.scx> <ops.txt>  (rename switches in place)" << std::endl
               << "  IsomTerrain extract <map.scx> <output.grid> [starcraft-dir]" << std::endl
               << "  IsomTerrain clip <map.scx> <x> <y> <w> <h> <out.stamp>" << std::endl
               << "  IsomTerrain tiledump <map.scx> <out.txt> [starcraft-dir]" << std::endl

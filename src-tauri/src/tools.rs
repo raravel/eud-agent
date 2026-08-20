@@ -3,10 +3,12 @@
 //! The functions here are small, deterministic backstops for crash-critical
 //! first principles and the EUD-090 evidence requirement.
 
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use base64::Engine;
 use encoding_rs::EUC_KR;
 use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
@@ -31,6 +33,10 @@ const MAX_SEARCH_DOCS_CALLS: usize = 120;
 
 /// Connected source-map digest tool name.
 pub const MAP_INFO_TOOL: &str = "map_info";
+/// Connected source-map minimap image tool name.
+pub const MAP_MINIMAP_TOOL: &str = "map_minimap";
+/// In-place switch rename tool name.
+pub const SWITCH_WRITE_TOOL: &str = "switch_write";
 
 /// Result type used by tool-layer validation and gate checks.
 pub type ToolResult<T> = Result<T, ToolError>;
@@ -334,13 +340,40 @@ pub fn tool_registry() -> Vec<ToolSpec> {
         ),
         tool_spec(
             MAP_INFO_TOOL,
-            "Read connected source-map locations, units, players, and forces.",
+            "Read paged connected-map terrain, placements, switches, players, and forces.",
             false,
             schema(
                 json!({
-                    "mode": enum_string_schema(&["summary", "locations", "units", "players"]),
+                    "mode": enum_string_schema(&[
+                        "summary",
+                        "terrain",
+                        "locations",
+                        "units",
+                        "players",
+                        "switches",
+                    ]),
                     "owner": map_info_owner_schema(),
                     "unitType": integer_or_string_schema(),
+                    "switch": integer_or_string_schema(),
+                    "x": integer_schema(),
+                    "y": integer_schema(),
+                    "width": integer_schema(),
+                    "height": integer_schema(),
+                    "offset": integer_schema(),
+                    "limit": integer_schema(),
+                }),
+                &[],
+            ),
+        ),
+        tool_spec(
+            MAP_MINIMAP_TOOL,
+            "Render the connected map as PNG terrain with an optional unit overlay.",
+            false,
+            schema(
+                json!({
+                    "maxSize": integer_schema(),
+                    "showUnits": {"type": "boolean"},
+                    "starcraftPath": string_schema(),
                 }),
                 &[],
             ),
@@ -619,6 +652,19 @@ pub fn tool_registry() -> Vec<ToolSpec> {
                     ]),
                 }),
                 &["action", "player"],
+            ),
+        ),
+        tool_spec(
+            SWITCH_WRITE_TOOL,
+            "Rename one connected-map switch in place without changing numeric trigger references.",
+            true,
+            schema(
+                json!({
+                    "action": enum_string_schema(&["rename"]),
+                    "switchId": integer_schema(),
+                    "name": string_schema(),
+                }),
+                &["action", "switchId", "name"],
             ),
         ),
         tool_spec(
@@ -1409,6 +1455,7 @@ where
         after: crate::journal::Snapshot::MapEdit {
             action: op.action().to_string(),
             location_id,
+            switch_id: None,
             name: op.name().map(str::to_owned),
         },
         ts,
@@ -1528,6 +1575,7 @@ where
         after: crate::journal::Snapshot::MapEdit {
             action: op.action().to_string(),
             location_id: None,
+            switch_id: None,
             name: None,
         },
         ts,
@@ -1589,6 +1637,174 @@ where
 
     let ts = saved_at_epoch_seconds(SystemTime::now());
     player_setup_apply(map_safe, journal, request_id, path, args, ts)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SwitchWrite {
+    id: usize,
+    name: String,
+}
+
+pub fn parse_switch_write(args: &Value) -> ToolResult<SwitchWrite> {
+    let Some(object) = args.as_object() else {
+        return Err(switch_write_error(
+            "arguments must be a JSON object with action rename, switchId, and name",
+        ));
+    };
+    if object.get("action").and_then(Value::as_str) != Some("rename") {
+        return Err(switch_write_error("action must be rename"));
+    }
+    let id = object
+        .get("switchId")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| switch_write_error("switchId must be an integer from 1 through 256"))?;
+    if !(1..=256).contains(&id) {
+        return Err(switch_write_error(
+            "switchId must be an integer from 1 through 256",
+        ));
+    }
+    let name = object
+        .get("name")
+        .and_then(Value::as_str)
+        .ok_or_else(|| switch_write_error("name must be a non-empty string"))?
+        .trim();
+    if name.is_empty() {
+        return Err(switch_write_error("name must be a non-empty string"));
+    }
+    if name
+        .bytes()
+        .any(|byte| matches!(byte, 0 | b'\r' | b'\n' | b'|'))
+    {
+        return Err(switch_write_error(
+            "name must not contain NUL, a line break, or '|'; those bytes delimit the native op format",
+        ));
+    }
+
+    Ok(SwitchWrite {
+        id: id as usize,
+        name: name.to_owned(),
+    })
+}
+
+pub fn switch_write_apply<S, L, E>(
+    map_safe: &crate::mapsafe::MapSafe<S, L, E>,
+    journal: &crate::journal::JournalStore,
+    request_id: &str,
+    map_path: &Path,
+    chk: &[u8],
+    args: &Value,
+    ts: u64,
+) -> ToolResult<Value>
+where
+    S: crate::mapsafe::CompilingStatus,
+    L: crate::mapsafe::LockProbe,
+    E: crate::mapsafe::MapEngine,
+{
+    let op = parse_switch_write(args)?;
+    let mut ops = format!("rename|{}|", op.id).into_bytes();
+    ops.extend_from_slice(&encode_location_name(&op.name, chk));
+    let backup = map_safe
+        .write(map_path, crate::mapsafe::OpKind::SwitchEdit, &ops)
+        .map_err(|error| switch_write_mapsafe_error(map_safe, map_path, error))?;
+
+    let post_chk = match isom::chk_extract(map_path) {
+        Ok(chk) => chk,
+        Err(isom_error) => std::fs::read(map_path).map_err(|read_error| {
+            switch_write_error(format!(
+                "post-edit CHK extraction failed for {}: {isom_error}; raw CHK fallback failed: {read_error}",
+                map_path.display()
+            ))
+        })?,
+    };
+    let post_digest = crate::chk::digest_chk(&post_chk);
+    let saved_switch = &post_digest.switches[op.id - 1];
+    if saved_switch.name != op.name {
+        let restore_entry = crate::mapsafe::JournalEntry {
+            map_path: backup.map_path.clone(),
+            backup_path: backup.backup_path.clone(),
+        };
+        let restore = map_safe.restore(&restore_entry);
+        return Err(switch_write_error(match restore {
+            Ok(()) => format!(
+                "post-edit verification returned switch #{} as {:?}; the map was restored",
+                op.id, saved_switch.name
+            ),
+            Err(error) => format!(
+                "post-edit verification returned switch #{} as {:?}; restore from {} also failed: {error}",
+                op.id,
+                saved_switch.name,
+                backup.backup_path.display()
+            ),
+        }));
+    }
+
+    let existing = match journal.changeset(request_id) {
+        Ok(changeset) => changeset.items.len() as u64,
+        Err(crate::journal::JournalError::MissingJournal { .. }) => 0,
+        Err(error) => return Err(switch_write_error(error.to_string())),
+    };
+    let seq = existing + 1;
+    let entry = crate::journal::JournalEntry {
+        id: format!("switch-{seq}"),
+        seq,
+        tool: crate::journal::WriteTool::SwitchWrite,
+        target: crate::journal::JournalTarget::Map {
+            path: map_path.to_string_lossy().to_string(),
+            summary: format!("Switch #{} renamed to {:?}", op.id, op.name),
+        },
+        before: crate::journal::Snapshot::MapBackup {
+            map_path: backup.map_path.to_string_lossy().to_string(),
+            backup_path: backup.backup_path.to_string_lossy().to_string(),
+        },
+        after: crate::journal::Snapshot::MapEdit {
+            action: "rename".to_owned(),
+            location_id: None,
+            switch_id: Some(op.id as i64),
+            name: Some(op.name.clone()),
+        },
+        ts,
+    };
+    journal
+        .record(request_id, entry)
+        .map_err(|error| switch_write_error(error.to_string()))?;
+
+    Ok(json!({
+        "ok": true,
+        "action": "rename",
+        "switch": saved_switch,
+        "mapPath": map_path.to_string_lossy().to_string(),
+        "backupPath": backup.backup_path.to_string_lossy().to_string(),
+    }))
+}
+
+pub fn switch_write<S, L, E>(
+    bridge: &crate::bridge_io::BridgeIo,
+    map_safe: &crate::mapsafe::MapSafe<S, L, E>,
+    journal: &crate::journal::JournalStore,
+    request_id: &str,
+    args: &Value,
+) -> ToolResult<Value>
+where
+    S: crate::mapsafe::CompilingStatus,
+    L: crate::mapsafe::LockProbe,
+    E: crate::mapsafe::MapEngine,
+{
+    let (map_path, _) = connected_map_metadata(bridge, SWITCH_WRITE_TOOL)?;
+    let chk = isom::chk_extract(&map_path).map_err(|error| {
+        switch_write_error(format!(
+            "CHK extraction failed for {}: {error}",
+            map_path.display()
+        ))
+    })?;
+    switch_write_apply(
+        map_safe,
+        journal,
+        request_id,
+        &map_path,
+        &chk,
+        args,
+        saved_at_epoch_seconds(SystemTime::now()),
+    )
 }
 
 impl LocWrite {
@@ -1860,49 +2076,20 @@ where
     }
 }
 
-/// Resolve the connected source map through the bridge, extract its CHK, and return a
-/// sliced JSON view of the digest. This is intentionally thin; map parsing, filtering,
-/// and truncation are in [`map_info_view`] for headless tests.
+/// Resolve the connected source map, extract its CHK, and return a paged view.
 pub fn map_info(bridge: &crate::bridge_io::BridgeIo, args: &Value) -> ToolResult<Value> {
-    let map_path_reply = bridge
-        .send(
-            "GETSET project|OpenMapName",
-            &crate::bridge_io::SendOpts::default(),
-            None,
-        )
-        .map_err(|error| map_info_error(format!("bridge GETSET OpenMapName failed: {error}")))?;
-    let map_path = parse_open_map_name_reply(&map_path_reply);
-    if map_path.is_empty() {
-        return Err(map_info_error(
-            "bridge returned an empty project OpenMapName; open or configure a source map",
-        ));
-    }
-
-    let path = Path::new(map_path);
-    let metadata = std::fs::metadata(path).map_err(|error| {
+    let (map_path, saved_at) = connected_map_metadata(bridge, MAP_INFO_TOOL)?;
+    let chk = isom::chk_extract(&map_path).map_err(|error| {
         map_info_error(format!(
-            "source map file is missing or unreadable: {map_path} ({error})"
+            "CHK extraction failed for {}: {error}",
+            map_path.display()
         ))
     })?;
-    if !metadata.is_file() {
-        return Err(map_info_error(format!(
-            "source map path is not a file: {map_path}"
-        )));
-    }
-    let saved_at = metadata
-        .modified()
-        .map(saved_at_epoch_seconds)
-        .map_err(|error| map_info_error(format!("could not read map mtime: {error}")))?;
-
-    let chk = isom::chk_extract(path).map_err(|error| {
-        map_info_error(format!("CHK extraction failed for {map_path}: {error}"))
-    })?;
     let digest = crate::chk::digest_chk(&chk);
-    map_info_view(&digest, args, map_path, saved_at)
+    map_info_view(&digest, args, &map_path.to_string_lossy(), saved_at)
 }
 
-/// Pure view builder for `map_info`: slices a precomputed CHK digest by mode, applies
-/// filters, caps unit output, and attaches the map path/mtime envelope.
+/// Pure view builder for `map_info`: applies mode-specific filters and bounded paging.
 pub fn map_info_view(
     digest: &crate::chk::Digest,
     args: &Value,
@@ -1912,7 +2099,6 @@ pub fn map_info_view(
     let Some(object) = args.as_object() else {
         return Err(map_info_error("map_info arguments must be a JSON object"));
     };
-
     let mode = object
         .get("mode")
         .and_then(Value::as_str)
@@ -1923,29 +2109,40 @@ pub fn map_info_view(
     });
 
     match mode {
-        "summary" => Ok(json!({
-            "map": map,
-            "mode": "summary",
-            "summary": {
-                "header": &digest.map,
-                "activePlayers": active_players(digest),
-                "forces": &digest.forces,
-                "startLocations": {
-                    "count": digest.start_locations.len(),
-                    "items": &digest.start_locations,
+        "summary" => {
+            let used_switches = switch_usage_counts(digest);
+            Ok(json!({
+                "map": map,
+                "mode": "summary",
+                "summary": {
+                    "header": &digest.map,
+                    "terrain": {
+                        "tileCount": usize::from(digest.map.width) * usize::from(digest.map.height),
+                        "availableTileCount": digest.tiles.len(),
+                        "tileGroups": tile_group_counts(&digest.tiles),
+                    },
+                    "activePlayers": active_players(digest),
+                    "forces": &digest.forces,
+                    "startLocations": {
+                        "count": digest.start_locations.len(),
+                        "items": &digest.start_locations,
+                    },
+                    "locations": {
+                        "count": digest.locations.len(),
+                        "names": digest.locations.iter().map(|location| location.name.clone()).collect::<Vec<_>>(),
+                    },
+                    "unitsByOwner": units_by_owner(digest),
+                    "switches": {
+                        "capacity": digest.switches.len(),
+                        "named": digest.switches.iter().filter(|switch| !switch.name.is_empty()).count(),
+                        "used": used_switches.len(),
+                        "usages": digest.switch_usages.len(),
+                    },
                 },
-                "locations": {
-                    "count": digest.locations.len(),
-                    "names": digest.locations.iter().map(|location| location.name.clone()).collect::<Vec<_>>(),
-                },
-                "unitsByOwner": units_by_owner(digest),
-            },
-        })),
-        "locations" => Ok(json!({
-            "map": map,
-            "mode": "locations",
-            "locations": &digest.locations,
-        })),
+            }))
+        }
+        "terrain" => terrain_view(digest, object, map),
+        "locations" => locations_view(digest, object, map),
         "units" => units_view(digest, object, map),
         "players" => Ok(json!({
             "map": map,
@@ -1953,8 +2150,9 @@ pub fn map_info_view(
             "players": &digest.players,
             "forces": &digest.forces,
         })),
+        "switches" => switches_view(digest, object, map),
         other => Err(map_info_error(format!(
-            "invalid map_info mode {other:?}; expected summary, locations, units, or players"
+            "invalid map_info mode {other:?}; expected summary, terrain, locations, units, players, or switches"
         ))),
     }
 }
@@ -1991,38 +2189,124 @@ fn units_by_owner(digest: &crate::chk::Digest) -> BTreeMap<String, BTreeMap<Stri
     owners
 }
 
+fn tile_group_counts(tiles: &[u16]) -> BTreeMap<u16, usize> {
+    let mut groups = BTreeMap::new();
+    for tile in tiles {
+        *groups.entry(tile / 16).or_default() += 1;
+    }
+    groups
+}
+
+fn terrain_view(
+    digest: &crate::chk::Digest,
+    args: &Map<String, Value>,
+    map: Value,
+) -> ToolResult<Value> {
+    let map_width = usize::from(digest.map.width);
+    let map_height = usize::from(digest.map.height);
+    if map_width == 0 || map_height == 0 {
+        return Err(map_info_error(
+            "terrain is unavailable because DIM is missing or empty",
+        ));
+    }
+
+    let x = optional_nonnegative(args, "x")?.unwrap_or(0);
+    let y = optional_nonnegative(args, "y")?.unwrap_or(0);
+    if x >= map_width || y >= map_height {
+        return Err(map_info_error(format!(
+            "terrain origin ({x},{y}) is outside map bounds {map_width}x{map_height}"
+        )));
+    }
+    let width = optional_nonnegative(args, "width")?.unwrap_or(map_width - x);
+    let height = optional_nonnegative(args, "height")?.unwrap_or(map_height - y);
+    if width == 0 || height == 0 || x + width > map_width || y + height > map_height {
+        return Err(map_info_error(format!(
+            "terrain rectangle ({x},{y},{width},{height}) must be non-empty and within {map_width}x{map_height}"
+        )));
+    }
+
+    let total = width.saturating_mul(height);
+    let (offset, limit) = page_args(args, 256, 1_024)?;
+    let end = offset.saturating_add(limit).min(total);
+    let mut tiles = Vec::with_capacity(end.saturating_sub(offset));
+    for position in offset.min(total)..end {
+        let tile_x = x + position % width;
+        let tile_y = y + position / width;
+        let value = digest.tiles.get(tile_y * map_width + tile_x).copied();
+        tiles.push(json!({
+            "x": tile_x,
+            "y": tile_y,
+            "value": value,
+            "group": value.map(|tile| tile / 16),
+            "variant": value.map(|tile| tile % 16),
+        }));
+    }
+
+    Ok(json!({
+        "map": map,
+        "mode": "terrain",
+        "rect": {"x": x, "y": y, "width": width, "height": height},
+        "count": total,
+        "availableTileCount": digest.tiles.len(),
+        "offset": offset,
+        "limit": limit,
+        "hasMore": end < total,
+        "tiles": tiles,
+    }))
+}
+
+fn locations_view(
+    digest: &crate::chk::Digest,
+    args: &Map<String, Value>,
+    map: Value,
+) -> ToolResult<Value> {
+    let (offset, limit) = page_args(args, 255, 255)?;
+    let total = digest.locations.len();
+    let end = offset.saturating_add(limit).min(total);
+    let locations = digest
+        .locations
+        .iter()
+        .skip(offset.min(total))
+        .take(end.saturating_sub(offset.min(total)))
+        .collect::<Vec<_>>();
+    Ok(json!({
+        "map": map,
+        "mode": "locations",
+        "count": total,
+        "offset": offset,
+        "limit": limit,
+        "hasMore": end < total,
+        "locations": locations,
+    }))
+}
+
 fn units_view(
     digest: &crate::chk::Digest,
     args: &Map<String, Value>,
     map: Value,
 ) -> ToolResult<Value> {
-    const UNIT_LIMIT: usize = 200;
-
     let owner_filter = args.get("owner").and_then(Value::as_str);
     let unit_type_filter = args.get("unitType").map(parse_unit_type_filter);
-
-    let mut filtered = Vec::new();
-    for unit in &digest.units {
-        if let Some(owner) = &owner_filter {
-            if !unit_owner_matches_filter(&unit.owner, owner) {
-                continue;
-            }
-        }
-        if let Some(filter) = &unit_type_filter {
-            if !unit_matches_type_filter(unit, filter) {
-                continue;
-            }
-        }
-        filtered.push(unit);
-    }
-
+    let filtered = digest
+        .units
+        .iter()
+        .filter(|unit| {
+            owner_filter.map_or(true, |owner| unit_owner_matches_filter(&unit.owner, owner))
+                && unit_type_filter
+                    .as_ref()
+                    .map_or(true, |filter| unit_matches_type_filter(unit, filter))
+        })
+        .collect::<Vec<_>>();
     let total = filtered.len();
+    let (offset, limit) = page_args(args, 200, 200)?;
+    let end = offset.saturating_add(limit).min(total);
     let units = filtered
         .into_iter()
-        .take(UNIT_LIMIT)
-        .cloned()
+        .skip(offset.min(total))
+        .take(end.saturating_sub(offset.min(total)))
         .collect::<Vec<_>>();
-    let mut value = json!({
+
+    Ok(json!({
         "map": map,
         "mode": "units",
         "filters": {
@@ -2030,20 +2314,113 @@ fn units_view(
             "unitType": args.get("unitType").cloned().unwrap_or(Value::Null),
         },
         "count": total,
+        "offset": offset,
+        "limit": limit,
+        "hasMore": end < total,
         "units": units,
-    });
+    }))
+}
 
-    if total > UNIT_LIMIT {
-        value["truncated"] = Value::Bool(true);
-        value["dropped"] = json!(total - UNIT_LIMIT);
-        value["hint"] = json!(format!(
-            "showing first {UNIT_LIMIT} units after filters owner={:?}, unitType={:?}",
-            args.get("owner"),
-            args.get("unitType")
-        ));
+fn switches_view(
+    digest: &crate::chk::Digest,
+    args: &Map<String, Value>,
+    map: Value,
+) -> ToolResult<Value> {
+    let filter = args.get("switch").map(parse_switch_filter);
+    let counts = switch_usage_counts(digest);
+    let switches = digest
+        .switches
+        .iter()
+        .filter(|switch| {
+            (filter.is_some() || !switch.name.is_empty() || counts.contains_key(&switch.id))
+                && filter
+                    .as_ref()
+                    .map_or(true, |filter| switch_matches_filter(switch, filter))
+        })
+        .map(|switch| {
+            let (conditions, actions) = counts.get(&switch.id).copied().unwrap_or_default();
+            json!({
+                "id": switch.id,
+                "name": switch.name,
+                "conditionCount": conditions,
+                "actionCount": actions,
+                "usageCount": conditions + actions,
+            })
+        })
+        .collect::<Vec<_>>();
+    let usages = digest
+        .switch_usages
+        .iter()
+        .filter(|usage| {
+            filter.as_ref().map_or(true, |filter| {
+                digest
+                    .switches
+                    .get(usage.switch_id - 1)
+                    .is_some_and(|switch| switch_matches_filter(switch, filter))
+            })
+        })
+        .collect::<Vec<_>>();
+    let total_usages = usages.len();
+    let (offset, limit) = page_args(args, 100, 200)?;
+    let end = offset.saturating_add(limit).min(total_usages);
+    let usages = usages
+        .into_iter()
+        .skip(offset.min(total_usages))
+        .take(end.saturating_sub(offset.min(total_usages)))
+        .collect::<Vec<_>>();
+
+    Ok(json!({
+        "map": map,
+        "mode": "switches",
+        "filter": args.get("switch").cloned().unwrap_or(Value::Null),
+        "capacity": digest.switches.len(),
+        "switches": switches,
+        "usageCount": total_usages,
+        "offset": offset,
+        "limit": limit,
+        "hasMore": end < total_usages,
+        "usages": usages,
+    }))
+}
+
+fn switch_usage_counts(digest: &crate::chk::Digest) -> BTreeMap<usize, (usize, usize)> {
+    let mut counts = BTreeMap::<usize, (usize, usize)>::new();
+    for usage in &digest.switch_usages {
+        let count = counts.entry(usage.switch_id).or_default();
+        match usage.kind {
+            crate::chk::SwitchUsageKind::Condition => count.0 += 1,
+            crate::chk::SwitchUsageKind::Action => count.1 += 1,
+        }
     }
+    counts
+}
 
-    Ok(value)
+fn page_args(
+    args: &Map<String, Value>,
+    default_limit: usize,
+    max_limit: usize,
+) -> ToolResult<(usize, usize)> {
+    let offset = optional_nonnegative(args, "offset")?.unwrap_or(0);
+    let limit = optional_nonnegative(args, "limit")?.unwrap_or(default_limit);
+    if limit == 0 || limit > max_limit {
+        return Err(map_info_error(format!(
+            "limit must be from 1 through {max_limit}"
+        )));
+    }
+    Ok((offset, limit))
+}
+
+fn optional_nonnegative(args: &Map<String, Value>, name: &str) -> ToolResult<Option<usize>> {
+    let Some(value) = args.get(name) else {
+        return Ok(None);
+    };
+    let value = value
+        .as_i64()
+        .ok_or_else(|| map_info_error(format!("{name} must be an integer")))?;
+    if value < 0 {
+        return Err(map_info_error(format!("{name} must be >= 0")));
+    }
+    Ok(Some(value as usize))
 }
 
 fn unit_owner_matches_filter(unit_owner: &str, filter: &str) -> bool {
@@ -2080,6 +2457,317 @@ fn unit_matches_type_filter(unit: &crate::chk::Unit, filter: &UnitTypeFilter) ->
     }
 }
 
+enum SwitchFilter {
+    Id(usize),
+    Name(String),
+}
+
+fn parse_switch_filter(value: &Value) -> SwitchFilter {
+    if let Some(id) = value.as_u64() {
+        return SwitchFilter::Id(id as usize);
+    }
+    if let Some(text) = value.as_str() {
+        if let Ok(id) = text.trim().parse::<usize>() {
+            return SwitchFilter::Id(id);
+        }
+        return SwitchFilter::Name(text.to_lowercase());
+    }
+    SwitchFilter::Id(usize::MAX)
+}
+
+fn switch_matches_filter(switch: &crate::chk::MapSwitch, filter: &SwitchFilter) -> bool {
+    match filter {
+        SwitchFilter::Id(id) => switch.id == *id,
+        SwitchFilter::Name(text) => switch.name.to_lowercase().contains(text),
+    }
+}
+
+pub fn map_minimap(bridge: &crate::bridge_io::BridgeIo, args: &Value) -> ToolResult<Value> {
+    let Some(object) = args.as_object() else {
+        return Err(map_minimap_error(
+            "map_minimap arguments must be a JSON object",
+        ));
+    };
+    let max_size = object.get("maxSize").and_then(Value::as_i64).unwrap_or(512);
+    if !(128..=2_048).contains(&max_size) {
+        return Err(map_minimap_error(
+            "maxSize must be an integer from 128 through 2048",
+        ));
+    }
+    let show_units = object
+        .get("showUnits")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+
+    let (map_path, saved_at) = connected_map_metadata(bridge, MAP_MINIMAP_TOOL)?;
+    let chk = isom::chk_extract(&map_path).map_err(|error| {
+        map_minimap_error(format!(
+            "CHK extraction failed for {}: {error}",
+            map_path.display()
+        ))
+    })?;
+    let digest = crate::chk::digest_chk(&chk);
+
+    let candidates = starcraft_path_candidates(bridge, object)?;
+    let mut failures = Vec::new();
+    let mut rendered = None;
+    for starcraft_path in candidates {
+        match isom::render_map(&map_path, &starcraft_path, 8) {
+            Ok(bmp) => {
+                rendered = Some((bmp, starcraft_path));
+                break;
+            }
+            Err(error) => failures.push(format!("{} ({error})", starcraft_path.display())),
+        }
+    }
+    let Some((bmp, starcraft_path)) = rendered else {
+        return Err(map_minimap_error(format!(
+            "native terrain render failed; checked StarCraft data paths: {}. Pass starcraftPath explicitly when the game data is elsewhere",
+            failures.join(", ")
+        )));
+    };
+
+    let (source_width, source_height, source_rgb) = decode_bmp24(&bmp)?;
+    let (width, height, mut rgb) =
+        resize_rgb_to_fit(source_width, source_height, &source_rgb, max_size as usize);
+    if show_units {
+        overlay_units(&mut rgb, width, height, &digest);
+    }
+    let png = encode_png(width, height, &rgb)?;
+
+    Ok(json!({
+        "map": {
+            "path": map_path.to_string_lossy().to_string(),
+            "savedAt": saved_at,
+        },
+        "layers": {
+            "terrain": true,
+            "units": show_units,
+        },
+        "unitCount": if show_units { digest.units.len() } else { 0 },
+        "renderer": {
+            "starcraftPath": starcraft_path.to_string_lossy().to_string(),
+        },
+        "image": {
+            "mimeType": "image/png",
+            "width": width,
+            "height": height,
+            "data": BASE64_STANDARD.encode(png),
+        },
+    }))
+}
+
+fn starcraft_path_candidates(
+    bridge: &crate::bridge_io::BridgeIo,
+    args: &Map<String, Value>,
+) -> ToolResult<Vec<PathBuf>> {
+    if let Some(path) = args.get("starcraftPath").and_then(Value::as_str) {
+        if path.trim().is_empty() {
+            return Err(map_minimap_error("starcraftPath must not be empty"));
+        }
+        return Ok(vec![PathBuf::from(path)]);
+    }
+
+    let mut candidates = Vec::new();
+    if let Some(path) = std::env::var_os("STARCRAFT_PATH") {
+        candidates.push(PathBuf::from(path));
+    }
+    candidates.push(PathBuf::from(r"C:\Program Files (x86)\StarCraft"));
+    if let Some(editor_root) = bridge
+        .data_dir()
+        .parent()
+        .and_then(Path::parent)
+        .map(Path::to_path_buf)
+    {
+        candidates.push(editor_root);
+    }
+    candidates.dedup();
+    Ok(candidates)
+}
+
+fn decode_bmp24(bmp: &[u8]) -> ToolResult<(usize, usize, Vec<u8>)> {
+    if bmp.len() < 54 || &bmp[0..2] != b"BM" {
+        return Err(map_minimap_error(
+            "native renderer returned an invalid BMP header",
+        ));
+    }
+    let pixel_offset = u32::from_le_bytes(bmp[10..14].try_into().unwrap()) as usize;
+    let width = i32::from_le_bytes(bmp[18..22].try_into().unwrap());
+    let signed_height = i32::from_le_bytes(bmp[22..26].try_into().unwrap());
+    let bits_per_pixel = u16::from_le_bytes(bmp[28..30].try_into().unwrap());
+    let compression = u32::from_le_bytes(bmp[30..34].try_into().unwrap());
+    if width <= 0 || signed_height == 0 || bits_per_pixel != 24 || compression != 0 {
+        return Err(map_minimap_error(
+            "native renderer returned an unsupported BMP layout",
+        ));
+    }
+    let width = width as usize;
+    let height = signed_height.unsigned_abs() as usize;
+    let row_bytes = width
+        .checked_mul(3)
+        .and_then(|bytes| bytes.checked_add(3))
+        .map(|bytes| bytes & !3)
+        .ok_or_else(|| map_minimap_error("rendered BMP dimensions overflow"))?;
+    let pixel_bytes = row_bytes
+        .checked_mul(height)
+        .and_then(|bytes| pixel_offset.checked_add(bytes))
+        .ok_or_else(|| map_minimap_error("rendered BMP dimensions overflow"))?;
+    if pixel_bytes > bmp.len() {
+        return Err(map_minimap_error(
+            "native renderer returned truncated BMP pixels",
+        ));
+    }
+
+    let mut rgb = vec![0; width * height * 3];
+    let bottom_up = signed_height > 0;
+    for y in 0..height {
+        let source_y = if bottom_up { height - 1 - y } else { y };
+        let source_row = pixel_offset + source_y * row_bytes;
+        for x in 0..width {
+            let source = source_row + x * 3;
+            let target = (y * width + x) * 3;
+            rgb[target] = bmp[source + 2];
+            rgb[target + 1] = bmp[source + 1];
+            rgb[target + 2] = bmp[source];
+        }
+    }
+    Ok((width, height, rgb))
+}
+
+fn resize_rgb_to_fit(
+    source_width: usize,
+    source_height: usize,
+    source: &[u8],
+    max_size: usize,
+) -> (usize, usize, Vec<u8>) {
+    if source_width <= max_size && source_height <= max_size {
+        return (source_width, source_height, source.to_vec());
+    }
+    let scale = (max_size as f64 / source_width as f64).min(max_size as f64 / source_height as f64);
+    let width = (source_width as f64 * scale).round().max(1.0) as usize;
+    let height = (source_height as f64 * scale).round().max(1.0) as usize;
+    let mut resized = vec![0; width * height * 3];
+    for y in 0..height {
+        let source_y = y * source_height / height;
+        for x in 0..width {
+            let source_x = x * source_width / width;
+            let from = (source_y * source_width + source_x) * 3;
+            let to = (y * width + x) * 3;
+            resized[to..to + 3].copy_from_slice(&source[from..from + 3]);
+        }
+    }
+    (width, height, resized)
+}
+
+fn overlay_units(rgb: &mut [u8], width: usize, height: usize, digest: &crate::chk::Digest) {
+    let map_width = usize::from(digest.map.width) * 32;
+    let map_height = usize::from(digest.map.height) * 32;
+    if map_width == 0 || map_height == 0 {
+        return;
+    }
+    let radius = (width.max(height) / 256).clamp(1, 4);
+    for unit in &digest.units {
+        let x = (usize::from(unit.x) * width / map_width).min(width.saturating_sub(1));
+        let y = (usize::from(unit.y) * height / map_height).min(height.saturating_sub(1));
+        let color = owner_minimap_color(&unit.owner);
+        let marker_radius = if unit.type_id == crate::chk::_START_LOCATION_TYPE {
+            (radius + 1).min(5)
+        } else {
+            radius
+        };
+        for py in y.saturating_sub(marker_radius)..=(y + marker_radius).min(height - 1) {
+            for px in x.saturating_sub(marker_radius)..=(x + marker_radius).min(width - 1) {
+                let target = (py * width + px) * 3;
+                rgb[target..target + 3].copy_from_slice(&color);
+            }
+        }
+    }
+}
+
+fn owner_minimap_color(owner: &str) -> [u8; 3] {
+    const COLORS: [[u8; 3]; 12] = [
+        [244, 4, 4],
+        [12, 72, 204],
+        [44, 180, 148],
+        [136, 64, 156],
+        [248, 140, 20],
+        [112, 48, 20],
+        [204, 224, 208],
+        [252, 252, 56],
+        [8, 128, 8],
+        [252, 252, 124],
+        [0, 228, 252],
+        [116, 20, 20],
+    ];
+    let slot = owner
+        .strip_prefix('P')
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|number| number.parse::<usize>().ok())
+        .and_then(|number| number.checked_sub(1));
+    slot.and_then(|slot| COLORS.get(slot).copied())
+        .unwrap_or([224, 224, 224])
+}
+
+fn encode_png(width: usize, height: usize, rgb: &[u8]) -> ToolResult<Vec<u8>> {
+    let width =
+        u32::try_from(width).map_err(|_| map_minimap_error("minimap width exceeds PNG limits"))?;
+    let height = u32::try_from(height)
+        .map_err(|_| map_minimap_error("minimap height exceeds PNG limits"))?;
+    let mut output = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut output, width, height);
+        encoder.set_color(png::ColorType::Rgb);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder
+            .write_header()
+            .map_err(|error| map_minimap_error(format!("PNG header failed: {error}")))?;
+        writer
+            .write_image_data(rgb)
+            .map_err(|error| map_minimap_error(format!("PNG encoding failed: {error}")))?;
+    }
+    Ok(output)
+}
+
+fn connected_map_metadata(
+    bridge: &crate::bridge_io::BridgeIo,
+    tool: &str,
+) -> ToolResult<(PathBuf, u64)> {
+    let reply = bridge
+        .send(
+            "GETSET project|OpenMapName",
+            &crate::bridge_io::SendOpts::default(),
+            None,
+        )
+        .map_err(|error| {
+            map_tool_error(tool, format!("bridge GETSET OpenMapName failed: {error}"))
+        })?;
+    let map_path = parse_open_map_name_reply(&reply);
+    if map_path.is_empty() {
+        return Err(map_tool_error(
+            tool,
+            "bridge returned an empty project OpenMapName; open or configure a source map",
+        ));
+    }
+    let path = PathBuf::from(map_path);
+    let metadata = std::fs::metadata(&path).map_err(|error| {
+        map_tool_error(
+            tool,
+            format!("source map file is missing or unreadable: {map_path} ({error})"),
+        )
+    })?;
+    if !metadata.is_file() {
+        return Err(map_tool_error(
+            tool,
+            format!("source map path is not a file: {map_path}"),
+        ));
+    }
+    let saved_at = metadata
+        .modified()
+        .map(saved_at_epoch_seconds)
+        .map_err(|error| map_tool_error(tool, format!("could not read map mtime: {error}")))?;
+    Ok((path, saved_at))
+}
+
 fn saved_at_epoch_seconds(time: SystemTime) -> u64 {
     time.duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
@@ -2098,10 +2786,14 @@ fn parse_open_map_name_reply(reply: &str) -> &str {
     }
 }
 
-fn map_info_error(message: impl Into<String>) -> ToolError {
+fn map_tool_error(tool: &str, message: impl Into<String>) -> ToolError {
     ToolError::AdmissionRejected {
-        message: format!("map_info: {}", message.into()),
+        message: format!("{tool}: {}", message.into()),
     }
+}
+
+fn map_info_error(message: impl Into<String>) -> ToolError {
+    map_tool_error(MAP_INFO_TOOL, message)
 }
 
 fn location_write_error(message: impl Into<String>) -> ToolError {
@@ -2113,6 +2805,48 @@ fn location_write_error(message: impl Into<String>) -> ToolError {
 fn player_setup_error(message: impl Into<String>) -> ToolError {
     ToolError::AdmissionRejected {
         message: format!("player_setup: {}", message.into()),
+    }
+}
+
+fn map_minimap_error(message: impl Into<String>) -> ToolError {
+    map_tool_error(MAP_MINIMAP_TOOL, message)
+}
+
+fn switch_write_error(message: impl Into<String>) -> ToolError {
+    map_tool_error(SWITCH_WRITE_TOOL, message)
+}
+
+fn switch_write_mapsafe_error<S, L, E>(
+    map_safe: &crate::mapsafe::MapSafe<S, L, E>,
+    map_path: &Path,
+    error: crate::mapsafe::MapSafeError,
+) -> ToolError
+where
+    S: crate::mapsafe::CompilingStatus,
+    L: crate::mapsafe::LockProbe,
+    E: crate::mapsafe::MapEngine,
+{
+    match error {
+        crate::mapsafe::MapSafeError::Verify { detail, backup } => {
+            let entry = crate::mapsafe::JournalEntry {
+                map_path: map_path.to_path_buf(),
+                backup_path: backup.clone(),
+            };
+            match map_safe.restore(&entry) {
+                Ok(()) => switch_write_error(format!(
+                    "post-edit verification failed ({detail}); the map was restored from backup {}",
+                    backup.display()
+                )),
+                Err(restore_error) => switch_write_error(format!(
+                    "post-edit verification failed ({detail}); restore from backup {} also failed: {restore_error}. Recover manually from this backup.",
+                    backup.display()
+                )),
+            }
+        }
+        crate::mapsafe::MapSafeError::Compiling => switch_write_error(
+            "compiling guard refused: the editor is building right now; retry after the build finishes",
+        ),
+        _ => switch_write_error(error.to_string()),
     }
 }
 
@@ -2246,6 +2980,30 @@ mod tests {
         }
     }
 
+    struct SwitchWriteFakeEngine {
+        applied_bytes: Vec<u8>,
+    }
+
+    impl crate::mapsafe::MapEngine for SwitchWriteFakeEngine {
+        fn apply(
+            &self,
+            map: &Path,
+            kind: crate::mapsafe::OpKind,
+            ops: &[u8],
+        ) -> Result<(), String> {
+            assert_eq!(kind, crate::mapsafe::OpKind::SwitchEdit);
+            assert!(
+                ops.starts_with(b"rename|1|"),
+                "switch_write should encode a switchedit rename op"
+            );
+            fs::write(map, &self.applied_bytes).map_err(|error| error.to_string())
+        }
+
+        fn digest(&self, _map: &Path) -> Result<Vec<u8>, String> {
+            Ok(self.applied_bytes.clone())
+        }
+    }
+
     const TOOL_TEST_MRGN_ENTRY_SIZE: usize = 20;
 
     fn tool_test_temp_dir(test_name: &str) -> PathBuf {
@@ -2316,6 +3074,17 @@ mod tests {
         chk.extend_from_slice(&tool_test_section("STRx", &strx));
         chk.extend_from_slice(&tool_test_section("MRGN", &mrgn));
         chk
+    }
+
+    fn tool_test_chk_with_switch(name: &[u8]) -> Vec<u8> {
+        let strx = tool_test_strx(&[name]);
+        let mut swnm = vec![0; 256 * crate::chk::SWNM_ENTRY_SIZE];
+        swnm[0..4].copy_from_slice(&1u32.to_le_bytes());
+        [
+            tool_test_section("STRx", &strx),
+            tool_test_section("SWNM", &swnm),
+        ]
+        .concat()
     }
 
     fn tool_test_unit_entry(
@@ -2857,6 +3626,112 @@ mod tests {
     }
 
     #[test]
+    fn switch_write_parse_rejects_bad_ids_and_op_delimiters() {
+        assert_eq!(
+            parse_switch_write(&serde_json::json!({
+                "action": "rename",
+                "switchId": 1,
+                "name": "Door Control",
+            }))
+            .unwrap(),
+            SwitchWrite {
+                id: 1,
+                name: "Door Control".to_owned(),
+            }
+        );
+        for args in [
+            serde_json::json!({"action": "rename", "switchId": 0, "name": "x"}),
+            serde_json::json!({"action": "rename", "switchId": 257, "name": "x"}),
+            serde_json::json!({"action": "rename", "switchId": 1, "name": "a|b"}),
+            serde_json::json!({"action": "rename", "switchId": 1, "name": ""}),
+        ] {
+            assert!(parse_switch_write(&args).is_err(), "must reject {args}");
+        }
+    }
+
+    #[test]
+    fn switch_write_apply_uses_mapsafe_and_records_verified_rename() {
+        let data_dir = tool_test_temp_dir("switch-write-apply");
+        let map_path = data_dir.join("demo.scx");
+        let pre_edit_chk = tool_test_chk_with_switch(b"Old Name");
+        let post_edit_chk = tool_test_chk_with_switch(b"Door Control");
+        fs::write(&map_path, &pre_edit_chk).expect("temp map should be writable");
+        let map_safe = crate::mapsafe::MapSafe::new(
+            data_dir.clone(),
+            LocationWriteFakeStatus(false),
+            LocationWriteFakeLock(false),
+            SwitchWriteFakeEngine {
+                applied_bytes: post_edit_chk.clone(),
+            },
+        );
+        let journal = crate::journal::JournalStore::new(&data_dir);
+        let request_id = "req-switch-write";
+
+        let result = switch_write_apply(
+            &map_safe,
+            &journal,
+            request_id,
+            &map_path,
+            &pre_edit_chk,
+            &serde_json::json!({
+                "action": "rename",
+                "switchId": 1,
+                "name": "Door Control",
+            }),
+            1_781_000_003,
+        )
+        .expect("switch rename should apply through mapsafe");
+
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["switch"]["id"], 1);
+        assert_eq!(result["switch"]["name"], "Door Control");
+        assert_eq!(fs::read(&map_path).unwrap(), post_edit_chk);
+        assert_eq!(journal.changeset(request_id).unwrap().items.len(), 1);
+    }
+
+    #[test]
+    #[ignore = "requires the native isom engine and real sample.scx"]
+    fn switch_write_real_map_roundtrip_verifies_exact_name() {
+        let data_dir = tool_test_temp_dir("switch-write-real");
+        let map_path = data_dir.join("demo.scx");
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("crates")
+            .join("isom")
+            .join("tests")
+            .join("fixtures")
+            .join("sample.scx");
+        fs::copy(&fixture, &map_path).expect("sample map copy should succeed");
+        let pre_edit_chk = isom::chk_extract(&map_path).expect("sample CHK should extract");
+        let map_safe = crate::mapsafe::MapSafe::new(
+            data_dir.clone(),
+            LocationWriteFakeStatus(false),
+            LocationWriteFakeLock(false),
+            crate::mapsafe::IsomEngine,
+        );
+        let journal = crate::journal::JournalStore::new(&data_dir);
+
+        let result = switch_write_apply(
+            &map_safe,
+            &journal,
+            "req-switch-write-real",
+            &map_path,
+            &pre_edit_chk,
+            &serde_json::json!({
+                "action": "rename",
+                "switchId": 1,
+                "name": "EUD Agent Real Smoke",
+            }),
+            1_781_000_004,
+        )
+        .expect("real switch rename should round-trip through native save");
+
+        assert_eq!(result["switch"]["id"], 1);
+        assert_eq!(result["switch"]["name"], "EUD Agent Real Smoke");
+        fs::remove_dir_all(data_dir).ok();
+    }
+
+    #[test]
     fn player_setup_parse_accepts_valid_action_shapes() {
         assert_eq!(
             parse_player_setup(&serde_json::json!({
@@ -3189,6 +4064,26 @@ mod tests {
                 tile_y: 5,
             }],
             units,
+            tiles: (0..64 * 128).map(|index| (index % 32) as u16).collect(),
+            switches: (1..=256)
+                .map(|id| crate::chk::MapSwitch {
+                    id,
+                    name: if id == 1 {
+                        "Door Control".to_owned()
+                    } else {
+                        String::new()
+                    },
+                })
+                .collect(),
+            switch_usages: vec![crate::chk::SwitchUsage {
+                switch_id: 1,
+                trigger_id: 3,
+                kind: crate::chk::SwitchUsageKind::Condition,
+                index: 2,
+                operation: crate::chk::SwitchOperation::Set,
+                raw_operation: None,
+                disabled: false,
+            }],
         }
     }
 
@@ -3201,10 +4096,22 @@ mod tests {
             y,
             tile_x: x / 32,
             tile_y: y / 32,
+            class_id: 0,
+            relation_flags: 0,
+            valid_state_flags: 0,
+            valid_field_flags: 0,
             hp_percent: 100,
             shield_percent: 100,
             energy_percent: 100,
             resources: 0,
+            hangar_amount: 0,
+            state_flags: 0,
+            cloaked: false,
+            burrowed: false,
+            in_transit: false,
+            hallucinated: false,
+            invincible: false,
+            relation_class_id: 0,
         }
     }
 
@@ -3286,9 +4193,35 @@ mod tests {
                 false,
                 schema(
                     serde_json::json!({
-                        "mode": enum_string_schema(&["summary", "locations", "units", "players"]),
+                        "mode": enum_string_schema(&[
+                            "summary",
+                            "terrain",
+                            "locations",
+                            "units",
+                            "players",
+                            "switches",
+                        ]),
                         "owner": map_info_owner_schema(),
                         "unitType": integer_or_string_schema(),
+                        "switch": integer_or_string_schema(),
+                        "x": integer_schema(),
+                        "y": integer_schema(),
+                        "width": integer_schema(),
+                        "height": integer_schema(),
+                        "offset": integer_schema(),
+                        "limit": integer_schema(),
+                    }),
+                    &[],
+                ),
+            ),
+            (
+                MAP_MINIMAP_TOOL,
+                false,
+                schema(
+                    serde_json::json!({
+                        "maxSize": integer_schema(),
+                        "showUnits": {"type": "boolean"},
+                        "starcraftPath": string_schema(),
                     }),
                     &[],
                 ),
@@ -3538,6 +4471,18 @@ mod tests {
                 ),
             ),
             (
+                SWITCH_WRITE_TOOL,
+                true,
+                schema(
+                    serde_json::json!({
+                        "action": enum_string_schema(&["rename"]),
+                        "switchId": integer_schema(),
+                        "name": string_schema(),
+                    }),
+                    &["action", "switchId", "name"],
+                ),
+            ),
+            (
                 MEMORY_WRITE_TOOL,
                 true,
                 schema(
@@ -3605,7 +4550,7 @@ mod tests {
         let error = admit_tool_call(
             &mut state,
             MAP_INFO_TOOL,
-            &serde_json::json!({"mode": "terrain"}),
+            &serde_json::json!({"mode": "fog"}),
         )
         .unwrap_err();
 
@@ -3721,6 +4666,10 @@ mod tests {
         );
         assert_eq!(value["summary"]["unitsByOwner"]["P1"]["Terran Marine"], 2);
         assert_eq!(value["summary"]["unitsByOwner"]["P2"]["Protoss Zealot"], 1);
+        assert_eq!(value["summary"]["terrain"]["tileCount"], 64 * 128);
+        assert_eq!(value["summary"]["terrain"]["availableTileCount"], 64 * 128);
+        assert_eq!(value["summary"]["switches"]["named"], 1);
+        assert_eq!(value["summary"]["switches"]["used"], 1);
     }
 
     #[test]
@@ -3755,7 +4704,7 @@ mod tests {
         assert_eq!(units["mode"], "units");
         assert_eq!(units["count"], 2);
         assert_eq!(units["units"][0]["type"], "Terran Marine");
-        assert!(units.get("truncated").is_none());
+        assert_eq!(units["hasMore"], false);
 
         let players = map_info_view(
             &digest,
@@ -3839,27 +4788,121 @@ mod tests {
     }
 
     #[test]
-    fn map_info_units_caps_at_200_and_reports_truncation() {
+    fn map_info_units_pages_after_filters() {
         let units = (0..205)
             .map(|idx| unit(0, "Terran Marine", "P1", idx, 160))
             .collect();
         let digest = sample_digest(units);
 
-        let value = map_info_view(
+        let first = map_info_view(
             &digest,
             &serde_json::json!({"mode": "units", "owner": "P1", "unitType": "Marine"}),
             "demo.scx",
             10,
         )
         .unwrap();
+        assert_eq!(first["count"], 205);
+        assert_eq!(first["units"].as_array().unwrap().len(), 200);
+        assert_eq!(first["offset"], 0);
+        assert_eq!(first["limit"], 200);
+        assert_eq!(first["hasMore"], true);
+        assert_eq!(first["filters"]["owner"], "P1");
+        assert_eq!(first["filters"]["unitType"], "Marine");
 
-        assert_eq!(value["count"], 205);
-        assert_eq!(value["units"].as_array().unwrap().len(), 200);
-        assert_eq!(value["truncated"], true);
-        assert_eq!(value["dropped"], 5);
-        assert!(value["hint"].as_str().unwrap().contains("owner"));
-        assert_eq!(value["filters"]["owner"], "P1");
-        assert_eq!(value["filters"]["unitType"], "Marine");
+        let second = map_info_view(
+            &digest,
+            &serde_json::json!({"mode": "units", "owner": "P1", "offset": 200, "limit": 5}),
+            "demo.scx",
+            10,
+        )
+        .unwrap();
+        assert_eq!(second["units"].as_array().unwrap().len(), 5);
+        assert_eq!(second["units"][0]["x"], 200);
+        assert_eq!(second["hasMore"], false);
+    }
+
+    #[test]
+    fn map_info_terrain_filters_rectangle_and_pages_tiles() {
+        let digest = sample_digest(Vec::new());
+        let value = map_info_view(
+            &digest,
+            &serde_json::json!({
+                "mode": "terrain",
+                "x": 1,
+                "y": 2,
+                "width": 3,
+                "height": 2,
+                "offset": 2,
+                "limit": 3,
+            }),
+            "demo.scx",
+            10,
+        )
+        .unwrap();
+
+        assert_eq!(value["count"], 6);
+        assert_eq!(value["offset"], 2);
+        assert_eq!(value["hasMore"], true);
+        assert_eq!(
+            value["tiles"][0],
+            serde_json::json!({
+                "x": 3,
+                "y": 2,
+                "value": 3,
+                "group": 0,
+                "variant": 3,
+            })
+        );
+        assert_eq!(value["tiles"][2]["x"], 2);
+        assert_eq!(value["tiles"][2]["y"], 3);
+    }
+    #[test]
+    fn minimap_bmp_decode_resize_overlay_and_png_encode_are_consistent() {
+        let mut bmp = vec![0u8; 54 + 16];
+        bmp[0..2].copy_from_slice(b"BM");
+        bmp[2..6].copy_from_slice(&70u32.to_le_bytes());
+        bmp[10..14].copy_from_slice(&54u32.to_le_bytes());
+        bmp[14..18].copy_from_slice(&40u32.to_le_bytes());
+        bmp[18..22].copy_from_slice(&2i32.to_le_bytes());
+        bmp[22..26].copy_from_slice(&2i32.to_le_bytes());
+        bmp[26..28].copy_from_slice(&1u16.to_le_bytes());
+        bmp[28..30].copy_from_slice(&24u16.to_le_bytes());
+        // Bottom row: blue, white. Top row: red, green. Each row has 2 bytes padding.
+        bmp[54..60].copy_from_slice(&[255, 0, 0, 255, 255, 255]);
+        bmp[62..68].copy_from_slice(&[0, 0, 255, 0, 255, 0]);
+
+        let (width, height, rgb) = decode_bmp24(&bmp).unwrap();
+        assert_eq!((width, height), (2, 2));
+        assert_eq!(rgb, vec![255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 255,]);
+
+        let (width, height, mut resized) = resize_rgb_to_fit(width, height, &rgb, 1);
+        assert_eq!((width, height), (1, 1));
+        let digest = sample_digest(vec![unit(0, "Terran Marine", "P1", 0, 0)]);
+        overlay_units(&mut resized, width, height, &digest);
+        assert_eq!(resized, vec![244, 4, 4], "P1 overlay should be red");
+
+        let png = encode_png(width, height, &resized).unwrap();
+        assert_eq!(&png[0..8], b"\x89PNG\r\n\x1a\n");
+    }
+
+    #[test]
+    fn map_info_switches_filters_names_and_returns_trigger_usages() {
+        let digest = sample_digest(Vec::new());
+        let value = map_info_view(
+            &digest,
+            &serde_json::json!({"mode": "switches", "switch": "door", "limit": 1}),
+            "demo.scx",
+            10,
+        )
+        .unwrap();
+
+        assert_eq!(value["switches"].as_array().unwrap().len(), 1);
+        assert_eq!(value["switches"][0]["id"], 1);
+        assert_eq!(value["switches"][0]["usageCount"], 1);
+        assert_eq!(value["usageCount"], 1);
+        assert_eq!(value["usages"][0]["triggerId"], 3);
+        assert_eq!(value["usages"][0]["kind"], "condition");
+        assert_eq!(value["usages"][0]["operation"], "set");
     }
 
     #[test]

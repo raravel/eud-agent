@@ -2,10 +2,10 @@
  *
  * Design (import-then-extend, NOT a rewrite of the engine):
  *   The verified map operations already live in MapGenCli.cpp as `mapGenMain`
- *   subcommands ("chk", "locedit", "playeredit"). Those routines own the exact
- *   save flags the rules require -- locEdit/playerEdit save in place with
- *   save(path, overwriting=true, updateListFile=true, lockAnywhere=true,
- *   autoDefragmentLocations=false) and dumpChk writes the Remastered .chk.
+ *   subcommands ("chk", "locedit", "playeredit", "switchedit", "render").
+ *   Those routines own the exact save flags the rules require -- every in-place
+ *   editor saves with lockAnywhere=true and autoDefragmentLocations=false, while
+ *   dumpChk/render write extracted artifacts.
  *   Rather than duplicate (and risk
  *   diverging from) that logic, this shim drives `mapGenMain` with a synthesized
  *   argv and marshals buffers <-> temp files.
@@ -33,7 +33,7 @@
 #include <Windows.h>
 
 /* mapGenMain has external linkage in MapGenCli.cpp (compiled into this lib).
- * It dispatches the "chk" / "locedit" / "playeredit" subcommands we drive here. */
+ * It dispatches the commands this shim drives. */
 int mapGenMain(int argc, char* argv[]);
 
 namespace {
@@ -179,7 +179,7 @@ int guardSeh(Fn&& fn, int& engineResultOut)
     }
 }
 
-// Shared body for the two ops-based editors. cmd is "locedit" or "playeredit".
+// Shared body for the ops-based map editors.
 int applyOps(const char* cmd, const char* mapPath,
              const uint8_t* ops, size_t opsLen)
 {
@@ -266,6 +266,56 @@ int isom_playeredit(const char* map_path, const uint8_t* ops, size_t ops_len)
     }
     catch ( ... )
     {
+        return ISOM_ERR_EXCEPTION;
+    }
+}
+
+int isom_switchedit(const char* map_path, const uint8_t* ops, size_t ops_len)
+{
+    try
+    {
+        return applyOps("switchedit", map_path, ops, ops_len);
+    }
+    catch ( ... )
+    {
+        return ISOM_ERR_EXCEPTION;
+    }
+}
+
+int isom_render_map(const char* map_path, const char* starcraft_path,
+                    uint32_t scale, uint8_t** out, size_t* out_len)
+{
+    if ( out == nullptr || out_len == nullptr )
+        return ISOM_ERR_INVALID_ARG;
+    *out = nullptr;
+    *out_len = 0;
+    if ( map_path == nullptr || map_path[0] == '\0'
+         || starcraft_path == nullptr || starcraft_path[0] == '\0'
+         || (scale != 1 && scale != 2 && scale != 4 && scale != 8) )
+        return ISOM_ERR_INVALID_ARG;
+
+    try
+    {
+        TempFile bmpFile(".bmp");
+        if ( !bmpFile.valid() )
+            return ISOM_ERR_IO;
+
+        const std::vector<std::string> args {
+            "isom", "render", map_path, bmpFile.path(),
+            std::to_string(scale), starcraft_path
+        };
+        int engineResult = 1;
+        int guard = guardSeh([&]() { return runMapGen(args); }, engineResult);
+        if ( guard != ISOM_OK )
+            return guard;
+        if ( engineResult != 0 )
+            return ISOM_ERR_ENGINE;
+
+        return readAllBytes(bmpFile.path(), out, out_len);
+    }
+    catch ( ... )
+    {
+        if ( *out ) { std::free(*out); *out = nullptr; *out_len = 0; }
         return ISOM_ERR_EXCEPTION;
     }
 }

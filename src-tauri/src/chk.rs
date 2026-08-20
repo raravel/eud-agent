@@ -5,6 +5,12 @@ use std::collections::BTreeMap;
 pub const _MAX_SECTIONS: usize = 10_000;
 pub const MRGN_ENTRY_SIZE: usize = 20;
 pub const UNIT_ENTRY_SIZE: usize = 36;
+pub const SWNM_ENTRY_SIZE: usize = 4;
+pub const TRIGGER_ENTRY_SIZE: usize = 2_400;
+pub const TRIGGER_CONDITION_SIZE: usize = 20;
+pub const TRIGGER_ACTION_SIZE: usize = 32;
+pub const TRIGGER_CONDITIONS: usize = 16;
+pub const TRIGGER_ACTIONS: usize = 64;
 pub const MRGN_STRUCT_LAYOUT: &str = "<iiiiHH";
 pub const UNIT_STRUCT_LAYOUT: &str = "<IHHHHHHBBBBIHHII";
 pub const _ANYWHERE_INDEX: usize = 63;
@@ -293,6 +299,12 @@ pub struct Digest {
     pub locations: Vec<Location>,
     pub units: Vec<Unit>,
     pub start_locations: Vec<StartLocation>,
+    #[serde(skip)]
+    pub tiles: Vec<u16>,
+    #[serde(skip)]
+    pub switches: Vec<MapSwitch>,
+    #[serde(skip)]
+    pub switch_usages: Vec<SwitchUsage>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -356,10 +368,22 @@ pub struct Unit {
     pub y: u16,
     pub tile_x: u16,
     pub tile_y: u16,
+    pub class_id: u32,
+    pub relation_flags: u16,
+    pub valid_state_flags: u16,
+    pub valid_field_flags: u16,
     pub hp_percent: u8,
     pub shield_percent: u8,
     pub energy_percent: u8,
     pub resources: u32,
+    pub hangar_amount: u16,
+    pub state_flags: u16,
+    pub cloaked: bool,
+    pub burrowed: bool,
+    pub in_transit: bool,
+    pub hallucinated: bool,
+    pub invincible: bool,
+    pub relation_class_id: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -370,6 +394,43 @@ pub struct StartLocation {
     pub y: u16,
     pub tile_x: u16,
     pub tile_y: u16,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct MapSwitch {
+    pub id: usize,
+    pub name: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SwitchUsageKind {
+    Condition,
+    Action,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SwitchOperation {
+    Set,
+    NotSet,
+    Clear,
+    Toggle,
+    Randomize,
+    Unknown,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SwitchUsage {
+    pub switch_id: usize,
+    pub trigger_id: usize,
+    pub kind: SwitchUsageKind,
+    pub index: usize,
+    pub operation: SwitchOperation,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw_operation: Option<u8>,
+    pub disabled: bool,
 }
 
 pub fn walk_sections(data: &[u8]) -> Vec<(String, Vec<u8>)> {
@@ -503,6 +564,7 @@ pub fn parse_units(unit: &[u8]) -> Vec<Unit> {
             let y = read_u16_le(entry, 6);
             let type_id = read_u16_le(entry, 8);
             let owner = entry[16];
+            let state_flags = read_u16_le(entry, 26);
 
             Unit {
                 type_name: unit_name(type_id),
@@ -512,10 +574,22 @@ pub fn parse_units(unit: &[u8]) -> Vec<Unit> {
                 y,
                 tile_x: x / 32,
                 tile_y: y / 32,
+                class_id: read_u32_le(entry, 0),
+                relation_flags: read_u16_le(entry, 10),
+                valid_state_flags: read_u16_le(entry, 12),
+                valid_field_flags: read_u16_le(entry, 14),
                 hp_percent: entry[17],
                 shield_percent: entry[18],
                 energy_percent: entry[19],
                 resources: read_u32_le(entry, 20),
+                hangar_amount: read_u16_le(entry, 24),
+                state_flags,
+                cloaked: state_flags & 0x01 != 0,
+                burrowed: state_flags & 0x02 != 0,
+                in_transit: state_flags & 0x04 != 0,
+                hallucinated: state_flags & 0x08 != 0,
+                invincible: state_flags & 0x10 != 0,
+                relation_class_id: read_u32_le(entry, 32),
             }
         })
         .collect()
@@ -629,6 +703,88 @@ pub fn parse_map_header(dim: &[u8], era: &[u8]) -> MapHeader {
     }
 }
 
+pub fn parse_tiles(mtxm: &[u8], width: u16, height: u16) -> Vec<u16> {
+    let expected = usize::from(width).saturating_mul(usize::from(height));
+    mtxm.chunks_exact(2)
+        .take(expected)
+        .map(|entry| read_u16_le(entry, 0))
+        .collect()
+}
+
+pub fn parse_switches(swnm: &[u8], strings: &[String]) -> Vec<MapSwitch> {
+    (0..256)
+        .map(|index| {
+            let offset = index * SWNM_ENTRY_SIZE;
+            let string_id = if offset + SWNM_ENTRY_SIZE <= swnm.len() {
+                read_u32_le(swnm, offset)
+            } else {
+                0
+            };
+            MapSwitch {
+                id: index + 1,
+                name: _string_at(strings, string_id),
+            }
+        })
+        .collect()
+}
+
+pub fn parse_switch_usages(trig: &[u8]) -> Vec<SwitchUsage> {
+    let mut usages = Vec::new();
+    for (trigger_index, trigger) in trig.chunks_exact(TRIGGER_ENTRY_SIZE).enumerate() {
+        for condition_index in 0..TRIGGER_CONDITIONS {
+            let offset = condition_index * TRIGGER_CONDITION_SIZE;
+            if trigger[offset + 15] != 11 {
+                continue;
+            }
+            let raw_operation = trigger[offset + 14];
+            let operation = match raw_operation {
+                2 => SwitchOperation::Set,
+                3 => SwitchOperation::NotSet,
+                _ => SwitchOperation::Unknown,
+            };
+            usages.push(SwitchUsage {
+                switch_id: usize::from(trigger[offset + 16]) + 1,
+                trigger_id: trigger_index + 1,
+                kind: SwitchUsageKind::Condition,
+                index: condition_index + 1,
+                operation,
+                raw_operation: (operation == SwitchOperation::Unknown).then_some(raw_operation),
+                disabled: trigger[offset + 17] & 0x02 != 0,
+            });
+        }
+
+        let actions_offset = TRIGGER_CONDITIONS * TRIGGER_CONDITION_SIZE;
+        for action_index in 0..TRIGGER_ACTIONS {
+            let offset = actions_offset + action_index * TRIGGER_ACTION_SIZE;
+            if trigger[offset + 26] != 13 {
+                continue;
+            }
+            let switch_index = read_u32_le(trigger, offset + 20);
+            if switch_index >= 256 {
+                continue;
+            }
+            let raw_operation = trigger[offset + 27];
+            let operation = match raw_operation {
+                4 => SwitchOperation::Set,
+                5 => SwitchOperation::Clear,
+                6 => SwitchOperation::Toggle,
+                11 => SwitchOperation::Randomize,
+                _ => SwitchOperation::Unknown,
+            };
+            usages.push(SwitchUsage {
+                switch_id: switch_index as usize + 1,
+                trigger_id: trigger_index + 1,
+                kind: SwitchUsageKind::Action,
+                index: action_index + 1,
+                operation,
+                raw_operation: (operation == SwitchOperation::Unknown).then_some(raw_operation),
+                disabled: trigger[offset + 28] & 0x02 != 0,
+            });
+        }
+    }
+    usages
+}
+
 pub fn digest_chk(data: &[u8]) -> Digest {
     let sections = assemble_sections(&walk_sections(data));
     let strings = parse_strings(&sections);
@@ -657,6 +813,13 @@ pub fn digest_chk(data: &[u8]) -> Digest {
             tile_y: unit.tile_y,
         })
         .collect();
+    let tiles = parse_tiles(
+        sections.get("MTXM").unwrap_or(&empty),
+        map.width,
+        map.height,
+    );
+    let switches = parse_switches(sections.get("SWNM").unwrap_or(&empty), &strings);
+    let switch_usages = parse_switch_usages(sections.get("TRIG").unwrap_or(&empty));
 
     Digest {
         map,
@@ -665,6 +828,9 @@ pub fn digest_chk(data: &[u8]) -> Digest {
         locations,
         units,
         start_locations,
+        tiles,
+        switches,
+        switch_usages,
     }
 }
 
@@ -1023,10 +1189,22 @@ mod tests {
                     y: 160,
                     tile_x: 3,
                     tile_y: 5,
+                    class_id: 1234,
+                    relation_flags: 0,
+                    valid_state_flags: 0,
+                    valid_field_flags: 0,
                     hp_percent: 100,
                     shield_percent: 75,
                     energy_percent: 50,
                     resources: 1_500,
+                    hangar_amount: 0,
+                    state_flags: 0,
+                    cloaked: false,
+                    burrowed: false,
+                    in_transit: false,
+                    hallucinated: false,
+                    invincible: false,
+                    relation_class_id: 0,
                 },
                 Unit {
                     type_name: "Start Location".to_string(),
@@ -1036,10 +1214,22 @@ mod tests {
                     y: 64,
                     tile_x: 10,
                     tile_y: 2,
+                    class_id: 1234,
+                    relation_flags: 0,
+                    valid_state_flags: 0,
+                    valid_field_flags: 0,
                     hp_percent: 100,
                     shield_percent: 100,
                     energy_percent: 100,
                     resources: 0,
+                    hangar_amount: 0,
+                    state_flags: 0,
+                    cloaked: false,
+                    burrowed: false,
+                    in_transit: false,
+                    hallucinated: false,
+                    invincible: false,
+                    relation_class_id: 0,
                 },
             ]
         );
@@ -1064,6 +1254,63 @@ mod tests {
                 tile_x: 10,
                 tile_y: 2,
             }]
+        );
+    }
+
+    #[test]
+    fn chk_parse_tiles_switch_names_and_trigger_usages() {
+        let mtxm = [0x21u16, 0x32, 0x43, 0x54]
+            .into_iter()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        assert_eq!(parse_tiles(&mtxm, 2, 2), vec![0x21, 0x32, 0x43, 0x54]);
+
+        let strings = vec!["Door Control".to_owned()];
+        let mut swnm = vec![0; 256 * SWNM_ENTRY_SIZE];
+        swnm[0..4].copy_from_slice(&1u32.to_le_bytes());
+        let switches = parse_switches(&swnm, &strings);
+        assert_eq!(switches.len(), 256);
+        assert_eq!(
+            switches[0],
+            MapSwitch {
+                id: 1,
+                name: "Door Control".to_owned(),
+            }
+        );
+        assert!(switches[1].name.is_empty());
+
+        let mut trig = vec![0u8; TRIGGER_ENTRY_SIZE];
+        trig[14] = 2;
+        trig[15] = 11;
+        trig[16] = 0;
+        trig[17] = 0x02;
+        let action = TRIGGER_CONDITIONS * TRIGGER_CONDITION_SIZE + TRIGGER_ACTION_SIZE;
+        trig[action + 20..action + 24].copy_from_slice(&0u32.to_le_bytes());
+        trig[action + 26] = 13;
+        trig[action + 27] = 6;
+
+        assert_eq!(
+            parse_switch_usages(&trig),
+            vec![
+                SwitchUsage {
+                    switch_id: 1,
+                    trigger_id: 1,
+                    kind: SwitchUsageKind::Condition,
+                    index: 1,
+                    operation: SwitchOperation::Set,
+                    raw_operation: None,
+                    disabled: true,
+                },
+                SwitchUsage {
+                    switch_id: 1,
+                    trigger_id: 1,
+                    kind: SwitchUsageKind::Action,
+                    index: 2,
+                    operation: SwitchOperation::Toggle,
+                    raw_operation: None,
+                    disabled: false,
+                },
+            ]
         );
     }
 
@@ -1359,10 +1606,22 @@ mod tests {
                         "y": 160,
                         "tileX": 3,
                         "tileY": 5,
+                        "classId": 1234,
+                        "relationFlags": 0,
+                        "validStateFlags": 0,
+                        "validFieldFlags": 0,
                         "hpPercent": 100,
                         "shieldPercent": 100,
                         "energyPercent": 100,
-                        "resources": 0
+                        "resources": 0,
+                        "hangarAmount": 0,
+                        "stateFlags": 0,
+                        "cloaked": false,
+                        "burrowed": false,
+                        "inTransit": false,
+                        "hallucinated": false,
+                        "invincible": false,
+                        "relationClassId": 0
                     },
                     {
                         "type": "Start Location",
@@ -1372,10 +1631,22 @@ mod tests {
                         "y": 64,
                         "tileX": 10,
                         "tileY": 2,
+                        "classId": 1234,
+                        "relationFlags": 0,
+                        "validStateFlags": 0,
+                        "validFieldFlags": 0,
                         "hpPercent": 100,
                         "shieldPercent": 100,
                         "energyPercent": 100,
-                        "resources": 0
+                        "resources": 0,
+                        "hangarAmount": 0,
+                        "stateFlags": 0,
+                        "cloaked": false,
+                        "burrowed": false,
+                        "inTransit": false,
+                        "hallucinated": false,
+                        "invincible": false,
+                        "relationClassId": 0
                     }
                 ],
                 "startLocations": [

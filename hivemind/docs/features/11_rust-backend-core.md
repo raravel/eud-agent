@@ -82,14 +82,14 @@ explicit recovery error.
 ## Tools
 
 Read: `project_status`, `list_files`, `read_file`, `eps_check`, `dat_get`, `xdat_get`, `tbl_get`,
-`req_get`, `btn_get`, `settings_get`, `plugins_list`, `map_info`, `search_docs`.
+`req_get`, `btn_get`, `settings_get`, `plugins_list`, `map_info`, `map_minimap`, `search_docs`.
 
 Flow: `propose_plan(markdown)`, `request_write_lane(reason)`.
 
 Write: `dat_set`, `xdat_set`, `tbl_set`, `req_set`, `btn_set`, `dat_reset`, `file_create`,
 `file_write`, `file_rename`, `file_delete`, `file_move`, `mkdir`, `set_main`, `settings_set`,
 `plugin_add`, `plugin_edit`, `plugin_remove`, `plugin_move`, `build_run`, `location_write`,
-`player_setup`, `memory_write`.
+`player_setup`, `switch_write`, `memory_write`.
 
 The runtime rejects every mutating tool, including build/map/memory writes, unless its exact
 project/session/request ticket owns the lease. `request_write_lane` is non-mutating. Existing

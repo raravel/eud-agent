@@ -124,6 +124,7 @@ pub enum WriteTool {
     PluginMove,
     LocationWrite,
     PlayerSetup,
+    SwitchWrite,
     WorkspaceWrite,
     WorkspaceCreate,
     WorkspaceDelete,
@@ -204,6 +205,8 @@ pub enum Snapshot {
     MapEdit {
         action: String,
         location_id: Option<i64>,
+        #[serde(default)]
+        switch_id: Option<i64>,
         name: Option<String>,
     },
 }
@@ -743,7 +746,7 @@ fn file_changeset_item(entry: &JournalEntry) -> Result<Option<ChangesetItem>, Jo
             properties: location_write_changeset_properties(entry)?,
             diff: None,
         },
-        WriteTool::PlayerSetup => ChangesetItem {
+        WriteTool::PlayerSetup | WriteTool::SwitchWrite => ChangesetItem {
             id: entry.id.clone(),
             kind: ChangesetItemKind::Modified,
             path: None,
@@ -1118,15 +1121,17 @@ where
                 )),
             }
         }
-        WriteTool::LocationWrite | WriteTool::PlayerSetup => match &entry.before {
-            Snapshot::MapBackup {
-                map_path,
-                backup_path,
-            } => bridge
-                .restore_map_backup(map_path, backup_path)
-                .map_err(bridge_error),
-            _ => Err(invalid_entry(entry, "expected map backup before snapshot")),
-        },
+        WriteTool::LocationWrite | WriteTool::PlayerSetup | WriteTool::SwitchWrite => {
+            match &entry.before {
+                Snapshot::MapBackup {
+                    map_path,
+                    backup_path,
+                } => bridge
+                    .restore_map_backup(map_path, backup_path)
+                    .map_err(bridge_error),
+                _ => Err(invalid_entry(entry, "expected map backup before snapshot")),
+            }
+        }
     }
 }
 fn workspace_target_parts(
@@ -1500,6 +1505,7 @@ mod tests {
             Snapshot::MapEdit {
                 action: action.to_owned(),
                 location_id,
+                switch_id: None,
                 name: name.map(str::to_owned),
             },
         )
@@ -1522,6 +1528,7 @@ mod tests {
             Snapshot::MapEdit {
                 action: action.to_owned(),
                 location_id: None,
+                switch_id: None,
                 name: None,
             },
         )

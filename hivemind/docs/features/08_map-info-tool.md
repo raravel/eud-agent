@@ -11,95 +11,89 @@ guessing.
 
 ```mermaid
 graph LR
-    Codex[codex thread] -- "map_info(mode, filters)" --> Tools[ToolLayer]
-    Tools --> Svc[MapInfoService<br/>chk_info.py]
-    Svc -- "GETSET project|OpenMapName" --> Bridge[Lua bridge]
-    Svc -- "spawn: chk map.scx tmp.chk" --> Isom[IsomTerrain.exe<br/>isom-poc build, BYO]
-    Svc -- "TLV parse: MRGN/UNIT/FORC/OWNR/SIDE/DIM/ERA/STR(+STRx)" --> Reply[JSON digest]
+    Codex[codex thread] -- "map_info / map_minimap" --> Tools[Rust ToolLayer]
+    Tools -- "GETSET project|OpenMapName" --> Bridge[Lua bridge]
+    Tools -- "isom_chk_extract" --> FFI[vendored isom static lib]
+    FFI --> Map[(source .scx)]
+    Tools --> Parse[Rust CHK parser<br/>DIM/ERA/MTXM/MRGN/UNIT/FORC/OWNR/SIDE/SWNM/TRIG]
+    Tools -- "isom_render_map" --> Render[VR4/VX4/WPE terrain renderer]
+    Parse --> Reply[bounded JSON pages]
+    Render --> PNG[MCP image/png content]
 ```
 
-## Architecture decision (feasibility review 2026-06-06, option B)
+## Architecture decision
 
 - **Editor memory is a dead end**: EUD Editor 3 reads `OpenMapName` only at
-  build time; `pjData` exposes no parsed CHK objects to Lua. The map FILE is
-  the only source.
-- **Extraction stays in the verified C++ CLI, parsing stays in Python**: the
-  server spawns `IsomTerrain.exe chk <map.scx> <tmp.chk>` (the isom-poc command
-  that already handles MPQ + protected maps) and parses the raw CHK in
-  `server/eud_agent/chk_info.py`. Zero C++ changes; pytest covers the parser
-  with synthesized CHK bytes; heavy work lives in Python (architecture.md
-  dependency direction). The isom-poc contract ("the CLI is called as a
-  subprocess by ../eud-agent") already sanctions this integration.
-- **Advisory shape (epscript-lsp policy)**: a missing/unconfigured exe degrades
-  ONLY `map_info` (clear ToolError at call time); boot, selfcheck, and every
-  other flow are untouched.
+  build time; `pjData` exposes no parsed CHK objects to Lua. The map FILE remains
+  the source of truth.
+- The app resolves `OpenMapName`, extracts CHK bytes through the statically linked
+  `isom_chk_extract`, and parses them in Rust (`src-tauri/src/chk.rs`). No sidecar,
+  Python process, or unbounded raw dump is involved.
+- Terrain rendering reuses the verified native VR4/VX4/WPE renderer through
+  `isom_render_map`; Rust converts its 24-bpp BMP to bounded PNG and applies
+  player-colored unit markers.
+- Every result identifies the last-saved source path and mtime. Unsaved SCMDraft
+  edits are intentionally invisible.
 
-## CHK parsing contract (`chk_info.py`)
+## CHK parsing contract (`src-tauri/src/chk.rs`)
 
-- TLV walk follows StarCraft's SIGNED-size seek (negative-size protection jumps
-  terminate via an iteration cap; a size past EOF clamps to the remaining
-  bytes). Duplicate `UNIT` sections STACK; every other section last-wins.
-- Sections digested: `DIM `/`ERA ` (size, tileset), `OWNR`/`SIDE` (slot
-  controllers, races), `FORC` (teams; legally-short section zero-padded; flag
-  bits randomStartLocation/allies/alliedVictory/sharedVision), `MRGN`
-  (locations: 1-based trigger ids, pixel + tile rects, names; index 63 flagged
-  `anywhere`; all-zero entries skipped; swapped bounds flagged
-  `inverted: "x"|"y"|"xy"` — 음수 로케이션, features/09), `UNIT` (36-byte entries: type, owner
-  label `P1..P12 (neutral)`, pixel + tile coords, hp/shield/energy %,
-  resources; start locations = type 214), `STR `/`STRx` (1-based ids; `STRx`
-  wins when both exist).
-- String decode is total: utf-8 → cp949 → latin-1/replace (Korean maps are
-  usually cp949; hangul cp949 bytes are almost never valid utf-8).
-- Unit type names come from `data/unit_names.json` — vendored
-  `Sc::Unit::defaultDisplayNames` 0-227 (isom-poc `Sc.cpp`), the SAME canonical
-  spelling the isom-poc grid `unit` directive uses. Unknown ids render `ID:<n>`.
-- Force membership lists only ACTIVE slots (controller ∈ computer/human/rescue)
-  — inactive slots default to force byte 0 and would misreport team 1.
+- TLV walk follows StarCraft's SIGNED-size seek with the existing iteration and EOF
+  guards. Duplicate `UNIT` sections stack; other sections are last-wins.
+- Existing data remains: `DIM `/`ERA ` header, `OWNR`/`SIDE` players, `FORC`
+  teams, `MRGN` locations, `UNIT` placements, and `STR `/`STRx` strings.
+- `MTXM` is decoded as the bounded `DIM.width * DIM.height` tile grid. Terrain
+  queries return tile coordinates, raw tile value, CV5 group (`value / 16`), and
+  variant (`value % 16`) without returning an unbounded whole-map payload.
+- `UNIT` exposes the complete 36-byte placement state: class/relation ids and
+  flags, owner/type/position, valid-field masks, hp/shield/energy, resources,
+  hangar count, and cloak/burrow/transit/hallucination/invincibility state.
+- `SWNM` supplies all 256 switch-name slots. `TRIG` walks 2,400-byte triggers and
+  reports every Switch condition and Set Switch action with 1-based trigger/slot,
+  operation, raw unknown operation, and disabled state.
+- String decode remains total: UTF-8 → cp949 → latin-1/replace. Unit type names
+  remain the vendored canonical 0-227 list.
 
 ## MCP tool: `map_info`
 
-`ToolSpec("map_info", "read", ...)` in `tools.py`, routed (memory_write
-precedent) to the injected `MapInfoService`:
+`map_info` is READ-only and accepts:
 
-- Parameters (all optional): `mode` enum `summary|locations|units|players`
-  (default `summary`); `owner` (`P1..P12|neutral`) and `unitType` (numeric id
-  or case-insensitive name substring) filter the `units` mode.
-- `summary` returns aggregates only (active players, forces, start locations,
-  location count + names, `unitsByOwner` type counts) — never the raw unit
-  list. `units` mode caps the list at 200 entries with a `truncated` marker +
-  filter hint (use-map UNIT sections run to thousands; the reply must stay
-  context-sized).
-- Every reply carries `map.path` and `map.savedAt` (file mtime): the digest is
-  the LAST-SAVED disk state — unsaved SCMDraft edits are invisible, and the
-  timestamp lets codex/user judge staleness.
-- READ semantics: counts one action; no mutation counter, no plan gate, no
-  journal. Validation first (bad `mode` rejects BEFORE the service runs and
-  counts nothing). `MapInfoError`/`BridgeError` surface as ToolError (codex-
-  correctable), never a transport crash.
+- `mode`: `summary|terrain|locations|units|players|switches`.
+- `owner` and `unitType` filters for units.
+- `switch` numeric id or case-insensitive name substring.
+- `x/y/width/height` tile rectangle for terrain.
+- `offset/limit` bounded paging. Defaults/maxima: terrain 256/1024, units
+  200/200, switch usages 100/200, locations 255/255.
 
-## Configuration
+`summary` returns aggregates only: header, terrain tile/group counts, players,
+forces, start locations, location names, unit counts by owner/type, and
+named/used switch counts. Large raw arrays appear only in their paged modes.
+Validation happens before action accounting; errors are correctable ToolErrors.
 
-`Config.isomterrain_cmd`: env `ISOMTERRAIN_CMD` > agent.cfg `isomterrain_cmd` >
-built-in default (the isom-poc build artifact
-`...\isom-poc\IsomTerrain\x64\ReleaseUS\IsomTerrain.exe`). NOT a selfcheck
-failure (advisory prerequisite). The spawn obeys the rules.md subprocess rules:
-absolute exe path, explicit `stdin=DEVNULL`, captured output decoded
-utf-8/replace, `cwd` set, 60s wall-clock timeout; the temp CHK lives in a
-`TemporaryDirectory` and is deleted with it.
+## MCP tool: `map_minimap`
+
+- Parameters: `maxSize` 128-2048 (default 512), `showUnits` (default true), and
+  optional `starcraftPath`.
+- StarCraft data lookup: explicit argument; otherwise `STARCRAFT_PATH`, standard
+  install path, then the EUD Editor root.
+- Native output is decoded, aspect-fit resized without upscaling, optionally
+  overlaid with P1-P12 colors, PNG-encoded, and returned as a real MCP image
+  content block plus compact metadata. Base64 never appears in the text block.
+- READ-only: no map backup, journal, mutation count, or plan gate.
 
 ## Verification
 
-`server/tests/test_chk_info.py` (headless; CHK bytes synthesized in-test, fake
-spawn + fake bridge): TLV walk guards, duplicate resolution, every decoder
-(incl. cp949 location names and short-FORC padding), mode slicing + filters +
-truncation cap, each distinct service error, and the tool-layer routing
-(registered READ tool, service-absent ToolError, validate-before-run,
-action-count accounting). Live E2E (user-assisted): with a real map project
-open, `map_info` returns the SCMDraft-authored locations/units/teams.
+- `chk::tests`: MTXM bounds, complete UNIT decode, SWNM names, TRIG condition/action
+  usage decode, existing section/string/location/player contracts.
+- `tools::tests`: summary/filter/rectangle/page behavior, 205-unit second page,
+  switch-name filtering/usages, BMP orientation/resize/unit overlay/PNG signature,
+  and switch-write handoff.
+- `mcp::tests`: minimap result becomes metadata text + `image/png` content without
+  leaking base64 into text.
+- Real ignored smokes: native copy/rename/re-extract + installed-map terrain render,
+  and the full MapSafe/native/journal switch path with exact post-name verification.
 
-## Out of scope (later phases)
+## Out of scope
 
-- Terrain grid (`extract`) and walkability (`walkmap`) exposure — same service
-  pattern when needed.
-- `SaveMapName` (built output) digestion, THG2 sprites, TRIG triggers.
-- Watching the map file for changes; the tool re-reads on every call.
+- Built `SaveMapName` digestion, THG2 doodad/sprite placement, and map-file watching.
+- Walkability/elevation semantic lookup from VF4 as structured JSON; the current
+  terrain contract exposes exact MTXM tile/group/variant data and visual pixels.

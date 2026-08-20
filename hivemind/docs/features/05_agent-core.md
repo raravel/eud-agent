@@ -74,14 +74,15 @@ Each worker hosts its own `127.0.0.1` streamable-HTTP MCP endpoint and shuts it 
 worker is discarded. No mutable global request pointer identifies MCP callers.
 
 Read tools: `project_status`, `list_files`, `read_file`, `eps_check`, `dat_get`, `xdat_get`,
-`tbl_get`, `req_get`, `btn_get`, `settings_get`, `plugins_list`, `map_info`, `search_docs`.
+`tbl_get`, `req_get`, `btn_get`, `settings_get`, `plugins_list`, `map_info`, `map_minimap`,
+`search_docs`.
 
 Flow tools: `propose_plan(markdown)`, `request_write_lane(reason)`.
 
 Write tools: `dat_set`, `xdat_set`, `tbl_set`, `req_set`, `btn_set`, `dat_reset`, `file_create`,
 `file_write`, `file_rename`, `file_delete`, `file_move`, `mkdir`, `set_main`, `settings_set`,
 `plugin_add`, `plugin_edit`, `plugin_remove`, `plugin_move`, `build_run`, `location_write`,
-`player_setup`, `memory_write`.
+`player_setup`, `switch_write`, `memory_write`.
 
 Evidence, first-principles, mutation-count, action-count, search, and three-build-attempt rails
 remain request scoped. `request_write_lane` is non-mutating and consumes no mutation budget.

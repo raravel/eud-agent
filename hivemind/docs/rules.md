@@ -159,8 +159,8 @@ hosting, panel re-arm, and server spawning are REMOVED.
   → sharing violation = SCMDraft has it) or while STATUS reports `compiling=true`.
 - Location NAME bytes follow the map's OWN string-table encoding — pass them through the C
   ABI as **raw bytes**; NEVER re-encode in Rust or C++.
-- locedit/playeredit apply all-or-nothing: any invalid op aborts BEFORE save. Verify by
-  re-digesting the map after the write.
+- locedit/playeredit/switchedit apply all-or-nothing: any invalid op aborts BEFORE
+  save. Verify by re-digesting the map after every write.
 - player_setup edits start-location units (214) + OWNR controllers through the SAME rails;
   its save also keeps `autoDefragmentLocations=false`.
 
@@ -171,6 +171,9 @@ hosting, panel re-arm, and server spawning are REMOVED.
   C-allocated buffers with the matching `isom_free`. A C++ exception must be caught at the
   shim and converted to an error code — NEVER allowed to unwind into Rust.
 - The engine is **statically linked** (Decision 09) — no `.dll` shipped or loaded. The
+- switch_write edits SWNM/string data only. Switch ids are 1-256 and trigger
+  conditions/actions keep their numeric ids unchanged. Switch NAME bytes follow
+  the map string-table encoding and pass raw through the C ABI.
   static `.lib` is produced by MSBuild; `isom-sys/build.rs` emits the link directives and
   bindgen generates the header bindings. Build requires the MSVC toolchain (same as Rust
   MSVC target).

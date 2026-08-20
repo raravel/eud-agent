@@ -146,12 +146,31 @@ path as `location_write`:
 - Journal: same backup-pointer entry (`_rollback_location` restores the
   bytes); changeset summaries "P1 controller = human in demo.scx" / "P1 start
   location placed at tile (4,8) in demo.scx"; target `player:<action> P<n>`.
-- Prompt: `[map locations]` carries the Human-player requirement +
+- Prompt: `[map inspection]` carries the Human-player requirement +
   check-then-fix workflow (`map_info(mode=players)` → `player_setup`); the
   `[build]` section routes the "no matching player" build failure here.
 - Verified with the REAL exe (2026-06-06): test.scx copy — controller human
   (P1/P2) + computer (P5), start add/move/delstart, bad-slot/missing-start
   refusals pre-save, digest round-trip after every step.
+
+## switch_write (same rails, switchedit CLI)
+
+`switch_write(action=rename, switchId=1..256, name)` renames a switch in the
+connected source map. Static SCX files do not contain one global initial switch
+state: runtime state comes from Switch conditions and Set Switch actions, which
+`map_info(mode=switches)` reports.
+
+- Native op: `rename|<1-based id>|<raw name bytes>`. Map text follows the same
+  UTF-8/STRx versus cp949/STR encoding rule as location names.
+- Trigger conditions/actions reference the numeric switch id; rename changes
+  SWNM/string data only and requires no trigger rewrite.
+- `switchedit` is all-or-nothing and saves in place with
+  `lockAnywhere=true`, `autoDefragmentLocations=false`.
+- `MapSafe` runs compiling guard, no-share lock probe, full backup, apply,
+  re-digest, exact post-name verification, journal, and rollback. The change
+  appears as its own `switch-<seq>` review item.
+- Input rejects ids outside 1-256, empty names, and op delimiters
+  (NUL/CR/LF/`|`).
 
 ## Out of scope
 

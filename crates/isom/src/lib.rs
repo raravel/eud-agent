@@ -11,8 +11,8 @@
 //! rollback) are NOT here — they live in the separate `mapsafe` layer
 //! (rules.md). This crate is the thin, leak-free FFI translation only.
 //!
-//! Location NAME bytes inside the `ops` buffer for [`locedit`] / [`playeredit`]
-//! are passed through to C RAW — never re-encoded in Rust (rules.md).
+//! Map-text bytes inside the `ops` buffers for [`locedit`], [`playeredit`], and
+//! [`switchedit`] are passed through to C RAW — never re-encoded in Rust.
 
 use std::ffi::{CString, NulError};
 use std::os::raw::c_int;
@@ -149,6 +149,49 @@ pub fn playeredit(map_path: &Path, ops: &[u8]) -> Result<(), IsomError> {
     // SAFETY: see `locedit` — identical buffer/lifetime contract.
     let code = unsafe { isom_sys::isom_playeredit(c_path.as_ptr(), ops.as_ptr(), ops.len()) };
     status(code)
+}
+
+/// Rename switches in a map, saved IN PLACE. Trigger references use numeric
+/// switch ids and are therefore unchanged by this operation.
+pub fn switchedit(map_path: &Path, ops: &[u8]) -> Result<(), IsomError> {
+    let c_path = path_cstring(map_path)?;
+    // SAFETY: see `locedit` — identical buffer/lifetime contract.
+    let code = unsafe { isom_sys::isom_switchedit(c_path.as_ptr(), ops.as_ptr(), ops.len()) };
+    status(code)
+}
+
+/// Render a map through the native tileset renderer and return its 24-bpp BMP.
+pub fn render_map(
+    map_path: &Path,
+    starcraft_path: &Path,
+    scale: u32,
+) -> Result<Vec<u8>, IsomError> {
+    let c_map_path = path_cstring(map_path)?;
+    let c_starcraft_path = path_cstring(starcraft_path)?;
+    let mut out: *mut u8 = std::ptr::null_mut();
+    let mut out_len: usize = 0;
+
+    // SAFETY: both C strings outlive the synchronous call; `out` and `out_len`
+    // are valid out-params. The returned allocation is owned by `buf`.
+    let code = unsafe {
+        isom_sys::isom_render_map(
+            c_map_path.as_ptr(),
+            c_starcraft_path.as_ptr(),
+            scale,
+            &mut out,
+            &mut out_len,
+        )
+    };
+    let buf = CBuf(out);
+    status(code)?;
+
+    let bytes = if buf.0.is_null() || out_len == 0 {
+        Vec::new()
+    } else {
+        // SAFETY: on ISOM_OK the C side guarantees `out_len` readable bytes.
+        unsafe { std::slice::from_raw_parts(buf.0, out_len).to_vec() }
+    };
+    Ok(bytes)
 }
 
 /// ABI version of the linked static lib — a load-time sanity check that the

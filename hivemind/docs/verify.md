@@ -35,8 +35,13 @@ stages from v1 are retired as `server/` is removed.
 ## smoke (task-specific, run when the touched area supports it)
 - RAG parity (feature 12): `cargo test -p eud-agent rag::parity -- --ignored` — top-k for a
   fixed query set matches the Python `sentence-transformers` baseline within tolerance.
-- isom FFI (feature 13): `cargo test -p isom ffi_smoke -- --ignored` — chk extract on a
-  sample map returns a parseable CHK; a no-op locedit round-trips byte-identical.
+- isom FFI (feature 13): `cargo test -p isom ffi_smoke -- --ignored` — CHK
+  extraction, switch rename on a copied sample, re-extraction, and terrain render.
+  `ISOM_SMOKE_MAP=<real map>` selects a richer render fixture and
+  `ISOM_SMOKE_BMP_OUT=<path>` retains pixels for visual inspection.
+- map switch write: `cargo test -p eud-agent switch_write_real_map_roundtrip -- --ignored`
+  copies `sample.scx`, runs the full MapSafe/native/journal path, and requires the
+  exact renamed SWNM string after re-extraction.
 - bootstrap (feature 10): `cargo test -p eud-agent bootstrap::manifest` — missing/corrupt
   assets trigger re-download, sha256 mismatch refuses installation, and Codex release
   metadata must provide a same-tag CLI + Code Mode host + Windows sandbox setup helper set

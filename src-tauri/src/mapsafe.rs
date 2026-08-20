@@ -1,8 +1,8 @@
 //! Map-write safety rails + journal (port of the Python `chk_info` write path +
 //! `journal._rollback_location`).
 //!
-//! EVERY mutating map write (location_write / player_setup) runs these rails IN
-//! ORDER (rules.md "Map file writes"; features/09 "Safety rails"):
+//! EVERY mutating map write (location_write / player_setup / switch_write) runs
+//! these rails IN ORDER (rules.md "Map file writes"; features/09 "Safety rails"):
 //!
 //! 1. **Compiling guard** — refuse while the editor reports a build in progress
 //!    (`compiling=true`); writing the map mid-build races the editor's read.
@@ -90,12 +90,12 @@ pub trait LockProbe {
     fn is_locked(&self, path: &Path) -> bool;
 }
 
-/// Which isom op family a write routes to (rail 4). Locedit -> isom::locedit,
-/// PlayerEdit -> isom::playeredit.
+/// Which isom op family a write routes to (rail 4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpKind {
     Locedit,
     PlayerEdit,
+    SwitchEdit,
 }
 
 /// The map engine: all-or-nothing apply (rail 4) + re-digest verify (rail 5).
@@ -123,6 +123,7 @@ impl MapEngine for IsomEngine {
         match kind {
             OpKind::Locedit => isom::locedit(map, ops),
             OpKind::PlayerEdit => isom::playeredit(map, ops),
+            OpKind::SwitchEdit => isom::switchedit(map, ops),
         }
         .map_err(|e| e.to_string())
     }

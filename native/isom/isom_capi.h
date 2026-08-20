@@ -10,10 +10,10 @@
  * and MUST be released by the caller with isom_free().
  *
  * The shim routes into the verified isom-poc code paths (MapGenCli `mapGenMain`:
- * chk / locedit / playeredit). The in-place map save keeps
- * autoDefragmentLocations=false and lockAnywhere=true (see rules.md). Location
- * NAME bytes inside `ops` are passed through as RAW bytes and are never
- * re-encoded here.
+ * chk / locedit / playeredit / switchedit / render). In-place map saves keep
+ * autoDefragmentLocations=false and lockAnywhere=true (see rules.md). Map-text
+ * bytes inside `ops` are passed through as RAW bytes and are never re-encoded
+ * here.
  */
 #ifndef ISOM_CAPI_H
 #define ISOM_CAPI_H
@@ -27,7 +27,7 @@ extern "C" {
 
 /* ABI version of this shim. Bump on any breaking change to the signatures or
  * the ops/buffer encoding below. The Rust side asserts this at startup. */
-#define ISOM_ABI_VERSION 1
+#define ISOM_ABI_VERSION 2
 
 /* Error codes returned by the isom_* functions. 0 == success. */
 enum IsomStatus {
@@ -67,6 +67,17 @@ int isom_locedit(const char* map_path, const uint8_t* ops, size_t ops_len);
  * existing map, saved IN PLACE. Same buffer/encoding/safety contract as
  * isom_locedit (autoDefragmentLocations=false on save). Returns 0 on success. */
 int isom_playeredit(const char* map_path, const uint8_t* ops, size_t ops_len);
+
+/* Rename switches in an existing map, saved IN PLACE. Ops are
+ * `rename|<1-based id>|<raw name bytes>`. Trigger references are numeric and
+ * remain unchanged. Same all-or-nothing and save-safety contract as locedit. */
+int isom_switchedit(const char* map_path, const uint8_t* ops, size_t ops_len);
+
+/* Render the map terrain through the verified VR4/VX4/WPE renderer.
+ * Returns a malloc'd 24-bpp BMP buffer (free with isom_free). `scale` must be
+ * 1, 2, 4, or 8. Paths are UTF-8 and NUL-terminated. */
+int isom_render_map(const char* map_path, const char* starcraft_path,
+                    uint32_t scale, uint8_t** out, size_t* out_len);
 
 /* Free a buffer previously returned by an isom_* function. Safe on NULL. */
 void isom_free(uint8_t* p);

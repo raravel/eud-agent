@@ -105,15 +105,19 @@ const BUILD_GUIDE: &str = r#"[build]
 - build_run returns the complete structured result ({ok, errors with source/file/line/message/raw}); read it directly, fix the code, and build again on failure. The server enforces a 3-attempt self-fix budget per request; when it is spent, STOP and report the remaining errors to the user verbatim.
 - A failure whose message says no matching player exists (e.g. "연결맵에 조건에 맞는 플레이어가 없습니다") is a MAP setup problem, not an eps bug — fix it with player_setup (a Human controller AND a start location for at least one player), then rebuild."#;
 
-const MAP_LOCATION_GUIDE: &str = r#"[map locations]
+const MAP_LOCATION_GUIDE: &str = r#"[map inspection]
+- Use map_info summary first, then page/filter terrain, units, locations, players, or switches instead of guessing from the connected map.
+- map_info(mode=terrain) returns tile coordinates, MTXM value, tile group, and variant. map_info(mode=units) returns full placed-unit attributes; use owner/unitType/offset/limit filters on large maps.
+- map_minimap returns the last-saved map as an actual PNG image content block. Inspect the terrain and player-colored unit overlay visually; set showUnits=false for terrain-only analysis.
+- Switch state is runtime trigger state, not a stored global initial value. map_info(mode=switches) reports names plus every Switch condition and Set Switch action. switch_write(action=rename) changes only the name; numeric trigger references remain stable.
 - BEFORE generating code that references a location by name, call map_info(mode=locations) to confirm it exists; if it is missing, create it with location_write(action=add) and use the returned id/name.
-- Location ids are stable (never renumbered); #64 is the engine 'Anywhere' location. The map data is the last-SAVED file on disk.
+- Location and switch ids are stable; #64 is the engine 'Anywhere' location. Map data is the last-SAVED file on disk.
 - For precise hit/movement detection use an INVERTED (음수) location: location_write with invertX+invertY, sized AT OR BELOW the target unit's collision box (an inverted location larger than the unit never matches Bring). At runtime MoveLocation it onto the unit and test Bring; locations flagged 'inverted' in map_info are these.
-- location_write edits the real map file (backed up + reviewable in the changeset); prefer reusing an existing suitable location over adding duplicates.
+- Map writes edit the real map file through backup, lock/build guards, post-write verification, journal, and changeset review. Prefer reusing existing resources over adding duplicates.
 - Player slots: eudplib only compiles when the map has at least one HUMAN player WITH a start location. Check map_info(mode=players); fix gaps with player_setup — action=controller (player, controller=human) and action=start (player, tileX/tileY). player is 1-based (1-8)."#;
 
 const EVIDENCE_GUIDE: &str = r#"[evidence]
-- EVERY unit of work (eps code, dat edits, map location/player writes, settings) must be grounded in the docs: call search_docs (Korean query) BEFORE writing, and justify each item with WHY plus its source as a markdown link — `... (근거: [제목](url))`.
+- EVERY unit of work (eps code, dat edits, map location/player/switch writes, settings) must be grounded in the docs: call search_docs (Korean query) BEFORE writing, and justify each item with WHY plus its source as a markdown link — `... (근거: [제목](url))`.
 - Cite on BOTH review surfaces: every propose_plan step carries its evidence link(s), and the final answer explains each applied change with its link(s). The reference-context chunks below carry their own `source:` links — cite those the same way.
 - The server enforces this: mutating tool calls are rejected until at least one search_docs has run in the request.
 - If searching finds NO relevant document for an item, mark it explicitly as 근거 없음 (일반 EUD 지식) and proceed — NEVER fabricate a source or url.

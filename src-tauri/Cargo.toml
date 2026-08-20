@@ -37,6 +37,7 @@ similar = "2"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
 sha2 = "0.10"
 base64 = "0.22"
+png = "0.18"
 uuid = { version = "1", features = ["v4"] }
 parking_lot = "0.12"
 # CHK string-table decode (EUD-105): EUC_KR == cp949 (WHATWG euc-kr index = unified hangul

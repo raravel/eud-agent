@@ -79,9 +79,7 @@ journal; mutating tools are gated until search_docs has grounded the change.",
             // A correctable tool error (EvidenceRequired / admission / bridge
             // message) is returned as an MCP tool error so codex can self-correct
             // — never an MCP protocol error.
-            Ok(Ok(value)) => Ok(CallToolResult::success(vec![Content::text(render_value(
-                &value,
-            ))])),
+            Ok(Ok(value)) => Ok(CallToolResult::success(render_contents(&value))),
             Ok(Err(message)) => Ok(CallToolResult::error(vec![Content::text(message)])),
             Err(join_error) => Ok(CallToolResult::error(vec![Content::text(format!(
                 "tool execution task failed: {join_error}"
@@ -119,6 +117,30 @@ fn render_value(value: &Value) -> String {
         Value::String(text) => text.clone(),
         other => serde_json::to_string(other).unwrap_or_else(|_| other.to_string()),
     }
+}
+
+/// Convert a normal JSON tool result to text, except for the map-minimap image
+/// envelope. That envelope becomes one compact metadata text block plus a real
+/// MCP image block so the model can inspect pixels instead of parsing base64.
+fn render_contents(value: &Value) -> Vec<Content> {
+    let Some(image) = value.get("image").and_then(Value::as_object) else {
+        return vec![Content::text(render_value(value))];
+    };
+    let Some(data) = image.get("data").and_then(Value::as_str) else {
+        return vec![Content::text(render_value(value))];
+    };
+    let Some(mime_type) = image.get("mimeType").and_then(Value::as_str) else {
+        return vec![Content::text(render_value(value))];
+    };
+
+    let mut metadata = value.clone();
+    if let Some(image) = metadata.get_mut("image").and_then(Value::as_object_mut) {
+        image.remove("data");
+    }
+    vec![
+        Content::text(render_value(&metadata)),
+        Content::image(data.to_owned(), mime_type.to_owned()),
+    ]
 }
 
 /// Lifetime handle for one session's loopback MCP endpoint.
@@ -194,6 +216,8 @@ mod tests {
             .expect("search_docs must be advertised");
         assert!(search.input_schema.contains_key("properties"));
         assert!(tools.iter().any(|tool| tool.name == "map_info"));
+        assert!(tools.iter().any(|tool| tool.name == "map_minimap"));
+        assert!(tools.iter().any(|tool| tool.name == "switch_write"));
         // SCA is fully defunct — it must never appear as a tool.
         assert!(!tools.iter().any(|tool| tool.name.contains("sca")));
     }
@@ -205,6 +229,27 @@ mod tests {
             render_value(&serde_json::json!({"ok": true})),
             "{\"ok\":true}"
         );
+    }
+
+    #[test]
+    fn render_contents_emits_minimap_as_metadata_plus_image_block() {
+        let contents = render_contents(&serde_json::json!({
+            "map": {"path": "demo.scx"},
+            "image": {
+                "mimeType": "image/png",
+                "width": 2,
+                "height": 1,
+                "data": "cG5n",
+            },
+        }));
+        let value = serde_json::to_value(contents).unwrap();
+
+        assert_eq!(value.as_array().unwrap().len(), 2);
+        assert_eq!(value[0]["type"], "text");
+        assert!(!value[0]["text"].as_str().unwrap().contains("cG5n"));
+        assert_eq!(value[1]["type"], "image");
+        assert_eq!(value[1]["mimeType"], "image/png");
+        assert_eq!(value[1]["data"], "cG5n");
     }
 
     #[tokio::test]
