@@ -5,8 +5,7 @@
 
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
-use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -29,15 +28,7 @@ pub const NO_MEMORY: &str = "(no project memory)";
 /// Marker appended after section-cap truncation.
 pub const TRUNCATED_MARKER: &str = "memory section truncated";
 
-/// Episodes injected into a rendered section.
-pub const RENDER_EPISODE_LIMIT: usize = 10;
-
-/// Instruction-head length for an episode line.
-pub const EPISODE_HEAD_CHARS: usize = 80;
-
-const EPISODES_FILE: &str = "episodes.jsonl";
 const META_FILE: &str = "meta.json";
-const CORRECTION_DECISIONS: [&str; 2] = ["rejected", "partial"];
 static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 const INSTRUCTION_BLOCK: &str = concat!(
     "Record only durable, project-specific facts via the memory_write tool: ",
@@ -176,44 +167,6 @@ impl ProjectMemory {
         }
     }
 
-    /// Append one JSON value as a line to `episodes.jsonl`.
-    ///
-    /// Best-effort: disabled stores and IO/serialization failures return `false`.
-    pub fn append_episode(&self, episode: &Value) -> bool {
-        let Some(path) = self.episodes_path() else {
-            return false;
-        };
-        let Some(store) = self.store_dir() else {
-            return false;
-        };
-
-        let result = (|| -> anyhow::Result<()> {
-            fs::create_dir_all(store)?;
-            let line = serde_json::to_string(episode)?;
-            let mut file = OpenOptions::new().create(true).append(true).open(path)?;
-            file.write_all(line.as_bytes())?;
-            file.write_all(b"\n")?;
-            Ok(())
-        })();
-
-        result.is_ok()
-    }
-
-    /// Return the last `limit` episodes (newest last), skipping malformed lines.
-    pub fn read_episodes(&self, limit: usize) -> Vec<Value> {
-        let Some(path) = self.episodes_path() else {
-            return Vec::new();
-        };
-        if !path.is_file() {
-            return Vec::new();
-        }
-
-        let Ok(text) = fs::read_to_string(path) else {
-            return Vec::new();
-        };
-        parse_episode_lines(&text, limit)
-    }
-
     /// Return `meta.json` as an object, or `{}` when absent/disabled/malformed.
     pub fn read_meta(&self) -> Map<String, Value> {
         let Some(path) = self.meta_path() else {
@@ -281,40 +234,15 @@ impl ProjectMemory {
         }
 
         let stale = list_reply.is_some_and(|reply| self.is_stale(reply));
-        let file_blocks = render_file_blocks(&files, stale, None);
-        let episode_block = self.render_episodes()?;
-
         let mut body_parts = vec![INSTRUCTION_BLOCK.to_string()];
-        body_parts.extend(file_blocks.clone());
-        if !episode_block.is_empty() {
-            body_parts.push(episode_block);
-        }
+        body_parts.extend(render_file_blocks(&files, stale, None));
 
         let section = section_from_parts(&body_parts);
         if section.chars().count() <= SECTION_CAP_CHARS {
             return Ok(section);
         }
 
-        let mut without_episodes = vec![INSTRUCTION_BLOCK.to_string()];
-        without_episodes.extend(file_blocks);
-        without_episodes.push(TRUNCATED_MARKER.to_string());
-        let section = section_from_parts(&without_episodes);
-        if section.chars().count() <= SECTION_CAP_CHARS {
-            return Ok(section);
-        }
-
         Ok(render_with_truncated_lessons(&files, stale))
-    }
-
-    fn render_episodes(&self) -> anyhow::Result<String> {
-        let episodes = self.read_episodes_for_render(RENDER_EPISODE_LIMIT)?;
-        if episodes.is_empty() {
-            return Ok(String::new());
-        }
-
-        let mut lines = vec!["## recent episodes".to_string()];
-        lines.extend(episodes.iter().map(episode_line));
-        Ok(lines.join("\n"))
     }
 
     fn read_for_render(&self, name: &str) -> anyhow::Result<String> {
@@ -327,30 +255,27 @@ impl ProjectMemory {
         Ok(fs::read_to_string(path)?)
     }
 
-    fn read_episodes_for_render(&self, limit: usize) -> anyhow::Result<Vec<Value>> {
-        let Some(path) = self.episodes_path() else {
-            return Ok(Vec::new());
-        };
-        if !path.is_file() {
-            return Ok(Vec::new());
-        }
-
-        let text = fs::read_to_string(path)?;
-        Ok(parse_episode_lines(&text, limit))
-    }
-
     fn file_path(&self, name: &str) -> Option<PathBuf> {
         self.store_dir()
             .map(|store| store.join(format!("{name}.md")))
     }
 
-    fn episodes_path(&self) -> Option<PathBuf> {
-        self.store_dir().map(|store| store.join(EPISODES_FILE))
-    }
-
     fn meta_path(&self) -> Option<PathBuf> {
         self.store_dir().map(|store| store.join(META_FILE))
     }
+}
+
+/// Remove obsolete `episodes.jsonl` files left by versions that stored request history
+/// alongside project memory. Best-effort and limited to immediate project directories.
+pub(crate) fn cleanup_legacy_episode_files(memory_root: &Path) -> usize {
+    let Ok(projects) = fs::read_dir(memory_root) else {
+        return 0;
+    };
+    projects
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        .filter(|entry| fs::remove_file(entry.path().join("episodes.jsonl")).is_ok())
+        .count()
 }
 
 fn is_invalid_windows_filename_char(ch: char) -> bool {
@@ -467,49 +392,6 @@ fn section_from_parts(parts: &[String]) -> String {
 
 fn no_memory_section() -> String {
     format!("[project memory]\n{NO_MEMORY}")
-}
-
-fn parse_episode_lines(text: &str, limit: usize) -> Vec<Value> {
-    let episodes: Vec<Value> = text
-        .lines()
-        .filter_map(|raw| {
-            let raw = raw.trim();
-            if raw.is_empty() {
-                None
-            } else {
-                serde_json::from_str(raw).ok()
-            }
-        })
-        .collect();
-
-    if limit >= episodes.len() {
-        episodes
-    } else {
-        episodes[episodes.len() - limit..].to_vec()
-    }
-}
-
-fn episode_line(ep: &Value) -> String {
-    let ts = field_string(ep, "ts");
-    let kind = field_string(ep, "kind");
-    let instruction = field_string(ep, "instruction").replace('\n', " ");
-    let head = take_chars(&instruction, EPISODE_HEAD_CHARS);
-    let mut decision = field_string(ep, "decision");
-    if CORRECTION_DECISIONS.contains(&decision.as_str()) {
-        decision = format!("{decision} (correction)");
-    }
-    format!("{ts} {kind} {head} -> {decision}")
-}
-
-fn field_string(value: &Value, name: &str) -> String {
-    value
-        .get(name)
-        .map(|field| match field {
-            Value::String(s) => s.clone(),
-            Value::Null => "None".to_string(),
-            other => other.to_string(),
-        })
-        .unwrap_or_default()
 }
 
 fn take_chars(s: &str, limit: usize) -> String {
@@ -665,34 +547,24 @@ mod tests {
     }
 
     #[test]
-    fn episodes_append_and_read_skip_malformed_with_limit_newest_last() {
-        let (base, root) = memory_root("episodes");
-        let memory = ProjectMemory::new(root, "Project");
-
-        assert!(memory.append_episode(
-            &json!({"ts":"1","kind":"answer","instruction":"one","decision":"answer"})
-        ));
-        assert!(memory.append_episode(
-            &json!({"ts":"2","kind":"changeset","instruction":"two","decision":"accepted"})
-        ));
-        assert!(memory.append_episode(
-            &json!({"ts":"3","kind":"changeset","instruction":"three","decision":"rejected"})
-        ));
+    fn cleanup_legacy_episode_files_removes_only_episode_logs() {
+        let (base, root) = memory_root("legacy-episodes");
+        let project = root.join("Project");
+        fs::create_dir_all(&project).unwrap();
         fs::write(
-            memory.store_dir().unwrap().join(EPISODES_FILE),
-            concat!(
-                "{\"ts\":\"1\",\"kind\":\"answer\",\"instruction\":\"one\",\"decision\":\"answer\"}\n",
-                "not json\n",
-                "{\"ts\":\"2\",\"kind\":\"changeset\",\"instruction\":\"two\",\"decision\":\"accepted\"}\n",
-                "{\"ts\":\"3\",\"kind\":\"changeset\",\"instruction\":\"three\",\"decision\":\"rejected\"}\n"
-            ),
+            project.join("episodes.jsonl"),
+            "{\"decision\":\"answer\"}\n",
         )
         .unwrap();
+        fs::write(project.join("resources.md"), "Switch 1 = reserved").unwrap();
 
-        let episodes = memory.read_episodes(2);
-        assert_eq!(episodes.len(), 2);
-        assert_eq!(episodes[0]["ts"], "2");
-        assert_eq!(episodes[1]["ts"], "3");
+        assert_eq!(cleanup_legacy_episode_files(&root), 1);
+        assert!(!project.join("episodes.jsonl").exists());
+        assert_eq!(
+            fs::read_to_string(project.join("resources.md")).unwrap(),
+            "Switch 1 = reserved"
+        );
+        assert_eq!(cleanup_legacy_episode_files(&root), 0);
         fs::remove_dir_all(base).ok();
     }
 
@@ -720,7 +592,7 @@ mod tests {
     }
 
     #[test]
-    fn render_section_disabled_and_enabled_order_staleness_and_episode_corrections() {
+    fn render_section_disabled_and_enabled_order_staleness() {
         let (base, root) = memory_root("render");
         let disabled = ProjectMemory::new(root.clone(), "");
         assert_eq!(
@@ -734,12 +606,6 @@ mod tests {
         assert!(memory.write("conventions", "conv").ok);
         assert!(memory.write("lessons", "").ok);
         memory.update_list_hash("LIST old").unwrap();
-        assert!(memory.append_episode(&json!({
-            "ts": "2026-01-01",
-            "kind": "changeset",
-            "instruction": "line\nbreak",
-            "decision": "partial"
-        })));
 
         let section = memory.render_section(Some("LIST new"));
         let resources = section.find("## resources\nres").unwrap();
@@ -751,22 +617,14 @@ mod tests {
         assert!(resources < structure);
         assert!(structure < conventions);
         assert!(!section.contains("## lessons"));
-        assert!(section.contains("## recent episodes"));
-        assert!(section.contains("2026-01-01 changeset line break -> partial (correction)"));
         fs::remove_dir_all(base).ok();
     }
 
     #[test]
-    fn render_truncation_drops_episodes_first_then_tail_truncates_lessons() {
+    fn render_truncation_tail_truncates_lessons() {
         let (base, root) = memory_root("truncate");
         let memory = ProjectMemory::new(root, "Project");
         assert!(memory.write("resources", "res").ok);
-        assert!(memory.append_episode(&json!({
-            "ts": "1",
-            "kind": "changeset",
-            "instruction": "episode should be dropped",
-            "decision": "rejected"
-        })));
 
         let store = memory.store_dir().unwrap();
         fs::create_dir_all(&store).unwrap();
@@ -779,8 +637,6 @@ mod tests {
         let section = memory.render_section(None);
         assert!(section.chars().count() <= SECTION_CAP_CHARS);
         assert!(section.contains(TRUNCATED_MARKER));
-        assert!(!section.contains("## recent episodes"));
-        assert!(!section.contains("episode should be dropped"));
         assert!(section.contains("## lessons\n"));
         assert!(section.contains(&"L".repeat(100)));
         assert!(!section.contains(&"L".repeat(SECTION_CAP_CHARS)));

@@ -50,26 +50,6 @@ function memoryState(overrides: Partial<MemoryViewState> = {}): MemoryViewState 
   return {
     project: "eud-agent",
     files,
-    episodes: [
-      {
-        ts: "2026-06-09T10:00:00Z",
-        request_id: "req-2",
-        instruction: "패널 메모리 보기 구현",
-        kind: "implementation",
-        tools: ["apply_patch"],
-        files: ["panel/src/components/MemoryView.tsx"],
-        decision: "Monaco markdown editor를 사용한다.",
-      },
-      {
-        ts: "2026-06-09T09:30:00Z",
-        request_id: "req-1",
-        instruction: "프로젝트 메모리 확인",
-        kind: "analysis",
-        tools: [],
-        files: [],
-        decision: "읽기 전용 에피소드 목록을 표시한다.",
-      },
-    ],
     activeTab: "resources",
     drafts: {},
     dirty: cleanDirty,
@@ -109,6 +89,7 @@ describe("MemoryView", () => {
     expect(screen.getByRole("tab", { name: "구조" })).toBeInTheDocument();
     expect(screen.getByRole("tab", { name: "컨벤션" })).toBeInTheDocument();
     expect(screen.getByRole("tab", { name: "교훈" })).toBeInTheDocument();
+    expect(screen.queryByText("에피소드")).not.toBeInTheDocument();
 
     const editor = await screen.findByLabelText("메모리 편집기");
     expect(editor).toHaveValue(files.resources);
@@ -169,17 +150,6 @@ describe("MemoryView", () => {
     expect(handlers.onTabSelected).toHaveBeenCalledWith("lessons");
   });
 
-  it("renders episodes newest first as read-only history", () => {
-    renderMemoryView();
-
-    const newest = screen.getByText("패널 메모리 보기 구현");
-    const older = screen.getByText("프로젝트 메모리 확인");
-    expect(newest.compareDocumentPosition(older) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
-    expect(screen.getByText(/req-2/)).toBeInTheDocument();
-    expect(screen.getByText("Monaco markdown editor를 사용한다.")).toBeInTheDocument();
-    expect(screen.getByText("apply_patch")).toBeInTheDocument();
-    expect(screen.queryByDisplayValue("패널 메모리 보기 구현")).not.toBeInTheDocument();
-  });
 
   it("closes when the close button is clicked", () => {
     const handlers = callbacks();

@@ -1,9 +1,9 @@
-import { Suspense, lazy, useMemo } from "react";
+import { Suspense, lazy } from "react";
 import { Save, X } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import type { MemoryViewState } from "@/state/store";
-import type { Episode, MemoryFile } from "@/lib/ipc";
+import type { MemoryFile } from "@/lib/ipc";
 import { cn } from "@/lib/utils";
 
 const MonacoEditor = lazy(() => import("@/components/MonacoEditor"));
@@ -24,36 +24,6 @@ export interface MemoryViewProps {
   onSave(payload: { file: MemoryFile; content: string }): void;
 }
 
-function episodeTime(episode: Episode): number {
-  if (!episode.ts) return 0;
-  const ts = Date.parse(episode.ts);
-  return Number.isFinite(ts) ? ts : 0;
-}
-
-function EpisodeLine({ episode }: { episode: Episode }) {
-  const title = episode.instruction?.trim() || "기록된 작업";
-  const meta = [episode.request_id, episode.ts].filter(Boolean).join(" · ");
-  const tools = episode.tools?.filter(Boolean).join(", ");
-  const files = episode.files?.filter(Boolean).join(", ");
-
-  return (
-    <li className="grid gap-1 rounded border border-border/60 px-3 py-2 text-xs">
-      <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
-        <span className="font-medium text-foreground">{title}</span>
-        {meta && <span className="text-muted-foreground">{meta}</span>}
-      </div>
-      {episode.decision && (
-        <div className="text-muted-foreground">{episode.decision}</div>
-      )}
-      {(tools || files) && (
-        <div className="flex flex-wrap gap-x-3 gap-y-1 text-muted-foreground">
-          {tools && <span>{tools}</span>}
-          {files && <span>{files}</span>}
-        </div>
-      )}
-    </li>
-  );
-}
 
 export function MemoryView({
   memory,
@@ -66,10 +36,6 @@ export function MemoryView({
   const activeFile = memory.activeTab;
   const activeValue = memory.drafts[activeFile] ?? memory.files[activeFile];
   const activeDirty = memory.dirty[activeFile];
-  const episodes = useMemo(
-    () => [...memory.episodes].sort((a, b) => episodeTime(b) - episodeTime(a)),
-    [memory.episodes],
-  );
 
   return (
     <section
@@ -157,23 +123,6 @@ export function MemoryView({
         </Suspense>
       </div>
 
-      <div className="min-h-0 overflow-y-auto">
-        <div className="mb-2 text-xs font-medium text-muted-foreground">
-          에피소드
-        </div>
-        {episodes.length === 0 ? (
-          <p className="text-xs text-muted-foreground">기록된 에피소드가 없습니다.</p>
-        ) : (
-          <ul className="grid gap-2">
-            {episodes.map((episode, index) => (
-              <EpisodeLine
-                key={`${episode.request_id ?? "episode"}-${episode.ts ?? index}`}
-                episode={episode}
-              />
-            ))}
-          </ul>
-        )}
-      </div>
     </section>
   );
 }

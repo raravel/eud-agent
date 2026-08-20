@@ -121,16 +121,6 @@ export const MEMORY_FILES = [
 ] as const;
 export type MemoryFile = (typeof MEMORY_FILES)[number];
 
-/** One read-only project-memory episode entry. All fields are defensive. */
-export interface Episode {
-  ts?: string;
-  request_id?: string;
-  instruction?: string;
-  kind?: string;
-  tools?: string[];
-  files?: string[];
-  decision?: string;
-}
 
 // ---- core -> panel messages -------------------------------------------
 /**
@@ -247,12 +237,11 @@ export interface ListMessage {
   error?: string;
 }
 
-/** `memory {project, files, episodes}` - project memory snapshot. */
+/** `memory {project, files}` - project memory snapshot. */
 export interface MemoryMessage {
   type: "memory";
   project: string;
   files: Record<MemoryFile, string>;
-  episodes: Episode[];
 }
 
 /** `memory_saved {file}` - acknowledgement for a saved memory file. */
@@ -573,24 +562,6 @@ function isMemoryFile(value: unknown): value is MemoryFile {
   return typeof value === "string" && MEMORY_FILES.includes(value as MemoryFile);
 }
 
-function isStringArray(value: unknown): value is string[] {
-  return Array.isArray(value) && value.every((item) => typeof item === "string");
-}
-
-function isEpisode(value: unknown): value is Episode {
-  return (
-    isObject(value) &&
-    (value.ts === undefined || typeof value.ts === "string") &&
-    (value.request_id === undefined ||
-      typeof value.request_id === "string") &&
-    (value.instruction === undefined ||
-      typeof value.instruction === "string") &&
-    (value.kind === undefined || typeof value.kind === "string") &&
-    (value.tools === undefined || isStringArray(value.tools)) &&
-    (value.files === undefined || isStringArray(value.files)) &&
-    (value.decision === undefined || typeof value.decision === "string")
-  );
-}
 
 function isMemoryFiles(value: unknown): value is Record<MemoryFile, string> {
   return (
@@ -727,9 +698,7 @@ export function isMemoryMessage(value: unknown): value is MemoryMessage {
     isObject(value) &&
     value.type === "memory" &&
     typeof value.project === "string" &&
-    isMemoryFiles(value.files) &&
-    Array.isArray(value.episodes) &&
-    value.episodes.every(isEpisode)
+    isMemoryFiles(value.files)diff --git a/src-tauri/src/ipc.rs b/src-tauri/src/ipc.rs
   );
 }
 

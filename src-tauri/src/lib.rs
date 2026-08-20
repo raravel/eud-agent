@@ -56,10 +56,6 @@ impl engine::MemoryProvider for AppMemoryProvider {
     fn render_section(&self) -> String {
         self.current_memory().render_section(None)
     }
-
-    fn append_episode(&self, episode: &serde_json::Value) -> bool {
-        self.current_memory().append_episode(episode)
-    }
 }
 
 /// Resolves the current project from the editor STATUS and reads/writes its
@@ -155,6 +151,12 @@ pub fn run() {
             // Non-fatal: a failed dir create resurfaces on first write with context.
             if let Err(error) = data_dirs.ensure_dirs() {
                 eprintln!("eud-agent: cannot create data dirs: {error}");
+            }
+            let removed_episodes = memory::cleanup_legacy_episode_files(&data_dirs.memory_dir());
+            if removed_episodes > 0 {
+                eprintln!(
+                    "eud-agent: removed {removed_episodes} obsolete project-memory episode files"
+                );
             }
             let attachment_store = attachment::AttachmentStore::new(data_dirs.attachments_dir());
             attachment_store.cleanup_stale_drafts();

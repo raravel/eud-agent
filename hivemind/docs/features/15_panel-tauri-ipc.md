@@ -42,7 +42,7 @@ Events (core -> panel, `listen`):
 | `error {message}` | `listen("error", ...)` |
 | `status {compiling, project}` | `listen("status", ...)` (push) or command return |
 | `list {files?, error?}` | command return value of `invoke("list")` |
-| `memory {project, files, episodes}` | command return value of `invoke("memory_get")` |
+| `memory {project, files}` | command return value of `invoke("memory_get")` |
 | `memory_saved {file}` | command return value of `invoke("memory_save")` |
 
 `status`/`list`/`memory_get`/`memory_save` and both `codex_model_settings*` calls are

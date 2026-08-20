@@ -38,5 +38,5 @@
   approval gate) with zero new staging machinery. User confirmed both recommendations.
 - Impact: features/07_project-memory.md (new feature spec); tools.py (new ToolSpec, gate
   exemption); journal.py (memory snapshot/inverse + changeset item kind); engine.py
-  ([project memory] section + episode recording); app.py (memory_get/memory_save WS);
-  panel (memory view).
+  (`[project memory]` section injection); app.py (memory_get/memory_save WS); panel
+  (memory view).

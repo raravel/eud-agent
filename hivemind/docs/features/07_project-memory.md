@@ -22,7 +22,6 @@ graph TD
     Tools --> Store[ProjectMemory store<br/>data-dir/harness/projname/]
     Store -- "[project memory] section" --> Prompt[system prompt /<br/>resume turn text]
     Prompt --> Codex
-    Engine[AgentEngine] -- "episode append on finalization" --> Store
     Panel[Panel memory view] -- "WS memory_get / memory_save" --> App[FastAPI app] --> Store
     Changeset[Changeset review] -- "reject = rollback file" --> Journal
 ```
@@ -37,7 +36,6 @@ graph TD
 | `structure.md` | codex + panel | One-line role summary per project file ("stats.eps: RPG stat system"). |
 | `conventions.md` | codex + panel | Naming and trigger-pattern conventions observed in the user's code. |
 | `lessons.md` | codex + panel | Corrections/feedback: the fact + why + how to apply next time. |
-| `episodes.jsonl` | server only | Append-only request history (see Episodes). Never injected raw — rendered compactly. |
 | `meta.json` | server only | `{"version": 1, "list_hash": "<sha256 of LIST reply>", "list_hash_ts": "<ISO8601>"}` for staleness detection. |
 
 - Project name comes from bridge STATUS via `parse_status()` (`engine.py`). Sanitization:
@@ -78,9 +76,7 @@ RAG examples; never-do rules outrank both):
 - `_resume_turn_text()` (resumed chats) includes a refreshed copy alongside the refreshed
   `[project state]` + `[reference context]` — memory changes between chats.
 - Section body, in order: `resources.md`, `structure.md`, `conventions.md`, `lessons.md`
-  (each under a `## <name>` heading, empty files omitted), then `## recent episodes` —
-  the last 10 episodes rendered one line each (`<ts> <kind> <instruction-head> -> <decision>`),
-  with rejected/partial decisions explicitly marked so codex treats them as corrections.
+  (each under a `## <name>` heading, empty files omitted).
 - Staleness annotation: when `meta.json`'s `list_hash` differs from the sha256 of the current
   LIST reply, the `structure.md` heading carries the suffix
   `(may be outdated — project files changed since last memory update)`. The hash is refreshed
@@ -89,44 +85,34 @@ RAG examples; never-do rules outrank both):
   only — resource allocations, file roles, conventions, user corrections — via `memory_write`,
   and never transient or code-derivable detail.
 - Size guard: the rendered section is capped at 40,000 characters; per-file write caps make
-  reaching it unlikely, but on overflow the episodes list is dropped first, then `lessons.md`
-  is truncated tail-first, and a `memory section truncated` marker is appended.
+  reaching it unlikely, but on overflow `lessons.md` is truncated tail-first and a
+  `memory section truncated` marker is appended.
 - When the project name is empty or the harness dir is unreadable, the section renders as
   `[project memory]\n(no project memory)` — best-effort, never blocks the turn (same
   degradation contract as RAG).
 
-## Episodes (server-written, zero token cost)
+## Conversation history boundary
 
-`AgentEngine` appends one JSONL line to `episodes.jsonl` at each request finalization point:
+Project Memory deliberately stores no request-level episode or chat history. Complete
+conversation history belongs to durable sessions; approved plans, decisions, and detailed
+work logs belong to the per-project workspace. The four memory files contain only the small,
+durable facts needed in every prompt.
 
-- changeset decided (`_on_changeset_decision`): decision `accepted` / `rejected` / `partial`.
-- default-accept on next chat (`_finalize_prior_request` path): decision `defaulted`.
-- answer-only turn end (no journal entries): decision `answer`.
-
-Line shape:
-
-```json
-{"ts": "<ISO8601>", "request_id": "...", "instruction": "<first 200 chars of the chat text>",
- "kind": "answer|changeset", "tools": ["dat_set", "file_write"], "files": ["stats.eps"],
- "decision": "answer|accepted|rejected|partial|defaulted"}
-```
-
-`tools` is the distinct journaled tool list; `files` the distinct file targets. Episodes are
-recorded only when a project name is known. Append failures are logged and swallowed
-(memory must never break the request flow).
+No `episodes.jsonl` is produced, read, injected into prompts, or returned to the panel.
+App startup removes obsolete `episodes.jsonl` files left by older versions on a best-effort
+basis.
 
 ## WS protocol additions
 
 Client → server:
 
-- `memory_get {}` — returns the current project's memory files + recent episodes.
+- `memory_get {}` — returns the current project's four memory files.
 - `memory_save {file, content}` — panel edit; `file` in the same enum, same 8 KB cap;
   writes directly (no journal — the user editing their own memory is not an agent mutation).
 
 Server → client:
 
-- `memory {project, files: {resources, structure, conventions, lessons}, episodes: [...]}`
-  (episodes: last 50, newest first).
+- `memory {project, files: {resources, structure, conventions, lessons}}`
 - `memory_saved {file}` on successful save; `error {message}` otherwise (no project open,
   oversize content, unknown file).
 
@@ -143,7 +129,7 @@ stateDiagram-v2
 - A header toggle button (lucide `BookText` icon, next to the existing status pills) opens
   the memory view; it overlays the conversation column like PlanView/ChangesetView do.
 - On open the panel sends `memory_get` and renders four file tabs (resources / structure /
-  conventions / lessons) plus a read-only episodes list.
+  conventions / lessons).
 - The edit surface is the existing Monaco wiring (`panel/src/editor/monaco.ts`, language
   `markdown`) — Decision 05 makes Monaco the panel's edit surface; Save sends `memory_save`,
   a `memory_saved` reply clears the dirty flag.
@@ -162,8 +148,6 @@ stateDiagram-v2
 - Rollback after the user manually edited the same memory file in the panel: inverse op
   restores the pre-tool content, discarding the manual edit — same memory-only semantics as
   editor rollback; the existing rollback warning copy covers it.
-- `episodes.jsonl` growth: unbounded on disk (cheap text), bounded in prompt (last 10) and
-  in WS payload (last 50). Compaction is out of scope.
 
 ## Out of scope (deliberate)
 
@@ -178,7 +162,7 @@ stateDiagram-v2
   rendering (order, staleness suffix, truncation order, no-project degradation), tool
   validation (enum, size cap, no-project error), journal snapshot/inverse round-trip for
   `memory_write` (existed and not-existed cases), plan-gate exemption (3 memory_writes do
-  not trip the gate), episode append on each finalization path.
+  not trip the gate), and obsolete episode-file cleanup.
 - Integration: fake-bridge WS test driving chat → memory_write → changeset with a `memory`
   item → reject → file content restored; `memory_get`/`memory_save` round-trip.
 - Panel: store reducer tests for the new messages; MemoryView component test (tabs, dirty
@@ -187,16 +171,15 @@ stateDiagram-v2
 ## Implementation
 
 - `server/eud_agent/memory.py` — NEW: ProjectMemory store (paths, sanitize, atomic IO,
-  episodes append, meta hash, `[project memory]` section renderer)
+  meta hash, `[project memory]` section renderer)
 - `server/eud_agent/tools.py` — `memory_write` ToolSpec + handler + plan-gate exemption
 - `server/eud_agent/journal.py` — memory snapshot/inverse, changeset item kind `memory`
-- `server/eud_agent/engine.py` — section injection (first + resumed turns), episode recording
-  at finalization points
+- `server/eud_agent/engine.py` — section injection (first + resumed turns)
 - `server/eud_agent/app.py` — `memory_get` / `memory_save` WS handlers
 - `panel/src/ws/protocol.ts` — new client/server message types
 - `panel/src/state/store.ts` — memory view state + reducers
-- `panel/src/components/MemoryView.tsx` — NEW: tabs + Monaco edit + episodes list
+- `panel/src/components/MemoryView.tsx` — NEW: tabs + Monaco edit
 - `panel/src/App.tsx` — header toggle + view wiring
-- `server/tests/test_memory.py` — NEW: store/render/episode tests
+- `server/tests/test_memory.py` — NEW: store/render tests
 - `server/tests/test_tools.py`, `server/tests/test_journal.py`, `server/tests/test_app.py`,
   `server/tests/test_integration_ws.py` — extended

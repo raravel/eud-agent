@@ -180,7 +180,7 @@ function syncProjectState(target: PanelStore, source: PanelStore): void {
   target.editorConnectionChanged(state.editorConnected);
   if (state.rag !== "unknown") target.ragWarmupChanged(state.rag);
   if (state.memory) {
-    target.memoryReceived(state.memory.project, state.memory.files, state.memory.episodes);
+    target.memoryReceived(state.memory.project, state.memory.files);
   }
   if (state.wikiData) {
     target.wikiReceived(state.wikiData.version, state.wikiData.entries);
@@ -485,9 +485,7 @@ export default function App() {
           );
           break;
         case "memory":
-          forEveryStore((target) =>
-            target.memoryReceived(msg.project, msg.files, msg.episodes),
-          );
+          forEveryStore((target) => target.memoryReceived(msg.project, msg.files));
           break;
         case "memory_saved":
           forEveryStore((target) => target.memorySaved(msg.file));

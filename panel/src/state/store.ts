@@ -36,7 +36,6 @@
 import type {
   ChangesetItem,
   ChatAttachment,
-  Episode,
   FileEntry,
   LedgerEntry,
   MemoryFile,
@@ -223,7 +222,6 @@ export interface WikiState {
 export interface MemoryViewState {
   project: string;
   files: Record<MemoryFile, string>;
-  episodes: Episode[];
   activeTab: MemoryFile;
   drafts: Partial<Record<MemoryFile, string>>;
   dirty: Record<MemoryFile, boolean>;
@@ -340,11 +338,7 @@ export interface PanelStore {
   /** Explicit editor bridge heartbeat setter (App/backend can drive this). */
   editorConnectionChanged(connected: boolean): void;
   /** `memory` - populate the memory view and clear local drafts. */
-  memoryReceived(
-    project: string,
-    files: Record<MemoryFile, string>,
-    episodes: Episode[],
-  ): void;
+  memoryReceived(project: string, files: Record<MemoryFile, string>): void;
   /** `memory_saved` - commit the saved draft and clear that tab's dirty flag. */
   memorySaved(file: MemoryFile): void;
   /**
@@ -961,11 +955,10 @@ export function createPanelStore(): PanelStore {
       emit();
     },
 
-    memoryReceived(project, files, episodes) {
+    memoryReceived(project, files) {
       core.memory = {
         project,
         files,
-        episodes,
         activeTab:
           core.memory?.activeTab && MEMORY_FILE_ORDER.includes(core.memory.activeTab)
             ? core.memory.activeTab

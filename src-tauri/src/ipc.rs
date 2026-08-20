@@ -171,8 +171,6 @@ pub struct MemoryGetResponse {
     pub project: String,
     /// Project memory markdown files.
     pub files: MemoryFiles,
-    /// Recent episodes, newest first.
-    pub episodes: Vec<serde_json::Value>,
 }
 
 /// Project memory markdown file payloads.
@@ -536,9 +534,6 @@ pub fn memory_get_payload(dirs: &DataDirs, project: &str) -> Result<MemoryGetRes
         return Err("no project is open; memory is disabled".to_string());
     }
 
-    let mut episodes = memory.read_episodes(50);
-    episodes.reverse();
-
     Ok(MemoryGetResponse {
         project: project.to_string(),
         files: MemoryFiles {
@@ -547,7 +542,6 @@ pub fn memory_get_payload(dirs: &DataDirs, project: &str) -> Result<MemoryGetRes
             conventions: memory.read("conventions"),
             lessons: memory.read("lessons"),
         },
-        episodes,
     })
 }
 
@@ -966,17 +960,6 @@ mod tests {
                 "conventions": "Use dc_ prefix for counters",
                 "lessons": "Build after eps edits"
             },
-            "episodes": [
-                {
-                    "ts": "2026-06-10T12:00:00Z",
-                    "request_id": "req-1",
-                    "instruction": "Add a boss phase",
-                    "kind": "changeset",
-                    "tools": ["file_write"],
-                    "files": ["main.eps"],
-                    "decision": "accepted"
-                }
-            ]
         }))
         .unwrap();
         assert_json(
@@ -989,17 +972,6 @@ mod tests {
                     "conventions": "Use dc_ prefix for counters",
                     "lessons": "Build after eps edits"
                 },
-                "episodes": [
-                    {
-                        "ts": "2026-06-10T12:00:00Z",
-                        "request_id": "req-1",
-                        "instruction": "Add a boss phase",
-                        "kind": "changeset",
-                        "tools": ["file_write"],
-                        "files": ["main.eps"],
-                        "decision": "accepted"
-                    }
-                ]
             }),
         );
 
@@ -1019,7 +991,7 @@ mod tests {
     }
 
     #[test]
-    fn memory_get_payload_reads_all_files_and_returns_last_50_episodes_newest_first() {
+    fn memory_get_payload_reads_all_files() {
         let base = unique_temp_dir("memory-get");
         let dirs = DataDirs::from_bases(&base.join("roaming"), &base.join("local"));
         let memory = ProjectMemory::new(dirs.memory_dir(), "ExampleProject");
@@ -1031,17 +1003,6 @@ mod tests {
                 .ok
         );
         assert!(memory.write("lessons", "Build after eps edits").ok);
-        for index in 0..55 {
-            assert!(memory.append_episode(&json!({
-                "ts": format!("2026-06-10T12:{index:02}:00Z"),
-                "request_id": format!("req-{index}"),
-                "instruction": format!("instruction {index}"),
-                "kind": if index % 2 == 0 { "answer" } else { "changeset" },
-                "tools": ["file_write"],
-                "files": ["main.eps"],
-                "decision": if index % 2 == 0 { "answer" } else { "accepted" }
-            })));
-        }
 
         let payload = ipc::memory_get_payload(&dirs, "ExampleProject")
             .expect("memory_get should return the open project's memory");
@@ -1051,12 +1012,6 @@ mod tests {
         assert_eq!(payload.files.structure, "main.eps: entry point");
         assert_eq!(payload.files.conventions, "Use dc_ prefix for counters");
         assert_eq!(payload.files.lessons, "Build after eps edits");
-        assert_eq!(payload.episodes.len(), 50);
-
-        let value = serde_json::to_value(&payload).unwrap();
-        let episodes = value["episodes"].as_array().unwrap();
-        assert_eq!(episodes[0]["request_id"], "req-54");
-        assert_eq!(episodes[49]["request_id"], "req-5");
 
         fs::remove_dir_all(base).ok();
     }

@@ -48,7 +48,6 @@ const WORKSPACE_GUIDE: &str = r#"[project workspace]
 - Workspace document edits are reviewed after the turn. Do not label a spec/decision/worklog as confirmed or completed merely because you wrote it; only user approval and changeset outcomes establish those states.
 - Use eud-tools for every editor, map, DAT, build, and RAG action. Native shell/file tools are only for this workspace."#;
 
-const EPISODE_INSTRUCTION_CHARS: usize = 200;
 const MAX_WORKSPACE_DOC_REPAIR_TURNS: usize = 2;
 
 /// Bound on the first post-open `thread/resume` turn before the session-restore
@@ -208,13 +207,10 @@ pub(crate) trait EventSink {
     fn emit(&self, event: EngineEvent) -> Result<(), AgentEngineError>;
 }
 
-/// Provides per-turn project memory rendering and best-effort episode recording.
+/// Provides per-turn project memory rendering.
 pub trait MemoryProvider: Send + Sync {
     /// Render the `[project memory]` prompt section for the current project state.
     fn render_section(&self) -> String;
-
-    /// Append one episode JSON value. Returns `false` when the append was skipped or failed.
-    fn append_episode(&self, episode: &serde_json::Value) -> bool;
 }
 
 /// Renders the `[project state]` section fresh each turn (project name + build
@@ -311,14 +307,6 @@ impl AgentEngineConfig {
             .map(|provider| provider.render_section())
             .or_else(|| self.project_memory.clone())
     }
-
-    fn append_episode(&self, episode: &serde_json::Value) {
-        if let Some(provider) = &self.memory_provider {
-            if !provider.append_episode(episode) {
-                eprintln!("project memory episode append was skipped or failed");
-            }
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -348,7 +336,6 @@ pub(crate) struct AgentEngine<D: CodexDriver, S: EventSink> {
     plan_revision: u32,
     current_plan_markdown: Option<String>,
     current_request_id: Option<String>,
-    current_instruction_head: Option<String>,
     session_id: String,
     project_id: String,
     pending_write: Option<WriteContinuation>,
@@ -381,7 +368,6 @@ impl<D: CodexDriver, S: EventSink> AgentEngine<D, S> {
             plan_revision: 0,
             current_plan_markdown: None,
             current_request_id: None,
-            current_instruction_head: None,
             session_id: session.meta.id,
             project_id: session.meta.project,
             pending_write: None,
@@ -409,12 +395,6 @@ impl<D: CodexDriver, S: EventSink> AgentEngine<D, S> {
             .map_err(AgentEngineError::new)?;
         self.current_plan_markdown = None;
         self.current_request_id = Some(request_id);
-        let session_seed = if req.text.trim().is_empty() && !req.attachments.is_empty() {
-            "첨부 파일 분석"
-        } else {
-            &req.text
-        };
-        self.current_instruction_head = Some(take_chars(session_seed, EPISODE_INSTRUCTION_CHARS));
         self.phase = Phase::Triage;
         let attachment_context = self.resolve_attachments(&req.attachments)?;
         let plain_user_text = if req.text.trim().is_empty() && !req.attachments.is_empty() {
@@ -836,8 +816,6 @@ Continue the requested change now, run the mandatory build, and stop only after 
             ipc::DecisionIds::All(_) => journal::DecisionIds::All,
             ipc::DecisionIds::List(ids) => journal::DecisionIds::Items(ids.clone()),
         };
-        let episode_decision = changeset_episode_decision(&req);
-        let episode_summary = self.journal_summary(&request_id);
         let accepted_wiki_entries = self.collect_accepted_wiki_entries(&request_id, &req);
         let accepted_workspace_entries = self.collect_accepted_workspace_entries(&request_id, &req);
 
@@ -889,7 +867,6 @@ Continue the requested change now, run the mandatory build, and stop only after 
             return Ok(());
         }
 
-        self.append_changeset_episode_with_summary(&request_id, episode_decision, episode_summary);
         if settled {
             self.runtime
                 .release_write_lease()
@@ -1020,7 +997,6 @@ Continue the requested change now, run the mandatory build, and stop only after 
         self.current_plan_markdown = None;
         self.runtime.clear_current();
         self.current_request_id = None;
-        self.current_instruction_head = None;
 
         let transcript = condense_transcript(&panel_log);
         self.pending_resume_transcript = (!transcript.trim().is_empty()).then_some(transcript);
@@ -1162,7 +1138,6 @@ Continue the requested change now, run the mandatory build, and stop only after 
                 self.phase = Phase::Answer;
                 self.sink
                     .emit(EngineEvent::Answer(ipc::AnswerEvent { text }))?;
-                self.append_answer_episode_if_no_changeset();
                 self.phase = Phase::Idle;
             }
             CodexTurnResult::Plan { markdown } => {
@@ -1209,57 +1184,6 @@ Continue the requested change now, run the mandatory build, and stop only after 
                 .collect(),
         }))?;
         Ok(true)
-    }
-
-    fn append_answer_episode_if_no_changeset(&self) {
-        let Some(request_id) = self.current_request_id.as_deref() else {
-            return;
-        };
-        let summary = self.journal_summary(request_id);
-        if summary.has_entries {
-            return;
-        }
-        self.append_episode(request_id, "answer", "answer", summary);
-    }
-
-    fn append_changeset_episode_with_summary(
-        &self,
-        request_id: &str,
-        decision: &str,
-        summary: JournalSummary,
-    ) {
-        if !summary.has_entries {
-            return;
-        }
-        self.append_episode(request_id, "changeset", decision, summary);
-    }
-
-    fn append_episode(
-        &self,
-        request_id: &str,
-        kind: &str,
-        decision: &str,
-        summary: JournalSummary,
-    ) {
-        let episode = serde_json::json!({
-            "ts": iso8601_utc_now(),
-            "request_id": request_id,
-            "instruction": self.current_instruction_head.as_deref().unwrap_or_default(),
-            "kind": kind,
-            "tools": summary.tools,
-            "files": summary.files,
-            "decision": decision,
-        });
-        self.config.append_episode(&episode);
-    }
-
-    fn journal_summary(&self, request_id: &str) -> JournalSummary {
-        if let Ok(changeset) = self.journal_store.changeset(request_id) {
-            return JournalSummary::from_changeset(&changeset);
-        }
-        journal::JournalStore::load(&self.journal_data_dir, request_id)
-            .map(|journal| JournalSummary::from_entries(&journal.entries))
-            .unwrap_or_default()
     }
 }
 
@@ -2766,200 +2690,6 @@ fn condense_transcript(panel_log: &serde_json::Value) -> String {
     take_chars(&joined, CONDENSED_TRANSCRIPT_CAP_CHARS)
 }
 
-fn iso8601_utc_now() -> String {
-    let seconds = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs() as i64)
-        .unwrap_or_default();
-    iso8601_utc_from_unix_seconds(seconds)
-}
-
-fn iso8601_utc_from_unix_seconds(seconds: i64) -> String {
-    let days = seconds.div_euclid(86_400);
-    let seconds_of_day = seconds.rem_euclid(86_400);
-    let (year, month, day) = civil_from_days(days);
-    let hour = seconds_of_day / 3_600;
-    let minute = (seconds_of_day % 3_600) / 60;
-    let second = seconds_of_day % 60;
-
-    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
-}
-
-fn civil_from_days(days_since_epoch: i64) -> (i64, i64, i64) {
-    let z = days_since_epoch + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let day_of_era = z - era * 146_097;
-    let year_of_era =
-        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
-    let year = year_of_era + era * 400;
-    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
-    let month_prime = (5 * day_of_year + 2) / 153;
-    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
-    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
-    let year = year + if month <= 2 { 1 } else { 0 };
-
-    (year, month, day)
-}
-
-fn changeset_episode_decision(req: &ipc::ChangesetDecisionRequest) -> &'static str {
-    match (&req.decision, &req.ids) {
-        (ipc::Decision::Accept, ipc::DecisionIds::All(_)) => "accepted",
-        (ipc::Decision::Accept, ipc::DecisionIds::List(_)) => "partial",
-        (ipc::Decision::Reject, _) => "rejected",
-    }
-}
-
-#[derive(Default)]
-struct JournalSummary {
-    has_entries: bool,
-    tools: Vec<String>,
-    files: Vec<String>,
-}
-
-impl JournalSummary {
-    fn from_entries(entries: &[journal::JournalEntry]) -> Self {
-        let mut summary = Self {
-            has_entries: !entries.is_empty(),
-            tools: Vec::new(),
-            files: Vec::new(),
-        };
-
-        for entry in entries {
-            push_unique(&mut summary.tools, write_tool_name(entry.tool).to_string());
-            for file in journal_target_files(&entry.target) {
-                push_unique(&mut summary.files, file);
-            }
-        }
-
-        summary
-    }
-
-    fn from_changeset(changeset: &journal::Changeset) -> Self {
-        let mut summary = Self {
-            has_entries: !changeset.items.is_empty(),
-            tools: Vec::new(),
-            files: Vec::new(),
-        };
-
-        for item in &changeset.items {
-            if let Some(tool) = changeset_item_tool(item) {
-                push_unique(&mut summary.tools, tool.to_string());
-            }
-            for file in changeset_item_files(item) {
-                push_unique(&mut summary.files, file);
-            }
-        }
-
-        summary
-    }
-}
-
-fn push_unique(values: &mut Vec<String>, value: String) {
-    if !values.iter().any(|existing| existing == &value) {
-        values.push(value);
-    }
-}
-
-fn write_tool_name(tool: journal::WriteTool) -> &'static str {
-    match tool {
-        journal::WriteTool::DatSet => "dat_set",
-        journal::WriteTool::XdatSet => "xdat_set",
-        journal::WriteTool::TblSet => "tbl_set",
-        journal::WriteTool::ReqSet => "req_set",
-        journal::WriteTool::BtnSet => "btn_set",
-        journal::WriteTool::FileWrite => "file_write",
-        journal::WriteTool::FileCreate => "file_create",
-        journal::WriteTool::Mkdir => "mkdir",
-        journal::WriteTool::FileDelete => "file_delete",
-        journal::WriteTool::FileRename => "file_rename",
-        journal::WriteTool::FileMove => "file_move",
-        journal::WriteTool::SetMain => "set_main",
-        journal::WriteTool::SettingsSet => "settings_set",
-        journal::WriteTool::PluginAdd => "plugin_add",
-        journal::WriteTool::PluginEdit => "plugin_edit",
-        journal::WriteTool::PluginRemove => "plugin_remove",
-        journal::WriteTool::PluginMove => "plugin_move",
-        journal::WriteTool::LocationWrite => "location_write",
-        journal::WriteTool::PlayerSetup => "player_setup",
-        journal::WriteTool::WorkspaceWrite => "workspace_write",
-        journal::WriteTool::WorkspaceCreate => "workspace_create",
-        journal::WriteTool::WorkspaceDelete => "workspace_delete",
-    }
-}
-
-fn journal_target_files(target: &journal::JournalTarget) -> Vec<String> {
-    match target {
-        journal::JournalTarget::Path { path } => vec![path.clone()],
-        journal::JournalTarget::WorkspacePath { path, .. } => {
-            vec![format!("workspace/{path}")]
-        }
-        journal::JournalTarget::Rename { from, to } => vec![from.clone(), to.clone()],
-        journal::JournalTarget::Map { path, .. } => vec![path.clone()],
-        journal::JournalTarget::Dat { .. }
-        | journal::JournalTarget::Setting { .. }
-        | journal::JournalTarget::Plugin { .. } => Vec::new(),
-    }
-}
-
-fn changeset_item_tool(item: &journal::ChangesetItem) -> Option<&'static str> {
-    if item.id.starts_with("dat:Dat:") {
-        return Some("dat_set");
-    }
-    if item.id.starts_with("dat:Xdat:") {
-        return Some("xdat_set");
-    }
-    if item.id.starts_with("dat:Tbl:") {
-        return Some("tbl_set");
-    }
-    if item.id.starts_with("dat:Req:") {
-        return Some("req_set");
-    }
-    if item.id.starts_with("dat:Btn:") {
-        return Some("btn_set");
-    }
-    match item.kind {
-        journal::ChangesetItemKind::WorkspaceCreated => return Some("workspace_create"),
-        journal::ChangesetItemKind::WorkspaceModified => return Some("workspace_write"),
-        journal::ChangesetItemKind::WorkspaceDeleted => return Some("workspace_delete"),
-        _ => {}
-    }
-    if item.diff.is_some() {
-        return Some("file_write");
-    }
-    if item
-        .properties
-        .iter()
-        .any(|property| property.property == "map")
-    {
-        return Some("location_write");
-    }
-    match item.kind {
-        journal::ChangesetItemKind::Created => Some("file_create"),
-        journal::ChangesetItemKind::Deleted => Some("file_delete"),
-        journal::ChangesetItemKind::Modified => None,
-        journal::ChangesetItemKind::Dat => None,
-        journal::ChangesetItemKind::WorkspaceCreated
-        | journal::ChangesetItemKind::WorkspaceModified
-        | journal::ChangesetItemKind::WorkspaceDeleted => unreachable!(),
-    }
-}
-
-fn changeset_item_files(item: &journal::ChangesetItem) -> Vec<String> {
-    if let Some(diff) = item.diff.as_deref().and_then(diff_new_path) {
-        return vec![diff];
-    }
-    item.properties
-        .iter()
-        .filter(|property| property.property == "map")
-        .filter_map(|property| property.new.as_str().map(ToOwned::to_owned))
-        .collect()
-}
-
-fn diff_new_path(diff: &str) -> Option<String> {
-    diff.lines()
-        .find_map(|line| line.strip_prefix("+++ new/").map(ToOwned::to_owned))
-}
-
 /// The `ids` echoed back to the panel in `rollback_result`. A per-item decision
 /// echoes the exact ids it targeted; a bulk (`all`) decision echoes EMPTY, which
 /// the panel resolves against its OWN still-undecided item ids (a dat group's ids
@@ -3533,10 +3263,6 @@ mod tests {
         fn render_section(&self) -> String {
             self.memory.render_section(None)
         }
-
-        fn append_episode(&self, episode: &Value) -> bool {
-            self.memory.append_episode(episode)
-        }
     }
 
     /// A wiki provider backed by a file-backed [`crate::wiki::WikiStore`], so the
@@ -3749,42 +3475,6 @@ mod tests {
         engine.journal_store = journal::JournalStore::new(data_dir);
         engine.journal_data_dir = data_dir.to_path_buf();
         engine
-    }
-
-    fn latest_episode(memory: &ProjectMemory) -> Value {
-        memory
-            .read_episodes(10)
-            .pop()
-            .expect("expected an episode to be recorded")
-    }
-
-    fn assert_common_episode_fields(
-        episode: &Value,
-        decision: &str,
-        kind: &str,
-        instruction_prefix: &str,
-    ) {
-        assert_eq!(episode["decision"], decision);
-        assert_eq!(episode["kind"], kind);
-        assert!(
-            episode["ts"].as_str().is_some_and(|ts| ts.contains('T')),
-            "episode ts must be an ISO8601 string, got {episode:?}"
-        );
-        assert!(
-            episode["request_id"]
-                .as_str()
-                .is_some_and(|request_id| request_id.starts_with("req-")),
-            "episode request_id must be populated, got {episode:?}"
-        );
-        let instruction = episode["instruction"]
-            .as_str()
-            .expect("episode instruction must be a string");
-        assert!(instruction.starts_with(instruction_prefix));
-        assert!(
-            instruction.chars().count() <= 200,
-            "episode instruction head must be capped at 200 chars, got {}",
-            instruction.chars().count()
-        );
     }
 
     fn test_engine<D: CodexDriver, S: EventSink>(driver: D, sink: S) -> AgentEngine<D, S> {
@@ -4007,77 +3697,6 @@ mod tests {
             !prompts[1].contains("Switch 1 = first value"),
             "resumed prompt must refresh memory instead of reusing startup config"
         );
-
-        fs::remove_dir_all(base).ok();
-    }
-
-    #[tokio::test]
-    async fn answer_only_turn_appends_answer_episode() {
-        let (base, memory) = memory_store("episode-answer");
-        let driver = FakeCodexDriver::scripted([CodexTurnResult::Answer {
-            text: "No edits are needed.".to_string(),
-        }]);
-        let sink = CapturingEventSink::default();
-        let mut engine = test_engine_with_memory(driver, sink, memory.clone(), &base.join("data"));
-        let instruction = format!("{}{}", "explain behavior ", "x".repeat(240));
-
-        engine
-            .chat(crate::ipc::ChatRequest {
-                text: instruction,
-                attachments: Vec::new(),
-            })
-            .await
-            .expect("answer-only chat should still complete after episode append");
-
-        let episode = latest_episode(&memory);
-        assert_common_episode_fields(&episode, "answer", "answer", "explain behavior ");
-        assert_eq!(episode["tools"], json!([]));
-        assert_eq!(episode["files"], json!([]));
-
-        fs::remove_dir_all(base).ok();
-    }
-
-    #[tokio::test]
-    async fn changeset_decision_appends_accepted_episode_with_tools_and_files() {
-        let (base, memory) = memory_store("episode-accepted");
-        let driver = FakeCodexDriver::scripted([CodexTurnResult::Plan {
-            markdown: "- Write file".to_string(),
-        }]);
-        let sink = CapturingEventSink::default();
-        let mut engine = test_engine_with_memory(driver, sink, memory.clone(), &base.join("data"));
-
-        engine
-            .chat(crate::ipc::ChatRequest {
-                text: "write the trigger".to_string(),
-                attachments: Vec::new(),
-            })
-            .await
-            .expect("chat should run");
-        let request_id = engine
-            .current_request_id
-            .clone()
-            .expect("chat should create a request id");
-        record_file_write(
-            &engine.journal_store,
-            &request_id,
-            "file-write",
-            1,
-            "scripts/main.eps",
-        );
-        engine.phase = Phase::ChangesetReview;
-
-        engine
-            .changeset_decision(crate::ipc::ChangesetDecisionRequest {
-                decision: crate::ipc::Decision::Accept,
-                ids: crate::ipc::DecisionIds::All(crate::ipc::AllLiteral),
-            })
-            .await
-            .expect("accept-all decision should finalize");
-
-        let episode = latest_episode(&memory);
-        assert_common_episode_fields(&episode, "accepted", "changeset", "write the trigger");
-        assert_eq!(episode["tools"], json!(["file_write"]));
-        assert_eq!(episode["files"], json!(["scripts/main.eps"]));
 
         fs::remove_dir_all(base).ok();
     }
@@ -4372,165 +3991,6 @@ mod tests {
             .get("dat:weapons:5:Damage")
             .expect("the kept dat edit is recorded");
         assert_eq!(kept.value, json!(6));
-
-        fs::remove_dir_all(base).ok();
-    }
-
-    #[tokio::test]
-    async fn accepted_episode_summarizes_live_unpersisted_journal_entries() {
-        let (base, memory) = memory_store("episode-live-journal");
-        let driver = FakeCodexDriver::scripted([CodexTurnResult::Plan {
-            markdown: "- Write file".to_string(),
-        }]);
-        let sink = CapturingEventSink::default();
-        let mut engine = test_engine_with_memory(driver, sink, memory.clone(), &base.join("data"));
-
-        engine
-            .chat(crate::ipc::ChatRequest {
-                text: "write the live trigger".to_string(),
-                attachments: Vec::new(),
-            })
-            .await
-            .expect("chat should run");
-        let request_id = engine
-            .current_request_id
-            .clone()
-            .expect("chat should create a request id");
-        record_file_write_in_memory(
-            &engine.journal_store,
-            &request_id,
-            "live-file-write",
-            1,
-            "scripts/live.eps",
-        );
-        engine.phase = Phase::ChangesetReview;
-
-        engine
-            .changeset_decision(crate::ipc::ChangesetDecisionRequest {
-                decision: crate::ipc::Decision::Accept,
-                ids: crate::ipc::DecisionIds::All(crate::ipc::AllLiteral),
-            })
-            .await
-            .expect("accept-all decision should finalize");
-
-        let episode = latest_episode(&memory);
-        assert_common_episode_fields(&episode, "accepted", "changeset", "write the live trigger");
-        assert_eq!(episode["tools"], json!(["file_write"]));
-        assert_eq!(episode["files"], json!(["scripts/live.eps"]));
-
-        fs::remove_dir_all(base).ok();
-    }
-
-    #[tokio::test]
-    async fn failed_reject_does_not_append_rejected_episode() {
-        let (base, memory) = memory_store("episode-failed-reject");
-        let driver = FakeCodexDriver::scripted([CodexTurnResult::Plan {
-            markdown: "- Write file".to_string(),
-        }]);
-        let sink = CapturingEventSink::default();
-        let sink_handle = sink.clone();
-        let mut engine = test_engine_with_memory(driver, sink, memory.clone(), &base.join("data"));
-
-        engine
-            .chat(crate::ipc::ChatRequest {
-                text: "write then reject".to_string(),
-                attachments: Vec::new(),
-            })
-            .await
-            .expect("chat should run");
-        let request_id = engine
-            .current_request_id
-            .clone()
-            .expect("chat should create a request id");
-        record_file_write_in_memory(
-            &engine.journal_store,
-            &request_id,
-            "reject-file-write",
-            1,
-            "scripts/reject.eps",
-        );
-        engine.phase = Phase::ChangesetReview;
-
-        engine
-            .changeset_decision(crate::ipc::ChangesetDecisionRequest {
-                decision: crate::ipc::Decision::Reject,
-                ids: crate::ipc::DecisionIds::All(crate::ipc::AllLiteral),
-            })
-            .await
-            .expect("failed rollback still emits rollback_result");
-
-        let events = sink_handle.events();
-        assert!(
-            matches!(
-                events.last(),
-                Some(EngineEvent::RollbackResult(
-                    crate::ipc::RollbackResultEvent { ok: false, .. }
-                ))
-            ),
-            "unsupported rollback should report ok=false"
-        );
-        assert!(
-            memory
-                .read_episodes(10)
-                .iter()
-                .all(|episode| episode["decision"] != "rejected"),
-            "failed reject must not leave a rejected project-memory episode"
-        );
-
-        fs::remove_dir_all(base).ok();
-    }
-
-    #[tokio::test]
-    async fn selected_accept_appends_partial_changeset_episode() {
-        let (base, memory) = memory_store("episode-partial");
-        let driver = FakeCodexDriver::scripted([CodexTurnResult::Plan {
-            markdown: "- Write files".to_string(),
-        }]);
-        let sink = CapturingEventSink::default();
-        let mut engine = test_engine_with_memory(driver, sink, memory.clone(), &base.join("data"));
-
-        engine
-            .chat(crate::ipc::ChatRequest {
-                text: "write two triggers".to_string(),
-                attachments: Vec::new(),
-            })
-            .await
-            .expect("chat should run");
-        let request_id = engine
-            .current_request_id
-            .clone()
-            .expect("chat should create a request id");
-        record_file_write(
-            &engine.journal_store,
-            &request_id,
-            "first-write",
-            1,
-            "scripts/first.eps",
-        );
-        record_file_write(
-            &engine.journal_store,
-            &request_id,
-            "second-write",
-            2,
-            "scripts/second.eps",
-        );
-        engine.phase = Phase::ChangesetReview;
-
-        engine
-            .changeset_decision(crate::ipc::ChangesetDecisionRequest {
-                decision: crate::ipc::Decision::Accept,
-                ids: crate::ipc::DecisionIds::List(vec!["first-write".to_string()]),
-            })
-            .await
-            .expect("selected accept should be recorded as partial");
-
-        let episode = latest_episode(&memory);
-        assert_common_episode_fields(&episode, "partial", "changeset", "write two triggers");
-        assert_eq!(episode["tools"], json!(["file_write"]));
-        assert_eq!(
-            episode["files"],
-            json!(["scripts/first.eps", "scripts/second.eps"])
-        );
 
         fs::remove_dir_all(base).ok();
     }
