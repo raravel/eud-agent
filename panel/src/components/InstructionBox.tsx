@@ -37,6 +37,13 @@ import {
 import { PromptInputButton } from "@/components/ai-elements/prompt-input";
 import { Shimmer } from "@/components/ai-elements/shimmer";
 import {
+  Context,
+  ContextContent,
+  ContextContentBody,
+  ContextContentHeader,
+  ContextTrigger,
+} from "@/components/ai-elements/context";
+import {
   Select,
   SelectContent,
   SelectItem,
@@ -44,7 +51,11 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import type { PanelState } from "@/state/store";
-import type { ChatAttachment, CodexModelSettings } from "@/lib/ipc";
+import type {
+  ChatAttachment,
+  CodexModelSettings,
+  ContextUsage,
+} from "@/lib/ipc";
 import {
   attachmentErrorMessage,
   formatAttachmentSize,
@@ -60,6 +71,43 @@ const REASONING_LABELS: Readonly<Record<string, string>> = {
   xhigh: "추론 매우 높음",
   ultra: "추론 최고",
 };
+const CONTEXT_TOKEN_FORMATTER = new Intl.NumberFormat("ko-KR", {
+  notation: "compact",
+  maximumFractionDigits: 1,
+});
+
+function ContextUsageDetails({ usage }: { usage: ContextUsage }) {
+  const rows = [
+    ["입력", usage.total.inputTokens],
+    ["캐시 입력", usage.total.cachedInputTokens],
+    ["출력", usage.total.outputTokens],
+    ["추론", usage.total.reasoningOutputTokens],
+  ] as const;
+
+  return (
+    <div className="space-y-2 text-xs">
+      <div className="flex items-center justify-between gap-3 font-medium">
+        <span>세션 누적</span>
+        <span className="font-mono tabular-nums">
+          {CONTEXT_TOKEN_FORMATTER.format(usage.total.totalTokens)}
+        </span>
+      </div>
+      <dl className="space-y-1.5">
+        {rows.map(([label, tokens]) => (
+          <div
+            key={label}
+            className="flex items-center justify-between gap-3 text-muted-foreground"
+          >
+            <dt>{label}</dt>
+            <dd className="font-mono tabular-nums">
+              {CONTEXT_TOKEN_FORMATTER.format(tokens)}
+            </dd>
+          </div>
+        ))}
+      </dl>
+    </div>
+  );
+}
 
 function turnActivityLabel(state: PanelState): string {
   for (let index = state.turn.tools.length - 1; index >= 0; index -= 1) {
@@ -486,6 +534,22 @@ export function InstructionBox({
                   : "모델 다시 불러오기"}
               </PromptInputButton>
             ) : null}
+            {state.contextUsage?.modelContextWindow !== null &&
+              state.contextUsage?.modelContextWindow !== undefined &&
+              state.contextUsage.modelContextWindow > 0 && (
+                <Context
+                  usedTokens={Math.max(0, state.contextUsage.last.totalTokens)}
+                  maxTokens={state.contextUsage.modelContextWindow}
+                >
+                  <ContextTrigger />
+                  <ContextContent side="top" align="end">
+                    <ContextContentHeader />
+                    <ContextContentBody>
+                      <ContextUsageDetails usage={state.contextUsage} />
+                    </ContextContentBody>
+                  </ContextContent>
+                </Context>
+              )}
           </PromptInputTools>
           <PromptInputSubmit aria-label="전송" disabled={!canSend || staging}>
             <SendIcon className="size-4" />

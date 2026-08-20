@@ -100,6 +100,7 @@ export interface IpcClientOptions {
 
 const PUSH_EVENT_TYPES = [
   "agent_event",
+  "context_usage",
   "answer",
   "plan",
   "changeset",

@@ -27,6 +27,7 @@ describe("initial state", () => {
     expect(s.files).toEqual([]);
     expect(s.plan).toBeNull();
     expect(s.changeset).toBeNull();
+    expect(s.contextUsage).toBeNull();
     expect(s.connected).toBe(false);
   });
 });
@@ -598,6 +599,7 @@ describe("v1 protocol literals are absent (no compat shim)", () => {
     expect(SERVER_MESSAGE_TYPES).toEqual(
       expect.arrayContaining([
         "agent_event",
+        "context_usage",
         "answer",
         "plan",
         "changeset",
@@ -608,6 +610,49 @@ describe("v1 protocol literals are absent (no compat shim)", () => {
         "list",
       ]),
     );
+  });
+});
+
+// ---- per-session Context usage ---------------------------------------
+
+describe("per-session context usage", () => {
+  const usage = {
+    last: {
+      inputTokens: 31_000,
+      cachedInputTokens: 24_000,
+      cacheWriteInputTokens: 0,
+      outputTokens: 1_200,
+      reasoningOutputTokens: 800,
+      totalTokens: 32_200,
+    },
+    total: {
+      inputTokens: 52_000,
+      cachedInputTokens: 40_000,
+      cacheWriteInputTokens: 600,
+      outputTokens: 2_100,
+      reasoningOutputTokens: 1_300,
+      totalTokens: 54_100,
+    },
+    modelContextWindow: 128_000,
+  };
+
+  it("replaces the latest snapshot independently from turn state", () => {
+    const store = freshStore();
+    store.contextUsageReceived(usage);
+
+    expect(store.getState().contextUsage).toEqual(usage);
+    expect(store.getState().phase).toBe("connecting");
+  });
+
+  it("clears stale usage when rewinding to a fresh Codex thread", () => {
+    const store = readyWithProject();
+    store.log("you", "다시 작성할 요청");
+    const entry = store.getState().log[0];
+    store.contextUsageReceived(usage);
+
+    store.rewindTo(entry.id);
+
+    expect(store.getState().contextUsage).toBeNull();
   });
 });
 

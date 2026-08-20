@@ -302,6 +302,9 @@ export default function App() {
       const existing = sessionsRef.current.get(record.id);
       if (existing) {
         existing.meta = record;
+        if (record.contextUsage !== undefined) {
+          existing.store.contextUsageReceived(record.contextUsage);
+        }
         existing.persisted = true;
         bumpSessions();
         return existing;
@@ -309,6 +312,9 @@ export default function App() {
       const sessionStore = createPanelStore();
       syncProjectState(sessionStore, projectStore);
       sessionStore.hydrate(record.panelLog ?? emptyPanelLog());
+      if (record.contextUsage !== undefined) {
+        sessionStore.contextUsageReceived(record.contextUsage);
+      }
       const slot: SessionSlot = {
         id: record.id,
         meta: record,
@@ -529,6 +535,9 @@ export default function App() {
         }
         case "agent_event":
           sessionStore()?.agentEvent(msg.kind, msg.detail, msg.data);
+          break;
+        case "context_usage":
+          sessionStore()?.contextUsageReceived(msg.tokenUsage);
           break;
         case "answer":
           sessionStore()?.answerReceived(msg.text);

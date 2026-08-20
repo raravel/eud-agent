@@ -36,6 +36,7 @@
 import type {
   ChangesetItem,
   ChatAttachment,
+  ContextUsage,
   FileEntry,
   LedgerEntry,
   MemoryFile,
@@ -281,6 +282,8 @@ export interface PanelState {
   pendingDecision: PendingDecision | null;
   /** Per-turn streaming buffers (reasoning / answer / tools); reset per turn. */
   turn: TurnState;
+  /** Latest active-context and cumulative token snapshot for this session. */
+  contextUsage: ContextUsage | null;
   /** RAG warmup gate — "loading" blocks {@link PanelState.canSend}. */
   rag: RagGateState;
   /** Capped event log (oldest dropped at {@link MAX_LOG_ENTRIES}). */
@@ -318,6 +321,8 @@ export interface PanelStore {
    * `data` is the optional EUD-068 payload (tool args / result / status).
    */
   agentEvent(kind: string, detail: string, data?: AgentEventData): void;
+  /** Replace this session's latest typed Codex context snapshot. */
+  contextUsageReceived(usage: ContextUsage): void;
   /** `answer` — answer-only turn; back to ready. */
   answerReceived(text: string): void;
   /** `plan` — enter/refresh plan_review (revision replaces the active card). */
@@ -482,6 +487,7 @@ export function createPanelStore(): PanelStore {
     // Per-turn streaming buffers (reasoning / answer / tools). Reset whenever a
     // new turn starts (chat / plan_feedback / plan_approve / reset).
     turn: emptyTurn(),
+    contextUsage: null as ContextUsage | null,
     // RAG warmup gate (server snapshot + broadcasts). "unknown" until the first
     // rag_warmup progress arrives — fail-open (no snapshot = no blocking).
     rag: "unknown" as RagGateState,
@@ -527,6 +533,7 @@ export function createPanelStore(): PanelStore {
       wikiData: core.wikiData,
       pendingDecision: core.pendingDecision,
       turn: core.turn,
+      contextUsage: core.contextUsage,
       rag: core.rag,
       log: core.log,
       connected: core.connected,
@@ -693,6 +700,11 @@ export function createPanelStore(): PanelStore {
       emit();
     },
 
+
+    contextUsageReceived(usage) {
+      core.contextUsage = usage;
+      emit();
+    },
     agentEvent(kind, detail, data) {
       // A cancel request marks the turn inactive before app-server's final
       // interrupted-turn events drain. Ignore those trailing deltas/results so
@@ -1068,6 +1080,7 @@ export function createPanelStore(): PanelStore {
       core.changeset = null;
       core.pendingDecision = null;
       core.turn = emptyTurn();
+      core.contextUsage = null;
       nextTextBlockBreak = false;
       core.phase = "ready";
       emit();

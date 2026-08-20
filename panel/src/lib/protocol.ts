@@ -161,6 +161,30 @@ export interface AgentEventMessage extends SessionScopedMessage {
   data?: { args?: string; result?: string; status?: string };
 }
 
+/** Token counts from one Codex model response. */
+export interface TokenUsageBreakdown {
+  inputTokens: number;
+  cachedInputTokens: number;
+  cacheWriteInputTokens: number;
+  outputTokens: number;
+  reasoningOutputTokens: number;
+  totalTokens: number;
+}
+
+/** Active context and cumulative token usage for one Codex thread. */
+export interface ContextUsage {
+  last: TokenUsageBreakdown;
+  total: TokenUsageBreakdown;
+  modelContextWindow: number | null;
+}
+
+/** `context_usage` — latest typed usage snapshot for one session. */
+export interface ContextUsageMessage extends SessionScopedMessage {
+  type: "context_usage";
+  turnId: string;
+  tokenUsage: ContextUsage;
+}
+
 /** `answer {text}` - answer-only turn (no edits). */
 export interface AnswerMessage extends SessionScopedMessage {
   type: "answer";
@@ -392,11 +416,13 @@ export interface SessionRecord extends SessionMeta {
   threadId: string | null;
   pendingRequestIds: string[];
   panelLog: PanelLog | null;
+  contextUsage?: ContextUsage;
 }
 
 /** Discriminated union of every documented core -> panel message. */
 export type ServerMessage =
   | AgentEventMessage
+  | ContextUsageMessage
   | AnswerMessage
   | PlanMessage
   | ChangesetMessage
@@ -414,6 +440,7 @@ export type ServerMessage =
 /** All server message `type` discriminants (closed set). */
 export const SERVER_MESSAGE_TYPES = [
   "agent_event",
+  "context_usage",
   "answer",
   "plan",
   "changeset",
@@ -580,6 +607,41 @@ export function isAgentEventMessage(value: unknown): value is AgentEventMessage 
     hasSessionId(value) &&
     typeof value.kind === "string" &&
     typeof value.detail === "string"
+  );
+}
+
+function isTokenUsageBreakdown(value: unknown): value is TokenUsageBreakdown {
+  return (
+    isObject(value) &&
+    typeof value.inputTokens === "number" &&
+    typeof value.cachedInputTokens === "number" &&
+    typeof value.cacheWriteInputTokens === "number" &&
+    typeof value.outputTokens === "number" &&
+    typeof value.reasoningOutputTokens === "number" &&
+    typeof value.totalTokens === "number"
+  );
+}
+
+function isContextUsage(value: unknown): value is ContextUsage {
+  return (
+    isObject(value) &&
+    isTokenUsageBreakdown(value.last) &&
+    isTokenUsageBreakdown(value.total) &&
+    (value.modelContextWindow === null ||
+      typeof value.modelContextWindow === "number")
+  );
+}
+
+/** True if `value` is a typed per-session context usage update. */
+export function isContextUsageMessage(
+  value: unknown,
+): value is ContextUsageMessage {
+  return (
+    isObject(value) &&
+    value.type === "context_usage" &&
+    hasSessionId(value) &&
+    typeof value.turnId === "string" &&
+    isContextUsage(value.tokenUsage)
   );
 }
 
@@ -750,6 +812,7 @@ export function isSetupMessage(value: unknown): value is SetupMessage {
 export function isServerMessage(value: unknown): value is ServerMessage {
   return (
     isAgentEventMessage(value) ||
+    isContextUsageMessage(value) ||
     isAnswerMessage(value) ||
     isPlanMessage(value) ||
     isChangesetMessage(value) ||

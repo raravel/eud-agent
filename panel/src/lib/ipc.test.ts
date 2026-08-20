@@ -149,6 +149,52 @@ describe("inbound events", () => {
       detail: "checking",
     });
   });
+
+  it("dispatches typed context usage for the addressed session", async () => {
+    const { invoke, listen, listeners } = makeHarness();
+    invoke.mockResolvedValue(undefined);
+    const received: ServerMessage[] = [];
+    const client = new IpcClient({
+      invoke,
+      listen,
+      onMessage: (message) => received.push(message),
+    });
+    const tokenUsage = {
+      last: {
+        inputTokens: 31_000,
+        cachedInputTokens: 24_000,
+        cacheWriteInputTokens: 0,
+        outputTokens: 1_200,
+        reasoningOutputTokens: 800,
+        totalTokens: 32_200,
+      },
+      total: {
+        inputTokens: 52_000,
+        cachedInputTokens: 40_000,
+        cacheWriteInputTokens: 600,
+        outputTokens: 2_100,
+        reasoningOutputTokens: 1_300,
+        totalTokens: 54_100,
+      },
+      modelContextWindow: 128_000,
+    };
+
+    await client.connect();
+    listeners.get("context_usage")?.({
+      payload: {
+        sessionId: "session-b",
+        turnId: "turn-2",
+        tokenUsage,
+      },
+    });
+
+    expect(received).toContainEqual({
+      type: "context_usage",
+      sessionId: "session-b",
+      turnId: "turn-2",
+      tokenUsage,
+    });
+  });
 });
 
 describe("request/response messages", () => {

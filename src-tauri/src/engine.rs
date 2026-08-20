@@ -207,6 +207,7 @@ pub(crate) trait CodexDriver {
 #[derive(Debug, Clone)]
 pub enum EngineEvent {
     Agent(ipc::AgentEvent),
+    ContextUsage(ipc::ContextUsageEvent),
     Answer(ipc::AnswerEvent),
     Plan(ipc::PlanEvent),
     Changeset(ipc::ChangesetEvent),
@@ -1030,6 +1031,7 @@ Continue the requested change now, run the mandatory build, and stop only after 
             .map_err(|error| AgentEngineError::new(error.to_string()))?;
         record.thread_id = None;
         record.pending_request_ids.clear();
+        record.context_usage = None;
         record.panel_log = panel_log;
         record.meta.updated_at = crate::session::now_unix_seconds();
         self.session_store
@@ -1250,6 +1252,7 @@ impl EventSink for SessionEventSink {
     fn emit(&self, event: EngineEvent) -> Result<(), AgentEngineError> {
         let result = match event {
             EngineEvent::Agent(payload) => self.emit_scoped("agent_event", payload),
+            EngineEvent::ContextUsage(payload) => self.emit_scoped("context_usage", payload),
             EngineEvent::Answer(payload) => self.emit_scoped("answer", payload),
             EngineEvent::Plan(payload) => self.emit_scoped("plan", payload),
             EngineEvent::Changeset(payload) => self.emit_scoped("changeset", payload),
@@ -1272,6 +1275,7 @@ pub(crate) struct ProductionCodexDriver {
     sink: SessionEventSink,
     mcp_port: u16,
     dirs: crate::config::DataDirs,
+    session_store: crate::session::SessionStore,
     runtime: SessionToolRuntime,
     workspace: WorkspaceManager,
     model_selection: Option<CodexModelSelection>,
@@ -1316,6 +1320,7 @@ impl ProductionCodexDriver {
                 _ => None,
             }
         });
+        let session_store = crate::session::SessionStore::new(&dirs);
         Self {
             fallback_cwd: cwd.into(),
             client_cwd: None,
@@ -1325,6 +1330,7 @@ impl ProductionCodexDriver {
             mcp_port,
             workspace: WorkspaceManager::new(dirs.clone()),
             dirs,
+            session_store,
             runtime,
             active_workspace: None,
             model_selection,
@@ -1687,6 +1693,26 @@ impl CodexDriver for ProductionCodexDriver {
                                 detail: name,
                                 data,
                             }))?;
+                        }
+                        AppServerEvent::TokenUsageUpdated {
+                            turn_id,
+                            token_usage,
+                        } => {
+                            if let Err(error) = self
+                                .session_store
+                                .update_context_usage(&self.session_id, token_usage.clone())
+                            {
+                                eprintln!(
+                                    "eud-agent: failed to persist context usage for {}: {error}",
+                                    self.session_id
+                                );
+                            }
+                            self.sink.emit(EngineEvent::ContextUsage(
+                                ipc::ContextUsageEvent {
+                                    turn_id,
+                                    token_usage,
+                                },
+                            ))?;
                         }
                         AppServerEvent::TurnComplete => {
                             turn_complete_seen = true;
@@ -2129,6 +2155,7 @@ impl SessionEngineManager {
             },
             thread_id: None,
             pending_request_ids: Vec::new(),
+            context_usage: None,
             panel_log: serde_json::Value::Null,
         };
         self.inner
@@ -3357,6 +3384,7 @@ mod tests {
             },
             thread_id: None,
             pending_request_ids: Vec::new(),
+            context_usage: None,
             panel_log: serde_json::Value::Null,
         };
         store.save(&record).unwrap();
@@ -4186,6 +4214,7 @@ mod tests {
         assert!(preflight < build);
         assert!(prompt.contains("every candidate in one batch"));
         assert!(prompt.contains("ordered exact edits"));
+        assert!(prompt.contains("append `.eps` only for eps_check"));
         assert!(prompt.contains("Fix error diagnostics and re-check before writing"));
         assert!(prompt.contains("If eps_check returns skipped"));
         assert!(prompt.contains("eps_check never replaces build_run"));
@@ -4525,6 +4554,7 @@ mod tests {
             },
             thread_id: None,
             pending_request_ids: Vec::new(),
+            context_usage: None,
             panel_log: serde_json::Value::Null,
         };
         sessions.save(&record).unwrap();

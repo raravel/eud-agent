@@ -177,6 +177,48 @@ describe("App concurrent sessions", () => {
     ).toHaveLength(0);
   });
 
+  it("keeps context usage isolated to its addressed session", async () => {
+    render(<App />);
+    await screen.findByRole("button", { name: "Session A, 유휴" });
+    await waitFor(() => expect(tauri.listeners.has("context_usage")).toBe(true));
+
+    act(() => {
+      emit("context_usage", {
+        sessionId: "session-b",
+        turnId: "turn-b",
+        tokenUsage: {
+          last: {
+            inputTokens: 31_000,
+            cachedInputTokens: 24_000,
+            cacheWriteInputTokens: 0,
+            outputTokens: 1_200,
+            reasoningOutputTokens: 800,
+            totalTokens: 32_200,
+          },
+          total: {
+            inputTokens: 52_000,
+            cachedInputTokens: 40_000,
+            cacheWriteInputTokens: 600,
+            outputTokens: 2_100,
+            reasoningOutputTokens: 1_300,
+            totalTokens: 54_100,
+          },
+          modelContextWindow: 128_000,
+        },
+      });
+    });
+
+    expect(
+      screen.queryByRole("button", { name: /컨텍스트 .* 사용/ }),
+    ).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Session B, 유휴" }));
+
+    expect(
+      screen.getByRole("button", { name: /컨텍스트 .* 사용/ }),
+    ).toBeInTheDocument();
+  });
+
   it("preserves a collapsed plan after switching session tabs", async () => {
     render(<App />);
     await screen.findByRole("button", { name: "Session A, 유휴" });

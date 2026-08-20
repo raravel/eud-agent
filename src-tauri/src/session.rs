@@ -51,6 +51,9 @@ pub struct SessionRecord {
     /// Unarchived journal request ids. The concurrent writer contract restores
     /// exactly one pending project writer and reports conflicting records.
     pub pending_request_ids: Vec<String>,
+    /// Last active context and cumulative token snapshot reported by Codex.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_usage: Option<crate::ipc::ContextUsage>,
     /// Opaque to Rust — stored and returned verbatim; the panel owns its schema.
     pub panel_log: serde_json::Value,
 }
@@ -144,6 +147,18 @@ impl SessionStore {
         let mut record = self.load_unlocked(id)?;
         record.panel_log = panel_log;
         record.meta.updated_at = now_unix_seconds();
+        self.save_unlocked(&record)
+    }
+
+    /// Persist the latest Codex context snapshot without changing the panel-owned log.
+    pub fn update_context_usage(
+        &self,
+        id: &str,
+        context_usage: crate::ipc::ContextUsage,
+    ) -> anyhow::Result<()> {
+        let _guard = self.lock()?;
+        let mut record = self.load_unlocked(id)?;
+        record.context_usage = Some(context_usage);
         self.save_unlocked(&record)
     }
 
@@ -246,6 +261,7 @@ pub fn now_unix_seconds() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ipc::{ContextUsage, TokenUsageBreakdown};
     use serde_json::json;
     use std::fs;
 
@@ -276,6 +292,7 @@ mod tests {
             },
             thread_id: Some("019ece1c-thread".to_string()),
             pending_request_ids: vec!["req-1a2b3c4d".to_string()],
+            context_usage: None,
             panel_log: json!({
                 "schemaVersion": 1,
                 "logSeq": 2,
@@ -284,6 +301,28 @@ mod tests {
                     { "id": 2, "kind": "agent", "text": "...markdown..." }
                 ]
             }),
+        }
+    }
+
+    fn sample_usage() -> ContextUsage {
+        ContextUsage {
+            last: TokenUsageBreakdown {
+                input_tokens: 30,
+                cached_input_tokens: 20,
+                cache_write_input_tokens: 0,
+                output_tokens: 5,
+                reasoning_output_tokens: 2,
+                total_tokens: 35,
+            },
+            total: TokenUsageBreakdown {
+                input_tokens: 50,
+                cached_input_tokens: 40,
+                cache_write_input_tokens: 1,
+                output_tokens: 8,
+                reasoning_output_tokens: 3,
+                total_tokens: 58,
+            },
+            model_context_window: Some(128_000),
         }
     }
 
@@ -329,6 +368,25 @@ mod tests {
         let after = store.list().unwrap();
         assert_eq!(after.len(), 1);
         assert_eq!(after[0].id, second.meta.id);
+
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn context_usage_update_preserves_the_panel_log() {
+        let (base, store) = store("context-usage");
+        let record = sample_record(&new_session_id(), "토큰 사용량");
+        let original_log = record.panel_log.clone();
+        store.save(&record).unwrap();
+
+        let usage = sample_usage();
+        store
+            .update_context_usage(&record.meta.id, usage.clone())
+            .unwrap();
+
+        let loaded = store.load(&record.meta.id).unwrap();
+        assert_eq!(loaded.context_usage, Some(usage));
+        assert_eq!(loaded.panel_log, original_log);
 
         fs::remove_dir_all(base).ok();
     }

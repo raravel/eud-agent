@@ -436,6 +436,74 @@ describe("InstructionBox — Codex model settings", () => {
   });
 });
 
+describe("InstructionBox — session context usage", () => {
+  it("shows current context and cumulative usage through the Context hover card", async () => {
+    const user = userEvent.setup();
+    const store = createPanelStore();
+    store.wsOpen();
+    store.applyList({ files: [] });
+    store.contextUsageReceived({
+      last: {
+        inputTokens: 31_000,
+        cachedInputTokens: 24_000,
+        cacheWriteInputTokens: 0,
+        outputTokens: 1_200,
+        reasoningOutputTokens: 800,
+        totalTokens: 32_200,
+      },
+      total: {
+        inputTokens: 52_000,
+        cachedInputTokens: 40_000,
+        cacheWriteInputTokens: 600,
+        outputTokens: 2_100,
+        reasoningOutputTokens: 1_300,
+        totalTokens: 54_100,
+      },
+      modelContextWindow: 128_000,
+    });
+
+    render(<InstructionBox state={store.getState()} onSend={noop} />);
+    const trigger = screen.getByRole("button", {
+      name: /컨텍스트 .* 사용/,
+    });
+    await user.hover(trigger);
+
+    expect(await screen.findByText("현재 컨텍스트")).toBeInTheDocument();
+    expect(screen.getByText("세션 누적")).toBeInTheDocument();
+    expect(screen.getByText("캐시 입력")).toBeInTheDocument();
+    expect(screen.queryByText(/Total cost/i)).not.toBeInTheDocument();
+  });
+
+  it("does not guess a percentage without a model context window", () => {
+    const store = createPanelStore();
+    store.contextUsageReceived({
+      last: {
+        inputTokens: 1,
+        cachedInputTokens: 0,
+        cacheWriteInputTokens: 0,
+        outputTokens: 0,
+        reasoningOutputTokens: 0,
+        totalTokens: 1,
+      },
+      total: {
+        inputTokens: 1,
+        cachedInputTokens: 0,
+        cacheWriteInputTokens: 0,
+        outputTokens: 0,
+        reasoningOutputTokens: 0,
+        totalTokens: 1,
+      },
+      modelContextWindow: null,
+    });
+
+    render(<InstructionBox state={store.getState()} onSend={noop} />);
+
+    expect(
+      screen.queryByRole("button", { name: /컨텍스트 .* 사용/ }),
+    ).not.toBeInTheDocument();
+  });
+});
+
 describe("InstructionBox — InputGroup composition (EUD-066 layout contract)", () => {
   // The InputGroup column layout depends on CSS `:has(> ...)` DIRECT-child
   // selectors (`has-[>[data-align=block-end]]:flex-col` / `:h-auto` in

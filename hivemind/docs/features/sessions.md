@@ -43,6 +43,25 @@ Each session file contains the flattened metadata plus:
 {
   "threadId": "019ece1c-...",
   "pendingRequestIds": ["req-1a2b3c4d"],
+  "contextUsage": {
+    "last": {
+      "inputTokens": 31000,
+      "cachedInputTokens": 24000,
+      "cacheWriteInputTokens": 0,
+      "outputTokens": 1200,
+      "reasoningOutputTokens": 800,
+      "totalTokens": 32200
+    },
+    "total": {
+      "inputTokens": 52000,
+      "cachedInputTokens": 40000,
+      "cacheWriteInputTokens": 600,
+      "outputTokens": 2100,
+      "reasoningOutputTokens": 1300,
+      "totalTokens": 54100
+    },
+    "modelContextWindow": 128000
+  },
   "panelLog": { "schemaVersion": 2, "logSeq": 4, "log": [] }
 }
 ```
@@ -51,6 +70,9 @@ Each session file contains the flattened metadata plus:
 journals; recovery requires zero or one project writer. Startup removes stale ids only when the
 matching journal is already in the accepted archive. A missing live journal without that archive
 and multiple pending writers remain explicit errors. `panelLog` is opaque to Rust.
+`contextUsage` is absent until Codex emits `thread/tokenUsage/updated`; `last.totalTokens` is the
+active context size, while `total` is cumulative for the thread. The latest snapshot is persisted
+outside `panelLog`, so unopened rows retain usage across an app restart.
 
 Attachment bytes remain under `%localappdata%\eud-agent\attachments\objects\` and are bound to
 the session on send.
@@ -72,10 +94,10 @@ The panel persists only conversation history:
 }
 ```
 
-Transient turn, plan, changeset, activity, wiki, and connection state is not persisted.
-`conversation_rewind` replaces the log with the selected prefix, clears the thread id and pending
-request ids, and stages a condensed replay for the next fresh thread. Rewind is rejected while
-the session is running, waiting for write, or in review.
+Transient turn, plan, changeset, activity, wiki, and connection state is not persisted in
+`panelLog`. `conversation_rewind` replaces the log with the selected prefix, clears the thread
+id, pending request ids, and context usage, and stages a condensed replay for the next fresh
+thread. Rewind is rejected while the session is running, waiting for write, or in review.
 
 ## Backend activity
 
@@ -201,7 +223,7 @@ project transactions.
 
 Every conversation event has a required immutable `sessionId`:
 
-- `agent_event`, `answer`, `plan`, `changeset`, `rollback_result`;
+- `agent_event`, `context_usage`, `answer`, `plan`, `changeset`, `rollback_result`;
 - turn `progress` and turn `error`;
 - `session_activity`.
 
@@ -213,6 +235,12 @@ Project status, list, memory/wiki snapshots, setup, bootstrap, and RAG warmup re
 `App.tsx` owns `Map<sessionId, SessionSlot>`, with one `PanelStore` per row. Drafts are persisted
 before their first chat, then invoked immediately. There is no frontend conversation queue,
 running slot, review owner, or event-owner fallback.
+
+`context_usage` replaces only the addressed store's typed snapshot. The PromptInput footer uses
+the AI Elements `Context` hover card: its trigger shows `last.totalTokens / modelContextWindow`,
+and its body shows cumulative input, cached-input, output, and reasoning counts. A missing context
+window suppresses the trigger rather than guessing. Cost is intentionally omitted because Codex
+account billing is not equivalent to direct API model pricing.
 
 `session_activity` drives:
 

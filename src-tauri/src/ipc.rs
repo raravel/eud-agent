@@ -287,6 +287,37 @@ pub struct AgentEvent {
     pub data: Option<AgentEventData>,
 }
 
+/// Token counts reported by one Codex model response.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TokenUsageBreakdown {
+    pub input_tokens: i64,
+    pub cached_input_tokens: i64,
+    #[serde(default)]
+    pub cache_write_input_tokens: i64,
+    pub output_tokens: i64,
+    pub reasoning_output_tokens: i64,
+    pub total_tokens: i64,
+}
+
+/// Latest active context and cumulative token usage for one Codex thread.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextUsage {
+    pub last: TokenUsageBreakdown,
+    pub total: TokenUsageBreakdown,
+    #[serde(default)]
+    pub model_context_window: Option<i64>,
+}
+
+/// `context_usage` event payload.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextUsageEvent {
+    pub turn_id: String,
+    pub token_usage: ContextUsage,
+}
+
 /// `answer` event payload.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AnswerEvent {
@@ -1261,6 +1292,54 @@ mod tests {
                 "data": {
                     "result": "2 hits",
                     "status": "completed"
+                }
+            }),
+        );
+
+        let context_usage = ipc::ContextUsageEvent {
+            turn_id: "turn-2".to_string(),
+            token_usage: ipc::ContextUsage {
+                last: ipc::TokenUsageBreakdown {
+                    input_tokens: 31_000,
+                    cached_input_tokens: 24_000,
+                    cache_write_input_tokens: 0,
+                    output_tokens: 1_200,
+                    reasoning_output_tokens: 800,
+                    total_tokens: 32_200,
+                },
+                total: ipc::TokenUsageBreakdown {
+                    input_tokens: 52_000,
+                    cached_input_tokens: 40_000,
+                    cache_write_input_tokens: 600,
+                    output_tokens: 2_100,
+                    reasoning_output_tokens: 1_300,
+                    total_tokens: 54_100,
+                },
+                model_context_window: Some(128_000),
+            },
+        };
+        assert_json(
+            &context_usage,
+            json!({
+                "turnId": "turn-2",
+                "tokenUsage": {
+                    "last": {
+                        "inputTokens": 31_000,
+                        "cachedInputTokens": 24_000,
+                        "cacheWriteInputTokens": 0,
+                        "outputTokens": 1_200,
+                        "reasoningOutputTokens": 800,
+                        "totalTokens": 32_200
+                    },
+                    "total": {
+                        "inputTokens": 52_000,
+                        "cachedInputTokens": 40_000,
+                        "cacheWriteInputTokens": 600,
+                        "outputTokens": 2_100,
+                        "reasoningOutputTokens": 1_300,
+                        "totalTokens": 54_100
+                    },
+                    "modelContextWindow": 128_000
                 }
             }),
         );

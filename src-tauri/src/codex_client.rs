@@ -30,6 +30,8 @@ use std::{
 use thiserror::Error;
 use tokio::{io::AsyncWriteExt, process::Command, time};
 
+use crate::ipc;
+
 const SYSTEM_PROMPT: &str =
     "너는 스타크래프트 EUD 맵 제작용 epScript(eps) 코드를 작성하는 어시스턴트다. \
 아래 [참고자료]는 네이버 카페/공식 매뉴얼에서 검색한 eps/eud3 지식이다. \
@@ -471,6 +473,10 @@ pub enum AppServerEvent {
         name: String,
         result: Option<String>,
         status: Option<String>,
+    },
+    TokenUsageUpdated {
+        turn_id: String,
+        token_usage: ipc::ContextUsage,
     },
     TurnComplete,
     Error(String),
@@ -1366,6 +1372,13 @@ async fn handle_notification(
             thread_started.notify_waiters();
             send_event(events_tx, AppServerEvent::ThreadStarted { thread_id: id }).await
         }
+        "thread/tokenUsage/updated" => {
+            if let Some(event) = token_usage_event(params) {
+                send_event(events_tx, event).await
+            } else {
+                true
+            }
+        }
         "turn/started" => send_event(events_tx, AppServerEvent::TurnStarted).await,
         "item/agentMessage/delta" => {
             if let Some(delta) = string_param(params, &["delta"]) {
@@ -1433,6 +1446,17 @@ fn string_param(params: Option<&serde_json::Value>, keys: &[&str]) -> Option<Str
     keys.iter()
         .find_map(|key| params.get(*key).and_then(serde_json::Value::as_str))
         .map(str::to_string)
+}
+
+fn token_usage_event(params: Option<&serde_json::Value>) -> Option<AppServerEvent> {
+    let params = params?;
+    let turn_id = params.get("turnId")?.as_str()?.to_string();
+    let token_usage: ipc::ContextUsage =
+        serde::Deserialize::deserialize(params.get("tokenUsage")?).ok()?;
+    Some(AppServerEvent::TokenUsageUpdated {
+        turn_id,
+        token_usage,
+    })
 }
 
 /// Cap on tool args/result text relayed to the panel (panel render safety,
@@ -1836,6 +1860,76 @@ mod tool_item_tests {
             TOOL_DATA_MAX_CHARS + " …(잘림)".chars().count()
         );
         assert!(args.ends_with("…(잘림)"));
+    }
+}
+
+#[cfg(test)]
+mod token_usage_tests {
+    use super::{token_usage_event, AppServerEvent};
+    use crate::ipc::{ContextUsage, TokenUsageBreakdown};
+    use serde_json::json;
+
+    #[test]
+    fn notification_maps_active_and_cumulative_context_usage() {
+        let params = json!({
+            "threadId": "thread-1",
+            "turnId": "turn-2",
+            "tokenUsage": {
+                "last": {
+                    "inputTokens": 31_000,
+                    "cachedInputTokens": 24_000,
+                    "outputTokens": 1_200,
+                    "reasoningOutputTokens": 800,
+                    "totalTokens": 32_200
+                },
+                "total": {
+                    "inputTokens": 52_000,
+                    "cachedInputTokens": 40_000,
+                    "cacheWriteInputTokens": 600,
+                    "outputTokens": 2_100,
+                    "reasoningOutputTokens": 1_300,
+                    "totalTokens": 54_100
+                },
+                "modelContextWindow": 128_000
+            }
+        });
+
+        assert_eq!(
+            token_usage_event(Some(&params)),
+            Some(AppServerEvent::TokenUsageUpdated {
+                turn_id: "turn-2".to_string(),
+                token_usage: ContextUsage {
+                    last: TokenUsageBreakdown {
+                        input_tokens: 31_000,
+                        cached_input_tokens: 24_000,
+                        cache_write_input_tokens: 0,
+                        output_tokens: 1_200,
+                        reasoning_output_tokens: 800,
+                        total_tokens: 32_200,
+                    },
+                    total: TokenUsageBreakdown {
+                        input_tokens: 52_000,
+                        cached_input_tokens: 40_000,
+                        cache_write_input_tokens: 600,
+                        output_tokens: 2_100,
+                        reasoning_output_tokens: 1_300,
+                        total_tokens: 54_100,
+                    },
+                    model_context_window: Some(128_000),
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn malformed_notification_is_ignored() {
+        assert_eq!(
+            token_usage_event(Some(&json!({
+                "turnId": "turn-2",
+                "tokenUsage": {"last": {}, "total": {}}
+            }))),
+            None
+        );
     }
 }
 
