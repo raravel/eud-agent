@@ -6,7 +6,7 @@ Expands the Lua bridge from the v1 instruct/apply set (LIST/GET/SET/NEWEPS/GETDA
 
 - SCA is fully defunct (incl. the SCAScript file type): settable/creatable text types are **CUIEps, CUIPy, RawText** only. `_SETTABLE_FAMILIES` on the server drops `"SCA"`.
 - GUI/GUIPy/ClassicTrigger remain read-only via GET (eps projection). SET/NEWFILE on them is structurally rejected by FileType pre-check in the bridge (assignment would THROW — `StringText` does not exist on those classes; never rely on pcall).
-- The agent authors epScript text only; `main` is whatever `pj.TEData.MainFile` references — SETMAIN points it at any CUIEps file.
+- The agent authors epScript text only. `pj.TEData.MainFile` object identity is the sole start-file authority; a file named `main` has no special meaning, and `GETMAIN` is its existing read command.
 - Editor BUILD stays the build path (server-side euddraft re-run is only the error-capture fallback, see [[features/05_agent-core|05_agent-core]] `05_agent-core.md`).
 
 ## New / changed commands
@@ -33,7 +33,8 @@ All commands keep the v6 file-IPC transport (`inbox/srv-*.cmd` → UI-thread Tic
 | RENAME | path (+ newname in body) | `f.FileName = newname` then parent `FileSort/FolderSort` | rejects top node, Setting node, duplicate sibling name. |
 | DELFILE | path | walk-located parent `:FileRemove/:FolderRemove` + `pjData:SetDirty(true)` | rejects top/Setting nodes; if target IS MainFile, clears `MainFile` first and the result notes `main-cleared`; bridge also closes an open tab via `WindowControl.TECloseTabITem` when present. |
 | MOVEFILE | path (+ destFolder in body) | `oldParent:FileRemove` + `dest:FileAdd` (same instance) | preserves MainFile identity; rejects move into Setting/top. |
-| SETMAIN | path | `pj.TEData.MainFile = <node>` | node must exist (walk); `GETMAIN` (no args) returns current main path or empty. |
+| SETMAIN | path | `pj.TEData.MainFile = <node>` | node must exist (walk); no naming convention is applied. |
+| GETMAIN | — | `pj.TEData.MainFile` identity + `PFIles` walk | returns the complete project-relative `/` path or empty when unset. `BridgeIo::get_main` is the typed consumer used by read-only `project_status` and `set_main` before-snapshot journaling. |
 
 ### Settings & plugins (B3)
 

@@ -185,6 +185,23 @@ precede all inbox work, so no project object is touched while compiling.
 Removed: the WebView2/panel-hosting commands and server-spawn handshake (PANEL is gone;
 the app is the panel). SET/NEWEPS remain memory-only and CUI/RawText-only.
 
+## Agent epScript project architecture
+
+The existing bridge `GETMAIN` command reads `pj.TEData.MainFile` by object identity and returns
+its complete project-relative `/` path. `BridgeIo::get_main` owns the protocol interpretation:
+an empty success or the expected no-project reply is `None`; transport, timeout, and unexpected
+bridge errors remain failures. The read-only `project_status` tool combines the unchanged raw
+`STATUS` reply with this value as `mainFile: string | null`. `list_files` remains the separate
+authority for path, type, and settable metadata; neither command's wire format changes.
+
+The `[eps project architecture]` guide is present in cold-start and resumed turns. It treats the
+configured MainFile as the composition root regardless of name, places behavior with the module
+that owns its state and invariants, permits new modules only for cohesive narrow responsibilities,
+and keeps dependencies directional and acyclic. Local fixes stay in the existing owner; the
+800-nonblank-line threshold is a cohesion review signal, not a split gate. Topology, MainFile,
+dependency, or responsibility changes require a complete `structure` memory replacement, and
+mutually dependent candidates still use one `eps_check` batch followed by mandatory `build_run`.
+
 ## Agent-only epScript preflight
 
 `eps_check` overlays one complete candidate batch onto the request-local project mirror,

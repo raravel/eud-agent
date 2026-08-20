@@ -63,6 +63,19 @@ const EPSCRIPT_GUIDE: &str = r#"[epscript]
 - Syntax essentials: statements end with ";"; variables `var x = 0;`, constants `const marine = $U("Terran Marine");` (names map via $U(unit)/$L(location)); conditions are if-expressions and actions are statements — `if (Deaths(P1, AtLeast, 1, marine)) { SetDeaths(P1, Subtract, 1, marine); CreateUnit(1, marine, $L("spawn"), P1); }`
 - Unsure about eps syntax or an API name? search_docs (Korean query) BEFORE writing code; follow eps examples from the reference-context section and ignore classic-trigger examples quoted in posts."#;
 
+const EPS_PROJECT_ARCHITECTURE_GUIDE: &str = r#"[eps project architecture]
+- Optimize for change locality, clear ownership, and explicit dependencies — not for the fewest or smallest files.
+- Before placing code, inspect project_status.mainFile, list_files, project memory structure, and relevant source files. Never guess the MainFile from a filename, list order, open tab, lifecycle hooks, or file count.
+- Preserve a configured MainFile as the composition root regardless of its name. Keep lifecycle entry functions and explicit subsystem call order there; never call set_main merely to normalize naming.
+- Put behavior in the module that owns the mutable state and invariant being changed. Edit an existing owner; create a module only for a distinct cohesive responsibility with a narrow API.
+- Keep imports directional and acyclic: configured MainFile -> feature modules -> stable leaf modules. Sibling modules must not mutate each other's internal state.
+- Do not create empty scaffolding or generic utils/common/helpers/state dumping grounds. Extract shared code only after two real consumers need the same stable contract.
+- Preserve the established layout for localized fixes. Broad splitting, moving, or renaming is planned work, not incidental cleanup.
+- File length is only a review signal: re-evaluate handwritten files above 800 nonblank lines and any MainFile containing feature implementation; never split generated/table-heavy or tightly coupled code solely by size.
+- If mainFile is null, never infer one. A new empty project may create and set a composition root; a non-empty project requires the selection in the reviewed plan.
+- After file topology, MainFile, dependency, or responsibility changes, rewrite memory structure with every file's current role and direct dependencies.
+- Preflight every mutually dependent candidate in one eps_check batch, then run the mandatory complete-project build."#;
+
 // Resident "write eps like THIS" anchor (L1, search-independent). It always sits
 // between the first-principles section (L0, the NEVER rules) and [reference
 // context] (L2, retrieved chunks), so the model has a positive idiom cheat-sheet
@@ -2415,6 +2428,8 @@ pub fn build_system_prompt(
         String::new(),
         EPSCRIPT_GUIDE.to_string(),
         String::new(),
+        EPS_PROJECT_ARCHITECTURE_GUIDE.to_string(),
+        String::new(),
         EPS_PREFLIGHT_GUIDE.to_string(),
         String::new(),
         BUILD_GUIDE.to_string(),
@@ -2471,6 +2486,8 @@ pub fn resume_turn_text(
         WORKSPACE_GUIDE.to_string(),
         String::new(),
         EPS_IDIOMS.to_string(),
+        String::new(),
+        EPS_PROJECT_ARCHITECTURE_GUIDE.to_string(),
         String::new(),
         reference_context_section(rag_hits),
         String::new(),
@@ -4177,6 +4194,79 @@ mod tests {
     }
 
     #[test]
+    fn cold_start_and_resume_include_the_canonical_architecture_guide_in_order() {
+        let hits = sample_hits();
+        let project_state = "[project state]\nproject=Sample compiling=false";
+        let cold = build_system_prompt(
+            "Place a cohesive epScript feature",
+            &hits,
+            project_state,
+            None,
+            None,
+        );
+        let resumed = resume_turn_text(
+            "Where should this small fix go?",
+            &hits,
+            project_state,
+            None,
+            None,
+        );
+
+        assert!(cold.contains(EPS_PROJECT_ARCHITECTURE_GUIDE));
+        let first_principles = cold.find("[first principles]").unwrap();
+        let epscript = cold.find("[epscript]").unwrap();
+        let architecture = cold.find("[eps project architecture]").unwrap();
+        let preflight = cold.find("[eps preflight]").unwrap();
+        let build = cold.find("[build]").unwrap();
+        let reference = cold.find("[reference context]").unwrap();
+        assert!(first_principles < epscript);
+        assert!(epscript < architecture);
+        assert!(architecture < preflight);
+        assert!(preflight < build);
+        assert!(architecture < reference);
+
+        assert!(resumed.contains(EPS_PROJECT_ARCHITECTURE_GUIDE));
+        let idioms = resumed.find("[eps idioms]").unwrap();
+        let architecture = resumed.find("[eps project architecture]").unwrap();
+        let reference = resumed.find("[reference context]").unwrap();
+        let user_message = resumed.find("[user message]").unwrap();
+        assert!(idioms < architecture);
+        assert!(architecture < reference);
+        assert!(reference < user_message);
+        assert!(
+            !resumed.contains("[first principles]"),
+            "resume text must preserve the existing first-principles boundary"
+        );
+    }
+
+    #[test]
+    fn architecture_guide_pins_mainfile_placement_and_verification_contracts() {
+        for required in [
+            "project_status.mainFile, list_files, project memory structure, and relevant source files",
+            "Never guess the MainFile from a filename, list order, open tab, lifecycle hooks, or file count",
+            "Preserve a configured MainFile as the composition root regardless of its name",
+            "never call set_main merely to normalize naming",
+            "owns the mutable state and invariant being changed",
+            "distinct cohesive responsibility with a narrow API",
+            "configured MainFile -> feature modules -> stable leaf modules",
+            "directional and acyclic",
+            "empty scaffolding or generic utils/common/helpers/state dumping grounds",
+            "only after two real consumers",
+            "Preserve the established layout for localized fixes",
+            "800 nonblank lines",
+            "If mainFile is null, never infer one",
+            "rewrite memory structure with every file's current role and direct dependencies",
+            "every mutually dependent candidate in one eps_check batch",
+            "mandatory complete-project build",
+        ] {
+            assert!(
+                EPS_PROJECT_ARCHITECTURE_GUIDE.contains(required),
+                "architecture guide must pin: {required}"
+            );
+        }
+    }
+
+    #[test]
     fn resume_turn_text_labels_user_message() {
         let hits = sample_hits();
         let user_text = "The editor freezes when I test the map.";
@@ -4517,8 +4607,7 @@ mod tests {
         let mut record = test_session(&sessions);
         let request_id = "req-restored";
         let journal = journal::JournalStore::new(dirs.app_data());
-        record_file_write_in_memory(&journal, request_id, "write-1", 1, "one.eps");
-        journal.persist(request_id).unwrap();
+        record_file_write(&journal, request_id, "write-1", 1, "one.eps");
         record.pending_request_ids = vec![request_id.to_string()];
         sessions.save(&record).unwrap();
         let writes = crate::write_coordinator::ProjectWriteCoordinator::silent();

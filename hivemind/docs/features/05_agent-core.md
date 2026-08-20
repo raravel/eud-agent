@@ -82,6 +82,13 @@ Read tools: `project_status`, `list_files`, `read_file`, `eps_check`, `dat_get`,
 items sequentially inside one runtime call, preserve input order, and return a per-item
 `ok`/value-or-error result with the identifying coordinates echoed.
 
+`project_status` returns `{status, mainFile}`. `status` remains the trimmed raw `STATUS` reply;
+`mainFile` is the exact project-relative path from the typed `BridgeIo::get_main` wrapper, or JSON
+`null` for an empty/unset result and the expected no-project state. Unexpected bridge,
+transport, and timeout failures remain visible. The tool stays read-only and requires no write
+registration; `list_files` separately owns path/type/settable metadata. `set_main` uses the same
+wrapper to journal its prior value.
+
 Flow tools: `propose_plan(markdown)`, `request_write_lane(reason)`.
 
 Write tools: `dat_set`, `xdat_set`, `tbl_set`, `req_set`, `btn_set`, `dat_reset`, `file_create`,
@@ -92,6 +99,18 @@ Write tools: `dat_set`, `xdat_set`, `tbl_set`, `req_set`, `btn_set`, `dat_reset`
 `file_edit` applies a non-empty ordered list of exact, uniquely matching `old_text`/`new_text`
 replacements to the session baseline, then uses the same non-overlapping live-change merge and
 full before/after journal snapshots as `file_write`.
+
+## epScript project placement policy
+
+Cold-start and resumed turns both receive the canonical `[eps project architecture]` guide. The
+configured `project_status.mainFile` is the composition root regardless of filename; the agent
+must not infer one or use `set_main` for name normalization. Behavior stays with the module that
+owns its mutable state and invariants, while a new module requires a cohesive responsibility and
+narrow API. Imports flow `configured MainFile -> feature modules -> stable leaf modules` without
+new cycles. Local fixes do not trigger unrelated moves or splits, and 800 nonblank lines is only a
+cohesion review signal. Structural role/dependency changes replace memory `structure` completely;
+mutually dependent candidates use one `eps_check` batch and every applied epScript changeset still
+requires `build_run`.
 
 Evidence, first-principles, mutation-count, action-count, search, and three-build-attempt rails
 remain request scoped. The non-search action hard ceiling is 300 calls; each batched getter

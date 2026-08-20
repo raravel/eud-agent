@@ -234,6 +234,25 @@ impl BridgeIo {
         self.send("STATUS", opts, on_busy)
     }
 
+    /// Configured EUD Editor start file as its exact project-relative path.
+    ///
+    /// An empty successful reply and the expected no-project state both mean that
+    /// no MainFile is configured. All other bridge failures remain visible.
+    pub fn get_main(
+        &self,
+        opts: &SendOpts,
+        on_busy: Option<&dyn Fn()>,
+    ) -> Result<Option<String>, BridgeError> {
+        match self.send("GETMAIN", opts, on_busy) {
+            Ok(reply) => {
+                let path = reply.trim();
+                Ok((!path.is_empty()).then(|| path.to_string()))
+            }
+            Err(BridgeError::Error(message)) if message == "ERROR: no project" => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
     /// Read editor status directly from `status.txt` after validating heartbeat freshness.
     pub fn read_status_snapshot(
         &self,
@@ -867,10 +886,11 @@ mod tests {
         BASE64_STANDARD,
     };
     use base64::Engine;
+    use parking_lot::Mutex;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
     use std::thread::{self, JoinHandle};
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -943,6 +963,18 @@ mod tests {
 
     impl FakeBridge {
         fn spawn(data_dir: &Path, expected_count: usize, seen: SeenLog) -> Self {
+            Self::spawn_with(data_dir, expected_count, seen, canned_reply)
+        }
+
+        fn spawn_with<F>(
+            data_dir: &Path,
+            expected_count: usize,
+            seen: SeenLog,
+            responder: F,
+        ) -> Self
+        where
+            F: Fn(&str) -> String + Send + 'static,
+        {
             let data_dir = data_dir.to_path_buf();
             let stop = Arc::new(AtomicBool::new(false));
             let stop_thread = Arc::clone(&stop);
@@ -975,12 +1007,12 @@ mod tests {
 
                         let bytes = fs::read(&cmd_path).unwrap();
                         let command = String::from_utf8(bytes.clone()).unwrap();
-                        seen.lock().unwrap().push((command.clone(), bytes));
+                        seen.lock().push((command.clone(), bytes));
 
                         fs::remove_file(&cmd_path).unwrap();
                         let stem = file_name.trim_end_matches(".cmd");
                         let result_path = outbox.join(format!("{stem}.result"));
-                        fs::write(result_path, canned_reply(&command).as_bytes()).unwrap();
+                        fs::write(result_path, responder(&command).as_bytes()).unwrap();
                         handled += 1;
                     }
 
@@ -1091,7 +1123,6 @@ mod tests {
 
         let commands: Vec<String> = seen
             .lock()
-            .unwrap()
             .iter()
             .map(|(command, _)| command.clone())
             .collect();
@@ -1101,6 +1132,72 @@ mod tests {
             "BridgeIo should delete consumed LIST .result files"
         );
 
+        fs::remove_dir_all(&data_dir).ok();
+    }
+
+    #[test]
+    fn get_main_preserves_root_and_nested_project_paths() {
+        for (tag, reply, expected) in [
+            ("main-root", "survivor_mvp\r\n", "survivor_mvp"),
+            (
+                "main-nested",
+                "systems/combat/survivor_mvp\r\n",
+                "systems/combat/survivor_mvp",
+            ),
+        ] {
+            let data_dir = unique_temp_dir(tag);
+            let seen: SeenLog = Arc::new(Mutex::new(Vec::new()));
+            {
+                let response = reply.to_string();
+                let _fake =
+                    FakeBridge::spawn_with(&data_dir, 1, Arc::clone(&seen), move |command| {
+                        assert_eq!(command, "GETMAIN");
+                        response.clone()
+                    });
+                let bridge = BridgeIo::new(&data_dir);
+
+                assert_eq!(
+                    bridge.get_main(&fast_opts(), None).unwrap(),
+                    Some(expected.to_string())
+                );
+            }
+            assert_eq!(seen.lock()[0].0, "GETMAIN");
+            fs::remove_dir_all(&data_dir).ok();
+        }
+    }
+
+    #[test]
+    fn get_main_maps_empty_success_and_no_project_to_none() {
+        for (tag, reply) in [("main-empty", ""), ("main-no-project", "ERROR: no project")] {
+            let data_dir = unique_temp_dir(tag);
+            let seen: SeenLog = Arc::new(Mutex::new(Vec::new()));
+            {
+                let response = reply.to_string();
+                let _fake = FakeBridge::spawn_with(&data_dir, 1, Arc::clone(&seen), move |_| {
+                    response.clone()
+                });
+                let bridge = BridgeIo::new(&data_dir);
+
+                assert_eq!(bridge.get_main(&fast_opts(), None).unwrap(), None);
+            }
+            fs::remove_dir_all(&data_dir).ok();
+        }
+    }
+
+    #[test]
+    fn get_main_surfaces_unexpected_bridge_errors() {
+        let data_dir = unique_temp_dir("main-error");
+        let seen: SeenLog = Arc::new(Mutex::new(Vec::new()));
+        {
+            let _fake =
+                FakeBridge::spawn_with(&data_dir, 1, seen, |_| "ERROR: getmain failed".to_string());
+            let bridge = BridgeIo::new(&data_dir);
+
+            match bridge.get_main(&fast_opts(), None).unwrap_err() {
+                BridgeError::Error(message) => assert_eq!(message, "ERROR: getmain failed"),
+                other => panic!("expected BridgeError::Error, got {other:?}"),
+            }
+        }
         fs::remove_dir_all(&data_dir).ok();
     }
 
@@ -1185,7 +1282,6 @@ mod tests {
 
         let commands: Vec<String> = seen
             .lock()
-            .unwrap()
             .iter()
             .map(|(command, _)| command.clone())
             .collect();
@@ -1299,7 +1395,7 @@ mod tests {
 
         assert_eq!(bridge.send(command, &opts, None).unwrap(), "OK");
 
-        let seen = seen.lock().unwrap();
+        let seen = seen.lock();
         assert_eq!(seen.len(), 1);
         let bytes = &seen[0].1;
         assert!(
@@ -1594,6 +1690,44 @@ mod tests {
         assert!(srv_entries(&outbox, ".result").is_empty());
 
         fs::remove_dir_all(&data_dir).ok();
+    }
+
+    #[test]
+    fn lua_getmain_uses_mainfile_identity_without_changing_list_shape() {
+        let source = include_str!("../../bridge/ZZZ_10_agent_bridge.lua");
+        assert_eq!(source.matches("elseif cmd == \"GETMAIN\" then").count(), 1);
+
+        let helper = source
+            .split("local function mainFilePath")
+            .nth(1)
+            .unwrap()
+            .split("-- ------------------------------------------------------------------")
+            .next()
+            .unwrap();
+        assert!(helper.contains("local main = pj.TEData.MainFile"));
+        assert!(helper.contains("if main == nil then return \"\" end"));
+        assert!(helper.contains(
+            "walk(pj.TEData.PFIles, \"\", function(p, f) if f == main then found = p end end)"
+        ));
+
+        let getmain = source
+            .split("elseif cmd == \"GETMAIN\" then")
+            .nth(1)
+            .unwrap()
+            .split("elseif cmd == \"GETDAT\" then")
+            .next()
+            .unwrap();
+        assert!(getmain.contains("return mainFilePath()"));
+
+        let list = source
+            .split("elseif cmd == \"LIST\" then")
+            .nth(1)
+            .unwrap()
+            .split("elseif cmd == \"EPSNAPSHOT\" then")
+            .next()
+            .unwrap();
+        assert!(list
+            .contains("lines[#lines + 1] = p .. \"\\t\" .. ((okT and ftype) and ftype or \"?\")"));
     }
 
     #[test]

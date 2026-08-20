@@ -280,7 +280,7 @@ pub fn tool_registry() -> Vec<ToolSpec> {
     vec![
         tool_spec(
             "project_status",
-            "Read current project status.",
+            "Read current project status and the exact configured EUD Editor start-file path.",
             false,
             empty_schema(),
         ),
@@ -4702,6 +4702,18 @@ mod tests {
                 "{name} must advertise the exact parameter schema"
             );
         }
+    }
+
+    #[test]
+    fn project_status_is_read_only_and_describes_the_configured_start_file() {
+        let spec = tool_registry()
+            .into_iter()
+            .find(|spec| spec.name == "project_status")
+            .expect("project_status must be registered");
+
+        assert!(!spec.mutating, "project_status must remain read-only");
+        assert!(spec.description.contains("exact configured EUD Editor"));
+        assert!(spec.description.contains("start-file path"));
     }
 
     #[test]

@@ -423,8 +423,10 @@ stop this turn so the backend can resume the same thread in its isolated writabl
         match tool {
             // ---- read tools (no journal) ----
             "project_status" => {
-                let reply = self.bridge()?.status(&opts, None).map_err(stringify)?;
-                Ok(json!({ "status": reply.trim() }))
+                let bridge = self.bridge()?;
+                let status = bridge.status(&opts, None).map_err(stringify)?;
+                let main_file = bridge.get_main(&opts, None).map_err(stringify)?;
+                Ok(json!({ "status": status.trim(), "mainFile": main_file }))
             }
             "list_files" => {
                 let files = self.bridge()?.list(&opts, None).map_err(stringify)?;
@@ -1048,14 +1050,13 @@ stop this turn so the backend can resume the same thread in its isolated writabl
 
     fn set_main(&self, request_id: &str, args: &Value) -> Result<Value, String> {
         let path = str_arg(args, "path")?;
-        let old = self
-            .send("GETMAIN")
-            .map(|reply| reply.trim().to_string())
-            .unwrap_or_default();
-        let reply = self.send(&format!("SETMAIN {path}"))?;
-        let before = Snapshot::MainPath {
-            path: (!old.is_empty()).then(|| old.clone()),
-        };
+        let opts = SendOpts::default();
+        let bridge = self.bridge()?;
+        let old = bridge.get_main(&opts, None).map_err(stringify)?;
+        let reply = bridge
+            .send(&format!("SETMAIN {path}"), &opts, None)
+            .map_err(stringify)?;
+        let before = Snapshot::MainPath { path: old };
         let after = Snapshot::MainPath {
             path: Some(path.to_string()),
         };
@@ -1757,6 +1758,134 @@ mod tests {
             }
             seen
         })
+    }
+
+    #[test]
+    fn project_status_adds_configured_main_without_list_or_write_lease() {
+        let (base, inbox, outbox, runtime) =
+            bridge_runtime("project-status-main", "req-project-status-main");
+        let raw_status = "compiling=False\r\nproject='E:\\maps\\demo.e3s'\r\nversion=0.19.6.0";
+        let responder = spawn_bridge_responder(
+            inbox,
+            outbox,
+            vec![
+                ("STATUS", raw_status),
+                ("GETMAIN", "survivor_mvp"),
+                ("LIST", "main\tClassicTrigger\r\nsurvivor_mvp\tCUIEps"),
+            ],
+        );
+
+        let status = runtime.execute("project_status", &json!({})).unwrap();
+        assert_eq!(status["status"], raw_status);
+        assert_eq!(status["mainFile"], "survivor_mvp");
+
+        let files = runtime.execute("list_files", &json!({})).unwrap();
+        assert_eq!(files["count"], 2);
+        assert_eq!(files["files"][0]["path"], "main");
+        assert_eq!(files["files"][0]["ftype"], "ClassicTrigger");
+        assert_eq!(files["files"][1]["path"], "survivor_mvp");
+        assert_eq!(files["files"][1]["ftype"], "CUIEps");
+        assert_eq!(
+            responder.join().unwrap(),
+            vec!["STATUS", "GETMAIN", "LIST"],
+            "project_status must read MainFile only through GETMAIN; LIST remains separate"
+        );
+        assert_eq!(runtime.request_state_snapshot().unwrap().action_count, 2);
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn project_status_maps_empty_getmain_reply_to_json_null() {
+        let (base, inbox, outbox, runtime) =
+            bridge_runtime("project-status-empty-main", "req-project-status-empty-main");
+        let responder = spawn_bridge_responder(
+            inbox,
+            outbox,
+            vec![("STATUS", "compiling=False\nproject=''"), ("GETMAIN", "")],
+        );
+
+        let result = runtime.execute("project_status", &json!({})).unwrap();
+        responder.join().unwrap();
+
+        assert_eq!(result["status"], "compiling=False\nproject=''");
+        assert!(result["mainFile"].is_null());
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn set_main_journals_configured_and_unset_old_values_through_getmain() {
+        for (tag, request_id, old_reply, expected_old) in [
+            (
+                "set-main-configured",
+                "req-set-main-configured",
+                "systems/old_root",
+                Some("systems/old_root"),
+            ),
+            ("set-main-unset", "req-set-main-unset", "", None),
+        ] {
+            let (base, inbox, outbox, runtime) = bridge_runtime(tag, request_id);
+            runtime
+                .request_write_workspace("set the requested composition root")
+                .unwrap();
+            runtime
+                .execute("search_docs", &json!({"query": "MainFile 설정"}))
+                .unwrap();
+            let responder = spawn_bridge_responder(
+                inbox,
+                outbox,
+                vec![
+                    ("GETMAIN", old_reply),
+                    ("SETMAIN survivor_mvp", "OK: main 'survivor_mvp'"),
+                ],
+            );
+
+            runtime
+                .execute("set_main", &json!({"path": "survivor_mvp"}))
+                .unwrap();
+            assert_eq!(
+                responder.join().unwrap(),
+                vec!["GETMAIN", "SETMAIN survivor_mvp"]
+            );
+
+            let entries = runtime
+                .services
+                .journal
+                .selected_entries(request_id, &crate::journal::DecisionIds::All)
+                .unwrap();
+            assert_eq!(entries.len(), 1);
+            assert_eq!(
+                entries[0].before,
+                Snapshot::MainPath {
+                    path: expected_old.map(str::to_string),
+                }
+            );
+            fs::remove_dir_all(base).ok();
+        }
+    }
+
+    #[test]
+    fn set_main_surfaces_getmain_errors_before_mutating_or_journaling() {
+        let request_id = "req-set-main-read-error";
+        let (base, inbox, outbox, runtime) = bridge_runtime("set-main-read-error", request_id);
+        runtime
+            .request_write_workspace("set the requested composition root")
+            .unwrap();
+        runtime
+            .execute("search_docs", &json!({"query": "MainFile 설정"}))
+            .unwrap();
+        let responder = spawn_bridge_responder(
+            inbox,
+            outbox,
+            vec![("GETMAIN", "ERROR: unexpected GETMAIN failure")],
+        );
+
+        let error = runtime
+            .execute("set_main", &json!({"path": "survivor_mvp"}))
+            .unwrap_err();
+        assert!(error.contains("unexpected GETMAIN failure"), "got: {error}");
+        assert_eq!(responder.join().unwrap(), vec!["GETMAIN"]);
+        assert_eq!(runtime.services.journal.entry_count(request_id), 0);
+        fs::remove_dir_all(base).ok();
     }
 
     #[test]

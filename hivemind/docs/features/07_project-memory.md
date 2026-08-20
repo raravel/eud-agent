@@ -33,7 +33,7 @@ graph TD
 | File | Writer | Content |
 |---|---|---|
 | `resources.md` | codex (`memory_write`) + panel | Resource ledger: switch/death-counter/location/EUD-address allocations. Highest-value file — prevents collision code. |
-| `structure.md` | codex + panel | One-line role summary per project file ("stats.eps: RPG stat system"). |
+| `structure.md` | codex + panel | Complete one-line role/dependency map per project file (`<path> — <single responsibility>; imports <direct project dependencies>`). |
 | `conventions.md` | codex + panel | Naming and trigger-pattern conventions observed in the user's code. |
 | `lessons.md` | codex + panel | Corrections/feedback: the fact + why + how to apply next time. |
 | `meta.json` | server only | `{"version": 1, "list_hash": "<sha256 of LIST reply>", "list_hash_ts": "<ISO8601>"}` for staleness detection. |
@@ -55,6 +55,12 @@ graph TD
   (string — the **full replacement content** of that file).
 - Full-file replace semantics: codex sees the current content in the prompt every turn, so it
   rewrites the file faithfully; the journal inverse is trivially "write old content back".
+- The architecture guide requires a complete `structure` replacement after file topology,
+  MainFile, direct-dependency, or material responsibility changes. Every current project file is
+  included. A localized internal change that leaves roles and dependencies unchanged does not
+  rewrite `structure`.
+- `structure` is durable descriptive context, not executable truth. Live `GETMAIN`, `LIST`, and
+  relevant source reads override stale or conflicting memory.
 - Validation (first line of defense, before any disk write): `file` in the enum; `content`
   size ≤ 8,192 bytes UTF-8 — over-budget returns `ToolError` telling codex to condense.
 - **Journaled**: snapshot before = `{content: <old or "">, existed: <bool>}`; record after

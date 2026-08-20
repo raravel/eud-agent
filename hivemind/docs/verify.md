@@ -24,6 +24,18 @@ stages from v1 are retired as `server/` is removed.
 - `cd panel && npx vitest run` — panel component/unit tests (state/IPC, cancel+rewind,
   persistent activity status, long-chat DOM virtualization, PlanView/ChangesetView).
 
+### MainFile architecture focused checks
+
+- `cargo test -p eud-agent bridge_io --lib` — verifies root and nested `GETMAIN` paths, empty/no
+  project mapping, unexpected-error propagation, and the unchanged Lua `GETMAIN` identity walk
+  plus `LIST` row shape.
+- `cargo test -p eud-agent tool_exec --lib` — verifies additive
+  `project_status.mainFile`, unchanged `status`, JSON `null`, read-only execution without a write
+  lease, name/type independence, and shared `set_main` prior-value journaling.
+- `cargo test -p eud-agent engine --lib` — verifies the canonical architecture guide in cold-start
+  and resume prompts, section boundaries/order, MainFile non-inference, localized ownership,
+  acyclic dependencies, complete `structure` refresh, one-batch preflight, and mandatory build.
+
 ## build
 - `cd panel && npm run build` — `tsc -b && vite build` produces `panel/dist`.
 - `cargo build --manifest-path src-tauri/Cargo.toml` — Rust core compiles **and links the
@@ -88,6 +100,13 @@ stages from v1 are retired as `server/` is removed.
   `document.documentElement.scrollWidth === document.documentElement.clientWidth`.
 
 ## E2E (user-assisted, GUI)
+- MainFile architecture live smoke: with `main` (`ClassicTrigger`, not MainFile) and
+  `survivor_mvp` (`CUIEps`, configured MainFile), call `project_status` and require
+  `mainFile == "survivor_mvp"`; call `list_files` and require both original paths/types. Ask a
+  read-only architecture question and require `survivor_mvp` as composition root, imports from it
+  in any modular proposal, and no `set_main` or other mutation. Do not modify the user's source or
+  structure. Verify the unset case only with a fake bridge/isolated fixture unless clearing the
+  live setting is separately safe and approved.
 - Editor live test: install the slim bridge, launch the editor + app, and run an agent
   coordinated `.eps` change. Observe one complete-batch `eps_check`, correction/re-check
   before writes, then mandatory `build_run`. Repeat with Node unavailable and confirm a

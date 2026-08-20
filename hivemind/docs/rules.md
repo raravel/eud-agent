@@ -78,6 +78,33 @@ hosting, panel re-arm, and server spawning are REMOVED.
 - NEVER poll `.result` without a timeout. Default 10s; extend to 180s when `status.txt`
   says `compiling=true` and emit `progress {stage: waiting_build}` to the panel.
 
+## Agent epScript project architecture
+
+- `GETMAIN` over `pj.TEData.MainFile` is the ONLY MainFile authority. `project_status.mainFile`
+  exposes its exact project-relative `/` path or `null`; `list_files` remains authoritative for
+  path/type/settable metadata. NEVER infer MainFile from a filename, list order, open tab,
+  lifecycle hooks, file count, or project memory.
+- Preserve a configured MainFile as the composition root regardless of name. NEVER rename it or
+  call `set_main` merely to normalize naming, and NEVER treat another file named `main` as special.
+  When `mainFile` is null, a non-empty project requires an explicit reviewed selection; localized
+  work that does not need a start-file change proceeds without setting one.
+- Put behavior in the existing module that owns the mutable state and invariant. Create a module
+  only for a distinct cohesive responsibility with a narrow API; extract a stable leaf only after
+  two real consumers exist.
+- Keep imports directional and acyclic:
+  `configured MainFile -> feature modules -> stable leaf modules`. Candidate-introduced
+  `EUDLSP002` cycles MUST be removed; report unrelated pre-existing cycles without refactoring them.
+- NEVER create empty scaffolding or generic `utils`, `common`, `helpers`, or `state` dumping
+  grounds. More than 800 nonblank lines is only a cohesion review signal, NEVER an automatic
+  split or build gate.
+- Localized fixes stay in the owning file. Broad splitting, moving, renaming, or unrelated code
+  cleanup requires reviewed scope.
+- After file topology, MainFile, direct dependency, or material responsibility changes, replace
+  project memory `structure` completely with every file's current role and direct imports.
+  Ordinary internal edits that leave roles and dependencies unchanged MUST NOT churn memory.
+- Preflight every mutually dependent candidate in one `eps_check` batch, remove newly introduced
+  cycles, apply the coherent changeset, and run the mandatory complete-project `build_run`.
+
 ## Agent epScript preflight process
 
 - `eps_check` is read-only and advisory: NEVER journal it, consume mutation/action budget,

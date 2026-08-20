@@ -316,7 +316,7 @@ do not require Node.
 
 ## Agent workflow
 
-Add an `[eps preflight]` system-prompt section before `[build]`:
+The `[eps preflight]` system-prompt section appears before `[build]`:
 
 ```text
 - Before file_create/file_write/file_edit for .eps, call eps_check with every candidate in one
@@ -335,6 +335,12 @@ Add an `[eps preflight]` system-prompt section before `[build]`:
 Do not add a mechanical admission gate requiring `eps_check`; diagnostics must remain advisory.
 The generic Tool row may show the call/result like every MCP tool, but there is no dedicated panel
 state, event, control, or diagnostics renderer.
+
+The adjacent `[eps project architecture]` policy keeps imports
+`configured MainFile -> feature modules -> stable leaf modules`. A candidate-introduced
+`EUDLSP002` cycle is corrected rather than accepted; unrelated pre-existing cycles are reported
+without incidental refactoring. Mutually dependent candidates remain one `eps_check` batch, and
+the authoritative `build_run` remains mandatory after applying the complete change.
 
 ## Upstream pin and distribution
 
