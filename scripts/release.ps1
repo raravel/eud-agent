@@ -98,8 +98,8 @@ try {
 
     # --- Build (beforeBuildCommand builds the panel; tauri signs the updater bundle) -----
     # This repo uses cargo-tauri (see scripts/dev_run.ps1 `cargo tauri dev`), NOT the npm
-    # `@tauri-apps/cli` — `npx tauri` is not installed here.
-    Write-Output "building (cargo tauri build)…"
+    # `@tauri-apps/cli` - `npx tauri` is not installed here.
+    Write-Output "building (cargo tauri build)..."
     & cargo tauri build
     if ($LASTEXITCODE -ne 0) { Fail "cargo tauri build failed." }
 
@@ -119,7 +119,7 @@ try {
     # Tauri 2 NSIS updater: the signed artifact IS the `-setup.exe` (there is no `.nsis.zip`);
     # the updater downloads + runs it. The new-install installer and the updater target are
     # the same file, so latest.json's url points at this exe and we upload it once.
-    # Match THIS version's artifacts only — the bundle dir may retain prior versions'
+    # Match THIS version's artifacts only - the bundle dir may retain prior versions'
     # `-setup.exe` files (e.g. a 0.1.0 build before a 0.1.1 build), which a bare
     # `*-setup.exe` glob would ambiguously match.
     $installer = Get-Single $nsisDir "*_${Version}_*-setup.exe" 'installer / updater artifact'
@@ -151,7 +151,7 @@ try {
     Write-Output "wrote $latestPath"
 
     # --- Publish ------------------------------------------------------------------------
-    Write-Output "creating GitHub release v$Version…"
+    Write-Output "creating GitHub release v$Version..."
     # --latest: explicitly claim "Latest" so the updater endpoint
     # (releases/latest/download/latest.json) and the download site resolve THIS app
     # release, never a side-channel rag-index-v* release.
