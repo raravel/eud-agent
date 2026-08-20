@@ -6,13 +6,14 @@
  * ids vs "all"). `rollback_result` row states surface via the store decisions:
  * accepted (적용 유지) / 되돌림 / 실패 (inline failure). Korean labels.
  *
- * Contract (Step B implements `@/components/ChangesetView`):
+ * Contract (`@/components/ChangesetView`):
  *   export interface ChangesetViewProps {
  *     changeset: ChangesetState;          // store.changeset (items + decisions)
+ *     open: boolean;                       // selected session's expansion state
+ *     onOpenChange(open: boolean): void;   // App persists expansion per session
  *     pending: boolean;                    // a decision is in flight (disable)
  *     onDecide(decision: "accept" | "reject", ids: "all" | string[]): void;
  *   }
- *   export function ChangesetView(props): JSX.Element;
  *
  * onDecide receives the SAME (decision, ids) the store's decisionSent() records,
  * and the App layer invokes `changeset_decision` from it.
@@ -20,7 +21,10 @@
 import { describe, it, expect, vi } from "vitest";
 import { render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { ChangesetView } from "@/components/ChangesetView";
+import {
+  ChangesetView,
+  type ChangesetViewProps,
+} from "@/components/ChangesetView";
 import type { ChangesetState } from "@/state/store";
 import type { ChangesetItem } from "@/lib/ipc";
 
@@ -108,14 +112,17 @@ function makeChangeset(
   return { request_id: "req-1", items, decisions };
 }
 
+const defaultChangesetViewProps: Omit<ChangesetViewProps, "changeset"> = {
+  open: true,
+  onOpenChange: () => {},
+  pending: false,
+  onDecide: () => {},
+};
+
 describe("ChangesetView — dat grouping", () => {
   it("renders a dat group header with dat, objId and (server-resolved) name", () => {
     render(
-      <ChangesetView
-        changeset={makeChangeset([datItem])}
-        pending={false}
-        onDecide={() => {}}
-      />,
+      <ChangesetView {...defaultChangesetViewProps} changeset={makeChangeset([datItem])} />,
     );
     // e.g. "unit [76] 마린" — assert all three pieces are present.
     expect(screen.getByText(/unit/)).toBeInTheDocument();
@@ -125,11 +132,7 @@ describe("ChangesetView — dat grouping", () => {
 
   it("renders each property as an old → new row", () => {
     render(
-      <ChangesetView
-        changeset={makeChangeset([datItem])}
-        pending={false}
-        onDecide={() => {}}
-      />,
+      <ChangesetView {...defaultChangesetViewProps} changeset={makeChangeset([datItem])} />,
     );
     expect(screen.getByText(/HP/)).toBeInTheDocument();
     expect(screen.getByText(/40/)).toBeInTheDocument();
@@ -154,11 +157,7 @@ describe("ChangesetView — dat grouping", () => {
 
   it("renders the family badge, dat-file label and #objId in the card header", () => {
     render(
-      <ChangesetView
-        changeset={makeChangeset([datCard])}
-        pending={false}
-        onDecide={() => {}}
-      />,
+      <ChangesetView {...defaultChangesetViewProps} changeset={makeChangeset([datCard])} />,
     );
     expect(screen.getByText("dat")).toBeInTheDocument(); // family badge
     expect(screen.getByText("units")).toBeInTheDocument(); // dat-file label
@@ -177,11 +176,7 @@ describe("ChangesetView — dat grouping", () => {
       properties: [],
     } as unknown as ChangesetItem;
     render(
-      <ChangesetView
-        changeset={makeChangeset([empty])}
-        pending={false}
-        onDecide={() => {}}
-      />,
+      <ChangesetView {...defaultChangesetViewProps} changeset={makeChangeset([empty])} />,
     );
     expect(screen.getByText(/변경된 속성이 없습니다/)).toBeInTheDocument();
   });
@@ -190,11 +185,7 @@ describe("ChangesetView — dat grouping", () => {
 describe("ChangesetView — files by kind", () => {
   it("renders a created file with a content preview", () => {
     render(
-      <ChangesetView
-        changeset={makeChangeset([createdFile])}
-        pending={false}
-        onDecide={() => {}}
-      />,
+      <ChangesetView {...defaultChangesetViewProps} changeset={makeChangeset([createdFile])} />,
     );
     expect(screen.getByText(/teleport\.eps/)).toBeInTheDocument();
     expect(screen.getByText(/function tp/)).toBeInTheDocument();
@@ -202,11 +193,7 @@ describe("ChangesetView — files by kind", () => {
 
   it("renders a modified file's unified diff with +/- line coloring (no Monaco)", () => {
     const { container } = render(
-      <ChangesetView
-        changeset={makeChangeset([modifiedFile])}
-        pending={false}
-        onDecide={() => {}}
-      />,
+      <ChangesetView {...defaultChangesetViewProps} changeset={makeChangeset([modifiedFile])} />,
     );
     // The path appears in the header AND in the diff file-header lines; assert
     // it renders at least once.
@@ -218,11 +205,7 @@ describe("ChangesetView — files by kind", () => {
 
   it("renders Workspace documents as distinct reviewable file diffs", () => {
     const { container } = render(
-      <ChangesetView
-        changeset={makeChangeset([workspaceDocument])}
-        pending={false}
-        onDecide={() => {}}
-      />,
+      <ChangesetView {...defaultChangesetViewProps} changeset={makeChangeset([workspaceDocument])} />,
     );
     expect(screen.getByText("Workspace")).toBeInTheDocument();
     expect(screen.getAllByText(/specs\/combat\.md/).length).toBeGreaterThan(0);
@@ -232,11 +215,7 @@ describe("ChangesetView — files by kind", () => {
 
   it("renders a deleted file as a name row", () => {
     render(
-      <ChangesetView
-        changeset={makeChangeset([deletedFile])}
-        pending={false}
-        onDecide={() => {}}
-      />,
+      <ChangesetView {...defaultChangesetViewProps} changeset={makeChangeset([deletedFile])} />,
     );
     expect(screen.getByText(/old\.eps/)).toBeInTheDocument();
   });
@@ -246,11 +225,7 @@ describe("ChangesetView — decision dispatch (single vs all)", () => {
   it("a per-item accept dispatches the item's ids (file: single id)", async () => {
     const onDecide = vi.fn();
     render(
-      <ChangesetView
-        changeset={makeChangeset([modifiedFile])}
-        pending={false}
-        onDecide={onDecide}
-      />,
+      <ChangesetView {...defaultChangesetViewProps} changeset={makeChangeset([modifiedFile])} onDecide={onDecide} />,
     );
     const row = screen.getByTestId("cs-item-fm");
     await userEvent.click(within(row).getByRole("button", { name: /적용/ }));
@@ -260,11 +235,7 @@ describe("ChangesetView — decision dispatch (single vs all)", () => {
   it("a per-item reject dispatches the item's ids", async () => {
     const onDecide = vi.fn();
     render(
-      <ChangesetView
-        changeset={makeChangeset([modifiedFile])}
-        pending={false}
-        onDecide={onDecide}
-      />,
+      <ChangesetView {...defaultChangesetViewProps} changeset={makeChangeset([modifiedFile])} onDecide={onDecide} />,
     );
     const row = screen.getByTestId("cs-item-fm");
     await userEvent.click(within(row).getByRole("button", { name: /되돌/ }));
@@ -274,11 +245,7 @@ describe("ChangesetView — decision dispatch (single vs all)", () => {
   it("a dat group (no item-level id) accept dispatches ALL its property ids", async () => {
     const onDecide = vi.fn();
     render(
-      <ChangesetView
-        changeset={makeChangeset([datItem])}
-        pending={false}
-        onDecide={onDecide}
-      />,
+      <ChangesetView {...defaultChangesetViewProps} changeset={makeChangeset([datItem])} onDecide={onDecide} />,
     );
     const row = screen.getByTestId(`cs-item-${DAT_KEY}`);
     await userEvent.click(within(row).getByRole("button", { name: /적용/ }));
@@ -288,11 +255,7 @@ describe("ChangesetView — decision dispatch (single vs all)", () => {
   it("renders MULTIPLE id-less dat groups with distinct testids that decide independently", async () => {
     const onDecide = vi.fn();
     render(
-      <ChangesetView
-        changeset={makeChangeset([datItem, datItem2])}
-        pending={false}
-        onDecide={onDecide}
-      />,
+      <ChangesetView {...defaultChangesetViewProps} changeset={makeChangeset([datItem, datItem2])} onDecide={onDecide} />,
     );
     // Distinct rows (no `cs-item-undefined` collision).
     const row1 = screen.getByTestId(`cs-item-${DAT_KEY}`);
@@ -308,11 +271,7 @@ describe("ChangesetView — decision dispatch (single vs all)", () => {
   it("bulk [전체 적용 유지] dispatches the literal \"all\"", async () => {
     const onDecide = vi.fn();
     render(
-      <ChangesetView
-        changeset={makeChangeset([datItem, modifiedFile])}
-        pending={false}
-        onDecide={onDecide}
-      />,
+      <ChangesetView {...defaultChangesetViewProps} changeset={makeChangeset([datItem, modifiedFile])} onDecide={onDecide} />,
     );
     await userEvent.click(screen.getByRole("button", { name: "전체 적용 유지" }));
     expect(onDecide).toHaveBeenCalledWith("accept", "all");
@@ -321,11 +280,7 @@ describe("ChangesetView — decision dispatch (single vs all)", () => {
   it("bulk [전체 되돌리기] dispatches reject with the literal \"all\"", async () => {
     const onDecide = vi.fn();
     render(
-      <ChangesetView
-        changeset={makeChangeset([datItem, modifiedFile])}
-        pending={false}
-        onDecide={onDecide}
-      />,
+      <ChangesetView {...defaultChangesetViewProps} changeset={makeChangeset([datItem, modifiedFile])} onDecide={onDecide} />,
     );
     await userEvent.click(screen.getByRole("button", { name: "전체 되돌리기" }));
     expect(onDecide).toHaveBeenCalledWith("reject", "all");
@@ -333,11 +288,7 @@ describe("ChangesetView — decision dispatch (single vs all)", () => {
 
   it("disables decision buttons while a decision is pending", () => {
     render(
-      <ChangesetView
-        changeset={makeChangeset([modifiedFile])}
-        pending={true}
-        onDecide={() => {}}
-      />,
+      <ChangesetView {...defaultChangesetViewProps} changeset={makeChangeset([modifiedFile])} pending={true} />,
     );
     const row = screen.getByTestId("cs-item-fm");
     expect(within(row).getByRole("button", { name: /적용/ })).toBeDisabled();
@@ -348,11 +299,7 @@ describe("ChangesetView — decision dispatch (single vs all)", () => {
   // just silently-disabled buttons (the live-E2E "동기적 렉" perception).
   it("shows an in-flight notice with a spinner while a decision is pending", () => {
     render(
-      <ChangesetView
-        changeset={makeChangeset([modifiedFile])}
-        pending={true}
-        onDecide={() => {}}
-      />,
+      <ChangesetView {...defaultChangesetViewProps} changeset={makeChangeset([modifiedFile])} pending={true} />,
     );
     expect(screen.getByRole("status")).toBeInTheDocument();
     expect(screen.getByText(/처리 중/)).toBeInTheDocument();
@@ -360,11 +307,7 @@ describe("ChangesetView — decision dispatch (single vs all)", () => {
 
   it("hides the in-flight notice when no decision is pending", () => {
     render(
-      <ChangesetView
-        changeset={makeChangeset([modifiedFile])}
-        pending={false}
-        onDecide={() => {}}
-      />,
+      <ChangesetView {...defaultChangesetViewProps} changeset={makeChangeset([modifiedFile])} />,
     );
     expect(screen.queryByText(/처리 중/)).not.toBeInTheDocument();
   });
@@ -373,11 +316,7 @@ describe("ChangesetView — decision dispatch (single vs all)", () => {
 describe("ChangesetView — rollback_result row states", () => {
   it("shows 적용 유지 for an accepted item", () => {
     render(
-      <ChangesetView
-        changeset={makeChangeset([modifiedFile], { fm: "accepted" })}
-        pending={false}
-        onDecide={() => {}}
-      />,
+      <ChangesetView {...defaultChangesetViewProps} changeset={makeChangeset([modifiedFile], { fm: "accepted" })} />,
     );
     const row = screen.getByTestId("cs-item-fm");
     expect(within(row).getByText(/적용 유지/)).toBeInTheDocument();
@@ -385,11 +324,7 @@ describe("ChangesetView — rollback_result row states", () => {
 
   it("shows 되돌림 for a rejected item", () => {
     render(
-      <ChangesetView
-        changeset={makeChangeset([modifiedFile], { fm: "rejected" })}
-        pending={false}
-        onDecide={() => {}}
-      />,
+      <ChangesetView {...defaultChangesetViewProps} changeset={makeChangeset([modifiedFile], { fm: "rejected" })} />,
     );
     const row = screen.getByTestId("cs-item-fm");
     expect(within(row).getByText(/되돌림/)).toBeInTheDocument();
@@ -397,11 +332,7 @@ describe("ChangesetView — rollback_result row states", () => {
 
   it("surfaces a rollback failure inline (실패)", () => {
     render(
-      <ChangesetView
-        changeset={makeChangeset([modifiedFile], { fm: "failed" })}
-        pending={false}
-        onDecide={() => {}}
-      />,
+      <ChangesetView {...defaultChangesetViewProps} changeset={makeChangeset([modifiedFile], { fm: "failed" })} />,
     );
     const row = screen.getByTestId("cs-item-fm");
     expect(within(row).getByText(/실패/)).toBeInTheDocument();
@@ -409,11 +340,7 @@ describe("ChangesetView — rollback_result row states", () => {
 
   it("renders settings as an old → new row", () => {
     render(
-      <ChangesetView
-        changeset={makeChangeset([settingsItem])}
-        pending={false}
-        onDecide={() => {}}
-      />,
+      <ChangesetView {...defaultChangesetViewProps} changeset={makeChangeset([settingsItem])} />,
     );
     expect(screen.getByText(/off/)).toBeInTheDocument();
     expect(screen.getByText(/on/)).toBeInTheDocument();
@@ -423,15 +350,11 @@ describe("ChangesetView — rollback_result row states", () => {
     // Group 1 (p1,p2) accepted; group 2 (q1) rejected — each row reflects only
     // its own properties' decisions (no cross-group bleed from undefined keys).
     render(
-      <ChangesetView
-        changeset={makeChangeset([datItem, datItem2], {
-          p1: "accepted",
-          p2: "accepted",
-          q1: "rejected",
-        })}
-        pending={false}
-        onDecide={() => {}}
-      />,
+      <ChangesetView {...defaultChangesetViewProps} changeset={makeChangeset([datItem, datItem2], {
+        p1: "accepted",
+        p2: "accepted",
+        q1: "rejected",
+      })} />,
     );
     const row1 = screen.getByTestId(`cs-item-${DAT_KEY}`);
     const row2 = screen.getByTestId(`cs-item-${DAT_KEY2}`);
@@ -440,5 +363,65 @@ describe("ChangesetView — rollback_result row states", () => {
     // The accepted group is NOT mislabelled as rejected, and vice versa.
     expect(within(row1).queryByText(/되돌림/)).not.toBeInTheDocument();
     expect(within(row2).queryByText(/적용 유지/)).not.toBeInTheDocument();
+  });
+});
+
+describe("ChangesetView — fixed review controls", () => {
+  it("keeps the header and bulk actions outside the scrollable item list", () => {
+    render(
+      <ChangesetView {...defaultChangesetViewProps} changeset={makeChangeset([datItem, modifiedFile])} />,
+    );
+    const section = screen.getByRole("region", { name: "변경사항 검토" });
+    const toggle = screen.getByRole("button", { name: "수정 적용 접기" });
+    const header = toggle.closest("header");
+    const scroll = screen.getByTestId("changeset-scroll");
+    const actions = screen.getByTestId("changeset-actions");
+
+    expect(section.children[0]).toBe(header);
+    expect(scroll.parentElement).toBe(section);
+    expect(actions.parentElement).toBe(section);
+    expect(scroll).toHaveClass("overflow-y-auto");
+    expect(actions).toHaveClass("shrink-0");
+    expect(screen.getByText("2건")).toBeInTheDocument();
+  });
+
+  it("keeps the header visible while the controlled review body is collapsed", async () => {
+    const onOpenChange = vi.fn();
+    const changeset = makeChangeset([modifiedFile]);
+    const { rerender } = render(
+      <ChangesetView
+        changeset={changeset}
+        open={true}
+        onOpenChange={onOpenChange}
+        pending={false}
+        onDecide={() => {}}
+      />,
+    );
+
+    await userEvent.click(
+      screen.getByRole("button", { name: "수정 적용 접기" }),
+    );
+    expect(onOpenChange).toHaveBeenCalledWith(false);
+
+    rerender(
+      <ChangesetView
+        changeset={changeset}
+        open={false}
+        onOpenChange={onOpenChange}
+        pending={false}
+        onDecide={() => {}}
+      />,
+    );
+    expect(screen.getByText("수정 적용")).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "수정 적용 펼치기" }),
+    ).toBeInTheDocument();
+    expect(screen.queryByTestId("changeset-scroll")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("changeset-actions")).not.toBeInTheDocument();
+
+    await userEvent.click(
+      screen.getByRole("button", { name: "수정 적용 펼치기" }),
+    );
+    expect(onOpenChange).toHaveBeenLastCalledWith(true);
   });
 });

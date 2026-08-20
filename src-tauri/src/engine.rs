@@ -320,7 +320,6 @@ enum Phase {
     Triage,
     Answer,
     PlanReview,
-    WaitingWrite,
     Executing,
     ChangesetReview,
 }
@@ -388,7 +387,7 @@ impl<D: CodexDriver, S: EventSink> AgentEngine<D, S> {
     pub async fn chat(&mut self, req: ipc::ChatRequest) -> Result<(), AgentEngineError> {
         if matches!(
             self.phase,
-            Phase::PlanReview | Phase::WaitingWrite | Phase::Executing | Phase::ChangesetReview
+            Phase::PlanReview | Phase::Executing | Phase::ChangesetReview
         ) {
             return Err(AgentEngineError::new(
                 "현재 세션의 진행 중인 요청 또는 검토를 먼저 완료해 주세요.",
@@ -455,7 +454,6 @@ impl<D: CodexDriver, S: EventSink> AgentEngine<D, S> {
             self.pending_write = Some(WriteContinuation::Direct);
             self.phase = match ticket.state() {
                 crate::write_coordinator::TicketState::Granted => Phase::Executing,
-                crate::write_coordinator::TicketState::Waiting(_) => Phase::WaitingWrite,
                 crate::write_coordinator::TicketState::Cancelled => Phase::Idle,
             };
             self.update_active_session().await;
@@ -646,12 +644,11 @@ impl<D: CodexDriver, S: EventSink> AgentEngine<D, S> {
         }
         let ticket = self
             .runtime
-            .request_write_lane("approved plan execution")
+            .request_write_workspace("approved plan execution")
             .map_err(AgentEngineError::new)?;
         self.pending_write = Some(WriteContinuation::ApprovedPlan);
         self.phase = match ticket.state() {
             crate::write_coordinator::TicketState::Granted => Phase::Executing,
-            crate::write_coordinator::TicketState::Waiting(_) => Phase::WaitingWrite,
             crate::write_coordinator::TicketState::Cancelled => Phase::Idle,
         };
         Ok(())
@@ -663,10 +660,10 @@ impl<D: CodexDriver, S: EventSink> AgentEngine<D, S> {
             .write_ticket()
             .ok_or_else(|| AgentEngineError::new("no write ticket is pending"))?;
         if ticket.state() != crate::write_coordinator::TicketState::Granted
-            || !self.runtime.owns_write_lease()
+            || !self.runtime.owns_write_registration()
         {
             return Err(AgentEngineError::new(
-                "the project write lease has not been granted",
+                "the concurrent workspace write registration is no longer active",
             ));
         }
         let continuation = self
@@ -681,8 +678,8 @@ impl<D: CodexDriver, S: EventSink> AgentEngine<D, S> {
         let (instruction, approved_markdown) = match continuation {
             WriteContinuation::Direct => (
                 format!(
-                    "The FIFO project write lease is now granted for request `{request_id}`. \
-Re-read every mutation target because accepted project state may have changed while waiting. \
+                    "The isolated writable workspace is ready for request `{request_id}`. \
+Re-read every mutation target because accepted project state may have changed since the read turn. \
 Continue the requested change now, run the mandatory build, and stop only after verification."
                 ),
                 None,
@@ -736,7 +733,7 @@ Continue the requested change now, run the mandatory build, and stop only after 
         if self.emit_current_changeset_if_any()? {
             self.phase = Phase::ChangesetReview;
             self.runtime
-                .emit_activity(crate::write_coordinator::SessionActivity::Review, None);
+                .emit_activity(crate::write_coordinator::SessionActivity::Review);
             return Ok(());
         }
         self.runtime
@@ -752,10 +749,10 @@ Continue the requested change now, run the mandatory build, and stop only after 
         if self.emit_current_changeset_if_any()? {
             self.phase = Phase::ChangesetReview;
             self.runtime
-                .emit_activity(crate::write_coordinator::SessionActivity::Review, None);
+                .emit_activity(crate::write_coordinator::SessionActivity::Review);
         } else {
             self.runtime
-                .release_write_lease()
+                .release_write_registration()
                 .map_err(AgentEngineError::new)?;
             self.phase = Phase::Idle;
         }
@@ -824,38 +821,45 @@ Continue the requested change now, run the mandatory build, and stop only after 
         let accepted_wiki_entries = self.collect_accepted_wiki_entries(&request_id, &req);
         let accepted_workspace_entries = self.collect_accepted_workspace_entries(&request_id, &req);
 
-        let outcome: Result<bool, AgentEngineError> = (|| match req.decision {
-            ipc::Decision::Accept => {
-                WorkspaceManager::new(self.runtime.data_dirs())
-                    .record_accepted_entries(&request_id, &accepted_workspace_entries)
-                    .map_err(|error| AgentEngineError::new(error.to_string()))?;
-                if let Some(payload) = self.record_accepted_wiki_edits(accepted_wiki_entries) {
-                    self.sink.emit(EngineEvent::Wiki(payload))?;
-                }
-                self.journal_store
-                    .accept_entries(&request_id, &decision_ids)
-                    .map_err(|error| AgentEngineError::new(error.to_string()))
-            }
-            ipc::Decision::Reject => {
-                let bridge = WorkspaceJournalBridge {
-                    workspace: WorkspaceManager::new(self.runtime.data_dirs()),
-                };
-                self.journal_store
-                    .decide(
-                        &request_id,
-                        journal::ChangesetDecision::Reject(decision_ids.clone()),
-                        &bridge,
-                    )
-                    .map_err(|error| AgentEngineError::new(error.to_string()))?;
-                if matches!(decision_ids, journal::DecisionIds::All) {
-                    Ok(true)
-                } else {
-                    self.journal_store
-                        .archive_if_empty(&request_id)
-                        .map_err(|error| AgentEngineError::new(error.to_string()))
-                }
-            }
-        })();
+        let runtime = self.runtime.clone();
+        let outcome: Result<bool, AgentEngineError> = runtime
+            .project_transaction(|| {
+                (|| match req.decision {
+                    ipc::Decision::Accept => {
+                        WorkspaceManager::new(self.runtime.data_dirs())
+                            .record_accepted_entries(&request_id, &accepted_workspace_entries)
+                            .map_err(|error| AgentEngineError::new(error.to_string()))?;
+                        if let Some(payload) =
+                            self.record_accepted_wiki_edits(accepted_wiki_entries)
+                        {
+                            self.sink.emit(EngineEvent::Wiki(payload))?;
+                        }
+                        self.journal_store
+                            .accept_entries(&request_id, &decision_ids)
+                            .map_err(|error| AgentEngineError::new(error.to_string()))
+                    }
+                    ipc::Decision::Reject => {
+                        let bridge = WorkspaceJournalBridge {
+                            workspace: WorkspaceManager::new(self.runtime.data_dirs()),
+                        };
+                        self.journal_store
+                            .decide(
+                                &request_id,
+                                journal::ChangesetDecision::Reject(decision_ids.clone()),
+                                &bridge,
+                            )
+                            .map_err(|error| AgentEngineError::new(error.to_string()))?;
+                        if matches!(decision_ids, journal::DecisionIds::All) {
+                            Ok(true)
+                        } else {
+                            self.journal_store
+                                .archive_if_empty(&request_id)
+                                .map_err(|error| AgentEngineError::new(error.to_string()))
+                        }
+                    }
+                })()
+            })
+            .map_err(AgentEngineError::new)?;
         let settled = outcome.as_ref().copied().unwrap_or(false);
         let ok = outcome.is_ok();
 
@@ -863,18 +867,19 @@ Continue the requested change now, run the mandatory build, and stop only after 
             .emit(EngineEvent::RollbackResult(ipc::RollbackResultEvent {
                 ids,
                 ok,
+                error: outcome.as_ref().err().map(|error| error.message.clone()),
             }))?;
         if outcome.is_err() {
             self.phase = Phase::ChangesetReview;
             self.runtime
-                .emit_activity(crate::write_coordinator::SessionActivity::Review, None);
+                .emit_activity(crate::write_coordinator::SessionActivity::Review);
             self.update_active_session().await;
             return Ok(());
         }
 
         if settled {
             self.runtime
-                .release_write_lease()
+                .release_write_registration()
                 .map_err(AgentEngineError::new)?;
             self.phase = Phase::Idle;
             self.drop_pending_request_from_session(&request_id);
@@ -882,7 +887,7 @@ Continue the requested change now, run the mandatory build, and stop only after 
         } else {
             self.phase = Phase::ChangesetReview;
             self.runtime
-                .emit_activity(crate::write_coordinator::SessionActivity::Review, None);
+                .emit_activity(crate::write_coordinator::SessionActivity::Review);
         }
         self.update_active_session().await;
         Ok(())
@@ -990,7 +995,7 @@ Continue the requested change now, run the mandatory build, and stop only after 
     pub async fn rewind(&mut self, panel_log: serde_json::Value) -> Result<(), AgentEngineError> {
         if matches!(
             self.phase,
-            Phase::PlanReview | Phase::WaitingWrite | Phase::Executing | Phase::ChangesetReview
+            Phase::PlanReview | Phase::Executing | Phase::ChangesetReview
         ) {
             return Err(AgentEngineError::new(
                 "현재 세션의 진행 중인 요청 또는 검토를 먼저 완료해 주세요.",
@@ -1483,9 +1488,9 @@ impl CodexDriver for ProductionCodexDriver {
             .current_request_id()
             .ok_or_else(|| AgentEngineError::new("no request is open for the Codex workspace"))?;
         let access = input.workspace_access;
-        if access == WorkspaceAccess::Write && !self.runtime.owns_write_lease() {
+        if access == WorkspaceAccess::Write && !self.runtime.owns_write_registration() {
             return Err(AgentEngineError::new(
-                "write-mode Codex execution requires the project write lease",
+                "write-mode Codex execution requires an active workspace write registration",
             ));
         }
         let workspace_manager = self.workspace.clone();
@@ -1747,7 +1752,6 @@ struct SessionEngineManagerInner {
     dirs: crate::config::DataDirs,
     fallback_cwd: PathBuf,
     recovered_projects: SyncMutex<HashMap<String, Result<(), String>>>,
-    scheduled_writes: SyncMutex<HashSet<String>>,
     settings_lock: tokio::sync::Mutex<()>,
 }
 
@@ -1782,13 +1786,7 @@ fn restore_pending_review(
             pending.push((record.meta.id.clone(), request_id));
         }
     }
-    if pending.len() > 1 {
-        return Err(format!(
-            "project `{project_id}` has {} conflicting pending writers; recovery requires exactly one",
-            pending.len()
-        ));
-    }
-    if let Some((session_id, request_id)) = pending.pop() {
+    for (session_id, request_id) in pending {
         let journal =
             journal::JournalStore::load(dirs.app_data(), &request_id).map_err(|error| {
                 format!("pending review `{request_id}` cannot be recovered: {error}")
@@ -1824,7 +1822,6 @@ impl SessionEngineManager {
                 dirs,
                 fallback_cwd,
                 recovered_projects: SyncMutex::new(HashMap::new()),
-                scheduled_writes: SyncMutex::new(HashSet::new()),
                 settings_lock: tokio::sync::Mutex::new(()),
             }),
         }
@@ -1834,24 +1831,10 @@ impl SessionEngineManager {
         project_id: &str,
         operation: impl FnOnce() -> Result<T, String>,
     ) -> Result<T, String> {
-        let request_id = format!("panel-{}", uuid::Uuid::new_v4());
-        let mut ticket =
-            self.inner
-                .services
-                .writes()
-                .request(project_id, "__project_panel__", &request_id)?;
-        ticket.wait_for_grant().await?;
-        let result = operation();
-        let release = self.inner.services.writes().release(&request_id);
-        match (result, release) {
-            (Ok(value), Ok(true)) => Ok(value),
-            (Ok(_), Ok(false)) => Err("direct project write lost its lease".to_string()),
-            (Ok(_), Err(error)) => Err(error),
-            (Err(error), Ok(_)) => Err(error),
-            (Err(error), Err(release_error)) => Err(format!(
-                "{error}; write lease release failed: {release_error}"
-            )),
-        }
+        self.inner
+            .services
+            .writes()
+            .transaction(project_id, operation)?
     }
 
     fn ensure_project_recovery(&self, project_id: &str) -> Result<(), String> {
@@ -1961,7 +1944,7 @@ impl SessionEngineManager {
                 } else {
                     crate::write_coordinator::SessionActivity::Error
                 };
-                worker.runtime.emit_activity(activity, None);
+                worker.runtime.emit_activity(activity);
                 let _ = engine.sink.emit(EngineEvent::Error(ipc::ErrorEvent {
                     message: error.message.clone(),
                 }));
@@ -1975,32 +1958,12 @@ impl SessionEngineManager {
         &self,
         worker: Arc<SessionWorker>,
     ) -> Result<(), AgentEngineError> {
-        let Some(mut ticket) = worker.runtime.write_ticket() else {
+        let Some(ticket) = worker.runtime.write_ticket() else {
             return Ok(());
         };
         match ticket.state() {
             crate::write_coordinator::TicketState::Granted => {
                 self.execute_granted_write(worker).await
-            }
-            crate::write_coordinator::TicketState::Waiting(_) => {
-                let request_id = ticket.request_id().to_string();
-                if !self
-                    .inner
-                    .scheduled_writes
-                    .lock()
-                    .insert(request_id.clone())
-                {
-                    return Ok(());
-                }
-                let manager = self.clone();
-                tauri::async_runtime::spawn(async move {
-                    let granted = ticket.wait_for_grant().await;
-                    manager.inner.scheduled_writes.lock().remove(&request_id);
-                    if granted.is_ok() {
-                        let _ = manager.execute_granted_write(worker).await;
-                    }
-                });
-                Ok(())
             }
             crate::write_coordinator::TicketState::Cancelled => Ok(()),
         }
@@ -2019,7 +1982,7 @@ impl SessionEngineManager {
             } else {
                 crate::write_coordinator::SessionActivity::Error
             };
-            worker.runtime.emit_activity(activity, None);
+            worker.runtime.emit_activity(activity);
             let message = match cleanup {
                 Ok(()) => error.message.clone(),
                 Err(cleanup_error) => format!(
@@ -2043,7 +2006,7 @@ impl SessionEngineManager {
             }
             _ => crate::write_coordinator::SessionActivity::Idle,
         };
-        worker.runtime.emit_activity(activity, None);
+        worker.runtime.emit_activity(activity);
         Ok(())
     }
 
@@ -2055,7 +2018,7 @@ impl SessionEngineManager {
         let worker = self.worker(session_id).await?;
         worker
             .runtime
-            .emit_activity(crate::write_coordinator::SessionActivity::RunningRead, None);
+            .emit_activity(crate::write_coordinator::SessionActivity::RunningRead);
         let result = {
             let mut engine = worker.engine.lock().await;
             engine.chat(request).await
@@ -2071,7 +2034,7 @@ impl SessionEngineManager {
         let worker = self.worker(session_id).await?;
         worker
             .runtime
-            .emit_activity(crate::write_coordinator::SessionActivity::RunningRead, None);
+            .emit_activity(crate::write_coordinator::SessionActivity::RunningRead);
         let result = {
             let mut engine = worker.engine.lock().await;
             let result = engine.plan_feedback(request).await;
@@ -2115,16 +2078,6 @@ impl SessionEngineManager {
 
     async fn cancel(&self, session_id: &str) -> Result<(), AgentEngineError> {
         let worker = self.worker(session_id).await?;
-        if worker
-            .runtime
-            .cancel_waiting_write()
-            .map_err(AgentEngineError::new)?
-        {
-            let mut engine = worker.engine.lock().await;
-            engine.pending_write = None;
-            engine.phase = Phase::Idle;
-            return Ok(());
-        }
         if let Ok(engine) = worker.engine.try_lock() {
             if matches!(engine.phase, Phase::PlanReview | Phase::ChangesetReview) {
                 return Err(AgentEngineError::new(
@@ -2142,7 +2095,7 @@ impl SessionEngineManager {
             engine.phase = Phase::Idle;
             worker
                 .runtime
-                .emit_activity(crate::write_coordinator::SessionActivity::Idle, None);
+                .emit_activity(crate::write_coordinator::SessionActivity::Idle);
         }
         engine.update_active_session().await;
         Ok(())
@@ -2186,7 +2139,7 @@ impl SessionEngineManager {
             let engine = worker.engine.lock().await;
             if engine.phase != Phase::Idle {
                 return Err(AgentEngineError::new(
-                    "실행, 쓰기 대기 또는 검토 중인 세션은 삭제할 수 없습니다.",
+                    "실행 또는 검토 중인 세션은 삭제할 수 없습니다.",
                 ));
             }
         }
@@ -3674,7 +3627,7 @@ mod tests {
         engine
             .plan_approve()
             .await
-            .expect("plan approval should acquire the test write lease");
+            .expect("plan approval should acquire the test write registration");
         let error = engine
             .continue_pending_write()
             .await
@@ -4388,7 +4341,7 @@ mod tests {
             .unwrap();
         engine
             .runtime
-            .request_write_lane("write after read")
+            .request_write_workspace("write after read")
             .unwrap();
         engine.current_request_id = Some("request-old".to_string());
         engine.phase = Phase::Triage;
@@ -4396,21 +4349,27 @@ mod tests {
         engine.recover_read_failure().unwrap();
 
         assert_eq!(engine.phase, Phase::Idle);
-        assert!(!engine.runtime.owns_write_lease());
+        assert!(!engine.runtime.owns_write_registration());
         engine
             .runtime
             .begin_request("request-new", "Sample")
             .unwrap();
-        let next = engine.runtime.request_write_lane("retry write").unwrap();
+        let next = engine
+            .runtime
+            .request_write_workspace("retry write")
+            .unwrap();
         assert_eq!(next.state(), crate::write_coordinator::TicketState::Granted);
     }
 
     #[tokio::test]
-    async fn partial_decision_keeps_write_lease_until_every_item_settles() {
+    async fn partial_decision_keeps_write_registration_until_every_item_settles() {
         let mut engine = test_engine(FakeCodexDriver::scripted([]), CapturingEventSink::default());
         let request_id = "req-partial";
         engine.runtime.begin_request(request_id, "Sample").unwrap();
-        engine.runtime.request_write_lane("test review").unwrap();
+        engine
+            .runtime
+            .request_write_workspace("test review")
+            .unwrap();
         engine.current_request_id = Some(request_id.to_string());
         engine.phase = Phase::ChangesetReview;
         record_file_write_in_memory(&engine.journal_store, request_id, "write-1", 1, "one.eps");
@@ -4424,13 +4383,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(engine.phase, Phase::ChangesetReview);
-        assert!(engine.runtime.owns_write_lease());
+        assert!(engine.runtime.owns_write_registration());
         assert_eq!(
             engine.journal_store.entry_count(request_id),
             1,
             "only the undecided item remains live"
         );
-
         engine
             .changeset_decision(ipc::ChangesetDecisionRequest {
                 decision: ipc::Decision::Accept,
@@ -4439,11 +4397,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(engine.phase, Phase::Idle);
-        assert!(!engine.runtime.owns_write_lease());
+        assert!(!engine.runtime.owns_write_registration());
     }
 
     #[tokio::test]
-    async fn reject_restores_session_then_grants_next_writer_without_touching_canonical() {
+    async fn reject_restores_one_session_while_another_writer_remains_active() {
         let services = crate::tool_exec::ToolServices::for_tests();
         let runtime_c = services.session("session-c");
         let runtime_e = services.session("session-e");
@@ -4482,7 +4440,7 @@ mod tests {
         sessions.save(&record).unwrap();
         let request_c = "req-c";
         runtime_c.begin_request(request_c, "Sample").unwrap();
-        runtime_c.request_write_lane("C mutation").unwrap();
+        runtime_c.request_write_workspace("C mutation").unwrap();
         runtime_c
             .journal()
             .record(
@@ -4525,14 +4483,11 @@ mod tests {
         engine.phase = Phase::Executing;
         engine.settle_write_lifecycle().unwrap();
         assert_eq!(engine.phase, Phase::ChangesetReview);
-        assert!(engine.runtime.owns_write_lease());
+        assert!(engine.runtime.owns_write_registration());
 
         runtime_e.begin_request("req-e", "Sample").unwrap();
-        let next = runtime_e.request_write_lane("E mutation").unwrap();
-        assert_eq!(
-            next.state(),
-            crate::write_coordinator::TicketState::Waiting(1)
-        );
+        let next = runtime_e.request_write_workspace("E mutation").unwrap();
+        assert_eq!(next.state(), crate::write_coordinator::TicketState::Granted);
 
         engine
             .changeset_decision(ipc::ChangesetDecisionRequest {
@@ -4554,7 +4509,7 @@ mod tests {
         fs::remove_dir_all(dirs.app_data()).ok();
     }
     #[test]
-    fn pending_review_recovery_precedes_new_writer_ticket() {
+    fn pending_review_recovery_coexists_with_new_writer_ticket() {
         let base = unique_temp_dir("pending-review-recovery");
         let dirs = crate::config::DataDirs::from_bases(&base, &base);
         dirs.ensure_dirs().unwrap();
@@ -4573,11 +4528,8 @@ mod tests {
             .request("Sample", "session-next", "req-next")
             .unwrap();
 
-        assert_eq!(writes.owner("Sample").unwrap().request_id, request_id);
-        assert_eq!(
-            next.state(),
-            crate::write_coordinator::TicketState::Waiting(1)
-        );
+        assert!(writes.owns("Sample", &record.meta.id, request_id));
+        assert_eq!(next.state(), crate::write_coordinator::TicketState::Granted);
         fs::remove_dir_all(base).ok();
     }
 
@@ -4615,7 +4567,10 @@ mod tests {
         let mut engine = test_engine(FakeCodexDriver::scripted([]), sink);
         let request_id = "req-rollback-failure";
         engine.runtime.begin_request(request_id, "Sample").unwrap();
-        engine.runtime.request_write_lane("test rollback").unwrap();
+        engine
+            .runtime
+            .request_write_workspace("test rollback")
+            .unwrap();
         engine.current_request_id = Some(request_id.to_string());
         record_file_write_in_memory(&engine.journal_store, request_id, "write-1", 1, "one.eps");
 
@@ -4631,7 +4586,7 @@ mod tests {
             EngineEvent::RollbackResult(ipc::RollbackResultEvent { ok: false, .. })
         )));
         assert_eq!(engine.phase, Phase::ChangesetReview);
-        assert!(engine.runtime.owns_write_lease());
+        assert!(engine.runtime.owns_write_registration());
         assert_eq!(engine.journal_store.entry_count(request_id), 1);
     }
     #[tokio::test]

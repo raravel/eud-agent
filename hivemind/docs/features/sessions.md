@@ -3,11 +3,11 @@
 eud-agent persists named Codex conversations and runs independent sessions concurrently. Each
 session owns its panel store, log, Codex thread/client, cancellation generation, MCP endpoint,
 request/preflight state, working workspace, and immutable event route. Commands within one
-session are serialized; different sessions may overlap read-only turns.
+session are serialized; different sessions may overlap read and write turns.
 
-Only project write transactions are serialized. The FIFO lease begins at declared write intent
-and remains owned through mutation, build, changeset review, and complete accept/reject rollback.
-Review blocks later writers, not read-only conversations.
+Write intent creates a concurrent session registration immediately. Only operations that touch
+shared editor/map/memory/build state and canonical workspace acceptance enter a short per-project
+transaction. A changeset under review does not block another session from editing or building.
 
 ## Durable session records
 
@@ -84,26 +84,23 @@ The backend is authoritative for each session:
 ```text
 idle
 running_read
-waiting_write(queuePosition)
 running_write
 review
 error
 ```
 
-`queuePosition` means only position in the project write queue. A waiting activity also carries
-`blockingSessionId`, the current project write owner. Neither field describes conversation order.
-
 Typical transitions:
 
 ```text
 idle -> running_read -> idle
-running_read -> waiting_write -> running_write
+running_read -> running_write
 running_write -> review -> idle
 running_write -> idle
 ```
 
-Plan review uses `review` presentation but does not own the write lease until approval. A
-changeset review owns the lease. Partial decisions and failed rollback remain `review`.
+Plan review uses `review` presentation before approval. Changeset review keeps only that
+session's write registration and journal; it does not reserve a project-wide execution lane.
+Partial decisions and failed rollback remain `review`.
 
 ## Session workers
 
@@ -127,47 +124,35 @@ inside any conversation worker.
 
 ## Project write coordinator
 
-`ProjectWriteCoordinator` provides:
+`ProjectWriteCoordinator` registers every active request independently:
 
 ```rust
 request(project_id, session_id, request_id) -> WriteTicket
-cancel(request_id)
 release(request_id)
 restore_review(project_id, session_id, request_id)
-owner(project_id) -> Option<WriteOwner>
+owns(project_id, session_id, request_id) -> bool
+transaction(project_id, operation)
 ```
 
-One project has at most one owner. Tickets are ordered when `request_write_lane` or
-`plan_approve` registers intent. Waiting is process state, not a sleeping MCP request. A granted
-ticket automatically resumes the same thread in write mode.
+`request` and `restore_review` grant immediately, including when another request for the same
+project is writing or awaiting review. `transaction` is the only serialized boundary. Mutating
+MCP calls, `build_run`, direct panel writes, and changeset decisions hold it only while their
+shared-state operation settles.
 
-The coordinator releases only after:
-
-- no live journal entry remains;
-- every workspace promotion or rollback completed;
-- build and changeset decision processing settled.
-
-Cancellation removes only a waiting ticket or interrupts only that worker. Journaled active
-writes become review and retain ownership.
-
-If a read turn fails after declaring write intent but before write continuation, the manager
-cancels a waiting ticket or releases an unmutated granted ticket before allowing another request.
-`SessionToolRuntime::begin_request` refuses to overwrite any active ticket. This prevents a
-single session from queueing behind its own stale owner as `쓰기 대기 1`.
-
-At startup, current-project session records are scanned before admitting any writer. A valid
-pending journal is restored as owner before new tickets. Read turns and unfinished tickets are
-not persisted; journaled writes are.
+Cancellation interrupts only that worker. An unmutated registration is released immediately;
+journaled changes remain reviewable. Startup restores every valid pending journal registration,
+so multiple sessions can recover review state for one project without blocking new writers.
 
 ## Session tool/runtime isolation
 
 `ToolServices` shares the journal store, RAG, map rails, analyzer, data dirs, and coordinator.
 Every `SessionToolRuntime` separately owns the live request id, evidence/mutation/action/search/
-build state, pending plan, epScript preflight state, write ticket, and tool execution lock.
+build state, pending plan, epScript preflight state, write registration, source baseline, and
+tool execution lock.
 
 One ephemeral MCP endpoint is created per worker. No global current-request pointer infers the
-caller. Mutating tools and `build_run` require that runtime's exact `(project, session, request)`
-ownership.
+caller. Mutating tools require that runtime's exact `(project, session, request)` registration.
+Each shared-state dispatch runs inside one short project transaction.
 
 ## Workspace isolation
 
@@ -180,14 +165,21 @@ Codex uses:
 `workspaces/.sessions/<project-id>/<session-id>/`
 
 Before every read turn, canonical documents are delta-synced and a coherent session source
-snapshot is refreshed. Read mode makes the whole root read-only. Before a granted write
-continuation, the sync and snapshot run again, Codex is told to re-read targets, and a trusted
-baseline is captured.
+snapshot is refreshed. Read mode makes the whole root read-only. Before write continuation, the
+sync and snapshot run again, Codex is told to re-read targets, and a trusted baseline is captured.
 
-Workspace accept promotes selected bytes to canonical storage under the lease. Promotion and
-trusted metadata update roll back together on failure. Reject restores/discards only the session
-copy. Approved plan snapshots are app-owned canonical files, synced before execution, immutable,
-and preserved after implementation rejection.
+Native session document changes remain isolated until review. Acceptance compares their journal
+baseline with current canonical bytes: unchanged targets promote directly, non-overlapping line
+changes merge automatically, and overlapping changes fail with `ConcurrentWriteConflict` while
+leaving canonical bytes untouched.
+
+Editor file tools use the session's coherent `source/` snapshot as their optimistic baseline.
+`file_write` and `file_edit` three-way merge non-overlapping live changes; `file_edit` first
+applies ordered exact replacements to the request's latest desired content and rejects missing or
+ambiguous matches before mutation. Write/delete/rename/move reject stale overlapping targets.
+Shared tool calls and builds are serialized only for the duration of that call. Reject
+restores/discards only the session workspace copy. Approved plan snapshots remain app-owned,
+immutable, and preserved after implementation rejection.
 
 ## Tauri IPC
 
@@ -204,8 +196,8 @@ All conversation commands include `sessionId`:
 | `session_open` | hydrate/reconnect one persisted worker |
 
 `session_list`, `session_load`, `session_create`, `session_update_log`, `session_rename`, and
-`session_delete` remain outside the project write queue. `memory_save` and `wiki_save` use short
-coordinated project writes.
+`session_delete` do not require write registration. `memory_save` and `wiki_save` use short
+project transactions.
 
 Every conversation event has a required immutable `sessionId`:
 
@@ -222,20 +214,16 @@ Project status, list, memory/wiki snapshots, setup, bootstrap, and RAG warmup re
 before their first chat, then invoked immediately. There is no frontend conversation queue,
 running slot, review owner, or event-owner fallback.
 
-`session_activity` drives explicit ownership labels:
+`session_activity` drives:
 
 - `running_read` -> `분석 중`;
-- `waiting_write` -> `쓰기 대기 N · <blocker> 검토 결정/변경 완료 대기 · 경과 초`;
-- `running_write` -> `변경 중 · 쓰기 권한 획득`;
+- `running_write` -> `변경 중 · 격리 워크스페이스`;
 - `review` -> `검토 필요`.
 
-The transition into `running_write` also appends
-`쓰기 권한을 획득했습니다. 변경을 시작합니다.` to that session log. A user can therefore
-distinguish a legitimate review wait, elapsed waiting, and an actual granted write turn.
-
-Two rows may show activity simultaneously. Review in one row does not disable a ready row.
-Selection only changes the rendered store. Delete/rewind remains disabled for running, waiting,
-and review rows. Waiting cancellation invokes backend `cancel`.
+The transition into `running_write` appends
+`격리 워크스페이스에서 변경을 시작합니다.` to that session log. Two rows may show activity
+simultaneously, and review in one row does not disable another row. Selection only changes the
+rendered store. Delete/rewind remains disabled for running and review rows.
 
 The left sidebar remains 220–420 px, collapses to a 56 px rail, and ellipsizes long names with a
 title. The center and both sidebars keep `min-width: 0`/horizontal clipping so the configured
@@ -243,12 +231,12 @@ title. The center and both sidebars keep `min-width: 0`/horizontal clipping so t
 
 ## Verification
 
-- Rust barrier tests: different-session overlap and same-session serialization.
-- Runtime tests: request/evidence/budget/preflight isolation.
-- Coordinator tests: FIFO, one owner, waiting cancellation, queue-position updates, review
-  retention, and restored-review priority.
-- Workspace tests: stable source snapshots, promotion, rejection invariance, approved plans.
-- Panel integration: overlapping `chat` invokes, simultaneous activities, immutable event
-  routing, and selection independence.
-- Browser mock-Tauri smoke: concurrent read, waiting write, active write, review, and 1280/960 px
-  horizontal-overflow checks.
+- Rust barrier tests: different-session overlap, same-session serialization, concurrent write
+  registration, and per-project operation serialization.
+- Runtime tests: request/evidence/budget/preflight/source-baseline isolation.
+- Workspace tests: independent snapshots, non-overlapping three-way merge, explicit overlapping
+  conflict, rejection invariance, and approved plans.
+- Panel integration: overlapping `chat` invokes, simultaneous write/review activities, immutable
+  event routing, and selection independence.
+- Browser mock-Tauri smoke: concurrent read/write/review and 1280/960 px horizontal-overflow
+  checks.

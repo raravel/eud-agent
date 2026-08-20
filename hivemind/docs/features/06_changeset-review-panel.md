@@ -82,9 +82,11 @@ new writers.
 - **Decision progress (EUD-070)**: while a `changeset_decision` awaits its `rollback_result`, ChangesetView shows a spinner notice (결정 처리 중…) — a rollback replays inverse ops over the 1s-tick file IPC, so the wait is visible, not just silently-disabled buttons.
 - **Answer prominence**: agent answers are the most visible text in the log (foreground Message bubbles, Streamdown-rendered); system/progress/info rows stay muted. (Inverts the original v2 styling where answers were muted.)
 - **Plan review (EUD-074 — user decision 2026-06-05)**: ai-elements **Plan** component; plan markdown renders via Streamdown. The embedded feedback textarea and the [수정요청] button are REMOVED: **the MAIN prompt input is the feedback channel** — during plan_review it stays ENABLED with a guidance placeholder, and a send routes to `plan_feedback{text}` (App routes by phase; the panel stays in plan_review until the next `plan{revision+1}` replaces the card). [승인] on the plan card sends `plan_approve`. `plan_review` is therefore NOT a send-gated busy phase (only `thinking` is).
-  Clicking [승인] immediately collapses the approved revision while its execution turn runs;
-  the accessible Plan trigger can reopen it manually. A later plan revision always opens
-  automatically so new review content is never hidden by the previous revision's state.
+  Plan expansion is UI-only state owned by each `SessionSlot`: switching session tabs preserves a
+  manually collapsed plan, while a genuinely newer revision opens automatically. Clicking [승인]
+  immediately collapses the approved revision while its execution turn runs; the accessible Plan
+  trigger can reopen it manually. Only the plan body scrolls; the approval/guidance row stays
+  outside that scroll region at the review panel's bottom.
 - **New session**: the permanent left `SessionSidebar` creates an unsaved draft tab. Its first
   message calls `session_create`, replaces the draft id with the Rust id, and invokes `chat`
   immediately.
@@ -96,7 +98,9 @@ new writers.
 - **Changeset review**: grouped DAT/file/settings/plugin/main/workspace entries retain the
   project write lease until all decisions complete. Partial decisions and rollback failures keep
   the row in review. A successful complete decision releases the lease and the next writer
-  resumes automatically.
+  resumes automatically. The review header and its collapse trigger stay above the item-list
+  scroll region, and the bulk accept/reject actions stay below it; only changeset items scroll.
+  Expansion is UI-only state owned by each `SessionSlot`.
 - **Workspace explorer / project wiki**: the right project sidebar's Files tab opens the
   viewer-only workspace explorer. `workspace_list` refreshes the EPS source mirror and
   returns durable documents plus `source/`; selecting a file calls confined
@@ -118,13 +122,16 @@ new writers.
 
 ## Verification contract
 
-- App integration tests prove A/B `chat` promises overlap and interleaved events update only the
-  addressed `PanelStore`.
-- Sidebar tests pin `분석 중`, `쓰기 대기 N`, `변경 중`, review, waiting cancellation, splitter
-  keyboard sizing, collapsed rail, and long-name clipping.
+- App integration tests prove A/B `chat` promises overlap, interleaved events update only the
+  addressed `PanelStore`, review does not block another writer, and an acceptance conflict is
+  logged as failure rather than success.
+- Sidebar tests pin `분석 중`, `변경 중`, review, splitter keyboard sizing, collapsed rail, and
+  long-name clipping. App tests also pin plan-collapse preservation across session switches.
+- PlanView/ChangesetView tests pin controlled collapse and the fixed header/footer layout
+  boundaries around their scrollable bodies.
 - Full Vitest, TypeScript, and production build remain required.
-- Mock-Tauri browser smoke observes concurrent read, waiting write, active write, and review rows
-  at 1280 px and 960 px with no horizontal overflow.
+- Mock-Tauri browser smoke observes simultaneous active-write and review rows at 1280 px and
+  960 px with no horizontal overflow.
 
 ## Implementation
 

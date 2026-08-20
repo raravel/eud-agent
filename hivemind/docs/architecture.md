@@ -134,10 +134,11 @@ its own agent state machine, Codex app-server client/event stream, loopback MCP 
 cancellation generation, request/preflight state, and immutable session event sink. A worker
 mutex serializes only that session's commands, so read-only turns in different sessions overlap.
 
-Projects share one `ProjectWriteCoordinator`. It queues declared write transactions FIFO and
-holds the lease through mutation, build, changeset review, and complete accept/reject. Review
-therefore blocks later writers without blocking unrelated read turns. Pending journals restore
-their review lease before new writers after restart.
+Projects share one `ProjectWriteCoordinator`, but write registration is concurrent: declaring
+write intent never waits behind another session's mutation or review. The coordinator keeps a
+short project transaction mutex only around each shared editor/map/memory/build operation and
+canonical accept/reject step. Session-local reasoning, workspace editing, and review remain
+outside that critical section.
 
 Each project identity hashes to a canonical accepted root:
 
@@ -153,9 +154,10 @@ The read sandbox makes the root read-only. Before write mode, the root is rebase
 must be re-read, a trusted baseline is captured outside the Codex cwd, and the write sandbox
 enables documents while keeping `source/**` read-only.
 
-Workspace accept promotes selected session bytes to the canonical root under the lease and
-records trusted revisions. Promotion and metadata persistence roll back together on failure.
-Reject restores only the session root, so canonical accepted bytes remain unchanged.
+Workspace accept compares each journal baseline with current canonical bytes. Unchanged targets
+promote directly, non-overlapping text edits use a three-way merge, and overlapping edits return
+an explicit `ConcurrentWriteConflict` without changing canonical bytes. Promotion and trusted
+metadata persistence still roll back together on failure. Reject restores only the session root.
 
 `specs/index.md` remains the canonical project-wiki entry point. `plan_approve` writes the exact
 approved Markdown to canonical `plans/<request-id>.md` only after lease grant and before the

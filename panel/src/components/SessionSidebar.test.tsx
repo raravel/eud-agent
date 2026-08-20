@@ -15,11 +15,10 @@ function props(overrides: Partial<SessionSidebarProps> = {}): SessionSidebarProp
         persisted: true,
       },
       {
-        id: "queued",
+        id: "writing",
         name: "트리거 수정",
         updatedAt: 9,
-        activity: "waiting_write",
-        queuePosition: 2,
+        activity: "running_write",
         persisted: true,
       },
       {
@@ -30,14 +29,13 @@ function props(overrides: Partial<SessionSidebarProps> = {}): SessionSidebarProp
         persisted: true,
       },
     ],
-    selectedId: "queued",
+    selectedId: "writing",
     collapsed: false,
     onCollapsedChange: vi.fn(),
     onNew: vi.fn(),
     onSelect: vi.fn(),
     onRename: vi.fn(),
     onDelete: vi.fn(),
-    onCancelQueued: vi.fn(),
     ...overrides,
   };
 }
@@ -47,26 +45,23 @@ beforeEach(() => {
 });
 
 describe("SessionSidebar", () => {
-  it("distinguishes selected, running, queued, and review states", () => {
+  it("distinguishes selected, running, writing, and review states", () => {
     render(<SessionSidebar {...props()} />);
 
     expect(
-      screen.getByRole("button", { name: "트리거 수정, 쓰기 대기 2" }),
+      screen.getByRole("button", { name: "트리거 수정, 변경 중" }),
     ).toHaveAttribute("aria-current", "page");
     expect(screen.getByText("분석 중")).toBeInTheDocument();
-    expect(screen.getByText("쓰기 대기 2")).toBeInTheDocument();
+    expect(screen.getByText("변경 중")).toBeInTheDocument();
     expect(screen.getByText("검토 필요")).toBeInTheDocument();
   });
 
-  it("selects a row and cancels only its queued request", () => {
+  it("selects a running row", () => {
     const handlers = props();
     render(<SessionSidebar {...handlers} />);
 
     fireEvent.click(screen.getByRole("button", { name: "유닛 밸런스, 분석 중" }));
     expect(handlers.onSelect).toHaveBeenCalledWith("running");
-
-    fireEvent.click(screen.getByRole("button", { name: "트리거 수정 대기 취소" }));
-    expect(handlers.onCancelQueued).toHaveBeenCalledWith("queued");
   });
 
   it("keeps the new-session action available when collapsed", () => {

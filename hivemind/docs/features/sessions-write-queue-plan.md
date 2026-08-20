@@ -1,6 +1,8 @@
 # Concurrent Sessions with a Project Write Queue — Implementation Plan
 
-Status: implemented (2026-08-20)
+Status: superseded (2026-08-20). The FIFO transaction lease below is retained as historical
+context; `features/sessions.md` now defines concurrent write registration, per-operation project
+transactions, and conflict-aware acceptance.
 
 ## Goal
 

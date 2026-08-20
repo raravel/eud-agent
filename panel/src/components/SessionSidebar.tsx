@@ -4,13 +4,11 @@ import {
   CheckCircle2,
   ChevronLeft,
   ChevronRight,
-  Clock3,
   LoaderCircle,
   Pencil,
   Plus,
   Search,
   Trash2,
-  X,
 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
@@ -20,7 +18,6 @@ import { cn } from "@/lib/utils";
 export type SessionActivity =
   | "idle"
   | "running_read"
-  | "waiting_write"
   | "running_write"
   | "review"
   | "error";
@@ -30,8 +27,6 @@ export interface SessionSidebarRow {
   name: string;
   updatedAt: number;
   activity: SessionActivity;
-  queuePosition?: number;
-  activityDetail?: string;
   persisted: boolean;
 }
 
@@ -45,7 +40,6 @@ export interface SessionSidebarProps {
   onSelect(id: string): void;
   onRename(id: string, name: string): void;
   onDelete(id: string): void;
-  onCancelQueued(id: string): void;
 }
 
 const WIDTH_KEY = "eud.session-sidebar.width";
@@ -66,12 +60,6 @@ function readStoredWidth(): number {
 
 function activityLabel(row: SessionSidebarRow): string {
   switch (row.activity) {
-    case "waiting_write": {
-      const waiting = row.queuePosition
-        ? `쓰기 대기 ${row.queuePosition}`
-        : "쓰기 대기";
-      return row.activityDetail ? `${waiting} · ${row.activityDetail}` : waiting;
-    }
     case "running_read":
       return "분석 중";
     case "running_write":
@@ -87,8 +75,6 @@ function activityLabel(row: SessionSidebarRow): string {
 
 function ActivityIcon({ activity }: { activity: SessionActivity }) {
   switch (activity) {
-    case "waiting_write":
-      return <Clock3 className="size-3.5 text-sky-400" aria-hidden="true" />;
     case "running_read":
     case "running_write":
       return (
@@ -128,7 +114,6 @@ export function SessionSidebar({
   onSelect,
   onRename,
   onDelete,
-  onCancelQueued,
 }: SessionSidebarProps) {
   const [query, setQuery] = useState("");
   const [width, setWidth] = useState(readStoredWidth);
@@ -157,7 +142,6 @@ export function SessionSidebar({
   const handleDelete = (row: SessionSidebarRow) => {
     if (
       row.activity === "running_read" ||
-      row.activity === "waiting_write" ||
       row.activity === "running_write" ||
       row.activity === "review"
     )
@@ -327,7 +311,6 @@ export function SessionSidebar({
                                 (row.activity === "running_read" ||
                                   row.activity === "running_write") &&
                                   "text-primary",
-                                row.activity === "waiting_write" && "text-sky-400",
                                 row.activity === "review" && "text-amber-400",
                                 row.activity === "error" && "text-destructive",
                               )}
@@ -345,20 +328,8 @@ export function SessionSidebar({
                     )}
                   </button>
 
-                  {!collapsed && row.activity === "waiting_write" && (
-                    <Button
-                      type="button"
-                      size="icon-sm"
-                      variant="ghost"
-                      className="absolute right-1.5 top-1.5 size-8"
-                      aria-label={`${row.name} 대기 취소`}
-                      onClick={() => onCancelQueued(row.id)}
-                    >
-                      <X className="size-3.5" aria-hidden="true" />
-                    </Button>
-                  )}
 
-                  {!collapsed && row.activity !== "waiting_write" && (
+                  {!collapsed && (
                     <>
                       <Button
                         type="button"

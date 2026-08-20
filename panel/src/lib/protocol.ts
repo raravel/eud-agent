@@ -181,11 +181,12 @@ export interface ChangesetMessage extends SessionScopedMessage {
   items: ChangesetItem[];
 }
 
-/** `rollback_result {ids, ok}` - outcome of a changeset_decision. */
+/** `rollback_result {ids, ok, error?}` - outcome of a changeset_decision. */
 export interface RollbackResultMessage extends SessionScopedMessage {
   type: "rollback_result";
   ids: string[];
   ok: boolean;
+  error?: string;
 }
 
 /** `progress {stage, detail?, pct?}` - render as a conversation entry. */
@@ -210,7 +211,6 @@ export interface ErrorMessage extends SessionScopedMessage {
 export type BackendSessionActivity =
   | "idle"
   | "running_read"
-  | "waiting_write"
   | "running_write"
   | "review"
   | "error";
@@ -219,8 +219,6 @@ export type BackendSessionActivity =
 export interface SessionActivityMessage extends SessionScopedMessage {
   type: "session_activity";
   activity: BackendSessionActivity;
-  queuePosition?: number;
-  blockingSessionId?: string;
 }
 
 /** `status {compiling, project}` - editor state for the header. */
@@ -617,7 +615,7 @@ export function isChangesetMessage(value: unknown): value is ChangesetMessage {
   );
 }
 
-/** True if `value` is a `rollback_result` message (ids array + ok bool). */
+/** True if `value` is a `rollback_result` message. */
 export function isRollbackResultMessage(
   value: unknown,
 ): value is RollbackResultMessage {
@@ -626,7 +624,8 @@ export function isRollbackResultMessage(
     value.type === "rollback_result" &&
     hasSessionId(value) &&
     Array.isArray(value.ids) &&
-    typeof value.ok === "boolean"
+    typeof value.ok === "boolean" &&
+    (value.error === undefined || typeof value.error === "string")
   );
 }
 
@@ -656,19 +655,9 @@ export function isSessionActivityMessage(
     isObject(value) &&
     value.type === "session_activity" &&
     hasSessionId(value) &&
-    [
-      "idle",
-      "running_read",
-      "waiting_write",
-      "running_write",
-      "review",
-      "error",
-    ].includes(String(value.activity)) &&
-    (value.queuePosition === undefined ||
-      (typeof value.queuePosition === "number" && value.queuePosition > 0)) &&
-    (value.blockingSessionId === undefined ||
-      (typeof value.blockingSessionId === "string" &&
-        value.blockingSessionId.length > 0))
+    ["idle", "running_read", "running_write", "review", "error"].includes(
+      String(value.activity),
+    )
   );
 }
 
@@ -698,7 +687,7 @@ export function isMemoryMessage(value: unknown): value is MemoryMessage {
     isObject(value) &&
     value.type === "memory" &&
     typeof value.project === "string" &&
-    isMemoryFiles(value.files)diff --git a/src-tauri/src/ipc.rs b/src-tauri/src/ipc.rs
+    isMemoryFiles(value.files)
   );
 }
 

@@ -342,6 +342,9 @@ pub struct RollbackResultEvent {
     pub ids: Vec<String>,
     /// True when the requested rollback/decision succeeded.
     pub ok: bool,
+    /// Conflict or rollback failure detail when `ok` is false.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 /// `progress` event payload.
@@ -1313,6 +1316,7 @@ mod tests {
         let rollback = ipc::RollbackResultEvent {
             ids: vec!["a".to_string(), "b".to_string()],
             ok: true,
+            error: None,
         };
         assert_json(
             &rollback,

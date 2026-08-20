@@ -159,26 +159,57 @@ describe("App concurrent sessions", () => {
       });
       emit("session_activity", {
         sessionId: "session-b",
-        activity: "waiting_write",
-        queuePosition: 1,
+        activity: "running_write",
       });
     });
 
     expect(screen.getByRole("button", { name: "Session A, 분석 중" })).toBeInTheDocument();
-    const waitingRow = screen.getByRole("button", {
-      name: /Session B, 쓰기 대기 1 · 앞 작업 완료 대기 · \d+초/,
+    const writingRow = screen.getByRole("button", {
+      name: "Session B, 변경 중",
     });
-    expect(waitingRow).toBeInTheDocument();
+    expect(writingRow).toBeInTheDocument();
     expect(screen.queryByText("B-only answer")).not.toBeInTheDocument();
 
-    fireEvent.click(waitingRow);
+    fireEvent.click(writingRow);
     expect(await screen.findByText("B-only answer")).toBeInTheDocument();
     expect(
       tauri.invoke.mock.calls.filter(([command]) => command === "session_open"),
     ).toHaveLength(0);
   });
 
-  it("shows the blocking review, elapsed wait, and explicit write grant transition", async () => {
+  it("preserves a collapsed plan after switching session tabs", async () => {
+    render(<App />);
+    await screen.findByRole("button", { name: "Session A, 유휴" });
+    await waitFor(() => expect(tauri.listeners.has("plan")).toBe(true));
+
+    act(() => {
+      emit("plan", {
+        sessionId: "session-a",
+        markdown: "# 계획\n\n세션 전환 뒤에도 접힌 상태여야 합니다.",
+        revision: 1,
+      });
+    });
+    expect(
+      await screen.findByText("세션 전환 뒤에도 접힌 상태여야 합니다."),
+    ).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "계획안 접기" }));
+    expect(
+      screen.queryByText("세션 전환 뒤에도 접힌 상태여야 합니다."),
+    ).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Session B, 유휴" }));
+    fireEvent.click(screen.getByRole("button", { name: "Session A, 유휴" }));
+
+    expect(
+      screen.queryByText("세션 전환 뒤에도 접힌 상태여야 합니다."),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "계획안 펼치기" }),
+    ).toBeInTheDocument();
+  });
+
+  it("keeps another session writable while the first session is in review", async () => {
     render(<App />);
     await screen.findByRole("button", { name: "Session A, 유휴" });
     await waitFor(() => expect(tauri.listeners.has("session_activity")).toBe(true));
@@ -190,27 +221,66 @@ describe("App concurrent sessions", () => {
       });
       emit("session_activity", {
         sessionId: "session-b",
-        activity: "waiting_write",
-        queuePosition: 1,
-        blockingSessionId: "session-a",
-      });
-    });
-
-    expect(
-      screen.getByRole("button", {
-        name: /Session B, 쓰기 대기 1 · Session A 검토 결정 대기 · \d+초/,
-      }),
-    ).toBeInTheDocument();
-
-    act(() => {
-      emit("session_activity", {
-        sessionId: "session-b",
         activity: "running_write",
       });
     });
-    fireEvent.click(screen.getByRole("button", { name: "Session B, 변경 중" }));
+
     expect(
-      await screen.findByText("쓰기 권한을 획득했습니다. 변경을 시작합니다."),
+      screen.getByRole("button", { name: "Session A, 검토 필요" }),
+    ).toBeInTheDocument();
+    const writingRow = screen.getByRole("button", {
+      name: "Session B, 변경 중",
+    });
+    expect(writingRow).toBeInTheDocument();
+
+    fireEvent.click(writingRow);
+    expect(
+      await screen.findByText("격리 워크스페이스에서 변경을 시작합니다."),
+    ).toBeInTheDocument();
+  });
+
+  it("surfaces an accept conflict instead of logging success", async () => {
+    render(<App />);
+    await screen.findByRole("button", { name: "Session A, 유휴" });
+    await waitFor(() => expect(tauri.listeners.has("changeset")).toBe(true));
+
+    act(() => {
+      emit("changeset", {
+        sessionId: "session-a",
+        request_id: "req-conflict",
+        items: [
+          {
+            category: "file",
+            id: "workspace-1",
+            seq: 1,
+            path: "specs/game.md",
+            diff: "@@ -1 +1 @@\n-old\n+new",
+          },
+        ],
+      });
+    });
+    fireEvent.click(await screen.findByRole("button", { name: "적용 유지" }));
+    await waitFor(() =>
+      expect(tauri.invoke).toHaveBeenCalledWith("changeset_decision", {
+        sessionId: "session-a",
+        decision: "accept",
+        ids: ["workspace-1"],
+      }),
+    );
+
+    act(() => {
+      emit("rollback_result", {
+        sessionId: "session-a",
+        ids: ["workspace-1"],
+        ok: false,
+        error: "ConcurrentWriteConflict: `specs/game.md` changed",
+      });
+    });
+
+    expect(
+      await screen.findByText(
+        "적용 실패: ConcurrentWriteConflict: `specs/game.md` changed",
+      ),
     ).toBeInTheDocument();
   });
 });

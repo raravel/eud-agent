@@ -142,11 +142,10 @@ interface SessionSlot {
   store: PanelStore;
   persisted: boolean;
   activity: SessionActivity;
-  queuePosition?: number;
-  blockingSessionId?: string;
-  activitySince: number;
   unsubscribe?: () => void;
   saveTimer?: number;
+  planOpen: boolean;
+  changesetOpen: boolean;
 }
 
 
@@ -187,31 +186,11 @@ function syncProjectState(target: PanelStore, source: PanelStore): void {
   }
 }
 
-function waitingActivityDetail(
-  slot: SessionSlot,
-  sessions: Map<string, SessionSlot>,
-  now: number,
-): string {
-  const blocker = slot.blockingSessionId
-    ? sessions.get(slot.blockingSessionId)
-    : undefined;
-  const reason =
-    blocker?.activity === "review"
-      ? `${blocker.meta.name} 검토 결정 대기`
-      : blocker?.activity === "running_write"
-        ? `${blocker.meta.name} 변경 완료 대기`
-        : blocker
-          ? `${blocker.meta.name} 쓰기 권한 해제 대기`
-          : "앞 작업 완료 대기";
-  const seconds = Math.max(0, Math.floor((now - slot.activitySince) / 1000));
-  return `${reason} · ${seconds}초`;
-}
 
 export default function App() {
   const projectStore = useMemo(() => createPanelStore(), []);
   const sessionsRef = useRef(new Map<string, SessionSlot>());
   const [sessionRevision, setSessionRevision] = useState(0);
-  const [activityClock, setActivityClock] = useState(() => Date.now());
   const toastedLogBySessionRef = useRef(new Map<string, number>());
   const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null);
   const selectedSessionIdRef = useRef<string | null>(null);
@@ -336,7 +315,8 @@ export default function App() {
         store: sessionStore,
         persisted: true,
         activity: record.pendingRequestIds.length > 0 ? "review" : "idle",
-        activitySince: Date.now(),
+        planOpen: true,
+        changesetOpen: true,
       };
       sessionsRef.current.set(slot.id, slot);
       attachSlot(slot);
@@ -360,7 +340,8 @@ export default function App() {
       store: sessionStore,
       persisted: false,
       activity: "idle",
-      activitySince: Date.now(),
+      planOpen: true,
+      changesetOpen: true,
     };
     sessionsRef.current.set(slot.id, slot);
     attachSlot(slot);
@@ -374,15 +355,6 @@ export default function App() {
     selectedSessionIdRef.current = selectedSessionId;
   }, [selectedSessionId]);
 
-  useEffect(() => {
-    const hasWaitingWriter = Array.from(sessionsRef.current.values()).some(
-      (slot) => slot.activity === "waiting_write",
-    );
-    if (!hasWaitingWriter) return;
-    setActivityClock(Date.now());
-    const id = window.setInterval(() => setActivityClock(Date.now()), 1000);
-    return () => window.clearInterval(id);
-  }, [sessionRevision]);
 
   useEffect(
     () => () => {
@@ -562,9 +534,15 @@ export default function App() {
           sessionStore()?.answerReceived(msg.text);
           break;
         case "plan": {
-          const target = sessionStore();
-          if (!target) break;
+          const targetSlot = scopedId
+            ? sessionsRef.current.get(scopedId)
+            : undefined;
+          if (!targetSlot) break;
+          const target = targetSlot.store;
           const prior = target.getState().plan;
+          if (prior === null || prior.revision !== msg.revision) {
+            targetSlot.planOpen = true;
+          }
           if (prior !== null && prior.revision !== msg.revision) {
             target.log("agent", `계획안(rev ${prior.revision})이 갱신되었습니다.`);
           }
@@ -573,8 +551,15 @@ export default function App() {
           break;
         }
         case "changeset": {
-          const target = sessionStore();
-          if (!target) break;
+          const targetSlot = scopedId
+            ? sessionsRef.current.get(scopedId)
+            : undefined;
+          if (!targetSlot) break;
+          const target = targetSlot.store;
+          const prior = target.getState().changeset;
+          if (prior === null || prior.request_id !== msg.request_id) {
+            targetSlot.changesetOpen = true;
+          }
           target.changesetReceived(msg.request_id, msg.items);
           target.log("agent", `변경사항 ${msg.items.length}건을 검토하세요.`);
           break;
@@ -585,12 +570,13 @@ export default function App() {
           const decision = target.getState().pendingDecision?.decision;
           const count = msg.ids.length;
           target.rollbackResult(msg.ids, msg.ok);
-          if (decision === "accept") {
+          if (!msg.ok) {
+            const label = decision === "accept" ? "적용 실패" : "되돌리기 실패";
+            target.log("warn", msg.error ? `${label}: ${msg.error}` : `${label} (${count}건)`);
+          } else if (decision === "accept") {
             target.log("ok", count > 0 ? `적용 유지 (${count}건)` : "적용 유지");
-          } else if (msg.ok) {
-            target.log("ok", `되돌림 (${count}건)`);
           } else {
-            target.log("warn", `되돌리기 일부 실패 (${count}건)`);
+            target.log("ok", `되돌림 (${count}건)`);
           }
           break;
         }
@@ -605,30 +591,9 @@ export default function App() {
           const slot = sessionsRef.current.get(msg.sessionId);
           if (!slot) break;
           const previous = slot.activity;
-          if (previous !== msg.activity) slot.activitySince = Date.now();
           slot.activity = msg.activity;
-          slot.queuePosition =
-            msg.activity === "waiting_write" ? msg.queuePosition : undefined;
-          slot.blockingSessionId =
-            msg.activity === "waiting_write"
-              ? msg.blockingSessionId
-              : undefined;
-          if (previous !== msg.activity && msg.activity === "waiting_write") {
-            const blockerName = msg.blockingSessionId
-              ? sessionsRef.current.get(msg.blockingSessionId)?.meta.name
-              : undefined;
-            slot.store.log(
-              "info",
-              blockerName
-                ? `쓰기 권한 대기 시작 · ${blockerName} 작업 완료 대기`
-                : "쓰기 권한 대기 시작",
-            );
-          }
           if (previous !== msg.activity && msg.activity === "running_write") {
-            slot.store.log(
-              "ok",
-              "쓰기 권한을 획득했습니다. 변경을 시작합니다.",
-            );
+            slot.store.log("ok", "격리 워크스페이스에서 변경을 시작합니다.");
           }
           bumpSessions();
           break;
@@ -895,7 +860,6 @@ export default function App() {
       slot &&
       (slot.store.getState().phase === "thinking" ||
         slot.activity === "running_read" ||
-        slot.activity === "waiting_write" ||
         slot.activity === "running_write");
     if (!slot || !cancellable || messageActionBusyRef.current) {
       return;
@@ -1017,7 +981,6 @@ export default function App() {
       if (
         !slot ||
         slot.activity === "running_read" ||
-        slot.activity === "waiting_write" ||
         slot.activity === "running_write" ||
         slot.activity === "review"
       )
@@ -1052,20 +1015,6 @@ export default function App() {
     [bumpSessions, createDraftSlot],
   );
 
-  const handleCancelQueued = useCallback((id: string) => {
-    const slot = sessionsRef.current.get(id);
-    if (!slot || slot.activity !== "waiting_write") return;
-    void clientRef.current
-      ?.send({ type: "cancel", sessionId: slot.id })
-      .then((sent) => {
-        if (sent) {
-          slot.store.cancelSent();
-          slot.store.log("info", "쓰기 대기를 취소했습니다.");
-        } else {
-          slot.store.log("error", "쓰기 대기를 취소하지 못했습니다.");
-        }
-      });
-  }, []);
 
   // Retry re-runs the backend download command (it re-fetches the release
   // manifest and skips already-verified assets), replacing the old full-reload
@@ -1180,6 +1129,26 @@ export default function App() {
 
   // Stop any in-flight OAuth poll on unmount.
   useEffect(() => stopCodexPoll, [stopCodexPoll]);
+
+  const handlePlanOpenChange = useCallback(
+    (open: boolean) => {
+      const slot = selectedSlot;
+      if (!slot || slot.planOpen === open) return;
+      slot.planOpen = open;
+      bumpSessions();
+    },
+    [bumpSessions, selectedSlot],
+  );
+
+  const handleChangesetOpenChange = useCallback(
+    (open: boolean) => {
+      const slot = selectedSlot;
+      if (!slot || slot.changesetOpen === open) return;
+      slot.changesetOpen = open;
+      bumpSessions();
+    },
+    [bumpSessions, selectedSlot],
+  );
 
   const handlePlanApprove = useCallback(async () => {
     const slot = selectedSlot;
@@ -1393,32 +1362,14 @@ export default function App() {
           name: slot.meta.name,
           updatedAt: slot.meta.updatedAt,
           activity: slot.activity,
-          queuePosition: slot.queuePosition,
-          activityDetail:
-            slot.activity === "waiting_write"
-              ? waitingActivityDetail(
-                  slot,
-                  sessionsRef.current,
-                  activityClock,
-                )
-              : undefined,
           persisted: slot.persisted,
         })),
-    [activityClock, sessionRevision],
+    [sessionRevision],
   );
   const selectedActionBusy =
     messageActionBusy ||
-    selectedSlot?.activity === "waiting_write" ||
     selectedSlot?.activity === "running_write" ||
     state.phase === "changeset_review";
-  const selectedWaitingDetail =
-    selectedSlot?.activity === "waiting_write"
-      ? waitingActivityDetail(
-          selectedSlot,
-          sessionsRef.current,
-          activityClock,
-        )
-      : null;
 
   if (setup?.setup_required || bootstrap.active) {
     return (
@@ -1454,7 +1405,6 @@ export default function App() {
         onSelect={handleSessionSelect}
         onRename={handleSessionRename}
         onDelete={handleSessionDelete}
-        onCancelQueued={handleCancelQueued}
       />
 
       <main className="flex min-w-[32rem] flex-1 flex-col overflow-hidden">
@@ -1490,20 +1440,11 @@ export default function App() {
             <span className="min-w-0 flex-1 truncate font-medium text-foreground">
               {selectedSlot.meta.name}
             </span>
-            {selectedSlot.activity === "waiting_write" && (
-              <span
-                className="min-w-0 max-w-[65%] truncate text-right text-sky-400"
-                title={`쓰기 대기 ${selectedSlot.queuePosition ?? ""} · ${selectedWaitingDetail ?? "앞 작업 완료 대기"}`}
-              >
-                쓰기 대기 {selectedSlot.queuePosition ?? ""} ·{" "}
-                {selectedWaitingDetail ?? "앞 작업 완료 대기"}
-              </span>
-            )}
             {selectedSlot.activity === "running_read" && (
               <span className="text-primary">분석 중</span>
             )}
             {selectedSlot.activity === "running_write" && (
-              <span className="text-primary">변경 중 · 쓰기 권한 획득</span>
+              <span className="text-primary">변경 중 · 격리 워크스페이스</span>
             )}
             {selectedSlot.activity === "review" && (
               <span className="text-amber-400">검토 필요</span>
@@ -1518,11 +1459,7 @@ export default function App() {
           turn={state.turn}
           ragLoading={state.rag === "loading"}
           onSuggestion={handleSuggestion}
-          suggestionsEnabled={
-            state.canSend &&
-            !selectedActionBusy &&
-            selectedSlot?.activity !== "waiting_write"
-          }
+          suggestionsEnabled={state.canSend && !selectedActionBusy}
           onEditMessage={handleEditMessage}
           editDisabled={
             messageActionBusy ||
@@ -1536,6 +1473,8 @@ export default function App() {
           (state.phase === "plan_review" || state.phase === "thinking") && (
             <PlanView
               plan={state.plan}
+              open={selectedSlot?.planOpen ?? true}
+              onOpenChange={handlePlanOpenChange}
               pending={state.phase !== "plan_review"}
               onApprove={handlePlanApprove}
             />
@@ -1544,6 +1483,8 @@ export default function App() {
         {state.changeset && state.phase === "changeset_review" && (
           <ChangesetView
             changeset={state.changeset}
+            open={selectedSlot?.changesetOpen ?? true}
+            onOpenChange={handleChangesetOpenChange}
             pending={state.pendingDecision !== null}
             onDecide={handleDecide}
           />

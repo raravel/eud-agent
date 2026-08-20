@@ -20,46 +20,50 @@ import {
 } from "@/components/ai-elements/plan";
 import { Response } from "@/components/ai-elements/response";
 import { Button } from "@/components/ui/button";
-import { useEffect, useState } from "react";
 import type { PlanState } from "@/state/store";
 
 export interface PlanViewProps {
   /** The active plan card (markdown + revision). */
   plan: PlanState;
+  /** Whether the plan body is expanded for the selected session. */
+  open: boolean;
+  /** Persist expansion changes in the selected session slot. */
+  onOpenChange(open: boolean): void;
   /** A turn is in flight (approve already sent / feedback running) — disable. */
   pending: boolean;
   /** Send plan_approve{}; the App invokes the command + store action. */
   onApprove(): void;
 }
 
-export function PlanView({ plan, pending, onApprove }: PlanViewProps) {
-  const [open, setOpen] = useState(true);
-
-  // A revised plan is new review content, so it opens even if the previously
-  // approved revision was collapsed. Approval itself collapses immediately;
-  // the trigger remains available for manual re-open while execution runs.
-  useEffect(() => {
-    setOpen(true);
-  }, [plan.revision]);
-
+export function PlanView({
+  plan,
+  open,
+  onOpenChange,
+  pending,
+  onApprove,
+}: PlanViewProps) {
   const handleApprove = () => {
-    setOpen(false);
+    onOpenChange(false);
     onApprove();
   };
 
   return (
     <section
       aria-label="계획 검토"
-      className="flex max-h-[40vh] flex-col gap-3 overflow-y-auto border-t border-border p-4"
+      className="flex max-h-[40vh] min-h-0 flex-col gap-3 overflow-hidden border-t border-border p-4"
     >
-      <Plan open={open} onOpenChange={setOpen} className="gap-3 py-3">
-        <PlanHeader className="px-3">
+      <Plan
+        open={open}
+        onOpenChange={onOpenChange}
+        className="min-h-0 flex-1 gap-3 overflow-hidden py-3"
+      >
+        <PlanHeader className="shrink-0 px-3">
           <PlanTitle className="text-sm">{`계획안 (rev ${plan.revision})`}</PlanTitle>
           <PlanAction>
             <PlanTrigger aria-label={open ? "계획안 접기" : "계획안 펼치기"} />
           </PlanAction>
         </PlanHeader>
-        <PlanContent className="px-3 text-sm">
+        <PlanContent className="min-h-0 flex-1 overflow-y-auto px-3 text-sm">
           {/* Key on the revision: a new plan is a FULL replacement (not a
               streaming append), so remount Streamdown to avoid stale cached
               blocks from the previous revision. */}
@@ -67,7 +71,10 @@ export function PlanView({ plan, pending, onApprove }: PlanViewProps) {
         </PlanContent>
       </Plan>
 
-      <div className="flex items-center justify-between gap-2">
+      <div
+        data-testid="plan-actions"
+        className="flex shrink-0 items-center justify-between gap-2 border-t border-border bg-background pt-3"
+      >
         <span className="text-xs text-muted-foreground">
           수정하려면 아래 입력창에 피드백을 입력하세요.
         </span>

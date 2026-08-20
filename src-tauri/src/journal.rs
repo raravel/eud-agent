@@ -451,7 +451,7 @@ impl JournalStore {
                     // inverse ops above; drop them from the journal so the rebuilt
                     // changeset and a later accept-all never resurrect a rolled-back
                     // value into the wiki ledger. Still-undecided entries remain live
-                    // and retain the project write lease.
+                    // and retain their session write registration until review settles.
                     let rejected_ids: Vec<String> =
                         rejected.iter().map(|entry| entry.id.clone()).collect();
                     self.forget_entries(request_id, &rejected_ids)?;

@@ -6,10 +6,10 @@
 //! write tickets cannot overwrite another session.
 //!
 //! [`SessionToolRuntime::execute`] is the single tool entry point. It verifies
-//! write-lease ownership before admitting mutations, applies the existing
-//! validation and safety gates, dispatches bridge/RAG/mapsafe operations, and
-//! journals every project write for changeset review.
+//! concurrent write registration, serializes each shared-state operation, applies
+//! validation and safety gates, and journals every project write for review.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -262,7 +262,7 @@ impl SessionToolRuntime {
         }
     }
 
-    pub fn request_write_lane(
+    pub fn request_write_workspace(
         &self,
         reason: impl Into<String>,
     ) -> Result<crate::write_coordinator::WriteTicket, String> {
@@ -309,7 +309,7 @@ impl SessionToolRuntime {
         self.write_state.lock().reason.clone()
     }
 
-    pub fn owns_write_lease(&self) -> bool {
+    pub fn owns_write_registration(&self) -> bool {
         let Some(ticket) = self.write_ticket() else {
             return false;
         };
@@ -320,7 +320,7 @@ impl SessionToolRuntime {
         )
     }
 
-    pub fn release_write_lease(&self) -> Result<bool, String> {
+    pub fn release_write_registration(&self) -> Result<bool, String> {
         let ticket = self.write_state.lock().ticket.clone();
         let Some(ticket) = ticket else {
             return Ok(false);
@@ -332,27 +332,9 @@ impl SessionToolRuntime {
         Ok(released)
     }
 
-    pub fn cancel_waiting_write(&self) -> Result<bool, String> {
-        let ticket = self.write_state.lock().ticket.clone();
-        let Some(ticket) = ticket else {
-            return Ok(false);
-        };
-        if !matches!(
-            ticket.state(),
-            crate::write_coordinator::TicketState::Waiting(_)
-        ) {
-            return Ok(false);
-        }
-        let cancelled = self.services.writes.cancel(ticket.request_id())?;
-        if cancelled {
-            *self.write_state.lock() = SessionWriteState::default();
-        }
-        Ok(cancelled)
-    }
-
     /// Release a read turn's write intent after the turn itself failed. Read mode
     /// cannot mutate the session workspace or call mutating MCP tools, so a
-    /// journal entry here is an invariant violation and must retain the lease.
+    /// journal entry here is an invariant violation and must retain registration.
     pub fn abort_unmutated_write_intent(&self) -> Result<(), String> {
         let Some(ticket) = self.write_ticket() else {
             return Ok(());
@@ -365,14 +347,7 @@ impl SessionToolRuntime {
                 ));
             }
         }
-        if self.owns_write_lease() && self.release_write_lease()? {
-            return Ok(());
-        }
-        if self.services.writes.cancel(ticket.request_id())? {
-            *self.write_state.lock() = SessionWriteState::default();
-            return Ok(());
-        }
-        if self.owns_write_lease() && self.release_write_lease()? {
+        if self.release_write_registration()? {
             return Ok(());
         }
         if ticket.state() == crate::write_coordinator::TicketState::Cancelled {
@@ -385,14 +360,17 @@ impl SessionToolRuntime {
         ))
     }
 
-    pub fn emit_activity(
-        &self,
-        activity: crate::write_coordinator::SessionActivity,
-        queue_position: Option<usize>,
-    ) {
+    pub fn emit_activity(&self, activity: crate::write_coordinator::SessionActivity) {
         self.services
             .writes
-            .emit_activity(self.session_id.clone(), activity, queue_position);
+            .emit_activity(self.session_id.clone(), activity);
+    }
+
+    pub fn project_transaction<T>(&self, operation: impl FnOnce() -> T) -> Result<T, String> {
+        let project_id = self
+            .current_project_id()
+            .ok_or_else(|| "no agent project is open".to_string())?;
+        self.services.writes.transaction(&project_id, operation)
     }
 
     pub fn execute(&self, tool: &str, args: &Value) -> Result<Value, String> {
@@ -401,10 +379,10 @@ impl SessionToolRuntime {
             "no agent request is open; tool calls are only valid during a turn".to_string()
         })?;
 
-        if tools::is_mutating_tool(tool) && !self.owns_write_lease() {
+        if tools::is_mutating_tool(tool) && !self.owns_write_registration() {
             return Err(
-                "WriteLeaseRequired: call request_write_lane with the reason for the change, \
-stop this turn, and wait for the backend to resume the same thread in write mode."
+                "WriteRegistrationRequired: call request_write_workspace with the reason for the change, \
+stop this turn so the backend can resume the same thread in its isolated writable workspace."
                     .to_string(),
             );
         }
@@ -418,7 +396,11 @@ stop this turn, and wait for the backend to resume the same thread in write mode
             tools::admit_tool_call(state, tool, args).map_err(|error| error.to_string())?;
         }
 
-        let result = self.dispatch(&request_id, tool, args);
+        let result = if tools::is_mutating_tool(tool) {
+            self.project_transaction(|| self.dispatch(&request_id, tool, args))?
+        } else {
+            self.dispatch(&request_id, tool, args)
+        };
         if result.is_ok() && tool == tools::SEARCH_DOCS_TOOL {
             if let Some(state) = self.request_state.lock().as_mut() {
                 state.record_search_docs();
@@ -590,21 +572,13 @@ stop this turn, and wait for the backend to resume the same thread in write mode
                 tools::map_minimap(&bridge, args).map_err(stringify)
             }
             tools::SEARCH_DOCS_TOOL => Ok(self.search_docs(args)),
-            tools::REQUEST_WRITE_LANE_TOOL => {
+            tools::REQUEST_WRITE_WORKSPACE_TOOL => {
                 let reason = str_arg(args, "reason")?;
-                let ticket = self.request_write_lane(reason)?;
-                let (status, queue_position) = match ticket.state() {
-                    crate::write_coordinator::TicketState::Granted => ("granted", None),
-                    crate::write_coordinator::TicketState::Waiting(position) => {
-                        ("waiting", Some(position))
-                    }
-                    crate::write_coordinator::TicketState::Cancelled => ("cancelled", None),
-                };
+                self.request_write_workspace(reason)?;
                 Ok(json!({
                     "ok": true,
-                    "status": status,
-                    "queuePosition": queue_position,
-                    "note": "Write intent recorded. Stop this turn now; the backend will resume this thread after the project write lease is granted."
+                    "status": "granted",
+                    "note": "Write intent recorded. Stop this turn now; the backend will resume this thread immediately in its isolated writable workspace."
                 }))
             }
 
@@ -1556,7 +1530,7 @@ mod tests {
     fn open_runtime(request_id: &str) -> SessionToolRuntime {
         let runtime = SessionToolRuntime::for_tests();
         runtime.begin_request(request_id, "test-project").unwrap();
-        runtime.request_write_lane("test mutation").unwrap();
+        runtime.request_write_workspace("test mutation").unwrap();
         runtime
     }
 
@@ -1575,7 +1549,7 @@ mod tests {
         let services = ToolServices::for_tests();
         let runtime = services.session("only-session");
         runtime.begin_request("request-old", "project").unwrap();
-        let old = runtime.request_write_lane("write after read").unwrap();
+        let old = runtime.request_write_workspace("write after read").unwrap();
         assert_eq!(old.state(), crate::write_coordinator::TicketState::Granted);
 
         let error = runtime
@@ -1586,7 +1560,7 @@ mod tests {
         runtime.abort_unmutated_write_intent().unwrap();
         runtime.clear_current();
         runtime.begin_request("request-new", "project").unwrap();
-        let next = runtime.request_write_lane("retry write").unwrap();
+        let next = runtime.request_write_workspace("retry write").unwrap();
         assert_eq!(
             next.state(),
             crate::write_coordinator::TicketState::Granted,
@@ -1607,8 +1581,8 @@ mod tests {
                 .execute(spec.name, &json!({}))
                 .expect_err("read mode must reject every project mutation");
             assert!(
-                error.starts_with("WriteLeaseRequired:"),
-                "{} bypassed the write lease: {error}",
+                error.starts_with("WriteRegistrationRequired:"),
+                "{} bypassed write registration: {error}",
                 spec.name
             );
         }
@@ -1715,6 +1689,168 @@ mod tests {
         }
 
         fn reset_project(&self) {}
+    }
+
+    fn bridge_runtime(
+        tag: &str,
+        request_id: &str,
+    ) -> (PathBuf, PathBuf, PathBuf, SessionToolRuntime) {
+        let base =
+            std::env::temp_dir().join(format!("eud-agent-runtime-{tag}-{}", uuid::Uuid::new_v4()));
+        let dirs = DataDirs::from_bases(&base.join("roaming"), &base.join("local"));
+        dirs.ensure_dirs().unwrap();
+        let editor = base.join("editor");
+        let agent_dir = editor.join("Data").join("agent");
+        let inbox = agent_dir.join("inbox");
+        let outbox = agent_dir.join("outbox");
+        fs::create_dir_all(&inbox).unwrap();
+        fs::create_dir_all(&outbox).unwrap();
+        dirs.save_config(&crate::config::Config {
+            editor_path: editor.to_string_lossy().to_string(),
+            ..Default::default()
+        })
+        .unwrap();
+        let services = ToolServices::new(
+            dirs,
+            Arc::new(ReturningAnalyzer {
+                calls: AtomicUsize::new(0),
+            }),
+            crate::write_coordinator::ProjectWriteCoordinator::silent(),
+        );
+        let runtime = services.session(format!("{tag}-session"));
+        runtime.begin_request(request_id, "project").unwrap();
+        (base, inbox, outbox, runtime)
+    }
+
+    fn spawn_bridge_responder(
+        inbox: PathBuf,
+        outbox: PathBuf,
+        replies: Vec<(&'static str, &'static str)>,
+    ) -> thread::JoinHandle<Vec<String>> {
+        thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut seen = Vec::with_capacity(replies.len());
+            for (expected, reply) in replies {
+                loop {
+                    let command = fs::read_dir(&inbox)
+                        .unwrap()
+                        .filter_map(Result::ok)
+                        .find_map(|entry| {
+                            let file_name = entry.file_name().to_string_lossy().to_string();
+                            if !file_name.starts_with("srv-") || !file_name.ends_with(".cmd") {
+                                return None;
+                            }
+                            Some((entry.path(), file_name))
+                        });
+                    if let Some((path, file_name)) = command {
+                        let command = fs::read_to_string(&path).unwrap();
+                        assert_eq!(command, expected);
+                        seen.push(command);
+                        fs::remove_file(path).unwrap();
+                        let stem = file_name.trim_end_matches(".cmd");
+                        fs::write(outbox.join(format!("{stem}.result")), reply.as_bytes()).unwrap();
+                        break;
+                    }
+                    assert!(Instant::now() < deadline, "bridge command did not arrive");
+                    thread::sleep(Duration::from_millis(5));
+                }
+            }
+            seen
+        })
+    }
+
+    #[test]
+    fn batched_tbl_get_preserves_order_and_reports_per_item_errors() {
+        let (base, inbox, outbox, runtime) =
+            bridge_runtime("batched-tbl-get", "req-batched-tbl-get");
+        let responder = spawn_bridge_responder(
+            inbox,
+            outbox,
+            vec![
+                ("GETTBL 1", "OK: tbl|1 = First"),
+                ("GETTBL 2", "ERROR: missing TBL string"),
+            ],
+        );
+
+        let result = runtime
+            .execute("tbl_get", &json!({"items": [{"index": 1}, {"index": 2}]}))
+            .unwrap();
+        responder.join().unwrap();
+
+        assert_eq!(result["count"], 2);
+        assert_eq!(result["results"][0]["index"], 1);
+        assert_eq!(result["results"][0]["ok"], true);
+        assert_eq!(result["results"][0]["value"], "First");
+        assert_eq!(result["results"][1]["index"], 2);
+        assert_eq!(result["results"][1]["ok"], false);
+        assert!(result["results"][1]["error"]
+            .as_str()
+            .unwrap()
+            .contains("missing TBL string"));
+        assert_eq!(runtime.request_state_snapshot().unwrap().action_count, 1);
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn file_edit_merges_non_overlapping_live_changes_and_journals_full_content() {
+        let (base, inbox, outbox, runtime) = bridge_runtime("file-edit", "req-file-edit");
+        let workspace = base.join("workspace");
+        fs::create_dir_all(workspace.join("source")).unwrap();
+        fs::write(workspace.join("source/main.eps"), "alpha: old\nbeta: old\n").unwrap();
+        runtime
+            .bind_workspace_root("req-file-edit", workspace)
+            .unwrap();
+        runtime.request_write_workspace("edit main.eps").unwrap();
+        runtime
+            .execute("search_docs", &json!({"query": "테스트"}))
+            .unwrap();
+        let responder = spawn_bridge_responder(
+            inbox,
+            outbox,
+            vec![
+                ("GET main.eps", "alpha: old\nbeta: external\n"),
+                ("SET main.eps\nalpha: agent\nbeta: external\n", "OK: saved"),
+                ("GET main.eps", "alpha: agent\nbeta: external\n"),
+                ("SET main.eps\nalpha: final\nbeta: external\n", "OK: saved"),
+            ],
+        );
+
+        let result = runtime
+            .execute(
+                "file_edit",
+                &json!({
+                    "path": "main.eps",
+                    "edits": [{"old_text": "alpha: old", "new_text": "alpha: agent"}],
+                }),
+            )
+            .unwrap();
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["editsApplied"], 1);
+        let second = runtime
+            .execute(
+                "file_edit",
+                &json!({
+                    "path": "main.eps",
+                    "edits": [{"old_text": "alpha: agent", "new_text": "alpha: final"}],
+                }),
+            )
+            .unwrap();
+        responder.join().unwrap();
+
+        assert_eq!(second["ok"], true);
+        assert_eq!(second["editsApplied"], 1);
+        let entries = runtime
+            .journal()
+            .selected_entries("req-file-edit", &crate::journal::DecisionIds::All)
+            .unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(
+            entries[1].after,
+            Snapshot::FileContent {
+                content: "alpha: final\nbeta: external\n".into(),
+            }
+        );
+        fs::remove_dir_all(base).ok();
     }
 
     #[test]

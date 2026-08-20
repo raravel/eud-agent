@@ -18,7 +18,11 @@
  * Diff/preview limits reuse lib/truncate (1 MiB UTF-16-consistent). Korean labels.
  */
 import type { ReactNode } from "react";
-import { FilePenLineIcon, FolderTreeIcon } from "lucide-react";
+import {
+  ChevronsUpDownIcon,
+  FilePenLineIcon,
+  FolderTreeIcon,
+} from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
@@ -39,6 +43,10 @@ import type { ChangesetItem } from "@/lib/ipc";
 export interface ChangesetViewProps {
   /** The active changeset under review (items + per-id decisions). */
   changeset: ChangesetState;
+  /** Whether the review body is expanded for the selected session. */
+  open: boolean;
+  /** Persist expansion changes in the selected session slot. */
+  onOpenChange(open: boolean): void;
   /** A decision is in flight (disable the controls until rollback_result). */
   pending: boolean;
   /** Fire the changeset_decision; ids "all" for bulk, else the item's ids. */
@@ -265,96 +273,141 @@ function ItemBody({ item }: { item: ChangesetItem }) {
   );
 }
 
-export function ChangesetView({ changeset, pending, onDecide }: ChangesetViewProps) {
+export function ChangesetView({
+  changeset,
+  open,
+  onOpenChange,
+  pending,
+  onDecide,
+}: ChangesetViewProps) {
   const { items, decisions } = changeset;
 
   return (
     <section
       aria-label="변경사항 검토"
-      className="flex max-h-[40vh] flex-col gap-3 overflow-y-auto border-t border-border p-4"
+      className="flex max-h-[40vh] min-h-0 flex-col overflow-hidden border-t border-border bg-background"
     >
-      {items.map((item) => {
-        const state = itemState(item, decisions);
-        const ids = itemIds(item);
-        const decided = state !== "undecided";
-        // Stable identity for keying + testid. A dat group has no item-level
-        // id, so itemKey falls back to the joined property ids (NEVER undefined).
-        const key = itemKey(item);
-        return (
-          <Card
-            key={key}
-            data-testid={`cs-item-${key}`}
-            className="gap-2 py-2 shadow-none"
-          >
-            <CardContent className="flex flex-col gap-2 px-3">
-              <ItemBody item={item} />
-              <div className="flex items-center justify-end gap-2">
-              {decided ? (
-                <Badge
-                  variant="outline"
-                  className={cn("text-xs font-medium", STATE_BADGE[state].tone)}
-                >
-                  {STATE_BADGE[state].label}
-                </Badge>
-              ) : (
-                <>
-                  <Button
-                    type="button"
-                    size="xs"
-                    variant="outline"
-                    disabled={pending}
-                    aria-label="적용 유지"
-                    onClick={() => onDecide("accept", ids)}
-                  >
-                    ✓ 적용
-                  </Button>
-                  <Button
-                    type="button"
-                    size="xs"
-                    variant="outline"
-                    disabled={pending}
-                    aria-label="되돌리기"
-                    onClick={() => onDecide("reject", ids)}
-                  >
-                    ✗ 되돌리기
-                  </Button>
-                </>
-              )}
-              </div>
-            </CardContent>
-          </Card>
-        );
-      })}
-
-      {/* EUD-070: in-flight notice — a rollback waits on the 1s bridge tick per
-          inverse op (2-4s for a dat group), so the wait must be visible, not
-          just silently-disabled buttons. */}
-      {pending && (
-        <div className="flex items-center gap-2 text-sm text-muted-foreground">
-          <Spinner className="size-3.5 shrink-0" />
-          <span>결정 처리 중… (되돌리기는 에디터에 한 건씩 적용됩니다)</span>
+      <header className="flex min-h-12 shrink-0 items-center justify-between gap-3 border-b border-border px-4 py-2">
+        <div className="flex min-w-0 items-baseline gap-2">
+          <h2 className="truncate text-sm font-semibold">수정 적용</h2>
+          <span className="shrink-0 text-xs text-muted-foreground">
+            {items.length}건
+          </span>
         </div>
-      )}
+        <Button
+          type="button"
+          size="icon"
+          variant="ghost"
+          className="size-8 shrink-0"
+          aria-expanded={open}
+          aria-label={open ? "수정 적용 접기" : "수정 적용 펼치기"}
+          onClick={() => onOpenChange(!open)}
+        >
+          <ChevronsUpDownIcon className="size-4" />
+        </Button>
+      </header>
 
-      <div className="flex items-center justify-end gap-2 border-t border-border pt-2">
-        <Button
-          type="button"
-          size="sm"
-          disabled={pending}
-          onClick={() => onDecide("accept", "all")}
-        >
-          전체 적용 유지
-        </Button>
-        <Button
-          type="button"
-          size="sm"
-          variant="outline"
-          disabled={pending}
-          onClick={() => onDecide("reject", "all")}
-        >
-          전체 되돌리기
-        </Button>
-      </div>
+      {open && (
+        <>
+          <div
+            data-testid="changeset-scroll"
+            className="min-h-0 flex-1 overflow-y-auto px-4 py-3"
+          >
+            <div className="flex flex-col gap-3">
+              {items.map((item) => {
+                const state = itemState(item, decisions);
+                const ids = itemIds(item);
+                const decided = state !== "undecided";
+                // Stable identity for keying + testid. A dat group has no item-level
+                // id, so itemKey falls back to the joined property ids (NEVER undefined).
+                const key = itemKey(item);
+                return (
+                  <Card
+                    key={key}
+                    data-testid={`cs-item-${key}`}
+                    className="gap-2 py-2 shadow-none"
+                  >
+                    <CardContent className="flex flex-col gap-2 px-3">
+                      <ItemBody item={item} />
+                      <div className="flex items-center justify-end gap-2">
+                        {decided ? (
+                          <Badge
+                            variant="outline"
+                            className={cn(
+                              "text-xs font-medium",
+                              STATE_BADGE[state].tone,
+                            )}
+                          >
+                            {STATE_BADGE[state].label}
+                          </Badge>
+                        ) : (
+                          <>
+                            <Button
+                              type="button"
+                              size="xs"
+                              variant="outline"
+                              disabled={pending}
+                              aria-label="적용 유지"
+                              onClick={() => onDecide("accept", ids)}
+                            >
+                              ✓ 적용
+                            </Button>
+                            <Button
+                              type="button"
+                              size="xs"
+                              variant="outline"
+                              disabled={pending}
+                              aria-label="되돌리기"
+                              onClick={() => onDecide("reject", ids)}
+                            >
+                              ✗ 되돌리기
+                            </Button>
+                          </>
+                        )}
+                      </div>
+                    </CardContent>
+                  </Card>
+                );
+              })}
+
+              {/* EUD-070: in-flight notice — a rollback waits on the 1s bridge tick per
+                  inverse op (2-4s for a dat group), so the wait must be visible, not
+                  just silently-disabled buttons. */}
+              {pending && (
+                <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                  <Spinner className="size-3.5 shrink-0" />
+                  <span>
+                    결정 처리 중… (되돌리기는 에디터에 한 건씩 적용됩니다)
+                  </span>
+                </div>
+              )}
+            </div>
+          </div>
+
+          <div
+            data-testid="changeset-actions"
+            className="flex shrink-0 items-center justify-end gap-2 border-t border-border bg-background px-4 py-3"
+          >
+            <Button
+              type="button"
+              size="sm"
+              disabled={pending}
+              onClick={() => onDecide("accept", "all")}
+            >
+              전체 적용 유지
+            </Button>
+            <Button
+              type="button"
+              size="sm"
+              variant="outline"
+              disabled={pending}
+              onClick={() => onDecide("reject", "all")}
+            >
+              전체 되돌리기
+            </Button>
+          </div>
+        </>
+      )}
     </section>
   );
 }

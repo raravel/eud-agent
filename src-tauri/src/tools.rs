@@ -23,10 +23,10 @@ pub const SEARCH_DOCS_TOOL: &str = "search_docs";
 /// Read-only epScript candidate preflight tool name.
 pub const EPS_CHECK_TOOL: &str = "eps_check";
 /// Flow-control tool that records write intent without mutating the project.
-pub const REQUEST_WRITE_LANE_TOOL: &str = "request_write_lane";
+pub const REQUEST_WRITE_WORKSPACE_TOOL: &str = "request_write_workspace";
 
 /// Maximum admitted non-search tool actions in one user request.
-const MAX_TOOL_ACTIONS: usize = 120;
+const MAX_TOOL_ACTIONS: usize = 300;
 
 /// Maximum admitted documentation searches in one user request.
 const MAX_SEARCH_DOCS_CALLS: usize = 120;
@@ -454,8 +454,8 @@ pub fn tool_registry() -> Vec<ToolSpec> {
             ),
         ),
         tool_spec(
-            REQUEST_WRITE_LANE_TOOL,
-            "Declare project write intent and park this read-only turn until the FIFO write lease is granted.",
+            REQUEST_WRITE_WORKSPACE_TOOL,
+            "Declare write intent, park this read-only turn, and resume immediately in the session's isolated writable workspace.",
             false,
             schema(json!({"reason": string_schema()}), &["reason"]),
         ),
@@ -4394,7 +4394,7 @@ mod tests {
                 ),
             ),
             (
-                REQUEST_WRITE_LANE_TOOL,
+                REQUEST_WRITE_WORKSPACE_TOOL,
                 false,
                 schema(serde_json::json!({"reason": string_schema()}), &["reason"]),
             ),

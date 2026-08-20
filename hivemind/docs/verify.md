@@ -75,16 +75,16 @@ stages from v1 are retired as `server/` is removed.
   covers edit-prefix truncation, cancel feedback, live-stage labels, and a 200-entry
   conversation mounting fewer than 50 viewport/overscan rows.
 
-- Concurrent sessions: `cargo test -p eud-agent different_session_read_turns_overlap_and_short_turn_finishes_first`,
-  `cargo test -p eud-agent write_coordinator::tests`,
-  `cargo test -p eud-agent opening_one_session_request_does_not_clear_another_sessions_state`,
-  and `cargo test -p eud-agent workspace::tests::session_`.
+- Concurrent sessions: `cargo test -p eud-agent write_coordinator::tests`,
+  `cargo test -p eud-agent workspace::tests::concurrent_session_accept`,
+  `cargo test -p eud-agent reject_restores_one_session_while_another_writer_remains_active`,
+  and `cargo test -p eud-agent pending_review_recovery_coexists_with_new_writer_ticket`.
 - Panel concurrency: `npm --prefix panel test -- --run App SessionSidebar ipc` proves overlapping
-  chat invokes, immutable event routing, backend activity labels, write-wait cancellation, and
-  selection independence.
-- Mock-Tauri browser smoke: use five sessions. Keep A in a long read while B completes; put C in
-  review; complete D read during C review; show E as `쓰기 대기 1`; reject C and observe E enter
-  `변경 중` only after rollback. Repeat at 1280×800 and 960×720 and require
+  chat invokes, immutable event routing, simultaneous write/review labels, conflict reporting,
+  and selection independence.
+- Mock-Tauri browser smoke: put A in review while B is `running_write` and C remains idle.
+  Select B and require `변경 중 · 격리 워크스페이스` plus the write-transition log. Repeat at
+  1280×800 and 960×720 and require
   `document.documentElement.scrollWidth === document.documentElement.clientWidth`.
 
 ## E2E (user-assisted, GUI)
