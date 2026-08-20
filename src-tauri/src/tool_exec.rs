@@ -1925,11 +1925,17 @@ mod tests {
         let (base, inbox, outbox, runtime) = bridge_runtime("file-edit", "req-file-edit");
         let workspace = base.join("workspace");
         fs::create_dir_all(workspace.join("source")).unwrap();
-        fs::write(workspace.join("source/main.eps"), "alpha: old\nbeta: old\n").unwrap();
+        fs::write(
+            workspace.join("source/survivor_mvp"),
+            "alpha: old\nbeta: old\n",
+        )
+        .unwrap();
         runtime
             .bind_workspace_root("req-file-edit", workspace)
             .unwrap();
-        runtime.request_write_workspace("edit main.eps").unwrap();
+        runtime
+            .request_write_workspace("edit survivor_mvp")
+            .unwrap();
         runtime
             .execute("search_docs", &json!({"query": "테스트"}))
             .unwrap();
@@ -1937,10 +1943,16 @@ mod tests {
             inbox,
             outbox,
             vec![
-                ("GET main.eps", "alpha: old\nbeta: external\n"),
-                ("SET main.eps\nalpha: agent\nbeta: external\n", "OK: saved"),
-                ("GET main.eps", "alpha: agent\nbeta: external\n"),
-                ("SET main.eps\nalpha: final\nbeta: external\n", "OK: saved"),
+                ("GET survivor_mvp", "alpha: old\nbeta: external\n"),
+                (
+                    "SET survivor_mvp\nalpha: agent\nbeta: external\n",
+                    "OK: saved",
+                ),
+                ("GET survivor_mvp", "alpha: agent\nbeta: external\n"),
+                (
+                    "SET survivor_mvp\nalpha: final\nbeta: external\n",
+                    "OK: saved",
+                ),
             ],
         );
 
@@ -1948,7 +1960,7 @@ mod tests {
             .execute(
                 "file_edit",
                 &json!({
-                    "path": "main.eps",
+                    "path": "survivor_mvp",
                     "edits": [{"old_text": "alpha: old", "new_text": "alpha: agent"}],
                 }),
             )
@@ -1959,7 +1971,7 @@ mod tests {
             .execute(
                 "file_edit",
                 &json!({
-                    "path": "main.eps",
+                    "path": "survivor_mvp",
                     "edits": [{"old_text": "alpha: agent", "new_text": "alpha: final"}],
                 }),
             )
@@ -1977,6 +1989,66 @@ mod tests {
             entries[1].after,
             Snapshot::FileContent {
                 content: "alpha: final\nbeta: external\n".into(),
+            }
+        );
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn file_write_accepts_extensionless_cuieps_source_baseline() {
+        let (base, inbox, outbox, runtime) =
+            bridge_runtime("file-write-extensionless", "req-file-write-extensionless");
+        let workspace = base.join("workspace");
+        fs::create_dir_all(workspace.join("source")).unwrap();
+        fs::write(
+            workspace.join("source/survivor_mvp"),
+            "function onPluginStart() {}\n",
+        )
+        .unwrap();
+        runtime
+            .bind_workspace_root("req-file-write-extensionless", workspace)
+            .unwrap();
+        runtime
+            .request_write_workspace("write survivor_mvp")
+            .unwrap();
+        runtime
+            .execute("search_docs", &json!({"query": "테스트"}))
+            .unwrap();
+        let responder = spawn_bridge_responder(
+            inbox,
+            outbox,
+            vec![
+                ("GET survivor_mvp", "function onPluginStart() {}\n"),
+                (
+                    "SET survivor_mvp\nfunction onPluginStart() {\n    init();\n}\n",
+                    "OK: saved",
+                ),
+            ],
+        );
+
+        let result = runtime
+            .execute(
+                "file_write",
+                &json!({
+                    "path": "survivor_mvp",
+                    "code": "function onPluginStart() {\n    init();\n}\n",
+                }),
+            )
+            .unwrap();
+        responder.join().unwrap();
+
+        assert_eq!(result["ok"], true);
+        let entries = runtime
+            .journal()
+            .selected_entries(
+                "req-file-write-extensionless",
+                &crate::journal::DecisionIds::All,
+            )
+            .unwrap();
+        assert_eq!(
+            entries[0].after,
+            Snapshot::FileContent {
+                content: "function onPluginStart() {\n    init();\n}\n".into(),
             }
         );
         fs::remove_dir_all(base).ok();

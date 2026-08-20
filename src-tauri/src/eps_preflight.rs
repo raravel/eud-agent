@@ -193,9 +193,21 @@ struct PreflightState {
     project: Option<String>,
     project_id: Option<String>,
     mirror_root: Option<PathBuf>,
+    source_paths: HashMap<String, String>,
     unreadable: Vec<UnreadableFile>,
     snapshot_ready: bool,
     suppressed: Option<SkipReason>,
+}
+
+fn tracked_analysis_path(state: &PreflightState, path: &str) -> Option<(String, String)> {
+    let editor_path = normalize_editor_path(path).ok()?;
+    let key = editor_path.to_lowercase();
+    let analysis_path = state
+        .source_paths
+        .get(&key)
+        .cloned()
+        .or_else(|| normalize_project_path(&editor_path).ok())?;
+    Some((key, analysis_path))
 }
 
 /// Request-aware snapshot/mirror owner. Each session owns one instance; the
@@ -237,6 +249,7 @@ impl EpsPreflight {
         state.snapshot_ready = false;
         state.suppressed = None;
         state.unreadable.clear();
+        state.source_paths.clear();
     }
 
     pub fn check(
@@ -271,6 +284,7 @@ impl EpsPreflight {
             state.snapshot_ready = false;
             state.suppressed = None;
             state.unreadable.clear();
+            state.source_paths.clear();
         }
         if let Some(reason) = state.suppressed {
             return Ok(EpsCheckResult::skipped(reason));
@@ -300,6 +314,7 @@ impl EpsPreflight {
             state.project_id = Some(refreshed.project_id);
             state.mirror_root = Some(refreshed.mirror_root);
             state.unreadable = refreshed.unreadable;
+            state.source_paths = refreshed.source_paths;
             state.snapshot_ready = true;
         }
 
@@ -359,13 +374,13 @@ impl EpsPreflight {
     }
 
     pub fn write_applied(&self, request_id: &str, path: &str, code: &str) {
-        let Ok(project_path) = normalize_project_path(path) else {
-            return;
-        };
         let mut state = self.state.lock();
         if state.request_id.as_deref() != Some(request_id) || !state.snapshot_ready {
             return;
         }
+        let Some((_, project_path)) = tracked_analysis_path(&state, path) else {
+            return;
+        };
         let Some(root) = state.mirror_root.as_ref() else {
             state.snapshot_ready = false;
             return;
@@ -376,20 +391,26 @@ impl EpsPreflight {
     }
 
     pub fn rename_applied(&self, request_id: &str, from: &str, to: &str) {
-        let from = normalize_project_path(from);
-        let to = normalize_project_path(to);
         let mut state = self.state.lock();
         if state.request_id.as_deref() != Some(request_id) || !state.snapshot_ready {
             return;
         }
-        let (Ok(from), Ok(to), Some(root)) = (from, to, state.mirror_root.as_ref()) else {
+        let Some((from_key, from_path)) = tracked_analysis_path(&state, from) else {
+            return;
+        };
+        let Ok(to_editor_path) = normalize_editor_path(to) else {
             state.snapshot_ready = false;
             return;
         };
-        let source = confined_path(root, &from);
-        let target = confined_path(root, &to);
-        let update = source.and_then(|source| {
-            target.and_then(|target| {
+        let to_key = to_editor_path.to_lowercase();
+        let to_path = normalize_project_path(&to_editor_path)
+            .unwrap_or_else(|_| format!("{to_editor_path}.eps"));
+        let Some(root) = state.mirror_root.as_ref() else {
+            state.snapshot_ready = false;
+            return;
+        };
+        let update = confined_path(root, &from_path).and_then(|source| {
+            confined_path(root, &to_path).and_then(|target| {
                 if !source.exists() {
                     return Err(io::Error::new(
                         io::ErrorKind::NotFound,
@@ -404,17 +425,19 @@ impl EpsPreflight {
         });
         if update.is_err() {
             state.snapshot_ready = false;
+        } else if state.source_paths.remove(&from_key).is_some() {
+            state.source_paths.insert(to_key, to_path);
         }
     }
 
     pub fn delete_applied(&self, request_id: &str, path: &str) {
-        let Ok(project_path) = normalize_project_path(path) else {
-            return;
-        };
         let mut state = self.state.lock();
         if state.request_id.as_deref() != Some(request_id) || !state.snapshot_ready {
             return;
         }
+        let Some((key, project_path)) = tracked_analysis_path(&state, path) else {
+            return;
+        };
         let Some(root) = state.mirror_root.as_ref() else {
             state.snapshot_ready = false;
             return;
@@ -428,6 +451,8 @@ impl EpsPreflight {
         });
         if removal.is_err() {
             state.snapshot_ready = false;
+        } else {
+            state.source_paths.remove(&key);
         }
     }
 
@@ -442,6 +467,7 @@ impl EpsPreflight {
 struct RefreshedMirror {
     project_id: String,
     mirror_root: PathBuf,
+    source_paths: HashMap<String, String>,
     unreadable: Vec<UnreadableFile>,
 }
 
@@ -463,11 +489,19 @@ fn refresh_mirror(dirs: &DataDirs, snapshot: &EpsSnapshot) -> io::Result<Refresh
     let staged = project_dir.join(format!("snapshot-{}", uuid::Uuid::new_v4()));
     fs::create_dir(&staged)?;
     let mut unreadable = Vec::new();
+    let mut source_paths = HashMap::new();
     let mut seen = HashMap::<String, String>::new();
     let populate = (|| -> io::Result<()> {
         for file in &snapshot.files {
-            let project_path = normalize_project_path(&file.path)
+            let editor_path = normalize_editor_path(&file.path)
                 .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+            let project_path = if editor_path.to_lowercase().ends_with(".eps") {
+                editor_path.clone()
+            } else if file.ftype == "CUIEps" {
+                format!("{editor_path}.eps")
+            } else {
+                continue;
+            };
             let key = project_path.to_lowercase();
             if let Some(previous) = seen.insert(key, project_path.clone()) {
                 return Err(io::Error::new(
@@ -477,6 +511,7 @@ fn refresh_mirror(dirs: &DataDirs, snapshot: &EpsSnapshot) -> io::Result<Refresh
                     ),
                 ));
             }
+            source_paths.insert(editor_path.to_lowercase(), project_path.clone());
             if let Some(content) = &file.content {
                 atomic_write_under_root(&staged, &project_path, content.as_bytes())?;
             } else {
@@ -503,6 +538,7 @@ fn refresh_mirror(dirs: &DataDirs, snapshot: &EpsSnapshot) -> io::Result<Refresh
         project_id,
         mirror_root: mirror,
         unreadable,
+        source_paths,
     })
 }
 
@@ -621,7 +657,7 @@ fn ensure_contained_existing(root: &Path, target: &Path) -> io::Result<()> {
     }
 }
 
-pub(crate) fn normalize_project_path(value: &str) -> Result<String, String> {
+pub(crate) fn normalize_editor_path(value: &str) -> Result<String, String> {
     if value.is_empty() || value.contains('\0') || value.contains('\\') {
         return Err("path must be a non-empty project-relative path using '/' separators".into());
     }
@@ -642,10 +678,15 @@ pub(crate) fn normalize_project_path(value: &str) -> Result<String, String> {
     {
         return Err(format!("path is not normalized: {value}"));
     }
-    if !value.to_lowercase().ends_with(".eps") {
+    Ok(segments.join("/"))
+}
+
+pub(crate) fn normalize_project_path(value: &str) -> Result<String, String> {
+    let normalized = normalize_editor_path(value)?;
+    if !normalized.to_lowercase().ends_with(".eps") {
         return Err(format!("path must end in .eps: {value}"));
     }
-    Ok(segments.join("/"))
+    Ok(normalized)
 }
 
 fn has_windows_prefix(value: &str) -> bool {
@@ -1729,6 +1770,48 @@ mod tests {
             fs::read_to_string(mirror_root.join("main.eps")).unwrap(),
             "function main() {\n    oldCall();\n}\n",
             "candidate edits must not mutate the reusable mirror"
+        );
+        assert_eq!(snapshots.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn extensionless_cuieps_snapshot_uses_eps_analysis_path() {
+        let dirs = temp_dirs("extensionless-cuieps");
+        dirs.ensure_dirs().unwrap();
+        let snapshots = Arc::new(FakeSnapshotProvider::new([Ok(snapshot(
+            "Project",
+            "survivor_mvp",
+            "function onPluginStart() {}\n",
+        ))]));
+        let analyzer = Arc::new(FakeAnalyzer::new([Ok(success(&["survivor_mvp.eps"]))]));
+        let preflight =
+            EpsPreflight::with_snapshot_provider(dirs, analyzer.clone(), snapshots.clone());
+
+        let result = preflight
+            .check(
+                "request",
+                vec![EpsCandidate {
+                    path: "survivor_mvp.eps".into(),
+                    code: "function onPluginStart() {\n    init();\n}\n".into(),
+                }],
+            )
+            .unwrap();
+
+        assert!(matches!(result, EpsCheckResult::Diagnosed { .. }));
+        assert_eq!(analyzer.requests.lock().len(), 1);
+        let mirror_root = preflight.state.lock().mirror_root.clone().unwrap();
+        assert_eq!(
+            fs::read_to_string(mirror_root.join("survivor_mvp.eps")).unwrap(),
+            "function onPluginStart() {}\n"
+        );
+        preflight.write_applied(
+            "request",
+            "survivor_mvp",
+            "function onPluginStart() {\n    init();\n}\n",
+        );
+        assert_eq!(
+            fs::read_to_string(mirror_root.join("survivor_mvp.eps")).unwrap(),
+            "function onPluginStart() {\n    init();\n}\n"
         );
         assert_eq!(snapshots.calls.load(Ordering::SeqCst), 1);
     }

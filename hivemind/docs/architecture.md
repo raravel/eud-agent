@@ -179,8 +179,10 @@ it deletes each `.result` after consuming and clears stale inbox/outbox at start
 
 Commands retained: PING, STATUS, LIST, GET, SET, NEWEPS, GETDAT/SETDAT, BUILD, LUA,
 and the additive `EPSNAPSHOT <uuid>` command. EPSNAPSHOT writes collision-safe ordinal
-`.eps` files plus a last-written base64-path manifest in one idle Tick; unreadable files
-remain individual manifest rows. Heartbeat/status and the compiling early-return still
+content plus a last-written base64-path manifest in one idle Tick for every settable text
+object regardless of its stored filename suffix, while retaining readable legacy paths that
+already end in `.eps`; unreadable files remain individual manifest rows. Heartbeat/status and
+the compiling early-return still
 precede all inbox work, so no project object is touched while compiling.
 Removed: the WebView2/panel-hosting commands and server-spawn handshake (PANEL is gone;
 the app is the panel). SET/NEWEPS remain memory-only and CUI/RawText-only.

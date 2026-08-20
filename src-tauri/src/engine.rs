@@ -108,6 +108,7 @@ The correct eps way to write the constructs people most often miscode. These are
 
 const EPS_PREFLIGHT_GUIDE: &str = r#"[eps preflight]
 - Before file_create/file_write/file_edit for .eps, call eps_check with every candidate in one batch. Pass complete code for creates/full rewrites or the same ordered exact edits used by file_edit.
+- eps_check uses analyzer `.eps` paths. When list_files returns an extensionless CUIEps path, append `.eps` only for eps_check; keep the exact editor path for read_file/file_edit/file_write.
 - Prefer file_edit for localized changes to existing files; use file_write only when replacing the complete file is intentional.
 - For mutually dependent files, include every candidate in one eps_check call.
 - Fix error diagnostics and re-check before writing. Warnings are advisory; explain any warning left unresolved.

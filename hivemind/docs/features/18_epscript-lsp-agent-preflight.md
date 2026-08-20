@@ -123,6 +123,8 @@ Contract:
 - Every `path` is a normalized, project-relative `.eps` path using `/` separators.
 - Paths must reject an absolute/prefixed path, `.` / `..`, an empty segment, NUL, and duplicate
   case-insensitive keys.
+- An extensionless `CUIEps` editor path is exposed to `eps_check` as `<exact-path>.eps`; editor
+  reads and mutations continue using the exact extensionless path returned by `list_files`.
 - Each item contains exactly one of `code` or `edits`. `code` is the complete candidate content.
   `edits` is a non-empty ordered array of exact `old_text`/`new_text` replacements; every
   `old_text` must be non-empty and match exactly once at its step.
@@ -212,10 +214,13 @@ Add `EPSNAPSHOT <token>`:
 
 1. Rust generates a lowercase ASCII UUID token and validates it before sending.
 2. The bridge walks the project tree once on the idle UI-thread Tick.
-3. Every readable path ending in `.eps` is written as an ordinal file under
-   `Data\agent\outbox\epsnapshot-<token>\`.
-4. `manifest.tsv` maps ordinal -> file type -> UTF-8/base64 project path -> byte length -> read
-   status. Ordinals avoid path flattening and collisions.
+3. Every settable text object is selected regardless of its stored filename suffix. Readable
+   legacy objects whose exact path already ends in `.eps` remain selected. Each selected file is
+   written as an ordinal file under `Data\agent\outbox\epsnapshot-<token>\`.
+4. `manifest.tsv` maps ordinal -> file type -> exact UTF-8/base64 editor path -> byte length ->
+   read status. Ordinals avoid path flattening and collisions. Rust preserves the exact path in
+   the session `source/` baseline and maps an extensionless `CUIEps` to a virtual `<path>.eps`
+   only inside the analyzer mirror.
 5. File content and the manifest are UTF-8 without BOM. `manifest.tsv` is written last.
 6. `handleCommand` returns only after the snapshot is complete; the normal request `.result`
    therefore remains the completion barrier.
@@ -231,7 +236,7 @@ Add `EPSNAPSHOT <token>`:
 9. Rust removes the request snapshot directory after consumption. Startup cleanup removes stale
    `epsnapshot-*` directories without touching normal `.result` files.
 
-The command reports unreadable `.eps` files in the manifest instead of aborting the entire
+The command reports unreadable selected files in the manifest instead of aborting the entire
 snapshot. The analyzer emits `EUDLSP004` only when an affected import needs one of those files.
 Heartbeat/status writes and the compiling early-return remain untouched and before inbox work.
 No project objects are accessed while compiling.

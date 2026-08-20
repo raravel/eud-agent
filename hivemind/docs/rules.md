@@ -59,9 +59,10 @@ hosting, panel re-arm, and server spawning are REMOVED.
   project line CACHED from the last idle Tick — NEVER touch `pjData` while compiling. In
   v2 these are read by the APP (editor-liveness + build-busy signals), not a self-spawned
   server.
-- EPSNAPSHOT MUST enumerate/read `.eps` project objects in one idle Tick, write
-  request-scoped ordinal files as UTF-8 without BOM, and write `manifest.tsv` last.
-  Unreadable files are individual manifest rows. NEVER repurpose the existing DUMP path.
+- EPSNAPSHOT MUST enumerate/read every settable text project object regardless of its stored
+  filename suffix, plus readable legacy objects whose exact path ends in `.eps`, in one idle
+  Tick. It writes request-scoped ordinal files as UTF-8 without BOM and writes `manifest.tsv`
+  last. Unreadable files are individual manifest rows. NEVER repurpose the existing DUMP path.
 - **DROPPED in v2** (cause removed with in-editor WebView2): panel re-arm via window-handle
   tracking, and the `DispatcherPriority.Normal` mandate against Render-starvation (EUD-039
   — the external panel no longer posts Render work to the editor Dispatcher). The default

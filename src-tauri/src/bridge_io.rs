@@ -649,7 +649,7 @@ fn decode_eps_snapshot(
             return Err(invalid_snapshot("snapshot file type is empty"));
         }
         let project_path = decode_base64_utf8(fields[3], "project path")?;
-        let project_path = crate::eps_preflight::normalize_project_path(&project_path)
+        let project_path = crate::eps_preflight::normalize_editor_path(&project_path)
             .map_err(|error| invalid_snapshot(&error))?;
         let key = project_path.to_lowercase();
         if let Some(previous) = paths.insert(key, project_path.clone()) {
@@ -1488,6 +1488,38 @@ mod tests {
     }
 
     #[test]
+    fn eps_snapshot_manifest_accepts_extensionless_settable_paths() {
+        let data_dir = unique_temp_dir("snapshot-extensionless-settable");
+        let outbox = data_dir.join("outbox");
+        fs::create_dir_all(&outbox).unwrap();
+        let token = "00000000-0000-4000-8000-000000000021";
+        let snapshot_dir = write_snapshot_fixture(
+            &outbox,
+            token,
+            "Project",
+            &[
+                (
+                    "survivor_mvp",
+                    "CUIEps",
+                    Some("function onPluginStart() {}"),
+                ),
+                ("notes", "RawText", Some("plain text")),
+            ],
+        );
+
+        let snapshot = decode_eps_snapshot(&outbox, &snapshot_dir, token).unwrap();
+        assert_eq!(snapshot.files[0].path, "survivor_mvp");
+        assert_eq!(
+            snapshot.files[0].content.as_deref(),
+            Some("function onPluginStart() {}")
+        );
+        assert_eq!(snapshot.files[1].path, "notes");
+        assert_eq!(snapshot.files[1].content.as_deref(), Some("plain text"));
+
+        fs::remove_dir_all(&data_dir).ok();
+    }
+
+    #[test]
     fn eps_snapshot_manifest_uses_map_name_when_project_filename_is_empty() {
         let data_dir = unique_temp_dir("snapshot-empty-project-filename");
         let outbox = data_dir.join("outbox");
@@ -1771,6 +1803,8 @@ mod tests {
             .split("local function handleCommand")
             .next()
             .unwrap();
+        assert!(snapshot.contains("local ftype = ftypeName(f)"));
+        assert!(snapshot.contains("if isSettableTypeName(ftype) or isEpsPath then"));
         assert!(
             snapshot.find("ordinalName").unwrap() < snapshot.find("manifest.tsv").unwrap(),
             "ordinal content must be written before the last-written manifest"

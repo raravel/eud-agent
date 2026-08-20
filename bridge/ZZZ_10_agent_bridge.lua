@@ -425,10 +425,11 @@ local ok, initErr = pcall(function()
         }
         local ordinal = 0
         walk(pj.TEData.PFIles, "", function(p, f)
-            if string.lower(string.sub(p, -4)) == ".eps" then
+            local ftype = ftypeName(f)
+            local isEpsPath = string.lower(string.sub(p, -4)) == ".eps"
+            if isSettableTypeName(ftype) or isEpsPath then
                 ordinal = ordinal + 1
                 local ordinalName = string.format("%06d.eps", ordinal)
-                local ftype = ftypeName(f)
                 local status = "unreadable"
                 local byteLength = 0
                 local okRead, text = pcall(getText, f)
