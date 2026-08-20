@@ -180,11 +180,23 @@ fn empty_schema() -> Value {
 }
 
 fn schema(properties: Value, required: &[&str]) -> Value {
+    object_schema(properties, required)
+}
+
+fn object_schema(properties: Value, required: &[&str]) -> Value {
     json!({
         "type": "object",
         "properties": properties,
         "required": required,
         "additionalProperties": false,
+    })
+}
+
+fn object_array_schema(properties: Value, required: &[&str]) -> Value {
+    json!({
+        "type": "array",
+        "minItems": 1,
+        "items": object_schema(properties, required),
     })
 }
 
@@ -208,19 +220,33 @@ fn enum_string_schema(values: &[&str]) -> Value {
     json!({"type": "string", "enum": values})
 }
 
+fn exact_text_edits_schema() -> Value {
+    object_array_schema(
+        json!({
+            "old_text": string_schema(),
+            "new_text": string_schema(),
+        }),
+        &["old_text", "new_text"],
+    )
+}
+
 fn eps_candidates_schema() -> Value {
+    let mut candidate = object_schema(
+        json!({
+            "path": string_schema(),
+            "code": string_schema(),
+            "edits": exact_text_edits_schema(),
+        }),
+        &["path"],
+    );
+    candidate["oneOf"] = json!([
+        {"required": ["code"], "not": {"required": ["edits"]}},
+        {"required": ["edits"], "not": {"required": ["code"]}},
+    ]);
     json!({
         "type": "array",
         "minItems": 1,
-        "items": {
-            "type": "object",
-            "properties": {
-                "path": string_schema(),
-                "code": string_schema(),
-            },
-            "required": ["path", "code"],
-            "additionalProperties": false,
-        },
+        "items": candidate,
     })
 }
 
@@ -272,59 +298,90 @@ pub fn tool_registry() -> Vec<ToolSpec> {
         ),
         tool_spec(
             EPS_CHECK_TOOL,
-            "Analyze complete epScript candidate files against the current project snapshot.",
+            "Analyze complete or exactly edited epScript candidates against the current project snapshot.",
             false,
             schema(json!({"files": eps_candidates_schema()}), &["files"]),
         ),
         tool_spec(
             "dat_get",
-            "Read a DAT field value.",
+            "Read one or more DAT field values.",
             false,
             schema(
                 json!({
-                    "dat": dat_names_schema(),
-                    "param": string_schema(),
-                    "objId": integer_schema(),
+                    "items": object_array_schema(
+                        json!({
+                            "dat": dat_names_schema(),
+                            "param": string_schema(),
+                            "objId": integer_schema(),
+                        }),
+                        &["dat", "param", "objId"],
+                    ),
                 }),
-                &["dat", "param", "objId"],
+                &["items"],
             ),
         ),
         tool_spec(
             "xdat_get",
-            "Read an extended DAT field value.",
+            "Read one or more extended DAT field values.",
             false,
             schema(
                 json!({
-                    "dat": xdat_kinds_schema(),
-                    "name": string_schema(),
-                    "objId": integer_schema(),
+                    "items": object_array_schema(
+                        json!({
+                            "dat": xdat_kinds_schema(),
+                            "name": string_schema(),
+                            "objId": integer_schema(),
+                        }),
+                        &["dat", "name", "objId"],
+                    ),
                 }),
-                &["dat", "name", "objId"],
+                &["items"],
             ),
         ),
         tool_spec(
             "tbl_get",
-            "Read a TBL string by index.",
-            false,
-            schema(json!({"index": integer_schema()}), &["index"]),
-        ),
-        tool_spec(
-            "req_get",
-            "Read a requirements payload.",
+            "Read one or more TBL strings by index.",
             false,
             schema(
                 json!({
-                    "dat": req_dats_schema(),
-                    "objId": integer_schema(),
+                    "items": object_array_schema(
+                        json!({"index": integer_schema()}),
+                        &["index"],
+                    ),
                 }),
-                &["dat", "objId"],
+                &["items"],
+            ),
+        ),
+        tool_spec(
+            "req_get",
+            "Read one or more requirements payloads.",
+            false,
+            schema(
+                json!({
+                    "items": object_array_schema(
+                        json!({
+                            "dat": req_dats_schema(),
+                            "objId": integer_schema(),
+                        }),
+                        &["dat", "objId"],
+                    ),
+                }),
+                &["items"],
             ),
         ),
         tool_spec(
             "btn_get",
-            "Read a button set CSV payload.",
+            "Read one or more button set CSV payloads.",
             false,
-            schema(json!({"setId": integer_schema()}), &["setId"]),
+            schema(
+                json!({
+                    "items": object_array_schema(
+                        json!({"setId": integer_schema()}),
+                        &["setId"],
+                    ),
+                }),
+                &["items"],
+            ),
         ),
         tool_spec(
             "settings_get",
@@ -504,6 +561,18 @@ pub fn tool_registry() -> Vec<ToolSpec> {
                     "code": string_schema(),
                 }),
                 &["path", "code"],
+            ),
+        ),
+        tool_spec(
+            "file_edit",
+            "Apply ordered exact-text edits to an existing project file.",
+            true,
+            schema(
+                json!({
+                    "path": string_schema(),
+                    "edits": exact_text_edits_schema(),
+                }),
+                &["path", "edits"],
             ),
         ),
         tool_spec(
@@ -856,6 +925,61 @@ fn validate_tool_args(spec: &ToolSpec, args: &Value) -> ToolResult<()> {
         validate_arg_value(spec, name, value, property_schema)?;
     }
 
+    validate_tool_arg_semantics(spec, object)
+}
+
+fn validate_tool_arg_semantics(spec: &ToolSpec, args: &Map<String, Value>) -> ToolResult<()> {
+    match spec.name {
+        EPS_CHECK_TOOL => {
+            let files = args
+                .get("files")
+                .and_then(Value::as_array)
+                .expect("generic schema validation guarantees eps_check.files is an array");
+            for (index, file) in files.iter().enumerate() {
+                let file = file
+                    .as_object()
+                    .expect("generic schema validation guarantees candidate objects");
+                match (file.get("code"), file.get("edits")) {
+                    (Some(_), None) => {}
+                    (None, Some(edits)) => {
+                        validate_nonempty_old_texts(spec, &format!("files[{index}].edits"), edits)?
+                    }
+                    _ => {
+                        return admission_error(&format!(
+                            "eps_check candidate files[{index}] requires exactly one of code or edits"
+                        ));
+                    }
+                }
+            }
+        }
+        "file_edit" => {
+            let edits = args
+                .get("edits")
+                .expect("generic schema validation guarantees file_edit.edits");
+            validate_nonempty_old_texts(spec, "edits", edits)?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn validate_nonempty_old_texts(spec: &ToolSpec, name: &str, edits: &Value) -> ToolResult<()> {
+    let edits = edits
+        .as_array()
+        .expect("generic schema validation guarantees exact edit arrays");
+    for (index, edit) in edits.iter().enumerate() {
+        let old_text = edit
+            .get("old_text")
+            .and_then(Value::as_str)
+            .expect("generic schema validation guarantees old_text strings");
+        if old_text.is_empty() {
+            return usage_error(
+                spec,
+                &[name],
+                &format!("{name}[{index}].old_text must not be empty"),
+            );
+        }
+    }
     Ok(())
 }
 
@@ -4137,11 +4261,16 @@ mod tests {
                 false,
                 schema(
                     serde_json::json!({
-                        "dat": dat_names_schema(),
-                        "param": string_schema(),
-                        "objId": integer_schema(),
+                        "items": object_array_schema(
+                            serde_json::json!({
+                                "dat": dat_names_schema(),
+                                "param": string_schema(),
+                                "objId": integer_schema(),
+                            }),
+                            &["dat", "param", "objId"],
+                        ),
                     }),
-                    &["dat", "param", "objId"],
+                    &["items"],
                 ),
             ),
             (
@@ -4149,33 +4278,59 @@ mod tests {
                 false,
                 schema(
                     serde_json::json!({
-                        "dat": xdat_kinds_schema(),
-                        "name": string_schema(),
-                        "objId": integer_schema(),
+                        "items": object_array_schema(
+                            serde_json::json!({
+                                "dat": xdat_kinds_schema(),
+                                "name": string_schema(),
+                                "objId": integer_schema(),
+                            }),
+                            &["dat", "name", "objId"],
+                        ),
                     }),
-                    &["dat", "name", "objId"],
+                    &["items"],
                 ),
             ),
             (
                 "tbl_get",
                 false,
-                schema(serde_json::json!({"index": integer_schema()}), &["index"]),
+                schema(
+                    serde_json::json!({
+                        "items": object_array_schema(
+                            serde_json::json!({"index": integer_schema()}),
+                            &["index"],
+                        ),
+                    }),
+                    &["items"],
+                ),
             ),
             (
                 "req_get",
                 false,
                 schema(
                     serde_json::json!({
-                        "dat": req_dats_schema(),
-                        "objId": integer_schema(),
+                        "items": object_array_schema(
+                            serde_json::json!({
+                                "dat": req_dats_schema(),
+                                "objId": integer_schema(),
+                            }),
+                            &["dat", "objId"],
+                        ),
                     }),
-                    &["dat", "objId"],
+                    &["items"],
                 ),
             ),
             (
                 "btn_get",
                 false,
-                schema(serde_json::json!({"setId": integer_schema()}), &["setId"]),
+                schema(
+                    serde_json::json!({
+                        "items": object_array_schema(
+                            serde_json::json!({"setId": integer_schema()}),
+                            &["setId"],
+                        ),
+                    }),
+                    &["items"],
+                ),
             ),
             (
                 "settings_get",
@@ -4337,6 +4492,17 @@ mod tests {
                         "code": string_schema(),
                     }),
                     &["path", "code"],
+                ),
+            ),
+            (
+                "file_edit",
+                true,
+                schema(
+                    serde_json::json!({
+                        "path": string_schema(),
+                        "edits": exact_text_edits_schema(),
+                    }),
+                    &["path", "edits"],
                 ),
             ),
             (
@@ -4595,10 +4761,32 @@ mod tests {
     }
 
     #[test]
-    fn eps_check_nested_schema_rejects_empty_or_incomplete_candidate_batches() {
+    fn eps_check_nested_schema_accepts_edits_and_rejects_invalid_candidate_modes() {
+        let mut valid_state = RequestState::for_request("req-valid-eps-edit");
+        admit_tool_call(
+            &mut valid_state,
+            EPS_CHECK_TOOL,
+            &serde_json::json!({
+                "files": [{
+                    "path": "main.eps",
+                    "edits": [{"old_text": "oldCall();", "new_text": "newCall();"}],
+                }],
+            }),
+        )
+        .unwrap();
+
         for args in [
             serde_json::json!({"files": []}),
             serde_json::json!({"files": [{"path": "main.eps"}]}),
+            serde_json::json!({"files": [{
+                "path": "main.eps",
+                "code": "oldCall();",
+                "edits": [{"old_text": "oldCall();", "new_text": "newCall();"}],
+            }]}),
+            serde_json::json!({"files": [{
+                "path": "main.eps",
+                "edits": [{"old_text": "", "new_text": "newCall();"}],
+            }]}),
             serde_json::json!({"files": [{"path": "main.eps", "code": "", "extra": true}]}),
         ] {
             let mut state = RequestState::for_request("req-invalid-eps-check");
@@ -4606,6 +4794,68 @@ mod tests {
             assert_eq!(state.action_count, 0);
             assert_eq!(state.mutation_count, 0);
         }
+    }
+
+    #[test]
+    fn batched_get_schemas_require_nonempty_well_typed_items() {
+        for (tool, valid) in [
+            (
+                "dat_get",
+                serde_json::json!({"items": [
+                    {"dat": "units", "param": "HitPoints", "objId": 0},
+                    {"dat": "weapons", "param": "DamageAmount", "objId": 1},
+                ]}),
+            ),
+            (
+                "xdat_get",
+                serde_json::json!({"items": [
+                    {"dat": "wireframe", "name": "wirefram", "objId": 0},
+                ]}),
+            ),
+            ("tbl_get", serde_json::json!({"items": [{"index": 1}]})),
+            (
+                "req_get",
+                serde_json::json!({"items": [{"dat": "units", "objId": 0}]}),
+            ),
+            ("btn_get", serde_json::json!({"items": [{"setId": 0}]})),
+        ] {
+            let mut state = RequestState::for_request("req-batched-get");
+            admit_tool_call(&mut state, tool, &valid).unwrap();
+            assert_eq!(
+                state.action_count, 1,
+                "{tool} batch must count as one action"
+            );
+            assert!(admit_tool_call(
+                &mut RequestState::for_request("req-empty-batch"),
+                tool,
+                &serde_json::json!({"items": []}),
+            )
+            .is_err());
+        }
+
+        assert!(admit_tool_call(
+            &mut RequestState::for_request("req-old-scalar-contract"),
+            "dat_get",
+            &serde_json::json!({"dat": "units", "param": "HitPoints", "objId": 0}),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn file_edit_requires_nonempty_exact_matches_before_counting() {
+        let mut invalid = RequestState::for_request("req-invalid-file-edit");
+        let error = admit_tool_call(
+            &mut invalid,
+            "file_edit",
+            &serde_json::json!({
+                "path": "main.eps",
+                "edits": [{"old_text": "", "new_text": "newCall();"}],
+            }),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("must not be empty"));
+        assert_eq!(invalid.action_count, 0);
+        assert_eq!(invalid.mutation_count, 0);
     }
 
     #[test]
@@ -5045,7 +5295,7 @@ mod tests {
     }
 
     #[test]
-    fn admission_rejects_121st_action_with_wrapup_message() {
+    fn admission_rejects_301st_action_with_wrapup_message() {
         let mut state = RequestState::for_request("req-budget");
 
         for _ in 0..MAX_TOOL_ACTIONS {
@@ -5056,12 +5306,12 @@ mod tests {
             admit_tool_call(&mut state, "project_status", &serde_json::json!({})).unwrap_err();
         let message = error.to_string().to_lowercase();
         assert!(
-            message.contains("120"),
+            message.contains("300"),
             "budget error should state the limit"
         );
         assert!(
             message.contains("wrap"),
-            "121st action should tell codex to wrap up"
+            "301st action should tell codex to wrap up"
         );
         assert_eq!(
             state.action_count, MAX_TOOL_ACTIONS,
@@ -5128,18 +5378,11 @@ mod tests {
     fn missing_required_arg_error_carries_self_correcting_usage_line() {
         let mut state = RequestState::for_request("req-args");
 
-        let error = admit_tool_call(
-            &mut state,
-            "xdat_get",
-            &serde_json::json!({"table": "units", "field": "ButtonSet", "id": 65}),
-        )
-        .unwrap_err();
+        let error = admit_tool_call(&mut state, "xdat_get", &serde_json::json!({})).unwrap_err();
         let message = error.to_string();
 
-        assert!(message.contains("Usage: xdat_get(dat, name, objId)"));
-        assert!(message.contains("'dat'"));
-        assert!(message.contains("'name'"));
-        assert!(message.contains("'objId'"));
+        assert!(message.contains("Usage: xdat_get(items)"));
+        assert!(message.contains("'items'"));
         assert_eq!(
             state.action_count, 0,
             "calls rejected by arg validation must not consume an action"

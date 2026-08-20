@@ -19,12 +19,13 @@ use serde_json::{json, Value};
 use crate::bridge_io::{BridgeIo, SendOpts, HEARTBEAT_STALE_AFTER};
 use crate::config::DataDirs;
 use crate::edd_runner;
-use crate::eps_preflight::{EpsAnalyzer, EpsCandidate, EpsPreflight};
+use crate::eps_preflight::{EpsAnalyzer, EpsCandidateInput, EpsPreflight};
 use crate::journal::{DatTable, JournalEntry, JournalStore, JournalTarget, Snapshot, WriteTool};
 use crate::mapsafe::{CompilingStatus, IsomEngine, MapSafe, WindowsLockProbe};
 use crate::memory::ProjectMemory;
 use crate::rag::Rag;
 use crate::tools::{self, RequestState};
+use crate::workspace::{apply_exact_text_edits, ExactTextEdit};
 
 /// Maximum `search_docs` top-k (mirrors the registry/feature 11 clamp).
 const SEARCH_DOCS_MAX_K: i64 = 10;
@@ -107,6 +108,7 @@ impl ToolServices {
 struct SessionRequest {
     request_id: String,
     project_id: String,
+    workspace_root: Option<PathBuf>,
 }
 
 #[derive(Debug, Default)]
@@ -173,6 +175,7 @@ impl SessionToolRuntime {
         *self.request.lock() = Some(SessionRequest {
             request_id: request_id.to_owned(),
             project_id: project_id.to_owned(),
+            workspace_root: None,
         });
         *self.request_state.lock() = Some(RequestState::for_request(request_id));
         *self.pending_plan.lock() = None;
@@ -192,6 +195,51 @@ impl SessionToolRuntime {
             .lock()
             .as_ref()
             .map(|request| request.project_id.clone())
+    }
+
+    pub fn bind_workspace_root(
+        &self,
+        request_id: &str,
+        workspace_root: PathBuf,
+    ) -> Result<(), String> {
+        let mut request = self.request.lock();
+        let active = request
+            .as_mut()
+            .filter(|request| request.request_id == request_id)
+            .ok_or_else(|| format!("request {request_id} is not active"))?;
+        active.workspace_root = Some(workspace_root);
+        Ok(())
+    }
+
+    fn source_baseline(&self, path: &str) -> Result<Option<String>, String> {
+        let workspace_root = self
+            .request
+            .lock()
+            .as_ref()
+            .and_then(|request| request.workspace_root.clone())
+            .ok_or_else(|| "the current request has no prepared session workspace".to_string())?;
+        crate::workspace::read_source_baseline(&workspace_root, path)
+            .map_err(|error| error.to_string())
+    }
+
+    fn source_created_by_request(&self, request_id: &str, path: &str) -> bool {
+        self.services
+            .journal
+            .selected_entries(request_id, &crate::journal::DecisionIds::All)
+            .is_ok_and(|entries| {
+                entries.iter().any(|entry| {
+                    if entry.tool != WriteTool::FileCreate {
+                        return false;
+                    }
+                    let JournalTarget::Path { path: created } = &entry.target else {
+                        return false;
+                    };
+                    created == path
+                        || path.strip_prefix(created.as_str()).is_some_and(|suffix| {
+                            suffix.starts_with('.') && !suffix[1..].contains('/')
+                        })
+                })
+            })
     }
 
     pub fn approve_current_plan(&self) {
@@ -412,51 +460,117 @@ stop this turn, and wait for the backend to resume the same thread in write mode
                 Ok(json!({ "path": path, "content": content }))
             }
             tools::EPS_CHECK_TOOL => {
-                let files: Vec<EpsCandidate> = serde_json::from_value(
+                let files: Vec<EpsCandidateInput> = serde_json::from_value(
                     args.get("files")
                         .cloned()
                         .ok_or_else(|| "missing argument 'files'".to_string())?,
                 )
                 .map_err(|error| format!("invalid eps_check files: {error}"))?;
-                let result = self.eps_preflight.check(request_id, files)?;
+                let result = self.eps_preflight.check_inputs(request_id, files)?;
                 serde_json::to_value(result)
                     .map_err(|error| format!("failed to serialize eps_check result: {error}"))
             }
             "dat_get" => {
-                let (dat, param, obj_id) = (
-                    str_arg(args, "dat")?,
-                    str_arg(args, "param")?,
-                    i64_arg(args, "objId")?,
-                );
-                let reply = self
-                    .bridge()?
-                    .getdat(dat, param, obj_id, &opts, None)
-                    .map_err(stringify)?;
-                Ok(json!({ "value": reply_value(&reply) }))
+                let bridge = self.bridge()?;
+                let items = array_arg(args, "items")?;
+                let mut results = Vec::with_capacity(items.len());
+                for item in items {
+                    let (dat, param, obj_id) = (
+                        str_arg(item, "dat")?,
+                        str_arg(item, "param")?,
+                        i64_arg(item, "objId")?,
+                    );
+                    let result = match bridge.getdat(dat, param, obj_id, &opts, None) {
+                        Ok(reply) => {
+                            json!({"dat": dat, "param": param, "objId": obj_id, "ok": true, "value": reply_value(&reply)})
+                        }
+                        Err(error) => {
+                            json!({"dat": dat, "param": param, "objId": obj_id, "ok": false, "error": error.to_string()})
+                        }
+                    };
+                    results.push(result);
+                }
+                Ok(json!({"count": results.len(), "results": results}))
             }
             "xdat_get" => {
-                let (dat, name, obj_id) = (
-                    str_arg(args, "dat")?,
-                    str_arg(args, "name")?,
-                    i64_arg(args, "objId")?,
-                );
-                let reply = self.send(&format!("GETXDAT {dat}|{name}|{obj_id}"))?;
-                Ok(json!({ "value": reply_value(&reply) }))
+                let bridge = self.bridge()?;
+                let items = array_arg(args, "items")?;
+                let mut results = Vec::with_capacity(items.len());
+                for item in items {
+                    let (dat, name, obj_id) = (
+                        str_arg(item, "dat")?,
+                        str_arg(item, "name")?,
+                        i64_arg(item, "objId")?,
+                    );
+                    let command = format!("GETXDAT {dat}|{name}|{obj_id}");
+                    let result = match bridge.send(&command, &opts, None) {
+                        Ok(reply) => {
+                            json!({"dat": dat, "name": name, "objId": obj_id, "ok": true, "value": reply_value(&reply)})
+                        }
+                        Err(error) => {
+                            json!({"dat": dat, "name": name, "objId": obj_id, "ok": false, "error": error.to_string()})
+                        }
+                    };
+                    results.push(result);
+                }
+                Ok(json!({"count": results.len(), "results": results}))
             }
             "tbl_get" => {
-                let index = i64_arg(args, "index")?;
-                let reply = self.send(&format!("GETTBL {index}"))?;
-                Ok(json!({ "value": reply_value(&reply) }))
+                let bridge = self.bridge()?;
+                let items = array_arg(args, "items")?;
+                let mut results = Vec::with_capacity(items.len());
+                for item in items {
+                    let index = i64_arg(item, "index")?;
+                    let command = format!("GETTBL {index}");
+                    let result = match bridge.send(&command, &opts, None) {
+                        Ok(reply) => {
+                            json!({"index": index, "ok": true, "value": reply_value(&reply)})
+                        }
+                        Err(error) => {
+                            json!({"index": index, "ok": false, "error": error.to_string()})
+                        }
+                    };
+                    results.push(result);
+                }
+                Ok(json!({"count": results.len(), "results": results}))
             }
             "req_get" => {
-                let (dat, obj_id) = (str_arg(args, "dat")?, i64_arg(args, "objId")?);
-                let reply = self.send(&format!("GETREQ {dat}|{obj_id}"))?;
-                Ok(json!({ "value": reply_value(&reply) }))
+                let bridge = self.bridge()?;
+                let items = array_arg(args, "items")?;
+                let mut results = Vec::with_capacity(items.len());
+                for item in items {
+                    let (dat, obj_id) = (str_arg(item, "dat")?, i64_arg(item, "objId")?);
+                    let command = format!("GETREQ {dat}|{obj_id}");
+                    let result = match bridge.send(&command, &opts, None) {
+                        Ok(reply) => {
+                            json!({"dat": dat, "objId": obj_id, "ok": true, "value": reply_value(&reply)})
+                        }
+                        Err(error) => {
+                            json!({"dat": dat, "objId": obj_id, "ok": false, "error": error.to_string()})
+                        }
+                    };
+                    results.push(result);
+                }
+                Ok(json!({"count": results.len(), "results": results}))
             }
             "btn_get" => {
-                let set_id = i64_arg(args, "setId")?;
-                let reply = self.send(&format!("GETBTN {set_id}"))?;
-                Ok(json!({ "csv": reply_value(&reply) }))
+                let bridge = self.bridge()?;
+                let items = array_arg(args, "items")?;
+                let mut results = Vec::with_capacity(items.len());
+                for item in items {
+                    let set_id = i64_arg(item, "setId")?;
+                    let command = format!("GETBTN {set_id}");
+                    let result = match bridge.send(&command, &opts, None) {
+                        Ok(reply) => {
+                            json!({"setId": set_id, "ok": true, "csv": reply_value(&reply)})
+                        }
+                        Err(error) => {
+                            json!({"setId": set_id, "ok": false, "error": error.to_string()})
+                        }
+                    };
+                    results.push(result);
+                }
+                Ok(json!({"count": results.len(), "results": results}))
             }
             "settings_get" => {
                 let (scope, key) = (str_arg(args, "scope")?, str_arg(args, "key")?);
@@ -517,6 +631,7 @@ stop this turn, and wait for the backend to resume the same thread in write mode
             "dat_reset" => self.dat_reset(request_id, args),
             "file_create" => self.file_create(request_id, args),
             "file_write" => self.file_write(request_id, args),
+            "file_edit" => self.file_edit(request_id, args),
             "file_rename" => self.file_rename(request_id, args),
             "file_delete" => self.file_delete(request_id, args),
             "file_move" => self.file_move(request_id, args),
@@ -761,8 +876,19 @@ stop this turn, and wait for the backend to resume the same thread in write mode
         // extension, which would persist as FileName `main.eps` and build to
         // `main.eps.eps`. Strip it so the stored name matches a native file.
         let path = normalize_create_path(requested_path, ftype);
-        let reply = self.send(&format!("NEWFILE {path}|{ftype}\n{code}"))?;
         let mirror_path = created_project_path(requested_path, ftype);
+        if self.source_baseline(&mirror_path)?.is_some()
+            || self
+                .bridge()?
+                .get(&mirror_path, &SendOpts::default(), None)
+                .is_ok()
+        {
+            return Err(concurrent_source_conflict(
+                &mirror_path,
+                "the create target already exists",
+            ));
+        }
+        let reply = self.send(&format!("NEWFILE {path}|{ftype}\n{code}"))?;
         self.eps_preflight
             .write_applied(request_id, &mirror_path, code);
         self.record_file(
@@ -781,31 +907,100 @@ stop this turn, and wait for the backend to resume the same thread in write mode
             .bridge()?
             .get(path, &SendOpts::default(), None)
             .map_err(stringify)?;
+        let merged = match self.source_baseline(path)? {
+            Some(base) => crate::workspace::merge_concurrent_text(path, &base, code, &old)
+                .map_err(|error| error.to_string())?,
+            None if self.source_created_by_request(request_id, path) || old == code => {
+                code.to_string()
+            }
+            None => {
+                return Err(concurrent_source_conflict(
+                    path,
+                    "the file was absent from this session's source baseline",
+                ))
+            }
+        };
         let reply = self
             .bridge()?
-            .set(path, code, &SendOpts::default(), None)
+            .set(path, &merged, &SendOpts::default(), None)
             .map_err(stringify)?;
-        self.eps_preflight.write_applied(request_id, path, code);
+        self.eps_preflight.write_applied(request_id, path, &merged);
         self.record_file(
             request_id,
             WriteTool::FileWrite,
             path,
             Snapshot::FileContent { content: old },
-            Snapshot::FileContent {
-                content: code.to_string(),
-            },
+            Snapshot::FileContent { content: merged },
         )?;
         Ok(json!({ "ok": true, "result": reply.trim() }))
     }
 
+    fn file_edit(&self, request_id: &str, args: &Value) -> Result<Value, String> {
+        let path = str_arg(args, "path")?;
+        let edits: Vec<ExactTextEdit> = serde_json::from_value(
+            args.get("edits")
+                .cloned()
+                .ok_or_else(|| "missing argument 'edits'".to_string())?,
+        )
+        .map_err(|error| format!("invalid file_edit edits: {error}"))?;
+        let bridge = self.bridge()?;
+        let old = bridge
+            .get(path, &SendOpts::default(), None)
+            .map_err(stringify)?;
+        let merged = match self.source_baseline(path)? {
+            Some(base) => {
+                let edit_base = self
+                    .latest_file_content(request_id, path)
+                    .unwrap_or_else(|| base.clone());
+                let ours = apply_exact_text_edits(path, &edit_base, &edits)
+                    .map_err(|error| error.to_string())?;
+                crate::workspace::merge_concurrent_text(path, &edit_base, &ours, &old)
+                    .map_err(|error| error.to_string())?
+            }
+            None if self.source_created_by_request(request_id, path) => {
+                apply_exact_text_edits(path, &old, &edits).map_err(|error| error.to_string())?
+            }
+            None => {
+                return Err(concurrent_source_conflict(
+                    path,
+                    "the file was absent from this session's source baseline",
+                ))
+            }
+        };
+        let reply = bridge
+            .set(path, &merged, &SendOpts::default(), None)
+            .map_err(stringify)?;
+        self.eps_preflight.write_applied(request_id, path, &merged);
+        self.record_file(
+            request_id,
+            WriteTool::FileWrite,
+            path,
+            Snapshot::FileContent { content: old },
+            Snapshot::FileContent { content: merged },
+        )?;
+        Ok(json!({
+            "ok": true,
+            "result": reply.trim(),
+            "editsApplied": edits.len(),
+        }))
+    }
+
     fn file_delete(&self, request_id: &str, args: &Value) -> Result<Value, String> {
         let path = str_arg(args, "path")?;
-        // Best-effort content snapshot for a future restore; a folder GET errors,
-        // which we tolerate (the delete still journals as a tail entry).
+        // Best-effort content snapshot for folder deletion. Text files are checked
+        // against this session's coherent source baseline before shared mutation.
         let old = self
             .bridge()?
             .get(path, &SendOpts::default(), None)
             .unwrap_or_default();
+        if let Some(base) = self.source_baseline(path)? {
+            if old != base {
+                return Err(concurrent_source_conflict(
+                    path,
+                    "the live file changed after this session read it",
+                ));
+            }
+        }
         let reply = self.send(&format!("DELFILE {path}"))?;
         self.eps_preflight.delete_applied(request_id, path);
         self.record_file(
@@ -836,6 +1031,18 @@ stop this turn, and wait for the backend to resume the same thread in write mode
 
     fn file_rename(&self, request_id: &str, args: &Value) -> Result<Value, String> {
         let (path, newname) = (str_arg(args, "path")?, str_arg(args, "newname")?);
+        if let Some(base) = self.source_baseline(path)? {
+            let current = self
+                .bridge()?
+                .get(path, &SendOpts::default(), None)
+                .map_err(stringify)?;
+            if current != base {
+                return Err(concurrent_source_conflict(
+                    path,
+                    "the live file changed after this session read it",
+                ));
+            }
+        }
         let to = sibling_path(path, newname);
         let reply = self.send(&format!("RENAME {path}\n{newname}"))?;
         self.eps_preflight.rename_applied(request_id, path, &to);
@@ -845,6 +1052,18 @@ stop this turn, and wait for the backend to resume the same thread in write mode
 
     fn file_move(&self, request_id: &str, args: &Value) -> Result<Value, String> {
         let path = str_arg(args, "path")?;
+        if let Some(base) = self.source_baseline(path)? {
+            let current = self
+                .bridge()?
+                .get(path, &SendOpts::default(), None)
+                .map_err(stringify)?;
+            if current != base {
+                return Err(concurrent_source_conflict(
+                    path,
+                    "the live file changed after this session read it",
+                ));
+            }
+        }
         let dest = args.get("destFolder").and_then(Value::as_str).unwrap_or("");
         let to = moved_path(path, dest);
         let reply = self.send(&format!("MOVEFILE {path}\n{dest}"))?;
@@ -1115,6 +1334,30 @@ stop this turn, and wait for the backend to resume the same thread in write mode
             .map_err(stringify)
     }
 
+    fn latest_file_content(&self, request_id: &str, path: &str) -> Option<String> {
+        self.services
+            .journal
+            .selected_entries(request_id, &crate::journal::DecisionIds::All)
+            .ok()?
+            .into_iter()
+            .rev()
+            .find_map(|entry| {
+                if entry.tool != WriteTool::FileWrite {
+                    return None;
+                }
+                let JournalTarget::Path { path: target } = entry.target else {
+                    return None;
+                };
+                if target != path {
+                    return None;
+                }
+                match entry.after {
+                    Snapshot::FileContent { content } => Some(content),
+                    _ => None,
+                }
+            })
+    }
+
     fn next_seq(&self, request_id: &str) -> u64 {
         self.services.journal.entry_count(request_id) as u64 + 1
     }
@@ -1171,10 +1414,21 @@ fn stringify(error: impl std::fmt::Display) -> String {
     error.to_string()
 }
 
+fn concurrent_source_conflict(path: &str, detail: &str) -> String {
+    format!("ConcurrentWriteConflict: `{path}` {detail}")
+}
+
 fn str_arg<'a>(args: &'a Value, name: &str) -> Result<&'a str, String> {
     args.get(name)
         .and_then(Value::as_str)
         .ok_or_else(|| format!("missing or non-string argument '{name}'"))
+}
+
+fn array_arg<'a>(args: &'a Value, name: &str) -> Result<&'a [Value], String> {
+    args.get(name)
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .ok_or_else(|| format!("missing or non-array argument '{name}'"))
 }
 
 fn i64_arg(args: &Value, name: &str) -> Result<i64, String> {

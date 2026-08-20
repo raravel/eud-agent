@@ -94,14 +94,15 @@ The correct eps way to write the constructs people most often miscode. These are
 - Button label tbl format is `[hotkey char]<qualifier>[bracketed text]` with a REQUIRED qualifier byte: `<00>` general command, `<01>` unit production, `<02>` research. A missing qualifier byte silently kills the hotkey (e.g. `w<00>[W] Skill` works; `w[W] Skill` does not). The editor stores `<NN>` escapes as text and converts them to `\xNN` at build."#;
 
 const EPS_PREFLIGHT_GUIDE: &str = r#"[eps preflight]
-- Before file_create/file_write for .eps, call eps_check with the complete candidate batch.
-- For mutually dependent new files, include every candidate in one eps_check call.
+- Before file_create/file_write/file_edit for .eps, call eps_check with every candidate in one batch. Pass complete code for creates/full rewrites or the same ordered exact edits used by file_edit.
+- Prefer file_edit for localized changes to existing files; use file_write only when replacing the complete file is intentional.
+- For mutually dependent files, include every candidate in one eps_check call.
 - Fix error diagnostics and re-check before writing. Warnings are advisory; explain any warning left unresolved.
 - If eps_check returns skipped, continue with the normal write and mandatory build_run flow.
 - eps_check never replaces build_run. After applying eps/file changes, build and repair using the existing three-attempt build budget."#;
 
 const BUILD_GUIDE: &str = r#"[build]
-- After you APPLY eps/file changes (file_write/file_create/plugin_*), ALWAYS run build_run in the SAME turn to verify the project compiles. Code you never built is NOT done.
+- After you APPLY eps/file changes (file_edit/file_write/file_create/plugin_*), ALWAYS run build_run in the SAME turn to verify the project compiles. Code you never built is NOT done.
 - build_run returns the complete structured result ({ok, errors with source/file/line/message/raw}); read it directly, fix the code, and build again on failure. The server enforces a 3-attempt self-fix budget per request; when it is spent, STOP and report the remaining errors to the user verbatim.
 - A failure whose message says no matching player exists (e.g. "연결맵에 조건에 맞는 플레이어가 없습니다") is a MAP setup problem, not an eps bug — fix it with player_setup (a Human controller AND a start location for at least one player), then rebuild."#;
 
@@ -1506,6 +1507,9 @@ impl CodexDriver for ProductionCodexDriver {
         .await
         .map_err(|error| AgentEngineError::new(error.to_string()))?
         .map_err(AgentEngineError::new)?;
+        self.runtime
+            .bind_workspace_root(&request_id, workspace.root.clone())
+            .map_err(AgentEngineError::new)?;
         self.active_workspace = Some(workspace.clone());
         let mut workspace_recorder = baseline.map(|baseline| {
             WorkspaceTurnRecorder::new(
@@ -4210,7 +4214,8 @@ mod tests {
         let preflight = prompt.find("[eps preflight]").unwrap();
         let build = prompt.find("[build]").unwrap();
         assert!(preflight < build);
-        assert!(prompt.contains("complete candidate batch"));
+        assert!(prompt.contains("every candidate in one batch"));
+        assert!(prompt.contains("ordered exact edits"));
         assert!(prompt.contains("Fix error diagnostics and re-check before writing"));
         assert!(prompt.contains("If eps_check returns skipped"));
         assert!(prompt.contains("eps_check never replaces build_run"));

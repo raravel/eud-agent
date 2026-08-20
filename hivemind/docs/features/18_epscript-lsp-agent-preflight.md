@@ -8,15 +8,15 @@
 ## Purpose
 
 Give Codex a fast, read-only epScript preflight before it mutates EUD Editor 3 project files.
-The preflight analyzes a batch of candidate `.eps` files against a snapshot of the whole editor
-project, resolves direct and transitive imports, and returns structured diagnostics to the same
-Codex turn. Codex fixes the candidates, checks again, and only then calls `file_create` /
-`file_write`.
+The preflight analyzes a batch of complete-code or exact-edit candidate `.eps` files against a
+snapshot of the whole editor project, resolves direct and transitive imports, and returns
+structured diagnostics to the same Codex turn. Codex fixes the candidates, checks again, and only
+then calls `file_create`, `file_write`, or `file_edit`.
 
 This complements, never replaces, the existing authoritative build loop:
 
 1. `eps_check` catches syntax, import, and analyzer-visible symbol mistakes before mutation.
-2. `file_create` / `file_write` applies only the corrected candidate.
+2. `file_create`, `file_write`, or `file_edit` applies only the corrected candidate.
 3. `build_run` remains mandatory after file mutations and catches real euddraft/editor semantics.
 
 The existing rules remain binding: diagnostics are advisory, absence of the analyzer never breaks
@@ -42,7 +42,7 @@ the turn, and a diagnostic never mechanically blocks a write.
 
 ## Goals
 
-- Add one read-only Codex tool, `eps_check`, that accepts one or more complete candidate files.
+- Add one read-only Codex tool, `eps_check`, that accepts one or more complete-code or exact-edit candidate files.
 - Analyze candidates in the context of every readable `.eps` file in the current editor project.
 - Resolve `import foo.bar [as alias];` against `foo/bar.eps` under an explicit project root.
 - Detect missing imports, case-insensitive path collisions, and import cycles independently of
@@ -109,7 +109,10 @@ Register `eps_check` as a non-mutating tool in `src-tauri/src/tools.rs`.
 {
   "files": [
     {"path": "main.eps", "code": "import lib.units; ..."},
-    {"path": "lib/units.eps", "code": "object UnitState { ... }"}
+    {
+      "path": "lib/units.eps",
+      "edits": [{"old_text": "oldCall();", "new_text": "newCall();"}]
+    }
   ]
 }
 ```
@@ -120,9 +123,13 @@ Contract:
 - Every `path` is a normalized, project-relative `.eps` path using `/` separators.
 - Paths must reject an absolute/prefixed path, `.` / `..`, an empty segment, NUL, and duplicate
   case-insensitive keys.
-- `code` is the complete candidate content, not a patch.
-- An existing path is overlaid as a modification; an absent path is overlaid as a proposed new
-  file. The editor is not touched in either case.
+- Each item contains exactly one of `code` or `edits`. `code` is the complete candidate content.
+  `edits` is a non-empty ordered array of exact `old_text`/`new_text` replacements; every
+  `old_text` must be non-empty and match exactly once at its step.
+- Edit candidates resolve against the reusable project mirror, then enter the same complete-file
+  atomic overlay as code candidates. Neither form mutates the editor or reusable mirror.
+- An absent path is valid only for a complete-code candidate; exact edits require an existing
+  readable mirror file.
 - A batch is required for mutually dependent new files: candidates are overlaid atomically before
   the import graph is built, so `a.eps` may import a new `b.eps` in the same call.
 
@@ -243,10 +250,11 @@ Rules:
 - The project id comes from the full snapshot project identity and is hashed, never used as a raw
   path component.
 - The first `eps_check` in each request refreshes the base mirror from `EPSNAPSHOT`.
-- Later checks in the same request reuse the mirror and atomically overlay the entire candidate
-  batch in a temporary analysis directory.
-- Successful `file_create`, `file_write`, `file_rename`, `file_move`, and `file_delete` operations
-  update/invalidate the cached mirror so a later check in the same turn sees the applied state.
+- Later checks in the same request reuse the mirror, resolve exact-edit candidates against it, and
+  atomically overlay the resulting complete candidate batch in a temporary analysis directory.
+- Successful `file_create`, `file_write`, `file_edit`, `file_rename`, `file_move`, and
+  `file_delete` operations update/invalidate the cached mirror so a later check in the same turn
+  sees the applied state.
 - A project identity change terminates the old adapter session and switches mirrors.
 - Candidate overlays use temp files plus rename. They are never copied back to the editor.
 - Mirror reads and adapter filesystem access are confined to the normalized mirror root.
@@ -311,7 +319,11 @@ do not require Node.
 Add an `[eps preflight]` system-prompt section before `[build]`:
 
 ```text
-- Before file_create/file_write for .eps, call eps_check with the complete candidate batch.
+- Before file_create/file_write/file_edit for .eps, call eps_check with every candidate in one
+  batch. Pass complete code for creates/full rewrites or the same ordered exact edits used by
+  file_edit.
+- Prefer file_edit for localized changes to existing files; use file_write only for intentional
+  complete replacement.
 - For mutually dependent files, include every candidate in one eps_check call.
 - Fix error diagnostics and re-check before writing.
 - Warnings are advisory; explain any warning left unresolved.
@@ -400,9 +412,10 @@ the same fixtures.
 
 ### 4. Expose and teach `eps_check`
 
-- Add the non-mutating schema to `tools.rs` and dispatch it from `tool_exec.rs`.
-- Overlay a complete candidate batch, call the analyzer, and return normalized JSON without
-  journaling.
+- Add the non-mutating complete-code/exact-edit schema to `tools.rs` and dispatch it from
+  `tool_exec.rs`.
+- Resolve edits against the mirror, overlay the resulting complete candidate batch, call the
+  analyzer, and return normalized JSON without journaling.
 - Update successful file mutations to keep/invalidate the request-local mirror.
 - Add the `[eps preflight]` prompt section in `engine.rs` before the existing mandatory `[build]`
   guide.
@@ -474,12 +487,13 @@ Run with the adapter package's exact lockfile:
 - Content-Length codec handles fragmented/multiple frames and rejects invalid/oversized lengths.
 - path normalization rejects traversal, prefixes, empty segments, and case-insensitive duplicates.
 - manifest decoder validates base64 paths, lengths, ordinals, token, and root containment.
-- candidate batches overlay atomically and never alter the base mirror/editor.
+- complete-code and exact-edit candidate batches overlay atomically and never alter the base
+  mirror/editor; edit matching rejects empty, missing, and ambiguous `old_text`.
 - fake analyzer result is returned as a non-mutating tool success with no journal entry.
 - every adapter/snapshot failure maps to a stable `skipped` result.
 - timeout/crash kills and reaps the child; one retry maximum per check.
 - project switch replaces process/mirror state; same-request calls reuse the snapshot.
-- successful create/write/rename/move/delete updates or invalidates mirror state.
+- successful create/write/edit/rename/move/delete updates or invalidates mirror state.
 - `eps_check` remains read-only in MCP descriptors and does not consume mutation/action budget.
 - tool catalog and system prompt include preflight before build guidance.
 - existing evidence, plan, build-attempt, and changeset tests remain unchanged and green.
@@ -524,7 +538,8 @@ With EUD Editor 3 and the app:
 
 ## Acceptance criteria
 
-- Codex can preflight one or multiple full `.eps` candidates before any editor mutation.
+- Codex can preflight one or multiple complete-code or exact-edit `.eps` candidates before any
+  editor mutation.
 - Mutually dependent candidates, direct imports, nested imports, and reverse dependents are checked
   against one coherent project snapshot.
 - Missing imports and cycles receive stable synthetic diagnostics; imported-file syntax errors are

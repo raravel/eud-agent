@@ -30,6 +30,9 @@ Every Codex turn has explicit `WorkspaceAccess::Read` or `WorkspaceAccess::Write
 - Write turns use `eud_workspace_write`: minimal runtime reads, the session workspace writable,
   `source/**` read-only, and network disabled.
 - Both require the elevated exact-root Windows sandbox. Unsupported or denied setup fails closed.
+- App-server command approvals are automatic in both modes so native commands and Code Mode
+  JavaScript can run inside the active profile. File-change, patch, and permission-expansion
+  approvals remain denied; neither command approval widens filesystem or network access.
 - Switching mode respawns the session's app-server when necessary, retains the thread id, and
   resumes the same conversation.
 
@@ -75,17 +78,24 @@ worker is discarded. No mutable global request pointer identifies MCP callers.
 
 Read tools: `project_status`, `list_files`, `read_file`, `eps_check`, `dat_get`, `xdat_get`,
 `tbl_get`, `req_get`, `btn_get`, `settings_get`, `plugins_list`, `map_info`, `map_minimap`,
-`search_docs`.
+`search_docs`. The DAT/XDAT/TBL/REQ/BTN getters require a non-empty `items` array, execute the
+items sequentially inside one runtime call, preserve input order, and return a per-item
+`ok`/value-or-error result with the identifying coordinates echoed.
 
 Flow tools: `propose_plan(markdown)`, `request_write_lane(reason)`.
 
 Write tools: `dat_set`, `xdat_set`, `tbl_set`, `req_set`, `btn_set`, `dat_reset`, `file_create`,
-`file_write`, `file_rename`, `file_delete`, `file_move`, `mkdir`, `set_main`, `settings_set`,
-`plugin_add`, `plugin_edit`, `plugin_remove`, `plugin_move`, `build_run`, `location_write`,
-`player_setup`, `switch_write`, `memory_write`.
+`file_write`, `file_edit`, `file_rename`, `file_delete`, `file_move`, `mkdir`, `set_main`,
+`settings_set`, `plugin_add`, `plugin_edit`, `plugin_remove`, `plugin_move`, `build_run`,
+`location_write`, `player_setup`, `switch_write`, `memory_write`.
+
+`file_edit` applies a non-empty ordered list of exact, uniquely matching `old_text`/`new_text`
+replacements to the session baseline, then uses the same non-overlapping live-change merge and
+full before/after journal snapshots as `file_write`.
 
 Evidence, first-principles, mutation-count, action-count, search, and three-build-attempt rails
-remain request scoped. `request_write_lane` is non-mutating and consumes no mutation budget.
+remain request scoped. The non-search action hard ceiling is 300 calls; each batched getter
+envelope consumes one action. `request_write_lane` is non-mutating and consumes no mutation budget.
 
 ## Session workspaces
 

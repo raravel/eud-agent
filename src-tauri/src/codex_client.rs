@@ -1286,10 +1286,15 @@ async fn handle_server_request<W>(
 where
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    let result = if should_accept_mcp_elicitation(method, params) {
-        serde_json::json!({ "action": "accept", "content": null })
-    } else {
-        decline_approval_result(method)
+    let result = match method {
+        "item/commandExecution/requestApproval" => {
+            serde_json::json!({ "decision": "accept" })
+        }
+        "execCommandApproval" => serde_json::json!({ "decision": "approved" }),
+        _ if should_accept_mcp_elicitation(method, params) => {
+            serde_json::json!({ "action": "accept", "content": null })
+        }
+        _ => decline_approval_result(method),
     };
 
     write_json_rpc_line(
@@ -1308,12 +1313,10 @@ fn decline_approval_result(method: &str) -> serde_json::Value {
         "mcpServer/elicitation/request" => {
             serde_json::json!({ "action": "decline", "content": null })
         }
-        "item/commandExecution/requestApproval"
-        | "item/fileChange/requestApproval"
-        | "item/permissions/requestApproval" => serde_json::json!({ "decision": "decline" }),
-        "execCommandApproval" | "applyPatchApproval" => {
-            serde_json::json!({ "decision": "denied" })
+        "item/fileChange/requestApproval" | "item/permissions/requestApproval" => {
+            serde_json::json!({ "decision": "decline" })
         }
+        "applyPatchApproval" => serde_json::json!({ "decision": "denied" }),
         _ => serde_json::json!({ "decision": "decline" }),
     }
 }
@@ -1991,6 +1994,15 @@ mod appserver_tests {
         assert_eq!(reply.pointer("/result/content"), Some(&Value::Null));
     }
 
+    fn assert_accepts_command_approval(reply: &Value, expected_id: &Value) {
+        assert_eq!(reply.get("jsonrpc").and_then(Value::as_str), Some("2.0"));
+        assert_eq!(reply.get("id"), Some(expected_id));
+        assert_eq!(
+            reply.pointer("/result/decision").and_then(Value::as_str),
+            Some("accept")
+        );
+    }
+
     fn assert_declines_approval(reply: &Value, expected_id: &Value) {
         assert_eq!(reply.get("jsonrpc").and_then(Value::as_str), Some("2.0"));
         assert_eq!(reply.get("id"), Some(expected_id));
@@ -2219,7 +2231,7 @@ mod appserver_tests {
             )
             .await;
             let command_reply = read_json_line(&mut client_requests).await;
-            assert_declines_approval(&command_reply, &json!("approval-command"));
+            assert_accepts_command_approval(&command_reply, &json!("approval-command"));
 
             write_json_line(
                 &mut server_responses,
@@ -2233,6 +2245,19 @@ mod appserver_tests {
             .await;
             let file_change_reply = read_json_line(&mut client_requests).await;
             assert_declines_approval(&file_change_reply, &json!("approval-file-change"));
+
+            write_json_line(
+                &mut server_responses,
+                json!({
+                    "jsonrpc":"2.0",
+                    "id":"approval-permissions",
+                    "method":"item/permissions/requestApproval",
+                    "params":{"reason":"read outside the session workspace"}
+                }),
+            )
+            .await;
+            let permissions_reply = read_json_line(&mut client_requests).await;
+            assert_declines_approval(&permissions_reply, &json!("approval-permissions"));
 
             write_json_line(
                 &mut server_responses,

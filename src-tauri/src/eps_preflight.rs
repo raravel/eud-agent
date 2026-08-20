@@ -22,6 +22,7 @@ use sha2::{Digest, Sha256};
 
 use crate::bridge_io::{EpsSnapshot, SendOpts};
 use crate::config::DataDirs;
+use crate::workspace::{apply_exact_text_edits, ExactTextEdit};
 
 pub const MAX_DIAGNOSTICS: usize = 200;
 pub const MAX_MESSAGE_BYTES: usize = 32 * 1024;
@@ -35,6 +36,22 @@ const WARM_REQUEST_DEADLINE: Duration = Duration::from_secs(5);
 pub struct EpsCandidate {
     pub path: String,
     pub code: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct EpsCandidateInput {
+    pub path: String,
+    pub code: Option<String>,
+    pub edits: Option<Vec<ExactTextEdit>>,
+}
+
+enum ValidatedCandidateInput {
+    Complete(EpsCandidate),
+    Edits {
+        path: String,
+        edits: Vec<ExactTextEdit>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -227,7 +244,27 @@ impl EpsPreflight {
         request_id: &str,
         candidates: Vec<EpsCandidate>,
     ) -> Result<EpsCheckResult, String> {
-        let candidates = validate_candidates(candidates)?;
+        let candidates = validate_candidates(candidates)?
+            .into_iter()
+            .map(ValidatedCandidateInput::Complete)
+            .collect();
+        self.check_validated(request_id, candidates)
+    }
+
+    pub(crate) fn check_inputs(
+        &self,
+        request_id: &str,
+        candidates: Vec<EpsCandidateInput>,
+    ) -> Result<EpsCheckResult, String> {
+        let candidates = validate_candidate_inputs(candidates)?;
+        self.check_validated(request_id, candidates)
+    }
+
+    fn check_validated(
+        &self,
+        request_id: &str,
+        candidates: Vec<ValidatedCandidateInput>,
+    ) -> Result<EpsCheckResult, String> {
         let mut state = self.state.lock();
         if state.request_id.as_deref() != Some(request_id) {
             state.request_id = Some(request_id.to_string());
@@ -272,6 +309,7 @@ impl EpsPreflight {
             .mirror_root
             .clone()
             .ok_or_else(|| "eps preflight mirror is unavailable".to_string())?;
+        let candidates = resolve_candidate_inputs(&mirror_root, candidates)?;
         let analysis_root = match prepare_analysis_root(&mirror_root, &candidates) {
             Ok(root) => root,
             Err(error) => {
@@ -613,6 +651,74 @@ pub(crate) fn normalize_project_path(value: &str) -> Result<String, String> {
 fn has_windows_prefix(value: &str) -> bool {
     let bytes = value.as_bytes();
     bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
+}
+
+fn validate_candidate_inputs(
+    candidates: Vec<EpsCandidateInput>,
+) -> Result<Vec<ValidatedCandidateInput>, String> {
+    if candidates.is_empty() {
+        return Err("eps_check requires at least one candidate file".to_string());
+    }
+    let mut seen = HashMap::<String, String>::new();
+    let mut validated = Vec::with_capacity(candidates.len());
+    for candidate in candidates {
+        let path = normalize_project_path(&candidate.path)?;
+        let key = path.to_lowercase();
+        if let Some(previous) = seen.insert(key, path.clone()) {
+            return Err(format!(
+                "candidate paths collide case-insensitively: {previous} and {path}"
+            ));
+        }
+        match (candidate.code, candidate.edits) {
+            (Some(code), None) => {
+                validated.push(ValidatedCandidateInput::Complete(EpsCandidate {
+                    path,
+                    code,
+                }));
+            }
+            (None, Some(edits)) if !edits.is_empty() => {
+                validated.push(ValidatedCandidateInput::Edits { path, edits });
+            }
+            (None, Some(_)) => {
+                return Err(format!(
+                    "eps_check edit candidate `{path}` requires at least one edit"
+                ));
+            }
+            (None, None) => {
+                return Err(format!(
+                    "eps_check candidate `{path}` requires exactly one of code or edits"
+                ));
+            }
+            (Some(_), Some(_)) => {
+                return Err(format!(
+                    "eps_check candidate `{path}` cannot contain both code and edits"
+                ));
+            }
+        }
+    }
+    Ok(validated)
+}
+
+fn resolve_candidate_inputs(
+    mirror_root: &Path,
+    candidates: Vec<ValidatedCandidateInput>,
+) -> Result<Vec<EpsCandidate>, String> {
+    candidates
+        .into_iter()
+        .map(|candidate| match candidate {
+            ValidatedCandidateInput::Complete(candidate) => Ok(candidate),
+            ValidatedCandidateInput::Edits { path, edits } => {
+                let source_path =
+                    confined_path(mirror_root, &path).map_err(|error| error.to_string())?;
+                let source = fs::read_to_string(&source_path).map_err(|error| {
+                    format!("cannot apply eps_check edits to `{path}`: {error}")
+                })?;
+                let code = apply_exact_text_edits(&path, &source, &edits)
+                    .map_err(|error| error.to_string())?;
+                Ok(EpsCandidate { path, code })
+            }
+        })
+        .collect()
 }
 
 fn validate_candidates(candidates: Vec<EpsCandidate>) -> Result<Vec<EpsCandidate>, String> {
@@ -1546,6 +1652,7 @@ mod tests {
 
     struct FakeAnalyzer {
         results: Mutex<VecDeque<Result<AnalyzerSuccess, AnalyzerError>>>,
+        requests: Mutex<Vec<AnalyzerRequest>>,
         calls: AtomicUsize,
         resets: AtomicUsize,
     }
@@ -1554,6 +1661,7 @@ mod tests {
         fn new(results: impl IntoIterator<Item = Result<AnalyzerSuccess, AnalyzerError>>) -> Self {
             Self {
                 results: Mutex::new(results.into_iter().collect()),
+                requests: Mutex::new(Vec::new()),
                 calls: AtomicUsize::new(0),
                 resets: AtomicUsize::new(0),
             }
@@ -1561,8 +1669,9 @@ mod tests {
     }
 
     impl EpsAnalyzer for FakeAnalyzer {
-        fn analyze(&self, _request: &AnalyzerRequest) -> Result<AnalyzerSuccess, AnalyzerError> {
+        fn analyze(&self, request: &AnalyzerRequest) -> Result<AnalyzerSuccess, AnalyzerError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
+            self.requests.lock().push(request.clone());
             self.results.lock().pop_front().unwrap()
         }
 
@@ -1581,6 +1690,47 @@ mod tests {
                 content: Some(code.to_string()),
             }],
         }
+    }
+
+    #[test]
+    fn edit_candidates_resolve_against_the_mirror_before_analysis() {
+        let dirs = temp_dirs("edit-candidate");
+        dirs.ensure_dirs().unwrap();
+        let snapshots = Arc::new(FakeSnapshotProvider::new([Ok(snapshot(
+            "Project",
+            "main.eps",
+            "function main() {\n    oldCall();\n}\n",
+        ))]));
+        let analyzer = Arc::new(FakeAnalyzer::new([Ok(success(&["main.eps"]))]));
+        let preflight =
+            EpsPreflight::with_snapshot_provider(dirs, analyzer.clone(), snapshots.clone());
+
+        preflight
+            .check_inputs(
+                "request",
+                vec![EpsCandidateInput {
+                    path: "main.eps".into(),
+                    code: None,
+                    edits: Some(vec![ExactTextEdit {
+                        old_text: "oldCall();".into(),
+                        new_text: "newCall();".into(),
+                    }]),
+                }],
+            )
+            .unwrap();
+
+        let requests = analyzer.requests.lock();
+        assert_eq!(
+            requests[0].candidates[0].code,
+            "function main() {\n    newCall();\n}\n"
+        );
+        let mirror_root = preflight.state.lock().mirror_root.clone().unwrap();
+        assert_eq!(
+            fs::read_to_string(mirror_root.join("main.eps")).unwrap(),
+            "function main() {\n    oldCall();\n}\n",
+            "candidate edits must not mutate the reusable mirror"
+        );
+        assert_eq!(snapshots.calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]

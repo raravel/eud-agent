@@ -13,6 +13,7 @@ use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use similar::{DiffTag, TextDiff};
 
 use crate::bridge_io::{BridgeIo, EpsSnapshot, HEARTBEAT_STALE_AFTER};
 use crate::config::{self, DataDirs};
@@ -573,7 +574,7 @@ impl WorkspaceManager {
         &self,
         entries: &[JournalEntry],
     ) -> io::Result<Vec<(PathBuf, Option<Vec<u8>>)>> {
-        let mut pending = BTreeMap::<PathBuf, (Option<Vec<u8>>, Option<Vec<u8>>)>::new();
+        let mut pending = BTreeMap::<PathBuf, PendingWorkspacePromotion>::new();
         let mut ordered = entries.iter().collect::<Vec<_>>();
         ordered.sort_by_key(|entry| entry.seq);
         for entry in ordered {
@@ -606,25 +607,39 @@ impl WorkspaceManager {
                 }
                 continue;
             }
-            let after = match &entry.after {
-                Snapshot::FileContent { content } => Some(content.as_bytes().to_vec()),
-                Snapshot::Deleted => None,
-                _ => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("workspace journal `{path}` has no promotable after snapshot"),
-                    ))
+            let base = workspace_snapshot_content(path, &entry.before, "before")?;
+            let after = workspace_snapshot_content(path, &entry.after, "after")?;
+            match pending.get_mut(&canonical_path) {
+                Some(promotion) => promotion.after = after.map(str::to_string),
+                None => {
+                    pending.insert(
+                        canonical_path,
+                        PendingWorkspacePromotion {
+                            relative: path.clone(),
+                            base: base.map(str::to_string),
+                            after: after.map(str::to_string),
+                        },
+                    );
                 }
-            };
-            let before = match pending.get(&canonical_path) {
-                Some((before, _)) => before.clone(),
-                None => optional_regular_file_bytes(&canonical_path)?,
-            };
-            pending.insert(canonical_path, (before, after));
+            }
+        }
+
+        let mut resolved = Vec::with_capacity(pending.len());
+        for (path, promotion) in pending {
+            let before = optional_regular_file_bytes(&path)?;
+            let after = merge_workspace_content(
+                &promotion.relative,
+                promotion.base.as_deref(),
+                promotion.after.as_deref(),
+                before.as_deref(),
+            )?;
+            if before != after {
+                resolved.push((path, before, after));
+            }
         }
 
         let mut promoted = Vec::new();
-        for (path, (before, after)) in pending {
+        for (path, before, after) in resolved {
             let applied = restore_optional_file_bytes(&path, after.as_deref());
             if let Err(error) = applied {
                 if let Err(rollback) = restore_promotions(&promoted) {
@@ -878,6 +893,223 @@ fn approved_plan_for_path<'a>(
     (!request_id.is_empty() && !request_id.contains('/'))
         .then(|| plans.get(request_id))
         .flatten()
+}
+
+#[derive(Debug)]
+struct PendingWorkspacePromotion {
+    relative: String,
+    base: Option<String>,
+    after: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TextEdit {
+    start: usize,
+    end: usize,
+    replacement: String,
+}
+
+fn workspace_snapshot_content<'a>(
+    path: &str,
+    snapshot: &'a Snapshot,
+    side: &str,
+) -> io::Result<Option<&'a str>> {
+    match snapshot {
+        Snapshot::FileContent { content } | Snapshot::DeletedFile { content, .. } => {
+            Ok(Some(content))
+        }
+        Snapshot::Created | Snapshot::Deleted => Ok(None),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("workspace journal `{path}` has no promotable {side} snapshot"),
+        )),
+    }
+}
+
+fn merge_workspace_content(
+    path: &str,
+    base: Option<&str>,
+    after: Option<&str>,
+    current_bytes: Option<&[u8]>,
+) -> io::Result<Option<Vec<u8>>> {
+    let current = current_bytes
+        .map(|bytes| {
+            std::str::from_utf8(bytes).map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("canonical workspace file `{path}` is not UTF-8: {error}"),
+                )
+            })
+        })
+        .transpose()?;
+
+    if current == base {
+        return Ok(after.map(|content| content.as_bytes().to_vec()));
+    }
+    if after == base || current == after {
+        return Ok(current.map(|content| content.as_bytes().to_vec()));
+    }
+
+    match (base, after, current) {
+        (Some(base), Some(after), Some(current)) => {
+            merge_text_changes(path, base, after, current).map(|merged| Some(merged.into_bytes()))
+        }
+        _ => Err(workspace_conflict(path)),
+    }
+}
+
+pub(crate) fn read_source_baseline(
+    workspace_root: &Path,
+    relative: &str,
+) -> io::Result<Option<String>> {
+    let source_root = workspace_root.join(SOURCE_DIR);
+    ensure_plain_directory(&source_root)?;
+    let path = confined_path(&source_root, relative, true)?;
+    optional_regular_file_bytes(&path)?
+        .map(|bytes| decode_utf8(bytes, relative))
+        .transpose()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ExactTextEdit {
+    pub old_text: String,
+    pub new_text: String,
+}
+
+pub(crate) fn apply_exact_text_edits(
+    path: &str,
+    content: &str,
+    edits: &[ExactTextEdit],
+) -> io::Result<String> {
+    if edits.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("file_edit requires at least one edit for `{path}`"),
+        ));
+    }
+
+    let mut candidate = content.to_owned();
+    for (index, edit) in edits.iter().enumerate() {
+        if edit.old_text.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("file_edit edit {index} for `{path}` has empty old_text"),
+            ));
+        }
+
+        let mut matches = candidate
+            .match_indices(&edit.old_text)
+            .map(|(offset, _)| offset);
+        let Some(offset) = matches.next() else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("file_edit edit {index} old_text was not found in `{path}`"),
+            ));
+        };
+        if matches.next().is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "file_edit edit {index} old_text occurs more than once in `{path}`; include more surrounding context"
+                ),
+            ));
+        }
+        drop(matches);
+        candidate.replace_range(offset..offset + edit.old_text.len(), &edit.new_text);
+    }
+    Ok(candidate)
+}
+
+pub(crate) fn merge_concurrent_text(
+    path: &str,
+    base: &str,
+    ours: &str,
+    current: &str,
+) -> io::Result<String> {
+    if current == base {
+        return Ok(ours.to_string());
+    }
+    if ours == base || ours == current {
+        return Ok(current.to_string());
+    }
+    merge_text_changes(path, base, ours, current)
+}
+
+fn merge_text_changes(path: &str, base: &str, ours: &str, theirs: &str) -> io::Result<String> {
+    let ours = text_edits(base, ours);
+    let theirs = text_edits(base, theirs);
+    for ours_edit in &ours {
+        for theirs_edit in &theirs {
+            if ours_edit != theirs_edit && text_edits_overlap(ours_edit, theirs_edit) {
+                return Err(workspace_conflict(path));
+            }
+        }
+    }
+
+    let mut edits = ours;
+    for edit in theirs {
+        if !edits.contains(&edit) {
+            edits.push(edit);
+        }
+    }
+    edits.sort_by_key(|edit| (edit.start, edit.end));
+
+    let base_lines = split_lines(base);
+    let mut merged = String::new();
+    let mut cursor = 0;
+    for edit in edits {
+        if edit.start < cursor || edit.end > base_lines.len() {
+            return Err(workspace_conflict(path));
+        }
+        merged.extend(base_lines[cursor..edit.start].iter().copied());
+        merged.push_str(&edit.replacement);
+        cursor = edit.end;
+    }
+    merged.extend(base_lines[cursor..].iter().copied());
+    Ok(merged)
+}
+
+fn text_edits(base: &str, changed: &str) -> Vec<TextEdit> {
+    let changed_lines = split_lines(changed);
+    TextDiff::from_lines(base, changed)
+        .ops()
+        .iter()
+        .filter(|operation| operation.tag() != DiffTag::Equal)
+        .map(|operation| {
+            let old = operation.old_range();
+            let new = operation.new_range();
+            TextEdit {
+                start: old.start,
+                end: old.end,
+                replacement: changed_lines[new].concat(),
+            }
+        })
+        .collect()
+}
+
+fn split_lines(content: &str) -> Vec<&str> {
+    content.split_inclusive('\n').collect()
+}
+
+fn text_edits_overlap(left: &TextEdit, right: &TextEdit) -> bool {
+    let left_insert = left.start == left.end;
+    let right_insert = right.start == right.end;
+    match (left_insert, right_insert) {
+        (true, true) => left.start == right.start,
+        (true, false) => left.start > right.start && left.start < right.end,
+        (false, true) => right.start > left.start && right.start < left.end,
+        (false, false) => left.start < right.end && right.start < left.end,
+    }
+}
+
+fn workspace_conflict(path: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!(
+            "ConcurrentWriteConflict: `{path}` changed in the same area since this session read it"
+        ),
+    )
 }
 
 fn optional_regular_file_bytes(path: &Path) -> io::Result<Option<Vec<u8>>> {
@@ -1256,6 +1488,54 @@ mod tests {
     }
 
     #[test]
+    fn exact_text_edits_apply_in_order_without_rewriting_untouched_content() {
+        let source =
+            "function first() {\n    oldCall();\n}\n\nfunction second() {\n    keep();\n}\n";
+        let edited = apply_exact_text_edits(
+            "main.eps",
+            source,
+            &[
+                ExactTextEdit {
+                    old_text: "oldCall();".into(),
+                    new_text: "newCall();".into(),
+                },
+                ExactTextEdit {
+                    old_text: "newCall();\n}".into(),
+                    new_text: "newCall();\n    addedCall();\n}".into(),
+                },
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(
+            edited,
+            "function first() {\n    newCall();\n    addedCall();\n}\n\nfunction second() {\n    keep();\n}\n"
+        );
+    }
+
+    #[test]
+    fn exact_text_edits_reject_empty_missing_and_ambiguous_matches() {
+        let source = "same();\nsame();\n";
+        for edit in [
+            ExactTextEdit {
+                old_text: String::new(),
+                new_text: "replacement".into(),
+            },
+            ExactTextEdit {
+                old_text: "missing();".into(),
+                new_text: "replacement".into(),
+            },
+            ExactTextEdit {
+                old_text: "same();".into(),
+                new_text: "replacement".into(),
+            },
+        ] {
+            assert!(apply_exact_text_edits("main.eps", source, &[edit]).is_err());
+        }
+        assert!(apply_exact_text_edits("main.eps", source, &[]).is_err());
+    }
+
+    #[test]
     fn prepare_creates_durable_dirs_and_coherent_source_mirror() {
         let (base, manager) = manager("prepare");
         let workspace = manager.prepare_snapshot(&snapshot()).unwrap();
@@ -1573,6 +1853,121 @@ mod tests {
         assert_eq!(
             fs::read_to_string(canonical.root.join("plans/req-approved.md")).unwrap(),
             "# Approved"
+        );
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn concurrent_session_accepts_merge_non_overlapping_changes() {
+        let (base, manager) = manager("session-merge");
+        let initial = snapshot();
+        let canonical = manager.prepare_snapshot(&initial).unwrap();
+        write_atomic_bytes(
+            &canonical.root.join("specs/game.md"),
+            b"# Game\n\nalpha: old\nbeta: old\n",
+        )
+        .unwrap();
+        let session_a = manager
+            .prepare_session_snapshot(&initial, "session-a")
+            .unwrap();
+        let session_b = manager
+            .prepare_session_snapshot(&initial, "session-b")
+            .unwrap();
+        let baseline_a = manager.begin_turn(&session_a, "req-merge-a").unwrap();
+        let baseline_b = manager.begin_turn(&session_b, "req-merge-b").unwrap();
+        write_atomic_bytes(
+            &session_a.root.join("specs/game.md"),
+            b"# Game\n\nalpha: session-a\nbeta: old\n",
+        )
+        .unwrap();
+        write_atomic_bytes(
+            &session_b.root.join("specs/game.md"),
+            b"# Game\n\nalpha: old\nbeta: session-b\n",
+        )
+        .unwrap();
+
+        let journal = JournalStore::new(base.join("roaming"));
+        WorkspaceTurnRecorder::new(manager.clone(), baseline_a, journal.clone())
+            .finish()
+            .unwrap();
+        WorkspaceTurnRecorder::new(manager.clone(), baseline_b, journal.clone())
+            .finish()
+            .unwrap();
+        let entries_a = JournalStore::load(base.join("roaming"), "req-merge-a")
+            .unwrap()
+            .entries;
+        let entries_b = JournalStore::load(base.join("roaming"), "req-merge-b")
+            .unwrap()
+            .entries;
+
+        manager
+            .record_accepted_entries("req-merge-a", &entries_a)
+            .unwrap();
+        manager
+            .record_accepted_entries("req-merge-b", &entries_b)
+            .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(canonical.root.join("specs/game.md")).unwrap(),
+            "# Game\n\nalpha: session-a\nbeta: session-b\n"
+        );
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn concurrent_session_accept_reports_overlapping_change_without_overwrite() {
+        let (base, manager) = manager("session-conflict");
+        let initial = snapshot();
+        let canonical = manager.prepare_snapshot(&initial).unwrap();
+        write_atomic_bytes(
+            &canonical.root.join("specs/game.md"),
+            b"# Game\n\nalpha: old\n",
+        )
+        .unwrap();
+        let session_a = manager
+            .prepare_session_snapshot(&initial, "session-a")
+            .unwrap();
+        let session_b = manager
+            .prepare_session_snapshot(&initial, "session-b")
+            .unwrap();
+        let baseline_a = manager.begin_turn(&session_a, "req-conflict-a").unwrap();
+        let baseline_b = manager.begin_turn(&session_b, "req-conflict-b").unwrap();
+        write_atomic_bytes(
+            &session_a.root.join("specs/game.md"),
+            b"# Game\n\nalpha: session-a\n",
+        )
+        .unwrap();
+        write_atomic_bytes(
+            &session_b.root.join("specs/game.md"),
+            b"# Game\n\nalpha: session-b\n",
+        )
+        .unwrap();
+
+        let journal = JournalStore::new(base.join("roaming"));
+        WorkspaceTurnRecorder::new(manager.clone(), baseline_a, journal.clone())
+            .finish()
+            .unwrap();
+        WorkspaceTurnRecorder::new(manager.clone(), baseline_b, journal.clone())
+            .finish()
+            .unwrap();
+        let entries_a = JournalStore::load(base.join("roaming"), "req-conflict-a")
+            .unwrap()
+            .entries;
+        let entries_b = JournalStore::load(base.join("roaming"), "req-conflict-b")
+            .unwrap()
+            .entries;
+
+        manager
+            .record_accepted_entries("req-conflict-a", &entries_a)
+            .unwrap();
+        let error = manager
+            .record_accepted_entries("req-conflict-b", &entries_b)
+            .unwrap_err();
+
+        assert!(error.to_string().contains("specs/game.md"));
+        assert_eq!(
+            fs::read_to_string(canonical.root.join("specs/game.md")).unwrap(),
+            "# Game\n\nalpha: session-a\n"
         );
         fs::remove_dir_all(base).ok();
     }

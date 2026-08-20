@@ -83,9 +83,10 @@ hosting, panel re-arm, and server spawning are REMOVED.
 - `eps_check` is read-only and advisory: NEVER journal it, consume mutation/action budget,
   gate a write, change evidence/plan/build state, or emit panel diagnostics state.
 - Candidate paths MUST be normalized project-relative `.eps` paths, collision-checked
-  case-insensitively, and confined beneath `%localappdata%\eud-agent\lsp_workspaces`.
-  Candidate batches overlay atomically in a disposable analysis directory; never copy
-  candidate data back to editor state.
+  case-insensitively, and confined beneath `%localappdata%\eud-agent\lsp_workspaces`. Each
+  candidate contains exactly one of complete `code` or ordered exact `edits`; edit candidates
+  resolve against the reusable mirror before analysis. Candidate batches overlay atomically in a
+  disposable analysis directory; never copy candidate data back to editor state.
 - The adapter resource, checksum, MIT license, and provenance are bundled from the pinned
   upstream commit. Verify SHA-256 before lazy startup. NEVER install npm packages,
   download code, invoke a shell, execute project code, or bundle a Node runtime at runtime.
@@ -112,6 +113,10 @@ hosting, panel re-arm, and server spawning are REMOVED.
   session root writable, `source/**` read-only, network disabled, elevated exact-root backend.
   Write mode is available only to the exact project/session/request lease owner. Unsupported
   setup fails closed; NEVER downgrade to legacy Windows workspace-write.
+- App-server command-execution requests MUST be auto-approved in both read and write modes so
+  native commands and Code Mode JavaScript run inside the active named profile. File-change,
+  patch, and generic permission-expansion requests MUST remain denied; command approval MUST
+  NEVER widen the profile's filesystem or network boundary.
 - Trusted baselines and acceptance metadata stay in `workspaces/.state/`, outside every Codex
   cwd. Each session `source/` is replaced from one coherent EPSNAPSHOT and is NEVER a
   live-editor write path.
@@ -163,6 +168,9 @@ hosting, panel re-arm, and server spawning are REMOVED.
   save. Verify by re-digesting the map after every write.
 - player_setup edits start-location units (214) + OWNR controllers through the SAME rails;
   its save also keeps `autoDefragmentLocations=false`.
+- switch_write edits SWNM/string data only. Switch ids are 1-256 and trigger
+  conditions/actions keep their numeric ids unchanged. Switch NAME bytes follow
+  the map string-table encoding and pass raw through the C ABI.
 
 ## Rust / C++ FFI (NEW)
 
@@ -171,9 +179,6 @@ hosting, panel re-arm, and server spawning are REMOVED.
   C-allocated buffers with the matching `isom_free`. A C++ exception must be caught at the
   shim and converted to an error code — NEVER allowed to unwind into Rust.
 - The engine is **statically linked** (Decision 09) — no `.dll` shipped or loaded. The
-- switch_write edits SWNM/string data only. Switch ids are 1-256 and trigger
-  conditions/actions keep their numeric ids unchanged. Switch NAME bytes follow
-  the map string-table encoding and pass raw through the C ABI.
   static `.lib` is produced by MSBuild; `isom-sys/build.rs` emits the link directives and
   bindgen generates the header bindings. Build requires the MSVC toolchain (same as Rust
   MSVC target).
@@ -255,11 +260,12 @@ hosting, panel re-arm, and server spawning are REMOVED.
 - Resumed turn text ALWAYS labels the user's text with a `[user message]` header after the
   prepended context; the system prompt carries the `[message format]` section (only
   `[user message]` is the instruction; a bug report there is a work request) (EUD-092).
-- The `[eps preflight]` section precedes `[build]`: submit the complete candidate batch,
-  fix error diagnostics, and re-check before `.eps` writes; mutually dependent new files
-  travel together. A skipped check falls through to writes and mandatory `build_run`.
-  epscript-lsp diagnostics are advisory only — annotate, never block apply; absence must
-  not break the flow. There is intentionally no mechanical “eps_check required” gate.
+- The `[eps preflight]` section precedes `[build]`: submit every candidate in one batch using
+  complete code for creates/full rewrites or the same ordered exact edits used by `file_edit`, fix
+  error diagnostics, and re-check before `.eps` writes; mutually dependent files travel together.
+  A skipped check falls through to writes and mandatory `build_run`. epscript-lsp diagnostics are
+  advisory only — annotate, never block apply; absence must not break the flow. There is
+  intentionally no mechanical “eps_check required” gate.
 
 ## Process
 
