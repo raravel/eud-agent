@@ -21,22 +21,26 @@ export interface MonacoEditorProps {
   onChange(next: string): void;
   /** Monaco language id. Defaults to plaintext for existing callers. */
   language?: string;
+  /** CSS height of the editor surface. */
+  height?: string | number;
 }
 
 export default function MonacoEditor({
   value,
   onChange,
   language = "plaintext",
+  height = "288px",
 }: MonacoEditorProps) {
   return (
     <Editor
-      height="288px"
+      height={height}
       defaultLanguage={language}
       value={value}
       onChange={(v) => onChange(v ?? "")}
       theme="vs-dark"
       options={{
         minimap: { enabled: false },
+        automaticLayout: true,
         fontSize: 13,
         wordWrap: "on",
         scrollBeyondLastLine: false,

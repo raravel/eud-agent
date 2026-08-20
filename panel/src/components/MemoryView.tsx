@@ -110,7 +110,7 @@ export function MemoryView({
       <div className={cn("overflow-hidden rounded border border-border", embedded ? "min-h-[220px] flex-1" : "min-h-[288px]")}>
         <Suspense
           fallback={
-            <div className={cn("flex items-center justify-center text-sm text-muted-foreground", embedded ? "h-[220px]" : "h-[288px]")}>
+            <div className={cn("flex min-h-[220px] items-center justify-center text-sm text-muted-foreground", embedded ? "h-full" : "h-[288px]")}>
               편집기를 여는 중…
             </div>
           }
@@ -119,6 +119,7 @@ export function MemoryView({
             value={activeValue}
             onChange={(value) => onEdited(activeFile, value)}
             language="markdown"
+            height={embedded ? "100%" : undefined}
           />
         </Suspense>
       </div>

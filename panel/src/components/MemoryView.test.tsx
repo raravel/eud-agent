@@ -12,14 +12,17 @@ vi.mock("@/components/MonacoEditor", async () => {
     value = "",
     onChange,
     language,
+    height,
   }: {
     value?: string;
     onChange?: (value: string) => void;
     language?: string;
+    height?: string | number;
   }) {
     return React.createElement("textarea", {
       "aria-label": "메모리 편집기",
       "data-language": language,
+      "data-height": height,
       value,
       onChange: (event: React.ChangeEvent<HTMLTextAreaElement>) =>
         onChange?.(event.currentTarget.value),
@@ -94,6 +97,25 @@ describe("MemoryView", () => {
     const editor = await screen.findByLabelText("메모리 편집기");
     expect(editor).toHaveValue(files.resources);
     expect(editor).toHaveAttribute("data-language", "markdown");
+  });
+
+  it("fills the available project-sidebar height with the editor", async () => {
+    const handlers = callbacks();
+    render(
+      <MemoryView
+        memory={memoryState()}
+        embedded
+        onClose={handlers.onClose}
+        onTabSelected={handlers.onTabSelected}
+        onEdited={handlers.onEdited}
+        onSave={handlers.onSave}
+      />,
+    );
+
+    expect(await screen.findByLabelText("메모리 편집기")).toHaveAttribute(
+      "data-height",
+      "100%",
+    );
   });
 
   it("editing a tab records the draft, enables Save when dirty, and saves {file, content}", async () => {
