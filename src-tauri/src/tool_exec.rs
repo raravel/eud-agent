@@ -9,6 +9,7 @@
 //! concurrent write registration, serializes each shared-state operation, applies
 //! validation and safety gates, and journals every project write for review.
 
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -116,6 +117,154 @@ struct SessionWriteState {
     ticket: Option<crate::write_coordinator::WriteTicket>,
     reason: Option<String>,
 }
+type AskEmitter = Arc<dyn Fn(crate::ipc::AskEvent) -> Result<(), String> + Send + Sync>;
+
+struct PendingAsk {
+    questions: Vec<crate::ipc::AskQuestion>,
+    response: tokio::sync::oneshot::Sender<Result<BTreeMap<String, crate::ipc::AskAnswer>, String>>,
+}
+
+#[derive(Default)]
+struct AskState {
+    next_id: u64,
+    emitter: Option<AskEmitter>,
+    pending: HashMap<String, PendingAsk>,
+}
+
+#[derive(serde::Deserialize)]
+struct AskToolInput {
+    questions: Vec<crate::ipc::AskQuestion>,
+}
+
+fn validate_ask_questions(questions: &[crate::ipc::AskQuestion]) -> Result<(), String> {
+    if !(1..=4).contains(&questions.len()) {
+        return Err("ask requires between 1 and 4 related questions".to_string());
+    }
+
+    let mut ids = HashSet::new();
+    for question in questions {
+        let id = question.id.trim();
+        if id.is_empty() || id.len() > 64 {
+            return Err("each ask question id must contain 1 to 64 characters".to_string());
+        }
+        if !ids.insert(id) {
+            return Err(format!("ask question id `{id}` is duplicated"));
+        }
+        if question.question.trim().is_empty() || question.question.len() > 1_000 {
+            return Err(format!(
+                "ask question `{id}` must contain 1 to 1000 characters"
+            ));
+        }
+        if question
+            .header
+            .as_ref()
+            .is_some_and(|header| header.len() > 80)
+        {
+            return Err(format!("ask question `{id}` header exceeds 80 characters"));
+        }
+        if question.options.is_empty() {
+            if question.multi {
+                return Err(format!(
+                    "ask question `{id}` cannot enable multi without selectable options"
+                ));
+            }
+            continue;
+        }
+        if !(2..=5).contains(&question.options.len()) {
+            return Err(format!(
+                "ask question `{id}` requires between 2 and 5 selectable options"
+            ));
+        }
+        let mut labels = HashSet::new();
+        for option in &question.options {
+            let label = option.label.trim();
+            if label.is_empty() || option.label.len() > 120 {
+                return Err(format!(
+                    "ask question `{id}` option labels must contain 1 to 120 characters"
+                ));
+            }
+            if !labels.insert(label) {
+                return Err(format!(
+                    "ask question `{id}` option label `{label}` is duplicated"
+                ));
+            }
+            if option
+                .description
+                .as_ref()
+                .is_some_and(|description| description.len() > 500)
+            {
+                return Err(format!(
+                    "ask question `{id}` option description exceeds 500 characters"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_ask_answers(
+    questions: &[crate::ipc::AskQuestion],
+    answers: BTreeMap<String, crate::ipc::AskAnswer>,
+) -> Result<BTreeMap<String, crate::ipc::AskAnswer>, String> {
+    if answers.len() != questions.len() {
+        return Err("ask response must answer every question exactly once".to_string());
+    }
+
+    let expected = questions
+        .iter()
+        .map(|question| question.id.as_str())
+        .collect::<HashSet<_>>();
+    if answers.keys().any(|id| !expected.contains(id.as_str())) {
+        return Err("ask response contains an unknown question id".to_string());
+    }
+
+    let mut normalized = BTreeMap::new();
+    for question in questions {
+        let answer = answers
+            .get(&question.id)
+            .ok_or_else(|| format!("ask question `{}` has no answer", question.id))?;
+        if answer.answers.is_empty() {
+            return Err(format!(
+                "ask question `{}` requires at least one answer",
+                question.id
+            ));
+        }
+        let max_answers = if question.multi {
+            question.options.len() + 1
+        } else {
+            1
+        };
+        if answer.answers.len() > max_answers {
+            return Err(format!(
+                "ask question `{}` accepts at most {max_answers} answer(s)",
+                question.id
+            ));
+        }
+        let mut values = Vec::with_capacity(answer.answers.len());
+        let mut seen = HashSet::new();
+        for value in &answer.answers {
+            let value = value.trim();
+            if value.is_empty() || value.len() > 2_000 {
+                return Err(format!(
+                    "ask question `{}` answers must contain 1 to 2000 characters",
+                    question.id
+                ));
+            }
+            if !seen.insert(value) {
+                return Err(format!(
+                    "ask question `{}` contains a duplicated answer",
+                    question.id
+                ));
+            }
+            values.push(value.to_string());
+        }
+        normalized.insert(
+            question.id.clone(),
+            crate::ipc::AskAnswer { answers: values },
+        );
+    }
+    Ok(normalized)
+}
 
 /// One session's MCP request state. Clones are shared only by that session's
 /// engine and loopback MCP handler.
@@ -129,6 +278,7 @@ pub struct SessionToolRuntime {
     pending_plan: Arc<Mutex<Option<(String, String)>>>,
     write_state: Arc<Mutex<SessionWriteState>>,
     execution_lock: Arc<Mutex<()>>,
+    ask: Arc<Mutex<AskState>>,
 }
 
 impl SessionToolRuntime {
@@ -146,6 +296,7 @@ impl SessionToolRuntime {
             pending_plan: Arc::new(Mutex::new(None)),
             write_state: Arc::new(Mutex::new(SessionWriteState::default())),
             execution_lock: Arc::new(Mutex::new(())),
+            ask: Arc::new(Mutex::new(AskState::default())),
         }
     }
 
@@ -165,6 +316,106 @@ impl SessionToolRuntime {
         self.services.dirs.clone()
     }
 
+    pub fn set_ask_emitter(
+        &self,
+        emitter: impl Fn(crate::ipc::AskEvent) -> Result<(), String> + Send + Sync + 'static,
+    ) {
+        self.ask.lock().emitter = Some(Arc::new(emitter));
+    }
+
+    pub async fn ask(&self, args: &Value) -> Result<Value, String> {
+        if self.current_request_id().is_none() {
+            return Err("no agent request is open; ask is only valid during a turn".to_string());
+        }
+        let input: AskToolInput = serde_json::from_value(args.clone())
+            .map_err(|error| format!("invalid ask arguments: {error}"))?;
+        validate_ask_questions(&input.questions)?;
+
+        let (request_id, response, emitter) = {
+            let mut ask = self.ask.lock();
+            if !ask.pending.is_empty() {
+                return Err("another ask request is already waiting for this session".to_string());
+            }
+            let emitter = ask
+                .emitter
+                .clone()
+                .ok_or_else(|| "ask UI is unavailable for this session".to_string())?;
+            ask.next_id = ask
+                .next_id
+                .checked_add(1)
+                .ok_or_else(|| "ask request id overflow".to_string())?;
+            let request_id = format!("ask-{}", ask.next_id);
+            let (send, response) = tokio::sync::oneshot::channel();
+            ask.pending.insert(
+                request_id.clone(),
+                PendingAsk {
+                    questions: input.questions.clone(),
+                    response: send,
+                },
+            );
+            (request_id, response, emitter)
+        };
+
+        self.emit_activity(crate::write_coordinator::SessionActivity::WaitingInput);
+        if let Err(error) = emitter(crate::ipc::AskEvent {
+            request_id: request_id.clone(),
+            questions: input.questions,
+        }) {
+            self.ask.lock().pending.remove(&request_id);
+            self.emit_activity_after_ask();
+            return Err(error);
+        }
+
+        let answers = response
+            .await
+            .map_err(|_| "ask response channel closed".to_string())??;
+        Ok(json!({ "answers": answers }))
+    }
+
+    pub fn answer_ask(
+        &self,
+        request_id: &str,
+        answers: BTreeMap<String, crate::ipc::AskAnswer>,
+    ) -> Result<(), String> {
+        let mut ask = self.ask.lock();
+        let pending = ask
+            .pending
+            .get(request_id)
+            .ok_or_else(|| format!("ask request `{request_id}` is not pending"))?;
+        let answers = validate_ask_answers(&pending.questions, answers)?;
+        let pending = ask
+            .pending
+            .remove(request_id)
+            .ok_or_else(|| format!("ask request `{request_id}` is not pending"))?;
+        drop(ask);
+        pending
+            .response
+            .send(Ok(answers))
+            .map_err(|_| format!("ask request `{request_id}` is no longer active"))?;
+        self.emit_activity_after_ask();
+        Ok(())
+    }
+
+    pub fn cancel_pending_ask(&self) {
+        let pending = {
+            let mut ask = self.ask.lock();
+            std::mem::take(&mut ask.pending)
+        };
+        for (_, pending) in pending {
+            let _ = pending
+                .response
+                .send(Err("ask request cancelled".to_string()));
+        }
+    }
+
+    fn emit_activity_after_ask(&self) {
+        let activity = if self.write_ticket().is_some() {
+            crate::write_coordinator::SessionActivity::RunningWrite
+        } else {
+            crate::write_coordinator::SessionActivity::RunningRead
+        };
+        self.emit_activity(activity);
+    }
     pub fn begin_request(&self, request_id: &str, project_id: &str) -> Result<(), String> {
         if let Some(ticket) = self.write_state.lock().ticket.as_ref() {
             return Err(format!(
@@ -249,6 +500,7 @@ impl SessionToolRuntime {
     }
 
     pub fn clear_current(&self) {
+        self.cancel_pending_ask();
         *self.request.lock() = None;
         *self.request_state.lock() = None;
         *self.pending_plan.lock() = None;
@@ -374,6 +626,12 @@ impl SessionToolRuntime {
     }
 
     pub fn execute(&self, tool: &str, args: &Value) -> Result<Value, String> {
+        if !self.ask.lock().pending.is_empty() {
+            return Err(
+                "a user answer is pending; wait for the ask tool to complete before calling another tool"
+                    .to_string(),
+            );
+        }
         let _execution = self.execution_lock.lock();
         let request_id = self.current_request_id().ok_or_else(|| {
             "no agent request is open; tool calls are only valid during a turn".to_string()
@@ -1543,6 +1801,90 @@ mod tests {
             .execute("project_status", &json!({}))
             .expect_err("a tool call outside a turn must be rejected");
         assert!(error.contains("no agent request is open"), "got: {error}");
+    }
+
+    #[tokio::test]
+    async fn ask_waits_for_all_answers_and_resumes_the_same_tool_call() {
+        let runtime = SessionToolRuntime::for_tests();
+        runtime.begin_request("req-ask", "project").unwrap();
+        let (events, mut emitted) = tokio::sync::mpsc::unbounded_channel();
+        runtime.set_ask_emitter(move |event| {
+            events
+                .send(event)
+                .map_err(|_| "ask event receiver closed".to_string())
+        });
+
+        let asking = runtime.clone();
+        let task = tokio::spawn(async move {
+            asking
+                .ask(&json!({
+                    "questions": [
+                        {
+                            "id": "mode",
+                            "header": "방식",
+                            "question": "어떤 방식을 사용할까요?",
+                            "options": [
+                                {"label": "A", "description": "첫 번째"},
+                                {"label": "B", "description": "두 번째"}
+                            ]
+                        },
+                        {
+                            "id": "features",
+                            "question": "필요한 항목을 고르세요.",
+                            "multi": true,
+                            "options": [
+                                {"label": "로그"},
+                                {"label": "알림"}
+                            ]
+                        }
+                    ]
+                }))
+                .await
+        });
+
+        let event = emitted.recv().await.expect("ask event must be emitted");
+        assert_eq!(event.questions.len(), 2);
+        assert_eq!(event.questions[0].id, "mode");
+
+        let incomplete = runtime
+            .answer_ask(
+                &event.request_id,
+                BTreeMap::from([(
+                    "mode".to_string(),
+                    crate::ipc::AskAnswer {
+                        answers: vec!["A".to_string()],
+                    },
+                )]),
+            )
+            .expect_err("every related question must be answered");
+        assert!(incomplete.contains("every question"));
+
+        runtime
+            .answer_ask(
+                &event.request_id,
+                BTreeMap::from([
+                    (
+                        "features".to_string(),
+                        crate::ipc::AskAnswer {
+                            answers: vec!["로그".to_string(), "직접 입력".to_string()],
+                        },
+                    ),
+                    (
+                        "mode".to_string(),
+                        crate::ipc::AskAnswer {
+                            answers: vec!["A".to_string()],
+                        },
+                    ),
+                ]),
+            )
+            .unwrap();
+
+        let result = task.await.unwrap().unwrap();
+        assert_eq!(result["answers"]["mode"]["answers"], json!(["A"]));
+        assert_eq!(
+            result["answers"]["features"]["answers"],
+            json!(["로그", "직접 입력"])
+        );
     }
 
     #[test]

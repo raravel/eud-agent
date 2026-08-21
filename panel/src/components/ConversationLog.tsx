@@ -37,7 +37,7 @@ import {
   ConversationScrollButton,
 } from "@/components/ai-elements/conversation";
 import { Message, MessageContent } from "@/components/ai-elements/message";
-import { Response } from "@/components/ai-elements/response";
+import { DiagramResponse } from "@/components/ai-elements/response";
 import { Shimmer } from "@/components/ai-elements/shimmer";
 import { Spinner } from "@/components/ui/spinner";
 import { cn } from "@/lib/utils";
@@ -299,7 +299,7 @@ function renderLogEntry(entry: LogEntry, context: RowRenderContext) {
     return (
       <Message from="assistant" className="text-foreground">
         <MessageContent>
-          <Response>{entry.text}</Response>
+          <DiagramResponse mode="static">{entry.text}</DiagramResponse>
         </MessageContent>
       </Message>
     );

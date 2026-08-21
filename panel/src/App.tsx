@@ -28,6 +28,7 @@ import { Toaster } from "@/components/ui/sonner";
 import { Header, type RagState } from "@/components/Header";
 import { ConversationLog } from "@/components/ConversationLog";
 import { ChangesetView } from "@/components/ChangesetView";
+import { AskCard } from "@/components/AskCard";
 import { PlanView } from "@/components/PlanView";
 import { InstructionBox, type ChatPayload } from "@/components/InstructionBox";
 import { ConnectionNotice } from "@/components/ConnectionNotice";
@@ -50,6 +51,7 @@ import {
   wikiSave,
   workspaceList,
   workspaceRead,
+  type AskAnswer,
   type LedgerEntry,
   type CodexModelSettings,
   type MemoryFile,
@@ -542,6 +544,9 @@ export default function App() {
         case "answer":
           sessionStore()?.answerReceived(msg.text);
           break;
+        case "ask":
+          sessionStore()?.askReceived(msg.requestId, msg.questions);
+          break;
         case "plan": {
           const targetSlot = scopedId
             ? sessionsRef.current.get(scopedId)
@@ -869,6 +874,7 @@ export default function App() {
       slot &&
       (slot.store.getState().phase === "thinking" ||
         slot.activity === "running_read" ||
+        slot.activity === "waiting_input" ||
         slot.activity === "running_write");
     if (!slot || !cancellable || messageActionBusyRef.current) {
       return;
@@ -991,6 +997,7 @@ export default function App() {
         !slot ||
         slot.activity === "running_read" ||
         slot.activity === "running_write" ||
+        slot.activity === "waiting_input" ||
         slot.activity === "review"
       )
         return;
@@ -1176,6 +1183,27 @@ export default function App() {
       slot.store.errorReceived("계획 승인 요청을 처리하지 못했습니다.");
     }
   }, [selectedSlot]);
+
+  const handleAskSubmit = useCallback(
+    async (answers: Record<string, AskAnswer>) => {
+      const slot = selectedSlot;
+      const ask = slot?.store.getState().ask;
+      if (!slot || !ask || ask.submitting) return;
+      slot.store.askSubmitStarted();
+      const sent = await clientRef.current?.send({
+        type: "ask_response",
+        sessionId: slot.id,
+        requestId: ask.requestId,
+        answers,
+      });
+      if (sent) {
+        slot.store.askAnswered();
+      } else {
+        slot.store.askSubmitFailed();
+      }
+    },
+    [selectedSlot],
+  );
 
   const handleDecide = useCallback(
     async (decision: "accept" | "reject", ids: "all" | string[]) => {
@@ -1440,6 +1468,9 @@ export default function App() {
             {selectedSlot.activity === "running_read" && (
               <span className="text-primary">분석 중</span>
             )}
+            {selectedSlot.activity === "waiting_input" && (
+              <span className="text-amber-400">응답 필요</span>
+            )}
             {selectedSlot.activity === "running_write" && (
               <span className="text-primary">변경 중 · 격리 워크스페이스</span>
             )}
@@ -1465,6 +1496,16 @@ export default function App() {
               selectedSlot.activity !== "error")
           }
         />
+
+        {state.ask && (
+          <AskCard
+            key={state.ask.requestId}
+            requestId={state.ask.requestId}
+            questions={state.ask.questions}
+            submitting={state.ask.submitting}
+            onSubmit={handleAskSubmit}
+          />
+        )}
 
         {state.plan &&
           (state.phase === "plan_review" || state.phase === "thinking") && (

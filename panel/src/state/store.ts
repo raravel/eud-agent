@@ -35,6 +35,7 @@
 
 import type {
   ChangesetItem,
+  AskQuestion,
   ChatAttachment,
   ContextUsage,
   FileEntry,
@@ -105,6 +106,13 @@ export interface PlanState {
   markdown: string;
   revision: number;
 }
+/** One pending ASK tool call owned by this session. */
+export interface AskState {
+  requestId: string;
+  questions: AskQuestion[];
+  submitting: boolean;
+}
+
 
 /**
  * One tool-call row in the current turn (EUD-065). `tool_call` opens a `running`
@@ -263,6 +271,8 @@ export interface PanelState {
   editorConnected: boolean;
   /** Active plan card (null until a `plan` event; replaced by higher revision). */
   plan: PlanState | null;
+  /** Structured user input currently blocking the AI turn. */
+  ask: AskState | null;
   /** Active changeset under review (null until a `changeset`; survives reconnect). */
   changeset: ChangesetState | null;
   /** Whether the project-memory overlay is open. */
@@ -327,6 +337,14 @@ export interface PanelStore {
   answerReceived(text: string): void;
   /** `plan` — enter/refresh plan_review (revision replaces the active card). */
   planReceived(markdown: string, revision: number): void;
+  /** Show a structured ASK card without ending the current turn. */
+  askReceived(requestId: string, questions: AskQuestion[]): void;
+  /** Disable the ASK form while its response command is in flight. */
+  askSubmitStarted(): void;
+  /** Re-enable the ASK form after a response command failed. */
+  askSubmitFailed(): void;
+  /** Remove the ASK card after the backend accepted its answers. */
+  askAnswered(): void;
   /** `changeset` — enter changeset_review with the journaled items. */
   changesetReceived(requestId: string, items: ChangesetItem[]): void;
   /** `rollback_result` — flip per-item decision state (rejected/failed). */
@@ -478,6 +496,7 @@ export function createPanelStore(): PanelStore {
     compiling: false,
     editorConnected: true,
     plan: null as PlanState | null,
+    ask: null as AskState | null,
     changeset: null as ChangesetState | null,
     memoryOpen: false,
     memory: null as MemoryViewState | null,
@@ -527,6 +546,7 @@ export function createPanelStore(): PanelStore {
       compiling: core.compiling,
       editorConnected: core.editorConnected,
       plan: core.plan,
+      ask: core.ask,
       changeset: core.changeset,
       memoryOpen: core.memoryOpen,
       memory: core.memory,
@@ -659,6 +679,7 @@ export function createPanelStore(): PanelStore {
       if (core.turnInFlight) {
         core.turnInFlight = false;
         core.plan = null;
+        core.ask = null;
         pushLog("warn", RECONNECT_TURN_NOTICE);
       }
       // The last changeset STAYS reviewable across a transport re-open (journal is
@@ -832,6 +853,30 @@ export function createPanelStore(): PanelStore {
       }
       core.turnInFlight = false;
       core.phase = "ready";
+      core.ask = null;
+      emit();
+    },
+
+    askReceived(requestId, questions) {
+      if (!core.turnInFlight) return;
+      core.ask = { requestId, questions, submitting: false };
+      emit();
+    },
+
+    askSubmitStarted() {
+      if (core.ask === null) return;
+      core.ask = { ...core.ask, submitting: true };
+      emit();
+    },
+
+    askSubmitFailed() {
+      if (core.ask === null) return;
+      core.ask = { ...core.ask, submitting: false };
+      emit();
+    },
+
+    askAnswered() {
+      core.ask = null;
       emit();
     },
 
@@ -845,6 +890,7 @@ export function createPanelStore(): PanelStore {
       core.turnInFlight = false;
       core.plan = { markdown, revision };
       core.phase = "plan_review";
+      core.ask = null;
       emit();
     },
 
@@ -856,6 +902,7 @@ export function createPanelStore(): PanelStore {
       core.turnInFlight = false;
       core.changeset = { request_id: requestId, items, decisions: {} };
       core.phase = "changeset_review";
+      core.ask = null;
       emit();
     },
 
@@ -925,6 +972,7 @@ export function createPanelStore(): PanelStore {
       // EUD-069 + F2: archive the turn blocks in stream order (tools + prose).
       clearLiveProgress();
       archiveTurnBlocks();
+      core.ask = null;
       if (core.phase !== "changeset_review") {
         core.turnInFlight = false;
         core.phase = "ready";
@@ -1015,6 +1063,7 @@ export function createPanelStore(): PanelStore {
       // intact (server archives it).
       core.turnInFlight = true;
       core.plan = null;
+      core.ask = null;
       core.turn = emptyTurn();
       nextTextBlockBreak = false;
       core.phase = "thinking";
@@ -1026,6 +1075,7 @@ export function createPanelStore(): PanelStore {
       // A new turn — reset the per-turn streaming buffers.
       core.turnInFlight = true;
       core.turn = emptyTurn();
+      core.ask = null;
       nextTextBlockBreak = false;
       core.phase = "thinking";
       emit();
@@ -1036,6 +1086,7 @@ export function createPanelStore(): PanelStore {
       // per-turn streaming buffers.
       core.turnInFlight = true;
       core.turn = emptyTurn();
+      core.ask = null;
       nextTextBlockBreak = false;
       core.phase = "thinking";
       emit();
@@ -1057,6 +1108,7 @@ export function createPanelStore(): PanelStore {
 
     cancelSent() {
       clearLiveProgress();
+      core.ask = null;
       core.turnInFlight = false;
       archiveTurnBlocks();
       pushLog("info", "작업을 중단했습니다.");

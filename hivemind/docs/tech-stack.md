@@ -9,7 +9,7 @@ user/system `node.exe`; no Node runtime is bundled.
 - react-dom 19.2.0 — DOM renderer
 - @monaco-editor/react ^4.7.0 — Monaco React wrapper (CDN loader forbidden; bundled)
 - monaco-editor ^0.55.1 — edit surface, loaded from npm bundle
-- streamdown ^2.5.0 — agent markdown/stream rendering (AI Elements pipeline)
+- streamdown ^2.5.0 + @streamdown/mermaid 1.0.2 — agent/plan Markdown and bundled Mermaid SVG rendering
 - radix-ui ^1.4.3 — shadcn/ui primitives
 - lucide-react ^1.17.0 — icons
 - class-variance-authority ^0.7.1, clsx ^2.1.1, tailwind-merge ^3.6.0 — styling utils

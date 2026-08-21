@@ -71,6 +71,35 @@ describe("send", () => {
     });
   });
 
+  it("returns ASK answers without starting a new chat turn", async () => {
+    const { invoke, listen } = makeHarness();
+    invoke.mockResolvedValue(undefined);
+    const client = new IpcClient({
+      invoke,
+      listen,
+      onMessage: () => {},
+    });
+
+    await client.send({
+      type: "ask_response",
+      sessionId: "session-a",
+      requestId: "ask-1",
+      answers: {
+        mode: { answers: ["빠르게"] },
+        features: { answers: ["로그", "진행률"] },
+      },
+    });
+
+    expect(invoke).toHaveBeenCalledWith("ask_response", {
+      sessionId: "session-a",
+      requestId: "ask-1",
+      answers: {
+        mode: { answers: ["빠르게"] },
+        features: { answers: ["로그", "진행률"] },
+      },
+    });
+  });
+
   it("sends changeset_decision via invoke", async () => {
     const { invoke, listen } = makeHarness();
     invoke.mockResolvedValue(undefined);
@@ -147,6 +176,47 @@ describe("inbound events", () => {
       sessionId: "session-a",
       kind: "reasoning",
       detail: "checking",
+    });
+  });
+
+  it("dispatches a structured ASK request for the addressed session", async () => {
+    const { invoke, listen, listeners } = makeHarness();
+    invoke.mockResolvedValue(undefined);
+    const received: ServerMessage[] = [];
+    const client = new IpcClient({
+      invoke,
+      listen,
+      onMessage: (message) => received.push(message),
+    });
+
+    await client.connect();
+    listeners.get("ask")?.({
+      payload: {
+        sessionId: "session-a",
+        requestId: "ask-1",
+        questions: [
+          {
+            id: "mode",
+            question: "방식을 고르세요.",
+            multi: false,
+            options: [{ label: "A" }, { label: "B" }],
+          },
+        ],
+      },
+    });
+
+    expect(received).toContainEqual({
+      type: "ask",
+      sessionId: "session-a",
+      requestId: "ask-1",
+      questions: [
+        {
+          id: "mode",
+          question: "방식을 고르세요.",
+          multi: false,
+          options: [{ label: "A" }, { label: "B" }],
+        },
+      ],
     });
   });
 

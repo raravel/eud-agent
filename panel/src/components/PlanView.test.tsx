@@ -18,7 +18,7 @@
  * a controlled renderer of the selected session's active plan.
  */
 import { describe, it, expect, vi } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { PlanView, type PlanViewProps } from "@/components/PlanView";
 import type { PlanState } from "@/state/store";
@@ -55,6 +55,20 @@ describe("PlanView — markdown render", () => {
     };
     render(<PlanView {...defaultPlanViewProps} plan={plan} />);
     expect(screen.getByText(/function tp/)).toBeInTheDocument();
+  });
+
+  it("renders Mermaid in the plan review surface", async () => {
+    const plan: PlanState = {
+      revision: 1,
+      markdown: "```mermaid\nflowchart LR\nA[요청] --> B[실행]\n```",
+    };
+    const { container } = render(
+      <PlanView {...defaultPlanViewProps} plan={plan} />,
+    );
+
+    await waitFor(() => {
+      expect(container.querySelector('[data-streamdown="mermaid"]')).not.toBeNull();
+    });
   });
 
   it("never injects a live <script> node (Streamdown sanitizes untrusted markdown)", () => {

@@ -219,6 +219,51 @@ describe("App concurrent sessions", () => {
     ).toBeInTheDocument();
   });
 
+  it("submits ASK answers to the blocked session without opening a new turn", async () => {
+    render(<App />);
+    const input = await screen.findByRole("textbox", { name: "지시 입력" });
+    await waitFor(() => expect(input).toBeEnabled());
+
+    fireEvent.change(input, { target: { value: "설계를 진행해 줘" } });
+    fireEvent.click(screen.getByRole("button", { name: "전송" }));
+    await waitFor(() => expect(tauri.resolveLongChat).toBeTypeOf("function"));
+    await waitFor(() => expect(tauri.listeners.has("ask")).toBe(true));
+
+    act(() => {
+      emit("session_activity", {
+        sessionId: "session-a",
+        activity: "waiting_input",
+      });
+      emit("ask", {
+        sessionId: "session-a",
+        requestId: "ask-1",
+        questions: [
+          {
+            id: "mode",
+            question: "방식을 고르세요.",
+            multi: false,
+            options: [{ label: "빠르게" }, { label: "세밀하게" }],
+          },
+        ],
+      });
+    });
+
+    expect(
+      screen.getByRole("button", { name: "Session A, 응답 필요" }),
+    ).toBeInTheDocument();
+    fireEvent.click(screen.getByLabelText("빠르게"));
+    fireEvent.click(screen.getByRole("button", { name: "답변 전달" }));
+
+    await waitFor(() => {
+      expect(tauri.invoke).toHaveBeenCalledWith("ask_response", {
+        sessionId: "session-a",
+        requestId: "ask-1",
+        answers: { mode: { answers: ["빠르게"] } },
+      });
+    });
+    expect(screen.queryByRole("region", { name: "AI 질문" })).not.toBeInTheDocument();
+  });
+
   it("preserves a collapsed plan after switching session tabs", async () => {
     render(<App />);
     await screen.findByRole("button", { name: "Session A, 유휴" });

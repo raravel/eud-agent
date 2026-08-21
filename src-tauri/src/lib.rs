@@ -305,6 +305,7 @@ pub fn run() {
             engine::engine_plan_feedback,
             engine::engine_plan_approve,
             engine::engine_changeset_decision,
+            engine::engine_ask_response,
             engine::engine_cancel,
             engine::engine_conversation_rewind,
             engine::engine_session_list,

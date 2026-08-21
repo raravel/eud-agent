@@ -78,6 +78,11 @@ sequenceDiagram
     C-->>P: emit progress {stage: rag}
     C->>C: codex exec (prompt via stdin)
     C-->>P: emit progress {stage: codex}
+    opt Codex needs a material user decision
+        C-->>P: emit ask {requestId, questions}
+        U->>P: select choices and/or enter Other
+        P->>C: invoke ask_response {answers}
+    end
     C->>L: inbox GET target (for diff)
     C-->>P: emit code {code, diff, diagnostics}
     U->>P: clicks Apply
@@ -252,7 +257,7 @@ churn caveat in rules.md applies only to the legacy chromadb, not the static `.b
 
 - SCA is fully defunct — never a settable/creatable type (CUI/RawText only).
 - NEWEPS duplicate filename returns ERROR (Decision 02).
-- Monaco is the edit surface; the diff tab renders the server-side unified diff
-  (now produced in Rust). Agent text renders via AI Elements + Streamdown.
+- Monaco is the edit surface; the diff tab renders the server-side unified diff. Agent text renders
+  via AI Elements + Streamdown; agent answers and plan cards enable bundled Mermaid SVG rendering.
 - Evidence gate + citations and the `[first principles]` system-prompt section are
   ported verbatim into the Rust tools/prompt layer (rules.md).

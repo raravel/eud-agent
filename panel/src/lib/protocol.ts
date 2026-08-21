@@ -197,6 +197,30 @@ export interface PlanMessage extends SessionScopedMessage {
   markdown: string;
   revision: number;
 }
+export interface AskOption {
+  label: string;
+  description?: string;
+}
+
+export interface AskQuestion {
+  id: string;
+  header?: string;
+  question: string;
+  options?: AskOption[];
+  multi: boolean;
+}
+
+/** `ask` pauses the current tool call until the user submits every answer. */
+export interface AskMessage extends SessionScopedMessage {
+  type: "ask";
+  requestId: string;
+  questions: AskQuestion[];
+}
+
+export interface AskAnswer {
+  answers: string[];
+}
+
 
 /** `changeset {request_id, items}` - journaled writes awaiting accept/reject. */
 export interface ChangesetMessage extends SessionScopedMessage {
@@ -236,6 +260,7 @@ export type BackendSessionActivity =
   | "idle"
   | "running_read"
   | "running_write"
+  | "waiting_input"
   | "review"
   | "error";
 
@@ -423,6 +448,7 @@ export interface SessionRecord extends SessionMeta {
 export type ServerMessage =
   | AgentEventMessage
   | ContextUsageMessage
+  | AskMessage
   | AnswerMessage
   | PlanMessage
   | ChangesetMessage
@@ -443,6 +469,7 @@ export const SERVER_MESSAGE_TYPES = [
   "context_usage",
   "answer",
   "plan",
+  "ask",
   "changeset",
   "rollback_result",
   "progress",
@@ -481,6 +508,13 @@ export interface PlanFeedbackMessage extends SessionCommand {
 export interface PlanApproveMessage extends SessionCommand {
   type: "plan_approve";
 }
+/** Resolve one pending ASK tool call without starting a new chat turn. */
+export interface AskResponseMessage extends SessionCommand {
+  type: "ask_response";
+  requestId: string;
+  answers: Record<string, AskAnswer>;
+}
+
 
 /** Accept or reject changeset items belonging to one session. */
 export interface ChangesetDecisionMessage extends SessionCommand {
@@ -549,6 +583,7 @@ export type ClientMessage =
   | ChatMessage
   | PlanFeedbackMessage
   | PlanApproveMessage
+  | AskResponseMessage
   | ChangesetDecisionMessage
   | CancelMessage
   | ConversationRewindMessage
@@ -565,6 +600,7 @@ export const CLIENT_MESSAGE_TYPES = [
   "chat",
   "plan_feedback",
   "plan_approve",
+  "ask_response",
   "changeset_decision",
   "cancel",
   "conversation_rewind",
@@ -666,6 +702,42 @@ export function isPlanMessage(value: unknown): value is PlanMessage {
   );
 }
 
+function isAskOption(value: unknown): value is AskOption {
+  return (
+    isObject(value) &&
+    typeof value.label === "string" &&
+    (value.description === undefined || typeof value.description === "string")
+  );
+}
+
+function isAskQuestion(value: unknown): value is AskQuestion {
+  return (
+    isObject(value) &&
+    typeof value.id === "string" &&
+    value.id.length > 0 &&
+    (value.header === undefined || typeof value.header === "string") &&
+    typeof value.question === "string" &&
+    value.question.length > 0 &&
+    typeof value.multi === "boolean" &&
+    (value.options === undefined ||
+      (Array.isArray(value.options) && value.options.every(isAskOption)))
+  );
+}
+
+/** True if `value` is a session-scoped pending ASK request. */
+export function isAskMessage(value: unknown): value is AskMessage {
+  return (
+    isObject(value) &&
+    value.type === "ask" &&
+    hasSessionId(value) &&
+    typeof value.requestId === "string" &&
+    value.requestId.length > 0 &&
+    Array.isArray(value.questions) &&
+    value.questions.length > 0 &&
+    value.questions.every(isAskQuestion)
+  );
+}
+
 /** True if `value` is a `changeset` message (request_id + items array). */
 export function isChangesetMessage(value: unknown): value is ChangesetMessage {
   return (
@@ -717,9 +789,14 @@ export function isSessionActivityMessage(
     isObject(value) &&
     value.type === "session_activity" &&
     hasSessionId(value) &&
-    ["idle", "running_read", "running_write", "review", "error"].includes(
-      String(value.activity),
-    )
+    [
+      "idle",
+      "running_read",
+      "waiting_input",
+      "running_write",
+      "review",
+      "error",
+    ].includes(String(value.activity))
   );
 }
 
@@ -815,6 +892,7 @@ export function isServerMessage(value: unknown): value is ServerMessage {
     isContextUsageMessage(value) ||
     isAnswerMessage(value) ||
     isPlanMessage(value) ||
+    isAskMessage(value) ||
     isChangesetMessage(value) ||
     isRollbackResultMessage(value) ||
     isProgressMessage(value) ||

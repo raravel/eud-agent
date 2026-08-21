@@ -71,7 +71,8 @@ rails, analyzer, and write coordinator. Each `SessionToolRuntime` separately own
 - evidence, mutation, action, search, and build budgets;
 - pending plan;
 - epScript preflight snapshot/suppression state;
-- write ticket and execution lock.
+- write ticket and execution lock;
+- one pending structured ASK request and its same-turn response channel.
 
 Each worker hosts its own `127.0.0.1` streamable-HTTP MCP endpoint and shuts it down when the
 worker is discarded. No mutable global request pointer identifies MCP callers.
@@ -89,13 +90,21 @@ transport, and timeout failures remain visible. The tool stays read-only and req
 registration; `list_files` separately owns path/type/settable metadata. `set_main` uses the same
 wrapper to journal its prior value.
 
-Flow tools: `propose_plan(markdown)`, `request_write_lane(reason)`.
+Flow tools: `ask(questions)`, `propose_plan(markdown)`, `request_write_lane(reason)`.
 
 Write tools: `dat_set`, `xdat_set`, `tbl_set`, `req_set`, `btn_set`, `dat_reset`, `file_create`,
 `file_write`, `file_edit`, `file_rename`, `file_delete`, `file_move`, `mkdir`, `set_main`,
 `settings_set`, `plugin_add`, `plugin_edit`, `plugin_remove`, `plugin_move`, `build_run`,
 `location_write`, `player_setup`, `switch_write`, `memory_write`.
 
+
+`ask` accepts one to four related questions. Each question has a stable id, optional header,
+optional 2-5 choices, and a `multi` flag; the panel always exposes direct input. The MCP call
+emits a session-scoped `ask` event, sets activity to `waiting_input`, and awaits
+`ask_response{sessionId,requestId,answers}` without holding the session engine mutex. A valid
+response resolves the original MCP call, restores read/write activity, and lets Codex continue
+the same turn. Missing/duplicate/oversized questions and incomplete or cardinality-invalid
+answers fail validation. Turn cancellation resolves every pending ASK as cancelled.
 `file_edit` applies a non-empty ordered list of exact, uniquely matching `old_text`/`new_text`
 replacements to the session baseline, then uses the same non-overlapping live-change merge and
 full before/after journal snapshots as `file_write`.
@@ -148,13 +157,14 @@ survive restart as review.
 
 ## Event and cancellation isolation
 
-`SessionEventSink` is constructed with one immutable session id. `agent_event`, `answer`, `plan`,
-`changeset`, `rollback_result`, turn `progress`, and turn `error` always carry that id. Global
-project/setup/bootstrap/RAG events remain unscoped. There is no `session_active` routing event or
-fallback to the selected panel row.
+`SessionEventSink` is constructed with one immutable session id. `agent_event`, `context_usage`,
+`ask`, `answer`, `plan`, `changeset`, `rollback_result`, turn `progress`, and turn `error` always
+carry that id. Global project/setup/bootstrap/RAG events remain unscoped. There is no
+`session_active` routing event or fallback to the selected panel row.
 
-`cancel {sessionId}` advances only that worker's cancellation generation or removes only its
-waiting write ticket. A writer with journal entries transitions to review and retains ownership.
+`cancel {sessionId}` advances only that worker's cancellation generation, cancels that session's
+pending ASK, or removes only its waiting write ticket. A writer with journal entries transitions
+to review and retains ownership.
 
 ## Verification
 
@@ -163,6 +173,9 @@ waiting write ticket. A writer with journal entries transitions to review and re
 - Coordinator tests prove one writer, write-intent FIFO, queue-position updates, scoped queued
   cancellation, review retention, and pending-review restoration priority.
 - Runtime tests prove request/evidence/budget/preflight isolation.
+- ASK tests prove one blocking MCP call emits one session-scoped related-question request,
+  rejects incomplete answers without consuming it, and returns mixed choice/direct answers to
+  the same call.
 - Workspace tests prove stable session snapshots, accepted promotion, canonical rejection
   invariance, and approved-plan preservation.
 - Panel integration tests prove overlapping `chat` invokes and strict event-to-`PanelStore`

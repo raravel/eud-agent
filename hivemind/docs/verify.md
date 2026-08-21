@@ -83,9 +83,10 @@ stages from v1 are retired as `server/` is removed.
 - Panel workspace: `npm --prefix panel test -- --run WorkspaceView ChangesetView ipc`
   covers explorer/viewer states, canonical wiki-home ordering, safe relative Markdown
   navigation, approved-plan badges, confined IPC shapes, and category `workspace` diffs.
-- Panel chat control/performance: `npm --prefix panel test -- --run ConversationLog InstructionBox store ipc`
-  covers edit-prefix truncation, cancel feedback, live-stage labels, and a 200-entry
-  conversation mounting fewer than 50 viewport/overscan rows.
+- Panel chat control/performance: `npm --prefix panel test -- --run App SessionSidebar ipc AskCard
+  AgentAnswer ConversationLog PlanView store` covers edit-prefix truncation, cancel feedback,
+  structured ASK routing/submission, Mermaid answer/plan rendering, live-stage labels, and a
+  200-entry conversation mounting fewer than 50 viewport/overscan rows.
 
 - Concurrent sessions: `cargo test -p eud-agent write_coordinator::tests`,
   `cargo test -p eud-agent workspace::tests::concurrent_session_accept`,
@@ -98,6 +99,10 @@ stages from v1 are retired as `server/` is removed.
   Select B and require `변경 중 · 격리 워크스페이스` plus the write-transition log. Repeat at
   1280×800 and 960×720 and require
   `document.documentElement.scrollWidth === document.documentElement.clientWidth`.
+- ASK + Mermaid browser smoke: use Mock-Tauri to emit a two-question `ask` event, submit mixed
+  single/multi/direct input, and require the exact same-session `ask_response` payload plus zero
+  horizontal overflow. Emit fenced Mermaid in an archived answer and plan; require real Mermaid
+  SVG nodes and no raw `pre/code` fallback.
 
 ## E2E (user-assisted, GUI)
 - MainFile architecture live smoke: with `main` (`ClassicTrigger`, not MainFile) and

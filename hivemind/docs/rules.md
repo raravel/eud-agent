@@ -218,6 +218,12 @@ hosting, panel re-arm, and server spawning are REMOVED.
 - Panel ↔ core is **Tauri IPC** (`invoke` + events) only — NO localhost socket, token, or
   Origin check, and NO `server.ready` (Decision 11). Reasoning renders dim/collapsible,
   answers prominent; NEVER render raw `agent_event` kind identifiers as user-facing text.
+- `ask` MUST be non-mutating and session-scoped. It may wait only on its per-session response
+  channel, NEVER while holding the session engine mutex. Every question id is unique; every
+  question must be answered; single-choice cardinality and multi-choice bounds are validated
+  backend-side. Cancel MUST release the pending tool call.
+- Mermaid is enabled only for AI answers (live and archived) and plan cards. It MUST use the
+  bundled `@streamdown/mermaid` package; NEVER fetch scripts, styles, or renderers from a CDN.
 - NEVER load panel assets from a CDN — JS/CSS/fonts/Monaco workers/Streamdown assets are
   bundled. Monaco MUST load from the `monaco-editor` npm bundle via `loader.config({
   monaco })`; the `@monaco-editor/react` default CDN loader is forbidden.

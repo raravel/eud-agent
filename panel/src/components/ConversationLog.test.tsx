@@ -17,7 +17,7 @@
  * text is rendered.
  */
 import { describe, it, expect, vi } from "vitest";
-import { fireEvent, render, screen, within } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { createPanelStore } from "@/state/store";
 import { ConversationLog } from "@/components/ConversationLog";
 
@@ -56,6 +56,21 @@ describe("ConversationLog — entries", () => {
     ).toBeInTheDocument();
     expect(screen.getByText("notes.eps")).toBeInTheDocument();
     expect(screen.getByText("2 KB")).toBeInTheDocument();
+  });
+
+  it("renders Mermaid diagrams in archived agent answers", async () => {
+    const store = createPanelStore();
+    store.log(
+      "agent",
+      "```mermaid\nflowchart LR\nA[요청] --> B[완료]\n```",
+    );
+    const { container } = render(
+      <ConversationLog log={store.getState().log} phase="ready" />,
+    );
+
+    await waitFor(() => {
+      expect(container.querySelector('[data-streamdown="mermaid"]')).not.toBeNull();
+    });
   });
 
   it("renders an applied confirmation entry", () => {

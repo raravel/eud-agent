@@ -5,6 +5,7 @@ import {
   ChevronLeft,
   ChevronRight,
   LoaderCircle,
+  MessageCircleQuestion,
   Pencil,
   Plus,
   Search,
@@ -18,6 +19,7 @@ import { cn } from "@/lib/utils";
 export type SessionActivity =
   | "idle"
   | "running_read"
+  | "waiting_input"
   | "running_write"
   | "review"
   | "error";
@@ -62,6 +64,8 @@ function activityLabel(row: SessionSidebarRow): string {
   switch (row.activity) {
     case "running_read":
       return "분석 중";
+    case "waiting_input":
+      return "응답 필요";
     case "running_write":
       return "변경 중";
     case "review":
@@ -80,6 +84,13 @@ function ActivityIcon({ activity }: { activity: SessionActivity }) {
       return (
         <LoaderCircle
           className="size-3.5 animate-spin text-primary motion-reduce:animate-none"
+          aria-hidden="true"
+        />
+      );
+    case "waiting_input":
+      return (
+        <MessageCircleQuestion
+          className="size-3.5 text-amber-400"
           aria-hidden="true"
         />
       );
@@ -143,6 +154,7 @@ export function SessionSidebar({
     if (
       row.activity === "running_read" ||
       row.activity === "running_write" ||
+      row.activity === "waiting_input" ||
       row.activity === "review"
     )
       return;

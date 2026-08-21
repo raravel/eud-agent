@@ -103,6 +103,7 @@ const PUSH_EVENT_TYPES = [
   "context_usage",
   "answer",
   "plan",
+  "ask",
   "changeset",
   "rollback_result",
   "progress",
@@ -306,6 +307,12 @@ export class IpcClient {
         };
       case "plan_approve":
         return { sessionId: msg.sessionId };
+      case "ask_response":
+        return {
+          sessionId: msg.sessionId,
+          requestId: msg.requestId,
+          answers: msg.answers,
+        };
       case "changeset_decision":
         return {
           sessionId: msg.sessionId,

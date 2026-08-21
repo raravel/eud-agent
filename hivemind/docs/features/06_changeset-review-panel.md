@@ -2,7 +2,7 @@
 
 Replaces the v1 target-picker/apply-bar flow ENTIRELY (user decision: full replacement — the agent chooses files/targets itself). The panel becomes a chat-first surface with three review affordances: streamed agent progress, plan review with feedback iteration, and an apply-then-review changeset with per-item and bulk accept/reject.
 
-**UI foundation (user decision 2026-06-05 — supersedes the earlier "dep pruning / no streamdown" carry-forward)**: the surface is built on vendored **Vercel AI Elements** components — mandatory: `Message`, `PromptInput`, `Plan` (plan approval), `Reasoning`; adopted alongside: `Conversation` (auto-scroll container), `Response` (message body), `Tool` (tool-call rows), `Loader`. Vendored SOURCE under `panel/components/ai-elements/` (fetched at dev time, committed — never a runtime CDN). ALL agent-authored markdown renders through **Streamdown** (streaming-safe markdown, npm-bundled) so text renders live as deltas arrive. See [[decisions/06_ai-elements-streamdown-adoption]].
+**UI foundation (user decision 2026-06-05 — supersedes the earlier "dep pruning / no streamdown" carry-forward)**: the surface is built on vendored **Vercel AI Elements** components — mandatory: `Message`, `PromptInput`, `Plan` (plan approval), `Reasoning`; adopted alongside: `Conversation` (auto-scroll container), `Response` (message body), `Tool` (tool-call rows), `Loader`. Vendored SOURCE under `panel/components/ai-elements/` (fetched at dev time, committed — never a runtime CDN). ALL agent-authored markdown renders through **Streamdown** (streaming-safe markdown, npm-bundled) so text renders live as deltas arrive. Agent answers and plan cards enable the bundled `@streamdown/mermaid` plugin; project/workspace Markdown retains its existing renderer scope. See [[decisions/06_ai-elements-streamdown-adoption]].
 
 ## UI layout
 
@@ -10,7 +10,7 @@ Replaces the v1 target-picker/apply-bar flow ENTIRELY (user decision: full repla
 +-------------------+--------------------------------+----------------------+
 | SessionSidebar    | selected session               | ProjectSidebar       |
 | + 새 세션          | Header + conversation          | DAT wiki / memory /  |
-| current project   | plan + changeset + PromptInput | workspace tabs       |
+| current project   | ASK + plan + changeset + input | workspace tabs       |
 | read / write wait  |                                |                      |
 | write / review     |                                |                      |
 +-------------------+--------------------------------+----------------------+
@@ -30,6 +30,7 @@ stateDiagram-v2
     [*] --> ready
     ready --> thinking: chat
     thinking --> ready: answer
+    thinking --> thinking: ASK request / response
     thinking --> plan_review: plan
     plan_review --> thinking: feedback / approve
     thinking --> changeset_review: changeset
@@ -39,7 +40,7 @@ stateDiagram-v2
 Backend `session_activity` is orthogonal:
 
 ```text
-idle | running_read | waiting_write(N) | running_write | review | error
+idle | running_read | waiting_input | running_write | review | error
 ```
 
 Chats are invoked immediately and different rows may be `running_read` together. Only declared
@@ -72,6 +73,7 @@ new writers.
 - **Status visibility** (user request 2026-06-05): header shows connection state transitions (연결 중 → 연결됨 → 재연결 중) and RAG model state with elapsed seconds while loading (`rag_warmup` started ts → done), reusing `progressLabel`.
 - **Agent stream (EUD-063 contract; EUD-068/069 amendments)**: per-turn `agent_event`s drive three surfaces — (1) `reasoning` deltas accumulate into the **Reasoning** component: dim/secondary, GPT-style, auto-open while streaming, collapses when the answer starts; (2) `delta` answer text streams into a PROMINENT (foreground) agent **Message/Response** via Streamdown; (3) `tool_call`/`tool_result` render as **Tool** rows showing the tool name (도구 호출 n건 summary retained) PLUS the call arguments (요청) and result text (결과) from `agent_event.data` inside the expandable card; a non-"completed" status renders a 실패 badge (EUD-068). Raw internal kind identifiers (`delta`, `answer`, `token_usage`, `turn_done`, `item_started`, `item_completed`, `event`) MUST NEVER appear as literal UI text. All per-turn surfaces reset when a new turn starts.
 - **Inline stream placement (EUD-069 — layout-crush fix)**: the live agent stream (Reasoning block + Tool rows + streamed answer bubble) renders INLINE at the END of the Conversation scroll area — NEVER as a fixed band between the log and the input (an unbounded band has no min-height escape and crushes the log/plan card; measured live: log 0px, plan 33px, 승인 button off-viewport). When a turn ends (answer/plan/changeset/error), the tool rows ARCHIVE into the log as a compact entry carrying the rows (`LogEntry.tools` → 도구 호출 n건 — name×k summary + expandable Tool cards) and the live buffer clears.
+- **Structured ASK**: the `ask` MCP tool may pause one running turn for up to four related questions. Each question renders as an accessible inline card with single-choice, multi-choice, and always-available direct input. The card validates that every question has an answer, sends `ask_response{sessionId,requestId,answers}`, and resolves the original tool call so Codex continues the same turn. `waiting_input` is backend-authoritative session activity, shown in the sidebar/header so an unselected blocked session remains discoverable; normal turn cancellation also cancels the pending ASK.
 - **Persistent turn status + stop**: while `phase === "thinking"`, a compact status bar stays
   attached to the bottom PromptInput instead of scrolling away. It derives the current label
   from the live turn and exposes `작업 중단`. Cancel names the selected `sessionId`; it interrupts
@@ -86,8 +88,8 @@ new writers.
   The virtual height remains inside `use-stick-to-bottom`, preserving stream autoscroll and
   the existing scroll-to-bottom control without retaining all 500 capped rows in the DOM.
 - **Decision progress (EUD-070)**: while a `changeset_decision` awaits its `rollback_result`, ChangesetView shows a spinner notice (결정 처리 중…) — a rollback replays inverse ops over the 1s-tick file IPC, so the wait is visible, not just silently-disabled buttons.
-- **Answer prominence**: agent answers are the most visible text in the log (foreground Message bubbles, Streamdown-rendered); system/progress/info rows stay muted. (Inverts the original v2 styling where answers were muted.)
-- **Plan review (EUD-074 — user decision 2026-06-05)**: ai-elements **Plan** component; plan markdown renders via Streamdown. The embedded feedback textarea and the [수정요청] button are REMOVED: **the MAIN prompt input is the feedback channel** — during plan_review it stays ENABLED with a guidance placeholder, and a send routes to `plan_feedback{text}` (App routes by phase; the panel stays in plan_review until the next `plan{revision+1}` replaces the card). [승인] on the plan card sends `plan_approve`. `plan_review` is therefore NOT a send-gated busy phase (only `thinking` is).
+- **Answer prominence + Mermaid**: agent answers are the most visible text in the log (foreground Message bubbles, Streamdown-rendered). Both live and archived agent answers render fenced `mermaid` blocks as interactive bundled SVG diagrams; system/progress/info rows stay muted.
+- **Plan review (EUD-074 — user decision 2026-06-05)**: ai-elements **Plan** component; plan markdown renders via Streamdown static mode with the same fenced-Mermaid support as agent answers. The embedded feedback textarea and the [수정요청] button are REMOVED: **the MAIN prompt input is the feedback channel** — during plan_review it stays ENABLED with a guidance placeholder, and a send routes to `plan_feedback{text}` (App routes by phase; the panel stays in plan_review until the next `plan{revision+1}` replaces the card). [승인] on the plan card sends `plan_approve`. `plan_review` is therefore NOT a send-gated busy phase (only `thinking` is).
   Plan expansion is UI-only state owned by each `SessionSlot`: switching session tabs preserves a
   manually collapsed plan, while a genuinely newer revision opens automatically. Clicking [승인]
   immediately collapses the approved revision while its execution turn runs; the accessible Plan
@@ -97,8 +99,8 @@ new writers.
   message calls `session_create`, replaces the draft id with the Rust id, and invokes `chat`
   immediately.
 - **Multi-active state**: every row owns a `PanelStore` and backend-owned
-  `idle|running_read|waiting_write|running_write|review|error` activity. Labels are `분석 중`,
-  `쓰기 대기 N`, `변경 중`, and `검토 필요`. Conversation events route only by required immutable
+  `idle|running_read|waiting_input|running_write|review|error` activity. Labels are `분석 중`,
+  `응답 필요`, `변경 중`, and `검토 필요`. Conversation events route only by required immutable
   `sessionId`; project events fan out to every row. Sidebar selection never calls backend
   activation and never changes execution ownership.
 - **Changeset review**: grouped DAT/file/settings/plugin/main/workspace entries retain the
@@ -138,16 +140,21 @@ new writers.
 - Full Vitest, TypeScript, and production build remain required.
 - Mock-Tauri browser smoke observes simultaneous active-write and review rows at 1280 px and
   960 px with no horizontal overflow.
+- Browser smoke submits a mixed single/multi/direct ASK response, verifies the exact `ask_response`
+  payload and zero horizontal overflow, then verifies real Mermaid SVG rendering in archived
+  answers and plan review (no raw code-block fallback).
 
 ## Implementation
 
 - `panel/src/App.tsx` — immediate per-session invocation, immutable event routing, backend activity
-  handling, pending-review reconnect.
-- `panel/src/lib/protocol.ts` / `ipc.ts` — required conversation `sessionId` and
-  `session_activity`.
-- `panel/src/state/store.ts` — independent conversation state per row.
+  handling, pending ASK response, pending-review reconnect.
+- `panel/src/lib/protocol.ts` / `ipc.ts` — required conversation `sessionId`, `ask` /
+  `ask_response`, and `session_activity`.
+- `panel/src/state/store.ts` — independent conversation and pending-ASK state per row.
+- `panel/src/components/AskCard.tsx` — accessible related-question form with single, multi, and
+  direct inputs.
 - `panel/src/components/SessionSidebar.tsx` — backend activity labels, waiting cancellation,
   clipping, collapse, and splitter behavior.
-- `panel/src/App.test.tsx` — overlapping invokes and interleaved store routing.
-- Existing AI Elements, Streamdown, attachment, workspace, plan, changeset, and virtualization
-  components remain the rendering implementation.
+- `panel/src/components/{AgentAnswer,ConversationLog,PlanView}.tsx` plus the vendored
+  `DiagramResponse` — scoped Mermaid rendering for AI answers and plans.
+- App/component tests cover ASK routing/submission and Mermaid plugin wiring.

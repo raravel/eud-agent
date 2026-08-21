@@ -18,7 +18,7 @@ import {
   PlanTitle,
   PlanTrigger,
 } from "@/components/ai-elements/plan";
-import { Response } from "@/components/ai-elements/response";
+import { DiagramResponse } from "@/components/ai-elements/response";
 import { Button } from "@/components/ui/button";
 import type { PlanState } from "@/state/store";
 
@@ -67,7 +67,9 @@ export function PlanView({
           {/* Key on the revision: a new plan is a FULL replacement (not a
               streaming append), so remount Streamdown to avoid stale cached
               blocks from the previous revision. */}
-          <Response key={plan.revision}>{plan.markdown}</Response>
+          <DiagramResponse key={plan.revision} mode="static">
+            {plan.markdown}
+          </DiagramResponse>
         </PlanContent>
       </Plan>
 

@@ -16,6 +16,7 @@ use tokio::sync::watch;
 pub enum SessionActivity {
     Idle,
     RunningRead,
+    WaitingInput,
     RunningWrite,
     Review,
     Error,

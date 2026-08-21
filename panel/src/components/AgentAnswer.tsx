@@ -9,7 +9,7 @@
  * delta arrives).
  */
 import { Message, MessageContent } from "@/components/ai-elements/message";
-import { Response } from "@/components/ai-elements/response";
+import { DiagramResponse } from "@/components/ai-elements/response";
 
 export interface AgentAnswerProps {
   /** The accumulated answer text (store turn.answer or a final answer{}). */
@@ -21,7 +21,7 @@ export function AgentAnswer({ text }: AgentAnswerProps) {
   return (
     <Message from="assistant" className="text-foreground">
       <MessageContent>
-        <Response>{text}</Response>
+        <DiagramResponse>{text}</DiagramResponse>
       </MessageContent>
     </Message>
   );

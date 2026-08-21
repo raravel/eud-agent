@@ -10,7 +10,7 @@
  *   export function AgentAnswer(props): JSX.Element | null;  // null when text === ""
  */
 import { describe, it, expect } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { render, screen, waitFor } from "@testing-library/react";
 import { AgentAnswer } from "@/components/AgentAnswer";
 
 describe("AgentAnswer — prominent streamed answer", () => {
@@ -40,5 +40,15 @@ describe("AgentAnswer — prominent streamed answer", () => {
     expect(screen.getByText("안녕")).toBeInTheDocument();
     rerender(<AgentAnswer text="안녕하세요 반갑습니다" />);
     expect(screen.getByText(/반갑습니다/)).toBeInTheDocument();
+  });
+
+  it("renders a Mermaid code fence as a diagram", async () => {
+    const { container } = render(
+      <AgentAnswer text={"```mermaid\ngraph TD\nA[시작] --> B[완료]\n```"} />,
+    );
+
+    await waitFor(() => {
+      expect(container.querySelector('[data-streamdown="mermaid"]')).not.toBeNull();
+    });
   });
 });

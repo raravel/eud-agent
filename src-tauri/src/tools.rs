@@ -24,6 +24,8 @@ pub const SEARCH_DOCS_TOOL: &str = "search_docs";
 pub const EPS_CHECK_TOOL: &str = "eps_check";
 /// Flow-control tool that records write intent without mutating the project.
 pub const REQUEST_WRITE_WORKSPACE_TOOL: &str = "request_write_workspace";
+/// Flow-control tool that pauses the current turn for structured user input.
+pub const ASK_TOOL: &str = "ask";
 
 /// Maximum admitted non-search tool actions in one user request.
 const MAX_TOOL_ACTIONS: usize = 300;
@@ -249,6 +251,35 @@ fn eps_candidates_schema() -> Value {
         "items": candidate,
     })
 }
+fn ask_questions_schema() -> Value {
+    let options = json!({
+        "type": "array",
+        "minItems": 2,
+        "maxItems": 5,
+        "items": object_schema(
+            json!({
+                "label": string_schema(),
+                "description": string_schema(),
+            }),
+            &["label"],
+        ),
+    });
+    json!({
+        "type": "array",
+        "minItems": 1,
+        "maxItems": 4,
+        "items": object_schema(
+            json!({
+                "id": string_schema(),
+                "header": string_schema(),
+                "question": string_schema(),
+                "options": options,
+                "multi": {"type": "boolean"},
+            }),
+            &["id", "question"],
+        ),
+    })
+}
 
 fn dat_names_schema() -> Value {
     enum_string_schema(&[
@@ -452,6 +483,12 @@ pub fn tool_registry() -> Vec<ToolSpec> {
                 }),
                 &["query"],
             ),
+        ),
+        tool_spec(
+            ASK_TOOL,
+            "Pause this turn to ask the user up to four related questions. Each question supports single or multiple choice and always allows direct input.",
+            false,
+            schema(json!({"questions": ask_questions_schema()}), &["questions"]),
         ),
         tool_spec(
             REQUEST_WRITE_WORKSPACE_TOOL,
@@ -4391,6 +4428,14 @@ mod tests {
                         "k": integer_schema(),
                     }),
                     &["query"],
+                ),
+            ),
+            (
+                ASK_TOOL,
+                false,
+                schema(
+                    serde_json::json!({"questions": ask_questions_schema()}),
+                    &["questions"],
                 ),
             ),
             (

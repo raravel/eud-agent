@@ -26,6 +26,7 @@ describe("initial state", () => {
     expect(s.hasProject).toBe(false);
     expect(s.files).toEqual([]);
     expect(s.plan).toBeNull();
+    expect(s.ask).toBeNull();
     expect(s.changeset).toBeNull();
     expect(s.contextUsage).toBeNull();
     expect(s.connected).toBe(false);
@@ -129,6 +130,49 @@ describe("turn transitions (ready <-> thinking -> plan_review|changeset_review)"
     ]);
     store.chatSent();
     expect(store.getState().phase).toBe("thinking");
+  });
+});
+
+describe("ASK lifecycle", () => {
+  const questions = [
+    {
+      id: "mode",
+      question: "방식을 고르세요.",
+      multi: false,
+      options: [{ label: "A" }, { label: "B" }],
+    },
+  ];
+
+  it("keeps the same turn active while the user answers", () => {
+    const store = readyWithProject();
+    store.chatSent();
+    store.askReceived("ask-1", questions);
+
+    expect(store.getState().phase).toBe("thinking");
+    expect(store.getState().ask).toEqual({
+      requestId: "ask-1",
+      questions,
+      submitting: false,
+    });
+
+    store.askSubmitStarted();
+    expect(store.getState().ask?.submitting).toBe(true);
+    store.askSubmitFailed();
+    expect(store.getState().ask?.submitting).toBe(false);
+    store.askAnswered();
+
+    expect(store.getState().ask).toBeNull();
+    expect(store.getState().phase).toBe("thinking");
+  });
+
+  it("clears a pending question when the turn is cancelled", () => {
+    const store = readyWithProject();
+    store.chatSent();
+    store.askReceived("ask-2", questions);
+    store.cancelSent();
+
+    expect(store.getState().ask).toBeNull();
+    expect(store.getState().phase).toBe("ready");
   });
 });
 
@@ -589,6 +633,7 @@ describe("v1 protocol literals are absent (no compat shim)", () => {
         "chat",
         "plan_feedback",
         "plan_approve",
+        "ask_response",
         "changeset_decision",
         "cancel",
         "conversation_rewind",
@@ -602,6 +647,7 @@ describe("v1 protocol literals are absent (no compat shim)", () => {
         "context_usage",
         "answer",
         "plan",
+        "ask",
         "changeset",
         "rollback_result",
         "error",

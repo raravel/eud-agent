@@ -6,6 +6,7 @@
    node_modules — without this @source those classes are never generated and
    links render as unstyled body text (streamdown README "Tailwind setup"). */
 @source "../node_modules/streamdown/dist/*.js";
+@source "../node_modules/@streamdown/mermaid/dist/*.js";
 
 @custom-variant dark (&:is(.dark *));
 

@@ -70,6 +70,12 @@ journal; mutating tools are gated until search_docs has grounded the change.",
         let name = request.name.to_string();
         let args = Value::Object(request.arguments.unwrap_or_default());
         let runtime = self.runtime.clone();
+        if name == crate::tools::ASK_TOOL {
+            return match self.runtime.ask(&args).await {
+                Ok(value) => Ok(CallToolResult::success(render_contents(&value))),
+                Err(message) => Ok(CallToolResult::error(vec![Content::text(message)])),
+            };
+        }
 
         // Tool execution does blocking bridge / map file I/O; keep it off the
         // async runtime so the MCP server stays responsive.
@@ -218,6 +224,7 @@ mod tests {
         assert!(tools.iter().any(|tool| tool.name == "map_info"));
         assert!(tools.iter().any(|tool| tool.name == "map_minimap"));
         assert!(tools.iter().any(|tool| tool.name == "switch_write"));
+        assert!(tools.iter().any(|tool| tool.name == crate::tools::ASK_TOOL));
         // SCA is fully defunct — it must never appear as a tool.
         assert!(!tools.iter().any(|tool| tool.name.contains("sca")));
     }

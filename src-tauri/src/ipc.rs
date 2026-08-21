@@ -96,6 +96,55 @@ pub struct PlanFeedbackRequest {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<String>,
 }
+/// One selectable answer exposed by the `ask` tool.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AskOption {
+    /// Short choice label returned to the model when selected.
+    pub label: String,
+    /// Optional tradeoff/context shown below the label.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+/// One related question in an `ask` tool call.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AskQuestion {
+    /// Stable caller-provided answer key.
+    pub id: String,
+    /// Optional compact category label.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub header: Option<String>,
+    /// User-facing question text.
+    pub question: String,
+    /// Empty means direct text input; otherwise the panel also exposes "Other".
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub options: Vec<AskOption>,
+    /// Whether more than one option/direct answer may be returned.
+    #[serde(default)]
+    pub multi: bool,
+}
+
+/// Core-to-panel `ask` event. The request remains pending until `ask_response`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AskEvent {
+    pub request_id: String,
+    pub questions: Vec<AskQuestion>,
+}
+
+/// Answers for one question. Multiple values are valid only for `multi`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AskAnswer {
+    pub answers: Vec<String>,
+}
+
+/// Panel-to-core response for one pending `ask` tool call.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AskResponseRequest {
+    pub request_id: String,
+    pub answers: std::collections::BTreeMap<String, AskAnswer>,
+}
 
 /// `changeset_decision.decision` wire values.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -863,6 +912,59 @@ mod tests {
             json!({
                 "text": "Please revise it.",
                 "attachments": ["bf93c8d0-76de-45bd-b118-2d004d71126e"]
+            }),
+        );
+
+        let ask_event = ipc::AskEvent {
+            request_id: "ask-1".to_string(),
+            questions: vec![ipc::AskQuestion {
+                id: "mode".to_string(),
+                header: Some("방식".to_string()),
+                question: "어떤 방식을 사용할까요?".to_string(),
+                options: vec![
+                    ipc::AskOption {
+                        label: "A".to_string(),
+                        description: Some("첫 번째".to_string()),
+                    },
+                    ipc::AskOption {
+                        label: "B".to_string(),
+                        description: None,
+                    },
+                ],
+                multi: false,
+            }],
+        };
+        assert_json(
+            &ask_event,
+            json!({
+                "requestId": "ask-1",
+                "questions": [{
+                    "id": "mode",
+                    "header": "방식",
+                    "question": "어떤 방식을 사용할까요?",
+                    "options": [
+                        {"label": "A", "description": "첫 번째"},
+                        {"label": "B"}
+                    ],
+                    "multi": false
+                }]
+            }),
+        );
+
+        let ask_response: ipc::AskResponseRequest = serde_json::from_value(json!({
+            "requestId": "ask-1",
+            "answers": {
+                "mode": {"answers": ["A"]}
+            }
+        }))
+        .unwrap();
+        assert_json(
+            &ask_response,
+            json!({
+                "requestId": "ask-1",
+                "answers": {
+                    "mode": {"answers": ["A"]}
+                }
             }),
         );
 
