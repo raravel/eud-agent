@@ -73,10 +73,11 @@ Each session file contains the flattened metadata plus:
 }
 ```
 
-`threadId` is null before the first Codex thread starts. `pendingRequestIds` names unarchived
-journals; recovery requires zero or one project writer. Startup removes stale ids only when the
-matching journal is already in the accepted archive. A missing live journal without that archive
-and multiple pending writers remain explicit errors. `panelLog` is opaque to Rust.
+`pendingRequestIds` names unarchived journals; each session expects at most one pending review.
+Startup removes stale ids only when the matching journal is already in the accepted archive.
+A missing live journal without that archive remains an explicit error on its owning session, but
+it never prevents `session_list`, healthy session hydration, or restoration of other valid pending
+journals in the same project. `panelLog` is opaque to Rust.
 `contextUsage` is absent until Codex emits `thread/tokenUsage/updated`; `last.totalTokens` is the
 active context size, while `total` is cumulative for the thread. The latest snapshot is persisted
 outside `panelLog`, so unopened rows retain usage across an app restart.
@@ -104,7 +105,9 @@ The panel persists only conversation history:
 Transient turn, plan, changeset, activity, wiki, and connection state is not persisted in
 `panelLog`. `conversation_rewind` replaces the log with the selected prefix, clears the thread
 id, pending request ids, and context usage, and stages a condensed replay for the next fresh
-thread. Rewind is rejected while the session is running, waiting for write, or in review.
+thread. Rewind is rejected while the session is running, waiting for write, or has a recoverable
+pending review. If every pending marker instead names a missing or empty journal, explicit rewind
+clears the unrecoverable markers and repairs the session so conversation can resume.
 
 ## Backend activity
 

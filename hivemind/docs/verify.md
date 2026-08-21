@@ -91,7 +91,9 @@ stages from v1 are retired as `server/` is removed.
 - Concurrent sessions: `cargo test -p eud-agent write_coordinator::tests`,
   `cargo test -p eud-agent workspace::tests::concurrent_session_accept`,
   `cargo test -p eud-agent reject_restores_one_session_while_another_writer_remains_active`,
-  and `cargo test -p eud-agent pending_review_recovery_coexists_with_new_writer_ticket`.
+  `cargo test -p eud-agent pending_review_recovery_coexists_with_new_writer_ticket`,
+  `cargo test -p eud-agent missing_pending_review_does_not_block_valid_review_recovery`, and
+  `cargo test -p eud-agent rewind_clears_only_an_unrecoverable_pending_review`.
 - Panel concurrency: `npm --prefix panel test -- --run App SessionSidebar ipc` proves overlapping
   chat invokes, immutable event routing, simultaneous write/review labels, conflict reporting,
   and selection independence.

@@ -1032,10 +1032,7 @@ Continue the requested change now, run the mandatory build, and stop only after 
             .session_store
             .load(&self.session_id)
             .map_err(|error| AgentEngineError::new(error.to_string()))?;
-        record.thread_id = None;
-        record.pending_request_ids.clear();
-        record.context_usage = None;
-        record.panel_log = panel_log;
+        reset_session_record_for_rewind(&mut record, panel_log);
         self.session_store
             .save(&record)
             .map_err(|error| AgentEngineError::new(error.to_string()))?;
@@ -1778,6 +1775,8 @@ fn cancel_worker_generation(
     Ok(())
 }
 
+type ProjectRecoveryResult = Result<HashMap<String, String>, String>;
+
 #[derive(Clone)]
 pub(crate) struct SessionEngineManager {
     inner: Arc<SessionEngineManagerInner>,
@@ -1792,7 +1791,7 @@ struct SessionEngineManagerInner {
     app: tauri::AppHandle,
     dirs: crate::config::DataDirs,
     fallback_cwd: PathBuf,
-    recovered_projects: SyncMutex<HashMap<String, Result<(), String>>>,
+    recovered_projects: SyncMutex<HashMap<String, ProjectRecoveryResult>>,
     settings_lock: tokio::sync::Mutex<()>,
 }
 
@@ -1801,15 +1800,25 @@ fn restore_pending_review(
     dirs: &crate::config::DataDirs,
     writes: &crate::write_coordinator::ProjectWriteCoordinator,
     project_id: &str,
-) -> Result<(), String> {
+) -> ProjectRecoveryResult {
     let mut pending = Vec::new();
+    let mut session_errors = HashMap::new();
     for meta in sessions
         .list()
         .map_err(|error| error.to_string())?
         .into_iter()
         .filter(|meta| meta.project == project_id)
     {
-        let mut record = sessions.load(&meta.id).map_err(|error| error.to_string())?;
+        let mut record = match sessions.load(&meta.id) {
+            Ok(record) => record,
+            Err(error) => {
+                session_errors.insert(
+                    meta.id,
+                    format!("pending review state cannot be loaded: {error}"),
+                );
+                continue;
+            }
+        };
         let pending_before = record.pending_request_ids.len();
         record.pending_request_ids.retain(|request_id| {
             let live_journal_missing = matches!(
@@ -1821,25 +1830,83 @@ fn restore_pending_review(
                 && journal::JournalStore::archived_exists(dirs.app_data(), request_id))
         });
         if record.pending_request_ids.len() != pending_before {
-            sessions.save(&record).map_err(|error| error.to_string())?;
+            if let Err(error) = sessions.save(&record) {
+                session_errors.insert(
+                    record.meta.id,
+                    format!("pending review state cannot be repaired: {error}"),
+                );
+                continue;
+            }
         }
         for request_id in record.pending_request_ids {
             pending.push((record.meta.id.clone(), request_id));
         }
     }
     for (session_id, request_id) in pending {
-        let journal =
-            journal::JournalStore::load(dirs.app_data(), &request_id).map_err(|error| {
-                format!("pending review `{request_id}` cannot be recovered: {error}")
-            })?;
+        let journal = match journal::JournalStore::load(dirs.app_data(), &request_id) {
+            Ok(journal) => journal,
+            Err(error) => {
+                session_errors.entry(session_id).or_insert_with(|| {
+                    format!("pending review `{request_id}` cannot be recovered: {error}")
+                });
+                continue;
+            }
+        };
         if journal.entries.is_empty() {
-            return Err(format!(
-                "pending review `{request_id}` has an empty undecided journal"
-            ));
+            session_errors.entry(session_id).or_insert_with(|| {
+                format!("pending review `{request_id}` has an empty undecided journal")
+            });
+            continue;
         }
-        writes.restore_review(project_id, &session_id, &request_id)?;
+        if let Err(error) = writes.restore_review(project_id, &session_id, &request_id) {
+            session_errors.entry(session_id).or_insert(error);
+        }
     }
-    Ok(())
+    Ok(session_errors)
+}
+
+fn reset_session_record_for_rewind(
+    record: &mut crate::session::SessionRecord,
+    panel_log: serde_json::Value,
+) {
+    record.thread_id = None;
+    record.pending_request_ids.clear();
+    record.context_usage = None;
+    record.panel_log = panel_log;
+}
+
+fn rewind_unrecoverable_pending_session(
+    sessions: &crate::session::SessionStore,
+    dirs: &crate::config::DataDirs,
+    session_id: &str,
+    expected_project: &str,
+    panel_log: serde_json::Value,
+) -> Result<Option<String>, String> {
+    let mut record = sessions
+        .load(session_id)
+        .map_err(|error| error.to_string())?;
+    if record.pending_request_ids.is_empty()
+        || (!expected_project.is_empty() && record.meta.project != expected_project)
+    {
+        return Ok(None);
+    }
+    for request_id in &record.pending_request_ids {
+        match journal::JournalStore::load(dirs.app_data(), request_id) {
+            Ok(journal) if !journal.entries.is_empty() => return Ok(None),
+            Ok(_) => {}
+            Err(journal::JournalError::Io(error))
+                if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "pending review `{request_id}` cannot be discarded by rewind: {error}"
+                ));
+            }
+        }
+    }
+
+    reset_session_record_for_rewind(&mut record, panel_log);
+    sessions.save(&record).map_err(|error| error.to_string())?;
+    Ok(Some(record.meta.project))
 }
 
 impl SessionEngineManager {
@@ -1878,21 +1945,35 @@ impl SessionEngineManager {
             .transaction(project_id, operation)?
     }
 
-    fn ensure_project_recovery(&self, project_id: &str) -> Result<(), String> {
-        if let Some(result) = self.inner.recovered_projects.lock().get(project_id) {
-            return result.clone();
+    fn ensure_project_recovery(
+        &self,
+        project_id: &str,
+        session_id: Option<&str>,
+    ) -> Result<(), String> {
+        let mut recovered_projects = self.inner.recovered_projects.lock();
+        let result = recovered_projects
+            .entry(project_id.to_string())
+            .or_insert_with(|| {
+                restore_pending_review(
+                    &self.inner.sessions,
+                    &self.inner.dirs,
+                    self.inner.services.writes(),
+                    project_id,
+                )
+            });
+        match result {
+            Err(error) => Err(error.clone()),
+            Ok(session_errors) => session_id
+                .and_then(|id| session_errors.get(id))
+                .cloned()
+                .map_or(Ok(()), Err),
         }
-        let result = restore_pending_review(
-            &self.inner.sessions,
-            &self.inner.dirs,
-            self.inner.services.writes(),
-            project_id,
-        );
-        self.inner
-            .recovered_projects
-            .lock()
-            .insert(project_id.to_string(), result.clone());
-        result
+    }
+
+    fn clear_session_recovery_error(&self, project_id: &str, session_id: &str) {
+        if let Some(Ok(session_errors)) = self.inner.recovered_projects.lock().get_mut(project_id) {
+            session_errors.remove(session_id);
+        }
     }
 
     fn recover_all_projects(&self) -> Result<(), String> {
@@ -1905,7 +1986,7 @@ impl SessionEngineManager {
             .map(|meta| meta.project)
             .collect::<HashSet<_>>();
         for project in projects {
-            self.ensure_project_recovery(&project)?;
+            self.ensure_project_recovery(&project, None)?;
         }
         Ok(())
     }
@@ -1919,7 +2000,7 @@ impl SessionEngineManager {
             .sessions
             .load(session_id)
             .map_err(|error| AgentEngineError::new(error.to_string()))?;
-        self.ensure_project_recovery(&record.meta.project)
+        self.ensure_project_recovery(&record.meta.project, Some(&record.meta.id))
             .map_err(AgentEngineError::new)?;
 
         let current_project =
@@ -2124,9 +2205,26 @@ impl SessionEngineManager {
         session_id: &str,
         panel_log: serde_json::Value,
     ) -> Result<(), AgentEngineError> {
-        let worker = self.worker(session_id).await?;
-        let result = worker.engine.lock().await.rewind(panel_log).await;
-        result
+        match self.worker(session_id).await {
+            Ok(worker) => worker.engine.lock().await.rewind(panel_log).await,
+            Err(worker_error) => {
+                let expected_project =
+                    project_name_from_state(&self.inner.config.project_state_for_prompt());
+                let recovered_project = rewind_unrecoverable_pending_session(
+                    &self.inner.sessions,
+                    &self.inner.dirs,
+                    session_id,
+                    &expected_project,
+                    panel_log,
+                )
+                .map_err(AgentEngineError::new)?;
+                let Some(project_id) = recovered_project else {
+                    return Err(worker_error);
+                };
+                self.clear_session_recovery_error(&project_id, session_id);
+                Ok(())
+            }
+        }
     }
 
     async fn answer_ask(
@@ -4724,6 +4822,98 @@ mod tests {
 
         assert!(writes.owns("Sample", &record.meta.id, request_id));
         assert_eq!(next.state(), crate::write_coordinator::TicketState::Granted);
+        fs::remove_dir_all(base).ok();
+    }
+    #[test]
+    fn missing_pending_review_does_not_block_valid_review_recovery() {
+        let base = unique_temp_dir("missing-pending-review-isolation");
+        let dirs = crate::config::DataDirs::from_bases(&base, &base);
+        dirs.ensure_dirs().unwrap();
+        let sessions = crate::session::SessionStore::new(&dirs);
+        let mut missing_record = test_session(&sessions);
+        let missing_request_id = "req-missing";
+        missing_record.pending_request_ids = vec![missing_request_id.to_string()];
+        sessions.save(&missing_record).unwrap();
+
+        let mut valid_record = test_session(&sessions);
+        let valid_request_id = "req-valid";
+        let journal = journal::JournalStore::new(dirs.app_data());
+        record_file_write(&journal, valid_request_id, "write-valid", 1, "valid.eps");
+        valid_record.pending_request_ids = vec![valid_request_id.to_string()];
+        sessions.save(&valid_record).unwrap();
+        let writes = crate::write_coordinator::ProjectWriteCoordinator::silent();
+
+        let recovery = restore_pending_review(&sessions, &dirs, &writes, "Sample");
+
+        let session_errors = recovery.expect("one missing journal must not block other sessions");
+        assert_eq!(session_errors.len(), 1);
+        assert!(session_errors
+            .get(&missing_record.meta.id)
+            .is_some_and(|error| error.contains(missing_request_id)));
+        assert!(writes.owns("Sample", &valid_record.meta.id, valid_request_id));
+        assert!(!writes.owns("Sample", &missing_record.meta.id, missing_request_id));
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn rewind_clears_only_an_unrecoverable_pending_review() {
+        let base = unique_temp_dir("rewind-unrecoverable-pending-review");
+        let dirs = crate::config::DataDirs::from_bases(&base, &base);
+        dirs.ensure_dirs().unwrap();
+        let sessions = crate::session::SessionStore::new(&dirs);
+        let mut missing_record = test_session(&sessions);
+        missing_record.thread_id = Some("thread-missing".to_string());
+        missing_record.pending_request_ids = vec!["req-missing".to_string()];
+        missing_record.panel_log = serde_json::json!({"log": ["old"]});
+        sessions.save(&missing_record).unwrap();
+        let prefix = serde_json::json!({"log": ["prefix"]});
+
+        let recovered_project = rewind_unrecoverable_pending_session(
+            &sessions,
+            &dirs,
+            &missing_record.meta.id,
+            "Sample",
+            prefix.clone(),
+        )
+        .unwrap();
+
+        assert_eq!(recovered_project.as_deref(), Some("Sample"));
+        let repaired = sessions.load(&missing_record.meta.id).unwrap();
+        assert!(repaired.thread_id.is_none());
+        assert!(repaired.pending_request_ids.is_empty());
+        assert_eq!(repaired.panel_log, prefix);
+
+        let mut valid_record = test_session(&sessions);
+        valid_record.thread_id = Some("thread-valid".to_string());
+        valid_record.pending_request_ids = vec!["req-valid-rewind".to_string()];
+        valid_record.panel_log = serde_json::json!({"log": ["valid"]});
+        sessions.save(&valid_record).unwrap();
+        let journal = journal::JournalStore::new(dirs.app_data());
+        record_file_write(
+            &journal,
+            "req-valid-rewind",
+            "write-valid-rewind",
+            1,
+            "valid.eps",
+        );
+
+        let valid_result = rewind_unrecoverable_pending_session(
+            &sessions,
+            &dirs,
+            &valid_record.meta.id,
+            "Sample",
+            serde_json::json!({"log": []}),
+        )
+        .unwrap();
+
+        assert!(valid_result.is_none());
+        let preserved = sessions.load(&valid_record.meta.id).unwrap();
+        assert_eq!(preserved.thread_id.as_deref(), Some("thread-valid"));
+        assert_eq!(
+            preserved.pending_request_ids,
+            vec!["req-valid-rewind".to_string()]
+        );
+        assert_eq!(preserved.panel_log, serde_json::json!({"log": ["valid"]}));
         fs::remove_dir_all(base).ok();
     }
 
