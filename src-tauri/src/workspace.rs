@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use similar::{DiffTag, TextDiff};
 
-use crate::bridge_io::{BridgeIo, EpsSnapshot, HEARTBEAT_STALE_AFTER};
+use crate::bridge_io::{BridgeIo, EpsSnapshot, SendOpts, HEARTBEAT_STALE_AFTER};
 use crate::config::{self, DataDirs};
 use crate::journal::{JournalEntry, JournalStore, JournalTarget, Snapshot, WriteTool};
 use crate::memory::write_atomic_bytes;
@@ -138,7 +138,7 @@ impl WorkspaceManager {
             .read_status_snapshot(HEARTBEAT_STALE_AFTER)
             .map_err(|error| error.to_string())?;
         let snapshot = bridge
-            .snapshot_eps(&Default::default(), None)
+            .snapshot_eps(&SendOpts::for_epsnapshot(), None)
             .map_err(|error| error.to_string())?;
         self.prepare_snapshot(&snapshot)
             .map_err(|error| error.to_string())
@@ -195,7 +195,7 @@ impl WorkspaceManager {
             .read_status_snapshot(HEARTBEAT_STALE_AFTER)
             .map_err(|error| error.to_string())?;
         let snapshot = bridge
-            .snapshot_eps(&Default::default(), None)
+            .snapshot_eps(&SendOpts::for_epsnapshot(), None)
             .map_err(|error| error.to_string())?;
         self.prepare_session_snapshot(&snapshot, session_id)
             .map_err(|error| error.to_string())

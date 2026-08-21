@@ -76,8 +76,9 @@ hosting, panel re-arm, and server spawning are REMOVED.
 - The app deletes each `.result` after consuming and clears stale inbox/outbox at startup.
   The bridge deletes `.cmd` after processing.
 - App command files are named `srv-<uuid8>.cmd`; a consumer polls only its own basenames.
-- NEVER poll `.result` without a timeout. Default 10s; extend to 180s when `status.txt`
-  says `compiling=true` and emit `progress {stage: waiting_build}` to the panel.
+- NEVER poll `.result` without a timeout. Default 10s; use 180s for full-project
+  `EPSNAPSHOT` scans, and extend other requests to 180s when `status.txt` says
+  `compiling=true` while emitting `progress {stage: waiting_build}` to the panel.
 
 ## Agent epScript project architecture
 

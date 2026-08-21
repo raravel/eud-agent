@@ -21,6 +21,7 @@ use uuid::Uuid;
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_BUSY_TIMEOUT: Duration = Duration::from_secs(180);
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(200);
+const EPSNAPSHOT_TIMEOUT: Duration = Duration::from_secs(180);
 /// Heartbeat freshness window used by app-facing editor liveness checks.
 ///
 /// The Lua bridge writes `heartbeat.txt` on roughly every 1s UI tick, so a 3s window
@@ -53,6 +54,16 @@ pub struct SendOpts {
     pub timeout: Duration,
     pub busy_timeout: Duration,
     pub poll_interval: Duration,
+}
+
+impl SendOpts {
+    /// Timeout policy for a full-project EPSNAPSHOT scan.
+    pub fn for_epsnapshot() -> Self {
+        Self {
+            timeout: EPSNAPSHOT_TIMEOUT,
+            ..Self::default()
+        }
+    }
 }
 
 impl Default for SendOpts {
@@ -922,6 +933,15 @@ mod tests {
             busy_timeout: Duration::from_millis(60),
             poll_interval: Duration::from_millis(10),
         }
+    }
+
+    #[test]
+    fn epsnapshot_opts_allow_full_project_scan() {
+        let opts = SendOpts::for_epsnapshot();
+
+        assert_eq!(opts.timeout, Duration::from_secs(180));
+        assert_eq!(opts.busy_timeout, Duration::from_secs(180));
+        assert_eq!(opts.poll_interval, Duration::from_millis(200));
     }
 
     fn srv_entries(dir: &Path, suffix: &str) -> Vec<PathBuf> {

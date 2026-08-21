@@ -81,7 +81,7 @@ jobs:
           tauriScript: cargo tauri
           tagName: ${{ steps.release.outputs.tag }}
           releaseName: "v__VERSION__"
-          releaseBody: "복원된 Codex 세션에도 eud-tools MCP 설정을 다시 주입해 프로젝트 도구 누락을 수정했습니다."
+          releaseBody: "대형 프로젝트의 전체 EPSNAPSHOT 제한을 10초에서 180초로 늘려 채팅 시작 전 브리지 시간 초과를 수정했습니다."
           releaseDraft: false
           prerelease: false
           generateReleaseNotes: true

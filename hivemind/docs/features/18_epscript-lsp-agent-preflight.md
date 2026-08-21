@@ -516,7 +516,8 @@ Use the existing fake bridge harness plus Lua contract checks:
 - one `EPSNAPSHOT` produces nested-path-safe ordinal files and a last-written manifest.
 - UTF-8 without BOM for manifest/content, including Korean source.
 - read failures are per-file entries, not whole-snapshot failure.
-- compiling state processes no project objects and follows the existing extended timeout.
+- full-project `EPSNAPSHOT` scans use a finite 180-second timeout; compiling state
+  processes no project objects and follows the same extended timeout.
 - stale/request-foreign snapshot paths are ignored and safely cleaned.
 - heartbeat and status writes still occur before the compiling early-return.
 

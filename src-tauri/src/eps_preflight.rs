@@ -182,7 +182,7 @@ impl SnapshotProvider for ConfiguredSnapshotProvider {
     fn snapshot(&self) -> Result<EpsSnapshot, String> {
         let bridge = crate::ipc::bridge_from_config(&self.dirs)?;
         bridge
-            .snapshot_eps(&SendOpts::default(), None)
+            .snapshot_eps(&SendOpts::for_epsnapshot(), None)
             .map_err(|error| error.to_string())
     }
 }
