@@ -591,7 +591,6 @@ impl<D: CodexDriver, S: EventSink> AgentEngine<D, S> {
         };
         record.thread_id = self.driver.current_thread_id().await;
         record.pending_request_ids = self.live_pending_request_ids();
-        record.meta.updated_at = crate::session::now_unix_seconds();
         if let Err(error) = self.session_store.save(&record) {
             eprintln!("eud-agent: active session update failed: {error}");
         }
@@ -926,7 +925,6 @@ Continue the requested change now, run the mandatory build, and stop only after 
         if record.pending_request_ids.len() == before {
             return;
         }
-        record.meta.updated_at = crate::session::now_unix_seconds();
         if let Err(error) = self.session_store.save(&record) {
             eprintln!("eud-agent: session pending-id drop failed: {error}");
         }
@@ -1038,7 +1036,6 @@ Continue the requested change now, run the mandatory build, and stop only after 
         record.pending_request_ids.clear();
         record.context_usage = None;
         record.panel_log = panel_log;
-        record.meta.updated_at = crate::session::now_unix_seconds();
         self.session_store
             .save(&record)
             .map_err(|error| AgentEngineError::new(error.to_string()))?;
@@ -2066,6 +2063,9 @@ impl SessionEngineManager {
         request: ipc::ChatRequest,
     ) -> Result<(), AgentEngineError> {
         let worker = self.worker(session_id).await?;
+        if let Err(error) = self.inner.sessions.touch_conversation(session_id) {
+            eprintln!("eud-agent: conversation timestamp update failed: {error}");
+        }
         worker
             .runtime
             .emit_activity(crate::write_coordinator::SessionActivity::RunningRead);
@@ -2082,6 +2082,9 @@ impl SessionEngineManager {
         request: ipc::PlanFeedbackRequest,
     ) -> Result<(), AgentEngineError> {
         let worker = self.worker(session_id).await?;
+        if let Err(error) = self.inner.sessions.touch_conversation(session_id) {
+            eprintln!("eud-agent: conversation timestamp update failed: {error}");
+        }
         worker
             .runtime
             .emit_activity(crate::write_coordinator::SessionActivity::RunningRead);
@@ -2175,14 +2178,14 @@ impl SessionEngineManager {
         &self,
         first_text: &str,
     ) -> Result<crate::session::SessionRecord, AgentEngineError> {
-        let now = crate::session::now_unix_seconds();
+        let created_at = crate::session::now_unix_seconds();
         let record = crate::session::SessionRecord {
             meta: crate::session::SessionMeta {
                 id: crate::session::new_session_id(),
                 name: auto_session_name(first_text),
                 project: project_name_from_state(&self.inner.config.project_state_for_prompt()),
-                created_at: now,
-                updated_at: now,
+                created_at,
+                last_conversation_at: crate::session::now_unix_millis(),
             },
             thread_id: None,
             pending_request_ids: Vec::new(),
@@ -3425,14 +3428,14 @@ mod tests {
     }
 
     fn test_session(store: &crate::session::SessionStore) -> crate::session::SessionRecord {
-        let now = crate::session::now_unix_seconds();
+        let created_at = crate::session::now_unix_seconds();
         let record = crate::session::SessionRecord {
             meta: crate::session::SessionMeta {
                 id: crate::session::new_session_id(),
                 name: "test session".to_string(),
                 project: "Sample".to_string(),
-                created_at: now,
-                updated_at: now,
+                created_at,
+                last_conversation_at: crate::session::now_unix_millis(),
             },
             thread_id: None,
             pending_request_ids: Vec::new(),
@@ -4622,7 +4625,7 @@ mod tests {
                 name: "C".to_string(),
                 project: "Sample".to_string(),
                 created_at: 1,
-                updated_at: 1,
+                last_conversation_at: 1_000,
             },
             thread_id: None,
             pending_request_ids: Vec::new(),

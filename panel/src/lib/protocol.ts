@@ -368,8 +368,9 @@ export interface SetupMessage {
 /**
  * Saved-session list metadata (the `session_list` result rows and the
  * flattened head of a `SessionRecord`). Field names are camelCase to match the
- * Rust `SessionMeta` (`#[serde(rename_all = "camelCase")]`); `createdAt` /
- * `updatedAt` are Unix seconds. The list is ordered most-recently-updated first.
+ * Rust `SessionMeta` (`#[serde(rename_all = "camelCase")]`). `createdAt` is in
+ * Unix seconds; `lastConversationAt` is in Unix milliseconds. The list is
+ * ordered by the latest submitted user conversation.
  */
 export interface SessionMeta {
   id: string;
@@ -377,7 +378,7 @@ export interface SessionMeta {
   /** Editor project name captured at session creation. */
   project: string;
   createdAt: number;
-  updatedAt: number;
+  lastConversationAt: number;
 }
 
 export type AttachmentKind = "image" | "text";

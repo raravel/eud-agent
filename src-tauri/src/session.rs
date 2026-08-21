@@ -8,9 +8,10 @@
 //! by the self-update). Every file is written via [`crate::memory::write_atomic_bytes`]
 //! (temp + rename, UTF-8 **without BOM**), the same write semantics as memory/wiki.
 //!
-//! `index.json` drives the list UI (ordered most-recently-updated first); one
-//! `<session-id>.json` record holds the full session. The `panelLog` blob is opaque to
-//! Rust — stored and returned verbatim as a [`serde_json::Value`]; its schema is owned
+//! `index.json` drives the list UI (ordered by the latest submitted user
+//! conversation); one `<session-id>.json` record holds the full session.
+//! The `panelLog` blob is opaque to Rust and stored/returned verbatim as a
+//! [`serde_json::Value`]; its schema is owned
 //! solely by the panel. A corrupt/missing `index.json` yields an empty list (never
 //! crash startup); a corrupt `<id>.json` on open is a graceful `Err` surfaced to the
 //! panel.
@@ -20,12 +21,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::config::DataDirs;
 use crate::memory::write_atomic_bytes;
 
-const SCHEMA_VERSION: u32 = 1;
+const SCHEMA_VERSION: u32 = 2;
 const INDEX_FILE: &str = "index.json";
 
 /// Session list-entry metadata (drives the list UI).
@@ -36,7 +37,23 @@ pub struct SessionMeta {
     pub name: String,
     pub project: String,
     pub created_at: u64,
-    pub updated_at: u64,
+    #[serde(
+        alias = "updatedAt",
+        deserialize_with = "deserialize_last_conversation_at"
+    )]
+    pub last_conversation_at: u64,
+}
+
+fn deserialize_last_conversation_at<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let timestamp = u64::deserialize(deserializer)?;
+    Ok(if timestamp < 10_000_000_000 {
+        timestamp.saturating_mul(1_000)
+    } else {
+        timestamp
+    })
 }
 
 /// One full session record: [`SessionMeta`] (flattened) + the resumable thread id,
@@ -58,7 +75,7 @@ pub struct SessionRecord {
     pub panel_log: serde_json::Value,
 }
 
-/// The on-disk `index.json` shape: an ordered, most-recently-updated-first list.
+/// The on-disk `index.json` shape: latest-conversation-first metadata rows.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SessionIndex {
@@ -91,11 +108,13 @@ impl SessionStore {
         }
     }
 
-    /// The session list, most-recently-updated first. A missing or corrupt
-    /// `index.json` yields `[]` (never crash startup).
+    /// The session list, sorted by the latest user conversation. A missing or
+    /// corrupt `index.json` yields `[]` (never crash startup).
     pub fn list(&self) -> anyhow::Result<Vec<SessionMeta>> {
         let _guard = self.lock()?;
-        Ok(self.read_index().sessions)
+        let mut sessions = self.read_index().sessions;
+        sort_sessions(&mut sessions);
+        Ok(sessions)
     }
 
     /// Load one full record by id. A corrupt/missing record is a graceful `Err`.
@@ -104,8 +123,8 @@ impl SessionStore {
         self.load_unlocked(id)
     }
 
-    /// Write the `<id>.json` record and rewrite `index.json` (most-recently-updated
-    /// first). Both via [`write_atomic_bytes`] (temp + rename, UTF-8 no BOM).
+    /// Write the `<id>.json` record and rewrite the latest-conversation-first
+    /// `index.json`. Both via [`write_atomic_bytes`] (temp + rename, UTF-8 no BOM).
     ///
     /// Each write is individually atomic but the pair is not transactional: if the
     /// index rewrite fails after the record write succeeds, the record exists but is
@@ -131,23 +150,41 @@ impl SessionStore {
         self.write_index(&index)
     }
 
-    /// Rename a session: update the record's `name` + `updatedAt` and the index.
+    /// Rename a session without changing its conversation recency.
     pub fn rename(&self, id: &str, name: &str) -> anyhow::Result<()> {
         let _guard = self.lock()?;
         let mut record = self.load_unlocked(id)?;
         record.meta.name = name.to_string();
-        record.meta.updated_at = now_unix_seconds();
         self.save_unlocked(&record)
     }
 
-    /// Replace one session's opaque panel log without making it the executing
-    /// session. Multi-session tabs autosave independently while another turn runs.
+    /// Replace one session's opaque panel log without changing its conversation
+    /// recency. Multi-session tabs autosave independently while another turn runs.
     pub fn update_panel_log(&self, id: &str, panel_log: serde_json::Value) -> anyhow::Result<()> {
         let _guard = self.lock()?;
         let mut record = self.load_unlocked(id)?;
         record.panel_log = panel_log;
-        record.meta.updated_at = now_unix_seconds();
         self.save_unlocked(&record)
+    }
+
+    /// Mark a newly submitted user conversation and return its Unix-millisecond
+    /// timestamp. The timestamp advances past every indexed session so the touched
+    /// row sorts first even when multiple submissions share one wall-clock tick.
+    pub fn touch_conversation(&self, id: &str) -> anyhow::Result<u64> {
+        let _guard = self.lock()?;
+        let mut record = self.load_unlocked(id)?;
+        let indexed_next = self
+            .read_index()
+            .sessions
+            .iter()
+            .map(|meta| meta.last_conversation_at)
+            .max()
+            .unwrap_or_default()
+            .saturating_add(1);
+        let timestamp = now_unix_millis().max(indexed_next);
+        record.meta.last_conversation_at = timestamp;
+        self.save_unlocked(&record)?;
+        Ok(timestamp)
     }
 
     /// Persist the latest Codex context snapshot without changing the panel-owned log.
@@ -203,19 +240,29 @@ impl SessionStore {
         Ok(())
     }
 
-    /// Upsert `meta` into the index and move it to the front (most-recently-updated
-    /// first), keeping the rest in their existing order.
+    /// Upsert `meta` and retain latest-conversation-first index ordering.
     fn upsert_index(&self, meta: SessionMeta) -> anyhow::Result<()> {
         let mut index = self.read_index();
         index.schema_version = SCHEMA_VERSION;
         index.sessions.retain(|existing| existing.id != meta.id);
-        index.sessions.insert(0, meta);
+        index.sessions.push(meta);
+        sort_sessions(&mut index.sessions);
         self.write_index(&index)
     }
 
     fn record_path(&self, id: &str) -> PathBuf {
         self.sessions_dir.join(format!("{id}.json"))
     }
+}
+
+fn sort_sessions(sessions: &mut [SessionMeta]) {
+    sessions.sort_by(|left, right| {
+        right
+            .last_conversation_at
+            .cmp(&left.last_conversation_at)
+            .then_with(|| right.created_at.cmp(&left.created_at))
+            .then_with(|| left.id.cmp(&right.id))
+    });
 }
 
 /// Mint a v4-style UUID string in Rust (decision: never panel-side / `Math.random`).
@@ -258,6 +305,14 @@ pub fn now_unix_seconds() -> u64 {
         .unwrap_or_default()
 }
 
+/// Current Unix time in milliseconds (0 if the clock is before the epoch).
+pub fn now_unix_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -288,7 +343,7 @@ mod tests {
                 name: name.to_string(),
                 project: "mymap".to_string(),
                 created_at: 1_718_000_000,
-                updated_at: 1_718_000_000,
+                last_conversation_at: 1_718_000_000_000,
             },
             thread_id: Some("019ece1c-thread".to_string()),
             pending_request_ids: vec!["req-1a2b3c4d".to_string()],
@@ -336,9 +391,9 @@ mod tests {
         let first = sample_record(&new_session_id(), "유닛 HP 작업");
         store.save(&first).unwrap();
 
-        // A second, newer save lands at the front (most-recently-updated first).
+        // A second session with a newer conversation sorts first.
         let mut second = sample_record(&new_session_id(), "무기 데미지");
-        second.meta.updated_at = 1_718_009_999;
+        second.meta.last_conversation_at = 1_718_009_999_000;
         store.save(&second).unwrap();
 
         let listed = store.list().unwrap();
@@ -351,16 +406,24 @@ mod tests {
         assert_eq!(loaded, first);
         assert_eq!(loaded.panel_log["logSeq"], json!(2));
 
-        // Rename updates name + the index entry.
+        // Rename updates only the name and leaves conversation order untouched.
         store.rename(&first.meta.id, "유닛 HP 완료").unwrap();
         let reloaded = store.load(&first.meta.id).unwrap();
         assert_eq!(reloaded.meta.name, "유닛 HP 완료");
-        assert!(reloaded.meta.updated_at >= first.meta.updated_at);
-        assert!(store
-            .list()
-            .unwrap()
-            .iter()
-            .any(|meta| meta.name == "유닛 HP 완료"));
+        assert_eq!(
+            reloaded.meta.last_conversation_at,
+            first.meta.last_conversation_at
+        );
+        assert_eq!(store.list().unwrap()[0].id, second.meta.id);
+
+        // Log autosave is also recency-neutral; a new user turn advances and promotes.
+        store
+            .update_panel_log(&first.meta.id, json!({ "schemaVersion": 2, "log": [] }))
+            .unwrap();
+        assert_eq!(store.list().unwrap()[0].id, second.meta.id);
+        let touched = store.touch_conversation(&first.meta.id).unwrap();
+        assert!(touched > second.meta.last_conversation_at);
+        assert_eq!(store.list().unwrap()[0].id, first.meta.id);
 
         // Delete removes the record file AND the index entry.
         store.delete(&first.meta.id).unwrap();
@@ -411,6 +474,34 @@ mod tests {
                 "{label} must be valid UTF-8"
             );
         }
+
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn legacy_updated_at_seconds_migrates_to_last_conversation_millis() {
+        let (base, store) = store("legacy-updated-at");
+        fs::create_dir_all(&store.sessions_dir).unwrap();
+        let id = new_session_id();
+        let legacy = json!({
+            "id": id,
+            "name": "기존 세션",
+            "project": "mymap",
+            "createdAt": 1_718_000_000_u64,
+            "updatedAt": 1_718_009_999_u64,
+            "threadId": null,
+            "pendingRequestIds": [],
+            "panelLog": null
+        });
+        fs::write(store.record_path(&id), serde_json::to_vec(&legacy).unwrap()).unwrap();
+
+        let loaded = store.load(&id).unwrap();
+        assert_eq!(loaded.meta.last_conversation_at, 1_718_009_999_000);
+        store.save(&loaded).unwrap();
+        let migrated: serde_json::Value =
+            serde_json::from_slice(&fs::read(store.record_path(&id)).unwrap()).unwrap();
+        assert_eq!(migrated["lastConversationAt"], json!(1_718_009_999_000_u64));
+        assert!(migrated.get("updatedAt").is_none());
 
         fs::remove_dir_all(base).ok();
     }

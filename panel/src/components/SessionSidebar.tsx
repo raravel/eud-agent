@@ -27,7 +27,7 @@ export type SessionActivity =
 export interface SessionSidebarRow {
   id: string;
   name: string;
-  updatedAt: number;
+  lastConversationAt: number;
   activity: SessionActivity;
   persisted: boolean;
 }
@@ -103,9 +103,9 @@ function ActivityIcon({ activity }: { activity: SessionActivity }) {
   }
 }
 
-function formatUpdated(updatedAt: number): string {
-  if (!Number.isFinite(updatedAt) || updatedAt <= 0) return "";
-  const date = new Date(updatedAt * 1000);
+function formatLastConversation(lastConversationAt: number): string {
+  if (!Number.isFinite(lastConversationAt) || lastConversationAt <= 0) return "";
+  const date = new Date(lastConversationAt);
   if (Number.isNaN(date.getTime())) return "";
   return new Intl.DateTimeFormat(undefined, {
     month: "short",
@@ -272,7 +272,7 @@ export function SessionSidebar({
             {filtered.map((row) => {
               const selected = row.id === selectedId;
               const label = activityLabel(row);
-              const updated = formatUpdated(row.updatedAt);
+              const lastConversation = formatLastConversation(row.lastConversationAt);
               return (
                 <li key={row.id} className="group relative min-w-0 max-w-full overflow-hidden">
                   <button
@@ -329,9 +329,9 @@ export function SessionSidebar({
                             >
                               {label}
                             </span>
-                            {row.activity === "idle" && updated && (
+                            {row.activity === "idle" && lastConversation && (
                               <span className="min-w-0 truncate text-muted-foreground/75">
-                                · {updated}
+                                · {lastConversation}
                               </span>
                             )}
                           </span>

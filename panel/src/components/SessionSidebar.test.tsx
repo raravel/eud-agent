@@ -10,21 +10,21 @@ function props(overrides: Partial<SessionSidebarProps> = {}): SessionSidebarProp
       {
         id: "running",
         name: "유닛 밸런스",
-        updatedAt: 10,
+        lastConversationAt: 10_000,
         activity: "running_read",
         persisted: true,
       },
       {
         id: "writing",
         name: "트리거 수정",
-        updatedAt: 9,
+        lastConversationAt: 9_000,
         activity: "running_write",
         persisted: true,
       },
       {
         id: "review",
         name: "맵 설정",
-        updatedAt: 8,
+        lastConversationAt: 8_000,
         activity: "review",
         persisted: true,
       },
@@ -94,7 +94,7 @@ describe("SessionSidebar", () => {
             {
               id: "long",
               name: longName,
-              updatedAt: 10,
+              lastConversationAt: 10_000,
               activity: "idle",
               persisted: true,
             },
@@ -111,5 +111,33 @@ describe("SessionSidebar", () => {
     const name = screen.getByTitle(longName);
     expect(name).toHaveClass("truncate");
     expect(name.closest("li")).toHaveClass("overflow-hidden");
+  });
+
+  it("shows the last conversation time beside an idle session", () => {
+    const lastConversationAt = Date.UTC(2026, 7, 21, 9, 30);
+    render(
+      <SessionSidebar
+        {...props({
+          rows: [
+            {
+              id: "idle",
+              name: "최근 대화",
+              lastConversationAt,
+              activity: "idle",
+              persisted: true,
+            },
+          ],
+          selectedId: "idle",
+        })}
+      />,
+    );
+
+    const formatted = new Intl.DateTimeFormat(undefined, {
+      month: "short",
+      day: "numeric",
+      hour: "2-digit",
+      minute: "2-digit",
+    }).format(new Date(lastConversationAt));
+    expect(screen.getByText(`· ${formatted}`)).toBeInTheDocument();
   });
 });

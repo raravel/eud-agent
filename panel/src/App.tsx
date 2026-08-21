@@ -146,6 +146,7 @@ interface SessionSlot {
   activity: SessionActivity;
   unsubscribe?: () => void;
   saveTimer?: number;
+  observedLog: readonly LogEntry[];
   planOpen: boolean;
   changesetOpen: boolean;
 }
@@ -159,13 +160,13 @@ function emptyPanelLog(): PanelLog {
 
 function draftSession(project: string): SessionRecord {
   draftSequence += 1;
-  const now = Math.floor(Date.now() / 1000);
+  const now = Date.now();
   return {
     id: `draft-${draftSequence}`,
     name: "새 대화",
     project,
-    createdAt: now,
-    updatedAt: now,
+    createdAt: Math.floor(now / 1_000),
+    lastConversationAt: now,
     threadId: null,
     pendingRequestIds: [],
     panelLog: emptyPanelLog(),
@@ -279,12 +280,30 @@ export default function App() {
     setSessionRevision((revision) => revision + 1);
   }, []);
 
+  const markConversationStarted = useCallback(
+    (slot: SessionSlot) => {
+      const newest = Array.from(sessionsRef.current.values()).reduce(
+        (latest, candidate) =>
+          Math.max(latest, candidate.meta.lastConversationAt),
+        0,
+      );
+      slot.meta = {
+        ...slot.meta,
+        lastConversationAt: Math.max(Date.now(), newest + 1),
+      };
+      bumpSessions();
+    },
+    [bumpSessions],
+  );
+
   const attachSlot = useCallback(
     (slot: SessionSlot) => {
       if (slot.unsubscribe) return;
       slot.unsubscribe = slot.store.subscribe((snapshot) => {
         bumpSessions();
-        if (!slot.persisted || snapshot.log.length === 0) return;
+        if (snapshot.log === slot.observedLog) return;
+        slot.observedLog = snapshot.log;
+        if (!slot.persisted) return;
         if (slot.saveTimer !== undefined) window.clearTimeout(slot.saveTimer);
         slot.saveTimer = window.setTimeout(() => {
           void invoke("session_update_log", {
@@ -322,6 +341,7 @@ export default function App() {
         meta: record,
         store: sessionStore,
         persisted: true,
+        observedLog: sessionStore.getState().log,
         activity: record.pendingRequestIds.length > 0 ? "review" : "idle",
         planOpen: true,
         changesetOpen: true,
@@ -347,6 +367,7 @@ export default function App() {
       meta,
       store: sessionStore,
       persisted: false,
+      observedLog: sessionStore.getState().log,
       activity: "idle",
       planOpen: true,
       changesetOpen: true,
@@ -833,6 +854,8 @@ export default function App() {
           bumpSessions();
         }
 
+        markConversationStarted(slot);
+
         if (slot.store.getState().phase === "plan_review") {
           slot.store.log("you", payload.text, undefined, payload.attachments);
           slot.store.log("agent", "계획 수정을 요청했습니다.");
@@ -865,7 +888,7 @@ export default function App() {
         slot.store.log("error", `요청을 처리하지 못했습니다: ${String(error)}`);
       }
     },
-    [bumpSessions, createDraftSlot, selectedSlot],
+    [bumpSessions, createDraftSlot, markConversationStarted, selectedSlot],
   );
 
   const handleCancel = useCallback(async () => {
@@ -1384,12 +1407,16 @@ export default function App() {
       Array.from(sessionsRef.current.values())
         .sort((left, right) => {
           if (left.persisted !== right.persisted) return left.persisted ? 1 : -1;
-          return right.meta.updatedAt - left.meta.updatedAt;
+          return (
+            right.meta.lastConversationAt - left.meta.lastConversationAt ||
+            right.meta.createdAt - left.meta.createdAt ||
+            left.id.localeCompare(right.id)
+          );
         })
         .map((slot) => ({
           id: slot.id,
           name: slot.meta.name,
-          updatedAt: slot.meta.updatedAt,
+          lastConversationAt: slot.meta.lastConversationAt,
           activity: slot.activity,
           persisted: slot.persisted,
         })),

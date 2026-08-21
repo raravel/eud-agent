@@ -25,17 +25,21 @@ const sessionRecords = [
     name: "Session A",
     project: "Project",
     createdAt: 1,
-    updatedAt: 2,
+    lastConversationAt: 2_000,
     threadId: null,
     pendingRequestIds: [],
-    panelLog: { schemaVersion: 2, logSeq: 0, log: [] },
+    panelLog: {
+      schemaVersion: 2,
+      logSeq: 1,
+      log: [{ id: 1, kind: "you", text: "previous conversation" }],
+    },
   },
   {
     id: "session-b",
     name: "Session B",
     project: "Project",
     createdAt: 1,
-    updatedAt: 1,
+    lastConversationAt: 1_000,
     threadId: null,
     pendingRequestIds: [],
     panelLog: { schemaVersion: 2, logSeq: 0, log: [] },
@@ -46,6 +50,16 @@ function emit(name: string, payload: unknown): void {
   const listener = tauri.listeners.get(name);
   if (!listener) throw new Error(`listener ${name} is not registered`);
   listener({ payload });
+}
+
+function sessionOrder(): string[] {
+  const navigation = screen.getByRole("navigation", {
+    name: "현재 프로젝트 세션",
+  });
+  return Array.from(
+    navigation.querySelectorAll<HTMLButtonElement>("li > button"),
+    (button) => button.getAttribute("aria-label") ?? "",
+  );
 }
 
 beforeEach(() => {
@@ -68,13 +82,15 @@ beforeEach(() => {
       case "list":
         return { files: [] };
       case "session_list":
-        return sessionRecords.map(({ id, name, project, createdAt, updatedAt }) => ({
-          id,
-          name,
-          project,
-          createdAt,
-          updatedAt,
-        }));
+        return sessionRecords.map(
+          ({ id, name, project, createdAt, lastConversationAt }) => ({
+            id,
+            name,
+            project,
+            createdAt,
+            lastConversationAt,
+          }),
+        );
       case "session_load":
         return sessionRecords.find((record) => record.id === args?.id);
       case "session_update_log":
@@ -144,6 +160,50 @@ describe("App concurrent sessions", () => {
       });
     });
     expect(tauri.resolveLongChat).toBeTypeOf("function");
+  });
+
+  it("moves the session with a newly sent chat to the top", async () => {
+    render(<App />);
+    const input = await screen.findByRole("textbox", { name: "지시 입력" });
+    await waitFor(() => expect(input).toBeEnabled());
+    expect(sessionOrder()).toEqual(["Session A, 유휴", "Session B, 유휴"]);
+
+    fireEvent.click(screen.getByRole("button", { name: "Session B, 유휴" }));
+    fireEvent.change(screen.getByRole("textbox", { name: "지시 입력" }), {
+      target: { value: "newest conversation" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "전송" }));
+
+    await waitFor(() => {
+      expect(tauri.invoke).toHaveBeenCalledWith("chat", {
+        sessionId: "session-b",
+        text: "newest conversation",
+        attachments: [],
+      });
+    });
+    expect(sessionOrder()).toEqual(["Session B, 유휴", "Session A, 유휴"]);
+  });
+
+  it("does not autosave conversation logs for project-state refreshes", async () => {
+    render(<App />);
+    await screen.findByRole("button", { name: "Session A, 유휴" });
+    await waitFor(() => expect(tauri.listeners.has("status")).toBe(true));
+    tauri.invoke.mockClear();
+
+    act(() => {
+      emit("status", { compiling: false, project: "Project" });
+    });
+    const delay = Promise.withResolvers<void>();
+    window.setTimeout(delay.resolve, 550);
+    await act(async () => {
+      await delay.promise;
+    });
+
+    expect(
+      tauri.invoke.mock.calls.filter(
+        ([command]) => command === "session_update_log",
+      ),
+    ).toHaveLength(0);
   });
 
   it("routes interleaved events and backend activities only to addressed sessions", async () => {

@@ -20,22 +20,29 @@ sessions/
 ```
 
 All writes use `memory::write_atomic_bytes` and UTF-8 without BOM. `index.json` contains
-most-recently-updated `SessionMeta` rows:
+`SessionMeta` rows sorted by `lastConversationAt` descending:
 
 ```json
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "sessions": [
     {
       "id": "<rust UUID>",
       "name": "유닛 HP 작업",
       "project": "mymap",
       "createdAt": 1718000000,
-      "updatedAt": 1718009999
+      "lastConversationAt": 1718009999000
     }
   ]
 }
 ```
+
+`createdAt` is Unix seconds; `lastConversationAt` is Unix milliseconds. Creating the first
+conversation and submitting a later `chat` or `plan_feedback` advances
+`lastConversationAt` past every indexed row before the turn runs. Rename, panel-log autosave,
+context usage, activity transitions, rewind, cancellation, and changeset decisions do not change
+conversation recency. Schema-v1 `updatedAt` seconds remain readable and migrate to
+`lastConversationAt` milliseconds on the next save.
 
 Each session file contains the flattened metadata plus:
 
@@ -233,9 +240,11 @@ Project status, list, memory/wiki snapshots, setup, bootstrap, and RAG warmup re
 ## Panel contract
 
 `App.tsx` owns `Map<sessionId, SessionSlot>`, with one `PanelStore` per row. Drafts are persisted
-before their first chat, then invoked immediately. There is no frontend conversation queue,
-running slot, review owner, or event-owner fallback.
-
+before their first chat, then invoked immediately. The sidebar sorts by `lastConversationAt`
+descending and optimistically advances the submitted row before awaiting the backend, so a lower
+row moves to the top as soon as its user message is sent. Session subscriptions autosave only when
+the conversation-log array changes; project/status/context rerenders do not rewrite every log.
+There is no frontend conversation queue, running slot, review owner, or event-owner fallback.
 `context_usage` replaces only the addressed store's typed snapshot. The PromptInput footer uses
 the AI Elements `Context` hover card: its trigger shows `last.totalTokens / modelContextWindow`,
 and its body shows cumulative input, cached-input, output, and reasoning counts. A missing context
@@ -266,5 +275,8 @@ title. The center and both sidebars keep `min-width: 0`/horizontal clipping so t
   conflict, rejection invariance, and approved plans.
 - Panel integration: overlapping `chat` invokes, simultaneous write/review activities, immutable
   event routing, and selection independence.
+- Session recency: project/status/context fan-out leaves every idle timestamp unchanged; a new
+  `chat` or `plan_feedback` advances only its session and moves that row to the top immediately
+  and after restart.
 - Browser mock-Tauri smoke: concurrent read/write/review and 1280/960 px horizontal-overflow
   checks.
