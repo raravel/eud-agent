@@ -37,9 +37,10 @@ Korean progress lines rather than raw event names.
 this set. An enabled active model receives thread start/resume config
 `model_context_window=1000000` and `model_auto_compact_token_limit=900000`; disabling it omits both
 overrides on the next resume. Capability is not hard-coded because the authenticated catalog can
-change independently of the app. Codex clamps unsupported models to their catalog limit; when
-`thread/tokenUsage/updated` reports an effective window below 900,000, the owning session logs one
-fallback warning per model and continues on that default window.
+change independently of the app. Codex clamps requested windows to the catalog maximum and reports
+95% of that window as effective; the current 1M-capable catalog cap of 872,000 therefore reports
+828,400. An effective value below 828,400 logs one fallback warning per model and continues on
+the Codex-reported window.
 
 ## Read and write execution modes
 

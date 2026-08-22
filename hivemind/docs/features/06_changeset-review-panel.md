@@ -77,7 +77,7 @@ new writers.
   keyboard-accessible Codex category listing the authenticated model catalog; every row has an
   immediate-save 1M switch, current-model text badge, loading state, and explicit explanation of
   the 1,000,000 window, 900,000 auto-compaction threshold, and default-window fallback. Native
-  automatic compaction start/completion and one-time unsupported-model fallback warnings render as
+  automatic compaction start/completion and one-time clamped-override fallback warnings render as
   user-facing progress rows; raw `contextCompaction` item names never render.
 - **Status visibility** (user request 2026-06-05): header shows connection state transitions (연결 중 → 연결됨 → 재연결 중) and RAG model state with elapsed seconds while loading (`rag_warmup` started ts → done), reusing `progressLabel`.
 - **User-attention notifications**: the Header gear opens an extensible general Settings dialog.

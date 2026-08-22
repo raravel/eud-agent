@@ -363,8 +363,8 @@ export function SettingsDialog({
                     </div>
                     <p className="mt-4 text-xs leading-relaxed text-muted-foreground">
                       켜면 해당 모델에 1,000,000 토큰 컨텍스트와 900,000 토큰
-                      자동 압축 임계치를 적용합니다. 모델이 지원하지 않으면 Codex
-                      기본 한도로 동작하고 대화에 한 번 안내합니다.
+                      자동 압축 임계치를 적용합니다. Codex가 더 작은 한도로 제한하면
+                      보고된 컨텍스트로 동작하고 대화에 한 번 안내합니다.
                     </p>
                   </>
                 ) : (

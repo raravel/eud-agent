@@ -33,7 +33,9 @@ use tauri::Emitter;
 use tokio::process::{ChildStdin, ChildStdout};
 
 const FIRST_PRINCIPLES: &str = include_str!("data/first_principles.md");
-const LARGE_CONTEXT_EFFECTIVE_MIN_TOKENS: i64 = 900_000;
+// Codex reports 95% of its catalog-clamped input window. A 1M override on
+// current 128K-output models therefore resolves to 872K raw / 828.4K effective.
+const LARGE_CONTEXT_EFFECTIVE_MIN_TOKENS: i64 = 828_400;
 
 const INTRO: &str = "You are the EUD Editor 3 agent. You work in a durable, sandboxed \
 project filesystem and edit the live StarCraft EUD map through eud-tools. The server \
@@ -1657,9 +1659,11 @@ fn large_context_fallback_detail(
         return None;
     }
     let model = model_selection?.model.clone();
-    fallback_notified
-        .insert(model.clone())
-        .then(|| format!("{model}은(는) 1M 컨텍스트를 지원하지 않아 기본 컨텍스트를 사용합니다."))
+    fallback_notified.insert(model.clone()).then(|| {
+        format!(
+            "{model}의 1M 컨텍스트 요청이 Codex에서 제한되어 {window} 토큰 컨텍스트를 사용합니다."
+        )
+    })
 }
 
 struct ContextUsageHandler<'a> {
@@ -3646,11 +3650,38 @@ mod tests {
         let detail =
             large_context_fallback_detail(Some(&selection), true, &mut notified, Some(258_400))
                 .expect("a clamped opted-in model should warn");
-        assert!(detail.contains("gpt-test"));
+        assert_eq!(
+            detail,
+            "gpt-test의 1M 컨텍스트 요청이 Codex에서 제한되어 258400 토큰 컨텍스트를 사용합니다."
+        );
         assert_eq!(
             large_context_fallback_detail(Some(&selection), true, &mut notified, Some(258_400),),
             None
         );
+        let codex_effective_limit = CodexModelSelection {
+            model: "gpt-5.6-sol".to_string(),
+            reasoning_effort: "medium".to_string(),
+        };
+        assert_eq!(
+            large_context_fallback_detail(
+                Some(&codex_effective_limit),
+                true,
+                &mut notified,
+                Some(828_400),
+            ),
+            None
+        );
+        let below_effective_limit = CodexModelSelection {
+            model: "gpt-below-large-context".to_string(),
+            reasoning_effort: "medium".to_string(),
+        };
+        assert!(large_context_fallback_detail(
+            Some(&below_effective_limit),
+            true,
+            &mut notified,
+            Some(828_399),
+        )
+        .is_some());
 
         let supported = CodexModelSelection {
             model: "gpt-supported".to_string(),

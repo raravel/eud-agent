@@ -80,8 +80,8 @@ shows *"editor not connected"* until the bridge heartbeat appears.
 - Enter `/compact` by itself to run Codex's native conversation compaction. Codex also
   compacts automatically when the active model reaches its configured token threshold.
 - **Settings → Codex** enables the 1M context override per model. The choice is persisted in
-  `%appdata%\eud-agent\config.json`; unsupported models keep their Codex-reported default
-  window and show one warning after the next usage update.
+  `%appdata%\eud-agent\config.json`; Codex-clamped overrides below 828,400 effective tokens
+  keep their reported window and show one warning after the next usage update.
 
 > Settable/creatable text types are **CUI / RawText only**; GUI files are read-only and SCA is
 > a defunct type that is never exposed.

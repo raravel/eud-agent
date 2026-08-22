@@ -169,9 +169,9 @@ hosting, panel re-arm, and server spawning are REMOVED.
 - The model-specific 1M opt-in MUST inject `model_context_window=1000000` and
   `model_auto_compact_token_limit=900000` through every thread start/resume while enabled, and
   omit both on the next resume when disabled. Drivers MUST reload this app setting before every
-  turn. NEVER hard-code a capability allowlist or override Codex's model catalog: an effective
-  context below 900,000 is a safe default-window fallback and gets one visible warning per
-  session/model.
+  turn. NEVER hard-code a capability allowlist or override Codex's model catalog. Codex reports
+  95% of its catalog-clamped input window, so the current 1M override floor is 828,400 effective
+  tokens; a lower value is a safe fallback and gets one visible warning per session/model.
 - Different sessions MAY overlap read-only Codex turns; commands within one session MUST stay
   serialized. Conversation submission MUST NOT be globally queued.
 - Unexpected app-server exit or stdio closure MUST interrupt the current turn without replaying

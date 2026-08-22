@@ -65,12 +65,16 @@ describe("progressLabel", () => {
     });
   });
 
-  it("surfaces the model-specific 1M fallback as a warning", () => {
+  it("surfaces the Codex-clamped 1M fallback as a warning", () => {
     const detail =
-      "gpt-test은(는) 1M 컨텍스트를 지원하지 않아 기본 컨텍스트를 사용합니다.";
+      "gpt-test의 1M 컨텍스트 요청이 Codex에서 제한되어 258400 토큰 컨텍스트를 사용합니다.";
     expect(progressLabel("large_context_fallback", detail)).toEqual({
       kind: "warn",
       text: detail,
+    });
+    expect(progressLabel("large_context_fallback")).toEqual({
+      kind: "warn",
+      text: "1M 컨텍스트 요청이 Codex에서 제한되어 보고된 컨텍스트를 사용합니다.",
     });
   });
 

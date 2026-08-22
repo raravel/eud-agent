@@ -74,7 +74,7 @@ export function progressLabel(stage: string, detail?: string): ProgressLine {
       kind: "warn",
       text:
         detail ??
-        "선택한 모델이 1M 컨텍스트를 지원하지 않아 기본 컨텍스트를 사용합니다.",
+        "1M 컨텍스트 요청이 Codex에서 제한되어 보고된 컨텍스트를 사용합니다.",
     };
   }
   return { kind: "progress", text: STAGE_LABELS[stage] ?? stage };
