@@ -6,6 +6,7 @@
 //! failure degrades to a structured `skipped` result; candidate/path errors remain
 //! corrective tool errors.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
@@ -1096,13 +1097,38 @@ struct ProcessSession {
     job: Option<WindowsJob>,
 }
 
+fn node_script_path(path: &Path) -> Cow<'_, Path> {
+    #[cfg(windows)]
+    if let Some(Component::Prefix(prefix)) = path.components().next() {
+        use std::path::Prefix;
+
+        let mut normalized = match prefix.kind() {
+            Prefix::VerbatimDisk(disk) => PathBuf::from(format!("{}:", char::from(disk))),
+            Prefix::VerbatimUNC(server, share) => {
+                let mut normalized = PathBuf::from(r"\\");
+                normalized.push(server);
+                normalized.push(share);
+                normalized
+            }
+            _ => return Cow::Borrowed(path),
+        };
+        for component in path.components().skip(1) {
+            normalized.push(component.as_os_str());
+        }
+        return Cow::Owned(normalized);
+    }
+
+    Cow::Borrowed(path)
+}
+
 impl ProcessSession {
     fn spawn(node: &Path, adapter: &Path, cwd: &Path, logs_dir: &Path) -> io::Result<Self> {
         fs::create_dir_all(cwd)?;
         fs::create_dir_all(logs_dir)?;
+        let adapter = node_script_path(adapter);
         let mut command = Command::new(node);
         command
-            .arg(adapter)
+            .arg(adapter.as_os_str())
             .current_dir(cwd)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -1563,6 +1589,25 @@ mod tests {
             },
         ])
         .is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn node_script_path_removes_windows_verbatim_prefixes() {
+        assert_eq!(
+            node_script_path(Path::new(
+                r"\\?\C:\Users\tester\AppData\Local\eud-agent\adapter.cjs"
+            )),
+            Path::new(r"C:\Users\tester\AppData\Local\eud-agent\adapter.cjs")
+        );
+        assert_eq!(
+            node_script_path(Path::new(r"\\?\UNC\server\share\adapter.cjs")),
+            Path::new(r"\\server\share\adapter.cjs")
+        );
+        assert_eq!(
+            node_script_path(Path::new(r"C:\eud-agent\adapter.cjs")),
+            Path::new(r"C:\eud-agent\adapter.cjs")
+        );
     }
 
     #[test]
