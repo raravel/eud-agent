@@ -29,6 +29,14 @@ use crate::memory::write_atomic_bytes;
 const SCHEMA_VERSION: u32 = 2;
 const INDEX_FILE: &str = "index.json";
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SessionKind {
+    #[default]
+    Eps,
+    Map,
+}
+
 /// Session list-entry metadata (drives the list UI).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -36,6 +44,8 @@ pub struct SessionMeta {
     pub id: String,
     pub name: String,
     pub project: String,
+    #[serde(default)]
+    pub kind: SessionKind,
     pub created_at: u64,
     #[serde(
         alias = "updatedAt",
@@ -115,6 +125,13 @@ impl SessionStore {
         let mut sessions = self.read_index().sessions;
         sort_sessions(&mut sessions);
         Ok(sessions)
+    }
+    pub fn list_kind(&self, kind: SessionKind) -> anyhow::Result<Vec<SessionMeta>> {
+        Ok(self
+            .list()?
+            .into_iter()
+            .filter(|session| session.kind == kind)
+            .collect())
     }
 
     /// Load one full record by id. A corrupt/missing record is a graceful `Err`.
@@ -342,6 +359,7 @@ mod tests {
                 id: id.to_string(),
                 name: name.to_string(),
                 project: "mymap".to_string(),
+                kind: SessionKind::Eps,
                 created_at: 1_718_000_000,
                 last_conversation_at: 1_718_000_000_000,
             },
@@ -436,6 +454,19 @@ mod tests {
     }
 
     #[test]
+    fn session_kind_lists_keep_eps_and_map_surfaces_isolated() {
+        let (base, store) = store("kind-isolation");
+        let eps = sample_record(&new_session_id(), "EPS");
+        let mut map = sample_record(&new_session_id(), "Map");
+        map.meta.kind = SessionKind::Map;
+        store.save(&eps).unwrap();
+        store.save(&map).unwrap();
+        assert_eq!(store.list_kind(SessionKind::Eps).unwrap(), vec![eps.meta]);
+        assert_eq!(store.list_kind(SessionKind::Map).unwrap(), vec![map.meta]);
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
     fn context_usage_update_preserves_the_panel_log() {
         let (base, store) = store("context-usage");
         let record = sample_record(&new_session_id(), "토큰 사용량");
@@ -497,10 +528,12 @@ mod tests {
 
         let loaded = store.load(&id).unwrap();
         assert_eq!(loaded.meta.last_conversation_at, 1_718_009_999_000);
+        assert_eq!(loaded.meta.kind, SessionKind::Eps);
         store.save(&loaded).unwrap();
         let migrated: serde_json::Value =
             serde_json::from_slice(&fs::read(store.record_path(&id)).unwrap()).unwrap();
         assert_eq!(migrated["lastConversationAt"], json!(1_718_009_999_000_u64));
+        assert_eq!(migrated["kind"], json!("eps"));
         assert!(migrated.get("updatedAt").is_none());
 
         fs::remove_dir_all(base).ok();

@@ -23,6 +23,7 @@
  *     them -- no re-encode happens here (see rules.md).
  */
 #include "isom_capi.h"
+#include "IsomTerrain/MapAgentCore.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -155,11 +156,13 @@ int runMapGen(const std::vector<std::string>& args)
     return mapGenMain(int(owned.size()), argv.data());
 }
 
-// Translate a SEH structured exception into our fault code. Used as the filter
-// for the __try wrapper so access violations etc. don't escape the boundary.
-int sehFilter(unsigned int /*code*/)
+// C++ exceptions use the MSVC 0xE06D7363 SEH code while unwinding through
+// this frame. Let those continue to the outer C++ catch; handle only actual
+// structured faults such as access violations here.
+int sehFilter(unsigned int code)
 {
-    return EXCEPTION_EXECUTE_HANDLER;
+    constexpr unsigned int MsvcCppException = 0xE06D7363u;
+    return code == MsvcCppException ? EXCEPTION_CONTINUE_SEARCH : EXCEPTION_EXECUTE_HANDLER;
 }
 
 // SEH-guarded invocation of a C++ lambda. SEH and C++ EH cannot share one frame
@@ -202,6 +205,42 @@ int applyOps(const char* cmd, const char* mapPath,
     if ( guard != ISOM_OK )
         return guard;
     return engineResult == 0 ? ISOM_OK : ISOM_ERR_ENGINE;
+}
+int copyBuffer(const void* data, size_t length, uint8_t** out, size_t* outLength)
+{
+    uint8_t* buffer = static_cast<uint8_t*>(std::malloc(length == 0 ? 1 : length));
+    if ( buffer == nullptr )
+        return ISOM_ERR_IO;
+    if ( length != 0 )
+        std::memcpy(buffer, data, length);
+    *out = buffer;
+    *outLength = length;
+    return ISOM_OK;
+}
+
+int copyString(const std::string& value, uint8_t** out, size_t* outLength)
+{
+    return copyBuffer(value.data(), value.size(), out, outLength);
+}
+
+std::string errorReport(const std::string& message)
+{
+    std::string escaped;
+    for ( unsigned char value : message )
+    {
+        switch ( value )
+        {
+        case '\"': escaped += "\\\""; break;
+        case '\\': escaped += "\\\\"; break;
+        case '\n': escaped += "\\n"; break;
+        case '\r': escaped += "\\r"; break;
+        case '\t': escaped += "\\t"; break;
+        default:
+            if ( value >= 0x20 )
+                escaped.push_back(static_cast<char>(value));
+        }
+    }
+    return "{\"schema\":\"eud-map-error/1\",\"ok\":false,\"error\":\"" + escaped + "\"}";
 }
 
 } // namespace
@@ -316,6 +355,239 @@ int isom_render_map(const char* map_path, const char* starcraft_path,
     catch ( ... )
     {
         if ( *out ) { std::free(*out); *out = nullptr; *out_len = 0; }
+        return ISOM_ERR_EXCEPTION;
+    }
+}
+
+int isom_mapedit(
+    const char* input_map_path,
+    const char* output_map_path,
+    const char* starcraft_path,
+    const uint8_t* batch_json,
+    size_t batch_len,
+    uint8_t** out_report_json,
+    size_t* out_report_len)
+{
+    if ( out_report_json == nullptr || out_report_len == nullptr )
+        return ISOM_ERR_INVALID_ARG;
+    *out_report_json = nullptr;
+    *out_report_len = 0;
+    if ( input_map_path == nullptr || input_map_path[0] == '\0'
+         || output_map_path == nullptr || output_map_path[0] == '\0'
+         || starcraft_path == nullptr || starcraft_path[0] == '\0'
+         || batch_json == nullptr || batch_len == 0 )
+        return ISOM_ERR_INVALID_ARG;
+    try
+    {
+        std::string report;
+        int engineResult = 1;
+        const int guard = guardSeh([&]() {
+            return mapagent::mapEdit(input_map_path, output_map_path, starcraft_path,
+                batch_json, batch_len, report);
+        }, engineResult);
+        if ( guard != ISOM_OK )
+            return guard;
+        if ( engineResult != 0 )
+            return ISOM_ERR_ENGINE;
+        return copyString(report, out_report_json, out_report_len);
+    }
+    catch ( const std::exception& error )
+    {
+        const std::string report = errorReport(error.what());
+        const int copied = copyString(report, out_report_json, out_report_len);
+        return copied == ISOM_OK ? ISOM_ERR_ENGINE : copied;
+    }
+    catch ( ... )
+    {
+        return ISOM_ERR_EXCEPTION;
+    }
+}
+
+int isom_render_region(
+    const char* map_path,
+    const char* starcraft_path,
+    const uint8_t* request_json,
+    size_t request_len,
+    uint8_t** out_rgba,
+    size_t* out_rgba_len,
+    uint32_t* out_width,
+    uint32_t* out_height)
+{
+    if ( out_rgba == nullptr || out_rgba_len == nullptr || out_width == nullptr || out_height == nullptr )
+        return ISOM_ERR_INVALID_ARG;
+    *out_rgba = nullptr;
+    *out_rgba_len = 0;
+    *out_width = 0;
+    *out_height = 0;
+    if ( map_path == nullptr || map_path[0] == '\0'
+         || starcraft_path == nullptr || starcraft_path[0] == '\0'
+         || request_json == nullptr || request_len == 0 )
+        return ISOM_ERR_INVALID_ARG;
+    try
+    {
+        std::vector<uint8_t> rgba;
+        uint32_t width = 0;
+        uint32_t height = 0;
+        int engineResult = 1;
+        const int guard = guardSeh([&]() {
+            return mapagent::renderRegion(map_path, starcraft_path, request_json, request_len, rgba, width, height);
+        }, engineResult);
+        if ( guard != ISOM_OK )
+            return guard;
+        if ( engineResult != 0 )
+            return ISOM_ERR_ENGINE;
+        const int copied = copyBuffer(rgba.data(), rgba.size(), out_rgba, out_rgba_len);
+        if ( copied != ISOM_OK )
+            return copied;
+        *out_width = width;
+        *out_height = height;
+        return ISOM_OK;
+    }
+    catch ( const std::exception& error )
+    {
+        if ( *out_rgba != nullptr )
+        {
+            std::free(*out_rgba);
+            *out_rgba = nullptr;
+            *out_rgba_len = 0;
+        }
+        const std::string report = errorReport(error.what());
+        const int copied = copyString(report, out_rgba, out_rgba_len);
+        return copied == ISOM_OK ? ISOM_ERR_ENGINE : copied;
+    }
+    catch ( ... )
+    {
+        if ( *out_rgba != nullptr )
+        {
+            std::free(*out_rgba);
+            *out_rgba = nullptr;
+            *out_rgba_len = 0;
+        }
+        return ISOM_ERR_EXCEPTION;
+    }
+}
+
+int isom_catalog_query(
+    const char* starcraft_path,
+    const uint8_t* request_json,
+    size_t request_len,
+    uint8_t** out_json,
+    size_t* out_json_len)
+{
+    if ( out_json == nullptr || out_json_len == nullptr )
+        return ISOM_ERR_INVALID_ARG;
+    *out_json = nullptr;
+    *out_json_len = 0;
+    if ( starcraft_path == nullptr || starcraft_path[0] == '\0'
+         || request_json == nullptr || request_len == 0 )
+        return ISOM_ERR_INVALID_ARG;
+    try
+    {
+        std::string result;
+        int engineResult = 1;
+        const int guard = guardSeh([&]() {
+            return mapagent::catalogQuery(starcraft_path, request_json, request_len, result);
+        }, engineResult);
+        if ( guard != ISOM_OK )
+            return guard;
+        if ( engineResult != 0 )
+            return ISOM_ERR_ENGINE;
+        return copyString(result, out_json, out_json_len);
+    }
+    catch ( const std::exception& error )
+    {
+        const std::string report = errorReport(error.what());
+        const int copied = copyString(report, out_json, out_json_len);
+        return copied == ISOM_OK ? ISOM_ERR_ENGINE : copied;
+    }
+    catch ( ... )
+    {
+        return ISOM_ERR_EXCEPTION;
+    }
+}
+
+int isom_image_quantize(
+    const char* starcraft_path,
+    uint16_t tileset,
+    const uint8_t* rgba,
+    size_t rgba_len,
+    uint16_t width,
+    uint16_t height,
+    const uint16_t* before_tiles,
+    size_t before_tile_count,
+    uint8_t** out_result,
+    size_t* out_result_len)
+{
+    if ( out_result == nullptr || out_result_len == nullptr )
+        return ISOM_ERR_INVALID_ARG;
+    *out_result = nullptr;
+    *out_result_len = 0;
+    if ( starcraft_path == nullptr || starcraft_path[0] == '\0'
+         || rgba == nullptr || before_tiles == nullptr )
+        return ISOM_ERR_INVALID_ARG;
+    try
+    {
+        std::vector<std::uint8_t> result;
+        int engineResult = 1;
+        const int guard = guardSeh([&]() {
+            return mapagent::imageQuantize(
+                starcraft_path,
+                tileset,
+                rgba,
+                rgba_len,
+                width,
+                height,
+                before_tiles,
+                before_tile_count,
+                result);
+        }, engineResult);
+        if ( guard != ISOM_OK )
+            return guard;
+        if ( engineResult != 0 )
+            return ISOM_ERR_ENGINE;
+        return copyBuffer(result.data(), result.size(), out_result, out_result_len);
+    }
+    catch ( const std::exception& error )
+    {
+        const std::string report = errorReport(error.what());
+        const int copied = copyString(report, out_result, out_result_len);
+        return copied == ISOM_OK ? ISOM_ERR_ENGINE : copied;
+    }
+    catch ( ... )
+    {
+        return ISOM_ERR_EXCEPTION;
+    }
+}
+
+int isom_map_digest(const char* map_path, uint8_t** out_json, size_t* out_json_len)
+{
+    if ( out_json == nullptr || out_json_len == nullptr )
+        return ISOM_ERR_INVALID_ARG;
+    *out_json = nullptr;
+    *out_json_len = 0;
+    if ( map_path == nullptr || map_path[0] == '\0' )
+        return ISOM_ERR_INVALID_ARG;
+    try
+    {
+        std::string result;
+        int engineResult = 1;
+        const int guard = guardSeh([&]() {
+            return mapagent::mapDigest(map_path, result);
+        }, engineResult);
+        if ( guard != ISOM_OK )
+            return guard;
+        if ( engineResult != 0 )
+            return ISOM_ERR_ENGINE;
+        return copyString(result, out_json, out_json_len);
+    }
+    catch ( const std::exception& error )
+    {
+        const std::string report = errorReport(error.what());
+        const int copied = copyString(report, out_json, out_json_len);
+        return copied == ISOM_OK ? ISOM_ERR_ENGINE : copied;
+    }
+    catch ( ... )
+    {
         return ISOM_ERR_EXCEPTION;
     }
 }

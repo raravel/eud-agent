@@ -209,6 +209,13 @@ fn string_schema() -> Value {
 fn integer_schema() -> Value {
     json!({"type": "integer"})
 }
+fn render_scale_schema() -> Value {
+    json!({
+        "type": "integer",
+        "enum": [1, 2, 4, 8],
+        "description": "Render scale must be one of 1, 2, 4, or 8.",
+    })
+}
 
 fn numeric_value_schema() -> Value {
     json!({"type": ["integer", "string"]})
@@ -798,10 +805,545 @@ pub fn tool_registry() -> Vec<ToolSpec> {
         ),
     ]
 }
+fn u8_schema() -> Value {
+    json!({"type": "integer", "minimum": 0, "maximum": 255})
+}
 
-/// Return MCP tool descriptors using each registry tool's verbatim inputSchema.
-pub fn mcp_tool_descriptors() -> Vec<Value> {
-    tool_registry()
+fn u16_schema() -> Value {
+    json!({"type": "integer", "minimum": 0, "maximum": 65_535})
+}
+
+fn positive_u16_schema() -> Value {
+    json!({"type": "integer", "minimum": 1, "maximum": 65_535})
+}
+
+fn u32_schema() -> Value {
+    json!({"type": "integer", "minimum": 0, "maximum": 4_294_967_295_u64})
+}
+
+fn i32_schema() -> Value {
+    json!({
+        "type": "integer",
+        "minimum": -2_147_483_648_i64,
+        "maximum": 2_147_483_647
+    })
+}
+
+fn defaulted(mut schema: Value, default: Value) -> Value {
+    schema["default"] = default;
+    schema
+}
+
+fn tile_rows_schema() -> Value {
+    json!({
+        "type": "array",
+        "minItems": 1,
+        "items": {
+            "type": "array",
+            "minItems": 1,
+            "items": u16_schema(),
+        },
+    })
+}
+
+fn unit_properties_schema(state_defaults: bool) -> Value {
+    let optional = |schema, default| {
+        if state_defaults {
+            defaulted(schema, default)
+        } else {
+            schema
+        }
+    };
+    json!({
+        "typeId": u16_schema(),
+        "owner": u8_schema(),
+        "x": u16_schema(),
+        "y": u16_schema(),
+        "classId": optional(u32_schema(), json!(0)),
+        "relationFlags": optional(u16_schema(), json!(0)),
+        "validStateFlags": optional(u16_schema(), json!(0)),
+        "validFieldFlags": optional(u16_schema(), json!(0)),
+        "hpPercent": optional(u8_schema(), json!(100)),
+        "shieldPercent": optional(u8_schema(), json!(100)),
+        "energyPercent": optional(u8_schema(), json!(100)),
+        "resourceAmount": optional(u32_schema(), json!(0)),
+        "hangarAmount": optional(u16_schema(), json!(0)),
+        "stateFlags": optional(u16_schema(), json!(0)),
+        "unused": optional(u32_schema(), json!(0)),
+        "relationClassId": optional(u32_schema(), json!(0)),
+    })
+}
+
+fn unit_state_schema() -> Value {
+    object_schema(unit_properties_schema(true), &["typeId", "owner", "x", "y"])
+}
+
+fn unit_patch_schema() -> Value {
+    object_schema(unit_properties_schema(false), &[])
+}
+
+fn doodad_state_schema() -> Value {
+    object_schema(
+        json!({
+            "doodadId": u16_schema(),
+            "x": u16_schema(),
+            "y": u16_schema(),
+            "owner": defaulted(u8_schema(), json!(11)),
+            "disabled": defaulted(json!({"type": "boolean"}), json!(false)),
+        }),
+        &["doodadId", "x", "y"],
+    )
+}
+
+fn sprite_state_schema() -> Value {
+    object_schema(
+        json!({
+            "spriteId": u16_schema(),
+            "x": u16_schema(),
+            "y": u16_schema(),
+            "owner": defaulted(u8_schema(), json!(11)),
+            "flags": defaulted(u16_schema(), json!(0)),
+        }),
+        &["spriteId", "x", "y"],
+    )
+}
+
+fn location_state_schema() -> Value {
+    object_schema(
+        json!({
+            "locationId": u16_schema(),
+            "left": i32_schema(),
+            "top": i32_schema(),
+            "right": i32_schema(),
+            "bottom": i32_schema(),
+            "elevationFlags": defaulted(u16_schema(), json!(0)),
+            "nameBytesHex": string_schema(),
+        }),
+        &["locationId", "left", "top", "right", "bottom"],
+    )
+}
+
+fn operation_schema(name: &str, mut properties: Value, required: &[&str]) -> Value {
+    properties
+        .as_object_mut()
+        .expect("map operation properties must be an object")
+        .insert("op".to_string(), json!({"const": name}));
+    object_schema(properties, required)
+}
+
+fn map_operation_schema() -> Value {
+    json!({
+        "oneOf": [
+            operation_schema(
+                "terrain.set",
+                json!({
+                    "x": u16_schema(),
+                    "y": u16_schema(),
+                    "before": u16_schema(),
+                    "after": u16_schema(),
+                }),
+                &["op", "x", "y", "before", "after"],
+            ),
+            operation_schema(
+                "terrain.rect",
+                json!({
+                    "x": u16_schema(),
+                    "y": u16_schema(),
+                    "width": u16_schema(),
+                    "height": u16_schema(),
+                    "after": u16_schema(),
+                }),
+                &["op", "x", "y", "width", "height", "after"],
+            ),
+            operation_schema(
+                "terrain.blit",
+                json!({
+                    "x": u16_schema(),
+                    "y": u16_schema(),
+                    "tiles": tile_rows_schema(),
+                }),
+                &["op", "x", "y", "tiles"],
+            ),
+            operation_schema(
+                "terrain.isom_brush",
+                json!({
+                    "isomX": u16_schema(),
+                    "isomY": u16_schema(),
+                    "brush": u16_schema(),
+                    "extent": defaulted(u16_schema(), json!(1)),
+                }),
+                &["op", "isomX", "isomY", "brush"],
+            ),
+            operation_schema(
+                "unit.add",
+                json!({"state": unit_state_schema()}),
+                &["op", "state"],
+            ),
+            operation_schema(
+                "unit.set",
+                json!({
+                    "ordinal": u32_schema(),
+                    "beforeFingerprint": string_schema(),
+                    "state": unit_patch_schema(),
+                }),
+                &["op", "ordinal", "beforeFingerprint", "state"],
+            ),
+            operation_schema(
+                "unit.delete",
+                json!({
+                    "ordinal": u32_schema(),
+                    "beforeFingerprint": string_schema(),
+                }),
+                &["op", "ordinal", "beforeFingerprint"],
+            ),
+            operation_schema(
+                "unit.move",
+                json!({
+                    "ordinal": u32_schema(),
+                    "beforeFingerprint": string_schema(),
+                    "x": u16_schema(),
+                    "y": u16_schema(),
+                }),
+                &["op", "ordinal", "beforeFingerprint", "x", "y"],
+            ),
+            operation_schema(
+                "doodad.add",
+                json!({"state": doodad_state_schema()}),
+                &["op", "state"],
+            ),
+            operation_schema(
+                "doodad.set",
+                json!({
+                    "ordinal": u32_schema(),
+                    "beforeFingerprint": string_schema(),
+                    "state": doodad_state_schema(),
+                    "replacementTiles": tile_rows_schema(),
+                }),
+                &[
+                    "op",
+                    "ordinal",
+                    "beforeFingerprint",
+                    "state",
+                    "replacementTiles",
+                ],
+            ),
+            operation_schema(
+                "doodad.delete",
+                json!({
+                    "ordinal": u32_schema(),
+                    "beforeFingerprint": string_schema(),
+                    "replacementTiles": tile_rows_schema(),
+                }),
+                &["op", "ordinal", "beforeFingerprint", "replacementTiles"],
+            ),
+            operation_schema(
+                "doodad.move",
+                json!({
+                    "ordinal": u32_schema(),
+                    "beforeFingerprint": string_schema(),
+                    "x": u16_schema(),
+                    "y": u16_schema(),
+                    "replacementTiles": tile_rows_schema(),
+                }),
+                &[
+                    "op",
+                    "ordinal",
+                    "beforeFingerprint",
+                    "x",
+                    "y",
+                    "replacementTiles",
+                ],
+            ),
+            operation_schema(
+                "sprite.add",
+                json!({"state": sprite_state_schema()}),
+                &["op", "state"],
+            ),
+            operation_schema(
+                "sprite.set",
+                json!({
+                    "ordinal": u32_schema(),
+                    "beforeFingerprint": string_schema(),
+                    "state": sprite_state_schema(),
+                }),
+                &["op", "ordinal", "beforeFingerprint", "state"],
+            ),
+            operation_schema(
+                "sprite.delete",
+                json!({
+                    "ordinal": u32_schema(),
+                    "beforeFingerprint": string_schema(),
+                }),
+                &["op", "ordinal", "beforeFingerprint"],
+            ),
+            operation_schema(
+                "sprite.move",
+                json!({
+                    "ordinal": u32_schema(),
+                    "beforeFingerprint": string_schema(),
+                    "x": u16_schema(),
+                    "y": u16_schema(),
+                }),
+                &["op", "ordinal", "beforeFingerprint", "x", "y"],
+            ),
+            operation_schema(
+                "location.add",
+                json!({"state": location_state_schema()}),
+                &["op", "state"],
+            ),
+            operation_schema(
+                "location.set",
+                json!({"state": location_state_schema()}),
+                &["op", "state"],
+            ),
+            operation_schema(
+                "location.rename",
+                json!({
+                    "locationId": u16_schema(),
+                    "nameBytesHex": string_schema(),
+                }),
+                &["op", "locationId", "nameBytesHex"],
+            ),
+            operation_schema(
+                "location.delete",
+                json!({"locationId": u16_schema()}),
+                &["op", "locationId"],
+            ),
+        ],
+    })
+}
+
+fn map_operations_schema() -> Value {
+    json!({
+        "type": "array",
+        "minItems": 1,
+        "maxItems": 4096,
+        "items": map_operation_schema(),
+    })
+}
+
+fn map_palette_filter_schema() -> Value {
+    let mut filter = object_schema(
+        json!({
+            "id": u16_schema(),
+            "terrainType": u16_schema(),
+            "group": {"type": "integer", "minimum": 0, "maximum": 1_023},
+            "variant": {"type": "integer", "minimum": 0, "maximum": 15},
+            "graphicsValid": {"type": "boolean"},
+            "walkability": enum_string_schema(&["all", "any", "none"]),
+            "groundHeight": u16_schema(),
+            "buildability": u16_schema(),
+            "ramp": {"type": "boolean"},
+            "blocksView": {"type": "boolean"},
+            "overlay": {"type": "boolean"},
+            "visible": {"type": "boolean"},
+            "width": u16_schema(),
+            "height": u16_schema(),
+            "placementWidth": u16_schema(),
+            "placementHeight": u16_schema(),
+        }),
+        &[],
+    );
+    filter["minProperties"] = json!(1);
+    filter["description"] = json!(
+        "Exact AND filters. Tiles: id/terrainType/group/variant/graphicsValid/walkability/groundHeight/buildability/ramp/blocksView; brushes: id/terrainType and preview metadata; units/buildings: id/placementWidth/placementHeight; doodads: id/graphicsValid/overlay/width/height/buildability; sprites: id/visible."
+    );
+    filter
+}
+
+fn map_palette_query_schema() -> Value {
+    let mut query = object_schema(
+        json!({
+            "kind": enum_string_schema(&["brushes", "tiles", "units", "buildings", "doodads", "sprites"]),
+            "query": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Case-insensitive name substring. Tile names contain only their numeric id; use filter for tile metadata.",
+            },
+            "filter": map_palette_filter_schema(),
+        }),
+        &["kind"],
+    );
+    query["anyOf"] = json!([
+        {"required": ["query"]},
+        {"required": ["filter"]},
+    ]);
+    query
+}
+
+fn map_stamp_destinations_schema() -> Value {
+    json!({
+        "type": "array",
+        "minItems": 1,
+        "maxItems": 64,
+        "items": object_schema(
+            json!({"x": u16_schema(), "y": u16_schema()}),
+            &["x", "y"],
+        ),
+    })
+}
+
+pub fn map_tool_registry() -> Vec<ToolSpec> {
+    let operations = map_operations_schema();
+    vec![
+        tool_spec(
+            "map_status",
+            "Read the saved source and visible candidate revision.",
+            false,
+            empty_schema(),
+        ),
+        tool_spec(
+            "map_selection_read",
+            "Read exact canonical row spans, role, and layer capabilities for one saved selection.",
+            false,
+            schema(json!({"selectionId": string_schema()}), &["selectionId"]),
+        ),
+        tool_spec(
+            "map_objects_read",
+            "Read structured candidate objects and locations; object identity is revision-bound.",
+            false,
+            schema(
+                json!({
+                    "layer": enum_string_schema(&["units", "buildings", "doodads", "sprites", "locations"]),
+                    "offset": integer_schema(),
+                    "limit": integer_schema(),
+                }),
+                &["layer"],
+            ),
+        ),
+        tool_spec(
+            "map_render",
+            "Render a bounded candidate crop using actual terrain and GRP assets.",
+            false,
+            schema(
+                json!({
+                    "x": integer_schema(), "y": integer_schema(),
+                    "width": integer_schema(), "height": integer_schema(),
+                    "scale": render_scale_schema(),
+                    "layers": {"type": "array", "items": string_schema()},
+                }),
+                &["x", "y", "width", "height"],
+            ),
+        ),
+        tool_spec(
+            "map_palette_query",
+            "Run one bounded current-tileset catalog search. Results are complete up to 256 matches; refine query/filter when broader. Never enumerate exact-tile pages.",
+            false,
+            map_palette_query_schema(),
+        ),
+        tool_spec(
+            "map_tile_info",
+            "Read exact CV5/VF4 metadata for one current-tileset tile.",
+            false,
+            schema(json!({"tileId": integer_schema()}), &["tileId"]),
+        ),
+        tool_spec(
+            "map_analyze",
+            "Analyze the visible candidate and its verification state.",
+            false,
+            empty_schema(),
+        ),
+        tool_spec(
+            "map_candidate_diff",
+            "Read the visible revision's layer diff and validation report.",
+            false,
+            empty_schema(),
+        ),
+        tool_spec(
+            "map_draft_begin",
+            "Create the request-owned draft from the visible candidate.",
+            false,
+            empty_schema(),
+        ),
+        tool_spec(
+            "map_stamp_preview",
+            "Inspect exact live-candidate selection stamping at one or more top-left destinations. Reports object/location collisions without mutating the draft.",
+            false,
+            schema(
+                json!({
+                    "selectionId": string_schema(),
+                    "destinations": map_stamp_destinations_schema(),
+                }),
+                &["selectionId", "destinations"],
+            ),
+        ),
+        tool_spec(
+            "map_stamp_place",
+            "Place an exact live-candidate selection stamp on the request draft. Never substitutes semantic ISOM. Preview first and ask the user before choosing merge or replace when collisions exist.",
+            false,
+            schema(
+                json!({
+                    "selectionId": string_schema(),
+                    "destinations": map_stamp_destinations_schema(),
+                    "collisionPolicy": enum_string_schema(&["merge", "replace"]),
+                }),
+                &["selectionId", "destinations", "collisionPolicy"],
+            ),
+        ),
+        tool_spec(
+            "map_draft_patch",
+            "Apply one strict all-or-nothing operation batch to the request draft only.",
+            false,
+            schema(json!({"operations": operations}), &["operations"]),
+        ),
+        tool_spec(
+            "map_image_place",
+            "Convert one current-request imageRef into a server-generated TerrainBlit on the request draft.",
+            false,
+            schema(
+                json!({
+                    "imageRef": string_schema(),
+                    "x": u16_schema(),
+                    "y": u16_schema(),
+                    "width": positive_u16_schema(),
+                    "height": positive_u16_schema(),
+                }),
+                &["imageRef", "x", "y", "width", "height"],
+            ),
+        ),
+        tool_spec(
+            "map_draft_render",
+            "Render the request draft with actual map assets.",
+            false,
+            schema(
+                json!({
+                    "x": integer_schema(), "y": integer_schema(),
+                    "width": integer_schema(), "height": integer_schema(),
+                    "scale": render_scale_schema(),
+                    "layers": {"type": "array", "items": string_schema()},
+                }),
+                &["x", "y", "width", "height"],
+            ),
+        ),
+        tool_spec(
+            "map_draft_analyze",
+            "Verify draft masks, protections, layers, CHK semantics, and MPQ assets.",
+            false,
+            empty_schema(),
+        ),
+        tool_spec(
+            "map_draft_reset",
+            "Reset only this request's draft to its parent candidate.",
+            false,
+            empty_schema(),
+        ),
+        tool_spec(
+            "map_candidate_finalize",
+            "Finalize at most one verified visible revision for this request.",
+            false,
+            empty_schema(),
+        ),
+        tool_spec(
+            ASK_TOOL,
+            "Pause this map turn for materially ambiguous owner, count, state, or authority input.",
+            false,
+            schema(json!({"questions": ask_questions_schema()}), &["questions"]),
+        ),
+    ]
+}
+
+fn descriptors(registry: Vec<ToolSpec>) -> Vec<Value> {
+    registry
         .into_iter()
         .map(|spec| {
             json!({
@@ -811,6 +1353,21 @@ pub fn mcp_tool_descriptors() -> Vec<Value> {
             })
         })
         .collect()
+}
+
+pub fn map_mcp_tool_descriptors() -> Vec<Value> {
+    descriptors(map_tool_registry())
+}
+
+pub fn is_map_tool(tool_name: &str) -> bool {
+    map_tool_registry()
+        .iter()
+        .any(|spec| spec.name == tool_name)
+}
+
+/// Return MCP tool descriptors using each registry tool's verbatim inputSchema.
+pub fn mcp_tool_descriptors() -> Vec<Value> {
+    descriptors(tool_registry())
 }
 
 /// Whether a registered tool can mutate project-owned state.
@@ -4225,6 +4782,8 @@ mod tests {
                 tile_y: 5,
             }],
             units,
+            doodads: Vec::new(),
+            sprites: Vec::new(),
             tiles: (0..64 * 128).map(|index| (index % 32) as u16).collect(),
             switches: (1..=256)
                 .map(|id| crate::chk::MapSwitch {
@@ -5222,6 +5781,592 @@ mod tests {
             parse_open_map_name_reply("C:/maps/demo.scx\n"),
             "C:/maps/demo.scx"
         );
+    }
+
+    fn map_operation<'a>(alternatives: &'a [Value], name: &str) -> &'a Value {
+        alternatives
+            .iter()
+            .find(|alternative| alternative["properties"]["op"]["const"] == name)
+            .unwrap_or_else(|| panic!("missing map operation schema for {name}"))
+    }
+
+    fn operation_property<'a>(
+        alternatives: &'a [Value],
+        operation: &str,
+        property: &str,
+    ) -> &'a Value {
+        &map_operation(alternatives, operation)["properties"][property]
+    }
+
+    fn schema_string_set(schema: &Value, property: &str) -> std::collections::BTreeSet<String> {
+        schema[property]
+            .as_array()
+            .unwrap_or_else(|| panic!("{property} must be an array"))
+            .iter()
+            .map(|value| {
+                value
+                    .as_str()
+                    .unwrap_or_else(|| panic!("{property} values must be strings"))
+                    .to_string()
+            })
+            .collect()
+    }
+
+    fn schema_property_set(schema: &Value) -> std::collections::BTreeSet<String> {
+        schema["properties"]
+            .as_object()
+            .expect("schema properties must be an object")
+            .keys()
+            .cloned()
+            .collect()
+    }
+
+    fn assert_object_contract(schema: &Value, properties: &[&str], required: &[&str]) {
+        assert_eq!(schema["type"], "object");
+        assert_eq!(schema["additionalProperties"], false);
+        assert_eq!(
+            schema_property_set(schema),
+            properties
+                .iter()
+                .map(|property| (*property).to_string())
+                .collect()
+        );
+        assert_eq!(
+            schema_string_set(schema, "required"),
+            required
+                .iter()
+                .map(|property| (*property).to_string())
+                .collect()
+        );
+    }
+
+    fn assert_integer_bounds(schema: &Value, minimum: i64, maximum: i64) {
+        assert_eq!(schema["type"], "integer");
+        assert_eq!(schema["minimum"].as_i64(), Some(minimum));
+        assert_eq!(schema["maximum"].as_i64(), Some(maximum));
+    }
+
+    fn assert_tile_rows(schema: &Value) {
+        assert_eq!(schema["type"], "array");
+        assert_eq!(schema["minItems"], 1);
+        assert_eq!(schema["items"]["type"], "array");
+        assert_eq!(schema["items"]["minItems"], 1);
+        assert_integer_bounds(&schema["items"]["items"], 0, 65_535);
+    }
+
+    #[test]
+    fn map_draft_patch_schema_exhaustively_mirrors_map_operation() {
+        let registry = map_tool_registry();
+        let patch = registry
+            .iter()
+            .find(|tool| tool.name == "map_draft_patch")
+            .expect("map_draft_patch must be registered");
+        assert_object_contract(&patch.input_schema, &["operations"], &["operations"]);
+        let operations = &patch.input_schema["properties"]["operations"];
+        assert_eq!(operations["type"], "array");
+        assert_eq!(operations["minItems"], 1);
+        assert_eq!(operations["maxItems"], 4096);
+        let alternatives = operations["items"]["oneOf"]
+            .as_array()
+            .expect("map operations must use oneOf");
+        let expected: &[(&str, &[&str], &[&str])] = &[
+            (
+                "terrain.set",
+                &["op", "x", "y", "before", "after"],
+                &["op", "x", "y", "before", "after"],
+            ),
+            (
+                "terrain.rect",
+                &["op", "x", "y", "width", "height", "after"],
+                &["op", "x", "y", "width", "height", "after"],
+            ),
+            (
+                "terrain.blit",
+                &["op", "x", "y", "tiles"],
+                &["op", "x", "y", "tiles"],
+            ),
+            (
+                "terrain.isom_brush",
+                &["op", "isomX", "isomY", "brush", "extent"],
+                &["op", "isomX", "isomY", "brush"],
+            ),
+            ("unit.add", &["op", "state"], &["op", "state"]),
+            (
+                "unit.set",
+                &["op", "ordinal", "beforeFingerprint", "state"],
+                &["op", "ordinal", "beforeFingerprint", "state"],
+            ),
+            (
+                "unit.delete",
+                &["op", "ordinal", "beforeFingerprint"],
+                &["op", "ordinal", "beforeFingerprint"],
+            ),
+            (
+                "unit.move",
+                &["op", "ordinal", "beforeFingerprint", "x", "y"],
+                &["op", "ordinal", "beforeFingerprint", "x", "y"],
+            ),
+            ("doodad.add", &["op", "state"], &["op", "state"]),
+            (
+                "doodad.set",
+                &[
+                    "op",
+                    "ordinal",
+                    "beforeFingerprint",
+                    "state",
+                    "replacementTiles",
+                ],
+                &[
+                    "op",
+                    "ordinal",
+                    "beforeFingerprint",
+                    "state",
+                    "replacementTiles",
+                ],
+            ),
+            (
+                "doodad.delete",
+                &["op", "ordinal", "beforeFingerprint", "replacementTiles"],
+                &["op", "ordinal", "beforeFingerprint", "replacementTiles"],
+            ),
+            (
+                "doodad.move",
+                &[
+                    "op",
+                    "ordinal",
+                    "beforeFingerprint",
+                    "x",
+                    "y",
+                    "replacementTiles",
+                ],
+                &[
+                    "op",
+                    "ordinal",
+                    "beforeFingerprint",
+                    "x",
+                    "y",
+                    "replacementTiles",
+                ],
+            ),
+            ("sprite.add", &["op", "state"], &["op", "state"]),
+            (
+                "sprite.set",
+                &["op", "ordinal", "beforeFingerprint", "state"],
+                &["op", "ordinal", "beforeFingerprint", "state"],
+            ),
+            (
+                "sprite.delete",
+                &["op", "ordinal", "beforeFingerprint"],
+                &["op", "ordinal", "beforeFingerprint"],
+            ),
+            (
+                "sprite.move",
+                &["op", "ordinal", "beforeFingerprint", "x", "y"],
+                &["op", "ordinal", "beforeFingerprint", "x", "y"],
+            ),
+            ("location.add", &["op", "state"], &["op", "state"]),
+            ("location.set", &["op", "state"], &["op", "state"]),
+            (
+                "location.rename",
+                &["op", "locationId", "nameBytesHex"],
+                &["op", "locationId", "nameBytesHex"],
+            ),
+            (
+                "location.delete",
+                &["op", "locationId"],
+                &["op", "locationId"],
+            ),
+        ];
+        assert_eq!(alternatives.len(), expected.len());
+        for (alternative, (name, properties, required)) in alternatives.iter().zip(expected) {
+            assert_eq!(alternative["properties"]["op"]["const"], *name);
+            assert_object_contract(alternative, properties, required);
+        }
+
+        for (operation, property) in [
+            ("terrain.set", "x"),
+            ("terrain.set", "y"),
+            ("terrain.set", "before"),
+            ("terrain.set", "after"),
+            ("terrain.rect", "x"),
+            ("terrain.rect", "y"),
+            ("terrain.rect", "width"),
+            ("terrain.rect", "height"),
+            ("terrain.rect", "after"),
+            ("terrain.blit", "x"),
+            ("terrain.blit", "y"),
+            ("terrain.isom_brush", "isomX"),
+            ("terrain.isom_brush", "isomY"),
+            ("terrain.isom_brush", "brush"),
+            ("terrain.isom_brush", "extent"),
+            ("unit.move", "x"),
+            ("unit.move", "y"),
+            ("doodad.move", "x"),
+            ("doodad.move", "y"),
+            ("sprite.move", "x"),
+            ("sprite.move", "y"),
+            ("location.rename", "locationId"),
+            ("location.delete", "locationId"),
+        ] {
+            assert_integer_bounds(
+                operation_property(alternatives, operation, property),
+                0,
+                65_535,
+            );
+        }
+        for (operation, property) in [
+            ("unit.set", "ordinal"),
+            ("unit.delete", "ordinal"),
+            ("unit.move", "ordinal"),
+            ("doodad.set", "ordinal"),
+            ("doodad.delete", "ordinal"),
+            ("doodad.move", "ordinal"),
+            ("sprite.set", "ordinal"),
+            ("sprite.delete", "ordinal"),
+            ("sprite.move", "ordinal"),
+        ] {
+            assert_integer_bounds(
+                operation_property(alternatives, operation, property),
+                0,
+                4_294_967_295,
+            );
+        }
+        for (operation, property) in [
+            ("unit.set", "beforeFingerprint"),
+            ("unit.delete", "beforeFingerprint"),
+            ("unit.move", "beforeFingerprint"),
+            ("doodad.set", "beforeFingerprint"),
+            ("doodad.delete", "beforeFingerprint"),
+            ("doodad.move", "beforeFingerprint"),
+            ("sprite.set", "beforeFingerprint"),
+            ("sprite.delete", "beforeFingerprint"),
+            ("sprite.move", "beforeFingerprint"),
+            ("location.rename", "nameBytesHex"),
+        ] {
+            assert_eq!(
+                operation_property(alternatives, operation, property)["type"],
+                "string"
+            );
+        }
+        assert_eq!(
+            operation_property(alternatives, "terrain.isom_brush", "extent")["default"],
+            1
+        );
+
+        let tiles = operation_property(alternatives, "terrain.blit", "tiles");
+        assert_tile_rows(tiles);
+        for (operation, property) in [
+            ("doodad.set", "replacementTiles"),
+            ("doodad.delete", "replacementTiles"),
+            ("doodad.move", "replacementTiles"),
+        ] {
+            assert_eq!(operation_property(alternatives, operation, property), tiles);
+        }
+
+        let unit_state = operation_property(alternatives, "unit.add", "state");
+        let unit_properties = [
+            "typeId",
+            "owner",
+            "x",
+            "y",
+            "classId",
+            "relationFlags",
+            "validStateFlags",
+            "validFieldFlags",
+            "hpPercent",
+            "shieldPercent",
+            "energyPercent",
+            "resourceAmount",
+            "hangarAmount",
+            "stateFlags",
+            "unused",
+            "relationClassId",
+        ];
+        assert_object_contract(unit_state, &unit_properties, &["typeId", "owner", "x", "y"]);
+        for property in ["owner", "hpPercent", "shieldPercent", "energyPercent"] {
+            assert_integer_bounds(&unit_state["properties"][property], 0, 255);
+        }
+        for property in [
+            "typeId",
+            "x",
+            "y",
+            "relationFlags",
+            "validStateFlags",
+            "validFieldFlags",
+            "hangarAmount",
+            "stateFlags",
+        ] {
+            assert_integer_bounds(&unit_state["properties"][property], 0, 65_535);
+        }
+        for property in ["classId", "resourceAmount", "unused", "relationClassId"] {
+            assert_integer_bounds(&unit_state["properties"][property], 0, 4_294_967_295);
+        }
+        for (property, default) in [
+            ("classId", 0),
+            ("relationFlags", 0),
+            ("validStateFlags", 0),
+            ("validFieldFlags", 0),
+            ("hpPercent", 100),
+            ("shieldPercent", 100),
+            ("energyPercent", 100),
+            ("resourceAmount", 0),
+            ("hangarAmount", 0),
+            ("stateFlags", 0),
+            ("unused", 0),
+            ("relationClassId", 0),
+        ] {
+            assert_eq!(unit_state["properties"][property]["default"], default);
+        }
+
+        let unit_patch = operation_property(alternatives, "unit.set", "state");
+        assert_object_contract(unit_patch, &unit_properties, &[]);
+        for property in ["owner", "hpPercent", "shieldPercent", "energyPercent"] {
+            assert_integer_bounds(&unit_patch["properties"][property], 0, 255);
+        }
+        for property in [
+            "typeId",
+            "x",
+            "y",
+            "relationFlags",
+            "validStateFlags",
+            "validFieldFlags",
+            "hangarAmount",
+            "stateFlags",
+        ] {
+            assert_integer_bounds(&unit_patch["properties"][property], 0, 65_535);
+        }
+        for property in ["classId", "resourceAmount", "unused", "relationClassId"] {
+            assert_integer_bounds(&unit_patch["properties"][property], 0, 4_294_967_295);
+        }
+
+        let doodad_state = operation_property(alternatives, "doodad.add", "state");
+        assert_object_contract(
+            doodad_state,
+            &["doodadId", "x", "y", "owner", "disabled"],
+            &["doodadId", "x", "y"],
+        );
+        for property in ["doodadId", "x", "y"] {
+            assert_integer_bounds(&doodad_state["properties"][property], 0, 65_535);
+        }
+        assert_integer_bounds(&doodad_state["properties"]["owner"], 0, 255);
+        assert_eq!(doodad_state["properties"]["owner"]["default"], 11);
+        assert_eq!(doodad_state["properties"]["disabled"]["type"], "boolean");
+        assert_eq!(doodad_state["properties"]["disabled"]["default"], false);
+        assert_eq!(
+            operation_property(alternatives, "doodad.set", "state"),
+            doodad_state
+        );
+
+        let sprite_state = operation_property(alternatives, "sprite.add", "state");
+        assert_object_contract(
+            sprite_state,
+            &["spriteId", "x", "y", "owner", "flags"],
+            &["spriteId", "x", "y"],
+        );
+        for property in ["spriteId", "x", "y", "flags"] {
+            assert_integer_bounds(&sprite_state["properties"][property], 0, 65_535);
+        }
+        assert_integer_bounds(&sprite_state["properties"]["owner"], 0, 255);
+        assert_eq!(sprite_state["properties"]["owner"]["default"], 11);
+        assert_eq!(sprite_state["properties"]["flags"]["default"], 0);
+        assert_eq!(
+            operation_property(alternatives, "sprite.set", "state"),
+            sprite_state
+        );
+
+        let location_state = operation_property(alternatives, "location.add", "state");
+        assert_object_contract(
+            location_state,
+            &[
+                "locationId",
+                "left",
+                "top",
+                "right",
+                "bottom",
+                "elevationFlags",
+                "nameBytesHex",
+            ],
+            &["locationId", "left", "top", "right", "bottom"],
+        );
+        for property in ["locationId", "elevationFlags"] {
+            assert_integer_bounds(&location_state["properties"][property], 0, 65_535);
+        }
+        for property in ["left", "top", "right", "bottom"] {
+            assert_integer_bounds(
+                &location_state["properties"][property],
+                -2_147_483_648,
+                2_147_483_647,
+            );
+        }
+        assert_eq!(
+            location_state["properties"]["nameBytesHex"]["type"],
+            "string"
+        );
+        assert_eq!(location_state["properties"]["elevationFlags"]["default"], 0);
+        assert_eq!(
+            operation_property(alternatives, "location.set", "state"),
+            location_state
+        );
+    }
+
+    #[test]
+    fn map_render_schemas_advertise_supported_scales() {
+        let registry = map_tool_registry();
+        for name in ["map_render", "map_draft_render"] {
+            let render = registry
+                .iter()
+                .find(|tool| tool.name == name)
+                .unwrap_or_else(|| panic!("{name} must be registered"));
+            assert_eq!(
+                render.input_schema["properties"]["scale"],
+                render_scale_schema()
+            );
+        }
+    }
+
+    #[test]
+    fn map_palette_query_schema_requires_a_bounded_structured_search() {
+        let registry = map_tool_registry();
+        let tool = registry
+            .iter()
+            .find(|tool| tool.name == "map_palette_query")
+            .expect("map_palette_query must be registered");
+        assert_object_contract(&tool.input_schema, &["kind", "query", "filter"], &["kind"]);
+        assert_eq!(
+            tool.input_schema["anyOf"],
+            json!([
+                {"required": ["query"]},
+                {"required": ["filter"]},
+            ])
+        );
+        assert_eq!(tool.input_schema["properties"]["query"]["minLength"], 1);
+
+        let filter = &tool.input_schema["properties"]["filter"];
+        assert_object_contract(
+            filter,
+            &[
+                "id",
+                "terrainType",
+                "group",
+                "variant",
+                "graphicsValid",
+                "walkability",
+                "groundHeight",
+                "buildability",
+                "ramp",
+                "blocksView",
+                "overlay",
+                "visible",
+                "width",
+                "height",
+                "placementWidth",
+                "placementHeight",
+            ],
+            &[],
+        );
+        assert_eq!(filter["minProperties"], 1);
+        assert_integer_bounds(&filter["properties"]["group"], 0, 1_023);
+        assert_integer_bounds(&filter["properties"]["variant"], 0, 15);
+        assert_eq!(
+            filter["properties"]["walkability"]["enum"],
+            json!(["all", "any", "none"])
+        );
+        assert!(tool.input_schema["properties"].get("offset").is_none());
+        assert!(tool.input_schema["properties"].get("limit").is_none());
+    }
+
+    #[test]
+    fn map_stamp_tools_require_exact_selection_destinations_and_collision_policy() {
+        let registry = map_tool_registry();
+        for (name, properties, required) in [
+            (
+                "map_stamp_preview",
+                vec!["selectionId", "destinations"],
+                vec!["selectionId", "destinations"],
+            ),
+            (
+                "map_stamp_place",
+                vec!["selectionId", "destinations", "collisionPolicy"],
+                vec!["selectionId", "destinations", "collisionPolicy"],
+            ),
+        ] {
+            let tool = registry
+                .iter()
+                .find(|tool| tool.name == name)
+                .unwrap_or_else(|| panic!("{name} must be registered"));
+            assert_object_contract(&tool.input_schema, &properties, &required);
+            let destinations = &tool.input_schema["properties"]["destinations"];
+            assert_eq!(destinations["type"], "array");
+            assert_eq!(destinations["minItems"], 1);
+            assert_eq!(destinations["maxItems"], 64);
+            assert_object_contract(&destinations["items"], &["x", "y"], &["x", "y"]);
+            assert_integer_bounds(&destinations["items"]["properties"]["x"], 0, 65_535);
+            assert_integer_bounds(&destinations["items"]["properties"]["y"], 0, 65_535);
+            let descriptor = map_mcp_tool_descriptors()
+                .into_iter()
+                .find(|descriptor| descriptor["name"] == name)
+                .unwrap_or_else(|| panic!("{name} must be advertised"));
+            assert_eq!(descriptor["inputSchema"], tool.input_schema);
+            assert!(descriptor.get("parameters").is_none());
+        }
+        let place = registry
+            .iter()
+            .find(|tool| tool.name == "map_stamp_place")
+            .unwrap();
+        assert_eq!(
+            place.input_schema["properties"]["collisionPolicy"]["enum"],
+            json!(["merge", "replace"])
+        );
+    }
+
+    #[test]
+    fn map_image_place_schema_exposes_only_request_ref_and_tile_transform() {
+        let registry = map_tool_registry();
+        let tool = registry
+            .iter()
+            .find(|tool| tool.name == "map_image_place")
+            .expect("map_image_place must be registered");
+        assert_object_contract(
+            &tool.input_schema,
+            &["imageRef", "x", "y", "width", "height"],
+            &["imageRef", "x", "y", "width", "height"],
+        );
+        assert_eq!(
+            tool.input_schema["properties"]["imageRef"]["type"],
+            "string"
+        );
+        for property in ["x", "y"] {
+            assert_integer_bounds(&tool.input_schema["properties"][property], 0, 65_535);
+        }
+        for property in ["width", "height"] {
+            assert_integer_bounds(&tool.input_schema["properties"][property], 1, 65_535);
+        }
+        for forbidden in ["path", "tiles", "tileId", "mtxm", "palette", "permission"] {
+            assert!(tool.input_schema["properties"].get(forbidden).is_none());
+        }
+        let descriptor = map_mcp_tool_descriptors()
+            .into_iter()
+            .find(|descriptor| descriptor["name"] == "map_image_place")
+            .expect("map_image_place must be advertised");
+        assert_eq!(descriptor["inputSchema"], tool.input_schema);
+        assert!(descriptor.get("parameters").is_none());
+    }
+
+    #[test]
+    fn map_mcp_descriptor_advertises_registry_input_schema_verbatim() {
+        let registry = map_tool_registry();
+        let registry_patch = registry
+            .iter()
+            .find(|tool| tool.name == "map_draft_patch")
+            .expect("map_draft_patch must be registered");
+        let descriptors = map_mcp_tool_descriptors();
+        let descriptor = descriptors
+            .iter()
+            .find(|descriptor| descriptor["name"] == "map_draft_patch")
+            .expect("map_draft_patch must be advertised");
+
+        assert_eq!(descriptor["inputSchema"], registry_patch.input_schema);
+        assert!(descriptor.get("parameters").is_none());
     }
 
     #[test]

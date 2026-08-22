@@ -72,6 +72,8 @@ sequenceDiagram
     participant C as Rust core
     participant L as Lua bridge
     participant E as EUD Editor 3
+    P->>C: invoke ask_pending {sessionId} after listener registration/reconnect
+    C-->>P: pending ASK snapshot or null
     U->>P: instruction + target file
     P->>C: invoke instruct {instruction, target, useContext}
     C->>C: rag search (in-process fastembed + cosine)
@@ -125,7 +127,7 @@ Runtime state is split by size and ownership (Decision 12):
 | Location | Contents | Who accesses |
 |---|---|---|
 | editor `Data\agent\` | `inbox/`, `outbox/`, `status.txt`, `heartbeat.txt` | bridge (writes/reads) + app (file-IPC) |
-| `%appdata%\eud-agent\` | `config.json` (editor path, settings), `memory/`, durable `workspaces/`, `map_backups/`, `journal/`, `sessions/` | app; Codex can access only its current project workspace through the strict sandbox |
+| `%appdata%\eud-agent\` | `config.json` (editor path, settings), `memory/`, durable `workspaces/`, `map_candidates/`, `map_backups/`, `journal/`, `sessions/` | app; Codex can access only its current project workspace through the strict sandbox |
 | `%localappdata%\eud-agent\` | `models/`, `rag/`, `bin/` (Codex CLI + Code Mode host + Windows sandbox setup helper), `logs/`, session-owned `attachments/`, regenerable `lsp_workspaces/` mirrors | app only |
 
 The bridge finds `Data\agent\` editor-relative (no absolute path baked into the .lua —
@@ -174,6 +176,110 @@ The named Windows profiles `eud_workspace_read` and `eud_workspace_write` both u
 runtime reads, exact-root elevated sandboxing, and disabled network. The write profile grants
 only the current session root and keeps `source/**` read-only. Unsupported or denied setup fails
 closed.
+
+## Map Agent workbench and candidate documents
+
+`map_agent_open` is an async Tauri command that creates one reusable `map-agent` WebView window
+in the same process. It loads the dedicated `map-agent.html`/`map-main.tsx` entry; the main window
+loads only `index.html`/`main.tsx`. This avoids query-string routing and prevents synchronous IPC
+window creation from leaving WebView2 at `about:blank`. The second invocation shows and focuses
+the existing window instead of creating another instance. The surface bootstraps only from the
+current saved `OpenMapName`; its toolbar retains the saved source path, mtime, file SHA-256,
+tileset, and dimensions. Terrain/object crops and palette thumbnails travel over binary Tauri IPC
+and are rendered from the statically linked native engine.
+The terrain palette opens on a paged grid of graphics-valid exact tiles from the current tileset;
+each thumbnail enlarges one 32×32 tile with nearest-neighbor pixels, while semantic ISOM brushes
+remain an explicit alternate mode. Space Platform thumbnail transparency is composited over the
+installed star parallax instead of appearing as a missing image.
+While the window remains open, a lightweight source probe polls only project/path/mtime/size.
+Metadata changes mark the current candidate stale without clearing or reloading the workbench; the
+toolbar offers an explicit action that preserves the stale session and creates a new Map session
+from a fresh full hash/CHK bootstrap. Map events carry the parent candidate revision key so
+stale/out-of-order output is discarded.
+
+`SessionKind::Map` is persisted beside the backward-compatible default `SessionKind::Eps`.
+Map workers have independent events, cancellation, conversation state, prompt, and MCP registry.
+Their tools can inspect the connected map and mutate only a request-owned draft. Original-file
+Apply and backup restore are deliberately absent from the model registry.
+
+`MapRequestAuthority::calculate` is the one write-scope calculation used by candidate patches,
+image conversion, per-batch verification, finalize, replay, and Apply verification. When the
+current request has no target mention, all cells of the current candidate are writable for
+terrain, units, buildings, doodads, sprites, and locations. Current-request targets narrow
+coordinate writes to the union of their exact cells and layers; stored targets omitted from the
+request do not narrow it. Persistent or mentioned protect masks remove their cells/layers in
+both cases. Reference and anchor masks are read/comparison context only. Revision-bound exact
+object/location mentions retain their fingerprint/id binding.
+
+Saved selections also form a project-scoped region-stamp palette. Their canonical masks, labels,
+roles, and selected layers persist in
+`map_candidates/<project-id>/selection-palette.json`; every Map session for that saved map rebinds
+the same definitions to its own visible candidate revision. Creating or updating a selection
+upserts its palette entry, and deleting the selection removes the shared entry. A stamp mention
+identifies this live selection but grants no write authority.
+
+`map_stamp_preview` and `map_stamp_place` read the stamp source from the visible candidate at
+placement time. Rust extracts exact MTXM/TILE and fully-contained selected-layer units, buildings,
+doodads, sprites, and locations, then resolves the placement to ordinary typed operation batches.
+The model never receives or reconstructs the tile matrix. Exact stamping never invokes ISOM;
+multiple destinations are bounded, in-map, and non-overlapping. Terrain is expected overwrite,
+while destination object/location collisions require an explicit merge, replace, or cancel
+choice. Merge preserves destination objects; replace removes only fully-contained selected-layer
+items and fails closed on boundary-crossing items. Direct palette placement and model placement
+use the same authority, persistent-protect, native mapedit, verification, finalize, and replay
+path.
+
+PNG, JPEG, WebP, and the first GIF frame use one `MapImageService` conversion path. The server
+checks encoded/decode/allocation caps, keeps one bounded normalized RGBA source per session,
+resizes with preserved aspect ratio, then calls the ABI-v5 native CV5/VX4/VR4/WPE quantizer.
+The native layer builds a cached graphics-valid SD representative-color palette, keeps the first
+stable tile for duplicate RGB, alpha-composites against candidate terrain, and applies Bayer 8x8
+ordered dithering with deterministic nearest-color ties. It returns packed MTXM values, preview
+RGB, unique-tile count, and walkability/height change counts. Rust emits a bounded binary
+JSON-header + PNG preview and a normal `TerrainBlit`; React and the model never parse tile assets
+or provide paths, palettes, MTXM ids, or tile matrices.
+
+Direct `map_agent_image_preview` is read-only. Trusted `map_agent_image_confirm` recomputes the
+transform, checks the preview tile-grid digest and persistent protect conflicts, and creates
+exactly one candidate revision. Map-request attachments are also exposed to vision as
+`localImage` and bound in request order as `image-1`, `image-2`, etc.; `map_image_place` resolves
+only those request-local refs and uses the same terrain authority/verifier. Image batches do not
+seal the draft, so multiple photos and ordinary terrain patches may be interleaved.
+
+Each Map session owns `%appdata%\eud-agent\map_candidates\<project-id>\<session-id>\`, while the
+saved selection palette is shared at the project directory above those session roots. The service
+materializes one immutable baseline snapshot and one current candidate SCX; revision manifests
+retain typed operation batches, authority snapshots, verification reports, candidate-local
+object UUIDs, and non-authorizing image conversion metadata (attachment SHA-256, source
+dimensions, placement, quantizer version, tile-grid SHA-256, changed rows, walkability changes,
+and height changes). A request begins from the visible candidate revision, iterates in
+`drafts/<request-id>.tmp.scx`, and may finalize one verified pending revision. That revision is
+published only after the complete model turn succeeds. Failed, cancelled, stale, or unfinalized
+requests delete their draft and pending manifest without changing the visible candidate.
+
+Replay uses stored `TerrainBlit` values and never depends on attachment ids or local paths. Startup
+removes incomplete drafts and unused candidate directories older than the configured 30-day
+policy.
+
+While a Map turn is running, successful scoped tool results from `map_draft_patch`,
+`map_stamp_place`, `map_image_place`, and `map_draft_reset` advance a panel-owned preview
+generation. When the user
+is on the candidate view, canvas and minimap renders read the request-owned `MapView::Draft` by
+the event's exact request id; object pages use the same request plus generation so locations and
+hit-test overlays match the rendered draft without receiving committed candidate UUIDs. The
+surface labels this state `수정 중 미리보기 · 미확정`, disables creating an object mention from
+the preview, and discards late generation output. Original/diff views remain authoritative saved
+views. Turn success replaces the preview with the published candidate; failure or cancellation
+removes it and reveals the unchanged parent candidate. This path is read-only and never publishes
+the draft or weakens candidate/source authority.
+
+Only trusted commands from the `map-agent` window may Apply or undo. Apply replays and verifies
+the complete revision chain, then enters `ProjectWriteCoordinator` and `CandidateMapSafe` for the
+compiling guard, no-share lock probe, source-hash check, full backup, same-directory atomic
+replacement, and post-write canonical/container verification. A flushed pending-Apply journal
+closes the crash window before replacement: startup restores an uncommitted replacement or
+recognizes the already-committed candidate state. Verification failure restores immediately;
+explicit undo restores exact backup bytes through the same lock and atomic-replace rails.
 
 ## File IPC protocol (app to bridge)
 

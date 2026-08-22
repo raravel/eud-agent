@@ -858,7 +858,9 @@ export function createPanelStore(): PanelStore {
     },
 
     askReceived(requestId, questions) {
-      if (!core.turnInFlight) return;
+      if (core.ask?.requestId === requestId) return;
+      core.turnInFlight = true;
+      core.phase = "thinking";
       core.ask = { requestId, questions, submitting: false };
       emit();
     },

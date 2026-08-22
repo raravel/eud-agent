@@ -1,10 +1,11 @@
-import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const tauri = vi.hoisted(() => ({
   invoke: vi.fn(),
   listeners: new Map<string, (event: { payload: unknown }) => void>(),
   resolveLongChat: undefined as (() => void) | undefined,
+  pendingAsk: undefined as Record<string, unknown> | undefined,
 }));
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: tauri.invoke }));
@@ -65,6 +66,7 @@ function sessionOrder(): string[] {
 beforeEach(() => {
   tauri.listeners.clear();
   tauri.resolveLongChat = undefined;
+  tauri.pendingAsk = undefined;
   tauri.invoke.mockReset();
   tauri.invoke.mockImplementation(async (command: string, args?: Record<string, unknown>) => {
     switch (command) {
@@ -95,6 +97,19 @@ beforeEach(() => {
         return sessionRecords.find((record) => record.id === args?.id);
       case "session_update_log":
         return undefined;
+      case "app_settings":
+        return {
+          notifications: {
+            planApproval: { sound: true, osNotification: true },
+            changesetReview: { sound: true, osNotification: true },
+          },
+          codexLargeContextModels: [],
+        };
+      case "app_settings_save":
+        return args?.settings;
+      case "attention_notify":
+      case "notification_sound_preview":
+        return undefined;
       case "codex_model_settings":
         return {
           models: [
@@ -112,6 +127,8 @@ beforeEach(() => {
           selectedModel: "gpt-test",
           selectedReasoningEffort: "medium",
         };
+      case "ask_pending":
+        return args?.sessionId === "session-a" ? (tauri.pendingAsk ?? null) : null;
       case "chat":
         if (args?.sessionId === "session-a") {
           return new Promise<void>((resolve) => {
@@ -324,6 +341,30 @@ describe("App concurrent sessions", () => {
     expect(screen.queryByRole("region", { name: "AI 질문" })).not.toBeInTheDocument();
   });
 
+  it("restores a pending ASK that was emitted before the panel could display it", async () => {
+    tauri.pendingAsk = {
+      sessionId: "session-a",
+      requestId: "ask-recovered",
+      questions: [
+        {
+          id: "mode",
+          question: "복구된 질문입니다.",
+          multi: false,
+          options: [{ label: "계속" }, { label: "중단" }],
+        },
+      ],
+    };
+
+    render(<App />);
+
+    expect(
+      await screen.findByRole("button", { name: "Session A, 응답 필요" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("region", { name: "AI 질문" }),
+    ).toHaveTextContent("복구된 질문입니다.");
+  });
+
   it("preserves a collapsed plan after switching session tabs", async () => {
     render(<App />);
     await screen.findByRole("button", { name: "Session A, 유휴" });
@@ -432,6 +473,149 @@ describe("App concurrent sessions", () => {
   });
 });
 
+describe("App native compaction", () => {
+  it("routes an exact /compact command without starting a chat turn", async () => {
+    render(<App />);
+    const input = await screen.findByRole("textbox", { name: "지시 입력" });
+    await waitFor(() => expect(input).toBeEnabled());
+
+    fireEvent.change(input, { target: { value: "/compact" } });
+    fireEvent.click(screen.getByRole("button", { name: "전송" }));
+
+    await waitFor(() => {
+      expect(tauri.invoke).toHaveBeenCalledWith("compact", {
+        sessionId: "session-a",
+      });
+    });
+    expect(
+      await screen.findByText("대화 컨텍스트를 압축했습니다."),
+    ).toBeInTheDocument();
+    expect(tauri.invoke).not.toHaveBeenCalledWith(
+      "chat",
+      expect.objectContaining({ text: "/compact" }),
+    );
+  });
+});
+
+describe("App notifications", () => {
+  it("opens general settings and persists event channel toggles", async () => {
+    render(<App />);
+    const settingsButton = await screen.findByRole("button", {
+      name: "설정 열기",
+    });
+    fireEvent.click(settingsButton);
+
+    expect(await screen.findByRole("dialog", { name: "설정" })).toBeInTheDocument();
+    fireEvent.click(
+      screen.getByRole("switch", { name: "계획 승인 필요 알림음" }),
+    );
+
+    await waitFor(() => {
+      expect(tauri.invoke).toHaveBeenCalledWith("app_settings_save", {
+        settings: {
+          notifications: {
+            planApproval: { sound: false, osNotification: true },
+            changesetReview: { sound: true, osNotification: true },
+          },
+          codexLargeContextModels: [],
+        },
+      });
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "소리 미리듣기" }));
+    await waitFor(() =>
+      expect(tauri.invoke).toHaveBeenCalledWith("notification_sound_preview"),
+    );
+  });
+
+  it("notifies once when each new review surface appears", async () => {
+    const focus = vi.spyOn(document, "hasFocus").mockReturnValue(false);
+    render(<App />);
+    await screen.findByRole("button", { name: "Session A, 유휴" });
+    await waitFor(() => {
+      expect(tauri.listeners.has("plan")).toBe(true);
+      expect(tauri.listeners.has("changeset")).toBe(true);
+    });
+
+    const item = {
+      category: "file",
+      id: "file-1",
+      seq: 1,
+      path: "main.eps",
+      diff: "@@ -1 +1 @@\\n-old\\n+new",
+    };
+    act(() => {
+      emit("plan", {
+        sessionId: "session-a",
+        markdown: "# 계획",
+        revision: 1,
+      });
+      emit("plan", {
+        sessionId: "session-a",
+        markdown: "# 계획",
+        revision: 1,
+      });
+      emit("plan", {
+        sessionId: "session-a",
+        markdown: "# 수정 계획",
+        revision: 2,
+      });
+      emit("changeset", {
+        sessionId: "session-a",
+        request_id: "request-1",
+        items: [item],
+      });
+      emit("changeset", {
+        sessionId: "session-a",
+        request_id: "request-1",
+        items: [item],
+      });
+    });
+
+    await waitFor(() => {
+      const attentionCalls = tauri.invoke.mock.calls.filter(
+        ([command]) => command === "attention_notify",
+      );
+      expect(attentionCalls).toEqual([
+        [
+          "attention_notify",
+          { kind: "planApproval", showOs: true, sessionId: "session-a" },
+        ],
+        [
+          "attention_notify",
+          { kind: "planApproval", showOs: true, sessionId: "session-a" },
+        ],
+        [
+          "attention_notify",
+          {
+            kind: "changesetReview",
+            showOs: true,
+            sessionId: "session-a",
+            itemCount: 1,
+          },
+        ],
+      ]);
+    });
+    focus.mockRestore();
+  });
+
+  it("selects the session named by a clicked OS notification", async () => {
+    render(<App />);
+    await screen.findByRole("button", { name: "Session A, 유휴" });
+    await waitFor(() =>
+      expect(tauri.listeners.has("notification_activated")).toBe(true),
+    );
+
+    act(() => {
+      emit("notification_activated", { sessionId: "session-b" });
+    });
+
+    expect(
+      screen.getByRole("button", { name: "Session B, 유휴" }),
+    ).toHaveAttribute("aria-current", "page");
+  });
+});
+
 describe("App project tools sidebar", () => {
   it("closes and reopens the tabbed sidebar with one header toggle", async () => {
     render(<App />);
@@ -442,6 +626,12 @@ describe("App project tools sidebar", () => {
     expect(screen.getByRole("tab", { name: "DAT 위키" })).toBeInTheDocument();
     expect(screen.getByRole("tab", { name: "메모리" })).toBeInTheDocument();
     expect(screen.getByRole("tab", { name: "파일" })).toBeInTheDocument();
+    expect(
+      within(screen.getByRole("complementary", { name: "프로젝트 도구" })).queryByRole(
+        "button",
+        { name: /닫기/ },
+      ),
+    ).not.toBeInTheDocument();
 
     fireEvent.click(
       screen.getByRole("button", { name: "프로젝트 도구 닫기" }),

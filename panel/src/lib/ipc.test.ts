@@ -1,8 +1,13 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import {
   IpcClient,
+  appSettingsGet,
+  appSettingsSave,
+  attentionNotify,
   codexModelSettingsGet,
   codexModelSettingsSave,
+  compactSession,
+  notificationSoundPreview,
   workspaceList,
   workspaceRead,
 } from "@/lib/ipc";
@@ -614,6 +619,73 @@ describe("Codex model settings commands", () => {
     await expect(codexModelSettingsGet(invoke)).rejects.toThrow(
       "invalid codex model settings response",
     );
+  });
+});
+
+describe("App notification settings commands", () => {
+  const settings = {
+    notifications: {
+      planApproval: { sound: true, osNotification: true },
+      changesetReview: { sound: false, osNotification: true },
+    },
+    codexLargeContextModels: ["gpt-5.5-codex"],
+  };
+
+  it("loads and saves the complete app settings payload", async () => {
+    const invoke = vi.fn().mockResolvedValue(settings);
+
+    await expect(appSettingsGet(invoke)).resolves.toEqual(settings);
+    expect(invoke).toHaveBeenCalledWith("app_settings");
+
+    invoke.mockClear();
+    await expect(appSettingsSave(settings, invoke)).resolves.toEqual(settings);
+    expect(invoke).toHaveBeenCalledWith("app_settings_save", { settings });
+  });
+
+  it("rejects malformed notification channel settings", async () => {
+    const invoke = vi.fn().mockResolvedValue({
+      notifications: {
+        planApproval: { sound: true },
+        changesetReview: { sound: true, osNotification: true },
+      },
+      codexLargeContextModels: [],
+    });
+
+    await expect(appSettingsGet(invoke)).rejects.toThrow(
+      "invalid app settings response",
+    );
+  });
+
+  it("invokes native compaction for the named session", async () => {
+    const invoke = vi.fn().mockResolvedValue(undefined);
+
+    await compactSession("session-a", invoke);
+
+    expect(invoke).toHaveBeenCalledWith("compact", {
+      sessionId: "session-a",
+    });
+  });
+
+  it("delivers attention events with focus, session, and item-count context", async () => {
+    const invoke = vi.fn().mockResolvedValue(undefined);
+
+    await attentionNotify("planApproval", false, "session-a", undefined, invoke);
+    expect(invoke).toHaveBeenCalledWith("attention_notify", {
+      kind: "planApproval",
+      showOs: false,
+      sessionId: "session-a",
+    });
+
+    await attentionNotify("changesetReview", true, "session-b", 3, invoke);
+    expect(invoke).toHaveBeenLastCalledWith("attention_notify", {
+      kind: "changesetReview",
+      showOs: true,
+      sessionId: "session-b",
+      itemCount: 3,
+    });
+
+    await notificationSoundPreview(invoke);
+    expect(invoke).toHaveBeenLastCalledWith("notification_sound_preview");
   });
 });
 

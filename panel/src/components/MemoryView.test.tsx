@@ -116,6 +116,7 @@ describe("MemoryView", () => {
       "data-height",
       "100%",
     );
+    expect(screen.queryByRole("button", { name: "닫기" })).not.toBeInTheDocument();
   });
 
   it("editing a tab records the draft, enables Save when dirty, and saves {file, content}", async () => {

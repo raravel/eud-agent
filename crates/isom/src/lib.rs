@@ -18,9 +18,17 @@ use std::ffi::{CString, NulError};
 use std::os::raw::c_int;
 use std::path::Path;
 
+static NATIVE_CALL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn native_call_guard() -> std::sync::MutexGuard<'static, ()> {
+    NATIVE_CALL_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// Typed errors mapped from the C `IsomStatus` codes (and the few Rust-side
 /// failures that mean the call could never reach the engine).
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum IsomError {
     /// `ISOM_ERR_INVALID_ARG` (1): null pointer / empty path / bad length.
     /// Also raised Rust-side when the path cannot be made into a C string
@@ -45,6 +53,45 @@ pub enum IsomError {
     /// A nonzero status the current ABI does not define.
     #[error("unknown isom status code {0}")]
     UnknownCode(i32),
+}
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{status}{detail_suffix}")]
+pub struct NativeCallError {
+    pub status: IsomError,
+    pub detail: Option<String>,
+    detail_suffix: String,
+}
+
+impl NativeCallError {
+    fn new(status: IsomError, detail: Option<String>) -> Self {
+        let detail_suffix = detail
+            .as_deref()
+            .map(|value| format!(": {value}"))
+            .unwrap_or_default();
+        Self {
+            status,
+            detail,
+            detail_suffix,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RgbaImage {
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageQuantizeResult {
+    pub width: u16,
+    pub height: u16,
+    pub tiles: Vec<u16>,
+    pub preview_rgb: Vec<u8>,
+    pub unique_tile_count: u32,
+    pub walkability_changed_cells: u32,
+    pub height_changed_cells: u32,
 }
 
 impl From<NulError> for IsomError {
@@ -102,6 +149,7 @@ impl Drop for CBuf {
 /// buffer is still handed to `isom_free` by the [`CBuf`] guard — no leak, no
 /// double-free.
 pub fn chk_extract(map_path: &Path) -> Result<Vec<u8>, IsomError> {
+    let _native_call = native_call_guard();
     let c_path = path_cstring(map_path)?;
 
     let mut out: *mut u8 = std::ptr::null_mut();
@@ -135,6 +183,7 @@ pub fn chk_extract(map_path: &Path) -> Result<Vec<u8>, IsomError> {
 /// location NAME bytes inside it are NEVER re-encoded here (rules.md). The save
 /// keeps `autoDefragmentLocations=false` / `lockAnywhere=true` (handled in C).
 pub fn locedit(map_path: &Path, ops: &[u8]) -> Result<(), IsomError> {
+    let _native_call = native_call_guard();
     let c_path = path_cstring(map_path)?;
     // SAFETY: `c_path` and `ops` both outlive the synchronous call; `ops` is
     // read-only on the C side. Empty `ops` => valid (ptr, 0) pair.
@@ -145,6 +194,7 @@ pub fn locedit(map_path: &Path, ops: &[u8]) -> Result<(), IsomError> {
 /// Apply a batch of player ops (start locations + OWNR controllers) to a map,
 /// saved IN PLACE. Same RAW-`ops` / save-safety contract as [`locedit`].
 pub fn playeredit(map_path: &Path, ops: &[u8]) -> Result<(), IsomError> {
+    let _native_call = native_call_guard();
     let c_path = path_cstring(map_path)?;
     // SAFETY: see `locedit` — identical buffer/lifetime contract.
     let code = unsafe { isom_sys::isom_playeredit(c_path.as_ptr(), ops.as_ptr(), ops.len()) };
@@ -154,6 +204,7 @@ pub fn playeredit(map_path: &Path, ops: &[u8]) -> Result<(), IsomError> {
 /// Rename switches in a map, saved IN PLACE. Trigger references use numeric
 /// switch ids and are therefore unchanged by this operation.
 pub fn switchedit(map_path: &Path, ops: &[u8]) -> Result<(), IsomError> {
+    let _native_call = native_call_guard();
     let c_path = path_cstring(map_path)?;
     // SAFETY: see `locedit` — identical buffer/lifetime contract.
     let code = unsafe { isom_sys::isom_switchedit(c_path.as_ptr(), ops.as_ptr(), ops.len()) };
@@ -166,6 +217,7 @@ pub fn render_map(
     starcraft_path: &Path,
     scale: u32,
 ) -> Result<Vec<u8>, IsomError> {
+    let _native_call = native_call_guard();
     let c_map_path = path_cstring(map_path)?;
     let c_starcraft_path = path_cstring(starcraft_path)?;
     let mut out: *mut u8 = std::ptr::null_mut();
@@ -192,6 +244,292 @@ pub fn render_map(
         unsafe { std::slice::from_raw_parts(buf.0, out_len).to_vec() }
     };
     Ok(bytes)
+}
+
+fn buffer_bytes(buffer: &CBuf, length: usize) -> Vec<u8> {
+    if buffer.0.is_null() || length == 0 {
+        Vec::new()
+    } else {
+        // SAFETY: successful native calls guarantee `length` readable bytes.
+        unsafe { std::slice::from_raw_parts(buffer.0, length).to_vec() }
+    }
+}
+
+fn native_detail(bytes: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(bytes).ok()?.trim();
+    if text.is_empty() {
+        return None;
+    }
+    serde_json::from_str::<serde_json::Value>(text)
+        .ok()
+        .and_then(|value| value.get("error")?.as_str().map(str::to_owned))
+        .or_else(|| Some(text.to_owned()))
+}
+
+pub fn mapedit(
+    input_map_path: &Path,
+    output_map_path: &Path,
+    starcraft_path: &Path,
+    batch_json: &[u8],
+) -> Result<String, NativeCallError> {
+    let _native_call = native_call_guard();
+    let input = path_cstring(input_map_path).map_err(|error| NativeCallError::new(error, None))?;
+    let output =
+        path_cstring(output_map_path).map_err(|error| NativeCallError::new(error, None))?;
+    let starcraft =
+        path_cstring(starcraft_path).map_err(|error| NativeCallError::new(error, None))?;
+    let mut report: *mut u8 = std::ptr::null_mut();
+    let mut report_len = 0_usize;
+    // SAFETY: both paths and `batch_json` outlive this synchronous call. The
+    // returned report uses the matching isom allocator and is guarded below.
+    let code = unsafe {
+        isom_sys::isom_mapedit(
+            input.as_ptr(),
+            output.as_ptr(),
+            starcraft.as_ptr(),
+            batch_json.as_ptr(),
+            batch_json.len(),
+            &mut report,
+            &mut report_len,
+        )
+    };
+    let report = CBuf(report);
+    let bytes = buffer_bytes(&report, report_len);
+    if let Err(error) = status(code) {
+        return Err(NativeCallError::new(error, native_detail(&bytes)));
+    }
+    String::from_utf8(bytes)
+        .map_err(|error| NativeCallError::new(IsomError::Engine, Some(error.to_string())))
+}
+
+pub fn render_region(
+    map_path: &Path,
+    starcraft_path: &Path,
+    request_json: &[u8],
+) -> Result<RgbaImage, NativeCallError> {
+    let _native_call = native_call_guard();
+    let map = path_cstring(map_path).map_err(|error| NativeCallError::new(error, None))?;
+    let starcraft =
+        path_cstring(starcraft_path).map_err(|error| NativeCallError::new(error, None))?;
+    let mut rgba: *mut u8 = std::ptr::null_mut();
+    let mut rgba_len = 0_usize;
+    let mut width = 0_u32;
+    let mut height = 0_u32;
+    // SAFETY: input buffers outlive the call and every out-param is valid.
+    let code = unsafe {
+        isom_sys::isom_render_region(
+            map.as_ptr(),
+            starcraft.as_ptr(),
+            request_json.as_ptr(),
+            request_json.len(),
+            &mut rgba,
+            &mut rgba_len,
+            &mut width,
+            &mut height,
+        )
+    };
+    let rgba = CBuf(rgba);
+    let bytes = buffer_bytes(&rgba, rgba_len);
+    if let Err(error) = status(code) {
+        return Err(NativeCallError::new(error, native_detail(&bytes)));
+    }
+    let expected = usize::try_from(width)
+        .ok()
+        .and_then(|width| {
+            usize::try_from(height)
+                .ok()
+                .and_then(|height| width.checked_mul(height))
+        })
+        .and_then(|pixels| pixels.checked_mul(4))
+        .ok_or_else(|| {
+            NativeCallError::new(
+                IsomError::Engine,
+                Some("RGBA dimensions overflow".to_string()),
+            )
+        })?;
+    if bytes.len() != expected {
+        return Err(NativeCallError::new(
+            IsomError::Engine,
+            Some(format!(
+                "native RGBA length {} does not match {width}x{height}",
+                bytes.len()
+            )),
+        ));
+    }
+    Ok(RgbaImage {
+        width,
+        height,
+        rgba: bytes,
+    })
+}
+
+pub fn catalog_query(
+    starcraft_path: &Path,
+    request_json: &[u8],
+) -> Result<String, NativeCallError> {
+    let _native_call = native_call_guard();
+    let starcraft =
+        path_cstring(starcraft_path).map_err(|error| NativeCallError::new(error, None))?;
+    let mut output: *mut u8 = std::ptr::null_mut();
+    let mut output_len = 0_usize;
+    // SAFETY: the path/request and output pointers satisfy the synchronous ABI.
+    let code = unsafe {
+        isom_sys::isom_catalog_query(
+            starcraft.as_ptr(),
+            request_json.as_ptr(),
+            request_json.len(),
+            &mut output,
+            &mut output_len,
+        )
+    };
+    let output = CBuf(output);
+    let bytes = buffer_bytes(&output, output_len);
+    if let Err(error) = status(code) {
+        return Err(NativeCallError::new(error, native_detail(&bytes)));
+    }
+    String::from_utf8(bytes)
+        .map_err(|error| NativeCallError::new(IsomError::Engine, Some(error.to_string())))
+}
+
+pub fn map_digest(map_path: &Path) -> Result<String, NativeCallError> {
+    let _native_call = native_call_guard();
+    let map = path_cstring(map_path).map_err(|error| NativeCallError::new(error, None))?;
+    let mut output: *mut u8 = std::ptr::null_mut();
+    let mut output_len = 0_usize;
+    // SAFETY: the C string and output pointers satisfy the synchronous ABI.
+    let code = unsafe { isom_sys::isom_map_digest(map.as_ptr(), &mut output, &mut output_len) };
+    let output = CBuf(output);
+    let bytes = buffer_bytes(&output, output_len);
+    if let Err(error) = status(code) {
+        return Err(NativeCallError::new(error, native_detail(&bytes)));
+    }
+    String::from_utf8(bytes)
+        .map_err(|error| NativeCallError::new(IsomError::Engine, Some(error.to_string())))
+}
+
+pub fn image_quantize(
+    starcraft_path: &Path,
+    tileset: u16,
+    rgba: &[u8],
+    width: u16,
+    height: u16,
+    before_tiles: &[u16],
+) -> Result<ImageQuantizeResult, NativeCallError> {
+    let cells = usize::from(width)
+        .checked_mul(usize::from(height))
+        .filter(|cells| width > 0 && height > 0 && width <= 256 && height <= 256 && *cells <= 65_536)
+        .ok_or_else(|| {
+            NativeCallError::new(
+                IsomError::InvalidArg,
+                Some("image quantizer dimensions are outside 1..=256".to_string()),
+            )
+        })?;
+    let rgba_len = cells.checked_mul(4).ok_or_else(|| {
+        NativeCallError::new(
+            IsomError::InvalidArg,
+            Some("image RGBA length overflow".to_string()),
+        )
+    })?;
+    if rgba.len() != rgba_len || before_tiles.len() != cells {
+        return Err(NativeCallError::new(
+            IsomError::InvalidArg,
+            Some("image quantizer input lengths do not match dimensions".to_string()),
+        ));
+    }
+
+    let _native_call = native_call_guard();
+    let starcraft =
+        path_cstring(starcraft_path).map_err(|error| NativeCallError::new(error, None))?;
+    let mut output: *mut u8 = std::ptr::null_mut();
+    let mut output_len = 0_usize;
+    // SAFETY: every input slice and out-param outlives this synchronous call.
+    let code = unsafe {
+        isom_sys::isom_image_quantize(
+            starcraft.as_ptr(),
+            tileset,
+            rgba.as_ptr(),
+            rgba.len(),
+            width,
+            height,
+            before_tiles.as_ptr(),
+            before_tiles.len(),
+            &mut output,
+            &mut output_len,
+        )
+    };
+    let output = CBuf(output);
+    let bytes = if output.0.is_null() || output_len == 0 {
+        &[][..]
+    } else {
+        // SAFETY: the native ABI returns exactly `output_len` readable bytes.
+        unsafe { std::slice::from_raw_parts(output.0, output_len) }
+    };
+    if let Err(error) = status(code) {
+        return Err(NativeCallError::new(error, native_detail(bytes)));
+    }
+    let expected = 20_usize
+        .checked_add(cells.checked_mul(5).ok_or_else(|| {
+            NativeCallError::new(
+                IsomError::Engine,
+                Some("image quantizer result length overflow".to_string()),
+            )
+        })?)
+        .ok_or_else(|| {
+            NativeCallError::new(
+                IsomError::Engine,
+                Some("image quantizer result length overflow".to_string()),
+            )
+        })?;
+    if bytes.len() != expected || bytes.get(..4) != Some(b"MIQ1") {
+        return Err(NativeCallError::new(
+            IsomError::Engine,
+            Some("native image quantizer returned an invalid envelope".to_string()),
+        ));
+    }
+    let read_u16 = |offset: usize| u16::from_le_bytes([bytes[offset], bytes[offset + 1]]);
+    let read_u32 = |offset: usize| {
+        u32::from_le_bytes([
+            bytes[offset],
+            bytes[offset + 1],
+            bytes[offset + 2],
+            bytes[offset + 3],
+        ])
+    };
+    let result_width = read_u16(4);
+    let result_height = read_u16(6);
+    if result_width != width || result_height != height {
+        return Err(NativeCallError::new(
+            IsomError::Engine,
+            Some("native image quantizer changed output dimensions".to_string()),
+        ));
+    }
+    let tile_start = 20;
+    let preview_start = tile_start + cells * 2;
+    let mut tiles = Vec::with_capacity(cells);
+    for offset in (tile_start..preview_start).step_by(2) {
+        tiles.push(read_u16(offset));
+    }
+    Ok(ImageQuantizeResult {
+        width,
+        height,
+        tiles,
+        preview_rgb: bytes[preview_start..].to_vec(),
+        unique_tile_count: read_u32(8),
+        walkability_changed_cells: read_u32(12),
+        height_changed_cells: read_u32(16),
+    })
+}
+
+
+pub const EXPECTED_ABI_VERSION: i32 = 5;
+
+pub fn assert_abi_version() -> Result<(), IsomError> {
+    let actual = abi_version();
+    if actual == EXPECTED_ABI_VERSION {
+        Ok(())
+    } else {
+        Err(IsomError::UnknownCode(actual))
+    }
 }
 
 /// ABI version of the linked static lib — a load-time sanity check that the

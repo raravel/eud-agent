@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { Database, FileText, FolderTree, PanelRightClose, RefreshCw } from "lucide-react";
+import { Database, FileText, FolderTree, RefreshCw } from "lucide-react";
 
 import { MemoryView } from "@/components/MemoryView";
 import { WikiView } from "@/components/WikiView";
@@ -99,9 +99,6 @@ export function ProjectSidebar({
             <h2 className="text-sm font-semibold">프로젝트</h2>
             <p className="truncate text-[11px] text-muted-foreground" title={project}>{project || "프로젝트 없음"}</p>
           </div>
-          <Button type="button" size="icon" variant="ghost" className="size-10" aria-label="프로젝트 사이드바 닫기" onClick={onClose}>
-            <PanelRightClose className="size-4" aria-hidden="true" />
-          </Button>
         </div>
         <div role="tablist" aria-label="프로젝트 도구" className="grid grid-cols-3 px-2">
           {TABS.map(({ id, label, icon: Icon }) => (

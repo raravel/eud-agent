@@ -22,6 +22,13 @@ pub mod engine;
 pub mod eps_preflight;
 pub mod ipc;
 pub mod journal;
+pub mod map_agent;
+pub mod map_candidate;
+pub mod map_context;
+pub mod map_image;
+pub mod map_model;
+pub mod map_stamp;
+pub mod map_verify;
 pub mod mapsafe;
 pub mod mcp;
 pub mod memory;
@@ -31,6 +38,8 @@ pub mod setup;
 pub mod tool_exec;
 pub mod tools;
 pub mod wiki;
+#[cfg(windows)]
+pub mod windows_notification;
 pub mod workspace;
 pub mod write_coordinator;
 
@@ -147,6 +156,7 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .setup(|app| {
+            isom::assert_abi_version()?;
             let data_dirs = config::DataDirs::resolve(&*app)?;
             // Non-fatal: a failed dir create resurfaces on first write with context.
             if let Err(error) = data_dirs.ensure_dirs() {
@@ -253,9 +263,33 @@ pub fn run() {
                     eprintln!("eud-agent: session activity emit failed: {error}");
                 }
             });
+            match mapsafe::recover_pending_candidate_applies(
+                &data_dirs.map_backups_dir(),
+                &data_dirs.map_candidates_dir(),
+            ) {
+                Ok(recovered) if recovered > 0 => {
+                    eprintln!(
+                        "eud-agent: restored {recovered} interrupted Map Agent Apply transaction(s)"
+                    );
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    eprintln!("eud-agent: pending Map Agent Apply recovery is blocked: {error}");
+                }
+            }
+            let candidates = map_candidate::CandidateStore::new(data_dirs.clone());
+            if let Err(error) = candidates.cleanup_startup() {
+                eprintln!("eud-agent: candidate cache cleanup skipped: {error}");
+            }
+            app.manage(map_agent::MapAgentService::new(
+                data_dirs.clone(),
+                candidates.clone(),
+                writes.clone(),
+            ));
             let services = tool_exec::ToolServices::new(
                 data_dirs.clone(),
                 std::sync::Arc::new(analyzer),
+                candidates,
                 writes,
             );
 
@@ -306,7 +340,9 @@ pub fn run() {
             engine::engine_plan_approve,
             engine::engine_changeset_decision,
             engine::engine_ask_response,
+            engine::engine_ask_pending,
             engine::engine_cancel,
+            engine::engine_compact,
             engine::engine_conversation_rewind,
             engine::engine_session_list,
             engine::engine_session_load,
@@ -315,8 +351,38 @@ pub fn run() {
             engine::engine_session_open,
             engine::engine_session_rename,
             engine::engine_session_delete,
+            map_agent::map_agent_open,
+            map_agent::map_agent_bootstrap,
+            map_agent::map_agent_session_list,
+            map_agent::map_agent_session_create,
+            map_agent::map_agent_session_load,
+            map_agent::map_agent_session_rename,
+            map_agent::map_agent_session_delete,
+            map_agent::map_agent_source_state,
+            map_agent::map_agent_render,
+            map_agent::map_agent_thumbnail,
+            map_agent::map_agent_image_preview,
+            map_agent::map_agent_image_confirm,
+            map_agent::map_agent_stamp_preview,
+            map_agent::map_agent_stamp_confirm,
+            map_agent::map_agent_image_cancel,
+            map_agent::map_agent_catalog,
+            map_agent::map_agent_objects,
+            map_agent::map_agent_diff_details,
+            map_agent::map_agent_selection_save,
+            map_agent::map_agent_selection_delete,
+            map_agent::map_agent_candidate_revert,
+            map_agent::map_agent_candidate_discard,
+            map_agent::map_agent_candidate_apply,
+            map_agent::map_agent_apply_undo,
+            map_agent::map_agent_chat,
+            map_agent::map_agent_cancel,
             attachment::stage_attachment,
             attachment::discard_attachment,
+            ipc::app_settings,
+            ipc::app_settings_save,
+            ipc::notification_sound_preview,
+            ipc::attention_notify,
             ipc::status,
             ipc::launch_editor,
             ipc::list,

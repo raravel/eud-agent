@@ -77,6 +77,12 @@ shows *"editor not connected"* until the bridge heartbeat appears.
 4. Review the diff and click **Apply** (`set` to overwrite, `neweps` to create a new eps).
 5. The change is applied in editor memory on the next UI-thread tick — **you save in the editor.**
 
+- Enter `/compact` by itself to run Codex's native conversation compaction. Codex also
+  compacts automatically when the active model reaches its configured token threshold.
+- **Settings → Codex** enables the 1M context override per model. The choice is persisted in
+  `%appdata%\eud-agent\config.json`; unsupported models keep their Codex-reported default
+  window and show one warning after the next usage update.
+
 > Settable/creatable text types are **CUI / RawText only**; GUI files are read-only and SCA is
 > a defunct type that is never exposed.
 

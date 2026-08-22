@@ -54,6 +54,26 @@ describe("progressLabel", () => {
     expect(out.text).toBe("codex 실행 중…");
     expect(out.kind).toBe("progress");
   });
+  it("shows native auto-compaction start and completion", () => {
+    expect(progressLabel("compaction", "started")).toEqual({
+      kind: "progress",
+      text: "대화 컨텍스트 자동 압축 중…",
+    });
+    expect(progressLabel("compaction", "done")).toEqual({
+      kind: "ok",
+      text: "대화 컨텍스트 자동 압축 완료",
+    });
+  });
+
+  it("surfaces the model-specific 1M fallback as a warning", () => {
+    const detail =
+      "gpt-test은(는) 1M 컨텍스트를 지원하지 않아 기본 컨텍스트를 사용합니다.";
+    expect(progressLabel("large_context_fallback", detail)).toEqual({
+      kind: "warn",
+      text: detail,
+    });
+  });
+
 });
 
 describe("formatElapsed (RAG loading elapsed seconds — features/06 header)", () => {

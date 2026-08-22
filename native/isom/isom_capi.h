@@ -27,7 +27,7 @@ extern "C" {
 
 /* ABI version of this shim. Bump on any breaking change to the signatures or
  * the ops/buffer encoding below. The Rust side asserts this at startup. */
-#define ISOM_ABI_VERSION 2
+#define ISOM_ABI_VERSION 5
 
 /* Error codes returned by the isom_* functions. 0 == success. */
 enum IsomStatus {
@@ -78,6 +78,67 @@ int isom_switchedit(const char* map_path, const uint8_t* ops, size_t ops_len);
  * 1, 2, 4, or 8. Paths are UTF-8 and NUL-terminated. */
 int isom_render_map(const char* map_path, const char* starcraft_path,
                     uint32_t scale, uint8_t** out, size_t* out_len);
+/* Apply one strict eud-map-edit/1 JSON batch to an existing map. The input is
+ * loaded once, every operation is applied in memory, and output is promoted
+ * only after one successful save and native re-open verification. Input and
+ * output paths must differ. The report buffer is returned on success and may
+ * also contain a structured error on failure. */
+int isom_mapedit(
+    const char* input_map_path,
+    const char* output_map_path,
+    const char* starcraft_path,
+    const uint8_t* batch_json,
+    size_t batch_len,
+    uint8_t** out_report_json,
+    size_t* out_report_len);
+
+/* Render a strict eud-map-render/1 region or palette thumbnail as top-down RGBA.
+ * On a standard C++ validation/engine error, out_rgba contains an
+ * eud-map-error/1 JSON report instead of pixels so the caller can surface the
+ * actionable native message. Every returned buffer is freed with isom_free(). */
+int isom_render_region(
+    const char* map_path,
+    const char* starcraft_path,
+    const uint8_t* request_json,
+    size_t request_len,
+    uint8_t** out_rgba,
+    size_t* out_rgba_len,
+    uint32_t* out_width,
+    uint32_t* out_height);
+
+/* Query semantic brushes, exact tiles, and actual DAT/GRP-backed object catalogs. */
+int isom_catalog_query(
+    const char* starcraft_path,
+    const uint8_t* request_json,
+    size_t request_len,
+    uint8_t** out_json,
+    size_t* out_json_len);
+
+/* Return the file/container digest including named extra MPQ asset hashes. */
+int isom_map_digest(
+    const char* map_path,
+    uint8_t** out_json,
+    size_t* out_json_len);
+
+/* Quantize one bounded RGBA pixel per output map tile against the current
+ * tileset's graphics-valid SD representative-color palette. `before_tiles`
+ * supplies candidate terrain for alpha preservation/compositing. The returned
+ * eud-map-image-quantize/1 binary is:
+ *   magic "MIQ1", width u16 LE, height u16 LE,
+ *   unique/walkability-changed/height-changed u32 LE,
+ *   width*height tile ids u16 LE, then one RGB triplet per tile.
+ * Width/height are 1..256 and every input/output allocation is bounded. */
+int isom_image_quantize(
+    const char* starcraft_path,
+    uint16_t tileset,
+    const uint8_t* rgba,
+    size_t rgba_len,
+    uint16_t width,
+    uint16_t height,
+    const uint16_t* before_tiles,
+    size_t before_tile_count,
+    uint8_t** out_result,
+    size_t* out_result_len);
 
 /* Free a buffer previously returned by an isom_* function. Safe on NULL. */
 void isom_free(uint8_t* p);

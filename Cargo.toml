@@ -1,3 +1,13 @@
 [workspace]
 members = ["src-tauri", "crates/isom-sys", "crates/isom"]
 resolver = "2"
+
+[profile.test]
+# The Tauri/ORT/native graph exceeds the Windows commit limit with full
+# dependency debuginfo. CI and behavioral tests do not consume DWARF/PDB data.
+debug = 0
+incremental = false
+
+[profile.dev]
+debug = 0
+incremental = false

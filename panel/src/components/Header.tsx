@@ -5,7 +5,13 @@
  * (`rag_warmup` started → done, elapsed formatted via lib/progress). Korean
  * labels throughout.
  */
-import { MonitorPlay, PanelRightClose, PanelRightOpen } from "lucide-react";
+import {
+  MapIcon,
+  MonitorPlay,
+  PanelRightClose,
+  PanelRightOpen,
+  Settings,
+} from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import {
@@ -42,10 +48,14 @@ export interface HeaderProps {
   launchPending?: boolean;
   /** Launch the configured EUD Editor 3 install. */
   onLaunchEditor?: () => void;
+  /** Open or focus the separate Map Agent workbench window. */
+  onOpenMapAgent?: () => void;
   /** Toggle the project tools sidebar. */
   onProjectPanelToggle?: () => void;
   /** Whether the project tools sidebar is currently visible. */
   projectPanelOpen?: boolean;
+  /** Open the general app settings dialog. */
+  onSettingsOpen?: () => void;
 }
 
 /** One status pill descriptor: label + tone classes + whether it is in flight. */
@@ -143,8 +153,10 @@ export function Header({
   hasProject = true,
   launchPending = false,
   onLaunchEditor,
+  onOpenMapAgent,
   onProjectPanelToggle,
   projectPanelOpen = false,
+  onSettingsOpen,
 }: HeaderProps) {
   const conn = connState(connected, phase, editorConnected, hasProject);
   const ragInfo = ragPill(rag);
@@ -176,6 +188,19 @@ export function Header({
         </div>
       </div>
       <div className="flex shrink-0 items-center gap-2">
+        {onOpenMapAgent && (
+          <Button
+            type="button"
+            size="sm"
+            variant="secondary"
+            className="gap-1.5"
+            disabled={!editorConnected || !hasProject}
+            onClick={onOpenMapAgent}
+          >
+            <MapIcon className="size-4" aria-hidden="true" />
+            맵 에이전트
+          </Button>
+        )}
         {onLaunchEditor && (
           <Button
             type="button"
@@ -193,6 +218,22 @@ export function Header({
         )}
         {ragInfo && <StatusPill pill={ragInfo} />}
         <StatusPill pill={conn} />
+        {onSettingsOpen && (
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                type="button"
+                size="icon"
+                variant="ghost"
+                aria-label="설정 열기"
+                onClick={onSettingsOpen}
+              >
+                <Settings className="size-4" aria-hidden="true" />
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent>설정</TooltipContent>
+          </Tooltip>
+        )}
         {onProjectPanelToggle && (
           <Tooltip>
             <TooltipTrigger asChild>

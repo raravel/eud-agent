@@ -38,6 +38,7 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 sha2 = "0.10"
 base64 = "0.22"
 png = "0.18"
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
 uuid = { version = "1", features = ["v4"] }
 parking_lot = "0.12"
 # CHK string-table decode (EUD-105): EUC_KR == cp949 (WHATWG euc-kr index = unified hangul
@@ -47,9 +48,13 @@ rmcp = { version = "1.7.0", features = ["server", "transport-streamable-http-ser
 axum = "0.8.4"
 
 [target.'cfg(windows)'.dependencies]
+tauri-winrt-notification = "0.7"
+windows-registry = "0.5"
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_Security",
+    "Win32_System_Diagnostics_Debug",
     "Win32_System_JobObjects",
     "Win32_System_Threading",
+    "Win32_UI_WindowsAndMessaging",
 ] }

@@ -47,11 +47,23 @@ fn main() {
     let solution = native_dir.join("isom_capi.sln");
     let header = native_dir.join("isom_capi.h");
     let shim_cpp = native_dir.join("isom_capi.cpp");
+    let project = native_dir.join("isom_capi.vcxproj");
+    let map_core_header = native_dir.join("IsomTerrain").join("MapAgentCore.h");
+    let map_core_cpp = native_dir.join("IsomTerrain").join("MapAgentCore.cpp");
+    let map_gen_cpp = native_dir.join("IsomTerrain").join("MapGenCli.cpp");
+    let map_json_header = native_dir.join("IsomTerrain").join("MapAgentJson.h");
+    let map_json_cpp = native_dir.join("IsomTerrain").join("MapAgentJson.cpp");
 
     // Rerun when the C ABI surface or the build target changes.
     println!("cargo:rerun-if-changed={}", header.display());
     println!("cargo:rerun-if-changed={}", shim_cpp.display());
     println!("cargo:rerun-if-changed={}", solution.display());
+    println!("cargo:rerun-if-changed={}", project.display());
+    println!("cargo:rerun-if-changed={}", map_core_header.display());
+    println!("cargo:rerun-if-changed={}", map_core_cpp.display());
+    println!("cargo:rerun-if-changed={}", map_gen_cpp.display());
+    println!("cargo:rerun-if-changed={}", map_json_header.display());
+    println!("cargo:rerun-if-changed={}", map_json_cpp.display());
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=MSBUILD");
 
@@ -86,9 +98,8 @@ fn find_msbuild() -> PathBuf {
         panic!("MSBUILD env var set but not a file: {}", p.display());
     }
 
-    let vswhere = PathBuf::from(
-        r"C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe",
-    );
+    let vswhere =
+        PathBuf::from(r"C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe");
     if !vswhere.is_file() {
         panic!(
             "vswhere.exe not found at {} — install Visual Studio 2022 (with the \
@@ -98,18 +109,11 @@ fn find_msbuild() -> PathBuf {
     }
 
     let out = Command::new(&vswhere)
-        .args([
-            "-latest",
-            "-find",
-            r"MSBuild\**\Bin\MSBuild.exe",
-        ])
+        .args(["-latest", "-find", r"MSBuild\**\Bin\MSBuild.exe"])
         .output()
         .expect("failed to run vswhere.exe");
     if !out.status.success() {
-        panic!(
-            "vswhere failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
+        panic!("vswhere failed: {}", String::from_utf8_lossy(&out.stderr));
     }
     let stdout = String::from_utf8_lossy(&out.stdout);
     let path = stdout
@@ -130,10 +134,7 @@ fn build_static_lib(native_dir: &Path, solution: &Path) {
     // unicode\ via a custom-build `copy` step; cmd's `copy` fails ("path not
     // found") if the destination dir is missing. Create it up front. This dir is
     // build output OUTSIDE native\isom\ and is intentionally not committed.
-    let icu_include = native_dir
-        .join("..")
-        .join("include")
-        .join("unicode");
+    let icu_include = native_dir.join("..").join("include").join("unicode");
     std::fs::create_dir_all(&icu_include)
         .unwrap_or_else(|e| panic!("could not create {}: {e}", icu_include.display()));
 
@@ -183,15 +184,7 @@ fn emit_link_directives(native_dir: &Path) {
 
 /// Win32 libs required by the folded engine archive. Add only what the link needs.
 const SYSTEM_LIBS: &[&str] = &[
-    "advapi32",
-    "user32",
-    "ole32",
-    "oleaut32",
-    "shell32",
-    "version",
-    "ws2_32",
-    "bcrypt",
-    "wininet",
+    "advapi32", "user32", "ole32", "oleaut32", "shell32", "version", "ws2_32", "bcrypt", "wininet",
     "comdlg32", // GetOpenFileNameW / GetSaveFileNameW (MappingCoreLib SystemIO)
 ];
 

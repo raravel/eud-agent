@@ -21,9 +21,7 @@ import {
   ImageIcon,
   LoaderCircleIcon,
   PaperclipIcon,
-  RefreshCwIcon,
   SendIcon,
-  SquareIcon,
   XIcon,
 } from "lucide-react";
 import {
@@ -35,90 +33,17 @@ import {
   PromptInputTools,
 } from "@/components/ai-elements/prompt-input";
 import { PromptInputButton } from "@/components/ai-elements/prompt-input";
-import { Shimmer } from "@/components/ai-elements/shimmer";
-import {
-  Context,
-  ContextContent,
-  ContextContentBody,
-  ContextContentHeader,
-  ContextTrigger,
-} from "@/components/ai-elements/context";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
+import { CodexPromptControls } from "@/components/CodexPromptControls";
+import { AgentTurnStatus } from "@/components/AgentTurnStatus";
 import type { PanelState } from "@/state/store";
-import type {
-  ChatAttachment,
-  CodexModelSettings,
-  ContextUsage,
-} from "@/lib/ipc";
+import type { ChatAttachment, CodexModelSettings } from "@/lib/ipc";
 import {
   attachmentErrorMessage,
   formatAttachmentSize,
   MAX_ATTACHMENTS_PER_TURN,
   MAX_TEXT_BYTES,
 } from "@/lib/attachments";
-const REASONING_LABELS: Readonly<Record<string, string>> = {
-  none: "추론 없음",
-  minimal: "추론 최소",
-  low: "추론 낮음",
-  medium: "추론 보통",
-  high: "추론 높음",
-  xhigh: "추론 매우 높음",
-  ultra: "추론 최고",
-};
-const CONTEXT_TOKEN_FORMATTER = new Intl.NumberFormat("ko-KR", {
-  notation: "compact",
-  maximumFractionDigits: 1,
-});
 
-function ContextUsageDetails({ usage }: { usage: ContextUsage }) {
-  const rows = [
-    ["입력", usage.total.inputTokens],
-    ["캐시 입력", usage.total.cachedInputTokens],
-    ["출력", usage.total.outputTokens],
-    ["추론", usage.total.reasoningOutputTokens],
-  ] as const;
-
-  return (
-    <div className="space-y-2 text-xs">
-      <div className="flex items-center justify-between gap-3 font-medium">
-        <span>세션 누적</span>
-        <span className="font-mono tabular-nums">
-          {CONTEXT_TOKEN_FORMATTER.format(usage.total.totalTokens)}
-        </span>
-      </div>
-      <dl className="space-y-1.5">
-        {rows.map(([label, tokens]) => (
-          <div
-            key={label}
-            className="flex items-center justify-between gap-3 text-muted-foreground"
-          >
-            <dt>{label}</dt>
-            <dd className="font-mono tabular-nums">
-              {CONTEXT_TOKEN_FORMATTER.format(tokens)}
-            </dd>
-          </div>
-        ))}
-      </dl>
-    </div>
-  );
-}
-
-function turnActivityLabel(state: PanelState): string {
-  for (let index = state.turn.tools.length - 1; index >= 0; index -= 1) {
-    const tool = state.turn.tools[index];
-    if (tool.state === "running") return `도구 실행 중 · ${tool.name}`;
-  }
-  if (state.turn.answerStarted) return "응답 작성 중";
-  if (state.turn.tools.length > 0) return "도구 결과 확인 중";
-  if (state.turn.reasoning.length > 0) return "추론 중";
-  return "작업 준비 중";
-}
 
 
 export interface ChatPayload {
@@ -186,14 +111,6 @@ export function InstructionBox({
   const turnInFlight = state.phase === "thinking";
   const ragLoading = state.rag === "loading";
   const editorDisconnected = !state.editorConnected;
-  const selectedModel = codexSettings?.models.find(
-    (model) => model.model === codexSettings.selectedModel,
-  );
-  const codexSettingsDisabled =
-    turnInFlight ||
-    actionBusy ||
-    codexSettingsBusy ||
-    onCodexSettingsChange === undefined;
   const attachmentInputDisabled =
     !canSend || staging || onStageAttachment === undefined;
   const placeholder = editorDisconnected
@@ -318,33 +235,11 @@ export function InstructionBox({
       onDrop={handleDrop}
     >
       {turnInFlight && (
-        <div
-          data-testid="active-turn-status"
-          role="status"
-          aria-live="polite"
-          aria-atomic="true"
-          className="mb-2 flex min-h-11 items-center justify-between gap-3 rounded-lg border border-border bg-card/95 px-3 shadow-sm"
-        >
-          <div className="flex min-w-0 items-center gap-2 text-sm">
-            <span
-              aria-hidden
-              className="size-2 shrink-0 animate-pulse rounded-full bg-emerald-400 motion-reduce:animate-none"
-            />
-            <Shimmer className="truncate">{turnActivityLabel(state)}</Shimmer>
-          </div>
-          {onCancel && (
-            <button
-              type="button"
-              aria-label="작업 중단"
-              disabled={actionBusy}
-              onClick={onCancel}
-              className="flex min-h-11 shrink-0 cursor-pointer items-center gap-1.5 rounded-md px-3 text-sm text-muted-foreground transition-colors duration-200 hover:bg-accent hover:text-foreground focus-visible:outline-2 focus-visible:outline-ring disabled:cursor-default disabled:opacity-50"
-            >
-              <SquareIcon aria-hidden className="size-3.5 fill-current" />
-              중단
-            </button>
-          )}
-        </div>
+        <AgentTurnStatus
+          turn={state.turn}
+          onCancel={onCancel}
+          cancelDisabled={actionBusy}
+        />
       )}
       {dragging && !attachmentInputDisabled && (
         <div
@@ -452,104 +347,14 @@ export function InstructionBox({
                 </PromptInputButton>
               </>
             )}
-            {codexSettings && selectedModel ? (
-              <>
-                <Select
-                  value={codexSettings.selectedModel}
-                  disabled={codexSettingsDisabled}
-                  onValueChange={(modelId) => {
-                    const model = codexSettings.models.find(
-                      (candidate) => candidate.model === modelId,
-                    );
-                    if (model) {
-                      onCodexSettingsChange?.(
-                        model.model,
-                        model.defaultReasoningEffort,
-                      );
-                    }
-                  }}
-                >
-                  <SelectTrigger
-                    size="sm"
-                    aria-label="Codex 모델"
-                    className="max-w-44"
-                  >
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent position="popper">
-                    {codexSettings.models.map((model) => (
-                      <SelectItem
-                        key={model.model}
-                        value={model.model}
-                        title={model.description}
-                      >
-                        {model.displayName}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-                <Select
-                  value={codexSettings.selectedReasoningEffort}
-                  disabled={codexSettingsDisabled}
-                  onValueChange={(reasoningEffort) =>
-                    onCodexSettingsChange?.(
-                      codexSettings.selectedModel,
-                      reasoningEffort,
-                    )
-                  }
-                >
-                  <SelectTrigger
-                    size="sm"
-                    aria-label="추론 단계"
-                    className="max-w-32"
-                  >
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent position="popper">
-                    {selectedModel.supportedReasoningEfforts.map((option) => (
-                      <SelectItem
-                        key={option.reasoningEffort}
-                        value={option.reasoningEffort}
-                        title={option.description}
-                      >
-                        {REASONING_LABELS[option.reasoningEffort] ??
-                          option.reasoningEffort}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-              </>
-            ) : onCodexSettingsReload ? (
-              <PromptInputButton
-                type="button"
-                aria-label="Codex 모델 다시 불러오기"
-                disabled={codexSettingsBusy}
-                onClick={onCodexSettingsReload}
-              >
-                <RefreshCwIcon
-                  className={`size-4 ${codexSettingsBusy ? "animate-spin" : ""}`}
-                />
-                {codexSettingsBusy
-                  ? "모델 불러오는 중…"
-                  : "모델 다시 불러오기"}
-              </PromptInputButton>
-            ) : null}
-            {state.contextUsage?.modelContextWindow !== null &&
-              state.contextUsage?.modelContextWindow !== undefined &&
-              state.contextUsage.modelContextWindow > 0 && (
-                <Context
-                  usedTokens={Math.max(0, state.contextUsage.last.totalTokens)}
-                  maxTokens={state.contextUsage.modelContextWindow}
-                >
-                  <ContextTrigger />
-                  <ContextContent side="top" align="end">
-                    <ContextContentHeader />
-                    <ContextContentBody>
-                      <ContextUsageDetails usage={state.contextUsage} />
-                    </ContextContentBody>
-                  </ContextContent>
-                </Context>
-              )}
+            <CodexPromptControls
+              settings={codexSettings}
+              busy={codexSettingsBusy}
+              disabled={turnInFlight || actionBusy}
+              contextUsage={state.contextUsage}
+              onChange={onCodexSettingsChange}
+              onReload={onCodexSettingsReload}
+            />
           </PromptInputTools>
           <PromptInputSubmit aria-label="전송" disabled={!canSend || staging}>
             <SendIcon className="size-4" />

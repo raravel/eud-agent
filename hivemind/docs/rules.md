@@ -163,6 +163,15 @@ hosting, panel re-arm, and server spawning are REMOVED.
   actual result/verification and linking a canonical topic spec. Specs describe implemented
   reality, NEVER merely intended work. Missing artifacts get at most two focused repair
   turns, then a visible error; they are never silently waived.
+- Manual conversation compaction MUST use app-server `thread/compact/start` for the exact saved
+  thread and MUST wait for the completed `contextCompaction` item. NEVER synthesize a panel-side
+  summary, send `/compact` as user text, clear panel history, or alter backend plan/review state.
+- The model-specific 1M opt-in MUST inject `model_context_window=1000000` and
+  `model_auto_compact_token_limit=900000` through every thread start/resume while enabled, and
+  omit both on the next resume when disabled. Drivers MUST reload this app setting before every
+  turn. NEVER hard-code a capability allowlist or override Codex's model catalog: an effective
+  context below 900,000 is a safe default-window fallback and gets one visible warning per
+  session/model.
 - Different sessions MAY overlap read-only Codex turns; commands within one session MUST stay
   serialized. Conversation submission MUST NOT be globally queued.
 - Unexpected app-server exit or stdio closure MUST interrupt the current turn without replaying
@@ -201,6 +210,85 @@ hosting, panel re-arm, and server spawning are REMOVED.
   conditions/actions keep their numeric ids unchanged. Switch NAME bytes follow
   the map string-table encoding and pass raw through the C ABI.
 
+## Map Agent candidate authority
+
+- The Map Agent MUST resolve only the current saved `OpenMapName`. It MUST display the saved
+  source path, mtime, and file hash; unsaved editor/SCMDraft state is not authority.
+- Model-visible Map tools MUST mutate only the active request draft. They MUST NOT expose original
+  Apply, backup restore, arbitrary filesystem paths, or EPS mutation tools.
+- `MapMentionSnapshot` is the only structured prompt constraint. NEVER parse chip labels or
+  natural-language text into selection, object, location, palette, owner, count, or state
+  authority.
+- When the current Map request has no target mention, the entire current candidate is writable
+  for the supported terrain, units, buildings, doodads, sprites, and locations layers. A missing
+  target MUST NOT cause mutation refusal or an area-selection question.
+- One or more current-request target mentions narrow coordinate writes to the union of their exact
+  canonical cells and explicit layers. A stored target omitted from the current request does not
+  constrain it. Reference and anchor mentions are read/comparison context and MUST NOT expand or
+  narrow write scope. Protect masks always remove their cells/layers, including persistent
+  protections omitted from later prompts; an empty protect layer set means all supported layers.
+- `MapRequestAuthority::calculate` is the only scope calculation. Candidate patch, selection-stamp
+  placement, image conversion, per-batch verifier, finalize, deterministic replay, and Apply
+  verification MUST use its persisted result. Native transitions MUST NOT be clipped or hidden to
+  evade it.
+- Object and location mentions remain bound to the exact candidate revision key and baseline file
+  hash. Object fingerprints plus candidate-local UUIDs MUST resolve exactly; stale, missing, or
+  ambiguous instances fail closed. Palette mentions are current-tileset type/style references,
+  never placement authority.
+- Every saved selection MUST have exactly one project-scoped palette entry for the saved map.
+  Selection create/update MUST atomically upsert the canonical mask/label/role/layers; selection
+  delete MUST remove the entry. Each Map session MUST bind that shared definition to its own
+  visible candidate revision. A stamp mention identifies the selection but NEVER grants placement
+  authority.
+- Region stamps MUST read source content from the visible candidate at placement time and resolve
+  server-side to exact typed operations. The model and React MUST NOT read, enumerate, infer, or
+  provide the source MTXM matrix. Exact copy/duplicate requests MUST NOT be reconstructed through
+  render comparison, catalog walks, expected-before probes, semantic ISOM, or approximate flat
+  tiles.
+- A stamp copies only its canonical mask and selected supported layers; an empty layer set means
+  all six supported layers. Units, buildings, doodads, sprites, and locations MUST be included
+  only when their complete footprint lies inside the source mask. Destination top-left positions
+  MUST be bounded and non-overlapping. Terrain writes exact MTXM/TILE values and NEVER receives
+  ISOM boundary correction.
+- Stamp preview MUST be read-only. Terrain replacement is expected and is not an object collision.
+  Existing destination objects or locations require an explicit user merge, replace, or cancel
+  choice. Merge preserves destination objects and adds copies. Replace may delete only
+  fully-contained selected-layer items; a boundary-crossing item fails closed. Both paths are
+  all-or-nothing and MUST pass current target/protect authority, free-location-slot, native edit,
+  per-batch verification, finalize, and deterministic replay rails.
+- Image attachments create no write permission, image mention, whole-map authority, or permission
+  toggle. Current-request images are opaque `image-N` bindings. `map_image_place` accepts only that
+  ref and integer tile placement, server-generates one normal `TerrainBlit`, and passes it through
+  the same terrain authority and verifier as `map_draft_patch`. It MUST NOT expose attachment ids,
+  local paths, palettes, MTXM ids, tile matrices, original Apply, or unsupported CHK surfaces.
+- Image decode MUST retain the 10 MiB encoded limit, reject zero/oversized dimensions before
+  allocation, cap decode at 16,777,216 pixels, cap output at 256x256 tiles, and accept only PNG,
+  JPEG, WebP, or the first GIF frame. The native palette MUST contain only graphics-valid tiles
+  from the current tileset and keep deterministic scan-order dedupe/ties.
+- Fully transparent output cells keep candidate MTXM and consume no target/protect scope. Partial
+  alpha MUST composite against the candidate tile representative color before quantization.
+  Preview never mutates candidate/source state; confirm recomputes and checks revision, baseline,
+  attachment SHA-256, transform, digest, map bounds, authority, and protect.
+- Every successful draft batch is verified immediately and again at finalize/replay. Stamp and
+  image batches do not seal a draft; multiple stamps, images, and normal terrain patches may be
+  interleaved. Native
+  finalize remains request-local until the complete model turn succeeds, then publishes at most
+  one visible revision. Failure, cancellation, stale preview, or abandoned drafts MUST leave the
+  visible candidate and source byte-for-byte unchanged.
+- Live Map workbench preview MAY read only a verified active request draft after a successful
+  scoped draft-mutation tool result. It MUST bind render and object requests to the exact session,
+  parent candidate revision, request id, and monotonically increasing panel generation; stale
+  output MUST be discarded. The UI MUST label the draft uncommitted, MUST NOT create candidate
+  object mentions from it, and MUST clear it on success, failure, or cancellation. Preview state
+  MUST NOT publish a candidate revision, authorize writes, or change source bytes.
+- Original Apply and undo are user-only commands accepted from the `map-agent` window label.
+  Apply is whole-candidate and atomic; it MUST pass coordinator serialization, compiling, lock,
+  source-hash, backup, deterministic replay, and post-write verification rails. Partial layer
+  Apply and model-triggered Apply are forbidden.
+- Apply MUST persist and flush a pending transaction record before replacing the source. Startup
+  restores an uncommitted interrupted Apply; a committed candidate state prevents false rollback.
+  The record is cleared only after candidate state persistence or exact undo.
+
 ## Rust / C++ FFI (NEW)
 
 - The C↔Rust boundary is plain C ABI only: `extern "C"`, no C++ STL types or exceptions
@@ -222,7 +310,9 @@ hosting, panel re-arm, and server spawning are REMOVED.
 - `ask` MUST be non-mutating and session-scoped. It may wait only on its per-session response
   channel, NEVER while holding the session engine mutex. Every question id is unique; every
   question must be answered; single-choice cardinality and multi-choice bounds are validated
-  backend-side. Cancel MUST release the pending tool call.
+  backend-side. Cancel and a dropped MCP ASK future MUST release the pending tool call. The panel
+  MUST reconcile the backend-authoritative pending request through `ask_pending` after registering
+  event listeners; a successful Tauri event emit alone is NEVER proof that the ASK was displayed.
 - Mermaid is enabled only for AI answers (live and archived) and plan cards. It MUST use the
   bundled `@streamdown/mermaid` package; NEVER fetch scripts, styles, or renderers from a CDN.
 - NEVER load panel assets from a CDN — JS/CSS/fonts/Monaco workers/Streamdown assets are

@@ -20,6 +20,9 @@ export default defineConfig({
     include: ["src/**/*.test.ts", "src/**/*.test.tsx"],
     setupFiles: ["src/test/setup.ts"],
     globals: false,
+    // The app test graph loads Monaco/Streamdown/Tauri modules; one worker avoids
+    // Windows commit-limit crashes while preserving file isolation.
+    maxWorkers: 1,
   },
   resolve: {
     // Mirror vite.config.ts: only the vendored shadcn/ui + AI Elements subtrees

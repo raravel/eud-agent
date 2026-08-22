@@ -21,6 +21,26 @@ the visible `PanelStore`; it never opens, resets, cancels, or transfers backend 
 worker. Resume failure starts a fresh thread with a condensed transcript and the full first-turn
 safety prompt.
 
+## Context compaction and 1M opt-in
+
+An exact `/compact` command is session maintenance, not a chat turn. The panel invokes
+`compact{sessionId}` without adding `/compact` to model-visible or panel conversation history.
+The session worker keeps its normal same-session serialization, sends app-server
+`thread/compact/start{threadId}`, and does not resolve the command until the matching
+`contextCompaction` item completes. Native Codex compaction retains Codex's instruction and
+recent-task semantics; backend-owned plan, review, workspace, and journal state are unchanged.
+Codex's normal threshold-driven compaction remains enabled, and its started/completed items become
+Korean progress lines rather than raw event names.
+
+`config.json.codex_large_context_models` is a sorted set of model slugs selected in
+**Settings → Codex**. Before every turn, each production driver reloads the global model pair and
+this set. An enabled active model receives thread start/resume config
+`model_context_window=1000000` and `model_auto_compact_token_limit=900000`; disabling it omits both
+overrides on the next resume. Capability is not hard-coded because the authenticated catalog can
+change independently of the app. Codex clamps unsupported models to their catalog limit; when
+`thread/tokenUsage/updated` reports an effective window below 900,000, the owning session logs one
+fallback warning per model and continues on that default window.
+
 ## Read and write execution modes
 
 Every Codex turn has explicit `WorkspaceAccess::Read` or `WorkspaceAccess::Write`.
@@ -100,11 +120,15 @@ Write tools: `dat_set`, `xdat_set`, `tbl_set`, `req_set`, `btn_set`, `dat_reset`
 
 `ask` accepts one to four related questions. Each question has a stable id, optional header,
 optional 2-5 choices, and a `multi` flag; the panel always exposes direct input. The MCP call
-emits a session-scoped `ask` event, sets activity to `waiting_input`, and awaits
-`ask_response{sessionId,requestId,answers}` without holding the session engine mutex. A valid
-response resolves the original MCP call, restores read/write activity, and lets Codex continue
-the same turn. Missing/duplicate/oversized questions and incomplete or cardinality-invalid
-answers fail validation. Turn cancellation resolves every pending ASK as cancelled.
+registers one owner-request-scoped pending ASK, emits a session-scoped `ask` notification, sets
+activity to `waiting_input`, and awaits `ask_response{sessionId,requestId,answers}` without holding
+the session engine mutex. A valid response resolves the original MCP call, restores read/write
+activity, and lets Codex continue the same turn. A dropped MCP future removes its pending slot
+through an RAII lease; turn cancellation resolves it as cancelled. Because Tauri events are
+ephemeral notifications rather than delivery acknowledgments, `ask_pending{sessionId}` returns the
+backend-authoritative pending snapshot. The main and Map panels query it only after installing
+listeners and restore the matching ASK idempotently. Missing/duplicate/oversized questions and
+incomplete or cardinality-invalid answers fail validation.
 `file_edit` applies a non-empty ordered list of exact, uniquely matching `old_text`/`new_text`
 replacements to the session baseline, then uses the same non-overlapping live-change merge and
 full before/after journal snapshots as `file_write`.
@@ -174,8 +198,9 @@ to review and retains ownership.
   cancellation, review retention, and pending-review restoration priority.
 - Runtime tests prove request/evidence/budget/preflight isolation.
 - ASK tests prove one blocking MCP call emits one session-scoped related-question request,
-  rejects incomplete answers without consuming it, and returns mixed choice/direct answers to
-  the same call.
+  rejects incomplete answers without consuming it, returns mixed choice/direct answers to the
+  same call, releases the session slot when the MCP future is dropped, and restores a pending
+  snapshot when the panel missed the push event.
 - Workspace tests prove stable session snapshots, accepted promotion, canonical rejection
   invariance, and approved-plan preservation.
 - Panel integration tests prove overlapping `chat` invokes and strict event-to-`PanelStore`

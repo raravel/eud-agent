@@ -29,6 +29,7 @@ export const STAGE_LABELS: Record<string, string> = {
   // The codex stage covers ANY turn (greetings/answers included), so the label
   // must not claim code generation specifically.
   codex: "codex 실행 중…",
+  compaction: "대화 컨텍스트 자동 압축 중…",
   workspace: "프로젝트 워크스페이스 보안 환경 준비 중…",
   lsp: "진단 검사 중…",
   waiting_build: "에디터 빌드 완료 대기 중…",
@@ -62,6 +63,19 @@ export function progressLabel(stage: string, detail?: string): ProgressLine {
     }
     // "started" (or any other detail) → the in-progress label.
     return { kind: "progress", text: STAGE_LABELS.rag_warmup };
+  }
+  if (stage === "compaction") {
+    return detail === "done"
+      ? { kind: "ok", text: "대화 컨텍스트 자동 압축 완료" }
+      : { kind: "progress", text: STAGE_LABELS.compaction };
+  }
+  if (stage === "large_context_fallback") {
+    return {
+      kind: "warn",
+      text:
+        detail ??
+        "선택한 모델이 1M 컨텍스트를 지원하지 않아 기본 컨텍스트를 사용합니다.",
+    };
   }
   return { kind: "progress", text: STAGE_LABELS[stage] ?? stage };
 }

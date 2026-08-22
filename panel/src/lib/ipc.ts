@@ -57,6 +57,25 @@ export interface CodexModelSettings {
   selectedModel: string;
   selectedReasoningEffort: string;
 }
+export interface NotificationChannelSettings {
+  sound: boolean;
+  osNotification: boolean;
+}
+
+export type NotificationEvent = "planApproval" | "changesetReview";
+
+export interface NotificationSettings {
+  planApproval: NotificationChannelSettings;
+  changesetReview: NotificationChannelSettings;
+}
+
+export interface AppSettings {
+  notifications: NotificationSettings;
+  codexLargeContextModels: string[];
+}
+
+export type AttentionNotificationKind = NotificationEvent;
+
 
 
 /** Unlisten callback returned by Tauri event registration. */
@@ -518,4 +537,76 @@ export async function codexModelSettingsSave(
   return toCodexModelSettings(
     await invoke("codex_model_settings_save", { model, reasoningEffort }),
   );
+}
+
+/** Run native Codex compaction for one persisted session. */
+export async function compactSession(
+  sessionId: string,
+  invoke: InvokeFn = tauriInvoke,
+): Promise<void> {
+  await invoke("compact", { sessionId });
+}
+
+function isNotificationChannelSettings(
+  value: unknown,
+): value is NotificationChannelSettings {
+  return (
+    isObject(value) &&
+    typeof value.sound === "boolean" &&
+    typeof value.osNotification === "boolean"
+  );
+}
+
+function toAppSettings(value: unknown): AppSettings {
+  if (
+    !isObject(value) ||
+    !isObject(value.notifications) ||
+    !isNotificationChannelSettings(value.notifications.planApproval) ||
+    !isNotificationChannelSettings(value.notifications.changesetReview) ||
+    !Array.isArray(value.codexLargeContextModels) ||
+    !value.codexLargeContextModels.every(
+      (model) => typeof model === "string" && model.trim().length > 0,
+    )
+  ) {
+    throw new Error("invalid app settings response");
+  }
+  return value as unknown as AppSettings;
+}
+
+/** Fetch app-owned preferences for the extensible settings dialog. */
+export async function appSettingsGet(
+  invoke: InvokeFn = tauriInvoke,
+): Promise<AppSettings> {
+  return toAppSettings(await invoke("app_settings"));
+}
+
+/** Persist app-owned preferences without replacing unrelated core config. */
+export async function appSettingsSave(
+  settings: AppSettings,
+  invoke: InvokeFn = tauriInvoke,
+): Promise<AppSettings> {
+  return toAppSettings(await invoke("app_settings_save", { settings }));
+}
+
+/** Play the native Windows sound used by attention notifications. */
+export async function notificationSoundPreview(
+  invoke: InvokeFn = tauriInvoke,
+): Promise<void> {
+  await invoke("notification_sound_preview");
+}
+
+/** Deliver a user-attention event through the channels enabled in persisted settings. */
+export async function attentionNotify(
+  kind: AttentionNotificationKind,
+  showOs: boolean,
+  sessionId: string,
+  itemCount?: number,
+  invoke: InvokeFn = tauriInvoke,
+): Promise<void> {
+  await invoke("attention_notify", {
+    kind,
+    showOs,
+    sessionId,
+    ...(itemCount === undefined ? {} : { itemCount }),
+  });
 }

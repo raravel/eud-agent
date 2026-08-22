@@ -23,7 +23,7 @@ const questions = [
 ];
 
 describe("AskCard", () => {
-  it("collects related single, multiple, and direct answers in one submission", () => {
+  it("answers one tab at a time and preserves answers while revisiting earlier questions", () => {
     const onSubmit = vi.fn();
     render(
       <AskCard
@@ -34,20 +34,44 @@ describe("AskCard", () => {
       />,
     );
 
-    const submit = screen.getByRole("button", { name: "답변 전달" });
-    expect(submit).toBeDisabled();
+    expect(screen.getByRole("tablist", { name: "질문 목록" })).toBeInTheDocument();
+    expect(screen.getByText("어떤 방식을 사용할까요?")).toBeInTheDocument();
+    expect(screen.queryByText("필요한 항목을 고르세요.")).not.toBeInTheDocument();
+    fireEvent.keyDown(screen.getByRole("tab", { name: /방식/ }), {
+      key: "ArrowRight",
+    });
+    expect(screen.getByText("필요한 항목을 고르세요.")).toBeInTheDocument();
+    fireEvent.keyDown(screen.getByRole("tab", { name: /질문 2/ }), {
+      key: "Home",
+    });
+    expect(screen.getByText("어떤 방식을 사용할까요?")).toBeInTheDocument();
 
+    const next = screen.getByRole("button", { name: "다음 질문" });
+    expect(next).toBeDisabled();
     fireEvent.click(screen.getByLabelText(/빠르게/));
+    expect(next).toBeEnabled();
+    fireEvent.click(next);
+
+    expect(screen.getByText("필요한 항목을 고르세요.")).toBeInTheDocument();
     fireEvent.click(screen.getByLabelText("로그"));
-    fireEvent.change(screen.getAllByLabelText("기타 입력")[1], {
+    fireEvent.change(screen.getByLabelText("기타 입력"), {
       target: { value: "진행률" },
     });
 
+    fireEvent.click(screen.getByRole("tab", { name: /방식/ }));
+    expect(screen.getByLabelText(/빠르게/)).toBeChecked();
+    fireEvent.click(screen.getByLabelText(/세밀하게/));
+
+    fireEvent.click(screen.getByRole("tab", { name: /질문 2/ }));
+    expect(screen.getByLabelText("로그")).toBeChecked();
+    expect(screen.getByLabelText("기타 입력")).toHaveValue("진행률");
+
+    const submit = screen.getByRole("button", { name: "답변 전달" });
     expect(submit).toBeEnabled();
     fireEvent.click(submit);
 
     expect(onSubmit).toHaveBeenCalledWith({
-      mode: { answers: ["빠르게"] },
+      mode: { answers: ["세밀하게"] },
       features: { answers: ["로그", "진행률"] },
     });
   });

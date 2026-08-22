@@ -133,9 +133,13 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClInclude Include="isom_capi.h" />
+    <ClInclude Include="IsomTerrain\MapAgentCore.h" />
+    <ClInclude Include="IsomTerrain\MapAgentJson.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="isom_capi.cpp" />
+    <ClCompile Include="IsomTerrain\MapAgentCore.cpp" />
+    <ClCompile Include="IsomTerrain\MapAgentJson.cpp" />
     <!-- Verified engine entry surface (import-then-extend; NOT Main.cpp). -->
     <ClCompile Include="IsomTerrain\MapGenCli.cpp" />
     <ClCompile Include="IsomTerrain\IsomTests.cpp" />

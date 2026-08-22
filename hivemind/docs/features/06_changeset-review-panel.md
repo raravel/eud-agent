@@ -70,10 +70,28 @@ new writers.
   hover card: `last.totalTokens / modelContextWindow` drives the visible percentage, while the
   body shows cumulative input, cached-input, output, and reasoning counts. A missing context
   window hides the trigger, rewind clears stale usage, and API-cost estimation is omitted.
+- **Compaction + large context**: an exact attachment-free `/compact` bypasses normal chat/plan
+  feedback routing, disables the input while the session-scoped native command runs, and appends
+  Korean start/success/error status rows without adding the slash command as a user message. The
+  same command is available in Map Agent conversations. The general Settings dialog adds a
+  keyboard-accessible Codex category listing the authenticated model catalog; every row has an
+  immediate-save 1M switch, current-model text badge, loading state, and explicit explanation of
+  the 1,000,000 window, 900,000 auto-compaction threshold, and default-window fallback. Native
+  automatic compaction start/completion and one-time unsupported-model fallback warnings render as
+  user-facing progress rows; raw `contextCompaction` item names never render.
 - **Status visibility** (user request 2026-06-05): header shows connection state transitions (연결 중 → 연결됨 → 재연결 중) and RAG model state with elapsed seconds while loading (`rag_warmup` started ts → done), reusing `progressLabel`.
+- **User-attention notifications**: the Header gear opens an extensible general Settings dialog.
+  Its Notifications category persists independent sound/OS-notification switches for plan
+  approval and changeset review in `config.json`; all four switches default on. A genuinely new
+  plan revision or changeset request plays the configured Windows sound. While the panel document
+  lacks focus, the backend sends a silent WinRT toast under the registered `eud-agent`
+  AppUserModelID with the bundled app icon, so sound and OS delivery remain independent. Clicking
+  the toast restores/focuses the main window and selects the immutable session id carried by that
+  notification. Repeated delivery of the same plan revision or changeset request is deduplicated.
+  The dialog also provides a native-sound preview.
 - **Agent stream (EUD-063 contract; EUD-068/069 amendments)**: per-turn `agent_event`s drive three surfaces — (1) `reasoning` deltas accumulate into the **Reasoning** component: dim/secondary, GPT-style, auto-open while streaming, collapses when the answer starts; (2) `delta` answer text streams into a PROMINENT (foreground) agent **Message/Response** via Streamdown; (3) `tool_call`/`tool_result` render as **Tool** rows showing the tool name (도구 호출 n건 summary retained) PLUS the call arguments (요청) and result text (결과) from `agent_event.data` inside the expandable card; a non-"completed" status renders a 실패 badge (EUD-068). Raw internal kind identifiers (`delta`, `answer`, `token_usage`, `turn_done`, `item_started`, `item_completed`, `event`) MUST NEVER appear as literal UI text. All per-turn surfaces reset when a new turn starts.
 - **Inline stream placement (EUD-069 — layout-crush fix)**: the live agent stream (Reasoning block + Tool rows + streamed answer bubble) renders INLINE at the END of the Conversation scroll area — NEVER as a fixed band between the log and the input (an unbounded band has no min-height escape and crushes the log/plan card; measured live: log 0px, plan 33px, 승인 button off-viewport). When a turn ends (answer/plan/changeset/error), the tool rows ARCHIVE into the log as a compact entry carrying the rows (`LogEntry.tools` → 도구 호출 n건 — name×k summary + expandable Tool cards) and the live buffer clears.
-- **Structured ASK**: the `ask` MCP tool may pause one running turn for up to four related questions. Each question renders as an accessible inline card with single-choice, multi-choice, and always-available direct input. The card validates that every question has an answer, sends `ask_response{sessionId,requestId,answers}`, and resolves the original tool call so Codex continues the same turn. `waiting_input` is backend-authoritative session activity, shown in the sidebar/header so an unselected blocked session remains discoverable; normal turn cancellation also cancels the pending ASK.
+- **Structured ASK**: the `ask` MCP tool may pause one running turn for up to four related questions. A multi-question request renders a top tab for each question and only one accessible question panel at a time; answered state survives tab changes, completed tabs are marked, and any prior answer remains editable before submission. Single-choice, multi-choice, and always-available direct input keep their existing semantics. The card validates that every question has an answer, sends `ask_response{sessionId,requestId,answers}`, and resolves the original tool call so Codex continues the same turn. `waiting_input` is backend-authoritative session activity, shown in the sidebar/header so an unselected blocked session remains discoverable; normal turn cancellation also cancels the pending ASK.
 - **Persistent turn status + stop**: while `phase === "thinking"`, a compact status bar stays
   attached to the bottom PromptInput instead of scrolling away. It derives the current label
   from the live turn and exposes `작업 중단`. Cancel names the selected `sessionId`; it interrupts
@@ -95,6 +113,11 @@ new writers.
   immediately collapses the approved revision while its execution turn runs; the accessible Plan
   trigger can reopen it manually. Only the plan body scrolls; the approval/guidance row stays
   outside that scroll region at the review panel's bottom.
+  While expanded, the review panel's top edge is an accessible horizontal separator: pointer/touch
+  dragging resizes the panel vertically, Up/Down adjust it by one step, Home/End select its bounds,
+  and double-click restores the default. The bounded pixel height persists in local storage across
+  sessions and window reloads; viewport-height changes clamp it so the conversation and main input
+  remain reachable. A collapsed plan returns to its compact natural height and hides the separator.
 - **New session**: the permanent left `SessionSidebar` creates an unsaved draft tab. Its first
   message calls `session_create`, replaces the draft id with the Rust id, and invokes `chat`
   immediately.
@@ -136,8 +159,13 @@ new writers.
 - Sidebar tests pin `분석 중`, `변경 중`, review, splitter keyboard sizing, collapsed rail, and
   long-name clipping. App tests also pin plan-collapse preservation across session switches.
 - PlanView/ChangesetView tests pin controlled collapse and the fixed header/footer layout
-  boundaries around their scrollable bodies.
+  boundaries around their scrollable bodies. PlanView additionally pins splitter orientation,
+  keyboard sizing, pointer resizing, and persisted height.
 - Full Vitest, TypeScript, and production build remain required.
+- Settings/App integration tests pin event-specific switches, immediate persistence, native-sound
+  preview, foreground OS-toast suppression, and one notification per new plan revision/changeset
+  request. Mock-Tauri browser smoke verifies the dialog, IPC payloads, review transitions, and zero
+  horizontal overflow.
 - Mock-Tauri browser smoke observes simultaneous active-write and review rows at 1280 px and
   960 px with no horizontal overflow.
 - Browser smoke submits a mixed single/multi/direct ASK response, verifies the exact `ask_response`

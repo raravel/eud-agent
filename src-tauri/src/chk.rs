@@ -1,11 +1,14 @@
 use encoding_rs::EUC_KR;
 use serde::Serialize;
+use sha2::{Digest as _, Sha256};
 use std::collections::BTreeMap;
 
 pub const _MAX_SECTIONS: usize = 10_000;
 pub const MRGN_ENTRY_SIZE: usize = 20;
 pub const UNIT_ENTRY_SIZE: usize = 36;
 pub const SWNM_ENTRY_SIZE: usize = 4;
+pub const DD2_ENTRY_SIZE: usize = 8;
+pub const THG2_ENTRY_SIZE: usize = 10;
 pub const TRIGGER_ENTRY_SIZE: usize = 2_400;
 pub const TRIGGER_CONDITION_SIZE: usize = 20;
 pub const TRIGGER_ACTION_SIZE: usize = 32;
@@ -15,6 +18,11 @@ pub const MRGN_STRUCT_LAYOUT: &str = "<iiiiHH";
 pub const UNIT_STRUCT_LAYOUT: &str = "<IHHHHHHBBBBIHHII";
 pub const _ANYWHERE_INDEX: usize = 63;
 pub const _START_LOCATION_TYPE: u16 = 214;
+/// The only CHK sections Map Agent may mutate. Every other known or unknown
+/// section is fixed authority and must retain its canonical digest.
+pub const MAP_AGENT_MUTABLE_SECTIONS: &[&str] = &[
+    "MTXM", "TILE", "ISOM", "UNIT", "DD2 ", "THG2", "MRGN", "STR ", "STRx",
+];
 
 pub const _OWNR_NAMES: &[&str] = &[
     "Inactive",
@@ -298,6 +306,8 @@ pub struct Digest {
     pub forces: Vec<Force>,
     pub locations: Vec<Location>,
     pub units: Vec<Unit>,
+    pub doodads: Vec<Doodad>,
+    pub sprites: Vec<Sprite>,
     pub start_locations: Vec<StartLocation>,
     #[serde(skip)]
     pub tiles: Vec<u16>,
@@ -388,6 +398,34 @@ pub struct Unit {
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct Doodad {
+    pub ordinal: usize,
+    pub type_id: u16,
+    pub x: u16,
+    pub y: u16,
+    pub tile_x: u16,
+    pub tile_y: u16,
+    pub owner: u8,
+    pub disabled: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Sprite {
+    pub ordinal: usize,
+    pub type_id: u16,
+    pub x: u16,
+    pub y: u16,
+    pub tile_x: u16,
+    pub tile_y: u16,
+    pub owner: u8,
+    pub flags: u16,
+    pub draw_as_sprite: bool,
+    pub disabled: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct StartLocation {
     pub player: String,
     pub x: u16,
@@ -431,6 +469,13 @@ pub struct SwitchUsage {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub raw_operation: Option<u8>,
     pub disabled: bool,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CanonicalChkDigest {
+    pub section_hashes: BTreeMap<String, String>,
+    pub unsupported_hashes: BTreeMap<String, String>,
+    pub overall_sha256: String,
 }
 
 pub fn walk_sections(data: &[u8]) -> Vec<(String, Vec<u8>)> {
@@ -481,6 +526,34 @@ pub fn assemble_sections(sections: &[(String, Vec<u8>)]) -> BTreeMap<String, Vec
     }
 
     assembled
+}
+pub fn canonical_chk_digest(data: &[u8]) -> CanonicalChkDigest {
+    let assembled = assemble_sections(&walk_sections(data));
+    let section_hashes = assembled
+        .iter()
+        .map(|(name, body)| (name.clone(), sha256_hex(body)))
+        .collect::<BTreeMap<_, _>>();
+    let unsupported_hashes = section_hashes
+        .iter()
+        .filter(|(name, _)| !MAP_AGENT_MUTABLE_SECTIONS.contains(&name.as_str()))
+        .map(|(name, hash)| (name.clone(), hash.clone()))
+        .collect::<BTreeMap<_, _>>();
+
+    let mut canonical = Vec::new();
+    for (name, hash) in &section_hashes {
+        canonical.extend_from_slice(&(name.len() as u32).to_le_bytes());
+        canonical.extend_from_slice(name.as_bytes());
+        canonical.extend_from_slice(hash.as_bytes());
+    }
+    CanonicalChkDigest {
+        section_hashes,
+        unsupported_hashes,
+        overall_sha256: sha256_hex(&canonical),
+    }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
 }
 
 pub fn decode_text(raw: &[u8]) -> String {
@@ -590,6 +663,48 @@ pub fn parse_units(unit: &[u8]) -> Vec<Unit> {
                 hallucinated: state_flags & 0x08 != 0,
                 invincible: state_flags & 0x10 != 0,
                 relation_class_id: read_u32_le(entry, 32),
+            }
+        })
+        .collect()
+}
+pub fn parse_doodads(dd2: &[u8]) -> Vec<Doodad> {
+    dd2.chunks_exact(DD2_ENTRY_SIZE)
+        .enumerate()
+        .map(|(ordinal, entry)| {
+            let x = read_u16_le(entry, 2);
+            let y = read_u16_le(entry, 4);
+            Doodad {
+                ordinal,
+                type_id: read_u16_le(entry, 0),
+                x,
+                y,
+                tile_x: x / 32,
+                tile_y: y / 32,
+                owner: entry[6],
+                disabled: entry[7] != 0,
+            }
+        })
+        .collect()
+}
+
+pub fn parse_sprites(thg2: &[u8]) -> Vec<Sprite> {
+    thg2.chunks_exact(THG2_ENTRY_SIZE)
+        .enumerate()
+        .map(|(ordinal, entry)| {
+            let x = read_u16_le(entry, 2);
+            let y = read_u16_le(entry, 4);
+            let flags = read_u16_le(entry, 8);
+            Sprite {
+                ordinal,
+                type_id: read_u16_le(entry, 0),
+                x,
+                y,
+                tile_x: x / 32,
+                tile_y: y / 32,
+                owner: entry[6],
+                flags,
+                draw_as_sprite: flags & 0x1000 != 0,
+                disabled: flags & 0x8000 != 0,
             }
         })
         .collect()
@@ -802,6 +917,8 @@ pub fn digest_chk(data: &[u8]) -> Digest {
     );
     let locations = parse_locations(sections.get("MRGN").unwrap_or(&empty), &strings);
     let units = parse_units(sections.get("UNIT").unwrap_or(&empty));
+    let doodads = parse_doodads(sections.get("DD2 ").unwrap_or(&empty));
+    let sprites = parse_sprites(sections.get("THG2").unwrap_or(&empty));
     let start_locations = units
         .iter()
         .filter(|unit| unit.type_id == _START_LOCATION_TYPE)
@@ -827,6 +944,8 @@ pub fn digest_chk(data: &[u8]) -> Digest {
         forces,
         locations,
         units,
+        doodads,
+        sprites,
         start_locations,
         tiles,
         switches,
@@ -1649,10 +1768,41 @@ mod tests {
                         "relationClassId": 0
                     }
                 ],
+                "doodads": [],
+                "sprites": [],
                 "startLocations": [
                     {"player": "P2", "x": 320, "y": 64, "tileX": 10, "tileY": 2}
                 ]
             })
         );
+    }
+    #[test]
+    fn rich_map_fixture_canonical_digests_are_reproducible() {
+        let fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("crates")
+            .join("isom")
+            .join("tests")
+            .join("fixtures")
+            .join("map_agent_rich.scx");
+        let chk = isom::chk_extract(&fixture).unwrap();
+        let first = canonical_chk_digest(&chk);
+        let second = canonical_chk_digest(&chk);
+        assert_eq!(first, second);
+        assert!(first.section_hashes.contains_key("MTXM"));
+        assert!(first.section_hashes.contains_key("UNIT"));
+        assert!(first.section_hashes.contains_key("DD2 "));
+        assert!(first.section_hashes.contains_key("THG2"));
+        assert!(first.unsupported_hashes.contains_key("TRIG"));
+        let digest = digest_chk(&chk);
+        assert!(!digest.units.is_empty());
+        assert!(!digest.doodads.is_empty());
+        assert!(!digest.sprites.is_empty());
+        assert!(digest.locations.iter().any(|location| location.id != 64));
+        let container: serde_json::Value =
+            serde_json::from_str(&isom::map_digest(&fixture).unwrap()).unwrap();
+        assert!(container["extraAssets"]["assets"]
+            .as_array()
+            .is_some_and(|assets| !assets.is_empty()));
     }
 }

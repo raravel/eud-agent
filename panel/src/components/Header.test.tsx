@@ -226,3 +226,34 @@ describe("Header — project tools sidebar", () => {
     expect(onProjectPanelToggle).toHaveBeenCalledTimes(1);
   });
 });
+
+describe("Header — Map Agent window", () => {
+  it("opens only when the editor and a project are connected", async () => {
+    const onOpenMapAgent = vi.fn();
+    const { rerender } = render(
+      <Header
+        project=""
+        connected={true}
+        phase="ready"
+        editorConnected={false}
+        hasProject={false}
+        onOpenMapAgent={onOpenMapAgent}
+      />,
+    );
+    expect(screen.getByRole("button", { name: "맵 에이전트" })).toBeDisabled();
+    rerender(
+      <Header
+        project="MyMap"
+        connected={true}
+        phase="ready"
+        editorConnected={true}
+        hasProject={true}
+        onOpenMapAgent={onOpenMapAgent}
+      />,
+    );
+    const button = screen.getByRole("button", { name: "맵 에이전트" });
+    expect(button).toBeEnabled();
+    await userEvent.click(button);
+    expect(onOpenMapAgent).toHaveBeenCalledTimes(1);
+  });
+});

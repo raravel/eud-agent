@@ -240,6 +240,40 @@ Every conversation event has a required immutable `sessionId`:
 Project status, list, memory/wiki snapshots, setup, bootstrap, and RAG warmup remain global.
 `session_active` and selected-row event-routing fallbacks do not exist.
 
+## Map Agent session history
+
+The Map Agent window lists only `SessionKind::Map` rows for the current project and saved
+`OpenMapName` source. `map_agent_session_list`, `map_agent_session_create`,
+`map_agent_session_load`, `map_agent_session_rename`, and `map_agent_session_delete` keep this
+surface separate from the main EPS sidebar. Loading a row reopens that session's Codex worker,
+candidate revision chain, saved selections, context usage, and panel conversation.
+
+The history dialog is latest-conversation-first, searchable, and identifies the active row. It
+supports creating, renaming, and deleting inactive map work. Switching is disabled while the
+visible map session is running; the panel flushes its current conversation log before create/load
+and clears draft mentions, prompt text, live stream state, and canvas selection when the session
+changes. Window focus/source refresh first reloads the selected session id, so selecting an older
+history row does not silently jump back to the newest row. Backend source checks reject rows bound
+to another project or saved map.
+
+Candidate state creation and reopening are explicit backend operations. A newly created or
+persisted-but-unbound Map session calls `CandidateStore::create_session`; loading, bootstrapping,
+or focus-reloading a source-bound row calls `CandidateStore::open_session`. Normal hydration
+validates source identity, repairs the visible candidate by replay when necessary, and refreshes
+stale-source state without inspecting or sweeping `drafts/`, so an active request keeps its exact
+draft path and bytes across reloads. `CandidateStore::cleanup_startup` is the only generic orphan
+draft sweep and runs before `MapAgentService` is managed; request finish/cancel and successful
+settlement continue to remove only the owning request's draft.
+
+Map image attachments remain session-bound in LocalAppData but each active request receives a new
+ordered `image-1..N` map in its `SessionToolRuntime`. The binding includes attachment SHA-256,
+decoded source dimensions, candidate revision key, and baseline hash; only the safe ref/name/mime/
+dimensions list is shown to the model beside its normal `localImage` inputs. Ending/resetting the
+request drops the ref map, so another request or session cannot reuse an `imageRef`. Candidate
+replay uses the manifest's stored `TerrainBlit` and image conversion metadata, never the attachment
+or cache. Direct image placement keeps one normalized image cache entry per session and releases it
+on successful confirm, session/source replacement, or UI cancellation.
+
 ## Panel contract
 
 `App.tsx` owns `Map<sessionId, SessionSlot>`, with one `PanelStore` per row. Drafts are persisted

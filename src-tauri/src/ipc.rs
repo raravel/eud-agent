@@ -4,10 +4,11 @@
 //! are emitted as typed Tauri events. The command bodies are placeholders until the engine
 //! orchestration task wires RAG, Codex, LSP, and editor bridge calls into this surface.
 
+use std::collections::BTreeSet;
 use std::path::Path;
 
 use crate::bridge_io::{BridgeIo, SendOpts, HEARTBEAT_STALE_AFTER};
-use crate::config::{self, DataDirs};
+use crate::config::{self, DataDirs, NotificationChannelSettings, NotificationSettings};
 use crate::memory::ProjectMemory;
 use serde::{Deserialize, Serialize};
 use tauri::Emitter;
@@ -63,6 +64,73 @@ impl BridgeManaged {
     pub fn dirs(&self) -> &DataDirs {
         &self.dirs
     }
+}
+/// App-owned settings exposed to the general settings dialog.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppSettings {
+    pub notifications: NotificationSettings,
+    pub codex_large_context_models: BTreeSet<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum AttentionNotificationKind {
+    PlanApproval,
+    ChangesetReview,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AttentionNotificationText {
+    title: &'static str,
+    body: String,
+}
+
+fn attention_notification_text(
+    kind: AttentionNotificationKind,
+    item_count: Option<usize>,
+) -> AttentionNotificationText {
+    match kind {
+        AttentionNotificationKind::PlanApproval => AttentionNotificationText {
+            title: "계획 승인이 필요합니다",
+            body: "새 계획안을 검토하고 승인해 주세요.".to_string(),
+        },
+        AttentionNotificationKind::ChangesetReview => AttentionNotificationText {
+            title: "변경사항 검토가 필요합니다",
+            body: item_count.map_or_else(
+                || "적용하거나 되돌릴 변경사항을 검토해 주세요.".to_string(),
+                |count| format!("변경사항 {count}건을 적용하거나 되돌릴지 검토해 주세요."),
+            ),
+        },
+    }
+}
+
+fn notification_channels(
+    settings: NotificationSettings,
+    kind: AttentionNotificationKind,
+) -> NotificationChannelSettings {
+    match kind {
+        AttentionNotificationKind::PlanApproval => settings.plan_approval,
+        AttentionNotificationKind::ChangesetReview => settings.changeset_review,
+    }
+}
+
+#[cfg(windows)]
+fn play_notification_sound() -> Result<(), String> {
+    use windows_sys::Win32::System::Diagnostics::Debug::MessageBeep;
+    use windows_sys::Win32::UI::WindowsAndMessaging::MB_ICONASTERISK;
+
+    let played = unsafe { MessageBeep(MB_ICONASTERISK) };
+    if played == 0 {
+        Err("failed to play the Windows notification sound".to_string())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(windows))]
+fn play_notification_sound() -> Result<(), String> {
+    Err("notification sounds are only supported on Windows".to_string())
 }
 
 /// Resolve a bridge client from `config.json`.
@@ -449,6 +517,12 @@ pub enum ProgressStage {
     /// Codex subprocess execution.
     #[serde(rename = "codex")]
     Codex,
+    /// Native automatic conversation compaction.
+    #[serde(rename = "compaction")]
+    Compaction,
+    /// Selected model requested 1M context but Codex reported a smaller effective window.
+    #[serde(rename = "large_context_fallback")]
+    LargeContextFallback,
     /// Per-project filesystem + exact-root Windows sandbox setup.
     #[serde(rename = "workspace")]
     Workspace,
@@ -519,6 +593,89 @@ pub async fn cancel() -> Result<(), String> {
 #[tauri::command]
 pub async fn reset() -> Result<(), String> {
     Ok(())
+}
+
+pub fn app_settings_payload(dirs: &DataDirs) -> Result<AppSettings, String> {
+    let config = dirs.load_config().map_err(|error| error.to_string())?;
+    Ok(AppSettings {
+        notifications: config.notifications,
+        codex_large_context_models: config.codex_large_context_models,
+    })
+}
+
+pub fn app_settings_save_payload(
+    dirs: &DataDirs,
+    settings: AppSettings,
+) -> Result<AppSettings, String> {
+    let mut config = dirs.load_config().map_err(|error| error.to_string())?;
+    config.notifications = settings.notifications;
+    config.codex_large_context_models = settings.codex_large_context_models.clone();
+    dirs.save_config(&config)
+        .map_err(|error| error.to_string())?;
+    Ok(settings)
+}
+
+/// Read app-owned settings for the extensible settings dialog.
+#[tauri::command]
+pub async fn app_settings(state: tauri::State<'_, BridgeManaged>) -> Result<AppSettings, String> {
+    app_settings_payload(state.dirs())
+}
+
+/// Persist app-owned settings without replacing unrelated config fields.
+#[tauri::command]
+pub async fn app_settings_save(
+    state: tauri::State<'_, BridgeManaged>,
+    settings: AppSettings,
+) -> Result<AppSettings, String> {
+    app_settings_save_payload(state.dirs(), settings)
+}
+
+/// Play the same Windows sound used by attention events.
+#[tauri::command]
+pub async fn notification_sound_preview() -> Result<(), String> {
+    play_notification_sound()
+}
+
+/// Deliver one attention event according to persisted settings.
+///
+/// The panel supplies `show_os=false` while its document has focus. The native toast is
+/// intentionally silent; the independently configurable Windows sound is played here.
+#[tauri::command]
+pub async fn attention_notify(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, BridgeManaged>,
+    kind: AttentionNotificationKind,
+    show_os: bool,
+    session_id: String,
+    item_count: Option<usize>,
+) -> Result<(), String> {
+    let settings = app_settings_payload(state.dirs())?.notifications;
+    let channels = notification_channels(settings, kind);
+    let sound_error = channels
+        .sound
+        .then(play_notification_sound)
+        .transpose()
+        .err();
+
+    let os_error = if channels.os_notification && show_os {
+        let text = attention_notification_text(kind, item_count);
+        #[cfg(windows)]
+        {
+            crate::windows_notification::show(&app, text.title, &text.body, &session_id).err()
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (app, text, session_id);
+            Some("OS notifications are only supported on Windows".to_string())
+        }
+    } else {
+        None
+    };
+
+    match sound_error.or(os_error) {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
 }
 
 /// Read editor compile/project status.
@@ -864,10 +1021,11 @@ pub fn emit_session_loaded<R: tauri::Runtime>(
 
 #[cfg(test)]
 mod tests {
-    use crate::config::{Config, DataDirs};
+    use crate::config::{Config, DataDirs, NotificationChannelSettings, NotificationSettings};
     use crate::ipc;
     use crate::memory::{ProjectMemory, CONTENT_CAP_BYTES};
     use serde_json::json;
+    use std::collections::BTreeSet;
     use std::fs;
     use std::path::PathBuf;
 
@@ -1070,6 +1228,11 @@ mod tests {
 
         assert_json(&ipc::ProgressStage::Rag, json!("rag"));
         assert_json(&ipc::ProgressStage::Codex, json!("codex"));
+        assert_json(&ipc::ProgressStage::Compaction, json!("compaction"));
+        assert_json(
+            &ipc::ProgressStage::LargeContextFallback,
+            json!("large_context_fallback"),
+        );
         assert_json(&ipc::ProgressStage::Lsp, json!("lsp"));
         assert_json(&ipc::ProgressStage::Bootstrap, json!("bootstrap"));
     }
@@ -1528,6 +1691,72 @@ mod tests {
             json!({
                 "stage": "bootstrap"
             }),
+        );
+    }
+
+    #[test]
+    fn app_settings_round_trip_preserves_unrelated_config_fields() {
+        let base = unique_temp_dir("app-settings");
+        let dirs = DataDirs::from_bases(&base.join("roaming"), &base.join("local"));
+        dirs.save_config(&Config {
+            editor_path: "C:\\Editor".to_string(),
+            codex_model: Some("gpt-test".to_string()),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let settings = ipc::AppSettings {
+            notifications: NotificationSettings {
+                plan_approval: NotificationChannelSettings {
+                    sound: false,
+                    os_notification: true,
+                },
+                changeset_review: NotificationChannelSettings {
+                    sound: true,
+                    os_notification: false,
+                },
+            },
+            codex_large_context_models: BTreeSet::from(["gpt-test".to_string()]),
+        };
+        let saved = ipc::app_settings_save_payload(&dirs, settings.clone()).unwrap();
+        assert_eq!(saved, settings);
+        assert_eq!(ipc::app_settings_payload(&dirs).unwrap(), settings);
+        assert_json(
+            &saved,
+            json!({
+                "notifications": {
+                    "planApproval": {"sound": false, "osNotification": true},
+                    "changesetReview": {"sound": true, "osNotification": false}
+                },
+                "codexLargeContextModels": ["gpt-test"]
+            }),
+        );
+
+        let config = dirs.load_config().unwrap();
+        assert_eq!(config.editor_path, "C:\\Editor");
+        assert_eq!(config.codex_model.as_deref(), Some("gpt-test"));
+        assert_eq!(
+            config.codex_large_context_models,
+            BTreeSet::from(["gpt-test".to_string()])
+        );
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn attention_notification_copy_matches_the_review_event() {
+        let plan =
+            ipc::attention_notification_text(ipc::AttentionNotificationKind::PlanApproval, None);
+        assert_eq!(plan.title, "계획 승인이 필요합니다");
+        assert_eq!(plan.body, "새 계획안을 검토하고 승인해 주세요.");
+
+        let changeset = ipc::attention_notification_text(
+            ipc::AttentionNotificationKind::ChangesetReview,
+            Some(3),
+        );
+        assert_eq!(changeset.title, "변경사항 검토가 필요합니다");
+        assert_eq!(
+            changeset.body,
+            "변경사항 3건을 적용하거나 되돌릴지 검토해 주세요."
         );
     }
 

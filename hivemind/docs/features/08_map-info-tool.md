@@ -92,8 +92,26 @@ Validation happens before action accounting; errors are correctable ToolErrors.
 - Real ignored smokes: native copy/rename/re-extract + installed-map terrain render,
   and the full MapSafe/native/journal switch path with exact post-name verification.
 
+## Shared Map Agent context and renderer
+
+The Map Agent reuses the same file authority through `MapContextService`: bridge
+`OpenMapName` resolution, path confinement, saved-path/mtime/file+CHK hashes, tileset, dimensions,
+and CHK digest. It extends rendering without changing the read-only MCP contracts:
+
+- `isom_render_region` returns a bounded RGBA terrain/object/location crop from installed
+  StarCraft DAT/GRP/tileset assets; the Tauri command PNG-encodes it and returns raw binary IPC.
+- `isom_catalog_query` supplies current-tileset semantic brushes, exact CV5 tiles, units,
+  buildings, doodads, and sprites with deterministic fingerprints and thumbnails.
+- ABI-v5 `isom_image_quantize` reuses that same cached CV5/VX4/VR4/WPE snapshot for the
+  Map Agent photo palette, representative colors, graphics-valid tile ids, walkability, and
+  height metadata. Rust/React/model do not add a second StarCraft tile parser.
+- Rust now digests `DD2 ` doodads and `THG2` sprites in addition to the earlier map-info layers.
+  Map Agent object pages are bounded and add revision-bound fingerprints/candidate UUIDs.
+- The existing `map_info` and `map_minimap` MCP tools remain read-only and retain their bounded
+  response/image contracts.
+
 ## Out of scope
 
-- Built `SaveMapName` digestion, THG2 doodad/sprite placement, and map-file watching.
-- Walkability/elevation semantic lookup from VF4 as structured JSON; the current
-  terrain contract exposes exact MTXM tile/group/variant data and visual pixels.
+- Built `SaveMapName` digestion and continuous map-file watching.
+- Walkability/elevation remains catalog metadata rather than an unbounded whole-map structured
+  dump; `map_info(mode=terrain)` retains exact MTXM tile/group/variant data.

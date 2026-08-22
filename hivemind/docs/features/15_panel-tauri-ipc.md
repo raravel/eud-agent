@@ -21,6 +21,7 @@ Commands (panel -> core, `invoke`):
 | `plan_approve {}` | `invoke("plan_approve")` |
 | `changeset_decision {decision, ids}` | `invoke("changeset_decision", { decision, ids })` |
 | `cancel {}` | `invoke("cancel")` |
+| compact current thread | `invoke("compact", { sessionId })` |
 | `conversation_rewind {panelLog}` | `invoke("conversation_rewind", { panelLog })` |
 | `reset {}` | `invoke("reset")` |
 | `status {}` | `invoke("status")` |
@@ -29,6 +30,10 @@ Commands (panel -> core, `invoke`):
 | `memory_save {file, content}` | `invoke("memory_save", { file, content })` |
 | model settings | `invoke("codex_model_settings")` |
 | save model settings | `invoke("codex_model_settings_save", { model, reasoningEffort })` |
+| app settings | `invoke("app_settings")` |
+| save app settings | `invoke("app_settings_save", { settings })` |
+| preview notification sound | `invoke("notification_sound_preview")` |
+| deliver review notification | `invoke("attention_notify", { kind, showOs, sessionId, itemCount? })` |
 
 Events (core -> panel, `listen`):
 | v2 WS message (server->client) | New Tauri event |
@@ -44,15 +49,23 @@ Events (core -> panel, `listen`):
 | `list {files?, error?}` | command return value of `invoke("list")` |
 | `memory {project, files}` | command return value of `invoke("memory_get")` |
 | `memory_saved {file}` | command return value of `invoke("memory_save")` |
+| notification click `{sessionId}` | `listen("notification_activated", ...)` |
 
-`status`/`list`/`memory_get`/`memory_save` and both `codex_model_settings*` calls are
-request/response commands (return the payload from `invoke`; the IPC client dispatches
-`memory`/`memory_saved` payloads to the store from the command return); the remaining server
-messages are push events delivered via `listen`.
+`status`/`list`/`memory_get`/`memory_save`, both `codex_model_settings*` calls,
+`app_settings*`, and `compact` are request/response commands. The IPC client dispatches
+`memory`/`memory_saved` payloads to the store from the command return. The remaining
+server messages are push events delivered via `listen`. `notification_sound_preview` and
+`attention_notify` are fire-and-forget native side effects; the latter reads persisted channel
+settings and receives the panel focus decision plus immutable notification owner through
+`showOs`/`sessionId`. Clicking a toast focuses the main window and emits
+`notification_activated{sessionId}` so the panel selects that session without backend ownership
+changes.
 `chat`/`plan_feedback`/`plan_approve` remain pending while their turn streams and resolve
-when it settles. `cancel` signals interruption immediately but resolves only after the
-app-server's interrupted `turn/completed`; `conversation_rewind` then replaces the active
-session's model-visible history. `changeset_decision`/`reset` retain their command semantics.
+when it settles. `compact` is session-scoped and remains pending from
+`thread/compact/start` until app-server emits the matching completed `contextCompaction` item.
+`cancel` signals interruption immediately but resolves only after the app-server's interrupted
+`turn/completed`; `conversation_rewind` then replaces the active session's model-visible history.
+`changeset_decision`/`reset` retain their command semantics.
 
 ## Removed from the panel
 - WebSocket connect/reconnect logic, `?token=` handshake, Origin assumptions, and the

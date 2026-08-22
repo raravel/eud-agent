@@ -26,6 +26,7 @@ import {
 import { toast } from "sonner";
 import { Toaster } from "@/components/ui/sonner";
 import { Header, type RagState } from "@/components/Header";
+import { SettingsDialog } from "@/components/SettingsDialog";
 import { ConversationLog } from "@/components/ConversationLog";
 import { ChangesetView } from "@/components/ChangesetView";
 import { AskCard } from "@/components/AskCard";
@@ -45,13 +46,19 @@ import { createPanelStore } from "@/state/store";
 import type { LogEntry, PanelStore } from "@/state/store";
 import {
   IpcClient,
+  appSettingsGet,
+  appSettingsSave,
+  attentionNotify,
   codexModelSettingsGet,
   codexModelSettingsSave,
+  compactSession,
   wikiGet,
+  notificationSoundPreview,
   wikiSave,
   workspaceList,
   workspaceRead,
   type AskAnswer,
+  type AppSettings,
   type LedgerEntry,
   type CodexModelSettings,
   type MemoryFile,
@@ -151,6 +158,12 @@ interface SessionSlot {
   changesetOpen: boolean;
 }
 
+type PendingAskSnapshot = {
+  sessionId: string;
+  requestId: string;
+  questions: Parameters<PanelStore["askReceived"]>[1];
+};
+
 
 let draftSequence = 0;
 
@@ -165,6 +178,7 @@ function draftSession(project: string): SessionRecord {
     id: `draft-${draftSequence}`,
     name: "새 대화",
     project,
+    kind: "eps",
     createdAt: Math.floor(now / 1_000),
     lastConversationAt: now,
     threadId: null,
@@ -269,6 +283,9 @@ export default function App() {
   const [codexSettings, setCodexSettings] =
     useState<CodexModelSettings | null>(null);
   const [codexSettingsBusy, setCodexSettingsBusy] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [appSettings, setAppSettings] = useState<AppSettings | null>(null);
+  const [appSettingsBusy, setAppSettingsBusy] = useState(false);
   // Message undo/edit flow: the core must finish cancellation/rewind before the
   // input unlocks. `editDraft` is applied by InstructionBox without controlling
   // subsequent typing.
@@ -358,6 +375,32 @@ export default function App() {
     [attachSlot, bumpSessions, projectStore],
   );
 
+  const syncPendingAsk = useCallback(
+    async (slot: SessionSlot) => {
+      const observedRequestId = slot.store.getState().ask?.requestId;
+      try {
+        const pending = await invoke<PendingAskSnapshot | null>("ask_pending", {
+          sessionId: slot.id,
+        });
+        if (pending !== null && pending.sessionId === slot.id) {
+          slot.activity = "waiting_input";
+          slot.store.askReceived(pending.requestId, pending.questions);
+          bumpSessions();
+          return;
+        }
+        if (
+          observedRequestId !== undefined &&
+          slot.store.getState().ask?.requestId === observedRequestId
+        ) {
+          slot.store.askAnswered();
+        }
+      } catch {
+        // Push events remain the fast path; a failed snapshot must not erase one.
+      }
+    },
+    [bumpSessions],
+  );
+
   const createDraftSlot = useCallback((): SessionSlot => {
     const meta = draftSession(projectStore.getState().project);
     const sessionStore = createPanelStore();
@@ -426,6 +469,47 @@ export default function App() {
     },
     [],
   );
+
+  const loadAppSettings = useCallback(async () => {
+    setAppSettingsBusy(true);
+    try {
+      setAppSettings(await appSettingsGet());
+    } catch {
+      setAppSettings(null);
+      toast.error("앱 설정을 불러오지 못했습니다.");
+    } finally {
+      setAppSettingsBusy(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void loadAppSettings();
+  }, [loadAppSettings]);
+
+  const handleAppSettingsChange = useCallback(
+    async (next: AppSettings) => {
+      const previous = appSettings;
+      setAppSettings(next);
+      setAppSettingsBusy(true);
+      try {
+        setAppSettings(await appSettingsSave(next));
+      } catch {
+        setAppSettings(previous);
+        toast.error("앱 설정을 저장하지 못했습니다.");
+      } finally {
+        setAppSettingsBusy(false);
+      }
+    },
+    [appSettings],
+  );
+
+  const handleNotificationSoundPreview = useCallback(async () => {
+    try {
+      await notificationSoundPreview();
+    } catch {
+      toast.error("알림음을 재생하지 못했습니다.");
+    }
+  }, []);
 
   useEffect(() => {
     bootstrapActiveRef.current = bootstrap.active;
@@ -577,6 +661,13 @@ export default function App() {
           const prior = target.getState().plan;
           if (prior === null || prior.revision !== msg.revision) {
             targetSlot.planOpen = true;
+            void attentionNotify(
+              "planApproval",
+              !document.hasFocus(),
+              targetSlot.id,
+            ).catch(() => {
+              // Delivery is best-effort and must not disturb review state.
+            });
           }
           if (prior !== null && prior.revision !== msg.revision) {
             target.log("agent", `계획안(rev ${prior.revision})이 갱신되었습니다.`);
@@ -594,6 +685,14 @@ export default function App() {
           const prior = target.getState().changeset;
           if (prior === null || prior.request_id !== msg.request_id) {
             targetSlot.changesetOpen = true;
+            void attentionNotify(
+              "changesetReview",
+              !document.hasFocus(),
+              targetSlot.id,
+              msg.items.length,
+            ).catch(() => {
+              // Delivery is best-effort and must not disturb review state.
+            });
           }
           target.changesetReceived(msg.request_id, msg.items);
           target.log("agent", `변경사항 ${msg.items.length}건을 검토하세요.`);
@@ -657,8 +756,12 @@ export default function App() {
         if (open) projectStore.wsOpen();
         else projectStore.wsError();
         for (const slot of sessionsRef.current.values()) {
-          if (open) slot.store.wsOpen();
-          else slot.store.wsError();
+          if (open) {
+            slot.store.wsOpen();
+            void syncPendingAsk(slot);
+          } else {
+            slot.store.wsError();
+          }
         }
       },
       onEditorChange: (connected) => {
@@ -678,7 +781,7 @@ export default function App() {
       client.stop();
       clientRef.current = null;
     };
-  }, [onMessage, projectStore]);
+  }, [onMessage, projectStore, syncPendingAsk]);
 
   // `session_loaded` is a SIGNAL only (features/sessions.md): the core emits it
   // after a session_open reconnect completes. Its payload carries nothing
@@ -754,6 +857,7 @@ export default function App() {
             .then((record) => {
               slot.meta = record;
               bumpSessions();
+              void syncPendingAsk(slot);
             })
             .catch((error) => {
               slot.activity = "error";
@@ -764,6 +868,7 @@ export default function App() {
               bumpSessions();
             });
         }
+        for (const slot of slots) void syncPendingAsk(slot);
         const first = slots[0] ?? createDraftSlot();
         setSelectedSessionId(first.id);
         selectedSessionIdRef.current = first.id;
@@ -788,6 +893,7 @@ export default function App() {
     projectState.hasProject,
     projectState.project,
     registerSession,
+    syncPendingAsk,
   ]);
 
   // Setup flow, download step: once the editor folder is picked (or was already
@@ -825,6 +931,46 @@ export default function App() {
   // within that session and queues only declared project write transactions.
   const handleSend = useCallback(
     async (payload: ChatPayload) => {
+      const compactRequested =
+        payload.text.trim() === "/compact" && payload.attachments.length === 0;
+      if (compactRequested) {
+        setEditDraft(null);
+        const slot = selectedSlot;
+        if (!slot?.persisted) {
+          toast.error("압축할 대화가 없습니다. 먼저 메시지를 보내 주세요.");
+          return;
+        }
+        const snapshot = slot.store.getState();
+        if (
+          messageActionBusyRef.current ||
+          snapshot.phase === "thinking" ||
+          snapshot.phase === "changeset_review" ||
+          (slot.activity !== "idle" &&
+            slot.activity !== "error" &&
+            slot.activity !== "review")
+        ) {
+          slot.store.log("warn", "현재 작업이 끝난 뒤 대화를 압축해 주세요.");
+          return;
+        }
+
+        messageActionBusyRef.current = true;
+        setMessageActionBusy(true);
+        slot.store.log("info", "대화 컨텍스트 압축 중…");
+        try {
+          await compactSession(slot.id);
+          slot.store.log("ok", "대화 컨텍스트를 압축했습니다.");
+        } catch (error) {
+          slot.store.log(
+            "error",
+            `대화 컨텍스트를 압축하지 못했습니다: ${String(error)}`,
+          );
+        } finally {
+          messageActionBusyRef.current = false;
+          setMessageActionBusy(false);
+        }
+        return;
+      }
+
       const slot = selectedSlot ?? createDraftSlot();
       setEditDraft(null);
       if (slot.store.getState().phase === "changeset_review") {
@@ -995,6 +1141,28 @@ export default function App() {
     },
     [],
   );
+
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    let cancelled = false;
+    void listen<unknown>("notification_activated", ({ payload }) => {
+      const sessionId =
+        typeof payload === "object" &&
+        payload !== null &&
+        "sessionId" in payload &&
+        typeof payload.sessionId === "string"
+          ? payload.sessionId
+          : null;
+      if (sessionId) handleSessionSelect(sessionId);
+    }).then((fn) => {
+      if (cancelled) fn();
+      else unlisten = fn;
+    });
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, [handleSessionSelect]);
 
   const handleSessionRename = useCallback(
     (id: string, name: string) => {
@@ -1382,6 +1550,11 @@ export default function App() {
         store.log("error", message);
       });
   }, [store]);
+  const handleOpenMapAgent = useCallback(() => {
+    void invoke("map_agent_open").catch(() => {
+      toast.error("Map Agent 창을 열지 못했습니다.");
+    });
+  }, []);
 
   const handleMemorySave = useCallback(
     async ({ file, content }: { file: MemoryFile; content: string }) => {
@@ -1473,8 +1646,22 @@ export default function App() {
           hasProject={projectState.hasProject}
           launchPending={launchPending}
           onLaunchEditor={handleLaunchEditor}
+          onOpenMapAgent={handleOpenMapAgent}
           projectPanelOpen={projectSidebarOpen}
           onProjectPanelToggle={handleProjectPanelToggle}
+          onSettingsOpen={() => setSettingsOpen(true)}
+        />
+        <SettingsDialog
+          open={settingsOpen}
+          settings={appSettings}
+          codexSettings={codexSettings}
+          busy={appSettingsBusy}
+          codexBusy={!editorPollEnabled || codexSettingsBusy}
+          onOpenChange={setSettingsOpen}
+          onSettingsChange={handleAppSettingsChange}
+          onReload={loadAppSettings}
+          onCodexReload={loadCodexModelSettings}
+          onPreviewSound={handleNotificationSoundPreview}
         />
 
         {update && !updateDismissed && (

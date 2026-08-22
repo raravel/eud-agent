@@ -2,6 +2,7 @@
 // Reuses the exact API patterns from IsomTests.cpp (newMap/placeTerrain),
 // kept in an anonymous namespace to avoid ODR collisions with IsomTests.cpp.
 #include "IsomApi.h"
+#include "MapAgentCore.h"
 #include "../CrossCutLib/Logger.h"
 #include "../MappingCoreLib/MappingCore.h"
 #include <algorithm>
@@ -1236,54 +1237,41 @@ namespace
             std::cerr << "Failed to open map: " << mapPath << std::endl;
             return 1;
         }
-        const std::vector<ArchiveFilePtr> orderedSourceFiles = openScDataFilesSilent(starcraftPath);
-        if ( orderedSourceFiles.empty() )
-        {
-            std::cerr << "Failed to open StarCraft data files at: " << starcraftPath << std::endl;
-            return 1;
-        }
-        const auto tileset = Sc::Terrain::Tileset(size_t(mapFile->getTileset()) % Sc::Terrain_::NumTilesets);
-        Sc::Terrain::Tiles tilesetData {};
-        if ( !tilesetData.load(size_t(tileset), orderedSourceFiles, Sc::Terrain::TilesetNames[size_t(tileset)]) )
-        {
-            std::cerr << "Failed to load tileset graphics (cv5/vx4/vr4/wpe)" << std::endl;
-            return 1;
-        }
         const size_t w = mapFile->getTileWidth(), h = mapFile->getTileHeight();
-        const size_t imgW = w * 32 / scale, imgH = h * 32 / scale;
+        std::ostringstream request;
+        request << "{\"schema\":\"eud-map-render/1\",\"mode\":\"region\",\"x\":0,\"y\":0,"
+                << "\"width\":" << w << ",\"height\":" << h << ",\"scale\":" << scale
+                << ",\"layers\":[\"terrain\"]}";
+        std::vector<std::uint8_t> rgba;
+        std::uint32_t renderedWidth = 0;
+        std::uint32_t renderedHeight = 0;
+        const std::string requestJson = request.str();
+        if ( mapagent::renderRegion(mapPath.c_str(), starcraftPath.c_str(),
+                reinterpret_cast<const std::uint8_t*>(requestJson.data()), requestJson.size(),
+                rgba, renderedWidth, renderedHeight) != 0 )
+        {
+            std::cerr << "Failed to render map terrain" << std::endl;
+            return 1;
+        }
+        const size_t imgW = renderedWidth, imgH = renderedHeight;
+        if ( imgW != w * 32 / scale || imgH != h * 32 / scale ||
+             rgba.size() != imgW * imgH * 4 )
+        {
+            std::cerr << "Rendered terrain dimensions are inconsistent" << std::endl;
+            return 1;
+        }
         const size_t rowBytes = (imgW * 3 + 3) & ~size_t(3); // BMP 4바이트 정렬
 
         std::vector<uint8_t> pixels(rowBytes * imgH, 0);
         for ( size_t py = 0; py < imgH; ++py )
         {
-            const size_t mapPy = py * scale;             // 맵 픽셀 y
-            const size_t ty = mapPy / 32;
             for ( size_t px = 0; px < imgW; ++px )
             {
-                const size_t mapPx = px * scale;
-                const size_t tx = mapPx / 32;
-                const uint16_t v = mapFile->tiles[ty * w + tx];
-                const size_t group = size_t(v) / 16;
-                if ( group >= tilesetData.tileGroups.size() )
-                    continue;
-                const uint16_t megaIdx = tilesetData.tileGroups[group].megaTileIndex[v % 16];
-                if ( size_t(megaIdx) >= tilesetData.tileGraphics.size() )
-                    continue;
-                const auto & mini = tilesetData.tileGraphics[megaIdx]
-                    .miniTileGraphics[(mapPy % 32) / 8][(mapPx % 32) / 8];
-                const size_t vr4 = mini.vr4Index();
-                if ( vr4 >= tilesetData.miniTilePixels.size() )
-                    continue;
-                size_t subX = mapPx % 8;
-                if ( mini.isFlipped() )
-                    subX = 7 - subX;
-                const uint8_t wpe = tilesetData.miniTilePixels[vr4].wpeIndex[mapPy % 8][subX];
-                const auto & color = tilesetData.systemColorPalette[wpe];
-                // BMP는 하단행부터: (imgH-1-py)
-                uint8_t* dst = &pixels[(imgH - 1 - py) * rowBytes + px * 3];
-                dst[0] = color.blue;
-                dst[1] = color.green;
-                dst[2] = color.red;
+                const std::uint8_t* source = &rgba[(py * imgW + px) * 4];
+                uint8_t* destination = &pixels[(imgH - 1 - py) * rowBytes + px * 3];
+                destination[0] = source[2];
+                destination[1] = source[1];
+                destination[2] = source[0];
             }
         }
 

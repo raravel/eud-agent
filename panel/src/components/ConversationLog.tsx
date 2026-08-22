@@ -24,7 +24,7 @@ import {
   SparklesIcon,
   WrenchIcon,
 } from "lucide-react";
-import { useMemo } from "react";
+import { useMemo, type ReactNode } from "react";
 import {
   measureElement as measureVirtualElement,
   observeElementRect as observeVirtualElementRect,
@@ -73,6 +73,13 @@ export interface ConversationLogProps {
   onEditMessage?: (entry: LogEntry) => void;
   /** Disable edit actions while cancel/rewind is settling in the core. */
   editDisabled?: boolean;
+  /** Product-specific copy while retaining the shared empty-state layout. */
+  emptyTitle?: string;
+  emptyDescription?: string;
+  /** Optional structured metadata rendered inside a user message bubble. */
+  renderUserMeta?: (entry: LogEntry) => ReactNode;
+  /** Session-scoped interactive card appended after the live turn. */
+  tail?: ReactNode;
 }
 
 /** Example instructions shown in the empty conversation (click → send). */
@@ -101,7 +108,8 @@ type ConversationRow =
   | { key: string; type: "log"; entry: LogEntry }
   | { key: "empty"; type: "empty" }
   | { key: "rag"; type: "rag" }
-  | { key: "live"; type: "live" };
+  | { key: "live"; type: "live" }
+  | { key: "tail"; type: "tail"; node: ReactNode };
 
 interface RowRenderContext {
   phase: Phase;
@@ -111,6 +119,9 @@ interface RowRenderContext {
   suggestionsEnabled: boolean;
   onEditMessage?: (entry: LogEntry) => void;
   editDisabled: boolean;
+  emptyTitle: string;
+  emptyDescription: string;
+  renderUserMeta?: (entry: LogEntry) => ReactNode;
 }
 
 export function ConversationLog({
@@ -122,6 +133,10 @@ export function ConversationLog({
   suggestionsEnabled = true,
   onEditMessage,
   editDisabled = false,
+  emptyTitle = "무엇을 만들까요?",
+  emptyDescription = "자연어로 지시하면 epScript 코드를 만들어 에디터에 적용합니다.",
+  renderUserMeta,
+  tail,
 }: ConversationLogProps) {
   const busy = BUSY_PHASES.has(phase);
   const activeProgressId = useMemo(() => {
@@ -149,8 +164,11 @@ export function ConversationLog({
     if (empty) next.push({ key: "empty", type: "empty" });
     if (ragLoading) next.push({ key: "rag", type: "rag" });
     if (hasLiveTurn) next.push({ key: "live", type: "live" });
+    if (tail !== undefined && tail !== null) {
+      next.push({ key: "tail", type: "tail", node: tail });
+    }
     return next;
-  }, [empty, hasLiveTurn, log, ragLoading]);
+  }, [empty, hasLiveTurn, log, ragLoading, tail]);
 
   return (
     <Conversation className="flex-1">
@@ -165,6 +183,9 @@ export function ConversationLog({
             suggestionsEnabled,
             onEditMessage,
             editDisabled,
+            emptyTitle,
+            emptyDescription,
+            renderUserMeta,
           }}
         />
       </ConversationContent>
@@ -233,6 +254,7 @@ function estimateRowSize(row: ConversationRow | undefined): number {
   if (row.type === "empty") return 300;
   if (row.type === "rag") return 32;
   if (row.type === "live") return 160;
+  if (row.type === "tail") return 280;
   if (row.entry.kind === "agent") return 140;
   if (row.entry.kind === "you") return 120;
   if (row.entry.tools !== undefined) return 96;
@@ -254,9 +276,9 @@ function renderRow(row: ConversationRow, context: RowRenderContext) {
             <SparklesIcon className="size-6" />
           </span>
           <div className="grid gap-1">
-            <p className="text-base font-semibold">무엇을 만들까요?</p>
+            <p className="text-base font-semibold">{context.emptyTitle}</p>
             <p className="text-sm text-muted-foreground">
-              자연어로 지시하면 epScript 코드를 만들어 에디터에 적용합니다.
+              {context.emptyDescription}
             </p>
           </div>
           {context.onSuggestion && (
@@ -289,6 +311,8 @@ function renderRow(row: ConversationRow, context: RowRenderContext) {
       );
     case "live":
       return renderLiveTurn(context.turn, context.phase);
+    case "tail":
+      return row.node;
     case "log":
       return renderLogEntry(row.entry, context);
   }
@@ -357,6 +381,7 @@ function renderLogEntry(entry: LogEntry, context: RowRenderContext) {
           {entry.text.length > 0 && (
             <span className="whitespace-pre-wrap">{entry.text}</span>
           )}
+          {context.renderUserMeta?.(entry)}
         </MessageContent>
         {context.onEditMessage && (
           <button

@@ -42,6 +42,8 @@ const RAW_SNIPPET_LIMIT: usize = 500;
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(600);
 const APP_SERVER_STDERR_TAIL_LIMIT: usize = 4 * 1024;
 const APP_SERVER_EXIT_DIAGNOSTIC_WAIT: Duration = Duration::from_millis(50);
+pub(crate) const LARGE_CONTEXT_WINDOW_TOKENS: i64 = 1_000_000;
+const LARGE_CONTEXT_AUTO_COMPACT_TOKENS: i64 = 900_000;
 
 /// Windows `CREATE_NO_WINDOW` process-creation flag. The GUI app is windowless,
 /// so spawning the `codex.cmd` batch shim would otherwise flash a console window
@@ -460,6 +462,8 @@ pub enum AppServerEvent {
     ItemCompleted {
         item_id: Option<String>,
     },
+    ContextCompactionStarted,
+    ContextCompactionCompleted,
     /// A tool-like thread item opened (mcpToolCall / commandExecution /
     /// webSearch) — carries the tool name + argument text so the panel can
     /// render a live Tool card (EUD-068 classification, ported from v1).
@@ -674,6 +678,7 @@ pub struct CodexAppServerClient<R, W> {
     next_id: u64,
     initialized: bool,
     model_selection: Option<CodexModelSelection>,
+    large_context_enabled: bool,
     mcp_server_url: Option<String>,
     thread_id: std::sync::Arc<tokio::sync::Mutex<Option<String>>>,
     thread_started: std::sync::Arc<tokio::sync::Notify>,
@@ -721,6 +726,7 @@ where
                 next_id: 1,
                 initialized: false,
                 model_selection: None,
+                large_context_enabled: false,
                 mcp_server_url: None,
                 thread_id,
                 thread_started,
@@ -853,6 +859,23 @@ where
     pub(crate) fn set_model_selection(&mut self, selection: Option<CodexModelSelection>) {
         self.model_selection = selection;
     }
+    pub(crate) fn set_large_context_enabled(&mut self, enabled: bool) {
+        self.large_context_enabled = enabled;
+    }
+
+    pub async fn start_compaction(&mut self) -> Result<(), AppServerError> {
+        self.ensure_initialized().await?;
+        let thread_id = self
+            .current_thread_id()
+            .await
+            .ok_or_else(|| AppServerError::new("압축할 Codex 대화가 없습니다."))?;
+        self.send_request(
+            "thread/compact/start",
+            serde_json::json!({ "threadId": thread_id }),
+        )
+        .await?;
+        Ok(())
+    }
 
     pub async fn run_turn(&mut self, input: CodexTurnInput) -> Result<(), AppServerError> {
         let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(0_u64);
@@ -885,6 +908,7 @@ where
                         &thread_id,
                         input.workspace_root.as_deref(),
                         self.mcp_server_url.as_deref(),
+                        self.large_context_enabled,
                     )?,
                 )
                 .await?;
@@ -896,6 +920,7 @@ where
                     thread_start_params(
                         input.workspace_root.as_deref(),
                         self.mcp_server_url.as_deref(),
+                        self.large_context_enabled,
                     )?,
                 )
                 .await?;
@@ -1069,6 +1094,7 @@ pub(crate) fn app_server_config_overrides(access: WorkspaceAccess) -> Vec<String
 fn thread_start_params(
     workspace_root: Option<&Path>,
     mcp_server_url: Option<&str>,
+    large_context_enabled: bool,
 ) -> Result<serde_json::Value, AppServerError> {
     let mut params = serde_json::json!({ "approvalPolicy": "on-request" });
     if let Some(workspace_root) = workspace_root {
@@ -1076,8 +1102,8 @@ fn thread_start_params(
     } else {
         params["sandboxPolicy"] = serde_json::json!({ "type": "readOnly", "networkAccess": false });
     }
-    if let Some(url) = mcp_server_url {
-        params["config"] = eud_tools_thread_config(url);
+    if let Some(config) = thread_config(mcp_server_url, large_context_enabled) {
+        params["config"] = config;
     }
     Ok(params)
 }
@@ -1086,25 +1112,44 @@ fn thread_resume_params(
     thread_id: &str,
     workspace_root: Option<&Path>,
     mcp_server_url: Option<&str>,
+    large_context_enabled: bool,
 ) -> Result<serde_json::Value, AppServerError> {
     let mut params = serde_json::json!({ "threadId": thread_id });
     if let Some(workspace_root) = workspace_root {
         params["cwd"] = serde_json::json!(path_text(workspace_root)?);
     }
-    if let Some(url) = mcp_server_url {
-        params["config"] = eud_tools_thread_config(url);
+    if let Some(config) = thread_config(mcp_server_url, large_context_enabled) {
+        params["config"] = config;
     }
     Ok(params)
 }
 
-fn eud_tools_thread_config(url: &str) -> serde_json::Value {
-    serde_json::json!({
-        "mcp_servers": {
-            "eud-tools": {
-                "url": url,
-            },
-        },
-    })
+fn thread_config(
+    mcp_server_url: Option<&str>,
+    large_context_enabled: bool,
+) -> Option<serde_json::Value> {
+    let mut config = serde_json::Map::new();
+    if let Some(url) = mcp_server_url {
+        config.insert(
+            "mcp_servers".to_string(),
+            serde_json::json!({
+                "eud-tools": {
+                    "url": url,
+                },
+            }),
+        );
+    }
+    if large_context_enabled {
+        config.insert(
+            "model_context_window".to_string(),
+            serde_json::json!(LARGE_CONTEXT_WINDOW_TOKENS),
+        );
+        config.insert(
+            "model_auto_compact_token_limit".to_string(),
+            serde_json::json!(LARGE_CONTEXT_AUTO_COMPACT_TOKENS),
+        );
+    }
+    (!config.is_empty()).then_some(serde_json::Value::Object(config))
 }
 
 fn path_text(path: &Path) -> Result<String, AppServerError> {
@@ -1435,19 +1480,19 @@ async fn handle_notification(
             // Tool-like items (mcpToolCall / commandExecution / webSearch) map to a
             // ToolCallStarted carrying the tool name + args so the panel renders a
             // Tool card (EUD-068); everything else keeps the bare item signal.
-            let event = tool_event_from_item(params, false).unwrap_or_else(|| {
-                AppServerEvent::ItemStarted {
+            let event = context_compaction_event(params, false)
+                .or_else(|| tool_event_from_item(params, false))
+                .unwrap_or_else(|| AppServerEvent::ItemStarted {
                     item_id: string_param(params, &["itemId", "item_id", "id"]),
-                }
-            });
+                });
             send_event(events_tx, event).await
         }
         "item/completed" => {
-            let event = tool_event_from_item(params, true).unwrap_or_else(|| {
-                AppServerEvent::ItemCompleted {
+            let event = context_compaction_event(params, true)
+                .or_else(|| tool_event_from_item(params, true))
+                .unwrap_or_else(|| AppServerEvent::ItemCompleted {
                     item_id: string_param(params, &["itemId", "item_id", "id"]),
-                }
-            });
+                });
             send_event(events_tx, event).await
         }
         "turn/completed" => {
@@ -1469,6 +1514,19 @@ async fn handle_notification(
         }
         _ => true,
     }
+}
+fn context_compaction_event(
+    params: Option<&serde_json::Value>,
+    completed: bool,
+) -> Option<AppServerEvent> {
+    if params?.pointer("/item/type")?.as_str()? != "contextCompaction" {
+        return None;
+    }
+    Some(if completed {
+        AppServerEvent::ContextCompactionCompleted
+    } else {
+        AppServerEvent::ContextCompactionStarted
+    })
 }
 
 async fn send_event(
@@ -1740,7 +1798,7 @@ mod app_server_override_tests {
 
     #[test]
     fn thread_start_uses_readonly_without_a_project_workspace() {
-        let params = super::thread_start_params(None, None).unwrap();
+        let params = super::thread_start_params(None, None, false).unwrap();
         assert_eq!(
             params["sandboxPolicy"]["type"],
             serde_json::json!("readOnly")
@@ -1755,9 +1813,56 @@ mod app_server_override_tests {
     #[test]
     fn thread_start_uses_custom_profile_for_project_workspace() {
         let params =
-            super::thread_start_params(Some(std::path::Path::new("C:\\workspace")), None).unwrap();
+            super::thread_start_params(Some(std::path::Path::new("C:\\workspace")), None, false)
+                .unwrap();
         assert_eq!(params["cwd"], serde_json::json!("C:\\workspace"));
         assert!(params.get("sandboxPolicy").is_none());
+    }
+    #[test]
+    fn large_context_opt_in_sets_native_window_and_auto_compaction_limit() {
+        let params =
+            super::thread_start_params(None, Some("http://127.0.0.1:54321/mcp"), true).unwrap();
+        assert_eq!(
+            params.pointer("/config/model_context_window"),
+            Some(&serde_json::json!(1_000_000))
+        );
+        assert_eq!(
+            params.pointer("/config/model_auto_compact_token_limit"),
+            Some(&serde_json::json!(900_000))
+        );
+        assert_eq!(
+            params.pointer("/config/mcp_servers/eud-tools/url"),
+            Some(&serde_json::json!("http://127.0.0.1:54321/mcp"))
+        );
+    }
+}
+
+#[cfg(test)]
+mod compaction_item_tests {
+    use super::{context_compaction_event, AppServerEvent};
+    use serde_json::json;
+
+    #[test]
+    fn native_context_compaction_items_have_distinct_lifecycle_events() {
+        let params = json!({
+            "threadId": "thread-1",
+            "item": {"id": "compact-1", "type": "contextCompaction"}
+        });
+        assert_eq!(
+            context_compaction_event(Some(&params), false),
+            Some(AppServerEvent::ContextCompactionStarted)
+        );
+        assert_eq!(
+            context_compaction_event(Some(&params), true),
+            Some(AppServerEvent::ContextCompactionCompleted)
+        );
+        assert_eq!(
+            context_compaction_event(
+                Some(&json!({"item": {"id": "message-1", "type": "agentMessage"}})),
+                false,
+            ),
+            None
+        );
     }
 }
 
@@ -2161,6 +2266,74 @@ mod appserver_tests {
             .await
             .expect("timed out waiting for app-server event")
             .expect("app-server event channel closed")
+    }
+
+    #[tokio::test]
+    async fn manual_compaction_uses_native_thread_request_and_events() {
+        let (client_write, server_read) = tokio::io::duplex(16 * 1024);
+        let (server_write, client_read) = tokio::io::duplex(16 * 1024);
+
+        let stub = tokio::spawn(async move {
+            let mut client_requests = BufReader::new(server_read).lines();
+            let mut server_responses = server_write;
+
+            let initialize = read_json_line(&mut client_requests).await;
+            let initialize_id = assert_client_request(&initialize, "initialize");
+            write_json_line(
+                &mut server_responses,
+                json!({"jsonrpc":"2.0","id":initialize_id,"result":{"protocolVersion":1}}),
+            )
+            .await;
+            let initialized = read_json_line(&mut client_requests).await;
+            assert_initialized_notification(&initialized);
+
+            let compact = read_json_line(&mut client_requests).await;
+            let compact_id = assert_client_request(&compact, "thread/compact/start");
+            assert_eq!(
+                compact.pointer("/params/threadId").and_then(Value::as_str),
+                Some("thread-compact")
+            );
+            write_json_line(
+                &mut server_responses,
+                json!({"jsonrpc":"2.0","id":compact_id,"result":{}}),
+            )
+            .await;
+            write_json_line(
+                &mut server_responses,
+                json!({
+                    "jsonrpc":"2.0",
+                    "method":"item/started",
+                    "params":{"threadId":"thread-compact","item":{"id":"compact-1","type":"contextCompaction"}}
+                }),
+            )
+            .await;
+            write_json_line(
+                &mut server_responses,
+                json!({
+                    "jsonrpc":"2.0",
+                    "method":"item/completed",
+                    "params":{"threadId":"thread-compact","item":{"id":"compact-1","type":"contextCompaction"}}
+                }),
+            )
+            .await;
+        });
+
+        let (mut client, mut events) =
+            CodexAppServerClient::new_with_stdio(client_read, client_write);
+        client.set_thread_id("thread-compact".to_string()).await;
+        client
+            .start_compaction()
+            .await
+            .expect("native compaction request should start");
+        assert_eq!(
+            next_event(&mut events).await,
+            AppServerEvent::ContextCompactionStarted
+        );
+        assert_eq!(
+            next_event(&mut events).await,
+            AppServerEvent::ContextCompactionCompleted
+        );
+        stub.await.expect("app-server stub should complete");
     }
 
     #[tokio::test]

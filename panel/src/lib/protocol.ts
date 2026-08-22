@@ -31,6 +31,8 @@ export const PROGRESS_STAGES = [
   "rag",
   "rag_warmup",
   "codex",
+  "compaction",
+  "large_context_fallback",
   "workspace",
   "lsp",
   "waiting_build",
@@ -377,6 +379,8 @@ export interface SessionMeta {
   name: string;
   /** Editor project name captured at session creation. */
   project: string;
+  /** Missing only in legacy records; the Rust backend migrates it to `eps`. */
+  kind?: "eps" | "map";
   createdAt: number;
   lastConversationAt: number;
 }

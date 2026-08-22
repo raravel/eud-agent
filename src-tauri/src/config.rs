@@ -10,6 +10,7 @@
 //! `config.json` is written UTF-8 **without BOM** (rules.md: a BOM breaks first-line
 //! command parsing on the bridge side and we keep every app-written file BOM-free).
 
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -36,6 +37,39 @@ pub struct AssetSpec {
     pub version: String,
 }
 
+fn notification_enabled_by_default() -> bool {
+    true
+}
+
+/// Delivery channels for one user-attention event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NotificationChannelSettings {
+    #[serde(default = "notification_enabled_by_default")]
+    pub sound: bool,
+    #[serde(default = "notification_enabled_by_default")]
+    pub os_notification: bool,
+}
+
+impl Default for NotificationChannelSettings {
+    fn default() -> Self {
+        Self {
+            sound: true,
+            os_notification: true,
+        }
+    }
+}
+
+/// Persisted attention-notification preferences.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NotificationSettings {
+    #[serde(default)]
+    pub plan_approval: NotificationChannelSettings,
+    #[serde(default)]
+    pub changeset_review: NotificationChannelSettings,
+}
+
 /// `config.json` contents (feature 10).
 ///
 /// Every field carries a serde default so a partial / first-run file (e.g. `{}`)
@@ -55,6 +89,12 @@ pub struct Config {
     /// Reasoning effort selected for [`Self::codex_model`].
     #[serde(default)]
     pub codex_reasoning_effort: Option<String>,
+    /// Codex model slugs opted into the 1M context-window override.
+    #[serde(default)]
+    pub codex_large_context_models: BTreeSet<String>,
+    /// User-attention notification channels.
+    #[serde(default)]
+    pub notifications: NotificationSettings,
     /// The embedding model asset.
     #[serde(default)]
     pub model: AssetSpec,
@@ -156,6 +196,10 @@ impl DataDirs {
     pub fn map_backups_dir(&self) -> PathBuf {
         self.app_data.join("map_backups")
     }
+    /// `%appdata%\eud-agent\map_candidates` — isolated candidate documents.
+    pub fn map_candidates_dir(&self) -> PathBuf {
+        self.app_data.join("map_candidates")
+    }
 
     /// `%appdata%\eud-agent\memory\<sanitized-project>\wiki` — the dat-edit ledger
     /// dir for `project`. Derived from [`Self::memory_dir`] + the SAME
@@ -231,6 +275,7 @@ impl DataDirs {
             self.workspace_state_dir(),
             self.session_workspaces_dir(),
             self.map_backups_dir(),
+            self.map_candidates_dir(),
             self.journal_dir(),
             self.sessions_dir(),
             self.app_local_data.clone(),
@@ -299,6 +344,8 @@ mod tests {
             codex_cmd: Some("C:\\tools\\codex.cmd".to_string()),
             codex_model: Some("gpt-5.5-codex".to_string()),
             codex_reasoning_effort: Some("high".to_string()),
+            codex_large_context_models: BTreeSet::from(["gpt-5.5-codex".to_string()]),
+            notifications: NotificationSettings::default(),
             model: AssetSpec {
                 name: "BAAI/bge-m3".to_string(),
                 sha256: "deadbeef".to_string(),
@@ -322,7 +369,21 @@ mod tests {
         let back: Config = serde_json::from_str("{}").unwrap();
         assert_eq!(back.editor_path, "");
         assert_eq!(back.codex_cmd, None);
+        assert!(back.codex_large_context_models.is_empty());
         assert_eq!(back.model, AssetSpec::default());
+        assert_eq!(back.notifications, NotificationSettings::default());
+    }
+
+    #[test]
+    fn partial_notification_settings_keep_unspecified_channels_enabled() {
+        let back: Config =
+            serde_json::from_str(r#"{"notifications":{"planApproval":{"sound":false}}}"#).unwrap();
+        assert!(!back.notifications.plan_approval.sound);
+        assert!(back.notifications.plan_approval.os_notification);
+        assert_eq!(
+            back.notifications.changeset_review,
+            NotificationChannelSettings::default()
+        );
     }
 
     #[test]

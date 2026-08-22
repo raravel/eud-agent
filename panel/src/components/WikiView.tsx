@@ -331,15 +331,17 @@ export function WikiView({ wiki, onClose, onSave, embedded = false }: WikiViewPr
         <h2 className="min-w-0 flex-1 truncate text-sm font-semibold" title={title}>
           {title}
         </h2>
-        <Button
-          type="button"
-          size="icon"
-          variant="ghost"
-          aria-label="닫기"
-          onClick={onClose}
-        >
-          <X className="size-4" aria-hidden="true" />
-        </Button>
+        {!embedded && (
+          <Button
+            type="button"
+            size="icon"
+            variant="ghost"
+            aria-label="닫기"
+            onClick={onClose}
+          >
+            <X className="size-4" aria-hidden="true" />
+          </Button>
+        )}
       </div>
 
       {/* Sliding 3-depth track (forward = slide left, back = slide right). */}

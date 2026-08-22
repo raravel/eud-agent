@@ -6,10 +6,12 @@
 
 use std::collections::HashSet;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 
 pub const MAX_ATTACHMENTS_PER_TURN: usize = 5;
 pub const MAX_IMAGE_BYTES: usize = 10 * 1024 * 1024;
@@ -37,8 +39,15 @@ pub struct AttachmentDescriptor {
 }
 
 #[derive(Debug, Clone)]
+pub struct ResolvedImageAttachment {
+    pub descriptor: AttachmentDescriptor,
+    pub path: PathBuf,
+    pub sha256: String,
+}
+#[derive(Debug, Clone)]
 pub struct AttachmentContext {
     pub image_paths: Vec<PathBuf>,
+    pub images: Vec<ResolvedImageAttachment>,
     pub text_files: Vec<(String, String)>,
 }
 
@@ -203,12 +212,21 @@ impl AttachmentStore {
         }
 
         let mut image_paths = Vec::new();
+        let mut images = Vec::new();
         let mut text_files = Vec::new();
         for (mut meta, content_path) in loaded {
             meta.session_id = Some(session_id.to_string());
             self.write_meta(&meta)?;
             match meta.descriptor.kind {
-                AttachmentKind::Image => image_paths.push(content_path),
+                AttachmentKind::Image => {
+                    let sha256 = file_sha256(&content_path)?;
+                    image_paths.push(content_path.clone());
+                    images.push(ResolvedImageAttachment {
+                        descriptor: meta.descriptor,
+                        path: content_path,
+                        sha256,
+                    });
+                }
                 AttachmentKind::Text => {
                     let content = fs::read_to_string(&content_path).map_err(|error| {
                         format!(
@@ -223,8 +241,21 @@ impl AttachmentStore {
 
         Ok(AttachmentContext {
             image_paths,
+            images,
             text_files,
         })
+    }
+
+    pub fn bind_and_resolve_image(
+        &self,
+        id: &str,
+        session_id: &str,
+    ) -> Result<ResolvedImageAttachment, String> {
+        let mut context = self.bind_and_resolve(&[id.to_string()], session_id)?;
+        context
+            .images
+            .pop()
+            .ok_or_else(|| "선택한 첨부 파일은 지원 이미지가 아닙니다.".to_string())
     }
 
     pub fn discard_draft(&self, id: &str) -> Result<(), String> {
@@ -398,6 +429,23 @@ fn detect_image(bytes: &[u8]) -> Option<(&'static str, &'static str)> {
     } else {
         None
     }
+}
+
+fn file_sha256(path: &Path) -> Result<String, String> {
+    let mut file =
+        fs::File::open(path).map_err(|error| format!("첨부 이미지를 읽을 수 없습니다: {error}"))?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let count = file
+            .read(&mut buffer)
+            .map_err(|error| format!("첨부 이미지를 읽을 수 없습니다: {error}"))?;
+        if count == 0 {
+            break;
+        }
+        digest.update(&buffer[..count]);
+    }
+    Ok(format!("{:x}", digest.finalize()))
 }
 
 fn validate_id(id: &str) -> Result<(), String> {

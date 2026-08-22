@@ -33,6 +33,7 @@ use tauri::Emitter;
 use tokio::process::{ChildStdin, ChildStdout};
 
 const FIRST_PRINCIPLES: &str = include_str!("data/first_principles.md");
+const LARGE_CONTEXT_EFFECTIVE_MIN_TOKENS: i64 = 900_000;
 
 const INTRO: &str = "You are the EUD Editor 3 agent. You work in a durable, sandboxed \
 project filesystem and edit the live StarCraft EUD map through eud-tools. The server \
@@ -193,6 +194,7 @@ pub(crate) trait CodexDriver {
         &mut self,
         input: CodexTurnInput,
     ) -> Result<CodexTurnResult, AgentEngineError>;
+    async fn compact_thread(&mut self) -> Result<(), AgentEngineError>;
     async fn reset_thread(&mut self) -> Result<(), AgentEngineError>;
 
     /// The live codex thread id, captured once `ThreadStarted` has arrived (session
@@ -361,6 +363,7 @@ pub(crate) struct AgentEngine<D: CodexDriver, S: EventSink> {
     current_request_id: Option<String>,
     session_id: String,
     project_id: String,
+    session_kind: crate::session::SessionKind,
     pending_write: Option<WriteContinuation>,
     pending_resume_transcript: Option<String>,
     session_store: crate::session::SessionStore,
@@ -393,6 +396,7 @@ impl<D: CodexDriver, S: EventSink> AgentEngine<D, S> {
             current_request_id: None,
             session_id: session.meta.id,
             project_id: session.meta.project,
+            session_kind: session.meta.kind,
             pending_write: None,
             pending_resume_transcript: None,
             session_store,
@@ -404,6 +408,34 @@ impl<D: CodexDriver, S: EventSink> AgentEngine<D, S> {
     }
 
     pub async fn chat(&mut self, req: ipc::ChatRequest) -> Result<(), AgentEngineError> {
+        if self.session_kind != crate::session::SessionKind::Eps {
+            return Err(AgentEngineError::new(
+                "Map sessions accept conversation only through map_agent_chat.",
+            ));
+        }
+        self.chat_with_request_id(req, None).await
+    }
+
+    pub async fn map_chat(
+        &mut self,
+        request_id: String,
+        text: String,
+        attachments: Vec<String>,
+    ) -> Result<(), AgentEngineError> {
+        if self.session_kind != crate::session::SessionKind::Map {
+            return Err(AgentEngineError::new(
+                "the requested session is not a Map session",
+            ));
+        }
+        self.chat_with_request_id(ipc::ChatRequest { text, attachments }, Some(request_id))
+            .await
+    }
+
+    async fn chat_with_request_id(
+        &mut self,
+        req: ipc::ChatRequest,
+        fixed_request_id: Option<String>,
+    ) -> Result<(), AgentEngineError> {
         if matches!(
             self.phase,
             Phase::PlanReview | Phase::Executing | Phase::ChangesetReview
@@ -412,25 +444,55 @@ impl<D: CodexDriver, S: EventSink> AgentEngine<D, S> {
                 "현재 세션의 진행 중인 요청 또는 검토를 먼저 완료해 주세요.",
             ));
         }
-        let request_id = next_request_id();
+        let request_id = fixed_request_id.unwrap_or_else(next_request_id);
         self.runtime
             .begin_request(&request_id, &self.project_id)
             .map_err(AgentEngineError::new)?;
         self.current_plan_markdown = None;
-        self.current_request_id = Some(request_id);
+        self.current_request_id = Some(request_id.clone());
         self.phase = Phase::Triage;
         let attachment_context = self.resolve_attachments(&req.attachments)?;
+        let map_image_refs = if self.session_kind == crate::session::SessionKind::Map {
+            self.runtime
+                .bind_map_images(&request_id, &attachment_context.images)
+                .map_err(AgentEngineError::new)?
+        } else {
+            Vec::new()
+        };
         let plain_user_text = if req.text.trim().is_empty() && !req.attachments.is_empty() {
             "첨부한 파일을 분석해 주세요."
         } else {
             req.text.as_str()
         };
-        let user_text = attachment_context.append_text_files(plain_user_text);
+        let mut user_text = attachment_context.append_text_files(plain_user_text);
+        if !map_image_refs.is_empty() {
+            user_text.push_str("\n\n[map image refs]\n");
+            user_text.push_str(&serde_json::to_string(&map_image_refs).map_err(|error| {
+                AgentEngineError::new(format!(
+                    "map image references could not be serialized: {error}"
+                ))
+            })?);
+        }
 
         let memory = self.config.project_memory_for_prompt();
         let project_state = self.config.project_state_for_prompt();
         let wiki = self.config.wiki_section_for_prompt(plain_user_text);
-        let turn_text = if self.thread_active {
+        let turn_text = if self.session_kind == crate::session::SessionKind::Map {
+            if self.thread_active {
+                format!(
+                    "[map agent continuation]\n{}\n{}\n\n{}",
+                    project_state,
+                    memory.as_deref().unwrap_or("[project memory]\n(none)"),
+                    user_text
+                )
+            } else {
+                format!(
+                    "{}\n\n{}",
+                    build_map_system_prompt(&project_state, memory.as_deref()),
+                    user_text
+                )
+            }
+        } else if self.thread_active {
             resume_turn_text(
                 &user_text,
                 &self.config.rag_hits,
@@ -1006,6 +1068,22 @@ Continue the requested change now, run the mandatory build, and stop only after 
             .and_then(|provider| provider.record_accepted(entries))
     }
 
+    /// Compact the live Codex thread through app-server without changing panel history
+    /// or backend-owned plan/review state.
+    pub async fn compact(&mut self) -> Result<(), AgentEngineError> {
+        if !self.thread_active || self.driver.current_thread_id().await.is_none() {
+            return Err(AgentEngineError::new(
+                "압축할 Codex 대화가 없습니다. 먼저 메시지를 보내 주세요.",
+            ));
+        }
+        if matches!(self.phase, Phase::Triage | Phase::Executing) {
+            return Err(AgentEngineError::new(
+                "현재 Codex 작업이 끝난 뒤 대화를 압축해 주세요.",
+            ));
+        }
+        self.driver.compact_thread().await
+    }
+
     /// Replace the model-visible conversation with the durable panel-log prefix
     /// selected by a message edit. The active saved session is retained, while
     /// the next chat starts a fresh Codex thread seeded from that prefix.
@@ -1043,6 +1121,7 @@ Continue the requested change now, run the mandatory build, and stop only after 
         if ids.is_empty() {
             return Ok(AttachmentContext {
                 image_paths: Vec::new(),
+                images: Vec::new(),
                 text_files: Vec::new(),
             });
         }
@@ -1211,10 +1290,20 @@ Continue the requested change now, run the mandatory build, and stop only after 
     }
 }
 
+#[derive(Clone)]
+struct MapEventContext {
+    request_id: String,
+    candidate_revision: String,
+}
+
 #[derive(Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-struct SessionEvent<T> {
+pub(crate) struct SessionEvent<T> {
     session_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    request_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    candidate_revision: Option<String>,
     #[serde(flatten)]
     payload: T,
 }
@@ -1223,6 +1312,7 @@ struct SessionEvent<T> {
 pub(crate) struct SessionEventSink {
     app: tauri::AppHandle,
     session_id: String,
+    map_context: Arc<parking_lot::RwLock<Option<MapEventContext>>>,
 }
 
 impl SessionEventSink {
@@ -1230,6 +1320,34 @@ impl SessionEventSink {
         Self {
             app,
             session_id: session_id.into(),
+            map_context: Arc::new(parking_lot::RwLock::new(None)),
+        }
+    }
+
+    pub(crate) fn set_map_context(&self, request_id: String, candidate_revision: String) {
+        *self.map_context.write() = Some(MapEventContext {
+            request_id,
+            candidate_revision,
+        });
+    }
+
+    pub(crate) fn clear_map_context(&self, request_id: &str) {
+        let mut context = self.map_context.write();
+        if context
+            .as_ref()
+            .is_some_and(|context| context.request_id == request_id)
+        {
+            *context = None;
+        }
+    }
+
+    fn scoped<T>(&self, payload: T) -> SessionEvent<T> {
+        let context = self.map_context.read().clone();
+        SessionEvent {
+            session_id: self.session_id.clone(),
+            request_id: context.as_ref().map(|context| context.request_id.clone()),
+            candidate_revision: context.map(|context| context.candidate_revision),
+            payload,
         }
     }
 
@@ -1237,13 +1355,7 @@ impl SessionEventSink {
     where
         T: serde::Serialize + Clone,
     {
-        self.app.emit(
-            name,
-            SessionEvent {
-                session_id: self.session_id.clone(),
-                payload,
-            },
-        )
+        self.app.emit(name, self.scoped(payload))
     }
 }
 
@@ -1278,6 +1390,8 @@ pub(crate) struct ProductionCodexDriver {
     runtime: SessionToolRuntime,
     workspace: WorkspaceManager,
     model_selection: Option<CodexModelSelection>,
+    large_context_enabled: bool,
+    large_context_fallback_notified: HashSet<String>,
     active_workspace: Option<PreparedWorkspace>,
     client: Option<CodexAppServerClient<ChildStdout, ChildStdin>>,
     events: Option<tokio::sync::mpsc::Receiver<AppServerEvent>>,
@@ -1296,6 +1410,32 @@ fn app_server_client_is_reusable(
         && client_access == Some(requested_access)
 }
 
+fn load_model_configuration(
+    dirs: &crate::config::DataDirs,
+) -> Result<(Option<CodexModelSelection>, bool), AgentEngineError> {
+    let config = dirs
+        .load_config()
+        .map_err(|error| AgentEngineError::new(format!("failed to load config: {error}")))?;
+    let selection = match (
+        config.codex_model.as_deref(),
+        config.codex_reasoning_effort.as_deref(),
+    ) {
+        (Some(model), Some(reasoning_effort))
+            if !model.trim().is_empty() && !reasoning_effort.trim().is_empty() =>
+        {
+            Some(CodexModelSelection {
+                model: model.to_string(),
+                reasoning_effort: reasoning_effort.to_string(),
+            })
+        }
+        _ => None,
+    };
+    let large_context_enabled = selection
+        .as_ref()
+        .is_some_and(|selection| config.codex_large_context_models.contains(&selection.model));
+    Ok((selection, large_context_enabled))
+}
+
 impl ProductionCodexDriver {
     pub(crate) fn new(
         session_id: impl Into<String>,
@@ -1306,19 +1446,8 @@ impl ProductionCodexDriver {
         runtime: SessionToolRuntime,
         cancellation: tokio::sync::watch::Receiver<u64>,
     ) -> Self {
-        let model_selection = dirs.load_config().ok().and_then(|config| {
-            match (config.codex_model, config.codex_reasoning_effort) {
-                (Some(model), Some(reasoning_effort))
-                    if !model.trim().is_empty() && !reasoning_effort.trim().is_empty() =>
-                {
-                    Some(CodexModelSelection {
-                        model,
-                        reasoning_effort,
-                    })
-                }
-                _ => None,
-            }
-        });
+        let (model_selection, large_context_enabled) =
+            load_model_configuration(&dirs).unwrap_or((None, false));
         let session_store = crate::session::SessionStore::new(&dirs);
         Self {
             fallback_cwd: cwd.into(),
@@ -1333,6 +1462,8 @@ impl ProductionCodexDriver {
             runtime,
             active_workspace: None,
             model_selection,
+            large_context_enabled,
+            large_context_fallback_notified: HashSet::new(),
             client: None,
             events: None,
             cancellation,
@@ -1368,6 +1499,7 @@ impl ProductionCodexDriver {
                 .await
                 .map_err(|err| AgentEngineError::new(err.to_string()))?;
         client.set_model_selection(self.model_selection.clone());
+        client.set_large_context_enabled(self.large_context_enabled);
         if let Some(thread_id) = retained_thread_id {
             client.set_thread_id(thread_id).await;
         }
@@ -1381,6 +1513,24 @@ impl ProductionCodexDriver {
     async fn ensure_client(&mut self) -> Result<(), AgentEngineError> {
         self.ensure_client_at(self.fallback_cwd.clone(), WorkspaceAccess::Read)
             .await
+    }
+    fn refresh_model_configuration(&mut self) -> Result<(), AgentEngineError> {
+        let (selection, large_context_enabled) = load_model_configuration(&self.dirs)?;
+        self.model_selection = selection.clone();
+        self.large_context_enabled = large_context_enabled;
+        if let Some(client) = self.client.as_mut() {
+            client.set_model_selection(selection);
+            client.set_large_context_enabled(large_context_enabled);
+        }
+        Ok(())
+    }
+
+    fn large_context_enabled_for(&self, model: &str) -> Result<bool, AgentEngineError> {
+        let config = self
+            .dirs
+            .load_config()
+            .map_err(|error| AgentEngineError::new(format!("failed to load config: {error}")))?;
+        Ok(config.codex_large_context_models.contains(model))
     }
 
     async fn fetch_models(&mut self) -> Result<Vec<CodexModel>, AgentEngineError> {
@@ -1410,13 +1560,13 @@ impl ProductionCodexDriver {
         let selection = resolve_model_selection(&models, self.model_selection.as_ref())?;
 
         if self.model_selection.as_ref() != Some(&selection) {
-            if self.model_selection.is_some() {
-                self.persist_selection(&selection)?;
-            }
+            self.persist_selection(&selection)?;
             self.model_selection = Some(selection.clone());
-            if let Some(client) = self.client.as_mut() {
-                client.set_model_selection(Some(selection.clone()));
-            }
+        }
+        self.large_context_enabled = self.large_context_enabled_for(&selection.model)?;
+        if let Some(client) = self.client.as_mut() {
+            client.set_model_selection(Some(selection.clone()));
+            client.set_large_context_enabled(self.large_context_enabled);
         }
 
         Ok(CodexModelSettings {
@@ -1452,8 +1602,10 @@ impl ProductionCodexDriver {
         };
         self.persist_selection(&selection)?;
         self.model_selection = Some(selection.clone());
+        self.large_context_enabled = self.large_context_enabled_for(&model)?;
         if let Some(client) = self.client.as_mut() {
             client.set_model_selection(Some(selection));
+            client.set_large_context_enabled(self.large_context_enabled);
         }
 
         Ok(CodexModelSettings {
@@ -1494,11 +1646,72 @@ fn resolve_model_selection(
     })
 }
 
+fn large_context_fallback_detail(
+    model_selection: Option<&CodexModelSelection>,
+    large_context_enabled: bool,
+    fallback_notified: &mut HashSet<String>,
+    model_context_window: Option<i64>,
+) -> Option<String> {
+    let window = model_context_window?;
+    if !large_context_enabled || window >= LARGE_CONTEXT_EFFECTIVE_MIN_TOKENS {
+        return None;
+    }
+    let model = model_selection?.model.clone();
+    fallback_notified
+        .insert(model.clone())
+        .then(|| format!("{model}은(는) 1M 컨텍스트를 지원하지 않아 기본 컨텍스트를 사용합니다."))
+}
+
+struct ContextUsageHandler<'a> {
+    session_store: &'a crate::session::SessionStore,
+    sink: &'a SessionEventSink,
+    session_id: &'a str,
+    model_selection: Option<&'a CodexModelSelection>,
+    large_context_enabled: bool,
+    fallback_notified: &'a mut HashSet<String>,
+}
+
+fn handle_context_usage(
+    handler: ContextUsageHandler<'_>,
+    turn_id: String,
+    token_usage: ipc::ContextUsage,
+) -> Result<(), AgentEngineError> {
+    if let Err(error) = handler
+        .session_store
+        .update_context_usage(handler.session_id, token_usage.clone())
+    {
+        eprintln!(
+            "eud-agent: failed to persist context usage for {}: {error}",
+            handler.session_id
+        );
+    }
+    if let Some(detail) = large_context_fallback_detail(
+        handler.model_selection,
+        handler.large_context_enabled,
+        handler.fallback_notified,
+        token_usage.model_context_window,
+    ) {
+        handler
+            .sink
+            .emit(EngineEvent::Progress(ipc::ProgressEvent {
+                stage: ipc::ProgressStage::LargeContextFallback,
+                detail: Some(detail),
+            }))?;
+    }
+    handler
+        .sink
+        .emit(EngineEvent::ContextUsage(ipc::ContextUsageEvent {
+            turn_id,
+            token_usage,
+        }))
+}
+
 impl CodexDriver for ProductionCodexDriver {
     async fn run_turn(
         &mut self,
         mut input: CodexTurnInput,
     ) -> Result<CodexTurnResult, AgentEngineError> {
+        self.refresh_model_configuration()?;
         let mut cancellation = self.cancellation.clone();
         let cancellation_generation = *cancellation.borrow_and_update();
         let request_id = self
@@ -1665,6 +1878,18 @@ impl CodexDriver for ProductionCodexDriver {
                                 data: None,
                             }))?;
                         }
+                        AppServerEvent::ContextCompactionStarted => {
+                            self.sink.emit(EngineEvent::Progress(ipc::ProgressEvent {
+                                stage: ipc::ProgressStage::Compaction,
+                                detail: Some("started".to_string()),
+                            }))?;
+                        }
+                        AppServerEvent::ContextCompactionCompleted => {
+                            self.sink.emit(EngineEvent::Progress(ipc::ProgressEvent {
+                                stage: ipc::ProgressStage::Compaction,
+                                detail: Some("done".to_string()),
+                            }))?;
+                        }
                         AppServerEvent::ToolCallStarted { name, args } => {
                             answer_break_pending = true;
                             self.sink.emit(EngineEvent::Agent(ipc::AgentEvent {
@@ -1697,21 +1922,18 @@ impl CodexDriver for ProductionCodexDriver {
                             turn_id,
                             token_usage,
                         } => {
-                            if let Err(error) = self
-                                .session_store
-                                .update_context_usage(&self.session_id, token_usage.clone())
-                            {
-                                eprintln!(
-                                    "eud-agent: failed to persist context usage for {}: {error}",
-                                    self.session_id
-                                );
-                            }
-                            self.sink.emit(EngineEvent::ContextUsage(
-                                ipc::ContextUsageEvent {
-                                    turn_id,
-                                    token_usage,
+                            handle_context_usage(
+                                ContextUsageHandler {
+                                    session_store: &self.session_store,
+                                    sink: &self.sink,
+                                    session_id: &self.session_id,
+                                    model_selection: self.model_selection.as_ref(),
+                                    large_context_enabled: self.large_context_enabled,
+                                    fallback_notified: &mut self.large_context_fallback_notified,
                                 },
-                            ))?;
+                                turn_id,
+                                token_usage,
+                            )?;
                         }
                         AppServerEvent::TurnComplete => {
                             turn_complete_seen = true;
@@ -1724,6 +1946,58 @@ impl CodexDriver for ProductionCodexDriver {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    async fn compact_thread(&mut self) -> Result<(), AgentEngineError> {
+        self.refresh_model_configuration()?;
+        let cwd = self
+            .client_cwd
+            .clone()
+            .unwrap_or_else(|| self.fallback_cwd.clone());
+        let access = self.client_access.unwrap_or(WorkspaceAccess::Read);
+        self.ensure_client_at(cwd, access).await?;
+        self.client
+            .as_mut()
+            .ok_or_else(|| AgentEngineError::new("codex app-server client is unavailable"))?
+            .start_compaction()
+            .await
+            .map_err(|error| AgentEngineError::new(error.to_string()))?;
+
+        loop {
+            let event = self
+                .events
+                .as_mut()
+                .ok_or_else(|| {
+                    AgentEngineError::new("codex app-server event stream is unavailable")
+                })?
+                .recv()
+                .await
+                .ok_or_else(|| AgentEngineError::new("codex app-server event stream closed"))?;
+            match event {
+                AppServerEvent::ContextCompactionCompleted => return Ok(()),
+                AppServerEvent::TokenUsageUpdated {
+                    turn_id,
+                    token_usage,
+                } => {
+                    handle_context_usage(
+                        ContextUsageHandler {
+                            session_store: &self.session_store,
+                            sink: &self.sink,
+                            session_id: &self.session_id,
+                            model_selection: self.model_selection.as_ref(),
+                            large_context_enabled: self.large_context_enabled,
+                            fallback_notified: &mut self.large_context_fallback_notified,
+                        },
+                        turn_id,
+                        token_usage,
+                    )?;
+                }
+                AppServerEvent::Error(message) => {
+                    return Err(AgentEngineError::new(message));
+                }
+                _ => {}
             }
         }
     }
@@ -1762,6 +2036,7 @@ pub(crate) struct SessionWorker {
     engine: tokio::sync::Mutex<AgentEngine<ProductionCodexDriver, SessionEventSink>>,
     cancellation: tokio::sync::watch::Sender<u64>,
     runtime: SessionToolRuntime,
+    sink: SessionEventSink,
     _mcp: crate::mcp::McpServerHandle,
 }
 
@@ -1808,6 +2083,7 @@ fn restore_pending_review(
         .map_err(|error| error.to_string())?
         .into_iter()
         .filter(|meta| meta.project == project_id)
+        .filter(|meta| meta.kind == crate::session::SessionKind::Eps)
     {
         let mut record = match sessions.load(&meta.id) {
             Ok(record) => record,
@@ -1864,7 +2140,6 @@ fn restore_pending_review(
     }
     Ok(session_errors)
 }
-
 fn reset_session_record_for_rewind(
     record: &mut crate::session::SessionRecord,
     panel_log: serde_json::Value,
@@ -1983,6 +2258,7 @@ impl SessionEngineManager {
             .list()
             .map_err(|error| error.to_string())?
             .into_iter()
+            .filter(|meta| meta.kind == crate::session::SessionKind::Eps)
             .map(|meta| meta.project)
             .collect::<HashSet<_>>();
         for project in projects {
@@ -2000,18 +2276,23 @@ impl SessionEngineManager {
             .sessions
             .load(session_id)
             .map_err(|error| AgentEngineError::new(error.to_string()))?;
-        self.ensure_project_recovery(&record.meta.project, Some(&record.meta.id))
-            .map_err(AgentEngineError::new)?;
-
-        let current_project =
-            project_name_from_state(&self.inner.config.project_state_for_prompt());
-        if !current_project.is_empty() && current_project != record.meta.project {
-            return Err(AgentEngineError::new(
-                "이 세션은 현재 에디터 프로젝트에 속하지 않습니다.",
-            ));
+        if record.meta.kind == crate::session::SessionKind::Eps {
+            self.ensure_project_recovery(&record.meta.project, Some(&record.meta.id))
+                .map_err(AgentEngineError::new)?;
+            let current_project =
+                project_name_from_state(&self.inner.config.project_state_for_prompt());
+            if !current_project.is_empty() && current_project != record.meta.project {
+                return Err(AgentEngineError::new(
+                    "이 세션은 현재 에디터 프로젝트에 속하지 않습니다.",
+                ));
+            }
         }
 
-        let runtime = self.inner.services.session(session_id.to_string());
+        let runtime = if record.meta.kind == crate::session::SessionKind::Map {
+            self.inner.services.map_session(session_id.to_string())
+        } else {
+            self.inner.services.session(session_id.to_string())
+        };
         let sink = SessionEventSink::new(self.inner.app.clone(), session_id.to_string());
         let ask_sink = sink.clone();
         runtime.set_ask_emitter(move |event| {
@@ -2035,7 +2316,7 @@ impl SessionEngineManager {
         let worker = Arc::new(SessionWorker {
             engine: tokio::sync::Mutex::new(AgentEngine::new(
                 driver,
-                sink,
+                sink.clone(),
                 self.inner.config.clone(),
                 runtime.clone(),
                 self.inner.sessions.clone(),
@@ -2044,6 +2325,7 @@ impl SessionEngineManager {
             )),
             cancellation,
             runtime,
+            sink: sink.clone(),
             _mcp: mcp,
         });
 
@@ -2144,6 +2426,11 @@ impl SessionEngineManager {
         request: ipc::ChatRequest,
     ) -> Result<(), AgentEngineError> {
         let worker = self.worker(session_id).await?;
+        if worker.runtime.kind() != crate::session::SessionKind::Eps {
+            return Err(AgentEngineError::new(
+                "Map sessions accept conversation only through map_agent_chat.",
+            ));
+        }
         if let Err(error) = self.inner.sessions.touch_conversation(session_id) {
             eprintln!("eud-agent: conversation timestamp update failed: {error}");
         }
@@ -2155,6 +2442,75 @@ impl SessionEngineManager {
             engine.chat(request).await
         };
         self.finish_read_command(&worker, result).await
+    }
+    pub(crate) async fn delete_map_session(&self, session_id: &str) -> Result<(), String> {
+        let record = self
+            .inner
+            .sessions
+            .load(session_id)
+            .map_err(|error| error.to_string())?;
+        if record.meta.kind != crate::session::SessionKind::Map {
+            return Err("the requested session is not a Map session".to_string());
+        }
+        self.delete_session(session_id)
+            .await
+            .map_err(|error| error.message)
+    }
+
+    pub(crate) async fn open_map_session(&self, session_id: &str) -> Result<(), String> {
+        let worker = self
+            .worker(session_id)
+            .await
+            .map_err(|error| error.message)?;
+        if worker.runtime.kind() != crate::session::SessionKind::Map {
+            return Err("the requested session is not a Map session".to_string());
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn map_chat(
+        &self,
+        session_id: &str,
+        request_id: String,
+        candidate_revision: String,
+        text: String,
+        attachments: Vec<String>,
+    ) -> Result<(), String> {
+        let worker = self
+            .worker(session_id)
+            .await
+            .map_err(|error| error.message)?;
+        if worker.runtime.kind() != crate::session::SessionKind::Map {
+            return Err("the requested session is not a Map session".to_string());
+        }
+        if let Err(error) = self.inner.sessions.touch_conversation(session_id) {
+            eprintln!("eud-agent: map conversation timestamp update failed: {error}");
+        }
+        worker
+            .runtime
+            .emit_activity(crate::write_coordinator::SessionActivity::RunningRead);
+        worker
+            .sink
+            .set_map_context(request_id.clone(), candidate_revision);
+        let result = {
+            let mut engine = worker.engine.lock().await;
+            engine.map_chat(request_id.clone(), text, attachments).await
+        };
+        worker.sink.clear_map_context(&request_id);
+        self.finish_read_command(&worker, result)
+            .await
+            .map_err(|error| error.message)
+    }
+
+    pub(crate) async fn cancel_map_session(&self, session_id: &str) -> Result<(), String> {
+        let worker = self
+            .worker(session_id)
+            .await
+            .map_err(|error| error.message)?;
+        if worker.runtime.kind() != crate::session::SessionKind::Map {
+            return Err("the requested session is not a Map session".to_string());
+        }
+        self.cancel(session_id).await.map_err(|error| error.message)
     }
 
     async fn plan_feedback(
@@ -2200,6 +2556,25 @@ impl SessionEngineManager {
         result
     }
 
+    async fn compact(&self, session_id: &str) -> Result<(), AgentEngineError> {
+        let worker = self.worker(session_id).await?;
+        worker
+            .runtime
+            .emit_activity(crate::write_coordinator::SessionActivity::RunningRead);
+        let (result, phase) = {
+            let mut engine = worker.engine.lock().await;
+            let result = engine.compact().await;
+            (result, engine.phase)
+        };
+        let activity = if matches!(phase, Phase::PlanReview | Phase::ChangesetReview) {
+            crate::write_coordinator::SessionActivity::Review
+        } else {
+            crate::write_coordinator::SessionActivity::Idle
+        };
+        worker.runtime.emit_activity(activity);
+        result
+    }
+
     async fn rewind(
         &self,
         session_id: &str,
@@ -2225,6 +2600,19 @@ impl SessionEngineManager {
                 Ok(())
             }
         }
+    }
+
+    async fn pending_ask(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<SessionEvent<ipc::AskEvent>>, AgentEngineError> {
+        let worker = self.inner.workers.lock().await.get(session_id).cloned();
+        Ok(worker.and_then(|worker| {
+            worker
+                .runtime
+                .pending_ask()
+                .map(|event| worker.sink.scoped(event))
+        }))
     }
 
     async fn answer_ask(
@@ -2282,6 +2670,7 @@ impl SessionEngineManager {
                 id: crate::session::new_session_id(),
                 name: auto_session_name(first_text),
                 project: project_name_from_state(&self.inner.config.project_state_for_prompt()),
+                kind: crate::session::SessionKind::Eps,
                 created_at,
                 last_conversation_at: crate::session::now_unix_millis(),
             },
@@ -2425,6 +2814,17 @@ pub(crate) async fn engine_changeset_decision(
         .map_err(|error| error.message)
 }
 
+#[tauri::command(rename = "ask_pending")]
+pub(crate) async fn engine_ask_pending(
+    state: tauri::State<'_, SessionEngineManager>,
+    session_id: String,
+) -> Result<Option<SessionEvent<ipc::AskEvent>>, String> {
+    state
+        .pending_ask(&session_id)
+        .await
+        .map_err(|error| error.message)
+}
+
 #[tauri::command(rename = "ask_response")]
 pub(crate) async fn engine_ask_response(
     state: tauri::State<'_, SessionEngineManager>,
@@ -2455,6 +2855,17 @@ pub(crate) async fn engine_cancel(
         .map_err(|error| error.message)
 }
 
+#[tauri::command(rename = "compact")]
+pub(crate) async fn engine_compact(
+    state: tauri::State<'_, SessionEngineManager>,
+    session_id: String,
+) -> Result<(), String> {
+    state
+        .compact(&session_id)
+        .await
+        .map_err(|error| error.message)
+}
+
 #[tauri::command(rename = "conversation_rewind")]
 pub(crate) async fn engine_conversation_rewind(
     state: tauri::State<'_, SessionEngineManager>,
@@ -2475,7 +2886,7 @@ pub(crate) async fn engine_session_list(
     state
         .inner
         .sessions
-        .list()
+        .list_kind(crate::session::SessionKind::Eps)
         .map_err(|error| error.to_string())
 }
 
@@ -2577,6 +2988,52 @@ fn workspace_completion_repair_instruction(
          Keep `{plan_path}` byte-for-byte equal to the approved plan. Specs must describe the actual implemented state, not intended work. The worklog must record actual verification and link the canonical topic specs. Do not call `propose_plan` and do not make unrelated editor/map changes.",
         gaps.join("\n- ")
     ))
+}
+
+pub fn build_map_system_prompt(project_state: &str, project_memory: Option<&str>) -> String {
+    format!(
+        "[role]\n\
+         You are Map Agent inside the separate Map Agent Workbench window.\n\
+         The connected saved OpenMapName SCX and visible candidate revision are the only map authority.\n\n\
+         [authority]\n\
+         - Exact backend-validated MapMentionSnapshot payloads define request constraints; never parse display text into authority.\n\
+         - Without a target mention, the entire current candidate is writable for terrain, units, buildings, doodads, sprites, and locations. Never refuse mutation or ask for a region merely because target is absent.\n\
+         - A target region narrows coordinate-based writes to its exact cells and explicit layer capabilities. Stored targets omitted from the current request, natural language, reference/anchor regions, palette mentions, and stamp mentions cannot enlarge or narrow that scope.\n\
+         - Reference and anchor regions are read/comparison context only. Protect masks always block their cells and layers, including persistent protections omitted from a later prompt.\n\
+         - Palette mentions describe a type/style, and stamp mentions identify a saved live-candidate selection; neither grants placement authority. Object and location mentions remain revision-bound exact instances; stale fingerprints must be reported.\n\n\
+         [candidate workflow]\n\
+         - Modify only the request-owned draft through map_draft_begin, map_draft_patch, map_stamp_place, and map_image_place.\n\
+         - Use map_draft_render and map_draft_analyze while iterating, then call map_candidate_finalize once at most.\n\
+         - A failed, cancelled, or unfinalized turn must leave the visible candidate unchanged.\n\
+         - Follow-up turns start from the visible candidate revision supplied by the backend.\n\
+         - terrain, units, buildings, doodads, sprites, and locations are the only writable layers.\n\
+         - fog, player/controller/force, triggers, briefing, switches, tech/upgrades, and sounds are unsupported and must remain unchanged.\n\
+         - Semantic ISOM transitions outside the current request scope make finalize fail. Do not clip, hide, or substitute them; ask the user to expand a supplied target only when that target blocks the requested transition.\n\
+         - A doodad that changes terrain plus a sprite overlay requires terrain, doodads, and sprites authority.\n\
+         - Materially ambiguous owner, count, state, or location bounds require the ask tool.\n\n\
+         [selection stamps]\n\
+         - Every saved selection is an exact reusable stamp whose source content is read from the visible candidate when placed. Its canonical mask and selected layers define the copied content; empty layers mean all six supported layers.\n\
+         - For exact copy/duplicate/replicate requests, use map_stamp_preview and map_stamp_place. Never reconstruct the selection through map_render, tile catalog enumeration, terrain.set probes, terrain.blit matrices, or semantic ISOM brushes.\n\
+         - A destination is the top-left of the saved selection bounds. If the requested total includes the existing source, place only the additional copies. Stamp destinations in one call must not overlap.\n\
+         - Call map_stamp_preview after map_draft_begin. Terrain replacement is inherent and is not an object collision. When object or location collisions exist, obtain the user's explicit merge, replace, or cancel choice unless that choice is already explicit in the current request. Never guess a collision policy.\n\
+         - Merge preserves destination objects and adds copied objects/locations. Replace removes only fully contained destination objects/locations in selected layers; boundary-crossing items make replace fail closed. Both modes copy exact MTXM/TILE values and never run ISOM correction.\n\n\
+         [palette search]\n\
+         - map_palette_query is a bounded search, not a browseable catalog. Supply a non-blank name query or structured filter; it returns a complete result only when at most 256 entries match.\n\
+         - For semantic terrain, search brushes by name first. Use the returned terrainType to filter exact tiles by graphicsValid, walkability, height, ramp, view, group, or variant metadata only when exact tiles are necessary.\n\
+         - If a palette search is too broad, refine the query/filter. Never enumerate tile ids or catalog pages.\n\n\
+         [image terrain]\n\
+         - Current-request images are listed as image-1, image-2, and so on under [map image refs] while the same files remain available as localImage vision inputs. imageRef is an input binding, never extra write authority.\n\
+         - When the user asks to apply an attached photo as terrain, call map_image_place with only imageRef and integer tile x/y/width/height. Never provide a filesystem path, palette, MTXM id, or tile matrix.\n\
+         - When the user asks only to inspect, compare, or analyze an image, do not create a terrain mutation.\n\
+         - Without a target, choose any in-map placement based on map analysis. With a target, every actually changed terrain cell must remain inside its terrain scope. Protect always blocks actual changes; transparent unchanged cells consume no authority.\n\
+         - map_image_place does not seal the draft. Multiple photos and ordinary terrain patches may be applied in either order before one finalize.\n\
+         - Report walkability and height changed-cell warnings returned by map_image_place in the final answer.\n\n\
+         [trust boundary]\n\
+         Original Apply and backup restore are intentionally absent from your tools. Only the user's trusted Map Agent window command can Apply or undo.\n\
+         Never request, infer, or expose SCX/candidate filesystem paths; all access uses typed map tools.\n\n\
+         [project state]\n{project_state}\n\n{}",
+        project_memory.unwrap_or("[project memory]\n(none)")
+    )
 }
 
 /// Build the first-turn system prompt from already-fetched request context.
@@ -3123,6 +3580,8 @@ mod tests {
     fn session_event_flattens_payload_with_session_id() {
         let value = serde_json::to_value(SessionEvent {
             session_id: "session-a".to_string(),
+            request_id: None,
+            candidate_revision: None,
             payload: ipc::AnswerEvent {
                 text: "done".to_string(),
             },
@@ -3171,6 +3630,36 @@ mod tests {
         .unwrap();
         assert_eq!(stale_model.model, "gpt-default");
         assert_eq!(stale_model.reasoning_effort, "medium");
+    }
+    #[test]
+    fn large_context_fallback_warns_once_only_for_a_clamped_opt_in() {
+        let selection = CodexModelSelection {
+            model: "gpt-test".to_string(),
+            reasoning_effort: "medium".to_string(),
+        };
+        let mut notified = HashSet::new();
+
+        assert_eq!(
+            large_context_fallback_detail(Some(&selection), false, &mut notified, Some(258_400),),
+            None
+        );
+        let detail =
+            large_context_fallback_detail(Some(&selection), true, &mut notified, Some(258_400))
+                .expect("a clamped opted-in model should warn");
+        assert!(detail.contains("gpt-test"));
+        assert_eq!(
+            large_context_fallback_detail(Some(&selection), true, &mut notified, Some(258_400),),
+            None
+        );
+
+        let supported = CodexModelSelection {
+            model: "gpt-supported".to_string(),
+            reasoning_effort: "medium".to_string(),
+        };
+        assert_eq!(
+            large_context_fallback_detail(Some(&supported), true, &mut notified, Some(950_000),),
+            None
+        );
     }
 
     #[test]
@@ -3333,6 +3822,15 @@ mod tests {
                 .expect("fake codex driver needs one scripted result per turn"))
         }
 
+        async fn compact_thread(&mut self) -> Result<(), AgentEngineError> {
+            self.thread_id
+                .lock()
+                .expect("thread id lock")
+                .as_ref()
+                .map(|_| ())
+                .ok_or_else(|| AgentEngineError::new("no fake thread"))
+        }
+
         async fn reset_thread(&mut self) -> Result<(), AgentEngineError> {
             *self.reset_count.lock().expect("reset count lock") += 1;
             *self.thread_id.lock().expect("thread id lock") = None;
@@ -3398,6 +3896,15 @@ mod tests {
             Ok(CodexTurnResult::Answer {
                 text: format!("{} done", self.label),
             })
+        }
+
+        async fn compact_thread(&mut self) -> Result<(), AgentEngineError> {
+            self.thread_id
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|_| ())
+                .ok_or_else(|| AgentEngineError::new("no gate thread"))
         }
 
         async fn reset_thread(&mut self) -> Result<(), AgentEngineError> {
@@ -3532,6 +4039,7 @@ mod tests {
                 id: crate::session::new_session_id(),
                 name: "test session".to_string(),
                 project: "Sample".to_string(),
+                kind: crate::session::SessionKind::Eps,
                 created_at,
                 last_conversation_at: crate::session::now_unix_millis(),
             },
@@ -4722,6 +5230,7 @@ mod tests {
                 id: "session-c".to_string(),
                 name: "C".to_string(),
                 project: "Sample".to_string(),
+                kind: crate::session::SessionKind::Eps,
                 created_at: 1,
                 last_conversation_at: 1_000,
             },
@@ -4854,7 +5363,6 @@ mod tests {
         assert!(!writes.owns("Sample", &missing_record.meta.id, missing_request_id));
         fs::remove_dir_all(base).ok();
     }
-
     #[test]
     fn rewind_clears_only_an_unrecoverable_pending_review() {
         let base = unique_temp_dir("rewind-unrecoverable-pending-review");
@@ -5026,5 +5534,32 @@ mod tests {
             .expect("session delete should clean attachments");
         assert!(!image_paths[0][0].exists());
         fs::remove_dir_all(base).ok();
+    }
+    #[test]
+    fn map_system_prompt_pins_candidate_authority_and_user_only_apply() {
+        let prompt = build_map_system_prompt("[project state]\nproject=Map", None);
+        assert!(prompt.contains("MapMentionSnapshot"));
+        assert!(prompt.contains("entire current candidate is writable"));
+        assert!(prompt
+            .contains("Never refuse mutation or ask for a region merely because target is absent"));
+        assert!(prompt.contains("target region narrows coordinate-based writes"));
+        assert!(prompt.contains("Protect masks always block"));
+        assert!(prompt.contains("map_candidate_finalize once at most"));
+        assert!(prompt.contains("Original Apply and backup restore are intentionally absent"));
+        assert!(prompt.contains("terrain, units, buildings, doodads, sprites, and locations"));
+        assert!(prompt.contains("Semantic ISOM transitions outside the current request scope"));
+        assert!(prompt.contains("map_palette_query is a bounded search"));
+        assert!(prompt.contains("search brushes by name first"));
+        assert!(prompt.contains("Never enumerate tile ids or catalog pages"));
+        assert!(prompt.contains("use map_stamp_preview and map_stamp_place"));
+        assert!(prompt.contains("Never reconstruct the selection"));
+        assert!(prompt.contains("Never guess a collision policy"));
+        assert!(prompt.contains("never run ISOM correction"));
+        assert!(prompt.contains("imageRef is an input binding, never extra write authority"));
+        assert!(prompt.contains("When the user asks only to inspect, compare, or analyze an image"));
+        assert!(prompt.contains("Multiple photos and ordinary terrain patches"));
+        assert!(
+            prompt.contains("Never provide a filesystem path, palette, MTXM id, or tile matrix")
+        );
     }
 }

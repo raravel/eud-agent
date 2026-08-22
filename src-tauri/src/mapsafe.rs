@@ -34,7 +34,10 @@
 //! restore (rail 7) are REAL filesystem ops and are tested for real against temp
 //! dirs.
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
+
+use sha2::{Digest, Sha256};
 
 /// Typed errors for the map-write rail sequence and rollback.
 #[derive(Debug, thiserror::Error)]
@@ -173,6 +176,14 @@ extern "system" {
     ) -> *mut core::ffi::c_void;
     fn CloseHandle(h_object: *mut core::ffi::c_void) -> i32;
     fn GetLastError() -> u32;
+    fn ReplaceFileW(
+        replaced_file_name: *const u16,
+        replacement_file_name: *const u16,
+        backup_file_name: *const u16,
+        replace_flags: u32,
+        exclude: *mut core::ffi::c_void,
+        reserved: *mut core::ffi::c_void,
+    ) -> i32;
 }
 
 impl LockProbe for WindowsLockProbe {
@@ -328,20 +339,10 @@ where
             return Err(MapSafeError::MapLocked(entry.map_path.clone()));
         }
 
-        // Write via a temp file beside the map, then atomically rename over it so a
-        // crash mid-restore can never leave a half-written map. `fs::rename` on the
-        // same volume is atomic and replaces the destination on Windows & *nix.
-        let mut ext = entry
-            .map_path
-            .extension()
-            .unwrap_or_default()
-            .to_os_string();
-        ext.push(".restoretmp");
-        let tmp = entry.map_path.with_extension(ext);
-
+        // Stage, flush, and replace in the map's own directory. On Windows this
+        // uses MoveFileExW(REPLACE_EXISTING|WRITE_THROUGH), not fs::rename.
         let bytes = std::fs::read(&entry.backup_path)?;
-        std::fs::write(&tmp, &bytes)?;
-        std::fs::rename(&tmp, &entry.map_path)?;
+        atomic_replace_bytes(&entry.map_path, &bytes)?;
         Ok(())
     }
 
@@ -362,6 +363,387 @@ where
         std::fs::copy(map_path, &backup_path)?;
         Ok(backup_path)
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CandidateApplyRecord {
+    pub source_path: PathBuf,
+    pub backup_path: PathBuf,
+    pub before_sha256: String,
+    pub applied_sha256: String,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum CandidateApplyError {
+    #[error("the editor is compiling; candidate Apply is blocked")]
+    Compiling,
+    #[error("map file is open in another program: {0}")]
+    MapLocked(PathBuf),
+    #[error("source map changed after candidate creation")]
+    StaleSource,
+    #[error("candidate bytes changed after verification")]
+    CandidateChanged,
+    #[error("candidate or applied source is not a parseable SCX: {0}")]
+    Verify(String),
+    #[error("candidate Apply I/O failure: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("candidate Apply failed and backup restore also failed: {0}")]
+    RestoreFailed(String),
+    #[error("last Apply cannot be undone because the source changed again")]
+    UndoSourceChanged,
+    #[error("Apply backup hash does not match its journal record")]
+    BackupChanged,
+}
+
+pub struct CandidateMapSafe<S, L> {
+    backup_dir: PathBuf,
+    status: S,
+    lock_probe: L,
+}
+
+impl<S, L> CandidateMapSafe<S, L>
+where
+    S: CompilingStatus,
+    L: LockProbe,
+{
+    pub fn new(backup_dir: PathBuf, status: S, lock_probe: L) -> Self {
+        Self {
+            backup_dir,
+            status,
+            lock_probe,
+        }
+    }
+
+    pub fn apply(
+        &self,
+        source: &Path,
+        candidate: &Path,
+        expected_source_sha256: &str,
+        expected_candidate_sha256: &str,
+    ) -> Result<CandidateApplyRecord, CandidateApplyError> {
+        self.apply_with_post_verify(
+            source,
+            candidate,
+            expected_source_sha256,
+            expected_candidate_sha256,
+            |_| Ok(()),
+        )
+    }
+
+    fn apply_with_post_verify<F>(
+        &self,
+        source: &Path,
+        candidate: &Path,
+        expected_source_sha256: &str,
+        expected_candidate_sha256: &str,
+        post_verify: F,
+    ) -> Result<CandidateApplyRecord, CandidateApplyError>
+    where
+        F: Fn(&Path) -> Result<(), CandidateApplyError>,
+    {
+        self.guard(source)?;
+        let source_sha256 = sha256_file(source)?;
+        if source_sha256 != expected_source_sha256 {
+            return Err(CandidateApplyError::StaleSource);
+        }
+        let candidate_bytes = std::fs::read(candidate)?;
+        let candidate_sha256 = sha256_bytes(&candidate_bytes);
+        if candidate_sha256 != expected_candidate_sha256 {
+            return Err(CandidateApplyError::CandidateChanged);
+        }
+        isom::chk_extract(candidate)
+            .map_err(|error| CandidateApplyError::Verify(error.to_string()))?;
+
+        std::fs::create_dir_all(&self.backup_dir)?;
+        let name = source
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "map.scx".to_string());
+        let backup_path = self
+            .backup_dir
+            .join(format!("{name}.{}.apply.bak", backup_timestamp()));
+        let source_bytes = std::fs::read(source)?;
+        crate::memory::write_atomic_bytes(&backup_path, &source_bytes)
+            .map_err(|error| CandidateApplyError::Io(std::io::Error::other(error.to_string())))?;
+        sync_file(&backup_path)?;
+        let pending_record = CandidateApplyRecord {
+            source_path: source.to_path_buf(),
+            backup_path: backup_path.clone(),
+            before_sha256: source_sha256.clone(),
+            applied_sha256: candidate_sha256.clone(),
+        };
+        let pending_path = pending_apply_path(&backup_path);
+        let pending_bytes = serde_json::to_vec(&pending_record).map_err(|error| {
+            CandidateApplyError::Io(std::io::Error::other(format!(
+                "pending Apply journal serialization failed: {error}"
+            )))
+        })?;
+        crate::memory::write_atomic_bytes(&pending_path, &pending_bytes)
+            .map_err(|error| CandidateApplyError::Io(std::io::Error::other(error.to_string())))?;
+        sync_file(&pending_path)?;
+
+        if let Err(error) = atomic_replace_bytes(source, &candidate_bytes) {
+            let _ = std::fs::remove_file(&pending_path);
+            return Err(CandidateApplyError::Io(error));
+        }
+        let post_result = (|| {
+            let applied_sha256 = sha256_file(source)?;
+            if applied_sha256 != candidate_sha256 {
+                return Err(CandidateApplyError::Verify(
+                    "post-Apply source bytes differ from candidate".to_string(),
+                ));
+            }
+            isom::chk_extract(source)
+                .map_err(|error| CandidateApplyError::Verify(error.to_string()))?;
+            post_verify(source)?;
+            Ok(applied_sha256)
+        })();
+        let applied_sha256 = match post_result {
+            Ok(hash) => hash,
+            Err(error) => {
+                let backup = std::fs::read(&backup_path).map_err(|restore| {
+                    CandidateApplyError::RestoreFailed(format!(
+                        "{error}; backup read failed: {restore}"
+                    ))
+                })?;
+                atomic_replace_bytes(source, &backup).map_err(|restore| {
+                    CandidateApplyError::RestoreFailed(format!(
+                        "{error}; atomic backup restore failed: {restore}"
+                    ))
+                })?;
+                if sha256_file(source).map_err(|restore| {
+                    CandidateApplyError::RestoreFailed(format!(
+                        "{error}; restored source hash failed: {restore}"
+                    ))
+                })? != source_sha256
+                {
+                    return Err(CandidateApplyError::RestoreFailed(format!(
+                        "{error}; restored bytes do not match original"
+                    )));
+                }
+                let _ = std::fs::remove_file(&pending_path);
+                return Err(error);
+            }
+        };
+        Ok(CandidateApplyRecord {
+            applied_sha256,
+            ..pending_record
+        })
+    }
+
+    pub fn complete_pending(
+        &self,
+        record: &CandidateApplyRecord,
+    ) -> Result<(), CandidateApplyError> {
+        let path = pending_apply_path(&record.backup_path);
+        if path.exists() {
+            std::fs::remove_file(path)?;
+        }
+        Ok(())
+    }
+
+    pub fn undo(&self, record: &CandidateApplyRecord) -> Result<(), CandidateApplyError> {
+        self.guard(&record.source_path)?;
+        if sha256_file(&record.source_path)? != record.applied_sha256 {
+            return Err(CandidateApplyError::UndoSourceChanged);
+        }
+        let backup = std::fs::read(&record.backup_path)?;
+        if sha256_bytes(&backup) != record.before_sha256 {
+            return Err(CandidateApplyError::BackupChanged);
+        }
+        atomic_replace_bytes(&record.source_path, &backup)?;
+        if sha256_file(&record.source_path)? != record.before_sha256 {
+            return Err(CandidateApplyError::RestoreFailed(
+                "undo source bytes do not match the exact backup".to_string(),
+            ));
+        }
+        isom::chk_extract(&record.source_path)
+            .map_err(|error| CandidateApplyError::Verify(error.to_string()))?;
+        self.complete_pending(record)?;
+        Ok(())
+    }
+
+    fn guard(&self, source: &Path) -> Result<(), CandidateApplyError> {
+        if self.status.is_compiling() {
+            return Err(CandidateApplyError::Compiling);
+        }
+        if self.lock_probe.is_locked(source) {
+            return Err(CandidateApplyError::MapLocked(source.to_path_buf()));
+        }
+        Ok(())
+    }
+}
+
+fn pending_apply_path(backup_path: &Path) -> PathBuf {
+    let mut name = backup_path.file_name().unwrap_or_default().to_os_string();
+    name.push(".pending.json");
+    backup_path.with_file_name(name)
+}
+
+fn candidate_state_committed(candidate_root: &Path, backup_path: &Path) -> bool {
+    let Ok(projects) = std::fs::read_dir(candidate_root) else {
+        return false;
+    };
+    for project in projects.flatten() {
+        let Ok(sessions) = std::fs::read_dir(project.path()) else {
+            continue;
+        };
+        for session in sessions.flatten() {
+            let state_path = session.path().join("state.json");
+            let Ok(bytes) = std::fs::read(state_path) else {
+                continue;
+            };
+            let Ok(state) = serde_json::from_slice::<crate::map_model::CandidateSession>(&bytes)
+            else {
+                continue;
+            };
+            if state.last_apply_backup.as_deref() == Some(backup_path) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+pub fn recover_pending_candidate_applies(
+    backup_dir: &Path,
+    candidate_root: &Path,
+) -> Result<usize, String> {
+    if !backup_dir.is_dir() {
+        return Ok(0);
+    }
+    let entries = std::fs::read_dir(backup_dir)
+        .map_err(|error| format!("pending Apply journals could not be inspected: {error}"))?;
+    let mut recovered = 0;
+    for entry in entries {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let path = entry.path();
+        if !path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.ends_with(".apply.bak.pending.json"))
+        {
+            continue;
+        }
+        let bytes = std::fs::read(&path)
+            .map_err(|error| format!("pending Apply journal could not be read: {error}"))?;
+        let record: CandidateApplyRecord = serde_json::from_slice(&bytes)
+            .map_err(|error| format!("pending Apply journal is invalid: {error}"))?;
+        if candidate_state_committed(candidate_root, &record.backup_path) {
+            std::fs::remove_file(&path).map_err(|error| {
+                format!("committed Apply journal could not be cleared: {error}")
+            })?;
+            continue;
+        }
+        let current_hash = sha256_file(&record.source_path)
+            .map_err(|error| format!("pending Apply source could not be read: {error}"))?;
+        if current_hash == record.applied_sha256 {
+            if WindowsLockProbe.is_locked(&record.source_path) {
+                return Err(format!(
+                    "pending Apply recovery is blocked because the source map is open: {}",
+                    record.source_path.display()
+                ));
+            }
+            let backup = std::fs::read(&record.backup_path)
+                .map_err(|error| format!("pending Apply backup could not be read: {error}"))?;
+            if sha256_bytes(&backup) != record.before_sha256 {
+                return Err("pending Apply backup hash does not match its journal".to_string());
+            }
+            atomic_replace_bytes(&record.source_path, &backup)
+                .map_err(|error| format!("pending Apply backup restore failed: {error}"))?;
+            if sha256_file(&record.source_path)
+                .map_err(|error| format!("restored source could not be hashed: {error}"))?
+                != record.before_sha256
+            {
+                return Err("pending Apply recovery did not restore exact source bytes".to_string());
+            }
+            recovered += 1;
+        } else if current_hash != record.before_sha256 {
+            return Err(format!(
+                "pending Apply source changed independently: {}",
+                record.source_path.display()
+            ));
+        }
+        std::fs::remove_file(&path)
+            .map_err(|error| format!("pending Apply journal could not be cleared: {error}"))?;
+    }
+    Ok(recovered)
+}
+
+fn sha256_bytes(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+fn sha256_file(path: &Path) -> Result<String, std::io::Error> {
+    std::fs::read(path).map(|bytes| sha256_bytes(&bytes))
+}
+
+fn sync_file(path: &Path) -> Result<(), std::io::Error> {
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)?
+        .sync_all()
+}
+
+fn atomic_replace_bytes(destination: &Path, bytes: &[u8]) -> Result<(), std::io::Error> {
+    let parent = destination.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "map destination has no parent directory",
+        )
+    })?;
+    let name = destination
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "map.scx".to_string());
+    let temporary = parent.join(format!(".{name}.{}.apply.tmp", backup_timestamp()));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    drop(file);
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        const REPLACEFILE_WRITE_THROUGH: u32 = 0x1;
+        let existing = temporary
+            .as_os_str()
+            .encode_wide()
+            .chain(Some(0))
+            .collect::<Vec<_>>();
+        let destination = destination
+            .as_os_str()
+            .encode_wide()
+            .chain(Some(0))
+            .collect::<Vec<_>>();
+        // SAFETY: both vectors are valid NUL-terminated UTF-16 paths for the
+        // synchronous ReplaceFileW call. The backup is already app-managed.
+        let moved = unsafe {
+            ReplaceFileW(
+                destination.as_ptr(),
+                existing.as_ptr(),
+                std::ptr::null(),
+                REPLACEFILE_WRITE_THROUGH,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        if moved == 0 {
+            let error = std::io::Error::last_os_error();
+            let _ = std::fs::remove_file(&temporary);
+            return Err(error);
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        std::fs::rename(&temporary, destination)?;
+    }
+    Ok(())
 }
 
 /// A filesystem-safe, monotonic-ish timestamp for backup filenames. Nanoseconds
@@ -469,11 +851,8 @@ mod tests {
     /// Unique temp base dir for a test, avoiding a `tempfile` dev-dependency
     /// (Cargo.toml is out of scope for this task — same precedent as config.rs).
     fn unique_temp_dir(tag: &str) -> PathBuf {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("eud-agent-mapsafe-{tag}-{nanos}"));
+        let dir =
+            std::env::temp_dir().join(format!("eud-agent-mapsafe-{tag}-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -771,6 +1150,193 @@ mod tests {
         let err = svc.restore(&entry).expect_err("missing backup must error");
         assert!(matches!(err, MapSafeError::BackupNotFound(_)));
 
+        fs::remove_dir_all(&base).ok();
+    }
+    #[test]
+    fn candidate_apply_and_undo_restore_exact_source_bytes() {
+        let base = unique_temp_dir("candidate-apply-undo");
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("crates")
+            .join("isom")
+            .join("tests")
+            .join("fixtures")
+            .join("map_agent_rich.scx");
+        let source = base.join("source.scx");
+        let candidate = base.join("candidate.scx");
+        fs::copy(&fixture, &source).unwrap();
+        fs::copy(&fixture, &candidate).unwrap();
+        let original = fs::read(&source).unwrap();
+        isom::switchedit(&candidate, b"rename|1|Candidate Apply Test").unwrap();
+        let candidate_bytes = fs::read(&candidate).unwrap();
+        assert_ne!(candidate_bytes, original);
+        let safe = CandidateMapSafe::new(base.join("backups"), FakeStatus(false), FakeLock(false));
+        let record = safe
+            .apply(
+                &source,
+                &candidate,
+                &sha256_bytes(&original),
+                &sha256_bytes(&candidate_bytes),
+            )
+            .unwrap();
+        assert_eq!(fs::read(&source).unwrap(), candidate_bytes);
+        assert_eq!(fs::read(&record.backup_path).unwrap(), original);
+        safe.undo(&record).unwrap();
+        assert_eq!(fs::read(&source).unwrap(), original);
+        fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn interrupted_candidate_apply_restores_backup_from_pending_journal() {
+        let base = unique_temp_dir("candidate-pending-recovery");
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("crates")
+            .join("isom")
+            .join("tests")
+            .join("fixtures")
+            .join("map_agent_rich.scx");
+        let source = base.join("source.scx");
+        let candidate = base.join("candidate.scx");
+        fs::copy(&fixture, &source).unwrap();
+        fs::copy(&fixture, &candidate).unwrap();
+        let original = fs::read(&source).unwrap();
+        isom::switchedit(&candidate, b"rename|1|Interrupted Apply").unwrap();
+        let candidate_bytes = fs::read(&candidate).unwrap();
+        let backup_dir = base.join("backups");
+        let candidate_root = base.join("candidates");
+        fs::create_dir_all(&candidate_root).unwrap();
+        let safe = CandidateMapSafe::new(backup_dir.clone(), FakeStatus(false), FakeLock(false));
+        let record = safe
+            .apply(
+                &source,
+                &candidate,
+                &sha256_bytes(&original),
+                &sha256_bytes(&candidate_bytes),
+            )
+            .unwrap();
+        assert!(pending_apply_path(&record.backup_path).is_file());
+        assert_eq!(fs::read(&source).unwrap(), candidate_bytes);
+        assert_eq!(
+            recover_pending_candidate_applies(&backup_dir, &candidate_root).unwrap(),
+            1
+        );
+        assert_eq!(fs::read(&source).unwrap(), original);
+        assert!(!pending_apply_path(&record.backup_path).exists());
+        fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn post_apply_verification_failure_restores_backup_immediately() {
+        let base = unique_temp_dir("candidate-post-verify-rollback");
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("crates")
+            .join("isom")
+            .join("tests")
+            .join("fixtures")
+            .join("map_agent_rich.scx");
+        let source = base.join("source.scx");
+        let candidate = base.join("candidate.scx");
+        fs::copy(&fixture, &source).unwrap();
+        fs::copy(&fixture, &candidate).unwrap();
+        isom::switchedit(&candidate, b"rename|1|Forced Verify Failure").unwrap();
+        let original = fs::read(&source).unwrap();
+        let candidate_bytes = fs::read(&candidate).unwrap();
+        let safe = CandidateMapSafe::new(base.join("backups"), FakeStatus(false), FakeLock(false));
+        let error = safe
+            .apply_with_post_verify(
+                &source,
+                &candidate,
+                &sha256_bytes(&original),
+                &sha256_bytes(&candidate_bytes),
+                |_| Err(CandidateApplyError::Verify("forced post-check".to_string())),
+            )
+            .unwrap_err();
+        assert!(matches!(error, CandidateApplyError::Verify(_)));
+        assert_eq!(fs::read(&source).unwrap(), original);
+        fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn candidate_apply_refuses_compiling_lock_stale_and_candidate_mismatch() {
+        let base = unique_temp_dir("candidate-apply-guards");
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("crates")
+            .join("isom")
+            .join("tests")
+            .join("fixtures")
+            .join("map_agent_rich.scx");
+        let source = base.join("source.scx");
+        let candidate = base.join("candidate.scx");
+        fs::copy(&fixture, &source).unwrap();
+        fs::copy(&fixture, &candidate).unwrap();
+        let source_hash = sha256_file(&source).unwrap();
+        let candidate_hash = sha256_file(&candidate).unwrap();
+        let compiling = CandidateMapSafe::new(
+            base.join("compiling-backups"),
+            FakeStatus(true),
+            FakeLock(false),
+        );
+        assert!(matches!(
+            compiling.apply(&source, &candidate, &source_hash, &candidate_hash),
+            Err(CandidateApplyError::Compiling)
+        ));
+        let locked = CandidateMapSafe::new(
+            base.join("locked-backups"),
+            FakeStatus(false),
+            FakeLock(true),
+        );
+        assert!(matches!(
+            locked.apply(&source, &candidate, &source_hash, &candidate_hash),
+            Err(CandidateApplyError::MapLocked(_))
+        ));
+        let normal = CandidateMapSafe::new(
+            base.join("normal-backups"),
+            FakeStatus(false),
+            FakeLock(false),
+        );
+        assert!(matches!(
+            normal.apply(&source, &candidate, "stale", &candidate_hash),
+            Err(CandidateApplyError::StaleSource)
+        ));
+        assert!(matches!(
+            normal.apply(&source, &candidate, &source_hash, "changed"),
+            Err(CandidateApplyError::CandidateChanged)
+        ));
+        assert_eq!(sha256_file(&source).unwrap(), source_hash);
+        assert!(!base.join("normal-backups").exists());
+        fs::remove_dir_all(&base).ok();
+    }
+    #[cfg(windows)]
+    #[test]
+    fn real_windows_no_share_handle_blocks_candidate_apply() {
+        use std::os::windows::ffi::OsStrExt;
+        let base = unique_temp_dir("candidate-real-lock");
+        let source = make_map(&base, ORIGINAL);
+        let wide = source
+            .as_os_str()
+            .encode_wide()
+            .chain(Some(0))
+            .collect::<Vec<_>>();
+        // SAFETY: valid NUL-terminated path and documented read-only exclusive-open constants.
+        let handle = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                0x8000_0000,
+                0,
+                std::ptr::null_mut(),
+                3,
+                0,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_ne!(handle, usize::MAX as *mut core::ffi::c_void);
+        assert!(WindowsLockProbe.is_locked(&source));
+        // SAFETY: handle was returned by CreateFileW and is closed exactly once.
+        unsafe { CloseHandle(handle) };
+        assert!(!WindowsLockProbe.is_locked(&source));
         fs::remove_dir_all(&base).ok();
     }
 }

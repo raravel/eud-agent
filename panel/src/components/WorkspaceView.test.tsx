@@ -42,6 +42,24 @@ describe("WorkspaceView", () => {
     expect(screen.getByText("검토 대상 문서")).toBeInTheDocument();
   });
 
+  it("omits the duplicate close button when embedded in the project sidebar", () => {
+    render(
+      <WorkspaceView
+        workspace={workspace}
+        selectedPath={null}
+        selectedContent={null}
+        loading={false}
+        error={null}
+        embedded
+        {...callbacks()}
+      />,
+    );
+
+    expect(
+      screen.queryByRole("button", { name: "워크스페이스 닫기" }),
+    ).not.toBeInTheDocument();
+  });
+
   it("navigates relative Markdown links inside the workspace wiki", async () => {
     const handlers = callbacks();
     const wikiWorkspace: WorkspaceListResponse = {

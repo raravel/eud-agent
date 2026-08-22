@@ -25,6 +25,8 @@ happy-dom ^16.8.1.
 - tauri 2 (stable) — desktop shell, WebView2 host, IPC, bundler/updater
 - tauri-plugin-shell 2 — spawn the codex CLI subprocess
 - tauri-plugin-dialog 2 — first-run editor-path picker
+- tauri-winrt-notification 0.7 — branded Windows toast delivery and in-process activation callback
+- windows-registry 0.5 — registers the app's per-user AppUserModelID display name and icon
 - tokio 1 — async runtime (codex subprocess, file-IPC polling, downloads)
 - fastembed 5.15 — bge-m3 ONNX embeddings (query-time); pulls `ort` (pykeio ONNX RT)
 - rusqlite 0.32 — read the prebuilt RAG index (vectors + text + source metadata)
@@ -33,8 +35,11 @@ happy-dom ^16.8.1.
 - base64 0.22 — EPSNAPSHOT UTF-8 project-path manifest decoding
 - uuid 1 — collision-safe snapshot and analysis-directory request ownership
 - parking_lot 0.12 — serialized preflight/analyzer process state
-- windows-sys 0.59 — Job Object process-tree containment for the Node adapter
+- windows-sys 0.59 — Job Object process-tree containment plus the Windows `MessageBeep` default
+  notification sound used independently from native toast delivery
 - similar 2 — unified diff (replaces Python difflib)
+- image 0.25.10 with `default-features=false` and only png/jpeg/webp/gif — bounded Map Agent
+  attachment metadata/decode, first-frame GIF normalization, Lanczos3 aspect-preserving resize
 - which 8 — resolve codex and optional analyzer `node.exe` executables
 - serde 1 + serde_json 1 — config/IPC/manifest/framed adapter payloads
 - anyhow 1 + thiserror 1 — error handling
@@ -53,10 +58,12 @@ repository instructions.
   Its SHA-256, MIT license, and provenance are separate bundled resources.
 
 ## Legacy / Vendored
-- isom-poc C++ (`native/isom/`, vendored from `isom-poc/IsomTerrain/`) — MSBuild
-  solution: IsomTerrain (lib) + CrossCutLib + IcuLib (vendored ICU) + CascLib. Built to a
-  static `.lib` with a C ABI shim and linked into the Rust binary (Decision 09). Our repo
-  is the source of truth; the editor's own C++ is never touched.
+- isom-poc C++ (`native/isom/`, vendored from isom-poc/IsomTerrain/) — MSBuild
+  solution: IsomTerrain (lib) + CrossCutLib + IcuLib (vendored ICU) + CascLib. ABI v5 adds the
+  packed bounded image quantizer over the existing cached CV5/VX4/VR4/WPE loader; palette
+  construction, graphics validity, representative color, walkability, and height metadata remain
+  native authority. The static `.lib` is linked into the Rust binary (Decision 09). Our repo is
+  the source of truth; the editor's own C++ is never touched.
 - vendor/webview2 — 3 WebView2 SDK DLLs from the POC; under Tauri the WebView2 runtime is
   the system Evergreen runtime, so these are retained only as a fallback reference.
 - `vendor/epscript-lsp-agent` — generated, reviewable analyzer distribution. The build
@@ -98,7 +105,10 @@ repository instructions.
 - [BOUND 2026-06-08 from EUD-112-4f01] which 8.0.3 -- resolve the codex CLI shim path in codex_client (replaces Python shutil.which); honors CODEX_CMD override
 - [BOUND 2026-06-08 from EUD-113-ba2a] similar 2 — TextDiff unified-diff generation for the engine instruct code/diff seam
 - [BOUND 2026-06-09 from EUD-105-dba3] encoding_rs 0.8 — CHK string-table decode in src-tauri/src/chk.rs; EUC_KR == cp949 (WHATWG euc-kr index = unified hangul code), matching chk_info.py utf-8->cp949->latin-1 fallback for Korean map names
-- [BOUND 2026-08-20] png 0.18 — encodes bounded RGB minimap pixels as MCP `image/png`; reuses the workspace's existing transitive version and avoids the much larger general-purpose `image` API
+- [BOUND 2026-08-22] png 0.18 — encodes bounded RGB map-image previews and MCP minimap PNGs; no
+  base64 JSON image payload is used for Tauri binary preview IPC
+- [BOUND 2026-08-22] image 0.25.10, minimal png/jpeg/webp/gif codecs only — enforces Map Agent
+  decode limits and normalizes source RGBA before the native deterministic tile quantizer
 - [BOUND 2026-06-10 from EUD-138-db9b] undici ^7.16.0 — Naver-Cafe scraper HTTP client (tools/scraper, local-only cookie-gated; EUD-138)
 - [BOUND 2026-06-10 from EUD-138-db9b] cheerio ^1.1.2 — Naver-Cafe scraper HTML parsing (tools/scraper post -> corpus row mapping; EUD-138)
 - [BOUND 2026-06-12 from EUD-161-5726] ort =2.0.0-rc.12 — optional dependency gated ONLY by the ci `cuda` feature (local-only GPU differential-test track, never built in CI); pinned to exactly fastembed 5.16 transitive ort so cargo unifies the node and the default CPU build is unaffected

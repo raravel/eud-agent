@@ -237,16 +237,18 @@ export function WorkspaceView({
             {loading ? <Spinner className="size-3.5" /> : <RefreshCw className="size-3.5" />}
             새로 고침
           </Button>
-          <Button
-            type="button"
-            size="icon"
-            variant="ghost"
-            className="size-10"
-            aria-label="워크스페이스 닫기"
-            onClick={onClose}
-          >
-            <X className="size-4" aria-hidden="true" />
-          </Button>
+          {!embedded && (
+            <Button
+              type="button"
+              size="icon"
+              variant="ghost"
+              className="size-10"
+              aria-label="워크스페이스 닫기"
+              onClick={onClose}
+            >
+              <X className="size-4" aria-hidden="true" />
+            </Button>
+          )}
         </div>
       </header>
 

@@ -17,8 +17,8 @@
  * Revision replacement and expansion state are App-owned, so the component is
  * a controlled renderer of the selected session's active plan.
  */
-import { describe, it, expect, vi } from "vitest";
-import { render, screen, waitFor } from "@testing-library/react";
+import { beforeEach, describe, it, expect, vi } from "vitest";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { PlanView, type PlanViewProps } from "@/components/PlanView";
 import type { PlanState } from "@/state/store";
@@ -232,5 +232,45 @@ describe("PlanView — pending state", () => {
   it("disables 승인 while a turn is in flight", () => {
     render(<PlanView {...defaultPlanViewProps} plan={rev1} pending={true} />);
     expect(screen.getByRole("button", { name: "승인" })).toBeDisabled();
+  });
+});
+
+describe("PlanView — resizable height", () => {
+  beforeEach(() => {
+    localStorage.removeItem("eud.plan-view.height");
+  });
+
+  it("exposes a keyboard-accessible horizontal splitter and persists height", () => {
+    render(<PlanView {...defaultPlanViewProps} plan={rev1} />);
+    const splitter = screen.getByRole("separator", {
+      name: "계획 패널 높이 조절",
+    });
+
+    expect(splitter).toHaveAttribute("aria-orientation", "horizontal");
+    expect(splitter).toHaveAttribute("aria-valuenow", "320");
+
+    fireEvent.keyDown(splitter, { key: "ArrowUp" });
+
+    expect(splitter).toHaveAttribute("aria-valuenow", "336");
+    expect(localStorage.getItem("eud.plan-view.height")).toBe("336");
+    expect(screen.getByLabelText("계획 검토")).toHaveStyle({
+      height: "336px",
+    });
+  });
+
+  it("resizes upward by dragging the splitter", () => {
+    render(<PlanView {...defaultPlanViewProps} plan={rev1} />);
+    const splitter = screen.getByRole("separator", {
+      name: "계획 패널 높이 조절",
+    });
+
+    fireEvent.pointerDown(splitter, { pointerId: 1, clientY: 300 });
+    fireEvent.pointerMove(splitter, { pointerId: 1, clientY: 260 });
+    fireEvent.pointerUp(splitter, { pointerId: 1, clientY: 260 });
+
+    expect(splitter).toHaveAttribute("aria-valuenow", "360");
+    expect(screen.getByLabelText("계획 검토")).toHaveStyle({
+      height: "360px",
+    });
   });
 });

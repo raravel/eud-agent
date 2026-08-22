@@ -31,6 +31,12 @@ export default defineConfig({
   build: {
     // No source maps: keeps the build CDN-free and avoids shipping map URLs.
     sourcemap: false,
+    rollupOptions: {
+      input: {
+        main: path.resolve(root, "index.html"),
+        mapAgent: path.resolve(root, "map-agent.html"),
+      },
+    },
   },
   server: {
     // tauri.conf.json devUrl points here; strictPort so `cargo tauri dev`

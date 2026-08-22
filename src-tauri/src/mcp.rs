@@ -27,7 +27,7 @@ use rmcp::{ErrorData as McpError, RoleServer, ServerHandler};
 use serde_json::Value;
 
 use crate::tool_exec::SessionToolRuntime;
-use crate::tools::mcp_tool_descriptors;
+use crate::tools::{map_mcp_tool_descriptors, mcp_tool_descriptors};
 
 /// The MCP server name codex registers (matched by the approval handler).
 pub const SERVER_NAME: &str = "eud-tools";
@@ -48,10 +48,11 @@ impl ServerHandler for EudToolHandler {
     fn get_info(&self) -> ServerInfo {
         InitializeResult::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::from_build_env())
-            .with_instructions(
-                "EUD Editor 3 map tools. Edits go through the connected editor and a change \
-journal; mutating tools are gated until search_docs has grounded the change.",
-            )
+            .with_instructions(if self.runtime.kind() == crate::session::SessionKind::Map {
+                "Map Agent candidate tools. Draft tools can modify only the request-owned candidate; original Apply is not exposed."
+            } else {
+                "EUD Editor 3 tools. Shared writes use the project coordinator and changeset review."
+            })
     }
 
     async fn list_tools(
@@ -59,7 +60,9 @@ journal; mutating tools are gated until search_docs has grounded the change.",
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
-        Ok(ListToolsResult::with_all_items(tool_list()))
+        Ok(ListToolsResult::with_all_items(tool_list(
+            self.runtime.kind(),
+        )))
     }
 
     async fn call_tool(
@@ -96,8 +99,13 @@ journal; mutating tools are gated until search_docs has grounded the change.",
 
 /// Build the MCP `Tool` list from the registry's MCP descriptors (verbatim
 /// inputSchema per tool).
-fn tool_list() -> Vec<Tool> {
-    mcp_tool_descriptors()
+fn tool_list(kind: crate::session::SessionKind) -> Vec<Tool> {
+    let descriptors = if kind == crate::session::SessionKind::Map {
+        map_mcp_tool_descriptors()
+    } else {
+        mcp_tool_descriptors()
+    };
+    descriptors
         .into_iter()
         .filter_map(|descriptor| {
             let name = descriptor.get("name")?.as_str()?.to_string();
@@ -211,7 +219,7 @@ mod tests {
 
     #[test]
     fn tool_list_exposes_every_registry_tool_with_its_schema() {
-        let tools = tool_list();
+        let tools = tool_list(crate::session::SessionKind::Eps);
         let registry = crate::tools::tool_registry();
         assert_eq!(tools.len(), registry.len());
 
@@ -227,6 +235,20 @@ mod tests {
         assert!(tools.iter().any(|tool| tool.name == crate::tools::ASK_TOOL));
         // SCA is fully defunct — it must never appear as a tool.
         assert!(!tools.iter().any(|tool| tool.name.contains("sca")));
+    }
+
+    #[test]
+    fn map_tool_list_excludes_original_apply_and_eps_mutations() {
+        let tools = tool_list(crate::session::SessionKind::Map);
+        let registry = crate::tools::map_tool_registry();
+        assert_eq!(tools.len(), registry.len());
+        assert!(tools
+            .iter()
+            .any(|tool| tool.name == "map_candidate_finalize"));
+        assert!(tools.iter().any(|tool| tool.name == crate::tools::ASK_TOOL));
+        assert!(!tools.iter().any(|tool| tool.name.contains("apply")));
+        assert!(!tools.iter().any(|tool| tool.name == "file_write"));
+        assert!(!tools.iter().any(|tool| tool.name == "location_write"));
     }
 
     #[test]

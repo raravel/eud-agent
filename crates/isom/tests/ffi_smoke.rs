@@ -8,11 +8,12 @@
 use std::fs;
 use std::path::PathBuf;
 
-/// The linked static lib reports ABI version 2 (and matches the -sys const).
+/// The linked static lib reports ABI version 5 (and matches the -sys const).
 #[test]
-fn abi_version_is_two() {
-    assert_eq!(isom::abi_version(), 2);
+fn abi_version_is_five() {
+    assert_eq!(isom::abi_version(), 5);
     assert_eq!(isom::abi_version(), isom_sys::ISOM_ABI_VERSION as i32);
+    isom::assert_abi_version().expect("ABI v5 startup assertion must pass");
 }
 
 /// A NUL byte inside the path can never reach the C side — the CString build

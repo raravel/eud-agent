@@ -165,6 +165,19 @@ describe("ASK lifecycle", () => {
     expect(store.getState().phase).toBe("thinking");
   });
 
+  it("restores a backend-pending ASK after local turn state was lost", () => {
+    const store = readyWithProject();
+
+    store.askReceived("ask-recovered", questions);
+
+    expect(store.getState().phase).toBe("thinking");
+    expect(store.getState().ask).toEqual({
+      requestId: "ask-recovered",
+      questions,
+      submitting: false,
+    });
+  });
+
   it("clears a pending question when the turn is cancelled", () => {
     const store = readyWithProject();
     store.chatSent();

@@ -17,20 +17,16 @@ include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 /// `tests/ffi_smoke.rs` integration test here).
 #[doc(hidden)]
 #[used]
-pub static __ISOM_LINK_ANCHOR: unsafe extern "C" fn() -> ::std::os::raw::c_int =
-    isom_abi_version;
+pub static __ISOM_LINK_ANCHOR: unsafe extern "C" fn() -> ::std::os::raw::c_int = isom_abi_version;
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// The bindgen-generated `isom_abi_version` links against the static lib and
-    /// returns ISOM_ABI_VERSION (== 1). Proves the C lib built + linked and the
-    /// bindings match the header. This lives in-crate (not only in tests/) so the
-    /// build-script `cargo:rustc-link-lib=static=isom_capi` directive applies to
-    /// the same compilation unit.
+    /// The bindgen-generated accessor proves the linked static library and
+    /// generated header agree on ABI v5.
     #[test]
-    fn abi_version_is_one() {
+    fn abi_version_matches_header() {
         assert_eq!(unsafe { isom_abi_version() }, ISOM_ABI_VERSION as i32);
     }
 }

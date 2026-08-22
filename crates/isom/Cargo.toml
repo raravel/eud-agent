@@ -8,4 +8,6 @@ build = "build.rs"
 
 [dependencies]
 isom-sys = { path = "../isom-sys" }
+serde_json = "1"
+sha2 = "0.10"
 thiserror = "1"

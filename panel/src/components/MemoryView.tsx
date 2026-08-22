@@ -68,15 +68,17 @@ export function MemoryView({
             <Save className="mr-1 size-3.5" aria-hidden="true" />
             저장
           </Button>
-          <Button
-            type="button"
-            size="icon"
-            variant="ghost"
-            aria-label="닫기"
-            onClick={onClose}
-          >
-            <X className="size-4" aria-hidden="true" />
-          </Button>
+          {!embedded && (
+            <Button
+              type="button"
+              size="icon"
+              variant="ghost"
+              aria-label="닫기"
+              onClick={onClose}
+            >
+              <X className="size-4" aria-hidden="true" />
+            </Button>
+          )}
         </div>
       </div>
 

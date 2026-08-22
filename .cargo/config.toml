@@ -1,0 +1,4 @@
+[build]
+# Tauri + ORT + the native static library exceed the Windows commit limit when
+# Cargo links the app library and its test harness concurrently.
+jobs = 1

@@ -172,9 +172,26 @@ state: runtime state comes from Switch conditions and Set Switch actions, which
 - Input rejects ids outside 1-256, empty names, and op delimiters
   (NUL/CR/LF/`|`).
 
+## Map Agent candidate location path
+
+Map Agent location changes are separate from the direct `location_write` tool. The model writes
+typed `location.add/set/rename/delete` operations only into its request draft via ABI v5
+`isom_mapedit`; it cannot call original Apply. With no current-request target, location changes
+may use the whole current candidate; current targets narrow them to their exact location-enabled
+cells, and protect always blocks its cells/layers. Exact location mentions remain bound to their
+revision, baseline hash, and MRGN id. Candidate verification also requires stable MRGN slot count,
+unchanged `#64 Anywhere`, preserved trigger references, and preserved unsupported sections/assets.
+Deleting a trigger-used location still fails in the native engine.
+
+After the user selects whole-candidate Apply in the Map Agent window, `CandidateMapSafe` performs
+the same compiling/no-share/hash/backup/atomic-replace rails and post-write verification. The
+direct `location_write` command remains the single-operation, plan-gated EPS-session workflow;
+neither path bypasses the other's trust boundary or mutates an unsaved map.
+
 ## Out of scope
 
-- General unit/terrain/force writes (same playeredit pattern when wanted).
+- General unit/terrain/force writes as direct EPS-session tools. Terrain, object, and location
+  edits are available only through the isolated Map Agent candidate workflow.
 - Auto-expanding an original-SC 64-slot MRGN to 255 (`addLocation` errors
   clearly; expansion changes the map version — a separate decision).
 - Multi-op batching per tool call (one op = one journal entry = one reviewable

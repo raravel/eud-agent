@@ -31,6 +31,7 @@ use crate::workspace::{apply_exact_text_edits, ExactTextEdit};
 /// Maximum `search_docs` top-k (mirrors the registry/feature 11 clamp).
 const SEARCH_DOCS_MAX_K: i64 = 10;
 const SEARCH_DOCS_DEFAULT_K: i64 = 5;
+const MAP_PALETTE_QUERY_MAX_MATCHES: usize = 256;
 
 /// Editor build-state probe backed by the editor `status.txt`, resolved from
 /// `config.json` on each read (the editor path can change at runtime, and the
@@ -66,12 +67,15 @@ pub struct ToolServices {
     map_safe: Arc<ProductionMapSafe>,
     analyzer: Arc<dyn EpsAnalyzer>,
     writes: crate::write_coordinator::ProjectWriteCoordinator,
+    map_candidates: crate::map_candidate::CandidateStore,
+    map_images: crate::map_image::MapImageService,
 }
 
 impl ToolServices {
     pub fn new(
         dirs: DataDirs,
         analyzer: Arc<dyn EpsAnalyzer>,
+        map_candidates: crate::map_candidate::CandidateStore,
         writes: crate::write_coordinator::ProjectWriteCoordinator,
     ) -> Self {
         let journal = JournalStore::new(dirs.app_data());
@@ -88,12 +92,25 @@ impl ToolServices {
             rag,
             map_safe,
             analyzer,
+            map_candidates,
+            map_images: crate::map_image::MapImageService::new(),
             writes,
         }
     }
 
     pub fn session(&self, session_id: impl Into<String>) -> SessionToolRuntime {
         SessionToolRuntime::new(self.clone(), session_id.into())
+    }
+    pub fn map_session(&self, session_id: impl Into<String>) -> SessionToolRuntime {
+        SessionToolRuntime::new_kind(
+            self.clone(),
+            session_id.into(),
+            crate::session::SessionKind::Map,
+        )
+    }
+
+    pub fn map_candidates(&self) -> crate::map_candidate::CandidateStore {
+        self.map_candidates.clone()
     }
 
     pub fn rag(&self) -> Arc<Rag> {
@@ -110,6 +127,7 @@ struct SessionRequest {
     request_id: String,
     project_id: String,
     workspace_root: Option<PathBuf>,
+    image_refs: BTreeMap<String, crate::map_image::MapImageBinding>,
 }
 
 #[derive(Debug, Default)]
@@ -120,6 +138,7 @@ struct SessionWriteState {
 type AskEmitter = Arc<dyn Fn(crate::ipc::AskEvent) -> Result<(), String> + Send + Sync>;
 
 struct PendingAsk {
+    owner_request_id: String,
     questions: Vec<crate::ipc::AskQuestion>,
     response: tokio::sync::oneshot::Sender<Result<BTreeMap<String, crate::ipc::AskAnswer>, String>>,
 }
@@ -272,6 +291,7 @@ fn validate_ask_answers(
 pub struct SessionToolRuntime {
     services: ToolServices,
     session_id: String,
+    kind: crate::session::SessionKind,
     eps_preflight: Arc<EpsPreflight>,
     request: Arc<Mutex<Option<SessionRequest>>>,
     request_state: Arc<Mutex<Option<RequestState>>>,
@@ -281,8 +301,29 @@ pub struct SessionToolRuntime {
     ask: Arc<Mutex<AskState>>,
 }
 
+struct PendingAskLease {
+    runtime: SessionToolRuntime,
+    request_id: String,
+}
+
+impl Drop for PendingAskLease {
+    fn drop(&mut self) {
+        if self.runtime.remove_pending_ask(&self.request_id).is_some() {
+            self.runtime.emit_activity_after_ask();
+        }
+    }
+}
+
 impl SessionToolRuntime {
     pub fn new(services: ToolServices, session_id: String) -> Self {
+        Self::new_kind(services, session_id, crate::session::SessionKind::Eps)
+    }
+
+    pub fn new_kind(
+        services: ToolServices,
+        session_id: String,
+        kind: crate::session::SessionKind,
+    ) -> Self {
         let eps_preflight = Arc::new(EpsPreflight::new(
             services.dirs.clone(),
             Arc::clone(&services.analyzer),
@@ -290,6 +331,7 @@ impl SessionToolRuntime {
         Self {
             services,
             session_id,
+            kind,
             eps_preflight,
             request: Arc::new(Mutex::new(None)),
             request_state: Arc::new(Mutex::new(None)),
@@ -302,6 +344,9 @@ impl SessionToolRuntime {
 
     pub fn session_id(&self) -> &str {
         &self.session_id
+    }
+    pub fn kind(&self) -> crate::session::SessionKind {
+        self.kind
     }
 
     pub fn journal(&self) -> &JournalStore {
@@ -324,9 +369,9 @@ impl SessionToolRuntime {
     }
 
     pub async fn ask(&self, args: &Value) -> Result<Value, String> {
-        if self.current_request_id().is_none() {
-            return Err("no agent request is open; ask is only valid during a turn".to_string());
-        }
+        let owner_request_id = self.current_request_id().ok_or_else(|| {
+            "no agent request is open; ask is only valid during a turn".to_string()
+        })?;
         let input: AskToolInput = serde_json::from_value(args.clone())
             .map_err(|error| format!("invalid ask arguments: {error}"))?;
         validate_ask_questions(&input.questions)?;
@@ -349,22 +394,23 @@ impl SessionToolRuntime {
             ask.pending.insert(
                 request_id.clone(),
                 PendingAsk {
+                    owner_request_id,
                     questions: input.questions.clone(),
                     response: send,
                 },
             );
             (request_id, response, emitter)
         };
+        let _lease = PendingAskLease {
+            runtime: self.clone(),
+            request_id: request_id.clone(),
+        };
 
         self.emit_activity(crate::write_coordinator::SessionActivity::WaitingInput);
-        if let Err(error) = emitter(crate::ipc::AskEvent {
-            request_id: request_id.clone(),
+        emitter(crate::ipc::AskEvent {
+            request_id,
             questions: input.questions,
-        }) {
-            self.ask.lock().pending.remove(&request_id);
-            self.emit_activity_after_ask();
-            return Err(error);
-        }
+        })?;
 
         let answers = response
             .await
@@ -372,6 +418,20 @@ impl SessionToolRuntime {
         Ok(json!({ "answers": answers }))
     }
 
+    pub fn pending_ask(&self) -> Option<crate::ipc::AskEvent> {
+        let owner_request_id = self.current_request_id()?;
+        let ask = self.ask.lock();
+        ask.pending.iter().find_map(|(request_id, pending)| {
+            (pending.owner_request_id == owner_request_id).then(|| crate::ipc::AskEvent {
+                request_id: request_id.clone(),
+                questions: pending.questions.clone(),
+            })
+        })
+    }
+
+    fn remove_pending_ask(&self, request_id: &str) -> Option<PendingAsk> {
+        self.ask.lock().pending.remove(request_id)
+    }
     pub fn answer_ask(
         &self,
         request_id: &str,
@@ -423,15 +483,83 @@ impl SessionToolRuntime {
                 ticket.request_id()
             ));
         }
+        if self
+            .current_request_id()
+            .as_deref()
+            .is_some_and(|current| current != request_id)
+        {
+            self.cancel_pending_ask();
+        }
         *self.request.lock() = Some(SessionRequest {
             request_id: request_id.to_owned(),
             project_id: project_id.to_owned(),
             workspace_root: None,
+            image_refs: BTreeMap::new(),
         });
         *self.request_state.lock() = Some(RequestState::for_request(request_id));
         *self.pending_plan.lock() = None;
         self.eps_preflight.begin_request(request_id);
         Ok(())
+    }
+
+    pub fn bind_map_images(
+        &self,
+        request_id: &str,
+        attachments: &[crate::attachment::ResolvedImageAttachment],
+    ) -> Result<Vec<crate::map_image::MapImageRequestRef>, String> {
+        if self.kind != crate::session::SessionKind::Map {
+            return Err(
+                "request-local imageRef bindings are available only to Map Agent".to_string(),
+            );
+        }
+        let project_id = self
+            .request
+            .lock()
+            .as_ref()
+            .filter(|request| request.request_id == request_id)
+            .map(|request| request.project_id.clone())
+            .ok_or_else(|| format!("request {request_id} is not active"))?;
+        let state = self
+            .services
+            .map_candidates
+            .state(&project_id, &self.session_id)?;
+        let bindings = self.services.map_images.bind_request_images(
+            &self.session_id,
+            request_id,
+            attachments,
+            &state.revision_key,
+            &state.baseline.file_sha256,
+        )?;
+        let refs = bindings
+            .iter()
+            .map(crate::map_image::MapImageBinding::request_ref)
+            .collect();
+        let mut request = self.request.lock();
+        let request = request
+            .as_mut()
+            .filter(|request| request.request_id == request_id)
+            .ok_or_else(|| format!("request {request_id} ended while images were binding"))?;
+        request.image_refs = bindings
+            .into_iter()
+            .map(|binding| (binding.image_ref.clone(), binding))
+            .collect();
+        Ok(refs)
+    }
+
+    fn map_image_binding(
+        &self,
+        request_id: &str,
+        image_ref: &str,
+    ) -> Result<crate::map_image::MapImageBinding, String> {
+        self.request
+            .lock()
+            .as_ref()
+            .filter(|request| request.request_id == request_id)
+            .and_then(|request| request.image_refs.get(image_ref))
+            .cloned()
+            .ok_or_else(|| {
+                format!("imageRef '{image_ref}' is not bound to the current Map Agent request")
+            })
     }
 
     pub fn current_request_id(&self) -> Option<String> {
@@ -636,6 +764,14 @@ impl SessionToolRuntime {
         let request_id = self.current_request_id().ok_or_else(|| {
             "no agent request is open; tool calls are only valid during a turn".to_string()
         })?;
+        if self.kind == crate::session::SessionKind::Map {
+            if !tools::is_map_tool(tool) {
+                return Err(format!(
+                    "tool '{tool}' is not available to Map Agent; original Apply is intentionally absent"
+                ));
+            }
+            return self.dispatch_map(&request_id, tool, args);
+        }
 
         if tools::is_mutating_tool(tool) && !self.owns_write_registration() {
             return Err(
@@ -674,6 +810,222 @@ stop this turn so the backend can resume the same thread in its isolated writabl
 
     fn bridge(&self) -> Result<BridgeIo, String> {
         crate::ipc::bridge_from_config(&self.services.dirs)
+    }
+
+    fn dispatch_map(&self, request_id: &str, tool: &str, args: &Value) -> Result<Value, String> {
+        let project_id = self
+            .current_project_id()
+            .ok_or_else(|| "no Map Agent project is open".to_string())?;
+        let candidates = self.services.map_candidates();
+        match tool {
+            "map_status" => serde_json::to_value(candidates.state(&project_id, &self.session_id)?)
+                .map_err(|error| error.to_string()),
+            "map_selection_read" => {
+                let selection_id = str_arg(args, "selectionId")?;
+                let state = candidates.state(&project_id, &self.session_id)?;
+                let selection = state
+                    .selections
+                    .into_iter()
+                    .find(|selection| selection.selection.id == selection_id)
+                    .ok_or_else(|| format!("selection '{selection_id}' does not exist"))?;
+                serde_json::to_value(selection).map_err(|error| error.to_string())
+            }
+            "map_objects_read" => {
+                let layer = str_arg(args, "layer")?;
+                let offset = usize_arg_default(args, "offset", 0)?;
+                let limit = usize_arg_default(args, "limit", 100)?.min(500);
+                let state = candidates.state(&project_id, &self.session_id)?;
+                let map = candidates.current_map(&project_id, &self.session_id)?;
+                let page = map_objects_page(
+                    &map,
+                    candidates.context().starcraft_path()?.as_path(),
+                    &state.revision_key,
+                    &state.baseline.file_sha256,
+                    layer,
+                    offset,
+                    limit,
+                )?;
+                candidates.annotate_object_page(&project_id, &self.session_id, page)
+            }
+            "map_render" => {
+                let state = candidates.state(&project_id, &self.session_id)?;
+                let map = candidates.current_map(&project_id, &self.session_id)?;
+                render_map_tool(
+                    &map,
+                    &state,
+                    args,
+                    candidates.context().starcraft_path()?.as_path(),
+                )
+            }
+            "map_palette_query" => {
+                let state = candidates.state(&project_id, &self.session_id)?;
+                let request = map_palette_catalog_request(args, state.baseline.tileset.era())?;
+                let result = isom::catalog_query(
+                    &candidates.context().starcraft_path()?,
+                    request.to_string().as_bytes(),
+                )
+                .map_err(|error| error.to_string())?;
+                let value: Value =
+                    serde_json::from_str(&result).map_err(|error| error.to_string())?;
+                enforce_map_palette_result_bound(value)
+            }
+            "map_tile_info" => {
+                let state = candidates.state(&project_id, &self.session_id)?;
+                let tile_id = usize_arg_default(args, "tileId", usize::MAX)?;
+                let request = json!({
+                    "schema": "eud-map-catalog/1",
+                    "kind": "tiles",
+                    "tileset": state.baseline.tileset.era(),
+                    "offset": tile_id,
+                    "limit": 1,
+                });
+                let result = isom::catalog_query(
+                    &candidates.context().starcraft_path()?,
+                    request.to_string().as_bytes(),
+                )
+                .map_err(|error| error.to_string())?;
+                let value: Value =
+                    serde_json::from_str(&result).map_err(|error| error.to_string())?;
+                value["entries"]
+                    .as_array()
+                    .and_then(|entries| entries.first())
+                    .cloned()
+                    .ok_or_else(|| format!("tile {tile_id} does not exist in this tileset"))
+            }
+            "map_analyze" | "map_candidate_diff" => {
+                let state = candidates.state(&project_id, &self.session_id)?;
+                let revision = state
+                    .revisions
+                    .iter()
+                    .find(|revision| revision.revision == state.current_revision);
+                Ok(json!({
+                    "candidateRevision": state.current_revision,
+                    "stale": state.stale,
+                    "diff": revision.map(|revision| &revision.diff),
+                    "verification": revision.map(|revision| &revision.verification),
+                }))
+            }
+            "map_draft_begin" => candidates.draft_begin(&project_id, &self.session_id, request_id),
+            "map_stamp_preview" => {
+                let input: crate::map_stamp::StampPreviewInput =
+                    serde_json::from_value(args.clone())
+                        .map_err(|error| format!("invalid map_stamp_preview arguments: {error}"))?;
+                serde_json::to_value(candidates.draft_stamp_preview(
+                    &project_id,
+                    &self.session_id,
+                    request_id,
+                    &input.selection_id,
+                    &input.destinations,
+                )?)
+                .map_err(|error| error.to_string())
+            }
+            "map_stamp_place" => {
+                let input: crate::map_stamp::StampPlaceInput = serde_json::from_value(args.clone())
+                    .map_err(|error| format!("invalid map_stamp_place arguments: {error}"))?;
+                serde_json::to_value(candidates.draft_stamp_place(
+                    &project_id,
+                    &self.session_id,
+                    request_id,
+                    &input.selection_id,
+                    &input.destinations,
+                    input.collision_policy,
+                )?)
+                .map_err(|error| error.to_string())
+            }
+            "map_draft_patch" => {
+                let operations: Vec<crate::map_model::MapOperation> = serde_json::from_value(
+                    args.get("operations")
+                        .cloned()
+                        .ok_or_else(|| "map_draft_patch requires operations".to_string())?,
+                )
+                .map_err(|error| format!("invalid map draft operations: {error}"))?;
+                candidates.draft_patch(&project_id, &self.session_id, request_id, operations)
+            }
+            "map_image_place" => {
+                let input: crate::map_image::MapImagePlaceInput =
+                    serde_json::from_value(args.clone())
+                        .map_err(|error| format!("invalid map_image_place arguments: {error}"))?;
+                let binding = self.map_image_binding(request_id, &input.image_ref)?;
+                if binding.session_id != self.session_id || binding.request_id != request_id {
+                    return Err(
+                        "imageRef belongs to another Map Agent session or request".to_string()
+                    );
+                }
+                let state = candidates.state(&project_id, &self.session_id)?;
+                if binding.candidate_revision_key != state.revision_key
+                    || binding.baseline_hash != state.baseline.file_sha256
+                {
+                    return Err("imageRef belongs to another candidate revision".to_string());
+                }
+                if !candidates.request_has_draft(&self.session_id, request_id)? {
+                    candidates.draft_begin(&project_id, &self.session_id, request_id)?;
+                }
+                let (authority, expected_revision, draft) =
+                    candidates.image_request_context(&project_id, &self.session_id, request_id)?;
+                let starcraft_path = candidates.context().starcraft_path()?;
+                let conversion = self.services.map_images.convert(
+                    &self.session_id,
+                    &binding.attachment,
+                    input.placement(),
+                    crate::map_image::MapImageMapContext {
+                        map_path: &draft,
+                        revision: &expected_revision,
+                        authority: &authority,
+                        starcraft_path: &starcraft_path,
+                    },
+                )?;
+                if conversion.report.protected_conflicts != 0 {
+                    return Err(format!(
+                        "map_image_place changes {} protected terrain cell(s)",
+                        conversion.report.protected_conflicts
+                    ));
+                }
+                if conversion.report.outside_authority_conflicts != 0 {
+                    return Err(format!(
+                        "map_image_place changes {} cell(s) outside the current terrain authority",
+                        conversion.report.outside_authority_conflicts
+                    ));
+                }
+                let report = conversion.report;
+                let patch = candidates.draft_patch_image(
+                    &project_id,
+                    &self.session_id,
+                    request_id,
+                    conversion.operation,
+                    conversion.metadata,
+                )?;
+                Ok(json!({
+                    "ok": true,
+                    "imageRef": input.image_ref,
+                    "report": report,
+                    "draft": patch,
+                }))
+            }
+            "map_draft_render" => {
+                let state = candidates.state(&project_id, &self.session_id)?;
+                let map = candidates.draft_map(&self.session_id, request_id)?;
+                render_map_tool(
+                    &map,
+                    &state,
+                    args,
+                    candidates.context().starcraft_path()?.as_path(),
+                )
+            }
+            "map_draft_analyze" => serde_json::to_value(candidates.draft_analyze(
+                &project_id,
+                &self.session_id,
+                request_id,
+            )?)
+            .map_err(|error| error.to_string()),
+            "map_draft_reset" => candidates.draft_reset(&project_id, &self.session_id, request_id),
+            "map_candidate_finalize" => serde_json::to_value(candidates.finalize(
+                &project_id,
+                &self.session_id,
+                request_id,
+            )?)
+            .map_err(|error| error.to_string()),
+            _ => Err(format!("unknown Map Agent tool '{tool}'")),
+        }
     }
 
     fn dispatch(&self, request_id: &str, tool: &str, args: &Value) -> Result<Value, String> {
@@ -1619,9 +1971,11 @@ impl ToolServices {
             crate::eps_preflight::SkipReason::AdapterMissing,
             "test runtime has no adapter resource",
         ));
+        let candidates = crate::map_candidate::CandidateStore::new(dirs.clone());
         Self::new(
             dirs,
             analyzer,
+            candidates,
             crate::write_coordinator::ProjectWriteCoordinator::silent(),
         )
     }
@@ -1632,6 +1986,326 @@ impl SessionToolRuntime {
     pub fn for_tests() -> Self {
         ToolServices::for_tests().session("test-session")
     }
+}
+
+fn map_palette_catalog_request(args: &Value, tileset: u16) -> Result<Value, String> {
+    if args.get("offset").is_some() || args.get("limit").is_some() {
+        return Err(
+            "map_palette_query does not accept pagination; refine query/filter instead".to_string(),
+        );
+    }
+    let kind = str_arg(args, "kind")?;
+    let query = match args.get("query") {
+        Some(value) => {
+            let query = value
+                .as_str()
+                .ok_or_else(|| "argument 'query' must be a string".to_string())?
+                .trim();
+            if query.is_empty() {
+                return Err("map_palette_query query must not be blank".to_string());
+            }
+            Some(query)
+        }
+        None => None,
+    };
+    let filter = match args.get("filter") {
+        Some(value) => {
+            let object = value
+                .as_object()
+                .ok_or_else(|| "argument 'filter' must be an object".to_string())?;
+            if object.is_empty() {
+                return Err("map_palette_query filter must not be empty".to_string());
+            }
+            Some(value)
+        }
+        None => None,
+    };
+    if query.is_none() && filter.is_none() {
+        return Err(
+            "map_palette_query requires a non-blank name query or structured filter".to_string(),
+        );
+    }
+
+    let mut request = json!({
+        "schema": "eud-map-catalog/1",
+        "kind": kind,
+        "tileset": tileset,
+        "offset": 0,
+        "limit": MAP_PALETTE_QUERY_MAX_MATCHES + 1,
+    });
+    if let Some(query) = query {
+        request["query"] = json!(query);
+    }
+    if let Some(filter) = filter {
+        request["filter"] = filter.clone();
+    }
+    Ok(request)
+}
+
+fn enforce_map_palette_result_bound(value: Value) -> Result<Value, String> {
+    let total = value
+        .get("total")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| "map palette catalog response is missing integer total".to_string())?;
+    if total > MAP_PALETTE_QUERY_MAX_MATCHES as u64 {
+        return Err(format!(
+            "map_palette_query matched {total} entries; refine query/filter to at most {MAP_PALETTE_QUERY_MAX_MATCHES} matches (for exact tiles, search brushes first and filter by terrainType, group, or tile metadata)"
+        ));
+    }
+    let returned = value
+        .get("entries")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "map palette catalog response is missing entries".to_string())?
+        .len() as u64;
+    if returned != total {
+        return Err(format!(
+            "map palette catalog returned {returned} of {total} bounded matches"
+        ));
+    }
+    Ok(value)
+}
+
+fn usize_arg_default(args: &Value, name: &str, default: usize) -> Result<usize, String> {
+    let Some(value) = args.get(name) else {
+        return Ok(default);
+    };
+    let value = value
+        .as_u64()
+        .or_else(|| value.as_str().and_then(|text| text.parse().ok()))
+        .ok_or_else(|| format!("argument '{name}' must be a non-negative integer"))?;
+    usize::try_from(value).map_err(|_| format!("argument '{name}' is too large"))
+}
+fn render_scale_arg(args: &Value) -> Result<usize, String> {
+    let scale = usize_arg_default(args, "scale", 4)?;
+    if !matches!(scale, 1 | 2 | 4 | 8) {
+        return Err("map render scale must be 1, 2, 4, or 8".to_string());
+    }
+    Ok(scale)
+}
+
+fn render_map_tool(
+    map: &std::path::Path,
+    state: &crate::map_candidate::CandidateStateView,
+    args: &Value,
+    starcraft_path: &std::path::Path,
+) -> Result<Value, String> {
+    let x = usize_arg_default(args, "x", 0)?;
+    let y = usize_arg_default(args, "y", 0)?;
+    let width = usize_arg_default(args, "width", usize::from(state.baseline.width))?;
+    let height = usize_arg_default(args, "height", usize::from(state.baseline.height))?;
+    let scale = render_scale_arg(args)?;
+    if width == 0
+        || height == 0
+        || x + width > usize::from(state.baseline.width)
+        || y + height > usize::from(state.baseline.height)
+    {
+        return Err("map render crop is outside candidate dimensions".to_string());
+    }
+    let layers = args
+        .get("layers")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_else(|| {
+            vec![
+                json!("terrain"),
+                json!("doodads"),
+                json!("sprites"),
+                json!("units"),
+                json!("buildings"),
+            ]
+        });
+    let request = json!({
+        "schema": "eud-map-render/1",
+        "mode": "region",
+        "x": x,
+        "y": y,
+        "width": width,
+        "height": height,
+        "scale": scale,
+        "layers": layers,
+    });
+    let image = isom::render_region(map, starcraft_path, request.to_string().as_bytes())
+        .map_err(|error| format!("map render failed: {error}"))?;
+    crate::map_agent::mcp_image(&image)
+}
+
+pub(crate) struct MapObjectSnapshot {
+    layers: std::collections::BTreeMap<&'static str, Vec<Value>>,
+}
+
+impl MapObjectSnapshot {
+    pub(crate) fn page(&self, layer: &str, offset: usize, limit: usize) -> Result<Value, String> {
+        let items = self
+            .layers
+            .get(layer)
+            .ok_or_else(|| format!("unsupported map object layer '{layer}'"))?;
+        let total = items.len();
+        let items = items
+            .iter()
+            .skip(offset)
+            .take(limit)
+            .cloned()
+            .collect::<Vec<_>>();
+        Ok(json!({"layer": layer, "offset": offset, "total": total, "items": items}))
+    }
+}
+
+pub(crate) fn map_object_snapshot(
+    map: &std::path::Path,
+    starcraft_path: &std::path::Path,
+    revision_key: &str,
+    baseline_hash: &str,
+) -> Result<MapObjectSnapshot, String> {
+    let chk = isom::chk_extract(map).map_err(|error| error.to_string())?;
+    let digest = crate::chk::digest_chk(&chk);
+    let sections = crate::chk::assemble_sections(&crate::chk::walk_sections(&chk));
+    let buildings = map_building_ids(starcraft_path, &digest.map.tileset)?;
+    let mut layers = std::collections::BTreeMap::from([
+        ("units", Vec::new()),
+        ("buildings", Vec::new()),
+        ("doodads", Vec::new()),
+        ("sprites", Vec::new()),
+        ("locations", Vec::new()),
+    ]);
+
+    let raw_units = sections.get("UNIT").map(Vec::as_slice).unwrap_or(&[]);
+    for (ordinal, (unit, bytes)) in digest
+        .units
+        .iter()
+        .zip(raw_units.chunks_exact(crate::chk::UNIT_ENTRY_SIZE))
+        .enumerate()
+    {
+        let building = buildings.contains(&unit.type_id);
+        let layer = if building { "buildings" } else { "units" };
+        layers
+            .get_mut(layer)
+            .expect("object layer exists")
+            .push(json!({
+                "object": unit,
+                "objectRef": {
+                    "kind": if building { "building" } else { "unit" },
+                    "ordinal": ordinal,
+                    "semanticFingerprint": crate::map_model::hex_sha256(bytes),
+                    "revisionKey": revision_key,
+                    "baselineHash": baseline_hash,
+                }
+            }));
+    }
+
+    let raw_doodads = sections.get("DD2 ").map(Vec::as_slice).unwrap_or(&[]);
+    for doodad in &digest.doodads {
+        let start = doodad.ordinal.saturating_mul(crate::chk::DD2_ENTRY_SIZE);
+        let Some(bytes) = raw_doodads.get(start..start.saturating_add(crate::chk::DD2_ENTRY_SIZE))
+        else {
+            continue;
+        };
+        layers
+            .get_mut("doodads")
+            .expect("object layer exists")
+            .push(json!({
+                "object": doodad,
+                "objectRef": {
+                    "kind": "doodad",
+                    "ordinal": doodad.ordinal,
+                    "semanticFingerprint": crate::map_model::hex_sha256(bytes),
+                    "revisionKey": revision_key,
+                    "baselineHash": baseline_hash,
+                }
+            }));
+    }
+
+    let raw_sprites = sections.get("THG2").map(Vec::as_slice).unwrap_or(&[]);
+    for sprite in &digest.sprites {
+        let start = sprite.ordinal.saturating_mul(crate::chk::THG2_ENTRY_SIZE);
+        let Some(bytes) = raw_sprites.get(start..start.saturating_add(crate::chk::THG2_ENTRY_SIZE))
+        else {
+            continue;
+        };
+        layers
+            .get_mut("sprites")
+            .expect("object layer exists")
+            .push(json!({
+                "object": sprite,
+                "objectRef": {
+                    "kind": "sprite",
+                    "ordinal": sprite.ordinal,
+                    "semanticFingerprint": crate::map_model::hex_sha256(bytes),
+                    "revisionKey": revision_key,
+                    "baselineHash": baseline_hash,
+                }
+            }));
+    }
+
+    layers
+        .get_mut("locations")
+        .expect("object layer exists")
+        .extend(digest.locations.iter().map(|location| {
+            json!({
+                "location": location,
+                "revisionKey": revision_key,
+                "baselineHash": baseline_hash,
+            })
+        }));
+
+    Ok(MapObjectSnapshot { layers })
+}
+
+pub(crate) fn map_objects_page(
+    map: &std::path::Path,
+    starcraft_path: &std::path::Path,
+    revision_key: &str,
+    baseline_hash: &str,
+    layer: &str,
+    offset: usize,
+    limit: usize,
+) -> Result<Value, String> {
+    map_object_snapshot(map, starcraft_path, revision_key, baseline_hash)?
+        .page(layer, offset, limit)
+}
+
+pub(crate) fn map_building_ids(
+    starcraft_path: &std::path::Path,
+    tileset_name: &str,
+) -> Result<std::collections::BTreeSet<u16>, String> {
+    let tileset = [
+        "badlands",
+        "platform",
+        "installation",
+        "ashworld",
+        "jungle",
+        "desert",
+        "arctic",
+        "twilight",
+    ]
+    .iter()
+    .position(|candidate| *candidate == tileset_name)
+    .ok_or_else(|| format!("unknown map tileset: {tileset_name}"))?;
+    let request = json!({
+        "schema": "eud-map-catalog/1",
+        "kind": "buildings",
+        "tileset": tileset,
+        "offset": 0,
+        "limit": 512,
+    });
+    let result = isom::catalog_query(starcraft_path, request.to_string().as_bytes())
+        .map_err(|error| format!("building DAT catalog is unavailable: {error}"))?;
+    let value: Value = serde_json::from_str(&result)
+        .map_err(|error| format!("building DAT catalog response is invalid: {error}"))?;
+    let entries = value["entries"]
+        .as_array()
+        .ok_or_else(|| "building DAT catalog has no entries array".to_string())?;
+    if entries.is_empty() {
+        return Err("building DAT catalog is empty".to_string());
+    }
+    entries
+        .iter()
+        .map(|entry| {
+            entry["id"]
+                .as_u64()
+                .and_then(|id| u16::try_from(id).ok())
+                .ok_or_else(|| "building DAT catalog contains an invalid id".to_string())
+        })
+        .collect()
 }
 
 fn load_rag(dirs: &DataDirs) -> Rag {
@@ -1845,6 +2519,7 @@ mod tests {
         let event = emitted.recv().await.expect("ask event must be emitted");
         assert_eq!(event.questions.len(), 2);
         assert_eq!(event.questions[0].id, "mode");
+        assert_eq!(runtime.pending_ask(), Some(event.clone()));
 
         let incomplete = runtime
             .answer_ask(
@@ -1885,6 +2560,46 @@ mod tests {
             result["answers"]["features"]["answers"],
             json!(["로그", "직접 입력"])
         );
+        assert!(runtime.pending_ask().is_none());
+    }
+
+    #[tokio::test]
+    async fn dropped_ask_future_releases_the_session_slot() {
+        let runtime = SessionToolRuntime::for_tests();
+        runtime.begin_request("req-ask-drop", "project").unwrap();
+        let (events, mut emitted) = tokio::sync::mpsc::unbounded_channel();
+        runtime.set_ask_emitter(move |event| {
+            events
+                .send(event)
+                .map_err(|_| "ask event receiver closed".to_string())
+        });
+        let args = json!({
+            "questions": [{
+                "id": "mode",
+                "question": "방식을 고르세요.",
+                "options": [{"label": "A"}, {"label": "B"}]
+            }]
+        });
+
+        let first_runtime = runtime.clone();
+        let first_args = args.clone();
+        let first = tokio::spawn(async move { first_runtime.ask(&first_args).await });
+        let first_event = emitted.recv().await.expect("first ask event");
+        assert_eq!(first_event.request_id, "ask-1");
+        first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
+
+        let second_runtime = runtime.clone();
+        let second_args = args.clone();
+        let second = tokio::spawn(async move { second_runtime.ask(&second_args).await });
+        let second_event = tokio::time::timeout(Duration::from_secs(1), emitted.recv())
+            .await
+            .expect("a dropped ask must release the session slot")
+            .expect("second ask event");
+        assert_eq!(second_event.request_id, "ask-2");
+
+        runtime.cancel_pending_ask();
+        assert_eq!(second.await.unwrap().unwrap_err(), "ask request cancelled");
     }
 
     #[test]
@@ -2053,11 +2768,13 @@ mod tests {
             ..Default::default()
         })
         .unwrap();
+        let candidates = crate::map_candidate::CandidateStore::new(dirs.clone());
         let services = ToolServices::new(
             dirs,
             Arc::new(ReturningAnalyzer {
                 calls: AtomicUsize::new(0),
             }),
+            candidates,
             crate::write_coordinator::ProjectWriteCoordinator::silent(),
         );
         let runtime = services.session(format!("{tag}-session"));
@@ -2474,9 +3191,11 @@ mod tests {
         let analyzer = Arc::new(ReturningAnalyzer {
             calls: AtomicUsize::new(0),
         });
+        let candidates = crate::map_candidate::CandidateStore::new(dirs.clone());
         let services = ToolServices::new(
             dirs,
             analyzer.clone(),
+            candidates,
             crate::write_coordinator::ProjectWriteCoordinator::silent(),
         );
         let runtime = services.session("eps-session");
@@ -2559,5 +3278,335 @@ mod tests {
             Some(3)
         );
         assert_eq!(parse_trailing_index("OK: nothing", "plugadd at "), None);
+    }
+    #[test]
+    #[ignore = "requires installed StarCraft terrain assets"]
+    fn map_palette_query_rejects_catalog_walks_and_returns_complete_filtered_tiles() {
+        let root = std::env::temp_dir().join(format!("map-palette-tool-{}", uuid::Uuid::new_v4()));
+        let dirs = DataDirs::from_bases(&root.join("roaming"), &root.join("local"));
+        dirs.ensure_dirs().unwrap();
+        let source = root.join("source.scx");
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("crates")
+            .join("isom")
+            .join("tests")
+            .join("fixtures")
+            .join("map_agent_rich.scx");
+        std::fs::copy(fixture, &source).unwrap();
+        let context_service = crate::map_context::MapContextService::new(dirs.clone());
+        let revision = context_service
+            .revision_for_path("project".to_string(), &source)
+            .unwrap();
+        let chk = isom::chk_extract(&source).unwrap();
+        let context = crate::map_context::MapContextSnapshot {
+            revision,
+            saved_source_notice: "saved".to_string(),
+            source_file_size: std::fs::metadata(&source).unwrap().len(),
+            starcraft_path: PathBuf::from(r"C:\Program Files (x86)\StarCraft"),
+            digest: crate::chk::digest_chk(&chk),
+        };
+        let candidates = crate::map_candidate::CandidateStore::new(dirs.clone());
+        candidates.create_session("map-session", &context).unwrap();
+        candidates
+            .prepare_request("project", "map-session", "request", 0, &[])
+            .unwrap();
+        let analyzer = Arc::new(crate::eps_preflight::NodeEpsAnalyzer::unavailable(
+            crate::eps_preflight::SkipReason::AdapterMissing,
+            "map palette test has no analyzer",
+        ));
+        let services = ToolServices::new(
+            dirs,
+            analyzer,
+            candidates.clone(),
+            crate::write_coordinator::ProjectWriteCoordinator::silent(),
+        );
+        let runtime = services.map_session("map-session");
+        runtime.begin_request("request", "project").unwrap();
+
+        let broad = runtime
+            .execute(
+                "map_palette_query",
+                &json!({"kind": "tiles", "query": "Tile"}),
+            )
+            .unwrap_err();
+        assert!(broad.contains("refine query/filter"), "got: {broad}");
+
+        let filtered = runtime
+            .execute(
+                "map_palette_query",
+                &json!({"kind": "tiles", "filter": {"group": 0}}),
+            )
+            .unwrap();
+        assert_eq!(filtered["total"], 16);
+        assert_eq!(filtered["entries"].as_array().unwrap().len(), 16);
+        assert!(filtered["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|entry| entry["group"] == 0));
+
+        let paginated = runtime
+            .execute(
+                "map_palette_query",
+                &json!({"kind": "tiles", "query": "Tile", "offset": 100}),
+            )
+            .unwrap_err();
+        assert!(paginated.contains("does not accept pagination"));
+
+        candidates.finish_request("map-session", "request").unwrap();
+        runtime.clear_current();
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    #[ignore = "requires installed StarCraft terrain assets"]
+    fn request_local_image_refs_support_multiple_images_and_terrain_patches_in_one_draft() {
+        let root = std::env::temp_dir().join(format!("map-image-tool-{}", uuid::Uuid::new_v4()));
+        let dirs = DataDirs::from_bases(&root.join("roaming"), &root.join("local"));
+        dirs.ensure_dirs().unwrap();
+        let source = root.join("source.scx");
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("crates")
+            .join("isom")
+            .join("tests")
+            .join("fixtures")
+            .join("map_agent_rich.scx");
+        std::fs::copy(fixture, &source).unwrap();
+        let context_service = crate::map_context::MapContextService::new(dirs.clone());
+        let revision = context_service
+            .revision_for_path("project".to_string(), &source)
+            .unwrap();
+        let chk = isom::chk_extract(&source).unwrap();
+        let context = crate::map_context::MapContextSnapshot {
+            revision,
+            saved_source_notice: "saved".to_string(),
+            source_file_size: std::fs::metadata(&source).unwrap().len(),
+            starcraft_path: PathBuf::from(r"C:\Program Files (x86)\StarCraft"),
+            digest: crate::chk::digest_chk(&chk),
+        };
+        let candidates = crate::map_candidate::CandidateStore::new(dirs.clone());
+        candidates.create_session("map-session", &context).unwrap();
+        candidates
+            .prepare_request("project", "map-session", "request", 0, &[])
+            .unwrap();
+        let analyzer = Arc::new(crate::eps_preflight::NodeEpsAnalyzer::unavailable(
+            crate::eps_preflight::SkipReason::AdapterMissing,
+            "map image test has no analyzer",
+        ));
+        let services = ToolServices::new(
+            dirs.clone(),
+            analyzer,
+            candidates.clone(),
+            crate::write_coordinator::ProjectWriteCoordinator::silent(),
+        );
+        let runtime = services.map_session("map-session");
+        runtime.begin_request("request", "project").unwrap();
+
+        let mut png = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut png, 2, 1);
+            encoder.set_color(png::ColorType::Rgba);
+            encoder.set_depth(png::BitDepth::Eight);
+            let mut writer = encoder.write_header().unwrap();
+            writer
+                .write_image_data(&[255, 0, 0, 255, 0, 0, 255, 255])
+                .unwrap();
+        }
+        let attachments = crate::attachment::AttachmentStore::new(dirs.attachments_dir());
+        let first = attachments.stage("first.png", "image/png", &png).unwrap();
+        let second = attachments.stage("second.png", "image/png", &png).unwrap();
+        let attachment_context = attachments
+            .bind_and_resolve(&[first.id.clone(), second.id.clone()], "map-session")
+            .unwrap();
+        let refs = runtime
+            .bind_map_images("request", &attachment_context.images)
+            .unwrap();
+        assert_eq!(
+            refs.iter()
+                .map(|reference| reference.image_ref.as_str())
+                .collect::<Vec<_>>(),
+            ["image-1", "image-2"]
+        );
+        assert!(serde_json::to_value(&refs).unwrap()[0]
+            .get("attachmentId")
+            .is_none());
+        assert!(attachments
+            .bind_and_resolve(&[first.id], "other-session")
+            .unwrap_err()
+            .contains("다른 대화"));
+
+        let first_result = runtime
+            .execute(
+                "map_image_place",
+                &json!({"imageRef": "image-1", "x": 0, "y": 0, "width": 2, "height": 1}),
+            )
+            .unwrap();
+        assert_eq!(first_result["report"]["placement"]["width"], 2);
+        let draft = candidates.draft_map("map-session", "request").unwrap();
+        let draft_chk = isom::chk_extract(&draft).unwrap();
+        let draft_digest = crate::chk::digest_chk(&draft_chk);
+        let patch_x = 10_u16;
+        let patch_y = 10_u16;
+        let before = draft_digest.tiles
+            [usize::from(patch_y) * usize::from(context.revision.width) + usize::from(patch_x)];
+        let catalog: Value = serde_json::from_str(
+            &isom::catalog_query(
+                &context.starcraft_path,
+                json!({
+                    "schema": "eud-map-catalog/1",
+                    "kind": "tiles",
+                    "tileset": context.revision.tileset.era(),
+                    "offset": 0,
+                    "limit": 512,
+                })
+                .to_string()
+                .as_bytes(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let after = catalog["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["graphicsValid"] == true && entry["id"] != before)
+            .and_then(|entry| entry["id"].as_u64())
+            .unwrap() as u16;
+        runtime
+            .execute(
+                "map_draft_patch",
+                &json!({
+                    "operations": [{
+                        "op": "terrain.set",
+                        "x": patch_x,
+                        "y": patch_y,
+                        "before": before,
+                        "after": after,
+                    }]
+                }),
+            )
+            .unwrap();
+        runtime
+            .execute(
+                "map_image_place",
+                &json!({"imageRef": "image-2", "x": 0, "y": 2, "width": 2, "height": 1}),
+            )
+            .unwrap();
+        runtime
+            .execute("map_candidate_finalize", &json!({}))
+            .unwrap();
+        let committed = candidates
+            .commit_request("project", "map-session", "request")
+            .unwrap();
+        assert_eq!(committed.current_revision, 1);
+        let manifest = dirs
+            .map_candidates_dir()
+            .join("project")
+            .join("map-session")
+            .join("revisions")
+            .join("r0001.json");
+        let manifest: Value = serde_json::from_slice(&std::fs::read(manifest).unwrap()).unwrap();
+        assert_eq!(manifest["imageConversions"].as_array().unwrap().len(), 2);
+        assert_eq!(manifest["batches"].as_array().unwrap().len(), 3);
+
+        candidates.finish_request("map-session", "request").unwrap();
+        runtime.clear_current();
+        candidates
+            .prepare_request("project", "map-session", "request-2", 1, &[])
+            .unwrap();
+        runtime.begin_request("request-2", "project").unwrap();
+        let stale_ref = runtime
+            .execute(
+                "map_image_place",
+                &json!({"imageRef": "image-1", "x": 0, "y": 0, "width": 2, "height": 1}),
+            )
+            .unwrap_err();
+        assert!(stale_ref.contains("not bound to the current Map Agent request"));
+        candidates
+            .finish_request("map-session", "request-2")
+            .unwrap();
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn eps_and_map_runtimes_keep_requests_and_tool_surfaces_isolated() {
+        let services = ToolServices::for_tests();
+        let eps = services.session("eps-session");
+        let map = services.map_session("map-session");
+        eps.begin_request("eps-request", "project").unwrap();
+        map.begin_request("map-request", "project").unwrap();
+        assert_eq!(eps.kind(), crate::session::SessionKind::Eps);
+        assert_eq!(map.kind(), crate::session::SessionKind::Map);
+        assert_eq!(eps.current_request_id().as_deref(), Some("eps-request"));
+        assert_eq!(map.current_request_id().as_deref(), Some("map-request"));
+        assert!(eps.execute("map_status", &json!({})).is_err());
+        let error = map
+            .execute("file_write", &json!({"path": "main", "code": ""}))
+            .unwrap_err();
+        assert!(error.contains("not available to Map Agent"));
+        assert!(!crate::tools::map_tool_registry()
+            .iter()
+            .any(|tool| tool.name.contains("apply")));
+    }
+    #[test]
+    fn map_palette_query_builds_one_complete_bounded_search() {
+        let request = map_palette_catalog_request(
+            &json!({
+                "kind": "tiles",
+                "query": "  Tile 12 ",
+                "filter": {
+                    "terrainType": 3,
+                    "graphicsValid": true,
+                    "walkability": "all",
+                },
+            }),
+            4,
+        )
+        .unwrap();
+        assert_eq!(request["kind"], "tiles");
+        assert_eq!(request["tileset"], 4);
+        assert_eq!(request["query"], "Tile 12");
+        assert_eq!(request["offset"], 0);
+        assert_eq!(request["limit"], (MAP_PALETTE_QUERY_MAX_MATCHES + 1) as u64);
+        assert_eq!(request["filter"]["terrainType"], 3);
+
+        for args in [
+            json!({"kind": "tiles"}),
+            json!({"kind": "tiles", "query": " "}),
+            json!({"kind": "tiles", "filter": {}}),
+            json!({"kind": "tiles", "query": "Tile", "offset": 100}),
+            json!({"kind": "tiles", "query": "Tile", "limit": 10}),
+        ] {
+            assert!(
+                map_palette_catalog_request(&args, 0).is_err(),
+                "broad or paginated search must fail: {args}"
+            );
+        }
+
+        let complete = json!({
+            "total": MAP_PALETTE_QUERY_MAX_MATCHES,
+            "entries": vec![Value::Null; MAP_PALETTE_QUERY_MAX_MATCHES],
+        });
+        assert!(enforce_map_palette_result_bound(complete).is_ok());
+        let broad = json!({
+            "total": MAP_PALETTE_QUERY_MAX_MATCHES + 1,
+            "entries": vec![Value::Null; MAP_PALETTE_QUERY_MAX_MATCHES + 1],
+        });
+        let error = enforce_map_palette_result_bound(broad).unwrap_err();
+        assert!(error.contains("refine query/filter"));
+    }
+
+    #[test]
+    fn render_scale_rejects_unsupported_values_with_actionable_error() {
+        assert_eq!(render_scale_arg(&json!({})), Ok(4));
+        for scale in [1, 2, 4, 8] {
+            assert_eq!(render_scale_arg(&json!({"scale": scale})), Ok(scale));
+        }
+        assert_eq!(
+            render_scale_arg(&json!({"scale": 3})),
+            Err("map render scale must be 1, 2, 4, or 8".to_string())
+        );
     }
 }
