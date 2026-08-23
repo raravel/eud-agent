@@ -68,6 +68,10 @@ pub struct NotificationSettings {
     pub plan_approval: NotificationChannelSettings,
     #[serde(default)]
     pub changeset_review: NotificationChannelSettings,
+    #[serde(default)]
+    pub agent_turn_complete: NotificationChannelSettings,
+    #[serde(default)]
+    pub ask_response_required: NotificationChannelSettings,
 }
 
 /// `config.json` contents (feature 10).
@@ -382,6 +386,14 @@ mod tests {
         assert!(back.notifications.plan_approval.os_notification);
         assert_eq!(
             back.notifications.changeset_review,
+            NotificationChannelSettings::default()
+        );
+        assert_eq!(
+            back.notifications.agent_turn_complete,
+            NotificationChannelSettings::default()
+        );
+        assert_eq!(
+            back.notifications.ask_response_required,
             NotificationChannelSettings::default()
         );
     }

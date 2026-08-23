@@ -78,6 +78,14 @@ const EVENT_COPY: Record<
   NotificationEvent,
   { title: string; description: string }
 > = {
+  agentTurnComplete: {
+    title: "에이전트 턴 종료",
+    description: "계획·변경사항 검토를 제외한 에이전트 턴이 종료됐을 때",
+  },
+  askResponseRequired: {
+    title: "ASK 응답 필요",
+    description: "에이전트가 질문에 대한 사용자 응답을 기다릴 때",
+  },
   planApproval: {
     title: "계획 승인 필요",
     description: "새 계획안이나 수정된 계획안이 도착했을 때",

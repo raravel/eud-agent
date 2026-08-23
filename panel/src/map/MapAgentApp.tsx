@@ -18,12 +18,19 @@ import type {
   TurnState,
 } from "@/state/store";
 import { Button } from "@/components/ui/button";
-import type { AskAnswer, AskQuestion, SessionMeta } from "@/lib/protocol";
+import type {
+  AskAnswer,
+  AskQuestion,
+  BackendSessionActivity,
+  SessionMeta,
+} from "@/lib/protocol";
 import { discardAttachment, stageAttachment } from "@/lib/attachments";
 import {
+  attentionNotify,
   codexModelSettingsGet,
   codexModelSettingsSave,
   compactSession,
+  isAgentTurnEndTransition,
   type ChatAttachment,
   type CodexModelSettings,
   type ContextUsage,
@@ -700,6 +707,8 @@ export default function MapAgentApp() {
   const turnInFlightRef = useRef(false);
   const turnEndedRef = useRef(false);
   const recoveredTurnRef = useRef(false);
+  const notificationActivityRef = useRef<BackendSessionActivity>("idle");
+  const notifiedAskRequestRef = useRef<string | undefined>(undefined);
 
   const markTurnInFlight = useCallback((active: boolean) => {
     turnInFlightRef.current = active;
@@ -1125,7 +1134,54 @@ export default function MapAgentApp() {
     const sessionId = bootstrap.session.id;
     const unlisteners: UnlistenFn[] = [];
     let disposed = false;
+    notificationActivityRef.current = "idle";
+    notifiedAskRequestRef.current = undefined;
     const register = async () => {
+      unlisteners.push(
+        await listen<Record<string, unknown>>(
+          "session_activity",
+          ({ payload }) => {
+            if (payload.sessionId !== sessionId) return;
+            const activity = payload.activity;
+            if (
+              activity !== "idle" &&
+              activity !== "running_read" &&
+              activity !== "waiting_input" &&
+              activity !== "running_write" &&
+              activity !== "review" &&
+              activity !== "error"
+            ) {
+              return;
+            }
+            const previous = notificationActivityRef.current;
+            notificationActivityRef.current = activity;
+            if (isAgentTurnEndTransition(previous, activity)) {
+              void attentionNotify(
+                "agentTurnComplete",
+                !document.hasFocus(),
+                sessionId,
+              ).catch(() => {
+                // Delivery is best-effort and must not disturb settled turn state.
+              });
+            }
+          },
+        ),
+      );
+      unlisteners.push(
+        await listen<Record<string, unknown>>(
+          "notification_activated",
+          ({ payload }) => {
+            if (payload.sessionId !== sessionId) return;
+            const windowHandle = getCurrentWindow();
+            void windowHandle
+              .show()
+              .then(() => windowHandle.setFocus())
+              .catch(() => {
+                // Activation focus is best-effort; notification delivery already succeeded.
+              });
+          },
+        ),
+      );
       unlisteners.push(
         await listen<Record<string, unknown>>("agent_event", ({ payload }) => {
           if (payload.sessionId !== sessionId) return;
@@ -1199,8 +1255,19 @@ export default function MapAgentApp() {
           if (payload.sessionId !== sessionId) return;
           if (payload.candidateRevision !== eventRevisionRef.current) return;
           if (!turnInFlightRef.current || turnEndedRef.current) return;
+          const requestId = String(payload.requestId);
+          if (notifiedAskRequestRef.current !== requestId) {
+            notifiedAskRequestRef.current = requestId;
+            void attentionNotify(
+              "askResponseRequired",
+              !document.hasFocus(),
+              sessionId,
+            ).catch(() => {
+              // Delivery is best-effort and must not disturb the pending ASK.
+            });
+          }
           setAsk({
-            requestId: String(payload.requestId),
+            requestId,
             questions: (payload.questions ?? []) as AskQuestion[],
             submitting: false,
           });
@@ -1252,6 +1319,7 @@ export default function MapAgentApp() {
       eventRevisionRef.current = candidateRevision;
       turnEndedRef.current = false;
       recoveredTurnRef.current = true;
+      notifiedAskRequestRef.current = pending.requestId;
       markTurnInFlight(true);
       setAsk({
         requestId: pending.requestId,

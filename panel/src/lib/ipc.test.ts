@@ -7,6 +7,7 @@ import {
   codexModelSettingsGet,
   codexModelSettingsSave,
   compactSession,
+  isAgentTurnEndTransition,
   notificationSoundPreview,
   workspaceList,
   workspaceRead,
@@ -627,6 +628,8 @@ describe("App notification settings commands", () => {
     notifications: {
       planApproval: { sound: true, osNotification: true },
       changesetReview: { sound: false, osNotification: true },
+      agentTurnComplete: { sound: true, osNotification: false },
+      askResponseRequired: { sound: false, osNotification: true },
     },
     codexLargeContextModels: ["gpt-5.5-codex"],
   };
@@ -647,6 +650,8 @@ describe("App notification settings commands", () => {
       notifications: {
         planApproval: { sound: true },
         changesetReview: { sound: true, osNotification: true },
+        agentTurnComplete: { sound: true, osNotification: true },
+        askResponseRequired: { sound: true, osNotification: true },
       },
       codexLargeContextModels: [],
     });
@@ -684,8 +689,42 @@ describe("App notification settings commands", () => {
       itemCount: 3,
     });
 
+    await attentionNotify(
+      "agentTurnComplete",
+      true,
+      "session-a",
+      undefined,
+      invoke,
+    );
+    expect(invoke).toHaveBeenLastCalledWith("attention_notify", {
+      kind: "agentTurnComplete",
+      showOs: true,
+      sessionId: "session-a",
+    });
+
+    await attentionNotify(
+      "askResponseRequired",
+      false,
+      "session-b",
+      undefined,
+      invoke,
+    );
+    expect(invoke).toHaveBeenLastCalledWith("attention_notify", {
+      kind: "askResponseRequired",
+      showOs: false,
+      sessionId: "session-b",
+    });
+
     await notificationSoundPreview(invoke);
     expect(invoke).toHaveBeenLastCalledWith("notification_sound_preview");
+  });
+
+  it("classifies only ordinary settled agent turns as completion notifications", () => {
+    expect(isAgentTurnEndTransition("running_read", "idle")).toBe(true);
+    expect(isAgentTurnEndTransition("running_write", "error")).toBe(true);
+    expect(isAgentTurnEndTransition("running_read", "review")).toBe(false);
+    expect(isAgentTurnEndTransition("waiting_input", "idle")).toBe(false);
+    expect(isAgentTurnEndTransition("idle", "idle")).toBe(false);
   });
 });
 

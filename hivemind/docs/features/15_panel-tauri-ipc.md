@@ -33,7 +33,7 @@ Commands (panel -> core, `invoke`):
 | app settings | `invoke("app_settings")` |
 | save app settings | `invoke("app_settings_save", { settings })` |
 | preview notification sound | `invoke("notification_sound_preview")` |
-| deliver review notification | `invoke("attention_notify", { kind, showOs, sessionId, itemCount? })` |
+| deliver attention notification | `invoke("attention_notify", { kind, showOs, sessionId, itemCount? })` |
 
 Events (core -> panel, `listen`):
 | v2 WS message (server->client) | New Tauri event |
@@ -57,9 +57,9 @@ Events (core -> panel, `listen`):
 server messages are push events delivered via `listen`. `notification_sound_preview` and
 `attention_notify` are fire-and-forget native side effects; the latter reads persisted channel
 settings and receives the panel focus decision plus immutable notification owner through
-`showOs`/`sessionId`. Clicking a toast focuses the main window and emits
-`notification_activated{sessionId}` so the panel selects that session without backend ownership
-changes.
+`showOs`/`sessionId`. Clicking a toast emits `notification_activated{sessionId}` without changing
+backend ownership; the main panel selects the matching EPS session, while the matching Map panel
+shows and focuses its own window.
 `chat`/`plan_feedback`/`plan_approve` remain pending while their turn streams and resolve
 when it settles. `compact` is session-scoped and remains pending from
 `thread/compact/start` until app-server emits the matching completed `contextCompaction` item.

@@ -81,14 +81,18 @@ new writers.
   user-facing progress rows; raw `contextCompaction` item names never render.
 - **Status visibility** (user request 2026-06-05): header shows connection state transitions (연결 중 → 연결됨 → 재연결 중) and RAG model state with elapsed seconds while loading (`rag_warmup` started ts → done), reusing `progressLabel`.
 - **User-attention notifications**: the Header gear opens an extensible general Settings dialog.
-  Its Notifications category persists independent sound/OS-notification switches for plan
-  approval and changeset review in `config.json`; all four switches default on. A genuinely new
-  plan revision or changeset request plays the configured Windows sound. While the panel document
-  lacks focus, the backend sends a silent WinRT toast under the registered `eud-agent`
-  AppUserModelID with the bundled app icon, so sound and OS delivery remain independent. Clicking
-  the toast restores/focuses the main window and selects the immutable session id carried by that
-  notification. Repeated delivery of the same plan revision or changeset request is deduplicated.
-  The dialog also provides a native-sound preview.
+  Its Notifications category persists independent sound/OS-notification switches for ordinary
+  agent-turn completion, ASK response requests, plan approval, and changeset review in
+  `config.json`; all eight switches default on. ASK emits its configured notification once per
+  request. A transition from active read/write work to idle or error emits the ordinary turn
+  notification; transitions into plan/changeset review use only their dedicated notification, so
+  one turn never produces a generic-plus-review duplicate. The same ASK and completion behavior
+  applies to main and Map Agent sessions. While the owning panel document lacks focus, the backend
+  also sends a silent WinRT toast under the registered `eud-agent` AppUserModelID with the bundled
+  app icon, so sound and OS delivery remain independent. Clicking the toast selects the immutable
+  main-session id or focuses its matching Map Agent window. Repeated delivery of the same ASK,
+  plan revision, or changeset request is deduplicated. The dialog also provides a native-sound
+  preview.
 - **Agent stream (EUD-063 contract; EUD-068/069 amendments)**: per-turn `agent_event`s drive three surfaces — (1) `reasoning` deltas accumulate into the **Reasoning** component: dim/secondary, GPT-style, auto-open while streaming, collapses when the answer starts; (2) `delta` answer text streams into a PROMINENT (foreground) agent **Message/Response** via Streamdown; (3) `tool_call`/`tool_result` render as **Tool** rows showing the tool name (도구 호출 n건 summary retained) PLUS the call arguments (요청) and result text (결과) from `agent_event.data` inside the expandable card; a non-"completed" status renders a 실패 badge (EUD-068). Raw internal kind identifiers (`delta`, `answer`, `token_usage`, `turn_done`, `item_started`, `item_completed`, `event`) MUST NEVER appear as literal UI text. All per-turn surfaces reset when a new turn starts.
 - **File tool payloads**: expanded `read_file` / `file_write` rows replace raw JSON with the
   filename and syntax-highlighted content. Expanded `file_edit` rows replace raw JSON with the
@@ -167,9 +171,10 @@ new writers.
   boundaries around their scrollable bodies. PlanView additionally pins splitter orientation,
   keyboard sizing, pointer resizing, and persisted height.
 - Full Vitest, TypeScript, and production build remain required.
-- Settings/App integration tests pin event-specific switches, immediate persistence, native-sound
-  preview, foreground OS-toast suppression, and one notification per new plan revision/changeset
-  request. Mock-Tauri browser smoke verifies the dialog, IPC payloads, review transitions, and zero
+- Settings/App integration tests pin all event-specific switches, immediate persistence,
+  native-sound preview, foreground OS-toast suppression, one notification per new ASK/plan/
+  changeset request, and generic completion only for active-to-idle/error transitions. Mock-Tauri
+  browser smoke verifies the dialog, IPC payloads, review-transition deduplication, and zero
   horizontal overflow.
 - Mock-Tauri browser smoke observes simultaneous active-write and review rows at 1280 px and
   960 px with no horizontal overflow.

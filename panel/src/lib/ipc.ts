@@ -17,6 +17,7 @@ import {
   isServerMessage,
   type ClientMessage,
   type LedgerEntry,
+  type BackendSessionActivity,
   type ServerMessage,
   type ServerMessageType,
   type WikiMessage,
@@ -62,11 +63,17 @@ export interface NotificationChannelSettings {
   osNotification: boolean;
 }
 
-export type NotificationEvent = "planApproval" | "changesetReview";
+export type NotificationEvent =
+  | "planApproval"
+  | "changesetReview"
+  | "agentTurnComplete"
+  | "askResponseRequired";
 
 export interface NotificationSettings {
   planApproval: NotificationChannelSettings;
   changesetReview: NotificationChannelSettings;
+  agentTurnComplete: NotificationChannelSettings;
+  askResponseRequired: NotificationChannelSettings;
 }
 
 export interface AppSettings {
@@ -563,6 +570,8 @@ function toAppSettings(value: unknown): AppSettings {
     !isObject(value.notifications) ||
     !isNotificationChannelSettings(value.notifications.planApproval) ||
     !isNotificationChannelSettings(value.notifications.changesetReview) ||
+    !isNotificationChannelSettings(value.notifications.agentTurnComplete) ||
+    !isNotificationChannelSettings(value.notifications.askResponseRequired) ||
     !Array.isArray(value.codexLargeContextModels) ||
     !value.codexLargeContextModels.every(
       (model) => typeof model === "string" && model.trim().length > 0,
@@ -594,6 +603,16 @@ export async function notificationSoundPreview(
 ): Promise<void> {
   await invoke("notification_sound_preview");
 }
+/** True only when an active agent turn settles without entering a dedicated review state. */
+export function isAgentTurnEndTransition(
+  previous: BackendSessionActivity,
+  current: BackendSessionActivity,
+): boolean {
+  const wasRunning =
+    previous === "running_read" || previous === "running_write";
+  return wasRunning && (current === "idle" || current === "error");
+}
+
 
 /** Deliver a user-attention event through the channels enabled in persisted settings. */
 export async function attentionNotify(

@@ -52,6 +52,7 @@ import {
   codexModelSettingsGet,
   codexModelSettingsSave,
   compactSession,
+  isAgentTurnEndTransition,
   wikiGet,
   notificationSoundPreview,
   wikiSave,
@@ -649,9 +650,22 @@ export default function App() {
         case "answer":
           sessionStore()?.answerReceived(msg.text);
           break;
-        case "ask":
-          sessionStore()?.askReceived(msg.requestId, msg.questions);
+        case "ask": {
+          const targetSlot = sessionsRef.current.get(msg.sessionId);
+          if (!targetSlot) break;
+          const priorRequestId = targetSlot.store.getState().ask?.requestId;
+          if (priorRequestId !== msg.requestId) {
+            void attentionNotify(
+              "askResponseRequired",
+              !document.hasFocus(),
+              targetSlot.id,
+            ).catch(() => {
+              // Delivery is best-effort and must not disturb the pending ASK.
+            });
+          }
+          targetSlot.store.askReceived(msg.requestId, msg.questions);
           break;
+        }
         case "plan": {
           const targetSlot = scopedId
             ? sessionsRef.current.get(scopedId)
@@ -728,6 +742,15 @@ export default function App() {
           slot.activity = msg.activity;
           if (previous !== msg.activity && msg.activity === "running_write") {
             slot.store.log("ok", "격리 워크스페이스에서 변경을 시작합니다.");
+          }
+          if (isAgentTurnEndTransition(previous, msg.activity)) {
+            void attentionNotify(
+              "agentTurnComplete",
+              !document.hasFocus(),
+              slot.id,
+            ).catch(() => {
+              // Delivery is best-effort and must not disturb settled turn state.
+            });
           }
           bumpSessions();
           break;

@@ -102,6 +102,8 @@ beforeEach(() => {
           notifications: {
             planApproval: { sound: true, osNotification: true },
             changesetReview: { sound: true, osNotification: true },
+            agentTurnComplete: { sound: true, osNotification: true },
+            askResponseRequired: { sound: true, osNotification: true },
           },
           codexLargeContextModels: [],
         };
@@ -516,6 +518,8 @@ describe("App notifications", () => {
           notifications: {
             planApproval: { sound: false, osNotification: true },
             changesetReview: { sound: true, osNotification: true },
+            agentTurnComplete: { sound: true, osNotification: true },
+            askResponseRequired: { sound: true, osNotification: true },
           },
           codexLargeContextModels: [],
         },
@@ -592,6 +596,110 @@ describe("App notifications", () => {
             showOs: true,
             sessionId: "session-a",
             itemCount: 1,
+          },
+        ],
+      ]);
+    });
+    focus.mockRestore();
+  });
+
+  it("notifies once for a new ASK request", async () => {
+    const focus = vi.spyOn(document, "hasFocus").mockReturnValue(false);
+    render(<App />);
+    await screen.findByRole("button", { name: "Session A, 유휴" });
+    await waitFor(() => expect(tauri.listeners.has("ask")).toBe(true));
+    tauri.invoke.mockClear();
+
+    const payload = {
+      sessionId: "session-a",
+      requestId: "ask-1",
+      questions: [
+        {
+          id: "mode",
+          question: "방식을 고르세요.",
+          multi: false,
+          options: [],
+        },
+      ],
+    };
+    act(() => {
+      emit("ask", payload);
+      emit("ask", payload);
+    });
+
+    await waitFor(() => {
+      const attentionCalls = tauri.invoke.mock.calls.filter(
+        ([command]) => command === "attention_notify",
+      );
+      expect(attentionCalls).toEqual([
+        [
+          "attention_notify",
+          {
+            kind: "askResponseRequired",
+            showOs: true,
+            sessionId: "session-a",
+          },
+        ],
+      ]);
+    });
+    focus.mockRestore();
+  });
+
+  it("notifies when ordinary turns settle but not when review starts", async () => {
+    const focus = vi.spyOn(document, "hasFocus").mockReturnValue(false);
+    render(<App />);
+    await screen.findByRole("button", { name: "Session A, 유휴" });
+    await waitFor(() =>
+      expect(tauri.listeners.has("session_activity")).toBe(true),
+    );
+    tauri.invoke.mockClear();
+
+    act(() => {
+      emit("session_activity", {
+        sessionId: "session-a",
+        activity: "running_read",
+      });
+      emit("session_activity", {
+        sessionId: "session-a",
+        activity: "idle",
+      });
+      emit("session_activity", {
+        sessionId: "session-a",
+        activity: "running_read",
+      });
+      emit("session_activity", {
+        sessionId: "session-a",
+        activity: "review",
+      });
+      emit("session_activity", {
+        sessionId: "session-a",
+        activity: "running_write",
+      });
+      emit("session_activity", {
+        sessionId: "session-a",
+        activity: "error",
+      });
+    });
+
+    await waitFor(() => {
+      const attentionCalls = tauri.invoke.mock.calls.filter(
+        ([command]) => command === "attention_notify",
+      );
+      expect(attentionCalls).toEqual([
+        [
+          "attention_notify",
+          {
+            kind: "agentTurnComplete",
+            showOs: true,
+            sessionId: "session-a",
+          },
+        ],
+        [
+          "attention_notify",
+          {
+            kind: "agentTurnComplete",
+            showOs: true,
+            sessionId: "session-a",
           },
         ],
       ]);

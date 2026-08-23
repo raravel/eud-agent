@@ -78,6 +78,8 @@ pub struct AppSettings {
 pub enum AttentionNotificationKind {
     PlanApproval,
     ChangesetReview,
+    AgentTurnComplete,
+    AskResponseRequired,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -102,6 +104,14 @@ fn attention_notification_text(
                 |count| format!("변경사항 {count}건을 적용하거나 되돌릴지 검토해 주세요."),
             ),
         },
+        AttentionNotificationKind::AgentTurnComplete => AttentionNotificationText {
+            title: "에이전트 턴이 종료되었습니다",
+            body: "에이전트의 응답을 확인해 주세요.".to_string(),
+        },
+        AttentionNotificationKind::AskResponseRequired => AttentionNotificationText {
+            title: "에이전트가 응답을 기다리고 있습니다",
+            body: "질문을 확인하고 답변해 주세요.".to_string(),
+        },
     }
 }
 
@@ -112,6 +122,8 @@ fn notification_channels(
     match kind {
         AttentionNotificationKind::PlanApproval => settings.plan_approval,
         AttentionNotificationKind::ChangesetReview => settings.changeset_review,
+        AttentionNotificationKind::AgentTurnComplete => settings.agent_turn_complete,
+        AttentionNotificationKind::AskResponseRequired => settings.ask_response_required,
     }
 }
 
@@ -1715,6 +1727,14 @@ mod tests {
                     sound: true,
                     os_notification: false,
                 },
+                agent_turn_complete: NotificationChannelSettings {
+                    sound: false,
+                    os_notification: false,
+                },
+                ask_response_required: NotificationChannelSettings {
+                    sound: true,
+                    os_notification: false,
+                },
             },
             codex_large_context_models: BTreeSet::from(["gpt-test".to_string()]),
         };
@@ -1726,7 +1746,9 @@ mod tests {
             json!({
                 "notifications": {
                     "planApproval": {"sound": false, "osNotification": true},
-                    "changesetReview": {"sound": true, "osNotification": false}
+                    "changesetReview": {"sound": true, "osNotification": false},
+                    "agentTurnComplete": {"sound": false, "osNotification": false},
+                    "askResponseRequired": {"sound": true, "osNotification": false}
                 },
                 "codexLargeContextModels": ["gpt-test"]
             }),
@@ -1743,7 +1765,7 @@ mod tests {
     }
 
     #[test]
-    fn attention_notification_copy_matches_the_review_event() {
+    fn attention_notification_copy_matches_each_event() {
         let plan =
             ipc::attention_notification_text(ipc::AttentionNotificationKind::PlanApproval, None);
         assert_eq!(plan.title, "계획 승인이 필요합니다");
@@ -1758,6 +1780,20 @@ mod tests {
             changeset.body,
             "변경사항 3건을 적용하거나 되돌릴지 검토해 주세요."
         );
+
+        let turn_complete = ipc::attention_notification_text(
+            ipc::AttentionNotificationKind::AgentTurnComplete,
+            None,
+        );
+        assert_eq!(turn_complete.title, "에이전트 턴이 종료되었습니다");
+        assert_eq!(turn_complete.body, "에이전트의 응답을 확인해 주세요.");
+
+        let ask = ipc::attention_notification_text(
+            ipc::AttentionNotificationKind::AskResponseRequired,
+            None,
+        );
+        assert_eq!(ask.title, "에이전트가 응답을 기다리고 있습니다");
+        assert_eq!(ask.body, "질문을 확인하고 답변해 주세요.");
     }
 
     #[test]

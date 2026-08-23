@@ -8,6 +8,8 @@ const settings: AppSettings = {
   notifications: {
     planApproval: { sound: true, osNotification: true },
     changesetReview: { sound: true, osNotification: false },
+    agentTurnComplete: { sound: true, osNotification: true },
+    askResponseRequired: { sound: false, osNotification: true },
   },
   codexLargeContextModels: [],
 };
@@ -50,6 +52,12 @@ describe("SettingsDialog", () => {
       screen.getByRole("button", { name: "설정 닫기" }),
     ).toBeInTheDocument();
     expect(
+      screen.getByRole("switch", { name: "에이전트 턴 종료 알림음" }),
+    ).toHaveAttribute("aria-checked", "true");
+    expect(
+      screen.getByRole("switch", { name: "ASK 응답 필요 알림음" }),
+    ).toHaveAttribute("aria-checked", "false");
+    expect(
       screen.getByRole("switch", { name: "계획 승인 필요 알림음" }),
     ).toHaveAttribute("aria-checked", "true");
     expect(
@@ -77,6 +85,8 @@ describe("SettingsDialog", () => {
       notifications: {
         planApproval: { sound: false, osNotification: true },
         changesetReview: { sound: true, osNotification: false },
+        agentTurnComplete: { sound: true, osNotification: true },
+        askResponseRequired: { sound: false, osNotification: true },
       },
       codexLargeContextModels: [],
     });

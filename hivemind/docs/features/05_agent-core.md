@@ -121,8 +121,8 @@ Write tools: `dat_set`, `xdat_set`, `tbl_set`, `req_set`, `btn_set`, `dat_reset`
 
 `ask` accepts one to four related questions. Each question has a stable id, optional header,
 optional 2-5 choices, and a `multi` flag; the panel always exposes direct input. The MCP call
-registers one owner-request-scoped pending ASK, emits a session-scoped `ask` notification, sets
-activity to `waiting_input`, and awaits `ask_response{sessionId,requestId,answers}` without holding
+registers one owner-request-scoped pending ASK, emits a session-scoped `ask` event, sets activity
+to `waiting_input`, and awaits `ask_response{sessionId,requestId,answers}` without holding
 the session engine mutex. A valid response resolves the original MCP call, restores read/write
 activity, and lets Codex continue the same turn. A dropped MCP future removes its pending slot
 through an RAII lease; turn cancellation resolves it as cancelled. Because Tauri events are
@@ -130,6 +130,8 @@ ephemeral notifications rather than delivery acknowledgments, `ask_pending{sessi
 backend-authoritative pending snapshot. The main and Map panels query it only after installing
 listeners and restore the matching ASK idempotently. Missing/duplicate/oversized questions and
 incomplete or cardinality-invalid answers fail validation.
+The live `ask` event also triggers the owning main or Map panel's configured sound/OS attention
+notification once per request; restoring an existing `ask_pending` snapshot does not replay it.
 `file_edit` applies a non-empty ordered list of exact, uniquely matching `old_text`/`new_text`
 replacements to the session baseline, then uses the same non-overlapping live-change merge and
 full before/after journal snapshots as `file_write`.
