@@ -80,6 +80,56 @@ describe("parseFileTool", () => {
     expect(view?.code).toBe("longcode");
   });
 
+  it("parses file_edit exact replacements into an ordered diff", () => {
+    const view = parseFileTool({
+      id: "1",
+      name: "file_edit",
+      state: "running",
+      args: JSON.stringify({
+        path: "triggers/main.eps",
+        edits: [
+          {
+            old_text: "function tick() {\n  oldCall();\n}",
+            new_text: "function tick() {\n  newCall();\n}",
+          },
+          {
+            old_text: "obsolete();",
+            new_text: "",
+          },
+        ],
+      }),
+    });
+    expect(view).toEqual({
+      mode: "edit",
+      path: "triggers/main.eps",
+      diff: [
+        "--- triggers/main.eps",
+        "+++ triggers/main.eps",
+        "@@ 변경 1 @@",
+        "-function tick() {",
+        "-  oldCall();",
+        "-}",
+        "+function tick() {",
+        "+  newCall();",
+        "+}",
+        "@@ 변경 2 @@",
+        "-obsolete();",
+      ].join("\n"),
+      truncated: false,
+    });
+  });
+
+  it("keeps raw file_edit arguments when the edit list is truncated", () => {
+    expect(
+      parseFileTool({
+        id: "1",
+        name: "file_edit",
+        state: "running",
+        args: '{"path":"a.eps","edits":[{"old_text":"old","new_text":"new …(잘림)',
+      }),
+    ).toBeNull();
+  });
+
   it("returns null for non-file tools (keeps the raw JSON view)", () => {
     expect(
       parseFileTool({ id: "1", name: "dat_set", state: "done", args: "{}" }),

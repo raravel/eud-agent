@@ -31,6 +31,7 @@ import {
   CodeBlockCopyButton,
 } from "@/components/ai-elements/code-block";
 import { parseFileTool, type FileToolView } from "@/lib/fileTool";
+import { classifyDiff } from "@/lib/diff";
 import { cn } from "@/lib/utils";
 
 /** One tool-call row (mirrors the store's per-turn AgentTool). */
@@ -128,8 +129,8 @@ export function ToolList({ tools }: { tools: AgentTool[] }) {
   return (
     <>
       {tools.map((tool) => {
-        // read_file / file_write render their payload as a real code block
-        // (filename header + syntax-highlighted code) instead of raw JSON.
+        // File reads/writes render as code; exact file edits render as an
+        // ordered colored diff instead of raw JSON.
         const fileView = parseFileTool(tool);
         return (
           <Tool key={tool.id} data-testid={`tool-${tool.id}`}>
@@ -172,13 +173,14 @@ export function ToolList({ tools }: { tools: AgentTool[] }) {
 }
 
 /**
- * A read_file / file_write payload as a code-editor block: a filename title bar
- * (file icon + path + 읽기/쓰기 tag) on top of the syntax-highlighted code with a
- * copy button. The path may be empty (older payloads); the code may be truncated
- * by the core (a notice is shown). See {@link FileToolView} (lib/fileTool).
+ * A file-tool payload as an editor-style block: filename header plus either
+ * syntax-highlighted content (`read_file` / `file_write`) or an ordered colored
+ * replacement diff (`file_edit`).
  */
 function FileToolBlock({ view }: { view: FileToolView }) {
-  const Icon = view.mode === "write" ? FilePenLineIcon : FileIcon;
+  const isRead = view.mode === "read";
+  const Icon = isRead ? FileIcon : FilePenLineIcon;
+  const label = isRead ? "읽기" : view.mode === "write" ? "쓰기" : "수정";
   return (
     <div className="flex flex-col">
       <div
@@ -192,25 +194,52 @@ function FileToolBlock({ view }: { view: FileToolView }) {
         <span
           className={cn(
             "ml-auto shrink-0 font-medium",
-            view.mode === "write" ? "text-amber-400" : "text-sky-400",
+            isRead ? "text-sky-400" : "text-amber-400",
           )}
         >
-          {view.mode === "write" ? "쓰기" : "읽기"}
+          {label}
         </span>
       </div>
-      <CodeBlock
-        code={view.code}
-        language={view.language}
-        showLineNumbers
-        className="rounded-t-none"
-      >
-        <CodeBlockCopyButton />
-      </CodeBlock>
+      {view.mode === "edit" ? (
+        <FileEditDiff diff={view.diff} />
+      ) : (
+        <CodeBlock
+          code={view.code}
+          language={view.language}
+          showLineNumbers
+          className="rounded-t-none"
+        >
+          <CodeBlockCopyButton />
+        </CodeBlock>
+      )}
       {view.truncated && (
         <p className="mt-1 text-xs text-amber-400">
           내용이 길어 일부만 표시됩니다.
         </p>
       )}
     </div>
+  );
+}
+
+/** Exact replacements rendered with the same +/- palette as changeset diffs. */
+function FileEditDiff({ diff }: { diff: string }) {
+  return (
+    <pre className="overflow-x-auto rounded-b-md border border-border bg-muted/40 p-2 text-xs">
+      {classifyDiff(diff).map((line, index) => (
+        <div
+          key={index}
+          data-diff={line.kind}
+          className={cn(
+            "whitespace-pre-wrap break-words",
+            line.kind === "add" && "text-emerald-400",
+            line.kind === "del" && "text-destructive",
+            line.kind === "hunk" && "text-sky-400",
+            line.kind === "file" && "text-muted-foreground",
+          )}
+        >
+          {line.text || " "}
+        </div>
+      ))}
+    </pre>
   );
 }

@@ -213,6 +213,44 @@ describe("AgentStream — tool args/result (EUD-068)", () => {
     expect(screen.queryByText("결과")).toBeNull();
   });
 
+  it("renders file_edit as an ordered colored diff, not raw JSON", async () => {
+    const user = userEvent.setup();
+    const { container } = render(
+      <AgentStream
+        reasoning=""
+        answerStarted={false}
+        live={true}
+        tools={[
+          {
+            id: "t1",
+            name: "file_edit",
+            state: "running",
+            args: JSON.stringify({
+              path: "triggers/main.eps",
+              edits: [
+                {
+                  old_text: "oldCall();",
+                  new_text: "newCall();",
+                },
+              ],
+            }),
+          },
+        ]}
+      />,
+    );
+    await user.click(screen.getByRole("button", { name: /file_edit/ }));
+    expect(screen.getByText("triggers/main.eps")).toBeInTheDocument();
+    expect(screen.getByText("수정")).toBeInTheDocument();
+    expect(container.querySelector('[data-diff="del"]')).toHaveTextContent(
+      "-oldCall();",
+    );
+    expect(container.querySelector('[data-diff="add"]')).toHaveTextContent(
+      "+newCall();",
+    );
+    expect(screen.queryByText("요청")).toBeNull();
+    expect(screen.queryByText("결과")).toBeNull();
+  });
+
   it("renders read_file content (from the result) as a code block", async () => {
     const user = userEvent.setup();
     const { container } = render(

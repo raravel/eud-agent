@@ -1,35 +1,46 @@
 /**
- * Parse the `read_file` / `file_write` tool payloads (EUD-068 tool_call args +
- * tool_result text) into a code-editor view: a path, the file's code/content,
- * and a Prism language. Only these two tools render as a CodeBlock (the user
- * asked for real code editing instead of raw JSON); every other tool keeps the
- * JSON request/result rows.
+ * Parse `read_file`, `file_write`, and `file_edit` payloads (EUD-068 tool_call
+ * args + tool_result text) into file-focused views. Reads and full writes show
+ * syntax-highlighted content; exact edits show the ordered old/new replacements
+ * as a diff. Every other tool keeps the JSON request/result rows.
  *
  * The core ships args/result as compact JSON strings truncated to 4000 chars
- * (codex_client `TOOL_DATA_MAX_CHARS`), appending `…(잘림)` when cut. So parsing
- * is tolerant: a strict `JSON.parse` covers whole payloads; a lenient single-
- * field scan recovers the (possibly truncated) code/content when the JSON itself
- * is cut mid-string. Returns null when no code can be extracted (e.g. a failed
- * read whose result is an error message) — the caller then keeps the raw view.
+ * (codex_client `TOOL_DATA_MAX_CHARS`), appending `…(잘림)` when cut. Content
+ * parsing is tolerant: a strict `JSON.parse` covers whole payloads; a lenient
+ * single-field scan recovers a code/content string cut mid-value. A truncated
+ * `file_edit` falls back to the raw view because a partial edits array would
+ * misrepresent the requested mutation.
  */
 import type { AgentTool } from "@/components/AgentStream";
 
 /** The marker the core appends to a tool arg/result string when it truncates. */
 const TRUNCATION_MARK = "…(잘림)";
 
-/** A parsed file-tool payload ready for the CodeBlock view. */
-export interface FileToolView {
-  /** "read" (read_file) or "write" (file_write). */
-  mode: "read" | "write";
+/** Fields shared by every parsed file-tool payload. */
+interface FileToolViewBase {
   /** Editor-relative file path (from the tool args). */
   path: string;
+  /** True when the core truncated the payload at 4000 chars. */
+  truncated: boolean;
+}
+
+/** A parsed read/write payload ready for the CodeBlock view. */
+export interface FileContentToolView extends FileToolViewBase {
+  mode: "read" | "write";
   /** The file content (read) or the code being written (write). */
   code: string;
   /** Prism language id derived from the path extension. */
   language: string;
-  /** True when the core truncated the payload at 4000 chars. */
-  truncated: boolean;
 }
+
+/** A parsed exact-edit payload ready for the colored diff view. */
+export interface FileEditToolView extends FileToolViewBase {
+  mode: "edit";
+  /** Ordered old/new replacements represented as a display diff. */
+  diff: string;
+}
+
+export type FileToolView = FileContentToolView | FileEditToolView;
 
 /**
  * Pull a single string field out of a (possibly truncated) compact-JSON string.
@@ -109,12 +120,67 @@ export function languageForPath(path: string): string {
   }
 }
 
+interface ExactTextEdit {
+  old_text: string;
+  new_text: string;
+}
+
+/** Build a truthful, ordered display diff without inventing unavailable file line numbers. */
+function exactEditsToDiff(path: string, edits: ExactTextEdit[]): string {
+  const displayPath = path || "(이름 없는 파일)";
+  const lines = [`--- ${displayPath}`, `+++ ${displayPath}`];
+  edits.forEach((edit, index) => {
+    lines.push(`@@ 변경 ${index + 1} @@`);
+    if (edit.old_text !== "") {
+      lines.push(...edit.old_text.split("\n").map((line) => `-${line}`));
+    }
+    if (edit.new_text !== "") {
+      lines.push(...edit.new_text.split("\n").map((line) => `+${line}`));
+    }
+  });
+  return lines.join("\n");
+}
+
+function parseFileEditTool(tool: AgentTool): FileEditToolView | null {
+  const raw = tool.args;
+  if (!raw || raw.includes(TRUNCATION_MARK)) return null;
+
+  try {
+    const payload = JSON.parse(raw) as Record<string, unknown>;
+    const path = typeof payload.path === "string" ? payload.path : "";
+    if (!Array.isArray(payload.edits) || payload.edits.length === 0) return null;
+
+    const edits: ExactTextEdit[] = [];
+    for (const candidate of payload.edits) {
+      if (
+        !candidate ||
+        typeof candidate !== "object" ||
+        typeof (candidate as Record<string, unknown>).old_text !== "string" ||
+        typeof (candidate as Record<string, unknown>).new_text !== "string"
+      ) {
+        return null;
+      }
+      edits.push(candidate as ExactTextEdit);
+    }
+
+    return {
+      mode: "edit",
+      path,
+      diff: exactEditsToDiff(path, edits),
+      truncated: false,
+    };
+  } catch {
+    return null;
+  }
+}
+
 /**
- * Parse a tool into a {@link FileToolView}, or null when it is not a file tool
- * or no code could be extracted. `read_file` shows its RESULT content; a
- * `file_write` shows the code from its ARGS (the result is just an ok ack).
+ * Parse a tool into a {@link FileToolView}, or null when it is not a supported
+ * file tool or its display payload cannot be recovered safely.
  */
 export function parseFileTool(tool: AgentTool): FileToolView | null {
+  if (tool.name === "file_edit") return parseFileEditTool(tool);
+
   const mode =
     tool.name === "read_file"
       ? "read"
