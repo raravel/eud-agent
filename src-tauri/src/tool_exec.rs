@@ -1958,6 +1958,194 @@ stop this turn so the backend can resume the same thread in its isolated writabl
     }
 }
 
+impl crate::journal::JournalBridge for SessionToolRuntime {
+    type Error = String;
+
+    fn set_dat_value(
+        &self,
+        table: DatTable,
+        dat: &str,
+        obj_id: u32,
+        property: &str,
+        value: Value,
+    ) -> Result<(), Self::Error> {
+        let value = value_to_text(&value);
+        let command = match table {
+            DatTable::Dat => format!("SETDAT {dat}|{property}|{obj_id}|{value}"),
+            DatTable::Xdat => format!("SETXDAT {dat}|{property}|{obj_id}|{value}"),
+            DatTable::Tbl => format!("SETTBL {obj_id}\n{value}"),
+            DatTable::Req => format!("SETREQ {dat}|{obj_id}\n{value}"),
+            DatTable::Btn => format!("SETBTN {obj_id}\n{value}"),
+        };
+        self.send(&command).map(|_| ())
+    }
+
+    fn reset_dat_value(
+        &self,
+        table: DatTable,
+        dat: &str,
+        obj_id: u32,
+        property: &str,
+    ) -> Result<(), Self::Error> {
+        let kind = match table {
+            DatTable::Dat => "dat",
+            DatTable::Xdat => "xdat",
+            DatTable::Tbl => "tbl",
+            DatTable::Req | DatTable::Btn => {
+                return Err(format!("{table} values do not support default reset"));
+            }
+        };
+        self.send(&format!("RESETDAT {kind}|{dat}|{property}|{obj_id}"))
+            .map(|_| ())
+    }
+
+    fn write_file(&self, path: &str, content: &str) -> Result<(), Self::Error> {
+        self.bridge()?
+            .set(path, content, &SendOpts::default(), None)
+            .map(|_| ())
+            .map_err(stringify)
+    }
+
+    fn delete_file(&self, path: &str) -> Result<(), Self::Error> {
+        self.send(&format!("DELFILE {path}")).map(|_| ())
+    }
+
+    fn write_workspace_file(
+        &self,
+        workspace_id: &str,
+        session_id: Option<&str>,
+        path: &str,
+        content: &str,
+    ) -> Result<(), Self::Error> {
+        crate::workspace::WorkspaceManager::new(self.data_dirs())
+            .restore_file(workspace_id, session_id, path, Some(content))
+            .map_err(stringify)
+    }
+
+    fn delete_workspace_file(
+        &self,
+        workspace_id: &str,
+        session_id: Option<&str>,
+        path: &str,
+    ) -> Result<(), Self::Error> {
+        crate::workspace::WorkspaceManager::new(self.data_dirs())
+            .restore_file(workspace_id, session_id, path, None)
+            .map_err(stringify)
+    }
+
+    fn create_file(
+        &self,
+        path: &str,
+        content: &str,
+        _position: Option<usize>,
+    ) -> Result<(), Self::Error> {
+        let file_type = rollback_file_type(path);
+        let create_path = normalize_create_path(path, file_type);
+        self.send(&format!("NEWFILE {create_path}|{file_type}\n{content}"))
+            .map(|_| ())
+    }
+
+    fn rename_path(&self, from: &str, to: &str) -> Result<(), Self::Error> {
+        if from == to {
+            return Ok(());
+        }
+        let (from_parent, from_name) = rollback_path_parts(from)?;
+        let (to_parent, to_name) = rollback_path_parts(to)?;
+        if from_parent == to_parent {
+            return self.send(&format!("RENAME {from}\n{to_name}")).map(|_| ());
+        }
+        if from_name == to_name {
+            return self
+                .send(&format!("MOVEFILE {from}\n{to_parent}"))
+                .map(|_| ());
+        }
+        Err(format!(
+            "cannot rollback a combined move and rename from '{from}' to '{to}'"
+        ))
+    }
+
+    fn set_main(&self, path: Option<&str>) -> Result<(), Self::Error> {
+        let path = path.ok_or_else(|| {
+            "cannot rollback MainFile because the editor bridge has no clear-main command"
+                .to_string()
+        })?;
+        self.send(&format!("SETMAIN {path}")).map(|_| ())
+    }
+
+    fn set_setting(&self, key: &str, value: Value) -> Result<(), Self::Error> {
+        let (scope, name) = key
+            .split_once('|')
+            .ok_or_else(|| format!("invalid journal setting key '{key}'"))?;
+        self.send(&format!("SETSET {scope}|{name}\n{}", value_to_text(&value)))
+            .map(|_| ())
+    }
+
+    fn plugin_add(
+        &self,
+        _plugin_id: &str,
+        texts: Vec<String>,
+        index: usize,
+    ) -> Result<(), Self::Error> {
+        self.send(&format!("PLUGADD {index}\n{}", texts.join("\n")))
+            .map(|_| ())
+    }
+
+    fn plugin_edit(
+        &self,
+        _plugin_id: &str,
+        texts: Vec<String>,
+        index: usize,
+    ) -> Result<(), Self::Error> {
+        self.send(&format!("PLUGSET {index}\n{}", texts.join("\n")))
+            .map(|_| ())
+    }
+
+    fn plugin_remove(&self, plugin_id: &str) -> Result<(), Self::Error> {
+        let index = rollback_plugin_index(plugin_id)?;
+        self.send(&format!("PLUGDEL {index}")).map(|_| ())
+    }
+
+    fn plugin_move(&self, from_index: usize, to_index: usize) -> Result<(), Self::Error> {
+        self.send(&format!("PLUGMOVE {from_index}|{to_index}"))
+            .map(|_| ())
+    }
+
+    fn restore_map_backup(&self, map_path: &str, backup_path: &str) -> Result<(), Self::Error> {
+        self.services
+            .map_safe
+            .restore(&crate::mapsafe::JournalEntry {
+                map_path: PathBuf::from(map_path),
+                backup_path: PathBuf::from(backup_path),
+            })
+            .map_err(stringify)
+    }
+}
+
+fn rollback_file_type(path: &str) -> &'static str {
+    let path = path.to_ascii_lowercase();
+    if path.ends_with(".eps") {
+        "CUIEps"
+    } else if path.ends_with(".py") {
+        "CUIPy"
+    } else {
+        "RawText"
+    }
+}
+
+fn rollback_path_parts(path: &str) -> Result<(&str, &str), String> {
+    let (parent, name) = path.rsplit_once('/').unwrap_or(("", path));
+    if name.is_empty() {
+        return Err(format!("invalid empty rollback path leaf in '{path}'"));
+    }
+    Ok((parent, name))
+}
+
+fn rollback_plugin_index(plugin_id: &str) -> Result<usize, String> {
+    plugin_id
+        .parse()
+        .map_err(|_| format!("invalid plugin journal index '{plugin_id}'"))
+}
+
 #[cfg(test)]
 impl ToolServices {
     pub fn for_tests() -> Self {
@@ -2453,6 +2641,7 @@ mod tests {
     use crate::eps_preflight::{
         AnalyzerError, AnalyzerRequest, AnalyzerSuccess, EpsDiagnostic, EpsImport,
     };
+    use crate::journal::JournalBridge;
     use base64::Engine;
     use serde_json::json;
     use std::fs;
@@ -2788,9 +2977,9 @@ mod tests {
         replies: Vec<(&'static str, &'static str)>,
     ) -> thread::JoinHandle<Vec<String>> {
         thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(5);
             let mut seen = Vec::with_capacity(replies.len());
             for (expected, reply) in replies {
+                let deadline = Instant::now() + Duration::from_secs(5);
                 loop {
                     let command = fs::read_dir(&inbox)
                         .unwrap()
@@ -2817,6 +3006,83 @@ mod tests {
             }
             seen
         })
+    }
+
+    #[test]
+    fn production_journal_bridge_translates_every_editor_inverse_command() {
+        let (base, inbox, outbox, runtime) =
+            bridge_runtime("journal-rollback-commands", "req-journal-rollback-commands");
+        let expected = vec![
+            ("SETDAT units|HP|0|40", "OK"),
+            ("SETXDAT weapons|Splash|1|2", "OK"),
+            ("SETTBL 2\nName", "OK"),
+            ("SETREQ units|3\npayload", "OK"),
+            ("SETBTN 4\ncsv", "OK"),
+            ("RESETDAT xdat|units|ButtonSet|5", "OK"),
+            ("SET scripts/main.eps\nold", "OK"),
+            ("DELFILE scripts/new.eps", "OK"),
+            ("NEWFILE scripts/deleted|CUIEps\nrestored", "OK"),
+            ("RENAME scripts/new.eps\nold.eps", "OK"),
+            ("MOVEFILE lib/moved.eps\nscripts", "OK"),
+            ("SETMAIN scripts/old-main.eps", "OK"),
+            ("SETSET project|output\nold", "OK"),
+            ("PLUGADD 2\nline1\nline2", "OK"),
+            ("PLUGSET 3\nold plugin", "OK"),
+            ("PLUGDEL 4", "OK"),
+            ("PLUGMOVE 5|1", "OK"),
+        ];
+        let responder = spawn_bridge_responder(inbox, outbox, expected.clone());
+
+        runtime
+            .set_dat_value(DatTable::Dat, "units", 0, "HP", json!(40))
+            .unwrap();
+        runtime
+            .set_dat_value(DatTable::Xdat, "weapons", 1, "Splash", json!(2))
+            .unwrap();
+        runtime
+            .set_dat_value(DatTable::Tbl, "", 2, "text", json!("Name"))
+            .unwrap();
+        runtime
+            .set_dat_value(DatTable::Req, "units", 3, "payload", json!("payload"))
+            .unwrap();
+        runtime
+            .set_dat_value(DatTable::Btn, "", 4, "csv", json!("csv"))
+            .unwrap();
+        runtime
+            .reset_dat_value(DatTable::Xdat, "units", 5, "ButtonSet")
+            .unwrap();
+        runtime.write_file("scripts/main.eps", "old").unwrap();
+        runtime.delete_file("scripts/new.eps").unwrap();
+        runtime
+            .create_file("scripts/deleted.eps", "restored", Some(4))
+            .unwrap();
+        runtime
+            .rename_path("scripts/new.eps", "scripts/old.eps")
+            .unwrap();
+        runtime
+            .rename_path("lib/moved.eps", "scripts/moved.eps")
+            .unwrap();
+        JournalBridge::set_main(&runtime, Some("scripts/old-main.eps")).unwrap();
+        runtime.set_setting("project|output", json!("old")).unwrap();
+        JournalBridge::plugin_add(&runtime, "2", vec!["line1\nline2".to_string()], 2).unwrap();
+        JournalBridge::plugin_edit(&runtime, "3", vec!["old plugin".to_string()], 3).unwrap();
+        JournalBridge::plugin_remove(&runtime, "4").unwrap();
+        JournalBridge::plugin_move(&runtime, 5, 1).unwrap();
+
+        assert_eq!(
+            responder.join().unwrap(),
+            expected
+                .into_iter()
+                .map(|(command, _)| command.to_string())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            JournalBridge::set_main(&runtime, None)
+                .unwrap_err()
+                .contains("clear-main"),
+            "an unset previous MainFile must refuse rather than corrupt state"
+        );
+        fs::remove_dir_all(base).ok();
     }
 
     #[test]

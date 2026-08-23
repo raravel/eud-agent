@@ -13,6 +13,7 @@ pub trait JournalBridge {
     fn set_dat_value(
         &self,
         table: DatTable,
+        dat: &str,
         obj_id: u32,
         property: &str,
         value: serde_json::Value,
@@ -21,6 +22,7 @@ pub trait JournalBridge {
     fn reset_dat_value(
         &self,
         table: DatTable,
+        dat: &str,
         obj_id: u32,
         property: &str,
     ) -> Result<(), Self::Error>;
@@ -77,7 +79,7 @@ pub trait JournalBridge {
 
     fn plugin_remove(&self, plugin_id: &str) -> Result<(), Self::Error>;
 
-    fn plugin_move(&self, plugin_id: &str, index: usize) -> Result<(), Self::Error>;
+    fn plugin_move(&self, from_index: usize, to_index: usize) -> Result<(), Self::Error>;
 
     fn restore_map_backup(&self, map_path: &str, backup_path: &str) -> Result<(), Self::Error>;
 }
@@ -1001,19 +1003,19 @@ where
         | WriteTool::TblSet
         | WriteTool::ReqSet
         | WriteTool::BtnSet => {
-            let (table, obj_id, property) = dat_target_parts(entry)?;
+            let (table, dat, obj_id, property) = dat_target_parts(entry)?;
             match &entry.before {
                 Snapshot::DatValue {
                     value: _,
                     was_default: true,
                 } => bridge
-                    .reset_dat_value(table, obj_id, property)
+                    .reset_dat_value(table, dat, obj_id, property)
                     .map_err(bridge_error),
                 Snapshot::DatValue {
                     value,
                     was_default: false,
                 } => bridge
-                    .set_dat_value(table, obj_id, property, value.clone())
+                    .set_dat_value(table, dat, obj_id, property, value.clone())
                     .map_err(bridge_error),
                 _ => Err(invalid_entry(entry, "expected dat before snapshot")),
             }
@@ -1088,6 +1090,10 @@ where
         WriteTool::PluginEdit => {
             let plugin_id = plugin_id(entry)?;
             match &entry.before {
+                Snapshot::PluginTexts { texts, .. } if texts.is_empty() => Err(invalid_entry(
+                    entry,
+                    "plugin rollback is unavailable because the bridge did not expose the original Texts",
+                )),
                 Snapshot::PluginTexts { texts, index } => bridge
                     .plugin_edit(plugin_id, texts.clone(), *index)
                     .map_err(bridge_error),
@@ -1100,6 +1106,10 @@ where
         WriteTool::PluginRemove => {
             let plugin_id = plugin_id(entry)?;
             match &entry.before {
+                Snapshot::PluginTexts { texts, .. } if texts.is_empty() => Err(invalid_entry(
+                    entry,
+                    "plugin rollback is unavailable because the bridge did not expose the original Texts",
+                )),
                 Snapshot::PluginTexts { texts, index } => bridge
                     .plugin_add(plugin_id, texts.clone(), *index)
                     .map_err(bridge_error),
@@ -1110,16 +1120,13 @@ where
             }
         }
         WriteTool::PluginMove => {
-            let plugin_id = plugin_id(entry)?;
-            match &entry.before {
-                Snapshot::PluginTexts { index, .. } => {
-                    bridge.plugin_move(plugin_id, *index).map_err(bridge_error)
-                }
-                _ => Err(invalid_entry(
-                    entry,
-                    "expected plugin texts before snapshot",
-                )),
-            }
+            let from_index = plugin_snapshot_index(entry, &entry.after)?
+                .ok_or_else(|| invalid_entry(entry, "expected plugin after index"))?;
+            let to_index = plugin_snapshot_index(entry, &entry.before)?
+                .ok_or_else(|| invalid_entry(entry, "expected plugin before index"))?;
+            bridge
+                .plugin_move(from_index, to_index)
+                .map_err(bridge_error)
         }
         WriteTool::LocationWrite | WriteTool::PlayerSetup | WriteTool::SwitchWrite => {
             match &entry.before {
@@ -1147,18 +1154,14 @@ fn workspace_target_parts(
     }
 }
 
-// The `dat`-file name is intentionally ignored here: the inverse-op replay keys
-// on (family, objId, property) via the JournalBridge, whose `set_dat_value` does
-// not yet take the dat-file name. When a real rollback bridge needs it, thread
-// `dat` from the target through here and into the bridge signature.
-fn dat_target_parts(entry: &JournalEntry) -> Result<(DatTable, u32, &str), JournalError> {
+fn dat_target_parts(entry: &JournalEntry) -> Result<(DatTable, &str, u32, &str), JournalError> {
     match &entry.target {
         JournalTarget::Dat {
             table,
+            dat,
             obj_id,
             property,
-            ..
-        } => Ok((*table, *obj_id, property.as_str())),
+        } => Ok((*table, dat.as_str(), *obj_id, property.as_str())),
         _ => Err(invalid_entry(entry, "expected dat target")),
     }
 }
@@ -1224,12 +1227,14 @@ mod tests {
     enum AppliedInverse {
         DatSet {
             table: DatTable,
+            dat: String,
             obj_id: u32,
             property: String,
             value: serde_json::Value,
         },
         DatReset {
             table: DatTable,
+            dat: String,
             obj_id: u32,
             property: String,
         },
@@ -1270,8 +1275,8 @@ mod tests {
             plugin_id: String,
         },
         PluginMove {
-            plugin_id: String,
-            index: usize,
+            from_index: usize,
+            to_index: usize,
         },
         RestoreMapBackup {
             map_path: String,
@@ -1296,12 +1301,14 @@ mod tests {
         fn set_dat_value(
             &self,
             table: DatTable,
+            dat: &str,
             obj_id: u32,
             property: &str,
             value: serde_json::Value,
         ) -> Result<(), Self::Error> {
             self.ops.borrow_mut().push(AppliedInverse::DatSet {
                 table,
+                dat: dat.to_owned(),
                 obj_id,
                 property: property.to_owned(),
                 value,
@@ -1312,11 +1319,13 @@ mod tests {
         fn reset_dat_value(
             &self,
             table: DatTable,
+            dat: &str,
             obj_id: u32,
             property: &str,
         ) -> Result<(), Self::Error> {
             self.ops.borrow_mut().push(AppliedInverse::DatReset {
                 table,
+                dat: dat.to_owned(),
                 obj_id,
                 property: property.to_owned(),
             });
@@ -1410,10 +1419,10 @@ mod tests {
             Ok(())
         }
 
-        fn plugin_move(&self, plugin_id: &str, index: usize) -> Result<(), Self::Error> {
+        fn plugin_move(&self, from_index: usize, to_index: usize) -> Result<(), Self::Error> {
             self.ops.borrow_mut().push(AppliedInverse::PluginMove {
-                plugin_id: plugin_id.to_owned(),
-                index,
+                from_index,
+                to_index,
             });
             Ok(())
         }
@@ -1898,8 +1907,8 @@ mod tests {
             bridge.ops(),
             vec![
                 AppliedInverse::PluginMove {
-                    plugin_id: "delta".to_owned(),
-                    index: 1,
+                    from_index: 5,
+                    to_index: 1,
                 },
                 AppliedInverse::PluginAdd {
                     plugin_id: "gamma".to_owned(),
@@ -1946,29 +1955,34 @@ mod tests {
                 },
                 AppliedInverse::DatSet {
                     table: DatTable::Btn,
+                    dat: "".to_owned(),
                     obj_id: 13,
                     property: "actstr".to_owned(),
                     value: json!("old btn"),
                 },
                 AppliedInverse::DatSet {
                     table: DatTable::Req,
+                    dat: "".to_owned(),
                     obj_id: 12,
                     property: "Use".to_owned(),
                     value: json!("old req"),
                 },
                 AppliedInverse::DatSet {
                     table: DatTable::Tbl,
+                    dat: "".to_owned(),
                     obj_id: 11,
                     property: "String".to_owned(),
                     value: json!("old tbl"),
                 },
                 AppliedInverse::DatReset {
                     table: DatTable::Xdat,
+                    dat: "".to_owned(),
                     obj_id: 3,
                     property: "ButtonSet".to_owned(),
                 },
                 AppliedInverse::DatSet {
                     table: DatTable::Dat,
+                    dat: "".to_owned(),
                     obj_id: 7,
                     property: "HitPoints".to_owned(),
                     value: json!(40),
@@ -2062,6 +2076,7 @@ mod tests {
                 },
                 AppliedInverse::DatReset {
                     table: DatTable::Dat,
+                    dat: "".to_owned(),
                     obj_id: 1,
                     property: "Cost".to_owned(),
                 },
@@ -2130,6 +2145,7 @@ mod tests {
             bridge.ops(),
             vec![AppliedInverse::DatSet {
                 table: DatTable::Dat,
+                dat: "units".to_owned(),
                 obj_id: 0,
                 property: "HP".to_owned(),
                 value: json!(40),

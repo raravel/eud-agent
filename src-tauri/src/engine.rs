@@ -921,14 +921,11 @@ Continue the requested change now, run the mandatory build, and stop only after 
                             .map_err(|error| AgentEngineError::new(error.to_string()))
                     }
                     ipc::Decision::Reject => {
-                        let bridge = WorkspaceJournalBridge {
-                            workspace: WorkspaceManager::new(self.runtime.data_dirs()),
-                        };
                         self.journal_store
                             .decide(
                                 &request_id,
                                 journal::ChangesetDecision::Reject(decision_ids.clone()),
-                                &bridge,
+                                &self.runtime,
                             )
                             .map_err(|error| AgentEngineError::new(error.to_string()))?;
                         if matches!(decision_ids, journal::DecisionIds::All) {
@@ -3412,124 +3409,6 @@ fn ipc_changeset_item(index: usize, item: journal::ChangesetItem) -> ipc::Change
     }
 }
 
-/// Rollback bridge for parent-owned Workspace files. Editor/map inverse
-/// operations remain unsupported; Workspace changes are fully reversible
-/// without an editor connection.
-struct WorkspaceJournalBridge {
-    workspace: crate::workspace::WorkspaceManager,
-}
-
-impl journal::JournalBridge for WorkspaceJournalBridge {
-    type Error = AgentEngineError;
-
-    fn set_dat_value(
-        &self,
-        _table: journal::DatTable,
-        _obj_id: u32,
-        _property: &str,
-        _value: serde_json::Value,
-    ) -> Result<(), Self::Error> {
-        unsupported_rollback()
-    }
-
-    fn reset_dat_value(
-        &self,
-        _table: journal::DatTable,
-        _obj_id: u32,
-        _property: &str,
-    ) -> Result<(), Self::Error> {
-        unsupported_rollback()
-    }
-
-    fn write_file(&self, _path: &str, _content: &str) -> Result<(), Self::Error> {
-        unsupported_rollback()
-    }
-
-    fn delete_file(&self, _path: &str) -> Result<(), Self::Error> {
-        unsupported_rollback()
-    }
-
-    fn write_workspace_file(
-        &self,
-        workspace_id: &str,
-        session_id: Option<&str>,
-        path: &str,
-        content: &str,
-    ) -> Result<(), Self::Error> {
-        self.workspace
-            .restore_file(workspace_id, session_id, path, Some(content))
-            .map_err(|error| AgentEngineError::new(error.to_string()))
-    }
-
-    fn delete_workspace_file(
-        &self,
-        workspace_id: &str,
-        session_id: Option<&str>,
-        path: &str,
-    ) -> Result<(), Self::Error> {
-        self.workspace
-            .restore_file(workspace_id, session_id, path, None)
-            .map_err(|error| AgentEngineError::new(error.to_string()))
-    }
-
-    fn create_file(
-        &self,
-        _path: &str,
-        _content: &str,
-        _position: Option<usize>,
-    ) -> Result<(), Self::Error> {
-        unsupported_rollback()
-    }
-
-    fn rename_path(&self, _from: &str, _to: &str) -> Result<(), Self::Error> {
-        unsupported_rollback()
-    }
-
-    fn set_main(&self, _path: Option<&str>) -> Result<(), Self::Error> {
-        unsupported_rollback()
-    }
-
-    fn set_setting(&self, _key: &str, _value: serde_json::Value) -> Result<(), Self::Error> {
-        unsupported_rollback()
-    }
-
-    fn plugin_add(
-        &self,
-        _plugin_id: &str,
-        _texts: Vec<String>,
-        _index: usize,
-    ) -> Result<(), Self::Error> {
-        unsupported_rollback()
-    }
-
-    fn plugin_edit(
-        &self,
-        _plugin_id: &str,
-        _texts: Vec<String>,
-        _index: usize,
-    ) -> Result<(), Self::Error> {
-        unsupported_rollback()
-    }
-
-    fn plugin_remove(&self, _plugin_id: &str) -> Result<(), Self::Error> {
-        unsupported_rollback()
-    }
-
-    fn plugin_move(&self, _plugin_id: &str, _index: usize) -> Result<(), Self::Error> {
-        unsupported_rollback()
-    }
-
-    fn restore_map_backup(&self, _map_path: &str, _backup_path: &str) -> Result<(), Self::Error> {
-        unsupported_rollback()
-    }
-}
-
-fn unsupported_rollback() -> Result<(), AgentEngineError> {
-    Err(AgentEngineError::new(
-        "rollback bridge is not wired in the current engine adapter",
-    ))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4515,6 +4394,114 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reject_replays_file_inverse_through_the_runtime_bridge() {
+        let base = unique_temp_dir("runtime-rollback-bridge");
+        let dirs = crate::config::DataDirs::from_bases(&base.join("roaming"), &base.join("local"));
+        dirs.ensure_dirs().unwrap();
+        let editor = base.join("editor");
+        let inbox = editor.join("Data").join("agent").join("inbox");
+        let outbox = editor.join("Data").join("agent").join("outbox");
+        fs::create_dir_all(&inbox).unwrap();
+        fs::create_dir_all(&outbox).unwrap();
+        dirs.save_config(&crate::config::Config {
+            editor_path: editor.to_string_lossy().to_string(),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let analyzer = Arc::new(crate::eps_preflight::NodeEpsAnalyzer::unavailable(
+            crate::eps_preflight::SkipReason::AdapterMissing,
+            "rollback test does not run preflight",
+        ));
+        let services = crate::tool_exec::ToolServices::new(
+            dirs.clone(),
+            analyzer,
+            crate::map_candidate::CandidateStore::new(dirs.clone()),
+            crate::write_coordinator::ProjectWriteCoordinator::silent(),
+        );
+        let sessions = crate::session::SessionStore::new(&dirs);
+        let session = test_session(&sessions);
+        let runtime = services.session(session.meta.id.clone());
+        let sink = CapturingEventSink::default();
+        let sink_handle = sink.clone();
+        let mut engine = AgentEngine::new(
+            FakeCodexDriver::scripted([]),
+            sink,
+            AgentEngineConfig::for_tests(
+                "[project state]\nproject=Sample compiling=false",
+                None,
+                sample_hits(),
+            ),
+            runtime,
+            sessions,
+            attachment_store_at(&base),
+            session,
+        );
+        let request_id = "req-runtime-rollback";
+        engine
+            .runtime
+            .begin_request(request_id, &engine.project_id)
+            .unwrap();
+        engine.current_request_id = Some(request_id.to_string());
+        engine.phase = Phase::ChangesetReview;
+        record_file_write(
+            &engine.journal_store,
+            request_id,
+            "file-main",
+            1,
+            "scripts/main.eps",
+        );
+
+        let responder = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                let command = fs::read_dir(&inbox)
+                    .unwrap()
+                    .filter_map(Result::ok)
+                    .find_map(|entry| {
+                        let file_name = entry.file_name().to_string_lossy().to_string();
+                        (file_name.starts_with("srv-") && file_name.ends_with(".cmd"))
+                            .then_some((entry.path(), file_name))
+                    });
+                if let Some((path, file_name)) = command {
+                    let command = fs::read_to_string(&path).unwrap();
+                    assert_eq!(command, "SET scripts/main.eps\nold\n");
+                    fs::remove_file(path).unwrap();
+                    let stem = file_name.trim_end_matches(".cmd");
+                    fs::write(
+                        outbox.join(format!("{stem}.result")),
+                        b"OK: set scripts/main.eps",
+                    )
+                    .unwrap();
+                    return command;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "rollback bridge command did not arrive"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        });
+
+        engine
+            .changeset_decision(crate::ipc::ChangesetDecisionRequest {
+                decision: crate::ipc::Decision::Reject,
+                ids: crate::ipc::DecisionIds::All(crate::ipc::AllLiteral),
+            })
+            .await
+            .expect("reject decision should finish");
+
+        assert_eq!(responder.join().unwrap(), "SET scripts/main.eps\nold\n");
+        assert!(sink_handle.events().iter().any(|event| matches!(
+            event,
+            EngineEvent::RollbackResult(payload) if payload.ok && payload.error.is_none()
+        )));
+        assert_eq!(engine.journal_store.entry_count(request_id), 0);
+        assert_eq!(engine.phase, Phase::Idle);
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[tokio::test]
     async fn reject_does_not_record_dat_edits_to_wiki() {
         let base = unique_temp_dir("wiki-reject");
         let memory = ProjectMemory::new(base.join("memory"), "ExampleProject");
@@ -4616,17 +4603,16 @@ mod tests {
             .persist(&request_id)
             .expect("journal should persist");
 
-        // Reject only the HP edit. The production reject bridge is a stub, so drive
-        // a genuine partial reject through the journal store with a no-op bridge: the
-        // inverse op "succeeds" and `forget_entries` drops the HP entry. This isolates
-        // the wiki contract (a rolled-back value never re-enters via accept-all) from
-        // the not-yet-wired rollback bridge.
+        // Drive the partial reject through a no-op bridge so this test remains
+        // focused on the wiki contract: a rolled-back value never re-enters via
+        // accept-all.
         struct NoopRollbackBridge;
         impl journal::JournalBridge for NoopRollbackBridge {
             type Error = AgentEngineError;
             fn set_dat_value(
                 &self,
                 _table: journal::DatTable,
+                _dat: &str,
                 _obj_id: u32,
                 _property: &str,
                 _value: Value,
@@ -4636,6 +4622,7 @@ mod tests {
             fn reset_dat_value(
                 &self,
                 _table: journal::DatTable,
+                _dat: &str,
                 _obj_id: u32,
                 _property: &str,
             ) -> Result<(), Self::Error> {
@@ -4683,7 +4670,7 @@ mod tests {
             fn plugin_remove(&self, _plugin_id: &str) -> Result<(), Self::Error> {
                 Ok(())
             }
-            fn plugin_move(&self, _plugin_id: &str, _index: usize) -> Result<(), Self::Error> {
+            fn plugin_move(&self, _from_index: usize, _to_index: usize) -> Result<(), Self::Error> {
                 Ok(())
             }
             fn restore_map_backup(
