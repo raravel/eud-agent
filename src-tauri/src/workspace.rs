@@ -1,10 +1,10 @@
 //! Per-project Codex filesystem workspace.
 //!
 //! A project workspace is a real Codex cwd under `%appdata%\eud-agent\workspaces`.
-//! Agent-authored documents are writable and reviewed after each turn; `source/` is a
-//! coherent editor EPSNAPSHOT mirror and is read-only under Codex's split filesystem
-//! permission profile. Trusted baselines live in the sibling `.state/` directory, outside
-//! the Codex cwd, so the model cannot rewrite rollback data.
+//! Foreground Codex reads durable documents and the coherent `source/` EPSNAPSHOT but cannot
+//! write either. Post-acceptance harness deltas are applied by Rust in isolated document
+//! workspaces and reviewed separately. Trusted baselines live in the sibling `.state/`
+//! directory, outside every Codex cwd.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -84,6 +84,12 @@ pub struct WorkspaceFileEntry {
     pub state: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub revision: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WorkspaceDocumentUpdate {
+    pub path: String,
+    pub content: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -229,6 +235,46 @@ impl WorkspaceManager {
         })
     }
 
+    /// Prepare an isolated document-only workspace from canonical accepted files.
+    ///
+    /// Background harness generation never needs a live editor snapshot. It receives
+    /// accepted source changes inline and stages only `specs/`, `decisions/`, and
+    /// `worklog/` updates in this isolated root.
+    pub(crate) fn prepare_document_session(
+        &self,
+        workspace_id: &str,
+        project: &str,
+        session_id: &str,
+    ) -> io::Result<PreparedWorkspace> {
+        let workspace_id = normalize_workspace_id(workspace_id)?;
+        let session_id = normalize_token(session_id, "session id")?;
+        let canonical_root = self.workspace_root(&workspace_id)?;
+        if !canonical_root.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("canonical workspace `{workspace_id}` does not exist"),
+            ));
+        }
+        let root = self.session_workspace_root(&workspace_id, &session_id)?;
+        fs::create_dir_all(&root)?;
+        ensure_plain_directory(&root)?;
+        for directory in DOCUMENT_DIRS {
+            let path = root.join(directory);
+            fs::create_dir_all(&path)?;
+            ensure_plain_directory(&path)?;
+        }
+        let temp = root.join(TEMP_DIR);
+        fs::create_dir_all(&temp)?;
+        ensure_plain_directory(&temp)?;
+        sync_documents(&canonical_root, &root)?;
+        Ok(PreparedWorkspace {
+            id: workspace_id,
+            project: project.to_string(),
+            root,
+            session_id: Some(session_id),
+        })
+    }
+
     /// Capture a crash-safe baseline outside the writable Codex cwd.
     ///
     /// Re-entering the same request (session-resume fallback) reuses the original baseline,
@@ -332,6 +378,64 @@ impl WorkspaceManager {
                 }
             })
             .collect())
+    }
+
+    pub(crate) fn document_content(
+        &self,
+        workspace: &PreparedWorkspace,
+        relative: &str,
+    ) -> io::Result<Option<String>> {
+        validate_mutable_document_path(relative)?;
+        let path = confined_path(&workspace.root, relative, false)?;
+        optional_regular_file_bytes(&path)?
+            .map(|bytes| decode_utf8(bytes, relative))
+            .transpose()
+    }
+
+    /// Apply a prevalidated document batch with rollback on the first failed write.
+    ///
+    /// Callers compute every final file body before entering this method, so the
+    /// mutation phase performs no model work and no shell commands.
+    pub(crate) fn apply_document_updates(
+        &self,
+        workspace: &PreparedWorkspace,
+        updates: &[WorkspaceDocumentUpdate],
+    ) -> io::Result<()> {
+        let mut seen = BTreeSet::new();
+        let mut prepared = Vec::with_capacity(updates.len());
+        for update in updates {
+            validate_mutable_document_path(&update.path)?;
+            if !seen.insert(update.path.as_str()) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("duplicate document update `{}`", update.path),
+                ));
+            }
+            if update.content.len() as u64 > MAX_FILE_BYTES {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "document update `{}` exceeds the file size cap",
+                        update.path
+                    ),
+                ));
+            }
+            let path = confined_path(&workspace.root, &update.path, true)?;
+            let previous = optional_regular_file_bytes(&path)?;
+            prepared.push((path, previous, update.content.as_bytes().to_vec()));
+        }
+
+        let mut applied: Vec<(PathBuf, Option<Vec<u8>>)> = Vec::new();
+        for (path, previous, content) in &prepared {
+            if let Err(error) = atomic_write(path, content) {
+                for (applied_path, applied_previous) in applied.into_iter().rev() {
+                    let _ = restore_optional_file_bytes(&applied_path, applied_previous.as_deref());
+                }
+                return Err(error);
+            }
+            applied.push((path.clone(), previous.clone()));
+        }
+        Ok(())
     }
 
     /// Persist authoritative acceptance metadata outside the Codex cwd.
@@ -438,93 +542,28 @@ impl WorkspaceManager {
         Ok(())
     }
 
-    /// Validate the durable project-wiki postconditions for one approved-plan execution.
-    ///
-    /// The approved plan is immutable. `specs/index.md` must link to a non-empty topic
-    /// spec, and the request worklog must link back to a canonical topic spec. Returned
-    /// strings are corrective instructions suitable for the Codex repair turn.
-    pub fn completion_doc_gaps(
-        &self,
-        workspace_id: &str,
-        request_id: &str,
-        approved_markdown: &str,
-    ) -> io::Result<Vec<String>> {
+    pub fn search_files(&self, workspace_id: &str, query: &str) -> io::Result<Vec<String>> {
+        let query = query.trim();
+        if query.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let query = query.to_lowercase();
         let root = self.workspace_root(workspace_id)?;
-        self.completion_doc_gaps_at(&root, request_id, approved_markdown)
-    }
-
-    pub fn completion_doc_gaps_for_workspace(
-        &self,
-        workspace: &PreparedWorkspace,
-        request_id: &str,
-        approved_markdown: &str,
-    ) -> io::Result<Vec<String>> {
-        self.completion_doc_gaps_at(&workspace.root, request_id, approved_markdown)
-    }
-
-    fn completion_doc_gaps_at(
-        &self,
-        root: &Path,
-        request_id: &str,
-        approved_markdown: &str,
-    ) -> io::Result<Vec<String>> {
-        let plan_path = approved_plan_path(request_id)?;
-        let worklog_path = completion_worklog_path(request_id)?;
-        let files = scan_text_tree(root, ScanMode::Writable)?;
-        let mut gaps = Vec::new();
-
-        match files.get(&plan_path) {
-            None => gaps.push(format!(
-                "`{plan_path}` is missing; restore the exact user-approved plan."
-            )),
-            Some(content) if content != approved_markdown => gaps.push(format!(
-                "`{plan_path}` differs from the user-approved plan; restore it exactly."
-            )),
-            Some(_) => {}
-        }
-
-        let topic_specs = files
-            .iter()
-            .filter_map(|(path, content)| {
-                (path.starts_with("specs/")
-                    && path != SPEC_INDEX_PATH
-                    && path.ends_with(".md")
-                    && !content.trim().is_empty())
-                .then_some(path.as_str())
-            })
-            .collect::<BTreeSet<_>>();
-
-        match files.get(SPEC_INDEX_PATH) {
-            None => gaps.push(format!(
-                "`{SPEC_INDEX_PATH}` is missing; create the canonical project-wiki index."
-            )),
-            Some(content) if content.trim().is_empty() => gaps.push(format!(
-                "`{SPEC_INDEX_PATH}` is empty; summarize the project and link its topic specs."
-            )),
-            Some(content) if !markdown_links_to_any(content, SPEC_INDEX_PATH, &topic_specs) => {
-                gaps.push(format!(
-                    "`{SPEC_INDEX_PATH}` must link to at least one non-empty topic page under `specs/`."
-                ));
+        let files = scan_files(&root, ScanMode::All)?;
+        let mut matches = Vec::new();
+        for relative in files.keys() {
+            let bytes = fs::read(confined_path(&root, relative, true)?)?;
+            let content = match decode_utf8(bytes, relative) {
+                Ok(content) => content,
+                Err(error) if error.kind() == io::ErrorKind::InvalidData => continue,
+                Err(error) => return Err(error),
+            };
+            if relative.to_lowercase().contains(&query) || content.to_lowercase().contains(&query) {
+                matches.push(relative.clone());
             }
-            Some(_) => {}
         }
-
-        match files.get(&worklog_path) {
-            None => gaps.push(format!(
-                "`{worklog_path}` is missing; record the actual result, verification, and canonical specs."
-            )),
-            Some(content) if content.trim().is_empty() => gaps.push(format!(
-                "`{worklog_path}` is empty; record the actual result, verification, and canonical specs."
-            )),
-            Some(content) if !markdown_links_to_any(content, &worklog_path, &topic_specs) => {
-                gaps.push(format!(
-                    "`{worklog_path}` must link to at least one canonical topic page under `specs/`."
-                ));
-            }
-            Some(_) => {}
-        }
-
-        Ok(gaps)
+        Ok(matches)
     }
 
     pub fn read_file(&self, workspace_id: &str, relative: &str) -> io::Result<String> {
@@ -972,7 +1011,7 @@ pub(crate) fn read_source_baseline(
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct ExactTextEdit {
+pub struct ExactTextEdit {
     pub old_text: String,
     pub new_text: String,
 }
@@ -1145,59 +1184,6 @@ fn restore_promotions(promoted: &[(PathBuf, Option<Vec<u8>>)]) -> io::Result<()>
     Ok(())
 }
 
-fn markdown_links_to_any(markdown: &str, source_path: &str, candidates: &BTreeSet<&str>) -> bool {
-    markdown_link_destinations(markdown)
-        .into_iter()
-        .filter_map(|destination| resolve_markdown_destination(source_path, destination))
-        .any(|target| candidates.contains(target.as_str()))
-}
-
-fn markdown_link_destinations(markdown: &str) -> Vec<&str> {
-    let mut destinations = Vec::new();
-    let mut remaining = markdown;
-    while let Some(open) = remaining.find("](") {
-        let after_open = &remaining[open + 2..];
-        let Some(close) = after_open.find(')') else {
-            break;
-        };
-        destinations.push(after_open[..close].trim());
-        remaining = &after_open[close + 1..];
-    }
-    destinations
-}
-
-fn resolve_markdown_destination(source_path: &str, destination: &str) -> Option<String> {
-    let destination = destination.trim();
-    let destination = if let Some(inner) = destination.strip_prefix('<') {
-        inner.split_once('>')?.0
-    } else {
-        destination.split_ascii_whitespace().next()?
-    };
-    let destination = destination.split(['#', '?']).next()?;
-    if destination.is_empty()
-        || destination.starts_with('/')
-        || destination.contains('\\')
-        || destination.contains(':')
-    {
-        return None;
-    }
-
-    let mut segments = source_path
-        .rsplit_once('/')
-        .map(|(parent, _)| parent.split('/').collect::<Vec<_>>())
-        .unwrap_or_default();
-    for segment in destination.split('/') {
-        match segment {
-            "" | "." => {}
-            ".." => {
-                segments.pop()?;
-            }
-            segment => segments.push(segment),
-        }
-    }
-    (!segments.is_empty()).then(|| segments.join("/"))
-}
-
 fn normalize_relative_path(value: &str, allow_source: bool) -> io::Result<String> {
     if value.is_empty() || value.contains('\0') || value.contains('\\') {
         return Err(io::Error::new(
@@ -1263,6 +1249,20 @@ fn normalize_relative_path(value: &str, allow_source: bool) -> io::Result<String
         ));
     }
     Ok(segments.join("/"))
+}
+
+fn validate_mutable_document_path(relative: &str) -> io::Result<String> {
+    let normalized = normalize_relative_path(relative, false)?;
+    let allowed = normalized.starts_with("specs/")
+        || normalized.starts_with("decisions/")
+        || normalized.starts_with("worklog/");
+    if !allowed || !normalized.ends_with(".md") {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("harness document path is not mutable: `{normalized}`"),
+        ));
+    }
+    Ok(normalized)
 }
 
 fn confined_path(root: &Path, relative: &str, allow_source: bool) -> io::Result<PathBuf> {
@@ -1555,6 +1555,42 @@ mod tests {
     }
 
     #[test]
+    fn search_files_matches_text_paths_and_contents_case_insensitively() {
+        let (base, manager) = manager("search");
+        let workspace = manager.prepare_snapshot(&snapshot()).unwrap();
+        write_atomic_bytes(
+            &workspace.root.join("specs/combat.md"),
+            b"Confirmed behavior.",
+        )
+        .unwrap();
+        fs::write(workspace.root.join("decisions/binary.dat"), [0xff, 0x00]).unwrap();
+
+        assert_eq!(
+            manager.search_files(&workspace.id, "COMBAT").unwrap(),
+            vec!["specs/combat.md"]
+        );
+        assert_eq!(
+            manager
+                .search_files(&workspace.id, "confirmed behavior")
+                .unwrap(),
+            vec!["specs/combat.md"]
+        );
+        assert_eq!(
+            manager.search_files(&workspace.id, "PLUGINSTART").unwrap(),
+            vec!["source/main.eps"]
+        );
+        assert!(manager
+            .search_files(&workspace.id, "binary.dat")
+            .unwrap()
+            .is_empty());
+        assert!(manager
+            .search_files(&workspace.id, "  ")
+            .unwrap()
+            .is_empty());
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
     fn baseline_diff_excludes_source_and_restores_writable_files() {
         let (base, manager) = manager("diff");
         let workspace = manager.prepare_snapshot(&snapshot()).unwrap();
@@ -1664,69 +1700,6 @@ mod tests {
             .state_path(&workspace.id)
             .unwrap()
             .starts_with(&workspace.root));
-        fs::remove_dir_all(base).ok();
-    }
-
-    #[test]
-    fn approved_plan_completion_requires_linked_specs_and_worklog() {
-        let (base, manager) = manager("completion-docs");
-        let workspace = manager.prepare_snapshot(&snapshot()).unwrap();
-        let approved_plan = "# Add combat progression";
-        manager
-            .record_plan_approval(&workspace.id, "req-wiki", 1, approved_plan)
-            .unwrap();
-
-        let gaps = manager
-            .completion_doc_gaps(&workspace.id, "req-wiki", approved_plan)
-            .unwrap();
-        assert!(gaps.iter().any(|gap| gap.contains("specs/index.md")));
-        assert!(gaps.iter().any(|gap| gap.contains("worklog/req-wiki.md")));
-
-        atomic_write(
-            &workspace.root.join("specs/combat.md"),
-            b"# Combat\n\nImplemented progression.",
-        )
-        .unwrap();
-        atomic_write(
-            &workspace.root.join(SPEC_INDEX_PATH),
-            b"# Project wiki\n\nCombat exists but is not linked.",
-        )
-        .unwrap();
-        atomic_write(
-            &workspace.root.join("worklog/req-wiki.md"),
-            b"# Result\n\nVerified the build.",
-        )
-        .unwrap();
-        let gaps = manager
-            .completion_doc_gaps(&workspace.id, "req-wiki", approved_plan)
-            .unwrap();
-        assert_eq!(gaps.len(), 2);
-        assert!(gaps.iter().all(|gap| gap.contains("must link")));
-
-        atomic_write(
-            &workspace.root.join(SPEC_INDEX_PATH),
-            b"# Project wiki\n\n- [Combat](combat.md#progression)",
-        )
-        .unwrap();
-        atomic_write(
-            &workspace.root.join("worklog/req-wiki.md"),
-            b"# Result\n\nVerified the build.\n\nSpec: [Combat](../specs/combat.md)",
-        )
-        .unwrap();
-        assert!(manager
-            .completion_doc_gaps(&workspace.id, "req-wiki", approved_plan)
-            .unwrap()
-            .is_empty());
-
-        atomic_write(
-            &workspace.root.join("plans/req-wiki.md"),
-            b"# Replaced plan",
-        )
-        .unwrap();
-        let gaps = manager
-            .completion_doc_gaps(&workspace.id, "req-wiki", approved_plan)
-            .unwrap();
-        assert!(gaps.iter().any(|gap| gap.contains("differs")));
         fs::remove_dir_all(base).ok();
     }
 

@@ -31,11 +31,10 @@ pub const TRUNCATED_MARKER: &str = "memory section truncated";
 const META_FILE: &str = "meta.json";
 static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 const INSTRUCTION_BLOCK: &str = concat!(
-    "Record only durable, project-specific facts via the memory_write tool: ",
-    "resource allocations (switches, death counters, locations, EUD addresses), ",
-    "file roles, naming/trigger conventions, and user corrections. Never record ",
-    "transient or code-derivable detail. Each file is a full replacement; rewrite ",
-    "it faithfully from what you see below."
+    "This is accepted durable project memory: resource allocations, file roles, ",
+    "naming/trigger conventions, and user corrections. Treat it as context, but ",
+    "do not edit it during foreground implementation. The post-acceptance harness ",
+    "synchronizes non-derivable durable facts after code approval."
 );
 
 /// Outcome of a [`ProjectMemory::write`].
