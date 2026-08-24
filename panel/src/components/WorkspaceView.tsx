@@ -3,11 +3,13 @@ import {
   BookOpen,
   ChevronDown,
   ChevronUp,
+  ChevronRight,
   Code2,
   FileText,
   FolderTree,
   GripHorizontal,
   RefreshCw,
+  Search,
   X,
 } from "lucide-react";
 
@@ -15,6 +17,7 @@ import { Response } from "@/components/ai-elements/response";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
+import { Input } from "@/components/ui/input";
 import type {
   WorkspaceFileEntry,
   WorkspaceListResponse,
@@ -29,6 +32,7 @@ export interface WorkspaceViewProps {
   error: string | null;
   embedded?: boolean;
   onSelect(file: WorkspaceFileEntry): void;
+  onSearch(query: string): Promise<string[]>;
   onRefresh(): void;
   onClose(): void;
 }
@@ -40,6 +44,8 @@ interface FileGroup {
 
 const DIRECTORY_ORDER = ["specs", "plans", "decisions", "worklog", "source"];
 const WORKSPACE_LINK_PREFIX = "https://workspace.invalid/";
+const COLLAPSED_DIRECTORIES_KEY_PREFIX = "eud.workspace.collapsed.";
+const SEARCH_DEBOUNCE_MS = 200;
 const WORKSPACE_SPLIT_KEY = "eud.workspace.split";
 const DEFAULT_TREE_HEIGHT = 192;
 const MIN_PANEL_HEIGHT = 120;
@@ -90,19 +96,19 @@ function clampTreeHeight(height: number, containerHeight: number): number {
   );
 }
 
-
 function directoryRank(directory: string): number {
   const root = directory.split("/", 1)[0];
   const rank = DIRECTORY_ORDER.indexOf(root);
   return rank === -1 ? DIRECTORY_ORDER.length : rank;
 }
 
+
 function groupFiles(files: WorkspaceFileEntry[]): FileGroup[] {
   const groups = new Map<string, WorkspaceFileEntry[]>();
   for (const file of files) {
-    const directory = file.path.includes("/")
-      ? file.path.slice(0, file.path.lastIndexOf("/"))
-      : "프로젝트 루트";
+    const separator = file.path.indexOf("/");
+    const directory =
+      separator === -1 ? "프로젝트 루트" : file.path.slice(0, separator);
     const group = groups.get(directory) ?? [];
     group.push(file);
     groups.set(directory, group);
@@ -123,9 +129,23 @@ function groupFiles(files: WorkspaceFileEntry[]): FileGroup[] {
     }));
 }
 
-function fileName(path: string): string {
-  return path.slice(path.lastIndexOf("/") + 1);
+
+function storedCollapsedDirectories(workspaceId: string): Set<string> {
+  if (typeof localStorage === "undefined") return new Set();
+  try {
+    const raw = localStorage.getItem(
+      `${COLLAPSED_DIRECTORIES_KEY_PREFIX}${workspaceId}`,
+    );
+    if (raw === null) return new Set();
+    const parsed: unknown = JSON.parse(raw);
+    return Array.isArray(parsed)
+      ? new Set(parsed.filter((value): value is string => typeof value === "string"))
+      : new Set();
+  } catch {
+    return new Set();
+  }
 }
+
 
 function formatBytes(size: number): string {
   if (size < 1024) return `${size} B`;
@@ -208,10 +228,19 @@ export function WorkspaceView({
   embedded = false,
   onSelect,
   onRefresh,
+  onSearch,
   onClose,
 }: WorkspaceViewProps) {
-  const groups = useMemo(() => groupFiles(workspace.files), [workspace.files]);
-  const selected = workspace.files.find((file) => file.path === selectedPath) ?? null;
+  const [collapsedDirectories, setCollapsedDirectories] = useState(() =>
+    storedCollapsedDirectories(workspace.workspaceId),
+  );
+  const [searchCollapsedDirectories, setSearchCollapsedDirectories] = useState(
+    () => new Set<string>(),
+  );
+  const [searchQuery, setSearchQuery] = useState("");
+  const [searchPaths, setSearchPaths] = useState<string[] | null>(null);
+  const [searchLoading, setSearchLoading] = useState(false);
+  const [searchError, setSearchError] = useState<string | null>(null);
   const [splitState, setSplitState] = useState(storedWorkspaceSplit);
   const splitContainerRef = useRef<HTMLDivElement>(null);
   const splitDragRef = useRef<{
@@ -219,6 +248,27 @@ export function WorkspaceView({
     startHeight: number;
     containerHeight: number;
   } | null>(null);
+  const normalizedSearchQuery = searchQuery.trim();
+  const visibleFiles = useMemo(() => {
+    if (searchPaths === null) return workspace.files;
+    const paths = new Set(searchPaths);
+    return workspace.files.filter((file) => paths.has(file.path));
+  }, [searchPaths, workspace.files]);
+  const groups = useMemo(() => groupFiles(visibleFiles), [visibleFiles]);
+  const activeCollapsedDirectories = normalizedSearchQuery
+    ? searchCollapsedDirectories
+    : collapsedDirectories;
+  const selected = workspace.files.find((file) => file.path === selectedPath) ?? null;
+  useEffect(() => {
+    try {
+      localStorage.setItem(
+        `${COLLAPSED_DIRECTORIES_KEY_PREFIX}${workspace.workspaceId}`,
+        JSON.stringify([...collapsedDirectories].sort()),
+      );
+    } catch {
+      // Persistence is optional; the current window keeps local state.
+    }
+  }, [collapsedDirectories, workspace.workspaceId]);
   useEffect(() => {
     try {
       localStorage.setItem(WORKSPACE_SPLIT_KEY, JSON.stringify(splitState));
@@ -226,6 +276,53 @@ export function WorkspaceView({
       // Split persistence is optional; the current window keeps local state.
     }
   }, [splitState]);
+  useEffect(() => {
+    if (!normalizedSearchQuery) {
+      setSearchPaths(null);
+      setSearchLoading(false);
+      setSearchError(null);
+      return;
+    }
+
+    let cancelled = false;
+    setSearchPaths([]);
+    setSearchLoading(true);
+    setSearchError(null);
+    const timeout = window.setTimeout(() => {
+      void onSearch(normalizedSearchQuery)
+        .then((paths) => {
+          if (!cancelled) setSearchPaths(paths);
+        })
+        .catch((searchFailure: unknown) => {
+          if (!cancelled) {
+            setSearchPaths([]);
+            setSearchError(`검색하지 못했습니다: ${String(searchFailure)}`);
+          }
+        })
+        .finally(() => {
+          if (!cancelled) setSearchLoading(false);
+        });
+    }, SEARCH_DEBOUNCE_MS);
+
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timeout);
+    };
+  }, [normalizedSearchQuery, onSearch]);
+  const toggleDirectory = (directory: string) => {
+    const update = (current: Set<string>) => {
+      const next = new Set(current);
+      if (next.has(directory)) next.delete(directory);
+      else next.add(directory);
+      return next;
+    };
+    if (normalizedSearchQuery) setSearchCollapsedDirectories(update);
+    else setCollapsedDirectories(update);
+  };
+  const updateSearchQuery = (query: string) => {
+    setSearchQuery(query);
+    setSearchCollapsedDirectories(new Set());
+  };
   const markdown = selectedPath?.toLowerCase().endsWith(".md") ?? false;
   const markdownContent = useMemo(
     () =>
@@ -339,49 +436,118 @@ export function WorkspaceView({
             splitState.collapsed === "tree" && "hidden",
           )}
         >
+          <div className="sticky top-0 z-10 bg-card/95 pb-2 backdrop-blur-sm">
+            <div className="relative">
+              <Search
+                className="pointer-events-none absolute left-2.5 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground"
+                aria-hidden="true"
+              />
+              <Input
+                type="search"
+                aria-label="파일명 또는 내용 검색"
+                aria-invalid={searchError ? true : undefined}
+                value={searchQuery}
+                placeholder="파일명 또는 내용 검색"
+                className="h-9 pl-8 pr-8 text-xs [&::-webkit-search-cancel-button]:appearance-none"
+                onChange={(event) => updateSearchQuery(event.target.value)}
+              />
+              {searchLoading ? (
+                <Spinner
+                  className="absolute right-2.5 top-1/2 size-3.5 -translate-y-1/2"
+                  aria-hidden="true"
+                />
+              ) : searchQuery ? (
+                <button
+                  type="button"
+                  aria-label="검색어 지우기"
+                  className="absolute right-1 top-1/2 flex size-7 -translate-y-1/2 items-center justify-center rounded text-muted-foreground hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                  onClick={() => updateSearchQuery("")}
+                >
+                  <X className="size-3.5" aria-hidden="true" />
+                </button>
+              ) : null}
+            </div>
+            {searchError && (
+              <p role="alert" className="px-1 pt-1.5 text-[11px] text-destructive">
+                {searchError}
+              </p>
+            )}
+          </div>
           {groups.length === 0 ? (
-            <p className="p-3 text-xs text-muted-foreground">표시할 파일이 없습니다.</p>
+            <div
+              className="flex items-center gap-2 p-3 text-xs text-muted-foreground"
+              aria-live="polite"
+            >
+              {searchLoading && <Spinner className="size-3.5" />}
+              {searchLoading
+                ? "검색 중…"
+                : normalizedSearchQuery
+                  ? "검색 결과가 없습니다."
+                  : "표시할 파일이 없습니다."}
+            </div>
           ) : (
-            groups.map((group) => (
-              <div key={group.directory} className="mb-3 last:mb-0">
-                <div className="mb-1 flex items-center gap-1.5 px-2 text-[11px] font-medium text-muted-foreground">
-                  <FolderTree className="size-3" aria-hidden="true" />
-                  <span className="truncate">{group.directory}</span>
+            groups.map((group) => {
+              const collapsed = activeCollapsedDirectories.has(group.directory);
+              return (
+                <div key={group.directory} className="mb-2 last:mb-0">
+                  <button
+                    type="button"
+                    aria-expanded={!collapsed}
+                    aria-label={`${group.directory} 폴더 ${collapsed ? "펼치기" : "접기"}`}
+                    className="mb-1 flex min-h-9 w-full items-center gap-1.5 rounded px-1.5 text-left text-[11px] font-medium text-muted-foreground hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                    onClick={() => toggleDirectory(group.directory)}
+                  >
+                    {collapsed ? (
+                      <ChevronRight className="size-3 shrink-0" aria-hidden="true" />
+                    ) : (
+                      <ChevronDown className="size-3 shrink-0" aria-hidden="true" />
+                    )}
+                    <FolderTree className="size-3 shrink-0" aria-hidden="true" />
+                    <span className="min-w-0 flex-1 truncate">{group.directory}</span>
+                    <span className="shrink-0 tabular-nums">{group.files.length}</span>
+                  </button>
+                  {!collapsed && (
+                    <div className="grid gap-0.5">
+                      {group.files.map((file) => {
+                        const active = file.path === selectedPath;
+                        const wikiHome = file.path === "specs/index.md";
+                        return (
+                          <button
+                            key={file.path}
+                            type="button"
+                            aria-current={active ? "page" : undefined}
+                            title={file.path}
+                            className={cn(
+                              "flex min-h-10 w-full items-center gap-2 rounded px-2 py-2 text-left text-xs transition-colors",
+                              active
+                                ? "bg-primary/15 text-foreground ring-1 ring-primary/30"
+                                : "text-muted-foreground hover:bg-muted hover:text-foreground",
+                            )}
+                            onClick={() => onSelect(file)}
+                          >
+                            {wikiHome ? (
+                              <BookOpen className="size-3.5 shrink-0 text-emerald-400" aria-hidden="true" />
+                            ) : file.source ? (
+                              <Code2 className="size-3.5 shrink-0 text-sky-400" aria-hidden="true" />
+                            ) : (
+                              <FileText className="size-3.5 shrink-0 text-emerald-400" aria-hidden="true" />
+                            )}
+                            <span className="min-w-0 flex-1 truncate">
+                              {group.directory === "프로젝트 루트"
+                                ? file.path
+                                : file.path.slice(group.directory.length + 1)}
+                            </span>
+                            <span className="shrink-0 text-[10px] tabular-nums text-muted-foreground">
+                              {formatBytes(file.size)}
+                            </span>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  )}
                 </div>
-                <div className="grid gap-0.5">
-                  {group.files.map((file) => {
-                    const active = file.path === selectedPath;
-                    const wikiHome = file.path === "specs/index.md";
-                    return (
-                      <button
-                        key={file.path}
-                        type="button"
-                        aria-current={active ? "page" : undefined}
-                        className={cn(
-                          "flex min-h-10 w-full items-center gap-2 rounded px-2 py-2 text-left text-xs transition-colors",
-                          active
-                            ? "bg-primary/15 text-foreground ring-1 ring-primary/30"
-                            : "text-muted-foreground hover:bg-muted hover:text-foreground",
-                        )}
-                        onClick={() => onSelect(file)}
-                      >
-                        {wikiHome ? (
-                          <BookOpen className="size-3.5 shrink-0 text-emerald-400" aria-hidden="true" />
-                        ) : file.source ? (
-                          <Code2 className="size-3.5 shrink-0 text-sky-400" aria-hidden="true" />
-                        ) : (
-                          <FileText className="size-3.5 shrink-0 text-emerald-400" aria-hidden="true" />
-                        )}
-                        <span className="min-w-0 flex-1 truncate">{fileName(file.path)}</span>
-                        <span className="shrink-0 text-[10px] tabular-nums text-muted-foreground">
-                          {formatBytes(file.size)}
-                        </span>
-                      </button>
-                    );
-                  })}
-                </div>
-              </div>
-            ))
+              );
+            })
           )}
         </nav>
 

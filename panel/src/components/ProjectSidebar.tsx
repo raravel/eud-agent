@@ -30,6 +30,7 @@ export interface ProjectSidebarProps {
   onMemoryEdited(file: MemoryViewState["activeTab"], content: string): void;
   onMemorySave(payload: { file: MemoryViewState["activeTab"]; content: string }): void;
   onWorkspaceSelect(file: WorkspaceFileEntry): void;
+  onWorkspaceSearch(query: string): Promise<string[]>;
   onWorkspaceRefresh(): void;
 }
 
@@ -72,6 +73,7 @@ export function ProjectSidebar({
   onMemoryEdited,
   onMemorySave,
   onWorkspaceSelect,
+  onWorkspaceSearch,
   onWorkspaceRefresh,
 }: ProjectSidebarProps) {
   const [width, setWidth] = useState(storedWidth);
@@ -143,6 +145,7 @@ export function ProjectSidebar({
         )}
         {activeTab === "workspace" && workspace && (
           <WorkspaceView
+            key={workspace.workspaceId}
             workspace={workspace}
             selectedPath={workspacePath}
             selectedContent={workspaceContent}
@@ -150,6 +153,7 @@ export function ProjectSidebar({
             error={workspaceError}
             embedded
             onSelect={onWorkspaceSelect}
+            onSearch={onWorkspaceSearch}
             onRefresh={onWorkspaceRefresh}
             onClose={onClose}
           />

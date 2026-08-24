@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { WorkspaceView } from "./WorkspaceView";
@@ -18,6 +18,7 @@ function callbacks() {
     onSelect: vi.fn(),
     onRefresh: vi.fn(),
     onClose: vi.fn(),
+    onSearch: vi.fn().mockResolvedValue([]),
   };
 }
 
@@ -191,6 +192,68 @@ describe("WorkspaceView", () => {
       />,
     );
     expect(screen.getByRole("alert")).toHaveTextContent("읽기 실패");
+  });
+
+  it("collapses top-level folders and restores their persisted state", () => {
+    const handlers = callbacks();
+    const view = render(
+      <WorkspaceView
+        workspace={workspace}
+        selectedPath={null}
+        selectedContent={null}
+        loading={false}
+        error={null}
+        {...handlers}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "specs 폴더 접기" }));
+    expect(screen.queryByText("combat.md")).not.toBeInTheDocument();
+    view.unmount();
+
+    render(
+      <WorkspaceView
+        workspace={workspace}
+        selectedPath={null}
+        selectedContent={null}
+        loading={false}
+        error={null}
+        {...handlers}
+      />,
+    );
+    expect(
+      screen.getByRole("button", { name: "specs 폴더 펼치기" }),
+    ).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryByText("combat.md")).not.toBeInTheDocument();
+  });
+
+  it("filters the tree with unified filename and content search results", async () => {
+    const handlers = callbacks();
+    handlers.onSearch.mockResolvedValue(["specs/combat.md"]);
+    render(
+      <WorkspaceView
+        workspace={workspace}
+        selectedPath={null}
+        selectedContent={null}
+        loading={false}
+        error={null}
+        {...handlers}
+      />,
+    );
+
+    fireEvent.change(
+      screen.getByRole("searchbox", { name: "파일명 또는 내용 검색" }),
+      { target: { value: "confirmed behavior" } },
+    );
+
+    await waitFor(() => {
+      expect(handlers.onSearch).toHaveBeenCalledWith("confirmed behavior");
+      expect(screen.queryByText("main.eps")).not.toBeInTheDocument();
+    });
+    expect(screen.getByText("combat.md")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "검색어 지우기" }));
+    expect(screen.getByText("main.eps")).toBeInTheDocument();
   });
 
   it("resizes the file tree vertically and restores the persisted height", () => {
