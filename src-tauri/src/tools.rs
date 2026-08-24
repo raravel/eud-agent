@@ -7,7 +7,7 @@ use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine;
 use encoding_rs::EUC_KR;
 use serde_json::{json, Map, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
@@ -20,6 +20,10 @@ pub const BUILD_RUN_TOOL: &str = "build_run";
 
 /// Documentation search tool name.
 pub const SEARCH_DOCS_TOOL: &str = "search_docs";
+/// Exact documentation-chunk lookup tool name.
+pub const DOCS_GET_TOOL: &str = "docs_get";
+/// Bounded source search tool name.
+pub const SOURCE_SEARCH_TOOL: &str = "source_search";
 /// Read-only epScript candidate preflight tool name.
 pub const EPS_CHECK_TOOL: &str = "eps_check";
 /// Flow-control tool that records write intent without mutating the project.
@@ -90,11 +94,34 @@ pub struct RequestState {
     /// Number of admitted `search_docs` calls in this request.
     pub search_docs_count: usize,
 
+    /// Number of documentation hits returned across discovery calls.
+    pub search_docs_returned_hits: usize,
+
+    /// Number of first-seen documentation hits in this request.
+    pub search_docs_unique_hits: usize,
+
+    /// Number of already-seen documentation hits returned again.
+    pub search_docs_repeated_hits: usize,
+
+    /// Serialized discovery-result bytes returned to Codex.
+    pub search_docs_result_bytes: usize,
+
+    /// Number of exact `docs_get` calls in this request.
+    pub docs_get_count: usize,
+
+    /// Number of exact documentation chunks returned by `docs_get`.
+    pub docs_get_documents: usize,
+
+    /// Serialized exact-document bytes returned to Codex.
+    pub docs_get_result_bytes: usize,
+
     /// Number of admitted mutating tool actions in this request.
     pub mutation_count: usize,
 
     /// Number of admitted build self-fix attempts in this request.
     pub build_fix_attempts: usize,
+
+    seen_doc_ids: BTreeSet<u64>,
 }
 
 impl RequestState {
@@ -111,8 +138,16 @@ impl RequestState {
             plan_approved: false,
             action_count: 0,
             search_docs_count: 0,
+            search_docs_returned_hits: 0,
+            search_docs_unique_hits: 0,
+            search_docs_repeated_hits: 0,
+            search_docs_result_bytes: 0,
+            docs_get_count: 0,
+            docs_get_documents: 0,
+            docs_get_result_bytes: 0,
             mutation_count: 0,
             build_fix_attempts: 0,
+            seen_doc_ids: BTreeSet::new(),
         }
     }
 
@@ -127,6 +162,35 @@ impl RequestState {
     /// validates the call and must not mark the evidence gate satisfied.
     pub fn record_search_docs(&mut self) {
         self.docs_searched = true;
+    }
+
+    /// Record discovery hits and return one repeated flag per id.
+    pub fn record_search_docs_hits(&mut self, ids: &[u64]) -> Vec<bool> {
+        self.record_search_docs();
+        self.search_docs_returned_hits += ids.len();
+        ids.iter()
+            .map(|id| {
+                let repeated = !self.seen_doc_ids.insert(*id);
+                if repeated {
+                    self.search_docs_repeated_hits += 1;
+                } else {
+                    self.search_docs_unique_hits += 1;
+                }
+                repeated
+            })
+            .collect()
+    }
+
+    /// Record the final serialized discovery payload size.
+    pub fn record_search_docs_payload(&mut self, bytes: usize) {
+        self.search_docs_result_bytes += bytes;
+    }
+
+    /// Record an exact-document response.
+    pub fn record_docs_get(&mut self, documents: usize, bytes: usize) {
+        self.docs_get_count += 1;
+        self.docs_get_documents += documents;
+        self.docs_get_result_bytes += bytes;
     }
 
     /// Approve the current request plan, lifting the mutation gate.
@@ -208,6 +272,15 @@ fn object_array_schema(properties: Value, required: &[&str]) -> Value {
         "type": "array",
         "minItems": 1,
         "items": object_schema(properties, required),
+    })
+}
+
+fn string_array_schema(max_items: usize) -> Value {
+    json!({
+        "type": "array",
+        "minItems": 1,
+        "maxItems": max_items,
+        "items": string_schema(),
     })
 }
 
@@ -347,9 +420,31 @@ pub fn tool_registry() -> Vec<ToolSpec> {
         ),
         tool_spec(
             "read_file",
-            "Read an editable project file.",
+            "Read an editable project file, optionally by inclusive 1-based line range.",
             false,
-            schema(json!({"path": string_schema()}), &["path"]),
+            schema(
+                json!({
+                    "path": string_schema(),
+                    "startLine": integer_schema(),
+                    "endLine": integer_schema(),
+                }),
+                &["path"],
+            ),
+        ),
+        tool_spec(
+            SOURCE_SEARCH_TOOL,
+            "Search editable project source with exact paged excerpts; native read-only shell remains available as a fallback.",
+            false,
+            schema(
+                json!({
+                    "query": string_schema(),
+                    "paths": string_array_schema(64),
+                    "contextLines": integer_schema(),
+                    "offset": integer_schema(),
+                    "limit": integer_schema(),
+                }),
+                &["query"],
+            ),
         ),
         tool_spec(
             EPS_CHECK_TOOL,
@@ -496,18 +591,50 @@ pub fn tool_registry() -> Vec<ToolSpec> {
             false,
             empty_schema(),
         ),
-        tool_spec(
-            SEARCH_DOCS_TOOL,
-            "Search the project reference corpus.",
-            false,
-            schema(
+    fn search_docs(&self, args: &Value) -> Value {
+        let query = args.get("query").and_then(Value::as_str).unwrap_or("");
+        let k = args
+            .get("k")
+            .and_then(Value::as_i64)
+            .unwrap_or(SEARCH_DOCS_DEFAULT_K)
+            .clamp(1, SEARCH_DOCS_MAX_K) as usize;
+
+        // Empty index (no asset yet) returns zero hits. Otherwise hybrid search:
+        // lexical substring hits (exact identifiers/Korean terms, no model needed)
+        // first, then dense semantic hits fill the rest. A model still warming
+        // yields no semantic hits but lexical still works; zero hits either way
+        // still lift the evidence gate.
+        let hits = if self.services.rag.is_empty() {
+            Vec::new()
+        } else {
+            self.services.rag.search_hybrid(query, k)
+        };
+
+        let items: Vec<Value> = hits
+            .iter()
+            .map(|hit| {
+                let (preview, preview_start_char, preview_truncated) =
+                    search_docs_preview(&hit.text, query);
                 json!({
-                    "query": string_schema(),
-                    "k": integer_schema(),
-                }),
-                &["query"],
-            ),
-        ),
+                    "id": format_doc_id(hit.id),
+                    "source": hit.source,
+                    "tier": tier_label(hit.tier_level),
+                    "match": hit.match_kind.as_str(),
+                    "score": hit.score,
+                    "preview": preview,
+                    "previewStartChar": preview_start_char,
+                    "previewTruncated": preview_truncated,
+                })
+            })
+            .collect();
+        let note = if items.is_empty() {
+            "no reference document matched; treat affected items as 근거 없음 (일반 EUD 지식) — never fabricate a source"
+        } else {
+            "previews are exact excerpts, not summaries; call docs_get with promising ids before relying on omitted details"
+        };
+        json!({ "query": query, "count": items.len(), "hits": items, "note": note })
+    }
+
         tool_spec(
             ASK_TOOL,
             "Pause this turn to ask the user up to four related questions. Each question supports single or multiple choice and always allows direct input.",
@@ -998,6 +1125,7 @@ fn map_operation_schema() -> Value {
             ),
             operation_schema(
                 "unit.set",
+
                 json!({
                     "ordinal": u32_schema(),
                     "beforeFingerprint": string_schema(),
@@ -2998,6 +3126,7 @@ fn terrain_view(
         "offset": offset,
         "limit": limit,
         "hasMore": end < total,
+
         "tiles": tiles,
     }))
 }
@@ -4871,7 +5000,28 @@ mod tests {
             (
                 "read_file",
                 false,
-                schema(serde_json::json!({"path": string_schema()}), &["path"]),
+                schema(
+                    serde_json::json!({
+                        "path": string_schema(),
+                        "startLine": integer_schema(),
+                        "endLine": integer_schema(),
+                    }),
+                    &["path"],
+                ),
+            ),
+            (
+                SOURCE_SEARCH_TOOL,
+                false,
+                schema(
+                    serde_json::json!({
+                        "query": string_schema(),
+                        "paths": string_array_schema(64),
+                        "contextLines": integer_schema(),
+                        "offset": integer_schema(),
+                        "limit": integer_schema(),
+                    }),
+                    &["query"],
+                ),
             ),
             (
                 EPS_CHECK_TOOL,
@@ -5016,6 +5166,14 @@ mod tests {
                         "k": integer_schema(),
                     }),
                     &["query"],
+                ),
+            ),
+            (
+                DOCS_GET_TOOL,
+                false,
+                schema(
+                    serde_json::json!({"ids": string_array_schema(10)}),
+                    &["ids"],
                 ),
             ),
             (

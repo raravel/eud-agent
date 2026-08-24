@@ -31,6 +31,13 @@ use crate::workspace::{apply_exact_text_edits, ExactTextEdit};
 /// Maximum `search_docs` top-k (mirrors the registry/feature 11 clamp).
 const SEARCH_DOCS_MAX_K: i64 = 10;
 const SEARCH_DOCS_DEFAULT_K: i64 = 5;
+const SEARCH_DOCS_PREVIEW_CHARS: usize = 480;
+const DOCS_GET_MAX_IDS: usize = 10;
+const READ_FILE_DEFAULT_LINES: usize = 400;
+const SOURCE_SEARCH_DEFAULT_LIMIT: usize = 20;
+const SOURCE_SEARCH_MAX_LIMIT: usize = 100;
+const SOURCE_SEARCH_MAX_CONTEXT_LINES: usize = 20;
+const SOURCE_SEARCH_MAX_QUERY_CHARS: usize = 256;
 const MAP_PALETTE_QUERY_MAX_MATCHES: usize = 256;
 
 /// Editor build-state probe backed by the editor `status.txt`, resolved from
@@ -646,7 +653,21 @@ impl SessionToolRuntime {
     pub fn clear_current(&self) {
         self.cancel_pending_ask();
         *self.request.lock() = None;
-        *self.request_state.lock() = None;
+        if let Some(state) = self.request_state.lock().take() {
+            eprintln!(
+                "eud-agent: retrieval session={} request={} searches={} hits={} unique={} repeated={} search_bytes={} docs_get={} documents={} docs_bytes={}",
+                self.session_id,
+                state.request_id,
+                state.search_docs_count,
+                state.search_docs_returned_hits,
+                state.search_docs_unique_hits,
+                state.search_docs_repeated_hits,
+                state.search_docs_result_bytes,
+                state.docs_get_count,
+                state.docs_get_documents,
+                state.docs_get_result_bytes,
+            );
+        }
         *self.pending_plan.lock() = None;
     }
 
@@ -802,17 +823,96 @@ stop this turn so the backend can resume the same thread in its isolated writabl
             tools::admit_tool_call(state, tool, args).map_err(|error| error.to_string())?;
         }
 
-        let result = if tools::is_mutating_tool(tool) {
+        let mut result = if tools::is_mutating_tool(tool) {
             self.project_transaction(|| self.dispatch(&request_id, tool, args))?
         } else {
             self.dispatch(&request_id, tool, args)
         };
-        if result.is_ok() && tool == tools::SEARCH_DOCS_TOOL {
-            if let Some(state) = self.request_state.lock().as_mut() {
-                state.record_search_docs();
+        if let Ok(value) = result.as_mut() {
+            if tool == tools::SEARCH_DOCS_TOOL {
+                self.record_search_docs_result(&request_id, value)?;
+            } else if tool == tools::DOCS_GET_TOOL {
+                self.record_docs_get_result(&request_id, value)?;
             }
         }
         result
+    }
+
+    fn record_search_docs_result(&self, request_id: &str, value: &mut Value) -> Result<(), String> {
+        let ids = value
+            .get("hits")
+            .and_then(Value::as_array)
+            .ok_or_else(|| "search_docs returned no hits array".to_string())?
+            .iter()
+            .map(|hit| {
+                hit.get("id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "search_docs hit omitted its id".to_string())
+                    .and_then(parse_doc_id)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let mut states = self.request_state.lock();
+        let state = states
+            .as_mut()
+            .filter(|state| state.request_id == request_id)
+            .ok_or_else(|| format!("request state for {request_id} is missing"))?;
+        let repeated = state.record_search_docs_hits(&ids);
+        let repeated_count = repeated.iter().filter(|flag| **flag).count();
+        let new_count = repeated.len() - repeated_count;
+
+        let hits = value
+            .get_mut("hits")
+            .and_then(Value::as_array_mut)
+            .ok_or_else(|| "search_docs returned no mutable hits array".to_string())?;
+        for (hit, repeated) in hits.iter_mut().zip(repeated) {
+            hit.as_object_mut()
+                .ok_or_else(|| "search_docs returned a non-object hit".to_string())?
+                .insert("repeated".to_string(), Value::Bool(repeated));
+        }
+        let object = value
+            .as_object_mut()
+            .ok_or_else(|| "search_docs returned a non-object result".to_string())?;
+        object.insert("newCount".to_string(), Value::from(new_count));
+        object.insert("repeatedCount".to_string(), Value::from(repeated_count));
+
+        let bytes = serde_json::to_vec(value)
+            .map_err(|error| format!("failed to measure search_docs result: {error}"))?
+            .len();
+        state.record_search_docs_payload(bytes);
+        eprintln!(
+            "eud-agent: search_docs session={} request={} call={} hits={} new={} repeated={} bytes={}",
+            self.session_id,
+            request_id,
+            state.search_docs_count,
+            ids.len(),
+            new_count,
+            repeated_count,
+            bytes,
+        );
+        Ok(())
+    }
+
+    fn record_docs_get_result(&self, request_id: &str, value: &Value) -> Result<(), String> {
+        let documents = value
+            .get("documents")
+            .and_then(Value::as_array)
+            .ok_or_else(|| "docs_get returned no documents array".to_string())?
+            .len();
+        let bytes = serde_json::to_vec(value)
+            .map_err(|error| format!("failed to measure docs_get result: {error}"))?
+            .len();
+        let mut states = self.request_state.lock();
+        let state = states
+            .as_mut()
+            .filter(|state| state.request_id == request_id)
+            .ok_or_else(|| format!("request state for {request_id} is missing"))?;
+        state.record_docs_get(documents, bytes);
+        eprintln!(
+            "eud-agent: docs_get session={} request={} call={} documents={} bytes={}",
+            self.session_id, request_id, state.docs_get_count, documents, bytes,
+        );
+        Ok(())
     }
 
     #[cfg(test)]
@@ -1060,11 +1160,8 @@ stop this turn so the backend can resume the same thread in its isolated writabl
                     .collect();
                 Ok(json!({ "count": items.len(), "files": items }))
             }
-            "read_file" => {
-                let path = str_arg(args, "path")?;
-                let content = self.bridge()?.get(path, &opts, None).map_err(stringify)?;
-                Ok(json!({ "path": path, "content": content }))
-            }
+            "read_file" => self.read_file(args, &opts),
+            tools::SOURCE_SEARCH_TOOL => self.source_search(args, &opts),
             tools::EPS_CHECK_TOOL => {
                 let files: Vec<EpsCandidateInput> = serde_json::from_value(
                     args.get("files")
@@ -1196,6 +1293,7 @@ stop this turn so the backend can resume the same thread in its isolated writabl
                 tools::map_minimap(&bridge, args).map_err(stringify)
             }
             tools::SEARCH_DOCS_TOOL => Ok(self.search_docs(args)),
+            tools::DOCS_GET_TOOL => self.docs_get(args),
             tools::REQUEST_WRITE_WORKSPACE_TOOL => {
                 let reason = str_arg(args, "reason")?;
                 self.request_write_workspace(reason)?;
@@ -1886,6 +1984,82 @@ stop this turn so the backend can resume the same thread in its isolated writabl
         }
     }
 
+    fn read_file(&self, args: &Value, opts: &SendOpts) -> Result<Value, String> {
+        let path = str_arg(args, "path")?;
+        let content = self.bridge()?.get(path, opts, None).map_err(stringify)?;
+        ranged_file_result(path, &content, args)
+    }
+
+    fn source_search(&self, args: &Value, opts: &SendOpts) -> Result<Value, String> {
+        let query = str_arg(args, "query")?.trim();
+        if query.is_empty() {
+            return Err("source_search query must not be empty".to_string());
+        }
+        if query.chars().count() > SOURCE_SEARCH_MAX_QUERY_CHARS {
+            return Err(format!(
+                "source_search query exceeds {SOURCE_SEARCH_MAX_QUERY_CHARS} characters"
+            ));
+        }
+        let context_lines =
+            usize_arg_default(args, "contextLines", 3)?.min(SOURCE_SEARCH_MAX_CONTEXT_LINES);
+        let offset = usize_arg_default(args, "offset", 0)?;
+        let limit = usize_arg_default(args, "limit", SOURCE_SEARCH_DEFAULT_LIMIT)?
+            .clamp(1, SOURCE_SEARCH_MAX_LIMIT);
+        let requested_paths = optional_string_array_arg(args, "paths")?;
+
+        let bridge = self.bridge()?;
+        let files = bridge.list(opts, None).map_err(stringify)?;
+        for requested in &requested_paths {
+            if !files
+                .iter()
+                .any(|file| file.settable && file.path.eq_ignore_ascii_case(requested.as_str()))
+            {
+                return Err(format!(
+                    "source_search path '{requested}' is not an editable project file"
+                ));
+            }
+        }
+
+        let mut matches = Vec::new();
+        let mut total = 0usize;
+        for file in files {
+            if !file.settable
+                || (!requested_paths.is_empty()
+                    && !requested_paths
+                        .iter()
+                        .any(|path| file.path.eq_ignore_ascii_case(path)))
+            {
+                continue;
+            }
+            let content = bridge.get(&file.path, opts, None).map_err(stringify)?;
+            let lines: Vec<&str> = content.lines().collect();
+            for (start, end) in source_match_regions(&lines, query, context_lines) {
+                if total >= offset && matches.len() < limit {
+                    matches.push(json!({
+                        "path": file.path,
+                        "startLine": start + 1,
+                        "endLine": end,
+                        "text": lines[start..end].join("\n"),
+                    }));
+                }
+                total += 1;
+            }
+        }
+
+        let next_offset = offset.saturating_add(matches.len());
+        let has_more = next_offset < total;
+        Ok(json!({
+            "query": query,
+            "offset": offset,
+            "limit": limit,
+            "total": total,
+            "count": matches.len(),
+            "hasMore": has_more,
+            "nextOffset": has_more.then_some(next_offset),
+            "matches": matches,
+        }))
+    }
+
     fn search_docs(&self, args: &Value) -> Value {
         let query = args.get("query").and_then(Value::as_str).unwrap_or("");
         let k = args
@@ -1907,14 +2081,63 @@ stop this turn so the backend can resume the same thread in its isolated writabl
 
         let items: Vec<Value> = hits
             .iter()
-            .map(|hit| json!({ "source": hit.source, "text": hit.text, "score": hit.score }))
+            .map(|hit| {
+                let (preview, preview_start_char, preview_truncated) =
+                    search_docs_preview(&hit.text, query);
+                json!({
+                    "id": format_doc_id(hit.id),
+                    "source": hit.source,
+                    "tier": tier_label(hit.tier_level),
+                    "match": hit.match_kind.as_str(),
+                    "score": hit.score,
+                    "preview": preview,
+                    "previewStartChar": preview_start_char,
+                    "previewTruncated": preview_truncated,
+                })
+            })
             .collect();
         let note = if items.is_empty() {
             "no reference document matched; treat affected items as 근거 없음 (일반 EUD 지식) — never fabricate a source"
         } else {
-            ""
+            "previews are exact excerpts, not summaries; call docs_get with promising ids before relying on omitted details"
         };
         json!({ "query": query, "count": items.len(), "hits": items, "note": note })
+    }
+
+    fn docs_get(&self, args: &Value) -> Result<Value, String> {
+        let raw_ids = array_arg(args, "ids")?;
+        if raw_ids.len() > DOCS_GET_MAX_IDS {
+            return Err(format!(
+                "docs_get accepts at most {DOCS_GET_MAX_IDS} ids per call; continue in another call"
+            ));
+        }
+        let mut seen = HashSet::with_capacity(raw_ids.len());
+        let mut documents = Vec::with_capacity(raw_ids.len());
+        let mut missing_ids = Vec::new();
+        for raw_id in raw_ids {
+            let text = raw_id
+                .as_str()
+                .ok_or_else(|| "docs_get ids must be strings".to_string())?;
+            let id = parse_doc_id(text)?;
+            if !seen.insert(id) {
+                return Err(format!("docs_get id '{text}' is duplicated"));
+            }
+            let Some(entry) = self.services.rag.document(id) else {
+                missing_ids.push(text.to_string());
+                continue;
+            };
+            documents.push(json!({
+                "id": format_doc_id(entry.id),
+                "source": entry.source,
+                "tier": tier_label(entry.tier_level),
+                "text": entry.text,
+            }));
+        }
+        Ok(json!({
+            "count": documents.len(),
+            "documents": documents,
+            "missingIds": missing_ids,
+        }))
     }
 
     fn current_project(&self) -> String {
@@ -2274,6 +2497,165 @@ fn usize_arg_default(args: &Value, name: &str, default: usize) -> Result<usize, 
         .or_else(|| value.as_str().and_then(|text| text.parse().ok()))
         .ok_or_else(|| format!("argument '{name}' must be a non-negative integer"))?;
     usize::try_from(value).map_err(|_| format!("argument '{name}' is too large"))
+}
+fn optional_string_array_arg(args: &Value, name: &str) -> Result<Vec<String>, String> {
+    let Some(value) = args.get(name) else {
+        return Ok(Vec::new());
+    };
+    let values = value
+        .as_array()
+        .ok_or_else(|| format!("argument '{name}' must be an array of strings"))?;
+    let mut seen = HashSet::with_capacity(values.len());
+    let mut result = Vec::with_capacity(values.len());
+    for value in values {
+        let text = value
+            .as_str()
+            .ok_or_else(|| format!("argument '{name}' must contain only strings"))?
+            .trim();
+        if text.is_empty() {
+            return Err(format!("argument '{name}' contains an empty string"));
+        }
+        let key = text.to_lowercase();
+        if !seen.insert(key) {
+            return Err(format!("argument '{name}' contains duplicate '{text}'"));
+        }
+        result.push(text.to_string());
+    }
+    Ok(result)
+}
+
+fn ranged_file_result(path: &str, content: &str, args: &Value) -> Result<Value, String> {
+    let total_lines = content.lines().count();
+    if args.get("startLine").is_none() && args.get("endLine").is_none() {
+        return Ok(json!({
+            "path": path,
+            "content": content,
+            "startLine": (total_lines > 0).then_some(1),
+            "endLine": total_lines,
+            "totalLines": total_lines,
+            "hasMore": false,
+        }));
+    }
+
+    let start = usize_arg_default(args, "startLine", 1)?;
+    if start == 0 {
+        return Err("read_file startLine is 1-based and must be at least 1".to_string());
+    }
+    if total_lines == 0 {
+        return Ok(json!({
+            "path": path,
+            "content": "",
+            "startLine": Value::Null,
+            "endLine": 0,
+            "totalLines": 0,
+            "hasMore": false,
+        }));
+    }
+    if start > total_lines {
+        return Err(format!(
+            "read_file startLine {start} exceeds {total_lines} total lines"
+        ));
+    }
+    let default_end = start
+        .saturating_add(READ_FILE_DEFAULT_LINES - 1)
+        .min(total_lines);
+    let end = usize_arg_default(args, "endLine", default_end)?.min(total_lines);
+    if end < start {
+        return Err(format!(
+            "read_file endLine {end} precedes startLine {start}"
+        ));
+    }
+    let selected = content
+        .lines()
+        .skip(start - 1)
+        .take(end - start + 1)
+        .collect::<Vec<_>>()
+        .join("\n");
+    Ok(json!({
+        "path": path,
+        "content": selected,
+        "startLine": start,
+        "endLine": end,
+        "totalLines": total_lines,
+        "hasMore": end < total_lines,
+    }))
+}
+
+fn source_match_regions(lines: &[&str], query: &str, context_lines: usize) -> Vec<(usize, usize)> {
+    let query = query.to_lowercase();
+    let mut regions: Vec<(usize, usize)> = Vec::new();
+    for (line_index, line) in lines.iter().enumerate() {
+        if !line.to_lowercase().contains(&query) {
+            continue;
+        }
+        let start = line_index.saturating_sub(context_lines);
+        let end = line_index
+            .saturating_add(context_lines + 1)
+            .min(lines.len());
+        if let Some(last) = regions.last_mut() {
+            if start <= last.1 {
+                last.1 = last.1.max(end);
+                continue;
+            }
+        }
+        regions.push((start, end));
+    }
+    regions
+}
+
+fn search_docs_preview(text: &str, query: &str) -> (String, usize, bool) {
+    let total_chars = text.chars().count();
+    if total_chars <= SEARCH_DOCS_PREVIEW_CHARS {
+        return (text.to_string(), 0, false);
+    }
+
+    let lower = text.to_lowercase();
+    let matched_char = crate::rag::tokenize_lexical(query)
+        .iter()
+        .filter_map(|term| {
+            lower
+                .find(term)
+                .map(|byte_index| lower[..byte_index].chars().count())
+        })
+        .min()
+        .unwrap_or(0);
+    let start = matched_char
+        .saturating_sub(SEARCH_DOCS_PREVIEW_CHARS / 3)
+        .min(total_chars - SEARCH_DOCS_PREVIEW_CHARS);
+    let preview = text
+        .chars()
+        .skip(start)
+        .take(SEARCH_DOCS_PREVIEW_CHARS)
+        .collect();
+    (preview, start, true)
+}
+
+fn format_doc_id(id: u64) -> String {
+    format!("{id:016x}")
+}
+
+fn parse_doc_id(text: &str) -> Result<u64, String> {
+    let text = text.trim();
+    let text = text
+        .strip_prefix("0x")
+        .or_else(|| text.strip_prefix("0X"))
+        .unwrap_or(text);
+    if text.is_empty() || text.len() > 16 || !text.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(format!(
+            "documentation id '{text}' must contain 1 to 16 hexadecimal digits"
+        ));
+    }
+    u64::from_str_radix(text, 16)
+        .map_err(|error| format!("invalid documentation id '{text}': {error}"))
+}
+
+fn tier_label(tier_level: u8) -> &'static str {
+    match tier_level {
+        3 => "primary",
+        2 => "lecture",
+        1 => "general",
+        _ => "qa",
+    }
 }
 fn render_scale_arg(args: &Value) -> Result<usize, String> {
     let scale = usize_arg_default(args, "scale", 4)?;
@@ -2912,6 +3294,79 @@ mod tests {
     }
 
     #[test]
+    fn progressive_docs_discovery_preserves_exact_reads_and_reports_repeats() {
+        let full_text = format!("{} SelectionCircle {}", "앞".repeat(600), "뒤".repeat(600));
+        let mut services = ToolServices::for_tests();
+        services.rag = Arc::new(Rag::new(
+            vec![crate::rag::IndexEntry {
+                id: 0x123,
+                vector: vec![0.0; crate::rag::EMBED_DIM],
+                tier_level: 3,
+                text: full_text.clone(),
+                source: "[원문](https://example.test/doc)".to_string(),
+            }],
+            None,
+        ));
+        let runtime = services.session("progressive-docs-session");
+        runtime
+            .begin_request("req-progressive-docs", "project")
+            .unwrap();
+
+        let first = runtime
+            .execute(
+                tools::SEARCH_DOCS_TOOL,
+                &json!({"query": "SelectionCircle", "k": 1}),
+            )
+            .unwrap();
+        assert_eq!(first["count"], 1);
+        assert_eq!(first["newCount"], 1);
+        assert_eq!(first["repeatedCount"], 0);
+        assert_eq!(first["hits"][0]["id"], "0000000000000123");
+        assert_eq!(first["hits"][0]["tier"], "primary");
+        assert_eq!(first["hits"][0]["match"], "lexical");
+        assert_eq!(first["hits"][0]["repeated"], false);
+        assert_eq!(first["hits"][0]["previewTruncated"], true);
+        assert!(first["hits"][0]["preview"]
+            .as_str()
+            .unwrap()
+            .contains("SelectionCircle"));
+        assert!(
+            first["hits"][0].get("text").is_none(),
+            "discovery must not inject the complete chunk"
+        );
+
+        let second = runtime
+            .execute(
+                tools::SEARCH_DOCS_TOOL,
+                &json!({"query": "SelectionCircle", "k": 1}),
+            )
+            .unwrap();
+        assert_eq!(second["newCount"], 0);
+        assert_eq!(second["repeatedCount"], 1);
+        assert_eq!(second["hits"][0]["repeated"], true);
+
+        let exact = runtime
+            .execute(tools::DOCS_GET_TOOL, &json!({"ids": ["0000000000000123"]}))
+            .unwrap();
+        assert_eq!(exact["count"], 1);
+        assert_eq!(exact["documents"][0]["text"], full_text);
+        assert_eq!(
+            exact["documents"][0]["source"],
+            "[원문](https://example.test/doc)"
+        );
+
+        let state = runtime.request_state_snapshot().unwrap();
+        assert_eq!(state.search_docs_count, 2);
+        assert_eq!(state.search_docs_returned_hits, 2);
+        assert_eq!(state.search_docs_unique_hits, 1);
+        assert_eq!(state.search_docs_repeated_hits, 1);
+        assert!(state.search_docs_result_bytes > 0);
+        assert_eq!(state.docs_get_count, 1);
+        assert_eq!(state.docs_get_documents, 1);
+        assert!(state.docs_get_result_bytes > full_text.len());
+    }
+
+    #[test]
     fn propose_plan_parks_markdown_for_the_engine_to_pick_up() {
         let runtime = open_runtime("req-plan");
         let result = runtime
@@ -3128,6 +3583,68 @@ mod tests {
             "project_status must read MainFile only through GETMAIN; LIST remains separate"
         );
         assert_eq!(runtime.request_state_snapshot().unwrap().action_count, 2);
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn ranged_read_and_source_search_page_exact_excerpts() {
+        let (base, inbox, outbox, runtime) = bridge_runtime("source-search", "req-source-search");
+        let responder = spawn_bridge_responder(
+            inbox,
+            outbox,
+            vec![
+                ("GET boss", "alpha\nbeta\ngamma\ndelta"),
+                ("LIST", "boss\tCUIEps\r\nhero\tCUIEps"),
+                ("GET boss", "a\nneedle one\nb\nc\nd\nneedle two\ne"),
+                ("GET hero", "x\ny"),
+                ("LIST", "boss\tCUIEps\r\nhero\tCUIEps"),
+                ("GET boss", "a\nneedle one\nb\nc\nd\nneedle two\ne"),
+                ("GET hero", "x\ny"),
+            ],
+        );
+
+        let ranged = runtime
+            .execute(
+                "read_file",
+                &json!({"path": "boss", "startLine": 2, "endLine": 3}),
+            )
+            .unwrap();
+        assert_eq!(ranged["content"], "beta\ngamma");
+        assert_eq!(ranged["startLine"], 2);
+        assert_eq!(ranged["endLine"], 3);
+        assert_eq!(ranged["totalLines"], 4);
+        assert_eq!(ranged["hasMore"], true);
+
+        let first = runtime
+            .execute(
+                tools::SOURCE_SEARCH_TOOL,
+                &json!({"query": "NEEDLE", "contextLines": 1, "offset": 0, "limit": 1}),
+            )
+            .unwrap();
+        assert_eq!(first["total"], 2);
+        assert_eq!(first["count"], 1);
+        assert_eq!(first["hasMore"], true);
+        assert_eq!(first["nextOffset"], 1);
+        assert_eq!(first["matches"][0]["path"], "boss");
+        assert_eq!(first["matches"][0]["startLine"], 1);
+        assert_eq!(first["matches"][0]["endLine"], 3);
+        assert_eq!(first["matches"][0]["text"], "a\nneedle one\nb");
+
+        let second = runtime
+            .execute(
+                tools::SOURCE_SEARCH_TOOL,
+                &json!({"query": "needle", "contextLines": 1, "offset": 1, "limit": 1}),
+            )
+            .unwrap();
+        assert_eq!(second["total"], 2);
+        assert_eq!(second["count"], 1);
+        assert_eq!(second["hasMore"], false);
+        assert!(second["nextOffset"].is_null());
+        assert_eq!(second["matches"][0]["startLine"], 5);
+        assert_eq!(second["matches"][0]["endLine"], 7);
+        assert_eq!(second["matches"][0]["text"], "d\nneedle two\ne");
+
+        responder.join().unwrap();
         fs::remove_dir_all(base).ok();
     }
 

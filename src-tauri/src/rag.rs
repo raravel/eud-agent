@@ -260,16 +260,37 @@ pub struct IndexEntry {
     pub source: String,
 }
 
+/// How a ranked chunk matched the query.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MatchKind {
+    Semantic,
+    Lexical,
+}
+
+impl MatchKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Semantic => "semantic",
+            Self::Lexical => "lexical",
+        }
+    }
+}
+
 /// A ranked search result. `source` carries the `[reference context]` link header the
 /// evidence gate cites.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Hit {
+    /// Stable corpus chunk id.
+    pub id: u64,
+    /// Source-trust tier code (0=Q&A … 3=official).
+    pub tier_level: u8,
+    /// Whether lexical or semantic ranking produced this hit.
+    pub match_kind: MatchKind,
     /// The matched chunk text.
     pub text: String,
     /// The citation link header (`[title](url)`).
     pub source: String,
-    /// Weighted ranking score: `cosine(query, entry) * TIER_WEIGHT[tier_level]`
-    /// (cosine == dot on L2-normalized vectors; the tier weight nudges by source trust).
+    /// Weighted semantic score or lexical occurrence count.
     pub score: f32,
 }
 
@@ -479,6 +500,11 @@ impl Rag {
         self.index.is_empty()
     }
 
+    /// Look up one exact indexed chunk by its stable id.
+    pub(crate) fn document(&self, id: u64) -> Option<&IndexEntry> {
+        self.index.iter().find(|entry| entry.id == id)
+    }
+
     /// True once the embedding model is loaded (after a successful [`Self::warmup`]).
     pub fn is_ready(&self) -> bool {
         self.embedder.lock().map(|g| g.is_some()).unwrap_or(false)
@@ -547,6 +573,9 @@ impl Rag {
             .into_iter()
             .take(k.min(MAX_TOP_K))
             .map(|(e, score)| Hit {
+                id: e.id,
+                tier_level: e.tier_level,
+                match_kind: MatchKind::Semantic,
                 text: e.text.clone(),
                 source: e.source.clone(),
                 score,
@@ -593,6 +622,9 @@ impl Rag {
             .into_iter()
             .take(k.min(MAX_TOP_K))
             .map(|(entry, _distinct, occurrences)| Hit {
+                id: entry.id,
+                tier_level: entry.tier_level,
+                match_kind: MatchKind::Lexical,
                 text: entry.text.clone(),
                 source: entry.source.clone(),
                 score: occurrences as f32,
@@ -601,7 +633,7 @@ impl Rag {
     }
 
     /// Hybrid retrieval: [`Self::lexical_rank`] first, then dense [`Self::search`]
-    /// fills the remaining slots, deduped by chunk text, clamped to [`MAX_TOP_K`].
+    /// fills the remaining slots, deduped by stable chunk id, clamped to [`MAX_TOP_K`].
     ///
     /// This is what `search_docs` uses so a bare identifier query (`chatEvent`) is
     /// found by substring match even though its dense cosine misses the top-k, while
@@ -611,14 +643,14 @@ impl Rag {
     pub fn search_hybrid(&self, query: &str, k: usize) -> Vec<Hit> {
         let k = k.min(MAX_TOP_K);
         let mut out: Vec<Hit> = Vec::with_capacity(k);
-        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
 
         // Lexical hits take the leading slots (exact-match wins for identifiers).
         for hit in self.lexical_rank(query, k) {
             if out.len() >= k {
                 break;
             }
-            if seen.insert(hit.text.clone()) {
+            if seen.insert(hit.id) {
                 out.push(hit);
             }
         }
@@ -627,7 +659,7 @@ impl Rag {
             if out.len() >= k {
                 break;
             }
-            if seen.insert(hit.text.clone()) {
+            if seen.insert(hit.id) {
                 out.push(hit);
             }
         }
@@ -978,6 +1010,9 @@ mod query {
         assert_eq!(hits.len(), 3);
         assert_eq!(hits[0].text, "button set disstr rule", "nearest is id=2");
         assert_eq!(hits[0].source, "[ECA chunk 2](https://cafe/edac/2)");
+        assert_eq!(hits[0].id, 2);
+        assert_eq!(hits[0].tier_level, 2);
+        assert_eq!(hits[0].match_kind, MatchKind::Semantic);
         assert_eq!(hits[1].text, "trigger location idiom", "second is id=1");
         assert_eq!(
             hits[2].text, "eps print idiom",
@@ -1219,6 +1254,8 @@ mod query {
         assert!(hits[0].text.contains("chatEvent"));
         // score is the occurrence count: "chatevent" appears twice in entry 1.
         assert_eq!(hits[0].score, 2.0);
+        assert_eq!(hits[0].id, 1);
+        assert_eq!(hits[0].match_kind, MatchKind::Lexical);
 
         // A query with no usable terms (all sub-min-length) returns nothing.
         assert!(rag.lexical_rank("a 의", 5).is_empty());

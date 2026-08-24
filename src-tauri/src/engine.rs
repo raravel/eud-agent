@@ -49,7 +49,7 @@ const WORKSPACE_GUIDE: &str = r#"[project workspace]
 - The foreground implementation workspace is read-only. NEVER edit `specs/`, `plans/`, `decisions/`, `worklog/`, or project memory during implementation.
 - On plan approval, the app writes the exact approved plan to `plans/<request-id>.md`; NEVER edit, replace, rename, or delete it.
 - After the code/map changes are accepted, the backend starts a separate post-acceptance harness job. That job generates one structured delta, a deterministic worklog, and a separately reviewable document changeset.
-- `source/` is a coherent read-only mirror of the editor's current epScript files. Use glob/grep/read there to understand the project. NEVER try to modify `source/`; live editor changes still go through eud-tools.
+- `source/` is a coherent read-only mirror of the editor's current epScript files. Prefer source_search and ranged read_file for bounded exact excerpts; native glob/grep/read remains available when broader inspection is required. NEVER try to modify `source/`; live editor changes still go through eud-tools.
 - Use eud-tools for every editor, map, DAT, build, and RAG action. Native shell/file tools are read-only in implementation turns.
 - After the authoritative build and required verification, answer immediately. Do not search for prior worklogs or perform harness/document cleanup."#;
 
@@ -113,7 +113,7 @@ const EPSCRIPT_GUIDE: &str = r#"[epscript]
 - NEVER write SCMDraft classic text-trigger blocks — `Trigger { players = {...}, conditions = {...}, actions = ... }` is NOT epScript and does not compile here.
 - Structure: code runs from entry functions — `function onPluginStart() { }` (once at map start), `function beforeTriggerExec() { }` / `function afterTriggerExec() { }` (every game loop). Repeating logic goes INSIDE a loop function; there is no PreserveTrigger.
 - Syntax essentials: statements end with ";"; variables `var x = 0;`, constants `const marine = $U("Terran Marine");` (names map via $U(unit)/$L(location)); conditions are if-expressions and actions are statements — `if (Deaths(P1, AtLeast, 1, marine)) { SetDeaths(P1, Subtract, 1, marine); CreateUnit(1, marine, $L("spawn"), P1); }`
-- Unsure about eps syntax or an API name? search_docs (Korean query) BEFORE writing code; follow eps examples from the reference-context section and ignore classic-trigger examples quoted in posts."#;
+- Unsure about eps syntax or an API name? Use search_docs (Korean query) to discover candidates, then docs_get to read the relevant exact chunks BEFORE writing code; follow eps examples from those sources and ignore classic-trigger examples quoted in posts."#;
 
 const EPS_PROJECT_ARCHITECTURE_GUIDE: &str = r#"[eps project architecture]
 - Optimize for change locality, clear ownership, and explicit dependencies — not for the fewest or smallest files.
@@ -201,7 +201,9 @@ const AUDIO_SOUND_GUIDE: &str = r#"[map sounds]
 - Preflight every modified/created EPS file in one eps_check batch after sound import, then run the complete-project build_run. A map sound mutation without both checks is incomplete."#;
 
 const EVIDENCE_GUIDE: &str = r#"[evidence]
-- EVERY unit of work (eps code, dat edits, map location/player/switch writes, settings) must be grounded in the docs: call search_docs (Korean query) BEFORE writing, and justify each item with WHY plus its source as a markdown link — `... (근거: [제목](url))`.
+- EVERY unit of work (eps code, dat edits, map location/player/switch writes, settings) must be grounded in the docs: call search_docs (Korean query) BEFORE writing, inspect promising exact chunks with docs_get, and justify each item with WHY plus its source as a markdown link — `... (근거: [제목](url))`.
+- search_docs previews are exact discovery excerpts, not summaries. Search as broadly and repeatedly as unresolved claims require; use docs_get in batches for the specific full chunks needed to verify details. Reuse an already verified source across related plan steps instead of re-fetching it.
+- `repeated=true` and a zero `newCount` are novelty signals, never a forced stopping condition. Reformulate, seek a different source tier, or continue exact reads when material uncertainty remains.
 - Cite on BOTH review surfaces: every propose_plan step carries its evidence link(s), and the final answer explains each applied change with its link(s). The reference-context chunks below carry their own `source:` links — cite those the same way.
 - The server enforces this: mutating tool calls are rejected until at least one search_docs has run in the request.
 - If searching finds NO relevant document for an item, mark it explicitly as 근거 없음 (일반 EUD 지식) and proceed — NEVER fabricate a source or url.
@@ -2264,6 +2266,16 @@ fn handle_context_usage(
                 detail: Some(detail),
             }))?;
     }
+    eprintln!(
+        "eud-agent: context_usage session={} turn={} last_input={} last_cached={} last_output={} last_total={} cumulative_total={}",
+        handler.session_id,
+        turn_id,
+        token_usage.last.input_tokens,
+        token_usage.last.cached_input_tokens,
+        token_usage.last.output_tokens,
+        token_usage.last.total_tokens,
+        token_usage.total.total_tokens,
+    );
     handler
         .sink
         .emit(EngineEvent::ContextUsage(ipc::ContextUsageEvent {
@@ -4794,6 +4806,9 @@ mod tests {
 
     fn sample_hits() -> Vec<crate::rag::Hit> {
         vec![crate::rag::Hit {
+            id: 1,
+            tier_level: 3,
+            match_kind: crate::rag::MatchKind::Semantic,
             text: "RAG chunk about safe epscript practice".to_string(),
             source: "[ECA sample](https://example.test/edac/1)".to_string(),
             score: 0.92,
@@ -6565,6 +6580,9 @@ mod tests {
                 "system prompt must contain required section {section}"
             );
         }
+        assert!(prompt.contains("docs_get"));
+        assert!(prompt.contains("zero `newCount`"));
+        assert!(prompt.contains("source_search"));
     }
 
     #[test]
