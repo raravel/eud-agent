@@ -16,6 +16,7 @@ use crate::map_image::{
     MapImageConversionReport, MapImageDescriptor, MapImageMapContext, MapImagePlacement,
     MapImageService,
 };
+use crate::map_import::MapStampSourceRef;
 use crate::map_model::{MapLayer, MapMentionSnapshot, RowSpan, SelectionMask, TileRect};
 use crate::map_stamp::{
     StampCollisionPolicy, StampDestination, StampPlacementReport, StampPlacementResult,
@@ -225,7 +226,7 @@ pub struct MapImageConfirmCommand {
 pub struct MapStampPreviewCommand {
     pub session_id: String,
     pub revision_key: String,
-    pub selection_id: String,
+    pub source: MapStampSourceRef,
     pub destinations: Vec<StampDestination>,
 }
 
@@ -234,7 +235,7 @@ pub struct MapStampPreviewCommand {
 pub struct MapStampConfirmCommand {
     pub session_id: String,
     pub revision_key: String,
-    pub selection_id: String,
+    pub source: MapStampSourceRef,
     pub destinations: Vec<StampDestination>,
     pub collision_policy: StampCollisionPolicy,
 }
@@ -439,11 +440,22 @@ impl MapAgentService {
         command: &MapStampPreviewCommand,
     ) -> Result<StampPlacementReport, String> {
         let session = self.session_record(&command.session_id)?;
+        let context = self.candidates.context().current()?;
+        let state = self
+            .candidates
+            .state(&session.meta.project, &command.session_id)?;
+        require_current_source(
+            &context.revision.project_id,
+            &context.revision.source_path,
+            &session.meta.project,
+            &state.baseline.source_path,
+            "stamp preview",
+        )?;
         self.candidates.direct_stamp_preview(
             &session.meta.project,
             &command.session_id,
             &command.revision_key,
-            &command.selection_id,
+            &command.source,
             &command.destinations,
         )
     }
@@ -460,16 +472,26 @@ impl MapAgentService {
             &session.meta.project,
             &command.session_id,
             &command.revision_key,
-            &command.selection_id,
+            &command.source,
             &command.destinations,
         )?;
         let request_id = format!("direct-stamp-{}", uuid::Uuid::new_v4());
+        let imported_mention = match &command.source {
+            MapStampSourceRef::Imported {
+                import_id,
+                snapshot_hash,
+            } => vec![MapMentionSnapshot::ImportedStamp {
+                import_id: import_id.clone(),
+                snapshot_hash: snapshot_hash.clone(),
+            }],
+            MapStampSourceRef::CandidateSelection { .. } => Vec::new(),
+        };
         self.candidates.prepare_request(
             &session.meta.project,
             &command.session_id,
             &request_id,
             state.current_revision,
-            &[],
+            &imported_mention,
         )?;
         let result = (|| {
             self.candidates
@@ -478,7 +500,7 @@ impl MapAgentService {
                 &session.meta.project,
                 &command.session_id,
                 &request_id,
-                &command.selection_id,
+                &command.source,
                 &command.destinations,
                 command.collision_policy,
             )?;
@@ -586,6 +608,8 @@ impl MapAgentService {
             pending_request_ids: Vec::new(),
             context_usage: None,
             panel_log: serde_json::Value::Null,
+            context_state: Default::default(),
+            task_state: Default::default(),
         };
         self.sessions
             .save(&record)
@@ -1341,10 +1365,14 @@ pub(crate) async fn map_agent_session_delete(
     Ok(())
 }
 #[tauri::command]
-pub fn map_agent_source_state(
+pub async fn map_agent_source_state(
     service: tauri::State<'_, MapAgentService>,
 ) -> Result<crate::map_context::MapSourceProbe, String> {
-    service.candidates.context().probe_current()
+    let service = service.inner().clone();
+    run_map_blocking("map source state", move || {
+        service.candidates.context().probe_current()
+    })
+    .await
 }
 
 async fn run_map_blocking<T>(
@@ -1560,6 +1588,17 @@ pub(crate) async fn map_agent_chat(
 ) -> Result<CandidateStateView, String> {
     require_map_window(&window)?;
     let session = service.session_record(&command.session_id)?;
+    let current = service.candidates.context().current()?;
+    let current_state = service
+        .candidates
+        .state(&session.meta.project, &command.session_id)?;
+    require_current_source(
+        &current.revision.project_id,
+        &current.revision.source_path,
+        &session.meta.project,
+        &current_state.baseline.source_path,
+        "Map request",
+    )?;
     let request_id = format!("map-{}", uuid::Uuid::new_v4());
     service.candidates.prepare_request(
         &session.meta.project,
@@ -1571,7 +1610,20 @@ pub(crate) async fn map_agent_chat(
     let state_before = service
         .candidates
         .state(&session.meta.project, &command.session_id)?;
-    let compact_mentions = compact_mentions(&state_before, &command.mentions);
+    let compact_mentions = match compact_mentions(
+        &service.candidates,
+        &session.meta.project,
+        &state_before,
+        &command.mentions,
+    ) {
+        Ok(value) => value,
+        Err(error) => {
+            service
+                .candidates
+                .finish_request(&command.session_id, &request_id)?;
+            return Err(error);
+        }
+    };
     let text = format!(
         "[map mention snapshots]\n{}\n\n[user message]\n{}",
         serde_json::to_string(&compact_mentions).map_err(|error| error.to_string())?,
@@ -1625,60 +1677,76 @@ pub(crate) async fn map_agent_cancel(
     result
 }
 
-fn compact_mentions(state: &CandidateStateView, mentions: &[MapMentionSnapshot]) -> Value {
+fn compact_mentions(
+    candidates: &CandidateStore,
+    project_id: &str,
+    state: &CandidateStateView,
+    mentions: &[MapMentionSnapshot],
+) -> Result<Value, String> {
     let values = mentions
         .iter()
-        .map(|mention| match mention {
-            MapMentionSnapshot::Region { selection_id, .. } => {
-                let selection = state
-                    .selections
-                    .iter()
-                    .find(|selection| &selection.selection.id == selection_id);
-                json!({
-                    "kind": "region",
-                    "id": selection_id,
-                    "role": selection.map(|view| view.selection.role),
-                    "layers": selection.map(|view| &view.selection.layers),
-                    "selectedCells": selection.map(|view| view.selection.selected_cells),
-                })
-            }
-            MapMentionSnapshot::Object { object_ref, role } => json!({
-                "kind": "object",
-                "object": object_ref,
-                "role": role,
-            }),
-            MapMentionSnapshot::Palette { entry, qualifiers } => json!({
-                "kind": "palette",
-                "entry": entry,
-                "qualifiers": qualifiers,
-            }),
-            MapMentionSnapshot::Stamp { selection_id, .. } => {
-                let selection = state
-                    .selections
-                    .iter()
-                    .find(|selection| &selection.selection.id == selection_id);
-                json!({
-                    "kind": "stamp",
-                    "selectionId": selection_id,
-                    "label": selection.map(|view| &view.selection.label),
-                    "layers": selection.map(|view| &view.selection.layers),
-                    "bounds": selection.map(|view| view.selection.bounds),
-                    "selectedCells": selection.map(|view| view.selection.selected_cells),
-                })
-            }
-            MapMentionSnapshot::Location {
-                location_id,
-                revision_key,
-                baseline_hash,
-            } => json!({
-                "kind": "location",
-                "locationId": location_id,
-                "revisionKey": revision_key,
-                "baselineHash": baseline_hash,
-            }),
+        .map(|mention| {
+            Ok(match mention {
+                MapMentionSnapshot::Region { selection_id, .. } => {
+                    let selection = state
+                        .selections
+                        .iter()
+                        .find(|selection| &selection.selection.id == selection_id);
+                    json!({
+                        "kind": "region",
+                        "id": selection_id,
+                        "role": selection.map(|view| view.selection.role),
+                        "layers": selection.map(|view| &view.selection.layers),
+                        "selectedCells": selection.map(|view| view.selection.selected_cells),
+                    })
+                }
+                MapMentionSnapshot::Object { object_ref, role } => json!({
+                    "kind": "object",
+                    "object": object_ref,
+                    "role": role,
+                }),
+                MapMentionSnapshot::Palette { entry, qualifiers } => json!({
+                    "kind": "palette",
+                    "entry": entry,
+                    "qualifiers": qualifiers,
+                }),
+                MapMentionSnapshot::Stamp { selection_id, .. } => {
+                    let selection = state
+                        .selections
+                        .iter()
+                        .find(|selection| &selection.selection.id == selection_id);
+                    json!({
+                        "kind": "stamp",
+                        "selectionId": selection_id,
+                        "label": selection.map(|view| &view.selection.label),
+                        "layers": selection.map(|view| &view.selection.layers),
+                        "bounds": selection.map(|view| view.selection.bounds),
+                        "selectedCells": selection.map(|view| view.selection.selected_cells),
+                    })
+                }
+                MapMentionSnapshot::ImportedStamp {
+                    import_id,
+                    snapshot_hash,
+                } => candidates.compact_imported_mention(
+                    project_id,
+                    import_id,
+                    snapshot_hash,
+                    state.baseline.tileset,
+                )?,
+                MapMentionSnapshot::Location {
+                    location_id,
+                    revision_key,
+                    baseline_hash,
+                } => json!({
+                    "kind": "location",
+                    "locationId": location_id,
+                    "revisionKey": revision_key,
+                    "baselineHash": baseline_hash,
+                }),
+            })
         })
-        .collect::<Vec<_>>();
-    json!({"candidateRevision": state.current_revision, "mentions": values})
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok(json!({"candidateRevision": state.current_revision, "mentions": values}))
 }
 
 fn require_map_window(window: &tauri::WebviewWindow) -> Result<(), String> {
@@ -1855,7 +1923,10 @@ mod tests {
             starcraft_path: PathBuf::from(r"C:\Program Files (x86)\StarCraft"),
             digest: crate::chk::digest_chk(&chk),
         };
-        let candidates = CandidateStore::new(dirs.clone());
+        let candidates = CandidateStore::new(
+            (dirs.clone()).clone(),
+            crate::map_import::MapImportStore::new(dirs.clone()),
+        );
         let view = candidates.create_session("map-session", &context).unwrap();
         let service = MapAgentService::new(
             dirs,
@@ -1877,6 +1948,8 @@ mod tests {
                 pending_request_ids: Vec::new(),
                 context_usage: None,
                 panel_log: Value::Null,
+                context_state: Default::default(),
+                task_state: Default::default(),
             })
             .unwrap();
         let target = SelectionMask::canonical(
@@ -1986,7 +2059,10 @@ mod tests {
             starcraft_path: PathBuf::from(r"C:\Program Files (x86)\StarCraft"),
             digest: crate::chk::digest_chk(&chk),
         };
-        let candidates = CandidateStore::new(dirs.clone());
+        let candidates = CandidateStore::new(
+            (dirs.clone()).clone(),
+            crate::map_import::MapImportStore::new(dirs.clone()),
+        );
         let view = candidates.create_session("map-session", &context).unwrap();
         let service = MapAgentService::new(
             dirs.clone(),
@@ -2008,6 +2084,8 @@ mod tests {
                 pending_request_ids: Vec::new(),
                 context_usage: None,
                 panel_log: Value::Null,
+                context_state: Default::default(),
+                task_state: Default::default(),
             })
             .unwrap();
 

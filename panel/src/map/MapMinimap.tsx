@@ -10,10 +10,10 @@ import { LoaderCircle, Map as MapIcon } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import type { TileViewport } from "./canvasTransform";
 import {
-  mapRender,
   type MapDiffMarker,
   type MapLayer,
   type MapObjectItem,
+  type MapRenderSource,
   type MapView,
   type RowSpan,
   type SelectionMask,
@@ -71,12 +71,10 @@ const selectionStyle: Record<
 };
 
 export interface MapMinimapProps {
-  sessionId: string;
-  revisionKey: string;
+  renderSource: MapRenderSource;
   width: number;
   height: number;
   view: MapView;
-  requestId?: string;
   layers: MapLayer[];
   selections: SelectionMask[];
   activeRows: RowSpan[];
@@ -88,12 +86,10 @@ export interface MapMinimapProps {
 }
 
 export function MapMinimap({
-  sessionId,
-  revisionKey,
+  renderSource,
   width,
   height,
   view,
-  requestId,
   layers,
   selections,
   activeRows,
@@ -140,17 +136,15 @@ export function MapMinimap({
     setLoading(true);
     setError("");
     const render = () => {
-      void mapRender({
-        sessionId,
-        view,
-        x: 0,
-        y: 0,
-        width,
-        height,
-        scale: 8,
-        layers,
-        requestId,
-      })
+      void renderSource
+        .render({
+          x: 0,
+          y: 0,
+          width,
+          height,
+          scale: 8,
+          layers,
+        })
         .then((blob) => createImageBitmap(blob))
         .then((nextBitmap) => {
           if (disposed || requestSequenceRef.current !== sequence) {
@@ -178,7 +172,7 @@ export function MapMinimap({
       disposed = true;
       if (timer !== null) window.clearTimeout(timer);
     };
-  }, [height, layerKey, layers, requestId, revisionKey, sessionId, view, width]);
+  }, [height, layerKey, layers, renderSource, view, width]);
 
   useEffect(
     () => () => {

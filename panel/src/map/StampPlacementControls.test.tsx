@@ -39,6 +39,7 @@ function report(overrides: Partial<StampPlacementReport> = {}): StampPlacementRe
 
 const baseProps = {
   selection,
+  sourceKind: "candidateSelection" as const,
   destination: { x: 43, y: 5 },
   mapWidth: 256,
   mapHeight: 256,

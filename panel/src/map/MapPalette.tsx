@@ -9,6 +9,7 @@ import {
   Plus,
   Search,
   Sparkles,
+  Trash2,
   Users,
 } from "lucide-react";
 
@@ -16,6 +17,10 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Spinner } from "@/components/ui/spinner";
 import { cn } from "@/lib/utils";
+import {
+  mapImportStampThumbnail,
+  type ImportedStampView,
+} from "./importProtocol";
 import {
   mapCatalog,
   mapThumbnail,
@@ -47,9 +52,13 @@ export interface MapPaletteProps {
   tileset: Tileset;
   locations: MapLocation[];
   selections: SavedSelection[];
+  importedEntries: ImportedStampView[];
   onMention(entry: PaletteEntry, layer: MapLayer, kind: PaletteKind): void;
   onStampMention(selection: SavedSelection): void;
   onStampPlace(selection: SavedSelection): void;
+  onImportedMention(stamp: ImportedStampView): void;
+  onImportedPlace(stamp: ImportedStampView): void;
+  onImportedDelete(stamp: ImportedStampView): void;
   onLocation(location: MapLocation): void;
   onNewLocation(): void;
 }
@@ -222,14 +231,52 @@ function PaletteThumbnail({
   );
 }
 
+function ImportedStampThumbnail({ stamp }: { stamp: ImportedStampView }) {
+  const [url, setUrl] = useState("");
+  const [failed, setFailed] = useState(false);
+  useEffect(() => {
+    if (!stamp.available) return;
+    let disposed = false;
+    let objectUrl = "";
+    void mapImportStampThumbnail(stamp.id)
+      .then((blob) => {
+        if (disposed) return;
+        objectUrl = URL.createObjectURL(blob);
+        setUrl(objectUrl);
+      })
+      .catch(() => {
+        if (!disposed) setFailed(true);
+      });
+    return () => {
+      disposed = true;
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+    };
+  }, [stamp.available, stamp.id, stamp.snapshotHash]);
+  return (
+    <span className="grid size-16 shrink-0 place-items-center overflow-hidden rounded border border-border bg-muted/50">
+      {url ? (
+        <img src={url} alt="" className="size-full object-cover [image-rendering:pixelated]" />
+      ) : failed || !stamp.available ? (
+        <ImageOff className="size-5 text-muted-foreground" aria-hidden="true" />
+      ) : (
+        <Spinner />
+      )}
+    </span>
+  );
+}
+
 export function MapPalette({
   sessionId,
   tileset,
   locations,
   selections,
+  importedEntries,
   onMention,
   onStampMention,
   onStampPlace,
+  onImportedMention,
+  onImportedPlace,
+  onImportedDelete,
   onLocation,
   onNewLocation,
 }: MapPaletteProps) {
@@ -284,6 +331,15 @@ export function MapPalette({
         .includes(normalized),
     );
   }, [query, selections]);
+  const filteredImported = useMemo(() => {
+    const normalized = query.trim().toLocaleLowerCase();
+    if (!normalized) return importedEntries;
+    return importedEntries.filter((stamp) =>
+      `${stamp.label} ${stamp.sourceDisplayName} ${stamp.layers.join(" ")}`
+        .toLocaleLowerCase()
+        .includes(normalized),
+    );
+  }, [importedEntries, query]);
 
 
   const mentionKind: PaletteKind =
@@ -446,6 +502,61 @@ export function MapPalette({
             })
           )}
         </section>
+        <section className="mb-2 space-y-2 rounded-lg border border-cyan-500/25 bg-cyan-500/5 p-2" aria-label="가져온 영역">
+          <div className="flex items-center gap-2 px-1">
+            <CopyPlus className="size-4 text-cyan-400" aria-hidden="true" />
+            <h2 className="text-xs font-semibold text-foreground">가져온 영역</h2>
+            <span className="ml-auto text-[10px] text-muted-foreground">외부 맵 고정 스냅샷</span>
+          </div>
+          {filteredImported.length === 0 ? (
+            <p className="rounded-md border border-dashed border-border px-3 py-4 text-center text-[11px] leading-relaxed text-muted-foreground">
+              다른 맵에서 가져온 영역이 없습니다.
+            </p>
+          ) : (
+            filteredImported.map((stamp) => {
+              const width = stamp.bounds.right - stamp.bounds.left;
+              const height = stamp.bounds.bottom - stamp.bounds.top;
+              const enabled = stamp.available && stamp.compatible;
+              return (
+                <article key={stamp.id} className="rounded-md border border-border bg-background/60 p-2">
+                  <div className="flex min-w-0 items-start gap-2">
+                    <ImportedStampThumbnail stamp={stamp} />
+                    <div className="min-w-0 flex-1">
+                      <h3 className="truncate text-xs font-medium" title={stamp.label}>{stamp.label}</h3>
+                      <p className="mt-1 truncate text-[10px] text-muted-foreground" title={stamp.sourceDisplayName}>
+                        {stamp.sourceDisplayName} · {stamp.sourceTileset}
+                      </p>
+                      <p className="mt-1 font-mono text-[10px] text-muted-foreground">
+                        {width}×{height} · {stamp.selectedCells.toLocaleString()}셀
+                      </p>
+                      <p className="mt-1 truncate text-[10px] text-muted-foreground">
+                        {stamp.layers.length === 0 ? "전체 레이어" : stamp.layers.join(" · ")}
+                      </p>
+                      {!enabled && (
+                        <p className="mt-1 text-[10px] text-destructive">
+                          {stamp.unavailableReason ?? "현재 대상과 호환되지 않습니다."}
+                        </p>
+                      )}
+                    </div>
+                  </div>
+                  <div className="mt-2 flex justify-end gap-1">
+                    <Button type="button" size="sm" variant="secondary" disabled={!enabled} onClick={() => onImportedPlace(stamp)}>
+                      <CopyPlus className="size-4" aria-hidden="true" />
+                      배치
+                    </Button>
+                    <Button type="button" size="sm" variant="outline" disabled={!enabled} onClick={() => onImportedMention(stamp)}>
+                      <Plus className="size-4" aria-hidden="true" />
+                      멘션 추가
+                    </Button>
+                    <Button type="button" size="icon" variant="ghost" className="min-h-11 min-w-11" aria-label={`${stamp.label} 가져온 영역 삭제`} onClick={() => onImportedDelete(stamp)}>
+                      <Trash2 className="size-4" aria-hidden="true" />
+                    </Button>
+                  </div>
+                </article>
+              );
+            })
+          )}
+        </section>
         {error && <p role="alert" className="m-2 rounded-md bg-destructive/15 p-2 text-xs text-destructive-foreground">{error}</p>}
         {loading && <div className="flex items-center gap-2 p-3 text-xs text-muted-foreground"><Spinner />팔레트 로딩…</div>}
         {layer === "locations" ? (
@@ -579,7 +690,7 @@ export function MapPalette({
         )}
       </div>
       <p className="border-t border-border p-2 text-[10px] leading-relaxed text-muted-foreground">
-        영역 스탬프는 현재 후보의 선택 레이어를 정확히 배치합니다. 나머지 카탈로그 항목은 프롬프트 멘션입니다.
+        영역 스탬프는 현재 후보, 가져온 영역은 pinned 외부 맵 스냅샷을 정확히 배치합니다. 둘 다 destination 권한을 만들지 않습니다.
       </p>
     </aside>
   );

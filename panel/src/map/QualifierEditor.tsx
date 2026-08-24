@@ -47,6 +47,8 @@ export function QualifierEditor({
             ? "영역 권한은 저장된 선택 스냅샷에서 검증됩니다."
             : chip.mention.kind === "stamp"
               ? "영역 스탬프는 배치 시점의 현재 후보 내용과 선택 레이어를 정확히 복사합니다."
+              : chip.mention.kind === "importedStamp"
+                ? "가져온 영역은 pinned 외부 맵 source만 식별하며 destination 권한을 만들지 않습니다."
               : chip.mention.kind === "object"
                 ? "캔버스 instance 멘션은 후보 revision과 fingerprint에 고정됩니다."
                 : "기존 로케이션 ID는 재정렬되지 않습니다."}

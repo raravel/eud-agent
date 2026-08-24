@@ -26,17 +26,29 @@ pub struct StampDestination {
     pub x: u16,
     pub y: u16,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub enum MapStampToolSource {
+    CandidateSelection { selection_id: String },
+    Imported { import_id: String },
+}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct StampPreviewInput {
-    pub selection_id: String,
+    pub source: MapStampToolSource,
     pub destinations: Vec<StampDestination>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct StampPlaceInput {
-    pub selection_id: String,
+    pub source: MapStampToolSource,
     pub destinations: Vec<StampDestination>,
     pub collision_policy: StampCollisionPolicy,
 }
@@ -159,6 +171,12 @@ impl PersistentSelection {
             },
         )
     }
+
+    pub fn snapshot_hash(&self) -> String {
+        let bytes =
+            serde_json::to_vec(self).expect("persistent selections are always serializable");
+        crate::map_model::hex_sha256(&bytes)
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -261,27 +279,44 @@ pub fn compile_stamp_placement(
     policy: Option<StampCollisionPolicy>,
     authority: &MapRequestAuthority,
 ) -> Result<CompiledStampPlacement, String> {
-    validate_destinations(
-        selection,
-        destinations,
-        authority.map_width,
-        authority.map_height,
-    )?;
-    let tileset_name = map_tileset_name(source_map)?;
-    let catalog = load_catalog(starcraft_path, &tileset_name)?;
+    let source_tileset = map_tileset_name(source_map)?;
+    let destination_tileset = if source_map == destination_map {
+        source_tileset.clone()
+    } else {
+        map_tileset_name(destination_map)?
+    };
+    require_matching_tilesets(&source_tileset, &destination_tileset)?;
+    let catalog = load_catalog(starcraft_path, &source_tileset)?;
     let source = parse_map(source_map, &catalog)?;
     let destination = if source_map == destination_map {
         source.clone()
     } else {
         parse_map(destination_map, &catalog)?
     };
-    if source.width != destination.width
-        || source.height != destination.height
-        || source.width != authority.map_width
-        || source.height != authority.map_height
-    {
-        return Err("stamp source, destination, and authority dimensions do not match".to_string());
+    let canonical_selection = SelectionMask::canonical(
+        selection.id.clone(),
+        selection.label.clone(),
+        selection.source_revision.clone(),
+        selection.role,
+        selection.layers.clone(),
+        crate::map_model::MaskGrid {
+            width: source.width,
+            height: source.height,
+            rows: selection.rows.clone(),
+        },
+    )?;
+    if &canonical_selection != selection {
+        return Err("stamp source selection is not canonical for source dimensions".to_string());
     }
+    if destination.width != authority.map_width || destination.height != authority.map_height {
+        return Err("stamp destination and authority dimensions do not match".to_string());
+    }
+    validate_destinations(
+        selection,
+        destinations,
+        destination.width,
+        destination.height,
+    )?;
 
     let layers = stamp_layers(selection);
     let content = capture_source_content(&source, &catalog, selection, &layers);
@@ -472,6 +507,7 @@ fn load_catalog(starcraft_path: &Path, tileset_name: &str) -> Result<StampCatalo
     {
         let id = json_u16(entry, "id", "doodad")?;
         let width = json_u16(entry, "width", "doodad")?;
+
         let height = json_u16(entry, "height", "doodad")?;
         let (overlay_id, overlay_flags) = if entry["overlay"].as_bool().unwrap_or(false) {
             (
@@ -498,6 +534,13 @@ fn load_catalog(starcraft_path: &Path, tileset_name: &str) -> Result<StampCatalo
     })
 }
 
+fn require_matching_tilesets(source: &str, destination: &str) -> Result<(), String> {
+    if source == destination {
+        Ok(())
+    } else {
+        Err("stamp source and destination tilesets do not match".to_string())
+    }
+}
 fn map_tileset_name(map_path: &Path) -> Result<String, String> {
     let chk = isom::chk_extract(map_path).map_err(|error| error.to_string())?;
     Ok(crate::chk::digest_chk(&chk).map.tileset)
@@ -1647,6 +1690,160 @@ mod tests {
             validate_destinations(&selection, &[StampDestination { x: 7, y: 7 }], 8, 8,)
                 .unwrap_err()
                 .contains("outside")
+        );
+    }
+
+    #[test]
+    fn different_source_and_destination_dimensions_preserve_exact_translation_and_authority() {
+        let selection = selection(&SUPPORTED_MAP_LAYERS);
+        let catalog = catalog();
+        let source = source_map();
+        let destination = ParsedMap {
+            width: 12,
+            height: 10,
+            tiles: vec![0; 120],
+            units: Vec::new(),
+            doodads: Vec::new(),
+            sprites: Vec::new(),
+            locations: Vec::new(),
+            available_location_slots: 62,
+        };
+        let destination_point = StampDestination { x: 9, y: 7 };
+        validate_destinations(
+            &selection,
+            &[destination_point],
+            destination.width,
+            destination.height,
+        )
+        .unwrap();
+        let layers = stamp_layers(&selection);
+        let content = capture_source_content(&source, &catalog, &selection, &layers);
+        let operations = build_operations(
+            &source,
+            &destination,
+            &catalog,
+            &selection,
+            &[destination_point],
+            &layers,
+            &content,
+            &DestinationCollisions::default(),
+            StampCollisionPolicy::Merge,
+        )
+        .unwrap();
+        let terrain = operations
+            .iter()
+            .find_map(|operation| match operation {
+                MapOperation::TerrainBlit { x, y, tiles } => Some((*x, *y, tiles.clone())),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(terrain, (9, 7, vec![vec![9, 10]]));
+        let unit = operations
+            .iter()
+            .find_map(|operation| match operation {
+                MapOperation::UnitAdd { state } => Some(state),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!((unit.x, unit.y), (304, 240));
+        let location = operations
+            .iter()
+            .find_map(|operation| match operation {
+                MapOperation::LocationAdd { state } => Some(state),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            (location.left, location.top, location.right, location.bottom),
+            (288, 224, 320, 256)
+        );
+        assert!(!operations
+            .iter()
+            .any(|operation| matches!(operation, MapOperation::TerrainIsomBrush { .. })));
+
+        let destination_target = SelectionMask::canonical(
+            "target",
+            "target",
+            "r0:hash",
+            SelectionRole::Target,
+            SUPPORTED_MAP_LAYERS.into_iter().collect(),
+            MaskGrid {
+                width: destination.width,
+                height: destination.height,
+                rows: vec![
+                    RowSpan {
+                        y: 7,
+                        spans: vec![(9, 11)],
+                    },
+                    RowSpan {
+                        y: 8,
+                        spans: vec![(9, 11)],
+                    },
+                ],
+            },
+        )
+        .unwrap();
+        let protected = SelectionMask::canonical(
+            "protect",
+            "protect",
+            "r0:hash",
+            SelectionRole::Protect,
+            SUPPORTED_MAP_LAYERS.into_iter().collect(),
+            MaskGrid {
+                width: destination.width,
+                height: destination.height,
+                rows: vec![RowSpan {
+                    y: 7,
+                    spans: vec![(9, 10)],
+                }],
+            },
+        )
+        .unwrap();
+        let authority = MapRequestAuthority::calculate(
+            "session".to_string(),
+            "request".to_string(),
+            0,
+            destination.width,
+            destination.height,
+            vec![destination_target],
+            vec![protected],
+        )
+        .unwrap();
+        let (outside, protected_cells) = authority_conflicts(
+            &authority,
+            &selection,
+            &[destination_point],
+            &layers,
+            &content,
+            &catalog,
+            &destination,
+            &DestinationCollisions::default(),
+            Some(StampCollisionPolicy::Merge),
+        );
+        assert_eq!(outside, 0);
+        assert!(protected_cells > 0);
+    }
+
+    #[test]
+    fn source_selection_uses_source_dimensions_and_tilesets_must_match() {
+        let selection = selection(&[MapLayer::Terrain]);
+        assert!(SelectionMask::canonical(
+            selection.id,
+            selection.label,
+            selection.source_revision,
+            selection.role,
+            selection.layers,
+            MaskGrid {
+                width: 2,
+                height: 2,
+                rows: selection.rows,
+            },
+        )
+        .is_err());
+        assert!(require_matching_tilesets("jungle", "jungle").is_ok());
+        assert_eq!(
+            require_matching_tilesets("jungle", "desert").unwrap_err(),
+            "stamp source and destination tilesets do not match"
         );
     }
 

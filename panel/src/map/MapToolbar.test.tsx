@@ -90,6 +90,7 @@ const callbacks = {
   onApply: vi.fn(),
   onUndo: vi.fn(),
   onImagePlace: vi.fn(),
+  onMapImport: vi.fn(),
   onReloadSource: vi.fn(),
 };
 
@@ -207,6 +208,9 @@ describe("MapToolbar candidate rails", () => {
     expect(photo).toBeEnabled();
     await userEvent.click(photo);
     expect(callbacks.onImagePlace).toHaveBeenCalledOnce();
+    const mapImport = screen.getByRole("button", { name: "다른 맵에서 가져오기" });
+    await userEvent.click(mapImport);
+    expect(callbacks.onMapImport).toHaveBeenCalledOnce();
 
     rerender(
       <MapToolbar

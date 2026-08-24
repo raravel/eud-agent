@@ -68,22 +68,27 @@ describe("Map draft object IPC", () => {
 });
 
 describe("Map stamp placement IPC", () => {
-  it("sends only a saved selection, top-left destinations, and explicit collision policy", async () => {
+  it("sends a strict source ref, top-left destinations, and explicit collision policy", async () => {
     const destinations = [
       { x: 43, y: 5 },
       { x: 5, y: 35 },
       { x: 43, y: 35 },
     ];
+    const source = {
+      kind: "candidateSelection" as const,
+      selectionId: "selection-a",
+      snapshotHash: "snapshot-a",
+    };
     await mapStampPreview({
       sessionId: "map-session",
       revisionKey: "r1:hash",
-      selectionId: "selection-a",
+      source,
       destinations,
     });
     await mapStampConfirm({
       sessionId: "map-session",
       revisionKey: "r1:hash",
-      selectionId: "selection-a",
+      source,
       destinations,
       collisionPolicy: "merge",
     });
@@ -95,7 +100,7 @@ describe("Map stamp placement IPC", () => {
           command: {
             sessionId: "map-session",
             revisionKey: "r1:hash",
-            selectionId: "selection-a",
+            source,
             destinations,
           },
         },
@@ -106,7 +111,7 @@ describe("Map stamp placement IPC", () => {
           command: {
             sessionId: "map-session",
             revisionKey: "r1:hash",
-            selectionId: "selection-a",
+            source,
             destinations,
             collisionPolicy: "merge",
           },

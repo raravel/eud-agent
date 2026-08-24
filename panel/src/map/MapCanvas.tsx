@@ -34,11 +34,11 @@ import {
   type SpatialObject,
 } from "./spatialIndex";
 import {
-  mapRender,
   type MapLayer,
   type MapObjectItem,
   type MapDiffMarker,
   type RowSpan,
+  type MapRenderSource,
   type MapView,
   type SelectionMask,
   type SelectionOperation,
@@ -56,12 +56,11 @@ interface CropImage {
 }
 
 export interface MapCanvasProps {
-  sessionId: string;
-  revisionKey: string;
+  renderSource: MapRenderSource;
+  ariaLabel: string;
   width: number;
   height: number;
   view: MapView;
-  requestId?: string;
   layers: MapLayer[];
   selections: SelectionMask[];
   activeCells: Set<string>;
@@ -125,12 +124,11 @@ function objectLayer(kind: SpatialObject["kind"]): MapLayer {
 }
 
 export function MapCanvas({
-  sessionId,
-  revisionKey,
+  renderSource,
+  ariaLabel,
   width,
   height,
   view,
-  requestId,
   layers,
   selections,
   activeCells,
@@ -259,7 +257,7 @@ export function MapCanvas({
     lastHitRef.current = { tile: "" };
     for (const image of cacheRef.current.values()) image.bitmap.close();
     cacheRef.current.clear();
-  }, [height, sessionId, width]);
+  }, [height, renderSource.key, width]);
 
   useEffect(() => {
     if (fitDoneRef.current || size.width <= 1 || size.height <= 1) return;
@@ -365,8 +363,7 @@ export function MapCanvas({
   );
   const nativeScale = nativeScaleForZoom(transform.zoom);
   const layerKey = layers.slice().sort().join(",");
-  const renderView = view === "diff" ? "candidate" : view;
-  const renderSourceKey = `${sessionId}|${revisionKey}|${renderView}|${requestId ?? ""}|${layerKey}`;
+  const renderSourceKey = `${renderSource.key}|${layerKey}`;
 
   useEffect(() => {
     let disposed = false;
@@ -386,14 +383,12 @@ export function MapCanvas({
     const timer = window.setTimeout(
       () => {
         setLoading(true);
-        void mapRender({
-          sessionId,
-          view: renderView,
-          ...crop,
-          scale: nativeScale,
-          layers,
-          requestId,
-        })
+        void renderSource
+          .render({
+            ...crop,
+            scale: nativeScale,
+            layers,
+          })
           .then((blob) => createImageBitmap(blob))
           .then((bitmap) => {
             if (disposed) {
@@ -432,15 +427,7 @@ export function MapCanvas({
       disposed = true;
       window.clearTimeout(timer);
     };
-  }, [
-    crop,
-    layers,
-    nativeScale,
-    renderSourceKey,
-    renderView,
-    requestId,
-    sessionId,
-  ]);
+  }, [crop, layers, nativeScale, renderSource, renderSourceKey]);
 
   useEffect(
     () => () => {
@@ -1092,7 +1079,7 @@ export function MapCanvas({
       <canvas
         ref={canvasRef}
         tabIndex={0}
-        aria-label="Map Agent 맵 캔버스"
+        aria-label={ariaLabel}
         className="size-full touch-none outline-none focus-visible:ring-2 focus-visible:ring-emerald-400"
         onContextMenu={(event) => event.preventDefault()}
         onPointerDown={handlePointerDown}

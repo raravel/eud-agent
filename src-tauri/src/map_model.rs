@@ -434,7 +434,8 @@ pub struct MentionQualifiers {
 #[serde(
     tag = "kind",
     rename_all = "camelCase",
-    rename_all_fields = "camelCase"
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
 )]
 pub enum MapMentionSnapshot {
     Region {
@@ -452,6 +453,10 @@ pub enum MapMentionSnapshot {
     },
     Stamp {
         selection_id: String,
+        snapshot_hash: String,
+    },
+    ImportedStamp {
+        import_id: String,
         snapshot_hash: String,
     },
     Location {
@@ -1028,6 +1033,11 @@ mod tests {
                 "snapshotHash": "snapshot-1"
             }),
             json!({
+                "kind": "importedStamp",
+                "importId": "import-1",
+                "snapshotHash": "snapshot-2"
+            }),
+            json!({
                 "kind": "location",
                 "locationId": 4,
                 "revisionKey": "revision-1",
@@ -1048,5 +1058,12 @@ mod tests {
             .unwrap();
 
         assert_eq!(round_trip, payloads);
+        assert!(serde_json::from_value::<MapMentionSnapshot>(json!({
+            "kind": "importedStamp",
+            "importId": "import-1",
+            "snapshotHash": "snapshot-2",
+            "path": "forbidden.scx"
+        }))
+        .is_err());
     }
 }

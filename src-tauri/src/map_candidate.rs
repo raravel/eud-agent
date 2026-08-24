@@ -9,14 +9,15 @@ use serde_json::{json, Value};
 use crate::config::DataDirs;
 use crate::map_context::{MapContextService, MapContextSnapshot};
 use crate::map_image::MapImageConversionMetadata;
+use crate::map_import::{MapImportStore, MapStampSourceRef, ResolvedImportedStamp};
 use crate::map_model::{
     hex_sha256, CandidateRevision, CandidateSession, MapEditBatch, MapEditExpected, MapLayer,
     MapMentionSnapshot, MapObjectKind, MapOperation, SelectionMask, SelectionRole,
     VerificationReport, MAP_EDIT_SCHEMA,
 };
 use crate::map_stamp::{
-    compile_stamp_placement, PersistentSelection, PersistentSelectionLibrary, StampCollisionPolicy,
-    StampDestination, StampPlacementReport, StampPlacementResult,
+    compile_stamp_placement, MapStampToolSource, PersistentSelection, PersistentSelectionLibrary,
+    StampCollisionPolicy, StampDestination, StampPlacementReport, StampPlacementResult,
 };
 use crate::map_verify::{MapRequestAuthority, MapVerificationService};
 
@@ -31,6 +32,7 @@ struct CandidateStoreInner {
     verifier: MapVerificationService,
     active: Mutex<HashMap<String, ActiveRequest>>,
     selection_palette: Mutex<()>,
+    imports: MapImportStore,
 }
 
 #[derive(Clone)]
@@ -43,6 +45,8 @@ struct ActiveRequest {
     batches: Vec<Vec<MapOperation>>,
     reports: Vec<Value>,
     image_conversions: Vec<MapImageConversionMetadata>,
+    imported_sources: BTreeMap<String, ResolvedImportedStamp>,
+    imported_provenance: Vec<ImportedStampProvenance>,
     pending_revision: Option<PendingRevision>,
     finalized: bool,
 }
@@ -51,6 +55,26 @@ struct ActiveRequest {
 struct PendingRevision {
     revision: CandidateRevision,
     object_ids: BTreeMap<String, String>,
+}
+
+struct StampRequestContext {
+    source: PathBuf,
+    draft: PathBuf,
+    selection: SelectionMask,
+    authority: MapRequestAuthority,
+    provenance: Option<ImportedStampProvenance>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ImportedStampProvenance {
+    import_id: String,
+    source_file_sha256: String,
+    source_chk_sha256: String,
+    snapshot_hash: String,
+    width: u16,
+    height: u16,
+    layers: BTreeSet<MapLayer>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -64,6 +88,8 @@ struct RevisionManifest {
     batches: Vec<Vec<MapOperation>>,
     #[serde(default)]
     image_conversions: Vec<MapImageConversionMetadata>,
+    #[serde(default)]
+    imported_stamps: Vec<ImportedStampProvenance>,
     #[serde(default)]
     object_ids: BTreeMap<String, String>,
 }
@@ -103,7 +129,7 @@ pub struct CandidateStateView {
 }
 
 impl CandidateStore {
-    pub fn new(dirs: DataDirs) -> Self {
+    pub fn new(dirs: DataDirs, imports: MapImportStore) -> Self {
         Self {
             inner: Arc::new(CandidateStoreInner {
                 context: MapContextService::new(dirs.clone()),
@@ -111,8 +137,27 @@ impl CandidateStore {
                 verifier: MapVerificationService,
                 active: Mutex::new(HashMap::new()),
                 selection_palette: Mutex::new(()),
+                imports,
             }),
         }
+    }
+
+    pub fn persistent_selections(
+        &self,
+        project_id: &str,
+    ) -> Result<Vec<PersistentSelection>, String> {
+        validate_component(project_id, "project id")?;
+        let _palette = self.inner.selection_palette.lock();
+        let library = self.read_selection_library(project_id)?;
+        for (key, selection) in &library.selections {
+            if key != &selection.id {
+                return Err(
+                    "map selection palette key does not match its persistent selection id"
+                        .to_string(),
+                );
+            }
+        }
+        Ok(library.selections.into_values().collect())
     }
     pub fn cleanup_startup(&self) -> Result<usize, String> {
         const UNUSED_MAX_AGE: std::time::Duration =
@@ -412,6 +457,7 @@ impl CandidateStore {
         let expected_revision = revision_key(state.current_revision, &current_hash);
         let mut targets = Vec::new();
         let mut forbidden = Vec::new();
+        let mut imported_sources: BTreeMap<String, ResolvedImportedStamp> = BTreeMap::new();
         for mention in mentions {
             match mention {
                 MapMentionSnapshot::Region {
@@ -495,6 +541,26 @@ impl CandidateStore {
                         return Err(format!("stamp mention '{selection_id}' snapshot is stale"));
                     }
                 }
+                MapMentionSnapshot::ImportedStamp {
+                    import_id,
+                    snapshot_hash,
+                } => {
+                    let resolved = self.inner.imports.resolve_imported(
+                        project_id,
+                        import_id,
+                        snapshot_hash,
+                        state.baseline.tileset,
+                    )?;
+                    if let Some(existing) = imported_sources.get(import_id) {
+                        if existing.stamp.snapshot_hash != resolved.stamp.snapshot_hash {
+                            return Err(format!(
+                                "imported stamp '{import_id}' has conflicting request snapshots"
+                            ));
+                        }
+                    } else {
+                        imported_sources.insert(import_id.clone(), resolved);
+                    }
+                }
                 MapMentionSnapshot::Location {
                     location_id,
                     revision_key,
@@ -536,6 +602,15 @@ impl CandidateStore {
             targets,
             forbidden,
         )?;
+        let mut requests = self.inner.active.lock();
+        if requests.contains_key(session_id) {
+            return Err("another map request is already active for this session".to_string());
+        }
+        for source in imported_sources.values() {
+            self.inner
+                .imports
+                .bind_blob(&source.stamp.source_file_sha256);
+        }
         let active = ActiveRequest {
             request_id: request_id.to_string(),
             parent_revision,
@@ -545,13 +620,11 @@ impl CandidateStore {
             batches: Vec::new(),
             reports: Vec::new(),
             image_conversions: Vec::new(),
+            imported_sources,
+            imported_provenance: Vec::new(),
             pending_revision: None,
             finalized: false,
         };
-        let mut requests = self.inner.active.lock();
-        if requests.contains_key(session_id) {
-            return Err("another map request is already active for this session".to_string());
-        }
         requests.insert(session_id.to_string(), active);
         Ok(authority)
     }
@@ -642,12 +715,62 @@ impl CandidateStore {
         }))
     }
 
+    pub fn normalize_stamp_tool_source(
+        &self,
+        project_id: &str,
+        session_id: &str,
+        request_id: &str,
+        source: &MapStampToolSource,
+    ) -> Result<MapStampSourceRef, String> {
+        match source {
+            MapStampToolSource::CandidateSelection { selection_id } => {
+                let state = self.load_state(project_id, session_id)?;
+                let selection = state
+                    .selections
+                    .get(selection_id)
+                    .ok_or_else(|| "stamp selection does not exist".to_string())?;
+                Ok(MapStampSourceRef::CandidateSelection {
+                    selection_id: selection_id.clone(),
+                    snapshot_hash: selection.snapshot_hash(),
+                })
+            }
+            MapStampToolSource::Imported { import_id } => {
+                let active = self.inner.active.lock();
+                let request = active_request(&active, session_id, request_id)?;
+                let source = request.imported_sources.get(import_id).ok_or_else(|| {
+                    format!(
+                        "imported stamp '{import_id}' is not authorized by a current-request mention"
+                    )
+                })?;
+                Ok(MapStampSourceRef::Imported {
+                    import_id: import_id.clone(),
+                    snapshot_hash: source.stamp.snapshot_hash.clone(),
+                })
+            }
+        }
+    }
+
+    pub fn compact_imported_mention(
+        &self,
+        project_id: &str,
+        import_id: &str,
+        snapshot_hash: &str,
+        destination_tileset: crate::map_model::Tileset,
+    ) -> Result<Value, String> {
+        self.inner.imports.compact_projection(
+            project_id,
+            import_id,
+            snapshot_hash,
+            destination_tileset,
+        )
+    }
+
     pub fn direct_stamp_preview(
         &self,
         project_id: &str,
         session_id: &str,
         expected_revision_key: &str,
-        selection_id: &str,
+        source_ref: &MapStampSourceRef,
         destinations: &[StampDestination],
     ) -> Result<StampPlacementReport, String> {
         let authority = self.direct_terrain_authority(
@@ -657,15 +780,39 @@ impl CandidateStore {
             expected_revision_key,
         )?;
         let state = self.load_state(project_id, session_id)?;
-        let selection = state
-            .selections
-            .get(selection_id)
-            .ok_or_else(|| "stamp selection does not exist".to_string())?;
+        let (source, selection) = match source_ref {
+            MapStampSourceRef::CandidateSelection {
+                selection_id,
+                snapshot_hash,
+            } => {
+                let selection = state
+                    .selections
+                    .get(selection_id)
+                    .cloned()
+                    .ok_or_else(|| "stamp selection does not exist".to_string())?;
+                if selection.snapshot_hash() != *snapshot_hash {
+                    return Err("stamp selection snapshot is stale".to_string());
+                }
+                (state.current_map.clone(), selection)
+            }
+            MapStampSourceRef::Imported {
+                import_id,
+                snapshot_hash,
+            } => {
+                let resolved = self.inner.imports.resolve_imported(
+                    project_id,
+                    import_id,
+                    snapshot_hash,
+                    state.baseline.tileset,
+                )?;
+                (resolved.blob_path, resolved.stamp.selection()?)
+            }
+        };
         Ok(compile_stamp_placement(
-            &state.current_map,
+            &source,
             &state.current_map,
             &self.inner.context.starcraft_path()?,
-            selection,
+            &selection,
             destinations,
             None,
             &authority,
@@ -678,19 +825,18 @@ impl CandidateStore {
         project_id: &str,
         session_id: &str,
         request_id: &str,
-        selection_id: &str,
+        source_ref: &MapStampSourceRef,
         destinations: &[StampDestination],
     ) -> Result<StampPlacementReport, String> {
-        let (source, draft, selection, authority) =
-            self.stamp_request_context(project_id, session_id, request_id, selection_id)?;
+        let context = self.stamp_request_context(project_id, session_id, request_id, source_ref)?;
         Ok(compile_stamp_placement(
-            &source,
-            &draft,
+            &context.source,
+            &context.draft,
             &self.inner.context.starcraft_path()?,
-            &selection,
+            &context.selection,
             destinations,
             None,
-            &authority,
+            &context.authority,
         )?
         .report)
     }
@@ -700,22 +846,28 @@ impl CandidateStore {
         project_id: &str,
         session_id: &str,
         request_id: &str,
-        selection_id: &str,
+        source_ref: &MapStampSourceRef,
         destinations: &[StampDestination],
         policy: StampCollisionPolicy,
     ) -> Result<StampPlacementResult, String> {
-        let (source, draft, selection, authority) =
-            self.stamp_request_context(project_id, session_id, request_id, selection_id)?;
+        let context = self.stamp_request_context(project_id, session_id, request_id, source_ref)?;
         let compiled = compile_stamp_placement(
-            &source,
-            &draft,
+            &context.source,
+            &context.draft,
             &self.inner.context.starcraft_path()?,
-            &selection,
+            &context.selection,
             destinations,
             Some(policy),
-            &authority,
+            &context.authority,
         )?;
         let patch = self.draft_patch(project_id, session_id, request_id, compiled.operations)?;
+        if let Some(provenance) = context.provenance {
+            let mut active = self.inner.active.lock();
+            let request = active_request_mut(&mut active, session_id, request_id)?;
+            if !request.imported_provenance.contains(&provenance) {
+                request.imported_provenance.push(provenance);
+            }
+        }
         Ok(StampPlacementResult {
             report: compiled.report,
             patch,
@@ -727,26 +879,63 @@ impl CandidateStore {
         project_id: &str,
         session_id: &str,
         request_id: &str,
-        selection_id: &str,
-    ) -> Result<(PathBuf, PathBuf, SelectionMask, MapRequestAuthority), String> {
+        source_ref: &MapStampSourceRef,
+    ) -> Result<StampRequestContext, String> {
         let state = self.load_state(project_id, session_id)?;
-        let selection = state
-            .selections
-            .get(selection_id)
-            .cloned()
-            .ok_or_else(|| "stamp selection does not exist".to_string())?;
         let active = self.inner.active.lock();
         let request = active_request(&active, session_id, request_id)?;
         let draft = request
             .draft_path
             .clone()
             .ok_or_else(|| "call map_draft_begin before placing a stamp".to_string())?;
-        Ok((
-            state.current_map,
+        let (source, selection, provenance) = match source_ref {
+            MapStampSourceRef::CandidateSelection {
+                selection_id,
+                snapshot_hash,
+            } => {
+                let selection = state
+                    .selections
+                    .get(selection_id)
+                    .cloned()
+                    .ok_or_else(|| "stamp selection does not exist".to_string())?;
+                if selection.snapshot_hash() != *snapshot_hash {
+                    return Err("stamp selection snapshot is stale".to_string());
+                }
+                (state.current_map, selection, None)
+            }
+            MapStampSourceRef::Imported {
+                import_id,
+                snapshot_hash,
+            } => {
+                let resolved = request.imported_sources.get(import_id).ok_or_else(|| {
+                    format!(
+                        "imported stamp '{import_id}' is not authorized by a current-request mention"
+                    )
+                })?;
+                if resolved.stamp.snapshot_hash != *snapshot_hash {
+                    return Err(format!("imported stamp '{import_id}' snapshot is stale"));
+                }
+                self.inner.imports.validate_resolved(resolved)?;
+                let selection = resolved.stamp.selection()?;
+                let provenance = ImportedStampProvenance {
+                    import_id: resolved.stamp.id.clone(),
+                    source_file_sha256: resolved.stamp.source_file_sha256.clone(),
+                    source_chk_sha256: resolved.stamp.source_chk_sha256.clone(),
+                    snapshot_hash: resolved.stamp.snapshot_hash.clone(),
+                    width: resolved.stamp.bounds.right - resolved.stamp.bounds.left,
+                    height: resolved.stamp.bounds.bottom - resolved.stamp.bounds.top,
+                    layers: resolved.stamp.layers.clone(),
+                };
+                (resolved.blob_path.clone(), selection, Some(provenance))
+            }
+        };
+        Ok(StampRequestContext {
+            source,
             draft,
             selection,
-            request.authority.clone(),
-        ))
+            authority: request.authority.clone(),
+            provenance,
+        })
     }
 
     pub fn draft_patch(
@@ -877,6 +1066,7 @@ impl CandidateStore {
         request.batches.clear();
         request.reports.clear();
         request.image_conversions.clear();
+        request.imported_provenance.clear();
         Ok(json!({"ok": true, "requestId": request_id, "draftHash": request.parent_hash}))
     }
 
@@ -960,6 +1150,7 @@ impl CandidateStore {
             authority: request.authority.clone(),
             batches: request.batches.clone(),
             image_conversions: request.image_conversions.clone(),
+            imported_stamps: request.imported_provenance.clone(),
             object_ids: object_ids.clone(),
         };
         let manifest_path = self
@@ -1041,7 +1232,16 @@ impl CandidateStore {
         if let Some(pending) = request.pending_revision.as_ref() {
             remove_if_exists(&pending.revision.operation_manifest)?;
         }
+        let source_hashes = request
+            .imported_sources
+            .values()
+            .map(|source| source.stamp.source_file_sha256.clone())
+            .collect::<Vec<_>>();
         active.remove(session_id);
+        drop(active);
+        for source_hash in source_hashes {
+            self.inner.imports.release_blob(&source_hash);
+        }
         Ok(())
     }
 
@@ -2031,7 +2231,8 @@ mod tests {
             b"partial",
         )
         .unwrap();
-        let store = CandidateStore::new(dirs);
+        let store =
+            CandidateStore::new((dirs).clone(), crate::map_import::MapImportStore::new(dirs));
         assert_eq!(store.cleanup_startup().unwrap(), 1);
         assert!(!incomplete.exists());
         std::fs::remove_dir_all(root).ok();
@@ -2044,7 +2245,8 @@ mod tests {
         let source = root.join("source.scx");
         std::fs::copy(fixture(), &source).unwrap();
         let snapshot = context(&dirs, &source);
-        let store = CandidateStore::new(dirs);
+        let store =
+            CandidateStore::new((dirs).clone(), crate::map_import::MapImportStore::new(dirs));
         let view = store.create_session("map-session", &snapshot).unwrap();
 
         let stored_target = full_target(&view, "stored-target");
@@ -2095,7 +2297,8 @@ mod tests {
         let source = root.join("source.scx");
         std::fs::copy(fixture(), &source).unwrap();
         let snapshot = context(&dirs, &source);
-        let store = CandidateStore::new(dirs);
+        let store =
+            CandidateStore::new((dirs).clone(), crate::map_import::MapImportStore::new(dirs));
         let view = store.create_session("map-session", &snapshot).unwrap();
         let slot = object_slots(&source)
             .unwrap()
@@ -2168,7 +2371,8 @@ mod tests {
         let source = root.join("source.scx");
         std::fs::copy(fixture(), &source).unwrap();
         let snapshot = context(&dirs, &source);
-        let store = CandidateStore::new(dirs);
+        let store =
+            CandidateStore::new((dirs).clone(), crate::map_import::MapImportStore::new(dirs));
         let view = store.create_session("map-session", &snapshot).unwrap();
         let target = full_target(&view, "target");
         store
@@ -2226,7 +2430,8 @@ mod tests {
         std::fs::copy(fixture(), &source).unwrap();
         let source_hash = file_hash(&source).unwrap();
         let snapshot = context(&dirs, &source);
-        let store = CandidateStore::new(dirs);
+        let store =
+            CandidateStore::new((dirs).clone(), crate::map_import::MapImportStore::new(dirs));
         let view = store.create_session("map-session", &snapshot).unwrap();
         let mut target = full_target(&view, "terrain-target");
         target.layers = [MapLayer::Terrain].into_iter().collect();
@@ -2361,7 +2566,10 @@ mod tests {
         let source = root.join("source.scx");
         std::fs::copy(fixture(), &source).unwrap();
         let snapshot = context(&dirs, &source);
-        let store = CandidateStore::new(dirs.clone());
+        let store = CandidateStore::new(
+            (dirs.clone()).clone(),
+            crate::map_import::MapImportStore::new(dirs.clone()),
+        );
         let session_root = store.session_root("project", "map-session");
 
         assert_eq!(
@@ -2417,7 +2625,10 @@ mod tests {
         let source = root.join("source.scx");
         std::fs::copy(fixture(), &source).unwrap();
         let snapshot = context(&dirs, &source);
-        let store = CandidateStore::new(dirs.clone());
+        let store = CandidateStore::new(
+            (dirs.clone()).clone(),
+            crate::map_import::MapImportStore::new(dirs.clone()),
+        );
         let mut view = store.create_session("map-session", &snapshot).unwrap();
 
         let target0 = full_target(&view, "target-r0");
@@ -2592,7 +2803,10 @@ mod tests {
         assert_eq!(reopened_view.current_hash, repaired_hash);
         assert!(orphan.exists(), "normal open must not sweep orphan drafts");
 
-        let recovered = CandidateStore::new(dirs.clone());
+        let recovered = CandidateStore::new(
+            (dirs.clone()).clone(),
+            crate::map_import::MapImportStore::new(dirs.clone()),
+        );
         recovered.cleanup_startup().unwrap();
         let recovered_view = recovered.open_session("map-session", &snapshot).unwrap();
         assert_eq!(recovered_view.current_revision, 1);
@@ -2620,7 +2834,10 @@ mod tests {
         let source = root.join("source.scx");
         std::fs::copy(fixture(), &source).unwrap();
         let snapshot = context(&dirs, &source);
-        let store = CandidateStore::new(dirs.clone());
+        let store = CandidateStore::new(
+            (dirs.clone()).clone(),
+            crate::map_import::MapImportStore::new(dirs.clone()),
+        );
         let mut view = store.create_session("map-session", &snapshot).unwrap();
         let target = full_target(&view, "target");
         view = store
@@ -2684,7 +2901,10 @@ mod tests {
         let source = root.join("source.scx");
         std::fs::copy(fixture(), &source).unwrap();
         let snapshot = context(&dirs, &source);
-        let store = CandidateStore::new(dirs.clone());
+        let store = CandidateStore::new(
+            (dirs.clone()).clone(),
+            crate::map_import::MapImportStore::new(dirs.clone()),
+        );
         let view = store.create_session("map-session", &snapshot).unwrap();
         let mut target = full_target(&view, "terrain-only");
         target.layers = [MapLayer::Terrain].into_iter().collect();
@@ -2731,7 +2951,10 @@ mod tests {
         let source = root.join("source.scx");
         std::fs::copy(fixture(), &source).unwrap();
         let snapshot = context(&dirs, &source);
-        let store = CandidateStore::new(dirs.clone());
+        let store = CandidateStore::new(
+            (dirs.clone()).clone(),
+            crate::map_import::MapImportStore::new(dirs.clone()),
+        );
         let view = store.create_session("map-session", &snapshot).unwrap();
         let target = SelectionMask::canonical(
             "tiny-target",
@@ -2828,7 +3051,8 @@ mod tests {
         std::fs::copy(fixture(), &source).unwrap();
         let source_bytes = std::fs::read(&source).unwrap();
         let snapshot = context(&dirs, &source);
-        let store = CandidateStore::new(dirs);
+        let store =
+            CandidateStore::new((dirs).clone(), crate::map_import::MapImportStore::new(dirs));
         let view = store.create_session("map-session", &snapshot).unwrap();
         let starcraft = Path::new(r"C:\Program Files (x86)\StarCraft");
         let catalog = |kind: &str| -> Value {
@@ -2917,7 +3141,8 @@ mod tests {
         std::fs::copy(fixture(), &source).unwrap();
         let source_bytes = std::fs::read(&source).unwrap();
         let snapshot = context(&dirs, &source);
-        let store = CandidateStore::new(dirs);
+        let store =
+            CandidateStore::new((dirs).clone(), crate::map_import::MapImportStore::new(dirs));
         let view = store.create_session("map-session", &snapshot).unwrap();
         let stamp = SelectionMask::canonical(
             "terrain-stamp",
@@ -2941,6 +3166,10 @@ mod tests {
             },
         )
         .unwrap();
+        let stamp_source = MapStampSourceRef::CandidateSelection {
+            selection_id: stamp.id.clone(),
+            snapshot_hash: stamp.snapshot_hash(),
+        };
         store
             .save_selection("project", "map-session", stamp)
             .unwrap();
@@ -2956,7 +3185,7 @@ mod tests {
                 "project",
                 "map-session",
                 "stamp-request",
-                "terrain-stamp",
+                &stamp_source,
                 &destination,
             )
             .unwrap();
@@ -2967,7 +3196,7 @@ mod tests {
                 "project",
                 "map-session",
                 "stamp-request",
-                "terrain-stamp",
+                &stamp_source,
                 &destination,
                 StampCollisionPolicy::Merge,
             )
@@ -3006,6 +3235,342 @@ mod tests {
         assert_eq!(std::fs::read(&source).unwrap(), source_bytes);
         std::fs::remove_dir_all(root).ok();
     }
+    #[test]
+    #[ignore = "requires installed StarCraft terrain assets"]
+    fn imported_stamp_is_request_bound_and_replay_is_blob_independent() {
+        let root = unique_root();
+        let dirs = DataDirs::from_bases(&root.join("roaming"), &root.join("local"));
+        dirs.ensure_dirs().unwrap();
+        let destination_source = root.join("destination.scx");
+        let external_source = root.join("external.scx");
+        std::fs::copy(fixture(), &destination_source).unwrap();
+        std::fs::copy(fixture(), &external_source).unwrap();
+        let destination_before = std::fs::read(&destination_source).unwrap();
+        let external_before = std::fs::read(&external_source).unwrap();
+        let snapshot = context(&dirs, &destination_source);
+        let imports = crate::map_import::MapImportStore::new(dirs.clone());
+        let store = CandidateStore::new(dirs.clone(), imports.clone());
+        let view = store.create_session("map-session", &snapshot).unwrap();
+        let selection = SelectionMask::canonical(
+            "external-selection",
+            "외부 영역",
+            "import-source",
+            SelectionRole::Reference,
+            [MapLayer::Terrain].into_iter().collect(),
+            crate::map_model::MaskGrid {
+                width: view.baseline.width,
+                height: view.baseline.height,
+                rows: vec![
+                    RowSpan {
+                        y: 0,
+                        spans: vec![(0, 2)],
+                    },
+                    RowSpan {
+                        y: 1,
+                        spans: vec![(0, 2)],
+                    },
+                ],
+            },
+        )
+        .unwrap();
+        let imported = imports
+            .insert_test_stamp("project", &external_source, &selection)
+            .unwrap();
+        let source_ref = MapStampSourceRef::Imported {
+            import_id: imported.id.clone(),
+            snapshot_hash: imported.snapshot_hash.clone(),
+        };
+        let destination = [StampDestination { x: 4, y: 4 }];
+        let preview = store
+            .direct_stamp_preview(
+                "project",
+                "map-session",
+                &view.revision_key,
+                &source_ref,
+                &destination,
+            )
+            .unwrap();
+        assert_eq!(preview.terrain_cells_per_destination, 4);
+        assert_eq!(
+            store
+                .state("project", "map-session")
+                .unwrap()
+                .current_revision,
+            0
+        );
+
+        store
+            .prepare_request("project", "map-session", "unmentioned", 0, &[])
+            .unwrap();
+        store
+            .draft_begin("project", "map-session", "unmentioned")
+            .unwrap();
+        assert!(store
+            .normalize_stamp_tool_source(
+                "project",
+                "map-session",
+                "unmentioned",
+                &MapStampToolSource::Imported {
+                    import_id: imported.id.clone(),
+                },
+            )
+            .unwrap_err()
+            .contains("current-request mention"));
+        store.finish_request("map-session", "unmentioned").unwrap();
+
+        let mention = MapMentionSnapshot::ImportedStamp {
+            import_id: imported.id.clone(),
+            snapshot_hash: imported.snapshot_hash.clone(),
+        };
+        store
+            .prepare_request("project", "map-session", "import-request", 0, &[mention])
+            .unwrap();
+        store
+            .draft_begin("project", "map-session", "import-request")
+            .unwrap();
+        let normalized = store
+            .normalize_stamp_tool_source(
+                "project",
+                "map-session",
+                "import-request",
+                &MapStampToolSource::Imported {
+                    import_id: imported.id.clone(),
+                },
+            )
+            .unwrap();
+        store
+            .draft_stamp_place(
+                "project",
+                "map-session",
+                "import-request",
+                &normalized,
+                &destination,
+                StampCollisionPolicy::Merge,
+            )
+            .unwrap();
+        store
+            .finalize("project", "map-session", "import-request")
+            .unwrap();
+        let committed = store
+            .commit_request("project", "map-session", "import-request")
+            .unwrap();
+        let committed_hash = committed.current_hash.clone();
+        let state = store.load_state("project", "map-session").unwrap();
+        let manifest: RevisionManifest = read_json(&state.revisions[0].operation_manifest).unwrap();
+        assert_eq!(manifest.imported_stamps.len(), 1);
+        let manifest_json = serde_json::to_string(&manifest).unwrap();
+        assert!(!manifest_json.contains("external.scx"));
+        assert!(!manifest_json.to_ascii_lowercase().contains("blob"));
+        let blob = imports
+            .resolve_imported(
+                "project",
+                &imported.id,
+                &imported.snapshot_hash,
+                view.baseline.tileset,
+            )
+            .unwrap()
+            .blob_path;
+        store
+            .finish_request("map-session", "import-request")
+            .unwrap();
+        std::fs::remove_file(&blob).unwrap();
+
+        store.revert("project", "map-session", 0).unwrap();
+        let replayed = store.revert("project", "map-session", 1).unwrap();
+        assert_eq!(replayed.current_hash, committed_hash);
+        assert!(store
+            .direct_stamp_preview(
+                "project",
+                "map-session",
+                &replayed.revision_key,
+                &source_ref,
+                &destination,
+            )
+            .unwrap_err()
+            .contains("missing"));
+        assert_eq!(
+            std::fs::read(&destination_source).unwrap(),
+            destination_before
+        );
+        assert_eq!(std::fs::read(&external_source).unwrap(), external_before);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    #[ignore = "requires installed StarCraft assets plus MAP_IMPORT_SMOKE_SOURCE and MAP_IMPORT_SMOKE_DESTINATION"]
+    fn real_cross_dimension_import_direct_and_request_paths_are_exact_and_blob_free_on_replay() {
+        let source_path = PathBuf::from(
+            std::env::var("MAP_IMPORT_SMOKE_SOURCE").expect("MAP_IMPORT_SMOKE_SOURCE is required"),
+        );
+        let destination_path = PathBuf::from(
+            std::env::var("MAP_IMPORT_SMOKE_DESTINATION")
+                .expect("MAP_IMPORT_SMOKE_DESTINATION is required"),
+        );
+        let source_before = std::fs::read(&source_path).unwrap();
+        let destination_before = std::fs::read(&destination_path).unwrap();
+        let roaming = PathBuf::from(std::env::var("APPDATA").expect("APPDATA is required"));
+        let local = PathBuf::from(std::env::var("LOCALAPPDATA").expect("LOCALAPPDATA is required"));
+        let dirs = DataDirs::from_bases(&roaming, &local);
+        let project_id = format!("cross-map-smoke-{}", uuid::Uuid::new_v4());
+        let context_service = MapContextService::new(dirs.clone());
+        let destination_revision = context_service
+            .revision_for_path(project_id.clone(), &destination_path)
+            .unwrap();
+        let source_revision = context_service
+            .revision_for_path(project_id.clone(), &source_path)
+            .unwrap();
+        assert_eq!(source_revision.tileset, destination_revision.tileset);
+        assert_ne!(
+            (source_revision.width, source_revision.height),
+            (destination_revision.width, destination_revision.height)
+        );
+        let destination_chk = isom::chk_extract(&destination_path).unwrap();
+        let snapshot = MapContextSnapshot {
+            revision: destination_revision,
+            saved_source_notice: "real cross-map smoke".to_string(),
+            source_file_size: destination_before.len() as u64,
+            starcraft_path: context_service.starcraft_path().unwrap(),
+            digest: crate::chk::digest_chk(&destination_chk),
+        };
+        let imports = crate::map_import::MapImportStore::new(dirs.clone());
+        let store = CandidateStore::new(dirs, imports.clone());
+        let view = store
+            .create_session("cross-map-session", &snapshot)
+            .unwrap();
+        let selection = SelectionMask::canonical(
+            "real-cross-map-selection",
+            "real cross-map selection",
+            "import-source",
+            SelectionRole::Reference,
+            crate::map_verify::SUPPORTED_MAP_LAYERS
+                .into_iter()
+                .collect(),
+            crate::map_model::MaskGrid {
+                width: source_revision.width,
+                height: source_revision.height,
+                rows: vec![
+                    RowSpan {
+                        y: 0,
+                        spans: vec![(0, 2)],
+                    },
+                    RowSpan {
+                        y: 1,
+                        spans: vec![(0, 2)],
+                    },
+                ],
+            },
+        )
+        .unwrap();
+        let imported = imports
+            .insert_test_stamp(&project_id, &source_path, &selection)
+            .unwrap();
+        let source_ref = MapStampSourceRef::Imported {
+            import_id: imported.id.clone(),
+            snapshot_hash: imported.snapshot_hash.clone(),
+        };
+        let destinations = [StampDestination { x: 4, y: 4 }];
+        let direct_preview = store
+            .direct_stamp_preview(
+                &project_id,
+                "cross-map-session",
+                &view.revision_key,
+                &source_ref,
+                &destinations,
+            )
+            .unwrap();
+        assert_eq!(direct_preview.terrain_cells_per_destination, 4);
+        assert_eq!(
+            store
+                .state(&project_id, "cross-map-session")
+                .unwrap()
+                .current_revision,
+            0
+        );
+        let mention = MapMentionSnapshot::ImportedStamp {
+            import_id: imported.id.clone(),
+            snapshot_hash: imported.snapshot_hash.clone(),
+        };
+        store
+            .prepare_request(
+                &project_id,
+                "cross-map-session",
+                "cross-map-request",
+                0,
+                &[mention],
+            )
+            .unwrap();
+        store
+            .draft_begin(&project_id, "cross-map-session", "cross-map-request")
+            .unwrap();
+        store
+            .draft_stamp_place(
+                &project_id,
+                "cross-map-session",
+                "cross-map-request",
+                &source_ref,
+                &destinations,
+                StampCollisionPolicy::Merge,
+            )
+            .unwrap();
+        store
+            .finalize(&project_id, "cross-map-session", "cross-map-request")
+            .unwrap();
+        let committed = store
+            .commit_request(&project_id, "cross-map-session", "cross-map-request")
+            .unwrap();
+        assert_eq!(committed.current_revision, 1);
+        let committed_hash = committed.current_hash.clone();
+        let state = store.load_state(&project_id, "cross-map-session").unwrap();
+        let manifest: RevisionManifest = read_json(&state.revisions[0].operation_manifest).unwrap();
+        assert_eq!(manifest.imported_stamps.len(), 1);
+        assert!(manifest
+            .batches
+            .iter()
+            .flatten()
+            .all(|operation| !matches!(operation, MapOperation::TerrainIsomBrush { .. })));
+        let imported_digest = crate::chk::digest_chk(&isom::chk_extract(&source_path).unwrap());
+        let candidate_digest = crate::chk::digest_chk(
+            &isom::chk_extract(&store.current_map(&project_id, "cross-map-session").unwrap())
+                .unwrap(),
+        );
+        for (source_x, source_y, destination_x, destination_y) in [
+            (0usize, 0usize, 4usize, 4usize),
+            (1, 0, 5, 4),
+            (0, 1, 4, 5),
+            (1, 1, 5, 5),
+        ] {
+            assert_eq!(
+                candidate_digest.tiles
+                    [destination_y * usize::from(candidate_digest.map.width) + destination_x],
+                imported_digest.tiles[source_y * usize::from(imported_digest.map.width) + source_x],
+            );
+        }
+        store
+            .finish_request("cross-map-session", "cross-map-request")
+            .unwrap();
+        imports
+            .remove_test_stamp(&project_id, &imported.id)
+            .unwrap();
+        store.revert(&project_id, "cross-map-session", 0).unwrap();
+        let replayed = store.revert(&project_id, "cross-map-session", 1).unwrap();
+        assert_eq!(replayed.current_hash, committed_hash);
+        assert!(store
+            .direct_stamp_preview(
+                &project_id,
+                "cross-map-session",
+                &replayed.revision_key,
+                &source_ref,
+                &destinations,
+            )
+            .unwrap_err()
+            .contains("no longer exists"));
+        assert_eq!(std::fs::read(&source_path).unwrap(), source_before);
+        assert_eq!(
+            std::fs::read(&destination_path).unwrap(),
+            destination_before
+        );
+        store.discard(&project_id, "cross-map-session").unwrap();
+    }
 
     #[test]
     fn saved_selection_palette_is_map_persistent_and_delete_is_shared() {
@@ -3015,7 +3580,8 @@ mod tests {
         let source = root.join("source.scx");
         std::fs::copy(fixture(), &source).unwrap();
         let snapshot = context(&dirs, &source);
-        let store = CandidateStore::new(dirs);
+        let store =
+            CandidateStore::new((dirs).clone(), crate::map_import::MapImportStore::new(dirs));
         let first = store.create_session("map-session-a", &snapshot).unwrap();
         let mut selection = full_target(&first, "shared-stamp");
         selection.label = "공유 영역".to_string();
@@ -3023,6 +3589,16 @@ mod tests {
         store
             .save_selection("project", "map-session-a", selection)
             .unwrap();
+
+        let state_path = store
+            .session_root("project", "map-session-a")
+            .join("state.json");
+        let state_before_read = std::fs::read(&state_path).unwrap();
+        let persistent = store.persistent_selections("project").unwrap();
+        assert_eq!(persistent.len(), 1);
+        assert_eq!(persistent[0].id, "shared-stamp");
+        assert_eq!(persistent[0].label, "공유 영역");
+        assert_eq!(std::fs::read(&state_path).unwrap(), state_before_read);
 
         let second = store.create_session("map-session-b", &snapshot).unwrap();
         let shared = second

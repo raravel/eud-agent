@@ -253,6 +253,7 @@ export type MapMentionSnapshot =
   | { kind: "object"; objectRef: MapObjectRef; role: "subject" | "reference" | "protect" | "anchor" }
   | { kind: "palette"; entry: PaletteRef; qualifiers: MentionQualifiers }
   | { kind: "stamp"; selectionId: string; snapshotHash: string }
+  | { kind: "importedStamp"; importId: string; snapshotHash: string }
   | { kind: "location"; locationId: number; revisionKey: string; baselineHash: string };
 
 export interface MentionChip {
@@ -374,6 +375,10 @@ export interface MapImageConfirmResponse {
 }
 
 export type StampCollisionPolicy = "merge" | "replace";
+export type MapStampSourceRef =
+  | { kind: "candidateSelection"; selectionId: string; snapshotHash: string }
+  | { kind: "imported"; importId: string; snapshotHash: string };
+
 
 export interface StampDestination {
   x: number;
@@ -411,19 +416,27 @@ export interface MapStampConfirmResponse {
 }
 
 
-export interface RenderCommand {
-  sessionId: string;
-  view: MapView;
+export interface MapCropRequest {
   x: number;
   y: number;
   width: number;
   height: number;
   scale: number;
   layers: MapLayer[];
+}
+
+export interface MapRenderSource {
+  key: string;
+  render(command: MapCropRequest): Promise<Blob>;
+}
+
+export interface RenderCommand extends MapCropRequest {
+  sessionId: string;
+  view: MapView;
   requestId?: string;
 }
 
-function binaryBytes(value: unknown): Uint8Array {
+export function binaryBytes(value: unknown): Uint8Array {
   if (value instanceof ArrayBuffer) return new Uint8Array(value);
   if (value instanceof Uint8Array) return value;
   if (ArrayBuffer.isView(value)) {
@@ -431,7 +444,7 @@ function binaryBytes(value: unknown): Uint8Array {
   }
   throw new Error("Map Agent binary IPC did not return an ArrayBuffer");
 }
-function pngBlob(bytes: Uint8Array): Blob {
+export function pngBlob(bytes: Uint8Array): Blob {
   const buffer = new ArrayBuffer(bytes.byteLength);
   new Uint8Array(buffer).set(bytes);
   return new Blob([buffer], { type: "image/png" });
@@ -508,6 +521,25 @@ export async function mapRender(command: RenderCommand): Promise<Blob> {
   return pngBlob(bytes);
 }
 
+export function candidateMapRenderSource(input: {
+  sessionId: string;
+  revisionKey: string;
+  view: MapView;
+  requestId?: string;
+}): MapRenderSource {
+  const view = input.view === "diff" ? "candidate" : input.view;
+  return {
+    key: `${input.sessionId}|${input.revisionKey}|${view}|${input.requestId ?? ""}`,
+    render: (command) =>
+      mapRender({
+        sessionId: input.sessionId,
+        view,
+        requestId: input.requestId,
+        ...command,
+      }),
+  };
+}
+
 export async function mapThumbnail(command: {
   sessionId: string;
   layer: MapLayer;
@@ -544,7 +576,7 @@ export function mapImageConfirm(command: {
 export function mapStampPreview(command: {
   sessionId: string;
   revisionKey: string;
-  selectionId: string;
+  source: MapStampSourceRef;
   destinations: StampDestination[];
 }): Promise<StampPlacementReport> {
   return invoke("map_agent_stamp_preview", { command });
@@ -553,7 +585,7 @@ export function mapStampPreview(command: {
 export function mapStampConfirm(command: {
   sessionId: string;
   revisionKey: string;
-  selectionId: string;
+  source: MapStampSourceRef;
   destinations: StampDestination[];
   collisionPolicy: StampCollisionPolicy;
 }): Promise<MapStampConfirmResponse> {

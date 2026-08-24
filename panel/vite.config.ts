@@ -35,6 +35,7 @@ export default defineConfig({
       input: {
         main: path.resolve(root, "index.html"),
         mapAgent: path.resolve(root, "map-agent.html"),
+        mapImport: path.resolve(root, "map-import.html"),
       },
     },
   },

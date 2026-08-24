@@ -7,17 +7,23 @@ import { MapPalette } from "./MapPalette";
 const api = vi.hoisted(() => ({
   mapCatalog: vi.fn(),
   mapThumbnail: vi.fn(),
+  mapImportStampThumbnail: vi.fn(),
 }));
 
 vi.mock("./mapProtocol", () => ({
   mapCatalog: api.mapCatalog,
   mapThumbnail: api.mapThumbnail,
 }));
+vi.mock("./importProtocol", () => ({
+  mapImportStampThumbnail: api.mapImportStampThumbnail,
+}));
 
 describe("Map palette paging", () => {
   beforeEach(() => {
     api.mapCatalog.mockReset();
     api.mapThumbnail.mockReset();
+    api.mapImportStampThumbnail.mockReset();
+    api.mapImportStampThumbnail.mockResolvedValue(new Blob());
     api.mapThumbnail.mockRejectedValue(new Error("thumbnail omitted by test"));
     api.mapCatalog.mockImplementation(
       async ({ kind, offset }: { kind: string; offset: number }) => ({
@@ -47,9 +53,13 @@ describe("Map palette paging", () => {
         tileset="jungle"
         locations={[]}
         selections={[]}
+        importedEntries={[]}
         onMention={vi.fn()}
         onStampMention={vi.fn()}
         onStampPlace={vi.fn()}
+        onImportedMention={vi.fn()}
+        onImportedPlace={vi.fn()}
+        onImportedDelete={vi.fn()}
         onLocation={vi.fn()}
         onNewLocation={vi.fn()}
       />,
@@ -100,9 +110,13 @@ describe("Map palette paging", () => {
         tileset="jungle"
         locations={[]}
         selections={[]}
+        importedEntries={[]}
         onMention={vi.fn()}
         onStampMention={vi.fn()}
         onStampPlace={vi.fn()}
+        onImportedMention={vi.fn()}
+        onImportedPlace={vi.fn()}
+        onImportedDelete={vi.fn()}
         onLocation={vi.fn()}
         onNewLocation={vi.fn()}
       />,
@@ -149,9 +163,13 @@ describe("Map palette paging", () => {
         tileset="jungle"
         locations={[]}
         selections={[]}
+        importedEntries={[]}
         onMention={onMention}
         onStampMention={vi.fn()}
         onStampPlace={vi.fn()}
+        onImportedMention={vi.fn()}
+        onImportedPlace={vi.fn()}
+        onImportedDelete={vi.fn()}
         onLocation={vi.fn()}
         onNewLocation={vi.fn()}
       />,
@@ -193,9 +211,13 @@ describe("Map palette paging", () => {
         tileset="jungle"
         locations={[]}
         selections={[selection]}
+        importedEntries={[]}
         onMention={vi.fn()}
         onStampMention={onStampMention}
         onStampPlace={onStampPlace}
+        onImportedMention={vi.fn()}
+        onImportedPlace={vi.fn()}
+        onImportedDelete={vi.fn()}
         onLocation={vi.fn()}
         onNewLocation={vi.fn()}
       />,
@@ -208,5 +230,58 @@ describe("Map palette paging", () => {
       screen.getByRole("button", { name: "영역 A 스탬프를 프롬프트에 추가" }),
     );
     expect(onStampMention).toHaveBeenCalledWith(selection);
+  });
+
+  it("shows pinned imported metadata and routes place, mention, and delete actions", async () => {
+    const stamp = {
+      id: "import-a",
+      label: "언덕 입구",
+      snapshotHash: "snapshot-import",
+      sourceDisplayName: "source-map.scx",
+      sourceFileSha256: "a".repeat(64),
+      sourceChkSha256: "b".repeat(64),
+      sourceExtension: "scx" as const,
+      sourceTileset: "jungle" as const,
+      sourceWidth: 128,
+      sourceHeight: 128,
+      bounds: { left: 10, top: 20, right: 30, bottom: 40 },
+      selectedCells: 400,
+      rows: [{ y: 20, spans: [[10, 30] as [number, number]] }],
+      layers: ["terrain" as const, "buildings" as const],
+      createdAt: "1",
+      available: true,
+      compatible: true,
+    };
+    const onPlace = vi.fn();
+    const onMention = vi.fn();
+    const onDelete = vi.fn();
+    render(
+      <MapPalette
+        sessionId="map-session"
+        tileset="jungle"
+        locations={[]}
+        selections={[]}
+        importedEntries={[stamp]}
+        onMention={vi.fn()}
+        onStampMention={vi.fn()}
+        onStampPlace={vi.fn()}
+        onImportedMention={onMention}
+        onImportedPlace={onPlace}
+        onImportedDelete={onDelete}
+        onLocation={vi.fn()}
+        onNewLocation={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText("source-map.scx · jungle")).toBeInTheDocument();
+    expect(screen.getByText("20×20 · 400셀")).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "배치" }));
+    expect(onPlace).toHaveBeenCalledWith(stamp);
+    await userEvent.click(screen.getByRole("button", { name: "멘션 추가" }));
+    expect(onMention).toHaveBeenCalledWith(stamp);
+    await userEvent.click(
+      screen.getByRole("button", { name: "언덕 입구 가져온 영역 삭제" }),
+    );
+    expect(onDelete).toHaveBeenCalledWith(stamp);
   });
 });

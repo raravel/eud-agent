@@ -55,7 +55,14 @@ import {
 import type { TileViewport } from "./canvasTransform";
 import type { SpatialObject } from "./spatialIndex";
 import {
+  mapAgentImportOpen,
+  mapImportStampDelete,
+  mapImportStampList,
+  type ImportedStampView,
+} from "./importProtocol";
+import {
   applyUndo,
+  candidateMapRenderSource,
   candidateApply,
   candidateDiscard,
   candidateRevert,
@@ -88,6 +95,7 @@ import {
   type MapLocation,
   type MapObjectItem,
   type MapView,
+  type MapStampSourceRef,
   type MapSourceProbe,
   type MentionChip,
   type MentionQualifiers,
@@ -140,6 +148,7 @@ interface DirectImagePlacement {
 }
 interface DirectStampPlacement {
   selection: SavedSelection;
+  source: MapStampSourceRef;
   destination: StampDestination;
   report?: StampPlacementReport;
   requestedSequence: number;
@@ -409,6 +418,36 @@ export function staleMentions(chips: MentionChip[], candidate: CandidateStateVie
   });
 }
 
+export function staleImportedMentions(
+  chips: MentionChip[],
+  imported: ImportedStampView[],
+): MentionChip[] {
+  return chips.map((chip) => {
+    const mention = chip.mention;
+    if (mention.kind !== "importedStamp") return chip;
+    const stamp = imported.find(
+      (entry) =>
+        entry.id === mention.importId &&
+        entry.snapshotHash === mention.snapshotHash,
+    );
+    return { ...chip, stale: !stamp || !stamp.available || !stamp.compatible };
+  });
+}
+
+function importedSelection(stamp: ImportedStampView): SavedSelection {
+  return {
+    id: stamp.id,
+    label: stamp.label,
+    sourceRevision: `imported:${stamp.snapshotHash}`,
+    role: "reference",
+    layers: stamp.layers,
+    bounds: stamp.bounds,
+    selectedCells: stamp.selectedCells,
+    rows: stamp.rows,
+    snapshotHash: stamp.snapshotHash,
+  };
+}
+
 export interface LiveDraftPreview {
   requestId: string;
   candidateRevision: string;
@@ -648,6 +687,7 @@ export default function MapAgentApp() {
     terrainRows: [],
     markers: [],
   });
+  const [importedEntries, setImportedEntries] = useState<ImportedStampView[]>([]);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
@@ -745,6 +785,31 @@ export default function MapAgentApp() {
     },
     [resetTurn],
   );
+
+  const refreshImportedEntries = useCallback(async () => {
+    const next = await mapImportStampList();
+    setImportedEntries(next);
+    setMentions((chips) => staleImportedMentions(chips, next));
+  }, []);
+
+  useEffect(() => {
+    if (!bootstrap) return;
+    void refreshImportedEntries().catch((reason) => setError(String(reason)));
+  }, [
+    bootstrap?.context.revision.fileSha256,
+    bootstrap?.context.revision.projectId,
+    refreshImportedEntries,
+  ]);
+
+  useEffect(() => {
+    let unlisten: UnlistenFn | undefined;
+    void listen("map-import-palette-changed", () => {
+      void refreshImportedEntries().catch((reason) => setError(String(reason)));
+    }).then((dispose) => {
+      unlisten = dispose;
+    });
+    return () => unlisten?.();
+  }, [refreshImportedEntries]);
 
   useEffect(() => {
     bootstrapRef.current = bootstrap;
@@ -1481,6 +1546,20 @@ export default function MapAgentApp() {
     setSelectedMentionId(chip.id);
   }, []);
 
+  const addImportedStampMention = useCallback((stamp: ImportedStampView) => {
+    const chip: MentionChip = {
+      id: crypto.randomUUID(),
+      label: `imported:${stamp.label}`,
+      mention: {
+        kind: "importedStamp",
+        importId: stamp.id,
+        snapshotHash: stamp.snapshotHash,
+      },
+    };
+    setMentions((chips) => [...chips, chip]);
+    setSelectedMentionId(chip.id);
+  }, []);
+
   const handlePaletteMention = useCallback(
     (entry: PaletteEntry, layer: MapLayer, kind: PaletteKind) => {
       if (!bootstrap) return;
@@ -1809,7 +1888,7 @@ export default function MapAgentApp() {
         const report = await mapStampPreview({
           sessionId: currentBootstrap.session.id,
           revisionKey: currentCandidate.revisionKey,
-          selectionId: current.selection.id,
+          source: current.source,
           destinations: [destination],
         });
         const latest = stampPlacementRef.current;
@@ -1852,7 +1931,14 @@ export default function MapAgentApp() {
   );
 
   const beginStampPlacement = useCallback(
-    (selection: SavedSelection) => {
+    (
+      selection: SavedSelection,
+      source: MapStampSourceRef = {
+        kind: "candidateSelection",
+        selectionId: selection.id,
+        snapshotHash: selection.snapshotHash,
+      },
+    ) => {
       const currentCandidate = candidateRef.current;
       if (
         !currentCandidate ||
@@ -1879,6 +1965,7 @@ export default function MapAgentApp() {
       };
       const next: DirectStampPlacement = {
         selection,
+        source,
         destination,
         requestedSequence: 0,
         acceptedSequence: -1,
@@ -1941,7 +2028,7 @@ export default function MapAgentApp() {
         const response = await mapStampConfirm({
           sessionId: currentBootstrap.session.id,
           revisionKey: currentCandidate.revisionKey,
-          selectionId: current.selection.id,
+          source: current.source,
           destinations: [current.destination],
           collisionPolicy,
         });
@@ -1965,6 +2052,30 @@ export default function MapAgentApp() {
       }
     },
     [clearStampPlacement, refreshObjects],
+  );
+
+  const beginImportedStampPlacement = useCallback(
+    (stamp: ImportedStampView) => {
+      beginStampPlacement(importedSelection(stamp), {
+        kind: "imported",
+        importId: stamp.id,
+        snapshotHash: stamp.snapshotHash,
+      });
+    },
+    [beginStampPlacement],
+  );
+
+  const deleteImportedStamp = useCallback(
+    async (stamp: ImportedStampView) => {
+      if (!window.confirm(`'${stamp.label}' 가져온 영역을 삭제할까요?`)) return;
+      try {
+        await mapImportStampDelete(stamp.id);
+        await refreshImportedEntries();
+      } catch (reason) {
+        setError(String(reason));
+      }
+    },
+    [refreshImportedEntries],
   );
 
   const send = useCallback(
@@ -2164,6 +2275,24 @@ export default function MapAgentApp() {
     },
     [reload],
   );
+  const renderedMapSource = useMemo(() => {
+    if (!bootstrap || !candidate) return null;
+    const draftVisible =
+      liveDraft !== null &&
+      liveDraft.candidateRevision === candidate.revisionKey &&
+      view === "candidate";
+    const renderedMapView: MapView = draftVisible ? "draft" : view;
+    const revisionKey = draftVisible
+      ? `${candidate.revisionKey}|draft:${liveDraft.requestId}:${liveDraft.generation}`
+      : candidate.revisionKey;
+    return candidateMapRenderSource({
+      sessionId: bootstrap.session.id,
+      revisionKey,
+      view: renderedMapView,
+      requestId: draftVisible ? liveDraft.requestId : undefined,
+    });
+  }, [bootstrap, candidate, liveDraft, view]);
+
 
   if (loading && !bootstrap) {
     return <div className="flex h-dvh items-center justify-center bg-background text-sm text-muted-foreground">Map Agent 연결 및 저장 SCX 로딩…</div>;
@@ -2203,9 +2332,6 @@ export default function MapAgentApp() {
     liveDraft.candidateRevision === candidate.revisionKey &&
     view === "candidate";
   const renderedView: MapView = liveDraftVisible ? "draft" : view;
-  const renderedRevisionKey = liveDraftVisible
-    ? `${candidate.revisionKey}|draft:${liveDraft.requestId}:${liveDraft.generation}`
-    : candidate.revisionKey;
   const renderedObjects = liveDraftVisible ? draftObjects : objects;
   const imagePreviewFresh =
     imagePlacement !== null &&
@@ -2268,6 +2394,9 @@ export default function MapAgentApp() {
           imagePlacementActive={imagePlacement !== null}
           liveDraftActive={liveDraft !== null}
           onImagePlace={() => imageFileInputRef.current?.click()}
+          onMapImport={() => {
+            void mapAgentImportOpen().catch((reason) => setError(String(reason)));
+          }}
           onReloadSource={() => void createSession()}
           onView={setView}
           onRevert={(revision) =>
@@ -2297,21 +2426,23 @@ export default function MapAgentApp() {
           tileset={bootstrap.context.revision.tileset}
           locations={locations}
           selections={candidate.selections}
+          importedEntries={importedEntries}
           onMention={handlePaletteMention}
           onStampMention={addStampMention}
           onStampPlace={beginStampPlacement}
+          onImportedMention={addImportedStampMention}
+          onImportedPlace={beginImportedStampPlacement}
+          onImportedDelete={(stamp) => void deleteImportedStamp(stamp)}
           onLocation={handleLocationMention}
           onNewLocation={handleNewLocation}
         />
       }
       minimap={
         <MapMinimap
-          sessionId={bootstrap.session.id}
-          revisionKey={renderedRevisionKey}
+          renderSource={renderedMapSource!}
           width={candidate.baseline.width}
           height={candidate.baseline.height}
           view={renderedView}
-          requestId={liveDraftVisible ? liveDraft.requestId : undefined}
           layers={layers}
           selections={candidate.selections}
           activeRows={minimapActiveRows}
@@ -2330,12 +2461,11 @@ export default function MapAgentApp() {
       }
       canvas={
         <MapCanvas
-          sessionId={bootstrap.session.id}
-          revisionKey={renderedRevisionKey}
+          renderSource={renderedMapSource!}
+          ariaLabel="Map Agent 맵 캔버스"
           width={candidate.baseline.width}
           height={candidate.baseline.height}
           view={renderedView}
-          requestId={liveDraftVisible ? liveDraft.requestId : undefined}
           layers={layers}
           selections={candidate.selections}
           activeCells={activeCells}
@@ -2431,6 +2561,7 @@ export default function MapAgentApp() {
           ) : stampPlacement ? (
             <StampPlacementControls
               selection={stampPlacement.selection}
+              sourceKind={stampPlacement.source.kind}
               destination={stampPlacement.destination}
               mapWidth={candidate.baseline.width}
               mapHeight={candidate.baseline.height}

@@ -42,7 +42,7 @@ export function MentionTray({
         const Icon =
           chip.mention.kind === "region"
             ? MapPinned
-            : chip.mention.kind === "stamp"
+            : chip.mention.kind === "stamp" || chip.mention.kind === "importedStamp"
               ? CopyPlus
               : chip.mention.kind === "object"
                 ? Box

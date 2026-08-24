@@ -15,9 +15,12 @@ import {
   minimapScreenToTile,
 } from "./MapMinimap";
 
+const renderSource = {
+  key: "candidate|r1:hash",
+  render: protocol.mapRender,
+};
 const baseProps = {
-  sessionId: "map-session",
-  revisionKey: "r1:hash",
+  renderSource,
   width: 100,
   height: 50,
   view: "candidate" as const,
@@ -93,8 +96,6 @@ describe("MapMinimap", () => {
 
     expect(protocol.mapRender).toHaveBeenCalledWith(
       expect.objectContaining({
-        sessionId: "map-session",
-        view: "candidate",
         x: 0,
         y: 0,
         width: 100,
@@ -113,9 +114,8 @@ describe("MapMinimap", () => {
       render(
         <MapMinimap
           {...baseProps}
-          revisionKey="r1:hash|draft:map-request:2"
+          renderSource={{ ...renderSource, key: "draft|map-request|2" }}
           view="draft"
-          requestId="map-request"
           onNavigate={vi.fn()}
         />,
       );
@@ -123,9 +123,10 @@ describe("MapMinimap", () => {
 
       expect(protocol.mapRender).toHaveBeenCalledWith(
         expect.objectContaining({
-          sessionId: "map-session",
-          view: "draft",
-          requestId: "map-request",
+          x: 0,
+          y: 0,
+          width: 100,
+          height: 50,
         }),
       );
       expect(screen.getByText("수정 중")).toBeInTheDocument();

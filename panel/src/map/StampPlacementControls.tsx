@@ -13,6 +13,7 @@ import type {
 
 export interface StampPlacementControlsProps {
   selection: SavedSelection;
+  sourceKind: "candidateSelection" | "imported";
   destination: StampDestination;
   mapWidth: number;
   mapHeight: number;
@@ -32,6 +33,7 @@ function countTotal(counts: StampLayerCounts): number {
 
 export function StampPlacementControls({
   selection,
+  sourceKind,
   destination,
   mapWidth,
   mapHeight,
@@ -94,7 +96,7 @@ export function StampPlacementControls({
             {selection.label}
           </div>
           <div className="text-[11px] text-muted-foreground">
-            {width}×{height}타일 · {selection.selectedCells.toLocaleString()}셀 · 현재 후보 원본
+            {width}×{height}타일 · {selection.selectedCells.toLocaleString()}셀 · {sourceKind === "imported" ? "외부 맵 고정 스냅샷" : "현재 후보 내용"}
           </div>
         </div>
         <Badge variant="outline">

@@ -10,6 +10,7 @@ import {
   mapSourceProbeChanged,
   nextSelectionLabel,
   reduceMapTurnEvent,
+  staleImportedMentions,
   staleMentions,
   advanceLiveDraftPreview,
   type LiveDraftPreview,
@@ -21,6 +22,7 @@ import type {
   MapSourceProbe,
   MentionChip,
 } from "./mapProtocol";
+import type { ImportedStampView } from "./importProtocol";
 
 function bootstrap(projectId: string, sourcePath: string): MapBootstrapResponse {
   return {
@@ -260,6 +262,7 @@ describe("Map Agent conversation timeline", () => {
   });
 });
 
+
 describe("Candidate mention freshness", () => {
   const candidate: CandidateStateView = {
     sessionId: "map-session",
@@ -330,5 +333,37 @@ describe("Candidate mention freshness", () => {
     );
 
     expect(stale.stale).toBe(true);
+  });
+});
+
+
+describe("Imported stamp mention freshness", () => {
+  it("marks deleted, unavailable, or snapshot-mismatched imported chips stale", () => {
+    const chip = {
+      id: "chip",
+      label: "imported:언덕",
+      mention: {
+        kind: "importedStamp" as const,
+        importId: "import-a",
+        snapshotHash: "snapshot-a",
+      },
+    };
+    const stamp = {
+      id: "import-a",
+      snapshotHash: "snapshot-a",
+      available: true,
+      compatible: true,
+    } as ImportedStampView;
+    expect(staleImportedMentions([chip], [stamp])[0].stale).toBe(false);
+    expect(staleImportedMentions([chip], [])[0].stale).toBe(true);
+    expect(
+      staleImportedMentions(
+        [chip],
+        [{ ...stamp, snapshotHash: "snapshot-b" }],
+      )[0].stale,
+    ).toBe(true);
+    expect(
+      staleImportedMentions([chip], [{ ...stamp, available: false }])[0].stale,
+    ).toBe(true);
   });
 });

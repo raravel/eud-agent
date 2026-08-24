@@ -2,6 +2,7 @@ import {
   CheckCircle2,
   GitCompareArrows,
   ImagePlus,
+  FolderInput,
   History,
   LoaderCircle,
   Map as MapIcon,
@@ -42,6 +43,7 @@ export interface MapToolbarProps {
   onApply(): void;
   onUndo(): void;
   onImagePlace(): void;
+  onMapImport(): void;
   onReloadSource(): void;
 }
 
@@ -72,6 +74,7 @@ export function MapToolbar({
   onApply,
   onUndo,
   onImagePlace,
+  onMapImport,
   onReloadSource,
 }: MapToolbarProps) {
   const sourceName =
@@ -213,6 +216,16 @@ export function MapToolbar({
             {reloadingSource ? "새 작업 여는 중…" : "변경된 원본으로 새 작업"}
           </Button>
         )}
+        <Button
+          type="button"
+          size="sm"
+          variant="outline"
+          disabled={busy}
+          onClick={onMapImport}
+        >
+          <FolderInput className="size-4" aria-hidden="true" />
+          다른 맵에서 가져오기
+        </Button>
         <Button
           type="button"
           size="sm"
