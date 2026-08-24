@@ -1093,14 +1093,15 @@ where
 
 /// Config overrides shared by read and write app-server processes. The active
 /// default profile is appended by [`app_server_config_overrides`].
-pub(crate) const APP_SERVER_CONFIG_OVERRIDES: [&str; 7] = [
+pub(crate) const APP_SERVER_CONFIG_OVERRIDES: [&str; 8] = [
     "skills.include_instructions=false",
     "project_doc_max_bytes=0",
     "model_supports_reasoning_summaries=true",
     "model_reasoning_summary=\"detailed\"",
+    "web_search=\"live\"",
     "windows.sandbox=\"elevated\"",
     "permissions.eud_workspace_read={description=\"eud-agent read-only session workspace\",filesystem={\":minimal\"=\"read\",\":workspace_roots\"={\".\"=\"read\"}},network={enabled=false}}",
-    "permissions.eud_workspace_write={description=\"eud-agent write-owner session workspace\",filesystem={\":minimal\"=\"read\",\":workspace_roots\"={\".\"=\"write\",\"source/**\"=\"read\"}},network={enabled=false}}",
+    "permissions.eud_workspace_write={description=\"eud-agent live-project writer with read-only documents\",filesystem={\":minimal\"=\"read\",\":workspace_roots\"={\".\"=\"read\",\".tmp/**\"=\"write\"}},network={enabled=false}}",
 ];
 
 pub(crate) fn app_server_config_overrides(access: WorkspaceAccess) -> Vec<String> {
@@ -1118,8 +1119,8 @@ pub(crate) fn app_server_config_overrides(access: WorkspaceAccess) -> Vec<String
 
 /// Params for a fresh thread. Project turns use the custom split-filesystem
 /// profile selected at app-server launch; tests/non-project callers retain the
-/// previous read-only policy. The session MCP config is repeated here because a
-/// resumed Codex thread can retain the config stored when that thread was created.
+/// previous read-only policy. Session config is repeated here because a resumed
+/// Codex thread can retain the config stored when that thread was created.
 fn thread_start_params(
     workspace_root: Option<&Path>,
     mcp_server_url: Option<&str>,
@@ -1131,9 +1132,7 @@ fn thread_start_params(
     } else {
         params["sandboxPolicy"] = serde_json::json!({ "type": "readOnly", "networkAccess": false });
     }
-    if let Some(config) = thread_config(mcp_server_url, large_context_enabled) {
-        params["config"] = config;
-    }
+    params["config"] = thread_config(mcp_server_url, large_context_enabled);
     Ok(params)
 }
 
@@ -1147,17 +1146,13 @@ fn thread_resume_params(
     if let Some(workspace_root) = workspace_root {
         params["cwd"] = serde_json::json!(path_text(workspace_root)?);
     }
-    if let Some(config) = thread_config(mcp_server_url, large_context_enabled) {
-        params["config"] = config;
-    }
+    params["config"] = thread_config(mcp_server_url, large_context_enabled);
     Ok(params)
 }
 
-fn thread_config(
-    mcp_server_url: Option<&str>,
-    large_context_enabled: bool,
-) -> Option<serde_json::Value> {
+fn thread_config(mcp_server_url: Option<&str>, large_context_enabled: bool) -> serde_json::Value {
     let mut config = serde_json::Map::new();
+    config.insert("web_search".to_string(), serde_json::json!("live"));
     if let Some(url) = mcp_server_url {
         config.insert(
             "mcp_servers".to_string(),
@@ -1178,7 +1173,7 @@ fn thread_config(
             serde_json::json!(LARGE_CONTEXT_AUTO_COMPACT_TOKENS),
         );
     }
-    (!config.is_empty()).then_some(serde_json::Value::Object(config))
+    serde_json::Value::Object(config)
 }
 
 fn path_text(path: &Path) -> Result<String, AppServerError> {
@@ -1846,6 +1841,7 @@ mod app_server_override_tests {
         assert!(APP_SERVER_CONFIG_OVERRIDES.contains(&"skills.include_instructions=false"));
         assert!(APP_SERVER_CONFIG_OVERRIDES.contains(&"project_doc_max_bytes=0"));
         assert!(APP_SERVER_CONFIG_OVERRIDES.contains(&"windows.sandbox=\"elevated\""));
+        assert!(APP_SERVER_CONFIG_OVERRIDES.contains(&"web_search=\"live\""));
         assert!(APP_SERVER_CONFIG_OVERRIDES
             .iter()
             .any(|value| value.starts_with("permissions.eud_workspace_read=")));
@@ -1860,6 +1856,13 @@ mod app_server_override_tests {
         assert!(write
             .iter()
             .any(|value| value == "default_permissions=\"eud_workspace_write\""));
+        let implementation_profile = APP_SERVER_CONFIG_OVERRIDES
+            .iter()
+            .find(|value| value.starts_with("permissions.eud_workspace_write="))
+            .unwrap();
+        assert!(implementation_profile.contains("\".\"=\"read\""));
+        assert!(implementation_profile.contains("\".tmp/**\"=\"write\""));
+        assert!(!implementation_profile.contains("\".\"=\"write\""));
     }
 
     #[test]
@@ -1896,6 +1899,21 @@ mod app_server_override_tests {
         assert_eq!(params["cwd"], serde_json::json!("C:\\workspace"));
         assert!(params.get("sandboxPolicy").is_none());
     }
+
+    #[test]
+    fn fresh_and_resumed_threads_enable_live_web_search() {
+        let start = super::thread_start_params(None, None, false).unwrap();
+        let resumed = super::thread_resume_params("thread-1", None, None, false).unwrap();
+        assert_eq!(
+            start.pointer("/config/web_search"),
+            Some(&serde_json::json!("live"))
+        );
+        assert_eq!(
+            resumed.pointer("/config/web_search"),
+            Some(&serde_json::json!("live"))
+        );
+    }
+
     #[test]
     fn large_context_opt_in_sets_native_window_and_auto_compaction_limit() {
         let params =
