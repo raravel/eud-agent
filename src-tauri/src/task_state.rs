@@ -1518,13 +1518,13 @@ pub fn compiler_output_schema() -> serde_json::Value {
       "minItems": 0,
       "maxItems": 128,
       "items": {
-        "oneOf": [
+        "anyOf": [
           {
             "type": "object",
             "additionalProperties": false,
             "required": ["op", "entity"],
             "properties": {
-              "op": { "const": "upsert" },
+              "op": { "type": "string", "const": "upsert" },
               "entity": { "$ref": "#/$defs/entity" }
             }
           },
@@ -1533,7 +1533,7 @@ pub fn compiler_output_schema() -> serde_json::Value {
             "additionalProperties": false,
             "required": ["op", "factId", "replacementId"],
             "properties": {
-              "op": { "const": "supersede" },
+              "op": { "type": "string", "const": "supersede" },
               "factId": { "type": "string" },
               "replacementId": { "type": ["string", "null"] }
             }
@@ -1543,7 +1543,7 @@ pub fn compiler_output_schema() -> serde_json::Value {
             "additionalProperties": false,
             "required": ["op", "factId"],
             "properties": {
-              "op": { "const": "remove" },
+              "op": { "type": "string", "const": "remove" },
               "factId": { "type": "string" }
             }
           },
@@ -1552,7 +1552,7 @@ pub fn compiler_output_schema() -> serde_json::Value {
             "additionalProperties": false,
             "required": ["op", "requestId"],
             "properties": {
-              "op": { "const": "close_request" },
+              "op": { "type": "string", "const": "close_request" },
               "requestId": { "type": "string" }
             }
           }
@@ -1566,13 +1566,13 @@ pub fn compiler_output_schema() -> serde_json::Value {
       "enum": ["proposed", "active", "accepted", "rejected", "superseded"]
     },
     "provenance": {
-      "oneOf": [
+      "anyOf": [
         {
           "type": "object",
           "additionalProperties": false,
           "required": ["kind", "clientTurnId", "exactQuote"],
           "properties": {
-            "kind": { "const": "user_turn" },
+            "kind": { "type": "string", "const": "user_turn" },
             "clientTurnId": { "type": "string" },
             "exactQuote": { "type": "string", "minLength": 1, "maxLength": 2048 }
           }
@@ -1582,7 +1582,7 @@ pub fn compiler_output_schema() -> serde_json::Value {
           "additionalProperties": false,
           "required": ["kind", "requestId", "sha256", "exactQuote"],
           "properties": {
-            "kind": { "const": "approved_plan" },
+            "kind": { "type": "string", "const": "approved_plan" },
             "requestId": { "type": "string" },
             "sha256": { "type": "string", "pattern": "^[0-9a-fA-F]{64}$" },
             "exactQuote": { "type": "string", "minLength": 1, "maxLength": 2048 }
@@ -1593,7 +1593,7 @@ pub fn compiler_output_schema() -> serde_json::Value {
           "additionalProperties": false,
           "required": ["kind", "path", "sha256", "exactQuote"],
           "properties": {
-            "kind": { "const": "project_artifact" },
+            "kind": { "type": "string", "const": "project_artifact" },
             "path": { "type": "string" },
             "sha256": { "type": "string", "pattern": "^[0-9a-fA-F]{64}$" },
             "exactQuote": { "type": "string", "minLength": 1, "maxLength": 2048 }
@@ -1604,7 +1604,7 @@ pub fn compiler_output_schema() -> serde_json::Value {
           "additionalProperties": false,
           "required": ["kind", "requestId", "entryId"],
           "properties": {
-            "kind": { "const": "accepted_journal" },
+            "kind": { "type": "string", "const": "accepted_journal" },
             "requestId": { "type": "string" },
             "entryId": { "type": "string" }
           }
@@ -1659,7 +1659,7 @@ pub fn compiler_output_schema() -> serde_json::Value {
       }
     },
     "entity": {
-      "oneOf": [
+      "anyOf": [
         { "$ref": "#/$defs/topicEntity" },
         { "$ref": "#/$defs/goalEntity" },
         { "$ref": "#/$defs/targetSetEntity" },
@@ -1673,42 +1673,42 @@ pub fn compiler_output_schema() -> serde_json::Value {
     "topicEntity": {
       "type": "object", "additionalProperties": false,
       "required": ["entityType", "fact"],
-      "properties": { "entityType": { "const": "topic" }, "fact": { "$ref": "#/$defs/fact" } }
+      "properties": { "entityType": { "type": "string", "const": "topic" }, "fact": { "$ref": "#/$defs/fact" } }
     },
     "goalEntity": {
       "type": "object", "additionalProperties": false,
       "required": ["entityType", "fact"],
-      "properties": { "entityType": { "const": "goal" }, "fact": { "$ref": "#/$defs/fact" } }
+      "properties": { "entityType": { "type": "string", "const": "goal" }, "fact": { "$ref": "#/$defs/fact" } }
     },
     "targetSetEntity": {
       "type": "object", "additionalProperties": false,
       "required": ["entityType", "targetSet"],
-      "properties": { "entityType": { "const": "target_set" }, "targetSet": { "$ref": "#/$defs/targetSet" } }
+      "properties": { "entityType": { "type": "string", "const": "target_set" }, "targetSet": { "$ref": "#/$defs/targetSet" } }
     },
     "constraintEntity": {
       "type": "object", "additionalProperties": false,
       "required": ["entityType", "fact"],
-      "properties": { "entityType": { "const": "constraint" }, "fact": { "$ref": "#/$defs/fact" } }
+      "properties": { "entityType": { "type": "string", "const": "constraint" }, "fact": { "$ref": "#/$defs/fact" } }
     },
     "decisionEntity": {
       "type": "object", "additionalProperties": false,
       "required": ["entityType", "fact"],
-      "properties": { "entityType": { "const": "decision" }, "fact": { "$ref": "#/$defs/fact" } }
+      "properties": { "entityType": { "type": "string", "const": "decision" }, "fact": { "$ref": "#/$defs/fact" } }
     },
     "artifactEntity": {
       "type": "object", "additionalProperties": false,
       "required": ["entityType", "artifact"],
-      "properties": { "entityType": { "const": "authoritative_artifact" }, "artifact": { "$ref": "#/$defs/artifact" } }
+      "properties": { "entityType": { "type": "string", "const": "authoritative_artifact" }, "artifact": { "$ref": "#/$defs/artifact" } }
     },
     "blockerEntity": {
       "type": "object", "additionalProperties": false,
       "required": ["entityType", "fact"],
-      "properties": { "entityType": { "const": "blocker" }, "fact": { "$ref": "#/$defs/fact" } }
+      "properties": { "entityType": { "type": "string", "const": "blocker" }, "fact": { "$ref": "#/$defs/fact" } }
     },
     "criterionEntity": {
       "type": "object", "additionalProperties": false,
       "required": ["entityType", "fact"],
-      "properties": { "entityType": { "const": "acceptance_criterion" }, "fact": { "$ref": "#/$defs/fact" } }
+      "properties": { "entityType": { "type": "string", "const": "acceptance_criterion" }, "fact": { "$ref": "#/$defs/fact" } }
     }
   }
 }"##,
@@ -1760,6 +1760,38 @@ mod tests {
         )
     }
 
+    #[test]
+    fn compiler_output_schema_uses_supported_union_and_constant_shapes() {
+        fn assert_typed_constants(value: &serde_json::Value) -> usize {
+            match value {
+                serde_json::Value::Object(schema) => {
+                    assert!(
+                        !schema.contains_key("oneOf"),
+                        "compiler schema must use the supported anyOf composition"
+                    );
+                    let current = if let Some(constant) = schema.get("const") {
+                        assert!(
+                            constant.is_string(),
+                            "compiler schema constant must be a string: {constant}"
+                        );
+                        assert_eq!(
+                            schema.get("type").and_then(|value| value.as_str()),
+                            Some("string"),
+                            "compiler schema constant lacks an explicit string type: {constant}"
+                        );
+                        1
+                    } else {
+                        0
+                    };
+                    current + schema.values().map(assert_typed_constants).sum::<usize>()
+                }
+                serde_json::Value::Array(values) => values.iter().map(assert_typed_constants).sum(),
+                _ => 0,
+            }
+        }
+
+        assert_eq!(assert_typed_constants(&compiler_output_schema()), 16);
+    }
     #[test]
     fn compilation_failure_detail_is_bounded_and_legacy_compatible() {
         let legacy: TaskStateEventKind = serde_json::from_str(
