@@ -1,4 +1,5 @@
 import {
+  startTransition,
   useCallback,
   useEffect,
   useMemo,
@@ -688,7 +689,6 @@ export default function MapAgentApp() {
   }>();
   const [mentions, setMentions] = useState<MentionChip[]>([]);
   const [selectedMentionId, setSelectedMentionId] = useState<string>();
-  const [prompt, setPrompt] = useState("");
   const [conversation, setConversation] = useState<MapConversationEntry[]>([]);
   const [turn, setTurn] = useState<TurnState>(createMapTurn);
   const [turnInFlight, setTurnInFlight] = useState(false);
@@ -951,7 +951,6 @@ export default function MapAgentApp() {
       if (sessionChanged || sourceChanged) {
         setMentions([]);
         setSelectedMentionId(undefined);
-        setPrompt("");
         resetTurn();
         markTurnInFlight(false);
         setAsk(undefined);
@@ -1209,21 +1208,6 @@ export default function MapAgentApp() {
               ? { status: rawData.status }
               : {}),
           };
-          setLiveDraft((current) =>
-            advanceLiveDraftPreview(current, {
-              kind,
-              detail,
-              status: data.status,
-              requestId:
-                typeof payload.requestId === "string"
-                  ? payload.requestId
-                  : undefined,
-              candidateRevision:
-                typeof payload.candidateRevision === "string"
-                  ? payload.candidateRevision
-                  : undefined,
-            }),
-          );
           const next = reduceMapTurnEvent(
             turnRef.current,
             turnCursorRef.current,
@@ -1233,7 +1217,24 @@ export default function MapAgentApp() {
           );
           turnRef.current = next.turn;
           turnCursorRef.current = next.cursor;
-          setTurn(next.turn);
+          startTransition(() => {
+            setLiveDraft((current) =>
+              advanceLiveDraftPreview(current, {
+                kind,
+                detail,
+                status: data.status,
+                requestId:
+                  typeof payload.requestId === "string"
+                    ? payload.requestId
+                    : undefined,
+                candidateRevision:
+                  typeof payload.candidateRevision === "string"
+                    ? payload.candidateRevision
+                    : undefined,
+              }),
+            );
+            setTurn(next.turn);
+          });
         }),
       );
       unlisteners.push(
@@ -1967,14 +1968,13 @@ export default function MapAgentApp() {
   );
 
   const send = useCallback(
-    async (attachments: ChatAttachment[]) => {
+    async (text: string, attachments: ChatAttachment[]) => {
       if (!bootstrap || !candidate || busy || turnInFlight) return;
       const compactRequested =
-        prompt.trim() === "/compact" &&
+        text.trim() === "/compact" &&
         mentions.length === 0 &&
         attachments.length === 0;
       if (compactRequested) {
-        setPrompt("");
         setBusy(true);
         logSequenceRef.current += 1;
         setConversation((entries) => [
@@ -2020,7 +2020,7 @@ export default function MapAgentApp() {
       }
       const activeMentions = mentions;
       if (
-        !prompt.trim() &&
+        !text.trim() &&
         activeMentions.length === 0 &&
         attachments.length === 0
       ) {
@@ -2036,7 +2036,7 @@ export default function MapAgentApp() {
           id: logSequenceRef.current,
           kind: "you",
           text:
-            prompt.trim() ||
+            text.trim() ||
             (activeMentions.length > 0
               ? "구조화된 맵 멘션을 반영해 주세요."
               : "첨부 파일을 분석해 주세요."),
@@ -2048,8 +2048,6 @@ export default function MapAgentApp() {
       turnEndedRef.current = false;
       markTurnInFlight(true);
       setAsk(undefined);
-      const text = prompt;
-      setPrompt("");
       try {
         const next = await mapChat({
           sessionId: bootstrap.session.id,
@@ -2094,7 +2092,6 @@ export default function MapAgentApp() {
       candidate,
       markTurnInFlight,
       mentions,
-      prompt,
       refreshObjects,
       resetTurn,
       turnInFlight,
@@ -2530,15 +2527,14 @@ export default function MapAgentApp() {
           contextUsage={contextUsage}
           codexSettings={codexSettings}
           codexSettingsBusy={codexSettingsBusy}
-          text={prompt}
           mentions={mentions}
           selectedMentionId={selectedMentionId}
           ask={ask}
           selections={candidate.selections}
           mapWidth={candidate.baseline.width}
           mapHeight={candidate.baseline.height}
-          onText={setPrompt}
-          onSend={(attachments) => void send(attachments)}
+          draftScope={`${bootstrap.session.id}|${bootstrap.context.revision.projectId}|${bootstrap.context.revision.fileSha256}`}
+          onSend={(text, attachments) => void send(text, attachments)}
           onCancel={() => void cancelTurn()}
           onStageAttachment={stageAttachment}
           onDiscardAttachment={discardAttachment}

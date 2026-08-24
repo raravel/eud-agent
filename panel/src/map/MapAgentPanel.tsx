@@ -33,15 +33,14 @@ export interface MapAgentPanelProps {
   contextUsage?: ContextUsage | null;
   codexSettings?: CodexModelSettings | null;
   codexSettingsBusy?: boolean;
-  text: string;
   mentions: MentionChip[];
   selectedMentionId?: string;
   ask?: { requestId: string; questions: AskQuestion[]; submitting: boolean };
   selections: SavedSelection[];
   mapWidth: number;
   mapHeight: number;
-  onText(text: string): void;
-  onSend(attachments: ChatAttachment[]): void;
+  draftScope: string;
+  onSend(text: string, attachments: ChatAttachment[]): void;
   onCancel(): void;
   onStageAttachment?(file: File): Promise<ChatAttachment>;
   onDiscardAttachment?(id: string): Promise<void>;
@@ -65,14 +64,13 @@ export function MapAgentPanel({
   contextUsage,
   codexSettings,
   codexSettingsBusy,
-  text,
   mentions,
   selectedMentionId,
   ask,
   selections,
   mapWidth,
   mapHeight,
-  onText,
+  draftScope,
   onSend,
   onCancel,
   onStageAttachment,
@@ -157,15 +155,14 @@ export function MapAgentPanel({
 
       <MapPromptInput
         turn={turn}
-        text={text}
         live={live}
         actionBusy={actionBusy}
         mentionCount={mentions.length}
         hasStaleMentions={mentions.some((chip) => chip.stale)}
+        draftScope={draftScope}
         contextUsage={contextUsage}
         codexSettings={codexSettings}
         codexSettingsBusy={codexSettingsBusy}
-        onText={onText}
         onSend={onSend}
         onCancel={onCancel}
         onStageAttachment={onStageAttachment}

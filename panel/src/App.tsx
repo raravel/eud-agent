@@ -16,6 +16,7 @@
  * and the RAG warmup state/timing (for the Header pill).
  */
 import {
+  startTransition,
   useCallback,
   useEffect,
   useMemo,
@@ -641,9 +642,15 @@ export default function App() {
           }
           break;
         }
-        case "agent_event":
-          sessionStore()?.agentEvent(msg.kind, msg.detail, msg.data);
+        case "agent_event": {
+          const target = sessionStore();
+          if (target) {
+            startTransition(() =>
+              target.agentEvent(msg.kind, msg.detail, msg.data),
+            );
+          }
           break;
+        }
         case "context_usage":
           sessionStore()?.contextUsageReceived(msg.tokenUsage);
           break;

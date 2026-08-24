@@ -56,12 +56,11 @@ function renderInput(
 ) {
   return render(
     <MapPromptInput
-      text=""
       turn={idleTurn}
       live={false}
       mentionCount={0}
       hasStaleMentions={false}
-      onText={noop}
+      draftScope="session-a|project-a|source-a"
       onSend={noop}
       onCancel={noop}
       {...props}
@@ -73,11 +72,14 @@ describe("MapPromptInput — AI Elements composer", () => {
   it("keeps the literal Send action, model controls, and context inside the input group", async () => {
     const user = userEvent.setup();
     const { container } = renderInput({
-      text: "지형을 수정해 줘",
       codexSettings,
       contextUsage,
       onCodexSettingsChange: noop,
     });
+    await user.type(
+      screen.getByRole("textbox", { name: "맵 요청 입력" }),
+      "지형을 수정해 줘",
+    );
 
     const group = container.querySelector('[data-slot="input-group"]');
     const send = screen.getByRole("button", { name: "전송" });
@@ -92,6 +94,44 @@ describe("MapPromptInput — AI Elements composer", () => {
 
     await user.hover(screen.getByRole("button", { name: /컨텍스트 .* 사용/ }));
     expect(await screen.findByText("세션 누적")).toBeInTheDocument();
+  });
+
+  it("owns the text draft, sends it with attachments, and clears after submission", async () => {
+    const user = userEvent.setup();
+    const onSend = vi.fn();
+    renderInput({ onSend });
+
+    const input = screen.getByRole("textbox", { name: "맵 요청 입력" });
+    await user.type(input, "정글 지형으로 바꿔줘");
+    expect(input).toHaveValue("정글 지형으로 바꿔줘");
+
+    await user.click(screen.getByRole("button", { name: "전송" }));
+
+    expect(onSend).toHaveBeenCalledWith("정글 지형으로 바꿔줘", []);
+    expect(input).toHaveValue("");
+  });
+
+  it("clears the local text draft when the session or source scope changes", async () => {
+    const user = userEvent.setup();
+    const { rerender } = renderInput({
+      draftScope: "session-a|project-a|source-a",
+    });
+    const input = screen.getByRole("textbox", { name: "맵 요청 입력" });
+    await user.type(input, "아직 보내지 않은 요청");
+
+    rerender(
+      <MapPromptInput
+        turn={idleTurn}
+        live={false}
+        mentionCount={0}
+        hasStaleMentions={false}
+        draftScope="session-b|project-a|source-b"
+        onSend={noop}
+        onCancel={noop}
+      />,
+    );
+
+    expect(input).toHaveValue("");
   });
 
   it("stages and sends an attachment-only request", async () => {
@@ -113,7 +153,7 @@ describe("MapPromptInput — AI Elements composer", () => {
     await user.click(screen.getByRole("button", { name: "전송" }));
 
     expect(onStageAttachment).toHaveBeenCalledWith(file);
-    expect(onSend).toHaveBeenCalledWith([attachment]);
+    expect(onSend).toHaveBeenCalledWith("", [attachment]);
   });
 
   it("accepts dropped text files and pasted clipboard images", async () => {

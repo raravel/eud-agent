@@ -6,7 +6,7 @@
  * (`editorConnected: true`) and gates send only once the backend explicitly
  * reports the editor is not connected.
  */
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import { createPanelStore } from "@/state/store";
 
 function freshStore() {
@@ -55,6 +55,21 @@ describe("editor connection state", () => {
 
     expect(store.getState().editorConnected).toBe(true);
     expect(store.getState().canSend).toBe(true);
+  });
+
+  it("does not publish an identical periodic status snapshot", () => {
+    const store = freshStore();
+    const listener = vi.fn();
+    const unsubscribe = store.subscribe(listener);
+
+    store.applyStatus({ compiling: false, project: "P" });
+    store.applyStatus({ compiling: false, project: "P" });
+
+    expect(listener).toHaveBeenCalledTimes(1);
+
+    store.applyStatus({ compiling: true, project: "P" });
+    expect(listener).toHaveBeenCalledTimes(2);
+    unsubscribe();
   });
 
   it("exposes an explicit editor connection setter", () => {

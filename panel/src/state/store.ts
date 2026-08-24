@@ -702,10 +702,20 @@ export function createPanelStore(): PanelStore {
 
     // ---- inbound server events ----
     applyStatus(msg) {
-      // A status push means the bridge heartbeat is alive.
+      // A status push means the bridge heartbeat is alive. The 2s liveness poll
+      // must not publish an identical snapshot and rerender every session.
+      const project = msg.project ?? "";
+      const compiling = msg.compiling ?? false;
+      if (
+        core.editorConnected &&
+        core.project === project &&
+        core.compiling === compiling
+      ) {
+        return;
+      }
       core.editorConnected = true;
-      core.project = msg.project ?? "";
-      core.compiling = msg.compiling ?? false;
+      core.project = project;
+      core.compiling = compiling;
       emit();
     },
 

@@ -1,4 +1,5 @@
 import {
+  useEffect,
   useRef,
   useState,
   type ClipboardEvent,
@@ -38,17 +39,16 @@ import type {
 import type { TurnState } from "@/state/store";
 
 export interface MapPromptInputProps {
-  text: string;
   turn: TurnState;
   live: boolean;
   actionBusy?: boolean;
   mentionCount: number;
   hasStaleMentions: boolean;
+  draftScope: string;
   contextUsage?: ContextUsage | null;
   codexSettings?: CodexModelSettings | null;
   codexSettingsBusy?: boolean;
-  onText(text: string): void;
-  onSend(attachments: ChatAttachment[]): void;
+  onSend(text: string, attachments: ChatAttachment[]): void;
   onCancel(): void;
   onStageAttachment?(file: File): Promise<ChatAttachment>;
   onDiscardAttachment?(id: string): Promise<void>;
@@ -57,16 +57,15 @@ export interface MapPromptInputProps {
 }
 
 export function MapPromptInput({
-  text,
   turn,
   live,
   actionBusy = false,
   mentionCount,
   hasStaleMentions,
+  draftScope,
   contextUsage,
   codexSettings,
   codexSettingsBusy = false,
-  onText,
   onSend,
   onCancel,
   onStageAttachment,
@@ -74,6 +73,7 @@ export function MapPromptInput({
   onCodexSettingsChange,
   onCodexSettingsReload,
 }: MapPromptInputProps) {
+  const [text, setText] = useState("");
   const [attachments, setAttachments] = useState<ChatAttachment[]>([]);
   const [attachmentError, setAttachmentError] = useState<string | null>(null);
   const [staging, setStaging] = useState(false);
@@ -81,6 +81,10 @@ export function MapPromptInput({
   const stagingRef = useRef(false);
   const dragDepth = useRef(0);
   const fileInput = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    setText("");
+  }, [draftScope]);
 
   const attachmentInputDisabled =
     live || actionBusy || staging || onStageAttachment === undefined;
@@ -156,7 +160,8 @@ export function MapPromptInput({
 
   function handleSend() {
     if (!canSend || stagingRef.current) return;
-    onSend(attachments);
+    onSend(text, attachments);
+    setText("");
     setAttachments([]);
     setAttachmentError(null);
   }
@@ -272,7 +277,7 @@ export function MapPromptInput({
             value={text}
             disabled={actionBusy}
             placeholder="예: target 영역 안에 P5 벙커 2개와 어울리는 정글 지형을 구성해줘"
-            onChange={(event) => onText(event.target.value)}
+            onChange={(event) => setText(event.target.value)}
             onPaste={handlePaste}
           />
         </PromptInputBody>
