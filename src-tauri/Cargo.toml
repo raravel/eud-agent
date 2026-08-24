@@ -49,6 +49,7 @@ axum = "0.8.4"
 
 [target.'cfg(windows)'.dependencies]
 tauri-winrt-notification = "0.7"
+dunce = "1"
 windows-registry = "0.5"
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",

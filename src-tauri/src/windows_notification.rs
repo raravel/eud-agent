@@ -10,6 +10,7 @@ use tauri_winrt_notification::{IconCrop, Toast};
 use windows_registry::CURRENT_USER;
 
 const NOTIFICATION_ICON_RESOURCE: &str = "icons/notification.png";
+const ICON_BACKGROUND_COLOR: &str = "FF001126";
 static IDENTITY_REGISTRATION: OnceLock<Result<(), String>> = OnceLock::new();
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -21,7 +22,21 @@ pub struct NotificationActivatedEvent {
 fn notification_icon(app: &AppHandle) -> Result<PathBuf, String> {
     app.path()
         .resolve(NOTIFICATION_ICON_RESOURCE, BaseDirectory::Resource)
+        .map(|path| dunce::simplified(&path).to_path_buf())
         .map_err(|error| format!("failed to resolve notification icon: {error}"))
+}
+
+fn toast_icon_source(icon: &Path) -> Result<PathBuf, String> {
+    let uri = tauri::Url::from_file_path(icon).map_err(|_| {
+        format!(
+            "failed to convert notification icon to a file URI: {}",
+            icon.display()
+        )
+    })?;
+    uri.as_str()
+        .strip_prefix("file:///")
+        .map(PathBuf::from)
+        .ok_or_else(|| format!("notification icon is not a local file: {}", icon.display()))
 }
 
 fn register_identity(app: &AppHandle, icon: &Path) -> Result<(), String> {
@@ -32,7 +47,7 @@ fn register_identity(app: &AppHandle, icon: &Path) -> Result<(), String> {
         .map_err(|error| format!("failed to register notification identity: {error}"))?;
     key.set_string("DisplayName", display_name)
         .map_err(|error| format!("failed to register notification display name: {error}"))?;
-    key.set_string("IconBackgroundColor", "0")
+    key.set_string("IconBackgroundColor", ICON_BACKGROUND_COLOR)
         .map_err(|error| format!("failed to register notification icon background: {error}"))?;
     key.set_hstring("IconUri", &icon.into())
         .map_err(|error| format!("failed to register notification icon: {error}"))?;
@@ -51,6 +66,7 @@ pub fn show(app: &AppHandle, title: &str, body: &str, session_id: &str) -> Resul
     }
 
     let icon = notification_icon(app)?;
+    let toast_icon = toast_icon_source(&icon)?;
     ensure_identity(app, &icon)?;
 
     let activation_app = app.clone();
@@ -58,7 +74,7 @@ pub fn show(app: &AppHandle, title: &str, body: &str, session_id: &str) -> Resul
     Toast::new(&app.config().identifier)
         .title(title)
         .text1(body)
-        .icon(&icon, IconCrop::Square, "eud-agent")
+        .icon(&toast_icon, IconCrop::Square, "eud-agent")
         .sound(None)
         .on_activated(move |_| {
             if let Some(window) = activation_app.get_webview_window("main") {
@@ -92,6 +108,28 @@ mod tests {
             })
             .unwrap(),
             serde_json::json!({"sessionId": "session-a"})
+        );
+    }
+
+    #[test]
+    fn shell_icon_path_drops_the_verbatim_prefix() {
+        let path =
+            Path::new(r"\\?\C:\Users\example\AppData\Local\eud-agent\icons\notification.png");
+        assert_eq!(
+            dunce::simplified(path),
+            Path::new(r"C:\Users\example\AppData\Local\eud-agent\icons\notification.png")
+        );
+    }
+
+    #[test]
+    fn toast_icon_source_is_a_percent_encoded_file_uri_path() {
+        let source = toast_icon_source(Path::new(
+            r"C:\Users\Test User\AppData\Local\eud-agent\icons\notification.png",
+        ))
+        .unwrap();
+        assert_eq!(
+            source,
+            PathBuf::from("C:/Users/Test%20User/AppData/Local/eud-agent/icons/notification.png")
         );
     }
 }
