@@ -145,6 +145,9 @@ new writers.
   viewer-only workspace explorer. `workspace_list` refreshes the EPS source mirror and
   returns durable documents plus `source/`; selecting a file calls confined
   `workspace_read`. `specs/` sorts first, `specs/index.md` is the default wiki home, and
+  The file tree and document preview stack vertically with a pointer/touch splitter. Browser
+  storage restores the last tree height or either collapsed extreme across explorer instances;
+  the first open retains the previous 192 px tree height.
   Markdown renders in Streamdown static mode. Existing relative Markdown links that resolve
   to listed workspace files are rewritten to a reserved safe HTTPS target and intercepted
   as in-explorer navigation; external links retain the normal safe browser path.

@@ -1,5 +1,5 @@
 import { fireEvent, render, screen } from "@testing-library/react";
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { WorkspaceView } from "./WorkspaceView";
 import type { WorkspaceListResponse } from "@/lib/ipc";
@@ -22,6 +22,10 @@ function callbacks() {
 }
 
 describe("WorkspaceView", () => {
+  beforeEach(() => {
+    localStorage.clear();
+  });
+
   it("renders the document tree and a Markdown preview", () => {
     const handlers = callbacks();
     const { container } = render(
@@ -187,5 +191,106 @@ describe("WorkspaceView", () => {
       />,
     );
     expect(screen.getByRole("alert")).toHaveTextContent("읽기 실패");
+  });
+
+  it("resizes the file tree vertically and restores the persisted height", () => {
+    const firstView = render(
+      <WorkspaceView
+        workspace={workspace}
+        selectedPath="specs/combat.md"
+        selectedContent="# Combat specification"
+        loading={false}
+        error={null}
+        {...callbacks()}
+      />,
+    );
+    const splitter = screen.getByRole("separator", {
+      name: "파일 트리와 문서 높이 조절",
+    });
+    vi.spyOn(splitter.parentElement!.parentElement!, "getBoundingClientRect").mockReturnValue({
+      bottom: 600,
+      height: 600,
+      left: 0,
+      right: 344,
+      top: 0,
+      width: 344,
+      x: 0,
+      y: 0,
+      toJSON: () => ({}),
+    });
+
+    fireEvent.pointerDown(splitter, { pointerId: 1, clientY: 192 });
+    fireEvent.pointerMove(splitter, { pointerId: 1, clientY: 292 });
+    fireEvent.pointerUp(splitter, { pointerId: 1, clientY: 292 });
+
+    expect(
+      screen.getByRole("navigation", { name: "워크스페이스 파일" }),
+    ).toHaveStyle({ height: "292px" });
+    expect(localStorage.getItem("eud.workspace.split")).toBe(
+      '{"treeHeight":292,"collapsed":null}',
+    );
+
+    firstView.unmount();
+    render(
+      <WorkspaceView
+        workspace={workspace}
+        selectedPath="specs/combat.md"
+        selectedContent="# Combat specification"
+        loading={false}
+        error={null}
+        {...callbacks()}
+      />,
+    );
+    expect(
+      screen.getByRole("navigation", { name: "워크스페이스 파일" }),
+    ).toHaveStyle({ height: "292px" });
+  });
+
+  it("collapses and restores either side of the workspace splitter", () => {
+    const view = render(
+      <WorkspaceView
+        workspace={workspace}
+        selectedPath="specs/combat.md"
+        selectedContent="# Combat specification"
+        loading={false}
+        error={null}
+        {...callbacks()}
+      />,
+    );
+    const fileTree = screen.getByRole("navigation", {
+      name: "워크스페이스 파일",
+    });
+    const preview = screen.getByRole("article");
+
+    fireEvent.click(screen.getByRole("button", { name: "파일 트리 접기" }));
+    expect(fileTree).not.toBeVisible();
+    expect(preview).toBeVisible();
+    expect(
+      screen.getByRole("button", { name: "파일 트리 펼치기" }),
+    ).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "파일 트리 펼치기" }));
+    fireEvent.click(screen.getByRole("button", { name: "문서 미리보기 접기" }));
+    expect(fileTree).toBeVisible();
+    expect(preview).not.toBeVisible();
+    expect(localStorage.getItem("eud.workspace.split")).toBe(
+      '{"treeHeight":192,"collapsed":"preview"}',
+    );
+
+    view.unmount();
+    render(
+      <WorkspaceView
+        workspace={workspace}
+        selectedPath="specs/combat.md"
+        selectedContent="# Combat specification"
+        loading={false}
+        error={null}
+        {...callbacks()}
+      />,
+    );
+    expect(
+      screen.getByRole("button", { name: "문서 미리보기 펼치기" }),
+    ).toBeInTheDocument();
+    expect(screen.getByRole("article", { hidden: true })).not.toBeVisible();
   });
 });

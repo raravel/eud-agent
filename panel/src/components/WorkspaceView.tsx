@@ -1,9 +1,12 @@
-import { type MouseEvent, useMemo } from "react";
+import { type MouseEvent, useEffect, useMemo, useRef, useState } from "react";
 import {
   BookOpen,
+  ChevronDown,
+  ChevronUp,
   Code2,
   FileText,
   FolderTree,
+  GripHorizontal,
   RefreshCw,
   X,
 } from "lucide-react";
@@ -37,6 +40,56 @@ interface FileGroup {
 
 const DIRECTORY_ORDER = ["specs", "plans", "decisions", "worklog", "source"];
 const WORKSPACE_LINK_PREFIX = "https://workspace.invalid/";
+const WORKSPACE_SPLIT_KEY = "eud.workspace.split";
+const DEFAULT_TREE_HEIGHT = 192;
+const MIN_PANEL_HEIGHT = 120;
+const SPLITTER_HEIGHT = 48;
+const COLLAPSE_THRESHOLD = 48;
+const MAX_STORED_TREE_HEIGHT = 1600;
+
+type WorkspaceCollapsedPanel = "tree" | "preview" | null;
+
+interface WorkspaceSplitState {
+  treeHeight: number;
+  collapsed: WorkspaceCollapsedPanel;
+}
+
+function storedWorkspaceSplit(): WorkspaceSplitState {
+  const fallback = { treeHeight: DEFAULT_TREE_HEIGHT, collapsed: null };
+  if (typeof localStorage === "undefined") return fallback;
+  try {
+    const stored = localStorage.getItem(WORKSPACE_SPLIT_KEY);
+    if (stored === null) return fallback;
+    const parsed = JSON.parse(stored) as Partial<WorkspaceSplitState>;
+    const treeHeight = Number(parsed.treeHeight);
+    if (!Number.isFinite(treeHeight)) return fallback;
+    const collapsed =
+      parsed.collapsed === "tree" || parsed.collapsed === "preview"
+        ? parsed.collapsed
+        : null;
+    return {
+      treeHeight: Math.min(
+        MAX_STORED_TREE_HEIGHT,
+        Math.max(MIN_PANEL_HEIGHT, Math.round(treeHeight)),
+      ),
+      collapsed,
+    };
+  } catch {
+    return fallback;
+  }
+}
+
+function clampTreeHeight(height: number, containerHeight: number): number {
+  const availableHeight = Math.max(0, containerHeight - SPLITTER_HEIGHT);
+  const maximumHeight = Math.max(
+    MIN_PANEL_HEIGHT,
+    availableHeight - MIN_PANEL_HEIGHT,
+  );
+  return Math.round(
+    Math.min(maximumHeight, Math.max(MIN_PANEL_HEIGHT, height)),
+  );
+}
+
 
 function directoryRank(directory: string): number {
   const root = directory.split("/", 1)[0];
@@ -159,6 +212,20 @@ export function WorkspaceView({
 }: WorkspaceViewProps) {
   const groups = useMemo(() => groupFiles(workspace.files), [workspace.files]);
   const selected = workspace.files.find((file) => file.path === selectedPath) ?? null;
+  const [splitState, setSplitState] = useState(storedWorkspaceSplit);
+  const splitContainerRef = useRef<HTMLDivElement>(null);
+  const splitDragRef = useRef<{
+    startY: number;
+    startHeight: number;
+    containerHeight: number;
+  } | null>(null);
+  useEffect(() => {
+    try {
+      localStorage.setItem(WORKSPACE_SPLIT_KEY, JSON.stringify(splitState));
+    } catch {
+      // Split persistence is optional; the current window keeps local state.
+    }
+  }, [splitState]);
   const markdown = selectedPath?.toLowerCase().endsWith(".md") ?? false;
   const markdownContent = useMemo(
     () =>
@@ -252,14 +319,24 @@ export function WorkspaceView({
         </div>
       </header>
 
-      <div className={cn("flex min-h-0 flex-1", embedded && "flex-col")}>
+      <div ref={splitContainerRef} className="flex min-h-0 flex-1 flex-col">
         <nav
           aria-label="워크스페이스 파일"
+          hidden={splitState.collapsed === "tree"}
+          style={
+            splitState.collapsed === null
+              ? {
+                  height: splitState.treeHeight,
+                  maxHeight: `calc(100% - ${MIN_PANEL_HEIGHT + SPLITTER_HEIGHT}px)`,
+                }
+              : undefined
+          }
           className={cn(
-            "shrink-0 overflow-y-auto bg-card/30 p-2",
-            embedded
-              ? "max-h-48 w-full border-b border-border"
-              : "w-[17rem] border-r border-border",
+            "w-full overflow-y-auto bg-card/30 p-2",
+            splitState.collapsed === "preview"
+              ? "min-h-0 flex-1"
+              : "shrink-0",
+            splitState.collapsed === "tree" && "hidden",
           )}
         >
           {groups.length === 0 ? (
@@ -308,7 +385,159 @@ export function WorkspaceView({
           )}
         </nav>
 
-        <article className="flex min-w-0 flex-1 flex-col overflow-hidden">
+        <div className="flex h-12 shrink-0 items-center border-y border-border bg-card/60">
+          <div
+            role="separator"
+            aria-orientation="horizontal"
+            aria-label="파일 트리와 문서 높이 조절"
+            title="드래그하여 파일 트리와 문서 높이 조절"
+            onDoubleClick={() =>
+              setSplitState({
+                treeHeight: DEFAULT_TREE_HEIGHT,
+                collapsed: null,
+              })
+            }
+            onPointerDown={(event) => {
+              const bounds = splitContainerRef.current?.getBoundingClientRect();
+              if (!bounds) return;
+              splitDragRef.current = {
+                startY: event.clientY,
+                startHeight:
+                  splitState.collapsed === "tree"
+                    ? 0
+                    : splitState.collapsed === "preview"
+                      ? bounds.height - SPLITTER_HEIGHT
+                      : splitState.treeHeight,
+                containerHeight: bounds.height,
+              };
+              event.currentTarget.setPointerCapture(event.pointerId);
+              event.preventDefault();
+            }}
+            onPointerMove={(event) => {
+              const drag = splitDragRef.current;
+              if (!drag) return;
+              const nextHeight =
+                drag.startHeight + event.clientY - drag.startY;
+              const availableHeight =
+                drag.containerHeight - SPLITTER_HEIGHT;
+              if (nextHeight <= COLLAPSE_THRESHOLD) {
+                setSplitState((current) => ({
+                  ...current,
+                  collapsed: "tree",
+                }));
+              } else if (
+                nextHeight >= availableHeight - COLLAPSE_THRESHOLD
+              ) {
+                setSplitState((current) => ({
+                  ...current,
+                  collapsed: "preview",
+                }));
+              } else {
+                setSplitState({
+                  treeHeight: clampTreeHeight(
+                    nextHeight,
+                    drag.containerHeight,
+                  ),
+                  collapsed: null,
+                });
+              }
+            }}
+            onPointerUp={(event) => {
+              if (!splitDragRef.current) return;
+              splitDragRef.current = null;
+              if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+                event.currentTarget.releasePointerCapture(event.pointerId);
+              }
+            }}
+            onPointerCancel={() => {
+              splitDragRef.current = null;
+            }}
+            className="group/splitter relative h-full min-w-0 flex-1 cursor-row-resize touch-none outline-none"
+          >
+            <span className="absolute inset-x-2 top-1/2 h-px -translate-y-1/2 bg-border transition-colors group-hover/splitter:h-0.5 group-hover/splitter:bg-primary/70 group-active/splitter:h-0.5 group-active/splitter:bg-primary" />
+            <span className="pointer-events-none absolute left-1/2 top-1/2 flex h-5 w-8 -translate-x-1/2 -translate-y-1/2 items-center justify-center bg-card text-muted-foreground">
+              <GripHorizontal className="size-4" aria-hidden="true" />
+            </span>
+          </div>
+          {splitState.collapsed === null ? (
+            <>
+              <Button
+                type="button"
+                size="icon"
+                variant="ghost"
+                className="size-12 shrink-0 rounded-none"
+                aria-label="파일 트리 접기"
+                title="파일 트리 접기"
+                onClick={() =>
+                  setSplitState((current) => ({
+                    ...current,
+                    collapsed: "tree",
+                  }))
+                }
+              >
+                <ChevronUp className="size-3.5" aria-hidden="true" />
+              </Button>
+              <Button
+                type="button"
+                size="icon"
+                variant="ghost"
+                className="size-12 shrink-0 rounded-none"
+                aria-label="문서 미리보기 접기"
+                title="문서 미리보기 접기"
+                onClick={() =>
+                  setSplitState((current) => ({
+                    ...current,
+                    collapsed: "preview",
+                  }))
+                }
+              >
+                <ChevronDown className="size-3.5" aria-hidden="true" />
+              </Button>
+            </>
+          ) : splitState.collapsed === "tree" ? (
+            <Button
+              type="button"
+              size="icon"
+              variant="ghost"
+              className="size-12 shrink-0 rounded-none"
+              aria-label="파일 트리 펼치기"
+              title="파일 트리 펼치기"
+              onClick={() =>
+                setSplitState((current) => ({
+                  ...current,
+                  collapsed: null,
+                }))
+              }
+            >
+              <ChevronDown className="size-3.5" aria-hidden="true" />
+            </Button>
+          ) : (
+            <Button
+              type="button"
+              size="icon"
+              variant="ghost"
+              className="size-12 shrink-0 rounded-none"
+              aria-label="문서 미리보기 펼치기"
+              title="문서 미리보기 펼치기"
+              onClick={() =>
+                setSplitState((current) => ({
+                  ...current,
+                  collapsed: null,
+                }))
+              }
+            >
+              <ChevronUp className="size-3.5" aria-hidden="true" />
+            </Button>
+          )}
+        </div>
+
+        <article
+          hidden={splitState.collapsed === "preview"}
+          className={cn(
+            "flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden",
+            splitState.collapsed === "preview" && "hidden",
+          )}
+        >
           {selected && (
             <div className="flex items-center gap-2 border-b border-border bg-muted/30 px-4 py-2 text-xs">
               <span className="min-w-0 flex-1 truncate font-mono">{selected.path}</span>
@@ -329,7 +558,7 @@ export function WorkspaceView({
               </div>
             ) : selectedContent === null ? (
               <div className="flex h-full items-center justify-center text-sm text-muted-foreground">
-                왼쪽에서 문서를 선택하세요.
+                파일 트리에서 문서를 선택하세요.
               </div>
             ) : markdown ? (
               <div
