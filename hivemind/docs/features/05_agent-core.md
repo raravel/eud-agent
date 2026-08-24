@@ -32,6 +32,39 @@ recent-task semantics; backend-owned plan, review, workspace, and journal state 
 Codex's normal threshold-driven compaction remains enabled, and its started/completed items become
 Korean progress lines rather than raw event names.
 
+## Instruction epochs and active task state
+
+Each saved session owns a defaulted `SessionContextState` and `SessionTaskState`; adding them does
+not bump the destructive global session schema. A cold/fresh thread receives one full static
+instruction baseline plus current project state, memory, wiki, references, the complete active-task
+projection, optional replay transcript, resolved mentions, and the current user message. A normal
+follow-up sends only current project state, changed memory/wiki replacement sections, the
+undelivered task-state delta, resolved mentions, and the current message. The successful-delivery
+cursor advances only after the primary Codex turn completes. Cancellation or transport failure
+therefore retries the same epoch/revisions.
+
+The static baseline has a SHA-256 fingerprint. A changed fingerprint resets the provider thread
+without deleting panel history or task events, increments `instructionEpoch`, and starts fresh with
+the condensed transcript. Rewind, resume fallback, and successful native compaction also reset the
+delivery cursor; compaction records a `CompactionBoundary` and the next turn resends the current
+full baseline/projection once.
+
+Active task state is an append-only parent-linked event graph with a derived bounded typed
+projection. Stable panel-generated `clientTurnId` values anchor user log rows, IPC requests, and
+task events. Rewind moves only the branch leaf, replays the projection, and retains abandoned events
+for audit; a legacy prefix without an anchor fails closed to an empty projection.
+
+After an answer or plan is visible (and after a changeset is visible for implementation turns), a
+separate fresh Codex thread may compile one strict-schema `TaskStateDelta`. That compiler has no
+MCP endpoint, tools are forbidden, session persistence is disabled, and input/output sizes are
+bounded. Rust validates base revision, state transitions, projection bounds, exact user/approved
+plan quotes, confined project-relative artifact paths, current file hashes, and journal
+provenance before appending. Failure preserves the foreground result and prior projection, appends
+a bounded reason code plus an optional bounded diagnostic detail (including captured app-server
+stderr/exit context when available), logs the correlated session/request/turn identifiers, and
+emits the generic `task_state_warning`. The projection is background context: it grants no
+editor/map/workspace/journal/tool authority.
+
 `config.json.codex_large_context_models` is a sorted set of model slugs selected in
 **Settings → Codex**. Before every turn, each production driver reloads the global model pair and
 this set. An enabled active model receives thread start/resume config
@@ -47,12 +80,14 @@ the Codex-reported window.
 Every Codex turn has explicit `WorkspaceAccess::Read` or `WorkspaceAccess::Write`.
 
 - Read turns use `eud_workspace_read`: minimal runtime reads, the session workspace read-only,
-  and network disabled.
-- Write turns use `eud_workspace_write`: minimal runtime reads, the session workspace writable,
-  `source/**` read-only, and network disabled.
+  and sandboxed command network disabled.
+- Implementation turns use `eud_workspace_write`, but project documents and `source/**` remain
+  read-only; only `.tmp/**` is writable for Code Mode. Live editor/map mutations use eud-tools.
 - Both require the elevated exact-root Windows sandbox. Unsupported or denied setup fails closed.
+- Codex hosted web search is explicitly `live` at app-server launch and in every fresh/resumed
+  thread. It does not grant sandboxed commands network access and has no app-added usage policy.
 - App-server command approvals are automatic in both modes so native commands and Code Mode
-  JavaScript can run inside the active profile. File-change, patch, and permission-expansion
+  JavaScript run inside the active profile. File-change, patch, and permission-expansion
   approvals remain denied; neither command approval widens filesystem or network access.
 - Switching mode respawns the session's app-server when necessary, retains the thread id, and
   resumes the same conversation.
@@ -60,28 +95,18 @@ Every Codex turn has explicit `WorkspaceAccess::Read` or `WorkspaceAccess::Write
 All initial chats and plan-feedback turns start in read mode. A direct edit calls
 `request_write_lane(reason)`, which records write intent and parks the turn. `plan_approve`
 submits the same request directly in the backend. Mutating tools called without ownership return
-`WriteLeaseRequired`; the read sandbox independently denies native filesystem writes.
+`WriteLeaseRequired`; neither foreground mode permits native project-document writes.
 
 ## Project write transaction
 
-`ProjectWriteCoordinator` owns a fair FIFO queue per project. FIFO order is the time write intent
-is registered, not chat submission time. The lease covers the complete transaction:
+`ProjectWriteCoordinator` registers concurrent session writes immediately and serializes only
+short shared-state transactions. Session-local reasoning, isolated source changes, and review do
+not hold the project transaction mutex. Mutating eud-tools, build calls, canonical promotion,
+rollback, panel memory save, and wiki save each acquire it only while their operation settles.
 
-1. write intent;
-2. latest accepted state rebase and trusted baseline;
-3. editor/map/memory/native-workspace mutations;
-4. mandatory build and any repair;
-5. changeset review;
-6. complete accept or rollback.
-
-The lease is not released for partial decisions, an undecided journal, rollback failure, or a
-cancelled writer that has journaled changes. A review blocks later writers only; read turns in
-other sessions continue. On release the next ticket is granted automatically and its saved thread
-resumes in write mode. Panel `memory_save` and `wiki_save` use the same coordinator through short
-synthetic transactions; session persistence and autosave do not.
-
-Backend activities are `idle`, `running_read`, `waiting_write`, `running_write`, `review`, and
-`error`. `queuePosition` exists only for `waiting_write`.
+Backend activities are `idle`, `running_read`, `waiting_input`, `running_write`, `review`, and
+`error`. Background harness state is orthogonal and never changes the session activity or disables
+chat.
 
 ## Tool state and MCP
 
@@ -116,7 +141,8 @@ Flow tools: `ask(questions)`, `propose_plan(markdown)`, `request_write_lane(reas
 Write tools: `dat_set`, `xdat_set`, `tbl_set`, `req_set`, `btn_set`, `dat_reset`, `file_create`,
 `file_write`, `file_edit`, `file_rename`, `file_delete`, `file_move`, `mkdir`, `set_main`,
 `settings_set`, `plugin_add`, `plugin_edit`, `plugin_remove`, `plugin_move`, `build_run`,
-`location_write`, `player_setup`, `switch_write`, `memory_write`.
+`location_write`, `player_setup`, and `switch_write`. Project memory is synchronized only by the
+post-acceptance harness; `memory_write` is not exposed to foreground Codex.
 
 
 `ask` accepts one to four related questions. Each question has a stable id, optional header,
@@ -152,6 +178,28 @@ Evidence, first-principles, mutation-count, action-count, search, and three-buil
 remain request scoped. The non-search action hard ceiling is 300 calls; each batched getter
 envelope consumes one action. `request_write_lane` is non-mutating and consumes no mutation budget.
 
+## Main resource mention transport
+
+Main EPS `ChatRequest` and `PlanFeedbackRequest` carry an optional ordered
+`Vec<MentionInstance>` beside text and attachments. `MentionService` is shared through
+`ToolServices`; `mention_search` is trusted panel IPC and is not present in the model-facing MCP
+registry. Its closed versioned union currently implements only `map.region` and `map.location`.
+
+Before request state begins or any Codex driver call, the engine validates the complete batch
+against a fresh saved `OpenMapName` context. Regions come from the exact project's persistent
+selection library through the narrow `CandidateStore::persistent_selections` boundary and bind
+source hash, dimensions, id, and complete persistent-selection hash. Locations come only from the
+saved CHK `MRGN` digest and bind source hash, exact id, and complete decoded-record fingerprint.
+Any stale/invalid/unsupported instance, duplicate instance id, or count above 16 rejects the
+complete turn. Text/attachment-only turns do not resolve a map context and retain their prior
+prompt behavior.
+
+Valid context is projected deterministically as compact `eud-resolved-mentions/1` JSON in a
+`[resolved mentions]` section before `[user message]` on cold, resumed, resume-fallback, and
+plan-feedback turns. Mention-only chat and feedback use stable backend fallback instructions.
+Visible labels are presentation only. Mentions do not authorize tools or change any existing
+evidence, plan, write, action, build, journal, changeset, or rollback state.
+
 ## Session workspaces
 
 The canonical accepted project workspace remains:
@@ -162,25 +210,34 @@ Codex runs from:
 
 `%appdata%\eud-agent\workspaces\.sessions\<project-id>\<session-id>\`
 
-Before every read turn, accepted canonical documents are delta-synced and a coherent session-owned
-`source/` snapshot is refreshed. Before write mode, the same sync runs again, then the trusted
-baseline is captured. Workspace changes are journaled with both project and session ownership.
-Accept promotes selected session bytes to canonical storage under the lease; promotion and trusted
-metadata update roll back together on failure. Reject restores only the session root, leaving
-canonical bytes unchanged. The app-owned approved plan is written canonical before the execution
-baseline, synced into the session root, remains immutable, and survives implementation rejection.
+Before every turn, accepted canonical documents are delta-synced and a coherent session-owned
+`source/` snapshot is refreshed. Foreground documents remain read-only. The app-owned approved
+plan is written canonical before implementation, synced into the session root, remains immutable,
+and survives implementation rejection.
 
-## Journal and recovery
+After a code changeset settles with accepted entries, `HarnessJobStore` persists one job under
+`%appdata%\eud-agent\harness_jobs\`. Runtime-sensitive jobs wait for user confirmation. The user
+may skip them into a terminal state that produces no model call or durable updates. Other jobs run
+immediately on a dedicated document workspace
+`workspaces/.sessions/<project-id>/<harness-job-id>/`. One tool-free, output-schema-constrained
+Codex turn returns ordered exact document edits and optional durable-memory replacements. Each
+`old_text` must match exactly once after earlier edits in the same patch have been applied. Rust
+validates and applies the batch, writes the worklog from accepted journal/build evidence, journals
+the document workspace, and emits a separate atomic review. Accept promotes documents and memory;
+reject discards the job workspace. A failed attempt retains accepted code, its validation error,
+and the rejected structured delta when parsing succeeded. Retry feeds that context into a fresh
+generation instead of repeating the original prompt.
+Terminal failed/completed/rejected/skipped jobs may be durably dismissed without deleting their
+audit record or changing accepted state.
 
-Every project mutation is journaled before review. Partial accept removes only accepted entries;
-partial reject rolls back and removes only rejected entries. Remaining entries stay live and keep
-the lease. Accept/reject-all archives only after all required work succeeds.
+Every project mutation is journaled before review. Partial code decisions retain only undecided
+entries; accepted entry snapshots accumulate in the pending harness job context. Harness reviews
+are independent of `AgentEngine.current_request_id`, so new conversations and code reviews may
+continue.
 
-On startup, session records for a project are scanned before admitting a new writer. One pending
-journal is restored as the project review owner. Multiple legacy pending writers, a missing
-journal, or an empty pending journal is an explicit recovery error; the backend never chooses
-silently. Read turns and unfinished queue tickets are process-local, while journaled writes
-survive restart as review.
+Schema v3 performs a clean legacy cutover: it preserves session names and panel logs, clears Codex
+thread/context/pending ownership, removes unaccepted journals and session workspaces, preserves
+accepted journals/canonical documents, and starts the new harness state machine empty.
 
 ## Event and cancellation isolation
 
@@ -197,14 +254,16 @@ to review and retains ownership.
 
 - Barrier-based Rust tests prove overlapping different-session reads and same-session
   serialization.
-- Coordinator tests prove one writer, write-intent FIFO, queue-position updates, scoped queued
-  cancellation, review retention, and pending-review restoration priority.
+- Coordinator tests prove concurrent registrations and short per-project transactions.
 - Runtime tests prove request/evidence/budget/preflight isolation.
+- Harness tests prove runtime classification, structured-delta validation, deterministic worklog
+  staging, interrupted-job recovery, foreground document-repair removal, and schema-v3 cutover.
+- Context/task-state tests cover full-versus-delta delivery, fingerprint/compaction resets,
+  deterministic replay and cache repair, stable rewind anchors, tools-disabled compiler
+  success/failure/timeout, provenance confinement, and cross-store atomic updates.
 - ASK tests prove one blocking MCP call emits one session-scoped related-question request,
   rejects incomplete answers without consuming it, returns mixed choice/direct answers to the
   same call, releases the session slot when the MCP future is dropped, and restores a pending
   snapshot when the panel missed the push event.
-- Workspace tests prove stable session snapshots, accepted promotion, canonical rejection
-  invariance, and approved-plan preservation.
-- Panel integration tests prove overlapping `chat` invokes and strict event-to-`PanelStore`
-  routing.
+- Panel integration tests prove harness event routing, runtime confirmation, retry, atomic
+  document review, and chat availability while a harness job runs.
