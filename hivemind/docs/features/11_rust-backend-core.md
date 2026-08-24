@@ -94,16 +94,16 @@ Flow: `propose_plan(markdown)`, `request_write_lane(reason)`.
 Write: `dat_set`, `xdat_set`, `tbl_set`, `req_set`, `btn_set`, `dat_reset`, `file_create`,
 `file_write`, `file_edit`, `file_rename`, `file_delete`, `file_move`, `mkdir`, `set_main`,
 `settings_set`, `plugin_add`, `plugin_edit`, `plugin_remove`, `plugin_move`, `build_run`,
-`location_write`, `player_setup`, `switch_write`, `memory_write`.
+`location_write`, `player_setup`, and `switch_write`. `memory_write` is removed; durable memory is
+an optional structured post-acceptance harness delta.
 
 `file_edit` resolves ordered exact replacements against the request's latest desired content,
 three-way merges that candidate with the trusted source baseline and live editor content, and
 journals the resulting full before/after bytes as a normal file modification.
 
-The runtime rejects every mutating tool, including build/map/memory writes, unless its exact
-project/session/request ticket owns the lease. `request_write_lane` is non-mutating. Existing
-validation, evidence, first-principles, plan-mutation, action/search, and build budgets remain
-session-request scoped; the non-search action hard ceiling is 300.
+The runtime rejects every mutating tool, including build/map writes, unless its exact
+project/session/request registration owns the operation. `request_write_lane` is non-mutating.
+Evidence, first-principles, plan-mutation, action/search, and build budgets remain request scoped.
 
 `build_run` is the single public build-result tool. It reads `EDSPATH`, snapshots output-map
 freshness, invokes the editor `BUILD`, waits up to 300 seconds, and consumes `BUILDERR`
@@ -114,15 +114,15 @@ internally for macro errors. A failed editor build with no macro errors triggers
 
 ## Change journal and rollback
 
-All editor/map/memory/native-workspace mutations remain journaled with UTF-8 no-BOM persistence.
-Workspace journal targets additionally carry the session id so reject restores the isolated
-working root rather than accepted canonical bytes.
+Editor/map foreground mutations are journaled with UTF-8 no-BOM persistence. Foreground native
+workspace documents are read-only. Harness documents are applied by Rust as one validated batch
+in a dedicated document workspace and journaled under their own request id.
 
-Partial accept promotes selected workspace bytes and removes only accepted journal entries.
-Partial reject applies inverse operations and removes only rejected entries. Remaining entries
-stay live and keep the project lease. Accept/reject-all archives only after promotion/rollback
-completes. Failed rollback emits `rollback_result{ok:false}`, retains the journal, and leaves the
-session in review.
+Partial code acceptance accumulates accepted entry snapshots for the eventual harness context;
+partial reject removes only rejected entries. A complete code decision archives the source
+journal, releases the conversation review state, and durably enqueues the independent harness job.
+Harness document review is atomic accept-all/reject-all. Failed rollback or promotion keeps its
+own review surface without re-blocking the already accepted code.
 
 Canonical workspace promotion and trusted metadata update are one parent-owned transaction:
 promotion bytes are restored if metadata persistence fails.
@@ -148,13 +148,15 @@ round-trip) — never placeholder constants. The editor install path comes from 
 
 ## Memory and wiki
 
-Project memory and the DAT wiki remain under Roaming app data and retain their existing caps,
-sanitization, prompt rendering, and acceptance-ledger semantics. Agent `memory_write` requires
-the write lease. Panel `memory_save` and `wiki_save` execute as short synthetic coordinator
-transactions and remain outside agent changeset review.
+Project memory and the DAT wiki remain under Roaming app data with their existing caps,
+sanitization, prompt rendering, and accepted-ledger semantics. Foreground Codex reads memory but
+cannot mutate it. Optional harness memory replacements apply only with the separate document
+review and roll back if canonical document promotion fails. Panel `memory_save` and `wiki_save`
+remain short synthetic project transactions.
 
 Every session reads fresh project memory/wiki context for its turn. Accepted DAT edits update the
-global project wiki only after the changeset decision succeeds; rejection never records them.
+global DAT wiki immediately after the code decision; harness generation never rewrites that
+accepted-value ledger.
 
 ## Edge cases
 - codex CLI unresolved -> fast clear error (no bare spawn).

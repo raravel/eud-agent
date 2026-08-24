@@ -1,7 +1,14 @@
 # Decision 07: Project memory via journaled MCP write tool
 
 - Date: 2026-06-06
-- Status: Accepted
+- Status: Superseded on 2026-08-23 by post-acceptance structured harness synchronization
+- Supersession: measured production sessions spent 71–73% of foreground write time after the
+  first successful build, largely on repeated memory/spec/worklog model cycles. Two accepted
+  implementations then documented behavior that immediate user runtime testing disproved.
+  Foreground `memory_write` was removed. Accepted code now creates a durable background job; one
+  tool-free output-schema turn proposes memory/spec deltas, the server writes the worklog, and a
+  separate atomic review applies memory only after code acceptance and any required runtime
+  confirmation. The original analysis below is retained as history.
 - Context: Planning the per-map-project memory harness ("project memory") — a store codex
   updates autonomously so it remembers map structure, resource allocation, conventions, and
   corrections across chats. The design conversation (2026-06-06) settled storage location

@@ -102,6 +102,28 @@ inverted-location precision pattern (≤ unit size, MoveLocation + Bring), and
 prefer-reuse-over-duplicates. This pins the workflow instead of relying on
 tool descriptions alone.
 
+## Resolved-region workflow
+
+Main EPS resource mentions do not call this tool directly. A backend-validated `map.region`
+supplies compact saved-region metadata, then the agent must call `map_info(mode=locations)` before
+using a location in epScript:
+
+- reuse an existing location only when its name and bounds exactly match the resolved region;
+- for a rectangular region with no same-name location, add one through this journaled
+  `location_write(action=add)` path;
+- when the same name has different bounds, ask whether to use the existing location or choose a
+  distinct name—never overwrite, move, rename, or silently suffix it;
+- for a free-form region, ask whether to use its bounding rectangle or require a rectangular
+  saved region—never silently approximate its mask;
+- `#64 Anywhere` may only be reused as the built-in location and is never created, deleted, or
+  repurposed.
+
+After resolving or creating the location, the normal EPS workflow remains mandatory:
+`project_status.mainFile`, `list_files`, memory and owner-source inspection, `search_docs`, one
+coherent `eps_check`, normal file tools, and `build_run`. The map journal entry and code journal
+entries stay in the same existing changeset/rollback flow. The mention grants no mutation
+permission and does not bypass location-write safety rails.
+
 ## Journal / changeset integration
 
 - The tool layer records `before={mapPath, backupPath}` / `after={action,

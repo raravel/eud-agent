@@ -24,6 +24,32 @@ stages from v1 are retired as `server/` is removed.
 - `cd panel && npx vitest run` — panel component/unit tests (state/IPC, cancel+rewind,
   persistent activity status, long-chat DOM virtualization, PlanView/ChangesetView).
 
+### Active task state and instruction epoch focused checks
+
+- `cargo test -p eud-agent task_state --lib` — append-only event replay, bounds,
+  provenance/authority rejection, cache repair, branch rewind, detached promotion, and the
+  10-member enemy roster smoke.
+- `cargo test -p eud-agent context_state --lib` — cold baseline, unchanged follow-up omission,
+  memory/wiki replacement hashes, successful-delivery cursor, legacy adoption, and epoch resets.
+- `cargo test -p eud-agent session --lib` — defaulted legacy records, narrow atomic updates,
+  panel/runtime/harness concurrency, anchored rewind, and lossless event retention.
+- `cargo test -p eud-agent engine --lib` — static prompt de-duplication, fingerprint fallback,
+  manual-compaction resend, isolated structured compiler success/failure/timeout, and branch prompt
+  restoration.
+- `cargo test -p eud-agent harness --lib` — bounded promotion candidates, optional no-op behavior,
+  accepted document/memory hashes, and reject/skip boundaries.
+- `npm --prefix panel test -- --run App store ipc` — stable `clientTurnId` transport, retry reuse,
+  edit-branch replacement, hydration/legacy compatibility, and 500-entry cap alignment.
+- `cargo test -p eud-agent ten_enemy_smoke --lib -- --nocapture` — keeps all 10 explicit target
+  members, `specs/enemy.md` hash/provenance, rewind exclusion, acceptance, and reviewed promotion
+  without production string heuristics.
+
+### Codex runtime focused checks
+
+- `cargo test -p eud-agent app_server_override_tests --lib` — verifies `live` hosted web search
+  at app-server launch and on fresh/resumed threads while both local sandbox profiles retain
+  disabled command network access.
+
 ### MainFile architecture focused checks
 
 - `cargo test -p eud-agent bridge_io --lib` — verifies root and nested `GETMAIN` paths, empty/no
@@ -35,6 +61,33 @@ stages from v1 are retired as `server/` is removed.
 - `cargo test -p eud-agent engine --lib` — verifies the canonical architecture guide in cold-start
   and resume prompts, section boundaries/order, MainFile non-inference, localized ownership,
   acyclic dependencies, complete `structure` refresh, one-batch preflight, and mandatory build.
+
+### Main resource mention focused checks
+
+- `cargo test -p eud-agent mentions::tests --lib` — strict namespaced/versioned serde,
+  deterministic bounded/Korean search, persistent-selection and location fingerprints, exact
+  rectangle classification, project/source/dimension/stale failures, candidate-only omission,
+  mixed ordering, duplicate/count refusal, and compact path/geometry-free projection.
+- `cargo test -p eud-agent map_candidate::tests --lib` — includes the read-only persistent
+  selection-library boundary and proves it does not mutate candidate session state.
+- `cargo test -p eud-agent engine --lib` — includes cold/resumed/plan-feedback resolved-section
+  placement, mention-only fallback, raw-label non-authority, and zero driver calls on stale input.
+- `cd panel && npx vitest run src/components/MentionComposer.test.tsx
+  src/components/InstructionBox.test.tsx src/components/ConversationLog.test.tsx
+  src/lib/ipc.test.ts src/state/store.test.ts src/App.test.tsx` — caret/Korean search,
+  loading/empty/error, keyboard/IME, mixed chips, duplicate/removal, mention-only send,
+  project/session invalidation, complete draft restoration, IPC, durable hydration, history,
+  edit, rewind, and concurrent session/plan regressions.
+- `cd panel && npm run build` — TypeScript and production bundle gate for the generic composer.
+
+Live Tauri/editor acceptance requires a project with a saved `OpenMapName` and rectangular
+`영역 A`. Search/select it in the main composer, send the healing request, and require
+`map_info(mode=locations)`, optional exact journaled `location_write(action=add)`, grounded
+project inspection, `search_docs`, one coherent `eps_check`, owner-module file mutation, and
+successful `build_run` in one changeset. Reject once and require exact map/code rollback; repeat,
+accept, and verify runtime healing. A candidate-only location must remain absent until trusted
+Map-window Apply. Changing the saved map or selected region after chip creation must reject before
+Codex and restore text, attachments, and mentions.
 
 ## build
 - `cd panel && npm run build` — `tsc -b && vite build` produces `panel/dist`.
@@ -91,9 +144,8 @@ stages from v1 are retired as `server/` is removed.
   enabled chat during background sync.
 - Panel chat control/performance: `npm --prefix panel test -- --run App SessionSidebar ipc AskCard
   AgentAnswer ConversationLog PlanView store` covers edit-prefix truncation, cancel feedback,
-  structured ASK routing/submission and missed-event restoration through `ask_pending`, Mermaid
-  answer/plan rendering, live-stage labels, and a 200-entry conversation mounting fewer than 50
-  viewport/overscan rows.
+  structured ASK routing/submission, Mermaid rendering, live-stage labels, and long-log
+  virtualization.
 
 - Concurrent sessions: `cargo test -p eud-agent write_coordinator::tests`,
   `cargo test -p eud-agent workspace::tests::concurrent_session_accept`,
@@ -125,6 +177,11 @@ stages from v1 are retired as `server/` is removed.
 - `cargo test -p isom --test map_agent_native terrain_thumbnail_renders_one_exact_tile_and_space_parallax -- --ignored --nocapture`
   — proves exact terrain thumbnails enlarge one tile rather than repeating a tile block and that
   transparent Space Platform tiles reveal the installed star parallax.
+- `cargo test -p eud-agent map_context::tests --lib` and
+  `cargo test -p eud-agent bridge_io --lib` — prove passive source probes use the same-tick
+  `project`/`openMapName` status without creating `.cmd` files, compiling confirmation fails
+  before IPC, explicit confirmation never inherits the 180s busy timeout, and the Lua Tick
+  persists both cached fields before its compiling early return.
 - `cargo test -p eud-agent map_model::tests --lib` — preserves the twenty-operation serde
   authority, camelCase names, defaults, and strict unknown-field rejection.
 - `cargo test -p eud-agent map_candidate::tests --lib` — covers strict candidate create/open,
@@ -140,6 +197,31 @@ stages from v1 are retired as `server/` is removed.
   — with installed StarCraft assets, places a real saved-map selection through the native
   candidate path, requires destination MTXM equality with the source cells, requires no
   `TerrainIsomBrush` in the persisted manifest, and leaves the source SCX byte-identical.
+- `cargo test -p eud-agent map_import --lib` — covers case-insensitive SCX/SCM allowlisting,
+  raw/unsupported/oversized/corrupt refusal, streaming hashes and length, DIM/ERA/MTXM validation,
+  temp cleanup, blob dedupe/retention/GC, strict project libraries, canonical masks, missing/corrupt
+  blobs, and path/raw-content-free model projection.
+- `cargo test -p eud-agent map_stamp --lib` — additionally covers different source/destination
+  dimensions, explicit tileset equality, exact relative MTXM translation, six-layer complete
+  footprint capture, target/protect, non-overlap, merge/replace boundary and location-slot rails,
+  and no `TerrainIsomBrush`.
+- `cargo test -p eud-agent imported_stamp_is_request_bound_and_replay_is_blob_independent --lib
+  -- --ignored --nocapture` — with installed StarCraft assets, validates imported direct preview,
+  request-only mention binding, provenance without paths, unchanged external/destination sources,
+  and deterministic committed replay after deleting the pinned blob.
+- With `MAP_IMPORT_SMOKE_SOURCE` set to a real same-tileset/different-dimension SCX/SCM and
+  `MAP_IMPORT_SMOKE_DESTINATION` set to a real saved destination, run
+  `cargo test -p eud-agent real_cross_dimension_source_stages_saves_and_preserves_both_originals
+  --lib -- --ignored --nocapture` and
+  `cargo test -p eud-agent
+  real_cross_dimension_import_direct_and_request_paths_are_exact_and_blob_free_on_replay --lib --
+  --ignored --nocapture`. These require exact source/destination byte invariance, direct and
+  request-bound placement, translated MTXM equality, one revision, no ISOM, and replay after
+  import deletion/blob GC.
+- With `MAP_IMPORT_MISMATCH_SOURCE` set to a real different-tileset SCX/SCM, run
+  `cargo test -p eud-agent
+  real_cross_tileset_source_is_rejected_without_palette_or_original_mutation --lib -- --ignored
+  --nocapture`; palette and both originals must remain unchanged.
 - `cargo test -p eud-agent tools::tests --lib` — requires the advertised `map_draft_patch`
   `inputSchema` to expose exactly all twenty operation alternatives and `map_image_place` to
   expose only request-local `imageRef` plus bounded integer x/y/width/height, all without a
@@ -184,6 +266,11 @@ stages from v1 are retired as `server/` is removed.
   — requires every saved region to appear as a live palette stamp, exposes direct placement and
   structured stamp mentions, and enforces explicit merge/replace/cancel handling with unsafe
   partial replacement disabled.
+- `cd panel && npx vitest run src/map` — also covers strict importer IPC, source
+  loading/error/tileset state, shared canvas/minimap renderer injection, rectangle/free-mask set
+  operations, six layer toggles, canonical save, project palette cards/thumbnails/events,
+  imported direct source payloads, structured mentions, delete/stale chips, Korean labels, and
+  existing Map Agent regressions.
 - `cd panel && npx vitest run src/map/MapSessionHistoryDialog.test.tsx src/map/mapProtocol.test.ts`
   — Map session history search/load/create/rename/delete controls, active-row protection, and
   map-window-specific IPC payloads.
@@ -204,6 +291,18 @@ stages from v1 are retired as `server/` is removed.
   protect counts, zero alerts, and zero horizontal overflow at 1280x800 and 1920x1080. Confirm one
   candidate revision, compare original/candidate/diff render and exact bounds, revert r1→r0→r1,
   and require the source SHA-256 unchanged.
+- Actual cross-map import Tauri/WebView2 smoke: with a live saved destination `OpenMapName`, invoke
+  `map_agent_import_open` twice and require one focused `/map-import.html` window titled
+  `Map Importer`. Pick a real same-tileset SCX/SCM with different dimensions, select a non-empty
+  mask and all six layers, save it, and require immediate Map Agent palette refresh. Exercise
+  direct drag/numeric/keyboard placement plus explicit collision policy and an importedStamp model
+  request. Require exact translated terrain/objects/locations, no ISOM op, one revision per path,
+  unchanged external and saved-destination SHA-256 before Apply, pinned behavior after moving the
+  original, replay after deleting the committed blob, cross-tileset refusal, and trusted
+  Map-window-only Apply/undo rails. At 1280×800 and 1920×1080 both windows require
+  `scrollWidth === clientWidth`, zero unexpected alerts, and mounted canvas/minimap. If native
+  picker automation is unavailable, automate every remaining window step and record only that
+  exact omission.
 - Actual SCX Apply/undo smoke: from that verified candidate, invoke only the trusted toolbar
   `전체 Apply`; require compiling=false, no-share probe success, baseline hash match, a full backup
   whose SHA-256 equals the pre-Apply source, deterministic replay, changed source hash, cleared

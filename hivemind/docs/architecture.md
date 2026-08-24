@@ -155,11 +155,11 @@ Codex runs from session roots:
 
 `%appdata%\eud-agent\workspaces\.sessions\<sha256>\<session-id>\`
 
-Before a read turn, canonical `specs/`, `plans/`, `decisions/`, and `worklog/` documents are
-delta-synced into the session root and a coherent session-owned `source/` EPSNAPSHOT is refreshed.
-The read sandbox makes the root read-only. Before write mode, the root is rebased again, targets
-must be re-read, a trusted baseline is captured outside the Codex cwd, and the write sandbox
-enables documents while keeping `source/**` read-only.
+Before every foreground turn, canonical `specs/`, `plans/`, `decisions/`, and `worklog/`
+documents are delta-synced into the session root and a coherent session-owned `source/`
+EPSNAPSHOT is refreshed. Both read and implementation sandboxes keep those documents and
+`source/**` read-only; implementation mutations travel only through eud-tools. The implementation
+profile grants write access solely to `.tmp/**` for Code Mode runtime files.
 
 Workspace accept compares each journal baseline with current canonical bytes. Unchanged targets
 promote directly, non-overlapping text edits use a three-way merge, and overlapping edits return
@@ -167,15 +167,20 @@ an explicit `ConcurrentWriteConflict` without changing canonical bytes. Promotio
 metadata persistence still roll back together on failure. Reject restores only the session root.
 
 `specs/index.md` remains the canonical project-wiki entry point. `plan_approve` writes the exact
-approved Markdown to canonical `plans/<request-id>.md` only after lease grant and before the
-execution baseline. It is synced to the session root, immutable, and survives implementation
-rejection. Approved execution still requires a linked non-empty topic spec and verified linked
-worklog, with at most two focused repair turns.
+approved Markdown to canonical `plans/<request-id>.md` before implementation. Code/map changes
+are reviewed first; a complete accept creates one durable post-acceptance harness job. Runtime-
+affecting file/DAT/plugin/map changes wait for explicit user in-game confirmation. The user may
+instead skip and terminate that job without generating documents or memory updates. Static
+settings/MainFile/workspace changes proceed automatically. The background job receives accepted
+journal entries and canonical documents inline, permits no tool calls, makes one
+output-schema-constrained Codex turn, and stages exact `specs/`/`decisions/` edits plus a
+server-generated `worklog/<source-request-id>.md` in a dedicated document workspace. Its
+changeset is reviewed independently, failure keeps accepted code and exposes retry, and the main
+session remains usable throughout.
 
 The named Windows profiles `eud_workspace_read` and `eud_workspace_write` both use minimal
-runtime reads, exact-root elevated sandboxing, and disabled network. The write profile grants
-only the current session root and keeps `source/**` read-only. Unsupported or denied setup fails
-closed.
+runtime reads, exact-root elevated sandboxing, and disabled network. Neither profile permits
+foreground document writes. Unsupported or denied setup fails closed.
 
 ## Map Agent workbench and candidate documents
 
@@ -191,11 +196,13 @@ The terrain palette opens on a paged grid of graphics-valid exact tiles from the
 each thumbnail enlarges one 32×32 tile with nearest-neighbor pixels, while semantic ISOM brushes
 remain an explicit alternate mode. Space Platform thumbnail transparency is composited over the
 installed star parallax instead of appearing as a missing image.
-While the window remains open, a lightweight source probe polls only project/path/mtime/size.
-Metadata changes mark the current candidate stale without clearing or reloading the workbench; the
-toolbar offers an explicit action that preserves the stale session and creates a new Map session
-from a fresh full hash/CHK bootstrap. Map events carry the parent candidate revision key so
-stale/out-of-order output is discarded.
+While the window remains open, an async lightweight source probe reads the bridge's cached
+`project`/`openMapName` status snapshot and polls only path/mtime/size; it never writes a bridge
+command. Metadata changes mark the current candidate stale without clearing or reloading the
+workbench. Explicit bootstrap/reload confirms `OpenMapName` with a bounded three-second bridge
+request when the editor is idle, then performs the fresh full hash/CHK load. The toolbar preserves
+the stale session while creating the new Map session. Map events carry the parent candidate
+revision key so stale/out-of-order output is discarded.
 
 `SessionKind::Map` is persisted beside the backward-compatible default `SessionKind::Eps`.
 Map workers have independent events, cancellation, conversation state, prompt, and MCP registry.
@@ -218,16 +225,31 @@ the same definitions to its own visible candidate revision. Creating or updating
 upserts its palette entry, and deleting the selection removes the shared entry. A stamp mention
 identifies this live selection but grants no write authority.
 
-`map_stamp_preview` and `map_stamp_place` read the stamp source from the visible candidate at
-placement time. Rust extracts exact MTXM/TILE and fully-contained selected-layer units, buildings,
-doodads, sprites, and locations, then resolves the placement to ordinary typed operation batches.
-The model never receives or reconstructs the tile matrix. Exact stamping never invokes ISOM;
-multiple destinations are bounded, in-map, and non-overlapping. Terrain is expected overwrite,
-while destination object/location collisions require an explicit merge, replace, or cancel
-choice. Merge preserves destination objects; replace removes only fully-contained selected-layer
-items and fails closed on boundary-crossing items. Direct palette placement and model placement
-use the same authority, persistent-protect, native mapedit, verification, finalize, and replay
-path.
+`map_stamp_preview` and `map_stamp_place` accept a strict source union. `candidateSelection`
+resolves a saved selection against the visible candidate; `imported` resolves only an
+`importedStamp` mention validated into the active request. Both paths use
+`compile_stamp_placement`, which validates the source mask against source dimensions, the shifted
+mask against destination dimensions, and exact source/destination tileset equality. Whole-map
+dimensions may differ. Rust extracts exact MTXM/TILE and fully-contained selected-layer units,
+buildings, doodads, sprites, and locations, then resolves placement to ordinary typed operation
+batches. The model never receives paths, raw CHK, object records, or tile matrices. Exact stamping
+never invokes ISOM; multiple destinations are bounded, in-map, and non-overlapping. Terrain is
+expected overwrite, while destination object/location collisions require explicit merge, replace,
+or cancel. Merge preserves destination objects; replace removes only fully-contained selected-layer
+items and fails closed on boundary-crossing items. Direct palette placement and model placement use
+the same request draft, authority, persistent-protect, native mapedit, verification, finalize, and
+replay path.
+
+`map_agent_import_open` creates or focuses one separate `map-import` WebView at
+`/map-import.html`. The importer accepts only trusted-picker `.scx`/`.scm` files, streams at most
+256 MiB into `%localappdata%\eud-agent\map_imports\blobs\<file-sha256>.map`, extracts and validates
+the embedded `staredit\scenario.chk`, and never reads the original path again. Project metadata is
+strict, atomic `map_candidates/<project-id>/import-palette.json`; it is separate from live
+`selection-palette.json`. Imported snapshots bind file/CHK hashes, tileset, source dimensions,
+canonical rows/bounds/cell count, and selected layers. Missing/corrupt blobs, stale snapshot hashes,
+project/source switches, destination revision changes, tileset mismatch, bounds, authority,
+collision, and location-slot failures reject before candidate mutation. `MapCanvas` and
+`MapMinimap` share one injected render-source interface across candidate and importer surfaces.
 
 PNG, JPEG, WebP, and the first GIF frame use one `MapImageService` conversion path. The server
 checks encoded/decode/allocation caps, keeps one bounded normalized RGBA source per session,
@@ -247,19 +269,21 @@ only those request-local refs and uses the same terrain authority/verifier. Imag
 seal the draft, so multiple photos and ordinary terrain patches may be interleaved.
 
 Each Map session owns `%appdata%\eud-agent\map_candidates\<project-id>\<session-id>\`, while the
-saved selection palette is shared at the project directory above those session roots. The service
-materializes one immutable baseline snapshot and one current candidate SCX; revision manifests
-retain typed operation batches, authority snapshots, verification reports, candidate-local
-object UUIDs, and non-authorizing image conversion metadata (attachment SHA-256, source
-dimensions, placement, quantizer version, tile-grid SHA-256, changed rows, walkability changes,
-and height changes). A request begins from the visible candidate revision, iterates in
+saved selection and imported palettes are shared at the project directory above those session
+roots. The service materializes one immutable baseline snapshot and one current candidate SCX;
+revision manifests retain typed operation batches, authority snapshots, verification reports,
+candidate-local object UUIDs, non-authorizing imported provenance (import id, source file/CHK
+hashes, snapshot hash, selection dimensions, layers), and non-authorizing image conversion
+metadata (attachment SHA-256, source dimensions, placement, quantizer version, tile-grid SHA-256,
+changed rows, walkability changes, and height changes). A request begins from the visible
+candidate revision, iterates in
 `drafts/<request-id>.tmp.scx`, and may finalize one verified pending revision. That revision is
 published only after the complete model turn succeeds. Failed, cancelled, stale, or unfinalized
 requests delete their draft and pending manifest without changing the visible candidate.
 
-Replay uses stored `TerrainBlit` values and never depends on attachment ids or local paths. Startup
-removes incomplete drafts and unused candidate directories older than the configured 30-day
-policy.
+Replay uses only persisted typed operation batches. It never depends on imported blobs, original
+external paths, attachment ids, or local attachment paths. Startup removes incomplete drafts,
+unreferenced import staging/blobs, and unused candidate directories under their retention rules.
 
 While a Map turn is running, successful scoped tool results from `map_draft_patch`,
 `map_stamp_place`, `map_image_place`, and `map_draft_reset` advance a panel-owned preview
@@ -280,6 +304,32 @@ replacement, and post-write canonical/container verification. A flushed pending-
 closes the crash window before replacement: startup restores an uncommitted replacement or
 recognizes the already-committed candidate state. Verification failure restores immediately;
 explicit undo restores exact backup bytes through the same lock and atomic-replace rails.
+
+## Main conversation resource mentions
+
+The main EPS conversation surface carries one optional ordered `mentions: MentionInstance[]`
+field through chat, plan feedback, panel-log persistence, session reload, edit, and rewind.
+`MentionSnapshot` is a closed namespaced/versioned Rust union; the implemented variants are
+`map.region` and `map.location`. The panel obtains every opaque snapshot through the bounded
+trusted `mention_search` Tauri command and never derives resource authority from visible labels,
+paths, coordinates, or natural-language text.
+
+`MentionService` is an app-wide read-only service shared by session workers. It resolves the
+current saved `OpenMapName` through `MapContextService`, reads project-scoped persistent
+selections only through `CandidateStore`, and reads locations only from the saved CHK `MRGN`.
+Region snapshots bind project id, source-file SHA-256, dimensions, selection id, and the complete
+persistent-selection hash. Location snapshots bind project id, source-file SHA-256, exact MRGN id,
+and the complete decoded-location fingerprint. Candidate-only Map Agent locations are therefore
+absent until trusted Map-window Apply changes the saved source map.
+
+Every instance is revalidated as one all-or-nothing batch immediately before an EPS Codex turn.
+Duplicate instance ids, stale project/source/geometry records, unsupported kind/version/fields,
+and the 16-instance cap fail before driver execution. Valid instances render one deterministic
+compact `[resolved mentions]` JSON section outside and before `[user message]` on cold, resumed,
+and plan-feedback turns. That context grants no tool permission and leaves evidence, plan,
+write-lane, mutation-budget, MapSafe, journal, changeset, preflight, build, and rollback rails
+unchanged. Map Agent's candidate-scoped `MapMentionSnapshot` and user-only original Apply remain
+separate authority contracts.
 
 ## File IPC protocol (app to bridge)
 

@@ -158,6 +158,11 @@ new writers.
   viewer-only workspace explorer. `workspace_list` refreshes the EPS source mirror and
   returns durable documents plus `source/`; selecting a file calls confined
   `workspace_read`. `specs/` sorts first, `specs/index.md` is the default wiki home, and
+  `workspace_search` scans that same confined, bounded tree and returns case-insensitive path or
+  UTF-8 content matches while skipping non-text files. The explorer groups files by top-level
+  directory, persists collapsed directories per workspace in browser storage, and temporarily
+  expands matching groups while a debounced unified search filters the tree. Clearing the search
+  restores the persisted collapsed state.
   The file tree and document preview stack vertically with a pointer/touch splitter. Browser
   storage restores the last tree height or either collapsed extreme across explorer instances;
   the first open retains the previous 192 px tree height.
@@ -218,6 +223,4 @@ new writers.
   direct inputs.
 - `panel/src/components/SessionSidebar.tsx` — backend activity labels, waiting cancellation,
   clipping, collapse, and splitter behavior.
-- `panel/src/components/{AgentAnswer,ConversationLog,PlanView}.tsx` plus the vendored
-  `DiagramResponse` — scoped Mermaid rendering for AI answers and plans.
-- App/component tests cover ASK routing/submission and Mermaid plugin wiring.
+- App/component tests cover ASK routing/submission, Mermaid plugin wiring, and harness lifecycle.

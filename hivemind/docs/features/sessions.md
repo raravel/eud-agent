@@ -24,7 +24,7 @@ All writes use `memory::write_atomic_bytes` and UTF-8 without BOM. `index.json` 
 
 ```json
 {
-  "schemaVersion": 2,
+  "schemaVersion": 3,
   "sessions": [
     {
       "id": "<rust UUID>",
@@ -41,8 +41,9 @@ All writes use `memory::write_atomic_bytes` and UTF-8 without BOM. `index.json` 
 conversation and submitting a later `chat` or `plan_feedback` advances
 `lastConversationAt` past every indexed row before the turn runs. Rename, panel-log autosave,
 context usage, activity transitions, rewind, cancellation, and changeset decisions do not change
-conversation recency. Schema-v1 `updatedAt` seconds remain readable and migrate to
-`lastConversationAt` milliseconds on the next save.
+conversation recency. Schema-v1 `updatedAt` seconds remain readable. The one-time v3 cutover
+preserves names and panel logs while resetting legacy thread/context/pending execution ownership
+and unaccepted session workspaces/journals before the new harness state machine starts.
 
 Each session file contains the flattened metadata plus:
 
@@ -69,7 +70,35 @@ Each session file contains the flattened metadata plus:
     },
     "modelContextWindow": 128000
   },
-  "panelLog": { "schemaVersion": 2, "logSeq": 4, "log": [] }
+  "panelLog": { "schemaVersion": 2, "logSeq": 4, "log": [] },
+  "contextState": {
+    "schemaVersion": 1,
+    "instructionEpoch": 3,
+    "staticPromptFingerprint": "<sha256>",
+    "delivered": {
+      "threadId": "019ece1c-...",
+      "epoch": 3,
+      "memorySha256": "<sha256>",
+      "wikiSha256": "<sha256>",
+      "taskRevision": 8
+    }
+  },
+  "taskState": {
+    "schemaVersion": 1,
+    "events": [],
+    "leafId": null,
+    "projection": {
+      "revision": 0,
+      "topic": null,
+      "goals": [],
+      "targetSets": [],
+      "constraints": [],
+      "decisions": [],
+      "authoritativeArtifacts": [],
+      "blockers": [],
+      "acceptanceCriteria": []
+    }
+  }
 }
 ```
 
@@ -81,6 +110,13 @@ journals in the same project. `panelLog` is opaque to Rust.
 `contextUsage` is absent until Codex emits `thread/tokenUsage/updated`; `last.totalTokens` is the
 active context size, while `total` is cumulative for the thread. The latest snapshot is persisted
 outside `panelLog`, so unopened rows retain usage across an app restart.
+
+`contextState` persists the instruction epoch, static-baseline fingerprint, and only the last
+successfully delivered model cursor. `taskState.events` is append-only; `leafId` selects the
+current branch and `projection` is a checksum-verified cache rebuilt from that branch on load.
+Both top-level fields use `serde(default)`. Existing schema-v3 records without them retain their
+name, thread, pending review, usage, and panel log and load with empty state; there is no new global
+schema cutover.
 
 Attachment bytes remain under `%localappdata%\eud-agent\attachments\objects\` and are bound to
 the session on send.
@@ -94,7 +130,7 @@ The panel persists only conversation history:
   "schemaVersion": 2,
   "logSeq": 4,
   "log": [
-    { "id": 1, "kind": "you", "text": "이 화면을 확인해 줘", "attachments": [] },
+    { "id": 1, "kind": "you", "text": "이 화면을 확인해 줘", "clientTurnId": "6aa5d80d-...", "attachments": [], "mentions": [] },
     { "id": 2, "kind": "agent", "text": "..." },
     { "id": 3, "kind": "info", "text": "도구 호출 2건", "tools": [] },
     { "id": 4, "kind": "ok", "text": "적용 유지" }
@@ -103,11 +139,26 @@ The panel persists only conversation history:
 ```
 
 Transient turn, plan, changeset, activity, wiki, and connection state is not persisted in
-`panelLog`. `conversation_rewind` replaces the log with the selected prefix, clears the thread
-id, pending request ids, and context usage, and stages a condensed replay for the next fresh
-thread. Rewind is rejected while the session is running, waiting for write, or has a recoverable
-pending review. If every pending marker instead names a missing or empty journal, explicit rewind
-clears the unrecoverable markers and repairs the session so conversation can resume.
+`panelLog`. Every new `you` row gets a UUID `clientTurnId` before it is appended; `chat` or
+`plan_feedback` sends the same value, and a transport retry reuses it. Editing and resending creates
+a new id for the new branch. Hydrated legacy rows may omit the field.
+
+`conversation_rewind` replaces the log with the selected prefix, clears the thread id, pending
+request ids, context usage, and context delivery cursor, and moves the task-event leaf to the final
+retained `clientTurnId` before staging a condensed replay. Abandoned task events remain durable.
+A legacy prefix without an id does not guess from text or sequence; it selects an empty task
+projection. Rewind is rejected while the session is running, waiting for write, or has a
+recoverable pending review. If every pending marker instead names a missing or empty journal,
+explicit rewind clears the unrecoverable markers and repairs the session so conversation can
+resume.
+
+`PanelLogEntry.mentions` is an optional additive schema-v2 field containing ordered generic
+`MentionInstance` records. The panel preserves exact backend-created snapshots through autosave,
+hydrate, session reload, historical rendering, edit, and rewind without resolving them. Edited
+historical mentions are revalidated on resend and may fail stale. Each selected session owns only
+its own durable mention history; unsent chips are scoped to the selected session and become
+invalid when the active EUD project changes. A rejected chat or plan-feedback invoke restores the
+complete unsent text, attachments, and mentions.
 
 ## Backend activity
 
@@ -130,9 +181,24 @@ running_write -> review -> idle
 running_write -> idle
 ```
 
-Plan review uses `review` presentation before approval. Changeset review keeps only that
+Plan review uses `review` presentation before approval. Code changeset review keeps only that
 session's write registration and journal; it does not reserve a project-wide execution lane.
 Partial decisions and failed rollback remain `review`.
+
+Post-acceptance harness jobs are a separate durable state machine:
+
+```text
+waiting_runtime -> pending -> running -> review -> completed
+       \-> skipped             \-> failed -> pending (manual retry)
+review -> rejected
+```
+
+`skipped` is terminal and means the user cancelled runtime verification and all harness
+generation while keeping accepted code.
+
+Harness state never changes `session_activity`, never occupies the conversation worker mutex, and
+never disables chat. Each attempt owns a synthetic Codex driver with no MCP server, one constrained
+turn, and a dedicated document workspace.
 
 ## Session workers
 
@@ -215,6 +281,14 @@ immutable, and preserved after implementation rejection.
 
 ## Tauri IPC
 
+`mention_search` is a separate read-only main-panel composer command. It searches only the current
+saved-project authority, returns opaque snapshots, has no model/MCP exposure, and does not mutate
+or select a session. The selected session id is required only when the resulting instances are
+sent through `chat` or `plan_feedback`.
+
+`chat` and `plan_feedback` also require the panel-generated `clientTurnId`. The backend validates
+it as a UUID and carries it unchanged into task-state lifecycle events.
+
 All conversation commands include `sessionId`:
 
 | command | purpose |
@@ -226,6 +300,12 @@ All conversation commands include `sessionId`:
 | `cancel` | interrupt that turn or remove that write ticket |
 | `conversation_rewind` | reset that idle session to a log prefix |
 | `session_open` | hydrate/reconnect one persisted worker |
+| `harness_jobs` | list/recover durable jobs for one session |
+| `harness_runtime_confirm` | release a runtime-sensitive job after user verification |
+| `harness_skip` | terminate a runtime-waiting job without durable harness updates |
+| `harness_dismiss` | durably hide a terminal job card without deleting its audit record |
+| `harness_retry` | retry one failed job with one new model attempt |
+| `harness_decision` | accept/reject an atomic harness document changeset |
 
 `session_list`, `session_load`, `session_create`, `session_update_log`, `session_rename`, and
 `session_delete` do not require write registration. `memory_save` and `wiki_save` use short
@@ -237,8 +317,11 @@ Every conversation event has a required immutable `sessionId`:
 - turn `progress` and turn `error`;
 - `session_activity`.
 
-Project status, list, memory/wiki snapshots, setup, bootstrap, and RAG warmup remain global.
-`session_active` and selected-row event-routing fallbacks do not exist.
+`harness_job` is separately session-scoped and carries durable job status, attempt count,
+runtime-verification state, optional failure/summary, optional memory file names, and the
+secondary document changeset while under review. Project status, list, memory/wiki snapshots,
+setup, bootstrap, and RAG warmup remain global. `session_active` and selected-row routing
+fallbacks do not exist.
 
 ## Map Agent session history
 
@@ -299,6 +382,14 @@ The transition into `running_write` appends
 simultaneously, and review in one row does not disable another row. Selection only changes the
 rendered store. Delete/rewind remains disabled for running and review rows.
 
+Each `SessionSlot` also keeps `harnessJobs`. `HarnessStatusCard` shows explicit runtime waiting,
+skip, background generation, retryable failure, atomic document review, and the latest terminal
+result. Failed/completed/rejected/skipped cards expose a labelled close control. The backend
+persists `dismissed`; the panel retains that marker so closing the newest terminal result does not
+surface an older one after an event or restart. The main PromptInput remains enabled.
+`harness_jobs` snapshot hydration merges by `updatedAt`, so a slower snapshot cannot overwrite a
+newer push event.
+
 The left sidebar remains 220–420 px, collapses to a 56 px rail, and ellipsizes long names with a
 title. The center and both sidebars keep `min-width: 0`/horizontal clipping so the configured
 960 px minimum surface has no horizontal overflow.
@@ -307,13 +398,18 @@ title. The center and both sidebars keep `min-width: 0`/horizontal clipping so t
 
 - Rust barrier tests: different-session overlap, same-session serialization, concurrent write
   registration, and per-project operation serialization.
-- Runtime tests: request/evidence/budget/preflight/source-baseline isolation.
-- Workspace tests: independent snapshots, non-overlapping three-way merge, explicit overlapping
-  conflict, rejection invariance, and approved plans.
-- Panel integration: overlapping `chat` invokes, simultaneous write/review activities, immutable
-  event routing, and selection independence.
-- Session recency: project/status/context fan-out leaves every idle timestamp unchanged; a new
-  `chat` or `plan_feedback` advances only its session and moves that row to the top immediately
-  and after restart.
-- Browser mock-Tauri smoke: concurrent read/write/review and 1280/960 px horizontal-overflow
-  checks.
+- Harness tests: runtime/static classification, skip-without-generation, structured delta
+  validation, deterministic worklog staging, durable interrupted-job recovery, schema-v3 reset,
+  and foreground completion without document repair turns.
+- Active-state tests cover append/reload/replay equivalence, projection cache repair, 10-member
+  target sets, authority/provenance rejection, anchored rewind with retained abandoned events,
+  detached promotion audit, and legacy no-anchor fail-closed behavior.
+- Panel tests cover chat/plan-feedback anchors, retry id reuse, new edit-branch ids, hydration,
+  legacy rows, and alignment after the 500-entry log cap.
+- Panel integration: overlapping conversations, immutable `harness_job` routing, runtime
+  confirmation, skip, retry, terminal dismissal, atomic document review, and input availability
+  during background work.
+- Session recency: project/status/context/harness fan-out leaves every idle timestamp unchanged;
+  a new `chat` or `plan_feedback` advances only its session.
+- Browser mock-Tauri smoke: a completed/failed terminal card closes durably while the chat input
+  stays enabled and horizontal overflow remains zero at 1280 px.

@@ -45,10 +45,17 @@ happy-dom ^16.8.1.
 - anyhow 1 + thiserror 1 — error handling
 - bindgen 0.70 — generate FFI from `native/isom/isom_capi.h` (in `isom-sys`)
 
+Map import uses existing `sha2`, `serde`, `parking_lot`, `uuid`, Tauri dialog/window APIs, and the
+existing statically linked isom CHK/render/mapedit surface. No second map parser, copy engine, or
+frontend rendering stack is introduced. External container bytes are streamed with a 256 MiB cap
+into `%localappdata%\eud-agent\map_imports\blobs`; small strict project metadata stays under
+`%appdata%\eud-agent\map_candidates\<project-id>\import-palette.json`.
+
 Runtime toolchain: each saved session owns an official Codex CLI app-server client and ephemeral
 loopback eud-tools MCP endpoint. Two strict elevated Windows profiles select read-only or
-lease-owner write access to that session's isolated workspace; both disable network and avoid
-repository instructions.
+lease-owner write access to that session's isolated workspace; both disable sandboxed command
+network access and avoid repository instructions. Codex hosted web search is explicitly `live`
+and remains separate from that local process boundary.
 
 ## Build Artifacts
 - tailwindcss v4.x (from `panel/dist` build via `@tailwindcss/vite`) — ground truth for
@@ -82,7 +89,9 @@ repository instructions.
   memory, config, bootstrap, and CHK.
 - `crates/isom-sys`, `crates/isom` — FFI bindings + safe wrapper for the C++ engine.
 - `native/isom/` — vendored C++ + C ABI shim.
-- `panel/` — React app (reused), Tauri IPC transport; built to `panel/dist`.
+- `panel/` — React multi-entry app (`index.html`, `map-agent.html`, `map-import.html`) over Tauri
+  IPC. Map Agent and the read-only importer inject candidate/import render sources into the same
+  `MapCanvas`/`MapMinimap` implementations.
 - `ci/` — RAG index builder + the committed corpus `ci/corpus/*.jsonl` (re-embeds the in-repo
   corpus with the runtime fastembed pipeline; output published to GitHub Releases).
 - `tools/scraper/` — Node.js + TypeScript corpus tooling (local-only): authenticated Naver-Cafe

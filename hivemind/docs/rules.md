@@ -79,6 +79,11 @@ hosting, panel re-arm, and server spawning are REMOVED.
 - NEVER poll `.result` without a timeout. Default 10s; use 180s for full-project
   `EPSNAPSHOT` scans, and extend other requests to 180s when `status.txt` says
   `compiling=true` while emitting `progress {stage: waiting_build}` to the panel.
+- `status.txt` MUST carry same-idle-Tick `project` and saved `openMapName`; the compiling path
+  MUST reuse both cached values without touching `pjData`. Passive Map Agent source probes MUST
+  read that snapshot plus filesystem metadata and MUST NOT enqueue bridge commands. Explicit
+  saved-map confirmation MUST fail immediately while compiling and otherwise use a fixed
+  three-second normal/busy timeout, never the default 10s/180s policy.
 
 ## Agent epScript project architecture
 
@@ -137,11 +142,13 @@ hosting, panel re-arm, and server spawning are REMOVED.
   turns use `%appdata%\eud-agent\workspaces\.sessions\<project-id>\<session-id>`; the
   canonical accepted workspace is never a writable Codex cwd.
 - Read turns MUST use `eud_workspace_read`: `:minimal` runtime reads, current session root
-  read-only, network disabled, elevated exact-root Windows backend.
+  read-only, sandboxed command network disabled, elevated exact-root Windows backend.
 - Write turns MUST use `eud_workspace_write`: `:minimal` runtime reads, only the current
-  session root writable, `source/**` read-only, network disabled, elevated exact-root backend.
-  Write mode is available only to the exact project/session/request lease owner. Unsupported
-  setup fails closed; NEVER downgrade to legacy Windows workspace-write.
+  session root writable, `source/**` read-only, sandboxed command network disabled, elevated
+  exact-root backend. Write mode is available only to the exact project/session/request lease
+  owner. Unsupported setup fails closed; NEVER downgrade to legacy Windows workspace-write.
+- Codex hosted web search MUST use `live` at app-server launch and on fresh/resumed threads.
+  Hosted search does not widen the sandboxed command network boundary.
 - App-server command-execution requests MUST be auto-approved in both read and write modes so
   native commands and Code Mode JavaScript run inside the active named profile. File-change,
   patch, and generic permission-expansion requests MUST remain denied; command approval MUST
@@ -256,11 +263,26 @@ hosting, panel re-arm, and server spawning are REMOVED.
   delete MUST remove the entry. Each Map session MUST bind that shared definition to its own
   visible candidate revision. A stamp mention identifies the selection but NEVER grants placement
   authority.
-- Region stamps MUST read source content from the visible candidate at placement time and resolve
-  server-side to exact typed operations. The model and React MUST NOT read, enumerate, infer, or
-  provide the source MTXM matrix. Exact copy/duplicate requests MUST NOT be reconstructed through
-  render comparison, catalog walks, expected-before probes, semantic ISOM, or approximate flat
-  tiles.
+- Imported stamps MUST live in strict project-scoped `import-palette.json`, never
+  `selection-palette.json`. The trusted `map-import` window is the only source picker/save
+  authority; model tools and natural language MUST NOT select files, manage imports, or receive
+  original paths, blob paths, raw CHK, object records, or MTXM/TILE matrices.
+- External input MUST be a regular `.scx`/`.scm` file no larger than 256 MiB. Copy and SHA-256 it
+  into the local content-addressed blob store before extraction/render/save/place; after pinning,
+  NEVER read the original path again. Raw `scenario.chk`, cross-tileset conversion, and unsupported
+  CHK layers/assets are forbidden.
+- An imported snapshot MUST bind project id, source file/CHK hashes, tileset, source dimensions,
+  canonical mask, and selected layers. Source blob/hash/CHK mismatch, stale/deleted snapshot,
+  project/OpenMapName switch, destination revision change, tileset mismatch, bounds, target,
+  protect, collision, partial-replace, or location-slot failure MUST reject before model execution
+  or candidate mutation. Active requests retain their pinned blob until cleanup.
+- Stamp tools use a strict `candidateSelection | imported` source union and resolve both sources
+  server-side through `compile_stamp_placement`. Candidate selections read the visible candidate;
+  imported ids resolve only from validated `ImportedStamp` mentions in the current request. An
+  imported mention identifies copy material and NEVER grants destination write authority.
+  React/model MUST NOT read, enumerate, infer, or provide source MTXM. Exact copy/duplicate
+  requests MUST NOT be reconstructed through render comparison, catalog walks, expected-before
+  probes, semantic ISOM, or approximate flat tiles.
 - A stamp copies only its canonical mask and selected supported layers; an empty layer set means
   all six supported layers. Units, buildings, doodads, sprites, and locations MUST be included
   only when their complete footprint lies inside the source mask. Destination top-left positions
@@ -272,6 +294,10 @@ hosting, panel re-arm, and server spawning are REMOVED.
   fully-contained selected-layer items; a boundary-crossing item fails closed. Both paths are
   all-or-nothing and MUST pass current target/protect authority, free-location-slot, native edit,
   per-batch verification, finalize, and deterministic replay rails.
+- Source and destination whole-map dimensions MAY differ. The source mask MUST canonicalize within
+  source dimensions, destination masks MUST fit destination/authority dimensions, and source and
+  destination tilesets MUST match exactly. Published manifest replay and trusted Apply MUST use
+  only persisted typed operations and remain deterministic after the imported blob/path is gone.
 - Image attachments create no write permission, image mention, whole-map authority, or permission
   toggle. Current-request images are opaque `image-N` bindings. `map_image_place` accepts only that
   ref and integer tile placement, server-generates one normal `TerrainBlit`, and passes it through
@@ -304,6 +330,37 @@ hosting, panel re-arm, and server spawning are REMOVED.
 - Apply MUST persist and flush a pending transaction record before replacing the source. Startup
   restores an uncommitted interrupted Apply; a committed candidate state prevents false rollback.
   The record is cleared only after candidate state persistence or exact undo.
+
+## Main resource mention authority
+
+- Main chat and plan feedback use only the generic ordered `mentions` field. `mapMentions` remains
+  Map-window-owned; map-specific main-surface fields and parallel mention transports are forbidden.
+- The panel MUST echo snapshots returned by `mention_search`. It MUST NOT manufacture or infer
+  project ids, source hashes, selection hashes, location fingerprints, paths, coordinates, ids, or
+  authority from visible `@labels` or natural-language text.
+- Rust MUST deserialize a closed namespaced/versioned `MentionSnapshot` union with variant-level
+  unknown-field rejection and exhaustive provider/resolver matching. Generic unvalidated JSON
+  payloads, dynamic registries, reflection, and placeholder future providers are forbidden.
+- Resolve the complete ordered mention batch immediately before every main chat or plan-feedback
+  Codex execution. More than 16 instances, duplicate instance ids, unsupported kind/version,
+  stale/invalid snapshots, or any single resolution failure MUST reject the complete request
+  before the driver call. Never drop, remap, or partially accept mentions.
+- `map.region` reads only the exact project's `selection-palette.json` through `CandidateStore` and
+  binds the current saved source-map SHA-256, dimensions, selection id, and complete persistent
+  selection hash. Model context contains compact metadata only, never canonical rows or candidate
+  paths.
+- `map.location` reads only current saved-source `MRGN` records and binds source SHA-256, exact id,
+  and complete decoded-record fingerprint. Un-applied candidate locations MUST NOT appear.
+- `[resolved mentions]` is backend-generated trusted context and MUST remain outside and before
+  `[user message]`. It grants no read/write permission and bypasses none of the evidence, plan,
+  write-lane, budget, MapSafe, journal, changeset, preflight, build, or rollback rules.
+- For EPS behavior using a resolved region, call `map_info(mode=locations)` first. Reuse an exact
+  same-name/same-bounds location; create a missing rectangular one only through journaled
+  `location_write(action=add)`. Same-name/different-bounds and free-form regions require explicit
+  user decisions. Never silently approximate, overwrite, rename, move, suffix, delete, or
+  repurpose a location, and never create/delete/repurpose `#64 Anywhere`.
+- Main resource mentions never expose Map Agent original Apply or weaken its trusted
+  Map-window-only boundary.
 
 ## Rust / C++ FFI (NEW)
 
@@ -395,11 +452,12 @@ hosting, panel re-arm, and server spawning are REMOVED.
   unit's `ButtonSet` to a different set id — always edit the unit's OWN set in place.
 - Evidence gate (EUD-090): mutating tool calls are REJECTED (`EvidenceRequired`) until one
   `search_docs` has RUN in the request (RAG-wired layers only); zero hits still lift the
-  gate (mark items 근거 없음 (일반 EUD 지식) — NEVER fabricate a source). Exempt:
-  `memory_write`, `build_run`. The `[evidence]` section requires why + a source link
-  (`[제목](url)`) on propose_plan steps AND the final answer; `[reference context]` chunks
-  carry `source:` headers. Crash diagnosis MUST first match `[first principles]` with the
-  item number cited (or "no item matches") before any fix.
+  gate (mark items 근거 없음 (일반 EUD 지식) — NEVER fabricate a source). `build_run` is
+  exempt. Project memory is no longer an MCP mutation; the accepted harness delta owns durable
+  memory synchronization. The `[evidence]` section requires why plus a source link
+  (`[제목](url)`) on propose_plan steps and the final answer; `[reference context]` chunks carry
+  `source:` headers. Crash diagnosis MUST first match `[first principles]` with the item number
+  cited (or "no item matches") before any fix.
 - Resumed turn text ALWAYS labels the user's text with a `[user message]` header after the
   prepended context; the system prompt carries the `[message format]` section (only
   `[user message]` is the instruction; a bug report there is a work request) (EUD-092).
