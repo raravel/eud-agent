@@ -37,6 +37,13 @@ export const PROGRESS_STAGES = [
   "workspace",
   "lsp",
   "waiting_build",
+  "bootstrap",
+  "audio_probe",
+  "audio_transcode",
+  "audio_validate",
+  "waiting_map_close",
+  "map_sound_write",
+  "map_sound_verify",
 ] as const;
 export type KnownProgressStage = (typeof PROGRESS_STAGES)[number];
 /** Open string - the core may emit warmup/other stages not in the closed set. */
@@ -80,6 +87,13 @@ export interface WorkspaceReadResponse {
   path: string;
   source: boolean;
   content: string;
+}
+
+/** `workspace_search` command output. */
+export interface WorkspaceSearchResponse {
+  workspaceId: string;
+  query: string;
+  paths: string[];
 }
 
 /**
@@ -424,7 +438,59 @@ export interface SessionMeta {
   lastConversationAt: number;
 }
 
-export type AttachmentKind = "image" | "text";
+export type MentionKind = "map.region" | "map.location";
+
+export interface MapRegionMentionV1 {
+  kind: "map.region";
+  version: 1;
+  projectId: string;
+  sourceFileSha256: string;
+  mapWidth: number;
+  mapHeight: number;
+  selectionId: string;
+  selectionSnapshotHash: string;
+}
+
+export interface MapLocationMentionV1 {
+  kind: "map.location";
+  version: 1;
+  projectId: string;
+  sourceFileSha256: string;
+  locationId: number;
+  locationFingerprint: string;
+}
+
+export type MentionSnapshot = MapRegionMentionV1 | MapLocationMentionV1;
+
+export interface MentionInstance {
+  id: string;
+  label: string;
+  detail?: string;
+  mention: MentionSnapshot;
+  stale?: boolean;
+}
+
+export interface MentionSearchRequest {
+  query: string;
+  kinds?: MentionKind[];
+  limit?: number;
+}
+
+export interface MentionSuggestion {
+  resourceKey: string;
+  kind: MentionKind;
+  label: string;
+  detail?: string;
+  mention: MentionSnapshot;
+}
+
+export interface MentionSearchResponse {
+  schema: "eud-mention-search/1";
+  results: MentionSuggestion[];
+  truncated: boolean;
+}
+
+export type AttachmentKind = "image" | "text" | "audio";
 
 /** App-owned attachment metadata returned by `attachment_stage`. */
 export interface AttachmentDescriptor {
@@ -435,7 +501,7 @@ export interface AttachmentDescriptor {
   size: number;
 }
 
-/** Attachment metadata retained in the panel log; image previews are small data URLs. */
+/** Attachment metadata retained in the panel log; only images may carry small preview data URLs. */
 export interface ChatAttachment extends AttachmentDescriptor {
   previewUrl?: string;
 }
@@ -464,6 +530,7 @@ export interface PanelLogEntry {
   stage?: string;
   tools?: PanelLogTool[];
   attachments?: ChatAttachment[];
+  mentions?: MentionInstance[];
 }
 
 /** Durable archived-tool row persisted in a {@link PanelLogEntry} (subset of AgentTool). */
@@ -544,6 +611,7 @@ export interface ChatMessage extends SessionCommand {
   clientTurnId: string;
   text: string;
   attachments: string[];
+  mentions?: MentionInstance[];
 }
 
 /** `plan_feedback` iterates the plan owned by one active session. */
@@ -552,6 +620,7 @@ export interface PlanFeedbackMessage extends SessionCommand {
   clientTurnId: string;
   text: string;
   attachments: string[];
+  mentions?: MentionInstance[];
 }
 
 /** `plan_approve` resumes the plan owned by one active session. */

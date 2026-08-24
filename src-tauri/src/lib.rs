@@ -10,6 +10,7 @@ use tauri::path::BaseDirectory;
 use tauri::{Emitter, Manager};
 
 pub mod attachment;
+pub mod audio;
 pub mod bootstrap;
 pub mod bridge_install;
 pub mod bridge_io;
@@ -28,12 +29,14 @@ pub mod map_agent;
 pub mod map_candidate;
 pub mod map_context;
 pub mod map_image;
+pub mod map_import;
 pub mod map_model;
 pub mod map_stamp;
 pub mod map_verify;
 pub mod mapsafe;
 pub mod mcp;
 pub mod memory;
+pub mod mentions;
 pub mod rag;
 pub mod session;
 pub mod setup;
@@ -231,6 +234,13 @@ pub fn run() {
                 if auto {
                     // run_bootstrap already emitted the failure to the panel.
                     let _ = setup::run_bootstrap(&boot_handle, &boot_dirs).await;
+                } else if !bootstrap::managed_ffmpeg_ready(&boot_dirs) {
+                    let emitter = bootstrap::TauriEmitter(boot_handle.clone());
+                    if let Err(error) = bootstrap::ensure_ffmpeg(&boot_dirs, &emitter).await {
+                        eprintln!(
+                            "eud-agent: managed audio converter remains unavailable: {error}"
+                        );
+                    }
                 }
             });
 
@@ -280,7 +290,12 @@ pub fn run() {
                     eprintln!("eud-agent: pending Map Agent Apply recovery is blocked: {error}");
                 }
             }
-            let candidates = map_candidate::CandidateStore::new(data_dirs.clone());
+            let imports = map_import::MapImportStore::new(data_dirs.clone());
+            if let Err(error) = imports.cleanup_startup() {
+                eprintln!("eud-agent: map import cleanup skipped: {error}");
+            }
+            app.manage(imports.clone());
+            let candidates = map_candidate::CandidateStore::new(data_dirs.clone(), imports);
             if let Err(error) = candidates.cleanup_startup() {
                 eprintln!("eud-agent: candidate cache cleanup skipped: {error}");
             }
@@ -295,6 +310,13 @@ pub fn run() {
                 candidates,
                 writes,
             );
+            let mentions = services.mentions();
+            app.manage(mentions.clone());
+            tauri::async_runtime::spawn_blocking(move || {
+                if let Err(error) = mentions.warmup() {
+                    eprintln!("eud-agent: mention context warmup skipped: {error}");
+                }
+            });
 
             // Warm the RAG embedding model in the background; readiness NEVER
             // gates startup (search_docs returns zero hits until it is ready,
@@ -360,7 +382,17 @@ pub fn run() {
             engine::engine_session_open,
             engine::engine_session_rename,
             engine::engine_session_delete,
+            mentions::mention_search,
             map_agent::map_agent_open,
+            map_import::map_agent_import_open,
+            map_import::map_import_bootstrap,
+            map_import::map_import_source_pick,
+            map_import::map_import_source_render,
+            map_import::map_import_source_objects,
+            map_import::map_import_stamp_save,
+            map_import::map_import_stamp_list,
+            map_import::map_import_stamp_thumbnail,
+            map_import::map_import_stamp_delete,
             map_agent::map_agent_bootstrap,
             map_agent::map_agent_session_list,
             map_agent::map_agent_session_create,
@@ -399,6 +431,7 @@ pub fn run() {
             ipc::memory_save,
             ipc::workspace_list,
             ipc::workspace_read,
+            ipc::workspace_search,
             ipc::wiki_get,
             ipc::wiki_save,
             setup::setup_status,

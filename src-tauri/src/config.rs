@@ -205,6 +205,11 @@ impl DataDirs {
         self.app_data.join("map_candidates")
     }
 
+    /// `%localappdata%\eud-agent\map_imports` — content-addressed external map blobs.
+    pub fn map_imports_dir(&self) -> PathBuf {
+        self.app_local_data.join("map_imports")
+    }
+
     /// `%appdata%\eud-agent\memory\<sanitized-project>\wiki` — the dat-edit ledger
     /// dir for `project`. Derived from [`Self::memory_dir`] + the SAME
     /// [`crate::memory::sanitize_project_name`] so the wiki lands beside the
@@ -227,6 +232,11 @@ impl DataDirs {
     /// survive a self-update, decision D). Small + user-owned.
     pub fn sessions_dir(&self) -> PathBuf {
         self.app_data.join("sessions")
+    }
+
+    /// `%appdata%\eud-agent\harness_jobs` — durable post-acceptance sync jobs.
+    pub fn harness_jobs_dir(&self) -> PathBuf {
+        self.app_data.join("harness_jobs")
     }
 
     /// `%localappdata%\eud-agent\models` — NEVER in Roaming (the model is ~570MB).
@@ -255,6 +265,10 @@ impl DataDirs {
     pub fn attachments_dir(&self) -> PathBuf {
         self.app_local_data.join("attachments")
     }
+    /// `%localappdata%\eud-agent\audio_temp` — request-owned normalized audio.
+    pub fn audio_temp_dir(&self) -> PathBuf {
+        self.app_local_data.join("audio_temp")
+    }
     /// `%localappdata%\eud-agent\lsp_workspaces` — regenerable, app-owned
     /// epScript snapshots and candidate analysis directories. Never Roaming.
     pub fn lsp_workspaces_dir(&self) -> PathBuf {
@@ -282,12 +296,15 @@ impl DataDirs {
             self.map_candidates_dir(),
             self.journal_dir(),
             self.sessions_dir(),
+            self.harness_jobs_dir(),
             self.app_local_data.clone(),
             self.models_dir(),
             self.rag_dir(),
             self.bin_dir(),
             self.logs_dir(),
             self.attachments_dir(),
+            self.audio_temp_dir(),
+            self.map_imports_dir(),
             self.lsp_workspaces_dir(),
             self.codex_workspace_dir(),
         ] {
@@ -451,12 +468,14 @@ mod tests {
         assert!(dirs.map_backups_dir().is_dir());
         assert!(dirs.journal_dir().is_dir());
         assert!(dirs.sessions_dir().is_dir());
+        assert!(dirs.harness_jobs_dir().is_dir());
         // Local subtree — model/rag/logs NEVER in Roaming.
         assert!(dirs.app_local_data().is_dir());
         assert!(dirs.models_dir().is_dir());
         assert!(dirs.rag_dir().is_dir());
         assert!(dirs.logs_dir().is_dir());
         assert!(dirs.attachments_dir().is_dir());
+        assert!(dirs.map_imports_dir().is_dir());
         assert!(dirs.lsp_workspaces_dir().is_dir());
 
         assert!(dirs.workspaces_dir().is_dir());
@@ -466,6 +485,8 @@ mod tests {
         assert!(!dirs.models_dir().starts_with(dirs.app_data()));
         assert!(dirs.lsp_workspaces_dir().starts_with(dirs.app_local_data()));
         assert!(dirs.attachments_dir().starts_with(dirs.app_local_data()));
+        assert!(dirs.map_imports_dir().starts_with(dirs.app_local_data()));
+        assert!(!dirs.map_imports_dir().starts_with(dirs.app_data()));
         assert!(!dirs.attachments_dir().starts_with(dirs.app_data()));
         assert!(dirs.workspaces_dir().starts_with(dirs.app_data()));
         assert!(!dirs.workspaces_dir().starts_with(dirs.app_local_data()));
@@ -482,6 +503,10 @@ mod tests {
         assert_eq!(
             dirs.config_path(),
             PathBuf::from("C:\\roam\\eud-agent\\config.json")
+        );
+        assert_eq!(
+            dirs.map_imports_dir(),
+            PathBuf::from("C:\\loc\\eud-agent\\map_imports")
         );
     }
 

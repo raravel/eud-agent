@@ -4,7 +4,11 @@ import {
   MAX_LOG_ENTRIES,
   type PanelState,
 } from "@/state/store";
-import { CLIENT_MESSAGE_TYPES, SERVER_MESSAGE_TYPES } from "@/lib/ipc";
+import {
+  CLIENT_MESSAGE_TYPES,
+  SERVER_MESSAGE_TYPES,
+  type MentionInstance,
+} from "@/lib/ipc";
 
 function freshStore() {
   return createPanelStore();
@@ -17,6 +21,22 @@ function readyWithProject() {
   store.applyList({ files: [{ path: "a.eps", ftype: "CUIEps", settable: true }] });
   return store;
 }
+
+const regionMention = {
+  id: "mention-region",
+  label: "영역 A",
+  detail: "저장된 영역 · 사각형",
+  mention: {
+    kind: "map.region",
+    version: 1,
+    projectId: "project-a",
+    sourceFileSha256: "a".repeat(64),
+    mapWidth: 64,
+    mapHeight: 64,
+    selectionId: "region-a",
+    selectionSnapshotHash: "b".repeat(64),
+  },
+} satisfies MentionInstance;
 
 describe("initial state", () => {
   it("starts in connecting with an empty log, no project, no plan/changeset", () => {
@@ -209,13 +229,14 @@ describe("cancel and message rewind", () => {
     const store = readyWithProject();
     store.log("you", "첫 요청");
     store.log("agent", "첫 답변");
-    store.log("you", "수정할 요청");
+    store.log("you", "수정할 요청", undefined, undefined, [regionMention]);
     const selectedId = store.getState().log.at(-1)!.id;
     store.log("agent", "제거할 답변");
 
     const restored = store.rewindTo(selectedId);
 
     expect(restored?.text).toBe("수정할 요청");
+    expect(restored?.mentions).toEqual([regionMention]);
     expect(store.getState().log.map((entry) => entry.text)).toEqual([
       "첫 요청",
       "첫 답변",
@@ -605,6 +626,23 @@ describe("event log cap (drop oldest, max 500)", () => {
     const log = store.getState().log;
     expect(log.length).toBe(MAX_LOG_ENTRIES);
     expect(log[0].text).toBe("line 50");
+  });
+
+  it("keeps stable client turn anchors aligned after the 500-entry cap", () => {
+    const store = freshStore();
+    for (let i = 0; i < MAX_LOG_ENTRIES + 1; i += 1) {
+      store.log(
+        "you",
+        `turn ${i}`,
+        undefined,
+        undefined,
+        undefined,
+        `client-turn-${i}`,
+      );
+    }
+    const log = store.getState().log;
+    expect(log[0].clientTurnId).toBe("client-turn-1");
+    expect(log.at(-1)?.clientTurnId).toBe(`client-turn-${MAX_LOG_ENTRIES}`);
   });
 });
 
@@ -1176,6 +1214,14 @@ describe("saved attachment log hydration", () => {
               size: 5,
               previewUrl: "https://example.test/tracker.png",
             },
+            {
+              id: "audio-preview",
+              name: "theme.ogg",
+              mime: "audio/ogg",
+              kind: "audio",
+              size: 4096,
+              previewUrl: "data:image/png;base64,not-audio-log-data",
+            },
           ],
         },
       ],
@@ -1184,6 +1230,44 @@ describe("saved attachment log hydration", () => {
     const restored = store.getState().log[0].attachments;
     expect(restored?.[0].previewUrl).toBe("data:image/png;base64,safe");
     expect(restored?.[1].previewUrl).toBeUndefined();
+    expect(restored?.[2].previewUrl).toBeUndefined();
+  });
+  it("hydrates generic mentions and returns them unchanged from rewind", () => {
+    const store = freshStore();
+    store.hydrate({
+      schemaVersion: 2,
+      logSeq: 1,
+      log: [
+        {
+          id: 1,
+          kind: "you",
+          text: "수정할 요청",
+          clientTurnId: "11111111-1111-4111-8111-111111111111",
+          mentions: [regionMention],
+        },
+      ],
+    });
+
+    expect(store.getState().log[0].mentions).toEqual([regionMention]);
+    expect(store.getState().log[0].clientTurnId).toBe(
+      "11111111-1111-4111-8111-111111111111",
+    );
+    const rewound = store.rewindTo(1);
+    expect(rewound?.mentions).toEqual([regionMention]);
+    expect(rewound?.clientTurnId).toBe(
+      "11111111-1111-4111-8111-111111111111",
+    );
+  });
+
+  it("hydrates a legacy user log without a client turn id", () => {
+    const store = freshStore();
+    store.hydrate({
+      schemaVersion: 2,
+      logSeq: 1,
+      log: [{ id: 1, kind: "you", text: "legacy" }],
+    });
+    expect(store.getState().log[0].clientTurnId).toBeUndefined();
+    expect(store.rewindTo(1)?.text).toBe("legacy");
   });
 });
 

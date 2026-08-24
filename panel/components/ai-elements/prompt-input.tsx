@@ -76,11 +76,16 @@ export type PromptInputTextareaProps = ComponentProps<typeof InputGroupTextarea>
 export const PromptInputTextarea = ({
   className,
   placeholder = "무엇을 만들까요?",
+  onCompositionEnd,
+  onCompositionStart,
+  onKeyDown,
   ...props
 }: PromptInputTextareaProps) => {
   const [isComposing, setIsComposing] = useState(false);
 
   const handleKeyDown: KeyboardEventHandler<HTMLTextAreaElement> = (e) => {
+    onKeyDown?.(e);
+    if (e.defaultPrevented) return;
     if (e.key === "Enter") {
       if (isComposing || e.nativeEvent.isComposing) {
         return;
@@ -104,8 +109,14 @@ export const PromptInputTextarea = ({
   return (
     <InputGroupTextarea
       className={cn("min-h-16 max-h-48 shrink-0 field-sizing-content overflow-y-auto", className)}
-      onCompositionEnd={() => setIsComposing(false)}
-      onCompositionStart={() => setIsComposing(true)}
+      onCompositionEnd={(event) => {
+        setIsComposing(false);
+        onCompositionEnd?.(event);
+      }}
+      onCompositionStart={(event) => {
+        setIsComposing(true);
+        onCompositionStart?.(event);
+      }}
       onKeyDown={handleKeyDown}
       placeholder={placeholder}
       {...props}

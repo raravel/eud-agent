@@ -18,12 +18,15 @@ import {
   type ClientMessage,
   type LedgerEntry,
   type BackendSessionActivity,
+  type MentionSearchRequest,
+  type MentionSearchResponse,
   type ServerMessage,
   type ServerMessageType,
   type WikiMessage,
   type WorkspaceFileEntry,
   type WorkspaceListResponse,
   type WorkspaceReadResponse,
+  type WorkspaceSearchResponse,
 } from "./protocol";
 
 export * from "./protocol";
@@ -326,6 +329,7 @@ export class IpcClient {
           clientTurnId: msg.clientTurnId,
           text: msg.text,
           attachments: msg.attachments,
+          mentions: msg.mentions ?? [],
         };
       case "plan_feedback":
         return {
@@ -333,6 +337,7 @@ export class IpcClient {
           clientTurnId: msg.clientTurnId,
           text: msg.text,
           attachments: msg.attachments,
+          mentions: msg.mentions ?? [],
         };
       case "plan_approve":
         return { sessionId: msg.sessionId };
@@ -395,10 +400,12 @@ export class IpcClient {
       }
       return true;
     } catch (error) {
-      this.onLog(
-        "unknown",
-        `IPC command failed (${msg.type}): ${formatError(error)}`,
-      );
+      const detail = formatError(error);
+      const text =
+        msg.type === "chat" || msg.type === "plan_feedback"
+          ? `요청을 처리하지 못했습니다: ${detail}`
+          : `IPC command failed (${msg.type}): ${detail}`;
+      this.onLog("unknown", text);
       return false;
     }
   }
@@ -427,6 +434,26 @@ export class IpcClient {
       }
     }
   }
+}
+
+function toMentionSearchResponse(value: unknown): MentionSearchResponse {
+  if (
+    !isObject(value) ||
+    value.schema !== "eud-mention-search/1" ||
+    !Array.isArray(value.results) ||
+    typeof value.truncated !== "boolean"
+  ) {
+    throw new Error("invalid mention search response");
+  }
+  return value as unknown as MentionSearchResponse;
+}
+
+/** Search current backend-owned resources without exposing an unbounded catalog. */
+export async function mentionSearch(
+  request: MentionSearchRequest,
+  invoke: InvokeFn = tauriInvoke,
+): Promise<MentionSearchResponse> {
+  return toMentionSearchResponse(await invoke("mention_search", { request }));
 }
 
 /**
@@ -517,6 +544,29 @@ export async function workspaceRead(
     throw new Error("invalid workspace read response");
   }
   return value as unknown as WorkspaceReadResponse;
+}
+
+/** Search confined UTF-8 workspace files by path and content. */
+export async function workspaceSearch(
+  workspaceId: string,
+  query: string,
+  invoke: InvokeFn = tauriInvoke,
+): Promise<WorkspaceSearchResponse> {
+  const value = await invoke("workspace_search", { workspaceId, query });
+  if (
+    !isObject(value) ||
+    value.workspaceId !== workspaceId ||
+    value.query !== query ||
+    !Array.isArray(value.paths) ||
+    !value.paths.every((path) => typeof path === "string")
+  ) {
+    throw new Error("invalid workspace search response");
+  }
+  return {
+    workspaceId,
+    query,
+    paths: value.paths,
+  };
 }
 
 function toCodexModelSettings(value: unknown): CodexModelSettings {

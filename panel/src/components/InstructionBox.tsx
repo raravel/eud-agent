@@ -1,13 +1,13 @@
 /**
  * Main chat/plan-feedback input:
- *   - `chat {sessionId, text, attachments}` / session-scoped `plan_feedback`;
+ *   - generic ordered mentions plus text and session-owned attachments;
  *   - file picker, HTML5 drag-and-drop, and pasted clipboard images;
- *   - removable draft chips with generated image thumbnails;
- *   - Send is gated by the store's `canSend`; attachment-only messages are valid.
+ *   - removable attachment and resource-mention chips;
+ *   - Send is gated by the store's `canSend`; attachment-only and mention-only messages are valid.
  *
- * The textarea keeps the accessible name "지시 입력"; visible controls are
+ * The textarea is an accessible combobox named "지시 입력"; visible controls are
  * labelled "첨부" and "전송". Enter (without Shift / IME composition)
- * submits through PromptInput.
+ * submits through PromptInput when mention search is closed.
  */
 import {
   useEffect,
@@ -17,6 +17,7 @@ import {
   type DragEvent,
 } from "react";
 import {
+  AudioLinesIcon,
   FileTextIcon,
   ImageIcon,
   LoaderCircleIcon,
@@ -26,21 +27,27 @@ import {
 } from "lucide-react";
 import {
   PromptInput,
-  PromptInputBody,
   PromptInputFooter,
   PromptInputSubmit,
-  PromptInputTextarea,
   PromptInputTools,
 } from "@/components/ai-elements/prompt-input";
 import { PromptInputButton } from "@/components/ai-elements/prompt-input";
 import { CodexPromptControls } from "@/components/CodexPromptControls";
 import { AgentTurnStatus } from "@/components/AgentTurnStatus";
+import { MentionComposer } from "@/components/MentionComposer";
 import type { PanelState } from "@/state/store";
-import type { ChatAttachment, CodexModelSettings } from "@/lib/ipc";
+import type {
+  ChatAttachment,
+  CodexModelSettings,
+  MentionInstance,
+  MentionSearchRequest,
+  MentionSearchResponse,
+} from "@/lib/ipc";
 import {
   attachmentErrorMessage,
   formatAttachmentSize,
   MAX_ATTACHMENTS_PER_TURN,
+  MAX_AUDIO_BYTES_PER_TURN,
   MAX_TEXT_BYTES,
 } from "@/lib/attachments";
 
@@ -49,6 +56,7 @@ import {
 export interface ChatPayload {
   text: string;
   attachments: ChatAttachment[];
+  mentions: MentionInstance[];
   /** Preserved only when retrying a transport-rejected submission. */
   clientTurnId?: string;
 }
@@ -64,6 +72,12 @@ export interface InstructionBoxProps {
   onCancel?(): void;
   /** A past user message restored for editing after a successful rewind. */
   draft?: ChatPayload | null;
+  /** Backend-owned bounded resource search used by the generic composer. */
+  onMentionSearch?(request: MentionSearchRequest): Promise<MentionSearchResponse>;
+  /** Current editor project identity; a change invalidates unsent mention snapshots. */
+  projectIdentity?: string;
+  /** Selected session/draft identity; mention drafts never cross this boundary. */
+  scopeIdentity?: string;
   /** A cancel/rewind command is waiting for the core. */
   actionBusy?: boolean;
   /** Current Codex catalog + persisted selection. */
@@ -83,6 +97,9 @@ export function InstructionBox({
   onDiscardAttachment,
   onCancel,
   draft,
+  onMentionSearch,
+  projectIdentity = state.project,
+  scopeIdentity = "default",
   actionBusy = false,
   codexSettings,
   codexSettingsBusy = false,
@@ -91,27 +108,30 @@ export function InstructionBox({
 }: InstructionBoxProps) {
   const [instruction, setInstruction] = useState("");
   const [attachments, setAttachments] = useState<ChatAttachment[]>([]);
+  const [mentions, setMentions] = useState<MentionInstance[]>([]);
   const [attachmentError, setAttachmentError] = useState<string | null>(null);
   const [staging, setStaging] = useState(false);
   const [dragging, setDragging] = useState(false);
   const stagingRef = useRef(false);
+  const retryClientTurnId = useRef<string | undefined>(undefined);
   const dragDepth = useRef(0);
   const fileInput = useRef<HTMLInputElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
-  const retryClientTurnId = useRef<string | undefined>(undefined);
 
   useEffect(() => {
     if (draft === undefined || draft === null) return;
     setInstruction(draft.text);
     setAttachments([...draft.attachments]);
+    setMentions(draft.mentions.map((mention) => ({ ...mention })));
     retryClientTurnId.current = draft.clientTurnId;
     setAttachmentError(null);
     textareaRef.current?.focus();
   }, [draft]);
 
-  // Send gating v2: the store's single `canSend` selector (connected &&
-  // hasProject && !busy). Empty text is valid only when a staged attachment exists.
+  // The store owns connection/project/busy gating. Empty text remains valid when
+  // at least one staged attachment or validated mention is present.
   const canSend = state.canSend && !actionBusy;
+  const hasStaleMention = mentions.some((mention) => mention.stale === true);
   const turnInFlight = state.phase === "thinking";
   const ragLoading = state.rag === "loading";
   const editorDisconnected = !state.editorConnected;
@@ -164,6 +184,17 @@ export function InstructionBox({
             "한 번에 첨부하는 텍스트/코드는 합계 512KB 이하여야 합니다.",
           );
         }
+        const audioBytes =
+          next
+            .filter((attachment) => attachment.kind === "audio")
+            .reduce((total, attachment) => total + attachment.size, 0) +
+          (staged.kind === "audio" ? staged.size : 0);
+        if (audioBytes > MAX_AUDIO_BYTES_PER_TURN) {
+          await onDiscardAttachment?.(staged.id);
+          throw new Error(
+            "한 번에 첨부하는 오디오는 합계 128MB 이하여야 합니다.",
+          );
+        }
         next = [...next, staged];
         setAttachments(next);
       }
@@ -192,18 +223,23 @@ export function InstructionBox({
     if (
       !canSend ||
       stagingRef.current ||
-      (text.length === 0 && attachments.length === 0)
+      hasStaleMention ||
+      (text.length === 0 && attachments.length === 0 && mentions.length === 0)
     ) {
       return;
     }
     onSend({
       text,
       attachments,
-      ...(retryClientTurnId.current ? { clientTurnId: retryClientTurnId.current } : {}),
+      mentions,
+      ...(retryClientTurnId.current
+        ? { clientTurnId: retryClientTurnId.current }
+        : {}),
     });
     retryClientTurnId.current = undefined;
     setInstruction("");
     setAttachments([]);
+    setMentions([]);
     setAttachmentError(null);
   }
 
@@ -285,6 +321,8 @@ export function InstructionBox({
                     <span className="flex size-9 shrink-0 items-center justify-center rounded-md bg-background text-muted-foreground">
                       {attachment.kind === "image" ? (
                         <ImageIcon className="size-4" />
+                      ) : attachment.kind === "audio" ? (
+                        <AudioLinesIcon className="size-4" />
                       ) : (
                         <FileTextIcon className="size-4" />
                       )}
@@ -312,17 +350,19 @@ export function InstructionBox({
             })}
           </div>
         )}
-        <PromptInputBody>
-          <PromptInputTextarea
-            ref={textareaRef}
-            aria-label="지시 입력"
-            value={instruction}
-            onChange={(event) => setInstruction(event.target.value)}
-            onPaste={handlePaste}
-            placeholder={placeholder}
-            disabled={ragLoading || actionBusy}
-          />
-        </PromptInputBody>
+        <MentionComposer
+          text={instruction}
+          onTextChange={setInstruction}
+          mentions={mentions}
+          onMentionsChange={setMentions}
+          search={onMentionSearch}
+          projectIdentity={projectIdentity}
+          scopeIdentity={scopeIdentity}
+          disabled={ragLoading || actionBusy}
+          placeholder={placeholder}
+          textareaRef={textareaRef}
+          onPaste={handlePaste}
+        />
         <PromptInputFooter>
           <PromptInputTools>
             {onStageAttachment !== undefined && (
@@ -333,7 +373,7 @@ export function InstructionBox({
                   multiple
                   aria-label="파일 첨부"
                   className="hidden"
-                  accept="image/png,image/jpeg,image/webp,image/gif,text/*,.eps,.json,.md,.csv,.xml,.yaml,.yml,.toml,.js,.ts,.tsx,.py,.rs,.lua"
+                  accept="image/png,image/jpeg,image/webp,image/gif,audio/*,text/*,.eps,.json,.md,.csv,.xml,.yaml,.yml,.toml,.js,.ts,.tsx,.py,.rs,.lua,.wav,.ogg,.mp3,.flac,.m4a,.aac,.wma,.aiff,.aif,.opus"
                   disabled={attachmentInputDisabled}
                   onChange={(event) => {
                     if (event.target.files !== null) {
@@ -365,7 +405,10 @@ export function InstructionBox({
               onReload={onCodexSettingsReload}
             />
           </PromptInputTools>
-          <PromptInputSubmit aria-label="전송" disabled={!canSend || staging}>
+          <PromptInputSubmit
+            aria-label="전송"
+            disabled={!canSend || staging || hasStaleMention}
+          >
             <SendIcon className="size-4" />
             전송
           </PromptInputSubmit>

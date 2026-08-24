@@ -55,17 +55,20 @@ import {
   codexModelSettingsSave,
   compactSession,
   isAgentTurnEndTransition,
+  mentionSearch,
   wikiGet,
   notificationSoundPreview,
   wikiSave,
   workspaceList,
   workspaceRead,
+  workspaceSearch,
   type AskAnswer,
   type AppSettings,
   type LedgerEntry,
   type CodexModelSettings,
   type MemoryFile,
   type PanelLog,
+  type MentionSearchRequest,
   type PanelLogEntry,
   type ServerMessage,
   type SessionMeta,
@@ -122,8 +125,9 @@ const PANEL_LOG_SCHEMA_VERSION = 2;
 /**
  * Serialize the live conversation log into the durable {@link PanelLog} subset
  * pushed via `session_update_log`: `id/kind/text` plus optional
- * `stage`/`tools`/`attachments` survive; transient turn/plan/changeset/wiki state
- * is dropped. `logSeq` advances restored store counters past existing ids.
+ * `stage`/`tools`/`attachments`/`mentions` survive; transient
+ * turn/plan/changeset/wiki state is dropped. `logSeq` advances restored store
+ * counters past existing ids.
  */
 function serializePanelLog(log: readonly LogEntry[]): PanelLog {
   const entries: PanelLogEntry[] = log.map((entry) => {
@@ -143,7 +147,22 @@ function serializePanelLog(log: readonly LogEntry[]): PanelLog {
         ...(tool.detail !== undefined ? { detail: tool.detail } : {}),
       }));
     }
-    if (entry.attachments) next.attachments = entry.attachments;
+    if (entry.attachments) {
+      next.attachments = entry.attachments.map((attachment) => ({
+        id: attachment.id,
+        name: attachment.name,
+        mime: attachment.mime,
+        kind: attachment.kind,
+        size: attachment.size,
+        ...(attachment.kind === "image" &&
+        attachment.previewUrl?.startsWith("data:image/") === true
+          ? { previewUrl: attachment.previewUrl }
+          : {}),
+      }));
+    }
+    if (entry.mentions) {
+      next.mentions = entry.mentions.map((mention) => ({ ...mention }));
+    }
     return next;
   });
   const logSeq = log.reduce((max, entry) => (entry.id > max ? entry.id : max), 0);
@@ -1015,6 +1034,11 @@ export default function App() {
         /* no release / offline — no banner */
       });
   }, [setup, updater]);
+  const handleMentionSearch = useCallback(
+    (request: MentionSearchRequest) => mentionSearch(request),
+    [],
+  );
+
 
   // ---- user intents ----
   // Every session invokes immediately. The backend serializes commands only
@@ -1022,7 +1046,9 @@ export default function App() {
   const handleSend = useCallback(
     async (payload: ChatPayload) => {
       const compactRequested =
-        payload.text.trim() === "/compact" && payload.attachments.length === 0;
+        payload.text.trim() === "/compact" &&
+        payload.attachments.length === 0 &&
+        payload.mentions.length === 0;
       if (compactRequested) {
         setEditDraft(null);
         const slot = selectedSlot;
@@ -1072,7 +1098,9 @@ export default function App() {
       try {
         if (!slot.persisted) {
           const oldId = slot.id;
-          const seed = payload.text.trim() || "첨부 파일 분석";
+          const seed =
+            payload.text.trim() ||
+            (payload.mentions.length > 0 ? "리소스 멘션 요청" : "첨부 파일 분석");
           const record = await invoke<SessionRecord>("session_create", {
             firstText: seed,
           });
@@ -1099,6 +1127,7 @@ export default function App() {
             payload.text,
             undefined,
             payload.attachments,
+            payload.mentions,
             clientTurnId,
           );
           slot.store.log("agent", "계획 수정을 요청했습니다.");
@@ -1109,10 +1138,16 @@ export default function App() {
             clientTurnId,
             text: payload.text,
             attachments: payload.attachments.map((attachment) => attachment.id),
+            mentions: payload.mentions,
           });
           if (!sent) {
-            setEditDraft({ ...payload, clientTurnId });
             slot.store.errorReceived("계획 수정 요청을 처리하지 못했습니다.");
+            setEditDraft({
+              text: payload.text,
+              attachments: [...payload.attachments],
+              mentions: payload.mentions.map((mention) => ({ ...mention })),
+              clientTurnId,
+            });
           }
           return;
         }
@@ -1122,6 +1157,7 @@ export default function App() {
           payload.text,
           undefined,
           payload.attachments,
+          payload.mentions,
           clientTurnId,
         );
         slot.store.chatSent();
@@ -1131,13 +1167,24 @@ export default function App() {
           clientTurnId,
           text: payload.text,
           attachments: payload.attachments.map((attachment) => attachment.id),
+          mentions: payload.mentions,
         });
         if (!sent) {
-          setEditDraft({ ...payload, clientTurnId });
           slot.store.errorReceived("요청을 처리하지 못했습니다.");
+          setEditDraft({
+            text: payload.text,
+            attachments: [...payload.attachments],
+            mentions: payload.mentions.map((mention) => ({ ...mention })),
+            clientTurnId,
+          });
         }
       } catch (error) {
-        setEditDraft({ ...payload, clientTurnId });
+        setEditDraft({
+          text: payload.text,
+          attachments: [...payload.attachments],
+          mentions: payload.mentions.map((mention) => ({ ...mention })),
+          clientTurnId,
+        });
         slot.store.errorReceived(String(error));
         slot.store.log("error", `요청을 처리하지 못했습니다: ${String(error)}`);
       }
@@ -1212,6 +1259,7 @@ export default function App() {
           setEditDraft({
             text: restored.text,
             attachments: restored.attachments ?? [],
+            mentions: restored.mentions ?? [],
           });
         }
       } finally {
@@ -1229,7 +1277,7 @@ export default function App() {
   const handleSuggestion = useCallback(
     (text: string) => {
       if (!store.getState().canSend) return;
-      void handleSend({ text, attachments: [] });
+      void handleSend({ text, attachments: [], mentions: [] });
     },
     [store, handleSend],
   );
@@ -1589,6 +1637,15 @@ export default function App() {
     [workspaceData],
   );
 
+  const handleWorkspaceSearch = useCallback(
+    async (query: string) => {
+      if (!workspaceData) return [];
+      const response = await workspaceSearch(workspaceData.workspaceId, query);
+      return response.paths;
+    },
+    [workspaceData],
+  );
+
   const handleWorkspaceRefresh = useCallback(async () => {
     setWorkspaceLoading(true);
     setWorkspaceError(null);
@@ -1879,6 +1936,7 @@ export default function App() {
           />
         )}
 
+
         {state.plan &&
           (state.phase === "plan_review" || state.phase === "thinking") && (
             <PlanView
@@ -1914,6 +1972,9 @@ export default function App() {
         <InstructionBox
           state={state}
           onSend={handleSend}
+          onMentionSearch={handleMentionSearch}
+          projectIdentity={projectState.project}
+          scopeIdentity={selectedSlot?.id ?? `draft:${projectState.project}`}
           onStageAttachment={stageAttachment}
           onDiscardAttachment={discardAttachment}
           onCancel={handleCancel}
@@ -1944,6 +2005,7 @@ export default function App() {
         onMemoryEdited={projectStore.memoryEdited}
         onMemorySave={handleMemorySave}
         onWorkspaceSelect={handleWorkspaceSelect}
+        onWorkspaceSearch={handleWorkspaceSearch}
         onWorkspaceRefresh={handleWorkspaceRefresh}
       />
     </div>

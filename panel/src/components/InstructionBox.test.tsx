@@ -52,7 +52,7 @@ const codexSettings = {
 describe("InstructionBox — textarea sizing", () => {
   it("grows with multiline input until the capped height, then scrolls", () => {
     render(<InstructionBox state={readyState()} onSend={noop} />);
-    const textarea = screen.getByRole("textbox", { name: "지시 입력" });
+    const textarea = screen.getByRole("combobox", { name: "지시 입력" });
 
     fireEvent.change(textarea, {
       target: {
@@ -170,13 +170,42 @@ describe("InstructionBox — persistent active-turn feedback", () => {
       <InstructionBox
         state={readyState()}
         onSend={noop}
-        draft={{ text: "수정할 요청", attachments: [] }}
+        draft={{
+          text: "수정할 요청",
+          attachments: [
+            {
+              id: "text-1",
+              name: "notes.eps",
+              mime: "text/plain",
+              kind: "text",
+              size: 12,
+            },
+          ],
+          mentions: [
+            {
+              id: "mention-region",
+              label: "영역 A",
+              mention: {
+                kind: "map.region",
+                version: 1,
+                projectId: "project-a",
+                sourceFileSha256: "a".repeat(64),
+                mapWidth: 64,
+                mapHeight: 64,
+                selectionId: "region-a",
+                selectionSnapshotHash: "b".repeat(64),
+              },
+            },
+          ],
+        }}
       />,
     );
 
-    expect(screen.getByRole("textbox", { name: "지시 입력" })).toHaveValue(
+    expect(screen.getByRole("combobox", { name: "지시 입력" })).toHaveValue(
       "수정할 요청",
     );
+    expect(screen.getByText("notes.eps")).toBeInTheDocument();
+    expect(screen.getByTestId("mention-chips")).toHaveTextContent("@영역 A");
   });
 });
 
@@ -200,7 +229,7 @@ describe("InstructionBox — plan_review feedback channel (EUD-074)", () => {
 
   it("switches the placeholder to the plan-feedback guidance", () => {
     render(<InstructionBox state={planReviewState()} onSend={noop} />);
-    const ta = screen.getByRole("textbox", { name: "지시 입력" });
+    const ta = screen.getByRole("combobox", { name: "지시 입력" });
     expect(ta).toHaveAttribute(
       "placeholder",
       expect.stringContaining("계획"),
@@ -213,11 +242,12 @@ describe("InstructionBox — chat payload (v2)", () => {
     const user = userEvent.setup();
     const onSend = vi.fn<(p: ChatPayload) => void>();
     render(<InstructionBox state={readyState()} onSend={onSend} />);
-    await user.type(screen.getByRole("textbox", { name: "지시 입력" }), "트리거 추가");
+    await user.type(screen.getByRole("combobox", { name: "지시 입력" }), "트리거 추가");
     await user.click(screen.getByRole("button", { name: "전송" }));
     expect(onSend).toHaveBeenCalledWith({
       text: "트리거 추가",
       attachments: [],
+      mentions: [],
     });
   });
 
@@ -225,11 +255,58 @@ describe("InstructionBox — chat payload (v2)", () => {
     const user = userEvent.setup();
     const onSend = vi.fn<(p: ChatPayload) => void>();
     render(<InstructionBox state={readyState()} onSend={onSend} />);
-    await user.type(screen.getByRole("textbox", { name: "지시 입력" }), "   ");
+    await user.type(screen.getByRole("combobox", { name: "지시 입력" }), "   ");
     await user.click(screen.getByRole("button", { name: "전송" }));
     expect(onSend).not.toHaveBeenCalled();
   });
+  it("sends a mention-only request with the opaque backend snapshot", async () => {
+    const user = userEvent.setup();
+    const onSend = vi.fn<(p: ChatPayload) => void>();
+    const mention = {
+      resourceKey: "map.region:region-a",
+      kind: "map.region" as const,
+      label: "영역 A",
+      detail: "저장된 영역 · 사각형",
+      mention: {
+        kind: "map.region" as const,
+        version: 1 as const,
+        projectId: "project-a",
+        sourceFileSha256: "a".repeat(64),
+        mapWidth: 64,
+        mapHeight: 64,
+        selectionId: "region-a",
+        selectionSnapshotHash: "b".repeat(64),
+      },
+    };
+    render(
+      <InstructionBox
+        state={readyState()}
+        onSend={onSend}
+        onMentionSearch={async () => ({
+          schema: "eud-mention-search/1",
+          results: [mention],
+          truncated: false,
+        })}
+      />,
+    );
+
+    await user.type(screen.getByRole("combobox", { name: "지시 입력" }), "@");
+    await user.click(await screen.findByRole("option", { name: /@영역 A/ }));
+    await user.click(screen.getByRole("button", { name: "전송" }));
+
+    expect(onSend).toHaveBeenCalledWith({
+      text: "",
+      attachments: [],
+      mentions: [
+        expect.objectContaining({
+          label: "영역 A",
+          mention: mention.mention,
+        }),
+      ],
+    });
+  });
 });
+
 
 describe("InstructionBox — attachments", () => {
   const imageAttachment = {
@@ -239,6 +316,13 @@ describe("InstructionBox — attachments", () => {
     kind: "image" as const,
     size: 4,
     previewUrl: "data:image/png;base64,iVBORw0KGgo=",
+  };
+  const audioAttachment = {
+    id: "audio-1",
+    name: "battle-theme.flac",
+    mime: "audio/flac",
+    kind: "audio" as const,
+    size: 4 * 1024 * 1024,
   };
 
   it("stages a picked image, renders a removable chip, and sends it with the text", async () => {
@@ -261,11 +345,12 @@ describe("InstructionBox — attachments", () => {
     expect(onStageAttachment).toHaveBeenCalledWith(file);
     expect(screen.getByText("screenshot.png")).toBeInTheDocument();
 
-    await user.type(screen.getByRole("textbox", { name: "지시 입력" }), "이 화면을 봐줘");
+    await user.type(screen.getByRole("combobox", { name: "지시 입력" }), "이 화면을 봐줘");
     await user.click(screen.getByRole("button", { name: "전송" }));
     expect(onSend).toHaveBeenCalledWith({
       text: "이 화면을 봐줘",
       attachments: [imageAttachment],
+      mentions: [],
     });
   });
 
@@ -289,7 +374,68 @@ describe("InstructionBox — attachments", () => {
     expect(onSend).toHaveBeenCalledWith({
       text: "",
       attachments: [imageAttachment],
+      mentions: [],
     });
+  });
+
+  it("accepts and sends an attachment-only audio file without an image preview", async () => {
+    const user = userEvent.setup();
+    const onSend = vi.fn<(payload: ChatPayload) => void>();
+    render(
+      <InstructionBox
+        state={readyState()}
+        onSend={onSend}
+        onStageAttachment={vi.fn().mockResolvedValue(audioAttachment)}
+      />,
+    );
+    const picker = screen.getByLabelText("파일 첨부");
+    expect(picker).toHaveAttribute("accept", expect.stringContaining("audio/*"));
+    await user.upload(
+      picker,
+      new File(["fLaC"], "battle-theme.flac", { type: "audio/flac" }),
+    );
+    expect(screen.getByText("battle-theme.flac")).toBeInTheDocument();
+    expect(screen.queryByRole("img")).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "전송" }));
+    expect(onSend).toHaveBeenCalledWith({
+      text: "",
+      attachments: [audioAttachment],
+      mentions: [],
+    });
+  });
+
+  it("rejects staged audio above the 128 MiB turn aggregate and discards it", async () => {
+    const user = userEvent.setup();
+    const onDiscardAttachment = vi.fn().mockResolvedValue(undefined);
+    const staged = [1, 2, 3].map((index) => ({
+      ...audioAttachment,
+      id: `audio-${index}`,
+      name: `audio-${index}.wav`,
+      size: 64 * 1024 * 1024,
+    }));
+    const onStageAttachment = vi
+      .fn()
+      .mockResolvedValueOnce(staged[0])
+      .mockResolvedValueOnce(staged[1])
+      .mockResolvedValueOnce(staged[2]);
+    render(
+      <InstructionBox
+        state={readyState()}
+        onSend={noop}
+        onStageAttachment={onStageAttachment}
+        onDiscardAttachment={onDiscardAttachment}
+      />,
+    );
+    await user.upload(screen.getByLabelText("파일 첨부"), [
+      new File(["a"], "audio-1.wav", { type: "audio/wav" }),
+      new File(["b"], "audio-2.wav", { type: "audio/wav" }),
+      new File(["c"], "audio-3.wav", { type: "audio/wav" }),
+    ]);
+    expect(await screen.findByRole("alert")).toHaveTextContent("합계 128MB");
+    expect(onDiscardAttachment).toHaveBeenCalledWith("audio-3");
+    expect(screen.getByText("audio-1.wav")).toBeInTheDocument();
+    expect(screen.getByText("audio-2.wav")).toBeInTheDocument();
+    expect(screen.queryByText("audio-3.wav")).not.toBeInTheDocument();
   });
 
   it("accepts dropped files and pasted clipboard images", async () => {
@@ -321,7 +467,7 @@ describe("InstructionBox — attachments", () => {
     const pastedImage = new File(["png!"], "clipboard.png", {
       type: "image/png",
     });
-    fireEvent.paste(screen.getByRole("textbox", { name: "지시 입력" }), {
+    fireEvent.paste(screen.getByRole("combobox", { name: "지시 입력" }), {
       clipboardData: { files: [pastedImage] },
     });
     await screen.findByText("screenshot.png");
@@ -552,7 +698,7 @@ describe("InstructionBox — RAG warmup gate", () => {
   it("disables Send + the textarea with a guide placeholder while loading", () => {
     render(<InstructionBox state={loadingState()} onSend={noop} />);
     expect(screen.getByRole("button", { name: "전송" })).toBeDisabled();
-    const textarea = screen.getByRole("textbox", { name: "지시 입력" });
+    const textarea = screen.getByRole("combobox", { name: "지시 입력" });
     expect(textarea).toBeDisabled();
     expect(textarea).toHaveAttribute(
       "placeholder",
@@ -570,6 +716,6 @@ describe("InstructionBox — RAG warmup gate", () => {
     store.ragWarmupChanged("ready");
     render(<InstructionBox state={store.getState()} onSend={noop} />);
     expect(screen.getByRole("button", { name: "전송" })).toBeEnabled();
-    expect(screen.getByRole("textbox", { name: "지시 입력" })).toBeEnabled();
+    expect(screen.getByRole("combobox", { name: "지시 입력" })).toBeEnabled();
   });
 });

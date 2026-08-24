@@ -163,11 +163,14 @@ pub fn bridge_from_config(dirs: &DataDirs) -> Result<BridgeIo, String> {
 pub struct ChatRequest {
     /// Stable panel-generated anchor shared with the durable user log entry.
     pub client_turn_id: String,
-    /// User message from the panel. May be empty when at least one attachment exists.
+    /// User message from the panel. May be empty when an attachment or mention exists.
     pub text: String,
     /// Opaque app-owned attachment ids staged before this turn.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<String>,
+    /// Ordered backend-created resource snapshots echoed by the panel.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mentions: Vec<crate::mentions::MentionInstance>,
 }
 
 /// `plan_feedback` command input.
@@ -181,6 +184,9 @@ pub struct PlanFeedbackRequest {
     /// Opaque app-owned attachment ids staged before this turn.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<String>,
+    /// Ordered backend-created resource snapshots echoed by the panel.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mentions: Vec<crate::mentions::MentionInstance>,
 }
 /// One selectable answer exposed by the `ask` tool.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -354,6 +360,15 @@ pub struct WorkspaceReadResponse {
     pub path: String,
     pub source: bool,
     pub content: String,
+}
+
+/// `workspace_search` command output.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceSearchResponse {
+    pub workspace_id: String,
+    pub query: String,
+    pub paths: Vec<String>,
 }
 
 /// `wiki` event payload AND the `wiki_get` command output: the dat-edit ledger.
@@ -556,6 +571,24 @@ pub enum ProgressStage {
     /// Bootstrap asset setup.
     #[serde(rename = "bootstrap")]
     Bootstrap,
+    /// Validating an attached audio stream with managed FFprobe.
+    #[serde(rename = "audio_probe")]
+    AudioProbe,
+    /// Encoding canonical OGG Vorbis with managed FFmpeg.
+    #[serde(rename = "audio_transcode")]
+    AudioTranscode,
+    /// Re-probing and hashing the canonical OGG.
+    #[serde(rename = "audio_validate")]
+    AudioValidate,
+    /// Waiting for the source map to be closed by SCMDraft.
+    #[serde(rename = "waiting_map_close")]
+    WaitingMapClose,
+    /// Writing the verified OGG, game string, and WAV slot.
+    #[serde(rename = "map_sound_write")]
+    MapSoundWrite,
+    /// Reopening and verifying the sound-bearing SCX.
+    #[serde(rename = "map_sound_verify")]
+    MapSoundVerify,
 }
 
 /// `error` event payload.
@@ -578,6 +611,7 @@ pub async fn chat(text: String, attachments: Vec<String>) -> Result<(), String> 
         client_turn_id: new_client_turn_id(),
         text,
         attachments,
+        mentions: Vec::new(),
     };
     Ok(())
 }
@@ -591,6 +625,7 @@ pub async fn plan_feedback(text: String, attachments: Vec<String>) -> Result<(),
         client_turn_id: new_client_turn_id(),
         text,
         attachments,
+        mentions: Vec::new(),
     };
     Ok(())
 }
@@ -962,6 +997,28 @@ pub async fn workspace_read(
             path,
             source,
             content,
+        })
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+/// Search confined UTF-8 workspace files by path and content.
+#[tauri::command]
+pub async fn workspace_search(
+    state: tauri::State<'_, BridgeManaged>,
+    workspace_id: String,
+    query: String,
+) -> Result<WorkspaceSearchResponse, String> {
+    let manager = crate::workspace::WorkspaceManager::new(state.dirs().clone());
+    tauri::async_runtime::spawn_blocking(move || {
+        let paths = manager
+            .search_files(&workspace_id, &query)
+            .map_err(|error| error.to_string())?;
+        Ok(WorkspaceSearchResponse {
+            workspace_id,
+            query,
+            paths,
         })
     })
     .await
@@ -1508,6 +1565,68 @@ mod tests {
         assert_eq!(err, "editor path not configured");
 
         fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn generic_mentions_round_trip_in_order_and_requests_reject_unknown_fields() {
+        let value = json!({
+            "clientTurnId": "33333333-3333-4333-8333-333333333333",
+            "text": "mixed",
+            "attachments": [],
+            "mentions": [
+                {
+                    "id": "location",
+                    "label": "회복 지점",
+                    "mention": {
+                        "kind": "map.location",
+                        "version": 1,
+                        "projectId": "project-a",
+                        "sourceFileSha256": "a",
+                        "locationId": 17,
+                        "locationFingerprint": "b"
+                    }
+                },
+                {
+                    "id": "region",
+                    "label": "영역 A",
+                    "mention": {
+                        "kind": "map.region",
+                        "version": 1,
+                        "projectId": "project-a",
+                        "sourceFileSha256": "a",
+                        "mapWidth": 64,
+                        "mapHeight": 64,
+                        "selectionId": "region-a",
+                        "selectionSnapshotHash": "c"
+                    }
+                }
+            ]
+        });
+        let chat: ipc::ChatRequest = serde_json::from_value(value.clone()).unwrap();
+        assert!(matches!(
+            chat.mentions[0].mention,
+            crate::mentions::MentionSnapshot::MapLocation(_)
+        ));
+        assert!(matches!(
+            chat.mentions[1].mention,
+            crate::mentions::MentionSnapshot::MapRegion(_)
+        ));
+        let mut expected = value;
+        expected.as_object_mut().unwrap().remove("attachments");
+        assert_json(&chat, expected);
+
+        assert!(serde_json::from_value::<ipc::ChatRequest>(json!({
+            "clientTurnId": "44444444-4444-4444-8444-444444444444",
+            "text": "hi",
+            "unknown": true
+        }))
+        .is_err());
+        assert!(serde_json::from_value::<ipc::PlanFeedbackRequest>(json!({
+            "clientTurnId": "55555555-5555-4555-8555-555555555555",
+            "text": "revise",
+            "unknown": true
+        }))
+        .is_err());
     }
 
     #[test]

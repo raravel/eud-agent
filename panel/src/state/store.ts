@@ -42,6 +42,7 @@ import type {
   LedgerEntry,
   MemoryFile,
   PanelLog,
+  MentionInstance,
   ProgressStage,
 } from "@/lib/ipc";
 // itemIds maps an item to its decision-target ids (a dat group has NO
@@ -101,6 +102,8 @@ export interface LogEntry {
   tools?: AgentTool[];
   /** Files/images attached to this user message. */
   attachments?: ChatAttachment[];
+  /** Ordered backend-created resource snapshots attached to this user message. */
+  mentions?: MentionInstance[];
 }
 
 /** Active plan card (from a `plan` event); replaced by a higher revision. */
@@ -415,6 +418,7 @@ export interface PanelStore {
     text: string,
     stage?: ProgressStage,
     attachments?: ChatAttachment[],
+    mentions?: MentionInstance[],
     clientTurnId?: string,
   ): void;
 
@@ -575,6 +579,7 @@ export function createPanelStore(): PanelStore {
     stage?: ProgressStage,
     tools?: AgentTool[],
     attachments?: ChatAttachment[],
+    mentions?: MentionInstance[],
     clientTurnId?: string,
   ): void {
     logSeq += 1;
@@ -583,6 +588,9 @@ export function createPanelStore(): PanelStore {
     if (stage) entry.stage = stage;
     if (tools) entry.tools = tools;
     if (attachments && attachments.length > 0) entry.attachments = attachments;
+    if (mentions && mentions.length > 0) {
+      entry.mentions = mentions.map((mention) => ({ ...mention }));
+    }
     // Drop oldest beyond the cap (features/06 ## Behaviors).
     const next =
       core.log.length >= MAX_LOG_ENTRIES ? core.log.slice(1) : core.log.slice();
@@ -1195,8 +1203,8 @@ export function createPanelStore(): PanelStore {
     },
 
     // ---- logging ----
-    log(kind, text, stage, attachments, clientTurnId) {
-      pushLog(kind, text, stage, undefined, attachments, clientTurnId);
+    log(kind, text, stage, attachments, mentions, clientTurnId) {
+      pushLog(kind, text, stage, undefined, attachments, mentions, clientTurnId);
       emit();
     },
 
@@ -1232,10 +1240,14 @@ export function createPanelStore(): PanelStore {
             mime: attachment.mime,
             kind: attachment.kind,
             size: attachment.size,
-            ...(attachment.previewUrl?.startsWith("data:image/") === true
+            ...(attachment.kind === "image" &&
+            attachment.previewUrl?.startsWith("data:image/") === true
               ? { previewUrl: attachment.previewUrl }
               : {}),
           }));
+        }
+        if (entry.mentions) {
+          next.mentions = entry.mentions.map((mention) => ({ ...mention }));
         }
         return next;
       });

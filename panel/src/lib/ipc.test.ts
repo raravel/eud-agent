@@ -9,8 +9,10 @@ import {
   compactSession,
   isAgentTurnEndTransition,
   notificationSoundPreview,
+  mentionSearch,
   workspaceList,
   workspaceRead,
+  workspaceSearch,
 } from "@/lib/ipc";
 import type { ClientMessage, ServerMessage } from "@/lib/ipc";
 
@@ -61,19 +63,74 @@ describe("send", () => {
       listen,
       onMessage: () => {},
     });
+    const mention = {
+      id: "mention-1",
+      label: "영역 A",
+      mention: {
+        kind: "map.region" as const,
+        version: 1 as const,
+        projectId: "project-a",
+        sourceFileSha256: "a".repeat(64),
+        mapWidth: 64,
+        mapHeight: 64,
+        selectionId: "region-a",
+        selectionSnapshotHash: "b".repeat(64),
+      },
+    };
     const msg: ClientMessage = {
       type: "chat",
       sessionId: "session-a",
+      clientTurnId: "11111111-1111-4111-8111-111111111111",
       text: "hello",
       attachments: ["image-1"],
+      mentions: [mention],
     };
 
     await client.send(msg);
 
     expect(invoke).toHaveBeenCalledWith("chat", {
       sessionId: "session-a",
+      clientTurnId: "11111111-1111-4111-8111-111111111111",
       text: "hello",
       attachments: ["image-1"],
+      mentions: [mention],
+    });
+  });
+
+  it("sends plan feedback with the same generic mentions field", async () => {
+    const { invoke, listen } = makeHarness();
+    invoke.mockResolvedValue(undefined);
+    const client = new IpcClient({ invoke, listen, onMessage: () => {} });
+    const mentions = [
+      {
+        id: "mention-location",
+        label: "회복 지점",
+        mention: {
+          kind: "map.location" as const,
+          version: 1 as const,
+          projectId: "project-a",
+          sourceFileSha256: "a".repeat(64),
+          locationId: 17,
+          locationFingerprint: "c".repeat(64),
+        },
+      },
+    ];
+
+    await client.send({
+      type: "plan_feedback",
+      sessionId: "session-a",
+      clientTurnId: "22222222-2222-4222-8222-222222222222",
+      text: "반영해 줘",
+      attachments: [],
+      mentions,
+    });
+
+    expect(invoke).toHaveBeenCalledWith("plan_feedback", {
+      sessionId: "session-a",
+      clientTurnId: "22222222-2222-4222-8222-222222222222",
+      text: "반영해 줘",
+      attachments: [],
+      mentions,
     });
   });
 
@@ -154,6 +211,38 @@ describe("send", () => {
       sessionId: "session-a",
       panelLog,
     });
+  });
+});
+
+describe("mention search", () => {
+  it("sends one bounded request envelope and preserves opaque snapshots", async () => {
+    const invoke = vi.fn().mockResolvedValue({
+      schema: "eud-mention-search/1",
+      results: [
+        {
+          resourceKey: "map.location:17",
+          kind: "map.location",
+          label: "회복 지점",
+          mention: {
+            kind: "map.location",
+            version: 1,
+            projectId: "project-a",
+            sourceFileSha256: "a".repeat(64),
+            locationId: 17,
+            locationFingerprint: "c".repeat(64),
+          },
+        },
+      ],
+      truncated: false,
+    });
+    const request = { query: "회복 지점", kinds: ["map.location" as const], limit: 20 };
+
+    const result = await mentionSearch(request, invoke);
+
+    expect(invoke).toHaveBeenCalledWith("mention_search", { request });
+    expect(result.results[0].mention).toEqual(
+      expect.objectContaining({ kind: "map.location", locationId: 17 }),
+    );
   });
 });
 
@@ -755,6 +844,23 @@ describe("Workspace commands", () => {
     expect(invoke).toHaveBeenCalledWith("workspace_read", {
       workspaceId: workspace.workspaceId,
       path: "specs/game.md",
+    });
+  });
+
+  it("searches workspace filenames and text content through one command", async () => {
+    const response = {
+      workspaceId: workspace.workspaceId,
+      query: "confirmed behavior",
+      paths: ["specs/game.md"],
+    };
+    const invoke = vi.fn().mockResolvedValue(response);
+
+    await expect(
+      workspaceSearch(workspace.workspaceId, response.query, invoke),
+    ).resolves.toEqual(response);
+    expect(invoke).toHaveBeenCalledWith("workspace_search", {
+      workspaceId: workspace.workspaceId,
+      query: response.query,
     });
   });
 

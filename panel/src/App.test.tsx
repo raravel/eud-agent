@@ -32,7 +32,12 @@ const sessionRecords = [
     panelLog: {
       schemaVersion: 2,
       logSeq: 1,
-      log: [{ id: 1, kind: "you", text: "previous conversation" }],
+      log: [{
+        id: 1,
+        kind: "you",
+        text: "previous conversation",
+        clientTurnId: "77777777-7777-4777-8777-777777777777",
+      }],
     },
   },
   {
@@ -140,6 +145,29 @@ beforeEach(() => {
           });
         }
         return undefined;
+      case "mention_search":
+        return {
+          schema: "eud-mention-search/1",
+          results: [
+            {
+              resourceKey: "map.region:region-a",
+              kind: "map.region",
+              label: "영역 A",
+              detail: "저장된 영역 · 사각형",
+              mention: {
+                kind: "map.region",
+                version: 1,
+                projectId: "project-a",
+                sourceFileSha256: "a".repeat(64),
+                mapWidth: 64,
+                mapHeight: 64,
+                selectionId: "region-a",
+                selectionSnapshotHash: "b".repeat(64),
+              },
+            },
+          ],
+          truncated: false,
+        };
       default:
         return undefined;
     }
@@ -154,7 +182,7 @@ afterEach(() => {
 describe("App concurrent sessions", () => {
   it("invokes session B before session A's unresolved chat completes", async () => {
     render(<App />);
-    const input = await screen.findByRole("textbox", { name: "지시 입력" });
+    const input = await screen.findByRole("combobox", { name: "지시 입력" });
     await waitFor(() => expect(input).toBeEnabled());
 
     fireEvent.change(input, { target: { value: "long analysis" } });
@@ -162,22 +190,26 @@ describe("App concurrent sessions", () => {
     await waitFor(() => {
       expect(tauri.invoke).toHaveBeenCalledWith("chat", {
         sessionId: "session-a",
+        clientTurnId: expect.any(String),
         text: "long analysis",
         attachments: [],
+        mentions: [],
       });
     });
     expect(tauri.resolveLongChat).toBeTypeOf("function");
 
     fireEvent.click(screen.getByRole("button", { name: "Session B, 유휴" }));
-    const secondInput = screen.getByRole("textbox", { name: "지시 입력" });
+    const secondInput = screen.getByRole("combobox", { name: "지시 입력" });
     fireEvent.change(secondInput, { target: { value: "short answer" } });
     fireEvent.click(screen.getByRole("button", { name: "전송" }));
 
     await waitFor(() => {
       expect(tauri.invoke).toHaveBeenCalledWith("chat", {
         sessionId: "session-b",
+        clientTurnId: expect.any(String),
         text: "short answer",
         attachments: [],
+        mentions: [],
       });
     });
     expect(tauri.resolveLongChat).toBeTypeOf("function");
@@ -185,12 +217,12 @@ describe("App concurrent sessions", () => {
 
   it("moves the session with a newly sent chat to the top", async () => {
     render(<App />);
-    const input = await screen.findByRole("textbox", { name: "지시 입력" });
+    const input = await screen.findByRole("combobox", { name: "지시 입력" });
     await waitFor(() => expect(input).toBeEnabled());
     expect(sessionOrder()).toEqual(["Session A, 유휴", "Session B, 유휴"]);
 
     fireEvent.click(screen.getByRole("button", { name: "Session B, 유휴" }));
-    fireEvent.change(screen.getByRole("textbox", { name: "지시 입력" }), {
+    fireEvent.change(screen.getByRole("combobox", { name: "지시 입력" }), {
       target: { value: "newest conversation" },
     });
     fireEvent.click(screen.getByRole("button", { name: "전송" }));
@@ -198,12 +230,174 @@ describe("App concurrent sessions", () => {
     await waitFor(() => {
       expect(tauri.invoke).toHaveBeenCalledWith("chat", {
         sessionId: "session-b",
+        clientTurnId: expect.any(String),
         text: "newest conversation",
         attachments: [],
+        mentions: [],
       });
     });
     expect(sessionOrder()).toEqual(["Session B, 유휴", "Session A, 유휴"]);
   });
+
+  it("mints a new branch turn id after edit and rewind", async () => {
+    render(<App />);
+    const input = await screen.findByRole("combobox", { name: "지시 입력" });
+    await waitFor(() => expect(input).toBeEnabled());
+    fireEvent.click(screen.getByRole("button", { name: "메시지 수정" }));
+    await waitFor(() => expect(input).toHaveValue("previous conversation"));
+    fireEvent.click(screen.getByRole("button", { name: "전송" }));
+    await waitFor(() => {
+      const chat = tauri.invoke.mock.calls.find(
+        ([command]) => command === "chat",
+      );
+      const args = chat?.[1];
+      expect(args).toBeDefined();
+      expect(args).toHaveProperty("clientTurnId");
+      expect(args).not.toHaveProperty(
+        "clientTurnId",
+        "77777777-7777-4777-8777-777777777777",
+      );
+    });
+  });
+
+  it("restores text and mention chips after backend validation rejection", async () => {
+    tauri.invoke.mockImplementation(async (command: string, args?: Record<string, unknown>) => {
+      if (command === "chat" && Array.isArray(args?.mentions) && args.mentions.length > 0) {
+        throw new Error("저장 영역이 변경되었습니다");
+      }
+      if (command === "mention_search") {
+        return {
+          schema: "eud-mention-search/1",
+          results: [
+            {
+              resourceKey: "map.region:region-a",
+              kind: "map.region",
+              label: "영역 A",
+              mention: {
+                kind: "map.region",
+                version: 1,
+                projectId: "project-a",
+                sourceFileSha256: "a".repeat(64),
+                mapWidth: 64,
+                mapHeight: 64,
+                selectionId: "region-a",
+                selectionSnapshotHash: "b".repeat(64),
+              },
+            },
+          ],
+          truncated: false,
+        };
+      }
+      if (command === "status") return { compiling: false, project: "Project" };
+      if (command === "list") return { files: [] };
+      if (command === "session_list") {
+        return sessionRecords.map(
+          ({ id, name, project, createdAt, lastConversationAt }) => ({
+            id,
+            name,
+            project,
+            createdAt,
+            lastConversationAt,
+          }),
+        );
+      }
+      if (command === "session_load") {
+        return sessionRecords.find((record) => record.id === args?.id);
+      }
+      if (command === "harness_jobs") return [];
+      if (command === "ask_pending") return null;
+      if (command === "setup_status") {
+        return {
+          editor_path: "C:/Editor",
+          editor_valid: true,
+          assets_ready: true,
+          codex_resolved: true,
+          codex_authed: true,
+          setup_required: false,
+        };
+      }
+      return undefined;
+    });
+    render(<App />);
+    const input = await screen.findByRole("combobox", { name: "지시 입력" });
+    await waitFor(() => expect(input).toBeEnabled());
+    fireEvent.change(input, { target: { value: "처리해 줘 @영역 A" } });
+    await fireEvent.click(await screen.findByRole("option", { name: /@영역 A/ }));
+    fireEvent.click(screen.getByRole("button", { name: "전송" }));
+    await waitFor(() => expect(input).toHaveValue("처리해 줘"));
+    expect(screen.getAllByTestId("mention-chips")).toHaveLength(2);
+    expect(screen.getAllByTestId("mention-chips").at(-1)).toHaveTextContent("@영역 A");
+    await waitFor(() => {
+      const autosave = tauri.invoke.mock.calls.find(
+        ([command]) => command === "session_update_log",
+      );
+      expect(
+        (
+          autosave?.[1] as
+            | { panelLog?: { log?: Array<{ mentions?: unknown[] }> } }
+            | undefined
+        )?.panelLog?.log?.some((entry) => entry.mentions?.length === 1),
+      ).toBe(true);
+    });
+    const clientTurnIdOf = (value: unknown): string | undefined => {
+      if (
+        value !== null &&
+        typeof value === "object" &&
+        "clientTurnId" in value &&
+        typeof value.clientTurnId === "string"
+      ) {
+        return value.clientTurnId;
+      }
+      return undefined;
+    };
+    const firstChat = tauri.invoke.mock.calls.find(
+      ([command]) => command === "chat",
+    )?.[1];
+    await waitFor(() => expect(input).toBeEnabled());
+    fireEvent.click(screen.getByRole("button", { name: "전송" }));
+    await waitFor(() => {
+      const chats = tauri.invoke.mock.calls.filter(
+        ([command]) => command === "chat",
+      );
+      expect(chats).toHaveLength(2);
+      expect(clientTurnIdOf(chats[1][1])).toBe(clientTurnIdOf(firstChat));
+    });
+  });
+  it("forwards mentions through the plan-feedback channel", async () => {
+    render(<App />);
+    const input = await screen.findByRole("combobox", { name: "지시 입력" });
+    await waitFor(() => expect(input).toBeEnabled());
+    await waitFor(() => expect(tauri.listeners.has("plan")).toBe(true));
+    act(() => {
+      emit("plan", {
+        sessionId: "session-a",
+        markdown: "# 계획",
+        revision: 1,
+      });
+    });
+
+    fireEvent.change(input, { target: { value: "@영역 A" } });
+    fireEvent.click(await screen.findByRole("option", { name: /@영역 A/ }));
+    fireEvent.click(screen.getByRole("button", { name: "전송" }));
+
+    await waitFor(() => {
+      expect(tauri.invoke).toHaveBeenCalledWith(
+        "plan_feedback",
+        expect.objectContaining({
+          sessionId: "session-a",
+          text: "",
+          attachments: [],
+          mentions: [
+            expect.objectContaining({
+              label: "영역 A",
+              mention: expect.objectContaining({ kind: "map.region" }),
+            }),
+          ],
+        }),
+      );
+    });
+  });
+
 
   it("does not autosave conversation logs for project-state refreshes", async () => {
     render(<App />);
@@ -357,7 +551,7 @@ describe("App concurrent sessions", () => {
 
   it("submits ASK answers to the blocked session without opening a new turn", async () => {
     render(<App />);
-    const input = await screen.findByRole("textbox", { name: "지시 입력" });
+    const input = await screen.findByRole("combobox", { name: "지시 입력" });
     await waitFor(() => expect(input).toBeEnabled());
 
     fireEvent.change(input, { target: { value: "설계를 진행해 줘" } });
@@ -535,7 +729,7 @@ describe("App concurrent sessions", () => {
 describe("App native compaction", () => {
   it("routes an exact /compact command without starting a chat turn", async () => {
     render(<App />);
-    const input = await screen.findByRole("textbox", { name: "지시 입력" });
+    const input = await screen.findByRole("combobox", { name: "지시 입력" });
     await waitFor(() => expect(input).toBeEnabled());
 
     fireEvent.change(input, { target: { value: "/compact" } });

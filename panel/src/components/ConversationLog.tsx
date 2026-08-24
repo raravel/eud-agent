@@ -18,6 +18,7 @@
  * 500 entries.
  */
 import {
+  AudioLinesIcon,
   FileTextIcon,
   ImageIcon,
   PencilLineIcon,
@@ -45,6 +46,7 @@ import { AgentStream, ToolList } from "@/components/AgentStream";
 import { AgentAnswer } from "@/components/AgentAnswer";
 import type { LogEntry, LogKind, Phase, TurnState } from "@/state/store";
 import { formatAttachmentSize } from "@/lib/attachments";
+import { MentionChips } from "@/components/MentionComposer";
 
 export interface ConversationLogProps {
   /** Store log entries (kind / text / optional stage). */
@@ -333,6 +335,11 @@ function renderLogEntry(entry: LogEntry, context: RowRenderContext) {
     return (
       <Message from="user">
         <MessageContent>
+          {entry.mentions && entry.mentions.length > 0 && (
+            <div className="mb-2 flex max-w-md justify-end">
+              <MentionChips mentions={entry.mentions} align="end" />
+            </div>
+          )}
           {entry.attachments && entry.attachments.length > 0 && (
             <div className="mb-2 flex max-w-md flex-wrap justify-end gap-2">
               {entry.attachments.map((attachment) => {
@@ -364,6 +371,8 @@ function renderLogEntry(entry: LogEntry, context: RowRenderContext) {
                   >
                     {attachment.kind === "image" ? (
                       <ImageIcon className="size-4 shrink-0 text-muted-foreground" />
+                    ) : attachment.kind === "audio" ? (
+                      <AudioLinesIcon className="size-4 shrink-0 text-muted-foreground" />
                     ) : (
                       <FileTextIcon className="size-4 shrink-0 text-muted-foreground" />
                     )}

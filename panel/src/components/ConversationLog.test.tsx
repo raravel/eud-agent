@@ -47,6 +47,13 @@ describe("ConversationLog — entries", () => {
         kind: "text",
         size: 12,
       },
+      {
+        id: "audio-1",
+        name: "battle-theme.flac",
+        mime: "audio/flac",
+        kind: "audio",
+        size: 4096,
+      },
     ]);
 
     render(<ConversationLog log={store.getState().log} phase="thinking" />);
@@ -56,6 +63,45 @@ describe("ConversationLog — entries", () => {
     ).toBeInTheDocument();
     expect(screen.getByText("notes.eps")).toBeInTheDocument();
     expect(screen.getByText("2 KB")).toBeInTheDocument();
+    expect(screen.getByText("battle-theme.flac")).toBeInTheDocument();
+    expect(screen.getAllByRole("img")).toHaveLength(1);
+  });
+
+  it("renders persisted heterogeneous mention chips in message order", () => {
+    const store = createPanelStore();
+    store.log("you", "처리해 줘", undefined, undefined, [
+      {
+        id: "region",
+        label: "영역 A",
+        mention: {
+          kind: "map.region",
+          version: 1,
+          projectId: "project-a",
+          sourceFileSha256: "a".repeat(64),
+          mapWidth: 64,
+          mapHeight: 64,
+          selectionId: "region-a",
+          selectionSnapshotHash: "b".repeat(64),
+        },
+      },
+      {
+        id: "location",
+        label: "회복 지점",
+        mention: {
+          kind: "map.location",
+          version: 1,
+          projectId: "project-a",
+          sourceFileSha256: "a".repeat(64),
+          locationId: 17,
+          locationFingerprint: "c".repeat(64),
+        },
+      },
+    ]);
+
+    render(<ConversationLog log={store.getState().log} phase="ready" />);
+    expect(
+      screen.getAllByText(/^@/).map((element) => element.textContent),
+    ).toEqual(["@영역 A", "@회복 지점"]);
   });
 
   it("renders Mermaid diagrams in archived agent answers", async () => {
