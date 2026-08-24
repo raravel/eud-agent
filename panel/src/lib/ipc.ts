@@ -131,6 +131,7 @@ const PUSH_EVENT_TYPES = [
   "plan",
   "ask",
   "changeset",
+  "harness_job",
   "rollback_result",
   "progress",
   "error",

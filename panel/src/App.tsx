@@ -30,6 +30,7 @@ import { Header, type RagState } from "@/components/Header";
 import { SettingsDialog } from "@/components/SettingsDialog";
 import { ConversationLog } from "@/components/ConversationLog";
 import { ChangesetView } from "@/components/ChangesetView";
+import { HarnessStatusCard } from "@/components/HarnessStatusCard";
 import { AskCard } from "@/components/AskCard";
 import { PlanView } from "@/components/PlanView";
 import { InstructionBox, type ChatPayload } from "@/components/InstructionBox";
@@ -69,6 +70,7 @@ import {
   type ServerMessage,
   type SessionMeta,
   type SessionRecord,
+  type HarnessJobView,
   type WorkspaceFileEntry,
   type WorkspaceListResponse,
   type SetupMessage,
@@ -159,6 +161,7 @@ interface SessionSlot {
   observedLog: readonly LogEntry[];
   planOpen: boolean;
   changesetOpen: boolean;
+  harnessJobs: HarnessJobView[];
 }
 
 type PendingAskSnapshot = {
@@ -294,6 +297,7 @@ export default function App() {
   // subsequent typing.
   const [editDraft, setEditDraft] = useState<ChatPayload | null>(null);
   const [messageActionBusy, setMessageActionBusy] = useState(false);
+  const [harnessActionJobId, setHarnessActionJobId] = useState<string | null>(null);
   const messageActionBusyRef = useRef(false);
 
   const bumpSessions = useCallback(() => {
@@ -338,6 +342,27 @@ export default function App() {
     [bumpSessions],
   );
 
+  const syncHarnessJobs = useCallback(
+    async (slot: SessionSlot) => {
+      try {
+        const jobs = await invoke<HarnessJobView[]>("harness_jobs", {
+          sessionId: slot.id,
+        });
+        if (!Array.isArray(jobs)) return;
+        const merged = new Map(slot.harnessJobs.map((job) => [job.id, job]));
+        for (const job of jobs) {
+          const current = merged.get(job.id);
+          if (!current || job.updatedAt >= current.updatedAt) merged.set(job.id, job);
+        }
+        slot.harnessJobs = [...merged.values()];
+        bumpSessions();
+      } catch {
+        // Push events remain authoritative; a failed snapshot does not erase them.
+      }
+    },
+    [bumpSessions],
+  );
+
   const registerSession = useCallback(
     (record: SessionRecord): SessionSlot => {
       const existing = sessionsRef.current.get(record.id);
@@ -348,6 +373,7 @@ export default function App() {
         }
         existing.persisted = true;
         bumpSessions();
+        void syncHarnessJobs(existing);
         return existing;
       }
       const sessionStore = createPanelStore();
@@ -365,9 +391,11 @@ export default function App() {
         activity: record.pendingRequestIds.length > 0 ? "review" : "idle",
         planOpen: true,
         changesetOpen: true,
+        harnessJobs: [],
       };
       sessionsRef.current.set(slot.id, slot);
       attachSlot(slot);
+      void syncHarnessJobs(slot);
       toastedLogBySessionRef.current.set(
         slot.id,
         record.panelLog?.logSeq ?? 0,
@@ -375,7 +403,7 @@ export default function App() {
       bumpSessions();
       return slot;
     },
-    [attachSlot, bumpSessions, projectStore],
+    [attachSlot, bumpSessions, projectStore, syncHarnessJobs],
   );
 
   const syncPendingAsk = useCallback(
@@ -417,6 +445,7 @@ export default function App() {
       activity: "idle",
       planOpen: true,
       changesetOpen: true,
+      harnessJobs: [],
     };
     sessionsRef.current.set(slot.id, slot);
     attachSlot(slot);
@@ -720,6 +749,36 @@ export default function App() {
           target.log("agent", `변경사항 ${msg.items.length}건을 검토하세요.`);
           break;
         }
+        case "harness_job": {
+          const slot = sessionsRef.current.get(msg.sessionId);
+          if (!slot) break;
+          const previous = slot.harnessJobs.find((job) => job.id === msg.id);
+          slot.harnessJobs = [
+            ...slot.harnessJobs.filter((job) => job.id !== msg.id),
+            msg,
+          ];
+          if (previous?.status !== msg.status) {
+            if (msg.status === "waiting_runtime") {
+              slot.store.log("warn", "인게임 검증 후 하네스 동기화를 계속합니다.");
+            } else if (msg.status === "review") {
+              slot.store.log("agent", "하네스 문서 변경사항을 검토하세요.");
+              void attentionNotify(
+                "changesetReview",
+                !document.hasFocus(),
+                slot.id,
+                msg.changeset?.items.length,
+              ).catch(() => {
+                // Attention delivery is best-effort.
+              });
+            } else if (msg.status === "failed") {
+              slot.store.log("warn", msg.error ?? "하네스 동기화에 실패했습니다.");
+            } else if (msg.status === "completed") {
+              slot.store.log("ok", "하네스 문서 동기화 완료");
+            }
+          }
+          bumpSessions();
+          break;
+        }
         case "rollback_result": {
           const target = sessionStore();
           if (!target) break;
@@ -767,7 +826,7 @@ export default function App() {
           break;
       }
     },
-    [projectStore],
+    [bumpSessions, projectStore],
   );
 
   // Boot the IPC client once. Project lifecycle state fans out to all session
@@ -1461,6 +1520,56 @@ export default function App() {
     [selectedSlot],
   );
 
+  const runHarnessAction = useCallback(
+    async (jobId: string, command: string, args: Record<string, unknown> = {}) => {
+      if (harnessActionJobId !== null) return;
+      setHarnessActionJobId(jobId);
+      try {
+        await invoke(command, { jobId, ...args });
+      } catch (error) {
+        toast.error(`하네스 작업을 처리하지 못했습니다: ${String(error)}`);
+      } finally {
+        setHarnessActionJobId(null);
+      }
+    },
+    [harnessActionJobId],
+  );
+
+  const handleHarnessRuntimeConfirm = useCallback(
+    (jobId: string) => {
+      void runHarnessAction(jobId, "harness_runtime_confirm");
+    },
+    [runHarnessAction],
+  );
+
+  const handleHarnessSkip = useCallback(
+    (jobId: string) => {
+      void runHarnessAction(jobId, "harness_skip");
+    },
+    [runHarnessAction],
+  );
+
+  const handleHarnessRetry = useCallback(
+    (jobId: string) => {
+      void runHarnessAction(jobId, "harness_retry");
+    },
+    [runHarnessAction],
+  );
+
+  const handleHarnessDismiss = useCallback(
+    (jobId: string) => {
+      void runHarnessAction(jobId, "harness_dismiss");
+    },
+    [runHarnessAction],
+  );
+
+  const handleHarnessDecision = useCallback(
+    (jobId: string, decision: "accept" | "reject") => {
+      void runHarnessAction(jobId, "harness_decision", { decision });
+    },
+    [runHarnessAction],
+  );
+
   const handleWorkspaceSelect = useCallback(
     async (file: WorkspaceFileEntry, data = workspaceData) => {
       if (!data) return;
@@ -1788,6 +1897,17 @@ export default function App() {
             onOpenChange={handleChangesetOpenChange}
             pending={state.pendingDecision !== null}
             onDecide={handleDecide}
+          />
+        )}
+        {selectedSlot && (
+          <HarnessStatusCard
+            jobs={selectedSlot.harnessJobs}
+            pendingJobId={harnessActionJobId}
+            onRuntimeConfirm={handleHarnessRuntimeConfirm}
+            onSkip={handleHarnessSkip}
+            onRetry={handleHarnessRetry}
+            onDismiss={handleHarnessDismiss}
+            onDecide={handleHarnessDecision}
           />
         )}
 

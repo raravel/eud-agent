@@ -141,6 +141,19 @@ new writers.
   resumes automatically. The review header and its collapse trigger stay above the item-list
   scroll region, and the bulk accept/reject actions stay below it; only changeset items scroll.
   Expansion is UI-only state owned by each `SessionSlot`.
+- **Post-acceptance harness**: accepting the code changeset immediately returns the session to
+  normal use and creates a separate durable harness job. `HarnessStatusCard` renders runtime
+  verification waiting, non-blocking pending/running, retryable failure, atomic document review,
+  and the latest rejected result. Runtime waiting exposes primary `인게임 검증 완료` and secondary
+  `건너뛰기`; skip terminates only the harness and clearly states that document/memory
+  synchronization did not run. Completed and skipped terminal statuses close automatically
+  without revealing older terminal cards. Failed and rejected cards expose an icon-only
+  `하네스 상태 닫기` button with an accessible label; manual dismissal is durable. Confirmation,
+  skip, retry, and dismiss use disabled in-flight states. Harness document review reuses
+  `ChangesetView` in
+  `bulkOnly` mode, hiding misleading per-item controls while retaining the fixed header, diff
+  bodies, and whole-batch accept/reject actions. Harness updates route by immutable `sessionId`;
+  snapshot hydration merges by `updatedAt`, and background status never disables the main input.
 - **Workspace explorer / project wiki**: the right project sidebar's Files tab opens the
   viewer-only workspace explorer. `workspace_list` refreshes the EPS source mirror and
   returns durable documents plus `source/`; selecting a file calls confined
@@ -173,6 +186,10 @@ new writers.
 - PlanView/ChangesetView tests pin controlled collapse and the fixed header/footer layout
   boundaries around their scrollable bodies. PlanView additionally pins splitter orientation,
   keyboard sizing, pointer resizing, and persisted height.
+- HarnessStatusCard tests pin runtime confirmation, cancellation by skip, retry, automatic
+  completed/skipped closure, failed/rejected dismissal, suppression of older terminal cards, and
+  atomic bulk-only document review; App integration pins immutable `harness_job` routing and exact
+  Tauri command payloads.
 - Full Vitest, TypeScript, and production build remain required.
 - Settings/App integration tests pin all event-specific switches, immediate persistence,
   native-sound preview, foreground OS-toast suppression, one notification per new ASK/plan/
@@ -187,11 +204,16 @@ new writers.
 
 ## Implementation
 
-- `panel/src/App.tsx` — immediate per-session invocation, immutable event routing, backend activity
-  handling, pending ASK response, pending-review reconnect.
+- `panel/src/App.tsx` — immediate per-session invocation, immutable conversation/harness routing,
+  backend activity handling, durable harness snapshot merge, pending ASK response, and review
+  reconnect.
 - `panel/src/lib/protocol.ts` / `ipc.ts` — required conversation `sessionId`, `ask` /
-  `ask_response`, and `session_activity`.
+  `ask_response`, `session_activity`, and validated `harness_job` events.
 - `panel/src/state/store.ts` — independent conversation and pending-ASK state per row.
+- `panel/src/components/HarnessStatusCard.tsx` — accessible background status, runtime
+  confirmation, retry, and atomic secondary changeset controls.
+- `panel/src/components/ChangesetView.tsx` — normal per-item code review plus `bulkOnly` document
+  review mode.
 - `panel/src/components/AskCard.tsx` — accessible related-question form with single, multi, and
   direct inputs.
 - `panel/src/components/SessionSidebar.tsx` — backend activity labels, waiting cancellation,

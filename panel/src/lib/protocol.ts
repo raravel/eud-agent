@@ -232,6 +232,44 @@ export interface ChangesetMessage extends SessionScopedMessage {
   items: ChangesetItem[];
 }
 
+export type HarnessJobStatus =
+  | "waiting_runtime"
+  | "pending"
+  | "running"
+  | "review"
+  | "failed"
+  | "completed"
+  | "rejected"
+  | "skipped";
+
+export type RuntimeVerification = "not_required" | "waiting" | "confirmed" | "skipped";
+
+export interface HarnessChangeset {
+  request_id: string;
+  items: ChangesetItem[];
+}
+
+export interface HarnessJobView {
+  id: string;
+  sessionId: string;
+  sourceRequestId: string;
+  status: HarnessJobStatus;
+  runtimeVerification: RuntimeVerification;
+  attempts: number;
+  createdAt: number;
+  updatedAt: number;
+  summary?: string;
+  error?: string;
+  memoryFiles: string[];
+  changeset?: HarnessChangeset;
+  dismissed: boolean;
+}
+
+/** Durable post-acceptance harness job update. */
+export interface HarnessJobMessage extends SessionScopedMessage, HarnessJobView {
+  type: "harness_job";
+}
+
 /** `rollback_result {ids, ok, error?}` - outcome of a changeset_decision. */
 export interface RollbackResultMessage extends SessionScopedMessage {
   type: "rollback_result";
@@ -460,6 +498,7 @@ export type ServerMessage =
   | AnswerMessage
   | PlanMessage
   | ChangesetMessage
+  | HarnessJobMessage
   | RollbackResultMessage
   | ProgressMessage
   | ErrorMessage
@@ -479,6 +518,7 @@ export const SERVER_MESSAGE_TYPES = [
   "plan",
   "ask",
   "changeset",
+  "harness_job",
   "rollback_result",
   "progress",
   "error",
@@ -759,6 +799,27 @@ export function isChangesetMessage(value: unknown): value is ChangesetMessage {
   );
 }
 
+export function isHarnessJobMessage(value: unknown): value is HarnessJobMessage {
+  return (
+    isObject(value) &&
+    value.type === "harness_job" &&
+    hasSessionId(value) &&
+    typeof value.id === "string" &&
+    typeof value.sourceRequestId === "string" &&
+    typeof value.status === "string" &&
+    typeof value.runtimeVerification === "string" &&
+    typeof value.attempts === "number" &&
+    typeof value.dismissed === "boolean" &&
+    Array.isArray(value.memoryFiles) &&
+    (value.summary === undefined || typeof value.summary === "string") &&
+    (value.error === undefined || typeof value.error === "string") &&
+    (value.changeset === undefined ||
+      (isObject(value.changeset) &&
+        typeof value.changeset.request_id === "string" &&
+        Array.isArray(value.changeset.items)))
+  );
+}
+
 /** True if `value` is a `rollback_result` message. */
 export function isRollbackResultMessage(
   value: unknown,
@@ -904,6 +965,7 @@ export function isServerMessage(value: unknown): value is ServerMessage {
     isPlanMessage(value) ||
     isAskMessage(value) ||
     isChangesetMessage(value) ||
+    isHarnessJobMessage(value) ||
     isRollbackResultMessage(value) ||
     isProgressMessage(value) ||
     isErrorMessage(value) ||

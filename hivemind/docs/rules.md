@@ -149,20 +149,36 @@ hosting, panel re-arm, and server spawning are REMOVED.
 - Trusted baselines and acceptance metadata stay in `workspaces/.state/`, outside every Codex
   cwd. Each session `source/` is replaced from one coherent EPSNAPSHOT and is NEVER a
   live-editor write path.
-- Native filesystem changes MUST be scanned and journaled at write-turn end, including timeout
-  cancellation. Accept promotes selected session bytes to canonical storage under the lease;
-  promotion and metadata failure MUST restore canonical bytes. Reject restores only the session
-  root.
-- `plan_approve` MUST acquire the project write lease before atomically writing the exact
-  approved Markdown to canonical `plans/<request-id>.md`. The plan is synced before the
-  execution baseline and survives implementation rejection. Codex MUST NEVER edit, rename, or
-  delete that authoritative file.
-- An approved-plan execution MUST NOT report normal completion until the backend verifies
-  all project-wiki postconditions: the exact plan snapshot; non-empty `specs/index.md`
-  linking a non-empty `specs/*.md` topic page; and `worklog/<request-id>.md` recording the
-  actual result/verification and linking a canonical topic spec. Specs describe implemented
-  reality, NEVER merely intended work. Missing artifacts get at most two focused repair
-  turns, then a visible error; they are never silently waived.
+- Foreground Codex turns MUST treat `specs/`, `plans/`, `decisions/`, `worklog/`, and
+  `source/` as read-only. Live project mutations use eud-tools; native writes are confined to
+  `.tmp/**`. Workspace document changes are created only by the post-acceptance harness and
+  journaled from a trusted document-workspace baseline.
+- `plan_approve` MUST atomically write the exact approved Markdown to canonical
+  `plans/<request-id>.md` before implementation. The plan is synced into the session root and
+  survives implementation rejection. Codex MUST NEVER edit, rename, or delete it.
+- A successful `build_run` starts a hard 30-second foreground completion deadline. When Codex
+  has not answered by the deadline, the backend interrupts the turn, emits a bounded completion
+  answer, and exposes the code changeset. Foreground completion MUST NEVER wait for specs,
+  worklogs, project-memory updates, or document repair turns.
+- A fully settled code acceptance MUST create one durable harness job from the accepted journal
+  entries. Runtime-affecting file/DAT/plugin/map changes MUST wait for explicit user confirmation;
+  static settings/MainFile/workspace-only changes MAY continue automatically. `harness_skip`
+  is valid only from `waiting_runtime`; it MUST set terminal `skipped`, generate no model turn,
+  document, worklog, or memory update, and leave accepted code unchanged.
+- `harness_dismiss` is valid only for `failed|completed|rejected|skipped`. It MUST persist a
+  `dismissed` marker without deleting the audit record or altering code/documents/memory. A
+  dismissed newest terminal job MUST suppress older terminal cards after restart.
+- The panel MUST close `completed|skipped` harness cards directly from their durable terminal
+  status without requiring a separate `harness_dismiss` action or close-button click. The newest
+  auto-closed terminal job MUST still suppress older terminal cards.
+- One harness attempt permits exactly one output-schema-constrained Codex turn and forbids every
+  tool call. The server MUST create `worklog/<source-request-id>.md` deterministically, apply the
+  validated exact document batch without shell/Git patching, and expose a separate atomic
+  changeset. Failure MUST preserve accepted code and expose retry; harness review MUST NOT block
+  new foreground conversations or code changes.
+- On the schema-v3 cutover, existing session names and panel logs survive while thread ids,
+  context usage, pending request ids, unaccepted journals, session workspaces, and interrupted
+  harness jobs are cleared. Accepted journals and canonical documents MUST remain intact.
 - Manual conversation compaction MUST use app-server `thread/compact/start` for the exact saved
   thread and MUST wait for the completed `contextCompaction` item. NEVER synthesize a panel-side
   summary, send `/compact` as user text, clear panel history, or alter backend plan/review state.

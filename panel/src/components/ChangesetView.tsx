@@ -51,6 +51,10 @@ export interface ChangesetViewProps {
   pending: boolean;
   /** Fire the changeset_decision; ids "all" for bulk, else the item's ids. */
   onDecide(decision: "accept" | "reject", ids: "all" | string[]): void;
+  /** Optional review title for secondary document changesets. */
+  title?: string;
+  /** Hide per-item decisions when the backend accepts only an atomic batch. */
+  bulkOnly?: boolean;
 }
 
 /** Per-state Korean label + tone for the resolved row badge. */
@@ -279,6 +283,8 @@ export function ChangesetView({
   onOpenChange,
   pending,
   onDecide,
+  title = "수정 적용",
+  bulkOnly = false,
 }: ChangesetViewProps) {
   const { items, decisions } = changeset;
 
@@ -289,7 +295,7 @@ export function ChangesetView({
     >
       <header className="flex min-h-12 shrink-0 items-center justify-between gap-3 border-b border-border px-4 py-2">
         <div className="flex min-w-0 items-baseline gap-2">
-          <h2 className="truncate text-sm font-semibold">수정 적용</h2>
+          <h2 className="truncate text-sm font-semibold">{title}</h2>
           <span className="shrink-0 text-xs text-muted-foreground">
             {items.length}건
           </span>
@@ -339,6 +345,10 @@ export function ChangesetView({
                             )}
                           >
                             {STATE_BADGE[state].label}
+                          </Badge>
+                        ) : bulkOnly ? (
+                          <Badge variant="outline" className="text-xs font-medium">
+                            일괄 검토
                           </Badge>
                         ) : (
                           <>

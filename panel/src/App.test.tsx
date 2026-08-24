@@ -97,6 +97,8 @@ beforeEach(() => {
         return sessionRecords.find((record) => record.id === args?.id);
       case "session_update_log":
         return undefined;
+      case "harness_jobs":
+        return [];
       case "app_settings":
         return {
           notifications: {
@@ -253,6 +255,61 @@ describe("App concurrent sessions", () => {
     expect(await screen.findByText("B-only answer")).toBeInTheDocument();
     expect(
       tauri.invoke.mock.calls.filter(([command]) => command === "session_open"),
+    ).toHaveLength(0);
+  });
+
+  it("routes post-acceptance harness actions and closes completed jobs automatically", async () => {
+    render(<App />);
+    await screen.findByRole("button", { name: "Session A, 유휴" });
+    await waitFor(() => expect(tauri.listeners.has("harness_job")).toBe(true));
+
+    act(() => {
+      emit("harness_job", {
+        sessionId: "session-a",
+        requestId: "req-code",
+        id: "harness-1",
+        sourceRequestId: "req-code",
+        status: "waiting_runtime",
+        runtimeVerification: "waiting",
+        attempts: 0,
+        createdAt: 1,
+        updatedAt: 1,
+        memoryFiles: [],
+        dismissed: false,
+      });
+    });
+
+    expect(screen.getByText("인게임 검증 대기")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "인게임 검증 완료" }));
+    await waitFor(() =>
+      expect(tauri.invoke).toHaveBeenCalledWith("harness_runtime_confirm", {
+        jobId: "harness-1",
+      }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "건너뛰기" }));
+    await waitFor(() =>
+      expect(tauri.invoke).toHaveBeenCalledWith("harness_skip", {
+        jobId: "harness-1",
+      }),
+    );
+    act(() => {
+      emit("harness_job", {
+        sessionId: "session-a",
+        id: "harness-1",
+        sourceRequestId: "req-code",
+        status: "completed",
+        runtimeVerification: "confirmed",
+        attempts: 1,
+        createdAt: 1,
+        updatedAt: 2,
+        memoryFiles: [],
+        dismissed: false,
+      });
+    });
+    expect(screen.queryByText("하네스 완료")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "하네스 상태 닫기" })).not.toBeInTheDocument();
+    expect(
+      tauri.invoke.mock.calls.filter(([command]) => command === "harness_dismiss"),
     ).toHaveLength(0);
   });
 

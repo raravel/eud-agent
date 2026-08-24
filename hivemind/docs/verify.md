@@ -73,16 +73,22 @@ stages from v1 are retired as `server/` is removed.
   heartbeat/status/compiling invariants.
 - Project workspace: `cargo test -p eud-agent workspace:: --lib` covers stable identity,
   durable document directories, coherent `source/` refresh, path confinement, `.codegraph`
-  runtime-metadata exclusion, UTF-8/size limits, turn baseline diffing, Workspace journal
-  kinds, restore behavior, exact approved-plan persistence/state, and linked
-  spec-index/topic/worklog completion checks.
-- Windows sandbox probe: with the installed Codex version, verify `eud_workspace_read`
-  can read the session root but cannot write it, and `eud_workspace_write` can write documents
-  while `source/**` remains read-only. Both profiles must deny unrelated user reads, outside
-  writes, and network. Unsupported exact-root setup must fail closed.
-- Panel workspace: `npm --prefix panel test -- --run WorkspaceView ChangesetView ipc`
-  covers explorer/viewer states, canonical wiki-home ordering, safe relative Markdown
-  navigation, approved-plan badges, confined IPC shapes, and category `workspace` diffs.
+  exclusion, UTF-8/size limits, exact approved-plan persistence, isolated document workspaces,
+  atomic document batches, and accepted promotion.
+- Post-acceptance harness: `cargo test -p eud-agent harness --lib`,
+  `cargo test -p eud-agent approved_plan_completion --lib`, and
+  `cargo test -p eud-agent v3_cutover --lib` cover runtime/static classification, skip without
+  generation, structured delta validation, deterministic server worklogs, interrupted-job
+  recovery, code-first review, 30-second foreground contract, and clean legacy reset.
+- Windows sandbox probe: both `eud_workspace_read` and `eud_workspace_write` must read the session
+  root but reject writes to `specs/`, `plans/`, `decisions/`, `worklog/`, and `source/`.
+  Implementation mode may write only `.tmp/**`. Both profiles deny unrelated user reads, outside
+  writes, and network.
+- Panel workspace/harness:
+  `npm --prefix panel test -- --run WorkspaceView ChangesetView HarnessStatusCard App ipc`
+  covers canonical workspace viewing, normal code review, atomic bulk-only harness review,
+  immutable job routing, runtime confirmation, skip, retry, durable terminal dismissal, and
+  enabled chat during background sync.
 - Panel chat control/performance: `npm --prefix panel test -- --run App SessionSidebar ipc AskCard
   AgentAnswer ConversationLog PlanView store` covers edit-prefix truncation, cancel feedback,
   structured ASK routing/submission and missed-event restoration through `ask_pending`, Mermaid
@@ -98,10 +104,11 @@ stages from v1 are retired as `server/` is removed.
 - Panel concurrency: `npm --prefix panel test -- --run App SessionSidebar ipc` proves overlapping
   chat invokes, immutable event routing, simultaneous write/review labels, conflict reporting,
   and selection independence.
-- Mock-Tauri browser smoke: put A in review while B is `running_write` and C remains idle.
-  Select B and require `변경 중 · 격리 워크스페이스` plus the write-transition log. Repeat at
-  1280×800 and 960×720 and require
-  `document.documentElement.scrollWidth === document.documentElement.clientWidth`.
+- Mock-Tauri browser smoke: render a waiting harness card, then transition it to `skipped` and
+  `completed` with `dismissed=false`; require the whole harness region to close automatically
+  without a close-control click and without revealing older terminal results. Render failed and
+  rejected cards separately, require the labelled close control, and verify manual dismissal.
+  Chat stays enabled and horizontal overflow is zero.
 - ASK + Mermaid browser smoke: use Mock-Tauri to return a pending multi-question ASK from
   `ask_pending` without first emitting an `ask` event. Require the addressed session to show
   `응답 필요`, answer one tab at a time, revisit and edit a completed tab, then submit mixed
@@ -219,10 +226,12 @@ stages from v1 are retired as `server/` is removed.
   before writes, then mandatory `build_run`. Repeat with Node unavailable and confirm a
   `skipped` result while write/build remain usable. This is the only Feature 18 scenario
   that requires the EUD Editor GUI; all adapter/fake-bridge/process coverage is headless.
-- Workspace live test: the first project turn may request one elevated Windows sandbox
-  setup. Approve it, approve a plan, and confirm `plans/<request-id>.md` appears immediately
-  with an approved revision. Let Codex finish: `specs/index.md`, at least one linked topic
-  spec, and a linked `worklog/<request-id>.md` must join the implementation changeset.
-  Follow the index link inside the explorer. Reject once and verify implementation-authored
-  specs/worklog restore while the approved plan remains; repeat and accept, restart the app,
-  and verify the viewer retains accepted documents while `source/` refreshes from the editor.
+- Workspace/harness live test: approve a plan and confirm immutable
+  `plans/<request-id>.md` appears before implementation. After successful `build_run`, code review
+  must appear within 30 seconds without specs/worklog/memory writes in the foreground turn.
+  Accept the code. Runtime-affecting changes must show `인게임 검증 대기`. First choose
+  `건너뛰기` and verify the job becomes terminal without a model call, worklog, spec, or memory
+  change. Repeat the code change, confirm after exercising the map, and require a separate document
+  review containing a server-generated worklog and any exact spec/memory delta. Reject once and
+  verify accepted code remains while documents/memory remain unchanged; retry and accept, restart,
+  and verify accepted documents persist while normal chat stayed usable throughout.
