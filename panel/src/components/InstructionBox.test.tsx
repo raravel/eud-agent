@@ -50,7 +50,7 @@ const codexSettings = {
 };
 
 describe("InstructionBox — textarea sizing", () => {
-  it("caps long input and scrolls overflow inside the textarea", () => {
+  it("grows with multiline input until the capped height, then scrolls", () => {
     render(<InstructionBox state={readyState()} onSend={noop} />);
     const textarea = screen.getByRole("textbox", { name: "지시 입력" });
 
@@ -62,7 +62,13 @@ describe("InstructionBox — textarea sizing", () => {
       },
     });
 
-    expect(textarea).toHaveClass("max-h-48", "overflow-y-auto");
+    expect(textarea).toHaveClass(
+      "min-h-16",
+      "max-h-48",
+      "field-sizing-content",
+      "overflow-y-auto",
+    );
+    expect(textarea).not.toHaveClass("h-16", "max-h-16", "field-sizing-fixed");
   });
 });
 

@@ -103,7 +103,7 @@ export const PromptInputTextarea = ({
 
   return (
     <InputGroupTextarea
-      className={cn("h-16 max-h-16 shrink-0 field-sizing-fixed overflow-y-auto", className)}
+      className={cn("min-h-16 max-h-48 shrink-0 field-sizing-content overflow-y-auto", className)}
       onCompositionEnd={() => setIsComposing(false)}
       onCompositionStart={() => setIsComposing(true)}
       onKeyDown={handleKeyDown}
