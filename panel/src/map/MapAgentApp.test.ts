@@ -10,13 +10,16 @@ import {
   mapSourceProbeChanged,
   nextSelectionLabel,
   reduceMapTurnEvent,
+  staleMentions,
   advanceLiveDraftPreview,
   type LiveDraftPreview,
 } from "./MapAgentApp";
 import type {
+  CandidateStateView,
   MapBootstrapResponse,
   MapContextSnapshot,
   MapSourceProbe,
+  MentionChip,
 } from "./mapProtocol";
 
 function bootstrap(projectId: string, sourcePath: string): MapBootstrapResponse {
@@ -254,5 +257,78 @@ describe("Map Agent conversation timeline", () => {
       detail: "loaded",
     });
     expect(archived.logSequence).toBe(13);
+  });
+});
+
+describe("Candidate mention freshness", () => {
+  const candidate: CandidateStateView = {
+    sessionId: "map-session",
+    baseline: {
+      projectId: "project",
+      sourcePath: "C:\\maps\\source.scx",
+      fileSha256: "baseline",
+      chkSha256: "chk",
+      mtimeNs: "1700000000000000000",
+      tileset: "jungle",
+      width: 64,
+      height: 64,
+    },
+    currentRevision: 2,
+    currentHash: "candidate",
+    revisionKey: "r2:candidate",
+    revisions: [],
+    selections: [
+      {
+        id: "target",
+        label: "영역 A",
+        sourceRevision: "r2:candidate",
+        role: "target",
+        layers: ["terrain"],
+        bounds: { left: 0, top: 0, right: 1, bottom: 1 },
+        selectedCells: 4,
+        rows: [{ y: 0, spans: [[0, 1]] }],
+        snapshotHash: "mask-a",
+      },
+    ],
+    stale: false,
+    canApply: true,
+    canUndo: false,
+  };
+  const chip: MentionChip = {
+    id: "chip",
+    label: "target:영역 A",
+    mention: {
+      kind: "region",
+      selectionId: "target",
+      snapshotHash: "mask-a",
+      sourceRevision: "r1:previous",
+    },
+  };
+
+  it("rebinds an unchanged saved region to the visible candidate revision", () => {
+    const [rebound] = staleMentions([chip], candidate);
+
+    expect(rebound.stale).toBe(false);
+    expect(rebound.mention).toMatchObject({
+      kind: "region",
+      sourceRevision: "r2:candidate",
+    });
+  });
+
+  it("keeps a changed saved region stale", () => {
+    const [stale] = staleMentions(
+      [chip],
+      {
+        ...candidate,
+        selections: [
+          {
+            ...candidate.selections[0],
+            snapshotHash: "mask-b",
+          },
+        ],
+      },
+    );
+
+    expect(stale.stale).toBe(true);
   });
 });

@@ -364,7 +364,7 @@ async function loadAllObjects(
   return pages.flat();
 }
 
-function staleMentions(chips: MentionChip[], candidate: CandidateStateView): MentionChip[] {
+export function staleMentions(chips: MentionChip[], candidate: CandidateStateView): MentionChip[] {
   return chips.map((chip) => {
     let stale = false;
     const mention = chip.mention;
@@ -376,6 +376,14 @@ function staleMentions(chips: MentionChip[], candidate: CandidateStateView): Men
         !selection ||
         selection.snapshotHash !== mention.snapshotHash ||
         selection.sourceRevision !== candidate.revisionKey;
+      return {
+        ...chip,
+        stale,
+        mention:
+          !stale && selection
+            ? { ...mention, sourceRevision: selection.sourceRevision }
+            : mention,
+      };
     } else if (mention.kind === "stamp") {
       const selection = candidate.selections.find(
         (item) => item.id === mention.selectionId,

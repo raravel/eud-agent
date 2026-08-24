@@ -987,6 +987,7 @@ impl CandidateStore {
         preview.current_map = draft;
         preview.revisions.push(candidate_revision);
         preview.candidate_object_ids = object_ids;
+        self.sync_selection_palette(&mut preview)?;
         self.view(&preview)
     }
 
@@ -1018,6 +1019,7 @@ impl CandidateStore {
         state.current_revision = pending.revision.revision;
         state.revisions.push(pending.revision);
         state.candidate_object_ids = pending.object_ids;
+        self.sync_selection_palette(&mut state)?;
         self.save_state(&state)?;
         request.pending_revision = None;
         request.draft_path = None;
@@ -1081,6 +1083,7 @@ impl CandidateStore {
                 .ok_or_else(|| "candidate revision disappeared during revert".to_string())?;
             read_json::<RevisionManifest>(&revision.operation_manifest)?.object_ids
         };
+        self.sync_selection_palette(&mut state)?;
         self.save_state(&state)?;
         self.view(&state)
     }
@@ -1299,6 +1302,7 @@ impl CandidateStore {
         state.last_apply_backup = Some(record.backup_path.clone());
         state.last_apply_source_hash = Some(record.applied_sha256.clone());
         state.last_apply_before_hash = Some(record.before_sha256.clone());
+        self.sync_selection_palette(&mut state)?;
         self.save_state(&state)?;
         self.view(&state)
     }
@@ -1345,6 +1349,7 @@ impl CandidateStore {
         state.last_apply_backup = None;
         state.last_apply_source_hash = None;
         state.last_apply_before_hash = None;
+        self.sync_selection_palette(&mut state)?;
         self.save_state(&state)?;
         self.view(&state)
     }
@@ -2303,6 +2308,15 @@ mod tests {
 
         let preview = store.finalize("project", "map-session", "request").unwrap();
         assert_eq!(preview.current_revision, 1);
+        let preview_selection = preview
+            .selections
+            .iter()
+            .find(|item| item.selection.id == target.id)
+            .unwrap();
+        assert_eq!(
+            preview_selection.selection.source_revision,
+            preview.revision_key
+        );
         assert!(store.finalize("project", "map-session", "request").is_err());
         assert_eq!(
             store
@@ -2315,9 +2329,27 @@ mod tests {
             .commit_request("project", "map-session", "request")
             .unwrap();
         assert_eq!(committed.current_revision, 1);
+        let committed_selection = committed
+            .selections
+            .iter()
+            .find(|item| item.selection.id == target.id)
+            .unwrap();
+        assert_eq!(
+            committed_selection.selection.source_revision,
+            committed.revision_key
+        );
         assert_eq!(file_hash(&source).unwrap(), source_hash);
         store.finish_request("map-session", "request").unwrap();
         assert!(!draft_path.exists());
+        for revision in [0, 1] {
+            let reverted = store.revert("project", "map-session", revision).unwrap();
+            let rebound = reverted
+                .selections
+                .iter()
+                .find(|item| item.selection.id == target.id)
+                .unwrap();
+            assert_eq!(rebound.selection.source_revision, reverted.revision_key);
+        }
         std::fs::remove_dir_all(root).ok();
     }
 
