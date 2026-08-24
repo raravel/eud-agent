@@ -7,6 +7,7 @@
 use std::{
     collections::{HashMap, HashSet},
     fmt,
+    future::Future,
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -57,6 +58,55 @@ const WORKSPACE_GUIDE: &str = r#"[project workspace]
 /// missing rollout, so this timeout is the defensive backstop alongside the error
 /// catch. Generous so a slow-but-valid resume is not aborted.
 const RESUME_FALLBACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+/// Apply a deadline only while Codex is actively running. Structured ASK wait
+/// time is user-owned and must never consume the resume fallback deadline.
+async fn active_time_timeout<T, F>(
+    duration: std::time::Duration,
+    mut ask_waiting: tokio::sync::watch::Receiver<bool>,
+    operation: F,
+) -> Result<T, ()>
+where
+    F: Future<Output = T>,
+{
+    let mut remaining = duration;
+    tokio::pin!(operation);
+
+    loop {
+        if *ask_waiting.borrow_and_update() {
+            tokio::select! {
+                result = &mut operation => return Ok(result),
+                changed = ask_waiting.changed() => {
+                    if changed.is_err() {
+                        return tokio::time::timeout(remaining, operation)
+                            .await
+                            .map_err(|_| ());
+                    }
+                    let _waiting = *ask_waiting.borrow_and_update();
+                }
+            }
+            continue;
+        }
+
+        let active_start = tokio::time::Instant::now();
+        tokio::select! {
+            result = &mut operation => return Ok(result),
+            _ = tokio::time::sleep(remaining) => return Err(()),
+            changed = ask_waiting.changed() => {
+                if changed.is_err() {
+                    return tokio::time::timeout(remaining, operation)
+                        .await
+                        .map_err(|_| ());
+                }
+                if *ask_waiting.borrow_and_update() {
+                    remaining = remaining.saturating_sub(active_start.elapsed());
+                    if remaining.is_zero() {
+                        return Err(());
+                    }
+                }
+            }
+        }
+    }
+}
 
 const EPSCRIPT_GUIDE: &str = r#"[epscript]
 - ALL code you write is epScript (*.eps, the C-like language compiled by euddraft's epscript->eudplib pipeline). Write epScript ONLY.
@@ -781,8 +831,12 @@ impl<D: CodexDriver, S: EventSink> AgentEngine<D, S> {
         // Primary path: the saved thread is already seeded, so this is a resume. If
         // it errors OR does not complete within the bounded timeout (codex may never
         // signal a missing rollout), fall back to a fresh start + transcript replay.
-        let resume =
-            tokio::time::timeout(RESUME_FALLBACK_TIMEOUT, self.driver.run_turn(input)).await;
+        let resume = active_time_timeout(
+            RESUME_FALLBACK_TIMEOUT,
+            self.runtime.subscribe_ask_waiting(),
+            self.driver.run_turn(input),
+        )
+        .await;
         match resume {
             Ok(Ok(result)) => Ok(result),
             Ok(Err(error)) => {
@@ -1997,10 +2051,14 @@ impl ProductionCodexDriver {
         self.client = None;
         self.events = None;
 
-        let (mut client, events) =
-            CodexAppServerClient::spawn_app_server(&cwd, self.mcp_port, access)
-                .await
-                .map_err(|err| AgentEngineError::new(err.to_string()))?;
+        let (mut client, events) = CodexAppServerClient::spawn_app_server(
+            &cwd,
+            self.mcp_port,
+            access,
+            Some(self.runtime.clone()),
+        )
+        .await
+        .map_err(|err| AgentEngineError::new(err.to_string()))?;
         client.set_model_selection(self.model_selection.clone());
         client.set_large_context_enabled(self.large_context_enabled);
         if let Some(thread_id) = retained_thread_id {
@@ -2516,10 +2574,14 @@ impl CodexDriver for ProductionCodexDriver {
             .ok_or_else(|| {
                 AgentEngineError::new("task-state compiler has no prepared workspace")
             })?;
-        let (mut client, mut events) =
-            CodexAppServerClient::spawn_app_server(&workspace.root, None, WorkspaceAccess::Read)
-                .await
-                .map_err(|error| AgentEngineError::new(error.to_string()))?;
+        let (mut client, mut events) = CodexAppServerClient::spawn_app_server(
+            &workspace.root,
+            None,
+            WorkspaceAccess::Read,
+            None,
+        )
+        .await
+        .map_err(|error| AgentEngineError::new(error.to_string()))?;
         client.set_model_selection(self.model_selection.clone());
         client.set_large_context_enabled(self.large_context_enabled);
         client
@@ -4496,6 +4558,24 @@ mod tests {
             default_reasoning_effort: default_reasoning_effort.to_string(),
             is_default,
         }
+    }
+
+    #[tokio::test]
+    async fn resume_fallback_timeout_excludes_ask_wait() {
+        let (ask_waiting, receiver) = tokio::sync::watch::channel(false);
+        let operation = async move {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            ask_waiting.send_replace(true);
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            ask_waiting.send_replace(false);
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            "completed"
+        };
+
+        let result =
+            active_time_timeout(std::time::Duration::from_millis(50), receiver, operation).await;
+
+        assert_eq!(result, Ok("completed"));
     }
 
     #[test]

@@ -299,6 +299,7 @@ pub struct SessionToolRuntime {
     write_state: Arc<Mutex<SessionWriteState>>,
     execution_lock: Arc<Mutex<()>>,
     ask: Arc<Mutex<AskState>>,
+    ask_waiting: tokio::sync::watch::Sender<bool>,
 }
 
 struct PendingAskLease {
@@ -328,6 +329,7 @@ impl SessionToolRuntime {
             services.dirs.clone(),
             Arc::clone(&services.analyzer),
         ));
+        let (ask_waiting, _) = tokio::sync::watch::channel(false);
         Self {
             services,
             session_id,
@@ -339,6 +341,7 @@ impl SessionToolRuntime {
             write_state: Arc::new(Mutex::new(SessionWriteState::default())),
             execution_lock: Arc::new(Mutex::new(())),
             ask: Arc::new(Mutex::new(AskState::default())),
+            ask_waiting,
         }
     }
 
@@ -366,6 +369,10 @@ impl SessionToolRuntime {
         emitter: impl Fn(crate::ipc::AskEvent) -> Result<(), String> + Send + Sync + 'static,
     ) {
         self.ask.lock().emitter = Some(Arc::new(emitter));
+    }
+
+    pub fn subscribe_ask_waiting(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.ask_waiting.subscribe()
     }
 
     pub async fn ask(&self, args: &Value) -> Result<Value, String> {
@@ -399,6 +406,7 @@ impl SessionToolRuntime {
                     response: send,
                 },
             );
+            self.ask_waiting.send_replace(true);
             (request_id, response, emitter)
         };
         let _lease = PendingAskLease {
@@ -430,7 +438,12 @@ impl SessionToolRuntime {
     }
 
     fn remove_pending_ask(&self, request_id: &str) -> Option<PendingAsk> {
-        self.ask.lock().pending.remove(request_id)
+        let mut ask = self.ask.lock();
+        let pending = ask.pending.remove(request_id);
+        if pending.is_some() {
+            self.ask_waiting.send_replace(!ask.pending.is_empty());
+        }
+        pending
     }
     pub fn answer_ask(
         &self,
@@ -447,6 +460,7 @@ impl SessionToolRuntime {
             .pending
             .remove(request_id)
             .ok_or_else(|| format!("ask request `{request_id}` is not pending"))?;
+        self.ask_waiting.send_replace(!ask.pending.is_empty());
         drop(ask);
         pending
             .response
@@ -459,7 +473,9 @@ impl SessionToolRuntime {
     pub fn cancel_pending_ask(&self) {
         let pending = {
             let mut ask = self.ask.lock();
-            std::mem::take(&mut ask.pending)
+            let pending = std::mem::take(&mut ask.pending);
+            self.ask_waiting.send_replace(false);
+            pending
         };
         for (_, pending) in pending {
             let _ = pending

@@ -561,6 +561,7 @@ struct AppServerReadContext<W> {
     thread_started: std::sync::Arc<tokio::sync::Notify>,
     turn_completed: tokio::sync::broadcast::Sender<()>,
     transport: std::sync::Arc<AppServerTransportState>,
+    ask_runtime: Option<crate::tool_exec::SessionToolRuntime>,
 }
 #[derive(Default)]
 struct AppServerTransportState {
@@ -696,6 +697,14 @@ where
         reader: R,
         writer: W,
     ) -> (Self, tokio::sync::mpsc::Receiver<AppServerEvent>) {
+        Self::new_with_stdio_and_ask_runtime(reader, writer, None)
+    }
+
+    fn new_with_stdio_and_ask_runtime(
+        reader: R,
+        writer: W,
+        ask_runtime: Option<crate::tool_exec::SessionToolRuntime>,
+    ) -> (Self, tokio::sync::mpsc::Receiver<AppServerEvent>) {
         let writer = std::sync::Arc::new(tokio::sync::Mutex::new(writer));
         let pending =
             std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
@@ -715,6 +724,7 @@ where
                 thread_started: std::sync::Arc::clone(&thread_started),
                 turn_completed: turn_completed.clone(),
                 transport: std::sync::Arc::clone(&transport),
+                ask_runtime,
             },
         ));
 
@@ -1176,6 +1186,7 @@ impl CodexAppServerClient<tokio::process::ChildStdout, tokio::process::ChildStdi
         cwd: impl AsRef<std::path::Path>,
         mcp_port: u16,
         access: WorkspaceAccess,
+        ask_runtime: Option<crate::tool_exec::SessionToolRuntime>,
     ) -> Result<(Self, tokio::sync::mpsc::Receiver<AppServerEvent>), AppServerError> {
         let codex_cmd = resolve_codex_cmd().map_err(|err| AppServerError::new(err.to_string()))?;
         let mcp_server_url = mcp_server_url(mcp_port);
@@ -1217,7 +1228,7 @@ impl CodexAppServerClient<tokio::process::ChildStdout, tokio::process::ChildStdi
             .take()
             .ok_or_else(|| AppServerError::new("codex app-server stderr was not piped"))?;
 
-        let (mut client, events) = Self::new_with_stdio(stdout, stdin);
+        let (mut client, events) = Self::new_with_stdio_and_ask_runtime(stdout, stdin, ask_runtime);
         client.mcp_server_url = Some(mcp_server_url);
         let waiter_transport = std::sync::Arc::clone(&client.transport);
         let waiter = tokio::spawn(async move {
@@ -1246,6 +1257,7 @@ where
         thread_started,
         turn_completed,
         transport,
+        ask_runtime,
     } = context;
     use tokio::io::AsyncBufReadExt as _;
 
@@ -1283,8 +1295,14 @@ where
 
         match (method, id) {
             (Some(method), Some(id)) => {
-                if let Err(error) =
-                    handle_server_request(&writer, method, id, message.get("params")).await
+                if let Err(error) = handle_server_request(
+                    &writer,
+                    method,
+                    id,
+                    message.get("params"),
+                    ask_runtime.as_ref(),
+                )
+                .await
                 {
                     close_reason = error.message;
                     break;
@@ -1370,19 +1388,37 @@ async fn handle_server_request<W>(
     method: &str,
     id: serde_json::Value,
     params: Option<&serde_json::Value>,
+    ask_runtime: Option<&crate::tool_exec::SessionToolRuntime>,
 ) -> Result<(), AppServerError>
 where
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    let result = match method {
-        "item/commandExecution/requestApproval" => {
-            serde_json::json!({ "decision": "accept" })
+    let result = if let Some(args) = eud_ask_arguments(method, params) {
+        match ask_runtime {
+            Some(runtime) => match runtime.ask(&args).await {
+                Ok(value) => {
+                    let payload = serde_json::to_string(&value).expect("JSON value must serialize");
+                    let content = serde_json::Map::from_iter([(
+                        crate::mcp::ASK_ELICITATION_PAYLOAD_KEY.to_string(),
+                        serde_json::Value::String(payload),
+                    )]);
+                    serde_json::json!({ "action": "accept", "content": content })
+                }
+                Err(_) => serde_json::json!({ "action": "cancel", "content": null }),
+            },
+            None => serde_json::json!({ "action": "decline", "content": null }),
         }
-        "execCommandApproval" => serde_json::json!({ "decision": "approved" }),
-        _ if should_accept_mcp_elicitation(method, params) => {
-            serde_json::json!({ "action": "accept", "content": null })
+    } else {
+        match method {
+            "item/commandExecution/requestApproval" => {
+                serde_json::json!({ "decision": "accept" })
+            }
+            "execCommandApproval" => serde_json::json!({ "decision": "approved" }),
+            _ if should_accept_mcp_elicitation(method, params) => {
+                serde_json::json!({ "action": "accept", "content": null })
+            }
+            _ => decline_approval_result(method),
         }
-        _ => decline_approval_result(method),
     };
 
     write_json_rpc_line(
@@ -1409,6 +1445,30 @@ fn decline_approval_result(method: &str) -> serde_json::Value {
     }
 }
 
+fn eud_ask_arguments(
+    method: &str,
+    params: Option<&serde_json::Value>,
+) -> Option<serde_json::Value> {
+    if method != "mcpServer/elicitation/request" {
+        return None;
+    }
+    let params = params?;
+    if !is_eud_tools_request(params) {
+        return None;
+    }
+    params
+        .get("_meta")
+        .or_else(|| params.pointer("/request/_meta"))?
+        .get(crate::mcp::ASK_ELICITATION_META_KEY)
+        .cloned()
+}
+
+fn is_eud_tools_request(params: &serde_json::Value) -> bool {
+    ["server", "serverName", "server_name", "name"]
+        .iter()
+        .any(|key| params.get(*key).and_then(serde_json::Value::as_str) == Some("eud-tools"))
+}
+
 fn should_accept_mcp_elicitation(method: &str, params: Option<&serde_json::Value>) -> bool {
     if method != "mcpServer/elicitation/request" {
         return false;
@@ -1426,9 +1486,7 @@ fn should_accept_mcp_elicitation(method: &str, params: Option<&serde_json::Value
         return false;
     }
 
-    ["server", "serverName", "server_name", "name"]
-        .iter()
-        .any(|key| params.get(*key).and_then(serde_json::Value::as_str) == Some("eud-tools"))
+    is_eud_tools_request(params)
 }
 
 async fn handle_notification(
@@ -2426,6 +2484,87 @@ mod appserver_tests {
             "medium"
         );
         stub.await.expect("stub server task should not panic");
+    }
+
+    #[tokio::test]
+    async fn eud_ask_elicitation_waits_for_panel_response_without_closing() {
+        let runtime = crate::tool_exec::SessionToolRuntime::for_tests();
+        runtime.begin_request("req-ask", "project").unwrap();
+        let (events, mut emitted) = tokio::sync::mpsc::unbounded_channel();
+        runtime.set_ask_emitter(move |event| {
+            events
+                .send(event)
+                .map_err(|_| "ask event receiver closed".to_string())
+        });
+
+        let (client_write, server_read) = tokio::io::duplex(16 * 1024);
+        let (mut server_write, client_read) = tokio::io::duplex(16 * 1024);
+        let (_client, _events) = CodexAppServerClient::new_with_stdio_and_ask_runtime(
+            client_read,
+            client_write,
+            Some(runtime.clone()),
+        );
+        let mut client_requests = BufReader::new(server_read).lines();
+
+        write_json_line(
+            &mut server_write,
+            json!({
+                "jsonrpc": "2.0",
+                "id": "ask-elicitation",
+                "method": "mcpServer/elicitation/request",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "serverName": "eud-tools",
+                    "mode": "form",
+                    "_meta": {
+                        "eudAgentAsk": {
+                            "questions": [{
+                                "id": "mode",
+                                "question": "방식을 고르세요.",
+                                "options": [{"label": "A"}, {"label": "B"}],
+                                "multi": false
+                            }]
+                        }
+                    },
+                    "message": "eud-agent structured ASK",
+                    "requestedSchema": {
+                        "type": "object",
+                        "properties": {"payload": {"type": "string"}},
+                        "required": ["payload"]
+                    }
+                }
+            }),
+        )
+        .await;
+
+        let event = emitted
+            .recv()
+            .await
+            .expect("ASK must reach the panel runtime");
+        assert!(*runtime.subscribe_ask_waiting().borrow());
+        runtime
+            .answer_ask(
+                &event.request_id,
+                std::collections::BTreeMap::from([(
+                    "mode".to_string(),
+                    crate::ipc::AskAnswer {
+                        answers: vec!["A".to_string()],
+                    },
+                )]),
+            )
+            .unwrap();
+
+        let response = read_json_line(&mut client_requests).await;
+        assert_eq!(response["id"], json!("ask-elicitation"));
+        assert_eq!(response["result"]["action"], json!("accept"));
+        let payload = response
+            .pointer("/result/content/payload")
+            .and_then(Value::as_str)
+            .expect("accepted ASK response must include the encoded answers");
+        let answers: Value = serde_json::from_str(payload).unwrap();
+        assert_eq!(answers["answers"]["mode"]["answers"], json!(["A"]));
+        assert!(!*runtime.subscribe_ask_waiting().borrow());
     }
 
     #[tokio::test]

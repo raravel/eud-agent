@@ -146,11 +146,15 @@ post-acceptance harness; `memory_write` is not exposed to foreground Codex.
 
 
 `ask` accepts one to four related questions. Each question has a stable id, optional header,
-optional 2-5 choices, and a `multi` flag; the panel always exposes direct input. The MCP call
-registers one owner-request-scoped pending ASK, emits a session-scoped `ask` event, sets activity
-to `waiting_input`, and awaits `ask_response{sessionId,requestId,answers}` without holding
-the session engine mutex. A valid response resolves the original MCP call, restores read/write
-activity, and lets Codex continue the same turn. A dropped MCP future removes its pending slot
+optional 2-5 choices, and a `multi` flag; the panel always exposes direct input. The tool call
+uses a standard MCP form elicitation so Codex pauses its MCP active-time deadline while the user
+is answering. The app-server callback registers one owner-request-scoped pending ASK, emits a
+session-scoped `ask` event, sets activity to `waiting_input`, and awaits
+`ask_response{sessionId,requestId,answers}` without holding the session engine mutex. The
+session-restore fallback deadline is paused by the same pending-ASK state. ASK therefore has no
+wall-clock response timeout: only a valid response, explicit turn cancellation, or teardown of
+the owning turn can end it. A valid response resolves the original MCP call, restores read/write
+activity, and lets Codex continue the same turn. A dropped ASK future removes its pending slot
 through an RAII lease; turn cancellation resolves it as cancelled. Because Tauri events are
 ephemeral notifications rather than delivery acknowledgments, `ask_pending{sessionId}` returns the
 backend-authoritative pending snapshot. The main and Map panels query it only after installing
