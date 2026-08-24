@@ -159,7 +159,10 @@ pub fn bridge_from_config(dirs: &DataDirs) -> Result<BridgeIo, String> {
 
 /// `chat` command input.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ChatRequest {
+    /// Stable panel-generated anchor shared with the durable user log entry.
+    pub client_turn_id: String,
     /// User message from the panel. May be empty when at least one attachment exists.
     pub text: String,
     /// Opaque app-owned attachment ids staged before this turn.
@@ -169,7 +172,10 @@ pub struct ChatRequest {
 
 /// `plan_feedback` command input.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PlanFeedbackRequest {
+    /// Stable panel-generated anchor shared with the durable user log entry.
+    pub client_turn_id: String,
     /// User feedback for the current plan.
     pub text: String,
     /// Opaque app-owned attachment ids staged before this turn.
@@ -532,6 +538,9 @@ pub enum ProgressStage {
     /// Native automatic conversation compaction.
     #[serde(rename = "compaction")]
     Compaction,
+    /// Active-task compiler failed without invalidating the foreground result.
+    #[serde(rename = "task_state_warning")]
+    TaskStateWarning,
     /// Selected model requested 1M context but Codex reported a smaller effective window.
     #[serde(rename = "large_context_fallback")]
     LargeContextFallback,
@@ -556,12 +565,20 @@ pub struct ErrorEvent {
     pub message: String,
 }
 
+pub fn new_client_turn_id() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
+
 /// Start a chat turn.
 ///
 /// The engine task replaces this placeholder body with the real orchestration.
 #[tauri::command]
 pub async fn chat(text: String, attachments: Vec<String>) -> Result<(), String> {
-    let _request = ChatRequest { text, attachments };
+    let _request = ChatRequest {
+        client_turn_id: new_client_turn_id(),
+        text,
+        attachments,
+    };
     Ok(())
 }
 
@@ -570,7 +587,11 @@ pub async fn chat(text: String, attachments: Vec<String>) -> Result<(), String> 
 /// The engine task replaces this placeholder body with the real orchestration.
 #[tauri::command]
 pub async fn plan_feedback(text: String, attachments: Vec<String>) -> Result<(), String> {
-    let _request = PlanFeedbackRequest { text, attachments };
+    let _request = PlanFeedbackRequest {
+        client_turn_id: new_client_turn_id(),
+        text,
+        attachments,
+    };
     Ok(())
 }
 
@@ -1060,6 +1081,7 @@ mod tests {
     #[test]
     fn command_inputs_serialize_to_v2_wire_schema() {
         let chat: ipc::ChatRequest = serde_json::from_value(json!({
+            "clientTurnId": "11111111-1111-4111-8111-111111111111",
             "text": "hi",
             "attachments": ["d61bb417-728e-4db9-8d81-2b366201aa89"]
         }))
@@ -1067,12 +1089,14 @@ mod tests {
         assert_json(
             &chat,
             json!({
+                "clientTurnId": "11111111-1111-4111-8111-111111111111",
                 "text": "hi",
                 "attachments": ["d61bb417-728e-4db9-8d81-2b366201aa89"]
             }),
         );
 
         let feedback: ipc::PlanFeedbackRequest = serde_json::from_value(json!({
+            "clientTurnId": "22222222-2222-4222-8222-222222222222",
             "text": "Please revise it.",
             "attachments": ["bf93c8d0-76de-45bd-b118-2d004d71126e"]
         }))
@@ -1080,6 +1104,7 @@ mod tests {
         assert_json(
             &feedback,
             json!({
+                "clientTurnId": "22222222-2222-4222-8222-222222222222",
                 "text": "Please revise it.",
                 "attachments": ["bf93c8d0-76de-45bd-b118-2d004d71126e"]
             }),
@@ -1487,8 +1512,18 @@ mod tests {
 
     #[test]
     fn v2_payloads_match_panel_wire_schema() {
-        let chat: ipc::ChatRequest = serde_json::from_value(json!({ "text": "hi" })).unwrap();
-        assert_json(&chat, json!({ "text": "hi" }));
+        let chat: ipc::ChatRequest = serde_json::from_value(json!({
+            "clientTurnId": "66666666-6666-4666-8666-666666666666",
+            "text": "hi"
+        }))
+        .unwrap();
+        assert_json(
+            &chat,
+            json!({
+                "clientTurnId": "66666666-6666-4666-8666-666666666666",
+                "text": "hi"
+            }),
+        );
 
         assert_json(&ipc::Decision::Accept, json!("accept"));
         assert_json(&ipc::Decision::Reject, json!("reject"));

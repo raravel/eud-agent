@@ -88,6 +88,8 @@ export interface LogEntry {
   id: number;
   kind: LogKind;
   text: string;
+  /** Stable panel-generated user-turn anchor; absent on legacy hydrated rows. */
+  clientTurnId?: string;
   /** Progress stage if this line is a live progress entry (spinner target). */
   stage?: ProgressStage;
   /**
@@ -413,6 +415,7 @@ export interface PanelStore {
     text: string,
     stage?: ProgressStage,
     attachments?: ChatAttachment[],
+    clientTurnId?: string,
   ): void;
 
   /**
@@ -572,9 +575,11 @@ export function createPanelStore(): PanelStore {
     stage?: ProgressStage,
     tools?: AgentTool[],
     attachments?: ChatAttachment[],
+    clientTurnId?: string,
   ): void {
     logSeq += 1;
     const entry: LogEntry = { id: logSeq, kind, text };
+    if (clientTurnId) entry.clientTurnId = clientTurnId;
     if (stage) entry.stage = stage;
     if (tools) entry.tools = tools;
     if (attachments && attachments.length > 0) entry.attachments = attachments;
@@ -1190,8 +1195,8 @@ export function createPanelStore(): PanelStore {
     },
 
     // ---- logging ----
-    log(kind, text, stage, attachments) {
-      pushLog(kind, text, stage, undefined, attachments);
+    log(kind, text, stage, attachments, clientTurnId) {
+      pushLog(kind, text, stage, undefined, attachments, clientTurnId);
       emit();
     },
 
@@ -1206,6 +1211,7 @@ export function createPanelStore(): PanelStore {
           kind: entry.kind as LogKind,
           text: entry.text,
         };
+        if (entry.clientTurnId) next.clientTurnId = entry.clientTurnId;
         if (entry.stage) next.stage = entry.stage;
         if (entry.tools) {
           next.tools = entry.tools.map((tool) => {

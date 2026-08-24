@@ -322,12 +322,14 @@ export class IpcClient {
       case "chat":
         return {
           sessionId: msg.sessionId,
+          clientTurnId: msg.clientTurnId,
           text: msg.text,
           attachments: msg.attachments,
         };
       case "plan_feedback":
         return {
           sessionId: msg.sessionId,
+          clientTurnId: msg.clientTurnId,
           text: msg.text,
           attachments: msg.attachments,
         };

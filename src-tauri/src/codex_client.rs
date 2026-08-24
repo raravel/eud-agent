@@ -430,6 +430,10 @@ pub struct CodexTurnInput {
     /// read-only mode used by isolated protocol tests and non-project operations.
     pub workspace_root: Option<PathBuf>,
     pub workspace_access: WorkspaceAccess,
+    /// Optional JSON Schema constraining the final assistant message.
+    pub output_schema: Option<serde_json::Value>,
+    /// Fail the turn if Codex attempts any tool call.
+    pub forbid_tools: bool,
 }
 
 impl CodexTurnInput {
@@ -439,11 +443,23 @@ impl CodexTurnInput {
             image_paths: Vec::new(),
             workspace_root: None,
             workspace_access: WorkspaceAccess::Read,
+            output_schema: None,
+            forbid_tools: false,
         }
     }
 
     pub fn with_access(mut self, access: WorkspaceAccess) -> Self {
         self.workspace_access = access;
+        self
+    }
+
+    pub fn with_output_schema(mut self, schema: serde_json::Value) -> Self {
+        self.output_schema = Some(schema);
+        self
+    }
+
+    pub fn without_tools(mut self) -> Self {
+        self.forbid_tools = true;
         self
     }
 }
@@ -959,6 +975,9 @@ where
             params["model"] = serde_json::json!(selection.model);
             params["effort"] = serde_json::json!(selection.reasoning_effort);
         }
+        if let Some(output_schema) = input.output_schema {
+            params["outputSchema"] = output_schema;
+        }
         if let Some(workspace_root) = input.workspace_root.as_deref() {
             params["cwd"] = serde_json::json!(path_text(workspace_root)?);
         }
@@ -1184,21 +1203,22 @@ pub(crate) fn mcp_server_override(url: &str) -> String {
 impl CodexAppServerClient<tokio::process::ChildStdout, tokio::process::ChildStdin> {
     pub async fn spawn_app_server(
         cwd: impl AsRef<std::path::Path>,
-        mcp_port: u16,
+        mcp_port: Option<u16>,
         access: WorkspaceAccess,
         ask_runtime: Option<crate::tool_exec::SessionToolRuntime>,
     ) -> Result<(Self, tokio::sync::mpsc::Receiver<AppServerEvent>), AppServerError> {
         let codex_cmd = resolve_codex_cmd().map_err(|err| AppServerError::new(err.to_string()))?;
-        let mcp_server_url = mcp_server_url(mcp_port);
+        let mcp_server_url = mcp_port.map(mcp_server_url);
         let mut command = tokio::process::Command::new(codex_cmd);
         command.arg("app-server");
         for override_arg in app_server_config_overrides(access) {
             command.arg("-c").arg(override_arg);
         }
         // Launch-level registration covers fresh threads; thread/start and
-        // thread/resume repeat it so restored threads cannot retain a tool-less
-        // historical config.
-        command.arg("-c").arg(mcp_server_override(&mcp_server_url));
+        // thread/resume repeat it so restored threads cannot retain stale tools.
+        if let Some(url) = mcp_server_url.as_deref() {
+            command.arg("-c").arg(mcp_server_override(url));
+        }
         let private_tmp = cwd.as_ref().join(crate::workspace::TEMP_DIR);
         if private_tmp.is_dir() {
             command.env("TEMP", &private_tmp).env("TMP", &private_tmp);
@@ -1229,7 +1249,7 @@ impl CodexAppServerClient<tokio::process::ChildStdout, tokio::process::ChildStdi
             .ok_or_else(|| AppServerError::new("codex app-server stderr was not piped"))?;
 
         let (mut client, events) = Self::new_with_stdio_and_ask_runtime(stdout, stdin, ask_runtime);
-        client.mcp_server_url = Some(mcp_server_url);
+        client.mcp_server_url = mcp_server_url;
         let waiter_transport = std::sync::Arc::clone(&client.transport);
         let waiter = tokio::spawn(async move {
             waiter_transport.record_exit(child.wait().await);
@@ -2651,6 +2671,10 @@ mod appserver_tests {
             assert_local_image(&turn_start, "C:/tmp/screenshot.png");
             assert_turn_thread_id(&turn_start, "thread-123");
             assert_turn_settings(&turn_start, "gpt-5.5-codex", "high");
+            assert_eq!(
+                turn_start.pointer("/params/outputSchema/type"),
+                Some(&json!("object"))
+            );
             write_json_line(
                 &mut server_responses,
                 json!({"jsonrpc":"2.0","id":turn_start_id,"result":{}}),
@@ -2825,6 +2849,8 @@ mod appserver_tests {
                 image_paths: vec![PathBuf::from("C:/tmp/screenshot.png")],
                 workspace_root: None,
                 workspace_access: WorkspaceAccess::Read,
+                output_schema: Some(json!({"type": "object"})),
+                forbid_tools: false,
             })
             .await
             .expect("first app-server turn should complete");

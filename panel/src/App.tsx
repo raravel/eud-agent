@@ -130,6 +130,7 @@ function serializePanelLog(log: readonly LogEntry[]): PanelLog {
       kind: entry.kind,
       text: entry.text,
     };
+    if (entry.clientTurnId) next.clientTurnId = entry.clientTurnId;
     if (entry.stage) next.stage = entry.stage;
     if (entry.tools) {
       next.tools = entry.tools.map((tool) => ({
@@ -1007,6 +1008,7 @@ export default function App() {
         slot.store.log("warn", "변경사항 검토를 완료한 뒤 새 요청을 보내세요.");
         return;
       }
+      const clientTurnId = payload.clientTurnId ?? crypto.randomUUID();
 
       try {
         if (!slot.persisted) {
@@ -1033,33 +1035,50 @@ export default function App() {
         markConversationStarted(slot);
 
         if (slot.store.getState().phase === "plan_review") {
-          slot.store.log("you", payload.text, undefined, payload.attachments);
+          slot.store.log(
+            "you",
+            payload.text,
+            undefined,
+            payload.attachments,
+            clientTurnId,
+          );
           slot.store.log("agent", "계획 수정을 요청했습니다.");
           slot.store.planFeedbackSent();
           const sent = await clientRef.current?.send({
             type: "plan_feedback",
             sessionId: slot.id,
+            clientTurnId,
             text: payload.text,
             attachments: payload.attachments.map((attachment) => attachment.id),
           });
           if (!sent) {
+            setEditDraft({ ...payload, clientTurnId });
             slot.store.errorReceived("계획 수정 요청을 처리하지 못했습니다.");
           }
           return;
         }
 
-        slot.store.log("you", payload.text, undefined, payload.attachments);
+        slot.store.log(
+          "you",
+          payload.text,
+          undefined,
+          payload.attachments,
+          clientTurnId,
+        );
         slot.store.chatSent();
         const sent = await clientRef.current?.send({
           type: "chat",
           sessionId: slot.id,
+          clientTurnId,
           text: payload.text,
           attachments: payload.attachments.map((attachment) => attachment.id),
         });
         if (!sent) {
+          setEditDraft({ ...payload, clientTurnId });
           slot.store.errorReceived("요청을 처리하지 못했습니다.");
         }
       } catch (error) {
+        setEditDraft({ ...payload, clientTurnId });
         slot.store.errorReceived(String(error));
         slot.store.log("error", `요청을 처리하지 못했습니다: ${String(error)}`);
       }

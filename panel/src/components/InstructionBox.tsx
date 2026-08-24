@@ -49,6 +49,8 @@ import {
 export interface ChatPayload {
   text: string;
   attachments: ChatAttachment[];
+  /** Preserved only when retrying a transport-rejected submission. */
+  clientTurnId?: string;
 }
 
 export interface InstructionBoxProps {
@@ -96,11 +98,13 @@ export function InstructionBox({
   const dragDepth = useRef(0);
   const fileInput = useRef<HTMLInputElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const retryClientTurnId = useRef<string | undefined>(undefined);
 
   useEffect(() => {
     if (draft === undefined || draft === null) return;
     setInstruction(draft.text);
     setAttachments([...draft.attachments]);
+    retryClientTurnId.current = draft.clientTurnId;
     setAttachmentError(null);
     textareaRef.current?.focus();
   }, [draft]);
@@ -192,7 +196,12 @@ export function InstructionBox({
     ) {
       return;
     }
-    onSend({ text, attachments });
+    onSend({
+      text,
+      attachments,
+      ...(retryClientTurnId.current ? { clientTurnId: retryClientTurnId.current } : {}),
+    });
+    retryClientTurnId.current = undefined;
     setInstruction("");
     setAttachments([]);
     setAttachmentError(null);

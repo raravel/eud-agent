@@ -32,6 +32,7 @@ export const PROGRESS_STAGES = [
   "rag_warmup",
   "codex",
   "compaction",
+  "task_state_warning",
   "large_context_fallback",
   "workspace",
   "lsp",
@@ -420,6 +421,8 @@ export interface PanelLogEntry {
   id: number;
   kind: string;
   text: string;
+  /** Stable user-turn anchor; absent only on hydrated legacy logs. */
+  clientTurnId?: string;
   stage?: string;
   tools?: PanelLogTool[];
   attachments?: ChatAttachment[];
@@ -498,6 +501,7 @@ interface SessionCommand {
 /** `chat {sessionId, text, attachments}` - queue/start one session turn. */
 export interface ChatMessage extends SessionCommand {
   type: "chat";
+  clientTurnId: string;
   text: string;
   attachments: string[];
 }
@@ -505,6 +509,7 @@ export interface ChatMessage extends SessionCommand {
 /** `plan_feedback` iterates the plan owned by one active session. */
 export interface PlanFeedbackMessage extends SessionCommand {
   type: "plan_feedback";
+  clientTurnId: string;
   text: string;
   attachments: string[];
 }
