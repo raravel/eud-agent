@@ -264,6 +264,197 @@ pub fn ensure_model(dirs: &DataDirs, emitter: &dyn ProgressEmitter) -> anyhow::R
     Ok(())
 }
 
+pub const FFMPEG_MANIFEST_JSON: &str = include_str!("../../vendor/ffmpeg/manifest.json");
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ManagedFfmpegArchive {
+    pub url: String,
+    pub sha256: String,
+    pub bytes: u64,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ManagedFfmpegMember {
+    pub name: String,
+    pub archive_path: String,
+    pub sha256: String,
+    pub bytes: u64,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ManagedFfmpegManifest {
+    pub schema: String,
+    pub version: String,
+    pub archive: ManagedFfmpegArchive,
+    pub members: Vec<ManagedFfmpegMember>,
+    pub configuration: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManagedFfmpegPaths {
+    pub ffmpeg: PathBuf,
+    pub ffprobe: PathBuf,
+    pub version: String,
+}
+
+pub fn managed_ffmpeg_manifest() -> anyhow::Result<ManagedFfmpegManifest> {
+    let manifest: ManagedFfmpegManifest =
+        serde_json::from_str(FFMPEG_MANIFEST_JSON).context("bundled FFmpeg manifest is invalid")?;
+    if manifest.schema != "eud-managed-ffmpeg/1"
+        || manifest.members.len() != 2
+        || manifest.archive.bytes == 0
+        || manifest.archive.sha256.len() != 64
+        || !manifest
+            .configuration
+            .iter()
+            .any(|item| item == "--enable-libvorbis")
+    {
+        bail!("bundled FFmpeg manifest violates the managed audio contract");
+    }
+    for name in ["ffmpeg.exe", "ffprobe.exe"] {
+        let member = manifest
+            .members
+            .iter()
+            .find(|member| member.name == name)
+            .with_context(|| format!("bundled FFmpeg manifest is missing {name}"))?;
+        if member.bytes == 0
+            || member.sha256.len() != 64
+            || member.archive_path.contains("..")
+            || !member.archive_path.is_ascii()
+        {
+            bail!("bundled FFmpeg member metadata is invalid for {name}");
+        }
+    }
+    Ok(manifest)
+}
+
+pub fn resolve_managed_ffmpeg(dirs: &DataDirs) -> anyhow::Result<ManagedFfmpegPaths> {
+    let manifest = managed_ffmpeg_manifest()?;
+    let member = |name: &str| {
+        manifest
+            .members
+            .iter()
+            .find(|member| member.name == name)
+            .with_context(|| format!("managed FFmpeg manifest is missing {name}"))
+    };
+    let ffmpeg_member = member("ffmpeg.exe")?;
+    let ffprobe_member = member("ffprobe.exe")?;
+    let ffmpeg = dirs.bin_dir().join(&ffmpeg_member.name);
+    let ffprobe = dirs.bin_dir().join(&ffprobe_member.name);
+    for (path, expected) in [
+        (&ffmpeg, ffmpeg_member.sha256.as_str()),
+        (&ffprobe, ffprobe_member.sha256.as_str()),
+    ] {
+        let actual = sha256_file(path).with_context(|| {
+            format!(
+                "managed audio converter asset is unavailable: {}",
+                path.display()
+            )
+        })?;
+        if actual != expected {
+            bail!("managed audio converter checksum mismatch");
+        }
+    }
+    Ok(ManagedFfmpegPaths {
+        ffmpeg,
+        ffprobe,
+        version: manifest.version,
+    })
+}
+
+pub fn managed_ffmpeg_ready(dirs: &DataDirs) -> bool {
+    resolve_managed_ffmpeg(dirs).is_ok()
+}
+
+pub async fn ensure_ffmpeg(
+    dirs: &DataDirs,
+    emitter: &(dyn ProgressEmitter + Send + Sync),
+) -> anyhow::Result<ManagedFfmpegPaths> {
+    if let Ok(paths) = resolve_managed_ffmpeg(dirs) {
+        return Ok(paths);
+    }
+    let manifest = managed_ffmpeg_manifest()?;
+    fs::create_dir_all(dirs.bin_dir())?;
+    let archive_tmp = dirs.bin_dir().join("ffmpeg-distribution.zip.tmp");
+    let _ = fs::remove_file(&archive_tmp);
+    if let Err(error) = download_to_tmp(
+        &manifest.archive.url,
+        &archive_tmp,
+        "FFmpeg/FFprobe",
+        emitter,
+    )
+    .await
+    {
+        let _ = fs::remove_file(&archive_tmp);
+        return Err(error);
+    }
+    verify_downloaded_tmp(&archive_tmp, &archive_tmp, &manifest.archive.sha256)?;
+    let bin_dir = dirs.bin_dir();
+    let extraction = tokio::task::spawn_blocking(move || {
+        extract_managed_ffmpeg_archive(&archive_tmp, &bin_dir, &manifest)
+    })
+    .await
+    .context("managed FFmpeg extraction task failed")?;
+    extraction?;
+    emitter.emit("bootstrap", 100, "audio converter ready");
+    resolve_managed_ffmpeg(dirs)
+}
+
+fn extract_managed_ffmpeg_archive(
+    archive_path: &Path,
+    bin_dir: &Path,
+    manifest: &ManagedFfmpegManifest,
+) -> anyhow::Result<()> {
+    let result = (|| {
+        let archive_file = File::open(archive_path)?;
+        let mut archive = zip::ZipArchive::new(archive_file)
+            .context("managed FFmpeg archive is not a valid ZIP")?;
+        let mut staged = Vec::with_capacity(manifest.members.len());
+        for member in &manifest.members {
+            let mut source = archive
+                .by_name(&member.archive_path)
+                .with_context(|| format!("managed FFmpeg archive is missing {}", member.name))?;
+            if source.size() != member.bytes {
+                bail!(
+                    "managed FFmpeg archive member size mismatch for {}",
+                    member.name
+                );
+            }
+            let tmp = bin_dir.join(format!("{}.audio.tmp", member.name));
+            let _ = fs::remove_file(&tmp);
+            let mut output = File::create(&tmp)?;
+            std::io::copy(&mut source, &mut output)?;
+            output.flush()?;
+            output.sync_all()?;
+            verify_downloaded_tmp(&tmp, &bin_dir.join(&member.name), &member.sha256)?;
+            staged.push((tmp, bin_dir.join(&member.name)));
+        }
+
+        let mut placed = Vec::new();
+        for (tmp, final_path) in &staged {
+            if final_path.exists() {
+                fs::remove_file(final_path)?;
+            }
+            if let Err(error) = place_verified_tmp(tmp, final_path) {
+                for path in placed {
+                    let _ = fs::remove_file(path);
+                }
+                return Err(error);
+            }
+            placed.push(final_path.clone());
+        }
+        Ok(())
+    })();
+    let _ = fs::remove_file(archive_path);
+    for member in &manifest.members {
+        let _ = fs::remove_file(bin_dir.join(format!("{}.audio.tmp", member.name)));
+    }
+    result
+}
+
 /// The app-installed codex binary filename under [`DataDirs::bin_dir`].
 pub const CODEX_BIN_FILENAME: &str = "codex.exe";
 
@@ -676,6 +867,14 @@ pub async fn bootstrap_assets(
     // fastembed is synchronous/CPU-bound; keep the async runtime free.
     let dirs2 = dirs.clone();
     tokio::task::block_in_place(|| ensure_model(&dirs2, emitter))?;
+    if let Err(error) = ensure_ffmpeg(dirs, emitter).await {
+        eprintln!("eud-agent: managed audio converter bootstrap failed: {error}");
+        emitter.emit(
+            "bootstrap",
+            100,
+            "audio converter unavailable; chat and existing attachments remain available",
+        );
+    }
     Ok(())
 }
 
@@ -1064,6 +1263,29 @@ mod manifest {
         assert!(dirs.bin_dir().join(CODEX_SANDBOX_SETUP_FILENAME).is_file());
 
         fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    #[ignore = "requires FFMPEG_TEST_ARCHIVE pointing to the pinned distribution ZIP"]
+    fn managed_ffmpeg_archive_extracts_and_verifies_both_exact_members() {
+        let source = PathBuf::from(
+            std::env::var_os("FFMPEG_TEST_ARCHIVE")
+                .expect("FFMPEG_TEST_ARCHIVE must name the pinned ZIP"),
+        );
+        let base = unique_temp_dir("ffmpeg-extract");
+        let dirs = crate::config::DataDirs::from_bases(&base.join("roaming"), &base.join("local"));
+        dirs.ensure_dirs().unwrap();
+        let staged = dirs.bin_dir().join("ffmpeg-distribution.zip.tmp");
+        fs::copy(source, &staged).unwrap();
+        let manifest = managed_ffmpeg_manifest().unwrap();
+        verify_downloaded_tmp(&staged, &staged, &manifest.archive.sha256).unwrap();
+        extract_managed_ffmpeg_archive(&staged, &dirs.bin_dir(), &manifest).unwrap();
+        let resolved = resolve_managed_ffmpeg(&dirs).unwrap();
+        assert!(resolved.ffmpeg.is_file());
+        assert!(resolved.ffprobe.is_file());
+        assert_eq!(resolved.version, manifest.version);
+        assert!(!staged.exists());
+        fs::remove_dir_all(base).ok();
     }
 
     #[test]

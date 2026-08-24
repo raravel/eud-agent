@@ -19,6 +19,7 @@
  */
 import type { ReactNode } from "react";
 import {
+  AudioLinesIcon,
   ChevronsUpDownIcon,
   FilePenLineIcon,
   FolderTreeIcon,
@@ -30,6 +31,7 @@ import { Spinner } from "@/components/ui/spinner";
 import { cn } from "@/lib/utils";
 import { classifyDiff } from "@/lib/diff";
 import { truncateForDisplay } from "@/lib/truncate";
+import { formatAttachmentSize } from "@/lib/attachments";
 import {
   datProperties,
   itemIds,
@@ -223,6 +225,85 @@ function DatChangeBlock({ item }: { item: ChangesetItem }) {
   );
 }
 
+function SoundChangeBlock({ item }: { item: ChangesetItem }) {
+  const properties = new Map(
+    datProperties(item).map((property) => [property.property, property.new]),
+  );
+  const source = asText(properties.get("source"));
+  const sourceCodec = asText(properties.get("sourceCodec"));
+  const mpqPath = asText(properties.get("mpqPath"));
+  const durationMs = Number(properties.get("durationMs"));
+  const normalizedBytes = Number(properties.get("normalizedBytes"));
+  const mapSizeDelta = Number(properties.get("mapSizeDelta"));
+  const wavIndex = asText(properties.get("wavIndex"));
+  const duration = Number.isFinite(durationMs)
+    ? `${Math.floor(durationMs / 60_000)
+        .toString()
+        .padStart(2, "0")}:${Math.floor((durationMs % 60_000) / 1_000)
+        .toString()
+        .padStart(2, "0")}.${Math.floor(durationMs % 1_000)
+        .toString()
+        .padStart(3, "0")}`
+    : "—";
+  return (
+    <div
+      className="overflow-hidden rounded border border-border"
+      aria-label={`오디오 추가 ${source}`}
+    >
+      <div className="flex items-center gap-2 bg-muted/60 px-3 py-2">
+        <AudioLinesIcon className="size-4 shrink-0 text-sky-400" />
+        <span className="min-w-0 flex-1 truncate text-sm font-semibold">
+          오디오 추가 · {source}
+        </span>
+        <span className="rounded bg-sky-500/15 px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-wide text-sky-400">
+          OGG Vorbis
+        </span>
+      </div>
+      <div className="grid gap-2 border-t border-border p-3 text-xs sm:grid-cols-2">
+        <div>
+          <span className="text-muted-foreground">원본 codec</span>
+          <span className="ml-2 font-mono">{sourceCodec || "—"}</span>
+        </div>
+        <div>
+          <span className="text-muted-foreground">길이</span>
+          <span className="ml-2 font-mono tabular-nums">{duration}</span>
+        </div>
+        <div>
+          <span className="text-muted-foreground">출력 크기</span>
+          <span className="ml-2 font-mono tabular-nums">
+            {Number.isFinite(normalizedBytes)
+              ? formatAttachmentSize(normalizedBytes)
+              : "—"}
+          </span>
+        </div>
+        <div>
+          <span className="text-muted-foreground">맵 크기 변화</span>
+          <span className="ml-2 font-mono tabular-nums">
+            {Number.isFinite(mapSizeDelta)
+              ? `${mapSizeDelta >= 0 ? "+" : "−"}${formatAttachmentSize(
+                  Math.abs(mapSizeDelta),
+                )}`
+              : "—"}
+          </span>
+        </div>
+        <div>
+          <span className="text-muted-foreground">WAV slot</span>
+          <span className="ml-2 font-mono">#{wavIndex || "—"}</span>
+        </div>
+        <div className="min-w-0 sm:col-span-2">
+          <span className="text-muted-foreground">맵 경로</span>
+          <code className="mt-1 block break-all rounded bg-background px-2 py-1.5 text-[11px]">
+            {mpqPath || "—"}
+          </code>
+        </div>
+        <p className="text-muted-foreground sm:col-span-2">
+          이 오디오를 맵에 배포할 권한은 사용자에게 있어야 합니다.
+        </p>
+      </div>
+    </div>
+  );
+}
+
 /** The body of one changeset item, by category/kind. */
 function ItemBody({ item }: { item: ChangesetItem }) {
   if (item.category === "memory" || item.kind === "memory") {
@@ -245,6 +326,10 @@ function ItemBody({ item }: { item: ChangesetItem }) {
 
   if (item.category === "dat") {
     return <DatChangeBlock item={item} />;
+  }
+
+  if (item.category === "mapSound") {
+    return <SoundChangeBlock item={item} />;
   }
 
   if (item.category === "file" || item.category === "workspace") {

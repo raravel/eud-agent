@@ -1442,11 +1442,11 @@ fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 }
 
 #[cfg(windows)]
-struct WindowsJob(isize);
+pub(crate) struct WindowsJob(isize);
 
 #[cfg(windows)]
 impl WindowsJob {
-    fn assign(child: &Child) -> io::Result<Self> {
+    pub(crate) fn assign(child: &Child) -> io::Result<Self> {
         use std::mem::size_of;
         use std::os::windows::io::AsRawHandle;
         use std::ptr;
@@ -1484,7 +1484,7 @@ impl WindowsJob {
         Ok(Self(handle as isize))
     }
 
-    fn terminate(self) {
+    pub(crate) fn terminate(self) {
         use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
         use windows_sys::Win32::System::JobObjects::TerminateJobObject;
         let handle = self.0 as HANDLE;

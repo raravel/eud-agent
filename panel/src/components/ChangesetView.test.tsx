@@ -105,6 +105,40 @@ const settingsItem: ChangesetItem = {
   seq: 4,
 };
 
+const mapSoundItem: ChangesetItem = {
+  category: "mapSound",
+  kind: "mapSound",
+  id: "sound-1",
+  seq: 5,
+  properties: [
+    { property: "source", old: null, new: "battle-theme.flac", id: "sound-1", seq: 5 },
+    { property: "sourceCodec", old: null, new: "flac", id: "sound-1", seq: 5 },
+    { property: "durationMs", old: null, new: 183420, id: "sound-1", seq: 5 },
+    {
+      property: "mpqPath",
+      old: null,
+      new: "staredit\\wav\\ea_8f3c91a2d4019a77.ogg",
+      id: "sound-1",
+      seq: 5,
+    },
+    {
+      property: "normalizedBytes",
+      old: null,
+      new: 4 * 1024 * 1024,
+      id: "sound-1",
+      seq: 5,
+    },
+    {
+      property: "mapSizeDelta",
+      old: null,
+      new: 4 * 1024 * 1024,
+      id: "sound-1",
+      seq: 5,
+    },
+    { property: "wavIndex", old: null, new: 12, id: "sound-1", seq: 5 },
+  ],
+};
+
 function makeChangeset(
   items: ChangesetItem[],
   decisions: ChangesetState["decisions"] = {},
@@ -310,6 +344,24 @@ describe("ChangesetView — decision dispatch (single vs all)", () => {
       <ChangesetView {...defaultChangesetViewProps} changeset={makeChangeset([modifiedFile])} />,
     );
     expect(screen.queryByText(/처리 중/)).not.toBeInTheDocument();
+  });
+});
+
+describe("ChangesetView — map sound", () => {
+  it("renders normalized metadata, exact MPQ path, map delta, and rights notice", () => {
+    render(
+      <ChangesetView
+        {...defaultChangesetViewProps}
+        changeset={makeChangeset([mapSoundItem])}
+      />,
+    );
+    const row = screen.getByTestId("cs-item-sound-1");
+    expect(within(row).getByText(/battle-theme\.flac/)).toBeInTheDocument();
+    expect(within(row).getByText("OGG Vorbis")).toBeInTheDocument();
+    expect(within(row).getByText("03:03.420")).toBeInTheDocument();
+    expect(within(row).getByText(/ea_8f3c91a2d4019a77\.ogg/)).toBeInTheDocument();
+    expect(within(row).getAllByText(/4\.0 MB/)).toHaveLength(2);
+    expect(within(row).getByText(/배포할 권한/)).toBeInTheDocument();
   });
 });
 

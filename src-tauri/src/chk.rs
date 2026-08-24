@@ -440,6 +440,14 @@ pub struct MapSwitch {
     pub name: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MapSound {
+    pub sound_index: usize,
+    pub string_id: u32,
+    pub mpq_path: String,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum SwitchUsageKind {
@@ -577,6 +585,28 @@ pub fn parse_strings(sections: &BTreeMap<String, Vec<u8>>) -> Vec<String> {
     } else {
         Vec::new()
     }
+}
+
+pub fn parse_sounds(chk: &[u8]) -> Vec<MapSound> {
+    let sections = assemble_sections(&walk_sections(chk));
+    let strings = parse_strings(&sections);
+    sections
+        .get("WAV ")
+        .into_iter()
+        .flat_map(|wav| wav.chunks_exact(4).take(512))
+        .enumerate()
+        .filter_map(|(sound_index, slot)| {
+            let string_id = u32::from_le_bytes(slot.try_into().ok()?);
+            if string_id == 0 {
+                return None;
+            }
+            Some(MapSound {
+                sound_index,
+                string_id,
+                mpq_path: _string_at(&strings, string_id),
+            })
+        })
+        .collect()
 }
 
 pub fn parse_locations(mrgn: &[u8], strings: &[String]) -> Vec<Location> {

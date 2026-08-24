@@ -65,6 +65,18 @@ describe("progressLabel", () => {
     });
   });
 
+  it("surfaces task-state compiler failure without failing the foreground turn", () => {
+    expect(
+      progressLabel(
+        "task_state_warning",
+        "작업 결과는 유지되지만 구조화 상태를 갱신하지 못했습니다.",
+      ),
+    ).toEqual({
+      kind: "warn",
+      text: "작업 결과는 유지되지만 구조화 상태를 갱신하지 못했습니다.",
+    });
+  });
+
   it("surfaces the Codex-clamped 1M fallback as a warning", () => {
     const detail =
       "gpt-test의 1M 컨텍스트 요청이 Codex에서 제한되어 258400 토큰 컨텍스트를 사용합니다.";
@@ -77,6 +89,15 @@ describe("progressLabel", () => {
       text: "1M 컨텍스트 요청이 Codex에서 제한되어 보고된 컨텍스트를 사용합니다.",
     });
   });
+  it("labels each bounded audio conversion and map-write stage", () => {
+    expect(progressLabel("audio_probe").text).toContain("오디오 검사");
+    expect(progressLabel("audio_transcode").text).toContain("OGG Vorbis");
+    expect(progressLabel("audio_validate").text).toContain("검증");
+    expect(progressLabel("waiting_map_close").text).toContain("SCMDraft");
+    expect(progressLabel("map_sound_write").text).toContain("등록");
+    expect(progressLabel("map_sound_verify").text).toContain("검증");
+  });
+
 
 });
 

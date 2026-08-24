@@ -71,6 +71,26 @@ jobs:
       - name: Install Tauri CLI
         run: cargo install tauri-cli --version "^2.0.0" --locked
 
+      - name: Verify managed audio distribution metadata
+        shell: pwsh
+        run: |
+          $manifest = Get-Content vendor/ffmpeg/manifest.json -Raw | ConvertFrom-Json
+          if ($manifest.schema -ne 'eud-managed-ffmpeg/1') {
+            throw 'Managed FFmpeg manifest schema is invalid.'
+          }
+          if ($manifest.archive.sha256 -notmatch '^[0-9a-f]{64}$') {
+            throw 'Managed FFmpeg archive SHA-256 is invalid.'
+          }
+          foreach ($name in @('ffmpeg.exe', 'ffprobe.exe')) {
+            $member = @($manifest.members | Where-Object { $_.name -eq $name })
+            if ($member.Count -ne 1 -or $member[0].sha256 -notmatch '^[0-9a-f]{64}$') {
+              throw "Managed FFmpeg member pin is invalid: $name"
+            }
+          }
+          if (-not (Test-Path vendor/ffmpeg/LICENSE.txt)) {
+            throw 'Managed FFmpeg GPL license resource is missing.'
+          }
+
       - name: Build, sign, and publish
         uses: tauri-apps/tauri-action@v1
         env:

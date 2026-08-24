@@ -710,4 +710,16 @@ RuntimeError: failed"#;
             Ok(self.process.clone())
         }
     }
+    #[test]
+    #[ignore = "requires the configured live EUD Editor project and bridge"]
+    fn live_complete_project_build_run() {
+        let dirs = crate::config::DataDirs::from_bases(
+            Path::new(&std::env::var("APPDATA").unwrap()),
+            Path::new(&std::env::var("LOCALAPPDATA").unwrap()),
+        );
+        let bridge = crate::ipc::bridge_from_config(&dirs).unwrap();
+        let result = build_run(&bridge).unwrap();
+        println!("{}", serde_json::to_string_pretty(&result).unwrap());
+        assert!(result.ok, "live complete build failed: {:?}", result.errors);
+    }
 }

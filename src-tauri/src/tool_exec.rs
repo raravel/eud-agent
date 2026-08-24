@@ -16,6 +16,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use parking_lot::Mutex;
 use serde_json::{json, Value};
+use sha2::{Digest as _, Sha256};
 
 use crate::bridge_io::{BridgeIo, SendOpts, HEARTBEAT_STALE_AFTER};
 use crate::config::DataDirs;
@@ -23,7 +24,6 @@ use crate::edd_runner;
 use crate::eps_preflight::{EpsAnalyzer, EpsCandidateInput, EpsPreflight};
 use crate::journal::{DatTable, JournalEntry, JournalStore, JournalTarget, Snapshot, WriteTool};
 use crate::mapsafe::{CompilingStatus, IsomEngine, MapSafe, WindowsLockProbe};
-use crate::memory::ProjectMemory;
 use crate::rag::Rag;
 use crate::tools::{self, RequestState};
 use crate::workspace::{apply_exact_text_edits, ExactTextEdit};
@@ -76,6 +76,8 @@ pub struct ToolServices {
     writes: crate::write_coordinator::ProjectWriteCoordinator,
     map_candidates: crate::map_candidate::CandidateStore,
     map_images: crate::map_image::MapImageService,
+    audio: crate::audio::AudioService,
+    mentions: crate::mentions::MentionService,
 }
 
 impl ToolServices {
@@ -93,6 +95,11 @@ impl ToolServices {
             WindowsLockProbe,
             IsomEngine,
         ));
+        let mentions = crate::mentions::MentionService::new(
+            map_candidates.clone(),
+            crate::map_context::MapContextService::new(dirs.clone()),
+        );
+        let audio = crate::audio::AudioService::new(dirs.clone());
         Self {
             dirs,
             journal,
@@ -100,7 +107,9 @@ impl ToolServices {
             map_safe,
             analyzer,
             map_candidates,
+            audio,
             map_images: crate::map_image::MapImageService::new(),
+            mentions,
             writes,
         }
     }
@@ -120,8 +129,16 @@ impl ToolServices {
         self.map_candidates.clone()
     }
 
+    pub fn mentions(&self) -> crate::mentions::MentionService {
+        self.mentions.clone()
+    }
+
     pub fn rag(&self) -> Arc<Rag> {
         Arc::clone(&self.rag)
+    }
+
+    pub fn journal(&self) -> &JournalStore {
+        &self.journal
     }
 
     pub fn writes(&self) -> &crate::write_coordinator::ProjectWriteCoordinator {
@@ -135,14 +152,19 @@ struct SessionRequest {
     project_id: String,
     workspace_root: Option<PathBuf>,
     image_refs: BTreeMap<String, crate::map_image::MapImageBinding>,
+    sound_results: usize,
+    audio_refs: BTreeMap<String, crate::audio::AudioBinding>,
+    audio_temp: Option<Arc<crate::audio::RequestAudioTemp>>,
 }
 
 #[derive(Debug, Default)]
 struct SessionWriteState {
     ticket: Option<crate::write_coordinator::WriteTicket>,
     reason: Option<String>,
+    hazard: Option<String>,
 }
 type AskEmitter = Arc<dyn Fn(crate::ipc::AskEvent) -> Result<(), String> + Send + Sync>;
+type ProgressEmitter = Arc<dyn Fn(crate::ipc::ProgressEvent) -> Result<(), String> + Send + Sync>;
 
 struct PendingAsk {
     owner_request_id: String,
@@ -307,6 +329,11 @@ pub struct SessionToolRuntime {
     execution_lock: Arc<Mutex<()>>,
     ask: Arc<Mutex<AskState>>,
     ask_waiting: tokio::sync::watch::Sender<bool>,
+    cancellation: Arc<Mutex<Option<tokio::sync::watch::Receiver<u64>>>>,
+    progress_emitter: Arc<Mutex<Option<ProgressEmitter>>>,
+    last_build: Arc<Mutex<Option<crate::harness::BuildEvidence>>>,
+    sound_build_required: Arc<Mutex<bool>>,
+    sound_preflight_required: Arc<Mutex<bool>>,
 }
 
 struct PendingAskLease {
@@ -349,6 +376,11 @@ impl SessionToolRuntime {
             execution_lock: Arc::new(Mutex::new(())),
             ask: Arc::new(Mutex::new(AskState::default())),
             ask_waiting,
+            cancellation: Arc::new(Mutex::new(None)),
+            progress_emitter: Arc::new(Mutex::new(None)),
+            last_build: Arc::new(Mutex::new(None)),
+            sound_build_required: Arc::new(Mutex::new(false)),
+            sound_preflight_required: Arc::new(Mutex::new(false)),
         }
     }
 
@@ -371,6 +403,10 @@ impl SessionToolRuntime {
         self.services.dirs.clone()
     }
 
+    pub fn mentions(&self) -> crate::mentions::MentionService {
+        self.services.mentions()
+    }
+
     pub fn set_ask_emitter(
         &self,
         emitter: impl Fn(crate::ipc::AskEvent) -> Result<(), String> + Send + Sync + 'static,
@@ -378,8 +414,27 @@ impl SessionToolRuntime {
         self.ask.lock().emitter = Some(Arc::new(emitter));
     }
 
+    pub fn set_progress_emitter(
+        &self,
+        emitter: impl Fn(crate::ipc::ProgressEvent) -> Result<(), String> + Send + Sync + 'static,
+    ) {
+        *self.progress_emitter.lock() = Some(Arc::new(emitter));
+    }
+
+    pub fn set_cancellation(&self, cancellation: tokio::sync::watch::Receiver<u64>) {
+        *self.cancellation.lock() = Some(cancellation);
+    }
     pub fn subscribe_ask_waiting(&self) -> tokio::sync::watch::Receiver<bool> {
         self.ask_waiting.subscribe()
+    }
+
+    fn emit_audio_progress(&self, stage: crate::ipc::ProgressStage, detail: &str) {
+        if let Some(emitter) = self.progress_emitter.lock().clone() {
+            let _ = emitter(crate::ipc::ProgressEvent {
+                stage,
+                detail: Some(detail.to_string()),
+            });
+        }
     }
 
     pub async fn ask(&self, args: &Value) -> Result<Value, String> {
@@ -516,11 +571,17 @@ impl SessionToolRuntime {
         *self.request.lock() = Some(SessionRequest {
             request_id: request_id.to_owned(),
             project_id: project_id.to_owned(),
+            sound_results: 0,
             workspace_root: None,
             image_refs: BTreeMap::new(),
+            audio_refs: BTreeMap::new(),
+            audio_temp: None,
         });
         *self.request_state.lock() = Some(RequestState::for_request(request_id));
         *self.pending_plan.lock() = None;
+        *self.last_build.lock() = None;
+        *self.sound_build_required.lock() = false;
+        *self.sound_preflight_required.lock() = false;
         self.eps_preflight.begin_request(request_id);
         Ok(())
     }
@@ -569,6 +630,114 @@ impl SessionToolRuntime {
         Ok(refs)
     }
 
+    pub fn bind_audio_attachments(
+        &self,
+        request_id: &str,
+        attachments: Vec<crate::attachment::ResolvedAudioAttachment>,
+    ) -> Result<Vec<crate::audio::TrustedAudioRef>, String> {
+        if self.kind != crate::session::SessionKind::Eps {
+            return Err("오디오 첨부는 메인 EPS 대화에서만 사용할 수 있습니다.".to_string());
+        }
+        if attachments.is_empty() {
+            return Ok(Vec::new());
+        }
+        let (start, request_temp, existing_ids) = {
+            let mut request = self.request.lock();
+            let request = request
+                .as_mut()
+                .filter(|request| request.request_id == request_id)
+                .ok_or_else(|| format!("request {request_id} is not active"))?;
+            let request_temp = match request.audio_temp.clone() {
+                Some(temp) => temp,
+                None => {
+                    let temp = self.services.audio.request_temp()?;
+                    request.audio_temp = Some(temp.clone());
+                    temp
+                }
+            };
+            let existing_ids = request
+                .audio_refs
+                .values()
+                .map(|binding| binding.descriptor.id.clone())
+                .collect::<HashSet<_>>();
+            (request.audio_refs.len(), request_temp, existing_ids)
+        };
+        let cancellation = self.cancellation.lock().clone();
+        let mut bindings = Vec::with_capacity(attachments.len());
+        for (offset, attachment) in attachments.into_iter().enumerate() {
+            if existing_ids.contains(&attachment.descriptor.id)
+                || bindings.iter().any(|binding: &crate::audio::AudioBinding| {
+                    binding.descriptor.id == attachment.descriptor.id
+                })
+            {
+                return Err("같은 오디오 첨부를 한 요청에 두 번 바인딩할 수 없습니다.".to_string());
+            }
+            let audio_ref = format!("audio-{}", start + offset + 1);
+            self.emit_audio_progress(
+                crate::ipc::ProgressStage::AudioProbe,
+                "첨부 오디오 스트림을 확인하고 있습니다.",
+            );
+            let binding = self.services.audio.bind(
+                attachment,
+                audio_ref,
+                request_temp.clone(),
+                cancellation.as_ref(),
+            )?;
+            bindings.push(binding);
+        }
+        let refs = bindings
+            .iter()
+            .map(crate::audio::AudioBinding::trusted_ref)
+            .collect::<Vec<_>>();
+        let mut request = self.request.lock();
+        let request = request
+            .as_mut()
+            .filter(|request| request.request_id == request_id)
+            .ok_or_else(|| format!("request {request_id} ended while audio was binding"))?;
+        for binding in bindings {
+            request
+                .audio_refs
+                .insert(binding.audio_ref.clone(), binding);
+        }
+        Ok(refs)
+    }
+
+    fn audio_binding(
+        &self,
+        request_id: &str,
+        audio_ref: &str,
+    ) -> Result<crate::audio::AudioBinding, String> {
+        self.request
+            .lock()
+            .as_ref()
+            .filter(|request| request.request_id == request_id)
+            .and_then(|request| request.audio_refs.get(audio_ref))
+            .cloned()
+            .ok_or_else(|| {
+                format!("audioRef '{audio_ref}' is not bound to the current session/request")
+            })
+    }
+
+    pub fn clear_audio_cache(&self) {
+        if let Some(request) = self.request.lock().as_mut() {
+            request.audio_refs.clear();
+            request.audio_temp = None;
+        }
+    }
+
+    fn next_sound_ref(&self, request_id: &str) -> Result<String, String> {
+        let mut request = self.request.lock();
+        let request = request
+            .as_mut()
+            .filter(|request| request.request_id == request_id)
+            .ok_or_else(|| format!("request {request_id} is not active"))?;
+        request.sound_results = request
+            .sound_results
+            .checked_add(1)
+            .ok_or_else(|| "soundRef sequence overflow".to_string())?;
+        Ok(format!("sound-{}", request.sound_results))
+    }
+
     fn map_image_binding(
         &self,
         request_id: &str,
@@ -597,6 +766,14 @@ impl SessionToolRuntime {
             .lock()
             .as_ref()
             .map(|request| request.project_id.clone())
+    }
+
+    pub fn last_build_evidence(&self) -> Option<crate::harness::BuildEvidence> {
+        self.last_build.lock().clone()
+    }
+
+    pub fn sound_build_required(&self) -> bool {
+        *self.sound_build_required.lock()
     }
 
     pub fn bind_workspace_root(
@@ -714,6 +891,7 @@ impl SessionToolRuntime {
         *self.write_state.lock() = SessionWriteState {
             ticket: Some(ticket.clone()),
             reason: Some("restored pending review".to_string()),
+            hazard: None,
         };
         Ok(ticket)
     }
@@ -737,7 +915,16 @@ impl SessionToolRuntime {
         )
     }
 
+    fn mark_write_hazard(&self, detail: impl Into<String>) {
+        self.write_state.lock().hazard = Some(detail.into());
+    }
+
     pub fn release_write_registration(&self) -> Result<bool, String> {
+        if let Some(hazard) = self.write_state.lock().hazard.clone() {
+            return Err(format!(
+                "write lease retained because map rollback did not settle: {hazard}"
+            ));
+        }
         let ticket = self.write_state.lock().ticket.clone();
         let Some(ticket) = ticket else {
             return Ok(false);
@@ -823,7 +1010,9 @@ stop this turn so the backend can resume the same thread in its isolated writabl
             tools::admit_tool_call(state, tool, args).map_err(|error| error.to_string())?;
         }
 
-        let mut result = if tools::is_mutating_tool(tool) {
+        let mut result = if tool == tools::MAP_SOUND_IMPORT_TOOL {
+            self.map_sound_import(&request_id, args)
+        } else if tools::is_mutating_tool(tool) {
             self.project_transaction(|| self.dispatch(&request_id, tool, args))?
         } else {
             self.dispatch(&request_id, tool, args)
@@ -1022,11 +1211,17 @@ stop this turn so the backend can resume the same thread in its isolated writabl
                 let input: crate::map_stamp::StampPreviewInput =
                     serde_json::from_value(args.clone())
                         .map_err(|error| format!("invalid map_stamp_preview arguments: {error}"))?;
+                let source = candidates.normalize_stamp_tool_source(
+                    &project_id,
+                    &self.session_id,
+                    request_id,
+                    &input.source,
+                )?;
                 serde_json::to_value(candidates.draft_stamp_preview(
                     &project_id,
                     &self.session_id,
                     request_id,
-                    &input.selection_id,
+                    &source,
                     &input.destinations,
                 )?)
                 .map_err(|error| error.to_string())
@@ -1034,11 +1229,17 @@ stop this turn so the backend can resume the same thread in its isolated writabl
             "map_stamp_place" => {
                 let input: crate::map_stamp::StampPlaceInput = serde_json::from_value(args.clone())
                     .map_err(|error| format!("invalid map_stamp_place arguments: {error}"))?;
+                let source = candidates.normalize_stamp_tool_source(
+                    &project_id,
+                    &self.session_id,
+                    request_id,
+                    &input.source,
+                )?;
                 serde_json::to_value(candidates.draft_stamp_place(
                     &project_id,
                     &self.session_id,
                     request_id,
-                    &input.selection_id,
+                    &source,
                     &input.destinations,
                     input.collision_policy,
                 )?)
@@ -1170,6 +1371,9 @@ stop this turn so the backend can resume the same thread in its isolated writabl
                 )
                 .map_err(|error| format!("invalid eps_check files: {error}"))?;
                 let result = self.eps_preflight.check_inputs(request_id, files)?;
+                if *self.sound_build_required.lock() {
+                    *self.sound_preflight_required.lock() = false;
+                }
                 serde_json::to_value(result)
                     .map_err(|error| format!("failed to serialize eps_check result: {error}"))
             }
@@ -1292,6 +1496,7 @@ stop this turn so the backend can resume the same thread in its isolated writabl
                 let bridge = self.bridge()?;
                 tools::map_minimap(&bridge, args).map_err(stringify)
             }
+            tools::MAP_SOUND_LIST_TOOL => self.map_sound_list(),
             tools::SEARCH_DOCS_TOOL => Ok(self.search_docs(args)),
             tools::DOCS_GET_TOOL => self.docs_get(args),
             tools::REQUEST_WRITE_WORKSPACE_TOOL => {
@@ -1339,8 +1544,19 @@ stop this turn so the backend can resume the same thread in its isolated writabl
             "plugin_remove" => self.plugin_remove(request_id, args),
             "plugin_move" => self.plugin_move(request_id, args),
             tools::BUILD_RUN_TOOL => {
+                if *self.sound_preflight_required.lock() {
+                    return Err(
+                        "map sound import 이후 modified/created EPS 전체를 한 eps_check batch로 검사해야 합니다."
+                            .to_string(),
+                    );
+                }
                 let bridge = self.bridge()?;
                 let result = edd_runner::build_run(&bridge)?;
+                *self.sound_build_required.lock() = false;
+                *self.last_build.lock() = Some(crate::harness::BuildEvidence {
+                    ok: result.ok,
+                    error_count: result.errors.len(),
+                });
                 serde_json::to_value(result)
                     .map_err(|error| format!("failed to serialize build result: {error}"))
             }
@@ -1377,7 +1593,6 @@ stop this turn so the backend can resume the same thread in its isolated writabl
                 )
                 .map_err(stringify)
             }
-            tools::MEMORY_WRITE_TOOL => self.memory_write(args),
             "propose_plan" => {
                 let markdown = str_arg(args, "markdown")?.to_string();
                 *self.pending_plan.lock() = Some((request_id.to_owned(), markdown));
@@ -1391,6 +1606,209 @@ stop this turn so the backend can resume the same thread in its isolated writabl
     }
 
     // ---- write-tool helpers ----
+    fn map_sound_list(&self) -> Result<Value, String> {
+        let bridge = self.bridge()?;
+        let (map_path, _) = tools::connected_map_metadata(&bridge, tools::MAP_SOUND_LIST_TOOL)
+            .map_err(stringify)?;
+        let chk = isom::chk_extract(&map_path)
+            .map_err(|_| "저장된 맵의 사운드 목록을 읽을 수 없습니다.".to_string())?;
+        let assets = map_asset_inventory(&map_path)?;
+        let sounds = crate::chk::parse_sounds(&chk)
+            .into_iter()
+            .take(512)
+            .map(|sound| {
+                let asset_present = assets.contains_key(&sound.mpq_path.to_ascii_lowercase());
+                json!({
+                    "soundIndex": sound.sound_index,
+                    "mpqPath": sound.mpq_path,
+                    "assetPresent": asset_present,
+                    "managed": managed_sound_hash(&sound.mpq_path).is_some(),
+                })
+            })
+            .collect::<Vec<_>>();
+        Ok(json!({"sounds": sounds}))
+    }
+
+    fn map_sound_import(&self, request_id: &str, args: &Value) -> Result<Value, String> {
+        let audio_ref = str_arg(args, "audioRef")?;
+        let binding = self.audio_binding(request_id, audio_ref)?;
+        let bridge = self.bridge()?;
+        let (map_path, _) = tools::connected_map_metadata(&bridge, tools::MAP_SOUND_IMPORT_TOOL)
+            .map_err(stringify)?;
+        let expected_map_sha256 = crate::bootstrap::sha256_file(&map_path)
+            .map_err(|_| "저장된 원본 맵을 읽을 수 없습니다.".to_string())?;
+        self.emit_audio_progress(
+            crate::ipc::ProgressStage::AudioTranscode,
+            "canonical OGG Vorbis로 변환하고 있습니다.",
+        );
+        let cancellation = self.cancellation.lock().clone();
+        let normalized = self
+            .services
+            .audio
+            .normalize(&binding, cancellation.as_ref())?;
+        self.emit_audio_progress(
+            crate::ipc::ProgressStage::AudioValidate,
+            "canonical OGG profile을 검증했습니다.",
+        );
+        let ogg_bytes = std::fs::read(&normalized.path)
+            .map_err(|_| "검증된 OGG cache를 읽을 수 없습니다.".to_string())?;
+        if ogg_bytes.len() as u64 != normalized.bytes
+            || !ogg_bytes.starts_with(b"OggS")
+            || format!("{:x}", Sha256::digest(&ogg_bytes)) != normalized.sha256
+        {
+            return Err("검증된 OGG cache invariant가 변경되었습니다.".to_string());
+        }
+        let mpq_path = select_managed_sound_path(&map_path, &normalized.sha256)?;
+        self.emit_audio_progress(
+            crate::ipc::ProgressStage::MapSoundWrite,
+            "저장된 SCX에 MPQ asset, game string, WAV slot을 등록하고 있습니다.",
+        );
+
+        let operation = self.project_transaction(|| {
+            let write = match self.services.map_safe.write_sound(
+                &map_path,
+                &expected_map_sha256,
+                &mpq_path,
+                &ogg_bytes,
+            ) {
+                Ok(write) => write,
+                Err(crate::mapsafe::MapSafeError::Compiling) => {
+                    return Err(
+                        "EUD Editor가 빌드 중이므로 맵 사운드를 추가할 수 없습니다.".to_string()
+                    )
+                }
+                Err(crate::mapsafe::MapSafeError::MapLocked(_)) => {
+                    self.emit_audio_progress(
+                        crate::ipc::ProgressStage::WaitingMapClose,
+                        "SCMDraft에서 현재 맵을 저장하고 닫은 뒤 다시 시도해 주세요.",
+                    );
+                    return Err(
+                        "SCMDraft에서 현재 맵을 저장하고 닫은 뒤 다시 시도해 주세요.".to_string(),
+                    );
+                }
+                Err(crate::mapsafe::MapSafeError::StaleSource { .. }) => {
+                    return Err("저장된 원본 맵이 오디오 변환 중 변경되었습니다.".to_string())
+                }
+                Err(crate::mapsafe::MapSafeError::PostVerifyRestored { .. }) => {
+                    return Err(
+                        "맵 사운드 저장 후 검증에 실패해 원본 backup을 복원했습니다.".to_string(),
+                    )
+                }
+                Err(crate::mapsafe::MapSafeError::Rollback { .. }) => {
+                    self.mark_write_hazard("map sound post-verify rollback failed");
+                    return Err(
+                        "맵 사운드 rollback에 실패했습니다. write lease와 backup을 유지합니다."
+                            .to_string(),
+                    );
+                }
+                Err(crate::mapsafe::MapSafeError::Apply(detail)) => {
+                    let message = if detail.contains("512 WAV") {
+                        "맵의 WAV 슬롯 512개가 모두 사용 중입니다."
+                    } else if detail.contains("different bytes") {
+                        "기존 MPQ sound path에 다른 bytes가 있습니다."
+                    } else if detail.contains("partial state") {
+                        "기존 맵 사운드의 MPQ/string/WAV 상태가 불완전합니다."
+                    } else {
+                        "native 맵 사운드 등록에 실패했습니다."
+                    };
+                    return Err(message.to_string());
+                }
+                Err(crate::mapsafe::MapSafeError::Verify { .. }) => {
+                    return Err("맵 사운드 저장 후 검증에 실패했습니다.".to_string())
+                }
+                Err(crate::mapsafe::MapSafeError::InsufficientDisk { .. }) => {
+                    return Err("맵 사운드 등록에 필요한 디스크 공간이 부족합니다.".to_string())
+                }
+                Err(crate::mapsafe::MapSafeError::Io(_))
+                | Err(crate::mapsafe::MapSafeError::BackupNotFound(_)) => {
+                    return Err("맵 backup 또는 atomic replace에 실패했습니다.".to_string())
+                }
+            };
+            if write.report.reused {
+                return Ok(write);
+            }
+            let seq = self.services.journal.entry_count(request_id) as u64 + 1;
+            let native_report = serde_json::to_vec(&write.report)
+                .map_err(|_| "native sound report를 직렬화할 수 없습니다.".to_string())?;
+            let entry = JournalEntry {
+                id: format!("sound-{seq}"),
+                seq,
+                tool: WriteTool::MapSound,
+                target: JournalTarget::MapSound {
+                    source_map: map_path.clone(),
+                    mpq_path: mpq_path.clone(),
+                    normalized_sha256: normalized.sha256.clone(),
+                },
+                before: Snapshot::MapBackup {
+                    map_path: map_path.to_string_lossy().into_owned(),
+                    backup_path: write.backup_path.to_string_lossy().into_owned(),
+                },
+                after: Snapshot::MapSound {
+                    source_sha256: binding.source_sha256.clone(),
+                    source_codec: binding.probe.codec.clone(),
+                    duration_ms: normalized.duration_ms,
+                    channels: binding.probe.channels,
+                    sample_rate: binding.probe.sample_rate,
+                    normalization_profile: format!(
+                        "{};ogg/vorbis/44100/stereo/q4",
+                        normalized.profile_version
+                    ),
+                    normalized_sha256: normalized.sha256.clone(),
+                    normalized_bytes: normalized.bytes,
+                    mpq_path: mpq_path.clone(),
+                    wav_index: write.report.sound_index,
+                    string_id: write.report.sound_string_id,
+                    map_sha256_before: write.report.input_sha256.clone(),
+                    map_sha256_after: write.report.output_sha256.clone(),
+                    backup_path: write.backup_path.clone(),
+                    native_report_sha256: format!("{:x}", Sha256::digest(&native_report)),
+                    map_bytes_before: write.map_bytes_before,
+                    map_bytes_after: write.map_bytes_after,
+                    source_display_name: binding.descriptor.name.clone(),
+                },
+                ts: epoch_secs(),
+            };
+            if let Err(error) = self.services.journal.record(request_id, entry) {
+                let restore = self
+                    .services
+                    .map_safe
+                    .restore(&crate::mapsafe::JournalEntry {
+                        map_path: map_path.clone(),
+                        backup_path: write.backup_path.clone(),
+                    });
+                let restored_exactly = crate::bootstrap::sha256_file(&map_path)
+                    .is_ok_and(|hash| hash == expected_map_sha256);
+                if restore.is_err() || !restored_exactly {
+                    self.mark_write_hazard(
+                        "map sound journal record failed and rollback did not settle",
+                    );
+                }
+                return Err(format!("맵 사운드 journal 기록에 실패했습니다: {error}"));
+            }
+            *self.sound_build_required.lock() = true;
+            *self.sound_preflight_required.lock() = true;
+            Ok(write)
+        })?;
+        let write = operation?;
+        let sound_ref = self.next_sound_ref(request_id)?;
+        self.emit_audio_progress(
+            crate::ipc::ProgressStage::MapSoundVerify,
+            "SCX sound asset과 WAV slot 저장 검증을 완료했습니다.",
+        );
+        let map_size_delta = i128::from(write.map_bytes_after) - i128::from(write.map_bytes_before);
+        Ok(json!({
+            "soundRef": sound_ref,
+            "mpqPath": write.report.mpq_path,
+            "durationMs": normalized.duration_ms,
+            "normalizedBytes": normalized.bytes,
+            "sourceCodec": normalized.source_codec,
+            "outputCodec": "vorbis",
+            "reused": write.report.reused,
+            "mapSha256Before": write.report.input_sha256,
+            "mapSha256After": write.report.output_sha256,
+            "mapSizeDelta": map_size_delta,
+        }))
+    }
 
     fn dat_family_set(
         &self,
@@ -1968,22 +2386,6 @@ stop this turn so the backend can resume the same thread in its isolated writabl
         })
     }
 
-    fn memory_write(&self, args: &Value) -> Result<Value, String> {
-        let file = str_arg(args, "file")?;
-        let content = str_arg(args, "content")?;
-        let project = self.current_project();
-        if project.is_empty() {
-            return Err("no project is open; memory_write needs a connected project".to_string());
-        }
-        let memory = ProjectMemory::new(self.services.dirs.memory_dir(), project);
-        let result = memory.write(file, content);
-        if result.ok {
-            Ok(json!({ "ok": true, "file": file }))
-        } else {
-            Err(result.reason)
-        }
-    }
-
     fn read_file(&self, args: &Value, opts: &SendOpts) -> Result<Value, String> {
         let path = str_arg(args, "path")?;
         let content = self.bridge()?.get(path, opts, None).map_err(stringify)?;
@@ -2138,14 +2540,6 @@ stop this turn so the backend can resume the same thread in its isolated writabl
             "documents": documents,
             "missingIds": missing_ids,
         }))
-    }
-
-    fn current_project(&self) -> String {
-        self.bridge()
-            .ok()
-            .and_then(|bridge| bridge.read_status_snapshot(HEARTBEAT_STALE_AFTER).ok())
-            .map(|snapshot| snapshot.project)
-            .unwrap_or_default()
     }
 
     fn send(&self, command: &str) -> Result<String, String> {
@@ -2345,14 +2739,28 @@ impl crate::journal::JournalBridge for SessionToolRuntime {
             .map(|_| ())
     }
 
-    fn restore_map_backup(&self, map_path: &str, backup_path: &str) -> Result<(), Self::Error> {
+    fn restore_map_backup(
+        &self,
+        map_path: &str,
+        backup_path: &str,
+        expected_sha256: Option<&str>,
+    ) -> Result<(), Self::Error> {
+        let map_path = PathBuf::from(map_path);
         self.services
             .map_safe
             .restore(&crate::mapsafe::JournalEntry {
-                map_path: PathBuf::from(map_path),
+                map_path: map_path.clone(),
                 backup_path: PathBuf::from(backup_path),
             })
-            .map_err(stringify)
+            .map_err(stringify)?;
+        if let Some(expected_sha256) = expected_sha256 {
+            let actual = crate::bootstrap::sha256_file(&map_path)
+                .map_err(|error| format!("restored map hash failed: {error}"))?;
+            if actual != expected_sha256 {
+                return Err("restored map SHA-256 does not match exact before state".to_string());
+            }
+        }
+        Ok(())
     }
 }
 
@@ -2394,7 +2802,10 @@ impl ToolServices {
             crate::eps_preflight::SkipReason::AdapterMissing,
             "test runtime has no adapter resource",
         ));
-        let candidates = crate::map_candidate::CandidateStore::new(dirs.clone());
+        let candidates = crate::map_candidate::CandidateStore::new(
+            (dirs.clone()).clone(),
+            crate::map_import::MapImportStore::new(dirs.clone()),
+        );
         Self::new(
             dirs,
             analyzer,
@@ -2408,6 +2819,11 @@ impl ToolServices {
 impl SessionToolRuntime {
     pub fn for_tests() -> Self {
         ToolServices::for_tests().session("test-session")
+    }
+
+    pub fn require_sound_build_for_tests(&self) {
+        *self.sound_build_required.lock() = true;
+        *self.sound_preflight_required.lock() = true;
     }
 }
 
@@ -2498,6 +2914,7 @@ fn usize_arg_default(args: &Value, name: &str, default: usize) -> Result<usize, 
         .ok_or_else(|| format!("argument '{name}' must be a non-negative integer"))?;
     usize::try_from(value).map_err(|_| format!("argument '{name}' is too large"))
 }
+
 fn optional_string_array_arg(args: &Value, name: &str) -> Result<Vec<String>, String> {
     let Some(value) = args.get(name) else {
         return Ok(Vec::new());
@@ -2888,6 +3305,79 @@ pub(crate) fn map_building_ids(
                 .ok_or_else(|| "building DAT catalog contains an invalid id".to_string())
         })
         .collect()
+}
+
+fn map_asset_inventory(map_path: &std::path::Path) -> Result<BTreeMap<String, String>, String> {
+    let digest = isom::map_digest(map_path)
+        .map_err(|_| "저장된 맵의 MPQ inventory를 읽을 수 없습니다.".to_string())?;
+    let value: Value = serde_json::from_str(&digest)
+        .map_err(|_| "맵 MPQ inventory 응답이 올바르지 않습니다.".to_string())?;
+    let assets = value["extraAssets"]["assets"]
+        .as_array()
+        .ok_or_else(|| "맵 MPQ inventory가 없습니다.".to_string())?;
+    let mut inventory = BTreeMap::new();
+    for asset in assets {
+        let path = asset["path"]
+            .as_str()
+            .filter(|path| !path.is_empty())
+            .ok_or_else(|| "맵 MPQ asset path가 올바르지 않습니다.".to_string())?;
+        let sha256 = asset["sha256"]
+            .as_str()
+            .filter(|sha256| sha256.len() == 64)
+            .ok_or_else(|| "맵 MPQ asset checksum이 올바르지 않습니다.".to_string())?;
+        if inventory
+            .insert(path.to_ascii_lowercase(), sha256.to_string())
+            .is_some()
+        {
+            return Err("맵 MPQ inventory에 중복 path가 있습니다.".to_string());
+        }
+    }
+    Ok(inventory)
+}
+
+fn managed_sound_hash(path: &str) -> Option<&str> {
+    let hash = path
+        .strip_prefix("staredit\\wav\\ea_")?
+        .strip_suffix(".ogg")?;
+    if matches!(hash.len(), 16 | 24 | 32 | 64)
+        && hash
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        Some(hash)
+    } else {
+        None
+    }
+}
+
+fn select_managed_sound_path(
+    map_path: &std::path::Path,
+    normalized_sha256: &str,
+) -> Result<String, String> {
+    let inventory = map_asset_inventory(map_path)?;
+    select_managed_sound_path_from_inventory(&inventory, normalized_sha256)
+}
+
+fn select_managed_sound_path_from_inventory(
+    inventory: &BTreeMap<String, String>,
+    normalized_sha256: &str,
+) -> Result<String, String> {
+    if normalized_sha256.len() != 64
+        || !normalized_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err("정규화된 OGG checksum이 올바르지 않습니다.".to_string());
+    }
+    for length in [16usize, 24, 32, 64] {
+        let path = format!("staredit\\wav\\ea_{}.ogg", &normalized_sha256[..length]);
+        match inventory.get(&path) {
+            None => return Ok(path),
+            Some(existing) if existing == normalized_sha256 => return Ok(path),
+            Some(_) => continue,
+        }
+    }
+    Err("관리형 MPQ sound path checksum prefix가 모두 충돌합니다.".to_string())
 }
 
 fn load_rag(dirs: &DataDirs) -> Rag {
@@ -3424,7 +3914,10 @@ mod tests {
             ..Default::default()
         })
         .unwrap();
-        let candidates = crate::map_candidate::CandidateStore::new(dirs.clone());
+        let candidates = crate::map_candidate::CandidateStore::new(
+            (dirs.clone()).clone(),
+            crate::map_import::MapImportStore::new(dirs.clone()),
+        );
         let services = ToolServices::new(
             dirs,
             Arc::new(ReturningAnalyzer {
@@ -3472,6 +3965,36 @@ mod tests {
                 }
             }
             seen
+        })
+    }
+
+    fn spawn_owned_bridge_responder(
+        inbox: PathBuf,
+        outbox: PathBuf,
+        expected: String,
+        reply: String,
+    ) -> thread::JoinHandle<()> {
+        thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                let command = fs::read_dir(&inbox)
+                    .unwrap()
+                    .filter_map(Result::ok)
+                    .find_map(|entry| {
+                        let file_name = entry.file_name().to_string_lossy().to_string();
+                        (file_name.starts_with("srv-") && file_name.ends_with(".cmd"))
+                            .then_some((entry.path(), file_name))
+                    });
+                if let Some((path, file_name)) = command {
+                    assert_eq!(fs::read_to_string(&path).unwrap(), expected);
+                    fs::remove_file(path).unwrap();
+                    let stem = file_name.trim_end_matches(".cmd");
+                    fs::write(outbox.join(format!("{stem}.result")), reply.as_bytes()).unwrap();
+                    return;
+                }
+                assert!(Instant::now() < deadline, "bridge command did not arrive");
+                thread::sleep(Duration::from_millis(5));
+            }
         })
     }
 
@@ -3986,7 +4509,10 @@ mod tests {
         let analyzer = Arc::new(ReturningAnalyzer {
             calls: AtomicUsize::new(0),
         });
-        let candidates = crate::map_candidate::CandidateStore::new(dirs.clone());
+        let candidates = crate::map_candidate::CandidateStore::new(
+            (dirs.clone()).clone(),
+            crate::map_import::MapImportStore::new(dirs.clone()),
+        );
         let services = ToolServices::new(
             dirs,
             analyzer.clone(),
@@ -4101,7 +4627,10 @@ mod tests {
             starcraft_path: PathBuf::from(r"C:\Program Files (x86)\StarCraft"),
             digest: crate::chk::digest_chk(&chk),
         };
-        let candidates = crate::map_candidate::CandidateStore::new(dirs.clone());
+        let candidates = crate::map_candidate::CandidateStore::new(
+            (dirs.clone()).clone(),
+            crate::map_import::MapImportStore::new(dirs.clone()),
+        );
         candidates.create_session("map-session", &context).unwrap();
         candidates
             .prepare_request("project", "map-session", "request", 0, &[])
@@ -4181,7 +4710,10 @@ mod tests {
             starcraft_path: PathBuf::from(r"C:\Program Files (x86)\StarCraft"),
             digest: crate::chk::digest_chk(&chk),
         };
-        let candidates = crate::map_candidate::CandidateStore::new(dirs.clone());
+        let candidates = crate::map_candidate::CandidateStore::new(
+            (dirs.clone()).clone(),
+            crate::map_import::MapImportStore::new(dirs.clone()),
+        );
         candidates.create_session("map-session", &context).unwrap();
         candidates
             .prepare_request("project", "map-session", "request", 0, &[])
@@ -4424,5 +4956,236 @@ mod tests {
             render_scale_arg(&json!({"scale": 3})),
             Err("map render scale must be 1, 2, 4, or 8".to_string())
         );
+    }
+    #[test]
+    #[ignore = "requires checksum-pinned managed FFmpeg/FFprobe in LocalAppData"]
+    fn audio_refs_are_exactly_session_and_request_bound_without_prompt_secrets() {
+        let services = ToolServices::for_tests();
+        let dirs = services.dirs.clone();
+        dirs.ensure_dirs().unwrap();
+        let installed = DataDirs::from_bases(
+            std::path::Path::new(&std::env::var("APPDATA").unwrap()),
+            std::path::Path::new(&std::env::var("LOCALAPPDATA").unwrap()),
+        );
+        for name in ["ffmpeg.exe", "ffprobe.exe"] {
+            std::fs::hard_link(installed.bin_dir().join(name), dirs.bin_dir().join(name)).unwrap();
+        }
+        let attachment_store = crate::attachment::AttachmentStore::new(dirs.attachments_dir());
+        let tone = std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("..")
+                .join("crates")
+                .join("isom")
+                .join("tests")
+                .join("fixtures")
+                .join("tone.ogg"),
+        )
+        .unwrap();
+        let descriptor = attachment_store
+            .stage("테마.ogg", "application/octet-stream", &tone)
+            .unwrap();
+        let context = attachment_store
+            .bind_and_resolve(std::slice::from_ref(&descriptor.id), "session-a")
+            .unwrap();
+
+        let runtime_a = services.session("session-a");
+        runtime_a.begin_request("request-a", "project").unwrap();
+        let refs = runtime_a
+            .bind_audio_attachments("request-a", context.audio_files)
+            .unwrap();
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].audio_ref, "audio-1");
+        let visible = serde_json::to_string(&refs).unwrap();
+        assert!(visible.contains("audio-1"));
+        assert!(!visible.contains(&descriptor.id));
+        assert!(!visible.contains("sha256"));
+        assert!(!visible.contains("audio_temp"));
+        assert!(runtime_a.audio_binding("request-a", "audio-1").is_ok());
+
+        let runtime_b = services.session("session-b");
+        runtime_b.begin_request("request-b", "project").unwrap();
+        assert!(runtime_b.audio_binding("request-b", "audio-1").is_err());
+
+        runtime_a.begin_request("request-a-2", "project").unwrap();
+        assert!(runtime_a.audio_binding("request-a-2", "audio-1").is_err());
+        let base = dirs.app_data().parent().unwrap().to_path_buf();
+        std::fs::remove_dir_all(base).ok();
+    }
+    #[test]
+    fn managed_sound_path_is_ascii_content_addressed_and_extends_on_collision() {
+        let normalized = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let empty = BTreeMap::new();
+        assert_eq!(
+            select_managed_sound_path_from_inventory(&empty, normalized).unwrap(),
+            "staredit\\wav\\ea_0123456789abcdef.ogg"
+        );
+
+        let mut collision = BTreeMap::new();
+        collision.insert(
+            "staredit\\wav\\ea_0123456789abcdef.ogg".to_string(),
+            "f".repeat(64),
+        );
+        assert_eq!(
+            select_managed_sound_path_from_inventory(&collision, normalized).unwrap(),
+            "staredit\\wav\\ea_0123456789abcdef01234567.ogg"
+        );
+
+        collision.insert(
+            "staredit\\wav\\ea_0123456789abcdef01234567.ogg".to_string(),
+            normalized.to_string(),
+        );
+        assert_eq!(
+            select_managed_sound_path_from_inventory(&collision, normalized).unwrap(),
+            "staredit\\wav\\ea_0123456789abcdef01234567.ogg"
+        );
+        assert!(managed_sound_hash("staredit\\wav\\ea_ABCDEF0123456789.ogg").is_none());
+        assert!(select_managed_sound_path_from_inventory(&empty, "bad").is_err());
+    }
+    #[test]
+    fn map_sound_requires_post_import_preflight_before_complete_build() {
+        let runtime = SessionToolRuntime::for_tests();
+        runtime.begin_request("sound-build", "project").unwrap();
+        *runtime.sound_build_required.lock() = true;
+        *runtime.sound_preflight_required.lock() = true;
+        let error = runtime
+            .dispatch("sound-build", tools::BUILD_RUN_TOOL, &json!({}))
+            .unwrap_err();
+        assert!(error.contains("eps_check batch"));
+        assert!(runtime.sound_build_required());
+
+        *runtime.sound_preflight_required.lock() = false;
+        let bridge_error = runtime
+            .dispatch("sound-build", tools::BUILD_RUN_TOOL, &json!({}))
+            .unwrap_err();
+        assert!(!bridge_error.contains("eps_check batch"));
+        assert!(runtime.sound_build_required());
+    }
+    #[test]
+    #[ignore = "requires checksum-pinned managed FFmpeg/FFprobe in LocalAppData"]
+    fn map_sound_import_is_one_lease_journal_and_exact_reject_transaction() {
+        let (base, inbox, outbox, runtime) = bridge_runtime("sound-import", "sound-import-request");
+        let dirs = runtime.data_dirs();
+        let installed = DataDirs::from_bases(
+            std::path::Path::new(&std::env::var("APPDATA").unwrap()),
+            std::path::Path::new(&std::env::var("LOCALAPPDATA").unwrap()),
+        );
+        for name in ["ffmpeg.exe", "ffprobe.exe"] {
+            std::fs::hard_link(installed.bin_dir().join(name), dirs.bin_dir().join(name)).unwrap();
+        }
+        let map = base.join("sound-source.scx");
+        std::fs::copy(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("..")
+                .join("crates")
+                .join("isom")
+                .join("tests")
+                .join("fixtures")
+                .join("map_agent_rich.scx"),
+            &map,
+        )
+        .unwrap();
+        let before = std::fs::read(&map).unwrap();
+        let tone = std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("..")
+                .join("crates")
+                .join("isom")
+                .join("tests")
+                .join("fixtures")
+                .join("tone.ogg"),
+        )
+        .unwrap();
+        let attachments = crate::attachment::AttachmentStore::new(dirs.attachments_dir());
+        let descriptor = attachments
+            .stage("battle-theme.ogg", "audio/ogg", &tone)
+            .unwrap();
+        let context = attachments
+            .bind_and_resolve(std::slice::from_ref(&descriptor.id), runtime.session_id())
+            .unwrap();
+        let refs = runtime
+            .bind_audio_attachments("sound-import-request", context.audio_files)
+            .unwrap();
+        assert_eq!(refs[0].audio_ref, "audio-1");
+        runtime
+            .execute(tools::SEARCH_DOCS_TOOL, &json!({"query": "PlayWAV"}))
+            .unwrap();
+        let ticket = runtime
+            .request_write_workspace("import request-local map sound")
+            .unwrap();
+        assert_eq!(
+            ticket.state(),
+            crate::write_coordinator::TicketState::Granted
+        );
+        let responder = spawn_owned_bridge_responder(
+            inbox,
+            outbox,
+            "GETSET project|OpenMapName".to_string(),
+            format!("OK: project|OpenMapName = {}", map.display()),
+        );
+        let result = runtime
+            .execute(
+                tools::MAP_SOUND_IMPORT_TOOL,
+                &json!({"audioRef": "audio-1"}),
+            )
+            .unwrap();
+        responder.join().unwrap();
+        assert_eq!(result["soundRef"], "sound-1");
+        assert_eq!(result["outputCodec"], "vorbis");
+        assert_eq!(result["reused"], false);
+        assert!(result["mpqPath"]
+            .as_str()
+            .is_some_and(|path| managed_sound_hash(path).is_some()));
+        let visible = result.to_string();
+        assert!(!visible.contains(&descriptor.id));
+        assert!(!visible.contains(&descriptor.name));
+        assert!(!visible.contains("audio_temp"));
+        assert_ne!(std::fs::read(&map).unwrap(), before);
+        let changeset = runtime.journal().changeset("sound-import-request").unwrap();
+        assert_eq!(changeset.items.len(), 1);
+        assert_eq!(
+            changeset.items[0].kind,
+            crate::journal::ChangesetItemKind::MapSound
+        );
+        assert!(runtime.sound_build_required());
+        let list_responder = spawn_owned_bridge_responder(
+            base.join("editor").join("Data").join("agent").join("inbox"),
+            base.join("editor")
+                .join("Data")
+                .join("agent")
+                .join("outbox"),
+            "GETSET project|OpenMapName".to_string(),
+            format!("OK: project|OpenMapName = {}", map.display()),
+        );
+        let listed = runtime
+            .execute(tools::MAP_SOUND_LIST_TOOL, &json!({}))
+            .unwrap();
+        list_responder.join().unwrap();
+        assert!(listed["sounds"].as_array().unwrap().iter().any(|sound| {
+            sound["mpqPath"] == result["mpqPath"]
+                && sound["assetPresent"] == true
+                && sound["managed"] == true
+        }));
+
+        attachments.delete_session(runtime.session_id()).unwrap();
+        assert_eq!(
+            crate::chk::parse_sounds(&isom::chk_extract(&map).unwrap())
+                .iter()
+                .filter(|sound| sound.mpq_path == result["mpqPath"].as_str().unwrap())
+                .count(),
+            1
+        );
+        runtime
+            .project_transaction(|| {
+                runtime.journal().decide(
+                    "sound-import-request",
+                    crate::journal::ChangesetDecision::reject(crate::journal::DecisionIds::All),
+                    &runtime,
+                )
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(std::fs::read(&map).unwrap(), before);
+        runtime.release_write_registration().unwrap();
+        std::fs::remove_dir_all(base).ok();
     }
 }

@@ -16,6 +16,8 @@ use sha2::{Digest as _, Sha256};
 pub const MAX_ATTACHMENTS_PER_TURN: usize = 5;
 pub const MAX_IMAGE_BYTES: usize = 10 * 1024 * 1024;
 pub const MAX_TEXT_BYTES: usize = 512 * 1024;
+pub const MAX_AUDIO_BYTES: usize = 64 * 1024 * 1024;
+pub const MAX_AUDIO_BYTES_PER_TURN: usize = 128 * 1024 * 1024;
 const DRAFT_MAX_AGE_SECS: u64 = 24 * 60 * 60;
 const META_FILE: &str = "meta.json";
 const CONTENT_STEM: &str = "content";
@@ -26,6 +28,7 @@ pub const FILE_NAME_HEX_HEADER: &str = "x-eud-file-name-hex";
 pub enum AttachmentKind {
     Image,
     Text,
+    Audio,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -44,16 +47,24 @@ pub struct ResolvedImageAttachment {
     pub path: PathBuf,
     pub sha256: String,
 }
+
+#[derive(Debug, Clone)]
+pub struct ResolvedAudioAttachment {
+    pub descriptor: AttachmentDescriptor,
+    pub path: PathBuf,
+    pub sha256: String,
+}
 #[derive(Debug, Clone)]
 pub struct AttachmentContext {
     pub image_paths: Vec<PathBuf>,
     pub images: Vec<ResolvedImageAttachment>,
     pub text_files: Vec<(String, String)>,
+    pub audio_files: Vec<ResolvedAudioAttachment>,
 }
 
 impl AttachmentContext {
     pub fn is_empty(&self) -> bool {
-        self.image_paths.is_empty() && self.text_files.is_empty()
+        self.image_paths.is_empty() && self.text_files.is_empty() && self.audio_files.is_empty()
     }
 
     pub fn append_text_files(&self, user_text: &str) -> String {
@@ -112,24 +123,33 @@ impl AttachmentStore {
         bytes: &[u8],
     ) -> Result<AttachmentDescriptor, String> {
         let name = clean_display_name(requested_name)?;
+        if bytes.is_empty() {
+            return Err(format!("빈 첨부 파일은 사용할 수 없습니다: {name}"));
+        }
         let (kind, mime, extension) = match detect_image(bytes) {
             Some((mime, extension)) => {
                 validate_attachment_size(AttachmentKind::Image, bytes.len(), &name)?;
                 (AttachmentKind::Image, mime.to_string(), extension)
             }
-            None => {
-                validate_attachment_size(AttachmentKind::Text, bytes.len(), &name)?;
-                let text = std::str::from_utf8(bytes)
-                    .map_err(|_| format!("지원하지 않는 바이너리 파일입니다: {name}"))?;
-                if text.contains('\0') {
-                    return Err(format!("지원하지 않는 바이너리 파일입니다: {name}"));
+            None => match detect_audio(bytes) {
+                Some((mime, extension)) => {
+                    validate_attachment_size(AttachmentKind::Audio, bytes.len(), &name)?;
+                    (AttachmentKind::Audio, mime.to_string(), extension)
                 }
-                (
-                    AttachmentKind::Text,
-                    normalize_text_mime(requested_mime),
-                    "txt",
-                )
-            }
+                None => {
+                    validate_attachment_size(AttachmentKind::Text, bytes.len(), &name)?;
+                    let text = std::str::from_utf8(bytes)
+                        .map_err(|_| format!("지원하지 않는 바이너리 파일입니다: {name}"))?;
+                    if text.contains('\0') {
+                        return Err(format!("지원하지 않는 바이너리 파일입니다: {name}"));
+                    }
+                    (
+                        AttachmentKind::Text,
+                        normalize_text_mime(requested_mime),
+                        "txt",
+                    )
+                }
+            },
         };
 
         let id = uuid::Uuid::new_v4().to_string();
@@ -174,6 +194,7 @@ impl AttachmentStore {
         let mut unique = HashSet::with_capacity(ids.len());
         let mut loaded = Vec::with_capacity(ids.len());
         let mut total_text_bytes = 0usize;
+        let mut total_audio_bytes = 0usize;
 
         for id in ids {
             validate_id(id)?;
@@ -208,12 +229,16 @@ impl AttachmentStore {
                     );
                 }
             }
+            if meta.descriptor.kind == AttachmentKind::Audio {
+                total_audio_bytes = checked_audio_total(total_audio_bytes, meta.descriptor.size)?;
+            }
             loaded.push((meta, content_path));
         }
 
         let mut image_paths = Vec::new();
         let mut images = Vec::new();
         let mut text_files = Vec::new();
+        let mut audio_files = Vec::new();
         for (mut meta, content_path) in loaded {
             meta.session_id = Some(session_id.to_string());
             self.write_meta(&meta)?;
@@ -236,6 +261,14 @@ impl AttachmentStore {
                     })?;
                     text_files.push((meta.descriptor.name, content));
                 }
+                AttachmentKind::Audio => {
+                    let sha256 = file_sha256(&content_path)?;
+                    audio_files.push(ResolvedAudioAttachment {
+                        descriptor: meta.descriptor,
+                        path: content_path,
+                        sha256,
+                    });
+                }
             }
         }
 
@@ -243,6 +276,7 @@ impl AttachmentStore {
             image_paths,
             images,
             text_files,
+            audio_files,
         })
     }
 
@@ -403,8 +437,22 @@ fn validate_attachment_size(kind: AttachmentKind, size: usize, name: &str) -> Re
         AttachmentKind::Text if size > MAX_TEXT_BYTES => {
             Err(format!("텍스트/코드 파일은 512KB 이하여야 합니다: {name}"))
         }
+        AttachmentKind::Audio if size > MAX_AUDIO_BYTES => {
+            Err(format!("오디오 파일은 64MB 이하여야 합니다: {name}"))
+        }
         _ => Ok(()),
     }
+}
+
+fn checked_audio_total(total: usize, size: u64) -> Result<usize, String> {
+    let size = usize::try_from(size).map_err(|_| "첨부 오디오 크기가 너무 큽니다.".to_string())?;
+    let total = total
+        .checked_add(size)
+        .ok_or_else(|| "첨부 오디오 크기 합계가 너무 큽니다.".to_string())?;
+    if total > MAX_AUDIO_BYTES_PER_TURN {
+        return Err("한 번에 첨부하는 오디오는 합계 128MB 이하여야 합니다.".to_string());
+    }
+    Ok(total)
 }
 
 fn normalize_text_mime(requested: &str) -> String {
@@ -431,15 +479,89 @@ fn detect_image(bytes: &[u8]) -> Option<(&'static str, &'static str)> {
     }
 }
 
+fn detect_audio(bytes: &[u8]) -> Option<(&'static str, &'static str)> {
+    if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WAVE" {
+        return Some(("audio/wav", "wav"));
+    }
+    if bytes.starts_with(b"OggS") {
+        return Some(("audio/ogg", "ogg"));
+    }
+    if bytes.starts_with(b"fLaC") {
+        return Some(("audio/flac", "flac"));
+    }
+    if bytes.starts_with(b"ID3") || has_valid_mp3_frame_sync(bytes) {
+        return Some(("audio/mpeg", "mp3"));
+    }
+    if has_valid_adts_header(bytes) {
+        return Some(("audio/aac", "aac"));
+    }
+    if is_audio_iso_bmff(bytes) {
+        return Some(("audio/mp4", "m4a"));
+    }
+    if bytes.len() >= 12 && bytes.starts_with(b"FORM") && matches!(&bytes[8..12], b"AIFF" | b"AIFC")
+    {
+        return Some(("audio/aiff", "aiff"));
+    }
+    const ASF_HEADER: [u8; 16] = [
+        0x30, 0x26, 0xb2, 0x75, 0x8e, 0x66, 0xcf, 0x11, 0xa6, 0xd9, 0x00, 0xaa, 0x00, 0x62, 0xce,
+        0x6c,
+    ];
+    bytes
+        .starts_with(&ASF_HEADER)
+        .then_some(("audio/x-ms-wma", "wma"))
+}
+
+fn has_valid_mp3_frame_sync(bytes: &[u8]) -> bool {
+    bytes.get(..4).is_some_and(|header| {
+        header[0] == 0xff
+            && header[1] & 0xe0 == 0xe0
+            && header[1] & 0x18 != 0x08
+            && header[1] & 0x06 != 0
+            && header[2] & 0xf0 != 0
+            && header[2] & 0xf0 != 0xf0
+            && header[2] & 0x0c != 0x0c
+    })
+}
+
+fn has_valid_adts_header(bytes: &[u8]) -> bool {
+    bytes.get(..7).is_some_and(|header| {
+        let sample_rate_index = (header[2] >> 2) & 0x0f;
+        let frame_length = (usize::from(header[3] & 0x03) << 11)
+            | (usize::from(header[4]) << 3)
+            | usize::from(header[5] >> 5);
+        header[0] == 0xff
+            && header[1] & 0xf6 == 0xf0
+            && sample_rate_index != 0x0f
+            && frame_length >= 7
+    })
+}
+
+fn is_audio_iso_bmff(bytes: &[u8]) -> bool {
+    if bytes.len() < 16 || &bytes[4..8] != b"ftyp" {
+        return false;
+    }
+    let box_size = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
+    if box_size < 16 {
+        return false;
+    }
+    let end = box_size.min(bytes.len()).min(128);
+    bytes[8..end].chunks_exact(4).any(|brand| {
+        matches!(
+            brand,
+            b"M4A " | b"M4B " | b"M4P " | b"mp41" | b"mp42" | b"isom" | b"iso2" | b"iso5"
+        )
+    })
+}
+
 fn file_sha256(path: &Path) -> Result<String, String> {
     let mut file =
-        fs::File::open(path).map_err(|error| format!("첨부 이미지를 읽을 수 없습니다: {error}"))?;
+        fs::File::open(path).map_err(|error| format!("첨부 파일을 읽을 수 없습니다: {error}"))?;
     let mut digest = Sha256::new();
     let mut buffer = [0_u8; 64 * 1024];
     loop {
         let count = file
             .read(&mut buffer)
-            .map_err(|error| format!("첨부 이미지를 읽을 수 없습니다: {error}"))?;
+            .map_err(|error| format!("첨부 파일을 읽을 수 없습니다: {error}"))?;
         if count == 0 {
             break;
         }
@@ -584,6 +706,62 @@ mod tests {
         assert!(store
             .bind_and_resolve(std::slice::from_ref(&descriptor.id), "session-2")
             .is_err());
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn audio_magic_order_caps_and_binding_are_bounded() {
+        let cases: &[(&[u8], &str)] = &[
+            (b"RIFF\0\0\0\0WAVE", "wav"),
+            (b"OggS\0\0\0\0", "ogg"),
+            (b"fLaC\0\0\0\0", "flac"),
+            (&[0xff, 0xfb, 0x90, 0x64], "mp3"),
+            (&[0xff, 0xf1, 0x50, 0x80, 0x01, 0x7f, 0xfc], "aac"),
+            (b"\0\0\0\x18ftypM4A \0\0\0\0M4A ", "m4a"),
+            (b"FORM\0\0\0\0AIFF", "aiff"),
+            (
+                &[
+                    0x30, 0x26, 0xb2, 0x75, 0x8e, 0x66, 0xcf, 0x11, 0xa6, 0xd9, 0, 0xaa, 0, 0x62,
+                    0xce, 0x6c,
+                ],
+                "wma",
+            ),
+        ];
+        for (bytes, extension) in cases {
+            assert_eq!(detect_audio(bytes).unwrap().1, *extension);
+        }
+        assert!(detect_audio(b"RIFF\0\0\0\0WEBP").is_none());
+        assert!(validate_attachment_size(AttachmentKind::Audio, MAX_AUDIO_BYTES, "a.ogg").is_ok());
+        assert!(
+            validate_attachment_size(AttachmentKind::Audio, MAX_AUDIO_BYTES + 1, "a.ogg").is_err()
+        );
+        assert_eq!(
+            checked_audio_total(MAX_AUDIO_BYTES, MAX_AUDIO_BYTES as u64).unwrap(),
+            MAX_AUDIO_BYTES_PER_TURN
+        );
+        assert!(checked_audio_total(MAX_AUDIO_BYTES_PER_TURN, 1).is_err());
+
+        let (root, store) = temp_store("audio");
+        let descriptor = store.stage("effect.wav", "text/plain", cases[0].0).unwrap();
+        assert_eq!(descriptor.kind, AttachmentKind::Audio);
+        assert_eq!(descriptor.mime, "audio/wav");
+        let context = store
+            .bind_and_resolve(std::slice::from_ref(&descriptor.id), "session-a")
+            .unwrap();
+        assert_eq!(context.audio_files.len(), 1);
+        assert!(context.image_paths.is_empty());
+        assert!(context.text_files.is_empty());
+        assert!(store
+            .bind_and_resolve(std::slice::from_ref(&descriptor.id), "session-b")
+            .is_err());
+        store.delete_session("session-a").unwrap();
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn empty_attachment_is_rejected_before_text_classification() {
+        let (root, store) = temp_store("empty");
+        assert!(store.stage("empty.txt", "text/plain", b"").is_err());
         fs::remove_dir_all(root).ok();
     }
 

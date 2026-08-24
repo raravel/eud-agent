@@ -12,9 +12,6 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
-/// Durable project-memory write tool name, exempt from the evidence gate.
-pub const MEMORY_WRITE_TOOL: &str = "memory_write";
-
 /// Build verification tool name, exempt from the evidence gate.
 pub const BUILD_RUN_TOOL: &str = "build_run";
 
@@ -43,6 +40,10 @@ pub const MAP_INFO_TOOL: &str = "map_info";
 pub const MAP_MINIMAP_TOOL: &str = "map_minimap";
 /// In-place switch rename tool name.
 pub const SWITCH_WRITE_TOOL: &str = "switch_write";
+/// Read-only registered map sound inventory for main EPS sessions.
+pub const MAP_SOUND_LIST_TOOL: &str = "map_sound_list";
+/// Request-local canonical audio import into the connected source SCX.
+pub const MAP_SOUND_IMPORT_TOOL: &str = "map_sound_import";
 
 const MAP_PALETTE_CATALOG_KINDS: [&str; 6] = [
     "brushes",
@@ -573,6 +574,12 @@ pub fn tool_registry() -> Vec<ToolSpec> {
             ),
         ),
         tool_spec(
+            MAP_SOUND_LIST_TOOL,
+            "List registered map WAV slots and exact MPQ paths from the connected saved SCX.",
+            false,
+            empty_schema(),
+        ),
+        tool_spec(
             MAP_MINIMAP_TOOL,
             "Render the connected map as PNG terrain with an optional unit overlay.",
             false,
@@ -591,50 +598,24 @@ pub fn tool_registry() -> Vec<ToolSpec> {
             false,
             empty_schema(),
         ),
-    fn search_docs(&self, args: &Value) -> Value {
-        let query = args.get("query").and_then(Value::as_str).unwrap_or("");
-        let k = args
-            .get("k")
-            .and_then(Value::as_i64)
-            .unwrap_or(SEARCH_DOCS_DEFAULT_K)
-            .clamp(1, SEARCH_DOCS_MAX_K) as usize;
-
-        // Empty index (no asset yet) returns zero hits. Otherwise hybrid search:
-        // lexical substring hits (exact identifiers/Korean terms, no model needed)
-        // first, then dense semantic hits fill the rest. A model still warming
-        // yields no semantic hits but lexical still works; zero hits either way
-        // still lift the evidence gate.
-        let hits = if self.services.rag.is_empty() {
-            Vec::new()
-        } else {
-            self.services.rag.search_hybrid(query, k)
-        };
-
-        let items: Vec<Value> = hits
-            .iter()
-            .map(|hit| {
-                let (preview, preview_start_char, preview_truncated) =
-                    search_docs_preview(&hit.text, query);
+        tool_spec(
+            SEARCH_DOCS_TOOL,
+            "Discover ranked reference chunks as compact exact previews. Inspect promising ids with docs_get; searches and exact reads remain repeatable.",
+            false,
+            schema(
                 json!({
-                    "id": format_doc_id(hit.id),
-                    "source": hit.source,
-                    "tier": tier_label(hit.tier_level),
-                    "match": hit.match_kind.as_str(),
-                    "score": hit.score,
-                    "preview": preview,
-                    "previewStartChar": preview_start_char,
-                    "previewTruncated": preview_truncated,
-                })
-            })
-            .collect();
-        let note = if items.is_empty() {
-            "no reference document matched; treat affected items as 근거 없음 (일반 EUD 지식) — never fabricate a source"
-        } else {
-            "previews are exact excerpts, not summaries; call docs_get with promising ids before relying on omitted details"
-        };
-        json!({ "query": query, "count": items.len(), "hits": items, "note": note })
-    }
-
+                    "query": string_schema(),
+                    "k": integer_schema(),
+                }),
+                &["query"],
+            ),
+        ),
+        tool_spec(
+            DOCS_GET_TOOL,
+            "Read selected search_docs chunks exactly by stable hexadecimal id.",
+            false,
+            schema(json!({"ids": string_array_schema(10)}), &["ids"]),
+        ),
         tool_spec(
             ASK_TOOL,
             "Pause this turn to ask the user up to four related questions. Each question supports single or multiple choice and always allows direct input.",
@@ -646,6 +627,12 @@ pub fn tool_registry() -> Vec<ToolSpec> {
             "Declare write intent, park this read-only turn, and resume immediately in the session's isolated writable workspace.",
             false,
             schema(json!({"reason": string_schema()}), &["reason"]),
+        ),
+        tool_spec(
+            MAP_SOUND_IMPORT_TOOL,
+            "Import one request-local audioRef as canonical OGG into the connected saved SCX.",
+            true,
+            schema(json!({"audioRef": string_schema()}), &["audioRef"]),
         ),
         tool_spec(
             "dat_set",
@@ -925,23 +912,6 @@ pub fn tool_registry() -> Vec<ToolSpec> {
             ),
         ),
         tool_spec(
-            MEMORY_WRITE_TOOL,
-            "Write durable agent memory.",
-            true,
-            schema(
-                json!({
-                    "file": enum_string_schema(&[
-                        "resources",
-                        "structure",
-                        "conventions",
-                        "lessons",
-                    ]),
-                    "content": string_schema(),
-                }),
-                &["file", "content"],
-            ),
-        ),
-        tool_spec(
             "propose_plan",
             "Propose a plan for approval.",
             false,
@@ -1125,7 +1095,6 @@ fn map_operation_schema() -> Value {
             ),
             operation_schema(
                 "unit.set",
-
                 json!({
                     "ordinal": u32_schema(),
                     "beforeFingerprint": string_schema(),
@@ -1328,6 +1297,27 @@ fn map_stamp_destinations_schema() -> Value {
     })
 }
 
+fn map_stamp_source_schema() -> Value {
+    json!({
+        "oneOf": [
+            object_schema(
+                json!({
+                    "kind": enum_string_schema(&["candidateSelection"]),
+                    "selectionId": string_schema(),
+                }),
+                &["kind", "selectionId"],
+            ),
+            object_schema(
+                json!({
+                    "kind": enum_string_schema(&["imported"]),
+                    "importId": string_schema(),
+                }),
+                &["kind", "importId"],
+            ),
+        ],
+    })
+}
+
 pub fn map_tool_registry() -> Vec<ToolSpec> {
     let operations = map_operations_schema();
     vec![
@@ -1402,27 +1392,27 @@ pub fn map_tool_registry() -> Vec<ToolSpec> {
         ),
         tool_spec(
             "map_stamp_preview",
-            "Inspect exact live-candidate selection stamping at one or more top-left destinations. Reports object/location collisions without mutating the draft.",
+            "Inspect an exact current-candidate or current-request imported stamp at one or more top-left destinations. Reports object/location collisions without mutating the draft.",
             false,
             schema(
                 json!({
-                    "selectionId": string_schema(),
+                    "source": map_stamp_source_schema(),
                     "destinations": map_stamp_destinations_schema(),
                 }),
-                &["selectionId", "destinations"],
+                &["source", "destinations"],
             ),
         ),
         tool_spec(
             "map_stamp_place",
-            "Place an exact live-candidate selection stamp on the request draft. Never substitutes semantic ISOM. Preview first and ask the user before choosing merge or replace when collisions exist.",
+            "Place an exact current-candidate or current-request imported stamp on the request draft. Never substitutes semantic ISOM. Preview first and ask the user before choosing merge or replace when collisions exist.",
             false,
             schema(
                 json!({
-                    "selectionId": string_schema(),
+                    "source": map_stamp_source_schema(),
                     "destinations": map_stamp_destinations_schema(),
                     "collisionPolicy": enum_string_schema(&["merge", "replace"]),
                 }),
-                &["selectionId", "destinations", "collisionPolicy"],
+                &["source", "destinations", "collisionPolicy"],
             ),
         ),
         tool_spec(
@@ -1532,7 +1522,7 @@ pub fn is_mutating_tool(tool_name: &str) -> bool {
 
 /// Return whether a tool is exempt from the EUD-090 evidence gate.
 pub fn is_evidence_gate_exempt(tool_name: &str) -> bool {
-    matches!(tool_name, MEMORY_WRITE_TOOL | BUILD_RUN_TOOL)
+    tool_name == BUILD_RUN_TOOL
 }
 
 /// Check whether a tool call passes the EUD-090 evidence gate.
@@ -1615,7 +1605,7 @@ Summarize the remaining build issue instead of running build again.",
 }
 
 fn counts_against_mutation_gate(spec: &ToolSpec) -> bool {
-    spec.mutating && spec.name != MEMORY_WRITE_TOOL
+    spec.mutating
 }
 
 fn lookup_tool(tool: &str) -> ToolResult<ToolSpec> {
@@ -1759,6 +1749,27 @@ fn validate_arg_value(
     value: &Value,
     property_schema: &Value,
 ) -> ToolResult<()> {
+    if let Some(alternatives) = property_schema
+        .get("oneOf")
+        .and_then(Value::as_array)
+        .filter(|alternatives| {
+            alternatives
+                .iter()
+                .all(|alternative| alternative.get("type").is_some())
+        })
+    {
+        let matches = alternatives
+            .iter()
+            .filter(|alternative| validate_arg_value(spec, name, value, alternative).is_ok())
+            .count();
+        if matches == 1 {
+            return Ok(());
+        }
+        return admission_error(&format!(
+            "invalid value for '{name}': expected exactly one documented source shape"
+        ));
+    }
+
     if let Some(values) = property_schema.get("enum").and_then(Value::as_array) {
         validate_string(spec, name, value)?;
         let Some(actual) = value.as_str() else {
@@ -3126,7 +3137,6 @@ fn terrain_view(
         "offset": offset,
         "limit": limit,
         "hasMore": end < total,
-
         "tiles": tiles,
     }))
 }
@@ -3604,7 +3614,7 @@ fn encode_png(width: usize, height: usize, rgb: &[u8]) -> ToolResult<Vec<u8>> {
     Ok(output)
 }
 
-fn connected_map_metadata(
+pub(crate) fn connected_map_metadata(
     bridge: &crate::bridge_io::BridgeIo,
     tool: &str,
 ) -> ToolResult<(PathBuf, u64)> {
@@ -4040,13 +4050,9 @@ mod tests {
     }
 
     #[test]
-    fn evidence_gate_never_blocks_memory_write_or_build_run() {
+    fn evidence_gate_never_blocks_build_run() {
         let state = RequestState::new();
 
-        assert_eq!(
-            check_evidence_gate(&state, &write_tool(MEMORY_WRITE_TOOL), true),
-            Ok(())
-        );
         assert_eq!(
             check_evidence_gate(&state, &write_tool(BUILD_RUN_TOOL), true),
             Ok(())
@@ -5439,20 +5445,13 @@ mod tests {
                     &["action", "switchId", "name"],
                 ),
             ),
+            (MAP_SOUND_LIST_TOOL, false, empty_schema()),
             (
-                MEMORY_WRITE_TOOL,
+                MAP_SOUND_IMPORT_TOOL,
                 true,
                 schema(
-                    serde_json::json!({
-                        "file": enum_string_schema(&[
-                            "resources",
-                            "structure",
-                            "conventions",
-                            "lessons",
-                        ]),
-                        "content": string_schema(),
-                    }),
-                    &["file", "content"],
+                    serde_json::json!({"audioRef": string_schema()}),
+                    &["audioRef"],
                 ),
             ),
             (
@@ -6472,18 +6471,18 @@ mod tests {
     }
 
     #[test]
-    fn map_stamp_tools_require_exact_selection_destinations_and_collision_policy() {
+    fn map_stamp_tools_require_strict_source_union_destinations_and_collision_policy() {
         let registry = map_tool_registry();
         for (name, properties, required) in [
             (
                 "map_stamp_preview",
-                vec!["selectionId", "destinations"],
-                vec!["selectionId", "destinations"],
+                vec!["source", "destinations"],
+                vec!["source", "destinations"],
             ),
             (
                 "map_stamp_place",
-                vec!["selectionId", "destinations", "collisionPolicy"],
-                vec!["selectionId", "destinations", "collisionPolicy"],
+                vec!["source", "destinations", "collisionPolicy"],
+                vec!["source", "destinations", "collisionPolicy"],
             ),
         ] {
             let tool = registry
@@ -6491,6 +6490,31 @@ mod tests {
                 .find(|tool| tool.name == name)
                 .unwrap_or_else(|| panic!("{name} must be registered"));
             assert_object_contract(&tool.input_schema, &properties, &required);
+            let source = &tool.input_schema["properties"]["source"];
+            let alternatives = source["oneOf"].as_array().unwrap();
+            assert_eq!(alternatives.len(), 2);
+            assert_object_contract(
+                &alternatives[0],
+                &["kind", "selectionId"],
+                &["kind", "selectionId"],
+            );
+            assert_object_contract(
+                &alternatives[1],
+                &["kind", "importId"],
+                &["kind", "importId"],
+            );
+            assert_eq!(
+                alternatives[0]["properties"]["kind"]["enum"],
+                json!(["candidateSelection"])
+            );
+            assert_eq!(
+                alternatives[1]["properties"]["kind"]["enum"],
+                json!(["imported"])
+            );
+            let serialized = source.to_string().to_ascii_lowercase();
+            for forbidden in ["path", "picker", "blob", "chk", "mtxm"] {
+                assert!(!serialized.contains(forbidden));
+            }
             let destinations = &tool.input_schema["properties"]["destinations"];
             assert_eq!(destinations["type"], "array");
             assert_eq!(destinations["minItems"], 1);
@@ -6512,6 +6536,31 @@ mod tests {
         assert_eq!(
             place.input_schema["properties"]["collisionPolicy"]["enum"],
             json!(["merge", "replace"])
+        );
+        assert!(
+            serde_json::from_value::<crate::map_stamp::StampPreviewInput>(json!({
+                "source": {"kind": "candidateSelection", "selectionId": "selection"},
+                "destinations": [{"x": 1, "y": 2}]
+            }))
+            .is_ok()
+        );
+        assert!(
+            serde_json::from_value::<crate::map_stamp::StampPreviewInput>(json!({
+                "source": {"kind": "imported", "importId": "import"},
+                "destinations": [{"x": 1, "y": 2}]
+            }))
+            .is_ok()
+        );
+        assert!(
+            serde_json::from_value::<crate::map_stamp::StampPreviewInput>(json!({
+                "source": {
+                    "kind": "imported",
+                    "importId": "import",
+                    "selectionId": "selection"
+                },
+                "destinations": [{"x": 1, "y": 2}]
+            }))
+            .is_err()
         );
     }
 
@@ -6651,22 +6700,6 @@ mod tests {
         assert!(!state.docs_searched);
         assert_eq!(state.search_docs_count, 1);
         assert_eq!(state.action_count, 0);
-    }
-
-    #[test]
-    fn memory_write_skips_mutation_gate_and_counter() {
-        let mut state = RequestState::for_request("req-memory");
-        state.mutation_count = 2;
-
-        admit_tool_call(
-            &mut state,
-            MEMORY_WRITE_TOOL,
-            &serde_json::json!({"file": "lessons", "content": "remember this"}),
-        )
-        .unwrap();
-
-        assert_eq!(state.action_count, 1);
-        assert_eq!(state.mutation_count, 2);
     }
 
     #[test]
@@ -6834,5 +6867,35 @@ mod tests {
             matches!(error, ToolError::EvidenceRequired { .. }),
             "new request must require fresh search_docs evidence before writes"
         );
+    }
+    #[test]
+    fn sound_tools_are_main_eps_only_and_import_accepts_only_audio_ref() {
+        let registry = tool_registry();
+        let list = registry
+            .iter()
+            .find(|spec| spec.name == MAP_SOUND_LIST_TOOL)
+            .expect("main EPS registry must expose map_sound_list");
+        assert!(!list.mutating);
+        assert_eq!(list.input_schema["properties"], json!({}));
+
+        let import = registry
+            .iter()
+            .find(|spec| spec.name == MAP_SOUND_IMPORT_TOOL)
+            .expect("main EPS registry must expose map_sound_import");
+        assert!(import.mutating);
+        assert_eq!(import.input_schema["required"], json!(["audioRef"]));
+        assert_eq!(
+            import.input_schema["properties"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec!["audioRef".to_string()]
+        );
+        assert_eq!(import.input_schema["additionalProperties"], json!(false));
+        assert!(map_tool_registry()
+            .iter()
+            .all(|spec| !matches!(spec.name, MAP_SOUND_LIST_TOOL | MAP_SOUND_IMPORT_TOOL)));
     }
 }

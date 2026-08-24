@@ -39,6 +39,7 @@ sha2 = "0.10"
 base64 = "0.22"
 png = "0.18"
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
+zip = { version = "2", default-features = false, features = ["deflate"] }
 uuid = { version = "1", features = ["v4"] }
 parking_lot = "0.12"
 # CHK string-table decode (EUD-105): EUC_KR == cp949 (WHATWG euc-kr index = unified hangul

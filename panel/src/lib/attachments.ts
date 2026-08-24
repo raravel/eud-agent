@@ -4,8 +4,11 @@ import type { AttachmentDescriptor, ChatAttachment } from "@/lib/protocol";
 export const MAX_ATTACHMENTS_PER_TURN = 5;
 export const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
 export const MAX_TEXT_BYTES = 512 * 1024;
+export const MAX_AUDIO_BYTES = 64 * 1024 * 1024;
+export const MAX_AUDIO_BYTES_PER_TURN = 128 * 1024 * 1024;
 
 const IMAGE_EXTENSIONS = /\.(?:png|jpe?g|webp|gif)$/i;
+const AUDIO_EXTENSIONS = /\.(?:wav|ogg|mp3|flac|m4a|aac|wma|aiff?|opus)$/i;
 const FILE_NAME_HEADER = "x-eud-file-name-hex";
 const THUMBNAIL_EDGE = 160;
 
@@ -16,12 +19,18 @@ export async function stageAttachment(
   invokeFn: RawInvoke = invoke,
 ): Promise<ChatAttachment> {
   const image = isLikelyImage(file);
-  const limit = image ? MAX_IMAGE_BYTES : MAX_TEXT_BYTES;
+  const audio = isLikelyAudio(file);
+  const limit = image ? MAX_IMAGE_BYTES : audio ? MAX_AUDIO_BYTES : MAX_TEXT_BYTES;
+  if (file.size === 0) {
+    throw new Error(`빈 첨부 파일은 사용할 수 없습니다: ${file.name}`);
+  }
   if (file.size > limit) {
     throw new Error(
       image
         ? `이미지 파일은 10MB 이하여야 합니다: ${file.name}`
-        : `텍스트/코드 파일은 512KB 이하여야 합니다: ${file.name}`,
+        : audio
+          ? `오디오 파일은 64MB 이하여야 합니다: ${file.name}`
+          : `텍스트/코드 파일은 512KB 이하여야 합니다: ${file.name}`,
     );
   }
 
@@ -63,6 +72,10 @@ export function formatAttachmentSize(bytes: number): string {
 
 function isLikelyImage(file: File): boolean {
   return file.type.startsWith("image/") || IMAGE_EXTENSIONS.test(file.name);
+}
+
+export function isLikelyAudio(file: File): boolean {
+  return file.type.startsWith("audio/") || AUDIO_EXTENSIONS.test(file.name);
 }
 
 function safeMime(mime: string): string {

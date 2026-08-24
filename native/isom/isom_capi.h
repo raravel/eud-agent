@@ -27,7 +27,7 @@ extern "C" {
 
 /* ABI version of this shim. Bump on any breaking change to the signatures or
  * the ops/buffer encoding below. The Rust side asserts this at startup. */
-#define ISOM_ABI_VERSION 5
+#define ISOM_ABI_VERSION 6
 
 /* Error codes returned by the isom_* functions. 0 == success. */
 enum IsomStatus {
@@ -119,6 +119,21 @@ int isom_map_digest(
     const char* map_path,
     uint8_t** out_json,
     size_t* out_json_len);
+
+/* Add or exactly reuse one canonical managed OGG sound in a copied SCX/SCM.
+ * Input and output paths must be distinct. The implementation verifies the
+ * expected input SHA-256, exact managed MPQ path, OggS bytes, WAV capacity,
+ * string/WAV consistency, exact MPQ delta, unrelated CHK sections, and a
+ * save/reopen cycle before promoting output. */
+int isom_map_sound_add(
+    const char* input_map_path,
+    const char* output_map_path,
+    const char* expected_input_sha256,
+    const char* destination_mpq_path_ascii,
+    const uint8_t* ogg_bytes,
+    size_t ogg_length,
+    uint8_t** out_report_json,
+    size_t* out_report_len);
 
 /* Quantize one bounded RGBA pixel per output map tile against the current
  * tileset's graphics-valid SD representative-color palette. `before_tiles`

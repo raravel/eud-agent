@@ -30,9 +30,17 @@ export const STAGE_LABELS: Record<string, string> = {
   // must not claim code generation specifically.
   codex: "codex 실행 중…",
   compaction: "대화 컨텍스트 자동 압축 중…",
+  task_state_warning: "활성 작업 상태 갱신 실패",
   workspace: "프로젝트 워크스페이스 보안 환경 준비 중…",
   lsp: "진단 검사 중…",
   waiting_build: "에디터 빌드 완료 대기 중…",
+  bootstrap: "필수 자산 준비 중…",
+  audio_probe: "첨부 오디오 검사 중…",
+  audio_transcode: "OGG Vorbis 변환 중…",
+  audio_validate: "변환된 오디오 검증 중…",
+  waiting_map_close: "SCMDraft에서 맵 닫기 대기 중…",
+  map_sound_write: "맵 사운드 등록 중…",
+  map_sound_verify: "맵 사운드 검증 중…",
 };
 
 /** A labelled progress line ready for `store.log(kind, text, stage)`. */
@@ -68,6 +76,12 @@ export function progressLabel(stage: string, detail?: string): ProgressLine {
     return detail === "done"
       ? { kind: "ok", text: "대화 컨텍스트 자동 압축 완료" }
       : { kind: "progress", text: STAGE_LABELS.compaction };
+  }
+  if (stage === "task_state_warning") {
+    return {
+      kind: "warn",
+      text: detail ?? STAGE_LABELS.task_state_warning,
+    };
   }
   if (stage === "large_context_fallback") {
     return {

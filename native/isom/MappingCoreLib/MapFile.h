@@ -53,6 +53,9 @@ class MapFile : public Scenario, public MpqFile // MapFile is a scenario file an
         bool addSound(const std::string & srcFilePath, WavQuality wavQuality, bool virtualFile);
         bool addSound(const std::string & srcFilePath, const std::string & destMpqPath, WavQuality wavQuality, bool virtualFile);
         bool addSound(const std::string & destMpqPath, const std::vector<u8> & soundContents, WavQuality wavQuality);
+        bool addSound(const std::string & destMpqPath, const std::vector<u8> & soundContents,
+            WavQuality wavQuality, bool preserveExistingStrings,
+            size_t & soundStringId, size_t & soundIndex);
         virtual bool removeSoundBySoundIndex(u16 soundIndex, bool removeIfUsed);
         virtual bool removeSoundByStringId(size_t stringId, bool removeIfUsed);
         SoundStatus getSoundStatus(size_t soundStringId);

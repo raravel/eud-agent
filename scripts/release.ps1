@@ -84,6 +84,28 @@ try {
         Fail "Working tree is not clean. Commit or stash changes before releasing."
     }
 
+    # Managed FFmpeg/FFprobe are one version-locked distribution contract. The
+    # runtime downloads the pinned upstream archive, verifies its archive hash,
+    # extracts only these two exact members, and re-verifies each executable.
+    $audioManifestPath = Join-Path $RepoRoot 'vendor\ffmpeg\manifest.json'
+    $audioLicensePath = Join-Path $RepoRoot 'vendor\ffmpeg\LICENSE.txt'
+    if (-not (Test-Path -LiteralPath $audioManifestPath) -or
+        -not (Test-Path -LiteralPath $audioLicensePath)) {
+        Fail 'managed FFmpeg manifest/license resources are missing.'
+    }
+    $audioManifest = Get-Content -LiteralPath $audioManifestPath -Raw | ConvertFrom-Json
+    if ($audioManifest.schema -ne 'eud-managed-ffmpeg/1' -or
+        $audioManifest.archive.sha256 -notmatch '^[0-9a-f]{64}$' -or
+        @($audioManifest.members).Count -ne 2) {
+        Fail 'managed FFmpeg manifest schema/archive/member contract is invalid.'
+    }
+    foreach ($memberName in @('ffmpeg.exe', 'ffprobe.exe')) {
+        $member = @($audioManifest.members | Where-Object { $_.name -eq $memberName })
+        if ($member.Count -ne 1 -or $member[0].sha256 -notmatch '^[0-9a-f]{64}$') {
+            Fail "managed FFmpeg manifest does not pin exactly one valid $memberName."
+        }
+    }
+
     # --- Bump version (BOM-free, surgical regex; ConvertTo-Json would reflow the file) ---
     $confPath = Join-Path $RepoRoot 'src-tauri\tauri.conf.json'
     $conf = Get-Content -LiteralPath $confPath -Raw

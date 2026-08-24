@@ -81,7 +81,12 @@ pub trait JournalBridge {
 
     fn plugin_move(&self, from_index: usize, to_index: usize) -> Result<(), Self::Error>;
 
-    fn restore_map_backup(&self, map_path: &str, backup_path: &str) -> Result<(), Self::Error>;
+    fn restore_map_backup(
+        &self,
+        map_path: &str,
+        backup_path: &str,
+        expected_sha256: Option<&str>,
+    ) -> Result<(), Self::Error>;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -130,6 +135,7 @@ pub enum WriteTool {
     WorkspaceWrite,
     WorkspaceCreate,
     WorkspaceDelete,
+    MapSound,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -169,8 +175,16 @@ pub enum JournalTarget {
         path: String,
         summary: String,
     },
+    MapSound {
+        source_map: PathBuf,
+        mpq_path: String,
+        normalized_sha256: String,
+    },
 }
 
+/// Journal snapshots stay inline to avoid one heap allocation per entry; their
+/// serde wire shape is durable and pending-review collections are tightly bounded.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Snapshot {
     DatValue {
@@ -210,6 +224,26 @@ pub enum Snapshot {
         #[serde(default)]
         switch_id: Option<i64>,
         name: Option<String>,
+    },
+    MapSound {
+        source_sha256: String,
+        source_codec: String,
+        duration_ms: u64,
+        channels: u32,
+        sample_rate: u32,
+        normalization_profile: String,
+        normalized_sha256: String,
+        normalized_bytes: u64,
+        mpq_path: String,
+        wav_index: u64,
+        string_id: u64,
+        map_sha256_before: String,
+        map_sha256_after: String,
+        backup_path: PathBuf,
+        native_report_sha256: String,
+        map_bytes_before: u64,
+        map_bytes_after: u64,
+        source_display_name: String,
     },
 }
 
@@ -293,6 +327,7 @@ pub enum ChangesetItemKind {
     WorkspaceCreated,
     WorkspaceModified,
     WorkspaceDeleted,
+    MapSound,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -756,6 +791,14 @@ fn file_changeset_item(entry: &JournalEntry) -> Result<Option<ChangesetItem>, Jo
             properties: location_write_changeset_properties(entry)?,
             diff: None,
         },
+        WriteTool::MapSound => ChangesetItem {
+            id: entry.id.clone(),
+            kind: ChangesetItemKind::MapSound,
+            path: None,
+            dat_ref: None,
+            properties: map_sound_changeset_properties(entry)?,
+            diff: None,
+        },
         WriteTool::DatSet
         | WriteTool::XdatSet
         | WriteTool::TblSet
@@ -806,6 +849,62 @@ fn location_write_changeset_properties(
             seq: entry.seq,
         },
     ])
+}
+
+fn map_sound_changeset_properties(
+    entry: &JournalEntry,
+) -> Result<Vec<PropertyChange>, JournalError> {
+    let JournalTarget::MapSound {
+        source_map,
+        mpq_path,
+        normalized_sha256,
+    } = &entry.target
+    else {
+        return Err(invalid_entry(entry, "expected map sound target"));
+    };
+    let Snapshot::MapSound {
+        source_codec,
+        duration_ms,
+        normalized_bytes,
+        wav_index,
+        map_sha256_before,
+        map_sha256_after,
+        map_bytes_before,
+        map_bytes_after,
+        source_display_name,
+        ..
+    } = &entry.after
+    else {
+        return Err(invalid_entry(entry, "expected map sound after snapshot"));
+    };
+    let map_size_delta = i128::from(*map_bytes_after) - i128::from(*map_bytes_before);
+    let values = [
+        ("source", serde_json::json!(source_display_name)),
+        ("sourceCodec", serde_json::json!(source_codec)),
+        ("durationMs", serde_json::json!(duration_ms)),
+        ("mpqPath", serde_json::json!(mpq_path)),
+        ("normalizedSha256", serde_json::json!(normalized_sha256)),
+        ("normalizedBytes", serde_json::json!(normalized_bytes)),
+        ("wavIndex", serde_json::json!(wav_index)),
+        ("map", serde_json::json!(source_map)),
+        ("mapSha256Before", serde_json::json!(map_sha256_before)),
+        ("mapSha256After", serde_json::json!(map_sha256_after)),
+        ("mapSizeDelta", serde_json::json!(map_size_delta)),
+        (
+            "rightsNotice",
+            serde_json::json!("이 오디오를 맵에 배포할 권한은 사용자에게 있어야 합니다."),
+        ),
+    ];
+    Ok(values
+        .into_iter()
+        .map(|(property, new)| PropertyChange {
+            property: property.to_string(),
+            old: serde_json::Value::Null,
+            new,
+            id: entry.id.clone(),
+            seq: entry.seq,
+        })
+        .collect())
 }
 
 fn unified_diff(path: &str, old: &str, new: &str) -> String {
@@ -950,6 +1049,11 @@ fn reject_targets(entry: &JournalEntry) -> Result<Vec<RejectTarget>, JournalErro
         JournalTarget::Setting { key } => vec![RejectTarget::Setting(key.clone())],
         JournalTarget::Plugin { .. } => plugin_targets(entry)?,
         JournalTarget::Map { path, .. } => vec![RejectTarget::Path(path.clone())],
+        JournalTarget::MapSound { source_map, .. } => {
+            vec![RejectTarget::Path(
+                source_map.to_string_lossy().into_owned(),
+            )]
+        }
     };
     targets.dedup();
     Ok(targets)
@@ -1128,17 +1232,31 @@ where
                 .plugin_move(from_index, to_index)
                 .map_err(bridge_error)
         }
-        WriteTool::LocationWrite | WriteTool::PlayerSetup | WriteTool::SwitchWrite => {
-            match &entry.before {
-                Snapshot::MapBackup {
-                    map_path,
-                    backup_path,
-                } => bridge
-                    .restore_map_backup(map_path, backup_path)
-                    .map_err(bridge_error),
-                _ => Err(invalid_entry(entry, "expected map backup before snapshot")),
+        WriteTool::LocationWrite
+        | WriteTool::PlayerSetup
+        | WriteTool::SwitchWrite
+        | WriteTool::MapSound => match &entry.before {
+            Snapshot::MapBackup {
+                map_path,
+                backup_path,
+            } => {
+                let expected_sha256 = if entry.tool == WriteTool::MapSound {
+                    let Snapshot::MapSound {
+                        map_sha256_before, ..
+                    } = &entry.after
+                    else {
+                        return Err(invalid_entry(entry, "expected map sound after snapshot"));
+                    };
+                    Some(map_sha256_before.as_str())
+                } else {
+                    None
+                };
+                bridge
+                    .restore_map_backup(map_path, backup_path, expected_sha256)
+                    .map_err(bridge_error)
             }
-        }
+            _ => Err(invalid_entry(entry, "expected map backup before snapshot")),
+        },
     }
 }
 fn workspace_target_parts(
@@ -1281,6 +1399,7 @@ mod tests {
         RestoreMapBackup {
             map_path: String,
             backup_path: String,
+            expected_sha256: Option<String>,
         },
     }
 
@@ -1427,12 +1546,18 @@ mod tests {
             Ok(())
         }
 
-        fn restore_map_backup(&self, map_path: &str, backup_path: &str) -> Result<(), Self::Error> {
+        fn restore_map_backup(
+            &self,
+            map_path: &str,
+            backup_path: &str,
+            _expected_sha256: Option<&str>,
+        ) -> Result<(), Self::Error> {
             self.ops
                 .borrow_mut()
                 .push(AppliedInverse::RestoreMapBackup {
                     map_path: map_path.to_owned(),
                     backup_path: backup_path.to_owned(),
+                    expected_sha256: _expected_sha256.map(str::to_owned),
                 });
             Ok(())
         }
@@ -1597,6 +1722,7 @@ mod tests {
                 map_path: "C:/maps/demo.scx".to_owned(),
                 backup_path: "C:/Users/me/AppData/Roaming/eud-agent/map_backups/demo.bak"
                     .to_owned(),
+                expected_sha256: None,
             }]
         );
     }
@@ -1647,6 +1773,77 @@ mod tests {
                 map_path: "C:/maps/demo.scx".to_owned(),
                 backup_path: "C:/Users/me/AppData/Roaming/eud-agent/map_backups/demo.bak"
                     .to_owned(),
+                expected_sha256: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn map_sound_changeset_and_inverse_keep_a_coherent_exact_backup_contract() {
+        let before_hash = "1".repeat(64);
+        let after_hash = "2".repeat(64);
+        let normalized_hash = "3".repeat(64);
+        let backup =
+            PathBuf::from("C:/Users/me/AppData/Roaming/eud-agent/map_backups/demo.sound.bak");
+        let entry = JournalEntry {
+            id: "sound-1".to_string(),
+            seq: 1,
+            tool: WriteTool::MapSound,
+            target: JournalTarget::MapSound {
+                source_map: PathBuf::from("C:/maps/demo.scx"),
+                mpq_path: "staredit\\wav\\ea_3333333333333333.ogg".to_string(),
+                normalized_sha256: normalized_hash.clone(),
+            },
+            before: Snapshot::MapBackup {
+                map_path: "C:/maps/demo.scx".to_string(),
+                backup_path: backup.to_string_lossy().into_owned(),
+            },
+            after: Snapshot::MapSound {
+                source_sha256: "4".repeat(64),
+                source_codec: "flac".to_string(),
+                duration_ms: 183_420,
+                channels: 2,
+                sample_rate: 44_100,
+                normalization_profile: "8.1.2;ogg/vorbis/44100/stereo/q4".to_string(),
+                normalized_sha256: normalized_hash,
+                normalized_bytes: 3_018_201,
+                mpq_path: "staredit\\wav\\ea_3333333333333333.ogg".to_string(),
+                wav_index: 12,
+                string_id: 418,
+                map_sha256_before: before_hash.clone(),
+                map_sha256_after: after_hash,
+                backup_path: backup,
+                native_report_sha256: "5".repeat(64),
+                map_bytes_before: 10_000,
+                map_bytes_after: 3_028_301,
+                source_display_name: "battle-theme.flac".to_string(),
+            },
+            ts: 1,
+        };
+        let changeset = changeset_from_journal(&Journal {
+            request_id: "req-sound".to_string(),
+            entries: vec![entry.clone()],
+        })
+        .unwrap();
+        assert_eq!(changeset.items.len(), 1);
+        assert_eq!(changeset.items[0].kind, ChangesetItemKind::MapSound);
+        assert!(changeset.items[0].properties.iter().any(|property| {
+            property.property == "mpqPath"
+                && property.new == json!("staredit\\wav\\ea_3333333333333333.ogg")
+        }));
+        assert!(changeset.items[0].properties.iter().any(|property| {
+            property.property == "mapSizeDelta" && property.new == json!(3_018_301_i64)
+        }));
+
+        let bridge = FakeBridge::default();
+        apply_inverse(&entry, &bridge).unwrap();
+        assert_eq!(
+            bridge.ops(),
+            vec![AppliedInverse::RestoreMapBackup {
+                map_path: "C:/maps/demo.scx".to_string(),
+                backup_path: "C:/Users/me/AppData/Roaming/eud-agent/map_backups/demo.sound.bak"
+                    .to_string(),
+                expected_sha256: Some(before_hash),
             }]
         );
     }

@@ -3,10 +3,12 @@
 #include "MapFile.h"
 #include "SystemIO.h"
 #include "EscapeStrings.h"
+#include <algorithm>
 #include <cstdio>
 #include <cstdarg>
 #include <fstream>
 #include <sstream>
+#include <iterator>
 #include <chrono>
 
 extern Logger logger;
@@ -277,7 +279,7 @@ bool MapFile::openMapFile(const std::string & filePath)
     std::string extension = getSystemFileExtension(filePath);
     if ( !extension.empty() )
     {
-        if ( extension == ".scm" || extension == ".scx" )
+        if ( extension == ".scm" || extension == ".scx" || extension == ".map" || extension == ".tmp" )
         {
             if ( MpqFile::open(filePath, true, false) )
             {
@@ -595,6 +597,64 @@ bool MapFile::addSound(const std::string & destMpqPath, const std::vector<u8> & 
             removeMpqAsset(destMpqPath); // Try to remove the sound, ignore errors if any
     }
     return false;
+}
+
+bool MapFile::addSound(const std::string & destMpqPath, const std::vector<u8> & soundContents,
+    WavQuality wavQuality, bool preserveExistingStrings,
+    size_t & soundStringId, size_t & soundIndex)
+{
+    soundStringId = Chk::StringId::NoString;
+    soundIndex = Chk::TotalSounds;
+    if ( !preserveExistingStrings )
+    {
+        if ( !addSound(destMpqPath, soundContents, wavQuality) )
+            return false;
+        soundStringId = Scenario::findString<RawString>(
+            RawString(destMpqPath), Chk::StrScope::Game);
+        const auto slots = std::find(
+            std::begin(soundPaths), std::end(soundPaths), static_cast<u32>(soundStringId));
+        soundIndex = static_cast<size_t>(std::distance(std::begin(soundPaths), slots));
+        return soundStringId != Chk::StringId::NoString && soundIndex < Chk::TotalSounds;
+    }
+    if ( !addMpqAsset(destMpqPath, soundContents, wavQuality) )
+        return false;
+
+    bool createdString = false;
+    soundStringId = Scenario::findString<RawString>(
+        RawString(destMpqPath), Chk::StrScope::Game);
+    if ( soundStringId == Chk::StringId::NoString )
+    {
+        for ( size_t id = 1; id < strings.size(); ++id )
+        {
+            if ( !strings[id].has_value() )
+            {
+                soundStringId = id;
+                break;
+            }
+        }
+        if ( soundStringId == Chk::StringId::NoString )
+        {
+            if ( strings.size() >= Chk::MaxStrings ||
+                 !setCapacity(strings.size() + 1, Chk::StrScope::Game, false) )
+            {
+                removeMpqAsset(destMpqPath);
+                return false;
+            }
+            soundStringId = strings.size() - 1;
+        }
+        strings[soundStringId] = RawString(destMpqPath);
+        createdString = true;
+    }
+    soundIndex = Scenario::addSound(soundStringId);
+    if ( soundIndex == Chk::TotalSounds )
+    {
+        if ( createdString )
+            strings[soundStringId] = std::nullopt;
+        removeMpqAsset(destMpqPath);
+        soundStringId = Chk::StringId::NoString;
+        return false;
+    }
+    return true;
 }
 
 bool MapFile::removeSoundBySoundIndex(u16 soundIndex, bool removeIfUsed)
