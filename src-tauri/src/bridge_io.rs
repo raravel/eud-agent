@@ -22,6 +22,7 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_BUSY_TIMEOUT: Duration = Duration::from_secs(180);
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(200);
 const EPSNAPSHOT_TIMEOUT: Duration = Duration::from_secs(180);
+const MAP_SOURCE_CONFIRM_TIMEOUT: Duration = Duration::from_secs(3);
 /// Heartbeat freshness window used by app-facing editor liveness checks.
 ///
 /// The Lua bridge writes `heartbeat.txt` on roughly every 1s UI tick, so a 3s window
@@ -64,6 +65,16 @@ impl SendOpts {
             ..Self::default()
         }
     }
+
+    /// Short timeout for explicit saved-map confirmation. Passive Map Agent
+    /// source monitoring reads `status.txt` and never uses bridge commands.
+    pub fn for_map_source_confirmation() -> Self {
+        Self {
+            timeout: MAP_SOURCE_CONFIRM_TIMEOUT,
+            busy_timeout: MAP_SOURCE_CONFIRM_TIMEOUT,
+            ..Self::default()
+        }
+    }
 }
 
 impl Default for SendOpts {
@@ -91,6 +102,9 @@ pub struct StatusSnapshot {
     pub compiling: bool,
     /// Current project line from the editor status file.
     pub project: String,
+    /// Saved OpenMapName from the same idle editor tick. `None` means the loaded
+    /// bridge predates this status contract.
+    pub open_map_name: Option<String>,
 }
 /// One `.eps` project entry from a coherent editor snapshot.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -283,6 +297,7 @@ impl BridgeIo {
         let text = fs::read_to_string(&self.status_file)?;
         let mut compiling = false;
         let mut project = String::new();
+        let mut open_map_name = None;
         for line in text.lines() {
             let Some((key, value)) = line.split_once('=') else {
                 continue;
@@ -291,10 +306,16 @@ impl BridgeIo {
                 compiling = value.trim().eq_ignore_ascii_case("true");
             } else if key.trim().eq_ignore_ascii_case("project") {
                 project = value.trim().to_string();
+            } else if key.trim().eq_ignore_ascii_case("openMapName") {
+                open_map_name = Some(value.trim().to_string());
             }
         }
 
-        Ok(StatusSnapshot { compiling, project })
+        Ok(StatusSnapshot {
+            compiling,
+            project,
+            open_map_name,
+        })
     }
 
     /// Project file tree parsed from `path\t<EFileType>` bridge lines.
@@ -944,6 +965,15 @@ mod tests {
         assert_eq!(opts.poll_interval, Duration::from_millis(200));
     }
 
+    #[test]
+    fn map_source_confirmation_never_inherits_build_timeout() {
+        let opts = SendOpts::for_map_source_confirmation();
+
+        assert_eq!(opts.timeout, Duration::from_secs(3));
+        assert_eq!(opts.busy_timeout, Duration::from_secs(3));
+        assert_eq!(opts.poll_interval, Duration::from_millis(200));
+    }
+
     fn srv_entries(dir: &Path, suffix: &str) -> Vec<PathBuf> {
         let Ok(entries) = fs::read_dir(dir) else {
             return Vec::new();
@@ -1063,11 +1093,16 @@ mod tests {
     const TARGET_HEARTBEAT_STALE_AFTER: Duration = Duration::from_secs(3);
     const EDITOR_NOT_CONNECTED: &str = "editor not connected";
 
-    fn write_live_status_files(data_dir: &Path, compiling: bool, project: &str) -> SystemTime {
+    fn write_live_status_files(
+        data_dir: &Path,
+        compiling: bool,
+        project: &str,
+        open_map_name: &str,
+    ) -> SystemTime {
         fs::create_dir_all(data_dir).unwrap();
         fs::write(
             data_dir.join("status.txt"),
-            format!("compiling={compiling}\nproject={project}\n"),
+            format!("compiling={compiling}\nproject={project}\nopenMapName={open_map_name}\n"),
         )
         .unwrap();
         fs::write(data_dir.join("heartbeat.txt"), b"alive\n").unwrap();
@@ -1081,7 +1116,7 @@ mod tests {
     #[test]
     fn status_snapshot_reads_status_txt_when_heartbeat_is_fresh() {
         let data_dir = unique_temp_dir("status-fresh");
-        let now = write_live_status_files(&data_dir, true, "DemoProject");
+        let now = write_live_status_files(&data_dir, true, "DemoProject", r"'C:\maps\demo.scx'");
         let bridge = BridgeIo::new(&data_dir);
 
         let status = bridge
@@ -1090,6 +1125,7 @@ mod tests {
 
         assert!(status.compiling);
         assert_eq!(status.project, "DemoProject");
+        assert_eq!(status.open_map_name.as_deref(), Some(r"'C:\maps\demo.scx'"));
 
         fs::remove_dir_all(&data_dir).ok();
     }
@@ -1097,7 +1133,8 @@ mod tests {
     #[test]
     fn status_snapshot_rejects_stale_or_absent_heartbeat() {
         let data_dir = unique_temp_dir("status-stale");
-        let heartbeat_time = write_live_status_files(&data_dir, false, "DemoProject");
+        let heartbeat_time =
+            write_live_status_files(&data_dir, false, "DemoProject", r"'C:\maps\demo.scx'");
         let bridge = BridgeIo::new(&data_dir);
 
         let stale_now = heartbeat_time + TARGET_HEARTBEAT_STALE_AFTER + Duration::from_millis(1);
@@ -1120,7 +1157,7 @@ mod tests {
     #[test]
     fn connected_list_round_trip_derives_settable_from_file_type() {
         let data_dir = unique_temp_dir("list-connected");
-        let now = write_live_status_files(&data_dir, false, "DemoProject");
+        let now = write_live_status_files(&data_dir, false, "DemoProject", r"'C:\maps\demo.scx'");
         let seen: SeenLog = Arc::new(Mutex::new(Vec::new()));
         let _fake = FakeBridge::spawn(&data_dir, 1, Arc::clone(&seen));
         let bridge = BridgeIo::new(&data_dir);
@@ -1840,8 +1877,14 @@ mod tests {
         assert!(compiling < busy_status);
         assert!(busy_status < early_return);
         assert!(
+            tick[busy_status..early_return].contains("\"\\r\\nopenMapName=\" .. lastOpenMapLine")
+        );
+        assert!(
             early_return < project_access,
             "compiling Tick must return before any project-object access"
         );
+        assert!(tick[project_access..]
+            .contains("local projectDisplay, _, openMapName = snapshotProjectMetadata(pj)"));
+        assert!(tick[project_access..].contains("lastOpenMapLine = \"'\" .. openMapName .. \"'\""));
     }
 }

@@ -90,12 +90,13 @@ local ok, initErr = pcall(function()
         local openMapName = safestr(pj.OpenMapName)
         if filename == "" and openMapName == "" then
             return "Untitled (" .. string.sub(bridgeSessionId, 1, 8) .. ")",
-                "untitled\n" .. bridgeSessionId
+                "untitled\n" .. bridgeSessionId,
+                openMapName
         end
         if filename ~= "" then
-            return filename, filename .. "\n" .. openMapName
+            return filename, filename .. "\n" .. openMapName, openMapName
         end
-        return openMapName, filename .. "\n" .. openMapName
+        return openMapName, filename .. "\n" .. openMapName, openMapName
     end
     local function split(s, sep)
         local parts = {}
@@ -1122,11 +1123,11 @@ local ok, initErr = pcall(function()
     end
 
     -- ------------------------------------------------------------------
-    -- Last idle-Tick project line, reused by the BUSY status write below:
-    -- while IsCompilng the Tick must not touch pjData (rules.md), so the
-    -- compiling status.txt carries the project string cached on the previous
-    -- idle Tick.
+    -- Last idle-Tick project and OpenMapName lines, reused by the BUSY status
+    -- write below: while IsCompilng the Tick must not touch pjData (rules.md),
+    -- so the compiling status.txt carries values cached on the previous idle Tick.
     lastProjectLine = "(none)"
+    lastOpenMapLine = ""
     local timer = DispatcherTimer(DispatcherPriority.Normal)
     timer.Interval = TimeSpan.FromSeconds(1)
     timer.Tick:Add(function(sender, args)
@@ -1147,21 +1148,25 @@ local ok, initErr = pcall(function()
                     File.WriteAllText(agentDir .. "status.txt",
                         "time=" .. tostring(DateTime.Now)
                         .. "\r\ncompiling=True"
-                        .. "\r\nproject=" .. lastProjectLine)
+                        .. "\r\nproject=" .. lastProjectLine
+                        .. "\r\nopenMapName=" .. lastOpenMapLine)
                 end)
                 return
             end
             local pj = GlobalObj.pjData
             if pj ~= nil then
-                local projectDisplay = snapshotProjectMetadata(pj)
+                local projectDisplay, _, openMapName = snapshotProjectMetadata(pj)
                 lastProjectLine = "'" .. projectDisplay .. "'"
+                lastOpenMapLine = "'" .. openMapName .. "'"
             else
                 lastProjectLine = "(none)"
+                lastOpenMapLine = ""
             end
             File.WriteAllText(agentDir .. "status.txt",
                 "time=" .. tostring(DateTime.Now)
                 .. "\r\ncompiling=" .. (pg == nil and "?" or tostring(pg.IsCompilng))
-                .. "\r\nproject=" .. lastProjectLine)
+                .. "\r\nproject=" .. lastProjectLine
+                .. "\r\nopenMapName=" .. lastOpenMapLine)
             local files = Directory.GetFiles(inboxDir, "*.cmd")
             for i = 0, files.Length - 1 do
                 local cmdPath = tostring(files[i])
