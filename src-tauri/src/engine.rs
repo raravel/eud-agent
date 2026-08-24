@@ -4128,7 +4128,7 @@ pub fn build_map_system_prompt(project_state: &str, project_memory: Option<&str>
          - Merge preserves destination objects and adds copied objects/locations. Replace removes only fully contained destination objects/locations in selected layers; boundary-crossing items make replace fail closed. Both modes copy exact MTXM/TILE values and never run ISOM correction.\n\n\
          [palette search]\n\
          - map_palette_query is a bounded search, not a browseable catalog. Supply a non-blank name query or structured filter; it returns a complete result only when at most 256 entries match.\n\
-         - For semantic terrain, search brushes by name first. Use the returned terrainType to filter exact tiles by graphicsValid, walkability, height, ramp, view, group, or variant metadata only when exact tiles are necessary.\n\
+         - map_palette_query kind is a catalog family, not a palette mention kind: use brushes for semanticTerrain, tiles for exactTile, and units/buildings/doodads/sprites for the corresponding object types. For semantic terrain, search brushes by name first. Use the returned terrainType to filter exact tiles by graphicsValid, walkability, height, ramp, view, group, or variant metadata only when exact tiles are necessary.\n\
          - If a palette search is too broad, refine the query/filter. Never enumerate tile ids or catalog pages.\n\n\
          [image terrain]\n\
          - Current-request images are listed as image-1, image-2, and so on under [map image refs] while the same files remain available as localImage vision inputs. imageRef is an input binding, never extra write authority.\n\
@@ -7415,6 +7415,7 @@ mod tests {
         assert!(prompt.contains("Semantic ISOM transitions outside the current request scope"));
         assert!(prompt.contains("map_palette_query is a bounded search"));
         assert!(prompt.contains("search brushes by name first"));
+        assert!(prompt.contains("use brushes for semanticTerrain"));
         assert!(prompt.contains("Never enumerate tile ids or catalog pages"));
         assert!(prompt.contains("use map_stamp_preview and map_stamp_place"));
         assert!(prompt.contains("Never reconstruct either source"));

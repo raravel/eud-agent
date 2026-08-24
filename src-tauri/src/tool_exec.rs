@@ -765,11 +765,7 @@ impl SessionToolRuntime {
             "no agent request is open; tool calls are only valid during a turn".to_string()
         })?;
         if self.kind == crate::session::SessionKind::Map {
-            if !tools::is_map_tool(tool) {
-                return Err(format!(
-                    "tool '{tool}' is not available to Map Agent; original Apply is intentionally absent"
-                ));
-            }
+            tools::validate_map_tool_call(tool, args).map_err(|error| error.to_string())?;
             return self.dispatch_map(&request_id, tool, args);
         }
 
@@ -3815,6 +3811,27 @@ mod tests {
         assert!(!crate::tools::map_tool_registry()
             .iter()
             .any(|tool| tool.name.contains("apply")));
+    }
+
+    #[test]
+    fn map_runtime_rejects_palette_mention_kind_before_native_dispatch() {
+        let services = ToolServices::for_tests();
+        let runtime = services.map_session("map-session");
+        runtime.begin_request("map-request", "project").unwrap();
+
+        let error = runtime
+            .execute(
+                "map_palette_query",
+                &json!({"kind": "semanticTerrain", "query": "Space"}),
+            )
+            .unwrap_err();
+
+        assert!(error.contains("semanticTerrain"), "got: {error}");
+        assert!(error.contains("brushes"), "got: {error}");
+        assert!(
+            !error.contains("unsupported catalog kind"),
+            "invalid model input reached the native catalog: {error}"
+        );
     }
     #[test]
     fn map_palette_query_builds_one_complete_bounded_search() {

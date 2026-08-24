@@ -246,6 +246,24 @@ mod tests {
             .iter()
             .any(|tool| tool.name == "map_candidate_finalize"));
         assert!(tools.iter().any(|tool| tool.name == crate::tools::ASK_TOOL));
+        let palette = tools
+            .iter()
+            .find(|tool| tool.name == "map_palette_query")
+            .expect("map_palette_query must be advertised");
+        assert_eq!(
+            palette.input_schema["properties"]["kind"]["enum"],
+            serde_json::json!([
+                "brushes",
+                "tiles",
+                "units",
+                "buildings",
+                "doodads",
+                "sprites"
+            ])
+        );
+        assert!(palette.input_schema["properties"]["kind"]["description"]
+            .as_str()
+            .is_some_and(|description| description.contains("semanticTerrain")));
         assert!(!tools.iter().any(|tool| tool.name.contains("apply")));
         assert!(!tools.iter().any(|tool| tool.name == "file_write"));
         assert!(!tools.iter().any(|tool| tool.name == "location_write"));

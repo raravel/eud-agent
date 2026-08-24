@@ -40,6 +40,15 @@ pub const MAP_MINIMAP_TOOL: &str = "map_minimap";
 /// In-place switch rename tool name.
 pub const SWITCH_WRITE_TOOL: &str = "switch_write";
 
+const MAP_PALETTE_CATALOG_KINDS: [&str; 6] = [
+    "brushes",
+    "tiles",
+    "units",
+    "buildings",
+    "doodads",
+    "sprites",
+];
+
 /// Result type used by tool-layer validation and gate checks.
 pub type ToolResult<T> = Result<T, ToolError>;
 
@@ -227,6 +236,14 @@ fn integer_or_string_schema() -> Value {
 
 fn enum_string_schema(values: &[&str]) -> Value {
     json!({"type": "string", "enum": values})
+}
+
+fn map_palette_catalog_kind_schema() -> Value {
+    let mut kind = enum_string_schema(&MAP_PALETTE_CATALOG_KINDS);
+    kind["description"] = json!(
+        "Catalog family, not PaletteRef.kind. Use brushes for semanticTerrain, tiles for exactTile, and the plural object family for unit/building/doodad/sprite."
+    );
+    kind
 }
 
 fn exact_text_edits_schema() -> Value {
@@ -1154,7 +1171,7 @@ fn map_palette_filter_schema() -> Value {
 fn map_palette_query_schema() -> Value {
     let mut query = object_schema(
         json!({
-            "kind": enum_string_schema(&["brushes", "tiles", "units", "buildings", "doodads", "sprites"]),
+            "kind": map_palette_catalog_kind_schema(),
             "query": {
                 "type": "string",
                 "minLength": 1,
@@ -1227,7 +1244,7 @@ pub fn map_tool_registry() -> Vec<ToolSpec> {
         ),
         tool_spec(
             "map_palette_query",
-            "Run one bounded current-tileset catalog search. Results are complete up to 256 matches; refine query/filter when broader. Never enumerate exact-tile pages.",
+            "Search one bounded current-tileset catalog family. kind must be brushes, tiles, units, buildings, doodads, or sprites; semanticTerrain palette mentions use brushes and exactTile mentions use tiles. Results are complete up to 256 matches; refine query/filter when broader. Never enumerate exact-tile pages.",
             false,
             map_palette_query_schema(),
         ),
@@ -1359,10 +1376,17 @@ pub fn map_mcp_tool_descriptors() -> Vec<Value> {
     descriptors(map_tool_registry())
 }
 
-pub fn is_map_tool(tool_name: &str) -> bool {
-    map_tool_registry()
-        .iter()
-        .any(|spec| spec.name == tool_name)
+/// Validate a Map Agent tool against the same strict schema advertised over MCP.
+pub fn validate_map_tool_call(tool_name: &str, args: &Value) -> ToolResult<()> {
+    let spec = map_tool_registry()
+        .into_iter()
+        .find(|spec| spec.name == tool_name)
+        .ok_or_else(|| ToolError::AdmissionRejected {
+            message: format!(
+                "tool '{tool_name}' is not available to Map Agent; original Apply is intentionally absent"
+            ),
+        })?;
+    validate_tool_args(&spec, args)
 }
 
 /// Return MCP tool descriptors using each registry tool's verbatim inputSchema.
@@ -1617,8 +1641,13 @@ fn validate_arg_value(
             .filter_map(Value::as_str)
             .any(|item| item == actual);
         if !allowed {
+            let expected = values
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(", ");
             return admission_error(&format!(
-                "invalid value for '{name}': '{actual}' is not allowed for {}",
+                "invalid value for '{name}': '{actual}' is not allowed for {}; expected one of {expected}",
                 spec.name
             ));
         }
@@ -6240,6 +6269,15 @@ mod tests {
             ])
         );
         assert_eq!(tool.input_schema["properties"]["query"]["minLength"], 1);
+        assert_eq!(
+            tool.input_schema["properties"]["kind"]["enum"],
+            json!(MAP_PALETTE_CATALOG_KINDS)
+        );
+        assert!(tool.input_schema["properties"]["kind"]["description"]
+            .as_str()
+            .is_some_and(|description| {
+                description.contains("semanticTerrain") && description.contains("brushes")
+            }));
 
         let filter = &tool.input_schema["properties"]["filter"];
         assert_object_contract(

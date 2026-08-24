@@ -247,6 +247,10 @@ Operation: replace | add | subtract | invert | clear
 - 모델용 `map_palette_query`는 browse API가 아니다. 비어 있지 않은 name `query` 또는 typed
   `filter`가 필요하고, 최대 256개 이하의 전체 결과만 한 번에 반환한다. `offset`/`limit`은
   노출하지 않으며 더 넓은 결과는 조건 구체화 오류로 닫는다.
+- `kind`는 palette mention의 `semanticTerrain`/`exactTile`이 아니라 native catalog family인
+  `brushes`/`tiles`/`units`/`buildings`/`doodads`/`sprites`만 허용한다.
+  `semanticTerrain`은 `brushes`, `exactTile`은 `tiles`로 조회한다. MCP에 광고한 enum은 Map
+  runtime에서도 native dispatch 전에 동일하게 검증하여 잘못된 kind가 engine까지 도달하지 않는다.
 - native `eud-map-catalog/1.filter`는 kind별 exact AND 조건을 pagination 전에 적용한다.
   exact tile은 ID/terrain type/CV5 group/variant/graphics validity/walkability/height/
   buildability/ramp/view를, 나머지 palette 종류는 각 entry에 존재하는 ID와 placement/

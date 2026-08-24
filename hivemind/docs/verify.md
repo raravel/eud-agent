@@ -138,8 +138,9 @@ stages from v1 are retired as `server/` is removed.
   expose only request-local `imageRef` plus bounded integer x/y/width/height, all without a
   `parameters` wrapper.
 - `cargo test -p eud-agent map_palette --lib` — requires the model-facing palette schema to
-  advertise typed filters without pagination and covers blank/browse rejection plus the
-  256-result completeness bound.
+  advertise the exact catalog-kind enum and typed filters without pagination, rejects palette
+  mention kinds before native dispatch, and covers blank/browse rejection plus the 256-result
+  completeness bound.
 - `cargo test -p isom --test map_agent_native catalog_structured_filters_narrow_tiles_before_pagination -- --ignored --nocapture`
   and `cargo test -p eud-agent map_palette_query_rejects_catalog_walks_and_returns_complete_filtered_tiles --lib -- --ignored --nocapture`
   — use installed terrain assets to prove native metadata filtering, incompatible kind-field
