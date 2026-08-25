@@ -88,9 +88,6 @@ pub struct RequestState {
     /// Set once a `search_docs` call has run successfully, even with zero hits.
     pub docs_searched: bool,
 
-    /// Set once a proposed plan has been approved for this request.
-    pub plan_approved: bool,
-
     /// Number of admitted tool actions in this request.
     pub action_count: usize,
 
@@ -118,9 +115,6 @@ pub struct RequestState {
     /// Serialized exact-document bytes returned to Codex.
     pub docs_get_result_bytes: usize,
 
-    /// Number of admitted mutating tool actions in this request.
-    pub mutation_count: usize,
-
     /// Number of admitted build self-fix attempts in this request.
     pub build_fix_attempts: usize,
 
@@ -138,7 +132,6 @@ impl RequestState {
         Self {
             request_id: id.to_string(),
             docs_searched: false,
-            plan_approved: false,
             action_count: 0,
             search_docs_count: 0,
             search_docs_returned_hits: 0,
@@ -148,7 +141,6 @@ impl RequestState {
             docs_get_count: 0,
             docs_get_documents: 0,
             docs_get_result_bytes: 0,
-            mutation_count: 0,
             build_fix_attempts: 0,
             seen_doc_ids: BTreeSet::new(),
         }
@@ -194,11 +186,6 @@ impl RequestState {
         self.docs_get_count += 1;
         self.docs_get_documents += documents;
         self.docs_get_result_bytes += bytes;
-    }
-
-    /// Approve the current request plan, lifting the mutation gate.
-    pub fn approve_plan(&mut self) {
-        self.plan_approved = true;
     }
 }
 
@@ -930,7 +917,7 @@ pub fn tool_registry() -> Vec<ToolSpec> {
         ),
         tool_spec(
             "propose_plan",
-            "Propose a plan for approval.",
+            "Propose a plan for approval only when the user explicitly requested a plan.",
             false,
             schema(json!({"markdown": string_schema()}), &["markdown"]),
         ),
@@ -1564,7 +1551,7 @@ link, then retry this call. A search with zero hits still lifts the gate; mark s
     Ok(())
 }
 
-/// Admit one tool call through argument, evidence, mutation, and budget gates.
+/// Admit one tool call through argument, evidence, and budget gates.
 ///
 /// Admission does not execute tools. In particular, successful `search_docs`
 /// execution is recorded by the execution layer, not here.
@@ -1590,13 +1577,6 @@ tool calls. Wrap up with the current findings instead of continuing to call tool
 
     check_evidence_gate(state, &spec, true)?;
 
-    if counts_against_mutation_gate(&spec) && !state.plan_approved && state.mutation_count >= 2 {
-        return admission_error(
-            "mutation gate: direct changes are limited to 2 before plan approval. Call \
-propose_plan with sourced steps, wait for approval, then retry the mutating tool call.",
-        );
-    }
-
     if spec.name == BUILD_RUN_TOOL && state.build_fix_attempts >= 3 {
         return admission_error(
             "build_run budget exhausted: this request is limited to 3 build self-fix attempts. \
@@ -1611,18 +1591,11 @@ Summarize the remaining build issue instead of running build again.",
     } else if spec.name != EPS_CHECK_TOOL {
         state.action_count += 1;
     }
-    if counts_against_mutation_gate(&spec) {
-        state.mutation_count += 1;
-    }
     if spec.name == BUILD_RUN_TOOL {
         state.build_fix_attempts += 1;
     }
 
     Ok(())
-}
-
-fn counts_against_mutation_gate(spec: &ToolSpec) -> bool {
-    spec.mutating
 }
 
 fn lookup_tool(tool: &str) -> ToolResult<ToolSpec> {
@@ -5558,11 +5531,10 @@ mod tests {
             state.action_count, 0,
             "invalid map_info mode must be rejected before counting"
         );
-        assert_eq!(state.mutation_count, 0);
     }
 
     #[test]
-    fn eps_check_is_read_only_and_does_not_consume_action_or_mutation_budgets() {
+    fn eps_check_is_read_only_and_does_not_consume_action_budget() {
         let spec = tool_registry()
             .into_iter()
             .find(|spec| spec.name == EPS_CHECK_TOOL)
@@ -5572,7 +5544,6 @@ mod tests {
         let mut state = RequestState::for_request("req-eps-check");
         state.action_count = MAX_TOOL_ACTIONS;
         state.search_docs_count = MAX_SEARCH_DOCS_CALLS;
-        state.mutation_count = 2;
         state.build_fix_attempts = 3;
         admit_tool_call(
             &mut state,
@@ -5587,10 +5558,8 @@ mod tests {
         .unwrap();
         assert_eq!(state.action_count, MAX_TOOL_ACTIONS);
         assert_eq!(state.search_docs_count, MAX_SEARCH_DOCS_CALLS);
-        assert_eq!(state.mutation_count, 2);
         assert_eq!(state.build_fix_attempts, 3);
         assert!(!state.docs_searched);
-        assert!(!state.plan_approved);
     }
 
     #[test]
@@ -5625,7 +5594,6 @@ mod tests {
             let mut state = RequestState::for_request("req-invalid-eps-check");
             assert!(admit_tool_call(&mut state, EPS_CHECK_TOOL, &args).is_err());
             assert_eq!(state.action_count, 0);
-            assert_eq!(state.mutation_count, 0);
         }
     }
 
@@ -5688,7 +5656,6 @@ mod tests {
         .unwrap_err();
         assert!(error.to_string().contains("must not be empty"));
         assert_eq!(invalid.action_count, 0);
-        assert_eq!(invalid.mutation_count, 0);
     }
 
     #[test]
@@ -5711,7 +5678,6 @@ mod tests {
         .unwrap();
         admit_tool_call(&mut state, BUILD_RUN_TOOL, &serde_json::json!({})).unwrap();
         assert_eq!(state.action_count, 2);
-        assert_eq!(state.mutation_count, 2);
         assert_eq!(state.build_fix_attempts, 1);
     }
 
@@ -6678,43 +6644,22 @@ mod tests {
     }
 
     #[test]
-    fn admission_blocks_third_mutation_until_plan_is_approved() {
+    fn admission_allows_repeated_file_writes_and_build_without_plan_approval() {
         let mut state = RequestState::for_request("req-mutate");
         state.record_search_docs();
 
-        admit_tool_call(
-            &mut state,
-            "file_write",
-            &serde_json::json!({"path": "a.eps", "code": "1"}),
-        )
-        .unwrap();
-        admit_tool_call(
-            &mut state,
-            "file_write",
-            &serde_json::json!({"path": "b.eps", "code": "2"}),
-        )
-        .unwrap();
+        for (path, code) in [("a.eps", "1"), ("b.eps", "2"), ("c.eps", "3")] {
+            admit_tool_call(
+                &mut state,
+                "file_write",
+                &serde_json::json!({"path": path, "code": code}),
+            )
+            .unwrap();
+        }
+        admit_tool_call(&mut state, BUILD_RUN_TOOL, &serde_json::json!({})).unwrap();
 
-        let error = admit_tool_call(
-            &mut state,
-            "file_write",
-            &serde_json::json!({"path": "c.eps", "code": "3"}),
-        )
-        .unwrap_err();
-        assert!(
-            error.to_string().contains("propose_plan"),
-            "3rd mutation without a plan must direct codex to propose_plan"
-        );
-        assert_eq!(state.mutation_count, 2, "rejected mutation must not count");
-
-        state.approve_plan();
-        admit_tool_call(
-            &mut state,
-            "file_write",
-            &serde_json::json!({"path": "c.eps", "code": "3"}),
-        )
-        .unwrap();
-        assert_eq!(state.mutation_count, 3);
+        assert_eq!(state.action_count, 4);
+        assert_eq!(state.build_fix_attempts, 1);
     }
 
     #[test]
@@ -6822,7 +6767,6 @@ mod tests {
     #[test]
     fn admission_rejects_fourth_build_run_attempt() {
         let mut state = RequestState::for_request("req-build");
-        state.approve_plan();
 
         for _ in 0..3 {
             admit_tool_call(&mut state, BUILD_RUN_TOOL, &serde_json::json!({})).unwrap();
@@ -6852,7 +6796,7 @@ mod tests {
     }
 
     #[test]
-    fn fresh_request_id_resets_per_request_gate_evidence_and_budgets() {
+    fn fresh_request_id_resets_per_request_evidence_and_budgets() {
         let mut state = RequestState::for_request("req-A");
         admit_tool_call(
             &mut state,
@@ -6861,7 +6805,6 @@ mod tests {
         )
         .unwrap();
         state.record_search_docs();
-        state.approve_plan();
         admit_tool_call(
             &mut state,
             "file_write",
@@ -6872,20 +6815,16 @@ mod tests {
 
         assert_eq!(state.request_id, "req-A");
         assert!(state.docs_searched);
-        assert!(state.plan_approved);
         assert_eq!(state.search_docs_count, 1);
         assert_eq!(state.action_count, 2);
-        assert_eq!(state.mutation_count, 2);
         assert_eq!(state.build_fix_attempts, 1);
 
         state.start_request("req-B");
 
         assert_eq!(state.request_id, "req-B");
         assert!(!state.docs_searched, "evidence gate is per-request");
-        assert!(!state.plan_approved, "plan approval is per-request");
         assert_eq!(state.search_docs_count, 0);
         assert_eq!(state.action_count, 0);
-        assert_eq!(state.mutation_count, 0);
         assert_eq!(state.build_fix_attempts, 0);
 
         let error = admit_tool_call(

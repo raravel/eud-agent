@@ -136,7 +136,7 @@ transport, and timeout failures remain visible. The tool stays read-only and req
 registration; `list_files` separately owns path/type/settable metadata. `set_main` uses the same
 wrapper to journal its prior value.
 
-Flow tools: `ask(questions)`, `propose_plan(markdown)`, `request_write_lane(reason)`.
+Flow tools: `ask(questions)`, `propose_plan(markdown)` for explicit user plan requests only, `request_write_lane(reason)`.
 
 Write tools: `dat_set`, `xdat_set`, `tbl_set`, `req_set`, `btn_set`, `dat_reset`, `file_create`,
 `file_write`, `file_edit`, `file_rename`, `file_delete`, `file_move`, `mkdir`, `set_main`,
@@ -178,9 +178,9 @@ cohesion review signal. Structural role/dependency changes replace memory `struc
 mutually dependent candidates use one `eps_check` batch and every applied epScript changeset still
 requires `build_run`.
 
-Evidence, first-principles, mutation-count, action-count, search, and three-build-attempt rails
-remain request scoped. The non-search action hard ceiling is 300 calls; each batched getter
-envelope consumes one action. `request_write_lane` is non-mutating and consumes no mutation budget.
+Evidence, first-principles, action-count, search, and three-build-attempt rails remain request
+scoped. The non-search action hard ceiling is 300 calls; each batched getter envelope consumes one
+action. Plans are proposed only for explicit user plan requests and never gate writes or builds.
 
 ## Main resource mention transport
 

@@ -465,9 +465,11 @@ hosting, panel re-arm, and server spawning are REMOVED.
   gate (mark items 근거 없음 (일반 EUD 지식) — NEVER fabricate a source). `build_run` is
   exempt. Project memory is no longer an MCP mutation; the accepted harness delta owns durable
   memory synchronization. The `[evidence]` section requires why plus a source link
-  (`[제목](url)`) on propose_plan steps and the final answer; `[reference context]` chunks carry
-  `source:` headers. Crash diagnosis MUST first match `[first principles]` with the item number
-  cited (or "no item matches") before any fix.
+  (`[제목](url)`) on every final answer and, when the user explicitly requests a plan, on each
+  `propose_plan` step. `[reference context]` chunks carry `source:` headers. Crash diagnosis MUST
+  first match `[first principles]` with the item number cited (or "no item matches") before any fix.
+  Plans are proposed only on explicit user request; file writes and `build_run` never require plan
+  approval.
 - Resumed turn text ALWAYS labels the user's text with a `[user message]` header after the
   prepended context; the system prompt carries the `[message format]` section (only
   `[user message]` is the instruction; a bug report there is a work request) (EUD-092).

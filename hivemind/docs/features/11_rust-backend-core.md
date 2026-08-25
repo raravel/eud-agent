@@ -89,7 +89,7 @@ Read: `project_status`, `list_files`, `read_file`, `eps_check`, `dat_get`, `xdat
 The DAT/XDAT/TBL/REQ/BTN getters take non-empty `items` arrays and return ordered per-item
 success/error results while consuming one action per tool envelope.
 
-Flow: `propose_plan(markdown)`, `request_write_lane(reason)`.
+Flow: `propose_plan(markdown)` only for explicit user plan requests, `request_write_lane(reason)`.
 
 Write: `dat_set`, `xdat_set`, `tbl_set`, `req_set`, `btn_set`, `dat_reset`, `file_create`,
 `file_write`, `file_edit`, `file_rename`, `file_delete`, `file_move`, `mkdir`, `set_main`,
@@ -103,7 +103,7 @@ journals the resulting full before/after bytes as a normal file modification.
 
 The runtime rejects every mutating tool, including build/map writes, unless its exact
 project/session/request registration owns the operation. `request_write_lane` is non-mutating.
-Evidence, first-principles, plan-mutation, action/search, and build budgets remain request scoped.
+Evidence, first-principles, action/search, and build budgets remain request scoped; plan approval is never a write or build admission gate.
 
 `build_run` is the single public build-result tool. It reads `EDSPATH`, snapshots output-map
 freshness, invokes the editor `BUILD`, waits up to 300 seconds, and consumes `BUILDERR`

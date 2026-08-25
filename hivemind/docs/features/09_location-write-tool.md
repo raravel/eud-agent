@@ -52,9 +52,9 @@ Hard invariants (each one verified in the smoke run):
 
 ## MCP tool: `location_write`
 
-`ToolSpec("location_write", "write", ...)` — a REAL write: plan-gated (3rd
-mutation without an approved plan → `propose_plan`), action-budgeted, and
-journaled. Routed (memory_write precedent) to the injected `MapInfoService`:
+`ToolSpec("location_write", "write", ...)` — a REAL write: evidence-gated,
+action-budgeted, and journaled, with no plan-approval admission gate. Routed
+(memory_write precedent) to the injected `MapInfoService`:
 
 - Params: `action` enum `add|set|rename|delete` (required); `name` (add/
   rename); `locationId` (set/rename/delete); `tileLeft/tileTop/tileRight/
@@ -207,7 +207,7 @@ Deleting a trigger-used location still fails in the native engine.
 
 After the user selects whole-candidate Apply in the Map Agent window, `CandidateMapSafe` performs
 the same compiling/no-share/hash/backup/atomic-replace rails and post-write verification. The
-direct `location_write` command remains the single-operation, plan-gated EPS-session workflow;
+direct `location_write` command remains the single-operation EPS-session workflow;
 neither path bypasses the other's trust boundary or mutates an unsaved map.
 
 ## Out of scope

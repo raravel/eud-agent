@@ -821,12 +821,6 @@ impl SessionToolRuntime {
             })
     }
 
-    pub fn approve_current_plan(&self) {
-        if let Some(state) = self.request_state.lock().as_mut() {
-            state.approve_plan();
-        }
-    }
-
     pub fn clear_current(&self) {
         self.cancel_pending_ask();
         *self.request.lock() = None;
