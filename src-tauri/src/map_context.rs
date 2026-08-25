@@ -352,9 +352,11 @@ mod tests {
             ..Default::default()
         })
         .unwrap();
-        let open_map_line = include_open_map
-            .then(|| format!("\nopenMapName='{}'", map.display()))
-            .unwrap_or_default();
+        let open_map_line = if include_open_map {
+            format!("\nopenMapName='{}'", map.display())
+        } else {
+            String::new()
+        };
         std::fs::write(
             agent_dir.join("status.txt"),
             format!(
