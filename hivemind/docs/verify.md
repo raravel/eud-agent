@@ -107,6 +107,12 @@ Codex and restore text, attachments, and mentions.
 - map switch write: `cargo test -p eud-agent switch_write_real_map_roundtrip -- --ignored`
   copies `sample.scx`, runs the full MapSafe/native/journal path, and requires the
   exact renamed SWNM string after re-extraction.
+- managed sound replacement:
+  `cargo test -p isom --test sound_native real_scx_replaces_managed_sound_without_leaving_the_old_registration`
+  proves old MPQ/string removal, exact new asset bytes, and stable WAV/string ids on a real SCX.
+  `cargo test -p eud-agent map_sound_import_is_one_lease_journal_and_exact_reject_transaction --lib -- --ignored --nocapture`
+  uses pinned FFmpeg/FFprobe to import, apply volume + fade, atomically replace the registration,
+  expose the changeset delta, and reject both writes back to the exact original map.
 - bootstrap (feature 10): `cargo test -p eud-agent bootstrap::manifest` — missing/corrupt
   assets trigger re-download, sha256 mismatch refuses installation, and Codex release
   metadata must provide a same-tag CLI + Code Mode host + Windows sandbox setup helper set

@@ -23,8 +23,7 @@ pub static __ISOM_LINK_ANCHOR: unsafe extern "C" fn() -> ::std::os::raw::c_int =
 mod tests {
     use super::*;
 
-    /// The bindgen-generated accessor proves the linked static library and
-    /// generated header agree on ABI v5.
+    /// The generated accessor proves the linked static library and current header agree.
     #[test]
     fn abi_version_matches_header() {
         assert_eq!(unsafe { isom_abi_version() }, ISOM_ABI_VERSION as i32);

@@ -1010,8 +1010,15 @@ stop this turn so the backend can resume the same thread in its isolated writabl
             tools::admit_tool_call(state, tool, args).map_err(|error| error.to_string())?;
         }
 
-        let mut result = if tool == tools::MAP_SOUND_IMPORT_TOOL {
-            self.map_sound_import(&request_id, args)
+        let mut result = if matches!(
+            tool,
+            tools::MAP_SOUND_IMPORT_TOOL | tools::MAP_SOUND_EDIT_TOOL
+        ) {
+            if tool == tools::MAP_SOUND_IMPORT_TOOL {
+                self.map_sound_import(&request_id, args)
+            } else {
+                self.map_sound_edit(&request_id, args)
+            }
         } else if tools::is_mutating_tool(tool) {
             self.project_transaction(|| self.dispatch(&request_id, tool, args))?
         } else {
@@ -1496,7 +1503,7 @@ stop this turn so the backend can resume the same thread in its isolated writabl
                 let bridge = self.bridge()?;
                 tools::map_minimap(&bridge, args).map_err(stringify)
             }
-            tools::MAP_SOUND_LIST_TOOL => self.map_sound_list(),
+            tools::MAP_SOUND_LIST_TOOL => self.map_sound_list(request_id),
             tools::SEARCH_DOCS_TOOL => Ok(self.search_docs(args)),
             tools::DOCS_GET_TOOL => self.docs_get(args),
             tools::REQUEST_WRITE_WORKSPACE_TOOL => {
@@ -1606,7 +1613,14 @@ stop this turn so the backend can resume the same thread in its isolated writabl
     }
 
     // ---- write-tool helpers ----
-    fn map_sound_list(&self) -> Result<Value, String> {
+    fn map_sound_list(&self, request_id: &str) -> Result<Value, String> {
+        let project_id = self
+            .request
+            .lock()
+            .as_ref()
+            .filter(|request| request.request_id == request_id)
+            .map(|request| request.project_id.clone())
+            .ok_or_else(|| format!("request {request_id} is not active"))?;
         let bridge = self.bridge()?;
         let (map_path, _) = tools::connected_map_metadata(&bridge, tools::MAP_SOUND_LIST_TOOL)
             .map_err(stringify)?;
@@ -1617,19 +1631,41 @@ stop this turn so the backend can resume the same thread in its isolated writabl
             .into_iter()
             .take(512)
             .map(|sound| {
-                let asset_present = assets.contains_key(&sound.mpq_path.to_ascii_lowercase());
-                json!({
+                let asset_sha256 = assets.get(&sound.mpq_path.to_ascii_lowercase()).cloned();
+                let managed = managed_sound_hash(&sound.mpq_path).is_some();
+                let source = if managed {
+                    self.services
+                        .audio
+                        .source_record(&project_id, &sound.mpq_path)?
+                } else {
+                    None
+                };
+                Ok(json!({
                     "soundIndex": sound.sound_index,
                     "mpqPath": sound.mpq_path,
-                    "assetPresent": asset_present,
-                    "managed": managed_sound_hash(&sound.mpq_path).is_some(),
-                })
+                    "assetPresent": asset_sha256.is_some(),
+                    "assetSha256": asset_sha256,
+                    "managed": managed,
+                    "sourceAvailable": source.is_some(),
+                    "sourceName": source.as_ref().map(|source| source.source_display_name.clone()),
+                    "originalDurationMs": source.as_ref().map(|source| source.source_duration_ms),
+                    "volumePercent": source.as_ref().map(|source| source.effects.volume_percent),
+                    "fadeInMs": source.as_ref().map(|source| source.effects.fade_in_ms),
+                    "fadeOutMs": source.as_ref().map(|source| source.effects.fade_out_ms),
+                }))
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, String>>()?;
         Ok(json!({"sounds": sounds}))
     }
 
     fn map_sound_import(&self, request_id: &str, args: &Value) -> Result<Value, String> {
+        let project_id = self
+            .request
+            .lock()
+            .as_ref()
+            .filter(|request| request.request_id == request_id)
+            .map(|request| request.project_id.clone())
+            .ok_or_else(|| format!("request {request_id} is not active"))?;
         let audio_ref = str_arg(args, "audioRef")?;
         let binding = self.audio_binding(request_id, audio_ref)?;
         let bridge = self.bridge()?;
@@ -1659,6 +1695,9 @@ stop this turn so the backend can resume the same thread in its isolated writabl
             return Err("검증된 OGG cache invariant가 변경되었습니다.".to_string());
         }
         let mpq_path = select_managed_sound_path(&map_path, &normalized.sha256)?;
+        self.services
+            .audio
+            .remember_import(&project_id, &mpq_path, &binding)?;
         self.emit_audio_progress(
             crate::ipc::ProgressStage::MapSoundWrite,
             "저장된 SCX에 MPQ asset, game string, WAV slot을 등록하고 있습니다.",
@@ -1765,6 +1804,7 @@ stop this turn so the backend can resume the same thread in its isolated writabl
                     map_bytes_before: write.map_bytes_before,
                     map_bytes_after: write.map_bytes_after,
                     source_display_name: binding.descriptor.name.clone(),
+                    edit: None,
                 },
                 ts: epoch_secs(),
             };
@@ -1807,6 +1847,302 @@ stop this turn so the backend can resume the same thread in its isolated writabl
             "mapSha256Before": write.report.input_sha256,
             "mapSha256After": write.report.output_sha256,
             "mapSizeDelta": map_size_delta,
+        }))
+    }
+
+    fn map_sound_edit(&self, request_id: &str, args: &Value) -> Result<Value, String> {
+        let project_id = self
+            .request
+            .lock()
+            .as_ref()
+            .filter(|request| request.request_id == request_id)
+            .map(|request| request.project_id.clone())
+            .ok_or_else(|| format!("request {request_id} is not active"))?;
+        let old_mpq_path = str_arg(args, "mpqPath")?;
+        if managed_sound_hash(old_mpq_path).is_none() {
+            return Err("eud-agent가 관리하는 MPQ 사운드 경로만 편집할 수 있습니다.".to_string());
+        }
+        let volume_percent = optional_u64_arg(args, "volumePercent")?;
+        if volume_percent.is_some_and(|value| value > u64::from(crate::audio::MAX_VOLUME_PERCENT)) {
+            return Err(format!(
+                "volumePercent는 0~{} 범위여야 합니다.",
+                crate::audio::MAX_VOLUME_PERCENT
+            ));
+        }
+        let fade_in_ms = optional_u64_arg(args, "fadeInMs")?;
+        let fade_out_ms = optional_u64_arg(args, "fadeOutMs")?;
+        if fade_in_ms
+            .into_iter()
+            .chain(fade_out_ms)
+            .any(|value| value > crate::audio::MAX_AUDIO_DURATION_MS)
+        {
+            return Err("fade 시간은 오디오 최대 길이를 초과할 수 없습니다.".to_string());
+        }
+        let patch = crate::audio::AudioEditPatch {
+            volume_percent: volume_percent.map(|value| value as u16),
+            fade_in_ms,
+            fade_out_ms,
+        };
+        if patch.is_empty() {
+            return Err(
+                "volumePercent, fadeInMs, fadeOutMs 중 하나를 지정해야 합니다.".to_string(),
+            );
+        }
+
+        let bridge = self.bridge()?;
+        let (map_path, _) = tools::connected_map_metadata(&bridge, tools::MAP_SOUND_EDIT_TOOL)
+            .map_err(stringify)?;
+        let expected_map_sha256 = crate::bootstrap::sha256_file(&map_path)
+            .map_err(|_| "저장된 원본 맵을 읽을 수 없습니다.".to_string())?;
+        let inventory = map_asset_inventory(&map_path)?;
+        let old_asset_sha256 = inventory
+            .get(&old_mpq_path.to_ascii_lowercase())
+            .cloned()
+            .ok_or_else(|| "편집할 관리형 MPQ 사운드 자산이 맵에 없습니다.".to_string())?;
+        let chk = isom::chk_extract(&map_path)
+            .map_err(|_| "저장된 맵의 사운드 목록을 읽을 수 없습니다.".to_string())?;
+        if crate::chk::parse_sounds(&chk)
+            .iter()
+            .filter(|sound| sound.mpq_path == old_mpq_path)
+            .count()
+            != 1
+        {
+            return Err("편집할 MPQ 사운드의 WAV 등록이 하나가 아닙니다.".to_string());
+        }
+
+        let supplied_audio_ref = args.get("audioRef").and_then(Value::as_str);
+        let existing_source = self
+            .services
+            .audio
+            .source_record(&project_id, old_mpq_path)?;
+        if existing_source.is_some() && supplied_audio_ref.is_some() {
+            return Err(
+                "이미 프로젝트 원본이 있는 사운드에는 audioRef를 다시 지정할 수 없습니다."
+                    .to_string(),
+            );
+        }
+        if existing_source.is_none() {
+            let audio_ref = supplied_audio_ref.ok_or_else(|| {
+                "이 사운드의 프로젝트 원본이 없습니다. 기존 등록에 사용한 원본을 다시 첨부해 주세요."
+                    .to_string()
+            })?;
+            let binding = self.audio_binding(request_id, audio_ref)?;
+            let cancellation = self.cancellation.lock().clone();
+            let normalized = self
+                .services
+                .audio
+                .normalize(&binding, cancellation.as_ref())?;
+            if normalized.sha256 != old_asset_sha256 {
+                return Err(
+                    "첨부한 원본을 기본 변환한 결과가 기존 등록 사운드와 일치하지 않습니다."
+                        .to_string(),
+                );
+            }
+            self.services
+                .audio
+                .remember_import(&project_id, old_mpq_path, &binding)?;
+        }
+
+        self.emit_audio_progress(
+            crate::ipc::ProgressStage::AudioTranscode,
+            "프로젝트 원본에 볼륨과 페이드 설정을 적용하고 있습니다.",
+        );
+        let request_temp = self.services.audio.request_temp()?;
+        let cancellation = self.cancellation.lock().clone();
+        let edited = self.services.audio.render_edit(
+            &project_id,
+            old_mpq_path,
+            patch,
+            request_temp.as_ref(),
+            cancellation.as_ref(),
+        )?;
+        self.emit_audio_progress(
+            crate::ipc::ProgressStage::AudioValidate,
+            "편집된 canonical OGG profile을 검증했습니다.",
+        );
+        let ogg_bytes = std::fs::read(&edited.normalized.path)
+            .map_err(|_| "검증된 편집 OGG cache를 읽을 수 없습니다.".to_string())?;
+        if ogg_bytes.len() as u64 != edited.normalized.bytes
+            || !ogg_bytes.starts_with(b"OggS")
+            || format!("{:x}", Sha256::digest(&ogg_bytes)) != edited.normalized.sha256
+        {
+            return Err("검증된 편집 OGG cache invariant가 변경되었습니다.".to_string());
+        }
+        if edited.normalized.sha256 == old_asset_sha256 {
+            return Err("편집 결과가 현재 맵 사운드 bytes와 같습니다.".to_string());
+        }
+        let new_mpq_path = select_managed_sound_replacement_path_from_inventory(
+            &inventory,
+            old_mpq_path,
+            &edited.normalized.sha256,
+        )?;
+        self.services
+            .audio
+            .remember_edit(&project_id, &new_mpq_path, &edited)?;
+        self.emit_audio_progress(
+            crate::ipc::ProgressStage::MapSoundWrite,
+            "SCX의 기존 MPQ asset, game string, WAV 등록을 편집본으로 교체하고 있습니다.",
+        );
+
+        let operation = self.project_transaction(|| {
+            let write = match self.services.map_safe.replace_sound(
+                &map_path,
+                &expected_map_sha256,
+                old_mpq_path,
+                &new_mpq_path,
+                &ogg_bytes,
+            ) {
+                Ok(write) => write,
+                Err(crate::mapsafe::MapSafeError::Compiling) => {
+                    return Err(
+                        "EUD Editor가 빌드 중이므로 맵 사운드를 교체할 수 없습니다.".to_string()
+                    )
+                }
+                Err(crate::mapsafe::MapSafeError::MapLocked(_)) => {
+                    self.emit_audio_progress(
+                        crate::ipc::ProgressStage::WaitingMapClose,
+                        "SCMDraft에서 현재 맵을 저장하고 닫은 뒤 다시 시도해 주세요.",
+                    );
+                    return Err(
+                        "SCMDraft에서 현재 맵을 저장하고 닫은 뒤 다시 시도해 주세요.".to_string(),
+                    );
+                }
+                Err(crate::mapsafe::MapSafeError::StaleSource { .. }) => {
+                    return Err("저장된 원본 맵이 오디오 편집 중 변경되었습니다.".to_string())
+                }
+                Err(crate::mapsafe::MapSafeError::PostVerifyRestored { .. }) => {
+                    return Err(
+                        "맵 사운드 교체 검증에 실패해 원본 backup을 복원했습니다.".to_string()
+                    )
+                }
+                Err(crate::mapsafe::MapSafeError::Rollback { .. }) => {
+                    self.mark_write_hazard("map sound replacement rollback failed");
+                    return Err(
+                        "맵 사운드 교체 rollback에 실패했습니다. write lease와 backup을 유지합니다."
+                            .to_string(),
+                    );
+                }
+                Err(crate::mapsafe::MapSafeError::Apply(detail)) => {
+                    let message = if detail.contains("source") {
+                        "기존 맵 사운드의 MPQ/string/WAV 등록이 완전하지 않습니다."
+                    } else if detail.contains("destination") {
+                        "편집본 MPQ sound path가 이미 사용 중입니다."
+                    } else {
+                        "native 맵 사운드 교체에 실패했습니다."
+                    };
+                    return Err(message.to_string());
+                }
+                Err(crate::mapsafe::MapSafeError::Verify { .. }) => {
+                    return Err("맵 사운드 교체 후 검증에 실패했습니다.".to_string())
+                }
+                Err(crate::mapsafe::MapSafeError::InsufficientDisk { .. }) => {
+                    return Err("맵 사운드 교체에 필요한 디스크 공간이 부족합니다.".to_string())
+                }
+                Err(crate::mapsafe::MapSafeError::Io(_))
+                | Err(crate::mapsafe::MapSafeError::BackupNotFound(_)) => {
+                    return Err("맵 backup 또는 atomic replace에 실패했습니다.".to_string())
+                }
+            };
+            let seq = self.services.journal.entry_count(request_id) as u64 + 1;
+            let native_report = serde_json::to_vec(&write.report).map_err(|_| {
+                "native sound replacement report를 직렬화할 수 없습니다.".to_string()
+            })?;
+            let entry = JournalEntry {
+                id: format!("sound-{seq}"),
+                seq,
+                tool: WriteTool::MapSound,
+                target: JournalTarget::MapSound {
+                    source_map: map_path.clone(),
+                    mpq_path: new_mpq_path.clone(),
+                    normalized_sha256: edited.normalized.sha256.clone(),
+                },
+                before: Snapshot::MapBackup {
+                    map_path: map_path.to_string_lossy().into_owned(),
+                    backup_path: write.backup_path.to_string_lossy().into_owned(),
+                },
+                after: Snapshot::MapSound {
+                    source_sha256: edited.source.source_sha256.clone(),
+                    source_codec: edited.source.source_codec.clone(),
+                    duration_ms: edited.normalized.duration_ms,
+                    channels: edited.source.source_channels,
+                    sample_rate: edited.source.source_sample_rate,
+                    normalization_profile: format!(
+                        "{};ogg/vorbis/44100/stereo/q4;volume={}%;fadeInMs={};fadeOutMs={}",
+                        edited.normalized.profile_version,
+                        edited.effects.volume_percent,
+                        edited.effects.fade_in_ms,
+                        edited.effects.fade_out_ms,
+                    ),
+                    normalized_sha256: edited.normalized.sha256.clone(),
+                    normalized_bytes: edited.normalized.bytes,
+                    mpq_path: new_mpq_path.clone(),
+                    wav_index: write.report.sound_index,
+                    string_id: write.report.sound_string_id,
+                    map_sha256_before: write.report.input_sha256.clone(),
+                    map_sha256_after: write.report.output_sha256.clone(),
+                    backup_path: write.backup_path.clone(),
+                    native_report_sha256: format!("{:x}", Sha256::digest(&native_report)),
+                    map_bytes_before: write.map_bytes_before,
+                    map_bytes_after: write.map_bytes_after,
+                    source_display_name: edited.source.source_display_name.clone(),
+                    edit: Some(crate::journal::MapSoundEditChange {
+                        previous_mpq_path: old_mpq_path.to_string(),
+                        before: crate::journal::MapSoundEffects {
+                            volume_percent: edited.previous_effects.volume_percent,
+                            fade_in_ms: edited.previous_effects.fade_in_ms,
+                            fade_out_ms: edited.previous_effects.fade_out_ms,
+                        },
+                        after: crate::journal::MapSoundEffects {
+                            volume_percent: edited.effects.volume_percent,
+                            fade_in_ms: edited.effects.fade_in_ms,
+                            fade_out_ms: edited.effects.fade_out_ms,
+                        },
+                    }),
+                },
+                ts: epoch_secs(),
+            };
+            if let Err(error) = self.services.journal.record(request_id, entry) {
+                let restore = self
+                    .services
+                    .map_safe
+                    .restore(&crate::mapsafe::JournalEntry {
+                        map_path: map_path.clone(),
+                        backup_path: write.backup_path.clone(),
+                    });
+                let restored_exactly = crate::bootstrap::sha256_file(&map_path)
+                    .is_ok_and(|hash| hash == expected_map_sha256);
+                if restore.is_err() || !restored_exactly {
+                    self.mark_write_hazard(
+                        "map sound replacement journal record failed and rollback did not settle",
+                    );
+                }
+                return Err(format!(
+                    "맵 사운드 교체 journal 기록에 실패했습니다: {error}"
+                ));
+            }
+            *self.sound_build_required.lock() = true;
+            *self.sound_preflight_required.lock() = true;
+            Ok(write)
+        })?;
+        let write = operation?;
+        self.emit_audio_progress(
+            crate::ipc::ProgressStage::MapSoundVerify,
+            "기존 사운드 제거와 편집본 MPQ/WAV 등록 검증을 완료했습니다.",
+        );
+        let map_size_delta = i128::from(write.map_bytes_after) - i128::from(write.map_bytes_before);
+        Ok(json!({
+            "oldMpqPath": old_mpq_path,
+            "mpqPath": write.report.mpq_path,
+            "durationMs": edited.normalized.duration_ms,
+            "normalizedBytes": edited.normalized.bytes,
+            "outputCodec": "vorbis",
+            "volumePercent": edited.effects.volume_percent,
+            "fadeInMs": edited.effects.fade_in_ms,
+            "fadeOutMs": edited.effects.fade_out_ms,
+            "mapSha256Before": write.report.input_sha256,
+            "mapSha256After": write.report.output_sha256,
+            "mapSizeDelta": map_size_delta,
+            "requiresCodeMigration": true,
         }))
     }
 
@@ -3380,6 +3716,28 @@ fn select_managed_sound_path_from_inventory(
     Err("관리형 MPQ sound path checksum prefix가 모두 충돌합니다.".to_string())
 }
 
+fn select_managed_sound_replacement_path_from_inventory(
+    inventory: &BTreeMap<String, String>,
+    old_mpq_path: &str,
+    normalized_sha256: &str,
+) -> Result<String, String> {
+    if managed_sound_hash(old_mpq_path).is_none()
+        || normalized_sha256.len() != 64
+        || !normalized_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err("편집된 OGG 경로 또는 checksum이 올바르지 않습니다.".to_string());
+    }
+    for length in [16usize, 24, 32, 64] {
+        let path = format!("staredit\\wav\\ea_{}.ogg", &normalized_sha256[..length]);
+        if path != old_mpq_path && !inventory.contains_key(&path) {
+            return Ok(path);
+        }
+    }
+    Err("편집본용 관리형 MPQ sound path checksum prefix가 모두 사용 중입니다.".to_string())
+}
+
 fn load_rag(dirs: &DataDirs) -> Rag {
     let index_path = dirs.rag_dir().join(crate::bootstrap::RAG_INDEX_FILENAME);
     let cache_dir = Some(dirs.models_dir());
@@ -3401,6 +3759,16 @@ fn str_arg<'a>(args: &'a Value, name: &str) -> Result<&'a str, String> {
     args.get(name)
         .and_then(Value::as_str)
         .ok_or_else(|| format!("missing or non-string argument '{name}'"))
+}
+
+fn optional_u64_arg(args: &Value, name: &str) -> Result<Option<u64>, String> {
+    match args.get(name) {
+        None => Ok(None),
+        Some(value) => value
+            .as_u64()
+            .map(Some)
+            .ok_or_else(|| format!("non-integer argument '{name}'")),
+    }
 }
 
 fn array_arg<'a>(args: &'a Value, name: &str) -> Result<&'a [Value], String> {
@@ -3729,8 +4097,6 @@ mod tests {
             let mut state = session_a.request_state.lock();
             let state = state.as_mut().expect("session A state");
             state.record_search_docs();
-            state.approve_plan();
-            state.mutation_count = 2;
             state.build_fix_attempts = 1;
         }
 
@@ -3740,8 +4106,6 @@ mod tests {
             .request_state_snapshot()
             .expect("session B must not clear session A");
         assert!(state_a.docs_searched);
-        assert!(state_a.plan_approved);
-        assert_eq!(state_a.mutation_count, 2);
         assert_eq!(state_a.build_fix_attempts, 1);
         assert_eq!(
             session_b.request_state_snapshot().unwrap().request_id,
@@ -3927,7 +4291,7 @@ mod tests {
             crate::write_coordinator::ProjectWriteCoordinator::silent(),
         );
         let runtime = services.session(format!("{tag}-session"));
-        runtime.begin_request(request_id, "project").unwrap();
+        runtime.begin_request(request_id, &"a".repeat(64)).unwrap();
         (base, inbox, outbox, runtime)
     }
 
@@ -4537,7 +4901,6 @@ mod tests {
         assert_eq!(runtime.journal().entry_count("req-eps"), 0);
         let state = runtime.request_state_snapshot().unwrap();
         assert_eq!(state.action_count, 0);
-        assert_eq!(state.mutation_count, 0);
         fs::remove_dir_all(base).ok();
     }
 
@@ -5040,6 +5403,23 @@ mod tests {
         );
         assert!(managed_sound_hash("staredit\\wav\\ea_ABCDEF0123456789.ogg").is_none());
         assert!(select_managed_sound_path_from_inventory(&empty, "bad").is_err());
+
+        let old_path = "staredit\\wav\\ea_aaaaaaaaaaaaaaaa.ogg";
+        let mut replacement_inventory = BTreeMap::new();
+        replacement_inventory.insert(old_path.to_string(), "a".repeat(64));
+        replacement_inventory.insert(
+            "staredit\\wav\\ea_0123456789abcdef.ogg".to_string(),
+            normalized.to_string(),
+        );
+        assert_eq!(
+            select_managed_sound_replacement_path_from_inventory(
+                &replacement_inventory,
+                old_path,
+                normalized,
+            )
+            .unwrap(),
+            "staredit\\wav\\ea_0123456789abcdef01234567.ogg"
+        );
     }
     #[test]
     fn map_sound_requires_post_import_preflight_before_complete_build() {
@@ -5164,13 +5544,69 @@ mod tests {
             sound["mpqPath"] == result["mpqPath"]
                 && sound["assetPresent"] == true
                 && sound["managed"] == true
+                && sound["sourceAvailable"] == true
+                && sound["volumePercent"] == 100
+        }));
+
+        let old_mpq_path = result["mpqPath"].as_str().unwrap().to_string();
+        let edit_responder = spawn_owned_bridge_responder(
+            base.join("editor").join("Data").join("agent").join("inbox"),
+            base.join("editor")
+                .join("Data")
+                .join("agent")
+                .join("outbox"),
+            "GETSET project|OpenMapName".to_string(),
+            format!("OK: project|OpenMapName = {}", map.display()),
+        );
+        let edited = runtime
+            .execute(
+                tools::MAP_SOUND_EDIT_TOOL,
+                &json!({
+                    "mpqPath": old_mpq_path,
+                    "volumePercent": 50,
+                    "fadeInMs": 100,
+                    "fadeOutMs": 100,
+                }),
+            )
+            .unwrap();
+        edit_responder.join().unwrap();
+        let new_mpq_path = edited["mpqPath"].as_str().unwrap();
+        assert_ne!(new_mpq_path, old_mpq_path);
+        assert_eq!(edited["oldMpqPath"], old_mpq_path);
+        assert_eq!(edited["volumePercent"], 50);
+        assert_eq!(edited["fadeInMs"], 100);
+        assert_eq!(edited["fadeOutMs"], 100);
+        assert_eq!(edited["requiresCodeMigration"], true);
+        let registered = crate::chk::parse_sounds(&isom::chk_extract(&map).unwrap());
+        assert_eq!(
+            registered
+                .iter()
+                .filter(|sound| sound.mpq_path == old_mpq_path)
+                .count(),
+            0
+        );
+        assert_eq!(
+            registered
+                .iter()
+                .filter(|sound| sound.mpq_path == new_mpq_path)
+                .count(),
+            1
+        );
+        let changeset = runtime.journal().changeset("sound-import-request").unwrap();
+        assert_eq!(changeset.items.len(), 2);
+        assert!(changeset.items.iter().any(|item| {
+            item.properties.iter().any(|property| {
+                property.property == "volumePercent"
+                    && property.old == json!(100)
+                    && property.new == json!(50)
+            })
         }));
 
         attachments.delete_session(runtime.session_id()).unwrap();
         assert_eq!(
             crate::chk::parse_sounds(&isom::chk_extract(&map).unwrap())
                 .iter()
-                .filter(|sound| sound.mpq_path == result["mpqPath"].as_str().unwrap())
+                .filter(|sound| sound.mpq_path == new_mpq_path)
                 .count(),
             1
         );

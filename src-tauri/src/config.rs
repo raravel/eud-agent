@@ -269,6 +269,11 @@ impl DataDirs {
     pub fn audio_temp_dir(&self) -> PathBuf {
         self.app_local_data.join("audio_temp")
     }
+    /// `%localappdata%\eud-agent\audio_sources` — immutable original audio blobs
+    /// and per-project managed-sound edit records.
+    pub fn audio_sources_dir(&self) -> PathBuf {
+        self.app_local_data.join("audio_sources")
+    }
     /// `%localappdata%\eud-agent\lsp_workspaces` — regenerable, app-owned
     /// epScript snapshots and candidate analysis directories. Never Roaming.
     pub fn lsp_workspaces_dir(&self) -> PathBuf {
@@ -304,6 +309,7 @@ impl DataDirs {
             self.logs_dir(),
             self.attachments_dir(),
             self.audio_temp_dir(),
+            self.audio_sources_dir(),
             self.map_imports_dir(),
             self.lsp_workspaces_dir(),
             self.codex_workspace_dir(),
@@ -475,6 +481,7 @@ mod tests {
         assert!(dirs.rag_dir().is_dir());
         assert!(dirs.logs_dir().is_dir());
         assert!(dirs.attachments_dir().is_dir());
+        assert!(dirs.audio_sources_dir().is_dir());
         assert!(dirs.map_imports_dir().is_dir());
         assert!(dirs.lsp_workspaces_dir().is_dir());
 
@@ -485,6 +492,7 @@ mod tests {
         assert!(!dirs.models_dir().starts_with(dirs.app_data()));
         assert!(dirs.lsp_workspaces_dir().starts_with(dirs.app_local_data()));
         assert!(dirs.attachments_dir().starts_with(dirs.app_local_data()));
+        assert!(dirs.audio_sources_dir().starts_with(dirs.app_local_data()));
         assert!(dirs.map_imports_dir().starts_with(dirs.app_local_data()));
         assert!(!dirs.map_imports_dir().starts_with(dirs.app_data()));
         assert!(!dirs.attachments_dir().starts_with(dirs.app_data()));

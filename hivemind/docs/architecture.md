@@ -128,7 +128,7 @@ Runtime state is split by size and ownership (Decision 12):
 |---|---|---|
 | editor `Data\agent\` | `inbox/`, `outbox/`, `status.txt`, `heartbeat.txt` | bridge (writes/reads) + app (file-IPC) |
 | `%appdata%\eud-agent\` | `config.json` (editor path, settings), `memory/`, durable `workspaces/`, `map_candidates/`, `map_backups/`, `journal/`, `sessions/` | app; Codex can access only its current project workspace through the strict sandbox |
-| `%localappdata%\eud-agent\` | `models/`, `rag/`, `bin/` (Codex CLI + Code Mode host + Windows sandbox setup helper), `logs/`, session-owned `attachments/`, regenerable `lsp_workspaces/` mirrors | app only |
+| `%localappdata%\eud-agent\` | `models/`, `rag/`, `bin/` (Codex CLI + Code Mode host + Windows sandbox setup helper), `logs/`, session-owned `attachments/`, project-keyed immutable `audio_sources/`, request-owned `audio_temp/`, regenerable `lsp_workspaces/` mirrors | app only |
 
 The bridge finds `Data\agent\` editor-relative (no absolute path baked into the .lua —
 KopiLua reads source as Latin1, so a non-ASCII path literal would corrupt). The app

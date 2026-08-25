@@ -232,6 +232,16 @@ hosting, panel re-arm, and server spawning are REMOVED.
 - switch_write edits SWNM/string data only. Switch ids are 1-256 and trigger
   conditions/actions keep their numeric ids unchanged. Switch NAME bytes follow
   the map string-table encoding and pass raw through the C ABI.
+- Managed map sounds are canonical OGG Vorbis under `staredit\wav\ea_<hash>.ogg`. Import and
+  replacement MUST mutate MPQ asset + game string + `WAV ` slot together and verify the exact
+  CHK/MPQ delta after save/reopen.
+- Offline volume/fade edits MUST render from the immutable project source, never from the
+  already encoded map OGG. The replacement MUST preserve the existing game string id and WAV
+  slot, remove the old MPQ/string path, and leave unrelated CHK sections/assets unchanged.
+- `map_sound_edit` returns a new content-addressed MPQ path. Every exact old EPS path reference
+  MUST migrate before one-batch `eps_check` and complete-project `build_run`.
+- A pre-feature sound without a project source MUST require one exact original reattachment;
+  adopt it only when default canonical normalization hashes to the current map asset.
 
 ## Map Agent candidate authority
 

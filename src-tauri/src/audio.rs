@@ -14,6 +14,7 @@ use sha2::{Digest as _, Sha256};
 use crate::attachment::{AttachmentDescriptor, ResolvedAudioAttachment, MAX_AUDIO_BYTES};
 use crate::bootstrap;
 use crate::config::DataDirs;
+use crate::memory::write_atomic_bytes;
 
 pub const MAX_AUDIO_DURATION_MS: u64 = 3_600_000;
 pub const MAX_PROBE_STDOUT: usize = 256 * 1024;
@@ -27,6 +28,76 @@ const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const FORMAT_ALLOWLIST: &[&str] = &[
     "wav", "ogg", "flac", "mp3", "aac", "mov", "mp4", "m4a", "aiff", "asf",
 ];
+
+const AUDIO_SOURCE_RECORD_SCHEMA: &str = "eud-project-audio-source/1";
+pub const MAX_VOLUME_PERCENT: u16 = 400;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AudioEffects {
+    pub volume_percent: u16,
+    pub fade_in_ms: u64,
+    pub fade_out_ms: u64,
+}
+
+impl Default for AudioEffects {
+    fn default() -> Self {
+        Self {
+            volume_percent: 100,
+            fade_in_ms: 0,
+            fade_out_ms: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AudioEditPatch {
+    pub volume_percent: Option<u16>,
+    pub fade_in_ms: Option<u64>,
+    pub fade_out_ms: Option<u64>,
+}
+
+impl AudioEditPatch {
+    fn apply(self, current: AudioEffects, duration_ms: u64) -> Result<AudioEffects, String> {
+        let edited = AudioEffects {
+            volume_percent: self.volume_percent.unwrap_or(current.volume_percent),
+            fade_in_ms: self.fade_in_ms.unwrap_or(current.fade_in_ms),
+            fade_out_ms: self.fade_out_ms.unwrap_or(current.fade_out_ms),
+        };
+        validate_effects(edited, duration_ms)?;
+        if edited == current {
+            return Err("요청한 오디오 편집값이 현재 값과 같습니다.".to_string());
+        }
+        Ok(edited)
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.volume_percent.is_none() && self.fade_in_ms.is_none() && self.fade_out_ms.is_none()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProjectAudioSource {
+    schema: String,
+    pub mpq_path: String,
+    pub source_sha256: String,
+    pub source_display_name: String,
+    pub source_codec: String,
+    pub source_duration_ms: u64,
+    pub source_channels: u32,
+    pub source_sample_rate: u32,
+    pub source_bytes: u64,
+    pub effects: AudioEffects,
+}
+
+#[derive(Debug, Clone)]
+pub struct EditedAudio {
+    pub source: ProjectAudioSource,
+    pub previous_effects: AudioEffects,
+    pub effects: AudioEffects,
+    pub normalized: NormalizedAudio,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -159,107 +230,447 @@ impl AudioService {
         }
 
         validate_bound_source(binding)?;
-        let tools = bootstrap::resolve_managed_ffmpeg(&self.dirs)
-            .map_err(|_| "관리되는 오디오 변환기 자산이 없거나 손상되었습니다.".to_string())?;
         let output = binding
             .request_temp
             .path()
             .join(format!("{}.ogg", binding.audio_ref));
-        let _ = fs::remove_file(&output);
-        let args = vec![
-            "-nostdin".to_string(),
-            "-v".to_string(),
-            "error".to_string(),
-            "-protocol_whitelist".to_string(),
-            "file".to_string(),
-            "-i".to_string(),
-            binding.source_path.to_string_lossy().into_owned(),
-            "-map".to_string(),
-            "0:a:0".to_string(),
-            "-vn".to_string(),
-            "-sn".to_string(),
-            "-dn".to_string(),
-            "-map_metadata".to_string(),
-            "-1".to_string(),
-            "-map_chapters".to_string(),
-            "-1".to_string(),
-            "-ar".to_string(),
-            "44100".to_string(),
-            "-ac".to_string(),
-            "2".to_string(),
-            "-c:a".to_string(),
-            "libvorbis".to_string(),
-            "-q:a".to_string(),
-            "4".to_string(),
-            "-f".to_string(),
-            "ogg".to_string(),
-            "-y".to_string(),
-            output.to_string_lossy().into_owned(),
-        ];
-        let process = run_managed_process(
-            &tools.ffmpeg,
-            &args,
-            TRANSCODE_DEADLINE,
-            1,
-            MAX_PROCESS_STDERR,
+        let normalized = transcode_canonical(
+            &self.dirs,
+            &binding.source_path,
+            &binding.probe,
+            &output,
+            AudioEffects::default(),
             cancellation,
-        );
-        let process = match process {
-            Ok(process) => process,
-            Err(error) => {
-                let _ = fs::remove_file(&output);
-                return Err(error);
-            }
-        };
-        if !process.success {
-            let _ = fs::remove_file(&output);
-            return Err("오디오 파일이 손상되었거나 디코딩할 수 없습니다.".to_string());
-        }
-
-        let normalized = (|| {
-            let before = stable_file_metadata(&output, MAX_NORMALIZED_AUDIO_BYTES)?;
-            let bytes =
-                fs::read(&output).map_err(|_| "정규화된 OGG를 읽을 수 없습니다.".to_string())?;
-            let after = stable_file_metadata(&output, MAX_NORMALIZED_AUDIO_BYTES)?;
-            if before != after {
-                return Err("정규화된 OGG가 검증 중 변경되었습니다.".to_string());
-            }
-            if !bytes.starts_with(b"OggS") {
-                return Err("정규화된 OGG magic 검증에 실패했습니다.".to_string());
-            }
-            let output_probe = probe_file(&tools.ffprobe, &output, cancellation)?;
-            if output_probe.codec != "vorbis"
-                || output_probe.sample_rate != 44_100
-                || output_probe.channels != 2
-            {
-                return Err("정규화된 OGG codec profile 검증에 실패했습니다.".to_string());
-            }
-            let tolerance = 250_u64.max(binding.probe.duration_ms / 200);
-            if output_probe.duration_ms.abs_diff(binding.probe.duration_ms) > tolerance {
-                return Err("정규화된 OGG 길이 검증에 실패했습니다.".to_string());
-            }
-            Ok(NormalizedAudio {
-                path: output.clone(),
-                sha256: sha256_bytes(&bytes),
-                bytes: bytes.len() as u64,
-                duration_ms: output_probe.duration_ms,
-                source_codec: binding.probe.codec.clone(),
-                profile_version: tools.version,
-            })
-        })();
-        let normalized = match normalized {
-            Ok(normalized) => normalized,
-            Err(error) => {
-                let _ = fs::remove_file(&output);
-                return Err(error);
-            }
-        };
+        )?;
         *binding
             .normalized
             .lock()
             .map_err(|_| "오디오 변환 cache lock이 손상되었습니다.".to_string())? =
             Some(normalized.clone());
         Ok(normalized)
+    }
+
+    pub fn remember_import(
+        &self,
+        project_id: &str,
+        mpq_path: &str,
+        binding: &AudioBinding,
+    ) -> Result<ProjectAudioSource, String> {
+        if let Some(existing) = self.source_record(project_id, mpq_path)? {
+            return Ok(existing);
+        }
+        validate_bound_source(binding)?;
+        let source_bytes =
+            self.persist_source_blob(project_id, &binding.source_path, &binding.source_sha256)?;
+        let record = ProjectAudioSource {
+            schema: AUDIO_SOURCE_RECORD_SCHEMA.to_string(),
+            mpq_path: mpq_path.to_string(),
+            source_sha256: binding.source_sha256.clone(),
+            source_display_name: binding.descriptor.name.clone(),
+            source_codec: binding.probe.codec.clone(),
+            source_duration_ms: binding.probe.duration_ms,
+            source_channels: binding.probe.channels,
+            source_sample_rate: binding.probe.sample_rate,
+            source_bytes,
+            effects: AudioEffects::default(),
+        };
+        self.write_source_record(project_id, &record)?;
+        Ok(record)
+    }
+
+    pub fn source_record(
+        &self,
+        project_id: &str,
+        mpq_path: &str,
+    ) -> Result<Option<ProjectAudioSource>, String> {
+        let path = self.source_record_path(project_id, mpq_path)?;
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(format!(
+                    "프로젝트 오디오 원본 기록을 읽을 수 없습니다: {error}"
+                ))
+            }
+        };
+        let record: ProjectAudioSource = serde_json::from_slice(&bytes)
+            .map_err(|_| "프로젝트 오디오 원본 기록이 손상되었습니다.".to_string())?;
+        validate_source_record(&record, mpq_path)?;
+        let blob = self.source_blob_path(project_id, &record.source_sha256)?;
+        let metadata = stable_file_metadata(&blob, MAX_AUDIO_BYTES)?;
+        if metadata.0 != record.source_bytes {
+            return Err("프로젝트 오디오 원본 크기가 변경되었습니다.".to_string());
+        }
+        Ok(Some(record))
+    }
+
+    pub fn render_edit(
+        &self,
+        project_id: &str,
+        mpq_path: &str,
+        patch: AudioEditPatch,
+        request_temp: &RequestAudioTemp,
+        cancellation: Option<&tokio::sync::watch::Receiver<u64>>,
+    ) -> Result<EditedAudio, String> {
+        if patch.is_empty() {
+            return Err("오디오 편집값을 하나 이상 지정해야 합니다.".to_string());
+        }
+        let source = self
+            .source_record(project_id, mpq_path)?
+            .ok_or_else(|| "이 사운드의 프로젝트 원본이 없습니다.".to_string())?;
+        let source_path = self.source_blob_path(project_id, &source.source_sha256)?;
+        if sha256_file(&source_path)? != source.source_sha256 {
+            return Err("프로젝트 오디오 원본 checksum이 변경되었습니다.".to_string());
+        }
+        let tools = bootstrap::resolve_managed_ffmpeg(&self.dirs)
+            .map_err(|_| "관리되는 오디오 변환기 자산이 없거나 손상되었습니다.".to_string())?;
+        let probe = probe_file(&tools.ffprobe, &source_path, cancellation)?;
+        let tolerance = 250_u64.max(source.source_duration_ms / 200);
+        if probe.duration_ms.abs_diff(source.source_duration_ms) > tolerance {
+            return Err("프로젝트 오디오 원본 길이가 변경되었습니다.".to_string());
+        }
+        let effects = patch.apply(source.effects, source.source_duration_ms)?;
+        let output = request_temp
+            .path()
+            .join(format!("edit-{}.ogg", uuid::Uuid::new_v4()));
+        let normalized = transcode_canonical(
+            &self.dirs,
+            &source_path,
+            &probe,
+            &output,
+            effects,
+            cancellation,
+        )?;
+        Ok(EditedAudio {
+            previous_effects: source.effects,
+            source,
+            effects,
+            normalized,
+        })
+    }
+
+    pub fn remember_edit(
+        &self,
+        project_id: &str,
+        mpq_path: &str,
+        edited: &EditedAudio,
+    ) -> Result<ProjectAudioSource, String> {
+        let mut record = edited.source.clone();
+        record.mpq_path = mpq_path.to_string();
+        record.effects = edited.effects;
+        self.write_source_record(project_id, &record)?;
+        Ok(record)
+    }
+
+    fn persist_source_blob(
+        &self,
+        project_id: &str,
+        source: &Path,
+        expected_sha256: &str,
+    ) -> Result<u64, String> {
+        validate_project_id(project_id)?;
+        validate_sha256(expected_sha256)?;
+        let before = stable_file_metadata(source, MAX_AUDIO_BYTES)?;
+        let blob = self.source_blob_path(project_id, expected_sha256)?;
+        if blob.is_file() {
+            let metadata = stable_file_metadata(&blob, MAX_AUDIO_BYTES)?;
+            if metadata.0 != before.0 || sha256_file(&blob)? != expected_sha256 {
+                return Err("프로젝트 오디오 원본 저장소가 손상되었습니다.".to_string());
+            }
+            return Ok(metadata.0);
+        }
+        let parent = blob
+            .parent()
+            .ok_or_else(|| "프로젝트 오디오 원본 경로가 올바르지 않습니다.".to_string())?;
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("프로젝트 오디오 원본 폴더를 만들 수 없습니다: {error}"))?;
+        let temporary = parent.join(format!(".{}.tmp", uuid::Uuid::new_v4()));
+        let copied = fs::copy(source, &temporary)
+            .map_err(|error| format!("프로젝트 오디오 원본을 복사할 수 없습니다: {error}"))?;
+        let after = stable_file_metadata(source, MAX_AUDIO_BYTES)?;
+        let staged = stable_file_metadata(&temporary, MAX_AUDIO_BYTES)?;
+        if before != after
+            || copied != before.0
+            || staged.0 != before.0
+            || sha256_file(&temporary)? != expected_sha256
+        {
+            let _ = fs::remove_file(&temporary);
+            return Err("프로젝트 오디오 원본이 복사 중 변경되었습니다.".to_string());
+        }
+        if let Err(error) = fs::rename(&temporary, &blob) {
+            let _ = fs::remove_file(&temporary);
+            if !blob.is_file()
+                || stable_file_metadata(&blob, MAX_AUDIO_BYTES)?.0 != before.0
+                || sha256_file(&blob)? != expected_sha256
+            {
+                return Err(format!(
+                    "프로젝트 오디오 원본을 확정할 수 없습니다: {error}"
+                ));
+            }
+        }
+        Ok(before.0)
+    }
+
+    fn write_source_record(
+        &self,
+        project_id: &str,
+        record: &ProjectAudioSource,
+    ) -> Result<(), String> {
+        validate_source_record(record, &record.mpq_path)?;
+        if let Some(existing) = self.source_record(project_id, &record.mpq_path)? {
+            if existing == *record {
+                return Ok(());
+            }
+            return Err(
+                "같은 MPQ 사운드 경로가 다른 프로젝트 원본 기록에 연결되어 있습니다.".to_string(),
+            );
+        }
+        let path = self.source_record_path(project_id, &record.mpq_path)?;
+        let bytes = serde_json::to_vec_pretty(record)
+            .map_err(|_| "프로젝트 오디오 원본 기록을 만들 수 없습니다.".to_string())?;
+        write_atomic_bytes(&path, &bytes)
+            .map_err(|error| format!("프로젝트 오디오 원본 기록을 저장할 수 없습니다: {error}"))
+    }
+
+    fn source_record_path(&self, project_id: &str, mpq_path: &str) -> Result<PathBuf, String> {
+        validate_project_id(project_id)?;
+        validate_managed_sound_path(mpq_path)?;
+        let key = sha256_bytes(mpq_path.to_ascii_lowercase().as_bytes());
+        Ok(self
+            .dirs
+            .audio_sources_dir()
+            .join(project_id)
+            .join("sounds")
+            .join(format!("{key}.json")))
+    }
+
+    fn source_blob_path(&self, project_id: &str, sha256: &str) -> Result<PathBuf, String> {
+        validate_project_id(project_id)?;
+        validate_sha256(sha256)?;
+        Ok(self
+            .dirs
+            .audio_sources_dir()
+            .join(project_id)
+            .join("blobs")
+            .join(sha256))
+    }
+}
+
+fn transcode_canonical(
+    dirs: &DataDirs,
+    source: &Path,
+    source_probe: &AudioProbe,
+    output: &Path,
+    effects: AudioEffects,
+    cancellation: Option<&tokio::sync::watch::Receiver<u64>>,
+) -> Result<NormalizedAudio, String> {
+    validate_effects(effects, source_probe.duration_ms)?;
+    let tools = bootstrap::resolve_managed_ffmpeg(dirs)
+        .map_err(|_| "관리되는 오디오 변환기 자산이 없거나 손상되었습니다.".to_string())?;
+    let _ = fs::remove_file(output);
+    let args = canonical_transcode_args(source, output, effects, source_probe.duration_ms);
+    let process = run_managed_process(
+        &tools.ffmpeg,
+        &args,
+        TRANSCODE_DEADLINE,
+        1,
+        MAX_PROCESS_STDERR,
+        cancellation,
+    );
+    let process = match process {
+        Ok(process) => process,
+        Err(error) => {
+            let _ = fs::remove_file(output);
+            return Err(error);
+        }
+    };
+    if !process.success {
+        let _ = fs::remove_file(output);
+        return Err("오디오 파일이 손상되었거나 디코딩할 수 없습니다.".to_string());
+    }
+
+    let normalized = (|| {
+        let before = stable_file_metadata(output, MAX_NORMALIZED_AUDIO_BYTES)?;
+        let bytes = fs::read(output).map_err(|_| "정규화된 OGG를 읽을 수 없습니다.".to_string())?;
+        let after = stable_file_metadata(output, MAX_NORMALIZED_AUDIO_BYTES)?;
+        if before != after {
+            return Err("정규화된 OGG가 검증 중 변경되었습니다.".to_string());
+        }
+        if !bytes.starts_with(b"OggS") {
+            return Err("정규화된 OGG magic 검증에 실패했습니다.".to_string());
+        }
+        let output_probe = probe_file(&tools.ffprobe, output, cancellation)?;
+        if output_probe.codec != "vorbis"
+            || output_probe.sample_rate != 44_100
+            || output_probe.channels != 2
+        {
+            return Err("정규화된 OGG codec profile 검증에 실패했습니다.".to_string());
+        }
+        let tolerance = 250_u64.max(source_probe.duration_ms / 200);
+        if output_probe.duration_ms.abs_diff(source_probe.duration_ms) > tolerance {
+            return Err("정규화된 OGG 길이 검증에 실패했습니다.".to_string());
+        }
+        Ok(NormalizedAudio {
+            path: output.to_path_buf(),
+            sha256: sha256_bytes(&bytes),
+            bytes: bytes.len() as u64,
+            duration_ms: output_probe.duration_ms,
+            source_codec: source_probe.codec.clone(),
+            profile_version: tools.version,
+        })
+    })();
+    if normalized.is_err() {
+        let _ = fs::remove_file(output);
+    }
+    normalized
+}
+
+fn canonical_transcode_args(
+    source: &Path,
+    output: &Path,
+    effects: AudioEffects,
+    duration_ms: u64,
+) -> Vec<String> {
+    let mut args = vec![
+        "-nostdin".to_string(),
+        "-v".to_string(),
+        "error".to_string(),
+        "-protocol_whitelist".to_string(),
+        "file".to_string(),
+        "-i".to_string(),
+        source.to_string_lossy().into_owned(),
+        "-map".to_string(),
+        "0:a:0".to_string(),
+        "-vn".to_string(),
+        "-sn".to_string(),
+        "-dn".to_string(),
+        "-map_metadata".to_string(),
+        "-1".to_string(),
+        "-map_chapters".to_string(),
+        "-1".to_string(),
+    ];
+    if let Some(filter) = audio_filter(effects, duration_ms) {
+        args.extend(["-af".to_string(), filter]);
+    }
+    args.extend([
+        "-ar".to_string(),
+        "44100".to_string(),
+        "-ac".to_string(),
+        "2".to_string(),
+        "-c:a".to_string(),
+        "libvorbis".to_string(),
+        "-q:a".to_string(),
+        "4".to_string(),
+        "-f".to_string(),
+        "ogg".to_string(),
+        "-y".to_string(),
+        output.to_string_lossy().into_owned(),
+    ]);
+    args
+}
+
+fn audio_filter(effects: AudioEffects, duration_ms: u64) -> Option<String> {
+    let mut filters = Vec::with_capacity(3);
+    if effects.volume_percent != 100 {
+        filters.push(format!("volume={}/100", effects.volume_percent));
+    }
+    if effects.fade_in_ms != 0 {
+        filters.push(format!("afade=t=in:st=0:d={}", seconds(effects.fade_in_ms)));
+    }
+    if effects.fade_out_ms != 0 {
+        filters.push(format!(
+            "afade=t=out:st={}:d={}",
+            seconds(duration_ms - effects.fade_out_ms),
+            seconds(effects.fade_out_ms)
+        ));
+    }
+    (!filters.is_empty()).then(|| filters.join(","))
+}
+
+fn seconds(milliseconds: u64) -> String {
+    format!("{}.{:03}", milliseconds / 1_000, milliseconds % 1_000)
+}
+
+fn validate_effects(effects: AudioEffects, duration_ms: u64) -> Result<(), String> {
+    if effects.volume_percent > MAX_VOLUME_PERCENT {
+        return Err(format!(
+            "오디오 볼륨은 0~{MAX_VOLUME_PERCENT}% 범위여야 합니다."
+        ));
+    }
+    if duration_ms == 0
+        || effects.fade_in_ms > duration_ms
+        || effects.fade_out_ms > duration_ms
+        || effects.fade_in_ms > duration_ms.saturating_sub(effects.fade_out_ms)
+    {
+        return Err("페이드인과 페이드아웃 합계가 오디오 길이를 초과합니다.".to_string());
+    }
+    Ok(())
+}
+
+fn validate_source_record(
+    record: &ProjectAudioSource,
+    expected_mpq_path: &str,
+) -> Result<(), String> {
+    validate_managed_sound_path(expected_mpq_path)?;
+    validate_sha256(&record.source_sha256)?;
+    validate_effects(record.effects, record.source_duration_ms)?;
+    if record.schema != AUDIO_SOURCE_RECORD_SCHEMA
+        || record.mpq_path != expected_mpq_path
+        || record.source_display_name.trim().is_empty()
+        || record.source_codec.trim().is_empty()
+        || record.source_duration_ms == 0
+        || record.source_duration_ms > MAX_AUDIO_DURATION_MS
+        || record.source_channels == 0
+        || record.source_channels > MAX_AUDIO_CHANNELS_IN
+        || record.source_sample_rate == 0
+        || record.source_sample_rate > MAX_SAMPLE_RATE
+        || record.source_bytes == 0
+        || record.source_bytes > MAX_AUDIO_BYTES as u64
+    {
+        return Err("프로젝트 오디오 원본 기록이 올바르지 않습니다.".to_string());
+    }
+    Ok(())
+}
+
+fn validate_project_id(project_id: &str) -> Result<(), String> {
+    if project_id.len() == 64
+        && project_id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        Ok(())
+    } else {
+        Err("프로젝트 오디오 저장소 ID가 올바르지 않습니다.".to_string())
+    }
+}
+
+fn validate_sha256(sha256: &str) -> Result<(), String> {
+    if sha256.len() == 64
+        && sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        Ok(())
+    } else {
+        Err("오디오 checksum이 올바르지 않습니다.".to_string())
+    }
+}
+
+fn validate_managed_sound_path(path: &str) -> Result<(), String> {
+    let Some(hash) = path
+        .strip_prefix("staredit\\wav\\ea_")
+        .and_then(|path| path.strip_suffix(".ogg"))
+    else {
+        return Err("관리형 MPQ sound path가 올바르지 않습니다.".to_string());
+    };
+    if matches!(hash.len(), 16 | 24 | 32 | 64)
+        && hash
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        Ok(())
+    } else {
+        Err("관리형 MPQ sound path가 올바르지 않습니다.".to_string())
     }
 }
 
@@ -627,6 +1038,124 @@ mod tests {
     fn bounded_reader_rejects_excess_after_draining() {
         assert_eq!(read_bounded(&b"abcd"[..], 4).unwrap(), b"abcd");
         assert!(read_bounded(&b"abcde"[..], 4).is_err());
+    }
+
+    #[test]
+    fn edit_patch_builds_bounded_volume_and_fade_filters() {
+        let effects = AudioEditPatch {
+            volume_percent: Some(50),
+            fade_in_ms: Some(1_500),
+            fade_out_ms: Some(2_000),
+        }
+        .apply(AudioEffects::default(), 10_000)
+        .unwrap();
+        let args = canonical_transcode_args(
+            Path::new("source.flac"),
+            Path::new("output.ogg"),
+            effects,
+            10_000,
+        );
+        let filter_index = args.iter().position(|arg| arg == "-af").unwrap();
+        assert_eq!(
+            args[filter_index + 1],
+            "volume=50/100,afade=t=in:st=0:d=1.500,afade=t=out:st=8.000:d=2.000"
+        );
+        assert!(AudioEditPatch {
+            volume_percent: None,
+            fade_in_ms: Some(6_000),
+            fade_out_ms: Some(5_000),
+        }
+        .apply(AudioEffects::default(), 10_000)
+        .is_err());
+        assert!(AudioEditPatch {
+            volume_percent: Some(MAX_VOLUME_PERCENT + 1),
+            ..AudioEditPatch::default()
+        }
+        .apply(AudioEffects::default(), 10_000)
+        .is_err());
+    }
+
+    #[test]
+    fn project_audio_store_keeps_immutable_source_and_path_edit_history() {
+        let root = integration_root("project-source");
+        let dirs = DataDirs::from_bases(&root.join("roaming"), &root.join("local"));
+        dirs.ensure_dirs().unwrap();
+        let service = AudioService::new(dirs.clone());
+        let source_path = root.join("source.bin");
+        let source_bytes = b"original-audio-master";
+        fs::write(&source_path, source_bytes).unwrap();
+        let project_id = "a".repeat(64);
+        let old_path = format!("staredit\\wav\\ea_{}.ogg", "b".repeat(16));
+        let binding = AudioBinding {
+            descriptor: AttachmentDescriptor {
+                id: uuid::Uuid::new_v4().to_string(),
+                name: "theme.flac".to_string(),
+                mime: "audio/flac".to_string(),
+                kind: crate::attachment::AttachmentKind::Audio,
+                size: source_bytes.len() as u64,
+            },
+            source_path,
+            source_sha256: sha256_bytes(source_bytes),
+            probe: AudioProbe {
+                codec: "flac".to_string(),
+                duration_ms: 10_000,
+                channels: 2,
+                sample_rate: 48_000,
+                format: "flac".to_string(),
+            },
+            audio_ref: "audio-1".to_string(),
+            request_temp: service.request_temp().unwrap(),
+            normalized: Arc::new(Mutex::new(None)),
+        };
+        let original = service
+            .remember_import(&project_id, &old_path, &binding)
+            .unwrap();
+        let blob = service
+            .source_blob_path(&project_id, &original.source_sha256)
+            .unwrap();
+        assert_eq!(fs::read(blob).unwrap(), source_bytes);
+
+        let new_path = format!("staredit\\wav\\ea_{}.ogg", "c".repeat(16));
+        let edited = EditedAudio {
+            source: original.clone(),
+            previous_effects: AudioEffects::default(),
+            effects: AudioEffects {
+                volume_percent: 50,
+                fade_in_ms: 1_000,
+                fade_out_ms: 2_000,
+            },
+            normalized: NormalizedAudio {
+                path: root.join("unused.ogg"),
+                sha256: "d".repeat(64),
+                bytes: 1,
+                duration_ms: 10_000,
+                source_codec: "flac".to_string(),
+                profile_version: "test".to_string(),
+            },
+        };
+        service
+            .remember_edit(&project_id, &new_path, &edited)
+            .unwrap();
+        service
+            .remember_edit(&project_id, &new_path, &edited)
+            .unwrap();
+        assert_eq!(
+            service
+                .source_record(&project_id, &old_path)
+                .unwrap()
+                .unwrap()
+                .effects,
+            AudioEffects::default()
+        );
+        assert_eq!(
+            service
+                .source_record(&project_id, &new_path)
+                .unwrap()
+                .unwrap()
+                .effects,
+            edited.effects
+        );
+        fs::remove_dir_all(root).ok();
     }
 
     fn installed_dirs() -> DataDirs {

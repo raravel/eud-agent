@@ -66,10 +66,11 @@ and remains separate from that local process boundary.
 
 ## Legacy / Vendored
 - isom-poc C++ (`native/isom/`, vendored from isom-poc/IsomTerrain/) — MSBuild
-  solution: IsomTerrain (lib) + CrossCutLib + IcuLib (vendored ICU) + CascLib. ABI v5 adds the
-  packed bounded image quantizer over the existing cached CV5/VX4/VR4/WPE loader; palette
-  construction, graphics validity, representative color, walkability, and height metadata remain
-  native authority. The static `.lib` is linked into the Rust binary (Decision 09). Our repo is
+  solution: IsomTerrain (lib) + CrossCutLib + IcuLib (vendored ICU) + CascLib. ABI v6 exposes
+  the packed bounded image quantizer plus exact managed-sound add/replace entry points over the
+  existing cached CV5/VX4/VR4/WPE and MappingCore loaders. Palette construction, graphics
+  validity, representative color, walkability, height metadata, and CHK/MPQ deltas remain native
+  authority. The static `.lib` is linked into the Rust binary (Decision 09). Our repo is
   the source of truth; the editor's own C++ is never touched.
 - vendor/webview2 — 3 WebView2 SDK DLLs from the POC; under Tauri the WebView2 runtime is
   the system Evergreen runtime, so these are retained only as a fallback reference.

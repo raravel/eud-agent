@@ -135,6 +135,20 @@ int isom_map_sound_add(
     uint8_t** out_report_json,
     size_t* out_report_len);
 
+/* Replace one complete canonical managed OGG registration while preserving its
+ * WAV slot and game string id. The old MPQ asset is removed, the new asset is
+ * added, and every unrelated CHK section and MPQ asset must remain byte-exact. */
+int isom_map_sound_replace(
+    const char* input_map_path,
+    const char* output_map_path,
+    const char* expected_input_sha256,
+    const char* old_mpq_path_ascii,
+    const char* destination_mpq_path_ascii,
+    const uint8_t* ogg_bytes,
+    size_t ogg_length,
+    uint8_t** out_report_json,
+    size_t* out_report_len);
+
 /* Quantize one bounded RGBA pixel per output map tile against the current
  * tileset's graphics-valid SD representative-color palette. `before_tiles`
  * supplies candidate terrain for alpha preservation/compositing. The returned

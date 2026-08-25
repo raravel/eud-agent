@@ -182,6 +182,21 @@ pub enum JournalTarget {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MapSoundEffects {
+    pub volume_percent: u16,
+    pub fade_in_ms: u64,
+    pub fade_out_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MapSoundEditChange {
+    pub previous_mpq_path: String,
+    pub before: MapSoundEffects,
+    pub after: MapSoundEffects,
+}
 /// Journal snapshots stay inline to avoid one heap allocation per entry; their
 /// serde wire shape is durable and pending-review collections are tightly bounded.
 #[allow(clippy::large_enum_variant)]
@@ -244,6 +259,8 @@ pub enum Snapshot {
         map_bytes_before: u64,
         map_bytes_after: u64,
         source_display_name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        edit: Option<MapSoundEditChange>,
     },
 }
 
@@ -872,34 +889,99 @@ fn map_sound_changeset_properties(
         map_bytes_before,
         map_bytes_after,
         source_display_name,
+        edit,
         ..
     } = &entry.after
     else {
         return Err(invalid_entry(entry, "expected map sound after snapshot"));
     };
     let map_size_delta = i128::from(*map_bytes_after) - i128::from(*map_bytes_before);
-    let values = [
-        ("source", serde_json::json!(source_display_name)),
-        ("sourceCodec", serde_json::json!(source_codec)),
-        ("durationMs", serde_json::json!(duration_ms)),
-        ("mpqPath", serde_json::json!(mpq_path)),
-        ("normalizedSha256", serde_json::json!(normalized_sha256)),
-        ("normalizedBytes", serde_json::json!(normalized_bytes)),
-        ("wavIndex", serde_json::json!(wav_index)),
-        ("map", serde_json::json!(source_map)),
-        ("mapSha256Before", serde_json::json!(map_sha256_before)),
-        ("mapSha256After", serde_json::json!(map_sha256_after)),
-        ("mapSizeDelta", serde_json::json!(map_size_delta)),
+    let previous_mpq_path = edit
+        .as_ref()
+        .map(|change| serde_json::json!(change.previous_mpq_path))
+        .unwrap_or(serde_json::Value::Null);
+    let mut values = vec![
+        (
+            "source",
+            serde_json::Value::Null,
+            serde_json::json!(source_display_name),
+        ),
+        (
+            "sourceCodec",
+            serde_json::Value::Null,
+            serde_json::json!(source_codec),
+        ),
+        (
+            "durationMs",
+            serde_json::Value::Null,
+            serde_json::json!(duration_ms),
+        ),
+        ("mpqPath", previous_mpq_path, serde_json::json!(mpq_path)),
+        (
+            "normalizedSha256",
+            serde_json::Value::Null,
+            serde_json::json!(normalized_sha256),
+        ),
+        (
+            "normalizedBytes",
+            serde_json::Value::Null,
+            serde_json::json!(normalized_bytes),
+        ),
+        (
+            "wavIndex",
+            serde_json::Value::Null,
+            serde_json::json!(wav_index),
+        ),
+        (
+            "map",
+            serde_json::Value::Null,
+            serde_json::json!(source_map),
+        ),
+        (
+            "mapSha256Before",
+            serde_json::Value::Null,
+            serde_json::json!(map_sha256_before),
+        ),
+        (
+            "mapSha256After",
+            serde_json::Value::Null,
+            serde_json::json!(map_sha256_after),
+        ),
+        (
+            "mapSizeDelta",
+            serde_json::Value::Null,
+            serde_json::json!(map_size_delta),
+        ),
         (
             "rightsNotice",
+            serde_json::Value::Null,
             serde_json::json!("이 오디오를 맵에 배포할 권한은 사용자에게 있어야 합니다."),
         ),
     ];
+    if let Some(change) = edit {
+        values.extend([
+            (
+                "volumePercent",
+                serde_json::json!(change.before.volume_percent),
+                serde_json::json!(change.after.volume_percent),
+            ),
+            (
+                "fadeInMs",
+                serde_json::json!(change.before.fade_in_ms),
+                serde_json::json!(change.after.fade_in_ms),
+            ),
+            (
+                "fadeOutMs",
+                serde_json::json!(change.before.fade_out_ms),
+                serde_json::json!(change.after.fade_out_ms),
+            ),
+        ]);
+    }
     Ok(values
         .into_iter()
-        .map(|(property, new)| PropertyChange {
+        .map(|(property, old, new)| PropertyChange {
             property: property.to_string(),
-            old: serde_json::Value::Null,
+            old,
             new,
             id: entry.id.clone(),
             seq: entry.seq,
@@ -1817,6 +1899,7 @@ mod tests {
                 map_bytes_before: 10_000,
                 map_bytes_after: 3_028_301,
                 source_display_name: "battle-theme.flac".to_string(),
+                edit: None,
             },
             ts: 1,
         };
@@ -1835,6 +1918,46 @@ mod tests {
             property.property == "mapSizeDelta" && property.new == json!(3_018_301_i64)
         }));
 
+        let mut replacement = entry.clone();
+        if let JournalTarget::MapSound { mpq_path, .. } = &mut replacement.target {
+            *mpq_path = "staredit\\wav\\ea_aaaaaaaaaaaaaaaa.ogg".to_string();
+        }
+        if let Snapshot::MapSound { edit, .. } = &mut replacement.after {
+            *edit = Some(MapSoundEditChange {
+                previous_mpq_path: "staredit\\wav\\ea_3333333333333333.ogg".to_string(),
+                before: MapSoundEffects {
+                    volume_percent: 100,
+                    fade_in_ms: 0,
+                    fade_out_ms: 0,
+                },
+                after: MapSoundEffects {
+                    volume_percent: 50,
+                    fade_in_ms: 1_000,
+                    fade_out_ms: 2_000,
+                },
+            });
+        }
+        let replacement_changeset = changeset_from_journal(&Journal {
+            request_id: "req-sound-edit".to_string(),
+            entries: vec![replacement],
+        })
+        .unwrap();
+        assert!(replacement_changeset.items[0]
+            .properties
+            .iter()
+            .any(|property| {
+                property.property == "mpqPath"
+                    && property.old == json!("staredit\\wav\\ea_3333333333333333.ogg")
+                    && property.new == json!("staredit\\wav\\ea_aaaaaaaaaaaaaaaa.ogg")
+            }));
+        assert!(replacement_changeset.items[0]
+            .properties
+            .iter()
+            .any(|property| {
+                property.property == "volumePercent"
+                    && property.old == json!(100)
+                    && property.new == json!(50)
+            }));
         let bridge = FakeBridge::default();
         apply_inverse(&entry, &bridge).unwrap();
         assert_eq!(

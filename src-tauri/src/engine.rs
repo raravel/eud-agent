@@ -194,11 +194,15 @@ const RESOURCE_MENTION_GUIDE: &str = r#"[resource mentions]
 const AUDIO_SOUND_GUIDE: &str = r#"[map sounds]
 - [audio attachments] contains only request-local audio-N metadata. Never ask for or infer attachment UUIDs, local paths, source checksums, converter paths, normalized temp paths, map paths, MPQ destinations, codec profiles, overwrite modes, or WAV slots.
 - Import a requested attachment only with map_sound_import({audioRef}). Use exactly the returned mpqPath in an escaped epScript string literal: PlayWAV("staredit\\wav\\ea_<hex>.ogg") for current-player playback, or PlayWAVAll("staredit\\wav\\ea_<hex>.ogg") for all players and observers. For later code-only changes, read registered paths with map_sound_list; never reuse an audio-N from an older request.
+- To resolve "current BGM", inspect exact managed MPQ paths referenced by the current EPS playback/loop code and intersect them with map_sound_list. Edit the unique referenced BGM automatically; if several remain plausible, ask the user to choose. Never guess by recency.
+- map_sound_list reports sourceAvailable and the persisted volumePercent/fadeInMs/fadeOutMs. "Lower by X%" means current volumePercent * (100-X) / 100; "set to X%" means X% of the immutable project source. Round only to the integer tool field and preserve unspecified settings.
+- map_sound_edit({mpqPath,volumePercent?,fadeInMs?,fadeOutMs?,audioRef?}) re-renders from the immutable project source, never from the already encoded OGG. It atomically replaces the SCX MPQ/game-string/WAV registration and returns oldMpqPath plus the new mpqPath.
+- After map_sound_edit, migrate every exact oldMpqPath EPS string to the returned mpqPath; leave no old code reference. If sourceAvailable is false, ask the user to reattach the exact original once, then pass that request-local audioRef. The tool refuses a non-matching source.
 - Current-player playback uses PlayWAV. Playback for all players and observers uses PlayWAVAll, called once outside any human-player loop. Never multiply PlayWAVAll across clients.
 - Put playback in the existing file that owns the triggering event and mutable lifecycle state. Keep the configured MainFile as composition root and keep imports acyclic.
-- Looping BGM uses the normalized durationMs returned by map_sound_import plus the existing lifecycle/timer cadence and a bounded guard margin. Never call early enough to overlap. Disclose that default StarCraft music may overlap.
-- Do not claim or implement stop, pause/resume, seek, fade, crossfade, gapless playback, or independent concurrent BGM control.
-- Preflight every modified/created EPS file in one eps_check batch after sound import, then run the complete-project build_run. A map sound mutation without both checks is incomplete."#;
+- Looping BGM uses the durationMs returned by the latest import/edit plus the existing lifecycle/timer cadence and a bounded guard margin. Never call early enough to overlap. Disclose that default StarCraft music may overlap.
+- Volume and fade are offline file edits. Do not claim runtime stop, pause/resume, seek, volume automation, crossfade, gapless playback, or independent concurrent BGM control.
+- Preflight every modified/created EPS file in one eps_check batch after any sound import/edit, then run the complete-project build_run. A map sound mutation without both checks is incomplete."#;
 
 const EVIDENCE_GUIDE: &str = r#"[evidence]
 - EVERY unit of work (eps code, dat edits, map location/player/switch writes, settings) must be grounded in the docs: call search_docs (Korean query) BEFORE writing, inspect promising exact chunks with docs_get, and justify each item with WHY plus its source as a markdown link — `... (근거: [제목](url))`.
@@ -7465,6 +7469,7 @@ mod tests {
                         map_bytes_before: 10,
                         map_bytes_after: 1_034,
                         source_display_name: "theme.flac".to_string(),
+                        edit: None,
                     },
                     ts: 1,
                 },
@@ -7537,11 +7542,15 @@ mod tests {
             "map_sound_import({audioRef})",
             "PlayWAVAll",
             "once outside any human-player loop",
-            "normalized durationMs",
+            "durationMs returned by the latest import/edit",
             "one eps_check batch",
             "complete-project build_run",
             "map_sound_list",
             "Never ask for or infer attachment UUIDs",
+            "map_sound_edit({mpqPath",
+            "sourceAvailable",
+            "migrate every exact oldMpqPath",
+            "immutable project source",
         ] {
             assert!(cold.contains(required));
         }

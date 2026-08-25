@@ -1,6 +1,6 @@
 # Audio Attachments → SCMDraft Sound Import — Authoritative Implementation Plan
 
-Status: planned. This document is the single implementation authority until the feature is accepted and folded into `architecture.md`, `rules.md`, `tech-stack.md`, and `verify.md`.
+Status: implemented and extended. This document is the authoritative sound import/edit contract.
 
 ## 1. 목표
 
@@ -35,11 +35,11 @@ Status: planned. This document is the single implementation authority until the 
 2. **입력 포맷과 맵 저장 포맷을 분리한다.** 입력은 FFmpeg가 안전하게 인식하는 일반 오디오이고 맵 내부 출력은 OGG Vorbis 하나다.
 3. **StarCraft: Remastered만 지원한다.** OGG를 재생하지 못하는 1.16.1용 WAV fallback은 포함하지 않는다.
 4. **배경음악과 효과음은 같은 사운드 등록 경로를 사용한다.** 차이는 생성되는 epScript 조건, 플레이어 범위, 반복 정책뿐이다.
-5. **첫 구현의 재생 권한은 `PlayWAV`/`PlayWAVAll`이다.** 즉시 정지, 일시정지, 이어 재생, 페이드, 독립 다중 BGM은 제외한다.
+5. **재생 권한은 `PlayWAV`/`PlayWAVAll`이다.** 볼륨과 페이드는 원본에서 새 OGG를 만드는 offline edit이며, 즉시 정지, 일시정지, 이어 재생, runtime volume automation, 독립 다중 BGM은 제외한다.
 6. **원본 첨부 이름은 MPQ 경로에 사용하지 않는다.** 출력 SHA-256에서 만든 ASCII 이름만 사용한다.
 7. **모델은 첨부 ID, 로컬 경로, FFmpeg 경로, 임의 MPQ 목적지를 제공하지 않는다.** 요청 전용 `audio-N`만 도구 입력으로 사용한다.
 8. **정규화는 프로젝트 변경 잠금 밖에서 수행한다.** 공유 프로젝트 임계구역에는 검증된 OGG를 SCX에 반영하고 검증하는 시간만 포함한다.
-9. **승인된 SCX가 오디오 원본 권위다.** 등록 후 세션 첨부나 외부 원본 파일이 삭제되어도 빌드와 SCMDraft 표시가 유지되어야 한다.
+9. **승인된 SCX는 재생 bytes의 권위이고 프로젝트별 immutable source store는 재편집 원본의 권위다.** 세션 첨부나 외부 파일이 삭제되어도 빌드·표시·후속 볼륨/페이드 편집이 유지되어야 한다.
 10. **SCMDraft 또는 다른 프로그램이 원본 맵을 열어 두면 Apply하지 않는다.** 저장·닫기 후 재시도한다.
 11. **기존 `ProjectWriteCoordinator`, journal, full backup, no-share lock, atomic replace, rollback을 우회하지 않는다.**
 12. **별도 범용 asset framework를 만들지 않는다.** 이번 범위는 오디오 첨부, 정규화, SCX 사운드 등록에 한정한다.
@@ -142,6 +142,11 @@ before assets + exactly one requested OGG asset == after assets
 - 코드와 맵의 한 write lease, build, changeset, rollback
 - SCMDraft 재열기 후 Sound Editor 표시 검증
 - 인게임 현재 플레이어/전체 플레이어/반복 재생 검증
+- 프로젝트별 immutable 오디오 원본 보관
+- 원본 기준 정수 `volumePercent`와 millisecond fade-in/fade-out
+- 관리형 사운드의 MPQ asset + game string + `WAV ` 원자 교체
+- 기존 EPS 경로의 새 content-addressed MPQ 경로 전체 migration
+- 과거 등록분의 exact 원본 1회 재첨부 및 normalized hash 일치 검증
 
 ### 4.2 제외
 
@@ -153,12 +158,12 @@ before assets + exactly one requested OGG asset == after assets
 - DRM 해제
 - 네트워크 URL, playlist, 외부 segment 참조
 - 동영상 파일에서 오디오 추출을 제품 기능으로 노출
-- 음량 정규화, 노이즈 제거, 무음 자르기
+- 자동 loudness 정규화, 노이즈 제거, 무음 자르기
 - waveform 편집기와 panel 오디오 플레이어
-- 즉시 stop, pause/resume, seek, crossfade, fade-in/out
+- runtime 즉시 stop, pause/resume, seek, volume automation, crossfade, gapless playback
 - 여러 BGM의 독립 동시 제어
 - EUD Editor의 `BGMData`/분할형 `BGMPlayer` 자동 등록
-- 기존 사운드 삭제·교체·이름 변경
+- eud-agent가 관리하지 않는 기존 사운드의 삭제·교체·이름 변경
 - 맵에 등록된 사운드 추출
 - Map Agent의 공간 target/protect 권한에 사운드를 억지로 포함
 
@@ -216,7 +221,7 @@ backend는 요청에 포함된 오디오를 순서대로 `audio-N`에 바인딩�
 - 한 번 또는 반복
 - 기존 책임 파일과 lifecycle 함수
 
-사운드 등록 자체는 `map_sound_import` 도구로만 수행한다.
+사운드 등록과 교체는 각각 `map_sound_import`, `map_sound_edit` 도구로만 수행한다.
 
 ### 5.3 SCMDraft 잠금
 
@@ -1188,10 +1193,66 @@ FFmpeg fixture tests는 exact pinned build에서 실행한다. codec encoder의 
 
 - 오디오 입력 포맷은 저장 포맷이 아니다. 맵 sound asset은 canonical OGG Vorbis만 허용한다.
 - 사용자 파일명을 MPQ sound path로 사용하지 않는다.
-- model-visible sound tool은 opaque request-local ref만 받는다.
-- sound import는 MPQ + game string + WAV slot의 검증된 원자 변경이다.
+- model-visible sound import는 opaque request-local ref만 받고, edit는 목록에서 읽은 exact managed MPQ path와 bounded effect 값만 받는다.
+- sound import/replace는 MPQ + game string + WAV slot의 검증된 원자 변경이다.
 - 512 WAV slot을 넘기지 않는다.
 - requested sound 외 MPQ asset delta를 허용하지 않는다.
 - SCMDraft lock과 EUD Editor compiling 중에는 map sound를 쓰지 않는다.
-- accepted SCX가 sound bytes의 durable authority다.
+- accepted SCX가 재생 bytes의 durable authority이고 프로젝트별 immutable source store가 재편집 원본의 authority다.
 - runtime-affecting sound change는 사용자 인게임 확인 전 harness를 완료하지 않는다.
+
+## 19. 볼륨/페이드 교체 확장
+
+### 19.1 프로젝트 원본
+
+첫 import는 첨부 bytes를 `%localappdata%\eud-agent\audio_sources\<project-id>\blobs\`
+아래 SHA-256 content-addressed blob으로 복사한다. 원본은 수정하거나 재인코딩하지 않는다.
+각 managed MPQ path는 `sounds\<sha256(path)>.json` 기록으로 원본 hash, probe metadata,
+현재 `volumePercent`, `fadeInMs`, `fadeOutMs`에 연결된다. 이전 path 기록은 rollback과
+과거 상태 재사용을 위해 유지하지만 현재 맵 목록에 없는 기록은 대상으로 노출하지 않는다.
+
+기능 추가 전 등록된 사운드는 최초 편집 때 exact 원본을 다시 첨부한다. 기본 canonical
+변환 SHA-256이 현재 SCX asset SHA-256과 일치할 때만 프로젝트 원본으로 채택한다.
+
+### 19.2 도구 계약
+
+`map_sound_list`는 각 WAV slot에 `assetSha256`, `sourceAvailable`, `sourceName`,
+`originalDurationMs`, `volumePercent`, `fadeInMs`, `fadeOutMs`를 추가한다.
+
+`map_sound_edit` 입력은 exact managed `mpqPath`와 하나 이상의 다음 patch다.
+
+```json
+{
+  "mpqPath": "staredit\\wav\\ea_<hex>.ogg",
+  "volumePercent": 50,
+  "fadeInMs": 1000,
+  "fadeOutMs": 2000,
+  "audioRef": "audio-1"
+}
+```
+
+`volumePercent`는 원본 진폭 기준 0~400의 정수다. 생략한 값은 현재 편집 상태를 유지하고,
+0ms fade는 기존 fade 제거를 뜻한다. fade 합계는 원본 길이를 넘지 않는다. “X% 낮춰”는
+현재 값에 `(100-X)/100`을 곱하고, “X%로”는 원본 기준 X로 해석한다.
+
+### 19.3 변환과 원자 교체
+
+FFmpeg filter는 shell 없이 `volume`, `afade in`, `afade out` 순서로 구성한다. 결과는
+기존 canonical OGG profile로 다시 probe/hash 검증한다. `isom_map_sound_replace`는 기존
+managed MPQ asset을 제거하고 새 content-addressed asset을 추가하면서 같은 game string id와
+WAV slot을 보존한다. 저장·재열기 후 old MPQ/string 부재, new OGG exact hash, WAV/string id,
+unrelated CHK/MPQ digest를 검증한 뒤에만 atomic replace한다.
+
+도구 결과의 `oldMpqPath`를 참조하는 모든 EPS 문자열은 반환된 `mpqPath`로 clean cutover한다.
+그 뒤 한 `eps_check` batch와 complete-project `build_run`을 수행한다. 거부 또는 journal 실패는
+full-map backup으로 exact rollback한다.
+
+### 19.4 검증
+
+- `cargo test -p isom --test sound_native real_scx_replaces_managed_sound_without_leaving_the_old_registration`
+- `cargo test -p eud-agent audio::tests:: --lib`
+- `cargo test -p eud-agent map_sound --lib`
+- `cargo test -p eud-agent map_sound_import_is_one_lease_journal_and_exact_reject_transaction --lib -- --ignored --nocapture`
+
+마지막 통합 테스트는 실제 managed FFmpeg/FFprobe로 import, volume/fade render, old 등록 삭제,
+새 MPQ/WAV 등록, changeset effect delta, reverse-order exact reject를 한 흐름에서 검증한다.

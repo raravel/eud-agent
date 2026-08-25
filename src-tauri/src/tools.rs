@@ -44,6 +44,8 @@ pub const SWITCH_WRITE_TOOL: &str = "switch_write";
 pub const MAP_SOUND_LIST_TOOL: &str = "map_sound_list";
 /// Request-local canonical audio import into the connected source SCX.
 pub const MAP_SOUND_IMPORT_TOOL: &str = "map_sound_import";
+/// Re-render one project-managed sound from its immutable source and replace it in the SCX.
+pub const MAP_SOUND_EDIT_TOOL: &str = "map_sound_edit";
 
 const MAP_PALETTE_CATALOG_KINDS: [&str; 6] = [
     "brushes",
@@ -633,6 +635,21 @@ pub fn tool_registry() -> Vec<ToolSpec> {
             "Import one request-local audioRef as canonical OGG into the connected saved SCX.",
             true,
             schema(json!({"audioRef": string_schema()}), &["audioRef"]),
+        ),
+        tool_spec(
+            MAP_SOUND_EDIT_TOOL,
+            "Apply persistent volume/fade settings to one managed sound, replace its SCX registration, and return the new exact MPQ path.",
+            true,
+            schema(
+                json!({
+                    "mpqPath": string_schema(),
+                    "audioRef": string_schema(),
+                    "volumePercent": {"type": "integer", "minimum": 0, "maximum": 400},
+                    "fadeInMs": {"type": "integer", "minimum": 0, "maximum": 3_600_000},
+                    "fadeOutMs": {"type": "integer", "minimum": 0, "maximum": 3_600_000},
+                }),
+                &["mpqPath"],
+            ),
         ),
         tool_spec(
             "dat_set",
@@ -5455,6 +5472,20 @@ mod tests {
                 ),
             ),
             (
+                MAP_SOUND_EDIT_TOOL,
+                true,
+                schema(
+                    serde_json::json!({
+                        "mpqPath": string_schema(),
+                        "audioRef": string_schema(),
+                        "volumePercent": {"type": "integer", "minimum": 0, "maximum": 400},
+                        "fadeInMs": {"type": "integer", "minimum": 0, "maximum": 3_600_000},
+                        "fadeOutMs": {"type": "integer", "minimum": 0, "maximum": 3_600_000},
+                    }),
+                    &["mpqPath"],
+                ),
+            ),
+            (
                 "propose_plan",
                 false,
                 schema(
@@ -6869,7 +6900,7 @@ mod tests {
         );
     }
     #[test]
-    fn sound_tools_are_main_eps_only_and_import_accepts_only_audio_ref() {
+    fn sound_tools_are_main_eps_only_and_expose_bounded_offline_edits() {
         let registry = tool_registry();
         let list = registry
             .iter()
@@ -6894,8 +6925,24 @@ mod tests {
             vec!["audioRef".to_string()]
         );
         assert_eq!(import.input_schema["additionalProperties"], json!(false));
-        assert!(map_tool_registry()
+        let edit = registry
             .iter()
-            .all(|spec| !matches!(spec.name, MAP_SOUND_LIST_TOOL | MAP_SOUND_IMPORT_TOOL)));
+            .find(|spec| spec.name == MAP_SOUND_EDIT_TOOL)
+            .expect("main EPS registry must expose map_sound_edit");
+        assert!(edit.mutating);
+        assert_eq!(edit.input_schema["required"], json!(["mpqPath"]));
+        assert_eq!(
+            edit.input_schema["properties"]["volumePercent"]["maximum"],
+            json!(400)
+        );
+        assert_eq!(
+            edit.input_schema["properties"]["fadeInMs"]["maximum"],
+            json!(3_600_000)
+        );
+        assert_eq!(edit.input_schema["additionalProperties"], json!(false));
+        assert!(map_tool_registry().iter().all(|spec| !matches!(
+            spec.name,
+            MAP_SOUND_LIST_TOOL | MAP_SOUND_IMPORT_TOOL | MAP_SOUND_EDIT_TOOL
+        )));
     }
 }

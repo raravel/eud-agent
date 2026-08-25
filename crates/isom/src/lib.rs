@@ -487,6 +487,107 @@ pub fn map_sound_add(
     Ok(parsed)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MapSoundReplaceReport {
+    pub schema: String,
+    pub ok: bool,
+    pub sound_index: u64,
+    pub sound_string_id: u64,
+    pub old_mpq_path: String,
+    pub mpq_path: String,
+    pub asset_sha256: String,
+    pub asset_bytes: u64,
+    pub input_sha256: String,
+    pub output_sha256: String,
+    pub unrelated_chk_digest_before: String,
+    pub unrelated_chk_digest_after: String,
+    pub unrelated_asset_digest_before: String,
+    pub unrelated_asset_digest_after: String,
+}
+
+pub fn map_sound_replace(
+    input_map_path: &Path,
+    output_map_path: &Path,
+    expected_input_sha256: &str,
+    old_mpq_path: &str,
+    destination_mpq_path: &str,
+    ogg_bytes: &[u8],
+) -> Result<MapSoundReplaceReport, NativeCallError> {
+    const MAX_OGG_BYTES: usize = 64 * 1024 * 1024;
+    if !exact_lower_hex(expected_input_sha256, 64)
+        || !valid_managed_sound_path(old_mpq_path)
+        || !valid_managed_sound_path(destination_mpq_path)
+        || old_mpq_path == destination_mpq_path
+        || ogg_bytes.len() < 4
+        || ogg_bytes.len() > MAX_OGG_BYTES
+        || !ogg_bytes.starts_with(b"OggS")
+        || input_map_path == output_map_path
+    {
+        return Err(NativeCallError::new(IsomError::InvalidArg, None));
+    }
+    let _native_call = native_call_guard();
+    let input = path_cstring(input_map_path).map_err(|error| NativeCallError::new(error, None))?;
+    let output =
+        path_cstring(output_map_path).map_err(|error| NativeCallError::new(error, None))?;
+    let expected = CString::new(expected_input_sha256)
+        .map_err(|_| NativeCallError::new(IsomError::InvalidArg, None))?;
+    let old = CString::new(old_mpq_path)
+        .map_err(|_| NativeCallError::new(IsomError::InvalidArg, None))?;
+    let destination = CString::new(destination_mpq_path)
+        .map_err(|_| NativeCallError::new(IsomError::InvalidArg, None))?;
+    let mut report: *mut u8 = std::ptr::null_mut();
+    let mut report_len = 0_usize;
+    // SAFETY: all input buffers outlive this synchronous call. The report is
+    // allocated by the C ABI and released by `CBuf` on every path.
+    let code = unsafe {
+        isom_sys::isom_map_sound_replace(
+            input.as_ptr(),
+            output.as_ptr(),
+            expected.as_ptr(),
+            old.as_ptr(),
+            destination.as_ptr(),
+            ogg_bytes.as_ptr(),
+            ogg_bytes.len(),
+            &mut report,
+            &mut report_len,
+        )
+    };
+    let report = CBuf(report);
+    let bytes = buffer_bytes(&report, report_len);
+    if let Err(error) = status(code) {
+        return Err(NativeCallError::new(error, native_detail(&bytes)));
+    }
+    let parsed: MapSoundReplaceReport = serde_json::from_slice(&bytes).map_err(|error| {
+        NativeCallError::new(
+            IsomError::Engine,
+            Some(format!("invalid sound-replace report: {error}")),
+        )
+    })?;
+    let asset_sha256 = format!("{:x}", Sha256::digest(ogg_bytes));
+    let valid = parsed.schema == "eud-map-sound-replace-report/1"
+        && parsed.ok
+        && parsed.sound_index < 512
+        && parsed.sound_string_id > 0
+        && parsed.old_mpq_path == old_mpq_path
+        && parsed.mpq_path == destination_mpq_path
+        && parsed.asset_sha256 == asset_sha256
+        && parsed.asset_bytes == ogg_bytes.len() as u64
+        && parsed.input_sha256 == expected_input_sha256
+        && exact_lower_hex(&parsed.output_sha256, 64)
+        && exact_lower_hex(&parsed.unrelated_chk_digest_before, 64)
+        && parsed.unrelated_chk_digest_before == parsed.unrelated_chk_digest_after
+        && exact_lower_hex(&parsed.unrelated_asset_digest_before, 64)
+        && parsed.unrelated_asset_digest_before == parsed.unrelated_asset_digest_after;
+    if !valid {
+        return Err(NativeCallError::new(
+            IsomError::Engine,
+            Some("sound-replace report invariant mismatch".to_string()),
+        ));
+    }
+    Ok(parsed)
+}
+
 fn exact_lower_hex(value: &str, length: usize) -> bool {
     value.len() == length
         && value

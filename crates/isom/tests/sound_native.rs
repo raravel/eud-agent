@@ -274,6 +274,52 @@ fn real_scx_adds_exact_mpq_string_wav_and_reuses_without_duplication() {
 }
 
 #[test]
+fn real_scx_replaces_managed_sound_without_leaving_the_old_registration() {
+    let input = fixture();
+    let old_hash = format!("{:x}", Sha256::digest(OGG));
+    let old_path = format!("staredit\\wav\\ea_{}.ogg", &old_hash[..16]);
+    let added = temp_map("replace-base");
+    let added_report =
+        isom::map_sound_add(&input, &added, &file_hash(&input), &old_path, OGG).unwrap();
+    let added_before = fs::read(&added).unwrap();
+
+    let mut edited_ogg = OGG.to_vec();
+    *edited_ogg.last_mut().unwrap() ^= 1;
+    let edited_hash = format!("{:x}", Sha256::digest(&edited_ogg));
+    let edited_path = format!("staredit\\wav\\ea_{}.ogg", &edited_hash[..16]);
+    let replaced = temp_map("replace-output");
+    let report = isom::map_sound_replace(
+        &added,
+        &replaced,
+        &file_hash(&added),
+        &old_path,
+        &edited_path,
+        &edited_ogg,
+    )
+    .unwrap();
+
+    assert_eq!(report.sound_index, added_report.sound_index);
+    assert_eq!(report.sound_string_id, added_report.sound_string_id);
+    assert_eq!(report.old_mpq_path, old_path);
+    assert_eq!(report.mpq_path, edited_path);
+    assert_eq!(report.asset_sha256, edited_hash);
+    assert_eq!(fs::read(&added).unwrap(), added_before);
+    let assets = extra_assets(&replaced);
+    assert!(!assets.contains_key(&old_path));
+    assert_eq!(assets.get(&edited_path), Some(&edited_hash));
+    assert_eq!(
+        sound_path_and_slot(&replaced, &edited_path),
+        (
+            added_report.sound_string_id as usize,
+            added_report.sound_index as usize,
+        )
+    );
+
+    fs::remove_file(added).ok();
+    fs::remove_file(replaced).ok();
+}
+
+#[test]
 fn sound_conflicts_and_invalid_inputs_leave_real_scx_unchanged() {
     let input = fixture();
     let before = fs::read(&input).unwrap();

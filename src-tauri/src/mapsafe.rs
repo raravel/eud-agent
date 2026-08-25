@@ -136,9 +136,28 @@ pub trait SoundMapEngine {
         ogg_bytes: &[u8],
     ) -> Result<isom::MapSoundAddReport, String>;
 
+    fn replace_sound(
+        &self,
+        input: &Path,
+        output: &Path,
+        expected_input_sha256: &str,
+        old_mpq_path: &str,
+        destination_mpq_path: &str,
+        ogg_bytes: &[u8],
+    ) -> Result<isom::MapSoundReplaceReport, String>;
+
     fn verify_sound(
         &self,
         map: &Path,
+        destination_mpq_path: &str,
+        normalized_sha256: &str,
+        sound_index: u64,
+        sound_string_id: u64,
+    ) -> Result<(), String>;
+    fn verify_sound_replacement(
+        &self,
+        map: &Path,
+        old_mpq_path: &str,
         destination_mpq_path: &str,
         normalized_sha256: &str,
         sound_index: u64,
@@ -187,6 +206,26 @@ impl SoundMapEngine for IsomEngine {
         .map_err(|error| error.to_string())
     }
 
+    fn replace_sound(
+        &self,
+        input: &Path,
+        output: &Path,
+        expected_input_sha256: &str,
+        old_mpq_path: &str,
+        destination_mpq_path: &str,
+        ogg_bytes: &[u8],
+    ) -> Result<isom::MapSoundReplaceReport, String> {
+        isom::map_sound_replace(
+            input,
+            output,
+            expected_input_sha256,
+            old_mpq_path,
+            destination_mpq_path,
+            ogg_bytes,
+        )
+        .map_err(|error| error.to_string())
+    }
+
     fn verify_sound(
         &self,
         map: &Path,
@@ -229,6 +268,44 @@ impl SoundMapEngine for IsomEngine {
         }
         Ok(())
     }
+
+    fn verify_sound_replacement(
+        &self,
+        map: &Path,
+        old_mpq_path: &str,
+        destination_mpq_path: &str,
+        normalized_sha256: &str,
+        sound_index: u64,
+        sound_string_id: u64,
+    ) -> Result<(), String> {
+        self.verify_sound(
+            map,
+            destination_mpq_path,
+            normalized_sha256,
+            sound_index,
+            sound_string_id,
+        )?;
+        let container: serde_json::Value =
+            serde_json::from_str(&isom::map_digest(map).map_err(|error| error.to_string())?)
+                .map_err(|error| format!("invalid map digest JSON: {error}"))?;
+        let assets = container["extraAssets"]["assets"]
+            .as_array()
+            .ok_or_else(|| "map digest has no MPQ asset inventory".to_string())?;
+        if assets
+            .iter()
+            .any(|asset| asset["path"].as_str() == Some(old_mpq_path))
+        {
+            return Err("saved map still contains the replaced MPQ asset".to_string());
+        }
+        let chk = isom::chk_extract(map).map_err(|error| error.to_string())?;
+        if crate::chk::parse_sounds(&chk)
+            .iter()
+            .any(|sound| sound.mpq_path == old_mpq_path)
+        {
+            return Err("saved map still contains the replaced sound registration".to_string());
+        }
+        Ok(())
+    }
 }
 
 /// A journal record for one map write (rail 6) — the rollback bookkeeping the
@@ -246,6 +323,15 @@ pub struct SoundJournalEntry {
     pub map_path: PathBuf,
     pub backup_path: PathBuf,
     pub report: isom::MapSoundAddReport,
+    pub map_bytes_before: u64,
+    pub map_bytes_after: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SoundReplaceJournalEntry {
+    pub map_path: PathBuf,
+    pub backup_path: PathBuf,
+    pub report: isom::MapSoundReplaceReport,
     pub map_bytes_before: u64,
     pub map_bytes_after: u64,
 }
@@ -607,6 +693,134 @@ where
             };
         }
         Ok(SoundJournalEntry {
+            map_path: map_path.to_path_buf(),
+            backup_path,
+            report,
+            map_bytes_before,
+            map_bytes_after,
+        })
+    }
+
+    pub fn replace_sound(
+        &self,
+        map_path: &Path,
+        expected_input_sha256: &str,
+        old_mpq_path: &str,
+        destination_mpq_path: &str,
+        ogg_bytes: &[u8],
+    ) -> Result<SoundReplaceJournalEntry, MapSafeError> {
+        if self.status.is_compiling() {
+            return Err(MapSafeError::Compiling);
+        }
+        if self.lock_probe.is_locked(map_path) {
+            return Err(MapSafeError::MapLocked(map_path.to_path_buf()));
+        }
+        let actual_input_sha256 = sha256_file(map_path)?;
+        if actual_input_sha256 != expected_input_sha256 {
+            return Err(MapSafeError::StaleSource {
+                expected: expected_input_sha256.to_string(),
+                actual: actual_input_sha256,
+            });
+        }
+        let map_bytes_before = std::fs::metadata(map_path)?.len();
+        ensure_sound_disk_space(map_path, map_bytes_before, ogg_bytes.len() as u64)?;
+        let backup_path = self.backup(map_path)?;
+        if sha256_file(&backup_path)? != expected_input_sha256 {
+            return Err(MapSafeError::Apply(
+                "full map backup hash does not match source".to_string(),
+            ));
+        }
+        let parent = map_path.parent().ok_or_else(|| {
+            MapSafeError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "map path has no parent",
+            ))
+        })?;
+        let stem = map_path
+            .file_stem()
+            .map(|stem| stem.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "map".to_string());
+        let extension = map_path
+            .extension()
+            .map(|extension| extension.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "scx".to_string());
+        let native_output = parent.join(format!(
+            ".{stem}.{}.audio-replace.{extension}",
+            backup_timestamp()
+        ));
+        let report = match self.engine.replace_sound(
+            map_path,
+            &native_output,
+            expected_input_sha256,
+            old_mpq_path,
+            destination_mpq_path,
+            ogg_bytes,
+        ) {
+            Ok(report) => report,
+            Err(error) => {
+                let _ = std::fs::remove_file(&native_output);
+                return Err(MapSafeError::Apply(error));
+            }
+        };
+        if report.input_sha256 != expected_input_sha256
+            || report.old_mpq_path != old_mpq_path
+            || report.mpq_path != destination_mpq_path
+            || sha256_file(&native_output)? != report.output_sha256
+        {
+            let _ = std::fs::remove_file(&native_output);
+            return Err(MapSafeError::Apply(
+                "native sound replacement report/output invariant mismatch".to_string(),
+            ));
+        }
+        if let Err(error) = atomic_replace_file(map_path, &native_output) {
+            let _ = std::fs::remove_file(&native_output);
+            return Err(MapSafeError::Io(error));
+        }
+        let map_bytes_after = std::fs::metadata(map_path)?.len();
+        let post_verify = (|| {
+            let actual = sha256_file(map_path).map_err(|error| error.to_string())?;
+            if actual != report.output_sha256 {
+                return Err("atomic replacement output hash changed".to_string());
+            }
+            self.engine.verify_sound_replacement(
+                map_path,
+                old_mpq_path,
+                destination_mpq_path,
+                &report.asset_sha256,
+                report.sound_index,
+                report.sound_string_id,
+            )
+        })();
+        if let Err(detail) = post_verify {
+            if self.lock_probe.is_locked(map_path) {
+                return Err(MapSafeError::Rollback {
+                    detail: format!("{detail}; rollback blocked by map lock"),
+                    backup: backup_path,
+                });
+            }
+            let restore = (|| {
+                let bytes = std::fs::read(&backup_path)?;
+                atomic_replace_bytes(map_path, &bytes)?;
+                let restored = sha256_file(map_path)?;
+                if restored != expected_input_sha256 {
+                    return Err(std::io::Error::other(
+                        "restored map hash does not match exact before state",
+                    ));
+                }
+                Ok::<(), std::io::Error>(())
+            })();
+            return match restore {
+                Ok(()) => Err(MapSafeError::PostVerifyRestored {
+                    detail,
+                    backup: backup_path,
+                }),
+                Err(restore_error) => Err(MapSafeError::Rollback {
+                    detail: format!("{detail}; rollback: {restore_error}"),
+                    backup: backup_path,
+                }),
+            };
+        }
+        Ok(SoundReplaceJournalEntry {
             map_path: map_path.to_path_buf(),
             backup_path,
             report,
@@ -1302,9 +1516,61 @@ mod tests {
             })
         }
 
+        fn replace_sound(
+            &self,
+            input: &Path,
+            output: &Path,
+            expected_input_sha256: &str,
+            old_mpq_path: &str,
+            destination_mpq_path: &str,
+            ogg_bytes: &[u8],
+        ) -> Result<isom::MapSoundReplaceReport, String> {
+            self.add_called.set(true);
+            self.backup_seen.set(
+                input
+                    .parent()
+                    .unwrap()
+                    .join("map_backups")
+                    .read_dir()
+                    .is_ok_and(|mut entries| entries.next().is_some()),
+            );
+            self.add_result.clone()?;
+            fs::write(output, &self.output_bytes).unwrap();
+            let digest = sha256_bytes(&self.output_bytes);
+            let stable = "a".repeat(64);
+            Ok(isom::MapSoundReplaceReport {
+                schema: "eud-map-sound-replace-report/1".to_string(),
+                ok: true,
+                sound_index: 7,
+                sound_string_id: 42,
+                old_mpq_path: old_mpq_path.to_string(),
+                mpq_path: destination_mpq_path.to_string(),
+                asset_sha256: sha256_bytes(ogg_bytes),
+                asset_bytes: ogg_bytes.len() as u64,
+                input_sha256: expected_input_sha256.to_string(),
+                output_sha256: digest,
+                unrelated_chk_digest_before: stable.clone(),
+                unrelated_chk_digest_after: stable.clone(),
+                unrelated_asset_digest_before: stable.clone(),
+                unrelated_asset_digest_after: stable,
+            })
+        }
+
         fn verify_sound(
             &self,
             _map: &Path,
+            _destination_mpq_path: &str,
+            _normalized_sha256: &str,
+            _sound_index: u64,
+            _sound_string_id: u64,
+        ) -> Result<(), String> {
+            self.verify_result.clone()
+        }
+
+        fn verify_sound_replacement(
+            &self,
+            _map: &Path,
+            _old_mpq_path: &str,
             _destination_mpq_path: &str,
             _normalized_sha256: &str,
             _sound_index: u64,
@@ -1863,6 +2129,42 @@ mod tests {
         assert_eq!(result.report.output_sha256, sha256_bytes(EDITED));
         assert_eq!(result.map_bytes_before, ORIGINAL.len() as u64);
         assert_eq!(result.map_bytes_after, EDITED.len() as u64);
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn sound_replace_runs_backup_atomic_replace_and_old_asset_post_verify() {
+        let base = unique_temp_dir("sound-replace-success");
+        let map = make_map(&base, ORIGINAL);
+        let expected = sha256_file(&map).unwrap();
+        let engine = FakeSoundEngine::ok(EDITED);
+        let service = MapSafe::new(
+            base.clone(),
+            FakeStatus(false),
+            SequenceLock::never(),
+            engine,
+        );
+        let result = service
+            .replace_sound(
+                &map,
+                &expected,
+                "staredit\\wav\\ea_0123456789abcdef.ogg",
+                "staredit\\wav\\ea_fedcba9876543210.ogg",
+                b"OggSedited",
+            )
+            .unwrap();
+        assert!(service.engine.add_called.get());
+        assert!(service.engine.backup_seen.get());
+        assert_eq!(fs::read(&map).unwrap(), EDITED);
+        assert_eq!(fs::read(&result.backup_path).unwrap(), ORIGINAL);
+        assert_eq!(
+            result.report.old_mpq_path,
+            "staredit\\wav\\ea_0123456789abcdef.ogg"
+        );
+        assert_eq!(
+            result.report.mpq_path,
+            "staredit\\wav\\ea_fedcba9876543210.ogg"
+        );
         fs::remove_dir_all(base).ok();
     }
 
