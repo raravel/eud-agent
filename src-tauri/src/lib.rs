@@ -19,6 +19,7 @@ pub mod codex_auth;
 pub mod codex_client;
 pub mod config;
 pub mod context_state;
+pub mod dat_project;
 pub mod edd_runner;
 pub mod engine;
 pub mod eps_preflight;
