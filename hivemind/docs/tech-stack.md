@@ -90,6 +90,8 @@ and remains separate from that local process boundary.
   memory, config, bootstrap, and CHK.
 - `crates/isom-sys`, `crates/isom` — FFI bindings + safe wrapper for the C++ engine.
 - `native/isom/` — vendored C++ + C ABI shim.
+- `native/trace_injector.rs` — dependency-free x86 helper compiled and embedded by `src-tauri/build.rs`;
+  validates the owned suspended SCR child and neutralizes only six fixed user32 focus/cursor exports.
 - `panel/` — React multi-entry app (`index.html`, `map-agent.html`, `map-import.html`) over Tauri
   IPC. Map Agent and the read-only importer inject candidate/import render sources into the same
   `MapCanvas`/`MapMinimap` implementations.

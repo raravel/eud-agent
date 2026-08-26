@@ -130,6 +130,21 @@ Codex and restore text, attachments, and mentions.
   paths, manifest ownership/containment, atomic overlays, mirror reuse/switching,
   stable skipped reasons, one-retry/reaping, non-journaling, budgets, and Lua Tick
   heartbeat/status/compiling invariants.
+- Isolated runtime trace behavior: `cargo test -p eud-agent trace_test --lib` covers strict tool
+  prerequisites/schema, logical `tests/**/*.tests.eps` discovery from CUIEps/RawText snapshots,
+  exact selected ordering and missing/outside/duplicate rejection, invalid/unreadable/empty
+  no-launch suite reporting, x86 injector architecture and bounded patch names, exact normal/Alt
+  background message sequences, EDS rewrite isolation, unique protocol generation, symbolized
+  pass/fail, overflow, and torn-record rejection.
+- Live 32-bit UDP persistent-suite smoke:
+  `EUD_TRACE_EDS=<generated EUDEditor.eds> EUD_TRACE_EUDDRAFT=<euddraft.exe>
+  EUD_TRACE_STARCRAFT=<StarCraft Launcher.exe> cargo test -p eud-agent
+  live_persistent_suite_build_launch_trace_and_cleanup --lib -- --ignored --nocapture` runs one
+  logical `tests/protocol.tests.eps` case through the suite layer, builds the temporary plugin/map,
+  creates the child suspended, validates the bounded x86 isolation helper, resumes only after the
+  six user32 patches succeed, and creates/starts the minimized LAN/UDP room through HWND-targeted
+  messages. It captures passing events, writes case/suite logs, removes the staged map/process, and
+  requires the source map hash to remain unchanged.
 - Project workspace: `cargo test -p eud-agent workspace:: --lib` covers stable identity,
   durable document directories, coherent `source/` refresh, path confinement, `.codegraph`
   exclusion, UTF-8/size limits, exact approved-plan persistence, isolated document workspaces,

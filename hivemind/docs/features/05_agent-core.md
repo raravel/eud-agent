@@ -141,8 +141,9 @@ Flow tools: `ask(questions)`, `propose_plan(markdown)` for explicit user plan re
 Write tools: `dat_set`, `xdat_set`, `tbl_set`, `req_set`, `btn_set`, `dat_reset`, `file_create`,
 `file_write`, `file_edit`, `file_rename`, `file_delete`, `file_move`, `mkdir`, `set_main`,
 `settings_set`, `plugin_add`, `plugin_edit`, `plugin_remove`, `plugin_move`, `build_run`,
-`location_write`, `player_setup`, and `switch_write`. Project memory is synchronized only by the
-post-acceptance harness; `memory_write` is not exposed to foreground Codex.
+`location_write`, `player_setup`, and `switch_write`. `trace_test_run` is the non-mutating,
+post-build runtime diagnostic. Project memory is synchronized only by the post-acceptance harness;
+`memory_write` is not exposed to foreground Codex.
 
 
 `ask` accepts one to four related questions. Each question has a stable id, optional header,
@@ -177,6 +178,26 @@ new cycles. Local fixes do not trigger unrelated moves or splits, and 800 nonbla
 cohesion review signal. Structural role/dependency changes replace memory `structure` completely;
 mutually dependent candidates use one `eps_check` batch and every applied epScript changeset still
 requires `build_run`.
+
+After a successful `build_run`, runtime-affecting epScript changes may use two non-mutating
+diagnostic tools before review. `trace_test_run` keeps the existing request-owned ad-hoc
+`eudAgentTestSetup`/`eudAgentTestStep` module. `trace_suite_run` snapshots the editor project once,
+projects extensionless CUIEps paths to logical `.eps` names, and discovers exactly
+`tests/**/*.tests.eps`; omit `tests` for the complete suite or pass a non-empty exact path list for
+a selected run. Each permanent file owns one scenario and remains outside the configured
+MainFile's production import graph.
+
+Each selected case clones the generated EDS/source map and adds the fixed 256-record trace ring.
+The runner creates one owned 32-bit StarCraft child suspended, then invokes a bundled x86 helper
+that validates the target image and neutralizes exactly six foreground/focus/cursor user32 exports
+inside that process. Only after successful isolation does the child resume off-screen and
+minimized. HWND-targeted `PostMessageW` calls drive LAN/UDP `CreateGame`, map selection, room
+creation, and `Alt+O`; the runner then decodes fixed-dword records. No arbitrary target, address,
+payload, game function, global input, mouse movement, or focus fallback is exposed.
+Ad-hoc runs additionally apply their optional event/source symbols. Per-case build/trace logs and
+a compact `suite.json` persist under LocalAppData; the staged map and process are removed and the
+source hash is checked. Pass, assertion failure, invalid or unreadable test source, timeout, crash,
+overflow, protocol loss, and an empty suite are diagnostic only and never block the normal changeset review.
 
 Evidence, first-principles, action-count, search, and three-build-attempt rails remain request
 scoped. The non-search action hard ceiling is 300 calls; each batched getter envelope consumes one

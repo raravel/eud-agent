@@ -43,10 +43,10 @@ pub struct BuildRunResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct CapturedProcess {
-    success: bool,
-    stdout: String,
-    stderr: String,
+pub(crate) struct CapturedProcess {
+    pub(crate) success: bool,
+    pub(crate) stdout: String,
+    pub(crate) stderr: String,
 }
 
 trait BuildHost {
@@ -221,7 +221,7 @@ fn is_fresh_output(before: Option<SystemTime>, after: Option<SystemTime>) -> boo
     }
 }
 
-fn run_euddraft_process(
+pub(crate) fn run_euddraft_process(
     executable: &Path,
     eds_path: &Path,
     timeout: Duration,
@@ -325,7 +325,7 @@ fn hide_console(command: &mut Command) {
     command.creation_flags(0x0800_0000);
 }
 
-fn parse_setting_value(reply: &str) -> String {
+pub(crate) fn parse_setting_value(reply: &str) -> String {
     reply
         .split_once(" = ")
         .map_or(reply, |(_, value)| value)
@@ -333,7 +333,7 @@ fn parse_setting_value(reply: &str) -> String {
         .to_string()
 }
 
-fn parse_edspath(reply: &str) -> Result<(PathBuf, PathBuf), String> {
+pub(crate) fn parse_edspath(reply: &str) -> Result<(PathBuf, PathBuf), String> {
     let mut lines = reply.lines().map(str::trim);
     let eds_path = lines.next().unwrap_or_default();
     let output_map = lines.next().unwrap_or_default();

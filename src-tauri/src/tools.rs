@@ -14,6 +14,10 @@ use thiserror::Error;
 
 /// Build verification tool name, exempt from the evidence gate.
 pub const BUILD_RUN_TOOL: &str = "build_run";
+/// Isolated runtime trace test tool name.
+pub const TRACE_TEST_RUN_TOOL: &str = "trace_test_run";
+/// Source-controlled persistent runtime regression suite tool name.
+pub const TRACE_SUITE_RUN_TOOL: &str = "trace_suite_run";
 
 /// Documentation search tool name.
 pub const SEARCH_DOCS_TOOL: &str = "search_docs";
@@ -856,6 +860,51 @@ pub fn tool_registry() -> Vec<ToolSpec> {
             "Run the editor build. Returns {ok, errors}; on an editor failure without macro errors, re-runs euddraft once to capture structured diagnostics.",
             true,
             empty_schema(),
+        ),
+        tool_spec(
+            TRACE_TEST_RUN_TOOL,
+            "Build and run one isolated epScript runtime test after a successful build_run. The owned 32-bit client is created suspended; a bounded x86 helper validates StarCraft.exe and neutralizes only its foreground/focus/cursor user32 calls before resume. The minimized off-screen client then receives LAN/UDP CreateGame and Alt+O through background window messages, with no global input or focus fallback. The source project/map remain unchanged.",
+            false,
+            schema(
+                json!({
+                    "name": {"type": "string", "minLength": 1, "maxLength": 512},
+                    "code": {"type": "string", "minLength": 1, "maxLength": 131072},
+                    "symbols": {
+                        "type": "array",
+                        "maxItems": 256,
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "properties": {
+                                "eventId": {"type": "integer", "minimum": 0, "maximum": 4294967295_u64},
+                                "name": {"type": "string", "minLength": 1, "maxLength": 128},
+                                "source": {"type": "string", "maxLength": 512},
+                                "line": {"type": "integer", "minimum": 1, "maximum": 4294967295_u64}
+                            },
+                            "required": ["eventId", "name"]
+                        }
+                    },
+                    "timeoutMs": {"type": "integer", "minimum": 1000, "maximum": 120000}
+                }),
+                &["name", "code"],
+            ),
+        ),
+        tool_spec(
+            TRACE_SUITE_RUN_TOOL,
+            "Discover and run up to 256 source-controlled tests/**/*.tests.eps after a successful build_run. Omit tests for the complete suite or provide exact logical project paths. Every owned 32-bit client is suspended until a bounded x86 helper neutralizes its foreground/focus/cursor user32 calls, then remains minimized and uses only background messages for LAN/UDP CreateGame and Alt+O. Results are diagnostic and the source project/map remain unchanged.",
+            false,
+            schema(
+                json!({
+                    "tests": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 256,
+                        "items": {"type": "string", "minLength": 1, "maxLength": 512}
+                    },
+                    "timeoutMs": {"type": "integer", "minimum": 1000, "maximum": 120000}
+                }),
+                &[],
+            ),
         ),
         tool_spec(
             "location_write",
@@ -5380,6 +5429,49 @@ mod tests {
                 ),
             ),
             ("build_run", true, schema(serde_json::json!({}), &[])),
+            (
+                "trace_test_run",
+                false,
+                schema(
+                    serde_json::json!({
+                        "name": {"type": "string", "minLength": 1, "maxLength": 512},
+                        "code": {"type": "string", "minLength": 1, "maxLength": 131072},
+                        "symbols": {
+                            "type": "array",
+                            "maxItems": 256,
+                            "items": {
+                                "type": "object",
+                                "additionalProperties": false,
+                                "properties": {
+                                    "eventId": {"type": "integer", "minimum": 0, "maximum": 4294967295_u64},
+                                    "name": {"type": "string", "minLength": 1, "maxLength": 128},
+                                    "source": {"type": "string", "maxLength": 512},
+                                    "line": {"type": "integer", "minimum": 1, "maximum": 4294967295_u64}
+                                },
+                                "required": ["eventId", "name"]
+                            }
+                        },
+                        "timeoutMs": {"type": "integer", "minimum": 1000, "maximum": 120000}
+                    }),
+                    &["name", "code"],
+                ),
+            ),
+            (
+                "trace_suite_run",
+                false,
+                schema(
+                    serde_json::json!({
+                        "tests": {
+                            "type": "array",
+                            "minItems": 1,
+                            "maxItems": 256,
+                            "items": {"type": "string", "minLength": 1, "maxLength": 512}
+                        },
+                        "timeoutMs": {"type": "integer", "minimum": 1000, "maximum": 120000}
+                    }),
+                    &[],
+                ),
+            ),
             (
                 "location_write",
                 true,

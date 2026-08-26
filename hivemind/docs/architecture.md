@@ -134,6 +134,26 @@ The bridge finds `Data\agent\` editor-relative (no absolute path baked into the 
 KopiLua reads source as Latin1, so a non-ASCII path literal would corrupt). The app
 reads the editor path from `config.json` (UTF-8-safe) written at install time.
 
+
+Runtime tests are an additive pre-review path after a successful authoritative build.
+`trace_test_run` accepts one request-owned ad-hoc module. `trace_suite_run` takes one coherent
+editor EPS snapshot, discovers logical `tests/**/*.tests.eps` paths, and runs all discovered files
+or an exact selected list; one file is one persistent scenario. Permanent tests remain unimported
+by the configured MainFile, while the isolated runner injects each source into its generated
+harness.
+
+For every case, the app copies the generated EDS inputs and source map into one local run, appends
+a temporary epScript trace/test plugin, and builds a content-unique map in the user's StarCraft
+Maps root. It refuses an existing StarCraft process and creates one owned 32-bit client suspended.
+A bundled x86 helper validates the target image and neutralizes six fixed user32
+foreground/focus/cursor entrypoints inside only that child before resume. The client launches
+off-screen and minimized; LAN/UDP `CreateGame` and `Alt+O` then use HWND-targeted messages only.
+No global input, arbitrary memory patch, game-function call, or foreground fallback is exposed.
+A unique versioned ring buffer is read through `ReadProcessMemory`. Pass/fail/inconclusive plus
+decoded events are written as JSON/JSONL logs; a compact `suite.json` links persistent case
+results. The staged map and owned game process are removed, and the source map hash must remain
+unchanged. Runtime results are diagnostic and do not block changeset review.
+
 ## Concurrent sessions and project workspaces
 
 `SessionEngineManager` owns lazily created workers keyed by durable session id. Each worker has

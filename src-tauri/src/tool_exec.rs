@@ -1561,6 +1561,94 @@ stop this turn so the backend can resume the same thread in its isolated writabl
                 serde_json::to_value(result)
                     .map_err(|error| format!("failed to serialize build result: {error}"))
             }
+            tools::TRACE_TEST_RUN_TOOL => {
+                let Some(build) = self.last_build.lock().clone() else {
+                    return Err(
+                        "trace_test_run requires build_run in the current request".to_string()
+                    );
+                };
+                if !build.ok {
+                    return Err(
+                        "trace_test_run requires the current request's latest build_run to succeed"
+                            .to_string(),
+                    );
+                }
+                let input: crate::trace_test::TraceTestInput = serde_json::from_value(args.clone())
+                    .map_err(|error| format!("invalid trace_test_run arguments: {error}"))?;
+                let eds_reply = self.send("EDSPATH")?;
+                let (eds_path, _) = edd_runner::parse_edspath(&eds_reply)?;
+                let euddraft_path = PathBuf::from(edd_runner::parse_setting_value(
+                    &self.send("GETSET program|euddraft")?,
+                ));
+                let starcraft_setting = PathBuf::from(edd_runner::parse_setting_value(
+                    &self.send("GETSET program|starcraft")?,
+                ));
+                let result = crate::trace_test::run(
+                    &self.services.dirs,
+                    &eds_path,
+                    &euddraft_path,
+                    &starcraft_setting,
+                    input,
+                    |phase| {
+                        self.emit_audio_progress(crate::ipc::ProgressStage::TraceTest, phase.as_str());
+                    },
+                )?;
+                let detail = format!("done:{}", result.status.as_str());
+                self.emit_audio_progress(crate::ipc::ProgressStage::TraceTest, &detail);
+                serde_json::to_value(result)
+                    .map_err(|error| format!("failed to serialize trace test result: {error}"))
+            }
+            tools::TRACE_SUITE_RUN_TOOL => {
+                let Some(build) = self.last_build.lock().clone() else {
+                    return Err(
+                        "trace_suite_run requires build_run in the current request".to_string()
+                    );
+                };
+                if !build.ok {
+                    return Err(
+                        "trace_suite_run requires the current request's latest build_run to succeed"
+                            .to_string(),
+                    );
+                }
+                let input: crate::trace_test::TraceSuiteInput =
+                    serde_json::from_value(args.clone())
+                        .map_err(|error| format!("invalid trace_suite_run arguments: {error}"))?;
+                self.emit_audio_progress(crate::ipc::ProgressStage::TraceTest, "discover");
+                let snapshot = self
+                    .bridge()?
+                    .snapshot_eps(&SendOpts::for_epsnapshot(), None)
+                    .map_err(stringify)?;
+                let timeout_ms = input.timeout_ms;
+                let selection = crate::trace_test::select_persistent_tests(&snapshot, &input)?;
+                let (eds_path, euddraft_path, starcraft_setting) = if selection.tests.is_empty() {
+                    (PathBuf::new(), PathBuf::new(), PathBuf::new())
+                } else {
+                    let eds_reply = self.send("EDSPATH")?;
+                    let (eds_path, _) = edd_runner::parse_edspath(&eds_reply)?;
+                    let euddraft_path = PathBuf::from(edd_runner::parse_setting_value(
+                        &self.send("GETSET program|euddraft")?,
+                    ));
+                    let starcraft_setting = PathBuf::from(edd_runner::parse_setting_value(
+                        &self.send("GETSET program|starcraft")?,
+                    ));
+                    (eds_path, euddraft_path, starcraft_setting)
+                };
+                let result = crate::trace_test::run_suite(
+                    &self.services.dirs,
+                    &eds_path,
+                    &euddraft_path,
+                    &starcraft_setting,
+                    selection,
+                    timeout_ms,
+                    |phase| {
+                        self.emit_audio_progress(crate::ipc::ProgressStage::TraceTest, phase.as_str());
+                    },
+                )?;
+                let detail = format!("done:{}", result.status.as_str());
+                self.emit_audio_progress(crate::ipc::ProgressStage::TraceTest, &detail);
+                serde_json::to_value(result)
+                    .map_err(|error| format!("failed to serialize trace suite result: {error}"))
+            }
             "location_write" => {
                 let bridge = self.bridge()?;
                 tools::location_write(
@@ -3910,6 +3998,42 @@ mod tests {
             .execute("project_status", &json!({}))
             .expect_err("a tool call outside a turn must be rejected");
         assert!(error.contains("no agent request is open"), "got: {error}");
+    }
+
+    #[test]
+    fn trace_runtime_tools_require_current_successful_build_before_launch() {
+        let runtime = open_runtime("req-trace-prerequisite");
+        let args = json!({
+            "name": "smoke",
+            "code": "function eudAgentTestSetup() { eudAgentPass(1); }\nfunction eudAgentTestStep(tick) {}"
+        });
+        let error = runtime
+            .execute(tools::TRACE_TEST_RUN_TOOL, &args)
+            .expect_err("trace test without build evidence must fail before bridge access");
+        assert!(error.contains("requires build_run"), "got: {error}");
+        let error = runtime
+            .execute(tools::TRACE_SUITE_RUN_TOOL, &json!({}))
+            .expect_err("trace suite without build evidence must fail before bridge access");
+        assert!(error.contains("requires build_run"), "got: {error}");
+
+        *runtime.last_build.lock() = Some(crate::harness::BuildEvidence {
+            ok: false,
+            error_count: 1,
+        });
+        let error = runtime
+            .execute(tools::TRACE_TEST_RUN_TOOL, &args)
+            .expect_err("failed build evidence must reject trace launch");
+        assert!(
+            error.contains("latest build_run to succeed"),
+            "got: {error}"
+        );
+        let error = runtime
+            .execute(tools::TRACE_SUITE_RUN_TOOL, &json!({}))
+            .expect_err("failed build evidence must reject trace suite launch");
+        assert!(
+            error.contains("latest build_run to succeed"),
+            "got: {error}"
+        );
     }
 
     #[tokio::test]

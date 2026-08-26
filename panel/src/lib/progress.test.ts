@@ -89,6 +89,24 @@ describe("progressLabel", () => {
       text: "1M 컨텍스트 요청이 Codex에서 제한되어 보고된 컨텍스트를 사용합니다.",
     });
   });
+  it("shows isolated runtime-test phases and advisory terminal states", () => {
+    expect(progressLabel("trace_test", "discover")).toEqual({
+      kind: "progress",
+      text: "영구 회귀 테스트 탐색 중…",
+    });
+    expect(progressLabel("trace_test", "build")).toEqual({
+      kind: "progress",
+      text: "임시 테스트 맵 빌드 중…",
+    });
+    expect(progressLabel("trace_test", "launch").text).toContain("StarCraft");
+    expect(progressLabel("trace_test", "run").text).toContain("트레이스");
+    expect(progressLabel("trace_test", "done:passed")).toEqual({
+      kind: "ok",
+      text: "런타임 자동테스트 통과",
+    });
+    expect(progressLabel("trace_test", "done:failed").kind).toBe("warn");
+    expect(progressLabel("trace_test", "done:inconclusive").kind).toBe("warn");
+  });
   it("labels each bounded audio conversion and map-write stage", () => {
     expect(progressLabel("audio_probe").text).toContain("오디오 검사");
     expect(progressLabel("audio_transcode").text).toContain("OGG Vorbis");

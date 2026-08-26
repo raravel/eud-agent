@@ -172,6 +172,13 @@ const BUILD_GUIDE: &str = r#"[build]
 - build_run returns the complete structured result ({ok, errors with source/file/line/message/raw}); read it directly, fix the code, and build again on failure. The server enforces a 3-attempt self-fix budget per request; when it is spent, STOP and report the remaining errors to the user verbatim.
 - A failure whose message says no matching player exists (e.g. "연결맵에 조건에 맞는 플레이어가 없습니다") is a MAP setup problem, not an eps bug — fix it with player_setup (a Human controller AND a start location for at least one player), then rebuild."#;
 
+const TRACE_TEST_GUIDE: &str = r#"[runtime trace tests]
+- Runtime trace results are diagnostic: failed/inconclusive never blocks review and never justifies changing correct project code to silence the harness. Use them only after the current request's build_run succeeds.
+- Permanent regression tests live only under `tests/**/*.tests.eps`, one scenario per file. Each file MUST define `function eudAgentTestSetup() {}` and `function eudAgentTestStep(tick) {}` and finish with exactly one `eudAgentPass(eventId)`. Keep these modules outside the configured MainFile's production import graph; use root-qualified project imports such as `TriggerEditor.feature` so the isolated harness can load them.
+- Run `trace_suite_run({tests:[...]})` for selected files while iterating and `trace_suite_run({})` for the complete persistent suite before review. When a repeatable deterministic contract changes, create or update its permanent test instead of regenerating the same temporary test on every request. `trace_test_run` remains available only for genuinely one-off diagnosis and takes the same callbacks as one temporary epScript module.
+- Tests may call `eudAgentTrace(eventId, severity, v0, v1, v2, v3)`, `eudAgentAssertEq(eventId, actual, expected)`, `eudAgentFail(eventId, actual, expected)`, and `eudAgentPass(eventId)`. Return immediately after a failed assertion.
+- Each test builds and runs an isolated map copy in one fresh 32-bit StarCraft process. Create the owned client suspended; before resume, the bundled x86 isolation helper MUST validate `StarCraft.exe` and neutralize only its foreground/focus/cursor user32 entrypoints. The client then remains minimized and off-screen. Targeted `PostMessageW` messages invoke LAN/UDP `CreateGame` and `Alt+O`; global keyboard/mouse synthesis and focus fallback are forbidden. Any isolation failure is inconclusive and terminates the owned process."#;
+
 const MAP_LOCATION_GUIDE: &str = r#"[map inspection]
 - Use map_info summary first, then page/filter terrain, units, locations, players, or switches instead of guessing from the connected map.
 - map_info(mode=terrain) returns tile coordinates, MTXM value, tile group, and variant. map_info(mode=units) returns full placed-unit attributes; use owner/unitType/offset/limit filters on large maps.
@@ -4233,6 +4240,7 @@ fn static_prompt_baseline() -> String {
         EPS_PROJECT_ARCHITECTURE_GUIDE.to_string(),
         EPS_PREFLIGHT_GUIDE.to_string(),
         BUILD_GUIDE.to_string(),
+        TRACE_TEST_GUIDE.to_string(),
         MAP_LOCATION_GUIDE.to_string(),
         RESOURCE_MENTION_GUIDE.to_string(),
         AUDIO_SOUND_GUIDE.to_string(),

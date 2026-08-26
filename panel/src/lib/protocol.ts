@@ -37,6 +37,7 @@ export const PROGRESS_STAGES = [
   "workspace",
   "lsp",
   "waiting_build",
+  "trace_test",
   "bootstrap",
   "audio_probe",
   "audio_transcode",

@@ -568,6 +568,9 @@ pub enum ProgressStage {
     /// Waiting for an editor build to finish.
     #[serde(rename = "waiting_build")]
     WaitingBuild,
+    /// Isolated StarCraft runtime trace test.
+    #[serde(rename = "trace_test")]
+    TraceTest,
     /// Bootstrap asset setup.
     #[serde(rename = "bootstrap")]
     Bootstrap,
@@ -1328,6 +1331,7 @@ mod tests {
             json!("large_context_fallback"),
         );
         assert_json(&ipc::ProgressStage::Lsp, json!("lsp"));
+        assert_json(&ipc::ProgressStage::TraceTest, json!("trace_test"));
         assert_json(&ipc::ProgressStage::Bootstrap, json!("bootstrap"));
     }
 

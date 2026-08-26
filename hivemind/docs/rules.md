@@ -135,6 +135,39 @@ hosting, panel re-arm, and server spawning are REMOVED.
   snapshot file. Final correctness always comes from the existing mandatory `build_run`.
 
 ## codex invocation (Rust, Windows) (PORTED)
+## Isolated runtime trace tests
+
+- `trace_test_run` and `trace_suite_run` are valid only after the current request's latest
+  `build_run` succeeds. Test failures, timeouts, client exits, and protocol failures are
+  diagnostic; they never gate changeset review or justify changing correct project code to
+  silence the harness.
+- Persistent regression tests are exactly `tests/**/*.tests.eps` in a coherent EPSNAPSHOT,
+  with an extensionless `CUIEps` editor path projected to its logical `.eps` name. Each file owns
+  one `eudAgentTestSetup`/`eudAgentTestStep` scenario and MUST stay outside the configured
+  MainFile's production import graph. Omitted `trace_suite_run.tests` means all discovered tests;
+  a non-empty list selects exact logical paths, with case-insensitive collision/missing-path
+  rejection.
+- ALWAYS clone the editor-generated EDS build inputs and source map into a request-owned run.
+  The temporary plugin/map MUST stay outside the editor project, and the source-map SHA-256 MUST
+  match after the run. Retain each case's `test.eps`, `test.eds`, `symbols.json`, `build.log`,
+  `trace.jsonl`, and `result.json`, plus the compact suite `suite.json`, under
+  `%localappdata%\eud-agent\logs\trace-tests\`.
+- The initial runtime supports only the 32-bit SCR client. Refuse when any StarCraft process is
+  already running. Create the owned client suspended. Before resume, the bundled x86 isolation
+  helper MUST validate that the target path ends in `StarCraft.exe` and patch only these named
+  target-process user32 exports: `SetForegroundWindow`, `BringWindowToTop`, `SetFocus`,
+  `SetCursorPos`, `ClipCursor`, and `SwitchToThisWindow`. Arbitrary process ids, addresses,
+  payloads, game functions, and non-owned processes are forbidden. Injector failure MUST terminate
+  the owned suspended process as inconclusive.
+- Launch off-screen and keep the client minimized. Drive LAN/UDP `CreateGame`, map selection, room
+  creation, and `Alt+O` only through HWND-targeted `PostMessageW`; global keyboard/mouse synthesis
+  and focus fallback are forbidden. Terminate only the owned process and do not change the user's
+  normal StarCraft settings.
+- The map plugin writes one versioned fixed ring buffer: unique 32-byte run marker, header,
+  256 records, and eight dwords per record (`sequence`, `tick`, `eventId`, `severity`, four
+  values). Write the record sequence last. The reader MUST reject torn records, duplicate active
+  buffers, malformed headers, overflowed passing runs, and missing/lost markers.
+
 
 - NEVER spawn bare `"codex"`. ALWAYS resolve the app-managed executable first and
   fall back to the `which` crate (fail fast if unresolved).

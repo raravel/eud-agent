@@ -34,6 +34,7 @@ export const STAGE_LABELS: Record<string, string> = {
   workspace: "프로젝트 워크스페이스 보안 환경 준비 중…",
   lsp: "진단 검사 중…",
   waiting_build: "에디터 빌드 완료 대기 중…",
+  trace_test: "런타임 자동테스트 준비 중…",
   bootstrap: "필수 자산 준비 중…",
   audio_probe: "첨부 오디오 검사 중…",
   audio_transcode: "OGG Vorbis 변환 중…",
@@ -76,6 +77,27 @@ export function progressLabel(stage: string, detail?: string): ProgressLine {
     return detail === "done"
       ? { kind: "ok", text: "대화 컨텍스트 자동 압축 완료" }
       : { kind: "progress", text: STAGE_LABELS.compaction };
+  }
+  if (stage === "trace_test") {
+    if (detail === "discover") {
+      return { kind: "progress", text: "영구 회귀 테스트 탐색 중…" };
+    }
+    if (detail === "build") {
+      return { kind: "progress", text: "임시 테스트 맵 빌드 중…" };
+    }
+    if (detail === "launch") {
+      return { kind: "progress", text: "StarCraft 테스트 프로세스 시작 중…" };
+    }
+    if (detail === "run") {
+      return { kind: "progress", text: "런타임 트레이스 수집 중…" };
+    }
+    if (detail === "done:passed") {
+      return { kind: "ok", text: "런타임 자동테스트 통과" };
+    }
+    if (detail?.startsWith("done:")) {
+      return { kind: "warn", text: "런타임 자동테스트 진단 완료" };
+    }
+    return { kind: "progress", text: STAGE_LABELS.trace_test };
   }
   if (stage === "task_state_warning") {
     return {

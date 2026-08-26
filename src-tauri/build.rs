@@ -15,5 +15,46 @@ fn main() {
         "cargo:rustc-link-arg={}",
         lib_dir.join("isom_capi.lib").display()
     );
+
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        let injector_source = std::path::Path::new(&manifest_dir)
+            .join("..")
+            .join("native")
+            .join("trace_injector.rs");
+        let injector_exe =
+            std::path::Path::new(&std::env::var("OUT_DIR").unwrap()).join("eud_trace_injector.exe");
+        let status = std::process::Command::new(std::env::var("RUSTC").unwrap())
+            .args([
+                "--crate-name",
+                "eud_trace_injector",
+                "--crate-type",
+                "bin",
+                "--edition",
+                "2021",
+                "--target",
+                "i686-pc-windows-msvc",
+                "-C",
+                "opt-level=z",
+                "-C",
+                "panic=abort",
+                "-C",
+                "strip=symbols",
+                "-C",
+                "lto=fat",
+                "-C",
+                "codegen-units=1",
+            ])
+            .arg(&injector_source)
+            .arg("-o")
+            .arg(&injector_exe)
+            .status()
+            .expect("failed to invoke rustc for the x86 trace injector");
+        assert!(status.success(), "failed to build the x86 trace injector");
+        println!("cargo:rerun-if-changed={}", injector_source.display());
+        println!(
+            "cargo:rustc-env=EUD_TRACE_INJECTOR_EXE={}",
+            injector_exe.display()
+        );
+    }
     tauri_build::build();
 }

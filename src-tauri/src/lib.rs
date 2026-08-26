@@ -43,6 +43,7 @@ pub mod setup;
 pub mod task_state;
 pub mod tool_exec;
 pub mod tools;
+pub mod trace_test;
 pub mod wiki;
 #[cfg(windows)]
 pub mod windows_notification;
