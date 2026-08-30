@@ -67,6 +67,7 @@ impl Embedder {
     /// model (~570MB) — expected, and the reason the parity test is `#[ignore]`d.
     pub fn new(cache_dir: Option<PathBuf>) -> Result<Self, RagError> {
         use fastembed::{Bgem3Embedding, Bgem3InitOptions, Bgem3Model};
+        let _model_guard = crate::bootstrap::lock_model_initialization();
 
         // BGEM3Q == the INT8-quantized bge-m3 ONNX variant — the SAME model
         // `bootstrap::ensure_model` downloads. We compare its quantized output

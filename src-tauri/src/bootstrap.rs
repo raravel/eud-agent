@@ -21,6 +21,7 @@
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard};
 
 use anyhow::{bail, Context};
 use sha2::{Digest, Sha256};
@@ -39,6 +40,16 @@ pub const REQUIRED_RAG_INDEX_VERSION: &str = "3";
 
 /// HF model id installed on first run when `config.json` carries none (feature 10).
 pub const DEFAULT_MODEL_NAME: &str = "BAAI/bge-m3";
+
+/// Serialize every in-process initialization of the shared fastembed model cache.
+///
+/// First-run bootstrap and background RAG warmup can otherwise call `hf-hub` for the
+/// same blob concurrently. Its Windows file lock waits only five seconds, so the later
+/// caller fails while the first is still downloading the ~570 MB model.
+pub(crate) fn lock_model_initialization() -> MutexGuard<'static, ()> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 /// Published release manifest for the RAG index, uploaded next to `rag-index.bin`
 /// by `.github/workflows/build-rag-index.yml` (`{"rag_index":{url,sha256,version}}`).
@@ -253,6 +264,7 @@ pub fn ensure_model(dirs: &DataDirs, emitter: &dyn ProgressEmitter) -> anyhow::R
         .with_context(|| format!("cannot create models dir {}", models_dir.display()))?;
 
     emitter.emit("bootstrap", 0, "downloading bge-m3 model");
+    let _model_guard = lock_model_initialization();
     // Point the HF cache at our Local data dir (never Roaming) and trigger the fetch.
     Bgem3Embedding::try_new(
         Bgem3InitOptions::new(Bgem3Model::BGEM3Q)
@@ -876,6 +888,45 @@ pub async fn bootstrap_assets(
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod model_initialization {
+    use super::lock_model_initialization;
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+    use std::sync::{Arc, Barrier};
+
+    #[test]
+    fn model_initialization_lock_serializes_bootstrap_and_rag() {
+        let workers = 8;
+        let start = Arc::new(Barrier::new(workers));
+        let inflight = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+
+        let mut handles = Vec::new();
+        for _ in 0..workers {
+            let start = start.clone();
+            let inflight = inflight.clone();
+            let peak = peak.clone();
+            handles.push(std::thread::spawn(move || {
+                start.wait();
+                let _guard = lock_model_initialization();
+                let now = inflight.fetch_add(1, SeqCst) + 1;
+                peak.fetch_max(now, SeqCst);
+                std::thread::yield_now();
+                inflight.fetch_sub(1, SeqCst);
+            }));
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        assert_eq!(
+            peak.load(SeqCst),
+            1,
+            "bootstrap and RAG warmup must serialize model initialization"
+        );
+    }
 }
 
 #[cfg(test)]
