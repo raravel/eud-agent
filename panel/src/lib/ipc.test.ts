@@ -4,8 +4,11 @@ import {
   appSettingsGet,
   appSettingsSave,
   attentionNotify,
-  codexModelSettingsGet,
-  codexModelSettingsSave,
+  providerBaseUrlSave,
+  providerDefaultsSave,
+  providerSettingsGet,
+  sessionModelSettingsGet,
+  sessionModelSettingsSave,
   compactSession,
   isAgentTurnEndTransition,
   notificationSoundPreview,
@@ -575,18 +578,38 @@ describe("readiness", () => {
   });
 });
 
+const setupProviders = [
+  "codex",
+  "claude-code",
+  "antigravity",
+  "opencode-go",
+  "ollama",
+].map((provider, index) => ({
+  provider,
+  availability: index === 0 ? "ready" : "unavailable",
+  selectedAsDefault: index === 0,
+  canInstall: index < 2,
+  canImport: index < 2,
+  experimental: provider === "antigravity",
+}));
+
 describe("setup commands", () => {
   it("dispatches the setup_status response as a setup message", async () => {
     const { invoke, listen } = makeHarness();
+    const nullableProviders = setupProviders.map((status) => ({
+      ...status,
+      detailCode: null,
+    }));
     invoke.mockImplementation(async (command: string) => {
       if (command === "setup_status") {
         return {
-          editor_path: "",
-          editor_valid: false,
-          assets_ready: false,
-          codex_resolved: true,
-          codex_authed: false,
-          setup_required: true,
+          editorPath: "",
+          editorValid: false,
+          assetsReady: false,
+          defaultProvider: null,
+          providers: nullableProviders,
+          setupRequired: true,
+          error: null,
         };
       }
       return undefined;
@@ -603,12 +626,13 @@ describe("setup commands", () => {
     expect(invoke).toHaveBeenCalledWith("setup_status", {});
     expect(received).toContainEqual({
       type: "setup",
-      editor_path: "",
-      editor_valid: false,
-      assets_ready: false,
-      codex_resolved: true,
-      codex_authed: false,
-      setup_required: true,
+      editorPath: "",
+      editorValid: false,
+      assetsReady: false,
+      defaultProvider: null,
+      providers: nullableProviders,
+      setupRequired: true,
+      error: null,
     });
   });
 
@@ -617,12 +641,11 @@ describe("setup commands", () => {
     invoke.mockImplementation(async (command: string) => {
       if (command === "setup_pick_editor_path") {
         return {
-          editor_path: "C:\\Games\\NotTheEditor",
-          editor_valid: false,
-          assets_ready: false,
-          codex_resolved: true,
-          codex_authed: false,
-          setup_required: true,
+          editorPath: "C:\\Games\\NotTheEditor",
+          editorValid: false,
+          assetsReady: false,
+          providers: setupProviders,
+          setupRequired: true,
           error: "invalid_editor_folder",
         };
       }
@@ -639,12 +662,11 @@ describe("setup commands", () => {
 
     expect(received).toContainEqual({
       type: "setup",
-      editor_path: "C:\\Games\\NotTheEditor",
-      editor_valid: false,
-      assets_ready: false,
-      codex_resolved: true,
-      codex_authed: false,
-      setup_required: true,
+      editorPath: "C:\\Games\\NotTheEditor",
+      editorValid: false,
+      assetsReady: false,
+      providers: setupProviders,
+      setupRequired: true,
       error: "invalid_editor_folder",
     });
   });
@@ -666,49 +688,127 @@ describe("setup commands", () => {
   });
 });
 
-describe("Codex model settings commands", () => {
+describe("provider model settings commands", () => {
+  const model = {
+    provider: "codex",
+    model: "gpt-5.5-codex",
+    displayName: "GPT-5.5 Codex",
+    description: "Most capable",
+    isDefault: true,
+    capabilities: {
+      vision: true,
+      toolCalls: true,
+      strictStructuredOutput: true,
+      reasoningLevels: ["high"],
+      nativeCompaction: true,
+      hostedWebSearch: true,
+    },
+  };
+  const status = {
+    provider: "codex",
+    availability: "ready",
+    selectedAsDefault: true,
+    canInstall: true,
+    canImport: true,
+    experimental: false,
+  };
   const response = {
-    models: [
-      {
-        model: "gpt-5.5-codex",
-        displayName: "GPT-5.5 Codex",
-        description: "Most capable",
-        supportedReasoningEfforts: [
-          { reasoningEffort: "high", description: "Deep reasoning" },
-        ],
-        defaultReasoningEffort: "high",
-        isDefault: true,
-      },
-    ],
+    provider: "codex",
+    status,
+    models: [model],
     selectedModel: "gpt-5.5-codex",
-    selectedReasoningEffort: "high",
+    selectedReasoning: { level: "high" },
+    hasApiKey: false,
   };
 
-  it("fetches the current authenticated model catalog", async () => {
+  it("fetches one provider settings view", async () => {
     const invoke = vi.fn().mockResolvedValue(response);
-
-    await expect(codexModelSettingsGet(invoke)).resolves.toEqual(response);
-    expect(invoke).toHaveBeenCalledWith("codex_model_settings");
-  });
-
-  it("saves a coherent model and reasoning pair", async () => {
-    const invoke = vi.fn().mockResolvedValue(response);
-
-    await expect(
-      codexModelSettingsSave("gpt-5.5-codex", "high", invoke),
-    ).resolves.toEqual(response);
-    expect(invoke).toHaveBeenCalledWith("codex_model_settings_save", {
-      model: "gpt-5.5-codex",
-      reasoningEffort: "high",
+    await expect(providerSettingsGet("codex", invoke)).resolves.toEqual(response);
+    expect(invoke).toHaveBeenCalledWith("provider_settings", {
+      provider: "codex",
     });
   });
 
-  it("rejects malformed backend responses", async () => {
-    const invoke = vi.fn().mockResolvedValue({ models: [] });
+  it("saves an Ollama OpenAI-compatible base URL", async () => {
+    const ollamaResponse = {
+      ...response,
+      provider: "ollama",
+      status: { ...status, provider: "ollama" },
+      models: [],
+      selectedModel: null,
+      selectedReasoning: null,
+      baseUrl: "https://ollama.example.test/v1",
+      hasApiKey: true,
+    };
+    const invoke = vi.fn().mockResolvedValue(ollamaResponse);
+    await expect(
+      providerBaseUrlSave(
+        "ollama",
+        "https://ollama.example.test/v1",
+        invoke,
+      ),
+    ).resolves.toEqual(ollamaResponse);
+    expect(invoke).toHaveBeenCalledWith("provider_base_url_save", {
+      provider: "ollama",
+      baseUrl: "https://ollama.example.test/v1",
+    });
+  });
 
-    await expect(codexModelSettingsGet(invoke)).rejects.toThrow(
-      "invalid codex model settings response",
-    );
+  it("saves provider defaults without changing existing sessions", async () => {
+    const invoke = vi.fn().mockResolvedValue(response);
+    await expect(
+      providerDefaultsSave(
+        "codex",
+        "gpt-5.5-codex",
+        { level: "high" },
+        true,
+        invoke,
+      ),
+    ).resolves.toEqual(response);
+    expect(invoke).toHaveBeenCalledWith("provider_defaults_save", {
+      provider: "codex",
+      model: "gpt-5.5-codex",
+      reasoning: { level: "high" },
+      setDefaultProvider: true,
+    });
+  });
+
+  it("normalizes Rust null reasoning when loading session settings", async () => {
+    const invoke = vi.fn().mockResolvedValue({
+      provider: "antigravity",
+      models: [{ ...model, provider: "antigravity" }],
+      selectedModel: "gemini-3.7-flash-high",
+      selectedReasoning: null,
+    });
+    await expect(sessionModelSettingsGet("session-1", invoke)).resolves.toEqual({
+      provider: "antigravity",
+      models: [{ ...model, provider: "antigravity" }],
+      selectedModel: "gemini-3.7-flash-high",
+      selectedReasoning: undefined,
+    });
+  });
+
+  it("saves model settings against one bound session", async () => {
+    const sessionResponse = {
+      provider: "codex",
+      models: [model],
+      selectedModel: "gpt-5.5-codex",
+      selectedReasoning: { level: "high" },
+    };
+    const invoke = vi.fn().mockResolvedValue(sessionResponse);
+    await expect(
+      sessionModelSettingsSave(
+        "session-1",
+        "gpt-5.5-codex",
+        { level: "high" },
+        invoke,
+      ),
+    ).resolves.toEqual(sessionResponse);
+    expect(invoke).toHaveBeenCalledWith("session_model_settings_save", {
+      sessionId: "session-1",
+      model: "gpt-5.5-codex",
+      reasoning: { level: "high" },
+    });
   });
 });
 

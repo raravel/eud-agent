@@ -17,9 +17,8 @@
 use std::sync::Arc;
 
 use rmcp::model::{
-    CallToolRequestParams, CallToolResult, Content, CreateElicitationRequestParams,
-    ElicitationAction, ElicitationSchema, Implementation, InitializeResult, ListToolsResult, Meta,
-    PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool,
+    CallToolRequestParams, CallToolResult, Content, Implementation, InitializeResult,
+    ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool,
 };
 use rmcp::service::RequestContext;
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
@@ -69,17 +68,17 @@ impl ServerHandler for EudToolHandler {
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
-        context: RequestContext<RoleServer>,
+        _context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         let name = request.name.to_string();
         let args = Value::Object(request.arguments.unwrap_or_default());
-        let runtime = self.runtime.clone();
         if name == crate::tools::ASK_TOOL {
-            return match call_ask(context, &args).await {
+            return match self.runtime.ask(&args).await {
                 Ok(value) => Ok(CallToolResult::success(render_contents(&value))),
                 Err(message) => Ok(CallToolResult::error(vec![Content::text(message)])),
             };
         }
+        let runtime = self.runtime.clone();
 
         // Tool execution does blocking bridge / map file I/O; keep it off the
         // async runtime so the MCP server stays responsive.
@@ -100,44 +99,6 @@ impl ServerHandler for EudToolHandler {
 
 pub(crate) const ASK_ELICITATION_META_KEY: &str = "eudAgentAsk";
 pub(crate) const ASK_ELICITATION_PAYLOAD_KEY: &str = "payload";
-
-fn ask_elicitation_request(args: &Value) -> Result<CreateElicitationRequestParams, String> {
-    let schema = ElicitationSchema::builder()
-        .required_string(ASK_ELICITATION_PAYLOAD_KEY)
-        .build()
-        .map_err(|error| format!("failed to build ASK elicitation schema: {error}"))?;
-    let mut meta = serde_json::Map::new();
-    meta.insert(ASK_ELICITATION_META_KEY.to_string(), args.clone());
-    Ok(CreateElicitationRequestParams::FormElicitationParams {
-        meta: Some(Meta(meta)),
-        message: "eud-agent structured ASK".to_string(),
-        requested_schema: schema,
-    })
-}
-
-async fn call_ask(context: RequestContext<RoleServer>, args: &Value) -> Result<Value, String> {
-    let result = context
-        .peer
-        .create_elicitation(ask_elicitation_request(args)?)
-        .await
-        .map_err(|error| format!("ASK elicitation failed: {error}"))?;
-
-    match result.action {
-        ElicitationAction::Accept => {
-            let payload = result
-                .content
-                .as_ref()
-                .and_then(Value::as_object)
-                .and_then(|content| content.get(ASK_ELICITATION_PAYLOAD_KEY))
-                .and_then(Value::as_str)
-                .ok_or_else(|| "ASK elicitation response omitted its payload".to_string())?;
-            serde_json::from_str(payload)
-                .map_err(|error| format!("ASK elicitation returned invalid JSON: {error}"))
-        }
-        ElicitationAction::Decline => Err("ask request declined".to_string()),
-        ElicitationAction::Cancel => Err("ask request cancelled".to_string()),
-    }
-}
 
 /// Build the MCP `Tool` list from the registry's MCP descriptors (verbatim
 /// inputSchema per tool).
@@ -277,32 +238,6 @@ mod tests {
         assert!(tools.iter().any(|tool| tool.name == crate::tools::ASK_TOOL));
         // SCA is fully defunct — it must never appear as a tool.
         assert!(!tools.iter().any(|tool| tool.name.contains("sca")));
-    }
-
-    #[test]
-    fn ask_tool_uses_form_elicitation_without_a_response_deadline() {
-        let args = serde_json::json!({
-            "questions": [{
-                "id": "mode",
-                "question": "방식을 고르세요.",
-                "options": [{"label": "A"}, {"label": "B"}],
-                "multi": false
-            }]
-        });
-        let request = serde_json::to_value(ask_elicitation_request(&args).unwrap()).unwrap();
-
-        assert_eq!(
-            request["_meta"][ASK_ELICITATION_META_KEY], args,
-            "the app-server callback must receive the original structured questions"
-        );
-        assert_eq!(
-            request["requestedSchema"]["required"],
-            serde_json::json!([ASK_ELICITATION_PAYLOAD_KEY])
-        );
-        assert!(
-            request.get("timeout").is_none(),
-            "ASK elicitation must not carry a response deadline"
-        );
     }
 
     #[test]

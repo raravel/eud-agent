@@ -28,7 +28,8 @@ export const STAGE_LABELS: Record<string, string> = {
   rag_warmup: "RAG 모델 준비 중…",
   // The codex stage covers ANY turn (greetings/answers included), so the label
   // must not claim code generation specifically.
-  codex: "codex 실행 중…",
+  codex: "Codex 실행 중…",
+  provider: "AI 제공자 실행 중…",
   compaction: "대화 컨텍스트 자동 압축 중…",
   task_state_warning: "활성 작업 상태 갱신 실패",
   workspace: "프로젝트 워크스페이스 보안 환경 준비 중…",

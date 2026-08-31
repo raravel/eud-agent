@@ -51,8 +51,14 @@ describe("progressLabel", () => {
   it("other stages keep the existing label unchanged (codex, kind progress)", () => {
     const out = progressLabel("codex", undefined);
     // Turn-agnostic wording: the codex stage also covers answer-only turns.
-    expect(out.text).toBe("codex 실행 중…");
+    expect(out.text).toBe("Codex 실행 중…");
     expect(out.kind).toBe("progress");
+  });
+  it("labels non-Codex provider turns without exposing a raw provider id", () => {
+    expect(progressLabel("provider", "Claude Code turn started")).toEqual({
+      kind: "progress",
+      text: "AI 제공자 실행 중…",
+    });
   });
   it("shows native auto-compaction start and completion", () => {
     expect(progressLabel("compaction", "started")).toEqual({

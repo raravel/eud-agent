@@ -191,7 +191,7 @@ export function Header({
         {onOpenMapAgent && (
           <Button
             type="button"
-            size="sm"
+            size="default"
             variant="secondary"
             className="gap-1.5"
             disabled={!editorConnected || !hasProject}
@@ -204,7 +204,7 @@ export function Header({
         {onLaunchEditor && (
           <Button
             type="button"
-            size="sm"
+            size="default"
             variant="outline"
             className="gap-1.5"
             // A connected editor must not be re-launched (single-instance topology);

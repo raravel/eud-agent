@@ -14,22 +14,27 @@ const idleTurn: TurnState = {
   tools: [],
   blocks: [],
 };
-const codexSettings = {
+const modelSettings = {
+  provider: "codex" as const,
   models: [
     {
+      provider: "codex" as const,
       model: "gpt-default",
       displayName: "GPT Default",
       description: "기본 모델",
-      supportedReasoningEfforts: [
-        { reasoningEffort: "medium", description: "균형" },
-        { reasoningEffort: "high", description: "깊게 추론" },
-      ],
-      defaultReasoningEffort: "medium",
       isDefault: true,
+      capabilities: {
+        vision: true,
+        toolCalls: true,
+        strictStructuredOutput: true,
+        reasoningLevels: ["medium", "high"] as const,
+        nativeCompaction: true,
+        hostedWebSearch: true,
+      },
     },
   ],
   selectedModel: "gpt-default",
-  selectedReasoningEffort: "medium",
+  selectedReasoning: { level: "medium" },
 };
 const contextUsage = {
   last: {
@@ -72,9 +77,9 @@ describe("MapPromptInput — AI Elements composer", () => {
   it("keeps the literal Send action, model controls, and context inside the input group", async () => {
     const user = userEvent.setup();
     const { container } = renderInput({
-      codexSettings,
+      modelSettings,
       contextUsage,
-      onCodexSettingsChange: noop,
+      onModelSettingsChange: noop,
     });
     await user.type(
       screen.getByRole("textbox", { name: "맵 요청 입력" }),
@@ -86,11 +91,11 @@ describe("MapPromptInput — AI Elements composer", () => {
     expect(group).toContainElement(send);
     expect(screen.queryByText("후보 요청")).not.toBeInTheDocument();
     expect(
-      screen.getByRole("combobox", { name: "Codex 모델" }),
+      screen.getByRole("combobox", { name: "세션 모델" }),
     ).toHaveTextContent("GPT Default");
     expect(
       screen.getByRole("combobox", { name: "추론 단계" }),
-    ).toHaveTextContent("추론 보통");
+    ).toHaveTextContent("보통");
 
     await user.hover(screen.getByRole("button", { name: /컨텍스트 .* 사용/ }));
     expect(await screen.findByText("세션 누적")).toBeInTheDocument();

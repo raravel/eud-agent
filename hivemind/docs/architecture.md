@@ -19,49 +19,66 @@ statically linked via FFI.
 
 ```mermaid
 graph TD
-    subgraph App["eud-agent.exe (Tauri 2, single static-linked binary)"]
-        Panel["React panel (WebView2 content)<br/>panel/dist, Tauri IPC client"]
+    subgraph App["eud-agent.exe (Tauri 2)"]
+        Panel["React panel + Map Agent"]
         subgraph Core["Rust core"]
-            IPC["ipc: tauri commands + events"]
-            Orch["engine/orchestrator"]
-            Tools["tools layer (evidence gate,<br/>first_principles, btn rails)"]
-            Codex["codex_client (tokio subprocess)"]
-            Rag["rag (fastembed bge-m3 + brute-force cosine)"]
-            Map["isom (FFI) + mapsafe (rails+journal)"]
-            Bio["bridge_io (file-IPC to editor)"]
-            Eps["eps_preflight (LocalAppData mirror<br/>+ framed Node client)"]
-            Mem["memory"]
-            Work["workspace (durable docs +<br/>read-only EPS source mirror)"]
-            Boot["bootstrap (first-run download)"]
+            IPC["typed Tauri IPC"]
+            Service["ProviderService<br/>status/install/auth/catalog"]
+            Manager["SessionEngineManager"]
+            Driver["closed ProductionProviderDriver"]
+            Codex["Codex app-server adapter"]
+            Claude["Claude Code CLI adapter"]
+            AG["Antigravity OAuth/Cloud Code adapter"]
+            Go["OpenCode Go three-wire adapter"]
+            Ollama["Ollama OpenAI-compatible adapter"]
+            Dispatch["ProviderToolDispatcher / MCP"]
+            Runtime["SessionToolRuntime"]
+            Work["workspace/write coordinator/journal/review"]
+            Map["Map candidate + mapsafe + isom FFI"]
+            Bio["bridge_io"]
+            Rag["RAG / eps preflight / memory"]
         end
     end
-    Isom[["native/isom static .lib<br/>(C ABI shim over IsomTerrain/ICU/CascLib)"]]
-    subgraph Editor["EUD Editor 3 (unmodified)"]
-        Bridge["slim Lua bridge<br/>bridge/ZZZ_10_agent_bridge.lua"]
-    end
-    CodexCLI["codex exec CLI (BYO)"]
-    HF[("HuggingFace<br/>bge-m3 ONNX")]
-    GHR[("GitHub Release<br/>RAG index asset")]
-    EpsAdapter["pinned epscript-lsp agent adapter<br/>(system Node, bundled CJS)"]
+    Cred[["Windows Credential Manager"]]
+    CodexCLI["official Codex CLI"]
+    ClaudeCLI["official Claude Code CLI"]
+    Google["Google OAuth + Cloud Code Assist"]
+    OpenCode["OpenCode Go API"]
+    OllamaAPI["Ollama / authenticated proxy"]
+    Editor["EUD Editor 3 + slim Lua bridge"]
 
     Panel <-- "invoke / emit" --> IPC
-    IPC --> Orch --> Tools
-    Tools --> Codex & Rag & Map & Mem & Eps
-    Codex --> CodexCLI & Work
-    Map --> Isom
-    Orch <-- "file IPC: inbox/*.cmd to outbox/*.result" --> Bio
-    Bio <-- "editor Data\\agent\\" --> Bridge
-    Eps --> EpsAdapter
-    Boot -. "first run" .-> HF & GHR
+    IPC --> Service & Manager
+    Manager --> Driver
+    Driver --> Codex & Claude & AG & Go & Ollama
+    Codex --> CodexCLI
+    Claude --> ClaudeCLI
+    AG --> Google
+    Go --> OpenCode
+    Ollama --> OllamaAPI
+    AG & Go & Ollama --> Cred
+    Codex & Claude --> Dispatch
+    AG & Go & Ollama --> Dispatch
+    Dispatch --> Runtime
+    Runtime --> Work & Map & Bio & Rag
+    Bio <--> Editor
 ```
 
-Dependency direction: `panel -> core -> {isom .lib, editor bridge, codex, data dir}`.
-The optional agent-only preflight adds
-`Codex -> eud-tools -> ToolRuntime -> EpsPreflight -> bundled adapter`; it has no panel
-or editor-LSP dependency. The Lua bridge never calls the app (it no longer even spawns
-it); the C++ engine is a pure library with no knowledge of the app; the panel only
-speaks Tauri IPC. Heavy work (LLM, RAG, orchestration, map binary I/O, analyzer process
-containment) stays outside Lua; Lua remains a thin file-IPC tool layer.
+Dependency direction is `panel -> Rust authority -> closed provider adapters`. Provider adapters
+translate auth/catalog/turn/conversation/capability wire shapes only. Every model-visible EUD read,
+mutation, ASK, build, Map draft, journal, review, rollback, and harness action returns through the
+same `SessionToolRuntime`; no provider owns a filesystem/editor/shell authority.
+
+Each persisted session contains an immutable typed `ProviderBinding` (provider, model, reasoning,
+provider-specific base URL, conversation state). `SessionEngineManager` creates exactly one
+exhaustive enum variant from that binding. Direct providers keep strict hash-verified transcript
+generations under `%appdata%\\eud-agent\\provider-sessions\\<session-id>`; CLI providers keep only
+their typed conversation id in the session record. Compiler and harness workers copy the source
+binding rather than reading current defaults. Provider errors never select another enum variant
+or model.
+
+The optional epScript analyzer remains process-isolated and provider-neutral. The Lua bridge never
+calls the app; the C++ engine remains a pure static library; the panel speaks only Tauri IPC.
 
 ## Runtime flow (instruct then apply)
 
@@ -127,8 +144,9 @@ Runtime state is split by size and ownership (Decision 12):
 | Location | Contents | Who accesses |
 |---|---|---|
 | editor `Data\agent\` | `inbox/`, `outbox/`, `status.txt`, `heartbeat.txt` | bridge (writes/reads) + app (file-IPC) |
-| `%appdata%\eud-agent\` | `config.json` (editor path, settings), `memory/`, durable `workspaces/`, `map_candidates/`, `map_backups/`, `journal/`, `sessions/` | app; Codex can access only its current project workspace through the strict sandbox |
-| `%localappdata%\eud-agent\` | `models/`, `rag/`, `bin/` (Codex CLI + Code Mode host + Windows sandbox setup helper), `logs/`, session-owned `attachments/`, project-keyed immutable `audio_sources/`, request-owned `audio_temp/`, regenerable `lsp_workspaces/` mirrors | app only |
+| `%appdata%\eud-agent\` | secret-free Config v2, sessions with immutable provider bindings, direct-provider transcript generations, memory/workspaces/maps/journal/harness | app; provider processes receive only their current session boundary |
+| `%localappdata%\eud-agent\providers\` | Codex bin/home, Claude Code bin/config, Antigravity/OpenCode Go non-secret caches | app only; CLI credential files use protected current-user ACLs |
+| Windows Credential Manager | OpenCode Go API key, optional Ollama proxy API key, and Antigravity access/refresh credential | Rust `ProviderSecretStore` only |
 
 The bridge finds `Data\agent\` editor-relative (no absolute path baked into the .lua —
 KopiLua reads source as Latin1, so a non-ASCII path literal would corrupt). The app
@@ -157,9 +175,9 @@ unchanged. Runtime results are diagnostic and do not block changeset review.
 ## Concurrent sessions and project workspaces
 
 `SessionEngineManager` owns lazily created workers keyed by durable session id. Each worker has
-its own agent state machine, Codex app-server client/event stream, loopback MCP endpoint,
-cancellation generation, request/preflight state, and immutable session event sink. A worker
-mutex serializes only that session's commands, so read-only turns in different sessions overlap.
+its own state machine, exact `ProductionProviderDriver` variant, optional loopback MCP endpoint,
+cancellation generation, request/preflight state, and immutable event sink. One worker mutex
+serializes that session; read-only turns in different sessions/providers overlap.
 
 Projects share one `ProjectWriteCoordinator`, but write registration is concurrent: declaring
 write intent never waits behind another session's mutation or review. The coordinator keeps a
@@ -170,8 +188,7 @@ outside that critical section.
 Each project identity hashes to a canonical accepted root:
 
 `%appdata%\eud-agent\workspaces\<sha256>\`
-
-Codex runs from session roots:
+CLI providers run from session roots:
 
 `%appdata%\eud-agent\workspaces\.sessions\<sha256>\<session-id>\`
 

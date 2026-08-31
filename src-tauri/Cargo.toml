@@ -47,6 +47,8 @@ parking_lot = "0.12"
 encoding_rs = "0.8"
 rmcp = { version = "1.7.0", features = ["elicitation", "server", "transport-streamable-http-server"] }
 axum = "0.8.4"
+jsonschema = { version = "0.18", default-features = false }
+zeroize = { version = "1", features = ["derive"] }
 
 [target.'cfg(windows)'.dependencies]
 tauri-winrt-notification = "0.7"
@@ -55,6 +57,12 @@ windows-registry = "0.5"
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_Security",
+    "Win32_Security_Credentials",
+    "Win32_Security_Authorization",
+    "Win32_Security_WinTrust",
+    "Win32_Security_Cryptography",
+    "Win32_Security_Cryptography_Catalog",
+    "Win32_Security_Cryptography_Sip",
     "Win32_System_Diagnostics_Debug",
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_JobObjects",

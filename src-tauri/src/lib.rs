@@ -9,12 +9,16 @@
 use tauri::path::BaseDirectory;
 use tauri::{Emitter, Manager};
 
+pub mod antigravity_auth;
+pub mod antigravity_client;
 pub mod attachment;
 pub mod audio;
 pub mod bootstrap;
 pub mod bridge_install;
 pub mod bridge_io;
 pub mod chk;
+pub mod claude_auth;
+pub mod claude_client;
 pub mod codex_auth;
 pub mod codex_client;
 pub mod config;
@@ -37,6 +41,13 @@ pub mod mapsafe;
 pub mod mcp;
 pub mod memory;
 pub mod mentions;
+pub mod ollama;
+pub mod opencode_go;
+pub mod provider;
+pub mod provider_secrets;
+pub mod provider_service;
+pub mod provider_tool_loop;
+pub mod provider_transcript;
 pub mod rag;
 pub mod session;
 pub mod setup;
@@ -151,6 +162,21 @@ impl engine::ProjectStateProvider for AppProjectStateProvider {
     }
 }
 
+fn finish_background_ffmpeg_bootstrap(
+    emitter: &(dyn bootstrap::ProgressEmitter + Send + Sync),
+    result: anyhow::Result<bootstrap::ManagedFfmpegPaths>,
+) {
+    if let Err(error) = result {
+        eprintln!("eud-agent: managed audio converter remains unavailable: {error}");
+        emitter.emit(
+            "bootstrap",
+            100,
+            "audio converter unavailable; chat and existing attachments remain available",
+        );
+    }
+    emitter.emit("bootstrap", 100, "done");
+}
+
 /// Build and run the Tauri application.
 ///
 /// Kept out of `main.rs` so the same setup is reusable by mobile targets and
@@ -212,6 +238,9 @@ pub fn run() {
                     }
                 }
             }
+            let provider_service = provider_service::ProviderService::new(data_dirs.clone())
+                .map_err(anyhow::Error::msg)?;
+            app.manage(provider_service.clone());
 
             app.manage(ipc::BridgeManaged::new(data_dirs.clone()));
             app.manage(attachment::AttachmentManaged::new(attachment_store.clone()));
@@ -235,12 +264,11 @@ pub fn run() {
                 if auto {
                     // run_bootstrap already emitted the failure to the panel.
                     let _ = setup::run_bootstrap(&boot_handle, &boot_dirs).await;
-                } else if !bootstrap::managed_ffmpeg_ready(&boot_dirs) {
+                } else {
                     let emitter = bootstrap::TauriEmitter(boot_handle.clone());
-                    if let Err(error) = bootstrap::ensure_ffmpeg(&boot_dirs, &emitter).await {
-                        eprintln!(
-                            "eud-agent: managed audio converter remains unavailable: {error}"
-                        );
+                    if !bootstrap::managed_ffmpeg_ready(&boot_dirs) {
+                        let result = bootstrap::ensure_ffmpeg(&boot_dirs, &emitter).await;
+                        finish_background_ffmpeg_bootstrap(&emitter, result);
                     }
                 }
             });
@@ -351,6 +379,7 @@ pub fn run() {
                 session_store,
                 attachment_store,
                 services,
+                provider_service,
                 config,
                 app_handle,
                 data_dirs.clone(),
@@ -359,8 +388,8 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            engine::engine_codex_model_settings,
-            engine::engine_codex_model_settings_save,
+            engine::session_model_settings,
+            engine::session_model_settings_save,
             engine::engine_chat,
             engine::engine_plan_feedback,
             engine::engine_plan_approve,
@@ -428,6 +457,18 @@ pub fn run() {
             ipc::status,
             ipc::launch_editor,
             ipc::list,
+            provider_service::provider_settings,
+            provider_service::provider_status_list,
+            provider_service::provider_install,
+            provider_service::provider_login_start,
+            provider_service::provider_login_status,
+            provider_service::provider_login_cancel,
+            provider_service::provider_credential_import,
+            provider_service::provider_api_key_save,
+            provider_service::provider_base_url_save,
+            provider_service::provider_logout,
+            provider_service::provider_catalog,
+            provider_service::provider_defaults_save,
             ipc::memory_get,
             ipc::memory_save,
             ipc::workspace_list,
@@ -437,12 +478,77 @@ pub fn run() {
             ipc::wiki_save,
             setup::setup_status,
             setup::setup_pick_editor_path,
+            setup::setup_provider_select,
             setup::bootstrap_run,
-            codex_auth::codex_install,
-            codex_auth::codex_login_status,
-            codex_auth::codex_login_start,
-            codex_auth::codex_login_with_api_key,
         ])
         .run(tauri::generate_context!())
         .expect("error while running eud-agent application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bootstrap::ProgressEmitter;
+    use parking_lot::Mutex;
+    use std::path::PathBuf;
+
+    #[derive(Default)]
+    struct RecordingEmitter {
+        events: Mutex<Vec<(String, u8, String)>>,
+    }
+
+    impl bootstrap::ProgressEmitter for RecordingEmitter {
+        fn emit(&self, stage: &str, pct: u8, detail: &str) {
+            self.events
+                .lock()
+                .push((stage.to_string(), pct, detail.to_string()));
+        }
+    }
+
+    #[test]
+    fn background_ffmpeg_ready_is_followed_by_terminal_done() {
+        let emitter = RecordingEmitter::default();
+        emitter.emit("bootstrap", 100, "audio converter ready");
+
+        finish_background_ffmpeg_bootstrap(
+            &emitter,
+            Ok(bootstrap::ManagedFfmpegPaths {
+                ffmpeg: PathBuf::from("ffmpeg.exe"),
+                ffprobe: PathBuf::from("ffprobe.exe"),
+                version: "test".to_string(),
+            }),
+        );
+
+        assert_eq!(
+            *emitter.events.lock(),
+            vec![
+                (
+                    "bootstrap".to_string(),
+                    100,
+                    "audio converter ready".to_string(),
+                ),
+                ("bootstrap".to_string(), 100, "done".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn background_ffmpeg_failure_is_non_blocking_and_terminal() {
+        let emitter = RecordingEmitter::default();
+
+        finish_background_ffmpeg_bootstrap(&emitter, Err(anyhow::anyhow!("download failed")));
+
+        assert_eq!(
+            *emitter.events.lock(),
+            vec![
+                (
+                    "bootstrap".to_string(),
+                    100,
+                    "audio converter unavailable; chat and existing attachments remain available"
+                        .to_string(),
+                ),
+                ("bootstrap".to_string(), 100, "done".to_string()),
+            ]
+        );
+    }
 }

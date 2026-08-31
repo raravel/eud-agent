@@ -1,9 +1,9 @@
 # Feature: Concurrent multi-active sessions
 
-eud-agent persists named Codex conversations and runs independent sessions concurrently. Each
-session owns its panel store, log, Codex thread/client, cancellation generation, MCP endpoint,
-request/preflight state, working workspace, and immutable event route. Commands within one
-session are serialized; different sessions may overlap read and write turns.
+eud-agent persists named conversations with one immutable `ProviderBinding` per session. Each
+session owns its panel log, exact provider driver/conversation state, cancellation generation,
+tool/ASK/preflight state, working workspace, and immutable event route. Commands within one
+session are serialized; different sessions/providers may overlap read turns.
 
 Write intent creates a concurrent session registration immediately. Only operations that touch
 shared editor/map/memory/build state and canonical workspace acceptance enter a short per-project
@@ -24,12 +24,15 @@ All writes use `memory::write_atomic_bytes` and UTF-8 without BOM. `index.json` 
 
 ```json
 {
-  "schemaVersion": 3,
+  "schemaVersion": 4,
   "sessions": [
     {
       "id": "<rust UUID>",
       "name": "유닛 HP 작업",
       "project": "mymap",
+      "kind": "eps",
+      "provider": "claude-code",
+      "model": "sonnet",
       "createdAt": 1718000000,
       "lastConversationAt": 1718009999000
     }
@@ -37,46 +40,39 @@ All writes use `memory::write_atomic_bytes` and UTF-8 without BOM. `index.json` 
 }
 ```
 
-`createdAt` is Unix seconds; `lastConversationAt` is Unix milliseconds. Creating the first
-conversation and submitting a later `chat` or `plan_feedback` advances
-`lastConversationAt` past every indexed row before the turn runs. Rename, panel-log autosave,
-context usage, activity transitions, rewind, cancellation, and changeset decisions do not change
-conversation recency. Schema-v1 `updatedAt` seconds remain readable. The one-time v3 cutover
-preserves names and panel logs while resetting legacy thread/context/pending execution ownership
-and unaccepted session workspaces/journals before the new harness state machine starts.
+`createdAt` is Unix seconds; `lastConversationAt` is Unix milliseconds. First request admission
+copies the ready global default provider/model/reasoning into the record before worker creation.
+Subsequent global changes never mutate the row. Rename, panel-log autosave, context usage,
+activity, rewind, cancellation, and review do not change recency or provider. Schema-v3 and older
+records migrate losslessly to a Codex binding using the legacy thread id and migrated Codex model.
 
-Each session file contains the flattened metadata plus:
+Each session file contains the flattened metadata plus strict provider authority:
 
 ```json
 {
-  "threadId": "019ece1c-...",
+  "providerBinding": {
+    "provider": "claude-code",
+    "model": "sonnet",
+    "reasoning": { "level": "high" },
+    "conversation": {
+      "provider": "claude-code",
+      "sessionId": "019ece1c-..."
+    }
+  },
   "pendingRequestIds": ["req-1a2b3c4d"],
   "contextUsage": {
-    "last": {
-      "inputTokens": 31000,
-      "cachedInputTokens": 24000,
-      "cacheWriteInputTokens": 0,
-      "outputTokens": 1200,
-      "reasoningOutputTokens": 800,
-      "totalTokens": 32200
-    },
-    "total": {
-      "inputTokens": 52000,
-      "cachedInputTokens": 40000,
-      "cacheWriteInputTokens": 600,
-      "outputTokens": 2100,
-      "reasoningOutputTokens": 1300,
-      "totalTokens": 54100
-    },
+    "last": { "inputTokens": 31000, "totalTokens": 32200 },
+    "total": { "inputTokens": 52000, "totalTokens": 54100 },
     "modelContextWindow": 128000
   },
   "panelLog": { "schemaVersion": 2, "logSeq": 4, "log": [] },
   "contextState": {
-    "schemaVersion": 1,
+    "schemaVersion": 2,
     "instructionEpoch": 3,
     "staticPromptFingerprint": "<sha256>",
     "delivered": {
-      "threadId": "019ece1c-...",
+      "provider": "claude-code",
+      "conversationKey": "019ece1c-...",
       "epoch": 3,
       "memorySha256": "<sha256>",
       "wikiSha256": "<sha256>",
@@ -197,28 +193,28 @@ review -> rejected
 generation while keeping accepted code.
 
 Harness state never changes `session_activity`, never occupies the conversation worker mutex, and
-never disables chat. Each attempt owns a synthetic Codex driver with no MCP server, one constrained
-turn, and a dedicated document workspace.
+never disables chat. Each attempt owns a fresh tools-disabled driver created from the job's
+provider/model/reasoning snapshot and a dedicated document workspace.
 
 ## Session workers
 
 `SessionEngineManager` lazily owns `HashMap<SessionId, Arc<SessionWorker>>`. Each worker contains:
 
 - a session-bound `AgentEngine` behind its own Tokio mutex;
-- `ProductionCodexDriver` with its own app-server client and event receiver;
-- a session-bound loopback MCP server and `SessionToolRuntime`;
+- one exact `ProductionProviderDriver` enum variant from the persisted binding;
+- a session-bound `SessionToolRuntime` and, for CLI providers, loopback MCP server;
 - a per-worker cancellation watch channel;
-- `SessionEventSink(app, sessionId)`.
+- `SessionEventSink(app, sessionId)` and immutable provider id for logout busy protection.
 
 The worker mutex is the same-session command sequencer. There is no global `ManagedAgentEngine`
 mutex and no mutable session-switching path. `session_open` hydrates only the named worker and is
 idempotent. Selecting a sidebar row never calls it.
 
-Resume seeds the saved thread id. A seed error or bounded first-resume failure resets only that
-worker and starts a fresh thread with a condensed transcript plus the full safety prompt.
+Resume seeds the binding's typed conversation state. A mismatch fails load; a provider-supported
+resume failure resets only that provider conversation and replays a bounded condensed transcript.
 
-Global model settings use a separate settings lock and temporary app-server; they are not stored
-inside any conversation worker.
+Global provider/model settings are owned by `ProviderService` with per-provider locks. They are
+new-session defaults only and are never read by an existing worker or harness retry.
 
 ## Project write coordinator
 
@@ -328,8 +324,8 @@ fallbacks do not exist.
 The Map Agent window lists only `SessionKind::Map` rows for the current project and saved
 `OpenMapName` source. `map_agent_session_list`, `map_agent_session_create`,
 `map_agent_session_load`, `map_agent_session_rename`, and `map_agent_session_delete` keep this
-surface separate from the main EPS sidebar. Loading a row reopens that session's Codex worker,
-candidate revision chain, saved selections, context usage, and panel conversation.
+surface separate from the main EPS sidebar. Loading a row recreates that session's exact provider
+worker, candidate revision chain, selections, context usage, and panel conversation.
 
 The history dialog is latest-conversation-first, searchable, and identifies the active row. It
 supports creating, renaming, and deleting inactive map work. Switching is disabled while the

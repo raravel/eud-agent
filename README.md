@@ -40,10 +40,11 @@ third-party tool (Buizz) and is **never modified** — integration is file copie
 | **Windows** | Windows 10/11. The editor is Windows-only; the app targets MSVC. |
 | **EUD Editor 3** | The third-party editor this agent integrates with. |
 | **WebView2 runtime** | System Evergreen runtime; the installer can bootstrap it. |
-| **codex CLI** | The LLM CLI the Rust core spawns. Install with `npm install -g @openai/codex`, or set `CODEX_CMD` to a full path. |
+| **One AI provider connection** | Choose Codex (ChatGPT/API key), Claude Code subscription, experimental Antigravity Google OAuth, OpenCode Go API key, or an Ollama OpenAI-compatible endpoint during first run. |
 
-First-run bootstrap downloads the bge-m3 ONNX model (from HuggingFace) and the RAG index
-(from a GitHub Release); every asset is sha256-verified and placed atomically.
+First-run setup downloads and verifies only bge-m3/RAG assets, then requires one default provider.
+Codex and Claude Code can be installed in app-owned profiles from the provider card; no global CLI
+is an unconditional prerequisite.
 
 ### Additional requirements for building from source
 
@@ -54,15 +55,20 @@ First-run bootstrap downloads the bge-m3 ONNX model (from HuggingFace) and the R
 | **Node.js + npm** | For the React panel (`panel/`). |
 | **MSVC toolchain** | Required to build the statically-linked `isom` C++ engine (MSBuild). |
 
+Antigravity builds require deployment-owned OAuth credentials at compile time through
+`EUD_ANTIGRAVITY_OAUTH_CLIENT_ID` and `EUD_ANTIGRAVITY_OAUTH_CLIENT_SECRET`. The release workflow
+reads them from the matching GitHub Actions repository variable and secret. OAuth client
+credentials are never committed; user tokens remain isolated in Windows Credential Manager.
+
 ---
 
 ## Installation (users)
 
-1. Download the latest `eud-agent_*-setup.exe` from the
-   [GitHub Releases](https://github.com/raravel/eud-agent/releases) page.
-2. Run the installer (per-user install — no admin rights required).
-3. Install the codex CLI if you don't have it: `npm install -g @openai/codex`.
-4. Launch **eud-agent**. On first run it sets up the model and RAG index, then shows the panel.
+1. Download the latest `eud-agent_*-setup.exe` from
+   [GitHub Releases](https://github.com/raravel/eud-agent/releases).
+2. Run the per-user installer.
+3. Launch **eud-agent** and complete the four setup steps: editor folder, assets, default provider,
+   and selected-provider authentication/model. The other four providers are optional.
 
 The app is independent of the editor's lifecycle: if EUD Editor 3 isn't running, the panel
 shows *"editor not connected"* until the bridge heartbeat appears.
@@ -71,17 +77,17 @@ shows *"editor not connected"* until the bridge heartbeat appears.
 
 ## Usage
 
-1. Open EUD Editor 3 (the agent installs/refreshes its Lua bridge automatically on launch).
-2. In the panel, enter an **instruction** and pick a **target file**.
-3. The agent runs RAG search → codex generation, then shows **code + diff + diagnostics**.
-4. Review the diff and click **Apply** (`set` to overwrite, `neweps` to create a new eps).
-5. The change is applied in editor memory on the next UI-thread tick — **you save in the editor.**
+1. Open EUD Editor 3; eud-agent installs/refreshes its Lua bridge automatically.
+2. Start a new EPS or Map session. The current default provider/model is pinned on first request.
+3. Ask, inspect evidence, edit through eud-tools, run preflight/build, and accept or reject the
+   journaled changeset. Every provider uses the same Rust write/review authority.
+4. Change global defaults under **Settings → AI Providers**; existing sessions and harness retries
+   keep their original provider/model. Use a new session to change providers.
 
-- Enter `/compact` by itself to run Codex's native conversation compaction. Codex also
-  compacts automatically when the active model reaches its configured token threshold.
-- **Settings → Codex** enables the 1M context override per model. The choice is persisted in
-  `%appdata%\eud-agent\config.json`; Codex-clamped overrides below 828,400 effective tokens
-  keep their reported window and show one warning after the next usage update.
+- `/compact` uses the pinned provider's supported native or direct-summary compaction path.
+- Provider/auth/quota/model failures stop on that provider. eud-agent never silently resends data
+  to another provider or model.
+- Codex-only 1M context opt-in remains under its provider section.
 
 > Settable/creatable text types are **CUI / RawText only**; GUI files are read-only and SCA is
 > a defunct type that is never exposed.
@@ -90,66 +96,50 @@ shows *"editor not connected"* until the bridge heartbeat appears.
 
 ## Architecture
 
-`eud-agent` is a single static-linked binary: a React panel (WebView2 content) over a Rust
-core, talking to the unmodified editor through a slim file-IPC Lua bridge, with the C++ map
-engine linked in via FFI.
+`eud-agent` is one Tauri/Rust authority with five closed provider adapters. Providers own only
+auth/catalog/conversation/wire translation; every EUD tool, write lease, journal, review,
+rollback, preflight, build, and Map candidate remains in the shared Rust runtime.
 
 ```mermaid
 graph TD
-    subgraph App["eud-agent.exe (Tauri 2, single static-linked binary)"]
-        Panel["React panel (WebView2)<br/>Tauri IPC client"]
-        subgraph Core["Rust core"]
-            IPC["ipc: tauri commands + events"]
-            Orch["engine/orchestrator"]
-            Tools["tools layer (evidence gate,<br/>first_principles, btn rails)"]
-            Codex["codex_client (tokio subprocess)"]
-            Rag["rag (fastembed bge-m3 + cosine)"]
-            Map["isom (FFI) + mapsafe (rails+journal)"]
-            Bio["bridge_io (file-IPC)"]
-            Mem["memory"]
-            Boot["bootstrap (first-run download)"]
-        end
-    end
-    Isom[["native/isom static .lib<br/>(C ABI over IsomTerrain/ICU/CascLib)"]]
-    subgraph Editor["EUD Editor 3 (unmodified)"]
-        Bridge["slim Lua bridge"]
-    end
-    CodexCLI["codex exec CLI (BYO)"]
-
-    Panel <-- "invoke / emit" --> IPC
-    IPC --> Orch --> Tools
-    Tools --> Codex & Rag & Map & Mem
-    Codex --> CodexCLI
-    Map --> Isom
-    Orch <-- "file IPC: inbox/*.cmd → outbox/*.result" --> Bio
-    Bio <-- "editor Data\agent\" --> Bridge
+    Panel["React panel + Map Agent"] --> IPC["typed Tauri IPC"]
+    IPC --> Manager["SessionEngineManager"]
+    IPC --> Service["ProviderService"]
+    Manager --> Driver["immutable session ProviderBinding"]
+    Driver --> Codex["Codex CLI app-server"]
+    Driver --> Claude["Claude Code CLI"]
+    Driver --> AG["Antigravity direct OAuth/HTTP"]
+    Driver --> Go["OpenCode Go direct three-wire HTTP"]
+    Driver --> Ollama["Ollama OpenAI-compatible HTTP"]
+    Codex & Claude & AG & Go & Ollama --> Tools["SessionToolRuntime"]
+    Tools --> Work["workspace / journal / review / build"]
+    Tools --> Map["mapsafe / isom FFI"]
+    Tools --> Bridge["file-IPC Lua bridge → EUD Editor 3"]
 ```
 
-Dependency direction: `panel → core → {isom .lib, editor bridge, codex, data dir}`. Heavy work
-(LLM, RAG, orchestration, map binary I/O) stays in Rust/C++; the Lua bridge stays a thin
-file-IPC tool layer and never calls back into the app.
+No OMP/OpenCode runtime is embedded. Direct and optional proxy credentials stay in Windows
+Credential Manager. Ollama base URLs are pinned into new session bindings; provider failure never
+selects another provider/model.
 
-### Runtime flow (instruct, then apply)
+### Runtime flow
 
 ```mermaid
 sequenceDiagram
     participant U as User
     participant P as Panel
-    participant C as Rust core
-    participant L as Lua bridge
-    participant E as EUD Editor 3
-    U->>P: instruction + target file
-    P->>C: invoke instruct
-    C->>C: rag search (in-process)
-    C->>C: codex exec (prompt via stdin)
-    C->>L: inbox GET target (for diff)
-    C-->>P: emit code {code, diff, diagnostics}
-    U->>P: clicks Apply
-    P->>C: invoke apply {mode: set|neweps}
-    C->>L: inbox srv-id.cmd (SET / NEWEPS)
-    L->>E: applied on UI-thread tick
-    L-->>C: outbox srv-id.result
-    C-->>P: emit applied | error
+    participant R as Rust engine
+    participant A as Pinned provider
+    participant T as eud-tools authority
+    U->>P: request
+    P->>R: session id + validated attachments/mentions
+    R->>R: persist/validate immutable binding
+    R->>A: provider-native turn
+    A->>T: inspect / ASK / request write / mutate / build
+    T-->>A: bounded journaled result
+    A-->>R: answer or structured result
+    R-->>P: answer + reviewable changeset
+    U->>P: accept or reject
+    P->>R: exact changeset decision
 ```
 
 For deeper detail (boot/bootstrap flow, data-directory layout, file-IPC protocol, and the full
@@ -165,9 +155,9 @@ eud-agent/
 ├── hivemind/                       # harness docs + tasks (architecture, rules, ...)
 ├── bridge/ZZZ_10_agent_bridge.lua  # slim file-IPC tool layer (editor side)
 ├── src-tauri/                      # Tauri 2 Rust app
-│   └── src/                        # ipc, engine, tools, codex_client, rag,
-│                                   # isom (FFI), mapsafe, bridge_io, memory,
-│                                   # config, bootstrap, chk
+│   └── src/                        # provider service/drivers/auth/transcripts,
+│                                   # engine/tools/workspace/journal/map/RAG,
+│                                   # bridge I/O, config/bootstrap/security
 ├── crates/
 │   ├── isom-sys/                   # FFI bindings + build.rs (msbuild + link)
 │   └── isom/                       # safe Rust wrapper over isom-sys
@@ -193,8 +183,8 @@ pwsh -NoProfile -File scripts\dev_run.ps1
 cargo tauri build
 ```
 
-`scripts\dev_run.ps1` checks prerequisites (codex CLI, cargo) before launching
-`cargo tauri dev`. Pushing a committed `v*` tag runs `.github/workflows/publish-app.yml`,
+`scripts\dev_run.ps1` requires Cargo/Tauri only; provider installation and authentication are
+owned by the app. Pushing a committed `v*` tag runs `.github/workflows/publish-app.yml`,
 which builds and signs the NSIS installer and publishes the updater `latest.json`.
 `scripts\release.ps1` remains the local fallback because a local `tauri build` does not emit it.
 

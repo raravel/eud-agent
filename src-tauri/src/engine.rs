@@ -16,11 +16,12 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+#[cfg(test)]
+use crate::codex_client::CodexModel;
 use crate::{
     attachment::{AttachmentContext, AttachmentStore},
     codex_client::{
-        AppServerEvent, CodexAppServerClient, CodexModel, CodexModelSelection, CodexModelSettings,
-        CodexTurnInput, WorkspaceAccess,
+        AgentTurnInput, AppServerEvent, CodexAppServerClient, CodexModelSelection, WorkspaceAccess,
     },
     ipc, journal,
     tool_exec::SessionToolRuntime,
@@ -236,14 +237,14 @@ const TRIAGE_INSTRUCTIONS: &str = r#"[triage]
 - Otherwise, execute the requested change directly regardless of its size. File writes and build_run never require plan approval."#;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CodexTurnResult {
+pub enum AgentTurnResult {
     Answer {
         text: String,
     },
     Plan {
         markdown: String,
     },
-    /// The user interrupted the live app-server turn. Any journaled writes stay
+    /// The user interrupted the live provider turn. Any journaled writes stay
     /// reviewable, but no answer or plan event is emitted.
     Cancelled,
 }
@@ -269,29 +270,28 @@ impl fmt::Display for AgentEngineError {
 
 impl std::error::Error for AgentEngineError {}
 
-pub(crate) trait CodexDriver {
+pub(crate) trait AgentDriver {
     async fn run_turn(
         &mut self,
-        input: CodexTurnInput,
-    ) -> Result<CodexTurnResult, AgentEngineError>;
-    /// Run one tools-disabled, nonpersistent compiler turn on a fresh thread.
+        input: AgentTurnInput,
+    ) -> Result<AgentTurnResult, AgentEngineError>;
+    /// Run one tools-disabled, nonpersistent compiler turn on a fresh conversation.
     /// Test drivers may opt out; production always overrides this seam.
     async fn compile_task_state(
         &mut self,
-        _input: CodexTurnInput,
+        _input: AgentTurnInput,
     ) -> Result<Option<String>, AgentEngineError> {
         Ok(None)
     }
-    async fn compact_thread(&mut self) -> Result<(), AgentEngineError>;
-    async fn reset_thread(&mut self) -> Result<(), AgentEngineError>;
+    async fn compact_conversation(&mut self) -> Result<(), AgentEngineError>;
+    async fn reset_conversation(&mut self) -> Result<(), AgentEngineError>;
 
-    /// The live codex thread id, captured once `ThreadStarted` has arrived (session
-    /// restore: the engine persists this so a later `open_session` can resume it).
-    async fn current_thread_id(&self) -> Option<String>;
+    async fn conversation_state(&self) -> crate::provider::ProviderConversationState;
 
-    /// Seed a saved thread id so the next `run_turn` issues `thread/resume` instead
-    /// of `thread/start` (session restore primary path, decision E).
-    async fn seed_thread_id(&mut self, id: String) -> Result<(), AgentEngineError>;
+    async fn seed_conversation(
+        &mut self,
+        state: crate::provider::ProviderConversationState,
+    ) -> Result<(), AgentEngineError>;
 
     /// Current session workspace prepared by the production driver.
     fn current_workspace(&self) -> Option<PreparedWorkspace> {
@@ -439,7 +439,7 @@ enum WriteContinuation {
     ApprovedPlan,
 }
 
-pub(crate) struct AgentEngine<D: CodexDriver, S: EventSink> {
+pub(crate) struct AgentEngine<D: AgentDriver, S: EventSink> {
     driver: D,
     sink: S,
     config: AgentEngineConfig,
@@ -457,6 +457,7 @@ pub(crate) struct AgentEngine<D: CodexDriver, S: EventSink> {
     session_id: String,
     project_id: String,
     session_kind: crate::session::SessionKind,
+    provider_binding: crate::provider::ProviderBinding,
     pending_write: Option<WriteContinuation>,
     pending_resume_transcript: Option<String>,
     pending_context_delivery: Option<crate::context_state::ModelContextCursor>,
@@ -466,7 +467,7 @@ pub(crate) struct AgentEngine<D: CodexDriver, S: EventSink> {
     journal_data_dir: PathBuf,
     runtime: SessionToolRuntime,
 }
-impl<D: CodexDriver, S: EventSink> AgentEngine<D, S> {
+impl<D: AgentDriver, S: EventSink> AgentEngine<D, S> {
     pub fn new(
         driver: D,
         sink: S,
@@ -478,6 +479,7 @@ impl<D: CodexDriver, S: EventSink> AgentEngine<D, S> {
     ) -> Self {
         let journal_store = runtime.journal().clone();
         let journal_data_dir = runtime.app_data_dir();
+        let provider_binding = session.provider_binding.clone();
         Self {
             driver,
             sink,
@@ -496,6 +498,7 @@ impl<D: CodexDriver, S: EventSink> AgentEngine<D, S> {
             session_id: session.meta.id,
             project_id: session.meta.project,
             session_kind: session.meta.kind,
+            provider_binding,
             pending_write: None,
             pending_resume_transcript: None,
             pending_context_delivery: None,
@@ -544,7 +547,7 @@ impl<D: CodexDriver, S: EventSink> AgentEngine<D, S> {
 
         let mut replay = replay_transcript.map(str::to_string);
         if !record.context_state.baseline_matches(&static_baseline) {
-            self.driver.reset_thread().await?;
+            self.driver.reset_conversation().await?;
             self.thread_active = false;
             self.pending_resume_transcript = None;
             if replay.is_none() {
@@ -561,8 +564,8 @@ impl<D: CodexDriver, S: EventSink> AgentEngine<D, S> {
             force_full = true;
         }
 
-        let current_thread_id = if self.thread_active {
-            self.driver.current_thread_id().await
+        let current_conversation_key = if self.thread_active {
+            self.driver.conversation_state().await.conversation_key()
         } else {
             None
         };
@@ -593,7 +596,8 @@ impl<D: CodexDriver, S: EventSink> AgentEngine<D, S> {
                 replay_transcript: replay.as_deref(),
                 resolved_mentions,
                 user_text,
-                current_thread_id: current_thread_id.as_deref(),
+                provider: record.provider_binding.provider,
+                current_conversation_key: current_conversation_key.as_deref(),
                 force_full: force_full || !self.thread_active,
             },
         )
@@ -613,14 +617,16 @@ impl<D: CodexDriver, S: EventSink> AgentEngine<D, S> {
         Ok(assembly.text)
     }
 
-    async fn commit_context_delivery(&mut self, result: &CodexTurnResult) {
+    async fn commit_context_delivery(&mut self, result: &AgentTurnResult) {
         let Some(mut cursor) = self.pending_context_delivery.take() else {
             return;
         };
-        if matches!(result, CodexTurnResult::Cancelled) {
+        if matches!(result, AgentTurnResult::Cancelled) {
             return;
         }
-        cursor.thread_id = self.driver.current_thread_id().await;
+        let conversation = self.driver.conversation_state().await;
+        cursor.provider = conversation.provider();
+        cursor.conversation_key = conversation.conversation_key();
         if let Err(error) =
             self.session_store
                 .commit_context_delivery(&self.session_id, cursor.epoch, cursor)
@@ -762,7 +768,7 @@ impl<D: CodexDriver, S: EventSink> AgentEngine<D, S> {
 
         let result = self
             .run_first_turn_with_resume_fallback(
-                CodexTurnInput {
+                AgentTurnInput {
                     text: turn_text,
                     image_paths: attachment_context.image_paths,
                     workspace_root: None,
@@ -777,8 +783,8 @@ impl<D: CodexDriver, S: EventSink> AgentEngine<D, S> {
         if self.session_kind == crate::session::SessionKind::Eps {
             self.commit_context_delivery(&result).await;
         }
-        self.thread_active = if matches!(&result, CodexTurnResult::Cancelled) {
-            self.driver.current_thread_id().await.is_some()
+        self.thread_active = if matches!(&result, AgentTurnResult::Cancelled) {
+            self.driver.conversation_state().await.is_started()
         } else {
             true
         };
@@ -815,10 +821,10 @@ impl<D: CodexDriver, S: EventSink> AgentEngine<D, S> {
     /// (no staged transcript) runs unchanged with no timeout wrapper.
     async fn run_first_turn_with_resume_fallback(
         &mut self,
-        input: CodexTurnInput,
+        input: AgentTurnInput,
         user_text: &str,
         mention_instances: &[crate::mentions::MentionInstance],
-    ) -> Result<CodexTurnResult, AgentEngineError> {
+    ) -> Result<AgentTurnResult, AgentEngineError> {
         let Some(transcript) = self.pending_resume_transcript.take() else {
             return self.driver.run_turn(input).await;
         };
@@ -888,8 +894,8 @@ impl<D: CodexDriver, S: EventSink> AgentEngine<D, S> {
         image_paths: Vec<PathBuf>,
         resolved_mentions: Option<&str>,
         reset_epoch: bool,
-    ) -> Result<CodexTurnResult, AgentEngineError> {
-        self.driver.reset_thread().await?;
+    ) -> Result<AgentTurnResult, AgentEngineError> {
+        self.driver.reset_conversation().await?;
         self.thread_active = false;
         if reset_epoch {
             self.session_store
@@ -901,7 +907,7 @@ impl<D: CodexDriver, S: EventSink> AgentEngine<D, S> {
             .await?;
         let result = self
             .driver
-            .run_turn(CodexTurnInput {
+            .run_turn(AgentTurnInput {
                 text: turn_text,
                 image_paths,
                 workspace_root: None,
@@ -914,19 +920,14 @@ impl<D: CodexDriver, S: EventSink> AgentEngine<D, S> {
         Ok(result)
     }
 
-    /// After a successful turn, refresh the active session record (decision B:
-    /// once a session is open, every completed `chat` auto-updates it). Captures
-    /// the live thread_id and the still-pending changeset req-id; the `panelLog`
-    /// is pushed separately by the panel via `session_update_log`, so it is left
-    /// untouched here.
-    /// Best-effort: a missing/corrupt record or a failed write is logged, never
-    /// surfaced as a chat error.
+    /// After a successful turn, persist the exact provider conversation and
+    /// still-pending changeset ownership. The panel log is saved separately.
     async fn update_active_session(&mut self) {
-        let thread_id = self.driver.current_thread_id().await;
+        let conversation = self.driver.conversation_state().await;
         let pending_request_ids = self.live_pending_request_ids();
         if let Err(error) = self.session_store.update_runtime_state(
             &self.session_id,
-            thread_id,
+            conversation,
             pending_request_ids,
         ) {
             eprintln!("eud-agent: active session update failed: {error}");
@@ -949,8 +950,8 @@ impl<D: CodexDriver, S: EventSink> AgentEngine<D, S> {
     /// A `propose_plan` tool call during the turn parks its markdown on the
     /// runtime; if the open request left one, the turn ends as a plan review
     /// rather than a plain answer (feature 11: propose_plan ends the turn).
-    fn reinterpret_plan(&self, result: CodexTurnResult) -> CodexTurnResult {
-        if matches!(&result, CodexTurnResult::Cancelled) {
+    fn reinterpret_plan(&self, result: AgentTurnResult) -> AgentTurnResult {
+        if matches!(&result, AgentTurnResult::Cancelled) {
             if let Some(request_id) = self.current_request_id.as_deref() {
                 let _ = self.runtime.take_pending_plan(request_id);
             }
@@ -958,7 +959,7 @@ impl<D: CodexDriver, S: EventSink> AgentEngine<D, S> {
         }
         if let Some(request_id) = self.current_request_id.as_deref() {
             if let Some(markdown) = self.runtime.take_pending_plan(request_id) {
-                return CodexTurnResult::Plan { markdown };
+                return AgentTurnResult::Plan { markdown };
             }
         }
         result
@@ -1001,7 +1002,7 @@ impl<D: CodexDriver, S: EventSink> AgentEngine<D, S> {
             .await?;
         let result = self
             .driver
-            .run_turn(CodexTurnInput {
+            .run_turn(AgentTurnInput {
                 text: turn_text,
                 image_paths: attachment_context.image_paths,
                 workspace_root: None,
@@ -1088,7 +1089,7 @@ Continue the requested change now, run the mandatory build, and stop only after 
             .await?;
         let result = self
             .driver
-            .run_turn(CodexTurnInput::text(turn_text).with_access(WorkspaceAccess::Write))
+            .run_turn(AgentTurnInput::text(turn_text).with_access(WorkspaceAccess::Write))
             .await?;
         self.commit_context_delivery(&result).await;
         self.thread_active = true;
@@ -1234,8 +1235,14 @@ Continue the requested change now, run the mandatory build, and stop only after 
 
         let mut harness_job = if settled && !self.accepted_for_harness.is_empty() {
             self.driver.current_workspace().map(|workspace| {
-                crate::harness::HarnessJob::new(
+                crate::harness::HarnessJob::new_with_provider(
                     self.session_id.clone(),
+                    crate::harness::HarnessProviderBinding {
+                        provider: self.provider_binding.provider,
+                        model: self.provider_binding.model.clone(),
+                        reasoning: self.provider_binding.reasoning.clone(),
+                        base_url: self.provider_binding.base_url.clone(),
+                    },
                     self.project_id.clone(),
                     workspace.id,
                     request_id.clone(),
@@ -1396,20 +1403,20 @@ Continue the requested change now, run the mandatory build, and stop only after 
             .and_then(|provider| provider.record_accepted(entries))
     }
 
-    /// Compact the live Codex thread through app-server without changing panel history
-    /// or backend-owned plan/review state.
+    /// Compact the live provider conversation without changing panel history or
+    /// backend-owned plan/review state.
     pub async fn compact(&mut self) -> Result<(), AgentEngineError> {
-        if !self.thread_active || self.driver.current_thread_id().await.is_none() {
+        if !self.thread_active || !self.driver.conversation_state().await.is_started() {
             return Err(AgentEngineError::new(
-                "압축할 Codex 대화가 없습니다. 먼저 메시지를 보내 주세요.",
+                "압축할 provider 대화가 없습니다. 먼저 메시지를 보내 주세요.",
             ));
         }
         if matches!(self.phase, Phase::Triage | Phase::Executing) {
             return Err(AgentEngineError::new(
-                "현재 Codex 작업이 끝난 뒤 대화를 압축해 주세요.",
+                "현재 provider 작업이 끝난 뒤 대화를 압축해 주세요.",
             ));
         }
-        self.driver.compact_thread().await?;
+        self.driver.compact_conversation().await?;
         self.session_store
             .record_compaction_boundary(&self.session_id, &static_prompt_baseline())
             .map_err(|error| AgentEngineError::new(error.to_string()))?;
@@ -1428,7 +1435,7 @@ Continue the requested change now, run the mandatory build, and stop only after 
                 "현재 세션의 진행 중인 요청 또는 검토를 먼저 완료해 주세요.",
             ));
         }
-        self.driver.reset_thread().await?;
+        self.driver.reset_conversation().await?;
         self.thread_active = false;
         self.phase = Phase::Idle;
         self.current_plan_markdown = None;
@@ -1498,14 +1505,17 @@ Continue the requested change now, run the mandatory build, and stop only after 
 
         let transcript = condense_transcript(&record.panel_log);
         let staged = (!transcript.is_empty()).then_some(transcript);
-        if let Some(thread_id) = record.thread_id.clone() {
-            match self.driver.seed_thread_id(thread_id).await {
+        let conversation = record.provider_binding.conversation.clone();
+        if conversation.is_started() {
+            match self.driver.seed_conversation(conversation).await {
                 Ok(()) => {
                     self.thread_active = true;
                     self.pending_resume_transcript = staged;
                 }
                 Err(error) => {
-                    eprintln!("eud-agent: thread seed failed, will replay transcript: {error}");
+                    eprintln!(
+                        "eud-agent: conversation seed failed, will replay transcript: {error}"
+                    );
                     self.thread_active = false;
                     self.pending_resume_transcript = staged;
                 }
@@ -1591,7 +1601,7 @@ Continue the requested change now, run the mandatory build, and stop only after 
 
     async fn update_task_state_after_turn(
         &mut self,
-        result: &CodexTurnResult,
+        result: &AgentTurnResult,
         compiler_user_text: &str,
         resolved_mentions: Option<&str>,
     ) {
@@ -1609,7 +1619,7 @@ Continue the requested change now, run the mandatory build, and stop only after 
             }
         };
         let expected_leaf = record.task_state.leaf_id.clone();
-        if matches!(result, CodexTurnResult::Cancelled) {
+        if matches!(result, AgentTurnResult::Cancelled) {
             let event = crate::task_state::TaskStateEvent::new(
                 Some(client_turn_id),
                 Some(request_id),
@@ -1626,9 +1636,9 @@ Continue the requested change now, run the mandatory build, and stop only after 
         }
 
         let foreground_result = match result {
-            CodexTurnResult::Answer { text } => text.as_str(),
-            CodexTurnResult::Plan { markdown } => markdown.as_str(),
-            CodexTurnResult::Cancelled => return,
+            AgentTurnResult::Answer { text } => text.as_str(),
+            AgentTurnResult::Plan { markdown } => markdown.as_str(),
+            AgentTurnResult::Cancelled => return,
         };
         let workspace_root = self
             .driver
@@ -1677,7 +1687,7 @@ Continue the requested change now, run the mandatory build, and stop only after 
                 return;
             }
         };
-        let turn = CodexTurnInput::text(prompt)
+        let turn = AgentTurnInput::text(prompt)
             .with_output_schema(crate::task_state::compiler_output_schema())
             .without_tools();
         let output = match tokio::time::timeout(
@@ -1788,19 +1798,21 @@ Continue the requested change now, run the mandatory build, and stop only after 
             detail: Some(
                 "작업 결과는 유지되지만 구조화된 활성 작업 상태를 갱신하지 못했습니다.".to_string(),
             ),
+            provider: Some(self.provider_binding.provider),
+            model: Some(self.provider_binding.model.clone()),
         }));
     }
 
-    fn handle_turn_result(&mut self, result: CodexTurnResult) -> Result<(), AgentEngineError> {
+    fn handle_turn_result(&mut self, result: AgentTurnResult) -> Result<(), AgentEngineError> {
         match result {
-            CodexTurnResult::Answer { text } => {
+            AgentTurnResult::Answer { text } => {
                 self.last_answer = text.clone();
                 self.phase = Phase::Answer;
                 self.sink
                     .emit(EngineEvent::Answer(ipc::AnswerEvent { text }))?;
                 self.phase = Phase::Idle;
             }
-            CodexTurnResult::Plan { markdown } => {
+            AgentTurnResult::Plan { markdown } => {
                 self.plan_revision = self
                     .plan_revision
                     .checked_add(1)
@@ -1812,7 +1824,7 @@ Continue the requested change now, run the mandatory build, and stop only after 
                     revision: self.plan_revision,
                 }))?;
             }
-            CodexTurnResult::Cancelled => {
+            AgentTurnResult::Cancelled => {
                 self.phase = Phase::Idle;
             }
         }
@@ -1969,46 +1981,44 @@ fn app_server_client_is_reusable(
         && client_access == Some(requested_access)
 }
 
-fn load_model_configuration(
-    dirs: &crate::config::DataDirs,
-) -> Result<(Option<CodexModelSelection>, bool), AgentEngineError> {
-    let config = dirs
-        .load_config()
-        .map_err(|error| AgentEngineError::new(format!("failed to load config: {error}")))?;
-    let selection = match (
-        config.codex_model.as_deref(),
-        config.codex_reasoning_effort.as_deref(),
-    ) {
-        (Some(model), Some(reasoning_effort))
-            if !model.trim().is_empty() && !reasoning_effort.trim().is_empty() =>
-        {
-            Some(CodexModelSelection {
-                model: model.to_string(),
-                reasoning_effort: reasoning_effort.to_string(),
-            })
-        }
-        _ => None,
-    };
-    let large_context_enabled = selection
-        .as_ref()
-        .is_some_and(|selection| config.codex_large_context_models.contains(&selection.model));
-    Ok((selection, large_context_enabled))
-}
-
 impl ProductionCodexDriver {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         session_id: impl Into<String>,
         cwd: impl Into<PathBuf>,
         sink: SessionEventSink,
         mcp_port: Option<u16>,
         dirs: crate::config::DataDirs,
+        binding: &crate::provider::ProviderBinding,
         runtime: SessionToolRuntime,
         cancellation: tokio::sync::watch::Receiver<u64>,
-    ) -> Self {
-        let (model_selection, large_context_enabled) =
-            load_model_configuration(&dirs).unwrap_or((None, false));
+    ) -> Result<Self, AgentEngineError> {
+        binding.validate().map_err(AgentEngineError::new)?;
+        if binding.provider != crate::provider::ProviderId::Codex {
+            return Err(AgentEngineError::new(
+                "Codex driver received a non-Codex provider binding",
+            ));
+        }
+        let large_context_enabled = dirs
+            .load_config()
+            .map(|config| {
+                config
+                    .providers
+                    .codex
+                    .large_context_models
+                    .contains(&binding.model)
+            })
+            .unwrap_or(false);
+        let model_selection = Some(CodexModelSelection {
+            model: binding.model.clone(),
+            reasoning_effort: binding
+                .reasoning
+                .as_ref()
+                .map(|selection| selection.level.clone())
+                .unwrap_or_else(|| "medium".to_string()),
+        });
         let session_store = crate::session::SessionStore::new(&dirs);
-        Self {
+        Ok(Self {
             fallback_cwd: cwd.into(),
             client_cwd: None,
             client_access: None,
@@ -2028,7 +2038,7 @@ impl ProductionCodexDriver {
             client: None,
             events: None,
             cancellation,
-        }
+        })
     }
 
     pub(crate) fn use_workspace(&mut self, workspace: PreparedWorkspace) {
@@ -2065,6 +2075,7 @@ impl ProductionCodexDriver {
 
         let (mut client, events) = CodexAppServerClient::spawn_app_server(
             &cwd,
+            &self.dirs,
             self.mcp_port,
             access,
             Some(self.runtime.clone()),
@@ -2087,108 +2098,9 @@ impl ProductionCodexDriver {
         self.ensure_client_at(self.fallback_cwd.clone(), WorkspaceAccess::Read)
             .await
     }
-    fn refresh_model_configuration(&mut self) -> Result<(), AgentEngineError> {
-        let (selection, large_context_enabled) = load_model_configuration(&self.dirs)?;
-        self.model_selection = selection.clone();
-        self.large_context_enabled = large_context_enabled;
-        if let Some(client) = self.client.as_mut() {
-            client.set_model_selection(selection);
-            client.set_large_context_enabled(large_context_enabled);
-        }
-        Ok(())
-    }
-
-    fn large_context_enabled_for(&self, model: &str) -> Result<bool, AgentEngineError> {
-        let config = self
-            .dirs
-            .load_config()
-            .map_err(|error| AgentEngineError::new(format!("failed to load config: {error}")))?;
-        Ok(config.codex_large_context_models.contains(model))
-    }
-
-    async fn fetch_models(&mut self) -> Result<Vec<CodexModel>, AgentEngineError> {
-        self.ensure_client().await?;
-        self.client
-            .as_mut()
-            .ok_or_else(|| AgentEngineError::new("codex app-server client is unavailable"))?
-            .list_models()
-            .await
-            .map_err(|err| AgentEngineError::new(err.to_string()))
-    }
-
-    fn persist_selection(&self, selection: &CodexModelSelection) -> Result<(), AgentEngineError> {
-        let mut config = self
-            .dirs
-            .load_config()
-            .map_err(|err| AgentEngineError::new(format!("failed to load config: {err}")))?;
-        config.codex_model = Some(selection.model.clone());
-        config.codex_reasoning_effort = Some(selection.reasoning_effort.clone());
-        self.dirs
-            .save_config(&config)
-            .map_err(|err| AgentEngineError::new(format!("failed to save config: {err}")))
-    }
-
-    async fn model_settings(&mut self) -> Result<CodexModelSettings, AgentEngineError> {
-        let models = self.fetch_models().await?;
-        let selection = resolve_model_selection(&models, self.model_selection.as_ref())?;
-
-        if self.model_selection.as_ref() != Some(&selection) {
-            self.persist_selection(&selection)?;
-            self.model_selection = Some(selection.clone());
-        }
-        self.large_context_enabled = self.large_context_enabled_for(&selection.model)?;
-        if let Some(client) = self.client.as_mut() {
-            client.set_model_selection(Some(selection.clone()));
-            client.set_large_context_enabled(self.large_context_enabled);
-        }
-
-        Ok(CodexModelSettings {
-            models,
-            selected_model: selection.model,
-            selected_reasoning_effort: selection.reasoning_effort,
-        })
-    }
-
-    async fn save_model_settings(
-        &mut self,
-        model: String,
-        reasoning_effort: String,
-    ) -> Result<CodexModelSettings, AgentEngineError> {
-        let models = self.fetch_models().await?;
-        let selected_model = models
-            .iter()
-            .find(|candidate| candidate.model == model)
-            .ok_or_else(|| AgentEngineError::new(format!("model is not available: {model}")))?;
-        if !selected_model
-            .supported_reasoning_efforts
-            .iter()
-            .any(|option| option.reasoning_effort == reasoning_effort)
-        {
-            return Err(AgentEngineError::new(format!(
-                "reasoning effort {reasoning_effort} is not available for {model}"
-            )));
-        }
-
-        let selection = CodexModelSelection {
-            model: model.clone(),
-            reasoning_effort: reasoning_effort.clone(),
-        };
-        self.persist_selection(&selection)?;
-        self.model_selection = Some(selection.clone());
-        self.large_context_enabled = self.large_context_enabled_for(&model)?;
-        if let Some(client) = self.client.as_mut() {
-            client.set_model_selection(Some(selection));
-            client.set_large_context_enabled(self.large_context_enabled);
-        }
-
-        Ok(CodexModelSettings {
-            models,
-            selected_model: model,
-            selected_reasoning_effort: reasoning_effort,
-        })
-    }
 }
 
+#[cfg(test)]
 fn resolve_model_selection(
     models: &[CodexModel],
     configured: Option<&CodexModelSelection>,
@@ -2274,6 +2186,10 @@ fn handle_context_usage(
             .emit(EngineEvent::Progress(ipc::ProgressEvent {
                 stage: ipc::ProgressStage::LargeContextFallback,
                 detail: Some(detail),
+                provider: Some(crate::provider::ProviderId::Codex),
+                model: handler
+                    .model_selection
+                    .map(|selection| selection.model.clone()),
             }))?;
     }
     eprintln!(
@@ -2294,12 +2210,11 @@ fn handle_context_usage(
         }))
 }
 
-impl CodexDriver for ProductionCodexDriver {
+impl AgentDriver for ProductionCodexDriver {
     async fn run_turn(
         &mut self,
-        mut input: CodexTurnInput,
-    ) -> Result<CodexTurnResult, AgentEngineError> {
-        self.refresh_model_configuration()?;
+        mut input: AgentTurnInput,
+    ) -> Result<AgentTurnResult, AgentEngineError> {
         let mut cancellation = self.cancellation.clone();
         let cancellation_generation = *cancellation.borrow_and_update();
         let request_id = self
@@ -2350,11 +2265,16 @@ impl CodexDriver for ProductionCodexDriver {
         self.ensure_client_at(workspace.root.clone(), access)
             .await?;
         if *cancellation.borrow() != cancellation_generation {
-            return Ok(CodexTurnResult::Cancelled);
+            return Ok(AgentTurnResult::Cancelled);
         }
         self.sink.emit(EngineEvent::Progress(ipc::ProgressEvent {
             stage: ipc::ProgressStage::Workspace,
             detail: Some("strict Windows sandbox setup may request elevation".to_string()),
+            provider: Some(crate::provider::ProviderId::Codex),
+            model: self
+                .model_selection
+                .as_ref()
+                .map(|selection| selection.model.clone()),
         }))?;
         {
             let client = self
@@ -2369,7 +2289,7 @@ impl CodexDriver for ProductionCodexDriver {
                 }
                 changed = cancellation.changed() => {
                     if changed.is_ok() {
-                        return Ok(CodexTurnResult::Cancelled);
+                        return Ok(AgentTurnResult::Cancelled);
                     }
                     (&mut sandbox)
                         .await
@@ -2411,14 +2331,14 @@ impl CodexDriver for ProductionCodexDriver {
                 }
                 return if interrupted {
                     if deadline_interrupted {
-                        Ok(CodexTurnResult::Answer {
+                        Ok(AgentTurnResult::Answer {
                             text: "빌드 성공 후 30초 완료 계약에 따라 구현 턴을 종료했습니다. 코드 변경사항을 검토해 주세요. 런타임 확인이 필요한 변경은 승인 후 별도 상태로 안내합니다.".to_string(),
                         })
                     } else {
-                        Ok(CodexTurnResult::Cancelled)
+                        Ok(AgentTurnResult::Cancelled)
                     }
                 } else {
-                    Ok(CodexTurnResult::Answer { text: answer })
+                    Ok(AgentTurnResult::Answer { text: answer })
                 };
             }
 
@@ -2460,6 +2380,11 @@ impl CodexDriver for ProductionCodexDriver {
                             self.sink.emit(EngineEvent::Progress(ipc::ProgressEvent {
                                 stage: ipc::ProgressStage::Codex,
                                 detail: Some("Codex turn started".to_string()),
+                                provider: Some(crate::provider::ProviderId::Codex),
+                                model: self
+                                    .model_selection
+                                    .as_ref()
+                                    .map(|selection| selection.model.clone()),
                             }))?;
                         }
                         AppServerEvent::ReasoningDelta(delta) => {
@@ -2498,12 +2423,22 @@ impl CodexDriver for ProductionCodexDriver {
                             self.sink.emit(EngineEvent::Progress(ipc::ProgressEvent {
                                 stage: ipc::ProgressStage::Compaction,
                                 detail: Some("started".to_string()),
+                                provider: Some(crate::provider::ProviderId::Codex),
+                                model: self
+                                    .model_selection
+                                    .as_ref()
+                                    .map(|selection| selection.model.clone()),
                             }))?;
                         }
                         AppServerEvent::ContextCompactionCompleted => {
                             self.sink.emit(EngineEvent::Progress(ipc::ProgressEvent {
                                 stage: ipc::ProgressStage::Compaction,
                                 detail: Some("done".to_string()),
+                                provider: Some(crate::provider::ProviderId::Codex),
+                                model: self
+                                    .model_selection
+                                    .as_ref()
+                                    .map(|selection| selection.model.clone()),
                             }))?;
                         }
                         AppServerEvent::ToolCallStarted { name, args } => {
@@ -2586,9 +2521,8 @@ impl CodexDriver for ProductionCodexDriver {
 
     async fn compile_task_state(
         &mut self,
-        mut input: CodexTurnInput,
+        mut input: AgentTurnInput,
     ) -> Result<Option<String>, AgentEngineError> {
-        self.refresh_model_configuration()?;
         let workspace = self
             .active_workspace
             .clone()
@@ -2598,6 +2532,7 @@ impl CodexDriver for ProductionCodexDriver {
             })?;
         let (mut client, mut events) = CodexAppServerClient::spawn_app_server(
             &workspace.root,
+            &self.dirs,
             None,
             WorkspaceAccess::Read,
             None,
@@ -2649,8 +2584,7 @@ impl CodexDriver for ProductionCodexDriver {
         }
     }
 
-    async fn compact_thread(&mut self) -> Result<(), AgentEngineError> {
-        self.refresh_model_configuration()?;
+    async fn compact_conversation(&mut self) -> Result<(), AgentEngineError> {
         let cwd = self
             .client_cwd
             .clone()
@@ -2702,7 +2636,7 @@ impl CodexDriver for ProductionCodexDriver {
         }
     }
 
-    async fn reset_thread(&mut self) -> Result<(), AgentEngineError> {
+    async fn reset_conversation(&mut self) -> Result<(), AgentEngineError> {
         self.client = None;
         self.events = None;
         self.client_cwd = None;
@@ -2710,14 +2644,27 @@ impl CodexDriver for ProductionCodexDriver {
         Ok(())
     }
 
-    async fn current_thread_id(&self) -> Option<String> {
-        let client = self.client.as_ref()?;
-        client.current_thread_id().await
+    async fn conversation_state(&self) -> crate::provider::ProviderConversationState {
+        let thread_id = match self.client.as_ref() {
+            Some(client) => client.current_thread_id().await,
+            None => None,
+        };
+        crate::provider::ProviderConversationState::Codex { thread_id }
     }
 
-    async fn seed_thread_id(&mut self, id: String) -> Result<(), AgentEngineError> {
-        // The client is lazily spawned; ensure it exists before seeding so the
-        // saved id is in place for the next run_turn's thread/resume.
+    async fn seed_conversation(
+        &mut self,
+        state: crate::provider::ProviderConversationState,
+    ) -> Result<(), AgentEngineError> {
+        let crate::provider::ProviderConversationState::Codex { thread_id } = state else {
+            return Err(AgentEngineError::new(
+                "Codex driver received incompatible conversation state",
+            ));
+        };
+        let Some(id) = thread_id else {
+            return Ok(());
+        };
+        // The client is lazily spawned; seed before the next turn resumes it.
         self.ensure_client().await?;
         let client = self
             .client
@@ -2732,8 +2679,221 @@ impl CodexDriver for ProductionCodexDriver {
     }
 }
 
+pub(crate) enum ProductionProviderDriver {
+    Codex(ProductionCodexDriver),
+    ClaudeCode(crate::claude_client::ProductionClaudeCodeDriver),
+    Antigravity(crate::antigravity_client::ProductionAntigravityDriver),
+    OpencodeGo(crate::opencode_go::ProductionOpenCodeGoDriver),
+    Ollama(crate::ollama::ProductionOllamaDriver),
+}
+
+impl ProductionProviderDriver {
+    fn use_workspace(&mut self, workspace: PreparedWorkspace) {
+        match self {
+            Self::Codex(driver) => driver.use_workspace(workspace),
+            Self::ClaudeCode(driver) => driver.use_workspace(workspace),
+            Self::Antigravity(driver) => driver.use_workspace(workspace),
+            Self::OpencodeGo(driver) => driver.use_workspace(workspace),
+            Self::Ollama(driver) => driver.use_workspace(workspace),
+        }
+    }
+
+    fn disable_session_persistence(&mut self) {
+        match self {
+            Self::Codex(driver) => driver.disable_session_persistence(),
+            Self::ClaudeCode(driver) => driver.disable_session_persistence(),
+            Self::Antigravity(driver) => driver.disable_session_persistence(),
+            Self::OpencodeGo(driver) => driver.disable_session_persistence(),
+            Self::Ollama(driver) => driver.disable_session_persistence(),
+        }
+    }
+}
+
+impl AgentDriver for ProductionProviderDriver {
+    async fn run_turn(
+        &mut self,
+        input: AgentTurnInput,
+    ) -> Result<AgentTurnResult, AgentEngineError> {
+        match self {
+            Self::Codex(driver) => driver.run_turn(input).await,
+            Self::ClaudeCode(driver) => driver.run_turn(input).await,
+            Self::Antigravity(driver) => driver.run_turn(input).await,
+            Self::OpencodeGo(driver) => driver.run_turn(input).await,
+            Self::Ollama(driver) => driver.run_turn(input).await,
+        }
+    }
+
+    async fn compile_task_state(
+        &mut self,
+        input: AgentTurnInput,
+    ) -> Result<Option<String>, AgentEngineError> {
+        match self {
+            Self::Codex(driver) => driver.compile_task_state(input).await,
+            Self::ClaudeCode(driver) => driver.compile_task_state(input).await,
+            Self::Antigravity(driver) => driver.compile_task_state(input).await,
+            Self::OpencodeGo(driver) => driver.compile_task_state(input).await,
+            Self::Ollama(driver) => driver.compile_task_state(input).await,
+        }
+    }
+
+    async fn compact_conversation(&mut self) -> Result<(), AgentEngineError> {
+        match self {
+            Self::Codex(driver) => driver.compact_conversation().await,
+            Self::ClaudeCode(driver) => driver.compact_conversation().await,
+            Self::Antigravity(driver) => driver.compact_conversation().await,
+            Self::OpencodeGo(driver) => driver.compact_conversation().await,
+            Self::Ollama(driver) => driver.compact_conversation().await,
+        }
+    }
+
+    async fn reset_conversation(&mut self) -> Result<(), AgentEngineError> {
+        match self {
+            Self::Codex(driver) => driver.reset_conversation().await,
+            Self::ClaudeCode(driver) => driver.reset_conversation().await,
+            Self::Antigravity(driver) => driver.reset_conversation().await,
+            Self::OpencodeGo(driver) => driver.reset_conversation().await,
+            Self::Ollama(driver) => driver.reset_conversation().await,
+        }
+    }
+
+    async fn conversation_state(&self) -> crate::provider::ProviderConversationState {
+        match self {
+            Self::Codex(driver) => driver.conversation_state().await,
+            Self::ClaudeCode(driver) => driver.conversation_state().await,
+            Self::Antigravity(driver) => driver.conversation_state().await,
+            Self::OpencodeGo(driver) => driver.conversation_state().await,
+            Self::Ollama(driver) => driver.conversation_state().await,
+        }
+    }
+
+    async fn seed_conversation(
+        &mut self,
+        state: crate::provider::ProviderConversationState,
+    ) -> Result<(), AgentEngineError> {
+        match self {
+            Self::Codex(driver) => driver.seed_conversation(state).await,
+            Self::ClaudeCode(driver) => driver.seed_conversation(state).await,
+            Self::Antigravity(driver) => driver.seed_conversation(state).await,
+            Self::OpencodeGo(driver) => driver.seed_conversation(state).await,
+            Self::Ollama(driver) => driver.seed_conversation(state).await,
+        }
+    }
+
+    fn current_workspace(&self) -> Option<PreparedWorkspace> {
+        match self {
+            Self::Codex(driver) => driver.current_workspace(),
+            Self::ClaudeCode(driver) => driver.current_workspace(),
+            Self::Antigravity(driver) => driver.current_workspace(),
+            Self::OpencodeGo(driver) => driver.current_workspace(),
+            Self::Ollama(driver) => driver.current_workspace(),
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn production_provider_driver(
+    session_id: &str,
+    fallback_cwd: &Path,
+    binding: &crate::provider::ProviderBinding,
+    sink: SessionEventSink,
+    mcp_port: Option<u16>,
+    dirs: crate::config::DataDirs,
+    runtime: SessionToolRuntime,
+    cancellation: tokio::sync::watch::Receiver<u64>,
+) -> Result<ProductionProviderDriver, AgentEngineError> {
+    binding.validate().map_err(AgentEngineError::new)?;
+    match (&binding.provider, &binding.conversation) {
+        (
+            crate::provider::ProviderId::Codex,
+            crate::provider::ProviderConversationState::Codex { .. },
+        ) => Ok(ProductionProviderDriver::Codex(ProductionCodexDriver::new(
+            session_id,
+            fallback_cwd,
+            sink,
+            mcp_port,
+            dirs,
+            binding,
+            runtime,
+            cancellation,
+        )?)),
+        (
+            crate::provider::ProviderId::ClaudeCode,
+            crate::provider::ProviderConversationState::ClaudeCode { .. },
+        ) => Ok(ProductionProviderDriver::ClaudeCode(
+            crate::claude_client::ProductionClaudeCodeDriver::new(
+                session_id.to_string(),
+                binding.model.clone(),
+                binding.reasoning.clone(),
+                dirs,
+                sink,
+                mcp_port,
+                runtime,
+                cancellation,
+            )?,
+        )),
+        (
+            crate::provider::ProviderId::Antigravity,
+            crate::provider::ProviderConversationState::Antigravity {
+                transcript_revision,
+            },
+        ) => Ok(ProductionProviderDriver::Antigravity(
+            crate::antigravity_client::ProductionAntigravityDriver::new(
+                session_id.to_string(),
+                binding.model.clone(),
+                binding.reasoning.clone(),
+                dirs,
+                runtime,
+                sink,
+                *transcript_revision,
+                cancellation,
+            )?,
+        )),
+        (
+            crate::provider::ProviderId::OpencodeGo,
+            crate::provider::ProviderConversationState::OpencodeGo {
+                transcript_revision,
+            },
+        ) => Ok(ProductionProviderDriver::OpencodeGo(
+            crate::opencode_go::ProductionOpenCodeGoDriver::new(
+                session_id.to_string(),
+                binding.model.clone(),
+                binding.reasoning.clone(),
+                dirs,
+                runtime,
+                sink,
+                *transcript_revision,
+                cancellation,
+            )?,
+        )),
+        (
+            crate::provider::ProviderId::Ollama,
+            crate::provider::ProviderConversationState::Ollama {
+                transcript_revision,
+            },
+        ) => Ok(ProductionProviderDriver::Ollama(
+            crate::ollama::ProductionOllamaDriver::new(
+                session_id.to_string(),
+                binding.model.clone(),
+                binding.reasoning.clone(),
+                binding.base_url.clone().ok_or_else(|| {
+                    AgentEngineError::new("ollama provider binding base URL is invalid")
+                })?,
+                dirs,
+                runtime,
+                sink,
+                *transcript_revision,
+                cancellation,
+            )?,
+        )),
+        _ => Err(AgentEngineError::new(
+            "provider binding conversation variant mismatch",
+        )),
+    }
+}
+
 pub(crate) struct SessionWorker {
-    engine: tokio::sync::Mutex<AgentEngine<ProductionCodexDriver, SessionEventSink>>,
+    engine: tokio::sync::Mutex<AgentEngine<ProductionProviderDriver, SessionEventSink>>,
+    provider: crate::provider::ProviderId,
     cancellation: tokio::sync::watch::Sender<u64>,
     runtime: SessionToolRuntime,
     sink: SessionEventSink,
@@ -2762,6 +2922,7 @@ struct SessionEngineManagerInner {
     sessions: crate::session::SessionStore,
     attachments: AttachmentStore,
     services: crate::tool_exec::ToolServices,
+    provider_service: crate::provider_service::ProviderService,
     config: AgentEngineConfig,
     app: tauri::AppHandle,
     dirs: crate::config::DataDirs,
@@ -2769,7 +2930,6 @@ struct SessionEngineManagerInner {
     harness_jobs: crate::harness::HarnessJobStore,
     running_harness: tokio::sync::Mutex<HashSet<String>>,
     recovered_projects: SyncMutex<HashMap<String, ProjectRecoveryResult>>,
-    settings_lock: tokio::sync::Mutex<()>,
 }
 
 fn restore_pending_review(
@@ -2879,10 +3039,12 @@ fn rewind_unrecoverable_pending_session(
 }
 
 impl SessionEngineManager {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         sessions: crate::session::SessionStore,
         attachments: AttachmentStore,
         services: crate::tool_exec::ToolServices,
+        provider_service: crate::provider_service::ProviderService,
         config: AgentEngineConfig,
         app: tauri::AppHandle,
         dirs: crate::config::DataDirs,
@@ -2894,6 +3056,7 @@ impl SessionEngineManager {
                 sessions,
                 attachments,
                 services,
+                provider_service,
                 config,
                 app,
                 dirs: dirs.clone(),
@@ -2901,7 +3064,6 @@ impl SessionEngineManager {
                 harness_jobs: crate::harness::HarnessJobStore::new(dirs.clone()),
                 running_harness: tokio::sync::Mutex::new(HashSet::new()),
                 recovered_projects: SyncMutex::new(HashMap::new()),
-                settings_lock: tokio::sync::Mutex::new(()),
             }),
         }
     }
@@ -3026,6 +3188,10 @@ impl SessionEngineManager {
         if job.status != crate::harness::HarnessJobStatus::Pending {
             return Ok(());
         }
+        let _provider_busy = self
+            .inner
+            .provider_service
+            .enter_busy(job.provider_binding.provider);
         let prompt = crate::harness::generation_prompt(&job, &self.inner.dirs)
             .map_err(AgentEngineError::new)?;
         job.status = crate::harness::HarnessJobStatus::Running;
@@ -3049,6 +3215,10 @@ impl SessionEngineManager {
             .prepare_document_session(&job.workspace_id, &job.project, &job.workspace_session_id)
             .map_err(|error| AgentEngineError::new(error.to_string()))?;
         let runtime = self.inner.services.session(format!("{}-generator", job.id));
+        runtime.set_provider_identity(
+            job.provider_binding.provider,
+            job.provider_binding.model.clone(),
+        );
         runtime
             .begin_request(
                 &format!("generate-{}-{}", job.id, job.attempts),
@@ -3057,18 +3227,28 @@ impl SessionEngineManager {
             .map_err(AgentEngineError::new)?;
         let sink = SessionEventSink::new(self.inner.app.clone(), format!("{}-generator", job.id));
         let (_cancellation, cancellation_rx) = tokio::sync::watch::channel(0_u64);
-        let mut driver = ProductionCodexDriver::new(
-            format!("{}-generator", job.id),
-            workspace.root.clone(),
+        let binding = crate::provider::ProviderBinding {
+            provider: job.provider_binding.provider,
+            model: job.provider_binding.model.clone(),
+            reasoning: job.provider_binding.reasoning.clone(),
+            base_url: job.provider_binding.base_url.clone(),
+            conversation: crate::provider::ProviderConversationState::empty(
+                job.provider_binding.provider,
+            ),
+        };
+        let mut driver = production_provider_driver(
+            &format!("{}-generator", job.id),
+            &workspace.root,
+            &binding,
             sink,
             None,
             self.inner.dirs.clone(),
             runtime,
             cancellation_rx,
-        );
+        )?;
         driver.use_workspace(workspace);
         driver.disable_session_persistence();
-        let turn = CodexTurnInput::text(prompt)
+        let turn = AgentTurnInput::text(prompt)
             .with_output_schema(crate::harness::output_schema())
             .without_tools();
         let result =
@@ -3076,13 +3256,13 @@ impl SessionEngineManager {
                 .await
                 .map_err(|_| AgentEngineError::new("harness generation timed out"))??;
         let text = match result {
-            CodexTurnResult::Answer { text } => text,
-            CodexTurnResult::Plan { .. } => {
+            AgentTurnResult::Answer { text } => text,
+            AgentTurnResult::Plan { .. } => {
                 return Err(AgentEngineError::new(
                     "harness generation returned a plan instead of a structured delta",
                 ));
             }
-            CodexTurnResult::Cancelled => {
+            AgentTurnResult::Cancelled => {
                 return Err(AgentEngineError::new("harness generation was cancelled"));
             }
         };
@@ -3369,6 +3549,10 @@ impl SessionEngineManager {
         } else {
             self.inner.services.session(session_id.to_string())
         };
+        runtime.set_provider_identity(
+            record.provider_binding.provider,
+            record.provider_binding.model.clone(),
+        );
         let sink = SessionEventSink::new(self.inner.app.clone(), session_id.to_string());
         let ask_sink = sink.clone();
         runtime.set_ask_emitter(move |event| {
@@ -3387,16 +3571,18 @@ impl SessionEngineManager {
             .map_err(AgentEngineError::new)?;
         let (cancellation, cancellation_rx) = tokio::sync::watch::channel(0_u64);
         runtime.set_cancellation(cancellation_rx.clone());
-        let driver = ProductionCodexDriver::new(
-            session_id.to_string(),
-            self.inner.fallback_cwd.clone(),
+        let driver = production_provider_driver(
+            session_id,
+            &self.inner.fallback_cwd,
+            &record.provider_binding,
             sink.clone(),
             Some(mcp.port()),
             self.inner.dirs.clone(),
             runtime.clone(),
             cancellation_rx,
-        );
+        )?;
         let worker = Arc::new(SessionWorker {
+            provider: record.provider_binding.provider,
             engine: tokio::sync::Mutex::new(AgentEngine::new(
                 driver,
                 sink.clone(),
@@ -3509,6 +3695,7 @@ impl SessionEngineManager {
         request: ipc::ChatRequest,
     ) -> Result<(), AgentEngineError> {
         let worker = self.worker(session_id).await?;
+        let _provider_busy = self.inner.provider_service.enter_busy(worker.provider);
         if worker.runtime.kind() != crate::session::SessionKind::Eps {
             return Err(AgentEngineError::new(
                 "Map sessions accept conversation only through map_agent_chat.",
@@ -3563,6 +3750,7 @@ impl SessionEngineManager {
             .worker(session_id)
             .await
             .map_err(|error| error.message)?;
+        let _provider_busy = self.inner.provider_service.enter_busy(worker.provider);
         if worker.runtime.kind() != crate::session::SessionKind::Map {
             return Err("the requested session is not a Map session".to_string());
         }
@@ -3602,6 +3790,7 @@ impl SessionEngineManager {
         request: ipc::PlanFeedbackRequest,
     ) -> Result<(), AgentEngineError> {
         let worker = self.worker(session_id).await?;
+        let _provider_busy = self.inner.provider_service.enter_busy(worker.provider);
         if let Err(error) = self.inner.sessions.touch_conversation(session_id) {
             eprintln!("eud-agent: conversation timestamp update failed: {error}");
         }
@@ -3621,6 +3810,7 @@ impl SessionEngineManager {
 
     async fn plan_approve(&self, session_id: &str) -> Result<(), AgentEngineError> {
         let worker = self.worker(session_id).await?;
+        let _provider_busy = self.inner.provider_service.enter_busy(worker.provider);
         {
             let mut engine = worker.engine.lock().await;
             engine.plan_approve().await?;
@@ -3649,6 +3839,7 @@ impl SessionEngineManager {
 
     async fn compact(&self, session_id: &str) -> Result<(), AgentEngineError> {
         let worker = self.worker(session_id).await?;
+        let _provider_busy = self.inner.provider_service.enter_busy(worker.provider);
         worker
             .runtime
             .emit_activity(crate::write_coordinator::SessionActivity::RunningRead);
@@ -3756,16 +3947,25 @@ impl SessionEngineManager {
         first_text: &str,
     ) -> Result<crate::session::SessionRecord, AgentEngineError> {
         let created_at = crate::session::now_unix_seconds();
+        let config = self
+            .inner
+            .dirs
+            .load_config()
+            .map_err(|error| AgentEngineError::new(error.to_string()))?;
+        let provider_binding =
+            crate::provider::default_binding(&config).map_err(AgentEngineError::new)?;
         let record = crate::session::SessionRecord {
             meta: crate::session::SessionMeta {
                 id: crate::session::new_session_id(),
                 name: auto_session_name(first_text),
                 project: project_name_from_state(&self.inner.config.project_state_for_prompt()),
                 kind: crate::session::SessionKind::Eps,
+                provider: provider_binding.provider,
+                model: provider_binding.model.clone(),
                 created_at,
                 last_conversation_at: crate::session::now_unix_millis(),
             },
-            thread_id: None,
+            provider_binding,
             pending_request_ids: Vec::new(),
             context_usage: None,
             panel_log: serde_json::Value::Null,
@@ -3837,57 +4037,148 @@ impl SessionEngineManager {
             .sessions
             .delete(id)
             .map_err(|error| AgentEngineError::new(error.to_string()))?;
+        crate::provider_transcript::ProviderTranscriptStore::new(&self.inner.dirs)
+            .delete_session(id)
+            .map_err(AgentEngineError::new)?;
         self.inner
             .attachments
             .delete_session(id)
             .map_err(AgentEngineError::new)
     }
 
-    async fn model_settings(
+    async fn session_model_settings(
         &self,
-        selection: Option<(String, String)>,
-    ) -> Result<CodexModelSettings, AgentEngineError> {
-        let _guard = self.inner.settings_lock.lock().await;
-        let runtime = self.inner.services.session("__model_settings");
-        let mcp = crate::mcp::serve(runtime.clone())
+        session_id: &str,
+    ) -> Result<crate::provider::SessionModelSettings, AgentEngineError> {
+        let record = self
+            .inner
+            .sessions
+            .load(session_id)
+            .map_err(|error| AgentEngineError::new(error.to_string()))?;
+        let mut models = self
+            .inner
+            .provider_service
+            .catalog(record.provider_binding.provider)
             .await
             .map_err(AgentEngineError::new)?;
-        let sink = SessionEventSink::new(self.inner.app.clone(), "__model_settings");
-        let (_cancel, cancel_rx) = tokio::sync::watch::channel(0_u64);
-        let mut driver = ProductionCodexDriver::new(
-            "__model_settings",
-            self.inner.fallback_cwd.clone(),
-            sink,
-            Some(mcp.port()),
-            self.inner.dirs.clone(),
-            runtime,
-            cancel_rx,
-        );
-        match selection {
-            Some((model, effort)) => driver.save_model_settings(model, effort).await,
-            None => driver.model_settings().await,
+        if record.provider_binding.provider == crate::provider::ProviderId::Ollama
+            && !models
+                .iter()
+                .any(|model| model.model == record.provider_binding.model)
+        {
+            models.push(
+                crate::ollama::provider_model(
+                    &record.provider_binding.model,
+                    Some(&record.provider_binding.model),
+                )
+                .map_err(AgentEngineError::new)?,
+            );
         }
+        if !models
+            .iter()
+            .any(|model| model.model == record.provider_binding.model)
+        {
+            return Err(AgentEngineError::new("provider_model_unavailable"));
+        }
+        Ok(crate::provider::SessionModelSettings {
+            provider: record.provider_binding.provider,
+            models,
+            selected_model: record.provider_binding.model,
+            selected_reasoning: record.provider_binding.reasoning,
+        })
+    }
+
+    async fn session_model_settings_save(
+        &self,
+        session_id: &str,
+        model: String,
+        reasoning: Option<crate::provider::ReasoningSelection>,
+    ) -> Result<crate::provider::SessionModelSettings, AgentEngineError> {
+        let record = self
+            .inner
+            .sessions
+            .load(session_id)
+            .map_err(|error| AgentEngineError::new(error.to_string()))?;
+        if let Some(worker) = self.inner.workers.lock().await.get(session_id).cloned() {
+            let engine = worker
+                .engine
+                .try_lock()
+                .map_err(|_| AgentEngineError::new("provider_busy"))?;
+            if engine.phase != Phase::Idle || worker.runtime.pending_ask().is_some() {
+                return Err(AgentEngineError::new("provider_busy"));
+            }
+        }
+        let model = if record.provider_binding.provider == crate::provider::ProviderId::Ollama {
+            crate::ollama::validate_model(&model)
+                .map_err(AgentEngineError::new)?
+                .to_string()
+        } else {
+            model
+        };
+        let models = if record.provider_binding.provider == crate::provider::ProviderId::Ollama {
+            vec![crate::ollama::provider_model(&model, Some(&model))
+                .map_err(AgentEngineError::new)?]
+        } else {
+            self.inner
+                .provider_service
+                .catalog(record.provider_binding.provider)
+                .await
+                .map_err(AgentEngineError::new)?
+        };
+        let selected = models
+            .iter()
+            .find(|candidate| candidate.model == model)
+            .ok_or_else(|| AgentEngineError::new("provider_model_unavailable"))?;
+        if let Some(reasoning) = reasoning.as_ref() {
+            if !selected
+                .capabilities
+                .reasoning_levels
+                .iter()
+                .any(|level| level.as_str() == reasoning.level)
+            {
+                return Err(AgentEngineError::new("provider_capability_unsupported"));
+            }
+        }
+        let record = self
+            .inner
+            .sessions
+            .update_model_settings(
+                session_id,
+                record.provider_binding.provider,
+                model,
+                reasoning,
+            )
+            .map_err(|error| AgentEngineError::new(error.to_string()))?;
+        self.inner.workers.lock().await.remove(session_id);
+        Ok(crate::provider::SessionModelSettings {
+            provider: record.provider_binding.provider,
+            models,
+            selected_model: record.provider_binding.model,
+            selected_reasoning: record.provider_binding.reasoning,
+        })
     }
 }
 
-#[tauri::command(rename = "codex_model_settings")]
-pub(crate) async fn engine_codex_model_settings(
+#[tauri::command]
+pub(crate) async fn session_model_settings(
     state: tauri::State<'_, SessionEngineManager>,
-) -> Result<CodexModelSettings, String> {
+    session_id: String,
+) -> Result<crate::provider::SessionModelSettings, String> {
     state
-        .model_settings(None)
+        .session_model_settings(&session_id)
         .await
         .map_err(|error| error.message)
 }
 
-#[tauri::command(rename = "codex_model_settings_save")]
-pub(crate) async fn engine_codex_model_settings_save(
+#[tauri::command]
+pub(crate) async fn session_model_settings_save(
     state: tauri::State<'_, SessionEngineManager>,
+    session_id: String,
     model: String,
-    reasoning_effort: String,
-) -> Result<CodexModelSettings, String> {
+    reasoning: Option<crate::provider::ReasoningSelection>,
+) -> Result<crate::provider::SessionModelSettings, String> {
     state
-        .model_settings(Some((model, reasoning_effort)))
+        .session_model_settings_save(&session_id, model, reasoning)
         .await
         .map_err(|error| error.message)
 }
@@ -4856,7 +5147,8 @@ mod tests {
                 replay_transcript: None,
                 resolved_mentions: None,
                 user_text,
-                current_thread_id: Some("thread-test"),
+                provider: crate::provider::ProviderId::Codex,
+                current_conversation_key: Some("thread-test"),
                 force_full: false,
             },
         )
@@ -4900,7 +5192,7 @@ mod tests {
     struct FakeCodexDriver {
         prompts: Arc<Mutex<Vec<String>>>,
         image_paths: Arc<Mutex<Vec<Vec<PathBuf>>>>,
-        scripted_turns: Arc<Mutex<VecDeque<CodexTurnResult>>>,
+        scripted_turns: Arc<Mutex<VecDeque<AgentTurnResult>>>,
         compiler_prompts: Arc<Mutex<Vec<String>>>,
         scripted_compilers: ScriptedCompilerResults,
         compiler_contracts: Arc<Mutex<Vec<(bool, bool)>>>,
@@ -4914,7 +5206,7 @@ mod tests {
     }
 
     impl FakeCodexDriver {
-        fn scripted(turns: impl IntoIterator<Item = CodexTurnResult>) -> Self {
+        fn scripted(turns: impl IntoIterator<Item = AgentTurnResult>) -> Self {
             Self {
                 prompts: Arc::new(Mutex::new(Vec::new())),
                 image_paths: Arc::new(Mutex::new(Vec::new())),
@@ -4980,11 +5272,11 @@ mod tests {
         }
     }
 
-    impl CodexDriver for FakeCodexDriver {
+    impl AgentDriver for FakeCodexDriver {
         async fn run_turn(
             &mut self,
-            input: CodexTurnInput,
-        ) -> Result<CodexTurnResult, AgentEngineError> {
+            input: AgentTurnInput,
+        ) -> Result<AgentTurnResult, AgentEngineError> {
             self.prompts.lock().expect("prompts lock").push(input.text);
             self.image_paths
                 .lock()
@@ -5006,7 +5298,7 @@ mod tests {
 
         async fn compile_task_state(
             &mut self,
-            input: CodexTurnInput,
+            input: AgentTurnInput,
         ) -> Result<Option<String>, AgentEngineError> {
             self.compiler_contracts
                 .lock()
@@ -5027,26 +5319,37 @@ mod tests {
                 .unwrap_or(Ok(None))
         }
 
-        async fn compact_thread(&mut self) -> Result<(), AgentEngineError> {
+        async fn compact_conversation(&mut self) -> Result<(), AgentEngineError> {
             self.thread_id
                 .lock()
                 .expect("thread id lock")
                 .as_ref()
                 .map(|_| ())
-                .ok_or_else(|| AgentEngineError::new("no fake thread"))
+                .ok_or_else(|| AgentEngineError::new("no fake conversation"))
         }
 
-        async fn reset_thread(&mut self) -> Result<(), AgentEngineError> {
+        async fn reset_conversation(&mut self) -> Result<(), AgentEngineError> {
             *self.reset_count.lock().expect("reset count lock") += 1;
             *self.thread_id.lock().expect("thread id lock") = None;
             Ok(())
         }
 
-        async fn current_thread_id(&self) -> Option<String> {
-            self.thread_id.lock().expect("thread id lock").clone()
+        async fn conversation_state(&self) -> crate::provider::ProviderConversationState {
+            crate::provider::ProviderConversationState::Codex {
+                thread_id: self.thread_id.lock().expect("thread id lock").clone(),
+            }
         }
 
-        async fn seed_thread_id(&mut self, id: String) -> Result<(), AgentEngineError> {
+        async fn seed_conversation(
+            &mut self,
+            state: crate::provider::ProviderConversationState,
+        ) -> Result<(), AgentEngineError> {
+            let crate::provider::ProviderConversationState::Codex {
+                thread_id: Some(id),
+            } = state
+            else {
+                return Err(AgentEngineError::new("invalid fake conversation state"));
+            };
             self.seeded.lock().expect("seeded lock").push(id.clone());
             *self.thread_id.lock().expect("thread id lock") = Some(id);
             Ok(())
@@ -5083,11 +5386,11 @@ mod tests {
         }
     }
 
-    impl CodexDriver for GateCodexDriver {
+    impl AgentDriver for GateCodexDriver {
         async fn run_turn(
             &mut self,
-            _input: CodexTurnInput,
-        ) -> Result<CodexTurnResult, AgentEngineError> {
+            _input: AgentTurnInput,
+        ) -> Result<AgentTurnResult, AgentEngineError> {
             self.entered
                 .send(self.label)
                 .map_err(|_| AgentEngineError::new("test entry receiver closed"))?;
@@ -5098,30 +5401,41 @@ mod tests {
                 self.release.notified().await;
             }
             *self.thread_id.lock().unwrap() = Some(format!("thread-{}", self.label));
-            Ok(CodexTurnResult::Answer {
+            Ok(AgentTurnResult::Answer {
                 text: format!("{} done", self.label),
             })
         }
 
-        async fn compact_thread(&mut self) -> Result<(), AgentEngineError> {
+        async fn compact_conversation(&mut self) -> Result<(), AgentEngineError> {
             self.thread_id
                 .lock()
                 .unwrap()
                 .as_ref()
                 .map(|_| ())
-                .ok_or_else(|| AgentEngineError::new("no gate thread"))
+                .ok_or_else(|| AgentEngineError::new("no gate conversation"))
         }
 
-        async fn reset_thread(&mut self) -> Result<(), AgentEngineError> {
+        async fn reset_conversation(&mut self) -> Result<(), AgentEngineError> {
             *self.thread_id.lock().unwrap() = None;
             Ok(())
         }
 
-        async fn current_thread_id(&self) -> Option<String> {
-            self.thread_id.lock().unwrap().clone()
+        async fn conversation_state(&self) -> crate::provider::ProviderConversationState {
+            crate::provider::ProviderConversationState::Codex {
+                thread_id: self.thread_id.lock().unwrap().clone(),
+            }
         }
 
-        async fn seed_thread_id(&mut self, id: String) -> Result<(), AgentEngineError> {
+        async fn seed_conversation(
+            &mut self,
+            state: crate::provider::ProviderConversationState,
+        ) -> Result<(), AgentEngineError> {
+            let crate::provider::ProviderConversationState::Codex {
+                thread_id: Some(id),
+            } = state
+            else {
+                return Err(AgentEngineError::new("invalid gate conversation state"));
+            };
             *self.thread_id.lock().unwrap() = Some(id);
             Ok(())
         }
@@ -5245,10 +5559,19 @@ mod tests {
                 name: "test session".to_string(),
                 project: "Sample".to_string(),
                 kind: crate::session::SessionKind::Eps,
+                provider: crate::provider::ProviderId::Codex,
+                model: "gpt-test".to_string(),
                 created_at,
                 last_conversation_at: crate::session::now_unix_millis(),
             },
-            thread_id: None,
+            provider_binding: crate::provider::ProviderBinding::new(
+                crate::provider::ProviderId::Codex,
+                "gpt-test".to_string(),
+                Some(crate::provider::ReasoningSelection {
+                    level: "medium".to_string(),
+                }),
+            )
+            .unwrap(),
             pending_request_ids: Vec::new(),
             context_usage: None,
             panel_log: serde_json::Value::Null,
@@ -5259,7 +5582,7 @@ mod tests {
         record
     }
 
-    fn test_engine_with_memory<D: CodexDriver, S: EventSink>(
+    fn test_engine_with_memory<D: AgentDriver, S: EventSink>(
         driver: D,
         sink: S,
         memory: ProjectMemory,
@@ -5362,7 +5685,7 @@ mod tests {
 
     /// Build an engine wired with BOTH a memory provider and a file-backed wiki
     /// provider rooted at `wiki_dir`, sharing the on-disk journal at `data_dir`.
-    fn test_engine_with_wiki<D: CodexDriver, S: EventSink>(
+    fn test_engine_with_wiki<D: AgentDriver, S: EventSink>(
         driver: D,
         sink: S,
         memory: ProjectMemory,
@@ -5388,7 +5711,7 @@ mod tests {
         engine
     }
 
-    fn test_engine<D: CodexDriver, S: EventSink>(driver: D, sink: S) -> AgentEngine<D, S> {
+    fn test_engine<D: AgentDriver, S: EventSink>(driver: D, sink: S) -> AgentEngine<D, S> {
         let data_dir = unique_temp_dir("engine-sessions");
         let sessions = session_store_at(&data_dir);
         let session = test_session(&sessions);
@@ -5410,14 +5733,14 @@ mod tests {
     #[tokio::test]
     async fn session_bound_engines_keep_independent_thread_prompt_state() {
         let driver_a = FakeCodexDriver::scripted([
-            CodexTurnResult::Answer {
+            AgentTurnResult::Answer {
                 text: "First answer.".to_string(),
             },
-            CodexTurnResult::Answer {
+            AgentTurnResult::Answer {
                 text: "Second answer.".to_string(),
             },
         ]);
-        let driver_b = FakeCodexDriver::scripted([CodexTurnResult::Answer {
+        let driver_b = FakeCodexDriver::scripted([AgentTurnResult::Answer {
             text: "Fresh answer.".to_string(),
         }]);
         let handle_a = driver_a.clone();
@@ -5466,10 +5789,10 @@ mod tests {
     #[tokio::test]
     async fn agentic_engine_routes_answer_only_and_propose_plan_turns_to_v2_events() {
         let driver = FakeCodexDriver::scripted([
-            CodexTurnResult::Answer {
+            AgentTurnResult::Answer {
                 text: "No edits are needed.".to_string(),
             },
-            CodexTurnResult::Plan {
+            AgentTurnResult::Plan {
                 markdown: "- Search docs\n- Apply the change\n- Build".to_string(),
             },
         ]);
@@ -5514,10 +5837,10 @@ mod tests {
     async fn approved_plan_completion_never_runs_foreground_document_repairs() {
         let approved_markdown = "- Apply the change\n- Verify the build";
         let driver = FakeCodexDriver::scripted([
-            CodexTurnResult::Plan {
+            AgentTurnResult::Plan {
                 markdown: approved_markdown.to_string(),
             },
-            CodexTurnResult::Answer {
+            AgentTurnResult::Answer {
                 text: "Implementation finished.".to_string(),
             },
         ]);
@@ -5572,7 +5895,7 @@ mod tests {
 
     #[tokio::test]
     async fn accepted_live_changes_return_a_runtime_gated_harness_job() {
-        let driver = FakeCodexDriver::scripted([CodexTurnResult::Answer {
+        let driver = FakeCodexDriver::scripted([AgentTurnResult::Answer {
             text: "Implementation finished.".to_string(),
         }]);
         let driver_handle = driver.clone();
@@ -5630,10 +5953,10 @@ mod tests {
         let (base, memory) = memory_store("memory-refresh");
         assert!(memory.write("resources", "Switch 1 = first value").ok);
         let driver = FakeCodexDriver::scripted([
-            CodexTurnResult::Answer {
+            AgentTurnResult::Answer {
                 text: "First answer.".to_string(),
             },
-            CodexTurnResult::Answer {
+            AgentTurnResult::Answer {
                 text: "Second answer.".to_string(),
             },
         ]);
@@ -5707,7 +6030,7 @@ mod tests {
             }]
         })
         .to_string();
-        let driver = FakeCodexDriver::scripted([CodexTurnResult::Answer {
+        let driver = FakeCodexDriver::scripted([AgentTurnResult::Answer {
             text: "Roster retained.".to_string(),
         }]);
         driver.script_compilers([Ok(Some(delta))]);
@@ -5743,7 +6066,7 @@ mod tests {
 
     #[tokio::test]
     async fn invalid_state_compiler_output_keeps_foreground_answer_and_marks_stale() {
-        let driver = FakeCodexDriver::scripted([CodexTurnResult::Answer {
+        let driver = FakeCodexDriver::scripted([AgentTurnResult::Answer {
             text: "Foreground answer.".to_string(),
         }]);
         driver.script_compilers([Ok(Some("not-json".to_string()))]);
@@ -5781,7 +6104,7 @@ mod tests {
     }
     #[tokio::test]
     async fn state_compiler_driver_error_records_exact_diagnostic_detail() {
-        let driver = FakeCodexDriver::scripted([CodexTurnResult::Answer {
+        let driver = FakeCodexDriver::scripted([AgentTurnResult::Answer {
             text: "Foreground answer.".to_string(),
         }]);
         let diagnostic =
@@ -5818,7 +6141,7 @@ mod tests {
 
     #[tokio::test]
     async fn state_compiler_timeout_keeps_projection_and_records_reason_code() {
-        let driver = FakeCodexDriver::scripted([CodexTurnResult::Answer {
+        let driver = FakeCodexDriver::scripted([AgentTurnResult::Answer {
             text: "Foreground answer.".to_string(),
         }]);
         driver.script_compilers([Ok(Some(
@@ -5851,10 +6174,10 @@ mod tests {
     #[tokio::test]
     async fn manual_compaction_resets_epoch_and_resends_full_baseline_and_projection() {
         let driver = FakeCodexDriver::scripted([
-            CodexTurnResult::Answer {
+            AgentTurnResult::Answer {
                 text: "First.".to_string(),
             },
-            CodexTurnResult::Answer {
+            AgentTurnResult::Answer {
                 text: "Second.".to_string(),
             },
         ]);
@@ -5904,10 +6227,10 @@ mod tests {
     #[tokio::test]
     async fn static_prompt_fingerprint_change_starts_fresh_without_losing_task_or_log() {
         let driver = FakeCodexDriver::scripted([
-            CodexTurnResult::Answer {
+            AgentTurnResult::Answer {
                 text: "First.".to_string(),
             },
-            CodexTurnResult::Answer {
+            AgentTurnResult::Answer {
                 text: "Second.".to_string(),
             },
         ]);
@@ -5968,7 +6291,7 @@ mod tests {
 
     #[tokio::test]
     async fn rewind_restores_anchored_branch_and_full_prompt_excludes_abandoned_fact() {
-        let driver = FakeCodexDriver::scripted([CodexTurnResult::Answer {
+        let driver = FakeCodexDriver::scripted([AgentTurnResult::Answer {
             text: "Branched.".to_string(),
         }]);
         let driver_handle = driver.clone();
@@ -6034,7 +6357,7 @@ mod tests {
         let base = unique_temp_dir("wiki-accept");
         let memory = ProjectMemory::new(base.join("memory"), "ExampleProject");
         let wiki_dir = base.join("wiki");
-        let driver = FakeCodexDriver::scripted([CodexTurnResult::Plan {
+        let driver = FakeCodexDriver::scripted([AgentTurnResult::Plan {
             markdown: "- Buff the marine".to_string(),
         }]);
         let sink = CapturingEventSink::default();
@@ -6225,7 +6548,7 @@ mod tests {
         let base = unique_temp_dir("wiki-reject");
         let memory = ProjectMemory::new(base.join("memory"), "ExampleProject");
         let wiki_dir = base.join("wiki");
-        let driver = FakeCodexDriver::scripted([CodexTurnResult::Plan {
+        let driver = FakeCodexDriver::scripted([AgentTurnResult::Plan {
             markdown: "- Buff the marine".to_string(),
         }]);
         let sink = CapturingEventSink::default();
@@ -6285,7 +6608,7 @@ mod tests {
         let base = unique_temp_dir("wiki-reject-then-accept");
         let memory = ProjectMemory::new(base.join("memory"), "ExampleProject");
         let wiki_dir = base.join("wiki");
-        let driver = FakeCodexDriver::scripted([CodexTurnResult::Plan {
+        let driver = FakeCodexDriver::scripted([AgentTurnResult::Plan {
             markdown: "- Tune two stats".to_string(),
         }]);
         let sink = CapturingEventSink::default();
@@ -6624,7 +6947,19 @@ mod tests {
         );
         let preflight = prompt.find("[eps preflight]").unwrap();
         let build = prompt.find("[build]").unwrap();
+        let trace_test = prompt.find("[runtime trace tests]").unwrap();
         assert!(preflight < build);
+        assert!(build < trace_test);
+        assert!(prompt.contains("eudAgentTestSetup"));
+        assert!(prompt.contains("failed/inconclusive never blocks review"));
+        assert!(prompt.contains("tests/**/*.tests.eps"));
+        assert!(prompt.contains("trace_suite_run({})"));
+        assert!(prompt.contains("outside the configured MainFile's production import graph"));
+        assert!(prompt.contains("trace_test_run` remains available only"));
+        assert!(prompt.contains("Create the owned client suspended"));
+        assert!(prompt.contains("foreground/focus/cursor user32 entrypoints"));
+        assert!(prompt.contains("Targeted `PostMessageW`"));
+        assert!(prompt.contains("focus fallback are forbidden"));
         assert!(prompt.contains("every candidate in one batch"));
         assert!(prompt.contains("ordered exact edits"));
         assert!(prompt.contains("append `.eps` only for eps_check"));
@@ -6654,11 +6989,14 @@ mod tests {
         let architecture = cold.find("[eps project architecture]").unwrap();
         let preflight = cold.find("[eps preflight]").unwrap();
         let build = cold.find("[build]").unwrap();
+        let trace_test = cold.find("[runtime trace tests]").unwrap();
         let reference = cold.find("[reference context]").unwrap();
         assert!(first_principles < epscript);
         assert!(epscript < architecture);
         assert!(architecture < preflight);
         assert!(preflight < build);
+        assert!(build < trace_test);
+        assert!(trace_test < reference);
         assert!(architecture < reference);
 
         assert!(!resumed.contains(EPS_PROJECT_ARCHITECTURE_GUIDE));
@@ -6713,22 +7051,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mock_driver_seed_sets_current_thread_id_and_reset_clears_it() {
+    async fn mock_driver_seed_sets_conversation_state_and_reset_clears_it() {
         let mut driver = FakeCodexDriver::scripted([]);
-        assert_eq!(driver.current_thread_id().await, None);
+        assert_eq!(
+            driver.conversation_state().await,
+            crate::provider::ProviderConversationState::Codex { thread_id: None }
+        );
 
         driver
-            .seed_thread_id("thread-seeded".to_string())
+            .seed_conversation(crate::provider::ProviderConversationState::Codex {
+                thread_id: Some("thread-seeded".to_string()),
+            })
             .await
             .expect("seed should succeed");
         assert_eq!(
-            driver.current_thread_id().await,
-            Some("thread-seeded".to_string())
+            driver.conversation_state().await,
+            crate::provider::ProviderConversationState::Codex {
+                thread_id: Some("thread-seeded".to_string())
+            }
         );
         assert_eq!(driver.seeded_ids(), vec!["thread-seeded".to_string()]);
 
-        driver.reset_thread().await.expect("reset should succeed");
-        assert_eq!(driver.current_thread_id().await, None);
+        driver
+            .reset_conversation()
+            .await
+            .expect("reset should succeed");
+        assert_eq!(
+            driver.conversation_state().await,
+            crate::provider::ProviderConversationState::Codex { thread_id: None }
+        );
     }
 
     #[tokio::test]
@@ -6940,10 +7291,19 @@ mod tests {
                 name: "C".to_string(),
                 project: "Sample".to_string(),
                 kind: crate::session::SessionKind::Eps,
+                provider: crate::provider::ProviderId::Codex,
+                model: "gpt-test".to_string(),
                 created_at: 1,
                 last_conversation_at: 1_000,
             },
-            thread_id: None,
+            provider_binding: crate::provider::ProviderBinding::new(
+                crate::provider::ProviderId::Codex,
+                "gpt-test".to_string(),
+                Some(crate::provider::ReasoningSelection {
+                    level: "medium".to_string(),
+                }),
+            )
+            .unwrap(),
             pending_request_ids: Vec::new(),
             context_usage: None,
             panel_log: serde_json::Value::Null,
@@ -7081,7 +7441,10 @@ mod tests {
         dirs.ensure_dirs().unwrap();
         let sessions = crate::session::SessionStore::new(&dirs);
         let mut missing_record = test_session(&sessions);
-        missing_record.thread_id = Some("thread-missing".to_string());
+        missing_record.provider_binding.conversation =
+            crate::provider::ProviderConversationState::Codex {
+                thread_id: Some("thread-missing".to_string()),
+            };
         missing_record.pending_request_ids = vec!["req-missing".to_string()];
         missing_record.panel_log = serde_json::json!({"log": ["old"]});
         sessions.save(&missing_record).unwrap();
@@ -7098,12 +7461,18 @@ mod tests {
 
         assert_eq!(recovered_project.as_deref(), Some("Sample"));
         let repaired = sessions.load(&missing_record.meta.id).unwrap();
-        assert!(repaired.thread_id.is_none());
+        assert_eq!(
+            repaired.provider_binding.conversation,
+            crate::provider::ProviderConversationState::Codex { thread_id: None }
+        );
         assert!(repaired.pending_request_ids.is_empty());
         assert_eq!(repaired.panel_log, prefix);
 
         let mut valid_record = test_session(&sessions);
-        valid_record.thread_id = Some("thread-valid".to_string());
+        valid_record.provider_binding.conversation =
+            crate::provider::ProviderConversationState::Codex {
+                thread_id: Some("thread-valid".to_string()),
+            };
         valid_record.pending_request_ids = vec!["req-valid-rewind".to_string()];
         valid_record.panel_log = serde_json::json!({"log": ["valid"]});
         sessions.save(&valid_record).unwrap();
@@ -7127,7 +7496,12 @@ mod tests {
 
         assert!(valid_result.is_none());
         let preserved = sessions.load(&valid_record.meta.id).unwrap();
-        assert_eq!(preserved.thread_id.as_deref(), Some("thread-valid"));
+        assert_eq!(
+            preserved.provider_binding.conversation,
+            crate::provider::ProviderConversationState::Codex {
+                thread_id: Some("thread-valid".to_string())
+            }
+        );
         assert_eq!(
             preserved.pending_request_ids,
             vec!["req-valid-rewind".to_string()]
@@ -7202,7 +7576,7 @@ mod tests {
         let image = attachment_store
             .stage("screen.png", "image/png", b"\x89PNG\r\n\x1a\nbody")
             .expect("image attachment should stage");
-        let driver = FakeCodexDriver::scripted([CodexTurnResult::Answer {
+        let driver = FakeCodexDriver::scripted([AgentTurnResult::Answer {
             text: "확인했습니다.".to_string(),
         }]);
         let driver_handle = driver.clone();
@@ -7328,10 +7702,10 @@ mod tests {
     async fn valid_mentions_are_ordered_on_cold_resumed_and_plan_feedback_turns() {
         let (location, mention) = engine_location_mention();
         let driver = FakeCodexDriver::scripted([
-            CodexTurnResult::Answer {
+            AgentTurnResult::Answer {
                 text: "cold".to_string(),
             },
-            CodexTurnResult::Answer {
+            AgentTurnResult::Answer {
                 text: "resumed".to_string(),
             },
         ]);
@@ -7365,10 +7739,10 @@ mod tests {
         assert_resolved_before_user(&prompts[1]);
 
         let plan_driver = FakeCodexDriver::scripted([
-            CodexTurnResult::Plan {
+            AgentTurnResult::Plan {
                 markdown: "initial".to_string(),
             },
-            CodexTurnResult::Plan {
+            AgentTurnResult::Plan {
                 markdown: "revised".to_string(),
             },
         ]);
@@ -7425,7 +7799,7 @@ mod tests {
         assert!(error.message.contains("변경"));
         assert!(handle.prompts().is_empty());
 
-        let plain_driver = FakeCodexDriver::scripted([CodexTurnResult::Answer {
+        let plain_driver = FakeCodexDriver::scripted([AgentTurnResult::Answer {
             text: "plain".to_string(),
         }]);
         let plain_handle = plain_driver.clone();

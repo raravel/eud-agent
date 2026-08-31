@@ -32,16 +32,17 @@ import {
   PromptInputTools,
 } from "@/components/ai-elements/prompt-input";
 import { PromptInputButton } from "@/components/ai-elements/prompt-input";
-import { CodexPromptControls } from "@/components/CodexPromptControls";
+import { ProviderPromptControls } from "@/components/ProviderPromptControls";
 import { AgentTurnStatus } from "@/components/AgentTurnStatus";
 import { MentionComposer } from "@/components/MentionComposer";
 import type { PanelState } from "@/state/store";
 import type {
   ChatAttachment,
-  CodexModelSettings,
   MentionInstance,
   MentionSearchRequest,
   MentionSearchResponse,
+  ReasoningSelection,
+  SessionModelSettings,
 } from "@/lib/ipc";
 import {
   attachmentErrorMessage,
@@ -80,14 +81,17 @@ export interface InstructionBoxProps {
   scopeIdentity?: string;
   /** A cancel/rewind command is waiting for the core. */
   actionBusy?: boolean;
-  /** Current Codex catalog + persisted selection. */
-  codexSettings?: CodexModelSettings | null;
-  /** Catalog load or settings save in flight. */
-  codexSettingsBusy?: boolean;
-  /** Persist and apply the pair to subsequent Codex turns. */
-  onCodexSettingsChange?(model: string, reasoningEffort: string): void;
-  /** Retry loading the catalog after startup or a transient failure. */
-  onCodexSettingsReload?(): void;
+  /** Current session's immutable provider and provider-scoped model catalog. */
+  modelSettings?: SessionModelSettings | null;
+  /** Catalog load or session settings save in flight. */
+  modelSettingsBusy?: boolean;
+  /** Persist a model selection within the already-bound provider. */
+  onModelSettingsChange?(
+    model: string,
+    reasoning: ReasoningSelection | undefined,
+  ): void;
+  /** Retry loading the bound provider catalog. */
+  onModelSettingsReload?(): void;
 }
 
 export function InstructionBox({
@@ -101,10 +105,10 @@ export function InstructionBox({
   projectIdentity = state.project,
   scopeIdentity = "default",
   actionBusy = false,
-  codexSettings,
-  codexSettingsBusy = false,
-  onCodexSettingsChange,
-  onCodexSettingsReload,
+  modelSettings,
+  modelSettingsBusy = false,
+  onModelSettingsChange,
+  onModelSettingsReload,
 }: InstructionBoxProps) {
   const [instruction, setInstruction] = useState("");
   const [attachments, setAttachments] = useState<ChatAttachment[]>([]);
@@ -396,13 +400,13 @@ export function InstructionBox({
                 </PromptInputButton>
               </>
             )}
-            <CodexPromptControls
-              settings={codexSettings}
-              busy={codexSettingsBusy}
+            <ProviderPromptControls
+              settings={modelSettings}
+              busy={modelSettingsBusy}
               disabled={turnInFlight || actionBusy}
               contextUsage={state.contextUsage}
-              onChange={onCodexSettingsChange}
-              onReload={onCodexSettingsReload}
+              onChange={onModelSettingsChange}
+              onReload={onModelSettingsReload}
             />
           </PromptInputTools>
           <PromptInputSubmit

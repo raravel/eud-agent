@@ -26,7 +26,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use crate::config::DataDirs;
 use crate::memory::write_atomic_bytes;
 
-const SCHEMA_VERSION: u32 = 3;
+const SCHEMA_VERSION: u32 = 4;
 const INDEX_FILE: &str = "index.json";
 static SESSION_WRITE_LOCK: Mutex<()> = Mutex::new(());
 
@@ -48,6 +48,10 @@ pub struct SessionMeta {
     #[serde(default)]
     pub kind: SessionKind,
     pub created_at: u64,
+    #[serde(default = "legacy_provider")]
+    pub provider: crate::provider::ProviderId,
+    #[serde(default)]
+    pub model: String,
     #[serde(
         alias = "updatedAt",
         deserialize_with = "deserialize_last_conversation_at"
@@ -66,30 +70,46 @@ where
         timestamp
     })
 }
+const fn legacy_provider() -> crate::provider::ProviderId {
+    crate::provider::ProviderId::Codex
+}
 
-/// One full session record: [`SessionMeta`] (flattened) + the resumable thread id,
-/// the pending changeset req-ids, and the panel-owned log blob.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// One full session record with an immutable provider binding.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionRecord {
     #[serde(flatten)]
     pub meta: SessionMeta,
-    /// `null` until the first turn emits `ThreadStarted`.
-    pub thread_id: Option<String>,
-    /// Unarchived journal request ids. The concurrent writer contract restores
-    /// exactly one pending project writer and reports conflicting records.
+    pub provider_binding: crate::provider::ProviderBinding,
     pub pending_request_ids: Vec<String>,
-    /// Last active context and cumulative token snapshot reported by Codex.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_usage: Option<crate::ipc::ContextUsage>,
-    /// Opaque to Rust — stored and returned verbatim; the panel owns its schema.
     pub panel_log: serde_json::Value,
-    /// Durable instruction epoch and successful model-delivery cursor.
     #[serde(default)]
     pub context_state: crate::context_state::SessionContextState,
-    /// Append-only active-task event graph and its derived current projection.
     #[serde(default)]
     pub task_state: crate::task_state::SessionTaskState,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionRecordWire {
+    #[serde(flatten)]
+    meta: SessionMeta,
+    #[serde(default)]
+    provider_binding: Option<crate::provider::ProviderBinding>,
+    #[serde(default)]
+    thread_id: Option<String>,
+    #[serde(default)]
+    pending_request_ids: Vec<String>,
+    #[serde(default)]
+    context_usage: Option<crate::ipc::ContextUsage>,
+    #[serde(default)]
+    panel_log: serde_json::Value,
+    #[serde(default)]
+    context_state: crate::context_state::SessionContextState,
+    #[serde(default)]
+    task_state: crate::task_state::SessionTaskState,
 }
 
 /// The on-disk `index.json` shape: latest-conversation-first metadata rows.
@@ -128,8 +148,8 @@ impl SessionStore {
             dirs: dirs.clone(),
             sessions_dir: dirs.sessions_dir(),
         };
-        if let Err(error) = store.reset_legacy_sessions() {
-            eprintln!("eud-agent: legacy session reset failed: {error}");
+        if let Err(error) = store.migrate_legacy_sessions() {
+            eprintln!("eud-agent: legacy session migration failed: {error}");
         }
         store
     }
@@ -219,7 +239,7 @@ impl SessionStore {
         Ok(timestamp)
     }
 
-    /// Persist the latest Codex context snapshot without changing the panel-owned log.
+    /// Persist the latest provider context snapshot without changing the panel log.
     pub fn update_context_usage(
         &self,
         id: &str,
@@ -230,18 +250,46 @@ impl SessionStore {
         record.context_usage = Some(context_usage);
         self.save_unlocked(&record)
     }
-    /// Update only primary runtime ownership fields under the latest-record lock.
+    /// Atomically persist provider conversation state and pending review ownership.
     pub fn update_runtime_state(
         &self,
         id: &str,
-        thread_id: Option<String>,
+        conversation: crate::provider::ProviderConversationState,
         pending_request_ids: Vec<String>,
     ) -> anyhow::Result<()> {
         let _guard = self.lock()?;
         let mut record = self.load_unlocked(id)?;
-        record.thread_id = thread_id;
+        if conversation.provider() != record.provider_binding.provider {
+            anyhow::bail!("provider conversation does not match immutable session binding");
+        }
+        record.provider_binding.conversation = conversation;
         record.pending_request_ids = pending_request_ids;
         self.save_unlocked(&record)
+    }
+    pub fn update_model_settings(
+        &self,
+        id: &str,
+        provider: crate::provider::ProviderId,
+        model: String,
+        reasoning: Option<crate::provider::ReasoningSelection>,
+    ) -> anyhow::Result<SessionRecord> {
+        let _guard = self.lock()?;
+        let mut record = self.load_unlocked(id)?;
+        if provider != record.provider_binding.provider {
+            anyhow::bail!("session provider is immutable");
+        }
+        if model.trim().is_empty() {
+            anyhow::bail!("session model is empty");
+        }
+        record.meta.model = model.clone();
+        record.provider_binding.model = model;
+        record.provider_binding.reasoning = reasoning;
+        record
+            .provider_binding
+            .validate()
+            .map_err(anyhow::Error::msg)?;
+        self.save_unlocked(&record)?;
+        Ok(record)
     }
 
     pub fn drop_pending_request(&self, id: &str, request_id: &str) -> anyhow::Result<()> {
@@ -253,7 +301,7 @@ impl SessionStore {
         self.save_unlocked(&record)
     }
 
-    /// Initialize defaulted context fields without resetting a resumable legacy thread.
+    /// Initialize defaulted context fields without resetting a resumable conversation.
     pub fn initialize_context_state(
         &self,
         id: &str,
@@ -265,10 +313,10 @@ impl SessionStore {
         let mut record = self.load_unlocked(id)?;
         let before = record.context_state.clone();
         if record.context_state.static_prompt_fingerprint.is_empty() {
-            if let Some(thread_id) = record.thread_id.clone() {
+            if let Some(key) = record.provider_binding.conversation.conversation_key() {
                 record.context_state.adopt_legacy_thread(
                     static_baseline,
-                    thread_id,
+                    key,
                     memory,
                     wiki,
                     record.task_state.projection.revision,
@@ -283,18 +331,21 @@ impl SessionStore {
         Ok(record.context_state)
     }
 
-    /// Start a new instruction epoch and optionally clear the provider thread.
+    /// Start a new instruction epoch and optionally clear the provider conversation.
     pub fn reset_context_epoch(
         &self,
         id: &str,
         static_baseline: &str,
-        clear_thread: bool,
+        clear_conversation: bool,
     ) -> anyhow::Result<u64> {
         let _guard = self.lock()?;
         let mut record = self.load_unlocked(id)?;
-        let epoch = record.context_state.reset_epoch(static_baseline);
-        if clear_thread {
-            record.thread_id = None;
+        let epoch = record
+            .context_state
+            .reset_epoch(static_baseline, record.provider_binding.provider);
+        if clear_conversation {
+            record.provider_binding.conversation =
+                crate::provider::ProviderConversationState::empty(record.provider_binding.provider);
             record.context_usage = None;
         }
         self.save_unlocked(&record)?;
@@ -351,7 +402,8 @@ impl SessionStore {
             .task_state
             .move_leaf_to_client_turn(client_turn_id.as_deref())
             .map_err(anyhow::Error::msg)?;
-        record.thread_id = None;
+        record.provider_binding.conversation =
+            crate::provider::ProviderConversationState::empty(record.provider_binding.provider);
         record.pending_request_ids.clear();
         record.context_usage = None;
         record.panel_log = panel_log;
@@ -373,7 +425,9 @@ impl SessionStore {
     ) -> anyhow::Result<u64> {
         let _guard = self.lock()?;
         let mut record = self.load_unlocked(id)?;
-        let epoch = record.context_state.reset_epoch(static_baseline);
+        let epoch = record
+            .context_state
+            .reset_epoch(static_baseline, record.provider_binding.provider);
         let expected_leaf = record.task_state.leaf_id.clone();
         record
             .task_state
@@ -441,11 +495,56 @@ impl SessionStore {
         let path = self.record_path(id);
         let bytes = std::fs::read(&path)
             .map_err(|err| anyhow::anyhow!("session '{id}' not found: {err}"))?;
-        // `File.ReadAllText` strips a BOM; serde_json does not. Strip a UTF-8 BOM
-        // defensively so a hand-edited file still parses.
         let bytes = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(&bytes);
-        let mut record: SessionRecord = serde_json::from_slice(bytes)
+        let wire: SessionRecordWire = serde_json::from_slice(bytes)
             .map_err(|err| anyhow::anyhow!("session '{id}' is corrupt: {err}"))?;
+        let fallback_model = self
+            .dirs
+            .load_config()
+            .ok()
+            .and_then(|config| config.providers.codex.default_model)
+            .filter(|model| !model.trim().is_empty())
+            .unwrap_or_else(|| "default".to_string());
+        let binding = match wire.provider_binding {
+            Some(binding) => {
+                if wire.thread_id.is_some() {
+                    anyhow::bail!("session '{id}' contains ambiguous conversation state");
+                }
+                binding
+            }
+            None => crate::provider::ProviderBinding {
+                provider: crate::provider::ProviderId::Codex,
+                model: if wire.meta.model.trim().is_empty() {
+                    fallback_model
+                } else {
+                    wire.meta.model.clone()
+                },
+                reasoning: None,
+                base_url: None,
+                conversation: crate::provider::ProviderConversationState::Codex {
+                    thread_id: wire.thread_id,
+                },
+            },
+        };
+        binding
+            .validate()
+            .map_err(|error| anyhow::anyhow!("session '{id}' binding is invalid: {error}"))?;
+        let mut meta = wire.meta;
+        if meta.model.trim().is_empty() {
+            meta.model = binding.model.clone();
+        }
+        if meta.provider != binding.provider || meta.model != binding.model {
+            anyhow::bail!("session '{id}' metadata does not match its provider binding");
+        }
+        let mut record = SessionRecord {
+            meta,
+            provider_binding: binding,
+            pending_request_ids: wire.pending_request_ids,
+            context_usage: wire.context_usage,
+            panel_log: wire.panel_log,
+            context_state: wire.context_state,
+            task_state: wire.task_state,
+        };
         if let Err(error) = record.task_state.repair_cache() {
             eprintln!("eud-agent: session '{id}' task-state replay failed: {error}");
             let events = std::mem::take(&mut record.task_state.events);
@@ -495,32 +594,26 @@ impl SessionStore {
         self.dirs.sessions_dir().join(format!("{id}.json"))
     }
 
-    fn reset_legacy_sessions(&self) -> anyhow::Result<()> {
+    fn migrate_legacy_sessions(&self) -> anyhow::Result<()> {
         let _guard = self.lock()?;
         let mut index = self.read_index();
         if index.schema_version >= SCHEMA_VERSION {
             return Ok(());
         }
 
-        for meta in &index.sessions {
-            let Ok(mut record) = self.load_unlocked(&meta.id) else {
-                continue;
-            };
-            record.thread_id = None;
-            record.pending_request_ids.clear();
-            record.context_usage = None;
-            let bytes = serde_json::to_vec_pretty(&record)?;
-            write_atomic_bytes(&self.record_path(&meta.id), &bytes)?;
+        let records = index
+            .sessions
+            .iter()
+            .map(|meta| self.load_unlocked(&meta.id))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        for record in &records {
+            let bytes = serde_json::to_vec_pretty(record)?;
+            write_atomic_bytes(&self.record_path(&record.meta.id), &bytes)?;
         }
-
-        clear_directory(&self.dirs.session_workspaces_dir(), None)?;
-        clear_directory(&self.dirs.workspace_state_dir().join("baselines"), None)?;
-        clear_directory(&self.dirs.journal_dir(), Some("accepted"))?;
-        clear_directory(&self.dirs.harness_jobs_dir(), None)?;
-
+        index.sessions = records.into_iter().map(|record| record.meta).collect();
+        sort_sessions(&mut index.sessions);
         index.schema_version = SCHEMA_VERSION;
-        self.write_index(&index)?;
-        Ok(())
+        self.write_index(&index)
     }
 }
 
@@ -535,26 +628,6 @@ fn last_client_turn_id(panel_log: &serde_json::Value) -> Option<String> {
         .and_then(serde_json::Value::as_str)
         .filter(|id| uuid::Uuid::parse_str(id).is_ok())
         .map(str::to_string)
-}
-
-fn clear_directory(path: &std::path::Path, preserve_name: Option<&str>) -> anyhow::Result<()> {
-    if !path.exists() {
-        std::fs::create_dir_all(path)?;
-        return Ok(());
-    }
-    for entry in std::fs::read_dir(path)? {
-        let entry = entry?;
-        if preserve_name.is_some_and(|name| entry.file_name() == std::ffi::OsStr::new(name)) {
-            continue;
-        }
-        let file_type = entry.file_type()?;
-        if file_type.is_dir() {
-            std::fs::remove_dir_all(entry.path())?;
-        } else {
-            std::fs::remove_file(entry.path())?;
-        }
-    }
-    Ok(())
 }
 
 fn sort_sessions(sessions: &mut [SessionMeta]) {
@@ -646,10 +719,22 @@ mod tests {
                 name: name.to_string(),
                 project: "mymap".to_string(),
                 kind: SessionKind::Eps,
+                provider: crate::provider::ProviderId::Codex,
+                model: "gpt-test".to_string(),
                 created_at: 1_718_000_000,
                 last_conversation_at: 1_718_000_000_000,
             },
-            thread_id: Some("019ece1c-thread".to_string()),
+            provider_binding: crate::provider::ProviderBinding {
+                provider: crate::provider::ProviderId::Codex,
+                model: "gpt-test".to_string(),
+                reasoning: Some(crate::provider::ReasoningSelection {
+                    level: "medium".to_string(),
+                }),
+                base_url: None,
+                conversation: crate::provider::ProviderConversationState::Codex {
+                    thread_id: Some("019ece1c-thread".to_string()),
+                },
+            },
             pending_request_ids: vec!["req-1a2b3c4d".to_string()],
             context_usage: None,
             panel_log: json!({
@@ -890,13 +975,13 @@ mod tests {
     }
 
     #[test]
-    fn v3_cutover_preserves_conversation_but_clears_legacy_execution_state() {
+    fn v4_migration_preserves_provider_conversation_and_execution_state() {
         let base = unique_temp_dir("v3-cutover");
         let dirs = DataDirs::from_bases(&base.join("roaming"), &base.join("local"));
         dirs.ensure_dirs().unwrap();
         let record = sample_record(&new_session_id(), "보존할 대화");
         let index = json!({
-            "schemaVersion": 2,
+            "schemaVersion": 3,
             "sessions": [record.meta.clone()]
         });
         fs::write(
@@ -930,24 +1015,83 @@ mod tests {
         let loaded = migrated.load(&record.meta.id).unwrap();
         assert_eq!(loaded.meta, record.meta);
         assert_eq!(loaded.panel_log, record.panel_log);
-        assert!(loaded.thread_id.is_none());
-        assert!(loaded.pending_request_ids.is_empty());
+        assert_eq!(
+            loaded.provider_binding.conversation,
+            crate::provider::ProviderConversationState::Codex {
+                thread_id: Some("019ece1c-thread".to_string())
+            }
+        );
+        assert_eq!(loaded.pending_request_ids, record.pending_request_ids);
         assert!(loaded.context_usage.is_none());
-        assert!(!dirs.journal_dir().join("req-pending.json").exists());
+        assert!(dirs.journal_dir().join("req-pending.json").is_file());
         assert!(dirs
             .journal_dir()
             .join("accepted")
             .join("req-accepted.json")
             .is_file());
-        assert!(fs::read_dir(dirs.session_workspaces_dir())
-            .unwrap()
-            .next()
-            .is_none());
+        assert!(dirs
+            .session_workspaces_dir()
+            .join("project/session/spec.md")
+            .is_file());
         let migrated_index: serde_json::Value =
             serde_json::from_slice(&fs::read(dirs.sessions_dir().join(INDEX_FILE)).unwrap())
                 .unwrap();
         assert_eq!(migrated_index["schemaVersion"], json!(SCHEMA_VERSION));
 
+        fs::remove_dir_all(base).ok();
+    }
+    #[test]
+    fn legacy_thread_id_migrates_losslessly_to_codex_binding() {
+        let base = unique_temp_dir("legacy-provider-binding");
+        let dirs = DataDirs::from_bases(&base.join("roaming"), &base.join("local"));
+        dirs.ensure_dirs().unwrap();
+        let mut config = crate::config::Config::default();
+        config.providers.codex.default_model = Some("gpt-legacy".to_string());
+        dirs.save_config(&config).unwrap();
+        let id = new_session_id();
+        let mut record = serde_json::to_value(sample_record(&id, "legacy")).unwrap();
+        let object = record.as_object_mut().unwrap();
+        object.remove("providerBinding");
+        object.remove("provider");
+        object.remove("model");
+        object.insert("threadId".to_string(), json!("thread-legacy"));
+        let mut meta = record.clone();
+        let meta = meta.as_object_mut().unwrap();
+        for field in [
+            "threadId",
+            "pendingRequestIds",
+            "contextUsage",
+            "panelLog",
+            "contextState",
+            "taskState",
+        ] {
+            meta.remove(field);
+        }
+        fs::write(
+            dirs.sessions_dir().join(format!("{id}.json")),
+            serde_json::to_vec_pretty(&record).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            dirs.sessions_dir().join(INDEX_FILE),
+            serde_json::to_vec_pretty(&json!({
+                "schemaVersion": 3,
+                "sessions": [meta]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let migrated = SessionStore::new(&dirs).load(&id).unwrap();
+        assert_eq!(migrated.meta.provider, crate::provider::ProviderId::Codex);
+        assert_eq!(migrated.meta.model, "gpt-legacy");
+        assert_eq!(
+            migrated.provider_binding.conversation,
+            crate::provider::ProviderConversationState::Codex {
+                thread_id: Some("thread-legacy".to_string())
+            }
+        );
+        assert_eq!(migrated.provider_binding.model, "gpt-legacy");
         fs::remove_dir_all(base).ok();
     }
 
@@ -994,7 +1138,9 @@ mod tests {
             runtime_store
                 .update_runtime_state(
                     &runtime_id,
-                    Some("thread-new".to_string()),
+                    crate::provider::ProviderConversationState::Codex {
+                        thread_id: Some("thread-new".to_string()),
+                    },
                     vec!["req-pending".to_string()],
                 )
                 .unwrap();
@@ -1022,7 +1168,12 @@ mod tests {
         task.join().unwrap();
 
         let loaded = store.load(&id).unwrap();
-        assert_eq!(loaded.thread_id.as_deref(), Some("thread-new"));
+        assert_eq!(
+            loaded.provider_binding.conversation,
+            crate::provider::ProviderConversationState::Codex {
+                thread_id: Some("thread-new".to_string())
+            }
+        );
         assert_eq!(loaded.pending_request_ids, vec!["req-pending"]);
         assert_eq!(loaded.task_state.projection.goals[0].id, "goal-2");
         fs::remove_dir_all(base).ok();
@@ -1117,7 +1268,10 @@ mod tests {
         assert_eq!(rewound.task_state.events.len(), 2);
         assert_eq!(rewound.task_state.projection.goals.len(), 1);
         assert_eq!(rewound.task_state.projection.goals[0].id, "first");
-        assert!(rewound.thread_id.is_none());
+        assert_eq!(
+            rewound.provider_binding.conversation,
+            crate::provider::ProviderConversationState::Codex { thread_id: None }
+        );
         assert!(rewound.pending_request_ids.is_empty());
         assert!(rewound.context_state.instruction_epoch >= 2);
 

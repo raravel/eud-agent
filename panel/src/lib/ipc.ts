@@ -14,6 +14,28 @@
 import { invoke as tauriInvoke } from "@tauri-apps/api/core";
 import { listen as tauriListen } from "@tauri-apps/api/event";
 import {
+  PROVIDER_IDS,
+  isProviderId,
+  isProviderModel,
+  isProviderStatus,
+  type ProviderId,
+  type ProviderModel,
+  type ProviderSettingsView,
+  type ProviderStatus,
+  type ReasoningSelection,
+  type SessionModelSettings,
+} from "@/providers/types";
+export type {
+  ProviderId,
+  ProviderModel,
+  ProviderSettingsView,
+  ProviderProgressEvent,
+  ProviderStatus,
+  ReasoningSelection,
+  SessionModelSettings,
+} from "@/providers/types";
+
+import {
   isServerMessage,
   type ClientMessage,
   type LedgerEntry,
@@ -42,25 +64,6 @@ export type InvokeFn = (
   cmd: string,
   args?: Record<string, unknown>,
 ) => Promise<unknown>;
-export interface CodexReasoningEffortOption {
-  reasoningEffort: string;
-  description: string;
-}
-
-export interface CodexModel {
-  model: string;
-  displayName: string;
-  description: string;
-  supportedReasoningEfforts: CodexReasoningEffortOption[];
-  defaultReasoningEffort: string;
-  isDefault: boolean;
-}
-
-export interface CodexModelSettings {
-  models: CodexModel[];
-  selectedModel: string;
-  selectedReasoningEffort: string;
-}
 export interface NotificationChannelSettings {
   sound: boolean;
   osNotification: boolean;
@@ -569,34 +572,215 @@ export async function workspaceSearch(
   };
 }
 
-function toCodexModelSettings(value: unknown): CodexModelSettings {
+function toProviderStatus(value: unknown): ProviderStatus {
+  if (!isProviderStatus(value)) {
+    throw new Error("invalid provider status response");
+  }
+  return value;
+}
+
+function toProviderModels(value: unknown): ProviderModel[] {
+  if (!Array.isArray(value) || !value.every(isProviderModel)) {
+    throw new Error("invalid provider catalog response");
+  }
+  return value;
+}
+
+function toProviderSettingsView(value: unknown): ProviderSettingsView {
   if (
     !isObject(value) ||
+    !isProviderId(value.provider) ||
+    !isProviderStatus(value.status) ||
     !Array.isArray(value.models) ||
-    typeof value.selectedModel !== "string" ||
-    typeof value.selectedReasoningEffort !== "string"
+    !value.models.every(isProviderModel) ||
+    (value.selectedModel !== undefined &&
+      value.selectedModel !== null &&
+      typeof value.selectedModel !== "string") ||
+    (value.selectedReasoning !== undefined &&
+      value.selectedReasoning !== null &&
+      (!isObject(value.selectedReasoning) ||
+        typeof value.selectedReasoning.level !== "string")) ||
+    (value.version !== undefined &&
+      value.version !== null &&
+      typeof value.version !== "string") ||
+    (value.channel !== undefined &&
+      value.channel !== null &&
+      typeof value.channel !== "string") ||
+    (value.baseUrl !== undefined &&
+      value.baseUrl !== null &&
+      typeof value.baseUrl !== "string") ||
+    typeof value.hasApiKey !== "boolean"
   ) {
-    throw new Error("invalid codex model settings response");
+    throw new Error("invalid provider settings response");
   }
-  return value as unknown as CodexModelSettings;
+  return value as unknown as ProviderSettingsView;
 }
 
-/** Fetch the authenticated account's current visible Codex model catalog. */
-export async function codexModelSettingsGet(
-  invoke: InvokeFn = tauriInvoke,
-): Promise<CodexModelSettings> {
-  return toCodexModelSettings(await invoke("codex_model_settings"));
+function toSessionModelSettings(value: unknown): SessionModelSettings {
+  if (
+    !isObject(value) ||
+    !isProviderId(value.provider) ||
+    !Array.isArray(value.models) ||
+    !value.models.every(isProviderModel) ||
+    typeof value.selectedModel !== "string" ||
+    (value.selectedReasoning !== undefined &&
+      value.selectedReasoning !== null &&
+      (!isObject(value.selectedReasoning) ||
+        typeof value.selectedReasoning.level !== "string"))
+  ) {
+    throw new Error("invalid session model settings response");
+  }
+  return {
+    provider: value.provider,
+    models: value.models as ProviderModel[],
+    selectedModel: value.selectedModel,
+    selectedReasoning:
+      value.selectedReasoning === null ||
+      value.selectedReasoning === undefined
+        ? undefined
+        : (value.selectedReasoning as unknown as ReasoningSelection),
+  };
 }
 
-/** Validate, persist, and apply a model + reasoning effort to subsequent turns. */
-export async function codexModelSettingsSave(
-  model: string,
-  reasoningEffort: string,
+export async function providerSettingsGet(
+  provider: ProviderId,
   invoke: InvokeFn = tauriInvoke,
-): Promise<CodexModelSettings> {
-  return toCodexModelSettings(
-    await invoke("codex_model_settings_save", { model, reasoningEffort }),
+): Promise<ProviderSettingsView> {
+  return toProviderSettingsView(
+    await invoke("provider_settings", { provider }),
   );
+}
+
+export async function providerStatusList(
+  invoke: InvokeFn = tauriInvoke,
+): Promise<ProviderStatus[]> {
+  const value = await invoke("provider_status_list");
+  if (!Array.isArray(value) || value.length !== PROVIDER_IDS.length) {
+    throw new Error("invalid provider status list response");
+  }
+  return value.map(toProviderStatus);
+}
+
+export async function providerInstall(
+  provider: ProviderId,
+  invoke: InvokeFn = tauriInvoke,
+): Promise<ProviderStatus> {
+  return toProviderStatus(await invoke("provider_install", { provider }));
+}
+
+export async function providerLoginStart(
+  provider: ProviderId,
+  invoke: InvokeFn = tauriInvoke,
+): Promise<string> {
+  const value = await invoke("provider_login_start", { provider });
+  if (typeof value !== "string") throw new Error("invalid provider login attempt");
+  return value;
+}
+
+export async function providerLoginCancel(
+  provider: ProviderId,
+  attemptId: string,
+  invoke: InvokeFn = tauriInvoke,
+): Promise<void> {
+  await invoke("provider_login_cancel", { provider, attemptId });
+}
+
+export async function providerLoginStatus(
+  provider: ProviderId,
+  invoke: InvokeFn = tauriInvoke,
+): Promise<ProviderStatus> {
+  return toProviderStatus(await invoke("provider_login_status", { provider }));
+}
+
+export async function providerCredentialImport(
+  provider: ProviderId,
+  invoke: InvokeFn = tauriInvoke,
+): Promise<ProviderStatus> {
+  return toProviderStatus(
+    await invoke("provider_credential_import", { provider }),
+  );
+}
+
+export async function providerApiKeySave(
+  provider: ProviderId,
+  key: string,
+  invoke: InvokeFn = tauriInvoke,
+): Promise<ProviderStatus> {
+  return toProviderStatus(
+    await invoke("provider_api_key_save", { provider, key }),
+  );
+}
+
+export async function providerBaseUrlSave(
+  provider: ProviderId,
+  baseUrl: string,
+  invoke: InvokeFn = tauriInvoke,
+): Promise<ProviderSettingsView> {
+  return toProviderSettingsView(
+    await invoke("provider_base_url_save", { provider, baseUrl }),
+  );
+}
+
+export async function providerLogout(
+  provider: ProviderId,
+  invoke: InvokeFn = tauriInvoke,
+): Promise<ProviderStatus> {
+  return toProviderStatus(await invoke("provider_logout", { provider }));
+}
+
+export async function providerCatalog(
+  provider: ProviderId,
+  invoke: InvokeFn = tauriInvoke,
+): Promise<ProviderModel[]> {
+  return toProviderModels(await invoke("provider_catalog", { provider }));
+}
+
+export async function providerDefaultsSave(
+  provider: ProviderId,
+  model: string,
+  reasoning: ReasoningSelection | undefined,
+  setDefaultProvider: boolean,
+  invoke: InvokeFn = tauriInvoke,
+): Promise<ProviderSettingsView> {
+  return toProviderSettingsView(
+    await invoke("provider_defaults_save", {
+      provider,
+      model,
+      reasoning,
+      setDefaultProvider,
+    }),
+  );
+}
+
+export async function sessionModelSettingsGet(
+  sessionId: string,
+  invoke: InvokeFn = tauriInvoke,
+): Promise<SessionModelSettings> {
+  return toSessionModelSettings(
+    await invoke("session_model_settings", { sessionId }),
+  );
+}
+
+export async function sessionModelSettingsSave(
+  sessionId: string,
+  model: string,
+  reasoning: ReasoningSelection | undefined,
+  invoke: InvokeFn = tauriInvoke,
+): Promise<SessionModelSettings> {
+  return toSessionModelSettings(
+    await invoke("session_model_settings_save", {
+      sessionId,
+      model,
+      reasoning,
+    }),
+  );
+}
+
+export async function setupProviderSelect(
+  provider: ProviderId,
+  invoke: InvokeFn = tauriInvoke,
+): Promise<unknown> {
+  return invoke("setup_provider_select", { provider });
 }
 
 /** Run native Codex compaction for one persisted session. */

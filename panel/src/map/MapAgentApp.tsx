@@ -28,13 +28,14 @@ import type {
 import { discardAttachment, stageAttachment } from "@/lib/attachments";
 import {
   attentionNotify,
-  codexModelSettingsGet,
-  codexModelSettingsSave,
   compactSession,
   isAgentTurnEndTransition,
+  sessionModelSettingsGet,
+  sessionModelSettingsSave,
   type ChatAttachment,
-  type CodexModelSettings,
   type ContextUsage,
+  type ReasoningSelection,
+  type SessionModelSettings,
 } from "@/lib/ipc";
 import { MapAgentPanel, type MapConversationEntry } from "./MapAgentPanel";
 import { MapCanvas } from "./MapCanvas";
@@ -695,9 +696,9 @@ export default function MapAgentApp() {
   const [sessionHistoryLoading, setSessionHistoryLoading] = useState(false);
   const [sessionActionBusy, setSessionActionBusy] = useState(false);
   const [mapSessions, setMapSessions] = useState<SessionMeta[]>([]);
-  const [codexSettings, setCodexSettings] =
-    useState<CodexModelSettings | null>(null);
-  const [codexSettingsBusy, setCodexSettingsBusy] = useState(false);
+  const [modelSettings, setModelSettings] =
+    useState<SessionModelSettings | null>(null);
+  const [modelSettingsBusy, setModelSettingsBusy] = useState(false);
   const [contextUsage, setContextUsage] = useState<ContextUsage | null>(null);
   const [view, setView] = useState<MapView>(persisted.view ?? "candidate");
   const [layers, setLayers] = useState<MapLayer[]>(persisted.layers ?? allLayers);
@@ -917,37 +918,44 @@ export default function MapAgentApp() {
     void refreshDraftObjects(sessionId, liveDraft);
   }, [liveDraft, refreshDraftObjects]);
 
-  const loadCodexModelSettings = useCallback(async () => {
-    setCodexSettingsBusy(true);
+  const loadModelSettings = useCallback(async (sessionId?: string) => {
+    const target = sessionId ?? sessionIdRef.current;
+    if (!target) {
+      setModelSettings(null);
+      return;
+    }
+    setModelSettingsBusy(true);
     try {
-      setCodexSettings(await codexModelSettingsGet());
+      setModelSettings(await sessionModelSettingsGet(target));
     } catch {
-      setCodexSettings(null);
-      setError("Codex 모델 목록을 불러오지 못했습니다.");
+      setModelSettings(null);
+      setError("세션 모델 목록을 불러오지 못했습니다.");
     } finally {
-      setCodexSettingsBusy(false);
+      setModelSettingsBusy(false);
     }
   }, []);
 
-  const handleCodexSettingsChange = useCallback(
-    async (model: string, reasoningEffort: string) => {
-      setCodexSettingsBusy(true);
+  const handleModelSettingsChange = useCallback(
+    async (model: string, reasoning: ReasoningSelection | undefined) => {
+      const sessionId = sessionIdRef.current;
+      if (!sessionId) return;
+      setModelSettingsBusy(true);
       try {
-        setCodexSettings(
-          await codexModelSettingsSave(model, reasoningEffort),
+        setModelSettings(
+          await sessionModelSettingsSave(sessionId, model, reasoning),
         );
       } catch {
-        setError("Codex 모델 설정을 저장하지 못했습니다.");
+        setError("세션 모델 설정을 저장하지 못했습니다.");
       } finally {
-        setCodexSettingsBusy(false);
+        setModelSettingsBusy(false);
       }
     },
     [],
   );
 
   useEffect(() => {
-    void loadCodexModelSettings();
-  }, [loadCodexModelSettings]);
+    if (bootstrap?.session.id) void loadModelSettings(bootstrap.session.id);
+  }, [bootstrap?.session.id, loadModelSettings]);
 
   const applyBootstrap = useCallback(
     async (next: MapBootstrapResponse) => {
@@ -2656,8 +2664,8 @@ export default function MapAgentApp() {
           live={turnInFlight}
           actionBusy={busy || imagePlacement !== null || stampPlacement !== null}
           contextUsage={contextUsage}
-          codexSettings={codexSettings}
-          codexSettingsBusy={codexSettingsBusy}
+          modelSettings={modelSettings}
+          modelSettingsBusy={modelSettingsBusy}
           mentions={mentions}
           selectedMentionId={selectedMentionId}
           ask={ask}
@@ -2669,10 +2677,10 @@ export default function MapAgentApp() {
           onCancel={() => void cancelTurn()}
           onStageAttachment={stageAttachment}
           onDiscardAttachment={discardAttachment}
-          onCodexSettingsChange={(model, reasoningEffort) => {
-            void handleCodexSettingsChange(model, reasoningEffort);
+          onModelSettingsChange={(model, reasoning) => {
+            void handleModelSettingsChange(model, reasoning);
           }}
-          onCodexSettingsReload={() => void loadCodexModelSettings()}
+          onModelSettingsReload={() => void loadModelSettings()}
           onMentionSelect={setSelectedMentionId}
           onMentionRemove={(id) => {
             setMentions((chips) => chips.filter((chip) => chip.id !== id));
@@ -2768,7 +2776,7 @@ export default function MapAgentApp() {
               <button
                 key={layer}
                 type="button"
-                className={`rounded px-1.5 py-0.5 text-[10px] ${layers.includes(layer) ? "bg-primary/15 text-primary" : "text-muted-foreground"}`}
+                className={`min-h-7 rounded-md px-2 text-[11px] font-medium transition-colors ${layers.includes(layer) ? "bg-primary/15 text-primary" : "text-muted-foreground hover:bg-muted hover:text-foreground"}`}
                 aria-pressed={layers.includes(layer)}
                 onClick={() => setLayers((visible) => visible.includes(layer) ? visible.filter((item) => item !== layer) : [...visible, layer])}
               >

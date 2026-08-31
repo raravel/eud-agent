@@ -15,6 +15,8 @@ import {
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { cn } from "@/lib/utils";
+import { PROVIDER_LABELS } from "@/providers/providerCopy";
+import type { ProviderId } from "@/providers/types";
 
 export type SessionActivity =
   | "idle"
@@ -28,6 +30,7 @@ export interface SessionSidebarRow {
   id: string;
   name: string;
   lastConversationAt: number;
+  provider: ProviderId;
   activity: SessionActivity;
   persisted: boolean;
 }
@@ -285,7 +288,7 @@ export function SessionSidebar({
                       "flex max-w-full overflow-hidden rounded-md text-left outline-none transition-colors focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring",
                       collapsed
                         ? "size-11 items-center justify-center"
-                        : "min-h-[58px] w-full min-w-0 items-start gap-2.5 px-2.5 py-2 pr-[4.5rem]",
+                        : "min-h-[58px] w-full min-w-0 items-start gap-2.5 px-2.5 py-2 pr-[5.5rem]",
                       selected
                         ? "bg-primary/10 text-foreground shadow-[inset_2px_0_0_var(--primary)]"
                         : "text-muted-foreground hover:bg-muted/65 hover:text-foreground",
@@ -295,7 +298,7 @@ export function SessionSidebar({
                       <span className="relative flex size-8 items-center justify-center rounded-md border border-border/70 bg-muted/45 text-xs font-semibold text-foreground">
                         {row.name.trim().charAt(0) || "·"}
                         {row.activity !== "idle" && (
-                          <span className="absolute -bottom-1 -right-1 flex size-4 items-center justify-center rounded-full border border-background bg-background">
+                          <span className="absolute bottom-0 right-0 flex size-4 items-center justify-center rounded-full border border-background bg-background">
                             <ActivityIcon activity={row.activity} />
                           </span>
                         )}
@@ -316,7 +319,7 @@ export function SessionSidebar({
                           <span className="block max-w-full truncate text-xs font-medium leading-5 text-foreground" title={row.name}>
                             {row.name}
                           </span>
-                          <span className="flex min-w-0 max-w-full items-center gap-1.5 overflow-hidden text-[10px] leading-4">
+                          <span className="flex min-w-0 max-w-full items-center gap-1.5 overflow-hidden text-[11px] leading-4">
                             <span
                               className={cn(
                                 "min-w-0 truncate",
@@ -328,6 +331,12 @@ export function SessionSidebar({
                               )}
                             >
                               {label}
+                            </span>
+                            <span aria-hidden className="text-muted-foreground/40">
+                              ·
+                            </span>
+                            <span className="shrink-0 text-muted-foreground/80">
+                              {PROVIDER_LABELS[row.provider]}
                             </span>
                             {row.activity === "idle" && lastConversation && (
                               <span className="min-w-0 truncate text-muted-foreground/75">
@@ -345,19 +354,19 @@ export function SessionSidebar({
                     <>
                       <Button
                         type="button"
-                        size="icon-sm"
+                        size="icon"
                         variant="ghost"
-                        className="absolute right-9 top-1.5 size-8 opacity-0 focus-visible:opacity-100 group-hover:opacity-100"
+                        className="absolute right-10 top-[11px] size-9 opacity-0 focus-visible:opacity-100 group-hover:opacity-100"
                         aria-label={`${row.name} 이름 변경`}
                         onClick={() => handleRename(row)}
                       >
-                        <Pencil className="size-3.5" aria-hidden="true" />
+                        <Pencil className="size-4" aria-hidden="true" />
                       </Button>
                       <Button
                         type="button"
-                        size="icon-sm"
+                        size="icon"
                         variant="ghost"
-                        className="absolute right-1.5 top-1.5 size-8 opacity-0 focus-visible:opacity-100 group-hover:opacity-100"
+                        className="absolute right-1 top-[11px] size-9 opacity-0 focus-visible:opacity-100 group-hover:opacity-100"
                         aria-label={`${row.name} 삭제`}
                         disabled={
                           row.activity === "running_read" ||
@@ -366,7 +375,7 @@ export function SessionSidebar({
                         }
                         onClick={() => handleDelete(row)}
                       >
-                        <Trash2 className="size-3.5" aria-hidden="true" />
+                        <Trash2 className="size-4" aria-hidden="true" />
                       </Button>
                     </>
                   )}

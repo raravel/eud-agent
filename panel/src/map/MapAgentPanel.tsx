@@ -5,8 +5,9 @@ import { ConversationLog } from "@/components/ConversationLog";
 import { Button } from "@/components/ui/button";
 import type {
   ChatAttachment,
-  CodexModelSettings,
   ContextUsage,
+  ReasoningSelection,
+  SessionModelSettings,
 } from "@/lib/ipc";
 import type { AskAnswer, AskQuestion } from "@/lib/protocol";
 import type { LogEntry, TurnState } from "@/state/store";
@@ -31,8 +32,8 @@ export interface MapAgentPanelProps {
   live: boolean;
   actionBusy?: boolean;
   contextUsage?: ContextUsage | null;
-  codexSettings?: CodexModelSettings | null;
-  codexSettingsBusy?: boolean;
+  modelSettings?: SessionModelSettings | null;
+  modelSettingsBusy?: boolean;
   mentions: MentionChip[];
   selectedMentionId?: string;
   ask?: { requestId: string; questions: AskQuestion[]; submitting: boolean };
@@ -44,8 +45,11 @@ export interface MapAgentPanelProps {
   onCancel(): void;
   onStageAttachment?(file: File): Promise<ChatAttachment>;
   onDiscardAttachment?(id: string): Promise<void>;
-  onCodexSettingsChange?(model: string, reasoningEffort: string): void;
-  onCodexSettingsReload?(): void;
+  onModelSettingsChange?(
+    model: string,
+    reasoning: ReasoningSelection | undefined,
+  ): void;
+  onModelSettingsReload?(): void;
   onMentionSelect(id: string): void;
   onMentionRemove(id: string): void;
   onMentionFind(id: string): void;
@@ -62,8 +66,8 @@ export function MapAgentPanel({
   live,
   actionBusy = false,
   contextUsage,
-  codexSettings,
-  codexSettingsBusy,
+  modelSettings,
+  modelSettingsBusy,
   mentions,
   selectedMentionId,
   ask,
@@ -75,8 +79,8 @@ export function MapAgentPanel({
   onCancel,
   onStageAttachment,
   onDiscardAttachment,
-  onCodexSettingsChange,
-  onCodexSettingsReload,
+  onModelSettingsChange,
+  onModelSettingsReload,
   onMentionSelect,
   onMentionRemove,
   onMentionFind,
@@ -161,14 +165,14 @@ export function MapAgentPanel({
         hasStaleMentions={mentions.some((chip) => chip.stale)}
         draftScope={draftScope}
         contextUsage={contextUsage}
-        codexSettings={codexSettings}
-        codexSettingsBusy={codexSettingsBusy}
+        modelSettings={modelSettings}
+        modelSettingsBusy={modelSettingsBusy}
         onSend={onSend}
         onCancel={onCancel}
         onStageAttachment={onStageAttachment}
         onDiscardAttachment={onDiscardAttachment}
-        onCodexSettingsChange={onCodexSettingsChange}
-        onCodexSettingsReload={onCodexSettingsReload}
+        onModelSettingsChange={onModelSettingsChange}
+        onModelSettingsReload={onModelSettingsReload}
       />
     </aside>
   );

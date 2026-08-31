@@ -1271,6 +1271,35 @@ describe("saved attachment log hydration", () => {
   });
 });
 
+describe("saved progress log hydration", () => {
+  it("drops transient progress rows while preserving the saved id high-water mark", () => {
+    const store = freshStore();
+    store.hydrate({
+      schemaVersion: 2,
+      logSeq: 3,
+      log: [
+        { id: 1, kind: "you", text: "hi" },
+        {
+          id: 2,
+          kind: "progress",
+          text: "AI 제공자 실행 중…",
+          stage: "provider",
+        },
+        {
+          id: 3,
+          kind: "warn",
+          text: "구조화된 활성 작업 상태를 갱신하지 못했습니다.",
+          stage: "task_state_warning",
+        },
+      ],
+    });
+
+    expect(store.getState().log.map((entry) => entry.id)).toEqual([1, 3]);
+    store.log("info", "next");
+    expect(store.getState().log.at(-1)?.id).toBe(4);
+  });
+});
+
 // Type-only: PanelState carries the v2 fields the (future) UI renders from.
 const _typecheck: PanelState = createPanelStore().getState();
 void _typecheck;

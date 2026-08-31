@@ -74,37 +74,89 @@ pub struct NotificationSettings {
     pub ask_response_required: NotificationChannelSettings,
 }
 
-/// `config.json` contents (feature 10).
-///
-/// Every field carries a serde default so a partial / first-run file (e.g. `{}`)
-/// deserializes cleanly.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub const CONFIG_SCHEMA_VERSION: u32 = 2;
+
+const fn config_schema_version() -> u32 {
+    CONFIG_SCHEMA_VERSION
+}
+
+/// Secret-free `config.json` authority. Credentials live in provider-owned stores.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
-    /// Absolute path to the EUD Editor 3 install root (the folder that contains
-    /// `Data\Lua\TriggerEditor`). Empty until captured via the first-run picker.
+    #[serde(default = "config_schema_version")]
+    pub schema_version: u32,
     #[serde(default)]
     pub editor_path: String,
-    /// Optional explicit path to the `codex` `.cmd` shim (overrides PATH resolution).
     #[serde(default)]
-    pub codex_cmd: Option<String>,
-    /// Codex model selected in the panel. `None` follows Codex's current default.
+    pub default_provider: Option<crate::provider::ProviderId>,
     #[serde(default)]
-    pub codex_model: Option<String>,
-    /// Reasoning effort selected for [`Self::codex_model`].
-    #[serde(default)]
-    pub codex_reasoning_effort: Option<String>,
-    /// Codex model slugs opted into the 1M context-window override.
-    #[serde(default)]
-    pub codex_large_context_models: BTreeSet<String>,
-    /// User-attention notification channels.
+    pub providers: crate::provider::ProviderSettings,
     #[serde(default)]
     pub notifications: NotificationSettings,
-    /// The embedding model asset.
     #[serde(default)]
     pub model: AssetSpec,
-    /// The RAG index asset.
     #[serde(default)]
     pub rag_index: AssetSpec,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            schema_version: CONFIG_SCHEMA_VERSION,
+            editor_path: String::new(),
+            default_provider: None,
+            providers: crate::provider::ProviderSettings::default(),
+            notifications: NotificationSettings::default(),
+            model: AssetSpec::default(),
+            rag_index: AssetSpec::default(),
+        }
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawConfigV1 {
+    #[serde(default)]
+    editor_path: String,
+    #[serde(default)]
+    codex_cmd: Option<String>,
+    #[serde(default)]
+    codex_model: Option<String>,
+    #[serde(default)]
+    codex_reasoning_effort: Option<String>,
+    #[serde(default)]
+    codex_large_context_models: BTreeSet<String>,
+    #[serde(default)]
+    notifications: NotificationSettings,
+    #[serde(default)]
+    model: AssetSpec,
+    #[serde(default)]
+    rag_index: AssetSpec,
+}
+
+impl RawConfigV1 {
+    fn migrate(self) -> Config {
+        Config {
+            editor_path: self.editor_path,
+            default_provider: Some(crate::provider::ProviderId::Codex),
+            providers: crate::provider::ProviderSettings {
+                codex: crate::provider::CodexProviderSettings {
+                    executable_override: self.codex_cmd,
+                    default_model: self.codex_model,
+                    default_reasoning: self
+                        .codex_reasoning_effort
+                        .map(|level| crate::provider::ReasoningSelection { level }),
+                    large_context_models: self.codex_large_context_models,
+                },
+                ..Default::default()
+            },
+            notifications: self.notifications,
+            model: self.model,
+            rag_index: self.rag_index,
+            ..Config::default()
+        }
+    }
 }
 
 /// The editor's file-IPC directory: `<editor_path>\Data\agent`.
@@ -238,6 +290,10 @@ impl DataDirs {
     pub fn harness_jobs_dir(&self) -> PathBuf {
         self.app_data.join("harness_jobs")
     }
+    /// Crash-safe normalized transcripts for direct providers.
+    pub fn provider_sessions_dir(&self) -> PathBuf {
+        self.app_data.join("provider-sessions")
+    }
 
     /// `%localappdata%\eud-agent\models` — NEVER in Roaming (the model is ~570MB).
     pub fn models_dir(&self) -> PathBuf {
@@ -253,6 +309,37 @@ impl DataDirs {
     /// standalone binary). NEVER in Roaming; resolved by [`resolve_codex_cmd`].
     pub fn bin_dir(&self) -> PathBuf {
         self.app_local_data.join("bin")
+    }
+    pub fn providers_dir(&self) -> PathBuf {
+        self.app_local_data.join("providers")
+    }
+
+    pub fn provider_dir(&self, provider: crate::provider::ProviderId) -> PathBuf {
+        self.providers_dir().join(provider.to_string())
+    }
+
+    pub fn codex_bin_dir(&self) -> PathBuf {
+        self.provider_dir(crate::provider::ProviderId::Codex)
+            .join("bin")
+    }
+
+    pub fn codex_home_dir(&self) -> PathBuf {
+        self.provider_dir(crate::provider::ProviderId::Codex)
+            .join("home")
+    }
+
+    pub fn claude_bin_dir(&self) -> PathBuf {
+        self.provider_dir(crate::provider::ProviderId::ClaudeCode)
+            .join("bin")
+    }
+
+    pub fn claude_config_dir(&self) -> PathBuf {
+        self.provider_dir(crate::provider::ProviderId::ClaudeCode)
+            .join("config")
+    }
+
+    pub fn provider_cache_dir(&self, provider: crate::provider::ProviderId) -> PathBuf {
+        self.provider_dir(provider).join("cache")
     }
 
     /// `%localappdata%\eud-agent\logs`.
@@ -302,10 +389,18 @@ impl DataDirs {
             self.journal_dir(),
             self.sessions_dir(),
             self.harness_jobs_dir(),
+            self.provider_sessions_dir(),
             self.app_local_data.clone(),
             self.models_dir(),
             self.rag_dir(),
             self.bin_dir(),
+            self.providers_dir(),
+            self.codex_bin_dir(),
+            self.codex_home_dir(),
+            self.claude_bin_dir(),
+            self.claude_config_dir(),
+            self.provider_cache_dir(crate::provider::ProviderId::Antigravity),
+            self.provider_cache_dir(crate::provider::ProviderId::OpencodeGo),
             self.logs_dir(),
             self.attachments_dir(),
             self.audio_temp_dir(),
@@ -319,30 +414,53 @@ impl DataDirs {
         Ok(())
     }
 
-    /// Load `config.json` from `app_data`. A missing file yields [`Config::default`]
-    /// (first run); a present file is parsed (partial files fill via serde defaults).
+    /// Load current config or atomically migrate a legacy Codex-only config.
     pub fn load_config(&self) -> anyhow::Result<Config> {
         let path = self.config_path();
-        match fs::read(&path) {
-            Ok(bytes) => {
-                // `File.ReadAllText` strips a BOM; serde_json does not. Strip a UTF-8
-                // BOM defensively so a hand-edited file still parses.
-                let bytes = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(&bytes);
-                Ok(serde_json::from_slice(bytes)?)
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Config::default())
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Config::default()),
-            Err(e) => Err(e.into()),
+            Err(error) => return Err(error.into()),
+        };
+        let bytes = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(&bytes);
+        let value: serde_json::Value = serde_json::from_slice(bytes)?;
+        let object = value
+            .as_object()
+            .ok_or_else(|| anyhow::anyhow!("config root must be an object"))?;
+
+        if object.contains_key("schema_version") {
+            let config: Config = serde_json::from_value(value)?;
+            if config.schema_version != CONFIG_SCHEMA_VERSION {
+                anyhow::bail!(
+                    "unsupported config schema version {}",
+                    config.schema_version
+                );
+            }
+            return Ok(config);
         }
+        if object.is_empty() {
+            return Ok(Config::default());
+        }
+
+        let legacy: RawConfigV1 = serde_json::from_value(value)?;
+        let migrated = legacy.migrate();
+        self.save_config(&migrated)?;
+        Ok(migrated)
     }
 
-    /// Serialize and write `config.json` to `app_data` as pretty UTF-8 **without BOM**.
-    /// Creates the data dirs first so a fresh install can save before anything else runs.
+    /// Serialize and atomically write secret-free config as UTF-8 without BOM.
     pub fn save_config(&self, config: &Config) -> anyhow::Result<()> {
+        if config.schema_version != CONFIG_SCHEMA_VERSION {
+            anyhow::bail!(
+                "refusing to save unsupported config schema version {}",
+                config.schema_version
+            );
+        }
         self.ensure_dirs()?;
-        let json = serde_json::to_string_pretty(config)?;
-        // `fs::write` of a `String` writes its raw UTF-8 bytes — no BOM is ever prepended.
-        fs::write(self.config_path(), json)?;
-        Ok(())
+        let json = serde_json::to_vec_pretty(config)?;
+        crate::memory::write_atomic_bytes(&self.config_path(), &json)
     }
 }
 
@@ -368,10 +486,18 @@ mod tests {
     fn config_round_trips() {
         let cfg = Config {
             editor_path: "C:\\Games\\EUDEditor3".to_string(),
-            codex_cmd: Some("C:\\tools\\codex.cmd".to_string()),
-            codex_model: Some("gpt-5.5-codex".to_string()),
-            codex_reasoning_effort: Some("high".to_string()),
-            codex_large_context_models: BTreeSet::from(["gpt-5.5-codex".to_string()]),
+            default_provider: Some(crate::provider::ProviderId::Codex),
+            providers: crate::provider::ProviderSettings {
+                codex: crate::provider::CodexProviderSettings {
+                    executable_override: Some("C:\\tools\\codex.exe".to_string()),
+                    default_model: Some("gpt-5.5-codex".to_string()),
+                    default_reasoning: Some(crate::provider::ReasoningSelection {
+                        level: "high".to_string(),
+                    }),
+                    large_context_models: BTreeSet::from(["gpt-5.5-codex".to_string()]),
+                },
+                ..Default::default()
+            },
             notifications: NotificationSettings::default(),
             model: AssetSpec {
                 name: "BAAI/bge-m3".to_string(),
@@ -383,6 +509,7 @@ mod tests {
                 sha256: "cafef00d".to_string(),
                 version: "1".to_string(),
             },
+            ..Config::default()
         };
 
         let json = serde_json::to_string(&cfg).unwrap();
@@ -391,14 +518,26 @@ mod tests {
     }
 
     #[test]
-    fn partial_config_deserializes_with_defaults() {
-        // A first-run / partial file must deserialize via serde defaults.
+    fn partial_config_deserializes_with_fresh_provider_selection() {
         let back: Config = serde_json::from_str("{}").unwrap();
+        assert_eq!(back.schema_version, CONFIG_SCHEMA_VERSION);
         assert_eq!(back.editor_path, "");
-        assert_eq!(back.codex_cmd, None);
-        assert!(back.codex_large_context_models.is_empty());
+        assert_eq!(back.default_provider, None);
+        assert!(back.providers.codex.large_context_models.is_empty());
         assert_eq!(back.model, AssetSpec::default());
         assert_eq!(back.notifications, NotificationSettings::default());
+    }
+
+    #[test]
+    fn existing_v2_provider_settings_gain_the_default_ollama_endpoint() {
+        let mut value = serde_json::to_value(Config::default()).unwrap();
+        value["providers"].as_object_mut().unwrap().remove("ollama");
+        let config: Config = serde_json::from_value(value).unwrap();
+        assert_eq!(
+            config.providers.ollama.base_url,
+            crate::provider::DEFAULT_OLLAMA_BASE_URL
+        );
+        assert_eq!(config.providers.ollama.default_model, None);
     }
 
     #[test]
@@ -437,6 +576,48 @@ mod tests {
         assert_eq!(cfg, loaded);
 
         fs::remove_dir_all(&base).ok();
+    }
+    #[test]
+    fn legacy_codex_config_migrates_once_without_alias_fields() {
+        let base = unique_temp_dir("provider-migration");
+        let dirs = DataDirs::from_bases(&base.join("roaming"), &base.join("local"));
+        dirs.ensure_dirs().unwrap();
+        fs::write(
+            dirs.config_path(),
+            br#"{
+                "editor_path": "C:\\Editor",
+                "codex_cmd": "C:\\tools\\codex.exe",
+                "codex_model": "gpt-legacy",
+                "codex_reasoning_effort": "high",
+                "codex_large_context_models": ["gpt-legacy"]
+            }"#,
+        )
+        .unwrap();
+
+        let migrated = dirs.load_config().unwrap();
+        assert_eq!(
+            migrated.default_provider,
+            Some(crate::provider::ProviderId::Codex)
+        );
+        assert_eq!(
+            migrated.providers.codex.default_model.as_deref(),
+            Some("gpt-legacy")
+        );
+        assert_eq!(
+            migrated
+                .providers
+                .codex
+                .default_reasoning
+                .as_ref()
+                .map(|selection| selection.level.as_str()),
+            Some("high")
+        );
+        let saved: serde_json::Value =
+            serde_json::from_slice(&fs::read(dirs.config_path()).unwrap()).unwrap();
+        assert_eq!(saved["schema_version"], CONFIG_SCHEMA_VERSION);
+        assert!(saved.get("codex_model").is_none());
+        assert!(saved.get("codex_cmd").is_none());
+        fs::remove_dir_all(base).ok();
     }
 
     #[test]

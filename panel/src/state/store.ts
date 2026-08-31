@@ -1209,11 +1209,12 @@ export function createPanelStore(): PanelStore {
     },
 
     hydrate(panelLog) {
-      // Rebuild the durable log entries (LogEntry subset: id/kind/text + optional
-      // stage/tools). Restored tools are always terminal (done/failed) per the
-      // session contract; the subset shapes are widened (string kind/state) on
-      // the wire, so coerce back into the store's literal unions.
-      const restored: LogEntry[] = panelLog.log.map((entry) => {
+      // Rebuild durable conversation rows only. Legacy records may contain
+      // transient progress rows from an interrupted panel; dropping them prevents
+      // a restored session from rendering a provider spinner with no live turn.
+      const restored: LogEntry[] = [];
+      for (const entry of panelLog.log) {
+        if (entry.kind === "progress") continue;
         const next: LogEntry = {
           id: entry.id,
           kind: entry.kind as LogKind,
@@ -1249,8 +1250,8 @@ export function createPanelStore(): PanelStore {
         if (entry.mentions) {
           next.mentions = entry.mentions.map((mention) => ({ ...mention }));
         }
-        return next;
-      });
+        restored.push(next);
+      }
       // Cap to the same MAX_LOG_ENTRIES bound the live log obeys (keep the tail).
       core.log =
         restored.length > MAX_LOG_ENTRIES

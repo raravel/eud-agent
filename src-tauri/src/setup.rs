@@ -38,55 +38,53 @@ fn bootstrap_lock() -> &'static Mutex<()> {
 /// rendered as-is).
 pub const INVALID_EDITOR_FOLDER: &str = "invalid_editor_folder";
 
-/// `setup_status` / `setup_pick_editor_path` command output (panel `setup` message).
+/// Typed five-provider setup snapshot.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SetupStatusResponse {
-    /// Configured editor install root (empty until picked).
     pub editor_path: String,
-    /// True when `editor_path` points at a real EUD Editor 3 install.
     pub editor_valid: bool,
-    /// True when the model + RAG index pass the manifest check (no download needed).
     pub assets_ready: bool,
-    /// True when the codex CLI was found (PATH / `CODEX_CMD`).
-    pub codex_resolved: bool,
-    /// True when `codex login status` reports a logged-in session.
-    pub codex_authed: bool,
-    /// True when the panel must show the setup screen before normal operation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_provider: Option<crate::provider::ProviderId>,
+    pub providers: Vec<crate::provider::ProviderStatus>,
     pub setup_required: bool,
-    /// Optional stable error code (e.g. a rejected folder pick).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
 
-/// Build the setup/manifest snapshot for the panel (filesystem probe + hash +
-/// codex login probe). Probes the ambient codex login state; see
-/// [`status_from_config`] for the injectable form used by tests.
-pub fn setup_status_payload(dirs: &DataDirs) -> Result<SetupStatusResponse, String> {
+pub fn setup_status_payload(
+    dirs: &DataDirs,
+    providers: Vec<crate::provider::ProviderStatus>,
+) -> Result<SetupStatusResponse, String> {
     let config = dirs.load_config().map_err(|error| error.to_string())?;
-    let codex = crate::codex_auth::login_status();
-    Ok(status_from_config(dirs, &config, &codex, None))
+    Ok(status_from_config(dirs, &config, providers, None))
 }
 
 fn status_from_config(
     dirs: &DataDirs,
     config: &Config,
-    codex: &crate::codex_auth::CodexAuthState,
+    providers: Vec<crate::provider::ProviderStatus>,
     error: Option<String>,
 ) -> SetupStatusResponse {
     let editor_path = config.editor_path.trim().to_string();
     let editor_valid =
         !editor_path.is_empty() && config::validate_editor_path(Path::new(&editor_path));
     let assets_ready = !bootstrap::needs_bootstrap(dirs, config);
-    // codex must be installed AND logged in before any turn can run; an
-    // unauthenticated codex fails every turn, so it gates setup like the editor
-    // path and the assets do.
+    let selected_ready = config.default_provider.is_some_and(|selected| {
+        providers
+            .iter()
+            .find(|status| status.provider == selected)
+            .is_some_and(|status| status.availability.is_ready())
+            && config.providers.default_model(selected).is_some()
+    });
     SetupStatusResponse {
         editor_path,
         editor_valid,
         assets_ready,
-        codex_resolved: codex.resolved,
-        codex_authed: codex.authed,
-        setup_required: !editor_valid || !assets_ready || !codex.authed,
+        default_provider: config.default_provider,
+        providers,
+        setup_required: !editor_valid || !assets_ready || !selected_ready,
         error,
     }
 }
@@ -172,10 +170,11 @@ async fn run_bootstrap_inner(
 #[tauri::command]
 pub async fn setup_status(
     state: tauri::State<'_, BridgeManaged>,
+    providers: tauri::State<'_, crate::provider_service::ProviderService>,
 ) -> Result<SetupStatusResponse, String> {
     let dirs = state.dirs().clone();
-    // The manifest check hashes the RAG index; keep it off the IPC thread.
-    tauri::async_runtime::spawn_blocking(move || setup_status_payload(&dirs))
+    let statuses = providers.status_list().await?;
+    tauri::async_runtime::spawn_blocking(move || setup_status_payload(&dirs, statuses))
         .await
         .map_err(|error| error.to_string())?
 }
@@ -187,31 +186,67 @@ pub async fn setup_status(
 pub async fn setup_pick_editor_path(
     app: tauri::AppHandle,
     state: tauri::State<'_, BridgeManaged>,
+    providers: tauri::State<'_, crate::provider_service::ProviderService>,
 ) -> Result<SetupStatusResponse, String> {
     let dirs = state.dirs().clone();
-    // blocking_pick_folder must not run on the main thread (it pumps its own loop).
+    let statuses = providers.status_list().await?;
     tauri::async_runtime::spawn_blocking(move || {
         let Some(picked) = app.dialog().file().blocking_pick_folder() else {
-            return setup_status_payload(&dirs);
+            return setup_status_payload(&dirs, statuses);
         };
         let picked = picked.into_path().map_err(|error| error.to_string())?;
         let mut config = dirs.load_config().map_err(|error| error.to_string())?;
-        let codex = crate::codex_auth::login_status();
         if !config::validate_editor_path(&picked) {
             return Ok(status_from_config(
                 &dirs,
                 &config,
-                &codex,
+                statuses,
                 Some(INVALID_EDITOR_FOLDER.to_string()),
             ));
         }
         config.editor_path = picked.to_string_lossy().into_owned();
         dirs.save_config(&config)
             .map_err(|error| error.to_string())?;
-        Ok(status_from_config(&dirs, &config, &codex, None))
+        Ok(status_from_config(&dirs, &config, statuses, None))
     })
     .await
     .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+pub async fn setup_provider_select(
+    state: tauri::State<'_, BridgeManaged>,
+    providers: tauri::State<'_, crate::provider_service::ProviderService>,
+    provider: crate::provider::ProviderId,
+) -> Result<SetupStatusResponse, String> {
+    let dirs = state.dirs().clone();
+    let mut config = dirs.load_config().map_err(|error| error.to_string())?;
+    let mut statuses = providers.status_list().await?;
+    let current_ready = config.default_provider.is_some_and(|current| {
+        statuses
+            .iter()
+            .find(|status| status.provider == current)
+            .is_some_and(|status| status.availability.is_ready())
+    });
+    let target_ready = statuses
+        .iter()
+        .find(|status| status.provider == provider)
+        .is_some_and(|status| status.availability.is_ready());
+    let core_setup_incomplete = config.editor_path.trim().is_empty()
+        || !config::validate_editor_path(Path::new(config.editor_path.trim()))
+        || bootstrap::needs_bootstrap(&dirs, &config);
+    if current_ready && !core_setup_incomplete && !target_ready {
+        return Err("provider_not_authenticated".to_string());
+    }
+    config.default_provider = Some(provider);
+    dirs.save_config(&config)
+        .map_err(|error| error.to_string())?;
+    for status in &mut statuses {
+        status.selected_as_default = status.provider == provider;
+    }
+    tauri::async_runtime::spawn_blocking(move || setup_status_payload(&dirs, statuses))
+        .await
+        .map_err(|error| error.to_string())?
 }
 
 /// Run the first-run asset download (also the setup screen's retry action).
@@ -251,20 +286,29 @@ mod tests {
         DataDirs::from_bases(&base.join("roaming"), &base.join("local"))
     }
 
-    fn codex_authed() -> crate::codex_auth::CodexAuthState {
-        crate::codex_auth::CodexAuthState {
-            resolved: true,
-            authed: true,
-            detail: "logged in".to_string(),
-        }
-    }
-
-    fn codex_unauthed() -> crate::codex_auth::CodexAuthState {
-        crate::codex_auth::CodexAuthState {
-            resolved: true,
-            authed: false,
-            detail: "not logged in".to_string(),
-        }
+    fn provider_statuses(
+        selected: Option<crate::provider::ProviderId>,
+        availability: crate::provider::ProviderAvailability,
+    ) -> Vec<crate::provider::ProviderStatus> {
+        crate::provider::ProviderId::ALL
+            .into_iter()
+            .map(|provider| crate::provider::ProviderStatus {
+                provider,
+                availability: if Some(provider) == selected {
+                    availability
+                } else {
+                    crate::provider::ProviderAvailability::Unavailable
+                },
+                selected_as_default: Some(provider) == selected,
+                can_install: matches!(
+                    provider,
+                    crate::provider::ProviderId::Codex | crate::provider::ProviderId::ClaudeCode
+                ),
+                can_import: false,
+                experimental: provider == crate::provider::ProviderId::Antigravity,
+                detail_code: None,
+            })
+            .collect()
     }
 
     /// A fake EUD Editor 3 install root (`Data\Lua\TriggerEditor` marker present).
@@ -290,7 +334,11 @@ mod tests {
         let base = unique_temp_dir("first-run");
         let dirs = make_dirs(&base);
 
-        let status = setup_status_payload(&dirs).unwrap();
+        let status = setup_status_payload(
+            &dirs,
+            provider_statuses(None, crate::provider::ProviderAvailability::Unavailable),
+        )
+        .unwrap();
 
         assert_eq!(status.editor_path, "");
         assert!(!status.editor_valid);
@@ -298,6 +346,25 @@ mod tests {
         assert!(status.setup_required);
         assert_eq!(status.error, None);
 
+        fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn setup_json_omits_absent_optional_fields_for_the_panel_guard() {
+        let base = unique_temp_dir("setup-json");
+        let dirs = make_dirs(&base);
+        let status = setup_status_payload(
+            &dirs,
+            provider_statuses(None, crate::provider::ProviderAvailability::Unavailable),
+        )
+        .unwrap();
+        let json = serde_json::to_value(status).unwrap();
+        let object = json.as_object().unwrap();
+        assert!(!object.contains_key("defaultProvider"));
+        assert!(!object.contains_key("error"));
+        for provider in object["providers"].as_array().unwrap() {
+            assert!(!provider.as_object().unwrap().contains_key("detailCode"));
+        }
         fs::remove_dir_all(&base).ok();
     }
 
@@ -312,7 +379,11 @@ mod tests {
         };
         dirs.save_config(&config).unwrap();
 
-        let status = setup_status_payload(&dirs).unwrap();
+        let status = setup_status_payload(
+            &dirs,
+            provider_statuses(None, crate::provider::ProviderAvailability::Unavailable),
+        )
+        .unwrap();
 
         assert!(!status.editor_valid);
         assert!(status.setup_required);
@@ -327,6 +398,14 @@ mod tests {
         let editor = make_editor_root(&base);
         let rag_spec = place_rag_asset(&dirs);
         let config = Config {
+            default_provider: Some(crate::provider::ProviderId::Codex),
+            providers: crate::provider::ProviderSettings {
+                codex: crate::provider::CodexProviderSettings {
+                    default_model: Some("gpt-test".to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
             editor_path: editor.to_string_lossy().into_owned(),
             model: AssetSpec {
                 name: "BAAI/bge-m3".to_string(),
@@ -337,13 +416,18 @@ mod tests {
         };
         dirs.save_config(&config).unwrap();
 
-        // Inject an authed codex so the assertion isolates editor + assets from
-        // the ambient codex login state of the test host.
-        let status = status_from_config(&dirs, &config, &codex_authed(), None);
+        let status = status_from_config(
+            &dirs,
+            &config,
+            provider_statuses(
+                Some(crate::provider::ProviderId::Codex),
+                crate::provider::ProviderAvailability::Ready,
+            ),
+            None,
+        );
 
         assert!(status.editor_valid);
         assert!(status.assets_ready);
-        assert!(status.codex_authed);
         assert!(!status.setup_required);
 
         fs::remove_dir_all(&base).ok();
@@ -358,6 +442,14 @@ mod tests {
         let editor = make_editor_root(&base);
         let rag_spec = place_rag_asset(&dirs);
         let config = Config {
+            default_provider: Some(crate::provider::ProviderId::Codex),
+            providers: crate::provider::ProviderSettings {
+                codex: crate::provider::CodexProviderSettings {
+                    default_model: Some("gpt-test".to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
             editor_path: editor.to_string_lossy().into_owned(),
             model: AssetSpec {
                 name: "BAAI/bge-m3".to_string(),
@@ -367,11 +459,18 @@ mod tests {
             ..Default::default()
         };
 
-        let status = status_from_config(&dirs, &config, &codex_unauthed(), None);
+        let status = status_from_config(
+            &dirs,
+            &config,
+            provider_statuses(
+                Some(crate::provider::ProviderId::Codex),
+                crate::provider::ProviderAvailability::NeedsAuthentication,
+            ),
+            None,
+        );
 
         assert!(status.editor_valid);
         assert!(status.assets_ready);
-        assert!(!status.codex_authed);
         assert!(status.setup_required);
 
         fs::remove_dir_all(&base).ok();
@@ -389,7 +488,11 @@ mod tests {
         };
         dirs.save_config(&config).unwrap();
 
-        let status = setup_status_payload(&dirs).unwrap();
+        let status = setup_status_payload(
+            &dirs,
+            provider_statuses(None, crate::provider::ProviderAvailability::Unavailable),
+        )
+        .unwrap();
 
         assert!(status.editor_valid);
         assert!(!status.assets_ready);
@@ -432,7 +535,7 @@ mod tests {
         let status = status_from_config(
             &dirs,
             &config,
-            &codex_authed(),
+            provider_statuses(None, crate::provider::ProviderAvailability::Unavailable),
             Some(INVALID_EDITOR_FOLDER.to_string()),
         );
 

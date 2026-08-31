@@ -331,6 +331,7 @@ pub struct SessionToolRuntime {
     ask_waiting: tokio::sync::watch::Sender<bool>,
     cancellation: Arc<Mutex<Option<tokio::sync::watch::Receiver<u64>>>>,
     progress_emitter: Arc<Mutex<Option<ProgressEmitter>>>,
+    provider_identity: Arc<Mutex<Option<(crate::provider::ProviderId, String)>>>,
     last_build: Arc<Mutex<Option<crate::harness::BuildEvidence>>>,
     sound_build_required: Arc<Mutex<bool>>,
     sound_preflight_required: Arc<Mutex<bool>>,
@@ -378,6 +379,7 @@ impl SessionToolRuntime {
             ask_waiting,
             cancellation: Arc::new(Mutex::new(None)),
             progress_emitter: Arc::new(Mutex::new(None)),
+            provider_identity: Arc::new(Mutex::new(None)),
             last_build: Arc::new(Mutex::new(None)),
             sound_build_required: Arc::new(Mutex::new(false)),
             sound_preflight_required: Arc::new(Mutex::new(false)),
@@ -424,15 +426,25 @@ impl SessionToolRuntime {
     pub fn set_cancellation(&self, cancellation: tokio::sync::watch::Receiver<u64>) {
         *self.cancellation.lock() = Some(cancellation);
     }
+    pub fn set_provider_identity(
+        &self,
+        provider: crate::provider::ProviderId,
+        model: impl Into<String>,
+    ) {
+        *self.provider_identity.lock() = Some((provider, model.into()));
+    }
     pub fn subscribe_ask_waiting(&self) -> tokio::sync::watch::Receiver<bool> {
         self.ask_waiting.subscribe()
     }
 
-    fn emit_audio_progress(&self, stage: crate::ipc::ProgressStage, detail: &str) {
+    fn emit_progress(&self, stage: crate::ipc::ProgressStage, detail: &str) {
         if let Some(emitter) = self.progress_emitter.lock().clone() {
+            let identity = self.provider_identity.lock().clone();
             let _ = emitter(crate::ipc::ProgressEvent {
                 stage,
                 detail: Some(detail.to_string()),
+                provider: identity.as_ref().map(|(provider, _)| *provider),
+                model: identity.map(|(_, model)| model),
             });
         }
     }
@@ -673,7 +685,7 @@ impl SessionToolRuntime {
                 return Err("같은 오디오 첨부를 한 요청에 두 번 바인딩할 수 없습니다.".to_string());
             }
             let audio_ref = format!("audio-{}", start + offset + 1);
-            self.emit_audio_progress(
+            self.emit_progress(
                 crate::ipc::ProgressStage::AudioProbe,
                 "첨부 오디오 스트림을 확인하고 있습니다.",
             );
@@ -1590,11 +1602,11 @@ stop this turn so the backend can resume the same thread in its isolated writabl
                     &starcraft_setting,
                     input,
                     |phase| {
-                        self.emit_audio_progress(crate::ipc::ProgressStage::TraceTest, phase.as_str());
+                        self.emit_progress(crate::ipc::ProgressStage::TraceTest, phase.as_str());
                     },
                 )?;
                 let detail = format!("done:{}", result.status.as_str());
-                self.emit_audio_progress(crate::ipc::ProgressStage::TraceTest, &detail);
+                self.emit_progress(crate::ipc::ProgressStage::TraceTest, &detail);
                 serde_json::to_value(result)
                     .map_err(|error| format!("failed to serialize trace test result: {error}"))
             }
@@ -1613,7 +1625,7 @@ stop this turn so the backend can resume the same thread in its isolated writabl
                 let input: crate::trace_test::TraceSuiteInput =
                     serde_json::from_value(args.clone())
                         .map_err(|error| format!("invalid trace_suite_run arguments: {error}"))?;
-                self.emit_audio_progress(crate::ipc::ProgressStage::TraceTest, "discover");
+                self.emit_progress(crate::ipc::ProgressStage::TraceTest, "discover");
                 let snapshot = self
                     .bridge()?
                     .snapshot_eps(&SendOpts::for_epsnapshot(), None)
@@ -1641,11 +1653,11 @@ stop this turn so the backend can resume the same thread in its isolated writabl
                     selection,
                     timeout_ms,
                     |phase| {
-                        self.emit_audio_progress(crate::ipc::ProgressStage::TraceTest, phase.as_str());
+                        self.emit_progress(crate::ipc::ProgressStage::TraceTest, phase.as_str());
                     },
                 )?;
                 let detail = format!("done:{}", result.status.as_str());
-                self.emit_audio_progress(crate::ipc::ProgressStage::TraceTest, &detail);
+                self.emit_progress(crate::ipc::ProgressStage::TraceTest, &detail);
                 serde_json::to_value(result)
                     .map_err(|error| format!("failed to serialize trace suite result: {error}"))
             }
@@ -1755,7 +1767,7 @@ stop this turn so the backend can resume the same thread in its isolated writabl
             .map_err(stringify)?;
         let expected_map_sha256 = crate::bootstrap::sha256_file(&map_path)
             .map_err(|_| "저장된 원본 맵을 읽을 수 없습니다.".to_string())?;
-        self.emit_audio_progress(
+        self.emit_progress(
             crate::ipc::ProgressStage::AudioTranscode,
             "canonical OGG Vorbis로 변환하고 있습니다.",
         );
@@ -1764,7 +1776,7 @@ stop this turn so the backend can resume the same thread in its isolated writabl
             .services
             .audio
             .normalize(&binding, cancellation.as_ref())?;
-        self.emit_audio_progress(
+        self.emit_progress(
             crate::ipc::ProgressStage::AudioValidate,
             "canonical OGG profile을 검증했습니다.",
         );
@@ -1780,7 +1792,7 @@ stop this turn so the backend can resume the same thread in its isolated writabl
         self.services
             .audio
             .remember_import(&project_id, &mpq_path, &binding)?;
-        self.emit_audio_progress(
+        self.emit_progress(
             crate::ipc::ProgressStage::MapSoundWrite,
             "저장된 SCX에 MPQ asset, game string, WAV slot을 등록하고 있습니다.",
         );
@@ -1799,7 +1811,7 @@ stop this turn so the backend can resume the same thread in its isolated writabl
                     )
                 }
                 Err(crate::mapsafe::MapSafeError::MapLocked(_)) => {
-                    self.emit_audio_progress(
+                    self.emit_progress(
                         crate::ipc::ProgressStage::WaitingMapClose,
                         "SCMDraft에서 현재 맵을 저장하고 닫은 뒤 다시 시도해 주세요.",
                     );
@@ -1913,7 +1925,7 @@ stop this turn so the backend can resume the same thread in its isolated writabl
         })?;
         let write = operation?;
         let sound_ref = self.next_sound_ref(request_id)?;
-        self.emit_audio_progress(
+        self.emit_progress(
             crate::ipc::ProgressStage::MapSoundVerify,
             "SCX sound asset과 WAV slot 저장 검증을 완료했습니다.",
         );
@@ -2025,7 +2037,7 @@ stop this turn so the backend can resume the same thread in its isolated writabl
                 .remember_import(&project_id, old_mpq_path, &binding)?;
         }
 
-        self.emit_audio_progress(
+        self.emit_progress(
             crate::ipc::ProgressStage::AudioTranscode,
             "프로젝트 원본에 볼륨과 페이드 설정을 적용하고 있습니다.",
         );
@@ -2038,7 +2050,7 @@ stop this turn so the backend can resume the same thread in its isolated writabl
             request_temp.as_ref(),
             cancellation.as_ref(),
         )?;
-        self.emit_audio_progress(
+        self.emit_progress(
             crate::ipc::ProgressStage::AudioValidate,
             "편집된 canonical OGG profile을 검증했습니다.",
         );
@@ -2061,7 +2073,7 @@ stop this turn so the backend can resume the same thread in its isolated writabl
         self.services
             .audio
             .remember_edit(&project_id, &new_mpq_path, &edited)?;
-        self.emit_audio_progress(
+        self.emit_progress(
             crate::ipc::ProgressStage::MapSoundWrite,
             "SCX의 기존 MPQ asset, game string, WAV 등록을 편집본으로 교체하고 있습니다.",
         );
@@ -2081,7 +2093,7 @@ stop this turn so the backend can resume the same thread in its isolated writabl
                     )
                 }
                 Err(crate::mapsafe::MapSafeError::MapLocked(_)) => {
-                    self.emit_audio_progress(
+                    self.emit_progress(
                         crate::ipc::ProgressStage::WaitingMapClose,
                         "SCMDraft에서 현재 맵을 저장하고 닫은 뒤 다시 시도해 주세요.",
                     );
@@ -2207,7 +2219,7 @@ stop this turn so the backend can resume the same thread in its isolated writabl
             Ok(write)
         })?;
         let write = operation?;
-        self.emit_audio_progress(
+        self.emit_progress(
             crate::ipc::ProgressStage::MapSoundVerify,
             "기존 사운드 제거와 편집본 MPQ/WAV 등록 검증을 완료했습니다.",
         );

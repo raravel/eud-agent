@@ -536,6 +536,10 @@ pub struct ProgressEvent {
     /// Human-readable progress detail.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<crate::provider::ProviderId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 /// `progress.stage` wire values.
@@ -550,6 +554,9 @@ pub enum ProgressStage {
     /// Codex subprocess execution.
     #[serde(rename = "codex")]
     Codex,
+    /// Non-Codex provider turn execution.
+    #[serde(rename = "provider")]
+    Provider,
     /// Native automatic conversation compaction.
     #[serde(rename = "compaction")]
     Compaction,
@@ -670,7 +677,7 @@ pub fn app_settings_payload(dirs: &DataDirs) -> Result<AppSettings, String> {
     let config = dirs.load_config().map_err(|error| error.to_string())?;
     Ok(AppSettings {
         notifications: config.notifications,
-        codex_large_context_models: config.codex_large_context_models,
+        codex_large_context_models: config.providers.codex.large_context_models,
     })
 }
 
@@ -680,7 +687,7 @@ pub fn app_settings_save_payload(
 ) -> Result<AppSettings, String> {
     let mut config = dirs.load_config().map_err(|error| error.to_string())?;
     config.notifications = settings.notifications;
-    config.codex_large_context_models = settings.codex_large_context_models.clone();
+    config.providers.codex.large_context_models = settings.codex_large_context_models.clone();
     dirs.save_config(&config)
         .map_err(|error| error.to_string())?;
     Ok(settings)
@@ -819,6 +826,8 @@ pub async fn list(
                 ProgressEvent {
                     stage: ProgressStage::WaitingBuild,
                     detail: Some("editor build in progress".to_string()),
+                    provider: None,
+                    model: None,
                 },
             );
         };
@@ -1303,6 +1312,8 @@ mod tests {
         let with_detail = ipc::ProgressEvent {
             stage: ipc::ProgressStage::RagWarmup,
             detail: Some("Loading embeddings".to_string()),
+            provider: None,
+            model: None,
         };
         assert_json(
             &with_detail,
@@ -1315,6 +1326,8 @@ mod tests {
         let without_detail = ipc::ProgressEvent {
             stage: ipc::ProgressStage::WaitingBuild,
             detail: None,
+            provider: None,
+            model: None,
         };
         assert_json(
             &without_detail,
@@ -1325,6 +1338,7 @@ mod tests {
 
         assert_json(&ipc::ProgressStage::Rag, json!("rag"));
         assert_json(&ipc::ProgressStage::Codex, json!("codex"));
+        assert_json(&ipc::ProgressStage::Provider, json!("provider"));
         assert_json(&ipc::ProgressStage::Compaction, json!("compaction"));
         assert_json(
             &ipc::ProgressStage::LargeContextFallback,
@@ -1843,18 +1857,24 @@ mod tests {
         let progress_with_detail = ipc::ProgressEvent {
             stage: ipc::ProgressStage::Codex,
             detail: Some("Generating patch".to_string()),
+            provider: Some(crate::provider::ProviderId::Codex),
+            model: Some("gpt-test".to_string()),
         };
         assert_json(
             &progress_with_detail,
             json!({
                 "stage": "codex",
-                "detail": "Generating patch"
+                "detail": "Generating patch",
+                "provider": "codex",
+                "model": "gpt-test"
             }),
         );
 
         let progress_without_detail = ipc::ProgressEvent {
             stage: ipc::ProgressStage::Bootstrap,
             detail: None,
+            provider: None,
+            model: None,
         };
         assert_json(
             &progress_without_detail,
@@ -1870,7 +1890,13 @@ mod tests {
         let dirs = DataDirs::from_bases(&base.join("roaming"), &base.join("local"));
         dirs.save_config(&Config {
             editor_path: "C:\\Editor".to_string(),
-            codex_model: Some("gpt-test".to_string()),
+            providers: crate::provider::ProviderSettings {
+                codex: crate::provider::CodexProviderSettings {
+                    default_model: Some("gpt-test".to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
             ..Default::default()
         })
         .unwrap();
@@ -1914,9 +1940,12 @@ mod tests {
 
         let config = dirs.load_config().unwrap();
         assert_eq!(config.editor_path, "C:\\Editor");
-        assert_eq!(config.codex_model.as_deref(), Some("gpt-test"));
         assert_eq!(
-            config.codex_large_context_models,
+            config.providers.codex.default_model.as_deref(),
+            Some("gpt-test")
+        );
+        assert_eq!(
+            config.providers.codex.large_context_models,
             BTreeSet::from(["gpt-test".to_string()])
         );
         fs::remove_dir_all(base).ok();

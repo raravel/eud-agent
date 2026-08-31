@@ -23,6 +23,7 @@ import {
 import { Input } from "@/components/ui/input";
 import type { SessionMeta } from "@/lib/protocol";
 import { cn } from "@/lib/utils";
+import { PROVIDER_LABELS } from "@/providers/providerCopy";
 
 export interface MapSessionHistoryDialogProps {
   open: boolean;
@@ -214,6 +215,7 @@ export function MapSessionHistoryDialog({
                           </span>
                           <span className="mt-0.5 block truncate text-[11px] text-muted-foreground">
                             {active ? "현재 작업 · " : ""}
+                            {PROVIDER_LABELS[session.provider]} ·{" "}
                             {formatConversationTime(session.lastConversationAt)}
                           </span>
                         </span>

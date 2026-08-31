@@ -7,41 +7,53 @@ and server-spawn lifecycle.
 > Decision: see [[decisions/08_tauri-rust-rewrite]] and
 > [[decisions/12_bootstrap-download-distribution]].
 
-## Data directories
-Resolve via Tauri path API:
-- `app_data_dir()` -> `%appdata%\eud-agent\` : `config.json`, `memory/`, `map_backups/`,
-  `journal/`.
-- `app_local_data_dir()` -> `%localappdata%\eud-agent\` : `models/`, `rag/`, `logs/`.
-- editor IPC dir: `<editor_path>\Data\agent\` (from `config.json`).
-Create missing dirs at startup. Never put the model in Roaming.
+## Data directories and Config v2
 
-## config.json
+- `%appdata%\\eud-agent`: secret-free config, sessions, direct transcripts, workspaces/journal.
+- `%localappdata%\\eud-agent\\providers`: app-owned Codex and Claude binaries/profiles plus
+  non-secret direct-provider caches.
+- Windows Credential Manager: Antigravity OAuth and OpenCode Go API key.
+
 ```json
 {
+  "schema_version": 2,
   "editor_path": "C:\\...\\EUDEditor3",
-  "codex_cmd": null,
-  "model": { "name": "BAAI/bge-m3", "sha256": "<onnx hash>", "version": "1" },
-  "rag_index": { "url": "<github release asset>", "sha256": "<hash>", "version": "1" }
+  "default_provider": "codex",
+  "providers": {
+    "codex": {
+      "executableOverride": null,
+      "defaultModel": "gpt-5.5-codex",
+      "defaultReasoning": { "level": "high" },
+      "largeContextModels": []
+    },
+    "claudeCode": {},
+    "antigravity": {},
+    "opencodeGo": {}
+  }
 }
 ```
-Written UTF-8 (no BOM). `editor_path` is captured on first run via a `tauri-plugin-dialog`
-folder picker (validated: `Data\Lua\TriggerEditor` must exist under it).
 
-## First-run flow
+Config is atomic UTF-8 without BOM and contains no credential. Existing Codex-only fields migrate
+once into `providers.codex`; an empty fresh object keeps `default_provider = null`.
+
+## Four-step first-run flow
+
 ```mermaid
 flowchart TD
-    A[launch] --> B[read/create config.json]
-    B --> C{editor_path set & valid?}
-    C -- no --> P[picker: choose EUDEditor3 folder] --> B
-    C -- yes --> D{model + rag_index present & sha256 OK?}
-    D -- no --> E[setup screen: download with progress]
-    E --> F[bge-m3 ONNX via fastembed HF cache to models/]
-    E --> G[RAG index from GitHub Release to rag/ tmp]
-    F & G --> H[sha256 verify]
-    H -- ok --> I[atomic rename into place] --> D
-    H -- fail --> E2[show error + retry]
-    D -- yes --> J[init core, lazy RAG warmup] --> K[show panel]
+    A[launch] --> B{editor folder valid?}
+    B -- no --> C[native folder picker] --> B
+    B -- yes --> D{bge-m3 + RAG verified?}
+    D -- no --> E[bounded download + sha256 + atomic placement] --> D
+    D -- yes --> F[show one large five-provider select]
+    F --> G[select one default provider]
+    G --> H[show only selected provider install/connect/model panel]
+    H --> I{selected provider ready?}
+    I -- no --> H
+    I -- yes --> J[normal panel]
 ```
+
+Only the selected provider participates in `setupRequired`; optional provider failure never blocks
+entry. Provider binaries are not part of the model/RAG asset bootstrap.
 
 ## Bootstrap rules
 - Every asset sha256-verified against `config.json`/a bundled manifest before use.
@@ -50,10 +62,14 @@ flowchart TD
 - Download progress emitted to the panel as `progress {stage: bootstrap, detail, pct}`.
 - The model is fetched through fastembed's HF cache (cache dir = `models/`); the RAG index
   is a direct `reqwest` GET of the Release asset.
-- Guided Codex install resolves one official GitHub release, downloads `codex.exe` plus its
-  matching `codex-code-mode-host.exe` and `codex-windows-sandbox-setup.exe`, verifies every
-  release sha256, and places them under `%localappdata%\eud-agent\bin\`. An app-managed CLI
-  missing either runtime helper is incomplete and returns to the setup install step.
+- Codex install keeps the same-tag CLI/Code Mode host/Windows sandbox helper digest contract under
+  `%localappdata%\\eud-agent\\providers\\codex\\bin`.
+- Claude Code install downloads only `downloads.claude.ai/claude-code-releases`, checks the
+  manifest platform SHA-256 and Windows Authenticode signer `Anthropic, PBC`, then atomically
+  publishes the binary. No remote PowerShell/npm/WinGet command is executed.
+- Antigravity/OpenCode Go have no executable install. Their OAuth/API-key controls are provider
+  service actions and never gate an unselected provider. A pending provider login exposes an exact
+  attempt-bound cancel action; closing the browser never leaves the panel irreversibly waiting.
 
 ## Edge cases
 - Offline on first run: setup screen shows a clear "network required for first-run

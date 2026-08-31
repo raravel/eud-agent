@@ -19,15 +19,82 @@ vi.mock("@tauri-apps/plugin-updater", () => ({ check: vi.fn(async () => null) })
 vi.mock("@tauri-apps/plugin-process", () => ({ relaunch: vi.fn(async () => undefined) }));
 
 import App from "./App";
+const providerStatuses = [
+  {
+    provider: "codex",
+    availability: "ready",
+    selectedAsDefault: true,
+    canInstall: true,
+    canImport: true,
+    experimental: false,
+  },
+  {
+    provider: "claude-code",
+    availability: "unavailable",
+    selectedAsDefault: false,
+    canInstall: true,
+    canImport: false,
+    experimental: false,
+  },
+  {
+    provider: "antigravity",
+    availability: "unavailable",
+    selectedAsDefault: false,
+    canInstall: false,
+    canImport: false,
+    experimental: true,
+  },
+  {
+    provider: "opencode-go",
+    availability: "unavailable",
+    selectedAsDefault: false,
+    canInstall: false,
+    canImport: false,
+    experimental: false,
+  },
+  {
+    provider: "ollama",
+    availability: "unavailable",
+    selectedAsDefault: false,
+    canInstall: false,
+    canImport: false,
+    experimental: false,
+  },
+];
+
+const providerModel = {
+  provider: "codex",
+  model: "gpt-test",
+  displayName: "GPT Test",
+  description: "test",
+  isDefault: true,
+  capabilities: {
+    vision: true,
+    toolCalls: true,
+    strictStructuredOutput: true,
+    reasoningLevels: ["medium"],
+    nativeCompaction: true,
+    hostedWebSearch: true,
+  },
+};
+
 
 const sessionRecords = [
   {
     id: "session-a",
     name: "Session A",
     project: "Project",
+    kind: "eps",
+    provider: "codex",
+    model: "gpt-test",
     createdAt: 1,
     lastConversationAt: 2_000,
-    threadId: null,
+    providerBinding: {
+      provider: "codex",
+      model: "gpt-test",
+      reasoning: { level: "medium" },
+      conversation: { provider: "codex" },
+    },
     pendingRequestIds: [],
     panelLog: {
       schemaVersion: 2,
@@ -44,9 +111,17 @@ const sessionRecords = [
     id: "session-b",
     name: "Session B",
     project: "Project",
+    kind: "eps",
+    provider: "codex",
+    model: "gpt-test",
     createdAt: 1,
     lastConversationAt: 1_000,
-    threadId: null,
+    providerBinding: {
+      provider: "codex",
+      model: "gpt-test",
+      reasoning: { level: "medium" },
+      conversation: { provider: "codex" },
+    },
     pendingRequestIds: [],
     panelLog: { schemaVersion: 2, logSeq: 0, log: [] },
   },
@@ -69,6 +144,7 @@ function sessionOrder(): string[] {
 }
 
 beforeEach(() => {
+  localStorage.clear();
   tauri.listeners.clear();
   tauri.resolveLongChat = undefined;
   tauri.pendingAsk = undefined;
@@ -77,12 +153,12 @@ beforeEach(() => {
     switch (command) {
       case "setup_status":
         return {
-          editor_path: "C:/Editor",
-          editor_valid: true,
-          assets_ready: true,
-          codex_resolved: true,
-          codex_authed: true,
-          setup_required: false,
+          editorPath: "C:/Editor",
+          editorValid: true,
+          assetsReady: true,
+          defaultProvider: "codex",
+          providers: providerStatuses,
+          setupRequired: false,
         };
       case "status":
         return { compiling: false, project: "Project" };
@@ -90,14 +166,61 @@ beforeEach(() => {
         return { files: [] };
       case "session_list":
         return sessionRecords.map(
-          ({ id, name, project, createdAt, lastConversationAt }) => ({
+          ({
             id,
             name,
             project,
+            kind,
+            provider,
+            model,
+            createdAt,
+            lastConversationAt,
+          }) => ({
+            id,
+            name,
+            project,
+            kind,
+            provider,
+            model,
             createdAt,
             lastConversationAt,
           }),
         );
+      case "provider_status_list":
+        return providerStatuses;
+      case "provider_settings": {
+        const provider = String(args?.provider);
+        const status =
+          providerStatuses.find((candidate) => candidate.provider === provider) ??
+          providerStatuses[0];
+        if (provider === "ollama") {
+          return {
+            provider,
+            status,
+            models: [],
+            selectedModel: null,
+            selectedReasoning: null,
+            baseUrl: "http://localhost:11434/v1",
+            hasApiKey: false,
+          };
+        }
+        return {
+          provider: "codex",
+          status,
+          models: [providerModel],
+          selectedModel: "gpt-test",
+          selectedReasoning: { level: "medium" },
+          hasApiKey: false,
+        };
+      }
+      case "session_model_settings":
+      case "session_model_settings_save":
+        return {
+          provider: "codex",
+          models: [providerModel],
+          selectedModel: "gpt-test",
+          selectedReasoning: { level: "medium" },
+        };
       case "session_load":
         return sessionRecords.find((record) => record.id === args?.id);
       case "session_update_log":
@@ -119,23 +242,6 @@ beforeEach(() => {
       case "attention_notify":
       case "notification_sound_preview":
         return undefined;
-      case "codex_model_settings":
-        return {
-          models: [
-            {
-              model: "gpt-test",
-              displayName: "Test",
-              description: "",
-              supportedReasoningEfforts: [
-                { reasoningEffort: "medium", description: "" },
-              ],
-              defaultReasoningEffort: "medium",
-              isDefault: true,
-            },
-          ],
-          selectedModel: "gpt-test",
-          selectedReasoningEffort: "medium",
-        };
       case "ask_pending":
         return args?.sessionId === "session-a" ? (tauri.pendingAsk ?? null) : null;
       case "chat":
@@ -182,6 +288,22 @@ afterEach(() => {
 describe("App concurrent sessions", () => {
   it("invokes session B before session A's unresolved chat completes", async () => {
     render(<App />);
+    await waitFor(() =>
+      expect(tauri.invoke.mock.calls.map(([command]) => command)).toContain(
+        "session_list",
+      ),
+    );
+    await waitFor(() =>
+      expect(tauri.invoke).toHaveBeenCalledWith("session_load", {
+        id: "session-a",
+      }),
+    );
+    await waitFor(() =>
+      expect(
+        screen.queryByText(/세션을 불러오지 못했습니다/),
+      ).not.toBeInTheDocument(),
+    );
+    await screen.findByRole("button", { name: "Session A, 유휴" });
     const input = await screen.findByRole("combobox", { name: "지시 입력" });
     await waitFor(() => expect(input).toBeEnabled());
 
@@ -292,10 +414,22 @@ describe("App concurrent sessions", () => {
       if (command === "list") return { files: [] };
       if (command === "session_list") {
         return sessionRecords.map(
-          ({ id, name, project, createdAt, lastConversationAt }) => ({
+          ({
             id,
             name,
             project,
+            kind,
+            provider,
+            model,
+            createdAt,
+            lastConversationAt,
+          }) => ({
+            id,
+            name,
+            project,
+            kind,
+            provider,
+            model,
             createdAt,
             lastConversationAt,
           }),
@@ -308,12 +442,12 @@ describe("App concurrent sessions", () => {
       if (command === "ask_pending") return null;
       if (command === "setup_status") {
         return {
-          editor_path: "C:/Editor",
-          editor_valid: true,
-          assets_ready: true,
-          codex_resolved: true,
-          codex_authed: true,
-          setup_required: false,
+          editorPath: "C:/Editor",
+          editorValid: true,
+          assetsReady: true,
+          defaultProvider: "codex",
+          providers: providerStatuses,
+          setupRequired: false,
         };
       }
       return undefined;
@@ -419,6 +553,46 @@ describe("App concurrent sessions", () => {
         ([command]) => command === "session_update_log",
       ),
     ).toHaveLength(0);
+  });
+
+  it("never persists transient provider progress rows", async () => {
+    render(<App />);
+    await screen.findByRole("button", { name: "Session A, 유휴" });
+    await waitFor(() => expect(tauri.listeners.has("progress")).toBe(true));
+    tauri.invoke.mockClear();
+
+    act(() => {
+      emit("progress", {
+        sessionId: "session-a",
+        stage: "provider",
+        detail: "Ollama turn started",
+      });
+    });
+    const delay = Promise.withResolvers<void>();
+    window.setTimeout(delay.resolve, 550);
+    await act(async () => {
+      await delay.promise;
+    });
+
+    const autosave = tauri.invoke.mock.calls.find(
+      ([command]) => command === "session_update_log",
+    );
+    expect(autosave).toBeDefined();
+    const autosaveArgs = autosave?.[1];
+    if (
+      !autosaveArgs ||
+      typeof autosaveArgs !== "object" ||
+      !("panelLog" in autosaveArgs) ||
+      !autosaveArgs.panelLog ||
+      typeof autosaveArgs.panelLog !== "object" ||
+      !("log" in autosaveArgs.panelLog) ||
+      !Array.isArray(autosaveArgs.panelLog.log)
+    ) {
+      throw new Error("session_update_log payload is invalid");
+    }
+    expect(autosaveArgs.panelLog.log).not.toContainEqual(
+      expect.objectContaining({ kind: "progress" }),
+    );
   });
 
   it("routes interleaved events and backend activities only to addressed sessions", async () => {
@@ -759,6 +933,7 @@ describe("App notifications", () => {
     fireEvent.click(settingsButton);
 
     expect(await screen.findByRole("dialog", { name: "설정" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "알림" }));
     fireEvent.click(
       screen.getByRole("switch", { name: "계획 승인 필요 알림음" }),
     );
@@ -972,6 +1147,82 @@ describe("App notifications", () => {
     expect(
       screen.getByRole("button", { name: "Session B, 유휴" }),
     ).toHaveAttribute("aria-current", "page");
+  });
+});
+
+describe("App setup payload compatibility", () => {
+  it("opens setup for nullable option fields from an older Rust response", async () => {
+    const baseInvoke = tauri.invoke.getMockImplementation();
+    tauri.invoke.mockImplementation(async (command: string, args?: Record<string, unknown>) => {
+      if (command === "setup_status") {
+        return {
+          editorPath: "C:/Editor",
+          editorValid: true,
+          assetsReady: true,
+          defaultProvider: null,
+          providers: providerStatuses.map((status) => ({
+            ...status,
+            availability: "unavailable",
+            selectedAsDefault: false,
+            detailCode: null,
+          })),
+          setupRequired: true,
+          error: null,
+        };
+      }
+      return baseInvoke?.(command, args);
+    });
+
+    render(<App />);
+    expect(
+      await screen.findByRole("combobox", { name: "기본 AI 제공자 선택" }),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/Unknown IPC message payload/)).not.toBeInTheDocument();
+  });
+});
+
+describe("App provider login cancellation", () => {
+  it("cancels the exact pending attempt and stops the waiting state", async () => {
+    const baseInvoke = tauri.invoke.getMockImplementation();
+    const firstRunStatuses = providerStatuses.map((status) => ({
+      ...status,
+      availability:
+        status.provider === "antigravity"
+          ? ("needs-authentication" as const)
+          : status.availability,
+      selectedAsDefault: status.provider === "antigravity",
+    }));
+    tauri.invoke.mockImplementation(async (command: string, args?: Record<string, unknown>) => {
+      if (command === "setup_status") {
+        return {
+          editorPath: "C:/Editor",
+          editorValid: true,
+          assetsReady: true,
+          defaultProvider: "antigravity",
+          providers: firstRunStatuses,
+          setupRequired: true,
+        };
+      }
+      if (command === "provider_login_start") return "attempt-antigravity";
+      if (command === "provider_login_cancel") return undefined;
+      if (command === "provider_login_status") {
+        return firstRunStatuses.find((status) => status.provider === args?.provider);
+      }
+      return baseInvoke?.(command, args);
+    });
+
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "Google 로그인" }));
+    fireEvent.click(await screen.findByRole("button", { name: "로그인 취소" }));
+
+    await waitFor(() =>
+      expect(tauri.invoke).toHaveBeenCalledWith("provider_login_cancel", {
+        provider: "antigravity",
+        attemptId: "attempt-antigravity",
+      }),
+    );
+    expect(await screen.findByRole("button", { name: "Google 로그인" })).toBeInTheDocument();
+    expect(screen.getByText("연결 작업이 취소되었습니다.")).toBeInTheDocument();
   });
 });
 

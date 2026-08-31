@@ -6,12 +6,14 @@
     source ASCII-only (5.1 reads BOM-less files as ANSI/CP949).
 
 .DESCRIPTION
-    The v2 Tauri/Rust app has no Python venv: the old `uv` + `venv-python`
-    checks are gone with the `server/` stack. The one remaining runtime
-    prerequisite is the codex CLI the Rust core spawns:
-      - codex : the LLM CLI. Resolve order is CODEX_CMD env override first,
-                then PATH. NEVER spawn bare "codex" (rules.md) -- we resolve to
-                a real file path and fail with install guidance otherwise.
+    The Tauri/Rust app installs and gates its selected provider at runtime, so
+    normal build/dev scripts request no provider prerequisite. This file keeps
+    opt-in CLI probes for provider-specific live smoke only:
+      - codex: CODEX_CMD, then PATH
+      - claude-code: CLAUDE_CODE_CMD, then PATH
+
+    Direct Antigravity/OpenCode Go smoke is credential-driven inside the app and
+    deliberately has no executable prerequisite.
 
     Defines functions only -- no work happens at dot-source time.
 #>
@@ -24,6 +26,13 @@ function Resolve-CodexCmd {
     if ($cmd) { return $cmd.Source }
     return $null
 }
+function Resolve-ClaudeCodeCmd {
+    if ($env:CLAUDE_CODE_CMD) { return $env:CLAUDE_CODE_CMD }
+    $cmd = Get-Command claude -ErrorAction SilentlyContinue
+    if ($cmd) { return $cmd.Source }
+    return $null
+}
+
 
 function Get-PrereqFailures {
     <#
@@ -33,7 +42,7 @@ function Get-PrereqFailures {
     #>
     param(
         [Parameter(Mandatory)]
-        [ValidateSet('codex')]
+        [ValidateSet('codex', 'claude-code')]
         [string[]]$Require
     )
 
@@ -42,20 +51,19 @@ function Get-PrereqFailures {
     if ($Require -contains 'codex') {
         $codex = Resolve-CodexCmd
         if (-not $codex) {
-            # codex normally installs via npm; tailor the guidance to whether
-            # npm (and therefore Node.js) is already available.
-            if (Get-Command npm -ErrorAction SilentlyContinue) {
-                $failures += ("codex CLI not found (checked CODEX_CMD env, then " +
-                    "PATH). Install it with: npm install -g @openai/codex")
-            } else {
-                $failures += ("codex CLI not found (checked CODEX_CMD env, then " +
-                    "PATH), and npm is not available to install it. Either " +
-                    "install Node.js (https://nodejs.org) and run " +
-                    "'npm install -g @openai/codex', or download a standalone " +
-                    "codex binary and set CODEX_CMD to its full path.")
-            }
+            $failures += ("codex CLI not found for live smoke (checked CODEX_CMD, " +
+                "then PATH). Install it from the app's AI provider settings.")
         } elseif (-not (Test-Path -LiteralPath $codex -PathType Leaf)) {
             $failures += "codex: resolved path does not exist: '$codex'"
+        }
+    }
+    if ($Require -contains 'claude-code') {
+        $claude = Resolve-ClaudeCodeCmd
+        if (-not $claude) {
+            $failures += ("Claude Code CLI not found for live smoke (checked " +
+                "CLAUDE_CODE_CMD, then PATH). Install it from the app's AI provider settings.")
+        } elseif (-not (Test-Path -LiteralPath $claude -PathType Leaf)) {
+            $failures += "claude-code: resolved path does not exist: '$claude'"
         }
     }
 

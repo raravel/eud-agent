@@ -595,16 +595,20 @@ impl MapAgentService {
     ) -> Result<crate::session::SessionRecord, String> {
         let sessions = self.map_sessions(context)?;
         let created_at = crate::session::now_unix_seconds();
+        let config = self.dirs.load_config().map_err(|error| error.to_string())?;
+        let provider_binding = crate::provider::default_binding(&config)?;
         let record = crate::session::SessionRecord {
             meta: crate::session::SessionMeta {
                 id: crate::session::new_session_id(),
                 name: next_map_session_name(&sessions),
                 project: context.revision.project_id.clone(),
                 kind: crate::session::SessionKind::Map,
+                provider: provider_binding.provider,
+                model: provider_binding.model.clone(),
                 created_at,
                 last_conversation_at: crate::session::now_unix_millis(),
             },
-            thread_id: None,
+            provider_binding,
             pending_request_ids: Vec::new(),
             context_usage: None,
             panel_log: serde_json::Value::Null,
@@ -1854,6 +1858,8 @@ mod tests {
             name: name.to_string(),
             project: "project".to_string(),
             kind: crate::session::SessionKind::Map,
+            provider: crate::provider::ProviderId::Codex,
+            model: "gpt-test".to_string(),
             created_at: 1,
             last_conversation_at: 1,
         };
@@ -1941,10 +1947,17 @@ mod tests {
                     name: "Map Agent".to_string(),
                     project: "project".to_string(),
                     kind: crate::session::SessionKind::Map,
+                    provider: crate::provider::ProviderId::Codex,
+                    model: "gpt-test".to_string(),
                     created_at: 1,
                     last_conversation_at: 1,
                 },
-                thread_id: None,
+                provider_binding: crate::provider::ProviderBinding::new(
+                    crate::provider::ProviderId::Codex,
+                    "gpt-test".to_string(),
+                    None,
+                )
+                .unwrap(),
                 pending_request_ids: Vec::new(),
                 context_usage: None,
                 panel_log: Value::Null,
@@ -2077,10 +2090,17 @@ mod tests {
                     name: "Map Agent".to_string(),
                     project: "project".to_string(),
                     kind: crate::session::SessionKind::Map,
+                    provider: crate::provider::ProviderId::Codex,
+                    model: "gpt-test".to_string(),
                     created_at: 1,
                     last_conversation_at: 1,
                 },
-                thread_id: None,
+                provider_binding: crate::provider::ProviderBinding::new(
+                    crate::provider::ProviderId::Codex,
+                    "gpt-test".to_string(),
+                    None,
+                )
+                .unwrap(),
                 pending_request_ids: Vec::new(),
                 context_usage: None,
                 panel_log: Value::Null,

@@ -9,9 +9,9 @@
     builds the Rust core, links the isom static lib, and serves the React panel
     with hot-reload in the app's own WebView2 window.
 
-    Requires the tauri CLI (`cargo install tauri-cli` / `cargo-tauri`) and the
-    codex CLI on PATH (checked below). The app resolves its own data dirs
-    (%appdata%/%localappdata%\eud-agent) -- there is no dev port or socket.
+    Requires the Tauri CLI (`cargo install tauri-cli` / `cargo-tauri`). AI provider
+    binaries and credentials are selected, installed, and gated inside the app;
+    development startup does not require Codex or any other provider globally.
 
 .PARAMETER TauriArgs
     Extra arguments passed through to `cargo tauri dev` (e.g. -- --release).
@@ -40,12 +40,6 @@ function Fail([string]$msg) {
     exit 1
 }
 
-# --- prerequisite: codex CLI (the Rust core spawns it) --------------------
-. (Join-Path $PSScriptRoot 'check_prereqs.ps1')
-$prereqFailures = @(Get-PrereqFailures -Require 'codex')
-if ($prereqFailures.Count -gt 0) {
-    Fail ("prerequisite check failed:`n  - " + ($prereqFailures -join "`n  - "))
-}
 
 # --- prerequisite: tauri CLI ----------------------------------------------
 # `cargo tauri` resolves through cargo; a missing cargo-tauri surfaces as a

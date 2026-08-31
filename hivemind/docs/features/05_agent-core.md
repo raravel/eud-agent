@@ -1,36 +1,33 @@
 # Agent Core (Rust session workers + eud-tools MCP + project write transactions)
 
-The in-process Rust backend runs one persistent Codex conversation per saved session. Sessions
-have independent drivers, loopback MCP endpoints, cancellation generations, request gates,
-preflight state, and immutable event sinks. There is no conversation-wide or application-wide
-turn mutex: different sessions may read, search, reason, plan, and answer concurrently.
+The Rust backend supports exactly five providers: Codex, Claude Code, Antigravity, OpenCode Go,
+and Ollama. A saved session owns one immutable typed provider/model/reasoning/base-URL/conversation
+binding, independent cancellation, request gates, preflight state, and event sink. Different
+sessions may read/search/reason concurrently regardless of provider; the project write coordinator
+remains the single shared mutation authority.
 
 ## Session execution
 
 `SessionEngineManager` lazily creates one `SessionWorker` for each session id. A worker owns:
 
-- `AgentEngine<ProductionCodexDriver, SessionEventSink>`;
-- one `CodexAppServerClient` and event receiver while active;
-- one `SessionToolRuntime` and ephemeral loopback eud-tools MCP server;
-- one cancellation generation;
+- `AgentEngine<ProductionProviderDriver, SessionEventSink>`;
+- one exhaustive driver variant constructed from the persisted binding;
+- one `SessionToolRuntime`; CLI providers also receive one strict loopback eud-tools MCP endpoint;
+- one cancellation generation and immutable provider id;
 - the fixed session id used by every conversation event.
 
-The worker mutex serializes commands in that session only. Selecting a panel row only changes
-the visible `PanelStore`; it never opens, resets, cancels, or transfers backend execution.
-`session_open` hydrates one worker's saved thread and pending review without touching any other
-worker. Resume failure starts a fresh thread with a condensed transcript and the full first-turn
-safety prompt.
+The worker mutex serializes only that session. `session_open` validates the provider/conversation
+variant and seeds the saved state without touching any other worker. Settings cannot switch an
+existing worker's provider; same-provider model changes persist to the binding and recreate only
+that worker.
 
-## Context compaction and 1M opt-in
+## Context compaction and Codex 1M opt-in
 
-An exact `/compact` command is session maintenance, not a chat turn. The panel invokes
-`compact{sessionId}` without adding `/compact` to model-visible or panel conversation history.
-The session worker keeps its normal same-session serialization, sends app-server
-`thread/compact/start{threadId}`, and does not resolve the command until the matching
-`contextCompaction` item completes. Native Codex compaction retains Codex's instruction and
-recent-task semantics; backend-owned plan, review, workspace, and journal state are unchanged.
-Codex's normal threshold-driven compaction remains enabled, and its started/completed items become
-Korean progress lines rather than raw event names.
+`compact{sessionId}` is session maintenance and never enters panel/model chat history. Codex and
+Claude Code use their verified native compaction paths; Antigravity, OpenCode Go, and Ollama run a
+tools-disabled summary turn and atomically publish a compacted transcript generation. Only success
+resets the instruction delivery cursor. Plan/review/workspace/journal authority remains in Rust.
+Unsupported or failed compaction never changes provider/model or replays the turn elsewhere.
 
 ## Instruction epochs and active task state
 
@@ -65,15 +62,12 @@ stderr/exit context when available), logs the correlated session/request/turn id
 emits the generic `task_state_warning`. The projection is background context: it grants no
 editor/map/workspace/journal/tool authority.
 
-`config.json.codex_large_context_models` is a sorted set of model slugs selected in
-**Settings → Codex**. Before every turn, each production driver reloads the global model pair and
-this set. An enabled active model receives thread start/resume config
-`model_context_window=1000000` and `model_auto_compact_token_limit=900000`; disabling it omits both
-overrides on the next resume. Capability is not hard-coded because the authenticated catalog can
-change independently of the app. Codex clamps requested windows to the catalog maximum and reports
-95% of that window as effective; the current 1M-capable catalog cap of 872,000 therefore reports
-828,400. An effective value below 828,400 logs one fallback warning per model and continues on
-the Codex-reported window.
+`config.json.providers.codex.large_context_models` is a Codex-only sorted opt-in set under
+**Settings → AI 제공자 → Codex**. The session's pinned Codex model receives
+`model_context_window=1000000` and `model_auto_compact_token_limit=900000` on start/resume when
+enabled. No other provider receives a fabricated 1M capability. Codex clamps the request to its
+catalog maximum and reports 95% effective usage; a value below 828,400 emits one visible warning
+and continues on the exact Codex-reported window.
 
 ## Read and write execution modes
 
@@ -147,16 +141,15 @@ post-build runtime diagnostic. Project memory is synchronized only by the post-a
 
 
 `ask` accepts one to four related questions. Each question has a stable id, optional header,
-optional 2-5 choices, and a `multi` flag; the panel always exposes direct input. The tool call
-uses a standard MCP form elicitation so Codex pauses its MCP active-time deadline while the user
-is answering. The app-server callback registers one owner-request-scoped pending ASK, emits a
-session-scoped `ask` event, sets activity to `waiting_input`, and awaits
-`ask_response{sessionId,requestId,answers}` without holding the session engine mutex. The
-session-restore fallback deadline is paused by the same pending-ASK state. ASK therefore has no
-wall-clock response timeout: only a valid response, explicit turn cancellation, or teardown of
-the owning turn can end it. A valid response resolves the original MCP call, restores read/write
-activity, and lets Codex continue the same turn. A dropped ASK future removes its pending slot
-through an RAII lease; turn cancellation resolves it as cancelled. Because Tauri events are
+optional 2-5 choices, and a `multi` flag; the panel always exposes direct input. MCP and direct
+provider dispatch both call the same owner-request-scoped `SessionToolRuntime::ask` future. It
+emits one session-scoped event, sets `waiting_input`, and awaits
+`ask_response{sessionId,requestId,answers}` without holding the engine mutex. Provider active-time
+deadlines exclude the wait, so ASK has no wall-clock response timeout: only a valid response,
+explicit turn cancellation, or teardown of the owning turn can end it. A valid response restores
+the prior read/write activity and lets the same provider turn continue.
+A dropped ASK future removes its pending slot through an RAII lease; cancellation resolves it as
+cancelled. Because Tauri events are
 ephemeral notifications rather than delivery acknowledgments, `ask_pending{sessionId}` returns the
 backend-authoritative pending snapshot. The main and Map panels query it only after installing
 listeners and restore the matching ASK idempotently. Missing/duplicate/oversized questions and

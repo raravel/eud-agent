@@ -51,32 +51,49 @@ import {
   appSettingsGet,
   appSettingsSave,
   attentionNotify,
-  codexModelSettingsGet,
-  codexModelSettingsSave,
   compactSession,
   isAgentTurnEndTransition,
   mentionSearch,
-  wikiGet,
   notificationSoundPreview,
+  providerApiKeySave,
+  providerBaseUrlSave,
+  providerSettingsGet,
+  providerCredentialImport,
+  providerDefaultsSave,
+  providerInstall,
+  providerLoginStart,
+  providerLoginCancel,
+  providerLoginStatus,
+  providerLogout,
+  providerStatusList,
+  sessionModelSettingsGet,
+  sessionModelSettingsSave,
+  setupProviderSelect,
+  wikiGet,
   wikiSave,
   workspaceList,
   workspaceRead,
   workspaceSearch,
   type AskAnswer,
   type AppSettings,
+  type HarnessJobView,
   type LedgerEntry,
-  type CodexModelSettings,
   type MemoryFile,
-  type PanelLog,
   type MentionSearchRequest,
+  type PanelLog,
   type PanelLogEntry,
+  type ProviderId,
+  type ProviderModel,
+  type ProviderProgressEvent,
+  type ProviderStatus,
+  type ReasoningSelection,
   type ServerMessage,
   type SessionMeta,
+  type SessionModelSettings,
   type SessionRecord,
-  type HarnessJobView,
+  type SetupMessage,
   type WorkspaceFileEntry,
   type WorkspaceListResponse,
-  type SetupMessage,
 } from "@/lib/ipc";
 import { progressLabel } from "@/lib/progress";
 import { useProjectIdentityEffect } from "@/lib/projectIdentity";
@@ -87,6 +104,7 @@ import {
 import { SetupScreen } from "@/setup/SetupScreen";
 import { UpdateNotice } from "@/components/UpdateNotice";
 import { createUpdater, type UpdateHandle } from "@/setup/update";
+import { PROVIDER_LABELS } from "@/providers/providerCopy";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import {
@@ -94,16 +112,8 @@ import {
   stageAttachment,
 } from "@/lib/attachments";
 
-/** codex login probe result (mirrors the Rust `CodexAuthState`). */
-interface CodexAuthState {
-  resolved: boolean;
-  authed: boolean;
-  detail: string;
-}
-
-/** OAuth poll cadence + ceiling: codex's browser flow rarely exceeds a minute. */
-const CODEX_POLL_MS = 2000;
-const CODEX_POLL_TIMEOUT_MS = 180000;
+const PROVIDER_POLL_MS = 2000;
+const PROVIDER_POLL_TIMEOUT_MS = 300000;
 
 /**
  * Editor-liveness poll cadence. The bridge writes heartbeat.txt every ~1s and
@@ -123,14 +133,15 @@ interface BootstrapState {
 const PANEL_LOG_SCHEMA_VERSION = 2;
 
 /**
- * Serialize the live conversation log into the durable {@link PanelLog} subset
- * pushed via `session_update_log`: `id/kind/text` plus optional
- * `stage`/`tools`/`attachments`/`mentions` survive; transient
- * turn/plan/changeset/wiki state is dropped. `logSeq` advances restored store
- * counters past existing ids.
+ * Serialize the live conversation log into the durable {@link PanelLog} subset.
+ * Turn progress is transient; durable rows keep `id/kind/text` plus optional
+ * `stage`/`tools`/`attachments`/`mentions`. `logSeq` advances restored store
+ * counters past every live id, including omitted progress rows.
  */
 function serializePanelLog(log: readonly LogEntry[]): PanelLog {
-  const entries: PanelLogEntry[] = log.map((entry) => {
+  const entries: PanelLogEntry[] = [];
+  for (const entry of log) {
+    if (entry.kind === "progress") continue;
     const next: PanelLogEntry = {
       id: entry.id,
       kind: entry.kind,
@@ -163,8 +174,8 @@ function serializePanelLog(log: readonly LogEntry[]): PanelLog {
     if (entry.mentions) {
       next.mentions = entry.mentions.map((mention) => ({ ...mention }));
     }
-    return next;
-  });
+    entries.push(next);
+  }
   const logSeq = log.reduce((max, entry) => (entry.id > max ? entry.id : max), 0);
   return { schemaVersion: PANEL_LOG_SCHEMA_VERSION, logSeq, log: entries };
 }
@@ -196,7 +207,11 @@ function emptyPanelLog(): PanelLog {
   return { schemaVersion: PANEL_LOG_SCHEMA_VERSION, logSeq: 0, log: [] };
 }
 
-function draftSession(project: string): SessionRecord {
+function draftSession(
+  project: string,
+  provider: ProviderId,
+  model: string,
+): SessionRecord {
   draftSequence += 1;
   const now = Date.now();
   return {
@@ -204,9 +219,10 @@ function draftSession(project: string): SessionRecord {
     name: "새 대화",
     project,
     kind: "eps",
+    provider,
+    model,
     createdAt: Math.floor(now / 1_000),
     lastConversationAt: now,
-    threadId: null,
     pendingRequestIds: [],
     panelLog: emptyPanelLog(),
   };
@@ -279,11 +295,55 @@ export default function App() {
   // then probes the editor every EDITOR_POLL_MS so a stale heartbeat at boot or
   // a mid-session editor restart recovers automatically.
   const [editorPollEnabled, setEditorPollEnabled] = useState(false);
-  // codex login step (setup screen step 3). The OAuth path spawns the browser
-  // flow in the backend and polls codex_login_status until it flips.
-  const [codexBusy, setCodexBusy] = useState(false);
-  const [codexError, setCodexError] = useState<string | null>(null);
-  const codexPollRef = useRef<number | null>(null);
+  const [providerStatuses, setProviderStatuses] = useState<ProviderStatus[]>([]);
+  const [providerModels, setProviderModels] = useState<
+    Partial<Record<ProviderId, ProviderModel[]>>
+  >({});
+  const [providerSelectedModels, setProviderSelectedModels] = useState<
+    Partial<Record<ProviderId, string>>
+  >({});
+  const [providerSelectedReasoning, setProviderSelectedReasoning] = useState<
+    Partial<Record<ProviderId, ReasoningSelection>>
+  >({});
+  const [providerVersions, setProviderVersions] = useState<
+    Partial<Record<ProviderId, string>>
+  >({});
+  const [providerChannels, setProviderChannels] = useState<
+    Partial<Record<ProviderId, string>>
+  >({});
+  const [providerBaseUrls, setProviderBaseUrls] = useState<
+    Partial<Record<ProviderId, string>>
+  >({});
+  const [providerHasApiKeys, setProviderHasApiKeys] = useState<
+    Partial<Record<ProviderId, boolean>>
+  >({});
+  const providerAttemptsRef = useRef<
+    Partial<Record<ProviderId, string>>
+  >({});
+  const [providerLoginPending, setProviderLoginPending] = useState<
+    Partial<Record<ProviderId, boolean>>
+  >({});
+  const [providerBusy, setProviderBusy] = useState<ProviderId | undefined>();
+  const [providerErrors, setProviderErrors] = useState<
+    Partial<Record<ProviderId, string>>
+  >({});
+  const providerPollsRef = useRef(new Map<ProviderId, number>());
+  const draftProviderRef = useRef<{
+    provider: ProviderId;
+    model: string;
+  }>({ provider: "codex", model: "pending" });
+  const previewProvider =
+    providerStatuses.find((status) => status.selectedAsDefault)?.provider ??
+    setup?.defaultProvider ??
+    "codex";
+  draftProviderRef.current = {
+    provider: previewProvider,
+    model:
+      providerSelectedModels[previewProvider] ??
+      providerModels[previewProvider]?.find((candidate) => candidate.isDefault)
+        ?.model ??
+      "pending",
+  };
   // "에디터 켜기": true while the launch_editor command is in flight. The button
   // re-enables once the editor connects (editorConnected) or the spawn resolves/fails.
   const [launchPending, setLaunchPending] = useState(false);
@@ -302,12 +362,9 @@ export default function App() {
   const [update, setUpdate] = useState<UpdateHandle | null>(null);
   const [updateDismissed, setUpdateDismissed] = useState(false);
   const updateCheckedRef = useRef(false);
-  // Authenticated Codex model catalog + persisted global selection. The catalog
-  // comes from app-server `model/list`; changing either select applies to the
-  // next eud-agent turn and is saved by the Rust core.
-  const [codexSettings, setCodexSettings] =
-    useState<CodexModelSettings | null>(null);
-  const [codexSettingsBusy, setCodexSettingsBusy] = useState(false);
+  const [sessionModelSettings, setSessionModelSettings] =
+    useState<SessionModelSettings | null>(null);
+  const [providerSettingsBusy, setProviderSettingsBusy] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [appSettings, setAppSettings] = useState<AppSettings | null>(null);
   const [appSettingsBusy, setAppSettingsBusy] = useState(false);
@@ -452,7 +509,8 @@ export default function App() {
   );
 
   const createDraftSlot = useCallback((): SessionSlot => {
-    const meta = draftSession(projectStore.getState().project);
+    const { provider, model } = draftProviderRef.current;
+    const meta = draftSession(projectStore.getState().project, provider, model);
     const sessionStore = createPanelStore();
     syncProjectState(sessionStore, projectStore);
     const slot: SessionSlot = {
@@ -489,36 +547,128 @@ export default function App() {
     [],
   );
 
-  const loadCodexModelSettings = useCallback(async () => {
-    setCodexSettingsBusy(true);
-    try {
-      setCodexSettings(await codexModelSettingsGet());
-    } catch {
-      setCodexSettings(null);
-      toast.error("Codex 모델 목록을 불러오지 못했습니다.");
-    } finally {
-      setCodexSettingsBusy(false);
-    }
+  const loadProviderCatalog = useCallback(async (provider: ProviderId) => {
+    const view = await providerSettingsGet(provider);
+    setProviderStatuses((current) =>
+      current.map((status) =>
+        status.provider === provider ? view.status : status,
+      ),
+    );
+    setProviderModels((current) => ({
+      ...current,
+      [provider]: view.models,
+    }));
+    setProviderSelectedModels((current) => ({
+      ...current,
+      [provider]: view.selectedModel ?? undefined,
+    }));
+    setProviderSelectedReasoning((current) => ({
+      ...current,
+      [provider]: view.selectedReasoning ?? undefined,
+    }));
+    setProviderVersions((current) => ({
+      ...current,
+      [provider]: view.version ?? undefined,
+    }));
+    setProviderChannels((current) => ({
+      ...current,
+      [provider]: view.channel ?? undefined,
+    }));
+    setProviderBaseUrls((current) => ({
+      ...current,
+      [provider]: view.baseUrl ?? undefined,
+    }));
+    setProviderHasApiKeys((current) => ({
+      ...current,
+      [provider]: view.hasApiKey,
+    }));
+    return view.models;
   }, []);
+  const loadProviders = useCallback(async () => {
+    setProviderSettingsBusy(true);
+    try {
+      const statuses = await providerStatusList();
+      setProviderStatuses(statuses);
+      await Promise.all(
+        statuses
+          .filter(
+            (status) =>
+              status.availability === "ready" || status.provider === "ollama",
+          )
+          .map((status) => loadProviderCatalog(status.provider)),
+      );
+    } catch {
+      toast.error("AI 제공자 상태를 불러오지 못했습니다.");
+    } finally {
+      setProviderSettingsBusy(false);
+    }
+  }, [loadProviderCatalog]);
 
   useEffect(() => {
-    if (editorPollEnabled) void loadCodexModelSettings();
-  }, [editorPollEnabled, loadCodexModelSettings]);
+    if (editorPollEnabled) void loadProviders();
+  }, [editorPollEnabled, loadProviders]);
 
-  const handleCodexSettingsChange = useCallback(
-    async (model: string, reasoningEffort: string) => {
-      setCodexSettingsBusy(true);
+  useEffect(() => {
+    if (!selectedSlot?.persisted) {
+      setSessionModelSettings(null);
+      return;
+    }
+    let active = true;
+    setProviderSettingsBusy(true);
+    void sessionModelSettingsGet(selectedSlot.id)
+      .then((settings) => {
+        if (active) setSessionModelSettings(settings);
+      })
+      .catch(() => {
+        if (active) setSessionModelSettings(null);
+      })
+      .finally(() => {
+        if (active) setProviderSettingsBusy(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, [selectedSlot?.id, selectedSlot?.persisted]);
+
+  const handleSessionModelChange = useCallback(
+    async (model: string, reasoning: ReasoningSelection | undefined) => {
+      setProviderSettingsBusy(true);
       try {
-        setCodexSettings(
-          await codexModelSettingsSave(model, reasoningEffort),
-        );
+        if (selectedSlot?.persisted) {
+          setSessionModelSettings(
+            await sessionModelSettingsSave(selectedSlot.id, model, reasoning),
+          );
+        } else {
+          const provider = providerStatuses.find(
+            (status) => status.selectedAsDefault,
+          )?.provider;
+          if (!provider) return;
+          const view = await providerDefaultsSave(
+            provider,
+            model,
+            reasoning,
+            true,
+          );
+          setProviderModels((current) => ({
+            ...current,
+            [provider]: view.models,
+          }));
+          setProviderSelectedModels((current) => ({
+            ...current,
+            [provider]: model,
+          }));
+          setProviderSelectedReasoning((current) => ({
+            ...current,
+            [provider]: reasoning,
+          }));
+        }
       } catch {
-        toast.error("Codex 모델 설정을 저장하지 못했습니다.");
+        toast.error("모델 설정을 저장하지 못했습니다.");
       } finally {
-        setCodexSettingsBusy(false);
+        setProviderSettingsBusy(false);
       }
     },
-    [],
+    [providerStatuses, selectedSlot],
   );
 
   const loadAppSettings = useCallback(async () => {
@@ -634,7 +784,8 @@ export default function App() {
           break;
         case "setup":
           setSetup(msg);
-          if (!msg.setup_required) {
+          setProviderStatuses(msg.providers);
+          if (!msg.setupRequired) {
             bootstrapActiveRef.current = false;
             setBootstrap((prev) =>
               prev.active ? { ...prev, active: false } : prev,
@@ -1010,7 +1161,7 @@ export default function App() {
   // Progress streams in as `progress {stage: "bootstrap"}`; the final "done"
   // re-queries setup_status, which dismisses the SetupScreen.
   useEffect(() => {
-    if (!setup?.setup_required || !setup.editor_valid || setup.assets_ready) return;
+    if (!setup?.setupRequired || !setup.editorValid || setup.assetsReady) return;
     if (bootstrapRunningRef.current) return;
     bootstrapRunningRef.current = true;
     void clientRef.current?.send({ type: "bootstrap_run" }).then(() => {
@@ -1022,7 +1173,7 @@ export default function App() {
   // Non-blocking: an updater error (offline, no release yet) just leaves the banner
   // hidden — it never gates the panel.
   useEffect(() => {
-    if (!setup || setup.setup_required) return;
+    if (!setup || setup.setupRequired) return;
     if (updateCheckedRef.current) return;
     updateCheckedRef.current = true;
     void updater
@@ -1399,99 +1550,357 @@ export default function App() {
     void clientRef.current?.send({ type: "setup_pick_editor_path" });
   }, []);
 
-  // Re-query the setup gate after a login attempt so codex_authed (and thus
-  // setup_required) refreshes and the SetupScreen dismisses on success.
   const refreshSetup = useCallback(() => {
     void clientRef.current?.send({ type: "setup_status" });
   }, []);
 
-  const stopCodexPoll = useCallback(() => {
-    if (codexPollRef.current !== null) {
-      window.clearInterval(codexPollRef.current);
-      codexPollRef.current = null;
+  const stopProviderPoll = useCallback((provider: ProviderId) => {
+    const timer = providerPollsRef.current.get(provider);
+    if (timer !== undefined) {
+      window.clearInterval(timer);
+      providerPollsRef.current.delete(provider);
     }
   }, []);
-
-  // Install: the backend downloads the standalone codex binary and places it
-  // where resolve_codex_cmd finds it; refreshing the gate flips codex_resolved
-  // and the login controls take over.
-  const handleCodexInstall = useCallback(() => {
-    stopCodexPoll();
-    setCodexError(null);
-    setCodexBusy(true);
-    void invoke<CodexAuthState>("codex_install")
-      .then((state) => {
-        setCodexBusy(false);
-        refreshSetup();
-        if (!state.resolved) {
-          setCodexError("codex 설치 후에도 실행 파일을 찾지 못했습니다.");
-        }
-      })
-      .catch((error) => {
-        setCodexBusy(false);
-        setCodexError(String(error));
+  const clearProviderLogin = useCallback(
+    (provider: ProviderId) => {
+      stopProviderPoll(provider);
+      delete providerAttemptsRef.current[provider];
+      setProviderLoginPending((current) => {
+        if (current[provider] === undefined) return current;
+        const next = { ...current };
+        delete next[provider];
+        return next;
       });
-  }, [refreshSetup, stopCodexPoll]);
+      setProviderBusy((current) => (current === provider ? undefined : current));
+    },
+    [stopProviderPoll],
+  );
 
-  // OAuth: the backend launches `codex login` (opens the browser); we poll
-  // codex_login_status until it reports authed, then refresh the gate.
-  const handleCodexOAuth = useCallback(() => {
-    stopCodexPoll();
-    setCodexError(null);
-    setCodexBusy(true);
-    void invoke("codex_login_start")
-      .then(() => {
+
+  const setProviderError = useCallback(
+    (provider: ProviderId, error: unknown) => {
+      setProviderErrors((current) => ({
+        ...current,
+        [provider]: String(error),
+      }));
+    },
+    [],
+  );
+
+  const updateProviderStatus = useCallback((status: ProviderStatus) => {
+    setProviderStatuses((current) =>
+      current.map((candidate) =>
+        candidate.provider === status.provider ? status : candidate,
+      ),
+    );
+  }, []);
+
+  const handleProviderRefresh = useCallback(
+    async (provider: ProviderId) => {
+      setProviderBusy(provider);
+      setProviderErrors((current) => ({ ...current, [provider]: undefined }));
+      try {
+        const status = await providerLoginStatus(provider);
+        updateProviderStatus(status);
+        if (status.availability === "ready") {
+          await loadProviderCatalog(provider);
+        }
+        refreshSetup();
+      } catch (error) {
+        setProviderError(provider, error);
+      } finally {
+        setProviderBusy(undefined);
+      }
+    },
+    [
+      loadProviderCatalog,
+      refreshSetup,
+      setProviderError,
+      updateProviderStatus,
+    ],
+  );
+
+  const handleProviderInstall = useCallback(
+    async (provider: ProviderId) => {
+      stopProviderPoll(provider);
+      setProviderBusy(provider);
+      setProviderErrors((current) => ({ ...current, [provider]: undefined }));
+      try {
+        updateProviderStatus(await providerInstall(provider));
+        refreshSetup();
+      } catch (error) {
+        setProviderError(provider, error);
+      } finally {
+        setProviderBusy(undefined);
+      }
+    },
+    [refreshSetup, setProviderError, stopProviderPoll, updateProviderStatus],
+  );
+
+  const handleProviderLogin = useCallback(
+    async (provider: ProviderId) => {
+      clearProviderLogin(provider);
+      setProviderBusy(provider);
+      setProviderErrors((current) => ({ ...current, [provider]: undefined }));
+      try {
+        const attemptId = await providerLoginStart(provider);
+        providerAttemptsRef.current[provider] = attemptId;
+        setProviderLoginPending((current) => ({ ...current, [provider]: true }));
         const startedAt = Date.now();
-        codexPollRef.current = window.setInterval(() => {
-          void invoke<CodexAuthState>("codex_login_status")
-            .then((state) => {
-              if (state.authed) {
-                stopCodexPoll();
-                setCodexBusy(false);
+        const timer = window.setInterval(() => {
+          void providerLoginStatus(provider)
+            .then(async (status) => {
+              updateProviderStatus(status);
+              if (status.availability === "ready") {
+                clearProviderLogin(provider);
+                await loadProviderCatalog(provider);
                 refreshSetup();
-              } else if (Date.now() - startedAt > CODEX_POLL_TIMEOUT_MS) {
-                stopCodexPoll();
-                setCodexBusy(false);
-                setCodexError(
-                  "로그인이 완료되지 않았습니다. 브라우저에서 인증을 마친 뒤 다시 시도해 주세요.",
-                );
+              } else if (
+                Date.now() - startedAt >
+                PROVIDER_POLL_TIMEOUT_MS
+              ) {
+                clearProviderLogin(provider);
+                setProviderError(provider, "provider_cancelled");
               }
             })
             .catch((error) => {
-              stopCodexPoll();
-              setCodexBusy(false);
-              setCodexError(String(error));
+              clearProviderLogin(provider);
+              setProviderError(provider, error);
             });
-        }, CODEX_POLL_MS);
-      })
-      .catch((error) => {
-        setCodexBusy(false);
-        setCodexError(String(error));
-      });
-  }, [refreshSetup, stopCodexPoll]);
-
-  // API key: piped to the backend (stdin), awaited; success refreshes the gate.
-  const handleCodexApiKey = useCallback(
-    (key: string) => {
-      stopCodexPoll();
-      setCodexError(null);
-      setCodexBusy(true);
-      void invoke<CodexAuthState>("codex_login_with_api_key", { key })
-        .then((state) => {
-          setCodexBusy(false);
-          if (state.authed) refreshSetup();
-          else setCodexError(state.detail || "API 키 로그인에 실패했습니다.");
-        })
-        .catch((error) => {
-          setCodexBusy(false);
-          setCodexError(String(error));
-        });
+        }, PROVIDER_POLL_MS);
+        providerPollsRef.current.set(provider, timer);
+      } catch (error) {
+        clearProviderLogin(provider);
+        setProviderError(provider, error);
+      }
     },
-    [refreshSetup, stopCodexPoll],
+    [
+      clearProviderLogin,
+      loadProviderCatalog,
+      refreshSetup,
+      setProviderError,
+      updateProviderStatus,
+    ],
+  );
+  const handleProviderLoginCancel = useCallback(
+    async (provider: ProviderId) => {
+      const attemptId = providerAttemptsRef.current[provider];
+      let failure: unknown;
+      if (attemptId !== undefined) {
+        try {
+          await providerLoginCancel(provider, attemptId);
+        } catch (error) {
+          if (String(error) !== "provider_cancelled") failure = error;
+        }
+      }
+      clearProviderLogin(provider);
+      setProviderError(provider, failure ?? "provider_cancelled");
+      try {
+        updateProviderStatus(await providerLoginStatus(provider));
+      } catch {
+        // Cancellation already completed locally; a status refresh remains optional.
+      }
+      refreshSetup();
+    },
+    [clearProviderLogin, refreshSetup, setProviderError, updateProviderStatus],
   );
 
-  // Stop any in-flight OAuth poll on unmount.
-  useEffect(() => stopCodexPoll, [stopCodexPoll]);
+
+  const handleProviderImport = useCallback(
+    async (provider: ProviderId) => {
+      setProviderBusy(provider);
+      try {
+        const status = await providerCredentialImport(provider);
+        updateProviderStatus(status);
+        if (status.availability === "ready") {
+          await loadProviderCatalog(provider);
+        }
+        refreshSetup();
+      } catch (error) {
+        setProviderError(provider, error);
+      } finally {
+        setProviderBusy(undefined);
+      }
+    },
+    [
+      loadProviderCatalog,
+      refreshSetup,
+      setProviderError,
+      updateProviderStatus,
+    ],
+  );
+
+  const handleProviderApiKey = useCallback(
+    async (provider: ProviderId, key: string) => {
+      setProviderBusy(provider);
+      try {
+        const status = await providerApiKeySave(provider, key);
+        updateProviderStatus(status);
+        if (status.availability === "ready") {
+          await loadProviderCatalog(provider);
+        }
+        refreshSetup();
+      } catch (error) {
+        setProviderError(provider, error);
+      } finally {
+        setProviderBusy(undefined);
+      }
+    },
+    [
+      loadProviderCatalog,
+      refreshSetup,
+      setProviderError,
+      updateProviderStatus,
+    ],
+  );
+
+  const handleProviderBaseUrl = useCallback(
+    async (provider: ProviderId, baseUrl: string) => {
+      setProviderBusy(provider);
+      setProviderErrors((current) => ({ ...current, [provider]: undefined }));
+      try {
+        const view = await providerBaseUrlSave(provider, baseUrl);
+        updateProviderStatus(view.status);
+        setProviderModels((current) => ({
+          ...current,
+          [provider]: view.models,
+        }));
+        setProviderSelectedModels((current) => ({
+          ...current,
+          [provider]: view.selectedModel ?? undefined,
+        }));
+        setProviderSelectedReasoning((current) => ({
+          ...current,
+          [provider]: view.selectedReasoning ?? undefined,
+        }));
+        setProviderBaseUrls((current) => ({
+          ...current,
+          [provider]: view.baseUrl ?? undefined,
+        }));
+        setProviderHasApiKeys((current) => ({
+          ...current,
+          [provider]: view.hasApiKey,
+        }));
+        refreshSetup();
+      } catch (error) {
+        setProviderError(provider, error);
+      } finally {
+        setProviderBusy(undefined);
+      }
+    },
+    [refreshSetup, setProviderError, updateProviderStatus],
+  );
+
+  const handleProviderLogout = useCallback(
+    async (provider: ProviderId) => {
+      setProviderBusy(provider);
+      try {
+        const status = await providerLogout(provider);
+        updateProviderStatus(status);
+        setProviderHasApiKeys((current) => ({
+          ...current,
+          [provider]: false,
+        }));
+        if (status.availability === "ready") {
+          await loadProviderCatalog(provider);
+        } else {
+          setProviderModels((current) => ({ ...current, [provider]: [] }));
+        }
+        refreshSetup();
+      } catch (error) {
+        setProviderError(provider, error);
+      } finally {
+        setProviderBusy(undefined);
+      }
+    },
+    [loadProviderCatalog, refreshSetup, setProviderError, updateProviderStatus],
+  );
+
+  const handleProviderSelect = useCallback(
+    async (provider: ProviderId) => {
+      try {
+        await setupProviderSelect(provider);
+        setProviderStatuses((current) =>
+          current.map((status) => ({
+            ...status,
+            selectedAsDefault: status.provider === provider,
+          })),
+        );
+        if (provider === "ollama") {
+          await loadProviderCatalog(provider);
+        }
+        refreshSetup();
+      } catch (error) {
+        setProviderError(provider, error);
+      }
+    },
+    [loadProviderCatalog, refreshSetup, setProviderError],
+  );
+
+  const handleProviderModelChange = useCallback(
+    async (
+      provider: ProviderId,
+      model: string,
+      reasoning: ReasoningSelection | undefined,
+    ) => {
+      setProviderBusy(provider);
+      try {
+        const selectedAsDefault = providerStatuses.some(
+          (status) =>
+            status.provider === provider && status.selectedAsDefault,
+        );
+        const view = await providerDefaultsSave(
+          provider,
+          model,
+          reasoning,
+          selectedAsDefault,
+        );
+
+        setProviderModels((current) => ({
+          ...current,
+          [provider]: view.models,
+        }));
+        setProviderSelectedModels((current) => ({
+          ...current,
+          [provider]: model,
+        }));
+        setProviderSelectedReasoning((current) => ({
+          ...current,
+          [provider]: reasoning,
+        }));
+        refreshSetup();
+      } catch (error) {
+        setProviderError(provider, error);
+      } finally {
+        setProviderBusy(undefined);
+      }
+    },
+    [providerStatuses, refreshSetup, setProviderError],
+  );
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    void listen<ProviderProgressEvent>("provider_progress", ({ payload }) => {
+      const currentAttempt = providerAttemptsRef.current[payload.provider];
+      if (currentAttempt !== payload.attemptId) return;
+      if (payload.detailCode) {
+        clearProviderLogin(payload.provider);
+        setProviderError(payload.provider, payload.detailCode);
+      }
+    }).then((dispose) => {
+      unlisten = dispose;
+    });
+    return () => unlisten?.();
+  }, [clearProviderLogin, setProviderError]);
+
+  useEffect(
+    () => () => {
+      for (const timer of providerPollsRef.current.values()) {
+        window.clearInterval(timer);
+      }
+      providerPollsRef.current.clear();
+    },
+    [],
+  );
 
   const handlePlanOpenChange = useCallback(
     (open: boolean) => {
@@ -1805,33 +2214,68 @@ export default function App() {
           id: slot.id,
           name: slot.meta.name,
           lastConversationAt: slot.meta.lastConversationAt,
+          provider: slot.meta.provider,
           activity: slot.activity,
           persisted: slot.persisted,
         })),
     [sessionRevision],
   );
+  const defaultProvider = providerStatuses.find(
+    (status) => status.selectedAsDefault,
+  )?.provider;
+  const draftModels = defaultProvider ? providerModels[defaultProvider] ?? [] : [];
+  const draftSelectedModel = defaultProvider
+    ? providerSelectedModels[defaultProvider] ??
+      draftModels.find((model) => model.isDefault)?.model
+    : undefined;
+  const promptModelSettings: SessionModelSettings | null =
+    selectedSlot?.persisted
+      ? sessionModelSettings
+      : defaultProvider && draftSelectedModel
+        ? {
+            provider: defaultProvider,
+            models: draftModels,
+            selectedModel: draftSelectedModel,
+            selectedReasoning: providerSelectedReasoning[defaultProvider],
+          }
+        : null;
   const selectedActionBusy =
     messageActionBusy ||
     selectedSlot?.activity === "running_write" ||
     state.phase === "changeset_review";
 
-  if (setup?.setup_required || bootstrap.active) {
+  if (setup?.setupRequired || bootstrap.active) {
     return (
       <SetupScreen
-        editorValid={setup?.editor_valid ?? true}
+        editorValid={setup?.editorValid ?? true}
         pickError={setup?.error ?? null}
         onPick={handlePickEditorPath}
         view={bootstrap.view}
         error={bootstrap.error}
         onRetry={handleBootstrapRetry}
-        assetsReady={setup?.assets_ready ?? false}
-        codexResolved={setup?.codex_resolved ?? true}
-        codexAuthed={setup?.codex_authed ?? true}
-        codexBusy={codexBusy}
-        codexError={codexError}
-        onCodexInstall={handleCodexInstall}
-        onCodexOAuth={handleCodexOAuth}
-        onCodexApiKey={handleCodexApiKey}
+        assetsReady={setup?.assetsReady ?? false}
+        defaultProvider={setup?.defaultProvider ?? undefined}
+        providers={setup?.providers ?? providerStatuses}
+        models={providerModels}
+        selectedModels={providerSelectedModels}
+        selectedReasoning={providerSelectedReasoning}
+        versions={providerVersions}
+        channels={providerChannels}
+        baseUrls={providerBaseUrls}
+        hasApiKeys={providerHasApiKeys}
+        busyProvider={providerBusy}
+        loginPending={providerLoginPending}
+        providerErrors={providerErrors}
+        onSelectProvider={handleProviderSelect}
+        onProviderInstall={handleProviderInstall}
+        onProviderLogin={handleProviderLogin}
+        onProviderLoginCancel={handleProviderLoginCancel}
+        onProviderImport={handleProviderImport}
+        onProviderApiKey={handleProviderApiKey}
+        onProviderBaseUrl={handleProviderBaseUrl}
+        onProviderLogout={handleProviderLogout}
+        onProviderRefresh={handleProviderRefresh}
+        onProviderModelChange={handleProviderModelChange}
       />
     );
   }
@@ -1869,13 +2313,31 @@ export default function App() {
         <SettingsDialog
           open={settingsOpen}
           settings={appSettings}
-          codexSettings={codexSettings}
-          busy={appSettingsBusy}
-          codexBusy={!editorPollEnabled || codexSettingsBusy}
+          providers={providerStatuses}
+          providerModels={providerModels}
+          selectedModels={providerSelectedModels}
+          selectedReasoning={providerSelectedReasoning}
+          versions={providerVersions}
+          channels={providerChannels}
+          baseUrls={providerBaseUrls}
+          hasApiKeys={providerHasApiKeys}
+          providerErrors={providerErrors}
+          providerBusy={providerBusy}
+          loginPending={providerLoginPending}
+          busy={appSettingsBusy || providerSettingsBusy}
           onOpenChange={setSettingsOpen}
           onSettingsChange={handleAppSettingsChange}
           onReload={loadAppSettings}
-          onCodexReload={loadCodexModelSettings}
+          onSelectProvider={handleProviderSelect}
+          onProviderInstall={handleProviderInstall}
+          onProviderLogin={handleProviderLogin}
+          onProviderLoginCancel={handleProviderLoginCancel}
+          onProviderImport={handleProviderImport}
+          onProviderApiKey={handleProviderApiKey}
+          onProviderBaseUrl={handleProviderBaseUrl}
+          onProviderLogout={handleProviderLogout}
+          onProviderRefresh={handleProviderRefresh}
+          onProviderModelChange={handleProviderModelChange}
           onPreviewSound={handleNotificationSoundPreview}
         />
 
@@ -1893,6 +2355,9 @@ export default function App() {
           <div className="flex min-h-10 items-center gap-2 border-b border-border bg-card/20 px-4 text-xs">
             <span className="min-w-0 flex-1 truncate font-medium text-foreground">
               {selectedSlot.meta.name}
+            </span>
+            <span className="rounded-full border border-border bg-muted/50 px-2 py-0.5 text-[11px] text-muted-foreground">
+              {PROVIDER_LABELS[selectedSlot.meta.provider]}
             </span>
             {selectedSlot.activity === "running_read" && (
               <span className="text-primary">분석 중</span>
@@ -1980,10 +2445,18 @@ export default function App() {
           onCancel={handleCancel}
           draft={editDraft}
           actionBusy={selectedActionBusy}
-          codexSettings={codexSettings}
-          codexSettingsBusy={!editorPollEnabled || codexSettingsBusy}
-          onCodexSettingsChange={handleCodexSettingsChange}
-          onCodexSettingsReload={loadCodexModelSettings}
+          modelSettings={promptModelSettings}
+          modelSettingsBusy={!editorPollEnabled || providerSettingsBusy}
+          onModelSettingsChange={handleSessionModelChange}
+          onModelSettingsReload={() => {
+            if (selectedSlot?.persisted) {
+              void sessionModelSettingsGet(selectedSlot.id).then(
+                setSessionModelSettings,
+              );
+            } else if (defaultProvider) {
+              void loadProviderCatalog(defaultProvider);
+            }
+          }}
         />
       </main>
 

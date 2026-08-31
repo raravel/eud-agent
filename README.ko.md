@@ -39,10 +39,10 @@
 | **Windows** | Windows 10/11. 에디터가 Windows 전용이며, 앱은 MSVC 타깃입니다. |
 | **EUD Editor 3** | 이 에이전트가 통합되는 서드파티 에디터입니다. |
 | **WebView2 런타임** | 시스템 Evergreen 런타임. 인스톨러가 부트스트랩할 수 있습니다. |
-| **codex CLI** | Rust 코어가 띄우는 LLM CLI. `npm install -g @openai/codex`로 설치하거나 `CODEX_CMD`에 전체 경로를 지정합니다. |
+| **AI 제공자 연결 1개** | 첫 실행에서 Codex(ChatGPT/API 키), Claude Code 구독, 실험적 Antigravity Google OAuth, OpenCode Go API 키, Ollama OpenAI 호환 endpoint 중 하나를 선택합니다. |
 
-첫 실행 시 부트스트랩이 bge-m3 ONNX 모델(HuggingFace)과 RAG 인덱스(GitHub Release)를
-내려받습니다. 모든 자산은 sha256으로 검증되고 원자적으로 배치됩니다.
+첫 실행은 bge-m3/RAG 자산만 검증·다운로드한 뒤 기본 제공자 하나를 요구합니다. Codex와
+Claude Code는 앱 전용 프로필에 설치할 수 있으므로 전역 CLI는 필수 요구 사항이 아닙니다.
 
 ### 소스 빌드를 위한 추가 요구 사항
 
@@ -53,15 +53,21 @@
 | **Node.js + npm** | React 패널(`panel/`) 빌드용. |
 | **MSVC 툴체인** | 정적 링크되는 `isom` C++ 엔진(MSBuild) 빌드에 필요합니다. |
 
+Antigravity build에는 배포 소유 OAuth credential을 compile time에
+`EUD_ANTIGRAVITY_OAUTH_CLIENT_ID`와 `EUD_ANTIGRAVITY_OAUTH_CLIENT_SECRET`으로 주입해야 합니다.
+release workflow는 같은 이름의 GitHub Actions repository variable과 secret을 읽습니다. OAuth
+client credential은 커밋하지 않으며, 사용자 token은 계속 Windows Credential Manager에만 격리됩니다.
+
 ---
+
 
 ## 설치 (사용자)
 
 1. [GitHub Releases](https://github.com/raravel/eud-agent/releases)에서 최신
    `eud-agent_*-setup.exe`를 내려받습니다.
-2. 인스톨러를 실행합니다(사용자 단위 설치 — 관리자 권한 불필요).
-3. codex CLI가 없다면 설치합니다: `npm install -g @openai/codex`.
-4. **eud-agent**를 실행합니다. 첫 실행 시 모델과 RAG 인덱스를 설정한 뒤 패널을 표시합니다.
+2. 사용자 단위 인스톨러를 실행합니다.
+3. **eud-agent**를 실행하고 에디터 폴더, 에셋, 기본 제공자, 선택 제공자 인증/모델의 네
+   단계를 완료합니다. 나머지 네 제공자는 연결하지 않아도 됩니다.
 
 앱은 에디터의 생명주기와 독립적입니다. EUD Editor 3가 실행 중이 아니면, 브리지 하트비트가
 나타날 때까지 패널에 *"editor not connected"*가 표시됩니다.
@@ -70,17 +76,17 @@
 
 ## 사용법
 
-1. EUD Editor 3을 엽니다(에이전트가 실행 시 Lua 브리지를 자동으로 설치/갱신합니다).
-2. 패널에서 **지시문**을 입력하고 **대상 파일**을 선택합니다.
-3. 에이전트가 RAG 검색 → codex 생성을 수행한 뒤 **코드 + diff + 진단**을 보여줍니다.
-4. diff를 검토하고 **Apply**를 클릭합니다(`set`은 덮어쓰기, `neweps`는 새 eps 생성).
-5. 다음 UI 스레드 틱에 에디터 메모리에 적용됩니다 — **저장은 에디터에서 사용자가 직접 합니다.**
+1. EUD Editor 3을 엽니다. eud-agent가 Lua 브리지를 자동 설치/갱신합니다.
+2. 새 EPS 또는 Map 세션을 시작합니다. 첫 요청에서 현재 기본 제공자/모델이 고정됩니다.
+3. 근거를 확인하고 eud-tools로 수정한 뒤 preflight/build와 changeset 승인·거절을
+   수행합니다. 다섯 제공자는 같은 Rust 쓰기/검토 권한을 사용합니다.
+4. **설정 → AI 제공자**에서 새 세션 기본값을 바꿀 수 있습니다. 기존 세션과 하네스
+   retry는 생성 당시 제공자/모델을 유지하며, 제공자 변경에는 새 세션이 필요합니다.
 
-- `/compact`만 입력하면 Codex의 네이티브 대화 압축을 실행합니다. 활성 모델의 토큰
-  임계치에 도달하면 Codex가 자동으로도 압축합니다.
-- **설정 → Codex**에서 모델별 1M 컨텍스트를 켜거나 끌 수 있습니다. 선택은
-  `%appdata%\eud-agent\config.json`에 저장됩니다. 지원하지 않는 모델은 Codex가 보고한
-  기본 컨텍스트로 동작하며 다음 사용량 갱신 후 한 번 안내합니다.
+- `/compact`는 고정된 제공자가 지원하는 네이티브 또는 direct-summary 압축을 사용합니다.
+- 인증/quota/model/transport 실패 시 해당 제공자에서 중단하며 다른 제공자/모델로
+  데이터를 무음 재전송하지 않습니다.
+- Codex 전용 1M 컨텍스트 opt-in은 Codex 제공자 섹션에만 표시됩니다.
 
 > 설정/생성 가능한 텍스트 타입은 **CUI / RawText 전용**입니다. GUI 파일은 읽기 전용이며, SCA는
 > 폐기된 타입으로 절대 노출되지 않습니다.
@@ -89,66 +95,50 @@
 
 ## 아키텍처
 
-`eud-agent`는 단일 정적 링크 바이너리입니다. Rust 코어 위에 React 패널(WebView2 콘텐츠)이
-올라가고, 얇은 파일-IPC Lua 브리지로 (수정하지 않은) 에디터와 통신하며, C++ 맵 엔진이 FFI로
-링크됩니다.
+`eud-agent`는 다섯 개의 닫힌 provider adapter를 가진 단일 Tauri/Rust 권한 경계입니다.
+provider는 인증/catalog/대화/wire 변환만 소유하며 EUD 도구, 쓰기 lease, journal, review,
+rollback, preflight, build, Map 후보 권한은 모두 공통 Rust runtime에 남습니다.
 
 ```mermaid
 graph TD
-    subgraph App["eud-agent.exe (Tauri 2, 단일 정적 링크 바이너리)"]
-        Panel["React 패널 (WebView2)<br/>Tauri IPC 클라이언트"]
-        subgraph Core["Rust 코어"]
-            IPC["ipc: tauri 커맨드 + 이벤트"]
-            Orch["engine/orchestrator"]
-            Tools["tools 계층 (근거 게이트,<br/>first_principles, btn 레일)"]
-            Codex["codex_client (tokio 서브프로세스)"]
-            Rag["rag (fastembed bge-m3 + cosine)"]
-            Map["isom (FFI) + mapsafe (레일+저널)"]
-            Bio["bridge_io (파일-IPC)"]
-            Mem["memory"]
-            Boot["bootstrap (첫 실행 다운로드)"]
-        end
-    end
-    Isom[["native/isom 정적 .lib<br/>(IsomTerrain/ICU/CascLib 위 C ABI)"]]
-    subgraph Editor["EUD Editor 3 (수정 안 함)"]
-        Bridge["슬림 Lua 브리지"]
-    end
-    CodexCLI["codex exec CLI (사용자 준비)"]
-
-    Panel <-- "invoke / emit" --> IPC
-    IPC --> Orch --> Tools
-    Tools --> Codex & Rag & Map & Mem
-    Codex --> CodexCLI
-    Map --> Isom
-    Orch <-- "파일 IPC: inbox/*.cmd → outbox/*.result" --> Bio
-    Bio <-- "에디터 Data\agent\" --> Bridge
+    Panel["React 패널 + Map Agent"] --> IPC["typed Tauri IPC"]
+    IPC --> Manager["SessionEngineManager"]
+    IPC --> Service["ProviderService"]
+    Manager --> Driver["immutable session ProviderBinding"]
+    Driver --> Codex["Codex CLI app-server"]
+    Driver --> Claude["Claude Code CLI"]
+    Driver --> AG["Antigravity direct OAuth/HTTP"]
+    Driver --> Go["OpenCode Go direct three-wire HTTP"]
+    Driver --> Ollama["Ollama OpenAI 호환 HTTP"]
+    Codex & Claude & AG & Go & Ollama --> Tools["SessionToolRuntime"]
+    Tools --> Work["workspace / journal / review / build"]
+    Tools --> Map["mapsafe / isom FFI"]
+    Tools --> Bridge["파일-IPC Lua bridge → EUD Editor 3"]
 ```
 
-의존성 방향: `panel → core → {isom .lib, 에디터 브리지, codex, 데이터 디렉터리}`. 무거운
-작업(LLM, RAG, 오케스트레이션, 맵 바이너리 I/O)은 Rust/C++에 머무르고, Lua 브리지는 얇은
-파일-IPC 도구 계층으로만 남아 앱을 역으로 호출하지 않습니다.
+OMP/OpenCode runtime은 포함하지 않습니다. direct credential과 선택적 proxy API key는
+Windows Credential Manager에 저장합니다. Ollama base URL은 새 세션 binding에 고정되며,
+provider 장애가 다른 provider/model을 선택하지 않습니다.
 
-### 런타임 흐름 (지시 후 적용)
+### 런타임 흐름
 
 ```mermaid
 sequenceDiagram
     participant U as 사용자
     participant P as 패널
-    participant C as Rust 코어
-    participant L as Lua 브리지
-    participant E as EUD Editor 3
-    U->>P: 지시문 + 대상 파일
-    P->>C: invoke instruct
-    C->>C: rag 검색 (인-프로세스)
-    C->>C: codex exec (stdin으로 프롬프트)
-    C->>L: inbox GET target (diff용)
-    C-->>P: emit code {code, diff, diagnostics}
-    U->>P: Apply 클릭
-    P->>C: invoke apply {mode: set|neweps}
-    C->>L: inbox srv-id.cmd (SET / NEWEPS)
-    L->>E: UI 스레드 틱에 적용
-    L-->>C: outbox srv-id.result
-    C-->>P: emit applied | error
+    participant R as Rust engine
+    participant A as 고정 provider
+    participant T as eud-tools 권한
+    U->>P: 요청
+    P->>R: session id + 검증된 첨부/mention
+    R->>R: immutable binding 저장/검증
+    R->>A: provider-native turn
+    A->>T: inspect / ASK / write / build
+    T-->>A: bounded journaled result
+    A-->>R: answer 또는 structured result
+    R-->>P: answer + reviewable changeset
+    U->>P: accept 또는 reject
+    P->>R: exact changeset decision
 ```
 
 부트/부트스트랩 흐름, 데이터 디렉터리 레이아웃, 파일-IPC 프로토콜, 전체 설계 결정 등 더 깊은
@@ -164,9 +154,9 @@ eud-agent/
 ├── hivemind/                       # 하니스 문서 + 작업 (architecture, rules, ...)
 ├── bridge/ZZZ_10_agent_bridge.lua  # 슬림 파일-IPC 도구 계층 (에디터 측)
 ├── src-tauri/                      # Tauri 2 Rust 앱
-│   └── src/                        # ipc, engine, tools, codex_client, rag,
-│                                   # isom (FFI), mapsafe, bridge_io, memory,
-│                                   # config, bootstrap, chk
+│   └── src/                        # provider service/driver/auth/transcript,
+│                                   # engine/tools/workspace/journal/map/RAG,
+│                                   # bridge I/O, config/bootstrap/security
 ├── crates/
 │   ├── isom-sys/                   # FFI 바인딩 + build.rs (msbuild + link)
 │   └── isom/                       # isom-sys 위 안전한 Rust 래퍼
@@ -192,8 +182,8 @@ pwsh -NoProfile -File scripts\dev_run.ps1
 cargo tauri build
 ```
 
-`scripts\dev_run.ps1`은 `cargo tauri dev` 실행 전에 사전 요구 사항(codex CLI, cargo)을
-점검합니다. 커밋된 `v*` 태그를 푸시하면 `.github/workflows/publish-app.yml`이 NSIS
+`scripts\dev_run.ps1`은 Cargo/Tauri만 요구하며 provider 설치·인증은 앱이 담당합니다.
+커밋된 `v*` 태그를 푸시하면 `.github/workflows/publish-app.yml`이 NSIS
 설치 파일을 빌드·서명하고 업데이터용 `latest.json`을 게시합니다. 로컬 `tauri build`는
 이를 생성하지 않으므로 `scripts\release.ps1`은 로컬 대체 릴리스 경로로 유지됩니다.
 

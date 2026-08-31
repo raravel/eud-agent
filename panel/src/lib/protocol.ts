@@ -19,6 +19,15 @@
  * {@link isServerMessage} is an "unknown type" the client surfaces as a log
  * entry and NEVER throws on.
  */
+import {
+  PROVIDER_IDS,
+  isProviderId,
+  isProviderStatus,
+  type ProviderId,
+  type ProviderBinding,
+  type ProviderStatus,
+} from "@/providers/types";
+
 
 // ---- progress stages (core -> panel) ----------------------------------
 /**
@@ -31,6 +40,7 @@ export const PROGRESS_STAGES = [
   "rag",
   "rag_warmup",
   "codex",
+  "provider",
   "compaction",
   "task_state_warning",
   "large_context_fallback",
@@ -298,6 +308,8 @@ export interface ProgressMessage extends OptionalSessionScopedMessage {
   type: "progress";
   stage: ProgressStage;
   detail?: string;
+  provider?: ProviderId;
+  model?: string;
   /**
    * Optional percent for bootstrap progress. The Rust bootstrap emitter sends
    * this as a separate field (`progress {stage:"bootstrap", detail, pct}`),
@@ -397,27 +409,18 @@ export interface WikiMessage {
 }
 
 /**
- * `setup {...}` - first-run manifest-check snapshot (response to `setup_status`
- * and `setup_pick_editor_path`). `setup_required` gates the setup screen;
- * `error` is a stable code (e.g. "invalid_editor_folder") the panel maps to
- * user-facing text (never rendered raw).
+ * First-run editor/assets/provider snapshot. Only the selected default provider
+ * participates in the setup gate.
  */
 export interface SetupMessage {
   type: "setup";
-  /** Configured editor install root ("" until picked). */
-  editor_path: string;
-  /** True when editor_path points at a real EUD Editor 3 install. */
-  editor_valid: boolean;
-  /** True when the model + RAG index pass the manifest check. */
-  assets_ready: boolean;
-  /** True when the codex CLI was found (PATH / CODEX_CMD). */
-  codex_resolved: boolean;
-  /** True when `codex login status` reports a logged-in session. */
-  codex_authed: boolean;
-  /** True when the setup screen must run before normal operation. */
-  setup_required: boolean;
-  /** Stable error code from a rejected folder pick. */
-  error?: string;
+  editorPath: string;
+  editorValid: boolean;
+  assetsReady: boolean;
+  defaultProvider?: ProviderId | null;
+  providers: ProviderStatus[];
+  setupRequired: boolean;
+  error?: string | null;
 }
 
 // ---- sessions (session restore feature) ------------------------------
@@ -435,6 +438,8 @@ export interface SessionMeta {
   project: string;
   /** Missing only in legacy records; the Rust backend migrates it to `eps`. */
   kind?: "eps" | "map";
+  provider: ProviderId;
+  model: string;
   createdAt: number;
   lastConversationAt: number;
 }
@@ -545,14 +550,11 @@ export interface PanelLogTool {
 }
 
 /**
- * The full saved session as returned by `session_open` — {@link SessionMeta}
- * (flattened) plus the resume/reconnect fields. Field names are camelCase to
- * match the Rust `SessionRecord`. `threadId` is null until the first turn emits
- * `ThreadStarted`; `pendingRequestIds` holds the (≤1, decision C) live changeset
- * journal ids reconnected on open; `panelLog` seeds {@link PanelStore.hydrate}.
+ * Full saved session. The backend validates that metadata and the strict
+ * provider conversation variant agree.
  */
 export interface SessionRecord extends SessionMeta {
-  threadId: string | null;
+  providerBinding?: ProviderBinding;
   pendingRequestIds: string[];
   panelLog: PanelLog | null;
   contextUsage?: ContextUsage;
@@ -909,7 +911,9 @@ export function isProgressMessage(value: unknown): value is ProgressMessage {
   return (
     isObject(value) &&
     value.type === "progress" &&
-    typeof value.stage === "string"
+    typeof value.stage === "string" &&
+    (value.provider === undefined || isProviderId(value.provider)) &&
+    (value.model === undefined || typeof value.model === "string")
   );
 }
 
@@ -1012,13 +1016,27 @@ export function isSetupMessage(value: unknown): value is SetupMessage {
   return (
     isObject(value) &&
     value.type === "setup" &&
-    typeof value.editor_path === "string" &&
-    typeof value.editor_valid === "boolean" &&
-    typeof value.assets_ready === "boolean" &&
-    typeof value.codex_resolved === "boolean" &&
-    typeof value.codex_authed === "boolean" &&
-    typeof value.setup_required === "boolean" &&
-    (value.error === undefined || typeof value.error === "string")
+    typeof value.editorPath === "string" &&
+    typeof value.editorValid === "boolean" &&
+    typeof value.assetsReady === "boolean" &&
+    (value.defaultProvider === undefined ||
+      value.defaultProvider === null ||
+      isProviderId(value.defaultProvider)) &&
+    Array.isArray(value.providers) &&
+    value.providers.length === PROVIDER_IDS.length &&
+    value.providers.every(isProviderStatus) &&
+    new Set(
+      (value.providers as ProviderStatus[]).map((status) => status.provider),
+    ).size === PROVIDER_IDS.length &&
+    PROVIDER_IDS.every((provider) =>
+      (value.providers as ProviderStatus[]).some(
+        (status) => status.provider === provider,
+      ),
+    ) &&
+    typeof value.setupRequired === "boolean" &&
+    (value.error === undefined ||
+      value.error === null ||
+      typeof value.error === "string")
   );
 }
 

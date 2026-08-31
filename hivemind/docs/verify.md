@@ -49,6 +49,44 @@ stages from v1 are retired as `server/` is removed.
 - `cargo test -p eud-agent app_server_override_tests --lib` — verifies `live` hosted web search
   at app-server launch and on fresh/resumed threads while both local sandbox profiles retain
   disabled command network access.
+### Five-provider runtime focused checks
+
+- `cargo test -p eud-agent provider --lib` — closed ids/status/capability/binding validation,
+  provider-neutral tool/structured paths, no cross-provider fallback contracts.
+- `cargo test -p eud-agent claude_ --lib` — verified manifest/signature/profile environment,
+  provider-managed default with no model/effort flags, stream/init built-in-tool exclusion,
+  structured output, resume/cancel boundary fixtures.
+- `cargo test -p eud-agent opencode_go::tests --lib` — arbitrary future live id + models.dev
+  metadata join, npm-to-wire routing, protocol-specific Bearer/`x-api-key` authentication,
+  three SSE/tool/usage parsers, malformed stream refusal, and no guessed privacy metadata.
+- `cargo test -p eud-agent antigravity_ --lib` — build-time OAuth identity requirement,
+  registered desktop OAuth form/state/callback, captured Cloud Code identity/project follow-up,
+  arbitrary future catalog passthrough, live capability/request metadata, account recovery,
+  onboarding/catalog/stream/function/usage fixtures, and bounded payload metadata.
+- `cargo test -p eud-agent ollama --lib` — loopback/HTTPS base URL validation, direct model
+  descriptors, optional bearer probing, schema-free normal chat request regression, OpenAI chat
+  fields, streamed text/reasoning/tool assembly, usage, structured output, and pinned direct
+  transcripts.
+- `cargo test -p eud-agent config::tests --lib` and
+  `cargo test -p eud-agent session::tests --lib` — atomic Config v2 and lossless legacy Codex
+  binding migration, immutable provider/model metadata, addressed transcript cleanup.
+- `npx vitest run src/setup/SetupScreen.test.tsx src/components/ProviderCard.test.tsx
+  src/components/SettingsDialog.test.tsx src/components/InstructionBox.test.tsx
+  src/map/MapPromptInput.test.tsx src/lib/protocol.setup.test.ts src/lib/ipc.test.ts
+  src/App.test.tsx` from `panel/` — nullable Rust setup payload compatibility, four-step
+  selected-only gate, five-provider management, Ollama URL/direct-model/optional-key controls,
+  key clearing, attempt-bound login cancellation, wrapped stable-code normalization, Antigravity
+  stage-specific recovery copy, privacy copy, provider badges, pinned model controls, IME/chat
+  regressions, and zero raw identifiers.
+
+Live provider acceptance is mandatory for a release: isolate app data and complete bootstrap,
+main EPS read/search/ASK/write/preflight/build/review/restart/compact/cancel, Map candidate
+read/draft/failure-discard/restart, compiler, harness retry, logout/relogin, and mixed concurrency
+for each provider. Antigravity additionally requires successful Google OAuth and
+`loadCodeAssist`, verifies cancel during browser wait, and rejects browser completion before
+token/onboarding/credential persistence. Missing unpublished-endpoint access is a release blocker,
+not a skip.
+
 
 ### MainFile architecture focused checks
 
@@ -76,8 +114,8 @@ stages from v1 are retired as `server/` is removed.
   src/components/InstructionBox.test.tsx src/components/ConversationLog.test.tsx
   src/lib/ipc.test.ts src/state/store.test.ts src/App.test.tsx` — caret/Korean search,
   loading/empty/error, keyboard/IME, mixed chips, duplicate/removal, mention-only send,
-  project/session invalidation, complete draft restoration, IPC, durable hydration, history,
-  edit, rewind, and concurrent session/plan regressions.
+  project/session invalidation, complete draft restoration, IPC, durable hydration with transient
+  progress exclusion, history, edit, rewind, and concurrent session/plan regressions.
 - `cd panel && npm run build` — TypeScript and production bundle gate for the generic composer.
 
 Live Tauri/editor acceptance requires a project with a saved `OpenMapName` and rectangular

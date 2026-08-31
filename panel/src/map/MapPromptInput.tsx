@@ -15,7 +15,7 @@ import {
 } from "lucide-react";
 
 import { AgentTurnStatus } from "@/components/AgentTurnStatus";
-import { CodexPromptControls } from "@/components/CodexPromptControls";
+import { ProviderPromptControls } from "@/components/ProviderPromptControls";
 import {
   PromptInput,
   PromptInputBody,
@@ -33,8 +33,9 @@ import {
 } from "@/lib/attachments";
 import type {
   ChatAttachment,
-  CodexModelSettings,
   ContextUsage,
+  ReasoningSelection,
+  SessionModelSettings,
 } from "@/lib/ipc";
 import type { TurnState } from "@/state/store";
 
@@ -46,14 +47,17 @@ export interface MapPromptInputProps {
   hasStaleMentions: boolean;
   draftScope: string;
   contextUsage?: ContextUsage | null;
-  codexSettings?: CodexModelSettings | null;
-  codexSettingsBusy?: boolean;
+  modelSettings?: SessionModelSettings | null;
+  modelSettingsBusy?: boolean;
   onSend(text: string, attachments: ChatAttachment[]): void;
   onCancel(): void;
   onStageAttachment?(file: File): Promise<ChatAttachment>;
   onDiscardAttachment?(id: string): Promise<void>;
-  onCodexSettingsChange?(model: string, reasoningEffort: string): void;
-  onCodexSettingsReload?(): void;
+  onModelSettingsChange?(
+    model: string,
+    reasoning: ReasoningSelection | undefined,
+  ): void;
+  onModelSettingsReload?(): void;
 }
 
 export function MapPromptInput({
@@ -64,14 +68,14 @@ export function MapPromptInput({
   hasStaleMentions,
   draftScope,
   contextUsage,
-  codexSettings,
-  codexSettingsBusy = false,
+  modelSettings,
+  modelSettingsBusy = false,
   onSend,
   onCancel,
   onStageAttachment,
   onDiscardAttachment,
-  onCodexSettingsChange,
-  onCodexSettingsReload,
+  onModelSettingsChange,
+  onModelSettingsReload,
 }: MapPromptInputProps) {
   const [text, setText] = useState("");
   const [attachments, setAttachments] = useState<ChatAttachment[]>([]);
@@ -281,8 +285,8 @@ export function MapPromptInput({
             onPaste={handlePaste}
           />
         </PromptInputBody>
-        <PromptInputFooter>
-          <PromptInputTools>
+        <PromptInputFooter className="flex-wrap gap-2">
+          <PromptInputTools className="min-w-0 flex-1 flex-wrap">
             {onStageAttachment !== undefined && (
               <>
                 <input
@@ -314,16 +318,16 @@ export function MapPromptInput({
                 </PromptInputButton>
               </>
             )}
-            <CodexPromptControls
-              settings={codexSettings}
-              busy={codexSettingsBusy}
+            <ProviderPromptControls
+              settings={modelSettings}
+              busy={modelSettingsBusy}
               disabled={live || actionBusy}
               contextUsage={contextUsage}
-              onChange={onCodexSettingsChange}
-              onReload={onCodexSettingsReload}
+              onChange={onModelSettingsChange}
+              onReload={onModelSettingsReload}
             />
           </PromptInputTools>
-          <PromptInputSubmit aria-label="전송" disabled={!canSend}>
+          <PromptInputSubmit className="ml-auto" aria-label="전송" disabled={!canSend}>
             <SendIcon className="size-4" aria-hidden="true" />
             전송
           </PromptInputSubmit>

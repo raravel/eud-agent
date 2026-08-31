@@ -23,7 +23,7 @@ use crate::workspace::{
     WorkspaceManager, WorkspaceTurnRecorder,
 };
 
-const JOB_SCHEMA_VERSION: u32 = 1;
+const JOB_SCHEMA_VERSION: u32 = 2;
 const MAX_JOBS_PER_SESSION: usize = 100;
 const MAX_PROMPT_CONTEXT_BYTES: usize = 192 * 1024;
 const MAX_DELTA_DOCUMENTS: usize = 8;
@@ -87,6 +87,26 @@ pub struct HarnessDelta {
     #[serde(default)]
     pub promoted_fact_ids: Vec<String>,
 }
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HarnessProviderBinding {
+    pub provider: crate::provider::ProviderId,
+    pub model: String,
+    pub reasoning: Option<crate::provider::ReasoningSelection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+}
+
+impl Default for HarnessProviderBinding {
+    fn default() -> Self {
+        Self {
+            provider: crate::provider::ProviderId::Codex,
+            model: "default".to_string(),
+            reasoning: None,
+            base_url: None,
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -94,6 +114,8 @@ pub struct HarnessJob {
     pub schema_version: u32,
     pub id: String,
     pub session_id: String,
+    #[serde(default)]
+    pub provider_binding: HarnessProviderBinding,
     pub project: String,
     pub workspace_id: String,
     pub source_request_id: String,
@@ -126,8 +148,9 @@ impl HarnessJob {
     /// Constructs the complete durable source snapshot in one place; keeping the
     /// fields explicit prevents partial or stale post-acceptance jobs.
     #[allow(clippy::too_many_arguments)]
-    pub fn new(
+    pub fn new_with_provider(
         session_id: String,
+        provider_binding: HarnessProviderBinding,
         project: String,
         workspace_id: String,
         source_request_id: String,
@@ -152,6 +175,7 @@ impl HarnessJob {
             workspace_session_id: id.clone(),
             id,
             session_id,
+            provider_binding,
             project,
             workspace_id,
             source_request_id,
@@ -173,6 +197,32 @@ impl HarnessJob {
             retry_delta: None,
             dismissed: false,
         }
+    }
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        session_id: String,
+        project: String,
+        workspace_id: String,
+        source_request_id: String,
+        request_text: String,
+        approved_plan: Option<String>,
+        final_answer: String,
+        accepted_entries: Vec<JournalEntry>,
+        build: Option<BuildEvidence>,
+    ) -> Self {
+        Self::new_with_provider(
+            session_id,
+            HarnessProviderBinding::default(),
+            project,
+            workspace_id,
+            source_request_id,
+            request_text,
+            approved_plan,
+            final_answer,
+            accepted_entries,
+            build,
+        )
     }
 
     pub fn touch(&mut self) {

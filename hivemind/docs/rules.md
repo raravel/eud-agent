@@ -134,7 +134,6 @@ hosting, panel re-arm, and server spawning are REMOVED.
   `EUDLSP003` is a case-insensitive path collision; `EUDLSP004` is an imported unreadable
   snapshot file. Final correctness always comes from the existing mandatory `build_run`.
 
-## codex invocation (Rust, Windows) (PORTED)
 ## Isolated runtime trace tests
 
 - `trace_test_run` and `trace_suite_run` are valid only after the current request's latest
@@ -168,9 +167,85 @@ hosting, panel re-arm, and server spawning are REMOVED.
   values). Write the record sequence last. The reader MUST reject torn records, duplicate active
   buffers, malformed headers, overflowed passing runs, and missing/lost markers.
 
+## AI provider runtime (Rust, Windows)
 
-- NEVER spawn bare `"codex"`. ALWAYS resolve the app-managed executable first and
-  fall back to the `which` crate (fail fast if unresolved).
+- Provider ids are a closed Rust enum with exactly `codex`, `claude-code`, `antigravity`,
+  `opencode-go`, and `ollama`. Dynamic providers, OMP/OpenCode runtimes, executable substitution,
+  and third-party inference proxies other than the explicitly configured Ollama endpoint are
+  forbidden.
+- A session atomically copies the global default provider/model/reasoning on first request. Its
+  provider is immutable across reload, rename, rewind, compaction, review, compiler, harness,
+  retry, and application restart. Global settings affect only new sessions.
+- Provider, model, conversation-state variant, session metadata, compiler snapshot, and harness
+  snapshot MUST agree. A mismatch fails closed; it never selects another provider or model.
+- Authentication, quota, rate limit, overload, removed model, protocol drift, logout, and
+  transport failure MUST NOT send prompts, attachments, source, or tool results to another
+  provider/model. There is no silent cross-provider/model fallback.
+- All five providers use the same `SessionToolRuntime`, evidence gate, write coordinator,
+  workspace, journal, changeset review, rollback, preflight, build rail, ASK coordinator, and Map
+  candidate authority. Provider adapters never gain filesystem, shell, editor IPC, or CHK access.
+- Codex and Claude Code use app-owned executable/config/credential roots. Ambient credentials are
+  copied only by explicit import; settings, instructions, hooks, plugins, MCP, memory, and sessions
+  are never imported. Import never modifies or logs out the ambient profile.
+- Claude Code runs official print mode with built-in tools disabled, one strict request-owned
+  `eud-tools` MCP config, no Chrome/slash commands, app-owned cwd, and subscription OAuth only.
+- Claude Code exposes only a provider-managed default behavior because its CLI has no
+  machine-readable model discovery command. Never ship alias/model/reasoning tables or parse human
+  help text. Omit `--model` and `--effort`; Claude Code owns the current account/deployment choice.
+- Antigravity uses the registered desktop Authorization Code flow with cryptographic state and a
+  loopback callback: prefer port 51121, fall back to an ephemeral port, and use the exact token
+  exchange fields accepted by the compatibility client. Do not add an unregistered PKCE variant.
+  OAuth client credentials are never committed. Every Antigravity-capable build injects its
+  deployment-owned identity through `EUD_ANTIGRAVITY_OAUTH_CLIENT_ID` and
+  `EUD_ANTIGRAVITY_OAUTH_CLIENT_SECRET`; missing either value returns
+  `provider_oauth_client_unconfigured`. The browser reports completion only after token exchange,
+  Cloud Code onboarding, and credential persistence succeed. Every onboarding, catalog, and
+  inference request uses the captured `antigravity/hub` compatibility identity.
+  `fetchAvailableModels` is the sole model authority: expose every non-internal valid entry using
+  its provider-supplied id, display name, ordering, image/thinking flags, thinking budget, context
+  window, output limit, and provider metadata. The request uses that exact selected id and current
+  live metadata. Local model names, allowlists, family collapse tables, suffix routing, fixed
+  capability profiles, model enums, and deny lists are forbidden.
+  Token exchange, Cloud Code unauthorized, account-ineligible, onboarding, and Windows credential
+  store failures remain distinct recovery codes. Panel-side `Error:`/IPC wrappers are normalized
+  back to the closed code before copy lookup; unknown Antigravity failures use protocol-recovery
+  copy and never the weightless generic fallback. There is no Gemini API substitution.
+- OpenCode Go catalog authority is the exact join of live `/zen/go/v1/models` availability/order
+  and OpenCode's machine-readable `models.dev` `opencode-go` metadata. Wire selection comes only
+  from provider/model `npm` metadata mapped to the three implemented adapters. Local model ids,
+  names, wire tables, vision/privacy/retention profiles, and prefix/suffix inference are forbidden.
+  Unknown npm dialects and missing metadata are hidden rather than guessed.
+  Authentication follows the selected wire contract: `/responses` and `/chat/completions` use
+  `Authorization: Bearer`, while Anthropic-compatible `/messages` uses `x-api-key`.
+- Ollama uses only its documented OpenAI-compatible `/v1/chat/completions` and `/v1/models`
+  contracts. The default base URL is `http://localhost:11434/v1`; plain HTTP is accepted only for
+  loopback hosts, while remote endpoints require HTTPS. Userinfo, query strings, fragments, and
+  control characters are rejected. The normalized base URL is copied into each new session,
+  compiler, and harness binding so later global endpoint changes cannot reroute existing work.
+  Model ids are direct user input and are never enumerated into the UI. Streaming, tools, vision,
+  JSON Schema output, and reasoning controls are sent according to the documented compatibility
+  surface; a selected model that lacks one of them fails on Ollama and never triggers fallback.
+- OpenCode Go API keys, optional Ollama proxy API keys, and Antigravity tokens live only in Windows
+  Credential Manager. Tokens, keys, email, project ids, and OAuth bodies never enter
+  config/session/panel/journal/log/error.
+- Direct-provider transcripts are strict, bounded, hash-verified atomic generations addressed by
+  validated session id. Cancellation publishes no partial assistant generation; rewind/delete
+  touches only the addressed session.
+- Model capabilities are explicit. Unsupported vision/reasoning/structured output is rejected
+  before transport; unknown capability and privacy metadata are never guessed.
+- Structured compiler/harness output is validated in Rust against the exact JSON Schema. JSON
+  substrings in prose are not accepted. Compiler and harness inherit source provider/model, and
+  retry uses the job snapshot.
+- Setup requires editor, assets, one selected default provider, that provider's ready status, and
+  an explicit model. The other four providers are optional and cannot gate normal entry.
+- Provider install/login/catalog locks are per provider and separate from session turn locks.
+  Different-provider read sessions overlap; the project write coordinator remains the only shared
+  mutation authority. Logout is rejected while that provider owns a turn or harness attempt.
+
+## Codex provider variant (Rust, Windows)
+
+- NEVER spawn bare `"codex"`. Resolve the configured override, complete app-managed distribution,
+  then PATH, and always set app-owned `CODEX_HOME`; unresolved or incomplete distributions fail.
 - App-server launch cwd is app-owned, never the repository or process launch dir. Project
   turns use `%appdata%\eud-agent\workspaces\.sessions\<project-id>\<session-id>`; the
   canonical accepted workspace is never a writable Codex cwd.
@@ -423,6 +498,11 @@ hosting, panel re-arm, and server spawning are REMOVED.
 - Panel ↔ core is **Tauri IPC** (`invoke` + events) only — NO localhost socket, token, or
   Origin check, and NO `server.ready` (Decision 11). Reasoning renders dim/collapsible,
   answers prominent; NEVER render raw `agent_event` kind identifiers as user-facing text.
+- Rust IPC view structs omit absent optional fields with
+  `#[serde(skip_serializing_if = "Option::is_none")]`. Panel guards also accept `null` from older
+  binaries at the IPC boundary and normalize it through nullish handling. A nullable optional
+  field must never demote a valid `setup` payload to `Unknown IPC message payload`; model/RAG
+  warmup never holds the bootstrap screen hostage.
 - `ask` MUST be non-mutating and session-scoped. It may wait only on its per-session response
   channel, NEVER while holding the session engine mutex. Every question id is unique; every
   question must be answered; single-choice cardinality and multi-choice bounds are validated

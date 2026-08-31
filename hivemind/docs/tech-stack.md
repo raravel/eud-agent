@@ -23,27 +23,29 @@ happy-dom ^16.8.1.
 
 ## Active Rust Stack (`src-tauri/Cargo.toml`)
 - tauri 2 (stable) — desktop shell, WebView2 host, IPC, bundler/updater
-- tauri-plugin-shell 2 — spawn the codex CLI subprocess
-- tauri-plugin-dialog 2 — first-run editor-path picker
-- tauri-winrt-notification 0.7 — branded Windows toast delivery and in-process activation callback
-- windows-registry 0.5 — registers the app's per-user AppUserModelID display name and icon
-- tokio 1 — async runtime (codex subprocess, file-IPC polling, downloads)
-- fastembed 5.15 — bge-m3 ONNX embeddings (query-time); pulls `ort` (pykeio ONNX RT)
-- rusqlite 0.32 — read the prebuilt RAG index (vectors + text + source metadata)
-- reqwest 0.12 — bootstrap downloads (RAG index and version-matched Codex CLI/runtime helpers)
-- sha2 0.10 — download and bundled adapter integrity verification
-- base64 0.22 — EPSNAPSHOT UTF-8 project-path manifest decoding
-- uuid 1 — collision-safe snapshot and analysis-directory request ownership
-- parking_lot 0.12 — serialized preflight/analyzer process state
-- windows-sys 0.59 — Job Object process-tree containment plus the Windows `MessageBeep` default
-  notification sound used independently from native toast delivery
-- similar 2 — unified diff (replaces Python difflib)
-- image 0.25.10 with `default-features=false` and only png/jpeg/webp/gif — bounded Map Agent
-  attachment metadata/decode, first-frame GIF normalization, Lanczos3 aspect-preserving resize
-- which 8 — resolve codex and optional analyzer `node.exe` executables
-- serde 1 + serde_json 1 — config/IPC/manifest/framed adapter payloads
-- anyhow 1 + thiserror 1 — error handling
-- bindgen 0.70 — generate FFI from `native/isom/isom_capi.h` (in `isom-sys`)
+- tauri-plugin-shell 2 — desktop shell integration; provider processes use Rust `Command`
+- tauri-plugin-dialog 2 — first-run editor path and trusted attachment/map pickers
+- tauri-winrt-notification 0.7 — branded Windows attention notifications
+- windows-registry 0.5 — per-user AppUserModelID
+- tokio 1 — per-provider HTTP streams, Codex/Claude subprocesses, OAuth callback, IPC polling
+- fastembed 5.15 — bge-m3 ONNX embeddings
+- rusqlite 0.32 — read-only prebuilt RAG index
+- reqwest 0.12 with rustls — provider OAuth/catalog/inference and verified asset/CLI downloads
+- sha2 0.10 — release, transcript-generation, source, and attachment integrity
+- base64 0.22 — provider image blocks, OAuth state material, and bridge payloads
+- uuid 1 — request/session/OAuth attempt ownership
+- parking_lot 0.12 — short synchronous service/runtime state
+- windows-sys 0.59 — Credential Manager, protected ACLs, Authenticode `WinVerifyTrust`, Job
+  Objects, process discovery/memory, suspended-process control, background window input, and
+  notification sound
+- jsonschema 0.18 — Rust authority validation for compiler/harness structured output
+- zeroize 1 — API key/token temporary buffer clearing
+- similar 2 — unified diff
+- image 0.25.10 with minimal png/jpeg/webp/gif codecs — bounded attachment/Map decode
+- which 8 — configured/app-managed/PATH CLI and optional analyzer resolution
+- serde 1 + serde_json 1 — strict provider/config/session/transcript/wire contracts
+- anyhow 1 + thiserror 1 — error boundaries
+- bindgen 0.70 — native isom C ABI generation
 
 Map import uses existing `sha2`, `serde`, `parking_lot`, `uuid`, Tauri dialog/window APIs, and the
 existing statically linked isom CHK/render/mapedit surface. No second map parser, copy engine, or
@@ -51,11 +53,14 @@ frontend rendering stack is introduced. External container bytes are streamed wi
 into `%localappdata%\eud-agent\map_imports\blobs`; small strict project metadata stays under
 `%appdata%\eud-agent\map_candidates\<project-id>\import-palette.json`.
 
-Runtime toolchain: each saved session owns an official Codex CLI app-server client and ephemeral
-loopback eud-tools MCP endpoint. Two strict elevated Windows profiles select read-only or
-lease-owner write access to that session's isolated workspace; both disable sandboxed command
-network access and avoid repository instructions. Codex hosted web search is explicitly `live`
-and remains separate from that local process boundary.
+Runtime provider set is closed: official Codex app-server and Claude Code subscription CLI use
+app-owned profiles; Antigravity, OpenCode Go, and Ollama use direct Rust HTTP/SSE adapters.
+OpenCode Go joins its live account catalog with OpenCode's public `models.dev` machine metadata;
+Ollama uses a user-entered OpenAI-compatible base URL and model id without UI catalog enumeration.
+Every variant shares `SessionToolRuntime` and an immutable session binding. Direct and optional
+proxy secrets use Windows Credential Manager; direct histories use atomic hashed generations.
+No OMP SDK/RPC, OpenCode server, Node provider runtime, unconfigured proxy, or silent
+provider/model fallback is present.
 
 ## Build Artifacts
 - tailwindcss v4.x (from `panel/dist` build via `@tailwindcss/vite`) — ground truth for
@@ -85,9 +90,10 @@ and remains separate from that local process boundary.
 - In-editor WebView2 hosting + server-spawn lifecycle in the Lua bridge.
 
 ## Project Structure
-- `src-tauri/` — Tauri app: session engine manager, project write coordinator, per-session tools/
-  MCP/Codex drivers, canonical/session workspaces, journal, RAG, mapsafe, bridge I/O, preflight,
-  memory, config, bootstrap, and CHK.
+- `src-tauri/` — Tauri app: provider service/auth/CLI/direct-wire drivers/transcripts, session
+  engine, provider-neutral tools/write coordinator/workspaces/journal/review, RAG/mapsafe/bridge/
+  preflight/memory/config/bootstrap/CHK, plus the dependency-free Windows x86 trace runner and
+  source-controlled `tests/**/*.tests.eps` suite discovery.
 - `crates/isom-sys`, `crates/isom` — FFI bindings + safe wrapper for the C++ engine.
 - `native/isom/` — vendored C++ + C ABI shim.
 - `native/trace_injector.rs` — dependency-free x86 helper compiled and embedded by `src-tauri/build.rs`;

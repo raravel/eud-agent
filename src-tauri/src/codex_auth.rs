@@ -17,7 +17,7 @@ use std::process::{Command, Stdio};
 
 use serde::{Deserialize, Serialize};
 
-use crate::codex_client::resolve_codex_cmd;
+use crate::codex_client::{ensure_codex_profile, resolve_codex_cmd_for};
 
 /// Suppress the console window when spawning the `codex.cmd` batch shim from the
 /// windowless GUI app. Without `CREATE_NO_WINDOW` (0x0800_0000) Windows opens a
@@ -49,54 +49,51 @@ impl CodexAuthState {
     }
 }
 
-/// Probe codex auth with `codex login status`. Exit 0 means logged in; a resolve
-/// failure reports `resolved: false` so the setup screen can guide installation.
-pub fn login_status() -> CodexAuthState {
-    let codex = match resolve_codex_cmd() {
-        Ok(path) => path,
-        Err(error) => return CodexAuthState::unresolved(error.to_string()),
-    };
+fn command_for(dirs: &crate::config::DataDirs) -> Result<Command, String> {
+    ensure_codex_profile(dirs)?;
+    let config = dirs
+        .load_config()
+        .map_err(|_| "provider_protocol_changed".to_string())?;
+    let executable =
+        resolve_codex_cmd_for(dirs, &config).map_err(|_| "provider_not_installed".to_string())?;
+    let mut command = Command::new(executable);
+    command.env("CODEX_HOME", dirs.codex_home_dir());
+    Ok(command)
+}
 
-    let mut command = Command::new(&codex);
+pub fn login_status(dirs: &crate::config::DataDirs) -> CodexAuthState {
+    let mut command = match command_for(dirs) {
+        Ok(command) => command,
+        Err(detail) => return CodexAuthState::unresolved(detail),
+    };
     command.args(["login", "status"]).stdin(Stdio::null());
     hide_console(&mut command);
     match command.output() {
         Ok(output) => {
-            let authed = output.status.success();
-            let stream = if authed {
-                &output.stdout
-            } else {
-                &output.stderr
-            };
-            let detail = first_line(&String::from_utf8_lossy(stream)).unwrap_or_else(|| {
-                if authed {
-                    "logged in".to_string()
-                } else {
-                    "not logged in".to_string()
-                }
-            });
+            let credential = dirs.codex_home_dir().join("auth.json");
+            let authed = output.status.success()
+                && credential.is_file()
+                && crate::provider_secrets::harden_private_path(&credential).is_ok();
             CodexAuthState {
                 resolved: true,
                 authed,
-                detail,
+                detail: if authed {
+                    "ready".to_string()
+                } else {
+                    "provider_not_authenticated".to_string()
+                },
             }
         }
-        Err(error) => CodexAuthState {
+        Err(_) => CodexAuthState {
             resolved: true,
             authed: false,
-            detail: format!("could not run codex login status: {error}"),
+            detail: "provider_transport_closed".to_string(),
         },
     }
 }
 
-/// Launch the interactive ChatGPT OAuth login (`codex login`), which opens a
-/// browser. Spawned DETACHED — codex runs its own loopback callback server and
-/// writes the auth on success, so this returns as soon as it is launched and the
-/// panel polls [`login_status`] until it flips. The child is intentionally not
-/// awaited and not killed on drop.
-pub fn login_oauth() -> Result<(), String> {
-    let codex = resolve_codex_cmd().map_err(|error| error.to_string())?;
-    let mut command = Command::new(&codex);
+pub fn login_oauth(dirs: &crate::config::DataDirs) -> Result<(), String> {
+    let mut command = command_for(dirs)?;
     command
         .arg("login")
         .stdin(Stdio::null())
@@ -105,124 +102,68 @@ pub fn login_oauth() -> Result<(), String> {
     hide_console(&mut command);
     command
         .spawn()
-        .map(|_child| ())
-        .map_err(|error| format!("failed to launch codex login: {error}"))
+        .map(|_| ())
+        .map_err(|_| "provider_transport_closed".to_string())
 }
 
-/// Log in with an API key piped to `codex login --with-api-key` over stdin (never
-/// argv). Awaits completion and re-probes status, so the returned state reflects
-/// the post-login session.
-pub fn login_api_key(api_key: &str) -> Result<CodexAuthState, String> {
+pub fn login_api_key(
+    dirs: &crate::config::DataDirs,
+    api_key: &str,
+) -> Result<CodexAuthState, String> {
     let key = api_key.trim();
     if key.is_empty() {
-        return Err("API key is empty".to_string());
+        return Err("provider_credential_missing".to_string());
     }
-    let codex = resolve_codex_cmd().map_err(|error| error.to_string())?;
-
-    let mut command = Command::new(&codex);
+    let mut command = command_for(dirs)?;
     command
         .args(["login", "--with-api-key"])
         .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
     hide_console(&mut command);
     let mut child = command
         .spawn()
-        .map_err(|error| format!("failed to spawn codex login: {error}"))?;
-
+        .map_err(|_| "provider_transport_closed".to_string())?;
     {
         let mut stdin = child
             .stdin
             .take()
-            .ok_or_else(|| "codex login stdin was not piped".to_string())?;
+            .ok_or_else(|| "provider_transport_closed".to_string())?;
         stdin
             .write_all(key.as_bytes())
-            .map_err(|error| format!("failed to write API key to codex login: {error}"))?;
-        // Drop closes stdin (EOF) so `--with-api-key` stops reading.
+            .map_err(|_| "provider_transport_closed".to_string())?;
     }
-
-    let output = child
-        .wait_with_output()
-        .map_err(|error| format!("codex login did not complete: {error}"))?;
-
-    if output.status.success() {
-        Ok(login_status())
+    let status = child
+        .wait()
+        .map_err(|_| "provider_transport_closed".to_string())?;
+    if status.success() {
+        Ok(login_status(dirs))
     } else {
-        Err(first_line(&String::from_utf8_lossy(&output.stderr))
-            .unwrap_or_else(|| "codex login with API key failed".to_string()))
+        Err("provider_not_authenticated".to_string())
     }
 }
 
-/// First non-empty trimmed line of a command's output (the user-facing summary).
-fn first_line(text: &str) -> Option<String> {
-    text.lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty())
-        .map(str::to_string)
-}
-
-/// Progress sink for the Codex distribution download: the setup screen shows a spinner
-/// (`codexBusy`) rather than a progress bar, so install progress is dropped.
-struct NoopEmitter;
-
-impl crate::bootstrap::ProgressEmitter for NoopEmitter {
-    fn emit(&self, _stage: &str, _pct: u8, _detail: &str) {}
-}
-
-/// Download + install the version-matched Codex CLI and runtime helpers, then report the
-/// refreshed login state. After placement `resolve_codex_cmd` finds the complete
-/// distribution without a restart.
-#[tauri::command]
-pub async fn codex_install(
-    state: tauri::State<'_, crate::ipc::BridgeManaged>,
-) -> Result<CodexAuthState, String> {
-    let dirs = state.dirs().clone();
-    crate::bootstrap::ensure_codex(&dirs, &NoopEmitter)
-        .await
-        .map_err(|error| format!("{error:#}"))?;
-    tauri::async_runtime::spawn_blocking(login_status)
-        .await
-        .map_err(|error| error.to_string())
-}
-
-/// Report codex login state (resolved + authenticated) for the setup gate.
-#[tauri::command]
-pub async fn codex_login_status() -> Result<CodexAuthState, String> {
-    tauri::async_runtime::spawn_blocking(login_status)
-        .await
-        .map_err(|error| error.to_string())
-}
-
-/// Launch the ChatGPT OAuth login; the panel then polls `codex_login_status`.
-#[tauri::command]
-pub async fn codex_login_start() -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(login_oauth)
-        .await
-        .map_err(|error| error.to_string())?
-}
-
-/// Log in with an API key (read from stdin) and return the refreshed state.
-/// The JS arg is `key` (single word) to avoid camelCase/snake_case ambiguity.
-#[tauri::command]
-pub async fn codex_login_with_api_key(key: String) -> Result<CodexAuthState, String> {
-    tauri::async_runtime::spawn_blocking(move || login_api_key(&key))
-        .await
-        .map_err(|error| error.to_string())?
+pub fn logout(dirs: &crate::config::DataDirs) -> Result<(), String> {
+    let mut command = command_for(dirs)?;
+    command
+        .arg("logout")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    hide_console(&mut command);
+    let status = command
+        .status()
+        .map_err(|_| "provider_transport_closed".to_string())?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err("provider_not_authenticated".to_string())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn first_line_skips_blank_leading_lines() {
-        assert_eq!(
-            first_line("\n  \nLogged in using ChatGPT\nextra"),
-            Some("Logged in using ChatGPT".to_string())
-        );
-        assert_eq!(first_line("   "), None);
-        assert_eq!(first_line(""), None);
-    }
 
     #[test]
     fn unresolved_state_is_not_authed() {
@@ -234,8 +175,13 @@ mod tests {
 
     #[test]
     fn empty_api_key_is_rejected_before_spawning() {
-        // Guards the stdin-only contract: a blank key never reaches codex.
-        assert_eq!(login_api_key("   "), Err("API key is empty".to_string()));
+        let base = std::env::temp_dir().join(format!("eud-codex-auth-{}", uuid::Uuid::new_v4()));
+        let dirs = crate::config::DataDirs::from_bases(&base.join("roaming"), &base.join("local"));
+        assert_eq!(
+            login_api_key(&dirs, "   "),
+            Err("provider_credential_missing".to_string())
+        );
+        std::fs::remove_dir_all(base).ok();
     }
 
     #[test]

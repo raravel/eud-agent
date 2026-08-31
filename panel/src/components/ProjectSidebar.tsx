@@ -90,10 +90,18 @@ export function ProjectSidebar({
   if (!open) return null;
 
   return (
+    <>
+      <button
+        type="button"
+        tabIndex={-1}
+        aria-hidden="true"
+        className="fixed inset-x-0 bottom-0 top-14 z-10 hidden cursor-default bg-black/50 backdrop-blur-[1px] max-[1140px]:block"
+        onClick={onClose}
+      />
     <aside
       aria-label="프로젝트 도구"
       style={{ width }}
-      className="relative z-20 flex h-full shrink-0 flex-col border-l border-border bg-background shadow-sm max-[1140px]:fixed max-[1140px]:inset-y-0 max-[1140px]:right-0 max-[1140px]:shadow-2xl"
+      className="relative z-20 flex h-full max-w-full shrink-0 flex-col border-l border-border bg-background shadow-sm max-[1140px]:fixed max-[1140px]:bottom-0 max-[1140px]:right-0 max-[1140px]:top-14 max-[1140px]:h-auto max-[1140px]:shadow-2xl"
     >
       <header className="border-b border-border bg-card/40">
         <div className="flex min-h-12 items-center gap-2 px-3">
@@ -193,5 +201,6 @@ export function ProjectSidebar({
         }}
       />
     </aside>
+    </>
   );
 }

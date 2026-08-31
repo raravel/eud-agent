@@ -1,27 +1,14 @@
-/**
- * First-run setup overlay (EUD-120, EUD-132).
- *
- * The setup screen is a full-screen dialog with two steps. The pick step is
- * shown while the editor path is missing/invalid and drives the native folder
- * picker through the backend. The download step renders Korean setup text and
- * an accessible progressbar while bootstrap progress is active; error mode
- * renders the bootstrap error and a retry control, with no progress bar.
- *
- * Contract:
- *   export interface SetupScreenProps {
- *     editorValid: boolean;
- *     pickError: string | null;
- *     onPick: () => void;
- *     view: BootstrapView;
- *     error: string | null;
- *     onRetry: () => void;
- *   }
- *   export function SetupScreen(props): JSX.Element;
- */
-import { describe, it, expect, vi } from "vitest";
-import { fireEvent, render, screen } from "@testing-library/react";
-import { SetupScreen } from "@/setup/SetupScreen";
+import { render, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { describe, expect, it, vi } from "vitest";
+
 import type { BootstrapView } from "@/setup/bootstrap";
+import { SetupScreen } from "@/setup/SetupScreen";
+import type {
+  ProviderId,
+  ProviderModel,
+  ProviderStatus,
+} from "@/providers/types";
 
 const idleView: BootstrapView = {
   pct: null,
@@ -29,186 +16,180 @@ const idleView: BootstrapView = {
   phase: "downloading",
 };
 
-function renderScreen(overrides: Partial<Parameters<typeof SetupScreen>[0]>) {
+const statuses: ProviderStatus[] = [
+  {
+    provider: "codex",
+    availability: "ready",
+    selectedAsDefault: true,
+    canInstall: true,
+    canImport: true,
+    experimental: false,
+  },
+  {
+    provider: "claude-code",
+    availability: "needs-authentication",
+    selectedAsDefault: false,
+    canInstall: true,
+    canImport: true,
+    experimental: false,
+  },
+  {
+    provider: "antigravity",
+    availability: "needs-authentication",
+    selectedAsDefault: false,
+    canInstall: false,
+    canImport: false,
+    experimental: true,
+    detailCode: "provider_credential_missing",
+  },
+  {
+    provider: "opencode-go",
+    availability: "needs-credential",
+    selectedAsDefault: false,
+    canInstall: false,
+    canImport: false,
+    experimental: false,
+  },
+  {
+    provider: "ollama",
+    availability: "unavailable",
+    selectedAsDefault: false,
+    canInstall: false,
+    canImport: false,
+    experimental: false,
+    detailCode: "provider_transport_closed",
+  },
+];
+
+const codexModel: ProviderModel = {
+  provider: "codex",
+  model: "gpt-test",
+  displayName: "GPT Test",
+  description: "test",
+  isDefault: true,
+  capabilities: {
+    vision: true,
+    toolCalls: true,
+    strictStructuredOutput: true,
+    reasoningLevels: ["medium", "high"],
+    nativeCompaction: true,
+    hostedWebSearch: true,
+  },
+};
+
+const noop = vi.fn(async () => {});
+
+function renderScreen(
+  overrides: Partial<Parameters<typeof SetupScreen>[0]> = {},
+) {
   return render(
     <SetupScreen
-      editorValid={true}
+      editorValid
       pickError={null}
       onPick={vi.fn()}
       view={idleView}
       error={null}
       onRetry={vi.fn()}
+      assetsReady
+      providers={statuses}
+      defaultProvider="codex"
+      models={{ codex: [codexModel] }}
+      selectedModels={{ codex: "gpt-test" }}
+      selectedReasoning={{ codex: { level: "medium" } }}
+      providerErrors={{}}
+      onSelectProvider={noop}
+      onProviderInstall={noop}
+      onProviderLogin={noop}
+      onProviderLoginCancel={noop}
+      onProviderImport={noop}
+      onProviderApiKey={noop}
+      onProviderBaseUrl={noop}
+      onProviderLogout={noop}
+      onProviderRefresh={noop}
+      onProviderModelChange={noop}
       {...overrides}
     />,
   );
 }
 
-describe("SetupScreen", () => {
-  it("renders determinate setup progress with the visible label", () => {
-    const view: BootstrapView = {
-      pct: 45,
-      label: "bge-m3 모델 다운로드 45%",
-      phase: "downloading",
-    };
-
-    renderScreen({ view });
-
-    expect(
-      screen.getByRole("dialog", { name: "최초 실행 설정" }),
-    ).toBeInTheDocument();
-    const progress = screen.getByRole("progressbar");
-    expect(progress).toHaveAttribute("aria-valuenow", "45");
-    expect(screen.getByText("bge-m3 모델 다운로드 45%")).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "다시 시도" })).not.toBeInTheDocument();
-  });
-
-  it("renders indeterminate setup progress without aria-valuenow", () => {
-    renderScreen({ view: idleView });
-
-    const progress = screen.getByRole("progressbar");
-    expect(progress).toHaveAttribute("aria-busy", "true");
-    expect(progress).not.toHaveAttribute("aria-valuenow");
-  });
-
-  it("renders an error with a retry button that calls onRetry", () => {
-    const onRetry = vi.fn();
-    const view: BootstrapView = {
-      pct: null,
-      label: "error: 네트워크 오류",
-      phase: "error",
-    };
-
-    renderScreen({ view, error: "디스크 공간 부족", onRetry });
-
-    expect(screen.getByText("디스크 공간 부족")).toBeInTheDocument();
-    expect(screen.queryByRole("progressbar")).not.toBeInTheDocument();
-
-    fireEvent.click(screen.getByRole("button", { name: "다시 시도" }));
-    expect(onRetry).toHaveBeenCalledTimes(1);
-  });
-
-  it("shows the editor-folder pick step before anything downloads", () => {
+describe("SetupScreen five-provider gate", () => {
+  it("shows the editor picker before assets or providers", async () => {
     const onPick = vi.fn();
-
-    renderScreen({ editorValid: false, onPick });
-
+    renderScreen({ editorValid: false, assetsReady: false, onPick });
+    await userEvent.click(screen.getByRole("button", { name: "폴더 선택" }));
+    expect(onPick).toHaveBeenCalledOnce();
     expect(
-      screen.getByText("EUD Editor 3 설치 폴더를 선택해 주세요."),
-    ).toBeInTheDocument();
-    expect(screen.queryByRole("progressbar")).not.toBeInTheDocument();
-
-    fireEvent.click(screen.getByRole("button", { name: "에디터 폴더 선택" }));
-    expect(onPick).toHaveBeenCalledTimes(1);
-  });
-
-  it("maps the invalid_editor_folder code to Korean text, never raw", () => {
-    renderScreen({ editorValid: false, pickError: "invalid_editor_folder" });
-
-    expect(
-      screen.getByText(/Data\\Lua\\TriggerEditor 폴더가 있는 설치 폴더/),
-    ).toBeInTheDocument();
-    expect(screen.queryByText("invalid_editor_folder")).not.toBeInTheDocument();
-  });
-
-  it("marks step 1 current while picking and step 2 current while downloading", () => {
-    const { unmount } = renderScreen({ editorValid: false });
-    expect(
-      screen.getByText("에디터 폴더").closest("li"),
-    ).toHaveAttribute("aria-current", "step");
-    expect(
-      screen.getByText("에셋 다운로드").closest("li"),
-    ).not.toHaveAttribute("aria-current");
-    unmount();
-
-    renderScreen({ editorValid: true });
-    expect(
-      screen.getByText("에셋 다운로드").closest("li"),
-    ).toHaveAttribute("aria-current", "step");
-    expect(
-      screen.getByText("에디터 폴더").closest("li"),
-    ).not.toHaveAttribute("aria-current");
-  });
-
-  it("prefers the pick step over download UI while the path is invalid", () => {
-    // A stale bootstrap error must not hide the picker (the pick step is the
-    // prerequisite; retry without a valid path would fail again).
-    renderScreen({ editorValid: false, error: "디스크 공간 부족" });
-
-    expect(
-      screen.getByRole("button", { name: "에디터 폴더 선택" }),
-    ).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "다시 시도" })).not.toBeInTheDocument();
-  });
-});
-
-// ---- step 3: codex login (editor + assets done, codex not yet authed) ------
-describe("SetupScreen — codex login step", () => {
-  const codexProps = {
-    editorValid: true,
-    assetsReady: true,
-    codexResolved: true,
-    codexAuthed: false,
-  };
-
-  it("shows the codex login step with both auth paths once assets are ready", () => {
-    renderScreen(codexProps);
-
-    expect(
-      screen.getByRole("button", { name: "ChatGPT로 로그인" }),
-    ).toBeInTheDocument();
-    expect(screen.getByLabelText("OpenAI API 키")).toBeInTheDocument();
-    // The download progressbar must NOT be shown (assets are done).
-    expect(screen.queryByRole("progressbar")).not.toBeInTheDocument();
-    // Step 3 is the current step.
-    expect(
-      screen.getByText("codex 로그인").closest("li"),
-    ).toHaveAttribute("aria-current", "step");
-  });
-
-  it("launches OAuth and submits the API key through the callbacks", () => {
-    const onCodexOAuth = vi.fn();
-    const onCodexApiKey = vi.fn();
-    renderScreen({ ...codexProps, onCodexOAuth, onCodexApiKey });
-
-    fireEvent.click(screen.getByRole("button", { name: "ChatGPT로 로그인" }));
-    expect(onCodexOAuth).toHaveBeenCalledTimes(1);
-
-    fireEvent.change(screen.getByLabelText("OpenAI API 키"), {
-      target: { value: "  sk-test-key  " },
-    });
-    fireEvent.click(screen.getByRole("button", { name: "API 키로 로그인" }));
-    // The key is trimmed before it reaches the backend (stdin-only contract).
-    expect(onCodexApiKey).toHaveBeenCalledWith("sk-test-key");
-  });
-
-  it("offers an install button (not manual guidance) when codex is not found", () => {
-    const onCodexInstall = vi.fn();
-    renderScreen({ ...codexProps, codexResolved: false, onCodexInstall });
-
-    const install = screen.getByRole("button", { name: "codex 설치" });
-    expect(install).toBeInTheDocument();
-    // The login controls are hidden until codex is installed/resolved.
-    expect(
-      screen.queryByRole("button", { name: "ChatGPT로 로그인" }),
+      screen.queryByRole("heading", { name: "사용할 AI 제공자 선택" }),
     ).not.toBeInTheDocument();
-
-    fireEvent.click(install);
-    expect(onCodexInstall).toHaveBeenCalledTimes(1);
   });
 
-  it("shows an installing spinner while the codex download is in flight", () => {
-    renderScreen({ ...codexProps, codexResolved: false, codexBusy: true });
-
-    expect(
-      screen.getByRole("button", { name: "codex 설치 중…" }),
-    ).toBeDisabled();
+  it("renders determinate asset progress as step two", () => {
+    renderScreen({
+      assetsReady: false,
+      view: { pct: 45, label: "문서 인덱스 다운로드", phase: "downloading" },
+    });
+    expect(screen.getByRole("progressbar", { name: "에셋 다운로드" })).toHaveAttribute(
+      "aria-valuenow",
+      "45",
+    );
+    expect(screen.getByText("문서 인덱스 다운로드")).toBeInTheDocument();
   });
 
-  it("disables the login controls while a login attempt is in flight", () => {
-    renderScreen({ ...codexProps, codexBusy: true });
-
+  it("renders one large provider select and only the selected connection panel", () => {
+    renderScreen();
+    const select = screen.getByRole("combobox", {
+      name: "기본 AI 제공자 선택",
+    });
+    expect(select).toHaveValue("codex");
+    expect(Array.from((select as HTMLSelectElement).options)).toHaveLength(6);
+    expect(screen.getByRole("heading", { name: "Codex" })).toBeInTheDocument();
     expect(
-      screen.getByRole("button", { name: "로그인 진행 중…" }),
-    ).toBeDisabled();
+      screen.queryByRole("heading", { name: "Claude Code" }),
+    ).not.toBeInTheDocument();
+    expect(screen.queryByRole("radio")).not.toBeInTheDocument();
+    expect(screen.queryByText(/Google의 공개 안정 API가 아니며/)).not.toBeInTheDocument();
+  });
+
+  it("switches the single connection panel after selecting an unconnected provider", async () => {
+    const onSelectProvider = vi.fn(async (_provider: ProviderId) => {});
+    renderScreen({ onSelectProvider });
+    await userEvent.selectOptions(
+      screen.getByRole("combobox", { name: "기본 AI 제공자 선택" }),
+      "claude-code",
+    );
+    expect(onSelectProvider).toHaveBeenCalledWith("claude-code");
+    expect(
+      screen.getByRole("heading", { name: "Claude Code" }),
+    ).toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "Codex" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Claude 로그인" })).toBeInTheDocument();
+  });
+
+  it("opens Google login when Antigravity is selected", async () => {
+    const onProviderLogin = vi.fn(async () => {});
+    renderScreen({ onProviderLogin });
+    await userEvent.selectOptions(
+      screen.getByRole("combobox", { name: "기본 AI 제공자 선택" }),
+      "antigravity",
+    );
+    const login = screen.getByRole("button", { name: "Google 로그인" });
+    await userEvent.click(login);
+    expect(onProviderLogin).toHaveBeenCalledWith("antigravity");
+    expect(screen.queryByText(/Google의 공개 안정 API가 아니며/)).not.toBeInTheDocument();
+  });
+
+  it("clears the selected OpenCode Go API key field after submission", async () => {
+    const onProviderApiKey = vi.fn(async () => {});
+    renderScreen({
+      defaultProvider: "opencode-go",
+      selectedModels: {},
+      selectedReasoning: {},
+      onProviderApiKey,
+    });
+    const input = screen.getByPlaceholderText("API 키");
+    await userEvent.type(input, "secret-key");
+    await userEvent.click(screen.getByRole("button", { name: "연결" }));
+    expect(onProviderApiKey).toHaveBeenCalledWith("opencode-go", "secret-key");
+    await waitFor(() => expect(input).toHaveValue(""));
   });
 });

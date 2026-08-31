@@ -1,23 +1,43 @@
 //! Instruction epochs and model-facing baseline/delta assembly.
 //!
-//! The durable cursor advances only after a successful primary Codex turn. Every
-//! rendered dynamic section is revision-labelled, so a failed delivery can be
-//! retried without inventing state or duplicating an unversioned instruction.
+//! The durable cursor advances only after a successful primary provider turn.
+//! Dynamic sections are revision-labelled so failed delivery can retry without
+//! inventing state or duplicating an unversioned instruction.
 
 use serde::{Deserialize, Serialize};
 
 use crate::task_state::sha256_bytes;
 
-pub const CONTEXT_STATE_SCHEMA_VERSION: u32 = 1;
+pub const CONTEXT_STATE_SCHEMA_VERSION: u32 = 2;
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelContextCursor {
-    pub thread_id: Option<String>,
+    #[serde(default = "legacy_provider")]
+    pub provider: crate::provider::ProviderId,
+    #[serde(default, alias = "threadId")]
+    pub conversation_key: Option<String>,
     pub epoch: u64,
     pub memory_sha256: Option<String>,
     pub wiki_sha256: Option<String>,
     pub task_revision: u64,
+}
+
+const fn legacy_provider() -> crate::provider::ProviderId {
+    crate::provider::ProviderId::Codex
+}
+
+impl Default for ModelContextCursor {
+    fn default() -> Self {
+        Self {
+            provider: legacy_provider(),
+            conversation_key: None,
+            epoch: 0,
+            memory_sha256: None,
+            wiki_sha256: None,
+            task_revision: 0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -55,17 +75,24 @@ impl SessionContextState {
             || self.static_prompt_fingerprint == static_prompt_fingerprint(static_baseline)
     }
 
-    pub fn reset_epoch(&mut self, static_baseline: &str) -> u64 {
+    pub fn reset_epoch(
+        &mut self,
+        static_baseline: &str,
+        provider: crate::provider::ProviderId,
+    ) -> u64 {
         self.instruction_epoch = self.instruction_epoch.max(1).saturating_add(1);
         self.static_prompt_fingerprint = static_prompt_fingerprint(static_baseline);
-        self.delivered = ModelContextCursor::default();
+        self.delivered = ModelContextCursor {
+            provider,
+            ..ModelContextCursor::default()
+        };
         self.instruction_epoch
     }
 
     pub fn adopt_legacy_thread(
         &mut self,
         static_baseline: &str,
-        thread_id: String,
+        conversation_key: String,
         memory: Option<&str>,
         wiki: Option<&str>,
         task_revision: u64,
@@ -73,7 +100,8 @@ impl SessionContextState {
         self.initialize_baseline(static_baseline);
         if self.delivered.epoch == 0 {
             self.delivered = ModelContextCursor {
-                thread_id: Some(thread_id),
+                provider: crate::provider::ProviderId::Codex,
+                conversation_key: Some(conversation_key),
                 epoch: self.instruction_epoch,
                 memory_sha256: section_hash(memory),
                 wiki_sha256: section_hash(wiki),
@@ -108,7 +136,8 @@ pub struct ContextAssemblyInput<'a> {
     pub replay_transcript: Option<&'a str>,
     pub resolved_mentions: Option<&'a str>,
     pub user_text: &'a str,
-    pub current_thread_id: Option<&'a str>,
+    pub provider: crate::provider::ProviderId,
+    pub current_conversation_key: Option<&'a str>,
     pub force_full: bool,
 }
 
@@ -130,7 +159,8 @@ pub fn assemble_context(
 
     let full = input.force_full
         || state.delivered.epoch != state.instruction_epoch
-        || state.delivered.thread_id.as_deref() != input.current_thread_id;
+        || state.delivered.provider != input.provider
+        || state.delivered.conversation_key.as_deref() != input.current_conversation_key;
     let memory_hash = section_hash(input.project_memory);
     let wiki_hash = section_hash(input.wiki_facts);
     let mut parts = Vec::new();
@@ -190,7 +220,8 @@ pub fn assemble_context(
             ContextDeliveryMode::Delta
         },
         cursor: ModelContextCursor {
-            thread_id: input.current_thread_id.map(str::to_string),
+            provider: input.provider,
+            conversation_key: input.current_conversation_key.map(str::to_string),
             epoch: state.instruction_epoch,
             memory_sha256: memory_hash,
             wiki_sha256: wiki_hash,
@@ -238,7 +269,7 @@ mod tests {
     }
 
     fn input<'a>(
-        current_thread_id: Option<&'a str>,
+        current_conversation_key: Option<&'a str>,
         memory: Option<&'a str>,
         wiki: Option<&'a str>,
         task_revision: u64,
@@ -256,7 +287,8 @@ mod tests {
             replay_transcript: None,
             resolved_mentions: None,
             user_text: "do work",
-            current_thread_id,
+            provider: crate::provider::ProviderId::Codex,
+            current_conversation_key,
             force_full: false,
         }
     }
@@ -369,7 +401,7 @@ mod tests {
         let first = assemble_context(&state, input(Some("thread-1"), None, None, 0, None)).unwrap();
         state.delivered = first.cursor;
         let prior_epoch = state.instruction_epoch;
-        state.reset_epoch("[static]\nguide");
+        state.reset_epoch("[static]\nguide", crate::provider::ProviderId::Codex);
         assert_eq!(state.instruction_epoch, prior_epoch + 1);
         let after = assemble_context(&state, input(Some("thread-1"), None, None, 0, None)).unwrap();
         assert_eq!(after.mode, ContextDeliveryMode::Full);

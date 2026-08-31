@@ -150,7 +150,7 @@ export function MapToolbar({
           disabled={busy}
           onValueChange={(value) => onRevert(Number(value))}
         >
-          <SelectTrigger size="sm" className="w-32" aria-label="후보 revision">
+          <SelectTrigger className="h-9 w-32" aria-label="후보 revision">
             <SelectValue />
           </SelectTrigger>
           <SelectContent>
@@ -200,7 +200,7 @@ export function MapToolbar({
           <Button
             type="button"
             size="sm"
-            className="gap-1.5"
+            className="h-9 gap-1.5"
             disabled={busy}
             title="기존 작업은 히스토리에 보존됩니다."
             onClick={onReloadSource}
@@ -221,6 +221,7 @@ export function MapToolbar({
           size="sm"
           variant="outline"
           disabled={busy}
+          className="h-9"
           onClick={onMapImport}
         >
           <FolderInput className="size-4" aria-hidden="true" />
@@ -231,13 +232,14 @@ export function MapToolbar({
           size="sm"
           variant={imagePlacementActive ? "secondary" : "outline"}
           disabled={busy || candidate.stale}
+          className="h-9"
           aria-pressed={imagePlacementActive}
           onClick={onImagePlace}
         >
           <ImagePlus className="size-4" aria-hidden="true" />
           사진 배치
         </Button>
-        <Button type="button" size="sm" variant="outline" disabled={busy || !candidate.canUndo} onClick={onUndo}>
+        <Button type="button" size="sm" className="h-9" variant="outline" disabled={busy || !candidate.canUndo} onClick={onUndo}>
           <RotateCcw className="size-4" aria-hidden="true" />
           마지막 적용 취소
         </Button>
@@ -246,6 +248,7 @@ export function MapToolbar({
           size="sm"
           variant="outline"
           disabled={busy || candidate.currentRevision === 0}
+          className="h-9"
           title="현재 후보 전체를 취소하고 기준 맵으로 돌아가기"
           onClick={onDiscard}
         >
@@ -256,6 +259,7 @@ export function MapToolbar({
           type="button"
           size="sm"
           disabled={busy || candidate.stale || !candidate.canApply}
+          className="h-9"
           onClick={onApply}
         >
           전체 Apply
