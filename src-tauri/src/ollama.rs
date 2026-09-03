@@ -472,7 +472,7 @@ impl ProductionOllamaDriver {
                 data: Some(crate::ipc::AgentEventData {
                     args: None,
                     result: serde_json::to_string(&result.result).ok(),
-                    status: Some(if result.is_error { "error" } else { "ok" }.to_string()),
+                    status: Some(result.ipc_status().to_string()),
                 }),
             }))?;
         }

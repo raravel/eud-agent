@@ -24,6 +24,16 @@ pub struct DirectToolResult {
     pub is_error: bool,
 }
 
+impl DirectToolResult {
+    pub(crate) const fn ipc_status(&self) -> &'static str {
+        if self.is_error {
+            "failed"
+        } else {
+            "completed"
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct NormalizedAssistantStep {
     pub text: String,
@@ -165,6 +175,19 @@ mod tests {
             validate_structured_output(&schema, &serde_json::json!({"ok": true, "extra": 1}))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn direct_tool_result_status_matches_panel_contract() {
+        for (is_error, expected) in [(false, "completed"), (true, "failed")] {
+            let result = DirectToolResult {
+                id: "call-1".to_string(),
+                name: "read_file".to_string(),
+                result: Value::Null,
+                is_error,
+            };
+            assert_eq!(result.ipc_status(), expected);
+        }
     }
 
     #[test]
