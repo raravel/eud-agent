@@ -469,6 +469,7 @@ impl ProductionOpenCodeGoDriver {
                 format!("{BASE_URL}/{}", wire_path(wire)),
                 wire,
                 &api_key,
+                &self.session_id,
             );
             let response = request
                 .json(&body)
@@ -755,8 +756,9 @@ fn authenticated_request(
     url: String,
     wire: OpenCodeGoWire,
     api_key: &str,
+    session_id: &str,
 ) -> reqwest::RequestBuilder {
-    match wire {
+    let request = match wire {
         OpenCodeGoWire::AnthropicMessages => client
             .post(url)
             .header("x-api-key", api_key)
@@ -764,7 +766,8 @@ fn authenticated_request(
         OpenCodeGoWire::Responses | OpenCodeGoWire::ChatCompletions => {
             client.post(url).bearer_auth(api_key)
         }
-    }
+    };
+    request.header("x-opencode-session", session_id)
 }
 
 fn structured_tool(schema: &Value, wire: OpenCodeGoWire) -> Value {
@@ -1654,7 +1657,7 @@ mod tests {
     }
 
     #[test]
-    fn wire_requests_use_protocol_specific_authentication_headers() {
+    fn wire_requests_use_session_and_protocol_specific_authentication_headers() {
         let client = reqwest::Client::new();
         for wire in [
             OpenCodeGoWire::Responses,
@@ -1666,9 +1669,17 @@ mod tests {
                 "https://example.test".to_string(),
                 wire,
                 "test-key",
+                "session-a",
             )
             .build()
             .unwrap();
+            assert_eq!(
+                request
+                    .headers()
+                    .get("x-opencode-session")
+                    .and_then(|value| value.to_str().ok()),
+                Some("session-a")
+            );
             if wire == OpenCodeGoWire::AnthropicMessages {
                 assert_eq!(
                     request

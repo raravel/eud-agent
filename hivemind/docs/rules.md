@@ -217,6 +217,8 @@ hosting, panel re-arm, and server spawning are REMOVED.
   Unknown npm dialects and missing metadata are hidden rather than guessed.
   Authentication follows the selected wire contract: `/responses` and `/chat/completions` use
   `Authorization: Bearer`, while Anthropic-compatible `/messages` uses `x-api-key`.
+  Every inference request, including later tool-loop rounds, sends `x-opencode-session` with the
+  stable driver conversation id. Per-request ids and catalog probes are not substitutes.
 - Ollama uses only its documented OpenAI-compatible `/v1/chat/completions` and `/v1/models`
   contracts. The default base URL is `http://localhost:11434/v1`; plain HTTP is accepted only for
   loopback hosts, while remote endpoints require HTTPS. Userinfo, query strings, fragments, and

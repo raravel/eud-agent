@@ -58,6 +58,7 @@ stages from v1 are retired as `server/` is removed.
   structured output, resume/cancel boundary fixtures.
 - `cargo test -p eud-agent opencode_go::tests --lib` — arbitrary future live id + models.dev
   metadata join, npm-to-wire routing, protocol-specific Bearer/`x-api-key` authentication,
+  stable per-conversation `x-opencode-session` coverage across every inference wire/tool round,
   three SSE/tool/usage parsers, malformed stream refusal, and no guessed privacy metadata.
 - `cargo test -p eud-agent antigravity_ --lib` — build-time OAuth identity requirement,
   registered desktop OAuth form/state/callback, captured Cloud Code identity/project follow-up,

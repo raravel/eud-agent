@@ -508,6 +508,9 @@ enum OpenCodeGoWire {
 - `@ai-sdk/openai` → `/responses`
 - `@ai-sdk/openai-compatible` → `/chat/completions`
 - `@ai-sdk/anthropic` → `/messages`
+- 세 inference endpoint의 최초 request와 이후 tool-loop round는 모두 driver의 안정적인
+  conversation id를 `x-opencode-session`으로 전달한다. request나 round마다 새 id를 만들지
+  않으며 catalog probe를 conversation id로 취급하지 않는다.
 
 model id prefix/suffix, display name, `owned_by`로 wire를 추측하지 않는다. 새로운 npm dialect는
 adapter가 지원되기 전까지 숨긴다.

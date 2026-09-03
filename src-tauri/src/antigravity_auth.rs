@@ -532,7 +532,7 @@ fn load_code_assist_followup_project(response: &LoadCodeAssistResponse) -> Optio
     response
         .paid_tier
         .is_none()
-        .then(|| response.cloudaicompanion_project.as_deref())
+        .then_some(response.cloudaicompanion_project.as_deref())
         .flatten()
 }
 
