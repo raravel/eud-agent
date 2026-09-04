@@ -1,0 +1,198 @@
+{
+  "schemaVersion": 1,
+  "benchmark": "dat-authoring-four-way-comparison",
+  "model": "gpt-5.6-sol",
+  "runsPerMethod": 3,
+  "metricSemantics": "wall time and cumulative Codex tokens; reliability requires exact final state, intact fixtures, and method-specific validation",
+  "scales": {
+    "50": {
+      "familyCounts": {
+        "dat": 35,
+        "xdat": 5,
+        "tbl": 5,
+        "requirements": 3,
+        "buttons": 2
+      },
+      "methods": {
+        "jsonFile": {
+          "runs": 3,
+          "successes": 3,
+          "successRate": 1.0,
+          "averageElapsedMs": 57317,
+          "medianElapsedMs": 52999,
+          "averageInputTokens": 86323,
+          "medianInputTokens": 92077,
+          "averageOutputTokens": 2459,
+          "medianOutputTokens": 2222
+        },
+        "mcpTools": {
+          "runs": 3,
+          "successes": 3,
+          "successRate": 1.0,
+          "averageElapsedMs": 27856,
+          "medianElapsedMs": 27204,
+          "averageInputTokens": 73521,
+          "medianInputTokens": 73171,
+          "averageOutputTokens": 1032,
+          "medianOutputTokens": 1001
+        },
+        "schemaJsonPatch": {
+          "runs": 3,
+          "successes": 3,
+          "successRate": 1,
+          "averageElapsedMs": 59544,
+          "medianElapsedMs": 62474,
+          "averageInputTokens": 76934,
+          "medianInputTokens": 77242,
+          "averageOutputTokens": 2483,
+          "medianOutputTokens": 2632
+        },
+        "sqliteSqlPatch": {
+          "runs": 3,
+          "successes": 3,
+          "successRate": 1,
+          "averageElapsedMs": 78752,
+          "medianElapsedMs": 78925,
+          "averageInputTokens": 136207,
+          "medianInputTokens": 154172,
+          "averageOutputTokens": 3189,
+          "medianOutputTokens": 3104
+        },
+        "mcpBatch": {
+          "runs": 3,
+          "successes": 3,
+          "successRate": 1,
+          "averageElapsedMs": 45786,
+          "medianElapsedMs": 51987,
+          "averageInputTokens": 73167,
+          "medianInputTokens": 73464,
+          "averageOutputTokens": 1717,
+          "medianOutputTokens": 2058
+        }
+      },
+      "reliableSpeedRanking": [
+        "mcpTools",
+        "mcpBatch",
+        "jsonFile",
+        "schemaJsonPatch",
+        "sqliteSqlPatch"
+      ],
+      "highestReliability": [
+        "jsonFile",
+        "mcpTools",
+        "schemaJsonPatch",
+        "sqliteSqlPatch",
+        "mcpBatch"
+      ]
+    },
+    "200": {
+      "familyCounts": {
+        "dat": 140,
+        "xdat": 20,
+        "tbl": 20,
+        "requirements": 10,
+        "buttons": 10
+      },
+      "methods": {
+        "jsonFile": {
+          "runs": 3,
+          "successes": 3,
+          "successRate": 1.0,
+          "averageElapsedMs": 68515,
+          "medianElapsedMs": 60751,
+          "averageInputTokens": 139490,
+          "medianInputTokens": 126750,
+          "averageOutputTokens": 2641,
+          "medianOutputTokens": 2269
+        },
+        "mcpTools": {
+          "runs": 3,
+          "successes": 1,
+          "successRate": 0.3333333333333333,
+          "averageElapsedMs": 43423,
+          "medianElapsedMs": 44683,
+          "averageInputTokens": 99506,
+          "medianInputTokens": 90980,
+          "averageOutputTokens": 1645,
+          "medianOutputTokens": 1784
+        },
+        "schemaJsonPatch": {
+          "runs": 3,
+          "successes": 3,
+          "successRate": 1,
+          "averageElapsedMs": 41716,
+          "medianElapsedMs": 45026,
+          "averageInputTokens": 125530,
+          "medianInputTokens": 142109,
+          "averageOutputTokens": 1346,
+          "medianOutputTokens": 1467
+        },
+        "sqliteSqlPatch": {
+          "runs": 3,
+          "successes": 3,
+          "successRate": 1,
+          "averageElapsedMs": 79066,
+          "medianElapsedMs": 90615,
+          "averageInputTokens": 206878,
+          "medianInputTokens": 264000,
+          "averageOutputTokens": 2243,
+          "medianOutputTokens": 2604
+        },
+        "mcpBatch": {
+          "runs": 3,
+          "successes": 3,
+          "successRate": 1,
+          "averageElapsedMs": 37255,
+          "medianElapsedMs": 38497,
+          "averageInputTokens": 89723,
+          "medianInputTokens": 89521,
+          "averageOutputTokens": 1206,
+          "medianOutputTokens": 1040
+        }
+      },
+      "reliableSpeedRanking": [
+        "mcpBatch",
+        "schemaJsonPatch",
+        "jsonFile",
+        "sqliteSqlPatch"
+      ],
+      "highestReliability": [
+        "jsonFile",
+        "schemaJsonPatch",
+        "sqliteSqlPatch",
+        "mcpBatch"
+      ]
+    }
+  },
+  "sourceFiles": {
+    "baseline50": "baseline-50.json",
+    "baseline200": "baseline-200.json",
+    "schema50": "schema-json-50.json",
+    "schema200": "schema-json-200.json",
+    "sql50": "sqlite-sql-50.json",
+    "sql200": "sqlite-sql-200.json",
+    "mcpBatch1": "mcp-batch-1.json",
+    "mcpBatch50": "mcp-batch-50.json",
+    "mcpBatch200": "mcp-batch-200.json"
+  },
+  "batchScale1": {
+    "familyCounts": {
+      "dat": 1,
+      "xdat": 0,
+      "tbl": 0,
+      "requirements": 0,
+      "buttons": 0
+    },
+    "mcpBatch": {
+      "runs": 3,
+      "successes": 3,
+      "successRate": 1,
+      "averageElapsedMs": 17684,
+      "medianElapsedMs": 17948,
+      "averageInputTokens": 65843,
+      "medianInputTokens": 65763,
+      "averageOutputTokens": 286,
+      "medianOutputTokens": 292
+    }
+  }
+}

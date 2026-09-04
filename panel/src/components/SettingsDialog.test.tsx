@@ -72,12 +72,42 @@ function renderDialog(
     onProviderLogout: vi.fn(),
     onProviderRefresh: vi.fn(),
     onProviderModelChange: vi.fn(),
+    onProjectOpen: vi.fn(),
+    onProjectCreate: vi.fn(),
+    onProjectImport: vi.fn(),
+    onProjectExport: vi.fn(),
     ...overrides,
   };
   return { ...render(<SettingsDialog {...props} />), props };
 }
 
 describe("SettingsDialog provider management", () => {
+  it("exposes native project and E3S actions", async () => {
+    const onProjectOpen = vi.fn();
+    const onProjectCreate = vi.fn();
+    const onProjectImport = vi.fn();
+    const onProjectExport = vi.fn();
+    renderDialog({
+      onProjectOpen,
+      onProjectCreate,
+      onProjectImport,
+      onProjectExport,
+    });
+
+    await userEvent.click(screen.getByRole("button", { name: "프로젝트" }));
+    await userEvent.click(
+      screen.getByRole("button", { name: "기존 Native 프로젝트 열기" }),
+    );
+    await userEvent.click(screen.getByRole("button", { name: "새 프로젝트" }));
+    await userEvent.click(screen.getByRole("button", { name: "E3S 가져오기" }));
+    await userEvent.click(screen.getByRole("button", { name: "E3S 내보내기" }));
+
+    expect(onProjectOpen).toHaveBeenCalledOnce();
+    expect(onProjectCreate).toHaveBeenCalledOnce();
+    expect(onProjectImport).toHaveBeenCalledOnce();
+    expect(onProjectExport).toHaveBeenCalledOnce();
+  });
+
   it("shows provider status summaries before opening one provider at a time", async () => {
     renderDialog({
       providers: providers.map((status) =>

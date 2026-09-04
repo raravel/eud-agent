@@ -21,8 +21,10 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::bridge_io::{EpsSnapshot, SendOpts};
 use crate::config::DataDirs;
+use crate::source_snapshot::{
+    ProjectSnapshot as EpsSnapshot, ProjectSnapshotFile as EpsSnapshotFile,
+};
 use crate::workspace::{apply_exact_text_edits, ExactTextEdit};
 
 pub const MAX_DIAGNOSTICS: usize = 200;
@@ -181,10 +183,21 @@ struct ConfiguredSnapshotProvider {
 
 impl SnapshotProvider for ConfiguredSnapshotProvider {
     fn snapshot(&self) -> Result<EpsSnapshot, String> {
-        let bridge = crate::ipc::bridge_from_config(&self.dirs)?;
-        bridge
-            .snapshot_eps(&SendOpts::for_epsnapshot(), None)
-            .map_err(|error| error.to_string())
+        let snapshot = crate::native_runtime::NativeProjectManager::new(self.dirs.clone())
+            .source_snapshot()?;
+        Ok(EpsSnapshot {
+            project: snapshot.project,
+            identity: snapshot.identity,
+            files: snapshot
+                .files
+                .into_iter()
+                .map(|file| EpsSnapshotFile {
+                    path: file.path,
+                    ftype: "CUIEps".to_string(),
+                    content: Some(file.content),
+                })
+                .collect(),
+        })
     }
 }
 
@@ -201,13 +214,13 @@ struct PreflightState {
 }
 
 fn tracked_analysis_path(state: &PreflightState, path: &str) -> Option<(String, String)> {
-    let editor_path = normalize_editor_path(path).ok()?;
-    let key = editor_path.to_lowercase();
+    let snapshot_path = normalize_snapshot_path(path).ok()?;
+    let key = snapshot_path.to_lowercase();
     let analysis_path = state
         .source_paths
         .get(&key)
         .cloned()
-        .or_else(|| normalize_project_path(&editor_path).ok())?;
+        .or_else(|| normalize_project_path(&snapshot_path).ok())?;
     Some((key, analysis_path))
 }
 
@@ -399,13 +412,13 @@ impl EpsPreflight {
         let Some((from_key, from_path)) = tracked_analysis_path(&state, from) else {
             return;
         };
-        let Ok(to_editor_path) = normalize_editor_path(to) else {
+        let Ok(to_source_path) = normalize_snapshot_path(to) else {
             state.snapshot_ready = false;
             return;
         };
-        let to_key = to_editor_path.to_lowercase();
-        let to_path = normalize_project_path(&to_editor_path)
-            .unwrap_or_else(|_| format!("{to_editor_path}.eps"));
+        let to_key = to_source_path.to_lowercase();
+        let to_path = normalize_project_path(&to_source_path)
+            .unwrap_or_else(|_| format!("{to_source_path}.eps"));
         let Some(root) = state.mirror_root.as_ref() else {
             state.snapshot_ready = false;
             return;
@@ -494,12 +507,12 @@ fn refresh_mirror(dirs: &DataDirs, snapshot: &EpsSnapshot) -> io::Result<Refresh
     let mut seen = HashMap::<String, String>::new();
     let populate = (|| -> io::Result<()> {
         for file in &snapshot.files {
-            let editor_path = normalize_editor_path(&file.path)
+            let snapshot_path = normalize_snapshot_path(&file.path)
                 .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-            let project_path = if editor_path.to_lowercase().ends_with(".eps") {
-                editor_path.clone()
+            let project_path = if snapshot_path.to_lowercase().ends_with(".eps") {
+                snapshot_path.clone()
             } else if file.ftype == "CUIEps" {
-                format!("{editor_path}.eps")
+                format!("{snapshot_path}.eps")
             } else {
                 continue;
             };
@@ -512,7 +525,7 @@ fn refresh_mirror(dirs: &DataDirs, snapshot: &EpsSnapshot) -> io::Result<Refresh
                     ),
                 ));
             }
-            source_paths.insert(editor_path.to_lowercase(), project_path.clone());
+            source_paths.insert(snapshot_path.to_lowercase(), project_path.clone());
             if let Some(content) = &file.content {
                 atomic_write_under_root(&staged, &project_path, content.as_bytes())?;
             } else {
@@ -658,7 +671,7 @@ fn ensure_contained_existing(root: &Path, target: &Path) -> io::Result<()> {
     }
 }
 
-pub(crate) fn normalize_editor_path(value: &str) -> Result<String, String> {
+pub(crate) fn normalize_snapshot_path(value: &str) -> Result<String, String> {
     if value.is_empty() || value.contains('\0') || value.contains('\\') {
         return Err("path must be a non-empty project-relative path using '/' separators".into());
     }
@@ -683,7 +696,7 @@ pub(crate) fn normalize_editor_path(value: &str) -> Result<String, String> {
 }
 
 pub(crate) fn normalize_project_path(value: &str) -> Result<String, String> {
-    let normalized = normalize_editor_path(value)?;
+    let normalized = normalize_snapshot_path(value)?;
     if !normalized.to_lowercase().ends_with(".eps") {
         return Err(format!("path must end in .eps: {value}"));
     }
@@ -1507,7 +1520,7 @@ impl Drop for WindowsJob {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bridge_io::EpsSnapshotFile;
+    use crate::source_snapshot::ProjectSnapshotFile as EpsSnapshotFile;
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicUsize, Ordering};
 

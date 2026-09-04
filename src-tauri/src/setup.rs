@@ -1,13 +1,6 @@
-//! First-run setup surface: manifest check, editor-path picker, bootstrap runner.
-//!
-//! Feature 10's boot flow gates the panel behind a setup screen when the manifest
-//! check fails (editor-path config + model + RAG index). This module is that check
-//! plus the commands the setup screen drives: the editor folder picker
-//! (pick -> validate -> store) and the bootstrap download. `lib.rs` auto-runs the
-//! download on later launches when an asset went missing/corrupt but the editor
-//! path is already configured; the very first run stays panel-driven so the user
-//! picks the editor folder before anything downloads.
+//! First-run native-project, euddraft, model, and RAG setup surface.
 
+use std::fs;
 use std::path::Path;
 use std::sync::OnceLock;
 
@@ -16,16 +9,13 @@ use tauri_plugin_dialog::DialogExt;
 use tokio::sync::Mutex;
 
 use crate::bootstrap::{self, ProgressEmitter};
-use crate::config::{self, Config, DataDirs};
-use crate::ipc::BridgeManaged;
+use crate::config::{Config, DataDirs};
+use crate::ipc::AppManaged;
 
 /// Process-wide bootstrap serialization lock.
 ///
-/// Bootstrap has two entry points that can fire concurrently: the startup
-/// auto-bootstrap (`lib.rs`, when an asset is missing but the editor path is set) and
-/// the panel-driven [`bootstrap_run`] command. Both download each asset to a FIXED
-/// `<asset>.tmp` path, so an overlap races on the same tmp — one entrant renames it into
-/// place while the other's `verify_and_place` rename then hits `os error 2` (tmp gone).
+/// Bootstrap has startup and panel-driven entry points. Both download each
+/// asset to a fixed `<asset>.tmp` path, so overlap would race on one file.
 /// Holding this lock for the whole run serializes them; the second entrant re-checks and
 /// finds the asset already `Present`, so it no-ops instead of re-downloading.
 fn bootstrap_lock() -> &'static Mutex<()> {
@@ -33,17 +23,19 @@ fn bootstrap_lock() -> &'static Mutex<()> {
     LOCK.get_or_init(|| Mutex::new(()))
 }
 
-/// Stable error code for a picked folder that is not an EUD Editor 3 install.
-/// The panel maps codes to user-facing text (rules.md: raw identifiers are never
-/// rendered as-is).
-pub const INVALID_EDITOR_FOLDER: &str = "invalid_editor_folder";
+pub const INVALID_PROJECT_FOLDER: &str = "invalid_project_folder";
+pub const INVALID_EUDDRAFT_PATH: &str = "invalid_euddraft_path";
+pub const PROJECT_CREATE_FAILED: &str = "project_create_failed";
+pub const E3S_IMPORT_FAILED: &str = "e3s_import_failed";
 
-/// Typed five-provider setup snapshot.
+/// `setup_status` and native picker command output.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SetupStatusResponse {
-    pub editor_path: String,
-    pub editor_valid: bool,
+    pub project_path: String,
+    pub project_valid: bool,
+    pub euddraft_path: String,
+    pub euddraft_valid: bool,
     pub assets_ready: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_provider: Option<crate::provider::ProviderId>,
@@ -53,6 +45,9 @@ pub struct SetupStatusResponse {
     pub error: Option<String>,
 }
 
+/// Build the setup/manifest snapshot for the panel (filesystem probe + hash +
+/// codex login probe). Probes the ambient codex login state; see
+/// [`status_from_config`] for the injectable form used by tests.
 pub fn setup_status_payload(
     dirs: &DataDirs,
     providers: Vec<crate::provider::ProviderStatus>,
@@ -67,9 +62,12 @@ fn status_from_config(
     providers: Vec<crate::provider::ProviderStatus>,
     error: Option<String>,
 ) -> SetupStatusResponse {
-    let editor_path = config.editor_path.trim().to_string();
-    let editor_valid =
-        !editor_path.is_empty() && config::validate_editor_path(Path::new(&editor_path));
+    let project_path = config.project_path.trim().to_string();
+    let project_valid = !project_path.is_empty()
+        && crate::native_project::NativeProject::open(Path::new(&project_path)).is_ok();
+    let euddraft_path = config.euddraft_path.trim().to_string();
+    let euddraft_valid = !euddraft_path.is_empty()
+        && crate::native_build::EuddraftLaunch::resolve(Path::new(&euddraft_path)).is_ok();
     let assets_ready = !bootstrap::needs_bootstrap(dirs, config);
     let selected_ready = config.default_provider.is_some_and(|selected| {
         providers
@@ -79,27 +77,29 @@ fn status_from_config(
             && config.providers.default_model(selected).is_some()
     });
     SetupStatusResponse {
-        editor_path,
-        editor_valid,
+        project_path,
+        project_valid,
+        euddraft_path,
+        euddraft_valid,
         assets_ready,
         default_provider: config.default_provider,
         providers,
-        setup_required: !editor_valid || !assets_ready || !selected_ready,
+        setup_required: !project_valid || !euddraft_valid || !assets_ready || !selected_ready,
         error,
     }
 }
 
-/// True when a later launch should auto-run the bootstrap: the editor path is
-/// already configured and valid, but an asset is missing/corrupt. The first run
-/// (no editor path yet) is panel-driven instead, so nothing downloads before the
-/// user has been asked anything.
+/// True when configured native prerequisites exist but a downloadable asset is stale.
 pub fn should_auto_bootstrap(dirs: &DataDirs) -> bool {
     match dirs.load_config() {
         Ok(config) => {
-            let editor_path = config.editor_path.trim();
-            !editor_path.is_empty()
-                && config::validate_editor_path(Path::new(editor_path))
-                && bootstrap::needs_bootstrap(dirs, &config)
+            let project_valid = !config.project_path.trim().is_empty()
+                && crate::native_project::NativeProject::open(Path::new(&config.project_path))
+                    .is_ok();
+            let euddraft_valid = !config.euddraft_path.trim().is_empty()
+                && crate::native_build::EuddraftLaunch::resolve(Path::new(&config.euddraft_path))
+                    .is_ok();
+            project_valid && euddraft_valid && bootstrap::needs_bootstrap(dirs, &config)
         }
         Err(_) => false,
     }
@@ -166,10 +166,10 @@ async fn run_bootstrap_inner(
     Ok(())
 }
 
-/// Report the first-run setup state (editor path + asset manifest check).
+/// Report first-run native setup state.
 #[tauri::command]
 pub async fn setup_status(
-    state: tauri::State<'_, BridgeManaged>,
+    state: tauri::State<'_, AppManaged>,
     providers: tauri::State<'_, crate::provider_service::ProviderService>,
 ) -> Result<SetupStatusResponse, String> {
     let dirs = state.dirs().clone();
@@ -179,13 +179,11 @@ pub async fn setup_status(
         .map_err(|error| error.to_string())?
 }
 
-/// Open the native folder picker, validate the selection as an EUD Editor 3 install,
-/// and persist it to `config.json`. A cancelled pick returns the unchanged state; an
-/// invalid folder returns the state with the `invalid_editor_folder` error code.
+/// Pick and configure an existing native project root.
 #[tauri::command]
-pub async fn setup_pick_editor_path(
+pub async fn setup_pick_project_path(
     app: tauri::AppHandle,
-    state: tauri::State<'_, BridgeManaged>,
+    state: tauri::State<'_, AppManaged>,
     providers: tauri::State<'_, crate::provider_service::ProviderService>,
 ) -> Result<SetupStatusResponse, String> {
     let dirs = state.dirs().clone();
@@ -196,15 +194,258 @@ pub async fn setup_pick_editor_path(
         };
         let picked = picked.into_path().map_err(|error| error.to_string())?;
         let mut config = dirs.load_config().map_err(|error| error.to_string())?;
-        if !config::validate_editor_path(&picked) {
+        if crate::native_project::NativeProject::open(&picked).is_err() {
             return Ok(status_from_config(
                 &dirs,
                 &config,
                 statuses,
-                Some(INVALID_EDITOR_FOLDER.to_string()),
+                Some(INVALID_PROJECT_FOLDER.to_string()),
             ));
         }
-        config.editor_path = picked.to_string_lossy().into_owned();
+        config.project_path = picked.to_string_lossy().into_owned();
+        dirs.save_config(&config)
+            .map_err(|error| error.to_string())?;
+        Ok(status_from_config(&dirs, &config, statuses, None))
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+/// Create a canonical native project from a selected source map.
+#[tauri::command]
+pub async fn setup_create_project(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppManaged>,
+    providers: tauri::State<'_, crate::provider_service::ProviderService>,
+) -> Result<SetupStatusResponse, String> {
+    let dirs = state.dirs().clone();
+    let statuses = providers.status_list().await?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let Some(source) = app
+            .dialog()
+            .file()
+            .add_filter("StarCraft maps", &["scx", "scm"])
+            .blocking_pick_file()
+        else {
+            return setup_status_payload(&dirs, statuses);
+        };
+        let source = source.into_path().map_err(|error| error.to_string())?;
+        let Some(destination) = app.dialog().file().blocking_pick_folder() else {
+            return setup_status_payload(&dirs, statuses);
+        };
+        let destination = destination.into_path().map_err(|error| error.to_string())?;
+        configure_created_project(&dirs, &source, &destination, statuses)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+/// Import a semantic legacy E3S projection into a new canonical native project.
+#[tauri::command]
+pub async fn setup_import_e3s(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppManaged>,
+    providers: tauri::State<'_, crate::provider_service::ProviderService>,
+) -> Result<SetupStatusResponse, String> {
+    let dirs = state.dirs().clone();
+    let statuses = providers.status_list().await?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let Some(source) = app
+            .dialog()
+            .file()
+            .add_filter("E3S compatibility projects", &["e3s"])
+            .blocking_pick_file()
+        else {
+            return setup_status_payload(&dirs, statuses);
+        };
+        let source = source.into_path().map_err(|error| error.to_string())?;
+        let Some(destination) = app.dialog().file().blocking_pick_folder() else {
+            return setup_status_payload(&dirs, statuses);
+        };
+        let destination = destination.into_path().map_err(|error| error.to_string())?;
+        configure_imported_project(&dirs, &source, &destination, statuses)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct E3sExportResponse {
+    pub path: String,
+}
+
+/// Export the configured imported project to an Editor-readable E3S.
+#[tauri::command]
+pub async fn project_export_e3s(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppManaged>,
+) -> Result<Option<E3sExportResponse>, String> {
+    let dirs = state.dirs().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let config = dirs.load_config().map_err(|error| error.to_string())?;
+        let project = crate::native_project::NativeProject::open(Path::new(&config.project_path))?;
+        let default_name = format!("{}.e3s", project.manifest().name);
+        let Some(destination) = app
+            .dialog()
+            .file()
+            .add_filter("E3S compatibility projects", &["e3s"])
+            .set_file_name(default_name)
+            .blocking_save_file()
+        else {
+            return Ok(None);
+        };
+        let destination = destination.into_path().map_err(|error| error.to_string())?;
+        crate::e3s_nrbf::export_e3s(&project, &destination, &dirs.native_assets_dir())?;
+        Ok(Some(E3sExportResponse {
+            path: destination.to_string_lossy().into_owned(),
+        }))
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+fn configure_created_project(
+    dirs: &DataDirs,
+    source_map: &Path,
+    destination: &Path,
+    providers: Vec<crate::provider::ProviderStatus>,
+) -> Result<SetupStatusResponse, String> {
+    let cleanable = destination_is_empty(destination)?;
+    let result = create_project_from_map(source_map, destination);
+    restore_empty_destination_after_failure(destination, cleanable, &result)?;
+    finish_project_configuration(dirs, destination, result, PROJECT_CREATE_FAILED, providers)
+}
+
+fn configure_imported_project(
+    dirs: &DataDirs,
+    source_e3s: &Path,
+    destination: &Path,
+    providers: Vec<crate::provider::ProviderStatus>,
+) -> Result<SetupStatusResponse, String> {
+    let cleanable = destination_is_empty(destination)?;
+    let result =
+        crate::e3s_nrbf::import_e3s(source_e3s, destination, &dirs.native_assets_dir()).map(|_| ());
+    restore_empty_destination_after_failure(destination, cleanable, &result)?;
+    finish_project_configuration(dirs, destination, result, E3S_IMPORT_FAILED, providers)
+}
+
+fn finish_project_configuration(
+    dirs: &DataDirs,
+    destination: &Path,
+    result: Result<(), String>,
+    error_code: &str,
+    providers: Vec<crate::provider::ProviderStatus>,
+) -> Result<SetupStatusResponse, String> {
+    let mut config = dirs.load_config().map_err(|error| error.to_string())?;
+    match result {
+        Ok(()) => {
+            config.project_path = destination.to_string_lossy().into_owned();
+            dirs.save_config(&config)
+                .map_err(|error| error.to_string())?;
+            Ok(status_from_config(dirs, &config, providers, None))
+        }
+        Err(error) => Ok(status_from_config(
+            dirs,
+            &config,
+            providers,
+            Some(format!("{error_code}: {error}")),
+        )),
+    }
+}
+
+fn destination_is_empty(destination: &Path) -> Result<bool, String> {
+    if !destination.exists() {
+        return Ok(true);
+    }
+    Ok(fs::read_dir(destination)
+        .map_err(|error| error.to_string())?
+        .next()
+        .is_none())
+}
+
+fn restore_empty_destination_after_failure(
+    destination: &Path,
+    cleanable: bool,
+    result: &Result<(), String>,
+) -> Result<(), String> {
+    if result.is_ok() || !cleanable || !destination.exists() {
+        return Ok(());
+    }
+    fs::remove_dir_all(destination).map_err(|error| error.to_string())?;
+    fs::create_dir_all(destination).map_err(|error| error.to_string())
+}
+
+fn create_project_from_map(source_map: &Path, destination: &Path) -> Result<(), String> {
+    if !source_map.is_file() {
+        return Err(format!(
+            "source map is unavailable: {}",
+            source_map.display()
+        ));
+    }
+    if destination.exists()
+        && fs::read_dir(destination)
+            .map_err(|error| error.to_string())?
+            .next()
+            .is_some()
+    {
+        return Err(format!(
+            "project destination must be empty: {}",
+            destination.display()
+        ));
+    }
+    let source_name = source_map
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| "source map filename is not Unicode".to_string())?;
+    let name = source_map
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("Native EUD Project");
+    let extension = source_map
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("scx");
+    let manifest = crate::native_project::ProjectManifest {
+        schema_version: crate::native_project::PROJECT_SCHEMA_VERSION,
+        name: name.to_string(),
+        source_map: format!("maps/{source_name}"),
+        output_map: format!("build/{name}_EUD.{extension}"),
+        main_file: "src/main.eps".to_string(),
+        settings: crate::native_project::ProjectSettings::default(),
+        plugins: Vec::new(),
+        editor_compatibility: None,
+    };
+    let project = crate::native_project::NativeProject::create(destination, manifest)?;
+    fs::copy(source_map, project.root().join("maps").join(source_name))
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+/// Pick `euddraft.exe` or `euddraft.py`.
+#[tauri::command]
+pub async fn setup_pick_euddraft_path(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppManaged>,
+    providers: tauri::State<'_, crate::provider_service::ProviderService>,
+) -> Result<SetupStatusResponse, String> {
+    let dirs = state.dirs().clone();
+    let statuses = providers.status_list().await?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let Some(picked) = app.dialog().file().blocking_pick_file() else {
+            return setup_status_payload(&dirs, statuses);
+        };
+        let picked = picked.into_path().map_err(|error| error.to_string())?;
+        let mut config = dirs.load_config().map_err(|error| error.to_string())?;
+        if crate::native_build::EuddraftLaunch::resolve(&picked).is_err() {
+            return Ok(status_from_config(
+                &dirs,
+                &config,
+                statuses,
+                Some(INVALID_EUDDRAFT_PATH.to_string()),
+            ));
+        }
+        config.euddraft_path = picked.to_string_lossy().into_owned();
         dirs.save_config(&config)
             .map_err(|error| error.to_string())?;
         Ok(status_from_config(&dirs, &config, statuses, None))
@@ -215,7 +456,7 @@ pub async fn setup_pick_editor_path(
 
 #[tauri::command]
 pub async fn setup_provider_select(
-    state: tauri::State<'_, BridgeManaged>,
+    state: tauri::State<'_, AppManaged>,
     providers: tauri::State<'_, crate::provider_service::ProviderService>,
     provider: crate::provider::ProviderId,
 ) -> Result<SetupStatusResponse, String> {
@@ -232,8 +473,12 @@ pub async fn setup_provider_select(
         .iter()
         .find(|status| status.provider == provider)
         .is_some_and(|status| status.availability.is_ready());
-    let core_setup_incomplete = config.editor_path.trim().is_empty()
-        || !config::validate_editor_path(Path::new(config.editor_path.trim()))
+    let core_setup_incomplete = config.project_path.trim().is_empty()
+        || crate::native_project::NativeProject::open(Path::new(config.project_path.trim()))
+            .is_err()
+        || config.euddraft_path.trim().is_empty()
+        || crate::native_build::EuddraftLaunch::resolve(Path::new(config.euddraft_path.trim()))
+            .is_err()
         || bootstrap::needs_bootstrap(&dirs, &config);
     if current_ready && !core_setup_incomplete && !target_ready {
         return Err("provider_not_authenticated".to_string());
@@ -253,7 +498,7 @@ pub async fn setup_provider_select(
 #[tauri::command]
 pub async fn bootstrap_run(
     app: tauri::AppHandle,
-    state: tauri::State<'_, BridgeManaged>,
+    state: tauri::State<'_, AppManaged>,
 ) -> Result<(), String> {
     let dirs = state.dirs().clone();
     run_bootstrap(&app, &dirs)
@@ -265,25 +510,22 @@ pub async fn bootstrap_run(
 mod tests {
     use super::*;
     use crate::bootstrap::RAG_INDEX_FILENAME;
-    use crate::config::AssetSpec;
+    use crate::native_project::{ProjectManifest, ProjectSettings};
     use std::fs;
     use std::path::PathBuf;
 
-    // sha256("hello") — matches the bootstrap manifest test vector.
     const HELLO_SHA: &str = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
 
     fn unique_temp_dir(tag: &str) -> PathBuf {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("eud-agent-setup-test-{tag}-{nanos}"));
+        let dir = std::env::temp_dir().join(format!(
+            "eud-agent-setup-native-{tag}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
         fs::create_dir_all(&dir).unwrap();
         dir
-    }
-
-    fn make_dirs(base: &Path) -> DataDirs {
-        DataDirs::from_bases(&base.join("roaming"), &base.join("local"))
     }
 
     fn provider_statuses(
@@ -311,18 +553,10 @@ mod tests {
             .collect()
     }
 
-    /// A fake EUD Editor 3 install root (`Data\Lua\TriggerEditor` marker present).
-    fn make_editor_root(base: &Path) -> PathBuf {
-        let editor = base.join("EUDEditor3");
-        fs::create_dir_all(editor.join("Data").join("Lua").join("TriggerEditor")).unwrap();
-        editor
-    }
-
-    /// Place a verified RAG index asset matching `spec_sha` under `dirs.rag_dir()`.
-    fn place_rag_asset(dirs: &DataDirs) -> AssetSpec {
+    fn place_rag_asset(dirs: &DataDirs) -> crate::config::AssetSpec {
         fs::create_dir_all(dirs.rag_dir()).unwrap();
         fs::write(dirs.rag_dir().join(RAG_INDEX_FILENAME), b"hello").unwrap();
-        AssetSpec {
+        crate::config::AssetSpec {
             name: "https://example.com/rag-index.bin".to_string(),
             sha256: HELLO_SHA.to_string(),
             version: bootstrap::REQUIRED_RAG_INDEX_VERSION.to_string(),
@@ -330,74 +564,48 @@ mod tests {
     }
 
     #[test]
-    fn setup_required_on_first_run_without_config() {
-        let base = unique_temp_dir("first-run");
-        let dirs = make_dirs(&base);
-
-        let status = setup_status_payload(
+    fn first_run_requires_native_project_and_euddraft() {
+        let base = unique_temp_dir("first");
+        let dirs = DataDirs::from_bases(&base.join("roaming"), &base.join("local"));
+        let status = status_from_config(
             &dirs,
+            &Config::default(),
             provider_statuses(None, crate::provider::ProviderAvailability::Unavailable),
-        )
-        .unwrap();
-
-        assert_eq!(status.editor_path, "");
-        assert!(!status.editor_valid);
-        assert!(!status.assets_ready);
+            None,
+        );
+        assert!(!status.project_valid);
+        assert!(!status.euddraft_valid);
         assert!(status.setup_required);
-        assert_eq!(status.error, None);
-
-        fs::remove_dir_all(&base).ok();
+        fs::remove_dir_all(base).ok();
     }
 
     #[test]
-    fn setup_json_omits_absent_optional_fields_for_the_panel_guard() {
-        let base = unique_temp_dir("setup-json");
-        let dirs = make_dirs(&base);
-        let status = setup_status_payload(
-            &dirs,
-            provider_statuses(None, crate::provider::ProviderAvailability::Unavailable),
+    fn valid_native_paths_advance_past_path_setup() {
+        let base = unique_temp_dir("valid");
+        let dirs = DataDirs::from_bases(&base.join("roaming"), &base.join("local"));
+        dirs.ensure_dirs().unwrap();
+        let project_root = base.join("project");
+        fs::create_dir_all(project_root.join("maps")).unwrap();
+        fs::write(project_root.join("maps/source.scx"), b"map").unwrap();
+        crate::native_project::NativeProject::create(
+            &project_root,
+            ProjectManifest {
+                schema_version: 1,
+                name: "Demo".to_string(),
+                source_map: "maps/source.scx".to_string(),
+                output_map: "build/output.scx".to_string(),
+                main_file: "src/main.eps".to_string(),
+                settings: ProjectSettings::default(),
+                plugins: Vec::new(),
+                editor_compatibility: None,
+            },
         )
         .unwrap();
-        let json = serde_json::to_value(status).unwrap();
-        let object = json.as_object().unwrap();
-        assert!(!object.contains_key("defaultProvider"));
-        assert!(!object.contains_key("error"));
-        for provider in object["providers"].as_array().unwrap() {
-            assert!(!provider.as_object().unwrap().contains_key("detailCode"));
-        }
-        fs::remove_dir_all(&base).ok();
-    }
-
-    #[test]
-    fn setup_required_when_editor_path_is_stale() {
-        // A configured-but-vanished editor folder must route back to the picker.
-        let base = unique_temp_dir("stale-editor");
-        let dirs = make_dirs(&base);
+        let euddraft = base.join("euddraft.exe");
+        fs::write(&euddraft, b"stub").unwrap();
         let config = Config {
-            editor_path: base.join("missing-editor").to_string_lossy().into_owned(),
-            ..Default::default()
-        };
-        dirs.save_config(&config).unwrap();
-
-        let status = setup_status_payload(
-            &dirs,
-            provider_statuses(None, crate::provider::ProviderAvailability::Unavailable),
-        )
-        .unwrap();
-
-        assert!(!status.editor_valid);
-        assert!(status.setup_required);
-
-        fs::remove_dir_all(&base).ok();
-    }
-
-    #[test]
-    fn setup_not_required_when_editor_valid_and_assets_verified() {
-        let base = unique_temp_dir("ready");
-        let dirs = make_dirs(&base);
-        let editor = make_editor_root(&base);
-        let rag_spec = place_rag_asset(&dirs);
-        let config = Config {
+            project_path: project_root.to_string_lossy().into_owned(),
+            euddraft_path: euddraft.to_string_lossy().into_owned(),
             default_provider: Some(crate::provider::ProviderId::Codex),
             providers: crate::provider::ProviderSettings {
                 codex: crate::provider::CodexProviderSettings {
@@ -406,16 +614,13 @@ mod tests {
                 },
                 ..Default::default()
             },
-            editor_path: editor.to_string_lossy().into_owned(),
-            model: AssetSpec {
-                name: "BAAI/bge-m3".to_string(),
+            model: crate::config::AssetSpec {
+                name: bootstrap::DEFAULT_MODEL_NAME.to_string(),
                 ..Default::default()
             },
-            rag_index: rag_spec,
+            rag_index: place_rag_asset(&dirs),
             ..Default::default()
         };
-        dirs.save_config(&config).unwrap();
-
         let status = status_from_config(
             &dirs,
             &config,
@@ -425,160 +630,43 @@ mod tests {
             ),
             None,
         );
-
-        assert!(status.editor_valid);
-        assert!(status.assets_ready);
+        assert!(status.project_valid);
+        assert!(status.euddraft_valid);
         assert!(!status.setup_required);
-
-        fs::remove_dir_all(&base).ok();
+        fs::remove_dir_all(base).ok();
     }
-
     #[test]
-    fn setup_required_when_codex_not_logged_in() {
-        // Editor + assets ready, but codex is unauthenticated: still gated, since
-        // every agent turn would otherwise fail on a codex auth error.
-        let base = unique_temp_dir("codex-unauthed");
-        let dirs = make_dirs(&base);
-        let editor = make_editor_root(&base);
-        let rag_spec = place_rag_asset(&dirs);
-        let config = Config {
-            default_provider: Some(crate::provider::ProviderId::Codex),
-            providers: crate::provider::ProviderSettings {
-                codex: crate::provider::CodexProviderSettings {
-                    default_model: Some("gpt-test".to_string()),
-                    ..Default::default()
-                },
-                ..Default::default()
-            },
-            editor_path: editor.to_string_lossy().into_owned(),
-            model: AssetSpec {
-                name: "BAAI/bge-m3".to_string(),
-                ..Default::default()
-            },
-            rag_index: rag_spec,
-            ..Default::default()
-        };
+    fn project_creation_copies_the_source_map_and_opens_canonical_state() {
+        let base = unique_temp_dir("create");
+        let source = base.join("input.scx");
+        let destination = base.join("project");
+        fs::write(&source, b"map").unwrap();
 
-        let status = status_from_config(
-            &dirs,
-            &config,
-            provider_statuses(
-                Some(crate::provider::ProviderId::Codex),
-                crate::provider::ProviderAvailability::NeedsAuthentication,
-            ),
-            None,
-        );
+        create_project_from_map(&source, &destination).unwrap();
 
-        assert!(status.editor_valid);
-        assert!(status.assets_ready);
-        assert!(status.setup_required);
-
-        fs::remove_dir_all(&base).ok();
-    }
-
-    #[test]
-    fn setup_required_when_editor_valid_but_assets_missing() {
-        // The download step of the setup flow: path picked, assets still absent.
-        let base = unique_temp_dir("assets-missing");
-        let dirs = make_dirs(&base);
-        let editor = make_editor_root(&base);
-        let config = Config {
-            editor_path: editor.to_string_lossy().into_owned(),
-            ..Default::default()
-        };
-        dirs.save_config(&config).unwrap();
-
-        let status = setup_status_payload(
-            &dirs,
-            provider_statuses(None, crate::provider::ProviderAvailability::Unavailable),
-        )
-        .unwrap();
-
-        assert!(status.editor_valid);
-        assert!(!status.assets_ready);
-        assert!(status.setup_required);
-
-        fs::remove_dir_all(&base).ok();
-    }
-
-    #[test]
-    fn auto_bootstrap_only_when_editor_configured_and_assets_needed() {
-        // First run (no editor path): panel-driven, never auto-download.
-        let base = unique_temp_dir("auto");
-        let dirs = make_dirs(&base);
-        assert!(!should_auto_bootstrap(&dirs));
-
-        // Editor configured + assets missing: auto-run on launch.
-        let editor = make_editor_root(&base);
-        let mut config = Config {
-            editor_path: editor.to_string_lossy().into_owned(),
-            ..Default::default()
-        };
-        dirs.save_config(&config).unwrap();
-        assert!(should_auto_bootstrap(&dirs));
-
-        // Everything installed and verified: nothing to do.
-        config.rag_index = place_rag_asset(&dirs);
-        config.model.name = "BAAI/bge-m3".to_string();
-        dirs.save_config(&config).unwrap();
-        assert!(!should_auto_bootstrap(&dirs));
-
-        fs::remove_dir_all(&base).ok();
-    }
-
-    #[test]
-    fn pick_error_code_is_carried_on_the_status_payload() {
-        let base = unique_temp_dir("pick-error");
-        let dirs = make_dirs(&base);
-        let config = Config::default();
-
-        let status = status_from_config(
-            &dirs,
-            &config,
-            provider_statuses(None, crate::provider::ProviderAvailability::Unavailable),
-            Some(INVALID_EDITOR_FOLDER.to_string()),
-        );
-
-        assert_eq!(status.error.as_deref(), Some(INVALID_EDITOR_FOLDER));
-        assert!(status.setup_required);
-
-        fs::remove_dir_all(&base).ok();
-    }
-
-    /// Regression (concurrent-bootstrap race): `run_bootstrap`'s `bootstrap_lock` must
-    /// serialize overlapping runs so the auto + panel entry points never download to the
-    /// shared `<asset>.tmp` at the same time (the overlap raced one rename into `os error
-    /// 2`). Each task increments an in-flight counter inside the lock and yields, giving
-    /// any unguarded peer a chance to overlap; the peak concurrency must stay 1. Remove
-    /// the lock and the counter climbs to 8 at the yield, failing this assertion.
-    #[tokio::test]
-    async fn bootstrap_lock_serializes_concurrent_runs() {
-        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
-        use std::sync::Arc;
-
-        let inflight = Arc::new(AtomicUsize::new(0));
-        let peak = Arc::new(AtomicUsize::new(0));
-
-        let mut handles = Vec::new();
-        for _ in 0..8 {
-            let inflight = inflight.clone();
-            let peak = peak.clone();
-            handles.push(tokio::spawn(async move {
-                let _guard = bootstrap_lock().lock().await;
-                let now = inflight.fetch_add(1, SeqCst) + 1;
-                peak.fetch_max(now, SeqCst);
-                tokio::task::yield_now().await;
-                inflight.fetch_sub(1, SeqCst);
-            }));
-        }
-        for handle in handles {
-            handle.await.unwrap();
-        }
-
+        let project = crate::native_project::NativeProject::open(&destination).unwrap();
+        assert_eq!(project.manifest().source_map, "maps/input.scx");
+        assert_eq!(project.manifest().main_file, "src/main.eps");
         assert_eq!(
-            peak.load(SeqCst),
-            1,
-            "bootstrap runs must be serialized by bootstrap_lock"
+            fs::read(project.source_map_path().unwrap()).unwrap(),
+            b"map"
         );
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn project_creation_refuses_a_nonempty_destination() {
+        let base = unique_temp_dir("create-nonempty");
+        let source = base.join("input.scx");
+        let destination = base.join("project");
+        fs::write(&source, b"map").unwrap();
+        fs::create_dir_all(&destination).unwrap();
+        fs::write(destination.join("keep.txt"), b"user").unwrap();
+
+        let error = create_project_from_map(&source, &destination).unwrap_err();
+
+        assert!(error.contains("must be empty"));
+        assert_eq!(fs::read(destination.join("keep.txt")).unwrap(), b"user");
+        fs::remove_dir_all(base).ok();
     }
 }

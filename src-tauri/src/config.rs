@@ -1,14 +1,12 @@
-//! config.json load/save, data-dir resolution, and editor-path validation.
+//! Native runtime configuration and app data-directory resolution.
 //!
-//! Data dirs (feature 10 / Decision 12):
-//! - `app_data` -> `%appdata%\eud-agent\` : `config.json`, `memory/`, `map_backups/`,
-//!   `journal/`.
-//! - `app_local_data` -> `%localappdata%\eud-agent\` : `models/`, `rag/`, `logs/`,
-//!   session-owned `attachments/`. Large/regenerable data NEVER lives in Roaming.
-//! - editor IPC dir: `<editor_path>\Data\agent\`.
+//! - Roaming `%APPDATA%/eud-agent`: config, memory, journals, sessions, backups.
+//! - Local `%LOCALAPPDATA%/eud-agent`: models, RAG, logs, attachments, analyzer
+//!   mirrors, media tools, and native compatibility assets.
+//! - Canonical project state stays in the configured `project_path`.
 //!
-//! `config.json` is written UTF-8 **without BOM** (rules.md: a BOM breaks first-line
-//! command parsing on the bridge side and we keep every app-written file BOM-free).
+//! `config.json` is atomic UTF-8 without BOM. Large/regenerable assets never
+//! live in Roaming.
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -74,7 +72,7 @@ pub struct NotificationSettings {
     pub ask_response_required: NotificationChannelSettings,
 }
 
-pub const CONFIG_SCHEMA_VERSION: u32 = 2;
+pub const CONFIG_SCHEMA_VERSION: u32 = 3;
 
 const fn config_schema_version() -> u32 {
     CONFIG_SCHEMA_VERSION
@@ -86,8 +84,15 @@ const fn config_schema_version() -> u32 {
 pub struct Config {
     #[serde(default = "config_schema_version")]
     pub schema_version: u32,
+    /// Absolute root of the active native EUD project (`project.json`).
     #[serde(default)]
-    pub editor_path: String,
+    pub project_path: String,
+    /// `euddraft.exe`, `euddraft.py`, or an euddraft source-repository root.
+    #[serde(default)]
+    pub euddraft_path: String,
+    /// Optional StarCraft install root used for map rendering/catalog assets.
+    #[serde(default)]
+    pub starcraft_path: String,
     #[serde(default)]
     pub default_provider: Option<crate::provider::ProviderId>,
     #[serde(default)]
@@ -104,7 +109,9 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             schema_version: CONFIG_SCHEMA_VERSION,
-            editor_path: String::new(),
+            project_path: String::new(),
+            euddraft_path: String::new(),
+            starcraft_path: String::new(),
             default_provider: None,
             providers: crate::provider::ProviderSettings::default(),
             notifications: NotificationSettings::default(),
@@ -117,8 +124,8 @@ impl Default for Config {
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawConfigV1 {
-    #[serde(default)]
-    editor_path: String,
+    #[serde(default, rename = "editor_path")]
+    _legacy_editor_root: String,
     #[serde(default)]
     codex_cmd: Option<String>,
     #[serde(default)]
@@ -138,7 +145,6 @@ struct RawConfigV1 {
 impl RawConfigV1 {
     fn migrate(self) -> Config {
         Config {
-            editor_path: self.editor_path,
             default_provider: Some(crate::provider::ProviderId::Codex),
             providers: crate::provider::ProviderSettings {
                 codex: crate::provider::CodexProviderSettings {
@@ -159,16 +165,36 @@ impl RawConfigV1 {
     }
 }
 
-/// The editor's file-IPC directory: `<editor_path>\Data\agent`.
-pub fn editor_ipc_dir(editor_path: &Path) -> PathBuf {
-    editor_path.join("Data").join("agent")
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawConfigV2 {
+    schema_version: u32,
+    #[serde(default, rename = "editor_path")]
+    _legacy_editor_root: String,
+    #[serde(default)]
+    default_provider: Option<crate::provider::ProviderId>,
+    #[serde(default)]
+    providers: crate::provider::ProviderSettings,
+    #[serde(default)]
+    notifications: NotificationSettings,
+    #[serde(default)]
+    model: AssetSpec,
+    #[serde(default)]
+    rag_index: AssetSpec,
 }
 
-/// True iff `<p>\Data\Lua\TriggerEditor` exists — the marker that `p` is a valid
-/// EUD Editor 3 install root. Pure (filesystem-probe only) so it is unit-testable
-/// without a running Tauri app; the folder picker wraps this (pick -> validate -> store).
-pub fn validate_editor_path(p: &Path) -> bool {
-    p.join("Data").join("Lua").join("TriggerEditor").is_dir()
+impl RawConfigV2 {
+    fn migrate(self) -> Config {
+        debug_assert_eq!(self.schema_version, 2);
+        Config {
+            default_provider: self.default_provider,
+            providers: self.providers,
+            notifications: self.notifications,
+            model: self.model,
+            rag_index: self.rag_index,
+            ..Config::default()
+        }
+    }
 }
 
 /// Resolved app data directories.
@@ -366,6 +392,10 @@ impl DataDirs {
     pub fn lsp_workspaces_dir(&self) -> PathBuf {
         self.app_local_data.join("lsp_workspaces")
     }
+    /// `%localappdata%\eud-agent\native_assets` — versioned DAT/offset/TBL compatibility data.
+    pub fn native_assets_dir(&self) -> PathBuf {
+        self.app_local_data.join("native_assets")
+    }
 
     /// `%localappdata%\eud-agent\codex_workspace` — the STABLE, app-owned cwd
     /// for spawned codex processes (rules.md: never the launch dir). Kept empty
@@ -407,6 +437,7 @@ impl DataDirs {
             self.audio_sources_dir(),
             self.map_imports_dir(),
             self.lsp_workspaces_dir(),
+            self.native_assets_dir(),
             self.codex_workspace_dir(),
         ] {
             fs::create_dir_all(dir)?;
@@ -430,18 +461,23 @@ impl DataDirs {
             .as_object()
             .ok_or_else(|| anyhow::anyhow!("config root must be an object"))?;
 
-        if object.contains_key("schema_version") {
-            let config: Config = serde_json::from_value(value)?;
-            if config.schema_version != CONFIG_SCHEMA_VERSION {
-                anyhow::bail!(
-                    "unsupported config schema version {}",
-                    config.schema_version
-                );
-            }
-            return Ok(config);
-        }
         if object.is_empty() {
             return Ok(Config::default());
+        }
+
+        if let Some(raw_version) = object.get("schema_version") {
+            let version = raw_version
+                .as_u64()
+                .ok_or_else(|| anyhow::anyhow!("config schema version must be an integer"))?;
+            if version == u64::from(CONFIG_SCHEMA_VERSION) {
+                return Ok(serde_json::from_value(value)?);
+            }
+            if version == 2 {
+                let migrated = serde_json::from_value::<RawConfigV2>(value)?.migrate();
+                self.save_config(&migrated)?;
+                return Ok(migrated);
+            }
+            anyhow::bail!("unsupported config schema version {version}");
         }
 
         let legacy: RawConfigV1 = serde_json::from_value(value)?;
@@ -485,7 +521,9 @@ mod tests {
     #[test]
     fn config_round_trips() {
         let cfg = Config {
-            editor_path: "C:\\Games\\EUDEditor3".to_string(),
+            project_path: "C:\\Maps\\NativeProject".to_string(),
+            euddraft_path: "C:\\Tools\\euddraft.exe".to_string(),
+            starcraft_path: "C:\\Games\\StarCraft".to_string(),
             default_provider: Some(crate::provider::ProviderId::Codex),
             providers: crate::provider::ProviderSettings {
                 codex: crate::provider::CodexProviderSettings {
@@ -521,7 +559,8 @@ mod tests {
     fn partial_config_deserializes_with_fresh_provider_selection() {
         let back: Config = serde_json::from_str("{}").unwrap();
         assert_eq!(back.schema_version, CONFIG_SCHEMA_VERSION);
-        assert_eq!(back.editor_path, "");
+        assert_eq!(back.project_path, "");
+        assert_eq!(back.euddraft_path, "");
         assert_eq!(back.default_provider, None);
         assert!(back.providers.codex.large_context_models.is_empty());
         assert_eq!(back.model, AssetSpec::default());
@@ -567,7 +606,8 @@ mod tests {
         dirs.ensure_dirs().unwrap();
 
         let cfg = Config {
-            editor_path: "C:\\Games\\EUDEditor3".to_string(),
+            project_path: "C:\\Maps\\NativeProject".to_string(),
+            euddraft_path: "C:\\Tools\\euddraft.exe".to_string(),
             ..Default::default()
         };
         dirs.save_config(&cfg).unwrap();
@@ -617,6 +657,53 @@ mod tests {
         assert_eq!(saved["schema_version"], CONFIG_SCHEMA_VERSION);
         assert!(saved.get("codex_model").is_none());
         assert!(saved.get("codex_cmd").is_none());
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn v2_provider_config_migrates_to_native_paths_without_losing_provider_defaults() {
+        let base = unique_temp_dir("native-path-migration");
+        let dirs = DataDirs::from_bases(&base.join("roaming"), &base.join("local"));
+        dirs.ensure_dirs().unwrap();
+        let mut legacy = serde_json::to_value(Config {
+            default_provider: Some(crate::provider::ProviderId::ClaudeCode),
+            providers: crate::provider::ProviderSettings {
+                claude_code: crate::provider::ClaudeCodeProviderSettings {
+                    default_model: Some("claude-test".to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..Config::default()
+        })
+        .unwrap();
+        let object = legacy.as_object_mut().unwrap();
+        object.insert("schema_version".to_string(), serde_json::json!(2));
+        object.insert(
+            "editor_path".to_string(),
+            serde_json::json!("C:\\LegacyEditor"),
+        );
+        object.remove("project_path");
+        object.remove("euddraft_path");
+        object.remove("starcraft_path");
+        fs::write(dirs.config_path(), serde_json::to_vec(&legacy).unwrap()).unwrap();
+
+        let migrated = dirs.load_config().unwrap();
+        assert_eq!(migrated.schema_version, CONFIG_SCHEMA_VERSION);
+        assert!(migrated.project_path.is_empty());
+        assert!(migrated.euddraft_path.is_empty());
+        assert_eq!(
+            migrated.default_provider,
+            Some(crate::provider::ProviderId::ClaudeCode)
+        );
+        assert_eq!(
+            migrated.providers.claude_code.default_model.as_deref(),
+            Some("claude-test")
+        );
+        let saved: serde_json::Value =
+            serde_json::from_slice(&fs::read(dirs.config_path()).unwrap()).unwrap();
+        assert_eq!(saved["schema_version"], CONFIG_SCHEMA_VERSION);
+        assert!(saved.get("editor_path").is_none());
         fs::remove_dir_all(base).ok();
     }
 
@@ -712,36 +799,5 @@ mod tests {
         // Empty/whitespace project name disables the wiki (mirrors memory).
         assert_eq!(dirs.wiki_dir("   "), None);
         assert_eq!(dirs.wiki_dir(""), None);
-    }
-
-    #[test]
-    fn editor_ipc_dir_is_under_editor_path() {
-        let editor = PathBuf::from("C:\\Games\\EUDEditor3");
-        let ipc = editor_ipc_dir(&editor);
-        assert_eq!(ipc, PathBuf::from("C:\\Games\\EUDEditor3\\Data\\agent"));
-    }
-
-    #[test]
-    fn validate_editor_path_true_when_subfolder_exists() {
-        let base = unique_temp_dir("valid-ok");
-        let editor = base.join("EUDEditor3");
-        fs::create_dir_all(editor.join("Data").join("Lua").join("TriggerEditor")).unwrap();
-
-        assert!(validate_editor_path(&editor));
-
-        fs::remove_dir_all(&base).ok();
-    }
-
-    #[test]
-    fn validate_editor_path_false_when_subfolder_missing() {
-        let base = unique_temp_dir("valid-bad");
-        let editor = base.join("NotTheEditor");
-        fs::create_dir_all(&editor).unwrap();
-        // No Data\Lua\TriggerEditor under it.
-        assert!(!validate_editor_path(&editor));
-        // A path that does not exist at all is also invalid.
-        assert!(!validate_editor_path(&base.join("missing")));
-
-        fs::remove_dir_all(&base).ok();
     }
 }

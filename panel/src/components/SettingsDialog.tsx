@@ -5,7 +5,11 @@ import {
   Bot,
   CheckCircle2,
   ChevronRight,
+  FileInput,
+  FileOutput,
+  FolderKanban,
   LoaderCircle,
+  Plus,
   RefreshCw,
   Volume2,
   X,
@@ -57,6 +61,7 @@ export interface SettingsDialogProps {
   baseUrls?: Partial<Record<ProviderId, string>>;
   hasApiKeys?: Partial<Record<ProviderId, boolean>>;
   providerErrors: Partial<Record<ProviderId, string>>;
+  projectBusy?: "open" | "create" | "import" | "export" | null;
   onOpenChange(open: boolean): void;
   onSettingsChange(settings: AppSettings): void;
   onReload(): void;
@@ -76,9 +81,13 @@ export interface SettingsDialogProps {
     model: string,
     reasoning: ReasoningSelection | undefined,
   ): Promise<void> | void;
+  onProjectOpen(): void;
+  onProjectCreate(): void;
+  onProjectImport(): void;
+  onProjectExport(): void;
 }
 
-type SettingsCategory = "providers" | "notifications";
+type SettingsCategory = "project" | "providers" | "notifications";
 
 const EVENT_COPY: Readonly<
   Record<NotificationEvent, { title: string; description: string }>
@@ -115,6 +124,7 @@ export function SettingsDialog({
   baseUrls = {},
   hasApiKeys = {},
   providerErrors,
+  projectBusy = null,
   onOpenChange,
   onSettingsChange,
   onReload,
@@ -130,6 +140,10 @@ export function SettingsDialog({
   onProviderLogout,
   onProviderRefresh,
   onProviderModelChange,
+  onProjectOpen,
+  onProjectCreate,
+  onProjectImport,
+  onProjectExport,
 }: SettingsDialogProps) {
   const [category, setCategory] = useState<SettingsCategory>("providers");
   const [selectedProvider, setSelectedProvider] = useState<ProviderId>();
@@ -207,7 +221,7 @@ export function SettingsDialog({
         <DialogHeader className="relative border-b border-border px-4 py-4 pr-16 text-left sm:px-6 sm:py-5">
           <DialogTitle>설정</DialogTitle>
           <DialogDescription>
-            AI 제공자와 사용자 확인 알림을 관리합니다.
+            Native 프로젝트, AI 제공자와 사용자 확인 알림을 관리합니다.
           </DialogDescription>
           <DialogClose asChild>
             <Button
@@ -229,8 +243,18 @@ export function SettingsDialog({
           >
             <Button
               type="button"
-              variant={category === "providers" ? "secondary" : "ghost"}
+              variant={category === "project" ? "secondary" : "ghost"}
               className="h-11 flex-1 justify-start gap-2 sm:w-full"
+              aria-current={category === "project" ? "page" : undefined}
+              onClick={() => selectCategory("project")}
+            >
+              <FolderKanban aria-hidden className="size-4" />
+              프로젝트
+            </Button>
+            <Button
+              type="button"
+              variant={category === "providers" ? "secondary" : "ghost"}
+              className="h-11 flex-1 justify-start gap-2 sm:mt-1 sm:w-full"
               aria-current={category === "providers" ? "page" : undefined}
               onClick={() => selectCategory("providers")}
             >
@@ -250,7 +274,77 @@ export function SettingsDialog({
           </nav>
 
           <section className="min-h-0 min-w-0 overflow-y-auto overscroll-contain px-4 py-4 sm:px-6 sm:py-5">
-            {category === "providers" ? (
+            {category === "project" ? (
+              <div className="animate-in fade-in duration-200 motion-reduce:animate-none">
+                <div className="flex items-start justify-between gap-4">
+                  <div>
+                    <h2 className="text-base font-semibold">Native 프로젝트</h2>
+                    <p className="mt-1.5 text-sm leading-6 text-muted-foreground">
+                      프로젝트를 전환하거나 E3S 호환 파일을 가져오고 내보냅니다.
+                    </p>
+                  </div>
+                  {projectBusy !== null && (
+                    <span
+                      role="status"
+                      className="flex shrink-0 items-center gap-1.5 text-xs text-muted-foreground"
+                    >
+                      <LoaderCircle
+                        aria-hidden
+                        className="size-3.5 animate-spin motion-reduce:animate-none"
+                      />
+                      처리 중…
+                    </span>
+                  )}
+                </div>
+                <div className="mt-5 grid gap-3 rounded-xl border border-border bg-card/40 p-4">
+                  <Button
+                    type="button"
+                    className="min-h-11 justify-start"
+                    disabled={projectBusy !== null}
+                    onClick={onProjectOpen}
+                  >
+                    <FolderKanban aria-hidden className="size-4" />
+                    기존 Native 프로젝트 열기
+                  </Button>
+                  <div className="grid grid-cols-2 gap-3">
+                    <Button
+                      type="button"
+                      variant="outline"
+                      className="min-h-11 justify-start"
+                      disabled={projectBusy !== null}
+                      onClick={onProjectCreate}
+                    >
+                      <Plus aria-hidden className="size-4" />
+                      새 프로젝트
+                    </Button>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      className="min-h-11 justify-start"
+                      disabled={projectBusy !== null}
+                      onClick={onProjectImport}
+                    >
+                      <FileInput aria-hidden className="size-4" />
+                      E3S 가져오기
+                    </Button>
+                  </div>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    className="min-h-11 justify-start"
+                    disabled={projectBusy !== null}
+                    onClick={onProjectExport}
+                  >
+                    <FileOutput aria-hidden className="size-4" />
+                    E3S 내보내기
+                  </Button>
+                </div>
+                <p className="mt-4 text-xs leading-relaxed text-muted-foreground">
+                  E3S 내보내기는 E3S에서 가져온 프로젝트만 지원합니다. Native
+                  프로젝트가 원본이며, EUD Editor 실행 환경은 사용하지 않습니다.
+                </p>
+              </div>
+            ) : category === "providers" ? (
               selectedProviderStatus ? (
                 <div className="animate-in fade-in slide-in-from-right-2 duration-200 motion-reduce:animate-none">
                   <Button

@@ -1,10 +1,8 @@
 //! eud-agent Tauri 2 application shell.
 //!
-//! This is the scaffold entry point for the v2 standalone desktop app. It wires the
-//! `tauri::Builder`, registers the shell and dialog plugins, and opens the main window
-//! that hosts the prebuilt React panel (`../panel/dist`). The typed Tauri IPC surface is
-//! registered here; engine, tools, codex_client, isom, bridge_io, and memory are wired by
-//! later tasks.
+//! Native standalone desktop shell. The Tauri builder hosts the React panel,
+//! native project/runtime services, euddraft generation, map tooling, Codex,
+//! RAG, memory, and typed in-process IPC.
 
 use tauri::path::BaseDirectory;
 use tauri::{Emitter, Manager};
@@ -14,8 +12,6 @@ pub mod antigravity_client;
 pub mod attachment;
 pub mod audio;
 pub mod bootstrap;
-pub mod bridge_install;
-pub mod bridge_io;
 pub mod chk;
 pub mod claude_auth;
 pub mod claude_client;
@@ -23,7 +19,7 @@ pub mod codex_auth;
 pub mod codex_client;
 pub mod config;
 pub mod context_state;
-pub mod edd_runner;
+pub mod e3s_nrbf;
 pub mod engine;
 pub mod eps_preflight;
 pub mod harness;
@@ -41,6 +37,10 @@ pub mod mapsafe;
 pub mod mcp;
 pub mod memory;
 pub mod mentions;
+pub mod native_build;
+pub mod native_project;
+pub mod native_runtime;
+mod nrbf;
 pub mod ollama;
 pub mod opencode_go;
 pub mod provider;
@@ -51,6 +51,7 @@ pub mod provider_transcript;
 pub mod rag;
 pub mod session;
 pub mod setup;
+pub mod source_snapshot;
 pub mod task_state;
 pub mod tool_exec;
 pub mod tools;
@@ -68,12 +69,8 @@ struct AppMemoryProvider {
 
 impl AppMemoryProvider {
     fn current_memory(&self) -> memory::ProjectMemory {
-        match ipc::bridge_from_config(&self.dirs).and_then(|bridge| {
-            bridge
-                .read_status_snapshot(bridge_io::HEARTBEAT_STALE_AFTER)
-                .map_err(|error| error.to_string())
-        }) {
-            Ok(snapshot) => memory::ProjectMemory::new(self.dirs.memory_dir(), snapshot.project),
+        match native_runtime::NativeProjectManager::new(self.dirs.clone()).status() {
+            Ok(status) => memory::ProjectMemory::new(self.dirs.memory_dir(), status.name),
             Err(_) => memory::ProjectMemory::new(self.dirs.memory_dir(), ""),
         }
     }
@@ -85,9 +82,7 @@ impl engine::MemoryProvider for AppMemoryProvider {
     }
 }
 
-/// Resolves the current project from the editor STATUS and reads/writes its
-/// dat-edit wiki ledger, so `[wiki facts]` and the accept-hook always target the
-/// project the editor currently has open (like [`AppMemoryProvider`]).
+/// Resolves the current native project and reads/writes its DAT wiki ledger.
 #[derive(Clone)]
 struct AppWikiProvider {
     dirs: config::DataDirs,
@@ -95,14 +90,10 @@ struct AppWikiProvider {
 
 impl AppWikiProvider {
     fn current_project(&self) -> String {
-        match ipc::bridge_from_config(&self.dirs).and_then(|bridge| {
-            bridge
-                .read_status_snapshot(bridge_io::HEARTBEAT_STALE_AFTER)
-                .map_err(|error| error.to_string())
-        }) {
-            Ok(snapshot) => snapshot.project,
-            Err(_) => String::new(),
-        }
+        native_runtime::NativeProjectManager::new(self.dirs.clone())
+            .status()
+            .map(|status| status.name)
+            .unwrap_or_default()
     }
 
     fn current_store(&self) -> wiki::WikiStore {
@@ -131,9 +122,7 @@ impl engine::WikiProvider for AppWikiProvider {
     }
 }
 
-/// Renders `[project state]` fresh each turn from the editor's `status.txt`
-/// (project name + build state), resolving the bridge from `config.json` so an
-/// editor-path change or a downed editor takes effect without a restart.
+/// Renders fresh native project state for every turn.
 #[derive(Clone)]
 struct AppProjectStateProvider {
     dirs: config::DataDirs,
@@ -141,23 +130,17 @@ struct AppProjectStateProvider {
 
 impl engine::ProjectStateProvider for AppProjectStateProvider {
     fn render_section(&self) -> String {
-        let bridge = match ipc::bridge_from_config(&self.dirs) {
-            Ok(bridge) => bridge,
-            Err(error) => return format!("[project state]\n(editor not connected: {error})"),
-        };
-        match bridge.read_status_snapshot(bridge_io::HEARTBEAT_STALE_AFTER) {
-            Ok(snapshot) => {
-                let project = if snapshot.project.trim().is_empty() {
-                    "(no project open)"
-                } else {
-                    snapshot.project.trim()
-                };
-                format!(
-                    "[project state]\nproject={project}\ncompiling={}",
-                    snapshot.compiling
-                )
-            }
-            Err(error) => format!("[project state]\n(editor not connected: {error})"),
+        let manager = native_runtime::NativeProjectManager::new(self.dirs.clone());
+        match manager.status() {
+            Ok(status) => format!(
+                "[project state]\nproject={}\nroot={}\nsourceMap={}\nmainFile={}\nbuilding={}",
+                status.name,
+                status.root,
+                status.source_map,
+                status.main_file,
+                manager.is_building(),
+            ),
+            Err(error) => format!("[project state]\n(native project unavailable: {error})"),
         }
     }
 }
@@ -195,6 +178,24 @@ pub fn run() {
             if let Err(error) = data_dirs.ensure_dirs() {
                 eprintln!("eud-agent: cannot create data dirs: {error}");
             }
+            match app
+                .path()
+                .resolve("native/eud-editor-compat", BaseDirectory::Resource)
+            {
+                Ok(source) => {
+                    match native_build::sync_compat_assets(&source, &data_dirs.native_assets_dir())
+                    {
+                        Ok(copied) if copied > 0 => {
+                            eprintln!("eud-agent: installed {copied} native compatibility assets")
+                        }
+                        Ok(_) => {}
+                        Err(error) => eprintln!("eud-agent: native asset sync failed: {error}"),
+                    }
+                }
+                Err(error) => {
+                    eprintln!("eud-agent: cannot resolve native compatibility assets: {error}")
+                }
+            }
             let removed_episodes = memory::cleanup_legacy_episode_files(&data_dirs.memory_dir());
             if removed_episodes > 0 {
                 eprintln!(
@@ -203,54 +204,17 @@ pub fn run() {
             }
             let attachment_store = attachment::AttachmentStore::new(data_dirs.attachments_dir());
             attachment_store.cleanup_stale_drafts();
-            if let Ok(bridge) = ipc::bridge_from_config(&data_dirs) {
-                bridge.cleanup_stale();
-            }
 
-            // Keep the editor's installed Lua bridge in sync with the copy bundled in
-            // this app: a self-update may ship a newer bridge, re-installed here on the
-            // next launch (no manual `install_bridge.ps1` re-run). Best-effort — a downed
-            // or moved editor must never block startup.
-            if let Ok(config) = data_dirs.load_config() {
-                let editor_path = config.editor_path.trim();
-                if !editor_path.is_empty()
-                    && config::validate_editor_path(std::path::Path::new(editor_path))
-                {
-                    match app
-                        .path()
-                        .resolve("bridge/ZZZ_10_agent_bridge.lua", BaseDirectory::Resource)
-                    {
-                        Ok(bundled) => {
-                            match bridge_install::sync_bridge(
-                                &bundled,
-                                std::path::Path::new(editor_path),
-                            ) {
-                                Ok(true) => eprintln!("eud-agent: bridge re-installed to editor"),
-                                Ok(false) => {}
-                                Err(error) => {
-                                    eprintln!("eud-agent: bridge sync skipped: {error}")
-                                }
-                            }
-                        }
-                        Err(error) => {
-                            eprintln!("eud-agent: cannot resolve bundled bridge resource: {error}")
-                        }
-                    }
-                }
-            }
             let provider_service = provider_service::ProviderService::new(data_dirs.clone())
                 .map_err(anyhow::Error::msg)?;
             app.manage(provider_service.clone());
 
-            app.manage(ipc::BridgeManaged::new(data_dirs.clone()));
+            app.manage(ipc::AppManaged::new(data_dirs.clone()));
             app.manage(attachment::AttachmentManaged::new(attachment_store.clone()));
 
-            // Feature 10 boot flow (EUD-132): on later launches where the editor
-            // path is already configured but an asset went missing/corrupt,
-            // re-download in the background. The very first run is panel-driven
-            // (setup screen -> pick folder -> bootstrap_run), and readiness is
-            // never gated on this task — failures surface to the panel as
-            // `progress {stage: bootstrap, detail: "error: ..."}` with retry.
+            // On later launches, restore missing/corrupt managed assets in the
+            // background. First-run setup remains panel-driven and progress or
+            // retry state is emitted through the typed bootstrap channel.
             let boot_handle = app.handle().clone();
             let boot_dirs = data_dirs.clone();
             tauri::async_runtime::spawn(async move {
@@ -455,7 +419,6 @@ pub fn run() {
             ipc::notification_sound_preview,
             ipc::attention_notify,
             ipc::status,
-            ipc::launch_editor,
             ipc::list,
             provider_service::provider_settings,
             provider_service::provider_status_list,
@@ -477,7 +440,11 @@ pub fn run() {
             ipc::wiki_get,
             ipc::wiki_save,
             setup::setup_status,
-            setup::setup_pick_editor_path,
+            setup::setup_pick_project_path,
+            setup::setup_create_project,
+            setup::setup_import_e3s,
+            setup::project_export_e3s,
+            setup::setup_pick_euddraft_path,
             setup::setup_provider_select,
             setup::bootstrap_run,
         ])

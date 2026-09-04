@@ -1,30 +1,26 @@
 /**
- * Editor connection-state notice (EUD-120).
+ * Native-project availability notice.
  *
- * The App renders this presentational banner only when the backend reports the
- * EUD Editor bridge heartbeat as stale/absent. Korean UI text must explain that
- * the editor is disconnected without exposing raw backend marker strings.
- *
- * Contract (Step B implements `@/components/ConnectionNotice`):
- *   export interface ConnectionNoticeProps {}
- *   export function ConnectionNotice(props): JSX.Element;
+ * The App renders this banner only when the configured project cannot be read.
+ * The text names the manifest/path recovery action without leaking raw errors.
  */
 import { describe, it, expect } from "vitest";
 import { render, screen } from "@testing-library/react";
 import { ConnectionNotice } from "@/components/ConnectionNotice";
 
 describe("ConnectionNotice", () => {
-  it("renders an editor connection status region", () => {
+  it("renders a native project status region", () => {
     render(<ConnectionNotice />);
 
     expect(
-      screen.getByRole("status", { name: "에디터 연결 상태" }),
+      screen.getByRole("status", { name: "Native 프로젝트 상태" }),
     ).toBeInTheDocument();
   });
 
-  it("states that the editor is not connected", () => {
+  it("states that the native project cannot be opened", () => {
     render(<ConnectionNotice />);
 
-    expect(screen.getByText(/에디터가 연결되지 않았습니다/)).toBeInTheDocument();
+    expect(screen.getByText(/Native 프로젝트를 열 수 없습니다/)).toBeInTheDocument();
+    expect(screen.getByText(/project\.json/)).toBeInTheDocument();
   });
 });

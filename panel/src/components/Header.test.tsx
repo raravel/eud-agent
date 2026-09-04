@@ -50,27 +50,27 @@ describe("Header — title + project + connection", () => {
   });
 });
 
-describe("Header — connection chip no-project suffix", () => {
-  it("appends '· 프로젝트 없음' when the editor is connected but no project is open", () => {
+describe("Header — native project status", () => {
+  it("appends '· 프로젝트 없음' when native storage is available without a project", () => {
     render(
       <Header
         project=""
         connected={true}
         phase="ready"
-        editorConnected={true}
+        projectAvailable={true}
         hasProject={false}
       />,
     );
     expect(screen.getByText("연결됨 · 프로젝트 없음")).toBeInTheDocument();
   });
 
-  it("shows plain '연결됨' when a project is open", () => {
+  it("shows plain '연결됨' when a native project is open", () => {
     render(
       <Header
         project="MyMap"
         connected={true}
         phase="ready"
-        editorConnected={true}
+        projectAvailable={true}
         hasProject={true}
       />,
     );
@@ -78,13 +78,13 @@ describe("Header — connection chip no-project suffix", () => {
     expect(screen.queryByText(/프로젝트 없음/)).not.toBeInTheDocument();
   });
 
-  it("does not append the suffix when the editor is disconnected (banner covers it)", () => {
+  it("leaves project unavailability to the dedicated notice", () => {
     render(
       <Header
         project=""
         connected={true}
         phase="ready"
-        editorConnected={false}
+        projectAvailable={false}
         hasProject={false}
       />,
     );
@@ -138,62 +138,6 @@ describe("Header — RAG state visibility", () => {
   });
 });
 
-describe("Header — 에디터 켜기 button", () => {
-  it("is hidden when no launch handler is provided", () => {
-    render(<Header project="" connected={false} phase="connecting" />);
-    expect(
-      screen.queryByRole("button", { name: "에디터 켜기" }),
-    ).not.toBeInTheDocument();
-  });
-
-  it("launches the editor on click when disconnected", async () => {
-    const onLaunchEditor = vi.fn();
-    render(
-      <Header
-        project=""
-        connected={false}
-        phase="connecting"
-        editorConnected={false}
-        onLaunchEditor={onLaunchEditor}
-      />,
-    );
-    const button = screen.getByRole("button", { name: "에디터 켜기" });
-    expect(button).toBeEnabled();
-    await userEvent.click(button);
-    expect(onLaunchEditor).toHaveBeenCalledTimes(1);
-  });
-
-  it("is disabled when the editor is already connected (no re-launch)", () => {
-    render(
-      <Header
-        project="MyMap"
-        connected={true}
-        phase="ready"
-        editorConnected={true}
-        onLaunchEditor={vi.fn()}
-      />,
-    );
-    expect(
-      screen.getByRole("button", { name: "에디터 켜기" }),
-    ).toBeDisabled();
-  });
-
-  it("shows a pending label and disables while a launch is in flight", () => {
-    render(
-      <Header
-        project=""
-        connected={false}
-        phase="connecting"
-        editorConnected={false}
-        launchPending={true}
-        onLaunchEditor={vi.fn()}
-      />,
-    );
-    expect(
-      screen.getByRole("button", { name: "여는 중…" }),
-    ).toBeDisabled();
-  });
-});
 
 describe("Header — project tools sidebar", () => {
   it("renders one toggle for the sidebar and calls its handler", async () => {
@@ -228,14 +172,14 @@ describe("Header — project tools sidebar", () => {
 });
 
 describe("Header — Map Agent window", () => {
-  it("opens only when the editor and a project are connected", async () => {
+  it("opens only when a native project is available", async () => {
     const onOpenMapAgent = vi.fn();
     const { rerender } = render(
       <Header
         project=""
         connected={true}
         phase="ready"
-        editorConnected={false}
+        projectAvailable={false}
         hasProject={false}
         onOpenMapAgent={onOpenMapAgent}
       />,
@@ -246,7 +190,7 @@ describe("Header — Map Agent window", () => {
         project="MyMap"
         connected={true}
         phase="ready"
-        editorConnected={true}
+        projectAvailable={true}
         hasProject={true}
         onOpenMapAgent={onOpenMapAgent}
       />,

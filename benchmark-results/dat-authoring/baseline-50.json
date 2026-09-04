@@ -1,0 +1,45 @@
+{
+  "schemaVersion": 2,
+  "benchmark": "dat-authoring",
+  "model": "gpt-5.6-sol",
+  "changeCount": 50,
+  "runsPerMethod": 3,
+  "metricSemantics": "command/file/MCP counts include completed items only",
+  "familyCounts": {
+    "dat": 35,
+    "xdat": 5,
+    "tbl": 5,
+    "requirements": 3,
+    "buttons": 2
+  },
+  "methods": {
+    "jsonFile": {
+      "successes": 3,
+      "averageElapsedMs": 57317,
+      "medianElapsedMs": 52999,
+      "averageInputTokens": 86323,
+      "medianInputTokens": 92077,
+      "averageOutputTokens": 2459,
+      "medianOutputTokens": 2222,
+      "trials": [
+        {"run": 1, "success": true, "elapsedMs": 49438, "commandExecutions": 2, "fileChanges": 1, "inputTokens": 73211, "cachedInputTokens": 58368, "outputTokens": 2150},
+        {"run": 2, "success": true, "elapsedMs": 69515, "commandExecutions": 3, "fileChanges": 1, "inputTokens": 93680, "cachedInputTokens": 70656, "outputTokens": 3006},
+        {"run": 3, "success": true, "elapsedMs": 52999, "commandExecutions": 3, "fileChanges": 1, "inputTokens": 92077, "cachedInputTokens": 59392, "outputTokens": 2222}
+      ]
+    },
+    "mcpTools": {
+      "successes": 3,
+      "averageElapsedMs": 27856,
+      "medianElapsedMs": 27204,
+      "averageInputTokens": 73521,
+      "medianInputTokens": 73171,
+      "averageOutputTokens": 1032,
+      "medianOutputTokens": 1001,
+      "trials": [
+        {"run": 1, "success": true, "elapsedMs": 25817, "mcpToolCalls": 55, "auditOperations": 100, "inputTokens": 72886, "cachedInputTokens": 47104, "outputTokens": 933},
+        {"run": 2, "success": true, "elapsedMs": 27204, "mcpToolCalls": 55, "auditOperations": 100, "inputTokens": 74506, "cachedInputTokens": 58368, "outputTokens": 1001},
+        {"run": 3, "success": true, "elapsedMs": 30546, "mcpToolCalls": 55, "auditOperations": 100, "inputTokens": 73171, "cachedInputTokens": 51456, "outputTokens": 1161}
+      ]
+    }
+  }
+}

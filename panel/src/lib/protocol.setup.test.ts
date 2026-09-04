@@ -22,8 +22,10 @@ describe("setup message guard", () => {
   it("accepts the typed five-provider snapshot", () => {
     const message: SetupMessage = {
       type: "setup",
-      editorPath: "C:\\Editor",
-      editorValid: true,
+      projectPath: "C:\\Project",
+      projectValid: true,
+      euddraftPath: "C:\\euddraft.exe",
+      euddraftValid: true,
       assetsReady: true,
       defaultProvider: "codex",
       providers,
@@ -36,8 +38,10 @@ describe("setup message guard", () => {
   it("accepts nullable option fields emitted by older Rust builds", () => {
     const message = {
       type: "setup",
-      editorPath: "",
-      editorValid: false,
+      projectPath: "",
+      projectValid: false,
+      euddraftPath: "",
+      euddraftValid: false,
       assetsReady: true,
       defaultProvider: null,
       providers: providers.map((status) => ({ ...status, detailCode: null })),
@@ -52,8 +56,10 @@ describe("setup message guard", () => {
     expect(
       isSetupMessage({
         type: "setup",
-        editorPath: "",
-        editorValid: false,
+        projectPath: "",
+        projectValid: false,
+        euddraftPath: "",
+        euddraftValid: false,
         assetsReady: false,
         providers: providers.slice(0, 4),
         setupRequired: true,
@@ -62,8 +68,10 @@ describe("setup message guard", () => {
     expect(
       isSetupMessage({
         type: "setup",
-        editorPath: "",
-        editorValid: false,
+        projectPath: "",
+        projectValid: false,
+        euddraftPath: "",
+        euddraftValid: false,
         assetsReady: false,
         providers: providers.map((status, index) =>
           index === 4 ? { ...status, provider: "other" } : status,
@@ -77,19 +85,23 @@ describe("setup message guard", () => {
     expect(
       isSetupMessage({
         type: "setup",
-        editorPath: "",
-        editorValid: false,
+        projectPath: "",
+        projectValid: false,
+        euddraftPath: "",
+        euddraftValid: false,
         assetsReady: false,
         providers,
         setupRequired: true,
-        error: "invalid_editor_folder",
+        error: "invalid_project_folder",
       }),
     ).toBe(true);
     expect(
       isSetupMessage({
         type: "setup",
-        editorPath: "",
-        editorValid: false,
+        projectPath: "",
+        projectValid: false,
+        euddraftPath: "",
+        euddraftValid: false,
         assetsReady: false,
         providers,
         setupRequired: true,
@@ -99,8 +111,10 @@ describe("setup message guard", () => {
     expect(
       isSetupMessage({
         type: "setup",
-        editorPath: "",
-        editorValid: false,
+        projectPath: "",
+        projectValid: false,
+        euddraftPath: "",
+        euddraftValid: false,
         assetsReady: false,
         providers,
         setupRequired: true,

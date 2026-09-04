@@ -14,9 +14,9 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::bridge_io::{EpsSnapshot, EpsSnapshotFile};
 use crate::config::DataDirs;
-use crate::eps_preflight::normalize_editor_path;
+use crate::native_build::EuddraftLaunch;
+use crate::native_project::{normalize_relative, NativeSourceFile, NativeSourceSnapshot};
 
 const TRACE_MAGIC: &[u8; 16] = b"EUDAGENTTRACEV1!";
 const TRACE_VERSION: u32 = 1;
@@ -215,7 +215,7 @@ struct TraceHeader {
 #[derive(Debug)]
 struct PreparedBuild {
     copied_eds: PathBuf,
-    euddraft: PathBuf,
+    euddraft: EuddraftLaunch,
     source_map: PathBuf,
     staged_map: PathBuf,
     marker: [u8; 32],
@@ -290,7 +290,7 @@ pub fn validate_input(input: &TraceTestInput) -> Result<(), String> {
 }
 
 pub(crate) fn select_persistent_tests(
-    snapshot: &EpsSnapshot,
+    snapshot: &NativeSourceSnapshot,
     input: &TraceSuiteInput,
 ) -> Result<PersistentTraceSelection, String> {
     if !(MIN_TEST_TIMEOUT_MS..=MAX_TEST_TIMEOUT_MS).contains(&input.timeout_ms) {
@@ -307,14 +307,13 @@ pub(crate) fn select_persistent_tests(
 
     let mut sources = BTreeMap::<String, (String, Option<String>)>::new();
     for file in &snapshot.files {
-        let Some(path) = logical_eps_path(file)? else {
-            continue;
-        };
+        let path = logical_eps_path(file)?;
         if !is_persistent_test_path(&path) {
             continue;
         }
         let key = path.to_lowercase();
-        if let Some((previous, _)) = sources.insert(key, (path.clone(), file.content.clone())) {
+        if let Some((previous, _)) = sources.insert(key, (path.clone(), Some(file.content.clone())))
+        {
             return Err(format!(
                 "persistent test paths collide case-insensitively: {previous} and {path}"
             ));
@@ -331,7 +330,7 @@ pub(crate) fn select_persistent_tests(
             let mut seen = BTreeSet::new();
             let mut keys = Vec::with_capacity(requested.len());
             for raw_path in requested {
-                let path = normalize_editor_path(raw_path)?;
+                let path = normalize_relative(raw_path)?;
                 if !is_persistent_test_path(&path) {
                     return Err(format!(
                         "persistent test path must match tests/**/*.tests.eps: {raw_path}"
@@ -372,15 +371,8 @@ pub(crate) fn select_persistent_tests(
     Ok(PersistentTraceSelection { discovered, tests })
 }
 
-fn logical_eps_path(file: &EpsSnapshotFile) -> Result<Option<String>, String> {
-    let editor_path = normalize_editor_path(&file.path)?;
-    if editor_path.to_lowercase().ends_with(".eps") {
-        Ok(Some(editor_path))
-    } else if file.ftype.eq_ignore_ascii_case("CUIEps") {
-        Ok(Some(format!("{editor_path}.eps")))
-    } else {
-        Ok(None)
-    }
+fn logical_eps_path(file: &NativeSourceFile) -> Result<String, String> {
+    normalize_relative(&file.path)
 }
 
 fn is_persistent_test_path(path: &str) -> bool {
@@ -391,7 +383,7 @@ fn is_persistent_test_path(path: &str) -> bool {
 pub(crate) fn run_suite(
     dirs: &DataDirs,
     source_eds: &Path,
-    euddraft: &Path,
+    euddraft: &EuddraftLaunch,
     starcraft_setting: &Path,
     selection: PersistentTraceSelection,
     timeout_ms: u64,
@@ -531,7 +523,7 @@ pub(crate) fn run_suite(
 pub fn run(
     dirs: &DataDirs,
     source_eds: &Path,
-    euddraft: &Path,
+    euddraft: &EuddraftLaunch,
     starcraft_setting: &Path,
     input: TraceTestInput,
     mut on_phase: impl FnMut(TracePhase),
@@ -612,11 +604,9 @@ fn run_inner(
     on_phase: &mut impl FnMut(TracePhase),
 ) -> Result<TraceOutcome, String> {
     on_phase(TracePhase::Build);
-    let captured = crate::edd_runner::run_euddraft_process(
-        &prepared.euddraft,
-        &prepared.copied_eds,
-        EUDDRAFT_TIMEOUT,
-    )?;
+    let captured = prepared
+        .euddraft
+        .run(&prepared.copied_eds, EUDDRAFT_TIMEOUT)?;
     write_build_log(run_root, &captured.stdout, &captured.stderr)?;
     if !captured.success || !prepared.staged_map.is_file() {
         return Ok(TraceOutcome {
@@ -653,7 +643,7 @@ fn run_inner(
 fn prepare_build(
     run_root: &Path,
     source_eds: &Path,
-    euddraft: &Path,
+    euddraft: &EuddraftLaunch,
     input: &TraceTestInput,
     run_token: &str,
 ) -> Result<PreparedBuild, String> {
@@ -661,12 +651,6 @@ fn prepare_build(
         return Err(format!(
             "generated EDS is missing or not absolute: '{}'",
             source_eds.display()
-        ));
-    }
-    if !euddraft.is_absolute() || !euddraft.is_file() {
-        return Err(format!(
-            "euddraft executable is missing or not absolute: '{}'",
-            euddraft.display()
         ));
     }
     let source_parent = source_eds
@@ -749,7 +733,7 @@ fn prepare_build(
 
     Ok(PreparedBuild {
         copied_eds,
-        euddraft: euddraft.to_path_buf(),
+        euddraft: euddraft.clone(),
         source_map,
         staged_map,
         marker,
@@ -1806,28 +1790,28 @@ mod tests {
         }
     }
 
-    fn persistent_snapshot() -> EpsSnapshot {
-        EpsSnapshot {
+    fn persistent_snapshot() -> NativeSourceSnapshot {
+        NativeSourceSnapshot {
             project: "Demo".to_string(),
             identity: "C:/projects/demo".to_string(),
+            main_file: "src/main.eps".to_string(),
+            revision: "revision".to_string(),
             files: vec![
-                EpsSnapshotFile {
-                    path: "tests/wave.tests".to_string(),
-                    ftype: "CUIEps".to_string(),
-                    content: Some(input().code),
+                NativeSourceFile {
+                    path: "tests/wave.tests.eps".to_string(),
+                    content: input().code,
+                    sha256: "wave".to_string(),
                 },
-                EpsSnapshotFile {
+                NativeSourceFile {
                     path: "tests/nested/reward.tests.eps".to_string(),
-                    ftype: "RawText".to_string(),
-                    content: Some(
-                        "function eudAgentTestSetup() {}\nfunction eudAgentTestStep(tick) { eudAgentPass(3); }"
-                            .to_string(),
-                    ),
+                    content: "function eudAgentTestSetup() {}\nfunction eudAgentTestStep(tick) { eudAgentPass(3); }"
+                        .to_string(),
+                    sha256: "reward".to_string(),
                 },
-                EpsSnapshotFile {
-                    path: "main".to_string(),
-                    ftype: "CUIEps".to_string(),
-                    content: Some("function onPluginStart() {}".to_string()),
+                NativeSourceFile {
+                    path: "src/main.eps".to_string(),
+                    content: "function onPluginStart() {}".to_string(),
+                    sha256: "main".to_string(),
                 },
             ],
         }
@@ -1989,19 +1973,6 @@ mod tests {
             )
             .is_err());
         }
-
-        let mut unreadable = persistent_snapshot();
-        unreadable.files[0].content = None;
-        let selected = select_persistent_tests(
-            &unreadable,
-            &TraceSuiteInput {
-                tests: Some(vec!["tests/wave.tests.eps".to_string()]),
-                timeout_ms: 5_000,
-            },
-        )
-        .unwrap();
-        assert_eq!(selected.tests.len(), 1);
-        assert!(selected.tests[0].code.is_none());
     }
 
     #[test]
@@ -2013,7 +1984,7 @@ mod tests {
         let result = run_suite(
             &dirs,
             Path::new("missing.eds"),
-            Path::new("missing-euddraft.exe"),
+            &EuddraftLaunch::Executable(PathBuf::from("missing-euddraft.exe")),
             Path::new("missing-starcraft.exe"),
             PersistentTraceSelection {
                 discovered: vec![path.clone()],
@@ -2035,7 +2006,7 @@ mod tests {
         let unreadable = run_suite(
             &dirs,
             Path::new(""),
-            Path::new(""),
+            &EuddraftLaunch::Executable(PathBuf::new()),
             Path::new(""),
             PersistentTraceSelection {
                 discovered: vec![path.clone()],
@@ -2061,7 +2032,7 @@ mod tests {
         let result = run_suite(
             &dirs,
             Path::new(""),
-            Path::new(""),
+            &EuddraftLaunch::Executable(PathBuf::new()),
             Path::new(""),
             PersistentTraceSelection {
                 discovered: Vec::new(),
@@ -2156,7 +2127,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires a generated live-editor EDS, euddraft, and 32-bit StarCraft"]
+    #[ignore = "requires a generated native EDS, euddraft, and 32-bit StarCraft"]
     fn live_single_test_build_launch_trace_and_cleanup() {
         let dirs = DataDirs::from_bases(
             Path::new(&std::env::var("APPDATA").unwrap()),
@@ -2164,7 +2135,8 @@ mod tests {
         );
         dirs.ensure_dirs().unwrap();
         let source_eds = PathBuf::from(std::env::var("EUD_TRACE_EDS").unwrap());
-        let euddraft = PathBuf::from(std::env::var("EUD_TRACE_EUDDRAFT").unwrap());
+        let euddraft_path = PathBuf::from(std::env::var("EUD_TRACE_EUDDRAFT").unwrap());
+        let euddraft = EuddraftLaunch::resolve(&euddraft_path).unwrap();
         let starcraft = PathBuf::from(std::env::var("EUD_TRACE_STARCRAFT").unwrap());
         let result = run(
             &dirs,
@@ -2209,18 +2181,19 @@ mod tests {
         );
         dirs.ensure_dirs().unwrap();
         let source_eds = PathBuf::from(std::env::var("EUD_TRACE_EDS").unwrap());
-        let euddraft = PathBuf::from(std::env::var("EUD_TRACE_EUDDRAFT").unwrap());
+        let euddraft_path = PathBuf::from(std::env::var("EUD_TRACE_EUDDRAFT").unwrap());
+        let euddraft = EuddraftLaunch::resolve(&euddraft_path).unwrap();
         let starcraft = PathBuf::from(std::env::var("EUD_TRACE_STARCRAFT").unwrap());
-        let snapshot = EpsSnapshot {
+        let snapshot = NativeSourceSnapshot {
             project: "live-suite".to_string(),
             identity: "live-suite".to_string(),
-            files: vec![EpsSnapshotFile {
-                path: "tests/protocol.tests".to_string(),
-                ftype: "CUIEps".to_string(),
-                content: Some(
-                    "function eudAgentTestSetup() {}\nfunction eudAgentTestStep(tick) {\n    if (tick == 8) {\n        if (eudAgentAssertEq(100, 42, 42)) {\n            eudAgentPass(101);\n        }\n    }\n}"
-                        .to_string(),
-                ),
+            main_file: "src/main.eps".to_string(),
+            revision: "live".to_string(),
+            files: vec![NativeSourceFile {
+                path: "tests/protocol.tests.eps".to_string(),
+                content: "function eudAgentTestSetup() {}\nfunction eudAgentTestStep(tick) {\n    if (tick == 8) {\n        if (eudAgentAssertEq(100, 42, 42)) {\n            eudAgentPass(101);\n        }\n    }\n}"
+                    .to_string(),
+                sha256: "live".to_string(),
             }],
         };
         let suite_input = TraceSuiteInput {

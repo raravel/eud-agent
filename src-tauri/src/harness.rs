@@ -1303,7 +1303,7 @@ mod tests {
         dirs.ensure_dirs().unwrap();
         let manager = WorkspaceManager::new(dirs.clone());
         let canonical = manager
-            .prepare_snapshot(&crate::bridge_io::EpsSnapshot {
+            .prepare_snapshot(&crate::source_snapshot::ProjectSnapshot {
                 project: "Project".to_string(),
                 identity: "C:/maps/project.scx".to_string(),
                 files: Vec::new(),

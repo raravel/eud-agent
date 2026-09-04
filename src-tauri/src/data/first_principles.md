@@ -42,7 +42,7 @@ that build of StarCraft.
 - [#31] NEVER call SetPName inside beforeTriggerExec() (it breaks the chatEvent
   plugin) — put it in afterTriggerExec().
 - [#33] NEVER add sounds (wav/ogg) with Korean (non-ASCII) filenames when the
-  map is compiled through the EUD editor. (EUD ERROR)
+  map is compiled through euddraft. Use ASCII content-addressed MPQ paths.
 
 ## NEVER via dat edits (unit / weapon / image / button settings)
 

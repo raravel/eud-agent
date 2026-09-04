@@ -20,9 +20,9 @@ Rust owns `%appdata%\eud-agent\memory\<sanitized-project-name>\`:
 | `lessons.md` | Durable user corrections and their application rule |
 | `meta.json` | Store metadata and source-list hash |
 
-Project names come from bridge STATUS. Windows-invalid filename characters are replaced with `_`;
-trailing dots/spaces are stripped. An empty project disables memory. Writes are atomic UTF-8
-without BOM, each Markdown file has an 8 KiB cap, and absent files read as empty.
+Project names come from native project status. Windows-invalid filename characters are replaced
+with `_`; trailing dots/spaces are stripped. An unavailable project disables memory. Writes are
+atomic UTF-8 without BOM, each Markdown file has an 8 KiB cap, and absent files read as empty.
 
 ## Foreground boundary
 

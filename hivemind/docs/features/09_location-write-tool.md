@@ -14,10 +14,10 @@ check).
 graph LR
     Codex -- "location_write(action,...)" --> Tools[ToolLayer<br/>plan gate + budget]
     Tools --> Svc[MapInfoService.location_write]
-    Svc -- "1 STATUS compiling guard" --> Bridge
-    Svc -- "2 share-probe lock check" --> Map[(OpenMapName .scx)]
+    Svc -- "1 native build marker guard" --> Build[NativeProject build state]
+    Svc -- "2 share-probe lock check" --> Map[(sourceMap .scx)]
     Svc -- "3 full-file backup" --> Bak[(data_dir/map_backups)]
-    Svc -- "4 spawn: locedit map ops" --> Isom[IsomTerrain.exe]
+    Svc -- "4 isom mutation" --> Isom[statically linked isom engine]
     Isom -- "MRGN edit + in-place MPQ save" --> Map
     Tools -- "journal entry {mapPath, backupPath}" --> Journal
     Journal -- "reject -> restore_map_backup" --> Map
@@ -81,8 +81,7 @@ action-budgeted, and journaled, with no plan-approval admission gate. Routed
 
 ## Safety rails (service, in order)
 
-1. **Compiling guard**: bridge STATUS `compiling=true` → refuse (writing the
-   map mid-build races the editor's read).
+1. **Build guard**: a held native euddraft build marker refuses map writes.
 2. **Lock probe**: `CreateFileW` with `dwShareMode=0` — SCMDraft (or anything)
    holding the map open → ERROR_SHARING_VIOLATION → refuse with "close
    SCMDraft and retry". Injectable for tests; non-Windows reads unlocked.
@@ -137,8 +136,7 @@ permission and does not bypass location-write safety rails.
 ## Verification
 
 - Headless (test_chk_info.py): ops-line rendering (tile→px, cp949 names),
-  every refusal rail, CLI-failure surfacing, backup creation/restore, tool
-  registration/gate/journal/rollback — fake spawn + fake bridge.
+  registration/gate/journal/rollback with fake build state and lock probes.
 - Headless with the REAL exe (run 2026-06-06): hill_demo.scx copy — add
   "공격지점" → set → rename → second add → delete → restore_map_backup; the
   digest after every step matched, ids stayed stable, Anywhere untouched.

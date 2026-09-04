@@ -9,7 +9,6 @@ use serde_json::{json, Value};
 use tauri::{Emitter, Manager};
 
 use crate::attachment::AttachmentStore;
-use crate::bridge_io::HEARTBEAT_STALE_AFTER;
 use crate::config::DataDirs;
 use crate::map_candidate::{CandidateStateView, CandidateStore};
 use crate::map_image::{
@@ -82,10 +81,7 @@ struct MapCompilingStatus {
 
 impl CompilingStatus for MapCompilingStatus {
     fn is_compiling(&self) -> bool {
-        crate::ipc::bridge_from_config(&self.dirs)
-            .ok()
-            .and_then(|bridge| bridge.read_status_snapshot(HEARTBEAT_STALE_AFTER).ok())
-            .is_some_and(|status| status.compiling)
+        crate::native_runtime::NativeProjectManager::new(self.dirs.clone()).is_building()
     }
 }
 
@@ -984,12 +980,8 @@ impl MapAgentService {
     }
 
     fn require_editor_idle(&self) -> Result<(), String> {
-        let bridge = crate::ipc::bridge_from_config(&self.dirs)?;
-        let status = bridge
-            .read_status_snapshot(HEARTBEAT_STALE_AFTER)
-            .map_err(|error| format!("editor status is unavailable; Apply is blocked: {error}"))?;
-        if status.compiling {
-            return Err("the editor is compiling; Apply is blocked".to_string());
+        if crate::native_runtime::NativeProjectManager::new(self.dirs.clone()).is_building() {
+            return Err("the native project is building; Apply is blocked".to_string());
         }
         Ok(())
     }

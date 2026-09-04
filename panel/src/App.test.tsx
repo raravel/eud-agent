@@ -153,8 +153,10 @@ beforeEach(() => {
     switch (command) {
       case "setup_status":
         return {
-          editorPath: "C:/Editor",
-          editorValid: true,
+          projectPath: "C:/Project",
+          projectValid: true,
+          euddraftPath: "C:/euddraft/euddraft.exe",
+          euddraftValid: true,
           assetsReady: true,
           defaultProvider: "codex",
           providers: providerStatuses,
@@ -442,8 +444,10 @@ describe("App concurrent sessions", () => {
       if (command === "ask_pending") return null;
       if (command === "setup_status") {
         return {
-          editorPath: "C:/Editor",
-          editorValid: true,
+          projectPath: "C:/Project",
+          projectValid: true,
+          euddraftPath: "C:/euddraft/euddraft.exe",
+          euddraftValid: true,
           assetsReady: true,
           defaultProvider: "codex",
           providers: providerStatuses,
@@ -1156,8 +1160,10 @@ describe("App setup payload compatibility", () => {
     tauri.invoke.mockImplementation(async (command: string, args?: Record<string, unknown>) => {
       if (command === "setup_status") {
         return {
-          editorPath: "C:/Editor",
-          editorValid: true,
+          projectPath: "C:/Project",
+          projectValid: true,
+          euddraftPath: "C:/euddraft/euddraft.exe",
+          euddraftValid: true,
           assetsReady: true,
           defaultProvider: null,
           providers: providerStatuses.map((status) => ({
@@ -1195,8 +1201,10 @@ describe("App provider login cancellation", () => {
     tauri.invoke.mockImplementation(async (command: string, args?: Record<string, unknown>) => {
       if (command === "setup_status") {
         return {
-          editorPath: "C:/Editor",
-          editorValid: true,
+          projectPath: "C:/Project",
+          projectValid: true,
+          euddraftPath: "C:/euddraft/euddraft.exe",
+          euddraftValid: true,
           assetsReady: true,
           defaultProvider: "antigravity",
           providers: firstRunStatuses,

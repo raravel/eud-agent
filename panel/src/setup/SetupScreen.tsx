@@ -17,14 +17,30 @@ import type {
 } from "@/providers/types";
 
 const PICK_ERROR_TEXT: Readonly<Record<string, string>> = {
-  invalid_editor_folder:
-    "선택한 폴더에서 EUD Editor 3을 찾지 못했습니다. Data\\Lua\\TriggerEditor 폴더가 있는 설치 폴더를 선택해 주세요.",
+  invalid_project_folder:
+    "project.json이 있는 Native EUD 프로젝트 폴더를 선택해 주세요.",
+  invalid_euddraft_path: "euddraft.exe 또는 euddraft.py를 선택해 주세요.",
 };
 
+function projectErrorText(error: string): string {
+  if (error.startsWith("project_create_failed:")) {
+    return "프로젝트를 만들지 못했습니다. 원본 맵과 비어 있는 대상 폴더를 확인해 주세요.";
+  }
+  if (error.startsWith("e3s_import_failed:")) {
+    return "E3S를 가져오지 못했습니다. 참조 맵이 존재하고 대상 폴더가 비어 있는지 확인해 주세요.";
+  }
+  return PICK_ERROR_TEXT[error] ?? "설정 경로를 확인하지 못했습니다.";
+}
+
 export interface SetupScreenProps {
-  editorValid: boolean;
+  projectValid: boolean;
+  euddraftValid: boolean;
   pickError: string | null;
-  onPick(): void;
+  onPickProject(): void;
+  onCreateProject(): void;
+  onImportE3s(): void;
+  projectAction?: "open" | "create" | "import" | null;
+  onPickEuddraft(): void;
   view: BootstrapView;
   error: string | null;
   onRetry(): void;
@@ -57,12 +73,23 @@ export interface SetupScreenProps {
   ): Promise<void> | void;
 }
 
-const STEPS = ["에디터 폴더", "에셋 다운로드", "AI 제공자 선택", "선택 제공자 연결"] as const;
+const STEPS = [
+  "프로젝트",
+  "euddraft",
+  "에셋 다운로드",
+  "AI 제공자 선택",
+  "선택 제공자 연결",
+] as const;
 
 export function SetupScreen({
-  editorValid,
+  projectValid,
+  euddraftValid,
   pickError,
-  onPick,
+  onPickProject,
+  onCreateProject,
+  onImportE3s,
+  projectAction = null,
+  onPickEuddraft,
   view,
   error,
   onRetry,
@@ -103,15 +130,17 @@ export function SetupScreen({
     selectedStatus?.availability === "ready" &&
     selectedProvider !== "" &&
     !!selectedModels[selectedProvider];
-  const currentStep = !editorValid
+  const currentStep = !projectValid
     ? 0
-    : !assetsReady
+    : !euddraftValid
       ? 1
-      : !selectedProvider
+      : !assetsReady
         ? 2
-        : selectedConnected
-          ? 4
-          : 3;
+        : !selectedProvider
+          ? 3
+          : selectedConnected
+            ? 5
+            : 4;
 
   return (
     <main className="min-h-dvh overflow-y-auto bg-background px-4 py-8 text-foreground sm:px-8">
@@ -121,13 +150,14 @@ export function SetupScreen({
           <h1 className="mt-2 text-2xl font-semibold tracking-tight sm:text-3xl">
             작업 환경과 AI 제공자를 연결합니다
           </h1>
-          <p className="mx-auto mt-3 max-w-2xl text-sm leading-6 text-muted-foreground">
+          <p className="mx-auto mt-3 max-w-2xl break-keep text-sm leading-6 text-muted-foreground">
             선택한 기본 제공자만 시작 조건입니다. 다른 제공자는 지금 연결하지 않아도 되며,
-            나중에 설정의 AI 제공자 화면에서 관리할 수 있습니다.
+            나중에 설정의 <span className="whitespace-nowrap">AI 제공자 화면에서</span>{" "}
+            관리할 수 있습니다.
           </p>
         </header>
 
-        <ol className="mt-8 grid gap-2 rounded-xl border border-border bg-card/60 p-3 sm:grid-cols-4">
+        <ol className="mt-8 grid gap-2 rounded-xl border border-border bg-card/60 p-3 sm:grid-cols-5">
           {STEPS.map((label, index) => {
             const state = index < currentStep ? "done" : index === currentStep ? "current" : "pending";
             return (
@@ -156,26 +186,79 @@ export function SetupScreen({
           })}
         </ol>
 
-        {!editorValid && (
+        {!projectValid && (
           <section className="mx-auto mt-6 max-w-xl rounded-xl border border-border bg-card p-6 shadow-sm">
-            <h2 className="text-lg font-semibold">EUD Editor 3 설치 폴더</h2>
+            <h2 className="text-lg font-semibold">Native EUD 프로젝트</h2>
             <p className="mt-2 text-sm leading-6 text-muted-foreground">
-              Data\\Lua\\TriggerEditor를 포함한 EUD Editor 3 루트 폴더를 선택해 주세요.
+              기존 프로젝트를 열거나 SCX/SCM에서 새 프로젝트를 만들고, 기존 E3S를
+              <span className="whitespace-nowrap">가져올 수 있습니다.</span>
             </p>
             {pickError && (
               <p role="alert" className="mt-4 flex gap-2 rounded-md border border-destructive/40 bg-destructive/10 p-3 text-sm text-destructive">
                 <CircleAlertIcon aria-hidden className="mt-0.5 size-4 shrink-0" />
-                {PICK_ERROR_TEXT[pickError] ?? "설치 폴더를 확인하지 못했습니다."}
+                {projectErrorText(pickError)}
               </p>
             )}
-            <Button className="mt-5 min-h-11" onClick={onPick}>
+            <div className="mt-5 grid gap-2">
+              <Button
+                className="min-h-11"
+                onClick={onPickProject}
+                disabled={projectAction !== null}
+              >
+                {projectAction === "open" ? (
+                  <Loader2Icon
+                    aria-hidden
+                    className="size-4 animate-spin motion-reduce:animate-none"
+                  />
+                ) : (
+                  <FolderOpenIcon aria-hidden className="size-4" />
+                )}
+                {projectAction === "open"
+                  ? "프로젝트 여는 중…"
+                  : "기존 Native 프로젝트 열기"}
+              </Button>
+              <div className="grid grid-cols-2 gap-2">
+                <Button
+                  variant="outline"
+                  className="min-h-11"
+                  onClick={onCreateProject}
+                  disabled={projectAction !== null}
+                >
+                  {projectAction === "create" ? "만드는 중…" : "새 프로젝트 만들기"}
+                </Button>
+                <Button
+                  variant="outline"
+                  className="min-h-11"
+                  onClick={onImportE3s}
+                  disabled={projectAction !== null}
+                >
+                  {projectAction === "import" ? "가져오는 중…" : "E3S 가져오기"}
+                </Button>
+              </div>
+            </div>
+          </section>
+        )}
+
+        {projectValid && !euddraftValid && (
+          <section className="mx-auto mt-6 max-w-xl rounded-xl border border-border bg-card p-6 shadow-sm">
+            <h2 className="text-lg font-semibold">euddraft 실행 파일</h2>
+            <p className="mt-2 text-sm leading-6 text-muted-foreground">
+              프로젝트를 직접 빌드할 euddraft.exe 또는 euddraft.py를 선택해 주세요.
+            </p>
+            {pickError && (
+              <p role="alert" className="mt-4 flex gap-2 rounded-md border border-destructive/40 bg-destructive/10 p-3 text-sm text-destructive">
+                <CircleAlertIcon aria-hidden className="mt-0.5 size-4 shrink-0" />
+                {projectErrorText(pickError)}
+              </p>
+            )}
+            <Button className="mt-5 min-h-11" onClick={onPickEuddraft}>
               <FolderOpenIcon aria-hidden className="size-4" />
-              폴더 선택
+              euddraft 선택
             </Button>
           </section>
         )}
 
-        {editorValid && !assetsReady && (
+        {projectValid && euddraftValid && !assetsReady && (
           <section className="mx-auto mt-6 max-w-xl rounded-xl border border-border bg-card p-6 shadow-sm">
             <h2 className="text-lg font-semibold">검색 에셋 준비</h2>
             <p className="mt-2 text-sm text-muted-foreground">
@@ -215,7 +298,7 @@ export function SetupScreen({
           </section>
         )}
 
-        {editorValid && assetsReady && (
+        {projectValid && euddraftValid && assetsReady && (
           <section className="mx-auto mt-6 max-w-3xl">
             <div className="rounded-2xl border border-border bg-card/70 p-5 shadow-sm sm:p-6">
               <div className="flex items-start gap-3">

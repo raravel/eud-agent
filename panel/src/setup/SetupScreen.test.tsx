@@ -84,9 +84,13 @@ function renderScreen(
 ) {
   return render(
     <SetupScreen
-      editorValid
+      projectValid
+      euddraftValid
       pickError={null}
-      onPick={vi.fn()}
+      onPickProject={vi.fn()}
+      onCreateProject={vi.fn()}
+      onImportE3s={vi.fn()}
+      onPickEuddraft={vi.fn()}
       view={idleView}
       error={null}
       onRetry={vi.fn()}
@@ -113,17 +117,43 @@ function renderScreen(
 }
 
 describe("SetupScreen five-provider gate", () => {
-  it("shows the editor picker before assets or providers", async () => {
-    const onPick = vi.fn();
-    renderScreen({ editorValid: false, assetsReady: false, onPick });
-    await userEvent.click(screen.getByRole("button", { name: "폴더 선택" }));
-    expect(onPick).toHaveBeenCalledOnce();
+  it("shows native project actions before euddraft, assets, or providers", async () => {
+    const onPickProject = vi.fn();
+    renderScreen({
+      projectValid: false,
+      euddraftValid: false,
+      assetsReady: false,
+      onPickProject,
+    });
+    await userEvent.click(
+      screen.getByRole("button", { name: "기존 Native 프로젝트 열기" }),
+    );
+    expect(onPickProject).toHaveBeenCalledOnce();
+    expect(
+      screen.getByRole("button", { name: "새 프로젝트 만들기" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "E3S 가져오기" }),
+    ).toBeInTheDocument();
     expect(
       screen.queryByRole("heading", { name: "사용할 AI 제공자 선택" }),
     ).not.toBeInTheDocument();
   });
 
-  it("renders determinate asset progress as step two", () => {
+  it("picks euddraft after the project step", async () => {
+    const onPickEuddraft = vi.fn();
+    renderScreen({
+      euddraftValid: false,
+      assetsReady: false,
+      onPickEuddraft,
+    });
+    await userEvent.click(
+      screen.getByRole("button", { name: "euddraft 선택" }),
+    );
+    expect(onPickEuddraft).toHaveBeenCalledOnce();
+  });
+
+  it("renders determinate asset progress as step three", () => {
     renderScreen({
       assetsReady: false,
       view: { pct: 45, label: "문서 인덱스 다운로드", phase: "downloading" },

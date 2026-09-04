@@ -7,7 +7,6 @@
  */
 import {
   MapIcon,
-  MonitorPlay,
   PanelRightClose,
   PanelRightOpen,
   Settings,
@@ -28,26 +27,21 @@ import type { Phase } from "@/state/store";
 export type RagState = "idle" | "loading" | "ready" | "unavailable";
 
 export interface HeaderProps {
-  /** Editor project name from the `status` event ("" when unknown). */
+  /** Native project name from the `status` event ("" when unknown). */
   project: string;
-  /** Whether the transport connection is currently open (store.connected). */
+  /** Whether the in-process Tauri transport is currently open. */
   connected: boolean;
   /** Panel phase — distinguishes "connecting" from "retry" wording. */
   phase: Phase;
   /** RAG model state + elapsed seconds (App tracks rag_warmup timing). */
   rag?: { state: RagState; elapsedSec?: number };
-  /** Whether the EUD Editor bridge is currently connected (store.editorConnected).
-   *  Drives the "에디터 켜기" button's disabled state — a connected editor must not be
-   *  re-launched (single-instance topology) — and the connection chip's no-project
-   *  suffix. */
-  editorConnected?: boolean;
-  /** Whether a project is open in the editor (store.hasProject). When the editor is
-   *  connected but this is false, the connection chip reads "연결됨 · 프로젝트 없음". */
+  /**
+   * Whether the configured native project can currently be read.
+   * When unavailable, the project notice carries the recovery instruction.
+   */
+  projectAvailable?: boolean;
+  /** Whether the native project is open and its source list is available. */
   hasProject?: boolean;
-  /** Whether a launch request is in flight (App awaits `launch_editor`). */
-  launchPending?: boolean;
-  /** Launch the configured EUD Editor 3 install. */
-  onLaunchEditor?: () => void;
   /** Open or focus the separate Map Agent workbench window. */
   onOpenMapAgent?: () => void;
   /** Toggle the project tools sidebar. */
@@ -66,22 +60,21 @@ interface Pill {
   busy?: boolean;
 }
 
-/** Connection-state label + pill tone from connected/phase.
- *
- * When the editor is connected but no project is open (`editorConnected && !hasProject`),
- * the connected label carries a "· 프로젝트 없음" suffix — the no-project state is shown
- * here rather than as a failed-`list` log line. The suffix is gated on `editorConnected`
- * so a downed editor (handled by the ConnectionNotice banner) is not mislabeled. */
+/**
+ * Connection-state label + pill tone. A readable native project with no open
+ * source list gets a no-project suffix; project unavailability is rendered by
+ * ConnectionNotice instead.
+ */
 function connState(
   connected: boolean,
   phase: Phase,
-  editorConnected: boolean,
+  projectAvailable: boolean,
   hasProject: boolean,
 ): Pill {
   if (connected) {
     return {
       label:
-        editorConnected && !hasProject ? "연결됨 · 프로젝트 없음" : "연결됨",
+        projectAvailable && !hasProject ? "연결됨 · 프로젝트 없음" : "연결됨",
       tone: "border-emerald-500/30 bg-emerald-500/15 text-emerald-400",
     };
   }
@@ -149,16 +142,14 @@ export function Header({
   connected,
   phase,
   rag,
-  editorConnected = false,
+  projectAvailable = false,
   hasProject = true,
-  launchPending = false,
-  onLaunchEditor,
   onOpenMapAgent,
   onProjectPanelToggle,
   projectPanelOpen = false,
   onSettingsOpen,
 }: HeaderProps) {
-  const conn = connState(connected, phase, editorConnected, hasProject);
+  const conn = connState(connected, phase, projectAvailable, hasProject);
   const ragInfo = ragPill(rag);
   return (
     <TooltipProvider delayDuration={300}>
@@ -194,26 +185,11 @@ export function Header({
             size="default"
             variant="secondary"
             className="gap-1.5"
-            disabled={!editorConnected || !hasProject}
+            disabled={!projectAvailable || !hasProject}
             onClick={onOpenMapAgent}
           >
             <MapIcon className="size-4" aria-hidden="true" />
             맵 에이전트
-          </Button>
-        )}
-        {onLaunchEditor && (
-          <Button
-            type="button"
-            size="default"
-            variant="outline"
-            className="gap-1.5"
-            // A connected editor must not be re-launched (single-instance topology);
-            // stays visible-but-disabled so the control's home in the header is stable.
-            disabled={editorConnected || launchPending}
-            onClick={onLaunchEditor}
-          >
-            <MonitorPlay className="size-4" aria-hidden="true" />
-            {launchPending ? "여는 중…" : "에디터 켜기"}
           </Button>
         )}
         {ragInfo && <StatusPill pill={ragInfo} />}

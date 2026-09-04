@@ -136,7 +136,7 @@ export function ConversationLog({
   onEditMessage,
   editDisabled = false,
   emptyTitle = "무엇을 만들까요?",
-  emptyDescription = "자연어로 지시하면 epScript 코드를 만들어 에디터에 적용합니다.",
+  emptyDescription = "자연어로 지시하면 epScript와 프로젝트 데이터를 만들고 빌드합니다.",
   renderUserMeta,
   tail,
 }: ConversationLogProps) {

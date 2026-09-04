@@ -15,10 +15,12 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use similar::{DiffTag, TextDiff};
 
-use crate::bridge_io::{BridgeIo, EpsSnapshot, SendOpts, HEARTBEAT_STALE_AFTER};
-use crate::config::{self, DataDirs};
+use crate::config::DataDirs;
 use crate::journal::{JournalEntry, JournalStore, JournalTarget, Snapshot, WriteTool};
 use crate::memory::write_atomic_bytes;
+use crate::source_snapshot::{
+    ProjectSnapshot as EpsSnapshot, ProjectSnapshotFile as EpsSnapshotFile,
+};
 
 pub const SOURCE_DIR: &str = "source";
 pub const TEMP_DIR: &str = ".tmp";
@@ -122,6 +124,24 @@ struct TrustedPlanState {
     markdown_sha256: String,
 }
 
+fn native_eps_snapshot(dirs: &DataDirs) -> Result<EpsSnapshot, String> {
+    let snapshot =
+        crate::native_runtime::NativeProjectManager::new(dirs.clone()).source_snapshot()?;
+    Ok(EpsSnapshot {
+        project: snapshot.project,
+        identity: snapshot.identity,
+        files: snapshot
+            .files
+            .into_iter()
+            .map(|file| EpsSnapshotFile {
+                path: file.path,
+                ftype: "CUIEps".to_string(),
+                content: Some(file.content),
+            })
+            .collect(),
+    })
+}
+
 #[derive(Debug, Clone)]
 pub struct WorkspaceManager {
     dirs: DataDirs,
@@ -132,20 +152,9 @@ impl WorkspaceManager {
         Self { dirs }
     }
 
-    /// Resolve the configured bridge and build the current project's workspace.
+    /// Build the current native project's durable workspace.
     pub fn prepare_current(&self) -> Result<PreparedWorkspace, String> {
-        let config = self.dirs.load_config().map_err(|error| error.to_string())?;
-        let editor_path = config.editor_path.trim();
-        if editor_path.is_empty() {
-            return Err("editor path is not configured".to_string());
-        }
-        let bridge = BridgeIo::new(config::editor_ipc_dir(Path::new(editor_path)));
-        bridge
-            .read_status_snapshot(HEARTBEAT_STALE_AFTER)
-            .map_err(|error| error.to_string())?;
-        let snapshot = bridge
-            .snapshot_eps(&SendOpts::for_epsnapshot(), None)
-            .map_err(|error| error.to_string())?;
+        let snapshot = native_eps_snapshot(&self.dirs)?;
         self.prepare_snapshot(&snapshot)
             .map_err(|error| error.to_string())
     }
@@ -188,21 +197,10 @@ impl WorkspaceManager {
         })
     }
 
-    /// Prepare one session-owned Codex cwd from the latest coherent editor
-    /// snapshot and the canonical accepted document tree.
+    /// Prepare one session-owned Codex cwd from the latest coherent native snapshot and the
+    /// canonical accepted document tree.
     pub fn prepare_session_current(&self, session_id: &str) -> Result<PreparedWorkspace, String> {
-        let config = self.dirs.load_config().map_err(|error| error.to_string())?;
-        let editor_path = config.editor_path.trim();
-        if editor_path.is_empty() {
-            return Err("editor path is not configured".to_string());
-        }
-        let bridge = BridgeIo::new(config::editor_ipc_dir(Path::new(editor_path)));
-        bridge
-            .read_status_snapshot(HEARTBEAT_STALE_AFTER)
-            .map_err(|error| error.to_string())?;
-        let snapshot = bridge
-            .snapshot_eps(&SendOpts::for_epsnapshot(), None)
-            .map_err(|error| error.to_string())?;
+        let snapshot = native_eps_snapshot(&self.dirs)?;
         self.prepare_session_snapshot(&snapshot, session_id)
             .map_err(|error| error.to_string())
     }
@@ -1450,7 +1448,7 @@ fn sync_documents(canonical_root: &Path, session_root: &Path) -> io::Result<()> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bridge_io::EpsSnapshotFile;
+    use crate::source_snapshot::ProjectSnapshotFile as EpsSnapshotFile;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn unique_temp_dir(tag: &str) -> PathBuf {

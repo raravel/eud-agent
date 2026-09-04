@@ -8,8 +8,7 @@ use base64::Engine;
 use encoding_rs::EUC_KR;
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::path::Path;
 use thiserror::Error;
 
 /// Build verification tool name, exempt from the evidence gate.
@@ -387,6 +386,61 @@ fn req_dats_schema() -> Value {
     enum_string_schema(&["units", "upgrades", "techdata", "Stechdata", "orders"])
 }
 
+fn dat_patch_changes_schema() -> Value {
+    let numeric = |kind: &str, dat: Value| {
+        object_schema(
+            json!({
+                "kind": {"const": kind},
+                "dat": dat,
+                "objectId": integer_schema(),
+                "field": string_schema(),
+                "before": numeric_value_schema(),
+                "after": numeric_value_schema(),
+            }),
+            &["kind", "dat", "objectId", "field", "before", "after"],
+        )
+    };
+    json!({
+        "type": "array",
+        "minItems": 1,
+        "maxItems": crate::native_project::MAX_DAT_PATCH_CHANGES,
+        "items": {
+            "oneOf": [
+                numeric("dat", dat_names_schema()),
+                numeric("xdat", xdat_kinds_schema()),
+                object_schema(
+                    json!({
+                        "kind": {"const": "tbl"},
+                        "index": integer_schema(),
+                        "before": string_schema(),
+                        "after": string_schema(),
+                    }),
+                    &["kind", "index", "before", "after"],
+                ),
+                object_schema(
+                    json!({
+                        "kind": {"const": "requirement"},
+                        "dat": req_dats_schema(),
+                        "objectId": integer_schema(),
+                        "before": string_schema(),
+                        "after": string_schema(),
+                    }),
+                    &["kind", "dat", "objectId", "before", "after"],
+                ),
+                object_schema(
+                    json!({
+                        "kind": {"const": "button"},
+                        "setId": integer_schema(),
+                        "before": string_schema(),
+                        "after": string_schema(),
+                    }),
+                    &["kind", "setId", "before", "after"],
+                ),
+            ]
+        }
+    })
+}
+
 fn settings_scopes_schema() -> Value {
     enum_string_schema(&["project", "program"])
 }
@@ -402,7 +456,7 @@ pub fn tool_registry() -> Vec<ToolSpec> {
     vec![
         tool_spec(
             "project_status",
-            "Read current project status and the exact configured EUD Editor start-file path.",
+            "Read current native project status and the exact configured mainFile path.",
             false,
             empty_schema(),
         ),
@@ -643,83 +697,10 @@ pub fn tool_registry() -> Vec<ToolSpec> {
             ),
         ),
         tool_spec(
-            "dat_set",
-            "Write a DAT field value.",
+            "dat_patch",
+            "Atomically validate and stage one complete native DAT/XDAT/TBL/requirements/buttons changeset.",
             true,
-            schema(
-                json!({
-                    "dat": dat_names_schema(),
-                    "param": string_schema(),
-                    "objId": integer_schema(),
-                    "value": numeric_value_schema(),
-                }),
-                &["dat", "param", "objId", "value"],
-            ),
-        ),
-        tool_spec(
-            "xdat_set",
-            "Write an extended DAT field value.",
-            true,
-            schema(
-                json!({
-                    "dat": xdat_kinds_schema(),
-                    "name": string_schema(),
-                    "objId": integer_schema(),
-                    "value": numeric_value_schema(),
-                }),
-                &["dat", "name", "objId", "value"],
-            ),
-        ),
-        tool_spec(
-            "tbl_set",
-            "Write a TBL string value.",
-            true,
-            schema(
-                json!({
-                    "index": integer_schema(),
-                    "value": string_schema(),
-                }),
-                &["index", "value"],
-            ),
-        ),
-        tool_spec(
-            "req_set",
-            "Write a requirements payload.",
-            true,
-            schema(
-                json!({
-                    "dat": req_dats_schema(),
-                    "objId": integer_schema(),
-                    "payload": string_schema(),
-                }),
-                &["dat", "objId", "payload"],
-            ),
-        ),
-        tool_spec(
-            "btn_set",
-            "Write a button set CSV payload.",
-            true,
-            schema(
-                json!({
-                    "setId": integer_schema(),
-                    "csv": string_schema(),
-                }),
-                &["setId", "csv"],
-            ),
-        ),
-        tool_spec(
-            "dat_reset",
-            "Reset a DAT, XDAT, or TBL value.",
-            true,
-            schema(
-                json!({
-                    "kind": enum_string_schema(&["dat", "xdat", "tbl"]),
-                    "dat": string_schema(),
-                    "param": string_schema(),
-                    "objId": integer_schema(),
-                }),
-                &["kind", "objId"],
-            ),
+            schema(json!({"changes": dat_patch_changes_schema()}), &["changes"]),
         ),
         tool_spec(
             "file_create",
@@ -857,7 +838,7 @@ pub fn tool_registry() -> Vec<ToolSpec> {
         ),
         tool_spec(
             BUILD_RUN_TOOL,
-            "Run the editor build. Returns {ok, errors}; on an editor failure without macro errors, re-runs euddraft once to capture structured diagnostics.",
+            "Generate deterministic native build artifacts, run configured euddraft, require a fresh output map, and return structured diagnostics.",
             true,
             empty_schema(),
         ),
@@ -1809,6 +1790,15 @@ fn validate_arg_value(
         ));
     }
 
+    if let Some(expected) = property_schema.get("const") {
+        if value != expected {
+            return admission_error(&format!(
+                "invalid value for '{name}': expected constant {expected}"
+            ));
+        }
+        return Ok(());
+    }
+
     if let Some(values) = property_schema.get("enum").and_then(Value::as_array) {
         validate_string(spec, name, value)?;
         let Some(actual) = value.as_str() else {
@@ -2008,6 +1998,31 @@ fn validate_union_type(
 
 fn validate_first_principles(spec: &ToolSpec, args: &Value) -> ToolResult<()> {
     match spec.name {
+        "dat_patch" => {
+            if let Some(changes) = args.get("changes").and_then(Value::as_array) {
+                for change in changes {
+                    match change.get("kind").and_then(Value::as_str) {
+                        Some("button") => {
+                            if let Some(csv) = change.get("after").and_then(Value::as_str) {
+                                validate_btn_csv(csv)?;
+                            }
+                        }
+                        Some("xdat") => {
+                            let dat = change.get("dat").and_then(Value::as_str);
+                            let name = change.get("field").and_then(Value::as_str);
+                            let obj_id = change.get("objectId").and_then(Value::as_i64);
+                            let value = change.get("after").and_then(parse_numeric_arg);
+                            if let (Some(dat), Some(name), Some(obj_id), Some(value)) =
+                                (dat, name, obj_id, value)
+                            {
+                                validate_buttonset_xdat(dat, name, obj_id, value)?;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
         "btn_set" => {
             if let Some(csv) = args.get("csv").and_then(Value::as_str) {
                 validate_btn_csv(csv)?;
@@ -2082,8 +2097,8 @@ pub fn validate_buttonset_xdat(dat: &str, name: &str, obj_id: i64, value: i64) -
             message: format!(
                 "measured hard-crash (2026-06-07): reassigning unit {obj_id}'s ButtonSet \
 to a different set id ({value}) crashes StarCraft on unit selection in both 32-bit and \
-64-bit. Edit the unit's OWN button set in place with btn_set instead; its set id equals \
-the unit id ({obj_id})."
+64-bit. Keep the unit's own set id and edit the matching `button` variant in the same \
+dat_patch; its set id equals the unit id ({obj_id})."
             ),
         });
     }
@@ -2399,53 +2414,6 @@ where
     }))
 }
 
-pub fn location_write<S, L, E>(
-    bridge: &crate::bridge_io::BridgeIo,
-    map_safe: &crate::mapsafe::MapSafe<S, L, E>,
-    journal: &crate::journal::JournalStore,
-    request_id: &str,
-    args: &Value,
-) -> ToolResult<Value>
-where
-    S: crate::mapsafe::CompilingStatus,
-    L: crate::mapsafe::LockProbe,
-    E: crate::mapsafe::MapEngine,
-{
-    let map_path_reply = bridge
-        .send(
-            "GETSET project|OpenMapName",
-            &crate::bridge_io::SendOpts::default(),
-            None,
-        )
-        .map_err(|error| {
-            location_write_error(format!("bridge GETSET OpenMapName failed: {error}"))
-        })?;
-    let map_path = parse_open_map_name_reply(&map_path_reply);
-    if map_path.is_empty() {
-        return Err(location_write_error(
-            "bridge returned an empty project OpenMapName; open or configure a source map",
-        ));
-    }
-
-    let path = Path::new(map_path);
-    let metadata = std::fs::metadata(path).map_err(|error| {
-        location_write_error(format!(
-            "source map file is missing or unreadable: {map_path} ({error})"
-        ))
-    })?;
-    if !metadata.is_file() {
-        return Err(location_write_error(format!(
-            "source map path is not a file: {map_path}"
-        )));
-    }
-
-    let chk = isom::chk_extract(path).map_err(|error| {
-        location_write_error(format!("CHK extraction failed for {map_path}: {error}"))
-    })?;
-    let ts = saved_at_epoch_seconds(SystemTime::now());
-    location_write_apply(map_safe, journal, request_id, path, &chk, args, ts)
-}
-
 pub fn player_setup_apply<S, L, E>(
     map_safe: &crate::mapsafe::MapSafe<S, L, E>,
     journal: &crate::journal::JournalStore,
@@ -2518,50 +2486,6 @@ where
         "players": post_digest.players,
         "startLocations": post_digest.start_locations,
     }))
-}
-
-pub fn player_setup<S, L, E>(
-    bridge: &crate::bridge_io::BridgeIo,
-    map_safe: &crate::mapsafe::MapSafe<S, L, E>,
-    journal: &crate::journal::JournalStore,
-    request_id: &str,
-    args: &Value,
-) -> ToolResult<Value>
-where
-    S: crate::mapsafe::CompilingStatus,
-    L: crate::mapsafe::LockProbe,
-    E: crate::mapsafe::MapEngine,
-{
-    let map_path_reply = bridge
-        .send(
-            "GETSET project|OpenMapName",
-            &crate::bridge_io::SendOpts::default(),
-            None,
-        )
-        .map_err(|error| {
-            player_setup_error(format!("bridge GETSET OpenMapName failed: {error}"))
-        })?;
-    let map_path = parse_open_map_name_reply(&map_path_reply);
-    if map_path.is_empty() {
-        return Err(player_setup_error(
-            "bridge returned an empty project OpenMapName; open or configure a source map",
-        ));
-    }
-
-    let path = Path::new(map_path);
-    let metadata = std::fs::metadata(path).map_err(|error| {
-        player_setup_error(format!(
-            "source map file is missing or unreadable: {map_path} ({error})"
-        ))
-    })?;
-    if !metadata.is_file() {
-        return Err(player_setup_error(format!(
-            "source map path is not a file: {map_path}"
-        )));
-    }
-
-    let ts = saved_at_epoch_seconds(SystemTime::now());
-    player_setup_apply(map_safe, journal, request_id, path, args, ts)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2700,36 +2624,6 @@ where
         "mapPath": map_path.to_string_lossy().to_string(),
         "backupPath": backup.backup_path.to_string_lossy().to_string(),
     }))
-}
-
-pub fn switch_write<S, L, E>(
-    bridge: &crate::bridge_io::BridgeIo,
-    map_safe: &crate::mapsafe::MapSafe<S, L, E>,
-    journal: &crate::journal::JournalStore,
-    request_id: &str,
-    args: &Value,
-) -> ToolResult<Value>
-where
-    S: crate::mapsafe::CompilingStatus,
-    L: crate::mapsafe::LockProbe,
-    E: crate::mapsafe::MapEngine,
-{
-    let (map_path, _) = connected_map_metadata(bridge, SWITCH_WRITE_TOOL)?;
-    let chk = isom::chk_extract(&map_path).map_err(|error| {
-        switch_write_error(format!(
-            "CHK extraction failed for {}: {error}",
-            map_path.display()
-        ))
-    })?;
-    switch_write_apply(
-        map_safe,
-        journal,
-        request_id,
-        &map_path,
-        &chk,
-        args,
-        saved_at_epoch_seconds(SystemTime::now()),
-    )
 }
 
 impl LocWrite {
@@ -3001,10 +2895,16 @@ where
     }
 }
 
-/// Resolve the connected source map, extract its CHK, and return a paged view.
-pub fn map_info(bridge: &crate::bridge_io::BridgeIo, args: &Value) -> ToolResult<Value> {
-    let (map_path, saved_at) = connected_map_metadata(bridge, MAP_INFO_TOOL)?;
-    let chk = isom::chk_extract(&map_path).map_err(|error| {
+pub fn map_info_path(map_path: &Path, args: &Value) -> ToolResult<Value> {
+    let metadata = std::fs::metadata(map_path)
+        .map_err(|error| map_info_error(format!("source map metadata failed: {error}")))?;
+    let saved_at = metadata
+        .modified()
+        .ok()
+        .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|value| value.as_secs())
+        .unwrap_or_default();
+    let chk = isom::chk_extract(map_path).map_err(|error| {
         map_info_error(format!(
             "CHK extraction failed for {}: {error}",
             map_path.display()
@@ -3407,7 +3307,7 @@ fn switch_matches_filter(switch: &crate::chk::MapSwitch, filter: &SwitchFilter) 
     }
 }
 
-pub fn map_minimap(bridge: &crate::bridge_io::BridgeIo, args: &Value) -> ToolResult<Value> {
+pub fn map_minimap_path(map_path: &Path, starcraft_path: &Path, args: &Value) -> ToolResult<Value> {
     let Some(object) = args.as_object() else {
         return Err(map_minimap_error(
             "map_minimap arguments must be a JSON object",
@@ -3423,35 +3323,23 @@ pub fn map_minimap(bridge: &crate::bridge_io::BridgeIo, args: &Value) -> ToolRes
         .get("showUnits")
         .and_then(Value::as_bool)
         .unwrap_or(true);
-
-    let (map_path, saved_at) = connected_map_metadata(bridge, MAP_MINIMAP_TOOL)?;
-    let chk = isom::chk_extract(&map_path).map_err(|error| {
+    let metadata = std::fs::metadata(map_path)
+        .map_err(|error| map_minimap_error(format!("source map metadata failed: {error}")))?;
+    let saved_at = metadata
+        .modified()
+        .ok()
+        .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|value| value.as_secs())
+        .unwrap_or_default();
+    let chk = isom::chk_extract(map_path).map_err(|error| {
         map_minimap_error(format!(
             "CHK extraction failed for {}: {error}",
             map_path.display()
         ))
     })?;
     let digest = crate::chk::digest_chk(&chk);
-
-    let candidates = starcraft_path_candidates(bridge, object)?;
-    let mut failures = Vec::new();
-    let mut rendered = None;
-    for starcraft_path in candidates {
-        match isom::render_map(&map_path, &starcraft_path, 8) {
-            Ok(bmp) => {
-                rendered = Some((bmp, starcraft_path));
-                break;
-            }
-            Err(error) => failures.push(format!("{} ({error})", starcraft_path.display())),
-        }
-    }
-    let Some((bmp, starcraft_path)) = rendered else {
-        return Err(map_minimap_error(format!(
-            "native terrain render failed; checked StarCraft data paths: {}. Pass starcraftPath explicitly when the game data is elsewhere",
-            failures.join(", ")
-        )));
-    };
-
+    let bmp = isom::render_map(map_path, starcraft_path, 8)
+        .map_err(|error| map_minimap_error(format!("native terrain render failed: {error}")))?;
     let (source_width, source_height, source_rgb) = decode_bmp24(&bmp)?;
     let (width, height, mut rgb) =
         resize_rgb_to_fit(source_width, source_height, &source_rgb, max_size as usize);
@@ -3459,20 +3347,14 @@ pub fn map_minimap(bridge: &crate::bridge_io::BridgeIo, args: &Value) -> ToolRes
         overlay_units(&mut rgb, width, height, &digest);
     }
     let png = encode_png(width, height, &rgb)?;
-
     Ok(json!({
         "map": {
             "path": map_path.to_string_lossy().to_string(),
             "savedAt": saved_at,
         },
-        "layers": {
-            "terrain": true,
-            "units": show_units,
-        },
+        "layers": {"terrain": true, "units": show_units},
         "unitCount": if show_units { digest.units.len() } else { 0 },
-        "renderer": {
-            "starcraftPath": starcraft_path.to_string_lossy().to_string(),
-        },
+        "renderer": {"starcraftPath": starcraft_path.to_string_lossy().to_string()},
         "image": {
             "mimeType": "image/png",
             "width": width,
@@ -3480,34 +3362,6 @@ pub fn map_minimap(bridge: &crate::bridge_io::BridgeIo, args: &Value) -> ToolRes
             "data": BASE64_STANDARD.encode(png),
         },
     }))
-}
-
-fn starcraft_path_candidates(
-    bridge: &crate::bridge_io::BridgeIo,
-    args: &Map<String, Value>,
-) -> ToolResult<Vec<PathBuf>> {
-    if let Some(path) = args.get("starcraftPath").and_then(Value::as_str) {
-        if path.trim().is_empty() {
-            return Err(map_minimap_error("starcraftPath must not be empty"));
-        }
-        return Ok(vec![PathBuf::from(path)]);
-    }
-
-    let mut candidates = Vec::new();
-    if let Some(path) = std::env::var_os("STARCRAFT_PATH") {
-        candidates.push(PathBuf::from(path));
-    }
-    candidates.push(PathBuf::from(r"C:\Program Files (x86)\StarCraft"));
-    if let Some(editor_root) = bridge
-        .data_dir()
-        .parent()
-        .and_then(Path::parent)
-        .map(Path::to_path_buf)
-    {
-        candidates.push(editor_root);
-    }
-    candidates.dedup();
-    Ok(candidates)
 }
 
 fn decode_bmp24(bmp: &[u8]) -> ToolResult<(usize, usize, Vec<u8>)> {
@@ -3651,64 +3505,6 @@ fn encode_png(width: usize, height: usize, rgb: &[u8]) -> ToolResult<Vec<u8>> {
             .map_err(|error| map_minimap_error(format!("PNG encoding failed: {error}")))?;
     }
     Ok(output)
-}
-
-pub(crate) fn connected_map_metadata(
-    bridge: &crate::bridge_io::BridgeIo,
-    tool: &str,
-) -> ToolResult<(PathBuf, u64)> {
-    let reply = bridge
-        .send(
-            "GETSET project|OpenMapName",
-            &crate::bridge_io::SendOpts::default(),
-            None,
-        )
-        .map_err(|error| {
-            map_tool_error(tool, format!("bridge GETSET OpenMapName failed: {error}"))
-        })?;
-    let map_path = parse_open_map_name_reply(&reply);
-    if map_path.is_empty() {
-        return Err(map_tool_error(
-            tool,
-            "bridge returned an empty project OpenMapName; open or configure a source map",
-        ));
-    }
-    let path = PathBuf::from(map_path);
-    let metadata = std::fs::metadata(&path).map_err(|error| {
-        map_tool_error(
-            tool,
-            format!("source map file is missing or unreadable: {map_path} ({error})"),
-        )
-    })?;
-    if !metadata.is_file() {
-        return Err(map_tool_error(
-            tool,
-            format!("source map path is not a file: {map_path}"),
-        ));
-    }
-    let saved_at = metadata
-        .modified()
-        .map(saved_at_epoch_seconds)
-        .map_err(|error| map_tool_error(tool, format!("could not read map mtime: {error}")))?;
-    Ok((path, saved_at))
-}
-
-fn saved_at_epoch_seconds(time: SystemTime) -> u64 {
-    time.duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or(0)
-}
-
-fn parse_open_map_name_reply(reply: &str) -> &str {
-    let trimmed = reply.trim();
-    let Some((prefix, value)) = trimmed.split_once(" = ") else {
-        return trimmed;
-    };
-    if prefix.trim() == "OK: project|OpenMapName" {
-        value.trim()
-    } else {
-        trimmed
-    }
 }
 
 fn map_tool_error(tool: &str, message: impl Into<String>) -> ToolError {
@@ -4876,10 +4672,6 @@ mod tests {
         serde_json::json!({"type": "integer"})
     }
 
-    fn numeric_value_schema() -> serde_json::Value {
-        serde_json::json!({"type": ["integer", "string"]})
-    }
-
     fn integer_or_string_schema() -> serde_json::Value {
         serde_json::json!({"type": ["integer", "string"], "x-eud-allowAnyString": true})
     }
@@ -5235,76 +5027,11 @@ mod tests {
                 schema(serde_json::json!({"reason": string_schema()}), &["reason"]),
             ),
             (
-                "dat_set",
+                "dat_patch",
                 true,
                 schema(
-                    serde_json::json!({
-                        "dat": dat_names_schema(),
-                        "param": string_schema(),
-                        "objId": integer_schema(),
-                        "value": numeric_value_schema(),
-                    }),
-                    &["dat", "param", "objId", "value"],
-                ),
-            ),
-            (
-                "xdat_set",
-                true,
-                schema(
-                    serde_json::json!({
-                        "dat": xdat_kinds_schema(),
-                        "name": string_schema(),
-                        "objId": integer_schema(),
-                        "value": numeric_value_schema(),
-                    }),
-                    &["dat", "name", "objId", "value"],
-                ),
-            ),
-            (
-                "tbl_set",
-                true,
-                schema(
-                    serde_json::json!({
-                        "index": integer_schema(),
-                        "value": string_schema(),
-                    }),
-                    &["index", "value"],
-                ),
-            ),
-            (
-                "req_set",
-                true,
-                schema(
-                    serde_json::json!({
-                        "dat": req_dats_schema(),
-                        "objId": integer_schema(),
-                        "payload": string_schema(),
-                    }),
-                    &["dat", "objId", "payload"],
-                ),
-            ),
-            (
-                "btn_set",
-                true,
-                schema(
-                    serde_json::json!({
-                        "setId": integer_schema(),
-                        "csv": string_schema(),
-                    }),
-                    &["setId", "csv"],
-                ),
-            ),
-            (
-                "dat_reset",
-                true,
-                schema(
-                    serde_json::json!({
-                        "kind": enum_string_schema(&["dat", "xdat", "tbl"]),
-                        "dat": string_schema(),
-                        "param": string_schema(),
-                        "objId": integer_schema(),
-                    }),
-                    &["kind", "objId"],
+                    serde_json::json!({"changes": dat_patch_changes_schema()}),
+                    &["changes"],
                 ),
             ),
             (
@@ -5597,9 +5324,8 @@ mod tests {
             .find(|spec| spec.name == "project_status")
             .expect("project_status must be registered");
 
-        assert!(!spec.mutating, "project_status must remain read-only");
-        assert!(spec.description.contains("exact configured EUD Editor"));
-        assert!(spec.description.contains("start-file path"));
+        assert!(spec.description.contains("native project"));
+        assert!(spec.description.contains("mainFile path"));
     }
 
     #[test]
@@ -6044,18 +5770,6 @@ mod tests {
         assert_eq!(value["usages"][0]["triggerId"], 3);
         assert_eq!(value["usages"][0]["kind"], "condition");
         assert_eq!(value["usages"][0]["operation"], "set");
-    }
-
-    #[test]
-    fn map_info_open_map_reply_accepts_bridge_ok_line_and_raw_path() {
-        assert_eq!(
-            parse_open_map_name_reply("OK: project|OpenMapName = C:/maps/demo.scx\r\n"),
-            "C:/maps/demo.scx"
-        );
-        assert_eq!(
-            parse_open_map_name_reply("C:/maps/demo.scx\n"),
-            "C:/maps/demo.scx"
-        );
     }
 
     fn map_operation<'a>(alternatives: &'a [Value], name: &str) -> &'a Value {
@@ -6706,29 +6420,24 @@ mod tests {
     #[test]
     fn mcp_advertisement_uses_real_input_schema_names_verbatim() {
         let descriptors = mcp_tool_descriptors();
-        let xdat_set = descriptors
+        let dat_patch = descriptors
             .iter()
-            .find(|descriptor| descriptor["name"] == "xdat_set")
-            .expect("xdat_set must be advertised to MCP");
+            .find(|descriptor| descriptor["name"] == "dat_patch")
+            .expect("dat_patch must be advertised to MCP");
 
         assert_eq!(
-            xdat_set["inputSchema"],
+            dat_patch["inputSchema"],
             schema(
-                serde_json::json!({
-                    "dat": xdat_kinds_schema(),
-                    "name": string_schema(),
-                    "objId": integer_schema(),
-                    "value": numeric_value_schema(),
-                }),
-                &["dat", "name", "objId", "value"],
+                serde_json::json!({"changes": dat_patch_changes_schema()}),
+                &["changes"],
             )
         );
         assert!(
-            xdat_set.get("parameters").is_none(),
+            dat_patch.get("parameters").is_none(),
             "MCP advertisement must use inputSchema, not a derived generic parameters wrapper"
         );
         assert!(
-            xdat_set["description"]
+            dat_patch["description"]
                 .as_str()
                 .is_some_and(|description| !description.is_empty()),
             "MCP descriptor must carry the registry description"

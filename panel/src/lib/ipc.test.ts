@@ -13,6 +13,7 @@ import {
   isAgentTurnEndTransition,
   notificationSoundPreview,
   mentionSearch,
+  projectExportE3s,
   workspaceList,
   workspaceRead,
   workspaceSearch,
@@ -460,7 +461,7 @@ describe("request/response messages", () => {
 });
 
 describe("readiness", () => {
-  it("opens the transport on listener registration, independent of the editor snapshot, without a reconnect loop", async () => {
+  it("opens transport independently from the native project snapshot", async () => {
     const { invoke, listen } = makeHarness();
     const status = deferred<{ compiling: boolean; project: string }>();
     const list = deferred<{ files: [] }>();
@@ -470,35 +471,34 @@ describe("readiness", () => {
       return Promise.resolve(undefined);
     });
     const openChanges: boolean[] = [];
-    const editorChanges: boolean[] = [];
+    const projectChanges: boolean[] = [];
     const client = new IpcClient({
       invoke,
       listen,
       onMessage: () => {},
       onOpenChange: (open) => openChanges.push(open),
-      onEditorChange: (connected) => editorChanges.push(connected),
+      onProjectAvailabilityChange: (available) => projectChanges.push(available),
     });
 
     await client.connect();
     expect(listen).toHaveBeenCalled();
-    // Transport open the moment listeners register — NOT gated on the editor.
+    // Transport opens when listeners register; project validation is separate.
     expect(openChanges).toEqual([true]);
     expect(client.isOpen()).toBe(true);
-    expect(editorChanges).toEqual([]);
+    expect(projectChanges).toEqual([]);
 
     const refreshing = client.refresh();
     await flushMicrotasks();
-    // The editor edge fires only once both the status probe and the edge-driven
-    // list round-trip resolve.
-    expect(editorChanges).toEqual([]);
+    // Availability resolves only after status and the edge-driven source list.
+    expect(projectChanges).toEqual([]);
 
     status.resolve({ compiling: false, project: "map.scx" });
     await flushMicrotasks();
-    expect(editorChanges).toEqual([]);
+    expect(projectChanges).toEqual([]);
 
     list.resolve({ files: [] });
     expect(await refreshing).toBe(true);
-    expect(editorChanges).toEqual([true]);
+    expect(projectChanges).toEqual([true]);
     // refresh() never re-touches the transport.
     expect(openChanges).toEqual([true]);
 
@@ -509,49 +509,44 @@ describe("readiness", () => {
     expect(listen).toHaveBeenCalledTimes(listenCalls);
   });
 
-  it("treats a failed editor probe as editor-down (transport stays open) and recovers on a later refresh()", async () => {
-    // The editor heartbeat being stale/absent must NOT read as a dead transport:
-    // listeners stay alive (bootstrap progress still flows), the transport stays
-    // open, and only editor liveness flips — recovering automatically when a
-    // later poll succeeds.
+  it("keeps transport open while a native project disappears and later recovers", async () => {
     const { invoke, listen, listeners, unlisteners } = makeHarness();
-    let editorUp = false;
+    let projectUp = false;
     invoke.mockImplementation(async (command: string) => {
       if (command === "status") {
-        if (!editorUp) throw new Error("editor not connected");
+        if (!projectUp) throw new Error("native project unavailable");
         return { compiling: false, project: "map.scx" };
       }
       if (command === "list") {
-        if (!editorUp) throw new Error("editor not connected");
+        if (!projectUp) throw new Error("native project unavailable");
         return { files: [] };
       }
       return undefined;
     });
     const received: ServerMessage[] = [];
     const openChanges: boolean[] = [];
-    const editorChanges: boolean[] = [];
+    const projectChanges: boolean[] = [];
     const client = new IpcClient({
       invoke,
       listen,
       onMessage: (m) => received.push(m),
       onOpenChange: (open) => openChanges.push(open),
-      onEditorChange: (connected) => editorChanges.push(connected),
+      onProjectAvailabilityChange: (available) => projectChanges.push(available),
     });
 
     await client.connect();
-    // Transport open from connect; the first editor probe fails -> editor-down.
+    // The first native status failure gates project work, not the transport.
     expect(openChanges).toEqual([true]);
     expect(client.isOpen()).toBe(true);
     expect(await client.refresh()).toBe(false);
-    expect(editorChanges).toEqual([false]);
-    // Transport untouched by the editor probe; listeners intact.
+    expect(projectChanges).toEqual([false]);
     expect(openChanges).toEqual([true]);
     expect(client.isOpen()).toBe(true);
     for (const unlisten of unlisteners) {
       expect(unlisten).not.toHaveBeenCalled();
     }
 
-    // Push events still flow while the editor is down.
+    // Bootstrap push events still flow while project storage is unavailable.
     listeners.get("progress")?.({
       payload: { stage: "bootstrap", pct: 10, detail: "downloading rag index" },
     });
@@ -562,13 +557,13 @@ describe("readiness", () => {
       detail: "downloading rag index",
     });
 
-    // A steady-state repeat failure stays quiet (no edge) — the poll never spams.
+    // Repeated failures are edge-suppressed; a later successful refresh recovers.
     expect(await client.refresh()).toBe(false);
-    expect(editorChanges).toEqual([false]);
+    expect(projectChanges).toEqual([false]);
 
-    editorUp = true;
+    projectUp = true;
     expect(await client.refresh()).toBe(true);
-    expect(editorChanges).toEqual([false, true]);
+    expect(projectChanges).toEqual([false, true]);
     expect(openChanges).toEqual([true]);
     expect(received).toContainEqual({
       type: "status",
@@ -603,8 +598,10 @@ describe("setup commands", () => {
     invoke.mockImplementation(async (command: string) => {
       if (command === "setup_status") {
         return {
-          editorPath: "",
-          editorValid: false,
+          projectPath: "",
+          projectValid: false,
+          euddraftPath: "",
+          euddraftValid: false,
           assetsReady: false,
           defaultProvider: null,
           providers: nullableProviders,
@@ -626,8 +623,10 @@ describe("setup commands", () => {
     expect(invoke).toHaveBeenCalledWith("setup_status", {});
     expect(received).toContainEqual({
       type: "setup",
-      editorPath: "",
-      editorValid: false,
+      projectPath: "",
+      projectValid: false,
+      euddraftPath: "",
+      euddraftValid: false,
       assetsReady: false,
       defaultProvider: null,
       providers: nullableProviders,
@@ -636,17 +635,19 @@ describe("setup commands", () => {
     });
   });
 
-  it("dispatches the setup_pick_editor_path response as a setup message", async () => {
+  it("dispatches the native project picker response as a setup message", async () => {
     const { invoke, listen } = makeHarness();
     invoke.mockImplementation(async (command: string) => {
-      if (command === "setup_pick_editor_path") {
+      if (command === "setup_pick_project_path") {
         return {
-          editorPath: "C:\\Games\\NotTheEditor",
-          editorValid: false,
+          projectPath: "C:\\Projects\\NotNative",
+          projectValid: false,
+          euddraftPath: "",
+          euddraftValid: false,
           assetsReady: false,
           providers: setupProviders,
           setupRequired: true,
-          error: "invalid_editor_folder",
+          error: "invalid_project_folder",
         };
       }
       return undefined;
@@ -658,17 +659,101 @@ describe("setup commands", () => {
       onMessage: (m) => received.push(m),
     });
 
-    await client.send({ type: "setup_pick_editor_path" });
+    await client.send({ type: "setup_pick_project_path" });
 
     expect(received).toContainEqual({
       type: "setup",
-      editorPath: "C:\\Games\\NotTheEditor",
-      editorValid: false,
+      projectPath: "C:\\Projects\\NotNative",
+      projectValid: false,
+      euddraftPath: "",
+      euddraftValid: false,
       assetsReady: false,
       providers: setupProviders,
       setupRequired: true,
-      error: "invalid_editor_folder",
+      error: "invalid_project_folder",
     });
+  });
+
+  it.each(["setup_create_project", "setup_import_e3s"] as const)(
+    "dispatches the %s response as a setup message",
+    async (command) => {
+      const response = {
+        projectPath: "C:\\Projects\\Native",
+        projectValid: true,
+        euddraftPath: "C:\\Tools\\euddraft.exe",
+        euddraftValid: true,
+        assetsReady: true,
+        defaultProvider: "codex",
+        providers: setupProviders,
+        setupRequired: false,
+      };
+      const { invoke, listen } = makeHarness();
+      invoke.mockResolvedValue(response);
+      const received: ServerMessage[] = [];
+      const client = new IpcClient({
+        invoke,
+        listen,
+        onMessage: (message) => received.push(message),
+      });
+
+      await client.send({ type: command });
+
+      expect(invoke).toHaveBeenCalledWith(command, {});
+      expect(received).toContainEqual({ type: "setup", ...response });
+    },
+  );
+
+  it("dispatches the euddraft picker response as a setup message", async () => {
+    const { invoke, listen } = makeHarness();
+    invoke.mockImplementation(async (command: string) => {
+      if (command === "setup_pick_euddraft_path") {
+        return {
+          projectPath: "C:\\Projects\\Native",
+          projectValid: true,
+          euddraftPath: "C:\\Tools\\NotEuddraft.exe",
+          euddraftValid: false,
+          assetsReady: false,
+          providers: setupProviders,
+          setupRequired: true,
+          error: "invalid_euddraft_path",
+        };
+      }
+      return undefined;
+    });
+    const received: ServerMessage[] = [];
+    const client = new IpcClient({
+      invoke,
+      listen,
+      onMessage: (m) => received.push(m),
+    });
+
+    await client.send({ type: "setup_pick_euddraft_path" });
+
+    expect(received).toContainEqual({
+      type: "setup",
+
+      projectPath: "C:\\Projects\\Native",
+      projectValid: true,
+      euddraftPath: "C:\\Tools\\NotEuddraft.exe",
+      euddraftValid: false,
+      assetsReady: false,
+      providers: setupProviders,
+      setupRequired: true,
+      error: "invalid_euddraft_path",
+    });
+  });
+  it("returns a typed E3S export path and preserves dialog cancellation", async () => {
+    const invoke = vi
+      .fn()
+      .mockResolvedValueOnce({ path: "C:\\Exports\\demo.e3s" })
+      .mockResolvedValueOnce(null);
+
+    await expect(projectExportE3s(invoke)).resolves.toEqual({
+      path: "C:\\Exports\\demo.e3s",
+    });
+    await expect(projectExportE3s(invoke)).resolves.toBeNull();
+    expect(invoke).toHaveBeenNthCalledWith(1, "project_export_e3s");
+    expect(invoke).toHaveBeenNthCalledWith(2, "project_export_e3s");
   });
 
   it("sends bootstrap_run without expecting a response payload", async () => {

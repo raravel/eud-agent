@@ -315,10 +315,10 @@ Required tests:
 
 After code and tests pass, update these existing sources of truth; do not create another plan:
 
-- `hivemind/docs/architecture.md` — read-tool flow exposes live MainFile; project architecture policy consumes it.
-- `hivemind/docs/rules.md` — MainFile authority is `GETMAIN`; filename inference and incidental `set_main` are forbidden.
-- `hivemind/docs/features/04_bridge-v2-surface.md` — retain existing `GETMAIN`; document its normal read-tool consumer.
-- `hivemind/docs/features/05_agent-core.md` — `project_status` result includes `mainFile`; architecture guide behavior.
+- `hivemind/docs/architecture.md` — native status and source snapshots expose MainFile.
+- `hivemind/docs/rules.md` — manifest MainFile authority forbids filename inference.
+- `hivemind/docs/features/04_native-project-surface.md` — Native manifest MainFile and source operations are authoritative.
+- `hivemind/docs/features/05_agent-core.md` — project context includes exact MainFile and architecture guidance.
 - `hivemind/docs/features/07_project-memory.md` — structural changes require complete `structure` role/dependency refresh.
 - `hivemind/docs/features/18_epscript-lsp-agent-preflight.md` — candidate-introduced cycles are repaired under architecture policy while analyzer severity remains advisory.
 - `hivemind/docs/verify.md` — focused Rust test commands and connected-editor smoke.
