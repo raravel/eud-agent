@@ -40,6 +40,10 @@ const baseProps = {
   onReload: vi.fn(),
   onPreviewSound: vi.fn(),
   onCodexReload: vi.fn(),
+  onProjectOpen: vi.fn(),
+  onProjectCreate: vi.fn(),
+  onProjectImport: vi.fn(),
+  onProjectExport: vi.fn(),
 };
 
 describe("SettingsDialog", () => {
@@ -66,6 +70,20 @@ describe("SettingsDialog", () => {
     expect(
       screen.getByText(/창이 포커스되어 있지 않을 때만 표시됩니다/),
     ).toBeInTheDocument();
+  });
+
+  it("exposes native project open, create, import, and export actions", () => {
+    const onProjectExport = vi.fn();
+    render(<SettingsDialog {...baseProps} onProjectExport={onProjectExport} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "프로젝트" }));
+    expect(
+      screen.getByRole("button", { name: "기존 Native 프로젝트 열기" }),
+    ).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "새 프로젝트" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "E3S 가져오기" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "E3S 내보내기" }));
+    expect(onProjectExport).toHaveBeenCalledTimes(1);
   });
 
   it("emits one complete settings value for an immediate-save toggle", () => {

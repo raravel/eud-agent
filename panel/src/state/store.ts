@@ -263,17 +263,16 @@ export interface PanelState {
   /** Project open (LIST returned files, even if zero). */
   hasProject: boolean;
   files: FileEntry[];
-  /** Editor project name for the header. */
+  /** Native project name for the header. */
   project: string;
-  /** Editor build-in-progress flag, from the `status` event. */
+  /** Native euddraft build-in-progress flag, from the `status` event. */
   compiling: boolean;
   /**
-   * Editor bridge heartbeat alive. The bridge writes heartbeat.txt/status.txt
-   * and the core reads them; stale/absent heartbeat is reported to the panel.
-   * Defaults true (fail-open) so an old core that never reports editor-down
-   * never locks the panel.
+   * Whether the configured native project can currently be read.
+   * Setup normally guarantees this; runtime path removal or external project
+   * damage flips it false and gates authoring until the next successful refresh.
    */
-  editorConnected: boolean;
+  projectAvailable: boolean;
   /** Active plan card (null until a `plan` event; replaced by higher revision). */
   plan: PlanState | null;
   /** Structured user input currently blocking the AI turn. */
@@ -306,7 +305,7 @@ export interface PanelState {
   // ---- derived selectors (computed on every mutation) ----
   /** Whether the connection is currently open. */
   connected: boolean;
-  /** Send gating v2: connected && hasProject && editorConnected && !busy. */
+  /** Send gating v2: connected && hasProject && projectAvailable && !busy. */
   canSend: boolean;
 }
 
@@ -363,8 +362,8 @@ export interface PanelStore {
    * while "loading". "unknown" is the initial state only (never dispatched).
    */
   ragWarmupChanged(state: Exclude<RagGateState, "unknown">): void;
-  /** Explicit editor bridge heartbeat setter (App/backend can drive this). */
-  editorConnectionChanged(connected: boolean): void;
+  /** Explicit native-project availability setter (App/backend can drive this). */
+  projectAvailabilityChanged(available: boolean): void;
   /** `memory` - populate the memory view and clear local drafts. */
   memoryReceived(project: string, files: Record<MemoryFile, string>): void;
   /** `memory_saved` - commit the saved draft and clear that tab's dirty flag. */
@@ -452,12 +451,12 @@ const BUSY_PHASES: ReadonlySet<Phase> = new Set<Phase>(["thinking"]);
  */
 const NO_PROJECT_MARKER = "no project";
 
-/**
- * Contractual editor-disconnected marker from the core. Matched as a
- * case-insensitive substring (kept lowercase) and used only for state, not
- * rendered raw to the user.
- */
-const EDITOR_DISCONNECTED_MARKER = "editor not connected";
+/** Native project unavailable markers from the core. */
+const PROJECT_UNAVAILABLE_MARKERS = [
+  "native project path not configured",
+  "native project root",
+  "native project unavailable",
+];
 
 /** Notice shown when a reconnect cancels an in-flight turn (features/06 line 52). */
 const RECONNECT_TURN_NOTICE = "재연결로 진행 중이던 작업이 취소되었습니다.";
@@ -501,7 +500,7 @@ export function createPanelStore(): PanelStore {
     files: [] as FileEntry[],
     project: "",
     compiling: false,
-    editorConnected: true,
+    projectAvailable: true,
     plan: null as PlanState | null,
     ask: null as AskState | null,
     changeset: null as ChangesetState | null,
@@ -542,7 +541,7 @@ export function createPanelStore(): PanelStore {
     const canSend =
       core.connected &&
       core.hasProject &&
-      core.editorConnected &&
+      core.projectAvailable &&
       !busy &&
       core.rag !== "loading";
     return {
@@ -551,7 +550,7 @@ export function createPanelStore(): PanelStore {
       files: core.files,
       project: core.project,
       compiling: core.compiling,
-      editorConnected: core.editorConnected,
+      projectAvailable: core.projectAvailable,
       plan: core.plan,
       ask: core.ask,
       changeset: core.changeset,
@@ -715,18 +714,18 @@ export function createPanelStore(): PanelStore {
 
     // ---- inbound server events ----
     applyStatus(msg) {
-      // A status push means the bridge heartbeat is alive. The 2s liveness poll
-      // must not publish an identical snapshot and rerender every session.
+      // A status response proves the configured native project is readable.
+      // Avoid publishing an identical snapshot on each periodic refresh.
       const project = msg.project ?? "";
       const compiling = msg.compiling ?? false;
       if (
-        core.editorConnected &&
+        core.projectAvailable &&
         core.project === project &&
         core.compiling === compiling
       ) {
         return;
       }
-      core.editorConnected = true;
+      core.projectAvailable = true;
       core.project = project;
       core.compiling = compiling;
       emit();
@@ -1016,9 +1015,11 @@ export function createPanelStore(): PanelStore {
       }
       if (
         typeof message === "string" &&
-        message.toLowerCase().includes(EDITOR_DISCONNECTED_MARKER)
+        PROJECT_UNAVAILABLE_MARKERS.some((marker) =>
+          message.toLowerCase().includes(marker),
+        )
       ) {
-        core.editorConnected = false;
+        core.projectAvailable = false;
       }
       emit();
     },
@@ -1035,8 +1036,8 @@ export function createPanelStore(): PanelStore {
       emit();
     },
 
-    editorConnectionChanged(connected) {
-      core.editorConnected = connected;
+    projectAvailabilityChanged(available) {
+      core.projectAvailable = available;
       emit();
     },
 

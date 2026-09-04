@@ -74,7 +74,7 @@ export interface InstructionBoxProps {
   draft?: ChatPayload | null;
   /** Backend-owned bounded resource search used by the generic composer. */
   onMentionSearch?(request: MentionSearchRequest): Promise<MentionSearchResponse>;
-  /** Current editor project identity; a change invalidates unsent mention snapshots. */
+  /** Current native project identity; a change invalidates unsent mention snapshots. */
   projectIdentity?: string;
   /** Selected session/draft identity; mention drafts never cross this boundary. */
   scopeIdentity?: string;
@@ -134,11 +134,11 @@ export function InstructionBox({
   const hasStaleMention = mentions.some((mention) => mention.stale === true);
   const turnInFlight = state.phase === "thinking";
   const ragLoading = state.rag === "loading";
-  const editorDisconnected = !state.editorConnected;
+  const projectUnavailable = !state.projectAvailable;
   const attachmentInputDisabled =
     !canSend || staging || onStageAttachment === undefined;
-  const placeholder = editorDisconnected
-    ? "에디터가 연결되지 않았습니다. EUD Editor 3을 실행하세요"
+  const placeholder = projectUnavailable
+    ? "Native 프로젝트를 열 수 없습니다. project.json 경로를 확인하세요"
     : ragLoading
       ? "RAG 모델 준비 중… 준비가 끝나면 입력할 수 있습니다"
       : state.phase === "plan_review"

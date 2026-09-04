@@ -472,7 +472,7 @@ export function ChangesetView({
                 <div className="flex items-center gap-2 text-sm text-muted-foreground">
                   <Spinner className="size-3.5 shrink-0" />
                   <span>
-                    결정 처리 중… (되돌리기는 에디터에 한 건씩 적용됩니다)
+                    결정 처리 중… (변경사항을 한 건씩 되돌리고 있습니다)
                   </span>
                 </div>
               )}

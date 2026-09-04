@@ -1,112 +1,56 @@
-# Feature 15: Panel transport migration (WebSocket -> Tauri IPC, v2 chat schema)
+# Panel ↔ Tauri IPC
 
-Swap the panel's transport from the localhost WebSocket client to Tauri IPC (`invoke` +
-event listeners). The PANEL's v2 chat protocol is preserved 1:1 — only the wire changes.
-Rendering (Monaco, diff tab, AI Elements/Streamdown, plan/changeset views) is untouched.
+## Transport
 
-> Decision: see [[decisions/13_ipc-v2-chat-contract]] (supersedes [[decisions/11_panel-tauri-ipc]]).
+The panel uses Tauri 2 directly:
 
-## Source of truth
-The panel already speaks the v2 chat protocol (features 05/06: chat-first, plan review,
-changeset accept/reject). That schema is the contract; the Rust backend (feature 11) is
-rebuilt to match it. There is NO instruct/apply/code/applied surface — those v1 messages
-were removed in the panel and must not reappear.
+- panel → core: `invoke(command, camelCaseArgs)`
+- core → panel: `listen(event, handler)`
+- no WebSocket, HTTP server, origin/token handshake, or reconnect socket
 
-## Transport mapping (panel v2 chat schema, 1:1 with the old WS messages)
-Commands (panel -> core, `invoke`):
-| v2 WS message (client->server) | New Tauri command |
-|---|---|
-| `chat {text}` | `invoke("chat", { text })` |
-| `plan_feedback {text}` | `invoke("plan_feedback", { text })` |
-| `plan_approve {}` | `invoke("plan_approve")` |
-| `changeset_decision {decision, ids}` | `invoke("changeset_decision", { decision, ids })` |
-| `cancel {}` | `invoke("cancel")` |
-| compact current thread | `invoke("compact", { sessionId })` |
-| `conversation_rewind {panelLog}` | `invoke("conversation_rewind", { panelLog })` |
-| `reset {}` | `invoke("reset")` |
-| `status {}` | `invoke("status")` |
-| `list {}` | `invoke("list")` |
-| `memory_get {}` | `invoke("memory_get")` |
-| `memory_save {file, content}` | `invoke("memory_save", { file, content })` |
-| model settings | `invoke("codex_model_settings")` |
-| save model settings | `invoke("codex_model_settings_save", { model, reasoningEffort })` |
-| app settings | `invoke("app_settings")` |
-| save app settings | `invoke("app_settings_save", { settings })` |
-| preview notification sound | `invoke("notification_sound_preview")` |
-| deliver attention notification | `invoke("attention_notify", { kind, showOs, sessionId, itemCount? })` |
+`IpcClient.connect()` registers every push listener and then marks transport open. Native project validation is separate and performed by `refresh()`.
 
-Events (core -> panel, `listen`):
-| v2 WS message (server->client) | New Tauri event |
-|---|---|
-| `agent_event {kind, detail, data?}` | `listen("agent_event", ...)` |
-| `answer {text}` | `listen("answer", ...)` |
-| `plan {markdown, revision}` | `listen("plan", ...)` |
-| `changeset {request_id, items}` | `listen("changeset", ...)` |
-| `rollback_result {ids, ok}` | `listen("rollback_result", ...)` |
-| `progress {stage, detail?}` | `listen("progress", ...)` |
-| `error {message}` | `listen("error", ...)` |
-| `status {compiling, project}` | `listen("status", ...)` (push) or command return |
-| `list {files?, error?}` | command return value of `invoke("list")` |
-| `memory {project, files}` | command return value of `invoke("memory_get")` |
-| `memory_saved {file}` | command return value of `invoke("memory_save")` |
-| notification click `{sessionId}` | `listen("notification_activated", ...)` |
+## Refresh
 
-`status`/`list`/`memory_get`/`memory_save`, both `codex_model_settings*` calls,
-`app_settings*`, and `compact` are request/response commands. The IPC client dispatches
-`memory`/`memory_saved` payloads to the store from the command return. The remaining
-server messages are push events delivered via `listen`. `notification_sound_preview` and
-`attention_notify` are fire-and-forget native side effects; the latter reads persisted channel
-settings and receives the panel focus decision plus immutable notification owner through
-`showOs`/`sessionId`. Clicking a toast emits `notification_activated{sessionId}` without changing
-backend ownership; the main panel selects the matching EPS session, while the matching Map panel
-shows and focuses its own window.
-`chat`/`plan_feedback`/`plan_approve` remain pending while their turn streams and resolve
-when it settles. `compact` is session-scoped and remains pending from
-`thread/compact/start` until app-server emits the matching completed `contextCompaction` item.
-`cancel` signals interruption immediately but resolves only after the app-server's interrupted
-`turn/completed`; `conversation_rewind` then replaces the active session's model-visible history.
-`changeset_decision`/`reset` retain their command semantics.
+`refresh()` invokes native `status`, then invokes `list` only after recovery or a project identity change. It reports project availability through `onProjectAvailabilityChange` without changing transport state. Periodic repeats are edge-suppressed.
 
-## Removed from the panel
-- WebSocket connect/reconnect logic, `?token=` handshake, Origin assumptions, and the
-  `server.ready`/port discovery. The single in-process app has no socket.
-- `panel/src/ws/client.ts` (+ test). The shared protocol TYPES in `panel/src/ws/protocol.ts`
-  (ClientMessage/ServerMessage discriminated unions, type guards, and the shared shapes
-  `FileEntry`/`ChangesetItem`/`Diagnostic`/`ProgressStage`) MOVE into the new IPC module
-  (`panel/src/lib/ipc.ts`) or a sibling types module so the store and components keep their
-  imports. After the move, `panel/src/ws/` is deleted.
+A missing/invalid project:
 
-## Connection lifecycle (no socket)
-There is no reconnect loop. The store's connection-lifecycle hooks
-(`wsConnecting`/`wsOpen`/`wsError`) are retained as transport-neutral phase drivers but are
-now driven by IPC readiness, not a socket: the client marks connected once the Tauri event
-listeners are registered and an initial `status`+`list` resolve. "editor not connected" is a
-backend-reported state (feature 11: stale/absent bridge heartbeat) surfaced via an `error`
-event / status, NOT a transport disconnect. Editor-connection UI lands in EUD-120.
+- keeps listeners active;
+- keeps bootstrap/session push events flowing;
+- sets `projectAvailable=false`;
+- gates authoring and shows the native project notice;
+- recovers on a later successful refresh.
 
-## Streaming
-Agent reasoning/answer deltas arrive as `agent_event` events; the existing AI Elements +
-Streamdown pipeline renders them (reasoning dim/collapsible, answer prominent). NEVER render
-raw `agent_event` kind identifiers as user-facing text.
+## Setup/project commands
 
-## Monaco / diff (unchanged constraints)
-- Monaco loads from the `monaco-editor` npm bundle via `loader.config({ monaco })` — no CDN.
-- The diff tab / changeset modified-file rows render the Rust-supplied unified diff with +/-
-  coloring — not Monaco DiffEditor.
+Setup response commands are normalized to the `setup` server message after runtime guarding:
 
-## Edge cases
-- Backend not ready (RAG warming) -> commands still accepted; `rag_warmup` progress shown.
-- Event listener cleanup on unmount to avoid duplicate handlers.
-- One in-flight `changeset_decision` at a time (matches backend EUD-070 background-decision).
+- `setup_status`
+- `setup_pick_project_path`
+- `setup_create_project`
+- `setup_import_e3s`
+- `setup_pick_euddraft_path`
 
-## Implementation
-- `panel/src/lib/ipc.ts` — new Tauri IPC client (replaces `ws/client.ts`); maps the v2
-  chat commands to `invoke` and the v2 server messages to `listen`; re-exports / re-homes
-  the shared protocol types previously in `ws/protocol.ts`.
-- `panel/src/state/*` — store wired to invoke/events instead of WS; lifecycle hooks driven
-  by IPC readiness.
-- `panel/src/App.tsx` — swap `WsClient` for the IPC client; remove WS lifecycle wiring.
-- removed: `panel/src/ws/client.ts`, `panel/src/ws/protocol.ts` (+ tests) once types move.
-- external: `@tauri-apps/api` ^2 (core `invoke` + `event`).
-- [BOUND 2026-06-09 from EUD-119-bc27] `panel/src/lib/protocol.ts` — sibling types module re-homed from `ws/protocol.ts` (ClientMessage/ServerMessage discriminated unions, type guards, and shared shapes FileEntry/ChangesetItem/Diagnostic/ProgressStage); re-exported by `lib/ipc.ts`.
-- [BOUND 2026-06-10 from EUD-120-ecca] `panel/src/components/ConnectionNotice.tsx` — editor-not-connected banner shown when store.editorConnected is false (stale bridge heartbeat); send is gated off via canSend
+`project_export_e3s` is a direct typed helper returning `{path}` or `null` on dialog cancellation.
+
+## Message ownership
+
+Conversation events carry `sessionId`. The panel dispatches them only to the owning session store. Global bootstrap/setup/settings events remain unscoped. Listener registration precedes pending ASK synchronization.
+
+## Runtime guards
+
+`protocol.ts` defines closed discriminated unions and structural guards. Unknown/malformed payloads become diagnostic log entries and never crash rendering.
+
+Setup snapshots require:
+
+- `project_path`, `project_valid`
+- `euddraft_path`, `euddraft_valid`
+- `assets_ready`
+- `codex_resolved`, `codex_authed`
+- `setup_required`
+- optional string `error`
+
+## Verification
+
+`ipc.test.ts` covers listener registration, request/response normalization, no-project vs genuine failure, native project disappearance/recovery, setup create/import dispatch, workspace commands, and malformed response rejection.

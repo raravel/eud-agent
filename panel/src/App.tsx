@@ -58,6 +58,7 @@ import {
   mentionSearch,
   wikiGet,
   notificationSoundPreview,
+  projectExportE3s,
   wikiSave,
   workspaceList,
   workspaceRead,
@@ -106,12 +107,10 @@ const CODEX_POLL_MS = 2000;
 const CODEX_POLL_TIMEOUT_MS = 180000;
 
 /**
- * Editor-liveness poll cadence. The bridge writes heartbeat.txt every ~1s and
- * the core treats a >3s-old heartbeat as stale, so a 2s probe recovers a downed
- * editor within ~1 cycle without churning the file IPC (the probe is the cheap
- * status-only path; the heavier `list` round-trip runs only on edges).
+ * Native project refresh cadence. Status is local filesystem state; the source
+ * list is reloaded only after recovery or a project identity change.
  */
-const EDITOR_POLL_MS = 2000;
+const PROJECT_REFRESH_MS = 2000;
 
 interface BootstrapState {
   active: boolean;
@@ -218,7 +217,7 @@ function syncProjectState(target: PanelStore, source: PanelStore): void {
   else target.wsConnecting();
   target.applyStatus({ compiling: state.compiling, project: state.project });
   target.applyList({ files: state.hasProject ? state.files : undefined });
-  target.editorConnectionChanged(state.editorConnected);
+  target.projectAvailabilityChanged(state.projectAvailable);
   if (state.rag !== "unknown") target.ragWarmupChanged(state.rag);
   if (state.memory) {
     target.memoryReceived(state.memory.project, state.memory.files);
@@ -270,23 +269,22 @@ export default function App() {
     error: null,
   }));
   const bootstrapActiveRef = useRef(false);
-  // First-run manifest check (EUD-132). null until the first `setup` snapshot
-  // arrives; setup_required routes the whole panel to the SetupScreen.
+  // First-run native project/euddraft/bootstrap check. null until the first
+  // `setup` snapshot arrives; setup_required routes the panel to SetupScreen.
   const [setup, setSetup] = useState<SetupMessage | null>(null);
   const bootstrapRunningRef = useRef(false);
-  // Editor-liveness poll gate. Flips true once first-run setup is satisfied (or
-  // a failed setup_status falls back to "assume configured"); the poll effect
-  // then probes the editor every EDITOR_POLL_MS so a stale heartbeat at boot or
-  // a mid-session editor restart recovers automatically.
-  const [editorPollEnabled, setEditorPollEnabled] = useState(false);
+  // Armed after setup completes. A cheap periodic native status refresh detects
+  // external project removal and recovery without affecting the IPC transport.
+  const [projectPollEnabled, setProjectPollEnabled] = useState(false);
+  const projectSetupBusyRef = useRef(false);
+  const [projectSetupAction, setProjectSetupAction] = useState<
+    "open" | "create" | "import" | "export" | null
+  >(null);
   // codex login step (setup screen step 3). The OAuth path spawns the browser
   // flow in the backend and polls codex_login_status until it flips.
   const [codexBusy, setCodexBusy] = useState(false);
   const [codexError, setCodexError] = useState<string | null>(null);
   const codexPollRef = useRef<number | null>(null);
-  // "에디터 켜기": true while the launch_editor command is in flight. The button
-  // re-enables once the editor connects (editorConnected) or the spawn resolves/fails.
-  const [launchPending, setLaunchPending] = useState(false);
   const [sessionSidebarCollapsed, setSessionSidebarCollapsed] = useState(false);
   const [projectSidebarOpen, setProjectSidebarOpen] = useState(true);
   const [projectPanelTab, setProjectPanelTab] =
@@ -502,8 +500,8 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    if (editorPollEnabled) void loadCodexModelSettings();
-  }, [editorPollEnabled, loadCodexModelSettings]);
+    if (projectPollEnabled) void loadCodexModelSettings();
+  }, [projectPollEnabled, loadCodexModelSettings]);
 
   const handleCodexSettingsChange = useCallback(
     async (model: string, reasoningEffort: string) => {
@@ -634,12 +632,17 @@ export default function App() {
           break;
         case "setup":
           setSetup(msg);
+          if (msg.error?.startsWith("project_create_failed:")) {
+            toast.error("Native 프로젝트를 만들지 못했습니다.");
+          } else if (msg.error?.startsWith("e3s_import_failed:")) {
+            toast.error("E3S 프로젝트를 가져오지 못했습니다.");
+          }
           if (!msg.setup_required) {
             bootstrapActiveRef.current = false;
             setBootstrap((prev) =>
               prev.active ? { ...prev, active: false } : prev,
             );
-            setEditorPollEnabled(true);
+            setProjectPollEnabled(true);
           }
           break;
         case "progress": {
@@ -873,17 +876,17 @@ export default function App() {
           }
         }
       },
-      onEditorChange: (connected) => {
-        projectStore.editorConnectionChanged(connected);
+      onProjectAvailabilityChange: (available) => {
+        projectStore.projectAvailabilityChanged(available);
         for (const slot of sessionsRef.current.values()) {
-          slot.store.editorConnectionChanged(connected);
+          slot.store.projectAvailabilityChanged(available);
         }
       },
     });
     clientRef.current = client;
     void client.connect().then(() =>
       client.send({ type: "setup_status" }).then((ok) => {
-        if (!ok) setEditorPollEnabled(true);
+        if (!ok) setProjectPollEnabled(true);
       }),
     );
     return () => {
@@ -893,11 +896,8 @@ export default function App() {
   }, [onMessage, projectStore, syncPendingAsk]);
 
   // `session_loaded` is a SIGNAL only (features/sessions.md): the core emits it
-  // after a session_open reconnect completes. Its payload carries nothing
-  // rendered raw (rules.md forbids raw kind identifiers as user text); the panel
-  // already hydrated from the session_open return value, so this just pulls a
-  // fresh editor snapshot to settle live state. Registered outside the IpcClient
-  // because it is not part of the closed ServerMessage push set.
+  // after a session_open reconnect completes. The panel already hydrated from
+  // the command result, so this only pulls a fresh native project snapshot.
   useEffect(() => {
     let unlisten: (() => void) | undefined;
     let cancelled = false;
@@ -914,28 +914,26 @@ export default function App() {
   }, []);
 
 
-  // Editor-liveness poll. Once armed (first-run setup satisfied), probe the
-  // editor every EDITOR_POLL_MS. The transport stays open throughout, so this
-  // only drives editorConnected (send gate + ConnectionNotice) and recovers a
-  // stale-heartbeat-at-boot or a mid-session editor restart with no user action.
+  // Refresh native project status after setup. The in-process transport remains
+  // open if the project path disappears, and availability recovers automatically.
   useEffect(() => {
-    if (!editorPollEnabled) return;
+    if (!projectPollEnabled) return;
     const client = clientRef.current;
     if (!client) return;
     let cancelled = false;
     const probe = () => {
       if (!cancelled) void client.refresh();
     };
-    probe(); // immediate — no EDITOR_POLL_MS dead window before the first probe
-    const id = window.setInterval(probe, EDITOR_POLL_MS);
+    probe();
+    const id = window.setInterval(probe, PROJECT_REFRESH_MS);
     return () => {
       cancelled = true;
       window.clearInterval(id);
     };
-  }, [editorPollEnabled]);
+  }, [projectPollEnabled]);
 
   // Populate the persistent left sidebar with sessions owned by the current
-  // editor project. Loading a row is read-only and never steals the execution lane.
+  // native project. Loading a row is read-only and never steals the execution lane.
   useEffect(() => {
     const project = projectState.project.trim();
     if (!projectState.hasProject || !project || loadedProjectRef.current === project) {
@@ -1005,12 +1003,15 @@ export default function App() {
     syncPendingAsk,
   ]);
 
-  // Setup flow, download step: once the editor folder is picked (or was already
-  // configured) and assets are still missing, start the bootstrap download.
-  // Progress streams in as `progress {stage: "bootstrap"}`; the final "done"
-  // re-queries setup_status, which dismisses the SetupScreen.
+  // Once native project and euddraft paths are valid, download any missing assets.
   useEffect(() => {
-    if (!setup?.setup_required || !setup.editor_valid || setup.assets_ready) return;
+    if (
+      !setup?.setup_required ||
+      !setup.project_valid ||
+      !setup.euddraft_valid ||
+      setup.assets_ready
+    )
+      return;
     if (bootstrapRunningRef.current) return;
     bootstrapRunningRef.current = true;
     void clientRef.current?.send({ type: "bootstrap_run" }).then(() => {
@@ -1395,8 +1396,54 @@ export default function App() {
     });
   }, []);
 
-  const handlePickEditorPath = useCallback(() => {
-    void clientRef.current?.send({ type: "setup_pick_editor_path" });
+  const runProjectSetupAction = useCallback(
+    (
+      action: "open" | "create" | "import",
+      command:
+        | "setup_pick_project_path"
+        | "setup_create_project"
+        | "setup_import_e3s",
+    ) => {
+      if (projectSetupBusyRef.current) return;
+      const client = clientRef.current;
+      if (!client) return;
+      projectSetupBusyRef.current = true;
+      setProjectSetupAction(action);
+      void client
+        .send({ type: command })
+        .then((ok) => (ok ? client.refresh() : false))
+        .finally(() => {
+          projectSetupBusyRef.current = false;
+          setProjectSetupAction(null);
+        });
+    },
+    [],
+  );
+
+  const handleProjectExport = useCallback(() => {
+    if (projectSetupBusyRef.current) return;
+    projectSetupBusyRef.current = true;
+    setProjectSetupAction("export");
+    void projectExportE3s()
+      .then((result) => {
+        if (result) toast.success(`E3S를 내보냈습니다: ${result.path}`);
+      })
+      .catch((error) => {
+        const detail = String(error);
+        toast.error(
+          detail.includes("compatibility base")
+            ? "E3S에서 가져온 프로젝트만 E3S로 내보낼 수 있습니다."
+            : "E3S를 내보내지 못했습니다. 프로젝트 파일과 대상 경로를 확인해 주세요.",
+        );
+      })
+      .finally(() => {
+        projectSetupBusyRef.current = false;
+        setProjectSetupAction(null);
+      });
+  }, []);
+
+  const handlePickEuddraftPath = useCallback(() => {
+    void clientRef.current?.send({ type: "setup_pick_euddraft_path" });
   }, []);
 
   // Re-query the setup gate after a login attempt so codex_authed (and thus
@@ -1742,29 +1789,6 @@ export default function App() {
     return () => media.removeEventListener("change", adaptSessionSidebar);
   }, []);
 
-  // Launch the configured EUD Editor 3 (Header button). The backend spawns the exe;
-  // the existing editor-heartbeat poll flips editorConnected once the bridge is up, so
-  // success needs no extra signal here. Stable error codes map to Korean (raw codes are
-  // never shown). The pending flag clears on resolve/reject; if the spawn succeeds the
-  // button stays disabled anyway once editorConnected turns true.
-  const handleLaunchEditor = useCallback(() => {
-    setLaunchPending(true);
-    void invoke("launch_editor")
-      .then(() => {
-        setLaunchPending(false);
-      })
-      .catch((error) => {
-        setLaunchPending(false);
-        const code = String(error);
-        const message =
-          code === "editor path not configured"
-            ? "에디터 경로가 설정되지 않았습니다. 설정에서 에디터 폴더를 먼저 지정해 주세요."
-            : code === "editor executable not found"
-              ? "에디터 실행 파일을 찾지 못했습니다. 에디터 폴더 경로를 확인해 주세요."
-              : "에디터를 실행하지 못했습니다.";
-        store.log("error", message);
-      });
-  }, [store]);
   const handleOpenMapAgent = useCallback(() => {
     void invoke("map_agent_open").catch(() => {
       toast.error("Map Agent 창을 열지 못했습니다.");
@@ -1818,9 +1842,20 @@ export default function App() {
   if (setup?.setup_required || bootstrap.active) {
     return (
       <SetupScreen
-        editorValid={setup?.editor_valid ?? true}
+        projectValid={setup?.project_valid ?? true}
+        euddraftValid={setup?.euddraft_valid ?? true}
         pickError={setup?.error ?? null}
-        onPick={handlePickEditorPath}
+        onPickProject={() =>
+          runProjectSetupAction("open", "setup_pick_project_path")
+        }
+        onCreateProject={() =>
+          runProjectSetupAction("create", "setup_create_project")
+        }
+        onImportE3s={() =>
+          runProjectSetupAction("import", "setup_import_e3s")
+        }
+        projectAction={projectSetupAction === "export" ? null : projectSetupAction}
+        onPickEuddraft={handlePickEuddraftPath}
         view={bootstrap.view}
         error={bootstrap.error}
         onRetry={handleBootstrapRetry}
@@ -1857,10 +1892,8 @@ export default function App() {
           connected={projectState.connected}
           phase={state.phase}
           rag={rag}
-          editorConnected={projectState.editorConnected}
+          projectAvailable={projectState.projectAvailable}
           hasProject={projectState.hasProject}
-          launchPending={launchPending}
-          onLaunchEditor={handleLaunchEditor}
           onOpenMapAgent={handleOpenMapAgent}
           projectPanelOpen={projectSidebarOpen}
           onProjectPanelToggle={handleProjectPanelToggle}
@@ -1871,12 +1904,23 @@ export default function App() {
           settings={appSettings}
           codexSettings={codexSettings}
           busy={appSettingsBusy}
-          codexBusy={!editorPollEnabled || codexSettingsBusy}
+          codexBusy={!projectPollEnabled || codexSettingsBusy}
+          projectBusy={projectSetupAction}
           onOpenChange={setSettingsOpen}
           onSettingsChange={handleAppSettingsChange}
           onReload={loadAppSettings}
           onCodexReload={loadCodexModelSettings}
           onPreviewSound={handleNotificationSoundPreview}
+          onProjectOpen={() =>
+            runProjectSetupAction("open", "setup_pick_project_path")
+          }
+          onProjectCreate={() =>
+            runProjectSetupAction("create", "setup_create_project")
+          }
+          onProjectImport={() =>
+            runProjectSetupAction("import", "setup_import_e3s")
+          }
+          onProjectExport={handleProjectExport}
         />
 
         {update && !updateDismissed && (
@@ -1887,7 +1931,7 @@ export default function App() {
           />
         )}
 
-        {!projectState.editorConnected && <ConnectionNotice />}
+        {!projectState.projectAvailable && <ConnectionNotice />}
 
         {selectedSlot && (
           <div className="flex min-h-10 items-center gap-2 border-b border-border bg-card/20 px-4 text-xs">
@@ -1981,7 +2025,7 @@ export default function App() {
           draft={editDraft}
           actionBusy={selectedActionBusy}
           codexSettings={codexSettings}
-          codexSettingsBusy={!editorPollEnabled || codexSettingsBusy}
+          codexSettingsBusy={!projectPollEnabled || codexSettingsBusy}
           onCodexSettingsChange={handleCodexSettingsChange}
           onCodexSettingsReload={loadCodexModelSettings}
         />

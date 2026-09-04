@@ -396,26 +396,18 @@ export interface WikiMessage {
 }
 
 /**
- * `setup {...}` - first-run manifest-check snapshot (response to `setup_status`
- * and `setup_pick_editor_path`). `setup_required` gates the setup screen;
- * `error` is a stable code (e.g. "invalid_editor_folder") the panel maps to
- * user-facing text (never rendered raw).
+ * Native first-run setup snapshot.
  */
 export interface SetupMessage {
   type: "setup";
-  /** Configured editor install root ("" until picked). */
-  editor_path: string;
-  /** True when editor_path points at a real EUD Editor 3 install. */
-  editor_valid: boolean;
-  /** True when the model + RAG index pass the manifest check. */
+  project_path: string;
+  project_valid: boolean;
+  euddraft_path: string;
+  euddraft_valid: boolean;
   assets_ready: boolean;
-  /** True when the codex CLI was found (PATH / CODEX_CMD). */
   codex_resolved: boolean;
-  /** True when `codex login status` reports a logged-in session. */
   codex_authed: boolean;
-  /** True when the setup screen must run before normal operation. */
   setup_required: boolean;
-  /** Stable error code from a rejected folder pick. */
   error?: string;
 }
 
@@ -430,7 +422,7 @@ export interface SetupMessage {
 export interface SessionMeta {
   id: string;
   name: string;
-  /** Editor project name captured at session creation. */
+  /** Native project name captured at session creation. */
   project: string;
   /** Missing only in legacy records; the Rust backend migrates it to `eps`. */
   kind?: "eps" | "map";
@@ -681,12 +673,24 @@ export interface SetupStatusRequest {
   type: "setup_status";
 }
 
-/**
- * `setup_pick_editor_path {}` - open the native folder picker, validate the
- * selection as an EUD Editor 3 install, persist it. Responds with `setup`.
- */
-export interface SetupPickEditorPathMessage {
-  type: "setup_pick_editor_path";
+/** Pick and configure an existing native project root. */
+export interface SetupPickProjectPathMessage {
+  type: "setup_pick_project_path";
+}
+/** Create a native project from a selected source map and empty destination. */
+export interface SetupCreateProjectMessage {
+  type: "setup_create_project";
+}
+
+/** Import a legacy `.e3s` into a selected empty native destination. */
+export interface SetupImportE3sMessage {
+  type: "setup_import_e3s";
+}
+
+
+/** Pick `euddraft.exe` or `euddraft.py`. */
+export interface SetupPickEuddraftPathMessage {
+  type: "setup_pick_euddraft_path";
 }
 
 /**
@@ -711,7 +715,10 @@ export type ClientMessage =
   | MemoryGetMessage
   | MemorySaveMessage
   | SetupStatusRequest
-  | SetupPickEditorPathMessage
+  | SetupPickProjectPathMessage
+  | SetupCreateProjectMessage
+  | SetupImportE3sMessage
+  | SetupPickEuddraftPathMessage
   | BootstrapRunMessage;
 
 /** All client message `type` discriminants (closed set). */
@@ -728,7 +735,10 @@ export const CLIENT_MESSAGE_TYPES = [
   "memory_get",
   "memory_save",
   "setup_status",
-  "setup_pick_editor_path",
+  "setup_pick_project_path",
+  "setup_create_project",
+  "setup_import_e3s",
+  "setup_pick_euddraft_path",
   "bootstrap_run",
 ] as const;
 export type ClientMessageType = (typeof CLIENT_MESSAGE_TYPES)[number];
@@ -1011,8 +1021,10 @@ export function isSetupMessage(value: unknown): value is SetupMessage {
   return (
     isObject(value) &&
     value.type === "setup" &&
-    typeof value.editor_path === "string" &&
-    typeof value.editor_valid === "boolean" &&
+    typeof value.project_path === "string" &&
+    typeof value.project_valid === "boolean" &&
+    typeof value.euddraft_path === "string" &&
+    typeof value.euddraft_valid === "boolean" &&
     typeof value.assets_ready === "boolean" &&
     typeof value.codex_resolved === "boolean" &&
     typeof value.codex_authed === "boolean" &&

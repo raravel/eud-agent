@@ -3,7 +3,6 @@ use std::time::UNIX_EPOCH;
 
 use serde::Serialize;
 
-use crate::bridge_io::{SendOpts, HEARTBEAT_STALE_AFTER};
 use crate::config::DataDirs;
 use crate::map_model::{hex_sha256, MapRevision, Tileset};
 
@@ -116,90 +115,18 @@ impl MapContextService {
     }
 
     fn current_source(&self) -> Result<(String, PathBuf), String> {
-        let status = self.current_status()?;
-        if status.compiling {
-            return Err(
-                "OpenMapName cannot be confirmed while the editor is compiling".to_string(),
-            );
-        }
-        let project_path = Self::project_path_from_status(&status)?;
-        let bridge = crate::ipc::bridge_from_config(&self.dirs)?;
-        let reply = bridge
-            .send(
-                "GETSET project|OpenMapName",
-                &SendOpts::for_map_source_confirmation(),
-                None,
-            )
-            .map_err(|error| format!("OpenMapName could not be read: {error}"))?;
-        Self::source_from_project(project_path, parse_open_map_reply(&reply))
+        let project = crate::native_runtime::NativeProjectManager::new(self.dirs.clone()).open()?;
+        let project_id = project_id_for_path(project.root().join("project.json"));
+        Ok((project_id, project.source_map_path()?))
     }
 
     fn status_source(&self) -> Result<(String, PathBuf), String> {
-        let status = self.current_status()?;
-        let project_path = Self::project_path_from_status(&status)?;
-        let open_map_name = status.open_map_name.as_deref().ok_or_else(|| {
-            "editor bridge status does not expose OpenMapName; restart EUD Editor after updating the bridge"
-                .to_string()
-        })?;
-        Self::source_from_project(project_path, unquote_status_value(open_map_name))
+        self.current_source()
     }
 
-    fn source_from_project(
-        project_path: PathBuf,
-        open_map_name: &str,
-    ) -> Result<(String, PathBuf), String> {
-        if open_map_name.trim().is_empty() {
-            return Err("the current project has no saved OpenMapName".to_string());
-        }
-        let project_root = project_path
-            .parent()
-            .ok_or_else(|| "the current project path has no parent directory".to_string())?;
-        let requested = PathBuf::from(open_map_name.trim());
-        let requested = if requested.is_absolute() {
-            requested
-        } else {
-            project_root.join(requested)
-        };
-        let source = requested
-            .canonicalize()
-            .map_err(|error| format!("saved source map is missing or unreadable: {error}"))?;
-        let canonical_root = project_root
-            .canonicalize()
-            .map_err(|error| format!("project directory is unreadable: {error}"))?;
-        if !source.starts_with(&canonical_root) {
-            return Err(
-                "OpenMapName resolves outside the current EUD project directory".to_string(),
-            );
-        }
-        Ok((project_id_for_path(project_path), source))
-    }
-
-    fn current_status(&self) -> Result<crate::bridge_io::StatusSnapshot, String> {
-        let bridge = crate::ipc::bridge_from_config(&self.dirs)?;
-        bridge
-            .read_status_snapshot(HEARTBEAT_STALE_AFTER)
-            .map_err(|error| format!("editor bridge is unavailable: {error}"))
-    }
-
-    fn project_path_from_status(
-        status: &crate::bridge_io::StatusSnapshot,
-    ) -> Result<PathBuf, String> {
-        let project = unquote_status_value(&status.project);
-        if project.is_empty() {
-            return Err("no EUD project is currently open".to_string());
-        }
-        Ok(PathBuf::from(project))
-    }
-
-    #[cfg(not(test))]
+    #[cfg_attr(test, allow(dead_code))]
     fn current_project_id(&self) -> Result<String, String> {
-        self.current_project_path().map(project_id_for_path)
-    }
-
-    #[cfg(not(test))]
-    fn current_project_path(&self) -> Result<PathBuf, String> {
-        let status = self.current_status()?;
-        Self::project_path_from_status(&status)
+        self.current_source().map(|(project_id, _)| project_id)
     }
 
     pub fn revision_for_path(
@@ -275,31 +202,6 @@ fn revision_from_parts(
     })
 }
 
-fn parse_open_map_reply(reply: &str) -> &str {
-    let trimmed = reply.trim();
-    let Some((prefix, value)) = trimmed.split_once(" = ") else {
-        return trimmed;
-    };
-    if prefix.trim() == "OK: project|OpenMapName" {
-        value.trim()
-    } else {
-        trimmed
-    }
-}
-
-fn unquote_status_value(value: &str) -> &str {
-    let value = value.trim();
-    if value.len() >= 2 {
-        let bytes = value.as_bytes();
-        if (bytes[0] == 0x27 && bytes[value.len() - 1] == 0x27)
-            || (bytes[0] == 0x22 && bytes[value.len() - 1] == 0x22)
-        {
-            return &value[1..value.len() - 1];
-        }
-    }
-    value
-}
-
 fn resolve_starcraft_path(dirs: &DataDirs) -> Result<PathBuf, String> {
     if let Some(path) = std::env::var_os("STARCRAFT_PATH").map(PathBuf::from) {
         if path.is_dir() {
@@ -311,13 +213,13 @@ fn resolve_starcraft_path(dirs: &DataDirs) -> Result<PathBuf, String> {
     if standard.is_dir() {
         return Ok(standard);
     }
-    let editor = dirs
+    let configured = dirs
         .load_config()
         .map_err(|error| format!("app config could not be read: {error}"))?
-        .editor_path;
-    let editor = PathBuf::from(editor);
-    if editor.is_dir() {
-        return Ok(editor);
+        .starcraft_path;
+    let configured = PathBuf::from(configured);
+    if configured.is_dir() {
+        return Ok(configured);
     }
     Err("StarCraft data directory could not be resolved".to_string())
 }
@@ -328,45 +230,6 @@ mod tests {
 
     fn test_dirs(root: &Path) -> DataDirs {
         DataDirs::from_bases(&root.join("roaming"), &root.join("local"))
-    }
-
-    fn status_probe_service(
-        root: &Path,
-        compiling: bool,
-        include_open_map: bool,
-    ) -> (MapContextService, PathBuf, PathBuf) {
-        let dirs = test_dirs(root);
-        let editor = root.join("editor");
-        let agent_dir = editor.join("Data").join("agent");
-        let inbox = agent_dir.join("inbox");
-        let project_dir = root.join("project");
-        let project = project_dir.join("demo.e3s");
-        let map = project_dir.join("demo.scx");
-        std::fs::create_dir_all(&inbox).unwrap();
-        std::fs::create_dir_all(agent_dir.join("outbox")).unwrap();
-        std::fs::create_dir_all(&project_dir).unwrap();
-        std::fs::write(&project, b"project").unwrap();
-        std::fs::write(&map, b"map").unwrap();
-        dirs.save_config(&crate::config::Config {
-            editor_path: editor.to_string_lossy().into_owned(),
-            ..Default::default()
-        })
-        .unwrap();
-        let open_map_line = if include_open_map {
-            format!("\nopenMapName='{}'", map.display())
-        } else {
-            String::new()
-        };
-        std::fs::write(
-            agent_dir.join("status.txt"),
-            format!(
-                "compiling={compiling}\nproject='{}'{open_map_line}\n",
-                project.display()
-            ),
-        )
-        .unwrap();
-        std::fs::write(agent_dir.join("heartbeat.txt"), b"alive\n").unwrap();
-        (MapContextService::new(dirs), map, inbox)
     }
 
     #[test]
@@ -406,56 +269,7 @@ mod tests {
     }
 
     #[test]
-    fn passive_source_probe_uses_status_without_bridge_command() {
-        let root = std::env::temp_dir().join(format!("map-context-probe-{}", uuid::Uuid::new_v4()));
-        let (service, map, inbox) = status_probe_service(&root, false, true);
-
-        let probe = service.probe_current().unwrap();
-
-        assert_eq!(probe.source_path, map.canonicalize().unwrap());
-        assert_eq!(probe.file_size, 3);
-        assert!(std::fs::read_dir(inbox).unwrap().next().is_none());
-        std::fs::remove_dir_all(root).ok();
-    }
-
-    #[test]
-    fn passive_source_probe_requires_updated_bridge_status() {
-        let root =
-            std::env::temp_dir().join(format!("map-context-old-bridge-{}", uuid::Uuid::new_v4()));
-        let (service, _, inbox) = status_probe_service(&root, false, false);
-
-        let error = service.probe_current().unwrap_err();
-
-        assert!(error.contains("restart EUD Editor after updating the bridge"));
-        assert!(std::fs::read_dir(inbox).unwrap().next().is_none());
-        std::fs::remove_dir_all(root).ok();
-    }
-
-    #[test]
-    fn authoritative_source_confirmation_skips_compiling_editor() {
-        let root =
-            std::env::temp_dir().join(format!("map-context-compiling-{}", uuid::Uuid::new_v4()));
-        let (service, _, inbox) = status_probe_service(&root, true, true);
-
-        let error = service.current_source().unwrap_err();
-
-        assert_eq!(
-            error,
-            "OpenMapName cannot be confirmed while the editor is compiling"
-        );
-        assert!(std::fs::read_dir(inbox).unwrap().next().is_none());
-        std::fs::remove_dir_all(root).ok();
-    }
-    #[test]
-    fn open_map_reply_accepts_only_the_protocol_prefix() {
-        assert_eq!(
-            parse_open_map_reply("OK: project|OpenMapName = C:\\map.scx"),
-            "C:\\map.scx"
-        );
-        assert_eq!(parse_open_map_reply("C:\\map.scx"), "C:\\map.scx");
-    }
-    #[test]
-    #[ignore = "requires the live EUD Editor bridge and current OpenMapName"]
+    #[ignore = "requires configured native project and StarCraft assets"]
     fn live_saved_open_map_loads_and_renders() {
         let roaming = PathBuf::from(std::env::var_os("APPDATA").unwrap());
         let local = PathBuf::from(std::env::var_os("LOCALAPPDATA").unwrap());

@@ -77,8 +77,10 @@ beforeEach(() => {
     switch (command) {
       case "setup_status":
         return {
-          editor_path: "C:/Editor",
-          editor_valid: true,
+          project_path: "C:/Project",
+          project_valid: true,
+          euddraft_path: "C:/euddraft/euddraft.exe",
+          euddraft_valid: true,
           assets_ready: true,
           codex_resolved: true,
           codex_authed: true,
@@ -308,8 +310,10 @@ describe("App concurrent sessions", () => {
       if (command === "ask_pending") return null;
       if (command === "setup_status") {
         return {
-          editor_path: "C:/Editor",
-          editor_valid: true,
+          project_path: "C:/Project",
+          project_valid: true,
+          euddraft_path: "C:/euddraft/euddraft.exe",
+          euddraft_valid: true,
           assets_ready: true,
           codex_resolved: true,
           codex_authed: true,

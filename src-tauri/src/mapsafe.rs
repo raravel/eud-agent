@@ -86,12 +86,11 @@ pub enum MapSafeError {
     InsufficientDisk { required: u64, available: u64 },
 }
 
-/// Source of the editor's build state (rail 1).
+/// Source of native euddraft build state (rail 1).
 ///
-/// The real impl reads the bridge `status.txt` / a `STATUS` reply; tests inject a
-/// fake. Returning `Ok(true)` means a build is in progress (refuse the write).
+/// Production reads the project-scoped build marker; tests inject a fake.
 pub trait CompilingStatus {
-    /// True iff the editor reports a build in progress (`compiling=true`).
+    /// True iff an euddraft build currently owns the project marker.
     fn is_compiling(&self) -> bool;
 }
 
@@ -432,9 +431,8 @@ impl LockProbe for WindowsLockProbe {
     }
 }
 
-/// The map-write service: runs the rail sequence and the rollback. Generic over
-/// the injected collaborators so production wiring (Windows probe, bridge status,
-/// isom engine) and tests (fakes) share the exact same logic.
+/// Map-write service with ordered safety rails and exact rollback. Production
+/// injects native build state, the Windows share probe, and the isom engine.
 pub struct MapSafe<S, L, E> {
     /// `%appdata%\eud-agent` — backups land under `<data_dir>/map_backups`.
     data_dir: PathBuf,

@@ -1,61 +1,26 @@
 //! Tauri IPC command and event payload schema.
 //!
-//! Panel-to-core commands are exposed through Tauri `invoke`, and core-to-panel messages
-//! are emitted as typed Tauri events. The command bodies are placeholders until the engine
-//! orchestration task wires RAG, Codex, LSP, and editor bridge calls into this surface.
+//! Panel-to-core commands use Tauri `invoke`; core-to-panel messages use typed
+//! Tauri events. Native project, RAG, Codex, preflight, and map services are
+//! wired directly in-process.
 
 use std::collections::BTreeSet;
-use std::path::Path;
 
-use crate::bridge_io::{BridgeIo, SendOpts, HEARTBEAT_STALE_AFTER};
-use crate::config::{self, DataDirs, NotificationChannelSettings, NotificationSettings};
+use crate::config::{DataDirs, NotificationChannelSettings, NotificationSettings};
 use crate::memory::ProjectMemory;
 use serde::{Deserialize, Serialize};
 use tauri::Emitter;
 
-/// Distinct from bridge_io's "editor not connected" (stale heartbeat): an empty
-/// `config.json` editor path means first-run setup has not happened — the panel
-/// routes this to the setup screen, not the reconnect notice.
-const EDITOR_PATH_NOT_CONFIGURED: &str = "editor path not configured";
-
-/// The single shipped EUD Editor 3 binary at the install root. `editor_path` is
-/// validated to contain `Data\Lua\TriggerEditor` (config::validate_editor_path), and the
-/// install ships exactly one top-level exe by this name, so `launch_editor` resolves it by
-/// a fixed name rather than scanning.
-const EDITOR_EXE_NAME: &str = "EUD Editor 3.exe";
-
-/// Stable error code: the editor path is configured but the expected exe is absent (a
-/// moved/renamed install). The panel maps this to Korean text, never rendering the code.
-const EDITOR_EXE_NOT_FOUND: &str = "editor executable not found";
-
-/// Resolve the launchable editor exe under `editor_path`, or a stable error code.
+/// Managed application state shared by native-project IPC commands.
 ///
-/// Pure (string + filesystem-probe only) so the launch command's path/validation logic is
-/// unit-testable without spawning the real editor: empty path → [`EDITOR_PATH_NOT_CONFIGURED`],
-/// missing exe → [`EDITOR_EXE_NOT_FOUND`], otherwise the absolute exe path.
-fn resolve_editor_exe(editor_path: &str) -> Result<std::path::PathBuf, String> {
-    let editor_path = editor_path.trim();
-    if editor_path.is_empty() {
-        return Err(EDITOR_PATH_NOT_CONFIGURED.to_string());
-    }
-    let exe = Path::new(editor_path).join(EDITOR_EXE_NAME);
-    if !exe.is_file() {
-        return Err(EDITOR_EXE_NOT_FOUND.to_string());
-    }
-    Ok(exe)
-}
-
-/// Managed app data-dir state used by bridge-backed IPC commands.
-///
-/// Commands resolve `config.json` on every call so first-run/editor-path edits take effect
-/// without restarting the Tauri app.
+/// Commands reload `config.json` on every call so project/euddraft path edits
+/// take effect without restarting the Tauri application.
 #[derive(Debug, Clone)]
-pub struct BridgeManaged {
+pub struct AppManaged {
     dirs: DataDirs,
 }
 
-impl BridgeManaged {
-    /// Create managed bridge state from resolved app data directories.
+impl AppManaged {
     pub fn new(dirs: DataDirs) -> Self {
         Self { dirs }
     }
@@ -143,18 +108,6 @@ fn play_notification_sound() -> Result<(), String> {
 #[cfg(not(windows))]
 fn play_notification_sound() -> Result<(), String> {
     Err("notification sounds are only supported on Windows".to_string())
-}
-
-/// Resolve a bridge client from `config.json`.
-pub fn bridge_from_config(dirs: &DataDirs) -> Result<BridgeIo, String> {
-    let config = dirs.load_config().map_err(|error| error.to_string())?;
-    let editor_path = config.editor_path.trim();
-    if editor_path.is_empty() {
-        return Err(EDITOR_PATH_NOT_CONFIGURED.to_string());
-    }
-    Ok(BridgeIo::new(config::editor_ipc_dir(Path::new(
-        editor_path,
-    ))))
 }
 
 /// `chat` command input.
@@ -292,23 +245,23 @@ pub struct ChangesetDecisionRequest {
 /// `status` command output and push event payload.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatusResponse {
-    /// True while EUD Editor is compiling.
+    /// True while the native project build marker is held.
     pub compiling: bool,
-    /// Current project line from the editor status file.
+    /// Current native project name.
     pub project: String,
 }
 
 /// `list` command output.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ListResponse {
-    /// Editor files exposed by the bridge LIST command.
+    /// Native EPS files in deterministic project order.
     pub files: Vec<FileEntry>,
 }
 
 /// `memory_get` command output.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryGetResponse {
-    /// Current project name from editor STATUS.
+    /// Current native project name.
     pub project: String,
     /// Project memory markdown files.
     pub files: MemoryFiles,
@@ -343,7 +296,7 @@ pub struct MemorySaveResponse {
     pub file: String,
 }
 
-/// `workspace_list` command output for the current editor project.
+/// `workspace_list` command output for the current native project.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkspaceListResponse {
@@ -565,7 +518,7 @@ pub enum ProgressStage {
     /// Advisory epscript-lsp diagnostics.
     #[serde(rename = "lsp")]
     Lsp,
-    /// Waiting for an editor build to finish.
+    /// Waiting for a native euddraft build to finish.
     #[serde(rename = "waiting_build")]
     WaitingBuild,
     /// Bootstrap asset setup.
@@ -685,14 +638,14 @@ pub fn app_settings_save_payload(
 
 /// Read app-owned settings for the extensible settings dialog.
 #[tauri::command]
-pub async fn app_settings(state: tauri::State<'_, BridgeManaged>) -> Result<AppSettings, String> {
+pub async fn app_settings(state: tauri::State<'_, AppManaged>) -> Result<AppSettings, String> {
     app_settings_payload(state.dirs())
 }
 
 /// Persist app-owned settings without replacing unrelated config fields.
 #[tauri::command]
 pub async fn app_settings_save(
-    state: tauri::State<'_, BridgeManaged>,
+    state: tauri::State<'_, AppManaged>,
     settings: AppSettings,
 ) -> Result<AppSettings, String> {
     app_settings_save_payload(state.dirs(), settings)
@@ -711,7 +664,7 @@ pub async fn notification_sound_preview() -> Result<(), String> {
 #[tauri::command]
 pub async fn attention_notify(
     app: tauri::AppHandle,
-    state: tauri::State<'_, BridgeManaged>,
+    state: tauri::State<'_, AppManaged>,
     kind: AttentionNotificationKind,
     show_os: bool,
     session_id: String,
@@ -746,92 +699,36 @@ pub async fn attention_notify(
     }
 }
 
-/// Read editor compile/project status.
+/// Read native project status.
 #[tauri::command]
-pub async fn status(state: tauri::State<'_, BridgeManaged>) -> Result<StatusResponse, String> {
-    let bridge = bridge_from_config(state.dirs())?;
-    let snapshot = tauri::async_runtime::spawn_blocking(move || {
-        bridge.read_status_snapshot(HEARTBEAT_STALE_AFTER)
-    })
-    .await
-    .map_err(|error| error.to_string())?
-    .map_err(|error| error.to_string())?;
-
+pub async fn status(state: tauri::State<'_, AppManaged>) -> Result<StatusResponse, String> {
+    let manager = crate::native_runtime::NativeProjectManager::new(state.dirs().clone());
+    let status = tauri::async_runtime::spawn_blocking(move || manager.status())
+        .await
+        .map_err(|error| error.to_string())??;
     Ok(StatusResponse {
-        compiling: snapshot.compiling,
-        project: snapshot.project,
+        compiling: false,
+        project: status.name,
     })
 }
 
-/// Launch the configured EUD Editor 3 install.
-///
-/// Resolves `<editor_path>\EUD Editor 3.exe` and spawns it detached, with the install root
-/// as the working directory (mirroring a double-click so the editor finds its `Data\`).
-/// We never wait on or keep the child handle: the app's lifecycle is independent of the
-/// editor (architecture.md), and the panel's existing heartbeat poll flips
-/// `editorConnected` once the bridge comes up — that is the "connected" half of done.
-/// Errors return a stable code (`editor path not configured` / `editor executable not
-/// found`) the panel maps to Korean. The editor is third-party and only ever launched,
-/// never modified.
-#[tauri::command]
-pub async fn launch_editor(state: tauri::State<'_, BridgeManaged>) -> Result<(), String> {
-    let config = state
-        .dirs()
-        .load_config()
-        .map_err(|error| error.to_string())?;
-    let exe = resolve_editor_exe(&config.editor_path)?;
-    // The install root is the exe's parent; use it as cwd.
-    let cwd = exe
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| Path::new(".").to_path_buf());
-    // Spawn off the IPC thread; we drop the child so it runs independently of the app.
-    tauri::async_runtime::spawn_blocking(move || {
-        std::process::Command::new(&exe)
-            .current_dir(&cwd)
-            .spawn()
-            .map(|_child| ())
-            .map_err(|error| error.to_string())
-    })
-    .await
-    .map_err(|error| error.to_string())?
-}
-
-/// List editor files available through the bridge.
-///
-/// While the editor is compiling the bridge round-trip extends to the busy timeout; the
-/// `on_busy` hook emits `progress {stage: waiting_build}` so the panel can surface the
-/// build wait instead of appearing stuck (rules.md IPC timeout/progress contract).
+/// List native project files.
 #[tauri::command]
 pub async fn list(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, BridgeManaged>,
+    _app: tauri::AppHandle,
+    state: tauri::State<'_, AppManaged>,
 ) -> Result<ListResponse, String> {
-    let bridge = bridge_from_config(state.dirs())?;
-    let files = tauri::async_runtime::spawn_blocking(move || {
-        let opts = SendOpts::default();
-        let on_busy = || {
-            let _ = emit_progress(
-                &app,
-                ProgressEvent {
-                    stage: ProgressStage::WaitingBuild,
-                    detail: Some("editor build in progress".to_string()),
-                },
-            );
-        };
-        bridge.list_connected(&opts, Some(&on_busy), HEARTBEAT_STALE_AFTER)
-    })
-    .await
-    .map_err(|error| error.to_string())?
-    .map_err(|error| error.to_string())?
-    .into_iter()
-    .map(|entry| FileEntry {
-        path: entry.path,
-        ftype: entry.ftype,
-        settable: entry.settable,
-    })
-    .collect();
-
+    let manager = crate::native_runtime::NativeProjectManager::new(state.dirs().clone());
+    let files = tauri::async_runtime::spawn_blocking(move || manager.list_files())
+        .await
+        .map_err(|error| error.to_string())??
+        .into_iter()
+        .map(|entry| FileEntry {
+            path: entry.path,
+            ftype: entry.file_type,
+            settable: entry.settable,
+        })
+        .collect();
     Ok(ListResponse { files })
 }
 
@@ -871,19 +768,17 @@ pub fn memory_save_payload(
     })
 }
 
-/// Read project memory for the current editor project.
+/// Read project memory for the current native project.
 #[tauri::command]
-pub async fn memory_get(
-    state: tauri::State<'_, BridgeManaged>,
-) -> Result<MemoryGetResponse, String> {
+pub async fn memory_get(state: tauri::State<'_, AppManaged>) -> Result<MemoryGetResponse, String> {
     let project = current_project_from_status(state.dirs()).await?;
     memory_get_payload(state.dirs(), &project)
 }
 
-/// Save one memory file for the current editor project.
+/// Save one memory file for the current native project.
 #[tauri::command]
 pub(crate) async fn memory_save(
-    state: tauri::State<'_, BridgeManaged>,
+    state: tauri::State<'_, AppManaged>,
     engines: tauri::State<'_, crate::engine::SessionEngineManager>,
     file: String,
     content: String,
@@ -932,17 +827,17 @@ pub fn wiki_save_payload(
     Ok(WikiResponse::from(store.ledger()))
 }
 
-/// Read the dat-edit wiki ledger for the current editor project.
+/// Read the dat-edit wiki ledger for the current native project.
 #[tauri::command]
-pub async fn wiki_get(state: tauri::State<'_, BridgeManaged>) -> Result<WikiResponse, String> {
+pub async fn wiki_get(state: tauri::State<'_, AppManaged>) -> Result<WikiResponse, String> {
     let project = current_project_from_status(state.dirs()).await?;
     wiki_get_payload(state.dirs(), &project)
 }
 
-/// Save user-corrected wiki entries for the current editor project.
+/// Save user-corrected wiki entries for the current native project.
 #[tauri::command]
 pub(crate) async fn wiki_save(
-    state: tauri::State<'_, BridgeManaged>,
+    state: tauri::State<'_, AppManaged>,
     engines: tauri::State<'_, crate::engine::SessionEngineManager>,
     entries: std::collections::BTreeMap<String, crate::wiki::LedgerEntry>,
 ) -> Result<WikiResponse, String> {
@@ -960,7 +855,7 @@ pub(crate) async fn wiki_save(
 /// Refresh and list the current project's real Codex workspace.
 #[tauri::command]
 pub async fn workspace_list(
-    state: tauri::State<'_, BridgeManaged>,
+    state: tauri::State<'_, AppManaged>,
 ) -> Result<WorkspaceListResponse, String> {
     let manager = crate::workspace::WorkspaceManager::new(state.dirs().clone());
     tauri::async_runtime::spawn_blocking(move || {
@@ -981,7 +876,7 @@ pub async fn workspace_list(
 /// Read one UTF-8 workspace file by opaque workspace id + confined relative path.
 #[tauri::command]
 pub async fn workspace_read(
-    state: tauri::State<'_, BridgeManaged>,
+    state: tauri::State<'_, AppManaged>,
     workspace_id: String,
     path: String,
 ) -> Result<WorkspaceReadResponse, String> {
@@ -1006,7 +901,7 @@ pub async fn workspace_read(
 /// Search confined UTF-8 workspace files by path and content.
 #[tauri::command]
 pub async fn workspace_search(
-    state: tauri::State<'_, BridgeManaged>,
+    state: tauri::State<'_, AppManaged>,
     workspace_id: String,
     query: String,
 ) -> Result<WorkspaceSearchResponse, String> {
@@ -1026,15 +921,9 @@ pub async fn workspace_search(
 }
 
 async fn current_project_from_status(dirs: &DataDirs) -> Result<String, String> {
-    let bridge = bridge_from_config(dirs)?;
-    let snapshot = tauri::async_runtime::spawn_blocking(move || {
-        bridge.read_status_snapshot(HEARTBEAT_STALE_AFTER)
-    })
-    .await
-    .map_err(|error| error.to_string())?
-    .map_err(|error| error.to_string())?;
-
-    Ok(snapshot.project)
+    crate::native_runtime::NativeProjectManager::new(dirs.clone())
+        .status()
+        .map(|status| status.name)
 }
 
 /// Emit an `agent_event` event.
@@ -1334,11 +1223,11 @@ mod tests {
     #[test]
     fn error_events_match_v2_wire_schema() {
         let error: ipc::ErrorEvent =
-            serde_json::from_value(json!({ "message": "editor not connected" })).unwrap();
+            serde_json::from_value(json!({ "message": "native project unavailable" })).unwrap();
         assert_json(
             &error,
             json!({
-                "message": "editor not connected"
+                "message": "native project unavailable"
             }),
         );
     }
@@ -1550,21 +1439,6 @@ mod tests {
                 }
             }),
         );
-    }
-
-    #[test]
-    fn bridge_state_from_config_rejects_unset_editor_path() {
-        let base = unique_temp_dir("unset-editor");
-        let dirs = DataDirs::from_bases(&base.join("roaming"), &base.join("local"));
-        dirs.save_config(&Config::default()).unwrap();
-
-        let err = ipc::bridge_from_config(&dirs).unwrap_err();
-
-        // First-run signal, distinct from the stale-heartbeat "editor not
-        // connected" — the panel routes it to the setup screen.
-        assert_eq!(err, "editor path not configured");
-
-        fs::remove_dir_all(&base).ok();
     }
 
     #[test]
@@ -1865,7 +1739,8 @@ mod tests {
         let base = unique_temp_dir("app-settings");
         let dirs = DataDirs::from_bases(&base.join("roaming"), &base.join("local"));
         dirs.save_config(&Config {
-            editor_path: "C:\\Editor".to_string(),
+            project_path: "C:\\Maps\\NativeProject".to_string(),
+            euddraft_path: "C:\\Tools\\euddraft.exe".to_string(),
             codex_model: Some("gpt-test".to_string()),
             ..Default::default()
         })
@@ -1909,7 +1784,8 @@ mod tests {
         );
 
         let config = dirs.load_config().unwrap();
-        assert_eq!(config.editor_path, "C:\\Editor");
+        assert_eq!(config.project_path, "C:\\Maps\\NativeProject");
+        assert_eq!(config.euddraft_path, "C:\\Tools\\euddraft.exe");
         assert_eq!(config.codex_model.as_deref(), Some("gpt-test"));
         assert_eq!(
             config.codex_large_context_models,
@@ -1948,31 +1824,5 @@ mod tests {
         );
         assert_eq!(ask.title, "에이전트가 응답을 기다리고 있습니다");
         assert_eq!(ask.body, "질문을 확인하고 답변해 주세요.");
-    }
-
-    #[test]
-    fn resolve_editor_exe_maps_unset_missing_and_present() {
-        // Unset editor path -> the first-run code (panel routes to setup).
-        assert_eq!(
-            ipc::resolve_editor_exe("   ").unwrap_err(),
-            "editor path not configured"
-        );
-
-        // Configured path but the exe is absent (moved/renamed install).
-        let base = unique_temp_dir("launch-editor");
-        assert_eq!(
-            ipc::resolve_editor_exe(&base.to_string_lossy()).unwrap_err(),
-            "editor executable not found"
-        );
-
-        // The exe present at the install root resolves to its absolute path.
-        let exe = base.join("EUD Editor 3.exe");
-        fs::write(&exe, b"stub").unwrap();
-        assert_eq!(
-            ipc::resolve_editor_exe(&base.to_string_lossy()).unwrap(),
-            exe
-        );
-
-        fs::remove_dir_all(&base).ok();
     }
 }

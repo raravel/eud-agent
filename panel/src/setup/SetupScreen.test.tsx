@@ -1,22 +1,10 @@
 /**
- * First-run setup overlay (EUD-120, EUD-132).
+ * Native project/euddraft/assets/codex first-run setup overlay.
  *
- * The setup screen is a full-screen dialog with two steps. The pick step is
- * shown while the editor path is missing/invalid and drives the native folder
- * picker through the backend. The download step renders Korean setup text and
- * an accessible progressbar while bootstrap progress is active; error mode
- * renders the bootstrap error and a retry control, with no progress bar.
- *
- * Contract:
- *   export interface SetupScreenProps {
- *     editorValid: boolean;
- *     pickError: string | null;
- *     onPick: () => void;
- *     view: BootstrapView;
- *     error: string | null;
- *     onRetry: () => void;
- *   }
- *   export function SetupScreen(props): JSX.Element;
+ * The setup screen is a full-screen dialog with four ordered prerequisites.
+ * Project and euddraft selection are explicit native pick steps. Once both
+ * paths are valid, bootstrap progress and codex authentication retain their
+ * accessible progress/error controls.
  */
 import { describe, it, expect, vi } from "vitest";
 import { fireEvent, render, screen } from "@testing-library/react";
@@ -32,9 +20,13 @@ const idleView: BootstrapView = {
 function renderScreen(overrides: Partial<Parameters<typeof SetupScreen>[0]>) {
   return render(
     <SetupScreen
-      editorValid={true}
+      projectValid={true}
+      euddraftValid={true}
       pickError={null}
-      onPick={vi.fn()}
+      onPickProject={vi.fn()}
+      onCreateProject={vi.fn()}
+      onImportE3s={vi.fn()}
+      onPickEuddraft={vi.fn()}
       view={idleView}
       error={null}
       onRetry={vi.fn()}
@@ -87,64 +79,92 @@ describe("SetupScreen", () => {
     expect(onRetry).toHaveBeenCalledTimes(1);
   });
 
-  it("shows the editor-folder pick step before anything downloads", () => {
-    const onPick = vi.fn();
+  it("shows the native-project pick step before anything downloads", () => {
+    const onPickProject = vi.fn();
 
-    renderScreen({ editorValid: false, onPick });
+    renderScreen({ projectValid: false, onPickProject });
 
     expect(
-      screen.getByText("EUD Editor 3 설치 폴더를 선택해 주세요."),
+      screen.getByText("Native EUD 프로젝트 폴더를 선택해 주세요."),
     ).toBeInTheDocument();
     expect(screen.queryByRole("progressbar")).not.toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole("button", { name: "에디터 폴더 선택" }));
-    expect(onPick).toHaveBeenCalledTimes(1);
+    fireEvent.click(screen.getByRole("button", { name: "기존 Native 프로젝트 열기" }));
+    expect(onPickProject).toHaveBeenCalledTimes(1);
   });
 
-  it("maps the invalid_editor_folder code to Korean text, never raw", () => {
-    renderScreen({ editorValid: false, pickError: "invalid_editor_folder" });
+  it("offers create and E3S import as explicit secondary project actions", () => {
+    const onCreateProject = vi.fn();
+    const onImportE3s = vi.fn();
+    renderScreen({ projectValid: false, onCreateProject, onImportE3s });
+
+    fireEvent.click(screen.getByRole("button", { name: "새 프로젝트 만들기" }));
+    fireEvent.click(screen.getByRole("button", { name: "E3S 가져오기" }));
+    expect(onCreateProject).toHaveBeenCalledTimes(1);
+    expect(onImportE3s).toHaveBeenCalledTimes(1);
+  });
+
+  it("shows the euddraft pick step after a project is selected", () => {
+    const onPickEuddraft = vi.fn();
+
+    renderScreen({ euddraftValid: false, onPickEuddraft });
 
     expect(
-      screen.getByText(/Data\\Lua\\TriggerEditor 폴더가 있는 설치 폴더/),
+      screen.getByText("euddraft 실행 파일을 선택해 주세요."),
     ).toBeInTheDocument();
-    expect(screen.queryByText("invalid_editor_folder")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "euddraft 선택" }));
+    expect(onPickEuddraft).toHaveBeenCalledTimes(1);
   });
 
-  it("marks step 1 current while picking and step 2 current while downloading", () => {
-    const { unmount } = renderScreen({ editorValid: false });
-    expect(
-      screen.getByText("에디터 폴더").closest("li"),
-    ).toHaveAttribute("aria-current", "step");
-    expect(
-      screen.getByText("에셋 다운로드").closest("li"),
-    ).not.toHaveAttribute("aria-current");
-    unmount();
+  it("maps native picker error codes to Korean text, never raw", () => {
+    renderScreen({
+      projectValid: false,
+      pickError: "invalid_project_folder",
+    });
 
-    renderScreen({ editorValid: true });
     expect(
-      screen.getByText("에셋 다운로드").closest("li"),
-    ).toHaveAttribute("aria-current", "step");
-    expect(
-      screen.getByText("에디터 폴더").closest("li"),
-    ).not.toHaveAttribute("aria-current");
+      screen.getByText(/project\.json이 있는 Native EUD 프로젝트 폴더/),
+    ).toBeInTheDocument();
+    expect(screen.queryByText("invalid_project_folder")).not.toBeInTheDocument();
   });
 
-  it("prefers the pick step over download UI while the path is invalid", () => {
-    // A stale bootstrap error must not hide the picker (the pick step is the
-    // prerequisite; retry without a valid path would fail again).
-    renderScreen({ editorValid: false, error: "디스크 공간 부족" });
+  it("marks each native prerequisite as current in order", () => {
+    const first = renderScreen({ projectValid: false });
+    expect(screen.getByText("프로젝트").closest("li")).toHaveAttribute(
+      "aria-current",
+      "step",
+    );
+    first.unmount();
+
+    const second = renderScreen({ euddraftValid: false });
+    expect(screen.getByText("euddraft").closest("li")).toHaveAttribute(
+      "aria-current",
+      "step",
+    );
+    second.unmount();
+
+    renderScreen({});
+    expect(screen.getByText("에셋").closest("li")).toHaveAttribute(
+      "aria-current",
+      "step",
+    );
+  });
+
+  it("prefers project selection over a stale bootstrap error", () => {
+    renderScreen({ projectValid: false, error: "디스크 공간 부족" });
 
     expect(
-      screen.getByRole("button", { name: "에디터 폴더 선택" }),
+      screen.getByRole("button", { name: "기존 Native 프로젝트 열기" }),
     ).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "다시 시도" })).not.toBeInTheDocument();
   });
 });
 
-// ---- step 3: codex login (editor + assets done, codex not yet authed) ------
+// ---- step 4: codex login (native paths + assets done, codex not yet authed) -
 describe("SetupScreen — codex login step", () => {
   const codexProps = {
-    editorValid: true,
+    projectValid: true,
+    euddraftValid: true,
     assetsReady: true,
     codexResolved: true,
     codexAuthed: false,
@@ -161,7 +181,7 @@ describe("SetupScreen — codex login step", () => {
     expect(screen.queryByRole("progressbar")).not.toBeInTheDocument();
     // Step 3 is the current step.
     expect(
-      screen.getByText("codex 로그인").closest("li"),
+      screen.getByText("codex").closest("li"),
     ).toHaveAttribute("aria-current", "step");
   });
 

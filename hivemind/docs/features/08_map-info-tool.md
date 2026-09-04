@@ -2,17 +2,15 @@
 
 Codex cannot see the map the project is built on: locations, unit placement,
 forces/teams, and player slots are authored in SCMDraft 2 and live only inside
-the `.scx` file — the editor holds nothing but the `OpenMapName`/`SaveMapName`
-path strings (features/04 settings surface), so no bridge command can return
-them. This feature gives codex a `map_info` READ tool that digests the
-**connected source map** (`OpenMapName`) from disk, so generated epScript can
-reference real location names, start positions, and team layouts instead of
-guessing.
+the `.scx` file. The native manifest holds its confined `sourceMap` path; the map file remains
+the source of truth. This feature gives Codex a `map_info` READ tool that digests that source map
+from disk, so generated epScript can reference real location names, start positions, and team
+layouts instead of guessing.
 
 ```mermaid
 graph LR
     Codex[codex thread] -- "map_info / map_minimap" --> Tools[Rust ToolLayer]
-    Tools -- "GETSET project|OpenMapName" --> Bridge[Lua bridge]
+    Tools --> Native[NativeProject sourceMap]
     Tools -- "isom_chk_extract" --> FFI[vendored isom static lib]
     FFI --> Map[(source .scx)]
     Tools --> Parse[Rust CHK parser<br/>DIM/ERA/MTXM/MRGN/UNIT/FORC/OWNR/SIDE/SWNM/TRIG]
@@ -23,12 +21,9 @@ graph LR
 
 ## Architecture decision
 
-- **Editor memory is a dead end**: EUD Editor 3 reads `OpenMapName` only at
-  build time; `pjData` exposes no parsed CHK objects to Lua. The map FILE remains
-  the source of truth.
-- The app resolves `OpenMapName`, extracts CHK bytes through the statically linked
-  `isom_chk_extract`, and parses them in Rust (`src-tauri/src/chk.rs`). No sidecar,
-  Python process, or unbounded raw dump is involved.
+- **Native file authority**: project state owns only the confined source-map path.
+  `isom_chk_extract` reads the SCX/SCM and Rust parses bounded CHK sections. No
+  sidecar, Python process, transport roundtrip, or unbounded raw dump is involved.
 - Terrain rendering reuses the verified native VR4/VX4/WPE renderer through
   `isom_render_map`; Rust converts its 24-bpp BMP to bounded PNG and applies
   player-colored unit markers.
@@ -73,8 +68,8 @@ Validation happens before action accounting; errors are correctable ToolErrors.
 
 - Parameters: `maxSize` 128-2048 (default 512), `showUnits` (default true), and
   optional `starcraftPath`.
-- StarCraft data lookup: explicit argument; otherwise `STARCRAFT_PATH`, standard
-  install path, then the EUD Editor root.
+- StarCraft data lookup: explicit argument; otherwise configured `starcraft_path`, environment,
+  then standard install locations.
 - Native output is decoded, aspect-fit resized without upscaling, optionally
   overlaid with P1-P12 colors, PNG-encoded, and returned as a real MCP image
   content block plus compact metadata. Base64 never appears in the text block.
@@ -94,8 +89,8 @@ Validation happens before action accounting; errors are correctable ToolErrors.
 
 ## Shared Map Agent context and renderer
 
-The Map Agent reuses the same file authority through `MapContextService`: bridge
-`OpenMapName` resolution, path confinement, saved-path/mtime/file+CHK hashes, tileset, dimensions,
+The Map Agent reuses the same native file authority through `MapContextService`: project
+`sourceMap` resolution, path confinement, saved-path/mtime/file+CHK hashes, tileset, dimensions,
 and CHK digest. It extends rendering without changing the read-only MCP contracts:
 
 - `isom_render_region` returns a bounded RGBA terrain/object/location crop from installed

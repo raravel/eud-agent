@@ -3,16 +3,16 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>eud-agent — EUD Editor 3 외부 AI 에이전트</title>
+    <title>eud-agent — Native EUD 맵 AI 저작 도구</title>
     <meta
       name="description"
-      content="자연어 지시를 epScript 코드로 변환해 EUD Editor 3에 안전하게 적용하는 Windows 데스크톱 AI 에이전트. 지금 다운로드하세요."
+      content="자연어로 epScript와 DAT를 편집하고 euddraft로 직접 빌드하는 Windows Native EUD 맵 AI 저작 도구."
     />
     <meta name="theme-color" content="#0f172a" />
-    <meta property="og:title" content="eud-agent — EUD Editor 3 외부 AI 에이전트" />
+    <meta property="og:title" content="eud-agent — Native EUD 맵 AI 저작 도구" />
     <meta
       property="og:description"
-      content="자연어로 epScript를 작성하고 에디터에 바로 적용하세요. Windows 10/11 · 무료 · 자동 업데이트."
+      content="Native 프로젝트, 검토 가능한 AI 변경, 직접 euddraft 빌드. Windows 10/11 · 무료 · 자동 업데이트."
     />
     <meta property="og:type" content="website" />
     <link rel="preload" href="./assets/fonts/PretendardVariable.woff2" as="font" type="font/woff2" crossorigin />
@@ -61,15 +61,15 @@
         <div class="mx-auto max-w-6xl px-5 pb-20 pt-16 sm:pt-24 text-center">
           <p class="mb-5 inline-flex items-center gap-2 rounded-full border border-slate-700/70 bg-slate-900/60 px-3.5 py-1.5 text-xs font-medium text-slate-300">
             <span class="h-1.5 w-1.5 rounded-full bg-green-400"></span>
-            EUD Editor 3 외부 AI 에이전트
+            Native EUD 맵 AI 저작 도구
           </p>
           <h1 class="mx-auto max-w-3xl text-4xl font-bold leading-[1.15] tracking-tight sm:text-5xl md:text-6xl">
             자연어로 epScript를 작성하고<br class="hidden sm:block" />
-            <span class="bg-gradient-to-r from-green-300 to-green-500 bg-clip-text text-transparent">에디터에 바로 적용</span>하세요
+            <span class="bg-gradient-to-r from-green-300 to-green-500 bg-clip-text text-transparent">Native 프로젝트에 안전하게 적용</span>하세요
           </h1>
           <p class="mx-auto mt-6 max-w-2xl text-pretty text-base leading-relaxed text-slate-300 sm:text-lg">
-            eud-agent는 StarCraft EUD 맵 제작을 위한 데스크톱 AI 에이전트입니다.
-            지시를 epScript(eps) 코드로 변환하고, RAG 근거와 함께 EUD Editor 3에 안전하게 적용합니다.
+            eud-agent는 StarCraft EUD 맵 제작을 위한 Native 데스크톱 AI 저작 도구입니다.
+            epScript와 DAT 변경을 검토한 뒤 euddraft로 결과 맵을 직접 빌드합니다.
           </p>
 
           <div class="mt-9 flex flex-col items-center justify-center gap-3 sm:flex-row">
@@ -122,18 +122,18 @@
             <span class="grid h-10 w-10 place-items-center rounded-lg bg-slate-800 text-green-400">
               <svg class="h-5 w-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 19.5v-15A2.5 2.5 0 0 1 6.5 2H20v20H6.5a2.5 2.5 0 0 1 0-5H20"/></svg>
             </span>
-            <h3 class="mt-4 font-semibold">EUD Editor 3</h3>
+            <h3 class="mt-4 font-semibold">euddraft</h3>
             <p class="mt-1.5 text-sm leading-relaxed text-slate-400">
-              별도로 보유한 EUD Editor 3가 필요합니다. 설치 후 에디터를 실행하면 자동으로 연결됩니다.
+              최초 설정에서 euddraft.exe 또는 euddraft.py를 선택합니다. EUD Editor는 필요하지 않습니다.
             </p>
           </div>
           <div class="rounded-2xl border border-slate-800 bg-slate-900/40 p-5">
             <span class="grid h-10 w-10 place-items-center rounded-lg bg-slate-800 text-green-400">
               <svg class="h-5 w-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="4 17 10 11 4 5"/><line x1="12" x2="20" y1="19" y2="19"/></svg>
             </span>
-            <h3 class="mt-4 font-semibold">codex CLI</h3>
+            <h3 class="mt-4 font-semibold">Codex</h3>
             <p class="mt-1.5 text-sm leading-relaxed text-slate-400">
-              코드 생성에 codex CLI를 사용합니다. 직접 설치·로그인(BYO)이 필요합니다.
+              설정 화면에서 Codex를 설치하거나 기존 로그인으로 연결할 수 있습니다.
             </p>
           </div>
         </div>
@@ -175,18 +175,18 @@
           <li class="flex gap-4 rounded-2xl border border-slate-800 bg-slate-900/40 p-5">
             <span class="grid h-9 w-9 shrink-0 place-items-center rounded-full bg-green-500/15 font-semibold text-green-400 ring-1 ring-green-500/30">3</span>
             <div>
-              <h3 class="font-semibold">최초 실행 설정</h3>
+              <h3 class="font-semibold">Native 프로젝트와 euddraft</h3>
               <p class="mt-1.5 text-sm leading-relaxed text-slate-400">
-                앱을 처음 켜면 설정 화면에서 임베딩 모델과 RAG 인덱스를 자동으로 내려받습니다. 완료될 때까지 잠시 기다리세요.
+                기존 프로젝트를 열거나 SCX에서 만들거나 E3S를 가져온 뒤 euddraft를 선택합니다. 이어서 검증된 RAG 자산을 준비합니다.
               </p>
             </div>
           </li>
           <li class="flex gap-4 rounded-2xl border border-slate-800 bg-slate-900/40 p-5">
             <span class="grid h-9 w-9 shrink-0 place-items-center rounded-full bg-green-500/15 font-semibold text-green-400 ring-1 ring-green-500/30">4</span>
             <div>
-              <h3 class="font-semibold">에디터 연결</h3>
+              <h3 class="font-semibold">Codex 로그인과 빌드</h3>
               <p class="mt-1.5 text-sm leading-relaxed text-slate-400">
-                EUD Editor 3를 실행하면 브리지가 자동으로 설치·연결됩니다. 이제 패널에서 지시를 입력하고 코드를 적용할 수 있습니다.
+                Codex 로그인을 마치면 자연어 지시, changeset 검토, 직접 euddraft 빌드를 사용할 수 있습니다.
               </p>
             </div>
           </li>

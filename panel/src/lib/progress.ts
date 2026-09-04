@@ -33,7 +33,7 @@ export const STAGE_LABELS: Record<string, string> = {
   task_state_warning: "활성 작업 상태 갱신 실패",
   workspace: "프로젝트 워크스페이스 보안 환경 준비 중…",
   lsp: "진단 검사 중…",
-  waiting_build: "에디터 빌드 완료 대기 중…",
+  waiting_build: "euddraft 빌드 완료 대기 중…",
   bootstrap: "필수 자산 준비 중…",
   audio_probe: "첨부 오디오 검사 중…",
   audio_transcode: "OGG Vorbis 변환 중…",

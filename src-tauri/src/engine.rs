@@ -2,7 +2,7 @@
 //!
 //! This module owns the pure v2 prompt assembly seam and the agentic turn loop.
 //! Callers provide already-fetched RAG/project context so the prompt helpers remain
-//! unit-testable without bridge, RAG, or Codex I/O.
+//! unit-testable without project I/O, RAG, or Codex I/O.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -40,9 +40,9 @@ const TASK_STATE_COMPILER_TIMEOUT: std::time::Duration = std::time::Duration::fr
 #[cfg(test)]
 const TASK_STATE_COMPILER_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(50);
 
-const INTRO: &str = "You are the EUD Editor 3 agent. You work in a durable, sandboxed \
-project filesystem and edit the live StarCraft EUD map through eud-tools. The server \
-validates and journals every live-editor mutation and every durable workspace change.";
+const INTRO: &str = "You are the native EUD project agent. You work in a durable, sandboxed \
+project filesystem and edit the canonical StarCraft EUD project through eud-tools. The server \
+validates and journals every project/map mutation and every durable workspace change.";
 
 const WORKSPACE_GUIDE: &str = r#"[project workspace]
 - Your cwd is the current project's durable filesystem workspace. Use native filesystem tools only for reading accepted `specs/`, immutable `plans/`, historical `decisions/`, `worklog/`, and the coherent `source/` mirror.
@@ -4402,8 +4402,8 @@ fn auto_session_name(first_text: &str) -> String {
 /// Cap on the condensed replay transcript (chars), kept well under prompt limits.
 const CONDENSED_TRANSCRIPT_CAP_CHARS: usize = 8000;
 
-/// Parse the editor project name out of a `[project state]` render
-/// (`project=<name>` line). Returns `""` when absent / `(no project open)`.
+/// Parse the native project name out of a `[project state]` prompt render.
+/// Returns `""` when absent or unavailable.
 fn project_name_from_state(project_state: &str) -> String {
     let name = project_state
         .lines()
@@ -5519,7 +5519,7 @@ mod tests {
         let dirs = engine.runtime.data_dirs();
         dirs.ensure_dirs().unwrap();
         let workspace = WorkspaceManager::new(dirs.clone())
-            .prepare_snapshot(&crate::bridge_io::EpsSnapshot {
+            .prepare_snapshot(&crate::source_snapshot::ProjectSnapshot {
                 project: "ExampleProject".to_string(),
                 identity: "C:/maps/example.scx".to_string(),
                 files: Vec::new(),
@@ -5573,7 +5573,7 @@ mod tests {
         let dirs = engine.runtime.data_dirs();
         dirs.ensure_dirs().unwrap();
         let workspace = WorkspaceManager::new(dirs.clone())
-            .prepare_snapshot(&crate::bridge_io::EpsSnapshot {
+            .prepare_snapshot(&crate::source_snapshot::ProjectSnapshot {
                 project: "ExampleProject".to_string(),
                 identity: "C:/maps/example.scx".to_string(),
                 files: Vec::new(),
@@ -6102,117 +6102,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reject_replays_file_inverse_through_the_runtime_bridge() {
-        let base = unique_temp_dir("runtime-rollback-bridge");
-        let dirs = crate::config::DataDirs::from_bases(&base.join("roaming"), &base.join("local"));
-        dirs.ensure_dirs().unwrap();
-        let editor = base.join("editor");
-        let inbox = editor.join("Data").join("agent").join("inbox");
-        let outbox = editor.join("Data").join("agent").join("outbox");
-        fs::create_dir_all(&inbox).unwrap();
-        fs::create_dir_all(&outbox).unwrap();
-        dirs.save_config(&crate::config::Config {
-            editor_path: editor.to_string_lossy().to_string(),
-            ..Default::default()
-        })
-        .unwrap();
-
-        let analyzer = Arc::new(crate::eps_preflight::NodeEpsAnalyzer::unavailable(
-            crate::eps_preflight::SkipReason::AdapterMissing,
-            "rollback test does not run preflight",
-        ));
-        let services = crate::tool_exec::ToolServices::new(
-            dirs.clone(),
-            analyzer,
-            crate::map_candidate::CandidateStore::new(
-                (dirs.clone()).clone(),
-                crate::map_import::MapImportStore::new(dirs.clone()),
-            ),
-            crate::write_coordinator::ProjectWriteCoordinator::silent(),
-        );
-        let sessions = crate::session::SessionStore::new(&dirs);
-        let session = test_session(&sessions);
-        let runtime = services.session(session.meta.id.clone());
-        let sink = CapturingEventSink::default();
-        let sink_handle = sink.clone();
-        let mut engine = AgentEngine::new(
-            FakeCodexDriver::scripted([]),
-            sink,
-            AgentEngineConfig::for_tests(
-                "[project state]\nproject=Sample compiling=false",
-                None,
-                sample_hits(),
-            ),
-            runtime,
-            sessions,
-            attachment_store_at(&base),
-            session,
-        );
-        let request_id = "req-runtime-rollback";
-        engine
-            .runtime
-            .begin_request(request_id, &engine.project_id)
-            .unwrap();
-        engine.current_request_id = Some(request_id.to_string());
-        engine.phase = Phase::ChangesetReview;
-        record_file_write(
-            &engine.journal_store,
-            request_id,
-            "file-main",
-            1,
-            "scripts/main.eps",
-        );
-
-        let responder = std::thread::spawn(move || {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-            loop {
-                let command = fs::read_dir(&inbox)
-                    .unwrap()
-                    .filter_map(Result::ok)
-                    .find_map(|entry| {
-                        let file_name = entry.file_name().to_string_lossy().to_string();
-                        (file_name.starts_with("srv-") && file_name.ends_with(".cmd"))
-                            .then_some((entry.path(), file_name))
-                    });
-                if let Some((path, file_name)) = command {
-                    let command = fs::read_to_string(&path).unwrap();
-                    assert_eq!(command, "SET scripts/main.eps\nold\n");
-                    fs::remove_file(path).unwrap();
-                    let stem = file_name.trim_end_matches(".cmd");
-                    fs::write(
-                        outbox.join(format!("{stem}.result")),
-                        b"OK: set scripts/main.eps",
-                    )
-                    .unwrap();
-                    return command;
-                }
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "rollback bridge command did not arrive"
-                );
-                std::thread::sleep(std::time::Duration::from_millis(5));
-            }
-        });
-
-        engine
-            .changeset_decision(crate::ipc::ChangesetDecisionRequest {
-                decision: crate::ipc::Decision::Reject,
-                ids: crate::ipc::DecisionIds::All(crate::ipc::AllLiteral),
-            })
-            .await
-            .expect("reject decision should finish");
-
-        assert_eq!(responder.join().unwrap(), "SET scripts/main.eps\nold\n");
-        assert!(sink_handle.events().iter().any(|event| matches!(
-            event,
-            EngineEvent::RollbackResult(payload) if payload.ok && payload.error.is_none()
-        )));
-        assert_eq!(engine.journal_store.entry_count(request_id), 0);
-        assert_eq!(engine.phase, Phase::Idle);
-        fs::remove_dir_all(base).ok();
-    }
-
-    #[tokio::test]
     async fn reject_does_not_record_dat_edits_to_wiki() {
         let base = unique_temp_dir("wiki-reject");
         let memory = ProjectMemory::new(base.join("memory"), "ExampleProject");
@@ -6318,11 +6207,10 @@ mod tests {
             .persist(&request_id)
             .expect("journal should persist");
 
-        // Drive the partial reject through a no-op bridge so this test remains
-        // focused on the wiki contract: a rolled-back value never re-enters via
-        // accept-all.
-        struct NoopRollbackBridge;
-        impl journal::JournalBridge for NoopRollbackBridge {
+        // Drive the partial reject through a no-op native rollback target so the
+        // test remains focused on the wiki contract.
+        struct NoopRollbackTarget;
+        impl journal::JournalRollbackTarget for NoopRollbackTarget {
             type Error = AgentEngineError;
             fn set_dat_value(
                 &self,
@@ -6404,7 +6292,7 @@ mod tests {
                 journal::ChangesetDecision::reject(journal::DecisionIds::Items(vec![
                     "dat-hp".to_string()
                 ])),
-                &NoopRollbackBridge,
+                &NoopRollbackTarget,
             )
             .expect("partial reject should roll back and forget the HP edit");
 
@@ -6909,7 +6797,7 @@ mod tests {
         let dirs = runtime_c.data_dirs();
         dirs.ensure_dirs().unwrap();
         let workspace_manager = WorkspaceManager::new(dirs.clone());
-        let snapshot = crate::bridge_io::EpsSnapshot {
+        let snapshot = crate::source_snapshot::ProjectSnapshot {
             project: "Sample".to_string(),
             identity: "C:/maps/sample.scx".to_string(),
             files: Vec::new(),

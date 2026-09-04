@@ -174,7 +174,7 @@ impl crate::bootstrap::ProgressEmitter for NoopEmitter {
 /// distribution without a restart.
 #[tauri::command]
 pub async fn codex_install(
-    state: tauri::State<'_, crate::ipc::BridgeManaged>,
+    state: tauri::State<'_, crate::ipc::AppManaged>,
 ) -> Result<CodexAuthState, String> {
     let dirs = state.dirs().clone();
     crate::bootstrap::ensure_codex(&dirs, &NoopEmitter)

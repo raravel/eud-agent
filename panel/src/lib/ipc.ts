@@ -112,19 +112,15 @@ export interface IpcClientOptions {
   /** Called for lifecycle + unknown/bad payloads (optional). */
   onLog?: (kind: IpcLogKind, text: string) => void;
   /**
-   * Called when the TRANSPORT (Tauri push listeners) becomes ready / not ready.
-   * This is editor-independent — see {@link IpcClientOptions.onEditorChange} for
-   * editor liveness.
+   * Called when the in-process Tauri event transport becomes ready or closes.
+   * Native project availability is reported separately.
    */
   onOpenChange?: (open: boolean) => void;
   /**
-   * Called on an EDITOR-liveness edge (heartbeat fresh -> connected, or
-   * stale/absent -> disconnected). Decoupled from transport openness so a downed
-   * editor never reads as a dead transport. Fired only on transitions (and the
-   * first probe), so a periodic poll does not spam it. `detail` carries the
-   * underlying error on a disconnect edge.
+   * Called when the configured native project changes between readable and
+   * unavailable. Fired only on transitions and the first refresh failure.
    */
-  onEditorChange?: (connected: boolean, detail?: string) => void;
+  onProjectAvailabilityChange?: (available: boolean, detail?: string) => void;
 }
 
 const PUSH_EVENT_TYPES = [
@@ -155,11 +151,9 @@ function formatError(error: unknown): string {
 }
 
 /**
- * Contractual no-project marker. The bridge returns `ERROR: no project` from `list`
- * when no project is open. This is an expected steady state, not a failure, so the poll
- * routes it to the store's no-project path (gates send + drives the header connection
- * chip) instead of logging a "IPC command failed" line. Case-insensitive substring,
- * mirroring the store's matcher.
+ * Contractual no-project marker. A configured native root may be temporarily
+ * unavailable or may not yet expose a source list. Treat that as project state,
+ * not as a transport failure.
  */
 const NO_PROJECT_MARKER = "no project";
 
@@ -174,17 +168,18 @@ export class IpcClient {
   private readonly onMessage: (msg: ServerMessage) => void;
   private readonly onLog: (kind: IpcLogKind, text: string) => void;
   private readonly onOpenChange: (open: boolean) => void;
-  private readonly onEditorChange: (connected: boolean, detail?: string) => void;
+  private readonly onProjectAvailabilityChange: (
+    available: boolean,
+    detail?: string,
+  ) => void;
 
   private unlisteners: UnlistenFn[] = [];
   private active = false;
   private open = false;
-  // Editor-liveness tracking for refresh(): `editorUp` is the last observed
-  // state, `editorProbed` guards the first-probe edge, and `lastProject` lets a
-  // project switch (while the editor stays up) re-pull the file list without
-  // polling the heavier `list` round-trip every tick.
-  private editorUp = false;
-  private editorProbed = false;
+  // Native-project tracking for refresh(). The last project identity avoids
+  // reloading the source list on every periodic status refresh.
+  private projectUp = false;
+  private projectProbed = false;
   private lastProject: string | undefined;
 
   constructor(options: IpcClientOptions) {
@@ -197,16 +192,14 @@ export class IpcClient {
     this.onMessage = options.onMessage;
     this.onLog = options.onLog ?? (() => {});
     this.onOpenChange = options.onOpenChange ?? (() => {});
-    this.onEditorChange = options.onEditorChange ?? (() => {});
+    this.onProjectAvailabilityChange =
+      options.onProjectAvailabilityChange ?? (() => {});
   }
 
   /**
-   * Register push-event listeners and mark the TRANSPORT open. Transport
-   * readiness = listeners registered; it does NOT depend on the editor (a stale
-   * editor heartbeat must not read as a dead transport, or the panel strands in
-   * the reconnect state with no recovery path). The editor snapshot/liveness is
-   * a separate {@link IpcClient.refresh} concern the App polls once first-run
-   * setup is satisfied; bootstrap progress events still flow from the very start.
+   * Register push-event listeners and mark the in-process transport open.
+   * Bootstrap progress can flow before a native project has been configured;
+   * project availability is resolved independently by {@link IpcClient.refresh}.
    */
   async connect(): Promise<void> {
     if (this.active) return;
@@ -225,15 +218,9 @@ export class IpcClient {
   }
 
   /**
-   * Probe the editor and refresh its snapshot. Transport openness is NOT touched
-   * here (see {@link IpcClient.connect}): this reports EDITOR liveness via
-   * {@link IpcClientOptions.onEditorChange} and dispatches the status/list
-   * snapshots. Safe to call on a periodic poll.
-   *
-   * `status` is the cheap liveness probe (the core reads `status.txt` + the
-   * heartbeat mtime); the heavier `list` round-trip runs only on a down->up edge
-   * or a project change, so a 2s poll does not churn the file IPC every tick.
-   * Returns whether the editor is currently connected.
+   * Refresh the native project snapshot without changing transport state.
+   * `status` validates the configured project and reports its build state;
+   * `list` reloads only after recovery or a project identity change.
    */
   async refresh(): Promise<boolean> {
     if (!this.active) return false;
@@ -242,14 +229,12 @@ export class IpcClient {
       status = await this.invoke("status");
     } catch (error) {
       if (!this.active) return false;
-      const wasUp = this.editorUp;
-      this.editorUp = false;
+      const wasUp = this.projectUp;
+      this.projectUp = false;
       this.lastProject = undefined;
-      // Notify on a down edge OR the very first probe; steady-state failures
-      // stay quiet so the poll never spams the log / event stream.
-      if (wasUp || !this.editorProbed) {
-        this.editorProbed = true;
-        this.onEditorChange(false, formatError(error));
+      if (wasUp || !this.projectProbed) {
+        this.projectProbed = true;
+        this.onProjectAvailabilityChange(false, formatError(error));
       }
       return false;
     }
@@ -259,9 +244,9 @@ export class IpcClient {
       isObject(status) && typeof status.project === "string"
         ? status.project
         : undefined;
-    const wasUp = this.editorUp;
+    const wasUp = this.projectUp;
     const needList = !wasUp || project !== this.lastProject;
-    this.editorUp = true;
+    this.projectUp = true;
     this.lastProject = project;
     if (needList) {
       try {
@@ -271,8 +256,8 @@ export class IpcClient {
         if (this.active) {
           const detail = formatError(error);
           if (detail.toLowerCase().includes(NO_PROJECT_MARKER)) {
-            // No open project: feed the store's no-project state (chip + send gate)
-            // and stay silent — never surface it as a failed-command log line.
+            // No configured/open project: feed the store's no-project state
+            // without treating it as an IPC transport failure.
             this.dispatchPayload("list", { error: detail });
           } else {
             this.onLog("unknown", `IPC command failed (list): ${detail}`);
@@ -281,8 +266,8 @@ export class IpcClient {
       }
     }
     if (!wasUp) {
-      this.editorProbed = true;
-      this.onEditorChange(true);
+      this.projectProbed = true;
+      this.onProjectAvailabilityChange(true);
     }
     return true;
   }
@@ -367,7 +352,13 @@ export class IpcClient {
         return { file: msg.file, content: msg.content };
       case "setup_status":
         return {};
-      case "setup_pick_editor_path":
+      case "setup_pick_project_path":
+        return {};
+      case "setup_create_project":
+        return {};
+      case "setup_import_e3s":
+        return {};
+      case "setup_pick_euddraft_path":
         return {};
       case "bootstrap_run":
         return {};
@@ -394,7 +385,10 @@ export class IpcClient {
         this.dispatchPayload("memory_saved", result);
       } else if (
         msg.type === "setup_status" ||
-        msg.type === "setup_pick_editor_path"
+        msg.type === "setup_pick_project_path" ||
+        msg.type === "setup_create_project" ||
+        msg.type === "setup_import_e3s" ||
+        msg.type === "setup_pick_euddraft_path"
       ) {
         this.dispatchPayload("setup", result);
       }
@@ -416,14 +410,14 @@ export class IpcClient {
   }
 
   /**
-   * Stop listening to Tauri events. The App drives editor recovery by polling
-   * {@link IpcClient.refresh}; there is no transport-level reconnect timer here.
+   * Stop listening to Tauri events. Native project recovery is driven by the
+   * App's periodic {@link IpcClient.refresh}; transport has no reconnect timer.
    */
   stop(): void {
     this.active = false;
     this.open = false;
-    this.editorUp = false;
-    this.editorProbed = false;
+    this.projectUp = false;
+    this.projectProbed = false;
     this.lastProject = undefined;
     const unlisteners = this.unlisteners.splice(0);
     for (const unlisten of unlisteners) {
@@ -579,6 +573,26 @@ function toCodexModelSettings(value: unknown): CodexModelSettings {
     throw new Error("invalid codex model settings response");
   }
   return value as unknown as CodexModelSettings;
+}
+
+export interface E3sExportResponse {
+  path: string;
+}
+
+/** Export the configured imported project through the native save dialog. */
+export async function projectExportE3s(
+  invoke: InvokeFn = tauriInvoke,
+): Promise<E3sExportResponse | null> {
+  const value = await invoke("project_export_e3s");
+  if (value === null) return null;
+  if (
+    !isObject(value) ||
+    typeof value.path !== "string" ||
+    value.path.trim().length === 0
+  ) {
+    throw new Error("invalid E3S export response");
+  }
+  return { path: value.path };
 }
 
 /** Fetch the authenticated account's current visible Codex model catalog. */

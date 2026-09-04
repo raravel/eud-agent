@@ -52,7 +52,7 @@ impl ServerHandler for EudToolHandler {
             .with_instructions(if self.runtime.kind() == crate::session::SessionKind::Map {
                 "Map Agent candidate tools. Draft tools can modify only the request-owned candidate; original Apply is not exposed."
             } else {
-                "EUD Editor 3 tools. Shared writes use the project coordinator and changeset review."
+                "Native EUD project tools. Shared writes use the project coordinator and changeset review."
             })
     }
 

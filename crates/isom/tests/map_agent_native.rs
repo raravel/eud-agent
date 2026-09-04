@@ -345,9 +345,7 @@ fn terrain_thumbnail_renders_one_exact_tile_and_space_parallax() {
     let reveals_star_parallax = platform["entries"].as_array().unwrap().iter().any(|entry| {
         let thumbnail = render(1, entry["id"].as_u64().unwrap());
         (0..32).any(|block_y| {
-            (0..32).any(|block_x| {
-                !block_is_uniform(&thumbnail.rgba, block_x, block_y)
-            })
+            (0..32).any(|block_x| !block_is_uniform(&thumbnail.rgba, block_x, block_y))
         })
     });
     assert!(
@@ -420,11 +418,9 @@ fn catalog_structured_filters_narrow_tiles_before_pagination() {
     });
     let error =
         isom::catalog_query(&starcraft, incompatible_request.to_string().as_bytes()).unwrap_err();
-    assert!(
-        error
-            .to_string()
-            .contains("catalog filter.terrainType is not supported for sprites")
-    );
+    assert!(error
+        .to_string()
+        .contains("catalog filter.terrainType is not supported for sprites"));
 }
 
 #[test]
@@ -1132,7 +1128,10 @@ fn image_quantizer_uses_only_stable_graphics_valid_tiles_for_every_tileset() {
             .unwrap();
             let entry = &entry["entries"][0];
             assert_eq!(entry["id"], tile, "tileset {tileset}");
-            assert_eq!(entry["graphicsValid"], true, "tileset {tileset} tile {tile}");
+            assert_eq!(
+                entry["graphicsValid"], true,
+                "tileset {tileset} tile {tile}"
+            );
         }
     }
 }

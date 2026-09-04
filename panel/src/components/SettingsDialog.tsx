@@ -1,5 +1,16 @@
 import { useState } from "react";
-import { Bell, Bot, LoaderCircle, RefreshCw, Volume2, X } from "lucide-react";
+import {
+  Bell,
+  Bot,
+  FileInput,
+  FileOutput,
+  FolderKanban,
+  LoaderCircle,
+  Plus,
+  RefreshCw,
+  Volume2,
+  X,
+} from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import {
@@ -24,13 +35,18 @@ export interface SettingsDialogProps {
   busy?: boolean;
   codexSettings: CodexModelSettings | null;
   codexBusy?: boolean;
+  projectBusy?: "open" | "create" | "import" | "export" | null;
   onOpenChange(open: boolean): void;
   onSettingsChange(settings: AppSettings): void;
   onReload(): void;
   onCodexReload(): void;
   onPreviewSound(): void;
+  onProjectOpen(): void;
+  onProjectCreate(): void;
+  onProjectImport(): void;
+  onProjectExport(): void;
 }
-type SettingsCategory = "notifications" | "codex";
+type SettingsCategory = "project" | "notifications" | "codex";
 
 
 interface EventRowProps {
@@ -102,11 +118,16 @@ export function SettingsDialog({
   codexSettings,
   busy = false,
   codexBusy = false,
+  projectBusy = null,
   onOpenChange,
   onSettingsChange,
   onReload,
   onCodexReload,
   onPreviewSound,
+  onProjectOpen,
+  onProjectCreate,
+  onProjectImport,
+  onProjectExport,
 }: SettingsDialogProps) {
   const [category, setCategory] =
     useState<SettingsCategory>("notifications");
@@ -168,8 +189,18 @@ export function SettingsDialog({
           >
             <Button
               type="button"
-              variant={category === "notifications" ? "secondary" : "ghost"}
+              variant={category === "project" ? "secondary" : "ghost"}
               className="h-11 w-full justify-start gap-2"
+              aria-current={category === "project" ? "page" : undefined}
+              onClick={() => setCategory("project")}
+            >
+              <FolderKanban className="size-4" aria-hidden="true" />
+              프로젝트
+            </Button>
+            <Button
+              type="button"
+              variant={category === "notifications" ? "secondary" : "ghost"}
+              className="mt-1 h-11 w-full justify-start gap-2"
               aria-current={category === "notifications" ? "page" : undefined}
               onClick={() => setCategory("notifications")}
             >
@@ -189,14 +220,82 @@ export function SettingsDialog({
           </nav>
 
           <section
-            aria-labelledby={
-              category === "notifications"
-                ? "notification-settings-title"
-                : "codex-settings-title"
-            }
+            aria-labelledby={`${category}-settings-title`}
             className="min-h-0 min-w-0 overflow-y-auto overscroll-contain px-6 py-5"
           >
-            {category === "notifications" ? (
+            {category === "project" ? (
+              <>
+                <div className="flex items-start justify-between gap-4">
+                  <div>
+                    <h2 id="project-settings-title" className="text-base font-semibold">
+                      Native 프로젝트
+                    </h2>
+                    <p className="mt-1.5 text-sm text-muted-foreground">
+                      프로젝트를 전환하거나 E3S 호환 파일을 가져오고 내보냅니다.
+                    </p>
+                  </div>
+                  {projectBusy !== null && (
+                    <span
+                      role="status"
+                      className="flex shrink-0 items-center gap-1.5 text-xs text-muted-foreground"
+                    >
+                      <LoaderCircle
+                        className="size-3.5 animate-spin motion-reduce:animate-none"
+                        aria-hidden="true"
+                      />
+                      처리 중…
+                    </span>
+                  )}
+                </div>
+                <div className="mt-5 grid gap-3 rounded-xl border border-border bg-card/40 p-4">
+                  <Button
+                    type="button"
+                    className="min-h-11 justify-start"
+                    disabled={projectBusy !== null}
+                    onClick={onProjectOpen}
+                  >
+                    <FolderKanban className="size-4" aria-hidden="true" />
+                    기존 Native 프로젝트 열기
+                  </Button>
+                  <div className="grid grid-cols-2 gap-3">
+                    <Button
+                      type="button"
+                      variant="outline"
+                      className="min-h-11 justify-start"
+                      disabled={projectBusy !== null}
+                      onClick={onProjectCreate}
+                    >
+                      <Plus className="size-4" aria-hidden="true" />
+                      새 프로젝트
+                    </Button>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      className="min-h-11 justify-start"
+                      disabled={projectBusy !== null}
+                      onClick={onProjectImport}
+                    >
+                      <FileInput className="size-4" aria-hidden="true" />
+                      E3S 가져오기
+                    </Button>
+                  </div>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    className="min-h-11 justify-start"
+                    disabled={projectBusy !== null}
+                    onClick={onProjectExport}
+                  >
+                    <FileOutput className="size-4" aria-hidden="true" />
+                    E3S 내보내기
+                  </Button>
+                </div>
+                <p className="mt-4 text-xs leading-relaxed text-muted-foreground">
+                  E3S 내보내기는 E3S에서 가져온 프로젝트만 지원합니다. Native
+                  프로젝트가 원본이며, EUD Editor 실행 환경은 사용하지 않습니다.
+                </p>
+              </>
+            ) : category === "notifications" ? (
               <>
             <div className="flex items-start justify-between gap-4">
               <div>

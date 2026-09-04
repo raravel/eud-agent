@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use thiserror::Error;
 
-pub trait JournalBridge {
+pub trait JournalRollbackTarget {
     type Error;
 
     fn set_dat_value(
@@ -369,8 +369,8 @@ pub enum JournalError {
     NonTailReject { request_id: String, target: String },
     #[error("invalid journal entry {entry_id}: {message}")]
     InvalidEntry { entry_id: String, message: String },
-    #[error("bridge operation failed: {0}")]
-    Bridge(String),
+    #[error("native rollback target operation failed: {0}")]
+    Target(String),
     #[error("journal lock poisoned")]
     LockPoisoned,
     #[error(transparent)]
@@ -481,10 +481,10 @@ impl JournalStore {
         &self,
         request_id: &str,
         decision: ChangesetDecision,
-        bridge: &B,
+        target: &B,
     ) -> Result<(), JournalError>
     where
-        B: JournalBridge,
+        B: JournalRollbackTarget,
         B::Error: fmt::Display,
     {
         let _guard = self.begin_decision(request_id)?;
@@ -495,7 +495,7 @@ impl JournalStore {
                 let rejected = rejected_entries(&journal, &ids);
                 validate_tail_reject(request_id, &journal, &rejected)?;
                 for entry in rejected.iter().rev() {
-                    apply_inverse(entry, bridge)?;
+                    apply_inverse(entry, target)?;
                 }
 
                 if matches!(ids, DecisionIds::All) {
@@ -1178,9 +1178,9 @@ fn changeset_item_id(entry: &JournalEntry) -> String {
     }
 }
 
-fn apply_inverse<B>(entry: &JournalEntry, bridge: &B) -> Result<(), JournalError>
+fn apply_inverse<B>(entry: &JournalEntry, target: &B) -> Result<(), JournalError>
 where
-    B: JournalBridge,
+    B: JournalRollbackTarget,
     B::Error: fmt::Display,
 {
     match entry.tool {
@@ -1194,15 +1194,15 @@ where
                 Snapshot::DatValue {
                     value: _,
                     was_default: true,
-                } => bridge
+                } => target
                     .reset_dat_value(table, dat, obj_id, property)
-                    .map_err(bridge_error),
+                    .map_err(target_error),
                 Snapshot::DatValue {
                     value,
                     was_default: false,
-                } => bridge
+                } => target
                     .set_dat_value(table, dat, obj_id, property, value.clone())
-                    .map_err(bridge_error),
+                    .map_err(target_error),
                 _ => Err(invalid_entry(entry, "expected dat before snapshot")),
             }
         }
@@ -1210,7 +1210,7 @@ where
             let path = entry_path(entry)?;
             match &entry.before {
                 Snapshot::FileContent { content } => {
-                    bridge.write_file(&path, content).map_err(bridge_error)
+                    target.write_file(&path, content).map_err(target_error)
                 }
                 _ => Err(invalid_entry(
                     entry,
@@ -1220,14 +1220,14 @@ where
         }
         WriteTool::FileCreate | WriteTool::Mkdir => {
             let path = entry_path(entry)?;
-            bridge.delete_file(&path).map_err(bridge_error)
+            target.delete_file(&path).map_err(target_error)
         }
         WriteTool::FileDelete => {
             let path = entry_path(entry)?;
             match &entry.before {
-                Snapshot::DeletedFile { content, position } => bridge
+                Snapshot::DeletedFile { content, position } => target
                     .create_file(&path, content, *position)
-                    .map_err(bridge_error),
+                    .map_err(target_error),
                 _ => Err(invalid_entry(
                     entry,
                     "expected deleted file before snapshot",
@@ -1237,9 +1237,9 @@ where
         WriteTool::WorkspaceWrite | WriteTool::WorkspaceDelete => {
             let (workspace_id, session_id, path) = workspace_target_parts(entry)?;
             match &entry.before {
-                Snapshot::FileContent { content } | Snapshot::DeletedFile { content, .. } => bridge
+                Snapshot::FileContent { content } | Snapshot::DeletedFile { content, .. } => target
                     .write_workspace_file(workspace_id, session_id, path, content)
-                    .map_err(bridge_error),
+                    .map_err(target_error),
                 _ => Err(invalid_entry(
                     entry,
                     "expected workspace file content before snapshot",
@@ -1248,41 +1248,41 @@ where
         }
         WriteTool::WorkspaceCreate => {
             let (workspace_id, session_id, path) = workspace_target_parts(entry)?;
-            bridge
+            target
                 .delete_workspace_file(workspace_id, session_id, path)
-                .map_err(bridge_error)
+                .map_err(target_error)
         }
         WriteTool::FileRename | WriteTool::FileMove => {
             let (from, to) = rename_inverse(entry)?;
-            bridge.rename_path(&from, &to).map_err(bridge_error)
+            target.rename_path(&from, &to).map_err(target_error)
         }
         WriteTool::SetMain => match &entry.before {
-            Snapshot::MainPath { path } => bridge.set_main(path.as_deref()).map_err(bridge_error),
+            Snapshot::MainPath { path } => target.set_main(path.as_deref()).map_err(target_error),
             _ => Err(invalid_entry(entry, "expected main path before snapshot")),
         },
         WriteTool::SettingsSet => {
             let key = setting_key(entry)?;
             match &entry.before {
                 Snapshot::SettingValue { value } => {
-                    bridge.set_setting(key, value.clone()).map_err(bridge_error)
+                    target.set_setting(key, value.clone()).map_err(target_error)
                 }
                 _ => Err(invalid_entry(entry, "expected setting before snapshot")),
             }
         }
         WriteTool::PluginAdd => {
             let plugin_id = plugin_id(entry)?;
-            bridge.plugin_remove(plugin_id).map_err(bridge_error)
+            target.plugin_remove(plugin_id).map_err(target_error)
         }
         WriteTool::PluginEdit => {
             let plugin_id = plugin_id(entry)?;
             match &entry.before {
                 Snapshot::PluginTexts { texts, .. } if texts.is_empty() => Err(invalid_entry(
                     entry,
-                    "plugin rollback is unavailable because the bridge did not expose the original Texts",
+                    "plugin rollback is unavailable because the native target has no original Texts",
                 )),
-                Snapshot::PluginTexts { texts, index } => bridge
+                Snapshot::PluginTexts { texts, index } => target
                     .plugin_edit(plugin_id, texts.clone(), *index)
-                    .map_err(bridge_error),
+                    .map_err(target_error),
                 _ => Err(invalid_entry(
                     entry,
                     "expected plugin texts before snapshot",
@@ -1294,11 +1294,11 @@ where
             match &entry.before {
                 Snapshot::PluginTexts { texts, .. } if texts.is_empty() => Err(invalid_entry(
                     entry,
-                    "plugin rollback is unavailable because the bridge did not expose the original Texts",
+                    "plugin rollback is unavailable because the native target has no original Texts",
                 )),
-                Snapshot::PluginTexts { texts, index } => bridge
+                Snapshot::PluginTexts { texts, index } => target
                     .plugin_add(plugin_id, texts.clone(), *index)
-                    .map_err(bridge_error),
+                    .map_err(target_error),
                 _ => Err(invalid_entry(
                     entry,
                     "expected plugin texts before snapshot",
@@ -1310,9 +1310,9 @@ where
                 .ok_or_else(|| invalid_entry(entry, "expected plugin after index"))?;
             let to_index = plugin_snapshot_index(entry, &entry.before)?
                 .ok_or_else(|| invalid_entry(entry, "expected plugin before index"))?;
-            bridge
+            target
                 .plugin_move(from_index, to_index)
-                .map_err(bridge_error)
+                .map_err(target_error)
         }
         WriteTool::LocationWrite
         | WriteTool::PlayerSetup
@@ -1333,9 +1333,9 @@ where
                 } else {
                     None
                 };
-                bridge
+                target
                     .restore_map_backup(map_path, backup_path, expected_sha256)
-                    .map_err(bridge_error)
+                    .map_err(target_error)
             }
             _ => Err(invalid_entry(entry, "expected map backup before snapshot")),
         },
@@ -1410,8 +1410,8 @@ fn invalid_entry(entry: &JournalEntry, message: &str) -> JournalError {
     }
 }
 
-fn bridge_error(error: impl fmt::Display) -> JournalError {
-    JournalError::Bridge(error.to_string())
+fn target_error(error: impl fmt::Display) -> JournalError {
+    JournalError::Target(error.to_string())
 }
 
 #[cfg(test)]
@@ -1486,17 +1486,17 @@ mod tests {
     }
 
     #[derive(Default)]
-    struct FakeBridge {
+    struct FakeTarget {
         ops: RefCell<Vec<AppliedInverse>>,
     }
 
-    impl FakeBridge {
+    impl FakeTarget {
         fn ops(&self) -> Vec<AppliedInverse> {
             self.ops.borrow().clone()
         }
     }
 
-    impl JournalBridge for FakeBridge {
+    impl JournalRollbackTarget for FakeTarget {
         type Error = String;
 
         fn set_dat_value(
@@ -1794,12 +1794,12 @@ mod tests {
     #[test]
     fn location_write_inverse_restores_recorded_map_backup() {
         let entry = location_write_entry("loc-rename", "rename", Some(5), Some("spot"));
-        let bridge = FakeBridge::default();
+        let target = FakeTarget::default();
 
-        apply_inverse(&entry, &bridge).expect("location_write inverse should restore backup");
+        apply_inverse(&entry, &target).expect("location_write inverse should restore backup");
 
         assert_eq!(
-            bridge.ops(),
+            target.ops(),
             vec![AppliedInverse::RestoreMapBackup {
                 map_path: "C:/maps/demo.scx".to_owned(),
                 backup_path: "C:/Users/me/AppData/Roaming/eud-agent/map_backups/demo.bak"
@@ -1845,12 +1845,12 @@ mod tests {
     #[test]
     fn player_setup_inverse_restores_recorded_map_backup() {
         let entry = player_setup_entry("plr-1", "controller", "P1 controller = human");
-        let bridge = FakeBridge::default();
+        let target = FakeTarget::default();
 
-        apply_inverse(&entry, &bridge).expect("player_setup inverse should restore backup");
+        apply_inverse(&entry, &target).expect("player_setup inverse should restore backup");
 
         assert_eq!(
-            bridge.ops(),
+            target.ops(),
             vec![AppliedInverse::RestoreMapBackup {
                 map_path: "C:/maps/demo.scx".to_owned(),
                 backup_path: "C:/Users/me/AppData/Roaming/eud-agent/map_backups/demo.bak"
@@ -1958,10 +1958,10 @@ mod tests {
                     && property.old == json!(100)
                     && property.new == json!(50)
             }));
-        let bridge = FakeBridge::default();
-        apply_inverse(&entry, &bridge).unwrap();
+        let target = FakeTarget::default();
+        apply_inverse(&entry, &target).unwrap();
         assert_eq!(
-            bridge.ops(),
+            target.ops(),
             vec![AppliedInverse::RestoreMapBackup {
                 map_path: "C:/maps/demo.scx".to_string(),
                 backup_path: "C:/Users/me/AppData/Roaming/eud-agent/map_backups/demo.sound.bak"
@@ -2214,17 +2214,17 @@ mod tests {
             .persist(request_id)
             .expect("journal should persist before rollback");
 
-        let bridge = FakeBridge::default();
+        let target = FakeTarget::default();
         store
             .decide(
                 request_id,
                 ChangesetDecision::reject(DecisionIds::All),
-                &bridge,
+                &target,
             )
             .expect("reject all should rollback");
 
         assert_eq!(
-            bridge.ops(),
+            target.ops(),
             vec![
                 AppliedInverse::PluginMove {
                     from_index: 5,
@@ -2373,17 +2373,17 @@ mod tests {
             )
             .expect("rename entry should record");
 
-        let bridge = FakeBridge::default();
+        let target = FakeTarget::default();
         store
             .decide(
                 request_id,
                 ChangesetDecision::reject(DecisionIds::All),
-                &bridge,
+                &target,
             )
             .expect("reject should apply inverses");
 
         assert_eq!(
-            bridge.ops(),
+            target.ops(),
             vec![
                 AppliedInverse::Rename {
                     from: "new.eps".to_owned(),
@@ -2451,18 +2451,18 @@ mod tests {
             .expect("dmg entry should record");
         store.persist(request_id).expect("journal should persist");
 
-        let bridge = FakeBridge::default();
+        let target = FakeTarget::default();
         store
             .decide(
                 request_id,
                 ChangesetDecision::reject(DecisionIds::Items(vec!["dat-hp".to_owned()])),
-                &bridge,
+                &target,
             )
             .expect("partial reject should roll back the HP edit");
 
         // The inverse re-set the rejected HP to its old value.
         assert_eq!(
-            bridge.ops(),
+            target.ops(),
             vec![AppliedInverse::DatSet {
                 table: DatTable::Dat,
                 dat: "units".to_owned(),
@@ -2790,12 +2790,12 @@ mod tests {
             .expect("entry should record");
         store.persist(request_id).expect("journal should persist");
 
-        let bridge = FakeBridge::default();
+        let target = FakeTarget::default();
         store
-            .decide(request_id, ChangesetDecision::accept(), &bridge)
+            .decide(request_id, ChangesetDecision::accept(), &target)
             .expect("accept should archive");
 
-        assert!(bridge.ops().is_empty());
+        assert!(target.ops().is_empty());
         assert!(!data_dir.join("journal").join("req-accept.json").exists());
         assert!(data_dir
             .join("journal")
@@ -2845,11 +2845,11 @@ mod tests {
             )
             .expect("second write should record");
 
-        let bridge = FakeBridge::default();
+        let target = FakeTarget::default();
         let result = store.decide(
             request_id,
             ChangesetDecision::reject(DecisionIds::Items(vec!["first-write".to_owned()])),
-            &bridge,
+            &target,
         );
 
         assert!(matches!(
@@ -2857,18 +2857,18 @@ mod tests {
             Err(JournalError::NonTailReject { request_id: id, target })
                 if id == request_id && target == "path:scripts/main.eps"
         ));
-        assert!(bridge.ops().is_empty());
+        assert!(target.ops().is_empty());
 
         store
             .decide(
                 request_id,
                 ChangesetDecision::reject(DecisionIds::All),
-                &bridge,
+                &target,
             )
             .expect("reject all should rollback the full target tail");
 
         assert_eq!(
-            bridge.ops(),
+            target.ops(),
             vec![
                 AppliedInverse::WriteFile {
                     path: "scripts/main.eps".to_owned(),

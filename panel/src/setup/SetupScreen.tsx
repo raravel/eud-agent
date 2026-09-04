@@ -1,18 +1,4 @@
-/**
- * First-run setup overlay (EUD-120, EUD-132).
- *
- * Two steps, mirroring feature 10's boot flow, rendered as a centered card with
- * a step indicator (1 에디터 폴더 → 2 에셋 다운로드):
- *  1. editor-path pick — shown while the configured editor path is missing or
- *     invalid; the button opens the native folder picker via the backend.
- *  2. asset download — rendered while bootstrap downloads/verifies first-run
- *     assets. Error mode swaps progress for a retry button; progress mode is
- *     determinate when a percent is available and indeterminate otherwise.
- *
- * Styling stays inside the panel's shadcn token system (dark theme, emerald
- * accent matching the Header status pills); icons are bundled lucide SVGs and
- * animations respect prefers-reduced-motion (rules.md: no CDN assets).
- */
+/** Native project/euddraft/assets/codex first-run setup overlay. */
 import { useState, type ReactNode } from "react";
 import {
   CheckIcon,
@@ -28,19 +14,32 @@ import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import type { BootstrapView } from "@/setup/bootstrap";
 
-/** User-facing text for stable backend pick-error codes (never rendered raw). */
 const PICK_ERROR_TEXT: Record<string, string> = {
-  invalid_editor_folder:
-    "선택한 폴더에서 EUD Editor 3을 찾지 못했습니다. Data\\Lua\\TriggerEditor 폴더가 있는 설치 폴더를 선택해 주세요.",
+  invalid_project_folder:
+    "project.json이 있는 Native EUD 프로젝트 폴더를 선택해 주세요.",
+  invalid_euddraft_path:
+    "euddraft.exe 또는 euddraft.py를 선택해 주세요.",
 };
 
+function projectErrorText(error: string): string {
+  if (error.startsWith("project_create_failed:")) {
+    return "프로젝트를 만들지 못했습니다. 원본 맵과 비어 있는 대상 폴더를 확인해 주세요.";
+  }
+  if (error.startsWith("e3s_import_failed:")) {
+    return "E3S를 가져오지 못했습니다. 참조 맵이 존재하고 대상 폴더가 비어 있는지 확인해 주세요.";
+  }
+  return PICK_ERROR_TEXT[error] ?? "설정 경로를 확인하지 못했습니다.";
+}
+
 export interface SetupScreenProps {
-  /** False while the editor install folder still needs to be picked. */
-  editorValid: boolean;
-  /** Stable error code from a rejected folder pick (null when none). */
+  projectValid: boolean;
+  euddraftValid: boolean;
   pickError: string | null;
-  /** Open the native folder picker (backend validates + persists). */
-  onPick: () => void;
+  onPickProject: () => void;
+  onCreateProject: () => void;
+  onImportE3s: () => void;
+  projectAction?: "open" | "create" | "import" | null;
+  onPickEuddraft: () => void;
   view: BootstrapView;
   error: string | null;
   onRetry: () => void;
@@ -91,7 +90,7 @@ function Step({
       </span>
       <span
         className={cn(
-          "text-sm",
+          "whitespace-nowrap text-sm",
           state === "current"
             ? "font-medium text-foreground"
             : "text-muted-foreground",
@@ -247,9 +246,14 @@ function CodexStep({
 }
 
 export function SetupScreen({
-  editorValid,
+  projectValid,
+  euddraftValid,
   pickError,
-  onPick,
+  onPickProject,
+  onCreateProject,
+  onImportE3s,
+  projectAction = null,
+  onPickEuddraft,
   view,
   error,
   onRetry,
@@ -266,9 +270,9 @@ export function SetupScreen({
   const errorMode = errorText.length > 0 || view.phase === "error";
   const determinate = view.pct !== null;
   const pct = view.pct === null ? undefined : view.pct;
-  const pickMode = !editorValid;
-  // The codex login step runs LAST: editor picked + assets verified, but codex
-  // is not yet logged in. Until then the download step owns the non-pick screen.
+  const projectPickMode = !projectValid;
+  const euddraftPickMode = projectValid && !euddraftValid;
+  const pickMode = projectPickMode || euddraftPickMode;
   const codexMode = !pickMode && assetsReady && !codexAuthed;
 
   return (
@@ -286,7 +290,7 @@ export function SetupScreen({
         <div className="absolute -right-20 bottom-0 size-64 rounded-full bg-primary/5 blur-3xl" />
       </div>
 
-      <div className="relative w-full max-w-md animate-in fade-in zoom-in-95 duration-300 motion-reduce:animate-none">
+      <div className="relative w-full max-w-lg animate-in fade-in zoom-in-95 duration-300 motion-reduce:animate-none">
         <div className="flex flex-col gap-6 rounded-xl border border-border bg-card/80 p-8 shadow-2xl backdrop-blur">
           {/* Branding + title */}
           <div className="flex items-center gap-3">
@@ -306,23 +310,24 @@ export function SetupScreen({
             </div>
           </div>
 
-          {/* Step indicator */}
-          <ol className="flex items-center gap-3">
-            <Step
-              index={1}
-              label="에디터 폴더"
-              state={pickMode ? "current" : "done"}
-            />
-            <span aria-hidden className="h-px min-w-6 flex-1 bg-border" />
+          <ol className="flex items-center gap-2">
+            <Step index={1} label="프로젝트" state={projectPickMode ? "current" : "done"} />
+            <span aria-hidden className="h-px min-w-3 flex-1 bg-border" />
             <Step
               index={2}
-              label="에셋 다운로드"
-              state={pickMode ? "pending" : assetsReady ? "done" : "current"}
+              label="euddraft"
+              state={projectPickMode ? "pending" : euddraftPickMode ? "current" : "done"}
             />
-            <span aria-hidden className="h-px min-w-6 flex-1 bg-border" />
+            <span aria-hidden className="h-px min-w-3 flex-1 bg-border" />
             <Step
               index={3}
-              label="codex 로그인"
+              label="에셋"
+              state={pickMode ? "pending" : assetsReady ? "done" : "current"}
+            />
+            <span aria-hidden className="h-px min-w-3 flex-1 bg-border" />
+            <Step
+              index={4}
+              label="codex"
               state={codexMode ? "current" : codexAuthed ? "done" : "pending"}
             />
           </ol>
@@ -336,23 +341,75 @@ export function SetupScreen({
                 />
                 <div className="grid gap-1">
                   <p className="text-sm">
-                    EUD Editor 3 설치 폴더를 선택해 주세요.
+                    {projectPickMode
+                      ? "Native EUD 프로젝트 폴더를 선택해 주세요."
+                      : "euddraft 실행 파일을 선택해 주세요."}
                   </p>
                   <p className="text-xs text-muted-foreground">
-                    Data\Lua\TriggerEditor 폴더가 들어 있는 위치입니다.
+                    {projectPickMode
+                      ? "project.json, src/, dat/, maps/가 있는 프로젝트 루트입니다."
+                      : "euddraft.exe 또는 euddraft.py를 선택합니다."}
                   </p>
                 </div>
               </div>
               {pickError !== null && (
                 <ErrorNotice>
-                  {PICK_ERROR_TEXT[pickError] ??
-                    "에디터 폴더를 설정하지 못했습니다. 다시 시도해 주세요."}
+                  {projectErrorText(pickError)}
                 </ErrorNotice>
               )}
-              <Button type="button" size="lg" className="w-full" onClick={onPick}>
-                <FolderOpenIcon aria-hidden />
-                에디터 폴더 선택
-              </Button>
+              {projectPickMode ? (
+                <div className="grid gap-2">
+                  <Button
+                    type="button"
+                    size="lg"
+                    className="w-full"
+                    onClick={onPickProject}
+                    disabled={projectAction !== null}
+                  >
+                    {projectAction === "open" ? (
+                      <Loader2Icon
+                        aria-hidden
+                        className="size-4 animate-spin motion-reduce:animate-none"
+                      />
+                    ) : (
+                      <FolderOpenIcon aria-hidden />
+                    )}
+                    {projectAction === "open"
+                      ? "프로젝트 여는 중…"
+                      : "기존 Native 프로젝트 열기"}
+                  </Button>
+                  <div className="grid grid-cols-2 gap-2">
+                    <Button
+                      type="button"
+                      variant="outline"
+                      className="min-h-11"
+                      onClick={onCreateProject}
+                      disabled={projectAction !== null}
+                    >
+                      {projectAction === "create" ? "만드는 중…" : "새 프로젝트 만들기"}
+                    </Button>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      className="min-h-11"
+                      onClick={onImportE3s}
+                      disabled={projectAction !== null}
+                    >
+                      {projectAction === "import" ? "가져오는 중…" : "E3S 가져오기"}
+                    </Button>
+                  </div>
+                </div>
+              ) : (
+                <Button
+                  type="button"
+                  size="lg"
+                  className="w-full"
+                  onClick={onPickEuddraft}
+                >
+                  <FolderOpenIcon aria-hidden />
+                  euddraft 선택
+                </Button>
+              )}
             </div>
           ) : codexMode ? (
             <CodexStep

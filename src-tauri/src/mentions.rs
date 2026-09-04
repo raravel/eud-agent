@@ -948,39 +948,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires the live EUD Editor bridge and current OpenMapName"]
-    fn live_warmed_search_avoids_editor_roundtrip() {
-        let roaming = PathBuf::from(std::env::var_os("APPDATA").unwrap());
-        let local = PathBuf::from(std::env::var_os("LOCALAPPDATA").unwrap());
-        let dirs = crate::config::DataDirs::from_bases(&roaming, &local);
-        let imports = crate::map_import::MapImportStore::new(dirs.clone());
-        let candidates = CandidateStore::new(dirs.clone(), imports);
-        let service = MentionService::new(candidates, MapContextService::new(dirs));
-        let search_request = MentionSearchRequest {
-            query: String::new(),
-            kinds: Some(vec![MentionKind::MapLocation]),
-            limit: Some(DEFAULT_SEARCH_LIMIT),
-        };
-
-        let warm_started = Instant::now();
-        service.warmup().unwrap();
-        let warm_elapsed = warm_started.elapsed();
-        let first_started = Instant::now();
-        service.search(search_request.clone()).unwrap();
-        let first_elapsed = first_started.elapsed();
-        let second_started = Instant::now();
-        service.search(search_request).unwrap();
-        let second_elapsed = second_started.elapsed();
-
-        eprintln!(
-            "mention warmup={warm_elapsed:?} first={first_elapsed:?} second={second_elapsed:?}"
-        );
-        assert_eq!(service.context_loads_for_tests(), 1);
-        assert!(first_elapsed < Duration::from_millis(500));
-        assert!(second_elapsed < Duration::from_millis(500));
-    }
-
-    #[test]
     fn strict_serde_rejects_unknown_kind_field_and_missing_authority() {
         let good = json!({
             "kind": "map.region",

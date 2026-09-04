@@ -1,8 +1,7 @@
 /**
- * Wire-schema guards for the first-run setup messages (EUD-132).
+ * Wire-schema guards for native project/euddraft first-run setup messages.
  *
- * `setup` is the response shape of the `setup_status` / `setup_pick_editor_path`
- * commands; the client normalizes it through isServerMessage before dispatch.
+ * Every setup response crosses the runtime guard before dispatch.
  */
 import { describe, it, expect } from "vitest";
 import {
@@ -15,8 +14,10 @@ describe("setup message guard", () => {
   it("accepts a full setup snapshot", () => {
     const msg = {
       type: "setup",
-      editor_path: "C:\\Games\\EUDEditor3",
-      editor_valid: true,
+      project_path: "C:\\Projects\\MyMap",
+      project_valid: true,
+      euddraft_path: "C:\\Tools\\euddraft.exe",
+      euddraft_valid: true,
       assets_ready: false,
       codex_resolved: true,
       codex_authed: false,
@@ -30,13 +31,15 @@ describe("setup message guard", () => {
     expect(
       isSetupMessage({
         type: "setup",
-        editor_path: "",
-        editor_valid: false,
+        project_path: "",
+        project_valid: false,
+        euddraft_path: "",
+        euddraft_valid: false,
         assets_ready: false,
         codex_resolved: true,
         codex_authed: false,
         setup_required: true,
-        error: "invalid_editor_folder",
+        error: "invalid_project_folder",
       }),
     ).toBe(true);
   });
@@ -46,8 +49,10 @@ describe("setup message guard", () => {
     expect(
       isSetupMessage({
         type: "setup",
-        editor_path: "",
-        editor_valid: "yes", // wrong type
+        project_path: "",
+        project_valid: "yes", // wrong type
+        euddraft_path: "",
+        euddraft_valid: false,
         assets_ready: false,
         codex_resolved: true,
         codex_authed: false,
@@ -57,8 +62,10 @@ describe("setup message guard", () => {
     expect(
       isSetupMessage({
         type: "setup",
-        editor_path: "",
-        editor_valid: false,
+        project_path: "",
+        project_valid: false,
+        euddraft_path: "",
+        euddraft_valid: false,
         assets_ready: false,
         codex_resolved: true,
         codex_authed: false,
@@ -70,8 +77,10 @@ describe("setup message guard", () => {
     expect(
       isSetupMessage({
         type: "setup",
-        editor_path: "",
-        editor_valid: false,
+        project_path: "",
+        project_valid: false,
+        euddraft_path: "",
+        euddraft_valid: false,
         assets_ready: false,
         setup_required: true,
       }),
@@ -80,7 +89,10 @@ describe("setup message guard", () => {
 
   it("exposes the setup client commands in the closed set", () => {
     expect(CLIENT_MESSAGE_TYPES).toContain("setup_status");
-    expect(CLIENT_MESSAGE_TYPES).toContain("setup_pick_editor_path");
+    expect(CLIENT_MESSAGE_TYPES).toContain("setup_pick_project_path");
+    expect(CLIENT_MESSAGE_TYPES).toContain("setup_create_project");
+    expect(CLIENT_MESSAGE_TYPES).toContain("setup_import_e3s");
+    expect(CLIENT_MESSAGE_TYPES).toContain("setup_pick_euddraft_path");
     expect(CLIENT_MESSAGE_TYPES).toContain("bootstrap_run");
   });
 });
