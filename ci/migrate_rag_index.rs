@@ -172,11 +172,7 @@ fn read_corpus_entries(corpus_dir: &Path) -> Result<Vec<CorpusEntry>> {
 /// Derive every authoritative field for one row using the same trimming,
 /// chunking, source-label, id, and tier rules as
 /// `build_rag_index.rs::corpus_docs_from_row`.
-fn corpus_entries_from_row(
-    row: JsonlRow,
-    file_name: &str,
-    line_number: usize,
-) -> Vec<CorpusEntry> {
+fn corpus_entries_from_row(row: JsonlRow, file_name: &str, line_number: usize) -> Vec<CorpusEntry> {
     let content = row.content.trim();
     let comments = row.comments.as_deref().unwrap_or("").trim();
     if content.is_empty() && comments.is_empty() {
@@ -380,8 +376,7 @@ fn build_v2_entries(
 ) -> Result<Vec<V2Entry>> {
     use std::collections::{hash_map::Entry, HashMap, HashSet};
 
-    let mut corpus_by_id: HashMap<u64, &CorpusEntry> =
-        HashMap::with_capacity(corpus_entries.len());
+    let mut corpus_by_id: HashMap<u64, &CorpusEntry> = HashMap::with_capacity(corpus_entries.len());
     for corpus in corpus_entries {
         match corpus_by_id.entry(corpus.id) {
             Entry::Vacant(entry) => {
@@ -405,10 +400,7 @@ fn build_v2_entries(
     let mut entries = Vec::with_capacity(v1_entries.len());
     for v1 in v1_entries {
         if !seen_v1.insert(v1.id) {
-            bail!(
-                "duplicate v1 id {} — refusing ambiguous migration",
-                v1.id
-            );
+            bail!("duplicate v1 id {} — refusing ambiguous migration", v1.id);
         }
 
         let corpus = corpus_by_id.get(&v1.id).ok_or_else(|| {
@@ -776,13 +768,13 @@ mod tests {
                 (
                     id_official,
                     vec_official.clone(),
-                    "official content",
+                    "제목: 오피셜\n\nofficial content",
                     "[오피셜](https://x/1)",
                 ),
                 (
                     id_qna,
                     vec_qna.clone(),
-                    "qna content",
+                    "제목: 질문\n\nqna content",
                     "[질문](https://x/2)",
                 ),
             ],
@@ -858,7 +850,12 @@ mod tests {
         write_v1_index(
             &v1_path,
             &[
-                (id_matched, synth_vector(1), "c", "[t](https://x/1)"),
+                (
+                    id_matched,
+                    synth_vector(1),
+                    "제목: t\n\nc",
+                    "[t](https://x/1)",
+                ),
                 (
                     id_orphan,
                     synth_vector(2),
@@ -897,7 +894,12 @@ mod tests {
         let v1_path = tmp.path().join("rag-index.v1.bin");
         write_v1_index(
             &v1_path,
-            &[(id_a1, synth_vector(3), "c1", "[t1](https://x/1)")],
+            &[(
+                id_a1,
+                synth_vector(3),
+                "제목: t1\n\nc1",
+                "[t1](https://x/1)",
+            )],
         );
         let out_path = tmp.path().join("rag-index.v2.bin");
 
@@ -935,7 +937,10 @@ mod tests {
 
         let id = super::fnv1a64(b"id:legacy#0");
         let v1_path = tmp.path().join("rag-index.v1.bin");
-        write_v1_index(&v1_path, &[(id, synth_vector(17), "c", "[legacy]")]);
+        write_v1_index(
+            &v1_path,
+            &[(id, synth_vector(17), "제목: legacy\n\nc", "[legacy]")],
+        );
         let out_path = tmp.path().join("rag-index.v2.bin");
 
         super::migrate_v1_to_v2(&v1_path, &corpus_dir, &out_path)
@@ -964,7 +969,10 @@ mod tests {
 
         let id = super::fnv1a64(b"id:legacy#0");
         let v1_path = tmp.path().join("rag-index.v1.bin");
-        write_v1_index(&v1_path, &[(id, synth_vector(23), "c", "[legacy]")]);
+        write_v1_index(
+            &v1_path,
+            &[(id, synth_vector(23), "제목: legacy\n\nc", "[legacy]")],
+        );
         let out_path = tmp.path().join("rag-index.v2.bin");
 
         let result = super::migrate_v1_to_v2(&v1_path, &corpus_dir, &out_path);
@@ -976,5 +984,36 @@ mod tests {
             !out_path.exists(),
             "migration must not write a partial output after an unmatched corpus row"
         );
+    }
+
+    #[test]
+    fn migration_rejects_changed_content_with_the_same_id_without_replacing_output() {
+        let tmp = TempDir::new("changed-content");
+        let corpus_dir = init_corpus_dir(&tmp);
+        write_corpus_file(
+            &corpus_dir,
+            "cafebook.jsonl",
+            &[
+                r#"{"id":"stable","title":"title","source":"cafebook.jsonl","content":"updated body"}"#,
+            ],
+        );
+        let id = super::fnv1a64(b"id:stable#0");
+        let v1_path = tmp.path().join("rag-index.v1.bin");
+        write_v1_index(
+            &v1_path,
+            &[(
+                id,
+                synth_vector(29),
+                "제목: title\n\noriginal body",
+                "[title]",
+            )],
+        );
+        let original_v1 = fs::read(&v1_path).unwrap();
+        let out_path = tmp.path().join("rag-index.v2.bin");
+        fs::write(&out_path, b"previous verified release").unwrap();
+
+        assert!(super::migrate_v1_to_v2(&v1_path, &corpus_dir, &out_path).is_err());
+        assert_eq!(fs::read(&v1_path).unwrap(), original_v1);
+        assert_eq!(fs::read(&out_path).unwrap(), b"previous verified release");
     }
 }
