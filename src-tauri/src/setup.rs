@@ -636,6 +636,47 @@ mod tests {
         fs::remove_dir_all(base).ok();
     }
     #[test]
+    fn cached_stale_rag_config_rolls_forward_to_current_readiness() {
+        let base = unique_temp_dir("rag-rollover");
+        let dirs = DataDirs::from_bases(&base.join("roaming"), &base.join("local"));
+        dirs.ensure_dirs().unwrap();
+
+        let mut stale_rag = place_rag_asset(&dirs);
+        stale_rag.version = "2".to_string();
+        dirs.save_config(&Config {
+            model: crate::config::AssetSpec {
+                name: bootstrap::DEFAULT_MODEL_NAME.to_string(),
+                ..Default::default()
+            },
+            rag_index: stale_rag,
+            ..Default::default()
+        })
+        .unwrap();
+
+        let stale = setup_status_payload(&dirs, Vec::new()).unwrap();
+        assert!(
+            !stale.assets_ready,
+            "a cached stale pin must keep setup in the asset-refresh state"
+        );
+
+        let current = Config {
+            model: crate::config::AssetSpec {
+                name: bootstrap::DEFAULT_MODEL_NAME.to_string(),
+                ..Default::default()
+            },
+            rag_index: place_rag_asset(&dirs),
+            ..Default::default()
+        };
+        dirs.save_config(&current).unwrap();
+        let refreshed = setup_status_payload(&dirs, Vec::new()).unwrap();
+        assert!(
+            refreshed.assets_ready,
+            "a cached current pin with verified assets must be ready"
+        );
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
     fn project_creation_copies_the_source_map_and_opens_canonical_state() {
         let base = unique_temp_dir("create");
         let source = base.join("input.scx");

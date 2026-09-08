@@ -46,7 +46,9 @@ the L0 item number rather than restating the prohibition.
 |---|---|---|---|
 | `eud_book.jsonl`, `cafebook.jsonl`, `scrmapdocs_en.jsonl`, `eudplib_api.jsonl`, `eudplib_examples.jsonl`, `eud_editor_schema.jsonl` | primary reference | 3 | verified manuals, APIs, examples, and editor schema |
 | `board_강좌팁`, `board_연구칼럼` | lecture/research | 2 | curated write-ups |
+| `eudtools_wiki.jsonl`, `eudtools_reference.jsonl` | lecture/research | 2 | legacy technical references; game behavior remains unverified |
 | `board_유틸리티툴`, `board_Lua자료실`, `user_*` | general | 1 | general posts |
+| `eudtools_wiki_experimental.jsonl` (row source within `eudtools_wiki.jsonl`) | general | 1 | experimental or unstable legacy techniques |
 | `board_질문답변` | Q&A | 0 | questions; may contain wrong/unsolved code |
 
 The mapping keys off `JsonlRow.source` (the original per-board filename), available only at
@@ -92,18 +94,22 @@ flowchart TD
 ```
 
 - Embedding vectors are copied byte-for-byte from v1 — DEFAULT_BATCH_SIZE=16 and the EUD-107
-  embedding space are preserved (rules.md "Learned rules"; full rebuild only on model change).
+  embedding space are preserved (rules.md "Learned rules"); metadata-only migration does not re-embed.
 - A test proves every v2 vector is byte-identical to its v1 source vector.
 - Any v1 id with no corpus match (or vice versa) is a hard error — migration is all-or-nothing.
+- Historical snapshots may omit only `eudtools_wiki.jsonl` and `eudtools_reference.jsonl`.
+  The original seven inputs remain required; any present new row must still join exactly.
+  Adding new corpus entries requires a full canonical rebuild, not vector-only migration.
 
 ## Bootstrap + CI republish
 
 - `src-tauri/src/bootstrap.rs`: the persisted index loader requires binary layout v2; the
-  distribution contract now requires release generation v3 so healthy v2 installations refresh.
+  distribution contract requires release generation v4 so healthy v3 installations refresh.
 - `.github/workflows/build-rag-index.yml`: the canonical CPU builder emits binary layout v2 from
-  the seven-source corpus and publishes a manifest with version `3`. UTF-8 without BOM throughout;
+  the nine-source corpus and generates a manifest with version `4`. UTF-8 without BOM throughout;
   the runner remains `ubuntu-latest`.
-- Published under `rag-index-v3`: `rag-index.bin`, `.sha256`, `rag-index.manifest.json`.
+- Release target `rag-index-v4`: `rag-index.bin`, `.sha256`, `rag-index.manifest.json`.
+  Local artifact generation is separate from uploading/tagging/publishing that release.
 
 ## GPU differential-test track (separate, gated)
 
@@ -126,8 +132,8 @@ critical path and NOT wired into CI (the `ubuntu-latest` runner has no GPU).
 - `ci/build_rag_index.rs` — `source`→`tier_level` derivation, v2 write
 - `ci/` migration binary (e.g. `migrate_rag_index.rs`) — v1 bin + corpus → v2 bin, vector-preservation test
 - `src-tauri/src/bootstrap.rs` — persisted index loader still requires binary layout v2; release
-  generation v3 forces installed v2 corpus assets to refresh through the manifest/sha256 path
-- `.github/workflows/build-rag-index.yml` — canonical CPU build published as `rag-index-v3`
+  generation v4 forces installed v3 corpus assets to refresh through the manifest/sha256 path
+- `.github/workflows/build-rag-index.yml` — canonical CPU build targets `rag-index-v4`
 - `ci/` GPU differential-test fixture + test (local-only, gated)
 - external: `fastembed 5.15` (BGEM3Q), `sha2` (manifest digest)
-- [BOUND 2026-06-12 from EUD-159-22ba; advanced to release generation v3] `src-tauri/src/setup.rs` — `run_bootstrap_inner` re-fetches the release manifest when the pinned `rag_index.version` differs from `REQUIRED_RAG_INDEX_VERSION`, so stale v1/v2 installations upgrade to v3
+- [BOUND 2026-06-12 from EUD-159-22ba; advanced to release generation v4] `src-tauri/src/setup.rs` — `run_bootstrap_inner` re-fetches the release manifest when the pinned `rag_index.version` differs from `REQUIRED_RAG_INDEX_VERSION`, so stale v1/v2/v3 installations upgrade to v4

@@ -1,13 +1,18 @@
 //! v1 -> v2 RAG index migration (NO re-embedding).
 //!
 //! Upgrades the published v1 `rag-index.bin` (no `tier_level` byte) to the v2 layout
-//! by re-parsing `ci/corpus/*.jsonl` to derive each chunk's `id` and `tier_level`,
-//! joining on `id`, copying every v1 vector BYTE-FOR-BYTE, and stamping the tier byte.
-//! Because vectors are preserved verbatim, the DEFAULT_BATCH_SIZE / EUD-107 embedding
-//! space is unchanged — a full rebuild is only ever needed on a model change.
+//! by re-parsing the matching historical corpus to derive each chunk's `id`,
+//! `tier_level`, `text`, and `source`. Every derived field must exactly match the v1
+//! entry before its vector is copied BYTE-FOR-BYTE and the derived tier is stamped.
 //!
-//! All-or-nothing join: any v1 id absent from the corpus, OR any corpus id absent from
-//! v1, is a HARD ERROR (the guard against id/tier-derivation drift vs build_rag_index.rs).
+//! Migration is valid only for an exact historical corpus match. Any corpus addition,
+//! removal, or content change requires a fresh canonical CPU rebuild instead; the
+//! migration MUST NOT skip unmatched rows. The newly introduced eudtools input files
+//! may be absent from an older historical snapshot, but when present their rows are
+//! part of the same all-or-nothing join.
+//!
+//! All-or-nothing join: duplicates on either side, any v1 id absent from the corpus,
+//! any corpus id absent from v1, or any text/source mismatch is a HARD ERROR.
 
 use std::{
     env,
@@ -28,15 +33,13 @@ const V2_VERSION: u32 = 2;
 // Pure corpus-derivation logic — DUPLICATED VERBATIM from
 // `ci/build_rag_index.rs` (fnv1a64, chunk_text, tier_level_for_source,
 // read_corpus over INPUT_FILES, corpus_docs_from_row, JsonlRow). The migration
-// MUST derive ids/tiers byte-identically to the index builder or the all-or-
-// nothing join silently fails. These MUST STAY IN SYNC with build_rag_index.rs;
-// the byte-for-byte vector-preservation test + the all-or-nothing join are the
-// guards against drift. The only intentional difference: this side derives ONLY
-// (id, tier_level) per chunk and DROPS the text/source it would build — those
-// come from the v1 entry, not re-derived here.
+// MUST derive ids/tiers/text/source byte-identically to the index builder or the
+// exact join fails. These MUST STAY IN SYNC with build_rag_index.rs; the
+// byte-for-byte vector-preservation test + the all-or-nothing join are the
+// guards against drift.
 // ---------------------------------------------------------------------------
 
-const INPUT_FILES: [&str; 7] = [
+const INPUT_FILES: [&str; 9] = [
     "articles.jsonl",
     "eud_book.jsonl",
     "cafebook.jsonl",
@@ -44,7 +47,14 @@ const INPUT_FILES: [&str; 7] = [
     "eudplib_api.jsonl",
     "eudplib_examples.jsonl",
     "eud_editor_schema.jsonl",
+    "eudtools_wiki.jsonl",
+    "eudtools_reference.jsonl",
 ];
+// These inputs were introduced after v1 corpus snapshots. A missing file is
+// therefore valid only for migration of such a historical snapshot; if the
+// file exists, every derived id still participates in the exact join.
+const OPTIONAL_HISTORICAL_INPUT_FILES: [&str; 2] =
+    ["eudtools_wiki.jsonl", "eudtools_reference.jsonl"];
 const CHUNK_CHARS: usize = 2000;
 const CHUNK_OVERLAP: usize = 200;
 
@@ -58,6 +68,14 @@ struct JsonlRow {
     content: String,
     #[serde(default)]
     comments: Option<String>,
+}
+
+#[derive(Debug)]
+struct CorpusEntry {
+    id: u64,
+    tier_level: u8,
+    text: String,
+    source: String,
 }
 
 fn fnv1a64(bytes: &[u8]) -> u64 {
@@ -93,13 +111,16 @@ fn chunk_text(text: String) -> Vec<String> {
 
 /// Derive the v2 source-trust tier code from a corpus row's raw `source` field.
 /// Mirrors `build_rag_index.rs::tier_level_for_source` — MUST STAY IN SYNC.
+/// The eudtools wiki/reference source keys are curated technical tier 2;
+/// `eudtools_wiki_experimental` is tier 1 for Extended Animations rows stored
+/// in the physical `eudtools_wiki.jsonl` file.
 fn tier_level_for_source(source: &str) -> u8 {
     let stem = source.strip_suffix(".jsonl").unwrap_or(source);
     match stem {
         "eud_book" | "cafebook" | "scrmapdocs_en" | "eudplib_api" | "eudplib_examples"
         | "eud_editor_schema" => 3,
-        "board_강좌팁" | "board_연구칼럼" => 2,
-        "board_유틸리티툴" | "board_Lua자료실" => 1,
+        "eudtools_wiki" | "eudtools_reference" | "board_강좌팁" | "board_연구칼럼" => 2,
+        "eudtools_wiki_experimental" | "board_유틸리티툴" | "board_Lua자료실" => 1,
         "board_질문답변" => 0,
         _ if stem.starts_with("user_") => 1,
         // Unknown source: conservative neutral default (general).
@@ -107,17 +128,28 @@ fn tier_level_for_source(source: &str) -> u8 {
     }
 }
 
-/// Read the corpus the SAME way `build_rag_index.rs::read_corpus` does — over the
-/// FIXED `INPUT_FILES` list (NOT a glob) — and derive `(id, tier_level)` per chunk.
-/// The board_*/user_* names are the per-ROW `source` FIELD inside these files, not
-/// separate files; reproducing the published v1 ids depends on this exact read path.
-fn read_corpus_id_to_tier(corpus_dir: &Path) -> Result<Vec<(u64, u8)>> {
+/// Read the corpus over the FIXED `INPUT_FILES` list (NOT a glob), exactly as
+/// `build_rag_index.rs::read_corpus` does for files that exist, and derive
+/// the authoritative fields for every chunk. The two eudtools files are optional only when
+/// migrating an older snapshot that predates them; missing legacy inputs remain
+/// errors. The board_*/user_* names are per-row `source` fields, not files.
+fn read_corpus_entries(corpus_dir: &Path) -> Result<Vec<CorpusEntry>> {
     let mut out = Vec::new();
 
     for file_name in INPUT_FILES {
         let path = corpus_dir.join(file_name);
-        let file =
-            File::open(&path).with_context(|| format!("open JSONL input {}", path.display()))?;
+        let file = match File::open(&path) {
+            Ok(file) => file,
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound
+                    && OPTIONAL_HISTORICAL_INPUT_FILES.contains(&file_name) =>
+            {
+                continue;
+            }
+            Err(error) => {
+                return Err(error).with_context(|| format!("open JSONL input {}", path.display()));
+            }
+        };
         let reader = BufReader::new(file);
 
         for (zero_based_line, line) in reader.lines().enumerate() {
@@ -130,21 +162,21 @@ fn read_corpus_id_to_tier(corpus_dir: &Path) -> Result<Vec<(u64, u8)>> {
 
             let row: JsonlRow = serde_json::from_str(&line)
                 .with_context(|| format!("parse {} line {line_number}", path.display()))?;
-            out.extend(corpus_docs_id_tier_from_row(row, file_name, line_number));
+            out.extend(corpus_entries_from_row(row, file_name, line_number));
         }
     }
 
     Ok(out)
 }
 
-/// Derive `(id, tier_level)` per chunk for one row, mirroring
-/// `build_rag_index.rs::corpus_docs_from_row`'s chunk_key + tier logic VERBATIM,
-/// but dropping the text/source it would build (those come from v1).
-fn corpus_docs_id_tier_from_row(
+/// Derive every authoritative field for one row using the same trimming,
+/// chunking, source-label, id, and tier rules as
+/// `build_rag_index.rs::corpus_docs_from_row`.
+fn corpus_entries_from_row(
     row: JsonlRow,
     file_name: &str,
     line_number: usize,
-) -> Vec<(u64, u8)> {
+) -> Vec<CorpusEntry> {
     let content = row.content.trim();
     let comments = row.comments.as_deref().unwrap_or("").trim();
     if content.is_empty() && comments.is_empty() {
@@ -162,6 +194,12 @@ fn corpus_docs_id_tier_from_row(
         text.push_str(comments);
     }
 
+    let source = if url.is_empty() {
+        format!("[{title}]")
+    } else {
+        format!("[{title}]({url})")
+    };
+
     let key = row
         .id
         .as_deref()
@@ -172,15 +210,27 @@ fn corpus_docs_id_tier_from_row(
         .unwrap_or_else(|| format!("source:{}:{file_name}:{line_number}", row.source));
 
     let chunks = chunk_text(text);
+    let total_chunks = chunks.len();
     chunks
         .into_iter()
         .enumerate()
-        .map(|(chunk_index, _chunk_text)| {
+        .map(|(chunk_index, chunk_text)| {
             let chunk_key = format!("{key}#{chunk_index}");
-            // Stable ids: FNV-1a 64-bit of the deterministic chunk key (matches
-            // build_rag_index.rs). The text/source the builder produces here are
-            // intentionally discarded — v1 supplies them.
-            (fnv1a64(chunk_key.as_bytes()), tier_level)
+            let chunk_source = if total_chunks == 1 {
+                source.clone()
+            } else {
+                format!("{source} (part {}/{total_chunks})", chunk_index + 1)
+            };
+
+            CorpusEntry {
+                // Stable ids are FNV-1a 64-bit hashes of a deterministic key:
+                // input id if present, else URL, else source + file + 1-based
+                // line number, plus #<chunk_index> so chunks stay unique.
+                id: fnv1a64(chunk_key.as_bytes()),
+                tier_level,
+                text: chunk_text,
+                source: chunk_source,
+            }
         })
         .collect()
 }
@@ -320,49 +370,88 @@ struct V2Entry {
     source: String,
 }
 
-/// Join v1 entries against the corpus-derived `(id -> tier)` map, stamping each
-/// v1 entry's tier and copying its vector/text/source VERBATIM. All-or-nothing:
-/// a v1 id absent from the corpus → hard error; a corpus id never consumed by any
-/// v1 entry → hard error (leftover corpus id).
+/// Join v1 entries against exact corpus-derived chunk authority. Duplicate ids,
+/// missing ids, leftover corpus entries, and text/source drift are hard errors.
+/// Only after a complete match is the derived tier stamped while the v1
+/// vector/text/source are copied verbatim.
 fn build_v2_entries(
     v1_entries: Vec<V1Entry>,
-    corpus_id_to_tier: &[(u64, u8)],
+    corpus_entries: &[CorpusEntry],
 ) -> Result<Vec<V2Entry>> {
-    use std::collections::{HashMap, HashSet};
+    use std::collections::{hash_map::Entry, HashMap, HashSet};
 
-    let mut tier_by_id: HashMap<u64, u8> = HashMap::with_capacity(corpus_id_to_tier.len());
-    for (id, tier) in corpus_id_to_tier {
-        tier_by_id.insert(*id, *tier);
+    let mut corpus_by_id: HashMap<u64, &CorpusEntry> =
+        HashMap::with_capacity(corpus_entries.len());
+    for corpus in corpus_entries {
+        match corpus_by_id.entry(corpus.id) {
+            Entry::Vacant(entry) => {
+                entry.insert(corpus);
+            }
+            Entry::Occupied(existing) => {
+                bail!(
+                    "duplicate corpus id {} (tiers {} and {}) — refusing ambiguous migration",
+                    corpus.id,
+                    existing.get().tier_level,
+                    corpus.tier_level
+                );
+            }
+        }
     }
 
     // Track which corpus ids a v1 entry consumed so leftovers can be detected.
     let mut consumed: HashSet<u64> = HashSet::with_capacity(v1_entries.len());
+    let mut seen_v1: HashSet<u64> = HashSet::with_capacity(v1_entries.len());
 
     let mut entries = Vec::with_capacity(v1_entries.len());
     for v1 in v1_entries {
-        let tier_level = *tier_by_id.get(&v1.id).ok_or_else(|| {
+        if !seen_v1.insert(v1.id) {
+            bail!(
+                "duplicate v1 id {} — refusing ambiguous migration",
+                v1.id
+            );
+        }
+
+        let corpus = corpus_by_id.get(&v1.id).ok_or_else(|| {
             anyhow!(
                 "v1 id {} ({}) has no corpus match — refusing partial migration",
                 v1.id,
                 v1.source
             )
         })?;
+        if v1.text != corpus.text {
+            bail!(
+                "v1 id {} text does not exactly match the corpus — refusing changed-corpus migration",
+                v1.id
+            );
+        }
+        if v1.source != corpus.source {
+            bail!(
+                "v1 id {} source {:?} does not exactly match corpus source {:?} — refusing changed-corpus migration",
+                v1.id,
+                v1.source,
+                corpus.source
+            );
+        }
+
         consumed.insert(v1.id);
         entries.push(V2Entry {
             id: v1.id,
             vector: v1.vector,
-            tier_level,
+            tier_level: corpus.tier_level,
             text: v1.text,
             source: v1.source,
         });
     }
 
     // Any corpus id never matched by a v1 entry is a hard error too.
-    if let Some((orphan_id, _)) = corpus_id_to_tier
+    if let Some(orphan) = corpus_entries
         .iter()
-        .find(|(id, _)| !consumed.contains(id))
+        .find(|corpus| !consumed.contains(&corpus.id))
     {
-        bail!("corpus id {orphan_id} has no v1 match — refusing partial migration");
+        bail!(
+            "corpus id {} has no v1 match — refusing partial migration",
+            orphan.id
+        );
     }
 
     Ok(entries)
@@ -465,11 +554,11 @@ fn read_v2_index(path: &Path) -> Result<Vec<V2Entry>> {
     Ok(entries)
 }
 
-/// Read v1, derive the corpus `(id -> tier)` map, join all-or-nothing, write v2.
+/// Read v1, derive exact corpus chunk authority, join all-or-nothing, write v2.
 fn migrate_v1_to_v2(v1_path: &Path, corpus_dir: &Path, out_path: &Path) -> Result<()> {
     let v1_entries = read_v1_index(v1_path)?;
-    let corpus_id_to_tier = read_corpus_id_to_tier(corpus_dir)?;
-    let v2_entries = build_v2_entries(v1_entries, &corpus_id_to_tier)?;
+    let corpus_entries = read_corpus_entries(corpus_dir)?;
+    let v2_entries = build_v2_entries(v1_entries, &corpus_entries)?;
     write_v2_index(out_path, &v2_entries)?;
     Ok(())
 }
@@ -582,10 +671,11 @@ mod tests {
     }
 
     /// Create the corpus dir with ALL `INPUT_FILES` present as empty files, mirroring
-    /// the real corpus (the migration reads the FIXED INPUT_FILES list, not a glob, and
-    /// errors hard on a missing one — exactly like `build_rag_index.rs::read_corpus`).
-    /// Tests then overwrite only the file(s) they populate; the rest stay empty (their
-    /// blank lines are skipped), so each test still exercises the real INPUT_FILES read.
+    /// the current corpus. The migration reads the FIXED INPUT_FILES list, not a glob;
+    /// legacy inputs are required, while the two newly introduced eudtools files may
+    /// be removed by the historical-snapshot regression test below.
+    /// Tests overwrite only the file(s) they populate; the rest stay empty (their
+    /// blank lines are skipped), so each test still exercises the real fixed read path.
     fn init_corpus_dir(tmp: &TempDir) -> PathBuf {
         let corpus_dir = tmp.path().join("corpus");
         fs::create_dir_all(&corpus_dir).expect("create corpus dir");
@@ -815,6 +905,76 @@ mod tests {
         assert!(
             result.is_err(),
             "a corpus id absent from v1 must be a hard error"
+        );
+    }
+
+    #[test]
+    fn tier_level_maps_eudtools_sources() {
+        assert_eq!(super::tier_level_for_source("eudtools_wiki.jsonl"), 2);
+        assert_eq!(super::tier_level_for_source("eudtools_reference.jsonl"), 2);
+        assert_eq!(
+            super::tier_level_for_source("eudtools_wiki_experimental.jsonl"),
+            1
+        );
+    }
+
+    /// A v1 index from before the eudtools files existed can still migrate when
+    /// the matching historical corpus omits those newly introduced files.
+    #[test]
+    fn migration_accepts_historical_corpus_without_new_eudtools_files() {
+        let tmp = TempDir::new("historical-missing-eudtools");
+        let corpus_dir = init_corpus_dir(&tmp);
+        for file_name in super::OPTIONAL_HISTORICAL_INPUT_FILES {
+            fs::remove_file(corpus_dir.join(file_name)).expect("remove historical-absent input");
+        }
+        write_corpus_file(
+            &corpus_dir,
+            "cafebook.jsonl",
+            &[r#"{"id":"legacy","title":"legacy","source":"cafebook.jsonl","content":"c"}"#],
+        );
+
+        let id = super::fnv1a64(b"id:legacy#0");
+        let v1_path = tmp.path().join("rag-index.v1.bin");
+        write_v1_index(&v1_path, &[(id, synth_vector(17), "c", "[legacy]")]);
+        let out_path = tmp.path().join("rag-index.v2.bin");
+
+        super::migrate_v1_to_v2(&v1_path, &corpus_dir, &out_path)
+            .expect("historical corpus without new files should migrate");
+        let entries = super::read_v2_index(&out_path).expect("read migrated historical index");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].id, id);
+        assert_eq!(entries[0].tier_level, 3);
+    }
+
+    /// A present new corpus row is not silently skipped: its id must be in v1.
+    #[test]
+    fn migration_rejects_new_eudtools_corpus_id_without_v1_match() {
+        let tmp = TempDir::new("new-eudtools-orphan");
+        let corpus_dir = init_corpus_dir(&tmp);
+        write_corpus_file(
+            &corpus_dir,
+            "cafebook.jsonl",
+            &[r#"{"id":"legacy","title":"legacy","source":"cafebook.jsonl","content":"c"}"#],
+        );
+        write_corpus_file(
+            &corpus_dir,
+            "eudtools_reference.jsonl",
+            &[r#"{"id":"new","title":"new","source":"eudtools_reference.jsonl","content":"new"}"#],
+        );
+
+        let id = super::fnv1a64(b"id:legacy#0");
+        let v1_path = tmp.path().join("rag-index.v1.bin");
+        write_v1_index(&v1_path, &[(id, synth_vector(23), "c", "[legacy]")]);
+        let out_path = tmp.path().join("rag-index.v2.bin");
+
+        let result = super::migrate_v1_to_v2(&v1_path, &corpus_dir, &out_path);
+        assert!(
+            result.is_err(),
+            "a new present corpus id without a v1 match must be a hard error"
+        );
+        assert!(
+            !out_path.exists(),
+            "migration must not write a partial output after an unmatched corpus row"
         );
     }
 }

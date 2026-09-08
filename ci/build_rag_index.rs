@@ -1,3 +1,9 @@
+//! Canonical release index builder for the fixed in-repo corpus.
+//!
+//! Any corpus addition, removal, or content change requires a fresh canonical
+//! CPU rebuild. The v1 migration helper is only for an exact historical corpus
+//! join and must not be used to absorb changed corpus data.
+
 use std::{
     env,
     ffi::OsString,
@@ -14,7 +20,7 @@ use sha2::{Digest, Sha256};
 const EMBED_DIM: usize = 1024;
 const INDEX_MAGIC: &[u8; 4] = b"ERAG";
 const INDEX_VERSION: u32 = 2;
-const INPUT_FILES: [&str; 7] = [
+const INPUT_FILES: [&str; 9] = [
     "articles.jsonl",
     "eud_book.jsonl",
     "cafebook.jsonl",
@@ -22,6 +28,8 @@ const INPUT_FILES: [&str; 7] = [
     "eudplib_api.jsonl",
     "eudplib_examples.jsonl",
     "eud_editor_schema.jsonl",
+    "eudtools_wiki.jsonl",
+    "eudtools_reference.jsonl",
 ];
 // The int8 BGEM3Q model's embeddings are batch-size-dependent (measured:
 // batch 64 drifts cosine to ~0.98 vs batch 16), so this default MUST stay
@@ -201,13 +209,16 @@ fn read_corpus(corpus_dir: &Path) -> Result<Vec<CorpusDoc>> {
 /// The `source` values carry the original board filename WITH a `.jsonl` suffix; the
 /// suffix is stripped before matching. Mapping (see features/17_rag-knowledge-tiering.md):
 ///
-/// | source                                                         | tier | meaning            |
-/// |----------------------------------------------------------------|------|--------------------|
 /// | `eud_book`, `cafebook`, `scrmapdocs_en`, `eudplib_*`,           | 3    | primary reference  |
 /// | `eud_editor_schema`                                            |      |                    |
+/// | `eudtools_wiki`, `eudtools_reference`                          | 2    | curated technical |
 /// | `board_강좌팁`, `board_연구칼럼`                                | 2    | lecture / research |
+/// | `eudtools_wiki_experimental`                                   | 1    | experimental      |
 /// | `board_유틸리티툴`, `board_Lua자료실`, `user_*`                  | 1    | general            |
 /// | `board_질문답변`                                                | 0    | Q&A (may be wrong) |
+///
+/// `eudtools_wiki_experimental` is the source key for Extended Animations rows
+/// stored in the physical `eudtools_wiki.jsonl` input.
 ///
 /// An unknown/unmapped source falls back to tier 1 (general) — the conservative neutral
 /// default so an unrecognized source is neither trusted as official nor demoted to Q&A.
@@ -217,8 +228,8 @@ fn tier_level_for_source(source: &str) -> u8 {
     match stem {
         "eud_book" | "cafebook" | "scrmapdocs_en" | "eudplib_api" | "eudplib_examples"
         | "eud_editor_schema" => 3,
-        "board_강좌팁" | "board_연구칼럼" => 2,
-        "board_유틸리티툴" | "board_Lua자료실" => 1,
+        "eudtools_wiki" | "eudtools_reference" | "board_강좌팁" | "board_연구칼럼" => 2,
+        "eudtools_wiki_experimental" | "board_유틸리티툴" | "board_Lua자료실" => 1,
         "board_질문답변" => 0,
         _ if stem.starts_with("user_") => 1,
         // Unknown source: conservative neutral default (general).
@@ -488,6 +499,16 @@ mod tests {
     fn tier_level_maps_lecture_and_research_to_2() {
         assert_eq!(super::tier_level_for_source("board_강좌팁.jsonl"), 2);
         assert_eq!(super::tier_level_for_source("board_연구칼럼.jsonl"), 2);
+    }
+
+    #[test]
+    fn tier_level_maps_eudtools_sources() {
+        assert_eq!(super::tier_level_for_source("eudtools_wiki.jsonl"), 2);
+        assert_eq!(super::tier_level_for_source("eudtools_reference.jsonl"), 2);
+        assert_eq!(
+            super::tier_level_for_source("eudtools_wiki_experimental.jsonl"),
+            1
+        );
     }
 
     #[test]

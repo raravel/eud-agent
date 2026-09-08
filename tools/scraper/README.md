@@ -31,7 +31,7 @@ Naver again in a browser, refresh the cookie, and rerun the command.
 
 ## Public Source Sync
 
-Refresh SCRMapDocs, eudplib, eud-book, and EUD Editor 3 snapshots:
+Refresh SCRMapDocs, eudplib, eud-book, EUD Editor 3, and the selected eudtools snapshots:
 
 ```sh
 npm run sync-public
@@ -40,6 +40,37 @@ npm run sync-public
 The command shallow-clones each upstream, records its exact commit (and project version
 where available), emits deterministic JSONL, and writes `ci/corpus/THIRD_PARTY_NOTICES.txt`.
 No Naver cookie is read.
+
+Refresh only the two eudtools corpora, preserving the other corpus files and notices:
+
+```sh
+npm run sync-public -- --only=eudtools
+```
+
+The eudtools allowlist contains exactly nine originals:
+
+- Wiki: `EUD-Tutorial:-Creating-uncreatable-units`,
+  `EUD-Tutorial:-How-to-make-units-other-than-spellcasters-cast-spells`,
+  `EUD-Tutorial:-Creating-Triggered-Spells`, `EUD-Tutorial:-Extended-Animations`,
+  `EUD-Tutorial:-The-Rock-Sprite,-and-removing-unwanted-sprites-&-images`, and `Button-Maker`.
+- Repository: `Data/iscriptopcodes.txt`, `Data/iscriptanimations.txt`, and
+  `Include/IscriptIDList.txt`.
+
+The repository is pinned to `e9729dc12cc30e575a83940ef380570d4819b5b2`; its wiki is pinned to
+`fba67326938424c005f6cbd94e8b9b385ad4e00c`. Bare snapshots and `git show` avoid checking out
+wiki filenames containing Windows-invalid colons. Other pages, JavaScript, and EUDDB are excluded.
+The outputs are `eudtools_wiki.jsonl` and `eudtools_reference.jsonl`.
+
+Wiki extraction selects technical explanations rather than GUI walkthroughs, records reviewed
+image context, and explicitly marks omitted long legacy code as incomplete. Each row retains
+attribution, original URL, path, commit, and permission basis. Permission is based on the user's
+confirmation of free use; no upstream license, including MIT, is inferred.
+
+Compatibility caveats appear at the start of each body so runtime previews retain them:
+these are legacy claims, not game behavior verified by this project, and SCMDraft/Pure EUD or
+IceCC examples are not epScript. General eudtools references use tier 2; experimental wiki
+material uses tier 1 through its row-level `eudtools_wiki_experimental.jsonl` source label,
+not a third corpus file.
 
 ## Dry Run
 

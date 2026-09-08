@@ -79,3 +79,35 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+================================================================================
+Ar3sgice/eudtools @ e9729dc12cc30e575a83940ef380570d4819b5b2
+Ar3sgice/eudtools.wiki @ fba67326938424c005f6cbd94e8b9b385ad4e00c
+Original author: Ar3sgice
+https://github.com/Ar3sgice/eudtools
+https://github.com/Ar3sgice/eudtools/wiki
+--------------------------------------------------------------------------------
+User confirmed on 2026-09-08 that these materials may be freely used. Permission basis: user confirmation, not an upstream license grant. No license is assigned.
+No upstream license text is supplied for these snapshots; no MIT or other license is inferred.
+Selected wiki paths (only these six documents):
+  EUD-Tutorial:-Creating-uncreatable-units.md
+  EUD-Tutorial:-How-to-make-units-other-than-spellcasters-cast-spells.md
+  EUD-Tutorial:-Creating-Triggered-Spells.md
+  EUD-Tutorial:-Extended-Animations.md
+  EUD-Tutorial:-The-Rock-Sprite,-and-removing-unwanted-sprites-&-images.md
+  Button-Maker.md
+Selected reference paths (only these three documents):
+  Data/iscriptopcodes.txt
+  Data/iscriptanimations.txt
+  Include/IscriptIDList.txt
+Linked images were visually inspected for textual descriptions only, at the body commit:
+  Include/Wiki/DataEditor_IscriptID.jpg
+  Include/Wiki/HydraSkill.png
+  Include/Wiki/DynamicCUnit.png
+  Include/Wiki/TriggerSpell1.png
+  Include/Wiki/TriggerSpell2.png
+  Include/Wiki/defi61.jpg
+  Include/Wiki/arbiterarchon.jpg
+Images, binaries, JavaScript sources, EUDDB and other wiki pages are not index inputs.
+Original English excerpts and separately labeled Korean editorial context are retained.
+Legacy examples and experimental/version-dependent claims are not current verified authoring APIs.
