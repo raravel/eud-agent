@@ -2,7 +2,7 @@
 
 eud-agent persists named conversations with one immutable `ProviderBinding` per session. Each
 session owns its panel log, exact provider driver/conversation state, cancellation generation,
-tool/ASK/preflight state, working workspace, and immutable event route. Commands within one
+tool/ASK/build state, working workspace, and immutable event route. Commands within one
 session are serialized; different sessions/providers may overlap read turns.
 
 Write intent creates a concurrent session registration immediately. Only operations that touch
@@ -239,10 +239,9 @@ so multiple sessions can recover review state for one project without blocking n
 
 ## Session tool/runtime isolation
 
-`ToolServices` shares the journal store, RAG, map rails, analyzer, data dirs, and coordinator.
+`ToolServices` shares the journal store, RAG, map rails, data dirs, and coordinator.
 Every `SessionToolRuntime` separately owns the live request id, evidence/mutation/action/search/
-build state, pending plan, epScript preflight state, write registration, source baseline, and
-tool execution lock.
+build state, pending plan, write registration, source baseline, and tool execution lock.
 
 One ephemeral MCP endpoint is created per worker. No global current-request pointer infers the
 caller. Mutating tools require that runtime's exact `(project, session, request)` registration.

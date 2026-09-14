@@ -11,7 +11,7 @@ chat/feedback
   -> project + memory + RAG context
   -> immutable session provider/model binding
   -> provider stream and typed tool admission
-  -> read/evidence/preflight
+  -> read/evidence
   -> native write registration
   -> semantic journal
   -> plan or changeset review

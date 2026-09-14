@@ -700,7 +700,6 @@ PlayWAVAll("staredit\\wav\\ea_8f3c91a2d4019a77.ogg");
 - 현재 mutable state와 이벤트를 소유한 기존 파일에 호출 추가
 - import cycle 생성 금지
 - 파일 topology가 바뀌면 structure memory 완전 갱신
-- 모든 modified/created EPS를 한 `eps_check` batch로 preflight
 - 최종 권위는 complete-project `build_run`
 
 ## 11. Transaction, journal, review
@@ -1142,7 +1141,7 @@ FFmpeg fixture tests는 exact pinned build에서 실행한다. codec encoder의 
 1. agent instruction에 1회/전체/반복 계약을 추가한다.
 2. 기존 owner에 `PlayWAV`/`PlayWAVAll` 코드를 생성한다.
 3. 반복은 duration metadata를 사용한다.
-4. `eps_check`와 complete `build_run`을 강제한다.
+4. complete `build_run`을 강제한다.
 5. build/reject/accept/harness lifecycle을 검증한다.
 
 완료 조건: 코드와 맵이 한 lease와 changeset으로 build/review/rollback된다.
@@ -1244,7 +1243,7 @@ WAV slot을 보존한다. 저장·재열기 후 old MPQ/string 부재, new OGG e
 unrelated CHK/MPQ digest를 검증한 뒤에만 atomic replace한다.
 
 도구 결과의 `oldMpqPath`를 참조하는 모든 EPS 문자열은 반환된 `mpqPath`로 clean cutover한다.
-그 뒤 한 `eps_check` batch와 complete-project `build_run`을 수행한다. 거부 또는 journal 실패는
+그 뒤 complete-project `build_run`을 수행한다. 거부 또는 journal 실패는
 full-map backup으로 exact rollback한다.
 
 ### 19.4 검증

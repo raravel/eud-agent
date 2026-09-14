@@ -24,8 +24,6 @@ pub const SEARCH_DOCS_TOOL: &str = "search_docs";
 pub const DOCS_GET_TOOL: &str = "docs_get";
 /// Bounded source search tool name.
 pub const SOURCE_SEARCH_TOOL: &str = "source_search";
-/// Read-only epScript candidate preflight tool name.
-pub const EPS_CHECK_TOOL: &str = "eps_check";
 /// Resolve one complete exact direct-Python dependency list into a bounded candidate.
 pub const PYTHON_DEPENDENCIES_PREPARE_TOOL: &str = "python_dependencies_prepare";
 /// Commit a previously prepared direct-Python dependency candidate.
@@ -340,25 +338,6 @@ fn exact_text_edits_schema() -> Value {
     )
 }
 
-fn eps_candidates_schema() -> Value {
-    let mut candidate = object_schema(
-        json!({
-            "path": string_schema(),
-            "code": string_schema(),
-            "edits": exact_text_edits_schema(),
-        }),
-        &["path"],
-    );
-    candidate["oneOf"] = json!([
-        {"required": ["code"], "not": {"required": ["edits"]}},
-        {"required": ["edits"], "not": {"required": ["code"]}},
-    ]);
-    json!({
-        "type": "array",
-        "minItems": 1,
-        "items": candidate,
-    })
-}
 fn ask_questions_schema() -> Value {
     let options = json!({
         "type": "array",
@@ -511,12 +490,6 @@ pub fn tool_registry() -> Vec<ToolSpec> {
                 }),
                 &["query"],
             ),
-        ),
-        tool_spec(
-            EPS_CHECK_TOOL,
-            "Analyze complete or exactly edited epScript candidates against the current project snapshot.",
-            false,
-            schema(json!({"files": eps_candidates_schema()}), &["files"]),
         ),
         tool_spec(
             PYTHON_DEPENDENCIES_PREPARE_TOOL,
@@ -1728,7 +1701,7 @@ continuing to search."
             "python_dependencies_prepare budget exhausted: this request is limited to {MAX_PYTHON_DEPENDENCY_PREPARATIONS} preparations."
         ));
     } else if state.action_count >= MAX_TOOL_ACTIONS
-        && !matches!(spec.name, EPS_CHECK_TOOL | PYTHON_DEPENDENCIES_PREPARE_TOOL)
+        && spec.name != PYTHON_DEPENDENCIES_PREPARE_TOOL
     {
         return admission_error(&format!(
             "action budget exhausted: this request is limited to {MAX_TOOL_ACTIONS} non-search \
@@ -1751,7 +1724,7 @@ Summarize the remaining build issue instead of running build again.",
         state.search_docs_count += 1;
     } else if spec.name == PYTHON_DEPENDENCIES_PREPARE_TOOL {
         state.python_dependency_prepare_count += 1;
-    } else if spec.name != EPS_CHECK_TOOL {
+    } else {
         state.action_count += 1;
     }
     if spec.name == BUILD_RUN_TOOL {
@@ -1819,28 +1792,6 @@ fn validate_tool_args(spec: &ToolSpec, args: &Value) -> ToolResult<()> {
 
 fn validate_tool_arg_semantics(spec: &ToolSpec, args: &Map<String, Value>) -> ToolResult<()> {
     match spec.name {
-        EPS_CHECK_TOOL => {
-            let files = args
-                .get("files")
-                .and_then(Value::as_array)
-                .expect("generic schema validation guarantees eps_check.files is an array");
-            for (index, file) in files.iter().enumerate() {
-                let file = file
-                    .as_object()
-                    .expect("generic schema validation guarantees candidate objects");
-                match (file.get("code"), file.get("edits")) {
-                    (Some(_), None) => {}
-                    (None, Some(edits)) => {
-                        validate_nonempty_old_texts(spec, &format!("files[{index}].edits"), edits)?
-                    }
-                    _ => {
-                        return admission_error(&format!(
-                            "eps_check candidate files[{index}] requires exactly one of code or edits"
-                        ));
-                    }
-                }
-            }
-        }
         "file_edit" => {
             let edits = args
                 .get("edits")
@@ -4994,14 +4945,6 @@ mod tests {
                 ),
             ),
             (
-                EPS_CHECK_TOOL,
-                false,
-                schema(
-                    serde_json::json!({"files": eps_candidates_schema()}),
-                    &["files"],
-                ),
-            ),
-            (
                 PYTHON_DEPENDENCIES_PREPARE_TOOL,
                 false,
                 schema(
@@ -5590,67 +5533,21 @@ mod tests {
         .is_err());
     }
     #[test]
-    fn eps_check_is_read_only_and_does_not_consume_action_budget() {
-        let spec = tool_registry()
-            .into_iter()
-            .find(|spec| spec.name == EPS_CHECK_TOOL)
-            .expect("eps_check must be registered");
-        assert!(!spec.mutating);
+    fn removed_eps_check_is_not_registered_or_admitted() {
+        assert!(tool_registry().iter().all(|spec| spec.name != "eps_check"));
+        assert!(mcp_tool_descriptors()
+            .iter()
+            .all(|descriptor| descriptor["name"] != "eps_check"));
 
-        let mut state = RequestState::for_request("req-eps-check");
-        state.action_count = MAX_TOOL_ACTIONS;
-        state.search_docs_count = MAX_SEARCH_DOCS_CALLS;
-        state.build_fix_attempts = 3;
-        admit_tool_call(
+        let mut state = RequestState::for_request("req-removed-eps-check");
+        let error = admit_tool_call(
             &mut state,
-            EPS_CHECK_TOOL,
-            &serde_json::json!({
-                "files": [
-                    {"path": "main.eps", "code": "import lib.units;"},
-                    {"path": "lib/units.eps", "code": "object UnitState {};"}
-                ]
-            }),
+            "eps_check",
+            &serde_json::json!({"files": [{"path": "main.eps", "code": ""}]}),
         )
-        .unwrap();
-        assert_eq!(state.action_count, MAX_TOOL_ACTIONS);
-        assert_eq!(state.search_docs_count, MAX_SEARCH_DOCS_CALLS);
-        assert_eq!(state.build_fix_attempts, 3);
-        assert!(!state.docs_searched);
-    }
-
-    #[test]
-    fn eps_check_nested_schema_accepts_edits_and_rejects_invalid_candidate_modes() {
-        let mut valid_state = RequestState::for_request("req-valid-eps-edit");
-        admit_tool_call(
-            &mut valid_state,
-            EPS_CHECK_TOOL,
-            &serde_json::json!({
-                "files": [{
-                    "path": "main.eps",
-                    "edits": [{"old_text": "oldCall();", "new_text": "newCall();"}],
-                }],
-            }),
-        )
-        .unwrap();
-
-        for args in [
-            serde_json::json!({"files": []}),
-            serde_json::json!({"files": [{"path": "main.eps"}]}),
-            serde_json::json!({"files": [{
-                "path": "main.eps",
-                "code": "oldCall();",
-                "edits": [{"old_text": "oldCall();", "new_text": "newCall();"}],
-            }]}),
-            serde_json::json!({"files": [{
-                "path": "main.eps",
-                "edits": [{"old_text": "", "new_text": "newCall();"}],
-            }]}),
-            serde_json::json!({"files": [{"path": "main.eps", "code": "", "extra": true}]}),
-        ] {
-            let mut state = RequestState::for_request("req-invalid-eps-check");
-            assert!(admit_tool_call(&mut state, EPS_CHECK_TOOL, &args).is_err());
-            assert_eq!(state.action_count, 0);
-        }
+        .unwrap_err();
+        assert!(error.to_string().contains("unknown tool 'eps_check'"));
+        assert_eq!(state.action_count, 0);
     }
 
     #[test]
@@ -5712,29 +5609,6 @@ mod tests {
         .unwrap_err();
         assert!(error.to_string().contains("must not be empty"));
         assert_eq!(invalid.action_count, 0);
-    }
-
-    #[test]
-    fn preflight_outcome_cannot_gate_later_write_or_build_admission() {
-        let mut state = RequestState::for_request("req-eps-fallthrough");
-        state.record_search_docs();
-        admit_tool_call(
-            &mut state,
-            EPS_CHECK_TOOL,
-            &serde_json::json!({
-                "files": [{"path": "main.eps", "code": "function onPluginStart() {}"}]
-            }),
-        )
-        .unwrap();
-        admit_tool_call(
-            &mut state,
-            "file_write",
-            &serde_json::json!({"path": "main.eps", "code": "function onPluginStart() {}"}),
-        )
-        .unwrap();
-        admit_tool_call(&mut state, BUILD_RUN_TOOL, &serde_json::json!({})).unwrap();
-        assert_eq!(state.action_count, 2);
-        assert_eq!(state.build_fix_attempts, 1);
     }
 
     #[test]

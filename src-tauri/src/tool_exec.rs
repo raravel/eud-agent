@@ -1,9 +1,8 @@
 //! Shared tool services and one request runtime per conversation session.
 //!
 //! [`ToolServices`] owns app-wide immutable/shared services. Each
-//! [`SessionToolRuntime`] is cloned only by one session engine and its MCP
-//! handler, so request ids, evidence/plan/budget gates, preflight state, and
-//! write tickets cannot overwrite another session.
+//! [`SessionToolRuntime`] is cloned only by one session engine and its MCP handler,
+//! so request ids, evidence/plan/budget gates, and write tickets cannot overwrite another session.
 //!
 //! [`SessionToolRuntime::execute`] is the single tool entry point. It verifies
 //! concurrent write registration, serializes each shared-state operation, applies
@@ -20,7 +19,6 @@ use sha2::{Digest as _, Sha256};
 
 use crate::bootstrap::process_tree::ProcessCancellation;
 use crate::config::DataDirs;
-use crate::eps_preflight::{EpsAnalyzer, EpsCandidateInput, EpsPreflight};
 use crate::journal::{DatTable, JournalEntry, JournalStore, JournalTarget, Snapshot, WriteTool};
 use crate::mapsafe::{CompilingStatus, IsomEngine, MapSafe, WindowsLockProbe};
 use crate::native_project::{DatScalar, DatTarget, NativeDatChange, NativeDatPatch};
@@ -101,15 +99,14 @@ impl CompilingStatus for NativeCompilingStatus {
 pub type ProductionMapSafe = MapSafe<NativeCompilingStatus, WindowsLockProbe, IsomEngine>;
 
 /// Shared, immutable production services. Session workers clone these handles,
-/// while every request gate, plan, preflight snapshot, and write ticket remains
-/// inside a [`SessionToolRuntime`].
+/// while every request gate, plan, and write ticket remains inside a
+/// [`SessionToolRuntime`].
 #[derive(Clone)]
 pub struct ToolServices {
     dirs: DataDirs,
     journal: JournalStore,
     rag: Arc<Rag>,
     map_safe: Arc<ProductionMapSafe>,
-    analyzer: Arc<dyn EpsAnalyzer>,
     writes: crate::write_coordinator::ProjectWriteCoordinator,
     map_candidates: crate::map_candidate::CandidateStore,
     map_images: crate::map_image::MapImageService,
@@ -121,7 +118,6 @@ pub struct ToolServices {
 impl ToolServices {
     pub fn new(
         dirs: DataDirs,
-        analyzer: Arc<dyn EpsAnalyzer>,
         map_candidates: crate::map_candidate::CandidateStore,
         writes: crate::write_coordinator::ProjectWriteCoordinator,
     ) -> Self {
@@ -144,7 +140,6 @@ impl ToolServices {
             journal,
             rag,
             map_safe,
-            analyzer,
             map_candidates,
             audio,
             map_images: crate::map_image::MapImageService::new(),
@@ -364,7 +359,6 @@ pub struct SessionToolRuntime {
     services: ToolServices,
     session_id: String,
     kind: crate::session::SessionKind,
-    eps_preflight: Arc<EpsPreflight>,
     request: Arc<Mutex<Option<SessionRequest>>>,
     request_state: Arc<Mutex<Option<RequestState>>>,
     pending_plan: Arc<Mutex<Option<(String, String)>>>,
@@ -379,7 +373,6 @@ pub struct SessionToolRuntime {
     provider_identity: Arc<Mutex<Option<(crate::provider::ProviderId, String)>>>,
     last_build: Arc<Mutex<Option<crate::harness::BuildEvidence>>>,
     sound_build_required: Arc<Mutex<bool>>,
-    sound_preflight_required: Arc<Mutex<bool>>,
 }
 
 struct PendingAskLease {
@@ -405,16 +398,11 @@ impl SessionToolRuntime {
         session_id: String,
         kind: crate::session::SessionKind,
     ) -> Self {
-        let eps_preflight = Arc::new(EpsPreflight::new(
-            services.dirs.clone(),
-            Arc::clone(&services.analyzer),
-        ));
         let (ask_waiting, _) = tokio::sync::watch::channel(false);
         Self {
             services,
             session_id,
             kind,
-            eps_preflight,
             request: Arc::new(Mutex::new(None)),
             request_state: Arc::new(Mutex::new(None)),
             pending_plan: Arc::new(Mutex::new(None)),
@@ -429,7 +417,6 @@ impl SessionToolRuntime {
             provider_identity: Arc::new(Mutex::new(None)),
             last_build: Arc::new(Mutex::new(None)),
             sound_build_required: Arc::new(Mutex::new(false)),
-            sound_preflight_required: Arc::new(Mutex::new(false)),
         }
     }
 
@@ -710,8 +697,6 @@ impl SessionToolRuntime {
         *self.pending_plan.lock() = None;
         *self.last_build.lock() = None;
         *self.sound_build_required.lock() = false;
-        *self.sound_preflight_required.lock() = false;
-        self.eps_preflight.begin_request(request_id);
         Ok(())
     }
 
@@ -1606,20 +1591,6 @@ stop this turn so the backend can resume the same thread in its isolated writabl
                     format!("Python 의존성 준비 결과를 직렬화하지 못했습니다: {error}")
                 })
             }
-            tools::EPS_CHECK_TOOL => {
-                let files: Vec<EpsCandidateInput> = serde_json::from_value(
-                    args.get("files")
-                        .cloned()
-                        .ok_or_else(|| "missing argument 'files'".to_string())?,
-                )
-                .map_err(|error| format!("invalid eps_check files: {error}"))?;
-                let result = self.eps_preflight.check_inputs(request_id, files)?;
-                if *self.sound_build_required.lock() {
-                    *self.sound_preflight_required.lock() = false;
-                }
-                serde_json::to_value(result)
-                    .map_err(|error| format!("failed to serialize eps_check result: {error}"))
-            }
             "dat_get" => {
                 let items = array_arg(args, "items")?;
                 let mut targets = Vec::with_capacity(items.len());
@@ -1860,12 +1831,6 @@ stop this turn so the backend can resume the same thread in its isolated writabl
             "plugin_remove" => self.plugin_remove(request_id, args),
             "plugin_move" => self.plugin_move(request_id, args),
             tools::BUILD_RUN_TOOL => {
-                if *self.sound_preflight_required.lock() {
-                    return Err(
-                        "map sound import 이후 modified/created EPS 전체를 한 eps_check batch로 검사해야 합니다."
-                            .to_string(),
-                    );
-                }
                 let project_id = self
                     .current_project_id()
                     .ok_or_else(|| "현재 에이전트 프로젝트가 열려 있지 않습니다.".to_string())?;
@@ -2213,7 +2178,6 @@ stop this turn so the backend can resume the same thread in its isolated writabl
                 return Err(format!("맵 사운드 journal 기록에 실패했습니다: {error}"));
             }
             *self.sound_build_required.lock() = true;
-            *self.sound_preflight_required.lock() = true;
             Ok(write)
         })?;
         let write = operation?;
@@ -2504,7 +2468,6 @@ stop this turn so the backend can resume the same thread in its isolated writabl
                 ));
             }
             *self.sound_build_required.lock() = true;
-            *self.sound_preflight_required.lock() = true;
             Ok(write)
         })?;
         let write = operation?;
@@ -2653,16 +2616,6 @@ stop this turn so the backend can resume the same thread in its isolated writabl
         })
     }
 
-    fn source_file_type(&self, path: &str) -> Result<String, String> {
-        self.services
-            .native()
-            .list_files()?
-            .into_iter()
-            .find(|file| file.path.eq_ignore_ascii_case(path))
-            .map(|file| file.file_type)
-            .ok_or_else(|| format!("프로젝트 소스 파일을 찾을 수 없습니다: {path}"))
-    }
-
     fn file_create(&self, request_id: &str, args: &Value) -> Result<Value, String> {
         let (requested_path, ftype) = (str_arg(args, "path")?, str_arg(args, "ftype")?);
         if !matches!(ftype, "CUIEps" | "CUIPy") {
@@ -2671,8 +2624,6 @@ stop this turn so the backend can resume the same thread in its isolated writabl
         let code = args.get("code").and_then(Value::as_str).unwrap_or("");
         let path = native_source_path(requested_path);
         self.services.native().create_source(&path, code)?;
-        self.eps_preflight
-            .write_applied(request_id, &path, ftype, code);
         self.record_file(
             request_id,
             WriteTool::FileCreate,
@@ -2687,7 +2638,6 @@ stop this turn so the backend can resume the same thread in its isolated writabl
         let requested_path = str_arg(args, "path")?;
         let path = native_source_path(requested_path);
         let code = str_arg(args, "code")?;
-        let ftype = self.source_file_type(&path)?;
         let old = self.services.native().read_source(&path)?;
         let merged = match self.source_baseline(&path)? {
             Some(base) => crate::workspace::merge_concurrent_text(&path, &base, code, &old)
@@ -2703,8 +2653,6 @@ stop this turn so the backend can resume the same thread in its isolated writabl
             }
         };
         self.services.native().write_source(&path, &merged)?;
-        self.eps_preflight
-            .write_applied(request_id, &path, &ftype, &merged);
         self.record_file(
             request_id,
             WriteTool::FileWrite,
@@ -2724,7 +2672,6 @@ stop this turn so the backend can resume the same thread in its isolated writabl
                 .ok_or_else(|| "missing argument 'edits'".to_string())?,
         )
         .map_err(|error| format!("invalid file_edit edits: {error}"))?;
-        let ftype = self.source_file_type(&path)?;
         let old = self.services.native().read_source(&path)?;
         let merged = match self.source_baseline(&path)? {
             Some(base) => {
@@ -2747,8 +2694,6 @@ stop this turn so the backend can resume the same thread in its isolated writabl
             }
         };
         self.services.native().write_source(&path, &merged)?;
-        self.eps_preflight
-            .write_applied(request_id, &path, &ftype, &merged);
         self.record_file(
             request_id,
             WriteTool::FileWrite,
@@ -2766,7 +2711,6 @@ stop this turn so the backend can resume the same thread in its isolated writabl
     fn file_delete(&self, request_id: &str, args: &Value) -> Result<Value, String> {
         let requested_path = str_arg(args, "path")?;
         let path = native_source_path(requested_path);
-        let ftype = self.source_file_type(&path)?;
         let old = self.services.native().read_source(&path)?;
         if let Some(base) = self.source_baseline(&path)? {
             if old != base {
@@ -2777,7 +2721,6 @@ stop this turn so the backend can resume the same thread in its isolated writabl
             }
         }
         self.services.native().delete_source(&path)?;
-        self.eps_preflight.delete_applied(request_id, &path, &ftype);
         self.record_file(
             request_id,
             WriteTool::FileDelete,
@@ -2807,7 +2750,6 @@ stop this turn so the backend can resume the same thread in its isolated writabl
 
     fn file_rename(&self, request_id: &str, args: &Value) -> Result<Value, String> {
         let path = native_source_path(str_arg(args, "path")?);
-        let ftype = self.source_file_type(&path)?;
         let newname = str_arg(args, "newname")?;
         if let Some(base) = self.source_baseline(&path)? {
             let current = self.services.native().read_source(&path)?;
@@ -2820,15 +2762,12 @@ stop this turn so the backend can resume the same thread in its isolated writabl
         }
         let to = sibling_path(&path, newname);
         self.services.native().move_source(&path, &to)?;
-        self.eps_preflight
-            .rename_applied(request_id, &path, &to, &ftype);
         self.record_rename(request_id, WriteTool::FileRename, &path, &to)?;
         Ok(json!({ "ok": true, "from": path, "to": to }))
     }
 
     fn file_move(&self, request_id: &str, args: &Value) -> Result<Value, String> {
         let path = native_source_path(str_arg(args, "path")?);
-        let ftype = self.source_file_type(&path)?;
         if let Some(base) = self.source_baseline(&path)? {
             let current = self.services.native().read_source(&path)?;
             if current != base {
@@ -2842,8 +2781,6 @@ stop this turn so the backend can resume the same thread in its isolated writabl
         let dest = native_source_dir(requested_dest);
         let to = moved_path(&path, &dest);
         self.services.native().move_source(&path, &to)?;
-        self.eps_preflight
-            .rename_applied(request_id, &path, &to, &ftype);
         self.record_rename(request_id, WriteTool::FileMove, &path, &to)?;
         Ok(json!({ "ok": true, "from": path, "to": to }))
     }
@@ -3629,17 +3566,12 @@ impl ToolServices {
             .unwrap_or_default();
         let base = std::env::temp_dir().join(format!("eud-agent-runtime-test-{nanos}"));
         let dirs = DataDirs::from_bases(&base, &base);
-        let analyzer = Arc::new(crate::eps_preflight::NodeEpsAnalyzer::unavailable(
-            crate::eps_preflight::SkipReason::AdapterMissing,
-            "test runtime has no adapter resource",
-        ));
         let candidates = crate::map_candidate::CandidateStore::new(
             (dirs.clone()).clone(),
             crate::map_import::MapImportStore::new(dirs.clone()),
         );
         Self::new(
             dirs,
-            analyzer,
             candidates,
             crate::write_coordinator::ProjectWriteCoordinator::silent(),
         )
@@ -3658,7 +3590,6 @@ impl SessionToolRuntime {
 
     pub fn require_sound_build_for_tests(&self) {
         *self.sound_build_required.lock() = true;
-        *self.sound_preflight_required.lock() = true;
     }
 }
 
@@ -4961,13 +4892,8 @@ mod tests {
         candidates
             .prepare_request("project", "map-session", "request", 0, &[])
             .unwrap();
-        let analyzer = Arc::new(crate::eps_preflight::NodeEpsAnalyzer::unavailable(
-            crate::eps_preflight::SkipReason::AdapterMissing,
-            "map palette test has no analyzer",
-        ));
         let services = ToolServices::new(
             dirs,
-            analyzer,
             candidates.clone(),
             crate::write_coordinator::ProjectWriteCoordinator::silent(),
         );
@@ -5044,13 +4970,8 @@ mod tests {
         candidates
             .prepare_request("project", "map-session", "request", 0, &[])
             .unwrap();
-        let analyzer = Arc::new(crate::eps_preflight::NodeEpsAnalyzer::unavailable(
-            crate::eps_preflight::SkipReason::AdapterMissing,
-            "map image test has no analyzer",
-        ));
         let services = ToolServices::new(
             dirs.clone(),
-            analyzer,
             candidates.clone(),
             crate::write_coordinator::ProjectWriteCoordinator::silent(),
         );
@@ -5383,24 +5304,5 @@ mod tests {
             .unwrap(),
             "staredit\\wav\\ea_0123456789abcdef01234567.ogg"
         );
-    }
-    #[test]
-    fn map_sound_requires_post_import_preflight_before_complete_build() {
-        let runtime = SessionToolRuntime::for_tests();
-        runtime.begin_request("sound-build", "project").unwrap();
-        *runtime.sound_build_required.lock() = true;
-        *runtime.sound_preflight_required.lock() = true;
-        let error = runtime
-            .dispatch("sound-build", tools::BUILD_RUN_TOOL, &json!({}))
-            .unwrap_err();
-        assert!(error.contains("eps_check batch"));
-        assert!(runtime.sound_build_required());
-
-        *runtime.sound_preflight_required.lock() = false;
-        let build_error = runtime
-            .dispatch("sound-build", tools::BUILD_RUN_TOOL, &json!({}))
-            .unwrap_err();
-        assert!(!build_error.contains("eps_check batch"));
-        assert!(runtime.sound_build_required());
     }
 }

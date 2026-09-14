@@ -30,7 +30,7 @@ Status: implementation integrated; release acceptance remains blocked until §21
 6. **통합 설정**: 설정 다이얼로그는 기본 제공자, 설치 상태, 로그인 상태, API key/OAuth, 자격 증명 가져오기, 로그아웃, 모델, thinking/reasoning을 provider별로 제공한다.
 7. **격리 후 가져오기**: Codex와 Claude Code는 eud-agent 전용 credential/config root를 사용한다. 기존 개인 CLI 로그인은 명시적 사용자 동작으로 credential만 복사하며, 설정, hooks, plugins, MCP, instructions, sessions는 가져오지 않는다.
 8. **직접 구현**: OpenCode Go, Antigravity, Ollama의 HTTP/OAuth/wire adapter는 Rust로 구현한다. OMP SDK, OMP RPC, OpenCode server, 동적 third-party proxy를 실행하지 않는다.
-9. **기존 권한 유지**: 모델은 제공자와 무관하게 기존 `SessionToolRuntime`, write coordinator, journal, changeset review, evidence gate, preflight, build rail을 통해서만 EUD 프로젝트를 읽고 쓴다.
+9. **기존 권한 유지**: 모델은 제공자와 무관하게 기존 `SessionToolRuntime`, write coordinator, journal, changeset review, evidence gate, build rail을 통해서만 EUD 프로젝트를 읽고 쓴다.
 10. **무음 fallback 금지**: 인증 실패, quota, overload, 모델 제거, provider 장애가 다른 provider/model로의 자동 전송을 일으켜서는 안 된다.
 11. **provider별 capability**: 모든 제공자에 존재하지 않는 web search, 1M context, vision, native compaction, reasoning level을 가짜로 평준화하지 않는다. UI와 engine이 capability를 명시적으로 반영한다.
 12. **main/Map 공통**: 다섯 제공자는 메인 EPS 세션과 Map Agent 세션 모두에서 작동해야 한다.
@@ -1399,12 +1399,11 @@ Automated fixture 통과 후 실제 계정/서비스로 검증한다.
 3. structured ASK
 4. write intent 전환
 5. `file_edit` 또는 `file_write`
-6. `eps_check`
-7. `build_run`
-8. changeset accept/reject
-9. app restart 후 session resume
-10. `/compact`
-11. active turn cancel
+6. `build_run`
+7. changeset accept/reject
+8. app restart 후 session resume
+9. `/compact`
+10. active turn cancel
 
 원본/editor/review 권한은 provider마다 동일해야 한다.
 

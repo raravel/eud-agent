@@ -12,7 +12,6 @@ use serde_json::Value;
 
 use crate::{
     config::DataDirs,
-    eps_preflight::{NodeEpsAnalyzer, SkipReason},
     map_candidate::CandidateStore,
     map_import::MapImportStore,
     native_project::{NativeProject, ProjectManifest, PROJECT_SCHEMA_VERSION},
@@ -217,17 +216,9 @@ impl RuntimeFixture {
             .activate_project(&project)
             .expect("activate fixture project");
 
-        let analyzer = Arc::new(NodeEpsAnalyzer::unavailable(
-            SkipReason::AdapterMissing,
-            "provider runtime contract fixture",
-        ));
         let candidates = CandidateStore::new(dirs.clone(), MapImportStore::new(dirs.clone()));
-        let services = ToolServices::new(
-            dirs.clone(),
-            analyzer,
-            candidates,
-            ProjectWriteCoordinator::silent(),
-        );
+        let services =
+            ToolServices::new(dirs.clone(), candidates, ProjectWriteCoordinator::silent());
         let session_id = "runtime-session".to_string();
         let request_id = "runtime-request".to_string();
         let tools = match kind {

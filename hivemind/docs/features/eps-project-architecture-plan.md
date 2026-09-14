@@ -15,7 +15,7 @@ Make file placement a grounded architectural decision instead of a filename or l
 5. keep imports directional and acyclic;
 6. preserve localized-change discipline so a small fix never triggers an unrelated project split;
 7. persist concise file-role knowledge after structural changes;
-8. retain complete-batch `eps_check` and mandatory `build_run` verification.
+8. retain mandatory `build_run` verification.
 
 ## Ground Truth
 
@@ -28,7 +28,7 @@ The implementation MUST build on these existing facts rather than adding a secon
 - `project_status` currently returns only `{ "status": <raw STATUS reply> }`.
 - `list_files` returns file path, type, and settable state, but it does not identify the start file.
 - `EPSCRIPT_GUIDE` explains syntax and lifecycle hooks but contains no project-placement policy.
-- `EPS_PREFLIGHT_GUIDE` already supports one coherent candidate batch for mutually dependent files.
+- `BUILD_GUIDE` already requires one authoritative complete-project build and compiler-error repair.
 - Project memory `structure` is already the durable one-line role summary per project file.
 - The connected validation project demonstrates the ambiguity: a `ClassicTrigger` node is named `main`, while the configured CUIEps start file is `survivor_mvp`. Correct behavior must select `survivor_mvp` without using either name as a heuristic.
 
@@ -215,17 +215,15 @@ config/resources — stable resource allocations; no project imports
 
 Do not update `structure` for a localized implementation change that leaves file roles and dependencies unchanged.
 
-### D11 — Multi-file correctness remains one batch plus one authoritative build
+### D11 — Multi-file correctness remains one authoritative build
 
 For creates, full rewrites, or exact edits that depend on each other:
 
-1. pass all candidates to one `eps_check` call;
-2. correct errors and candidate-introduced import cycles;
-3. apply the complete intended file changes;
-4. run the mandatory `build_run` in the same turn;
-5. repair within the existing three-build-attempt budget;
-6. update `structure` memory when topology or roles changed;
-7. present one coherent changeset for review.
+1. apply the complete intended file changes coherently;
+2. run the mandatory `build_run` in the same turn;
+3. repair within the existing three-build-attempt budget;
+4. update `structure` memory when topology or roles changed;
+5. present one coherent changeset for review.
 
 Architecture guidance never weakens the existing build contract.
 
@@ -245,12 +243,12 @@ Add one concise constant in `src-tauri/src/engine.rs`. Its normative content is:
 - File length is only a review signal: re-evaluate handwritten files above 800 nonblank lines and any MainFile containing feature implementation; never split generated/table-heavy or tightly coupled code solely by size.
 - If mainFile is null, never infer one. A new empty project may create and set a composition root; a non-empty project requires the selection in the reviewed plan.
 - After file topology, MainFile, dependency, or responsibility changes, rewrite memory structure with every file's current role and direct dependencies.
-- Preflight every mutually dependent candidate in one eps_check batch, then run the mandatory complete-project build.
+- Apply coherent source changes, then run the mandatory complete-project build and repair every reported compiler error before completion.
 ```
 
 Prompt placement:
 
-- in `build_system_prompt`, place it after `EPSCRIPT_GUIDE` and before `EPS_PREFLIGHT_GUIDE`;
+- in `build_system_prompt`, place it after `EPSCRIPT_GUIDE` and before `BUILD_GUIDE`;
 - in `resume_turn_text`, include it after `EPS_IDIOMS` so existing saved threads receive the current architecture contract instead of retaining only their original system prompt;
 - preserve `[first principles]`, RAG/reference ordering, and message-boundary invariants.
 
@@ -284,7 +282,7 @@ Work:
 
 1. Add the canonical prompt block.
 2. Include it in cold-start and resume prompt assembly at the specified positions.
-3. Keep the prompt concise and avoid restating epScript syntax, preflight, build, or workspace rules already owned by adjacent guides.
+3. Keep the prompt concise and avoid restating epScript syntax, build, or workspace rules already owned by adjacent guides.
 
 Exit condition: both new and resumed conversations receive the same MainFile and file-placement policy.
 
@@ -307,8 +305,8 @@ Required tests:
 6. `set_main` journals the old path through the shared wrapper, including the unset case.
 7. `project_status` remains a read tool and does not require a write lease.
 8. The architecture guide appears in both cold-start and resume prompts.
-9. Cold-start ordering is `EPSCRIPT_GUIDE` → architecture guide → `EPS_PREFLIGHT_GUIDE` → `BUILD_GUIDE`.
-10. Prompt tests pin: no filename inference, configured-main preservation, null-main behavior, localized-change discipline, acyclic direction, `structure` refresh, complete-batch preflight, and mandatory build.
+9. Cold-start ordering is `EPSCRIPT_GUIDE` → architecture guide → `BUILD_GUIDE`.
+10. Prompt tests pin: no filename inference, configured-main preservation, null-main behavior, localized-change discipline, acyclic direction, `structure` refresh, and mandatory build.
 11. Existing first-principles/header and reference-context boundary tests remain unchanged.
 
 ### Phase 4 — Current-behavior documentation
@@ -320,7 +318,6 @@ After code and tests pass, update these existing sources of truth; do not create
 - `hivemind/docs/features/04_native-project-surface.md` — Native manifest MainFile and source operations are authoritative.
 - `hivemind/docs/features/05_agent-core.md` — project context includes exact MainFile and architecture guidance.
 - `hivemind/docs/features/07_project-memory.md` — structural changes require complete `structure` role/dependency refresh.
-- `hivemind/docs/features/18_epscript-lsp-agent-preflight.md` — candidate-introduced cycles are repaired under architecture policy while analyzer severity remains advisory.
 - `hivemind/docs/verify.md` — focused Rust test commands and connected-editor smoke.
 
 Do not describe this intended behavior as implemented until the implementation and verification are complete.
@@ -386,7 +383,7 @@ The work is complete only when all are true:
 - The guide resists both monolith bias and automatic file-count/line-count splitting.
 - Small fixes remain localized; broad splits require planned scope.
 - Structural changes refresh `structure` memory, while ordinary internal edits do not create memory churn.
-- Mutually dependent files use one `eps_check` candidate batch and the resulting project passes mandatory `build_run`.
+- Mutually dependent files are applied coherently and the resulting project passes mandatory `build_run`.
 - Focused tests, workspace tests, formatting, and clippy pass.
 - The connected-editor smoke distinguishes `main` ClassicTrigger from `survivor_mvp` MainFile.
 - Current-behavior docs are updated only after the behavior exists.

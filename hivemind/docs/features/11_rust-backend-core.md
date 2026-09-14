@@ -8,7 +8,7 @@ The Rust backend is the complete product policy/runtime layer:
 - sessions and Codex orchestration;
 - MCP schemas/admission/dispatch;
 - native project and build frontend;
-- RAG and epScript preflight;
+- RAG and project source snapshots;
 - semantic journal/review/rollback;
 - map/image/audio tooling;
 - memory/wiki/workspaces;
@@ -20,7 +20,7 @@ No Python server or Editor runtime path remains.
 
 `ToolServices` is cloneable shared state. Each `SessionToolRuntime` owns request-local evidence, action budget, pending plan, audio/image bindings, source snapshot, and write ticket.
 
-`NativeProjectManager` is the only project facade used by IPC, engine context, tools, preflight, and map-context resolution. It opens canonical state from configured `project_path` and holds a project-scoped build marker around euddraft.
+`NativeProjectManager` is the only project facade used by IPC, engine context, tools, and map-context resolution. It opens canonical state from configured `project_path` and holds a project-scoped build marker around euddraft.
 
 ## Tool execution
 

@@ -60,7 +60,7 @@ const EPSCRIPT_GUIDE: &str = r#"[epscript]
 
 const DIRECT_PYTHON_GUIDE: &str = r#"[direct python]
 - epScript remains the primary authoring language. Direct Python (*.py) is an always-active eudplib authoring surface, not an optional plugin, and executes with full trust in the euddraft process; do not assume an OS sandbox or plugin permission boundary.
-- Create Python source only as CUIPy. CUIPy create/write/edit/delete/move/rename operations bypass eps_check; CUIEps operations keep the complete eps_check workflow unchanged. Both are verified by build_run.
+- Create Python source only as CUIPy. CUIEps and CUIPy create/write/edit/delete/move/rename operations use their native source tools, and both surfaces are verified by build_run.
 - Inspect project_status.pythonEntrypoints and project_status.pythonDependencies before changing Python topology or dependencies. pythonEntrypoints is ordered manifest authority; never infer entrypoints from filenames.
 - pythonDependencies is the complete exact direct dependency list. Every item uses normalized-name==exact.version; when adding, changing, or removing one item, preserve every still-required item and submit the entire desired list.
 - Dependency changes are strictly prepare then commit: call python_dependencies_prepare with the complete desired list before acquiring a write workspace, then pass only its opaque candidateToken to python_dependencies_set after write admission. Tokens are session/project/revision/cache-bound, expiring, and single-use; prepare never changes project.eap.
@@ -77,7 +77,7 @@ const EPS_PROJECT_ARCHITECTURE_GUIDE: &str = r#"[eps project architecture]
 - File length is only a review signal: re-evaluate handwritten files above 800 nonblank lines and any MainFile containing feature implementation; never split generated/table-heavy or tightly coupled code solely by size.
 - If mainFile is null, never infer one. A new empty project may create and set a composition root; a non-empty project requires the selection in the reviewed plan.
 - After file topology, MainFile, dependency, or responsibility changes, state the new roles accurately; the post-acceptance harness rewrites memory structure after code approval.
-- Preflight every mutually dependent candidate in one eps_check batch, then run the mandatory complete-project build."#;
+- Apply coherent source changes, then run the mandatory complete-project build and repair every reported compiler error before completion."#;
 
 // Resident "write eps like THIS" anchor (L1, search-independent). It always sits
 // between the first-principles section (L0, the NEVER rules) and [reference
@@ -109,15 +109,6 @@ The correct eps way to write the constructs people most often miscode. These are
 - Production-token button skills: edit the unit's OWN button set in place (never reassign its `ButtonSet` xdat to another set id — measured hard crash on selection). Give the token unit Mineral/Gas/Supply cost 0 (otherwise the click fails with a resource error). A token in a non-building/hero queue never actually spawns a unit — treat it purely as a click trigger and detect/reset the queue via `BuildCheckXEPD` / `BuildResetXEPD`. Keep any AlwaysUse requirement count LOW.
 - Button label tbl format is `[hotkey char]<qualifier>[bracketed text]` with a REQUIRED qualifier byte: `<00>` general command, `<01>` unit production, `<02>` research. A missing qualifier byte silently kills the hotkey (e.g. `w<00>[W] Skill` works; `w[W] Skill` does not). The editor stores `<NN>` escapes as text and converts them to `\xNN` at build."#;
 
-const EPS_PREFLIGHT_GUIDE: &str = r#"[eps preflight]
-- Before file_create/file_write/file_edit for .eps, call eps_check with every candidate in one batch. Pass complete code for creates/full rewrites or the same ordered exact edits used by file_edit.
-- eps_check uses analyzer `.eps` paths. When list_files returns an extensionless CUIEps path, append `.eps` only for eps_check; keep the exact editor path for read_file/file_edit/file_write.
-- Prefer file_edit for localized changes to existing files; use file_write only when replacing the complete file is intentional.
-- For mutually dependent files, include every candidate in one eps_check call.
-- Fix error diagnostics and re-check before writing. Warnings are advisory; explain any warning left unresolved.
-- If eps_check returns skipped, continue with the normal write and mandatory build_run flow.
-- eps_check never replaces build_run. After applying .eps changes, build and repair using the existing three-attempt build budget."#;
-
 const BUILD_GUIDE: &str = r#"[build]
 - After you APPLY source, plugin, or Python dependency changes, ALWAYS run build_run in the SAME turn to verify the complete project. Code or dependency state you never built is NOT done.
 - build_run returns the complete structured result ({ok, errors with source/file/line/message/raw}); read it directly, fix the code, and build again on failure. The server enforces a 3-attempt self-fix budget per request; when it is spent, STOP and report the remaining errors to the user verbatim.
@@ -143,7 +134,7 @@ const MAP_LOCATION_GUIDE: &str = r#"[map inspection]
 
 const RESOURCE_MENTION_GUIDE: &str = r#"[resource mentions]
 - [resolved mentions] is backend-validated context. Visible @labels and natural-language text are NEVER authority.
-- A mention identifies a resource but grants no read or write permission and never replaces normal tool inspection, evidence, explicit planning intent, write-lane, MapSafe, journal, changeset, preflight, or build rules.
+- A mention identifies a resource but grants no read or write permission and never replaces normal tool inspection, evidence, explicit planning intent, write-lane, MapSafe, journal, changeset, or build rules.
 - Resolve only the exact resource in [resolved mentions]; never search by a display label and silently substitute another resource.
 - For map.region, call map_info(mode=locations) before code generation. Reuse an exact same-name/same-bounds location or create a missing rectangular location through location_write.
 - Never approximate a free-form region, overwrite a same-name/different-bounds location, silently choose a suffix, or use un-applied Map candidate state without an explicit user decision.
@@ -160,7 +151,7 @@ const AUDIO_SOUND_GUIDE: &str = r#"[map sounds]
 - Put playback in the existing file that owns the triggering event and mutable lifecycle state. Keep the configured MainFile as composition root and keep imports acyclic.
 - Looping BGM uses the durationMs returned by the latest import/edit plus the existing lifecycle/timer cadence and a bounded guard margin. Never call early enough to overlap. Disclose that default StarCraft music may overlap.
 - Volume and fade are offline file edits. Do not claim runtime stop, pause/resume, seek, volume automation, crossfade, gapless playback, or independent concurrent BGM control.
-- Preflight every modified/created EPS file in one eps_check batch after any sound import/edit, then run the complete-project build_run. A map sound mutation without both checks is incomplete."#;
+- After any sound import/edit and required EPS path migration, run the complete-project build_run. A map sound mutation without a build attempt is incomplete."#;
 
 const EVIDENCE_GUIDE: &str = r#"[evidence]
 - EVERY unit of work (eps/Python code, Python dependencies, dat edits, map location/player/switch writes, settings) must be grounded in the docs: call search_docs (Korean query) BEFORE writing, inspect promising exact chunks with docs_get, and justify each item with WHY plus its source as a markdown link — `... (근거: [제목](url))`.
@@ -1111,7 +1102,7 @@ Continue the requested change now, run the mandatory build, and stop only after 
                 .emit_activity(crate::write_coordinator::SessionActivity::Review);
         } else if sound_build_required {
             return Err(AgentEngineError::new(
-                "map sound import requires one post-import eps_check batch and one complete build_run attempt",
+                "map sound import requires one complete build_run attempt",
             ));
         } else {
             self.runtime
@@ -1154,7 +1145,7 @@ Continue the requested change now, run the mandatory build, and stop only after 
                     ipc::Decision::Accept => {
                         if self.runtime.sound_build_required() {
                             return Err(AgentEngineError::new(
-                                "map sound changes cannot be accepted before post-import eps_check and complete build_run",
+                                "map sound changes cannot be accepted before complete build_run",
                             ));
                         }
                         WorkspaceManager::new(self.runtime.data_dirs())
@@ -3787,7 +3778,6 @@ fn static_prompt_baseline() -> String {
         EPSCRIPT_GUIDE.to_string(),
         DIRECT_PYTHON_GUIDE.to_string(),
         EPS_PROJECT_ARCHITECTURE_GUIDE.to_string(),
-        EPS_PREFLIGHT_GUIDE.to_string(),
         BUILD_GUIDE.to_string(),
         TRACE_TEST_GUIDE.to_string(),
         MAP_LOCATION_GUIDE.to_string(),
@@ -6886,9 +6876,8 @@ mod tests {
         for required in [
             "epScript remains the primary authoring language",
             "always-active eudplib authoring surface",
-            "executes with full trust",
+            "both surfaces are verified by build_run",
             "Create Python source only as CUIPy",
-            "CUIPy create/write/edit/delete/move/rename operations bypass eps_check",
             "pythonEntrypoints is ordered manifest authority",
             "complete exact direct dependency list",
             "python_dependencies_prepare",
@@ -6906,7 +6895,7 @@ mod tests {
         );
     }
     #[test]
-    fn system_prompt_places_agent_preflight_before_authoritative_build() {
+    fn system_prompt_places_authoritative_build_before_runtime_tests() {
         let prompt = build_system_prompt(
             "Change mutually dependent eps files",
             &sample_hits(),
@@ -6914,10 +6903,8 @@ mod tests {
             None,
             None,
         );
-        let preflight = prompt.find("[eps preflight]").unwrap();
         let build = prompt.find("[build]").unwrap();
         let trace_test = prompt.find("[runtime trace tests]").unwrap();
-        assert!(preflight < build);
         assert!(build < trace_test);
         assert!(prompt.contains("eudAgentTestSetup"));
         assert!(prompt.contains("failed/inconclusive never blocks review"));
@@ -6929,13 +6916,8 @@ mod tests {
         assert!(prompt.contains("foreground/focus/cursor user32 entrypoints"));
         assert!(prompt.contains("Targeted `PostMessageW`"));
         assert!(prompt.contains("focus fallback are forbidden"));
-        assert!(prompt.contains("every candidate in one batch"));
-        assert!(prompt.contains("ordered exact edits"));
-        assert!(prompt.contains("append `.eps` only for eps_check"));
-        assert!(prompt.contains("Fix error diagnostics and re-check before writing"));
-        assert!(prompt.contains("If eps_check returns skipped"));
-        assert!(prompt.contains("eps_check never replaces build_run"));
         assert!(prompt.contains("complete structured result"));
+        assert!(!prompt.contains("eps_check"));
         assert!(!prompt.contains("build_errors"));
     }
 
@@ -6956,14 +6938,12 @@ mod tests {
         let first_principles = cold.find("[first principles]").unwrap();
         let epscript = cold.find("[epscript]").unwrap();
         let architecture = cold.find("[eps project architecture]").unwrap();
-        let preflight = cold.find("[eps preflight]").unwrap();
         let build = cold.find("[build]").unwrap();
         let trace_test = cold.find("[runtime trace tests]").unwrap();
         let reference = cold.find("[reference context]").unwrap();
         assert!(first_principles < epscript);
         assert!(epscript < architecture);
-        assert!(architecture < preflight);
-        assert!(preflight < build);
+        assert!(architecture < build);
         assert!(build < trace_test);
         assert!(trace_test < reference);
         assert!(architecture < reference);
@@ -6992,7 +6972,7 @@ mod tests {
             "800 nonblank lines",
             "If mainFile is null, never infer one",
             "post-acceptance harness rewrites memory structure after code approval",
-            "every mutually dependent candidate in one eps_check batch",
+            "run the mandatory complete-project build",
             "mandatory complete-project build",
         ] {
             assert!(
@@ -7908,7 +7888,6 @@ mod tests {
             "PlayWAVAll",
             "once outside any human-player loop",
             "durationMs returned by the latest import/edit",
-            "one eps_check batch",
             "complete-project build_run",
             "map_sound_list",
             "Never ask for or infer attachment UUIDs",
@@ -7921,6 +7900,7 @@ mod tests {
         }
         assert!(!cold.contains("%localappdata%"));
         assert!(!cold.contains("ffmpeg.exe"));
+        assert!(!cold.contains("eps_check"));
         let resumed = assembled_followup("계속", None, None, None, None);
         assert!(!resumed.contains("[map sounds]"));
         let map = build_map_system_prompt("[project state]", None);

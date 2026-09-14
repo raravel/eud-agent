@@ -17,7 +17,6 @@
 - `parking_lot`/standard synchronization for session services and project write coordination
 - `reqwest` for managed release/bootstrap downloads
 - `fastembed` for in-process BGE-M3 retrieval
-- framed Node adapter only for pinned epScript analyzer integration
 
 Native domain modules:
 
@@ -28,7 +27,6 @@ Native domain modules:
 - `tool_exec`/`tools`: schema-rich MCP runtime
 - `journal`/`workspace`/`memory`: durable review state
 - `isom`/`mapsafe`/`chk`: map reads and safe mutations
-- `eps_preflight`: full native source snapshots and analyzer gate
 
 ## Native project format
 

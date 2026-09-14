@@ -1,4 +1,4 @@
-//! Coherent native project source snapshot shared by workspace and EPS preflight layers.
+//! Coherent native project source snapshot used by durable workspace mirrors.
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectSnapshotFile {

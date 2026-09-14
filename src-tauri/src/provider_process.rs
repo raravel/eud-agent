@@ -9,6 +9,22 @@ impl WindowsJob {
     const REAP_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(1);
 
     pub(crate) fn assign(child: &tokio::process::Child) -> std::io::Result<Self> {
+        use windows_sys::Win32::Foundation::HANDLE;
+        let child_handle = child
+            .raw_handle()
+            .ok_or_else(std::io::Error::last_os_error)?;
+        Self::assign_handle(child_handle as HANDLE)
+    }
+
+    pub(crate) fn assign_std(child: &std::process::Child) -> std::io::Result<Self> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Foundation::HANDLE;
+        Self::assign_handle(child.as_raw_handle() as HANDLE)
+    }
+
+    fn assign_handle(
+        child_handle: windows_sys::Win32::Foundation::HANDLE,
+    ) -> std::io::Result<Self> {
         use std::mem::size_of;
         use windows_sys::Win32::Foundation::{
             CloseHandle, DuplicateHandle, DUPLICATE_SAME_ACCESS, HANDLE,
@@ -19,9 +35,6 @@ impl WindowsJob {
             JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
         };
         use windows_sys::Win32::System::Threading::GetCurrentProcess;
-        let child_handle = child
-            .raw_handle()
-            .ok_or_else(std::io::Error::last_os_error)?;
         // SAFETY: Category 8 (FFI). Null names are accepted by CreateJobObjectW, and
         // the returned handle is checked before use and owned by WindowsJob.
         let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
@@ -45,7 +58,7 @@ impl WindowsJob {
         let assigned = if configured != 0 {
             // SAFETY: Category 8 (FFI). Both handles are live OS handles and neither
             // is closed while AssignProcessToJobObject executes.
-            unsafe { AssignProcessToJobObject(handle, child_handle as HANDLE) }
+            unsafe { AssignProcessToJobObject(handle, child_handle) }
         } else {
             0
         };
@@ -57,13 +70,13 @@ impl WindowsJob {
             return Err(error);
         }
         let mut primary_process: HANDLE = std::ptr::null_mut();
-        // SAFETY: Category 8 (FFI). The tokio child still owns `child_handle`;
-        // duplicating it in this process preserves its existing synchronization access.
+        // SAFETY: Category 8 (FFI). The child still owns `child_handle`; duplicating
+        // it in this process preserves its existing synchronization access.
         let duplicated = unsafe {
             let current_process = GetCurrentProcess();
             DuplicateHandle(
                 current_process,
-                child_handle as HANDLE,
+                child_handle,
                 current_process,
                 &raw mut primary_process,
                 0,
@@ -74,7 +87,7 @@ impl WindowsJob {
         if duplicated == 0 {
             let error = std::io::Error::last_os_error();
             // SAFETY: Category 12 (invalid/double free). This branch still owns
-            // the job handle and returns before WindowsJob can close it.
+            // the job handle and returns before WindowsJob can own it.
             unsafe { CloseHandle(handle) };
             return Err(error);
         }

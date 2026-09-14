@@ -118,10 +118,10 @@ using a location in epScript:
   repurposed.
 
 After resolving or creating the location, the normal EPS workflow remains mandatory:
-`project_status.mainFile`, `list_files`, memory and owner-source inspection, `search_docs`, one
-coherent `eps_check`, normal file tools, and `build_run`. The map journal entry and code journal
-entries stay in the same existing changeset/rollback flow. The mention grants no mutation
-permission and does not bypass location-write safety rails.
+`project_status.mainFile`, `list_files`, memory and owner-source inspection, `search_docs`, normal
+file tools, and `build_run`. The map journal entry and code journal entries stay in the same
+existing changeset/rollback flow. The mention grants no mutation permission and does not bypass
+location-write safety rails.
 
 ## Journal / changeset integration
 

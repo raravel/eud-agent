@@ -32,10 +32,6 @@
     "createUpdaterArtifacts": true,
     "resources": {
       "resources/eud-editor-compat": "native/eud-editor-compat",
-      "../vendor/epscript-lsp-agent/adapter.cjs": "vendor/epscript-lsp-agent/adapter.cjs",
-      "../vendor/epscript-lsp-agent/adapter.sha256": "vendor/epscript-lsp-agent/adapter.sha256",
-      "../vendor/epscript-lsp-agent/LICENSE.md": "vendor/epscript-lsp-agent/LICENSE.md",
-      "../vendor/epscript-lsp-agent/provenance.json": "vendor/epscript-lsp-agent/provenance.json",
       "../vendor/ffmpeg/manifest.json": "vendor/ffmpeg/manifest.json",
       "../vendor/ffmpeg/LICENSE.txt": "vendor/ffmpeg/LICENSE.txt",
       "icons/128x128.png": "icons/notification.png"

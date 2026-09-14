@@ -12,7 +12,7 @@ The motivating request is:
 @영역 A에 들어가면 유닛의 체력이 회복되게 해줘.
 ```
 
-For a rectangular saved region, the EPS agent must be able to resolve the exact region, inspect the current source map for a matching location, create the location through the existing journaled `location_write` path when missing, write the owning epScript behavior, preflight it, and run the authoritative build. The mention itself grants no write permission and never bypasses review.
+For a rectangular saved region, the EPS agent must be able to resolve the exact region, inspect the current source map for a matching location, create the location through the existing journaled `location_write` path when missing, write the owning epScript behavior, and run the authoritative build. The mention itself grants no write permission and never bypasses review.
 
 A later request must be representable by the same message contract:
 
@@ -38,7 +38,7 @@ Current main EPS behavior:
 - `panel/src/components/InstructionBox.tsx::ChatPayload` contains only `text` and `attachments`.
 - `panel/src/lib/protocol.ts::{ChatMessage, PlanFeedbackMessage}` contain only text and attachment ids.
 - `src-tauri/src/ipc.rs::{ChatRequest, PlanFeedbackRequest}` contain only text and attachment ids.
-- `src-tauri/src/engine.rs` already tells the EPS agent to inspect `map_info(mode=locations)`, create a missing location with `location_write`, preflight epScript with `eps_check`, mutate through eud-tools, and run `build_run`.
+- `src-tauri/src/engine.rs` already tells the EPS agent to inspect `map_info(mode=locations)`, create a missing location with `location_write`, mutate through eud-tools, and run `build_run`.
 
 The missing capability is therefore not a second trigger generator. It is a generic, typed, backend-validated reference channel from the main prompt composer into an EPS conversation turn.
 
@@ -54,7 +54,7 @@ The implementation MUST build on these existing authorities rather than adding a
 4. A Map Agent `MapMentionSnapshot` is candidate-revision authority. It must not be reused as an EPS source-map mention merely because some variant names overlap.
 5. Existing source-map locations come from the current saved CHK `MRGN` section. Location ids are stable, `#64` is Anywhere, and location names follow the map's string encoding.
 6. `location_write` is the existing source-map mutation path. It already has compiling, exclusive-lock, full-backup, all-or-nothing native edit, post-digest, journal, changeset, and rollback rails.
-7. The EPS agent already owns project placement, `eps_check`, file mutation, and mandatory `build_run`. The mention feature supplies grounded references; it does not hard-code trigger implementations.
+7. The EPS agent already owns project placement, file mutation, and mandatory `build_run`. The mention feature supplies grounded references; it does not hard-code trigger implementations.
 8. The panel-owned `panelLog` is opaque to Rust and already persists optional additive fields. New main-surface mention snapshots can remain an optional version-2 log field.
 9. Main EPS sessions and Map sessions are intentionally separate. Map candidate Apply remains a trusted Map-window-only command and is never exposed by this feature.
 
@@ -70,7 +70,7 @@ The implementation MUST build on these existing authorities rather than adding a
 - `map.location` search, snapshot creation, validation, and trusted prompt rendering.
 - Main prompt `@` search with heterogeneous results, chips, keyboard access, Korean IME safety, stale errors, and mention-only send.
 - Exact snapshot persistence across session reload, message history, message edit, and conversation rewind.
-- EPS prompt guidance for reusing or creating a location from a resolved region and then following the existing epScript placement/preflight/build workflow.
+- EPS prompt guidance for reusing or creating a location from a resolved region and then following the existing epScript placement/build workflow.
 - Focused Rust and panel tests plus a live editor/app smoke scenario.
 - Updates to architecture, rules, agent-core, location-write, sessions, and verification documentation after behavior is implemented.
 
@@ -106,7 +106,7 @@ The implementation MUST build on these existing authorities rather than adding a
 5. The panel MUST echo a backend-created typed snapshot. It MUST NOT manufacture project ids, source hashes, selection hashes, location fingerprints, editor paths, or workspace paths.
 6. Every snapshot kind MUST be namespaced and versioned. Unknown kinds, unknown versions, missing fields, and unknown fields MUST fail closed.
 7. Generic transport MUST NOT mean generic `serde_json::Value` validation. Rust owns a strict discriminated union and a match arm for every supported kind.
-8. A resolved mention is context, not permission. Existing read/write lane, evidence, mutation count, plan, action budget, map safety, journal, changeset, preflight, and build rules remain unchanged.
+8. A resolved mention is context, not permission. Existing read/write lane, evidence, mutation count, plan, action budget, map safety, journal, changeset, and build rules remain unchanged.
 9. `map.region` MUST bind to the current EUD project, current saved source-map file hash, exact persistent selection id, exact persistent selection hash, and compatible dimensions.
 10. `map.location` MUST bind to the current EUD project, current saved source-map file hash, exact MRGN id, and exact location fingerprint.
 11. Un-applied candidate state MUST NOT appear in main-surface search results or resolution.
@@ -314,10 +314,9 @@ A map-region mention does not directly call `location_write`. It grounds the age
 2. use `search_docs` before any mutation;
 3. call `map_info(mode=locations)` before referencing a location name;
 4. reuse an exact existing location or create a missing rectangular one with `location_write(action=add)`;
-5. preflight complete candidate epScript with `eps_check`;
-6. mutate through the existing file tools and write lane;
-7. run `build_run` in the same turn;
-8. present map and code journal items in the existing changeset review.
+5. mutate through the existing file tools and write lane;
+6. run `build_run` in the same turn;
+7. present map and code journal items in the existing changeset review.
 
 No mention contract weakens evidence, mutation count, plan approval, write registration, backup, rollback, or build requirements.
 
@@ -406,7 +405,7 @@ content hash
 
 Search authority comes from `list_files`; MainFile annotation comes from `project_status.mainFile`; content authority comes from `read_file` or the same typed bridge wrappers. The resolved prompt includes exact path/type/MainFile status/hash, not full source content. The agent then calls `read_file`. An EPS file mention grants no write permission.
 
-Extensionless CUIEps editor paths remain exact on editor tool calls. `.eps` is appended only where the existing `eps_check` contract requires it.
+Extensionless CUIEps editor paths remain exact on every editor tool call.
 
 ### D16 — Future `workspace.file` contract
 
@@ -527,7 +526,7 @@ graph TD
     Trusted --> EpsEngine[EPS AgentEngine]
     EpsEngine --> MapInfo[map_info]
     EpsEngine --> LocWrite[location_write]
-    EpsEngine --> EpsTools[eps_check + file tools + build_run]
+    EpsEngine --> EpsTools[file tools + build_run]
 ```
 
 Dependency direction:
@@ -645,7 +644,7 @@ Add concise guidance to the EPS system prompt:
 - For map.location, use the resolved exact id/name and do not create a duplicate.
 ```
 
-The existing `[map inspection]`, `[eps project architecture]`, `[eps preflight]`, `[build]`, evidence, and triage blocks remain authoritative and are not duplicated wholesale.
+The existing `[map inspection]`, `[eps project architecture]`, `[build]`, evidence, and triage blocks remain authoritative and are not duplicated wholesale.
 
 ## 13. Implementation Sequence
 
@@ -692,7 +691,7 @@ Acceptance: keyboard/IME operation, mixed chips, exact payload forwarding, dupli
 1. Save a rectangular `영역 A` in Map Agent.
 2. Search/select it in the main composer.
 3. Send the motivating healing request.
-4. Observe existing tool flow: `map_info`, optional `location_write`, project inspection, `search_docs`, `eps_check`, file mutation, and `build_run`.
+4. Observe existing tool flow: `map_info`, optional `location_write`, project inspection, `search_docs`, file mutation, and `build_run`.
 5. Verify the changeset contains both the map edit and epScript edit and that reject restores both.
 6. Accept, rebuild, and verify runtime healing behavior in the editor/game.
 
@@ -808,7 +807,7 @@ With EUD Editor and eud-agent running:
 4. Select it and send `에 들어가면 유닛의 체력이 회복되게 해줘.`
 5. Require `map_info(mode=locations)` before any location reference.
 6. If absent, require one journaled `location_write(action=add)` with exact tile bounds and name.
-7. Require grounded project placement, `eps_check`, editor file mutation, and successful `build_run`.
+7. Require grounded project placement, editor file mutation, and successful `build_run`.
 8. Require one review containing the location and epScript changes.
 9. Reject once and confirm exact map backup restoration plus code rollback.
 10. Repeat, accept, build, enter the map, and confirm the intended unit healing behavior.
@@ -860,7 +859,7 @@ The first implementation is complete only when all of the following hold:
 5. Visible `@label` text alone has no authority.
 6. Main search exposes only persistent regions and locations from the current saved source map; un-applied candidate state is absent.
 7. Trusted resolved mention context appears outside and before `[user message]` on cold, resumed, and plan-feedback turns.
-8. Rectangular region requests can drive the existing map inspection/location creation/epScript preflight/write/build workflow without bypassing review.
+8. Rectangular region requests can drive the existing map inspection/location creation/epScript write/build workflow without bypassing review.
 9. Free-form regions and same-name/different-bounds locations are never silently approximated or overwritten.
 10. Mention instances persist through logs, session reload, message edit, and rewind.
 11. Map Agent candidate mention authority and trusted Apply remain unchanged and isolated.

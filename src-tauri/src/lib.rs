@@ -22,7 +22,6 @@ pub mod config;
 pub mod context_state;
 pub mod e3s_nrbf;
 pub mod engine;
-pub mod eps_preflight;
 pub mod harness;
 pub mod harness_import;
 pub mod ipc;
@@ -237,30 +236,6 @@ pub fn run() {
 
             let app_handle = app.handle().clone();
 
-            // Resolve and checksum-verify the pinned adapter before constructing
-            // the shared runtime. Failure is represented by an unavailable
-            // analyzer and never blocks application startup or other tools.
-            let adapter = app.path().resolve(
-                "vendor/epscript-lsp-agent/adapter.cjs",
-                BaseDirectory::Resource,
-            );
-            let checksum = app.path().resolve(
-                "vendor/epscript-lsp-agent/adapter.sha256",
-                BaseDirectory::Resource,
-            );
-            let analyzer = match (adapter, checksum) {
-                (Ok(adapter), Ok(checksum)) => eps_preflight::NodeEpsAnalyzer::from_resource(
-                    adapter,
-                    checksum,
-                    data_dirs.logs_dir(),
-                    data_dirs.lsp_workspaces_dir(),
-                ),
-                (Err(error), _) | (_, Err(error)) => eps_preflight::NodeEpsAnalyzer::unavailable(
-                    eps_preflight::SkipReason::AdapterMissing,
-                    format!("cannot resolve bundled epscript adapter: {error}"),
-                ),
-            };
-
             let activity_handle = app_handle.clone();
             let writes = write_coordinator::ProjectWriteCoordinator::new(move |event| {
                 if let Err(error) = activity_handle.emit("session_activity", event) {
@@ -295,12 +270,7 @@ pub fn run() {
                 candidates.clone(),
                 writes.clone(),
             ));
-            let services = tool_exec::ToolServices::new(
-                data_dirs.clone(),
-                std::sync::Arc::new(analyzer),
-                candidates,
-                writes,
-            );
+            let services = tool_exec::ToolServices::new(data_dirs.clone(), candidates, writes);
             let mentions = services.mentions();
             app.manage(mentions.clone());
             tauri::async_runtime::spawn_blocking(move || {

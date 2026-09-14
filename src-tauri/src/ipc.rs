@@ -1,8 +1,8 @@
 //! Tauri IPC command and event payload schema.
 //!
 //! Panel-to-core commands use Tauri `invoke`; core-to-panel messages use typed
-//! Tauri events. Native project, RAG, Codex, preflight, and map services are
-//! wired directly in-process.
+//! Tauri events. Native project, RAG, provider, and map services are wired
+//! directly in-process.
 
 use std::collections::BTreeSet;
 

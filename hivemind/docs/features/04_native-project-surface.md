@@ -29,7 +29,7 @@ All paths are normalized `/`-separated project-relative paths. Source files must
 - source list/read/create/write/edit/move/rename/delete;
 - MainFile selection;
 - settings and ordered plugin CRUD;
-- complete source snapshots for Codex workspaces and epScript preflight;
+- complete source snapshots for Codex workspaces;
 - sparse DAT reads and atomic batch patching;
 - E3S compatibility metadata;
 - atomic JSON/manifest persistence.

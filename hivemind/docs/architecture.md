@@ -15,7 +15,6 @@ graph TD
     Native --> Manifest[project.json]
     Native --> Sources[src/**/*.eps]
     Native --> Dat[dat/*.json]
-    Tools --> Preflight[epscript preflight]
     Tools --> Map[Map Agent / isom / CHK]
     Tools --> Journal[semantic journal]
     Engine --> Providers[Codex / Claude Code / Antigravity / OpenCode Go / Ollama]
@@ -49,7 +48,6 @@ compat/editor-project.e3s   # only after E3S import
 - `ProjectWriteCoordinator`: serializes project mutations across sessions.
 - `JournalStore`: durable semantic before/after records and reverse-order rollback through the native runtime.
 - `WorkspaceManager`: durable agent workspace plus read-only source mirror.
-- `EpsPreflight`: project snapshots and framed Node analyzer client.
 - `MapSafe`: native build marker, Windows no-share probe, backup, isom mutation, verification, rollback.
 
 No module reads an Editor heartbeat/status file, starts Editor, installs Lua, polls inbox/outbox, invokes BindingManager, or asks Editor to build.
@@ -97,7 +95,7 @@ Project management remains available in Settings after setup, including E3S expo
 ## Data locations
 
 - Roaming `%APPDATA%/eud-agent`: config, sessions, memory, journals, accepted workspaces.
-- Local `%LOCALAPPDATA%/eud-agent`: model/RAG cache, native compatibility assets, analyzer mirrors, audio tools, temporary work.
+- Local `%LOCALAPPDATA%/eud-agent`: model/RAG cache, native compatibility assets, audio tools, temporary work.
 - Project root: canonical authoring state and build outputs.
 
 Every app-written text/JSON file is UTF-8 without BOM. Large/regenerable assets never live in Roaming.

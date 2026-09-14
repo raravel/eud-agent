@@ -858,7 +858,7 @@ fn run_managed_process(
         .spawn()
         .map_err(|_| "관리되는 오디오 변환기를 실행할 수 없습니다.".to_string())?;
     #[cfg(windows)]
-    let mut job = match crate::eps_preflight::WindowsJob::assign(&child) {
+    let mut job = match crate::provider_process::WindowsJob::assign_std(&child) {
         Ok(job) => Some(job),
         Err(_) => {
             let _ = child.kill();

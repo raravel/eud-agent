@@ -59,12 +59,11 @@
 - Surface structured file/line diagnostics; never suppress or special-case a compiler symptom.
 - Map/sound writes refuse while the build marker is held.
 
-## Source editing and preflight
+## Source editing and build verification
 
-- `eps_check` receives complete creates/rewrites or the exact ordered edits used by `file_edit`.
-- Batch mutually dependent candidates in one preflight.
-- Diagnostics are advisory; compiler/build output remains final authority.
-- Preflight snapshots come directly from the native EPS tree. No transport roundtrip or flattened shared dump.
+- Apply mutually dependent source changes coherently through the native file tools.
+- After source, plugin, or Python dependency changes, run `build_run` in the same turn.
+- euddraft diagnostics and a fresh output map are the only build authority; repair every reported compiler error before completion.
 - Prefer localized `file_edit`; use full `file_write` only for intentional replacement.
 - Preserve exact import paths and MainFile composition-root policy.
 

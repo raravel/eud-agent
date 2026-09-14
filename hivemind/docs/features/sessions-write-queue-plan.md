@@ -137,7 +137,6 @@ struct ToolServices {
     journal: JournalStore,
     rag: Arc<Rag>,
     map_safe: Arc<ProductionMapSafe>,
-    analyzer: Arc<dyn EpsAnalyzer>,
     writes: ProjectWriteCoordinator,
 }
 
@@ -148,11 +147,10 @@ struct SessionToolRuntime {
     request_state: Mutex<Option<RequestState>>,
     pending_plan: Mutex<Option<(String, String)>>,
     write_state: Mutex<SessionWriteState>,
-    eps_preflight: EpsPreflight,
 }
 ```
 
-The RAG index, journal store, map rails, analyzer process, and coordinator remain shared. Evidence flags, mutation budgets, approved-plan state, pending plans, request IDs, and preflight request state are session scoped.
+The RAG index, journal store, map rails, and coordinator remain shared. Evidence flags, mutation budgets, approved-plan state, pending plans, and request IDs are session scoped.
 
 Each active worker receives its own ephemeral loopback MCP server. This is intentionally preferred over teaching one endpoint to infer the caller from a mutable global pointer. The MCP server must return a shutdown handle and stop when its worker is discarded.
 
@@ -278,7 +276,7 @@ Backend tests must prove:
 - two different session workers enter fake `run_turn` concurrently;
 - same-session commands remain serialized;
 - interleaved events retain the correct session ID;
-- one session's request initialization does not clear another session's evidence, budget, plan, or preflight state;
+- one session's request initialization does not clear another session's evidence, budget, plan, or build state;
 - cancellation targets exactly one worker.
 
 Panel tests must prove that sending in session B invokes `chat` before session A's unresolved invocation completes.
@@ -298,7 +296,7 @@ Refactor `ToolRuntime` without changing write behavior yet:
 
 - extract `ToolServices`;
 - create one `SessionToolRuntime` per worker;
-- make pending plan, current request, gates, budgets, and preflight state session local;
+- make pending plan, current request, gates, and budgets session local;
 - return an MCP server handle with explicit shutdown;
 - construct a session-bound event sink;
 - move cancellation to each worker.
@@ -308,7 +306,6 @@ Target files:
 - `src-tauri/src/tool_exec.rs`
 - `src-tauri/src/mcp.rs`
 - `src-tauri/src/tools.rs`
-- `src-tauri/src/eps_preflight.rs`
 - `src-tauri/src/engine.rs`
 - `src-tauri/src/lib.rs`
 
