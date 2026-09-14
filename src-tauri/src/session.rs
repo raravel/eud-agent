@@ -16,7 +16,9 @@
 //! crash startup); a corrupt `<id>.json` on open is a graceful `Err` surfaced to the
 //! panel.
 
-use std::path::PathBuf;
+use std::collections::BTreeSet;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -129,6 +131,134 @@ impl Default for SessionIndex {
     }
 }
 
+/// Transactional import guard for legacy E3S-backed session history.
+///
+/// The guard owns only the records and index entries it published. Dropping or
+/// rolling it back removes those entries only while their bytes are unchanged,
+/// so a concurrent edit is never overwritten.
+#[derive(Debug)]
+pub(crate) struct LegacySessionImport {
+    owned_records: Vec<(PathBuf, Vec<u8>)>,
+    owned_meta: Vec<SessionMeta>,
+    committed: bool,
+}
+
+impl LegacySessionImport {
+    pub(crate) fn commit(mut self) {
+        self.committed = true;
+    }
+
+    pub(crate) fn rollback(mut self) -> anyhow::Result<()> {
+        self.rollback_inner()
+    }
+
+    fn rollback_inner(&mut self) -> anyhow::Result<()> {
+        if self.committed {
+            return Ok(());
+        }
+        let _guard = SESSION_WRITE_LOCK
+            .lock()
+            .map_err(|_| anyhow::anyhow!("session store lock poisoned"))?;
+        self.rollback_inner_locked()
+    }
+
+    fn rollback_inner_locked(&mut self) -> anyhow::Result<()> {
+        if self.committed {
+            return Ok(());
+        }
+        let mut first_error = None;
+        let mut removable_ids = BTreeSet::new();
+        for (path, bytes) in self.owned_records.iter().rev() {
+            match fs::read(path) {
+                Ok(current) if current.as_slice() == bytes.as_slice() => {
+                    let removed = match fs::remove_file(path) {
+                        Ok(()) => true,
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+                        Err(error) => {
+                            if first_error.is_none() {
+                                first_error = Some(anyhow::Error::from(error));
+                            }
+                            false
+                        }
+                    };
+                    if removed {
+                        if let Some(id) = path.file_stem().and_then(|value| value.to_str()) {
+                            removable_ids.insert(id.to_string());
+                        }
+                    }
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) if first_error.is_none() => {
+                    first_error = Some(anyhow::Error::from(error));
+                }
+                Err(_) => {}
+            }
+        }
+
+        let store_dir = self
+            .owned_records
+            .first()
+            .and_then(|(path, _)| path.parent().map(Path::to_path_buf));
+        if let Some(store_dir) = store_dir {
+            let index_path = store_dir.join(INDEX_FILE);
+            match read_strict_index_from(&index_path) {
+                Ok(mut index) => {
+                    let before = index.sessions.len();
+                    index.sessions.retain(|meta| {
+                        !removable_ids.contains(&meta.id) || !self.owned_meta.contains(meta)
+                    });
+                    if index.sessions.len() != before {
+                        sort_sessions(&mut index.sessions);
+                        if let Err(error) = write_index_at(&index_path, &index) {
+                            if first_error.is_none() {
+                                first_error = Some(error);
+                            }
+                        }
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) if first_error.is_none() => {
+                    first_error = Some(error.into());
+                }
+                Err(_) => {}
+            }
+        }
+        self.committed = true;
+        first_error.map_or(Ok(()), Err)
+    }
+}
+
+impl Drop for LegacySessionImport {
+    fn drop(&mut self) {
+        let _ = self.rollback_inner();
+    }
+}
+
+fn abort_import(
+    owned_records: Vec<(PathBuf, Vec<u8>)>,
+    owned_meta: Vec<SessionMeta>,
+    error: anyhow::Error,
+) -> anyhow::Error {
+    let mut rollback = LegacySessionImport {
+        owned_records,
+        owned_meta,
+        committed: false,
+    };
+    match rollback.rollback_inner_locked() {
+        Ok(()) => error,
+        Err(rollback_error) => anyhow::anyhow!("{error}; rollback failed: {rollback_error}"),
+    }
+}
+
+fn empty_session_import() -> LegacySessionImport {
+    LegacySessionImport {
+        owned_records: Vec::new(),
+        owned_meta: Vec::new(),
+        committed: true,
+    }
+}
+
 /// Reads/writes named session records under `%appdata%\eud-agent\sessions\`.
 #[derive(Debug, Clone)]
 pub struct SessionStore {
@@ -153,6 +283,241 @@ impl SessionStore {
         }
         store
     }
+    /// Prepare legacy E3S session history before native project activation.
+    ///
+    /// Legacy EPS rows are keyed by the quoted full E3S path. Legacy Map rows
+    /// use the historical SHA-256 of that same normalized full path. No
+    /// basename or guessed directory is considered. Unavailable matching rows
+    /// are reported in `issues` and do not prevent healthy rows from importing.
+    /// The returned guard owns only the fresh native rows until `commit`.
+    pub(crate) fn import_legacy_harness(
+        dirs: &DataDirs,
+        source_e3s: &Path,
+        source_project: &str,
+        target: &crate::native_project::NativeProject,
+        issues: &mut Vec<crate::harness_import::HarnessImportIssue>,
+    ) -> anyhow::Result<LegacySessionImport> {
+        validate_source_e3s(source_e3s)?;
+        let store = Self {
+            dirs: dirs.clone(),
+            sessions_dir: dirs.sessions_dir(),
+        };
+        let _guard = store.lock()?;
+        if let Err(error) = ensure_session_directory(&store.sessions_dir) {
+            issues.push(crate::harness_import::HarnessImportIssue::new(
+                "sessions",
+                store.sessions_dir.to_string_lossy().into_owned(),
+                format!("session store is unavailable: {error}"),
+            ));
+            return Ok(empty_session_import());
+        }
+
+        let index_path = store.sessions_dir.join(INDEX_FILE);
+        let mut index = match read_strict_index_from(&index_path) {
+            Ok(index) => index,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => SessionIndex::default(),
+            Err(error) => {
+                issues.push(crate::harness_import::HarnessImportIssue::new(
+                    "sessions",
+                    index_path.to_string_lossy().into_owned(),
+                    format!("session index is unavailable: {error}"),
+                ));
+                return Ok(empty_session_import());
+            }
+        };
+        if let Err(error) = validate_index_entries(&index) {
+            issues.push(crate::harness_import::HarnessImportIssue::new(
+                "sessions",
+                index_path.to_string_lossy().into_owned(),
+                format!("session index is unsafe to merge: {error}"),
+            ));
+            return Ok(empty_session_import());
+        }
+
+        let source_key = legacy_path_key(source_project).ok_or_else(|| {
+            anyhow::anyhow!("legacy E3S source project must be an absolute full path")
+        })?;
+        let legacy_map_id = legacy_map_project_id(source_project);
+        let target_eps = target.manifest().name.clone();
+        let target_map = crate::map_context::project_id_for_path(target.root().to_path_buf());
+
+        let eps_occupied = index
+            .sessions
+            .iter()
+            .any(|meta| meta.kind == SessionKind::Eps && meta.project == target_eps);
+        let map_occupied = index
+            .sessions
+            .iter()
+            .any(|meta| meta.kind == SessionKind::Map && meta.project == target_map);
+
+        let mut matches = Vec::new();
+        for meta in &index.sessions {
+            let is_match = match meta.kind {
+                SessionKind::Eps => {
+                    legacy_path_key(&meta.project).is_some_and(|key| key == source_key)
+                }
+                SessionKind::Map => legacy_map_id.as_ref().is_some_and(|id| id == &meta.project),
+            };
+            if !is_match {
+                continue;
+            }
+            let record_path = store.record_path(&meta.id);
+            if (meta.kind == SessionKind::Eps && eps_occupied)
+                || (meta.kind == SessionKind::Map && map_occupied)
+            {
+                issues.push(crate::harness_import::HarnessImportIssue::new(
+                    "sessions",
+                    record_path.to_string_lossy(),
+                    "같은 프로젝트 키로 저장된 대화가 있어 이 대화는 섞지 않고 제외했습니다.",
+                ));
+                continue;
+            }
+            if let Err(error) = validate_session_id(&meta.id) {
+                issues.push(crate::harness_import::HarnessImportIssue::new(
+                    "sessions",
+                    record_path.to_string_lossy().into_owned(),
+                    format!("matching session record has an unsafe id: {error}"),
+                ));
+                continue;
+            }
+            let record = match store.load_unlocked_strict(&meta.id) {
+                Ok(record) => record,
+                Err(error) => {
+                    issues.push(crate::harness_import::HarnessImportIssue::new(
+                        "sessions",
+                        record_path.to_string_lossy().into_owned(),
+                        format!("matching session record is unavailable: {error}"),
+                    ));
+                    continue;
+                }
+            };
+            if let Err(error) = validate_index_record(meta, &record) {
+                issues.push(crate::harness_import::HarnessImportIssue::new(
+                    "sessions",
+                    record_path.to_string_lossy().into_owned(),
+                    format!("matching session record metadata is unsafe: {error}"),
+                ));
+                continue;
+            }
+            matches.push(record);
+        }
+        if matches.is_empty() {
+            if legacy_map_id.is_none() {
+                eprintln!(
+                    "eud-agent: legacy map history was not imported; source project identity is not linkable"
+                );
+            }
+            return Ok(empty_session_import());
+        }
+
+        let mut owned_records = Vec::with_capacity(matches.len());
+        let mut owned_meta = Vec::with_capacity(matches.len());
+        let mut used_ids = index
+            .sessions
+            .iter()
+            .map(|meta| meta.id.clone())
+            .collect::<BTreeSet<_>>();
+        for mut source in matches {
+            let meta_source_id = source.meta.id.clone();
+            let id = loop {
+                let id = new_session_id();
+                validate_session_id(&id)?;
+                if used_ids.insert(id.clone()) && !path_exists_any(&store.record_path(&id)) {
+                    break id;
+                }
+            };
+            let kind = source.meta.kind;
+            source.meta.id = id;
+            source.meta.project = if kind == SessionKind::Eps {
+                target_eps.clone()
+            } else {
+                target_map.clone()
+            };
+            source.provider_binding.conversation =
+                crate::provider::ProviderConversationState::empty(source.provider_binding.provider);
+            source.pending_request_ids.clear();
+            source.context_usage = None;
+            source.context_state = Default::default();
+            source.task_state = Default::default();
+            source.meta.provider = source.provider_binding.provider;
+            source.meta.model = source.provider_binding.model.clone();
+            let bytes = match serde_json::to_vec_pretty(&source) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    return Err(abort_import(owned_records, owned_meta, error.into()));
+                }
+            };
+            let path = store.record_path(&source.meta.id);
+            let mut file = match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(file) => file,
+                Err(error) => {
+                    issues.push(crate::harness_import::HarnessImportIssue::new(
+                        "sessions",
+                        store.record_path(&meta_source_id).to_string_lossy(),
+                        format!("대화 사본을 만들 수 없습니다: {error}"),
+                    ));
+                    continue;
+                }
+            };
+            // New IDs are invisible to consumers until the index is published.
+            // Exclusive creation prevents replacing a concurrently created record.
+            use std::io::Write;
+            if let Err(error) = file.write_all(&bytes).and_then(|_| file.sync_all()) {
+                drop(file);
+                if let Err(cleanup) = fs::remove_file(&path) {
+                    return Err(abort_import(
+                        owned_records,
+                        owned_meta,
+                        anyhow::anyhow!("{error}; incomplete session cleanup failed: {cleanup}"),
+                    ));
+                }
+                issues.push(crate::harness_import::HarnessImportIssue::new(
+                    "sessions",
+                    store.record_path(&meta_source_id).to_string_lossy(),
+                    format!("대화 사본을 저장하지 못했습니다: {error}"),
+                ));
+                continue;
+            }
+            owned_records.push((path, bytes));
+            owned_meta.push(source.meta.clone());
+            index.sessions.push(source.meta);
+        }
+        if owned_records.is_empty() {
+            return Ok(empty_session_import());
+        }
+        index.schema_version = SCHEMA_VERSION;
+        sort_sessions(&mut index.sessions);
+        if let Err(error) = write_index_at(&index_path, &index) {
+            let mut rollback = LegacySessionImport {
+                owned_records,
+                owned_meta,
+                committed: false,
+            };
+            return match rollback.rollback_inner_locked() {
+                Ok(()) => {
+                    issues.push(crate::harness_import::HarnessImportIssue::new(
+                        "sessions",
+                        index_path.to_string_lossy().into_owned(),
+                        format!("session index publication failed: {error}"),
+                    ));
+                    Ok(empty_session_import())
+                }
+                Err(rollback_error) => Err(anyhow::anyhow!(
+                    "{error}; rollback failed: {rollback_error}"
+                )),
+            };
+        }
+        Ok(LegacySessionImport {
+            owned_records,
+            owned_meta,
+            committed: false,
+        })
+    }
+
     /// The session list, sorted by the latest user conversation. A missing or
     /// corrupt `index.json` yields `[]` (never crash startup).
     pub fn list(&self) -> anyhow::Result<Vec<SessionMeta>> {
@@ -495,7 +860,30 @@ impl SessionStore {
         let path = self.record_path(id);
         let bytes = std::fs::read(&path)
             .map_err(|err| anyhow::anyhow!("session '{id}' not found: {err}"))?;
-        let bytes = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(&bytes);
+        self.decode_record(id, &bytes, true)
+    }
+
+    fn load_unlocked_strict(&self, id: &str) -> anyhow::Result<SessionRecord> {
+        let path = self.record_path(id);
+        let metadata = fs::symlink_metadata(&path)?;
+        if !metadata.is_file()
+            || metadata.file_type().is_symlink()
+            || crate::memory::is_reparse_point(&metadata)
+        {
+            anyhow::bail!("session '{id}' is not a regular non-symlink file");
+        }
+        let bytes = std::fs::read(&path)
+            .map_err(|err| anyhow::anyhow!("session '{id}' not found: {err}"))?;
+        self.decode_record(id, &bytes, false)
+    }
+
+    fn decode_record(
+        &self,
+        id: &str,
+        bytes: &[u8],
+        repair_task_state: bool,
+    ) -> anyhow::Result<SessionRecord> {
+        let bytes = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes);
         let wire: SessionRecordWire = serde_json::from_slice(bytes)
             .map_err(|err| anyhow::anyhow!("session '{id}' is corrupt: {err}"))?;
         let fallback_model = self
@@ -546,6 +934,9 @@ impl SessionStore {
             task_state: wire.task_state,
         };
         if let Err(error) = record.task_state.repair_cache() {
+            if !repair_task_state {
+                anyhow::bail!("session '{id}' task state is corrupt: {error}");
+            }
             eprintln!("eud-agent: session '{id}' task-state replay failed: {error}");
             let events = std::mem::take(&mut record.task_state.events);
             let audits = std::mem::take(&mut record.task_state.promotion_audits);
@@ -575,9 +966,7 @@ impl SessionStore {
     }
 
     fn write_index(&self, index: &SessionIndex) -> anyhow::Result<()> {
-        let bytes = serde_json::to_vec_pretty(index)?;
-        write_atomic_bytes(&self.sessions_dir.join(INDEX_FILE), &bytes)?;
-        Ok(())
+        write_index_at(&self.sessions_dir.join(INDEX_FILE), index)
     }
 
     /// Upsert `meta` and retain latest-conversation-first index ordering.
@@ -615,6 +1004,158 @@ impl SessionStore {
         index.schema_version = SCHEMA_VERSION;
         self.write_index(&index)
     }
+}
+
+fn write_index_at(path: &Path, index: &SessionIndex) -> anyhow::Result<()> {
+    let bytes = serde_json::to_vec_pretty(index)?;
+    write_atomic_bytes(path, &bytes)?;
+    Ok(())
+}
+
+fn read_strict_index_from(path: &Path) -> std::io::Result<SessionIndex> {
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.is_file()
+        || metadata.file_type().is_symlink()
+        || crate::memory::is_reparse_point(&metadata)
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "session index must be a regular non-symlink file",
+        ));
+    }
+    let bytes = fs::read(path)?;
+    let bytes = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(&bytes);
+    let index: SessionIndex = serde_json::from_slice(bytes).map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("session index is corrupt: {error}"),
+        )
+    })?;
+    if index.schema_version > SCHEMA_VERSION {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "session index schema is newer than this application",
+        ));
+    }
+    Ok(index)
+}
+
+fn validate_index_entries(index: &SessionIndex) -> anyhow::Result<()> {
+    let mut ids = BTreeSet::new();
+    for meta in &index.sessions {
+        validate_session_id(&meta.id)?;
+        if !ids.insert(meta.id.clone()) {
+            anyhow::bail!("session index contains duplicate ids");
+        }
+    }
+    Ok(())
+}
+
+fn validate_index_record(meta: &SessionMeta, record: &SessionRecord) -> anyhow::Result<()> {
+    if meta.id != record.meta.id
+        || meta.name != record.meta.name
+        || meta.project != record.meta.project
+        || meta.kind != record.meta.kind
+        || meta.created_at != record.meta.created_at
+        || meta.last_conversation_at != record.meta.last_conversation_at
+        || (meta.provider != record.meta.provider && !meta.model.is_empty())
+        || (!meta.model.is_empty() && meta.model != record.meta.model)
+    {
+        anyhow::bail!("legacy session index metadata does not match its record");
+    }
+    Ok(())
+}
+
+fn validate_session_id(id: &str) -> anyhow::Result<()> {
+    if id.is_empty()
+        || id.len() > 128
+        || !id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        anyhow::bail!("session id is not a safe path component");
+    }
+    Ok(())
+}
+
+fn path_exists_any(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok()
+}
+
+fn ensure_session_directory(path: &Path) -> std::io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if !metadata.is_dir()
+                || metadata.file_type().is_symlink()
+                || crate::memory::is_reparse_point(&metadata)
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "session store path is not a plain directory",
+                ));
+            }
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if let Some(parent) = path.parent() {
+                ensure_session_directory(parent)?;
+            }
+            fs::create_dir(path)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn unquote_legacy_path(value: &str) -> &str {
+    let value = value.trim();
+    value
+        .strip_prefix('\'')
+        .and_then(|value| value.strip_suffix('\''))
+        .map(str::trim)
+        .unwrap_or(value)
+}
+
+fn is_absolute_path_like(value: &str) -> bool {
+    let path = Path::new(value);
+    path.is_absolute()
+        || value.starts_with('/')
+        || value.starts_with('\\')
+        || value.as_bytes().get(1).is_some_and(|byte| *byte == b':')
+}
+
+fn legacy_path_key(value: &str) -> Option<String> {
+    let value = unquote_legacy_path(value);
+    if value.is_empty() || !is_absolute_path_like(value) {
+        return None;
+    }
+    let path = PathBuf::from(value);
+    let path = fs::canonicalize(&path).unwrap_or(path);
+    Some(crate::config::RecentProjectRecord::key(
+        path.to_string_lossy().as_ref(),
+    ))
+}
+
+fn legacy_map_project_id(source_project: &str) -> Option<String> {
+    let value = unquote_legacy_path(source_project);
+    if value.is_empty() || !is_absolute_path_like(value) {
+        return None;
+    }
+    let path = PathBuf::from(value);
+    let path = fs::canonicalize(&path).unwrap_or(path);
+    let identity = path.to_string_lossy().to_lowercase();
+    Some(crate::map_model::hex_sha256(identity.as_bytes()))
+}
+
+fn validate_source_e3s(path: &Path) -> anyhow::Result<()> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| anyhow::anyhow!("legacy E3S source is unavailable: {error}"))?;
+    if !metadata.is_file()
+        || metadata.file_type().is_symlink()
+        || crate::memory::is_reparse_point(&metadata)
+    {
+        anyhow::bail!("legacy E3S source must be a regular non-symlink file");
+    }
+    Ok(())
 }
 
 fn last_client_turn_id(panel_log: &serde_json::Value) -> Option<String> {
@@ -748,6 +1289,289 @@ mod tests {
             context_state: Default::default(),
             task_state: Default::default(),
         }
+    }
+    fn import_fixture(
+        tag: &str,
+    ) -> (
+        PathBuf,
+        SessionStore,
+        PathBuf,
+        crate::native_project::NativeProject,
+    ) {
+        let (base, store) = store(tag);
+        let source = base.join("legacy.e3s");
+        fs::write(&source, b"legacy source").unwrap();
+        let root = base.join("native");
+        fs::create_dir_all(root.join("maps")).unwrap();
+        fs::write(root.join("maps/source.scx"), b"map").unwrap();
+        let target = crate::native_project::NativeProject::create(
+            &root,
+            crate::native_project::ProjectManifest {
+                schema_version: crate::native_project::PROJECT_SCHEMA_VERSION,
+                name: "Imported".to_string(),
+                source_map: "maps/source.scx".to_string(),
+                output_map: "build/output.scx".to_string(),
+                main_file: "src/main.eps".to_string(),
+                settings: Default::default(),
+                plugins: Vec::new(),
+                python_entrypoints: Vec::new(),
+                python_dependencies: Vec::new(),
+                python_lock: None,
+                editor_compatibility: None,
+            },
+        )
+        .unwrap();
+        (base, store, source, target)
+    }
+
+    #[test]
+    fn legacy_import_preserves_eps_and_map_history_without_runtime_or_other_projects() {
+        let (base, store, source, target) = import_fixture("import-history");
+        let source_name = source.to_string_lossy();
+        let mut eps = sample_record(&new_session_id(), "기존 대화");
+        eps.meta.project = format!("'{source_name}'");
+        eps.context_usage = Some(sample_usage());
+        eps.context_state.instruction_epoch = 42;
+        store.save(&eps).unwrap();
+        let mut map = eps.clone();
+        map.meta.id = new_session_id();
+        map.meta.name = "기존 맵 대화".to_string();
+        map.meta.kind = SessionKind::Map;
+        let canonical = source
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .to_lowercase();
+        map.meta.project = crate::map_model::hex_sha256(canonical.as_bytes());
+        store.save(&map).unwrap();
+        let mut unrelated = eps.clone();
+        unrelated.meta.id = new_session_id();
+        unrelated.meta.project = format!("'{}'", base.join("other/legacy.e3s").display());
+        store.save(&unrelated).unwrap();
+        let originals = [&eps, &map, &unrelated].map(|record| {
+            (
+                store.record_path(&record.meta.id),
+                fs::read(store.record_path(&record.meta.id)).unwrap(),
+            )
+        });
+
+        let mut issues = Vec::new();
+        SessionStore::import_legacy_harness(
+            &store.dirs,
+            &source,
+            &source_name,
+            &target,
+            &mut issues,
+        )
+        .unwrap()
+        .commit();
+        assert!(issues.is_empty());
+        let target_map = crate::map_context::project_id_for_path(target.root().to_path_buf());
+        let imported = store
+            .list()
+            .unwrap()
+            .into_iter()
+            .filter(|meta| meta.project == "Imported" || meta.project == target_map)
+            .collect::<Vec<_>>();
+        assert_eq!(imported.len(), 2);
+        for meta in imported {
+            let copied = store.load(&meta.id).unwrap();
+            let original = if meta.kind == SessionKind::Eps {
+                &eps
+            } else {
+                &map
+            };
+            assert_ne!(meta.id, original.meta.id);
+            assert_eq!(meta.name, original.meta.name);
+            assert_eq!(
+                meta.last_conversation_at,
+                original.meta.last_conversation_at
+            );
+            assert_eq!(copied.panel_log, original.panel_log);
+            let mut binding = original.provider_binding.clone();
+            binding.conversation =
+                crate::provider::ProviderConversationState::empty(binding.provider);
+            assert_eq!(copied.provider_binding, binding);
+            assert!(copied.pending_request_ids.is_empty());
+            assert!(copied.context_usage.is_none());
+            assert_eq!(copied.context_state, Default::default());
+            assert_eq!(copied.task_state, Default::default());
+        }
+        for (path, bytes) in originals {
+            assert_eq!(fs::read(path).unwrap(), bytes);
+        }
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn occupied_eps_history_does_not_block_importable_map_history() {
+        let (base, store, source, target) = import_fixture("occupied-eps");
+        let source_name = source.to_string_lossy();
+        let mut eps = sample_record(&new_session_id(), "원본 EPS 대화");
+        eps.meta.project = source_name.to_string();
+        store.save(&eps).unwrap();
+        let mut map = eps.clone();
+        map.meta.id = new_session_id();
+        map.meta.kind = SessionKind::Map;
+        map.meta.project = legacy_map_project_id(&source_name).unwrap();
+        store.save(&map).unwrap();
+        let mut existing = sample_record(&new_session_id(), "기존 대상 대화");
+        existing.meta.project = target.manifest().name.clone();
+        store.save(&existing).unwrap();
+        let original = fs::read(store.record_path(&existing.meta.id)).unwrap();
+        let mut issues = Vec::new();
+        SessionStore::import_legacy_harness(
+            &store.dirs,
+            &source,
+            &source_name,
+            &target,
+            &mut issues,
+        )
+        .unwrap()
+        .commit();
+        assert_eq!(issues.len(), 1);
+        assert_eq!(
+            issues[0].path,
+            store.record_path(&eps.meta.id).to_string_lossy()
+        );
+        let target_map = crate::map_context::project_id_for_path(target.root().to_path_buf());
+        let copied = store
+            .list()
+            .unwrap()
+            .into_iter()
+            .find(|meta| meta.kind == SessionKind::Map && meta.project == target_map)
+            .unwrap();
+        assert_eq!(store.load(&copied.id).unwrap().panel_log, map.panel_log);
+        assert_eq!(
+            fs::read(store.record_path(&existing.meta.id)).unwrap(),
+            original
+        );
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn legacy_import_rollback_preserves_concurrent_history_and_partial_corruption() {
+        let (base, store, source, target) = import_fixture("import-rollback");
+        let source_name = source.to_string_lossy();
+        let mut record = sample_record(&new_session_id(), "원본");
+        record.meta.project = format!("'{source_name}'");
+        store.save(&record).unwrap();
+        let original = fs::read(store.record_path(&record.meta.id)).unwrap();
+        let mut issues = Vec::new();
+        let guard = SessionStore::import_legacy_harness(
+            &store.dirs,
+            &source,
+            &source_name,
+            &target,
+            &mut issues,
+        )
+        .unwrap();
+        assert!(issues.is_empty());
+        let copied_ids = store
+            .list()
+            .unwrap()
+            .into_iter()
+            .filter(|meta| meta.project == "Imported")
+            .map(|meta| meta.id)
+            .collect::<Vec<_>>();
+        assert_eq!(copied_ids.len(), 1);
+        let concurrent = sample_record(&new_session_id(), "다른 프로젝트 대화");
+        store.save(&concurrent).unwrap();
+        guard.rollback().unwrap();
+        assert!(copied_ids.iter().all(|id| !store.record_path(id).exists()));
+        assert_eq!(store.list().unwrap().len(), 2);
+        assert_eq!(store.load(&concurrent.meta.id).unwrap(), concurrent);
+        assert_eq!(
+            fs::read(store.record_path(&record.meta.id)).unwrap(),
+            original
+        );
+        fs::write(store.record_path(&record.meta.id), b"not json").unwrap();
+        let mut healthy = sample_record(&new_session_id(), "건강한 형제");
+        healthy.meta.project = format!("'{source_name}'");
+        store.save(&healthy).unwrap();
+        let healthy_original = fs::read(store.record_path(&healthy.meta.id)).unwrap();
+
+        let mut issues = Vec::new();
+        SessionStore::import_legacy_harness(
+            &store.dirs,
+            &source,
+            &source_name,
+            &target,
+            &mut issues,
+        )
+        .unwrap()
+        .commit();
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].scope, "sessions");
+        assert_eq!(
+            issues[0].path,
+            store.record_path(&record.meta.id).to_string_lossy()
+        );
+        let imported_ids = store
+            .list()
+            .unwrap()
+            .into_iter()
+            .filter(|meta| meta.project == "Imported")
+            .map(|meta| meta.id)
+            .collect::<Vec<_>>();
+        assert_eq!(imported_ids.len(), 1);
+        assert_eq!(
+            store.load(&imported_ids[0]).unwrap().panel_log,
+            healthy.panel_log
+        );
+        assert_eq!(
+            fs::read(store.record_path(&record.meta.id)).unwrap(),
+            b"not json"
+        );
+        assert_eq!(store.load(&healthy.meta.id).unwrap(), healthy);
+        assert_eq!(
+            fs::read(store.record_path(&healthy.meta.id)).unwrap(),
+            healthy_original
+        );
+
+        assert_eq!(store.list().unwrap().len(), 4);
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn legacy_import_index_publication_failure_removes_copies_without_deadlocking() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let (base, store, source, target) = import_fixture("import-index-locked");
+        let source_name = source.to_string_lossy();
+        let mut record = sample_record(&new_session_id(), "원본");
+        record.meta.project = format!("'{source_name}'");
+        store.save(&record).unwrap();
+        let index_path = store.sessions_dir.join(INDEX_FILE);
+        let original_index = fs::read(&index_path).unwrap();
+        let original_record = fs::read(store.record_path(&record.meta.id)).unwrap();
+        let index_handle = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(1)
+            .open(&index_path)
+            .unwrap();
+        let mut issues = Vec::new();
+        SessionStore::import_legacy_harness(
+            &store.dirs,
+            &source,
+            &source_name,
+            &target,
+            &mut issues,
+        )
+        .unwrap()
+        .commit();
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].scope, "sessions");
+        assert_eq!(issues[0].path, index_path.to_string_lossy());
+        assert_eq!(fs::read(&index_path).unwrap(), original_index);
+        assert_eq!(
+            fs::read(store.record_path(&record.meta.id)).unwrap(),
+            original_record
+        );
+        assert_eq!(store.list().unwrap(), vec![record.meta]);
+        assert_eq!(fs::read_dir(&store.sessions_dir).unwrap().count(), 2);
+        drop(index_handle);
+        fs::remove_dir_all(base).unwrap();
     }
 
     fn sample_usage() -> ContextUsage {

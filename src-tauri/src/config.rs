@@ -1,9 +1,10 @@
 //! Native runtime configuration and app data-directory resolution.
 //!
-//! - Roaming `%APPDATA%/eud-agent`: config, memory, journals, sessions, backups.
+//! - Roaming `%APPDATA%/eud-agent`: config, journals, sessions, backups, and
+//!   explicit legacy-import sources.
 //! - Local `%LOCALAPPDATA%/eud-agent`: models, RAG, logs, attachments, analyzer
 //!   mirrors, media tools, and native compatibility assets.
-//! - Canonical project state stays in the configured `project_path`.
+//! - Canonical project memory/wiki state stays in `<project>/.eud-agent/memory`.
 //!
 //! `config.json` is atomic UTF-8 without BOM. Large/regenerable assets never
 //! live in Roaming.
@@ -16,6 +17,36 @@ use serde::{Deserialize, Serialize};
 
 const APP_DIR_NAME: &str = "eud-agent";
 const CONFIG_FILE_NAME: &str = "config.json";
+pub const MAX_RECENT_PROJECTS: usize = 20;
+
+/// Serializes project selection/history read-modify-write operations across managers.
+pub(crate) static PROJECT_CONFIG_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+/// One durable project-launch history entry. Availability is probed from the
+/// canonical project root when the launcher asks for its list and is therefore
+/// intentionally not persisted here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecentProjectRecord {
+    pub name: String,
+    pub path: String,
+    pub last_opened_at: u64,
+}
+
+impl RecentProjectRecord {
+    pub fn key(path: &str) -> String {
+        let normalized = path.replace('\\', "/").to_lowercase();
+        let normalized = if let Some(unc) = normalized.strip_prefix("//?/unc/") {
+            format!("//{unc}")
+        } else {
+            normalized
+                .strip_prefix("//?/")
+                .unwrap_or(&normalized)
+                .to_string()
+        };
+        normalized.trim_end_matches('/').to_string()
+    }
+}
 
 /// A downloadable, sha256-verified asset (the bge-m3 model or the RAG index).
 ///
@@ -84,7 +115,7 @@ const fn config_schema_version() -> u32 {
 pub struct Config {
     #[serde(default = "config_schema_version")]
     pub schema_version: u32,
-    /// Absolute root of the active native EUD project (`project.json`).
+    /// Absolute root of the active native EUD project (containing its `.eap` manifest).
     #[serde(default)]
     pub project_path: String,
     /// `euddraft.exe`, `euddraft.py`, or an euddraft source-repository root.
@@ -103,6 +134,12 @@ pub struct Config {
     pub model: AssetSpec,
     #[serde(default)]
     pub rag_index: AssetSpec,
+    /// Recently opened native project roots, newest first.
+    #[serde(default)]
+    pub project_recents: Vec<RecentProjectRecord>,
+    /// Distinguishes first-run migration from an intentionally emptied history.
+    #[serde(default)]
+    pub project_recents_initialized: bool,
 }
 
 impl Default for Config {
@@ -117,7 +154,53 @@ impl Default for Config {
             notifications: NotificationSettings::default(),
             model: AssetSpec::default(),
             rag_index: AssetSpec::default(),
+            project_recents: Vec::new(),
+            project_recents_initialized: false,
         }
+    }
+}
+
+impl Config {
+    /// Add an explicitly opened project to bounded, newest-first history.
+    pub fn record_recent_project(&mut self, name: String, path: String, now: u64) {
+        let key = RecentProjectRecord::key(&path);
+        self.project_recents
+            .retain(|entry| RecentProjectRecord::key(&entry.path) != key);
+        let newest = self
+            .project_recents
+            .iter()
+            .map(|entry| entry.last_opened_at)
+            .max()
+            .unwrap_or_default();
+        self.project_recents.insert(
+            0,
+            RecentProjectRecord {
+                name,
+                path,
+                last_opened_at: now.max(newest.saturating_add(1)),
+            },
+        );
+        self.project_recents.truncate(MAX_RECENT_PROJECTS);
+        self.project_recents_initialized = true;
+    }
+
+    /// Canonicalize duplicate aliases while preserving the newest record.
+    pub fn normalize_recent_projects(&mut self) -> bool {
+        let before = self.project_recents.clone();
+        self.project_recents
+            .sort_by(|left, right| right.last_opened_at.cmp(&left.last_opened_at));
+        let mut seen = BTreeSet::new();
+        self.project_recents
+            .retain(|entry| seen.insert(RecentProjectRecord::key(&entry.path)));
+        self.project_recents.truncate(MAX_RECENT_PROJECTS);
+        self.project_recents != before
+    }
+
+    pub fn remove_recent_project(&mut self, path: &str) {
+        let key = RecentProjectRecord::key(path);
+        self.project_recents
+            .retain(|entry| RecentProjectRecord::key(&entry.path) != key);
+        self.project_recents_initialized = true;
     }
 }
 
@@ -226,9 +309,27 @@ impl DataDirs {
     pub fn resolve<R: tauri::Runtime, M: tauri::Manager<R>>(
         manager: &M,
     ) -> Result<Self, tauri::Error> {
+        // Repeatable debug QA must not depend on platform AppData environment handling.
+        #[cfg(debug_assertions)]
+        if let Some(root) = std::env::var_os("EUD_AGENT_TEST_DATA_ROOT") {
+            return Ok(Self::from_test_data_root(Path::new(&root))?);
+        }
         let roaming = manager.path().data_dir()?;
         let local = manager.path().local_data_dir()?;
         Ok(Self::from_bases(&roaming, &local))
+    }
+
+    /// Debug QA stores app data under `<root>/roaming` and `<root>/local`.
+    /// Invalid explicit roots fail closed before resolving any user directories.
+    #[cfg(debug_assertions)]
+    fn from_test_data_root(root: &Path) -> std::io::Result<Self> {
+        if !root.is_absolute() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "EUD_AGENT_TEST_DATA_ROOT must be a nonempty absolute path",
+            ));
+        }
+        Ok(Self::from_bases(&root.join("roaming"), &root.join("local")))
     }
 
     /// `%appdata%\eud-agent\`.
@@ -246,30 +347,30 @@ impl DataDirs {
         self.app_data.join(CONFIG_FILE_NAME)
     }
 
-    /// `%appdata%\eud-agent\memory`.
+    /// `%appdata%\eud-agent\memory` legacy-import source root.
+    ///
+    /// Live project memory is resolved from the validated native project root;
+    /// this path is retained solely for explicit migration/import operations.
     pub fn memory_dir(&self) -> PathBuf {
         self.app_data.join("memory")
     }
 
-    /// `%appdata%\eud-agent\workspaces` — durable, per-project Codex workspaces.
-    ///
-    /// Each project directory is the Codex thread cwd: agent-authored project
-    /// documents are writable, while the generated `source/` mirror is read-only
-    /// under the Codex split-filesystem permission profile.
+    /// `%appdata%\eud-agent\workspaces` — preserved legacy import sources and
+    /// machine-local session working roots. Accepted documents now live under
+    /// the selected project's `.eud-agent/workspace`.
     pub fn workspaces_dir(&self) -> PathBuf {
         self.app_data.join("workspaces")
     }
 
-    /// Session-owned working roots. Canonical accepted project workspaces remain
-    /// direct children of `workspaces/` and are never used as a writable Codex cwd.
+    /// Session-owned Codex working roots. Generated source mirrors and writable
+    /// turn copies stay machine-local, separate from accepted project documents.
     pub fn session_workspaces_dir(&self) -> PathBuf {
         self.workspaces_dir().join(".sessions")
     }
 
-    /// Parent-owned workspace state (turn baselines and trusted metadata).
-    ///
-    /// This is a sibling of project cwd directories, never a descendant, so a
-    /// sandboxed Codex process cannot rewrite acceptance state or rollback data.
+    /// Parent-owned turn baselines and preserved legacy trusted-state sources.
+    /// Live approval metadata is in the project's `.eud-agent/state`, outside
+    /// the session Codex cwd and its writable document tree.
     pub fn workspace_state_dir(&self) -> PathBuf {
         self.workspaces_dir().join(".state")
     }
@@ -288,17 +389,22 @@ impl DataDirs {
         self.app_local_data.join("map_imports")
     }
 
-    /// `%appdata%\eud-agent\memory\<sanitized-project>\wiki` — the dat-edit ledger
-    /// dir for `project`. Derived from [`Self::memory_dir`] + the SAME
-    /// [`crate::memory::sanitize_project_name`] so the wiki lands beside the
-    /// project's memory dir. Returns `None` for an empty/whitespace project name
-    /// (mirrors the disabled-store behavior of [`crate::memory::ProjectMemory`]).
+    /// `<native-root>\.eud-agent\memory\wiki` for the currently configured
+    /// native project. The supplied project name must match the validated
+    /// manifest; this prevents a stale caller from selecting another
+    /// same-name project. `None` means no validated current project.
     pub fn wiki_dir(&self, project: &str) -> Option<PathBuf> {
-        let sanitized = crate::memory::sanitize_project_name(project);
-        if sanitized.is_empty() {
+        if project.trim().is_empty() {
             return None;
         }
-        Some(self.memory_dir().join(sanitized).join("wiki"))
+        let configured = self.load_config().ok()?.project_path;
+        if configured.trim().is_empty() {
+            return None;
+        }
+        let native =
+            crate::native_project::NativeProject::open(Path::new(configured.trim())).ok()?;
+        (native.manifest().name == project)
+            .then(|| native.root().join(".eud-agent").join("memory").join("wiki"))
     }
 
     /// `%appdata%\eud-agent\journal`.
@@ -329,6 +435,31 @@ impl DataDirs {
     /// `%localappdata%\eud-agent\rag`.
     pub fn rag_dir(&self) -> PathBuf {
         self.app_local_data.join("rag")
+    }
+
+    /// `%localappdata%\eud-agent\euddraft` — complete managed release distributions.
+    pub fn euddraft_dir(&self) -> PathBuf {
+        self.app_local_data.join("euddraft")
+    }
+
+    /// `%localappdata%\eud-agent\uv` — versioned, checksum-pinned uv distributions.
+    pub fn uv_dir(&self) -> PathBuf {
+        self.app_local_data.join("uv")
+    }
+
+    /// One immutable managed uv distribution below [`Self::uv_dir`].
+    pub fn managed_uv_dir(&self, version: &str) -> PathBuf {
+        self.uv_dir().join(version)
+    }
+
+    /// `%localappdata%\eud-agent\python-downloads` — content-addressed wheel files.
+    pub fn python_downloads_dir(&self) -> PathBuf {
+        self.app_local_data.join("python-downloads")
+    }
+
+    /// `%localappdata%\eud-agent\python-envs` — immutable, verified project environments.
+    pub fn python_envs_dir(&self) -> PathBuf {
+        self.app_local_data.join("python-envs")
     }
 
     /// `%localappdata%\eud-agent\bin` — app-installed executables (the codex
@@ -423,6 +554,10 @@ impl DataDirs {
             self.app_local_data.clone(),
             self.models_dir(),
             self.rag_dir(),
+            self.euddraft_dir(),
+            self.uv_dir(),
+            self.python_downloads_dir(),
+            self.python_envs_dir(),
             self.bin_dir(),
             self.providers_dir(),
             self.codex_bin_dir(),
@@ -505,6 +640,46 @@ mod tests {
     use super::*;
     use std::fs;
     use std::path::PathBuf;
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn test_data_dirs_use_isolated_bases_when_root_is_absolute() {
+        // Given an absolute root without creating directories or changing global environment.
+        let root = std::env::temp_dir().join("eud-agent-isolated-data-root");
+
+        // When debug QA resolves that root.
+        let dirs = DataDirs::from_test_data_root(&root).unwrap();
+
+        // Then both app data bases are confined to the supplied root.
+        assert_eq!(dirs.app_data(), root.join("roaming").join("eud-agent"));
+        assert_eq!(dirs.app_local_data(), root.join("local").join("eud-agent"));
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn test_data_dirs_reject_relative_root_without_falling_back() {
+        // Given a relative root.
+        let root = Path::new("isolated-data");
+
+        // When debug QA resolves that root.
+        let error = DataDirs::from_test_data_root(root).unwrap_err();
+
+        // Then resolution fails instead of returning user data directories.
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn test_data_dirs_reject_empty_root_without_falling_back() {
+        // Given an explicitly empty root.
+        let root = Path::new("");
+
+        // When debug QA resolves that root.
+        let error = DataDirs::from_test_data_root(root).unwrap_err();
+
+        // Then resolution fails instead of returning user data directories.
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    }
 
     /// Unique temp base dir for a test, avoiding a `tempfile` dev-dependency
     /// (Cargo.toml is out of scope for this task).
@@ -686,6 +861,8 @@ mod tests {
         object.remove("project_path");
         object.remove("euddraft_path");
         object.remove("starcraft_path");
+        object.remove("project_recents");
+        object.remove("project_recents_initialized");
         fs::write(dirs.config_path(), serde_json::to_vec(&legacy).unwrap()).unwrap();
 
         let migrated = dirs.load_config().unwrap();
@@ -747,6 +924,10 @@ mod tests {
         assert!(dirs.app_local_data().is_dir());
         assert!(dirs.models_dir().is_dir());
         assert!(dirs.rag_dir().is_dir());
+        assert!(dirs.euddraft_dir().is_dir());
+        assert!(dirs.uv_dir().is_dir());
+        assert!(dirs.python_downloads_dir().is_dir());
+        assert!(dirs.python_envs_dir().is_dir());
         assert!(dirs.logs_dir().is_dir());
         assert!(dirs.attachments_dir().is_dir());
         assert!(dirs.audio_sources_dir().is_dir());
@@ -772,6 +953,31 @@ mod tests {
     }
 
     #[test]
+    fn recent_projects_dedupe_aliases_using_newest_timestamp() {
+        let mut config = Config {
+            project_recents: vec![
+                RecentProjectRecord {
+                    name: "old".to_string(),
+                    path: "C:\\Work\\Demo".to_string(),
+                    last_opened_at: 10,
+                },
+                RecentProjectRecord {
+                    name: "new".to_string(),
+                    path: "c:/work/demo".to_string(),
+                    last_opened_at: 20,
+                },
+            ],
+            ..Config::default()
+        };
+        assert!(config.normalize_recent_projects());
+        assert_eq!(config.project_recents.len(), 1);
+        assert_eq!(config.project_recents[0].name, "new");
+        config.remove_recent_project("C:\\WORK\\DEMO");
+        assert!(config.project_recents.is_empty());
+        assert!(config.project_recents_initialized);
+    }
+
+    #[test]
     fn data_dirs_append_eud_agent_to_bases() {
         let dirs = DataDirs::from_bases(&PathBuf::from("C:\\roam"), &PathBuf::from("C:\\loc"));
         assert_eq!(dirs.app_data(), &PathBuf::from("C:\\roam\\eud-agent"));
@@ -784,19 +990,24 @@ mod tests {
             dirs.map_imports_dir(),
             PathBuf::from("C:\\loc\\eud-agent\\map_imports")
         );
+        assert_eq!(
+            dirs.managed_uv_dir("0.11.3"),
+            PathBuf::from("C:\\loc\\eud-agent\\uv\\0.11.3")
+        );
+        assert_eq!(
+            dirs.python_downloads_dir(),
+            PathBuf::from("C:\\loc\\eud-agent\\python-downloads")
+        );
+        assert_eq!(
+            dirs.python_envs_dir(),
+            PathBuf::from("C:\\loc\\eud-agent\\python-envs")
+        );
     }
 
     #[test]
-    fn wiki_dir_lives_beside_project_memory_and_disables_on_empty_name() {
+    fn wiki_dir_requires_validated_current_project() {
         let dirs = DataDirs::from_bases(&PathBuf::from("C:\\roam"), &PathBuf::from("C:\\loc"));
-        // Sanitized project name + `wiki` under the memory dir (beside memory/<project>).
-        assert_eq!(
-            dirs.wiki_dir("My<Project>"),
-            Some(PathBuf::from(
-                "C:\\roam\\eud-agent\\memory\\My_Project_\\wiki"
-            ))
-        );
-        // Empty/whitespace project name disables the wiki (mirrors memory).
+        assert_eq!(dirs.wiki_dir("My<Project>"), None);
         assert_eq!(dirs.wiki_dir("   "), None);
         assert_eq!(dirs.wiki_dir(""), None);
     }

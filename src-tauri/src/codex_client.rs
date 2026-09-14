@@ -12,7 +12,10 @@ use std::{
 use thiserror::Error;
 use tokio::time;
 
-use crate::ipc;
+use crate::{
+    ipc,
+    provider_runtime::{AgentTurnInput, WorkspaceAccess},
+};
 
 const APP_SERVER_STDERR_TAIL_LIMIT: usize = 4 * 1024;
 const APP_SERVER_EXIT_DIAGNOSTIC_WAIT: Duration = Duration::from_millis(50);
@@ -78,6 +81,31 @@ project_doc_max_bytes = 0\n";
     crate::provider_secrets::harden_private_path(&path)
 }
 
+#[derive(Debug, Clone)]
+pub struct CodexLaunchConfig {
+    pub executable: PathBuf,
+    pub executable_args: Vec<std::ffi::OsString>,
+    pub profile_dir: PathBuf,
+    pub large_context_models: std::collections::BTreeSet<String>,
+}
+
+pub fn resolve_codex_launch_config(
+    dirs: &crate::config::DataDirs,
+) -> Result<CodexLaunchConfig, AppServerError> {
+    ensure_codex_profile(dirs).map_err(AppServerError::new)?;
+    let config = dirs
+        .load_config()
+        .map_err(|_| AppServerError::new("provider_protocol_changed"))?;
+    let executable = resolve_codex_cmd_for(dirs, &config)
+        .map_err(|error| AppServerError::new(error.to_string()))?;
+    Ok(CodexLaunchConfig {
+        executable,
+        executable_args: Vec::new(),
+        profile_dir: dirs.codex_home_dir(),
+        large_context_models: config.providers.codex.large_context_models,
+    })
+}
+
 fn app_managed_codex_bin(bin_dir: &Path) -> Result<Option<PathBuf>, PathBuf> {
     let codex = bin_dir.join(crate::bootstrap::CODEX_BIN_FILENAME);
     if !codex.is_file() {
@@ -94,60 +122,14 @@ fn app_managed_codex_bin(bin_dir: &Path) -> Result<Option<PathBuf>, PathBuf> {
     Ok(Some(codex))
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WorkspaceAccess {
-    Read,
-    Write,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AgentTurnInput {
-    pub text: String,
-    pub image_paths: Vec<PathBuf>,
-    /// Session-owned per-project agent cwd. `None` retains the hermetic
-    /// read-only mode used by isolated protocol tests and non-project operations.
-    pub workspace_root: Option<PathBuf>,
-    pub workspace_access: WorkspaceAccess,
-    /// Optional JSON Schema constraining the final assistant message.
-    pub output_schema: Option<serde_json::Value>,
-    /// Fail the turn if the provider attempts any tool call.
-    pub forbid_tools: bool,
-}
-
-impl AgentTurnInput {
-    pub fn text(text: impl Into<String>) -> Self {
-        Self {
-            text: text.into(),
-            image_paths: Vec::new(),
-            workspace_root: None,
-            workspace_access: WorkspaceAccess::Read,
-            output_schema: None,
-            forbid_tools: false,
-        }
-    }
-
-    pub fn with_access(mut self, access: WorkspaceAccess) -> Self {
-        self.workspace_access = access;
-        self
-    }
-
-    pub fn with_output_schema(mut self, schema: serde_json::Value) -> Self {
-        self.output_schema = Some(schema);
-        self
-    }
-
-    pub fn without_tools(mut self) -> Self {
-        self.forbid_tools = true;
-        self
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub enum AppServerEvent {
     ThreadStarted {
         thread_id: String,
     },
-    TurnStarted,
+    TurnStarted {
+        turn_id: String,
+    },
     ReasoningDelta(String),
     AnswerDelta(String),
     ItemStarted {
@@ -162,12 +144,16 @@ pub enum AppServerEvent {
     /// webSearch) — carries the tool name + argument text so the panel can
     /// render a live Tool card (EUD-068 classification, ported from v1).
     ToolCallStarted {
+        item_id: Option<String>,
+        mcp_server: Option<String>,
         name: String,
         args: Option<String>,
     },
     /// The matching tool-like thread item completed — result text + status
     /// ("completed" vs failed/declined) for the Tool card flip.
     ToolCallCompleted {
+        item_id: Option<String>,
+        mcp_server: Option<String>,
         name: String,
         result: Option<String>,
         status: Option<String>,
@@ -179,6 +165,83 @@ pub enum AppServerEvent {
     TurnComplete,
     Error(String),
 }
+
+impl PartialEq for AppServerEvent {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::ThreadStarted { thread_id: left }, Self::ThreadStarted { thread_id: right }) => {
+                left == right
+            }
+            (Self::TurnStarted { turn_id: left }, Self::TurnStarted { turn_id: right }) => {
+                left == right
+            }
+            (Self::ContextCompactionStarted, Self::ContextCompactionStarted)
+            | (Self::ContextCompactionCompleted, Self::ContextCompactionCompleted)
+            | (Self::TurnComplete, Self::TurnComplete) => true,
+            (Self::ReasoningDelta(left), Self::ReasoningDelta(right))
+            | (Self::AnswerDelta(left), Self::AnswerDelta(right))
+            | (Self::Error(left), Self::Error(right)) => left == right,
+            (Self::ItemStarted { item_id: left }, Self::ItemStarted { item_id: right })
+            | (Self::ItemCompleted { item_id: left }, Self::ItemCompleted { item_id: right }) => {
+                left == right
+            }
+            (
+                Self::ToolCallStarted {
+                    item_id: left_id,
+                    mcp_server: left_server,
+                    name: left_name,
+                    args: left_args,
+                },
+                Self::ToolCallStarted {
+                    item_id: right_id,
+                    mcp_server: right_server,
+                    name: right_name,
+                    args: right_args,
+                },
+            ) => {
+                left_id == right_id
+                    && left_server == right_server
+                    && left_name == right_name
+                    && left_args == right_args
+            }
+            (
+                Self::ToolCallCompleted {
+                    item_id: left_id,
+                    mcp_server: left_server,
+                    name: left_name,
+                    result: left_result,
+                    status: left_status,
+                },
+                Self::ToolCallCompleted {
+                    item_id: right_id,
+                    mcp_server: right_server,
+                    name: right_name,
+                    result: right_result,
+                    status: right_status,
+                },
+            ) => {
+                left_id == right_id
+                    && left_server == right_server
+                    && left_name == right_name
+                    && left_result == right_result
+                    && left_status == right_status
+            }
+            (
+                Self::TokenUsageUpdated {
+                    turn_id: left_id,
+                    token_usage: left_usage,
+                },
+                Self::TokenUsageUpdated {
+                    turn_id: right_id,
+                    token_usage: right_usage,
+                },
+            ) => left_id == right_id && left_usage == right_usage,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for AppServerEvent {}
 
 #[derive(Debug, Clone)]
 pub struct AppServerError {
@@ -247,7 +310,7 @@ struct AppServerReadContext<W> {
     thread_started: std::sync::Arc<tokio::sync::Notify>,
     turn_completed: tokio::sync::broadcast::Sender<()>,
     transport: std::sync::Arc<AppServerTransportState>,
-    ask_runtime: Option<crate::tool_exec::SessionToolRuntime>,
+    native_tools_enabled: bool,
 }
 #[derive(Default)]
 struct AppServerTransportState {
@@ -255,6 +318,7 @@ struct AppServerTransportState {
     exit_detail: std::sync::Mutex<Option<String>>,
     stderr_tail: std::sync::Mutex<Vec<u8>>,
     exit_observed: tokio::sync::Notify,
+    closed_observed: tokio::sync::Notify,
 }
 
 impl AppServerTransportState {
@@ -265,6 +329,30 @@ impl AppServerTransportState {
     fn mark_closed(&self) {
         self.closed
             .store(true, std::sync::atomic::Ordering::Release);
+        self.closed_observed.notify_waiters();
+    }
+
+    async fn wait_closed(&self) {
+        loop {
+            let closed = self.closed_observed.notified();
+            tokio::pin!(closed);
+            closed.as_mut().enable();
+            if self.is_closed() {
+                return;
+            }
+            closed.await;
+        }
+    }
+
+    async fn wait_turn_completed(
+        &self,
+        completed: &mut tokio::sync::broadcast::Receiver<()>,
+    ) -> Result<(), AppServerError> {
+        tokio::select! {
+            biased;
+            result = completed.recv() => result.map_err(|error| AppServerError::new(format!("turn completion wait failed: {error}"))),
+            _ = self.wait_closed() => Err(AppServerError::new(self.failure_message("app-server transport closed while awaiting turn completion"))),
+        }
     }
 
     fn record_exit(&self, result: std::io::Result<std::process::ExitStatus>) {
@@ -341,7 +429,7 @@ impl AppServerTransportState {
             message.push_str("; stderr: ");
             message.push_str(stderr_tail);
         }
-        message.push_str("; app-server will restart automatically on the next request");
+        message.push_str("; app-server transport is closed");
         message
     }
 }
@@ -349,6 +437,7 @@ impl AppServerTransportState {
 struct AppServerProcess {
     waiter: tokio::task::JoinHandle<()>,
     stderr_reader: tokio::task::JoinHandle<()>,
+    _job: crate::provider_process::WindowsJob,
 }
 
 impl Drop for AppServerProcess {
@@ -371,6 +460,7 @@ pub struct CodexAppServerClient<R, W> {
     thread_started: std::sync::Arc<tokio::sync::Notify>,
     turn_completed: tokio::sync::broadcast::Sender<()>,
     transport: std::sync::Arc<AppServerTransportState>,
+    native_tools_enabled: bool,
     _process: Option<AppServerProcess>,
 }
 
@@ -383,13 +473,13 @@ where
         reader: R,
         writer: W,
     ) -> (Self, tokio::sync::mpsc::Receiver<AppServerEvent>) {
-        Self::new_with_stdio_and_ask_runtime(reader, writer, None)
+        Self::new_with_stdio_policy(reader, writer, true)
     }
 
-    fn new_with_stdio_and_ask_runtime(
+    fn new_with_stdio_policy(
         reader: R,
         writer: W,
-        ask_runtime: Option<crate::tool_exec::SessionToolRuntime>,
+        native_tools_enabled: bool,
     ) -> (Self, tokio::sync::mpsc::Receiver<AppServerEvent>) {
         let writer = std::sync::Arc::new(tokio::sync::Mutex::new(writer));
         let pending =
@@ -410,7 +500,7 @@ where
                 thread_started: std::sync::Arc::clone(&thread_started),
                 turn_completed: turn_completed.clone(),
                 transport: std::sync::Arc::clone(&transport),
-                ask_runtime,
+                native_tools_enabled,
             },
         ));
 
@@ -428,6 +518,7 @@ where
                 thread_started,
                 turn_completed,
                 transport,
+                native_tools_enabled,
                 _process: None,
             },
             events_rx,
@@ -573,6 +664,29 @@ where
         Ok(())
     }
 
+    pub(crate) async fn resume_for_compaction(
+        &mut self,
+        workspace_root: &Path,
+    ) -> Result<(), AppServerError> {
+        self.ensure_initialized().await?;
+        let thread_id = self
+            .current_thread_id()
+            .await
+            .ok_or_else(|| AppServerError::new("no saved Codex thread to compact"))?;
+        self.send_request(
+            "thread/resume",
+            thread_resume_params(
+                &thread_id,
+                Some(workspace_root),
+                self.mcp_server_url.as_deref(),
+                self.large_context_enabled,
+                self.native_tools_enabled,
+            )?,
+        )
+        .await?;
+        Ok(())
+    }
+
     pub async fn run_turn(&mut self, input: AgentTurnInput) -> Result<(), AppServerError> {
         let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(0_u64);
         let interrupted = self.run_turn_cancellable(input, cancel_rx, 0).await?;
@@ -592,6 +706,9 @@ where
         mut cancellation: tokio::sync::watch::Receiver<u64>,
         cancellation_generation: u64,
     ) -> Result<bool, AppServerError> {
+        if *cancellation.borrow_and_update() != cancellation_generation {
+            return Ok(true);
+        }
         self.ensure_initialized().await?;
 
         let mut turn_completed = self.turn_completed.subscribe();
@@ -605,6 +722,7 @@ where
                         input.workspace_root.as_deref(),
                         self.mcp_server_url.as_deref(),
                         self.large_context_enabled,
+                        self.native_tools_enabled,
                     )?,
                 )
                 .await?;
@@ -617,6 +735,7 @@ where
                         input.workspace_root.as_deref(),
                         self.mcp_server_url.as_deref(),
                         self.large_context_enabled,
+                        self.native_tools_enabled,
                     )?,
                 )
                 .await?;
@@ -669,39 +788,42 @@ where
                 serde_json::json!({"threadId": thread_id, "turnId": turn_id}),
             )
             .await?;
-            turn_completed.recv().await.map_err(|err| {
-                AppServerError::new(format!("interrupted turn completion wait failed: {err}"))
-            })?;
+            self.transport
+                .wait_turn_completed(&mut turn_completed)
+                .await?;
             return Ok(true);
         }
 
-        tokio::select! {
-            biased;
-            completed = turn_completed.recv() => {
-                completed.map_err(|err| {
-                    AppServerError::new(format!("turn completion wait failed: {err}"))
-                })?;
-                Ok(false)
-            }
-            changed = cancellation.changed() => {
-                if changed.is_err() {
-                    turn_completed.recv().await.map_err(|err| {
+        let transport = std::sync::Arc::clone(&self.transport);
+        loop {
+            tokio::select! {
+                biased;
+                completed = turn_completed.recv() => {
+                    completed.map_err(|err| {
                         AppServerError::new(format!("turn completion wait failed: {err}"))
                     })?;
                     return Ok(false);
                 }
-                let turn_id = turn_id.as_deref().ok_or_else(|| {
-                    AppServerError::new("turn/start response omitted turn.id; cannot interrupt")
-                })?;
-                self.send_request(
-                    "turn/interrupt",
-                    serde_json::json!({"threadId": thread_id, "turnId": turn_id}),
-                )
-                .await?;
-                turn_completed.recv().await.map_err(|err| {
-                    AppServerError::new(format!("interrupted turn completion wait failed: {err}"))
-                })?;
-                Ok(true)
+                _ = transport.wait_closed() => return Err(AppServerError::new(transport.failure_message("app-server transport closed while awaiting turn completion"))),
+                changed = cancellation.changed() => {
+                    if changed.is_err() {
+                        self.transport.wait_turn_completed(&mut turn_completed).await?;
+                        return Ok(false);
+                    }
+                    if *cancellation.borrow_and_update() == cancellation_generation {
+                        continue;
+                    }
+                    let turn_id = turn_id.as_deref().ok_or_else(|| {
+                        AppServerError::new("turn/start response omitted turn.id; cannot interrupt")
+                    })?;
+                    self.send_request(
+                        "turn/interrupt",
+                        serde_json::json!({"threadId": thread_id, "turnId": turn_id}),
+                    )
+                    .await?;
+                    self.transport.wait_turn_completed(&mut turn_completed).await?;
+                    return Ok(true);
+                }
             }
         }
     }
@@ -721,7 +843,10 @@ where
             if let Some(thread_id) = self.current_thread_id().await {
                 return Ok(thread_id);
             }
-            self.thread_started.notified().await;
+            tokio::select! {
+                _ = self.thread_started.notified() => {},
+                _ = self.transport.wait_closed() => return Err(AppServerError::new(self.transport.failure_message("app-server transport closed before thread started"))),
+            }
         }
     }
 
@@ -751,7 +876,15 @@ where
             return Err(err);
         }
 
-        rx.await.map_err(|err| {
+        let response = tokio::select! {
+            biased;
+            response = rx => response,
+            _ = self.transport.wait_closed() => {
+                self.pending.lock().await.remove(&id);
+                return Err(AppServerError::new(self.transport.failure_message("app-server transport closed while awaiting response")));
+            }
+        };
+        response.map_err(|err| {
             self.transport.mark_closed();
             AppServerError::new(
                 self.transport
@@ -772,6 +905,21 @@ pub(crate) const APP_SERVER_CONFIG_OVERRIDES: [&str; 8] = [
     "windows.sandbox=\"elevated\"",
     "permissions.eud_workspace_read={description=\"eud-agent read-only session workspace\",filesystem={\":minimal\"=\"read\",\":workspace_roots\"={\".\"=\"read\"}},network={enabled=false}}",
     "permissions.eud_workspace_write={description=\"eud-agent live-project writer with read-only documents\",filesystem={\":minimal\"=\"read\",\":workspace_roots\"={\".\"=\"read\",\".tmp/**\"=\"write\"}},network={enabled=false}}",
+];
+
+const STRUCTURED_APP_SERVER_CONFIG_OVERRIDES: [&str; 12] = [
+    "web_search=\"disabled\"",
+    "features.apps=false",
+    "features.goals=false",
+    "features.hooks=false",
+    "features.image_generation=false",
+    "features.memories=false",
+    "features.multi_agent=false",
+    "features.plugins=false",
+    "features.request_permissions_tool=false",
+    "features.shell_tool=false",
+    "features.standalone_web_search=false",
+    "features.unified_exec=false",
 ];
 
 pub(crate) fn app_server_config_overrides(access: WorkspaceAccess) -> Vec<String> {
@@ -795,14 +943,17 @@ fn thread_start_params(
     workspace_root: Option<&Path>,
     mcp_server_url: Option<&str>,
     large_context_enabled: bool,
+    native_tools_enabled: bool,
 ) -> Result<serde_json::Value, AppServerError> {
-    let mut params = serde_json::json!({ "approvalPolicy": "on-request" });
+    let mut params = serde_json::json!({
+        "approvalPolicy": if native_tools_enabled { "on-request" } else { "never" }
+    });
     if let Some(workspace_root) = workspace_root {
         params["cwd"] = serde_json::json!(path_text(workspace_root)?);
     } else {
         params["sandboxPolicy"] = serde_json::json!({ "type": "readOnly", "networkAccess": false });
     }
-    params["config"] = thread_config(mcp_server_url, large_context_enabled);
+    params["config"] = thread_config(mcp_server_url, large_context_enabled, native_tools_enabled);
     Ok(params)
 }
 
@@ -811,18 +962,27 @@ fn thread_resume_params(
     workspace_root: Option<&Path>,
     mcp_server_url: Option<&str>,
     large_context_enabled: bool,
+    native_tools_enabled: bool,
 ) -> Result<serde_json::Value, AppServerError> {
     let mut params = serde_json::json!({ "threadId": thread_id });
     if let Some(workspace_root) = workspace_root {
         params["cwd"] = serde_json::json!(path_text(workspace_root)?);
     }
-    params["config"] = thread_config(mcp_server_url, large_context_enabled);
+    params["config"] = thread_config(mcp_server_url, large_context_enabled, native_tools_enabled);
     Ok(params)
 }
 
-fn thread_config(mcp_server_url: Option<&str>, large_context_enabled: bool) -> serde_json::Value {
+fn thread_config(
+    mcp_server_url: Option<&str>,
+    large_context_enabled: bool,
+    native_tools_enabled: bool,
+) -> serde_json::Value {
     let mut config = serde_json::Map::new();
-    config.insert("web_search".to_string(), serde_json::json!("live"));
+    if native_tools_enabled {
+        config.insert("web_search".to_string(), serde_json::json!("live"));
+    } else {
+        config.insert("web_search".to_string(), serde_json::json!("disabled"));
+    }
     if let Some(url) = mcp_server_url {
         config.insert(
             "mcp_servers".to_string(),
@@ -852,10 +1012,6 @@ fn path_text(path: &Path) -> Result<String, AppServerError> {
         .ok_or_else(|| AppServerError::new("Codex workspace path is not UTF-8"))
 }
 
-fn mcp_server_url(port: u16) -> String {
-    format!("http://127.0.0.1:{port}/mcp")
-}
-
 /// The dotted-key `-c` override that registers the in-process eud-tools MCP
 /// server with codex over loopback streamable HTTP (decision A2). The value is a
 /// TOML string, so it is quoted; the `eud-tools` key segment is a valid TOML
@@ -868,23 +1024,23 @@ pub(crate) fn mcp_server_override(url: &str) -> String {
 impl CodexAppServerClient<tokio::process::ChildStdout, tokio::process::ChildStdin> {
     pub async fn spawn_app_server(
         cwd: impl AsRef<std::path::Path>,
-        dirs: &crate::config::DataDirs,
-        mcp_port: Option<u16>,
+        launch: &CodexLaunchConfig,
+        mcp_server_url: Option<&str>,
         access: WorkspaceAccess,
-        ask_runtime: Option<crate::tool_exec::SessionToolRuntime>,
+        native_tools_enabled: bool,
     ) -> Result<(Self, tokio::sync::mpsc::Receiver<AppServerEvent>), AppServerError> {
-        ensure_codex_profile(dirs).map_err(AppServerError::new)?;
-        let config = dirs
-            .load_config()
-            .map_err(|_| AppServerError::new("provider_protocol_changed"))?;
-        let codex_cmd = resolve_codex_cmd_for(dirs, &config)
-            .map_err(|err| AppServerError::new(err.to_string()))?;
-        let mcp_server_url = mcp_port.map(mcp_server_url);
-        let mut command = tokio::process::Command::new(codex_cmd);
-        command.env("CODEX_HOME", dirs.codex_home_dir());
+        let mcp_server_url = mcp_server_url.map(str::to_string);
+        let mut command = tokio::process::Command::new(&launch.executable);
+        command.env("CODEX_HOME", &launch.profile_dir);
+        command.args(&launch.executable_args);
         command.arg("app-server");
         for override_arg in app_server_config_overrides(access) {
             command.arg("-c").arg(override_arg);
+        }
+        if !native_tools_enabled {
+            for override_arg in STRUCTURED_APP_SERVER_CONFIG_OVERRIDES {
+                command.arg("-c").arg(override_arg);
+            }
         }
         // Launch-level registration covers fresh threads; thread/start and
         // thread/resume repeat it so restored threads cannot retain stale tools.
@@ -907,6 +1063,8 @@ impl CodexAppServerClient<tokio::process::ChildStdout, tokio::process::ChildStdi
         let mut child = command.spawn().map_err(|err| {
             AppServerError::new(format!("failed to spawn codex app-server: {err}"))
         })?;
+        let job = crate::provider_process::WindowsJob::assign(&child)
+            .map_err(|_| AppServerError::new("Codex process tree isolation is unavailable"))?;
         let stdout = child
             .stdout
             .take()
@@ -920,7 +1078,7 @@ impl CodexAppServerClient<tokio::process::ChildStdout, tokio::process::ChildStdi
             .take()
             .ok_or_else(|| AppServerError::new("codex app-server stderr was not piped"))?;
 
-        let (mut client, events) = Self::new_with_stdio_and_ask_runtime(stdout, stdin, ask_runtime);
+        let (mut client, events) = Self::new_with_stdio_policy(stdout, stdin, native_tools_enabled);
         client.mcp_server_url = mcp_server_url;
         let waiter_transport = std::sync::Arc::clone(&client.transport);
         let waiter = tokio::spawn(async move {
@@ -931,6 +1089,7 @@ impl CodexAppServerClient<tokio::process::ChildStdout, tokio::process::ChildStdi
         client._process = Some(AppServerProcess {
             waiter,
             stderr_reader,
+            _job: job,
         });
         Ok((client, events))
     }
@@ -949,7 +1108,7 @@ where
         thread_started,
         turn_completed,
         transport,
-        ask_runtime,
+        native_tools_enabled,
     } = context;
     use tokio::io::AsyncBufReadExt as _;
 
@@ -992,7 +1151,7 @@ where
                     method,
                     id,
                     message.get("params"),
-                    ask_runtime.as_ref(),
+                    native_tools_enabled,
                 )
                 .await
                 {
@@ -1022,7 +1181,6 @@ where
         }
     }
 
-    transport.mark_closed();
     transport.wait_for_exit_detail().await;
     let failure = transport.failure_message(&close_reason);
     let _ = events_tx.try_send(AppServerEvent::Error(failure.clone()));
@@ -1030,6 +1188,8 @@ where
     for (_, tx) in pending.drain() {
         let _ = tx.send(Err(AppServerError::new(failure.clone())));
     }
+    drop(pending);
+    transport.mark_closed();
 }
 
 async fn read_app_server_stderr(
@@ -1080,37 +1240,22 @@ async fn handle_server_request<W>(
     method: &str,
     id: serde_json::Value,
     params: Option<&serde_json::Value>,
-    ask_runtime: Option<&crate::tool_exec::SessionToolRuntime>,
+    native_tools_enabled: bool,
 ) -> Result<(), AppServerError>
 where
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    let result = if let Some(args) = eud_ask_arguments(method, params) {
-        match ask_runtime {
-            Some(runtime) => match runtime.ask(&args).await {
-                Ok(value) => {
-                    let payload = serde_json::to_string(&value).expect("JSON value must serialize");
-                    let content = serde_json::Map::from_iter([(
-                        crate::mcp::ASK_ELICITATION_PAYLOAD_KEY.to_string(),
-                        serde_json::Value::String(payload),
-                    )]);
-                    serde_json::json!({ "action": "accept", "content": content })
-                }
-                Err(_) => serde_json::json!({ "action": "cancel", "content": null }),
-            },
-            None => serde_json::json!({ "action": "decline", "content": null }),
+    let result = match method {
+        "item/commandExecution/requestApproval" if native_tools_enabled => {
+            serde_json::json!({ "decision": "accept" })
         }
-    } else {
-        match method {
-            "item/commandExecution/requestApproval" => {
-                serde_json::json!({ "decision": "accept" })
-            }
-            "execCommandApproval" => serde_json::json!({ "decision": "approved" }),
-            _ if should_accept_mcp_elicitation(method, params) => {
-                serde_json::json!({ "action": "accept", "content": null })
-            }
-            _ => decline_approval_result(method),
+        "execCommandApproval" if native_tools_enabled => {
+            serde_json::json!({ "decision": "approved" })
         }
+        _ if native_tools_enabled && should_accept_mcp_elicitation(method, params) => {
+            serde_json::json!({ "action": "accept", "content": null })
+        }
+        _ => decline_approval_result(method),
     };
 
     write_json_rpc_line(
@@ -1135,24 +1280,6 @@ fn decline_approval_result(method: &str) -> serde_json::Value {
         "applyPatchApproval" => serde_json::json!({ "decision": "denied" }),
         _ => serde_json::json!({ "decision": "decline" }),
     }
-}
-
-fn eud_ask_arguments(
-    method: &str,
-    params: Option<&serde_json::Value>,
-) -> Option<serde_json::Value> {
-    if method != "mcpServer/elicitation/request" {
-        return None;
-    }
-    let params = params?;
-    if !is_eud_tools_request(params) {
-        return None;
-    }
-    params
-        .get("_meta")
-        .or_else(|| params.pointer("/request/_meta"))?
-        .get(crate::mcp::ASK_ELICITATION_META_KEY)
-        .cloned()
 }
 
 fn is_eud_tools_request(params: &serde_json::Value) -> bool {
@@ -1211,7 +1338,22 @@ async fn handle_notification(
                 true
             }
         }
-        "turn/started" => send_event(events_tx, AppServerEvent::TurnStarted).await,
+        "turn/started" => {
+            let event = params
+                .and_then(|params| params.pointer("/turn/id"))
+                .and_then(serde_json::Value::as_str)
+                .filter(|turn_id| !turn_id.is_empty())
+                .map(|turn_id| AppServerEvent::TurnStarted {
+                    turn_id: turn_id.to_string(),
+                })
+                .unwrap_or_else(|| {
+                    AppServerEvent::Error(
+                        "turn/started notification has missing or empty required turn.id"
+                            .to_string(),
+                    )
+                });
+            send_event(events_tx, event).await
+        }
         "item/agentMessage/delta" => {
             if let Some(delta) = string_param(params, &["delta"]) {
                 send_event(events_tx, AppServerEvent::AnswerDelta(delta)).await
@@ -1383,7 +1525,17 @@ fn tool_event_from_item(
     completed: bool,
 ) -> Option<AppServerEvent> {
     let item = params?.get("item")?;
+    let item_id = item_field(item, &["id", "itemId", "item_id"])
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
     let item_type = item.get("type").and_then(serde_json::Value::as_str)?;
+    let mcp_server = matches!(item_type, "mcpToolCall" | "mcp_tool_call")
+        .then(|| {
+            item.get("server")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+        .flatten();
     let (name, args, result) = match item_type {
         "mcpToolCall" | "mcp_tool_call" => {
             let name = item_field(item, &["tool"])
@@ -1416,6 +1568,8 @@ fn tool_event_from_item(
     };
     if completed {
         Some(AppServerEvent::ToolCallCompleted {
+            item_id,
+            mcp_server,
             name,
             result,
             status: item_field(item, &["status"])
@@ -1423,7 +1577,12 @@ fn tool_event_from_item(
                 .map(str::to_string),
         })
     } else {
-        Some(AppServerEvent::ToolCallStarted { name, args })
+        Some(AppServerEvent::ToolCallStarted {
+            item_id,
+            mcp_server,
+            name,
+            args,
+        })
     }
 }
 
@@ -1457,7 +1616,10 @@ mod app_server_override_tests {
     //! Pins the hermetic-turn config overrides: user-local skills and any
     //! AGENTS.md found at/above the cwd must never steer the agent's codex
     //! turns (only our system prompt does).
-    use super::{app_server_config_overrides, WorkspaceAccess, APP_SERVER_CONFIG_OVERRIDES};
+    use super::{
+        app_server_config_overrides, WorkspaceAccess, APP_SERVER_CONFIG_OVERRIDES,
+        STRUCTURED_APP_SERVER_CONFIG_OVERRIDES,
+    };
 
     #[test]
     fn app_managed_codex_distribution_uses_the_provider_profile() {
@@ -1545,17 +1707,16 @@ mod app_server_override_tests {
     fn mcp_server_override_is_a_loopback_dotted_key_with_a_quoted_url() {
         // codex selects the streamable-HTTP transport from `url`; the value is a
         // TOML string (quoted), the key segment `eud-tools` is a valid bare key.
-        let url = super::mcp_server_url(54321);
-        let arg = super::mcp_server_override(&url);
+        let arg = super::mcp_server_override("http://127.0.0.1:54321/mcp/run-token");
         assert_eq!(
             arg,
-            "mcp_servers.eud-tools.url=\"http://127.0.0.1:54321/mcp\""
+            "mcp_servers.eud-tools.url=\"http://127.0.0.1:54321/mcp/run-token\""
         );
     }
 
     #[test]
     fn thread_start_uses_readonly_without_a_project_workspace() {
-        let params = super::thread_start_params(None, None, false).unwrap();
+        let params = super::thread_start_params(None, None, false, true).unwrap();
         assert_eq!(
             params["sandboxPolicy"]["type"],
             serde_json::json!("readOnly")
@@ -1569,17 +1730,21 @@ mod app_server_override_tests {
 
     #[test]
     fn thread_start_uses_custom_profile_for_project_workspace() {
-        let params =
-            super::thread_start_params(Some(std::path::Path::new("C:\\workspace")), None, false)
-                .unwrap();
+        let params = super::thread_start_params(
+            Some(std::path::Path::new("C:\\workspace")),
+            None,
+            false,
+            true,
+        )
+        .unwrap();
         assert_eq!(params["cwd"], serde_json::json!("C:\\workspace"));
         assert!(params.get("sandboxPolicy").is_none());
     }
 
     #[test]
     fn fresh_and_resumed_threads_enable_live_web_search() {
-        let start = super::thread_start_params(None, None, false).unwrap();
-        let resumed = super::thread_resume_params("thread-1", None, None, false).unwrap();
+        let start = super::thread_start_params(None, None, false, true).unwrap();
+        let resumed = super::thread_resume_params("thread-1", None, None, false, true).unwrap();
         assert_eq!(
             start.pointer("/config/web_search"),
             Some(&serde_json::json!("live"))
@@ -1591,9 +1756,24 @@ mod app_server_override_tests {
     }
 
     #[test]
+    fn structured_thread_disables_native_tools_and_live_web_search() {
+        let params = super::thread_start_params(None, None, false, false).unwrap();
+        assert_eq!(params["approvalPolicy"], serde_json::json!("never"));
+        assert_eq!(
+            params.pointer("/config/web_search"),
+            Some(&serde_json::json!("disabled"))
+        );
+        assert!(params.pointer("/config/mcp_servers").is_none());
+        assert!(STRUCTURED_APP_SERVER_CONFIG_OVERRIDES.contains(&"web_search=\"disabled\""));
+        assert!(STRUCTURED_APP_SERVER_CONFIG_OVERRIDES.contains(&"features.shell_tool=false"));
+        assert!(STRUCTURED_APP_SERVER_CONFIG_OVERRIDES.contains(&"features.unified_exec=false"));
+    }
+
+    #[test]
     fn large_context_opt_in_sets_native_window_and_auto_compaction_limit() {
         let params =
-            super::thread_start_params(None, Some("http://127.0.0.1:54321/mcp"), true).unwrap();
+            super::thread_start_params(None, Some("http://127.0.0.1:54321/mcp"), true, true)
+                .unwrap();
         assert_eq!(
             params.pointer("/config/model_context_window"),
             Some(&serde_json::json!(1_000_000))
@@ -1662,6 +1842,8 @@ mod tool_item_tests {
         assert_eq!(
             event,
             Some(AppServerEvent::ToolCallStarted {
+                item_id: Some("item_1".to_string()),
+                mcp_server: Some("eud-tools".to_string()),
                 name: "search_docs".to_string(),
                 args: Some("{\"query\":\"countdown\"}".to_string()),
             })
@@ -1686,6 +1868,8 @@ mod tool_item_tests {
         assert_eq!(
             event,
             Some(AppServerEvent::ToolCallCompleted {
+                item_id: Some("item_1".to_string()),
+                mcp_server: None,
                 name: "search_docs".to_string(),
                 result: Some("hit 1\nhit 2".to_string()),
                 status: Some("completed".to_string()),
@@ -1708,6 +1892,8 @@ mod tool_item_tests {
         assert_eq!(
             event,
             Some(AppServerEvent::ToolCallCompleted {
+                item_id: None,
+                mcp_server: None,
                 name: "dat_set".to_string(),
                 result: Some("EvidenceRequired".to_string()),
                 status: Some("failed".to_string()),
@@ -1723,6 +1909,8 @@ mod tool_item_tests {
         assert_eq!(
             tool_event_from_item(Some(&started), false),
             Some(AppServerEvent::ToolCallStarted {
+                item_id: None,
+                mcp_server: None,
                 name: "command".to_string(),
                 args: Some("cargo test".to_string()),
             })
@@ -1740,6 +1928,8 @@ mod tool_item_tests {
         assert_eq!(
             tool_event_from_item(Some(&completed), true),
             Some(AppServerEvent::ToolCallCompleted {
+                item_id: None,
+                mcp_server: None,
                 name: "command".to_string(),
                 result: Some("ok. 12 passed".to_string()),
                 status: Some("completed".to_string()),
@@ -2201,87 +2391,6 @@ mod appserver_tests {
     }
 
     #[tokio::test]
-    async fn eud_ask_elicitation_waits_for_panel_response_without_closing() {
-        let runtime = crate::tool_exec::SessionToolRuntime::for_tests();
-        runtime.begin_request("req-ask", "project").unwrap();
-        let (events, mut emitted) = tokio::sync::mpsc::unbounded_channel();
-        runtime.set_ask_emitter(move |event| {
-            events
-                .send(event)
-                .map_err(|_| "ask event receiver closed".to_string())
-        });
-
-        let (client_write, server_read) = tokio::io::duplex(16 * 1024);
-        let (mut server_write, client_read) = tokio::io::duplex(16 * 1024);
-        let (_client, _events) = CodexAppServerClient::new_with_stdio_and_ask_runtime(
-            client_read,
-            client_write,
-            Some(runtime.clone()),
-        );
-        let mut client_requests = BufReader::new(server_read).lines();
-
-        write_json_line(
-            &mut server_write,
-            json!({
-                "jsonrpc": "2.0",
-                "id": "ask-elicitation",
-                "method": "mcpServer/elicitation/request",
-                "params": {
-                    "threadId": "thread-1",
-                    "turnId": "turn-1",
-                    "serverName": "eud-tools",
-                    "mode": "form",
-                    "_meta": {
-                        "eudAgentAsk": {
-                            "questions": [{
-                                "id": "mode",
-                                "question": "방식을 고르세요.",
-                                "options": [{"label": "A"}, {"label": "B"}],
-                                "multi": false
-                            }]
-                        }
-                    },
-                    "message": "eud-agent structured ASK",
-                    "requestedSchema": {
-                        "type": "object",
-                        "properties": {"payload": {"type": "string"}},
-                        "required": ["payload"]
-                    }
-                }
-            }),
-        )
-        .await;
-
-        let event = emitted
-            .recv()
-            .await
-            .expect("ASK must reach the panel runtime");
-        assert!(*runtime.subscribe_ask_waiting().borrow());
-        runtime
-            .answer_ask(
-                &event.request_id,
-                std::collections::BTreeMap::from([(
-                    "mode".to_string(),
-                    crate::ipc::AskAnswer {
-                        answers: vec!["A".to_string()],
-                    },
-                )]),
-            )
-            .unwrap();
-
-        let response = read_json_line(&mut client_requests).await;
-        assert_eq!(response["id"], json!("ask-elicitation"));
-        assert_eq!(response["result"]["action"], json!("accept"));
-        let payload = response
-            .pointer("/result/content/payload")
-            .and_then(Value::as_str)
-            .expect("accepted ASK response must include the encoded answers");
-        let answers: Value = serde_json::from_str(payload).unwrap();
-        assert_eq!(answers["answers"]["mode"]["answers"], json!(["A"]));
-        assert!(!*runtime.subscribe_ask_waiting().borrow());
-    }
-
-    #[tokio::test]
     async fn stdout_eof_marks_transport_closed_for_next_request_recovery() {
         let (client_write, server_read) = tokio::io::duplex(16 * 1024);
         let (server_write, client_read) = tokio::io::duplex(16 * 1024);
@@ -2310,7 +2419,7 @@ mod appserver_tests {
             .await
             .expect_err("stdout EOF must fail the pending request");
         assert!(error.message.contains("app-server stdout closed"));
-        assert!(error.message.contains("restart automatically"));
+        assert!(error.message.contains("app-server transport is closed"));
         assert!(client.is_transport_closed());
         assert_eq!(
             next_event(&mut events).await,
@@ -2434,7 +2543,7 @@ mod appserver_tests {
 
             write_json_line(
                 &mut server_responses,
-                json!({"jsonrpc":"2.0","method":"turn/started","params":{"turnId":"turn-1"}}),
+                json!({"jsonrpc":"2.0","method":"turn/started","params":{"threadId":"thread-123","turn":{"id":"turn-1","items":[],"status":"inProgress"}}}),
             )
             .await;
             write_json_line(
@@ -2524,7 +2633,17 @@ mod appserver_tests {
             .await;
             write_json_line(
                 &mut server_responses,
+                json!({"jsonrpc":"2.0","method":"turn/started","params":{"threadId":"thread-123","turn":{"id":"turn-2","items":[],"status":"inProgress"}}}),
+            )
+            .await;
+            write_json_line(
+                &mut server_responses,
                 json!({"jsonrpc":"2.0","method":"turn/completed","params":{"turnId":"turn-2"}}),
+            )
+            .await;
+            write_json_line(
+                &mut server_responses,
+                json!({"jsonrpc":"2.0","method":"turn/started","params":{"threadId":"thread-123","turn":{"id":"","items":[],"status":"inProgress"}}}),
             )
             .await;
         });
@@ -2554,7 +2673,12 @@ mod appserver_tests {
                 thread_id: "thread-123".to_string()
             }
         );
-        assert_eq!(next_event(&mut events).await, AppServerEvent::TurnStarted);
+        assert_eq!(
+            next_event(&mut events).await,
+            AppServerEvent::TurnStarted {
+                turn_id: "turn-1".to_string()
+            }
+        );
         assert_eq!(
             next_event(&mut events).await,
             AppServerEvent::AnswerDelta("hello ".to_string())
@@ -2570,6 +2694,8 @@ mod appserver_tests {
         assert_eq!(
             next_event(&mut events).await,
             AppServerEvent::ToolCallStarted {
+                item_id: Some("item_1".to_string()),
+                mcp_server: Some("eud-tools".to_string()),
                 name: "search_docs".to_string(),
                 args: Some("{\"query\":\"countdown\"}".to_string()),
             }
@@ -2577,6 +2703,8 @@ mod appserver_tests {
         assert_eq!(
             next_event(&mut events).await,
             AppServerEvent::ToolCallCompleted {
+                item_id: Some("item_1".to_string()),
+                mcp_server: Some("eud-tools".to_string()),
                 name: "search_docs".to_string(),
                 result: Some("2 hits".to_string()),
                 status: Some("completed".to_string()),
@@ -2588,7 +2716,19 @@ mod appserver_tests {
             .run_turn(AgentTurnInput::text("second prompt"))
             .await
             .expect("second app-server turn should complete");
+        assert_eq!(
+            next_event(&mut events).await,
+            AppServerEvent::TurnStarted {
+                turn_id: "turn-2".to_string()
+            }
+        );
         assert_eq!(next_event(&mut events).await, AppServerEvent::TurnComplete);
+        assert_eq!(
+            next_event(&mut events).await,
+            AppServerEvent::Error(
+                "turn/started notification has missing or empty required turn.id".to_string()
+            )
+        );
 
         stub.await.expect("stub server task should not panic");
     }

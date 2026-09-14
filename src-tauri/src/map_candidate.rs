@@ -2558,6 +2558,121 @@ mod tests {
         std::fs::remove_dir_all(root).ok();
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn long_windows_candidate_paths_patch_and_finalize_without_touching_source() {
+        use std::os::windows::ffi::OsStrExt;
+
+        let project_id = "p".repeat(64);
+        let session_id = "s".repeat(36);
+        let request_id = "r".repeat(40);
+        let base_root = unique_root();
+        let mut root = base_root.clone();
+        loop {
+            let dirs = DataDirs::from_bases(&root.join("roaming"), &root.join("local"));
+            let draft = dirs
+                .map_candidates_dir()
+                .join(&project_id)
+                .join(&session_id)
+                .join("drafts")
+                .join(format!("{request_id}.tmp.scx"));
+            if draft.as_os_str().encode_wide().count() >= 271 {
+                break;
+            }
+            root.push("long-path-segment");
+        }
+        let dirs = DataDirs::from_bases(&root.join("roaming"), &root.join("local"));
+        dirs.ensure_dirs().unwrap();
+        let source = base_root.join("source.scx");
+        std::fs::copy(fixture(), &source).unwrap();
+        let source_hash = file_hash(&source).unwrap();
+        let context_service = MapContextService::new(dirs.clone());
+        let revision = context_service
+            .revision_for_path(project_id.clone(), &source)
+            .unwrap();
+        let chk = isom::chk_extract(&source).unwrap();
+        let snapshot = MapContextSnapshot {
+            revision,
+            saved_source_notice: "saved".to_string(),
+            source_file_size: std::fs::metadata(&source).unwrap().len(),
+            starcraft_path: PathBuf::from(r"C:\Program Files (x86)\StarCraft"),
+            digest: crate::chk::digest_chk(&chk),
+        };
+        let store = CandidateStore::new(dirs.clone(), crate::map_import::MapImportStore::new(dirs));
+        let view = store.create_session(&session_id, &snapshot).unwrap();
+        let target = full_target(&view, "target");
+        store
+            .save_selection(&project_id, &session_id, target.clone())
+            .unwrap();
+        store
+            .prepare_request(
+                &project_id,
+                &session_id,
+                &request_id,
+                0,
+                &[region_mention(&target)],
+            )
+            .unwrap();
+        store
+            .draft_begin(&project_id, &session_id, &request_id)
+            .unwrap();
+        let draft = store
+            .inner
+            .active
+            .lock()
+            .get(&session_id)
+            .and_then(|request| request.draft_path.clone())
+            .unwrap();
+        assert!(draft.as_os_str().encode_wide().count() >= 271);
+        assert!(
+            draft
+                .with_file_name(format!("{request_id}.next.scx"))
+                .as_os_str()
+                .encode_wide()
+                .count()
+                >= 271
+        );
+
+        let before = snapshot.digest.tiles[0];
+        let after = snapshot
+            .digest
+            .tiles
+            .iter()
+            .copied()
+            .find(|tile| *tile != before)
+            .unwrap();
+        store
+            .draft_patch(
+                &project_id,
+                &session_id,
+                &request_id,
+                vec![MapOperation::TerrainSet {
+                    x: 0,
+                    y: 0,
+                    before,
+                    after,
+                }],
+            )
+            .unwrap();
+        let preview = store
+            .finalize(&project_id, &session_id, &request_id)
+            .unwrap();
+        assert_eq!(preview.current_revision, 1);
+        assert_eq!(
+            preview
+                .revisions
+                .iter()
+                .find(|revision| revision.revision == 1)
+                .map(|revision| revision.diff.terrain_cells),
+            Some(1)
+        );
+        assert_eq!(file_hash(&source).unwrap(), source_hash);
+
+        store.finish_request(&session_id, &request_id).unwrap();
+        drop(store);
+        std::fs::remove_dir_all(base_root).unwrap();
+    }
+
     #[test]
     fn strict_candidate_session_create_and_open_fail_closed() {
         let root = unique_root();

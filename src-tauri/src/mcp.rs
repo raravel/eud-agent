@@ -2,18 +2,19 @@
 //!
 //! Topology (decision A2): codex's MCP transport accepts only `command` (stdio)
 //! or `url` (HTTP) — it cannot attach an in-process Rust server directly. So the
-//! agent process hosts one **127.0.0.1-only** streamable-HTTP server per session
-//! on an ephemeral port and registers it as `http://127.0.0.1:<port>/mcp`.
-//! The handler shares only that worker's [`SessionToolRuntime`]; no mutable
-//! global request pointer identifies callers.
+//! agent process hosts one **127.0.0.1-only** streamable-HTTP server per run
+//! on an ephemeral port with an unguessable path unique to that server. The
+//! handler holds only that run's [`RunGate`]. A cached URL cannot initialize a
+//! later run's handler even when the operating system reuses the same port.
 //!
 //! rules.md's "panel ↔ core is Tauri IPC only — NO localhost socket" bounds the
 //! PANEL boundary; it does not apply to this codex ↔ core MCP channel. The server
 //! binds loopback only (rmcp's default `allowed_hosts` is `localhost/127.0.0.1/
 //! ::1`), and the codex approval handler already accepts only the `eud-tools`
-//! server, so no bearer token is layered on (loopback + ephemeral port is the
-//! trust boundary, matching the single-editor-per-machine topology).
+//! server. The run-specific URL isolates old native clients without a separate
+//! bearer-token protocol.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use rmcp::model::{
@@ -26,21 +27,27 @@ use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, Stream
 use rmcp::{ErrorData as McpError, RoleServer, ServerHandler};
 use serde_json::Value;
 
-use crate::tool_exec::SessionToolRuntime;
+use crate::provider_tool_loop::RunGate;
 use crate::tools::{map_mcp_tool_descriptors, mcp_tool_descriptors};
 
 /// The MCP server name codex registers (matched by the approval handler).
 pub const SERVER_NAME: &str = "eud-tools";
 
-/// MCP handler bridging Codex tool calls to one session's runtime.
+static NEXT_HANDLER_ID: AtomicU64 = AtomicU64::new(1);
+
+/// MCP handler bridging native tool calls through one run's admission gate.
 #[derive(Clone)]
 pub struct EudToolHandler {
-    runtime: SessionToolRuntime,
+    gate: RunGate,
+    handler_id: u64,
 }
 
 impl EudToolHandler {
-    pub fn new(runtime: SessionToolRuntime) -> Self {
-        Self { runtime }
+    pub fn new(gate: RunGate) -> Self {
+        Self {
+            gate,
+            handler_id: NEXT_HANDLER_ID.fetch_add(1, Ordering::Relaxed),
+        }
     }
 }
 
@@ -48,7 +55,7 @@ impl ServerHandler for EudToolHandler {
     fn get_info(&self) -> ServerInfo {
         InitializeResult::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::from_build_env())
-            .with_instructions(if self.runtime.kind() == crate::session::SessionKind::Map {
+            .with_instructions(if self.gate.identity().session_kind == crate::session::SessionKind::Map {
                 "Map Agent candidate tools. Draft tools can modify only the request-owned candidate; original Apply is not exposed."
             } else {
                 "Native EUD project tools. Shared writes use the project coordinator and changeset review."
@@ -61,44 +68,27 @@ impl ServerHandler for EudToolHandler {
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
         Ok(ListToolsResult::with_all_items(tool_list(
-            self.runtime.kind(),
+            self.gate.identity().session_kind,
         )))
     }
 
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         let name = request.name.to_string();
         let args = Value::Object(request.arguments.unwrap_or_default());
-        if name == crate::tools::ASK_TOOL {
-            return match self.runtime.ask(&args).await {
-                Ok(value) => Ok(CallToolResult::success(render_contents(&value))),
-                Err(message) => Ok(CallToolResult::error(vec![Content::text(message)])),
-            };
-        }
-        let runtime = self.runtime.clone();
-
-        // Tool execution does blocking bridge / map file I/O; keep it off the
-        // async runtime so the MCP server stays responsive.
-        let outcome = tokio::task::spawn_blocking(move || runtime.execute(&name, &args)).await;
-
-        match outcome {
-            // A correctable tool error (EvidenceRequired / admission / bridge
-            // message) is returned as an MCP tool error so codex can self-correct
-            // — never an MCP protocol error.
-            Ok(Ok(value)) => Ok(CallToolResult::success(render_contents(&value))),
-            Ok(Err(message)) => Ok(CallToolResult::error(vec![Content::text(message)])),
-            Err(join_error) => Ok(CallToolResult::error(vec![Content::text(format!(
-                "tool execution task failed: {join_error}"
-            ))])),
+        let call_id = Some(format!("mcp-{}-{:?}", self.handler_id, context.id));
+        match self.gate.dispatch_native(call_id, name, args).await {
+            Ok(result) if result.is_error => Ok(CallToolResult::error(vec![Content::text(
+                render_value(&result.result),
+            )])),
+            Ok(result) => Ok(CallToolResult::success(render_contents(&result.result))),
+            Err(message) => Ok(CallToolResult::error(vec![Content::text(message)])),
         }
     }
 }
-
-pub(crate) const ASK_ELICITATION_META_KEY: &str = "eudAgentAsk";
-pub(crate) const ASK_ELICITATION_PAYLOAD_KEY: &str = "payload";
 
 /// Build the MCP `Tool` list from the registry's MCP descriptors (verbatim
 /// inputSchema per tool).
@@ -160,40 +150,76 @@ fn render_contents(value: &Value) -> Vec<Content> {
     ]
 }
 
-/// Lifetime handle for one session's loopback MCP endpoint.
+/// Lifetime handle for one run's loopback MCP endpoint.
 pub struct McpServerHandle {
     port: u16,
+    endpoint: String,
+    gate: RunGate,
     shutdown: Option<tokio::sync::oneshot::Sender<()>>,
-    task: tokio::task::JoinHandle<()>,
+    task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl McpServerHandle {
     pub fn port(&self) -> u16 {
         self.port
     }
+
+    pub fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+
+    pub async fn close_and_drain(&mut self, within: std::time::Duration) -> Result<(), String> {
+        let deadline = tokio::time::Instant::now() + within;
+        self.gate.close();
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        if let Some(mut task) = self.task.take() {
+            match tokio::time::timeout_at(deadline, &mut task).await {
+                Ok(result) => {
+                    result.map_err(|error| format!("eud-tools MCP server task failed: {error}"))?
+                }
+                Err(_) => task.abort(),
+            }
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        self.gate.drain(remaining).await
+    }
 }
 
 impl Drop for McpServerHandle {
     fn drop(&mut self) {
+        self.gate.close();
         if let Some(shutdown) = self.shutdown.take() {
             let _ = shutdown.send(());
         }
-        self.task.abort();
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
     }
 }
 
-/// Start one session-bound loopback MCP server on an ephemeral port.
-pub async fn serve(runtime: SessionToolRuntime) -> Result<McpServerHandle, String> {
+/// Start one run-bound loopback MCP server on an ephemeral port.
+pub async fn serve(gate: RunGate) -> Result<McpServerHandle, String> {
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .map_err(|error| format!("eud-tools MCP server failed to bind loopback: {error}"))?;
+    serve_with_listener(gate, listener)
+}
+
+fn serve_with_listener(
+    gate: RunGate,
+    listener: tokio::net::TcpListener,
+) -> Result<McpServerHandle, String> {
+    let handler_gate = gate.clone();
     let service = StreamableHttpService::new(
-        move || Ok(EudToolHandler::new(runtime.clone())),
+        move || Ok(EudToolHandler::new(handler_gate.clone())),
         Arc::new(LocalSessionManager::default()),
         StreamableHttpServerConfig::default(),
     );
 
-    let app = axum::Router::new().nest_service("/mcp", service);
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
-        .await
-        .map_err(|error| format!("eud-tools MCP server failed to bind loopback: {error}"))?;
+    let path = format!("/mcp/{}", uuid::Uuid::new_v4().simple());
+    let app = axum::Router::new().nest_service(&path, service);
     let port = listener
         .local_addr()
         .map_err(|error| format!("eud-tools MCP server has no local address: {error}"))?
@@ -210,15 +236,36 @@ pub async fn serve(runtime: SessionToolRuntime) -> Result<McpServerHandle, Strin
 
     Ok(McpServerHandle {
         port,
+        endpoint: format!("http://127.0.0.1:{port}{path}"),
+        gate,
         shutdown: Some(shutdown),
-        task,
+        task: Some(task),
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        provider_runtime::{RunId, RunIdentity},
+        tool_exec::SessionToolRuntime,
+    };
     use std::time::Duration;
+
+    fn run_gate(runtime: SessionToolRuntime, request_id: &str, generation: u64) -> RunGate {
+        RunGate::new(
+            RunIdentity {
+                session_id: runtime.session_id().to_string(),
+                run_id: RunId::new(generation + 1),
+                request_id: request_id.to_string(),
+                session_kind: runtime.kind(),
+                cancellation_generation: generation,
+            },
+            runtime,
+            crate::provider_runtime::WorkspaceAccess::Read,
+            None,
+        )
+    }
 
     #[test]
     fn tool_list_exposes_every_registry_tool_with_its_schema() {
@@ -305,19 +352,20 @@ mod tests {
     #[tokio::test]
     async fn loopback_server_binds_and_serves_the_mcp_endpoint() {
         let runtime = SessionToolRuntime::for_tests();
-        let server = serve(runtime)
+        let (_cancel, cancellation) = tokio::sync::watch::channel(0_u64);
+        runtime.set_cancellation(cancellation);
+        runtime.begin_request("request", "project").unwrap();
+        let server = serve(run_gate(runtime, "request", 0))
             .await
             .expect("MCP server should bind loopback");
-        let port = server.port();
-
         // A streamable-HTTP MCP initialize round-trip over loopback: the server
-        // must accept the handshake (proving the /mcp endpoint is live, routed,
+        // must accept the handshake (proving the run endpoint is live, routed,
         // and bound to 127.0.0.1) — not refuse the connection.
         let client = reqwest::Client::new();
         let response = tokio::time::timeout(
             Duration::from_secs(5),
             client
-                .post(format!("http://127.0.0.1:{port}/mcp"))
+                .post(server.endpoint())
                 .header("content-type", "application/json")
                 .header("accept", "application/json, text/event-stream")
                 .body(
@@ -344,5 +392,276 @@ mod tests {
             "MCP initialize should be accepted, got {}",
             response.status()
         );
+    }
+
+    #[tokio::test]
+    async fn stale_endpoint_cannot_initialize_when_port_is_reused_by_a_new_run() {
+        // Given: a native client initialized against an ended run's URL.
+        let runtime = SessionToolRuntime::for_tests();
+        let (cancel, cancellation) = tokio::sync::watch::channel(4_u64);
+        runtime.set_cancellation(cancellation);
+        runtime.begin_request("request-old", "project").unwrap();
+        let old_gate = run_gate(runtime.clone(), "request-old", 4);
+        let mut old_server = serve(old_gate.clone()).await.unwrap();
+        let old_endpoint = old_server.endpoint().to_owned();
+        let port = old_server.port();
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .pool_max_idle_per_host(0)
+            .build()
+            .unwrap();
+        let old_session = initialize_session(&client, &old_endpoint).await;
+        old_server
+            .close_and_drain(Duration::from_secs(5))
+            .await
+            .unwrap();
+        runtime.clear_current();
+        cancel.send_replace(5);
+        runtime.begin_request("request-new", "project").unwrap();
+        let new_gate = run_gate(runtime, "request-new", 5);
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
+            .await
+            .expect("the stopped server's exact port must be reusable");
+        let mut new_server = serve_with_listener(new_gate.clone(), listener).unwrap();
+
+        // When: the old client reconnects and then retries initialization without a session.
+        let replay = mcp_post(&client, &old_endpoint, tool_call())
+            .header("mcp-session-id", old_session)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(replay.status(), reqwest::StatusCode::NOT_FOUND);
+        let reinitialize = mcp_post(&client, &old_endpoint, initialize_request())
+            .send()
+            .await
+            .unwrap();
+
+        // Then: fresh initialization cannot cross run authority, while the current URL works.
+        assert_eq!(
+            reinitialize.status(),
+            reqwest::StatusCode::NOT_FOUND,
+            "an old URL must not initialize a handler for the new run"
+        );
+        assert!(new_gate.completed().is_empty());
+        let new_session = initialize_session(&client, new_server.endpoint()).await;
+        let response = mcp_post(&client, new_server.endpoint(), tool_call())
+            .header("mcp-session-id", new_session)
+            .send()
+            .await
+            .unwrap();
+        assert!(response.status().is_success());
+        let body = response.text().await.unwrap();
+        let result: Value = body
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("data: ")
+                    .and_then(|data| serde_json::from_str(data).ok())
+            })
+            .expect("tool response must contain an SSE JSON-RPC result");
+        assert_eq!(result["id"], 2);
+        assert_eq!(result["result"]["isError"], false);
+        new_gate.drain(Duration::from_secs(5)).await.unwrap();
+        let receipt_path = new_gate.receipt_path().unwrap();
+        let receipt: Value =
+            serde_json::from_slice(&std::fs::read(&receipt_path).unwrap()).unwrap();
+        assert_eq!(receipt["requestId"], "request-new");
+        assert_eq!(receipt["runId"], 6);
+        assert_eq!(receipt["cancellationGeneration"], 5);
+        let completions = receipt["completions"].as_array().unwrap();
+        assert_eq!(completions.len(), 1);
+        assert_eq!(completions[0]["requestId"], "request-new");
+        assert_eq!(completions[0]["runId"], 6);
+        assert_eq!(completions[0]["name"], "search_docs");
+        assert_eq!(completions[0]["isError"], false);
+        assert!(old_gate.completed().is_empty());
+        assert!(!old_gate.receipt_path().unwrap().exists());
+        new_gate.acknowledge_receipts().unwrap();
+        new_server
+            .close_and_drain(Duration::from_secs(5))
+            .await
+            .unwrap();
+    }
+
+    fn mcp_post(client: &reqwest::Client, endpoint: &str, body: Value) -> reqwest::RequestBuilder {
+        client
+            .post(endpoint)
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .body(body.to_string())
+    }
+
+    fn initialize_request() -> Value {
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": "2025-06-18", "capabilities": {},
+                "clientInfo": {"name": "endpoint-generation-test", "version": "0"}}
+        })
+    }
+
+    fn tool_call() -> Value {
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": {"name": "search_docs", "arguments": {"query": "endpoint generation", "k": 1}}
+        })
+    }
+
+    async fn initialize_session(client: &reqwest::Client, endpoint: &str) -> String {
+        let response = mcp_post(client, endpoint, initialize_request())
+            .send()
+            .await
+            .unwrap();
+        assert!(response.status().is_success());
+        let session = response
+            .headers()
+            .get("mcp-session-id")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let _body = response.text().await.unwrap();
+        let initialized = mcp_post(
+            client,
+            endpoint,
+            serde_json::json!({
+                "jsonrpc": "2.0", "method": "notifications/initialized"
+            }),
+        )
+        .header("mcp-session-id", &session)
+        .send()
+        .await
+        .unwrap();
+        assert!(initialized.status().is_success());
+        session
+    }
+
+    #[tokio::test]
+    async fn production_mcp_endpoint_rejects_a_stale_handler_after_request_rotation() {
+        // Given: an initialized production streamable-HTTP MCP client bound to one run.
+        let runtime = SessionToolRuntime::for_tests();
+        let (_cancel, cancellation) = tokio::sync::watch::channel(4_u64);
+        runtime.set_cancellation(cancellation);
+        runtime.begin_request("request-old", "project").unwrap();
+        let gate = run_gate(runtime.clone(), "request-old", 4);
+        let server = serve(gate.clone()).await.unwrap();
+        let endpoint = server.endpoint().to_owned();
+        let client = reqwest::Client::new();
+        let initialize = client
+            .post(&endpoint)
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .body(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2025-06-18",
+                        "capabilities": {},
+                        "clientInfo": {"name": "stale-client-test", "version": "0"}
+                    }
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+        let session_id = initialize
+            .headers()
+            .get("mcp-session-id")
+            .expect("initialize response must bind an MCP session")
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(initialize.status().is_success());
+        let initialized = client
+            .post(&endpoint)
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .header("mcp-session-id", &session_id)
+            .body(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": "notifications/initialized"
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+        assert!(initialized.status().is_success());
+        let execution_lock = runtime.execution_lock_for_tests();
+        let (locked, ready) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let blocker = std::thread::spawn(move || {
+            let _guard = execution_lock.lock();
+            locked.send(()).unwrap();
+            released.recv().unwrap();
+        });
+        ready.recv().unwrap();
+        let request_endpoint = endpoint.clone();
+        let request_client = client.clone();
+        let request_session = session_id.clone();
+        let disconnected = tokio::spawn(async move {
+            request_client
+                .post(request_endpoint)
+                .header("content-type", "application/json")
+                .header("accept", "application/json, text/event-stream")
+                .header("mcp-session-id", request_session)
+                .body(
+                    serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": 2,
+                        "method": "tools/call",
+                        "params": {"name": "list_files", "arguments": {}}
+                    })
+                    .to_string(),
+                )
+                .send()
+                .await
+        });
+        gate.wait_for_admission().await;
+        disconnected.abort();
+        let _ = disconnected.await;
+        gate.cancel();
+        let rotation_error = runtime
+            .begin_request("request-new", "project")
+            .expect_err("an admitted old tool must block request rotation");
+        assert!(rotation_error.contains("previously admitted tool"));
+        release.send(()).unwrap();
+        blocker.join().unwrap();
+        gate.drain(Duration::from_secs(5)).await.unwrap();
+        let receipt_path = gate.receipt_path().unwrap();
+        let receipt: Value =
+            serde_json::from_slice(&std::fs::read(&receipt_path).unwrap()).unwrap();
+        assert_eq!(receipt["completions"].as_array().unwrap().len(), 1);
+        assert_eq!(receipt["completions"][0]["name"], "list_files");
+        runtime.clear_current();
+        runtime.begin_request("request-new", "project").unwrap();
+
+        // When: that old client calls a valid tool after the new request is active.
+        let response = client
+            .post(&endpoint)
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .header("mcp-session-id", session_id)
+            .body(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 3,
+                    "method": "tools/call",
+                    "params": {"name": "list_files", "arguments": {}}
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+        let body = response.text().await.unwrap();
+
+        // Then: the real endpoint returns a stale-run error and adds no second completion.
+        assert!(body.contains("stale provider run"), "response was: {body}");
+        assert_eq!(gate.completed().len(), 1);
+        gate.acknowledge_receipts().unwrap();
+        assert!(!receipt_path.exists());
     }
 }

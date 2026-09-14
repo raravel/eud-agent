@@ -335,6 +335,9 @@ fn project_from_graph(
         main_file,
         settings,
         plugins,
+        python_entrypoints: Vec::new(),
+        python_dependencies: Vec::new(),
+        python_lock: None,
         editor_compatibility: None,
     };
     let dat = extract_dat(graph, root, catalog)?;
@@ -1657,6 +1660,9 @@ mod tests {
                     }],
                     raw_text: None,
                 }],
+                python_entrypoints: Vec::new(),
+                python_dependencies: Vec::new(),
+                python_lock: None,
                 editor_compatibility: None,
             },
             dat: NativeDatState::default(),

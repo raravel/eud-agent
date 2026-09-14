@@ -18,6 +18,7 @@
 //! injected [`ProgressEmitter`]: prod uses Tauri's `AppHandle::emit`; tests use a recording
 //! double.
 
+use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -27,6 +28,9 @@ use anyhow::{bail, Context};
 use sha2::{Digest, Sha256};
 
 use crate::config::{AssetSpec, DataDirs};
+
+#[path = "process_tree.rs"]
+pub mod process_tree;
 
 /// The RAG index is stored under `rag/` with this fixed basename (the GitHub Release asset
 /// is downloaded to it after sha256 verification).
@@ -745,6 +749,776 @@ pub async fn ensure_codex(
     Ok(codex_path)
 }
 
+pub const MANAGED_UV_VERSION: &str = "0.11.3";
+pub const MANAGED_UV_URL: &str =
+    "https://github.com/astral-sh/uv/releases/download/0.11.3/uv-x86_64-pc-windows-msvc.zip";
+pub const MANAGED_UV_SHA256: &str =
+    "ae681c0aaec7cc96af184648cb88d73f8393ed60fa5880abdd6bdb910f9b227c";
+const MANAGED_UV_ARCHIVE_NAME: &str = "uv-x86_64-pc-windows-msvc.zip";
+const MANAGED_UV_EXE_NAME: &str = "uv.exe";
+const MANAGED_UV_MARKER: &str = ".uv-install.json";
+const MAX_UV_ARCHIVE_FILES: usize = 32;
+const MAX_UV_ARCHIVE_BYTES: u64 = 256 * 1024 * 1024;
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManagedUvInstalledFile {
+    path: String,
+    sha256: String,
+    bytes: u64,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManagedUvInstallMarker {
+    version: String,
+    archive_sha256: String,
+    executable: String,
+    files: Vec<ManagedUvInstalledFile>,
+}
+
+/// Bundled managed-uv identity. No ambient executable or mutable release metadata
+/// participates in dependency resolution.
+pub fn managed_uv_spec() -> AssetSpec {
+    AssetSpec {
+        name: MANAGED_UV_URL.to_string(),
+        sha256: MANAGED_UV_SHA256.to_string(),
+        version: MANAGED_UV_VERSION.to_string(),
+    }
+}
+
+fn safe_uv_zip_path(name: &str) -> anyhow::Result<PathBuf> {
+    if name.is_empty() || name.contains('\\') || name.contains('\0') {
+        bail!("uv 압축 파일에 잘못된 경로가 있습니다.");
+    }
+    let directoryless = name.trim_end_matches('/');
+    if directoryless.is_empty()
+        || directoryless.starts_with('/')
+        || directoryless.as_bytes().get(1) == Some(&b':')
+    {
+        bail!("uv 압축 파일에 절대 경로가 있습니다.");
+    }
+    let mut path = PathBuf::new();
+    for component in directoryless.split('/') {
+        if component.is_empty()
+            || matches!(component, "." | "..")
+            || component.ends_with(['.', ' '])
+            || component
+                .chars()
+                .any(|character| character.is_control() || "<>:\"|?*".contains(character))
+        {
+            bail!("uv 압축 파일에 경로 이탈 항목이 있습니다.");
+        }
+        path.push(component);
+    }
+    Ok(path)
+}
+
+fn metadata_is_reparse(metadata: &fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    }
+    #[cfg(not(windows))]
+    false
+}
+
+fn require_plain_directory(path: &Path) -> anyhow::Result<()> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("관리형 도구 디렉터리가 없습니다: {}", path.display()))?;
+    if !metadata.file_type().is_dir() || metadata_is_reparse(&metadata) {
+        bail!(
+            "관리형 도구 경로가 일반 디렉터리가 아닙니다: {}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+fn ensure_plain_directory(base: &Path, path: &Path) -> anyhow::Result<()> {
+    if !path.starts_with(base) {
+        bail!("관리형 도구 경로가 설치 루트를 벗어났습니다.");
+    }
+    require_plain_directory(base)?;
+    let mut current = base.to_path_buf();
+    for component in path.strip_prefix(base)?.components() {
+        current.push(component);
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) => {
+                if !metadata.file_type().is_dir() || metadata_is_reparse(&metadata) {
+                    bail!(
+                        "관리형 도구 하위 경로가 일반 디렉터리가 아닙니다: {}",
+                        current.display()
+                    );
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                fs::create_dir(&current)?;
+                require_plain_directory(&current)?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+
+fn managed_uv_tree(
+    root: &Path,
+    current: &Path,
+    files: &mut HashSet<String>,
+    directories: &mut HashSet<String>,
+) -> anyhow::Result<()> {
+    for entry in fs::read_dir(current)? {
+        let entry = entry?;
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path)?;
+        if metadata_is_reparse(&metadata) {
+            bail!(
+                "uv 설치 트리에 reparse point가 있습니다: {}",
+                path.display()
+            );
+        }
+        let relative = path
+            .strip_prefix(root)?
+            .to_string_lossy()
+            .replace('\\', "/")
+            .to_lowercase();
+        if metadata.file_type().is_dir() {
+            directories.insert(relative);
+            managed_uv_tree(root, &path, files, directories)?;
+        } else if metadata.file_type().is_file() {
+            files.insert(relative);
+        } else {
+            bail!(
+                "uv 설치 트리에 일반 파일이 아닌 항목이 있습니다: {}",
+                path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn extract_managed_uv_archive(archive_path: &Path, staging_dir: &Path) -> anyhow::Result<PathBuf> {
+    require_plain_directory(staging_dir)?;
+    let archive_file = File::open(archive_path)?;
+    let mut archive =
+        zip::ZipArchive::new(archive_file).context("uv 배포 파일이 올바른 ZIP이 아닙니다.")?;
+    if archive.is_empty() || archive.len() > MAX_UV_ARCHIVE_FILES {
+        bail!("uv 압축 파일의 항목 수가 허용 범위를 벗어났습니다.");
+    }
+    let mut seen = HashSet::new();
+    let mut files = Vec::new();
+    let mut executable = None;
+    let mut total_bytes = 0_u64;
+    for index in 0..archive.len() {
+        let mut source = archive.by_index(index)?;
+        let raw_name = source.name().to_owned();
+        let relative = safe_uv_zip_path(&raw_name)?;
+        if relative == Path::new(MANAGED_UV_MARKER) {
+            bail!("uv 압축 파일이 예약된 설치 표식을 포함합니다.");
+        }
+        if source
+            .unix_mode()
+            .is_some_and(|mode| mode & 0o170000 == 0o120000)
+        {
+            bail!("uv 압축 파일에 심볼릭 링크가 있습니다.");
+        }
+        let duplicate_key = relative.to_string_lossy().replace('\\', "/").to_lowercase();
+        if !seen.insert(duplicate_key) {
+            bail!("uv 압축 파일에 중복 경로가 있습니다.");
+        }
+        let output = staging_dir.join(&relative);
+        if source.is_dir() {
+            ensure_plain_directory(staging_dir, &output)?;
+            continue;
+        }
+        if raw_name.ends_with('/') {
+            bail!("uv 압축 파일의 파일/디렉터리 표시가 일치하지 않습니다.");
+        }
+        let bytes = source.size();
+        total_bytes = total_bytes
+            .checked_add(bytes)
+            .context("uv 압축 해제 크기가 넘쳤습니다.")?;
+        if bytes > MAX_UV_ARCHIVE_BYTES || total_bytes > MAX_UV_ARCHIVE_BYTES {
+            bail!("uv 압축 해제 크기가 허용 범위를 벗어났습니다.");
+        }
+        let parent = output
+            .parent()
+            .context("uv 압축 파일 항목에 상위 경로가 없습니다.")?;
+        ensure_plain_directory(staging_dir, parent)?;
+        let mut destination = File::create_new(&output)?;
+        std::io::copy(&mut source, &mut destination)?;
+        destination.flush()?;
+        destination.sync_all()?;
+        let installed_bytes = destination.metadata()?.len();
+        if installed_bytes != bytes {
+            bail!("uv 압축 파일 항목이 완전히 기록되지 않았습니다.");
+        }
+        let sha256 = sha256_file(&output)?;
+        if relative.file_name().is_some_and(|name| {
+            name.to_string_lossy()
+                .eq_ignore_ascii_case(MANAGED_UV_EXE_NAME)
+        }) {
+            if executable.is_some() {
+                bail!("uv 압축 파일에 uv.exe가 여러 개 있습니다.");
+            }
+            executable = Some(relative.clone());
+        }
+        files.push(ManagedUvInstalledFile {
+            path: relative.to_string_lossy().replace('\\', "/"),
+            sha256,
+            bytes,
+        });
+    }
+    let executable = executable.context("uv 압축 파일에 uv.exe가 없습니다.")?;
+    files.sort_by(|left, right| left.path.to_lowercase().cmp(&right.path.to_lowercase()));
+    let marker = ManagedUvInstallMarker {
+        version: MANAGED_UV_VERSION.to_string(),
+        archive_sha256: MANAGED_UV_SHA256.to_string(),
+        executable: executable.to_string_lossy().replace('\\', "/"),
+        files,
+    };
+    let marker_tmp = staging_dir.join(format!("{MANAGED_UV_MARKER}.tmp"));
+    let marker_path = staging_dir.join(MANAGED_UV_MARKER);
+    let mut marker_file = File::create_new(&marker_tmp)?;
+    marker_file.write_all(&serde_json::to_vec(&marker)?)?;
+    marker_file.flush()?;
+    marker_file.sync_all()?;
+    fs::rename(marker_tmp, marker_path)?;
+    validate_managed_uv_dir(staging_dir)
+}
+
+fn validate_managed_uv_dir(install_dir: &Path) -> anyhow::Result<PathBuf> {
+    require_plain_directory(install_dir)?;
+    let marker_path = install_dir.join(MANAGED_UV_MARKER);
+    let marker_metadata =
+        fs::symlink_metadata(&marker_path).context("uv 설치 완료 표식이 없습니다.")?;
+    if !marker_metadata.file_type().is_file()
+        || metadata_is_reparse(&marker_metadata)
+        || marker_metadata.len() > 64 * 1024
+    {
+        bail!("uv 설치 완료 표식이 일반 파일이 아닙니다.");
+    }
+    let marker: ManagedUvInstallMarker = serde_json::from_slice(&fs::read(&marker_path)?)
+        .context("uv 설치 완료 표식이 올바르지 않습니다.")?;
+    if marker.version != MANAGED_UV_VERSION
+        || marker.archive_sha256 != MANAGED_UV_SHA256
+        || marker.files.is_empty()
+    {
+        bail!("uv 설치 완료 표식의 버전 또는 체크섬이 일치하지 않습니다.");
+    }
+    let root = fs::canonicalize(install_dir)?;
+    let declared_executable = safe_uv_zip_path(&marker.executable)?;
+    let mut seen = HashSet::with_capacity(marker.files.len());
+    let mut executable = None;
+    for file in &marker.files {
+        let relative = safe_uv_zip_path(&file.path)?;
+        let key = relative.to_string_lossy().replace('\\', "/").to_lowercase();
+        if !seen.insert(key) {
+            bail!("uv 설치 완료 표식에 중복 파일이 있습니다.");
+        }
+        let path = install_dir.join(&relative);
+        let metadata = fs::symlink_metadata(&path)
+            .with_context(|| format!("uv 설치 파일이 없습니다: {}", file.path))?;
+        if !metadata.file_type().is_file()
+            || metadata_is_reparse(&metadata)
+            || metadata.len() != file.bytes
+        {
+            bail!("uv 설치 파일이 손상되었습니다: {}", file.path);
+        }
+        let canonical = fs::canonicalize(&path)?;
+        if !canonical.starts_with(&root)
+            || sha256_file(&path)? != file.sha256
+            || file.sha256.len() != 64
+            || !file.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            bail!("uv 설치 파일 검증에 실패했습니다: {}", file.path);
+        }
+        if relative == declared_executable {
+            executable = Some(path);
+        }
+    }
+    let mut expected_files = seen;
+    expected_files.insert(MANAGED_UV_MARKER.to_lowercase());
+    let mut expected_directories = HashSet::new();
+    for file in &marker.files {
+        let relative = safe_uv_zip_path(&file.path)?;
+        let mut parent = relative.parent();
+        while let Some(directory) = parent {
+            if directory.as_os_str().is_empty() {
+                break;
+            }
+            expected_directories.insert(
+                directory
+                    .to_string_lossy()
+                    .replace('\\', "/")
+                    .to_lowercase(),
+            );
+            parent = directory.parent();
+        }
+    }
+    let mut actual_files = HashSet::new();
+    let mut actual_directories = HashSet::new();
+    managed_uv_tree(
+        install_dir,
+        install_dir,
+        &mut actual_files,
+        &mut actual_directories,
+    )?;
+    if actual_files != expected_files || actual_directories != expected_directories {
+        bail!("uv 설치 트리가 완료 표식의 정확한 파일 목록과 다릅니다.");
+    }
+    let executable = executable.context("uv 설치 완료 표식의 실행 파일이 없습니다.")?;
+    if !executable.file_name().is_some_and(|name| {
+        name.to_string_lossy()
+            .eq_ignore_ascii_case(MANAGED_UV_EXE_NAME)
+    }) {
+        bail!("uv 설치 완료 표식의 실행 파일 경로가 올바르지 않습니다.");
+    }
+    Ok(executable)
+}
+
+/// Validate the pinned managed uv distribution without downloading or consulting PATH.
+pub fn managed_uv_path(dirs: &DataDirs) -> anyhow::Result<PathBuf> {
+    validate_managed_uv_dir(&dirs.managed_uv_dir(MANAGED_UV_VERSION))
+}
+
+fn publish_managed_uv(staging_dir: &Path, install_dir: &Path) -> anyhow::Result<PathBuf> {
+    match fs::rename(staging_dir, install_dir) {
+        Ok(()) => validate_managed_uv_dir(install_dir),
+        Err(_error) if install_dir.exists() => {
+            if let Ok(executable) = validate_managed_uv_dir(install_dir) {
+                return Ok(executable);
+            }
+            let parent = install_dir
+                .parent()
+                .context("uv 설치 경로에 상위 디렉터리가 없습니다.")?;
+            let quarantine = parent.join(format!(".invalid-{}", uuid::Uuid::new_v4().simple()));
+            fs::rename(install_dir, &quarantine)
+                .context("손상된 uv 설치를 격리하지 못했습니다.")?;
+            if let Err(publish_error) = fs::rename(staging_dir, install_dir) {
+                let _ = fs::rename(&quarantine, install_dir);
+                return Err(publish_error).context("검증된 uv 설치를 게시하지 못했습니다.");
+            }
+            let _ = fs::remove_dir_all(quarantine);
+            validate_managed_uv_dir(install_dir)
+        }
+        Err(error) => Err(error).context("검증된 uv 설치를 게시하지 못했습니다."),
+    }
+}
+
+/// Download, verify, safely extract, and atomically publish the pinned uv 0.11.3 build.
+pub async fn ensure_managed_uv(
+    dirs: &DataDirs,
+    emitter: &(dyn ProgressEmitter + Send + Sync),
+) -> anyhow::Result<PathBuf> {
+    let root = dirs.uv_dir();
+    fs::create_dir_all(&root)?;
+    require_plain_directory(&root)?;
+    if let Ok(executable) = managed_uv_path(dirs) {
+        return Ok(executable);
+    }
+
+    let staging_root = root.join(format!(".staging-{}", uuid::Uuid::new_v4().simple()));
+    fs::create_dir(&staging_root)?;
+    require_plain_directory(&staging_root)?;
+    let payload = staging_root.join("payload");
+    fs::create_dir(&payload)?;
+    let archive_tmp = staging_root.join(MANAGED_UV_ARCHIVE_NAME);
+    let result = async {
+        emitter.emit("bootstrap", 0, "관리형 uv를 다운로드하고 있습니다.");
+        download_to_tmp(MANAGED_UV_URL, &archive_tmp, "uv 0.11.3", emitter).await?;
+        verify_downloaded_tmp(&archive_tmp, &archive_tmp, MANAGED_UV_SHA256)?;
+        emitter.emit("bootstrap", 90, "관리형 uv를 검증하고 있습니다.");
+        let extracted = tokio::task::spawn_blocking({
+            let archive_tmp = archive_tmp.clone();
+            let payload = payload.clone();
+            move || {
+                let executable = extract_managed_uv_archive(&archive_tmp, &payload)?;
+                fs::remove_file(&archive_tmp)?;
+                Ok::<PathBuf, anyhow::Error>(executable)
+            }
+        })
+        .await
+        .context("uv 압축 해제 작업이 중단되었습니다.")??;
+        debug_assert!(extracted.starts_with(&payload));
+        let executable = publish_managed_uv(&payload, &dirs.managed_uv_dir(MANAGED_UV_VERSION))?;
+        emitter.emit("bootstrap", 100, "관리형 uv가 준비되었습니다.");
+        Ok(executable)
+    }
+    .await;
+    let _ = fs::remove_dir_all(staging_root);
+    result
+}
+
+const EUDDRAFT_RELEASE_API_URL: &str =
+    "https://api.github.com/repos/armoha/euddraft/releases/latest";
+const EUDDRAFT_INSTALL_MARKER: &str = ".euddraft-install.json";
+const EUDDRAFT_EXE_FILENAME: &str = "euddraft.exe";
+
+#[derive(Debug)]
+struct EuddraftReleaseSpec {
+    version: String,
+    archive: AssetSpec,
+    archive_name: String,
+    archive_bytes: u64,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct EuddraftInstalledFile {
+    path: String,
+    sha256: String,
+    bytes: u64,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct EuddraftInstallMarker {
+    version: String,
+    archive_sha256: String,
+    executable: String,
+    files: Vec<EuddraftInstalledFile>,
+}
+
+fn parse_euddraft_release(bytes: &[u8]) -> anyhow::Result<EuddraftReleaseSpec> {
+    let release: GitHubRelease =
+        serde_json::from_slice(bytes).context("invalid euddraft release metadata")?;
+    let version = release.tag_name.trim();
+    if version.is_empty()
+        || version.contains('/')
+        || version.contains('\\')
+        || version.contains('?')
+        || version.contains('#')
+    {
+        bail!("euddraft release metadata has an invalid tag_name");
+    }
+    let version_number = version.strip_prefix('v').unwrap_or(version);
+    let expected_name = format!("euddraft{version_number}.zip");
+    let asset = release
+        .assets
+        .iter()
+        .find(|asset| asset.name == expected_name)
+        .with_context(|| format!("euddraft release {version} is missing {expected_name}"))?;
+    let url_prefix = "https://github.com/armoha/euddraft/releases/download/";
+    let url_suffix = asset
+        .browser_download_url
+        .strip_prefix(url_prefix)
+        .with_context(|| {
+            format!(
+                "euddraft release {version} asset {expected_name} has an unofficial download URL"
+            )
+        })?;
+    let (url_tag, url_name) = url_suffix.split_once('/').with_context(|| {
+        format!("euddraft release {version} asset {expected_name} has an invalid download URL")
+    })?;
+    if url_tag != version || url_name != asset.name || url_name.contains('/') {
+        bail!("euddraft release {version} asset {expected_name} has an invalid download URL");
+    }
+    if asset.size == 0 {
+        bail!("euddraft release {version} asset {expected_name} has an invalid size");
+    }
+    let digest = asset
+        .digest
+        .as_deref()
+        .and_then(|digest| digest.strip_prefix("sha256:"))
+        .filter(|digest| digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .with_context(|| {
+            format!("euddraft release {version} asset {expected_name} has no valid sha256 digest")
+        })?;
+    Ok(EuddraftReleaseSpec {
+        version: version.to_string(),
+        archive: AssetSpec {
+            name: asset.browser_download_url.clone(),
+            sha256: digest.to_ascii_lowercase(),
+            version: version.to_string(),
+        },
+        archive_name: asset.name.clone(),
+        archive_bytes: asset.size,
+    })
+}
+
+async fn fetch_euddraft_release() -> anyhow::Result<EuddraftReleaseSpec> {
+    let bytes = reqwest::Client::builder()
+        .user_agent("eud-agent-bootstrap")
+        .build()?
+        .get(EUDDRAFT_RELEASE_API_URL)
+        .send()
+        .await
+        .context("failed to fetch latest euddraft release metadata")?
+        .error_for_status()
+        .context("latest euddraft release metadata returned an error status")?
+        .bytes()
+        .await
+        .context("failed to read latest euddraft release metadata")?;
+    parse_euddraft_release(&bytes)
+}
+
+fn safe_euddraft_zip_path(name: &str) -> anyhow::Result<PathBuf> {
+    if name.is_empty() || name.contains('\\') || name.contains('\0') {
+        bail!("euddraft archive contains an invalid member path");
+    }
+    let directoryless = name.trim_end_matches('/');
+    if directoryless.is_empty()
+        || directoryless.starts_with('/')
+        || directoryless.as_bytes().get(1) == Some(&b':')
+    {
+        bail!("euddraft archive contains an absolute member path");
+    }
+    let mut path = PathBuf::new();
+    for component in directoryless.split('/') {
+        if component.is_empty()
+            || component.ends_with(['.', ' '])
+            || component
+                .chars()
+                .any(|c| c.is_control() || "<>:\"|?*".contains(c))
+        {
+            bail!("euddraft archive contains a path traversal member");
+        }
+        path.push(component);
+    }
+    Ok(path)
+}
+
+fn euddraft_install_path(
+    install_dir: &Path,
+    marker: &EuddraftInstallMarker,
+) -> anyhow::Result<PathBuf> {
+    let install_meta =
+        fs::symlink_metadata(install_dir).context("euddraft install directory is missing")?;
+    if !install_meta.file_type().is_dir() || install_meta.file_type().is_symlink() {
+        bail!("euddraft install directory is not a regular directory");
+    }
+    let marker_path = install_dir.join(EUDDRAFT_INSTALL_MARKER);
+    let marker_meta =
+        fs::symlink_metadata(&marker_path).context("euddraft install marker is missing")?;
+    if !marker_meta.file_type().is_file() {
+        bail!("euddraft install marker is not a regular file");
+    }
+    let root = fs::canonicalize(install_dir)?;
+    let mut seen = HashSet::with_capacity(marker.files.len());
+    let mut executable = None;
+    for file in &marker.files {
+        let relative = safe_euddraft_zip_path(&file.path)?;
+        if !seen.insert(file.path.to_lowercase()) {
+            bail!("euddraft install marker contains duplicate files");
+        }
+        let path = install_dir.join(&relative);
+        let metadata = fs::symlink_metadata(&path)
+            .with_context(|| format!("euddraft install is missing {}", file.path))?;
+        if !metadata.file_type().is_file() || metadata.len() != file.bytes {
+            bail!("euddraft install file is incomplete: {}", file.path);
+        }
+        let canonical = fs::canonicalize(&path)?;
+        if !canonical.starts_with(&root) || sha256_file(&path)? != file.sha256 {
+            bail!("euddraft install file failed validation: {}", file.path);
+        }
+        if relative.file_name().is_some_and(|name| {
+            name.to_string_lossy()
+                .eq_ignore_ascii_case(EUDDRAFT_EXE_FILENAME)
+        }) {
+            if executable.is_some() {
+                bail!("euddraft install marker contains multiple euddraft.exe files");
+            }
+            executable = Some(path);
+        }
+    }
+    let executable = executable.context("euddraft archive has no euddraft.exe")?;
+    let declared = safe_euddraft_zip_path(&marker.executable)?;
+    if declared != executable.strip_prefix(install_dir)? {
+        bail!("euddraft install marker executable is invalid");
+    }
+    Ok(executable)
+}
+
+fn extract_euddraft_archive(
+    archive_path: &Path,
+    staging_dir: &Path,
+    version: &str,
+    archive_sha256: &str,
+) -> anyhow::Result<PathBuf> {
+    let archive_file = File::open(archive_path)?;
+    let mut archive =
+        zip::ZipArchive::new(archive_file).context("euddraft release is not a valid ZIP")?;
+    let mut seen = HashSet::new();
+    let mut files = Vec::new();
+    let mut executable = None;
+    for index in 0..archive.len() {
+        let mut source = archive.by_index(index)?;
+        let raw_name = source.name().to_owned();
+        let relative = safe_euddraft_zip_path(&raw_name)?;
+        if raw_name.eq_ignore_ascii_case(EUDDRAFT_INSTALL_MARKER) {
+            bail!("euddraft archive contains a reserved install marker");
+        }
+        if source
+            .unix_mode()
+            .is_some_and(|mode| mode & 0o170000 == 0o120000)
+        {
+            bail!("euddraft archive contains a symlink");
+        }
+        if !seen.insert(raw_name.trim_end_matches('/').to_lowercase()) {
+            bail!("euddraft archive contains duplicate member paths");
+        }
+        let output = staging_dir.join(&relative);
+        if output == archive_path {
+            bail!("euddraft archive member collides with its staging file");
+        }
+        if source.is_dir() {
+            fs::create_dir_all(&output)?;
+            continue;
+        }
+        if raw_name.ends_with('/') {
+            bail!("euddraft archive contains a file with a directory path");
+        }
+        if let Some(parent) = output.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let mut destination = File::create_new(&output)?;
+        std::io::copy(&mut source, &mut destination)?;
+        destination.flush()?;
+        destination.sync_all()?;
+        let bytes = destination.metadata()?.len();
+        let sha256 = sha256_file(&output)?;
+        if relative.file_name().is_some_and(|name| {
+            name.to_string_lossy()
+                .eq_ignore_ascii_case(EUDDRAFT_EXE_FILENAME)
+        }) {
+            if executable.is_some() {
+                bail!("euddraft archive contains multiple euddraft.exe files");
+            }
+            executable = Some(relative.clone());
+        }
+        files.push(EuddraftInstalledFile {
+            path: raw_name,
+            sha256,
+            bytes,
+        });
+    }
+    let executable = executable.context("euddraft archive has no euddraft.exe")?;
+    let marker = EuddraftInstallMarker {
+        version: version.to_string(),
+        archive_sha256: archive_sha256.to_string(),
+        executable: executable.to_string_lossy().replace('\\', "/"),
+        files,
+    };
+    fs::remove_file(archive_path)?;
+    let marker_tmp = staging_dir.join(format!("{EUDDRAFT_INSTALL_MARKER}.tmp"));
+    let marker_path = staging_dir.join(EUDDRAFT_INSTALL_MARKER);
+    let mut marker_file = File::create(&marker_tmp)?;
+    marker_file.write_all(&serde_json::to_vec(&marker)?)?;
+    marker_file.flush()?;
+    marker_file.sync_all()?;
+    fs::rename(marker_tmp, marker_path)?;
+    euddraft_install_path(staging_dir, &marker)
+}
+
+fn validate_euddraft_install(
+    install_dir: &Path,
+    version: &str,
+    archive_sha256: &str,
+) -> anyhow::Result<PathBuf> {
+    let marker_path = install_dir.join(EUDDRAFT_INSTALL_MARKER);
+    let marker: EuddraftInstallMarker = serde_json::from_slice(&fs::read(&marker_path)?)?;
+    if marker.version != version || marker.archive_sha256 != archive_sha256 {
+        bail!("euddraft install version or digest does not match latest release");
+    }
+    euddraft_install_path(install_dir, &marker)
+}
+
+/// Download and atomically install the latest complete euddraft distribution.
+///
+/// The release archive is verified before extraction. All members are extracted into a
+/// fresh version/digest-addressed directory, validated with a persisted file manifest, and
+/// only then published by rename, so a failed download or extraction cannot become runnable.
+pub async fn ensure_euddraft(
+    dirs: &DataDirs,
+    emitter: &(dyn ProgressEmitter + Send + Sync),
+) -> anyhow::Result<PathBuf> {
+    let root = dirs.euddraft_dir();
+    fs::create_dir_all(&root)
+        .with_context(|| format!("cannot create euddraft dir {}", root.display()))?;
+    if fs::symlink_metadata(&root)?.file_type().is_symlink() {
+        bail!("euddraft dir is a symlink");
+    }
+    emitter.emit("bootstrap", 0, "checking latest euddraft release");
+    let release = fetch_euddraft_release().await?;
+    let install_dir = root.join(format!("sha256-{}", release.archive.sha256));
+    match fs::symlink_metadata(&install_dir) {
+        Ok(_) => {
+            return validate_euddraft_install(
+                &install_dir,
+                &release.version,
+                &release.archive.sha256,
+            )
+            .inspect(|_| {
+                emitter.emit("bootstrap", 100, "euddraft ready");
+            });
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+
+    let staging_dir = root.join(format!(".staging-{}", uuid::Uuid::new_v4().simple()));
+    fs::create_dir(&staging_dir)?;
+    let archive_tmp = staging_dir.join(&release.archive_name);
+    let result = async {
+        emitter.emit(
+            "bootstrap",
+            0,
+            &format!("downloading euddraft {}", release.version),
+        );
+        download_to_tmp(&release.archive.name, &archive_tmp, "euddraft", emitter).await?;
+        let actual_size = fs::metadata(&archive_tmp)?.len();
+        if actual_size != release.archive_bytes {
+            bail!(
+                "euddraft archive size mismatch: expected {}, got {}",
+                release.archive_bytes,
+                actual_size
+            );
+        }
+        verify_downloaded_tmp(&archive_tmp, &archive_tmp, &release.archive.sha256)?;
+        emitter.emit("bootstrap", 90, "extracting euddraft");
+        let executable = tokio::task::spawn_blocking({
+            let archive_tmp = archive_tmp.clone();
+            let staging_dir = staging_dir.clone();
+            let version = release.version.clone();
+            let digest = release.archive.sha256.clone();
+            move || extract_euddraft_archive(&archive_tmp, &staging_dir, &version, &digest)
+        })
+        .await
+        .context("euddraft extraction task failed")??;
+        let installed_executable = install_dir.join(executable.strip_prefix(&staging_dir)?);
+        match fs::rename(&staging_dir, &install_dir) {
+            Ok(()) => {}
+            Err(_) if fs::symlink_metadata(&install_dir).is_ok() => {
+                let executable = validate_euddraft_install(
+                    &install_dir,
+                    &release.version,
+                    &release.archive.sha256,
+                )
+                .with_context(|| {
+                    format!(
+                        "euddraft install appeared concurrently but is invalid: {}",
+                        install_dir.display()
+                    )
+                })?;
+                emitter.emit("bootstrap", 100, "euddraft ready");
+                return Ok(executable);
+            }
+            Err(error) => return Err(error.into()),
+        }
+        emitter.emit("bootstrap", 100, "euddraft ready");
+        Ok(installed_executable)
+    }
+    .await;
+    // Also remove our staging tree when another process published the same release.
+    let _ = fs::remove_dir_all(&staging_dir);
+    result
+}
+
 /// Stream `url` to `tmp`, emitting `bootstrap` byte-progress. Caller owns tmp cleanup on
 /// error (we only write; verify+place happens after). NOT unit-tested (real HTTP).
 async fn download_to_tmp(
@@ -949,6 +1723,102 @@ mod manifest {
 
     // sha256("hello") — the canonical test vector.
     const HELLO_SHA: &str = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
+
+    #[test]
+    fn managed_uv_metadata_is_fully_pinned() {
+        let spec = managed_uv_spec();
+        assert_eq!(spec.version, "0.11.3");
+        assert_eq!(
+            spec.name,
+            "https://github.com/astral-sh/uv/releases/download/0.11.3/uv-x86_64-pc-windows-msvc.zip"
+        );
+        assert_eq!(
+            spec.sha256,
+            "ae681c0aaec7cc96af184648cb88d73f8393ed60fa5880abdd6bdb910f9b227c"
+        );
+    }
+
+    #[test]
+    fn managed_uv_staging_is_marker_last_and_detects_corruption() {
+        let base = unique_temp_dir("managed-uv");
+        let archive_path = base.join("uv.zip");
+        let mut archive = zip::ZipWriter::new(File::create(&archive_path).unwrap());
+        for (name, bytes) in [("uv.exe", b"uv".as_slice()), ("uvx.exe", b"uvx".as_slice())] {
+            archive
+                .start_file(name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            archive.write_all(bytes).unwrap();
+        }
+        archive.finish().unwrap();
+        let staging = base.join("staging");
+        fs::create_dir(&staging).unwrap();
+        let executable = extract_managed_uv_archive(&archive_path, &staging).unwrap();
+        assert_eq!(executable, staging.join("uv.exe"));
+        assert!(staging.join(MANAGED_UV_MARKER).is_file());
+        assert_eq!(validate_managed_uv_dir(&staging).unwrap(), executable);
+        fs::write(staging.join("unexpected.txt"), b"unexpected").unwrap();
+        assert!(validate_managed_uv_dir(&staging).is_err());
+        fs::remove_file(staging.join("unexpected.txt")).unwrap();
+        fs::write(staging.join("uvx.exe"), b"damaged").unwrap();
+        assert!(validate_managed_uv_dir(&staging).is_err());
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn managed_uv_zip_paths_reject_escape_and_windows_aliases() {
+        for path in [
+            "../uv.exe",
+            "/uv.exe",
+            "C:/uv.exe",
+            "dir\\uv.exe",
+            "dir./uv.exe",
+        ] {
+            assert!(
+                safe_uv_zip_path(path).is_err(),
+                "unsafe path accepted: {path}"
+            );
+        }
+        assert_eq!(
+            safe_uv_zip_path("tools/uv.exe").unwrap(),
+            PathBuf::from("tools/uv.exe")
+        );
+    }
+
+    #[test]
+    fn euddraft_archive_preserves_nested_distribution_and_detects_damaged_dependency() {
+        let base = unique_temp_dir("euddraft-extract");
+        let archive_path = base.join("release.zip");
+        let mut archive = zip::ZipWriter::new(File::create(&archive_path).unwrap());
+        for (name, contents) in [
+            ("euddraft/euddraft.exe", "executable"),
+            ("euddraft/lib/python.dll", "runtime"),
+            ("euddraft/plugins/example.py", "plugin"),
+        ] {
+            archive
+                .start_file(name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            archive.write_all(contents.as_bytes()).unwrap();
+        }
+        archive.finish().unwrap();
+        let staging = base.join("staging");
+        fs::create_dir(&staging).unwrap();
+        let executable =
+            extract_euddraft_archive(&archive_path, &staging, "v1", HELLO_SHA).unwrap();
+        assert_eq!(fs::read(executable).unwrap(), b"executable");
+        assert_eq!(
+            fs::read(staging.join("euddraft/plugins/example.py")).unwrap(),
+            b"plugin"
+        );
+        let installed = base.join("installed");
+        fs::rename(staging, &installed).unwrap();
+        assert_eq!(
+            validate_euddraft_install(&installed, "v1", HELLO_SHA).unwrap(),
+            installed.join("euddraft/euddraft.exe")
+        );
+        fs::write(installed.join("euddraft/lib/python.dll"), b"damaged").unwrap();
+        assert!(validate_euddraft_install(&installed, "v1", HELLO_SHA).is_err());
+        fs::remove_dir_all(base).unwrap();
+    }
 
     #[test]
     fn sha256_hex_bytes_matches_known_vector() {
@@ -1199,6 +2069,57 @@ mod manifest {
             )
             .is_err(),
             "empty sha256 must refuse (nothing to verify against)"
+        );
+    }
+
+    #[test]
+    fn euddraft_release_requires_pinned_official_zip_and_digest() {
+        let json = format!(
+            r#"{{
+                "tag_name": "v0.10.2.5",
+                "assets": [{{
+                    "name": "euddraft0.10.2.5.zip",
+                    "browser_download_url": "https://github.com/armoha/euddraft/releases/download/v0.10.2.5/euddraft0.10.2.5.zip",
+                    "digest": "sha256:{HELLO_SHA}",
+                    "size": 15108674
+                }}]
+            }}"#
+        );
+        let release = parse_euddraft_release(json.as_bytes()).unwrap();
+        assert_eq!(release.version, "v0.10.2.5");
+        assert_eq!(release.archive_name, "euddraft0.10.2.5.zip");
+        assert_eq!(release.archive.sha256, HELLO_SHA);
+        assert!(parse_euddraft_release(
+            json.replace(
+                "https://github.com/armoha/euddraft/releases/download",
+                "https://github.com/armoha/euddraft/archive"
+            )
+            .as_bytes()
+        )
+        .is_err());
+        assert!(parse_euddraft_release(
+            json.replace("euddraft0.10.2.5.zip", "euddraft0.10.2.5-source.zip")
+                .as_bytes()
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn euddraft_zip_paths_reject_escape_and_drive_names() {
+        for path in [
+            "../escape.exe",
+            "/absolute.exe",
+            "C:/drive.exe",
+            "nested\\escape.exe",
+        ] {
+            assert!(
+                safe_euddraft_zip_path(path).is_err(),
+                "unsafe ZIP member path accepted: {path}"
+            );
+        }
+        assert_eq!(
+            safe_euddraft_zip_path("release/bin/euddraft.exe").unwrap(),
+            PathBuf::from("release/bin/euddraft.exe")
         );
     }
 

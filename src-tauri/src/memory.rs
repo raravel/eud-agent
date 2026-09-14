@@ -1,14 +1,18 @@
-//! Per-project memory store ported from `server/eud_agent/memory.py`.
+//! Per-project memory store.
 //!
-//! The Rust v2 store is rooted at `%appdata%\eud-agent\memory\<project>\`; callers pass
-//! the memory root (`DataDirs::memory_dir()`) plus the raw project name.
+//! Live memory is rooted at `<native project>/.eud-agent/memory`.  The
+//! `new` constructor remains only for explicit legacy fixtures/import lookup;
+//! normal callers use `for_project` or `current`.
 
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use std::fs;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use crate::wiki::Ledger;
 
 /// The four codex/panel-editable markdown files, in render order.
 pub const MEMORY_FILES: [&str; 4] = ["resources", "structure", "conventions", "lessons"];
@@ -27,6 +31,661 @@ pub const NO_MEMORY: &str = "(no project memory)";
 
 /// Marker appended after section-cap truncation.
 pub const TRUNCATED_MARKER: &str = "memory section truncated";
+const IMPORT_META_CAP_BYTES: usize = 64 * 1024;
+const IMPORT_WIKI_CAP_BYTES: usize = 4 * 1024 * 1024;
+
+/// Transactional import guard for accepted memory and wiki data from a legacy
+/// E3S-backed memory store.
+#[derive(Debug)]
+pub(crate) struct LegacyMemoryImport {
+    owned: Vec<OwnedImportFile>,
+    committed: bool,
+}
+
+#[derive(Debug)]
+struct OwnedImportFile {
+    path: PathBuf,
+    bytes: Vec<u8>,
+}
+
+impl LegacyMemoryImport {
+    pub(crate) fn empty() -> Self {
+        empty_import()
+    }
+
+    /// Commit the imported store, retaining files when the guard is dropped.
+    pub(crate) fn commit(mut self) {
+        self.committed = true;
+    }
+
+    /// Remove only files created by this import, and only if they are unchanged.
+    pub(crate) fn rollback(mut self) -> io::Result<()> {
+        self.committed = true;
+        rollback_owned(&mut self.owned)
+    }
+}
+
+impl Drop for LegacyMemoryImport {
+    fn drop(&mut self) {
+        if !self.committed {
+            let _ = rollback_owned(&mut self.owned);
+        }
+    }
+}
+
+fn rollback_owned(owned: &mut Vec<OwnedImportFile>) -> io::Result<()> {
+    let mut first_error = None;
+    for file in owned.drain(..).rev() {
+        match fs::read(&file.path) {
+            Ok(bytes) if bytes == file.bytes => {
+                if let Err(error) = fs::remove_file(&file.path) {
+                    if error.kind() != io::ErrorKind::NotFound && first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                }
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
+        }
+    }
+    first_error.map_or(Ok(()), Err)
+}
+
+fn empty_import() -> LegacyMemoryImport {
+    LegacyMemoryImport {
+        owned: Vec::new(),
+        committed: true,
+    }
+}
+
+/// Import accepted memory/wiki files from the legacy E3S-keyed store.
+///
+/// Every recognized source item is validated independently. A bad item is
+/// reported and skipped while healthy siblings are still copied. Source data
+/// and existing project-local data are never modified.
+impl ProjectMemory {
+    pub(crate) fn import_legacy_harness(
+        memory_root: &Path,
+        source_project: &str,
+        target: &crate::native_project::NativeProject,
+        issues: &mut Vec<crate::harness_import::HarnessImportIssue>,
+    ) -> io::Result<LegacyMemoryImport> {
+        let target_dir = target_store_dir(target);
+        if let Err(error) = validate_existing_components(memory_root) {
+            report_issue(
+                issues,
+                "memory",
+                memory_root,
+                format!("legacy memory root is unsafe or unavailable: {error}"),
+            );
+            return Ok(empty_import());
+        }
+        let source = match find_legacy_source(memory_root, source_project) {
+            Ok(source) => source,
+            Err(error) => {
+                report_issue(
+                    issues,
+                    "memory",
+                    memory_root,
+                    format!("legacy memory source is ambiguous or unavailable: {error}"),
+                );
+                return Ok(empty_import());
+            }
+        };
+        let Some(source) = source else {
+            return Ok(empty_import());
+        };
+        if let Ok(metadata) = fs::symlink_metadata(&source) {
+            if !is_safe_directory_metadata(&metadata) {
+                report_issue(
+                    issues,
+                    "memory",
+                    &source,
+                    "legacy memory source is not a regular directory",
+                );
+                return Ok(empty_import());
+            }
+        } else {
+            report_issue(
+                issues,
+                "memory",
+                &source,
+                "legacy memory source disappeared",
+            );
+            return Ok(empty_import());
+        }
+        let files = collect_import_files(&source, issues);
+        let guard = publish_import_files(&target_dir, &files, issues)?;
+        Ok(guard)
+    }
+
+    /// Migrate the old native-name store once, preserving the origin.
+    pub(crate) fn migrate_native_harness(
+        memory_root: &Path,
+        target: &crate::native_project::NativeProject,
+        issues: &mut Vec<crate::harness_import::HarnessImportIssue>,
+    ) -> io::Result<LegacyMemoryImport> {
+        Self::import_legacy_harness(memory_root, target.manifest().name.as_str(), target, issues)
+    }
+}
+
+fn target_store_dir(target: &crate::native_project::NativeProject) -> PathBuf {
+    target.root().join(".eud-agent").join("memory")
+}
+
+fn report_issue(
+    issues: &mut Vec<crate::harness_import::HarnessImportIssue>,
+    scope: &str,
+    path: &Path,
+    reason: impl Into<String>,
+) {
+    issues.push(crate::harness_import::HarnessImportIssue::new(
+        scope,
+        path.to_string_lossy().into_owned(),
+        reason,
+    ));
+}
+
+fn find_legacy_source(memory_root: &Path, source_project: &str) -> io::Result<Option<PathBuf>> {
+    let names = legacy_source_names(source_project);
+    let mut matches = Vec::new();
+    let entries = match fs::read_dir(memory_root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().to_lowercase();
+        if names.iter().any(|candidate| candidate == &name) {
+            matches.push(entry.path());
+        }
+    }
+    if matches.len() > 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "multiple legacy memory stores match the source E3S project",
+        ));
+    }
+    Ok(matches.pop())
+}
+
+fn legacy_source_names(source_project: &str) -> Vec<String> {
+    let normalized = crate::config::RecentProjectRecord::key(source_project);
+    let mut names = Vec::with_capacity(4);
+    for name in [
+        sanitize_project_name(source_project),
+        sanitize_project_name(&normalized),
+    ] {
+        if name.is_empty() {
+            continue;
+        }
+        let name = name.to_lowercase();
+        if !names.contains(&name) {
+            names.push(name.clone());
+        }
+        let quoted = format!("'{name}'");
+        if !names.contains(&quoted) {
+            names.push(quoted);
+        }
+    }
+    names
+}
+
+#[derive(Debug)]
+struct ImportFile {
+    relative: PathBuf,
+    bytes: Vec<u8>,
+}
+
+fn collect_import_files(
+    source: &Path,
+    issues: &mut Vec<crate::harness_import::HarnessImportIssue>,
+) -> Vec<ImportFile> {
+    let mut files = Vec::new();
+    let entries = match fs::read_dir(source) {
+        Ok(entries) => entries,
+        Err(error) => {
+            report_issue(
+                issues,
+                "memory",
+                source,
+                format!("cannot read legacy store: {error}"),
+            );
+            return files;
+        }
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                report_issue(
+                    issues,
+                    "memory",
+                    source,
+                    format!("cannot inspect legacy item: {error}"),
+                );
+                continue;
+            }
+        };
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                report_issue(
+                    issues,
+                    "memory",
+                    &path,
+                    format!("cannot inspect legacy item: {error}"),
+                );
+                continue;
+            }
+        };
+        if name == "wiki" {
+            if !is_safe_directory_metadata(&metadata) {
+                report_issue(
+                    issues,
+                    "memory",
+                    &path,
+                    "legacy wiki path is not a regular directory",
+                );
+            } else {
+                collect_wiki_file(&path, &mut files, issues);
+            }
+            continue;
+        }
+        if name == META_FILE {
+            collect_meta_file(&path, &metadata, &mut files, issues);
+            continue;
+        }
+        let Some(relative) = name
+            .strip_suffix(".md")
+            .filter(|name| MEMORY_FILES.contains(name))
+        else {
+            continue;
+        };
+        if !is_safe_regular_file_metadata(&metadata) {
+            report_issue(
+                issues,
+                "memory",
+                &path,
+                "legacy memory file is not a regular file",
+            );
+            continue;
+        }
+        match read_bounded_file(&path, CONTENT_CAP_BYTES)
+            .and_then(|bytes| validate_utf8_without_bom(&bytes).map(|_| bytes))
+        {
+            Ok(bytes) => files.push(ImportFile {
+                relative: PathBuf::from(format!("{relative}.md")),
+                bytes,
+            }),
+            Err(error) => report_issue(issues, "memory", &path, error.to_string()),
+        }
+    }
+    files
+}
+
+fn collect_meta_file(
+    path: &Path,
+    metadata: &fs::Metadata,
+    files: &mut Vec<ImportFile>,
+    issues: &mut Vec<crate::harness_import::HarnessImportIssue>,
+) {
+    if !is_safe_regular_file_metadata(metadata) {
+        report_issue(
+            issues,
+            "memory",
+            path,
+            "legacy memory metadata is not a regular file",
+        );
+        return;
+    }
+    let bytes = match read_bounded_file(path, IMPORT_META_CAP_BYTES)
+        .and_then(|bytes| validate_utf8_without_bom(&bytes).map(|_| bytes))
+        .and_then(|bytes| match serde_json::from_slice::<Value>(&bytes) {
+            Ok(Value::Object(_)) => Ok(bytes),
+            Ok(_) => Err(invalid_source(
+                "legacy memory metadata must be a JSON object",
+            )),
+            Err(error) => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("legacy memory metadata is invalid JSON: {error}"),
+            )),
+        }) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            report_issue(issues, "memory", path, error.to_string());
+            return;
+        }
+    };
+    files.push(ImportFile {
+        relative: PathBuf::from(META_FILE),
+        bytes,
+    });
+}
+
+fn collect_wiki_file(
+    path: &Path,
+    files: &mut Vec<ImportFile>,
+    issues: &mut Vec<crate::harness_import::HarnessImportIssue>,
+) {
+    let entries = match fs::read_dir(path) {
+        Ok(entries) => entries,
+        Err(error) => {
+            report_issue(
+                issues,
+                "memory",
+                path,
+                format!("cannot read legacy wiki: {error}"),
+            );
+            return;
+        }
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                report_issue(
+                    issues,
+                    "memory",
+                    path,
+                    format!("cannot inspect legacy wiki: {error}"),
+                );
+                continue;
+            }
+        };
+        if entry.file_name() != "ledger.json" {
+            continue;
+        }
+        let child = entry.path();
+        let metadata = match fs::symlink_metadata(&child) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                report_issue(
+                    issues,
+                    "memory",
+                    &child,
+                    format!("cannot inspect wiki ledger: {error}"),
+                );
+                continue;
+            }
+        };
+        if !is_safe_regular_file_metadata(&metadata) {
+            report_issue(
+                issues,
+                "memory",
+                &child,
+                "legacy wiki ledger is not a regular file",
+            );
+            continue;
+        }
+        let bytes = match read_bounded_file(&child, IMPORT_WIKI_CAP_BYTES)
+            .and_then(|bytes| validate_utf8_without_bom(&bytes).map(|_| bytes))
+            .and_then(|bytes| {
+                serde_json::from_slice::<Ledger>(&bytes)
+                    .map(|_| bytes)
+                    .map_err(|error| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("legacy wiki ledger is invalid: {error}"),
+                        )
+                    })
+            }) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                report_issue(issues, "memory", &child, error.to_string());
+                continue;
+            }
+        };
+        files.push(ImportFile {
+            relative: PathBuf::from("wiki").join("ledger.json"),
+            bytes,
+        });
+    }
+}
+
+fn publish_import_files(
+    target: &Path,
+    files: &[ImportFile],
+    issues: &mut Vec<crate::harness_import::HarnessImportIssue>,
+) -> io::Result<LegacyMemoryImport> {
+    if let Err(error) = validate_existing_components(target) {
+        report_issue(
+            issues,
+            "memory",
+            target,
+            format!("local memory destination is unsafe or unavailable: {error}"),
+        );
+        return Ok(empty_import());
+    }
+    if let Err(error) = fs::create_dir_all(target) {
+        report_issue(
+            issues,
+            "memory",
+            target,
+            format!("cannot create local memory destination: {error}"),
+        );
+        return Ok(empty_import());
+    }
+    let mut owned = Vec::new();
+    for file in files {
+        let destination = target.join(&file.relative);
+        match fs::symlink_metadata(&destination) {
+            Ok(metadata) => {
+                let reason = if is_safe_regular_file_metadata(&metadata) {
+                    "destination already contains local data"
+                } else {
+                    "destination is not a safe regular file"
+                };
+                report_issue(issues, "memory", &destination, reason);
+                continue;
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                report_issue(
+                    issues,
+                    "memory",
+                    &destination,
+                    format!("cannot inspect local destination: {error}"),
+                );
+                continue;
+            }
+        }
+        if let Some(parent) = destination.parent() {
+            if let Err(error) =
+                validate_existing_components(parent).and_then(|_| fs::create_dir_all(parent))
+            {
+                report_issue(
+                    issues,
+                    "memory",
+                    &destination,
+                    format!("local destination is unavailable: {error}"),
+                );
+                continue;
+            }
+        }
+        match write_import_no_replace(&destination, &file.bytes) {
+            Ok(tmp) => {
+                owned.push(OwnedImportFile {
+                    path: destination,
+                    bytes: file.bytes.clone(),
+                });
+                if let Err(error) = remove_import_temp(&tmp) {
+                    return abort_publish(&mut owned, error);
+                }
+            }
+            Err(ImportPublishError::Cleanup(error)) => {
+                return abort_publish(&mut owned, error);
+            }
+            Err(ImportPublishError::Item(error)) => {
+                let reason = if error.kind() == io::ErrorKind::AlreadyExists {
+                    "destination was occupied during import".to_string()
+                } else {
+                    format!("cannot publish imported item: {error}")
+                };
+                report_issue(issues, "memory", &destination, reason);
+            }
+        }
+    }
+    Ok(LegacyMemoryImport {
+        owned,
+        committed: false,
+    })
+}
+enum ImportPublishError {
+    Item(io::Error),
+    Cleanup(io::Error),
+}
+
+fn write_import_no_replace(path: &Path, bytes: &[u8]) -> Result<PathBuf, ImportPublishError> {
+    let tmp = tmp_path(path);
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+        .map_err(ImportPublishError::Item)?;
+    use std::io::Write;
+    let written = file.write_all(bytes);
+    drop(file);
+    match written.and_then(|_| crate::harness_import::publish_staged_file(&tmp, path)) {
+        Ok(()) => Ok(tmp),
+        Err(error) => match remove_import_temp(&tmp) {
+            Ok(()) => Err(ImportPublishError::Item(error)),
+            Err(cleanup) => Err(ImportPublishError::Cleanup(io::Error::other(format!(
+                "{error}; temporary import cleanup failed: {cleanup}"
+            )))),
+        },
+    }
+}
+
+fn remove_import_temp(path: &Path) -> io::Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(io::Error::new(
+            error.kind(),
+            format!(
+                "cannot remove import staging file '{}': {error}",
+                path.display()
+            ),
+        )),
+    }
+}
+
+fn abort_publish(
+    owned: &mut Vec<OwnedImportFile>,
+    error: io::Error,
+) -> io::Result<LegacyMemoryImport> {
+    if let Err(rollback) = rollback_owned(owned) {
+        return Err(io::Error::other(format!(
+            "legacy memory import cleanup failed: {error}; rollback failed: {rollback}"
+        )));
+    }
+    Err(error)
+}
+
+fn read_bounded_file(path: &Path, cap: usize) -> io::Result<Vec<u8>> {
+    let metadata = fs::metadata(path)?;
+    if metadata.len() > cap as u64 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("legacy import file exceeds {cap}-byte limit"),
+        ));
+    }
+    let file = fs::File::open(path)?;
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(cap as u64 + 1).read_to_end(&mut bytes)?;
+    if bytes.len() > cap {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("legacy import file exceeds {cap}-byte limit"),
+        ));
+    }
+    Ok(bytes)
+}
+
+fn validate_utf8_without_bom(bytes: &[u8]) -> io::Result<()> {
+    if bytes.starts_with(&[0xef, 0xbb, 0xbf]) {
+        return Err(invalid_source(
+            "legacy import files must be UTF-8 without BOM",
+        ));
+    }
+    std::str::from_utf8(bytes)
+        .map(|_| ())
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
+
+pub(crate) fn validate_existing_components(path: &Path) -> io::Result<()> {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        current.push(component);
+        // A Windows volume prefix (notably \\?\C:) is not a directory until
+        // its root separator or first relative component has been appended.
+        if matches!(component, std::path::Component::Prefix(_)) {
+            continue;
+        }
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() || is_reparse_point(&metadata) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "memory path contains a symlink/reparse point",
+                    ));
+                }
+                if !metadata.is_dir() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "memory path contains a non-directory component",
+                    ));
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => break,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+fn safe_regular_file(path: &Path) -> bool {
+    if let Some(parent) = path.parent() {
+        if validate_existing_components(parent).is_err() {
+            return false;
+        }
+    }
+    fs::symlink_metadata(path)
+        .map(|metadata| is_safe_regular_file_metadata(&metadata))
+        .unwrap_or(false)
+}
+
+fn is_safe_directory_metadata(metadata: &fs::Metadata) -> bool {
+    metadata.is_dir() && !metadata.file_type().is_symlink() && !is_reparse_point(metadata)
+}
+
+fn is_safe_regular_file_metadata(metadata: &fs::Metadata) -> bool {
+    metadata.is_file() && !metadata.file_type().is_symlink() && !is_reparse_point(metadata)
+}
+
+#[cfg(windows)]
+pub(crate) fn is_reparse_point(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    metadata.file_attributes() & 0x400 != 0
+}
+
+#[cfg(not(windows))]
+pub(crate) fn is_reparse_point(_metadata: &fs::Metadata) -> bool {
+    false
+}
+
+fn invalid_source(message: &str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message)
+}
 
 const META_FILE: &str = "meta.json";
 static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -94,10 +753,12 @@ pub struct ProjectMemory {
     memory_root: PathBuf,
     project_name: String,
     sanitized: String,
+    local_store: bool,
 }
 
 impl ProjectMemory {
-    /// Construct from the v2 memory root (`DataDirs::memory_dir()`) and raw project name.
+    /// Construct an explicit legacy lookup store. Live callers must use
+    /// [`ProjectMemory::for_project`] or [`ProjectMemory::current`].
     pub fn new(memory_root: impl Into<PathBuf>, project_name: impl Into<String>) -> Self {
         let project_name = project_name.into();
         let sanitized = sanitize_project_name(&project_name);
@@ -105,6 +766,37 @@ impl ProjectMemory {
             memory_root: memory_root.into(),
             project_name,
             sanitized,
+            local_store: false,
+        }
+    }
+
+    /// Construct the project-local store at `<root>/.eud-agent/memory`.
+    pub fn for_project(project: &crate::native_project::NativeProject) -> Self {
+        Self {
+            memory_root: project.root().join(".eud-agent").join("memory"),
+            project_name: project.manifest().name.clone(),
+            sanitized: sanitize_project_name(&project.manifest().name),
+            local_store: true,
+        }
+    }
+
+    /// Resolve and validate the configured native project.
+    pub fn current(dirs: &crate::config::DataDirs) -> Result<Self, String> {
+        let config = dirs.load_config().map_err(|error| error.to_string())?;
+        let configured = config.project_path.trim();
+        if configured.is_empty() {
+            return Err("no project is open; memory is disabled".to_string());
+        }
+        let project = crate::native_project::NativeProject::open(Path::new(configured))?;
+        Ok(Self::for_project(&project))
+    }
+    /// Disabled provider used when no project can be resolved.
+    pub fn disabled() -> Self {
+        Self {
+            memory_root: PathBuf::new(),
+            project_name: String::new(),
+            sanitized: String::new(),
+            local_store: true,
         }
     }
 
@@ -115,15 +807,18 @@ impl ProjectMemory {
 
     /// The store directory, or `None` when the store is disabled.
     pub fn store_dir(&self) -> Option<PathBuf> {
-        self.enabled()
-            .then(|| self.memory_root.join(&self.sanitized))
+        self.enabled().then(|| {
+            if self.local_store {
+                self.memory_root.clone()
+            } else {
+                self.memory_root.join(&self.sanitized)
+            }
+        })
     }
-
-    /// Raw project name supplied at construction time.
+    /// Raw project name supplied at construction time or read from the manifest.
     pub fn project_name(&self) -> &str {
         &self.project_name
     }
-
     /// Return a markdown file's content, or `""` when absent/disabled/unreadable.
     ///
     /// A read never creates the store dir and never errors.
@@ -131,7 +826,7 @@ impl ProjectMemory {
         let Some(path) = self.file_path(name) else {
             return String::new();
         };
-        if !path.is_file() {
+        if !safe_regular_file(&path) {
             return String::new();
         }
         fs::read_to_string(path).unwrap_or_default()
@@ -171,10 +866,9 @@ impl ProjectMemory {
         let Some(path) = self.meta_path() else {
             return Map::new();
         };
-        if !path.is_file() {
+        if !safe_regular_file(&path) {
             return Map::new();
         }
-
         let Ok(bytes) = fs::read(path) else {
             return Map::new();
         };
@@ -248,7 +942,7 @@ impl ProjectMemory {
         let Some(path) = self.file_path(name) else {
             return Ok(String::new());
         };
-        if !path.is_file() {
+        if !safe_regular_file(&path) {
             return Ok(String::new());
         }
         Ok(fs::read_to_string(path)?)
@@ -264,37 +958,42 @@ impl ProjectMemory {
     }
 }
 
-/// Remove obsolete `episodes.jsonl` files left by versions that stored request history
-/// alongside project memory. Best-effort and limited to immediate project directories.
-pub(crate) fn cleanup_legacy_episode_files(memory_root: &Path) -> usize {
-    let Ok(projects) = fs::read_dir(memory_root) else {
-        return 0;
-    };
-    projects
-        .filter_map(Result::ok)
-        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
-        .filter(|entry| fs::remove_file(entry.path().join("episodes.jsonl")).is_ok())
-        .count()
-}
-
 fn is_invalid_windows_filename_char(ch: char) -> bool {
     matches!(ch, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*') || (ch as u32) <= 0x1f
 }
 
 /// Atomically write `bytes` to `path` (temp + rename) as raw bytes (no BOM).
 ///
-/// Shared with [`crate::wiki`] so the dat-edit ledger lands beside the project's
-/// memory dir with the SAME write semantics (UTF-8 without BOM, crash-safe rename).
 pub(crate) fn write_atomic_bytes(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
+        validate_existing_components(parent)?;
         fs::create_dir_all(parent)?;
+        validate_existing_components(parent)?;
+    }
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink()
+                || is_reparse_point(&metadata)
+                || !metadata.is_file()
+            {
+                anyhow::bail!("refusing to write through an unsafe memory path");
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
     }
 
     let tmp = tmp_path(path);
-    if let Err(err) = fs::write(&tmp, bytes) {
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)?;
+    use std::io::Write;
+    if let Err(error) = file.write_all(bytes) {
         let _ = fs::remove_file(&tmp);
-        return Err(err.into());
+        return Err(error.into());
     }
+    drop(file);
     if let Err(err) = fs::rename(&tmp, path) {
         let _ = fs::remove_file(&tmp);
         return Err(err.into());
@@ -546,28 +1245,6 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_legacy_episode_files_removes_only_episode_logs() {
-        let (base, root) = memory_root("legacy-episodes");
-        let project = root.join("Project");
-        fs::create_dir_all(&project).unwrap();
-        fs::write(
-            project.join("episodes.jsonl"),
-            "{\"decision\":\"answer\"}\n",
-        )
-        .unwrap();
-        fs::write(project.join("resources.md"), "Switch 1 = reserved").unwrap();
-
-        assert_eq!(cleanup_legacy_episode_files(&root), 1);
-        assert!(!project.join("episodes.jsonl").exists());
-        assert_eq!(
-            fs::read_to_string(project.join("resources.md")).unwrap(),
-            "Switch 1 = reserved"
-        );
-        assert_eq!(cleanup_legacy_episode_files(&root), 0);
-        fs::remove_dir_all(base).ok();
-    }
-
-    #[test]
     fn meta_write_read_and_staleness() {
         let (base, root) = memory_root("meta");
         let memory = ProjectMemory::new(root, "Project");
@@ -639,6 +1316,169 @@ mod tests {
         assert!(section.contains("## lessons\n"));
         assert!(section.contains(&"L".repeat(100)));
         assert!(!section.contains(&"L".repeat(SECTION_CAP_CHARS)));
+        fs::remove_dir_all(base).ok();
+    }
+    fn native_fixture(base: &Path, name: &str) -> crate::native_project::NativeProject {
+        use crate::native_project::{
+            NativeProject, ProjectManifest, ProjectSettings, PROJECT_SCHEMA_VERSION,
+        };
+        let root = base.join(name);
+        fs::create_dir_all(root.join("maps")).unwrap();
+        fs::write(root.join("maps/source.scx"), b"map").unwrap();
+        NativeProject::create(
+            &root,
+            ProjectManifest {
+                schema_version: PROJECT_SCHEMA_VERSION,
+                name: name.to_string(),
+                source_map: "maps/source.scx".to_string(),
+                output_map: "build/output.scx".to_string(),
+                main_file: "src/main.eps".to_string(),
+                settings: ProjectSettings::default(),
+                plugins: Vec::new(),
+                python_entrypoints: Vec::new(),
+                python_dependencies: Vec::new(),
+                python_lock: None,
+                editor_compatibility: None,
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn local_store_is_isolated_and_moves_with_project_root() {
+        let base = unique_temp_dir("local-isolation");
+        let first = native_fixture(&base.join("first"), "Shared");
+        let second = native_fixture(&base.join("second"), "Shared");
+        assert!(
+            ProjectMemory::for_project(&first)
+                .write("resources", "one")
+                .ok
+        );
+        assert!(
+            ProjectMemory::for_project(&second)
+                .write("resources", "two")
+                .ok
+        );
+        assert_eq!(ProjectMemory::for_project(&first).read("resources"), "one");
+        assert_eq!(ProjectMemory::for_project(&second).read("resources"), "two");
+        let moved_root = base.join("moved");
+        fs::rename(first.root(), &moved_root).unwrap();
+        let moved = crate::native_project::NativeProject::open(&moved_root).unwrap();
+        assert_eq!(ProjectMemory::for_project(&moved).read("resources"), "one");
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn import_reports_bad_items_but_copies_healthy_siblings() {
+        let base = unique_temp_dir("partial-import");
+        let target = native_fixture(&base, "target");
+        let legacy_root = base.join("legacy");
+        let source = legacy_root.join(sanitize_project_name("old.e3s"));
+        fs::create_dir_all(source.join("wiki")).unwrap();
+        fs::write(source.join("resources.md"), "healthy").unwrap();
+        fs::write(source.join("structure.md"), [0xff, 0xfe]).unwrap();
+        fs::write(source.join(META_FILE), b"{bad").unwrap();
+        fs::write(source.join("wiki/ledger.json"), b"{bad").unwrap();
+        let mut issues = Vec::new();
+        let guard =
+            ProjectMemory::import_legacy_harness(&legacy_root, "old.e3s", &target, &mut issues)
+                .unwrap();
+        assert_eq!(
+            ProjectMemory::for_project(&target).read("resources"),
+            "healthy"
+        );
+        assert!(issues
+            .iter()
+            .any(|issue| issue.path.ends_with("structure.md")));
+        assert!(issues.iter().any(|issue| issue.path.ends_with("meta.json")));
+        assert!(issues
+            .iter()
+            .any(|issue| issue.path.ends_with("ledger.json")));
+        guard.commit();
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn rollback_preserves_concurrent_changes_and_existing_files() {
+        let base = unique_temp_dir("rollback-owned");
+        let target = native_fixture(&base, "target");
+        let legacy_root = base.join("legacy");
+        let source = legacy_root.join("old");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("resources.md"), "imported").unwrap();
+        let mut issues = Vec::new();
+        let guard = ProjectMemory::import_legacy_harness(&legacy_root, "old", &target, &mut issues)
+            .unwrap();
+        let memory = ProjectMemory::for_project(&target);
+        assert!(memory.write("resources", "user changed").ok);
+        assert!(memory.write("lessons", "concurrent").ok);
+        guard.rollback().unwrap();
+        assert_eq!(memory.read("resources"), "user changed");
+        assert_eq!(memory.read("lessons"), "concurrent");
+        fs::remove_dir_all(base).ok();
+    }
+    #[test]
+    fn ambiguous_legacy_aliases_are_reported_without_copying() {
+        let base = unique_temp_dir("ambiguous-import");
+        let target = native_fixture(&base, "old");
+        let legacy_root = base.join("legacy");
+        fs::create_dir_all(legacy_root.join("old")).unwrap();
+        fs::create_dir_all(legacy_root.join("'old'")).unwrap();
+        let mut issues = Vec::new();
+        let guard =
+            ProjectMemory::migrate_native_harness(&legacy_root, &target, &mut issues).unwrap();
+        assert!(!issues.is_empty());
+        assert!(ProjectMemory::for_project(&target)
+            .read("resources")
+            .is_empty());
+        guard.commit();
+        fs::remove_dir_all(base).ok();
+    }
+    #[test]
+    fn quoted_full_path_alias_imports_without_mutating_origin() {
+        let base = unique_temp_dir("quoted-import");
+        let target = native_fixture(&base, "target");
+        let legacy_root = base.join("legacy");
+        let source_project = r"E:\proj\maps\one.e3s";
+        let source_name = sanitize_project_name(source_project);
+        let source = legacy_root.join(format!("'{source_name}'"));
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("resources.md"), "from legacy").unwrap();
+        let before = fs::read(source.join("resources.md")).unwrap();
+        let mut issues = Vec::new();
+        let guard = ProjectMemory::import_legacy_harness(
+            &legacy_root,
+            source_project,
+            &target,
+            &mut issues,
+        )
+        .unwrap();
+        assert_eq!(
+            ProjectMemory::for_project(&target).read("resources"),
+            "from legacy"
+        );
+        guard.commit();
+        assert_eq!(fs::read(source.join("resources.md")).unwrap(), before);
+        fs::remove_dir_all(base).ok();
+    }
+    #[test]
+    fn import_collision_preserves_local_file_and_reports_issue() {
+        let base = unique_temp_dir("collision-import");
+        let target = native_fixture(&base, "target");
+        let local = ProjectMemory::for_project(&target);
+        assert!(local.write("resources", "local").ok);
+        let legacy_root = base.join("legacy");
+        let source = legacy_root.join("old");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("resources.md"), "legacy").unwrap();
+        let mut issues = Vec::new();
+        let guard = ProjectMemory::import_legacy_harness(&legacy_root, "old", &target, &mut issues)
+            .unwrap();
+        assert_eq!(local.read("resources"), "local");
+        assert!(issues
+            .iter()
+            .any(|issue| issue.path.ends_with("resources.md")));
+        guard.commit();
         fs::remove_dir_all(base).ok();
     }
 }

@@ -7,8 +7,7 @@
 use std::{
     collections::{HashMap, HashSet},
     fmt,
-    future::Future,
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
@@ -16,31 +15,29 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-#[cfg(test)]
-use crate::codex_client::CodexModel;
+pub(crate) mod runtime_events;
+
 use crate::{
     attachment::{AttachmentContext, AttachmentStore},
-    codex_client::{
-        AgentTurnInput, AppServerEvent, CodexAppServerClient, CodexModelSelection, WorkspaceAccess,
-    },
     ipc, journal,
+    provider_runtime::{
+        AgentTurnInput, BindingSnapshot, CompactionRequest, ForegroundRequest, JobBase, RunId,
+        RunIdentity, RunOutcome, RunPolicy, RuntimeExecutor, StructuredJobExecutor,
+        StructuredJobKind, StructuredJobRequest, WorkspaceAccess, DEFAULT_MAX_TOOL_ROUNDS,
+        HARNESS_DEADLINE, TASK_STATE_COMPILER_DEADLINE, TASK_STATE_COMPILER_OUTPUT_TOKENS,
+    },
     tool_exec::SessionToolRuntime,
-    workspace::{approved_plan_path, PreparedWorkspace, WorkspaceManager, WorkspaceTurnRecorder},
+    workspace::{approved_plan_path, WorkspaceManager},
+};
+#[cfg(test)]
+use crate::{
+    provider_runtime::{AdapterEventKind, NormalizedBlock},
+    workspace::PreparedWorkspace,
 };
 use parking_lot::Mutex as SyncMutex;
 use tauri::Emitter;
-use tokio::process::{ChildStdin, ChildStdout};
 
 const FIRST_PRINCIPLES: &str = include_str!("data/first_principles.md");
-// Codex reports 95% of its catalog-clamped input window. A 1M override on
-// current 128K-output models therefore resolves to 872K raw / 828.4K effective.
-const LARGE_CONTEXT_EFFECTIVE_MIN_TOKENS: i64 = 828_400;
-const FOREGROUND_POST_BUILD_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
-#[cfg(not(test))]
-const TASK_STATE_COMPILER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
-#[cfg(test)]
-const TASK_STATE_COMPILER_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(50);
-
 const INTRO: &str = "You are the native EUD project agent. You work in a durable, sandboxed \
 project filesystem and edit the canonical StarCraft EUD project through eud-tools. The server \
 validates and journals every project/map mutation and every durable workspace change.";
@@ -54,68 +51,21 @@ const WORKSPACE_GUIDE: &str = r#"[project workspace]
 - Use eud-tools for every editor, map, DAT, build, and RAG action. Native shell/file tools are read-only in implementation turns.
 - After the authoritative build and required verification, answer immediately. Do not search for prior worklogs or perform harness/document cleanup."#;
 
-/// Bound on the first post-open `thread/resume` turn before the session-restore
-/// fallback (decision E) drops to a fresh `thread/start`. codex may never signal a
-/// missing rollout, so this timeout is the defensive backstop alongside the error
-/// catch. Generous so a slow-but-valid resume is not aborted.
-const RESUME_FALLBACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
-/// Apply a deadline only while Codex is actively running. Structured ASK wait
-/// time is user-owned and must never consume the resume fallback deadline.
-async fn active_time_timeout<T, F>(
-    duration: std::time::Duration,
-    mut ask_waiting: tokio::sync::watch::Receiver<bool>,
-    operation: F,
-) -> Result<T, ()>
-where
-    F: Future<Output = T>,
-{
-    let mut remaining = duration;
-    tokio::pin!(operation);
-
-    loop {
-        if *ask_waiting.borrow_and_update() {
-            tokio::select! {
-                result = &mut operation => return Ok(result),
-                changed = ask_waiting.changed() => {
-                    if changed.is_err() {
-                        return tokio::time::timeout(remaining, operation)
-                            .await
-                            .map_err(|_| ());
-                    }
-                    let _waiting = *ask_waiting.borrow_and_update();
-                }
-            }
-            continue;
-        }
-
-        let active_start = tokio::time::Instant::now();
-        tokio::select! {
-            result = &mut operation => return Ok(result),
-            _ = tokio::time::sleep(remaining) => return Err(()),
-            changed = ask_waiting.changed() => {
-                if changed.is_err() {
-                    return tokio::time::timeout(remaining, operation)
-                        .await
-                        .map_err(|_| ());
-                }
-                if *ask_waiting.borrow_and_update() {
-                    remaining = remaining.saturating_sub(active_start.elapsed());
-                    if remaining.is_zero() {
-                        return Err(());
-                    }
-                }
-            }
-        }
-    }
-}
-
 const EPSCRIPT_GUIDE: &str = r#"[epscript]
-- ALL code you write is epScript (*.eps, the C-like language compiled by euddraft's epscript->eudplib pipeline). Write epScript ONLY.
+- epScript (*.eps) is the primary authoring language and the default for gameplay logic; use direct Python only when the requested change belongs in an existing or explicitly requested Python entrypoint.
 - NEVER write SCMDraft classic text-trigger blocks — `Trigger { players = {...}, conditions = {...}, actions = ... }` is NOT epScript and does not compile here.
 - Structure: code runs from entry functions — `function onPluginStart() { }` (once at map start), `function beforeTriggerExec() { }` / `function afterTriggerExec() { }` (every game loop). Repeating logic goes INSIDE a loop function; there is no PreserveTrigger.
 - Syntax essentials: statements end with ";"; variables `var x = 0;`, constants `const marine = $U("Terran Marine");` (names map via $U(unit)/$L(location)); conditions are if-expressions and actions are statements — `if (Deaths(P1, AtLeast, 1, marine)) { SetDeaths(P1, Subtract, 1, marine); CreateUnit(1, marine, $L("spawn"), P1); }`
 - Unsure about eps syntax or an API name? Use search_docs (Korean query) to discover candidates, then docs_get to read the relevant exact chunks BEFORE writing code; follow eps examples from those sources and ignore classic-trigger examples quoted in posts."#;
 
+const DIRECT_PYTHON_GUIDE: &str = r#"[direct python]
+- epScript remains the primary authoring language. Direct Python (*.py) is an always-active eudplib authoring surface, not an optional plugin, and executes with full trust in the euddraft process; do not assume an OS sandbox or plugin permission boundary.
+- Create Python source only as CUIPy. CUIPy create/write/edit/delete/move/rename operations bypass eps_check; CUIEps operations keep the complete eps_check workflow unchanged. Both are verified by build_run.
+- Inspect project_status.pythonEntrypoints and project_status.pythonDependencies before changing Python topology or dependencies. pythonEntrypoints is ordered manifest authority; never infer entrypoints from filenames.
+- pythonDependencies is the complete exact direct dependency list. Every item uses normalized-name==exact.version; when adding, changing, or removing one item, preserve every still-required item and submit the entire desired list.
+- Dependency changes are strictly prepare then commit: call python_dependencies_prepare with the complete desired list before acquiring a write workspace, then pass only its opaque candidateToken to python_dependencies_set after write admission. Tokens are session/project/revision/cache-bound, expiring, and single-use; prepare never changes project.eap.
+- Never edit project.eap directly and never run pip/uv or mutate the managed cache yourself. A build consumes only the committed deterministic lock and already prepared cache; build_run never resolves, installs, syncs, or repairs dependencies.
+- Do not represent direct Python as an EDS plugin. Keep imports explicit and ensure the ordered Python entrypoints and exact dependencies remain complete after the change."#;
 const EPS_PROJECT_ARCHITECTURE_GUIDE: &str = r#"[eps project architecture]
 - Optimize for change locality, clear ownership, and explicit dependencies — not for the fewest or smallest files.
 - Before placing code, inspect project_status.mainFile, list_files, project memory structure, and relevant source files. Never guess the MainFile from a filename, list order, open tab, lifecycle hooks, or file count.
@@ -166,10 +116,10 @@ const EPS_PREFLIGHT_GUIDE: &str = r#"[eps preflight]
 - For mutually dependent files, include every candidate in one eps_check call.
 - Fix error diagnostics and re-check before writing. Warnings are advisory; explain any warning left unresolved.
 - If eps_check returns skipped, continue with the normal write and mandatory build_run flow.
-- eps_check never replaces build_run. After applying eps/file changes, build and repair using the existing three-attempt build budget."#;
+- eps_check never replaces build_run. After applying .eps changes, build and repair using the existing three-attempt build budget."#;
 
 const BUILD_GUIDE: &str = r#"[build]
-- After you APPLY eps/file changes (file_edit/file_write/file_create/plugin_*), ALWAYS run build_run in the SAME turn to verify the project compiles. Code you never built is NOT done.
+- After you APPLY source, plugin, or Python dependency changes, ALWAYS run build_run in the SAME turn to verify the complete project. Code or dependency state you never built is NOT done.
 - build_run returns the complete structured result ({ok, errors with source/file/line/message/raw}); read it directly, fix the code, and build again on failure. The server enforces a 3-attempt self-fix budget per request; when it is spent, STOP and report the remaining errors to the user verbatim.
 - A failure whose message says no matching player exists (e.g. "연결맵에 조건에 맞는 플레이어가 없습니다") is a MAP setup problem, not an eps bug — fix it with player_setup (a Human controller AND a start location for at least one player), then rebuild."#;
 
@@ -213,7 +163,7 @@ const AUDIO_SOUND_GUIDE: &str = r#"[map sounds]
 - Preflight every modified/created EPS file in one eps_check batch after any sound import/edit, then run the complete-project build_run. A map sound mutation without both checks is incomplete."#;
 
 const EVIDENCE_GUIDE: &str = r#"[evidence]
-- EVERY unit of work (eps code, dat edits, map location/player/switch writes, settings) must be grounded in the docs: call search_docs (Korean query) BEFORE writing, inspect promising exact chunks with docs_get, and justify each item with WHY plus its source as a markdown link — `... (근거: [제목](url))`.
+- EVERY unit of work (eps/Python code, Python dependencies, dat edits, map location/player/switch writes, settings) must be grounded in the docs: call search_docs (Korean query) BEFORE writing, inspect promising exact chunks with docs_get, and justify each item with WHY plus its source as a markdown link — `... (근거: [제목](url))`.
 - search_docs previews are exact discovery excerpts, not summaries. Search as broadly and repeatedly as unresolved claims require; use docs_get in batches for the specific full chunks needed to verify details. Reuse an already verified source across related plan steps instead of re-fetching it.
 - `repeated=true` and a zero `newCount` are novelty signals, never a forced stopping condition. Reformulate, seek a different source tier, or continue exact reads when material uncertainty remains.
 - Cite on BOTH review surfaces: when the user explicitly requests a plan, every propose_plan step carries its evidence link(s); the final answer always explains each applied change with its link(s). The reference-context chunks below carry their own `source:` links — cite those the same way.
@@ -247,6 +197,7 @@ pub enum AgentTurnResult {
     /// The user interrupted the live provider turn. Any journaled writes stay
     /// reviewable, but no answer or plan event is emitted.
     Cancelled,
+    WriteTransition,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -269,35 +220,6 @@ impl fmt::Display for AgentEngineError {
 }
 
 impl std::error::Error for AgentEngineError {}
-
-pub(crate) trait AgentDriver {
-    async fn run_turn(
-        &mut self,
-        input: AgentTurnInput,
-    ) -> Result<AgentTurnResult, AgentEngineError>;
-    /// Run one tools-disabled, nonpersistent compiler turn on a fresh conversation.
-    /// Test drivers may opt out; production always overrides this seam.
-    async fn compile_task_state(
-        &mut self,
-        _input: AgentTurnInput,
-    ) -> Result<Option<String>, AgentEngineError> {
-        Ok(None)
-    }
-    async fn compact_conversation(&mut self) -> Result<(), AgentEngineError>;
-    async fn reset_conversation(&mut self) -> Result<(), AgentEngineError>;
-
-    async fn conversation_state(&self) -> crate::provider::ProviderConversationState;
-
-    async fn seed_conversation(
-        &mut self,
-        state: crate::provider::ProviderConversationState,
-    ) -> Result<(), AgentEngineError>;
-
-    /// Current session workspace prepared by the production driver.
-    fn current_workspace(&self) -> Option<PreparedWorkspace> {
-        None
-    }
-}
 
 #[derive(Debug, Clone)]
 pub enum EngineEvent {
@@ -439,8 +361,8 @@ enum WriteContinuation {
     ApprovedPlan,
 }
 
-pub(crate) struct AgentEngine<D: AgentDriver, S: EventSink> {
-    driver: D,
+pub(crate) struct AgentEngine<R: RuntimeExecutor, S: EventSink> {
+    executor: R,
     sink: S,
     config: AgentEngineConfig,
     phase: Phase,
@@ -460,28 +382,33 @@ pub(crate) struct AgentEngine<D: AgentDriver, S: EventSink> {
     provider_binding: crate::provider::ProviderBinding,
     pending_write: Option<WriteContinuation>,
     pending_resume_transcript: Option<String>,
+    conversation_resume_error: Option<String>,
     pending_context_delivery: Option<crate::context_state::ModelContextCursor>,
     session_store: crate::session::SessionStore,
     attachment_store: AttachmentStore,
     journal_store: journal::JournalStore,
     journal_data_dir: PathBuf,
     runtime: SessionToolRuntime,
+    cancellation: tokio::sync::watch::Receiver<u64>,
 }
-impl<D: AgentDriver, S: EventSink> AgentEngine<D, S> {
+impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
+    // Keep each injected runtime, persistence, session, and cancellation authority explicit.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
-        driver: D,
+        executor: R,
         sink: S,
         config: AgentEngineConfig,
         runtime: SessionToolRuntime,
         session_store: crate::session::SessionStore,
         attachment_store: AttachmentStore,
         session: crate::session::SessionRecord,
+        cancellation: tokio::sync::watch::Receiver<u64>,
     ) -> Self {
         let journal_store = runtime.journal().clone();
         let journal_data_dir = runtime.app_data_dir();
         let provider_binding = session.provider_binding.clone();
         Self {
-            driver,
+            executor,
             sink,
             config,
             phase: Phase::Idle,
@@ -501,12 +428,90 @@ impl<D: AgentDriver, S: EventSink> AgentEngine<D, S> {
             provider_binding,
             pending_write: None,
             pending_resume_transcript: None,
+            conversation_resume_error: None,
             pending_context_delivery: None,
             session_store,
             attachment_store,
             journal_store,
             journal_data_dir,
             runtime,
+            cancellation,
+        }
+    }
+
+    fn run_identity(&self, request_id: &str) -> RunIdentity {
+        RunIdentity {
+            session_id: self.session_id.clone(),
+            run_id: RunId::new(next_run_id()),
+            request_id: request_id.to_string(),
+            session_kind: self.session_kind,
+            cancellation_generation: *self.cancellation.borrow(),
+        }
+    }
+
+    fn binding_snapshot(&self, fresh: bool) -> Result<BindingSnapshot, AgentEngineError> {
+        let mut snapshot = BindingSnapshot::from_binding(&self.provider_binding, None)
+            .map_err(|error| AgentEngineError::new(error.to_string()))?;
+        if fresh {
+            snapshot.conversation =
+                crate::provider::ProviderConversationState::empty(self.provider_binding.provider);
+        }
+        Ok(snapshot)
+    }
+
+    fn ensure_provider_conversation_ready(&self) -> Result<(), AgentEngineError> {
+        match self.conversation_resume_error.as_deref() {
+            Some(error) => Err(AgentEngineError::new(error)),
+            None => Ok(()),
+        }
+    }
+
+    fn foreground_request(
+        &self,
+        request_id: &str,
+        turn: AgentTurnInput,
+    ) -> Result<ForegroundRequest, AgentEngineError> {
+        let record = self
+            .session_store
+            .load(&self.session_id)
+            .map_err(|error| AgentEngineError::new(error.to_string()))?;
+        Ok(ForegroundRequest {
+            identity: self.run_identity(request_id),
+            binding: self.binding_snapshot(false)?,
+            turn,
+            checkpoint: JobBase {
+                revision: record.task_state.projection.revision,
+                instruction_epoch: record.context_state.instruction_epoch,
+                branch: record.task_state.leaf_id,
+            },
+            policy: RunPolicy {
+                active_deadline: None,
+                shutdown_grace: std::time::Duration::from_secs(2),
+                max_output_bytes: 32 * 1024 * 1024,
+                max_output_tokens: None,
+                max_tool_rounds: DEFAULT_MAX_TOOL_ROUNDS,
+                allow_resume: true,
+            },
+        })
+    }
+
+    async fn run_foreground(
+        &mut self,
+        turn: AgentTurnInput,
+    ) -> Result<AgentTurnResult, AgentEngineError> {
+        let request_id = self
+            .current_request_id
+            .clone()
+            .ok_or_else(|| AgentEngineError::new("foreground run has no request id"))?;
+        let request = self.foreground_request(&request_id, turn)?;
+        match self.executor.run_foreground(request).await {
+            RunOutcome::Completed { text, .. } => Ok(AgentTurnResult::Answer { text }),
+            RunOutcome::Cancelled => Ok(AgentTurnResult::Cancelled),
+            RunOutcome::WriteTransition => Ok(AgentTurnResult::WriteTransition),
+            RunOutcome::Structured { .. } => Err(AgentEngineError::new(
+                "foreground provider run returned a structured job result",
+            )),
+            RunOutcome::Failed(error) => Err(AgentEngineError::new(error.to_string())),
         }
     }
     async fn prepare_eps_context(
@@ -547,7 +552,10 @@ impl<D: AgentDriver, S: EventSink> AgentEngine<D, S> {
 
         let mut replay = replay_transcript.map(str::to_string);
         if !record.context_state.baseline_matches(&static_baseline) {
-            self.driver.reset_conversation().await?;
+            self.executor
+                .reset()
+                .await
+                .map_err(|error| AgentEngineError::new(error.to_string()))?;
             self.thread_active = false;
             self.pending_resume_transcript = None;
             if replay.is_none() {
@@ -565,7 +573,7 @@ impl<D: AgentDriver, S: EventSink> AgentEngine<D, S> {
         }
 
         let current_conversation_key = if self.thread_active {
-            self.driver.conversation_state().await.conversation_key()
+            self.executor.conversation_state().conversation_key()
         } else {
             None
         };
@@ -624,7 +632,7 @@ impl<D: AgentDriver, S: EventSink> AgentEngine<D, S> {
         if matches!(result, AgentTurnResult::Cancelled) {
             return;
         }
-        let conversation = self.driver.conversation_state().await;
+        let conversation = self.executor.conversation_state();
         cursor.provider = conversation.provider();
         cursor.conversation_key = conversation.conversation_key();
         if let Err(error) =
@@ -679,6 +687,7 @@ impl<D: AgentDriver, S: EventSink> AgentEngine<D, S> {
         req: ipc::ChatRequest,
         fixed_request_id: Option<String>,
     ) -> Result<(), AgentEngineError> {
+        self.ensure_provider_conversation_ready()?;
         if matches!(
             self.phase,
             Phase::PlanReview | Phase::Executing | Phase::ChangesetReview
@@ -707,9 +716,8 @@ impl<D: AgentDriver, S: EventSink> AgentEngine<D, S> {
                 "오디오 첨부는 메인 EPS 대화에서만 사용할 수 있습니다.",
             ));
         }
-        let audio_refs = self
-            .bind_audio_attachments(&request_id, audio_files)
-            .await?;
+        let audio_refs =
+            Self::bind_audio_attachments(self.runtime.clone(), &request_id, audio_files).await?;
         let map_image_refs = if self.session_kind == crate::session::SessionKind::Map {
             self.runtime
                 .bind_map_images(&request_id, &attachment_context.images)
@@ -784,7 +792,7 @@ impl<D: AgentDriver, S: EventSink> AgentEngine<D, S> {
             self.commit_context_delivery(&result).await;
         }
         self.thread_active = if matches!(&result, AgentTurnResult::Cancelled) {
-            self.driver.conversation_state().await.is_started()
+            self.executor.conversation_state().is_started()
         } else {
             true
         };
@@ -797,6 +805,11 @@ impl<D: AgentDriver, S: EventSink> AgentEngine<D, S> {
             };
             self.update_active_session().await;
             return Ok(());
+        }
+        if matches!(result, AgentTurnResult::WriteTransition) {
+            return Err(AgentEngineError::new(
+                "provider requested a write transition without a write ticket",
+            ));
         }
         let state_result = result.clone();
         self.handle_turn_result(result)?;
@@ -812,13 +825,6 @@ impl<D: AgentDriver, S: EventSink> AgentEngine<D, S> {
         Ok(())
     }
 
-    /// Run the turn, applying the session-restore resume fallback (decision E) when a
-    /// saved thread was seeded by `open_session`. Defensive-by-construction: if the
-    /// FIRST post-open turn's `thread/resume` errors OR does not complete within a
-    /// bounded timeout (codex may never signal a missing rollout), reset to a fresh
-    /// `thread/start` and re-run with a condensed transcript prepended via the
-    /// `resume_turn_text` path so the model still sees prior context. A normal turn
-    /// (no staged transcript) runs unchanged with no timeout wrapper.
     async fn run_first_turn_with_resume_fallback(
         &mut self,
         input: AgentTurnInput,
@@ -826,14 +832,10 @@ impl<D: AgentDriver, S: EventSink> AgentEngine<D, S> {
         mention_instances: &[crate::mentions::MentionInstance],
     ) -> Result<AgentTurnResult, AgentEngineError> {
         let Some(transcript) = self.pending_resume_transcript.take() else {
-            return self.driver.run_turn(input).await;
+            return self.run_foreground(input).await;
         };
         let image_paths = input.image_paths.clone();
 
-        // No resumable thread was seeded (the saved record had no thread id, or the
-        // seed failed in `open_session`): there is nothing to resume, so start fresh
-        // and inject the transcript directly rather than waiting out a resume that
-        // cannot happen.
         if !self.thread_active {
             let resolved_mentions = self.resolve_mentions(mention_instances)?;
             return self
@@ -847,42 +849,7 @@ impl<D: AgentDriver, S: EventSink> AgentEngine<D, S> {
                 .await;
         }
 
-        // Primary path: the saved thread is already seeded, so this is a resume. If
-        // it errors OR does not complete within the bounded timeout (codex may never
-        // signal a missing rollout), fall back to a fresh start + transcript replay.
-        let resume = active_time_timeout(
-            RESUME_FALLBACK_TIMEOUT,
-            self.runtime.subscribe_ask_waiting(),
-            self.driver.run_turn(input),
-        )
-        .await;
-        match resume {
-            Ok(Ok(result)) => Ok(result),
-            Ok(Err(error)) => {
-                eprintln!("eud-agent: thread resume failed, replaying transcript: {error}");
-                let resolved_mentions = self.resolve_mentions(mention_instances)?;
-                self.fresh_start_with_transcript(
-                    &transcript,
-                    user_text,
-                    image_paths,
-                    resolved_mentions.as_deref(),
-                    true,
-                )
-                .await
-            }
-            Err(_) => {
-                eprintln!("eud-agent: thread resume timed out, replaying transcript");
-                let resolved_mentions = self.resolve_mentions(mention_instances)?;
-                self.fresh_start_with_transcript(
-                    &transcript,
-                    user_text,
-                    image_paths,
-                    resolved_mentions.as_deref(),
-                    true,
-                )
-                .await
-            }
-        }
+        self.run_foreground(input).await
     }
 
     /// Drop the seeded provider thread and replay the durable transcript through
@@ -895,7 +862,10 @@ impl<D: AgentDriver, S: EventSink> AgentEngine<D, S> {
         resolved_mentions: Option<&str>,
         reset_epoch: bool,
     ) -> Result<AgentTurnResult, AgentEngineError> {
-        self.driver.reset_conversation().await?;
+        self.executor
+            .reset()
+            .await
+            .map_err(|error| AgentEngineError::new(error.to_string()))?;
         self.thread_active = false;
         if reset_epoch {
             self.session_store
@@ -906,8 +876,7 @@ impl<D: AgentDriver, S: EventSink> AgentEngine<D, S> {
             .prepare_eps_context(user_text, resolved_mentions, Some(transcript), true)
             .await?;
         let result = self
-            .driver
-            .run_turn(AgentTurnInput {
+            .run_foreground(AgentTurnInput {
                 text: turn_text,
                 image_paths,
                 workspace_root: None,
@@ -923,7 +892,7 @@ impl<D: AgentDriver, S: EventSink> AgentEngine<D, S> {
     /// After a successful turn, persist the exact provider conversation and
     /// still-pending changeset ownership. The panel log is saved separately.
     async fn update_active_session(&mut self) {
-        let conversation = self.driver.conversation_state().await;
+        let conversation = self.executor.conversation_state();
         let pending_request_ids = self.live_pending_request_ids();
         if let Err(error) = self.session_store.update_runtime_state(
             &self.session_id,
@@ -931,6 +900,10 @@ impl<D: AgentDriver, S: EventSink> AgentEngine<D, S> {
             pending_request_ids,
         ) {
             eprintln!("eud-agent: active session update failed: {error}");
+            return;
+        }
+        if let Err(error) = self.executor.acknowledge_persisted().await {
+            eprintln!("eud-agent: persisted provider receipt acknowledgement failed: {error}");
         }
     }
 
@@ -951,7 +924,10 @@ impl<D: AgentDriver, S: EventSink> AgentEngine<D, S> {
     /// runtime; if the open request left one, the turn ends as a plan review
     /// rather than a plain answer (feature 11: propose_plan ends the turn).
     fn reinterpret_plan(&self, result: AgentTurnResult) -> AgentTurnResult {
-        if matches!(&result, AgentTurnResult::Cancelled) {
+        if matches!(
+            &result,
+            AgentTurnResult::Cancelled | AgentTurnResult::WriteTransition
+        ) {
             if let Some(request_id) = self.current_request_id.as_deref() {
                 let _ = self.runtime.take_pending_plan(request_id);
             }
@@ -969,6 +945,7 @@ impl<D: AgentDriver, S: EventSink> AgentEngine<D, S> {
         &mut self,
         req: ipc::PlanFeedbackRequest,
     ) -> Result<(), AgentEngineError> {
+        self.ensure_provider_conversation_ready()?;
         let resolved_mentions = self.resolve_mentions(&req.mentions)?;
         self.set_client_turn_id(&req.client_turn_id)?;
         self.phase = Phase::PlanReview;
@@ -978,9 +955,8 @@ impl<D: AgentDriver, S: EventSink> AgentEngine<D, S> {
             .current_request_id
             .clone()
             .ok_or_else(|| AgentEngineError::new("no request is awaiting plan feedback"))?;
-        let audio_refs = self
-            .bind_audio_attachments(&request_id, audio_files)
-            .await?;
+        let audio_refs =
+            Self::bind_audio_attachments(self.runtime.clone(), &request_id, audio_files).await?;
         let plain_user_text = if req.text.trim().is_empty() && !req.attachments.is_empty() {
             "첨부한 파일을 반영해 계획을 수정해 주세요."
         } else if req.text.trim().is_empty() && !req.mentions.is_empty() {
@@ -1001,8 +977,7 @@ impl<D: AgentDriver, S: EventSink> AgentEngine<D, S> {
             .prepare_eps_context(&user_text, resolved_mentions.as_deref(), None, false)
             .await?;
         let result = self
-            .driver
-            .run_turn(AgentTurnInput {
+            .run_foreground(AgentTurnInput {
                 text: turn_text,
                 image_paths: attachment_context.image_paths,
                 workspace_root: None,
@@ -1023,6 +998,7 @@ impl<D: AgentDriver, S: EventSink> AgentEngine<D, S> {
     }
 
     pub async fn plan_approve(&mut self) -> Result<(), AgentEngineError> {
+        self.ensure_provider_conversation_ready()?;
         if self.runtime.current_request_id().is_none() || self.current_plan_markdown.is_none() {
             return Err(AgentEngineError::new(
                 "no request is awaiting plan approval",
@@ -1043,6 +1019,7 @@ impl<D: AgentDriver, S: EventSink> AgentEngine<D, S> {
     }
 
     pub async fn continue_pending_write(&mut self) -> Result<(), AgentEngineError> {
+        self.ensure_provider_conversation_ready()?;
         let ticket = self
             .runtime
             .write_ticket()
@@ -1074,7 +1051,7 @@ Continue the requested change now, run the mandatory build, and stop only after 
                     .current_plan_markdown
                     .clone()
                     .ok_or_else(|| AgentEngineError::new("no plan is awaiting approval"))?;
-                let workspace = self.driver.current_workspace().ok_or_else(|| {
+                let workspace = self.executor.current_workspace().ok_or_else(|| {
                     AgentEngineError::new("the approved plan has no prepared project workspace")
                 })?;
                 WorkspaceManager::new(self.runtime.data_dirs())
@@ -1088,8 +1065,7 @@ Continue the requested change now, run the mandatory build, and stop only after 
             .prepare_eps_context(&instruction, None, None, false)
             .await?;
         let result = self
-            .driver
-            .run_turn(AgentTurnInput::text(turn_text).with_access(WorkspaceAccess::Write))
+            .run_foreground(AgentTurnInput::text(turn_text).with_access(WorkspaceAccess::Write))
             .await?;
         self.commit_context_delivery(&result).await;
         self.thread_active = true;
@@ -1234,7 +1210,7 @@ Continue the requested change now, run the mandatory build, and stop only after 
         }
 
         let mut harness_job = if settled && !self.accepted_for_harness.is_empty() {
-            self.driver.current_workspace().map(|workspace| {
+            self.executor.current_workspace().map(|workspace| {
                 crate::harness::HarnessJob::new_with_provider(
                     self.session_id.clone(),
                     crate::harness::HarnessProviderBinding {
@@ -1406,7 +1382,7 @@ Continue the requested change now, run the mandatory build, and stop only after 
     /// Compact the live provider conversation without changing panel history or
     /// backend-owned plan/review state.
     pub async fn compact(&mut self) -> Result<(), AgentEngineError> {
-        if !self.thread_active || !self.driver.conversation_state().await.is_started() {
+        if !self.thread_active || !self.executor.conversation_state().is_started() {
             return Err(AgentEngineError::new(
                 "압축할 provider 대화가 없습니다. 먼저 메시지를 보내 주세요.",
             ));
@@ -1416,10 +1392,56 @@ Continue the requested change now, run the mandatory build, and stop only after 
                 "현재 provider 작업이 끝난 뒤 대화를 압축해 주세요.",
             ));
         }
-        self.driver.compact_conversation().await?;
-        self.session_store
+        let record = self
+            .session_store
+            .load(&self.session_id)
+            .map_err(|error| AgentEngineError::new(error.to_string()))?;
+        let next_instruction_epoch = record
+            .context_state
+            .instruction_epoch
+            .max(1)
+            .saturating_add(1);
+        let workspace_root = match self.executor.current_workspace() {
+            Some(workspace) => workspace.root,
+            None => {
+                let workspace = WorkspaceManager::new(self.runtime.data_dirs());
+                let session_id = self.session_id.clone();
+                tokio::task::spawn_blocking(move || workspace.prepare_session_current(&session_id))
+                    .await
+                    .map_err(|error| AgentEngineError::new(error.to_string()))?
+                    .map_err(|error| AgentEngineError::new(error.to_string()))?
+                    .root
+            }
+        };
+        let request_id = format!("compact-{}", next_request_id());
+        let request = CompactionRequest {
+            identity: self.run_identity(&request_id),
+            binding: self.binding_snapshot(false)?,
+            workspace_root,
+            next_instruction_epoch,
+            policy: RunPolicy {
+                active_deadline: None,
+                shutdown_grace: std::time::Duration::from_secs(2),
+                max_output_bytes: 1024 * 1024,
+                max_output_tokens: None,
+                max_tool_rounds: 0,
+                allow_resume: false,
+            },
+        };
+        self.executor
+            .compact(request)
+            .await
+            .map_err(|error| AgentEngineError::new(error.to_string()))?;
+        let committed_epoch = self
+            .session_store
             .record_compaction_boundary(&self.session_id, &static_prompt_baseline())
             .map_err(|error| AgentEngineError::new(error.to_string()))?;
+        if committed_epoch != next_instruction_epoch {
+            return Err(AgentEngineError::new(
+                "compaction instruction epoch changed before commit",
+            ));
+        }
+        self.update_active_session().await;
         Ok(())
     }
 
@@ -1435,8 +1457,12 @@ Continue the requested change now, run the mandatory build, and stop only after 
                 "현재 세션의 진행 중인 요청 또는 검토를 먼저 완료해 주세요.",
             ));
         }
-        self.driver.reset_conversation().await?;
+        self.executor
+            .reset()
+            .await
+            .map_err(|error| AgentEngineError::new(error.to_string()))?;
         self.thread_active = false;
+        self.conversation_resume_error = None;
         self.phase = Phase::Idle;
         self.current_plan_markdown = None;
         self.runtime.clear_current();
@@ -1469,14 +1495,13 @@ Continue the requested change now, run the mandatory build, and stop only after 
     }
 
     async fn bind_audio_attachments(
-        &self,
+        runtime: SessionToolRuntime,
         request_id: &str,
         attachments: Vec<crate::attachment::ResolvedAudioAttachment>,
     ) -> Result<Vec<crate::audio::TrustedAudioRef>, AgentEngineError> {
         if attachments.is_empty() {
             return Ok(Vec::new());
         }
-        let runtime = self.runtime.clone();
         let request_id = request_id.to_string();
         tokio::task::spawn_blocking(move || {
             runtime.bind_audio_attachments(&request_id, attachments)
@@ -1506,23 +1531,23 @@ Continue the requested change now, run the mandatory build, and stop only after 
         let transcript = condense_transcript(&record.panel_log);
         let staged = (!transcript.is_empty()).then_some(transcript);
         let conversation = record.provider_binding.conversation.clone();
-        if conversation.is_started() {
-            match self.driver.seed_conversation(conversation).await {
+        let mut seeded_conversation = false;
+        let seed_error = if conversation.is_started() {
+            match self.executor.seed(conversation).await {
                 Ok(()) => {
+                    seeded_conversation = true;
                     self.thread_active = true;
                     self.pending_resume_transcript = staged;
+                    None
                 }
-                Err(error) => {
-                    eprintln!(
-                        "eud-agent: conversation seed failed, will replay transcript: {error}"
-                    );
-                    self.thread_active = false;
-                    self.pending_resume_transcript = staged;
-                }
+                Err(error) => Some(error),
             }
-        } else if staged.is_some() {
-            self.pending_resume_transcript = staged;
-        }
+        } else {
+            if staged.is_some() {
+                self.pending_resume_transcript = staged;
+            }
+            None
+        };
 
         if let Some(request_id) = record.pending_request_ids.first() {
             self.runtime
@@ -1538,6 +1563,15 @@ Continue the requested change now, run the mandatory build, and stop only after 
             .emit(EngineEvent::SessionLoaded(ipc::SessionLoadedEvent {
                 id: self.session_id.clone(),
             }))?;
+        if let Some(error) = seed_error {
+            let message = format!("persisted provider conversation could not be resumed: {error}");
+            self.conversation_resume_error = Some(message.clone());
+            return Err(AgentEngineError::new(message));
+        }
+        self.conversation_resume_error = None;
+        if seeded_conversation {
+            self.update_active_session().await;
+        }
         Ok(record)
     }
 
@@ -1638,10 +1672,10 @@ Continue the requested change now, run the mandatory build, and stop only after 
         let foreground_result = match result {
             AgentTurnResult::Answer { text } => text.as_str(),
             AgentTurnResult::Plan { markdown } => markdown.as_str(),
-            AgentTurnResult::Cancelled => return,
+            AgentTurnResult::Cancelled | AgentTurnResult::WriteTransition => return,
         };
         let workspace_root = self
-            .driver
+            .executor
             .current_workspace()
             .map(|workspace| workspace.root);
         let artifact_candidates = match workspace_root.as_deref() {
@@ -1687,31 +1721,110 @@ Continue the requested change now, run the mandatory build, and stop only after 
                 return;
             }
         };
-        let turn = AgentTurnInput::text(prompt)
-            .with_output_schema(crate::task_state::compiler_output_schema())
-            .without_tools();
-        let output = match tokio::time::timeout(
-            TASK_STATE_COMPILER_TIMEOUT,
-            self.driver.compile_task_state(turn),
-        )
-        .await
-        {
-            Err(_) => {
+        if workspace_root.is_none() {
+            return;
+        }
+        let compiler_workspace = match crate::provider_runtime::CompilerInputWorkspace::prepare(
+            &self.runtime.data_dirs(),
+        ) {
+            Ok(workspace) => workspace,
+            Err(error) => {
+                self.record_task_compilation_failure("workspace_error", error.to_string());
+                return;
+            }
+        };
+        let base = JobBase {
+            revision: record.task_state.projection.revision,
+            instruction_epoch: record.context_state.instruction_epoch,
+            branch: expected_leaf.clone(),
+        };
+        let structured_request = StructuredJobRequest {
+            identity: self.run_identity(&format!("{request_id}-task-state")),
+            binding: match self.binding_snapshot(true) {
+                Ok(binding) => binding,
+                Err(error) => {
+                    self.record_task_compilation_failure("binding_error", error.to_string());
+                    return;
+                }
+            },
+            kind: StructuredJobKind::TaskStateCompiler,
+            prompt,
+            workspace_root: compiler_workspace.root().to_path_buf(),
+            output_schema: crate::task_state::compiler_output_schema(),
+            base: base.clone(),
+            policy: RunPolicy {
+                active_deadline: Some(TASK_STATE_COMPILER_DEADLINE),
+                shutdown_grace: std::time::Duration::from_secs(2),
+                max_output_bytes: crate::task_state::MAX_SEMANTIC_EVENT_BYTES,
+                max_output_tokens: Some(TASK_STATE_COMPILER_OUTPUT_TOKENS),
+                max_tool_rounds: 0,
+                allow_resume: false,
+            },
+        };
+        let outcome = self.executor.run_structured(structured_request).await;
+        if let Err(error) = compiler_workspace.close() {
+            self.record_task_compilation_failure("workspace_cleanup_failed", error.to_string());
+            return;
+        }
+        let output = match outcome {
+            RunOutcome::Structured {
+                value,
+                base: returned_base,
+            } if returned_base == base => value,
+            RunOutcome::Structured { .. } => {
                 self.record_task_compilation_failure(
-                    "timeout",
-                    format!(
-                        "task-state compiler exceeded its {} ms timeout",
-                        TASK_STATE_COMPILER_TIMEOUT.as_millis()
-                    ),
+                    "stale_base",
+                    "task-state compiler returned a stale base",
                 );
                 return;
             }
-            Ok(Err(error)) => {
-                self.record_task_compilation_failure("driver_error", error.to_string());
+            RunOutcome::Failed(error) => {
+                let kind = if matches!(
+                    error,
+                    crate::provider_runtime::ProviderRuntimeError::TimedOut
+                ) {
+                    "timeout"
+                } else {
+                    "runtime_error"
+                };
+                self.record_task_compilation_failure(kind, error.to_string());
                 return;
             }
-            Ok(Ok(None)) => return,
-            Ok(Ok(Some(output))) => output,
+            RunOutcome::Cancelled => {
+                self.record_task_compilation_failure("cancelled", "task-state compiler cancelled");
+                return;
+            }
+            RunOutcome::Completed { .. } | RunOutcome::WriteTransition => {
+                self.record_task_compilation_failure(
+                    "invalid_outcome",
+                    "task-state compiler returned a foreground outcome",
+                );
+                return;
+            }
+        };
+        let latest = match self.session_store.load(&self.session_id) {
+            Ok(latest) => latest,
+            Err(error) => {
+                self.record_task_compilation_failure("reload_failed", error.to_string());
+                return;
+            }
+        };
+        if latest.task_state.projection.revision != base.revision
+            || latest.context_state.instruction_epoch != base.instruction_epoch
+            || latest.task_state.leaf_id != base.branch
+        {
+            self.record_task_compilation_failure(
+                "append_conflict",
+                "task-state base changed while compiler was running",
+            );
+            return;
+        }
+        let output = match serde_json::to_string(&output) {
+            Ok(output) => output,
+            Err(error) => {
+                self.record_task_compilation_failure("invalid_output", error.to_string());
+                return;
+            }
         };
         let delta = match crate::task_state::parse_compiler_delta(&output) {
             Ok(delta) => delta,
@@ -1826,6 +1939,11 @@ Continue the requested change now, run the mandatory build, and stop only after 
             }
             AgentTurnResult::Cancelled => {
                 self.phase = Phase::Idle;
+            }
+            AgentTurnResult::WriteTransition => {
+                return Err(AgentEngineError::new(
+                    "write transition reached answer handling",
+                ));
             }
         }
         Ok(())
@@ -1947,957 +2065,13 @@ impl EventSink for SessionEventSink {
     }
 }
 
-pub(crate) struct ProductionCodexDriver {
-    fallback_cwd: PathBuf,
-    client_cwd: Option<PathBuf>,
-    client_access: Option<WorkspaceAccess>,
-    session_id: String,
-    sink: SessionEventSink,
-    mcp_port: Option<u16>,
-    dirs: crate::config::DataDirs,
-    session_store: crate::session::SessionStore,
-    persist_context_usage: bool,
-    runtime: SessionToolRuntime,
-    workspace: WorkspaceManager,
-    model_selection: Option<CodexModelSelection>,
-    large_context_enabled: bool,
-    large_context_fallback_notified: HashSet<String>,
-    active_workspace: Option<PreparedWorkspace>,
-    workspace_override: Option<PreparedWorkspace>,
-    client: Option<CodexAppServerClient<ChildStdout, ChildStdin>>,
-    events: Option<tokio::sync::mpsc::Receiver<AppServerEvent>>,
-    cancellation: tokio::sync::watch::Receiver<u64>,
-}
-
-fn app_server_client_is_reusable(
-    transport_closed: bool,
-    client_cwd: Option<&Path>,
-    client_access: Option<WorkspaceAccess>,
-    requested_cwd: &Path,
-    requested_access: WorkspaceAccess,
-) -> bool {
-    !transport_closed
-        && client_cwd == Some(requested_cwd)
-        && client_access == Some(requested_access)
-}
-
-impl ProductionCodexDriver {
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new(
-        session_id: impl Into<String>,
-        cwd: impl Into<PathBuf>,
-        sink: SessionEventSink,
-        mcp_port: Option<u16>,
-        dirs: crate::config::DataDirs,
-        binding: &crate::provider::ProviderBinding,
-        runtime: SessionToolRuntime,
-        cancellation: tokio::sync::watch::Receiver<u64>,
-    ) -> Result<Self, AgentEngineError> {
-        binding.validate().map_err(AgentEngineError::new)?;
-        if binding.provider != crate::provider::ProviderId::Codex {
-            return Err(AgentEngineError::new(
-                "Codex driver received a non-Codex provider binding",
-            ));
-        }
-        let large_context_enabled = dirs
-            .load_config()
-            .map(|config| {
-                config
-                    .providers
-                    .codex
-                    .large_context_models
-                    .contains(&binding.model)
-            })
-            .unwrap_or(false);
-        let model_selection = Some(CodexModelSelection {
-            model: binding.model.clone(),
-            reasoning_effort: binding
-                .reasoning
-                .as_ref()
-                .map(|selection| selection.level.clone())
-                .unwrap_or_else(|| "medium".to_string()),
-        });
-        let session_store = crate::session::SessionStore::new(&dirs);
-        Ok(Self {
-            fallback_cwd: cwd.into(),
-            client_cwd: None,
-            client_access: None,
-            session_id: session_id.into(),
-            sink,
-            mcp_port,
-            workspace: WorkspaceManager::new(dirs.clone()),
-            dirs,
-            session_store,
-            persist_context_usage: true,
-            runtime,
-            active_workspace: None,
-            workspace_override: None,
-            model_selection,
-            large_context_enabled,
-            large_context_fallback_notified: HashSet::new(),
-            client: None,
-            events: None,
-            cancellation,
-        })
-    }
-
-    pub(crate) fn use_workspace(&mut self, workspace: PreparedWorkspace) {
-        self.workspace_override = Some(workspace);
-    }
-
-    pub(crate) fn disable_session_persistence(&mut self) {
-        self.persist_context_usage = false;
-    }
-
-    async fn ensure_client_at(
-        &mut self,
-        cwd: PathBuf,
-        access: WorkspaceAccess,
-    ) -> Result<(), AgentEngineError> {
-        let reusable = self.client.as_ref().is_some_and(|client| {
-            app_server_client_is_reusable(
-                client.is_transport_closed(),
-                self.client_cwd.as_deref(),
-                self.client_access,
-                &cwd,
-                access,
-            )
-        });
-        if reusable {
-            return Ok(());
-        }
-        let retained_thread_id = match self.client.as_ref() {
-            Some(client) => client.current_thread_id().await,
-            None => None,
-        };
-        self.client = None;
-        self.events = None;
-
-        let (mut client, events) = CodexAppServerClient::spawn_app_server(
-            &cwd,
-            &self.dirs,
-            self.mcp_port,
-            access,
-            Some(self.runtime.clone()),
-        )
-        .await
-        .map_err(|err| AgentEngineError::new(err.to_string()))?;
-        client.set_model_selection(self.model_selection.clone());
-        client.set_large_context_enabled(self.large_context_enabled);
-        if let Some(thread_id) = retained_thread_id {
-            client.set_thread_id(thread_id).await;
-        }
-        self.client_cwd = Some(cwd);
-        self.client_access = Some(access);
-        self.client = Some(client);
-        self.events = Some(events);
-        Ok(())
-    }
-
-    async fn ensure_client(&mut self) -> Result<(), AgentEngineError> {
-        self.ensure_client_at(self.fallback_cwd.clone(), WorkspaceAccess::Read)
-            .await
-    }
-}
-
-#[cfg(test)]
-fn resolve_model_selection(
-    models: &[CodexModel],
-    configured: Option<&CodexModelSelection>,
-) -> Result<CodexModelSelection, AgentEngineError> {
-    let model = configured
-        .and_then(|selection| {
-            models
-                .iter()
-                .find(|candidate| candidate.model == selection.model)
-        })
-        .or_else(|| models.iter().find(|candidate| candidate.is_default))
-        .or_else(|| models.first())
-        .ok_or_else(|| AgentEngineError::new("Codex returned an empty model catalog"))?;
-    let reasoning_effort = configured
-        .filter(|selection| selection.model == model.model)
-        .and_then(|selection| {
-            model
-                .supported_reasoning_efforts
-                .iter()
-                .find(|option| option.reasoning_effort == selection.reasoning_effort)
-                .map(|_| selection.reasoning_effort.clone())
-        })
-        .unwrap_or_else(|| model.default_reasoning_effort.clone());
-
-    Ok(CodexModelSelection {
-        model: model.model.clone(),
-        reasoning_effort,
-    })
-}
-
-fn large_context_fallback_detail(
-    model_selection: Option<&CodexModelSelection>,
-    large_context_enabled: bool,
-    fallback_notified: &mut HashSet<String>,
-    model_context_window: Option<i64>,
-) -> Option<String> {
-    let window = model_context_window?;
-    if !large_context_enabled || window >= LARGE_CONTEXT_EFFECTIVE_MIN_TOKENS {
-        return None;
-    }
-    let model = model_selection?.model.clone();
-    fallback_notified.insert(model.clone()).then(|| {
-        format!(
-            "{model}의 1M 컨텍스트 요청이 Codex에서 제한되어 {window} 토큰 컨텍스트를 사용합니다."
-        )
-    })
-}
-
-struct ContextUsageHandler<'a> {
-    session_store: &'a crate::session::SessionStore,
-    persist: bool,
-    sink: &'a SessionEventSink,
-    session_id: &'a str,
-    model_selection: Option<&'a CodexModelSelection>,
-    large_context_enabled: bool,
-    fallback_notified: &'a mut HashSet<String>,
-}
-
-fn handle_context_usage(
-    handler: ContextUsageHandler<'_>,
-    turn_id: String,
-    token_usage: ipc::ContextUsage,
-) -> Result<(), AgentEngineError> {
-    if handler.persist {
-        if let Err(error) = handler
-            .session_store
-            .update_context_usage(handler.session_id, token_usage.clone())
-        {
-            eprintln!(
-                "eud-agent: failed to persist context usage for {}: {error}",
-                handler.session_id
-            );
-        }
-    }
-    if let Some(detail) = large_context_fallback_detail(
-        handler.model_selection,
-        handler.large_context_enabled,
-        handler.fallback_notified,
-        token_usage.model_context_window,
-    ) {
-        handler
-            .sink
-            .emit(EngineEvent::Progress(ipc::ProgressEvent {
-                stage: ipc::ProgressStage::LargeContextFallback,
-                detail: Some(detail),
-                provider: Some(crate::provider::ProviderId::Codex),
-                model: handler
-                    .model_selection
-                    .map(|selection| selection.model.clone()),
-            }))?;
-    }
-    eprintln!(
-        "eud-agent: context_usage session={} turn={} last_input={} last_cached={} last_output={} last_total={} cumulative_total={}",
-        handler.session_id,
-        turn_id,
-        token_usage.last.input_tokens,
-        token_usage.last.cached_input_tokens,
-        token_usage.last.output_tokens,
-        token_usage.last.total_tokens,
-        token_usage.total.total_tokens,
-    );
-    handler
-        .sink
-        .emit(EngineEvent::ContextUsage(ipc::ContextUsageEvent {
-            turn_id,
-            token_usage,
-        }))
-}
-
-impl AgentDriver for ProductionCodexDriver {
-    async fn run_turn(
-        &mut self,
-        mut input: AgentTurnInput,
-    ) -> Result<AgentTurnResult, AgentEngineError> {
-        let mut cancellation = self.cancellation.clone();
-        let cancellation_generation = *cancellation.borrow_and_update();
-        let request_id = self
-            .runtime
-            .current_request_id()
-            .ok_or_else(|| AgentEngineError::new("no request is open for the Codex workspace"))?;
-        let access = input.workspace_access;
-        if access == WorkspaceAccess::Write && !self.runtime.owns_write_registration() {
-            return Err(AgentEngineError::new(
-                "write-mode Codex execution requires an active workspace write registration",
-            ));
-        }
-        let workspace_manager = self.workspace.clone();
-        let baseline_request = request_id.clone();
-        let session_id = self.session_id.clone();
-        let workspace_override = self.workspace_override.clone();
-        let (workspace, baseline) = tokio::task::spawn_blocking(move || {
-            let workspace = match workspace_override {
-                Some(workspace) => workspace,
-                None => workspace_manager.prepare_session_current(&session_id)?,
-            };
-            let baseline = if access == WorkspaceAccess::Write {
-                Some(
-                    workspace_manager
-                        .begin_turn(&workspace, &baseline_request)
-                        .map_err(|error| error.to_string())?,
-                )
-            } else {
-                None
-            };
-            Ok::<_, String>((workspace, baseline))
-        })
-        .await
-        .map_err(|error| AgentEngineError::new(error.to_string()))?
-        .map_err(AgentEngineError::new)?;
-        self.runtime
-            .bind_workspace_root(&request_id, workspace.root.clone())
-            .map_err(AgentEngineError::new)?;
-        self.active_workspace = Some(workspace.clone());
-        let mut workspace_recorder = baseline.map(|baseline| {
-            WorkspaceTurnRecorder::new(
-                self.workspace.clone(),
-                baseline,
-                self.runtime.journal().clone(),
-            )
-        });
-
-        self.ensure_client_at(workspace.root.clone(), access)
-            .await?;
-        if *cancellation.borrow() != cancellation_generation {
-            return Ok(AgentTurnResult::Cancelled);
-        }
-        self.sink.emit(EngineEvent::Progress(ipc::ProgressEvent {
-            stage: ipc::ProgressStage::Workspace,
-            detail: Some("strict Windows sandbox setup may request elevation".to_string()),
-            provider: Some(crate::provider::ProviderId::Codex),
-            model: self
-                .model_selection
-                .as_ref()
-                .map(|selection| selection.model.clone()),
-        }))?;
-        {
-            let client = self
-                .client
-                .as_mut()
-                .ok_or_else(|| AgentEngineError::new("codex app-server client is unavailable"))?;
-            let sandbox = client.ensure_workspace_sandbox(&workspace.root);
-            tokio::pin!(sandbox);
-            tokio::select! {
-                result = &mut sandbox => {
-                    result.map_err(|error| AgentEngineError::new(error.to_string()))?;
-                }
-                changed = cancellation.changed() => {
-                    if changed.is_ok() {
-                        return Ok(AgentTurnResult::Cancelled);
-                    }
-                    (&mut sandbox)
-                        .await
-                        .map_err(|error| AgentEngineError::new(error.to_string()))?;
-                }
-            }
-        }
-        input.workspace_root = Some(workspace.root);
-
-        let client = self
-            .client
-            .as_mut()
-            .ok_or_else(|| AgentEngineError::new("codex app-server client is unavailable"))?;
-        let events = self
-            .events
-            .as_mut()
-            .ok_or_else(|| AgentEngineError::new("codex app-server event stream is unavailable"))?;
-
-        let forbid_tools = input.forbid_tools;
-        let mut answer = String::new();
-        let mut answer_break_pending = false;
-        let mut turn_complete_seen = false;
-        let mut run_finished = false;
-        let mut interrupted = false;
-        let mut deadline_interrupted = false;
-        let mut deadline_armed = false;
-        let deadline = tokio::time::sleep(std::time::Duration::from_secs(365 * 24 * 60 * 60));
-        tokio::pin!(deadline);
-        let (turn_cancel, turn_cancel_rx) = tokio::sync::watch::channel(0_u64);
-        let run_turn = client.run_turn_cancellable(input, turn_cancel_rx, 0);
-        tokio::pin!(run_turn);
-
-        loop {
-            if run_finished && turn_complete_seen {
-                if let Some(recorder) = workspace_recorder.as_mut() {
-                    recorder
-                        .finish()
-                        .map_err(|error| AgentEngineError::new(error.to_string()))?;
-                }
-                return if interrupted {
-                    if deadline_interrupted {
-                        Ok(AgentTurnResult::Answer {
-                            text: "빌드 성공 후 30초 완료 계약에 따라 구현 턴을 종료했습니다. 코드 변경사항을 검토해 주세요. 런타임 확인이 필요한 변경은 승인 후 별도 상태로 안내합니다.".to_string(),
-                        })
-                    } else {
-                        Ok(AgentTurnResult::Cancelled)
-                    }
-                } else {
-                    Ok(AgentTurnResult::Answer { text: answer })
-                };
-            }
-
-            tokio::select! {
-                result = &mut run_turn, if !run_finished => {
-                    match result {
-                        Ok(was_interrupted) => {
-                            interrupted = was_interrupted;
-                            run_finished = true;
-                        }
-                        Err(err) => return Err(AgentEngineError::new(err.to_string())),
-                    }
-                }
-                changed = cancellation.changed(), if !run_finished => {
-                    if changed.is_ok() {
-                        let next = (*turn_cancel.borrow()).saturating_add(1);
-                        turn_cancel.send_replace(next);
-                    }
-                }
-                _ = &mut deadline, if deadline_armed && !run_finished => {
-                    deadline_armed = false;
-                    deadline_interrupted = true;
-                    let next = (*turn_cancel.borrow()).saturating_add(1);
-                    turn_cancel.send_replace(next);
-                }
-                event = events.recv(), if !turn_complete_seen => {
-                    let Some(event) = event else {
-                        return Err(AgentEngineError::new("codex app-server event stream closed"));
-                    };
-                    match event {
-                        AppServerEvent::ThreadStarted { thread_id } => {
-                            self.sink.emit(EngineEvent::Agent(ipc::AgentEvent {
-                                kind: "thread_started".to_string(),
-                                detail: thread_id,
-                                data: None,
-                            }))?;
-                        }
-                        AppServerEvent::TurnStarted => {
-                            self.sink.emit(EngineEvent::Progress(ipc::ProgressEvent {
-                                stage: ipc::ProgressStage::Codex,
-                                detail: Some("Codex turn started".to_string()),
-                                provider: Some(crate::provider::ProviderId::Codex),
-                                model: self
-                                    .model_selection
-                                    .as_ref()
-                                    .map(|selection| selection.model.clone()),
-                            }))?;
-                        }
-                        AppServerEvent::ReasoningDelta(delta) => {
-                            self.sink.emit(EngineEvent::Agent(ipc::AgentEvent {
-                                kind: "reasoning".to_string(),
-                                detail: delta,
-                                data: None,
-                            }))?;
-                        }
-                        AppServerEvent::AnswerDelta(delta) => {
-                            answer.push_str(message_break(&answer, answer_break_pending));
-                            answer_break_pending = false;
-                            answer.push_str(&delta);
-                            self.sink.emit(EngineEvent::Agent(ipc::AgentEvent {
-                                kind: "delta".to_string(),
-                                detail: delta,
-                                data: None,
-                            }))?;
-                        }
-                        AppServerEvent::ItemStarted { item_id } => {
-                            answer_break_pending = true;
-                            self.sink.emit(EngineEvent::Agent(ipc::AgentEvent {
-                                kind: "item_started".to_string(),
-                                detail: item_id.unwrap_or_default(),
-                                data: None,
-                            }))?;
-                        }
-                        AppServerEvent::ItemCompleted { item_id } => {
-                            self.sink.emit(EngineEvent::Agent(ipc::AgentEvent {
-                                kind: "item_completed".to_string(),
-                                detail: item_id.unwrap_or_default(),
-                                data: None,
-                            }))?;
-                        }
-                        AppServerEvent::ContextCompactionStarted => {
-                            self.sink.emit(EngineEvent::Progress(ipc::ProgressEvent {
-                                stage: ipc::ProgressStage::Compaction,
-                                detail: Some("started".to_string()),
-                                provider: Some(crate::provider::ProviderId::Codex),
-                                model: self
-                                    .model_selection
-                                    .as_ref()
-                                    .map(|selection| selection.model.clone()),
-                            }))?;
-                        }
-                        AppServerEvent::ContextCompactionCompleted => {
-                            self.sink.emit(EngineEvent::Progress(ipc::ProgressEvent {
-                                stage: ipc::ProgressStage::Compaction,
-                                detail: Some("done".to_string()),
-                                provider: Some(crate::provider::ProviderId::Codex),
-                                model: self
-                                    .model_selection
-                                    .as_ref()
-                                    .map(|selection| selection.model.clone()),
-                            }))?;
-                        }
-                        AppServerEvent::ToolCallStarted { name, args } => {
-                            if forbid_tools {
-                                return Err(AgentEngineError::new(format!(
-                                    "structured harness generation attempted forbidden tool `{name}`"
-                                )));
-                            }
-                            answer_break_pending = true;
-                            self.sink.emit(EngineEvent::Agent(ipc::AgentEvent {
-                                kind: "tool_call".to_string(),
-                                detail: name,
-                                data: args.map(|args| ipc::AgentEventData {
-                                    args: Some(args),
-                                    result: None,
-                                    status: None,
-                                }),
-                            }))?;
-                        }
-                        AppServerEvent::ToolCallCompleted { name, result, status } => {
-                            if name.ends_with(crate::tools::BUILD_RUN_TOOL)
-                                && self
-                                    .runtime
-                                    .last_build_evidence()
-                                    .is_some_and(|build| build.ok)
-                                && !deadline_armed
-                            {
-                                deadline
-                                    .as_mut()
-                                    .reset(tokio::time::Instant::now() + FOREGROUND_POST_BUILD_DEADLINE);
-                                deadline_armed = true;
-                            }
-                            let data = if result.is_some() || status.is_some() {
-                                Some(ipc::AgentEventData {
-                                    args: None,
-                                    result,
-                                    status,
-                                })
-                            } else {
-                                None
-                            };
-                            self.sink.emit(EngineEvent::Agent(ipc::AgentEvent {
-                                kind: "tool_result".to_string(),
-                                detail: name,
-                                data,
-                            }))?;
-                        }
-                        AppServerEvent::TokenUsageUpdated {
-                            turn_id,
-                            token_usage,
-                        } => {
-                            handle_context_usage(
-                                ContextUsageHandler {
-                                    session_store: &self.session_store,
-                                    persist: self.persist_context_usage,
-                                    sink: &self.sink,
-                                    session_id: &self.session_id,
-                                    model_selection: self.model_selection.as_ref(),
-                                    large_context_enabled: self.large_context_enabled,
-                                    fallback_notified: &mut self.large_context_fallback_notified,
-                                },
-                                turn_id,
-                                token_usage,
-                            )?;
-                        }
-                        AppServerEvent::TurnComplete => {
-                            turn_complete_seen = true;
-                        }
-                        AppServerEvent::Error(message) => {
-                            self.sink.emit(EngineEvent::Error(ipc::ErrorEvent {
-                                message: message.clone(),
-                            }))?;
-                            return Err(AgentEngineError::new(message));
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    async fn compile_task_state(
-        &mut self,
-        mut input: AgentTurnInput,
-    ) -> Result<Option<String>, AgentEngineError> {
-        let workspace = self
-            .active_workspace
-            .clone()
-            .or_else(|| self.workspace_override.clone())
-            .ok_or_else(|| {
-                AgentEngineError::new("task-state compiler has no prepared workspace")
-            })?;
-        let (mut client, mut events) = CodexAppServerClient::spawn_app_server(
-            &workspace.root,
-            &self.dirs,
-            None,
-            WorkspaceAccess::Read,
-            None,
-        )
-        .await
-        .map_err(|error| AgentEngineError::new(error.to_string()))?;
-        client.set_model_selection(self.model_selection.clone());
-        client.set_large_context_enabled(self.large_context_enabled);
-        client
-            .ensure_workspace_sandbox(&workspace.root)
-            .await
-            .map_err(|error| AgentEngineError::new(error.to_string()))?;
-        input.workspace_root = Some(workspace.root);
-        input.forbid_tools = true;
-
-        let run = client.run_turn(input);
-        tokio::pin!(run);
-        let mut run_finished = false;
-        let mut turn_complete = false;
-        let mut answer = String::new();
-        loop {
-            if run_finished && turn_complete {
-                return Ok(Some(answer));
-            }
-            tokio::select! {
-                result = &mut run, if !run_finished => {
-                    result.map_err(|error| AgentEngineError::new(error.to_string()))?;
-                    run_finished = true;
-                }
-                event = events.recv(), if !turn_complete => {
-                    let event = event.ok_or_else(|| {
-                        AgentEngineError::new("task-state compiler event stream closed")
-                    })?;
-                    match event {
-                        AppServerEvent::AnswerDelta(delta) => answer.push_str(&delta),
-                        AppServerEvent::ToolCallStarted { name, .. } => {
-                            return Err(AgentEngineError::new(format!(
-                                "task-state compiler attempted forbidden tool `{name}`"
-                            )));
-                        }
-                        AppServerEvent::TurnComplete => turn_complete = true,
-                        AppServerEvent::Error(message) => {
-                            return Err(AgentEngineError::new(message));
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        }
-    }
-
-    async fn compact_conversation(&mut self) -> Result<(), AgentEngineError> {
-        let cwd = self
-            .client_cwd
-            .clone()
-            .unwrap_or_else(|| self.fallback_cwd.clone());
-        let access = self.client_access.unwrap_or(WorkspaceAccess::Read);
-        self.ensure_client_at(cwd, access).await?;
-        self.client
-            .as_mut()
-            .ok_or_else(|| AgentEngineError::new("codex app-server client is unavailable"))?
-            .start_compaction()
-            .await
-            .map_err(|error| AgentEngineError::new(error.to_string()))?;
-
-        loop {
-            let event = self
-                .events
-                .as_mut()
-                .ok_or_else(|| {
-                    AgentEngineError::new("codex app-server event stream is unavailable")
-                })?
-                .recv()
-                .await
-                .ok_or_else(|| AgentEngineError::new("codex app-server event stream closed"))?;
-            match event {
-                AppServerEvent::ContextCompactionCompleted => return Ok(()),
-                AppServerEvent::TokenUsageUpdated {
-                    turn_id,
-                    token_usage,
-                } => {
-                    handle_context_usage(
-                        ContextUsageHandler {
-                            session_store: &self.session_store,
-                            persist: self.persist_context_usage,
-                            sink: &self.sink,
-                            session_id: &self.session_id,
-                            model_selection: self.model_selection.as_ref(),
-                            large_context_enabled: self.large_context_enabled,
-                            fallback_notified: &mut self.large_context_fallback_notified,
-                        },
-                        turn_id,
-                        token_usage,
-                    )?;
-                }
-                AppServerEvent::Error(message) => {
-                    return Err(AgentEngineError::new(message));
-                }
-                _ => {}
-            }
-        }
-    }
-
-    async fn reset_conversation(&mut self) -> Result<(), AgentEngineError> {
-        self.client = None;
-        self.events = None;
-        self.client_cwd = None;
-        self.client_access = None;
-        Ok(())
-    }
-
-    async fn conversation_state(&self) -> crate::provider::ProviderConversationState {
-        let thread_id = match self.client.as_ref() {
-            Some(client) => client.current_thread_id().await,
-            None => None,
-        };
-        crate::provider::ProviderConversationState::Codex { thread_id }
-    }
-
-    async fn seed_conversation(
-        &mut self,
-        state: crate::provider::ProviderConversationState,
-    ) -> Result<(), AgentEngineError> {
-        let crate::provider::ProviderConversationState::Codex { thread_id } = state else {
-            return Err(AgentEngineError::new(
-                "Codex driver received incompatible conversation state",
-            ));
-        };
-        let Some(id) = thread_id else {
-            return Ok(());
-        };
-        // The client is lazily spawned; seed before the next turn resumes it.
-        self.ensure_client().await?;
-        let client = self
-            .client
-            .as_ref()
-            .ok_or_else(|| AgentEngineError::new("codex app-server client is unavailable"))?;
-        client.set_thread_id(id).await;
-        Ok(())
-    }
-
-    fn current_workspace(&self) -> Option<PreparedWorkspace> {
-        self.active_workspace.clone()
-    }
-}
-
-pub(crate) enum ProductionProviderDriver {
-    Codex(ProductionCodexDriver),
-    ClaudeCode(crate::claude_client::ProductionClaudeCodeDriver),
-    Antigravity(crate::antigravity_client::ProductionAntigravityDriver),
-    OpencodeGo(crate::opencode_go::ProductionOpenCodeGoDriver),
-    Ollama(crate::ollama::ProductionOllamaDriver),
-}
-
-impl ProductionProviderDriver {
-    fn use_workspace(&mut self, workspace: PreparedWorkspace) {
-        match self {
-            Self::Codex(driver) => driver.use_workspace(workspace),
-            Self::ClaudeCode(driver) => driver.use_workspace(workspace),
-            Self::Antigravity(driver) => driver.use_workspace(workspace),
-            Self::OpencodeGo(driver) => driver.use_workspace(workspace),
-            Self::Ollama(driver) => driver.use_workspace(workspace),
-        }
-    }
-
-    fn disable_session_persistence(&mut self) {
-        match self {
-            Self::Codex(driver) => driver.disable_session_persistence(),
-            Self::ClaudeCode(driver) => driver.disable_session_persistence(),
-            Self::Antigravity(driver) => driver.disable_session_persistence(),
-            Self::OpencodeGo(driver) => driver.disable_session_persistence(),
-            Self::Ollama(driver) => driver.disable_session_persistence(),
-        }
-    }
-}
-
-impl AgentDriver for ProductionProviderDriver {
-    async fn run_turn(
-        &mut self,
-        input: AgentTurnInput,
-    ) -> Result<AgentTurnResult, AgentEngineError> {
-        match self {
-            Self::Codex(driver) => driver.run_turn(input).await,
-            Self::ClaudeCode(driver) => driver.run_turn(input).await,
-            Self::Antigravity(driver) => driver.run_turn(input).await,
-            Self::OpencodeGo(driver) => driver.run_turn(input).await,
-            Self::Ollama(driver) => driver.run_turn(input).await,
-        }
-    }
-
-    async fn compile_task_state(
-        &mut self,
-        input: AgentTurnInput,
-    ) -> Result<Option<String>, AgentEngineError> {
-        match self {
-            Self::Codex(driver) => driver.compile_task_state(input).await,
-            Self::ClaudeCode(driver) => driver.compile_task_state(input).await,
-            Self::Antigravity(driver) => driver.compile_task_state(input).await,
-            Self::OpencodeGo(driver) => driver.compile_task_state(input).await,
-            Self::Ollama(driver) => driver.compile_task_state(input).await,
-        }
-    }
-
-    async fn compact_conversation(&mut self) -> Result<(), AgentEngineError> {
-        match self {
-            Self::Codex(driver) => driver.compact_conversation().await,
-            Self::ClaudeCode(driver) => driver.compact_conversation().await,
-            Self::Antigravity(driver) => driver.compact_conversation().await,
-            Self::OpencodeGo(driver) => driver.compact_conversation().await,
-            Self::Ollama(driver) => driver.compact_conversation().await,
-        }
-    }
-
-    async fn reset_conversation(&mut self) -> Result<(), AgentEngineError> {
-        match self {
-            Self::Codex(driver) => driver.reset_conversation().await,
-            Self::ClaudeCode(driver) => driver.reset_conversation().await,
-            Self::Antigravity(driver) => driver.reset_conversation().await,
-            Self::OpencodeGo(driver) => driver.reset_conversation().await,
-            Self::Ollama(driver) => driver.reset_conversation().await,
-        }
-    }
-
-    async fn conversation_state(&self) -> crate::provider::ProviderConversationState {
-        match self {
-            Self::Codex(driver) => driver.conversation_state().await,
-            Self::ClaudeCode(driver) => driver.conversation_state().await,
-            Self::Antigravity(driver) => driver.conversation_state().await,
-            Self::OpencodeGo(driver) => driver.conversation_state().await,
-            Self::Ollama(driver) => driver.conversation_state().await,
-        }
-    }
-
-    async fn seed_conversation(
-        &mut self,
-        state: crate::provider::ProviderConversationState,
-    ) -> Result<(), AgentEngineError> {
-        match self {
-            Self::Codex(driver) => driver.seed_conversation(state).await,
-            Self::ClaudeCode(driver) => driver.seed_conversation(state).await,
-            Self::Antigravity(driver) => driver.seed_conversation(state).await,
-            Self::OpencodeGo(driver) => driver.seed_conversation(state).await,
-            Self::Ollama(driver) => driver.seed_conversation(state).await,
-        }
-    }
-
-    fn current_workspace(&self) -> Option<PreparedWorkspace> {
-        match self {
-            Self::Codex(driver) => driver.current_workspace(),
-            Self::ClaudeCode(driver) => driver.current_workspace(),
-            Self::Antigravity(driver) => driver.current_workspace(),
-            Self::OpencodeGo(driver) => driver.current_workspace(),
-            Self::Ollama(driver) => driver.current_workspace(),
-        }
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn production_provider_driver(
-    session_id: &str,
-    fallback_cwd: &Path,
-    binding: &crate::provider::ProviderBinding,
-    sink: SessionEventSink,
-    mcp_port: Option<u16>,
-    dirs: crate::config::DataDirs,
-    runtime: SessionToolRuntime,
-    cancellation: tokio::sync::watch::Receiver<u64>,
-) -> Result<ProductionProviderDriver, AgentEngineError> {
-    binding.validate().map_err(AgentEngineError::new)?;
-    match (&binding.provider, &binding.conversation) {
-        (
-            crate::provider::ProviderId::Codex,
-            crate::provider::ProviderConversationState::Codex { .. },
-        ) => Ok(ProductionProviderDriver::Codex(ProductionCodexDriver::new(
-            session_id,
-            fallback_cwd,
-            sink,
-            mcp_port,
-            dirs,
-            binding,
-            runtime,
-            cancellation,
-        )?)),
-        (
-            crate::provider::ProviderId::ClaudeCode,
-            crate::provider::ProviderConversationState::ClaudeCode { .. },
-        ) => Ok(ProductionProviderDriver::ClaudeCode(
-            crate::claude_client::ProductionClaudeCodeDriver::new(
-                session_id.to_string(),
-                binding.model.clone(),
-                binding.reasoning.clone(),
-                dirs,
-                sink,
-                mcp_port,
-                runtime,
-                cancellation,
-            )?,
-        )),
-        (
-            crate::provider::ProviderId::Antigravity,
-            crate::provider::ProviderConversationState::Antigravity {
-                transcript_revision,
-            },
-        ) => Ok(ProductionProviderDriver::Antigravity(
-            crate::antigravity_client::ProductionAntigravityDriver::new(
-                session_id.to_string(),
-                binding.model.clone(),
-                binding.reasoning.clone(),
-                dirs,
-                runtime,
-                sink,
-                *transcript_revision,
-                cancellation,
-            )?,
-        )),
-        (
-            crate::provider::ProviderId::OpencodeGo,
-            crate::provider::ProviderConversationState::OpencodeGo {
-                transcript_revision,
-            },
-        ) => Ok(ProductionProviderDriver::OpencodeGo(
-            crate::opencode_go::ProductionOpenCodeGoDriver::new(
-                session_id.to_string(),
-                binding.model.clone(),
-                binding.reasoning.clone(),
-                dirs,
-                runtime,
-                sink,
-                *transcript_revision,
-                cancellation,
-            )?,
-        )),
-        (
-            crate::provider::ProviderId::Ollama,
-            crate::provider::ProviderConversationState::Ollama {
-                transcript_revision,
-            },
-        ) => Ok(ProductionProviderDriver::Ollama(
-            crate::ollama::ProductionOllamaDriver::new(
-                session_id.to_string(),
-                binding.model.clone(),
-                binding.reasoning.clone(),
-                binding.base_url.clone().ok_or_else(|| {
-                    AgentEngineError::new("ollama provider binding base URL is invalid")
-                })?,
-                dirs,
-                runtime,
-                sink,
-                *transcript_revision,
-                cancellation,
-            )?,
-        )),
-        _ => Err(AgentEngineError::new(
-            "provider binding conversation variant mismatch",
-        )),
-    }
-}
-
 pub(crate) struct SessionWorker {
-    engine: tokio::sync::Mutex<AgentEngine<ProductionProviderDriver, SessionEventSink>>,
+    engine:
+        tokio::sync::Mutex<AgentEngine<crate::provider_runtime::ProviderRuntime, SessionEventSink>>,
     provider: crate::provider::ProviderId,
     cancellation: tokio::sync::watch::Sender<u64>,
     runtime: SessionToolRuntime,
     sink: SessionEventSink,
-    _mcp: crate::mcp::McpServerHandle,
 }
 
 fn cancel_worker_generation(
@@ -3067,6 +2241,94 @@ impl SessionEngineManager {
             }),
         }
     }
+
+    /// Hold admission closed until project configuration has atomically settled.
+    /// Called off the async runtime, after any native picker has closed.
+    pub(crate) fn with_project_switch<T>(
+        &self,
+        operation: impl FnOnce() -> Result<T, String>,
+    ) -> Result<T, String> {
+        const BUSY: &str =
+            "진행 중인 작업이나 검토가 있습니다. 작업을 완료하거나 취소한 뒤 프로젝트를 전환해 주세요.";
+        let mut workers = self
+            .inner
+            .workers
+            .try_lock()
+            .map_err(|_| BUSY.to_string())?;
+        let running = self
+            .inner
+            .running_harness
+            .try_lock()
+            .map_err(|_| BUSY.to_string())?;
+        if !running.is_empty() {
+            return Err(BUSY.to_string());
+        }
+        if ["map-agent", "map-import"]
+            .iter()
+            .any(|label| tauri::Manager::get_webview_window(&self.inner.app, label).is_some())
+        {
+            return Err(
+                "맵 작업을 저장하고 Map Agent와 맵 가져오기 창을 닫은 뒤 프로젝트를 전환해 주세요."
+                    .to_string(),
+            );
+        }
+        if crate::native_runtime::NativeProjectManager::new(self.inner.dirs.clone()).is_building() {
+            return Err(
+                "빌드가 진행 중입니다. 빌드가 끝난 뒤 프로젝트를 전환해 주세요.".to_string(),
+            );
+        }
+        let mut idle = Vec::with_capacity(workers.len());
+        for (session_id, worker) in workers.iter() {
+            // A cloned handle includes commands waiting to acquire the engine lock.
+            if Arc::strong_count(worker) != 1 {
+                return Err(BUSY.to_string());
+            }
+            let engine = worker.engine.try_lock().map_err(|_| BUSY.to_string())?;
+            if engine.phase != Phase::Idle || worker.runtime.write_ticket().is_some() {
+                return Err(BUSY.to_string());
+            }
+            if self
+                .inner
+                .harness_jobs
+                .list_session(session_id)
+                .map_err(|error| error.to_string())?
+                .iter()
+                .any(|job| {
+                    matches!(
+                        job.status,
+                        crate::harness::HarnessJobStatus::Pending
+                            | crate::harness::HarnessJobStatus::Running
+                            | crate::harness::HarnessJobStatus::Review
+                            | crate::harness::HarnessJobStatus::WaitingRuntime
+                    )
+                })
+            {
+                return Err(BUSY.to_string());
+            }
+            idle.push(engine);
+        }
+        let previous = self
+            .inner
+            .dirs
+            .load_config()
+            .map_err(|error| error.to_string())?
+            .project_path;
+        let result = operation();
+        let current = self
+            .inner
+            .dirs
+            .load_config()
+            .map_err(|error| error.to_string())?
+            .project_path;
+        drop(idle);
+        if previous != current {
+            // Durable sessions remain intact; provider threads must rehydrate in
+            // the newly selected project's context rather than reuse stale workers.
+            workers.clear();
+        }
+        result
+    }
+
     pub(crate) async fn direct_project_write<T>(
         &self,
         project_id: &str,
@@ -3214,58 +2476,43 @@ impl SessionEngineManager {
         let workspace = WorkspaceManager::new(self.inner.dirs.clone())
             .prepare_document_session(&job.workspace_id, &job.project, &job.workspace_session_id)
             .map_err(|error| AgentEngineError::new(error.to_string()))?;
-        let runtime = self.inner.services.session(format!("{}-generator", job.id));
-        runtime.set_provider_identity(
-            job.provider_binding.provider,
-            job.provider_binding.model.clone(),
-        );
-        runtime
-            .begin_request(
-                &format!("generate-{}-{}", job.id, job.attempts),
-                &job.project,
-            )
-            .map_err(AgentEngineError::new)?;
-        let sink = SessionEventSink::new(self.inner.app.clone(), format!("{}-generator", job.id));
         let (_cancellation, cancellation_rx) = tokio::sync::watch::channel(0_u64);
-        let binding = crate::provider::ProviderBinding {
-            provider: job.provider_binding.provider,
-            model: job.provider_binding.model.clone(),
-            reasoning: job.provider_binding.reasoning.clone(),
-            base_url: job.provider_binding.base_url.clone(),
-            conversation: crate::provider::ProviderConversationState::empty(
-                job.provider_binding.provider,
-            ),
-        };
-        let mut driver = production_provider_driver(
-            &format!("{}-generator", job.id),
-            &workspace.root,
-            &binding,
-            sink,
-            None,
-            self.inner.dirs.clone(),
-            runtime,
-            cancellation_rx,
+        let (binding, request) = harness_execution_contract(
+            &job,
+            prompt,
+            workspace.root.clone(),
+            *cancellation_rx.borrow(),
         )?;
-        driver.use_workspace(workspace);
-        driver.disable_session_persistence();
-        let turn = AgentTurnInput::text(prompt)
-            .with_output_schema(crate::harness::output_schema())
-            .without_tools();
-        let result =
-            tokio::time::timeout(std::time::Duration::from_secs(300), driver.run_turn(turn))
-                .await
-                .map_err(|_| AgentEngineError::new("harness generation timed out"))??;
-        let text = match result {
-            AgentTurnResult::Answer { text } => text,
-            AgentTurnResult::Plan { .. } => {
-                return Err(AgentEngineError::new(
-                    "harness generation returned a plan instead of a structured delta",
-                ));
-            }
-            AgentTurnResult::Cancelled => {
+        let adapter = crate::provider_runtime::production_adapter(
+            &binding,
+            &self.inner.dirs,
+            workspace.root.clone(),
+        )
+        .map_err(|error| AgentEngineError::new(error.to_string()))?;
+        let mut executor = StructuredJobExecutor::new(adapter, cancellation_rx.clone());
+        let base = request.base.clone();
+        let value = match executor.run(request).await {
+            RunOutcome::Structured {
+                value,
+                base: returned_base,
+            } if returned_base == base => value,
+            RunOutcome::Cancelled => {
                 return Err(AgentEngineError::new("harness generation was cancelled"));
             }
+            RunOutcome::Failed(error) => return Err(AgentEngineError::new(error.to_string())),
+            RunOutcome::Structured { .. } => {
+                return Err(AgentEngineError::new(
+                    "harness generation returned a stale base",
+                ));
+            }
+            RunOutcome::Completed { .. } | RunOutcome::WriteTransition => {
+                return Err(AgentEngineError::new(
+                    "harness generation returned a foreground outcome",
+                ));
+            }
         };
+        let text = serde_json::to_string(&value)
+            .map_err(|error| AgentEngineError::new(error.to_string()))?;
         let delta = crate::harness::parse_delta(&text).map_err(AgentEngineError::new)?;
         if let Err(error) = crate::harness::stage_delta(
             &self.inner.dirs,
@@ -3428,7 +2675,7 @@ impl SessionEngineManager {
                     if let Err(error) = WorkspaceManager::new(dirs.clone())
                         .record_accepted_entries(&request_id, &entries)
                     {
-                        crate::harness::rollback_memory_updates(&dirs, applied_memory);
+                        crate::harness::rollback_memory_updates(applied_memory);
                         return Err(error.to_string());
                     }
                     store
@@ -3524,7 +2771,10 @@ impl SessionEngineManager {
     }
 
     async fn worker(&self, session_id: &str) -> Result<Arc<SessionWorker>, AgentEngineError> {
-        if let Some(worker) = self.inner.workers.lock().await.get(session_id).cloned() {
+        // Keep worker creation inside project-switch admission, including its
+        // async provider setup and initial hydration.
+        let mut workers = self.inner.workers.lock().await;
+        if let Some(worker) = workers.get(session_id).cloned() {
             return Ok(worker);
         }
         let record = self
@@ -3566,45 +2816,48 @@ impl SessionEngineManager {
                 .emit_scoped("progress", event)
                 .map_err(|error| format!("failed to emit progress event: {error}"))
         });
-        let mcp = crate::mcp::serve(runtime.clone())
-            .await
-            .map_err(AgentEngineError::new)?;
         let (cancellation, cancellation_rx) = tokio::sync::watch::channel(0_u64);
         runtime.set_cancellation(cancellation_rx.clone());
-        let driver = production_provider_driver(
-            session_id,
-            &self.inner.fallback_cwd,
+        let binding = BindingSnapshot::from_binding(&record.provider_binding, None)
+            .map_err(|error| AgentEngineError::new(error.to_string()))?;
+        let adapter = crate::provider_runtime::production_adapter(
             &record.provider_binding,
-            sink.clone(),
-            Some(mcp.port()),
+            &self.inner.dirs,
+            self.inner.fallback_cwd.clone(),
+        )
+        .map_err(|error| AgentEngineError::new(error.to_string()))?;
+        let executor = crate::provider_runtime::ProviderRuntime::new(
+            adapter,
+            binding,
             self.inner.dirs.clone(),
+            self.inner.fallback_cwd.clone(),
             runtime.clone(),
-            cancellation_rx,
-        )?;
+            cancellation_rx.clone(),
+            Arc::new(runtime_events::SessionRuntimeEventSink::new(
+                sink.clone(),
+                self.inner.sessions.clone(),
+                session_id.to_string(),
+            )),
+        )
+        .map_err(|error| AgentEngineError::new(error.to_string()))?;
         let worker = Arc::new(SessionWorker {
             provider: record.provider_binding.provider,
             engine: tokio::sync::Mutex::new(AgentEngine::new(
-                driver,
+                executor,
                 sink.clone(),
                 self.inner.config.clone(),
                 runtime.clone(),
                 self.inner.sessions.clone(),
                 self.inner.attachments.clone(),
                 record,
+                cancellation_rx,
             )),
             cancellation,
             runtime,
             sink: sink.clone(),
-            _mcp: mcp,
         });
 
-        let worker = {
-            let mut workers = self.inner.workers.lock().await;
-            workers
-                .entry(session_id.to_string())
-                .or_insert_with(|| Arc::clone(&worker))
-                .clone()
-        };
+        workers.insert(session_id.to_string(), Arc::clone(&worker));
         worker.engine.lock().await.hydrate().await?;
         Ok(worker)
     }
@@ -4032,6 +3285,10 @@ impl SessionEngineManager {
             .harness_jobs
             .delete_session(id)
             .map_err(|error| AgentEngineError::new(error.to_string()))?;
+        self.inner
+            .services
+            .native()
+            .revoke_python_dependency_candidates(id);
         self.inner.workers.lock().await.remove(id);
         self.inner
             .sessions
@@ -4528,6 +3785,7 @@ fn static_prompt_baseline() -> String {
         first_principles_section(),
         EPS_IDIOMS.to_string(),
         EPSCRIPT_GUIDE.to_string(),
+        DIRECT_PYTHON_GUIDE.to_string(),
         EPS_PROJECT_ARCHITECTURE_GUIDE.to_string(),
         EPS_PREFLIGHT_GUIDE.to_string(),
         BUILD_GUIDE.to_string(),
@@ -4661,18 +3919,65 @@ fn next_request_id() -> String {
     format!("req-{value:08x}", value = value as u32)
 }
 
+fn next_run_id() -> u64 {
+    static NEXT_RUN_ID: AtomicU64 = AtomicU64::new(1);
+    NEXT_RUN_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+pub(crate) fn harness_execution_contract(
+    job: &crate::harness::HarnessJob,
+    prompt: String,
+    workspace_root: PathBuf,
+    cancellation_generation: u64,
+) -> Result<(crate::provider::ProviderBinding, StructuredJobRequest), AgentEngineError> {
+    let runtime_session_id = format!("{}-generator", job.id);
+    let binding = crate::provider::ProviderBinding {
+        provider: job.provider_binding.provider,
+        model: job.provider_binding.model.clone(),
+        reasoning: job.provider_binding.reasoning.clone(),
+        base_url: job.provider_binding.base_url.clone(),
+        conversation: crate::provider::ProviderConversationState::empty(
+            job.provider_binding.provider,
+        ),
+    };
+    let binding_snapshot = BindingSnapshot::from_binding(&binding, None)
+        .map_err(|error| AgentEngineError::new(error.to_string()))?;
+    let promotion = job.task_state_promotion.as_ref();
+    let base = JobBase {
+        revision: promotion.map_or(0, |input| input.source_task_revision),
+        instruction_epoch: 0,
+        branch: promotion.map(|input| input.source_event_id.clone()),
+    };
+    let request = StructuredJobRequest {
+        identity: RunIdentity {
+            session_id: runtime_session_id,
+            run_id: RunId::new(next_run_id()),
+            request_id: format!("generate-{}-{}", job.id, job.attempts),
+            session_kind: crate::session::SessionKind::Eps,
+            cancellation_generation,
+        },
+        binding: binding_snapshot,
+        kind: StructuredJobKind::HarnessGenerator,
+        prompt,
+        workspace_root,
+        output_schema: crate::harness::output_schema(),
+        base,
+        policy: RunPolicy {
+            active_deadline: Some(HARNESS_DEADLINE),
+            shutdown_grace: std::time::Duration::from_secs(2),
+            max_output_bytes: 1024 * 1024,
+            max_output_tokens: None,
+            max_tool_rounds: 0,
+            allow_resume: false,
+        },
+    };
+    Ok((binding, request))
+}
+
 /// Paragraph break for the accumulated answer when an item boundary was seen:
 /// codex streams each agent message as a separate thread item, so without a
 /// break two messages would concatenate into one unbroken paragraph. No break
 /// before the first message (empty accumulator).
-fn message_break(answer: &str, boundary_seen: bool) -> &'static str {
-    if boundary_seen && !answer.is_empty() {
-        "\n\n"
-    } else {
-        ""
-    }
-}
-
 fn take_chars(s: &str, limit: usize) -> String {
     s.chars().take(limit).collect()
 }
@@ -4852,65 +4157,6 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
-    fn model_option(
-        model: &str,
-        default_reasoning_effort: &str,
-        efforts: &[&str],
-        is_default: bool,
-    ) -> CodexModel {
-        CodexModel {
-            model: model.to_string(),
-            display_name: model.to_string(),
-            description: String::new(),
-            supported_reasoning_efforts: efforts
-                .iter()
-                .map(|effort| crate::codex_client::CodexReasoningEffortOption {
-                    reasoning_effort: (*effort).to_string(),
-                    description: String::new(),
-                })
-                .collect(),
-            default_reasoning_effort: default_reasoning_effort.to_string(),
-            is_default,
-        }
-    }
-
-    #[tokio::test]
-    async fn resume_fallback_timeout_excludes_ask_wait() {
-        let (ask_waiting, receiver) = tokio::sync::watch::channel(false);
-        let operation = async move {
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            ask_waiting.send_replace(true);
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            ask_waiting.send_replace(false);
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            "completed"
-        };
-
-        let result =
-            active_time_timeout(std::time::Duration::from_millis(50), receiver, operation).await;
-
-        assert_eq!(result, Ok("completed"));
-    }
-
-    #[test]
-    fn closed_app_server_transport_is_never_reused() {
-        let cwd = Path::new("C:/app/session");
-        assert!(app_server_client_is_reusable(
-            false,
-            Some(cwd),
-            Some(WorkspaceAccess::Read),
-            cwd,
-            WorkspaceAccess::Read,
-        ));
-        assert!(!app_server_client_is_reusable(
-            true,
-            Some(cwd),
-            Some(WorkspaceAccess::Read),
-            cwd,
-            WorkspaceAccess::Read,
-        ));
-    }
-
     #[test]
     fn session_event_flattens_payload_with_session_id() {
         let value = serde_json::to_value(SessionEvent {
@@ -4924,104 +4170,6 @@ mod tests {
         .expect("session event should serialize");
         assert_eq!(value["sessionId"], "session-a");
         assert_eq!(value["text"], "done");
-    }
-
-    #[test]
-    fn model_selection_preserves_valid_choice_and_repairs_stale_values() {
-        let models = vec![
-            model_option("gpt-default", "medium", &["low", "medium", "high"], true),
-            model_option("gpt-fast", "low", &["low", "medium"], false),
-        ];
-
-        let valid = resolve_model_selection(
-            &models,
-            Some(&CodexModelSelection {
-                model: "gpt-fast".to_string(),
-                reasoning_effort: "medium".to_string(),
-            }),
-        )
-        .unwrap();
-        assert_eq!(valid.model, "gpt-fast");
-        assert_eq!(valid.reasoning_effort, "medium");
-
-        let stale_effort = resolve_model_selection(
-            &models,
-            Some(&CodexModelSelection {
-                model: "gpt-fast".to_string(),
-                reasoning_effort: "ultra".to_string(),
-            }),
-        )
-        .unwrap();
-        assert_eq!(stale_effort.model, "gpt-fast");
-        assert_eq!(stale_effort.reasoning_effort, "low");
-
-        let stale_model = resolve_model_selection(
-            &models,
-            Some(&CodexModelSelection {
-                model: "retired".to_string(),
-                reasoning_effort: "high".to_string(),
-            }),
-        )
-        .unwrap();
-        assert_eq!(stale_model.model, "gpt-default");
-        assert_eq!(stale_model.reasoning_effort, "medium");
-    }
-    #[test]
-    fn large_context_fallback_warns_once_only_for_a_clamped_opt_in() {
-        let selection = CodexModelSelection {
-            model: "gpt-test".to_string(),
-            reasoning_effort: "medium".to_string(),
-        };
-        let mut notified = HashSet::new();
-
-        assert_eq!(
-            large_context_fallback_detail(Some(&selection), false, &mut notified, Some(258_400),),
-            None
-        );
-        let detail =
-            large_context_fallback_detail(Some(&selection), true, &mut notified, Some(258_400))
-                .expect("a clamped opted-in model should warn");
-        assert_eq!(
-            detail,
-            "gpt-test의 1M 컨텍스트 요청이 Codex에서 제한되어 258400 토큰 컨텍스트를 사용합니다."
-        );
-        assert_eq!(
-            large_context_fallback_detail(Some(&selection), true, &mut notified, Some(258_400),),
-            None
-        );
-        let codex_effective_limit = CodexModelSelection {
-            model: "gpt-5.6-sol".to_string(),
-            reasoning_effort: "medium".to_string(),
-        };
-        assert_eq!(
-            large_context_fallback_detail(
-                Some(&codex_effective_limit),
-                true,
-                &mut notified,
-                Some(828_400),
-            ),
-            None
-        );
-        let below_effective_limit = CodexModelSelection {
-            model: "gpt-below-large-context".to_string(),
-            reasoning_effort: "medium".to_string(),
-        };
-        assert!(large_context_fallback_detail(
-            Some(&below_effective_limit),
-            true,
-            &mut notified,
-            Some(828_399),
-        )
-        .is_some());
-
-        let supported = CodexModelSelection {
-            model: "gpt-supported".to_string(),
-            reasoning_effort: "medium".to_string(),
-        };
-        assert_eq!(
-            large_context_fallback_detail(Some(&supported), true, &mut notified, Some(950_000),),
-            None
-        );
     }
 
     #[test]
@@ -5187,6 +4335,10 @@ mod tests {
         )
     }
     type ScriptedCompilerResults = Arc<Mutex<VecDeque<Result<Option<String>, AgentEngineError>>>>;
+    type CompilerGate = (
+        tokio::sync::mpsc::UnboundedSender<()>,
+        Arc<tokio::sync::Notify>,
+    );
 
     #[derive(Clone, Default)]
     struct FakeCodexDriver {
@@ -5194,9 +4346,16 @@ mod tests {
         image_paths: Arc<Mutex<Vec<Vec<PathBuf>>>>,
         scripted_turns: Arc<Mutex<VecDeque<AgentTurnResult>>>,
         compiler_prompts: Arc<Mutex<Vec<String>>>,
+        compiler_workspaces: Arc<Mutex<Vec<PathBuf>>>,
         scripted_compilers: ScriptedCompilerResults,
         compiler_contracts: Arc<Mutex<Vec<(bool, bool)>>>,
         compiler_delay: Arc<Mutex<Option<std::time::Duration>>>,
+        compiler_gate: Arc<Mutex<Option<CompilerGate>>>,
+        foreground_error: Arc<Mutex<Option<String>>>,
+        reject_seed: Arc<Mutex<bool>>,
+        write_runtime: Arc<Mutex<Option<SessionToolRuntime>>>,
+        plan_runtime: Option<SessionToolRuntime>,
+        acknowledgement_count: Arc<Mutex<usize>>,
         reset_count: Arc<Mutex<usize>>,
         /// The mock's live thread id; `reset_thread` clears it, `seed_thread_id`
         /// sets it, mirroring the production client's thread_id mutex.
@@ -5212,8 +4371,15 @@ mod tests {
                 image_paths: Arc::new(Mutex::new(Vec::new())),
                 scripted_turns: Arc::new(Mutex::new(turns.into_iter().collect())),
                 compiler_prompts: Arc::new(Mutex::new(Vec::new())),
+                compiler_workspaces: Arc::new(Mutex::new(Vec::new())),
                 scripted_compilers: Arc::new(Mutex::new(VecDeque::new())),
                 compiler_delay: Arc::new(Mutex::new(None)),
+                compiler_gate: Arc::new(Mutex::new(None)),
+                foreground_error: Arc::new(Mutex::new(None)),
+                reject_seed: Arc::new(Mutex::new(false)),
+                write_runtime: Arc::new(Mutex::new(None)),
+                plan_runtime: None,
+                acknowledgement_count: Arc::new(Mutex::new(0)),
 
                 compiler_contracts: Arc::new(Mutex::new(Vec::new())),
                 reset_count: Arc::new(Mutex::new(0)),
@@ -5253,10 +4419,42 @@ mod tests {
             *self.compiler_delay.lock().expect("compiler delay lock") = Some(delay);
         }
 
+        fn gate_compiler(
+            &self,
+        ) -> (
+            tokio::sync::mpsc::UnboundedReceiver<()>,
+            Arc<tokio::sync::Notify>,
+        ) {
+            let (entered_tx, entered_rx) = tokio::sync::mpsc::unbounded_channel();
+            let release = Arc::new(tokio::sync::Notify::new());
+            *self.compiler_gate.lock().expect("compiler gate lock") =
+                Some((entered_tx, Arc::clone(&release)));
+            (entered_rx, release)
+        }
+
+        fn fail_next_foreground(&self, message: impl Into<String>) {
+            *self.foreground_error.lock().expect("foreground error lock") = Some(message.into());
+        }
+
+        fn request_write_on_run(&self, runtime: SessionToolRuntime) {
+            *self.write_runtime.lock().expect("write runtime lock") = Some(runtime);
+        }
+
+        fn reject_next_seed(&self) {
+            *self.reject_seed.lock().expect("reject seed lock") = true;
+        }
+
         fn compiler_prompts(&self) -> Vec<String> {
             self.compiler_prompts
                 .lock()
                 .expect("compiler prompts lock")
+                .clone()
+        }
+
+        fn compiler_workspaces(&self) -> Vec<PathBuf> {
+            self.compiler_workspaces
+                .lock()
+                .expect("compiler workspace lock")
                 .clone()
         }
 
@@ -5270,89 +4468,268 @@ mod tests {
         fn reset_count(&self) -> usize {
             *self.reset_count.lock().expect("reset count lock")
         }
+
+        fn acknowledgement_count(&self) -> usize {
+            *self
+                .acknowledgement_count
+                .lock()
+                .expect("acknowledgement count lock")
+        }
     }
 
-    impl AgentDriver for FakeCodexDriver {
-        async fn run_turn(
+    impl RuntimeExecutor for FakeCodexDriver {
+        fn run_foreground(
             &mut self,
-            input: AgentTurnInput,
-        ) -> Result<AgentTurnResult, AgentEngineError> {
-            self.prompts.lock().expect("prompts lock").push(input.text);
-            self.image_paths
-                .lock()
-                .expect("image paths lock")
-                .push(input.image_paths);
-            {
-                let mut thread = self.thread_id.lock().expect("thread id lock");
-                if thread.is_none() {
-                    *thread = Some("thread-fake".to_string());
+            request: ForegroundRequest,
+        ) -> crate::provider_runtime::AdapterFuture<'_, RunOutcome> {
+            Box::pin(async move {
+                let runtime_session_id = request.identity.session_id.clone();
+                let input = request.turn;
+                self.prompts.lock().expect("prompts lock").push(input.text);
+                self.image_paths
+                    .lock()
+                    .expect("image paths lock")
+                    .push(input.image_paths);
+                if let Some(runtime) = self
+                    .write_runtime
+                    .lock()
+                    .expect("write runtime lock")
+                    .take()
+                {
+                    if let Err(error) = runtime.request_write_workspace("test transition") {
+                        return RunOutcome::Failed(
+                            crate::provider_runtime::ProviderRuntimeError::Protocol(error),
+                        );
+                    }
                 }
-            }
-            Ok(self
-                .scripted_turns
-                .lock()
-                .expect("scripted turns lock")
-                .pop_front()
-                .expect("fake codex driver needs one scripted result per turn"))
+                if let Some(message) = self
+                    .foreground_error
+                    .lock()
+                    .expect("foreground error lock")
+                    .take()
+                {
+                    return RunOutcome::Failed(
+                        crate::provider_runtime::ProviderRuntimeError::Transport(message),
+                    );
+                }
+                {
+                    let mut thread = self.thread_id.lock().expect("thread id lock");
+                    if thread.is_none() {
+                        *thread = Some("thread-fake".to_string());
+                    }
+                }
+                {
+                    let compiler_requested = !self
+                        .scripted_compilers
+                        .lock()
+                        .expect("compiler queue lock")
+                        .is_empty();
+                    let mut workspace = self.workspace.lock().expect("workspace lock");
+                    if workspace.is_none() && compiler_requested {
+                        let root = unique_temp_dir("runtime-workspace");
+                        *workspace = Some(PreparedWorkspace {
+                            id: "runtime-workspace".to_string(),
+                            project: "Sample".to_string(),
+                            root,
+                            session_id: Some(runtime_session_id),
+                        });
+                    }
+                }
+                let result = self
+                    .scripted_turns
+                    .lock()
+                    .expect("scripted turns lock")
+                    .pop_front()
+                    .expect("fake codex driver needs one scripted result per turn");
+                match result {
+                    AgentTurnResult::Answer { text } => RunOutcome::Completed {
+                        text,
+                        conversation: self.conversation_state(),
+                    },
+                    AgentTurnResult::Plan { markdown } => {
+                        self.plan_runtime
+                            .as_ref()
+                            .expect("plan fixture must bind the engine tool runtime")
+                            .execute("propose_plan", &json!({"markdown": markdown}))
+                            .expect("scripted plan must pass the actual tool authority");
+                        RunOutcome::Completed {
+                            text: markdown,
+                            conversation: self.conversation_state(),
+                        }
+                    }
+                    AgentTurnResult::Cancelled => RunOutcome::Cancelled,
+                    AgentTurnResult::WriteTransition => RunOutcome::WriteTransition,
+                }
+            })
         }
 
-        async fn compile_task_state(
+        fn run_structured(
             &mut self,
-            input: AgentTurnInput,
-        ) -> Result<Option<String>, AgentEngineError> {
-            self.compiler_contracts
-                .lock()
-                .expect("compiler contracts lock")
-                .push((input.output_schema.is_some(), input.forbid_tools));
-            self.compiler_prompts
-                .lock()
-                .expect("compiler prompts lock")
-                .push(input.text);
-            let delay = *self.compiler_delay.lock().expect("compiler delay lock");
-            if let Some(delay) = delay {
-                tokio::time::sleep(delay).await;
-            }
-            self.scripted_compilers
-                .lock()
-                .expect("compiler queue lock")
-                .pop_front()
-                .unwrap_or(Ok(None))
+            request: StructuredJobRequest,
+        ) -> crate::provider_runtime::AdapterFuture<'_, RunOutcome> {
+            Box::pin(async move {
+                assert!(
+                    request.workspace_root.is_dir(),
+                    "compiler input cwd must exist"
+                );
+                let foreground_workspace = self.current_workspace();
+                assert_ne!(
+                    foreground_workspace
+                        .as_ref()
+                        .map(|workspace| &workspace.root),
+                    Some(&request.workspace_root),
+                    "compiler must not run in the foreground workspace"
+                );
+                assert!(
+                    fs::read_dir(&request.workspace_root)
+                        .expect("read compiler input cwd")
+                        .next()
+                        .is_none(),
+                    "compiler input cwd must be empty"
+                );
+                self.compiler_workspaces
+                    .lock()
+                    .expect("compiler workspace lock")
+                    .push(request.workspace_root.clone());
+                self.compiler_contracts
+                    .lock()
+                    .expect("compiler contracts lock")
+                    .push((
+                        request.output_schema.is_object(),
+                        request.policy.max_tool_rounds == 0
+                            && !request.binding.conversation.is_started(),
+                    ));
+                self.compiler_prompts
+                    .lock()
+                    .expect("compiler prompts lock")
+                    .push(request.prompt);
+                let compiler_gate = self
+                    .compiler_gate
+                    .lock()
+                    .expect("compiler gate lock")
+                    .clone();
+                if let Some((entered, release)) = compiler_gate {
+                    let _ = entered.send(());
+                    release.notified().await;
+                }
+                let delay = *self.compiler_delay.lock().expect("compiler delay lock");
+                if delay.is_some() {
+                    return RunOutcome::Failed(
+                        crate::provider_runtime::ProviderRuntimeError::TimedOut,
+                    );
+                }
+                match self
+                    .scripted_compilers
+                    .lock()
+                    .expect("compiler queue lock")
+                    .pop_front()
+                    .unwrap_or(Ok(None))
+                {
+                    Ok(Some(output)) => match serde_json::from_str(&output) {
+                        Ok(value) => RunOutcome::Structured {
+                            value,
+                            base: request.base,
+                        },
+                        Err(_) => RunOutcome::Structured {
+                            value: serde_json::Value::String(output),
+                            base: request.base,
+                        },
+                    },
+                    Ok(None) => RunOutcome::Failed(
+                        crate::provider_runtime::ProviderRuntimeError::Transport(
+                            "structured result was not scripted".to_string(),
+                        ),
+                    ),
+                    Err(error) => RunOutcome::Failed(
+                        crate::provider_runtime::ProviderRuntimeError::Transport(error.to_string()),
+                    ),
+                }
+            })
         }
 
-        async fn compact_conversation(&mut self) -> Result<(), AgentEngineError> {
-            self.thread_id
-                .lock()
-                .expect("thread id lock")
-                .as_ref()
-                .map(|_| ())
-                .ok_or_else(|| AgentEngineError::new("no fake conversation"))
+        fn compact(
+            &mut self,
+            _request: CompactionRequest,
+        ) -> crate::provider_runtime::AdapterFuture<
+            '_,
+            Result<
+                crate::provider::ProviderConversationState,
+                crate::provider_runtime::ProviderRuntimeError,
+            >,
+        > {
+            Box::pin(async move {
+                let thread_id = self.thread_id.lock().expect("thread id lock").clone();
+                thread_id
+                    .map(
+                        |thread_id| crate::provider::ProviderConversationState::Codex {
+                            thread_id: Some(thread_id),
+                        },
+                    )
+                    .ok_or_else(|| {
+                        crate::provider_runtime::ProviderRuntimeError::Protocol(
+                            "no fake conversation".to_string(),
+                        )
+                    })
+            })
         }
 
-        async fn reset_conversation(&mut self) -> Result<(), AgentEngineError> {
-            *self.reset_count.lock().expect("reset count lock") += 1;
-            *self.thread_id.lock().expect("thread id lock") = None;
-            Ok(())
+        fn reset(
+            &mut self,
+        ) -> crate::provider_runtime::AdapterFuture<
+            '_,
+            Result<(), crate::provider_runtime::ProviderRuntimeError>,
+        > {
+            Box::pin(async move {
+                *self.reset_count.lock().expect("reset count lock") += 1;
+                *self.thread_id.lock().expect("thread id lock") = None;
+                Ok(())
+            })
         }
 
-        async fn conversation_state(&self) -> crate::provider::ProviderConversationState {
+        fn conversation_state(&self) -> crate::provider::ProviderConversationState {
             crate::provider::ProviderConversationState::Codex {
                 thread_id: self.thread_id.lock().expect("thread id lock").clone(),
             }
         }
 
-        async fn seed_conversation(
+        fn acknowledge_persisted(
+            &mut self,
+        ) -> crate::provider_runtime::AdapterFuture<
+            '_,
+            Result<(), crate::provider_runtime::ProviderRuntimeError>,
+        > {
+            Box::pin(async move {
+                *self
+                    .acknowledgement_count
+                    .lock()
+                    .expect("acknowledgement count lock") += 1;
+                Ok(())
+            })
+        }
+
+        fn seed(
             &mut self,
             state: crate::provider::ProviderConversationState,
-        ) -> Result<(), AgentEngineError> {
-            let crate::provider::ProviderConversationState::Codex {
-                thread_id: Some(id),
-            } = state
-            else {
-                return Err(AgentEngineError::new("invalid fake conversation state"));
-            };
-            self.seeded.lock().expect("seeded lock").push(id.clone());
-            *self.thread_id.lock().expect("thread id lock") = Some(id);
-            Ok(())
+        ) -> crate::provider_runtime::AdapterFuture<
+            '_,
+            Result<(), crate::provider_runtime::ProviderRuntimeError>,
+        > {
+            Box::pin(async move {
+                if std::mem::take(&mut *self.reject_seed.lock().expect("reject seed lock")) {
+                    return Err(crate::provider_runtime::ProviderRuntimeError::ContinuationInvalid);
+                }
+                let crate::provider::ProviderConversationState::Codex {
+                    thread_id: Some(id),
+                } = state
+                else {
+                    return Err(crate::provider_runtime::ProviderRuntimeError::Protocol(
+                        "invalid fake conversation state".to_string(),
+                    ));
+                };
+                self.seeded.lock().expect("seeded lock").push(id.clone());
+                *self.thread_id.lock().expect("thread id lock") = Some(id);
+                Ok(())
+            })
         }
 
         fn current_workspace(&self) -> Option<PreparedWorkspace> {
@@ -5386,69 +4763,110 @@ mod tests {
         }
     }
 
-    impl AgentDriver for GateCodexDriver {
-        async fn run_turn(
+    impl RuntimeExecutor for GateCodexDriver {
+        fn run_foreground(
             &mut self,
-            _input: AgentTurnInput,
-        ) -> Result<AgentTurnResult, AgentEngineError> {
-            self.entered
-                .send(self.label)
-                .map_err(|_| AgentEngineError::new("test entry receiver closed"))?;
-            if self
-                .wait_once
-                .swap(false, std::sync::atomic::Ordering::SeqCst)
-            {
-                self.release.notified().await;
-            }
-            *self.thread_id.lock().unwrap() = Some(format!("thread-{}", self.label));
-            Ok(AgentTurnResult::Answer {
-                text: format!("{} done", self.label),
+            _request: ForegroundRequest,
+        ) -> crate::provider_runtime::AdapterFuture<'_, RunOutcome> {
+            Box::pin(async move {
+                if self.entered.send(self.label).is_err() {
+                    return RunOutcome::Failed(
+                        crate::provider_runtime::ProviderRuntimeError::Transport(
+                            "test entry receiver closed".to_string(),
+                        ),
+                    );
+                }
+                if self
+                    .wait_once
+                    .swap(false, std::sync::atomic::Ordering::SeqCst)
+                {
+                    self.release.notified().await;
+                }
+                *self.thread_id.lock().unwrap() = Some(format!("thread-{}", self.label));
+                RunOutcome::Completed {
+                    text: format!("{} done", self.label),
+                    conversation: self.conversation_state(),
+                }
             })
         }
 
-        async fn compact_conversation(&mut self) -> Result<(), AgentEngineError> {
-            self.thread_id
-                .lock()
-                .unwrap()
-                .as_ref()
-                .map(|_| ())
-                .ok_or_else(|| AgentEngineError::new("no gate conversation"))
+        fn run_structured(
+            &mut self,
+            _request: StructuredJobRequest,
+        ) -> crate::provider_runtime::AdapterFuture<'_, RunOutcome> {
+            Box::pin(async {
+                RunOutcome::Failed(crate::provider_runtime::ProviderRuntimeError::Protocol(
+                    "gate runtime has no structured fixture".to_string(),
+                ))
+            })
         }
 
-        async fn reset_conversation(&mut self) -> Result<(), AgentEngineError> {
-            *self.thread_id.lock().unwrap() = None;
-            Ok(())
+        fn compact(
+            &mut self,
+            _request: CompactionRequest,
+        ) -> crate::provider_runtime::AdapterFuture<
+            '_,
+            Result<
+                crate::provider::ProviderConversationState,
+                crate::provider_runtime::ProviderRuntimeError,
+            >,
+        > {
+            Box::pin(async move {
+                self.thread_id
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .map(|_| self.conversation_state())
+                    .ok_or_else(|| {
+                        crate::provider_runtime::ProviderRuntimeError::Protocol(
+                            "no gate conversation".to_string(),
+                        )
+                    })
+            })
         }
 
-        async fn conversation_state(&self) -> crate::provider::ProviderConversationState {
+        fn reset(
+            &mut self,
+        ) -> crate::provider_runtime::AdapterFuture<
+            '_,
+            Result<(), crate::provider_runtime::ProviderRuntimeError>,
+        > {
+            Box::pin(async move {
+                *self.thread_id.lock().unwrap() = None;
+                Ok(())
+            })
+        }
+
+        fn conversation_state(&self) -> crate::provider::ProviderConversationState {
             crate::provider::ProviderConversationState::Codex {
                 thread_id: self.thread_id.lock().unwrap().clone(),
             }
         }
 
-        async fn seed_conversation(
+        fn seed(
             &mut self,
             state: crate::provider::ProviderConversationState,
-        ) -> Result<(), AgentEngineError> {
-            let crate::provider::ProviderConversationState::Codex {
-                thread_id: Some(id),
-            } = state
-            else {
-                return Err(AgentEngineError::new("invalid gate conversation state"));
-            };
-            *self.thread_id.lock().unwrap() = Some(id);
-            Ok(())
+        ) -> crate::provider_runtime::AdapterFuture<
+            '_,
+            Result<(), crate::provider_runtime::ProviderRuntimeError>,
+        > {
+            Box::pin(async move {
+                let crate::provider::ProviderConversationState::Codex {
+                    thread_id: Some(id),
+                } = state
+                else {
+                    return Err(crate::provider_runtime::ProviderRuntimeError::Protocol(
+                        "invalid gate conversation state".to_string(),
+                    ));
+                };
+                *self.thread_id.lock().unwrap() = Some(id);
+                Ok(())
+            })
         }
-    }
 
-    #[test]
-    fn message_break_separates_messages_only_after_a_boundary() {
-        // No boundary seen → glue (same message item's deltas).
-        assert_eq!(super::message_break("이전 텍스트", false), "");
-        // Boundary seen mid-answer → paragraph break between message items.
-        assert_eq!(super::message_break("이전 텍스트", true), "\n\n");
-        // Boundary before the FIRST message (empty accumulator) → no break.
-        assert_eq!(super::message_break("", true), "");
+        fn current_workspace(&self) -> Option<PreparedWorkspace> {
+            None
+        }
     }
 
     #[derive(Clone, Default)]
@@ -5530,6 +4948,40 @@ mod tests {
         (base, memory)
     }
 
+    fn native_workspace_snapshot(
+        dirs: &crate::config::DataDirs,
+        name: &str,
+    ) -> crate::source_snapshot::ProjectSnapshot {
+        let root = dirs.app_data().join("test-project");
+        fs::create_dir_all(root.join("maps")).unwrap();
+        fs::write(root.join("maps/source.scx"), b"map").unwrap();
+        let project = crate::native_project::NativeProject::create(
+            &root,
+            crate::native_project::ProjectManifest {
+                schema_version: crate::native_project::PROJECT_SCHEMA_VERSION,
+                name: name.to_string(),
+                source_map: "maps/source.scx".to_string(),
+                output_map: "build/output.scx".to_string(),
+                main_file: "src/main.eps".to_string(),
+                settings: Default::default(),
+                plugins: Vec::new(),
+                python_entrypoints: Vec::new(),
+                python_dependencies: Vec::new(),
+                python_lock: None,
+                editor_compatibility: None,
+            },
+        )
+        .unwrap();
+        crate::native_runtime::NativeProjectManager::new(dirs.clone())
+            .activate_project(&project)
+            .unwrap();
+        crate::source_snapshot::ProjectSnapshot {
+            project: name.to_string(),
+            identity: project.root().to_string_lossy().into_owned(),
+            files: Vec::new(),
+        }
+    }
+
     fn config_with_memory(memory: ProjectMemory) -> AgentEngineConfig {
         AgentEngineConfig::for_tests(
             "[project state]\nproject=Sample compiling=false",
@@ -5582,22 +5034,24 @@ mod tests {
         record
     }
 
-    fn test_engine_with_memory<D: AgentDriver, S: EventSink>(
-        driver: D,
+    fn test_engine_with_memory<R: RuntimeExecutor, S: EventSink>(
+        executor: R,
         sink: S,
         memory: ProjectMemory,
         data_dir: &std::path::Path,
-    ) -> AgentEngine<D, S> {
+    ) -> AgentEngine<R, S> {
         let sessions = session_store_at(data_dir);
         let session = test_session(&sessions);
+        let (_cancellation_tx, cancellation_rx) = tokio::sync::watch::channel(0_u64);
         let mut engine = AgentEngine::new(
-            driver,
+            executor,
             sink,
             config_with_memory(memory),
             SessionToolRuntime::for_tests(),
             sessions,
             attachment_store_at(data_dir),
             session,
+            cancellation_rx,
         );
         engine.journal_store = journal::JournalStore::new(data_dir);
         engine.journal_data_dir = data_dir.to_path_buf();
@@ -5685,38 +5139,41 @@ mod tests {
 
     /// Build an engine wired with BOTH a memory provider and a file-backed wiki
     /// provider rooted at `wiki_dir`, sharing the on-disk journal at `data_dir`.
-    fn test_engine_with_wiki<D: AgentDriver, S: EventSink>(
-        driver: D,
+    fn test_engine_with_wiki<R: RuntimeExecutor, S: EventSink>(
+        executor: R,
         sink: S,
         memory: ProjectMemory,
         data_dir: &std::path::Path,
         wiki_dir: &std::path::Path,
-    ) -> AgentEngine<D, S> {
+    ) -> AgentEngine<R, S> {
         let config = config_with_memory(memory).with_wiki_provider(Arc::new(StoreWikiProvider {
             wiki_dir: wiki_dir.to_path_buf(),
         }));
         let sessions = session_store_at(data_dir);
         let session = test_session(&sessions);
+        let (_cancellation_tx, cancellation_rx) = tokio::sync::watch::channel(0_u64);
         let mut engine = AgentEngine::new(
-            driver,
+            executor,
             sink,
             config,
             SessionToolRuntime::for_tests(),
             sessions,
             attachment_store_at(data_dir),
             session,
+            cancellation_rx,
         );
         engine.journal_store = journal::JournalStore::new(data_dir);
         engine.journal_data_dir = data_dir.to_path_buf();
         engine
     }
 
-    fn test_engine<D: AgentDriver, S: EventSink>(driver: D, sink: S) -> AgentEngine<D, S> {
+    fn test_engine<R: RuntimeExecutor, S: EventSink>(executor: R, sink: S) -> AgentEngine<R, S> {
         let data_dir = unique_temp_dir("engine-sessions");
         let sessions = session_store_at(&data_dir);
         let session = test_session(&sessions);
+        let (_cancellation_tx, cancellation_rx) = tokio::sync::watch::channel(0_u64);
         AgentEngine::new(
-            driver,
+            executor,
             sink,
             AgentEngineConfig::for_tests(
                 "[project state]\nproject=Sample compiling=false",
@@ -5727,7 +5184,428 @@ mod tests {
             sessions,
             attachment_store_at(&unique_temp_dir("engine-attachments")),
             session,
+            cancellation_rx,
         )
+    }
+
+    #[tokio::test]
+    async fn resumed_foreground_failure_does_not_reset_or_replay_completed_work() {
+        let driver = FakeCodexDriver::scripted([]);
+        driver.fail_next_foreground("resume failed after durable tool completion");
+        *driver.thread_id.lock().expect("thread id lock") = Some("thread-saved".to_string());
+        let driver_handle = driver.clone();
+        let mut engine = test_engine(driver, CapturingEventSink::default());
+        engine.thread_active = true;
+        engine.pending_resume_transcript = Some("prior transcript".to_string());
+        record_file_write_in_memory(
+            &engine.journal_store,
+            "req-resume-failure",
+            "completed-call",
+            1,
+            "triggers/main.eps",
+        );
+
+        let error = engine
+            .chat_with_request_id(
+                crate::ipc::ChatRequest {
+                    client_turn_id: crate::ipc::new_client_turn_id(),
+                    text: "continue".to_string(),
+                    attachments: Vec::new(),
+                    mentions: Vec::new(),
+                },
+                Some("req-resume-failure".to_string()),
+            )
+            .await
+            .expect_err("resume transport failure must remain a failure");
+
+        assert!(error.message.contains("resume failed"));
+        assert_eq!(driver_handle.prompts().len(), 1);
+        assert_eq!(driver_handle.reset_count(), 0);
+        assert_eq!(
+            engine
+                .journal_store
+                .changeset("req-resume-failure")
+                .expect("completed tool journal remains reviewable")
+                .items
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn production_runtime_sink_emits_completed_and_failed_tool_statuses() {
+        let data_dir = unique_temp_dir("runtime-tool-status");
+        let sessions = session_store_at(&data_dir);
+        let record = test_session(&sessions);
+        let events = CapturingEventSink::default();
+        let sink =
+            runtime_events::SessionRuntimeEventSink::new(events.clone(), sessions, record.meta.id);
+        for is_error in [false, true] {
+            crate::provider_runtime::RuntimeEventSink::emit(
+                &sink,
+                &AdapterEventKind::Block(NormalizedBlock::ToolResult {
+                    response_id: "tool-response".to_string(),
+                    batch_id: "tool-batch".to_string(),
+                    result: crate::provider_tool_loop::DirectToolResult {
+                        id: format!("tool-{is_error}"),
+                        name: "read_file".to_string(),
+                        result: json!({"ok": !is_error}),
+                        is_error,
+                    },
+                }),
+            )
+            .expect("publish actual runtime tool result");
+        }
+        let statuses = events
+            .events()
+            .into_iter()
+            .map(|event| match event {
+                EngineEvent::Agent(ipc::AgentEvent {
+                    kind,
+                    data: Some(data),
+                    ..
+                }) => {
+                    assert_eq!(kind, "tool_result");
+                    data.status.expect("tool result status")
+                }
+                other => panic!("unexpected tool sink event: {other:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(statuses, ["completed", "failed"]);
+        fs::remove_dir_all(data_dir).expect("clean tool sink fixture");
+    }
+
+    #[test]
+    fn production_runtime_sink_serializes_tool_call_identity() {
+        // Given: the production session sink receives an authoritative tool pair.
+        let data_dir = unique_temp_dir("runtime-tool-identity");
+        let sessions = session_store_at(&data_dir);
+        let record = test_session(&sessions);
+        let events = CapturingEventSink::default();
+        let sink =
+            runtime_events::SessionRuntimeEventSink::new(events.clone(), sessions, record.meta.id);
+        for event in [
+            AdapterEventKind::Block(NormalizedBlock::ToolCall {
+                response_id: "tool-response".to_string(),
+                batch_id: "tool-batch".to_string(),
+                call: crate::provider_tool_loop::DirectToolCall {
+                    id: "call-a".to_string(),
+                    name: "read_file".to_string(),
+                    arguments: json!({"path":"a.eps"}),
+                },
+                continuation: None,
+            }),
+            AdapterEventKind::Block(NormalizedBlock::ToolResult {
+                response_id: "tool-response".to_string(),
+                batch_id: "tool-batch".to_string(),
+                result: crate::provider_tool_loop::DirectToolResult {
+                    id: "call-a".to_string(),
+                    name: "read_file".to_string(),
+                    result: json!({"contents":"alpha"}),
+                    is_error: false,
+                },
+            }),
+        ] {
+            crate::provider_runtime::RuntimeEventSink::emit(&sink, &event)
+                .expect("publish actual runtime tool event");
+        }
+
+        // When: the actual emitted AgentEvent payloads cross the serde boundary.
+        let serialized = events
+            .events()
+            .into_iter()
+            .map(|event| match event {
+                EngineEvent::Agent(agent) => {
+                    serde_json::to_value(agent).expect("serialize production runtime AgentEvent")
+                }
+                other => panic!("unexpected tool sink event: {other:?}"),
+            })
+            .collect::<Vec<_>>();
+
+        // Then: both sides carry the same call identity in IPC camelCase form.
+        assert_eq!(serialized[0]["data"]["callId"], "call-a");
+        assert_eq!(serialized[1]["data"]["callId"], "call-a");
+        fs::remove_dir_all(data_dir).expect("clean tool identity sink fixture");
+    }
+
+    #[test]
+    fn production_runtime_sink_persists_exact_context_usage_and_emits_typed_event() {
+        let data_dir = unique_temp_dir("runtime-context-usage");
+        let sessions = session_store_at(&data_dir);
+        let mut record = test_session(&sessions);
+        record.panel_log = json!({"schemaVersion":2,"logSeq":1,"log":[{"text":"preserved"}]});
+        record.pending_request_ids = vec!["review-preserved".to_string()];
+        sessions
+            .save(&record)
+            .expect("save unrelated session state");
+        let events = CapturingEventSink::default();
+        let sink = runtime_events::SessionRuntimeEventSink::new(
+            events.clone(),
+            sessions.clone(),
+            record.meta.id.clone(),
+        );
+        crate::provider_runtime::RuntimeEventSink::emit(
+            &sink,
+            &AdapterEventKind::ResponseStarted {
+                response_id: "usage-response".to_string(),
+            },
+        )
+        .expect("start actual runtime response");
+        let expected = ipc::ContextUsage {
+            last: ipc::TokenUsageBreakdown {
+                input_tokens: 100,
+                cached_input_tokens: 20,
+                cache_write_input_tokens: 5,
+                output_tokens: 30,
+                reasoning_output_tokens: 7,
+                total_tokens: 130,
+            },
+            total: ipc::TokenUsageBreakdown {
+                input_tokens: 700,
+                cached_input_tokens: 140,
+                cache_write_input_tokens: 35,
+                output_tokens: 210,
+                reasoning_output_tokens: 49,
+                total_tokens: 910,
+            },
+            model_context_window: Some(2048),
+        };
+        let event = AdapterEventKind::Usage(crate::provider_runtime::NormalizedUsage {
+            input_tokens: Some(100),
+            cached_input_tokens: Some(20),
+            output_tokens: Some(30),
+            total_tokens: Some(130),
+            provider_details: None,
+            context_usage: Some(expected.clone()),
+        });
+        crate::provider_runtime::RuntimeEventSink::emit(&sink, &event)
+            .expect("publish typed usage");
+        let restored = sessions
+            .load(&record.meta.id)
+            .expect("reload persisted usage");
+        assert_eq!(restored.context_usage, Some(expected.clone()));
+        assert_eq!(restored.panel_log, record.panel_log);
+        assert_eq!(restored.pending_request_ids, record.pending_request_ids);
+        assert!(
+            matches!(events.events().last(), Some(EngineEvent::ContextUsage(usage))
+            if usage.turn_id == "usage-response" && usage.token_usage == expected)
+        );
+        assert!(!events.events().iter().any(|event| matches!(event,
+            EngineEvent::Agent(agent) if agent.kind == "usage")));
+        sessions
+            .delete(&record.meta.id)
+            .expect("simulate stats persistence failure");
+        crate::provider_runtime::RuntimeEventSink::emit(&sink, &event)
+            .expect("stats persistence failure must not fail foreground response");
+        assert!(
+            matches!(events.events().last(), Some(EngineEvent::ContextUsage(usage))
+            if usage.token_usage == expected)
+        );
+        fs::remove_dir_all(data_dir).expect("clean usage sink fixture");
+    }
+
+    #[test]
+    fn production_runtime_sink_maps_builtin_start_and_terminal_statuses() {
+        let data_dir = unique_temp_dir("runtime-builtin-observation");
+        let sessions = session_store_at(&data_dir);
+        let record = test_session(&sessions);
+        let events = CapturingEventSink::default();
+        let sink =
+            runtime_events::SessionRuntimeEventSink::new(events.clone(), sessions, record.meta.id);
+        let observation =
+            |arguments, result, status: &str| AdapterEventKind::NativeToolObservation {
+                call_id: Some("builtin-call".to_string()),
+                mcp_server: None,
+                name: "web_search".to_string(),
+                arguments,
+                result,
+                status: Some(status.to_string()),
+            };
+        for event in [
+            observation(Some(json!({"query":"first"})), None, "started"),
+            observation(None, Some(json!("found")), "completed"),
+            observation(Some(json!({"query":"empty-result"})), None, "started"),
+            observation(None, None, "completed"),
+            observation(Some(json!({"query":"failed"})), None, "started"),
+            observation(None, Some(json!("denied")), "failed"),
+            observation(Some(json!({"query":"declined"})), None, "started"),
+            observation(None, None, "declined"),
+        ] {
+            crate::provider_runtime::RuntimeEventSink::emit(&sink, &event)
+                .expect("publish visible builtin observation");
+        }
+        assert!(matches!(
+            crate::provider_runtime::RuntimeEventSink::emit(
+                &sink,
+                &observation(
+                    Some(json!({"query":"malformed"})),
+                    None,
+                    "argument_complete"
+                )
+            ),
+            Err(crate::provider_runtime::ProviderRuntimeError::Protocol(_))
+        ));
+        let rows = events
+            .events()
+            .into_iter()
+            .map(|event| match event {
+                EngineEvent::Agent(ipc::AgentEvent {
+                    kind,
+                    detail,
+                    data: Some(data),
+                }) => {
+                    assert_eq!(detail, "web_search");
+                    (kind, data)
+                }
+                other => panic!("unexpected builtin event: {other:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rows.iter().map(|row| row.0.as_str()).collect::<Vec<_>>(),
+            [
+                "tool_call",
+                "tool_result",
+                "tool_call",
+                "tool_result",
+                "tool_call",
+                "tool_result",
+                "tool_call",
+                "tool_result"
+            ]
+        );
+        assert_eq!(rows[1].1.status.as_deref(), Some("completed"));
+        assert_eq!(rows[3].1.status.as_deref(), Some("completed"));
+        assert_eq!(rows[3].1.result, None);
+        assert_eq!(rows[5].1.status.as_deref(), Some("failed"));
+        assert_eq!(rows[7].1.status.as_deref(), Some("declined"));
+        assert_eq!(rows[2].1.status, None);
+        assert_eq!(
+            rows[2].1.args.as_deref(),
+            Some("{\"query\":\"empty-result\"}")
+        );
+        fs::remove_dir_all(data_dir).expect("clean builtin sink fixture");
+    }
+
+    #[tokio::test]
+    async fn write_transition_sets_pending_write_without_emitting_answer() {
+        let driver = FakeCodexDriver::scripted([AgentTurnResult::WriteTransition]);
+        let driver_handle = driver.clone();
+        let sink = CapturingEventSink::default();
+        let sink_handle = sink.clone();
+        let mut engine = test_engine(driver, sink);
+        driver_handle.request_write_on_run(engine.runtime.clone());
+
+        engine
+            .chat(crate::ipc::ChatRequest {
+                client_turn_id: crate::ipc::new_client_turn_id(),
+                text: "change the project".to_string(),
+                attachments: Vec::new(),
+                mentions: Vec::new(),
+            })
+            .await
+            .expect("write transition should park the foreground turn");
+
+        assert_eq!(engine.pending_write, Some(WriteContinuation::Direct));
+        assert!(engine.runtime.write_ticket().is_some());
+        assert!(driver_handle.compiler_prompts().is_empty());
+        assert!(!sink_handle
+            .events()
+            .iter()
+            .any(|event| matches!(event, EngineEvent::Answer(_))));
+    }
+
+    #[tokio::test]
+    async fn provider_receipt_acknowledgement_requires_session_persistence() {
+        let persisted_driver = FakeCodexDriver::scripted([AgentTurnResult::Answer {
+            text: "saved".to_string(),
+        }]);
+        let persisted_handle = persisted_driver.clone();
+        let mut persisted_engine = test_engine(persisted_driver, CapturingEventSink::default());
+        persisted_engine
+            .chat(crate::ipc::ChatRequest {
+                client_turn_id: crate::ipc::new_client_turn_id(),
+                text: "save this turn".to_string(),
+                attachments: Vec::new(),
+                mentions: Vec::new(),
+            })
+            .await
+            .expect("foreground turn should persist");
+        assert_eq!(persisted_handle.acknowledgement_count(), 1);
+
+        let failed_driver = FakeCodexDriver::scripted([]);
+        let failed_handle = failed_driver.clone();
+        let mut failed_engine = test_engine(failed_driver, CapturingEventSink::default());
+        failed_engine
+            .session_store
+            .delete(&failed_engine.session_id)
+            .expect("session fixture should delete");
+        failed_engine.update_active_session().await;
+        assert_eq!(failed_handle.acknowledgement_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn invalid_persisted_continuation_preserves_review_without_replay() {
+        let driver = FakeCodexDriver::scripted([]);
+        driver.reject_next_seed();
+        let driver_handle = driver.clone();
+        let mut engine = test_engine(driver, CapturingEventSink::default());
+        let request_id = "req-invalid-continuation";
+        let mut record = engine
+            .session_store
+            .load(&engine.session_id)
+            .expect("session fixture should load");
+        record.provider_binding.conversation = crate::provider::ProviderConversationState::Codex {
+            thread_id: Some("thread-unsafe".to_string()),
+        };
+        record.pending_request_ids = vec![request_id.to_string()];
+        record.panel_log = serde_json::json!({
+            "schemaVersion": 2,
+            "logSeq": 1,
+            "log": [{"seq": 1, "kind": "user", "text": "previous request"}]
+        });
+        engine
+            .session_store
+            .save(&record)
+            .expect("session fixture should save");
+        record_file_write(
+            &engine.journal_store,
+            request_id,
+            "completed-call",
+            1,
+            "triggers/main.eps",
+        );
+        engine.journal_store = journal::JournalStore::new(&engine.journal_data_dir);
+
+        let error = engine
+            .hydrate()
+            .await
+            .expect_err("invalid continuation must block automatic replay");
+
+        assert!(error.message.contains("could not be resumed"));
+        assert_eq!(driver_handle.reset_count(), 0);
+        assert!(driver_handle.prompts().is_empty());
+        assert!(engine.pending_resume_transcript.is_none());
+        assert!(engine.ensure_provider_conversation_ready().is_err());
+        assert_eq!(engine.current_request_id.as_deref(), Some(request_id));
+        assert_eq!(engine.phase, Phase::ChangesetReview);
+        assert_eq!(
+            engine
+                .journal_store
+                .changeset(request_id)
+                .expect("completed tool remains reviewable")
+                .items
+                .len(),
+            1
+        );
+        assert_eq!(
+            engine
+                .session_store
+                .load(&engine.session_id)
+                .expect("saved session remains present")
+                .provider_binding
+                .conversation,
+            record.provider_binding.conversation
+        );
     }
 
     #[tokio::test]
@@ -5799,6 +5677,7 @@ mod tests {
         let sink = CapturingEventSink::default();
         let sink_handle = sink.clone();
         let mut engine = test_engine(driver, sink);
+        engine.executor.plan_runtime = Some(engine.runtime.clone());
 
         engine
             .chat(crate::ipc::ChatRequest {
@@ -5847,14 +5726,11 @@ mod tests {
         let driver_handle = driver.clone();
         let sink = CapturingEventSink::default();
         let mut engine = test_engine(driver, sink);
+        engine.executor.plan_runtime = Some(engine.runtime.clone());
         let dirs = engine.runtime.data_dirs();
         dirs.ensure_dirs().unwrap();
         let workspace = WorkspaceManager::new(dirs.clone())
-            .prepare_snapshot(&crate::source_snapshot::ProjectSnapshot {
-                project: "ExampleProject".to_string(),
-                identity: "C:/maps/example.scx".to_string(),
-                files: Vec::new(),
-            })
+            .prepare_snapshot(&native_workspace_snapshot(&dirs, "ExampleProject"))
             .unwrap();
         driver_handle.set_workspace(workspace.clone());
 
@@ -5883,12 +5759,6 @@ mod tests {
         );
         let prompts = driver_handle.prompts();
         assert_eq!(prompts.len(), 2);
-        assert!(prompts[1].contains("separate post-acceptance harness job"));
-        assert_eq!(
-            FOREGROUND_POST_BUILD_DEADLINE,
-            std::time::Duration::from_secs(30)
-        );
-        assert!(!prompts[1].contains(&format!("`worklog/{request_id}.md`")));
 
         fs::remove_dir_all(dirs.app_data()).ok();
     }
@@ -5904,11 +5774,7 @@ mod tests {
         let dirs = engine.runtime.data_dirs();
         dirs.ensure_dirs().unwrap();
         let workspace = WorkspaceManager::new(dirs.clone())
-            .prepare_snapshot(&crate::source_snapshot::ProjectSnapshot {
-                project: "ExampleProject".to_string(),
-                identity: "C:/maps/example.scx".to_string(),
-                files: Vec::new(),
-            })
+            .prepare_snapshot(&native_workspace_snapshot(&dirs, "ExampleProject"))
             .unwrap();
         driver_handle.set_workspace(workspace);
         engine
@@ -5946,6 +5812,73 @@ mod tests {
         assert_eq!(job.accepted_entries.len(), 1);
 
         fs::remove_dir_all(dirs.app_data()).ok();
+    }
+
+    #[test]
+    fn persisted_harness_retry_preserves_original_provider_binding() {
+        let runtime = SessionToolRuntime::for_tests();
+        let dirs = runtime.data_dirs();
+        dirs.ensure_dirs().expect("test data dirs should exist");
+        let store = crate::harness::HarnessJobStore::new(dirs.clone());
+        let workspace_root = unique_temp_dir("harness-binding-retry");
+        let main_path = workspace_root.join("main.eps");
+        fs::write(&main_path, b"function onPluginStart() {}").expect("main fixture should write");
+        let original_main = fs::read(&main_path).expect("main fixture should read");
+        let mut job = crate::harness::HarnessJob::new_with_provider(
+            "session-binding".to_string(),
+            crate::harness::HarnessProviderBinding {
+                provider: crate::provider::ProviderId::Ollama,
+                model: "original-model".to_string(),
+                reasoning: Some(crate::provider::ReasoningSelection {
+                    level: "medium".to_string(),
+                }),
+                base_url: Some("http://127.0.0.1:11434".to_string()),
+            },
+            "Sample".to_string(),
+            "workspace-binding".to_string(),
+            "source-request".to_string(),
+            "generate docs".to_string(),
+            None,
+            "implemented".to_string(),
+            Vec::new(),
+            None,
+        );
+        job.fail("first attempt failed".to_string());
+        store.create(&job).expect("failed job should persist");
+        let mut reloaded = store.load(&job.id).expect("failed job should reload");
+        reloaded.retry().expect("failed job should become pending");
+        store.save(&reloaded).expect("retry state should persist");
+        let retried = store.load(&job.id).expect("retry job should reload");
+
+        let (binding, request) = harness_execution_contract(
+            &retried,
+            "harness prompt".to_string(),
+            workspace_root.clone(),
+            7,
+        )
+        .expect("persisted harness binding should form an execution request");
+
+        assert_eq!(binding.provider, crate::provider::ProviderId::Ollama);
+        assert_eq!(binding.model, "original-model");
+        assert_eq!(
+            binding.reasoning.as_ref().map(|value| value.level.as_str()),
+            Some("medium")
+        );
+        assert_eq!(binding.base_url.as_deref(), Some("http://127.0.0.1:11434"));
+        assert_eq!(request.binding.provider, binding.provider);
+        assert_eq!(request.binding.model, binding.model);
+        assert_eq!(request.binding.reasoning, binding.reasoning);
+        assert_eq!(request.binding.base_url, binding.base_url);
+        assert!(matches!(request.kind, StructuredJobKind::HarnessGenerator));
+        assert_eq!(request.workspace_root, workspace_root);
+        assert_eq!(request.policy.max_tool_rounds, 0);
+        assert_eq!(request.identity.cancellation_generation, 7);
+        assert_eq!(
+            fs::read(&main_path).expect("main fixture should remain readable"),
+            original_main
+        );
+
+        fs::remove_dir_all(workspace_root).ok();
     }
 
     #[tokio::test]
@@ -6062,6 +5995,102 @@ mod tests {
         let compiler_prompts = driver_handle.compiler_prompts();
         assert_eq!(compiler_prompts.len(), 1);
         assert!(!compiler_prompts[0].contains("[tools]"));
+        let compiler_workspaces = driver_handle.compiler_workspaces();
+        assert_eq!(compiler_workspaces.len(), 1);
+        assert!(
+            !compiler_workspaces[0].exists(),
+            "compiler cwd must be removed after completion"
+        );
+    }
+
+    #[tokio::test]
+    async fn delayed_compiler_rejects_result_after_revision_and_branch_change() {
+        let foreground_turn_id = "12121212-1212-4212-8212-121212121212";
+        let concurrent_turn_id = "13131313-1313-4313-8313-131313131313";
+        let driver = FakeCodexDriver::scripted([AgentTurnResult::Answer {
+            text: "Foreground answer.".to_string(),
+        }]);
+        driver.script_compilers([Ok(Some(
+            json!({
+                "baseRevision": 0,
+                "operations": [{
+                    "op": "upsert",
+                    "entity": {
+                        "entityType": "goal",
+                        "fact": {
+                            "id": "compiler-goal",
+                            "status": "active",
+                            "text": "stale compiler result",
+                            "provenance": [{
+                                "kind": "user_turn",
+                                "clientTurnId": foreground_turn_id,
+                                "exactQuote": "foreground goal"
+                            }]
+                        }
+                    }
+                }]
+            })
+            .to_string(),
+        ))]);
+        let (mut compiler_entered, release_compiler) = driver.gate_compiler();
+        let mut engine = test_engine(driver, CapturingEventSink::default());
+        let sessions = engine.session_store.clone();
+        let session_id = engine.session_id.clone();
+
+        let concurrent_update = async move {
+            compiler_entered
+                .recv()
+                .await
+                .expect("compiler should reach the execution gate");
+            sessions
+                .append_task_event(
+                    &session_id,
+                    None,
+                    task_goal_event(
+                        concurrent_turn_id,
+                        "req-concurrent",
+                        0,
+                        "concurrent-goal",
+                        "newer branch goal",
+                    ),
+                )
+                .expect("concurrent task update should commit");
+            release_compiler.notify_one();
+        };
+        let chat = engine.chat(crate::ipc::ChatRequest {
+            client_turn_id: foreground_turn_id.to_string(),
+            text: "foreground goal".to_string(),
+            attachments: Vec::new(),
+            mentions: Vec::new(),
+        });
+
+        let (chat_result, ()) = tokio::join!(chat, concurrent_update);
+        chat_result.expect("foreground answer should remain successful");
+
+        let record = engine
+            .session_store
+            .load(&engine.session_id)
+            .expect("session should remain readable");
+        assert!(record
+            .task_state
+            .projection
+            .goals
+            .iter()
+            .any(|goal| goal.id == "concurrent-goal"));
+        assert!(!record
+            .task_state
+            .projection
+            .goals
+            .iter()
+            .any(|goal| goal.id == "compiler-goal"));
+        assert!(record.task_state.events.iter().any(|event| matches!(
+            &event.kind,
+            crate::task_state::TaskStateEventKind::StateCompilationFailed {
+                reason_code,
+                detail,
+            } if reason_code == "append_conflict"
+                && detail.as_deref() == Some("task-state base changed while compiler was running")
+        )));
     }
 
     #[tokio::test]
@@ -6103,7 +6132,7 @@ mod tests {
         )));
     }
     #[tokio::test]
-    async fn state_compiler_driver_error_records_exact_diagnostic_detail() {
+    async fn state_compiler_runtime_error_records_exact_diagnostic_detail() {
         let driver = FakeCodexDriver::scripted([AgentTurnResult::Answer {
             text: "Foreground answer.".to_string(),
         }]);
@@ -6135,8 +6164,11 @@ mod tests {
                 _ => None,
             })
             .expect("driver failure event");
-        assert_eq!(failure.0, "driver_error");
-        assert_eq!(failure.1.as_deref(), Some(diagnostic.as_str()));
+        assert_eq!(failure.0, "runtime_error");
+        assert!(failure
+            .1
+            .as_deref()
+            .is_some_and(|detail| detail.contains(diagnostic.as_str())));
     }
 
     #[tokio::test]
@@ -6166,7 +6198,7 @@ mod tests {
                 reason_code,
                 detail,
             } if reason_code == "timeout"
-                && detail.as_deref().is_some_and(|value| value.contains("50 ms timeout"))
+                && detail.as_deref().is_some_and(|value| value.contains("timed out"))
         )));
         assert_eq!(record.task_state.projection.revision, 1);
     }
@@ -6182,6 +6214,14 @@ mod tests {
             },
         ]);
         let driver_handle = driver.clone();
+        driver.script_compilers([
+            Ok(Some(
+                json!({"baseRevision": 0, "operations": []}).to_string(),
+            )),
+            Ok(Some(
+                json!({"baseRevision": 2, "operations": []}).to_string(),
+            )),
+        ]);
         let sink = CapturingEventSink::default();
         let mut engine = test_engine(driver, sink);
         engine
@@ -6363,6 +6403,7 @@ mod tests {
         let sink = CapturingEventSink::default();
         let sink_handle = sink.clone();
         let mut engine = test_engine_with_wiki(driver, sink, memory, &base.join("data"), &wiki_dir);
+        engine.executor.plan_runtime = Some(engine.runtime.clone());
 
         engine
             .chat(crate::ipc::ChatRequest {
@@ -6443,6 +6484,7 @@ mod tests {
         let sink = CapturingEventSink::default();
         let sink_handle = sink.clone();
         let mut engine = test_engine_with_wiki(driver, sink, memory, &base.join("data"), &wiki_dir);
+        engine.executor.plan_runtime = Some(engine.runtime.clone());
 
         engine
             .chat(crate::ipc::ChatRequest {
@@ -6502,6 +6544,7 @@ mod tests {
         }]);
         let sink = CapturingEventSink::default();
         let mut engine = test_engine_with_wiki(driver, sink, memory, &base.join("data"), &wiki_dir);
+        engine.executor.plan_runtime = Some(engine.runtime.clone());
 
         engine
             .chat(crate::ipc::ChatRequest {
@@ -6605,6 +6648,13 @@ mod tests {
                 Ok(())
             }
             fn plugin_move(&self, _from_index: usize, _to_index: usize) -> Result<(), Self::Error> {
+                Ok(())
+            }
+            fn restore_project_manifest(
+                &self,
+                _expected_revision: &str,
+                _bytes: &[u8],
+            ) -> Result<(), Self::Error> {
                 Ok(())
             }
             fn restore_map_backup(
@@ -6825,6 +6875,37 @@ mod tests {
     }
 
     #[test]
+    fn system_prompt_pins_always_active_full_trust_python_prepare_commit_contract() {
+        let prompt = build_system_prompt(
+            "Python 엔트리포인트와 의존성을 수정해 줘",
+            &sample_hits(),
+            "[project state]\nproject=Sample compiling=false",
+            None,
+            None,
+        );
+        for required in [
+            "epScript remains the primary authoring language",
+            "always-active eudplib authoring surface",
+            "executes with full trust",
+            "Create Python source only as CUIPy",
+            "CUIPy create/write/edit/delete/move/rename operations bypass eps_check",
+            "pythonEntrypoints is ordered manifest authority",
+            "complete exact direct dependency list",
+            "python_dependencies_prepare",
+            "pass only its opaque candidateToken to python_dependencies_set",
+            "build_run never resolves, installs, syncs, or repairs dependencies",
+        ] {
+            assert!(
+                prompt.contains(required),
+                "Python guide must pin: {required}"
+            );
+        }
+        assert!(
+            prompt.find("python_dependencies_prepare").unwrap()
+                < prompt.find("python_dependencies_set").unwrap()
+        );
+    }
+    #[test]
     fn system_prompt_places_agent_preflight_before_authoritative_build() {
         let prompt = build_system_prompt(
             "Change mutually dependent eps files",
@@ -6939,33 +7020,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mock_driver_seed_sets_conversation_state_and_reset_clears_it() {
-        let mut driver = FakeCodexDriver::scripted([]);
+    async fn mock_runtime_seed_sets_conversation_state_and_reset_clears_it() {
+        let mut executor = FakeCodexDriver::scripted([]);
         assert_eq!(
-            driver.conversation_state().await,
+            executor.conversation_state(),
             crate::provider::ProviderConversationState::Codex { thread_id: None }
         );
 
-        driver
-            .seed_conversation(crate::provider::ProviderConversationState::Codex {
+        executor
+            .seed(crate::provider::ProviderConversationState::Codex {
                 thread_id: Some("thread-seeded".to_string()),
             })
             .await
             .expect("seed should succeed");
         assert_eq!(
-            driver.conversation_state().await,
+            executor.conversation_state(),
             crate::provider::ProviderConversationState::Codex {
                 thread_id: Some("thread-seeded".to_string())
             }
         );
-        assert_eq!(driver.seeded_ids(), vec!["thread-seeded".to_string()]);
+        assert_eq!(executor.seeded_ids(), vec!["thread-seeded".to_string()]);
 
-        driver
-            .reset_conversation()
-            .await
-            .expect("reset should succeed");
+        executor.reset().await.expect("reset should succeed");
         assert_eq!(
-            driver.conversation_state().await,
+            executor.conversation_state(),
             crate::provider::ProviderConversationState::Codex { thread_id: None }
         );
     }
@@ -7156,11 +7234,7 @@ mod tests {
         let dirs = runtime_c.data_dirs();
         dirs.ensure_dirs().unwrap();
         let workspace_manager = WorkspaceManager::new(dirs.clone());
-        let snapshot = crate::source_snapshot::ProjectSnapshot {
-            project: "Sample".to_string(),
-            identity: "C:/maps/sample.scx".to_string(),
-            files: Vec::new(),
-        };
+        let snapshot = native_workspace_snapshot(&dirs, "Sample");
         let canonical = workspace_manager.prepare_snapshot(&snapshot).unwrap();
         fs::write(canonical.root.join("specs/state.md"), b"accepted").unwrap();
         let session_workspace = workspace_manager
@@ -7227,6 +7301,7 @@ mod tests {
             .unwrap();
         runtime_c.journal().persist(request_c).unwrap();
 
+        let (_cancellation_tx, cancellation_rx) = tokio::sync::watch::channel(0_u64);
         let mut engine = AgentEngine::new(
             FakeCodexDriver::scripted([]),
             CapturingEventSink::default(),
@@ -7239,6 +7314,7 @@ mod tests {
             sessions,
             AttachmentStore::new(dirs.attachments_dir()),
             record,
+            cancellation_rx,
         );
         engine.current_request_id = Some(request_c.to_string());
         engine.phase = Phase::Executing;
@@ -7471,6 +7547,7 @@ mod tests {
         let sink = CapturingEventSink::default();
         let sessions = session_store_at(&base);
         let session = test_session(&sessions);
+        let (_cancellation_tx, cancellation_rx) = tokio::sync::watch::channel(0_u64);
         let mut engine = AgentEngine::new(
             driver,
             sink,
@@ -7483,6 +7560,7 @@ mod tests {
             sessions,
             attachment_store.clone(),
             session,
+            cancellation_rx,
         );
 
         engine
@@ -7636,6 +7714,7 @@ mod tests {
         ]);
         let plan_handle = plan_driver.clone();
         let mut plan_engine = test_engine(plan_driver, CapturingEventSink::default());
+        plan_engine.executor.plan_runtime = Some(plan_engine.runtime.clone());
         plan_engine
             .runtime
             .mentions()

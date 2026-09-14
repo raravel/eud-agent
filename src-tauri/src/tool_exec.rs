@@ -11,13 +11,14 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{mpsc, Arc};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use parking_lot::Mutex;
 use serde_json::{json, Value};
 use sha2::{Digest as _, Sha256};
 
+use crate::bootstrap::process_tree::ProcessCancellation;
 use crate::config::DataDirs;
 use crate::eps_preflight::{EpsAnalyzer, EpsCandidateInput, EpsPreflight};
 use crate::journal::{DatTable, JournalEntry, JournalStore, JournalTarget, Snapshot, WriteTool};
@@ -26,6 +27,50 @@ use crate::native_project::{DatScalar, DatTarget, NativeDatChange, NativeDatPatc
 use crate::rag::Rag;
 use crate::tools::{self, RequestState};
 use crate::workspace::{apply_exact_text_edits, ExactTextEdit};
+
+struct ProcessCancellationBridge {
+    token: ProcessCancellation,
+    stop: mpsc::Sender<()>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+impl ProcessCancellationBridge {
+    fn new(mut receiver: tokio::sync::watch::Receiver<u64>) -> Self {
+        let generation = *receiver.borrow_and_update();
+        let token = ProcessCancellation::default();
+        let watched = token.clone();
+        let (stop, stopped) = mpsc::channel();
+        let worker = std::thread::spawn(move || loop {
+            match stopped.recv_timeout(Duration::from_millis(10)) {
+                Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if *receiver.borrow() != generation {
+                        watched.cancel();
+                        break;
+                    }
+                }
+            }
+        });
+        Self {
+            token,
+            stop,
+            worker: Some(worker),
+        }
+    }
+
+    fn token(&self) -> &ProcessCancellation {
+        &self.token
+    }
+}
+
+impl Drop for ProcessCancellationBridge {
+    fn drop(&mut self) {
+        let _ = self.stop.send(());
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
 
 /// Maximum `search_docs` top-k (mirrors the registry/feature 11 clamp).
 const SEARCH_DOCS_MAX_K: i64 = 10;
@@ -325,6 +370,8 @@ pub struct SessionToolRuntime {
     pending_plan: Arc<Mutex<Option<(String, String)>>>,
     write_state: Arc<Mutex<SessionWriteState>>,
     execution_lock: Arc<Mutex<()>>,
+    #[cfg(test)]
+    completion_barrier: Arc<Mutex<Option<ToolCompletionBarrier>>>,
     ask: Arc<Mutex<AskState>>,
     ask_waiting: tokio::sync::watch::Sender<bool>,
     cancellation: Arc<Mutex<Option<tokio::sync::watch::Receiver<u64>>>>,
@@ -373,6 +420,8 @@ impl SessionToolRuntime {
             pending_plan: Arc::new(Mutex::new(None)),
             write_state: Arc::new(Mutex::new(SessionWriteState::default())),
             execution_lock: Arc::new(Mutex::new(())),
+            #[cfg(test)]
+            completion_barrier: Arc::new(Mutex::new(None)),
             ask: Arc::new(Mutex::new(AskState::default())),
             ask_waiting,
             cancellation: Arc::new(Mutex::new(None)),
@@ -389,6 +438,26 @@ impl SessionToolRuntime {
     }
     pub fn kind(&self) -> crate::session::SessionKind {
         self.kind
+    }
+
+    pub(crate) fn tool_descriptors(&self) -> Vec<Value> {
+        if self.kind == crate::session::SessionKind::Map {
+            crate::tools::map_mcp_tool_descriptors()
+        } else {
+            crate::tools::mcp_tool_descriptors()
+        }
+    }
+
+    pub(crate) fn matches_run_scope(
+        &self,
+        identity: &crate::provider_runtime::RunIdentity,
+    ) -> bool {
+        self.matches_request_scope(identity)
+            && self
+                .cancellation
+                .lock()
+                .as_ref()
+                .is_some_and(|receiver| *receiver.borrow() == identity.cancellation_generation)
     }
 
     pub fn journal(&self) -> &JournalStore {
@@ -451,10 +520,46 @@ impl SessionToolRuntime {
         let owner_request_id = self.current_request_id().ok_or_else(|| {
             "no agent request is open; ask is only valid during a turn".to_string()
         })?;
+        self.ask_scoped(&owner_request_id, None, args).await
+    }
+
+    pub(crate) async fn ask_for_run(
+        &self,
+        identity: &crate::provider_runtime::RunIdentity,
+        args: &Value,
+    ) -> Result<Value, String> {
+        if self.session_id != identity.session_id || self.kind != identity.session_kind {
+            return Err("stale provider run cannot create an ask request".to_string());
+        }
+        self.ask_scoped(
+            &identity.request_id,
+            Some(identity.cancellation_generation),
+            args,
+        )
+        .await
+    }
+
+    async fn ask_scoped(
+        &self,
+        expected_request_id: &str,
+        expected_generation: Option<u64>,
+        args: &Value,
+    ) -> Result<Value, String> {
         let input: AskToolInput = serde_json::from_value(args.clone())
             .map_err(|error| format!("invalid ask arguments: {error}"))?;
         validate_ask_questions(&input.questions)?;
 
+        let request_guard = self.execution_lock.lock();
+        let generation_matches = expected_generation.map_or(true, |expected| {
+            self.cancellation
+                .lock()
+                .as_ref()
+                .is_some_and(|receiver| *receiver.borrow() == expected)
+        });
+        if self.current_request_id().as_deref() != Some(expected_request_id) || !generation_matches
+        {
+            return Err("stale provider run cannot create an ask request".to_string());
+        }
         let (request_id, response, emitter) = {
             let mut ask = self.ask.lock();
             if !ask.pending.is_empty() {
@@ -473,7 +578,7 @@ impl SessionToolRuntime {
             ask.pending.insert(
                 request_id.clone(),
                 PendingAsk {
-                    owner_request_id,
+                    owner_request_id: expected_request_id.to_string(),
                     questions: input.questions.clone(),
                     response: send,
                 },
@@ -481,6 +586,7 @@ impl SessionToolRuntime {
             self.ask_waiting.send_replace(true);
             (request_id, response, emitter)
         };
+        drop(request_guard);
         let _lease = PendingAskLease {
             runtime: self.clone(),
             request_id: request_id.clone(),
@@ -507,6 +613,15 @@ impl SessionToolRuntime {
                 questions: pending.questions.clone(),
             })
         })
+    }
+
+    pub(crate) fn matches_request_scope(
+        &self,
+        identity: &crate::provider_runtime::RunIdentity,
+    ) -> bool {
+        self.session_id == identity.session_id
+            && self.kind == identity.session_kind
+            && self.current_request_id().as_deref() == Some(identity.request_id.as_str())
     }
 
     fn remove_pending_ask(&self, request_id: &str) -> Option<PendingAsk> {
@@ -565,6 +680,10 @@ impl SessionToolRuntime {
         self.emit_activity(activity);
     }
     pub fn begin_request(&self, request_id: &str, project_id: &str) -> Result<(), String> {
+        let _execution = self.execution_lock.try_lock().ok_or_else(|| {
+            "a previously admitted tool is still running; wait for its completion before opening a new request"
+                .to_string()
+        })?;
         if let Some(ticket) = self.write_state.lock().ticket.as_ref() {
             return Err(format!(
                 "previous write ticket {} is still active; settle or abort it before opening {request_id}",
@@ -832,6 +951,7 @@ impl SessionToolRuntime {
     }
 
     pub fn clear_current(&self) {
+        let _execution = self.execution_lock.lock();
         self.cancel_pending_ask();
         *self.request.lock() = None;
         if let Some(state) = self.request_state.lock().take() {
@@ -982,6 +1102,36 @@ impl SessionToolRuntime {
     }
 
     pub fn execute(&self, tool: &str, args: &Value) -> Result<Value, String> {
+        let request_id = self.current_request_id().ok_or_else(|| {
+            "no agent request is open; tool calls are only valid during a turn".to_string()
+        })?;
+        self.execute_scoped(&request_id, None, tool, args)
+    }
+
+    pub(crate) fn execute_for_run(
+        &self,
+        identity: &crate::provider_runtime::RunIdentity,
+        tool: &str,
+        args: &Value,
+    ) -> Result<Value, String> {
+        if self.session_id != identity.session_id || self.kind != identity.session_kind {
+            return Err("stale provider run cannot execute tools".to_string());
+        }
+        self.execute_scoped(
+            &identity.request_id,
+            Some(identity.cancellation_generation),
+            tool,
+            args,
+        )
+    }
+
+    fn execute_scoped(
+        &self,
+        expected_request_id: &str,
+        expected_generation: Option<u64>,
+        tool: &str,
+        args: &Value,
+    ) -> Result<Value, String> {
         if !self.ask.lock().pending.is_empty() {
             return Err(
                 "a user answer is pending; wait for the ask tool to complete before calling another tool"
@@ -989,12 +1139,26 @@ impl SessionToolRuntime {
             );
         }
         let _execution = self.execution_lock.lock();
-        let request_id = self.current_request_id().ok_or_else(|| {
-            "no agent request is open; tool calls are only valid during a turn".to_string()
-        })?;
+        let generation_matches = expected_generation.map_or(true, |expected| {
+            self.cancellation
+                .lock()
+                .as_ref()
+                .is_some_and(|receiver| *receiver.borrow() == expected)
+        });
+        let request_id = self
+            .current_request_id()
+            .filter(|request_id| request_id == expected_request_id && generation_matches)
+            .ok_or_else(|| "stale provider run cannot execute tools".to_string())?;
         if self.kind == crate::session::SessionKind::Map {
             tools::validate_map_tool_call(tool, args).map_err(|error| error.to_string())?;
             return self.dispatch_map(&request_id, tool, args);
+        }
+
+        if tool == tools::PYTHON_DEPENDENCIES_PREPARE_TOOL && self.owns_write_registration() {
+            return Err(
+                "Python 의존성 준비는 프로젝트 쓰기 등록을 보유하지 않은 상태에서 실행해야 합니다."
+                    .to_string(),
+            );
         }
 
         if tools::is_mutating_tool(tool) && !self.owns_write_registration() {
@@ -1014,7 +1178,20 @@ stop this turn so the backend can resume the same thread in its isolated writabl
             tools::admit_tool_call(state, tool, args).map_err(|error| error.to_string())?;
         }
 
-        let mut result = if matches!(
+        let mut result = if tool == tools::PYTHON_DEPENDENCIES_SET_TOOL {
+            let token = str_arg(args, "candidateToken")?;
+            let project_id = self
+                .current_project_id()
+                .ok_or_else(|| "현재 에이전트 프로젝트가 열려 있지 않습니다.".to_string())?;
+            let claimed = self.services.native().claim_python_dependencies(
+                token,
+                &self.session_id,
+                &project_id,
+            )?;
+            self.project_transaction(|| {
+                self.python_dependencies_set(&request_id, &project_id, claimed)
+            })?
+        } else if matches!(
             tool,
             tools::MAP_SOUND_IMPORT_TOOL | tools::MAP_SOUND_EDIT_TOOL
         ) {
@@ -1033,6 +1210,19 @@ stop this turn so the backend can resume the same thread in its isolated writabl
                 self.record_search_docs_result(&request_id, value)?;
             } else if tool == tools::DOCS_GET_TOOL {
                 self.record_docs_get_result(&request_id, value)?;
+            }
+        }
+        #[cfg(test)]
+        if result.is_ok() && tools::is_mutating_tool(tool) {
+            if let Some(barrier) = self.completion_barrier.lock().take() {
+                barrier
+                    .reached
+                    .send(())
+                    .expect("completion observer is waiting");
+                barrier
+                    .released
+                    .recv_timeout(std::time::Duration::from_secs(15))
+                    .expect("test releases the completed mutation");
             }
         }
         result
@@ -1352,7 +1542,8 @@ stop this turn so the backend can resume the same thread in its isolated writabl
         match tool {
             // ---- read tools (no journal) ----
             "project_status" => {
-                let status = self.services.native().status()?;
+                let project = self.services.native().open()?;
+                let status = project.status()?;
                 Ok(json!({
                     "status": {
                         "name": status.name,
@@ -1362,6 +1553,9 @@ stop this turn so the backend can resume the same thread in its isolated writabl
                         "revision": status.revision,
                     },
                     "mainFile": status.main_file,
+                    "pythonEntrypoints": project.manifest().python_entrypoints.clone(),
+                    "pythonDependencies": project.manifest().python_dependencies.clone(),
+                    "pythonLock": project.manifest().python_lock.clone(),
                 }))
             }
             "list_files" => {
@@ -1380,6 +1574,38 @@ stop this turn so the backend can resume the same thread in its isolated writabl
                 ranged_file_result(path, &content, args)
             }
             tools::SOURCE_SEARCH_TOOL => self.source_search(args),
+            tools::PYTHON_DEPENDENCIES_PREPARE_TOOL => {
+                let values = array_arg(args, "dependencies")?;
+                let dependencies = values
+                    .iter()
+                    .map(|value| {
+                        value.as_str().map(str::to_string).ok_or_else(|| {
+                            "dependencies에는 문자열만 사용할 수 있습니다.".to_string()
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let project_id = self
+                    .current_project_id()
+                    .ok_or_else(|| "현재 에이전트 프로젝트가 열려 있지 않습니다.".to_string())?;
+                let bridge = self
+                    .cancellation
+                    .lock()
+                    .clone()
+                    .map(ProcessCancellationBridge::new);
+                serde_json::to_value(
+                    self.services
+                        .native()
+                        .prepare_python_dependencies_with_cancellation(
+                            &self.session_id,
+                            &project_id,
+                            dependencies,
+                            bridge.as_ref().map(ProcessCancellationBridge::token),
+                        )?,
+                )
+                .map_err(|error| {
+                    format!("Python 의존성 준비 결과를 직렬화하지 못했습니다: {error}")
+                })
+            }
             tools::EPS_CHECK_TOOL => {
                 let files: Vec<EpsCandidateInput> = serde_json::from_value(
                     args.get("files")
@@ -1640,7 +1866,18 @@ stop this turn so the backend can resume the same thread in its isolated writabl
                             .to_string(),
                     );
                 }
-                let result = self.services.native().build()?;
+                let project_id = self
+                    .current_project_id()
+                    .ok_or_else(|| "현재 에이전트 프로젝트가 열려 있지 않습니다.".to_string())?;
+                let bridge = self
+                    .cancellation
+                    .lock()
+                    .clone()
+                    .map(ProcessCancellationBridge::new);
+                let result = self.services.native().build_with_cancellation(
+                    &project_id,
+                    bridge.as_ref().map(ProcessCancellationBridge::token),
+                )?;
                 *self.sound_build_required.lock() = false;
                 *self.last_build.lock() = Some(crate::harness::BuildEvidence {
                     ok: result.ok,
@@ -2416,15 +2653,26 @@ stop this turn so the backend can resume the same thread in its isolated writabl
         })
     }
 
+    fn source_file_type(&self, path: &str) -> Result<String, String> {
+        self.services
+            .native()
+            .list_files()?
+            .into_iter()
+            .find(|file| file.path.eq_ignore_ascii_case(path))
+            .map(|file| file.file_type)
+            .ok_or_else(|| format!("프로젝트 소스 파일을 찾을 수 없습니다: {path}"))
+    }
+
     fn file_create(&self, request_id: &str, args: &Value) -> Result<Value, String> {
         let (requested_path, ftype) = (str_arg(args, "path")?, str_arg(args, "ftype")?);
-        if ftype != "CUIEps" {
-            return Err("native projects create CUIEps files only".to_string());
+        if !matches!(ftype, "CUIEps" | "CUIPy") {
+            return Err("파일 형식은 CUIEps 또는 CUIPy여야 합니다.".to_string());
         }
         let code = args.get("code").and_then(Value::as_str).unwrap_or("");
         let path = native_source_path(requested_path);
         self.services.native().create_source(&path, code)?;
-        self.eps_preflight.write_applied(request_id, &path, code);
+        self.eps_preflight
+            .write_applied(request_id, &path, ftype, code);
         self.record_file(
             request_id,
             WriteTool::FileCreate,
@@ -2439,6 +2687,7 @@ stop this turn so the backend can resume the same thread in its isolated writabl
         let requested_path = str_arg(args, "path")?;
         let path = native_source_path(requested_path);
         let code = str_arg(args, "code")?;
+        let ftype = self.source_file_type(&path)?;
         let old = self.services.native().read_source(&path)?;
         let merged = match self.source_baseline(&path)? {
             Some(base) => crate::workspace::merge_concurrent_text(&path, &base, code, &old)
@@ -2454,7 +2703,8 @@ stop this turn so the backend can resume the same thread in its isolated writabl
             }
         };
         self.services.native().write_source(&path, &merged)?;
-        self.eps_preflight.write_applied(request_id, &path, &merged);
+        self.eps_preflight
+            .write_applied(request_id, &path, &ftype, &merged);
         self.record_file(
             request_id,
             WriteTool::FileWrite,
@@ -2474,6 +2724,7 @@ stop this turn so the backend can resume the same thread in its isolated writabl
                 .ok_or_else(|| "missing argument 'edits'".to_string())?,
         )
         .map_err(|error| format!("invalid file_edit edits: {error}"))?;
+        let ftype = self.source_file_type(&path)?;
         let old = self.services.native().read_source(&path)?;
         let merged = match self.source_baseline(&path)? {
             Some(base) => {
@@ -2496,7 +2747,8 @@ stop this turn so the backend can resume the same thread in its isolated writabl
             }
         };
         self.services.native().write_source(&path, &merged)?;
-        self.eps_preflight.write_applied(request_id, &path, &merged);
+        self.eps_preflight
+            .write_applied(request_id, &path, &ftype, &merged);
         self.record_file(
             request_id,
             WriteTool::FileWrite,
@@ -2514,6 +2766,7 @@ stop this turn so the backend can resume the same thread in its isolated writabl
     fn file_delete(&self, request_id: &str, args: &Value) -> Result<Value, String> {
         let requested_path = str_arg(args, "path")?;
         let path = native_source_path(requested_path);
+        let ftype = self.source_file_type(&path)?;
         let old = self.services.native().read_source(&path)?;
         if let Some(base) = self.source_baseline(&path)? {
             if old != base {
@@ -2524,7 +2777,7 @@ stop this turn so the backend can resume the same thread in its isolated writabl
             }
         }
         self.services.native().delete_source(&path)?;
-        self.eps_preflight.delete_applied(request_id, &path);
+        self.eps_preflight.delete_applied(request_id, &path, &ftype);
         self.record_file(
             request_id,
             WriteTool::FileDelete,
@@ -2554,6 +2807,7 @@ stop this turn so the backend can resume the same thread in its isolated writabl
 
     fn file_rename(&self, request_id: &str, args: &Value) -> Result<Value, String> {
         let path = native_source_path(str_arg(args, "path")?);
+        let ftype = self.source_file_type(&path)?;
         let newname = str_arg(args, "newname")?;
         if let Some(base) = self.source_baseline(&path)? {
             let current = self.services.native().read_source(&path)?;
@@ -2566,13 +2820,15 @@ stop this turn so the backend can resume the same thread in its isolated writabl
         }
         let to = sibling_path(&path, newname);
         self.services.native().move_source(&path, &to)?;
-        self.eps_preflight.rename_applied(request_id, &path, &to);
+        self.eps_preflight
+            .rename_applied(request_id, &path, &to, &ftype);
         self.record_rename(request_id, WriteTool::FileRename, &path, &to)?;
         Ok(json!({ "ok": true, "from": path, "to": to }))
     }
 
     fn file_move(&self, request_id: &str, args: &Value) -> Result<Value, String> {
         let path = native_source_path(str_arg(args, "path")?);
+        let ftype = self.source_file_type(&path)?;
         if let Some(base) = self.source_baseline(&path)? {
             let current = self.services.native().read_source(&path)?;
             if current != base {
@@ -2586,7 +2842,8 @@ stop this turn so the backend can resume the same thread in its isolated writabl
         let dest = native_source_dir(requested_dest);
         let to = moved_path(&path, &dest);
         self.services.native().move_source(&path, &to)?;
-        self.eps_preflight.rename_applied(request_id, &path, &to);
+        self.eps_preflight
+            .rename_applied(request_id, &path, &to, &ftype);
         self.record_rename(request_id, WriteTool::FileMove, &path, &to)?;
         Ok(json!({ "ok": true, "from": path, "to": to }))
     }
@@ -2672,6 +2929,84 @@ stop this turn so the backend can resume the same thread in its isolated writabl
             ts: epoch_secs(),
         })?;
         Ok(json!({ "ok": true, "scope": scope, "key": key, "value": value }))
+    }
+
+    fn python_dependencies_set(
+        &self,
+        request_id: &str,
+        project_id: &str,
+        claimed: crate::native_runtime::ClaimedPythonDependencies,
+    ) -> Result<Value, String> {
+        let commit = self.services.native().commit_python_dependencies(
+            claimed,
+            &self.session_id,
+            project_id,
+        )?;
+        let seq = self.next_seq(request_id);
+        let entry = JournalEntry {
+            id: format!("python-dependencies-{seq}"),
+            seq,
+            tool: WriteTool::PythonDependenciesSet,
+            target: JournalTarget::ProjectManifest {
+                path: crate::native_project::PROJECT_MANIFEST_FILE.to_string(),
+            },
+            before: Snapshot::ManifestBytes {
+                bytes: commit.before_manifest.clone(),
+                manifest_sha256: commit.before_manifest_sha256,
+            },
+            after: Snapshot::ManifestBytes {
+                bytes: commit.after_manifest,
+                manifest_sha256: commit.after_manifest_sha256.clone(),
+            },
+            ts: epoch_secs(),
+        };
+        let entry_id = entry.id.clone();
+        if let Err(error) = self.record(entry) {
+            self.services
+                .native()
+                .restore_manifest_bytes(
+                    &commit.after_manifest_sha256,
+                    &commit.before_manifest,
+                )
+                .map_err(|restore_error| {
+                    format!(
+                        "Python 의존성 저널 기록과 매니페스트 복원이 모두 실패했습니다: {error}; {restore_error}"
+                    )
+                })?;
+            return Err(format!(
+                "Python 의존성 저널을 기록하지 못해 매니페스트를 복원했습니다: {error}"
+            ));
+        }
+        if let Err(error) = self.services.journal.persist(request_id) {
+            self.services
+                .native()
+                .restore_manifest_bytes(
+                    &commit.after_manifest_sha256,
+                    &commit.before_manifest,
+                )
+                .map_err(|restore_error| {
+                    format!(
+                        "Python 의존성 저널 저장과 매니페스트 복원이 모두 실패했습니다: {error}; {restore_error}"
+                    )
+                })?;
+            self.services
+                .journal
+                .forget_unpersisted_entry(request_id, &entry_id)
+                .map_err(|cleanup_error| {
+                    format!(
+                        "Python 의존성 매니페스트는 복원했지만 미저장 저널을 정리하지 못했습니다: {cleanup_error}"
+                    )
+                })?;
+            return Err(format!(
+                "Python 의존성 저널을 저장하지 못해 매니페스트를 복원했습니다: {error}"
+            ));
+        }
+        Ok(json!({
+            "ok": true,
+            "revision": commit.revision,
+            "normalizedDependencies": commit.normalized_dependencies,
+            "lockDigest": commit.lock_digest,
+        }))
     }
 
     fn plugin_add(&self, request_id: &str, args: &Value) -> Result<Value, String> {
@@ -3243,6 +3578,17 @@ impl crate::journal::JournalRollbackTarget for SessionToolRuntime {
         self.services.native().plugin_move(from_index, to_index)
     }
 
+    fn restore_project_manifest(
+        &self,
+        expected_revision: &str,
+        bytes: &[u8],
+    ) -> Result<(), Self::Error> {
+        self.services
+            .native()
+            .restore_manifest_bytes(expected_revision, bytes)
+            .map(|_| ())
+    }
+
     fn restore_map_backup(
         &self,
         map_path: &str,
@@ -3304,6 +3650,10 @@ impl ToolServices {
 impl SessionToolRuntime {
     pub fn for_tests() -> Self {
         ToolServices::for_tests().session("test-session")
+    }
+
+    pub(crate) fn execution_lock_for_tests(&self) -> Arc<Mutex<()>> {
+        Arc::clone(&self.execution_lock)
     }
 
     pub fn require_sound_build_for_tests(&self) {
@@ -4050,6 +4400,31 @@ fn epoch_secs() -> u64 {
 }
 
 #[cfg(test)]
+struct ToolCompletionBarrier {
+    reached: tokio::sync::oneshot::Sender<()>,
+    released: std::sync::mpsc::Receiver<()>,
+}
+
+#[cfg(test)]
+impl SessionToolRuntime {
+    pub(crate) fn pause_mutation_completion(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        let (reached, observed) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        *self.completion_barrier.lock() = Some(ToolCompletionBarrier { reached, released });
+        (observed, release)
+    }
+}
+
+#[cfg(test)]
+#[path = "tool_exec/blocking_completion_tests.rs"]
+mod blocking_completion_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
@@ -4060,6 +4435,109 @@ mod tests {
         runtime.begin_request(request_id, "test-project").unwrap();
         runtime.request_write_workspace("test mutation").unwrap();
         runtime
+    }
+
+    #[test]
+    fn prepared_native_source_baseline_admits_an_exact_file_edit() {
+        // Given: a real native project is mirrored into the session workspace used by writes.
+        let services = ToolServices::for_tests();
+        let root = services.dirs.app_data().join("source-baseline-project");
+        std::fs::create_dir_all(root.join("maps")).unwrap();
+        std::fs::write(root.join("maps/source.scx"), b"fixture map").unwrap();
+        let project = crate::native_project::NativeProject::create(
+            &root,
+            crate::native_project::ProjectManifest {
+                schema_version: crate::native_project::PROJECT_SCHEMA_VERSION,
+                name: "Source baseline project".to_string(),
+                source_map: "maps/source.scx".to_string(),
+                output_map: "build/output.scx".to_string(),
+                main_file: "src/main.eps".to_string(),
+                settings: Default::default(),
+                plugins: Vec::new(),
+                python_entrypoints: Vec::new(),
+                python_dependencies: Vec::new(),
+                python_lock: None,
+                editor_compatibility: None,
+            },
+        )
+        .unwrap();
+        services.native().activate_project(&project).unwrap();
+        services
+            .native()
+            .write_source("src/main.eps", "// baseline\n")
+            .unwrap();
+        services.native().create_source_dir("src/nested").unwrap();
+        services
+            .native()
+            .write_source("src/nested/helper.eps", "// nested\n")
+            .unwrap();
+        let workspace = crate::workspace::WorkspaceManager::new(services.dirs.clone())
+            .prepare_session_current("source-baseline-session")
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(workspace.root.join("source/main.eps")).unwrap(),
+            "// baseline\n"
+        );
+        assert!(!workspace.root.join("source/src/main.eps").exists());
+
+        let runtime = services.session("source-baseline-session");
+        runtime
+            .begin_request("source-baseline-request", "source-baseline-project")
+            .unwrap();
+        runtime
+            .request_write_workspace("edit the existing source")
+            .unwrap();
+        runtime
+            .bind_workspace_root("source-baseline-request", workspace.root.clone())
+            .unwrap();
+        runtime
+            .execute("search_docs", &json!({"query": "epScript comment"}))
+            .unwrap();
+
+        // When: the production file-edit path resolves the native src/ path against that mirror.
+        runtime
+            .execute(
+                "file_edit",
+                &json!({
+                    "path": "src/main.eps",
+                    "edits": [{"old_text": "// baseline\n", "new_text": "// baseline\n// edited\n"}],
+                }),
+            )
+            .unwrap();
+
+        // Then: the existing source is edited, while a genuinely absent source has no baseline.
+        assert_eq!(
+            services.native().read_source("src/main.eps").unwrap(),
+            "// baseline\n// edited\n"
+        );
+        let entries = services
+            .journal
+            .selected_entries("source-baseline-request", &crate::journal::DecisionIds::All)
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].tool, WriteTool::FileWrite);
+        assert_eq!(
+            entries[0].target,
+            JournalTarget::Path {
+                path: "src/main.eps".to_string()
+            }
+        );
+        assert_eq!(
+            crate::workspace::read_source_baseline(&workspace.root, "src/missing.eps").unwrap(),
+            None
+        );
+        assert_eq!(
+            crate::workspace::read_source_baseline(&workspace.root, "src/nested/helper.eps")
+                .unwrap()
+                .as_deref(),
+            Some("// nested\n")
+        );
+        assert_eq!(
+            crate::workspace::read_source_baseline(&workspace.root, "nested/helper.eps")
+                .unwrap()
+                .as_deref(),
+            Some("// nested\n")
+        );
     }
 
     #[test]

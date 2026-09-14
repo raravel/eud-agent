@@ -414,6 +414,9 @@ fn create_project_from_map(source_map: &Path, destination: &Path) -> Result<(), 
         main_file: "src/main.eps".to_string(),
         settings: crate::native_project::ProjectSettings::default(),
         plugins: Vec::new(),
+        python_entrypoints: Vec::new(),
+        python_dependencies: Vec::new(),
+        python_lock: None,
         editor_compatibility: None,
     };
     let project = crate::native_project::NativeProject::create(destination, manifest)?;
@@ -597,6 +600,9 @@ mod tests {
                 main_file: "src/main.eps".to_string(),
                 settings: ProjectSettings::default(),
                 plugins: Vec::new(),
+                python_entrypoints: Vec::new(),
+                python_dependencies: Vec::new(),
+                python_lock: None,
                 editor_compatibility: None,
             },
         )

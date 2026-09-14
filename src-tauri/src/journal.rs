@@ -81,6 +81,12 @@ pub trait JournalRollbackTarget {
 
     fn plugin_move(&self, from_index: usize, to_index: usize) -> Result<(), Self::Error>;
 
+    fn restore_project_manifest(
+        &self,
+        expected_manifest_sha256: &str,
+        bytes: &[u8],
+    ) -> Result<(), Self::Error>;
+
     fn restore_map_backup(
         &self,
         map_path: &str,
@@ -136,6 +142,8 @@ pub enum WriteTool {
     WorkspaceCreate,
     WorkspaceDelete,
     MapSound,
+    PythonDependenciesSet,
+    ProjectManifestMigrate,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -179,6 +187,9 @@ pub enum JournalTarget {
         source_map: PathBuf,
         mpq_path: String,
         normalized_sha256: String,
+    },
+    ProjectManifest {
+        path: String,
     },
 }
 
@@ -261,6 +272,10 @@ pub enum Snapshot {
         source_display_name: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         edit: Option<MapSoundEditChange>,
+    },
+    ManifestBytes {
+        bytes: Vec<u8>,
+        manifest_sha256: String,
     },
 }
 
@@ -420,6 +435,17 @@ impl JournalStore {
             });
         journal.entries.push(entry);
         journal.entries.sort_by_key(|entry| entry.seq);
+        Ok(())
+    }
+
+    pub fn forget_unpersisted_entry(
+        &self,
+        request_id: &str,
+        entry_id: &str,
+    ) -> Result<(), JournalError> {
+        if let Some(journal) = lock(&self.journals)?.get_mut(request_id) {
+            journal.entries.retain(|entry| entry.id != entry_id);
+        }
         Ok(())
     }
 
@@ -772,6 +798,18 @@ fn file_changeset_item(entry: &JournalEntry) -> Result<Option<ChangesetItem>, Jo
                 properties: Vec::new(),
             }
         }
+        WriteTool::PythonDependenciesSet | WriteTool::ProjectManifestMigrate => {
+            let path = project_manifest_path(entry)?;
+            let (old, new) = manifest_contents(entry)?;
+            ChangesetItem {
+                id: entry.id.clone(),
+                kind: ChangesetItemKind::Modified,
+                diff: Some(unified_diff(&path, &old, &new)),
+                path: Some(path),
+                dat_ref: None,
+                properties: Vec::new(),
+            }
+        }
         WriteTool::FileRename | WriteTool::FileMove | WriteTool::SetMain => ChangesetItem {
             id: entry.id.clone(),
             kind: ChangesetItemKind::Modified,
@@ -830,6 +868,25 @@ fn workspace_entry_path(entry: &JournalEntry) -> Result<String, JournalError> {
         JournalTarget::WorkspacePath { path, .. } => Ok(path.clone()),
         _ => Err(invalid_entry(entry, "expected workspace path target")),
     }
+}
+
+fn project_manifest_path(entry: &JournalEntry) -> Result<String, JournalError> {
+    match &entry.target {
+        JournalTarget::ProjectManifest { path } => Ok(path.clone()),
+        _ => Err(invalid_entry(entry, "expected project manifest target")),
+    }
+}
+
+fn manifest_contents(entry: &JournalEntry) -> Result<(String, String), JournalError> {
+    let decode = |snapshot: &Snapshot| match snapshot {
+        Snapshot::ManifestBytes { bytes, .. } => String::from_utf8(bytes.clone())
+            .map_err(|_| invalid_entry(entry, "project manifest snapshot is not UTF-8")),
+        _ => Err(invalid_entry(
+            entry,
+            "expected project manifest before/after snapshots",
+        )),
+    };
+    Ok((decode(&entry.before)?, decode(&entry.after)?))
 }
 
 fn location_write_changeset_kind(entry: &JournalEntry) -> Result<ChangesetItemKind, JournalError> {
@@ -1136,6 +1193,7 @@ fn reject_targets(entry: &JournalEntry) -> Result<Vec<RejectTarget>, JournalErro
                 source_map.to_string_lossy().into_owned(),
             )]
         }
+        JournalTarget::ProjectManifest { path } => vec![RejectTarget::Path(path.clone())],
     };
     targets.dedup();
     Ok(targets)
@@ -1260,6 +1318,23 @@ where
             Snapshot::MainPath { path } => target.set_main(path.as_deref()).map_err(target_error),
             _ => Err(invalid_entry(entry, "expected main path before snapshot")),
         },
+        WriteTool::PythonDependenciesSet | WriteTool::ProjectManifestMigrate => {
+            match (&entry.before, &entry.after) {
+                (
+                    Snapshot::ManifestBytes { bytes, .. },
+                    Snapshot::ManifestBytes {
+                        manifest_sha256: expected_manifest_sha256,
+                        ..
+                    },
+                ) => target
+                    .restore_project_manifest(expected_manifest_sha256, bytes)
+                    .map_err(target_error),
+                _ => Err(invalid_entry(
+                    entry,
+                    "expected project manifest before/after snapshots",
+                )),
+            }
+        }
         WriteTool::SettingsSet => {
             let key = setting_key(entry)?;
             match &entry.before {
@@ -1483,6 +1558,10 @@ mod tests {
             backup_path: String,
             expected_sha256: Option<String>,
         },
+        RestoreManifest {
+            expected_manifest_sha256: String,
+            bytes: Vec<u8>,
+        },
     }
 
     #[derive(Default)]
@@ -1624,6 +1703,18 @@ mod tests {
             self.ops.borrow_mut().push(AppliedInverse::PluginMove {
                 from_index,
                 to_index,
+            });
+            Ok(())
+        }
+
+        fn restore_project_manifest(
+            &self,
+            expected_manifest_sha256: &str,
+            bytes: &[u8],
+        ) -> Result<(), Self::Error> {
+            self.ops.borrow_mut().push(AppliedInverse::RestoreManifest {
+                expected_manifest_sha256: expected_manifest_sha256.to_string(),
+                bytes: bytes.to_vec(),
             });
             Ok(())
         }
@@ -2769,6 +2860,78 @@ mod tests {
     }
 
     #[test]
+    fn python_file_changeset_and_rejection_restore_exact_content() {
+        let data_dir = temp_data_dir("python-file-review");
+        let store = JournalStore::new(&data_dir);
+        let request_id = "req-python-review";
+        store
+            .record(
+                request_id,
+                entry(
+                    "python-write",
+                    1,
+                    WriteTool::FileWrite,
+                    path_target("src/helper.py"),
+                    Snapshot::FileContent {
+                        content: "VALUE = 1\n".to_owned(),
+                    },
+                    Snapshot::FileContent {
+                        content: "VALUE = 2\n".to_owned(),
+                    },
+                ),
+            )
+            .unwrap();
+        store
+            .record(
+                request_id,
+                entry(
+                    "python-delete",
+                    2,
+                    WriteTool::FileDelete,
+                    path_target("src/deleted.py"),
+                    Snapshot::DeletedFile {
+                        content: "DELETED = True\n".to_owned(),
+                        position: None,
+                    },
+                    Snapshot::Deleted,
+                ),
+            )
+            .unwrap();
+        let changeset = store.changeset(request_id).unwrap();
+        assert!(changeset.items.iter().any(|item| {
+            item.path.as_deref() == Some("src/helper.py")
+                && item.kind == ChangesetItemKind::Modified
+        }));
+        assert!(changeset.items.iter().any(|item| {
+            item.path.as_deref() == Some("src/deleted.py")
+                && item.kind == ChangesetItemKind::Deleted
+        }));
+        let target = FakeTarget::default();
+        store
+            .decide(
+                request_id,
+                ChangesetDecision::reject(DecisionIds::All),
+                &target,
+            )
+            .unwrap();
+        assert_eq!(
+            target.ops(),
+            vec![
+                AppliedInverse::CreateFile {
+                    path: "src/deleted.py".to_owned(),
+                    content: "DELETED = True\n".to_owned(),
+                    position: None,
+                },
+                AppliedInverse::WriteFile {
+                    path: "src/helper.py".to_owned(),
+                    content: "VALUE = 1\n".to_owned(),
+                },
+            ]
+        );
+        fs::remove_dir_all(data_dir).ok();
+    }
+
+    #[test]
     fn accept_archives_journal_without_bridge_ops() {
         let data_dir = temp_data_dir("accept");
         let store = JournalStore::new(&data_dir);
@@ -2897,5 +3060,62 @@ mod tests {
             second,
             Err(JournalError::DecisionInProgress { request_id: id }) if id == request_id
         ));
+    }
+
+    #[test]
+    fn python_dependency_rejection_restores_exact_manifest_bytes() {
+        let data_dir = temp_data_dir("python-manifest-reject");
+        let store = JournalStore::new(&data_dir);
+        let before =
+            b"{\r\n  \"schemaVersion\": 2,\r\n  \"pythonDependencies\": []\r\n}\r\n".to_vec();
+        let after =
+            b"{\n  \"schemaVersion\": 2,\n  \"pythonDependencies\": [\"orjson==3.10.0\"]\n}\n"
+                .to_vec();
+        store
+            .record(
+                "python-request",
+                entry(
+                    "python-dependencies-1",
+                    1,
+                    WriteTool::PythonDependenciesSet,
+                    JournalTarget::ProjectManifest {
+                        path: "project.eap".to_string(),
+                    },
+                    Snapshot::ManifestBytes {
+                        bytes: before.clone(),
+                        manifest_sha256: "before-manifest-sha256".to_string(),
+                    },
+                    Snapshot::ManifestBytes {
+                        bytes: after,
+                        manifest_sha256: "after-manifest-sha256".to_string(),
+                    },
+                ),
+            )
+            .unwrap();
+
+        let changeset = store.changeset("python-request").unwrap();
+        assert_eq!(changeset.items.len(), 1);
+        assert_eq!(changeset.items[0].path.as_deref(), Some("project.eap"));
+        assert!(changeset.items[0]
+            .diff
+            .as_deref()
+            .is_some_and(|diff| diff.contains("orjson==3.10.0")));
+
+        let target = FakeTarget::default();
+        store
+            .decide(
+                "python-request",
+                ChangesetDecision::reject(DecisionIds::All),
+                &target,
+            )
+            .unwrap();
+        assert_eq!(
+            target.ops(),
+            vec![AppliedInverse::RestoreManifest {
+                expected_manifest_sha256: "after-manifest-sha256".to_string(),
+                bytes: before,
+            }]
+        );
+        fs::remove_dir_all(data_dir).ok();
     }
 }

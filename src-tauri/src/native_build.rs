@@ -8,20 +8,20 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::{Cursor, Read};
 use std::path::{Component, Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::thread;
-use std::time::{Duration, Instant, SystemTime};
+use std::process::Command;
+use std::time::{Duration, SystemTime};
 
 use encoding_rs::EUC_KR;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
+use crate::bootstrap::process_tree::{run_process_tree, ProcessCancellation, ProcessEnd};
 use crate::memory::write_atomic_bytes;
 use crate::native_project::{
     NativeDatState, NativeProject, NumericOverride, ProjectManifest, TextOverride,
 };
 
 const EUDDRAFT_TIMEOUT: Duration = Duration::from_secs(300);
-const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const PYTHON_PROBE_TIMEOUT: Duration = Duration::from_secs(120);
 const TRACEBACK_MARKER: &str = "Traceback (most recent call last):";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -217,6 +217,7 @@ pub struct NativeBuildArtifacts {
     pub data_editor: Option<String>,
     pub extra_data_editor: Option<String>,
     pub custom_tbl: Option<String>,
+    pub python_path_bootstrap: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -234,6 +235,7 @@ pub struct NativeBuildError {
 pub struct NativeBuildResult {
     pub ok: bool,
     pub errors: Vec<NativeBuildError>,
+    pub raw_status: u32,
     pub stdout: String,
     pub stderr: String,
     pub artifacts: NativeBuildArtifacts,
@@ -295,9 +297,39 @@ impl EuddraftLaunch {
         ))
     }
 
+    pub fn frozen_executable(&self) -> Result<&Path, String> {
+        match self {
+            Self::Executable(path)
+                if path.is_file()
+                    && path.file_name().is_some_and(|name| {
+                        name.to_string_lossy().eq_ignore_ascii_case("euddraft.exe")
+                    }) =>
+            {
+                Ok(path)
+            }
+            Self::Executable(path) => Err(format!(
+                "설정 경로가 frozen euddraft.exe를 가리키지 않습니다: {}",
+                path.display()
+            )),
+            Self::SourceRepository { .. } => Err(
+                "직접 Python 실행에는 소스 저장소가 아닌 frozen euddraft.exe가 필요합니다."
+                    .to_string(),
+            ),
+        }
+    }
+
+    pub fn frozen_fingerprint(&self) -> Result<String, String> {
+        crate::bootstrap::sha256_file(self.frozen_executable()?)
+            .map_err(|error| format!("frozen euddraft.exe 지문을 계산하지 못했습니다: {error}"))
+    }
+
     fn command(&self, eds_path: &Path) -> Result<Command, String> {
         let mut command = match self {
-            Self::Executable(executable) => Command::new(executable),
+            Self::Executable(executable) => {
+                let mut command = Command::new(executable);
+                configure_frozen_euddraft_environment(&mut command);
+                command
+            }
             Self::SourceRepository { uv, root, script } => {
                 let mut command = Command::new(uv);
                 command
@@ -318,8 +350,143 @@ impl EuddraftLaunch {
         eds_path: &Path,
         timeout: Duration,
     ) -> Result<CapturedProcess, String> {
-        run_process(self.command(eds_path)?, eds_path, timeout)
+        self.run_with_cancellation(eds_path, timeout, None)
     }
+
+    pub(crate) fn run_with_cancellation(
+        &self,
+        eds_path: &Path,
+        timeout: Duration,
+        cancellation: Option<&ProcessCancellation>,
+    ) -> Result<CapturedProcess, String> {
+        run_process(self.command(eds_path)?, eds_path, timeout, cancellation)
+    }
+}
+
+fn configure_frozen_euddraft_environment(command: &mut Command) {
+    command.env_clear();
+    for key in ["SystemRoot", "WINDIR", "TEMP", "TMP"] {
+        if let Some(value) = std::env::var_os(key) {
+            command.env(key, value);
+        }
+    }
+    command
+        .env("PYTHONNOUSERSITE", "1")
+        .env("PYTHONDONTWRITEBYTECODE", "1");
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct FrozenPythonIdentity {
+    pub python_abi: String,
+    pub euddraft_fingerprint: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FrozenPythonProbeReport {
+    python_abi: String,
+    imported: Vec<String>,
+}
+
+/// Execute a real plugin inside the configured frozen runtime. With an environment,
+/// every importable top-level module advertised by the locked distributions is imported.
+pub fn probe_frozen_python(
+    project: &NativeProject,
+    euddraft: &EuddraftLaunch,
+    probe_root: &Path,
+    site_packages: Option<&Path>,
+    package_names: &[String],
+    cancellation: Option<&ProcessCancellation>,
+) -> Result<FrozenPythonIdentity, String> {
+    let executable = euddraft.frozen_executable()?;
+    let fingerprint = crate::bootstrap::sha256_file(executable)
+        .map_err(|error| format!("frozen euddraft.exe 지문을 계산하지 못했습니다: {error}"))?;
+    fs::create_dir_all(probe_root).map_err(stringify_io)?;
+    let report_path = probe_root.join("python-probe.json");
+    let output_map = probe_root.join("python-probe.scx");
+    let script_path = probe_root.join("PythonRuntimeProbe.py");
+    let eds_path = probe_root.join("python-runtime-probe.eds");
+    let source_map = project.source_map_path()?;
+    let site_json = match site_packages {
+        Some(path) => serde_json::to_string(&path.to_string_lossy().into_owned())
+            .map_err(|error| error.to_string())?,
+        None => "None".to_string(),
+    };
+    let report_json =
+        serde_json::to_string(&report_path.to_string_lossy()).map_err(|error| error.to_string())?;
+    let packages_json = serde_json::to_string(package_names).map_err(|error| error.to_string())?;
+    let script = format!(
+        r#"import importlib
+import importlib.metadata
+import json
+import pathlib
+import re
+import sys
+
+sys.dont_write_bytecode = True
+site_packages = {site_json}
+if site_packages is not None and site_packages not in sys.path:
+    sys.path.insert(0, site_packages)
+wanted = {{re.sub(r"[-_.]+", "-", name).lower() for name in {packages_json}}}
+imported = []
+if wanted:
+    installed = {{
+        re.sub(r"[-_.]+", "-", distribution.metadata["Name"]).lower()
+        for distribution in importlib.metadata.distributions(path=[site_packages])
+    }}
+    missing = sorted(wanted - installed)
+    if missing:
+        raise RuntimeError("잠금 패키지 메타데이터가 설치 환경에 없습니다: " + ", ".join(missing))
+    for module, distributions in sorted(importlib.metadata.packages_distributions().items()):
+        normalized = {{re.sub(r"[-_.]+", "-", name).lower() for name in distributions}}
+        if wanted.intersection(normalized):
+            importlib.import_module(module)
+            imported.append(module)
+tag = sys.implementation.cache_tag
+if not isinstance(tag, str) or not tag.startswith("cpython-"):
+    raise RuntimeError("지원되는 CPython ABI 태그를 확인할 수 없습니다.")
+python_abi = "cp" + tag.removeprefix("cpython-")
+pathlib.Path({report_json}).write_text(
+    json.dumps({{"python_abi": python_abi, "imported": imported}}, sort_keys=True),
+    encoding="utf-8",
+)
+"#
+    );
+    write_atomic_bytes(&script_path, script.as_bytes()).map_err(|error| error.to_string())?;
+    let eds = format!(
+        "[main]\ninput: {}\noutput: {}\n\n[PythonRuntimeProbe.py]\n",
+        path_text(&source_map).replace('\\', "/"),
+        path_text(&output_map).replace('\\', "/")
+    );
+    write_atomic_bytes(&eds_path, eds.as_bytes()).map_err(|error| error.to_string())?;
+    let captured = euddraft.run_with_cancellation(&eds_path, PYTHON_PROBE_TIMEOUT, cancellation)?;
+    if !captured.success {
+        return Err(format!(
+            "frozen euddraft Python 호환성 검사가 실패했습니다 (종료 코드 0x{:08X}): {}",
+            captured.raw_status,
+            joined_output(&captured.stdout, &captured.stderr)
+        ));
+    }
+    let report: FrozenPythonProbeReport = serde_json::from_slice(
+        &fs::read(&report_path)
+            .map_err(|error| format!("frozen Python 검사 결과를 읽지 못했습니다: {error}"))?,
+    )
+    .map_err(|error| format!("frozen Python 검사 결과가 올바르지 않습니다: {error}"))?;
+    if !package_names.is_empty() && report.imported.is_empty() {
+        return Err("설치된 Python 의존성에서 가져올 모듈을 찾지 못했습니다.".to_string());
+    }
+    if !report.python_abi.starts_with("cp")
+        || !report.python_abi[2..]
+            .bytes()
+            .all(|byte| byte.is_ascii_digit())
+    {
+        return Err("frozen Python ABI 결과가 올바르지 않습니다.".to_string());
+    }
+    Ok(FrozenPythonIdentity {
+        python_abi: report.python_abi,
+        euddraft_fingerprint: fingerprint,
+    })
 }
 
 pub fn sync_compat_assets(source: &Path, destination: &Path) -> Result<usize, String> {
@@ -380,14 +547,22 @@ pub fn generate_native_build(
     project: &NativeProject,
     compat_root: &Path,
 ) -> Result<NativeBuildArtifacts, String> {
+    generate_native_build_with_python(project, compat_root, None)
+}
+
+pub fn generate_native_build_with_python(
+    project: &NativeProject,
+    compat_root: &Path,
+    python_site_packages: Option<&Path>,
+) -> Result<NativeBuildArtifacts, String> {
     let catalog = DatCatalog::load(compat_root)?;
     let build_dir = project.root().join("build/euddraft");
     fs::create_dir_all(&build_dir).map_err(stringify_io)?;
 
     let data_editor = generate_data_editor(project.dat(), &catalog)?;
     let data_editor_path = build_dir.join("DataEditor.py");
-    let data_editor_output = if data_editor.is_some() {
-        write_atomic_bytes(&data_editor_path, data_editor.as_ref().unwrap().as_bytes())
+    let data_editor_output = if let Some(data_editor) = &data_editor {
+        write_atomic_bytes(&data_editor_path, data_editor.as_bytes())
             .map_err(|error| error.to_string())?;
         Some(path_text(&data_editor_path))
     } else {
@@ -419,12 +594,9 @@ pub fn generate_native_build(
     let extra_editor =
         generate_extra_data_editor(project.dat(), &catalog, requirement_artifacts.as_ref())?;
     let extra_editor_path = build_dir.join("ExtraDataEditor.py");
-    let extra_editor_output = if extra_editor.is_some() {
-        write_atomic_bytes(
-            &extra_editor_path,
-            extra_editor.as_ref().unwrap().as_bytes(),
-        )
-        .map_err(|error| error.to_string())?;
+    let extra_editor_output = if let Some(extra_editor) = &extra_editor {
+        write_atomic_bytes(&extra_editor_path, extra_editor.as_bytes())
+            .map_err(|error| error.to_string())?;
         Some(path_text(&extra_editor_path))
     } else {
         fs::remove_file(&extra_editor_path).ok();
@@ -443,15 +615,42 @@ pub fn generate_native_build(
         Some(path_text(&custom_tbl_path))
     };
 
+    let python_bootstrap_path = build_dir.join("PythonPath.py");
+    let mut python_search_paths = Vec::new();
+    if !project.manifest().python_entrypoints.is_empty() {
+        python_search_paths.push(path_text(
+            &fs::canonicalize(project.root().join("src")).map_err(stringify_io)?,
+        ));
+    }
+    if let Some(site_packages) = python_site_packages {
+        python_search_paths.push(path_text(site_packages));
+    }
+    let python_path_bootstrap = if python_search_paths.is_empty() {
+        fs::remove_file(&python_bootstrap_path).ok();
+        None
+    } else {
+        let quoted_paths =
+            serde_json::to_string(&python_search_paths).map_err(|error| error.to_string())?;
+        let source = format!(
+            "import importlib.machinery\nimport sys\nsys.dont_write_bytecode = True\n_eud_agent_paths = {quoted_paths}\nclass _EudAgentSourceFinder:\n    @staticmethod\n    def find_spec(fullname, path=None, target=None):\n        if path is not None:\n            return None\n        return importlib.machinery.PathFinder.find_spec(fullname, _eud_agent_paths)\nsys.meta_path.insert(0, _EudAgentSourceFinder)\n"
+        );
+        write_atomic_bytes(&python_bootstrap_path, source.as_bytes())
+            .map_err(|error| error.to_string())?;
+        Some(path_text(&python_bootstrap_path))
+    };
+
     let eds_path = build_dir.join("eud-agent.eds");
     let eds = generate_eds(
         project.root(),
         project.manifest(),
         &eds_path,
-        data_editor_output.is_some(),
-        extra_editor_output.is_some(),
-        custom_tbl.is_some(),
-        wireframe_output.is_some(),
+        GeneratedEdsSections {
+            python_path: python_path_bootstrap.is_some(),
+            data_editor: data_editor_output.is_some(),
+            extra_editor: extra_editor_output.is_some(),
+            custom_tbl: custom_tbl.is_some(),
+            wireframe_editor: wireframe_output.is_some(),
+        },
     )?;
     write_atomic_bytes(&eds_path, eds.as_bytes()).map_err(|error| error.to_string())?;
 
@@ -464,6 +663,7 @@ pub fn generate_native_build(
         extra_data_editor: extra_editor_output,
         custom_tbl,
         wireframe_editor: wireframe_output,
+        python_path_bootstrap,
     })
 }
 
@@ -472,14 +672,78 @@ pub fn run_native_build(
     compat_root: &Path,
     euddraft: &EuddraftLaunch,
 ) -> Result<NativeBuildResult, String> {
-    let artifacts = generate_native_build(project, compat_root)?;
+    run_native_build_with_python(project, compat_root, euddraft, None)
+}
+
+pub fn run_native_build_with_python(
+    project: &NativeProject,
+    compat_root: &Path,
+    euddraft: &EuddraftLaunch,
+    python_site_packages: Option<&Path>,
+) -> Result<NativeBuildResult, String> {
+    run_native_build_with_python_and_cancellation(
+        project,
+        compat_root,
+        euddraft,
+        python_site_packages,
+        None,
+    )
+}
+
+pub fn run_native_build_with_python_and_cancellation(
+    project: &NativeProject,
+    compat_root: &Path,
+    euddraft: &EuddraftLaunch,
+    python_site_packages: Option<&Path>,
+    cancellation: Option<&ProcessCancellation>,
+) -> Result<NativeBuildResult, String> {
+    let has_direct_python = project.has_direct_python()?;
+    if has_direct_python {
+        euddraft.frozen_executable()?;
+    }
+    match (
+        project.manifest().python_lock.as_ref(),
+        python_site_packages,
+    ) {
+        (Some(lock), None) if !lock.packages.is_empty() => {
+            return Err("Python 잠금에 맞는 검증된 의존성 환경이 없습니다.".to_string());
+        }
+        (None, Some(_)) => {
+            return Err("Python 잠금 없이 의존성 환경을 빌드에 주입할 수 없습니다.".to_string());
+        }
+        (_, Some(path)) if !path.is_dir() => {
+            return Err("검증된 Python 의존성 환경 디렉터리가 없습니다.".to_string());
+        }
+        _ => {}
+    }
+    let artifacts = generate_native_build_with_python(project, compat_root, python_site_packages)?;
     let eds_path = PathBuf::from(&artifacts.eds_path);
     let output_map = PathBuf::from(&artifacts.output_map);
     let before_output = modified_time(&output_map)?;
-    let captured = euddraft.run(&eds_path, EUDDRAFT_TIMEOUT)?;
+    let captured = euddraft.run_with_cancellation(&eds_path, EUDDRAFT_TIMEOUT, cancellation)?;
     let fresh_output = is_fresh_output(before_output, modified_time(&output_map)?);
-    let mut errors = parse_euddraft_output(&captured.stdout, &captured.stderr);
-    let ok = captured.success && fresh_output;
+    let eds_dir = eds_path
+        .parent()
+        .ok_or_else(|| "EDS path has no parent".to_string())?;
+    Ok(assemble_build_result(
+        captured,
+        fresh_output,
+        artifacts,
+        project.root(),
+        eds_dir,
+    ))
+}
+
+fn assemble_build_result(
+    captured: CapturedProcess,
+    fresh_output: bool,
+    artifacts: NativeBuildArtifacts,
+    project_root: &Path,
+    eds_dir: &Path,
+) -> NativeBuildResult {
+    let mut errors =
+        parse_euddraft_output(&captured.stdout, &captured.stderr, project_root, eds_dir);
+    let ok = captured.success && fresh_output && errors.is_empty();
     if !ok && errors.is_empty() {
         let raw = joined_output(&captured.stdout, &captured.stderr);
         errors.push(NativeBuildError {
@@ -489,20 +753,27 @@ pub fn run_native_build(
             message: if captured.success {
                 "euddraft exited successfully but did not produce a fresh output map".to_string()
             } else if raw.is_empty() {
-                "euddraft failed without diagnostic output".to_string()
+                format!(
+                    "euddraft가 진단 출력 없이 종료되었습니다 (종료 코드 0x{:08X}).",
+                    captured.raw_status
+                )
             } else {
-                "euddraft failed with an unrecognized diagnostic format".to_string()
+                format!(
+                    "euddraft가 인식되지 않는 진단 형식으로 종료되었습니다 (종료 코드 0x{:08X}).",
+                    captured.raw_status
+                )
             },
             raw,
         });
     }
-    Ok(NativeBuildResult {
+    NativeBuildResult {
         ok,
         errors,
+        raw_status: captured.raw_status,
         stdout: captured.stdout,
         stderr: captured.stderr,
         artifacts,
-    })
+    }
 }
 
 fn generate_data_editor(
@@ -753,11 +1024,11 @@ fn generate_extra_data_editor(
     ];
     let wireframe = dat.xdat.tables.get("wireframe");
     let mut output = String::from("from eudplib import *\n");
-    if wireframe.is_some() {
+    if let Some(wireframe) = wireframe {
         output.push_str("import WireFrameDataEditor\n\n");
         output.push_str("def init_wireframe():\n");
         output.push_str("    WireFrameDataEditor.WireFrameInit()\n");
-        for (object_id, fields) in wireframe.unwrap() {
+        for (object_id, fields) in wireframe {
             for (field, change) in fields {
                 let (function, limit) = match field.as_str() {
                     "wire" => ("ChangeWireframe", 228),
@@ -972,14 +1243,20 @@ fn button_bytes(buttons: &[Button]) -> Vec<u8> {
     output
 }
 
+#[derive(Clone, Copy)]
+struct GeneratedEdsSections {
+    python_path: bool,
+    data_editor: bool,
+    extra_editor: bool,
+    custom_tbl: bool,
+    wireframe_editor: bool,
+}
+
 fn generate_eds(
     project_root: &Path,
     manifest: &ProjectManifest,
     eds_path: &Path,
-    has_data_editor: bool,
-    has_extra_editor: bool,
-    has_custom_tbl: bool,
-    has_wireframe_editor: bool,
+    sections: GeneratedEdsSections,
 ) -> Result<String, String> {
     let eds_dir = eds_path
         .parent()
@@ -1009,6 +1286,10 @@ fn generate_eds(
     }
     eds.push_str(&format!("sectorSize: {}\n", manifest.settings.sector_size));
 
+    if sections.python_path {
+        eds.push_str("\n[PythonPath.py]\n");
+    }
+
     for plugin in &manifest.plugins {
         if let Some(raw_text) = &plugin.raw_text {
             eds.push('\n');
@@ -1024,17 +1305,21 @@ fn generate_eds(
             }
         }
     }
-    if has_data_editor {
+    if sections.data_editor {
         eds.push_str("\n[DataEditor.py]\n");
     }
-    if has_wireframe_editor {
+    if sections.wireframe_editor {
         eds.push_str("\n[WireFrameDataEditor.eps]\n");
     }
-    if has_extra_editor {
+    if sections.extra_editor {
         eds.push_str("\n[ExtraDataEditor.py]\n");
     }
-    if has_custom_tbl {
+    if sections.custom_tbl {
         eds.push_str("\n[dataDumper]\ncustom_txt.tbl: 0x6D5A30, copy\n");
+    }
+    for entrypoint in &manifest.python_entrypoints {
+        let entrypoint = relative_path(eds_dir, &project_root.join(path_to_os(entrypoint)))?;
+        eds.push_str(&format!("\n[{entrypoint}]\n"));
     }
     eds.push_str(&format!("\n[{main}]\n"));
     Ok(eds)
@@ -1477,6 +1762,7 @@ fn read_u32(cursor: &mut Cursor<&[u8]>) -> Result<u32, String> {
 #[derive(Debug)]
 pub(crate) struct CapturedProcess {
     pub(crate) success: bool,
+    pub(crate) raw_status: u32,
     pub(crate) stdout: String,
     pub(crate) stderr: String,
 }
@@ -1485,50 +1771,39 @@ fn run_process(
     mut command: Command,
     eds_path: &Path,
     timeout: Duration,
+    cancellation: Option<&ProcessCancellation>,
 ) -> Result<CapturedProcess, String> {
     let cwd = eds_path
         .parent()
-        .ok_or_else(|| "EDS path has no parent".to_string())?;
-    command
-        .current_dir(cwd)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        command.creation_flags(0x08000000);
-    }
-    let mut child = command
-        .spawn()
-        .map_err(|error| format!("failed to start euddraft: {error}"))?;
-    let started = Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) if started.elapsed() < timeout => thread::sleep(PROCESS_POLL_INTERVAL),
-            Ok(None) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(format!(
-                    "euddraft did not finish within {}s",
-                    timeout.as_secs()
-                ));
-            }
-            Err(error) => return Err(format!("failed to poll euddraft: {error}")),
+        .ok_or_else(|| "EDS 경로에 상위 디렉터리가 없습니다.".to_string())?;
+    command.current_dir(cwd);
+    let output = run_process_tree(command, timeout, cancellation)?;
+    let raw_status = match output.end {
+        ProcessEnd::Exited(code) => code,
+        ProcessEnd::TimedOut => {
+            return Err(format!(
+                "euddraft가 {}초 안에 끝나지 않아 프로세스 트리를 종료했습니다.",
+                timeout.as_secs()
+            ))
         }
-    }
-    let output = child
-        .wait_with_output()
-        .map_err(|error| format!("failed to collect euddraft output: {error}"))?;
+        ProcessEnd::Cancelled => {
+            return Err("euddraft 실행이 취소되어 프로세스 트리를 종료했습니다.".to_string())
+        }
+    };
     Ok(CapturedProcess {
-        success: output.status.success(),
-        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        success: raw_status == 0,
+        raw_status,
+        stdout: output.stdout_lossy(),
+        stderr: output.stderr_lossy(),
     })
 }
 
-fn parse_euddraft_output(stdout: &str, stderr: &str) -> Vec<NativeBuildError> {
+fn parse_euddraft_output(
+    stdout: &str,
+    stderr: &str,
+    project_root: &Path,
+    eds_dir: &Path,
+) -> Vec<NativeBuildError> {
     let combined = joined_output(stdout, stderr);
     let mut errors = Vec::new();
     for line in combined.lines() {
@@ -1536,7 +1811,7 @@ fn parse_euddraft_output(stdout: &str, stderr: &str) -> Vec<NativeBuildError> {
         if let Some((file, rest)) = parse_python_file_line(trimmed) {
             errors.push(NativeBuildError {
                 source: "euddraft".to_string(),
-                file,
+                file: normalize_traceback_file(&file, project_root, eds_dir),
                 line: rest.0,
                 message: rest.1.clone(),
                 raw: trimmed.to_string(),
@@ -1593,6 +1868,60 @@ fn parse_python_file_line(line: &str) -> Option<(String, (u64, String))> {
     Some((file, (line_number, "euddraft source error".to_string())))
 }
 
+fn normalize_traceback_file(file: &str, project_root: &Path, eds_dir: &Path) -> String {
+    let original = Path::new(file);
+    let resolved = if original.is_relative() {
+        fs::canonicalize(eds_dir.join(original)).ok()
+    } else {
+        fs::canonicalize(original).ok()
+    };
+    let canonical_root = fs::canonicalize(project_root).ok();
+    let path = resolved.as_deref().unwrap_or(original);
+    let root = canonical_root.as_deref().unwrap_or(project_root);
+    if let Ok(relative) = path.strip_prefix(root) {
+        let components = relative.components().collect::<Vec<_>>();
+        if !components.is_empty()
+            && components
+                .iter()
+                .all(|component| matches!(component, Component::Normal(_)))
+        {
+            return components
+                .iter()
+                .filter_map(|component| match component {
+                    Component::Normal(value) => Some(value.to_string_lossy().into_owned()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("/");
+        }
+    }
+    let root_components = root.components().collect::<Vec<_>>();
+    let path_components = path.components().collect::<Vec<_>>();
+    if path_components.len() >= root_components.len()
+        && root_components
+            .iter()
+            .zip(&path_components)
+            .all(|(root, path)| {
+                root.as_os_str()
+                    .to_string_lossy()
+                    .eq_ignore_ascii_case(&path.as_os_str().to_string_lossy())
+            })
+    {
+        let relative = path_components[root_components.len()..]
+            .iter()
+            .filter_map(|component| match component {
+                Component::Normal(value) => Some(value.to_string_lossy().into_owned()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("/");
+        if !relative.is_empty() {
+            return relative;
+        }
+    }
+    file.to_string()
+}
+
 fn joined_output(stdout: &str, stderr: &str) -> String {
     match (stdout.trim(), stderr.trim()) {
         ("", "") => String::new(),
@@ -1633,6 +1962,7 @@ mod tests {
         DatScalar, DatTarget, EdsPlugin, NativeDatChange, NativeDatPatch, ProjectManifest,
         ProjectSettings,
     };
+    use std::collections::HashMap;
 
     fn compat_root() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("resources/eud-editor-compat")
@@ -1654,7 +1984,7 @@ mod tests {
     fn project(tag: &str) -> (PathBuf, NativeProject) {
         let root = root(tag);
         let manifest = ProjectManifest {
-            schema_version: 1,
+            schema_version: crate::native_project::PROJECT_SCHEMA_VERSION,
             name: "Build Demo".to_string(),
             source_map: "maps/source.scx".to_string(),
             output_map: "build/output.scx".to_string(),
@@ -1665,6 +1995,9 @@ mod tests {
                 entries: Vec::new(),
                 raw_text: None,
             }],
+            python_entrypoints: Vec::new(),
+            python_dependencies: Vec::new(),
+            python_lock: None,
             editor_compatibility: None,
         };
         let created = NativeProject::create(&root, manifest).unwrap();
@@ -1743,6 +2076,153 @@ mod tests {
         let decoded = decode_tbl(&encoded).unwrap();
         assert!(decoded[0].starts_with("정예 해병"));
     }
+    fn synthetic_artifacts(root: &Path) -> NativeBuildArtifacts {
+        NativeBuildArtifacts {
+            build_dir: path_text(&root.join("build/euddraft")),
+            wireframe_editor: None,
+            requirement_file: None,
+            eds_path: path_text(&root.join("build/euddraft/test.eds")),
+            output_map: path_text(&root.join("build/output.scx")),
+            data_editor: None,
+            extra_data_editor: None,
+            custom_tbl: None,
+            python_path_bootstrap: None,
+        }
+    }
+
+    #[test]
+    fn build_result_rejects_traceback_even_with_zero_exit_and_fresh_output() {
+        let root = std::env::temp_dir().join("eud-agent-build-result-classification");
+        let eds_dir = root.join("build/euddraft");
+        fs::create_dir_all(&eds_dir).unwrap();
+        let result = assemble_build_result(
+            CapturedProcess {
+                success: true,
+                raw_status: 0,
+                stdout: String::new(),
+                stderr: format!(
+                    "Traceback (most recent call last):\n  File \"{}\", line 7, in <module>\nRuntimeError: boom",
+                    root.join("src/direct.py").display()
+                ),
+            },
+            true,
+            synthetic_artifacts(&root),
+            &root,
+            &eds_dir,
+        );
+        assert!(!result.ok);
+        assert!(!result.errors.is_empty());
+        assert_eq!(result.raw_status, 0);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn build_result_rejects_zero_exit_without_fresh_output() {
+        let root = std::env::temp_dir().join("eud-agent-build-result-stale-output");
+        let eds_dir = root.join("build/euddraft");
+        fs::create_dir_all(&eds_dir).unwrap();
+        let result = assemble_build_result(
+            CapturedProcess {
+                success: true,
+                raw_status: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            },
+            false,
+            synthetic_artifacts(&root),
+            &root,
+            &eds_dir,
+        );
+        assert!(!result.ok);
+        assert!(result.errors[0].message.contains("fresh output"));
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn frozen_euddraft_environment_drops_ambient_python_configuration() {
+        let mut command = Command::new("euddraft.exe");
+        command
+            .env("PYTHONPATH", "hostile")
+            .env("PYTHONHOME", "hostile")
+            .env("PYTHONUSERBASE", "hostile");
+        configure_frozen_euddraft_environment(&mut command);
+        let configured = command
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.map(|value| value.to_os_string()),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        assert!(!configured.contains_key("PYTHONPATH"));
+        assert!(!configured.contains_key("PYTHONHOME"));
+        assert!(!configured.contains_key("PYTHONUSERBASE"));
+        assert_eq!(
+            configured
+                .get("PYTHONNOUSERSITE")
+                .and_then(Option::as_ref)
+                .map(|value| value.as_os_str()),
+            Some(std::ffi::OsStr::new("1"))
+        );
+    }
+
+    #[test]
+    fn traceback_files_under_project_are_project_relative_and_external_paths_survive() {
+        let root = std::env::temp_dir().join("eud-agent-traceback-root");
+        let internal = root.join("src/feature.py");
+        let eds_dir = root.join("build/euddraft");
+        fs::create_dir_all(internal.parent().unwrap()).unwrap();
+        fs::create_dir_all(&eds_dir).unwrap();
+        fs::write(&internal, b"pass\n").unwrap();
+        let external = std::env::temp_dir().join("external-package/module.py");
+        let stderr = format!(
+            "  File \"{}\", line 17, in feature\n  File \"../../src/feature.py\", line 18, in feature\n  File \"{}\", line 4, in helper\n",
+            internal.display(),
+            external.display(),
+        );
+        let errors = parse_euddraft_output("", &stderr, &root, &eds_dir);
+        assert_eq!(errors.len(), 3);
+        assert_eq!(errors[0].file, "src/feature.py");
+        assert_eq!(errors[1].file, "src/feature.py");
+        assert_eq!(errors[2].file, external.to_string_lossy().as_ref());
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn dependency_bootstrap_precedes_plugins_and_ordered_python_entrypoints() {
+        let (root, project) = project("python-order");
+        let mut manifest = project.manifest().clone();
+        manifest.python_entrypoints =
+            vec!["src/bootstrap.py".to_string(), "src/feature.py".to_string()];
+        let eds_path = root.join("build/euddraft/eud-agent.eds");
+        let eds = generate_eds(
+            &root,
+            &manifest,
+            &eds_path,
+            GeneratedEdsSections {
+                python_path: true,
+                data_editor: true,
+                extra_editor: false,
+                custom_tbl: false,
+                wireframe_editor: false,
+            },
+        )
+        .unwrap();
+        let python_path = eds.find("[PythonPath.py]").unwrap();
+        let plugin = eds.find("[eudTurbo]").unwrap();
+        let generated = eds.find("[DataEditor.py]").unwrap();
+        let bootstrap = eds.find("[../../src/bootstrap.py]").unwrap();
+        let feature = eds.find("[../../src/feature.py]").unwrap();
+        let main = eds.find("[../../src/main.eps]").unwrap();
+        assert!(python_path < plugin);
+        assert!(plugin < generated);
+        assert!(generated < bootstrap);
+        assert!(bootstrap < feature);
+        assert!(feature < main);
+        fs::remove_dir_all(root).ok();
+    }
+
     #[test]
     #[ignore = "requires EUD_AGENT_EUDDRAFT and EUD_AGENT_BUILD_MAP"]
     fn real_euddraft_builds_generated_native_project() {
@@ -1759,13 +2239,16 @@ mod tests {
         let mut project = NativeProject::create(
             &root,
             ProjectManifest {
-                schema_version: 1,
+                schema_version: crate::native_project::PROJECT_SCHEMA_VERSION,
                 name: "Native Real Build".to_string(),
                 source_map: "maps/source.scx".to_string(),
                 output_map: "build/output.scx".to_string(),
                 main_file: "src/main.eps".to_string(),
                 settings: ProjectSettings::default(),
                 plugins: Vec::new(),
+                python_entrypoints: Vec::new(),
+                python_dependencies: Vec::new(),
+                python_lock: None,
                 editor_compatibility: None,
             },
         )
@@ -1773,6 +2256,26 @@ mod tests {
         project
             .write_source("src/main.eps", "function onPluginStart() {}\n")
             .unwrap();
+        project
+            .create_source(
+                "src/helper.py",
+                "from eudplib import *\n\ndef emit():\n    DoActions(SetMemory(0x58F500, SetTo, 1))\n",
+            )
+            .unwrap();
+        project
+            .create_source(
+                "src/direct.py",
+                "from eudplib import *\nimport helper\n\ndef onPluginStart():\n    helper.emit()\n\ndef beforeTriggerExec():\n    pass\n\ndef afterTriggerExec():\n    pass\n",
+            )
+            .unwrap();
+        let mut manifest = project.manifest().clone();
+        manifest.python_entrypoints = vec!["src/direct.py".to_string()];
+        write_atomic_bytes(
+            project.manifest_path(),
+            &serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        project = NativeProject::open(&root).unwrap();
         let target = DatTarget::Dat {
             dat: "units".to_string(),
             object_id: 0,
@@ -1800,6 +2303,11 @@ mod tests {
 
         assert!(result.ok, "{:?}", result.errors);
         assert!(root.join("build/output.scx").is_file());
+        let eds = fs::read_to_string(&result.artifacts.eds_path).unwrap();
+        assert!(
+            eds.find("[../../src/direct.py]").unwrap() < eds.find("[../../src/main.eps]").unwrap()
+        );
+        assert!(!eds.contains("helper.py]"));
         fs::remove_dir_all(root).ok();
     }
 }

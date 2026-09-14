@@ -39,6 +39,49 @@ pub struct AntigravityCredential {
     pub project_id: String,
 }
 
+#[derive(Clone)]
+pub(crate) struct AntigravityAuthHandle {
+    source: AntigravityCredentialSource,
+}
+
+#[derive(Clone)]
+enum AntigravityCredentialSource {
+    Stored(crate::config::DataDirs),
+    #[cfg(test)]
+    Fixed(AntigravityCredential),
+}
+
+impl AntigravityAuthHandle {
+    pub(crate) fn new(dirs: crate::config::DataDirs) -> Self {
+        Self {
+            source: AntigravityCredentialSource::Stored(dirs),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fixed(credential: AntigravityCredential) -> Self {
+        Self {
+            source: AntigravityCredentialSource::Fixed(credential),
+        }
+    }
+
+    pub(crate) async fn current(&self) -> Result<AntigravityCredential, String> {
+        match &self.source {
+            AntigravityCredentialSource::Stored(dirs) => access_credential(dirs).await,
+            #[cfg(test)]
+            AntigravityCredentialSource::Fixed(credential) => Ok(credential.clone()),
+        }
+    }
+
+    pub(crate) async fn refresh(&self) -> Result<AntigravityCredential, String> {
+        match &self.source {
+            AntigravityCredentialSource::Stored(dirs) => force_refresh(dirs).await,
+            #[cfg(test)]
+            AntigravityCredentialSource::Fixed(credential) => Ok(credential.clone()),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AntigravityStatus {
     pub availability: ProviderAvailability,

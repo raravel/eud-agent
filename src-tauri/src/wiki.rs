@@ -1,15 +1,15 @@
 //! Per-project dat-edit WIKI: a last-value ledger of dat-editor edits the agent
-//! applied (via GETDAT/SETDAT) and the user APPROVED.
+//! applied through `dat_patch` and the user APPROVED.
 //!
 //! Purpose: later work (including trigger edits) can read the LAST applied
 //! unit/weapon/flingy/etc stat values so the agent does not confuse them. SCOPE is
 //! the dat-editor tables ONLY (dat/xdat/tbl/req/btn). The original `.scx` map
 //! (locations/players via mapsafe/isom) is OUT OF SCOPE — never recorded here.
 //!
-//! On-disk: `%appdata%\eud-agent\memory\<sanitized-project>\wiki\ledger.json`, written
-//! UTF-8 **without BOM** via the shared atomic temp+rename (rules.md). The store reuses
-//! [`crate::memory::sanitize_project_name`]/[`crate::memory::write_atomic_bytes`] so the
-//! ledger lands beside the project's memory dir with identical write semantics.
+//! On-disk: `<project>/.eud-agent/memory/wiki/ledger.json`, resolved from the
+//! validated native project root rather than a sanitized display name. Writes
+//! use UTF-8 **without BOM** and [`crate::memory::write_atomic_bytes`] beside
+//! the project's memory files.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -443,6 +443,18 @@ fn dat_table_slug(table: crate::journal::DatTable) -> &'static str {
 
 fn read_ledger(dir: &Path) -> Ledger {
     let path = dir.join(LEDGER_FILE);
+    if crate::memory::validate_existing_components(dir).is_err() {
+        return Ledger::default();
+    }
+    let Ok(metadata) = fs::symlink_metadata(&path) else {
+        return Ledger::default();
+    };
+    if !metadata.is_file()
+        || metadata.file_type().is_symlink()
+        || crate::memory::is_reparse_point(&metadata)
+    {
+        return Ledger::default();
+    }
     let Ok(bytes) = fs::read(&path) else {
         return Ledger::default();
     };

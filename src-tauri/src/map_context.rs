@@ -116,7 +116,10 @@ impl MapContextService {
 
     fn current_source(&self) -> Result<(String, PathBuf), String> {
         let project = crate::native_runtime::NativeProjectManager::new(self.dirs.clone()).open()?;
-        let project_id = project_id_for_path(project.root().join("project.json"));
+        // Keep the historical project identity key (root/project.json) even though the
+        // canonical manifest is now `.eap`; changing this hash would orphan map sessions,
+        // selections, and imported stamps already persisted for the project.
+        let project_id = project_id_for_path(project.root().to_path_buf());
         Ok((project_id, project.source_map_path()?))
     }
 
@@ -158,10 +161,11 @@ impl MapContextService {
     }
 }
 
-fn project_id_for_path(project_path: PathBuf) -> String {
-    let project_identity = project_path
+pub(crate) fn project_id_for_path(project_root: PathBuf) -> String {
+    let project_identity = project_root
+        .join(crate::native_project::LEGACY_PROJECT_MANIFEST_FILE)
         .canonicalize()
-        .unwrap_or(project_path)
+        .unwrap_or_else(|_| project_root.join(crate::native_project::LEGACY_PROJECT_MANIFEST_FILE))
         .to_string_lossy()
         .to_lowercase();
     hex_sha256(project_identity.as_bytes())

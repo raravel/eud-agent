@@ -600,13 +600,15 @@ impl ProviderService {
         match provider {
             ProviderId::Codex => {
                 let _guard = self.inner.codex_lock.lock().await;
+                let launch = crate::codex_client::resolve_codex_launch_config(&self.inner.dirs)
+                    .map_err(|_| "provider_catalog_unavailable".to_string())?;
                 let (mut client, _events) =
                     crate::codex_client::CodexAppServerClient::spawn_app_server(
                         self.inner.dirs.codex_workspace_dir(),
-                        &self.inner.dirs,
+                        &launch,
                         None,
-                        crate::codex_client::WorkspaceAccess::Read,
-                        None,
+                        crate::provider_runtime::WorkspaceAccess::Read,
+                        true,
                     )
                     .await
                     .map_err(|_| "provider_catalog_unavailable".to_string())?;

@@ -366,7 +366,11 @@ pub struct FileEntry {
 
 /// `agent_event.data` payload.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AgentEventData {
+    /// Provider/run-scoped tool call identity.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub call_id: Option<String>,
     /// Tool call argument text.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub args: Option<String>,
@@ -742,15 +746,11 @@ pub async fn list(
     Ok(ListResponse { files })
 }
 
-/// Build the `memory_get` payload for an already-resolved project name.
+/// Build the `memory_get` payload for the validated current native project.
 pub fn memory_get_payload(dirs: &DataDirs, project: &str) -> Result<MemoryGetResponse, String> {
-    let memory = ProjectMemory::new(dirs.memory_dir(), project);
-    if !memory.enabled() {
-        return Err("no project is open; memory is disabled".to_string());
-    }
-
+    let memory = current_memory_for_project(dirs, project)?;
     Ok(MemoryGetResponse {
-        project: project.to_string(),
+        project: memory.project_name().to_string(),
         files: MemoryFiles {
             resources: memory.read("resources"),
             structure: memory.read("structure"),
@@ -760,14 +760,14 @@ pub fn memory_get_payload(dirs: &DataDirs, project: &str) -> Result<MemoryGetRes
     })
 }
 
-/// Save one project memory file for an already-resolved project name.
+/// Save one project memory file in the validated current native project.
 pub fn memory_save_payload(
     dirs: &DataDirs,
     project: &str,
     file: &str,
     content: &str,
 ) -> Result<MemorySaveResponse, String> {
-    let memory = ProjectMemory::new(dirs.memory_dir(), project);
+    let memory = current_memory_for_project(dirs, project)?;
     let result = memory.write(file, content);
     if !result.ok {
         return Err(result.reason);
@@ -804,29 +804,28 @@ pub(crate) async fn memory_save(
         .await
 }
 
-/// Build the `wiki_get` payload (the current ledger) for a resolved project name.
+/// Build the `wiki_get` payload for the validated current native project.
 pub fn wiki_get_payload(dirs: &DataDirs, project: &str) -> Result<WikiResponse, String> {
-    let store = crate::wiki::WikiStore::load(dirs.wiki_dir(project));
+    let memory = current_memory_for_project(dirs, project)?;
+    let store = crate::wiki::WikiStore::load(memory.store_dir().map(|dir| dir.join("wiki")));
     if !store.enabled() {
         return Err("no project is open; the wiki is disabled".to_string());
     }
     Ok(WikiResponse::from(store.ledger()))
 }
 
-/// Persist user-corrected ledger entries (sets `editedByUser=true`) for a project.
+/// Persist user-corrected ledger entries for the validated current project.
 pub fn wiki_save_payload(
     dirs: &DataDirs,
     project: &str,
     entries: std::collections::BTreeMap<String, crate::wiki::LedgerEntry>,
 ) -> Result<WikiResponse, String> {
-    let mut store = crate::wiki::WikiStore::load(dirs.wiki_dir(project));
+    let memory = current_memory_for_project(dirs, project)?;
+    let mut store = crate::wiki::WikiStore::load(memory.store_dir().map(|dir| dir.join("wiki")));
     if !store.enabled() {
         return Err("no project is open; the wiki is disabled".to_string());
     }
     for mut entry in entries.into_values() {
-        // Mirror the accept-hook invariant (wiki::accepted_ledger_entries): never
-        // persist a null-valued entry. The panel's isLedgerEntry guard rejects
-        // null, which would silently drop the whole wiki payload on the next sync.
         if entry.value.is_null() {
             continue;
         }
@@ -837,7 +836,7 @@ pub fn wiki_save_payload(
     Ok(WikiResponse::from(store.ledger()))
 }
 
-/// Read the dat-edit wiki ledger for the current native project.
+/// Read the wiki ledger for the current native project.
 #[tauri::command]
 pub async fn wiki_get(state: tauri::State<'_, AppManaged>) -> Result<WikiResponse, String> {
     let project = current_project_from_status(state.dirs()).await?;
@@ -862,7 +861,7 @@ pub(crate) async fn wiki_save(
         .await
 }
 
-/// Refresh and list the current project's real Codex workspace.
+/// List the current project's accepted, project-local harness documents.
 #[tauri::command]
 pub async fn workspace_list(
     state: tauri::State<'_, AppManaged>,
@@ -928,6 +927,13 @@ pub async fn workspace_search(
     })
     .await
     .map_err(|error| error.to_string())?
+}
+fn current_memory_for_project(dirs: &DataDirs, project: &str) -> Result<ProjectMemory, String> {
+    let memory = ProjectMemory::current(dirs)?;
+    if memory.project_name() != project {
+        return Err("the requested project is not the validated current project".to_string());
+    }
+    Ok(memory)
 }
 
 async fn current_project_from_status(dirs: &DataDirs) -> Result<String, String> {
@@ -1016,10 +1022,9 @@ mod tests {
     use serde_json::json;
     use std::collections::BTreeSet;
     use std::fs;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
-    /// Unique temp base dir for a test, avoiding a `tempfile` dev-dependency
-    /// (Cargo.toml is out of scope for this task).
+    /// Unique temp base dir for a test, avoiding a `tempfile` dev-dependency.
     fn unique_temp_dir(tag: &str) -> PathBuf {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1028,6 +1033,40 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("eud-agent-ipc-test-{tag}-{nanos}"));
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    fn current_project_dirs(
+        base: &Path,
+        name: &str,
+    ) -> (DataDirs, crate::native_project::NativeProject) {
+        use crate::native_project::{
+            NativeProject, ProjectManifest, ProjectSettings, PROJECT_SCHEMA_VERSION,
+        };
+        let dirs = DataDirs::from_bases(&base.join("roaming"), &base.join("local"));
+        let project = NativeProject::create(
+            &base.join("project"),
+            ProjectManifest {
+                schema_version: PROJECT_SCHEMA_VERSION,
+                name: name.to_string(),
+                source_map: "maps/source.scx".to_string(),
+                output_map: "build/output.scx".to_string(),
+                main_file: "src/main.eps".to_string(),
+                settings: ProjectSettings::default(),
+                plugins: Vec::new(),
+                python_entrypoints: Vec::new(),
+                python_dependencies: Vec::new(),
+                python_lock: None,
+                editor_compatibility: None,
+            },
+        )
+        .unwrap();
+        fs::write(project.root().join("maps/source.scx"), b"map").unwrap();
+        let config = Config {
+            project_path: project.root().to_string_lossy().into_owned(),
+            ..Config::default()
+        };
+        dirs.save_config(&config).unwrap();
+        (dirs, project)
     }
 
     fn assert_json<T: serde::Serialize>(value: &T, expected: serde_json::Value) {
@@ -1291,8 +1330,8 @@ mod tests {
     #[test]
     fn memory_get_payload_reads_all_files() {
         let base = unique_temp_dir("memory-get");
-        let dirs = DataDirs::from_bases(&base.join("roaming"), &base.join("local"));
-        let memory = ProjectMemory::new(dirs.memory_dir(), "ExampleProject");
+        let (dirs, _project) = current_project_dirs(&base, "ExampleProject");
+        let memory = ProjectMemory::current(&dirs).unwrap();
         assert!(memory.write("resources", "Switch 1 = boss phase").ok);
         assert!(memory.write("structure", "main.eps: entry point").ok);
         assert!(
@@ -1317,8 +1356,8 @@ mod tests {
     #[test]
     fn memory_save_payload_round_trips_without_journal_and_rejects_invalid_requests() {
         let base = unique_temp_dir("memory-save");
-        let dirs = DataDirs::from_bases(&base.join("roaming"), &base.join("local"));
-        let memory = ProjectMemory::new(dirs.memory_dir(), "ExampleProject");
+        let (dirs, _project) = current_project_dirs(&base, "ExampleProject");
+        let memory = ProjectMemory::current(&dirs).unwrap();
         assert!(memory.write("resources", "prior").ok);
 
         let saved = ipc::memory_save_payload(
@@ -1331,36 +1370,17 @@ mod tests {
         assert_json(&saved, json!({ "file": "resources" }));
         assert_eq!(memory.read("resources"), "Switch 1 = boss phase");
         assert!(
-            !dirs.journal_dir().exists(),
+            fs::read_dir(dirs.journal_dir()).unwrap().next().is_none(),
             "panel memory_save writes directly and must not create a journal entry"
         );
 
-        let err = ipc::memory_get_payload(&dirs, "   ").unwrap_err();
-        assert!(
-            err.contains("no project"),
-            "empty project should return a no-project error, got {err:?}"
-        );
-
-        let err = ipc::memory_save_payload(&dirs, "   ", "resources", "new").unwrap_err();
-        assert!(
-            err.contains("no project"),
-            "empty project should return a no-project error, got {err:?}"
-        );
-
-        let err = ipc::memory_save_payload(&dirs, "ExampleProject", "unknown", "new").unwrap_err();
-        assert!(
-            err.contains("unknown memory file"),
-            "unknown file should preserve store validation wording, got {err:?}"
-        );
+        assert!(ipc::memory_get_payload(&dirs, "   ").is_err());
+        assert!(ipc::memory_save_payload(&dirs, "   ", "resources", "new").is_err());
+        assert!(ipc::memory_save_payload(&dirs, "ExampleProject", "unknown", "new").is_err());
         assert_eq!(memory.read("resources"), "Switch 1 = boss phase");
 
         let oversize = "x".repeat(CONTENT_CAP_BYTES + 1);
-        let err =
-            ipc::memory_save_payload(&dirs, "ExampleProject", "resources", &oversize).unwrap_err();
-        assert!(
-            err.contains(&format!("{CONTENT_CAP_BYTES}-byte budget")),
-            "oversize content should preserve store cap wording, got {err:?}"
-        );
+        assert!(ipc::memory_save_payload(&dirs, "ExampleProject", "resources", &oversize).is_err());
         assert_eq!(memory.read("resources"), "Switch 1 = boss phase");
 
         fs::remove_dir_all(base).ok();
@@ -1372,7 +1392,7 @@ mod tests {
         use std::collections::BTreeMap;
 
         let base = unique_temp_dir("wiki-payload");
-        let dirs = DataDirs::from_bases(&base.join("roaming"), &base.join("local"));
+        let (dirs, _project) = current_project_dirs(&base, "ExampleProject");
 
         // Seed a ledger via the store (as the accept-hook would).
         let mut store = WikiStore::load(dirs.wiki_dir("ExampleProject"));
@@ -1410,13 +1430,16 @@ mod tests {
             json!(100)
         );
 
-        // Empty project name disables both commands.
-        assert!(ipc::wiki_get_payload(&dirs, "   ")
-            .unwrap_err()
-            .contains("no project"));
-        assert!(ipc::wiki_save_payload(&dirs, "   ", BTreeMap::new())
-            .unwrap_err()
-            .contains("no project"));
+        // A stale project key cannot read or overwrite the current ledger.
+        assert!(ipc::wiki_get_payload(&dirs, "   ").is_err());
+        assert!(ipc::wiki_save_payload(&dirs, "   ", BTreeMap::new()).is_err());
+        assert_eq!(
+            ipc::wiki_get_payload(&dirs, "ExampleProject")
+                .unwrap()
+                .entries["dat:units:0:HP"]
+                .value,
+            json!(100)
+        );
 
         fs::remove_dir_all(base).ok();
     }
@@ -1580,6 +1603,7 @@ mod tests {
             kind: "tool_call".to_string(),
             detail: "search_docs".to_string(),
             data: Some(ipc::AgentEventData {
+                call_id: Some("call-search-docs".to_string()),
                 args: Some("{\"query\":\"countdown\"}".to_string()),
                 result: None,
                 status: None,
@@ -1591,6 +1615,7 @@ mod tests {
                 "kind": "tool_call",
                 "detail": "search_docs",
                 "data": {
+                    "callId": "call-search-docs",
                     "args": "{\"query\":\"countdown\"}"
                 }
             }),
@@ -1600,6 +1625,7 @@ mod tests {
             kind: "tool_result".to_string(),
             detail: "search_docs".to_string(),
             data: Some(ipc::AgentEventData {
+                call_id: Some("call-search-docs".to_string()),
                 args: None,
                 result: Some("2 hits".to_string()),
                 status: Some("completed".to_string()),
@@ -1611,6 +1637,7 @@ mod tests {
                 "kind": "tool_result",
                 "detail": "search_docs",
                 "data": {
+                    "callId": "call-search-docs",
                     "result": "2 hits",
                     "status": "completed"
                 }

@@ -26,6 +26,10 @@ pub const DOCS_GET_TOOL: &str = "docs_get";
 pub const SOURCE_SEARCH_TOOL: &str = "source_search";
 /// Read-only epScript candidate preflight tool name.
 pub const EPS_CHECK_TOOL: &str = "eps_check";
+/// Resolve one complete exact direct-Python dependency list into a bounded candidate.
+pub const PYTHON_DEPENDENCIES_PREPARE_TOOL: &str = "python_dependencies_prepare";
+/// Commit a previously prepared direct-Python dependency candidate.
+pub const PYTHON_DEPENDENCIES_SET_TOOL: &str = "python_dependencies_set";
 /// Flow-control tool that records write intent without mutating the project.
 pub const REQUEST_WRITE_WORKSPACE_TOOL: &str = "request_write_workspace";
 /// Flow-control tool that pauses the current turn for structured user input.
@@ -33,6 +37,7 @@ pub const ASK_TOOL: &str = "ask";
 
 /// Maximum admitted non-search tool actions in one user request.
 const MAX_TOOL_ACTIONS: usize = 300;
+const MAX_PYTHON_DEPENDENCY_PREPARATIONS: usize = 4;
 
 /// Maximum admitted documentation searches in one user request.
 const MAX_SEARCH_DOCS_CALLS: usize = 120;
@@ -121,6 +126,9 @@ pub struct RequestState {
     /// Number of admitted build self-fix attempts in this request.
     pub build_fix_attempts: usize,
 
+    /// Number of admitted derived-cache Python dependency preparations.
+    pub python_dependency_prepare_count: usize,
+
     seen_doc_ids: BTreeSet<u64>,
 }
 
@@ -145,6 +153,7 @@ impl RequestState {
             docs_get_documents: 0,
             docs_get_result_bytes: 0,
             build_fix_attempts: 0,
+            python_dependency_prepare_count: 0,
             seen_doc_ids: BTreeSet::new(),
         }
     }
@@ -265,6 +274,15 @@ fn object_array_schema(properties: Value, required: &[&str]) -> Value {
         "type": "array",
         "minItems": 1,
         "items": object_schema(properties, required),
+    })
+}
+
+fn optional_string_array_schema(max_items: usize) -> Value {
+    json!({
+        "type": "array",
+        "minItems": 0,
+        "maxItems": max_items,
+        "items": string_schema(),
     })
 }
 
@@ -501,6 +519,15 @@ pub fn tool_registry() -> Vec<ToolSpec> {
             schema(json!({"files": eps_candidates_schema()}), &["files"]),
         ),
         tool_spec(
+            PYTHON_DEPENDENCIES_PREPARE_TOOL,
+            "Resolve a complete exact direct-Python dependency list without changing project state.",
+            false,
+            schema(
+                json!({"dependencies": optional_string_array_schema(128)}),
+                &["dependencies"],
+            ),
+        ),
+        tool_spec(
             "dat_get",
             "Read one or more DAT field values.",
             false,
@@ -676,6 +703,15 @@ pub fn tool_registry() -> Vec<ToolSpec> {
             schema(json!({"reason": string_schema()}), &["reason"]),
         ),
         tool_spec(
+            PYTHON_DEPENDENCIES_SET_TOOL,
+            "Commit one prepared direct-Python dependency candidate by its opaque token.",
+            true,
+            schema(
+                json!({"candidateToken": string_schema()}),
+                &["candidateToken"],
+            ),
+        ),
+        tool_spec(
             MAP_SOUND_IMPORT_TOOL,
             "Import one request-local audioRef as canonical OGG into the connected saved SCX.",
             true,
@@ -709,7 +745,7 @@ pub fn tool_registry() -> Vec<ToolSpec> {
             schema(
                 json!({
                     "path": string_schema(),
-                    "ftype": enum_string_schema(&["CUIEps", "CUIPy", "RawText"]),
+                    "ftype": enum_string_schema(&["CUIEps", "CUIPy"]),
                     "code": string_schema(),
                 }),
                 &["path", "ftype"],
@@ -1071,194 +1107,208 @@ fn location_state_schema() -> Value {
     )
 }
 
-fn operation_schema(name: &str, mut properties: Value, required: &[&str]) -> Value {
+fn replace_closed_objects_with_property_names(value: &mut Value) {
+    match value {
+        Value::Array(values) => values
+            .iter_mut()
+            .for_each(replace_closed_objects_with_property_names),
+        Value::Object(map) => {
+            for value in map.values_mut() {
+                replace_closed_objects_with_property_names(value);
+            }
+            if map.get("additionalProperties") == Some(&Value::Bool(false)) {
+                let property_names = map
+                    .get("properties")
+                    .and_then(Value::as_object)
+                    .map(|properties| properties.keys().cloned().collect::<Vec<_>>())
+                    .unwrap_or_default();
+                map.remove("additionalProperties");
+                map.insert("propertyNames".to_string(), json!({"enum": property_names}));
+            }
+        }
+        _ => {}
+    }
+}
+
+fn map_operation_leaf(
+    names: &[&str],
+    mut properties: Value,
+    required: &[&str],
+    inherited_properties: &[&str],
+) -> Value {
     properties
         .as_object_mut()
         .expect("map operation properties must be an object")
-        .insert("op".to_string(), json!({"const": name}));
-    object_schema(properties, required)
+        .insert(
+            "op".to_string(),
+            if names.len() == 1 {
+                json!({"const": names[0]})
+            } else {
+                enum_string_schema(names)
+            },
+        );
+    let mut leaf = object_schema(properties, required);
+    replace_closed_objects_with_property_names(&mut leaf);
+    let mut allowed = schema_string_set_from_properties(&leaf);
+    allowed.extend(inherited_properties.iter().map(|name| (*name).to_string()));
+    leaf["propertyNames"] = json!({"enum": allowed});
+    leaf
+}
+
+fn schema_string_set_from_properties(schema: &Value) -> Vec<String> {
+    schema["properties"]
+        .as_object()
+        .expect("map operation properties must be an object")
+        .keys()
+        .cloned()
+        .collect()
 }
 
 fn map_operation_schema() -> Value {
-    json!({
-        "oneOf": [
-            operation_schema(
-                "terrain.set",
-                json!({
-                    "x": u16_schema(),
-                    "y": u16_schema(),
-                    "before": u16_schema(),
-                    "after": u16_schema(),
-                }),
-                &["op", "x", "y", "before", "after"],
-            ),
-            operation_schema(
-                "terrain.rect",
-                json!({
-                    "x": u16_schema(),
-                    "y": u16_schema(),
-                    "width": u16_schema(),
-                    "height": u16_schema(),
-                    "after": u16_schema(),
-                }),
-                &["op", "x", "y", "width", "height", "after"],
-            ),
-            operation_schema(
-                "terrain.blit",
-                json!({
-                    "x": u16_schema(),
-                    "y": u16_schema(),
-                    "tiles": tile_rows_schema(),
-                }),
-                &["op", "x", "y", "tiles"],
-            ),
-            operation_schema(
-                "terrain.isom_brush",
+    let terrain_xy = json!({
+        "type": "object",
+        "properties": {"x": u16_schema(), "y": u16_schema()},
+        "required": ["x", "y"],
+    });
+    let terrain = json!({"allOf": [terrain_xy, {"oneOf": [
+        map_operation_leaf(
+            &["terrain.set"],
+            json!({"before": u16_schema(), "after": u16_schema()}),
+            &["before", "after"],
+            &["x", "y"],
+        ),
+        map_operation_leaf(
+            &["terrain.rect"],
+            json!({"width": u16_schema(), "height": u16_schema(), "after": u16_schema()}),
+            &["width", "height", "after"],
+            &["x", "y"],
+        ),
+        map_operation_leaf(
+            &["terrain.blit"],
+            json!({"tiles": {"$ref": "#/$defs/t"}}),
+            &["tiles"],
+            &["x", "y"],
+        ),
+    ]}]});
+
+    let target_identity = json!({
+        "type": "object",
+        "properties": {
+            "ordinal": u32_schema(),
+            "beforeFingerprint": string_schema(),
+        },
+        "required": ["ordinal", "beforeFingerprint"],
+    });
+    let target_operations = json!({"allOf": [target_identity, {"oneOf": [
+        map_operation_leaf(
+            &["unit.set"],
+            json!({"state": unit_patch_schema()}),
+            &["state"],
+            &["ordinal", "beforeFingerprint"],
+        ),
+        map_operation_leaf(
+            &["unit.delete", "sprite.delete"],
+            json!({}),
+            &[],
+            &["ordinal", "beforeFingerprint"],
+        ),
+        map_operation_leaf(
+            &["unit.move", "sprite.move"],
+            json!({"x": u16_schema(), "y": u16_schema()}),
+            &["x", "y"],
+            &["ordinal", "beforeFingerprint"],
+        ),
+        map_operation_leaf(
+            &["doodad.set"],
+            json!({
+                "state": {"$ref": "#/$defs/d"},
+                "replacementTiles": {"$ref": "#/$defs/t"},
+            }),
+            &["state", "replacementTiles"],
+            &["ordinal", "beforeFingerprint"],
+        ),
+        map_operation_leaf(
+            &["doodad.delete"],
+            json!({"replacementTiles": {"$ref": "#/$defs/t"}}),
+            &["replacementTiles"],
+            &["ordinal", "beforeFingerprint"],
+        ),
+        map_operation_leaf(
+            &["doodad.move"],
+            json!({
+                "x": u16_schema(),
+                "y": u16_schema(),
+                "replacementTiles": {"$ref": "#/$defs/t"},
+            }),
+            &["x", "y", "replacementTiles"],
+            &["ordinal", "beforeFingerprint"],
+        ),
+        map_operation_leaf(
+            &["sprite.set"],
+            json!({"state": {"$ref": "#/$defs/s"}}),
+            &["state"],
+            &["ordinal", "beforeFingerprint"],
+        ),
+    ]}]});
+
+    json!({"allOf": [
+        {
+            "type": "object",
+            "properties": {"op": string_schema()},
+            "required": ["op"],
+        },
+        {"oneOf": [
+            terrain,
+            map_operation_leaf(
+                &["terrain.isom_brush"],
                 json!({
                     "isomX": u16_schema(),
                     "isomY": u16_schema(),
                     "brush": u16_schema(),
                     "extent": defaulted(u16_schema(), json!(1)),
                 }),
-                &["op", "isomX", "isomY", "brush"],
+                &["isomX", "isomY", "brush"],
+                &[],
             ),
-            operation_schema(
-                "unit.add",
+            map_operation_leaf(
+                &["unit.add"],
                 json!({"state": unit_state_schema()}),
-                &["op", "state"],
+                &["state"],
+                &[],
             ),
-            operation_schema(
-                "unit.set",
-                json!({
-                    "ordinal": u32_schema(),
-                    "beforeFingerprint": string_schema(),
-                    "state": unit_patch_schema(),
-                }),
-                &["op", "ordinal", "beforeFingerprint", "state"],
+            map_operation_leaf(
+                &["doodad.add"],
+                json!({"state": {"$ref": "#/$defs/d"}}),
+                &["state"],
+                &[],
             ),
-            operation_schema(
-                "unit.delete",
-                json!({
-                    "ordinal": u32_schema(),
-                    "beforeFingerprint": string_schema(),
-                }),
-                &["op", "ordinal", "beforeFingerprint"],
+            map_operation_leaf(
+                &["sprite.add"],
+                json!({"state": {"$ref": "#/$defs/s"}}),
+                &["state"],
+                &[],
             ),
-            operation_schema(
-                "unit.move",
-                json!({
-                    "ordinal": u32_schema(),
-                    "beforeFingerprint": string_schema(),
-                    "x": u16_schema(),
-                    "y": u16_schema(),
-                }),
-                &["op", "ordinal", "beforeFingerprint", "x", "y"],
-            ),
-            operation_schema(
-                "doodad.add",
-                json!({"state": doodad_state_schema()}),
-                &["op", "state"],
-            ),
-            operation_schema(
-                "doodad.set",
-                json!({
-                    "ordinal": u32_schema(),
-                    "beforeFingerprint": string_schema(),
-                    "state": doodad_state_schema(),
-                    "replacementTiles": tile_rows_schema(),
-                }),
-                &[
-                    "op",
-                    "ordinal",
-                    "beforeFingerprint",
-                    "state",
-                    "replacementTiles",
-                ],
-            ),
-            operation_schema(
-                "doodad.delete",
-                json!({
-                    "ordinal": u32_schema(),
-                    "beforeFingerprint": string_schema(),
-                    "replacementTiles": tile_rows_schema(),
-                }),
-                &["op", "ordinal", "beforeFingerprint", "replacementTiles"],
-            ),
-            operation_schema(
-                "doodad.move",
-                json!({
-                    "ordinal": u32_schema(),
-                    "beforeFingerprint": string_schema(),
-                    "x": u16_schema(),
-                    "y": u16_schema(),
-                    "replacementTiles": tile_rows_schema(),
-                }),
-                &[
-                    "op",
-                    "ordinal",
-                    "beforeFingerprint",
-                    "x",
-                    "y",
-                    "replacementTiles",
-                ],
-            ),
-            operation_schema(
-                "sprite.add",
-                json!({"state": sprite_state_schema()}),
-                &["op", "state"],
-            ),
-            operation_schema(
-                "sprite.set",
-                json!({
-                    "ordinal": u32_schema(),
-                    "beforeFingerprint": string_schema(),
-                    "state": sprite_state_schema(),
-                }),
-                &["op", "ordinal", "beforeFingerprint", "state"],
-            ),
-            operation_schema(
-                "sprite.delete",
-                json!({
-                    "ordinal": u32_schema(),
-                    "beforeFingerprint": string_schema(),
-                }),
-                &["op", "ordinal", "beforeFingerprint"],
-            ),
-            operation_schema(
-                "sprite.move",
-                json!({
-                    "ordinal": u32_schema(),
-                    "beforeFingerprint": string_schema(),
-                    "x": u16_schema(),
-                    "y": u16_schema(),
-                }),
-                &["op", "ordinal", "beforeFingerprint", "x", "y"],
-            ),
-            operation_schema(
-                "location.add",
+            target_operations,
+            map_operation_leaf(
+                &["location.add", "location.set"],
                 json!({"state": location_state_schema()}),
-                &["op", "state"],
+                &["state"],
+                &[],
             ),
-            operation_schema(
-                "location.set",
-                json!({"state": location_state_schema()}),
-                &["op", "state"],
+            map_operation_leaf(
+                &["location.rename"],
+                json!({"locationId": u16_schema(), "nameBytesHex": string_schema()}),
+                &["locationId", "nameBytesHex"],
+                &[],
             ),
-            operation_schema(
-                "location.rename",
-                json!({
-                    "locationId": u16_schema(),
-                    "nameBytesHex": string_schema(),
-                }),
-                &["op", "locationId", "nameBytesHex"],
-            ),
-            operation_schema(
-                "location.delete",
+            map_operation_leaf(
+                &["location.delete"],
                 json!({"locationId": u16_schema()}),
-                &["op", "locationId"],
+                &["locationId"],
+                &[],
             ),
-        ],
-    })
+        ]},
+    ]})
 }
 
 fn map_operations_schema() -> Value {
@@ -1268,6 +1318,20 @@ fn map_operations_schema() -> Value {
         "maxItems": 4096,
         "items": map_operation_schema(),
     })
+}
+
+fn map_draft_patch_schema() -> Value {
+    let mut doodad = doodad_state_schema();
+    let mut sprite = sprite_state_schema();
+    replace_closed_objects_with_property_names(&mut doodad);
+    replace_closed_objects_with_property_names(&mut sprite);
+    let mut patch = schema(
+        json!({"operations": map_operations_schema()}),
+        &["operations"],
+    );
+    replace_closed_objects_with_property_names(&mut patch);
+    patch["$defs"] = json!({"t": tile_rows_schema(), "d": doodad, "s": sprite});
+    patch
 }
 
 fn map_palette_filter_schema() -> Value {
@@ -1300,21 +1364,19 @@ fn map_palette_filter_schema() -> Value {
 }
 
 fn map_palette_query_schema() -> Value {
-    let mut query = object_schema(
-        json!({
-            "kind": map_palette_catalog_kind_schema(),
-            "query": {
-                "type": "string",
-                "minLength": 1,
-                "description": "Case-insensitive name substring. Tile names contain only their numeric id; use filter for tile metadata.",
-            },
-            "filter": map_palette_filter_schema(),
-        }),
-        &["kind"],
-    );
+    let properties = json!({
+        "kind": map_palette_catalog_kind_schema(),
+        "query": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Case-insensitive name substring. Tile names contain only their numeric id; use filter for tile metadata.",
+        },
+        "filter": map_palette_filter_schema(),
+    });
+    let mut query = object_schema(properties.clone(), &["kind"]);
     query["anyOf"] = json!([
-        {"required": ["query"]},
-        {"required": ["filter"]},
+        object_schema(properties.clone(), &["kind", "query"]),
+        object_schema(properties, &["kind", "filter"]),
     ]);
     query
 }
@@ -1353,7 +1415,6 @@ fn map_stamp_source_schema() -> Value {
 }
 
 pub fn map_tool_registry() -> Vec<ToolSpec> {
-    let operations = map_operations_schema();
     vec![
         tool_spec(
             "map_status",
@@ -1453,7 +1514,7 @@ pub fn map_tool_registry() -> Vec<ToolSpec> {
             "map_draft_patch",
             "Apply one strict all-or-nothing operation batch to the request draft only.",
             false,
-            schema(json!({"operations": operations}), &["operations"]),
+            map_draft_patch_schema(),
         ),
         tool_spec(
             "map_image_place",
@@ -1528,6 +1589,41 @@ pub fn map_mcp_tool_descriptors() -> Vec<Value> {
     descriptors(map_tool_registry())
 }
 
+fn bounded_schema_value(value: &Value) -> String {
+    match value {
+        Value::String(text) => {
+            let mut chars = text.chars();
+            let mut preview = chars.by_ref().take(80).collect::<String>();
+            if chars.next().is_some() {
+                preview.push('…');
+            }
+            format!("{preview:?}")
+        }
+        Value::Number(_) | Value::Bool(_) | Value::Null => value.to_string(),
+        Value::Array(_) => "[array]".to_string(),
+        Value::Object(_) => "{object}".to_string(),
+    }
+}
+
+fn map_validation_error_detail(error: &jsonschema::ValidationError<'_>) -> String {
+    let instance_path = error.instance_path.to_string();
+    let instance_path = if instance_path.is_empty() {
+        "$".to_string()
+    } else {
+        instance_path
+    };
+    match &error.kind {
+        jsonschema::error::ValidationErrorKind::Enum { options } => format!(
+            "invalid value at {instance_path}: {} is not one of {options}",
+            bounded_schema_value(error.instance.as_ref())
+        ),
+        _ => format!(
+            "invalid value at {instance_path} (schema {})",
+            error.schema_path
+        ),
+    }
+}
+
 /// Validate a Map Agent tool against the same strict schema advertised over MCP.
 pub fn validate_map_tool_call(tool_name: &str, args: &Value) -> ToolResult<()> {
     let spec = map_tool_registry()
@@ -1538,7 +1634,34 @@ pub fn validate_map_tool_call(tool_name: &str, args: &Value) -> ToolResult<()> {
                 "tool '{tool_name}' is not available to Map Agent; original Apply is intentionally absent"
             ),
         })?;
-    validate_tool_args(&spec, args)
+    let validator = jsonschema::JSONSchema::options()
+        .with_draft(jsonschema::Draft::Draft7)
+        .compile(&spec.input_schema)
+        .map_err(|error| ToolError::AdmissionRejected {
+            message: format!("tool schema for {} is invalid: {error}", spec.name),
+        })?;
+    if let Err(errors) = validator.validate(args) {
+        let mut errors = errors.take(3).collect::<Vec<_>>();
+        errors.sort_by_key(|error| {
+            !matches!(
+                &error.kind,
+                jsonschema::error::ValidationErrorKind::Enum { .. }
+            )
+        });
+        let details = errors
+            .iter()
+            .map(map_validation_error_detail)
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(ToolError::AdmissionRejected {
+            message: format!(
+                "Usage: {}({}). arguments do not match the documented input schema: {details}",
+                spec.name,
+                required_args(&spec).join(", ")
+            ),
+        });
+    }
+    Ok(())
 }
 
 /// Return MCP tool descriptors using each registry tool's verbatim inputSchema.
@@ -1598,7 +1721,15 @@ pub fn admit_tool_call(state: &mut RequestState, tool: &str, args: &Value) -> To
 continuing to search."
             ));
         }
-    } else if state.action_count >= MAX_TOOL_ACTIONS && spec.name != EPS_CHECK_TOOL {
+    } else if spec.name == PYTHON_DEPENDENCIES_PREPARE_TOOL
+        && state.python_dependency_prepare_count >= MAX_PYTHON_DEPENDENCY_PREPARATIONS
+    {
+        return admission_error(&format!(
+            "python_dependencies_prepare budget exhausted: this request is limited to {MAX_PYTHON_DEPENDENCY_PREPARATIONS} preparations."
+        ));
+    } else if state.action_count >= MAX_TOOL_ACTIONS
+        && !matches!(spec.name, EPS_CHECK_TOOL | PYTHON_DEPENDENCIES_PREPARE_TOOL)
+    {
         return admission_error(&format!(
             "action budget exhausted: this request is limited to {MAX_TOOL_ACTIONS} non-search \
 tool calls. Wrap up with the current findings instead of continuing to call tools."
@@ -1618,6 +1749,8 @@ Summarize the remaining build issue instead of running build again.",
 
     if spec.name == SEARCH_DOCS_TOOL {
         state.search_docs_count += 1;
+    } else if spec.name == PYTHON_DEPENDENCIES_PREPARE_TOOL {
+        state.python_dependency_prepare_count += 1;
     } else if spec.name != EPS_CHECK_TOOL {
         state.action_count += 1;
     }
@@ -4869,6 +5002,14 @@ mod tests {
                 ),
             ),
             (
+                PYTHON_DEPENDENCIES_PREPARE_TOOL,
+                false,
+                schema(
+                    serde_json::json!({"dependencies": optional_string_array_schema(128)}),
+                    &["dependencies"],
+                ),
+            ),
+            (
                 "dat_get",
                 false,
                 schema(
@@ -5027,6 +5168,14 @@ mod tests {
                 schema(serde_json::json!({"reason": string_schema()}), &["reason"]),
             ),
             (
+                PYTHON_DEPENDENCIES_SET_TOOL,
+                true,
+                schema(
+                    serde_json::json!({"candidateToken": string_schema()}),
+                    &["candidateToken"],
+                ),
+            ),
+            (
                 "dat_patch",
                 true,
                 schema(
@@ -5040,7 +5189,7 @@ mod tests {
                 schema(
                     serde_json::json!({
                         "path": string_schema(),
-                        "ftype": enum_string_schema(&["CUIEps", "CUIPy", "RawText"]),
+                        "ftype": enum_string_schema(&["CUIEps", "CUIPy"]),
                         "code": string_schema(),
                     }),
                     &["path", "ftype"],
@@ -5351,6 +5500,95 @@ mod tests {
         );
     }
 
+    #[test]
+    fn python_dependency_tools_have_closed_schemas_and_correct_admission_lanes() {
+        let registry = tool_registry();
+        let prepare = registry
+            .iter()
+            .find(|spec| spec.name == PYTHON_DEPENDENCIES_PREPARE_TOOL)
+            .expect("python dependency preparation must be registered");
+        assert!(!prepare.mutating);
+        assert_eq!(prepare.input_schema["additionalProperties"], json!(false));
+        assert_eq!(
+            prepare.input_schema["properties"]["dependencies"]["maxItems"],
+            json!(128)
+        );
+
+        let set = registry
+            .iter()
+            .find(|spec| spec.name == PYTHON_DEPENDENCIES_SET_TOOL)
+            .expect("python dependency commit must be registered");
+        assert!(set.mutating);
+        assert_eq!(set.input_schema["additionalProperties"], json!(false));
+        assert_eq!(set.input_schema["required"], json!(["candidateToken"]));
+
+        let mut prepare_state = RequestState::for_request("req-python-prepare");
+        prepare_state.action_count = MAX_TOOL_ACTIONS;
+        admit_tool_call(
+            &mut prepare_state,
+            PYTHON_DEPENDENCIES_PREPARE_TOOL,
+            &json!({"dependencies": ["eudplib==0.80.6"]}),
+        )
+        .unwrap();
+        assert_eq!(prepare_state.action_count, MAX_TOOL_ACTIONS);
+        assert_eq!(prepare_state.python_dependency_prepare_count, 1);
+        assert!(!prepare_state.docs_searched);
+        admit_tool_call(
+            &mut prepare_state,
+            PYTHON_DEPENDENCIES_PREPARE_TOOL,
+            &json!({"dependencies": []}),
+        )
+        .unwrap();
+        assert_eq!(prepare_state.python_dependency_prepare_count, 2);
+
+        for invalid in [
+            json!({"dependencies": ["eudplib==0.80.6"], "extra": true}),
+            json!({"dependencies": [7]}),
+        ] {
+            let mut state = RequestState::for_request("req-invalid-python-prepare");
+            assert!(
+                admit_tool_call(&mut state, PYTHON_DEPENDENCIES_PREPARE_TOOL, &invalid,).is_err()
+            );
+            assert_eq!(state.action_count, 0);
+        }
+
+        let mut bounded = RequestState::for_request("req-python-prepare-budget");
+        for _ in 0..MAX_PYTHON_DEPENDENCY_PREPARATIONS {
+            admit_tool_call(
+                &mut bounded,
+                PYTHON_DEPENDENCIES_PREPARE_TOOL,
+                &json!({"dependencies": []}),
+            )
+            .unwrap();
+        }
+        assert!(admit_tool_call(
+            &mut bounded,
+            PYTHON_DEPENDENCIES_PREPARE_TOOL,
+            &json!({"dependencies": []}),
+        )
+        .is_err());
+
+        let mut set_state = RequestState::for_request("req-python-set");
+        assert_evidence_required(admit_tool_call(
+            &mut set_state,
+            PYTHON_DEPENDENCIES_SET_TOOL,
+            &json!({"candidateToken": "opaque"}),
+        ));
+        set_state.record_search_docs();
+        admit_tool_call(
+            &mut set_state,
+            PYTHON_DEPENDENCIES_SET_TOOL,
+            &json!({"candidateToken": "opaque"}),
+        )
+        .unwrap();
+        assert_eq!(set_state.action_count, 1);
+        assert!(admit_tool_call(
+            &mut set_state,
+            PYTHON_DEPENDENCIES_SET_TOOL,
+            &json!({"candidateToken": "opaque", "dependencies": []}),
+        )
+        .is_err());
+    }
     #[test]
     fn eps_check_is_read_only_and_does_not_consume_action_budget() {
         let spec = tool_registry()
@@ -5772,6 +6010,141 @@ mod tests {
         assert_eq!(value["usages"][0]["operation"], "set");
     }
 
+    fn resolve_map_schema_refs(root: &Value, schema: &Value) -> Value {
+        if let Some(reference) = schema["$ref"].as_str() {
+            let pointer = reference
+                .strip_prefix('#')
+                .expect("Map schema refs must be local");
+            return resolve_map_schema_refs(
+                root,
+                root.pointer(pointer)
+                    .unwrap_or_else(|| panic!("missing Map schema ref {reference}")),
+            );
+        }
+        match schema {
+            Value::Array(values) => Value::Array(
+                values
+                    .iter()
+                    .map(|value| resolve_map_schema_refs(root, value))
+                    .collect(),
+            ),
+            Value::Object(map) => Value::Object(
+                map.iter()
+                    .map(|(name, value)| (name.clone(), resolve_map_schema_refs(root, value)))
+                    .collect(),
+            ),
+            _ => schema.clone(),
+        }
+    }
+
+    fn materialized_map_operations(root: &Value) -> Vec<Value> {
+        fn collect(
+            root: &Value,
+            schema: &Value,
+            inherited_properties: &Map<String, Value>,
+            inherited_required: &std::collections::BTreeSet<String>,
+            operations: &mut Vec<Value>,
+        ) {
+            if let Some(parts) = schema["allOf"].as_array() {
+                let mut properties = inherited_properties.clone();
+                let mut required = inherited_required.clone();
+                let mut composition = None;
+                for part in parts {
+                    if part["oneOf"].is_array() || part["allOf"].is_array() {
+                        assert!(composition.replace(part).is_none());
+                    } else {
+                        if let Some(part_properties) = part["properties"].as_object() {
+                            properties.extend(part_properties.clone());
+                        }
+                        if let Some(part_required) = part["required"].as_array() {
+                            required.extend(part_required.iter().map(|name| {
+                                name.as_str()
+                                    .expect("required names are strings")
+                                    .to_string()
+                            }));
+                        }
+                    }
+                }
+                collect(
+                    root,
+                    composition.expect("Map allOf must contain one composition"),
+                    &properties,
+                    &required,
+                    operations,
+                );
+                return;
+            }
+            if let Some(alternatives) = schema["oneOf"].as_array() {
+                for alternative in alternatives {
+                    collect(
+                        root,
+                        alternative,
+                        inherited_properties,
+                        inherited_required,
+                        operations,
+                    );
+                }
+                return;
+            }
+
+            let mut properties = inherited_properties.clone();
+            properties.extend(
+                schema["properties"]
+                    .as_object()
+                    .expect("Map operation leaf must have properties")
+                    .clone(),
+            );
+            let mut required = inherited_required.clone();
+            required.extend(
+                schema["required"]
+                    .as_array()
+                    .expect("Map operation leaf must have required names")
+                    .iter()
+                    .map(|name| {
+                        name.as_str()
+                            .expect("required names are strings")
+                            .to_string()
+                    }),
+            );
+            assert_eq!(
+                schema_string_set(&schema["propertyNames"], "enum"),
+                properties.keys().cloned().collect(),
+                "Map operation leaf closure must include inherited properties"
+            );
+            let discriminators = properties["op"]
+                .get("enum")
+                .and_then(Value::as_array)
+                .cloned()
+                .or_else(|| {
+                    properties["op"]
+                        .get("const")
+                        .cloned()
+                        .map(|name| vec![name])
+                })
+                .expect("Map operation leaf must have a discriminator");
+            for discriminator in discriminators {
+                let mut operation_properties = properties.clone();
+                operation_properties.insert("op".to_string(), json!({"const": discriminator}));
+                let mut operation = object_schema(
+                    Value::Object(operation_properties),
+                    &required.iter().map(String::as_str).collect::<Vec<_>>(),
+                );
+                operation = resolve_map_schema_refs(root, &operation);
+                operations.push(operation);
+            }
+        }
+
+        let mut operations = Vec::new();
+        collect(
+            root,
+            &root["properties"]["operations"]["items"],
+            &Map::new(),
+            &std::collections::BTreeSet::new(),
+            &mut operations,
+        );
+        operations
+    }
+
     fn map_operation<'a>(alternatives: &'a [Value], name: &str) -> &'a Value {
         alternatives
             .iter()
@@ -5812,7 +6185,14 @@ mod tests {
 
     fn assert_object_contract(schema: &Value, properties: &[&str], required: &[&str]) {
         assert_eq!(schema["type"], "object");
-        assert_eq!(schema["additionalProperties"], false);
+        if schema["additionalProperties"] != false {
+            assert!(schema["additionalProperties"].is_null());
+            assert_eq!(
+                schema_string_set(&schema["propertyNames"], "enum"),
+                schema_property_set(schema),
+                "closed object must enumerate exactly its properties"
+            );
+        }
         assert_eq!(
             schema_property_set(schema),
             properties
@@ -5855,9 +6235,7 @@ mod tests {
         assert_eq!(operations["type"], "array");
         assert_eq!(operations["minItems"], 1);
         assert_eq!(operations["maxItems"], 4096);
-        let alternatives = operations["items"]["oneOf"]
-            .as_array()
-            .expect("map operations must use oneOf");
+        let alternatives = materialized_map_operations(&patch.input_schema);
         let expected: &[(&str, &[&str], &[&str])] = &[
             (
                 "terrain.set",
@@ -5967,7 +6345,8 @@ mod tests {
             ),
         ];
         assert_eq!(alternatives.len(), expected.len());
-        for (alternative, (name, properties, required)) in alternatives.iter().zip(expected) {
+        for (name, properties, required) in expected {
+            let alternative = map_operation(&alternatives, name);
             assert_eq!(alternative["properties"]["op"]["const"], *name);
             assert_object_contract(alternative, properties, required);
         }
@@ -5998,7 +6377,7 @@ mod tests {
             ("location.delete", "locationId"),
         ] {
             assert_integer_bounds(
-                operation_property(alternatives, operation, property),
+                operation_property(&alternatives, operation, property),
                 0,
                 65_535,
             );
@@ -6015,7 +6394,7 @@ mod tests {
             ("sprite.move", "ordinal"),
         ] {
             assert_integer_bounds(
-                operation_property(alternatives, operation, property),
+                operation_property(&alternatives, operation, property),
                 0,
                 4_294_967_295,
             );
@@ -6033,26 +6412,29 @@ mod tests {
             ("location.rename", "nameBytesHex"),
         ] {
             assert_eq!(
-                operation_property(alternatives, operation, property)["type"],
+                operation_property(&alternatives, operation, property)["type"],
                 "string"
             );
         }
         assert_eq!(
-            operation_property(alternatives, "terrain.isom_brush", "extent")["default"],
+            operation_property(&alternatives, "terrain.isom_brush", "extent")["default"],
             1
         );
 
-        let tiles = operation_property(alternatives, "terrain.blit", "tiles");
+        let tiles = operation_property(&alternatives, "terrain.blit", "tiles");
         assert_tile_rows(tiles);
         for (operation, property) in [
             ("doodad.set", "replacementTiles"),
             ("doodad.delete", "replacementTiles"),
             ("doodad.move", "replacementTiles"),
         ] {
-            assert_eq!(operation_property(alternatives, operation, property), tiles);
+            assert_eq!(
+                operation_property(&alternatives, operation, property),
+                tiles
+            );
         }
 
-        let unit_state = operation_property(alternatives, "unit.add", "state");
+        let unit_state = operation_property(&alternatives, "unit.add", "state");
         let unit_properties = [
             "typeId",
             "owner",
@@ -6107,7 +6489,7 @@ mod tests {
             assert_eq!(unit_state["properties"][property]["default"], default);
         }
 
-        let unit_patch = operation_property(alternatives, "unit.set", "state");
+        let unit_patch = operation_property(&alternatives, "unit.set", "state");
         assert_object_contract(unit_patch, &unit_properties, &[]);
         for property in ["owner", "hpPercent", "shieldPercent", "energyPercent"] {
             assert_integer_bounds(&unit_patch["properties"][property], 0, 255);
@@ -6128,7 +6510,7 @@ mod tests {
             assert_integer_bounds(&unit_patch["properties"][property], 0, 4_294_967_295);
         }
 
-        let doodad_state = operation_property(alternatives, "doodad.add", "state");
+        let doodad_state = operation_property(&alternatives, "doodad.add", "state");
         assert_object_contract(
             doodad_state,
             &["doodadId", "x", "y", "owner", "disabled"],
@@ -6142,11 +6524,11 @@ mod tests {
         assert_eq!(doodad_state["properties"]["disabled"]["type"], "boolean");
         assert_eq!(doodad_state["properties"]["disabled"]["default"], false);
         assert_eq!(
-            operation_property(alternatives, "doodad.set", "state"),
+            operation_property(&alternatives, "doodad.set", "state"),
             doodad_state
         );
 
-        let sprite_state = operation_property(alternatives, "sprite.add", "state");
+        let sprite_state = operation_property(&alternatives, "sprite.add", "state");
         assert_object_contract(
             sprite_state,
             &["spriteId", "x", "y", "owner", "flags"],
@@ -6159,11 +6541,11 @@ mod tests {
         assert_eq!(sprite_state["properties"]["owner"]["default"], 11);
         assert_eq!(sprite_state["properties"]["flags"]["default"], 0);
         assert_eq!(
-            operation_property(alternatives, "sprite.set", "state"),
+            operation_property(&alternatives, "sprite.set", "state"),
             sprite_state
         );
 
-        let location_state = operation_property(alternatives, "location.add", "state");
+        let location_state = operation_property(&alternatives, "location.add", "state");
         assert_object_contract(
             location_state,
             &[
@@ -6193,9 +6575,136 @@ mod tests {
         );
         assert_eq!(location_state["properties"]["elevationFlags"]["default"], 0);
         assert_eq!(
-            operation_property(alternatives, "location.set", "state"),
+            operation_property(&alternatives, "location.set", "state"),
             location_state
         );
+    }
+
+    fn codex_normalized_map_schema(value: &Value) -> Value {
+        if let Some(values) = value.as_array() {
+            return Value::Array(values.iter().map(codex_normalized_map_schema).collect());
+        }
+        let Some(source) = value.as_object() else {
+            return value.clone();
+        };
+        let mut normalized = Map::new();
+        for key in [
+            "$ref",
+            "type",
+            "description",
+            "encrypted",
+            "enum",
+            "required",
+            "items",
+            "additionalProperties",
+            "properties",
+            "$defs",
+            "definitions",
+            "anyOf",
+            "oneOf",
+            "allOf",
+        ] {
+            let Some(child) = source.get(key) else {
+                continue;
+            };
+            let normalized_child = if matches!(key, "properties" | "$defs" | "definitions") {
+                Value::Object(
+                    child
+                        .as_object()
+                        .expect("Map schema table must be an object")
+                        .iter()
+                        .map(|(name, schema)| (name.clone(), codex_normalized_map_schema(schema)))
+                        .collect(),
+                )
+            } else {
+                codex_normalized_map_schema(child)
+            };
+            normalized.insert(key.to_string(), normalized_child);
+        }
+        if let Some(constant) = source.get("const") {
+            normalized.insert("type".to_string(), json!("string"));
+            normalized.insert("enum".to_string(), json!([constant]));
+        }
+        Value::Object(normalized)
+    }
+
+    fn required_map_schema_example(schema: &Value) -> Value {
+        if let Some(constant) = schema.get("const") {
+            return constant.clone();
+        }
+        if let Some(value) = schema.get("enum").and_then(Value::as_array) {
+            return value
+                .first()
+                .expect("schema enum must not be empty")
+                .clone();
+        }
+        match schema["type"].as_str() {
+            Some("object") => Value::Object(
+                schema["required"]
+                    .as_array()
+                    .expect("object schema must declare required")
+                    .iter()
+                    .map(|name| {
+                        let name = name.as_str().expect("required name must be a string");
+                        (
+                            name.to_string(),
+                            required_map_schema_example(&schema["properties"][name]),
+                        )
+                    })
+                    .collect(),
+            ),
+            Some("array") => json!([required_map_schema_example(&schema["items"])]),
+            Some("integer" | "number") => json!(schema["minimum"].as_i64().unwrap_or(0)),
+            Some("string") => json!("x"),
+            Some("boolean") => json!(false),
+            _ => panic!("unsupported Map example schema {schema}"),
+        }
+    }
+
+    #[test]
+    fn map_draft_patch_schema_stays_within_codex_normalized_budget() {
+        let schema = map_tool_registry()
+            .into_iter()
+            .find(|tool| tool.name == "map_draft_patch")
+            .expect("map_draft_patch must be registered")
+            .input_schema;
+        let normalized_bytes = serde_json::to_vec(&codex_normalized_map_schema(&schema))
+            .expect("normalized Map schema must serialize")
+            .len();
+        assert!(
+            normalized_bytes <= 5_000,
+            "Map schema exceeds the Codex normalized budget: {normalized_bytes}B"
+        );
+        let operations = materialized_map_operations(&schema);
+        assert_eq!(operations.len(), 20);
+        let validator = jsonschema::JSONSchema::options()
+            .with_draft(jsonschema::Draft::Draft7)
+            .compile(&schema)
+            .expect("Map schema must compile as Draft 7");
+        let mut canonical = Vec::new();
+        for operation in &operations {
+            let example = required_map_schema_example(operation);
+            assert!(validator.is_valid(&json!({"operations": [example.clone()]})));
+            for required in operation["required"]
+                .as_array()
+                .expect("operation must declare required")
+            {
+                let mut missing = example.clone();
+                missing
+                    .as_object_mut()
+                    .expect("operation example must be an object")
+                    .remove(required.as_str().expect("required name must be a string"));
+                assert!(!validator.is_valid(&json!({"operations": [missing]})));
+            }
+            let mut extra = example.clone();
+            extra["unexpected"] = json!(true);
+            assert!(!validator.is_valid(&json!({"operations": [extra]})));
+            canonical.push(example);
+        }
+        assert!(validator.is_valid(&json!({"operations": canonical})));
+        assert!(!validator.is_valid(&json!({
+            "operations": [{"type": "setTile", "x": 64, "y": 64, "tileId": 1}],
+        })));
     }
 
     #[test]
@@ -6214,6 +6723,93 @@ mod tests {
     }
 
     #[test]
+    fn map_render_admission_accepts_only_advertised_numeric_scales() {
+        let crop = json!({"x": 0, "y": 0, "width": 8, "height": 8});
+        for name in ["map_render", "map_draft_render"] {
+            for scale in [1, 2, 4, 8] {
+                let mut args = crop.clone();
+                args["scale"] = json!(scale);
+                assert_eq!(validate_map_tool_call(name, &args), Ok(()));
+            }
+            for scale in [json!(3), json!("1"), json!(1.5), json!(true)] {
+                let mut args = crop.clone();
+                args["scale"] = scale;
+                assert!(matches!(
+                    validate_map_tool_call(name, &args),
+                    Err(ToolError::AdmissionRejected { .. })
+                ));
+            }
+        }
+
+        assert_eq!(
+            validate_map_tool_call("map_objects_read", &json!({"layer": "units"})),
+            Ok(())
+        );
+        for layer in [json!("terrain"), json!(1)] {
+            assert!(matches!(
+                validate_map_tool_call("map_objects_read", &json!({"layer": layer})),
+                Err(ToolError::AdmissionRejected { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn map_draft_patch_public_admission_accepts_all_documented_operations() {
+        let schema = map_tool_registry()
+            .into_iter()
+            .find(|tool| tool.name == "map_draft_patch")
+            .expect("map_draft_patch must be registered")
+            .input_schema;
+        let operations = materialized_map_operations(&schema)
+            .iter()
+            .map(required_map_schema_example)
+            .collect::<Vec<_>>();
+        assert_eq!(operations.len(), 20);
+        for operation in &operations {
+            assert_eq!(
+                validate_map_tool_call("map_draft_patch", &json!({"operations": [operation]})),
+                Ok(())
+            );
+        }
+        assert_eq!(
+            validate_map_tool_call("map_draft_patch", &json!({"operations": operations})),
+            Ok(())
+        );
+
+        let valid_terrain_set = json!({
+            "op": "terrain.set",
+            "x": 0,
+            "y": 0,
+            "before": 0,
+            "after": 1,
+        });
+        assert_eq!(
+            validate_map_tool_call(
+                "map_draft_patch",
+                &json!({"operations": [valid_terrain_set.clone()]}),
+            ),
+            Ok(())
+        );
+        let mut extra_terrain_set = valid_terrain_set;
+        extra_terrain_set["unexpected"] = json!(true);
+        for args in [
+            json!({"operations": [extra_terrain_set]}),
+            json!({"operations": [{"type": "setTile", "x": 64, "y": 64, "tileId": 1}]}),
+            json!({"operations": [{}]}),
+        ] {
+            assert!(matches!(
+                validate_map_tool_call("map_draft_patch", &args),
+                Err(ToolError::AdmissionRejected { .. })
+            ));
+        }
+        assert!(matches!(
+            validate_map_tool_call("map_apply", &json!({})),
+            Err(ToolError::AdmissionRejected { message })
+                if message.contains("original Apply is intentionally absent")
+        ));
+    }
+
+    #[test]
     fn map_palette_query_schema_requires_a_bounded_structured_search() {
         let registry = map_tool_registry();
         let tool = registry
@@ -6221,12 +6817,27 @@ mod tests {
             .find(|tool| tool.name == "map_palette_query")
             .expect("map_palette_query must be registered");
         assert_object_contract(&tool.input_schema, &["kind", "query", "filter"], &["kind"]);
+        let alternatives = tool.input_schema["anyOf"]
+            .as_array()
+            .expect("map_palette_query must advertise search alternatives");
+        assert_eq!(alternatives.len(), 2);
+        assert_object_contract(
+            &alternatives[0],
+            &["kind", "query", "filter"],
+            &["kind", "query"],
+        );
+        assert_object_contract(
+            &alternatives[1],
+            &["kind", "query", "filter"],
+            &["kind", "filter"],
+        );
         assert_eq!(
-            tool.input_schema["anyOf"],
-            json!([
-                {"required": ["query"]},
-                {"required": ["filter"]},
-            ])
+            alternatives[0]["properties"],
+            tool.input_schema["properties"]
+        );
+        assert_eq!(
+            alternatives[1]["properties"],
+            tool.input_schema["properties"]
         );
         assert_eq!(tool.input_schema["properties"]["query"]["minLength"], 1);
         assert_eq!(
@@ -6271,6 +6882,98 @@ mod tests {
         );
         assert!(tool.input_schema["properties"].get("offset").is_none());
         assert!(tool.input_schema["properties"].get("limit").is_none());
+    }
+
+    #[test]
+    fn map_palette_query_mcp_union_arms_preserve_the_complete_contract() {
+        let descriptor = map_mcp_tool_descriptors()
+            .into_iter()
+            .find(|descriptor| descriptor["name"] == "map_palette_query")
+            .expect("map_palette_query must be advertised");
+        let schema = &descriptor["inputSchema"];
+        let branches = schema["anyOf"]
+            .as_array()
+            .expect("map_palette_query must advertise search alternatives");
+        assert_eq!(branches.len(), 2);
+
+        let query = branches
+            .iter()
+            .find(|branch| {
+                branch["required"]
+                    .as_array()
+                    .is_some_and(|required| required.contains(&json!("query")))
+            })
+            .expect("one query alternative must be advertised");
+        let filter = branches
+            .iter()
+            .find(|branch| {
+                branch["required"]
+                    .as_array()
+                    .is_some_and(|required| required.contains(&json!("filter")))
+            })
+            .expect("one filter alternative must be advertised");
+
+        let query_validator = jsonschema::JSONSchema::options()
+            .with_draft(jsonschema::Draft::Draft7)
+            .compile(query)
+            .expect("query alternative must be valid JSON Schema");
+        let filter_validator = jsonschema::JSONSchema::options()
+            .with_draft(jsonschema::Draft::Draft7)
+            .compile(filter)
+            .expect("filter alternative must be valid JSON Schema");
+
+        assert!(query_validator
+            .validate(&json!({"kind": "tiles", "query": "floor"}))
+            .is_ok());
+        assert!(filter_validator
+            .validate(&json!({"kind": "tiles", "filter": {"id": 0}}))
+            .is_ok());
+        let captured_invalid = json!({"kind": "tiles", "filter": {"tileId": 0}});
+        assert!(
+            filter_validator.validate(&captured_invalid).is_err(),
+            "standalone filter alternative accepted the captured invalid tileId call"
+        );
+        assert!(
+            query_validator
+                .validate(&json!({"query": "floor"}))
+                .is_err(),
+            "standalone query alternative accepted a call without kind"
+        );
+        assert!(query_validator.validate(&captured_invalid).is_err());
+
+        let properties = ["kind", "query", "filter"];
+        assert_object_contract(query, &properties, &["kind", "query"]);
+        assert_object_contract(filter, &properties, &["kind", "filter"]);
+        assert_eq!(query["properties"], schema["properties"]);
+        assert_eq!(filter["properties"], schema["properties"]);
+
+        let complete_validator = jsonschema::JSONSchema::options()
+            .with_draft(jsonschema::Draft::Draft7)
+            .compile(schema)
+            .expect("complete map palette input must be valid JSON Schema");
+        for accepted in [
+            json!({"kind": "tiles", "query": "floor"}),
+            json!({"kind": "tiles", "filter": {"id": 0}}),
+            json!({"kind": "tiles", "query": "floor", "filter": {"id": 0}}),
+        ] {
+            assert!(
+                complete_validator.validate(&accepted).is_ok(),
+                "complete schema rejected valid palette query: {accepted}"
+            );
+        }
+        for rejected in [
+            json!({"kind": "tiles"}),
+            json!({"kind": "tiles", "query": ""}),
+            json!({"kind": "tiles", "filter": {}}),
+            json!({"kind": "tiles", "query": "floor", "offset": 1}),
+            json!({"kind": "semanticTerrain", "query": "floor"}),
+            captured_invalid,
+        ] {
+            assert!(
+                complete_validator.validate(&rejected).is_err(),
+                "complete schema accepted invalid palette query: {rejected}"
+            );
+        }
     }
 
     #[test]

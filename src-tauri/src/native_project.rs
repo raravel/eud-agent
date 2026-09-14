@@ -14,9 +14,17 @@ use sha2::{Digest, Sha256};
 
 use crate::memory::write_atomic_bytes;
 
-pub const PROJECT_SCHEMA_VERSION: u32 = 1;
+pub const PROJECT_SCHEMA_VERSION: u32 = 2;
+pub const LEGACY_PROJECT_SCHEMA_VERSION: u32 = 1;
 pub const DAT_SCHEMA_VERSION: u32 = 1;
-pub const PROJECT_MANIFEST_FILE: &str = "project.json";
+pub const PYTHON_LOCK_DOMAIN: &[u8] = b"eud-agent/python-lock/v1\0";
+pub const PYTHON_LOCK_OS: &str = "windows";
+pub const PYTHON_LOCK_ARCH: &str = "x86_64";
+pub const MANAGED_UV_VERSION: &str = "0.11.3";
+/// Canonical EUD Agent Project manifest filename.
+pub const PROJECT_MANIFEST_FILE: &str = "project.eap";
+/// Legacy manifest filename accepted only by explicit migration.
+pub const LEGACY_PROJECT_MANIFEST_FILE: &str = "project.json";
 pub const MAX_DAT_PATCH_CHANGES: usize = 300;
 pub const MAX_TEXT_BYTES: usize = 4 * 1024 * 1024;
 
@@ -38,8 +46,74 @@ pub struct ProjectManifest {
     pub settings: ProjectSettings,
     #[serde(default)]
     pub plugins: Vec<EdsPlugin>,
+    pub python_entrypoints: Vec<String>,
+    pub python_dependencies: Vec<String>,
+    pub python_lock: Option<PythonLock>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub editor_compatibility: Option<EditorCompatibility>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ProjectManifestV1 {
+    schema_version: u32,
+    name: String,
+    source_map: String,
+    output_map: String,
+    main_file: String,
+    #[serde(default)]
+    settings: ProjectSettings,
+    #[serde(default)]
+    plugins: Vec<EdsPlugin>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    editor_compatibility: Option<EditorCompatibility>,
+}
+
+impl From<ProjectManifestV1> for ProjectManifest {
+    fn from(legacy: ProjectManifestV1) -> Self {
+        Self {
+            schema_version: PROJECT_SCHEMA_VERSION,
+            name: legacy.name,
+            source_map: legacy.source_map,
+            output_map: legacy.output_map,
+            main_file: legacy.main_file,
+            settings: legacy.settings,
+            plugins: legacy.plugins,
+            python_entrypoints: Vec::new(),
+            python_dependencies: Vec::new(),
+            python_lock: None,
+            editor_compatibility: legacy.editor_compatibility,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PythonLock {
+    pub digest: String,
+    pub target: PythonLockTarget,
+    pub packages: Vec<PythonLockedPackage>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PythonLockTarget {
+    pub os: String,
+    pub arch: String,
+    pub python_abi: String,
+    pub euddraft_fingerprint: String,
+    pub uv_version: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PythonLockedPackage {
+    pub name: String,
+    pub version: String,
+    pub wheel_filename: String,
+    pub wheel_tags: Vec<String>,
+    pub artifact_url: String,
+    pub sha256: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -353,6 +427,7 @@ pub struct NativeSourceSnapshot {
 #[derive(Debug, Clone)]
 pub struct NativeProject {
     root: PathBuf,
+    manifest_path: PathBuf,
     manifest: ProjectManifest,
     dat: NativeDatState,
 }
@@ -360,29 +435,73 @@ pub struct NativeProject {
 impl NativeProject {
     pub fn create(root: &Path, manifest: ProjectManifest) -> Result<Self, String> {
         validate_manifest(&manifest)?;
+        ensure_no_symlink_components(root)?;
+        if root_exists_as_symlink(root)? {
+            return Err("native project root must not be a symlink".to_string());
+        }
         fs::create_dir_all(root).map_err(stringify_io)?;
         for directory in ["src", "dat", "plugins", "maps", "build"] {
             fs::create_dir_all(root.join(directory)).map_err(stringify_io)?;
         }
+        let root = canonical_or_absolute(root)?;
         let project = Self {
-            root: canonical_or_absolute(root)?,
+            manifest_path: root.join(PROJECT_MANIFEST_FILE),
+            root,
             manifest,
             dat: NativeDatState::default(),
         };
         project.save_manifest()?;
         project.save_dat_state()?;
         project.create_source(&project.manifest.main_file, "")?;
+        validate_manifest_source_paths(&project)?;
         Ok(project)
     }
 
+    /// Open the sole canonical `.eap` manifest in a project root.
     pub fn open(root: &Path) -> Result<Self, String> {
+        ensure_no_symlink_components(root)?;
         let root = fs::canonicalize(root).map_err(|error| {
             format!(
                 "native project root '{}' is unavailable: {error}",
                 root.display()
             )
         })?;
-        let manifest: ProjectManifest = read_json(&root.join(PROJECT_MANIFEST_FILE))?;
+        if !root.is_dir() {
+            return Err(format!(
+                "native project root is not a directory: {}",
+                root.display()
+            ));
+        }
+        let manifest_path = discover_manifest_path(&root)?;
+        reject_legacy_authority(&root)?;
+        Self::open_manifest(&manifest_path)
+    }
+
+    /// Open an explicitly selected canonical `.eap` file without substituting a sibling.
+    pub fn open_manifest(path: &Path) -> Result<Self, String> {
+        ensure_no_symlink_components(path)?;
+        let metadata = fs::symlink_metadata(path).map_err(|error| {
+            format!(
+                "native project manifest '{}' is unavailable: {error}",
+                path.display()
+            )
+        })?;
+        if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+            return Err("native project manifest must be a regular, non-symlink file".to_string());
+        }
+        if !path
+            .extension()
+            .and_then(|value| value.to_str())
+            .is_some_and(|value| value.eq_ignore_ascii_case("eap"))
+        {
+            return Err("native project manifest must use the .eap extension".to_string());
+        }
+        let manifest_path = fs::canonicalize(path).map_err(stringify_io)?;
+        let root = manifest_path
+            .parent()
+            .map(Path::to_path_buf)
+            .ok_or_else(|| "native project manifest has no parent directory".to_string())?;
+        let manifest = read_project_manifest_v2(&manifest_path)?;
         validate_manifest(&manifest)?;
         let project = Self {
             dat: NativeDatState {
@@ -393,12 +512,80 @@ impl NativeProject {
                 buttons: read_json_or_default(&root.join(BUTTONS_FILE))?,
             },
             root,
+            manifest_path,
             manifest,
         };
-        project.validate_dat_state()?;
-        project.require_path(&project.manifest.source_map, false)?;
-        project.require_path(&project.manifest.main_file, true)?;
+        project.validate_project_state()?;
         Ok(project)
+    }
+
+    /// 명시적으로 선택된 스키마 v1 `.eap`를 검증한 뒤 같은 파일에 v2로 원자 변환한다.
+    /// 일반 [`Self::open`]과 [`Self::open_manifest`]는 이 함수를 호출하지 않는다.
+    pub(crate) fn migrate_v1_manifest(path: &Path) -> Result<Self, String> {
+        ensure_regular_manifest_file(path, "eap")?;
+        let manifest = read_project_manifest_v1(path)?;
+        let manifest_path = fs::canonicalize(path).map_err(stringify_io)?;
+        let root = manifest_path
+            .parent()
+            .map(Path::to_path_buf)
+            .ok_or_else(|| "프로젝트 매니페스트의 상위 폴더가 없습니다.".to_string())?;
+        let project = Self::from_parts(root, manifest_path, manifest)?;
+        project.save_manifest()?;
+        Ok(project)
+    }
+
+    /// 이전 `project.json`을 검증한 뒤 v2 `project.eap`로 명시적으로 변환한다.
+    pub(crate) fn migrate_legacy(root: &Path) -> Result<Self, String> {
+        ensure_no_symlink_components(root)?;
+        let root = fs::canonicalize(root).map_err(stringify_io)?;
+        let legacy_path = root.join(LEGACY_PROJECT_MANIFEST_FILE);
+        ensure_regular_manifest_file(&legacy_path, "json")?;
+        if !discover_manifest_files(&root)?.is_empty() {
+            return Err("정식 매니페스트와 이전 매니페스트가 함께 존재합니다.".to_string());
+        }
+        let manifest = read_project_manifest_v1(&legacy_path)?;
+        let manifest_path = root.join(PROJECT_MANIFEST_FILE);
+        let project = Self::from_parts(root, manifest_path.clone(), manifest)?;
+        project.save_manifest()?;
+        if let Err(error) = fs::remove_file(&legacy_path) {
+            let cleanup = fs::remove_file(&manifest_path);
+            return Err(match cleanup {
+                Ok(()) => format!("project.json 변환을 완료하지 못했습니다: {error}"),
+                Err(cleanup) => format!(
+                    "project.json 변환을 완료하지 못했고 생성된 project.eap 정리도 실패했습니다: {error}; {cleanup}"
+                ),
+            });
+        }
+        Ok(project)
+    }
+
+    fn from_parts(
+        root: PathBuf,
+        manifest_path: PathBuf,
+        manifest: ProjectManifest,
+    ) -> Result<Self, String> {
+        validate_manifest(&manifest)?;
+        let project = Self {
+            dat: NativeDatState {
+                standard: read_json_or_default(&root.join(STANDARD_DAT_FILE))?,
+                xdat: read_json_or_default(&root.join(XDAT_FILE))?,
+                tbl: read_json_or_default(&root.join(TBL_FILE))?,
+                requirements: read_json_or_default(&root.join(REQUIREMENTS_FILE))?,
+                buttons: read_json_or_default(&root.join(BUTTONS_FILE))?,
+            },
+            root,
+            manifest_path,
+            manifest,
+        };
+        project.validate_project_state()?;
+        Ok(project)
+    }
+
+    fn validate_project_state(&self) -> Result<(), String> {
+        self.validate_dat_state()?;
+        self.require_path(&self.manifest.source_map, true)?;
+        self.require_path(&self.manifest.main_file, true)?;
+        validate_manifest_source_paths(self)
     }
 
     pub fn root(&self) -> &Path {
@@ -407,6 +594,28 @@ impl NativeProject {
 
     pub fn manifest(&self) -> &ProjectManifest {
         &self.manifest
+    }
+
+    pub fn manifest_path(&self) -> &Path {
+        &self.manifest_path
+    }
+
+    pub fn manifest_bytes(&self) -> Result<Vec<u8>, String> {
+        fs::read(&self.manifest_path).map_err(stringify_io)
+    }
+
+    pub fn manifest_sha256(&self) -> Result<String, String> {
+        self.manifest_bytes().map(|bytes| sha256_hex(&bytes))
+    }
+
+    pub fn has_direct_python(&self) -> Result<bool, String> {
+        Ok(!self.manifest.python_entrypoints.is_empty()
+            || !self.manifest.python_dependencies.is_empty()
+            || self.manifest.python_lock.is_some()
+            || self
+                .list_source_files()?
+                .iter()
+                .any(|path| is_python_source_path(path)))
     }
 
     pub fn dat(&self) -> &NativeDatState {
@@ -448,7 +657,7 @@ impl NativeProject {
     pub fn source_snapshot(&self) -> Result<NativeSourceSnapshot, String> {
         let mut files = Vec::new();
         for path in self.list_source_files()? {
-            if !path.to_lowercase().ends_with(".eps") {
+            if !is_editable_source_path(&path) {
                 continue;
             }
             let absolute = self.require_path(&path, true)?;
@@ -469,12 +678,12 @@ impl NativeProject {
     }
 
     pub fn read_source(&self, path: &str) -> Result<String, String> {
-        require_source_path(path)?;
+        require_editable_source_path(path)?;
         read_bounded_text(&self.require_path(path, true)?)
     }
 
     pub fn write_source(&self, path: &str, content: &str) -> Result<(), String> {
-        require_source_path(path)?;
+        require_editable_source_path(path)?;
         if content.len() > MAX_TEXT_BYTES {
             return Err(format!("source content exceeds {MAX_TEXT_BYTES} bytes"));
         }
@@ -483,11 +692,14 @@ impl NativeProject {
     }
 
     pub fn create_source(&self, path: &str, content: &str) -> Result<(), String> {
-        let target = self.require_path(path, false)?;
+        require_editable_source_path(path)?;
+        let normalized = normalize_relative(path)?;
+        self.reject_source_case_collision(&normalized, None)?;
+        let target = self.require_path(&normalized, false)?;
         if target.exists() {
-            return Err(format!("source file already exists: {path}"));
+            return Err(format!("소스 파일이 이미 존재합니다: {normalized}"));
         }
-        self.write_source(path, content)
+        self.write_source(&normalized, content)
     }
 
     pub fn create_source_dir(&self, path: &str) -> Result<(), String> {
@@ -500,20 +712,51 @@ impl NativeProject {
     }
 
     pub fn move_source(&mut self, from: &str, to: &str) -> Result<(), String> {
-        require_source_path(from)?;
-        require_source_path(to)?;
-        let source = self.require_path(from, true)?;
-        let target = self.require_path(to, false)?;
-        if target.exists() {
-            return Err(format!("source target already exists: {to}"));
+        require_editable_source_path(from)?;
+        require_editable_source_path(to)?;
+        let from = normalize_relative(from)?;
+        let to = normalize_relative(to)?;
+        let moves_main = self.manifest.main_file.eq_ignore_ascii_case(&from);
+        if moves_main {
+            require_eps_source_path(&to)?;
+        }
+        let entrypoint_index = self
+            .manifest
+            .python_entrypoints
+            .iter()
+            .position(|path| path.eq_ignore_ascii_case(&from));
+        if entrypoint_index.is_some() {
+            require_python_source_path(&to)?;
+        }
+        self.reject_source_case_collision(&to, Some(&from))?;
+        let source = self.require_path(&from, true)?;
+        let target = self.require_path(&to, false)?;
+        if target.exists() && !from.eq_ignore_ascii_case(&to) {
+            return Err(format!("이동 대상 소스가 이미 존재합니다: {to}"));
         }
         if let Some(parent) = target.parent() {
             fs::create_dir_all(parent).map_err(stringify_io)?;
         }
         fs::rename(&source, &target).map_err(stringify_io)?;
-        if self.manifest.main_file.eq_ignore_ascii_case(from) {
-            self.manifest.main_file = normalize_relative(to)?;
-            self.save_manifest()?;
+
+        if !moves_main && entrypoint_index.is_none() {
+            return Ok(());
+        }
+        let previous = self.manifest.clone();
+        if moves_main {
+            self.manifest.main_file = to.clone();
+        }
+        if let Some(index) = entrypoint_index {
+            self.manifest.python_entrypoints[index] = to.clone();
+        }
+        if let Err(error) = validate_manifest(&self.manifest).and_then(|_| self.save_manifest()) {
+            self.manifest = previous;
+            return match fs::rename(&target, &source) {
+                Ok(()) => Err(error),
+                Err(rollback) => Err(format!(
+                    "소스 이동 후 매니페스트 저장에 실패했고 파일 복원도 실패했습니다: {error}; {rollback}"
+                )),
+            };
         }
         Ok(())
     }
@@ -593,18 +836,114 @@ impl NativeProject {
         self.save_manifest()
     }
     pub fn delete_source(&mut self, path: &str) -> Result<(), String> {
-        require_source_path(path)?;
+        require_editable_source_path(path)?;
         if self.manifest.main_file.eq_ignore_ascii_case(path) {
-            return Err("cannot delete the configured mainFile".to_string());
+            return Err("선택된 mainFile은 삭제할 수 없습니다.".to_string());
+        }
+        if self
+            .manifest
+            .python_entrypoints
+            .iter()
+            .any(|entrypoint| entrypoint.eq_ignore_ascii_case(path))
+        {
+            return Err("선택된 Python 진입점은 삭제할 수 없습니다.".to_string());
         }
         fs::remove_file(self.require_path(path, true)?).map_err(stringify_io)
     }
 
     pub fn set_main_file(&mut self, path: &str) -> Result<(), String> {
-        require_source_path(path)?;
-        self.require_path(path, true)?;
-        self.manifest.main_file = normalize_relative(path)?;
-        self.save_manifest()
+        require_eps_source_path(path)?;
+        let normalized = normalize_relative(path)?;
+        if !self
+            .list_source_files()?
+            .iter()
+            .any(|existing| existing == &normalized)
+        {
+            return Err("mainFile은 기존 소스의 정확한 대소문자 경로여야 합니다.".to_string());
+        }
+        self.require_path(&normalized, true)?;
+        let previous = self.manifest.main_file.clone();
+        self.manifest.main_file = normalized;
+        if let Err(error) = self.save_manifest() {
+            self.manifest.main_file = previous;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    pub fn replace_python_dependencies(
+        &mut self,
+        dependencies: Vec<String>,
+        python_lock: Option<PythonLock>,
+    ) -> Result<(String, Vec<u8>), String> {
+        let dependencies = validate_python_dependencies(&dependencies)?;
+        validate_python_lock(&dependencies, python_lock.as_ref())?;
+        let before_bytes = fs::read(&self.manifest_path).map_err(stringify_io)?;
+        let previous = self.manifest.clone();
+        self.manifest.python_dependencies = dependencies;
+        self.manifest.python_lock = python_lock;
+        let after_bytes =
+            serde_json::to_vec_pretty(&self.manifest).map_err(|error| error.to_string())?;
+        if let Err(error) = validate_manifest(&self.manifest).and_then(|_| {
+            write_atomic_bytes(&self.manifest_path, &after_bytes).map_err(|error| error.to_string())
+        }) {
+            self.manifest = previous;
+            return Err(error);
+        }
+        match self.revision() {
+            Ok(revision) => Ok((revision, after_bytes)),
+            Err(error) => {
+                self.manifest = previous;
+                write_atomic_bytes(&self.manifest_path, &before_bytes).map_err(|restore_error| {
+                    format!(
+                        "Python 의존성 변경 후 리비전 계산과 project.eap 복원이 모두 실패했습니다: {error}; {restore_error}"
+                    )
+                })?;
+                Err(format!(
+                    "Python 의존성 변경 후 리비전을 계산하지 못해 project.eap을 복원했습니다: {error}"
+                ))
+            }
+        }
+    }
+
+    pub fn restore_manifest_bytes(
+        &mut self,
+        expected_manifest_sha256: &str,
+        bytes: &[u8],
+    ) -> Result<String, String> {
+        let current_manifest = fs::read(&self.manifest_path).map_err(stringify_io)?;
+        if sha256_hex(&current_manifest) != expected_manifest_sha256 {
+            return Err("project.eap이 바뀌어 매니페스트를 복원할 수 없습니다.".to_string());
+        }
+        let manifest: ProjectManifest = serde_json::from_slice(bytes)
+            .map_err(|error| format!("복원할 project.eap JSON이 올바르지 않습니다: {error}"))?;
+        validate_manifest(&manifest)?;
+        let previous = self.manifest.clone();
+        self.manifest = manifest;
+        if let Err(error) = validate_manifest_source_paths(self).and_then(|_| {
+            write_atomic_bytes(&self.manifest_path, bytes).map_err(|error| error.to_string())
+        }) {
+            self.manifest = previous;
+            return Err(error);
+        }
+        Ok(sha256_hex(bytes))
+    }
+
+    fn reject_source_case_collision(
+        &self,
+        candidate: &str,
+        ignored: Option<&str>,
+    ) -> Result<(), String> {
+        let folded = windows_case_fold(candidate);
+        if self.list_source_files()?.into_iter().any(|path| {
+            ignored.map_or(true, |ignored| !path.eq_ignore_ascii_case(ignored))
+                && windows_case_fold(&path) == folded
+        }) {
+            return Err(format!(
+                "대소문자만 다른 소스 경로가 이미 존재합니다: {candidate}"
+            ));
+        }
+        Ok(())
     }
 
     pub fn original_dat_value(&self, target: &DatTarget) -> Option<DatScalar> {
@@ -771,7 +1110,7 @@ impl NativeProject {
     fn source_snapshot_without_revision(&self) -> Result<Vec<NativeSourceFile>, String> {
         let mut files = Vec::new();
         for path in self.list_source_files()? {
-            if path.to_lowercase().ends_with(".eps") {
+            if is_editable_source_path(&path) {
                 let content = read_bounded_text(&self.require_path(&path, true)?)?;
                 files.push(NativeSourceFile {
                     path,
@@ -784,7 +1123,7 @@ impl NativeProject {
     }
 
     fn save_manifest(&self) -> Result<(), String> {
-        write_json(&self.root.join(PROJECT_MANIFEST_FILE), &self.manifest)
+        write_json(&self.manifest_path, &self.manifest)
     }
 
     fn save_dat_state(&self) -> Result<(), String> {
@@ -811,6 +1150,7 @@ impl NativeProject {
                 serde_json::to_vec_pretty(&self.dat.buttons).map_err(|error| error.to_string())?,
             ),
         ];
+
         let originals: Vec<_> = documents
             .iter()
             .map(|(path, _)| fs::read(path).ok())
@@ -910,6 +1250,508 @@ fn parse_raw_plugin(raw_text: &str) -> Result<EdsPlugin, String> {
     })
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProjectSchemaEnvelope {
+    schema_version: u32,
+}
+
+fn ensure_regular_manifest_file(path: &Path, extension: &str) -> Result<(), String> {
+    ensure_no_symlink_components(path)?;
+    let metadata = fs::symlink_metadata(path).map_err(|error| {
+        format!(
+            "프로젝트 매니페스트 '{}'를 읽을 수 없습니다: {error}",
+            path.display()
+        )
+    })?;
+    if metadata.file_type().is_symlink()
+        || crate::memory::is_reparse_point(&metadata)
+        || !metadata.file_type().is_file()
+    {
+        return Err("프로젝트 매니페스트는 일반 파일이어야 합니다.".to_string());
+    }
+    if !path
+        .extension()
+        .and_then(|value| value.to_str())
+        .is_some_and(|value| value.eq_ignore_ascii_case(extension))
+    {
+        return Err(format!(
+            "프로젝트 매니페스트 확장자는 .{extension}이어야 합니다."
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn project_manifest_schema_version(path: &Path) -> Result<u32, String> {
+    let text = read_bounded_text(path)?;
+    serde_json::from_str::<ProjectSchemaEnvelope>(&text)
+        .map(|envelope| envelope.schema_version)
+        .map_err(|error| format!("프로젝트 매니페스트 JSON이 올바르지 않습니다: {error}"))
+}
+
+fn read_project_manifest_v2(path: &Path) -> Result<ProjectManifest, String> {
+    let text = read_bounded_text(path)?;
+    let envelope: ProjectSchemaEnvelope = serde_json::from_str(&text)
+        .map_err(|error| format!("project.eap JSON이 올바르지 않습니다: {error}"))?;
+    match envelope.schema_version {
+        PROJECT_SCHEMA_VERSION => serde_json::from_str(&text)
+            .map_err(|error| format!("project.eap 스키마 v2가 올바르지 않습니다: {error}")),
+        LEGACY_PROJECT_SCHEMA_VERSION => Err(
+            "project.eap 스키마 v1은 설정 화면에서 프로젝트를 명시적으로 열어 v2로 변환해야 합니다."
+                .to_string(),
+        ),
+        version => Err(format!(
+            "지원하지 않는 project.eap schemaVersion입니다: {version} (필요: {PROJECT_SCHEMA_VERSION})"
+        )),
+    }
+}
+
+fn read_project_manifest_v1(path: &Path) -> Result<ProjectManifest, String> {
+    let text = read_bounded_text(path)?;
+    let envelope: ProjectSchemaEnvelope = serde_json::from_str(&text)
+        .map_err(|error| format!("이전 프로젝트 매니페스트 JSON이 올바르지 않습니다: {error}"))?;
+    if envelope.schema_version != LEGACY_PROJECT_SCHEMA_VERSION {
+        return Err(format!(
+            "schemaVersion {}은 v2로 변환할 수 없습니다.",
+            envelope.schema_version
+        ));
+    }
+    let legacy: ProjectManifestV1 = serde_json::from_str(&text)
+        .map_err(|error| format!("이전 프로젝트 스키마 v1이 올바르지 않습니다: {error}"))?;
+    Ok(legacy.into())
+}
+
+pub fn validate_python_dependencies(dependencies: &[String]) -> Result<Vec<String>, String> {
+    let mut normalized = Vec::with_capacity(dependencies.len());
+    let mut names = BTreeSet::new();
+    for (index, dependency) in dependencies.iter().enumerate() {
+        let (name, version) = normalize_exact_python_dependency(dependency)
+            .map_err(|error| format!("pythonDependencies[{index}]: {error}"))?;
+        if !names.insert(name.clone()) {
+            return Err(format!("Python 직접 의존성이 중복되었습니다: {name}"));
+        }
+        normalized.push(format!("{name}=={version}"));
+    }
+    normalized.sort_by(|left, right| {
+        let left_name = left.split_once("==").map_or(left.as_str(), |value| value.0);
+        let right_name = right
+            .split_once("==")
+            .map_or(right.as_str(), |value| value.0);
+        left_name.cmp(right_name)
+    });
+    Ok(normalized)
+}
+
+pub fn normalize_exact_python_dependency(value: &str) -> Result<(String, String), String> {
+    if value.trim() != value || value.matches("==").count() != 1 {
+        return Err("의존성은 공백 없는 정확한 name==version 형식이어야 합니다.".to_string());
+    }
+    let (name, version) = value
+        .split_once("==")
+        .ok_or_else(|| "의존성은 정확한 name==version 형식이어야 합니다.".to_string())?;
+    Ok((
+        normalize_python_name(name)?,
+        normalize_python_version(version)?,
+    ))
+}
+
+fn normalize_python_name(value: &str) -> Result<String, String> {
+    if value.is_empty()
+        || !value.is_ascii()
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        || !value.as_bytes()[0].is_ascii_alphanumeric()
+        || !value.as_bytes()[value.len() - 1].is_ascii_alphanumeric()
+    {
+        return Err("Python 패키지 이름이 PEP 503 형식이 아닙니다.".to_string());
+    }
+    let mut normalized = String::with_capacity(value.len());
+    let mut separator = false;
+    for byte in value.bytes() {
+        if matches!(byte, b'-' | b'_' | b'.') {
+            separator = true;
+        } else {
+            if separator && !normalized.is_empty() {
+                normalized.push('-');
+            }
+            separator = false;
+            normalized.push(char::from(byte.to_ascii_lowercase()));
+        }
+    }
+    Ok(normalized)
+}
+
+fn normalize_python_version(value: &str) -> Result<String, String> {
+    if value.is_empty() || !value.is_ascii() || value.trim() != value {
+        return Err("Python 버전이 비어 있거나 ASCII 정확 버전이 아닙니다.".to_string());
+    }
+    let lower = value.to_ascii_lowercase();
+    let mut public_and_local = lower.split('+');
+    let public = public_and_local.next().unwrap_or_default();
+    let local = public_and_local.next();
+    if public_and_local.next().is_some() {
+        return Err("Python 버전에 '+'가 두 번 이상 들어 있습니다.".to_string());
+    }
+    let (epoch, public) = match public.split_once('!') {
+        Some((epoch, rest))
+            if !epoch.is_empty() && epoch.bytes().all(|byte| byte.is_ascii_digit()) =>
+        {
+            (Some(normalize_decimal(epoch)?), rest)
+        }
+        Some(_) => return Err("Python 버전 epoch 형식이 올바르지 않습니다.".to_string()),
+        None => (None, public),
+    };
+    let release_end = public
+        .bytes()
+        .position(|byte| !byte.is_ascii_digit() && byte != b'.')
+        .unwrap_or(public.len());
+    let release = &public[..release_end];
+    if release.is_empty() || release.split('.').any(|part| part.is_empty()) {
+        return Err("Python 버전 release 형식이 올바르지 않습니다.".to_string());
+    }
+    let release = release
+        .split('.')
+        .map(normalize_decimal)
+        .collect::<Result<Vec<_>, _>>()?
+        .join(".");
+    let mut rest = &public[release_end..];
+    let mut suffix = String::new();
+    for label in ["rc", "a", "b"] {
+        if let Some(after) = rest.strip_prefix(label) {
+            let (number, remaining) = take_decimal(after)?;
+            suffix.push_str(label);
+            suffix.push_str(&normalize_decimal(number)?);
+            rest = remaining;
+            break;
+        }
+    }
+    if let Some(after) = rest.strip_prefix(".post") {
+        let (number, remaining) = take_decimal(after)?;
+        suffix.push_str(".post");
+        suffix.push_str(&normalize_decimal(number)?);
+        rest = remaining;
+    }
+    if let Some(after) = rest.strip_prefix(".dev") {
+        let (number, remaining) = take_decimal(after)?;
+        suffix.push_str(".dev");
+        suffix.push_str(&normalize_decimal(number)?);
+        rest = remaining;
+    }
+    if !rest.is_empty() {
+        return Err("Python 버전은 정규화 가능한 정확한 PEP 440 버전이어야 합니다.".to_string());
+    }
+    let mut normalized = String::new();
+    if let Some(epoch) = epoch {
+        normalized.push_str(&epoch);
+        normalized.push('!');
+    }
+    normalized.push_str(&release);
+    normalized.push_str(&suffix);
+    if let Some(local) = local {
+        let mut local_parts = Vec::new();
+        for part in local.split(['-', '_', '.']) {
+            if part.is_empty() || !part.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
+                return Err("Python 로컬 버전 형식이 올바르지 않습니다.".to_string());
+            }
+            local_parts.push(if part.bytes().all(|byte| byte.is_ascii_digit()) {
+                normalize_decimal(part)?
+            } else {
+                part.to_string()
+            });
+        }
+        normalized.push('+');
+        normalized.push_str(&local_parts.join("."));
+    }
+    Ok(normalized)
+}
+
+fn take_decimal(value: &str) -> Result<(&str, &str), String> {
+    let length = value
+        .bytes()
+        .take_while(|byte| byte.is_ascii_digit())
+        .count();
+    if length == 0 {
+        return Err("Python 버전 접미사에는 숫자가 필요합니다.".to_string());
+    }
+    Ok(value.split_at(length))
+}
+
+fn normalize_decimal(value: &str) -> Result<String, String> {
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err("Python 버전 숫자가 올바르지 않습니다.".to_string());
+    }
+    Ok(value
+        .trim_start_matches('0')
+        .to_string()
+        .chars()
+        .next()
+        .map_or_else(
+            || "0".to_string(),
+            |_| value.trim_start_matches('0').to_string(),
+        ))
+}
+
+pub fn validate_python_lock(
+    dependencies: &[String],
+    python_lock: Option<&PythonLock>,
+) -> Result<(), String> {
+    let normalized_dependencies = validate_python_dependencies(dependencies)?;
+    if normalized_dependencies != dependencies {
+        return Err("pythonDependencies는 PEP 503 이름 순서의 정규형이어야 합니다.".to_string());
+    }
+    let Some(python_lock) = python_lock else {
+        return if dependencies.is_empty() {
+            Ok(())
+        } else {
+            Err("비어 있지 않은 pythonDependencies에는 pythonLock이 필요합니다.".to_string())
+        };
+    };
+    if dependencies.is_empty() {
+        return Err("pythonDependencies가 비어 있으면 pythonLock도 null이어야 합니다.".to_string());
+    }
+    validate_lock_target(&python_lock.target)?;
+    if python_lock.packages.is_empty() {
+        return Err("pythonLock.packages는 비어 있을 수 없습니다.".to_string());
+    }
+    let mut previous: Option<(&str, &str, &str)> = None;
+    let mut package_versions = BTreeMap::new();
+    for (index, package) in python_lock.packages.iter().enumerate() {
+        let canonical_name = normalize_python_name(&package.name)?;
+        let canonical_version = normalize_python_version(&package.version)?;
+        if canonical_name != package.name || canonical_version != package.version {
+            return Err(format!(
+                "pythonLock.packages[{index}] 이름 또는 버전이 정규형이 아닙니다."
+            ));
+        }
+        let key = (
+            package.name.as_str(),
+            package.version.as_str(),
+            package.wheel_filename.as_str(),
+        );
+        if previous.is_some_and(|previous| previous >= key) {
+            return Err(
+                "pythonLock.packages 정렬 순서가 올바르지 않거나 중복되었습니다.".to_string(),
+            );
+        }
+        previous = Some(key);
+        if package_versions
+            .insert(package.name.clone(), package.version.clone())
+            .is_some()
+        {
+            return Err(format!(
+                "pythonLock 패키지 이름이 중복되었습니다: {}",
+                package.name
+            ));
+        }
+        validate_locked_wheel(package)
+            .map_err(|error| format!("pythonLock.packages[{index}]: {error}"))?;
+    }
+    for dependency in dependencies {
+        let (name, version) = dependency.split_once("==").expect("validated dependency");
+        if package_versions.get(name).map(String::as_str) != Some(version) {
+            return Err(format!(
+                "직접 의존성 {dependency}의 정확한 wheel 기록이 없습니다."
+            ));
+        }
+    }
+    let expected =
+        compute_python_lock_digest(dependencies, &python_lock.target, &python_lock.packages)?;
+    if python_lock.digest != expected {
+        return Err("pythonLock.digest가 선언 및 wheel 기록과 일치하지 않습니다.".to_string());
+    }
+    Ok(())
+}
+
+fn validate_lock_target(target: &PythonLockTarget) -> Result<(), String> {
+    if target.os != PYTHON_LOCK_OS
+        || target.arch != PYTHON_LOCK_ARCH
+        || target.uv_version != MANAGED_UV_VERSION
+    {
+        return Err(format!(
+            "pythonLock.target은 {PYTHON_LOCK_OS}/{PYTHON_LOCK_ARCH}/uv {MANAGED_UV_VERSION}이어야 합니다."
+        ));
+    }
+    if !target.python_abi.starts_with("cp")
+        || !(4..=6).contains(&target.python_abi.len())
+        || !target.python_abi[2..]
+            .bytes()
+            .all(|byte| byte.is_ascii_digit())
+    {
+        return Err("pythonLock.target.pythonAbi가 올바른 CPython ABI가 아닙니다.".to_string());
+    }
+    validate_lower_sha256(&target.euddraft_fingerprint, "euddraftFingerprint")
+}
+
+fn validate_locked_wheel(package: &PythonLockedPackage) -> Result<(), String> {
+    validate_lower_sha256(&package.sha256, "sha256")?;
+    if package.wheel_filename.contains(['/', '\\']) || !package.wheel_filename.ends_with(".whl") {
+        return Err("wheelFilename은 경로가 없는 .whl 파일명이어야 합니다.".to_string());
+    }
+    let stem = package.wheel_filename.trim_end_matches(".whl");
+    let parts: Vec<_> = stem.split('-').collect();
+    if parts.len() < 5
+        || normalize_python_name(parts[0]).as_deref() != Ok(package.name.as_str())
+        || normalize_python_version(parts[1]).as_deref() != Ok(package.version.as_str())
+    {
+        return Err("wheelFilename의 배포 이름 또는 버전이 패키지 기록과 다릅니다.".to_string());
+    }
+    let python_tags = parts[parts.len() - 3].split('.').collect::<Vec<_>>();
+    let abi_tags = parts[parts.len() - 2].split('.').collect::<Vec<_>>();
+    let platform_tags = parts[parts.len() - 1].split('.').collect::<Vec<_>>();
+    if python_tags
+        .iter()
+        .chain(&abi_tags)
+        .chain(&platform_tags)
+        .any(|tag| {
+            tag.is_empty()
+                || !tag
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        })
+    {
+        return Err("wheelFilename 태그 형식이 올바르지 않습니다.".to_string());
+    }
+    let mut parsed_tags = Vec::new();
+    for python in python_tags {
+        for abi in &abi_tags {
+            for platform in &platform_tags {
+                parsed_tags.push(format!("{python}-{abi}-{platform}"));
+            }
+        }
+    }
+    parsed_tags.sort();
+    parsed_tags.dedup();
+    if parsed_tags != package.wheel_tags {
+        return Err("wheelTags가 wheelFilename에서 파싱한 정렬 태그와 다릅니다.".to_string());
+    }
+    let Some(path) = package
+        .artifact_url
+        .strip_prefix("https://files.pythonhosted.org/packages/")
+    else {
+        return Err(
+            "artifactUrl은 files.pythonhosted.org의 HTTPS PyPI URL이어야 합니다.".to_string(),
+        );
+    };
+    if path.is_empty()
+        || path.contains(['?', '#', '\\'])
+        || !path.ends_with(&format!("/{}", package.wheel_filename))
+    {
+        return Err("artifactUrl이 정확한 PyPI wheel 파일을 가리키지 않습니다.".to_string());
+    }
+    Ok(())
+}
+
+fn validate_lower_sha256(value: &str, label: &str) -> Result<(), String> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(format!("{label}은 소문자 SHA-256이어야 합니다."));
+    }
+    Ok(())
+}
+
+pub fn compute_python_lock_digest(
+    dependencies: &[String],
+    target: &PythonLockTarget,
+    packages: &[PythonLockedPackage],
+) -> Result<String, String> {
+    let mut declarations = BTreeMap::new();
+    declarations.insert(
+        "pythonDependencies",
+        serde_json::to_value(dependencies).map_err(|error| error.to_string())?,
+    );
+    let mut target_value = BTreeMap::new();
+    target_value.insert("arch", serde_json::Value::String(target.arch.clone()));
+    target_value.insert(
+        "euddraftFingerprint",
+        serde_json::Value::String(target.euddraft_fingerprint.clone()),
+    );
+    target_value.insert("os", serde_json::Value::String(target.os.clone()));
+    target_value.insert(
+        "pythonAbi",
+        serde_json::Value::String(target.python_abi.clone()),
+    );
+    target_value.insert(
+        "uvVersion",
+        serde_json::Value::String(target.uv_version.clone()),
+    );
+    let package_values = packages
+        .iter()
+        .map(|package| {
+            let mut value = BTreeMap::new();
+            value.insert(
+                "artifactUrl",
+                serde_json::Value::String(package.artifact_url.clone()),
+            );
+            value.insert("name", serde_json::Value::String(package.name.clone()));
+            value.insert("sha256", serde_json::Value::String(package.sha256.clone()));
+            value.insert(
+                "version",
+                serde_json::Value::String(package.version.clone()),
+            );
+            value.insert(
+                "wheelFilename",
+                serde_json::Value::String(package.wheel_filename.clone()),
+            );
+            value.insert(
+                "wheelTags",
+                serde_json::to_value(&package.wheel_tags).map_err(|error| error.to_string())?,
+            );
+            Ok(value)
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let mut value = BTreeMap::new();
+    value.insert(
+        "declarations",
+        serde_json::to_value(declarations).map_err(|error| error.to_string())?,
+    );
+    value.insert(
+        "packages",
+        serde_json::to_value(package_values).map_err(|error| error.to_string())?,
+    );
+    value.insert(
+        "target",
+        serde_json::to_value(target_value).map_err(|error| error.to_string())?,
+    );
+    let canonical = serde_json::to_vec(&value).map_err(|error| error.to_string())?;
+    let mut hasher = Sha256::new();
+    hasher.update(PYTHON_LOCK_DOMAIN);
+    hasher.update(canonical);
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn validate_manifest_source_paths(project: &NativeProject) -> Result<(), String> {
+    let files = project.list_source_files()?;
+    let mut exact = BTreeSet::new();
+    let mut folded = BTreeSet::new();
+    for path in files.iter().filter(|path| is_editable_source_path(path)) {
+        if !folded.insert(windows_case_fold(path)) {
+            return Err(format!(
+                "대소문자를 무시하면 중복되는 소스 경로가 있습니다: {path}"
+            ));
+        }
+        exact.insert(path.as_str());
+        project.require_path(path, true)?;
+    }
+    if !exact.contains(project.manifest.main_file.as_str()) {
+        return Err(format!(
+            "mainFile이 정확한 대소문자의 기존 EPS 소스를 가리키지 않습니다: {}",
+            project.manifest.main_file
+        ));
+    }
+    for entrypoint in &project.manifest.python_entrypoints {
+        if !exact.contains(entrypoint.as_str()) {
+            return Err(format!(
+                "Python 진입점이 정확한 대소문자의 기존 소스를 가리키지 않습니다: {entrypoint}"
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn validate_manifest(manifest: &ProjectManifest) -> Result<(), String> {
     if manifest.schema_version != PROJECT_SCHEMA_VERSION {
         return Err(format!(
@@ -932,7 +1774,32 @@ fn validate_manifest(manifest: &ProjectManifest) -> Result<(), String> {
     if source.eq_ignore_ascii_case(&output) {
         return Err("sourceMap and outputMap must differ".to_string());
     }
-    require_source_path(&main)?;
+    require_eps_source_path(&main)?;
+    let mut entrypoints = BTreeSet::new();
+    for entrypoint in &manifest.python_entrypoints {
+        require_python_source_path(entrypoint)?;
+        if normalize_relative(entrypoint)? != *entrypoint {
+            return Err(format!(
+                "Python 진입점 경로가 정규형이 아닙니다: {entrypoint}"
+            ));
+        }
+        if !entrypoints.insert(windows_case_fold(entrypoint)) {
+            return Err(format!("Python 진입점이 중복되었습니다: {entrypoint}"));
+        }
+    }
+    validate_python_lock(&manifest.python_dependencies, manifest.python_lock.as_ref())?;
+    if let Some(value) = manifest.settings.decode_unit_name.as_deref() {
+        if value.is_empty()
+            || value.len() > 128
+            || value
+                .chars()
+                .any(|character| matches!(character, '\r' | '\n' | '\0'))
+        {
+            return Err(
+                "settings.decodeUnitName은 1..128자의 단일 행 값이어야 합니다.".to_string(),
+            );
+        }
+    }
     if manifest.settings.sector_size == 0 || manifest.settings.sector_size > 255 {
         return Err("settings.sectorSize must be in 1..255".to_string());
     }
@@ -1172,16 +2039,46 @@ fn validate_component(value: &str, label: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn require_source_path(path: &str) -> Result<(), String> {
+pub fn require_eps_source_path(path: &str) -> Result<(), String> {
+    require_source_extension(path, "eps", "EPS")
+}
+
+pub fn require_python_source_path(path: &str) -> Result<(), String> {
+    require_source_extension(path, "py", "Python")
+}
+
+pub fn require_editable_source_path(path: &str) -> Result<(), String> {
     let normalized = normalize_relative(path)?;
-    if !normalized.starts_with("src/") || !normalized.to_lowercase().ends_with(".eps") {
-        return Err("EPS source path must be under src/ and end in .eps".to_string());
+    if !normalized.starts_with("src/") || !matches_extension(&normalized, &["eps", "py"]) {
+        return Err("편집 가능한 소스는 src/ 아래의 .eps 또는 .py 파일이어야 합니다.".to_string());
     }
     Ok(())
 }
 
+fn require_source_extension(path: &str, extension: &str, label: &str) -> Result<(), String> {
+    let normalized = normalize_relative(path)?;
+    if !normalized.starts_with("src/") || !matches_extension(&normalized, &[extension]) {
+        return Err(format!(
+            "{label} 소스는 src/ 아래의 .{extension} 파일이어야 합니다."
+        ));
+    }
+    Ok(())
+}
+
+fn is_python_source_path(path: &str) -> bool {
+    require_python_source_path(path).is_ok()
+}
+
+fn is_editable_source_path(path: &str) -> bool {
+    require_editable_source_path(path).is_ok()
+}
+
+fn windows_case_fold(value: &str) -> String {
+    value.to_lowercase()
+}
+
 pub fn normalize_relative(value: &str) -> Result<String, String> {
-    if value.is_empty() || value.contains(['\0', '\\']) {
+    if value.is_empty() || value.contains(['\0', '\\', '\r', '\n', '[', ']']) {
         return Err("path must be non-empty and use '/' separators".to_string());
     }
     let path = Path::new(value);
@@ -1231,9 +2128,10 @@ fn collect_text_files(
     entries.sort_by_key(|entry| entry.file_name().to_string_lossy().to_lowercase());
     for entry in entries {
         let file_type = entry.file_type().map_err(stringify_io)?;
-        if file_type.is_symlink() {
+        let metadata = fs::symlink_metadata(entry.path()).map_err(stringify_io)?;
+        if file_type.is_symlink() || crate::memory::is_reparse_point(&metadata) {
             return Err(format!(
-                "symlinks are forbidden in native source trees: {}",
+                "네이티브 소스 트리에는 심볼릭 링크나 재분석 지점을 둘 수 없습니다: {}",
                 entry.path().display()
             ));
         }
@@ -1288,6 +2186,103 @@ fn read_bounded_text(path: &Path) -> Result<String, String> {
     String::from_utf8(bytes).map_err(|error| error.to_string())
 }
 
+fn root_exists_as_symlink(root: &Path) -> Result<bool, String> {
+    match fs::symlink_metadata(root) {
+        Ok(metadata) => Ok(metadata.file_type().is_symlink()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(stringify_io(error)),
+    }
+}
+
+pub(crate) fn discover_manifest_files(root: &Path) -> Result<Vec<PathBuf>, String> {
+    let mut manifests = Vec::new();
+    for entry in fs::read_dir(root).map_err(stringify_io)? {
+        let entry = entry.map_err(stringify_io)?;
+        let file_name = entry.file_name();
+        let is_eap = file_name
+            .to_str()
+            .and_then(|name| Path::new(name).extension())
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("eap"));
+        if !is_eap {
+            continue;
+        }
+        let metadata = fs::symlink_metadata(entry.path()).map_err(stringify_io)?;
+        if metadata.file_type().is_symlink() {
+            return Err(format!(
+                "canonical .eap manifest must be a regular, non-symlink file: {}",
+                entry.path().display()
+            ));
+        }
+        if !metadata.file_type().is_file() {
+            return Err(format!(
+                "canonical .eap manifest must be a regular file: {}",
+                entry.path().display()
+            ));
+        }
+        manifests.push(fs::canonicalize(entry.path()).map_err(stringify_io)?);
+    }
+    Ok(manifests)
+}
+
+fn discover_manifest_path(root: &Path) -> Result<PathBuf, String> {
+    let mut manifests = discover_manifest_files(root)?;
+    match manifests.len() {
+        0 => Err(format!(
+            "native project has no canonical .eap manifest in {}",
+            root.display()
+        )),
+        1 => Ok(manifests.remove(0)),
+        count => Err(format!(
+            "native project has ambiguous canonical manifests ({count} .eap files)"
+        )),
+    }
+}
+
+fn reject_legacy_authority(root: &Path) -> Result<(), String> {
+    for entry in fs::read_dir(root).map_err(stringify_io)? {
+        let entry = entry.map_err(stringify_io)?;
+        let is_descriptor = entry
+            .path()
+            .extension()
+            .and_then(|value| value.to_str())
+            .is_some_and(|value| value.eq_ignore_ascii_case("eudproj"));
+        let is_legacy_manifest = entry
+            .file_name()
+            .to_str()
+            .is_some_and(|value| value.eq_ignore_ascii_case(LEGACY_PROJECT_MANIFEST_FILE));
+        if is_descriptor || is_legacy_manifest {
+            return Err("project has both canonical and legacy manifest authorities".to_string());
+        }
+    }
+    Ok(())
+}
+
+fn ensure_no_symlink_components(path: &Path) -> Result<(), String> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().map_err(stringify_io)?.join(path)
+    };
+    for ancestor in absolute.ancestors() {
+        match fs::symlink_metadata(ancestor) {
+            Ok(metadata)
+                if metadata.file_type().is_symlink()
+                    || crate::memory::is_reparse_point(&metadata) =>
+            {
+                return Err(format!(
+                    "프로젝트 경로에 심볼릭 링크 또는 재분석 지점이 있습니다: {}",
+                    ancestor.display()
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(stringify_io(error)),
+        }
+    }
+    Ok(())
+}
+
 fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T, String> {
     let text = read_bounded_text(path)?;
     serde_json::from_str(&text)
@@ -1337,7 +2332,7 @@ mod tests {
 
     fn manifest() -> ProjectManifest {
         ProjectManifest {
-            schema_version: 1,
+            schema_version: PROJECT_SCHEMA_VERSION,
             name: "Native Demo".to_string(),
             source_map: "maps/source.scx".to_string(),
             output_map: "build/output.scx".to_string(),
@@ -1348,6 +2343,9 @@ mod tests {
                 entries: Vec::new(),
                 raw_text: None,
             }],
+            python_entrypoints: Vec::new(),
+            python_dependencies: Vec::new(),
+            python_lock: None,
             editor_compatibility: None,
         }
     }
@@ -1384,6 +2382,231 @@ mod tests {
         assert_eq!(project.manifest().main_file, "src/core/main.eps");
         assert!(project.delete_source("src/core/main.eps").is_err());
         fs::remove_dir_all(root).ok();
+    }
+    #[cfg(windows)]
+    #[test]
+    fn dependency_replace_restores_manifest_when_revision_fails_after_write() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let (root, mut project) = project("dependency-revision-rollback");
+        let before = fs::read(root.join(PROJECT_MANIFEST_FILE)).unwrap();
+        let dependencies = vec!["demo==1.0".to_string()];
+        let target = PythonLockTarget {
+            os: PYTHON_LOCK_OS.to_string(),
+            arch: PYTHON_LOCK_ARCH.to_string(),
+            python_abi: "cp313".to_string(),
+            euddraft_fingerprint: "a".repeat(64),
+            uv_version: MANAGED_UV_VERSION.to_string(),
+        };
+        let packages = vec![PythonLockedPackage {
+            name: "demo".to_string(),
+            version: "1.0".to_string(),
+            wheel_filename: "demo-1.0-py3-none-any.whl".to_string(),
+            wheel_tags: vec!["py3-none-any".to_string()],
+            artifact_url: "https://files.pythonhosted.org/packages/aa/demo-1.0-py3-none-any.whl"
+                .to_string(),
+            sha256: "b".repeat(64),
+        }];
+        let lock = PythonLock {
+            digest: compute_python_lock_digest(&dependencies, &target, &packages).unwrap(),
+            target,
+            packages,
+        };
+        let _source_lock = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(root.join("src/main.eps"))
+            .unwrap();
+        assert!(project
+            .replace_python_dependencies(dependencies, Some(lock))
+            .is_err());
+        assert_eq!(fs::read(root.join(PROJECT_MANIFEST_FILE)).unwrap(), before);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn main_file_requires_exact_existing_source_case() {
+        let (root, mut project) = project("main-case");
+        assert!(project.set_main_file("src/MAIN.eps").is_err());
+        assert_eq!(project.manifest().main_file, "src/main.eps");
+        assert_eq!(
+            NativeProject::open(&root).unwrap().manifest().main_file,
+            "src/main.eps"
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn renamed_manifest_remains_the_persistence_target() {
+        let (root, project) = project("renamed-manifest");
+        let original = root.join(PROJECT_MANIFEST_FILE);
+        let renamed = root.join("custom-name.eap");
+        fs::rename(&original, &renamed).unwrap();
+        let mut reopened = NativeProject::open(&root).unwrap();
+        reopened
+            .create_source("src/alternate.eps", "function alternate() {}\n")
+            .unwrap();
+        reopened.set_main_file("src/alternate.eps").unwrap();
+        assert!(!original.exists());
+        let persisted: ProjectManifest =
+            serde_json::from_slice(&fs::read(&renamed).unwrap()).unwrap();
+        assert_eq!(persisted.main_file, "src/alternate.eps");
+        drop(project);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn manifest_rejects_eds_scalar_injection_and_invalid_entrypoint_matrix() {
+        let mut injected = manifest();
+        injected.settings.decode_unit_name = Some("True\n[src/hidden.py]".to_string());
+        assert!(validate_manifest(&injected).is_err());
+
+        let mut path_injected = manifest();
+        path_injected.output_map = "build/output.scx\n[src/hidden.py]\n#keep.scx".to_string();
+        assert!(validate_manifest(&path_injected).is_err());
+
+        let (root, project) = project("invalid-python-entrypoints");
+        project.create_source("src/bootstrap.py", "pass\n").unwrap();
+        let manifest_path = root.join(PROJECT_MANIFEST_FILE);
+        let base: ProjectManifest =
+            serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+        for entrypoints in [
+            vec![
+                "src/bootstrap.py".to_string(),
+                "src/BOOTSTRAP.py".to_string(),
+            ],
+            vec!["../outside.py".to_string()],
+            vec!["src/missing.py".to_string()],
+            vec!["src/BOOTSTRAP.py".to_string()],
+            vec!["src/main.eps".to_string()],
+        ] {
+            let mut invalid = base.clone();
+            invalid.python_entrypoints = entrypoints;
+            write_json(&manifest_path, &invalid).unwrap();
+            assert!(NativeProject::open(&root).is_err());
+        }
+        write_json(&manifest_path, &base).unwrap();
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn helper_only_python_change_updates_project_revision() {
+        let (root, project) = project("python-helper-revision");
+        project
+            .create_source("src/helper.py", "VALUE = 1\n")
+            .unwrap();
+        let before = project.revision().unwrap();
+        project
+            .write_source("src/helper.py", "VALUE = 2\n")
+            .unwrap();
+        let after = project.revision().unwrap();
+        assert_ne!(before, after);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn python_lock_identity_rejects_every_tampered_field() {
+        let dependencies = vec!["demo==1.0".to_string()];
+        let target = PythonLockTarget {
+            os: PYTHON_LOCK_OS.to_string(),
+            arch: PYTHON_LOCK_ARCH.to_string(),
+            python_abi: "cp313".to_string(),
+            euddraft_fingerprint: "a".repeat(64),
+            uv_version: MANAGED_UV_VERSION.to_string(),
+        };
+        let packages = vec![PythonLockedPackage {
+            name: "demo".to_string(),
+            version: "1.0".to_string(),
+            wheel_filename: "demo-1.0-py3-none-any.whl".to_string(),
+            wheel_tags: vec!["py3-none-any".to_string()],
+            artifact_url: "https://files.pythonhosted.org/packages/aa/demo-1.0-py3-none-any.whl"
+                .to_string(),
+            sha256: "b".repeat(64),
+        }];
+        let lock = PythonLock {
+            digest: compute_python_lock_digest(&dependencies, &target, &packages).unwrap(),
+            target,
+            packages,
+        };
+        validate_python_lock(&dependencies, Some(&lock)).unwrap();
+        let mut variants = Vec::new();
+        let mut value = lock.clone();
+        value.packages[0].wheel_filename = "demo-1.0-cp313-cp313-win_amd64.whl".to_string();
+        variants.push(value);
+        let mut value = lock.clone();
+        value.packages[0].sha256 = "c".repeat(64);
+        variants.push(value);
+        let mut value = lock.clone();
+        value.packages[0].artifact_url = "https://example.invalid/demo.whl".to_string();
+        variants.push(value);
+        let mut value = lock.clone();
+        value.target.euddraft_fingerprint = "d".repeat(64);
+        variants.push(value);
+        let mut value = lock.clone();
+        value.target.python_abi = "cp312".to_string();
+        variants.push(value);
+        let mut value = lock;
+        value.digest = "e".repeat(64);
+        variants.push(value);
+        for tampered in variants {
+            assert!(validate_python_lock(&dependencies, Some(&tampered)).is_err());
+        }
+    }
+
+    #[test]
+    fn python_sources_are_first_class_and_selected_entrypoints_are_guarded() {
+        let (root, mut project) = project("python-source");
+        project
+            .create_source("src/bootstrap.py", "from eudplib import *\n")
+            .unwrap();
+        assert!(project.create_source("src/bad.txt", "x").is_err());
+        assert!(project.set_main_file("src/bootstrap.py").is_err());
+
+        let mut manifest: ProjectManifest =
+            serde_json::from_slice(&fs::read(root.join(PROJECT_MANIFEST_FILE)).unwrap()).unwrap();
+        manifest.python_entrypoints = vec!["src/bootstrap.py".to_string()];
+        write_json(&root.join(PROJECT_MANIFEST_FILE), &manifest).unwrap();
+
+        let mut reopened = NativeProject::open(&root).unwrap();
+        assert!(reopened.has_direct_python().unwrap());
+        assert!(reopened
+            .source_snapshot()
+            .unwrap()
+            .files
+            .iter()
+            .any(|file| file.path == "src/bootstrap.py"));
+        reopened
+            .move_source("src/bootstrap.py", "src/runtime/bootstrap.py")
+            .unwrap();
+        assert_eq!(
+            reopened.manifest().python_entrypoints,
+            vec!["src/runtime/bootstrap.py"]
+        );
+        assert!(reopened.delete_source("src/runtime/bootstrap.py").is_err());
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn exact_python_dependencies_normalize_and_reject_unsupported_forms() {
+        assert_eq!(
+            validate_python_dependencies(&[
+                "Requests==2.032.0".to_string(),
+                "typing_extensions==4.12.2".to_string(),
+            ])
+            .unwrap(),
+            vec!["requests==2.32.0", "typing-extensions==4.12.2"]
+        );
+        for invalid in [
+            "requests>=2",
+            "requests",
+            "requests[security]==2.32.0",
+            "git+https://example.test/x",
+        ] {
+            assert!(
+                validate_python_dependencies(&[invalid.to_string()]).is_err(),
+                "accepted {invalid}"
+            );
+        }
     }
 
     #[test]

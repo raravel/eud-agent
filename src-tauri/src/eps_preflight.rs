@@ -192,8 +192,12 @@ impl SnapshotProvider for ConfiguredSnapshotProvider {
                 .files
                 .into_iter()
                 .map(|file| EpsSnapshotFile {
+                    ftype: if file.path.to_ascii_lowercase().ends_with(".py") {
+                        "CUIPy".to_string()
+                    } else {
+                        "CUIEps".to_string()
+                    },
                     path: file.path,
-                    ftype: "CUIEps".to_string(),
                     content: Some(file.content),
                 })
                 .collect(),
@@ -222,6 +226,10 @@ fn tracked_analysis_path(state: &PreflightState, path: &str) -> Option<(String, 
         .cloned()
         .or_else(|| normalize_project_path(&snapshot_path).ok())?;
     Some((key, analysis_path))
+}
+
+fn routes_to_eps_preflight(ftype: &str) -> bool {
+    ftype == "CUIEps"
 }
 
 /// Request-aware snapshot/mirror owner. Each session owns one instance; the
@@ -387,7 +395,10 @@ impl EpsPreflight {
         }
     }
 
-    pub fn write_applied(&self, request_id: &str, path: &str, code: &str) {
+    pub fn write_applied(&self, request_id: &str, path: &str, ftype: &str, code: &str) {
+        if !routes_to_eps_preflight(ftype) {
+            return;
+        }
         let mut state = self.state.lock();
         if state.request_id.as_deref() != Some(request_id) || !state.snapshot_ready {
             return;
@@ -404,7 +415,10 @@ impl EpsPreflight {
         }
     }
 
-    pub fn rename_applied(&self, request_id: &str, from: &str, to: &str) {
+    pub fn rename_applied(&self, request_id: &str, from: &str, to: &str, ftype: &str) {
+        if !routes_to_eps_preflight(ftype) {
+            return;
+        }
         let mut state = self.state.lock();
         if state.request_id.as_deref() != Some(request_id) || !state.snapshot_ready {
             return;
@@ -444,7 +458,10 @@ impl EpsPreflight {
         }
     }
 
-    pub fn delete_applied(&self, request_id: &str, path: &str) {
+    pub fn delete_applied(&self, request_id: &str, path: &str, ftype: &str) {
+        if !routes_to_eps_preflight(ftype) {
+            return;
+        }
         let mut state = self.state.lock();
         if state.request_id.as_deref() != Some(request_id) || !state.snapshot_ready {
             return;
@@ -507,6 +524,9 @@ fn refresh_mirror(dirs: &DataDirs, snapshot: &EpsSnapshot) -> io::Result<Refresh
     let mut seen = HashMap::<String, String>::new();
     let populate = (|| -> io::Result<()> {
         for file in &snapshot.files {
+            if !routes_to_eps_preflight(&file.ftype) {
+                continue;
+            }
             let snapshot_path = normalize_snapshot_path(&file.path)
                 .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
             let project_path = if snapshot_path.to_lowercase().ends_with(".eps") {
@@ -1522,6 +1542,13 @@ mod tests {
     use super::*;
     use crate::source_snapshot::ProjectSnapshotFile as EpsSnapshotFile;
     use std::collections::VecDeque;
+
+    #[test]
+    fn only_cuieps_routes_to_eps_preflight() {
+        assert!(routes_to_eps_preflight("CUIEps"));
+        assert!(!routes_to_eps_preflight("CUIPy"));
+        assert!(!routes_to_eps_preflight("RawText"));
+    }
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn temp_dirs(tag: &str) -> DataDirs {
@@ -1664,11 +1691,18 @@ mod tests {
         let snapshot = EpsSnapshot {
             project: "OverlayProject".into(),
             identity: "OverlayProject\nmap.scx".into(),
-            files: vec![EpsSnapshotFile {
-                path: "main.eps".into(),
-                ftype: "CUIEps".into(),
-                content: Some("const old = 1;".into()),
-            }],
+            files: vec![
+                EpsSnapshotFile {
+                    path: "main.eps".into(),
+                    ftype: "CUIEps".into(),
+                    content: Some("const old = 1;".into()),
+                },
+                EpsSnapshotFile {
+                    path: "helper.py".into(),
+                    ftype: "CUIPy".into(),
+                    content: Some("from eudplib import *".into()),
+                },
+            ],
         };
         let mirror = refresh_mirror(&dirs, &snapshot).unwrap();
         let analysis = prepare_analysis_root(
@@ -1689,6 +1723,8 @@ mod tests {
             fs::read_to_string(mirror.mirror_root.join("main.eps")).unwrap(),
             "const old = 1;"
         );
+        assert!(!mirror.mirror_root.join("helper.py").exists());
+        assert!(!mirror.mirror_root.join("helper.py.eps").exists());
         assert_eq!(
             fs::read_to_string(analysis.join("main.eps")).unwrap(),
             "const new = 2;"
@@ -1865,6 +1901,7 @@ mod tests {
         preflight.write_applied(
             "request",
             "survivor_mvp",
+            "CUIEps",
             "function onPluginStart() {\n    init();\n}\n",
         );
         assert_eq!(
@@ -2119,9 +2156,9 @@ mod tests {
                 }],
             )
             .unwrap();
-        preflight.write_applied("request", "main.eps", "written");
-        preflight.rename_applied("request", "main.eps", "renamed.eps");
-        preflight.delete_applied("request", "renamed.eps");
+        preflight.write_applied("request", "main.eps", "CUIEps", "written");
+        preflight.rename_applied("request", "main.eps", "renamed.eps", "CUIEps");
+        preflight.delete_applied("request", "renamed.eps", "CUIEps");
         preflight.invalidate("request");
         preflight
             .check(

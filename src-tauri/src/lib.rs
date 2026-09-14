@@ -15,6 +15,7 @@ pub mod bootstrap;
 pub mod chk;
 pub mod claude_auth;
 pub mod claude_client;
+pub mod codex_adapter;
 pub mod codex_auth;
 pub mod codex_client;
 pub mod config;
@@ -23,6 +24,7 @@ pub mod e3s_nrbf;
 pub mod engine;
 pub mod eps_preflight;
 pub mod harness;
+pub mod harness_import;
 pub mod ipc;
 pub mod journal;
 pub mod map_agent;
@@ -44,6 +46,8 @@ mod nrbf;
 pub mod ollama;
 pub mod opencode_go;
 pub mod provider;
+pub(crate) mod provider_process;
+pub mod provider_runtime;
 pub mod provider_secrets;
 pub mod provider_service;
 pub mod provider_tool_loop;
@@ -195,12 +199,6 @@ pub fn run() {
                 Err(error) => {
                     eprintln!("eud-agent: cannot resolve native compatibility assets: {error}")
                 }
-            }
-            let removed_episodes = memory::cleanup_legacy_episode_files(&data_dirs.memory_dir());
-            if removed_episodes > 0 {
-                eprintln!(
-                    "eud-agent: removed {removed_episodes} obsolete project-memory episode files"
-                );
             }
             let attachment_store = attachment::AttachmentStore::new(data_dirs.attachments_dir());
             attachment_store.cleanup_stale_drafts();
