@@ -241,6 +241,37 @@ beforeEach(() => {
         };
       case "app_settings_save":
         return args?.settings;
+      case "euddraft_settings":
+        return {
+          path: "C:/euddraft/euddraft.exe",
+          valid: true,
+          managed: true,
+          installedVersion: "v0.10.2.5",
+          updateAvailable: false,
+        };
+      case "euddraft_check_update":
+        return {
+          path: "C:/euddraft/euddraft.exe",
+          valid: true,
+          managed: true,
+          installedVersion: "v0.10.2.5",
+          latestVersion: "v0.11.0.1",
+          updateAvailable: true,
+        };
+      case "euddraft_update":
+        emit("progress", {
+          stage: "euddraft_update",
+          pct: 50,
+          detail: "downloading euddraft v0.11.0.1",
+        });
+        return {
+          path: "C:/euddraft/updated/euddraft.exe",
+          valid: true,
+          managed: true,
+          installedVersion: "v0.11.0.1",
+          latestVersion: "v0.11.0.1",
+          updateAvailable: false,
+        };
       case "attention_notify":
       case "notification_sound_preview":
         return undefined;
@@ -960,6 +991,34 @@ describe("App notifications", () => {
     await waitFor(() =>
       expect(tauri.invoke).toHaveBeenCalledWith("notification_sound_preview"),
     );
+  });
+
+  it("checks and applies an euddraft update from compile settings", async () => {
+    render(<App />);
+    fireEvent.click(
+      await screen.findByRole("button", { name: "설정 열기" }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "컴파일" }));
+
+    expect(
+      await screen.findByText("C:/euddraft/euddraft.exe"),
+    ).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "최신 버전 확인" }));
+    expect(
+      await screen.findByText(/새 euddraft v0\.11\.0\.1 버전을 설치할 수 있습니다/),
+    ).toBeInTheDocument();
+    fireEvent.click(
+      screen.getByRole("button", { name: "최신 버전으로 업데이트" }),
+    );
+
+    expect(
+      await screen.findByText("C:/euddraft/updated/euddraft.exe"),
+    ).toBeInTheDocument();
+    expect(screen.getByRole("dialog", { name: "설정" })).toBeInTheDocument();
+    expect(screen.queryByText("euddraft_update")).not.toBeInTheDocument();
+    expect(screen.getByText("최신 버전을 사용 중입니다.")).toBeInTheDocument();
+    expect(tauri.invoke).toHaveBeenCalledWith("euddraft_check_update");
+    expect(tauri.invoke).toHaveBeenCalledWith("euddraft_update");
   });
 
   it("notifies once when each new review surface appears", async () => {

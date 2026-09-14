@@ -49,6 +49,7 @@ export const PROGRESS_STAGES = [
   "waiting_build",
   "trace_test",
   "bootstrap",
+  "euddraft_update",
   "audio_probe",
   "audio_transcode",
   "audio_validate",

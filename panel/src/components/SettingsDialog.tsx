@@ -5,16 +5,17 @@ import {
   Bot,
   CheckCircle2,
   ChevronRight,
+  Download,
   FileInput,
   FileOutput,
   FolderKanban,
+  Hammer,
   LoaderCircle,
   Plus,
   RefreshCw,
   Volume2,
   X,
 } from "lucide-react";
-
 import {
   ProviderCard,
   ProviderStatusBadge,
@@ -31,10 +32,11 @@ import {
 import { Switch } from "@/components/ui/switch";
 import type {
   AppSettings,
+  EuddraftSettings,
   NotificationChannelSettings,
   NotificationEvent,
 } from "@/lib/ipc";
-import { cn } from "@/lib/utils";
+import { cn, formatPathForDisplay } from "@/lib/utils";
 import {
   AVAILABILITY_LABELS,
   PROVIDER_DESCRIPTIONS,
@@ -62,6 +64,9 @@ export interface SettingsDialogProps {
   hasApiKeys?: Partial<Record<ProviderId, boolean>>;
   providerErrors: Partial<Record<ProviderId, string>>;
   projectBusy?: "open" | "create" | "import" | "export" | null;
+  euddraft: EuddraftSettings | null;
+  euddraftBusy?: "load" | "check" | "update" | null;
+  euddraftError?: string;
   onOpenChange(open: boolean): void;
   onSettingsChange(settings: AppSettings): void;
   onReload(): void;
@@ -85,9 +90,11 @@ export interface SettingsDialogProps {
   onProjectCreate(): void;
   onProjectImport(): void;
   onProjectExport(): void;
+  onEuddraftCheck(): void;
+  onEuddraftUpdate(): void;
 }
 
-type SettingsCategory = "project" | "providers" | "notifications";
+type SettingsCategory = "project" | "compile" | "providers" | "notifications";
 
 const EVENT_COPY: Readonly<
   Record<NotificationEvent, { title: string; description: string }>
@@ -110,6 +117,176 @@ const EVENT_COPY: Readonly<
   },
 };
 
+interface EuddraftSettingsPanelProps {
+  status: EuddraftSettings | null;
+  busy: "load" | "check" | "update" | null;
+  error?: string;
+  onCheck(): void;
+  onUpdate(): void;
+}
+
+function EuddraftSettingsPanel({
+  status,
+  busy,
+  error,
+  onCheck,
+  onUpdate,
+}: EuddraftSettingsPanelProps) {
+  return (
+    <div className="animate-in fade-in duration-200 motion-reduce:animate-none">
+      <div className="flex items-start justify-between gap-4">
+        <div>
+          <h2 className="text-base font-semibold">euddraft 컴파일 도구</h2>
+          <p className="mt-1.5 text-sm leading-6 text-muted-foreground">
+            설치 경로와 관리형 배포판 버전을 확인하고 최신 공식 릴리스로
+            업데이트합니다.
+          </p>
+        </div>
+        {busy !== null && (
+          <span
+            role="status"
+            className="flex shrink-0 items-center gap-1.5 text-xs text-muted-foreground"
+          >
+            <LoaderCircle
+              aria-hidden
+              className="size-3.5 animate-spin motion-reduce:animate-none"
+            />
+            {busy === "update"
+              ? "업데이트 중…"
+              : busy === "check"
+                ? "확인 중…"
+                : "불러오는 중…"}
+          </span>
+        )}
+      </div>
+
+      {status ? (
+        <>
+          <dl className="mt-5 overflow-hidden rounded-xl border border-border bg-card/40">
+            <div className="grid gap-1.5 border-b border-border px-4 py-3.5">
+              <dt className="text-xs font-medium text-muted-foreground">
+                설치 경로
+              </dt>
+              <dd
+                className="break-all font-mono text-sm text-foreground"
+                title={formatPathForDisplay(status.path)}
+              >
+                {formatPathForDisplay(status.path) || "설정되지 않음"}
+              </dd>
+            </div>
+            <div className="grid grid-cols-2 gap-4 px-4 py-3.5">
+              <div>
+                <dt className="text-xs font-medium text-muted-foreground">
+                  현재 버전
+                </dt>
+                <dd className="mt-1 text-sm font-semibold">
+                  {status.installedVersion ?? "버전 정보 없음"}
+                </dd>
+              </div>
+              <div>
+                <dt className="text-xs font-medium text-muted-foreground">
+                  최신 버전
+                </dt>
+                <dd className="mt-1 text-sm font-semibold">
+                  {status.latestVersion ?? "확인 전"}
+                </dd>
+              </div>
+            </div>
+          </dl>
+
+          {!status.valid && (
+            <p
+              role="alert"
+              className="mt-3 rounded-lg border border-destructive/40 bg-destructive/10 px-4 py-3 text-sm text-destructive"
+            >
+              설정된 euddraft를 찾을 수 없습니다. 부트스트랩 화면에서 경로를
+              다시 선택해 주세요.
+            </p>
+          )}
+          {status.valid && !status.managed && (
+            <p className="mt-3 rounded-lg border border-border bg-muted/30 px-4 py-3 text-xs leading-5 text-muted-foreground">
+              직접 선택한 배포판은 버전을 자동 판별할 수 없습니다. 최신 관리형
+              배포판을 설치하면 이후 버전을 자동으로 비교할 수 있습니다.
+            </p>
+          )}
+          {status.latestVersion &&
+            status.managed &&
+            !status.updateAvailable && (
+              <p className="mt-3 flex items-center gap-2 rounded-lg border border-emerald-500/30 bg-emerald-500/10 px-4 py-3 text-sm text-emerald-700 dark:text-emerald-300">
+                <CheckCircle2 aria-hidden className="size-4 shrink-0" />
+                최신 버전을 사용 중입니다.
+              </p>
+            )}
+          {status.updateAvailable && (
+            <p className="mt-3 rounded-lg border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-sm text-amber-800 dark:text-amber-200">
+              새 euddraft {status.latestVersion} 버전을 설치할 수 있습니다.
+            </p>
+          )}
+          {error && (
+            <p
+              role="alert"
+              className="mt-3 rounded-lg border border-destructive/40 bg-destructive/10 px-4 py-3 text-sm text-destructive"
+            >
+              {error}
+            </p>
+          )}
+
+          <div className="mt-5 flex flex-col gap-3 sm:flex-row sm:justify-end">
+            <Button
+              type="button"
+              variant="outline"
+              className="h-11"
+              disabled={busy !== null}
+              onClick={onCheck}
+            >
+              <RefreshCw aria-hidden className="size-4" />
+              최신 버전 확인
+            </Button>
+            {status.latestVersion &&
+              (status.updateAvailable || !status.managed) && (
+                <Button
+                  type="button"
+                  className="h-11"
+                  disabled={busy !== null}
+                  onClick={onUpdate}
+                >
+                  {busy === "update" ? (
+                    <LoaderCircle
+                      aria-hidden
+                      className="size-4 animate-spin motion-reduce:animate-none"
+                    />
+                  ) : (
+                    <Download aria-hidden className="size-4" />
+                  )}
+                  {status.managed
+                    ? "최신 버전으로 업데이트"
+                    : "최신 관리형 버전 설치"}
+                </Button>
+              )}
+          </div>
+        </>
+      ) : (
+        <div className="mt-5 flex min-h-52 flex-col items-center justify-center rounded-xl border border-dashed border-border text-center">
+          <p className="text-sm text-muted-foreground">
+            euddraft 설정을 불러오지 못했습니다.
+          </p>
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            className="mt-3 h-11 gap-1.5"
+            disabled={busy !== null}
+            onClick={onCheck}
+          >
+            <RefreshCw aria-hidden className="size-3.5" />
+            다시 시도
+          </Button>
+        </div>
+      )}
+    </div>
+  );
+}
+
 export function SettingsDialog({
   open,
   settings,
@@ -125,6 +302,9 @@ export function SettingsDialog({
   hasApiKeys = {},
   providerErrors,
   projectBusy = null,
+  euddraft,
+  euddraftBusy = null,
+  euddraftError,
   onOpenChange,
   onSettingsChange,
   onReload,
@@ -144,6 +324,8 @@ export function SettingsDialog({
   onProjectCreate,
   onProjectImport,
   onProjectExport,
+  onEuddraftCheck,
+  onEuddraftUpdate,
 }: SettingsDialogProps) {
   const [category, setCategory] = useState<SettingsCategory>("providers");
   const [selectedProvider, setSelectedProvider] = useState<ProviderId>();
@@ -221,7 +403,8 @@ export function SettingsDialog({
         <DialogHeader className="relative border-b border-border px-4 py-4 pr-16 text-left sm:px-6 sm:py-5">
           <DialogTitle>설정</DialogTitle>
           <DialogDescription>
-            Native 프로젝트, AI 제공자와 사용자 확인 알림을 관리합니다.
+            Native 프로젝트, 컴파일 도구, AI 제공자와 사용자 확인 알림을
+            관리합니다.
           </DialogDescription>
           <DialogClose asChild>
             <Button
@@ -250,6 +433,16 @@ export function SettingsDialog({
             >
               <FolderKanban aria-hidden className="size-4" />
               프로젝트
+            </Button>
+            <Button
+              type="button"
+              variant={category === "compile" ? "secondary" : "ghost"}
+              className="h-11 flex-1 justify-start gap-2 sm:mt-1 sm:w-full"
+              aria-current={category === "compile" ? "page" : undefined}
+              onClick={() => selectCategory("compile")}
+            >
+              <Hammer aria-hidden className="size-4" />
+              컴파일
             </Button>
             <Button
               type="button"
@@ -344,6 +537,14 @@ export function SettingsDialog({
                   프로젝트가 원본이며, EUD Editor 실행 환경은 사용하지 않습니다.
                 </p>
               </div>
+            ) : category === "compile" ? (
+              <EuddraftSettingsPanel
+                status={euddraft}
+                busy={euddraftBusy}
+                error={euddraftError}
+                onCheck={onEuddraftCheck}
+                onUpdate={onEuddraftUpdate}
+              />
             ) : category === "providers" ? (
               selectedProviderStatus ? (
                 <div className="animate-in fade-in slide-in-from-right-2 duration-200 motion-reduce:animate-none">

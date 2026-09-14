@@ -1257,6 +1257,11 @@ async fn fetch_euddraft_release() -> anyhow::Result<EuddraftReleaseSpec> {
     parse_euddraft_release(&bytes)
 }
 
+/// Return the tag of the latest official euddraft GitHub release.
+pub async fn latest_euddraft_version() -> anyhow::Result<String> {
+    Ok(fetch_euddraft_release().await?.version)
+}
+
 fn safe_euddraft_zip_path(name: &str) -> anyhow::Result<PathBuf> {
     if name.is_empty() || name.contains('\\') || name.contains('\0') {
         bail!("euddraft archive contains an invalid member path");
@@ -1426,6 +1431,43 @@ fn validate_euddraft_install(
         bail!("euddraft install version or digest does not match latest release");
     }
     euddraft_install_path(install_dir, &marker)
+}
+
+/// Read the release version for a configured executable installed by this app.
+///
+/// Manually selected distributions intentionally return `None`: only the
+/// checksum-addressed managed install marker is authoritative for a version.
+pub fn managed_euddraft_version(dirs: &DataDirs, configured: &Path) -> Option<String> {
+    let executable = match crate::native_build::EuddraftLaunch::resolve(configured).ok()? {
+        crate::native_build::EuddraftLaunch::Executable(path) => path,
+        crate::native_build::EuddraftLaunch::SourceRepository { .. } => return None,
+    };
+    let managed_root = fs::canonicalize(dirs.euddraft_dir()).ok()?;
+    let executable = fs::canonicalize(executable).ok()?;
+    if !executable.starts_with(&managed_root) {
+        return None;
+    }
+
+    let mut candidate = executable.parent();
+    while let Some(install_dir) = candidate {
+        if install_dir == managed_root {
+            break;
+        }
+        if !install_dir.starts_with(&managed_root) {
+            return None;
+        }
+        let marker_path = install_dir.join(EUDDRAFT_INSTALL_MARKER);
+        if marker_path.is_file() {
+            let marker: EuddraftInstallMarker =
+                serde_json::from_slice(&fs::read(marker_path).ok()?).ok()?;
+            let relative = safe_euddraft_zip_path(&marker.executable).ok()?;
+            let declared = fs::canonicalize(install_dir.join(relative)).ok()?;
+            let version = marker.version.trim();
+            return (declared == executable && !version.is_empty()).then(|| version.to_string());
+        }
+        candidate = install_dir.parent();
+    }
+    None
 }
 
 /// Download and atomically install the latest complete euddraft distribution.
@@ -2102,6 +2144,38 @@ mod manifest {
                 .as_bytes()
         )
         .is_err());
+    }
+
+    #[test]
+    fn managed_euddraft_version_uses_only_the_matching_managed_marker() {
+        let base = unique_temp_dir("euddraft-version");
+        let dirs = crate::config::DataDirs::from_bases(&base.join("roaming"), &base.join("local"));
+        dirs.ensure_dirs().unwrap();
+        let install = dirs.euddraft_dir().join("sha256-release");
+        fs::create_dir_all(install.join("bin")).unwrap();
+        let executable = install.join("bin/euddraft.exe");
+        fs::write(&executable, b"managed").unwrap();
+        fs::write(
+            install.join(EUDDRAFT_INSTALL_MARKER),
+            serde_json::to_vec(&EuddraftInstallMarker {
+                version: "v0.11.0.1".to_string(),
+                archive_sha256: HELLO_SHA.to_string(),
+                executable: "bin/euddraft.exe".to_string(),
+                files: Vec::new(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let manual = base.join("manual/euddraft.exe");
+        fs::create_dir_all(manual.parent().unwrap()).unwrap();
+        fs::write(&manual, b"manual").unwrap();
+
+        assert_eq!(
+            managed_euddraft_version(&dirs, &executable).as_deref(),
+            Some("v0.11.0.1")
+        );
+        assert_eq!(managed_euddraft_version(&dirs, &manual), None);
+        fs::remove_dir_all(base).unwrap();
     }
 
     #[test]

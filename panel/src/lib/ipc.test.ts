@@ -10,6 +10,9 @@ import {
   sessionModelSettingsGet,
   sessionModelSettingsSave,
   compactSession,
+  euddraftCheckUpdate,
+  euddraftSettingsGet,
+  euddraftUpdate,
   isAgentTurnEndTransition,
   notificationSoundPreview,
   mentionSearch,
@@ -907,6 +910,25 @@ describe("App notification settings commands", () => {
     },
     codexLargeContextModels: ["gpt-5.5-codex"],
   };
+
+  it("loads, checks, and updates the typed euddraft settings contract", async () => {
+    const response = {
+      path: String.raw`C:\euddraft\euddraft.exe`,
+      valid: true,
+      managed: true,
+      installedVersion: "v0.10.2.5",
+      latestVersion: "v0.11.0.1",
+      updateAvailable: true,
+    };
+    const invoke = vi.fn().mockResolvedValue(response);
+
+    await expect(euddraftSettingsGet(invoke)).resolves.toEqual(response);
+    expect(invoke).toHaveBeenLastCalledWith("euddraft_settings");
+    await expect(euddraftCheckUpdate(invoke)).resolves.toEqual(response);
+    expect(invoke).toHaveBeenLastCalledWith("euddraft_check_update");
+    await expect(euddraftUpdate(invoke)).resolves.toEqual(response);
+    expect(invoke).toHaveBeenLastCalledWith("euddraft_update");
+  });
 
   it("loads and saves the complete app settings payload", async () => {
     const invoke = vi.fn().mockResolvedValue(settings);

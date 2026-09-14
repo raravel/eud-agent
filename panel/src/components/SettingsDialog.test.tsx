@@ -2,7 +2,7 @@ import { render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 
-import type { AppSettings } from "@/lib/ipc";
+import type { AppSettings, EuddraftSettings } from "@/lib/ipc";
 import type { ProviderModel, ProviderStatus } from "@/providers/types";
 import { SettingsDialog } from "./SettingsDialog";
 
@@ -14,6 +14,15 @@ const settings: AppSettings = {
     askResponseRequired: { sound: true, osNotification: true },
   },
   codexLargeContextModels: [],
+};
+
+const euddraft: EuddraftSettings = {
+  path: String.raw`C:\Users\tester\AppData\Local\eud-agent\euddraft\old\euddraft.exe`,
+  valid: true,
+  managed: true,
+  installedVersion: "v0.10.2.5",
+  latestVersion: "v0.11.0.1",
+  updateAvailable: true,
 };
 
 const providers: ProviderStatus[] = [
@@ -58,6 +67,7 @@ function renderDialog(
     selectedModels: { codex: "gpt-test" },
     selectedReasoning: { codex: { level: "medium" } },
     providerErrors: {},
+    euddraft,
     onOpenChange: vi.fn(),
     onSettingsChange: vi.fn(),
     onReload: vi.fn(),
@@ -76,6 +86,8 @@ function renderDialog(
     onProjectCreate: vi.fn(),
     onProjectImport: vi.fn(),
     onProjectExport: vi.fn(),
+    onEuddraftCheck: vi.fn(),
+    onEuddraftUpdate: vi.fn(),
     ...overrides,
   };
   return { ...render(<SettingsDialog {...props} />), props };
@@ -106,6 +118,30 @@ describe("SettingsDialog provider management", () => {
     expect(onProjectCreate).toHaveBeenCalledOnce();
     expect(onProjectImport).toHaveBeenCalledOnce();
     expect(onProjectExport).toHaveBeenCalledOnce();
+  });
+
+  it("shows managed euddraft versions and exposes check and update actions", async () => {
+    const onEuddraftCheck = vi.fn();
+    const onEuddraftUpdate = vi.fn();
+    renderDialog({ onEuddraftCheck, onEuddraftUpdate });
+
+    await userEvent.click(screen.getByRole("button", { name: "컴파일" }));
+
+    expect(screen.getByText(euddraft.path)).toBeInTheDocument();
+    expect(screen.getByText("v0.10.2.5")).toBeInTheDocument();
+    expect(screen.getAllByText("v0.11.0.1")).not.toHaveLength(0);
+    expect(
+      screen.getByText(/새 euddraft v0\.11\.0\.1 버전을 설치할 수 있습니다/),
+    ).toBeInTheDocument();
+
+    await userEvent.click(
+      screen.getByRole("button", { name: "최신 버전 확인" }),
+    );
+    await userEvent.click(
+      screen.getByRole("button", { name: "최신 버전으로 업데이트" }),
+    );
+    expect(onEuddraftCheck).toHaveBeenCalledOnce();
+    expect(onEuddraftUpdate).toHaveBeenCalledOnce();
   });
 
   it("shows provider status summaries before opening one provider at a time", async () => {

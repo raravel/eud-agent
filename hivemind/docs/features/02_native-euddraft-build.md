@@ -51,6 +51,13 @@ Unchanged sparse families emit no plugin. Standard DAT address/delta math follow
 
 The sibling `../euddraft` repository is read-only. Missing private source modules are not patched; installed euddraft is a supported configured executable.
 
+The Settings **Compile** category reads the configured path and, for managed
+installs, the persisted release tag. An explicit check compares that tag with
+GitHub's latest official release; an available update reuses the same
+SHA-256-verified staging and atomic publication path before replacing the
+configured executable path. A manually selected distribution is never probed
+by launching it and is replaced only by an explicit managed-install action.
+
 ## Safety
 
 - Source/output paths are confined by `NativeProject`.

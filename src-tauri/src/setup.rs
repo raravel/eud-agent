@@ -23,6 +23,18 @@ fn bootstrap_lock() -> &'static Mutex<()> {
     LOCK.get_or_init(|| Mutex::new(()))
 }
 
+/// Preserve installer progress while keeping each caller's UI surface isolated.
+struct RetaggedProgressEmitter<'a> {
+    inner: &'a (dyn ProgressEmitter + Send + Sync),
+    stage: &'static str,
+}
+
+impl ProgressEmitter for RetaggedProgressEmitter<'_> {
+    fn emit(&self, _stage: &str, pct: u8, detail: &str) {
+        self.inner.emit(self.stage, pct, detail);
+    }
+}
+
 pub const INVALID_PROJECT_FOLDER: &str = "invalid_project_folder";
 pub const INVALID_EUDDRAFT_PATH: &str = "invalid_euddraft_path";
 pub const PROJECT_CREATE_FAILED: &str = "project_create_failed";
@@ -43,6 +55,46 @@ pub struct SetupStatusResponse {
     pub setup_required: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+}
+
+/// euddraft state shown in Settings → Compile.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EuddraftSettingsResponse {
+    pub path: String,
+    pub valid: bool,
+    pub managed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub installed_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest_version: Option<String>,
+    pub update_available: bool,
+}
+
+pub fn euddraft_settings_payload(
+    dirs: &DataDirs,
+    latest_version: Option<String>,
+) -> Result<EuddraftSettingsResponse, String> {
+    let config = dirs.load_config().map_err(|error| error.to_string())?;
+    let path = config.euddraft_path.trim().to_string();
+    let valid =
+        !path.is_empty() && crate::native_build::EuddraftLaunch::resolve(Path::new(&path)).is_ok();
+    let installed_version = valid
+        .then(|| bootstrap::managed_euddraft_version(dirs, Path::new(&path)))
+        .flatten();
+    let managed = installed_version.is_some();
+    let update_available = installed_version
+        .as_deref()
+        .zip(latest_version.as_deref())
+        .is_some_and(|(installed, latest)| installed != latest);
+    Ok(EuddraftSettingsResponse {
+        path,
+        valid,
+        managed,
+        installed_version,
+        latest_version,
+        update_available,
+    })
 }
 
 /// Build the setup/manifest snapshot for the panel (filesystem probe + hash +
@@ -166,6 +218,16 @@ async fn run_bootstrap_inner(
     Ok(())
 }
 
+fn persist_euddraft_path(dirs: &DataDirs, path: &Path, replace: bool) -> anyhow::Result<()> {
+    crate::native_build::EuddraftLaunch::resolve(path).map_err(anyhow::Error::msg)?;
+    let mut config = dirs.load_config()?;
+    if replace || config.euddraft_path.trim().is_empty() {
+        config.euddraft_path = path.to_string_lossy().into_owned();
+        dirs.save_config(&config)?;
+    }
+    Ok(())
+}
+
 /// Report first-run native setup state.
 #[tauri::command]
 pub async fn setup_status(
@@ -175,6 +237,31 @@ pub async fn setup_status(
     let dirs = state.dirs().clone();
     let statuses = providers.status_list().await?;
     tauri::async_runtime::spawn_blocking(move || setup_status_payload(&dirs, statuses))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+/// Read configured euddraft path and managed-install version without network access.
+#[tauri::command]
+pub async fn euddraft_settings(
+    state: tauri::State<'_, AppManaged>,
+) -> Result<EuddraftSettingsResponse, String> {
+    let dirs = state.dirs().clone();
+    tauri::async_runtime::spawn_blocking(move || euddraft_settings_payload(&dirs, None))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+/// Compare the configured managed euddraft against GitHub's latest official release.
+#[tauri::command]
+pub async fn euddraft_check_update(
+    state: tauri::State<'_, AppManaged>,
+) -> Result<EuddraftSettingsResponse, String> {
+    let latest = bootstrap::latest_euddraft_version()
+        .await
+        .map_err(|error| format!("{error:#}"))?;
+    let dirs = state.dirs().clone();
+    tauri::async_runtime::spawn_blocking(move || euddraft_settings_payload(&dirs, Some(latest)))
         .await
         .map_err(|error| error.to_string())?
 }
@@ -457,6 +544,48 @@ pub async fn setup_pick_euddraft_path(
     .map_err(|error| error.to_string())?
 }
 
+async fn install_latest_euddraft(
+    dirs: &DataDirs,
+    emitter: &(dyn ProgressEmitter + Send + Sync),
+) -> Result<(), String> {
+    let _guard = bootstrap_lock().lock().await;
+    let result = async {
+        let installed = bootstrap::ensure_euddraft(dirs, emitter).await?;
+        persist_euddraft_path(dirs, &installed, true)?;
+        emitter.emit("bootstrap", 100, "euddraft configured");
+        anyhow::Ok(())
+    }
+    .await;
+    if let Err(error) = result {
+        emitter.emit("bootstrap", 0, &format!("error: {error:#}"));
+        return Err(format!("{error:#}"));
+    }
+    Ok(())
+}
+
+/// Install GitHub's latest official release and select the managed executable.
+#[tauri::command]
+pub async fn euddraft_update(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppManaged>,
+) -> Result<EuddraftSettingsResponse, String> {
+    let dirs = state.dirs().clone();
+    let native_emitter = bootstrap::TauriEmitter(app);
+    let update_emitter = RetaggedProgressEmitter {
+        inner: &native_emitter,
+        stage: "euddraft_update",
+    };
+    install_latest_euddraft(&dirs, &update_emitter).await?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut response = euddraft_settings_payload(&dirs, None)?;
+        response.latest_version = response.installed_version.clone();
+        response.update_available = false;
+        Ok(response)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
 #[tauri::command]
 pub async fn setup_provider_select(
     state: tauri::State<'_, AppManaged>,
@@ -518,6 +647,36 @@ mod tests {
     use std::path::PathBuf;
 
     const HELLO_SHA: &str = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
+
+    #[test]
+    fn settings_update_progress_is_not_reported_as_bootstrap() {
+        #[derive(Default)]
+        struct RecordingEmitter(parking_lot::Mutex<Vec<(String, u8, String)>>);
+
+        impl ProgressEmitter for RecordingEmitter {
+            fn emit(&self, stage: &str, pct: u8, detail: &str) {
+                self.0
+                    .lock()
+                    .push((stage.to_string(), pct, detail.to_string()));
+            }
+        }
+
+        let recording = RecordingEmitter::default();
+        let update = RetaggedProgressEmitter {
+            inner: &recording,
+            stage: "euddraft_update",
+        };
+        update.emit("bootstrap", 42, "downloading euddraft");
+
+        assert_eq!(
+            *recording.0.lock(),
+            vec![(
+                "euddraft_update".to_string(),
+                42,
+                "downloading euddraft".to_string(),
+            )]
+        );
+    }
 
     fn unique_temp_dir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -641,6 +800,41 @@ mod tests {
         assert!(!status.setup_required);
         fs::remove_dir_all(base).ok();
     }
+    #[test]
+    fn compile_settings_reports_managed_version_and_available_update() {
+        let base = unique_temp_dir("euddraft-settings");
+        let dirs = DataDirs::from_bases(&base.join("roaming"), &base.join("local"));
+        dirs.ensure_dirs().unwrap();
+        let install = dirs.euddraft_dir().join("sha256-old");
+        fs::create_dir_all(&install).unwrap();
+        let executable = install.join("euddraft.exe");
+        fs::write(&executable, b"managed").unwrap();
+        fs::write(
+            install.join(".euddraft-install.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "version": "v0.10.2.5",
+                "archive_sha256": HELLO_SHA,
+                "executable": "euddraft.exe",
+                "files": []
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        dirs.save_config(&Config {
+            euddraft_path: executable.to_string_lossy().into_owned(),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let status = euddraft_settings_payload(&dirs, Some("v0.11.0.1".to_string())).unwrap();
+        assert!(status.valid);
+        assert!(status.managed);
+        assert_eq!(status.installed_version.as_deref(), Some("v0.10.2.5"));
+        assert_eq!(status.latest_version.as_deref(), Some("v0.11.0.1"));
+        assert!(status.update_available);
+        fs::remove_dir_all(base).unwrap();
+    }
+
     #[test]
     fn cached_stale_rag_config_rolls_forward_to_current_readiness() {
         let base = unique_temp_dir("rag-rollover");

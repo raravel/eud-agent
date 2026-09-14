@@ -55,6 +55,18 @@ Model/RAG/provider settings retain their versioned/checksummed fields. The merge
 
 Create/import destinations must be empty. Cancellation returns the unchanged setup snapshot. A failed action does not replace the configured valid project.
 
+Settings includes a **Compile** category backed by dedicated typed commands. It
+shows the configured path and the release tag from a matching managed install
+marker without launching euddraft. **Check latest version** reads GitHub's
+official latest release metadata; when the managed tag differs, **Update to
+latest** runs the same checksum-verified atomic installer and switches the
+configured path only after validation. Its progress uses the dedicated
+`euddraft_update` stage and remains inside Compile settings; it never activates
+the first-run bootstrap screen or writes progress into a chat session. Manually
+selected distributions keep their path and report that their version cannot be
+inferred; switching one to the latest managed release remains an explicit user
+action.
+
 ## Resource sync
 
 Tauri resource `native/eud-editor-compat` is copied to LocalAppData on startup. It contains data-format metadata only. EUD Editor binaries, DLLs, Lua, and install scripts are not resources.

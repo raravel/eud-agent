@@ -87,6 +87,15 @@ export interface AppSettings {
   codexLargeContextModels: string[];
 }
 
+export interface EuddraftSettings {
+  path: string;
+  valid: boolean;
+  managed: boolean;
+  installedVersion?: string;
+  latestVersion?: string;
+  updateAvailable: boolean;
+}
+
 export type AttentionNotificationKind = NotificationEvent;
 
 
@@ -845,6 +854,50 @@ export async function appSettingsSave(
   invoke: InvokeFn = tauriInvoke,
 ): Promise<AppSettings> {
   return toAppSettings(await invoke("app_settings_save", { settings }));
+}
+
+function toEuddraftSettings(value: unknown): EuddraftSettings {
+  if (
+    !isObject(value) ||
+    typeof value.path !== "string" ||
+    typeof value.valid !== "boolean" ||
+    typeof value.managed !== "boolean" ||
+    (value.installedVersion !== undefined &&
+      (typeof value.installedVersion !== "string" ||
+        value.installedVersion.trim().length === 0)) ||
+    (value.latestVersion !== undefined &&
+      (typeof value.latestVersion !== "string" ||
+        value.latestVersion.trim().length === 0)) ||
+    typeof value.updateAvailable !== "boolean" ||
+    value.managed !== (typeof value.installedVersion === "string") ||
+    (value.updateAvailable &&
+      (typeof value.latestVersion !== "string" ||
+        value.installedVersion === value.latestVersion))
+  ) {
+    throw new Error("invalid euddraft settings response");
+  }
+  return value as unknown as EuddraftSettings;
+}
+
+/** Read the configured euddraft path and managed-install version. */
+export async function euddraftSettingsGet(
+  invoke: InvokeFn = tauriInvoke,
+): Promise<EuddraftSettings> {
+  return toEuddraftSettings(await invoke("euddraft_settings"));
+}
+
+/** Fetch GitHub's latest official euddraft release and compare it locally. */
+export async function euddraftCheckUpdate(
+  invoke: InvokeFn = tauriInvoke,
+): Promise<EuddraftSettings> {
+  return toEuddraftSettings(await invoke("euddraft_check_update"));
+}
+
+/** Install and select GitHub's latest official managed euddraft release. */
+export async function euddraftUpdate(
+  invoke: InvokeFn = tauriInvoke,
+): Promise<EuddraftSettings> {
+  return toEuddraftSettings(await invoke("euddraft_update"));
 }
 
 /** Play the native Windows sound used by attention notifications. */

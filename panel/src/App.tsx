@@ -50,6 +50,9 @@ import {
   IpcClient,
   appSettingsGet,
   appSettingsSave,
+  euddraftCheckUpdate,
+  euddraftSettingsGet,
+  euddraftUpdate,
   attentionNotify,
   compactSession,
   isAgentTurnEndTransition,
@@ -77,6 +80,7 @@ import {
   workspaceSearch,
   type AskAnswer,
   type AppSettings,
+  type EuddraftSettings,
   type HarnessJobView,
   type LedgerEntry,
   type MemoryFile,
@@ -364,6 +368,12 @@ export default function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [appSettings, setAppSettings] = useState<AppSettings | null>(null);
   const [appSettingsBusy, setAppSettingsBusy] = useState(false);
+  const [euddraftSettings, setEuddraftSettings] =
+    useState<EuddraftSettings | null>(null);
+  const [euddraftSettingsBusy, setEuddraftSettingsBusy] = useState<
+    "load" | "check" | "update" | null
+  >(null);
+  const [euddraftSettingsError, setEuddraftSettingsError] = useState<string>();
   // Message undo/edit flow: the core must finish cancellation/rewind before the
   // input unlocks. `editDraft` is applied by InstructionBox without controlling
   // subsequent typing.
@@ -683,6 +693,25 @@ export default function App() {
     void loadAppSettings();
   }, [loadAppSettings]);
 
+  const loadEuddraftSettings = useCallback(async () => {
+    setEuddraftSettingsBusy("load");
+    setEuddraftSettingsError(undefined);
+    try {
+      setEuddraftSettings(await euddraftSettingsGet());
+    } catch {
+      setEuddraftSettings(null);
+      setEuddraftSettingsError(
+        "euddraft 설정을 불러오지 못했습니다. 다시 시도해 주세요.",
+      );
+    } finally {
+      setEuddraftSettingsBusy(null);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (settingsOpen) void loadEuddraftSettings();
+  }, [loadEuddraftSettings, settingsOpen]);
+
   const handleAppSettingsChange = useCallback(
     async (next: AppSettings) => {
       const previous = appSettings;
@@ -809,6 +838,11 @@ export default function App() {
               view,
               error: view.phase === "error" ? view.label : null,
             });
+            break;
+          }
+          if (msg.stage === "euddraft_update") {
+            // Settings owns this invoke lifecycle and renders its progress
+            // in-place; it must not enter setup or pollute a chat session.
             break;
           }
           if (bootstrapActiveRef.current) {
@@ -1599,6 +1633,37 @@ export default function App() {
     void clientRef.current?.send({ type: "setup_status" });
   }, []);
 
+  const handleEuddraftCheck = useCallback(async () => {
+    setEuddraftSettingsBusy("check");
+    setEuddraftSettingsError(undefined);
+    try {
+      setEuddraftSettings(await euddraftCheckUpdate());
+    } catch {
+      setEuddraftSettingsError(
+        "최신 euddraft 버전을 확인하지 못했습니다. 네트워크 연결을 확인하고 다시 시도해 주세요.",
+      );
+    } finally {
+      setEuddraftSettingsBusy(null);
+    }
+  }, []);
+
+  const handleEuddraftUpdate = useCallback(async () => {
+    setEuddraftSettingsBusy("update");
+    setEuddraftSettingsError(undefined);
+    try {
+      const updated = await euddraftUpdate();
+      setEuddraftSettings(updated);
+      refreshSetup();
+      toast.success(`euddraft ${updated.installedVersion ?? ""} 업데이트를 완료했습니다.`);
+    } catch {
+      setEuddraftSettingsError(
+        "euddraft를 업데이트하지 못했습니다. 네트워크 연결과 설치 경로를 확인한 뒤 다시 시도해 주세요.",
+      );
+    } finally {
+      setEuddraftSettingsBusy(null);
+    }
+  }, [refreshSetup]);
+
   const stopProviderPoll = useCallback((provider: ProviderId) => {
     const timer = providerPollsRef.current.get(provider);
     if (timer !== undefined) {
@@ -2357,6 +2422,9 @@ export default function App() {
           loginPending={providerLoginPending}
           busy={appSettingsBusy || providerSettingsBusy}
           projectBusy={projectSetupAction}
+          euddraft={euddraftSettings}
+          euddraftBusy={euddraftSettingsBusy}
+          euddraftError={euddraftSettingsError}
           onOpenChange={setSettingsOpen}
           onSettingsChange={handleAppSettingsChange}
           onReload={loadAppSettings}
@@ -2381,6 +2449,8 @@ export default function App() {
             runProjectSetupAction("import", "setup_import_e3s")
           }
           onProjectExport={handleProjectExport}
+          onEuddraftCheck={handleEuddraftCheck}
+          onEuddraftUpdate={handleEuddraftUpdate}
         />
 
         {update && !updateDismissed && (
