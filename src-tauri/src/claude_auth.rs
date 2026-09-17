@@ -36,6 +36,23 @@ struct ClaudeAuthStatus {
 }
 
 pub fn resolve_claude_cmd(dirs: &DataDirs, config: &Config) -> Result<PathBuf, String> {
+    let user_home = std::env::var_os("USERPROFILE")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from);
+    resolve_claude_cmd_with(dirs, config, user_home.as_deref(), || {
+        which::which("claude").ok()
+    })
+}
+
+/// Resolution order: explicit override, app-managed binary, `PATH`, then the official
+/// native installer location. The last step exists because a GUI process launched from an
+/// Explorer started before the installer updated the user `PATH` never inherits that entry.
+fn resolve_claude_cmd_with(
+    dirs: &DataDirs,
+    config: &Config,
+    user_home: Option<&Path>,
+    path_lookup: impl FnOnce() -> Option<PathBuf>,
+) -> Result<PathBuf, String> {
     if let Some(path) = config
         .providers
         .claude_code
@@ -54,7 +71,25 @@ pub fn resolve_claude_cmd(dirs: &DataDirs, config: &Config) -> Result<PathBuf, S
     if managed.is_file() {
         return Ok(managed);
     }
-    which::which("claude").map_err(|_| "provider_not_installed".to_string())
+    if let Some(path) = path_lookup() {
+        return Ok(path);
+    }
+    user_home
+        .map(|home| home.join(".local").join("bin").join(CLAUDE_BIN_FILENAME))
+        .filter(|path| path.is_file())
+        .ok_or_else(|| "provider_not_installed".to_string())
+}
+
+/// Import verification: surface the exact status cause instead of collapsing every
+/// unauthenticated state into `provider_not_authenticated`.
+pub fn require_authenticated(state: &ClaudeAuthState) -> Result<(), String> {
+    if state.authenticated {
+        return Ok(());
+    }
+    Err(state
+        .detail_code
+        .clone()
+        .unwrap_or_else(|| "provider_not_authenticated".to_string()))
 }
 
 pub fn login_status(dirs: &DataDirs) -> ClaudeAuthState {
@@ -529,6 +564,68 @@ mod tests {
             "win32-x64"
         )
         .is_err());
+    }
+
+    #[test]
+    fn resolution_falls_back_to_native_installer_location() {
+        let base =
+            std::env::temp_dir().join(format!("eud-claude-resolve-{}", uuid::Uuid::new_v4()));
+        let dirs = DataDirs::from_bases(&base.join("roaming"), &base.join("local"));
+        let home = base.join("home");
+        let native = home.join(".local").join("bin").join(CLAUDE_BIN_FILENAME);
+        let config = Config::default();
+        let no_path = || None;
+        assert!(resolve_claude_cmd_with(&dirs, &config, None, no_path).is_err());
+        assert!(resolve_claude_cmd_with(&dirs, &config, Some(&home), no_path).is_err());
+        fs::create_dir_all(native.parent().unwrap()).unwrap();
+        fs::write(&native, b"").unwrap();
+        assert_eq!(
+            resolve_claude_cmd_with(&dirs, &config, Some(&home), no_path).unwrap(),
+            native
+        );
+        // A PATH hit still takes precedence over the native installer copy.
+        let on_path = base.join("path").join(CLAUDE_BIN_FILENAME);
+        assert_eq!(
+            resolve_claude_cmd_with(&dirs, &config, Some(&home), || Some(on_path.clone())).unwrap(),
+            on_path
+        );
+        // A managed binary still wins over the native installer copy.
+        let managed = dirs.claude_bin_dir().join(CLAUDE_BIN_FILENAME);
+        fs::create_dir_all(dirs.claude_bin_dir()).unwrap();
+        fs::write(&managed, b"").unwrap();
+        assert_eq!(
+            resolve_claude_cmd_with(&dirs, &config, Some(&home), no_path).unwrap(),
+            managed
+        );
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn import_verification_reports_exact_status_cause() {
+        assert_eq!(
+            require_authenticated(&unavailable("provider_not_installed")),
+            Err("provider_not_installed".to_string())
+        );
+        assert_eq!(
+            require_authenticated(&ClaudeAuthState {
+                resolved: true,
+                compatible: true,
+                authenticated: false,
+                version: Some("2.1.274".to_string()),
+                detail_code: None,
+            }),
+            Err("provider_not_authenticated".to_string())
+        );
+        assert_eq!(
+            require_authenticated(&ClaudeAuthState {
+                resolved: true,
+                compatible: true,
+                authenticated: true,
+                version: Some("2.1.274".to_string()),
+                detail_code: None,
+            }),
+            Ok(())
+        );
     }
 
     #[test]

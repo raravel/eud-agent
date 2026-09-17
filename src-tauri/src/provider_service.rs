@@ -454,11 +454,9 @@ impl ProviderService {
                 let _guard = self.inner.claude_lock.lock().await;
                 let dirs = self.inner.dirs.clone();
                 self.inner.secrets.import_cli_credential(provider, || {
-                    let state = crate::claude_auth::login_status(&dirs);
-                    state
-                        .authenticated
-                        .then_some(())
-                        .ok_or_else(|| "provider_not_authenticated".to_string())
+                    crate::claude_auth::require_authenticated(&crate::claude_auth::login_status(
+                        &dirs,
+                    ))
                 })?;
             }
             _ => return Err("unsupported_operation".to_string()),
