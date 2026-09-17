@@ -12,7 +12,7 @@ use super::foreground::ensure_expected_session;
 use super::process::StreamProcessRequest;
 use super::request::{stream_args, validate_workspace_boundary, MAX_STDOUT_BYTES};
 
-pub(super) const CLAUDE_PROVIDER_DEFAULT: &str = "provider-default";
+pub(super) use crate::claude_client::catalog::CLAUDE_PROVIDER_DEFAULT;
 
 pub(super) struct PreparedClaudeProcess {
     pub(super) child: tokio::process::Child,
@@ -36,11 +36,8 @@ impl ProductionClaudeCodeAdapter {
         executable: PathBuf,
         profile_dir: PathBuf,
     ) -> Result<Self, ProviderRuntimeError> {
-        if model != CLAUDE_PROVIDER_DEFAULT {
-            return Err(ProviderRuntimeError::Protocol(
-                "provider_model_unavailable".to_string(),
-            ));
-        }
+        crate::claude_client::catalog::validate_model_id(&model)
+            .map_err(ProviderRuntimeError::Protocol)?;
         Ok(Self {
             model,
             executable,
@@ -125,7 +122,8 @@ impl ProviderAdapter for ProductionClaudeCodeAdapter {
                 .run_stream_process(StreamProcessRequest {
                     identity: &identity,
                     cwd: &cwd,
-                    args: stream_args(None, Some(&session_id), true),
+                    args: stream_args(None, Some(&session_id), true, &self.model, None)
+                        .map_err(ProviderRuntimeError::Protocol)?,
                     message: json!({"type":"user","message":{"role":"user","content":[{"type":"text","text":"/compact"}]},"parent_tool_use_id":Value::Null}),
                     require_mcp: false,
                     max_output_bytes: MAX_STDOUT_BYTES,
@@ -194,7 +192,8 @@ impl ProviderAdapter for ProductionClaudeCodeAdapter {
                 .map_err(ProviderRuntimeError::Protocol)?;
             let prepared = self.spawn_stream_process(
                 &request.workspace_root,
-                stream_args(None, Some(session_id), true),
+                stream_args(None, Some(session_id), true, &self.model, None)
+                    .map_err(ProviderRuntimeError::Protocol)?,
             )?;
             self.last_cwd = Some(request.workspace_root.clone());
             self.prepared_compaction = Some(prepared);

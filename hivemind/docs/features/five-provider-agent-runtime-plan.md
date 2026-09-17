@@ -381,25 +381,34 @@ claude -p
   [--resume <binding.session_id>]
 ```
 
-Claude CLI는 machine-readable model discovery command를 제공하지 않는다. 따라서 eud-agent는
-`sonnet`/`opus`/`haiku` alias나 reasoning tier를 catalog로 만들지 않는다. UI에는
-`provider-default` 동작 하나만 표시하고 turn에는 `--model`/`--effort`를 전달하지 않아
-현재 계정·배포에 맞는 모델 선택을 Claude Code에 위임한다.
+Claude CLI는 machine-readable model discovery command를 제공하지 않지만, app profile의
+`.credentials.json`에 저장된 같은 구독 OAuth access token은 Anthropic Models API
+(`GET https://api.anthropic.com/v1/models`, `Authorization: Bearer` +
+`anthropic-beta: oauth-2025-04-20`)에서 그대로 받아들여진다. catalog는 이 응답의
+`id`/`display_name`/`max_input_tokens`/`capabilities`(effort 단계, image_input,
+structured_outputs)를 그대로 매핑하고 alias나 하드코딩 목록을 만들지 않는다. 첫 항목은 항상
+`provider-default`이며, token 부재·만료·HTTP 실패·schema 변경 시 catalog는 그 한 항목으로
+degrade한다. token은 요청 동안만 메모리에 있고 로그·저장·UI에 노출되지 않는다.
+`provider-default` 선택은 `--model`/`--effort`를 전달하지 않아 현재 계정·배포에 맞는 모델
+선택을 Claude Code에 위임하고, catalog model 선택은 foreground/structured turn에
+`--model <id>`와(선택 시) `--effort <level>`을 그대로 전달한다. compaction/prepare는 session
+model만 전달한다. Models API 목록은 조직 catalog이므로 구독 플랜에서 Claude Code가 거부하는
+모델은 turn 시작 시 CLI 오류로 표면화되며 catalog가 이를 사전 보장하지 않는다.
 
-- request-owned MCP config에는 현재 worker의 `eud-tools` loopback URL 하나만 있다.
+- run-owned MCP config에는 생성 run만을 위한 고유 `eud-tools` loopback URL 하나만 있다. 이전 run의 handler/URL은 새 도구 권한을 얻지 못한다.
 - `--tools ""`는 built-in Bash/PowerShell/Read/Edit/Write/Search/Agent tool을 model context에서 제거하지만 MCP tool에는 영향을 주지 않는다.
 - app profile과 session cwd에 ambient project configuration이 없음을 시작 전 검증한다.
 - first turn result의 `session_id`를 persist하고 이후 `--resume`으로 재개한다.
 - stdout은 line-bounded strict JSONL parser로 읽고 text/reasoning/tool/usage/result를 generic event로 변환한다.
 - stderr는 bounded tail만 보관하며 credential과 raw body를 redaction한다.
 - cancellation은 graceful interrupt 후 bounded process-tree termination을 사용한다.
-- CLI가 unexpected exit하면 turn을 replay하지 않고 session id를 유지한다.
+- CLI가 unexpected exit하면 turn을 replay하지 않는다. 마지막 저장 ID는 보존하되 remote continuation이 불명확하면 runtime이 확인 없는 재개를 거부한다.
 
 #### 9.2.4 structured output와 compaction
 
 - tools-disabled compiler/harness turn은 `--tools ""`, MCP 없음, `--json-schema <schema>`, `--output-format json`, `--no-session-persistence`를 사용한다.
 - Rust가 `structured_output`을 같은 schema로 다시 검증한다.
-- `/compact`는 Claude Code의 supported compact command를 `--resume` session에 실행하고 성공 event 이후에만 context delivery cursor를 reset한다.
+- `/compact`는 Claude Code의 supported compact command를 준비된 `--resume` session에 실행한다. runtime이 성공 경계를 확인한 뒤 engine이 context delivery cursor를 갱신한다.
 - CLI version이 required structured/stream/capability behavior를 지원하지 않으면 provider status는 `Degraded`가 아니라 `Unavailable`이다.
 
 #### 9.2.5 attachments

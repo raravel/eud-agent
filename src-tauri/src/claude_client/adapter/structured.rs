@@ -3,6 +3,7 @@ use std::process::Stdio;
 use serde_json::Value;
 use tokio::io::AsyncReadExt as _;
 
+use crate::provider::ProviderId;
 use crate::provider_runtime::{
     AdapterEvent, AdapterEventKind, AdapterRequestKind, AdapterStepOutcome, AdapterStepRequest,
     NormalizedBlock, ProviderRuntimeError,
@@ -10,7 +11,8 @@ use crate::provider_runtime::{
 use crate::provider_tool_loop::validate_structured_output;
 
 use super::request::{
-    hide_console, terminate_child, validate_workspace_boundary, MAX_STDERR_BYTES, MAX_STDOUT_BYTES,
+    hide_console, model_args, terminate_child, validate_workspace_boundary, MAX_STDERR_BYTES,
+    MAX_STDOUT_BYTES,
 };
 use super::state::ProductionClaudeCodeAdapter;
 
@@ -43,10 +45,26 @@ impl ProductionClaudeCodeAdapter {
             ));
         }
         validate_workspace_boundary(workspace_root).map_err(ProviderRuntimeError::Protocol)?;
+        if request.binding.model != self.model || request.binding.provider != ProviderId::ClaudeCode
+        {
+            return Err(ProviderRuntimeError::Protocol(
+                "provider_model_unavailable".to_string(),
+            ));
+        }
+        let model_args = model_args(
+            &self.model,
+            request
+                .binding
+                .reasoning
+                .as_ref()
+                .map(|selection| selection.level.as_str()),
+        )
+        .map_err(ProviderRuntimeError::Protocol)?;
         let mut command = self.command();
         command
             .arg("-p")
             .arg(prompt)
+            .args(model_args)
             .args(["--output-format", "json"])
             .arg("--json-schema")
             .arg(output_schema.to_string())

@@ -66,13 +66,25 @@ impl ProductionClaudeCodeAdapter {
         })
         .to_string();
         let message = claude_user_message(turn).map_err(ProviderRuntimeError::Protocol)?;
+        let args = stream_args(
+            Some(&mcp_config),
+            resume,
+            false,
+            &self.model,
+            request
+                .binding
+                .reasoning
+                .as_ref()
+                .map(|selection| selection.level.as_str()),
+        )
+        .map_err(ProviderRuntimeError::Protocol)?;
         self.last_cwd = Some(workspace_root.to_path_buf());
         self.continuation_unknown = true;
         let result = self
             .run_stream_process(StreamProcessRequest {
                 identity: &request.identity,
                 cwd: workspace_root,
-                args: stream_args(Some(&mcp_config), resume, false),
+                args,
                 message,
                 require_mcp: true,
                 max_output_bytes: MAX_STDOUT_BYTES,

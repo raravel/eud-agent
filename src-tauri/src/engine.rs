@@ -3322,6 +3322,21 @@ impl SessionEngineManager {
                 .map_err(AgentEngineError::new)?,
             );
         }
+        // A degraded Claude catalog (expired token, offline) must not blank a session that is
+        // still bound to a valid catalog model; keep the bound id selectable with its saved level.
+        if record.provider_binding.provider == crate::provider::ProviderId::ClaudeCode
+            && !models
+                .iter()
+                .any(|model| model.model == record.provider_binding.model)
+        {
+            models.push(
+                crate::claude_client::bound_model(
+                    &record.provider_binding.model,
+                    record.provider_binding.reasoning.as_ref(),
+                )
+                .map_err(AgentEngineError::new)?,
+            );
+        }
         if !models
             .iter()
             .any(|model| model.model == record.provider_binding.model)

@@ -644,7 +644,26 @@ impl ProviderService {
                     })
                     .collect())
             }
-            ProviderId::ClaudeCode => Ok(crate::claude_client::provider_managed_models(selected)),
+            ProviderId::ClaudeCode => {
+                // Hold the profile lock only for the credential read, not the network round trip.
+                let token = {
+                    let _guard = self.inner.claude_lock.lock().await;
+                    crate::claude_client::read_access_token(&self.inner.dirs.claude_config_dir())
+                };
+                let token = match token {
+                    Ok(token) => token,
+                    Err(_) => return Ok(crate::claude_client::provider_managed_models(selected)),
+                };
+                let live =
+                    crate::claude_client::fetch_catalog(&self.inner.client, &token, selected).await;
+                drop(token);
+                // Live discovery is an enrichment: any failure degrades to CLI-selected default.
+                Ok(
+                    live.unwrap_or_else(|_| {
+                        crate::claude_client::provider_managed_models(selected)
+                    }),
+                )
+            }
             ProviderId::Antigravity => {
                 let credential =
                     crate::antigravity_auth::access_credential(&self.inner.dirs).await?;

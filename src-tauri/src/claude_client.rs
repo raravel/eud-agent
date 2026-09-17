@@ -1,29 +1,17 @@
 mod adapter;
+mod catalog;
 
 pub use adapter::ProductionClaudeCodeAdapter;
+#[cfg(test)]
+use catalog::CLAUDE_PROVIDER_DEFAULT;
+pub use catalog::{bound_model, provider_default_model};
+pub(crate) use catalog::{fetch_catalog, read_access_token};
 
-use crate::provider::{ModelCapabilities, ProviderId, ProviderModel};
+use crate::provider::ProviderModel;
 
-const CLAUDE_PROVIDER_DEFAULT: &str = "provider-default";
-
+/// Catalog without network access: the CLI-selected default only.
 pub fn provider_managed_models(selected: Option<&str>) -> Vec<ProviderModel> {
-    vec![ProviderModel {
-        provider: ProviderId::ClaudeCode,
-        model: CLAUDE_PROVIDER_DEFAULT.to_string(),
-        display_name: "Claude Code 기본 모델".to_string(),
-        description: "Claude Code가 현재 계정과 배포 기준으로 모델을 선택합니다.".to_string(),
-        is_default: selected == Some(CLAUDE_PROVIDER_DEFAULT),
-        capabilities: ModelCapabilities {
-            vision: true,
-            tool_calls: true,
-            strict_structured_output: true,
-            reasoning_levels: Vec::new(),
-            native_compaction: true,
-            context_window: None,
-            hosted_web_search: false,
-        },
-        privacy: None,
-    }]
+    vec![provider_default_model(selected)]
 }
 
 #[cfg(test)]
