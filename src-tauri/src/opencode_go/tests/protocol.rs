@@ -164,6 +164,54 @@ async fn chat_stream_error_is_not_empty_or_partial_success() {
     }
 }
 
+#[tokio::test]
+async fn failed_inference_status_keeps_the_provider_error_message() {
+    use axum::http::StatusCode;
+    use axum::routing::get;
+
+    let app = axum::Router::new()
+        .route(
+            "/json",
+            get(|| async {
+                (
+                    StatusCode::FORBIDDEN,
+                    r#"{"error":{"message":"You have hit the 5-hour\nlimit for glm-5.3","type":"forbidden"}}"#,
+                )
+            }),
+        )
+        .route(
+            "/text",
+            get(|| async { (StatusCode::PAYMENT_REQUIRED, "  Insufficient  balance \u{1} ") }),
+        )
+        .route("/empty", get(|| async { (StatusCode::FORBIDDEN, "") }));
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let client = reqwest::Client::new();
+    let mut results = Vec::new();
+    for path in ["json", "text", "empty"] {
+        let response = client
+            .get(format!("http://{address}/{path}"))
+            .send()
+            .await
+            .unwrap();
+        results.push(inference_status_error(response).await);
+    }
+    server.abort();
+    assert_eq!(
+        results,
+        [
+            "provider_quota_exhausted (HTTP 403): You have hit the 5-hour limit for glm-5.3",
+            "provider_quota_exhausted (HTTP 402): Insufficient balance",
+            "provider_quota_exhausted (HTTP 403)",
+        ]
+    );
+}
+
 #[test]
 fn incomplete_sse_fails_closed() {
     let mut incomplete = SseDecoder::default();
