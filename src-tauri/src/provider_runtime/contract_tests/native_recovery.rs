@@ -345,3 +345,31 @@ async fn c14_explicit_reset_archives_corrupt_claim_before_fresh_native_run() {
         [ProviderConversationState::Codex { thread_id: None }]
     );
 }
+
+#[tokio::test]
+async fn native_round_exhaustion_fails_closed_without_synthesizing_a_checkpoint() {
+    let fixture = RuntimeFixture::new("native-round-boundary");
+    let observed = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let initial = binding(&fixture).conversation;
+    let mut runtime = native_runtime(
+        &fixture,
+        NativeAdapter {
+            started: None,
+            observed: observed.clone(),
+        },
+    );
+    let mut request = fixture.foreground(binding(&fixture), 40_024);
+    request.policy.max_tool_rounds = 0;
+
+    let outcome = runtime.run_foreground(request).await;
+
+    assert_eq!(
+        outcome,
+        RunOutcome::Failed(ProviderRuntimeError::IterationBoundaryNotResumable)
+    );
+    assert_eq!(runtime.conversation_state(), initial);
+    assert!(
+        observed.lock().is_empty(),
+        "native adapter must not run when no confirmed boundary can be obtained"
+    );
+}

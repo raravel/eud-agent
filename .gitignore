@@ -56,3 +56,10 @@ ci/target/
 /rag-index.bin
 /rag-index.bin.sha256
 /rag-index.manifest.json
+# Local GJC/agent runtime state and per-file mutation locks
+/.gjc/
+/.omo/
+/src-tauri/src/*.rs.lock/
+
+# Legacy in-tree Cargo target output
+/src-tauri/target/

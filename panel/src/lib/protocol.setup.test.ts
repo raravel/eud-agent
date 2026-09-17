@@ -24,6 +24,7 @@ describe("setup message guard", () => {
       type: "setup",
       projectPath: "C:\\Project",
       projectValid: true,
+      projectOpened: false,
       euddraftPath: "C:\\euddraft.exe",
       euddraftValid: true,
       assetsReady: true,
@@ -34,12 +35,12 @@ describe("setup message guard", () => {
     expect(isSetupMessage(message)).toBe(true);
     expect(isServerMessage(message)).toBe(true);
   });
-
-  it("accepts nullable option fields emitted by older Rust builds", () => {
+  it("accepts nullable option fields with the explicit-launch marker", () => {
     const message = {
       type: "setup",
       projectPath: "",
       projectValid: false,
+      projectOpened: false,
       euddraftPath: "",
       euddraftValid: false,
       assetsReady: true,
@@ -58,6 +59,7 @@ describe("setup message guard", () => {
         type: "setup",
         projectPath: "",
         projectValid: false,
+        projectOpened: false,
         euddraftPath: "",
         euddraftValid: false,
         assetsReady: false,
@@ -70,6 +72,7 @@ describe("setup message guard", () => {
         type: "setup",
         projectPath: "",
         projectValid: false,
+        projectOpened: false,
         euddraftPath: "",
         euddraftValid: false,
         assetsReady: false,
@@ -91,6 +94,20 @@ describe("setup message guard", () => {
         euddraftValid: false,
         assetsReady: false,
         providers,
+        projectOpened: false,
+        setupRequired: true,
+      }),
+    ).toBe(true);
+    expect(
+      isSetupMessage({
+        type: "setup",
+        projectPath: "",
+        projectValid: false,
+        euddraftPath: "",
+        euddraftValid: false,
+        assetsReady: false,
+        providers,
+        projectOpened: false,
         setupRequired: true,
         error: "invalid_project_folder",
       }),
@@ -100,25 +117,48 @@ describe("setup message guard", () => {
         type: "setup",
         projectPath: "",
         projectValid: false,
-        euddraftPath: "",
-        euddraftValid: false,
-        assetsReady: false,
-        providers,
-        setupRequired: true,
-        error: null,
-      }),
-    ).toBe(true);
-    expect(
-      isSetupMessage({
-        type: "setup",
-        projectPath: "",
-        projectValid: false,
+        projectOpened: false,
         euddraftPath: "",
         euddraftValid: false,
         assetsReady: false,
         providers,
         setupRequired: true,
         error: 42,
+      }),
+    ).toBe(false);
+  });
+
+  it("validates all harness import issue fields and scopes", () => {
+    const base = {
+      type: "setup" as const,
+      projectPath: "",
+      projectValid: false,
+      euddraftPath: "",
+      euddraftValid: false,
+      assetsReady: false,
+      providers,
+      projectOpened: false,
+      setupRequired: true,
+      importIssues: [
+        {
+          id: "memory-1",
+          scope: "memory" as const,
+          path: "C:\\legacy\\.eud-agent\\memory\\meta.json",
+          reason: "invalid UTF-8",
+        },
+      ],
+    };
+    expect(isSetupMessage(base)).toBe(true);
+    expect(
+      isSetupMessage({
+        ...base,
+        importIssues: [{ ...base.importIssues[0], scope: "unknown" }],
+      }),
+    ).toBe(false);
+    expect(
+      isSetupMessage({
+        ...base,
+        importIssues: [{ ...base.importIssues[0], reason: " " }],
       }),
     ).toBe(false);
   });

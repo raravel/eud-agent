@@ -610,6 +610,7 @@ impl MapAgentService {
             panel_log: serde_json::Value::Null,
             context_state: Default::default(),
             task_state: Default::default(),
+            autonomous_run: None,
         };
         self.sessions
             .save(&record)
@@ -1955,6 +1956,7 @@ mod tests {
                 panel_log: Value::Null,
                 context_state: Default::default(),
                 task_state: Default::default(),
+                autonomous_run: None,
             })
             .unwrap();
         let target = SelectionMask::canonical(
@@ -2098,6 +2100,7 @@ mod tests {
                 panel_log: Value::Null,
                 context_state: Default::default(),
                 task_state: Default::default(),
+                autonomous_run: None,
             })
             .unwrap();
 

@@ -523,7 +523,11 @@ export function reduceMapTurnEvent(
   kind: string,
   detail: string,
   data: AgentEventData = {},
-): { turn: TurnState; cursor: MapTurnCursor } {
+): {
+  turn: TurnState;
+  cursor: MapTurnCursor;
+  unpairedToolStart?: { name: string; args?: string };
+} {
   const nextCursor = { ...cursor };
   if (kind === "reasoning") {
     return {
@@ -560,9 +564,27 @@ export function reduceMapTurnEvent(
     };
   }
   if (kind === "tool_call") {
+    const callId =
+      data.callId !== undefined && data.callId.trim().length > 0
+        ? data.callId
+        : undefined;
+    if (callId === undefined) {
+      return {
+        turn,
+        cursor: nextCursor,
+        unpairedToolStart: {
+          name: detail || "tool",
+          ...(data.args ? { args: data.args } : {}),
+        },
+      };
+    }
+    if (turn.tools.some((tool) => tool.callId === callId)) {
+      return { turn, cursor: nextCursor };
+    }
     nextCursor.toolSequence += 1;
     const tool: AgentTool = {
       id: `map-tool-${nextCursor.toolSequence}`,
+      callId,
       name: detail || "tool",
       state: "running",
       ...(data.args ? { args: data.args } : {}),
@@ -590,18 +612,61 @@ export function reduceMapTurnEvent(
   }
   if (kind === "tool_result") {
     const failed = data.status !== undefined && data.status !== "completed";
+    const callId =
+      data.callId !== undefined && data.callId.trim().length > 0
+        ? data.callId
+        : undefined;
     const complete = (tool: AgentTool): AgentTool => ({
       ...tool,
       state: failed ? "failed" : "done",
       ...(data.result ? { detail: data.result } : {}),
     });
-    const tools = turn.tools.slice();
-    for (let index = tools.length - 1; index >= 0; index -= 1) {
-      if (tools[index].state === "running") {
-        tools[index] = complete(tools[index]);
-        break;
-      }
+    const matchingIndex =
+      callId === undefined
+        ? -1
+        : turn.tools.findIndex(
+            (tool) =>
+              tool.callId === callId && tool.state === "running",
+          );
+    if (
+      matchingIndex < 0 &&
+      callId !== undefined &&
+      turn.tools.some((tool) => tool.callId === callId)
+    ) {
+      return { turn, cursor: nextCursor };
     }
+    if (matchingIndex < 0) {
+      nextCursor.toolSequence += 1;
+      const terminal: AgentTool = {
+        id: `map-tool-${nextCursor.toolSequence}`,
+        ...(callId !== undefined ? { callId } : {}),
+        name: detail || "tool",
+        state: failed ? "failed" : "done",
+        ...(data.result ? { detail: data.result } : {}),
+      };
+      const blocks = turn.blocks.slice();
+      const last = blocks[blocks.length - 1];
+      if (last !== undefined && last.type === "tools") {
+        blocks[blocks.length - 1] = {
+          ...last,
+          tools: [...last.tools, terminal],
+        };
+      } else {
+        nextCursor.blockSequence += 1;
+        blocks.push({
+          id: nextCursor.blockSequence,
+          type: "tools",
+          tools: [terminal],
+        });
+      }
+      return {
+        turn: { ...turn, tools: [...turn.tools, terminal], blocks },
+        cursor: nextCursor,
+      };
+    }
+    const tools = turn.tools.slice();
+    const matchingTool = tools[matchingIndex];
+    tools[matchingIndex] = complete(matchingTool);
     const blocks = turn.blocks.slice();
     let completed = false;
     for (
@@ -616,7 +681,7 @@ export function reduceMapTurnEvent(
         toolIndex >= 0;
         toolIndex -= 1
       ) {
-        if (block.tools[toolIndex].state !== "running") continue;
+        if (block.tools[toolIndex].id !== matchingTool.id) continue;
         const blockTools = block.tools.slice();
         blockTools[toolIndex] = complete(blockTools[toolIndex]);
         blocks[blockIndex] = { ...block, tools: blockTools };
@@ -1271,6 +1336,9 @@ export default function MapAgentApp() {
           const detail = String(payload.detail ?? "");
           const rawData = (payload.data ?? {}) as Record<string, unknown>;
           const data: AgentEventData = {
+            ...(typeof rawData.callId === "string"
+              ? { callId: rawData.callId }
+              : {}),
             ...(typeof rawData.args === "string"
               ? { args: rawData.args }
               : {}),
@@ -1288,6 +1356,20 @@ export default function MapAgentApp() {
             detail,
             data,
           );
+          if (next.unpairedToolStart !== undefined) {
+            logSequenceRef.current += 1;
+            const { name, args } = next.unpairedToolStart;
+            setConversation((entries) => [
+              ...entries,
+              {
+                id: logSequenceRef.current,
+                kind: "info",
+                text: args
+                  ? `도구 호출 시작 — ${name}\n${args}`
+                  : `도구 호출 시작 — ${name}`,
+              },
+            ]);
+          }
           turnRef.current = next.turn;
           turnCursorRef.current = next.cursor;
           startTransition(() => {

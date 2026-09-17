@@ -2,17 +2,17 @@
 
 ## Authority and runtime
 
-- `project.json`, `src/**/*.eps`, and sparse `dat/*.json` are the only authoring authority.
+- The sole schema-v2 `.eap` manifest, `src/**/*.eps`, `src/**/*.py`, and sparse `dat/*.json` are the only authoring authority.
 - NEVER make EDS, generated Python/binaries, E3S, SQLite, LocalAppData mirrors, or Codex workspaces canonical.
 - NEVER start, install, patch, probe, or communicate with EUD Editor at runtime.
 - NEVER add Lua/file-IPC, heartbeat/status polling, Editor path/bootstrap, BindingManager calls, assembly loading, or Editor build initiation.
 - The sibling `../euddraft` repository is read-only. Adapters and fixes belong in `eud-agent`.
-- euddraft runs only through the bounded native launcher with explicit cwd/arguments and captured diagnostics.
+- euddraft runs only through the bounded native launcher with explicit cwd/arguments and captured diagnostics. Any project with direct Python state MUST use configured frozen `euddraft.exe`; source-repository mode is rejected.
 
 ## Native project paths
 
 - All manifest/source/plugin paths are `/`-separated project-relative paths.
-- EPS sources MUST stay under `src/` and end in `.eps`.
+- EPS and direct-Python sources MUST stay under `src/` and end in `.eps` or `.py`; MainFile remains EPS-only.
 - Source and output maps MUST end in `.scx` or `.scm` and MUST NOT alias.
 - Reject absolute paths, `..`, NUL, empty components, case-colliding duplicates, and symlink/canonical-parent escapes before I/O.
 - MainFile is exact manifest state, not a filename convention. Moving MainFile updates the manifest; deleting it is rejected.
@@ -23,8 +23,12 @@
 - App-written text and JSON are UTF-8 without BOM.
 - Use same-directory temp files plus atomic replace for canonical state.
 - Validate complete state before any write.
-- Roaming contains small durable config/session/memory/journal/workspace state.
+- Roaming contains config, conversations, runtime jobs, journals, session workspaces/turn baselines, and preserved legacy harness sources.
 - Local contains large/regenerable model, RAG, analyzer, audio, and compatibility assets.
+- Accepted harness documents, trusted approval metadata, memory, and wiki MUST live in the selected project's `.eud-agent`, not in display-name or absolute-path-hash AppData stores. Keep the local workspace ID across folder moves.
+- Legacy migration MUST preserve source stores and existing local files, require unambiguous ownership, and record a one-time cutover so deleted local files are not resurrected.
+- Optional E3S harness omissions MUST return scoped paths/reasons and stable consent IDs. Explicit approval applies only to the current issues; recheck never authorizes exclusions. Core import and cleanup/rollback failures remain errors.
+- New import files MUST be published without replacing concurrent destination files. Windows publication MUST work without hard-link support, including exFAT project volumes.
 - Generated build outputs stay inside the project `build/` tree.
 
 ## Sparse DAT
@@ -70,7 +74,7 @@
 ## Agent tool admission
 
 - Tool schemas are closed, typed, and validated before dispatch.
-- `const`, `enum`, `oneOf`, primitive, array, and object constraints MUST match the advertised schema.
+- `const`, `enum`, `oneOf`, primitive, array, and object constraints MUST match the advertised schema. A violating call completes with a detailed usage error the model can correct within the run's tool-round budget; it never executes and never fails the run outright. Duplicate call ids, unknown tools, malformed call shape, and stale-run dispatch remain fatal admission errors.
 - Read tools never consume write budgets.
 - Mutations require evidence and a project write registration.
 - Journal every accepted semantic mutation with exact before/after state.
@@ -102,6 +106,10 @@
 - Long operations disable their trigger and show progress within the same surface.
 - Project setup order is project → euddraft → assets → provider selection → provider connection.
 - Project actions expose open/create/import; settings also exposes export.
+- Every ordinary launch requires explicit project selection; a file launch opens only its requested project. Stored config alone must not activate project polling, session restoration, or project-dependent bootstrap.
+- Recents are newest-first by successful explicit open; failed/canceled actions do not change selection or recency. Removing history must never delete project files.
+- File association is `.eap` only, never all `.json` files. The `.eap` file contains the canonical manifest directly. Legacy `project.json`/`.eudproj` may be migrated only on explicit open after validation; never generate descriptors or maintain two manifest authorities.
+- Refuse project switches during active work. Preserve forwarded requests for visible retry rather than dropping them or switching under a running agent/build.
 - Error text states a recovery action and never leaks raw protocol identifiers as the only explanation.
 - Use Lucide/vector icons, semantic theme tokens, and reduced-motion classes; no emoji structural icons.
 
@@ -114,3 +122,12 @@
 - E3S acceptance MUST include real import→export→import equality and original .NET BinaryFormatter deserialization.
 - UI changes MUST be browser/Tauri-surface verified, not inferred from unit tests.
 - Remove temporary fixtures, diagnostic scripts, obsolete tests/docs, and generated smoke files after verification.
+
+## Direct Python dependencies
+
+- Python is always active and full-trust; never describe an import allowlist as a sandbox.
+- Only ordered manifest entrypoints execute before the EPS MainFile. All `src/**/*.py` remain part of revision, snapshots, search, review, and rollback.
+- Exact direct PyPI pins and the complete wheel lock live only in `project.eap`; caches and preparation tokens are derived.
+- Preparation holds no project write lease. Token commit rechecks identity/revision/manifest, journals exact before/after bytes, and retains normal review ownership.
+- Managed uv/wheels/environments are checksummed, reparse-safe, atomically published, frozen-runtime probed, and fail closed offline.
+- E3S export refuses any project containing direct Python state; EPS-only compatibility is unchanged.

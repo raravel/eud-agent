@@ -3,7 +3,7 @@ import { Database, FileText, FolderTree, RefreshCw } from "lucide-react";
 
 import { MemoryView } from "@/components/MemoryView";
 import { WikiView } from "@/components/WikiView";
-import { WorkspaceView } from "@/components/WorkspaceView";
+import { WorkspaceFileTree } from "@/components/WorkspaceFileTree";
 import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
 import type { LedgerEntry, WorkspaceFileEntry, WorkspaceListResponse } from "@/lib/ipc";
@@ -19,8 +19,7 @@ export interface ProjectSidebarProps {
   wiki: WikiState;
   memory: MemoryViewState | null;
   workspace: WorkspaceListResponse | null;
-  workspacePath: string | null;
-  workspaceContent: string | null;
+  workspaceSelectedPath: string | null;
   workspaceLoading: boolean;
   workspaceError: string | null;
   onTabChange(tab: ProjectPanelTab): void;
@@ -50,9 +49,9 @@ function storedWidth(): number {
 }
 
 const TABS: ReadonlyArray<{ id: ProjectPanelTab; label: string; icon: typeof Database }> = [
+  { id: "workspace", label: "파일", icon: FolderTree },
   { id: "wiki", label: "DAT 위키", icon: Database },
   { id: "memory", label: "메모리", icon: FileText },
-  { id: "workspace", label: "파일", icon: FolderTree },
 ];
 
 export function ProjectSidebar({
@@ -62,8 +61,7 @@ export function ProjectSidebar({
   wiki,
   memory,
   workspace,
-  workspacePath,
-  workspaceContent,
+  workspaceSelectedPath,
   workspaceLoading,
   workspaceError,
   onTabChange,
@@ -152,18 +150,14 @@ export function ProjectSidebar({
           </div>
         )}
         {activeTab === "workspace" && workspace && (
-          <WorkspaceView
+          <WorkspaceFileTree
             key={workspace.workspaceId}
             workspace={workspace}
-            selectedPath={workspacePath}
-            selectedContent={workspaceContent}
+            selectedPath={workspaceSelectedPath}
             loading={workspaceLoading}
-            error={workspaceError}
-            embedded
             onSelect={onWorkspaceSelect}
             onSearch={onWorkspaceSearch}
             onRefresh={onWorkspaceRefresh}
-            onClose={onClose}
           />
         )}
         {activeTab === "workspace" && !workspace && (

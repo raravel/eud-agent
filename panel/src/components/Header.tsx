@@ -6,12 +6,12 @@
  * labels throughout.
  */
 import {
+  FolderKanban,
   MapIcon,
   PanelRightClose,
   PanelRightOpen,
   Settings,
 } from "lucide-react";
-
 import { Button } from "@/components/ui/button";
 import {
   Tooltip,
@@ -50,8 +50,10 @@ export interface HeaderProps {
   projectPanelOpen?: boolean;
   /** Open the general app settings dialog. */
   onSettingsOpen?: () => void;
-}
+  /** Return to the project launcher without changing project until a choice succeeds. */
+  onProjectSwitch?: () => void;
 
+}
 /** One status pill descriptor: label + tone classes + whether it is in flight. */
 interface Pill {
   label: string;
@@ -148,6 +150,7 @@ export function Header({
   onProjectPanelToggle,
   projectPanelOpen = false,
   onSettingsOpen,
+  onProjectSwitch,
 }: HeaderProps) {
   const conn = connState(connected, phase, projectAvailable, hasProject);
   const ragInfo = ragPill(rag);
@@ -178,6 +181,17 @@ export function Header({
           )}
         </div>
       </div>
+        {onProjectSwitch && (
+          <Button
+            type="button"
+            variant="outline"
+            className="gap-1.5"
+            onClick={onProjectSwitch}
+          >
+            <FolderKanban className="size-4" aria-hidden="true" />
+            프로젝트 전환
+          </Button>
+        )}
       <div className="flex shrink-0 items-center gap-2">
         {onOpenMapAgent && (
           <Button

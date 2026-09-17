@@ -91,6 +91,7 @@ function renderScreen(
       onCreateProject={vi.fn()}
       onImportE3s={vi.fn()}
       onPickEuddraft={vi.fn()}
+      onInstallEuddraft={vi.fn()}
       view={idleView}
       error={null}
       onRetry={vi.fn()}
@@ -140,7 +141,7 @@ describe("SetupScreen five-provider gate", () => {
     ).not.toBeInTheDocument();
   });
 
-  it("picks euddraft after the project step", async () => {
+  it("offers existing euddraft file and folder pickers after the project step", async () => {
     const onPickEuddraft = vi.fn();
     renderScreen({
       euddraftValid: false,
@@ -148,9 +149,13 @@ describe("SetupScreen five-provider gate", () => {
       onPickEuddraft,
     });
     await userEvent.click(
-      screen.getByRole("button", { name: "euddraft 선택" }),
+      screen.getByRole("button", { name: "euddraft 파일 선택" }),
     );
-    expect(onPickEuddraft).toHaveBeenCalledOnce();
+    await userEvent.click(
+      screen.getByRole("button", { name: "euddraft 폴더 선택" }),
+    );
+    expect(onPickEuddraft).toHaveBeenNthCalledWith(1, false);
+    expect(onPickEuddraft).toHaveBeenNthCalledWith(2, true);
   });
 
   it("renders determinate asset progress as step three", () => {

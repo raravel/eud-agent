@@ -206,7 +206,7 @@ fn revision_from_parts(
     })
 }
 
-fn resolve_starcraft_path(dirs: &DataDirs) -> Result<PathBuf, String> {
+pub(crate) fn resolve_starcraft_path(dirs: &DataDirs) -> Result<PathBuf, String> {
     if let Some(path) = std::env::var_os("STARCRAFT_PATH").map(PathBuf::from) {
         if path.is_dir() {
             return Ok(path);

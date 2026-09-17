@@ -75,6 +75,32 @@ impl RunGate {
         .map_err(|error| format!("provider tool execution task failed: {error}"))?;
         result
     }
+
+    /// Complete one admitted call with a model-correctable usage error without
+    /// executing it. The result is durable (journal/checkpoint/receipt) and
+    /// published exactly like an executed completion, so the model receives the
+    /// guidance and the transcript stays paired.
+    pub(super) async fn complete_usage_error(
+        &self,
+        call: &DirectToolCall,
+        message: String,
+    ) -> Result<DirectToolResult, String> {
+        let admission = self.admit()?;
+        self.publish_started(call)?;
+        let completion_inner = Arc::clone(&self.inner);
+        let completion_gate = self.clone();
+        let call = call.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            let result = tool_result(&call, Err(message));
+            let recorded = record_completion(&completion_inner, &call, &result);
+            let published = recorded.and_then(|()| completion_gate.publish_completed(&result));
+            drop(admission);
+            published.map(|()| result)
+        })
+        .await
+        .map_err(|error| format!("provider tool usage completion task failed: {error}"))?;
+        result
+    }
 }
 
 fn stale_scope_error(outcome: &Result<serde_json::Value, String>) -> Option<String> {

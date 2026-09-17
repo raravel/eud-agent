@@ -59,6 +59,7 @@ async fn live_codex_runtime_foreground_resume_structured_compact_cancel_and_rest
             None,
             crate::provider_runtime::WorkspaceAccess::Read,
             false,
+            None,
         )
         .await
         .expect("start authenticated model inventory");

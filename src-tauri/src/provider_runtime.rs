@@ -1,4 +1,5 @@
 use crate::provider::ProviderConversationState;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::time::Duration;
 use thiserror::Error;
@@ -35,6 +36,15 @@ pub const HARNESS_DEADLINE: Duration = Duration::from_secs(300);
 pub const DEFAULT_MAX_TOOL_ROUNDS: usize = 64;
 pub const MAX_PROVIDER_CONTINUATION_BYTES: usize = 64 * 1024;
 
+/// Typed reason why a foreground request stopped at a resumable iteration boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IterationBoundaryReason {
+    ToolActions,
+    ToolRounds,
+    ContextPressure,
+    ProviderContinuation,
+}
 #[derive(Debug, Clone, PartialEq)]
 pub enum RunOutcome {
     Completed {
@@ -44,6 +54,10 @@ pub enum RunOutcome {
     Structured {
         value: Value,
         base: JobBase,
+    },
+    IterationBoundary {
+        reason: IterationBoundaryReason,
+        conversation: ProviderConversationState,
     },
     Cancelled,
     WriteTransition,
@@ -89,8 +103,8 @@ pub enum ProviderRuntimeError {
     Protocol(String),
     #[error("provider structured output is invalid")]
     StructuredOutputInvalid,
-    #[error("provider tool loop exceeded its round limit")]
-    ToolRoundLimit,
+    #[error("provider iteration boundary was not resumable")]
+    IterationBoundaryNotResumable,
     #[error("provider event belongs to another run")]
     StaleEvent,
 }

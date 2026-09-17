@@ -6,6 +6,7 @@ mod direct_write_transition;
 mod fixtures;
 mod harness_retry;
 mod live;
+mod live_smoke;
 mod native_ask;
 mod native_mcp;
 mod native_pending_mutation;
@@ -206,12 +207,12 @@ async fn c02_actual_ollama_runs_ordered_tools_and_checkpoints_results_before_fin
 }
 
 #[tokio::test]
-async fn c12_actual_write_transition_resumes_once_in_write_workspace() {
-    // Given: the production adapter asks to transition one read turn into write mode.
+async fn c12_actual_first_mutation_transitions_and_resumes_once_in_write_context() {
+    // Given: the production adapter directly requests a mutation during a read turn.
     let transition = concat!(
         "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"transition reasoning\",\"tool_calls\":[",
         "{\"index\":0,\"id\":\"read-call\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"src/main.eps\\\"}\"}},",
-        "{\"index\":1,\"id\":\"write-call\",\"function\":{\"name\":\"request_write_workspace\",\"arguments\":\"{\\\"reason\\\":\\\"edit source\\\"}\"}},",
+        "{\"index\":1,\"id\":\"write-call\",\"function\":{\"name\":\"file_create\",\"arguments\":\"{\\\"path\\\":\\\"src/automatic-transition.eps\\\",\\\"ftype\\\":\\\"CUIEps\\\",\\\"code\\\":\\\"const automatic_transition = 1;\\\\n\\\"}\"}},",
         "{\"index\":2,\"id\":\"never-call\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"src/main.eps\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
         "data: [DONE]\n\n"
     );
@@ -224,7 +225,7 @@ async fn c12_actual_write_transition_resumes_once_in_write_workspace() {
     let binding = fixture.binding(&http.base_url);
     let mut runtime = runtime(&fixture, binding.clone());
 
-    // When: the read run transitions, then the same request resumes with write authority.
+    // When: the runtime parks that mutation, then the same request resumes with write authority.
     let first = runtime
         .run_foreground(fixture.foreground(binding.clone(), 121))
         .await;
@@ -264,6 +265,26 @@ async fn c12_actual_write_transition_resumes_once_in_write_workspace() {
         })
         .collect::<Vec<_>>();
     assert_eq!(audited_results, ["read-call", "write-call"]);
+    let transition_result = audit
+        .generation
+        .checkpoint
+        .blocks
+        .iter()
+        .find_map(|block| match block {
+            TranscriptBlock::ToolResult {
+                id,
+                result,
+                is_error,
+                ..
+            } if id == "write-call" => Some((result, is_error)),
+            _ => None,
+        })
+        .expect("transition result");
+    assert!(*transition_result.1);
+    assert!(transition_result
+        .0
+        .as_str()
+        .is_some_and(|message| message.starts_with("WriteWorkspaceTransition:")));
     let audited_calls = audit
         .generation
         .checkpoint

@@ -905,10 +905,54 @@ impl NativeProjectManager {
         let manifest_path = project.manifest_path().to_path_buf();
         let manifest_bytes = fs::read(&manifest_path).map_err(stringify_io)?;
         let manifest_sha256 = sha256_bytes(&manifest_bytes);
+        let euddraft = self.frozen_euddraft()?;
+        let current_euddraft_fingerprint = euddraft.frozen_fingerprint()?;
+        {
+            let mut candidates = self.python_candidates.lock();
+            let now = unix_millis();
+            candidates.retain(|_, candidate| candidate.expires_at >= now);
+            if let Some((token, candidate)) = candidates.iter().find(|(_, candidate)| {
+                candidate.session_id == session_id
+                    && candidate.project_id == project_id
+                    && candidate.project_root == project_root
+                    && candidate.base_revision == base_revision
+                    && candidate.manifest_sha256 == manifest_sha256
+                    && candidate.input_digest == input_digest
+                    && candidate.euddraft_fingerprint == current_euddraft_fingerprint
+            }) {
+                let resolved_packages = candidate
+                    .python_lock
+                    .as_ref()
+                    .map(|lock| {
+                        lock.packages
+                            .iter()
+                            .map(|package| PythonResolvedPackageSummary {
+                                name: package.name.clone(),
+                                version: package.version.clone(),
+                                wheel_filename: package.wheel_filename.clone(),
+                                sha256: package.sha256.clone(),
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let result = PythonDependenciesPrepareResult {
+                    candidate_token: token.clone(),
+                    normalized_dependencies: candidate.dependencies.clone(),
+                    resolved_packages,
+                    lock_digest: candidate.lock_digest.clone(),
+                    input_digest: candidate.input_digest.clone(),
+                    cache_identity: candidate.cache_identity.clone(),
+                    base_revision: candidate.base_revision.clone(),
+                    manifest_sha256: candidate.manifest_sha256.clone(),
+                    euddraft_fingerprint: candidate.euddraft_fingerprint.clone(),
+                    expires_at: candidate.expires_at,
+                };
+                return Ok(result);
+            }
+        }
         let uv = crate::bootstrap::managed_uv_path(&self.dirs).map_err(|error| {
             format!("검증된 관리형 uv {MANAGED_UV_VERSION}을 찾지 못했습니다: {error}")
         })?;
-        let euddraft = self.frozen_euddraft()?;
         let project_env_root = self.dirs.python_envs_dir().join(&cache_key);
         ensure_plain_directory_path(&self.dirs.python_envs_dir(), &project_env_root)?;
 
@@ -2561,6 +2605,11 @@ mod tests {
         assert_eq!(prepared.normalized_dependencies, vec!["six==1.17.0"]);
         assert_eq!(prepared.lock_digest, concurrent.lock_digest);
         assert_eq!(prepared.cache_identity, concurrent.cache_identity);
+        assert_eq!(
+            prepared.candidate_token, concurrent.candidate_token,
+            "identical normalized dependency input must reuse the active prepared candidate"
+        );
+        assert_eq!(prepared.input_digest, concurrent.input_digest);
         let cache_key = python_project_cache_key(&fs::canonicalize(&root).unwrap());
         let completed = fs::read_dir(manager.data_dirs().python_envs_dir().join(&cache_key))
             .unwrap()
@@ -2591,6 +2640,10 @@ mod tests {
                 vec!["six==1.17.0".to_string()],
             )
             .unwrap();
+        assert_ne!(
+            prepared.candidate_token, concurrent.candidate_token,
+            "a changed project revision must not reuse a stale candidate"
+        );
         let claimed = manager
             .claim_python_dependencies(
                 &prepared.candidate_token,
@@ -2937,6 +2990,7 @@ wheels = [{ url = "https://packages.example/demo-1.0-py3-none-any.whl", hashes =
         assert!(parse_pylock(alternate).unwrap_err().contains("PyPI"));
 
         let sdist_only = r#"
+
 lock-version = "1.0"
 [[packages]]
 name = "demo"
@@ -2944,6 +2998,33 @@ version = "1.0"
 sdist = { url = "https://files.pythonhosted.org/packages/demo-1.0.tar.gz", hashes = { sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" } }
 "#;
         assert!(parse_pylock(sdist_only).unwrap_err().contains("wheel"));
+    }
+    #[test]
+    fn dependency_input_digest_covers_the_complete_normalized_set() {
+        let a = validate_python_dependencies(&[
+            "Requests==2.32.0".to_string(),
+            "typing_extensions==4.12.2".to_string(),
+        ])
+        .unwrap();
+        let same = validate_python_dependencies(&[
+            "requests==2.32.0".to_string(),
+            "typing-extensions==4.12.2".to_string(),
+        ])
+        .unwrap();
+        let different = validate_python_dependencies(&[
+            "requests==2.32.1".to_string(),
+            "typing-extensions==4.12.2".to_string(),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            python_input_digest(&a).unwrap(),
+            python_input_digest(&same).unwrap()
+        );
+        assert_ne!(
+            python_input_digest(&a).unwrap(),
+            python_input_digest(&different).unwrap()
+        );
     }
 
     #[test]

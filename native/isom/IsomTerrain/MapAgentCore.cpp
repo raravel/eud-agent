@@ -21,6 +21,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <share.h>
 #include <set>
 #include <optional>
 #include <sstream>
@@ -122,9 +123,16 @@ std::string sha256Bytes(const void* data, std::size_t size)
     return sha(data, size);
 }
 
+std::wstring utf8Wide(const std::string& text);
+
 std::string readFileSha256(const std::string& path)
 {
-    std::ifstream input(path, std::ios::binary);
+    const std::wstring widePath = utf8Wide(path);
+    std::unique_ptr<FILE, decltype(&std::fclose)> inputFile(
+        _wfsopen(widePath.c_str(), L"rbN", _SH_DENYNO), &std::fclose);
+    if ( inputFile == nullptr )
+        fail("cannot open input map: " + path);
+    std::ifstream input(inputFile.get());
     if ( !input )
         fail("cannot open input map: " + path);
     SHA256 sha;

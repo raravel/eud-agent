@@ -129,6 +129,7 @@ export interface AskState {
  */
 export interface AgentTool {
   id: string;
+  callId?: string;
   name: string;
   state: "running" | "done" | "failed";
   /** Tool-call argument text (agent_event.data.args, EUD-068). */
@@ -139,6 +140,7 @@ export interface AgentTool {
 
 /** Optional payload on a streamed agent_event (EUD-068 tool args/result). */
 export interface AgentEventData {
+  callId?: string;
   args?: string;
   result?: string;
   status?: string;
@@ -787,10 +789,25 @@ export function createPanelStore(): PanelStore {
           break;
         }
         case "tool_call": {
-          // Open a running Tool row by name; carry the call args (EUD-068).
+          const callId =
+            data?.callId !== undefined && data.callId.trim().length > 0
+              ? data.callId
+              : undefined;
+          if (callId === undefined) {
+            const name = detail || "tool";
+            pushLog(
+              "info",
+              data?.args
+                ? `도구 호출 시작 — ${name}\n${data.args}`
+                : `도구 호출 시작 — ${name}`,
+            );
+            break;
+          }
+          if (core.turn.tools.some((tool) => tool.callId === callId)) break;
           toolSeq += 1;
           const tool: AgentTool = {
             id: `tool-${toolSeq}`,
+            callId,
             name: detail || "tool",
             state: "running",
           };
@@ -809,32 +826,68 @@ export function createPanelStore(): PanelStore {
           break;
         }
         case "tool_result": {
-          // Flip the latest still-running Tool row to done/failed; attach the
-          // result text (EUD-068). A non-"completed" server status (failed /
-          // declined) flags the row; absence of data keeps the legacy done flip.
           const failed =
             data?.status !== undefined && data.status !== "completed";
+          const callId =
+            data?.callId !== undefined && data.callId.trim().length > 0
+              ? data.callId
+              : undefined;
           const flip = (tool: AgentTool): AgentTool => ({
             ...tool,
             state: failed ? "failed" : "done",
             ...(data?.result ? { detail: data.result } : {}),
           });
-          const tools = core.turn.tools.slice();
-          for (let i = tools.length - 1; i >= 0; i -= 1) {
-            if (tools[i].state === "running") {
-              tools[i] = flip(tools[i]);
-              break;
-            }
+          const matchingIndex =
+            callId === undefined
+              ? -1
+              : core.turn.tools.findIndex(
+                  (tool) =>
+                    tool.callId === callId && tool.state === "running",
+                );
+          if (
+            matchingIndex < 0 &&
+            callId !== undefined &&
+            core.turn.tools.some((tool) => tool.callId === callId)
+          ) {
+            break;
           }
-          // Mirror the flip into the blocks timeline (block tools are separate
-          // row objects from turn.tools).
+          if (matchingIndex < 0) {
+            toolSeq += 1;
+            const terminal: AgentTool = {
+              id: `tool-${toolSeq}`,
+              ...(callId !== undefined ? { callId } : {}),
+              name: detail || "tool",
+              state: failed ? "failed" : "done",
+              ...(data?.result ? { detail: data.result } : {}),
+            };
+            const blocks = core.turn.blocks.slice();
+            const last = blocks[blocks.length - 1];
+            if (last !== undefined && last.type === "tools") {
+              blocks[blocks.length - 1] = {
+                ...last,
+                tools: [...last.tools, terminal],
+              };
+            } else {
+              blockSeq += 1;
+              blocks.push({ id: blockSeq, type: "tools", tools: [terminal] });
+            }
+            core.turn = {
+              ...core.turn,
+              tools: [...core.turn.tools, terminal],
+              blocks,
+            };
+            break;
+          }
+          const tools = core.turn.tools.slice();
+          const matchingTool = tools[matchingIndex];
+          tools[matchingIndex] = flip(matchingTool);
           const blocks = core.turn.blocks.slice();
           let flipped = false;
           for (let b = blocks.length - 1; b >= 0 && !flipped; b -= 1) {
             const block = blocks[b];
             if (block.type !== "tools") continue;
             for (let i = block.tools.length - 1; i >= 0; i -= 1) {
-              if (block.tools[i].state === "running") {
+              if (block.tools[i].id === matchingTool.id) {
                 const blockTools = block.tools.slice();
                 blockTools[i] = flip(blockTools[i]);
                 blocks[b] = { ...block, tools: blockTools };

@@ -5,7 +5,7 @@ use serde_json::Value;
 use tokio::sync::{mpsc, watch, Notify};
 
 use crate::{
-    provider_runtime::{RunIdentity, WorkspaceAccess},
+    provider_runtime::{IterationBoundaryReason, RunIdentity, WorkspaceAccess},
     provider_transcript::RunCheckpointWriter,
     tool_exec::SessionToolRuntime,
 };
@@ -13,7 +13,7 @@ use crate::{
 use super::{
     gate_state::{Admission, GateState, RunGateInner},
     receipt::RunReceiptStore,
-    validation::validate_call_shape,
+    validation::{validate_call_shape, CallAdmission},
     DirectDispatchBatch, DirectToolCall, DirectToolResult, DurableToolCompletion,
 };
 
@@ -46,6 +46,8 @@ impl RunGate {
                     in_flight: 0,
                     next_sequence: 0,
                     completed: Vec::new(),
+                    write_transition_requested: false,
+                    iteration_boundary_requested: None,
                 }),
                 recording: Mutex::new(()),
                 event_sender,
@@ -174,14 +176,16 @@ impl RunGate {
         calls: Vec<DirectToolCall>,
         tools_disabled: bool,
     ) -> Result<DirectDispatchBatch, String> {
-        self.reserve_batch(&calls, tools_disabled)?;
+        let violations = self.reserve_batch(&calls, tools_disabled)?;
         let mut results = Vec::with_capacity(calls.len());
         let mut stop_for_write_transition = false;
-        for call in calls {
-            let result = self.execute_call(call).await?;
-            let is_write_transition = Self::is_granted_write_transition(&result);
+        for (call, violation) in calls.into_iter().zip(violations) {
+            let result = match violation {
+                Some(message) => self.complete_usage_error(&call, message).await?,
+                None => self.execute_call(call).await?,
+            };
             results.push(result);
-            if is_write_transition {
+            if self.write_transition_requested() {
                 stop_for_write_transition = true;
                 break;
             }
@@ -199,14 +203,24 @@ impl RunGate {
         arguments: Value,
     ) -> Result<DirectToolResult, String> {
         let result = async {
-            validate_call_shape(&self.descriptors(), call_id.as_deref(), &name, &arguments)?;
-            self.reserve_ids(call_id.iter().map(String::as_str))?;
-            self.execute_call(DirectToolCall {
-                id: call_id.unwrap_or_default(),
+            let call = DirectToolCall {
+                id: call_id.clone().unwrap_or_default(),
                 name,
                 arguments,
-            })
-            .await
+            };
+            let admission = validate_call_shape(
+                &self.descriptors(),
+                call_id.as_deref(),
+                &call.name,
+                &call.arguments,
+            )?;
+            self.reserve_ids(call_id.iter().map(String::as_str))?;
+            match admission {
+                CallAdmission::Valid => self.execute_call(call).await,
+                CallAdmission::SchemaViolation(message) => {
+                    self.complete_usage_error(&call, message).await
+                }
+            }
         }
         .await;
         if let Err(error) = &result {
@@ -215,19 +229,37 @@ impl RunGate {
         result
     }
 
-    fn reserve_batch(&self, calls: &[DirectToolCall], tools_disabled: bool) -> Result<(), String> {
+    /// Fatal-shape the whole batch before admitting anything, then return one
+    /// optional schema-violation message per call for recoverable completion.
+    fn reserve_batch(
+        &self,
+        calls: &[DirectToolCall],
+        tools_disabled: bool,
+    ) -> Result<Vec<Option<String>>, String> {
         if tools_disabled && !calls.is_empty() {
             return Err("provider_structured_output_invalid".to_string());
         }
         let descriptors = self.descriptors();
         let mut batch_ids = HashSet::with_capacity(calls.len());
+        let mut violations = Vec::with_capacity(calls.len());
         for call in calls {
-            validate_call_shape(&descriptors, Some(&call.id), &call.name, &call.arguments)?;
+            violations.push(
+                match validate_call_shape(
+                    &descriptors,
+                    Some(&call.id),
+                    &call.name,
+                    &call.arguments,
+                )? {
+                    CallAdmission::Valid => None,
+                    CallAdmission::SchemaViolation(message) => Some(message),
+                },
+            );
             if !batch_ids.insert(call.id.as_str()) {
                 return Err("provider returned a duplicate tool-call id".to_string());
             }
         }
-        self.reserve_ids(calls.iter().map(|call| call.id.as_str()))
+        self.reserve_ids(calls.iter().map(|call| call.id.as_str()))?;
+        Ok(violations)
     }
 
     fn reserve_ids<'a>(&self, ids: impl Iterator<Item = &'a str>) -> Result<(), String> {
@@ -275,44 +307,58 @@ impl RunGate {
         call: &DirectToolCall,
         execute: impl FnOnce() -> Result<Value, String>,
     ) -> Result<Value, String> {
+        if let Some(reason) = self.iteration_boundary_reason() {
+            return Err(match reason {
+                IterationBoundaryReason::ToolActions => {
+                    "IterationBoundary: 이번 반복에서 300개 도구 작업을 완료했습니다. 이 호출은 실행하지 않았습니다."
+                        .to_string()
+                }
+                _ => {
+                    "IterationBoundary: 안전한 재개 지점이 요청되어 이 호출은 실행하지 않았습니다."
+                        .to_string()
+                }
+            });
+        }
         if self.inner.workspace_access == WorkspaceAccess::Read
             && self.inner.identity.session_kind == crate::session::SessionKind::Eps
-            && crate::tools::is_mutating_tool(&call.name)
+            && crate::tools::requires_write_workspace(&call.name)
         {
+            self.inner
+                .runtime
+                .register_write_request(format!("automatic transition for {}", call.name))?;
+            self.inner.state.lock().write_transition_requested = true;
             return Err(
-                "WriteWorkspaceTransitionRequired: this foreground run is read-only. Complete the write transition by stopping this turn after request_write_workspace so the backend can resume the same thread in its isolated writable workspace before using mutation tools."
+                "WriteWorkspaceTransition: mutation was not executed because this foreground run is read-only. The runtime will resume the same thread in its isolated write context; re-read the target and retry the mutation."
                     .to_string(),
             );
         }
-        let mut result = execute()?;
-        if self.inner.workspace_access == WorkspaceAccess::Write
-            && call.name == crate::tools::REQUEST_WRITE_WORKSPACE_TOOL
-            && result["status"] == "granted"
-        {
-            result["status"] = Value::String("already_granted".to_string());
-            result["note"] = Value::String(
-                "Write workspace is already active. Continue this turn and use the required mutation tools."
-                    .to_string(),
-            );
+        execute()
+    }
+
+    pub(crate) fn has_requested_write_transition(&self) -> bool {
+        self.write_transition_requested()
+    }
+
+    fn write_transition_requested(&self) -> bool {
+        self.inner.state.lock().write_transition_requested
+    }
+
+    pub(crate) fn iteration_boundary_reason(&self) -> Option<IterationBoundaryReason> {
+        let mut state = self.inner.state.lock();
+        if state.iteration_boundary_requested.is_none() {
+            state.iteration_boundary_requested = if self.inner.runtime.autonomous_pause_requested()
+            {
+                Some(IterationBoundaryReason::ProviderContinuation)
+            } else if self
+                .inner
+                .runtime
+                .iteration_action_boundary_reached(&self.inner.identity.request_id)
+            {
+                Some(IterationBoundaryReason::ToolActions)
+            } else {
+                None
+            };
         }
-        Ok(result)
-    }
-
-    pub(crate) fn has_granted_write_transition(&self) -> bool {
-        self.completed()
-            .iter()
-            .any(Self::is_granted_write_transition_completion)
-    }
-
-    fn is_granted_write_transition(result: &DirectToolResult) -> bool {
-        result.name == crate::tools::REQUEST_WRITE_WORKSPACE_TOOL
-            && !result.is_error
-            && result.result["status"] == "granted"
-    }
-
-    fn is_granted_write_transition_completion(completion: &DurableToolCompletion) -> bool {
-        completion.name == crate::tools::REQUEST_WRITE_WORKSPACE_TOOL
-            && !completion.is_error
-            && completion.result["status"] == "granted"
+        state.iteration_boundary_requested
     }
 }

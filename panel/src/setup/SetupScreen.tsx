@@ -18,29 +18,39 @@ import type {
 
 const PICK_ERROR_TEXT: Readonly<Record<string, string>> = {
   invalid_project_folder:
-    "project.json이 있는 Native EUD 프로젝트 폴더를 선택해 주세요.",
-  invalid_euddraft_path: "euddraft.exe 또는 euddraft.py를 선택해 주세요.",
+    ".eap 파일이 있는 Native EUD 프로젝트 폴더를 선택해 주세요.",
+  invalid_euddraft_path:
+    "euddraft.exe 또는 euddraft.py 파일이나 해당 파일이 있는 폴더를 선택해 주세요.",
 };
 
 function projectErrorText(error: string): string {
+  const separator = error.indexOf(":");
+  if (separator > 0) {
+    const detail = error.slice(separator + 1).trim();
+    if (detail) return detail;
+  }
   if (error.startsWith("project_create_failed:")) {
     return "프로젝트를 만들지 못했습니다. 원본 맵과 비어 있는 대상 폴더를 확인해 주세요.";
   }
   if (error.startsWith("e3s_import_failed:")) {
-    return "E3S를 가져오지 못했습니다. 참조 맵이 존재하고 대상 폴더가 비어 있는지 확인해 주세요.";
+    return "E3S 프로젝트를 가져오지 못했습니다. 참조 맵과 비어 있는 대상 폴더를 확인해 주세요.";
   }
   return PICK_ERROR_TEXT[error] ?? "설정 경로를 확인하지 못했습니다.";
 }
 
 export interface SetupScreenProps {
   projectValid: boolean;
+  euddraftPath?: string;
   euddraftValid: boolean;
   pickError: string | null;
   onPickProject(): void;
   onCreateProject(): void;
   onImportE3s(): void;
   projectAction?: "open" | "create" | "import" | null;
-  onPickEuddraft(): void;
+  onPickEuddraft(directory?: boolean): void;
+  onInstallEuddraft(): void;
+  euddraftAction?: "file" | "folder" | "install" | null;
+  bootstrapActive?: boolean;
   view: BootstrapView;
   error: string | null;
   onRetry(): void;
@@ -83,6 +93,7 @@ const STEPS = [
 
 export function SetupScreen({
   projectValid,
+  euddraftPath = "",
   euddraftValid,
   pickError,
   onPickProject,
@@ -90,6 +101,9 @@ export function SetupScreen({
   onImportE3s,
   projectAction = null,
   onPickEuddraft,
+  onInstallEuddraft,
+  euddraftAction = null,
+  bootstrapActive = false,
   view,
   error,
   onRetry,
@@ -141,6 +155,7 @@ export function SetupScreen({
           : selectedConnected
             ? 5
             : 4;
+  const hasConfiguredEuddraft = euddraftPath.trim().length > 0;
 
   return (
     <main className="min-h-dvh overflow-y-auto bg-background px-4 py-8 text-foreground sm:px-8">
@@ -238,12 +253,13 @@ export function SetupScreen({
             </div>
           </section>
         )}
-
         {projectValid && !euddraftValid && (
           <section className="mx-auto mt-6 max-w-xl rounded-xl border border-border bg-card p-6 shadow-sm">
-            <h2 className="text-lg font-semibold">euddraft 실행 파일</h2>
+            <h2 className="text-lg font-semibold">euddraft 준비</h2>
             <p className="mt-2 text-sm leading-6 text-muted-foreground">
-              프로젝트를 직접 빌드할 euddraft.exe 또는 euddraft.py를 선택해 주세요.
+              {hasConfiguredEuddraft
+                ? "설정된 euddraft 경로를 찾을 수 없습니다. 최신 버전을 설치하거나 기존 실행 파일을 다시 선택해 주세요."
+                : "euddraft를 직접 선택하지 않으면 최신 버전을 자동으로 내려받아 설치합니다."}
             </p>
             {pickError && (
               <p role="alert" className="mt-4 flex gap-2 rounded-md border border-destructive/40 bg-destructive/10 p-3 text-sm text-destructive">
@@ -251,10 +267,92 @@ export function SetupScreen({
                 {projectErrorText(pickError)}
               </p>
             )}
-            <Button className="mt-5 min-h-11" onClick={onPickEuddraft}>
-              <FolderOpenIcon aria-hidden className="size-4" />
-              euddraft 선택
-            </Button>
+            {(bootstrapActive || (!hasConfiguredEuddraft && view.phase === "error")) && (
+              <div className="mt-5 rounded-md border border-border bg-muted/40 p-4">
+                <div className="flex items-center gap-2 text-sm">
+                  <Loader2Icon
+                    aria-hidden
+                    className={cn(
+                      "size-4",
+                      bootstrapActive && "animate-spin motion-reduce:animate-none",
+                    )}
+                  />
+                  {view.label}
+                </div>
+                {view.pct !== null && (
+                  <div
+                    role="progressbar"
+                    aria-label="euddraft 다운로드"
+                    aria-valuemin={0}
+                    aria-valuemax={100}
+                    aria-valuenow={view.pct}
+                    className="mt-3 h-2 overflow-hidden rounded-full bg-muted"
+                  >
+                    <div
+                      className="h-full bg-primary transition-transform"
+                      style={{ transform: `translateX(${view.pct - 100}%)` }}
+                    />
+                  </div>
+                )}
+              </div>
+            )}
+            {view.phase === "error" && (
+              <p role="alert" className="mt-4 text-sm text-destructive">
+                euddraft를 준비하지 못했습니다. 네트워크 연결과 설치 경로를 확인해 주세요.
+              </p>
+            )}
+            <div className="mt-5 grid gap-2 sm:grid-cols-2">
+              <Button
+                className="min-h-11"
+                onClick={() => onPickEuddraft(false)}
+                disabled={euddraftAction !== null}
+              >
+                {euddraftAction === "file" ? (
+                  <Loader2Icon aria-hidden className="size-4 animate-spin motion-reduce:animate-none" />
+                ) : (
+                  <FolderOpenIcon aria-hidden className="size-4" />
+                )}
+                euddraft 파일 선택
+              </Button>
+              <Button
+                variant="outline"
+                className="min-h-11"
+                onClick={() => onPickEuddraft(true)}
+                disabled={euddraftAction !== null}
+              >
+                {euddraftAction === "folder" ? (
+                  <Loader2Icon aria-hidden className="size-4 animate-spin motion-reduce:animate-none" />
+                ) : (
+                  <FolderOpenIcon aria-hidden className="size-4" />
+                )}
+                euddraft 폴더 선택
+              </Button>
+            </div>
+            {hasConfiguredEuddraft && (
+              <Button
+                variant="outline"
+                className="mt-2 min-h-11 w-full"
+                onClick={onInstallEuddraft}
+                disabled={euddraftAction !== null || bootstrapActive}
+              >
+                {euddraftAction === "install" ? (
+                  <Loader2Icon aria-hidden className="size-4 animate-spin motion-reduce:animate-none" />
+                ) : (
+                  <Loader2Icon aria-hidden className="size-4" />
+                )}
+                최신 euddraft 설치
+              </Button>
+            )}
+            {view.phase === "error" && (
+              <Button
+                variant="ghost"
+                className="mt-2 min-h-11 w-full"
+                onClick={hasConfiguredEuddraft ? onInstallEuddraft : onRetry}
+                disabled={euddraftAction !== null || bootstrapActive}
+              >
+                다시 시도
+              </Button>
+            )}
           </section>
         )}
 

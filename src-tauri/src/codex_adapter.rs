@@ -44,6 +44,8 @@ struct ClientKey {
     access: WorkspaceAccess,
     mcp_endpoint: Option<String>,
     native_tools_enabled: bool,
+    /// Session-private `TEMP`/`TMP` target baked into the spawned process.
+    temp_dir: Option<PathBuf>,
 }
 
 pub struct CodexAdapter {
@@ -92,6 +94,7 @@ impl CodexAdapter {
                 key.mcp_endpoint.as_deref(),
                 key.access,
                 key.native_tools_enabled,
+                key.temp_dir.as_deref(),
             )
             .await
             .map_err(transport_error)?;

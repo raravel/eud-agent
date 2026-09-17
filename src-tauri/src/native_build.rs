@@ -272,6 +272,7 @@ impl EuddraftLaunch {
                     script: configured.to_path_buf(),
                 });
             }
+            crate::bootstrap::validate_managed_install(configured)?;
             return Ok(Self::Executable(configured.to_path_buf()));
         }
         if configured.is_dir() {
@@ -288,6 +289,7 @@ impl EuddraftLaunch {
             }
             let executable = configured.join("euddraft.exe");
             if executable.is_file() {
+                crate::bootstrap::validate_managed_install(&executable)?;
                 return Ok(Self::Executable(executable));
             }
         }
@@ -2349,15 +2351,104 @@ mod tests {
             EuddraftLaunch::resolve(Path::new(&std::env::var("EUD_AGENT_EUDDRAFT").unwrap()))
                 .unwrap();
 
-        let result = run_native_build(&project, &compat_root(), &euddraft).unwrap();
-
-        assert!(result.ok, "{:?}", result.errors);
-        assert!(root.join("build/output.scx").is_file());
+        let mut revisions = std::collections::BTreeSet::new();
+        let mut final_result = None;
+        for cycle in 1..=4 {
+            project
+                .write_source(
+                    "src/main.eps",
+                    &format!(
+                        "// autonomous real-build cycle {cycle}\nfunction onPluginStart() {{}}\n"
+                    ),
+                )
+                .unwrap();
+            revisions.insert(project.revision().unwrap());
+            let result = run_native_build(&project, &compat_root(), &euddraft).unwrap();
+            assert!(result.ok, "cycle {cycle}: {:?}", result.errors);
+            assert!(root.join("build/output.scx").is_file());
+            final_result = Some(result);
+        }
+        assert_eq!(revisions.len(), 4);
+        let result = final_result.unwrap();
         let eds = fs::read_to_string(&result.artifacts.eds_path).unwrap();
         assert!(
             eds.find("[../../src/direct.py]").unwrap() < eds.find("[../../src/main.eps]").unwrap()
         );
         assert!(!eds.contains("helper.py]"));
         fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn resolve_rejects_a_corrupt_managed_install_and_accepts_an_intact_one() {
+        let base = std::env::temp_dir().join(format!(
+            "eud-agent-resolve-integrity-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let exe_sha = crate::bootstrap::sha256_hex_bytes(b"managed");
+
+        // App-managed install: nearest ancestor marker drives full manifest re-validation.
+        let managed = base.join("sha256-managed");
+        fs::create_dir_all(&managed).unwrap();
+        let managed_exe = managed.join("euddraft.exe");
+        fs::write(&managed_exe, b"managed").unwrap();
+        let marker = |files: serde_json::Value| {
+            serde_json::json!({
+                "version": "v0.10.2.5",
+                "archive_sha256": exe_sha,
+                "executable": "euddraft.exe",
+                "files": files,
+            })
+        };
+        let intact = serde_json::json!([
+            { "path": "euddraft.exe", "sha256": exe_sha, "bytes": 7 }
+        ]);
+        let damaged = serde_json::json!([
+            { "path": "euddraft.exe", "sha256": exe_sha, "bytes": 7 },
+            { "path": "python3.dll", "sha256": exe_sha, "bytes": 7 },
+        ]);
+
+        // Corrupt: a declared dependency is missing → resolve refuses and names the file.
+        fs::write(
+            managed.join(".euddraft-install.json"),
+            marker(damaged).to_string(),
+        )
+        .unwrap();
+        let corrupt_error = EuddraftLaunch::resolve(&managed_exe).unwrap_err();
+        assert!(
+            corrupt_error.contains("corrupt"),
+            "expected a corrupt-install error, got: {corrupt_error}"
+        );
+        assert!(
+            corrupt_error.contains("python3.dll"),
+            "error must name the missing file, got: {corrupt_error}"
+        );
+        assert!(EuddraftLaunch::resolve(&managed).is_err());
+
+        // Intact: every declared file present with exact size/sha → resolve succeeds.
+        fs::write(
+            managed.join(".euddraft-install.json"),
+            marker(intact).to_string(),
+        )
+        .unwrap();
+        assert!(matches!(
+            EuddraftLaunch::resolve(&managed_exe).unwrap(),
+            EuddraftLaunch::Executable(path) if path == managed_exe
+        ));
+        assert!(matches!(
+            EuddraftLaunch::resolve(&managed).unwrap(),
+            EuddraftLaunch::Executable(_)
+        ));
+
+        // Manual distribution: no ancestor marker → validation is skipped, resolve succeeds.
+        let manual = base.join("manual");
+        fs::create_dir_all(&manual).unwrap();
+        let manual_exe = manual.join("euddraft.exe");
+        fs::write(&manual_exe, b"managed").unwrap();
+        assert!(matches!(
+            EuddraftLaunch::resolve(&manual_exe).unwrap(),
+            EuddraftLaunch::Executable(path) if path == manual_exe
+        ));
+
+        fs::remove_dir_all(base).ok();
     }
 }

@@ -9,7 +9,7 @@ use std::{
     fmt,
     path::PathBuf,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
     },
     time::{SystemTime, UNIX_EPOCH},
@@ -43,11 +43,12 @@ project filesystem and edit the canonical StarCraft EUD project through eud-tool
 validates and journals every project/map mutation and every durable workspace change.";
 
 const WORKSPACE_GUIDE: &str = r#"[project workspace]
-- Your cwd is the current project's durable filesystem workspace. Use native filesystem tools only for reading accepted `specs/`, immutable `plans/`, historical `decisions/`, `worklog/`, and the coherent `source/` mirror.
-- The foreground implementation workspace is read-only. NEVER edit `specs/`, `plans/`, `decisions/`, `worklog/`, or project memory during implementation.
-- On plan approval, the app writes the exact approved plan to `plans/<request-id>.md`; NEVER edit, replace, rename, or delete it.
+- Your cwd is the native project root that holds `project.eap`. Read the real project tree directly: `src/**/*.eps`, `dat/*.json`, `maps/`, `build/`, `compat/`, and the durable harness documents under `.eud-agent/workspace/{specs,plans,decisions,worklog}`.
+- The only filesystem path you may write is `.eud-agent/workspace/.tmp/**`. Every other path is read-only to native filesystem tools.
+- NEVER edit `specs/`, `plans/`, `decisions/`, `worklog/`, or project memory with native file tools during implementation. The foreground implementation workspace is read-only.
+- On plan approval, the app writes the exact approved plan to `.eud-agent/workspace/plans/<request-id>.md`; NEVER edit, replace, rename, or delete it.
 - After the code/map changes are accepted, the backend starts a separate post-acceptance harness job. That job generates one structured delta, a deterministic worklog, and a separately reviewable document changeset.
-- `source/` is a coherent read-only mirror of the editor's current epScript files. Prefer source_search and ranged read_file for bounded exact excerpts; native glob/grep/read remains available when broader inspection is required. NEVER try to modify `source/`; live editor changes still go through eud-tools.
+- Live project changes (source, DAT, map, settings, plugins, build) always go through eud-tools, never through native file writes. `file_write`/`file_edit` take project-relative `src/...` paths — the same paths you read.
 - Use eud-tools for every editor, map, DAT, build, and RAG action. Native shell/file tools are read-only in implementation turns.
 - After the authoritative build and required verification, answer immediately. Do not search for prior worklogs or perform harness/document cleanup."#;
 
@@ -111,12 +112,12 @@ The correct eps way to write the constructs people most often miscode. These are
 
 const BUILD_GUIDE: &str = r#"[build]
 - After you APPLY source, plugin, or Python dependency changes, ALWAYS run build_run in the SAME turn to verify the complete project. Code or dependency state you never built is NOT done.
-- build_run returns the complete structured result ({ok, errors with source/file/line/message/raw}); read it directly, fix the code, and build again on failure. The server enforces a 3-attempt self-fix budget per request; when it is spent, STOP and report the remaining errors to the user verbatim.
+- build_run returns the complete structured result ({ok, errors with source/file/line/message/raw}); read it directly, fix the code, and build again on failure. The server tracks progress by project revision plus stable diagnostic fingerprint and blocks repeated identical or short cyclic no-progress failures until the project input changes.
 - A failure whose message says no matching player exists (e.g. "연결맵에 조건에 맞는 플레이어가 없습니다") is a MAP setup problem, not an eps bug — fix it with player_setup (a Human controller AND a start location for at least one player), then rebuild."#;
 
 const TRACE_TEST_GUIDE: &str = r#"[runtime trace tests]
 - Runtime trace results are diagnostic: failed/inconclusive never blocks review and never justifies changing correct project code to silence the harness. Use them only after the current request's build_run succeeds.
-- Permanent regression tests live only under `tests/**/*.tests.eps`, one scenario per file. Each file MUST define `function eudAgentTestSetup() {}` and `function eudAgentTestStep(tick) {}` and finish with exactly one `eudAgentPass(eventId)`. Keep these modules outside the configured MainFile's production import graph; use root-qualified project imports such as `TriggerEditor.feature` so the isolated harness can load them.
+- Permanent regression tests live only under `src/tests/**/*.tests.eps`, one scenario per file. Each file MUST define `function eudAgentTestSetup() {}` and `function eudAgentTestStep(tick) {}` and finish with exactly one `eudAgentPass(eventId)`. Keep these modules outside the configured MainFile's production import graph; import them with src-relative epScript imports — flat siblings use `import module;` or `import .module;`, nested modules use `import sub.module;`. Never use a `src.` or folder-rooted prefix import: the build resolves imports against `src/`, so a root-qualified form fails with `No module named 'src'`.
 - Run `trace_suite_run({tests:[...]})` for selected files while iterating and `trace_suite_run({})` for the complete persistent suite before review. When a repeatable deterministic contract changes, create or update its permanent test instead of regenerating the same temporary test on every request. `trace_test_run` remains available only for genuinely one-off diagnosis and takes the same callbacks as one temporary epScript module.
 - Tests may call `eudAgentTrace(eventId, severity, v0, v1, v2, v3)`, `eudAgentAssertEq(eventId, actual, expected)`, `eudAgentFail(eventId, actual, expected)`, and `eudAgentPass(eventId)`. Return immediately after a failed assertion.
 - Each test builds and runs an isolated map copy in one fresh 32-bit StarCraft process. Create the owned client suspended; before resume, the bundled x86 isolation helper MUST validate `StarCraft.exe` and neutralize only its foreground/focus/cursor user32 entrypoints. The client then remains minimized and off-screen. Targeted `PostMessageW` messages invoke LAN/UDP `CreateGame` and `Alt+O`; global keyboard/mouse synthesis and focus fallback are forbidden. Any isolation failure is inconclusive and terminates the owned process."#;
@@ -189,6 +190,9 @@ pub enum AgentTurnResult {
     /// reviewable, but no answer or plan event is emitted.
     Cancelled,
     WriteTransition,
+    IterationBoundary {
+        reason: crate::provider_runtime::IterationBoundaryReason,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -228,6 +232,7 @@ pub enum EngineEvent {
     /// panel can flip out of its connecting state. Carries nothing rendered raw
     /// (rules.md forbids raw kind identifiers as user-facing text).
     SessionLoaded(ipc::SessionLoadedEvent),
+    AutonomousRun(Box<crate::autonomous::AutonomousRunState>),
 }
 
 pub(crate) trait EventSink {
@@ -381,6 +386,9 @@ pub(crate) struct AgentEngine<R: RuntimeExecutor, S: EventSink> {
     journal_data_dir: PathBuf,
     runtime: SessionToolRuntime,
     cancellation: tokio::sync::watch::Receiver<u64>,
+    execution_mode: crate::autonomous::ExecutionMode,
+    autonomous_policy: crate::autonomous::AutonomousRunPolicy,
+    autonomous_pause_requested: Arc<AtomicBool>,
 }
 impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
     // Keep each injected runtime, persistence, session, and cancellation authority explicit.
@@ -398,6 +406,23 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
         let journal_store = runtime.journal().clone();
         let journal_data_dir = runtime.app_data_dir();
         let provider_binding = session.provider_binding.clone();
+        let autonomous_run = session.autonomous_run.clone();
+        let execution_mode = if autonomous_run.is_some() {
+            crate::autonomous::ExecutionMode::Autonomous
+        } else {
+            crate::autonomous::ExecutionMode::Interactive
+        };
+        let autonomous_policy = autonomous_run
+            .as_ref()
+            .map(|run| run.policy.clone())
+            .unwrap_or_default();
+        let autonomous_pause_requested = runtime.autonomous_pause_handle();
+        autonomous_pause_requested.store(
+            autonomous_run
+                .as_ref()
+                .is_some_and(|run| run.status.can_resume()),
+            Ordering::SeqCst,
+        );
         Self {
             executor,
             sink,
@@ -427,7 +452,315 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
             journal_data_dir,
             runtime,
             cancellation,
+            execution_mode,
+            autonomous_policy,
+            autonomous_pause_requested,
         }
+    }
+
+    pub fn autonomous_pause_handle(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.autonomous_pause_requested)
+    }
+
+    fn autonomous_run(&self) -> Result<crate::autonomous::AutonomousRunState, AgentEngineError> {
+        self.session_store
+            .load(&self.session_id)
+            .map_err(|error| AgentEngineError::new(error.to_string()))?
+            .autonomous_run
+            .ok_or_else(|| AgentEngineError::new("장시간 작업 상태가 없습니다."))
+    }
+
+    async fn persist_autonomous_run(
+        &mut self,
+        mut run: crate::autonomous::AutonomousRunState,
+    ) -> Result<(), AgentEngineError> {
+        let conversation = self.executor.conversation_state();
+        run.last_checkpoint = Some(conversation.clone());
+        run.updated_at = crate::session::now_unix_millis();
+        self.session_store
+            .set_autonomous_checkpoint(&self.session_id, conversation, run.clone())
+            .map_err(|error| AgentEngineError::new(error.to_string()))?;
+        self.executor
+            .acknowledge_persisted()
+            .await
+            .map_err(|error| AgentEngineError::new(error.to_string()))?;
+        self.sink.emit(EngineEvent::AutonomousRun(Box::new(run)))
+    }
+
+    fn update_autonomous_progress(
+        &self,
+        run: &mut crate::autonomous::AutonomousRunState,
+        record_fingerprint: bool,
+    ) -> Result<(), AgentEngineError> {
+        let now = crate::session::now_unix_millis();
+        if let Some(active_started_at) = run.active_started_at.replace(now) {
+            run.progress.elapsed_active_millis = run
+                .progress
+                .elapsed_active_millis
+                .saturating_add(now.saturating_sub(active_started_at));
+        }
+        let (read_actions, write_actions) = self.runtime.request_action_counts();
+        run.progress.read_actions = read_actions;
+        run.progress.write_actions = write_actions;
+        run.progress.latest_build = self.runtime.latest_build_progress().map(Into::into);
+        run.project_revision = self
+            .runtime
+            .current_project_revision()
+            .map_err(AgentEngineError::new)?;
+        let record = self
+            .session_store
+            .load(&self.session_id)
+            .map_err(|error| AgentEngineError::new(error.to_string()))?;
+        if let Some(observed) = record
+            .context_usage
+            .as_ref()
+            .map(|usage| usage.total.total_tokens.max(0) as u64)
+        {
+            run.progress.observed_tokens = Some(
+                run.progress
+                    .observed_tokens
+                    .unwrap_or_default()
+                    .max(observed),
+            );
+        }
+        if record_fingerprint {
+            let journal_count = self
+                .journal_store
+                .changeset(&run.request_id)
+                .map(|changeset| changeset.items.len())
+                .unwrap_or_default();
+            let build = run
+                .progress
+                .latest_build
+                .as_ref()
+                .map(|build| {
+                    format!(
+                        "{}:{}:{}:{}",
+                        build.input_revision,
+                        build.diagnostics_fingerprint,
+                        build.error_count,
+                        build.success
+                    )
+                })
+                .unwrap_or_else(|| "none".to_string());
+            run.record_progress_fingerprint(format!(
+                "{}|{}|{}|{}",
+                run.project_revision, build, journal_count, record.task_state.projection.revision
+            ));
+        }
+        Ok(())
+    }
+
+    async fn checkpoint_autonomous_boundary(
+        &mut self,
+        reason: crate::provider_runtime::IterationBoundaryReason,
+        blocker: Option<String>,
+    ) -> Result<bool, AgentEngineError> {
+        let mut run = self.autonomous_run()?;
+        if run.status.is_terminal() {
+            return Ok(false);
+        }
+        self.update_autonomous_progress(&mut run, true)?;
+        run.boundary_reason = Some(reason);
+        run.blocker = blocker;
+        if self.autonomous_pause_requested.load(Ordering::SeqCst) {
+            run.status = crate::autonomous::AutonomousRunStatus::Paused;
+            run.pause_reason = Some(crate::autonomous::AutonomousPauseReason::User);
+            run.active_started_at = None;
+        } else if let Some(limit_reason) = run.run_limit_reason() {
+            run.status = crate::autonomous::AutonomousRunStatus::SafetyStopped;
+            run.pause_reason = None;
+            run.blocker = Some(limit_reason);
+            run.active_started_at = None;
+        } else {
+            run.status = crate::autonomous::AutonomousRunStatus::Running;
+            run.pause_reason = None;
+            run.iteration = run.iteration.saturating_add(1);
+        }
+        let should_continue = run.status == crate::autonomous::AutonomousRunStatus::Running;
+        self.persist_autonomous_run(run).await?;
+        Ok(should_continue)
+    }
+
+    fn autonomous_completion_blocker(&self) -> Result<Option<String>, AgentEngineError> {
+        let Some(request_id) = self.current_request_id.as_deref() else {
+            return Err(AgentEngineError::new("foreground run has no request id"));
+        };
+        let has_runtime_changes = self
+            .journal_store
+            .changeset(request_id)
+            .map(|changeset| !changeset.items.is_empty())
+            .unwrap_or(false);
+        if !has_runtime_changes {
+            return Ok(None);
+        }
+        let revision = self
+            .runtime
+            .current_project_revision()
+            .map_err(AgentEngineError::new)?;
+        let built = self
+            .runtime
+            .latest_build_progress()
+            .is_some_and(|build| build.success && build.input_revision == revision);
+        Ok((!built).then(|| {
+            "현재 runtime revision의 성공한 build_run이 없어 장시간 작업을 완료할 수 없습니다."
+                .to_string()
+        }))
+    }
+
+    fn autonomous_continuation_turn(
+        &self,
+        previous: &AgentTurnInput,
+        reason: crate::provider_runtime::IterationBoundaryReason,
+        blocker: Option<&str>,
+    ) -> Result<AgentTurnInput, AgentEngineError> {
+        let run = self.autonomous_run()?;
+        let record = self
+            .session_store
+            .load(&self.session_id)
+            .map_err(|error| AgentEngineError::new(error.to_string()))?;
+        let acceptance = record
+            .task_state
+            .projection
+            .acceptance_criteria
+            .iter()
+            .map(|fact| format!("- {}", fact.text))
+            .collect::<Vec<_>>();
+        let latest_build = run
+            .progress
+            .latest_build
+            .as_ref()
+            .map(|build| {
+                format!(
+                    "revision={}, success={}, errors={}, fingerprint={}",
+                    build.input_revision,
+                    build.success,
+                    build.error_count,
+                    build.diagnostics_fingerprint
+                )
+            })
+            .unwrap_or_else(|| "없음".to_string());
+        Ok(AgentTurnInput {
+            text: format!(
+                "[autonomous continuation]\n원래 목표:\n{}\n\n수락 기준:\n{}\n\n현재 blocker:\n{}\n\n최근 build:\n{}\n\n경계 이유: {:?}\n\n확인된 체크포인트 이후의 미완료 작업만 계속하세요. 완료된 도구 호출을 재실행하거나 이전 대화 전체를 재진술하지 마세요.",
+                run.goal,
+                if acceptance.is_empty() {
+                    "- 명시된 원래 목표와 검증 기준".to_string()
+                } else {
+                    acceptance.join("\n")
+                },
+                blocker.unwrap_or("없음"),
+                latest_build,
+                reason,
+            ),
+            image_paths: Vec::new(),
+            workspace_root: previous.workspace_root.clone(),
+            workspace_temp: previous.workspace_temp.clone(),
+            workspace_access: previous.workspace_access,
+            output_schema: None,
+            forbid_tools: false,
+        })
+    }
+
+    fn interactive_continuation_turn(
+        previous: &AgentTurnInput,
+        reason: crate::provider_runtime::IterationBoundaryReason,
+    ) -> AgentTurnInput {
+        AgentTurnInput {
+            text: format!(
+                "[continuation]
+경계 이유: {reason:?}
+
+확인된 체크포인트 이후의 미완료 작업만 계속하세요. 완료된 도구 호출을 재실행하거나 이전 대화 전체를 재진술하지 마세요."
+            ),
+            image_paths: Vec::new(),
+            workspace_root: previous.workspace_root.clone(),
+            workspace_temp: previous.workspace_temp.clone(),
+            workspace_access: previous.workspace_access,
+            output_schema: None,
+            forbid_tools: false,
+        }
+    }
+
+    async fn finish_autonomous_run(
+        &mut self,
+        status: crate::autonomous::AutonomousRunStatus,
+        blocker: Option<String>,
+    ) -> Result<(), AgentEngineError> {
+        let mut run = self.autonomous_run()?;
+        if run.status.is_terminal() {
+            return Ok(());
+        }
+        self.update_autonomous_progress(&mut run, false)?;
+        run.status = status;
+        run.blocker = blocker;
+        run.pause_reason = match status {
+            crate::autonomous::AutonomousRunStatus::Review => {
+                Some(crate::autonomous::AutonomousPauseReason::Review)
+            }
+            crate::autonomous::AutonomousRunStatus::WaitingInput => {
+                Some(crate::autonomous::AutonomousPauseReason::WaitingInput)
+            }
+            _ => None,
+        };
+        run.active_started_at = None;
+        self.persist_autonomous_run(run).await
+    }
+
+    async fn settle_autonomous_review(&mut self) -> Result<(), AgentEngineError> {
+        if self.execution_mode != crate::autonomous::ExecutionMode::Autonomous {
+            return Ok(());
+        }
+        let mut run = self.autonomous_run()?;
+        self.update_autonomous_progress(&mut run, false)?;
+        match run.status {
+            crate::autonomous::AutonomousRunStatus::Review => {
+                run.status = crate::autonomous::AutonomousRunStatus::Completed;
+                run.pause_reason = None;
+                run.blocker = None;
+                run.active_started_at = None;
+            }
+            crate::autonomous::AutonomousRunStatus::Paused => {
+                run.pause_reason = Some(crate::autonomous::AutonomousPauseReason::User);
+                run.active_started_at = None;
+            }
+            _ => return Ok(()),
+        }
+        self.persist_autonomous_run(run).await
+    }
+
+    fn boundary_context_pressure(&self) -> Result<bool, AgentEngineError> {
+        if self.autonomous_pause_requested.load(Ordering::SeqCst) {
+            return Ok(false);
+        }
+        let record = self
+            .session_store
+            .load(&self.session_id)
+            .map_err(|error| AgentEngineError::new(error.to_string()))?;
+        Ok(record.context_usage.is_some_and(|usage| {
+            usage
+                .model_context_window
+                .filter(|window| *window > 0)
+                .is_some_and(|window| {
+                    usage.last.total_tokens.saturating_mul(100) >= window.saturating_mul(85)
+                })
+        }))
+    }
+
+    /// Compact at a confirmed iteration boundary when the provider context is under pressure.
+    /// The boundary already checkpointed a started provider conversation, so the thread counts
+    /// as active even inside the first turn of a session.
+    async fn compact_at_boundary(&mut self) -> Result<bool, AgentEngineError> {
+        if !self.boundary_context_pressure()? {
+            return Ok(false);
+        }
+        let previous_phase = self.phase;
+        self.phase = Phase::Idle;
+        self.thread_active = true;
+        let result = self.compact().await;
+        self.phase = previous_phase;
+        result?;
+        Ok(true)
     }
 
     fn run_identity(&self, request_id: &str) -> RunIdentity {
@@ -494,15 +827,116 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
             .current_request_id
             .clone()
             .ok_or_else(|| AgentEngineError::new("foreground run has no request id"))?;
-        let request = self.foreground_request(&request_id, turn)?;
-        match self.executor.run_foreground(request).await {
-            RunOutcome::Completed { text, .. } => Ok(AgentTurnResult::Answer { text }),
-            RunOutcome::Cancelled => Ok(AgentTurnResult::Cancelled),
-            RunOutcome::WriteTransition => Ok(AgentTurnResult::WriteTransition),
-            RunOutcome::Structured { .. } => Err(AgentEngineError::new(
-                "foreground provider run returned a structured job result",
-            )),
-            RunOutcome::Failed(error) => Err(AgentEngineError::new(error.to_string())),
+        let mut turn = turn;
+        loop {
+            let request = self.foreground_request(&request_id, turn.clone())?;
+            match self.executor.run_foreground(request).await {
+                RunOutcome::Completed { text, .. } => {
+                    if self.execution_mode == crate::autonomous::ExecutionMode::Autonomous {
+                        if let Some(blocker) = self.autonomous_completion_blocker()? {
+                            let reason = if self.compact_at_boundary().await? {
+                                crate::provider_runtime::IterationBoundaryReason::ContextPressure
+                            } else {
+                                crate::provider_runtime::IterationBoundaryReason::ProviderContinuation
+                            };
+                            if self
+                                .checkpoint_autonomous_boundary(reason, Some(blocker.clone()))
+                                .await?
+                            {
+                                self.runtime
+                                    .begin_iteration(&request_id)
+                                    .map_err(AgentEngineError::new)?;
+                                turn = self.autonomous_continuation_turn(
+                                    &turn,
+                                    reason,
+                                    Some(&blocker),
+                                )?;
+                                continue;
+                            }
+                            return Ok(AgentTurnResult::IterationBoundary { reason });
+                        }
+                        let status = if self
+                            .journal_store
+                            .changeset(&request_id)
+                            .map(|changeset| !changeset.items.is_empty())
+                            .unwrap_or(false)
+                        {
+                            crate::autonomous::AutonomousRunStatus::Review
+                        } else {
+                            crate::autonomous::AutonomousRunStatus::Completed
+                        };
+                        self.finish_autonomous_run(status, None).await?;
+                    }
+                    return Ok(AgentTurnResult::Answer { text });
+                }
+                RunOutcome::Cancelled => {
+                    if self.execution_mode == crate::autonomous::ExecutionMode::Autonomous {
+                        self.finish_autonomous_run(
+                            crate::autonomous::AutonomousRunStatus::Cancelled,
+                            Some("사용자가 장시간 작업을 중단했습니다.".to_string()),
+                        )
+                        .await?;
+                    }
+                    return Ok(AgentTurnResult::Cancelled);
+                }
+                RunOutcome::WriteTransition => {
+                    if self.execution_mode == crate::autonomous::ExecutionMode::Autonomous {
+                        let mut run = self.autonomous_run()?;
+                        self.update_autonomous_progress(&mut run, false)?;
+                        run.status = crate::autonomous::AutonomousRunStatus::Running;
+                        run.boundary_reason = None;
+                        self.persist_autonomous_run(run).await?;
+                    }
+                    return Ok(AgentTurnResult::WriteTransition);
+                }
+                RunOutcome::IterationBoundary { reason, .. } => {
+                    let reason = if self.compact_at_boundary().await? {
+                        crate::provider_runtime::IterationBoundaryReason::ContextPressure
+                    } else {
+                        reason
+                    };
+                    if self.execution_mode != crate::autonomous::ExecutionMode::Autonomous {
+                        // Ordinary turns never stop at a soft action/round boundary: persist the
+                        // confirmed checkpoint and continue the same request in place.
+                        self.update_active_session().await;
+                        self.runtime
+                            .begin_iteration(&request_id)
+                            .map_err(AgentEngineError::new)?;
+                        turn = Self::interactive_continuation_turn(&turn, reason);
+                        continue;
+                    }
+                    if !self.checkpoint_autonomous_boundary(reason, None).await? {
+                        return Ok(AgentTurnResult::IterationBoundary { reason });
+                    }
+                    self.runtime
+                        .begin_iteration(&request_id)
+                        .map_err(AgentEngineError::new)?;
+                    turn = self.autonomous_continuation_turn(&turn, reason, None)?;
+                }
+                RunOutcome::Structured { .. } => {
+                    let detail =
+                        "foreground provider run returned a structured job result".to_string();
+                    if self.execution_mode == crate::autonomous::ExecutionMode::Autonomous {
+                        self.finish_autonomous_run(
+                            crate::autonomous::AutonomousRunStatus::Failed,
+                            Some(detail.clone()),
+                        )
+                        .await?;
+                    }
+                    return Err(AgentEngineError::new(detail));
+                }
+                RunOutcome::Failed(error) => {
+                    let detail = error.to_string();
+                    if self.execution_mode == crate::autonomous::ExecutionMode::Autonomous {
+                        self.finish_autonomous_run(
+                            crate::autonomous::AutonomousRunStatus::Failed,
+                            Some(detail.clone()),
+                        )
+                        .await?;
+                    }
+                    return Err(AgentEngineError::new(detail));
+                }
+            }
         }
     }
     async fn prepare_eps_context(
@@ -667,18 +1101,132 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
                 client_turn_id: crate::ipc::new_client_turn_id(),
                 attachments,
                 mentions: Vec::new(),
+                execution_mode: crate::autonomous::ExecutionMode::Interactive,
+                autonomous_policy: None,
             },
             Some(request_id),
         )
         .await
     }
 
+    pub async fn autonomous_resume(&mut self) -> Result<(), AgentEngineError> {
+        self.ensure_provider_conversation_ready()?;
+        let record = self
+            .session_store
+            .load(&self.session_id)
+            .map_err(|error| AgentEngineError::new(error.to_string()))?;
+        let mut run = record
+            .autonomous_run
+            .clone()
+            .ok_or_else(|| AgentEngineError::new("계속할 장시간 작업이 없습니다."))?;
+        if !run.status.can_resume() {
+            return Err(AgentEngineError::new(
+                "현재 장시간 작업 상태에서는 계속할 수 없습니다.",
+            ));
+        }
+        if !record.pending_request_ids.is_empty() {
+            return Err(AgentEngineError::new(
+                "변경사항 검토를 먼저 완료한 뒤 장시간 작업을 계속하세요.",
+            ));
+        }
+        let current_revision = self
+            .runtime
+            .current_project_revision()
+            .map_err(AgentEngineError::new)?;
+        if run.project_id != self.project_id || run.project_revision != current_revision {
+            run.status = crate::autonomous::AutonomousRunStatus::SafetyStopped;
+            run.blocker = Some(
+                "프로젝트 identity 또는 revision이 체크포인트 이후 변경되었습니다.".to_string(),
+            );
+            run.active_started_at = None;
+            self.persist_autonomous_run(run).await?;
+            return Err(AgentEngineError::new(
+                "프로젝트가 체크포인트 이후 변경되어 장시간 작업을 계속하지 않았습니다.",
+            ));
+        }
+        if run.last_checkpoint.as_ref() != Some(&record.provider_binding.conversation)
+            || self.executor.conversation_state() != record.provider_binding.conversation
+        {
+            run.status = crate::autonomous::AutonomousRunStatus::SafetyStopped;
+            run.blocker = Some("확인된 공급자 체크포인트가 현재 세션과 다릅니다.".to_string());
+            run.active_started_at = None;
+            self.persist_autonomous_run(run).await?;
+            return Err(AgentEngineError::new(
+                "확인된 공급자 체크포인트가 달라 장시간 작업을 계속하지 않았습니다.",
+            ));
+        }
+        if self.current_request_id.as_deref() != Some(run.request_id.as_str()) {
+            self.runtime
+                .begin_request(&run.request_id, &self.project_id)
+                .map_err(AgentEngineError::new)?;
+            self.runtime
+                .restore_autonomous_progress(&run.request_id, &run.progress)
+                .map_err(AgentEngineError::new)?;
+            self.current_request_id = Some(run.request_id.clone());
+            self.current_client_turn_id = Some(run.client_turn_id.clone());
+            self.current_user_text = run.goal.clone();
+        }
+        self.execution_mode = crate::autonomous::ExecutionMode::Autonomous;
+        self.autonomous_policy = run.policy.clone();
+        self.autonomous_pause_requested
+            .store(false, Ordering::SeqCst);
+        self.runtime
+            .begin_iteration(&run.request_id)
+            .map_err(AgentEngineError::new)?;
+        let reason = run
+            .boundary_reason
+            .unwrap_or(crate::provider_runtime::IterationBoundaryReason::ProviderContinuation);
+        run.status = crate::autonomous::AutonomousRunStatus::Running;
+        run.pause_reason = None;
+        run.blocker = None;
+        run.active_started_at = Some(crate::session::now_unix_millis());
+        self.persist_autonomous_run(run).await?;
+        self.phase = Phase::Triage;
+        let base = AgentTurnInput::text(String::new()).with_access(WorkspaceAccess::Read);
+        let turn = self.autonomous_continuation_turn(&base, reason, None)?;
+        let result = self.run_foreground(turn).await?;
+        self.thread_active = true;
+        if let Some(ticket) = self.runtime.write_ticket() {
+            self.pending_write = Some(WriteContinuation::Direct);
+            self.phase = match ticket.state() {
+                crate::write_coordinator::TicketState::Granted => Phase::Executing,
+                crate::write_coordinator::TicketState::Cancelled => Phase::Idle,
+            };
+            self.update_active_session().await;
+            return Ok(());
+        }
+        if matches!(result, AgentTurnResult::WriteTransition) {
+            return Err(AgentEngineError::new(
+                "provider requested a write transition without a write ticket",
+            ));
+        }
+        let state_result = result.clone();
+        self.handle_turn_result(result)?;
+        let goal = self.current_user_text.clone();
+        self.update_task_state_after_turn(&state_result, &goal, None)
+            .await;
+        self.update_active_session().await;
+        Ok(())
+    }
     async fn chat_with_request_id(
         &mut self,
         req: ipc::ChatRequest,
         fixed_request_id: Option<String>,
     ) -> Result<(), AgentEngineError> {
         self.ensure_provider_conversation_ready()?;
+
+        let execution_mode = req.execution_mode;
+        let autonomous_policy = req.autonomous_policy.clone().unwrap_or_default();
+        if execution_mode == crate::autonomous::ExecutionMode::Autonomous {
+            if self.session_kind != crate::session::SessionKind::Eps {
+                return Err(AgentEngineError::new(
+                    "장시간 작업은 현재 메인 EPS 세션에서만 실행할 수 있습니다.",
+                ));
+            }
+            autonomous_policy
+                .validate()
+                .map_err(AgentEngineError::new)?;
+        }
         if matches!(
             self.phase,
             Phase::PlanReview | Phase::Executing | Phase::ChangesetReview
@@ -693,6 +1241,10 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
         self.runtime
             .begin_request(&request_id, &self.project_id)
             .map_err(AgentEngineError::new)?;
+        self.execution_mode = execution_mode;
+        self.autonomous_policy = autonomous_policy.clone();
+        self.autonomous_pause_requested
+            .store(false, Ordering::SeqCst);
         self.current_plan_markdown = None;
         self.approved_plan_sha256 = None;
         self.current_request_id = Some(request_id.clone());
@@ -740,8 +1292,24 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
                 ))
             })?);
         }
+        if execution_mode == crate::autonomous::ExecutionMode::Autonomous {
+            let revision = self
+                .runtime
+                .current_project_revision()
+                .map_err(AgentEngineError::new)?;
+            let run = crate::autonomous::AutonomousRunState::new(
+                user_text.clone(),
+                req.client_turn_id.clone(),
+                request_id.clone(),
+                self.project_id.clone(),
+                revision,
+                autonomous_policy,
+                crate::session::now_unix_millis(),
+            );
+            self.persist_autonomous_run(run).await?;
+        }
 
-        let turn_text = if self.session_kind == crate::session::SessionKind::Map {
+        let mut turn_text = if self.session_kind == crate::session::SessionKind::Map {
             let memory = self.config.project_memory_for_prompt();
             let project_state = self.config.project_state_for_prompt();
             if self.thread_active {
@@ -764,6 +1332,11 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
             self.prepare_eps_context(&user_text, resolved_mentions.as_deref(), None, false)
                 .await?
         };
+        if execution_mode == crate::autonomous::ExecutionMode::Autonomous {
+            turn_text.push_str(
+                "\n\n[autonomous execution]\n이 요청은 사용자가 명시적으로 장시간 작업으로 시작했습니다. iteration 경계에서는 확인된 상태에서 계속하고, 완료된 도구 호출은 반복하지 마세요. canonical runtime 변경 후에는 현재 revision의 build_run 성공을 확인한 뒤에만 완료하세요. ASK 또는 변경사항 검토는 사용자의 결정을 기다리세요.",
+            );
+        }
 
         let result = self
             .run_first_turn_with_resume_fallback(
@@ -771,6 +1344,7 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
                     text: turn_text,
                     image_paths: attachment_context.image_paths,
                     workspace_root: None,
+                    workspace_temp: None,
                     workspace_access: WorkspaceAccess::Read,
                     output_schema: None,
                     forbid_tools: false,
@@ -871,6 +1445,7 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
                 text: turn_text,
                 image_paths,
                 workspace_root: None,
+                workspace_temp: None,
                 workspace_access: WorkspaceAccess::Read,
                 output_schema: None,
                 forbid_tools: false,
@@ -972,6 +1547,7 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
                 text: turn_text,
                 image_paths: attachment_context.image_paths,
                 workspace_root: None,
+                workspace_temp: None,
                 workspace_access: WorkspaceAccess::Read,
                 output_schema: None,
                 forbid_tools: false,
@@ -999,7 +1575,7 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
         self.approved_plan_sha256 = Some(crate::task_state::sha256_bytes(plan.as_bytes()));
         let ticket = self
             .runtime
-            .request_write_workspace("approved plan execution")
+            .register_write_request("approved plan execution")
             .map_err(AgentEngineError::new)?;
         self.pending_write = Some(WriteContinuation::ApprovedPlan);
         self.phase = match ticket.state() {
@@ -1275,6 +1851,7 @@ Continue the requested change now, run the mandatory build, and stop only after 
             self.runtime
                 .release_write_registration()
                 .map_err(AgentEngineError::new)?;
+            self.settle_autonomous_review().await?;
             self.phase = Phase::Idle;
             self.drop_pending_request_from_session(&request_id);
             self.current_request_id = None;
@@ -1549,6 +2126,25 @@ Continue the requested change now, run the mandatory build, and stop only after 
                 .map_err(AgentEngineError::new)?;
             self.reconnect_pending_changeset(&record);
         }
+        if let Some(run) = record.autonomous_run.as_ref() {
+            self.execution_mode = crate::autonomous::ExecutionMode::Autonomous;
+            self.autonomous_policy = run.policy.clone();
+            self.current_user_text = run.goal.clone();
+            self.current_client_turn_id = Some(run.client_turn_id.clone());
+            self.autonomous_pause_requested
+                .store(run.status.can_resume(), Ordering::SeqCst);
+            if record.pending_request_ids.is_empty() && run.status.can_resume() {
+                self.runtime
+                    .begin_request(&run.request_id, &self.project_id)
+                    .map_err(AgentEngineError::new)?;
+                self.runtime
+                    .restore_autonomous_progress(&run.request_id, &run.progress)
+                    .map_err(AgentEngineError::new)?;
+                self.current_request_id = Some(run.request_id.clone());
+            }
+            self.sink
+                .emit(EngineEvent::AutonomousRun(Box::new(run.clone())))?;
+        }
         self.hydrated = true;
         self.sink
             .emit(EngineEvent::SessionLoaded(ipc::SessionLoadedEvent {
@@ -1663,12 +2259,14 @@ Continue the requested change now, run the mandatory build, and stop only after 
         let foreground_result = match result {
             AgentTurnResult::Answer { text } => text.as_str(),
             AgentTurnResult::Plan { markdown } => markdown.as_str(),
-            AgentTurnResult::Cancelled | AgentTurnResult::WriteTransition => return,
+            AgentTurnResult::Cancelled
+            | AgentTurnResult::WriteTransition
+            | AgentTurnResult::IterationBoundary { .. } => return,
         };
         let workspace_root = self
             .executor
             .current_workspace()
-            .map(|workspace| workspace.root);
+            .map(|workspace| workspace.workspace_root);
         let artifact_candidates = match workspace_root.as_deref() {
             Some(root) => match crate::task_state::collect_artifact_candidates(root) {
                 Ok(candidates) => candidates,
@@ -1785,7 +2383,9 @@ Continue the requested change now, run the mandatory build, and stop only after 
                 self.record_task_compilation_failure("cancelled", "task-state compiler cancelled");
                 return;
             }
-            RunOutcome::Completed { .. } | RunOutcome::WriteTransition => {
+            RunOutcome::Completed { .. }
+            | RunOutcome::IterationBoundary { .. }
+            | RunOutcome::WriteTransition => {
                 self.record_task_compilation_failure(
                     "invalid_outcome",
                     "task-state compiler returned a foreground outcome",
@@ -1936,6 +2536,9 @@ Continue the requested change now, run the mandatory build, and stop only after 
                     "write transition reached answer handling",
                 ));
             }
+            AgentTurnResult::IterationBoundary { .. } => {
+                self.phase = Phase::Idle;
+            }
         }
         Ok(())
     }
@@ -2049,6 +2652,7 @@ impl EventSink for SessionEventSink {
             EngineEvent::Progress(payload) => self.emit_scoped("progress", payload),
             EngineEvent::Error(payload) => self.emit_scoped("error", payload),
             EngineEvent::Status(payload) => ipc::emit_status(&self.app, payload),
+            EngineEvent::AutonomousRun(payload) => self.emit_scoped("autonomous_run", payload),
             EngineEvent::Wiki(payload) => ipc::emit_wiki(&self.app, payload),
             EngineEvent::SessionLoaded(payload) => ipc::emit_session_loaded(&self.app, payload),
         };
@@ -2061,6 +2665,7 @@ pub(crate) struct SessionWorker {
         tokio::sync::Mutex<AgentEngine<crate::provider_runtime::ProviderRuntime, SessionEventSink>>,
     provider: crate::provider::ProviderId,
     cancellation: tokio::sync::watch::Sender<u64>,
+    autonomous_pause_requested: Arc<AtomicBool>,
     runtime: SessionToolRuntime,
     sink: SessionEventSink,
 }
@@ -2496,7 +3101,9 @@ impl SessionEngineManager {
                     "harness generation returned a stale base",
                 ));
             }
-            RunOutcome::Completed { .. } | RunOutcome::WriteTransition => {
+            RunOutcome::Completed { .. }
+            | RunOutcome::IterationBoundary { .. }
+            | RunOutcome::WriteTransition => {
                 return Err(AgentEngineError::new(
                     "harness generation returned a foreground outcome",
                 ));
@@ -2807,6 +3414,12 @@ impl SessionEngineManager {
                 .emit_scoped("progress", event)
                 .map_err(|error| format!("failed to emit progress event: {error}"))
         });
+        let autonomous_sink = sink.clone();
+        runtime.set_autonomous_emitter(move |event| {
+            autonomous_sink
+                .emit_scoped("autonomous_run", event)
+                .map_err(|error| format!("failed to emit autonomous run event: {error}"))
+        });
         let (cancellation, cancellation_rx) = tokio::sync::watch::channel(0_u64);
         runtime.set_cancellation(cancellation_rx.clone());
         let binding = BindingSnapshot::from_binding(&record.provider_binding, None)
@@ -2831,19 +3444,22 @@ impl SessionEngineManager {
             )),
         )
         .map_err(|error| AgentEngineError::new(error.to_string()))?;
+        let engine = AgentEngine::new(
+            executor,
+            sink.clone(),
+            self.inner.config.clone(),
+            runtime.clone(),
+            self.inner.sessions.clone(),
+            self.inner.attachments.clone(),
+            record,
+            cancellation_rx,
+        );
+        let autonomous_pause_requested = engine.autonomous_pause_handle();
         let worker = Arc::new(SessionWorker {
-            provider: record.provider_binding.provider,
-            engine: tokio::sync::Mutex::new(AgentEngine::new(
-                executor,
-                sink.clone(),
-                self.inner.config.clone(),
-                runtime.clone(),
-                self.inner.sessions.clone(),
-                self.inner.attachments.clone(),
-                record,
-                cancellation_rx,
-            )),
+            provider: engine.provider_binding.provider,
+            engine: tokio::sync::Mutex::new(engine),
             cancellation,
+            autonomous_pause_requested,
             runtime,
             sink: sink.clone(),
         });
@@ -3160,6 +3776,99 @@ impl SessionEngineManager {
             .map_err(AgentEngineError::new)
     }
 
+    async fn autonomous_pause(&self, session_id: &str) -> Result<(), AgentEngineError> {
+        let worker = self.worker(session_id).await?;
+        let mut record = self
+            .inner
+            .sessions
+            .load(session_id)
+            .map_err(|error| AgentEngineError::new(error.to_string()))?;
+        let run = record
+            .autonomous_run
+            .as_mut()
+            .ok_or_else(|| AgentEngineError::new("일시 중지할 장시간 작업이 없습니다."))?;
+        if run.status != crate::autonomous::AutonomousRunStatus::Running {
+            return Err(AgentEngineError::new(
+                "현재 장시간 작업은 실행 중 상태가 아닙니다.",
+            ));
+        }
+        worker
+            .autonomous_pause_requested
+            .store(true, Ordering::SeqCst);
+        run.status = crate::autonomous::AutonomousRunStatus::Pausing;
+        run.pause_reason = Some(crate::autonomous::AutonomousPauseReason::User);
+        run.updated_at = crate::session::now_unix_millis();
+        let run_payload = run.clone();
+        self.inner
+            .sessions
+            .save(&record)
+            .map_err(|error| AgentEngineError::new(error.to_string()))?;
+        worker
+            .sink
+            .emit_scoped("autonomous_run", run_payload)
+            .map_err(|error| AgentEngineError::new(error.to_string()))
+    }
+
+    async fn autonomous_resume(&self, session_id: &str) -> Result<(), AgentEngineError> {
+        let worker = self.worker(session_id).await?;
+        let _provider_busy = self.inner.provider_service.enter_busy(worker.provider);
+        worker
+            .runtime
+            .emit_activity(crate::write_coordinator::SessionActivity::RunningRead);
+        let result = {
+            let mut engine = worker.engine.lock().await;
+            engine.autonomous_resume().await
+        };
+        self.finish_read_command(&worker, result).await
+    }
+
+    async fn autonomous_stop(&self, session_id: &str) -> Result<(), AgentEngineError> {
+        let worker = self.worker(session_id).await?;
+        worker
+            .autonomous_pause_requested
+            .store(true, Ordering::SeqCst);
+        worker.runtime.cancel_pending_ask();
+        let record = self
+            .inner
+            .sessions
+            .load(session_id)
+            .map_err(|error| AgentEngineError::new(error.to_string()))?;
+        let run = record
+            .autonomous_run
+            .as_ref()
+            .ok_or_else(|| AgentEngineError::new("중단할 장시간 작업이 없습니다."))?;
+        if run.status.is_terminal() {
+            return Err(AgentEngineError::new("장시간 작업이 이미 종료되었습니다."));
+        }
+        let run_payload = self
+            .inner
+            .sessions
+            .update_autonomous_status(
+                session_id,
+                crate::autonomous::AutonomousRunStatus::Cancelled,
+                None,
+                Some("사용자가 장시간 작업을 중단했습니다.".to_string()),
+            )
+            .map_err(|error| AgentEngineError::new(error.to_string()))?
+            .ok_or_else(|| AgentEngineError::new("중단할 장시간 작업이 없습니다."))?;
+        worker
+            .sink
+            .emit_scoped("autonomous_run", run_payload)
+            .map_err(|error| AgentEngineError::new(error.to_string()))?;
+        cancel_worker_generation(&worker.cancellation)?;
+        let mut engine = worker.engine.lock().await;
+        if worker.runtime.write_ticket().is_some() && engine.phase != Phase::ChangesetReview {
+            engine.recover_write_failure()?;
+        } else if engine.phase != Phase::ChangesetReview {
+            engine.phase = Phase::Idle;
+            worker
+                .runtime
+                .emit_activity(crate::write_coordinator::SessionActivity::Idle);
+        }
+        engine.update_active_session().await;
+        Ok(())
+    }
+
     async fn cancel(&self, session_id: &str) -> Result<(), AgentEngineError> {
         let worker = self.worker(session_id).await?;
         worker.runtime.cancel_pending_ask();
@@ -3215,6 +3924,7 @@ impl SessionEngineManager {
             panel_log: serde_json::Value::Null,
             context_state: Default::default(),
             task_state: Default::default(),
+            autonomous_run: None,
         };
         self.inner
             .sessions
@@ -3446,6 +4156,10 @@ pub(crate) async fn session_model_settings_save(
         .map_err(|error| error.message)
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "Tauri exposes each chat request field as a named command argument"
+)]
 #[tauri::command(rename = "chat")]
 pub(crate) async fn engine_chat(
     state: tauri::State<'_, SessionEngineManager>,
@@ -3454,6 +4168,8 @@ pub(crate) async fn engine_chat(
     attachments: Vec<String>,
     client_turn_id: String,
     mentions: Option<Vec<crate::mentions::MentionInstance>>,
+    execution_mode: Option<crate::autonomous::ExecutionMode>,
+    autonomous_policy: Option<crate::autonomous::AutonomousRunPolicy>,
 ) -> Result<(), String> {
     state
         .chat(
@@ -3463,6 +4179,8 @@ pub(crate) async fn engine_chat(
                 text,
                 attachments,
                 mentions: mentions.unwrap_or_default(),
+                execution_mode: execution_mode.unwrap_or_default(),
+                autonomous_policy,
             },
         )
         .await
@@ -3612,6 +4330,39 @@ pub(crate) async fn engine_ask_response(
         .map_err(|error| error.message)
 }
 
+#[tauri::command(rename = "autonomous_pause")]
+pub(crate) async fn engine_autonomous_pause(
+    state: tauri::State<'_, SessionEngineManager>,
+    session_id: String,
+) -> Result<(), String> {
+    state
+        .autonomous_pause(&session_id)
+        .await
+        .map_err(|error| error.message)
+}
+
+#[tauri::command(rename = "autonomous_resume")]
+pub(crate) async fn engine_autonomous_resume(
+    state: tauri::State<'_, SessionEngineManager>,
+    session_id: String,
+) -> Result<(), String> {
+    state
+        .autonomous_resume(&session_id)
+        .await
+        .map_err(|error| error.message)
+}
+
+#[tauri::command(rename = "autonomous_stop")]
+pub(crate) async fn engine_autonomous_stop(
+    state: tauri::State<'_, SessionEngineManager>,
+    session_id: String,
+) -> Result<(), String> {
+    state
+        .autonomous_stop(&session_id)
+        .await
+        .map_err(|error| error.message)
+}
+
 #[tauri::command(rename = "cancel")]
 pub(crate) async fn engine_cancel(
     state: tauri::State<'_, SessionEngineManager>,
@@ -3757,6 +4508,13 @@ pub fn build_map_system_prompt(project_state: &str, project_memory: Option<&str>
          - Semantic ISOM transitions outside the current request scope make finalize fail. Do not clip, hide, or substitute them; ask the user to expand a supplied target only when that target blocks the requested transition.\n\
          - A doodad that changes terrain plus a sprite overlay requires terrain, doodads, and sprites authority.\n\
          - Materially ambiguous owner, count, state, or location bounds require the ask tool.\n\n\
+         [draft patch operations]\n\
+         Every map_draft_patch operation is a flat object with op plus exactly the listed keys; bracketed keys are optional and state{{...}} lists nested object keys. Never invent keys such as tileId.\n\
+         {operations_guide}\n\
+         - Every value is typed exactly as advertised: brush, after, tiles, and replacementTiles are numeric ids from map_palette_query, never names such as 'Dirt'.\n\
+         - terrain.set before must equal the current tile id at (x, y); when it is unknown use terrain.rect or terrain.blit, which need no expected-before value.\n\
+         - ordinal and beforeFingerprint identify one existing object exactly as map_objects_read returned it for the current revision.\n\
+         - tiles and replacementTiles are row-major matrices of exact tile ids whose top-left is (x, y) or the doodad footprint.\n\n\
          [selection stamps]\n\
          - A candidateSelection source is an exact reusable stamp whose content is read from the visible candidate when placed. An imported source is a pinned external-map snapshot authorized only by an importedStamp mention in the current request. Empty layers mean all six supported layers.\n\
          - For exact copy/duplicate/replicate requests, use map_stamp_preview and map_stamp_place. Never reconstruct either source through map_render, tile catalog enumeration, terrain.set probes, terrain.blit matrices, expected-before probes, or semantic ISOM brushes.\n\
@@ -3779,7 +4537,8 @@ pub fn build_map_system_prompt(project_state: &str, project_memory: Option<&str>
          Original Apply and backup restore are intentionally absent from your tools. Only the user's trusted Map Agent window command can Apply or undo.\n\
          Never request, infer, or expose SCX/candidate filesystem paths; all access uses typed map tools.\n\n\
          [project state]\n{project_state}\n\n{}",
-        project_memory.unwrap_or("[project memory]\n(none)")
+        project_memory.unwrap_or("[project memory]\n(none)"),
+        operations_guide = crate::tools::map_draft_patch_operations_guide(),
     )
 }
 
@@ -3840,7 +4599,7 @@ fn tool_catalog_section() -> String {
     let mut write = Vec::new();
     for spec in crate::tools::tool_registry() {
         let line = format!("- {} — {}", spec.name, spec.description);
-        if spec.mutating {
+        if spec.requires_write_workspace {
             write.push(line);
         } else {
             read.push(line);
@@ -4441,7 +5200,7 @@ mod tests {
             *self.foreground_error.lock().expect("foreground error lock") = Some(message.into());
         }
 
-        fn request_write_on_run(&self, runtime: SessionToolRuntime) {
+        fn trigger_write_transition_on_run(&self, runtime: SessionToolRuntime) {
             *self.write_runtime.lock().expect("write runtime lock") = Some(runtime);
         }
 
@@ -4501,7 +5260,7 @@ mod tests {
                     .expect("write runtime lock")
                     .take()
                 {
-                    if let Err(error) = runtime.request_write_workspace("test transition") {
+                    if let Err(error) = runtime.register_write_request("test transition") {
                         return RunOutcome::Failed(
                             crate::provider_runtime::ProviderRuntimeError::Protocol(error),
                         );
@@ -4532,9 +5291,12 @@ mod tests {
                     let mut workspace = self.workspace.lock().expect("workspace lock");
                     if workspace.is_none() && compiler_requested {
                         let root = unique_temp_dir("runtime-workspace");
+                        let workspace_root = root.join(".eud-agent/workspace");
                         *workspace = Some(PreparedWorkspace {
                             id: "runtime-workspace".to_string(),
                             project: "Sample".to_string(),
+                            temp_dir: workspace_root.join(".tmp"),
+                            workspace_root,
                             root,
                             session_id: Some(runtime_session_id),
                         });
@@ -4564,6 +5326,12 @@ mod tests {
                     }
                     AgentTurnResult::Cancelled => RunOutcome::Cancelled,
                     AgentTurnResult::WriteTransition => RunOutcome::WriteTransition,
+                    AgentTurnResult::IterationBoundary { reason } => {
+                        RunOutcome::IterationBoundary {
+                            reason,
+                            conversation: self.conversation_state(),
+                        }
+                    }
                 }
             })
         }
@@ -4983,7 +5751,6 @@ mod tests {
         crate::source_snapshot::ProjectSnapshot {
             project: name.to_string(),
             identity: project.root().to_string_lossy().into_owned(),
-            files: Vec::new(),
         }
     }
 
@@ -5034,6 +5801,7 @@ mod tests {
             panel_log: serde_json::Value::Null,
             context_state: Default::default(),
             task_state: Default::default(),
+            autonomous_run: None,
         };
         store.save(&record).unwrap();
         record
@@ -5217,6 +5985,8 @@ mod tests {
                     text: "continue".to_string(),
                     attachments: Vec::new(),
                     mentions: Vec::new(),
+                    execution_mode: Default::default(),
+                    autonomous_policy: None,
                 },
                 Some("req-resume-failure".to_string()),
             )
@@ -5498,7 +6268,7 @@ mod tests {
         let sink = CapturingEventSink::default();
         let sink_handle = sink.clone();
         let mut engine = test_engine(driver, sink);
-        driver_handle.request_write_on_run(engine.runtime.clone());
+        driver_handle.trigger_write_transition_on_run(engine.runtime.clone());
 
         engine
             .chat(crate::ipc::ChatRequest {
@@ -5506,6 +6276,8 @@ mod tests {
                 text: "change the project".to_string(),
                 attachments: Vec::new(),
                 mentions: Vec::new(),
+                execution_mode: Default::default(),
+                autonomous_policy: None,
             })
             .await
             .expect("write transition should park the foreground turn");
@@ -5532,6 +6304,8 @@ mod tests {
                 text: "save this turn".to_string(),
                 attachments: Vec::new(),
                 mentions: Vec::new(),
+                execution_mode: Default::default(),
+                autonomous_policy: None,
             })
             .await
             .expect("foreground turn should persist");
@@ -5637,6 +6411,8 @@ mod tests {
                 text: "first user message".to_string(),
                 attachments: Vec::new(),
                 mentions: Vec::new(),
+                execution_mode: Default::default(),
+                autonomous_policy: None,
             })
             .await
             .unwrap();
@@ -5646,6 +6422,8 @@ mod tests {
                 text: "follow-up user message".to_string(),
                 attachments: Vec::new(),
                 mentions: Vec::new(),
+                execution_mode: Default::default(),
+                autonomous_policy: None,
             })
             .await
             .unwrap();
@@ -5655,6 +6433,8 @@ mod tests {
                 text: "fresh user message".to_string(),
                 attachments: Vec::new(),
                 mentions: Vec::new(),
+                execution_mode: Default::default(),
+                autonomous_policy: None,
             })
             .await
             .unwrap();
@@ -5690,6 +6470,8 @@ mod tests {
                 text: "Explain the current behavior.".to_string(),
                 attachments: Vec::new(),
                 mentions: Vec::new(),
+                execution_mode: Default::default(),
+                autonomous_policy: None,
             })
             .await
             .expect("answer-only turn should run");
@@ -5699,6 +6481,8 @@ mod tests {
                 text: "Make a larger change.".to_string(),
                 attachments: Vec::new(),
                 mentions: Vec::new(),
+                execution_mode: Default::default(),
+                autonomous_policy: None,
             })
             .await
             .expect("propose_plan turn should run");
@@ -5745,6 +6529,8 @@ mod tests {
                 text: "Make a planned change.".to_string(),
                 attachments: Vec::new(),
                 mentions: Vec::new(),
+                execution_mode: Default::default(),
+                autonomous_policy: None,
             })
             .await
             .expect("plan turn should run");
@@ -5759,7 +6545,12 @@ mod tests {
             .expect("implementation answer must complete without document repair turns");
 
         assert_eq!(
-            fs::read_to_string(workspace.root.join(format!("plans/{request_id}.md"))).unwrap(),
+            fs::read_to_string(
+                workspace
+                    .workspace_root
+                    .join(format!("plans/{request_id}.md")),
+            )
+            .unwrap(),
             approved_markdown
         );
         let prompts = driver_handle.prompts();
@@ -5788,6 +6579,8 @@ mod tests {
                 text: "Change live projectile behavior.".to_string(),
                 attachments: Vec::new(),
                 mentions: Vec::new(),
+                execution_mode: Default::default(),
+                autonomous_policy: None,
             })
             .await
             .unwrap();
@@ -5908,6 +6701,8 @@ mod tests {
                 text: "first request".to_string(),
                 attachments: Vec::new(),
                 mentions: Vec::new(),
+                execution_mode: Default::default(),
+                autonomous_policy: None,
             })
             .await
             .expect("first chat should run");
@@ -5918,6 +6713,8 @@ mod tests {
                 text: "second request".to_string(),
                 attachments: Vec::new(),
                 mentions: Vec::new(),
+                execution_mode: Default::default(),
+                autonomous_policy: None,
             })
             .await
             .expect("second chat should run");
@@ -5982,6 +6779,8 @@ mod tests {
                 text: "all ten enemies".to_string(),
                 attachments: Vec::new(),
                 mentions: Vec::new(),
+                execution_mode: Default::default(),
+                autonomous_policy: None,
             })
             .await
             .unwrap();
@@ -6067,6 +6866,8 @@ mod tests {
             text: "foreground goal".to_string(),
             attachments: Vec::new(),
             mentions: Vec::new(),
+            execution_mode: Default::default(),
+            autonomous_policy: None,
         });
 
         let (chat_result, ()) = tokio::join!(chat, concurrent_update);
@@ -6113,6 +6914,8 @@ mod tests {
                 text: "retain this goal".to_string(),
                 attachments: Vec::new(),
                 mentions: Vec::new(),
+                execution_mode: Default::default(),
+                autonomous_policy: None,
             })
             .await
             .unwrap();
@@ -6152,6 +6955,8 @@ mod tests {
                 text: "driver error fixture".to_string(),
                 attachments: Vec::new(),
                 mentions: Vec::new(),
+                execution_mode: Default::default(),
+                autonomous_policy: None,
             })
             .await
             .unwrap();
@@ -6193,6 +6998,8 @@ mod tests {
                 text: "timeout fixture".to_string(),
                 attachments: Vec::new(),
                 mentions: Vec::new(),
+                execution_mode: Default::default(),
+                autonomous_policy: None,
             })
             .await
             .unwrap();
@@ -6235,6 +7042,8 @@ mod tests {
                 text: "first".to_string(),
                 attachments: Vec::new(),
                 mentions: Vec::new(),
+                execution_mode: Default::default(),
+                autonomous_policy: None,
             })
             .await
             .unwrap();
@@ -6257,6 +7066,8 @@ mod tests {
                 text: "second".to_string(),
                 attachments: Vec::new(),
                 mentions: Vec::new(),
+                execution_mode: Default::default(),
+                autonomous_policy: None,
             })
             .await
             .unwrap();
@@ -6289,6 +7100,8 @@ mod tests {
                 text: "stable goal".to_string(),
                 attachments: Vec::new(),
                 mentions: Vec::new(),
+                execution_mode: Default::default(),
+                autonomous_policy: None,
             })
             .await
             .unwrap();
@@ -6320,6 +7133,8 @@ mod tests {
                 text: "continue".to_string(),
                 attachments: Vec::new(),
                 mentions: Vec::new(),
+                execution_mode: Default::default(),
+                autonomous_policy: None,
             })
             .await
             .unwrap();
@@ -6385,6 +7200,8 @@ mod tests {
                 text: "new branch".to_string(),
                 attachments: Vec::new(),
                 mentions: Vec::new(),
+                execution_mode: Default::default(),
+                autonomous_policy: None,
             })
             .await
             .unwrap();
@@ -6416,6 +7233,8 @@ mod tests {
                 text: "set marine HP to 80".to_string(),
                 attachments: Vec::new(),
                 mentions: Vec::new(),
+                execution_mode: Default::default(),
+                autonomous_policy: None,
             })
             .await
             .expect("chat should run");
@@ -6497,6 +7316,8 @@ mod tests {
                 text: "set marine HP to 80".to_string(),
                 attachments: Vec::new(),
                 mentions: Vec::new(),
+                execution_mode: Default::default(),
+                autonomous_policy: None,
             })
             .await
             .expect("chat should run");
@@ -6557,6 +7378,8 @@ mod tests {
                 text: "set marine HP to 80 and weapon damage to 6".to_string(),
                 attachments: Vec::new(),
                 mentions: Vec::new(),
+                execution_mode: Default::default(),
+                autonomous_policy: None,
             })
             .await
             .expect("chat should run");
@@ -6923,7 +7746,7 @@ mod tests {
         assert!(build < trace_test);
         assert!(prompt.contains("eudAgentTestSetup"));
         assert!(prompt.contains("failed/inconclusive never blocks review"));
-        assert!(prompt.contains("tests/**/*.tests.eps"));
+        assert!(prompt.contains("src/tests/**/*.tests.eps"));
         assert!(prompt.contains("trace_suite_run({})"));
         assert!(prompt.contains("outside the configured MainFile's production import graph"));
         assert!(prompt.contains("trace_test_run` remains available only"));
@@ -7064,6 +7887,8 @@ mod tests {
                     text: "long read".to_string(),
                     attachments: Vec::new(),
                     mentions: Vec::new(),
+                    execution_mode: Default::default(),
+                    autonomous_policy: None,
                 })
                 .await
         });
@@ -7076,6 +7901,8 @@ mod tests {
                     text: "short read".to_string(),
                     attachments: Vec::new(),
                     mentions: Vec::new(),
+                    execution_mode: Default::default(),
+                    autonomous_policy: None,
                 })
                 .await
         });
@@ -7109,6 +7936,8 @@ mod tests {
                     text: "first".to_string(),
                     attachments: Vec::new(),
                     mentions: Vec::new(),
+                    execution_mode: Default::default(),
+                    autonomous_policy: None,
                 })
                 .await
         });
@@ -7124,6 +7953,8 @@ mod tests {
                     text: "second".to_string(),
                     attachments: Vec::new(),
                     mentions: Vec::new(),
+                    execution_mode: Default::default(),
+                    autonomous_policy: None,
                 })
                 .await
         });
@@ -7162,7 +7993,7 @@ mod tests {
             .unwrap();
         engine
             .runtime
-            .request_write_workspace("write after read")
+            .register_write_request("write after read")
             .unwrap();
         engine.current_request_id = Some("request-old".to_string());
         engine.phase = Phase::Triage;
@@ -7177,7 +8008,7 @@ mod tests {
             .unwrap();
         let next = engine
             .runtime
-            .request_write_workspace("retry write")
+            .register_write_request("retry write")
             .unwrap();
         assert_eq!(next.state(), crate::write_coordinator::TicketState::Granted);
     }
@@ -7189,7 +8020,7 @@ mod tests {
         engine.runtime.begin_request(request_id, "Sample").unwrap();
         engine
             .runtime
-            .request_write_workspace("test review")
+            .register_write_request("test review")
             .unwrap();
         engine.current_request_id = Some(request_id.to_string());
         engine.phase = Phase::ChangesetReview;
@@ -7231,12 +8062,14 @@ mod tests {
         let workspace_manager = WorkspaceManager::new(dirs.clone());
         let snapshot = native_workspace_snapshot(&dirs, "Sample");
         let canonical = workspace_manager.prepare_snapshot(&snapshot).unwrap();
-        fs::write(canonical.root.join("specs/state.md"), b"accepted").unwrap();
+        fs::write(canonical.workspace_root.join("specs/state.md"), b"accepted").unwrap();
         let session_workspace = workspace_manager
             .prepare_session_snapshot(&snapshot, "session-c")
             .unwrap();
+        assert_eq!(session_workspace.workspace_root, canonical.workspace_root);
+        // The staged change lands directly on the single canonical copy.
         fs::write(
-            session_workspace.root.join("specs/state.md"),
+            session_workspace.workspace_root.join("specs/state.md"),
             b"pending change",
         )
         .unwrap();
@@ -7266,11 +8099,12 @@ mod tests {
             panel_log: serde_json::Value::Null,
             context_state: Default::default(),
             task_state: Default::default(),
+            autonomous_run: None,
         };
         sessions.save(&record).unwrap();
         let request_c = "req-c";
         runtime_c.begin_request(request_c, "Sample").unwrap();
-        runtime_c.request_write_workspace("C mutation").unwrap();
+        runtime_c.register_write_request("C mutation").unwrap();
         runtime_c
             .journal()
             .record(
@@ -7281,7 +8115,6 @@ mod tests {
                     tool: journal::WriteTool::WorkspaceWrite,
                     target: journal::JournalTarget::WorkspacePath {
                         workspace_id: session_workspace.id.clone(),
-                        session_id: Some("session-c".to_string()),
                         path: "specs/state.md".to_string(),
                     },
                     before: journal::Snapshot::FileContent {
@@ -7318,7 +8151,7 @@ mod tests {
         assert!(engine.runtime.owns_write_registration());
 
         runtime_e.begin_request("req-e", "Sample").unwrap();
-        let next = runtime_e.request_write_workspace("E mutation").unwrap();
+        let next = runtime_e.register_write_request("E mutation").unwrap();
         assert_eq!(next.state(), crate::write_coordinator::TicketState::Granted);
 
         engine
@@ -7331,11 +8164,7 @@ mod tests {
 
         assert_eq!(next.state(), crate::write_coordinator::TicketState::Granted);
         assert_eq!(
-            fs::read_to_string(session_workspace.root.join("specs/state.md")).unwrap(),
-            "accepted"
-        );
-        assert_eq!(
-            fs::read_to_string(canonical.root.join("specs/state.md")).unwrap(),
+            fs::read_to_string(canonical.workspace_root.join("specs/state.md")).unwrap(),
             "accepted"
         );
         fs::remove_dir_all(dirs.app_data()).ok();
@@ -7505,7 +8334,7 @@ mod tests {
         engine.runtime.begin_request(request_id, "Sample").unwrap();
         engine
             .runtime
-            .request_write_workspace("test rollback")
+            .register_write_request("test rollback")
             .unwrap();
         engine.current_request_id = Some(request_id.to_string());
         record_file_write_in_memory(&engine.journal_store, request_id, "write-1", 1, "one.eps");
@@ -7564,6 +8393,8 @@ mod tests {
                 text: "첨부 내용을 검토해 줘".to_string(),
                 attachments: vec![text.id.clone(), image.id.clone()],
                 mentions: Vec::new(),
+                execution_mode: Default::default(),
+                autonomous_policy: None,
             })
             .await
             .expect("attachment turn should complete");
@@ -7682,6 +8513,8 @@ mod tests {
                 text: String::new(),
                 attachments: Vec::new(),
                 mentions: vec![mention.clone()],
+                execution_mode: Default::default(),
+                autonomous_policy: None,
             })
             .await
             .unwrap();
@@ -7691,6 +8524,8 @@ mod tests {
                 text: "후속 요청".to_string(),
                 attachments: Vec::new(),
                 mentions: vec![mention.clone()],
+                execution_mode: Default::default(),
+                autonomous_policy: None,
             })
             .await
             .unwrap();
@@ -7720,6 +8555,8 @@ mod tests {
                 text: "계획해 줘".to_string(),
                 attachments: Vec::new(),
                 mentions: Vec::new(),
+                execution_mode: Default::default(),
+                autonomous_policy: None,
             })
             .await
             .unwrap();
@@ -7755,6 +8592,8 @@ mod tests {
                 text: "@회복 지점에서 치료해 줘".to_string(),
                 attachments: Vec::new(),
                 mentions: vec![mention],
+                execution_mode: Default::default(),
+                autonomous_policy: None,
             })
             .await
             .unwrap_err();
@@ -7772,6 +8611,8 @@ mod tests {
                 text: "@회복 지점에서 치료해 줘".to_string(),
                 attachments: Vec::new(),
                 mentions: Vec::new(),
+                execution_mode: Default::default(),
+                autonomous_policy: None,
             })
             .await
             .unwrap();
@@ -7785,7 +8626,7 @@ mod tests {
         engine.runtime.begin_request(request_id, "Sample").unwrap();
         engine
             .runtime
-            .request_write_workspace("sound import")
+            .register_write_request("sound import")
             .unwrap();
         engine.runtime.require_sound_build_for_tests();
         let before_hash = "1".repeat(64);
@@ -7890,6 +8731,13 @@ mod tests {
         assert!(prompt.contains("imageRef is an input binding, never extra write authority"));
         assert!(prompt.contains("When the user asks only to inspect, compare, or analyze an image"));
         assert!(prompt.contains("Multiple photos and ordinary terrain patches"));
+        assert!(prompt.contains("[draft patch operations]"));
+        assert!(prompt.contains("Never invent keys such as tileId"));
+        assert!(prompt.contains("- terrain.set: x, y, before, after\n"));
+        assert!(prompt.contains("- location.delete: locationId\n"));
+        assert!(prompt.contains("before must equal the current tile id at (x, y)"));
+        assert!(prompt.contains("use terrain.rect or terrain.blit"));
+        assert!(prompt.contains("numeric ids from map_palette_query, never names"));
         assert!(
             prompt.contains("Never provide a filesystem path, palette, MTXM id, or tile matrix")
         );
@@ -7921,5 +8769,307 @@ mod tests {
         let map = build_map_system_prompt("[project state]", None);
         assert!(!map.contains("map_sound_import"));
         assert!(map.contains("sounds are unsupported"));
+    }
+    #[tokio::test]
+    async fn autonomous_mode_continues_typed_boundaries_with_minimal_context() {
+        let (base, memory) = memory_store("autonomous-boundary");
+        let driver = FakeCodexDriver::scripted([
+            AgentTurnResult::IterationBoundary {
+                reason: crate::provider_runtime::IterationBoundaryReason::ToolRounds,
+            },
+            AgentTurnResult::Answer {
+                text: "완료".to_string(),
+            },
+        ]);
+        let driver_handle = driver.clone();
+        let sink = CapturingEventSink::default();
+        let mut engine = test_engine_with_memory(driver, sink, memory, &base.join("data"));
+        native_workspace_snapshot(&engine.runtime.data_dirs(), "Sample");
+
+        engine
+            .chat(crate::ipc::ChatRequest {
+                client_turn_id: crate::ipc::new_client_turn_id(),
+                text: "여러 반복이 필요한 목표".to_string(),
+                attachments: Vec::new(),
+                mentions: Vec::new(),
+                execution_mode: crate::autonomous::ExecutionMode::Autonomous,
+                autonomous_policy: None,
+            })
+            .await
+            .unwrap();
+
+        let prompts = driver_handle.prompts();
+        assert_eq!(prompts.len(), 2);
+        assert!(prompts[0].contains("[autonomous execution]"));
+        assert!(prompts[1].contains("[autonomous continuation]"));
+        assert!(prompts[1].contains("여러 반복이 필요한 목표"));
+        assert!(!prompts[1].contains(EPS_PROJECT_ARCHITECTURE_GUIDE));
+        let run = engine
+            .session_store
+            .load(&engine.session_id)
+            .unwrap()
+            .autonomous_run
+            .unwrap();
+        assert_eq!(
+            run.status,
+            crate::autonomous::AutonomousRunStatus::Completed
+        );
+        assert_eq!(run.iteration, 2);
+        assert!(run.last_checkpoint.unwrap().is_started());
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[tokio::test]
+    async fn interactive_mode_continues_at_a_typed_boundary_without_creating_autonomous_state() {
+        let (base, memory) = memory_store("interactive-boundary");
+        let driver = FakeCodexDriver::scripted([
+            AgentTurnResult::IterationBoundary {
+                reason: crate::provider_runtime::IterationBoundaryReason::ToolRounds,
+            },
+            AgentTurnResult::IterationBoundary {
+                reason: crate::provider_runtime::IterationBoundaryReason::ToolActions,
+            },
+            AgentTurnResult::Answer {
+                text: "일반 완료".to_string(),
+            },
+        ]);
+        let driver_handle = driver.clone();
+        let sink = CapturingEventSink::default();
+        let sink_handle = sink.clone();
+        let mut engine = test_engine_with_memory(driver, sink, memory, &base.join("data"));
+
+        engine
+            .chat(crate::ipc::ChatRequest {
+                client_turn_id: crate::ipc::new_client_turn_id(),
+                text: "일반 실행".to_string(),
+                attachments: Vec::new(),
+                mentions: Vec::new(),
+                execution_mode: crate::autonomous::ExecutionMode::Interactive,
+                autonomous_policy: None,
+            })
+            .await
+            .unwrap();
+
+        let prompts = driver_handle.prompts();
+        assert_eq!(prompts.len(), 3);
+        assert!(prompts[0].contains("일반 실행"));
+        assert!(!prompts[0].contains("[autonomous execution]"));
+        assert!(prompts[1].starts_with("[continuation]"));
+        assert!(prompts[1].contains("ToolRounds"));
+        assert!(prompts[2].starts_with("[continuation]"));
+        assert!(prompts[2].contains("ToolActions"));
+        assert!(engine
+            .session_store
+            .load(&engine.session_id)
+            .unwrap()
+            .autonomous_run
+            .is_none());
+        let events = sink_handle.events();
+        assert!(events.iter().any(
+            |event| matches!(event, EngineEvent::Answer(answer) if answer.text == "일반 완료")
+        ));
+        assert!(!events.iter().any(
+            |event| matches!(event, EngineEvent::Answer(answer) if answer.text.contains("일시 중지"))
+        ));
+        fs::remove_dir_all(base).ok();
+    }
+    #[tokio::test]
+    async fn autonomous_resume_requires_exact_checkpoint_and_project_revision() {
+        for (tag, revision_matches) in [
+            ("autonomous-resume-valid", true),
+            ("autonomous-resume-stale", false),
+        ] {
+            let (base, memory) = memory_store(tag);
+            let driver = FakeCodexDriver::scripted([AgentTurnResult::Answer {
+                text: "재개 완료".to_string(),
+            }]);
+            let driver_handle = driver.clone();
+            let sink = CapturingEventSink::default();
+            let mut engine = test_engine_with_memory(driver, sink, memory, &base.join("data"));
+            native_workspace_snapshot(&engine.runtime.data_dirs(), "Sample");
+            let checkpoint = engine.executor.conversation_state();
+            let current_revision = engine.runtime.current_project_revision().unwrap();
+            let mut run = crate::autonomous::AutonomousRunState::new(
+                "재개할 목표".to_string(),
+                crate::ipc::new_client_turn_id(),
+                format!("req-{tag}"),
+                engine.project_id.clone(),
+                if revision_matches {
+                    current_revision
+                } else {
+                    "stale-revision".to_string()
+                },
+                Default::default(),
+                crate::session::now_unix_millis(),
+            );
+            run.status = crate::autonomous::AutonomousRunStatus::PausedAfterRestart;
+            run.pause_reason = Some(crate::autonomous::AutonomousPauseReason::Restart);
+            run.active_started_at = None;
+            run.last_checkpoint = Some(checkpoint);
+            engine
+                .session_store
+                .set_autonomous_run(&engine.session_id, Some(run))
+                .unwrap();
+
+            let result = engine.autonomous_resume().await;
+            let persisted = engine
+                .session_store
+                .load(&engine.session_id)
+                .unwrap()
+                .autonomous_run
+                .unwrap();
+            if revision_matches {
+                result.unwrap();
+                assert_eq!(
+                    persisted.status,
+                    crate::autonomous::AutonomousRunStatus::Completed
+                );
+                assert_eq!(driver_handle.prompts().len(), 1);
+                assert!(driver_handle.prompts()[0].contains("[autonomous continuation]"));
+                assert!(driver_handle.prompts()[0].contains("재개할 목표"));
+            } else {
+                assert!(result.unwrap_err().message.contains("프로젝트"));
+                assert_eq!(
+                    persisted.status,
+                    crate::autonomous::AutonomousRunStatus::SafetyStopped
+                );
+                assert!(driver_handle.prompts().is_empty());
+            }
+            fs::remove_dir_all(base).ok();
+        }
+    }
+
+    #[test]
+    fn autonomous_completion_requires_a_successful_build_for_current_revision() {
+        let (base, memory) = memory_store("autonomous-build-gate");
+        let driver = FakeCodexDriver::scripted([]);
+        let sink = CapturingEventSink::default();
+        let mut engine = test_engine_with_memory(driver, sink, memory, &base.join("data"));
+        native_workspace_snapshot(&engine.runtime.data_dirs(), "Sample");
+        let request_id = "req-autonomous-build";
+        engine.current_request_id = Some(request_id.to_string());
+        engine
+            .runtime
+            .begin_request(request_id, &engine.project_id)
+            .unwrap();
+        record_file_write_in_memory(
+            &engine.journal_store,
+            request_id,
+            "write-build",
+            1,
+            "src/main.eps",
+        );
+
+        assert!(engine
+            .autonomous_completion_blocker()
+            .unwrap()
+            .unwrap()
+            .contains("build_run"));
+
+        let revision = engine.runtime.current_project_revision().unwrap();
+        engine
+            .runtime
+            .restore_autonomous_progress(
+                request_id,
+                &crate::autonomous::AutonomousRunProgress {
+                    latest_build: Some(crate::autonomous::AutonomousBuildStatus {
+                        input_revision: revision,
+                        diagnostics_fingerprint: "success".to_string(),
+                        error_count: 0,
+                        success: true,
+                        consecutive_no_progress: 0,
+                    }),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(engine.autonomous_completion_blocker().unwrap(), None);
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[tokio::test]
+    async fn accepted_autonomous_review_completes_while_paused_review_stays_resumable() {
+        for (tag, initial_status, expected_status) in [
+            (
+                "autonomous-review",
+                crate::autonomous::AutonomousRunStatus::Review,
+                crate::autonomous::AutonomousRunStatus::Completed,
+            ),
+            (
+                "autonomous-paused-review",
+                crate::autonomous::AutonomousRunStatus::Paused,
+                crate::autonomous::AutonomousRunStatus::Paused,
+            ),
+        ] {
+            let (base, memory) = memory_store(tag);
+            let driver = FakeCodexDriver::scripted([]);
+            let sink = CapturingEventSink::default();
+            let mut engine = test_engine_with_memory(driver, sink, memory, &base.join("data"));
+            native_workspace_snapshot(&engine.runtime.data_dirs(), "Sample");
+            let request_id = format!("req-{tag}");
+            engine.execution_mode = crate::autonomous::ExecutionMode::Autonomous;
+            engine.current_request_id = Some(request_id.clone());
+            engine.current_client_turn_id = Some(crate::ipc::new_client_turn_id());
+            engine
+                .runtime
+                .begin_request(&request_id, &engine.project_id)
+                .unwrap();
+            engine
+                .runtime
+                .register_write_request("review fixture")
+                .unwrap();
+            record_file_write(
+                &engine.journal_store,
+                &request_id,
+                "review-write",
+                1,
+                "src/main.eps",
+            );
+            let mut run = crate::autonomous::AutonomousRunState::new(
+                "검토할 목표".to_string(),
+                engine.current_client_turn_id.clone().unwrap(),
+                request_id.clone(),
+                engine.project_id.clone(),
+                engine.runtime.current_project_revision().unwrap(),
+                Default::default(),
+                crate::session::now_unix_millis(),
+            );
+            run.status = initial_status;
+            if initial_status == crate::autonomous::AutonomousRunStatus::Paused {
+                run.pause_reason = Some(crate::autonomous::AutonomousPauseReason::User);
+            }
+            engine
+                .session_store
+                .set_autonomous_run(&engine.session_id, Some(run))
+                .unwrap();
+
+            engine
+                .changeset_decision(crate::ipc::ChangesetDecisionRequest {
+                    decision: crate::ipc::Decision::Accept,
+                    ids: crate::ipc::DecisionIds::All(crate::ipc::AllLiteral),
+                })
+                .await
+                .unwrap();
+
+            let persisted = engine
+                .session_store
+                .load(&engine.session_id)
+                .unwrap()
+                .autonomous_run
+                .unwrap();
+            assert_eq!(persisted.status, expected_status);
+            assert_eq!(
+                persisted.project_revision,
+                engine.runtime.current_project_revision().unwrap()
+            );
+            if expected_status == crate::autonomous::AutonomousRunStatus::Paused {
+                assert!(persisted.status.can_resume());
+                assert_eq!(
+                    persisted.pause_reason,
+                    Some(crate::autonomous::AutonomousPauseReason::User)
+                );
+            }
+            fs::remove_dir_all(base).ok();
+        }
     }
 }

@@ -2,7 +2,7 @@ use super::*;
 use crate::{
     opencode_go::OpenCodeGoAdapter,
     provider::{ModelCapabilities, ProviderConversationState, ProviderId},
-    provider_runtime::{BindingSnapshot, ProviderRuntimeError},
+    provider_runtime::BindingSnapshot,
 };
 use serde_json::Value;
 use std::sync::{
@@ -14,6 +14,7 @@ struct SchemaServer {
     base: String,
     posts: Arc<AtomicUsize>,
     saw_actual_result: Arc<AtomicBool>,
+    saw_usage_error: Arc<AtomicBool>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -28,8 +29,10 @@ async fn schema_server(invalid_arguments: bool) -> SchemaServer {
 
     let posts = Arc::new(AtomicUsize::new(0));
     let saw_actual_result = Arc::new(AtomicBool::new(false));
+    let saw_usage_error = Arc::new(AtomicBool::new(false));
     let response_posts = Arc::clone(&posts);
     let response_saw_result = Arc::clone(&saw_actual_result);
+    let response_saw_usage = Arc::clone(&saw_usage_error);
     let app = axum::Router::new()
         .route(
             "/models.dev",
@@ -52,6 +55,7 @@ async fn schema_server(invalid_arguments: bool) -> SchemaServer {
             post(move |axum::Json(body): axum::Json<Value>| {
                 let posts = Arc::clone(&response_posts);
                 let saw_result = Arc::clone(&response_saw_result);
+                let saw_usage = Arc::clone(&response_saw_usage);
                 async move {
                     let read_file = body["tools"]
                         .as_array()
@@ -83,6 +87,12 @@ async fn schema_server(invalid_arguments: bool) -> SchemaServer {
                     });
                     let stream = if let Some(output) = output {
                         saw_result.store(output.contains("onPluginStart"), Ordering::SeqCst);
+                        saw_usage.store(
+                            output.contains("Usage: read_file(path)")
+                                && output
+                                    .contains("arguments do not match the documented input schema"),
+                            Ordering::SeqCst,
+                        );
                         concat!(
                             "event: response.output_text.delta\n",
                             "data: {\"delta\":\"done\"}\n\n",
@@ -125,6 +135,7 @@ async fn schema_server(invalid_arguments: bool) -> SchemaServer {
         base,
         posts,
         saw_actual_result,
+        saw_usage_error,
         task,
     }
 }
@@ -178,17 +189,16 @@ async fn opencode_optional_schema_roundtrips_through_runtime_admission() {
     assert_eq!(valid_server.posts.load(Ordering::SeqCst), 2);
     assert!(valid_server.saw_actual_result.load(Ordering::SeqCst));
 
+    // A schema violation is a recoverable usage completion: the exact guidance
+    // reaches the model, the run continues, and no fatal protocol failure ends it.
     let invalid_fixture = RuntimeFixture::new("opencode-optional-schema-invalid");
     let invalid_server = schema_server(true).await;
     let invalid = runtime_outcome(&invalid_fixture, &invalid_server, 40_102).await;
     assert!(
-        matches!(
-        &invalid,
-        RunOutcome::Failed(ProviderRuntimeError::Protocol(error))
-            if error.contains("arguments do not match its input schema")
-        ),
+        matches!(&invalid, RunOutcome::Completed { text, .. } if text == "done"),
         "{invalid:?}"
     );
-    assert_eq!(invalid_server.posts.load(Ordering::SeqCst), 1);
+    assert_eq!(invalid_server.posts.load(Ordering::SeqCst), 2);
+    assert!(invalid_server.saw_usage_error.load(Ordering::SeqCst));
     assert!(!invalid_server.saw_actual_result.load(Ordering::SeqCst));
 }

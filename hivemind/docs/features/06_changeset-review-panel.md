@@ -155,8 +155,9 @@ new writers.
   bodies, and whole-batch accept/reject actions. Harness updates route by immutable `sessionId`;
   snapshot hydration merges by `updatedAt`, and background status never disables the main input.
 - **Workspace explorer / project wiki**: the right project sidebar's Files tab opens the
-  viewer-only workspace explorer. `workspace_list` refreshes the EPS source mirror and
-  returns durable documents plus `source/`; selecting a file calls confined
+  viewer-only workspace explorer. `workspace_list` returns the durable documents under
+  `<project>/.eud-agent/workspace` (documents only — the EPS source mirror is gone now that
+  the CLI cwd is the project root); selecting a file calls confined
   `workspace_read`. `specs/` sorts first, `specs/index.md` is the default wiki home, and
   `workspace_search` scans that same confined, bounded tree and returns case-insensitive path or
   UTF-8 content matches while skipping non-text files. The explorer groups files by top-level
@@ -170,8 +171,8 @@ new writers.
   to listed workspace files are rewritten to a reserved safe HTTPS target and intercepted
   as in-explorer navigation; external links retain the normal safe browser path.
   Source/non-Markdown text uses a read-only code block. Documents carry “검토 대상 문서”,
-  accepted revisions carry “확정됨 · rN”, approved plan snapshots carry
-  “승인된 계획 · rN”, and generated EPS files carry “읽기 전용 소스”.
+  accepted revisions carry “확정됨 · rN”, and approved plan snapshots carry
+  “승인된 계획 · rN”.
 - **Workspace changeset items**: turn-end filesystem create/modify/delete entries render as
   category `workspace`, with a distinct Workspace title badge and server unified diff. They
   use the existing per-item/bulk accept/reject controls; reject restores the trusted

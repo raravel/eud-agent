@@ -34,19 +34,13 @@ pub trait JournalRollbackTarget {
     fn write_workspace_file(
         &self,
         _workspace_id: &str,
-        _session_id: Option<&str>,
         path: &str,
         content: &str,
     ) -> Result<(), Self::Error> {
         self.write_file(path, content)
     }
 
-    fn delete_workspace_file(
-        &self,
-        _workspace_id: &str,
-        _session_id: Option<&str>,
-        path: &str,
-    ) -> Result<(), Self::Error> {
+    fn delete_workspace_file(&self, _workspace_id: &str, path: &str) -> Result<(), Self::Error> {
         self.delete_file(path)
     }
 
@@ -165,8 +159,6 @@ pub enum JournalTarget {
     },
     WorkspacePath {
         workspace_id: String,
-        #[serde(default)]
-        session_id: Option<String>,
         path: String,
     },
     Rename {
@@ -1088,7 +1080,6 @@ enum RejectTarget {
     Setting(String),
     WorkspacePath {
         workspace_id: String,
-        session_id: Option<String>,
         path: String,
     },
     PluginIndex(usize),
@@ -1104,16 +1095,8 @@ impl fmt::Display for RejectTarget {
                 property,
             } => write!(f, "dat:{table}:{dat}:{obj_id}:{property}"),
             Self::Path(path) => write!(f, "path:{path}"),
-            Self::WorkspacePath {
-                workspace_id,
-                session_id,
-                path,
-            } => {
-                write!(
-                    f,
-                    "workspace:{workspace_id}:{}:{path}",
-                    session_id.as_deref().unwrap_or("legacy")
-                )
+            Self::WorkspacePath { workspace_id, path } => {
+                write!(f, "workspace:{workspace_id}:{path}")
             }
             Self::Setting(key) => write!(f, "setting:{key}"),
             Self::PluginIndex(index) => write!(f, "plugin-index:{index}"),
@@ -1168,14 +1151,9 @@ fn reject_targets(entry: &JournalEntry) -> Result<Vec<RejectTarget>, JournalErro
             property: property.clone(),
         }],
         JournalTarget::Path { path } => vec![RejectTarget::Path(path.clone())],
-        JournalTarget::WorkspacePath {
-            workspace_id,
-            session_id,
-            path,
-        } => {
+        JournalTarget::WorkspacePath { workspace_id, path } => {
             vec![RejectTarget::WorkspacePath {
                 workspace_id: workspace_id.clone(),
-                session_id: session_id.clone(),
                 path: path.clone(),
             }]
         }
@@ -1293,10 +1271,10 @@ where
             }
         }
         WriteTool::WorkspaceWrite | WriteTool::WorkspaceDelete => {
-            let (workspace_id, session_id, path) = workspace_target_parts(entry)?;
+            let (workspace_id, path) = workspace_target_parts(entry)?;
             match &entry.before {
                 Snapshot::FileContent { content } | Snapshot::DeletedFile { content, .. } => target
-                    .write_workspace_file(workspace_id, session_id, path, content)
+                    .write_workspace_file(workspace_id, path, content)
                     .map_err(target_error),
                 _ => Err(invalid_entry(
                     entry,
@@ -1305,9 +1283,9 @@ where
             }
         }
         WriteTool::WorkspaceCreate => {
-            let (workspace_id, session_id, path) = workspace_target_parts(entry)?;
+            let (workspace_id, path) = workspace_target_parts(entry)?;
             target
-                .delete_workspace_file(workspace_id, session_id, path)
+                .delete_workspace_file(workspace_id, path)
                 .map_err(target_error)
         }
         WriteTool::FileRename | WriteTool::FileMove => {
@@ -1416,15 +1394,9 @@ where
         },
     }
 }
-fn workspace_target_parts(
-    entry: &JournalEntry,
-) -> Result<(&str, Option<&str>, &str), JournalError> {
+fn workspace_target_parts(entry: &JournalEntry) -> Result<(&str, &str), JournalError> {
     match &entry.target {
-        JournalTarget::WorkspacePath {
-            workspace_id,
-            session_id,
-            path,
-        } => Ok((workspace_id, session_id.as_deref(), path)),
+        JournalTarget::WorkspacePath { workspace_id, path } => Ok((workspace_id, path)),
         _ => Err(invalid_entry(entry, "expected workspace path target")),
     }
 }
@@ -2857,6 +2829,38 @@ mod tests {
         assert_eq!(loaded.request_id, request_id);
         assert_eq!(loaded.entries.len(), 1);
         assert_eq!(loaded.entries[0].id, "file-write");
+    }
+
+    #[test]
+    fn legacy_workspace_journal_session_id_is_read_and_ignored() {
+        // Journals written before the project-root cwd cutover carried a
+        // per-session copy id on workspace targets; pending reviews from those
+        // builds must still load after upgrade.
+        let raw = json!({
+            "request_id": "req-legacy",
+            "entries": [{
+                "id": "ws-write",
+                "seq": 1,
+                "tool": "WorkspaceWrite",
+                "target": {
+                    "WorkspacePath": {
+                        "workspace_id": "w".repeat(64),
+                        "session_id": "legacy-session",
+                        "path": "specs/game.md",
+                    }
+                },
+                "before": { "FileContent": { "content": "old" } },
+                "after": { "FileContent": { "content": "new" } },
+                "ts": 1,
+            }],
+        });
+        let journal: Journal = serde_json::from_value(raw).expect("legacy journal should load");
+        match &journal.entries[0].target {
+            JournalTarget::WorkspacePath { path, .. } => {
+                assert_eq!(path, "specs/game.md");
+            }
+            other => panic!("unexpected target: {other:?}"),
+        }
     }
 
     #[test]

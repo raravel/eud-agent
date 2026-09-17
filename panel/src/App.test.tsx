@@ -149,12 +149,31 @@ beforeEach(() => {
   tauri.resolveLongChat = undefined;
   tauri.pendingAsk = undefined;
   tauri.invoke.mockReset();
+  let launchPending = true;
   tauri.invoke.mockImplementation(async (command: string, args?: Record<string, unknown>) => {
     switch (command) {
       case "setup_status":
         return {
           projectPath: "C:/Project",
           projectValid: true,
+          euddraftPath: "C:/euddraft/euddraft.exe",
+          euddraftValid: true,
+          assetsReady: true,
+          defaultProvider: "codex",
+          providers: providerStatuses,
+          projectOpened: false,
+          setupRequired: false,
+        };
+      case "project_take_launch_request": {
+        if (!launchPending) return null;
+        launchPending = false;
+        return { path: "C:/Project" };
+      }
+      case "project_open":
+        return {
+          projectPath: "C:/Project",
+          projectValid: true,
+          projectOpened: true,
           euddraftPath: "C:/euddraft/euddraft.exe",
           euddraftValid: true,
           assetsReady: true,
@@ -275,6 +294,27 @@ beforeEach(() => {
       case "attention_notify":
       case "notification_sound_preview":
         return undefined;
+      case "workspace_list":
+        return {
+          project: "Project",
+          workspaceId: "a".repeat(64),
+          files: [
+            { path: "specs/index.md", size: 24 },
+            { path: "specs/combat.md", size: 32 },
+          ],
+        };
+      case "workspace_read":
+        return {
+          workspaceId: args?.workspaceId,
+          path: args?.path,
+          content: "# 문서 제목\n\n문서 본문",
+        };
+      case "workspace_search":
+        return {
+          workspaceId: args?.workspaceId,
+          query: args?.query,
+          paths: [],
+        };
       case "ask_pending":
         return args?.sessionId === "session-a" ? (tauri.pendingAsk ?? null) : null;
       case "chat":
@@ -313,6 +353,57 @@ beforeEach(() => {
   });
 });
 
+describe("App project launcher", () => {
+  it("keeps the previous project closed until an explicit open succeeds", async () => {
+    const baseInvoke = tauri.invoke.getMockImplementation();
+    const projectPath = String.raw`\\?\E:\proj\eud\proj1\native`;
+    tauri.invoke.mockImplementation(async (command: string, args?: Record<string, unknown>) => {
+      if (command === "project_take_launch_request") return null;
+      if (command === "project_recent_list") {
+        return [{ name: "Project", path: projectPath, lastOpenedAt: 1, available: true }];
+      }
+      if (command === "setup_pick_project_path") return baseInvoke?.("setup_status");
+      return baseInvoke?.(command, args);
+    });
+    render(<App />);
+    const open = await screen.findByRole("button", { name: /프로젝트 파일 열기/ });
+    await waitFor(() => expect(open).toBeEnabled());
+    fireEvent.click(open);
+    await waitFor(() => expect(open).toBeEnabled());
+    expect(screen.getByRole("heading", { name: "프로젝트 시작" })).toBeInTheDocument();
+    expect(tauri.invoke).not.toHaveBeenCalledWith("status");
+    expect(tauri.invoke).not.toHaveBeenCalledWith("session_list");
+    fireEvent.click(screen.getByRole("button", { name: String.raw`Project E:\proj\eud\proj1\native` }));
+    expect(await screen.findByRole("button", { name: "Session A, 유휴" })).toBeInTheDocument();
+    expect(tauri.invoke).toHaveBeenCalledWith("project_open", { path: projectPath });
+  });
+
+  it("retains a file-open request during a build for explicit retry", async () => {
+    const baseInvoke = tauri.invoke.getMockImplementation();
+    let forwarded: string | null = null;
+    tauri.invoke.mockImplementation(async (command: string, args?: Record<string, unknown>) => {
+      if (command === "project_take_launch_request" && forwarded) {
+        const path = forwarded;
+        forwarded = null;
+        return { path };
+      }
+      return baseInvoke?.(command, args);
+    });
+    render(<App />);
+    await screen.findByRole("button", { name: "Session A, 유휴" });
+    act(() => emit("status", { compiling: true, project: "Project" }));
+    forwarded = "C:/Another/project.eap";
+    act(() => emit("project-open-requested", null));
+    expect(await screen.findByText("C:/Another/project.eap")).toBeInTheDocument();
+    expect(tauri.invoke).not.toHaveBeenCalledWith("project_open", { path: "C:/Another/project.eap" });
+    act(() => emit("status", { compiling: false, project: "Project" }));
+    fireEvent.click(screen.getByRole("button", { name: "다시 열기" }));
+    await screen.findByRole("button", { name: "Session A, 유휴" });
+    expect(screen.queryByText("대기 중인 프로젝트 열기")).not.toBeInTheDocument();
+    expect(tauri.invoke).toHaveBeenCalledWith("project_open", { path: "C:/Another/project.eap" });
+  });
+});
+
 afterEach(() => {
   tauri.resolveLongChat?.();
   vi.clearAllMocks();
@@ -341,7 +432,7 @@ describe("App concurrent sessions", () => {
     await waitFor(() => expect(input).toBeEnabled());
 
     fireEvent.change(input, { target: { value: "long analysis" } });
-    fireEvent.click(screen.getByRole("button", { name: "전송" }));
+    fireEvent.click(screen.getByRole("button", { name: "실행" }));
     await waitFor(() => {
       expect(tauri.invoke).toHaveBeenCalledWith("chat", {
         sessionId: "session-a",
@@ -349,6 +440,7 @@ describe("App concurrent sessions", () => {
         text: "long analysis",
         attachments: [],
         mentions: [],
+        executionMode: "interactive",
       });
     });
     expect(tauri.resolveLongChat).toBeTypeOf("function");
@@ -356,7 +448,7 @@ describe("App concurrent sessions", () => {
     fireEvent.click(screen.getByRole("button", { name: "Session B, 유휴" }));
     const secondInput = screen.getByRole("combobox", { name: "지시 입력" });
     fireEvent.change(secondInput, { target: { value: "short answer" } });
-    fireEvent.click(screen.getByRole("button", { name: "전송" }));
+    fireEvent.click(screen.getByRole("button", { name: "실행" }));
 
     await waitFor(() => {
       expect(tauri.invoke).toHaveBeenCalledWith("chat", {
@@ -365,6 +457,7 @@ describe("App concurrent sessions", () => {
         text: "short answer",
         attachments: [],
         mentions: [],
+        executionMode: "interactive",
       });
     });
     expect(tauri.resolveLongChat).toBeTypeOf("function");
@@ -380,7 +473,7 @@ describe("App concurrent sessions", () => {
     fireEvent.change(screen.getByRole("combobox", { name: "지시 입력" }), {
       target: { value: "newest conversation" },
     });
-    fireEvent.click(screen.getByRole("button", { name: "전송" }));
+    fireEvent.click(screen.getByRole("button", { name: "실행" }));
 
     await waitFor(() => {
       expect(tauri.invoke).toHaveBeenCalledWith("chat", {
@@ -389,6 +482,7 @@ describe("App concurrent sessions", () => {
         text: "newest conversation",
         attachments: [],
         mentions: [],
+        executionMode: "interactive",
       });
     });
     expect(sessionOrder()).toEqual(["Session B, 유휴", "Session A, 유휴"]);
@@ -400,7 +494,7 @@ describe("App concurrent sessions", () => {
     await waitFor(() => expect(input).toBeEnabled());
     fireEvent.click(screen.getByRole("button", { name: "메시지 수정" }));
     await waitFor(() => expect(input).toHaveValue("previous conversation"));
-    fireEvent.click(screen.getByRole("button", { name: "전송" }));
+    fireEvent.click(screen.getByRole("button", { name: "실행" }));
     await waitFor(() => {
       const chat = tauri.invoke.mock.calls.find(
         ([command]) => command === "chat",
@@ -416,6 +510,7 @@ describe("App concurrent sessions", () => {
   });
 
   it("restores text and mention chips after backend validation rejection", async () => {
+    const baseInvoke = tauri.invoke.getMockImplementation();
     tauri.invoke.mockImplementation(async (command: string, args?: Record<string, unknown>) => {
       if (command === "chat" && Array.isArray(args?.mentions) && args.mentions.length > 0) {
         throw new Error("저장 영역이 변경되었습니다");
@@ -482,17 +577,18 @@ describe("App concurrent sessions", () => {
           assetsReady: true,
           defaultProvider: "codex",
           providers: providerStatuses,
+          projectOpened: false,
           setupRequired: false,
         };
       }
-      return undefined;
+      return baseInvoke?.(command, args);
     });
     render(<App />);
     const input = await screen.findByRole("combobox", { name: "지시 입력" });
     await waitFor(() => expect(input).toBeEnabled());
     fireEvent.change(input, { target: { value: "처리해 줘 @영역 A" } });
     await fireEvent.click(await screen.findByRole("option", { name: /@영역 A/ }));
-    fireEvent.click(screen.getByRole("button", { name: "전송" }));
+    fireEvent.click(screen.getByRole("button", { name: "실행" }));
     await waitFor(() => expect(input).toHaveValue("처리해 줘"));
     expect(screen.getAllByTestId("mention-chips")).toHaveLength(2);
     expect(screen.getAllByTestId("mention-chips").at(-1)).toHaveTextContent("@영역 A");
@@ -523,7 +619,7 @@ describe("App concurrent sessions", () => {
       ([command]) => command === "chat",
     )?.[1];
     await waitFor(() => expect(input).toBeEnabled());
-    fireEvent.click(screen.getByRole("button", { name: "전송" }));
+    fireEvent.click(screen.getByRole("button", { name: "실행" }));
     await waitFor(() => {
       const chats = tauri.invoke.mock.calls.filter(
         ([command]) => command === "chat",
@@ -547,7 +643,7 @@ describe("App concurrent sessions", () => {
 
     fireEvent.change(input, { target: { value: "@영역 A" } });
     fireEvent.click(await screen.findByRole("option", { name: /@영역 A/ }));
-    fireEvent.click(screen.getByRole("button", { name: "전송" }));
+    fireEvent.click(screen.getByRole("button", { name: "실행" }));
 
     await waitFor(() => {
       expect(tauri.invoke).toHaveBeenCalledWith(
@@ -660,6 +756,54 @@ describe("App concurrent sessions", () => {
       tauri.invoke.mock.calls.filter(([command]) => command === "session_open"),
     ).toHaveLength(0);
   });
+  it("routes autonomous lifecycle independently from session activity", async () => {
+    render(<App />);
+    await screen.findByRole("button", { name: "Session A, 유휴" });
+    await waitFor(() => expect(tauri.listeners.has("autonomous_run")).toBe(true));
+
+    act(() => {
+      emit("session_activity", {
+        sessionId: "session-a",
+        activity: "running_read",
+      });
+      emit("autonomous_run", {
+        sessionId: "session-a",
+        schemaVersion: 1,
+        id: "auto-a",
+        status: "paused_after_restart",
+        startedAt: 1,
+        updatedAt: 2,
+        iteration: 4,
+        goal: "긴 작업",
+        requestId: "request-a",
+        projectId: "ExampleProject",
+        clientTurnId: "11111111-1111-4111-8111-111111111111",
+        projectRevision: "revision-a",
+        policy: {
+          maxWallTimeMillis: 14_400_000,
+        },
+        progress: {
+          elapsedActiveMillis: 3_000,
+          readActions: 12,
+          writeActions: 5,
+          consecutiveNoProgress: 0,
+          recentFingerprints: [],
+        },
+        pauseReason: "restart",
+        blocker: "앱 재시작 후 명시적으로 계속해야 합니다.",
+      });
+    });
+
+    expect(screen.getByText("앱 재시작 후 일시 중지")).toBeInTheDocument();
+    expect(screen.getByText("반복 4")).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Session A, 분석 중" }),
+    ).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Session B, 유휴" }));
+    expect(screen.queryByText("앱 재시작 후 일시 중지")).not.toBeInTheDocument();
+  });
+
 
   it("routes post-acceptance harness actions and closes completed jobs automatically", async () => {
     render(<App />);
@@ -764,7 +908,7 @@ describe("App concurrent sessions", () => {
     await waitFor(() => expect(input).toBeEnabled());
 
     fireEvent.change(input, { target: { value: "설계를 진행해 줘" } });
-    fireEvent.click(screen.getByRole("button", { name: "전송" }));
+    fireEvent.click(screen.getByRole("button", { name: "실행" }));
     await waitFor(() => expect(tauri.resolveLongChat).toBeTypeOf("function"));
     await waitFor(() => expect(tauri.listeners.has("ask")).toBe(true));
 
@@ -942,7 +1086,7 @@ describe("App native compaction", () => {
     await waitFor(() => expect(input).toBeEnabled());
 
     fireEvent.change(input, { target: { value: "/compact" } });
-    fireEvent.click(screen.getByRole("button", { name: "전송" }));
+    fireEvent.click(screen.getByRole("button", { name: "실행" }));
 
     await waitFor(() => {
       expect(tauri.invoke).toHaveBeenCalledWith("compact", {
@@ -1214,10 +1358,10 @@ describe("App notifications", () => {
 });
 
 describe("App setup payload compatibility", () => {
-  it("opens setup for nullable option fields from an older Rust response", async () => {
+  it("continues to provider setup after an explicit open with nullable options", async () => {
     const baseInvoke = tauri.invoke.getMockImplementation();
     tauri.invoke.mockImplementation(async (command: string, args?: Record<string, unknown>) => {
-      if (command === "setup_status") {
+      if (command === "setup_status" || command === "project_open") {
         return {
           projectPath: "C:/Project",
           projectValid: true,
@@ -1231,6 +1375,7 @@ describe("App setup payload compatibility", () => {
             selectedAsDefault: false,
             detailCode: null,
           })),
+          projectOpened: command === "project_open",
           setupRequired: true,
           error: null,
         };
@@ -1258,7 +1403,7 @@ describe("App provider login cancellation", () => {
       selectedAsDefault: status.provider === "antigravity",
     }));
     tauri.invoke.mockImplementation(async (command: string, args?: Record<string, unknown>) => {
-      if (command === "setup_status") {
+      if (command === "setup_status" || command === "project_open") {
         return {
           projectPath: "C:/Project",
           projectValid: true,
@@ -1267,6 +1412,7 @@ describe("App provider login cancellation", () => {
           assetsReady: true,
           defaultProvider: "antigravity",
           providers: firstRunStatuses,
+          projectOpened: command === "project_open",
           setupRequired: true,
         };
       }
@@ -1322,6 +1468,136 @@ describe("App project tools sidebar", () => {
     );
     expect(
       screen.getByRole("complementary", { name: "프로젝트 도구" }),
+    ).toBeInTheDocument();
+  });
+});
+
+describe("App center document tabs", () => {
+  it("opens workspace files as center tabs and returns to the conversation", async () => {
+    render(<App />);
+
+    // The file tree is the default right-panel tab and loads with the project.
+    const sidebar = await screen.findByRole("complementary", {
+      name: "프로젝트 도구",
+    });
+    expect(screen.getByRole("tab", { name: "파일" })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+    fireEvent.click(
+      await within(sidebar).findByRole("button", { name: "specs 폴더 펼치기" }),
+    );
+    fireEvent.click(
+      await within(sidebar).findByRole("button", { name: /combat\.md/ }),
+    );
+
+    // A center tab opens with the document body; the tree keeps its place.
+    const documentTab = await screen.findByRole("tab", {
+      name: "combat.md 문서 탭",
+    });
+    expect(documentTab).toHaveAttribute("aria-selected", "true");
+    await screen.findByText("specs/combat.md");
+    expect(screen.getByText(/문서 본문/)).toBeInTheDocument();
+    expect(
+      within(sidebar).getByRole("button", { name: /combat\.md/ }),
+    ).toHaveAttribute("aria-current", "page");
+
+    // The conversation tab still exists and reactivates without refetching.
+    fireEvent.click(screen.getByRole("tab", { name: "대화" }));
+    expect(screen.getByRole("tab", { name: "대화" })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+    expect(documentTab).toHaveAttribute("aria-selected", "false");
+
+    // Closing the document tab removes it and returns to the conversation.
+    fireEvent.click(
+      screen.getByRole("button", { name: "combat.md 탭 닫기" }),
+    );
+    expect(
+      screen.queryByRole("tab", { name: "combat.md 문서 탭" }),
+    ).not.toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: "대화" })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+  });
+
+  it("closes the active document tab with Ctrl+W", async () => {
+    render(<App />);
+    const sidebar = await screen.findByRole("complementary", {
+      name: "프로젝트 도구",
+    });
+    fireEvent.click(
+      await within(sidebar).findByRole("button", { name: "specs 폴더 펼치기" }),
+    );
+    fireEvent.click(
+      await within(sidebar).findByRole("button", { name: "combat.md" }),
+    );
+    await screen.findByRole("tab", { name: "combat.md 문서 탭" });
+
+    fireEvent.keyDown(window, { key: "w", ctrlKey: true });
+    expect(
+      screen.queryByRole("tab", { name: "combat.md 문서 탭" }),
+    ).not.toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: "대화" })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+
+    // Ctrl+W never closes the pinned conversation tab.
+    fireEvent.keyDown(window, { key: "w", ctrlKey: true });
+    expect(screen.getByRole("tab", { name: "대화" })).toBeInTheDocument();
+  });
+});
+
+describe("App document tab cap", () => {
+  it("replaces the active document tab instead of growing past the cap", async () => {
+    const baseInvoke = tauri.invoke.getMockImplementation();
+    const files = Array.from({ length: 12 }, (_, index) => ({
+      path: `specs/doc-${index}.md`,
+      size: 16,
+    }));
+    tauri.invoke.mockImplementation(async (command: string, args?: Record<string, unknown>) => {
+      if (command === "workspace_list") {
+        return { project: "Project", workspaceId: "a".repeat(64), files };
+      }
+      return baseInvoke?.(command, args);
+    });
+
+    render(<App />);
+    const sidebar = await screen.findByRole("complementary", {
+      name: "프로젝트 도구",
+    });
+    fireEvent.click(
+      await within(sidebar).findByRole("button", { name: "specs 폴더 펼치기" }),
+    );
+
+    // Open more files than the cap allows.
+    for (const { path } of files) {
+      const leaf = path.slice(path.lastIndexOf("/") + 1);
+      fireEvent.click(
+        await within(sidebar).findByRole("button", {
+          name: new RegExp(`^${leaf.replace(".", "\\.")}$`),
+        }),
+      );
+    }
+
+    const strip = screen.getByRole("tablist", { name: "열린 문서" });
+    await waitFor(() => {
+      // 1 pinned 대화 tab + at most 8 document tabs.
+      expect(within(strip).getAllByRole("tab").length).toBeLessThanOrEqual(9);
+    });
+    // The newest file is active; the previously active tab was replaced, so
+    // the earliest opened tabs survive (preview-reuse, not FIFO eviction).
+    expect(
+      screen.getByRole("tab", { name: "doc-11.md 문서 탭" }),
+    ).toHaveAttribute("aria-selected", "true");
+    expect(
+      screen.queryByRole("tab", { name: "doc-10.md 문서 탭" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.getByRole("tab", { name: "doc-0.md 문서 탭" }),
     ).toBeInTheDocument();
   });
 });

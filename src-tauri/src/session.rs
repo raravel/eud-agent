@@ -28,7 +28,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use crate::config::DataDirs;
 use crate::memory::write_atomic_bytes;
 
-const SCHEMA_VERSION: u32 = 4;
+const SCHEMA_VERSION: u32 = 5;
 const INDEX_FILE: &str = "index.json";
 static SESSION_WRITE_LOCK: Mutex<()> = Mutex::new(());
 
@@ -91,6 +91,8 @@ pub struct SessionRecord {
     pub context_state: crate::context_state::SessionContextState,
     #[serde(default)]
     pub task_state: crate::task_state::SessionTaskState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub autonomous_run: Option<crate::autonomous::AutonomousRunState>,
 }
 
 #[derive(Deserialize)]
@@ -112,6 +114,8 @@ struct SessionRecordWire {
     context_state: crate::context_state::SessionContextState,
     #[serde(default)]
     task_state: crate::task_state::SessionTaskState,
+    #[serde(default)]
+    autonomous_run: Option<crate::autonomous::AutonomousRunState>,
 }
 
 /// The on-disk `index.json` shape: latest-conversation-first metadata rows.
@@ -439,6 +443,7 @@ impl SessionStore {
             source.context_usage = None;
             source.context_state = Default::default();
             source.task_state = Default::default();
+            source.autonomous_run = None;
             source.meta.provider = source.provider_binding.provider;
             source.meta.model = source.provider_binding.model.clone();
             let bytes = match serde_json::to_vec_pretty(&source) {
@@ -550,6 +555,107 @@ impl SessionStore {
     pub fn save(&self, rec: &SessionRecord) -> anyhow::Result<()> {
         let _guard = self.lock()?;
         self.save_unlocked(rec)
+    }
+
+    /// Atomically replace only the durable autonomous lifecycle projection.
+    pub fn set_autonomous_run(
+        &self,
+        id: &str,
+        run: Option<crate::autonomous::AutonomousRunState>,
+    ) -> anyhow::Result<()> {
+        let _guard = self.lock()?;
+        let mut record = self.load_unlocked(id)?;
+        record.autonomous_run = run;
+        self.save_unlocked(&record)
+    }
+
+    pub fn update_autonomous_status(
+        &self,
+        id: &str,
+        status: crate::autonomous::AutonomousRunStatus,
+        pause_reason: Option<crate::autonomous::AutonomousPauseReason>,
+        blocker: Option<String>,
+    ) -> anyhow::Result<Option<crate::autonomous::AutonomousRunState>> {
+        let _guard = self.lock()?;
+        let mut record = self.load_unlocked(id)?;
+        let Some(run) = record.autonomous_run.as_mut() else {
+            return Ok(None);
+        };
+        let now = now_unix_millis();
+        if matches!(
+            status,
+            crate::autonomous::AutonomousRunStatus::Running
+                | crate::autonomous::AutonomousRunStatus::Pausing
+        ) {
+            run.active_started_at.get_or_insert(now);
+        } else if let Some(active_started_at) = run.active_started_at.take() {
+            run.progress.elapsed_active_millis = run
+                .progress
+                .elapsed_active_millis
+                .saturating_add(now.saturating_sub(active_started_at));
+        }
+        run.status = status;
+        run.pause_reason = pause_reason;
+        run.blocker = blocker;
+        run.updated_at = now;
+        let run = run.clone();
+        self.save_unlocked(&record)?;
+        Ok(Some(run))
+    }
+
+    /// Persist an autonomous checkpoint and its provider continuation atomically.
+    pub fn set_autonomous_checkpoint(
+        &self,
+        id: &str,
+        conversation: crate::provider::ProviderConversationState,
+        run: crate::autonomous::AutonomousRunState,
+    ) -> anyhow::Result<()> {
+        let _guard = self.lock()?;
+        let mut record = self.load_unlocked(id)?;
+        if conversation.provider() != record.provider_binding.provider {
+            anyhow::bail!("autonomous checkpoint provider does not match the session binding");
+        }
+        record.provider_binding.conversation = conversation;
+        record.autonomous_run = Some(run);
+        self.save_unlocked(&record)
+    }
+    /// Convert interrupted active work into an explicit restart pause.
+    ///
+    /// This is called once by application startup, never by ordinary store construction.
+    pub fn recover_interrupted_autonomous_runs(&self) -> anyhow::Result<usize> {
+        let _guard = self.lock()?;
+        let sessions = self.read_index().sessions;
+        let mut recovered = 0_usize;
+        for meta in sessions {
+            let mut record = self.load_unlocked(&meta.id)?;
+            let Some(run) = record.autonomous_run.as_mut() else {
+                continue;
+            };
+            if matches!(
+                run.status,
+                crate::autonomous::AutonomousRunStatus::Running
+                    | crate::autonomous::AutonomousRunStatus::Pausing
+                    | crate::autonomous::AutonomousRunStatus::WaitingInput
+            ) {
+                let now = now_unix_millis();
+                if let Some(active_started_at) = run.active_started_at.take() {
+                    run.progress.elapsed_active_millis = run
+                        .progress
+                        .elapsed_active_millis
+                        .saturating_add(now.saturating_sub(active_started_at));
+                }
+                run.status = crate::autonomous::AutonomousRunStatus::PausedAfterRestart;
+                run.pause_reason = Some(crate::autonomous::AutonomousPauseReason::Restart);
+                run.updated_at = now;
+                if run.blocker.is_none() {
+                    run.blocker =
+                        Some("앱 재시작 후 자동 변경은 명시적으로 계속해야 합니다.".to_string());
+                }
+                self.save_unlocked(&record)?;
+                recovered = recovered.saturating_add(1);
+            }
+        }
+        Ok(recovered)
     }
 
     /// Delete the record file and remove it from the index. A missing record file is
@@ -932,6 +1038,7 @@ impl SessionStore {
             panel_log: wire.panel_log,
             context_state: wire.context_state,
             task_state: wire.task_state,
+            autonomous_run: wire.autonomous_run,
         };
         if let Err(error) = record.task_state.repair_cache() {
             if !repair_task_state {
@@ -1288,6 +1395,7 @@ mod tests {
             }),
             context_state: Default::default(),
             task_state: Default::default(),
+            autonomous_run: None,
         }
     }
     fn import_fixture(
@@ -1827,13 +1935,9 @@ mod tests {
             b"accepted",
         )
         .unwrap();
-        fs::create_dir_all(dirs.session_workspaces_dir().join("project/session")).unwrap();
-        fs::write(
-            dirs.session_workspaces_dir()
-                .join("project/session/spec.md"),
-            b"stale",
-        )
-        .unwrap();
+        let legacy_sessions = dirs.workspaces_dir().join(".sessions");
+        fs::create_dir_all(legacy_sessions.join("project/session")).unwrap();
+        fs::write(legacy_sessions.join("project/session/spec.md"), b"stale").unwrap();
 
         let migrated = SessionStore::new(&dirs);
         let loaded = migrated.load(&record.meta.id).unwrap();
@@ -1853,10 +1957,7 @@ mod tests {
             .join("accepted")
             .join("req-accepted.json")
             .is_file());
-        assert!(dirs
-            .session_workspaces_dir()
-            .join("project/session/spec.md")
-            .is_file());
+        assert!(legacy_sessions.join("project/session/spec.md").is_file());
         let migrated_index: serde_json::Value =
             serde_json::from_slice(&fs::read(dirs.sessions_dir().join(INDEX_FILE)).unwrap())
                 .unwrap();
@@ -2114,6 +2215,72 @@ mod tests {
             crate::task_state::ActiveTaskProjection::default()
         );
         assert_eq!(legacy.task_state.events.len(), 2);
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn restart_recovery_pauses_active_autonomous_runs_without_changing_checkpoint() {
+        let (base, store) = store("autonomous-restart");
+        let mut record = sample_record(&new_session_id(), "장시간 작업");
+        let checkpoint = crate::provider::ProviderConversationState::Codex {
+            thread_id: Some("thread-confirmed".to_string()),
+        };
+        record.provider_binding.conversation = checkpoint.clone();
+        let mut run = crate::autonomous::AutonomousRunState::new(
+            "긴 작업".to_string(),
+            "turn-1".to_string(),
+            "req-auto".to_string(),
+            record.meta.project.clone(),
+            "revision-1".to_string(),
+            Default::default(),
+            now_unix_millis(),
+        );
+        run.last_checkpoint = Some(checkpoint.clone());
+        record.autonomous_run = Some(run);
+        store.save(&record).unwrap();
+
+        assert_eq!(store.recover_interrupted_autonomous_runs().unwrap(), 1);
+
+        let recovered = store.load(&record.meta.id).unwrap();
+        let run = recovered.autonomous_run.unwrap();
+        assert_eq!(
+            run.status,
+            crate::autonomous::AutonomousRunStatus::PausedAfterRestart
+        );
+        assert_eq!(
+            run.pause_reason,
+            Some(crate::autonomous::AutonomousPauseReason::Restart)
+        );
+        assert_eq!(run.last_checkpoint, Some(checkpoint.clone()));
+        assert_eq!(recovered.provider_binding.conversation, checkpoint);
+        assert!(run.active_started_at.is_none());
+        assert!(run.blocker.unwrap().contains("명시적으로 계속"));
+        assert_eq!(store.recover_interrupted_autonomous_runs().unwrap(), 0);
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn restart_recovery_leaves_terminal_autonomous_runs_unchanged() {
+        let (base, store) = store("autonomous-terminal");
+        let mut record = sample_record(&new_session_id(), "완료 작업");
+        let mut run = crate::autonomous::AutonomousRunState::new(
+            "완료 목표".to_string(),
+            "turn-2".to_string(),
+            "req-done".to_string(),
+            record.meta.project.clone(),
+            "revision-2".to_string(),
+            Default::default(),
+            now_unix_millis(),
+        );
+        run.status = crate::autonomous::AutonomousRunStatus::Completed;
+        record.autonomous_run = Some(run.clone());
+        store.save(&record).unwrap();
+
+        assert_eq!(store.recover_interrupted_autonomous_runs().unwrap(), 0);
+        assert_eq!(
+            store.load(&record.meta.id).unwrap().autonomous_run,
+            Some(run)
+        );
         fs::remove_dir_all(base).ok();
     }
 

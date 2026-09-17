@@ -4,15 +4,15 @@ import {
   appSettingsGet,
   appSettingsSave,
   attentionNotify,
+  euddraftCheckUpdate,
+  euddraftSettingsGet,
+  euddraftUpdate,
   providerBaseUrlSave,
   providerDefaultsSave,
   providerSettingsGet,
   sessionModelSettingsGet,
   sessionModelSettingsSave,
   compactSession,
-  euddraftCheckUpdate,
-  euddraftSettingsGet,
-  euddraftUpdate,
   isAgentTurnEndTransition,
   notificationSoundPreview,
   mentionSearch,
@@ -61,6 +61,40 @@ afterEach(() => {
   vi.useRealTimers();
 });
 
+describe("project refresh invalidation", () => {
+  it("never publishes an old source list after a same-name project switch", async () => {
+    const { invoke, listen } = makeHarness();
+    const oldList = deferred<unknown>();
+    const listStarted = deferred<void>();
+    let firstList = true;
+    const newFile = { path: "src/new.eps", ftype: "CUIEps", settable: true };
+    invoke.mockImplementation(async (command: string) => {
+      if (command === "status") return { project: "Same name", compiling: false };
+      if (command === "list") {
+        if (firstList) {
+          firstList = false;
+          listStarted.resolve();
+          return oldList.promise;
+        }
+        return { files: [newFile] };
+      }
+    });
+    const messages: ServerMessage[] = [];
+    const client = new IpcClient({ invoke, listen, onMessage: (message) => messages.push(message) });
+    await client.connect();
+    const stale = client.refresh();
+    await listStarted.promise;
+    client.invalidateProject();
+    await client.refresh();
+    oldList.resolve({ files: [{ path: "src/old.eps", ftype: "CUIEps", settable: true }] });
+    await stale;
+    expect(messages.filter((message) => message.type === "list")).toEqual([
+      { type: "list", files: [newFile] },
+    ]);
+    client.stop();
+  });
+});
+
 describe("send", () => {
   it("sends chat via invoke", async () => {
     const { invoke, listen } = makeHarness();
@@ -101,6 +135,7 @@ describe("send", () => {
       text: "hello",
       attachments: ["image-1"],
       mentions: [mention],
+      executionMode: "interactive",
     });
   });
 
@@ -219,6 +254,27 @@ describe("send", () => {
       panelLog,
     });
   });
+  it("sends reviewed harness issue ids without legacy fields", async () => {
+    const { invoke, listen } = makeHarness();
+    invoke.mockResolvedValue(undefined);
+    const client = new IpcClient({ invoke, listen, onMessage: () => {} });
+
+    await client.send({
+      type: "setup_import_e3s",
+      sourceE3s: "C:\\Legacy\\sample.e3s",
+      destination: "C:\\Work\\ImportedProject",
+      excludedImportItems: ["workspace-1", "memory-1"],
+    });
+
+    expect(invoke).toHaveBeenCalledWith("setup_import_e3s", {
+      request: {
+        sourceE3s: "C:\\Legacy\\sample.e3s",
+        destination: "C:\\Work\\ImportedProject",
+        excludedImportItems: ["workspace-1", "memory-1"],
+      },
+    });
+  });
+
 });
 
 describe("mention search", () => {
@@ -608,6 +664,7 @@ describe("setup commands", () => {
           assetsReady: false,
           defaultProvider: null,
           providers: nullableProviders,
+          projectOpened: false,
           setupRequired: true,
           error: null,
         };
@@ -633,6 +690,7 @@ describe("setup commands", () => {
       assetsReady: false,
       defaultProvider: null,
       providers: nullableProviders,
+      projectOpened: false,
       setupRequired: true,
       error: null,
     });
@@ -649,6 +707,7 @@ describe("setup commands", () => {
           euddraftValid: false,
           assetsReady: false,
           providers: setupProviders,
+          projectOpened: false,
           setupRequired: true,
           error: "invalid_project_folder",
         };
@@ -672,14 +731,13 @@ describe("setup commands", () => {
       euddraftValid: false,
       assetsReady: false,
       providers: setupProviders,
+      projectOpened: false,
       setupRequired: true,
       error: "invalid_project_folder",
     });
   });
 
-  it.each(["setup_create_project", "setup_import_e3s"] as const)(
-    "dispatches the %s response as a setup message",
-    async (command) => {
+  it("dispatches the project creation response as a setup message", async () => {
       const response = {
         projectPath: "C:\\Projects\\Native",
         projectValid: true,
@@ -688,6 +746,7 @@ describe("setup commands", () => {
         assetsReady: true,
         defaultProvider: "codex",
         providers: setupProviders,
+        projectOpened: true,
         setupRequired: false,
       };
       const { invoke, listen } = makeHarness();
@@ -699,12 +758,13 @@ describe("setup commands", () => {
         onMessage: (message) => received.push(message),
       });
 
-      await client.send({ type: command });
+      await client.send({ type: "setup_create_project" });
 
-      expect(invoke).toHaveBeenCalledWith(command, {});
+      expect(invoke).toHaveBeenCalledWith("setup_create_project", {});
       expect(received).toContainEqual({ type: "setup", ...response });
-    },
-  );
+  });
+
+
 
   it("dispatches the euddraft picker response as a setup message", async () => {
     const { invoke, listen } = makeHarness();
@@ -717,6 +777,7 @@ describe("setup commands", () => {
           euddraftValid: false,
           assetsReady: false,
           providers: setupProviders,
+          projectOpened: false,
           setupRequired: true,
           error: "invalid_euddraft_path",
         };
@@ -741,6 +802,7 @@ describe("setup commands", () => {
       euddraftValid: false,
       assetsReady: false,
       providers: setupProviders,
+      projectOpened: false,
       setupRequired: true,
       error: "invalid_euddraft_path",
     });
@@ -757,6 +819,37 @@ describe("setup commands", () => {
     await expect(projectExportE3s(invoke)).resolves.toBeNull();
     expect(invoke).toHaveBeenNthCalledWith(1, "project_export_e3s");
     expect(invoke).toHaveBeenNthCalledWith(2, "project_export_e3s");
+  });
+
+  it("sends folder selection intent and dispatches latest install snapshots", async () => {
+    const response = {
+      projectPath: "C:\\Projects\\Native",
+      projectValid: true,
+      euddraftPath: "C:\\euddraft\\euddraft.exe",
+      euddraftValid: true,
+      assetsReady: true,
+      providers: setupProviders,
+      projectOpened: false,
+      setupRequired: true,
+    };
+    const { invoke, listen } = makeHarness();
+    invoke.mockResolvedValue(response);
+    const received: ServerMessage[] = [];
+    const client = new IpcClient({
+      invoke,
+      listen,
+      onMessage: (message) => received.push(message),
+    });
+
+    await client.send({ type: "setup_pick_euddraft_path", directory: true });
+    await client.send({ type: "setup_install_euddraft" });
+
+    expect(invoke).toHaveBeenNthCalledWith(1, "setup_pick_euddraft_path", {
+      directory: true,
+    });
+    expect(invoke).toHaveBeenNthCalledWith(2, "setup_install_euddraft", {});
+    expect(received).toHaveLength(2);
+    expect(received[1]).toEqual({ type: "setup", ...response });
   });
 
   it("sends bootstrap_run without expecting a response payload", async () => {
@@ -911,6 +1004,17 @@ describe("App notification settings commands", () => {
     codexLargeContextModels: ["gpt-5.5-codex"],
   };
 
+  it("loads and saves the complete app settings payload", async () => {
+    const invoke = vi.fn().mockResolvedValue(settings);
+
+    await expect(appSettingsGet(invoke)).resolves.toEqual(settings);
+    expect(invoke).toHaveBeenCalledWith("app_settings");
+
+    invoke.mockClear();
+    await expect(appSettingsSave(settings, invoke)).resolves.toEqual(settings);
+    expect(invoke).toHaveBeenCalledWith("app_settings_save", { settings });
+  });
+
   it("loads, checks, and updates the typed euddraft settings contract", async () => {
     const response = {
       path: String.raw`C:\euddraft\euddraft.exe`,
@@ -928,17 +1032,6 @@ describe("App notification settings commands", () => {
     expect(invoke).toHaveBeenLastCalledWith("euddraft_check_update");
     await expect(euddraftUpdate(invoke)).resolves.toEqual(response);
     expect(invoke).toHaveBeenLastCalledWith("euddraft_update");
-  });
-
-  it("loads and saves the complete app settings payload", async () => {
-    const invoke = vi.fn().mockResolvedValue(settings);
-
-    await expect(appSettingsGet(invoke)).resolves.toEqual(settings);
-    expect(invoke).toHaveBeenCalledWith("app_settings");
-
-    invoke.mockClear();
-    await expect(appSettingsSave(settings, invoke)).resolves.toEqual(settings);
-    expect(invoke).toHaveBeenCalledWith("app_settings_save", { settings });
   });
 
   it("rejects malformed notification channel settings", async () => {
@@ -1028,7 +1121,7 @@ describe("Workspace commands", () => {
   const workspace = {
     project: "Example",
     workspaceId: "a".repeat(64),
-    files: [{ path: "specs/game.md", source: false, size: 12 }],
+    files: [{ path: "specs/game.md", size: 12 }],
   };
 
   it("lists the current project workspace", async () => {
@@ -1041,7 +1134,6 @@ describe("Workspace commands", () => {
     const response = {
       workspaceId: workspace.workspaceId,
       path: "specs/game.md",
-      source: false,
       content: "# Game",
     };
     const invoke = vi.fn().mockResolvedValue(response);
@@ -1074,7 +1166,7 @@ describe("Workspace commands", () => {
   it("rejects malformed file entries", async () => {
     const invoke = vi.fn().mockResolvedValue({
       ...workspace,
-      files: [{ path: "source/main.eps", source: "yes", size: 1 }],
+      files: [{ path: "specs/game.md", size: "twelve" }],
     });
     await expect(workspaceList(invoke)).rejects.toThrow(
       "invalid workspace file entry",

@@ -19,6 +19,13 @@ use std::ffi::{CString, NulError};
 use std::os::raw::c_int;
 use std::path::Path;
 
+#[cfg(windows)]
+use std::ffi::OsString;
+#[cfg(windows)]
+use std::os::windows::ffi::OsStringExt;
+#[cfg(windows)]
+use std::path::{Component, Prefix};
+
 static NATIVE_CALL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn native_call_guard() -> std::sync::MutexGuard<'static, ()> {
@@ -125,7 +132,87 @@ fn status(code: c_int) -> Result<(), IsomError> {
 /// `const char*` (UTF-8); on Windows `Path::to_str` yields the UTF-8 form.
 fn path_cstring(map_path: &Path) -> Result<CString, IsomError> {
     let s = map_path.to_str().ok_or(IsomError::InvalidArg)?;
-    Ok(CString::new(s)?)
+    if s.is_empty() {
+        return Err(IsomError::InvalidArg);
+    }
+    let validated = CString::new(s)?;
+    #[cfg(windows)]
+    {
+        drop(validated);
+        CString::new(windows_native_path(map_path, s)?).map_err(IsomError::from)
+    }
+    #[cfg(not(windows))]
+    Ok(validated)
+}
+
+#[cfg(windows)]
+fn windows_native_path(path: &Path, utf8: &str) -> Result<String, IsomError> {
+    let prefix = path.components().next();
+    if matches!(
+        prefix,
+        Some(Component::Prefix(prefix))
+            if matches!(
+                prefix.kind(),
+                Prefix::Verbatim(_)
+                    | Prefix::VerbatimUNC(_, _)
+                    | Prefix::VerbatimDisk(_)
+                    | Prefix::DeviceNS(_)
+            )
+    ) {
+        return Ok(utf8.to_owned());
+    }
+
+    let input = utf8
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let mut output = vec![0_u16; 260];
+    loop {
+        // SAFETY: [Category 8 — FFI boundary] `input` is NUL-terminated and remains
+        // alive for the call. `output` is initialized writable memory whose element
+        // count is passed exactly; the optional file-part pointer is intentionally null.
+        let written = unsafe {
+            windows_sys::Win32::Storage::FileSystem::GetFullPathNameW(
+                input.as_ptr(),
+                u32::try_from(output.len()).map_err(|_| IsomError::InvalidArg)?,
+                output.as_mut_ptr(),
+                std::ptr::null_mut(),
+            )
+        };
+        if written == 0 {
+            return Err(IsomError::InvalidArg);
+        }
+        let written = usize::try_from(written).map_err(|_| IsomError::InvalidArg)?;
+        if written < output.len() {
+            output.truncate(written);
+            break;
+        }
+        if written <= output.len() {
+            return Err(IsomError::InvalidArg);
+        }
+        output.resize(written, 0);
+    }
+
+    let normalized = OsString::from_wide(&output);
+    let normalized_path = Path::new(&normalized);
+    let normalized_utf8 = normalized_path.to_str().ok_or(IsomError::InvalidArg)?;
+    if output.len() < 260 {
+        return Ok(normalized_utf8.to_owned());
+    }
+    match normalized_path.components().next() {
+        Some(Component::Prefix(prefix)) => match prefix.kind() {
+            Prefix::Disk(_) => Ok(format!(r"\\?\{normalized_utf8}")),
+            Prefix::UNC(_, _) => normalized_utf8
+                .strip_prefix(r"\\")
+                .map(|suffix| format!(r"\\?\UNC\{suffix}"))
+                .ok_or(IsomError::InvalidArg),
+            Prefix::Verbatim(_)
+            | Prefix::VerbatimUNC(_, _)
+            | Prefix::VerbatimDisk(_)
+            | Prefix::DeviceNS(_) => Ok(normalized_utf8.to_owned()),
+        },
+        _ => Err(IsomError::InvalidArg),
+    }
 }
 
 /// RAII guard that frees a C-allocated `out` buffer via `isom_free` exactly once
@@ -794,5 +881,78 @@ mod tests {
     fn embedded_nul_path_maps_to_invalid_arg() {
         let err = chk_extract(Path::new("a\0b.scx")).expect_err("NUL path must error");
         assert!(matches!(err, IsomError::InvalidArg));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_windows_paths_apply_extended_prefix_only_when_needed() {
+        use std::path::PathBuf;
+
+        let relative = path_cstring(Path::new(r".\nested\..\output.scx")).unwrap();
+        let relative = relative.to_str().unwrap();
+        assert!(Path::new(relative).is_absolute());
+        assert!(relative.ends_with(r"\output.scx"));
+        assert!(!relative.contains(r"\nested\..\"));
+
+        let short_nonexistent = Path::new(r"C:\isom-path-control\folder\..\output.scx");
+        assert!(!short_nonexistent.exists());
+        let short_nonexistent = path_cstring(short_nonexistent).unwrap();
+        assert_eq!(
+            short_nonexistent.to_str().unwrap(),
+            r"C:\isom-path-control\output.scx"
+        );
+
+        let unc = path_cstring(Path::new(r"\\server\share\folder\..\output.scx")).unwrap();
+        assert_eq!(unc.to_str().unwrap(), r"\\server\share\output.scx");
+
+        let long_relative = PathBuf::from(r".\nested\..")
+            .join("r".repeat(140))
+            .join("s".repeat(140))
+            .join("missing.scx");
+        let long_relative = path_cstring(&long_relative).unwrap();
+        let long_relative = long_relative.to_str().unwrap();
+        assert!(long_relative.starts_with(r"\\?\"));
+        assert!(!long_relative.contains(r"\nested\..\"));
+
+        let long_nonexistent = std::env::temp_dir()
+            .join("d".repeat(140))
+            .join("e".repeat(140))
+            .join("missing.scx");
+        assert!(!long_nonexistent.exists());
+        let long_nonexistent = path_cstring(&long_nonexistent).unwrap();
+        assert!(long_nonexistent.to_str().unwrap().starts_with(r"\\?\"));
+
+        let long_unc = format!(
+            r"\\server\share\{}\{}\output.scx",
+            "u".repeat(120),
+            "v".repeat(120)
+        );
+        let long_unc = path_cstring(Path::new(&long_unc)).unwrap();
+        assert!(long_unc
+            .to_str()
+            .unwrap()
+            .starts_with(r"\\?\UNC\server\share\"));
+
+        for namespaced in [
+            r"\\?\C:\already\extended.scx",
+            r"\\?\UNC\server\share\already.scx",
+            r"\\.\pipe\already-device",
+        ] {
+            assert_eq!(
+                path_cstring(Path::new(namespaced))
+                    .unwrap()
+                    .to_str()
+                    .unwrap(),
+                namespaced
+            );
+        }
+        assert!(matches!(
+            path_cstring(Path::new("")),
+            Err(IsomError::InvalidArg)
+        ));
+        assert!(matches!(
+            path_cstring(Path::new("a\0b.scx")),
+            Err(IsomError::InvalidArg)
+        ));
     }
 }

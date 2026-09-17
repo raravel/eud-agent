@@ -208,13 +208,125 @@ describe("Map Agent live draft preview", () => {
 });
 
 describe("Map Agent conversation timeline", () => {
+  it("matches interleaved same-name tool results by call id", () => {
+    // Given: two overlapping calls with the same display name and distinct IDs.
+    let turn = createMapTurn();
+    let cursor = createMapTurnCursor();
+    const apply = (
+      kind: string,
+      detail: string,
+      data?: {
+        callId?: string;
+        args?: string;
+        result?: string;
+        status?: string;
+      },
+    ) => {
+      const next = reduceMapTurnEvent(turn, cursor, kind, detail, data);
+      turn = next.turn;
+      cursor = next.cursor;
+    };
+    apply("tool_call", "map_status", {
+      callId: "map-call-a",
+      args: '{"scope":"a"}',
+    });
+    apply("tool_call", "map_status", {
+      callId: "map-call-b",
+      args: '{"scope":"b"}',
+    });
+
+    // When: their results arrive in start order rather than stack order.
+    apply("tool_result", "map_status", {
+      callId: "map-call-a",
+      result: "alpha",
+      status: "completed",
+    });
+    apply("tool_result", "map_status", {
+      callId: "map-call-b",
+      result: "beta-error",
+      status: "failed",
+    });
+
+    // Then: each result and terminal state stays with its originating call.
+    expect(turn.tools).toMatchObject([
+      {
+        callId: "map-call-a",
+        args: '{"scope":"a"}',
+        detail: "alpha",
+        state: "done",
+      },
+      {
+        callId: "map-call-b",
+        args: '{"scope":"b"}',
+        detail: "beta-error",
+        state: "failed",
+      },
+    ]);
+  });
+
+  it("preserves current-run orphan terminals without changing a keyed call", () => {
+    let turn = createMapTurn();
+    let cursor = createMapTurnCursor();
+    for (const [kind, callId, result, status] of [
+      ["tool_call", "known", undefined, undefined],
+      ["tool_result", "unknown", "orphan-error", "failed"],
+      ["tool_result", "known", "known-result", "completed"],
+      ["tool_result", "known", "duplicate-error", "failed"],
+    ] as const) {
+      const next = reduceMapTurnEvent(turn, cursor, kind, "map_status", {
+        callId,
+        ...(result !== undefined ? { result } : {}),
+        ...(status !== undefined ? { status } : {}),
+      });
+      turn = next.turn;
+      cursor = next.cursor;
+    }
+
+    expect(turn.tools).toMatchObject([
+      { callId: "known", state: "done", detail: "known-result" },
+      { callId: "unknown", state: "failed", detail: "orphan-error" },
+    ]);
+  });
+
+  it("reports id-less starts as information and keeps id-less terminals standalone", () => {
+    const initial = createMapTurn();
+    const start = reduceMapTurnEvent(
+      initial,
+      createMapTurnCursor(),
+      "tool_call",
+      "command",
+      { callId: "", args: "cargo test" },
+    );
+    expect(start.turn.tools).toEqual([]);
+    expect(start.unpairedToolStart).toEqual({
+      name: "command",
+      args: "cargo test",
+    });
+
+    const terminal = reduceMapTurnEvent(
+      start.turn,
+      start.cursor,
+      "tool_result",
+      "command",
+      { result: "12 passed", status: "completed" },
+    );
+    expect(terminal.turn.tools).toMatchObject([
+      { name: "command", state: "done", detail: "12 passed" },
+    ]);
+  });
+
   it("archives streamed prose and tools in their arrival order", () => {
     let turn = createMapTurn();
     let cursor = createMapTurnCursor();
     const apply = (
       kind: string,
       detail: string,
-      data?: { args?: string; result?: string; status?: string },
+      data?: {
+        callId?: string;
+        args?: string;
+        result?: string;
+        status?: string;
+      },
     ) => {
       const next = reduceMapTurnEvent(turn, cursor, kind, detail, data);
       turn = next.turn;
@@ -223,8 +335,9 @@ describe("Map Agent conversation timeline", () => {
 
     apply("reasoning", "요청을 분석합니다.");
     apply("delta", "먼저 맵을 확인합니다.");
-    apply("tool_call", "map_status", { args: "{}" });
+    apply("tool_call", "map_status", { callId: "map-status", args: "{}" });
     apply("tool_result", "map_status", {
+      callId: "map-status",
       result: "loaded",
       status: "completed",
     });

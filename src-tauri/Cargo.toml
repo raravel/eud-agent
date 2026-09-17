@@ -10,13 +10,14 @@ publish = false
 # Tauri 2 idiomatic split: the app entry lives in a lib so the same code can be
 # reused by mobile targets / integration tests; main.rs is a thin shim.
 name = "eud_agent_lib"
-crate-type = ["staticlib", "cdylib", "rlib"]
+crate-type = ["rlib"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
 tauri = { version = "2", features = [] }
+tauri-plugin-single-instance = "2"
 tauri-plugin-shell = "2"
 tauri-plugin-dialog = "2"
 # Self-update (Decision 04): the updater downloads + verifies + installs the signed

@@ -175,6 +175,11 @@ pub struct EditorCompatibility {
     pub source_sha256: String,
     #[serde(default)]
     pub opaque_records: Vec<OpaqueEditorRecord>,
+    /// epScript import prefixes stripped when this project was imported from an E3S
+    /// (`import TriggerEditor.leaf` -> `import leaf`). Export restores them; the field
+    /// is additive so manifests written before it stay readable.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub editor_import_prefixes: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2113,6 +2118,13 @@ fn matches_extension(path: &str, extensions: &[&str]) -> bool {
         .is_some_and(|value| extensions.iter().any(|ext| value.eq_ignore_ascii_case(ext)))
 }
 
+/// Build-time generated shadows of the canonical source tree. They are
+/// outputs, never canonical state, so every source list/snapshot/revision/
+/// search/export surface skips them (plan D8).
+fn is_generated_artifact_dir(name: &str) -> bool {
+    name.eq_ignore_ascii_case("__epspy__") || name.eq_ignore_ascii_case("__pycache__")
+}
+
 fn collect_text_files(
     root: &Path,
     project_root: &Path,
@@ -2128,6 +2140,11 @@ fn collect_text_files(
     entries.sort_by_key(|entry| entry.file_name().to_string_lossy().to_lowercase());
     for entry in entries {
         let file_type = entry.file_type().map_err(stringify_io)?;
+        if file_type.is_dir()
+            && is_generated_artifact_dir(entry.file_name().to_string_lossy().as_ref())
+        {
+            continue;
+        }
         let metadata = fs::symlink_metadata(entry.path()).map_err(stringify_io)?;
         if file_type.is_symlink() || crate::memory::is_reparse_point(&metadata) {
             return Err(format!(
@@ -2369,6 +2386,25 @@ mod tests {
         let snapshot = project.source_snapshot().unwrap();
         assert_eq!(snapshot.files.len(), 1);
         assert_eq!(snapshot.main_file, "src/main.eps");
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn generated_artifact_dirs_stay_out_of_the_canonical_source_tree() {
+        let (root, project) = project("artifacts");
+        fs::create_dir_all(root.join("src/__epspy__")).unwrap();
+        fs::write(root.join("src/__epspy__/main.py"), b"# generated shadow\n").unwrap();
+        fs::create_dir_all(root.join("src/sub/__pycache__")).unwrap();
+        fs::write(root.join("src/sub/__pycache__/x.pyc"), b"\x00\x01").unwrap();
+
+        let reopened = NativeProject::open(&root).unwrap();
+        assert_eq!(
+            reopened.list_source_files().unwrap(),
+            vec!["src/main.eps".to_string()]
+        );
+        assert!(!reopened.has_direct_python().unwrap());
+        // Build artifacts must not perturb the project revision.
+        assert_eq!(reopened.revision().unwrap(), project.revision().unwrap());
         fs::remove_dir_all(root).ok();
     }
 

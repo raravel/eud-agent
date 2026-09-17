@@ -780,8 +780,10 @@ describe("agentEvent streaming buffers (EUD-065 / features/06)", () => {
   it("records tool_call events as tool rows with the tool name", () => {
     const store = readyWithProject();
     store.chatSent();
-    store.agentEvent("tool_call", "dat_set unit hp");
-    store.agentEvent("tool_call", "file_write main.eps");
+    store.agentEvent("tool_call", "dat_set unit hp", { callId: "call-dat" });
+    store.agentEvent("tool_call", "file_write main.eps", {
+      callId: "call-file",
+    });
     const tools = store.getState().turn.tools;
     expect(tools).toHaveLength(2);
     expect(tools[0].name).toBe("dat_set unit hp");
@@ -854,10 +856,101 @@ describe("agentEvent streaming buffers (EUD-065 / features/06)", () => {
 // text + completion status (item/completed) so the Tool cards can show what was
 // requested and what came back (live-E2E defect 2).
 describe("agentEvent tool args/result (EUD-068)", () => {
+  it("matches interleaved same-name tool results by call id", () => {
+    // Given: two overlapping calls with the same display name and distinct IDs.
+    const store = readyWithProject();
+    store.chatSent();
+    const firstCall = { callId: "call-a", args: '{"path":"a.eps"}' };
+    const secondCall = { callId: "call-b", args: '{"path":"b.eps"}' };
+    store.agentEvent("tool_call", "read_file", firstCall);
+    store.agentEvent("tool_call", "read_file", secondCall);
+
+    // When: their results arrive in start order rather than stack order.
+    store.agentEvent("tool_result", "read_file", {
+      callId: "call-a",
+      result: "alpha",
+      status: "completed",
+    });
+    store.agentEvent("tool_result", "read_file", {
+      callId: "call-b",
+      result: "beta-error",
+      status: "failed",
+    });
+
+    // Then: each result and terminal state stays with its originating call.
+    expect(store.getState().turn.tools).toMatchObject([
+      {
+        callId: "call-a",
+        args: '{"path":"a.eps"}',
+        detail: "alpha",
+        state: "done",
+      },
+      {
+        callId: "call-b",
+        args: '{"path":"b.eps"}',
+        detail: "beta-error",
+        state: "failed",
+      },
+    ]);
+  });
+
+  it("keeps unknown and duplicate keyed results from changing another call", () => {
+    const store = readyWithProject();
+    store.chatSent();
+    store.agentEvent("tool_call", "read_file", {
+      callId: "known",
+      args: '{"path":"known.eps"}',
+    });
+    store.agentEvent("tool_result", "read_file", {
+      callId: "unknown",
+      result: "orphan-error",
+      status: "failed",
+    });
+    store.agentEvent("tool_result", "read_file", {
+      callId: "known",
+      result: "known-result",
+      status: "completed",
+    });
+    store.agentEvent("tool_result", "read_file", {
+      callId: "known",
+      result: "duplicate-error",
+      status: "failed",
+    });
+
+    expect(store.getState().turn.tools).toMatchObject([
+      { callId: "known", state: "done", detail: "known-result" },
+      { callId: "unknown", state: "failed", detail: "orphan-error" },
+    ]);
+  });
+
+  it("renders id-less starts as information and id-less terminals as their own row", () => {
+    const store = readyWithProject();
+    store.chatSent();
+    store.agentEvent("tool_call", "command", {
+      callId: "",
+      args: "cargo test",
+    });
+
+    expect(store.getState().turn.tools).toEqual([]);
+    expect(store.getState().log.at(-1)).toMatchObject({
+      kind: "info",
+      text: "도구 호출 시작 — command\ncargo test",
+    });
+
+    store.agentEvent("tool_result", "command", {
+      result: "12 passed",
+      status: "completed",
+    });
+    expect(store.getState().turn.tools).toMatchObject([
+      { name: "command", state: "done", detail: "12 passed" },
+    ]);
+  });
+
   it("stores tool_call args from the data field", () => {
     const store = readyWithProject();
     store.chatSent();
     store.agentEvent("tool_call", "dat_set", {
+      callId: "call-dat-set",
       args: '{"dat":"units","objId":0,"param":"Hit Points","value":20480}',
     });
     const t = store.getState().turn.tools[0];
@@ -891,7 +984,7 @@ describe("agentEvent tool args/result (EUD-068)", () => {
     expect(t.detail).toContain("invalid dat name");
   });
 
-  it("keeps working without a data field (legacy server shape)", () => {
+  it("preserves supported id-less native observations", () => {
     const store = readyWithProject();
     store.chatSent();
     store.agentEvent("tool_call", "build_run");

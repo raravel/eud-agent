@@ -6,7 +6,7 @@
 
 Input authority:
 
-- `project.json`
+- the sole `.eap` manifest (new projects use `project.eap`)
 - `src/**/*.eps`
 - sparse `dat/*.json`
 - bundled version-matched compatibility metadata under `native/eud-editor-compat`
@@ -46,7 +46,7 @@ Requirement and TBL output follow the Editor's `WriteReqFile`/`tblReader`/`tblWr
 
 ## euddraft process
 
-`EuddraftLaunch` accepts `euddraft.exe` or `euddraft.py`, normalizes argv, and runs with:
+`EuddraftLaunch` accepts `euddraft.exe`, `euddraft.py`, or their containing folder, normalizes argv, and runs with:
 
 - explicit EDS argument and working directory;
 - bounded timeout;
@@ -56,6 +56,8 @@ Requirement and TBL output follow the Editor's `WriteReqFile`/`tblReader`/`tblWr
 - structured file/line diagnostics.
 
 The sibling `../euddraft` repository is read-only. Missing private source modules are not patched; installed euddraft is a supported configured executable.
+
+First-run bootstrap downloads and SHA-256 verifies the latest official [armoha/euddraft](https://github.com/armoha/euddraft) release when no path is configured. The complete unmodified distribution is installed under LocalAppData and its executable is passed to the same native launcher. Explicit local paths remain supported and are never replaced by automatic installation.
 
 The Settings **Compile** category reads the configured path and, for managed
 installs, the persisted release tag. An explicit check compares that tag with

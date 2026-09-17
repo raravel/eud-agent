@@ -68,4 +68,16 @@ describe("bootstrapView", () => {
   it("floors decimal percentages", () => {
     expect(bootstrapView(12.9, "x").pct).toBe(12);
   });
+
+  it("maps managed euddraft installer details to Korean progress labels", () => {
+    expect(bootstrapView(12, "checking latest euddraft release").label).toBe(
+      "최신 euddraft 릴리스를 확인하는 중…",
+    );
+    expect(bootstrapView(42, "downloading euddraft").label).toBe(
+      "euddraft 다운로드 중…",
+    );
+    expect(bootstrapView(80, "extracting euddraft").label).toBe(
+      "euddraft 압축 해제 중…",
+    );
+  });
 });

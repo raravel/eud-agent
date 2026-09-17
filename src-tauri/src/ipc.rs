@@ -124,6 +124,12 @@ pub struct ChatRequest {
     /// Ordered backend-created resource snapshots echoed by the panel.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mentions: Vec<crate::mentions::MentionInstance>,
+    /// Explicit execution mode. Existing clients remain interactive by default.
+    #[serde(default)]
+    pub execution_mode: crate::autonomous::ExecutionMode,
+    /// Optional autonomous safety limits. Ignored for interactive execution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub autonomous_policy: Option<crate::autonomous::AutonomousRunPolicy>,
 }
 
 /// `plan_feedback` command input.
@@ -311,7 +317,6 @@ pub struct WorkspaceListResponse {
 pub struct WorkspaceReadResponse {
     pub workspace_id: String,
     pub path: String,
-    pub source: bool,
     pub content: String,
 }
 
@@ -579,6 +584,8 @@ pub async fn chat(text: String, attachments: Vec<String>) -> Result<(), String> 
         text,
         attachments,
         mentions: Vec::new(),
+        execution_mode: crate::autonomous::ExecutionMode::Interactive,
+        autonomous_policy: None,
     };
     Ok(())
 }
@@ -894,12 +901,9 @@ pub async fn workspace_read(
         let content = manager
             .read_file(&workspace_id, &path)
             .map_err(|error| error.to_string())?;
-        let source = path == crate::workspace::SOURCE_DIR
-            || path.starts_with(&format!("{}/", crate::workspace::SOURCE_DIR));
         Ok(WorkspaceReadResponse {
             workspace_id,
             path,
-            source,
             content,
         })
     })
@@ -1086,7 +1090,8 @@ mod tests {
             json!({
                 "clientTurnId": "11111111-1111-4111-8111-111111111111",
                 "text": "hi",
-                "attachments": ["d61bb417-728e-4db9-8d81-2b366201aa89"]
+                "attachments": ["d61bb417-728e-4db9-8d81-2b366201aa89"],
+                "executionMode": "interactive"
             }),
         );
 
@@ -1526,6 +1531,7 @@ mod tests {
         ));
         let mut expected = value;
         expected.as_object_mut().unwrap().remove("attachments");
+        expected["executionMode"] = json!("interactive");
         assert_json(&chat, expected);
 
         assert!(serde_json::from_value::<ipc::ChatRequest>(json!({
@@ -1553,7 +1559,8 @@ mod tests {
             &chat,
             json!({
                 "clientTurnId": "66666666-6666-4666-8666-666666666666",
-                "text": "hi"
+                "text": "hi",
+                "executionMode": "interactive"
             }),
         );
 

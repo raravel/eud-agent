@@ -10,7 +10,7 @@ export function ConnectionNotice(_props: ConnectionNoticeProps) {
     >
       <span className="font-medium">Native 프로젝트를 열 수 없습니다.</span>{" "}
       <span className="text-amber-100/90">
-        project.json과 프로젝트 경로를 확인해 주세요.
+        .eap 파일과 프로젝트 경로를 확인해 주세요.
       </span>
     </section>
   );

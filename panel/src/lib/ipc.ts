@@ -37,13 +37,16 @@ export type {
 
 import {
   isServerMessage,
+  isSetupMessage,
   type ClientMessage,
   type LedgerEntry,
   type BackendSessionActivity,
   type MentionSearchRequest,
   type MentionSearchResponse,
+  type RecentProject,
   type ServerMessage,
   type ServerMessageType,
+  type SetupMessage,
   type WikiMessage,
   type WorkspaceFileEntry,
   type WorkspaceListResponse,
@@ -147,6 +150,7 @@ const PUSH_EVENT_TYPES = [
   "progress",
   "error",
   "session_activity",
+  "autonomous_run",
   "status",
   "memory",
   "memory_saved",
@@ -193,6 +197,7 @@ export class IpcClient {
   private projectUp = false;
   private projectProbed = false;
   private lastProject: string | undefined;
+  private projectGeneration = 0;
 
   constructor(options: IpcClientOptions) {
     this.invoke =
@@ -236,10 +241,12 @@ export class IpcClient {
    */
   async refresh(): Promise<boolean> {
     if (!this.active) return false;
+    const generation = this.projectGeneration;
     let status: unknown;
     try {
       status = await this.invoke("status");
     } catch (error) {
+      if (generation !== this.projectGeneration) return false;
       if (!this.active) return false;
       const wasUp = this.projectUp;
       this.projectUp = false;
@@ -251,6 +258,7 @@ export class IpcClient {
       return false;
     }
     if (!this.active) return false;
+    if (generation !== this.projectGeneration) return false;
     this.dispatchPayload("status", status);
     const project =
       isObject(status) && typeof status.project === "string"
@@ -263,8 +271,10 @@ export class IpcClient {
     if (needList) {
       try {
         const list = await this.invoke("list");
+        if (generation !== this.projectGeneration) return false;
         if (this.active) this.dispatchPayload("list", list);
       } catch (error) {
+        if (generation !== this.projectGeneration) return false;
         if (this.active) {
           const detail = formatError(error);
           if (detail.toLowerCase().includes(NO_PROJECT_MARKER)) {
@@ -327,6 +337,10 @@ export class IpcClient {
           text: msg.text,
           attachments: msg.attachments,
           mentions: msg.mentions ?? [],
+          executionMode: msg.executionMode ?? "interactive",
+          ...(msg.autonomousPolicy
+            ? { autonomousPolicy: msg.autonomousPolicy }
+            : {}),
         };
       case "plan_feedback":
         return {
@@ -352,6 +366,10 @@ export class IpcClient {
         };
       case "cancel":
         return { sessionId: msg.sessionId };
+      case "autonomous_pause":
+      case "autonomous_resume":
+      case "autonomous_stop":
+        return { sessionId: msg.sessionId };
       case "conversation_rewind":
         return { sessionId: msg.sessionId, panelLog: msg.panelLog };
       case "status":
@@ -365,12 +383,22 @@ export class IpcClient {
       case "setup_status":
         return {};
       case "setup_pick_project_path":
-        return {};
+        return msg.directory === undefined ? {} : { directory: msg.directory };
       case "setup_create_project":
         return {};
-      case "setup_import_e3s":
-        return {};
+      case "setup_import_e3s": {
+        const request: Record<string, unknown> = {
+          sourceE3s: msg.sourceE3s,
+          destination: msg.destination,
+        };
+        if (msg.excludedImportItems !== undefined) {
+          request.excludedImportItems = msg.excludedImportItems;
+        }
+        return { request };
+      }
       case "setup_pick_euddraft_path":
+        return msg.directory === undefined ? {} : { directory: msg.directory };
+      case "setup_install_euddraft":
         return {};
       case "bootstrap_run":
         return {};
@@ -400,7 +428,8 @@ export class IpcClient {
         msg.type === "setup_pick_project_path" ||
         msg.type === "setup_create_project" ||
         msg.type === "setup_import_e3s" ||
-        msg.type === "setup_pick_euddraft_path"
+        msg.type === "setup_pick_euddraft_path" ||
+        msg.type === "setup_install_euddraft"
       ) {
         this.dispatchPayload("setup", result);
       }
@@ -439,6 +468,13 @@ export class IpcClient {
         // ignore - listener may already be removed
       }
     }
+  }
+  /** Force the next refresh to reload status and source data after a project switch. */
+  invalidateProject(): void {
+    this.projectGeneration += 1;
+    this.projectUp = false;
+    this.projectProbed = false;
+    this.lastProject = undefined;
   }
 }
 
@@ -511,7 +547,6 @@ function toWorkspaceList(value: unknown): WorkspaceListResponse {
     (entry): entry is WorkspaceFileEntry =>
       isObject(entry) &&
       typeof entry.path === "string" &&
-      typeof entry.source === "boolean" &&
       typeof entry.size === "number" &&
       (entry.state === undefined || typeof entry.state === "string") &&
       (entry.revision === undefined || typeof entry.revision === "number"),
@@ -526,7 +561,7 @@ function toWorkspaceList(value: unknown): WorkspaceListResponse {
   };
 }
 
-/** Refresh the source mirror and list the current project's real Codex workspace. */
+/** List the current project's accepted, project-local harness documents. */
 export async function workspaceList(
   invoke: InvokeFn = tauriInvoke,
 ): Promise<WorkspaceListResponse> {
@@ -544,7 +579,6 @@ export async function workspaceRead(
     !isObject(value) ||
     value.workspaceId !== workspaceId ||
     value.path !== path ||
-    typeof value.source !== "boolean" ||
     typeof value.content !== "string"
   ) {
     throw new Error("invalid workspace read response");
@@ -644,6 +678,84 @@ function toSessionModelSettings(value: unknown): SessionModelSettings {
         : (value.selectedReasoning as unknown as ReasoningSelection),
   };
 }
+
+function parseSetupResponse(value: unknown, command: string): SetupMessage {
+  if (isObject(value)) {
+    const candidate = { ...value, type: "setup" };
+    if (isSetupMessage(candidate)) return candidate;
+  }
+  throw new Error(`invalid response from ${command}`);
+}
+
+function parseRecentProject(value: unknown): RecentProject {
+  if (
+    !isObject(value) ||
+    typeof value.name !== "string" ||
+    typeof value.path !== "string" ||
+    typeof value.lastOpenedAt !== "number" ||
+    typeof value.available !== "boolean"
+  ) {
+    throw new Error("invalid response from project_recent_list");
+  }
+  return {
+    name: value.name,
+    path: value.path,
+    lastOpenedAt: value.lastOpenedAt,
+    available: value.available,
+  };
+}
+
+export async function setupProjectOpen(
+  path: string,
+  invoke: InvokeFn = tauriInvoke,
+): Promise<SetupMessage> {
+  return parseSetupResponse(await invoke("project_open", { path }), "project_open");
+}
+
+export async function setupPickProjectPath(
+  directory = false,
+  invoke: InvokeFn = tauriInvoke,
+): Promise<SetupMessage> {
+  return parseSetupResponse(
+    await invoke("setup_pick_project_path", directory ? { directory: true } : {}),
+    "setup_pick_project_path",
+  );
+}
+export async function setupCreateProject(
+  invoke: InvokeFn = tauriInvoke,
+): Promise<SetupMessage> {
+  return parseSetupResponse(await invoke("setup_create_project"), "setup_create_project");
+}
+
+export async function projectRecentList(
+  invoke: InvokeFn = tauriInvoke,
+): Promise<RecentProject[]> {
+  const value = await invoke("project_recent_list");
+  if (!Array.isArray(value)) throw new Error("invalid response from project_recent_list");
+  return value.map(parseRecentProject);
+}
+
+export async function projectRecentRemove(
+  path: string,
+  invoke: InvokeFn = tauriInvoke,
+): Promise<RecentProject[]> {
+  const value = await invoke("project_recent_remove", { path });
+  if (!Array.isArray(value)) throw new Error("invalid response from project_recent_remove");
+  return value.map(parseRecentProject);
+}
+
+export async function projectTakeLaunchRequest(
+  invoke: InvokeFn = tauriInvoke,
+): Promise<string | null> {
+  const value = await invoke("project_take_launch_request");
+  if (value === null) return null;
+  if (isObject(value) && typeof value.path === "string" && value.path.trim() !== "") {
+    return value.path;
+  }
+  throw new Error("invalid response from project_take_launch_request");
+}
+
+
 
 export interface E3sExportResponse {
   path: string;
@@ -841,21 +953,6 @@ function toAppSettings(value: unknown): AppSettings {
   return value as unknown as AppSettings;
 }
 
-/** Fetch app-owned preferences for the extensible settings dialog. */
-export async function appSettingsGet(
-  invoke: InvokeFn = tauriInvoke,
-): Promise<AppSettings> {
-  return toAppSettings(await invoke("app_settings"));
-}
-
-/** Persist app-owned preferences without replacing unrelated core config. */
-export async function appSettingsSave(
-  settings: AppSettings,
-  invoke: InvokeFn = tauriInvoke,
-): Promise<AppSettings> {
-  return toAppSettings(await invoke("app_settings_save", { settings }));
-}
-
 function toEuddraftSettings(value: unknown): EuddraftSettings {
   if (
     !isObject(value) ||
@@ -898,6 +995,21 @@ export async function euddraftUpdate(
   invoke: InvokeFn = tauriInvoke,
 ): Promise<EuddraftSettings> {
   return toEuddraftSettings(await invoke("euddraft_update"));
+}
+
+/** Fetch app-owned preferences for the extensible settings dialog. */
+export async function appSettingsGet(
+  invoke: InvokeFn = tauriInvoke,
+): Promise<AppSettings> {
+  return toAppSettings(await invoke("app_settings"));
+}
+
+/** Persist app-owned preferences without replacing unrelated core config. */
+export async function appSettingsSave(
+  settings: AppSettings,
+  invoke: InvokeFn = tauriInvoke,
+): Promise<AppSettings> {
+  return toAppSettings(await invoke("app_settings_save", { settings }));
 }
 
 /** Play the native Windows sound used by attention notifications. */

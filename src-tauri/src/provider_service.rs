@@ -607,6 +607,7 @@ impl ProviderService {
                         None,
                         crate::provider_runtime::WorkspaceAccess::Read,
                         true,
+                        None,
                     )
                     .await
                     .map_err(|_| "provider_catalog_unavailable".to_string())?;

@@ -28,6 +28,7 @@ import { toast } from "sonner";
 import { Toaster } from "@/components/ui/sonner";
 import { Header, type RagState } from "@/components/Header";
 import { SettingsDialog } from "@/components/SettingsDialog";
+import { E3sImportDialog } from "@/setup/E3sImportDialog";
 import { ConversationLog } from "@/components/ConversationLog";
 import { ChangesetView } from "@/components/ChangesetView";
 import { HarnessStatusCard } from "@/components/HarnessStatusCard";
@@ -35,6 +36,12 @@ import { AskCard } from "@/components/AskCard";
 import { PlanView } from "@/components/PlanView";
 import { InstructionBox, type ChatPayload } from "@/components/InstructionBox";
 import { ConnectionNotice } from "@/components/ConnectionNotice";
+import {
+  DocumentTabStrip,
+  type DocumentTab,
+  type DocumentTabId,
+} from "@/components/DocumentTabStrip";
+import { WorkspaceDocument } from "@/components/WorkspaceDocument";
 import {
   SessionSidebar,
   type SessionActivity,
@@ -58,6 +65,9 @@ import {
   isAgentTurnEndTransition,
   mentionSearch,
   notificationSoundPreview,
+  projectRecentList,
+  projectRecentRemove,
+  projectTakeLaunchRequest,
   providerApiKeySave,
   providerBaseUrlSave,
   providerSettingsGet,
@@ -71,6 +81,9 @@ import {
   providerStatusList,
   sessionModelSettingsGet,
   sessionModelSettingsSave,
+  setupCreateProject,
+  setupPickProjectPath,
+  setupProjectOpen,
   setupProviderSelect,
   projectExportE3s,
   wikiGet,
@@ -79,6 +92,7 @@ import {
   workspaceRead,
   workspaceSearch,
   type AskAnswer,
+  type AutonomousRunState,
   type AppSettings,
   type EuddraftSettings,
   type HarnessJobView,
@@ -92,6 +106,7 @@ import {
   type ProviderProgressEvent,
   type ProviderStatus,
   type ReasoningSelection,
+  type RecentProject,
   type ServerMessage,
   type SessionMeta,
   type SessionModelSettings,
@@ -100,13 +115,21 @@ import {
   type WorkspaceFileEntry,
   type WorkspaceListResponse,
 } from "@/lib/ipc";
+import {
+  formatImportIssueReason,
+  importE3sProject,
+  pickE3sImportDestination,
+  pickE3sSource,
+} from "@/lib/projectImport";
 import { progressLabel } from "@/lib/progress";
 import { useProjectIdentityEffect } from "@/lib/projectIdentity";
+import { formatPathForDisplay } from "@/lib/utils";
 import {
   bootstrapView,
   type BootstrapView,
 } from "@/setup/bootstrap";
 import { SetupScreen } from "@/setup/SetupScreen";
+import { ProjectLauncher } from "@/setup/ProjectLauncher";
 import { UpdateNotice } from "@/components/UpdateNotice";
 import { createUpdater, type UpdateHandle } from "@/setup/update";
 import { PROVIDER_LABELS } from "@/providers/providerCopy";
@@ -125,6 +148,16 @@ const PROVIDER_POLL_TIMEOUT_MS = 300000;
  * list is reloaded only after recovery or a project identity change.
  */
 const PROJECT_REFRESH_MS = 2000;
+
+/** Maximum simultaneously open workspace document tabs in the center column. */
+const MAX_DOCUMENT_TABS = 8;
+
+/** Per-tab fetch state; contents persist across tab switches. */
+interface DocumentTabState {
+  content: string | null;
+  loading: boolean;
+  error: string | null;
+}
 
 interface BootstrapState {
   active: boolean;
@@ -189,6 +222,7 @@ interface SessionSlot {
   store: PanelStore;
   persisted: boolean;
   activity: SessionActivity;
+  autonomousRun: AutonomousRunState | null;
   unsubscribe?: () => void;
   saveTimer?: number;
   observedLog: readonly LogEntry[];
@@ -248,6 +282,13 @@ function syncProjectState(target: PanelStore, source: PanelStore): void {
 }
 
 
+function projectOpenError(error: unknown): string {
+  const detail = String(error).replace(/^Error:\s*/, "").replace(/^[a-z_]+:\s*/, "");
+  return /[가-힣]/.test(detail)
+    ? detail
+    : `프로젝트를 열지 못했습니다. 프로젝트 파일과 원본 맵의 위치를 확인해 주세요. (${detail})`;
+}
+
 export default function App() {
   const projectStore = useMemo(() => createPanelStore(), []);
   const sessionsRef = useRef(new Map<string, SessionSlot>());
@@ -282,6 +323,16 @@ export default function App() {
   // counter while loading; a 1s tick re-renders so the seconds advance.
   const [ragState, setRagState] = useState<RagState>("idle");
   const ragStartRef = useRef<number | null>(null);
+  const [launcherVisible, setLauncherVisible] = useState(true);
+  const [recentProjects, setRecentProjects] = useState<RecentProject[]>([]);
+  const [recentLoading, setRecentLoading] = useState(true);
+  const [launcherBusy, setLauncherBusy] = useState(false);
+  const [launcherError, setLauncherError] = useState<string | null>(null);
+  const [activeProjectPath, setActiveProjectPath] = useState<string | null>(null);
+  const [pendingLaunchPath, setPendingLaunchPath] = useState<string | null>(null);
+  const [launchInitializing, setLaunchInitializing] = useState(true);
+  const launchQueueRef = useRef<string[]>([]);
+  const launchBusyRef = useRef(false);
   const [ragElapsedSec, setRagElapsedSec] = useState(0);
   const [bootstrap, setBootstrap] = useState<BootstrapState>(() => ({
     active: false,
@@ -291,6 +342,10 @@ export default function App() {
   const bootstrapActiveRef = useRef(false);
   const [setup, setSetup] = useState<SetupMessage | null>(null);
   const bootstrapRunningRef = useRef(false);
+  const euddraftActionRef = useRef(false);
+  const [euddraftAction, setEuddraftAction] = useState<
+    "file" | "folder" | "install" | null
+  >(null);
   const [providerStatuses, setProviderStatuses] = useState<ProviderStatus[]>([]);
   const [providerModels, setProviderModels] = useState<
     Partial<Record<ProviderId, ProviderModel[]>>
@@ -347,16 +402,37 @@ export default function App() {
   const [projectSetupAction, setProjectSetupAction] = useState<
     "open" | "create" | "import" | "export" | null
   >(null);
+  const [e3sImportOpen, setE3sImportOpen] = useState(false);
+  const projectDialogOpenRef = useRef(false);
+  projectDialogOpenRef.current = e3sImportOpen;
   const [sessionSidebarCollapsed, setSessionSidebarCollapsed] = useState(false);
   const [projectSidebarOpen, setProjectSidebarOpen] = useState(true);
   const [projectPanelTab, setProjectPanelTab] =
-    useState<ProjectPanelTab>("wiki");
+    useState<ProjectPanelTab>("workspace");
   const [workspaceData, setWorkspaceData] =
     useState<WorkspaceListResponse | null>(null);
-  const [workspacePath, setWorkspacePath] = useState<string | null>(null);
-  const [workspaceContent, setWorkspaceContent] = useState<string | null>(null);
   const [workspaceLoading, setWorkspaceLoading] = useState(false);
   const [workspaceError, setWorkspaceError] = useState<string | null>(null);
+  // Center-column document tabs (Orca-style: tree right, document center). The
+  // tab list and per-path contents live here so switching tabs never refetches
+  // and each tab keeps its own loading/error state.
+  const [openDocumentTabs, setOpenDocumentTabs] = useState<string[]>([]);
+  const [activeCenterTab, setActiveCenterTab] = useState<DocumentTabId>("chat");
+  const [documentStates, setDocumentStates] = useState<
+    Record<string, DocumentTabState>
+  >({});
+  // A read that completes after its tab was closed/replaced reinserts an
+  // invisible entry; prune those so per-path contents cannot accumulate.
+  useEffect(() => {
+    setDocumentStates((current) => {
+      const open = new Set(openDocumentTabs);
+      const orphans = Object.keys(current).filter((path) => !open.has(path));
+      if (orphans.length === 0) return current;
+      const next = { ...current };
+      for (const path of orphans) delete next[path];
+      return next;
+    });
+  }, [documentStates, openDocumentTabs]);
   // Self-update banner state: the pending update (null until found) and a
   // session-scoped "나중에" dismissal. The check fires once (guarded by the ref).
   const [update, setUpdate] = useState<UpdateHandle | null>(null);
@@ -381,6 +457,10 @@ export default function App() {
   const [messageActionBusy, setMessageActionBusy] = useState(false);
   const [harnessActionJobId, setHarnessActionJobId] = useState<string | null>(null);
   const messageActionBusyRef = useRef(false);
+  const projectCompilingRef = useRef(false);
+  const selectedPhaseRef = useRef(state.phase);
+  projectCompilingRef.current = projectState.compiling;
+  selectedPhaseRef.current = state.phase;
 
   const bumpSessions = useCallback(() => {
     setSessionRevision((revision) => revision + 1);
@@ -450,6 +530,7 @@ export default function App() {
       const existing = sessionsRef.current.get(record.id);
       if (existing) {
         existing.meta = record;
+        existing.autonomousRun = record.autonomousRun ?? null;
         if (record.contextUsage !== undefined) {
           existing.store.contextUsageReceived(record.contextUsage);
         }
@@ -471,6 +552,7 @@ export default function App() {
         persisted: true,
         observedLog: sessionStore.getState().log,
         activity: record.pendingRequestIds.length > 0 ? "review" : "idle",
+        autonomousRun: record.autonomousRun ?? null,
         planOpen: true,
         changesetOpen: true,
         harnessJobs: [],
@@ -526,10 +608,12 @@ export default function App() {
       persisted: false,
       observedLog: sessionStore.getState().log,
       activity: "idle",
+      autonomousRun: null,
       planOpen: true,
       changesetOpen: true,
       harnessJobs: [],
     };
+
     sessionsRef.current.set(slot.id, slot);
     attachSlot(slot);
     setSelectedSessionId(slot.id);
@@ -537,6 +621,34 @@ export default function App() {
     bumpSessions();
     return slot;
   }, [attachSlot, bumpSessions, projectStore]);
+  const clearProjectSessions = useCallback(() => {
+    for (const slot of sessionsRef.current.values()) {
+      slot.unsubscribe?.();
+      if (slot.saveTimer !== undefined) {
+        window.clearTimeout(slot.saveTimer);
+        if (slot.persisted) {
+          void invoke("session_update_log", {
+            id: slot.id,
+            panelLog: serializePanelLog(slot.store.getState().log),
+          }).catch(() => toast.error("이전 프로젝트의 대화 저장에 실패했습니다."));
+        }
+      }
+    }
+    sessionsRef.current.clear();
+    loadedProjectRef.current = null;
+    setSelectedSessionId(null);
+    selectedSessionIdRef.current = null;
+    projectStore.applyStatus({ compiling: false, project: "" });
+    projectStore.applyList({ files: undefined });
+    projectStore.projectAvailabilityChanged(false);
+    setWorkspaceData(null);
+    setWorkspaceError(null);
+    setOpenDocumentTabs([]);
+    setDocumentStates({});
+    setActiveCenterTab("chat");
+    setEditDraft(null);
+    bumpSessions();
+  }, [bumpSessions, projectStore]);
 
   useEffect(() => {
     selectedSessionIdRef.current = selectedSessionId;
@@ -815,12 +927,49 @@ export default function App() {
           } else if (msg.error?.startsWith("e3s_import_failed:")) {
             toast.error("E3S 프로젝트를 가져오지 못했습니다.");
           }
+          if (msg.projectOpened) {
+            if (msg.importIssues?.length) {
+              toast.warning(`하네스 자료 ${msg.importIssues.length}개를 옮기지 못했습니다.`, {
+                description: (
+                  <div className="max-h-60 overflow-y-auto break-all">
+                    <p>가져올 수 있는 자료는 프로젝트 안으로 복사했고 원본은 보존했습니다.</p>
+                    <ul className="mt-2 space-y-2">
+                      {msg.importIssues.map((issue) => (
+                        <li key={issue.id}>
+                          <div className="font-mono text-xs">{issue.path}</div>
+                          <div>{formatImportIssueReason(issue.reason)}</div>
+                          <details>
+                            <summary className="cursor-pointer">제외 사유 상세</summary>
+                            <p className="whitespace-pre-wrap text-xs">{issue.reason}</p>
+                          </details>
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                ),
+                duration: Infinity,
+                closeButton: true,
+              });
+            }
+            clearProjectSessions();
+            setActiveProjectPath(msg.projectPath);
+            setLauncherVisible(false);
+            setLauncherError(null);
+            setSettingsOpen(false);
+            const client = clientRef.current;
+            client?.invalidateProject();
+            setProjectPollEnabled(false);
+            void projectRecentList()
+              .then(setRecentProjects)
+              .catch(() => {
+                // Recent history is advisory; an open project remains usable.
+              });
+          }
           if (!msg.setupRequired) {
             bootstrapActiveRef.current = false;
             setBootstrap((prev) =>
               prev.active ? { ...prev, active: false } : prev,
             );
-            setProjectPollEnabled(true);
           }
           break;
         case "progress": {
@@ -831,10 +980,18 @@ export default function App() {
               void clientRef.current?.send({ type: "setup_status" });
               break;
             }
+            if (msg.detail === "euddraft configured") {
+              // The installer announces readiness before its caller persists
+              // the selected path. Refresh only after this post-save marker.
+              bootstrapActiveRef.current = false;
+              setBootstrap((prev) => ({ ...prev, active: false, error: null }));
+              void clientRef.current?.send({ type: "setup_status" });
+              break;
+            }
             const view = bootstrapView(msg.pct, msg.detail);
-            bootstrapActiveRef.current = true;
+            bootstrapActiveRef.current = view.phase !== "error";
             setBootstrap({
-              active: true,
+              active: view.phase !== "error",
               view,
               error: view.phase === "error" ? view.label : null,
             });
@@ -884,6 +1041,14 @@ export default function App() {
               target.agentEvent(msg.kind, msg.detail, msg.data),
             );
           }
+          break;
+        }
+        case "autonomous_run": {
+          const targetSlot = sessionsRef.current.get(msg.sessionId);
+          if (!targetSlot) break;
+          const { type: _type, sessionId: _sessionId, ...run } = msg;
+          targetSlot.autonomousRun = run;
+          bumpSessions();
           break;
         }
         case "context_usage":
@@ -1031,7 +1196,79 @@ export default function App() {
           break;
       }
     },
-    [bumpSessions, projectStore],
+    [bumpSessions, clearProjectSessions, projectStore],
+  );
+
+  const projectSwitchBlocked = useCallback(() => {
+    if (projectCompilingRef.current) return "빌드 또는 맵 작업이 진행 중입니다. 작업이 끝난 뒤 프로젝트를 전환해 주세요.";
+    if (selectedPhaseRef.current === "thinking" || selectedPhaseRef.current === "plan_review" || selectedPhaseRef.current === "changeset_review") {
+      return "현재 세션이 작업 중이거나 검토를 기다리고 있습니다. 세션을 마친 뒤 프로젝트를 전환해 주세요.";
+    }
+    for (const slot of sessionsRef.current.values()) {
+      if (slot.activity !== "idle" && slot.activity !== "error") {
+        return "진행 중인 세션 작업이 있습니다. 작업이 끝난 뒤 프로젝트를 전환해 주세요.";
+      }
+      if (slot.harnessJobs.some((job) =>
+        job.status === "waiting_runtime" ||
+        job.status === "pending" ||
+        job.status === "running" ||
+        job.status === "review"
+      )) {
+        return "맵 또는 하네스 작업이 진행 중입니다. 작업이 끝난 뒤 프로젝트를 전환해 주세요.";
+      }
+    }
+    return null;
+  }, []);
+
+  const processLaunchQueue = useCallback(async () => {
+    if (launchBusyRef.current) return;
+    if (projectSetupBusyRef.current || projectDialogOpenRef.current) {
+      setLauncherError("프로젝트 선택 또는 가져오기를 마친 뒤 대기 중인 열기 요청을 다시 시도해 주세요.");
+      return;
+    }
+    launchBusyRef.current = true;
+    setLauncherBusy(true);
+    try {
+      while (launchQueueRef.current.length > 0) {
+        const path = launchQueueRef.current[0];
+        setPendingLaunchPath(path);
+        const blocked = projectSwitchBlocked();
+        if (blocked) {
+          setLauncherError(blocked);
+          setLauncherVisible(true);
+          break;
+        }
+        try {
+          const response = await setupProjectOpen(path);
+          if (!response.projectOpened) {
+            throw new Error(response.error ?? "프로젝트 파일과 원본 맵의 위치를 확인해 주세요.");
+          }
+          onMessage(response);
+          launchQueueRef.current.shift();
+          setPendingLaunchPath(launchQueueRef.current[0] ?? null);
+          setLauncherError(null);
+        } catch (error) {
+          setLauncherError(projectOpenError(error));
+          setLauncherVisible(true);
+          break;
+        }
+      }
+    } finally {
+      launchBusyRef.current = false;
+      setLauncherBusy(false);
+    }
+  }, [onMessage, projectSwitchBlocked]);
+
+  const enqueueLaunch = useCallback(
+    (path: string) => {
+      const trimmed = path.trim();
+      if (!trimmed) return;
+      if (!launchQueueRef.current.includes(trimmed)) launchQueueRef.current.push(trimmed);
+      setPendingLaunchPath(launchQueueRef.current[0]);
+      setLauncherVisible(true);
+      void processLaunchQueue();
+    },
+    [processLaunchQueue],
   );
 
   // Boot the IPC client once. Project lifecycle state fans out to all session
@@ -1067,25 +1304,76 @@ export default function App() {
       },
     });
     clientRef.current = client;
-    void client.connect().then(() =>
-      client.send({ type: "setup_status" }).then((ok) => {
-        if (!ok) setProjectPollEnabled(true);
-      }),
-    );
+    let cancelled = false;
+    let unlisten: (() => void) | undefined;
+    let draining = false;
+    let drainRequested = false;
+    const drainLaunchRequest = async () => {
+      drainRequested = true;
+      if (draining) return;
+      draining = true;
+      try {
+        do {
+          drainRequested = false;
+          while (!cancelled) {
+            const path = await projectTakeLaunchRequest();
+            if (!path) break;
+            enqueueLaunch(path);
+          }
+        } while (drainRequested && !cancelled);
+      } catch (error) {
+        if (!cancelled) setLauncherError(`프로젝트 열기 요청을 확인하지 못했습니다: ${String(error)}`);
+      } finally {
+        draining = false;
+      }
+    };
+    void client.connect().then(async () => {
+      if (cancelled) return;
+      try {
+        unlisten = await listen("project-open-requested", drainLaunchRequest);
+        if (cancelled) {
+          unlisten();
+          return;
+        }
+        await client.send({ type: "setup_status" });
+        await drainLaunchRequest();
+      } catch (error) {
+        if (!cancelled) setLauncherError(`프로젝트 시작 정보를 불러오지 못했습니다: ${String(error)}`);
+      } finally {
+        if (!cancelled) setLaunchInitializing(false);
+      }
+    });
     return () => {
+      cancelled = true;
+      unlisten?.();
       client.stop();
       clientRef.current = null;
     };
-  }, [onMessage, projectStore, syncPendingAsk]);
+  }, [enqueueLaunch, onMessage, projectStore, syncPendingAsk]);
+  useEffect(() => {
+    let active = true;
+    void projectRecentList()
+      .then((projects) => {
+        if (active) setRecentProjects(projects);
+      })
+      .catch(() => {
+        if (active) setLauncherError("최근 프로젝트를 불러오지 못했습니다. 프로젝트 파일을 직접 열거나 앱을 다시 시작해 주세요.");
+      })
+      .finally(() => {
+        if (active) setRecentLoading(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, []);
 
-  // `session_loaded` is a SIGNAL only (features/sessions.md): the core emits it
   // after a session_open reconnect completes. The panel already hydrated from
   // the command result, so this only pulls a fresh native project snapshot.
   useEffect(() => {
     let unlisten: (() => void) | undefined;
     let cancelled = false;
     void listen("session_loaded", () => {
-      void clientRef.current?.refresh();
+      if (activeProjectPath) void clientRef.current?.refresh();
     }).then((fn) => {
       if (cancelled) fn();
       else unlisten = fn;
@@ -1094,8 +1382,11 @@ export default function App() {
       cancelled = true;
       unlisten?.();
     };
-  }, []);
+  }, [activeProjectPath]);
 
+  useEffect(() => {
+    setProjectPollEnabled(activeProjectPath !== null && setup !== null && !setup.setupRequired);
+  }, [activeProjectPath, setup]);
 
   // Refresh native project status after setup. The in-process transport remains
   // open if the project path disappears, and availability recovers automatically.
@@ -1113,16 +1404,16 @@ export default function App() {
       cancelled = true;
       window.clearInterval(id);
     };
-  }, [projectPollEnabled]);
+  }, [projectPollEnabled, activeProjectPath]);
 
   // Populate the persistent left sidebar with sessions owned by the current
   // native project. Loading a row is read-only and never steals the execution lane.
   useEffect(() => {
     const project = projectState.project.trim();
-    if (!projectState.hasProject || !project || loadedProjectRef.current === project) {
+    if (!projectPollEnabled || !projectState.hasProject || !project || loadedProjectRef.current === activeProjectPath) {
       return;
     }
-    loadedProjectRef.current = project;
+    loadedProjectRef.current = activeProjectPath;
     let cancelled = false;
     void invoke<SessionMeta[]>("session_list")
       .then((rows) =>
@@ -1178,6 +1469,8 @@ export default function App() {
       cancelled = true;
     };
   }, [
+    activeProjectPath,
+    projectPollEnabled,
     bumpSessions,
     createDraftSlot,
     projectState.hasProject,
@@ -1186,27 +1479,42 @@ export default function App() {
     syncPendingAsk,
   ]);
 
-  // Once native project and euddraft paths are valid, download any missing assets.
+  // A blank euddraft path opts into the managed latest-release installer. A
+  // non-empty invalid path is an explicit user choice and must never be
+  // overwritten by this effect.
   useEffect(() => {
-    if (
-      !setup?.setupRequired ||
-      !setup.projectValid ||
-      !setup.euddraftValid ||
-      setup.assetsReady
-    )
-      return;
+    if (!activeProjectPath || !setup?.setupRequired || !setup.projectValid) return;
+    const euddraftMissing = setup.euddraftPath.trim().length === 0;
+    if (!euddraftMissing && (!setup.euddraftValid || setup.assetsReady)) return;
     if (bootstrapRunningRef.current) return;
+    const client = clientRef.current;
+    if (!client) return;
     bootstrapRunningRef.current = true;
-    void clientRef.current?.send({ type: "bootstrap_run" }).then(() => {
-      bootstrapRunningRef.current = false;
-    });
-  }, [setup]);
+    void client
+      .send({ type: "bootstrap_run" })
+      .then((ok) => {
+        if (!ok && !bootstrapActiveRef.current) {
+          const view = bootstrapView(null, "error: euddraft 자동 설치 명령이 실패했습니다.");
+          setBootstrap({ active: false, view, error: view.label });
+        }
+      })
+      .finally(() => {
+        bootstrapRunningRef.current = false;
+      });
+  }, [
+    activeProjectPath,
+    setup?.setupRequired,
+    setup?.projectValid,
+    setup?.euddraftPath,
+    setup?.euddraftValid,
+    setup?.assetsReady,
+  ]);
 
   // Once first-run setup is satisfied, check for an app self-update exactly once.
   // Non-blocking: an updater error (offline, no release yet) just leaves the banner
   // hidden — it never gates the panel.
   useEffect(() => {
-    if (!setup || setup.setupRequired) return;
+    if (!setup || setup.setupRequired || launcherVisible) return;
     if (updateCheckedRef.current) return;
     updateCheckedRef.current = true;
     void updater
@@ -1217,7 +1525,7 @@ export default function App() {
       .catch(() => {
         /* no release / offline — no banner */
       });
-  }, [setup, updater]);
+  }, [setup, updater, launcherVisible]);
   const handleMentionSearch = useCallback(
     (request: MentionSearchRequest) => mentionSearch(request),
     [],
@@ -1352,6 +1660,7 @@ export default function App() {
           text: payload.text,
           attachments: payload.attachments.map((attachment) => attachment.id),
           mentions: payload.mentions,
+          executionMode: payload.executionMode,
         });
         if (!sent) {
           slot.store.errorReceived("요청을 처리하지 못했습니다.");
@@ -1359,6 +1668,7 @@ export default function App() {
             text: payload.text,
             attachments: [...payload.attachments],
             mentions: payload.mentions.map((mention) => ({ ...mention })),
+            executionMode: payload.executionMode,
             clientTurnId,
           });
         }
@@ -1367,6 +1677,7 @@ export default function App() {
           text: payload.text,
           attachments: [...payload.attachments],
           mentions: payload.mentions.map((mention) => ({ ...mention })),
+          executionMode: payload.executionMode,
           clientTurnId,
         });
         slot.store.errorReceived(String(error));
@@ -1405,6 +1716,41 @@ export default function App() {
       setMessageActionBusy(false);
     }
   }, [selectedSlot]);
+
+  const sendAutonomousControl = useCallback(
+    (type: "autonomous_pause" | "autonomous_resume" | "autonomous_stop") => {
+      const slot = selectedSlot;
+      if (!slot?.persisted) return;
+      void clientRef.current
+        ?.send({ type, sessionId: slot.id })
+        .then((sent) => {
+          if (!sent) {
+            slot.store.log(
+              "error",
+              type === "autonomous_pause"
+                ? "장시간 작업을 일시 중지하지 못했습니다."
+                : type === "autonomous_resume"
+                  ? "장시간 작업을 계속하지 못했습니다."
+                  : "장시간 작업을 중단하지 못했습니다.",
+            );
+          }
+        });
+    },
+    [selectedSlot],
+  );
+
+  const handleAutonomousPause = useCallback(
+    () => sendAutonomousControl("autonomous_pause"),
+    [sendAutonomousControl],
+  );
+  const handleAutonomousResume = useCallback(
+    () => sendAutonomousControl("autonomous_resume"),
+    [sendAutonomousControl],
+  );
+  const handleAutonomousStop = useCallback(
+    () => sendAutonomousControl("autonomous_stop"),
+    [sendAutonomousControl],
+  );
 
   const handleEditMessage = useCallback(
     async (entry: LogEntry) => {
@@ -1562,10 +1908,6 @@ export default function App() {
     [bumpSessions, createDraftSlot],
   );
 
-
-  // Retry re-runs the backend download command (it re-fetches the release
-  // manifest and skips already-verified assets), replacing the old full-reload
-  // fallback from before bootstrap_run existed.
   const handleBootstrapRetry = useCallback(() => {
     if (bootstrapRunningRef.current) return;
     setBootstrap((prev) => ({
@@ -1573,35 +1915,101 @@ export default function App() {
       error: null,
       view: bootstrapView(null, undefined),
     }));
+    const client = clientRef.current;
+    if (!client) return;
     bootstrapRunningRef.current = true;
-    void clientRef.current?.send({ type: "bootstrap_run" }).then(() => {
-      bootstrapRunningRef.current = false;
-    });
+    void client
+      .send({ type: "bootstrap_run" })
+      .then((ok) => {
+        if (!ok) {
+          const view = bootstrapView(null, "error: 설치 명령이 실패했습니다.");
+          setBootstrap({ active: false, view, error: view.label });
+        }
+      })
+      .finally(() => {
+        bootstrapRunningRef.current = false;
+      });
   }, []);
+
 
   const runProjectSetupAction = useCallback(
     (
-      action: "open" | "create" | "import",
-      command:
-        | "setup_pick_project_path"
-        | "setup_create_project"
-        | "setup_import_e3s",
+      action: "open" | "create",
+      command: "setup_pick_project_path" | "setup_create_project",
+      directory = false,
     ) => {
-      if (projectSetupBusyRef.current) return;
-      const client = clientRef.current;
-      if (!client) return;
+      const blocked = projectSwitchBlocked();
+      if (blocked) {
+        toast.error(blocked);
+        return;
+      }
+      if (projectSetupBusyRef.current || launchBusyRef.current) return;
+      launchQueueRef.current = [];
+      setPendingLaunchPath(null);
+      setLauncherError(null);
       projectSetupBusyRef.current = true;
       setProjectSetupAction(action);
-      void client
-        .send({ type: command })
-        .then((ok) => (ok ? client.refresh() : false))
+      const request =
+        command === "setup_pick_project_path"
+          ? setupPickProjectPath(directory)
+          : setupCreateProject();
+      void request
+        .then((response) => {
+          onMessage(response);
+          if (!response.projectOpened && response.error) {
+            setLauncherError(projectOpenError(response.error));
+            setLauncherVisible(true);
+          }
+        })
+        .catch((error) => {
+          setLauncherError(projectOpenError(error));
+          setLauncherVisible(true);
+        })
         .finally(() => {
           projectSetupBusyRef.current = false;
           setProjectSetupAction(null);
+          if (launchQueueRef.current.length > 0) void processLaunchQueue();
         });
     },
-    [],
+    [onMessage, processLaunchQueue, projectSwitchBlocked],
   );
+
+  const openE3sImport = useCallback(() => {
+    if (projectSetupBusyRef.current || launchBusyRef.current) return;
+    const blocked = projectSwitchBlocked();
+    if (blocked) {
+      toast.error(blocked);
+      return;
+    }
+    setSettingsOpen(false);
+    setE3sImportOpen(true);
+  }, [projectSwitchBlocked]);
+
+  const handleE3sImported = useCallback(
+    (nextSetup: SetupMessage) => {
+      if (!nextSetup.projectOpened) {
+        setLauncherError(projectOpenError(nextSetup.error ?? "프로젝트 가져오기가 취소되었습니다."));
+
+        return;
+      }
+      onMessage(nextSetup);
+    },
+    [onMessage],
+  );
+  const handleProjectSwitch = useCallback(() => {
+    const blocked = projectSwitchBlocked();
+    if (blocked) {
+      toast.error(blocked);
+      return;
+    }
+    setLauncherError(null);
+    setLauncherVisible(true);
+    setRecentLoading(true);
+    void projectRecentList()
+      .then(setRecentProjects)
+      .catch(() => setLauncherError("최근 프로젝트를 불러오지 못했습니다. 프로젝트 파일을 직접 열어 주세요."))
+      .finally(() => setRecentLoading(false));
+  }, [projectSwitchBlocked]);
 
   const handleProjectExport = useCallback(() => {
     if (projectSetupBusyRef.current) return;
@@ -1625,14 +2033,44 @@ export default function App() {
       });
   }, []);
 
-  const handlePickEuddraftPath = useCallback(() => {
-    void clientRef.current?.send({ type: "setup_pick_euddraft_path" });
+  const handlePickEuddraftPath = useCallback((directory = false) => {
+    if (euddraftActionRef.current) return;
+    const client = clientRef.current;
+    if (!client) return;
+    euddraftActionRef.current = true;
+    setEuddraftAction(directory ? "folder" : "file");
+    void client
+      .send({ type: "setup_pick_euddraft_path", directory })
+      .finally(() => {
+        euddraftActionRef.current = false;
+        setEuddraftAction(null);
+      });
   }, []);
 
+  const handleInstallEuddraft = useCallback(() => {
+    if (euddraftActionRef.current || bootstrapRunningRef.current) return;
+    const client = clientRef.current;
+    if (!client) return;
+    euddraftActionRef.current = true;
+    setEuddraftAction("install");
+    setBootstrap({ active: true, view: bootstrapView(null), error: null });
+    void client
+      .send({ type: "setup_install_euddraft" })
+      .then((ok) => {
+        if (!ok && !bootstrapActiveRef.current) {
+          const view = bootstrapView(null, "error: 최신 euddraft 설치 명령이 실패했습니다.");
+          setBootstrap({ active: false, view, error: view.label });
+        }
+      })
+      .finally(() => {
+        euddraftActionRef.current = false;
+        setEuddraftAction(null);
+      });
+
+  }, []);
   const refreshSetup = useCallback(() => {
     void clientRef.current?.send({ type: "setup_status" });
   }, []);
-
   const handleEuddraftCheck = useCallback(async () => {
     setEuddraftSettingsBusy("check");
     setEuddraftSettingsError(undefined);
@@ -2137,24 +2575,92 @@ export default function App() {
     [runHarnessAction],
   );
 
-  const handleWorkspaceSelect = useCallback(
-    async (file: WorkspaceFileEntry, data = workspaceData) => {
-      if (!data) return;
-      setWorkspacePath(file.path);
-      setWorkspaceContent(null);
-      setWorkspaceError(null);
-      setWorkspaceLoading(true);
+  const loadDocumentTab = useCallback(
+    async (workspaceId: string, path: string) => {
+      setDocumentStates((current) => ({
+        ...current,
+        [path]: { content: null, loading: true, error: null },
+      }));
       try {
-        const response = await workspaceRead(data.workspaceId, file.path);
-        setWorkspaceContent(response.content);
+        const response = await workspaceRead(workspaceId, path);
+        setDocumentStates((current) => ({
+          ...current,
+          [path]: { content: response.content, loading: false, error: null },
+        }));
       } catch (error) {
-        setWorkspaceError(`파일을 열지 못했습니다: ${String(error)}`);
-      } finally {
-        setWorkspaceLoading(false);
+        setDocumentStates((current) => ({
+          ...current,
+          [path]: {
+            content: null,
+            loading: false,
+            error: `파일을 열지 못했습니다: ${String(error)}`,
+          },
+        }));
       }
     },
-    [workspaceData],
+    [],
   );
+
+  // Opening a file activates its center tab; at the tab cap the active
+  // document tab is replaced (editor-style preview reuse) rather than
+  // silently dropping the request.
+  const openDocumentTab = useCallback(
+    (file: WorkspaceFileEntry) => {
+      const data = workspaceData;
+      if (!data) return;
+      setActiveCenterTab(file.path);
+      setOpenDocumentTabs((current) => {
+        if (current.includes(file.path)) return current;
+        if (current.length < MAX_DOCUMENT_TABS) return [...current, file.path];
+        const replaced = current.indexOf(activeCenterTab);
+        const next = [...current];
+        next[replaced === -1 ? 0 : replaced] = file.path;
+        return next;
+      });
+      void loadDocumentTab(data.workspaceId, file.path);
+    },
+    [activeCenterTab, loadDocumentTab, workspaceData],
+  );
+
+  const closeDocumentTab = useCallback(
+    (id: DocumentTabId) => {
+      if (id === "chat") return;
+      const index = openDocumentTabs.indexOf(id);
+      if (index !== -1) {
+        const next = openDocumentTabs.filter((path) => path !== id);
+        setOpenDocumentTabs(next);
+        if (activeCenterTab === id) {
+          setActiveCenterTab(next[index] ?? next[index - 1] ?? "chat");
+        }
+      }
+      setDocumentStates((current) => {
+        if (!(id in current)) return current;
+        const next = { ...current };
+        delete next[id];
+        return next;
+      });
+    },
+    [activeCenterTab, openDocumentTabs],
+  );
+
+  const closeAllDocumentTabs = useCallback(() => {
+    setOpenDocumentTabs([]);
+    setDocumentStates({});
+    setActiveCenterTab("chat");
+  }, []);
+
+  // Ctrl+W closes the active document tab (the pinned conversation tab stays).
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (!(event.ctrlKey && !event.metaKey && !event.altKey && !event.shiftKey)) return;
+      if (event.key.toLowerCase() !== "w") return;
+      if (activeCenterTab === "chat") return;
+      event.preventDefault();
+      closeDocumentTab(activeCenterTab);
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [activeCenterTab, closeDocumentTab]);
 
   const handleWorkspaceSearch = useCallback(
     async (query: string) => {
@@ -2165,32 +2671,31 @@ export default function App() {
     [workspaceData],
   );
 
+  // Refreshes the tree, drops tabs whose files disappeared, and reloads the
+  // contents of the remaining open tabs so accepted agent writes show up.
   const handleWorkspaceRefresh = useCallback(async () => {
     setWorkspaceLoading(true);
     setWorkspaceError(null);
     try {
       const data = await workspaceList();
       setWorkspaceData(data);
-      const selected =
-        data.files.find((file) => file.path === workspacePath) ??
-        data.files.find((file) => file.path === "specs/index.md") ??
-        data.files.find((file) => !file.source && file.path.toLowerCase().endsWith(".md")) ??
-        data.files[0] ??
-        null;
-      if (selected) {
-        setWorkspacePath(selected.path);
-        const response = await workspaceRead(data.workspaceId, selected.path);
-        setWorkspaceContent(response.content);
-      } else {
-        setWorkspacePath(null);
-        setWorkspaceContent(null);
+      const available = new Set(data.files.map((file) => file.path));
+      const nextTabs = openDocumentTabs.filter((path) => available.has(path));
+      if (nextTabs.length !== openDocumentTabs.length) {
+        setOpenDocumentTabs(nextTabs);
+        if (activeCenterTab !== "chat" && !available.has(activeCenterTab)) {
+          setActiveCenterTab(nextTabs[0] ?? "chat");
+        }
+      }
+      for (const path of nextTabs) {
+        void loadDocumentTab(data.workspaceId, path);
       }
     } catch (error) {
       setWorkspaceError(`워크스페이스를 불러오지 못했습니다: ${String(error)}`);
     } finally {
       setWorkspaceLoading(false);
     }
-  }, [workspacePath]);
+  }, [activeCenterTab, loadDocumentTab, openDocumentTabs]);
 
   const handleProjectPanelTab = useCallback(
     async (tab: ProjectPanelTab) => {
@@ -2239,15 +2744,17 @@ export default function App() {
   );
 
   useProjectIdentityEffect(
-    projectState.hasProject && projectState.project ? projectState.project : null,
+    projectState.hasProject ? activeProjectPath : null,
     (projectIdentity) => {
       setWorkspaceData(null);
-      setWorkspacePath(null);
-      setWorkspaceContent(null);
       setWorkspaceError(null);
-      if (projectIdentity && projectPanelTab === "wiki") {
-        void handleProjectPanelTab("wiki");
-      }
+      setOpenDocumentTabs([]);
+      setDocumentStates({});
+      setActiveCenterTab("chat");
+      if (!projectIdentity) return;
+      // The file tree is the default project tab, so its data loads with the
+      // project; the wiki/memory ledgers load on first tab selection.
+      void handleWorkspaceRefresh();
     },
   );
 
@@ -2330,51 +2837,131 @@ export default function App() {
     messageActionBusy ||
     selectedSlot?.activity === "running_write" ||
     state.phase === "changeset_review";
+  const documentTabs = useMemo<DocumentTab[]>(
+    () => [
+      { id: "chat", label: "대화" },
+      ...openDocumentTabs.map((path) => ({
+        id: path,
+        label: path.slice(path.lastIndexOf("/") + 1),
+      })),
+    ],
+    [openDocumentTabs],
+  );
+  const handleCenterTabSelect = useCallback((id: DocumentTabId) => {
+    setActiveCenterTab(id);
+  }, []);
+  if (launcherVisible) {
+    return (
+      <>
+        <ProjectLauncher
+          recent={recentProjects}
+          loading={recentLoading}
+          busy={launchInitializing || launcherBusy || projectSetupAction !== null}
+          busyLabel={launchInitializing ? "프로젝트 시작 정보를 확인하는 중…" : "프로젝트 작업을 처리하는 중…"}
+          pendingPath={pendingLaunchPath}
+          onRetryPending={() => void processLaunchQueue()}
+          onDismissPending={() => {
+            launchQueueRef.current = [];
+            setPendingLaunchPath(null);
+            setLauncherError(null);
+          }}
+          error={launcherError}
+          onOpenRecent={(path) => {
+            launchQueueRef.current = [];
+            enqueueLaunch(path);
+          }}
+          onOpenPicker={(directory = false) =>
+            runProjectSetupAction("open", "setup_pick_project_path", directory)
+          }
+          onCreate={() => runProjectSetupAction("create", "setup_create_project")}
+          onImport={openE3sImport}
+          onRemoveRecent={(path) => {
+            if (projectSetupBusyRef.current || launchBusyRef.current) return;
+            projectSetupBusyRef.current = true;
+            setLauncherBusy(true);
+            void projectRecentRemove(path)
+              .then(setRecentProjects)
+              .catch((error) =>
+                setLauncherError(`최근 프로젝트를 제거하지 못했습니다: ${String(error)}`),
+              )
+              .finally(() => {
+                projectSetupBusyRef.current = false;
+                setLauncherBusy(false);
+              });
+          }}
+          onCancel={activeProjectPath ? () => setLauncherVisible(false) : undefined}
+        />
+        <Toaster position="bottom-right" richColors closeButton />
+        <E3sImportDialog
+          open={e3sImportOpen}
+          onOpenChange={setE3sImportOpen}
+          pickSource={pickE3sSource}
+          pickDestination={pickE3sImportDestination}
+          importProject={importE3sProject}
+          onImported={handleE3sImported}
+        />
+      </>
+    );
+  }
 
   if (setup?.setupRequired || bootstrap.active) {
+
     return (
-      <SetupScreen
-        projectValid={setup?.projectValid ?? true}
-        euddraftValid={setup?.euddraftValid ?? true}
-        pickError={setup?.error ?? null}
-        onPickProject={() =>
-          runProjectSetupAction("open", "setup_pick_project_path")
-        }
-        onCreateProject={() =>
-          runProjectSetupAction("create", "setup_create_project")
-        }
-        onImportE3s={() =>
-          runProjectSetupAction("import", "setup_import_e3s")
-        }
-        projectAction={projectSetupAction === "export" ? null : projectSetupAction}
-        onPickEuddraft={handlePickEuddraftPath}
-        view={bootstrap.view}
-        error={bootstrap.error}
-        onRetry={handleBootstrapRetry}
-        assetsReady={setup?.assetsReady ?? false}
-        defaultProvider={setup?.defaultProvider ?? undefined}
-        providers={setup?.providers ?? providerStatuses}
-        models={providerModels}
-        selectedModels={providerSelectedModels}
-        selectedReasoning={providerSelectedReasoning}
-        versions={providerVersions}
-        channels={providerChannels}
-        baseUrls={providerBaseUrls}
-        hasApiKeys={providerHasApiKeys}
-        busyProvider={providerBusy}
-        loginPending={providerLoginPending}
-        providerErrors={providerErrors}
-        onSelectProvider={handleProviderSelect}
-        onProviderInstall={handleProviderInstall}
-        onProviderLogin={handleProviderLogin}
-        onProviderLoginCancel={handleProviderLoginCancel}
-        onProviderImport={handleProviderImport}
-        onProviderApiKey={handleProviderApiKey}
-        onProviderBaseUrl={handleProviderBaseUrl}
-        onProviderLogout={handleProviderLogout}
-        onProviderRefresh={handleProviderRefresh}
-        onProviderModelChange={handleProviderModelChange}
-      />
+      <>
+        <SetupScreen
+          projectValid={setup?.projectValid ?? true}
+          euddraftPath={setup?.euddraftPath ?? ""}
+          euddraftValid={setup?.euddraftValid ?? true}
+          pickError={setup?.error ?? null}
+          onPickProject={() =>
+            runProjectSetupAction("open", "setup_pick_project_path")
+          }
+          onCreateProject={() =>
+            runProjectSetupAction("create", "setup_create_project")
+          }
+          onImportE3s={openE3sImport}
+          projectAction={projectSetupAction === "export" ? null : projectSetupAction}
+          onPickEuddraft={handlePickEuddraftPath}
+          onInstallEuddraft={handleInstallEuddraft}
+          euddraftAction={euddraftAction}
+          bootstrapActive={bootstrap.active}
+          view={bootstrap.view}
+          error={bootstrap.error}
+          onRetry={handleBootstrapRetry}
+          assetsReady={setup?.assetsReady ?? false}
+          defaultProvider={setup?.defaultProvider ?? undefined}
+          providers={setup?.providers ?? providerStatuses}
+          models={providerModels}
+          selectedModels={providerSelectedModels}
+          selectedReasoning={providerSelectedReasoning}
+          versions={providerVersions}
+          channels={providerChannels}
+          baseUrls={providerBaseUrls}
+          hasApiKeys={providerHasApiKeys}
+          busyProvider={providerBusy}
+          loginPending={providerLoginPending}
+          providerErrors={providerErrors}
+          onSelectProvider={handleProviderSelect}
+          onProviderInstall={handleProviderInstall}
+          onProviderLogin={handleProviderLogin}
+          onProviderLoginCancel={handleProviderLoginCancel}
+          onProviderImport={handleProviderImport}
+          onProviderApiKey={handleProviderApiKey}
+          onProviderBaseUrl={handleProviderBaseUrl}
+          onProviderLogout={handleProviderLogout}
+          onProviderRefresh={handleProviderRefresh}
+          onProviderModelChange={handleProviderModelChange}
+        />
+        <Toaster position="bottom-right" richColors closeButton />
+        <E3sImportDialog
+          open={e3sImportOpen}
+          onOpenChange={setE3sImportOpen}
+          pickSource={pickE3sSource}
+          pickDestination={pickE3sImportDestination}
+          importProject={importE3sProject}
+          onImported={handleE3sImported}
+        />
+      </>
     );
   }
 
@@ -2405,7 +2992,20 @@ export default function App() {
           projectPanelOpen={projectSidebarOpen}
           onProjectPanelToggle={handleProjectPanelToggle}
           onSettingsOpen={() => setSettingsOpen(true)}
+          onProjectSwitch={handleProjectSwitch}
         />
+        {pendingLaunchPath && (
+          <div role="status" className="flex items-center gap-3 border-b border-border bg-card px-4 py-2 text-sm">
+            <span className="min-w-0 flex-1 truncate" title={formatPathForDisplay(pendingLaunchPath)}>대기 중인 프로젝트: {formatPathForDisplay(pendingLaunchPath)}</span>
+            <button
+              type="button"
+              className="shrink-0 rounded-md px-3 py-2 text-primary outline-none hover:bg-accent focus-visible:ring-2 focus-visible:ring-ring"
+              onClick={() => setLauncherVisible(true)}
+            >
+              열기 요청 확인
+            </button>
+          </div>
+        )}
         <SettingsDialog
           open={settingsOpen}
           settings={appSettings}
@@ -2445,12 +3045,18 @@ export default function App() {
           onProjectCreate={() =>
             runProjectSetupAction("create", "setup_create_project")
           }
-          onProjectImport={() =>
-            runProjectSetupAction("import", "setup_import_e3s")
-          }
+          onProjectImport={openE3sImport}
           onProjectExport={handleProjectExport}
           onEuddraftCheck={handleEuddraftCheck}
           onEuddraftUpdate={handleEuddraftUpdate}
+        />
+        <E3sImportDialog
+          open={e3sImportOpen}
+          onOpenChange={setE3sImportOpen}
+          pickSource={pickE3sSource}
+          pickDestination={pickE3sImportDestination}
+          importProject={importE3sProject}
+          onImported={handleE3sImported}
         />
 
         {update && !updateDismissed && (
@@ -2460,9 +3066,26 @@ export default function App() {
             onLater={() => setUpdateDismissed(true)}
           />
         )}
-
         {!projectState.projectAvailable && <ConnectionNotice />}
 
+        <DocumentTabStrip
+          tabs={documentTabs}
+          activeTab={activeCenterTab}
+          onSelect={handleCenterTabSelect}
+          onClose={closeDocumentTab}
+          onCloseAll={closeAllDocumentTabs}
+        />
+
+        <div
+          id="document-panel-chat"
+          role="tabpanel"
+          aria-labelledby="document-tab-chat"
+          className={
+            activeCenterTab === "chat"
+              ? "flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden"
+              : "hidden"
+          }
+        >
         {selectedSlot && (
           <div className="flex min-h-10 items-center gap-2 border-b border-border bg-card/20 px-4 text-xs">
             <span className="min-w-0 flex-1 truncate font-medium text-foreground">
@@ -2555,6 +3178,10 @@ export default function App() {
           onStageAttachment={stageAttachment}
           onDiscardAttachment={discardAttachment}
           onCancel={handleCancel}
+          autonomousRun={selectedSlot?.autonomousRun ?? null}
+          onAutonomousPause={handleAutonomousPause}
+          onAutonomousResume={handleAutonomousResume}
+          onAutonomousStop={handleAutonomousStop}
           draft={editDraft}
           actionBusy={selectedActionBusy}
           modelSettings={promptModelSettings}
@@ -2570,6 +3197,42 @@ export default function App() {
             }
           }}
         />
+        </div>
+
+        {activeCenterTab !== "chat" &&
+          workspaceData &&
+          openDocumentTabs.map((path) => {
+            const documentState = documentStates[path] ?? {
+              content: null,
+              loading: false,
+              error: "파일을 찾을 수 없습니다. 파일 트리에서 다시 열어 주세요.",
+            };
+            return (
+              <div
+                key={path}
+                id={`document-panel-${path}`}
+                role="tabpanel"
+                aria-labelledby={`document-tab-${path}`}
+                className={
+                  activeCenterTab === path
+                    ? "flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden"
+                    : "hidden"
+                }
+              >
+                <WorkspaceDocument
+                  workspace={workspaceData}
+                  file={
+                    workspaceData.files.find((file) => file.path === path) ??
+                    null
+                  }
+                  content={documentState.content}
+                  loading={documentState.loading}
+                  error={documentState.error}
+                  onSelect={openDocumentTab}
+                />
+              </div>
+            );
+          })}
       </main>
 
       <ProjectSidebar
@@ -2579,8 +3242,9 @@ export default function App() {
         wiki={projectState.wikiData ?? { version: 1, entries: {} }}
         memory={projectState.memory}
         workspace={workspaceData}
-        workspacePath={workspacePath}
-        workspaceContent={workspaceContent}
+        workspaceSelectedPath={
+          activeCenterTab !== "chat" ? activeCenterTab : null
+        }
         workspaceLoading={workspaceLoading}
         workspaceError={workspaceError}
         onTabChange={(tab) => void handleProjectPanelTab(tab)}
@@ -2589,7 +3253,7 @@ export default function App() {
         onMemoryTabSelected={projectStore.memoryTabSelected}
         onMemoryEdited={projectStore.memoryEdited}
         onMemorySave={handleMemorySave}
-        onWorkspaceSelect={handleWorkspaceSelect}
+        onWorkspaceSelect={openDocumentTab}
         onWorkspaceSearch={handleWorkspaceSearch}
         onWorkspaceRefresh={handleWorkspaceRefresh}
       />

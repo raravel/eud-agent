@@ -1,12 +1,12 @@
 # Feature: Concurrent multi-active sessions
 
 eud-agent persists named conversations with one immutable `ProviderBinding` per session. Each
-session owns its panel log, exact provider driver/conversation state, cancellation generation,
+session owns its panel log, ProviderRuntime/conversation state, cancellation generation,
 tool/ASK/build state, working workspace, and immutable event route. Commands within one
 session are serialized; different sessions/providers may overlap read turns.
 
 Write intent creates a concurrent session registration immediately. Only operations that touch
-shared editor/map/memory/build state and canonical workspace acceptance enter a short per-project
+shared native project/map/memory/build state and canonical workspace acceptance enter a short per-project
 transaction. A changeset under review does not block another session from editing or building.
 
 ## Durable session records
@@ -103,9 +103,15 @@ Startup removes stale ids only when the matching journal is already in the accep
 A missing live journal without that archive remains an explicit error on its owning session, but
 it never prevents `session_list`, healthy session hydration, or restoration of other valid pending
 journals in the same project. `panelLog` is opaque to Rust.
-`contextUsage` is absent until Codex emits `thread/tokenUsage/updated`; `last.totalTokens` is the
-active context size, while `total` is cumulative for the thread. The latest snapshot is persisted
+`contextUsage` is absent until the provider reports usage. Codex's `thread/tokenUsage/updated`
+supplies active-context `last` and cumulative thread `total`; other adapters retain their observed
+usage meaning without inventing missing values. The latest snapshot is persisted
 outside `panelLog`, so unopened rows retain usage across an app restart.
+
+For a Codex native foreground turn, the runtime records the official nonempty `turn/started`
+`turn.id` before accepting `thread/tokenUsage/updated`. It persists usage only when the event's
+`turnId` equals that active native turn ID; usage from a prior or stale turn is ignored. The normal
+`SessionRuntimeEventSink` remains strict, so this correlation happens before session event routing.
 
 `contextState` persists the instruction epoch, static-baseline fingerprint, and only the last
 successfully delivered model cursor. `taskState.events` is append-only; `leafId` selects the
@@ -116,6 +122,17 @@ schema cutover.
 
 Attachment bytes remain under `%localappdata%\eud-agent\attachments\objects\` and are bound to
 the session on send.
+
+E3S import preserves locally associated EPS and Map conversation history as new native sessions.
+Historical EPS project keys may include surrounding single quotes; matching uses the full path,
+never the basename. Map history uses the legacy canonical full-path hash. Copies retain names,
+provider/model/reasoning settings, conversation timestamps, and opaque panel logs. Fresh session
+IDs separate them from original records; provider connections, pending review IDs, usage/context/
+task state, journals, and map candidates are not carried over. Original session records remain
+unchanged. Import validates the index and each matching record before publication. Unreadable
+records and occupied native histories are scoped omissions, not a veto on healthy independent
+records/kinds. Explicit setup consent is required for current omissions; rollback removes only
+its own unchanged records/index entries and preserves unrelated concurrent session saves.
 
 ## Panel log
 
@@ -139,7 +156,7 @@ Transient turn, plan, changeset, activity, wiki, and connection state is not per
 `plan_feedback` sends the same value, and a transport retry reuses it. Editing and resending creates
 a new id for the new branch. Hydrated legacy rows may omit the field.
 
-`conversation_rewind` replaces the log with the selected prefix, clears the thread id, pending
+`conversation_rewind` replaces the log with the selected prefix, resets provider continuation, pending
 request ids, context usage, and context delivery cursor, and moves the task-event leaf to the final
 retained `clientTurnId` before staging a condensed replay. Abandoned task events remain durable.
 A legacy prefix without an id does not guess from text or sequence; it selects an empty task
@@ -193,16 +210,18 @@ review -> rejected
 generation while keeping accepted code.
 
 Harness state never changes `session_activity`, never occupies the conversation worker mutex, and
-never disables chat. Each attempt owns a fresh tools-disabled driver created from the job's
-provider/model/reasoning snapshot and a dedicated document workspace.
+never disables chat. Each attempt owns an independent `StructuredJobExecutor` created from the
+job's persisted provider/model/reasoning/base URL snapshot, with isolated input/cwd, no EUD tools
+or MCP endpoint, and no main store/workspace/UI authority. Schema and domain validation precede
+staging; retry never reads current global defaults.
 
 ## Session workers
 
 `SessionEngineManager` lazily owns `HashMap<SessionId, Arc<SessionWorker>>`. Each worker contains:
 
-- a session-bound `AgentEngine` behind its own Tokio mutex;
-- one exact `ProductionProviderDriver` enum variant from the persisted binding;
-- a session-bound `SessionToolRuntime` and, for CLI providers, loopback MCP server;
+- a session-bound `AgentEngine<R: RuntimeExecutor>` behind its own Tokio mutex;
+- one `ProviderRuntime` with its fixed Codex, Claude Code, Antigravity, OpenCode Go, or Ollama production adapter selected from the persisted binding;
+- a session-bound `SessionToolRuntime`; native foreground runs create their own MCP endpoint;
 - a per-worker cancellation watch channel;
 - `SessionEventSink(app, sessionId)` and immutable provider id for logout busy protection.
 
@@ -210,8 +229,11 @@ The worker mutex is the same-session command sequencer. There is no global `Mana
 mutex and no mutable session-switching path. `session_open` hydrates only the named worker and is
 idempotent. Selecting a sidebar row never calls it.
 
-Resume seeds the binding's typed conversation state. A mismatch fails load; a provider-supported
-resume failure resets only that provider conversation and replays a bounded condensed transcript.
+Resume seeds the binding's typed conversation state through the runtime. A provider mismatch,
+corrupt direct head, or unknown native continuation fails closed while preserving pending review;
+it does not reset to empty state or automatically replay completed tools. A validated direct head
+can repair lagging matching metadata. Native receipts retire only after engine persistence
+acknowledgement. Explicit rewind/reset remains a separate idle-session operation.
 
 Global provider/model settings are owned by `ProviderService` with per-provider locks. They are
 new-session defaults only and are never read by an existing worker or harness retry.
@@ -240,39 +262,90 @@ so multiple sessions can recover review state for one project without blocking n
 ## Session tool/runtime isolation
 
 `ToolServices` shares the journal store, RAG, map rails, data dirs, and coordinator.
-Every `SessionToolRuntime` separately owns the live request id, evidence/mutation/action/search/
-build state, pending plan, write registration, source baseline, and tool execution lock.
+Every `SessionToolRuntime` separately owns the live request ID, evidence/mutation counters,
+iteration and progress identities, pending plan, write registration, source baseline, and tool
+execution lock.
 
-One ephemeral MCP endpoint is created per worker. No global current-request pointer infers the
-caller. Mutating tools require that runtime's exact `(project, session, request)` registration.
-Each shared-state dispatch runs inside one short project transaction.
+Each native foreground run creates an ephemeral unique-URL MCP endpoint and handler bound to its
+fixed `RunIdentity`. Old handlers cannot acquire a later run's tool authority. Direct batches and
+native MCP use the same gate; native tool notifications never execute tools again. The first
+mutating tool call in a read run is not executed: the gate registers the exact
+`(project, session, request)`, parks the remaining batch, and resumes the same conversation in
+write mode. Each shared-state dispatch then runs inside one short project transaction.
+
+Cancellation closes new admission before transport cleanup. Late model events are discarded, but
+already-started blocking tools settle and persist their original run's completion/journal. Failed
+final answers neither discard reviewable mutations nor replay/rollback tools automatically. ASK
+waiting pauses the provider active deadline and clears once on cancellation or transport exit.
 
 ## Workspace isolation
 
-Canonical accepted files remain panel-visible at:
+The provider CLI cwd is the native project root — the directory holding `project.eap`.
+The agent reads the real project tree (`src/`, `dat/`, `maps/`, `build/`, `compat/`)
+and the durable documents directly; there is no session mirror and no per-turn document copy.
 
-`workspaces/<project-id>/`
+```text
+<project>/                                  ← CLI cwd
+  project.eap
+  src/  dat/  maps/  build/  compat/
+  .eud-agent/
+    workspace/                              ← canonical documents (specs/plans/decisions/worklog)
+      .tmp/<session-id>/                    ← the only filesystem write area
+    state/workspace.json                    ← trusted acceptance metadata
+    memory/
+```
 
-Codex uses:
+Trusted accepted-document/plan metadata lives in `<project>/.eud-agent/state/workspace.json`,
+outside the editable document tree. Its workspace ID survives moving the project. Journals,
+jobs, and turn baselines remain machine-local under `%APPDATA%/eud-agent`; durable harness
+documents and memory/wiki move with the project.
 
-`workspaces/.sessions/<project-id>/<session-id>/`
+Sandbox scope: the read profile exposes the whole project root read-only; the write profile
+adds exactly `.eud-agent/workspace/.tmp/**` as writable. Every other filesystem path stays
+read-only — source and document mutations go through eud-tools into the journal/changeset
+review path. `TEMP`/`TMP` point at the session's `.tmp/<session-id>/` directory.
 
-Before every read turn, canonical documents are delta-synced and a coherent session source
-snapshot is refreshed. Read mode makes the whole root read-only. Before write continuation, the
-sync and snapshot run again, Codex is told to re-read targets, and a trusted baseline is captured.
+Turn baselines live outside the cwd at
+`%APPDATA%/eud-agent/workspaces/.state/baselines/<request-id>/<workspace-id>/` with
+`documents/` (the canonical document tree) and `source/` (canonical `src/` bytes without the
+`src/` prefix) subtrees. Read turns capture no baseline. A write turn captures both subtrees
+before the first mutation, and the agent is told to re-read targets and retry rather than
+replaying stale arguments.
 
-Native session document changes remain isolated until review. Acceptance compares their journal
-baseline with current canonical bytes: unchanged targets promote directly, non-overlapping line
-changes merge automatically, and overlapping changes fail with `ConcurrentWriteConflict` while
-leaving canonical bytes untouched.
+Document changes stage directly against the canonical tree and are journaled with exact
+before/after bytes. Acceptance compares the journal baseline with current canonical bytes:
+unchanged targets promote directly, non-overlapping line changes merge automatically, and
+overlapping changes fail with `ConcurrentWriteConflict` while leaving canonical bytes
+untouched. Reject restores the exact journaled canonical bytes.
 
-Editor file tools use the session's coherent `source/` snapshot as their optimistic baseline.
+Native source tools use the captured `source/` baseline subtree as their optimistic baseline.
 `file_write` and `file_edit` three-way merge non-overlapping live changes; `file_edit` first
 applies ordered exact replacements to the request's latest desired content and rejects missing or
 ambiguous matches before mutation. Write/delete/rename/move reject stale overlapping targets.
-Shared tool calls and builds are serialized only for the duration of that call. Reject
-restores/discards only the session workspace copy. Approved plan snapshots remain app-owned,
-immutable, and preserved after implementation rejection.
+Shared tool calls and builds are serialized only for the duration of that call.
+Approved plan snapshots remain app-owned, immutable, and preserved after implementation rejection.
+
+## Autonomous run lifecycle
+
+`SessionRecord.autonomousRun` persists an opt-in run independently from `session_activity`.
+The record owns the original goal, request/client-turn identity, selected project and revision,
+policy, iteration number, bounded progress fingerprints, observed provider usage, last build,
+blocker, and last confirmed provider checkpoint. Checkpoint persistence updates the run and typed
+provider conversation atomically, then retires the runtime receipt only after acknowledgement.
+
+`running`, `pausing`, `paused`, `paused_after_restart`, `waiting_input`, `review`,
+`safety_stopped`, `cancelled`, `failed`, and `completed` are distinct durable states. Active elapsed
+time excludes user/review/restart waits. Startup converts interrupted running, pausing, or ASK work
+to `paused_after_restart`; it never launches provider or mutation work. Explicit resume requires a
+resumable status, no pending semantic review, the same project identity and canonical revision,
+and byte-equivalent persisted/runtime provider checkpoints. A mismatch becomes `safety_stopped`.
+
+The request ID, semantic journal, and cumulative progress survive iteration boundaries in both
+interactive and autonomous turns. Only the soft iteration action count resets. Direct providers resume from the ordered transcript after all
+durable call results; native providers resume only from an official completed native continuation.
+Pause closes new tool admission at the next confirmed boundary. Stop cancels ASK/provider
+generation, preserves reviewable journal entries, and terminal state cannot be overwritten by a
+late completion.
 
 ## Tauri IPC
 
@@ -288,11 +361,14 @@ All conversation commands include `sessionId`:
 
 | command | purpose |
 |---|---|
-| `chat` | start/resume a read turn immediately |
+| `chat` | start an explicit interactive or opt-in autonomous read turn |
 | `plan_feedback` | revise that session's plan in read mode |
 | `plan_approve` | register write intent and execute after grant |
 | `changeset_decision` | accept/reject that session's journal |
 | `cancel` | interrupt that turn or remove that write ticket |
+| `autonomous_pause` | request pause at the next confirmed tool/provider boundary |
+| `autonomous_resume` | validate and continue a paused run from its exact checkpoint |
+| `autonomous_stop` | cancel the run, ASK, and new tool admission while preserving review |
 | `conversation_rewind` | reset that idle session to a log prefix |
 | `session_open` | hydrate/reconnect one persisted worker |
 | `harness_jobs` | list/recover durable jobs for one session |
@@ -310,7 +386,14 @@ Every conversation event has a required immutable `sessionId`:
 
 - `agent_event`, `context_usage`, `answer`, `plan`, `changeset`, `rollback_result`;
 - turn `progress` and turn `error`;
-- `session_activity`.
+- `session_activity` for current read/write/wait/review resource activity;
+- `autonomous_run` for the separate durable autonomous lifecycle and progress projection.
+
+Tool call/result events additionally preserve the gate-assigned UUID `callId`. The panel matches
+EPS and Map rows by `(sessionId, callId)` only. An ID-less start is informational and an ID-less
+terminal is a standalone terminal row; neither may mutate a last-running row. A late event whose
+session or captured run identity no longer matches the addressed row is discarded. There is no
+selected-row, most-recent-running, or other identity fallback.
 
 `harness_job` is separately session-scoped and carries durable job status, attempt count,
 runtime-verification state, optional failure/summary, optional memory file names, and the
@@ -342,6 +425,31 @@ stale-source state without inspecting or sweeping `drafts/`, so an active reques
 draft path and bytes across reloads. `CandidateStore::cleanup_startup` is the only generic orphan
 draft sweep and runs before `MapAgentService` is managed; request finish/cancel and successful
 settlement continue to remove only the owning request's draft.
+
+Native map SHA-256 reads use a non-inheritable `rbN` file handle with RAII ownership before any
+child process can inherit it. The checkpoint-22 full-suite cleanup failure remains historical with
+its exact holder unidentified; the checkpoint-23 event-barrier probe observed Windows deletion
+error 32 for inheritable `rb` and success for `rbN`, and the exact Map recovery selector passed.
+Checkpoint 25's full Rust suite passed the Map recovery regression; actual Map UI validation
+remains separate.
+
+The permanent Map descriptor now uses the production registry schema. Checkpoint35's exact budget,
+exhaustive-operation, and verbatim-descriptor selectors pass; Antigravity's production-adapter
+regressions also preserve all Map alternatives, inherited fields, local references, and non-first
+operations. These are deterministic codec/schema results, with strict local admission still
+authoritative where the remote wire cannot express every closure rule.
+
+App37's numeric render refusal established the obsolete string-enum admission defect. The registry
+now validates Map calls with Draft7 and its public numeric-scale and complete-draft-operation tests.
+Actual39 subsequently completes status/analyze/palette/render/draft-begin but fails its patch on a
+271-character temporary draft path before candidate mutation. Source41 corrects that shared Windows
+path boundary; the permanent long-path Map selector passes. Actual Map41 preserves two preceding
+`before` conflicts, then completes a legal same-request patch, render/analyze, and finalize to
+candidate revision 1. The trusted UI Apply changes the isolated source from baseline hash
+`F864E65E0B078FF383DEB1071DC74128501FCBA908BBB4ADB24F2CDCFEFF5C24` to
+`144E15B8B4AA0A15B60CCE2BD27079869CF71F4680E71DE7C9C487376E49C1FA`; one Undo restores the
+exact baseline bytes and hash. Stale-fork validation did not run, so no stale acceptance claim is
+made.
 
 Map image attachments remain session-bound in LocalAppData but each active request receives a new
 ordered `image-1..N` map in its `SessionToolRuntime`. The binding includes attachment SHA-256,
@@ -384,6 +492,15 @@ persists `dismissed`; the panel retains that marker so closing the newest termin
 surface an older one after an event or restart. The main PromptInput remains enabled.
 `harness_jobs` snapshot hydration merges by `updatedAt`, so a slower snapshot cannot overwrite a
 newer push event.
+
+App37 also supplies bounded continuation evidence: native ASK answer settled after about 91.8
+seconds of wait, a separate cancelled ASK stayed idle through 8.08 seconds of observation, and a
+normal restart restored the 88-byte EPS source/hash and persisted sessions without replaying either
+the settled ASK or failed Map request. Actual39 separately overlaps a Map read with an OpenCode
+Go/`glm-5.3` read; its results and usage remain in their own session rows. Independent QA41 then
+observes r0/base, no candidate, disabled Apply/Undo, and retained final/history without issuing a
+request. The normal app close leaves no owned processes and preserves baseline hashes. This does
+not establish stale-fork behavior or gameplay-backed harness recovery.
 
 The left sidebar remains 220–420 px, collapses to a 56 px rail, and ellipsizes long names with a
 title. The center and both sidebars keep `min-width: 0`/horizontal clipping so the configured

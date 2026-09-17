@@ -37,8 +37,10 @@ import { AgentTurnStatus } from "@/components/AgentTurnStatus";
 import { MentionComposer } from "@/components/MentionComposer";
 import type { PanelState } from "@/state/store";
 import type {
+  AutonomousRunState,
   ChatAttachment,
   MentionInstance,
+  ExecutionMode,
   MentionSearchRequest,
   MentionSearchResponse,
   ReasoningSelection,
@@ -58,6 +60,7 @@ export interface ChatPayload {
   text: string;
   attachments: ChatAttachment[];
   mentions: MentionInstance[];
+  executionMode: ExecutionMode;
   /** Preserved only when retrying a transport-rejected submission. */
   clientTurnId?: string;
 }
@@ -71,6 +74,11 @@ export interface InstructionBoxProps {
   onDiscardAttachment?(id: string): Promise<void>;
   /** Interrupt the active turn without discarding its prior conversation. */
   onCancel?(): void;
+  /** Durable autonomous lifecycle controls, separate from turn cancellation. */
+  autonomousRun?: AutonomousRunState | null;
+  onAutonomousPause?(): void;
+  onAutonomousResume?(): void;
+  onAutonomousStop?(): void;
   /** A past user message restored for editing after a successful rewind. */
   draft?: ChatPayload | null;
   /** Backend-owned bounded resource search used by the generic composer. */
@@ -100,6 +108,10 @@ export function InstructionBox({
   onStageAttachment,
   onDiscardAttachment,
   onCancel,
+  autonomousRun = null,
+  onAutonomousPause,
+  onAutonomousResume,
+  onAutonomousStop,
   draft,
   onMentionSearch,
   projectIdentity = state.project,
@@ -134,7 +146,12 @@ export function InstructionBox({
 
   // The store owns connection/project/busy gating. Empty text remains valid when
   // at least one staged attachment or validated mention is present.
-  const canSend = state.canSend && !actionBusy;
+  const autonomousBlocksNewRequest =
+    autonomousRun !== null &&
+    !["completed", "cancelled", "failed", "safety_stopped"].includes(
+      autonomousRun.status,
+    );
+  const canSend = state.canSend && !actionBusy && !autonomousBlocksNewRequest;
   const hasStaleMention = mentions.some((mention) => mention.stale === true);
   const turnInFlight = state.phase === "thinking";
   const ragLoading = state.rag === "loading";
@@ -142,7 +159,7 @@ export function InstructionBox({
   const attachmentInputDisabled =
     !canSend || staging || onStageAttachment === undefined;
   const placeholder = projectUnavailable
-    ? "Native 프로젝트를 열 수 없습니다. project.json 경로를 확인하세요"
+    ? "Native 프로젝트를 열 수 없습니다. .eap 파일 경로를 확인하세요"
     : ragLoading
       ? "RAG 모델 준비 중… 준비가 끝나면 입력할 수 있습니다"
       : state.phase === "plan_review"
@@ -222,7 +239,7 @@ export function InstructionBox({
     }
   }
 
-  function handleSend() {
+  function submit() {
     const text = instruction.trim();
     if (
       !canSend ||
@@ -236,6 +253,7 @@ export function InstructionBox({
       text,
       attachments,
       mentions,
+      executionMode: "interactive",
       ...(retryClientTurnId.current
         ? { clientTurnId: retryClientTurnId.current }
         : {}),
@@ -245,6 +263,10 @@ export function InstructionBox({
     setAttachments([]);
     setMentions([]);
     setAttachmentError(null);
+  }
+
+  function handleSend() {
+    submit();
   }
 
   function handleDrop(event: DragEvent<HTMLDivElement>) {
@@ -283,10 +305,14 @@ export function InstructionBox({
       }}
       onDrop={handleDrop}
     >
-      {turnInFlight && (
+      {(turnInFlight || autonomousRun !== null) && (
         <AgentTurnStatus
           turn={state.turn}
+          autonomousRun={autonomousRun}
           onCancel={onCancel}
+          onPause={onAutonomousPause}
+          onResume={onAutonomousResume}
+          onStop={onAutonomousStop}
           cancelDisabled={actionBusy}
         />
       )}
@@ -410,11 +436,11 @@ export function InstructionBox({
             />
           </PromptInputTools>
           <PromptInputSubmit
-            aria-label="전송"
+            aria-label="실행"
             disabled={!canSend || staging || hasStaleMention}
           >
             <SendIcon className="size-4" />
-            전송
+            실행
           </PromptInputSubmit>
         </PromptInputFooter>
       </PromptInput>

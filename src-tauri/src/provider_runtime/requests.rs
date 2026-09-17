@@ -12,7 +12,12 @@ pub enum WorkspaceAccess {
 pub struct AgentTurnInput {
     pub text: String,
     pub image_paths: Vec<PathBuf>,
+    /// The native project root used as the provider CLI cwd.
     pub workspace_root: Option<PathBuf>,
+    /// The session-private scratch directory under the project workspace. It is
+    /// the only filesystem location a write-profile turn may create, and it is
+    /// exported to the CLI as `TEMP`/`TMP`.
+    pub workspace_temp: Option<PathBuf>,
     pub workspace_access: WorkspaceAccess,
     pub output_schema: Option<Value>,
     pub forbid_tools: bool,
@@ -24,6 +29,7 @@ impl AgentTurnInput {
             text: text.into(),
             image_paths: Vec::new(),
             workspace_root: None,
+            workspace_temp: None,
             workspace_access: WorkspaceAccess::Read,
             output_schema: None,
             forbid_tools: false,

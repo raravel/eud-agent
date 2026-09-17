@@ -1470,6 +1470,46 @@ pub fn managed_euddraft_version(dirs: &DataDirs, configured: &Path) -> Option<St
     None
 }
 
+/// Validate an app-managed euddraft install before a build runs its executable.
+///
+/// `resolve` only knows the executable path, not [`DataDirs`], so the managed install is
+/// identified the same way [`managed_euddraft_version`] does: the nearest ancestor directory
+/// carrying the checksum-addressed `.euddraft-install.json` marker. When such a marker exists
+/// the install is app-managed and its full declared manifest is re-verified (every file present,
+/// exact size, exact sha256, canonically contained, single declared `euddraft.exe`). A manually
+/// selected distribution has no marker and is intentionally skipped, preserving prior behavior.
+/// This rejects the partial-update wreckage (an interrupted `del` → `xcopy` leaves a runnable
+/// `euddraft.exe` beside missing `python3.dll`/`epTrace.exe`/CRT runtimes) with a clear error
+/// naming the damaged files instead of a cryptic build-time `FileNotFoundError`.
+pub(crate) fn validate_managed_install(executable: &Path) -> Result<(), String> {
+    let Some((install_dir, marker)) = nearest_install_marker(executable) else {
+        return Ok(());
+    };
+    euddraft_install_path(&install_dir, &marker)
+        .map(|_| ())
+        .map_err(|error| {
+            format!(
+                "app-managed euddraft install is corrupt and must be reinstalled ({}): {error}",
+                install_dir.display()
+            )
+        })
+}
+
+/// Nearest ancestor directory of `executable` holding a parsable install marker.
+fn nearest_install_marker(executable: &Path) -> Option<(PathBuf, EuddraftInstallMarker)> {
+    let mut candidate = executable.parent();
+    while let Some(install_dir) = candidate {
+        let marker_path = install_dir.join(EUDDRAFT_INSTALL_MARKER);
+        if marker_path.is_file() {
+            let marker: EuddraftInstallMarker =
+                serde_json::from_slice(&fs::read(&marker_path).ok()?).ok()?;
+            return Some((install_dir.to_path_buf(), marker));
+        }
+        candidate = install_dir.parent();
+    }
+    None
+}
+
 /// Download and atomically install the latest complete euddraft distribution.
 ///
 /// The release archive is verified before extraction. All members are extracted into a
@@ -2161,7 +2201,11 @@ mod manifest {
                 version: "v0.11.0.1".to_string(),
                 archive_sha256: HELLO_SHA.to_string(),
                 executable: "bin/euddraft.exe".to_string(),
-                files: Vec::new(),
+                files: vec![EuddraftInstalledFile {
+                    path: "bin/euddraft.exe".to_string(),
+                    sha256: sha256_hex_bytes(b"managed"),
+                    bytes: 7,
+                }],
             })
             .unwrap(),
         )

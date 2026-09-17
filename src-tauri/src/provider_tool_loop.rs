@@ -172,8 +172,98 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn calls_after_write_transition_are_validated_but_not_executed() {
-        // Given: a write transition followed by another valid tool call.
+    async fn schema_violation_in_a_batch_completes_with_usage_and_keeps_the_batch_alive() {
+        // Given: a valid call and a schema-violating call in the same model batch.
+        let runtime = SessionToolRuntime::for_tests();
+        let (_cancel, cancellation) = tokio::sync::watch::channel(7_u64);
+        runtime.set_cancellation(cancellation);
+        runtime.begin_request("request-usage", "project").unwrap();
+        let gate = RunGate::new(
+            crate::provider_runtime::RunIdentity {
+                session_id: runtime.session_id().to_string(),
+                run_id: crate::provider_runtime::RunId::new(18),
+                request_id: "request-usage".to_string(),
+                session_kind: runtime.kind(),
+                cancellation_generation: 7,
+            },
+            runtime,
+            crate::provider_runtime::WorkspaceAccess::Read,
+            None,
+        );
+
+        // When: the complete batch is submitted.
+        let batch = gate
+            .dispatch_batch(
+                vec![
+                    DirectToolCall {
+                        id: "call-ok".to_string(),
+                        name: "list_files".to_string(),
+                        arguments: serde_json::json!({}),
+                    },
+                    DirectToolCall {
+                        id: "call-bad".to_string(),
+                        name: "read_file".to_string(),
+                        arguments: serde_json::json!({"path": 7}),
+                    },
+                ],
+                false,
+            )
+            .await
+            .unwrap();
+
+        // Then: the violating call completes with model-correctable usage
+        // guidance rather than executing, the valid-shaped call is dispatched to
+        // execution (its result is not a usage rejection), and admission stays open.
+        assert_eq!(batch.results.len(), 2);
+        assert!(!batch.results[0]
+            .result
+            .as_str()
+            .is_some_and(|message| message.contains("arguments do not match")));
+        assert!(batch.results[1].is_error);
+        assert!(batch.results[1]
+            .result
+            .as_str()
+            .is_some_and(|message| message.contains("Usage: read_file(path)")));
+        assert!(gate.fatal_admission_error().is_none());
+        assert_eq!(gate.completed().len(), 2);
+    }
+
+    #[test]
+    fn read_mode_build_stays_in_place_while_mutations_still_transition() {
+        let runtime = SessionToolRuntime::for_tests();
+        runtime
+            .begin_request("request-build-effect", "project")
+            .unwrap();
+        let gate = RunGate::new(
+            crate::provider_runtime::RunIdentity {
+                session_id: runtime.session_id().to_string(),
+                run_id: crate::provider_runtime::RunId::new(12),
+                request_id: "request-build-effect".to_string(),
+                session_kind: runtime.kind(),
+                cancellation_generation: 0,
+            },
+            runtime.clone(),
+            crate::provider_runtime::WorkspaceAccess::Read,
+            None,
+        );
+        let build = DirectToolCall {
+            id: "build-effect".to_string(),
+            name: crate::tools::BUILD_RUN_TOOL.to_string(),
+            arguments: serde_json::json!({}),
+        };
+
+        assert_eq!(
+            gate.execute_outcome(&build, || Ok(serde_json::json!({"ok": true})))
+                .unwrap(),
+            serde_json::json!({"ok": true})
+        );
+        assert!(!gate.has_requested_write_transition());
+        assert!(runtime.write_ticket().is_none());
+    }
+
+    #[tokio::test]
+    async fn first_read_mode_mutation_requests_transition_and_stops_the_batch() {
+        // Given: a mutating call followed by another valid call in a read-only run.
         let runtime = SessionToolRuntime::for_tests();
         let (_cancel, cancellation) = tokio::sync::watch::channel(8_u64);
         runtime.set_cancellation(cancellation);
@@ -186,19 +276,23 @@ mod tests {
                 session_kind: runtime.kind(),
                 cancellation_generation: 8,
             },
-            runtime,
+            runtime.clone(),
             crate::provider_runtime::WorkspaceAccess::Read,
             None,
         );
 
-        // When: the complete batch passes shape validation and dispatch starts.
+        // When: dispatch reaches the first mutation.
         let batch = gate
             .dispatch_batch(
                 vec![
                     DirectToolCall {
                         id: "call-write".to_string(),
-                        name: crate::tools::REQUEST_WRITE_WORKSPACE_TOOL.to_string(),
-                        arguments: serde_json::json!({"reason": "test change"}),
+                        name: "file_create".to_string(),
+                        arguments: serde_json::json!({
+                            "path": "src/automatic-transition.eps",
+                            "ftype": "CUIEps",
+                            "code": "const automatic_transition = 1;\n",
+                        }),
                     },
                     DirectToolCall {
                         id: "call-after".to_string(),
@@ -211,9 +305,15 @@ mod tests {
             .await
             .unwrap();
 
-        // Then: the transition is explicit and the remainder has no completion record.
+        // Then: runtime admission is registered, the mutation is not executed, and the tail is parked.
         assert!(batch.stop_for_write_transition);
         assert_eq!(batch.results.len(), 1);
+        assert!(batch.results[0].is_error);
+        assert!(batch.results[0]
+            .result
+            .as_str()
+            .is_some_and(|message| message.starts_with("WriteWorkspaceTransition:")));
+        assert!(runtime.owns_write_registration());
         assert_eq!(gate.completed().len(), 1);
         assert_eq!(gate.completed()[0].call_id.as_deref(), Some("call-write"));
     }
@@ -504,5 +604,98 @@ mod tests {
         assert!(receipt.is_file());
         gate.acknowledge_receipts().unwrap();
         assert!(!receipt.exists());
+    }
+    #[tokio::test]
+    async fn gate_stops_execution_at_300_actions_with_a_resumable_boundary() {
+        let runtime = SessionToolRuntime::for_tests();
+        let (_cancel, cancellation) = tokio::sync::watch::channel(11_u64);
+        runtime.set_cancellation(cancellation);
+        runtime
+            .begin_request("request-boundary", "project")
+            .unwrap();
+        let gate = RunGate::new(
+            crate::provider_runtime::RunIdentity {
+                session_id: runtime.session_id().to_string(),
+                run_id: crate::provider_runtime::RunId::new(16),
+                request_id: "request-boundary".to_string(),
+                session_kind: runtime.kind(),
+                cancellation_generation: 11,
+            },
+            runtime.clone(),
+            crate::provider_runtime::WorkspaceAccess::Read,
+            None,
+        );
+        let calls = (0..=crate::tools::ITERATION_TOOL_ACTION_THRESHOLD)
+            .map(|index| DirectToolCall {
+                id: format!("boundary-{index}"),
+                name: "list_files".to_string(),
+                arguments: serde_json::json!({}),
+            })
+            .collect();
+
+        let batch = gate.dispatch_batch(calls, false).await.unwrap();
+
+        assert_eq!(
+            batch.results.len(),
+            crate::tools::ITERATION_TOOL_ACTION_THRESHOLD + 1
+        );
+        assert!(
+            !batch.results[crate::tools::ITERATION_TOOL_ACTION_THRESHOLD - 1]
+                .result
+                .get("error")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|error| error.starts_with("IterationBoundary:"))
+        );
+        assert!(batch.results[crate::tools::ITERATION_TOOL_ACTION_THRESHOLD].is_error);
+        assert_eq!(
+            gate.iteration_boundary_reason(),
+            Some(crate::provider_runtime::IterationBoundaryReason::ToolActions)
+        );
+        assert_eq!(
+            runtime.request_action_counts().0,
+            crate::tools::ITERATION_TOOL_ACTION_THRESHOLD as u64
+        );
+        assert_eq!(
+            gate.completed().len(),
+            crate::tools::ITERATION_TOOL_ACTION_THRESHOLD + 1
+        );
+    }
+
+    #[tokio::test]
+    async fn pause_request_stops_new_tool_execution_without_a_fatal_gate_error() {
+        let runtime = SessionToolRuntime::for_tests();
+        let (_cancel, cancellation) = tokio::sync::watch::channel(12_u64);
+        runtime.set_cancellation(cancellation);
+        runtime.begin_request("request-pause", "project").unwrap();
+        runtime.set_autonomous_pause_requested(true);
+        let gate = RunGate::new(
+            crate::provider_runtime::RunIdentity {
+                session_id: runtime.session_id().to_string(),
+                run_id: crate::provider_runtime::RunId::new(17),
+                request_id: "request-pause".to_string(),
+                session_kind: runtime.kind(),
+                cancellation_generation: 12,
+            },
+            runtime.clone(),
+            crate::provider_runtime::WorkspaceAccess::Read,
+            None,
+        );
+
+        let result = gate
+            .dispatch_native(
+                Some("paused-call".to_string()),
+                "list_files".to_string(),
+                serde_json::json!({}),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.is_error);
+        assert!(gate.fatal_admission_error().is_none());
+        assert_eq!(runtime.request_action_counts(), (0, 0));
+        assert_eq!(
+            gate.iteration_boundary_reason(),
+            Some(crate::provider_runtime::IterationBoundaryReason::ProviderContinuation)
+        );
     }
 }

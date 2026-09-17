@@ -10,7 +10,10 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::{mpsc, Arc};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    mpsc, Arc,
+};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use parking_lot::Mutex;
@@ -188,7 +191,7 @@ impl ToolServices {
 struct SessionRequest {
     request_id: String,
     project_id: String,
-    workspace_root: Option<PathBuf>,
+    source_baseline_root: Option<PathBuf>,
     image_refs: BTreeMap<String, crate::map_image::MapImageBinding>,
     sound_results: usize,
     audio_refs: BTreeMap<String, crate::audio::AudioBinding>,
@@ -203,6 +206,8 @@ struct SessionWriteState {
 }
 type AskEmitter = Arc<dyn Fn(crate::ipc::AskEvent) -> Result<(), String> + Send + Sync>;
 type ProgressEmitter = Arc<dyn Fn(crate::ipc::ProgressEvent) -> Result<(), String> + Send + Sync>;
+type AutonomousEmitter =
+    Arc<dyn Fn(crate::autonomous::AutonomousRunState) -> Result<(), String> + Send + Sync>;
 
 struct PendingAsk {
     owner_request_id: String,
@@ -370,9 +375,11 @@ pub struct SessionToolRuntime {
     ask_waiting: tokio::sync::watch::Sender<bool>,
     cancellation: Arc<Mutex<Option<tokio::sync::watch::Receiver<u64>>>>,
     progress_emitter: Arc<Mutex<Option<ProgressEmitter>>>,
+    autonomous_emitter: Arc<Mutex<Option<AutonomousEmitter>>>,
     provider_identity: Arc<Mutex<Option<(crate::provider::ProviderId, String)>>>,
     last_build: Arc<Mutex<Option<crate::harness::BuildEvidence>>>,
     sound_build_required: Arc<Mutex<bool>>,
+    autonomous_pause_requested: Arc<AtomicBool>,
 }
 
 struct PendingAskLease {
@@ -414,9 +421,11 @@ impl SessionToolRuntime {
             ask_waiting,
             cancellation: Arc::new(Mutex::new(None)),
             progress_emitter: Arc::new(Mutex::new(None)),
+            autonomous_emitter: Arc::new(Mutex::new(None)),
             provider_identity: Arc::new(Mutex::new(None)),
             last_build: Arc::new(Mutex::new(None)),
             sound_build_required: Arc::new(Mutex::new(false)),
+            autonomous_pause_requested: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -425,6 +434,18 @@ impl SessionToolRuntime {
     }
     pub fn kind(&self) -> crate::session::SessionKind {
         self.kind
+    }
+    pub fn autonomous_pause_handle(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.autonomous_pause_requested)
+    }
+
+    pub fn autonomous_pause_requested(&self) -> bool {
+        self.autonomous_pause_requested.load(Ordering::SeqCst)
+    }
+
+    pub fn set_autonomous_pause_requested(&self, requested: bool) {
+        self.autonomous_pause_requested
+            .store(requested, Ordering::SeqCst);
     }
 
     pub(crate) fn tool_descriptors(&self) -> Vec<Value> {
@@ -475,6 +496,15 @@ impl SessionToolRuntime {
         emitter: impl Fn(crate::ipc::ProgressEvent) -> Result<(), String> + Send + Sync + 'static,
     ) {
         *self.progress_emitter.lock() = Some(Arc::new(emitter));
+    }
+    pub fn set_autonomous_emitter(
+        &self,
+        emitter: impl Fn(crate::autonomous::AutonomousRunState) -> Result<(), String>
+            + Send
+            + Sync
+            + 'static,
+    ) {
+        *self.autonomous_emitter.lock() = Some(Arc::new(emitter));
     }
 
     pub fn set_cancellation(&self, cancellation: tokio::sync::watch::Receiver<u64>) {
@@ -580,6 +610,10 @@ impl SessionToolRuntime {
         };
 
         self.emit_activity(crate::write_coordinator::SessionActivity::WaitingInput);
+        self.update_autonomous_status(
+            crate::autonomous::AutonomousRunStatus::WaitingInput,
+            Some(crate::autonomous::AutonomousPauseReason::WaitingInput),
+        )?;
         emitter(crate::ipc::AskEvent {
             request_id,
             questions: input.questions,
@@ -588,6 +622,7 @@ impl SessionToolRuntime {
         let answers = response
             .await
             .map_err(|_| "ask response channel closed".to_string())??;
+        self.update_autonomous_status(crate::autonomous::AutonomousRunStatus::Running, None)?;
         Ok(json!({ "answers": answers }))
     }
 
@@ -658,6 +693,27 @@ impl SessionToolRuntime {
         }
     }
 
+    fn update_autonomous_status(
+        &self,
+        status: crate::autonomous::AutonomousRunStatus,
+        pause_reason: Option<crate::autonomous::AutonomousPauseReason>,
+    ) -> Result<(), String> {
+        let sessions = crate::session::SessionStore::new(&self.services.dirs);
+        let Ok(record) = sessions.load(&self.session_id) else {
+            return Ok(());
+        };
+        if record.autonomous_run.is_none() {
+            return Ok(());
+        }
+        let updated = sessions
+            .update_autonomous_status(&self.session_id, status, pause_reason, None)
+            .map_err(|error| format!("장시간 작업 상태를 저장하지 못했습니다: {error}"))?;
+        if let (Some(run), Some(emitter)) = (updated, self.autonomous_emitter.lock().clone()) {
+            emitter(run)?;
+        }
+        Ok(())
+    }
+
     fn emit_activity_after_ask(&self) {
         let activity = if self.write_ticket().is_some() {
             crate::write_coordinator::SessionActivity::RunningWrite
@@ -667,6 +723,7 @@ impl SessionToolRuntime {
         self.emit_activity(activity);
     }
     pub fn begin_request(&self, request_id: &str, project_id: &str) -> Result<(), String> {
+        self.set_autonomous_pause_requested(false);
         let _execution = self.execution_lock.try_lock().ok_or_else(|| {
             "a previously admitted tool is still running; wait for its completion before opening a new request"
                 .to_string()
@@ -688,7 +745,7 @@ impl SessionToolRuntime {
             request_id: request_id.to_owned(),
             project_id: project_id.to_owned(),
             sound_results: 0,
-            workspace_root: None,
+            source_baseline_root: None,
             image_refs: BTreeMap::new(),
             audio_refs: BTreeMap::new(),
             audio_temp: None,
@@ -697,6 +754,61 @@ impl SessionToolRuntime {
         *self.pending_plan.lock() = None;
         *self.last_build.lock() = None;
         *self.sound_build_required.lock() = false;
+        Ok(())
+    }
+
+    /// Reset only the soft iteration action counter for a continuing request.
+    pub fn begin_iteration(&self, request_id: &str) -> Result<(), String> {
+        let mut state = self.request_state.lock();
+        let state = state
+            .as_mut()
+            .filter(|state| state.request_id == request_id)
+            .ok_or_else(|| format!("request state for {request_id} is missing"))?;
+        state.begin_iteration();
+        Ok(())
+    }
+
+    pub fn iteration_action_boundary_reached(&self, request_id: &str) -> bool {
+        self.request_state
+            .lock()
+            .as_ref()
+            .filter(|state| state.request_id == request_id)
+            .is_some_and(RequestState::iteration_action_boundary_reached)
+    }
+
+    pub fn latest_build_progress(&self) -> Option<tools::BuildProgress> {
+        self.request_state
+            .lock()
+            .as_ref()
+            .and_then(RequestState::latest_build)
+            .cloned()
+    }
+
+    pub fn request_action_counts(&self) -> (u64, u64) {
+        self.request_state.lock().as_ref().map_or((0, 0), |state| {
+            (state.read_action_count, state.write_action_count)
+        })
+    }
+
+    pub fn current_project_revision(&self) -> Result<String, String> {
+        self.services.native().open()?.revision()
+    }
+
+    pub fn restore_autonomous_progress(
+        &self,
+        request_id: &str,
+        progress: &crate::autonomous::AutonomousRunProgress,
+    ) -> Result<(), String> {
+        let mut state = self.request_state.lock();
+        let state = state
+            .as_mut()
+            .filter(|state| state.request_id == request_id)
+            .ok_or_else(|| format!("request state for {request_id} is missing"))?;
+        state.restore_autonomous_progress(
+            progress.read_actions,
+            progress.write_actions,
+            progress.latest_build.clone().map(Into::into),
+        );
         Ok(())
     }
 
@@ -890,28 +1002,32 @@ impl SessionToolRuntime {
         *self.sound_build_required.lock()
     }
 
-    pub fn bind_workspace_root(
+    /// Bind the trusted turn baseline captured by [`WorkspaceManager::begin_turn`].
+    ///
+    /// Only write turns capture a baseline; mutating tools run exclusively in
+    /// write turns, so the stale-check reference is always present when needed.
+    pub fn bind_source_baseline(
         &self,
         request_id: &str,
-        workspace_root: PathBuf,
+        baseline_root: PathBuf,
     ) -> Result<(), String> {
         let mut request = self.request.lock();
         let active = request
             .as_mut()
             .filter(|request| request.request_id == request_id)
             .ok_or_else(|| format!("request {request_id} is not active"))?;
-        active.workspace_root = Some(workspace_root);
+        active.source_baseline_root = Some(baseline_root);
         Ok(())
     }
 
     fn source_baseline(&self, path: &str) -> Result<Option<String>, String> {
-        let workspace_root = self
+        let baseline_root = self
             .request
             .lock()
             .as_ref()
-            .and_then(|request| request.workspace_root.clone())
-            .ok_or_else(|| "the current request has no prepared session workspace".to_string())?;
-        crate::workspace::read_source_baseline(&workspace_root, path)
+            .and_then(|request| request.source_baseline_root.clone())
+            .ok_or_else(|| "the current request has no captured source baseline".to_string())?;
+        crate::workspace::read_source_baseline(&baseline_root, path)
             .map_err(|error| error.to_string())
     }
 
@@ -965,7 +1081,7 @@ impl SessionToolRuntime {
         }
     }
 
-    pub fn request_write_workspace(
+    pub(crate) fn register_write_request(
         &self,
         reason: impl Into<String>,
     ) -> Result<crate::write_coordinator::WriteTicket, String> {
@@ -1146,10 +1262,10 @@ impl SessionToolRuntime {
             );
         }
 
-        if tools::is_mutating_tool(tool) && !self.owns_write_registration() {
+        let effects = tools::tool_spec(tool).ok_or_else(|| format!("Unknown tool `{tool}`."))?;
+        if effects.requires_write_workspace && !self.owns_write_registration() {
             return Err(
-                "WriteRegistrationRequired: call request_write_workspace with the reason for the change, \
-stop this turn so the backend can resume the same thread in its isolated writable workspace."
+                "WriteRegistrationRequired: canonical authoring requires runtime-managed write admission."
                     .to_string(),
             );
         }
@@ -1185,20 +1301,20 @@ stop this turn so the backend can resume the same thread in its isolated writabl
             } else {
                 self.map_sound_edit(&request_id, args)
             }
-        } else if tools::is_mutating_tool(tool) {
+        } else if effects.requires_project_transaction {
             self.project_transaction(|| self.dispatch(&request_id, tool, args))?
         } else {
             self.dispatch(&request_id, tool, args)
         };
         if let Ok(value) = result.as_mut() {
             if tool == tools::SEARCH_DOCS_TOOL {
-                self.record_search_docs_result(&request_id, value)?;
+                self.record_search_docs_result(&request_id, args, value)?;
             } else if tool == tools::DOCS_GET_TOOL {
                 self.record_docs_get_result(&request_id, value)?;
             }
         }
         #[cfg(test)]
-        if result.is_ok() && tools::is_mutating_tool(tool) {
+        if result.is_ok() && effects.requires_write_workspace {
             if let Some(barrier) = self.completion_barrier.lock().take() {
                 barrier
                     .reached
@@ -1213,7 +1329,12 @@ stop this turn so the backend can resume the same thread in its isolated writabl
         result
     }
 
-    fn record_search_docs_result(&self, request_id: &str, value: &mut Value) -> Result<(), String> {
+    fn record_search_docs_result(
+        &self,
+        request_id: &str,
+        args: &Value,
+        value: &mut Value,
+    ) -> Result<(), String> {
         let ids = value
             .get("hits")
             .and_then(Value::as_array)
@@ -1232,7 +1353,7 @@ stop this turn so the backend can resume the same thread in its isolated writabl
             .as_mut()
             .filter(|state| state.request_id == request_id)
             .ok_or_else(|| format!("request state for {request_id} is missing"))?;
-        let repeated = state.record_search_docs_hits(&ids);
+        let repeated = state.record_search_docs_hits(args, &ids);
         let repeated_count = repeated.iter().filter(|flag| **flag).count();
         let new_count = repeated.len() - repeated_count;
 
@@ -1265,6 +1386,12 @@ stop this turn so the backend can resume the same thread in its isolated writabl
             repeated_count,
             bytes,
         );
+        if state.search_docs_count > 1 && new_count == 0 {
+            return Err(
+                "search_docs no-progress: this normalized search produced no new stable document ids. Reuse the existing evidence or change the query and filters."
+                    .to_string(),
+            );
+        }
         Ok(())
     }
 
@@ -1786,15 +1913,6 @@ stop this turn so the backend can resume the same thread in its isolated writabl
             tools::MAP_SOUND_LIST_TOOL => self.map_sound_list(request_id),
             tools::SEARCH_DOCS_TOOL => Ok(self.search_docs(args)),
             tools::DOCS_GET_TOOL => self.docs_get(args),
-            tools::REQUEST_WRITE_WORKSPACE_TOOL => {
-                let reason = str_arg(args, "reason")?;
-                self.request_write_workspace(reason)?;
-                Ok(json!({
-                    "ok": true,
-                    "status": "granted",
-                    "note": "Write intent recorded. Stop this turn now; the backend will resume this thread immediately in its isolated writable workspace."
-                }))
-            }
 
             // ---- write tools (journaled) ----
             "dat_patch" => {
@@ -1834,6 +1952,19 @@ stop this turn so the backend can resume the same thread in its isolated writabl
                 let project_id = self
                     .current_project_id()
                     .ok_or_else(|| "현재 에이전트 프로젝트가 열려 있지 않습니다.".to_string())?;
+                let input_revision = self.services.native().open()?.revision()?;
+                {
+                    let state = self.request_state.lock();
+                    let state = state
+                        .as_ref()
+                        .filter(|state| state.request_id == request_id)
+                        .ok_or_else(|| format!("request state for {request_id} is missing"))?;
+                    if state.build_blocked_for_revision(&input_revision) {
+                        return Err(format!(
+                            "build_run no-progress: revision `{input_revision}` is blocked until a canonical input change produces a new revision."
+                        ));
+                    }
+                }
                 let bridge = self
                     .cancellation
                     .lock()
@@ -1848,8 +1979,39 @@ stop this turn so the backend can resume the same thread in its isolated writabl
                     ok: result.ok,
                     error_count: result.errors.len(),
                 });
-                serde_json::to_value(result)
-                    .map_err(|error| format!("failed to serialize build result: {error}"))
+                let progress = {
+                    let mut state = self.request_state.lock();
+                    let state = state
+                        .as_mut()
+                        .filter(|state| state.request_id == request_id)
+                        .ok_or_else(|| format!("request state for {request_id} is missing"))?;
+                    state.record_build(input_revision, &result)
+                };
+                let mut value = serde_json::to_value(result)
+                    .map_err(|error| format!("failed to serialize build result: {error}"))?;
+                let (progress, no_progress_reason) = match progress {
+                    tools::BuildProgressOutcome::Progress(progress) => (progress, None),
+                    tools::BuildProgressOutcome::NoProgress { progress, reason } => {
+                        (progress, Some(reason))
+                    }
+                };
+                value
+                    .as_object_mut()
+                    .ok_or_else(|| "failed to serialize build result object".to_string())?
+                    .insert(
+                        "buildProgress".to_string(),
+                        json!({
+                            "inputRevision": progress.input_revision,
+                            "diagnosticsFingerprint": progress.diagnostics_fingerprint,
+                            "errorCount": progress.error_count,
+                            "success": progress.success,
+                            "consecutiveNoProgress": progress.consecutive_no_progress,
+                        }),
+                    );
+                if let Some(reason) = no_progress_reason {
+                    return Err(reason);
+                }
+                Ok(value)
             }
             tools::TRACE_TEST_RUN_TOOL => {
                 let Some(build) = self.last_build.lock().clone() else {
@@ -3413,23 +3575,17 @@ impl crate::journal::JournalRollbackTarget for SessionToolRuntime {
     fn write_workspace_file(
         &self,
         workspace_id: &str,
-        session_id: Option<&str>,
         path: &str,
         content: &str,
     ) -> Result<(), Self::Error> {
         crate::workspace::WorkspaceManager::new(self.data_dirs())
-            .restore_file(workspace_id, session_id, path, Some(content))
+            .restore_file(workspace_id, path, Some(content))
             .map_err(stringify)
     }
 
-    fn delete_workspace_file(
-        &self,
-        workspace_id: &str,
-        session_id: Option<&str>,
-        path: &str,
-    ) -> Result<(), Self::Error> {
+    fn delete_workspace_file(&self, workspace_id: &str, path: &str) -> Result<(), Self::Error> {
         crate::workspace::WorkspaceManager::new(self.data_dirs())
-            .restore_file(workspace_id, session_id, path, None)
+            .restore_file(workspace_id, path, None)
             .map_err(stringify)
     }
 
@@ -4196,10 +4352,13 @@ fn native_trace_runtime(
         .map_err(|error| format!("failed to load native trace settings: {error}"))?;
     let euddraft_path = PathBuf::from(config.euddraft_path.trim());
     let euddraft = crate::native_build::EuddraftLaunch::resolve(&euddraft_path)?;
+    // Share the map-context resolution so an unset/blank config still finds the
+    // standard StarCraft install instead of failing on `Path::new("").parent()`.
+    let starcraft = crate::map_context::resolve_starcraft_path(&services.dirs)?;
     Ok((
         PathBuf::from(artifacts.eds_path),
         euddraft,
-        PathBuf::from(config.starcraft_path.trim()),
+        starcraft,
         snapshot,
     ))
 }
@@ -4364,13 +4523,14 @@ mod tests {
     fn open_runtime(request_id: &str) -> SessionToolRuntime {
         let runtime = SessionToolRuntime::for_tests();
         runtime.begin_request(request_id, "test-project").unwrap();
-        runtime.request_write_workspace("test mutation").unwrap();
+        runtime.register_write_request("test mutation").unwrap();
         runtime
     }
 
     #[test]
     fn prepared_native_source_baseline_admits_an_exact_file_edit() {
-        // Given: a real native project is mirrored into the session workspace used by writes.
+        // Given: a real native project whose canonical src/ is captured into the
+        // trusted turn baseline that write tools use for stale checks.
         let services = ToolServices::for_tests();
         let root = services.dirs.app_data().join("source-baseline-project");
         std::fs::create_dir_all(root.join("maps")).unwrap();
@@ -4402,24 +4562,23 @@ mod tests {
             .native()
             .write_source("src/nested/helper.eps", "// nested\n")
             .unwrap();
-        let workspace = crate::workspace::WorkspaceManager::new(services.dirs.clone())
+        let manager = crate::workspace::WorkspaceManager::new(services.dirs.clone());
+        let workspace = manager
             .prepare_session_current("source-baseline-session")
             .unwrap();
-        assert_eq!(
-            std::fs::read_to_string(workspace.root.join("source/main.eps")).unwrap(),
-            "// baseline\n"
-        );
-        assert!(!workspace.root.join("source/src/main.eps").exists());
+        let baseline = manager
+            .begin_turn(&workspace, "source-baseline-request")
+            .unwrap();
 
         let runtime = services.session("source-baseline-session");
         runtime
             .begin_request("source-baseline-request", "source-baseline-project")
             .unwrap();
         runtime
-            .request_write_workspace("edit the existing source")
+            .register_write_request("edit the existing source")
             .unwrap();
         runtime
-            .bind_workspace_root("source-baseline-request", workspace.root.clone())
+            .bind_source_baseline("source-baseline-request", baseline.baseline_root.clone())
             .unwrap();
         runtime
             .execute("search_docs", &json!({"query": "epScript comment"}))
@@ -4454,21 +4613,26 @@ mod tests {
             }
         );
         assert_eq!(
-            crate::workspace::read_source_baseline(&workspace.root, "src/missing.eps").unwrap(),
+            crate::workspace::read_source_baseline(&baseline.baseline_root, "src/missing.eps")
+                .unwrap(),
             None
         );
         assert_eq!(
-            crate::workspace::read_source_baseline(&workspace.root, "src/nested/helper.eps")
-                .unwrap()
-                .as_deref(),
+            crate::workspace::read_source_baseline(
+                &baseline.baseline_root,
+                "src/nested/helper.eps"
+            )
+            .unwrap()
+            .as_deref(),
             Some("// nested\n")
         );
         assert_eq!(
-            crate::workspace::read_source_baseline(&workspace.root, "nested/helper.eps")
+            crate::workspace::read_source_baseline(&baseline.baseline_root, "nested/helper.eps")
                 .unwrap()
                 .as_deref(),
             Some("// nested\n")
         );
+        manager.finish_turn(&baseline).unwrap();
     }
 
     #[test]
@@ -4520,12 +4684,57 @@ mod tests {
     #[tokio::test]
     async fn ask_waits_for_all_answers_and_resumes_the_same_tool_call() {
         let runtime = SessionToolRuntime::for_tests();
+        let sessions = crate::session::SessionStore::new(&runtime.data_dirs());
+        let now = crate::session::now_unix_millis();
+        let mut autonomous = crate::autonomous::AutonomousRunState::new(
+            "사용자 선택이 필요한 작업".to_string(),
+            "turn-ask".to_string(),
+            "req-ask".to_string(),
+            "project".to_string(),
+            "revision".to_string(),
+            Default::default(),
+            now,
+        );
+        let binding = crate::provider::ProviderBinding::new(
+            crate::provider::ProviderId::Codex,
+            "gpt-test".to_string(),
+            None,
+        )
+        .unwrap();
+        autonomous.last_checkpoint = Some(binding.conversation.clone());
+        sessions
+            .save(&crate::session::SessionRecord {
+                meta: crate::session::SessionMeta {
+                    id: runtime.session_id().to_string(),
+                    name: "ask lifecycle".to_string(),
+                    project: "project".to_string(),
+                    kind: crate::session::SessionKind::Eps,
+                    provider: binding.provider,
+                    model: binding.model.clone(),
+                    created_at: now / 1_000,
+                    last_conversation_at: now,
+                },
+                provider_binding: binding,
+                pending_request_ids: Vec::new(),
+                context_usage: None,
+                panel_log: Value::Null,
+                context_state: Default::default(),
+                task_state: Default::default(),
+                autonomous_run: Some(autonomous),
+            })
+            .unwrap();
         runtime.begin_request("req-ask", "project").unwrap();
         let (events, mut emitted) = tokio::sync::mpsc::unbounded_channel();
         runtime.set_ask_emitter(move |event| {
             events
                 .send(event)
                 .map_err(|_| "ask event receiver closed".to_string())
+        });
+        let (autonomous_events, mut emitted_autonomous) = tokio::sync::mpsc::unbounded_channel();
+        runtime.set_autonomous_emitter(move |event| {
+            autonomous_events
+                .send(event)
+                .map_err(|_| "autonomous event receiver closed".to_string())
         });
 
         let asking = runtime.clone();
@@ -4560,6 +4769,19 @@ mod tests {
         assert_eq!(event.questions.len(), 2);
         assert_eq!(event.questions[0].id, "mode");
         assert_eq!(runtime.pending_ask(), Some(event.clone()));
+        assert_eq!(
+            sessions
+                .load(runtime.session_id())
+                .unwrap()
+                .autonomous_run
+                .unwrap()
+                .status,
+            crate::autonomous::AutonomousRunStatus::WaitingInput
+        );
+        assert_eq!(
+            emitted_autonomous.recv().await.unwrap().status,
+            crate::autonomous::AutonomousRunStatus::WaitingInput
+        );
 
         let incomplete = runtime
             .answer_ask(
@@ -4601,6 +4823,19 @@ mod tests {
             json!(["로그", "직접 입력"])
         );
         assert!(runtime.pending_ask().is_none());
+        assert_eq!(
+            sessions
+                .load(runtime.session_id())
+                .unwrap()
+                .autonomous_run
+                .unwrap()
+                .status,
+            crate::autonomous::AutonomousRunStatus::Running
+        );
+        assert_eq!(
+            emitted_autonomous.recv().await.unwrap().status,
+            crate::autonomous::AutonomousRunStatus::Running
+        );
     }
 
     #[tokio::test]
@@ -4647,7 +4882,7 @@ mod tests {
         let services = ToolServices::for_tests();
         let runtime = services.session("only-session");
         runtime.begin_request("request-old", "project").unwrap();
-        let old = runtime.request_write_workspace("write after read").unwrap();
+        let old = runtime.register_write_request("write after read").unwrap();
         assert_eq!(old.state(), crate::write_coordinator::TicketState::Granted);
 
         let error = runtime
@@ -4658,7 +4893,7 @@ mod tests {
         runtime.abort_unmutated_write_intent().unwrap();
         runtime.clear_current();
         runtime.begin_request("request-new", "project").unwrap();
-        let next = runtime.request_write_workspace("retry write").unwrap();
+        let next = runtime.register_write_request("retry write").unwrap();
         assert_eq!(
             next.state(),
             crate::write_coordinator::TicketState::Granted,
@@ -4667,13 +4902,13 @@ mod tests {
     }
 
     #[test]
-    fn every_mutating_tool_requires_the_exact_session_write_lease() {
+    fn every_write_workspace_tool_requires_the_exact_session_write_lease() {
         let runtime = SessionToolRuntime::for_tests();
         runtime.begin_request("req-read-only", "project").unwrap();
 
         for spec in tools::tool_registry()
             .into_iter()
-            .filter(|spec| spec.mutating)
+            .filter(|spec| spec.requires_write_workspace)
         {
             let error = runtime
                 .execute(spec.name, &json!({}))
@@ -4696,7 +4931,7 @@ mod tests {
             let mut state = session_a.request_state.lock();
             let state = state.as_mut().expect("session A state");
             state.record_search_docs();
-            state.build_fix_attempts = 1;
+            state.iteration_action_count = 7;
         }
 
         session_b.begin_request("request-b", "project").unwrap();
@@ -4705,7 +4940,7 @@ mod tests {
             .request_state_snapshot()
             .expect("session B must not clear session A");
         assert!(state_a.docs_searched);
-        assert_eq!(state_a.build_fix_attempts, 1);
+        assert_eq!(state_a.iteration_action_count, 7);
         assert_eq!(
             session_b.request_state_snapshot().unwrap().request_id,
             "request-b"
@@ -4751,7 +4986,7 @@ mod tests {
     }
 
     #[test]
-    fn progressive_docs_discovery_preserves_exact_reads_and_reports_repeats() {
+    fn progressive_docs_discovery_preserves_exact_reads_and_rejects_no_progress() {
         let full_text = format!("{} SelectionCircle {}", "앞".repeat(600), "뒤".repeat(600));
         let mut services = ToolServices::for_tests();
         services.rag = Arc::new(Rag::new(
@@ -4792,15 +5027,21 @@ mod tests {
             "discovery must not inject the complete chunk"
         );
 
-        let second = runtime
+        let exact_repeat = runtime
             .execute(
                 tools::SEARCH_DOCS_TOOL,
-                &json!({"query": "SelectionCircle", "k": 1}),
+                &json!({"query": "  selectioncircle  ", "k": 1}),
             )
-            .unwrap();
-        assert_eq!(second["newCount"], 0);
-        assert_eq!(second["repeatedCount"], 1);
-        assert_eq!(second["hits"][0]["repeated"], true);
+            .unwrap_err();
+        assert!(exact_repeat.contains("no-progress"));
+
+        let no_novel_ids = runtime
+            .execute(
+                tools::SEARCH_DOCS_TOOL,
+                &json!({"query": "Circle Selection", "k": 1}),
+            )
+            .unwrap_err();
+        assert!(no_novel_ids.contains("no new stable"));
 
         let exact = runtime
             .execute(tools::DOCS_GET_TOOL, &json!({"ids": ["0000000000000123"]}))
@@ -4846,7 +5087,7 @@ mod tests {
         let error = runtime
             .execute("teleport", &json!({}))
             .expect_err("an unregistered tool must be rejected");
-        assert!(error.contains("unknown tool"), "got: {error}");
+        assert!(error.contains("Unknown tool"), "got: {error}");
     }
 
     #[test]

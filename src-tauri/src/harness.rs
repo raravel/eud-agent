@@ -914,11 +914,14 @@ fn promoted_ref(relative: &str, path: &Path) -> Result<crate::task_state::Promot
 }
 
 pub fn cleanup_job_workspace(dirs: &DataDirs, job: &HarnessJob) {
-    let root = dirs
-        .session_workspaces_dir()
-        .join(&job.workspace_id)
-        .join(&job.workspace_session_id);
-    let _ = fs::remove_dir_all(root);
+    // The harness stages directly against canonical documents; only its
+    // per-session `.tmp` scratch directory is job-owned.
+    if let Ok(root) = WorkspaceManager::new(dirs.clone()).workspace_root(&job.workspace_id) {
+        let temp = root
+            .join(crate::workspace::TEMP_DIR)
+            .join(&job.workspace_session_id);
+        let _ = fs::remove_dir_all(temp);
+    }
 }
 
 fn render_worklog(job: &HarnessJob, delta: &HarnessDelta) -> String {
@@ -1235,7 +1238,7 @@ mod tests {
         dirs.ensure_dirs().unwrap();
         let workspace = prepare_project(&dirs, &base);
         let workspace_id = workspace.id;
-        let document = workspace.root.join("specs/gameplay.md");
+        let document = workspace.workspace_root.join("specs/gameplay.md");
         fs::create_dir_all(document.parent().unwrap()).unwrap();
         fs::write(&document, "# Gameplay\n\nCurrent behavior.\n").unwrap();
         let mut job = HarnessJob::new(
@@ -1330,7 +1333,7 @@ mod tests {
         dirs.ensure_dirs().unwrap();
         let canonical = prepare_project(&dirs, &base);
         fs::write(
-            canonical.root.join("specs/game.md"),
+            canonical.workspace_root.join("specs/game.md"),
             "# Gameplay\n\nOld behavior.\n",
         )
         .unwrap();
@@ -1369,10 +1372,7 @@ mod tests {
         let request_id = job.harness_request_id.as_deref().unwrap();
         let changeset = journal.changeset(request_id).unwrap();
         assert_eq!(changeset.items.len(), 2);
-        let workspace_root = dirs
-            .session_workspaces_dir()
-            .join(&canonical.id)
-            .join(&job.workspace_session_id);
+        let workspace_root = canonical.workspace_root.clone();
         assert!(fs::read_to_string(workspace_root.join("specs/game.md"))
             .unwrap()
             .contains("Accepted behavior."));
@@ -1390,7 +1390,7 @@ mod tests {
         dirs.ensure_dirs().unwrap();
         let workspace = prepare_project(&dirs, &base);
         let workspace_id = workspace.id;
-        let document = workspace.root.join("specs/game.md");
+        let document = workspace.workspace_root.join("specs/game.md");
         fs::create_dir_all(document.parent().unwrap()).unwrap();
         fs::write(&document, "Accepted behavior.").unwrap();
         let memory = ProjectMemory::current(&dirs).unwrap();

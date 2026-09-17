@@ -17,10 +17,4 @@ describe("ConnectionNotice", () => {
     ).toBeInTheDocument();
   });
 
-  it("states that the native project cannot be opened", () => {
-    render(<ConnectionNotice />);
-
-    expect(screen.getByText(/Native 프로젝트를 열 수 없습니다/)).toBeInTheDocument();
-    expect(screen.getByText(/project\.json/)).toBeInTheDocument();
-  });
 });

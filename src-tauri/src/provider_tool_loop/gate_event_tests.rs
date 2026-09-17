@@ -120,7 +120,7 @@ async fn executed_tool_error_is_a_recoverable_completion() {
 }
 
 #[tokio::test]
-async fn native_schema_and_duplicate_failures_close_admission() {
+async fn native_schema_failures_are_recoverable_usage_completions() {
     for (run_id, request_id, arguments) in [
         (81_005, "schema-request", serde_json::json!({})),
         (
@@ -135,23 +135,32 @@ async fn native_schema_and_duplicate_failures_close_admission() {
         runtime.begin_request(request_id, "project").unwrap();
         let gate = gate(runtime, run_id, request_id);
 
-        let error = gate
+        let result = gate
             .dispatch_native(
                 Some("schema-call".to_string()),
                 "read_file".to_string(),
                 arguments,
             )
             .await
-            .unwrap_err();
+            .unwrap();
 
-        assert!(error.contains("arguments do not match"));
-        assert_eq!(
-            gate.fatal_admission_error().as_deref(),
-            Some(error.as_str())
+        // The model receives actionable usage guidance, not a bare mismatch.
+        assert!(result.is_error);
+        let message = result.result.as_str().unwrap();
+        assert!(message.contains("Usage: read_file(path)"), "{message}");
+        assert!(
+            message.contains("arguments do not match the documented input schema"),
+            "{message}"
         );
-        assert!(gate.completed().is_empty());
+        // No fatal error: admission stays open and the run continues.
+        assert!(gate.fatal_admission_error().is_none());
+        assert_eq!(gate.completed().len(), 1);
+        assert!(gate.completed()[0].is_error);
     }
+}
 
+#[tokio::test]
+async fn native_duplicate_failures_close_admission() {
     let runtime = SessionToolRuntime::for_tests();
     let (_cancel, cancellation) = tokio::sync::watch::channel(0_u64);
     runtime.set_cancellation(cancellation);

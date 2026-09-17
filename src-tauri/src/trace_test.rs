@@ -36,7 +36,7 @@ const DEFAULT_TEST_TIMEOUT_MS: u64 = 30_000;
 const MIN_TEST_TIMEOUT_MS: u64 = 1_000;
 const MAX_TEST_TIMEOUT_MS: u64 = 120_000;
 const TEST_MAP_PREFIX: &str = "zzzz-eud-agent-";
-const PERSISTENT_TEST_ROOT: &str = "tests/";
+const PERSISTENT_TEST_ROOT: &str = "src/tests/";
 const PERSISTENT_TEST_SUFFIX: &str = ".tests.eps";
 const MAX_PERSISTENT_TESTS: usize = 256;
 const INTERNAL_BEGIN_EVENT: u32 = 0xffff_ff00;
@@ -333,7 +333,7 @@ pub(crate) fn select_persistent_tests(
                 let path = normalize_relative(raw_path)?;
                 if !is_persistent_test_path(&path) {
                     return Err(format!(
-                        "persistent test path must match tests/**/*.tests.eps: {raw_path}"
+                        "persistent test path must match src/tests/**/*.tests.eps: {raw_path}"
                     ));
                 }
                 let key = path.to_lowercase();
@@ -593,6 +593,7 @@ pub fn run(
     };
     write_json(&run_root.join("result.json"), &result)?;
     let _ = fs::remove_dir_all(run_root.join("build"));
+    let _ = fs::remove_dir_all(run_root.join("src"));
     Ok(result)
 }
 
@@ -681,6 +682,12 @@ fn prepare_build(
         )?;
     }
 
+    // The EDS main section references `../../src/<main>.eps` relative to `<run>/build/euddraft`,
+    // so the isolated tree must also carry `<run>/src` or the build fails with FileNotFoundError
+    // (plan §6 Phase 8 defect 1, option b). Copying the canonical source — never rewriting the
+    // relative section to an absolute path — keeps the run isolated from concurrent live edits.
+    copy_project_src(source_build_root, run_root, &mut budget)?;
+
     let copied_parent = copied_build_root.join(
         source_parent
             .file_name()
@@ -752,11 +759,9 @@ fn copy_tree(source: &Path, destination: &Path, budget: &mut CopyBudget) -> Resu
         fs::create_dir_all(destination).map_err(|error| error.to_string())?;
         for entry in fs::read_dir(source).map_err(|error| error.to_string())? {
             let entry = entry.map_err(|error| error.to_string())?;
-            if entry
-                .file_name()
-                .to_string_lossy()
-                .eq_ignore_ascii_case("__pycache__")
-            {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.eq_ignore_ascii_case("__pycache__") || name.eq_ignore_ascii_case("__epspy__") {
                 continue;
             }
             copy_tree(&entry.path(), &destination.join(entry.file_name()), budget)?;
@@ -772,10 +777,34 @@ fn copy_tree(source: &Path, destination: &Path, budget: &mut CopyBudget) -> Resu
     budget.files += 1;
     budget.bytes = budget.bytes.saturating_add(metadata.len());
     if budget.files > MAX_BUILD_COPY_FILES || budget.bytes > MAX_BUILD_COPY_BYTES {
-        return Err("generated EDS build directory exceeds trace-copy limits".to_string());
+        return Err("trace-build copy exceeds limits".to_string());
     }
     fs::copy(source, destination).map_err(|error| error.to_string())?;
     Ok(())
+}
+
+/// Copy `<project>/src` into `<run>/src` so the EDS main section's relative
+/// `../../src/<main>.eps` resolves inside the isolated run tree. `source_build_root` is
+/// `<project>/build` (the EDS build directory's parent), so its parent is the project root.
+fn copy_project_src(
+    source_build_root: &Path,
+    run_root: &Path,
+    budget: &mut CopyBudget,
+) -> Result<(), String> {
+    let project_root = source_build_root.parent().ok_or_else(|| {
+        format!(
+            "EDS build root has no parent: '{}'",
+            source_build_root.display()
+        )
+    })?;
+    let source_src = project_root.join("src");
+    if !source_src.is_dir() {
+        return Err(format!(
+            "project source directory is missing for trace build: '{}'",
+            source_src.display()
+        ));
+    }
+    copy_tree(&source_src, &run_root.join("src"), budget)
 }
 
 fn resolve_eds_input(eds_parent: &Path, text: &str) -> Result<PathBuf, String> {
@@ -1069,12 +1098,22 @@ fn resolve_x86_starcraft(setting: &Path) -> Result<PathBuf, String> {
     {
         return Ok(setting.to_path_buf());
     }
-    let root = setting.parent().ok_or_else(|| {
-        format!(
-            "StarCraft setting has no install root: '{}'",
-            setting.display()
-        )
-    })?;
+    // A directory setting is the install root itself (e.g. `map_context::resolve_starcraft_path`
+    // returns `C:\Program Files (x86)\StarCraft`); a file setting is the root `StarCraft.exe`
+    // whose parent is the install root. Either way the 32-bit client lives in `<root>\x86`.
+    let root = if setting.is_dir() {
+        setting.to_path_buf()
+    } else {
+        setting
+            .parent()
+            .ok_or_else(|| {
+                format!(
+                    "StarCraft setting has no install root: '{}'",
+                    setting.display()
+                )
+            })?
+            .to_path_buf()
+    };
     let candidate = root.join("x86").join("StarCraft.exe");
     if candidate.is_file() {
         Ok(candidate)
@@ -1798,12 +1837,12 @@ mod tests {
             revision: "revision".to_string(),
             files: vec![
                 NativeSourceFile {
-                    path: "tests/wave.tests.eps".to_string(),
+                    path: "src/tests/wave.tests.eps".to_string(),
                     content: input().code,
                     sha256: "wave".to_string(),
                 },
                 NativeSourceFile {
-                    path: "tests/nested/reward.tests.eps".to_string(),
+                    path: "src/tests/nested/reward.tests.eps".to_string(),
                     content: "function eudAgentTestSetup() {}\nfunction eudAgentTestStep(tick) { eudAgentPass(3); }"
                         .to_string(),
                     sha256: "reward".to_string(),
@@ -1921,8 +1960,8 @@ mod tests {
         assert_eq!(
             all.discovered,
             vec![
-                "tests/nested/reward.tests.eps".to_string(),
-                "tests/wave.tests.eps".to_string(),
+                "src/tests/nested/reward.tests.eps".to_string(),
+                "src/tests/wave.tests.eps".to_string(),
             ]
         );
         assert_eq!(
@@ -1930,15 +1969,18 @@ mod tests {
                 .iter()
                 .map(|test| test.path.as_str())
                 .collect::<Vec<_>>(),
-            vec!["tests/nested/reward.tests.eps", "tests/wave.tests.eps",]
+            vec![
+                "src/tests/nested/reward.tests.eps",
+                "src/tests/wave.tests.eps",
+            ]
         );
 
         let selected = select_persistent_tests(
             &persistent_snapshot(),
             &TraceSuiteInput {
                 tests: Some(vec![
-                    "tests/wave.tests.eps".to_string(),
-                    "tests/nested/reward.tests.eps".to_string(),
+                    "src/tests/wave.tests.eps".to_string(),
+                    "src/tests/nested/reward.tests.eps".to_string(),
                 ]),
                 timeout_ms: 5_000,
             },
@@ -1950,18 +1992,21 @@ mod tests {
                 .iter()
                 .map(|test| test.path.as_str())
                 .collect::<Vec<_>>(),
-            vec!["tests/wave.tests.eps", "tests/nested/reward.tests.eps",]
+            vec![
+                "src/tests/wave.tests.eps",
+                "src/tests/nested/reward.tests.eps",
+            ]
         );
     }
 
     #[test]
     fn persistent_selection_rejects_missing_outside_and_duplicate_paths() {
         for tests in [
-            vec!["tests/missing.tests.eps".to_string()],
+            vec!["src/tests/missing.tests.eps".to_string()],
             vec!["feature.tests.eps".to_string()],
             vec![
-                "tests/wave.tests.eps".to_string(),
-                "TESTS/WAVE.TESTS.EPS".to_string(),
+                "src/tests/wave.tests.eps".to_string(),
+                "SRC/TESTS/WAVE.TESTS.EPS".to_string(),
             ],
         ] {
             assert!(select_persistent_tests(
@@ -1980,7 +2025,7 @@ mod tests {
         let base =
             std::env::temp_dir().join(format!("eud-agent-trace-suite-{}", uuid::Uuid::new_v4()));
         let dirs = DataDirs::from_bases(&base.join("roaming"), &base.join("local"));
-        let path = "tests/invalid.tests.eps".to_string();
+        let path = "src/tests/invalid.tests.eps".to_string();
         let result = run_suite(
             &dirs,
             Path::new("missing.eds"),
@@ -2048,6 +2093,75 @@ mod tests {
         assert!(result.selected.is_empty());
         assert!(result.tests.is_empty());
         let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn copy_project_src_mirrors_source_and_skips_generated_artifacts() {
+        let base =
+            std::env::temp_dir().join(format!("eud-agent-trace-src-copy-{}", uuid::Uuid::new_v4()));
+        let project = base.join("project");
+        let build_root = project.join("build");
+        fs::create_dir_all(build_root.join("euddraft")).unwrap();
+        fs::create_dir_all(project.join("src/nested")).unwrap();
+        fs::write(
+            project.join("src/main.eps"),
+            b"function onPluginStart() {}\n",
+        )
+        .unwrap();
+        fs::write(project.join("src/nested/feature.eps"), b"// feature\n").unwrap();
+        // Build-time generated shadows must never enter the isolated run tree.
+        fs::create_dir_all(project.join("src/__epspy__")).unwrap();
+        fs::write(project.join("src/__epspy__/main.py"), b"# generated\n").unwrap();
+        fs::create_dir_all(project.join("src/nested/__pycache__")).unwrap();
+        fs::write(project.join("src/nested/__pycache__/x.pyc"), b"\x00\x01").unwrap();
+
+        let run_root = base.join("run");
+        fs::create_dir_all(&run_root).unwrap();
+        let mut budget = CopyBudget::default();
+        copy_project_src(&build_root, &run_root, &mut budget).unwrap();
+
+        let copied = run_root.join("src");
+        assert!(copied.join("main.eps").is_file());
+        assert!(copied.join("nested/feature.eps").is_file());
+        assert!(!copied.join("__epspy__").exists());
+        assert!(!copied.join("nested/__pycache__").exists());
+        assert_eq!(budget.files, 2);
+
+        // The project source directory is mandatory: a missing `<project>/src` is a hard error.
+        let bare_build = base.join("bare/build");
+        fs::create_dir_all(&bare_build).unwrap();
+        let bare_run = base.join("bare-run");
+        fs::create_dir_all(&bare_run).unwrap();
+        assert!(copy_project_src(&bare_build, &bare_run, &mut CopyBudget::default()).is_err());
+
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn resolve_x86_starcraft_accepts_install_root_directory_and_exe_file() {
+        let base =
+            std::env::temp_dir().join(format!("eud-agent-trace-sc-{}", uuid::Uuid::new_v4()));
+        let x86 = base.join("x86");
+        fs::create_dir_all(&x86).unwrap();
+        let client = x86.join("StarCraft.exe");
+        fs::write(&client, b"MZ").unwrap();
+
+        // Directory setting = install root (`map_context::resolve_starcraft_path` contract).
+        assert_eq!(resolve_x86_starcraft(&base).unwrap(), client);
+        // File setting naming StarCraft.exe is returned directly.
+        assert_eq!(resolve_x86_starcraft(&client).unwrap(), client);
+
+        // A root with no 32-bit client fails clearly and names the expected path.
+        let bare = base.join("bare-root");
+        fs::create_dir_all(&bare).unwrap();
+        let error = resolve_x86_starcraft(&bare).unwrap_err();
+        assert!(
+            error.contains("32-bit StarCraft client is missing"),
+            "{error}"
+        );
+        assert!(error.contains("StarCraft.exe"), "{error}");
+
+        fs::remove_dir_all(base).ok();
     }
 
     #[test]
@@ -2190,7 +2304,7 @@ mod tests {
             main_file: "src/main.eps".to_string(),
             revision: "live".to_string(),
             files: vec![NativeSourceFile {
-                path: "tests/protocol.tests.eps".to_string(),
+                path: "src/tests/protocol.tests.eps".to_string(),
                 content: "function eudAgentTestSetup() {}\nfunction eudAgentTestStep(tick) {\n    if (tick == 8) {\n        if (eudAgentAssertEq(100, 42, 42)) {\n            eudAgentPass(101);\n        }\n    }\n}"
                     .to_string(),
                 sha256: "live".to_string(),
@@ -2215,7 +2329,7 @@ mod tests {
         eprintln!("{}", serde_json::to_string_pretty(&result).unwrap());
         assert_eq!(result.status, TraceTestStatus::Passed, "{result:?}");
         assert_eq!(result.passed, 1);
-        assert_eq!(result.tests[0].path, "tests/protocol.tests.eps");
+        assert_eq!(result.tests[0].path, "src/tests/protocol.tests.eps");
         assert_eq!(result.tests[0].source_map_unchanged, Some(true));
         assert!(result.tests[0].summary.contains("3 event(s)"));
         assert!(Path::new(&result.log_dir).join("suite.json").is_file());

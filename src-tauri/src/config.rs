@@ -355,17 +355,12 @@ impl DataDirs {
         self.app_data.join("memory")
     }
 
-    /// `%appdata%\eud-agent\workspaces` — preserved legacy import sources and
-    /// machine-local session working roots. Accepted documents now live under
-    /// the selected project's `.eud-agent/workspace`.
+    /// `%appdata%\eud-agent\workspaces` — preserved legacy import sources.
+    /// Accepted documents live under the selected project's `.eud-agent/workspace`;
+    /// the provider CLI cwd is the project root itself, so there are no
+    /// machine-local session working roots anymore.
     pub fn workspaces_dir(&self) -> PathBuf {
         self.app_data.join("workspaces")
-    }
-
-    /// Session-owned Codex working roots. Generated source mirrors and writable
-    /// turn copies stay machine-local, separate from accepted project documents.
-    pub fn session_workspaces_dir(&self) -> PathBuf {
-        self.workspaces_dir().join(".sessions")
     }
 
     /// Parent-owned turn baselines and preserved legacy trusted-state sources.
@@ -539,7 +534,6 @@ impl DataDirs {
             self.memory_dir(),
             self.workspaces_dir(),
             self.workspace_state_dir(),
-            self.session_workspaces_dir(),
             self.map_backups_dir(),
             self.map_candidates_dir(),
             self.journal_dir(),

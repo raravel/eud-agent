@@ -45,6 +45,7 @@ fn save_session(fixture: &RuntimeFixture, binding: &ProviderBinding) -> SessionS
             panel_log: serde_json::Value::Null,
             context_state: Default::default(),
             task_state: Default::default(),
+            autonomous_run: None,
         })
         .expect("save session consumed by production usage sink");
     store
