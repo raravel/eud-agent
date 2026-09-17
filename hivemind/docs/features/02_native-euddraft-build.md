@@ -38,6 +38,12 @@ These assets are copied into `%LOCALAPPDATA%/eud-agent/native_assets` at startup
 
 Unchanged sparse families emit no plugin. Standard DAT address/delta math follows the source-verified Editor generator contract.
 
+Requirement and TBL output follow the Editor's `WriteReqFile`/`tblReader`/`tblWriter` byte contract, verified against a real Editor build folder of the same project:
+
+- an `orders` requirement pointer addresses the word after the leading order-id word, matching stock `require.dat`; a pointer at the id word makes the game read that id as a must-own-unit opcode, which drops MSQC queue commands and other orders;
+- a TBL entry ends at the first NUL after at least two bytes, so hotkey strings such as `o<00>Tank Mode` keep their text;
+- `custom_txt.tbl` always dumps the complete 1547-entry table because `dataDumper` copies it over the in-game header in place.
+
 ## euddraft process
 
 `EuddraftLaunch` accepts `euddraft.exe` or `euddraft.py`, normalizes argv, and runs with:

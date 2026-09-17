@@ -875,12 +875,14 @@ fn generate_requirement_artifacts(
             if !resolved.allocated {
                 continue;
             }
+            if writes_object_id {
+                // Editor records StartPos after the order id word; stock require.dat
+                // points every order past its id as well.
+                section.extend_from_slice(&(object_id as u16).to_le_bytes());
+            }
             let pointer = u16::try_from(section.len() / 2)
                 .map_err(|_| format!("{table} requirement pointer overflow"))?;
             pointers[object_id] = pointer;
-            if writes_object_id {
-                section.extend_from_slice(&(object_id as u16).to_le_bytes());
-            }
             for block in &resolved.blocks {
                 write_requirement_block(&mut section, block)?;
             }
@@ -1600,9 +1602,12 @@ fn decode_tbl(bytes: &[u8]) -> Result<Vec<String>, String> {
         if start >= bytes.len() {
             return Err(format!("stat_txt.tbl offset {index} is invalid"));
         }
+        // Editor's tblReader only treats a NUL after at least two bytes as the terminator,
+        // so hotkey strings such as "o<00>Tank Mode" keep their text past the separator.
         let end = bytes[start..]
             .iter()
-            .position(|value| *value == 0)
+            .enumerate()
+            .position(|(relative, value)| *value == 0 && relative >= 2)
             .map(|relative| start + relative)
             .unwrap_or(bytes.len());
         let slice = &bytes[start..end];
@@ -1637,7 +1642,9 @@ fn encode_custom_tbl(
             baseline.len()
         ));
     }
-    let mut values = baseline[..=last].to_vec();
+    // Editor always dumps the complete table: the game keeps indexing the original
+    // 1547-entry header, so a shorter copy leaves the tail reading string bytes as offsets.
+    let mut values = baseline.to_vec();
     for (index, change) in overrides {
         values[*index as usize] = change.after.clone();
     }
@@ -1959,8 +1966,8 @@ fn stringify_io(error: std::io::Error) -> String {
 mod tests {
     use super::*;
     use crate::native_project::{
-        DatScalar, DatTarget, EdsPlugin, NativeDatChange, NativeDatPatch, ProjectManifest,
-        ProjectSettings,
+        DatScalar, DatTarget, EdsPlugin, NativeDatChange, NativeDatPatch, NativeDatState,
+        ProjectManifest, ProjectSettings,
     };
     use std::collections::HashMap;
 
@@ -2023,6 +2030,44 @@ mod tests {
     }
 
     #[test]
+    fn order_requirement_pointers_skip_the_order_id_word_like_editor() {
+        // Editor's WriteRequireData writes the order id before recording StartPos, and
+        // the stock require.dat points every order at the word after its id. A pointer
+        // at the id word makes the game read that id as a "must own unit" opcode.
+        let catalog = DatCatalog::load(&compat_root()).unwrap();
+        let mut dat = NativeDatState::default();
+        dat.requirements.tables.insert(
+            "orders".to_string(),
+            BTreeMap::from([(
+                6_u32,
+                crate::native_project::TextOverride {
+                    before: catalog.requirement_payload("orders", 6).unwrap(),
+                    after: "2".to_string(),
+                },
+            )]),
+        );
+        let artifacts = generate_requirement_artifacts(&dat, &catalog)
+            .unwrap()
+            .unwrap();
+        let orders_base = 1096 + 840 + 320 + 688;
+        let orders = &artifacts.bytes[orders_base..orders_base + 1316];
+        let word = |index: usize| u16::from_le_bytes([orders[index * 2], orders[index * 2 + 1]]);
+        for (order_id, pointer) in artifacts.pointers["orders"].iter().enumerate() {
+            if *pointer == 0 {
+                continue;
+            }
+            assert_eq!(
+                word(*pointer as usize - 1),
+                order_id as u16,
+                "order {order_id} pointer {pointer} must follow its id word"
+            );
+        }
+        assert_eq!(artifacts.pointers["orders"][0], 2);
+        assert_eq!(word(artifacts.pointers["orders"][6] as usize), 0xffff);
+        assert_eq!(artifacts.pointers["units"][0], 1);
+    }
+
+    #[test]
     fn standard_dat_plugin_matches_editor_address_math() {
         let (root, mut project) = project("dat");
         let target = DatTarget::Dat {
@@ -2075,6 +2120,11 @@ mod tests {
         let encoded = encode_custom_tbl(&baseline, &overrides).unwrap();
         let decoded = decode_tbl(&encoded).unwrap();
         assert!(decoded[0].starts_with("정예 해병"));
+        assert_eq!(decoded.len(), baseline.len());
+        assert_eq!(decoded[1..], baseline[1..]);
+        // Hotkey strings separate the key from the text with a NUL in the second byte.
+        assert_eq!(baseline[338], "o\u{0}Tank M\u{3}o\u{1}de");
+        assert_eq!(baseline[0], "Terran Marine");
     }
     fn synthetic_artifacts(root: &Path) -> NativeBuildArtifacts {
         NativeBuildArtifacts {
