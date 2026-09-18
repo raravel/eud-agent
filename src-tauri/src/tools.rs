@@ -31,6 +31,12 @@ pub const PYTHON_DEPENDENCIES_PREPARE_TOOL: &str = "python_dependencies_prepare"
 pub const PYTHON_DEPENDENCIES_SET_TOOL: &str = "python_dependencies_set";
 /// Flow-control tool that pauses the current turn for structured user input.
 pub const ASK_TOOL: &str = "ask";
+/// Bounded wait for one `ask` before it expires into a plain-text handoff.
+///
+/// Native Codex/Claude CLIs abort a silent MCP call after 300 seconds and
+/// progress notifications do not extend it (measured 2026-09-17, `verify.md`),
+/// so no single tool call may wait longer than this.
+pub const ASK_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(240);
 
 /// Soft action threshold for one foreground iteration.
 pub const ITERATION_TOOL_ACTION_THRESHOLD: usize = 300;
@@ -872,7 +878,7 @@ pub fn tool_registry() -> Vec<ToolSpec> {
         ),
         read_tool(
             ASK_TOOL,
-            "Pause this turn to ask the user up to four related questions. Each question supports single or multiple choice and always allows direct input.",
+            "Pause this turn to ask the user up to four related questions. Each question supports single or multiple choice and always allows direct input. The user has 240 seconds to answer in the panel. A result with status \"unanswered\" means no answer arrived in time: restate the same questions as your final plain-text answer, end the turn, and treat the user's next message as the answer. Never call ask again after an unanswered result in the same turn.",
             schema(json!({"questions": ask_questions_schema()}), &["questions"]),
         ),
         canonical_tool(

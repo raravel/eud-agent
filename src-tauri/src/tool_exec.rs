@@ -212,14 +212,36 @@ type AutonomousEmitter =
 struct PendingAsk {
     owner_request_id: String,
     questions: Vec<crate::ipc::AskQuestion>,
+    /// When the bounded wait started, so a restored card shows the real remainder.
+    started_at: std::time::Instant,
     response: tokio::sync::oneshot::Sender<Result<BTreeMap<String, crate::ipc::AskAnswer>, String>>,
 }
 
-#[derive(Default)]
+/// The one ask of the current foreground run whose bounded wait elapsed.
+struct ExpiredAsk {
+    ask_request_id: String,
+    owner_request_id: String,
+}
+
 struct AskState {
     next_id: u64,
     emitter: Option<AskEmitter>,
     pending: HashMap<String, PendingAsk>,
+    /// Bounded wait before a pending ask expires; tests inject shorter values.
+    wait_timeout: Duration,
+    expired: Option<ExpiredAsk>,
+}
+
+impl Default for AskState {
+    fn default() -> Self {
+        Self {
+            next_id: 0,
+            emitter: None,
+            pending: HashMap::new(),
+            wait_timeout: tools::ASK_WAIT_TIMEOUT,
+            expired: None,
+        }
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -521,6 +543,30 @@ impl SessionToolRuntime {
         self.ask_waiting.subscribe()
     }
 
+    /// Override the bounded ask wait (tests only; production keeps
+    /// [`tools::ASK_WAIT_TIMEOUT`]).
+    #[cfg(test)]
+    pub(crate) fn set_ask_wait_timeout(&self, timeout: Duration) {
+        self.ask.lock().wait_timeout = timeout;
+    }
+
+    /// Whether an ask of `request_id` expired in the current foreground run, so
+    /// the turn is ending with the question restated as text.
+    pub(crate) fn ask_expired_for_request(&self, request_id: &str) -> bool {
+        self.ask
+            .lock()
+            .expired
+            .as_ref()
+            .is_some_and(|expired| expired.owner_request_id == request_id)
+    }
+
+    /// Forget an expired ask. The engine calls this whenever it starts a new
+    /// foreground run for the same request (continuation, plan feedback, write
+    /// transition), so the "do not ask again" rule covers exactly one run.
+    pub(crate) fn clear_expired_ask(&self) {
+        self.ask.lock().expired = None;
+    }
+
     fn emit_progress(&self, stage: crate::ipc::ProgressStage, detail: &str) {
         if let Some(emitter) = self.progress_emitter.lock().clone() {
             let identity = self.provider_identity.lock().clone();
@@ -577,10 +623,20 @@ impl SessionToolRuntime {
         {
             return Err("stale provider run cannot create an ask request".to_string());
         }
-        let (request_id, response, emitter) = {
+        let (request_id, response, emitter, wait_timeout) = {
             let mut ask = self.ask.lock();
             if !ask.pending.is_empty() {
                 return Err("another ask request is already waiting for this session".to_string());
+            }
+            if ask
+                .expired
+                .as_ref()
+                .is_some_and(|expired| expired.owner_request_id == expected_request_id)
+            {
+                return Err(
+                    "a previous ask in this turn went unanswered; restate the questions as your final text answer and end the turn instead of calling ask again"
+                        .to_string(),
+                );
             }
             let emitter = ask
                 .emitter
@@ -597,11 +653,13 @@ impl SessionToolRuntime {
                 PendingAsk {
                     owner_request_id: expected_request_id.to_string(),
                     questions: input.questions.clone(),
+                    started_at: std::time::Instant::now(),
                     response: send,
                 },
             );
             self.ask_waiting.send_replace(true);
-            (request_id, response, emitter)
+            let wait_timeout = ask.wait_timeout;
+            (request_id, response, emitter, wait_timeout)
         };
         drop(request_guard);
         let _lease = PendingAskLease {
@@ -614,14 +672,73 @@ impl SessionToolRuntime {
             crate::autonomous::AutonomousRunStatus::WaitingInput,
             Some(crate::autonomous::AutonomousPauseReason::WaitingInput),
         )?;
+        let wait_seconds = wait_timeout.as_secs();
         emitter(crate::ipc::AskEvent {
-            request_id,
-            questions: input.questions,
+            request_id: request_id.clone(),
+            status: crate::ipc::AskEventStatus::Pending,
+            wait_seconds: Some(wait_seconds),
+            questions: input.questions.clone(),
         })?;
 
-        let answers = response
-            .await
-            .map_err(|_| "ask response channel closed".to_string())??;
+        tokio::pin!(response);
+        let deadline = tokio::time::sleep(wait_timeout);
+        tokio::pin!(deadline);
+        let answers = tokio::select! {
+            biased;
+            answered = &mut response => Some(answered),
+            _ = &mut deadline => None,
+        };
+        let answers = match answers {
+            Some(answered) => answered,
+            None => {
+                // The wait elapsed. If `answer_ask` removed the pending entry in
+                // the meantime its answer already sits in the channel and wins;
+                // otherwise this ask expires and the turn continues as text.
+                let expired = {
+                    let mut ask = self.ask.lock();
+                    let removed = ask.pending.remove(&request_id).is_some();
+                    if removed {
+                        self.ask_waiting.send_replace(!ask.pending.is_empty());
+                        ask.expired = Some(ExpiredAsk {
+                            ask_request_id: request_id.clone(),
+                            owner_request_id: expected_request_id.to_string(),
+                        });
+                    }
+                    removed
+                };
+                if !expired {
+                    response.await
+                } else {
+                    // The expiry is already recorded; status/UI publication
+                    // failures must not turn it into a tool error.
+                    self.emit_activity_after_ask();
+                    if let Err(error) = self.update_autonomous_status(
+                        crate::autonomous::AutonomousRunStatus::Running,
+                        None,
+                    ) {
+                        eprintln!("eud-agent: ask expiry status update failed: {error}");
+                    }
+                    if let Err(error) = emitter(crate::ipc::AskEvent {
+                        request_id,
+                        status: crate::ipc::AskEventStatus::Expired,
+                        wait_seconds: Some(wait_seconds),
+                        questions: input.questions.clone(),
+                    }) {
+                        eprintln!("eud-agent: ask expiry event failed: {error}");
+                    }
+                    return Ok(json!({
+                        "status": "unanswered",
+                        "questionIds": input
+                            .questions
+                            .iter()
+                            .map(|question| question.id.as_str())
+                            .collect::<Vec<_>>(),
+                        "waitedSeconds": wait_seconds,
+                    }));
+                }
+            }
+        };
+        let answers = answers.map_err(|_| "ask response channel closed".to_string())??;
         self.update_autonomous_status(crate::autonomous::AutonomousRunStatus::Running, None)?;
         Ok(json!({ "answers": answers }))
     }
@@ -632,6 +749,12 @@ impl SessionToolRuntime {
         ask.pending.iter().find_map(|(request_id, pending)| {
             (pending.owner_request_id == owner_request_id).then(|| crate::ipc::AskEvent {
                 request_id: request_id.clone(),
+                status: crate::ipc::AskEventStatus::Pending,
+                wait_seconds: Some(
+                    ask.wait_timeout
+                        .saturating_sub(pending.started_at.elapsed())
+                        .as_secs(),
+                ),
                 questions: pending.questions.clone(),
             })
         })
@@ -660,6 +783,16 @@ impl SessionToolRuntime {
         answers: BTreeMap<String, crate::ipc::AskAnswer>,
     ) -> Result<(), String> {
         let mut ask = self.ask.lock();
+        if ask
+            .expired
+            .as_ref()
+            .is_some_and(|expired| expired.ask_request_id == request_id)
+        {
+            return Err(format!(
+                "ask_expired: 답변 대기 시간({}초)이 지나 접수되지 않았습니다. 대화에 답을 입력해 주세요.",
+                ask.wait_timeout.as_secs()
+            ));
+        }
         let pending = ask
             .pending
             .get(request_id)
@@ -751,6 +884,7 @@ impl SessionToolRuntime {
             audio_temp: None,
         });
         *self.request_state.lock() = Some(RequestState::for_request(request_id));
+        self.ask.lock().expired = None;
         *self.pending_plan.lock() = None;
         *self.last_build.lock() = None;
         *self.sound_build_required.lock() = false;
@@ -759,12 +893,15 @@ impl SessionToolRuntime {
 
     /// Reset only the soft iteration action counter for a continuing request.
     pub fn begin_iteration(&self, request_id: &str) -> Result<(), String> {
-        let mut state = self.request_state.lock();
-        let state = state
-            .as_mut()
-            .filter(|state| state.request_id == request_id)
-            .ok_or_else(|| format!("request state for {request_id} is missing"))?;
-        state.begin_iteration();
+        {
+            let mut state = self.request_state.lock();
+            let state = state
+                .as_mut()
+                .filter(|state| state.request_id == request_id)
+                .ok_or_else(|| format!("request state for {request_id} is missing"))?;
+            state.begin_iteration();
+        }
+        self.ask.lock().expired = None;
         Ok(())
     }
 
@@ -4768,7 +4905,11 @@ mod tests {
         let event = emitted.recv().await.expect("ask event must be emitted");
         assert_eq!(event.questions.len(), 2);
         assert_eq!(event.questions[0].id, "mode");
-        assert_eq!(runtime.pending_ask(), Some(event.clone()));
+        let restored = runtime.pending_ask().expect("ask is pending");
+        assert_eq!(restored.request_id, event.request_id);
+        assert_eq!(restored.questions, event.questions);
+        assert_eq!(restored.status, crate::ipc::AskEventStatus::Pending);
+        assert!(restored.wait_seconds.unwrap() <= event.wait_seconds.unwrap());
         assert_eq!(
             sessions
                 .load(runtime.session_id())
@@ -4875,6 +5016,126 @@ mod tests {
 
         runtime.cancel_pending_ask();
         assert_eq!(second.await.unwrap().unwrap_err(), "ask request cancelled");
+    }
+
+    fn ask_args() -> Value {
+        json!({
+            "questions": [{
+                "id": "mode",
+                "question": "방식을 고르세요.",
+                "options": [{"label": "A"}, {"label": "B"}]
+            }]
+        })
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unanswered_ask_expires_into_a_text_handoff() {
+        // Native CLIs abort a silent MCP call after 300s, so the wait is bounded
+        // and the model continues by restating the question as plain text.
+        let runtime = SessionToolRuntime::for_tests();
+        runtime.set_ask_wait_timeout(Duration::from_millis(50));
+        runtime.begin_request("req-ask-expire", "project").unwrap();
+        let (events, mut emitted) = tokio::sync::mpsc::unbounded_channel();
+        runtime.set_ask_emitter(move |event| {
+            events
+                .send(event)
+                .map_err(|_| "ask event receiver closed".to_string())
+        });
+        let identity = crate::provider_runtime::RunIdentity {
+            session_id: runtime.session_id().to_string(),
+            run_id: crate::provider_runtime::RunId::new(1),
+            request_id: "req-ask-expire".to_string(),
+            session_kind: crate::session::SessionKind::Eps,
+            cancellation_generation: 0,
+        };
+        let (_cancel, receiver) = tokio::sync::watch::channel(0_u64);
+        runtime.set_cancellation(receiver);
+        let mut waiting = runtime.subscribe_ask_waiting();
+
+        let outcome = runtime.ask_for_run(&identity, &ask_args()).await.unwrap();
+        assert_eq!(outcome["status"], "unanswered");
+        assert_eq!(outcome["questionIds"], json!(["mode"]));
+        assert_eq!(outcome["waitedSeconds"], json!(0));
+        let pending = emitted.recv().await.unwrap();
+        assert_eq!(pending.status, crate::ipc::AskEventStatus::Pending);
+        assert_eq!(pending.wait_seconds, Some(0));
+        assert!(pending.questions[0].id == "mode");
+        let expired = emitted.recv().await.unwrap();
+        assert_eq!(expired.request_id, pending.request_id);
+        assert_eq!(expired.status, crate::ipc::AskEventStatus::Expired);
+        assert_eq!(expired.questions, pending.questions);
+        assert!(runtime.pending_ask().is_none());
+        assert!(!*waiting.borrow_and_update());
+        assert!(runtime.ask_expired_for_request("req-ask-expire"));
+
+        let late = runtime
+            .answer_ask(&pending.request_id, BTreeMap::new())
+            .expect_err("an expired ask cannot be answered");
+        assert!(late.starts_with("ask_expired"), "{late}");
+
+        let again = runtime
+            .ask_for_run(&identity, &ask_args())
+            .await
+            .expect_err("the same run cannot ask again after an expiry");
+        assert!(again.contains("unanswered"), "{again}");
+
+        runtime.begin_iteration("req-ask-expire").unwrap();
+        assert!(!runtime.ask_expired_for_request("req-ask-expire"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restored_pending_ask_reports_the_remaining_wait() {
+        let runtime = SessionToolRuntime::for_tests();
+        runtime.set_ask_wait_timeout(Duration::from_secs(30));
+        runtime.begin_request("req-ask-restore", "project").unwrap();
+        runtime.set_ask_emitter(|_| Ok(()));
+        let asking = runtime.clone();
+        let task = tokio::spawn(async move { asking.ask(&ask_args()).await });
+        tokio::time::sleep(Duration::from_millis(1_100)).await;
+        let restored = runtime.pending_ask().expect("ask is still pending");
+        let remaining = restored.wait_seconds.unwrap();
+        assert!(
+            (25..=29).contains(&remaining),
+            "restored wait must be the remainder, got {remaining}"
+        );
+        runtime.clear_expired_ask();
+        runtime.cancel_pending_ask();
+        assert_eq!(task.await.unwrap().unwrap_err(), "ask request cancelled");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ask_answered_before_expiry_keeps_the_answer_and_emits_no_expiry() {
+        let runtime = SessionToolRuntime::for_tests();
+        runtime.set_ask_wait_timeout(Duration::from_millis(80));
+        runtime.begin_request("req-ask-race", "project").unwrap();
+        let (events, mut emitted) = tokio::sync::mpsc::unbounded_channel();
+        runtime.set_ask_emitter(move |event| {
+            events
+                .send(event)
+                .map_err(|_| "ask event receiver closed".to_string())
+        });
+        let asking = runtime.clone();
+        let task = tokio::spawn(async move { asking.ask(&ask_args()).await });
+        let event = emitted.recv().await.unwrap();
+        runtime
+            .answer_ask(
+                &event.request_id,
+                BTreeMap::from([(
+                    "mode".to_string(),
+                    crate::ipc::AskAnswer {
+                        answers: vec!["B".to_string()],
+                    },
+                )]),
+            )
+            .unwrap();
+        let outcome = task.await.unwrap().unwrap();
+        assert_eq!(outcome["answers"]["mode"]["answers"], json!(["B"]));
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            emitted.try_recv().is_err(),
+            "an answered ask must not also expire"
+        );
+        assert!(!runtime.ask_expired_for_request("req-ask-race"));
     }
 
     #[test]

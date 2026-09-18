@@ -36,7 +36,13 @@ export interface MapAgentPanelProps {
   modelSettingsBusy?: boolean;
   mentions: MentionChip[];
   selectedMentionId?: string;
-  ask?: { requestId: string; questions: AskQuestion[]; submitting: boolean };
+  ask?: {
+    requestId: string;
+    questions: AskQuestion[];
+    submitting: boolean;
+    waitSeconds?: number;
+    receivedAt?: number;
+  };
   selections: SavedSelection[];
   mapWidth: number;
   mapHeight: number;
@@ -133,6 +139,8 @@ export function MapAgentPanel({
               requestId={ask.requestId}
               questions={ask.questions}
               submitting={ask.submitting}
+              waitSeconds={ask.waitSeconds}
+              receivedAt={ask.receivedAt}
               onSubmit={(answers) => onAskSubmit(ask.requestId, answers)}
             />
           ) : undefined

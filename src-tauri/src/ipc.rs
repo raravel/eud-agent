@@ -175,11 +175,30 @@ pub struct AskQuestion {
     pub multi: bool,
 }
 
-/// Core-to-panel `ask` event. The request remains pending until `ask_response`.
+/// Lifecycle of one `ask` request as seen by the panel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AskEventStatus {
+    /// Waiting for `ask_response`; the card is actionable.
+    #[default]
+    Pending,
+    /// The bounded wait elapsed; the model continues by restating the question
+    /// as plain text and the user's next message is the answer.
+    Expired,
+}
+
+/// Core-to-panel `ask` event. A `pending` request stays answerable until
+/// `ask_response` or until `wait_seconds` elapse, when an `expired` event with
+/// the same `request_id` closes it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AskEvent {
     pub request_id: String,
+    #[serde(default)]
+    pub status: AskEventStatus,
+    /// Bounded wait for the pending request, in whole seconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait_seconds: Option<u64>,
     pub questions: Vec<AskQuestion>,
 }
 
@@ -1112,6 +1131,8 @@ mod tests {
 
         let ask_event = ipc::AskEvent {
             request_id: "ask-1".to_string(),
+            status: ipc::AskEventStatus::Pending,
+            wait_seconds: Some(240),
             questions: vec![ipc::AskQuestion {
                 id: "mode".to_string(),
                 header: Some("방식".to_string()),
@@ -1133,6 +1154,8 @@ mod tests {
             &ask_event,
             json!({
                 "requestId": "ask-1",
+                "status": "pending",
+                "waitSeconds": 240,
                 "questions": [{
                     "id": "mode",
                     "header": "방식",

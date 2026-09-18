@@ -171,6 +171,7 @@ const MESSAGE_FORMAT_INSTRUCTIONS: &str = r#"[message format]
 const INTERACTION_GUIDE: &str = r#"[interaction]
 - Use ask only when a user decision or missing input materially changes the result. Never ask for facts available from project files, memory, or tools.
 - Group up to four related questions in one ask call. Use 2-5 concise options for a choice, set multi only when selections can be combined, and rely on the panel's Other input for free-form answers. Explain tradeoffs in option descriptions.
+- The user has 240 seconds to answer an ask. If the result is {"status":"unanswered"}, restate the same questions as your final plain-text answer and end the turn; the user's next message is the answer. Do not call ask again in that turn.
 - When explaining a flow, state transition, dependency, or component composition, prefer a fenced `mermaid` diagram over an ASCII/text-only flow. Use Mermaid only when relationships are genuinely clearer as a diagram; keep supporting prose brief."#;
 
 const TRIAGE_INSTRUCTIONS: &str = r#"[triage]
@@ -707,6 +708,22 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
         self.persist_autonomous_run(run).await
     }
 
+    async fn pause_autonomous_for_unanswered_ask(&mut self) -> Result<(), AgentEngineError> {
+        let mut run = self.autonomous_run()?;
+        if run.status.is_terminal() {
+            return Ok(());
+        }
+        self.update_autonomous_progress(&mut run, false)?;
+        run.status = crate::autonomous::AutonomousRunStatus::Paused;
+        run.pause_reason = Some(crate::autonomous::AutonomousPauseReason::UnansweredAsk);
+        run.blocker = Some(
+            "질문에 대한 답을 기다리는 시간이 지나 텍스트로 질문했습니다. 계속을 누르면 AI가 같은 질문을 다시 합니다."
+                .to_string(),
+        );
+        run.active_started_at = None;
+        self.persist_autonomous_run(run).await
+    }
+
     async fn settle_autonomous_review(&mut self) -> Result<(), AgentEngineError> {
         if self.execution_mode != crate::autonomous::ExecutionMode::Autonomous {
             return Ok(());
@@ -721,7 +738,8 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
                 run.active_started_at = None;
             }
             crate::autonomous::AutonomousRunStatus::Paused => {
-                run.pause_reason = Some(crate::autonomous::AutonomousPauseReason::User);
+                run.pause_reason
+                    .get_or_insert(crate::autonomous::AutonomousPauseReason::User);
                 run.active_started_at = None;
             }
             _ => return Ok(()),
@@ -799,6 +817,8 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
             .session_store
             .load(&self.session_id)
             .map_err(|error| AgentEngineError::new(error.to_string()))?;
+        // Every foreground run starts without an inherited unanswered-ask mark.
+        self.runtime.clear_expired_ask();
         Ok(ForegroundRequest {
             identity: self.run_identity(request_id),
             binding: self.binding_snapshot(false)?,
@@ -833,6 +853,13 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
             match self.executor.run_foreground(request).await {
                 RunOutcome::Completed { text, .. } => {
                     if self.execution_mode == crate::autonomous::ExecutionMode::Autonomous {
+                        if self.runtime.ask_expired_for_request(&request_id) {
+                            // The model restated an unanswered ask as text; the
+                            // reply arrives as an ordinary message, so the run
+                            // pauses instead of completing or iterating.
+                            self.pause_autonomous_for_unanswered_ask().await?;
+                            return Ok(AgentTurnResult::Answer { text });
+                        }
                         if let Some(blocker) = self.autonomous_completion_blocker()? {
                             let reason = if self.compact_at_boundary().await? {
                                 crate::provider_runtime::IterationBoundaryReason::ContextPressure
@@ -1176,14 +1203,16 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
         let reason = run
             .boundary_reason
             .unwrap_or(crate::provider_runtime::IterationBoundaryReason::ProviderContinuation);
+        // The pause blocker (for example an unanswered ask) is the one thing the
+        // resumed run must know about; it is consumed here, not persisted.
+        let blocker = run.blocker.take();
         run.status = crate::autonomous::AutonomousRunStatus::Running;
         run.pause_reason = None;
-        run.blocker = None;
         run.active_started_at = Some(crate::session::now_unix_millis());
         self.persist_autonomous_run(run).await?;
         self.phase = Phase::Triage;
         let base = AgentTurnInput::text(String::new()).with_access(WorkspaceAccess::Read);
-        let turn = self.autonomous_continuation_turn(&base, reason, None)?;
+        let turn = self.autonomous_continuation_turn(&base, reason, blocker.as_deref())?;
         let result = self.run_foreground(turn).await?;
         self.thread_active = true;
         if let Some(ticket) = self.runtime.write_ticket() {
@@ -5119,6 +5148,9 @@ mod tests {
         reject_seed: Arc<Mutex<bool>>,
         write_runtime: Arc<Mutex<Option<SessionToolRuntime>>>,
         plan_runtime: Option<SessionToolRuntime>,
+        /// When set, the next foreground run issues one real `ask` through the
+        /// engine tool runtime before returning its scripted result.
+        ask_runtime: Arc<Mutex<Option<SessionToolRuntime>>>,
         acknowledgement_count: Arc<Mutex<usize>>,
         reset_count: Arc<Mutex<usize>>,
         /// The mock's live thread id; `reset_thread` clears it, `seed_thread_id`
@@ -5142,6 +5174,7 @@ mod tests {
                 foreground_error: Arc::new(Mutex::new(None)),
                 reject_seed: Arc::new(Mutex::new(false)),
                 write_runtime: Arc::new(Mutex::new(None)),
+                ask_runtime: Arc::new(Mutex::new(None)),
                 plan_runtime: None,
                 acknowledgement_count: Arc::new(Mutex::new(0)),
 
@@ -5275,6 +5308,23 @@ mod tests {
                     return RunOutcome::Failed(
                         crate::provider_runtime::ProviderRuntimeError::Transport(message),
                     );
+                }
+                let ask_runtime = self.ask_runtime.lock().expect("ask runtime lock").take();
+                if let Some(runtime) = ask_runtime {
+                    // The test runtime carries a fixture session id, so the ask
+                    // enters through the request-scoped path rather than the
+                    // run-identity path; expiry handling is identical.
+                    let outcome = runtime
+                        .ask(&json!({
+                            "questions": [{
+                                "id": "mode",
+                                "question": "방식을 고르세요.",
+                                "options": [{"label": "A"}, {"label": "B"}]
+                            }]
+                        }))
+                        .await
+                        .expect("scripted ask must be admitted");
+                    assert_eq!(outcome["status"], "unanswered");
                 }
                 {
                     let mut thread = self.thread_id.lock().expect("thread id lock");
@@ -8817,6 +8867,87 @@ mod tests {
         assert_eq!(run.iteration, 2);
         assert!(run.last_checkpoint.unwrap().is_started());
         fs::remove_dir_all(base).ok();
+    }
+
+    #[tokio::test]
+    async fn autonomous_turn_after_an_unanswered_ask_pauses_and_resume_carries_the_blocker() {
+        let (base, memory) = memory_store("autonomous-unanswered-ask");
+        let driver = FakeCodexDriver::scripted([
+            AgentTurnResult::Answer {
+                text: "어떤 방식을 사용할까요? A 또는 B".to_string(),
+            },
+            AgentTurnResult::Answer {
+                text: "완료".to_string(),
+            },
+        ]);
+        let driver_handle = driver.clone();
+        let sink = CapturingEventSink::default();
+        let mut engine = test_engine_with_memory(driver, sink, memory, &base.join("data"));
+        native_workspace_snapshot(&engine.runtime.data_dirs(), "Sample");
+        engine.runtime.set_ask_emitter(|_| Ok(()));
+        engine
+            .runtime
+            .set_ask_wait_timeout(std::time::Duration::from_millis(30));
+        *driver_handle.ask_runtime.lock().unwrap() = Some(engine.runtime.clone());
+
+        engine
+            .chat(crate::ipc::ChatRequest {
+                client_turn_id: crate::ipc::new_client_turn_id(),
+                text: "사용자 선택이 필요한 목표".to_string(),
+                attachments: Vec::new(),
+                mentions: Vec::new(),
+                execution_mode: crate::autonomous::ExecutionMode::Autonomous,
+                autonomous_policy: None,
+            })
+            .await
+            .unwrap();
+
+        let run = engine
+            .session_store
+            .load(&engine.session_id)
+            .unwrap()
+            .autonomous_run
+            .unwrap();
+        assert_eq!(run.status, crate::autonomous::AutonomousRunStatus::Paused);
+        assert_eq!(
+            run.pause_reason,
+            Some(crate::autonomous::AutonomousPauseReason::UnansweredAsk)
+        );
+        assert!(run.active_started_at.is_none());
+        let blocker = run
+            .blocker
+            .clone()
+            .expect("pause blocker names the unanswered ask");
+        assert!(blocker.contains("같은 질문을 다시"));
+        assert!(run.status.can_resume());
+        assert!(engine.runtime.pending_ask().is_none());
+
+        engine.autonomous_resume().await.unwrap();
+
+        let prompts = driver_handle.prompts();
+        assert_eq!(prompts.len(), 2);
+        assert!(prompts[1].contains("[autonomous continuation]"));
+        assert!(prompts[1].contains(&blocker));
+        let run = engine
+            .session_store
+            .load(&engine.session_id)
+            .unwrap()
+            .autonomous_run
+            .unwrap();
+        assert_eq!(
+            run.status,
+            crate::autonomous::AutonomousRunStatus::Completed
+        );
+        assert_eq!(run.pause_reason, None);
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn ask_wait_copy_matches_the_shared_timeout_constant() {
+        let seconds = format!("{} seconds", crate::tools::ASK_WAIT_TIMEOUT.as_secs());
+        assert!(INTERACTION_GUIDE.contains(&seconds));
+        let ask = crate::tools::tool_spec(crate::tools::ASK_TOOL).unwrap();
+        assert!(ask.description.contains(&seconds));
     }
 
     #[tokio::test]

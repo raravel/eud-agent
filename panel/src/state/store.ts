@@ -116,6 +116,10 @@ export interface AskState {
   requestId: string;
   questions: AskQuestion[];
   submitting: boolean;
+  /** Bounded wait in seconds; the core closes the request when it elapses. */
+  waitSeconds?: number;
+  /** Local clock when the request was shown, for the remaining-time display. */
+  receivedAt?: number;
 }
 
 
@@ -344,7 +348,12 @@ export interface PanelStore {
   /** `plan` — enter/refresh plan_review (revision replaces the active card). */
   planReceived(markdown: string, revision: number): void;
   /** Show a structured ASK card without ending the current turn. */
-  askReceived(requestId: string, questions: AskQuestion[]): void;
+  askReceived(requestId: string, questions: AskQuestion[], waitSeconds?: number): void;
+  /**
+   * `ask` with status `expired` — the bounded wait elapsed; the card closes
+   * and the agent restates the question as text for the next message.
+   */
+  askExpired(requestId: string): void;
   /** Disable the ASK form while its response command is in flight. */
   askSubmitStarted(): void;
   /** Re-enable the ASK form after a response command failed. */
@@ -932,11 +941,31 @@ export function createPanelStore(): PanelStore {
       emit();
     },
 
-    askReceived(requestId, questions) {
+    askReceived(requestId, questions, waitSeconds) {
       if (core.ask?.requestId === requestId) return;
       core.turnInFlight = true;
       core.phase = "thinking";
-      core.ask = { requestId, questions, submitting: false };
+      core.ask = {
+        requestId,
+        questions,
+        submitting: false,
+        ...(waitSeconds === undefined
+          ? {}
+          : { waitSeconds, receivedAt: Date.now() }),
+      };
+      emit();
+    },
+
+    askExpired(requestId) {
+      if (core.ask?.requestId !== requestId) return;
+      const waited = core.ask.waitSeconds;
+      core.ask = null;
+      pushLog(
+        "info",
+        waited === undefined
+          ? "질문 답변 대기 시간이 지나 AI가 질문을 글로 남깁니다. 다음 메시지로 답할 수 있습니다."
+          : `질문 답변 대기 시간(${waited}초)이 지나 AI가 질문을 글로 남깁니다. 다음 메시지로 답할 수 있습니다.`,
+      );
       emit();
     },
 

@@ -198,6 +198,24 @@ describe("ASK lifecycle", () => {
     });
   });
 
+  it("closes an expired question and tells the user the answer continues as text", () => {
+    const store = readyWithProject();
+    store.chatSent();
+    store.askReceived("ask-3", questions, 240);
+    expect(store.getState().ask?.waitSeconds).toBe(240);
+    expect(store.getState().ask?.receivedAt).toBeTypeOf("number");
+
+    store.askExpired("ask-other");
+    expect(store.getState().ask?.requestId).toBe("ask-3");
+
+    store.askExpired("ask-3");
+    expect(store.getState().ask).toBeNull();
+    expect(store.getState().phase).toBe("thinking");
+    const last = store.getState().log.at(-1)!;
+    expect(last.kind).toBe("info");
+    expect(last.text).toContain("240초");
+  });
+
   it("clears a pending question when the turn is cancelled", () => {
     const store = readyWithProject();
     store.chatSent();

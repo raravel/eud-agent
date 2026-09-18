@@ -947,6 +947,55 @@ describe("App concurrent sessions", () => {
     expect(screen.queryByRole("region", { name: "AI 질문" })).not.toBeInTheDocument();
   });
 
+  it("closes the ASK card when the backend reports the wait expired", async () => {
+    render(<App />);
+    const input = await screen.findByRole("combobox", { name: "지시 입력" });
+    await waitFor(() => expect(input).toBeEnabled());
+
+    fireEvent.change(input, { target: { value: "설계를 진행해 줘" } });
+    fireEvent.click(screen.getByRole("button", { name: "실행" }));
+    await waitFor(() => expect(tauri.resolveLongChat).toBeTypeOf("function"));
+    await waitFor(() => expect(tauri.listeners.has("ask")).toBe(true));
+    const questions = [
+      {
+        id: "mode",
+        question: "방식을 고르세요.",
+        multi: false,
+        options: [{ label: "빠르게" }, { label: "세밀하게" }],
+      },
+    ];
+
+    act(() => {
+      emit("ask", {
+        sessionId: "session-a",
+        requestId: "ask-1",
+        status: "pending",
+        waitSeconds: 240,
+        questions,
+      });
+    });
+    expect(screen.getByRole("region", { name: "AI 질문" })).toHaveTextContent(
+      "남은 시간",
+    );
+
+    act(() => {
+      emit("ask", {
+        sessionId: "session-a",
+        requestId: "ask-1",
+        status: "expired",
+        waitSeconds: 240,
+        questions,
+      });
+    });
+
+    expect(screen.queryByRole("region", { name: "AI 질문" })).not.toBeInTheDocument();
+    expect(screen.getByText(/240초/)).toBeInTheDocument();
+    expect(tauri.invoke).not.toHaveBeenCalledWith(
+      "ask_response",
+      expect.anything(),
+    );
+  });
+
   it("restores a pending ASK that was emitted before the panel could display it", async () => {
     tauri.pendingAsk = {
       sessionId: "session-a",

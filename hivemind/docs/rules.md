@@ -76,6 +76,9 @@
 - Tool schemas are closed, typed, and validated before dispatch.
 - `const`, `enum`, `oneOf`, primitive, array, and object constraints MUST match the advertised schema. A violating call completes with a detailed usage error the model can correct within the run's tool-round budget; it never executes and never fails the run outright. Duplicate call ids, unknown tools, malformed call shape, and stale-run dispatch remain fatal admission errors.
 - Read tools never consume write budgets.
+- No single tool call waits longer than 240 seconds: native CLIs abort a silent MCP call at 300
+  seconds. `ask` expires into a plain-text handoff; any future delegation or team wait shares the
+  bound and continues as a new user turn.
 - Mutations require evidence and a project write registration.
 - Journal every accepted semantic mutation with exact before/after state.
 - Reject/rollback applies inverse operations in reverse sequence and persists exact canonical state.

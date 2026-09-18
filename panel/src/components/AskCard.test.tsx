@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
 import { AskCard } from "@/components/AskCard";
@@ -23,6 +23,35 @@ const questions = [
 ];
 
 describe("AskCard", () => {
+  it("shows the remaining answer time and the text fallback when a wait is bounded", () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-09-18T00:00:00Z"));
+      render(
+        <AskCard
+          requestId="ask-timed"
+          questions={questions}
+          submitting={false}
+          waitSeconds={240}
+          receivedAt={Date.now() - 30_000}
+          onSubmit={vi.fn()}
+        />,
+      );
+      expect(screen.getByText("남은 시간 3:30")).toBeInTheDocument();
+      expect(screen.getByText(/다음 메시지로 답할 수 있습니다/)).toBeInTheDocument();
+      act(() => {
+        vi.advanceTimersByTime(60_000);
+      });
+      expect(screen.getByText("남은 시간 2:30")).toBeInTheDocument();
+      act(() => {
+        vi.advanceTimersByTime(200_000);
+      });
+      expect(screen.getByText("시간 초과")).toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("answers one tab at a time and preserves answers while revisiting earlier questions", () => {
     const onSubmit = vi.fn();
     render(

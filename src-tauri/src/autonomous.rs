@@ -74,6 +74,9 @@ pub enum AutonomousPauseReason {
     Restart,
     WaitingInput,
     Review,
+    /// An `ask` expired and the turn ended with the question as plain text;
+    /// the user's reply arrives as an ordinary message.
+    UnansweredAsk,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

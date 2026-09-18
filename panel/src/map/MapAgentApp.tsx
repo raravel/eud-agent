@@ -129,6 +129,8 @@ interface AskState {
   requestId: string;
   questions: AskQuestion[];
   submitting: boolean;
+  waitSeconds?: number;
+  receivedAt?: number;
 }
 
 interface DirectImagePlacement {
@@ -1420,6 +1422,12 @@ export default function MapAgentApp() {
           if (payload.candidateRevision !== eventRevisionRef.current) return;
           if (!turnInFlightRef.current || turnEndedRef.current) return;
           const requestId = String(payload.requestId);
+          if (payload.status === "expired") {
+            setAsk((current) =>
+              current?.requestId === requestId ? undefined : current,
+            );
+            return;
+          }
           if (notifiedAskRequestRef.current !== requestId) {
             notifiedAskRequestRef.current = requestId;
             void attentionNotify(
@@ -1430,10 +1438,15 @@ export default function MapAgentApp() {
               // Delivery is best-effort and must not disturb the pending ASK.
             });
           }
+          const waitSeconds =
+            typeof payload.waitSeconds === "number" ? payload.waitSeconds : undefined;
           setAsk({
             requestId,
             questions: (payload.questions ?? []) as AskQuestion[],
             submitting: false,
+            ...(waitSeconds === undefined
+              ? {}
+              : { waitSeconds, receivedAt: Date.now() }),
           });
         }),
       );
@@ -1489,6 +1502,9 @@ export default function MapAgentApp() {
         requestId: pending.requestId,
         questions: pending.questions,
         submitting: false,
+        ...(typeof pending.waitSeconds === "number"
+          ? { waitSeconds: pending.waitSeconds, receivedAt: Date.now() }
+          : {}),
       });
     };
     void register().catch((reason) => {

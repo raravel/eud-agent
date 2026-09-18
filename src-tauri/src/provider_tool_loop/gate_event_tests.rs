@@ -120,6 +120,45 @@ async fn executed_tool_error_is_a_recoverable_completion() {
 }
 
 #[tokio::test]
+async fn unanswered_native_ask_completes_as_a_durable_unanswered_result() {
+    // A native CLI aborts a silent MCP call after 300s; the gate must complete
+    // the ask itself, before that, with the text-handoff result.
+    let runtime = SessionToolRuntime::for_tests();
+    runtime.set_ask_wait_timeout(std::time::Duration::from_millis(50));
+    let (_cancel, cancellation) = tokio::sync::watch::channel(0_u64);
+    runtime.set_cancellation(cancellation);
+    runtime.set_ask_emitter(|_| Ok(()));
+    runtime
+        .begin_request("ask-expiry-request", "project")
+        .unwrap();
+    let gate = gate(runtime.clone(), 81_009, "ask-expiry-request");
+
+    let result = gate
+        .dispatch_native(
+            Some("ask-expiry-call".to_string()),
+            "ask".to_string(),
+            serde_json::json!({
+                "questions": [{
+                    "id": "mode",
+                    "question": "방식을 고르세요.",
+                    "options": [{"label": "A"}, {"label": "B"}]
+                }]
+            }),
+        )
+        .await
+        .unwrap();
+
+    assert!(!result.is_error, "{result:?}");
+    assert_eq!(result.result["status"], "unanswered");
+    assert_eq!(result.result["questionIds"], serde_json::json!(["mode"]));
+    assert!(runtime.pending_ask().is_none());
+    assert!(runtime.ask_expired_for_request("ask-expiry-request"));
+    assert!(gate.fatal_admission_error().is_none());
+    assert_eq!(gate.completed().len(), 1);
+    assert!(gate.receipt_path().unwrap().is_file());
+}
+
+#[tokio::test]
 async fn native_schema_failures_are_recoverable_usage_completions() {
     for (run_id, request_id, arguments) in [
         (81_005, "schema-request", serde_json::json!({})),

@@ -242,9 +242,16 @@ export interface AskQuestion {
 }
 
 /** `ask` pauses the current tool call until the user submits every answer. */
+/** Lifecycle of one `ask` request: answerable, or closed because its bounded wait elapsed. */
+export type AskEventStatus = "pending" | "expired";
+
 export interface AskMessage extends SessionScopedMessage {
   type: "ask";
   requestId: string;
+  /** Absent means `pending` (older cores). */
+  status?: AskEventStatus;
+  /** Bounded wait in whole seconds before the request expires. */
+  waitSeconds?: number;
   questions: AskQuestion[];
 }
 
@@ -362,7 +369,8 @@ export type AutonomousPauseReason =
   | "user"
   | "restart"
   | "waiting_input"
-  | "review";
+  | "review"
+  | "unanswered_ask";
 
 export interface AutonomousRunPolicy {
   maxWallTimeMillis?: number | null;
@@ -1031,6 +1039,11 @@ export function isAskMessage(value: unknown): value is AskMessage {
     hasSessionId(value) &&
     typeof value.requestId === "string" &&
     value.requestId.length > 0 &&
+    (value.status === undefined ||
+      value.status === "pending" ||
+      value.status === "expired") &&
+    (value.waitSeconds === undefined ||
+      (typeof value.waitSeconds === "number" && value.waitSeconds >= 0)) &&
     Array.isArray(value.questions) &&
     value.questions.length > 0 &&
     value.questions.every(isAskQuestion)

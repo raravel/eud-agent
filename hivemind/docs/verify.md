@@ -110,6 +110,42 @@ substituted. Therefore action/round continuation, cancellation, restart pause/re
 review reject/accept are proven by production-path deterministic contracts, while the combined
 real-provider application run is not claimed.
 
+### Bounded ASK wait — 2026-09-18
+
+Source-level verification of Phase 0 of the
+[subagent/team plan](features/subagent-delegation-and-team-handoff-plan.md):
+
+- `tool_exec::tests::unanswered_ask_expires_into_a_text_handoff`: an `ask` whose injected wait
+  elapses completes as `{status: "unanswered", questionIds, waitedSeconds}`, emits `pending` then
+  `expired` ask events for the same request id, clears the pending slot and `ask_waiting`, rejects a
+  late `ask_response` with `ask_expired`, refuses a second `ask` in the same run, and
+  `begin_iteration` clears the marker; `restored_pending_ask_reports_the_remaining_wait` shows
+  `pending_ask()` reporting the remainder rather than the full wait.
+- `tool_exec::tests::ask_answered_before_expiry_keeps_the_answer_and_emits_no_expiry`: an answer
+  that arrives first wins and no `expired` event follows.
+- `provider_tool_loop::gate_event_tests::unanswered_native_ask_completes_as_a_durable_unanswered_result`:
+  through the native gate path the expiry is a non-error durable completion with a receipt.
+- `engine::tests::autonomous_turn_after_an_unanswered_ask_pauses_and_resume_carries_the_blocker`:
+  an autonomous turn that completes after an expired ask persists `paused`/`unanswered_ask` with a
+  blocker, and explicit resume sends that blocker in the continuation prompt and completes.
+- `ipc::tests` wire shape (`status`, `waitSeconds`); `engine::tests::system_prompt_*` and
+  `ask_wait_copy_matches_the_shared_timeout_constant` keep the ask policy text in step with
+  `ASK_WAIT_TIMEOUT`; the full default-parallel Rust suite and Clippy status are recorded below.
+- Panel: `store.test.ts` (`askExpired` closes the card and logs the 240-second notice),
+  `App.test.tsx` (an `expired` ask event closes the region without sending `ask_response`),
+  `AskCard.test.tsx` (remaining-time countdown and "시간 초과"); TypeScript, 63-file/604-test
+  Vitest, and production build pass.
+
+Gate status on this source: `cargo test -p eud-agent` first ran `835/1/34` with the known
+intermittent `map_candidate::tests::draft_finalize_revert_recovery_and_stale_source_are_safe`
+revert failure (the existing Map finalize/revert WATCH, unrelated to ASK); that test passes in
+isolation and an unchanged full repeat passes `836/0/34`. Clippy reports only the two pre-existing
+MSRV notes in `tools.rs`; rustfmt is clean.
+
+Not covered here: a live native CLI observing a 240-second silent ask (the fixture injects the
+wait), and a real user answering from the Tauri surface after expiry. Production waits keep the
+fixed 240-second `ASK_WAIT_TIMEOUT`; there is no runtime override.
+
 ### Schema-violation recoverable usage — 2026-09-14
 
 Tool-argument schema violations are reclassified from fatal admission to recoverable usage

@@ -63,6 +63,14 @@ Project state changes invalidate stale source/mention/workspace authority. A mis
 - `build_run` requires the project transaction but not write-workspace admission; generated EDS,
   Python, output maps, and other build artifacts never enter the semantic changeset.
 - `dat_patch` is the only model-facing DAT mutation boundary.
+- `ask` waits at most `ASK_WAIT_TIMEOUT` (240 s) for `ask_response`. Native Codex/Claude CLIs abort
+  a silent MCP call after 300 s and progress notifications do not extend it, so the wait is bounded
+  below that. An unanswered ask completes as `{status: "unanswered", questionIds, waitedSeconds}`,
+  the panel receives an `expired` ask event for the same request id, a late `ask_response` fails
+  with `ask_expired`, and the same foreground run cannot ask again; the model restates the
+  questions as its final text and the user's next message is the answer. A restored pending ask
+  reports its remaining wait. An autonomous turn that ends this way pauses as `unanswered_ask`
+  instead of completing, and explicit resume carries that blocker so the model asks again.
 - Tool schemas are validated before execution, including `const` tags and exactly-one `oneOf` alternatives. A schema-violating call is completed with a field-level usage error the model can self-correct within the run's tool-round budget; duplicate ids, unknown tools, malformed call shape, and stale-run dispatch stay fatal. For `map_draft_patch`, a rejected `operations[i]` names the documented keys of the attempted `op` (or the documented op list), plus its missing and unexpected keys; the Map system prompt's `[draft patch operations]` section is generated from the same advertised schema.
 - The first canonical mutation in a read run automatically registers write intent and parks without
   executing; the resumed write run re-reads the target and must satisfy evidence and

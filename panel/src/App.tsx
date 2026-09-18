@@ -235,6 +235,8 @@ type PendingAskSnapshot = {
   sessionId: string;
   requestId: string;
   questions: Parameters<PanelStore["askReceived"]>[1];
+  /** Remaining bounded wait reported by the core at restore time. */
+  waitSeconds?: number;
 };
 
 
@@ -579,7 +581,11 @@ export default function App() {
         });
         if (pending !== null && pending.sessionId === slot.id) {
           slot.activity = "waiting_input";
-          slot.store.askReceived(pending.requestId, pending.questions);
+          slot.store.askReceived(
+            pending.requestId,
+            pending.questions,
+            pending.waitSeconds,
+          );
           bumpSessions();
           return;
         }
@@ -1060,6 +1066,10 @@ export default function App() {
         case "ask": {
           const targetSlot = sessionsRef.current.get(msg.sessionId);
           if (!targetSlot) break;
+          if (msg.status === "expired") {
+            targetSlot.store.askExpired(msg.requestId);
+            break;
+          }
           const priorRequestId = targetSlot.store.getState().ask?.requestId;
           if (priorRequestId !== msg.requestId) {
             void attentionNotify(
@@ -1070,7 +1080,7 @@ export default function App() {
               // Delivery is best-effort and must not disturb the pending ASK.
             });
           }
-          targetSlot.store.askReceived(msg.requestId, msg.questions);
+          targetSlot.store.askReceived(msg.requestId, msg.questions, msg.waitSeconds);
           break;
         }
         case "plan": {
@@ -3132,6 +3142,8 @@ export default function App() {
             requestId={state.ask.requestId}
             questions={state.ask.questions}
             submitting={state.ask.submitting}
+            waitSeconds={state.ask.waitSeconds}
+            receivedAt={state.ask.receivedAt}
             onSubmit={handleAskSubmit}
           />
         )}
