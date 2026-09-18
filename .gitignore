@@ -63,3 +63,12 @@ ci/target/
 
 # Legacy in-tree Cargo target output
 /src-tauri/target/
+
+# oh-my-claudecode per-directory runtime state (sessions, notepad, plans); never committed
+.omc/
+
+# Cargo output of the isom crate when built standalone (root /target/ rule is anchored)
+crates/isom/target/
+
+# Git Bash crash dumps
+*.stackdump
