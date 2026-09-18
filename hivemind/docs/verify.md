@@ -36,6 +36,40 @@ Production-adapter tests substitute only the remote HTTP peer or native executab
 
 Relevant permanent test surfaces are `provider_runtime::contract_tests` (including native MCP, structured isolation, harness retry and live modules), the five adapter/client test modules, `provider_tool_loop`, `provider_transcript`, `mcp`, and engine/session recovery tests. The common contracts must observe real mutation/journal completion under cancellation, old-run admission rejection, ASK deadline pause, stale revision/branch rejection, metadata/head corruption handling, persisted retry binding and session overlap. Filtered nonzero tests help diagnosis; they do not replace the original unfiltered gates above.
 
+### Native CLI MCP tool-call timeout measurement — 2026-09-17
+
+Measured outside the app against an isolated stateless streamable-HTTP MCP server (Python `mcp`
+1.27.0, SSE responses, tool that sleeps N seconds; a variant sends `notifications/progress`
+every 30 seconds). Claude ran with the same flags as `claude_client/adapter/request.rs`
+(`--mcp-config` http server, `--strict-mcp-config`, `--tools ""`, `--allowedTools mcp__*`,
+`--permission-mode dontAsk`), model haiku. Codex ran `codex exec` with an isolated `CODEX_HOME`,
+`--dangerously-bypass-approvals-and-sandbox`, and `mcp_servers.<id>.url`.
+
+| CLI | Configuration | 70 s | 130 s | 330 s | Observed limit |
+| --- | --- | --- | --- | --- | --- |
+| Claude Code 2.1.274 | default | pass | pass | fail | idle watchdog: `sent no response or progress for 300s; aborting` |
+| Claude Code 2.1.274 | default + progress every 30 s (server received `progressToken`) | – | – | fail | same 300 s abort; progress did not extend it |
+| Claude Code 2.1.274 | `CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT=0` | – | – | pass | idle watchdog disabled |
+| Claude Code 2.1.274 | per-server `"timeout": 900000` in `--mcp-config` | – | – | pass | idle bound raised with the server timeout |
+| Codex 0.154.0 | default | pass | pass | fail | `timed out awaiting tools/call after 300s` (documented 60 s default is outdated) |
+| Codex 0.154.0 | default + progress every 30 s (server received `progressToken`) | – | – | fail | same 300 s abort |
+| Codex 0.154.0 | `mcp_servers.<id>.tool_timeout_sec=900` | – | – | pass | override honored |
+| Codex 0.154.0 | `mcp_servers.<id>.tool_timeout_sec=360`, 400 s call | – | – | fail at 360 s | override is exact |
+
+Static evidence in the Claude binary: hard per-call limit `MCP_TOOL_TIMEOUT` defaults to `1e8` ms;
+the idle limit `CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT` defaults to 300 000 ms for http/sse servers and
+1 800 000 ms for stdio; the effective idle bound is `min(max(idle, serverTimeout), hardLimit)`. A
+separate 60 s first-byte HTTP budget did not affect SSE responses (the 70 s and 130 s calls pass).
+
+Consequence for the current adapters: neither `claude_client/adapter/foreground.rs` nor
+`codex_client.rs` sets a tool timeout, so any single `eud-tools` call that stays silent for more
+than 300 s — including an unanswered native `ask` — is aborted by the CLI while the run gate still
+holds it pending. App37's native ASK verification lasted seconds and does not cover this. The
+decision (2026-09-17) is not to raise the CLI limits: Phase 0 of the
+[subagent/team plan](features/subagent-delegation-and-team-handoff-plan.md) bounds every in-tool
+wait (ASK, delegation, team candidate) at 240 seconds and continues longer waits as a new user
+turn. This is a measurement of the installed CLI versions, not a product fix.
+
 ### Isolated live environment
 
 Use disposable native projects and application data, copying fixture maps rather than writing original projects. Never log credential values, raw profile contents or private source excerpts. Keep the provider/model/wire or CLI version, capability, observed result, source/binary evidence and cleanup outcome in the sanitized receipt.
