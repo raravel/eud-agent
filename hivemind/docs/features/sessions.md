@@ -325,6 +325,17 @@ ambiguous matches before mutation. Write/delete/rename/move reject stale overlap
 Shared tool calls and builds are serialized only for the duration of that call.
 Approved plan snapshots remain app-owned, immutable, and preserved after implementation rejection.
 
+## Staged workflow state
+
+`SessionRecord.workflow` holds the `WorkflowState` of the current staged request: stage, route,
+triage goal/acceptance criteria, research/plan/verdict artifact references (path + SHA-256), plan
+revision and approval hash, critique rounds, verify attempts, deep-planning capture, and the user
+text with clarification answers. It is replaced atomically at every transition. Startup maps an
+in-flight stage (`triage`, `research`, `planning`, `critique`, `verifying`) to `interrupted`; plan
+review and changeset review survive as they are. `workflow_resume` restarts the interrupted stage
+from its persisted inputs after validating the project revision; `workflow_restart` clears the
+state and resends the same user text as a fresh request.
+
 ## Autonomous run lifecycle
 
 `SessionRecord.autonomousRun` persists an opt-in run independently from `session_activity`.
@@ -346,6 +357,13 @@ durable call results; native providers resume only from an official completed na
 Pause closes new tool admission at the next confirmed boundary. Stop cancels ASK/provider
 generation, preserves reviewable journal entries, and terminal state cannot be overwritten by a
 late completion.
+
+### Staged workflow commands
+
+- `workflow_resume { sessionId }` — resume an `interrupted` stage.
+- `workflow_restart { sessionId }` — discard an interrupted/failed/cancelled request's stage state
+  and resend its user text.
+- scoped event `workflow` — the `WorkflowEvent` projection on every transition and on hydrate.
 
 ## Tauri IPC
 

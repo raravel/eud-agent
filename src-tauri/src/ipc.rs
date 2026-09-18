@@ -36,6 +36,9 @@ impl AppManaged {
 pub struct AppSettings {
     pub notifications: NotificationSettings,
     pub codex_large_context_models: BTreeSet<String>,
+    /// "더 똑똑한 계획": planner + architect + critic consensus for staged requests.
+    #[serde(default)]
+    pub deep_planning: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -661,6 +664,7 @@ pub fn app_settings_payload(dirs: &DataDirs) -> Result<AppSettings, String> {
     Ok(AppSettings {
         notifications: config.notifications,
         codex_large_context_models: config.providers.codex.large_context_models,
+        deep_planning: config.deep_planning,
     })
 }
 
@@ -671,6 +675,7 @@ pub fn app_settings_save_payload(
     let mut config = dirs.load_config().map_err(|error| error.to_string())?;
     config.notifications = settings.notifications;
     config.providers.codex.large_context_models = settings.codex_large_context_models.clone();
+    config.deep_planning = settings.deep_planning;
     dirs.save_config(&config)
         .map_err(|error| error.to_string())?;
     Ok(settings)
@@ -1851,6 +1856,7 @@ mod tests {
                 },
             },
             codex_large_context_models: BTreeSet::from(["gpt-test".to_string()]),
+            deep_planning: true,
         };
         let saved = ipc::app_settings_save_payload(&dirs, settings.clone()).unwrap();
         assert_eq!(saved, settings);
@@ -1864,11 +1870,13 @@ mod tests {
                     "agentTurnComplete": {"sound": false, "osNotification": false},
                     "askResponseRequired": {"sound": true, "osNotification": false}
                 },
-                "codexLargeContextModels": ["gpt-test"]
+                "codexLargeContextModels": ["gpt-test"],
+                "deepPlanning": true
             }),
         );
 
         let config = dirs.load_config().unwrap();
+        assert!(config.deep_planning);
         assert_eq!(config.project_path, "C:\\Maps\\NativeProject");
         assert_eq!(config.euddraft_path, "C:\\Tools\\euddraft.exe");
         assert_eq!(

@@ -35,6 +35,7 @@ import { PromptInputButton } from "@/components/ai-elements/prompt-input";
 import { ProviderPromptControls } from "@/components/ProviderPromptControls";
 import { AgentTurnStatus } from "@/components/AgentTurnStatus";
 import { MentionComposer } from "@/components/MentionComposer";
+import { isBusyPhase } from "@/state/store";
 import type { PanelState } from "@/state/store";
 import type {
   AutonomousRunState,
@@ -153,7 +154,7 @@ export function InstructionBox({
     );
   const canSend = state.canSend && !actionBusy && !autonomousBlocksNewRequest;
   const hasStaleMention = mentions.some((mention) => mention.stale === true);
-  const turnInFlight = state.phase === "thinking";
+  const turnInFlight = isBusyPhase(state.phase);
   const ragLoading = state.rag === "loading";
   const projectUnavailable = !state.projectAvailable;
   const attachmentInputDisabled =

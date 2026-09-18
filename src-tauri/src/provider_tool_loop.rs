@@ -9,12 +9,14 @@ mod execution;
 mod gate_event_tests;
 mod gate_events;
 mod gate_state;
+mod profile;
 mod receipt;
 mod run_gate;
 mod validation;
 
 pub use completion::DurableToolCompletion;
 pub use gate_events::{GateEvent, GateEventKind};
+pub use profile::{DelegatedToolProfile, ToolProfile, SUBMIT_RESULT_TOOL};
 pub use receipt::{
     acknowledge_native_run, clear_native_run_recovery, unresolved_native_runs,
     NativeRunReceiptState, UnresolvedNativeRun,
@@ -124,6 +126,120 @@ mod tests {
         let first = gate.dispatch_batch(vec![call.clone()], false).await;
         assert!(first.is_ok());
         assert!(gate.dispatch_batch(vec![call], false).await.is_err());
+    }
+
+    fn delegated_gate(runtime: &SessionToolRuntime, request_id: &str) -> RunGate {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": { "summary": { "type": "string" } },
+            "required": ["summary"],
+            "additionalProperties": false
+        });
+        RunGate::delegated(
+            crate::provider_runtime::RunIdentity {
+                session_id: runtime.session_id().to_string(),
+                run_id: crate::provider_runtime::RunId::new(21),
+                request_id: request_id.to_string(),
+                session_kind: runtime.kind(),
+                cancellation_generation: 0,
+            },
+            runtime.clone(),
+            DelegatedToolProfile::new(["list_files"], &schema).unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn delegated_submission_is_captured_and_later_calls_do_not_execute() {
+        let runtime = SessionToolRuntime::for_tests();
+        let (_cancel, cancellation) = tokio::sync::watch::channel(0_u64);
+        runtime.set_cancellation(cancellation);
+        runtime
+            .begin_request("delegated-submit", "project")
+            .unwrap();
+        let gate = delegated_gate(&runtime, "delegated-submit");
+
+        // A schema-invalid submission completes as a correctable usage error.
+        let invalid = gate
+            .dispatch_batch(
+                vec![DirectToolCall {
+                    id: "submit-bad".to_string(),
+                    name: SUBMIT_RESULT_TOOL.to_string(),
+                    arguments: serde_json::json!({"summary": 1}),
+                }],
+                false,
+            )
+            .await
+            .unwrap();
+        assert!(invalid.results[0].is_error);
+        assert!(gate.delegated_result().is_none());
+        assert!(gate.fatal_admission_error().is_none());
+
+        // A valid submission is captured without dispatching to the runtime,
+        // and the rest of the batch completes as "already ended".
+        let batch = gate
+            .dispatch_batch(
+                vec![
+                    DirectToolCall {
+                        id: "submit-ok".to_string(),
+                        name: SUBMIT_RESULT_TOOL.to_string(),
+                        arguments: serde_json::json!({"summary": "done"}),
+                    },
+                    DirectToolCall {
+                        id: "late-read".to_string(),
+                        name: "list_files".to_string(),
+                        arguments: serde_json::json!({}),
+                    },
+                ],
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(batch.results.len(), 2);
+        assert!(!batch.results[0].is_error);
+        assert!(
+            batch.results[1].is_error,
+            "the rest of the batch completes as ended"
+        );
+        assert!(gate.receipt_path().is_none());
+        assert_eq!(
+            gate.delegated_result(),
+            Some(serde_json::json!({"summary": "done"}))
+        );
+        let late = gate
+            .dispatch_native(
+                Some("late-native".to_string()),
+                "list_files".to_string(),
+                serde_json::json!({}),
+            )
+            .await
+            .unwrap();
+        assert!(late.is_error);
+        assert!(late.result.as_str().unwrap().contains("already submitted"));
+        assert!(gate.fatal_admission_error().is_none());
+        assert!(!runtime.owns_write_registration());
+    }
+
+    #[tokio::test]
+    async fn delegated_gate_refuses_write_tools_as_unknown_without_registration() {
+        let runtime = SessionToolRuntime::for_tests();
+        let (_cancel, cancellation) = tokio::sync::watch::channel(0_u64);
+        runtime.set_cancellation(cancellation);
+        runtime.begin_request("delegated-write", "project").unwrap();
+        let gate = delegated_gate(&runtime, "delegated-write");
+        let error = gate
+            .dispatch_native(
+                Some("write-1".to_string()),
+                "file_write".to_string(),
+                serde_json::json!({"path": "src/main.eps", "code": "x"}),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.contains("unknown tool 'file_write'"), "{error}");
+        assert_eq!(
+            gate.fatal_admission_error().as_deref(),
+            Some(error.as_str())
+        );
+        assert!(!runtime.owns_write_registration());
     }
 
     #[tokio::test]

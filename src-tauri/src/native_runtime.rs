@@ -755,6 +755,143 @@ impl NativeProjectManager {
         self.open()?.read_source(path)
     }
 
+    /// Render the `[project map]` prompt section: MainFile, ordered Python
+    /// entrypoints, every `src/**` file with its byte length and first
+    /// meaningful line, plugin sections, sparse DAT override counts, and the
+    /// accepted spec index. It is hashed by the context cursor, so it costs a
+    /// turn only when something in it changes.
+    pub fn render_project_map(&self) -> Result<String, String> {
+        const MAX_SPEC_INDEX_BYTES: usize = 8 * 1024;
+        const MAX_FILES: usize = 400;
+        let project = self.open()?;
+        let manifest = project.manifest();
+        let snapshot = project.source_snapshot()?;
+        let mut out = format!(
+            "[project map]
+mainFile={}
+sourceMap={}
+revision={}
+",
+            manifest.main_file, manifest.source_map, snapshot.revision
+        );
+        if !manifest.python_entrypoints.is_empty() {
+            out.push_str(&format!(
+                "pythonEntrypoints={}
+",
+                manifest.python_entrypoints.join(", ")
+            ));
+        }
+        out.push_str(&format!(
+            "files ({}):
+",
+            snapshot.files.len()
+        ));
+        for file in snapshot.files.iter().take(MAX_FILES) {
+            let first_line = file
+                .content
+                .lines()
+                .map(str::trim)
+                .find(|line| !line.is_empty())
+                .unwrap_or_default();
+            let first_line = first_line.chars().take(96).collect::<String>();
+            out.push_str(&format!(
+                "- {} ({} bytes) {}
+",
+                file.path,
+                file.content.len(),
+                first_line
+            ));
+        }
+        if snapshot.files.len() > MAX_FILES {
+            out.push_str(&format!(
+                "- … {} more files
+",
+                snapshot.files.len() - MAX_FILES
+            ));
+        }
+        if !manifest.plugins.is_empty() {
+            out.push_str(&format!(
+                "plugins: {}
+",
+                manifest
+                    .plugins
+                    .iter()
+                    .map(|plugin| plugin.section.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        let dat = project.dat();
+        let numeric = |tables: &crate::native_project::NumericTables| -> usize {
+            tables
+                .values()
+                .map(|objects| objects.values().map(|fields| fields.len()).sum::<usize>())
+                .sum()
+        };
+        let overrides = [
+            ("standard", numeric(&dat.standard.tables)),
+            ("xdat", numeric(&dat.xdat.tables)),
+            ("tbl", dat.tbl.values.len()),
+            (
+                "requirements",
+                dat.requirements
+                    .tables
+                    .values()
+                    .map(|objects| objects.len())
+                    .sum::<usize>(),
+            ),
+            ("buttons", dat.buttons.values.len()),
+        ];
+        out.push_str(&format!(
+            "dat overrides: {}
+",
+            overrides
+                .iter()
+                .map(|(family, count)| format!("{family}={count}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+        let workspace_root = project.root().join(".eud-agent").join("workspace");
+        if let Ok(index) = std::fs::read_to_string(workspace_root.join("specs").join("index.md")) {
+            let mut index = index.trim().to_string();
+            if index.len() > MAX_SPEC_INDEX_BYTES {
+                let mut cut = MAX_SPEC_INDEX_BYTES;
+                while !index.is_char_boundary(cut) {
+                    cut -= 1;
+                }
+                index.truncate(cut);
+                index.push_str(
+                    "
+…",
+                );
+            }
+            if !index.is_empty() {
+                out.push_str(&format!(
+                    "specs/index.md:
+{index}
+"
+                ));
+            }
+        }
+        if let Ok(entries) = std::fs::read_dir(workspace_root.join("worklog")) {
+            let mut worklogs = entries
+                .filter_map(Result::ok)
+                .filter_map(|entry| entry.file_name().into_string().ok())
+                .filter(|name| name.ends_with(".md"))
+                .collect::<Vec<_>>();
+            worklogs.sort();
+            if !worklogs.is_empty() {
+                let recent = worklogs.iter().rev().take(10).cloned().collect::<Vec<_>>();
+                out.push_str(&format!(
+                    "worklog: {}
+",
+                    recent.join(", ")
+                ));
+            }
+        }
+        Ok(out)
+    }
+
     pub fn write_source(&self, path: &str, content: &str) -> Result<(), String> {
         let _transaction = self.transaction.lock();
         self.open()?.write_source(path, content)

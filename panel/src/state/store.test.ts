@@ -298,13 +298,17 @@ describe("reconnect during thinking resets to ready WITH a notice", () => {
     expect(last.text.length).toBeGreaterThan(0);
   });
 
-  it("a wsOpen mid-plan_review also resets to ready with a notice", () => {
+  it("a wsOpen mid-plan_review keeps the plan under review (durable workflow state)", () => {
     const store = readyWithProject();
     store.chatSent();
     store.planReceived("# plan", 1);
     store.wsConnecting();
     store.wsOpen();
-    expect(store.getState().phase).toBe("ready");
+    const s = store.getState();
+    expect(s.phase).toBe("plan_review");
+    expect(s.plan).toEqual({ markdown: "# plan", revision: 1 });
+    // No turn was in flight (plan_review awaits a decision): no cancel notice.
+    expect(s.log.some((entry) => entry.kind === "warn")).toBe(false);
   });
 });
 

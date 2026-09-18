@@ -42,6 +42,23 @@ Independent QA41 observes the post-Undo Map surface at r0 with no candidate and 
 
 Historical checkpoints28/33 retain an OpenCode Go/`glm-5.3` foreground read while its separate task-state compiler fails at the local 16 KiB serialized-normalized-output policy and keeps the foreground result. The provider/model binding is exact, but the wire remains unverified; no Chat Completions compatibility conclusion follows from its call-ID convention.
 
+## Staged workflow
+
+Interactive EPS requests run triage → (clarify) → research → plan (+critic) → plan review →
+execute → verify → changeset review. Stage jobs are delegated runs: a fresh provider session over
+the session's `SessionToolRuntime` with a read-only profile, a run-scoped gate that refuses any
+write tool name as a fatal admission error, a per-run MCP endpoint for native CLIs, and a required
+`submit_result` call validated against the stage schema. Their text never enters the session
+stream; tool calls do. The `answer` and `direct` routes keep the ordinary foreground turn with a
+`[route]` note; `pipeline` never runs a foreground turn before the user approves the plan file.
+
+Clarify emits the ASK event from the engine (no model tool call), appends the answers as
+`[clarification]`, and re-triages at most twice. Plan feedback re-runs the planner (and, in deep
+mode, the reviewers). Verification runs after the executing turn while the request still holds
+its write ticket; a `fail` re-enters the executing turn with the unmet criteria once, and the
+verdict is rendered above the changeset. Cancellation at any stage returns the session to idle
+and retains completed artifacts. Map sessions and autonomous runs are unaffected.
+
 ## Structured jobs
 
 Task-state compilation and harness generation use a fresh `StructuredJobExecutor`, with their own immutable `StructuredJobRequest`. It owns only an adapter and cancellation receiver: empty main history/continuation, no EUD tools or MCP endpoint, and no main store/workspace/UI authority. The runtime supplies an isolated cwd where a native CLI requires one.

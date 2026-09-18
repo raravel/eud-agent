@@ -383,6 +383,11 @@ export function SettingsDialog({
     });
   };
 
+  const updateDeepPlanning = (checked: boolean) => {
+    if (!settings) return;
+    onSettingsChange({ ...settings, deepPlanning: checked });
+  };
+
   const updateLargeContext = (model: string, checked: boolean) => {
     if (!settings) return;
     const enabled = new Set(settings.codexLargeContextModels);
@@ -743,6 +748,24 @@ export function SettingsDialog({
                       세션과 하네스 작업의 제공자는 바뀌지 않습니다.
                     </p>
                   </div>
+                  {settings && (
+                    <label className="mt-4 flex min-h-11 items-center justify-between gap-4 rounded-xl border border-border bg-card/40 px-4 py-3.5">
+                      <span className="min-w-0">
+                        <span className="block text-sm font-medium text-foreground">
+                          더 똑똑한 계획
+                        </span>
+                        <span className="mt-0.5 block text-xs leading-5 text-muted-foreground">
+                          계획마다 모델 호출이 여러 번 추가되어 토큰 사용량이 크게 늘어납니다.
+                        </span>
+                      </span>
+                      <Switch
+                        checked={settings.deepPlanning}
+                        disabled={busy}
+                        aria-label="더 똑똑한 계획"
+                        onCheckedChange={updateDeepPlanning}
+                      />
+                    </label>
+                  )}
                 </div>
               )
             ) : (

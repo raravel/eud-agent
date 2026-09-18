@@ -16,6 +16,9 @@ use std::{
 };
 
 pub(crate) mod runtime_events;
+mod workflow_stages;
+#[cfg(test)]
+mod workflow_tests;
 
 use crate::{
     attachment::{AttachmentContext, AttachmentStore},
@@ -50,7 +53,7 @@ const WORKSPACE_GUIDE: &str = r#"[project workspace]
 - After the code/map changes are accepted, the backend starts a separate post-acceptance harness job. That job generates one structured delta, a deterministic worklog, and a separately reviewable document changeset.
 - Live project changes (source, DAT, map, settings, plugins, build) always go through eud-tools, never through native file writes. `file_write`/`file_edit` take project-relative `src/...` paths — the same paths you read.
 - Use eud-tools for every editor, map, DAT, build, and RAG action. Native shell/file tools are read-only in implementation turns.
-- After the authoritative build and required verification, answer immediately. Do not search for prior worklogs or perform harness/document cleanup."#;
+- After the authoritative build and required verification, answer immediately. Do not perform harness/document cleanup; the accepted spec index and recent worklog names are already listed in `[project map]`."#;
 
 const EPSCRIPT_GUIDE: &str = r#"[epscript]
 - epScript (*.eps) is the primary authoring language and the default for gameplay logic; use direct Python only when the requested change belongs in an existing or explicitly requested Python entrypoint.
@@ -175,9 +178,10 @@ const INTERACTION_GUIDE: &str = r#"[interaction]
 - When explaining a flow, state transition, dependency, or component composition, prefer a fenced `mermaid` diagram over an ASCII/text-only flow. Use Mermaid only when relationships are genuinely clearer as a diagram; keep supporting prose brief."#;
 
 const TRIAGE_INSTRUCTIONS: &str = r#"[triage]
-- Answer-only requests (questions, explanations): reply directly and use NO write tools.
-- Call propose_plan(markdown) ONLY when the user explicitly asks you to write or propose a plan.
-- Otherwise, execute the requested change directly regardless of its size. File writes and build_run never require plan approval."#;
+- Every request is triaged before this turn. A `[route]` section, when present, states the decision: answer-only turns reply directly and use NO write tools; direct turns apply the one specified change, run the authoritative build, and answer.
+- Larger changes are researched, planned, reviewed, and verified in separate stages; the approved plan and research files then instruct the executing turn. Do not call propose_plan for them.
+- Call propose_plan(markdown) only when the user explicitly asks you to write a plan in this turn.
+- File writes and build_run never require plan approval within a routed turn."#;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentTurnResult {
@@ -234,6 +238,8 @@ pub enum EngineEvent {
     /// (rules.md forbids raw kind identifiers as user-facing text).
     SessionLoaded(ipc::SessionLoadedEvent),
     AutonomousRun(Box<crate::autonomous::AutonomousRunState>),
+    /// Staged-workflow projection, emitted on every stage transition and on hydrate.
+    Workflow(Box<crate::workflow::WorkflowEvent>),
 }
 
 pub(crate) trait EventSink {
@@ -250,6 +256,13 @@ pub trait MemoryProvider: Send + Sync {
 /// state from the editor), so a resumed thread never carries a stale snapshot.
 pub trait ProjectStateProvider: Send + Sync {
     fn render_section(&self) -> String;
+}
+
+/// Renders the `[project map]` section (source listing, entrypoints, plugins,
+/// DAT override counts, accepted spec index) fresh each turn; the context
+/// cursor hashes it so it is re-sent only when it changes.
+pub trait ProjectMapProvider: Send + Sync {
+    fn render_section(&self) -> Option<String>;
 }
 
 /// Provides the dat-edit WIKI `[wiki facts]` prompt section and records accepted
@@ -274,6 +287,7 @@ pub struct AgentEngineConfig {
     rag_hits: Vec<crate::rag::Hit>,
     memory_provider: Option<Arc<dyn MemoryProvider>>,
     project_state_provider: Option<Arc<dyn ProjectStateProvider>>,
+    project_map_provider: Option<Arc<dyn ProjectMapProvider>>,
     wiki_provider: Option<Arc<dyn WikiProvider>>,
 }
 
@@ -289,6 +303,7 @@ impl AgentEngineConfig {
             rag_hits,
             memory_provider: None,
             project_state_provider: None,
+            project_map_provider: None,
             wiki_provider: None,
         }
     }
@@ -314,6 +329,18 @@ impl AgentEngineConfig {
     pub fn with_wiki_provider(mut self, provider: Arc<dyn WikiProvider>) -> Self {
         self.wiki_provider = Some(provider);
         self
+    }
+
+    pub fn with_project_map_provider(mut self, provider: Arc<dyn ProjectMapProvider>) -> Self {
+        self.project_map_provider = Some(provider);
+        self
+    }
+
+    /// The `[project map]` section for the prompt, when a provider is wired.
+    fn project_map_for_prompt(&self) -> Option<String> {
+        self.project_map_provider
+            .as_ref()
+            .and_then(|provider| provider.render_section())
     }
 
     /// The `[wiki facts]` section for the prompt, when a provider is wired and the
@@ -390,6 +417,8 @@ pub(crate) struct AgentEngine<R: RuntimeExecutor, S: EventSink> {
     execution_mode: crate::autonomous::ExecutionMode,
     autonomous_policy: crate::autonomous::AutonomousRunPolicy,
     autonomous_pause_requested: Arc<AtomicBool>,
+    /// In-memory mirror of the session's persisted staged-workflow state.
+    workflow: Option<crate::workflow::WorkflowState>,
 }
 impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
     // Keep each injected runtime, persistence, session, and cancellation authority explicit.
@@ -455,6 +484,7 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
             cancellation,
             execution_mode,
             autonomous_policy,
+            workflow: session.workflow.clone(),
             autonomous_pause_requested,
         }
     }
@@ -975,6 +1005,7 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
     ) -> Result<String, AgentEngineError> {
         let static_baseline = static_prompt_baseline();
         let project_state = project_state_section(&self.config.project_state_for_prompt());
+        let project_map = self.config.project_map_for_prompt();
         let memory = self
             .config
             .project_memory_for_prompt()
@@ -1049,6 +1080,7 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
                 project_state: &project_state,
                 project_memory: memory.as_deref(),
                 wiki_facts: wiki.as_deref(),
+                project_map: project_map.as_deref(),
                 reference_context: reference_context.as_deref(),
                 task_revision: record.task_state.projection.revision,
                 task_snapshot: &task_snapshot,
@@ -1276,6 +1308,7 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
             .store(false, Ordering::SeqCst);
         self.current_plan_markdown = None;
         self.approved_plan_sha256 = None;
+        self.plan_revision = 0;
         self.current_request_id = Some(request_id.clone());
         self.current_user_text = req.text.clone();
         self.last_answer.clear();
@@ -1321,6 +1354,31 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
                 ))
             })?);
         }
+        let staged = self.session_kind == crate::session::SessionKind::Eps
+            && execution_mode == crate::autonomous::ExecutionMode::Interactive;
+        let mut route_note = None;
+        if !staged {
+            // A leftover staged request never adopts an autonomous or Map turn.
+            self.workflow_cancel_if_active()?;
+        }
+        if staged {
+            match self
+                .workflow_start(&request_id, &req.client_turn_id, &user_text)
+                .await?
+            {
+                workflow_stages::TriageDecision::Handled => {
+                    self.update_active_session().await;
+                    return Ok(());
+                }
+                workflow_stages::TriageDecision::Foreground(route) => {
+                    route_note = Some(self.workflow_route_note(route));
+                }
+            }
+            if let Some(clarification) = self.workflow_clarification_text() {
+                user_text.push_str("\n\n");
+                user_text.push_str(&clarification);
+            }
+        }
         if execution_mode == crate::autonomous::ExecutionMode::Autonomous {
             let revision = self
                 .runtime
@@ -1356,11 +1414,19 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
                 )
             }
         } else if !self.thread_active && self.pending_resume_transcript.is_some() {
+            if let Some(note) = route_note.take() {
+                user_text.push_str("\n\n");
+                user_text.push_str(&note);
+            }
             String::new()
         } else {
             self.prepare_eps_context(&user_text, resolved_mentions.as_deref(), None, false)
                 .await?
         };
+        if let Some(note) = route_note {
+            turn_text.push_str("\n\n");
+            turn_text.push_str(&note);
+        }
         if execution_mode == crate::autonomous::ExecutionMode::Autonomous {
             turn_text.push_str(
                 "\n\n[autonomous execution]\n이 요청은 사용자가 명시적으로 장시간 작업으로 시작했습니다. iteration 경계에서는 확인된 상태에서 계속하고, 완료된 도구 호출은 반복하지 마세요. canonical runtime 변경 후에는 현재 revision의 build_run 성공을 확인한 뒤에만 완료하세요. ASK 또는 변경사항 검토는 사용자의 결정을 기다리세요.",
@@ -1397,6 +1463,7 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
                 crate::write_coordinator::TicketState::Granted => Phase::Executing,
                 crate::write_coordinator::TicketState::Cancelled => Phase::Idle,
             };
+            self.workflow_settle_foreground()?;
             self.update_active_session().await;
             return Ok(());
         }
@@ -1406,6 +1473,7 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
             ));
         }
         let state_result = result.clone();
+        let cancelled = matches!(result, AgentTurnResult::Cancelled);
         self.handle_turn_result(result)?;
         if self.session_kind == crate::session::SessionKind::Eps {
             self.update_task_state_after_turn(
@@ -1414,6 +1482,11 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
                 resolved_mentions.as_deref(),
             )
             .await;
+        }
+        if cancelled {
+            self.workflow_cancel_if_active()?;
+        } else {
+            self.workflow_settle_foreground()?;
         }
         self.update_active_session().await;
         Ok(())
@@ -1544,6 +1617,17 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
         let resolved_mentions = self.resolve_mentions(&req.mentions)?;
         self.set_client_turn_id(&req.client_turn_id)?;
         self.phase = Phase::PlanReview;
+        if self.workflow_is_pipeline() {
+            // Staged plans revise through the planner job, not the foreground.
+            let feedback = if req.text.trim().is_empty() {
+                "첨부 또는 참조한 내용을 반영해 계획을 수정해 주세요.".to_string()
+            } else {
+                req.text.clone()
+            };
+            self.workflow_plan_round(Some(&feedback)).await?;
+            self.update_active_session().await;
+            return Ok(());
+        }
         let mut attachment_context = self.resolve_attachments(&req.attachments)?;
         let audio_files = std::mem::take(&mut attachment_context.audio_files);
         let request_id = self
@@ -1601,15 +1685,22 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
             ));
         }
         let plan = self.current_plan_markdown.as_deref().unwrap_or_default();
-        self.approved_plan_sha256 = Some(crate::task_state::sha256_bytes(plan.as_bytes()));
+        let sha256 = crate::task_state::sha256_bytes(plan.as_bytes());
+        self.approved_plan_sha256 = Some(sha256.clone());
         let ticket = self
             .runtime
             .register_write_request("approved plan execution")
             .map_err(AgentEngineError::new)?;
         self.pending_write = Some(WriteContinuation::ApprovedPlan);
         self.phase = match ticket.state() {
-            crate::write_coordinator::TicketState::Granted => Phase::Executing,
-            crate::write_coordinator::TicketState::Cancelled => Phase::Idle,
+            crate::write_coordinator::TicketState::Granted => {
+                self.workflow_record_approval(&sha256)?;
+                Phase::Executing
+            }
+            crate::write_coordinator::TicketState::Cancelled => {
+                self.workflow_cancel_if_active()?;
+                Phase::Idle
+            }
         };
         Ok(())
     }
@@ -1647,13 +1738,16 @@ Continue the requested change now, run the mandatory build, and stop only after 
                     .current_plan_markdown
                     .clone()
                     .ok_or_else(|| AgentEngineError::new("no plan is awaiting approval"))?;
-                let workspace = self.executor.current_workspace().ok_or_else(|| {
-                    AgentEngineError::new("the approved plan has no prepared project workspace")
-                })?;
+                // A staged plan may be approved before any foreground turn
+                // prepared the session workspace (or after a restart).
+                let workspace = self.prepared_workspace().await?;
                 WorkspaceManager::new(self.runtime.data_dirs())
                     .record_plan_approval(&workspace.id, &request_id, self.plan_revision, &markdown)
                     .map_err(|error| AgentEngineError::new(error.to_string()))?;
-                approved_plan_execution_instruction(&request_id)?
+                match self.workflow_execution_instruction(&request_id, &workspace) {
+                    Some(instruction) => instruction,
+                    None => approved_plan_execution_instruction(&request_id)?,
+                }
             }
         };
 
@@ -1667,9 +1761,19 @@ Continue the requested change now, run the mandatory build, and stop only after 
         self.thread_active = true;
         let result = self.reinterpret_plan(result);
         let state_result = result.clone();
+        let cancelled = matches!(result, AgentTurnResult::Cancelled);
         self.handle_turn_result(result)?;
+        if !cancelled {
+            // Staged requests are verified against their plan before review.
+            self.workflow_verify_loop().await?;
+        }
         self.pending_write = None;
         self.settle_write_lifecycle()?;
+        if cancelled {
+            self.workflow_cancel_if_active()?;
+        } else {
+            self.workflow_settle_foreground()?;
+        }
         let compiler_user_text = self.current_user_text.clone();
         self.update_task_state_after_turn(&state_result, &compiler_user_text, None)
             .await;
@@ -1679,11 +1783,13 @@ Continue the requested change now, run the mandatory build, and stop only after 
 
     pub fn recover_write_failure(&mut self) -> Result<(), AgentEngineError> {
         self.pending_write = None;
+        self.workflow_fail_if_active("실행 단계가 실패했습니다.")?;
         self.settle_write_lifecycle()
     }
 
     fn recover_read_failure(&mut self) -> Result<(), AgentEngineError> {
         self.pending_write = None;
+        self.workflow_fail_if_active("요청이 실패했습니다.")?;
         if self.emit_current_changeset_if_any()? {
             self.phase = Phase::ChangesetReview;
             self.runtime
@@ -1828,6 +1934,9 @@ Continue the requested change now, run the mandatory build, and stop only after 
         } else {
             None
         };
+        if let Some(job) = harness_job.as_mut() {
+            job.verify_verdict = self.workflow_verdict_markdown();
+        }
         if settled {
             let record = self.session_store.load(&self.session_id).ok();
             let journal_entry_ids = harness_job
@@ -1882,6 +1991,7 @@ Continue the requested change now, run the mandatory build, and stop only after 
                 .map_err(AgentEngineError::new)?;
             self.settle_autonomous_review().await?;
             self.phase = Phase::Idle;
+            self.workflow_mark_done()?;
             self.drop_pending_request_from_session(&request_id);
             self.current_request_id = None;
             self.current_client_turn_id = None;
@@ -2154,6 +2264,9 @@ Continue the requested change now, run the mandatory build, and stop only after 
                 .restore_review(&self.project_id, request_id)
                 .map_err(AgentEngineError::new)?;
             self.reconnect_pending_changeset(&record);
+        }
+        if let Err(error) = self.workflow_hydrate(&record).await {
+            eprintln!("eud-agent: staged workflow restore failed: {error}");
         }
         if let Some(run) = record.autonomous_run.as_ref() {
             self.execution_mode = crate::autonomous::ExecutionMode::Autonomous;
@@ -2682,6 +2795,7 @@ impl EventSink for SessionEventSink {
             EngineEvent::Error(payload) => self.emit_scoped("error", payload),
             EngineEvent::Status(payload) => ipc::emit_status(&self.app, payload),
             EngineEvent::AutonomousRun(payload) => self.emit_scoped("autonomous_run", payload),
+            EngineEvent::Workflow(payload) => self.emit_scoped("workflow", *payload),
             EngineEvent::Wiki(payload) => ipc::emit_wiki(&self.app, payload),
             EngineEvent::SessionLoaded(payload) => ipc::emit_session_loaded(&self.app, payload),
         };
@@ -3708,6 +3822,42 @@ impl SessionEngineManager {
         self.drive_pending_write(worker).await
     }
 
+    async fn workflow_resume(&self, session_id: &str) -> Result<(), AgentEngineError> {
+        let worker = self.worker(session_id).await?;
+        let _provider_busy = self.inner.provider_service.enter_busy(worker.provider);
+        worker
+            .runtime
+            .emit_activity(crate::write_coordinator::SessionActivity::RunningRead);
+        let result = {
+            let mut engine = worker.engine.lock().await;
+            engine.workflow_resume().await
+        };
+        self.finish_read_command(&worker, result).await
+    }
+
+    async fn workflow_restart(&self, session_id: &str) -> Result<(), AgentEngineError> {
+        let worker = self.worker(session_id).await?;
+        let text = {
+            let mut engine = worker.engine.lock().await;
+            let text = engine.workflow_restart()?;
+            engine.update_active_session().await;
+            text
+        };
+        drop(worker);
+        self.chat(
+            session_id,
+            ipc::ChatRequest {
+                client_turn_id: ipc::new_client_turn_id(),
+                text,
+                attachments: Vec::new(),
+                mentions: Vec::new(),
+                execution_mode: crate::autonomous::ExecutionMode::Interactive,
+                autonomous_policy: None,
+            },
+        )
+        .await
+    }
+
     async fn changeset_decision(
         &self,
         session_id: &str,
@@ -3954,6 +4104,7 @@ impl SessionEngineManager {
             context_state: Default::default(),
             task_state: Default::default(),
             autonomous_run: None,
+            workflow: None,
         };
         self.inner
             .sessions
@@ -4246,6 +4397,28 @@ pub(crate) async fn engine_plan_approve(
 ) -> Result<(), String> {
     state
         .plan_approve(&session_id)
+        .await
+        .map_err(|error| error.message)
+}
+
+#[tauri::command(rename = "workflow_resume")]
+pub(crate) async fn engine_workflow_resume(
+    state: tauri::State<'_, SessionEngineManager>,
+    session_id: String,
+) -> Result<(), String> {
+    state
+        .workflow_resume(&session_id)
+        .await
+        .map_err(|error| error.message)
+}
+
+#[tauri::command(rename = "workflow_restart")]
+pub(crate) async fn engine_workflow_restart(
+    state: tauri::State<'_, SessionEngineManager>,
+    session_id: String,
+) -> Result<(), String> {
+    state
+        .workflow_restart(&session_id)
         .await
         .map_err(|error| error.message)
 }
@@ -5081,6 +5254,7 @@ mod tests {
                 project_state: "[project state]\nproject=Sample",
                 project_memory: current_memory,
                 wiki_facts: current_wiki,
+                project_map: None,
                 reference_context: Some("[reference context]\nshould not repeat"),
                 task_revision: 0,
                 task_snapshot: "[active task state]\n{}",
@@ -5134,7 +5308,7 @@ mod tests {
     );
 
     #[derive(Clone, Default)]
-    struct FakeCodexDriver {
+    pub(super) struct FakeCodexDriver {
         prompts: Arc<Mutex<Vec<String>>>,
         image_paths: Arc<Mutex<Vec<Vec<PathBuf>>>>,
         scripted_turns: Arc<Mutex<VecDeque<AgentTurnResult>>>,
@@ -5147,10 +5321,10 @@ mod tests {
         foreground_error: Arc<Mutex<Option<String>>>,
         reject_seed: Arc<Mutex<bool>>,
         write_runtime: Arc<Mutex<Option<SessionToolRuntime>>>,
-        plan_runtime: Option<SessionToolRuntime>,
         /// When set, the next foreground run issues one real `ask` through the
         /// engine tool runtime before returning its scripted result.
         ask_runtime: Arc<Mutex<Option<SessionToolRuntime>>>,
+        pub(super) plan_runtime: Option<SessionToolRuntime>,
         acknowledgement_count: Arc<Mutex<usize>>,
         reset_count: Arc<Mutex<usize>>,
         /// The mock's live thread id; `reset_thread` clears it, `seed_thread_id`
@@ -5158,14 +5332,20 @@ mod tests {
         thread_id: Arc<Mutex<Option<String>>>,
         seeded: Arc<Mutex<Vec<String>>>,
         workspace: Arc<Mutex<Option<PreparedWorkspace>>>,
+        /// Scripted stage-job results in order. When empty, triage defaults to
+        /// `direct` so ordinary foreground fixtures keep their pre-workflow shape.
+        scripted_delegated: Arc<Mutex<VecDeque<crate::provider_runtime::DelegatedRunOutcome>>>,
+        delegated_requests: Arc<Mutex<Vec<(crate::provider_runtime::DelegatedRunKind, String)>>>,
     }
 
     impl FakeCodexDriver {
-        fn scripted(turns: impl IntoIterator<Item = AgentTurnResult>) -> Self {
+        pub(super) fn scripted(turns: impl IntoIterator<Item = AgentTurnResult>) -> Self {
             Self {
                 prompts: Arc::new(Mutex::new(Vec::new())),
                 image_paths: Arc::new(Mutex::new(Vec::new())),
                 scripted_turns: Arc::new(Mutex::new(turns.into_iter().collect())),
+                scripted_delegated: Arc::new(Mutex::new(VecDeque::new())),
+                delegated_requests: Arc::new(Mutex::new(Vec::new())),
                 compiler_prompts: Arc::new(Mutex::new(Vec::new())),
                 compiler_workspaces: Arc::new(Mutex::new(Vec::new())),
                 scripted_compilers: Arc::new(Mutex::new(VecDeque::new())),
@@ -5186,8 +5366,27 @@ mod tests {
             }
         }
 
-        fn prompts(&self) -> Vec<String> {
+        pub(super) fn prompts(&self) -> Vec<String> {
             self.prompts.lock().expect("prompts lock").clone()
+        }
+
+        pub(super) fn script_delegated(
+            &self,
+            outcomes: impl IntoIterator<Item = crate::provider_runtime::DelegatedRunOutcome>,
+        ) {
+            self.scripted_delegated
+                .lock()
+                .expect("delegated queue lock")
+                .extend(outcomes);
+        }
+
+        pub(super) fn delegated_requests(
+            &self,
+        ) -> Vec<(crate::provider_runtime::DelegatedRunKind, String)> {
+            self.delegated_requests
+                .lock()
+                .expect("delegated requests lock")
+                .clone()
         }
 
         fn image_paths(&self) -> Vec<Vec<PathBuf>> {
@@ -5198,7 +5397,7 @@ mod tests {
             self.seeded.lock().expect("seeded lock").clone()
         }
 
-        fn set_workspace(&self, workspace: PreparedWorkspace) {
+        pub(super) fn set_workspace(&self, workspace: PreparedWorkspace) {
             *self.workspace.lock().expect("workspace lock") = Some(workspace);
         }
 
@@ -5380,6 +5579,44 @@ mod tests {
                         RunOutcome::IterationBoundary {
                             reason,
                             conversation: self.conversation_state(),
+                        }
+                    }
+                }
+            })
+        }
+
+        fn run_delegated(
+            &mut self,
+            request: crate::provider_runtime::DelegatedRunRequest,
+        ) -> crate::provider_runtime::AdapterFuture<'_, crate::provider_runtime::DelegatedRunOutcome>
+        {
+            Box::pin(async move {
+                self.delegated_requests
+                    .lock()
+                    .expect("delegated requests lock")
+                    .push((request.kind, request.prompt.clone()));
+                let scripted = self
+                    .scripted_delegated
+                    .lock()
+                    .expect("delegated queue lock")
+                    .pop_front();
+                match scripted {
+                    Some(outcome) => outcome,
+                    None => {
+                        assert_eq!(
+                            request.kind,
+                            crate::provider_runtime::DelegatedRunKind::Triage,
+                            "only triage has a default fixture result"
+                        );
+                        crate::provider_runtime::DelegatedRunOutcome::Result {
+                            value: json!({
+                                "route": "direct",
+                                "goal": "fixture direct change",
+                                "acceptanceCriteria": [],
+                                "rationale": "fixture default"
+                            }),
+                            completions: 1,
+                            usage: None,
                         }
                     }
                 }
@@ -5613,6 +5850,27 @@ mod tests {
             })
         }
 
+        fn run_delegated(
+            &mut self,
+            _request: crate::provider_runtime::DelegatedRunRequest,
+        ) -> crate::provider_runtime::AdapterFuture<'_, crate::provider_runtime::DelegatedRunOutcome>
+        {
+            // Triage routes every gate fixture request directly so the
+            // foreground gate remains the serialization witness.
+            Box::pin(async {
+                crate::provider_runtime::DelegatedRunOutcome::Result {
+                    value: json!({
+                        "route": "direct",
+                        "goal": "gate fixture",
+                        "acceptanceCriteria": [],
+                        "rationale": "fixture"
+                    }),
+                    completions: 1,
+                    usage: None,
+                }
+            })
+        }
+
         fn run_structured(
             &mut self,
             _request: StructuredJobRequest,
@@ -5693,12 +5951,12 @@ mod tests {
     }
 
     #[derive(Clone, Default)]
-    struct CapturingEventSink {
+    pub(super) struct CapturingEventSink {
         events: Arc<Mutex<Vec<EngineEvent>>>,
     }
 
     impl CapturingEventSink {
-        fn events(&self) -> Vec<EngineEvent> {
+        pub(super) fn events(&self) -> Vec<EngineEvent> {
             self.events.lock().expect("events lock").clone()
         }
     }
@@ -5755,7 +6013,7 @@ mod tests {
         }
     }
 
-    fn unique_temp_dir(tag: &str) -> PathBuf {
+    pub(super) fn unique_temp_dir(tag: &str) -> PathBuf {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -5771,7 +6029,7 @@ mod tests {
         (base, memory)
     }
 
-    fn native_workspace_snapshot(
+    pub(super) fn native_workspace_snapshot(
         dirs: &crate::config::DataDirs,
         name: &str,
     ) -> crate::source_snapshot::ProjectSnapshot {
@@ -5821,7 +6079,7 @@ mod tests {
         crate::session::SessionStore::new(&dirs)
     }
 
-    fn attachment_store_at(data_dir: &std::path::Path) -> AttachmentStore {
+    pub(super) fn attachment_store_at(data_dir: &std::path::Path) -> AttachmentStore {
         AttachmentStore::new(data_dir.join("attachments"))
     }
 
@@ -5852,6 +6110,7 @@ mod tests {
             context_state: Default::default(),
             task_state: Default::default(),
             autonomous_run: None,
+            workflow: None,
         };
         store.save(&record).unwrap();
         record
@@ -5870,7 +6129,7 @@ mod tests {
             executor,
             sink,
             config_with_memory(memory),
-            SessionToolRuntime::for_tests(),
+            test_tool_runtime(),
             sessions,
             attachment_store_at(data_dir),
             session,
@@ -5894,7 +6153,7 @@ mod tests {
             .expect("journal entry should persist");
     }
 
-    fn record_file_write_in_memory(
+    pub(super) fn record_file_write_in_memory(
         store: &journal::JournalStore,
         request_id: &str,
         id: &str,
@@ -5979,7 +6238,7 @@ mod tests {
             executor,
             sink,
             config,
-            SessionToolRuntime::for_tests(),
+            test_tool_runtime(),
             sessions,
             attachment_store_at(data_dir),
             session,
@@ -5990,7 +6249,52 @@ mod tests {
         engine
     }
 
-    fn test_engine<R: RuntimeExecutor, S: EventSink>(executor: R, sink: S) -> AgentEngine<R, S> {
+    /// A session tool runtime with an activated native project, so stage jobs
+    /// and approvals can prepare the session workspace as production does.
+    fn test_tool_runtime() -> SessionToolRuntime {
+        let runtime = SessionToolRuntime::for_tests();
+        let dirs = runtime.data_dirs();
+        dirs.ensure_dirs().expect("test data dirs");
+        // A separate root from `native_workspace_snapshot`, which tests may
+        // still call to activate their own fixture project afterwards.
+        let root = dirs.app_data().join("base-project");
+        fs::create_dir_all(root.join("maps")).unwrap();
+        fs::write(root.join("maps/source.scx"), b"map").unwrap();
+        let project = crate::native_project::NativeProject::create(
+            &root,
+            crate::native_project::ProjectManifest {
+                schema_version: crate::native_project::PROJECT_SCHEMA_VERSION,
+                name: "Sample".to_string(),
+                source_map: "maps/source.scx".to_string(),
+                output_map: "build/output.scx".to_string(),
+                main_file: "src/main.eps".to_string(),
+                settings: Default::default(),
+                plugins: Vec::new(),
+                python_entrypoints: Vec::new(),
+                python_dependencies: Vec::new(),
+                python_lock: None,
+                editor_compatibility: None,
+            },
+        )
+        .unwrap();
+        crate::native_runtime::NativeProjectManager::new(dirs)
+            .activate_project(&project)
+            .unwrap();
+        runtime
+    }
+
+    pub(super) fn test_engine<R: RuntimeExecutor, S: EventSink>(
+        executor: R,
+        sink: S,
+    ) -> AgentEngine<R, S> {
+        test_engine_on(executor, sink, test_tool_runtime())
+    }
+
+    fn test_engine_on<R: RuntimeExecutor, S: EventSink>(
+        executor: R,
+        sink: S,
+        runtime: SessionToolRuntime,
+    ) -> AgentEngine<R, S> {
         let data_dir = unique_temp_dir("engine-sessions");
         let sessions = session_store_at(&data_dir);
         let session = test_session(&sessions);
@@ -6003,7 +6307,7 @@ mod tests {
                 None,
                 sample_hits(),
             ),
-            SessionToolRuntime::for_tests(),
+            runtime,
             sessions,
             attachment_store_at(&unique_temp_dir("engine-attachments")),
             session,
@@ -6537,7 +6841,13 @@ mod tests {
             .await
             .expect("propose_plan turn should run");
 
-        let events = sink_handle.events();
+        // Workflow projections interleave with the v2 events; only the
+        // answer/plan events carry the turn outcome.
+        let events = sink_handle
+            .events()
+            .into_iter()
+            .filter(|event| !matches!(event, EngineEvent::Workflow(_)))
+            .collect::<Vec<_>>();
         assert!(
             matches!(
                 events.as_slice(),
@@ -7746,9 +8056,10 @@ mod tests {
         );
 
         assert!(prompt.contains(
-            "Call propose_plan(markdown) ONLY when the user explicitly asks you to write or propose a plan"
+            "Call propose_plan(markdown) only when the user explicitly asks you to write a plan"
         ));
-        assert!(prompt.contains("Otherwise, execute the requested change directly"));
+        assert!(prompt.contains("Every request is triaged before this turn"));
+        assert!(!prompt.contains("regardless of its size"));
         assert!(!prompt.contains("3+ mutations"));
     }
 
@@ -8150,6 +8461,7 @@ mod tests {
             context_state: Default::default(),
             task_state: Default::default(),
             autonomous_run: None,
+            workflow: None,
         };
         sessions.save(&record).unwrap();
         let request_c = "req-c";
@@ -8379,7 +8691,12 @@ mod tests {
     async fn rollback_failure_keeps_review_owner_and_live_journal() {
         let sink = CapturingEventSink::default();
         let sink_handle = sink.clone();
-        let mut engine = test_engine(FakeCodexDriver::scripted([]), sink);
+        // No native project: the journaled write cannot be reverted.
+        let mut engine = test_engine_on(
+            FakeCodexDriver::scripted([]),
+            sink,
+            SessionToolRuntime::for_tests(),
+        );
         let request_id = "req-rollback-failure";
         engine.runtime.begin_request(request_id, "Sample").unwrap();
         engine
@@ -8430,7 +8747,7 @@ mod tests {
                 None,
                 sample_hits(),
             ),
-            SessionToolRuntime::for_tests(),
+            test_tool_runtime(),
             sessions,
             attachment_store.clone(),
             session,

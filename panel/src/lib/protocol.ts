@@ -267,6 +267,81 @@ export interface ChangesetMessage extends SessionScopedMessage {
   items: ChangesetItem[];
 }
 
+/** Staged workflow stages (features/staged-workflow-plan.md ## Stage model). */
+export type WorkflowStage =
+  | "triage"
+  | "clarify"
+  | "research"
+  | "planning"
+  | "critique"
+  | "plan_review"
+  | "executing"
+  | "verifying"
+  | "changeset_review"
+  | "interrupted"
+  | "cancelled"
+  | "done"
+  | "failed";
+
+/** Triage route: answer-only, direct edit, or the full staged pipeline. */
+export type WorkflowRoute = "answer" | "direct" | "pipeline";
+
+/** A durable stage artifact (research markdown) by project-relative path. */
+export interface WorkflowArtifactRef {
+  path: string;
+  sha256: string;
+  summary: string;
+}
+
+/** The rendered plan artifact under review or approved for execution. */
+export interface WorkflowPlanArtifact {
+  path: string;
+  revision: number;
+  sha256: string;
+  approvedSha256?: string;
+  title: string;
+  acceptanceCriteria: string[];
+  criticVerdict?: "approve" | "revise";
+  criticSummary?: string;
+  deep: boolean;
+  iterations: number;
+}
+
+/** The verifier verdict for the executed plan. */
+export interface WorkflowVerifyResult {
+  verdict: "pass" | "fail";
+  summary: string;
+  path: string;
+  sha256: string;
+  unmet: string[];
+}
+
+/**
+ * One workflow snapshot, emitted on every stage transition and on hydrate.
+ * `stage: "plan_review"` accompanies (or follows) an ordinary `plan` event;
+ * `stage: "changeset_review"` arrives together with the `changeset` event.
+ */
+export interface WorkflowEvent {
+  requestId: string;
+  stage: WorkflowStage;
+  interruptedStage?: WorkflowStage;
+  route?: WorkflowRoute;
+  goal?: string;
+  acceptanceCriteria: string[];
+  research?: WorkflowArtifactRef;
+  plan?: WorkflowPlanArtifact;
+  critiqueRounds: number;
+  verifyAttempts: number;
+  verdict?: WorkflowVerifyResult;
+  deepPlanning: boolean;
+  error?: string;
+}
+
+/** `workflow {sessionId, ...WorkflowEvent}` - staged workflow state. */
+export interface WorkflowMessage extends SessionScopedMessage, WorkflowEvent {
+  type: "workflow";
+}
+
 export type HarnessJobStatus =
   | "waiting_runtime"
   | "pending"
@@ -674,6 +749,7 @@ export type ServerMessage =
   | AnswerMessage
   | PlanMessage
   | ChangesetMessage
+  | WorkflowMessage
   | HarnessJobMessage
   | RollbackResultMessage
   | ProgressMessage
@@ -695,6 +771,7 @@ export const SERVER_MESSAGE_TYPES = [
   "plan",
   "ask",
   "changeset",
+  "workflow",
   "harness_job",
   "rollback_result",
   "progress",
@@ -739,6 +816,14 @@ export interface PlanFeedbackMessage extends SessionCommand {
 /** `plan_approve` resumes the plan owned by one active session. */
 export interface PlanApproveMessage extends SessionCommand {
   type: "plan_approve";
+}
+/** `workflow_resume` restarts the interrupted stage from its persisted inputs. */
+export interface WorkflowResumeMessage extends SessionCommand {
+  type: "workflow_resume";
+}
+/** `workflow_restart` discards the interrupted stage state and re-triages. */
+export interface WorkflowRestartMessage extends SessionCommand {
+  type: "workflow_restart";
 }
 /** Resolve one pending ASK tool call without starting a new chat turn. */
 export interface AskResponseMessage extends SessionCommand {
@@ -850,6 +935,8 @@ export type ClientMessage =
   | ChatMessage
   | PlanFeedbackMessage
   | PlanApproveMessage
+  | WorkflowResumeMessage
+  | WorkflowRestartMessage
   | AskResponseMessage
   | ChangesetDecisionMessage
   | CancelMessage
@@ -874,6 +961,8 @@ export const CLIENT_MESSAGE_TYPES = [
   "chat",
   "plan_feedback",
   "plan_approve",
+  "workflow_resume",
+  "workflow_restart",
   "ask_response",
   "changeset_decision",
   "cancel",
@@ -1058,6 +1147,96 @@ export function isChangesetMessage(value: unknown): value is ChangesetMessage {
     hasSessionId(value) &&
     typeof value.request_id === "string" &&
     Array.isArray(value.items)
+  );
+}
+
+const WORKFLOW_STAGES: readonly WorkflowStage[] = [
+  "triage",
+  "clarify",
+  "research",
+  "planning",
+  "critique",
+  "plan_review",
+  "executing",
+  "verifying",
+  "changeset_review",
+  "interrupted",
+  "cancelled",
+  "done",
+  "failed",
+];
+
+const WORKFLOW_ROUTES: readonly WorkflowRoute[] = ["answer", "direct", "pipeline"];
+
+function isStringArray(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every((item) => typeof item === "string");
+}
+
+function isWorkflowStage(value: unknown): value is WorkflowStage {
+  return WORKFLOW_STAGES.includes(value as WorkflowStage);
+}
+
+function isWorkflowArtifactRef(value: unknown): value is WorkflowArtifactRef {
+  return (
+    isObject(value) &&
+    typeof value.path === "string" &&
+    typeof value.sha256 === "string" &&
+    typeof value.summary === "string"
+  );
+}
+
+function isWorkflowPlanArtifact(value: unknown): value is WorkflowPlanArtifact {
+  return (
+    isObject(value) &&
+    typeof value.path === "string" &&
+    typeof value.revision === "number" &&
+    typeof value.sha256 === "string" &&
+    (value.approvedSha256 === undefined ||
+      typeof value.approvedSha256 === "string") &&
+    typeof value.title === "string" &&
+    isStringArray(value.acceptanceCriteria) &&
+    (value.criticVerdict === undefined ||
+      value.criticVerdict === "approve" ||
+      value.criticVerdict === "revise") &&
+    (value.criticSummary === undefined ||
+      typeof value.criticSummary === "string") &&
+    typeof value.deep === "boolean" &&
+    typeof value.iterations === "number"
+  );
+}
+
+function isWorkflowVerifyResult(value: unknown): value is WorkflowVerifyResult {
+  return (
+    isObject(value) &&
+    (value.verdict === "pass" || value.verdict === "fail") &&
+    typeof value.summary === "string" &&
+    typeof value.path === "string" &&
+    typeof value.sha256 === "string" &&
+    isStringArray(value.unmet)
+  );
+}
+
+/** True if `value` is a session-scoped `workflow` stage snapshot. */
+export function isWorkflowMessage(value: unknown): value is WorkflowMessage {
+  return (
+    isObject(value) &&
+    value.type === "workflow" &&
+    hasSessionId(value) &&
+    typeof value.requestId === "string" &&
+    isWorkflowStage(value.stage) &&
+    (value.interruptedStage === undefined ||
+      isWorkflowStage(value.interruptedStage)) &&
+    (value.route === undefined ||
+      WORKFLOW_ROUTES.includes(value.route as WorkflowRoute)) &&
+    (value.goal === undefined || typeof value.goal === "string") &&
+    isStringArray(value.acceptanceCriteria) &&
+    (value.research === undefined || isWorkflowArtifactRef(value.research)) &&
+    (value.plan === undefined || isWorkflowPlanArtifact(value.plan)) &&
+    typeof value.critiqueRounds === "number" &&
+    typeof value.verifyAttempts === "number" &&
+    (value.verdict === undefined || isWorkflowVerifyResult(value.verdict)) &&
+    typeof value.deepPlanning === "boolean" &&
+    (value.error === undefined || typeof value.error === "string")
   );
 }
 
@@ -1289,6 +1468,7 @@ export function isServerMessage(value: unknown): value is ServerMessage {
     isPlanMessage(value) ||
     isAskMessage(value) ||
     isChangesetMessage(value) ||
+    isWorkflowMessage(value) ||
     isHarnessJobMessage(value) ||
     isRollbackResultMessage(value) ||
     isProgressMessage(value) ||

@@ -8,11 +8,13 @@ use crate::{
 };
 
 use super::{
-    AdapterEventKind, AdapterLoopKind, BindingSnapshot, CompactionRequest, ForegroundRequest,
-    ProviderAdapter, ProviderRuntimeError, RunOutcome, RuntimeExecutor, StructuredJobRequest,
+    AdapterEventKind, AdapterLoopKind, BindingSnapshot, CompactionRequest, DelegatedRunOutcome,
+    DelegatedRunRequest, ForegroundRequest, ProviderAdapter, ProviderRuntimeError, RunOutcome,
+    RuntimeExecutor, StructuredJobRequest,
 };
 
 mod compaction;
+mod delegated;
 mod events;
 mod foreground;
 mod native_compaction;
@@ -25,6 +27,7 @@ mod tool_batch;
 mod tool_events;
 
 use super::{AdapterFuture, ProviderContinuation, RunIdentity, WorkspaceAccess};
+pub use delegated::DelegatedRunExecutor;
 pub use structured::StructuredJobExecutor;
 
 pub trait RuntimeEventSink: Send + Sync {
@@ -75,6 +78,30 @@ impl RuntimeExecutor for ProviderRuntime {
             StructuredJobExecutor::new(adapter, self.cancellation.clone())
                 .run(request)
                 .await
+        })
+    }
+
+    fn run_delegated(
+        &mut self,
+        request: DelegatedRunRequest,
+    ) -> super::AdapterFuture<'_, DelegatedRunOutcome> {
+        Box::pin(async move {
+            let adapter = match super::production_adapter(
+                &request.binding.to_binding(),
+                &self.dirs,
+                self.fallback_cwd.clone(),
+            ) {
+                Ok(adapter) => adapter,
+                Err(error) => return DelegatedRunOutcome::Failed(error),
+            };
+            DelegatedRunExecutor::new(
+                adapter,
+                self.tools.clone(),
+                self.events.clone(),
+                self.cancellation.clone(),
+            )
+            .run(request)
+            .await
         })
     }
 

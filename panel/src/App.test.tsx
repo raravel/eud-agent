@@ -257,6 +257,7 @@ beforeEach(() => {
             askResponseRequired: { sound: true, osNotification: true },
           },
           codexLargeContextModels: [],
+          deepPlanning: false,
         };
       case "app_settings_save":
         return args?.settings;
@@ -1020,6 +1021,206 @@ describe("App concurrent sessions", () => {
     ).toHaveTextContent("복구된 질문입니다.");
   });
 
+  it("renders the stage strip from workflow events and routes resume/restart commands", async () => {
+    render(<App />);
+    await screen.findByRole("button", { name: "Session A, 유휴" });
+    await waitFor(() => expect(tauri.listeners.has("workflow")).toBe(true));
+
+    const snapshot = {
+      sessionId: "session-a",
+      requestId: "req-1",
+      route: "pipeline",
+      acceptanceCriteria: ["게임 시작 시 미네랄 1000 지급"],
+      critiqueRounds: 0,
+      verifyAttempts: 0,
+      deepPlanning: true,
+    };
+    act(() => {
+      emit("workflow", {
+        ...snapshot,
+        stage: "research",
+        research: {
+          path: ".eud-agent/workspace/research/req-1.md",
+          sha256: "a".repeat(64),
+          summary: "트리거 3개를 확인했습니다.",
+        },
+      });
+    });
+    const strip = await screen.findByRole("navigation", { name: "작업 단계" });
+    const active = within(strip)
+      .getAllByRole("listitem")
+      .find((item) => item.getAttribute("aria-current") === "step");
+    expect(active).toHaveTextContent("조사");
+    expect(within(strip).getByText("심층 계획")).toBeInTheDocument();
+    expect(screen.getByRole("region", { name: "조사 결과" })).toBeInTheDocument();
+    // A busy stage is send-gated like thinking and shows the turn status.
+    expect(screen.getByRole("button", { name: "실행" })).toBeDisabled();
+    expect(screen.getByTestId("active-turn-status")).toBeInTheDocument();
+
+    act(() => {
+      emit("workflow", {
+        ...snapshot,
+        stage: "interrupted",
+        interruptedStage: "research",
+      });
+    });
+    const resume = await screen.findByRole("button", { name: "이어서 진행" });
+    fireEvent.click(resume);
+    await waitFor(() => {
+      expect(tauri.invoke).toHaveBeenCalledWith("workflow_resume", {
+        sessionId: "session-a",
+      });
+    });
+    await waitFor(() =>
+      expect(screen.queryByRole("button", { name: "이어서 진행" })).toBeNull(),
+    );
+
+    act(() => {
+      emit("workflow", {
+        ...snapshot,
+        stage: "interrupted",
+        interruptedStage: "research",
+      });
+    });
+    fireEvent.click(await screen.findByRole("button", { name: "처음부터" }));
+    await waitFor(() => {
+      expect(tauri.invoke).toHaveBeenCalledWith("workflow_restart", {
+        sessionId: "session-a",
+      });
+    });
+    await waitFor(() =>
+      expect(screen.queryByRole("navigation", { name: "작업 단계" })).toBeNull(),
+    );
+  });
+
+  it("keeps a cancelled request visible and restarts it from the strip", async () => {
+    render(<App />);
+    await screen.findByRole("button", { name: "Session A, 유휴" });
+    await waitFor(() => expect(tauri.listeners.has("workflow")).toBe(true));
+    act(() => {
+      emit("workflow", {
+        sessionId: "session-a",
+        requestId: "req-4",
+        stage: "cancelled",
+        interruptedStage: "research",
+        route: "pipeline",
+        acceptanceCriteria: [],
+        critiqueRounds: 0,
+        verifyAttempts: 0,
+        deepPlanning: false,
+      });
+    });
+    const strip = await screen.findByRole("navigation", { name: "작업 단계" });
+    expect(within(strip).getByRole("status")).toHaveTextContent("취소됨");
+    expect(screen.getByRole("button", { name: "실행" })).toBeEnabled();
+    fireEvent.click(within(strip).getByRole("button", { name: "처음부터" }));
+    await waitFor(() => {
+      expect(tauri.invoke).toHaveBeenCalledWith("workflow_restart", {
+        sessionId: "session-a",
+      });
+    });
+    await waitFor(() =>
+      expect(screen.queryByRole("navigation", { name: "작업 단계" })).toBeNull(),
+    );
+  });
+
+  it("hides the stage strip once triage routes to a direct answer", async () => {
+    render(<App />);
+    await screen.findByRole("button", { name: "Session A, 유휴" });
+    await waitFor(() => expect(tauri.listeners.has("workflow")).toBe(true));
+    const snapshot = {
+      sessionId: "session-a",
+      requestId: "req-2",
+      acceptanceCriteria: [],
+      critiqueRounds: 0,
+      verifyAttempts: 0,
+      deepPlanning: false,
+    };
+    act(() => {
+      emit("workflow", { ...snapshot, stage: "triage" });
+    });
+    expect(
+      await screen.findByRole("navigation", { name: "작업 단계" }),
+    ).toBeInTheDocument();
+    act(() => {
+      emit("workflow", { ...snapshot, stage: "executing", route: "answer" });
+    });
+    await waitFor(() =>
+      expect(screen.queryByRole("navigation", { name: "작업 단계" })).toBeNull(),
+    );
+    act(() => {
+      emit("answer", { sessionId: "session-a", text: "답변입니다." });
+      emit("workflow", { ...snapshot, stage: "done", route: "answer" });
+    });
+    expect(await screen.findByText("답변입니다.")).toBeInTheDocument();
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "실행" })).toBeEnabled(),
+    );
+  });
+
+  it("shows the verdict above the changeset and the plan artifact details", async () => {
+    render(<App />);
+    await screen.findByRole("button", { name: "Session A, 유휴" });
+    await waitFor(() => {
+      expect(tauri.listeners.has("workflow")).toBe(true);
+      expect(tauri.listeners.has("plan")).toBe(true);
+      expect(tauri.listeners.has("changeset")).toBe(true);
+    });
+    const snapshot = {
+      sessionId: "session-a",
+      requestId: "req-3",
+      route: "pipeline",
+      acceptanceCriteria: ["빌드 통과"],
+      critiqueRounds: 1,
+      verifyAttempts: 0,
+      deepPlanning: false,
+      plan: {
+        path: ".eud-agent/workspace/plans/req-3.md",
+        revision: 1,
+        sha256: "d".repeat(64),
+        title: "미네랄 지급 트리거",
+        acceptanceCriteria: ["빌드 통과"],
+        criticVerdict: "approve",
+        criticSummary: "문제 없음",
+        deep: false,
+        iterations: 1,
+      },
+    };
+    act(() => {
+      emit("workflow", { ...snapshot, stage: "plan_review" });
+      emit("plan", { sessionId: "session-a", markdown: "# 계획", revision: 1 });
+    });
+    expect(await screen.findByText("미네랄 지급 트리거")).toBeInTheDocument();
+    expect(screen.getByRole("list", { name: "수용 기준" })).toHaveTextContent("빌드 통과");
+    expect(screen.getByText("비평 승인")).toBeInTheDocument();
+
+    act(() => {
+      emit("changeset", {
+        sessionId: "session-a",
+        request_id: "req-3",
+        items: [{ category: "file", id: "file-1", seq: 1, path: "main.eps", diff: "" }],
+      });
+      emit("workflow", {
+        ...snapshot,
+        stage: "changeset_review",
+        verifyAttempts: 1,
+        verdict: {
+          verdict: "pass",
+          summary: "모든 수용 기준을 충족합니다.",
+          path: ".eud-agent/workspace/verify/req-3.md",
+          sha256: "e".repeat(64),
+          unmet: [],
+        },
+      });
+    });
+    const verdict = await screen.findByRole("region", { name: "검증 결과" });
+    expect(verdict).toHaveTextContent("검증 통과");
+    const changeset = screen.getByRole("region", { name: "변경사항 검토" });
+    expect(
+      verdict.compareDocumentPosition(changeset) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+  });
+
   it("preserves a collapsed plan after switching session tabs", async () => {
     render(<App />);
     await screen.findByRole("button", { name: "Session A, 유휴" });
@@ -1176,6 +1377,7 @@ describe("App notifications", () => {
             askResponseRequired: { sound: true, osNotification: true },
           },
           codexLargeContextModels: [],
+          deepPlanning: false,
         },
       });
     });

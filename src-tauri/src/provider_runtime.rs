@@ -26,10 +26,11 @@ pub use conversation::{
 pub(crate) use factory::production_adapter;
 pub use identity::{BindingSnapshot, RunId, RunIdentity};
 pub use requests::{
-    AgentTurnInput, CompactionRequest, ForegroundRequest, JobBase, RunPolicy, StructuredJobKind,
-    StructuredJobRequest, WorkspaceAccess,
+    AgentTurnInput, CompactionRequest, DelegatedRunKind, DelegatedRunOutcome, DelegatedRunRequest,
+    ForegroundRequest, JobBase, RunPolicy, StructuredJobKind, StructuredJobRequest,
+    WorkspaceAccess,
 };
-pub use runtime::{ProviderRuntime, RuntimeEventSink, StructuredJobExecutor};
+pub use runtime::{DelegatedRunExecutor, ProviderRuntime, RuntimeEventSink, StructuredJobExecutor};
 pub const TASK_STATE_COMPILER_DEADLINE: Duration = Duration::from_secs(60);
 pub const TASK_STATE_COMPILER_OUTPUT_TOKENS: u64 = 8_192;
 pub const HARNESS_DEADLINE: Duration = Duration::from_secs(300);
@@ -67,6 +68,16 @@ pub enum RunOutcome {
 pub trait RuntimeExecutor: Send {
     fn run_foreground(&mut self, request: ForegroundRequest) -> AdapterFuture<'_, RunOutcome>;
     fn run_structured(&mut self, request: StructuredJobRequest) -> AdapterFuture<'_, RunOutcome>;
+    fn run_delegated(
+        &mut self,
+        _request: DelegatedRunRequest,
+    ) -> AdapterFuture<'_, DelegatedRunOutcome> {
+        Box::pin(async {
+            DelegatedRunOutcome::Failed(ProviderRuntimeError::Protocol(
+                "delegated runs are unavailable on this executor".into(),
+            ))
+        })
+    }
     fn reset(&mut self) -> AdapterFuture<'_, Result<(), ProviderRuntimeError>>;
     fn compact(
         &mut self,

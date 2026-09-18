@@ -28,7 +28,6 @@ use rmcp::{ErrorData as McpError, RoleServer, ServerHandler};
 use serde_json::Value;
 
 use crate::provider_tool_loop::RunGate;
-use crate::tools::{map_mcp_tool_descriptors, mcp_tool_descriptors};
 
 /// The MCP server name codex registers (matched by the approval handler).
 pub const SERVER_NAME: &str = "eud-tools";
@@ -68,7 +67,7 @@ impl ServerHandler for EudToolHandler {
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
         Ok(ListToolsResult::with_all_items(tool_list(
-            self.gate.identity().session_kind,
+            self.gate.descriptors(),
         )))
     }
 
@@ -90,14 +89,9 @@ impl ServerHandler for EudToolHandler {
     }
 }
 
-/// Build the MCP `Tool` list from the registry's MCP descriptors (verbatim
-/// inputSchema per tool).
-fn tool_list(kind: crate::session::SessionKind) -> Vec<Tool> {
-    let descriptors = if kind == crate::session::SessionKind::Map {
-        map_mcp_tool_descriptors()
-    } else {
-        mcp_tool_descriptors()
-    };
+/// Build the MCP `Tool` list from the gate's advertised descriptors (verbatim
+/// inputSchema per tool), so a native CLI sees exactly what the gate admits.
+fn tool_list(descriptors: Vec<Value>) -> Vec<Tool> {
     descriptors
         .into_iter()
         .filter_map(|descriptor| {
@@ -269,7 +263,7 @@ mod tests {
 
     #[test]
     fn tool_list_exposes_every_registry_tool_with_its_schema() {
-        let tools = tool_list(crate::session::SessionKind::Eps);
+        let tools = tool_list(crate::tools::mcp_tool_descriptors());
         let registry = crate::tools::tool_registry();
         assert_eq!(tools.len(), registry.len());
 
@@ -291,8 +285,45 @@ mod tests {
     }
 
     #[test]
+    fn delegated_gate_tool_list_is_exactly_the_profile_plus_submit_result() {
+        let runtime = SessionToolRuntime::for_tests();
+        let (_cancel, cancellation) = tokio::sync::watch::channel(0_u64);
+        runtime.set_cancellation(cancellation);
+        runtime.begin_request("delegated-list", "project").unwrap();
+        let schema = serde_json::json!({"type": "object", "properties": {"summary": {"type": "string"}}, "required": ["summary"]});
+        let gate = RunGate::delegated(
+            RunIdentity {
+                session_id: runtime.session_id().to_string(),
+                run_id: RunId::new(3),
+                request_id: "delegated-list".to_string(),
+                session_kind: runtime.kind(),
+                cancellation_generation: 0,
+            },
+            runtime,
+            crate::provider_tool_loop::DelegatedToolProfile::new(
+                ["read_file", "search_docs", "list_files"],
+                &schema,
+            )
+            .unwrap(),
+        );
+        let names = tool_list(gate.descriptors())
+            .into_iter()
+            .map(|tool| tool.name.to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            [
+                "list_files",
+                "read_file",
+                "search_docs",
+                crate::provider_tool_loop::SUBMIT_RESULT_TOOL
+            ]
+        );
+    }
+
+    #[test]
     fn map_tool_list_excludes_original_apply_and_eps_mutations() {
-        let tools = tool_list(crate::session::SessionKind::Map);
+        let tools = tool_list(crate::tools::map_mcp_tool_descriptors());
         let registry = crate::tools::map_tool_registry();
         assert_eq!(tools.len(), registry.len());
         assert!(tools

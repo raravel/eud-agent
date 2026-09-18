@@ -44,6 +44,8 @@ import type {
   PanelLog,
   MentionInstance,
   ProgressStage,
+  WorkflowEvent,
+  WorkflowStage,
 } from "@/lib/ipc";
 // itemIds maps an item to its decision-target ids (a dat group has NO
 // item-level id — its ids live on each property; see lib/changeset). The store
@@ -55,12 +57,21 @@ import { itemIds } from "@/lib/changeset";
 /** Max conversation/event-log entries (features/06 ## Behaviors). */
 export const MAX_LOG_ENTRIES = 500;
 
-/** Phases of the v2 panel state machine. */
+/**
+ * Phases of the v2 panel state machine. `research` / `planning` / `verifying`
+ * are staged-workflow projections of a busy turn (send-gated like `thinking`);
+ * `interrupted` is a stage job cut by shutdown awaiting resume/restart (not
+ * busy). See features/staged-workflow-plan.md ## Phase 2 Panel.
+ */
 export type Phase =
   | "connecting"
   | "retry"
   | "ready"
   | "thinking"
+  | "research"
+  | "planning"
+  | "verifying"
+  | "interrupted"
   | "plan_review"
   | "changeset_review";
 
@@ -285,6 +296,12 @@ export interface PanelState {
   ask: AskState | null;
   /** Active changeset under review (null until a `changeset`; survives reconnect). */
   changeset: ChangesetState | null;
+  /**
+   * The last staged-workflow snapshot for the active request (null until a
+   * `workflow` event; cleared when a new request starts). Drives the stage
+   * strip, research/verdict cards, and the interrupted controls.
+   */
+  workflow: WorkflowEvent | null;
   /** Whether the project-memory overlay is open. */
   memoryOpen: boolean;
   /** Project memory snapshot/drafts (null until `memory` arrives). */
@@ -362,6 +379,12 @@ export interface PanelStore {
   askAnswered(): void;
   /** `changeset` — enter changeset_review with the journaled items. */
   changesetReceived(requestId: string, items: ChangesetItem[]): void;
+  /**
+   * `workflow` — replace the stage snapshot and project its stage onto the
+   * phase (see {@link phaseForWorkflowStage}). Newly appearing research /
+   * verdict artifacts are archived into the log while a turn is in flight.
+   */
+  workflowReceived(event: WorkflowEvent): void;
   /** `rollback_result` — flip per-item decision state (rejected/failed). */
   rollbackResult(ids: string[], ok: boolean): void;
   /** `error` — return the flow to ready (and detect the no-project signal). */
@@ -392,6 +415,10 @@ export interface PanelStore {
   planFeedbackSent(): void;
   /** plan_approve was sent → thinking. */
   planApproveSent(): void;
+  /** workflow_resume was sent → the interrupted stage's busy phase. */
+  workflowResumeSent(): void;
+  /** workflow_restart was sent → thinking (the request re-enters triage). */
+  workflowRestartSent(): void;
   /**
    * A changeset_decision was sent (per-item or bulk) — RECORD it so the matching
    * `rollback_result` can be labelled per the recorded accept/reject (the inbound
@@ -453,7 +480,54 @@ export interface PanelStore {
  * items). `compiling` is an orthogonal busy signal layered on top in
  * {@link PanelState.canSend}.
  */
-const BUSY_PHASES: ReadonlySet<Phase> = new Set<Phase>(["thinking"]);
+const BUSY_PHASES: ReadonlySet<Phase> = new Set<Phase>([
+  "thinking",
+  "research",
+  "planning",
+  "verifying",
+]);
+
+/** True when a turn is in flight in `phase` (send-gated; cancel available). */
+export function isBusyPhase(phase: Phase): boolean {
+  return BUSY_PHASES.has(phase);
+}
+
+/**
+ * Stage → phase projection (features/staged-workflow-plan.md ## Phase 2):
+ * triage/clarify/executing → thinking, research → research, planning/critique
+ * → planning, verifying → verifying, plan_review → plan_review,
+ * changeset_review → changeset_review, interrupted → interrupted,
+ * cancelled/done/failed → ready.
+ */
+export function phaseForWorkflowStage(stage: WorkflowStage): Phase {
+  switch (stage) {
+    case "triage":
+    case "clarify":
+    case "executing":
+      return "thinking";
+    case "research":
+      return "research";
+    case "planning":
+    case "critique":
+      return "planning";
+    case "verifying":
+      return "verifying";
+    case "plan_review":
+      return "plan_review";
+    case "changeset_review":
+      return "changeset_review";
+    case "interrupted":
+      return "interrupted";
+    case "cancelled":
+    case "done":
+    case "failed":
+      return "ready";
+    default: {
+      const _exhaustive: never = stage;
+      return _exhaustive;
+    }
+  }
+}
 
 /**
  * Contractual no-project marker. The bridge returns `ERROR: no project` when no
@@ -515,6 +589,7 @@ export function createPanelStore(): PanelStore {
     plan: null as PlanState | null,
     ask: null as AskState | null,
     changeset: null as ChangesetState | null,
+    workflow: null as WorkflowEvent | null,
     memoryOpen: false,
     memory: null as MemoryViewState | null,
     // The dat-edit wiki ledger snapshot (null until the first `wiki` event /
@@ -565,6 +640,7 @@ export function createPanelStore(): PanelStore {
       plan: core.plan,
       ask: core.ask,
       changeset: core.changeset,
+      workflow: core.workflow,
       memoryOpen: core.memoryOpen,
       memory: core.memory,
       wikiData: core.wikiData,
@@ -703,14 +779,22 @@ export function createPanelStore(): PanelStore {
         core.turnInFlight = false;
         core.plan = null;
         core.ask = null;
+        core.workflow = null;
         pushLog("warn", RECONNECT_TURN_NOTICE);
       }
       // The last changeset STAYS reviewable across a transport re-open (journal is
       // server-persisted; features/06 line 52): if an undecided changeset is
       // present, restore changeset_review even though the intermediate
-      // connecting/retry phases passed through. Otherwise land on ready.
+      // connecting/retry phases passed through. A plan awaiting a decision is
+      // likewise durable workflow state (staged-workflow-plan ## Restore): keep
+      // it under review instead of dropping it, and keep an interrupted stage
+      // resumable. Otherwise land on ready.
       if (core.changeset !== null && !isChangesetFullyDecided(core.changeset)) {
         core.phase = "changeset_review";
+      } else if (core.plan !== null) {
+        core.phase = "plan_review";
+      } else if (core.workflow?.stage === "interrupted") {
+        core.phase = "interrupted";
       } else {
         core.phase = "ready";
       }
@@ -1012,6 +1096,83 @@ export function createPanelStore(): PanelStore {
       emit();
     },
 
+    workflowReceived(event) {
+      const prior = core.workflow;
+      core.workflow = event;
+      // Archive newly appearing stage artifacts as ordinary log rows while a
+      // turn is in flight. A hydrate/reconnect re-emission (no turn in flight)
+      // never re-logs rows the restored panel log already carries.
+      if (core.turnInFlight) {
+        if (
+          event.research !== undefined &&
+          prior?.research?.sha256 !== event.research.sha256
+        ) {
+          pushLog(
+            "info",
+            `조사 완료 — ${event.research.summary}\n${event.research.path}`,
+          );
+        }
+        if (
+          event.verdict !== undefined &&
+          prior?.verdict?.sha256 !== event.verdict.sha256
+        ) {
+          const passed = event.verdict.verdict === "pass";
+          const unmet = event.verdict.unmet.map((item) => `- ${item}`).join("\n");
+          pushLog(
+            passed ? "ok" : "warn",
+            `${passed ? "검증 통과" : "검증 실패"} — ${event.verdict.summary}${unmet ? `\n${unmet}` : ""}`,
+          );
+        }
+      }
+      const phase = phaseForWorkflowStage(event.stage);
+      if (isBusyPhase(phase)) {
+        // A stage job is running: the turn is in flight again (streamed
+        // agent_events are accepted) even after a restore without chatSent.
+        core.turnInFlight = true;
+        core.phase = phase;
+        emit();
+        return;
+      }
+      core.turnInFlight = false;
+      switch (event.stage) {
+        case "plan_review":
+          // The plan markdown rides the accompanying `plan` event; the phase is
+          // entered here so a workflow-first ordering still lands on review.
+          core.phase = "plan_review";
+          break;
+        case "changeset_review":
+          core.phase =
+            core.changeset !== null && isChangesetFullyDecided(core.changeset)
+              ? "ready"
+              : "changeset_review";
+          break;
+        case "interrupted":
+          // The stage job was cut by shutdown; the user chooses resume/restart.
+          clearLiveProgress();
+          archiveTurnBlocks();
+          core.ask = null;
+          core.phase = "interrupted";
+          break;
+        case "cancelled":
+        case "done":
+        case "failed":
+          // Terminal: the ordinary answer/changeset event already archived the
+          // turn; an undecided changeset keeps its review open (as errorReceived).
+          // `cancelled` retains its artifacts so the strip can offer 처음부터.
+          clearLiveProgress();
+          archiveTurnBlocks();
+          core.ask = null;
+          if (core.phase !== "changeset_review") {
+            core.phase = "ready";
+            if (event.stage === "failed") core.plan = null;
+          }
+          break;
+        default:
+          break;
+      }
+      emit();
+    },
+
     rollbackResult(ids, ok) {
       // Label items per the RECORDED decision — the inbound rollback_result has no
       // accept/reject discriminator (engine.py routes BOTH through it). accept →
@@ -1083,6 +1244,7 @@ export function createPanelStore(): PanelStore {
         core.turnInFlight = false;
         core.phase = "ready";
         core.plan = null;
+        core.workflow = null;
       }
       // No-project signal: the server has NO list{error} path — the bridge's
       // "ERROR: no project" surfaces as an error{message}. Treat the contractual
@@ -1172,6 +1334,7 @@ export function createPanelStore(): PanelStore {
       core.turnInFlight = true;
       core.plan = null;
       core.ask = null;
+      core.workflow = null;
       core.turn = emptyTurn();
       nextTextBlockBreak = false;
       core.phase = "thinking";
@@ -1200,6 +1363,33 @@ export function createPanelStore(): PanelStore {
       emit();
     },
 
+    workflowResumeSent() {
+      // interrupted --> the interrupted stage's busy phase (the backend re-emits
+      // the exact stage right after). A new turn — reset the streaming buffers.
+      core.turnInFlight = true;
+      core.turn = emptyTurn();
+      core.ask = null;
+      nextTextBlockBreak = false;
+      const stage = core.workflow?.interruptedStage;
+      const phase = stage === undefined ? "thinking" : phaseForWorkflowStage(stage);
+      core.phase = isBusyPhase(phase) ? phase : "thinking";
+      emit();
+    },
+
+    workflowRestartSent() {
+      // interrupted/cancelled --> thinking: the same user text re-enters
+      // triage, so the stage snapshot and any plan from the discarded attempt
+      // are dropped.
+      core.turnInFlight = true;
+      core.plan = null;
+      core.ask = null;
+      core.workflow = null;
+      core.turn = emptyTurn();
+      nextTextBlockBreak = false;
+      core.phase = "thinking";
+      emit();
+    },
+
     decisionSent(decision, ids) {
       // Record the decision so the matching rollback_result can be labelled
       // correctly (the inbound reply carries no accept/reject discriminator, and
@@ -1223,6 +1413,9 @@ export function createPanelStore(): PanelStore {
       if (core.phase !== "changeset_review") {
         core.phase = "ready";
         core.plan = null;
+        // A `cancelled` snapshot that already landed stays (terminal state with
+        // its retained artifacts); a stale busy snapshot is dropped.
+        if (core.workflow?.stage !== "cancelled") core.workflow = null;
       }
       emit();
     },
@@ -1238,6 +1431,7 @@ export function createPanelStore(): PanelStore {
       core.turnInFlight = false;
       core.plan = null;
       core.changeset = null;
+      core.workflow = null;
       core.pendingDecision = null;
       core.turn = emptyTurn();
       core.contextUsage = null;

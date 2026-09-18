@@ -88,6 +88,8 @@ export interface NotificationSettings {
 export interface AppSettings {
   notifications: NotificationSettings;
   codexLargeContextModels: string[];
+  /** Deep planning (planner → architect → critic loop); captured at triage. */
+  deepPlanning: boolean;
 }
 
 export interface EuddraftSettings {
@@ -145,6 +147,7 @@ const PUSH_EVENT_TYPES = [
   "plan",
   "ask",
   "changeset",
+  "workflow",
   "harness_job",
   "rollback_result",
   "progress",
@@ -351,6 +354,9 @@ export class IpcClient {
           mentions: msg.mentions ?? [],
         };
       case "plan_approve":
+        return { sessionId: msg.sessionId };
+      case "workflow_resume":
+      case "workflow_restart":
         return { sessionId: msg.sessionId };
       case "ask_response":
         return {
@@ -946,7 +952,8 @@ function toAppSettings(value: unknown): AppSettings {
     !Array.isArray(value.codexLargeContextModels) ||
     !value.codexLargeContextModels.every(
       (model) => typeof model === "string" && model.trim().length > 0,
-    )
+    ) ||
+    typeof value.deepPlanning !== "boolean"
   ) {
     throw new Error("invalid app settings response");
   }

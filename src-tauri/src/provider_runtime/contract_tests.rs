@@ -1,6 +1,7 @@
 mod claude_size;
 mod codex_live;
 mod concurrency;
+mod delegated_runs;
 mod direct_size;
 mod direct_write_transition;
 mod fixtures;

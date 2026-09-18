@@ -134,6 +134,9 @@ pub struct HarnessJob {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_state_promotion: Option<crate::task_state::TaskStatePromotionInput>,
     pub build: Option<BuildEvidence>,
+    /// The staged verifier's rendered verdict, when the request was verified.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verify_verdict: Option<String>,
     pub delta: Option<HarnessDelta>,
     pub error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -191,6 +194,7 @@ impl HarnessJob {
             accepted_entries,
             task_state_promotion: None,
             build,
+            verify_verdict: None,
             delta: None,
             error: None,
             retry_feedback: None,
@@ -671,6 +675,9 @@ The code/map changes below are already accepted. Update only durable current-beh
 [build evidence]
 {}
 
+[verification verdict]
+{}
+
 [runtime verification]
 {:?}
 
@@ -691,6 +698,9 @@ The code/map changes below are already accepted. Update only durable current-beh
         job.approved_plan.as_deref().unwrap_or("(direct change; no approved plan)"),
         job.final_answer,
         serde_json::to_string(&job.build).map_err(|error| error.to_string())?,
+        job.verify_verdict
+            .as_deref()
+            .unwrap_or("(not verified by a staged verifier)"),
         job.runtime_verification,
         promotion,
         accepted,

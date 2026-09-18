@@ -14,6 +14,7 @@ const settings: AppSettings = {
     askResponseRequired: { sound: true, osNotification: true },
   },
   codexLargeContextModels: [],
+  deepPlanning: false,
 };
 
 const euddraft: EuddraftSettings = {
@@ -215,6 +216,34 @@ describe("SettingsDialog provider management", () => {
     expect(onSettingsChange).toHaveBeenCalledWith({
       ...settings,
       codexLargeContextModels: ["gpt-test"],
+    });
+  });
+
+  it("round-trips the deep-planning switch under the AI provider section", async () => {
+    const onSettingsChange = vi.fn();
+    const { rerender, props } = renderDialog({ onSettingsChange });
+    const toggle = screen.getByRole("switch", { name: "더 똑똑한 계획" });
+    expect(toggle).not.toBeChecked();
+    expect(
+      screen.getByText(
+        "계획마다 모델 호출이 여러 번 추가되어 토큰 사용량이 크게 늘어납니다.",
+      ),
+    ).toBeInTheDocument();
+    await userEvent.click(toggle);
+    expect(onSettingsChange).toHaveBeenCalledWith({
+      ...settings,
+      deepPlanning: true,
+    });
+
+    rerender(
+      <SettingsDialog {...props} settings={{ ...settings, deepPlanning: true }} />,
+    );
+    const enabled = screen.getByRole("switch", { name: "더 똑똑한 계획" });
+    expect(enabled).toBeChecked();
+    await userEvent.click(enabled);
+    expect(onSettingsChange).toHaveBeenLastCalledWith({
+      ...settings,
+      deepPlanning: false,
     });
   });
 

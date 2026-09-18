@@ -34,6 +34,9 @@ import { ChangesetView } from "@/components/ChangesetView";
 import { HarnessStatusCard } from "@/components/HarnessStatusCard";
 import { AskCard } from "@/components/AskCard";
 import { PlanView } from "@/components/PlanView";
+import { ResearchCard } from "@/components/ResearchCard";
+import { VerdictCard } from "@/components/VerdictCard";
+import { WorkflowStrip } from "@/components/WorkflowStrip";
 import { InstructionBox, type ChatPayload } from "@/components/InstructionBox";
 import { ConnectionNotice } from "@/components/ConnectionNotice";
 import {
@@ -51,7 +54,7 @@ import {
   ProjectSidebar,
   type ProjectPanelTab,
 } from "@/components/ProjectSidebar";
-import { createPanelStore } from "@/state/store";
+import { createPanelStore, isBusyPhase } from "@/state/store";
 import type { LogEntry, PanelStore } from "@/state/store";
 import {
   IpcClient,
@@ -1129,6 +1132,13 @@ export default function App() {
           target.log("agent", `변경사항 ${msg.items.length}건을 검토하세요.`);
           break;
         }
+        case "workflow": {
+          const target = sessionStore();
+          if (!target) break;
+          const { type: _type, sessionId: _sessionId, ...event } = msg;
+          target.workflowReceived(event);
+          break;
+        }
         case "harness_job": {
           const slot = sessionsRef.current.get(msg.sessionId);
           if (!slot) break;
@@ -1211,7 +1221,7 @@ export default function App() {
 
   const projectSwitchBlocked = useCallback(() => {
     if (projectCompilingRef.current) return "빌드 또는 맵 작업이 진행 중입니다. 작업이 끝난 뒤 프로젝트를 전환해 주세요.";
-    if (selectedPhaseRef.current === "thinking" || selectedPhaseRef.current === "plan_review" || selectedPhaseRef.current === "changeset_review") {
+    if (isBusyPhase(selectedPhaseRef.current) || selectedPhaseRef.current === "plan_review" || selectedPhaseRef.current === "changeset_review") {
       return "현재 세션이 작업 중이거나 검토를 기다리고 있습니다. 세션을 마친 뒤 프로젝트를 전환해 주세요.";
     }
     for (const slot of sessionsRef.current.values()) {
@@ -1561,7 +1571,7 @@ export default function App() {
         const snapshot = slot.store.getState();
         if (
           messageActionBusyRef.current ||
-          snapshot.phase === "thinking" ||
+          isBusyPhase(snapshot.phase) ||
           snapshot.phase === "changeset_review" ||
           (slot.activity !== "idle" &&
             slot.activity !== "error" &&
@@ -1648,6 +1658,7 @@ export default function App() {
               text: payload.text,
               attachments: [...payload.attachments],
               mentions: payload.mentions.map((mention) => ({ ...mention })),
+              executionMode: payload.executionMode,
               clientTurnId,
             });
           }
@@ -1701,7 +1712,7 @@ export default function App() {
     const slot = selectedSlot;
     const cancellable =
       slot &&
-      (slot.store.getState().phase === "thinking" ||
+      (isBusyPhase(slot.store.getState().phase) ||
         slot.activity === "running_read" ||
         slot.activity === "waiting_input" ||
         slot.activity === "running_write");
@@ -1726,6 +1737,56 @@ export default function App() {
       setMessageActionBusy(false);
     }
   }, [selectedSlot]);
+
+  const sendWorkflowControl = useCallback(
+    async (type: "workflow_resume" | "workflow_restart") => {
+      const slot = selectedSlot;
+      const snapshot = slot?.store.getState();
+      // Resume applies to an interrupted stage only; restart also accepts a
+      // cancelled (or failed) request whose artifacts were retained.
+      const restartable =
+        snapshot?.workflow?.stage === "interrupted" ||
+        snapshot?.workflow?.stage === "cancelled" ||
+        snapshot?.workflow?.stage === "failed";
+      const allowed =
+        type === "workflow_resume"
+          ? snapshot?.phase === "interrupted"
+          : restartable && !isBusyPhase(snapshot.phase);
+      if (!slot?.persisted || !allowed || messageActionBusyRef.current) {
+        return;
+      }
+      messageActionBusyRef.current = true;
+      setMessageActionBusy(true);
+      try {
+        const sent = await clientRef.current?.send({ type, sessionId: slot.id });
+        if (sent) {
+          if (type === "workflow_resume") slot.store.workflowResumeSent();
+          else slot.store.workflowRestartSent();
+          markConversationStarted(slot);
+        } else {
+          slot.store.log(
+            "error",
+            type === "workflow_resume"
+              ? "중단된 작업을 이어서 진행하지 못했습니다."
+              : "작업을 처음부터 다시 시작하지 못했습니다.",
+          );
+        }
+      } finally {
+        messageActionBusyRef.current = false;
+        setMessageActionBusy(false);
+      }
+    },
+    [markConversationStarted, selectedSlot],
+  );
+
+  const handleWorkflowResume = useCallback(
+    () => void sendWorkflowControl("workflow_resume"),
+    [sendWorkflowControl],
+  );
+  const handleWorkflowRestart = useCallback(
+    () => void sendWorkflowControl("workflow_restart"),
+    [sendWorkflowControl],
+  );
 
   const sendAutonomousControl = useCallback(
     (type: "autonomous_pause" | "autonomous_resume" | "autonomous_stop") => {
@@ -1800,6 +1861,7 @@ export default function App() {
             text: restored.text,
             attachments: restored.attachments ?? [],
             mentions: restored.mentions ?? [],
+            executionMode: "interactive",
           });
         }
       } finally {
@@ -1817,7 +1879,12 @@ export default function App() {
   const handleSuggestion = useCallback(
     (text: string) => {
       if (!store.getState().canSend) return;
-      void handleSend({ text, attachments: [], mentions: [] });
+      void handleSend({
+        text,
+        attachments: [],
+        mentions: [],
+        executionMode: "interactive",
+      });
     },
     [store, handleSend],
   );
@@ -2847,6 +2914,15 @@ export default function App() {
     messageActionBusy ||
     selectedSlot?.activity === "running_write" ||
     state.phase === "changeset_review";
+  // The stage strip and stage cards are pipeline surfaces: answer/direct
+  // routes show 파악 during triage and then fall back to the ordinary
+  // answer/changeset flow; done/failed hide them, while a cancelled request
+  // stays visible as a terminal state offering 처음부터.
+  const workflowActive =
+    state.workflow !== null &&
+    state.workflow.stage !== "done" &&
+    state.workflow.stage !== "failed" &&
+    (state.workflow.route === undefined || state.workflow.route === "pipeline");
   const documentTabs = useMemo<DocumentTab[]>(
     () => [
       { id: "chat", label: "대화" },
@@ -3119,6 +3195,17 @@ export default function App() {
           </div>
         )}
 
+        {workflowActive && state.workflow && (
+          <WorkflowStrip
+            workflow={state.workflow}
+            phase={state.phase}
+            actionBusy={messageActionBusy}
+            onCancel={handleCancel}
+            onResume={handleWorkflowResume}
+            onRestart={handleWorkflowRestart}
+          />
+        )}
+
         <ConversationLog
           key={selectedSessionId ?? "no-session"}
           log={state.log}
@@ -3149,16 +3236,32 @@ export default function App() {
         )}
 
 
+        {workflowActive && state.workflow?.research && (
+          <ResearchCard
+            key={state.workflow.research.sha256}
+            research={state.workflow.research}
+            defaultOpen={state.workflow.stage === "research"}
+          />
+        )}
+
         {state.plan &&
-          (state.phase === "plan_review" || state.phase === "thinking") && (
+          (state.phase === "plan_review" || isBusyPhase(state.phase)) && (
             <PlanView
               plan={state.plan}
+              artifact={state.workflow?.plan}
               open={selectedSlot?.planOpen ?? true}
               onOpenChange={handlePlanOpenChange}
               pending={state.phase !== "plan_review"}
               onApprove={handlePlanApprove}
             />
           )}
+
+        {workflowActive && state.workflow?.verdict && (
+          <VerdictCard
+            verdict={state.workflow.verdict}
+            attempts={state.workflow.verifyAttempts}
+          />
+        )}
 
         {state.changeset && state.phase === "changeset_review" && (
           <ChangesetView

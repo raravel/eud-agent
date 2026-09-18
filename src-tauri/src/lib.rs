@@ -64,6 +64,7 @@ pub mod trace_test;
 pub mod wiki;
 #[cfg(windows)]
 pub mod windows_notification;
+pub mod workflow;
 pub mod workspace;
 pub mod write_coordinator;
 
@@ -130,6 +131,18 @@ impl engine::WikiProvider for AppWikiProvider {
 #[derive(Clone)]
 struct AppProjectStateProvider {
     dirs: config::DataDirs,
+}
+
+impl engine::ProjectMapProvider for AppProjectStateProvider {
+    fn render_section(&self) -> Option<String> {
+        match native_runtime::NativeProjectManager::new(self.dirs.clone()).render_project_map() {
+            Ok(section) => Some(section),
+            Err(error) => {
+                eprintln!("eud-agent: project map unavailable: {error}");
+                None
+            }
+        }
+    }
 }
 
 impl engine::ProjectStateProvider for AppProjectStateProvider {
@@ -299,6 +312,9 @@ pub fn run() {
             if let Err(error) = session_store.recover_interrupted_autonomous_runs() {
                 eprintln!("eud-agent: autonomous restart recovery failed: {error}");
             }
+            if let Err(error) = session_store.recover_interrupted_workflows() {
+                eprintln!("eud-agent: staged workflow restart recovery failed: {error}");
+            }
 
             let config =
                 engine::AgentEngineConfig::new("[project state]\n(unavailable)", None, Vec::new())
@@ -309,6 +325,9 @@ pub fn run() {
                         dirs: data_dirs.clone(),
                     }))
                     .with_project_state_provider(std::sync::Arc::new(AppProjectStateProvider {
+                        dirs: data_dirs.clone(),
+                    }))
+                    .with_project_map_provider(std::sync::Arc::new(AppProjectStateProvider {
                         dirs: data_dirs.clone(),
                     }));
 
@@ -330,6 +349,8 @@ pub fn run() {
             engine::engine_chat,
             engine::engine_plan_feedback,
             engine::engine_plan_approve,
+            engine::engine_workflow_resume,
+            engine::engine_workflow_restart,
             engine::engine_changeset_decision,
             engine::engine_harness_jobs,
             engine::engine_harness_runtime_confirm,

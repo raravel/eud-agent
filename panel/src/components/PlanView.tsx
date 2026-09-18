@@ -21,7 +21,9 @@ import {
   PlanTrigger,
 } from "@/components/ai-elements/plan";
 import { DiagramResponse } from "@/components/ai-elements/response";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import type { WorkflowPlanArtifact } from "@/lib/ipc";
 import type { PlanState } from "@/state/store";
 
 const HEIGHT_KEY = "eud.plan-view.height";
@@ -60,6 +62,12 @@ function readStoredHeight(): number {
 export interface PlanViewProps {
   /** The active plan card (markdown + revision). */
   plan: PlanState;
+  /**
+   * Staged-workflow plan artifact (acceptance criteria, critic verdict, deep
+   * planning); absent on the event-only path (features/staged-workflow-plan.md
+   * ## Phase 5 Plan review).
+   */
+  artifact?: WorkflowPlanArtifact;
   /** Whether the plan body is expanded for the selected session. */
   open: boolean;
   /** Persist expansion changes in the selected session slot. */
@@ -72,6 +80,7 @@ export interface PlanViewProps {
 
 export function PlanView({
   plan,
+  artifact,
   open,
   onOpenChange,
   pending,
@@ -168,11 +177,54 @@ export function PlanView({
       >
         <PlanHeader className="shrink-0 px-3">
           <PlanTitle className="text-sm">{`계획안 (rev ${plan.revision})`}</PlanTitle>
-          <PlanAction>
+          <PlanAction className="flex items-center gap-1.5">
+            {artifact?.deep && (
+              <Badge variant="outline" className="text-[11px]">
+                심층 계획
+                {artifact.iterations > 0 ? ` · ${artifact.iterations}회` : ""}
+              </Badge>
+            )}
+            {artifact?.criticVerdict !== undefined && (
+              <Badge
+                variant={artifact.criticVerdict === "approve" ? "secondary" : "outline"}
+                className="text-[11px]"
+              >
+                {artifact.criticVerdict === "approve" ? "비평 승인" : "비평 수정 요청"}
+              </Badge>
+            )}
             <PlanTrigger aria-label={open ? "계획안 접기" : "계획안 펼치기"} />
           </PlanAction>
         </PlanHeader>
         <PlanContent className="min-h-0 flex-1 overflow-y-auto px-3 text-sm">
+          {artifact && (
+            <div className="mb-3 flex flex-col gap-2 rounded-lg border border-border bg-card/40 px-3 py-2 text-xs">
+              {artifact.title.trim().length > 0 && (
+                <p className="font-medium text-foreground">{artifact.title}</p>
+              )}
+              {artifact.acceptanceCriteria.length > 0 && (
+                <div>
+                  <p className="font-medium text-foreground">수용 기준</p>
+                  <ul
+                    aria-label="수용 기준"
+                    className="mt-1 list-disc space-y-0.5 pl-5 leading-5 text-muted-foreground"
+                  >
+                    {artifact.acceptanceCriteria.map((criterion, index) => (
+                      <li key={`${index}-${criterion}`}>{criterion}</li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+              {artifact.criticSummary !== undefined &&
+                artifact.criticSummary.trim().length > 0 && (
+                  <div>
+                    <p className="font-medium text-foreground">비평 요약</p>
+                    <p className="mt-1 whitespace-pre-wrap leading-5 text-muted-foreground">
+                      {artifact.criticSummary}
+                    </p>
+                  </div>
+                )}
+            </div>
+          )}
           {/* Key on the revision: a new plan is a FULL replacement (not a
               streaming append), so remount Streamdown to avoid stale cached
               blocks from the previous revision. */}

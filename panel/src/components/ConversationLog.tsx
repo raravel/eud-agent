@@ -44,6 +44,7 @@ import { Spinner } from "@/components/ui/spinner";
 import { cn } from "@/lib/utils";
 import { AgentStream, ToolList } from "@/components/AgentStream";
 import { AgentAnswer } from "@/components/AgentAnswer";
+import { isBusyPhase } from "@/state/store";
 import type { LogEntry, LogKind, Phase, TurnState } from "@/state/store";
 import { formatAttachmentSize } from "@/lib/attachments";
 import { MentionChips } from "@/components/MentionComposer";
@@ -94,6 +95,9 @@ const SUGGESTIONS: readonly string[] = [
 /** Phases in which a live progress entry should still spin (v2: a turn in flight). */
 const BUSY_PHASES: ReadonlySet<Phase> = new Set<Phase>([
   "thinking",
+  "research",
+  "planning",
+  "verifying",
   "plan_review",
 ]);
 
@@ -449,9 +453,9 @@ function renderLiveTurn(turn: TurnState | undefined, phase: Phase) {
         reasoning={turn.reasoning}
         answerStarted={turn.answerStarted}
         tools={turn.blocks.length > 0 ? [] : turn.tools}
-        live={phase === "thinking"}
+        live={isBusyPhase(phase)}
       />
-      {phase === "thinking" &&
+      {isBusyPhase(phase) &&
         turn.blocks.map((block) =>
           block.type === "tools" ? (
             <div
@@ -468,7 +472,7 @@ function renderLiveTurn(turn: TurnState | undefined, phase: Phase) {
             <AgentAnswer key={`turn-block-${block.id}`} text={block.text} />
           ) : null,
         )}
-      {phase === "thinking" && turn.blocks.length === 0 && (
+      {isBusyPhase(phase) && turn.blocks.length === 0 && (
         <AgentAnswer text={turn.answer} />
       )}
     </>

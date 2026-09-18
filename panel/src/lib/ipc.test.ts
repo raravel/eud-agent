@@ -1002,6 +1002,7 @@ describe("App notification settings commands", () => {
       askResponseRequired: { sound: false, osNotification: true },
     },
     codexLargeContextModels: ["gpt-5.5-codex"],
+    deepPlanning: true,
   };
 
   it("loads and saves the complete app settings payload", async () => {
@@ -1043,6 +1044,7 @@ describe("App notification settings commands", () => {
         askResponseRequired: { sound: true, osNotification: true },
       },
       codexLargeContextModels: [],
+      deepPlanning: false,
     });
 
     await expect(appSettingsGet(invoke)).rejects.toThrow(

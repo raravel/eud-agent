@@ -93,6 +93,9 @@ pub struct SessionRecord {
     pub task_state: crate::task_state::SessionTaskState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub autonomous_run: Option<crate::autonomous::AutonomousRunState>,
+    /// Durable stage state of the current staged request, when one exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow: Option<crate::workflow::WorkflowState>,
 }
 
 #[derive(Deserialize)]
@@ -116,6 +119,8 @@ struct SessionRecordWire {
     task_state: crate::task_state::SessionTaskState,
     #[serde(default)]
     autonomous_run: Option<crate::autonomous::AutonomousRunState>,
+    #[serde(default)]
+    workflow: Option<crate::workflow::WorkflowState>,
 }
 
 /// The on-disk `index.json` shape: latest-conversation-first metadata rows.
@@ -444,6 +449,7 @@ impl SessionStore {
             source.context_state = Default::default();
             source.task_state = Default::default();
             source.autonomous_run = None;
+            source.workflow = None;
             source.meta.provider = source.provider_binding.provider;
             source.meta.model = source.provider_binding.model.clone();
             let bytes = match serde_json::to_vec_pretty(&source) {
@@ -555,6 +561,49 @@ impl SessionStore {
     pub fn save(&self, rec: &SessionRecord) -> anyhow::Result<()> {
         let _guard = self.lock()?;
         self.save_unlocked(rec)
+    }
+
+    /// Atomically replace only the durable staged-workflow projection.
+    pub fn set_workflow(
+        &self,
+        id: &str,
+        workflow: Option<crate::workflow::WorkflowState>,
+    ) -> anyhow::Result<()> {
+        let _guard = self.lock()?;
+        let mut record = self.load_unlocked(id)?;
+        record.workflow = workflow;
+        self.save_unlocked(&record)
+    }
+
+    /// Convert an in-flight stage job into an explicit interruption.
+    ///
+    /// Like autonomous recovery, this is called once by application startup.
+    pub fn recover_interrupted_workflows(&self) -> anyhow::Result<usize> {
+        let _guard = self.lock()?;
+        let now = now_unix_millis();
+        let mut recovered = 0;
+        for meta in self.read_index().sessions {
+            let mut record = self.load_unlocked(&meta.id)?;
+            let pending = record.pending_request_ids.clone();
+            let Some(workflow) = record.workflow.as_mut() else {
+                continue;
+            };
+            // An executing turn that died before journaling anything has no
+            // pending changeset to reconnect; it is interrupted like a job.
+            let orphaned_execution = workflow.stage == crate::workflow::WorkflowStage::Executing
+                && !pending.iter().any(|id| id == &workflow.request_id);
+            if orphaned_execution {
+                workflow.interrupted_stage = Some(workflow.stage);
+                workflow.stage = crate::workflow::WorkflowStage::Interrupted;
+                workflow.updated_at = now;
+                self.save_unlocked(&record)?;
+                recovered += 1;
+            } else if workflow.interrupt_if_in_flight(now) {
+                self.save_unlocked(&record)?;
+                recovered += 1;
+            }
+        }
+        Ok(recovered)
     }
 
     /// Atomically replace only the durable autonomous lifecycle projection.
@@ -1039,6 +1088,7 @@ impl SessionStore {
             context_state: wire.context_state,
             task_state: wire.task_state,
             autonomous_run: wire.autonomous_run,
+            workflow: wire.workflow,
         };
         if let Err(error) = record.task_state.repair_cache() {
             if !repair_task_state {
@@ -1396,6 +1446,7 @@ mod tests {
             context_state: Default::default(),
             task_state: Default::default(),
             autonomous_run: None,
+            workflow: None,
         }
     }
     fn import_fixture(

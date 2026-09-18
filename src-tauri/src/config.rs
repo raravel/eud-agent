@@ -140,6 +140,10 @@ pub struct Config {
     /// Distinguishes first-run migration from an intentionally emptied history.
     #[serde(default)]
     pub project_recents_initialized: bool,
+    /// Planner + architect + critic consensus iteration for staged requests.
+    /// Off by default because it multiplies model calls per plan.
+    #[serde(default)]
+    pub deep_planning: bool,
 }
 
 impl Default for Config {
@@ -156,6 +160,7 @@ impl Default for Config {
             rag_index: AssetSpec::default(),
             project_recents: Vec::new(),
             project_recents_initialized: false,
+            deep_planning: false,
         }
     }
 }
@@ -851,6 +856,7 @@ mod tests {
         object.remove("starcraft_path");
         object.remove("project_recents");
         object.remove("project_recents_initialized");
+        object.remove("deep_planning");
         fs::write(dirs.config_path(), serde_json::to_vec(&legacy).unwrap()).unwrap();
 
         let migrated = dirs.load_config().unwrap();

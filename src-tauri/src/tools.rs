@@ -1139,7 +1139,7 @@ pub fn tool_registry() -> Vec<ToolSpec> {
         ),
         read_tool(
             "propose_plan",
-            "Propose a plan for approval only when the user explicitly requested a plan.",
+            "Propose a plan for approval only when the user explicitly requested a plan in this turn; staged requests plan through their own stage.",
             schema(json!({"markdown": string_schema()}), &["markdown"]),
         ),
     ]

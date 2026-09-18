@@ -1476,6 +1476,47 @@ impl WorkspaceManager {
         Ok(())
     }
 
+    /// Write one staged-workflow artifact (`research/…`, `plans/…`, `verify/…`)
+    /// under the workspace root atomically. Artifacts are engine-rendered
+    /// outputs of a request stage, not reviewable documents: only `plans/`
+    /// is also a document directory, and its approval metadata is recorded
+    /// separately by [`Self::record_plan_approval`].
+    pub fn write_stage_artifact(
+        &self,
+        workspace_id: &str,
+        relative: &str,
+        contents: &str,
+    ) -> io::Result<()> {
+        const STAGE_DIRS: [&str; 3] = ["research", "plans", "verify"];
+        let directory = relative
+            .split_once('/')
+            .map(|(directory, _)| directory)
+            .filter(|directory| STAGE_DIRS.contains(directory))
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("stage artifact path '{relative}' is outside the stage directories"),
+                )
+            })?;
+        let root = self.workspace_root(workspace_id)?;
+        ensure_plain_directory(&root)?;
+        let stage_dir = root.join(directory);
+        if matches!(fs::symlink_metadata(&stage_dir), Err(error) if error.kind() == io::ErrorKind::NotFound)
+        {
+            fs::create_dir(&stage_dir)?;
+        }
+        ensure_plain_directory(&stage_dir)?;
+        let path = confined_path(&root, relative, false)?;
+        atomic_write(&path, contents.as_bytes())
+    }
+
+    pub fn read_stage_artifact(&self, workspace_id: &str, relative: &str) -> io::Result<String> {
+        let root = self.workspace_root(workspace_id)?;
+        let path = confined_path(&root, relative, false)?;
+        String::from_utf8(fs::read(path)?)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))
+    }
+
     pub fn search_files(&self, workspace_id: &str, query: &str) -> io::Result<Vec<String>> {
         let query = query.trim();
         if query.is_empty() {

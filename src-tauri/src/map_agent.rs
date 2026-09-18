@@ -611,6 +611,7 @@ impl MapAgentService {
             context_state: Default::default(),
             task_state: Default::default(),
             autonomous_run: None,
+            workflow: None,
         };
         self.sessions
             .save(&record)
@@ -1957,6 +1958,7 @@ mod tests {
                 context_state: Default::default(),
                 task_state: Default::default(),
                 autonomous_run: None,
+                workflow: None,
             })
             .unwrap();
         let target = SelectionMask::canonical(
@@ -2101,6 +2103,7 @@ mod tests {
                 context_state: Default::default(),
                 task_state: Default::default(),
                 autonomous_run: None,
+                workflow: None,
             })
             .unwrap();
 

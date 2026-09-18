@@ -107,6 +107,42 @@ verdicts in [verify.md](verify.md).
 
 Historical checkpoints retain their recorded source/binary bindings: checkpoint 22's Windows draft-cleanup failure and checkpoint 33's compiler-cwd error 32 are not evidence for later source. The checkpoint-23 non-inheritable `rbN` Map reader mechanism, ordinary OpenCode `strict: false` descriptors, active-turn usage filtering, and independent raw/normalized-output bounds remain part of the implemented runtime.
 
+## Staged request workflow
+
+Every interactive EPS chat request is triaged before any foreground turn. The engine runs
+isolated read-only delegated runs (`DelegatedRunExecutor` over a filtered `ToolProfile`, ending in
+a schema-validated `submit_result`) for triage, research, planning, critique/architecture review,
+and verification; the ordinary foreground turn remains the only executing context.
+
+```mermaid
+stateDiagram-v2
+    [*] --> Triage: chat
+    Triage --> Clarify: engine ASK
+    Clarify --> Triage
+    Triage --> Foreground: answer / direct
+    Triage --> Research: pipeline
+    Research --> Planning
+    Planning --> Critique
+    Critique --> Planning: revise (bounded)
+    Critique --> PlanReview
+    PlanReview --> Planning: feedback
+    PlanReview --> Executing: approve
+    Executing --> Verifying
+    Verifying --> Executing: fail (max 2)
+    Verifying --> ChangesetReview
+```
+
+`WorkflowState` is persisted on the session at every transition and projected to the panel as the
+`workflow` event; plan review survives reconnect and restart, in-flight stage jobs become
+`Interrupted` at startup and resume or restart only explicitly. Research, plan revisions, and
+verification verdicts are engine-rendered files under `.eud-agent/workspace/{research,plans,verify}`;
+the approved plan file instructs the executing turn and the verifier judges the changeset, build
+and trace evidence against its acceptance criteria. The default plan depth is planner + one critic
+round; the app-wide "더 똑똑한 계획" setting runs planner → architect → critic up to three times.
+A `[project map]` section (source listing, entrypoints, plugins, DAT override counts, accepted spec
+index) is delivered through the context cursor like memory, so an unchanged tree costs nothing per
+turn. See [staged workflow plan](features/staged-workflow-plan.md) and the scenario set.
+
 ## Current verification boundary
 
 Checkpoint41 binds source `078F460095E965AEB7B3E7FE04F8FACF494DD9D23917FD78458F78F8C78C330D` to immutable test executable `0C161936695EEEA3CEA91A2B677FCF3AA5FDC28B607906F77106EA96BE44E84A`. The permanent long-Windows-path Map selector passes, `isom` passes 12 with 7 existing environment ignores, and an unchanged full default-parallel repeat passes `749/0/30`, including main and doc targets. Library check, strict `isom` and all-target/all-feature `eud-agent` Clippy, and full formatter pass. The first full41 run's existing Map finalize/revert Access-denied failure (`748/1/30`) remains a WATCH: the exact diagnostic and unchanged repeat pass do not attribute or causally fix it. Fresh panel36 TypeScript, 58-file/539-test Vitest, and production build remain product-equivalent and pass with the existing chunk advisory. The custom-protocol app build passes on checkpoint41 source and binds app SHA `C8CCB48B0ABBBFC93EB65626BB0668895BF2D0F22FBB979CF9216968F66B8DE2`.

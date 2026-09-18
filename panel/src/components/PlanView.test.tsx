@@ -18,7 +18,7 @@
  * a controlled renderer of the selected session's active plan.
  */
 import { beforeEach, describe, it, expect, vi } from "vitest";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { PlanView, type PlanViewProps } from "@/components/PlanView";
 import type { PlanState } from "@/state/store";
@@ -272,5 +272,43 @@ describe("PlanView — resizable height", () => {
     expect(screen.getByLabelText("계획 검토")).toHaveStyle({
       height: "360px",
     });
+  });
+});
+
+describe("PlanView — staged-workflow plan artifact", () => {
+  it("renders acceptance criteria, critic verdict/summary, and the deep-planning badge", () => {
+    render(
+      <PlanView
+        {...defaultPlanViewProps}
+        plan={rev2}
+        artifact={{
+          path: ".eud-agent/workspace/plans/req-1.md",
+          revision: 2,
+          sha256: "d".repeat(64),
+          title: "미네랄 지급 트리거 추가",
+          acceptanceCriteria: ["게임 시작 시 미네랄 1000 지급", "빌드 통과"],
+          criticVerdict: "revise",
+          criticSummary: "검증 단계가 없는 항목이 있습니다.",
+          deep: true,
+          iterations: 2,
+        }}
+      />,
+    );
+    expect(screen.getByText("계획안 (rev 2)")).toBeInTheDocument();
+    expect(screen.getByText("미네랄 지급 트리거 추가")).toBeInTheDocument();
+    const criteria = screen.getByRole("list", { name: "수용 기준" });
+    expect(within(criteria).getAllByRole("listitem").map((item) => item.textContent)).toEqual([
+      "게임 시작 시 미네랄 1000 지급",
+      "빌드 통과",
+    ]);
+    expect(screen.getByText("비평 수정 요청")).toBeInTheDocument();
+    expect(screen.getByText("검증 단계가 없는 항목이 있습니다.")).toBeInTheDocument();
+    expect(screen.getByText("심층 계획 · 2회")).toBeInTheDocument();
+  });
+
+  it("keeps the event-only path unchanged without an artifact", () => {
+    render(<PlanView {...defaultPlanViewProps} plan={rev1} />);
+    expect(screen.queryByRole("list", { name: "수용 기준" })).toBeNull();
+    expect(screen.queryByText("심층 계획")).toBeNull();
   });
 });

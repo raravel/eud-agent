@@ -107,3 +107,57 @@ pub struct CompactionRequest {
     pub next_instruction_epoch: u64,
     pub policy: RunPolicy,
 }
+
+/// The purpose of one isolated read-only run. Each kind owns a tool profile and
+/// a result schema; the executor is shared.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DelegatedRunKind {
+    Triage,
+    Research,
+    Planner,
+    Architect,
+    Critic,
+    Verifier,
+    /// A model-invoked exploration child of a live foreground run.
+    Read,
+}
+
+/// One isolated model context over the session's read tools that must end by
+/// calling `submit_result` with a value matching `output_schema`.
+#[derive(Debug, Clone)]
+pub struct DelegatedRunRequest {
+    pub identity: RunIdentity,
+    /// The foreground run that delegated this work, when model-invoked. The
+    /// executor does not read it; call sites label events and state with it.
+    pub parent_run_id: Option<super::RunId>,
+    pub binding: BindingSnapshot,
+    /// Labels the run for call sites and persisted state; the executor does
+    /// not branch on it. Profiles and budgets are chosen by the caller.
+    pub kind: DelegatedRunKind,
+    pub prompt: String,
+    /// The native project root: the provider CLI cwd and the tool scope.
+    pub workspace_root: PathBuf,
+    /// The session-private scratch directory exported to native CLIs.
+    pub workspace_temp: Option<PathBuf>,
+    pub output_schema: Value,
+    pub profile: crate::provider_tool_loop::DelegatedToolProfile,
+    /// Only the engine-owned verifier sets this: it runs after the executing
+    /// turn has settled while the request still holds its write ticket for
+    /// pending review. Model-invoked delegation must leave it false.
+    pub allow_live_write_ticket: bool,
+    pub policy: RunPolicy,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum DelegatedRunOutcome {
+    Result {
+        value: Value,
+        /// Every admitted completion of the run, including usage-error
+        /// completions and the accepted submission itself.
+        completions: usize,
+        usage: Option<crate::ipc::ContextUsage>,
+    },
+    Cancelled,
+    Failed(super::ProviderRuntimeError),
+}

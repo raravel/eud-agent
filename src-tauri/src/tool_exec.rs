@@ -400,6 +400,10 @@ pub struct SessionToolRuntime {
     autonomous_emitter: Arc<Mutex<Option<AutonomousEmitter>>>,
     provider_identity: Arc<Mutex<Option<(crate::provider::ProviderId, String)>>>,
     last_build: Arc<Mutex<Option<crate::harness::BuildEvidence>>>,
+    /// The complete JSON of the request's latest `build_run` and trace results,
+    /// retained as verifier evidence (file/line diagnostics, not only counts).
+    last_build_result: Arc<Mutex<Option<Value>>>,
+    last_trace_result: Arc<Mutex<Option<Value>>>,
     sound_build_required: Arc<Mutex<bool>>,
     autonomous_pause_requested: Arc<AtomicBool>,
 }
@@ -446,6 +450,8 @@ impl SessionToolRuntime {
             autonomous_emitter: Arc::new(Mutex::new(None)),
             provider_identity: Arc::new(Mutex::new(None)),
             last_build: Arc::new(Mutex::new(None)),
+            last_build_result: Arc::new(Mutex::new(None)),
+            last_trace_result: Arc::new(Mutex::new(None)),
             sound_build_required: Arc::new(Mutex::new(false)),
             autonomous_pause_requested: Arc::new(AtomicBool::new(false)),
         }
@@ -600,6 +606,27 @@ impl SessionToolRuntime {
             args,
         )
         .await
+    }
+
+    /// Ask the user structured questions on behalf of the engine (not a model
+    /// tool call), for example a triage clarification. Waits through the same
+    /// pending-ask path as the `ask` tool and returns the validated answers.
+    pub(crate) async fn ask_for_request(
+        &self,
+        request_id: &str,
+        questions: Vec<crate::ipc::AskQuestion>,
+    ) -> Result<BTreeMap<String, crate::ipc::AskAnswer>, String> {
+        let outcome = self
+            .ask_scoped(request_id, None, &json!({ "questions": questions }))
+            .await?;
+        if outcome["status"] == "unanswered" {
+            return Err(format!(
+                "ask_unanswered: 질문 답변 대기 시간({}초)이 지났습니다.",
+                outcome["waitedSeconds"]
+            ));
+        }
+        serde_json::from_value(outcome["answers"].clone())
+            .map_err(|error| format!("ask answers are malformed: {error}"))
     }
 
     async fn ask_scoped(
@@ -887,6 +914,8 @@ impl SessionToolRuntime {
         self.ask.lock().expired = None;
         *self.pending_plan.lock() = None;
         *self.last_build.lock() = None;
+        *self.last_build_result.lock() = None;
+        *self.last_trace_result.lock() = None;
         *self.sound_build_required.lock() = false;
         Ok(())
     }
@@ -1133,6 +1162,16 @@ impl SessionToolRuntime {
 
     pub fn last_build_evidence(&self) -> Option<crate::harness::BuildEvidence> {
         self.last_build.lock().clone()
+    }
+
+    /// The latest complete `build_run` result JSON of this request.
+    pub fn last_build_result(&self) -> Option<Value> {
+        self.last_build_result.lock().clone()
+    }
+
+    /// The latest `trace_suite_run`/`trace_test_run` result JSON of this request.
+    pub fn last_trace_result(&self) -> Option<Value> {
+        self.last_trace_result.lock().clone()
     }
 
     pub fn sound_build_required(&self) -> bool {
@@ -2145,6 +2184,7 @@ impl SessionToolRuntime {
                             "consecutiveNoProgress": progress.consecutive_no_progress,
                         }),
                     );
+                *self.last_build_result.lock() = Some(value.clone());
                 if let Some(reason) = no_progress_reason {
                     return Err(reason);
                 }
@@ -2178,8 +2218,10 @@ impl SessionToolRuntime {
                 )?;
                 let detail = format!("done:{}", result.status.as_str());
                 self.emit_progress(crate::ipc::ProgressStage::TraceTest, &detail);
-                serde_json::to_value(result)
-                    .map_err(|error| format!("failed to serialize trace test result: {error}"))
+                let value = serde_json::to_value(result)
+                    .map_err(|error| format!("failed to serialize trace test result: {error}"))?;
+                *self.last_trace_result.lock() = Some(value.clone());
+                Ok(value)
             }
             tools::TRACE_SUITE_RUN_TOOL => {
                 let Some(build) = self.last_build.lock().clone() else {
@@ -2214,8 +2256,10 @@ impl SessionToolRuntime {
                 )?;
                 let detail = format!("done:{}", result.status.as_str());
                 self.emit_progress(crate::ipc::ProgressStage::TraceTest, &detail);
-                serde_json::to_value(result)
-                    .map_err(|error| format!("failed to serialize trace suite result: {error}"))
+                let value = serde_json::to_value(result)
+                    .map_err(|error| format!("failed to serialize trace suite result: {error}"))?;
+                *self.last_trace_result.lock() = Some(value.clone());
+                Ok(value)
             }
             "location_write" => {
                 let map_path = self.services.native().source_map_path()?;
@@ -3857,7 +3901,12 @@ impl ToolServices {
             .duration_since(UNIX_EPOCH)
             .map(|duration| duration.as_nanos())
             .unwrap_or_default();
-        let base = std::env::temp_dir().join(format!("eud-agent-runtime-test-{nanos}"));
+        // Nanoseconds alone collide when parallel tests construct runtimes in
+        // the same tick; the UUID keeps every runtime's data dirs private.
+        let base = std::env::temp_dir().join(format!(
+            "eud-agent-runtime-test-{nanos}-{}",
+            uuid::Uuid::new_v4()
+        ));
         let dirs = DataDirs::from_bases(&base, &base);
         let candidates = crate::map_candidate::CandidateStore::new(
             (dirs.clone()).clone(),
@@ -4858,6 +4907,7 @@ mod tests {
                 context_state: Default::default(),
                 task_state: Default::default(),
                 autonomous_run: Some(autonomous),
+                workflow: None,
             })
             .unwrap();
         runtime.begin_request("req-ask", "project").unwrap();

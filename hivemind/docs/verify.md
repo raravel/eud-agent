@@ -233,6 +233,30 @@ At this documentation update (2026-09-12), checkpoint37 Rust, library check, str
 
 Exact commands, timestamps, source/binary bindings, and sanitized logs are in [the verification ledger](../../.omo/provider-runtime/verification.md), including `final-19-*`, `red-21-*`, the checkpoint-22 receipts, and checkpoint-23/24 evidence. Do not mark A–G, C01–C18, all five providers, or native UI complete from this snapshot.
 
+## Staged workflow
+
+Deterministic contracts (Rust): delegated-run gate profile, submission capture, write refusal,
+post-submission usage completion, MCP list parity, five-provider two-read/submit fixtures, prose
+and round-exhaustion failures, cancellation, pause, write-ticket refusal; `workflow` schemas,
+profiles, renderers, triage parsing, interruption mapping; engine tests for pipeline routing to
+plan review, critic-driven revision, answer route note, clarify ASK re-triage, approval → execute
+→ verify fail → fix → verify pass → review → done, plan feedback through the planner, stage
+failure, cancellation, and hydrate/startup interruption. Panel: store stage → phase mapping, plan
+review restore, strip, interrupted controls, verdict card, and the deep-planning switch.
+
+Scenario run: `features/staged-workflow-scenarios.md` defines eight rows against a fixture EPS
+project. `pre` rows require a build from commit `c23f0b2` (before triage was enabled); `post` rows
+the current build. Neither has been run. Until then the routing quality of triage and the
+usefulness of research/plan/verify on a live provider are unverified: every staged-workflow
+verdict above is deterministic (scripted stage results), not a live-provider result.
+
+Gate status on 2026-09-18 for the staged workflow source: Rust `cargo test -p eud-agent` passes
+(the combined tree with the bounded ASK change repeats `836/0/34`, see above), library check and
+strict all-target/all-feature Clippy pass with
+`clippy::incompatible_msrv` excluded (`tools.rs:1514` `is_none_or` predates this change and
+conflicts with the declared MSRV 1.77.2 under clippy 1.92), formatter passes, panel TypeScript,
+Vitest (63 files / 601 tests) and production build pass.
+
 ## Native project and batch DAT
 
 Rust suite MUST cover:

@@ -1610,6 +1610,7 @@ mod tests {
             context_state: Default::default(),
             task_state: Default::default(),
             autonomous_run: None,
+            workflow: None,
         };
         sessions.save(&session).unwrap();
         let original_session_path = dirs
