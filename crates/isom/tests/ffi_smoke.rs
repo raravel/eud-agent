@@ -10,8 +10,8 @@ use std::path::PathBuf;
 
 /// The linked static lib reports ABI version 6 (and matches the -sys const).
 #[test]
-fn abi_version_is_six() {
-    assert_eq!(isom::abi_version(), 6);
+fn abi_version_is_seven() {
+    assert_eq!(isom::abi_version(), 7);
     assert_eq!(isom::abi_version(), isom_sys::ISOM_ABI_VERSION as i32);
     isom::assert_abi_version().expect("ABI v6 startup assertion must pass");
 }

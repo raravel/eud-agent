@@ -190,7 +190,14 @@ Associated `.eap` files contain the canonical manifest directly. Startup argumen
 
 Environment setup after project selection:
 
-1. open/create/import a native project from the launcher or a direct file request;
+1. open/create/import a native project from the launcher or a direct file request. "Create"
+   starts from an existing SCX/SCM or from the blank-map wizard (`NewMapWizard`): tileset,
+   64..256 size, initial ISOM terrain brush, title/description, map format, up to 8 slots with
+   type/race/force, 1..4 named forces with flags, start locations auto-placed as a packed top-left cluster, and a rendered
+   preview before the project opens. The wizard needs the StarCraft install folder
+   (`config.starcraft_path`, selectable in place and preferred over the default install folder)
+   and generates `maps/<name>.scx` through `isom_map_new`, which saves via a same-directory
+   temporary file and atomic promotion and re-opens the result before Rust re-reads the CHK;
 2. automatically install the latest official euddraft release when no path is set, or select an existing euddraft folder/entrypoint;
 3. verify/download managed RAG/model assets;
 4. select and connect at least one supported AI provider.

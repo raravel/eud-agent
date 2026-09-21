@@ -643,7 +643,7 @@ impl NativeProject {
     }
 
     pub fn output_map_path(&self) -> Result<PathBuf, String> {
-        self.require_path(&self.manifest.output_map, false)
+        self.require_path_with(&self.manifest.output_map, false, true)
     }
 
     pub fn list_source_files(&self) -> Result<Vec<String>, String> {
@@ -769,7 +769,7 @@ impl NativeProject {
     pub fn set_project_setting(&mut self, key: &str, value: &str) -> Result<(), String> {
         match key {
             "OpenMapName" => self.manifest.source_map = normalize_relative(value)?,
-            "SaveMapName" => self.manifest.output_map = normalize_relative(value)?,
+            "SaveMapName" => self.manifest.output_map = normalize_output_map_relative(value)?,
             "UseCustomtbl" => {
                 self.manifest.settings.use_custom_tbl = value
                     .parse::<bool>()
@@ -1197,7 +1197,16 @@ impl NativeProject {
     }
 
     fn require_path(&self, relative: &str, must_exist: bool) -> Result<PathBuf, String> {
-        let relative = normalize_relative(relative)?;
+        self.require_path_with(relative, must_exist, false)
+    }
+
+    fn require_path_with(
+        &self,
+        relative: &str,
+        must_exist: bool,
+        allow_brackets: bool,
+    ) -> Result<PathBuf, String> {
+        let relative = normalize_relative_with(relative, allow_brackets)?;
         let path = self
             .root
             .join(relative.replace('/', std::path::MAIN_SEPARATOR_STR));
@@ -1757,7 +1766,14 @@ fn validate_manifest_source_paths(project: &NativeProject) -> Result<(), String>
     Ok(())
 }
 
-fn validate_manifest(manifest: &ProjectManifest) -> Result<(), String> {
+/// Canonical build output name for a project: `build/[EUD]<name>.<ext>`.
+/// `[`/`]` are safe here because the output map only ever appears as the
+/// `[main]` `output:` value in the generated EDS, never as a section header.
+pub fn default_output_map(name: &str, extension: &str) -> String {
+    format!("build/[EUD]{name}.{extension}")
+}
+
+pub fn validate_manifest(manifest: &ProjectManifest) -> Result<(), String> {
     if manifest.schema_version != PROJECT_SCHEMA_VERSION {
         return Err(format!(
             "project schemaVersion {} is unsupported (expected {PROJECT_SCHEMA_VERSION})",
@@ -1768,7 +1784,7 @@ fn validate_manifest(manifest: &ProjectManifest) -> Result<(), String> {
         return Err("project name must contain 1..128 characters".to_string());
     }
     let source = normalize_relative(&manifest.source_map)?;
-    let output = normalize_relative(&manifest.output_map)?;
+    let output = normalize_output_map_relative(&manifest.output_map)?;
     let main = normalize_relative(&manifest.main_file)?;
     if !matches_extension(&source, &["scx", "scm"]) {
         return Err("sourceMap must end in .scx or .scm".to_string());
@@ -2082,8 +2098,23 @@ fn windows_case_fold(value: &str) -> String {
     value.to_lowercase()
 }
 
+/// Normalize a project-relative path that may appear as an EDS section header
+/// (`[src/plugin.eps]`), so `[` and `]` are rejected outright.
 pub fn normalize_relative(value: &str) -> Result<String, String> {
-    if value.is_empty() || value.contains(['\0', '\\', '\r', '\n', '[', ']']) {
+    normalize_relative_with(value, false)
+}
+
+/// Normalize the output map path. It is only ever emitted as the `[main]`
+/// `output:` value, never as a section header, so `[EUD]name.scx` is allowed.
+pub fn normalize_output_map_relative(value: &str) -> Result<String, String> {
+    normalize_relative_with(value, true)
+}
+
+fn normalize_relative_with(value: &str, allow_brackets: bool) -> Result<String, String> {
+    if value.is_empty()
+        || value.contains(['\0', '\\', '\r', '\n'])
+        || (!allow_brackets && value.contains(['[', ']']))
+    {
         return Err("path must be non-empty and use '/' separators".to_string());
     }
     let path = Path::new(value);
@@ -2487,6 +2518,48 @@ mod tests {
         let persisted: ProjectManifest =
             serde_json::from_slice(&fs::read(&renamed).unwrap()).unwrap();
         assert_eq!(persisted.main_file, "src/alternate.eps");
+        drop(project);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn brackets_are_allowed_only_in_the_output_map() {
+        assert_eq!(default_output_map("Arena", "scx"), "build/[EUD]Arena.scx");
+        assert_eq!(
+            normalize_output_map_relative("build/[EUD]Arena.scx").unwrap(),
+            "build/[EUD]Arena.scx"
+        );
+        assert!(normalize_relative("build/[EUD]Arena.scx").is_err());
+
+        let mut bracketed = manifest();
+        bracketed.output_map = "build/[EUD]Arena.scx".to_string();
+        validate_manifest(&bracketed).unwrap();
+
+        let mut source = manifest();
+        source.source_map = "maps/[EUD]source.scx".to_string();
+        assert!(validate_manifest(&source).is_err());
+        let mut main = manifest();
+        main.main_file = "src/[main].eps".to_string();
+        assert!(validate_manifest(&main).is_err());
+
+        let (root, mut project) = project("bracketed-output");
+        project
+            .set_project_setting("SaveMapName", "build/[EUD]Arena.scx")
+            .unwrap();
+        assert!(project
+            .set_project_setting("OpenMapName", "maps/[EUD]source.scx")
+            .is_err());
+        let output = project.output_map_path().unwrap();
+        assert!(output.starts_with(project.root()));
+        assert!(output.ends_with(Path::new("build").join("[EUD]Arena.scx")));
+        // The EDS `[main]` value keeps the brackets verbatim and stays a value line.
+        let eds = format!(
+            "[main]\ninput: maps/source.scx\noutput: {}\n",
+            project.manifest().output_map
+        );
+        assert!(eds
+            .lines()
+            .all(|line| !(line.starts_with('[') && line.ends_with(']')) || line == "[main]"));
         drop(project);
         fs::remove_dir_all(root).ok();
     }

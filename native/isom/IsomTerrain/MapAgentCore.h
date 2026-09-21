@@ -15,6 +15,13 @@ int mapEdit(
     std::size_t batchLength,
     std::string& reportJson);
 
+int mapNew(
+    const char* outputMapPath,
+    const char* starCraftPath,
+    const std::uint8_t* specJson,
+    std::size_t specLength,
+    std::string& reportJson);
+
 int renderRegion(
     const char* mapPath,
     const char* starCraftPath,

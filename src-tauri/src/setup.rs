@@ -381,6 +381,156 @@ pub(crate) async fn setup_create_project(
     .map_err(|error| error.to_string())?
 }
 
+fn starcraft_availability(dirs: &DataDirs) -> crate::blank_project::StarcraftAvailability {
+    match crate::map_context::resolve_starcraft_path(dirs) {
+        Ok(path) => crate::blank_project::StarcraftAvailability {
+            available: true,
+            path: path.display().to_string(),
+            reason: None,
+        },
+        Err(error) => crate::blank_project::StarcraftAvailability {
+            available: false,
+            path: String::new(),
+            reason: Some(if error.starts_with("STARCRAFT_PATH") {
+                "환경 변수 STARCRAFT_PATH가 StarCraft 설치 폴더를 가리키지 않습니다.".to_string()
+            } else {
+                r"StarCraft 설치 폴더를 찾지 못했습니다. 기본 위치(C:\Program Files (x86)\StarCraft)에 없으면 직접 선택해 주세요.".to_string()
+            }),
+        },
+    }
+}
+
+fn map_new_options_payload(dirs: &DataDirs) -> crate::blank_project::MapNewOptionsResponse {
+    crate::blank_project::MapNewOptionsResponse {
+        starcraft: starcraft_availability(dirs),
+        tilesets: crate::blank_project::tileset_options(),
+        size_presets: crate::blank_project::size_presets(),
+        size_min: crate::blank_project::MAP_SIZE_MIN,
+        size_max: crate::blank_project::MAP_SIZE_MAX,
+    }
+}
+
+/// Wizard bootstrap: StarCraft data availability plus the static tileset/size choices.
+#[tauri::command]
+pub async fn setup_map_new_options(
+    state: tauri::State<'_, AppManaged>,
+) -> Result<crate::blank_project::MapNewOptionsResponse, String> {
+    let dirs = state.dirs().clone();
+    tauri::async_runtime::spawn_blocking(move || Ok(map_new_options_payload(&dirs)))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+/// Terrain brushes of one tileset from the installed StarCraft data.
+#[tauri::command]
+pub async fn setup_map_new_brushes(
+    state: tauri::State<'_, AppManaged>,
+    tileset: u8,
+) -> Result<Vec<crate::blank_project::BrushOption>, String> {
+    let dirs = state.dirs().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let starcraft = crate::map_context::resolve_starcraft_path(&dirs)?;
+        crate::blank_project::tileset_brushes(&starcraft, tileset)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+/// Pick the StarCraft install folder for terrain data and persist it.
+#[tauri::command]
+pub async fn setup_pick_starcraft_path(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppManaged>,
+) -> Result<crate::blank_project::MapNewOptionsResponse, String> {
+    let dirs = state.dirs().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let Some(picked) = app.dialog().file().blocking_pick_folder() else {
+            return Ok(map_new_options_payload(&dirs));
+        };
+        let picked = picked.into_path().map_err(|error| error.to_string())?;
+        if !picked.is_dir() {
+            return Err("선택한 경로가 폴더가 아닙니다.".to_string());
+        }
+        // Probe the folder before saving so a wrong pick never poisons config.
+        crate::blank_project::tileset_brushes(&picked, 0).map_err(|error| {
+            format!("선택한 폴더에서 StarCraft 데이터를 읽지 못했습니다. StarCraft 설치 폴더를 선택해 주세요. ({error})")
+        })?;
+        let mut config = dirs.load_config().map_err(|error| error.to_string())?;
+        config.starcraft_path = picked.display().to_string();
+        dirs.save_config(&config).map_err(|error| error.to_string())?;
+        Ok(map_new_options_payload(&dirs))
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+/// Blank-map project creation result: setup status plus the generated preview.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BlankProjectResponse {
+    #[serde(flatten)]
+    pub status: SetupStatusResponse,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preview: Option<crate::blank_project::BlankProjectPreview>,
+}
+
+/// Create a native project around a freshly generated blank map.
+#[tauri::command]
+pub(crate) async fn setup_create_blank_project(
+    state: tauri::State<'_, AppManaged>,
+    providers: tauri::State<'_, crate::provider_service::ProviderService>,
+    engine: tauri::State<'_, crate::engine::SessionEngineManager>,
+    request: crate::blank_project::BlankProjectRequest,
+) -> Result<BlankProjectResponse, String> {
+    let dirs = state.dirs().clone();
+    let statuses = providers.status_list().await?;
+    let switch_guard = engine.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::blank_project::validate_project_name(&request.name)?;
+        crate::blank_project::validate_spec(&request.spec)?;
+        let destination = request.destination.trim();
+        if destination.is_empty() {
+            return Err("작업 폴더를 먼저 선택해 주세요.".to_string());
+        }
+        let destination = PathBuf::from(destination);
+        let starcraft = crate::map_context::resolve_starcraft_path(&dirs)?;
+        let mut preview = None;
+        let result = switch_guard.with_project_switch(|| {
+            let cleanable = destination_is_empty(&destination)?;
+            if !cleanable {
+                return Err(format!(
+                    "project destination must be empty: {}",
+                    destination.display()
+                ));
+            }
+            let result =
+                crate::blank_project::create_blank_project(&destination, &starcraft, &request)
+                    .and_then(|created| {
+                        preview = Some(created);
+                        crate::native_project::NativeProject::open(&destination).and_then(
+                            |project| {
+                                crate::native_runtime::NativeProjectManager::new(dirs.clone())
+                                    .activate_project(&project)
+                            },
+                        )
+                    });
+            if result.is_err() {
+                crate::blank_project::remove_generated_contents(&destination).map_err(|error| {
+                    format!("{}; cleanup failed: {error}", result.as_ref().unwrap_err())
+                })?;
+            }
+            result
+        });
+        let status = finish_project_configuration(&dirs, result, PROJECT_CREATE_FAILED, statuses)?;
+        Ok(BlankProjectResponse {
+            preview: if status.project_opened { preview } else { None },
+            status,
+        })
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
 #[tauri::command]
 pub async fn setup_pick_e3s_source(
     app: tauri::AppHandle,
@@ -921,7 +1071,7 @@ fn create_project_from_map(source_map: &Path, destination: &Path) -> Result<(), 
         schema_version: crate::native_project::PROJECT_SCHEMA_VERSION,
         name: name.to_string(),
         source_map: format!("maps/{source_name}"),
-        output_map: format!("build/{name}_EUD.{extension}"),
+        output_map: crate::native_project::default_output_map(name, extension),
         main_file: "src/main.eps".to_string(),
         settings: crate::native_project::ProjectSettings::default(),
         plugins: Vec::new(),

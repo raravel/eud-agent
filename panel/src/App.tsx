@@ -29,6 +29,7 @@ import { Toaster } from "@/components/ui/sonner";
 import { Header, type RagState } from "@/components/Header";
 import { SettingsDialog } from "@/components/SettingsDialog";
 import { E3sImportDialog } from "@/setup/E3sImportDialog";
+import { NewMapWizard } from "@/setup/NewMapWizard";
 import { ConversationLog } from "@/components/ConversationLog";
 import { ChangesetView } from "@/components/ChangesetView";
 import { HarnessStatusCard } from "@/components/HarnessStatusCard";
@@ -124,6 +125,12 @@ import {
   pickE3sImportDestination,
   pickE3sSource,
 } from "@/lib/projectImport";
+import {
+  createBlankProject,
+  mapNewBrushes,
+  mapNewOptions,
+  pickStarcraftPath,
+} from "@/lib/mapNew";
 import { progressLabel } from "@/lib/progress";
 import { useProjectIdentityEffect } from "@/lib/projectIdentity";
 import { formatPathForDisplay } from "@/lib/utils";
@@ -408,8 +415,9 @@ export default function App() {
     "open" | "create" | "import" | "export" | null
   >(null);
   const [e3sImportOpen, setE3sImportOpen] = useState(false);
+  const [newMapWizardOpen, setNewMapWizardOpen] = useState(false);
   const projectDialogOpenRef = useRef(false);
-  projectDialogOpenRef.current = e3sImportOpen;
+  projectDialogOpenRef.current = e3sImportOpen || newMapWizardOpen;
   const [sessionSidebarCollapsed, setSessionSidebarCollapsed] = useState(false);
   const [projectSidebarOpen, setProjectSidebarOpen] = useState(true);
   const [projectPanelTab, setProjectPanelTab] =
@@ -2062,6 +2070,28 @@ export default function App() {
     setE3sImportOpen(true);
   }, [projectSwitchBlocked]);
 
+  const openNewMapWizard = useCallback(() => {
+    if (projectSetupBusyRef.current || launchBusyRef.current) return;
+    const blocked = projectSwitchBlocked();
+    if (blocked) {
+      toast.error(blocked);
+      return;
+    }
+    setLauncherError(null);
+    setNewMapWizardOpen(true);
+  }, [projectSwitchBlocked]);
+
+  const handleBlankProjectCreated = useCallback(
+    (nextSetup: SetupMessage) => {
+      if (!nextSetup.projectOpened) {
+        setLauncherError(projectOpenError(nextSetup.error ?? "새 맵 프로젝트 생성이 취소되었습니다."));
+        return;
+      }
+      onMessage(nextSetup);
+    },
+    [onMessage],
+  );
+
   const handleE3sImported = useCallback(
     (nextSetup: SetupMessage) => {
       if (!nextSetup.projectOpened) {
@@ -2960,6 +2990,7 @@ export default function App() {
             runProjectSetupAction("open", "setup_pick_project_path", directory)
           }
           onCreate={() => runProjectSetupAction("create", "setup_create_project")}
+          onCreateBlank={openNewMapWizard}
           onImport={openE3sImport}
           onRemoveRecent={(path) => {
             if (projectSetupBusyRef.current || launchBusyRef.current) return;
@@ -2985,6 +3016,16 @@ export default function App() {
           pickDestination={pickE3sImportDestination}
           importProject={importE3sProject}
           onImported={handleE3sImported}
+        />
+        <NewMapWizard
+          open={newMapWizardOpen}
+          onOpenChange={setNewMapWizardOpen}
+          loadOptions={mapNewOptions}
+          loadBrushes={mapNewBrushes}
+          pickStarcraft={pickStarcraftPath}
+          pickDestination={pickE3sImportDestination}
+          create={createBlankProject}
+          onCreated={handleBlankProjectCreated}
         />
       </>
     );

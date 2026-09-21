@@ -12,6 +12,7 @@
 ## Native project paths
 
 - All manifest/source/plugin paths are `/`-separated project-relative paths.
+- `[` and `]` are rejected in every path that can become an EDS section header (sources, plugins, Python entrypoints, source map). Only `outputMap` may contain them, because it is emitted solely as the `[main]` `output:` value; the canonical default is `build/[EUD]<name>.<ext>`.
 - EPS and direct-Python sources MUST stay under `src/` and end in `.eps` or `.py`; MainFile remains EPS-only.
 - Source and output maps MUST end in `.scx` or `.scm` and MUST NOT alias.
 - Reject absolute paths, `..`, NUL, empty components, case-colliding duplicates, and symlink/canonical-parent escapes before I/O.
@@ -108,7 +109,8 @@
 - Use semantic controls, visible focus, keyboard operation, and descriptive aria labels.
 - Long operations disable their trigger and show progress within the same surface.
 - Project setup order is project → euddraft → assets → provider selection → provider connection.
-- Project actions expose open/create/import; settings also exposes export.
+- Project actions expose open/create/import; settings also exposes export. Create offers both "existing map" and the blank-map wizard; the wizard is launcher-only and never an agent tool.
+- The blank-map wizard fails closed without a resolvable StarCraft data folder and offers the folder picker in place; it never generates terrain from bundled or synthetic tileset data.
 - Every ordinary launch requires explicit project selection; a file launch opens only its requested project. Stored config alone must not activate project polling, session restoration, or project-dependent bootstrap.
 - Recents are newest-first by successful explicit open; failed/canceled actions do not change selection or recency. Removing history must never delete project files.
 - File association is `.eap` only, never all `.json` files. The `.eap` file contains the canonical manifest directly. Legacy `project.json`/`.eudproj` may be migrated only on explicit open after validation; never generate descriptors or maintain two manifest authorities.
@@ -117,6 +119,7 @@
 - Use Lucide/vector icons, semantic theme tokens, and reduced-motion classes; no emoji structural icons.
 
 ## Verification
+- Every panel control is a shadcn/ui primitive from `panel/components/ui` (Button, Input, Textarea, Select, RadioGroup, Checkbox, Switch, Dialog, Tabs, ...). Native `<select>`, `<input type="radio">`, `<input type="checkbox">`, or hand-styled equivalents are prohibited; a missing primitive is added with the shadcn CLI (`npx shadcn add <name>` in `panel/`), never hand-rolled.
 
 - Bug fixes reproduce and then remove the observed failure.
 - Permanent contracts get behavior tests, not source-text tests.

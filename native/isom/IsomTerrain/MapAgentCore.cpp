@@ -34,6 +34,7 @@ namespace {
 constexpr const char* EditSchema = "eud-map-edit/1";
 constexpr const char* RenderSchema = "eud-map-render/1";
 constexpr const char* CatalogSchema = "eud-map-catalog/1";
+constexpr const char* NewSchema = "eud-map-new/1";
 constexpr std::size_t MaxOperations = 4096;
 
 [[noreturn]] void fail(const std::string& message)
@@ -691,9 +692,28 @@ std::string temporaryOutputPath(const std::string& output)
     return output + ".native-" + std::to_string(GetCurrentProcessId()) + "-" + std::to_string(GetTickCount64()) + ".tmp";
 }
 
+// Every path that crosses the C ABI is UTF-8 (the Rust side never re-encodes),
+// so filesystem calls must go through the wide APIs; the ANSI variants would
+// interpret those bytes in the system code page and miss non-ASCII folders.
 bool replaceFile(const std::string& source, const std::string& destination)
 {
-    return ::MoveFileExA(source.c_str(), destination.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != FALSE;
+    return ::MoveFileExW(utf8Wide(source).c_str(), utf8Wide(destination).c_str(),
+        MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != FALSE;
+}
+
+bool fileExists(const std::string& path)
+{
+    return ::GetFileAttributesW(utf8Wide(path).c_str()) != INVALID_FILE_ATTRIBUTES;
+}
+
+void deleteFile(const std::string& path)
+{
+    ::DeleteFileW(utf8Wide(path).c_str());
+}
+
+bool copyFileNoOverwrite(const std::string& source, const std::string& destination)
+{
+    return ::CopyFileW(utf8Wide(source).c_str(), utf8Wide(destination).c_str(), TRUE) != FALSE;
 }
 
 using AssetInventory = std::map<std::string, std::string>;
@@ -1628,7 +1648,7 @@ int mapEdit(const char* inputMapPath, const char* outputMapPath, const char* sta
     const std::string outputPath(outputMapPath);
     if ( inputPath.empty() || outputPath.empty() || lowerAscii(inputPath) == lowerAscii(outputPath) )
         fail("mapedit requires distinct non-empty input and output paths");
-    ::DeleteFileA(outputPath.c_str());
+    deleteFile(outputPath);
 
     const Json root = parseJson(std::string(reinterpret_cast<const char*>(batchJson), batchLength), "map edit batch");
     const auto& object = objectValue(root, "map edit batch");
@@ -1928,27 +1948,27 @@ int mapEdit(const char* inputMapPath, const char* outputMapPath, const char* sta
 
     const AssetInventory beforeAssets = inventoryMpq(inputPath);
     const std::string temporary = temporaryOutputPath(outputPath);
-    ::DeleteFileA(temporary.c_str());
+    deleteFile(temporary);
     if ( !map.save(temporary, true, true, true, false) )
     {
-        ::DeleteFileA(temporary.c_str());
+        deleteFile(temporary);
         fail("map save failed before output promotion");
     }
     const AssetInventory afterAssets = inventoryMpq(temporary);
     if ( beforeAssets != afterAssets )
     {
-        ::DeleteFileA(temporary.c_str());
+        deleteFile(temporary);
         fail("map save changed unrelated MPQ assets");
     }
     if ( !replaceFile(temporary, outputPath) )
     {
-        ::DeleteFileA(temporary.c_str());
+        deleteFile(temporary);
         fail("map output atomic promotion failed");
     }
     MapFile verified(outputPath);
     if ( verified.empty() )
     {
-        ::DeleteFileA(outputPath.c_str());
+        deleteFile(outputPath);
         fail("saved map failed native re-open verification");
     }
     reportJson = serializeJson(Json::Object{
@@ -1959,6 +1979,247 @@ int mapEdit(const char* inputMapPath, const char* outputMapPath, const char* sta
         {"inputSha256", expectedHash},
         {"outputSha256", readFileSha256(outputPath)},
         {"extraAssetsDigest", inventoryDigest(afterAssets)}
+    });
+    return 0;
+}
+
+namespace {
+
+Sc::Player::SlotType parseSlotType(const std::string& value, const std::string& context)
+{
+    if ( value == "human" ) return Sc::Player::SlotType::Human;
+    if ( value == "computer" ) return Sc::Player::SlotType::Computer;
+    if ( value == "rescuable" ) return Sc::Player::SlotType::RescuePassive;
+    if ( value == "neutral" ) return Sc::Player::SlotType::Neutral;
+    if ( value == "inactive" ) return Sc::Player::SlotType::Inactive;
+    if ( value == "closed" ) return Sc::Player::SlotType::GameClosed;
+    fail(context + ": unsupported slot type '" + value + "'");
+}
+
+Chk::Race parseRace(const std::string& value, const std::string& context)
+{
+    if ( value == "zerg" ) return Chk::Race::Zerg;
+    if ( value == "terran" ) return Chk::Race::Terran;
+    if ( value == "protoss" ) return Chk::Race::Protoss;
+    if ( value == "userSelectable" ) return Chk::Race::UserSelectable;
+    if ( value == "random" ) return Chk::Race::Random;
+    fail(context + ": unsupported race '" + value + "'");
+}
+
+} // namespace
+
+// Create a brand-new ISOM-consistent map in one call: fill the whole map with one
+// terrain brush, then set scenario title/description, slot types, races, forces and
+// start locations on the same in-memory MapFile before a single save. The output is
+// promoted only after native re-open verification, matching mapEdit.
+int mapNew(const char* outputMapPath, const char* starCraftPath,
+    const std::uint8_t* specJson, std::size_t specLength, std::string& reportJson)
+{
+    if ( outputMapPath == nullptr || outputMapPath[0] == '\0' || starCraftPath == nullptr ||
+         starCraftPath[0] == '\0' || specJson == nullptr || specLength == 0 )
+        fail("map new received an invalid argument");
+    const std::string outputPath(outputMapPath);
+    if ( !validMapContainerPath(outputPath) )
+        fail("map new accepts only SCX/SCM output paths");
+    if ( fileExists(outputPath) )
+        fail("map new output path must not already exist");
+
+    const Json root = parseJson(std::string(reinterpret_cast<const char*>(specJson), specLength), "map new spec");
+    const auto& spec = objectValue(root, "map new spec");
+    allowedFields(spec, {"schema", "version", "tileset", "width", "height", "terrainType", "title", "description",
+        "players", "forces"}, "map new spec");
+    if ( stringValue(requiredField(spec, "schema", "map new spec"), "map new spec.schema") != NewSchema )
+        fail("unsupported map new schema");
+    const std::string version = optionalField(spec, "version") == nullptr
+        ? std::string("remastered")
+        : stringValue(*optionalField(spec, "version"), "map new spec.version");
+    SaveType saveType = SaveType::RemasteredScx;
+    if ( version == "broodWar" ) saveType = SaveType::ExpansionScx;
+    else if ( version != "remastered" ) fail("map new spec.version must be remastered or broodWar");
+
+    const std::size_t tilesetIndex = checkedSize(spec, "tileset", "map new spec");
+    if ( tilesetIndex >= Sc::Terrain::NumTilesets ) fail("map new spec.tileset is out of range");
+    const auto tileset = Sc::Terrain::Tileset(tilesetIndex);
+    const std::size_t width = checkedSize(spec, "width", "map new spec", true);
+    const std::size_t height = checkedSize(spec, "height", "map new spec", true);
+    if ( width < 64 || width > 256 || height < 64 || height > 256 )
+        fail("map new spec width and height must be within 64..256");
+    const std::size_t terrainType = checkedSize(spec, "terrainType", "map new spec", true);
+    const std::string title = optionalField(spec, "title") == nullptr
+        ? std::string("Untitled Scenario")
+        : stringValue(*optionalField(spec, "title"), "map new spec.title");
+    const std::string description = optionalField(spec, "description") == nullptr
+        ? std::string("Destroy all enemy buildings.")
+        : stringValue(*optionalField(spec, "description"), "map new spec.description");
+    if ( title.empty() || title.size() > 1024 || description.size() > 4096 )
+        fail("map new spec title/description length is out of range");
+
+    struct ForceSpec { std::string name; std::uint8_t flags; };
+    std::vector<ForceSpec> forces;
+    if ( const Json* forcesJson = optionalField(spec, "forces") )
+    {
+        const auto& forceArray = arrayValue(*forcesJson, "map new spec.forces");
+        if ( forceArray.empty() || forceArray.size() > Chk::TotalForces )
+            fail("map new spec.forces must contain 1..4 entries");
+        for ( std::size_t index = 0; index < forceArray.size(); ++index )
+        {
+            const std::string context = "map new spec.forces[" + std::to_string(index) + "]";
+            const auto& force = objectValue(forceArray[index], context);
+            exactFields(force, {"name", "allied", "alliedVictory", "sharedVision", "randomStart"}, context);
+            const std::string name = stringValue(requiredField(force, "name", context), context + ".name");
+            if ( name.empty() || name.size() > 256 ) fail(context + ".name length is out of range");
+            std::uint8_t flags = 0;
+            if ( boolValue(requiredField(force, "allied", context), context + ".allied") ) flags |= Chk::ForceFlags::RandomAllies;
+            if ( boolValue(requiredField(force, "alliedVictory", context), context + ".alliedVictory") ) flags |= Chk::ForceFlags::AlliedVictory;
+            if ( boolValue(requiredField(force, "sharedVision", context), context + ".sharedVision") ) flags |= Chk::ForceFlags::SharedVision;
+            if ( boolValue(requiredField(force, "randomStart", context), context + ".randomStart") ) flags |= Chk::ForceFlags::RandomizeStartLocation;
+            forces.push_back({name, flags});
+        }
+    }
+    else
+        forces.push_back({"Force 1", Chk::ForceFlags::All});
+
+    struct PlayerSpec
+    {
+        std::size_t slot;
+        Sc::Player::SlotType type;
+        Chk::Race race;
+        std::size_t force;
+        bool hasStart;
+        std::uint16_t startX;
+        std::uint16_t startY;
+    };
+    std::vector<PlayerSpec> players;
+    if ( const Json* playersJson = optionalField(spec, "players") )
+    {
+        const auto& playerArray = arrayValue(*playersJson, "map new spec.players");
+        if ( playerArray.size() > 8 ) fail("map new spec.players must contain at most 8 entries");
+        std::set<std::size_t> slots;
+        for ( std::size_t index = 0; index < playerArray.size(); ++index )
+        {
+            const std::string context = "map new spec.players[" + std::to_string(index) + "]";
+            const auto& player = objectValue(playerArray[index], context);
+            allowedFields(player, {"slot", "type", "race", "force", "start"}, context);
+            PlayerSpec parsed {};
+            parsed.slot = checkedSize(player, "slot", context);
+            if ( parsed.slot >= 8 ) fail(context + ".slot must be within 0..7");
+            if ( !slots.insert(parsed.slot).second ) fail(context + ".slot is duplicated");
+            parsed.type = parseSlotType(stringValue(requiredField(player, "type", context), context + ".type"), context + ".type");
+            parsed.race = parseRace(stringValue(requiredField(player, "race", context), context + ".race"), context + ".race");
+            parsed.force = checkedSize(player, "force", context);
+            if ( parsed.force >= forces.size() ) fail(context + ".force does not name a declared force");
+            parsed.hasStart = false;
+            if ( const Json* start = optionalField(player, "start") )
+            {
+                const auto& startObject = objectValue(*start, context + ".start");
+                exactFields(startObject, {"x", "y"}, context + ".start");
+                parsed.startX = checkedU16(startObject, "x", context + ".start");
+                parsed.startY = checkedU16(startObject, "y", context + ".start");
+                if ( parsed.startX >= width * 32 || parsed.startY >= height * 32 )
+                    fail(context + ".start is outside the map");
+                parsed.hasStart = true;
+            }
+            players.push_back(parsed);
+        }
+    }
+
+    const auto assets = loadAssets(starCraftPath);
+    const auto& isomData = assets->isom.get(tileset);
+    bool brushKnown = false;
+    for ( const auto& brush : isomData.brushes )
+        brushKnown = brushKnown || brush.index == terrainType;
+    if ( !brushKnown )
+        fail("map new spec.terrainType is not a terrain brush of the selected tileset");
+
+    MapFile map(tileset, static_cast<u16>(width), static_cast<u16>(height));
+    map.setSaveType(saveType);
+    {
+        ScMap scMap = copyToScMap(map);
+        Chk::IsomCache cache(tileset, width, height, isomData);
+        const std::uint16_t isomValue = static_cast<std::uint16_t>(
+            (cache.getTerrainTypeIsomValue(terrainType) << 4) | Chk::IsomRect::EditorFlag::Modified);
+        scMap.isomRects.assign(scMap.getIsomWidth() * scMap.getIsomHeight(),
+            Chk::IsomRect{isomValue, isomValue, isomValue, isomValue});
+        cache.setAllChanged();
+        scMap.updateTilesFromIsom(cache);
+        copyFromScMap(map, scMap);
+    }
+
+    map.setScenarioName<RawString>(RawString(title));
+    map.setScenarioDescription<RawString>(RawString(description));
+    for ( std::size_t index = 0; index < forces.size(); ++index )
+    {
+        map.setForceName<RawString>(Chk::Force(index), RawString(forces[index].name));
+        map.setForceFlags(Chk::Force(index), forces[index].flags);
+    }
+    // Every slot the spec does not mention is Inactive so the lobby matches the wizard.
+    for ( std::size_t slot = 0; slot < 8; ++slot )
+        map.setSlotType(slot, Sc::Player::SlotType::Inactive);
+    std::size_t startLocations = 0;
+    for ( const auto& player : players )
+    {
+        map.setSlotType(player.slot, player.type);
+        map.setPlayerRace(player.slot, player.race);
+        map.setPlayerForce(player.slot, Chk::Force(player.force));
+        if ( player.hasStart )
+        {
+            Chk::Unit unit {};
+            unit.type = Sc::Unit::Type::StartLocation;
+            unit.owner = static_cast<u8>(player.slot);
+            unit.xc = player.startX;
+            unit.yc = player.startY;
+            unit.hitpointPercent = 100;
+            unit.shieldPercent = 100;
+            unit.energyPercent = 100;
+            map.addUnit(unit);
+            ++startLocations;
+        }
+    }
+
+    const std::string temporary = temporaryOutputPath(outputPath);
+    deleteFile(temporary);
+    if ( !map.save(temporary, true, true, true, false) )
+    {
+        deleteFile(temporary);
+        fail("map save failed before output promotion");
+    }
+    if ( !replaceFile(temporary, outputPath) )
+    {
+        deleteFile(temporary);
+        fail("map output atomic promotion failed");
+    }
+    MapFile verified(outputPath);
+    if ( verified.empty() )
+    {
+        deleteFile(outputPath);
+        fail("saved map failed native re-open verification");
+    }
+    if ( verified.getTileset() != tileset || verified.getTileWidth() != width || verified.getTileHeight() != height )
+    {
+        deleteFile(outputPath);
+        fail("saved map header does not match the requested spec");
+    }
+    std::size_t verifiedStarts = 0;
+    for ( std::size_t index = 0; index < verified.numUnits(); ++index )
+    {
+        if ( verified.getUnit(index).type == Sc::Unit::Type::StartLocation )
+            ++verifiedStarts;
+    }
+    if ( verifiedStarts != startLocations )
+    {
+        deleteFile(outputPath);
+        fail("saved map start locations do not match the requested spec");
+    }
+    reportJson = serializeJson(Json::Object{
+        {"schema", "eud-map-new-report/1"},
+        {"ok", true},
+        {"tileset", tilesetName(tileset)},
+        {"width", width},
+        {"height", height},
+        {"terrainType", terrainType},
+        {"players", players.size()},
+        {"startLocations", startLocations},
+        {"outputSha256", readFileSha256(outputPath)}
     });
     return 0;
 }
@@ -2368,7 +2629,7 @@ int mapSoundAdd(
         fail("destination MPQ path is not an exact managed sound path");
     if ( oggLength < 4 || std::memcmp(oggBytes, "OggS", 4) != 0 )
         fail("map sound bytes are not OGG");
-    if ( ::GetFileAttributesA(outputPath.c_str()) != INVALID_FILE_ATTRIBUTES )
+    if ( fileExists(outputPath) )
         fail("map sound output path must not already exist");
 
     const std::string inputHash = readFileSha256(inputPath);
@@ -2403,12 +2664,12 @@ int mapSoundAdd(
     std::size_t soundIndex = existingSound.first;
     std::size_t soundStringId = existingStringId;
     const std::string temporary = temporaryOutputPath(outputPath);
-    ::DeleteFileA(temporary.c_str());
+    deleteFile(temporary);
     try
     {
         if ( reused )
         {
-            if ( !::CopyFileA(inputPath.c_str(), temporary.c_str(), TRUE) )
+            if ( !copyFileNoOverwrite(inputPath, temporary) )
                 fail("cannot stage idempotent sound output");
         }
         else
@@ -2482,7 +2743,7 @@ int mapSoundAdd(
         const std::string outputHash = readFileSha256(outputPath);
         if ( outputHash != stagedOutputHash )
         {
-            ::DeleteFileA(outputPath.c_str());
+            deleteFile(outputPath);
             fail("promoted sound map output hash changed");
         }
         reportJson = serializeJson(Json::Object{
@@ -2505,8 +2766,8 @@ int mapSoundAdd(
     }
     catch ( ... )
     {
-        ::DeleteFileA(temporary.c_str());
-        ::DeleteFileA(outputPath.c_str());
+        deleteFile(temporary);
+        deleteFile(outputPath);
         throw;
     }
 }
@@ -2544,7 +2805,7 @@ int mapSoundReplace(
         fail("replacement MPQ path is not an exact managed sound path");
     if ( oggLength < 4 || std::memcmp(oggBytes, "OggS", 4) != 0 )
         fail("map sound bytes are not OGG");
-    if ( ::GetFileAttributesA(outputPath.c_str()) != INVALID_FILE_ATTRIBUTES )
+    if ( fileExists(outputPath) )
         fail("map sound output path must not already exist");
 
     const std::string inputHash = readFileSha256(inputPath);
@@ -2580,7 +2841,7 @@ int mapSoundReplace(
     const std::string beforeUnrelatedAssetDigest = inventoryDigest(beforeUnrelatedAssets);
     const std::size_t soundIndex = oldSound.first;
     const std::string temporary = temporaryOutputPath(outputPath);
-    ::DeleteFileA(temporary.c_str());
+    deleteFile(temporary);
     try
     {
         if ( !map.removeSoundBySoundIndex(static_cast<u16>(soundIndex), true) )
@@ -2651,7 +2912,7 @@ int mapSoundReplace(
         const std::string outputHash = readFileSha256(outputPath);
         if ( outputHash != stagedOutputHash )
         {
-            ::DeleteFileA(outputPath.c_str());
+            deleteFile(outputPath);
             fail("promoted sound replacement output hash changed");
         }
         reportJson = serializeJson(Json::Object{
@@ -2674,8 +2935,8 @@ int mapSoundReplace(
     }
     catch ( ... )
     {
-        ::DeleteFileA(temporary.c_str());
-        ::DeleteFileA(outputPath.c_str());
+        deleteFile(temporary);
+        deleteFile(outputPath);
         throw;
     }
 }

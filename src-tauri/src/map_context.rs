@@ -213,10 +213,8 @@ pub(crate) fn resolve_starcraft_path(dirs: &DataDirs) -> Result<PathBuf, String>
         }
         return Err("STARCRAFT_PATH does not name an installed StarCraft directory".to_string());
     }
-    let standard = PathBuf::from(r"C:\Program Files (x86)\StarCraft");
-    if standard.is_dir() {
-        return Ok(standard);
-    }
+    // An explicitly configured folder wins over the default install location so
+    // the wizard's "StarCraft 폴더 선택" can override a stale default directory.
     let configured = dirs
         .load_config()
         .map_err(|error| format!("app config could not be read: {error}"))?
@@ -224,6 +222,10 @@ pub(crate) fn resolve_starcraft_path(dirs: &DataDirs) -> Result<PathBuf, String>
     let configured = PathBuf::from(configured);
     if configured.is_dir() {
         return Ok(configured);
+    }
+    let standard = PathBuf::from(r"C:\Program Files (x86)\StarCraft");
+    if standard.is_dir() {
+        return Ok(standard);
     }
     Err("StarCraft data directory could not be resolved".to_string())
 }

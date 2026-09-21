@@ -8,6 +8,7 @@ import {
   FolderX,
   History,
   Loader2,
+  Map,
   Plus,
   Search,
   X,
@@ -29,6 +30,7 @@ export interface ProjectLauncherProps {
   onOpenRecent(path: string): void | Promise<void>;
   onOpenPicker(directory?: boolean): void | Promise<void>;
   onCreate(): void | Promise<void>;
+  onCreateBlank(): void | Promise<void>;
   onImport(): void | Promise<void>;
   onRemoveRecent(path: string): void | Promise<void>;
   onCancel?: () => void;
@@ -62,6 +64,7 @@ export function ProjectLauncher({
   onOpenRecent,
   onOpenPicker,
   onCreate,
+  onCreateBlank,
   onImport,
   onRemoveRecent,
   onCancel,
@@ -241,11 +244,16 @@ export function ProjectLauncher({
 
           <aside aria-labelledby="launcher-actions" className="min-h-0 border-t border-border pt-6 md:overflow-y-auto md:overscroll-contain md:border-l md:border-t-0 md:pl-8 md:pt-0 lg:pl-10">
             <h2 id="launcher-actions" className="text-lg font-semibold">새로 만들기 및 열기</h2>
-            <p className="mt-2 break-keep text-sm leading-6 text-muted-foreground">새 맵에서 시작하거나 가져온 프로젝트를 여세요.</p>
+            <p className="mt-2 break-keep text-sm leading-6 text-muted-foreground">빈 맵이나 기존 맵에서 시작하거나 가져온 프로젝트를 여세요.</p>
             <div className="mt-5 space-y-3">
+              <Button type="button" variant="outline" className={actionClassName} disabled={busy} onClick={() => void onCreateBlank()}>
+                <Map aria-hidden className="size-5 shrink-0 text-muted-foreground" />
+                <span className="min-w-0 flex-1"><span className="block font-medium">빈 맵으로 새 프로젝트</span><span className="mt-1 block text-xs font-normal leading-5 text-muted-foreground">타일셋·크기·플레이어를 정해 바로 생성</span></span>
+                <ArrowRight aria-hidden className="size-4 shrink-0 text-muted-foreground opacity-0 transition-opacity group-hover:opacity-100 group-focus-visible:opacity-100" />
+              </Button>
               <Button type="button" variant="outline" className={actionClassName} disabled={busy} onClick={() => void onCreate()}>
                 <Plus aria-hidden className="size-5 shrink-0 text-muted-foreground" />
-                <span className="min-w-0 flex-1"><span className="block font-medium">새 프로젝트 만들기</span><span className="mt-1 block text-xs font-normal leading-5 text-muted-foreground">SCX·SCM 맵에서 시작</span></span>
+                <span className="min-w-0 flex-1"><span className="block font-medium">기존 맵으로 새 프로젝트</span><span className="mt-1 block text-xs font-normal leading-5 text-muted-foreground">SCX·SCM 맵 파일에서 시작</span></span>
                 <ArrowRight aria-hidden className="size-4 shrink-0 text-muted-foreground opacity-0 transition-opacity group-hover:opacity-100 group-focus-visible:opacity-100" />
               </Button>
               <Button type="button" variant="outline" className={actionClassName} disabled={busy} onClick={() => void onOpenPicker(false)}>

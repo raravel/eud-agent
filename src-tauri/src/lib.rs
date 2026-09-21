@@ -12,6 +12,7 @@ pub mod antigravity_client;
 pub mod attachment;
 pub mod audio;
 pub mod autonomous;
+pub mod blank_project;
 pub mod bootstrap;
 pub mod chk;
 pub mod claude_auth;
@@ -452,6 +453,10 @@ pub fn run() {
             setup::project_export_e3s,
             setup::setup_pick_euddraft_path,
             setup::setup_install_euddraft,
+            setup::setup_map_new_options,
+            setup::setup_map_new_brushes,
+            setup::setup_pick_starcraft_path,
+            setup::setup_create_blank_project,
             setup::setup_provider_select,
             setup::bootstrap_run,
         ])

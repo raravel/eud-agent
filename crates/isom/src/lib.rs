@@ -390,6 +390,142 @@ pub fn mapedit(
         .map_err(|error| NativeCallError::new(IsomError::Engine, Some(error.to_string())))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MapNewStart {
+    pub x: u16,
+    pub y: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MapNewPlayer {
+    pub slot: u8,
+    /// `human`, `computer`, `rescuable`, `neutral`, `inactive`, or `closed`.
+    pub r#type: String,
+    /// `zerg`, `terran`, `protoss`, `userSelectable`, or `random`.
+    pub race: String,
+    pub force: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start: Option<MapNewStart>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MapNewForce {
+    pub name: String,
+    pub allied: bool,
+    pub allied_victory: bool,
+    pub shared_vision: bool,
+    pub random_start: bool,
+}
+
+/// Strict `eud-map-new/1` request. Serialized verbatim for the native engine,
+/// which re-validates every field before touching the filesystem.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MapNewSpec {
+    /// `remastered` (default) or `broodWar`.
+    pub version: String,
+    pub tileset: u8,
+    pub width: u16,
+    pub height: u16,
+    pub terrain_type: u16,
+    pub title: String,
+    pub description: String,
+    pub players: Vec<MapNewPlayer>,
+    pub forces: Vec<MapNewForce>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MapNewReport {
+    pub schema: String,
+    pub ok: bool,
+    pub tileset: String,
+    pub width: u16,
+    pub height: u16,
+    pub terrain_type: u16,
+    pub players: u64,
+    pub start_locations: u64,
+    pub output_sha256: String,
+}
+
+/// Create a brand-new map at `output_map_path` from `spec`. The path must not
+/// exist; the engine promotes the file only after save and re-open verification.
+pub fn map_new(
+    output_map_path: &Path,
+    starcraft_path: &Path,
+    spec: &MapNewSpec,
+) -> Result<MapNewReport, NativeCallError> {
+    if !(64..=256).contains(&spec.width)
+        || !(64..=256).contains(&spec.height)
+        || spec.tileset > 7
+        || spec.terrain_type == 0
+        || spec.players.len() > 8
+        || spec.forces.is_empty()
+        || spec.forces.len() > 4
+        || output_map_path.exists()
+    {
+        return Err(NativeCallError::new(IsomError::InvalidArg, None));
+    }
+    let mut request = serde_json::to_value(spec)
+        .map_err(|error| NativeCallError::new(IsomError::InvalidArg, Some(error.to_string())))?;
+    request["schema"] = serde_json::Value::String("eud-map-new/1".to_string());
+    let request = serde_json::to_vec(&request)
+        .map_err(|error| NativeCallError::new(IsomError::InvalidArg, Some(error.to_string())))?;
+    let _native_call = native_call_guard();
+    let output =
+        path_cstring(output_map_path).map_err(|error| NativeCallError::new(error, None))?;
+    let starcraft =
+        path_cstring(starcraft_path).map_err(|error| NativeCallError::new(error, None))?;
+    let mut report: *mut u8 = std::ptr::null_mut();
+    let mut report_len = 0_usize;
+    // SAFETY: both paths and the request buffer outlive this synchronous call.
+    // The report is allocated by the C ABI and released by `CBuf` on every path.
+    let code = unsafe {
+        isom_sys::isom_map_new(
+            output.as_ptr(),
+            starcraft.as_ptr(),
+            request.as_ptr(),
+            request.len(),
+            &mut report,
+            &mut report_len,
+        )
+    };
+    let report = CBuf(report);
+    let bytes = buffer_bytes(&report, report_len);
+    if let Err(error) = status(code) {
+        return Err(NativeCallError::new(error, native_detail(&bytes)));
+    }
+    let parsed: MapNewReport = serde_json::from_slice(&bytes).map_err(|error| {
+        NativeCallError::new(
+            IsomError::Engine,
+            Some(format!("invalid map-new report: {error}")),
+        )
+    })?;
+    let expected_starts = spec
+        .players
+        .iter()
+        .filter(|player| player.start.is_some())
+        .count() as u64;
+    let valid = parsed.schema == "eud-map-new-report/1"
+        && parsed.ok
+        && parsed.width == spec.width
+        && parsed.height == spec.height
+        && parsed.terrain_type == spec.terrain_type
+        && parsed.players == spec.players.len() as u64
+        && parsed.start_locations == expected_starts
+        && exact_lower_hex(&parsed.output_sha256, 64);
+    if !valid {
+        return Err(NativeCallError::new(
+            IsomError::Engine,
+            Some("map-new report invariant mismatch".to_string()),
+        ));
+    }
+    Ok(parsed)
+}
+
 pub fn render_region(
     map_path: &Path,
     starcraft_path: &Path,
@@ -829,7 +965,7 @@ pub fn image_quantize(
     })
 }
 
-pub const EXPECTED_ABI_VERSION: i32 = 6;
+pub const EXPECTED_ABI_VERSION: i32 = 7;
 
 pub fn assert_abi_version() -> Result<(), IsomError> {
     let actual = abi_version();

@@ -27,7 +27,7 @@ extern "C" {
 
 /* ABI version of this shim. Bump on any breaking change to the signatures or
  * the ops/buffer encoding below. The Rust side asserts this at startup. */
-#define ISOM_ABI_VERSION 6
+#define ISOM_ABI_VERSION 7
 
 /* Error codes returned by the isom_* functions. 0 == success. */
 enum IsomStatus {
@@ -89,6 +89,20 @@ int isom_mapedit(
     const char* starcraft_path,
     const uint8_t* batch_json,
     size_t batch_len,
+    uint8_t** out_report_json,
+    size_t* out_report_len);
+
+/* Create a brand-new map from a strict eud-map-new/1 JSON spec: tileset,
+ * 64..256 dimensions, one ISOM terrain brush filling the whole map, scenario
+ * title/description, up to 8 player slots (type/race/force/start location) and
+ * 1..4 forces. The output path must not exist; it is promoted only after one
+ * successful save and native re-open verification. The report buffer is
+ * returned on success and may also contain a structured error on failure. */
+int isom_map_new(
+    const char* output_map_path,
+    const char* starcraft_path,
+    const uint8_t* spec_json,
+    size_t spec_len,
     uint8_t** out_report_json,
     size_t* out_report_len);
 

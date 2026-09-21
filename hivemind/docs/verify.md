@@ -401,3 +401,23 @@ The unconditional static/unit commands at the top MUST cover strict schema-v2 pa
 Real acceptance additionally uses `EUD_AGENT_EUDDRAFT` and `EUD_AGENT_BUILD_MAP` to prove local helper imports and lifecycle hooks, entrypoints before exact EPS MainFile in one frozen process, fresh SCX generation, normalized Python traceback file/line, raw access-violation status, pure/native wheel compatibility where supported, source-repository rejection, online preparation followed by offline verified-cache build, and fail-closed corruption without changing `project.eap`. Python-bearing E3S export must fail explicitly while the existing EPS-only real fixture remains stable.
 
 The panel TypeScript build, complete Vitest suite, and production build are unconditional even when panel files are unchanged.
+Blank-map wizard (2026-09-20): the launcher's **빈 맵으로 새 프로젝트** opens the ordered
+기본 → 지형 → 플레이어 → 완료 dialog. Without a resolvable StarCraft folder the first step shows the
+Korean reason and an in-place **StarCraft 폴더 선택** that must unblock 다음 without reopening the
+dialog; a brush-load failure on the terrain step must disable 다음 and offer **StarCraft 폴더 다시
+선택**. Verify name validation copy, the `maps/<name>.scx` / `build/[EUD]<name>.scx` hint, size
+presets plus free 64..256 input with non-numeric rejection, tileset change re-picking the first
+graphics-valid brush, per-slot type/race/force, the 1..4 force count with per-force name, flags
+and member summary (shrinking moves orphaned slots to the last force), the three quick presets
+(개별 disabled above four players), the start-location preview line (all packed top-left, four per row), busy disabling during creation,
+the preview image/summary on 완료, and **프로젝트 열기** leaving the launcher for environment setup.
+At 960×640 and 1280×800 the dialog must scroll internally with no horizontal overflow.
+
+Current-source evidence: real-engine `isom` tests create and re-verify all eight tilesets and
+reject five invalid specs without writing; `blank_project::tests::creates_a_native_project_around_a_generated_map`
+creates a project under a non-ASCII folder with a Korean name and, with `EUDDRAFT_PATH` and
+`NATIVE_ASSETS_DIR` set, builds `build/[EUD]새 맵.scx` through the real frozen euddraft. Chromium
+with only the Tauri invoke/listen transport mocked walked every wizard step at 1280×800 and
+960×640 with no console errors from app code. The wizard has not been exercised in the actual
+Tauri binary, and the generated map has not been reopened in SCMDraft 2; those remain open.
+
