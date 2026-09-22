@@ -5321,6 +5321,11 @@ mod tests {
         ask_runtime: Arc<Mutex<Option<SessionToolRuntime>>>,
         pub(super) plan_runtime: Option<SessionToolRuntime>,
         acknowledgement_count: Arc<Mutex<usize>>,
+        /// The request whose last native run completed but was not yet
+        /// acknowledged through `acknowledge_persisted`. The production
+        /// runtime refuses to start that request again (its completed receipt
+        /// would look like an unrecovered crash), so the fake does too.
+        unacknowledged_request: Arc<Mutex<Option<String>>>,
         reset_count: Arc<Mutex<usize>>,
         /// The mock's live thread id; `reset_thread` clears it, `seed_thread_id`
         /// sets it, mirroring the production client's thread_id mutex.
@@ -5352,6 +5357,7 @@ mod tests {
                 ask_runtime: Arc::new(Mutex::new(None)),
                 plan_runtime: None,
                 acknowledgement_count: Arc::new(Mutex::new(0)),
+                unacknowledged_request: Arc::new(Mutex::new(None)),
 
                 compiler_contracts: Arc::new(Mutex::new(Vec::new())),
                 reset_count: Arc::new(Mutex::new(0)),
@@ -5475,6 +5481,21 @@ mod tests {
         ) -> crate::provider_runtime::AdapterFuture<'_, RunOutcome> {
             Box::pin(async move {
                 let runtime_session_id = request.identity.session_id.clone();
+                let request_id = request.identity.request_id.clone();
+                if self
+                    .unacknowledged_request
+                    .lock()
+                    .expect("unacknowledged request lock")
+                    .as_deref()
+                    == Some(request_id.as_str())
+                {
+                    // Same refusal as `ProviderRuntime::resolve_native_conversation`.
+                    return RunOutcome::Failed(
+                        crate::provider_runtime::ProviderRuntimeError::Protocol(
+                            "이미 완료된 요청의 저장 복구가 필요합니다. 같은 요청을 자동으로 재실행할 수 없습니다.".into(),
+                        ),
+                    );
+                }
                 let input = request.turn;
                 self.prompts.lock().expect("prompts lock").push(input.text);
                 self.image_paths
@@ -5552,6 +5573,14 @@ mod tests {
                     .expect("scripted turns lock")
                     .pop_front()
                     .expect("fake codex driver needs one scripted result per turn");
+                if !matches!(result, AgentTurnResult::Cancelled) {
+                    // A completed native run persists its receipt; only
+                    // `acknowledge_persisted` retires it.
+                    *self
+                        .unacknowledged_request
+                        .lock()
+                        .expect("unacknowledged request lock") = Some(request_id);
+                }
                 match result {
                     AgentTurnResult::Answer { text } => RunOutcome::Completed {
                         text,
@@ -5758,6 +5787,10 @@ mod tests {
                     .acknowledgement_count
                     .lock()
                     .expect("acknowledgement count lock") += 1;
+                *self
+                    .unacknowledged_request
+                    .lock()
+                    .expect("unacknowledged request lock") = None;
                 Ok(())
             })
         }

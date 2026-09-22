@@ -993,8 +993,13 @@ Answer with a per-step status list (step id — done/partial/skipped and why). A
                 self.workflow_transition(WorkflowStage::ChangesetReview, |_| {})?;
                 return Ok(());
             }
-            // Fix turn on the same request and write ticket.
+            // Fix turn on the same request and write ticket. The completed
+            // executing turn's checkpoint is persisted and its native receipt
+            // acknowledged first, as at an iteration boundary; otherwise the
+            // runtime sees an unacknowledged completed run for this request
+            // and refuses to start it again.
             self.workflow_transition(WorkflowStage::Executing, |_| {})?;
+            self.update_active_session().await;
             let instruction = format!(
                 "[verification]\nThe verifier judged attempt {attempt} as fail. Resolve every item below, run `build_run` after runtime changes, and answer again with the per-step status list:\n{}",
                 unmet
