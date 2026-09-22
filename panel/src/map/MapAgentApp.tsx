@@ -2795,6 +2795,8 @@ export default function MapAgentApp() {
             void handleModelSettingsChange(model, reasoning);
           }}
           onModelSettingsReload={() => void loadModelSettings()}
+          onLocationMention={handleLocationMention}
+          onRegionMention={addRegionMention}
           onMentionSelect={setSelectedMentionId}
           onMentionRemove={(id) => {
             setMentions((chips) => chips.filter((chip) => chip.id !== id));

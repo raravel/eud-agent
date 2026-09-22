@@ -1,5 +1,6 @@
 import {
   useEffect,
+  useMemo,
   useRef,
   useState,
   type ClipboardEvent,
@@ -7,14 +8,17 @@ import {
 } from "react";
 import {
   FileTextIcon,
+  FocusIcon,
   ImageIcon,
   LoaderCircleIcon,
+  MapPinnedIcon,
   PaperclipIcon,
   SendIcon,
   XIcon,
 } from "lucide-react";
 
 import { AgentTurnStatus } from "@/components/AgentTurnStatus";
+import { activeMentionFragment } from "@/components/MentionComposer";
 import { ProviderPromptControls } from "@/components/ProviderPromptControls";
 import {
   PromptInput,
@@ -46,9 +50,16 @@ export interface MapPromptInputProps {
   mentionCount: number;
   hasStaleMentions: boolean;
   draftScope: string;
+  /** Applied once per object identity; later typing is not controlled by it. */
+  draft?: MapPromptDraft | null;
   contextUsage?: ContextUsage | null;
   modelSettings?: SessionModelSettings | null;
   modelSettingsBusy?: boolean;
+  /** `@` completion sources; picking one adds a tray chip through the callbacks below. */
+  locations?: MapLocation[];
+  selections?: SavedSelection[];
+  onLocationMention?(location: MapLocation): void;
+  onRegionMention?(selection: SavedSelection): void;
   onSend(text: string, attachments: ChatAttachment[]): void;
   onCancel(): void;
   onStageAttachment?(file: File): Promise<ChatAttachment>;
@@ -67,9 +78,14 @@ export function MapPromptInput({
   mentionCount,
   hasStaleMentions,
   draftScope,
+  draft,
   contextUsage,
   modelSettings,
   modelSettingsBusy = false,
+  locations = [],
+  selections = [],
+  onLocationMention,
+  onRegionMention,
   onSend,
   onCancel,
   onStageAttachment,
@@ -82,13 +98,69 @@ export function MapPromptInput({
   const [attachmentError, setAttachmentError] = useState<string | null>(null);
   const [staging, setStaging] = useState(false);
   const [dragging, setDragging] = useState(false);
+  const [fragment, setFragment] =
+    useState<ReturnType<typeof activeMentionFragment>>(null);
+  const [activeIndex, setActiveIndex] = useState(0);
   const stagingRef = useRef(false);
   const dragDepth = useRef(0);
   const fileInput = useRef<HTMLInputElement>(null);
+  const textarea = useRef<HTMLTextAreaElement>(null);
+  const composingRef = useRef(false);
+  const dismissedFragmentRef = useRef<string | null>(null);
 
   useEffect(() => {
     setText("");
+    setFragment(null);
   }, [draftScope]);
+
+  useEffect(() => {
+    if (draft === undefined || draft === null) return;
+    setText(draft.text);
+    setAttachments([...draft.attachments]);
+    setAttachmentError(null);
+    setFragment(null);
+    requestAnimationFrame(() => textarea.current?.focus());
+  }, [draft]);
+
+  const mentionSourcesEnabled =
+    onLocationMention !== undefined || onRegionMention !== undefined;
+  const listboxOpen = fragment !== null && mentionSourcesEnabled && !actionBusy;
+  const suggestions = useMemo(
+    () =>
+      listboxOpen && fragment !== null
+        ? mapMentionSuggestions(fragment.query, selections, locations)
+        : [],
+    [fragment, listboxOpen, locations, selections],
+  );
+  const activeSuggestion = suggestions[activeIndex];
+
+  useEffect(() => {
+    setActiveIndex(0);
+  }, [fragment?.key]);
+
+  function updateFragment(value: string, caret: number | null) {
+    if (composingRef.current || caret === null) return;
+    const next = activeMentionFragment(value, caret);
+    if (next?.key === dismissedFragmentRef.current) {
+      setFragment(null);
+      return;
+    }
+    dismissedFragmentRef.current = null;
+    setFragment((current) => (next?.key === current?.key ? current : next));
+  }
+
+  function selectSuggestion(suggestion: MapMentionSuggestion) {
+    if (composingRef.current || fragment === null) return;
+    if (suggestion.kind === "location") onLocationMention?.(suggestion.location);
+    else onRegionMention?.(suggestion.selection);
+    const caret = fragment.start;
+    setText(text.slice(0, fragment.start) + text.slice(fragment.end));
+    setFragment(null);
+    requestAnimationFrame(() => {
+      textarea.current?.focus();
+      textarea.current?.setSelectionRange(caret, caret);
+    });
+  }
 
   const attachmentInputDisabled =
     live || actionBusy || staging || onStageAttachment === undefined;
@@ -166,6 +238,7 @@ export function MapPromptInput({
     if (!canSend || stagingRef.current) return;
     onSend(text, attachments);
     setText("");
+    setFragment(null);
     setAttachments([]);
     setAttachmentError(null);
   }
@@ -277,14 +350,118 @@ export function MapPromptInput({
         )}
         <PromptInputBody>
           <PromptInputTextarea
+            ref={textarea}
+            role="combobox"
+            aria-autocomplete="list"
+            aria-expanded={listboxOpen}
+            aria-controls={listboxOpen ? MENTION_LISTBOX_ID : undefined}
+            aria-activedescendant={
+              listboxOpen && activeSuggestion !== undefined
+                ? `${MENTION_LISTBOX_ID}-option-${activeIndex}`
+                : undefined
+            }
             aria-label="맵 요청 입력"
             value={text}
             disabled={actionBusy}
-            placeholder="예: target 영역 안에 P5 벙커 2개와 어울리는 정글 지형을 구성해줘"
-            onChange={(event) => setText(event.target.value)}
+            placeholder="예: @target 영역 안에 P5 벙커 2개와 어울리는 정글 지형을 구성해줘"
+            onChange={(event) => {
+              setText(event.target.value);
+              updateFragment(event.target.value, event.target.selectionStart);
+            }}
+            onClick={(event) =>
+              updateFragment(event.currentTarget.value, event.currentTarget.selectionStart)
+            }
+            onSelect={(event) =>
+              updateFragment(event.currentTarget.value, event.currentTarget.selectionStart)
+            }
+            onKeyUp={(event) => {
+              if (event.key !== "Escape") {
+                updateFragment(event.currentTarget.value, event.currentTarget.selectionStart);
+              }
+            }}
+            onKeyDown={(event) => {
+              if (composingRef.current || event.nativeEvent.isComposing || !listboxOpen) {
+                return;
+              }
+              if (event.key === "ArrowDown") {
+                event.preventDefault();
+                setActiveIndex((index) =>
+                  suggestions.length === 0 ? 0 : (index + 1) % suggestions.length,
+                );
+              } else if (event.key === "ArrowUp") {
+                event.preventDefault();
+                setActiveIndex((index) =>
+                  suggestions.length === 0
+                    ? 0
+                    : (index - 1 + suggestions.length) % suggestions.length,
+                );
+              } else if (event.key === "Enter") {
+                event.preventDefault();
+                if (activeSuggestion !== undefined) selectSuggestion(activeSuggestion);
+              } else if (event.key === "Escape") {
+                event.preventDefault();
+                dismissedFragmentRef.current = fragment?.key ?? null;
+                setFragment(null);
+              }
+            }}
+            onCompositionStart={() => {
+              composingRef.current = true;
+              setFragment(null);
+            }}
+            onCompositionEnd={(event) => {
+              composingRef.current = false;
+              updateFragment(event.currentTarget.value, event.currentTarget.selectionStart);
+            }}
             onPaste={handlePaste}
           />
         </PromptInputBody>
+        {listboxOpen && (
+          <div
+            id={MENTION_LISTBOX_ID}
+            role="listbox"
+            aria-label="맵 멘션 검색 결과"
+            className="mx-2 mb-1 max-h-56 w-[calc(100%-1rem)] overflow-y-auto rounded-md border border-border bg-popover p-1 text-popover-foreground shadow-lg"
+          >
+            {suggestions.length === 0 ? (
+              <p role="status" className="px-2 py-2 text-xs text-muted-foreground">
+                {selections.length === 0 && locations.length === 0
+                  ? "멘션할 저장 영역이나 로케이션이 없습니다. 캔버스에서 영역을 선택해 저장하세요."
+                  : "일치하는 저장 영역이나 로케이션이 없습니다."}
+              </p>
+            ) : (
+              suggestions.map((suggestion, index) => (
+                <div
+                  id={`${MENTION_LISTBOX_ID}-option-${index}`}
+                  key={suggestion.key}
+                  role="option"
+                  aria-selected={index === activeIndex}
+                  data-mention-kind={suggestion.kind}
+                  className={cn(
+                    "flex cursor-pointer items-start gap-2 rounded px-2 py-2 text-sm",
+                    index === activeIndex ? "bg-accent" : "hover:bg-accent/60",
+                  )}
+                  onMouseDown={(event) => event.preventDefault()}
+                  onMouseEnter={() => setActiveIndex(index)}
+                  onClick={() => selectSuggestion(suggestion)}
+                >
+                  <span className="mt-0.5 shrink-0 text-emerald-400">
+                    {suggestion.kind === "region" ? (
+                      <MapPinnedIcon aria-hidden className="size-3.5" />
+                    ) : (
+                      <FocusIcon aria-hidden className="size-3.5" />
+                    )}
+                  </span>
+                  <span className="min-w-0">
+                    <span className="block truncate font-medium">@{suggestion.label}</span>
+                    <span className="block truncate text-xs text-muted-foreground">
+                      {suggestion.detail}
+                    </span>
+                  </span>
+                </div>
+              ))
+            )}
+          </div>
+        )}
         <PromptInputFooter className="flex-wrap gap-2">
           <PromptInputTools className="min-w-0 flex-1 flex-wrap">
             {onStageAttachment !== undefined && (

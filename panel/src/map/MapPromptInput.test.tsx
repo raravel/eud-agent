@@ -4,6 +4,7 @@ import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 
 import { MapPromptInput } from "./MapPromptInput";
+import type { MapLocation, SavedSelection } from "./mapProtocol";
 import type { TurnState } from "@/state/store";
 
 const noop = () => {};
@@ -56,6 +57,28 @@ const contextUsage = {
   modelContextWindow: 128_000,
 };
 
+const targetSelection: SavedSelection = {
+  id: "sel-1",
+  label: "영역 1",
+  role: "target",
+  sourceRevision: "r1",
+  layers: ["terrain"],
+  bounds: [0, 0, 4, 4],
+  selectedCells: 16,
+  rows: [],
+  snapshotHash: "hash-1",
+};
+const spawnLocation: MapLocation = {
+  id: 3,
+  name: "Spawn",
+  left: 0,
+  top: 0,
+  right: 64,
+  bottom: 64,
+  tileRect: [0, 0, 2, 2],
+  elevationFlags: 0,
+};
+
 function renderInput(
   props: Partial<ComponentProps<typeof MapPromptInput>> = {},
 ) {
@@ -82,7 +105,7 @@ describe("MapPromptInput — AI Elements composer", () => {
       onModelSettingsChange: noop,
     });
     await user.type(
-      screen.getByRole("textbox", { name: "맵 요청 입력" }),
+      screen.getByRole("combobox", { name: "맵 요청 입력" }),
       "지형을 수정해 줘",
     );
 
@@ -106,7 +129,7 @@ describe("MapPromptInput — AI Elements composer", () => {
     const onSend = vi.fn();
     renderInput({ onSend });
 
-    const input = screen.getByRole("textbox", { name: "맵 요청 입력" });
+    const input = screen.getByRole("combobox", { name: "맵 요청 입력" });
     await user.type(input, "정글 지형으로 바꿔줘");
     expect(input).toHaveValue("정글 지형으로 바꿔줘");
 
@@ -121,7 +144,7 @@ describe("MapPromptInput — AI Elements composer", () => {
     const { rerender } = renderInput({
       draftScope: "session-a|project-a|source-a",
     });
-    const input = screen.getByRole("textbox", { name: "맵 요청 입력" });
+    const input = screen.getByRole("combobox", { name: "맵 요청 입력" });
     await user.type(input, "아직 보내지 않은 요청");
 
     rerender(
@@ -191,7 +214,7 @@ describe("MapPromptInput — AI Elements composer", () => {
     const pasted = new File(["png!"], "clipboard.png", {
       type: "image/png",
     });
-    fireEvent.paste(screen.getByRole("textbox", { name: "맵 요청 입력" }), {
+    fireEvent.paste(screen.getByRole("combobox", { name: "맵 요청 입력" }), {
       clipboardData: { files: [pasted] },
     });
     await screen.findByText("clipboard.png");
@@ -225,9 +248,106 @@ describe("MapPromptInput — AI Elements composer", () => {
     expect(screen.getByTestId("active-turn-status")).toHaveTextContent(
       "도구 실행 중 · map_status",
     );
-    expect(screen.getByRole("textbox", { name: "맵 요청 입력" })).toBeEnabled();
+    expect(screen.getByRole("combobox", { name: "맵 요청 입력" })).toBeEnabled();
 
     await user.click(stop);
     expect(onCancel).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("MapPromptInput — `@` map mentions", () => {
+  it("offers saved selections and locations on `@` and adds the pick as a tray chip", async () => {
+    const user = userEvent.setup();
+    const onRegionMention = vi.fn();
+    const onLocationMention = vi.fn();
+    renderInput({
+      selections: [targetSelection],
+      locations: [spawnLocation],
+      onRegionMention,
+      onLocationMention,
+    });
+    const input = screen.getByRole("combobox", { name: "맵 요청 입력" });
+    expect(input).toHaveAttribute("aria-expanded", "false");
+
+    await user.type(input, "@");
+    const listbox = screen.getByRole("listbox", { name: "맵 멘션 검색 결과" });
+    expect(input).toHaveAttribute("aria-expanded", "true");
+    expect(listbox).toHaveTextContent("@target:영역 1");
+    expect(listbox).toHaveTextContent("@location:#3 Spawn");
+
+    await user.type(input, "tar");
+    expect(screen.getAllByRole("option")).toHaveLength(1);
+    await user.click(screen.getByRole("option", { name: /target:영역 1/ }));
+
+    expect(onRegionMention).toHaveBeenCalledWith(targetSelection);
+    expect(onLocationMention).not.toHaveBeenCalled();
+    expect(input).toHaveValue("");
+    expect(screen.queryByRole("listbox")).toBeNull();
+  });
+
+  it("picks a location with the keyboard and keeps the surrounding text", async () => {
+    const user = userEvent.setup();
+    const onLocationMention = vi.fn();
+    const onSend = vi.fn();
+    renderInput({
+      selections: [targetSelection],
+      locations: [spawnLocation],
+      onRegionMention: noop,
+      onLocationMention,
+      onSend,
+    });
+    const input = screen.getByRole("combobox", { name: "맵 요청 입력" });
+
+    await user.type(input, "여기 @spa");
+    expect(screen.getByRole("option", { name: /location:#3 Spawn/ })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+    await user.keyboard("{Enter}");
+
+    expect(onLocationMention).toHaveBeenCalledWith(spawnLocation);
+    expect(onSend).not.toHaveBeenCalled();
+    expect(input).toHaveValue("여기 ");
+
+    await user.type(input, "에 벙커");
+    expect(screen.queryByRole("listbox")).toBeNull();
+  });
+
+  it("closes on Escape until the fragment changes and reports no match", async () => {
+    const user = userEvent.setup();
+    renderInput({
+      selections: [targetSelection],
+      onRegionMention: noop,
+      onLocationMention: noop,
+    });
+    const input = screen.getByRole("combobox", { name: "맵 요청 입력" });
+
+    await user.type(input, "@");
+    expect(screen.getByRole("listbox", { name: "맵 멘션 검색 결과" })).toBeInTheDocument();
+    await user.keyboard("{Escape}");
+    expect(screen.queryByRole("listbox")).toBeNull();
+
+    await user.type(input, "zz");
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "일치하는 저장 영역이나 로케이션이 없습니다.",
+    );
+  });
+
+  it("explains an empty catalog instead of an empty list", async () => {
+    const user = userEvent.setup();
+    renderInput({ onRegionMention: noop, onLocationMention: noop });
+    await user.type(screen.getByRole("combobox", { name: "맵 요청 입력" }), "@");
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "멘션할 저장 영역이나 로케이션이 없습니다. 캔버스에서 영역을 선택해 저장하세요.",
+    );
+  });
+
+  it("stays a plain textarea when no mention source is wired", async () => {
+    const user = userEvent.setup();
+    renderInput();
+    const input = screen.getByRole("combobox", { name: "맵 요청 입력" });
+    await user.type(input, "@target");
+    expect(screen.queryByRole("listbox")).toBeNull();
+    expect(input).toHaveValue("@target");
   });
 });

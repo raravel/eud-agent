@@ -12,6 +12,7 @@ import type {
 import type { AskAnswer, AskQuestion } from "@/lib/protocol";
 import type { LogEntry, TurnState } from "@/state/store";
 import type {
+  MapLocation,
   MapMentionSnapshot,
   MentionChip,
   MentionQualifiers,
@@ -56,6 +57,8 @@ export interface MapAgentPanelProps {
     reasoning: ReasoningSelection | undefined,
   ): void;
   onModelSettingsReload?(): void;
+  onLocationMention?(location: MapLocation): void;
+  onRegionMention?(selection: SavedSelection): void;
   onMentionSelect(id: string): void;
   onMentionRemove(id: string): void;
   onMentionFind(id: string): void;
