@@ -8094,7 +8094,7 @@ mod tests {
         );
     }
     #[test]
-    fn system_prompt_places_authoritative_build_before_runtime_tests() {
+    fn system_prompt_keeps_build_authoritative_without_runtime_trace_tools() {
         let prompt = build_system_prompt(
             "Change mutually dependent eps files",
             &sample_hits(),
@@ -8102,20 +8102,16 @@ mod tests {
             None,
             None,
         );
-        let build = prompt.find("[build]").unwrap();
-        let trace_test = prompt.find("[runtime trace tests]").unwrap();
-        assert!(build < trace_test);
-        assert!(prompt.contains("eudAgentTestSetup"));
-        assert!(prompt.contains("failed/inconclusive never blocks review"));
-        assert!(prompt.contains("src/tests/**/*.tests.eps"));
-        assert!(prompt.contains("trace_suite_run({})"));
-        assert!(prompt.contains("outside the configured MainFile's production import graph"));
-        assert!(prompt.contains("trace_test_run` remains available only"));
-        assert!(prompt.contains("Create the owned client suspended"));
-        assert!(prompt.contains("foreground/focus/cursor user32 entrypoints"));
-        assert!(prompt.contains("Targeted `PostMessageW`"));
-        assert!(prompt.contains("focus fallback are forbidden"));
-        assert!(prompt.contains("complete structured result"));
+        assert!(prompt.contains("[build]"));
+        assert!(prompt
+            .contains("warnings (for example euddraft null-tile replacement) never fail a build"));
+        assert!(prompt.contains("page the complete log with build_log_read"));
+        // The StarCraft trace harness is not a model tool: the prompt never
+        // names it, so the model never calls an unregistered tool.
+        assert!(!prompt.contains("[runtime trace tests]"));
+        assert!(!prompt.contains("trace_suite_run"));
+        assert!(!prompt.contains("trace_test_run"));
+        assert!(!prompt.contains("eudAgentTestSetup"));
         assert!(!prompt.contains("eps_check"));
         assert!(!prompt.contains("build_errors"));
     }
@@ -8138,13 +8134,11 @@ mod tests {
         let epscript = cold.find("[epscript]").unwrap();
         let architecture = cold.find("[eps project architecture]").unwrap();
         let build = cold.find("[build]").unwrap();
-        let trace_test = cold.find("[runtime trace tests]").unwrap();
         let reference = cold.find("[reference context]").unwrap();
         assert!(first_principles < epscript);
         assert!(epscript < architecture);
         assert!(architecture < build);
-        assert!(build < trace_test);
-        assert!(trace_test < reference);
+        assert!(build < reference);
         assert!(architecture < reference);
 
         assert!(!resumed.contains(EPS_PROJECT_ARCHITECTURE_GUIDE));

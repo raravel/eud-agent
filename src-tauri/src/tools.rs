@@ -7731,6 +7731,22 @@ mod tests {
     }
 
     #[test]
+    fn runtime_trace_harness_is_not_an_advertised_tool() {
+        // The StarCraft trace harness cannot reach gameplay on the hidden
+        // desktop yet, so neither the EPS nor the Map registry offers it.
+        for descriptor in mcp_tool_descriptors()
+            .iter()
+            .chain(map_mcp_tool_descriptors().iter())
+        {
+            let name = descriptor["name"].as_str().unwrap_or_default();
+            assert!(
+                !name.starts_with("trace_"),
+                "{name} must not be advertised to the model"
+            );
+        }
+    }
+
+    #[test]
     fn mcp_advertisement_uses_real_input_schema_names_verbatim() {
         let descriptors = mcp_tool_descriptors();
         let dat_patch = descriptors

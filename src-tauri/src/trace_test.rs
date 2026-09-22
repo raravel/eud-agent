@@ -6,6 +6,10 @@
 //! that exact process. The connected source map and editor project are read-only.
 //! The x86 helper renames the client's single-instance object per test PID, so
 //! the harness runs beside the user's own game without touching that process.
+//!
+//! The harness is not an agent tool: `trace_test_run`/`trace_suite_run` are not
+//! registered in `tools`, no prompt names them, and only the ignored live tests
+//! drive this module until map selection works on the hidden desktop.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
@@ -66,13 +70,13 @@ pub struct TraceSuiteInput {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct PersistentTraceTest {
+pub struct PersistentTraceTest {
     pub path: String,
     pub code: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct PersistentTraceSelection {
+pub struct PersistentTraceSelection {
     pub discovered: Vec<String>,
     pub tests: Vec<PersistentTraceTest>,
 }
@@ -291,7 +295,7 @@ pub fn validate_input(input: &TraceTestInput) -> Result<(), String> {
     Ok(())
 }
 
-pub(crate) fn select_persistent_tests(
+pub fn select_persistent_tests(
     snapshot: &NativeSourceSnapshot,
     input: &TraceSuiteInput,
 ) -> Result<PersistentTraceSelection, String> {
@@ -382,7 +386,7 @@ fn is_persistent_test_path(path: &str) -> bool {
     path.starts_with(PERSISTENT_TEST_ROOT) && path.ends_with(PERSISTENT_TEST_SUFFIX)
 }
 
-pub(crate) fn run_suite(
+pub fn run_suite(
     dirs: &DataDirs,
     source_eds: &Path,
     euddraft: &EuddraftLaunch,

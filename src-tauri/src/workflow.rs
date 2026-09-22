@@ -486,22 +486,10 @@ pub fn plan_schema() -> Value {
                 }
             },
             "buildRequired": { "type": "boolean" },
-            "tests": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "path": { "type": "string" },
-                        "scenario": { "type": "string" }
-                    },
-                    "required": ["path", "scenario"],
-                    "additionalProperties": false
-                }
-            },
             "risks": string_array(),
             "outOfScope": string_array()
         },
-        "required": ["title", "goal", "acceptanceCriteria", "steps", "buildRequired", "tests", "risks", "outOfScope"],
+        "required": ["title", "goal", "acceptanceCriteria", "steps", "buildRequired", "risks", "outOfScope"],
         "additionalProperties": false
     })
 }
@@ -596,19 +584,38 @@ pub fn verifier_schema() -> Value {
                 "required": ["ok"],
                 "additionalProperties": false
             },
-            "tests": {
-                "type": "object",
-                "properties": {
-                    "passed": { "type": "integer" },
-                    "failed": { "type": "integer" },
-                    "inconclusive": { "type": "integer" }
-                },
-                "required": ["passed", "failed", "inconclusive"],
-                "additionalProperties": false
-            },
             "summary": { "type": "string" }
         },
-        "required": ["verdict", "criteria", "stepStatus", "build", "tests", "summary"],
+        "required": ["verdict", "criteria", "stepStatus", "build", "summary"],
+        "additionalProperties": false
+    })
+}
+
+/// The fixed `delegate_read` result: a summary plus located findings. It is
+/// what the parent receives as its tool result, verbatim.
+pub fn read_delegation_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "summary": { "type": "string" },
+            "findings": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string" },
+                        "line": { "type": "integer" },
+                        "excerpt": { "type": "string" },
+                        "note": { "type": "string" }
+                    },
+                    "required": ["note"],
+                    "additionalProperties": false
+                }
+            },
+            "openQuestions": string_array(),
+            "toolCalls": { "type": "integer" }
+        },
+        "required": ["summary", "findings", "openQuestions", "toolCalls"],
         "additionalProperties": false
     })
 }
@@ -763,20 +770,9 @@ pub fn render_plan(request_id: &str, revision: u32, value: &Value) -> String {
         .and_then(Value::as_bool)
         .unwrap_or(true);
     out.push_str(&format!(
-        "## 빌드와 테스트\n\n- build_run 필요: {}\n",
+        "## 빌드\n\n- build_run 필요: {}\n",
         if build_required { "예" } else { "아니오" }
     ));
-    let tests = objects(value, "tests");
-    if tests.is_empty() {
-        out.push_str("- 테스트: (none)\n");
-    }
-    for test in tests {
-        out.push_str(&format!(
-            "- 테스트 `{}`: {}\n",
-            text(test, "path"),
-            text(test, "scenario")
-        ));
-    }
     bullet_section(&mut out, "위험", &strings(value, "risks"));
     bullet_section(&mut out, "범위 밖", &strings(value, "outOfScope"));
     out
@@ -859,21 +855,14 @@ pub fn render_verdict(request_id: &str, attempt: u8, value: &Value) -> String {
         ));
     }
     let build = value.get("build").cloned().unwrap_or(Value::Null);
-    let tests = value.get("tests").cloned().unwrap_or(Value::Null);
     out.push_str(&format!(
-        "\n## 빌드와 테스트\n\n- 빌드 성공: {}{}\n- 테스트: 통과 {}, 실패 {}, 미확정 {}\n",
+        "\n## 빌드\n\n- 빌드 성공: {}{}\n",
         build.get("ok").and_then(Value::as_bool).unwrap_or(false),
         build
             .get("revision")
             .and_then(Value::as_str)
             .map(|revision| format!(" (revision {revision})"))
             .unwrap_or_default(),
-        tests.get("passed").and_then(Value::as_u64).unwrap_or(0),
-        tests.get("failed").and_then(Value::as_u64).unwrap_or(0),
-        tests
-            .get("inconclusive")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
     ));
     out
 }
@@ -929,7 +918,7 @@ pub struct StageContext<'a> {
     pub clarifications: &'a [String],
 }
 
-const SUBMIT_RULE: &str = "Finish by calling `submit_result` exactly once with a value that matches its schema. Write every user-facing text field in Korean. Only the tools offered to this run exist: `build_run`, `trace_suite_run`, and every write tool are absent unless listed; never call a tool that is not offered; never edit files.";
+const SUBMIT_RULE: &str = "Finish by calling `submit_result` exactly once with a value that matches its schema. Write every user-facing text field in Korean. Only the tools offered to this run exist: `build_run` and every write tool are absent unless listed; never call a tool that is not offered; never edit files.";
 
 fn clarification_section(clarifications: &[String]) -> String {
     if clarifications.is_empty() {
@@ -994,8 +983,8 @@ pub fn planner_prompt(
 [plan rules]\n\
 - Every step names its files, the exact change, and how that step is verified. Order steps by dependency.\n\
 - Keep MainFile as the composition root; place cohesive logic in focused modules; keep imports acyclic; batch mutually dependent edits into one step.\n\
-- Set buildRequired to true whenever source, DAT, plugins, or Python change. List permanent tests under `src/tests/**/*.tests.eps` for deterministic contracts.\n\
-- acceptanceCriteria must be checkable from project state, build output, or test output.\n\
+- Set buildRequired to true whenever source, DAT, plugins, or Python change.\n\
+- acceptanceCriteria must be checkable from project state or build output.\n\
 - Cite documentation from the research; do not invent sources.\n\
 {SUBMIT_RULE}\n\n[research]\n{}\n",
         triage.goal,
@@ -1071,7 +1060,6 @@ pub struct VerifierInputs<'a> {
     pub plan_markdown: &'a str,
     pub changeset_summary: &'a str,
     pub build_result: &'a str,
-    pub trace_results: &'a str,
     pub executor_answer: &'a str,
     pub revision: &'a str,
 }
@@ -1083,20 +1071,19 @@ pub fn verifier_prompt(
     attempt: u8,
 ) -> String {
     format!(
-        "[role]\nYou verify one implemented change in the native EUD project against its approved plan and acceptance criteria. This is attempt {attempt}. Read the changed files, and run `build_run` and `trace_suite_run` when the plan requires a build or tests. Do not change anything.\n\n\
+        "[role]\nYou verify one implemented change in the native EUD project against its approved plan and acceptance criteria. This is attempt {attempt}. Read the changed files, and run `build_run` when the plan requires a build. Do not change anything.\n\n\
 [goal]\n{}\n\n[acceptance criteria]\n{}\n\n\
 [judgement]\n\
-- Mark each criterion met only with concrete evidence from files, build output, or test output; unverifiable when no evidence can exist.\n\
+- Mark each criterion met only with concrete evidence from files or build output; unverifiable when no evidence can exist.\n\
 - Mark each plan step done, partial, or missing from the changeset and files.\n\
 - Verdict `pass` only when every criterion is met, every step is done, and the build succeeded for revision {} when required.\n\
-{SUBMIT_RULE}\n\n[approved plan]\n{}\n\n[changeset]\n{}\n\n[last build_run]\n{}\n\n[trace results]\n{}\n\n[executor answer]\n{}\n\n{}\n\n{}",
+{SUBMIT_RULE}\n\n[approved plan]\n{}\n\n[changeset]\n{}\n\n[last build_run]\n{}\n\n[executor answer]\n{}\n\n{}\n\n{}",
         triage.goal,
         bullets(&triage.acceptance_criteria),
         inputs.revision,
         inputs.plan_markdown,
         inputs.changeset_summary,
         inputs.build_result,
-        inputs.trace_results,
         inputs.executor_answer,
         context.guides,
         context.project
@@ -1200,7 +1187,7 @@ mod tests {
             ),
             (
                 DelegatedRunKind::Planner,
-                json!({"title": "t", "goal": "g", "acceptanceCriteria": ["a"], "steps": [{"id": "S1", "title": "x", "files": ["src/main.eps"], "change": "c", "verification": "v"}], "buildRequired": true, "tests": [], "risks": [], "outOfScope": []}),
+                json!({"title": "t", "goal": "g", "acceptanceCriteria": ["a"], "steps": [{"id": "S1", "title": "x", "files": ["src/main.eps"], "change": "c", "verification": "v"}], "buildRequired": true, "risks": [], "outOfScope": []}),
             ),
             (
                 DelegatedRunKind::Critic,
@@ -1212,7 +1199,11 @@ mod tests {
             ),
             (
                 DelegatedRunKind::Verifier,
-                json!({"verdict": "fail", "criteria": [{"text": "a", "status": "unmet", "evidence": "e"}], "stepStatus": [{"id": "S1", "status": "partial"}], "build": {"ok": false}, "tests": {"passed": 0, "failed": 0, "inconclusive": 0}, "summary": "s"}),
+                json!({"verdict": "fail", "criteria": [{"text": "a", "status": "unmet", "evidence": "e"}], "stepStatus": [{"id": "S1", "status": "partial"}], "build": {"ok": false}, "summary": "s"}),
+            ),
+            (
+                DelegatedRunKind::Read,
+                json!({"summary": "s", "findings": [{"path": "src/main.eps", "line": 3, "excerpt": "x", "note": "n"}, {"note": "unlocated"}], "openQuestions": [], "toolCalls": 2}),
             ),
         ];
         for (kind, value) in cases {
@@ -1221,9 +1212,77 @@ mod tests {
         }
         assert!(crate::provider_tool_loop::validate_structured_output(
             &plan_schema(),
-            &json!({"title": "t", "goal": "g", "acceptanceCriteria": [], "steps": [], "buildRequired": true, "tests": [], "risks": [], "outOfScope": []})
+            &json!({"title": "t", "goal": "g", "acceptanceCriteria": [], "steps": [], "buildRequired": true, "risks": [], "outOfScope": []})
         )
         .is_err(), "a plan needs at least one step");
+    }
+
+    #[test]
+    fn triage_routes_map_placement_requests_direct_to_the_map_handoff() {
+        let state = WorkflowState::new(
+            "req".into(),
+            "turn".into(),
+            "rev".into(),
+            "전부 공허 지형으로 만들어줘".into(),
+            false,
+            0,
+        );
+        let context = StageContext {
+            guides: "",
+            project: "[project state]",
+            user_text: &state.user_text,
+            clarifications: &state.clarifications,
+        };
+        let prompt = triage_prompt(&context, 2);
+        assert!(prompt.contains("map placement only"));
+        assert!(prompt.contains("map_task_request"));
+        assert!(prompt.contains("choose pipeline only when it also needs EPS code"));
+    }
+
+    #[test]
+    fn read_delegation_is_one_parent_tool_call_over_exploration_reads() {
+        // The child settles inside the native MCP call ceiling and never sees
+        // build, dependency, ask, plan, or nested delegation tools.
+        let policy = stage_policy(DelegatedRunKind::Read);
+        assert_eq!(
+            policy.active_deadline,
+            Some(crate::tools::DELEGATE_READ_TIMEOUT)
+        );
+        assert!(policy.active_deadline < Some(STAGE_DEADLINE));
+        assert!(!policy.allow_resume);
+        let tools = stage_tools(DelegatedRunKind::Read);
+        for absent in [
+            "build_run",
+            "python_dependencies_prepare",
+            "ask",
+            "propose_plan",
+            crate::tools::DELEGATE_READ_TOOL,
+        ] {
+            assert!(
+                !tools.contains(&absent),
+                "{absent} must stay out of the child"
+            );
+        }
+        for present in [
+            "source_search",
+            "read_file",
+            "docs_get",
+            "map_info",
+            "map_minimap",
+        ] {
+            assert!(tools.contains(&present), "{present} is exploration");
+        }
+        assert!(crate::provider_tool_loop::validate_structured_output(
+            &read_delegation_schema(),
+            &json!({"summary": "s", "findings": [{"path": "p"}], "openQuestions": [], "toolCalls": 1})
+        )
+        .is_err(), "every finding carries a note");
+        let prompt = read_delegation_prompt("where is P1 hp", &["src/main.eps".to_string()]);
+        assert!(prompt.contains("[goal]\nwhere is P1 hp"));
+        assert!(prompt.contains("[focus]\n- src/main.eps"));
+        assert!(prompt.contains("not mutation evidence"));
+        assert!(prompt.contains("submit_result"));
+        assert!(read_delegation_prompt("g", &[]).contains("[focus]\n(none)"));
     }
 
     #[test]
@@ -1246,19 +1305,20 @@ mod tests {
             "title": "웨이브", "goal": "g", "acceptanceCriteria": ["a1"],
             "steps": [{"id": "S1", "title": "모듈", "files": ["src/wave.eps"], "change": "c", "verification": "v", "dependsOn": []},
                       {"id": "S2", "title": "import", "files": ["src/main.eps"], "change": "c2", "verification": "v2", "dependsOn": ["S1"]}],
-            "buildRequired": true, "tests": [{"path": "src/tests/wave.tests.eps", "scenario": "s"}],
+            "buildRequired": true,
             "risks": ["r"], "outOfScope": []
         });
         let rendered = render_plan("req-1", 2, &plan);
         assert!(rendered.starts_with("# 웨이브\n\n요청: `req-1` · 개정 2"));
         assert!(rendered.contains("### S2 — import\n\n- 파일: `src/main.eps`\n- 선행: S1\n"));
-        assert!(rendered.contains("- 테스트 `src/tests/wave.tests.eps`: s"));
+        assert!(rendered.contains("## 빌드\n\n- build_run 필요: 예\n"));
+        assert!(!rendered.contains("테스트"));
 
         let verdict = json!({
             "verdict": "fail", "summary": "요약",
             "criteria": [{"text": "a1", "status": "met", "evidence": "e"}, {"text": "a2", "status": "unmet", "evidence": "missing"}],
             "stepStatus": [{"id": "S1", "status": "done"}, {"id": "S2", "status": "missing", "note": "no import"}],
-            "build": {"ok": true, "revision": "abc"}, "tests": {"passed": 1, "failed": 0, "inconclusive": 0}
+            "build": {"ok": true, "revision": "abc"}
         });
         let rendered = render_verdict("req-1", 1, &verdict);
         assert!(rendered.contains("판정: **fail**"));
@@ -1269,7 +1329,7 @@ mod tests {
             "verdict": "fail", "summary": "s",
             "criteria": [{"text": "gameplay", "status": "unverifiable", "evidence": "needs a game"}],
             "stepStatus": [{"id": "S1", "status": "done"}],
-            "build": {"ok": true}, "tests": {"passed": 0, "failed": 0, "inconclusive": 0}
+            "build": {"ok": true}
         });
         assert!(verdict_unmet(&unverifiable).is_empty());
         assert_eq!(

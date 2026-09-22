@@ -55,7 +55,6 @@ fn plan(title: &str) -> DelegatedRunOutcome {
             {"id": "S2", "title": "import", "files": ["src/main.eps"], "change": "import wave", "verification": "build", "dependsOn": ["S1"]}
         ],
         "buildRequired": true,
-        "tests": [],
         "risks": [],
         "outOfScope": []
     }))
@@ -75,7 +74,6 @@ fn verdict(value: &str) -> DelegatedRunOutcome {
         "criteria": [{"text": "1분마다 웨이브가 오른다", "status": if value == "pass" { "met" } else { "unmet" }, "evidence": "wave.eps"}],
         "stepStatus": [{"id": "S1", "status": "done"}, {"id": "S2", "status": if value == "pass" { "done" } else { "missing" }, "note": "no import"}],
         "build": {"ok": true, "revision": "r1"},
-        "tests": {"passed": 0, "failed": 0, "inconclusive": 0},
         "summary": if value == "pass" { "충족" } else { "S2 누락" }
     }))
 }

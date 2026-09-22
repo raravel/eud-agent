@@ -915,7 +915,6 @@ impl SessionToolRuntime {
         *self.pending_plan.lock() = None;
         *self.last_build.lock() = None;
         *self.last_build_result.lock() = None;
-        *self.last_trace_result.lock() = None;
         *self.sound_build_required.lock() = false;
         Ok(())
     }
@@ -1167,11 +1166,6 @@ impl SessionToolRuntime {
     /// The latest complete `build_run` result JSON of this request.
     pub fn last_build_result(&self) -> Option<Value> {
         self.last_build_result.lock().clone()
-    }
-
-    /// The latest `trace_suite_run`/`trace_test_run` result JSON of this request.
-    pub fn last_trace_result(&self) -> Option<Value> {
-        self.last_trace_result.lock().clone()
     }
 
     pub fn sound_build_required(&self) -> bool {
@@ -2188,77 +2182,6 @@ impl SessionToolRuntime {
                 if let Some(reason) = no_progress_reason {
                     return Err(reason);
                 }
-                Ok(value)
-            }
-            tools::TRACE_TEST_RUN_TOOL => {
-                let Some(build) = self.last_build.lock().clone() else {
-                    return Err(
-                        "trace_test_run requires build_run in the current request".to_string()
-                    );
-                };
-                if !build.ok {
-                    return Err(
-                        "trace_test_run requires the current request's latest build_run to succeed"
-                            .to_string(),
-                    );
-                }
-                let input: crate::trace_test::TraceTestInput = serde_json::from_value(args.clone())
-                    .map_err(|error| format!("invalid trace_test_run arguments: {error}"))?;
-                let (eds_path, euddraft, starcraft_setting, _) =
-                    native_trace_runtime(&self.services)?;
-                let result = crate::trace_test::run(
-                    &self.services.dirs,
-                    &eds_path,
-                    &euddraft,
-                    &starcraft_setting,
-                    input,
-                    |phase| {
-                        self.emit_progress(crate::ipc::ProgressStage::TraceTest, phase.as_str());
-                    },
-                )?;
-                let detail = format!("done:{}", result.status.as_str());
-                self.emit_progress(crate::ipc::ProgressStage::TraceTest, &detail);
-                let value = serde_json::to_value(result)
-                    .map_err(|error| format!("failed to serialize trace test result: {error}"))?;
-                *self.last_trace_result.lock() = Some(value.clone());
-                Ok(value)
-            }
-            tools::TRACE_SUITE_RUN_TOOL => {
-                let Some(build) = self.last_build.lock().clone() else {
-                    return Err(
-                        "trace_suite_run requires build_run in the current request".to_string()
-                    );
-                };
-                if !build.ok {
-                    return Err(
-                        "trace_suite_run requires the current request's latest build_run to succeed"
-                            .to_string(),
-                    );
-                }
-                let input: crate::trace_test::TraceSuiteInput =
-                    serde_json::from_value(args.clone())
-                        .map_err(|error| format!("invalid trace_suite_run arguments: {error}"))?;
-                self.emit_progress(crate::ipc::ProgressStage::TraceTest, "discover");
-                let (eds_path, euddraft, starcraft_setting, snapshot) =
-                    native_trace_runtime(&self.services)?;
-                let timeout_ms = input.timeout_ms;
-                let selection = crate::trace_test::select_persistent_tests(&snapshot, &input)?;
-                let result = crate::trace_test::run_suite(
-                    &self.services.dirs,
-                    &eds_path,
-                    &euddraft,
-                    &starcraft_setting,
-                    selection,
-                    timeout_ms,
-                    |phase| {
-                        self.emit_progress(crate::ipc::ProgressStage::TraceTest, phase.as_str());
-                    },
-                )?;
-                let detail = format!("done:{}", result.status.as_str());
-                self.emit_progress(crate::ipc::ProgressStage::TraceTest, &detail);
-                let value = serde_json::to_value(result)
-                    .map_err(|error| format!("failed to serialize trace suite result: {error}"))?;
-                *self.last_trace_result.lock() = Some(value.clone());
                 Ok(value)
             }
             "location_write" => {
@@ -4517,38 +4440,6 @@ fn numeric_json_value(value: &Value) -> Result<i64, String> {
         .ok_or_else(|| "DAT value must be an integer or numeric string".to_string())
 }
 
-fn native_trace_runtime(
-    services: &ToolServices,
-) -> Result<
-    (
-        PathBuf,
-        crate::native_build::EuddraftLaunch,
-        PathBuf,
-        crate::native_project::NativeSourceSnapshot,
-    ),
-    String,
-> {
-    let project = services.native.open()?;
-    let snapshot = project.source_snapshot()?;
-    let artifacts =
-        crate::native_build::generate_native_build(&project, &services.dirs.native_assets_dir())?;
-    let config = services
-        .dirs
-        .load_config()
-        .map_err(|error| format!("failed to load native trace settings: {error}"))?;
-    let euddraft_path = PathBuf::from(config.euddraft_path.trim());
-    let euddraft = crate::native_build::EuddraftLaunch::resolve(&euddraft_path)?;
-    // Share the map-context resolution so an unset/blank config still finds the
-    // standard StarCraft install instead of failing on `Path::new("").parent()`.
-    let starcraft = crate::map_context::resolve_starcraft_path(&services.dirs)?;
-    Ok((
-        PathBuf::from(artifacts.eds_path),
-        euddraft,
-        starcraft,
-        snapshot,
-    ))
-}
-
 fn load_rag(dirs: &DataDirs) -> Rag {
     let index_path = dirs.rag_dir().join(crate::bootstrap::RAG_INDEX_FILENAME);
     let cache_dir = Some(dirs.models_dir());
@@ -4829,42 +4720,6 @@ mod tests {
             .execute("project_status", &json!({}))
             .expect_err("a tool call outside a turn must be rejected");
         assert!(error.contains("no agent request is open"), "got: {error}");
-    }
-
-    #[test]
-    fn trace_runtime_tools_require_current_successful_build_before_launch() {
-        let runtime = open_runtime("req-trace-prerequisite");
-        let args = json!({
-            "name": "smoke",
-            "code": "function eudAgentTestSetup() { eudAgentPass(1); }\nfunction eudAgentTestStep(tick) {}"
-        });
-        let error = runtime
-            .execute(tools::TRACE_TEST_RUN_TOOL, &args)
-            .expect_err("trace test without build evidence must fail before bridge access");
-        assert!(error.contains("requires build_run"), "got: {error}");
-        let error = runtime
-            .execute(tools::TRACE_SUITE_RUN_TOOL, &json!({}))
-            .expect_err("trace suite without build evidence must fail before bridge access");
-        assert!(error.contains("requires build_run"), "got: {error}");
-
-        *runtime.last_build.lock() = Some(crate::harness::BuildEvidence {
-            ok: false,
-            error_count: 1,
-        });
-        let error = runtime
-            .execute(tools::TRACE_TEST_RUN_TOOL, &args)
-            .expect_err("failed build evidence must reject trace launch");
-        assert!(
-            error.contains("latest build_run to succeed"),
-            "got: {error}"
-        );
-        let error = runtime
-            .execute(tools::TRACE_SUITE_RUN_TOOL, &json!({}))
-            .expect_err("failed build evidence must reject trace suite launch");
-        assert!(
-            error.contains("latest build_run to succeed"),
-            "got: {error}"
-        );
     }
 
     #[tokio::test]

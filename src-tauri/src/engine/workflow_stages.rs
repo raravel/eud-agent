@@ -210,12 +210,7 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
     }
 
     fn verifier_guides() -> String {
-        [
-            Self::stage_guides(),
-            super::BUILD_GUIDE.to_string(),
-            super::TRACE_TEST_GUIDE.to_string(),
-        ]
-        .join(
+        [Self::stage_guides(), super::BUILD_GUIDE.to_string()].join(
             "
 
 ",
@@ -821,7 +816,7 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
         Some(format!(
             "The user approved the plan for request `{request_id}`. Execute it now.\n\
 The approved plan is saved at `{plan_path}`{research}; do not edit, rename, or delete them.\n\
-Implement the steps in dependency order through the eud-tools file/DAT tools. After source, DAT, plugin, or Python changes, run `build_run`; when the plan lists tests, create or update them under `src/tests/**` and run `trace_suite_run`. Repair every compiler error before answering.\n\
+Implement the steps in dependency order through the eud-tools file/DAT tools. After source, DAT, plugin, or Python changes, run `build_run`. Repair every compiler error before answering.\n\
 The foreground workspace is read-only: do not edit specs, decisions, worklogs, plans, or project memory. Do not call `propose_plan`.\n\
 {criteria}\
 Answer with a per-step status list (step id — done/partial/skipped and why). A separate verifier will judge the result; the backend creates the post-acceptance harness job after the user accepts the changes.\n\n\
@@ -886,11 +881,6 @@ Answer with a per-step status list (step id — done/partial/skipped and why). A
                 .last_build_result()
                 .map(|value| truncate(&value.to_string(), EVIDENCE_BYTES))
                 .unwrap_or_else(|| "(no build_run in this request)".to_string());
-            let trace_results = self
-                .runtime
-                .last_trace_result()
-                .map(|value| truncate(&value.to_string(), EVIDENCE_BYTES))
-                .unwrap_or_else(|| "(no trace run in this request)".to_string());
             let revision = self.runtime.current_project_revision().unwrap_or_default();
             let prompt = {
                 let state = self.workflow.as_ref().expect("workflow state");
@@ -901,7 +891,6 @@ Answer with a per-step status list (step id — done/partial/skipped and why). A
                         plan_markdown: &plan_markdown,
                         changeset_summary: &changeset_summary,
                         build_result: &build_result,
-                        trace_results: &trace_results,
                         executor_answer: &self.last_answer,
                         revision: &revision,
                     },
