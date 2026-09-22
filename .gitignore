@@ -6,6 +6,9 @@ __pycache__/
 *.pyc
 *.pyo
 
+# eudplib epScript→Python shadows written next to every compiled .eps at build time
+__epspy__/
+
 # Tooling caches
 .ruff_cache/
 .pytest_cache/
