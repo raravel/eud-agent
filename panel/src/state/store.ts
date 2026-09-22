@@ -115,6 +115,14 @@ export interface LogEntry {
   attachments?: ChatAttachment[];
   /** Ordered backend-created resource snapshots attached to this user message. */
   mentions?: MentionInstance[];
+  /**
+   * Long supporting text (a verifier verdict's unmet list, …) rendered behind
+   * a "자세히" toggle so a muted row never overruns the viewport. While
+   * folded, `text` is clamped to two lines; the toggle reveals both.
+   */
+  detail?: string;
+  /** Never pop a toast for this row: the conversation row is the notice. */
+  silent?: boolean;
 }
 
 /** Active plan card (from a `plan` event); replaced by a higher revision. */
@@ -667,12 +675,15 @@ export function createPanelStore(): PanelStore {
     attachments?: ChatAttachment[],
     mentions?: MentionInstance[],
     clientTurnId?: string,
+    extra?: Pick<LogEntry, "detail" | "silent">,
   ): void {
     logSeq += 1;
     const entry: LogEntry = { id: logSeq, kind, text };
     if (clientTurnId) entry.clientTurnId = clientTurnId;
     if (stage) entry.stage = stage;
     if (tools) entry.tools = tools;
+    if (extra?.detail) entry.detail = extra.detail;
+    if (extra?.silent) entry.silent = true;
     if (attachments && attachments.length > 0) entry.attachments = attachments;
     if (mentions && mentions.length > 0) {
       entry.mentions = mentions.map((mention) => ({ ...mention }));
@@ -1116,11 +1127,25 @@ export function createPanelStore(): PanelStore {
           event.verdict !== undefined &&
           prior?.verdict?.sha256 !== event.verdict.sha256
         ) {
+          // The verdict summary and unmet list are the executor's fix ticket
+          // and can run to a screenful; the row clamps the headline + summary
+          // to two lines and folds the unmet list behind "자세히". It never
+          // toasts (the verify report tab already opens on failure).
           const passed = event.verdict.verdict === "pass";
+          const unmetCount = event.verdict.unmet.length;
           const unmet = event.verdict.unmet.map((item) => `- ${item}`).join("\n");
           pushLog(
             passed ? "ok" : "warn",
-            `${passed ? "검증 통과" : "검증 실패"} — ${event.verdict.summary}${unmet ? `\n${unmet}` : ""}`,
+            `${passed ? "검증 통과" : "검증 실패"}${unmetCount > 0 ? ` — 미충족 ${unmetCount}건` : ""} · ${event.verdict.summary}`,
+            undefined,
+            undefined,
+            undefined,
+            undefined,
+            undefined,
+            {
+              detail: `${unmet ? `${unmet}\n\n` : ""}${event.verdict.path}`,
+              silent: true,
+            },
           );
         }
       }
@@ -1527,6 +1552,7 @@ export function createPanelStore(): PanelStore {
         if (entry.mentions) {
           next.mentions = entry.mentions.map((mention) => ({ ...mention }));
         }
+        if (entry.detail) next.detail = entry.detail;
         restored.push(next);
       }
       // Cap to the same MAX_LOG_ENTRIES bound the live log obeys (keep the tail).

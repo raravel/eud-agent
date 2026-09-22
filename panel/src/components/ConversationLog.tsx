@@ -19,13 +19,14 @@
  */
 import {
   AudioLinesIcon,
+  ChevronDownIcon,
   FileTextIcon,
   ImageIcon,
   PencilLineIcon,
   SparklesIcon,
   WrenchIcon,
 } from "lucide-react";
-import { useMemo, type ReactNode } from "react";
+import { useMemo, useState, type ReactNode } from "react";
 import {
   measureElement as measureVirtualElement,
   observeElementRect as observeVirtualElementRect,
@@ -40,6 +41,7 @@ import {
 import { Message, MessageContent } from "@/components/ai-elements/message";
 import { DiagramResponse } from "@/components/ai-elements/response";
 import { Shimmer } from "@/components/ai-elements/shimmer";
+import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
 import { cn } from "@/lib/utils";
 import { AgentStream, ToolList } from "@/components/AgentStream";
@@ -429,6 +431,12 @@ function renderLogEntry(entry: LogEntry, context: RowRenderContext) {
     );
   }
 
+  if (entry.detail !== undefined) {
+    return (
+      <DetailedLogRow entry={entry} className={MUTED_KIND_CLASS[entry.kind]} />
+    );
+  }
+
   const isActive = entry.id === context.activeProgressId;
   const testId = entry.stage ? `log-entry-${entry.stage}` : undefined;
   return (
@@ -441,6 +449,62 @@ function renderLogEntry(entry: LogEntry, context: RowRenderContext) {
     >
       {isActive && <Spinner className="size-3.5 shrink-0" />}
       <span className="whitespace-pre-wrap break-words">{entry.text}</span>
+    </div>
+  );
+}
+
+/**
+ * Muted row whose `text` is clamped to two lines and whose `detail` (a
+ * verifier verdict's unmet list, …) is folded behind a "자세히" toggle; once
+ * open, the full text shows and the detail scrolls inside a bounded box so one
+ * row can never push the conversation past the viewport.
+ */
+function DetailedLogRow({
+  entry,
+  className,
+}: {
+  entry: LogEntry;
+  className: string;
+}) {
+  const [open, setOpen] = useState(false);
+  const detailId = `log-detail-${entry.id}`;
+  return (
+    <div
+      data-testid="log-entry-detailed"
+      className={cn("flex w-fit max-w-[95%] flex-col gap-1 text-sm", className)}
+    >
+      <span
+        data-testid="log-entry-detailed-text"
+        className={cn("whitespace-pre-wrap break-words", !open && "line-clamp-2")}
+      >
+        {entry.text}
+      </span>
+      <Button
+        type="button"
+        size="sm"
+        variant="ghost"
+        className="h-7 w-fit gap-1 px-2 text-xs text-muted-foreground"
+        aria-expanded={open}
+        aria-controls={detailId}
+        onClick={() => setOpen((value) => !value)}
+      >
+        {open ? "접기" : "자세히"}
+        <ChevronDownIcon
+          aria-hidden
+          className={cn(
+            "size-3.5 transition-transform duration-200 motion-reduce:transition-none",
+            open && "rotate-180",
+          )}
+        />
+      </Button>
+      {open && (
+        <pre
+          id={detailId}
+          className="max-h-64 overflow-y-auto whitespace-pre-wrap break-words rounded-md border border-border bg-card/60 px-3 py-2 font-sans text-xs text-muted-foreground"
+        >
+          {entry.detail}
+        </pre>
+      )}
     </div>
   );
 }

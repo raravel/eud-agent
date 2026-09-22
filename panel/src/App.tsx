@@ -3,11 +3,14 @@
  * chat-first review UI (features/06_changeset-review-panel.md).
  *
  * Components: a status-rich Header (connection transitions + RAG state/elapsed),
- * the ConversationLog cards, a live AgentStream under the turn, the PlanView
- * feedback/approve surface, the ChangesetView accept/reject surface, and the
- * regated InstructionBox. Plan cards are archived into the conversation log as
- * agent entries when a plan arrives, is superseded by a higher revision, or is
- * approved.
+ * the ConversationLog cards, a live AgentStream under the turn, the ChangesetView
+ * accept/reject surface, and the regated InstructionBox shared under every
+ * center tab. Staged-workflow artifacts leave the conversation column: research
+ * and verify reports open as workspace document tabs the moment the workflow
+ * snapshot announces them, and the selected session's plan is a virtual
+ * "계획 (rev N)" tab hosting the PlanView approve surface. Plan cards are
+ * archived into the conversation log as agent entries when a plan arrives, is
+ * superseded by a higher revision, or is approved.
  *
  * Data flow: IpcClient (Tauri invoke + listen) -> store actions + log entries
  * -> React snapshot via useSyncExternalStore -> components -> user intents call
@@ -35,8 +38,6 @@ import { ChangesetView } from "@/components/ChangesetView";
 import { HarnessStatusCard } from "@/components/HarnessStatusCard";
 import { AskCard } from "@/components/AskCard";
 import { PlanView } from "@/components/PlanView";
-import { ResearchCard } from "@/components/ResearchCard";
-import { VerdictCard } from "@/components/VerdictCard";
 import { WorkflowStrip } from "@/components/WorkflowStrip";
 import { InstructionBox, type ChatPayload } from "@/components/InstructionBox";
 import { ConnectionNotice } from "@/components/ConnectionNotice";
@@ -56,7 +57,7 @@ import {
   type ProjectPanelTab,
 } from "@/components/ProjectSidebar";
 import { createPanelStore, isBusyPhase } from "@/state/store";
-import type { LogEntry, PanelStore } from "@/state/store";
+import type { LogEntry, PanelStore, PlanState } from "@/state/store";
 import {
   IpcClient,
   appSettingsGet,
@@ -147,7 +148,15 @@ import { PROVIDER_LABELS } from "@/providers/providerCopy";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import {
+  ClipboardCheck,
+  ClipboardList,
+  Search,
+  type LucideIcon,
+} from "lucide-react";
+import { Button } from "@/components/ui/button";
+import {
   discardAttachment,
+  formatAttachmentSize,
   stageAttachment,
 } from "@/lib/attachments";
 
@@ -162,6 +171,64 @@ const PROJECT_REFRESH_MS = 2000;
 
 /** Maximum simultaneously open workspace document tabs in the center column. */
 const MAX_DOCUMENT_TABS = 8;
+
+/**
+ * Virtual center tab id for the selected session's active plan. Workspace
+ * paths are confined relative paths and never contain `:`, so it cannot
+ * collide with a document tab.
+ */
+const PLAN_TAB_ID = "workflow:plan";
+
+/** Staged-workflow artifact families that open as center tabs. */
+type StageArtifactKind = "research" | "plan" | "verify";
+
+/**
+ * Stage artifact directories (engine-rendered `research/`, `plans/`,
+ * `verify/` markdown under the workspace document tree) and their tab
+ * presentation. `dir` is the project-relative form used by the file tree and
+ * document tabs; workflow events name artifacts workspace-relative.
+ */
+const STAGE_TABS: Record<
+  StageArtifactKind,
+  { dir: string; label: string; icon: LucideIcon }
+> = {
+  research: {
+    dir: `${WORKSPACE_DOCUMENT_PREFIX}research/`,
+    label: "조사 보고",
+    icon: Search,
+  },
+  plan: {
+    dir: `${WORKSPACE_DOCUMENT_PREFIX}plans/`,
+    label: "계획",
+    icon: ClipboardList,
+  },
+  verify: {
+    dir: `${WORKSPACE_DOCUMENT_PREFIX}verify/`,
+    label: "검증 보고",
+    icon: ClipboardCheck,
+  },
+};
+
+/** Project-relative tab path of a workspace-relative stage artifact path. */
+function stageArtifactTabPath(workspacePath: string): string {
+  return `${WORKSPACE_DOCUMENT_PREFIX}${workspacePath}`;
+}
+
+function stageArtifactKind(path: string): StageArtifactKind | null {
+  for (const kind of Object.keys(STAGE_TABS) as StageArtifactKind[]) {
+    if (path.startsWith(STAGE_TABS[kind].dir)) return kind;
+  }
+  return null;
+}
+
+/** Tab label/icon for a workspace document: stage reports get a Korean name. */
+function documentTabPresentation(path: string): Pick<DocumentTab, "label" | "icon"> {
+  const kind = stageArtifactKind(path);
+  if (kind !== null) {
+    return { label: STAGE_TABS[kind].label, icon: STAGE_TABS[kind].icon };
+  }
+  return { label: path.slice(path.lastIndexOf("/") + 1) };
+}
 
 /** Per-tab fetch state; contents persist across tab switches. */
 interface DocumentTabState {
@@ -234,6 +301,7 @@ function serializePanelLog(log: readonly LogEntry[]): PanelLog {
     if (entry.mentions) {
       next.mentions = entry.mentions.map((mention) => ({ ...mention }));
     }
+    if (entry.detail) next.detail = entry.detail;
     entries.push(next);
   }
   const logSeq = log.reduce((max, entry) => (entry.id > max ? entry.id : max), 0);
@@ -250,7 +318,6 @@ interface SessionSlot {
   unsubscribe?: () => void;
   saveTimer?: number;
   observedLog: readonly LogEntry[];
-  planOpen: boolean;
   changesetOpen: boolean;
   harnessJobs: HarnessJobView[];
 }
@@ -448,6 +515,15 @@ export default function App() {
   const [documentStates, setDocumentStates] = useState<
     Record<string, DocumentTabState>
   >({});
+  // Sessions whose virtual plan tab the user closed; a new plan revision
+  // reopens it (see the plan-arrival effect below).
+  const [planTabHidden, setPlanTabHidden] = useState<ReadonlySet<string>>(
+    () => new Set(),
+  );
+  // The document tab auto-opened for each stage kind; the next artifact of
+  // the same kind replaces it in place so pipeline requests do not pile up
+  // 조사 보고/검증 보고 tabs. Cleared with the project.
+  const autoOpenedStageTabs = useRef(new Map<StageArtifactKind, string>());
   // A read that completes after its tab was closed/replaced reinserts an
   // invisible entry; prune those so per-path contents cannot accumulate.
   useEffect(() => {
@@ -580,7 +656,6 @@ export default function App() {
         observedLog: sessionStore.getState().log,
         activity: record.pendingRequestIds.length > 0 ? "review" : "idle",
         autonomousRun: record.autonomousRun ?? null,
-        planOpen: true,
         changesetOpen: true,
         harnessJobs: [],
       };
@@ -640,7 +715,6 @@ export default function App() {
       observedLog: sessionStore.getState().log,
       activity: "idle",
       autonomousRun: null,
-      planOpen: true,
       changesetOpen: true,
       harnessJobs: [],
     };
@@ -667,6 +741,8 @@ export default function App() {
     }
     sessionsRef.current.clear();
     loadedProjectRef.current = null;
+    setPlanTabHidden(new Set());
+    seenStageArtifacts.current.clear();
     setSelectedSessionId(null);
     selectedSessionIdRef.current = null;
     projectStore.applyStatus({ compiling: false, project: "" });
@@ -896,7 +972,8 @@ export default function App() {
   }, [ragState]);
 
   // Every error/warn log entry ALSO pops a toast so a problem is noticeable even
-  // when the conversation is scrolled away or the user is on the input. The log
+  // when the conversation is scrolled away or the user is on the input, unless
+  // the row is `silent` (its folded detail would overrun the viewport). The log
   // Toast high-water marks are session-scoped so selecting an old conversation
   // neither replays its historical alerts nor suppresses a newer session's ids.
   useEffect(() => {
@@ -905,8 +982,10 @@ export default function App() {
     let highWater = toastedLogBySessionRef.current.get(sessionId) ?? 0;
     for (const entry of state.log) {
       if (entry.id <= highWater) continue;
-      if (entry.kind === "error") toast.error(entry.text);
-      else if (entry.kind === "warn") toast.warning(entry.text);
+      if (!entry.silent) {
+        if (entry.kind === "error") toast.error(entry.text);
+        else if (entry.kind === "warn") toast.warning(entry.text);
+      }
       highWater = Math.max(highWater, entry.id);
     }
     toastedLogBySessionRef.current.set(sessionId, highWater);
@@ -1116,7 +1195,6 @@ export default function App() {
           const target = targetSlot.store;
           const prior = target.getState().plan;
           if (prior === null || prior.revision !== msg.revision) {
-            targetSlot.planOpen = true;
             void attentionNotify(
               "planApproval",
               !document.hasFocus(),
@@ -2571,16 +2649,6 @@ export default function App() {
     [],
   );
 
-  const handlePlanOpenChange = useCallback(
-    (open: boolean) => {
-      const slot = selectedSlot;
-      if (!slot || slot.planOpen === open) return;
-      slot.planOpen = open;
-      bumpSessions();
-    },
-    [bumpSessions, selectedSlot],
-  );
-
   const handleChangesetOpenChange = useCallback(
     (open: boolean) => {
       const slot = selectedSlot;
@@ -2752,9 +2820,69 @@ export default function App() {
     [activeCenterTab, loadDocumentTab, workspaceData],
   );
 
+  // Stage artifacts (research / verify markdown, and the plan file once its
+  // virtual tab retires) open as document tabs the moment the workflow
+  // snapshot announces them. `workspacePath` is the event's workspace-relative
+  // path; the tab uses the project-relative form. The list is refreshed first
+  // so the new file gets its tree entry; the tab auto-opened for the same
+  // stage earlier is replaced in place. Returns whether the tab was opened.
+  const openStageArtifactTab = useCallback(
+    async (
+      kind: StageArtifactKind,
+      workspacePath: string,
+      activate = true,
+    ): Promise<boolean> => {
+      const path = stageArtifactTabPath(workspacePath);
+      let data = workspaceData;
+      try {
+        data = await workspaceList();
+        setWorkspaceData(data);
+      } catch (error) {
+        if (!data) {
+          store.log(
+            "warn",
+            `${STAGE_TABS[kind].label}를 열지 못했습니다: ${String(error)}`,
+          );
+          return false;
+        }
+      }
+      const previous = autoOpenedStageTabs.current.get(kind);
+      autoOpenedStageTabs.current.set(kind, path);
+      setOpenDocumentTabs((current) => {
+        if (current.includes(path)) return current;
+        const next = [...current];
+        const replaced =
+          previous === undefined ? -1 : current.indexOf(previous);
+        if (replaced !== -1) {
+          next[replaced] = path;
+        } else if (current.length < MAX_DOCUMENT_TABS) {
+          next.push(path);
+        } else {
+          const active = current.indexOf(activeCenterTab);
+          next[active === -1 ? 0 : active] = path;
+        }
+        return next;
+      });
+      if (activate) setActiveCenterTab(path);
+      void loadDocumentTab(data.workspaceId, path);
+      return true;
+    },
+    [activeCenterTab, loadDocumentTab, store, workspaceData],
+  );
+
   const closeDocumentTab = useCallback(
     (id: DocumentTabId) => {
       if (id === "chat") return;
+      if (id === PLAN_TAB_ID) {
+        const sessionId = selectedSessionIdRef.current;
+        if (sessionId !== null) {
+          setPlanTabHidden((current) => new Set(current).add(sessionId));
+        }
+        if (activeCenterTab === PLAN_TAB_ID) {
+          setActiveCenterTab(openDocumentTabs[openDocumentTabs.length - 1] ?? "chat");
+        }
+        return;
+      }
       const index = openDocumentTabs.indexOf(id);
       if (index !== -1) {
         const next = openDocumentTabs.filter((path) => path !== id);
@@ -2776,6 +2904,10 @@ export default function App() {
   const closeAllDocumentTabs = useCallback(() => {
     setOpenDocumentTabs([]);
     setDocumentStates({});
+    const sessionId = selectedSessionIdRef.current;
+    if (sessionId !== null) {
+      setPlanTabHidden((current) => new Set(current).add(sessionId));
+    }
     setActiveCenterTab("chat");
   }, []);
 
@@ -2809,11 +2941,19 @@ export default function App() {
     try {
       const data = await workspaceList();
       setWorkspaceData(data);
+      // Research/verify reports are readable but never listed, so their tabs
+      // survive a refresh; the virtual plan tab is not a file at all.
       const available = new Set(data.files.map((file) => file.path));
-      const nextTabs = openDocumentTabs.filter((path) => available.has(path));
+      const retained = (path: string) =>
+        available.has(path) || stageArtifactKind(path) !== null;
+      const nextTabs = openDocumentTabs.filter(retained);
       if (nextTabs.length !== openDocumentTabs.length) {
         setOpenDocumentTabs(nextTabs);
-        if (activeCenterTab !== "chat" && !available.has(activeCenterTab)) {
+        if (
+          activeCenterTab !== "chat" &&
+          activeCenterTab !== PLAN_TAB_ID &&
+          !retained(activeCenterTab)
+        ) {
           setActiveCenterTab(nextTabs[0] ?? "chat");
         }
       }
@@ -2880,6 +3020,7 @@ export default function App() {
       setWorkspaceError(null);
       setOpenDocumentTabs([]);
       setDocumentStates({});
+      autoOpenedStageTabs.current.clear();
       setActiveCenterTab("chat");
       if (!projectIdentity) return;
       // The file tree is the default project tab, so its data loads with the
@@ -2976,19 +3117,143 @@ export default function App() {
     state.workflow.stage !== "done" &&
     state.workflow.stage !== "failed" &&
     (state.workflow.route === undefined || state.workflow.route === "pipeline");
+  // The selected session's plan is a virtual tab (no workspace fetch: the
+  // markdown is store state) that stays open read-only after approval until
+  // the next request clears the plan.
+  const planTabVisible =
+    state.plan !== null &&
+    selectedSessionId !== null &&
+    !planTabHidden.has(selectedSessionId);
+  const planRevision = state.plan?.revision;
   const documentTabs = useMemo<DocumentTab[]>(
     () => [
       { id: "chat", label: "대화" },
       ...openDocumentTabs.map((path) => ({
         id: path,
-        label: path.slice(path.lastIndexOf("/") + 1),
+        ...documentTabPresentation(path),
       })),
+      ...(planTabVisible && planRevision !== undefined
+        ? [
+            {
+              id: PLAN_TAB_ID,
+              label: `계획 (rev ${planRevision})`,
+              icon: STAGE_TABS.plan.icon,
+            },
+          ]
+        : []),
     ],
-    [openDocumentTabs],
+    [openDocumentTabs, planRevision, planTabVisible],
   );
   const handleCenterTabSelect = useCallback((id: DocumentTabId) => {
     setActiveCenterTab(id);
   }, []);
+  const showPlanTab = useCallback(() => {
+    const sessionId = selectedSessionIdRef.current;
+    if (sessionId !== null) {
+      setPlanTabHidden((current) => {
+        if (!current.has(sessionId)) return current;
+        const next = new Set(current);
+        next.delete(sessionId);
+        return next;
+      });
+    }
+    setActiveCenterTab(PLAN_TAB_ID);
+  }, []);
+
+  // A plan the selected session has not shown yet opens (or reopens) the plan
+  // tab and activates it; re-selecting the session later leaves the user's
+  // tab choice alone. Identity, not revision: revisions restart at 1 for
+  // every request, and the store creates one PlanState per `plan` event.
+  const seenPlans = useRef(new WeakSet<PlanState>());
+  const selectedPlan = state.plan;
+  useEffect(() => {
+    if (selectedSessionId === null || selectedPlan === null) return;
+    if (seenPlans.current.has(selectedPlan)) return;
+    seenPlans.current.add(selectedPlan);
+    showPlanTab();
+  }, [selectedPlan, selectedSessionId, showPlanTab]);
+
+  // Research and verify artifacts open as 조사 보고 / 검증 보고 tabs once per
+  // artifact hash while the pipeline is active (snapshots repeat the same
+  // artifact on every later stage; hydrated done/failed requests stay quiet).
+  const seenStageArtifacts = useRef(new Map<string, string>());
+  const workflowResearch = workflowActive ? state.workflow?.research : undefined;
+  const workflowVerdict = workflowActive ? state.workflow?.verdict : undefined;
+  const openSeenStageArtifact = useCallback(
+    (kind: "research" | "verify", sessionId: string, artifact: { path: string; sha256: string }, activate: boolean) => {
+      const key = `${sessionId}:${kind}`;
+      const identity = `${artifact.path}@${artifact.sha256}`;
+      if (seenStageArtifacts.current.get(key) === identity) return;
+      seenStageArtifacts.current.set(key, identity);
+      void openStageArtifactTab(kind, artifact.path, activate).then((opened) => {
+        // A failed open stays retryable on the next snapshot of the same artifact.
+        if (!opened && seenStageArtifacts.current.get(key) === identity) {
+          seenStageArtifacts.current.delete(key);
+        }
+      });
+    },
+    [openStageArtifactTab],
+  );
+  useEffect(() => {
+    if (selectedSessionId === null || !workflowResearch) return;
+    openSeenStageArtifact("research", selectedSessionId, workflowResearch, true);
+  }, [openSeenStageArtifact, selectedSessionId, workflowResearch]);
+  // The verdict arrives with changeset review (or a fix turn); when the
+  // conversation is waiting on the user, the report opens without stealing
+  // the tab so the changeset/ASK surface stays in view.
+  const conversationAwaitsUser =
+    state.phase === "changeset_review" || state.ask !== null;
+  useEffect(() => {
+    if (selectedSessionId === null || !workflowVerdict) return;
+    openSeenStageArtifact("verify", selectedSessionId, workflowVerdict, !conversationAwaitsUser);
+    // The activation choice belongs to the moment the verdict first appears,
+    // so the phase/ASK state is read here rather than listed as a dependency.
+  }, [openSeenStageArtifact, selectedSessionId, workflowVerdict]);
+
+  // When the plan clears (the next request starts) while its tab is active,
+  // the tab turns into the plan file's document tab so the approved plan stays
+  // readable; without a known file, or after a session switch, fall back to
+  // the conversation.
+  const planTabRef = useRef<{
+    sessionId: string;
+    plan: PlanState;
+    path?: string;
+  } | null>(null);
+  const planPath = state.workflow?.plan?.path;
+  useEffect(() => {
+    if (planTabVisible && selectedSessionId !== null && selectedPlan !== null) {
+      const previous = planTabRef.current;
+      planTabRef.current = {
+        sessionId: selectedSessionId,
+        plan: selectedPlan,
+        path:
+          planPath ??
+          (previous?.sessionId === selectedSessionId && previous.plan === selectedPlan
+            ? previous.path
+            : undefined),
+      };
+      return;
+    }
+    if (activeCenterTab !== PLAN_TAB_ID) return;
+    const previous = planTabRef.current;
+    planTabRef.current = null;
+    setActiveCenterTab("chat");
+    if (
+      previous !== null &&
+      previous.sessionId === selectedSessionId &&
+      previous.path !== undefined &&
+      selectedPlan === null
+    ) {
+      void openStageArtifactTab("plan", previous.path);
+    }
+  }, [
+    activeCenterTab,
+    openStageArtifactTab,
+    planPath,
+    planTabVisible,
+    selectedPlan,
+    selectedSessionId,
+  ]);
   if (launcherVisible) {
     return (
       <>
@@ -3300,31 +3565,30 @@ export default function App() {
         )}
 
 
-        {workflowActive && state.workflow?.research && (
-          <ResearchCard
-            key={state.workflow.research.sha256}
-            research={state.workflow.research}
-            defaultOpen={state.workflow.stage === "research"}
-          />
-        )}
-
-        {state.plan &&
-          (state.phase === "plan_review" || isBusyPhase(state.phase)) && (
-            <PlanView
-              plan={state.plan}
-              artifact={state.workflow?.plan}
-              open={selectedSlot?.planOpen ?? true}
-              onOpenChange={handlePlanOpenChange}
-              pending={state.phase !== "plan_review"}
-              onApprove={handlePlanApprove}
+        {selectedPlan && state.phase === "plan_review" && (
+          <div
+            data-testid="plan-review-notice"
+            className="flex shrink-0 items-center gap-3 border-t border-border bg-card/30 px-4 py-2 text-xs"
+          >
+            <ClipboardList
+              className="size-4 shrink-0 text-primary"
+              aria-hidden="true"
             />
-          )}
-
-        {workflowActive && state.workflow?.verdict && (
-          <VerdictCard
-            verdict={state.workflow.verdict}
-            attempts={state.workflow.verifyAttempts}
-          />
+            <span role="status" className="min-w-0 flex-1 text-foreground">
+              {`계획안 (rev ${selectedPlan.revision})이 검토를 기다립니다. 계획 탭에서 승인하거나 아래 입력창에 피드백을 입력하세요.`}
+            </span>
+            {activeCenterTab !== PLAN_TAB_ID && (
+              <Button
+                type="button"
+                size="sm"
+                variant="outline"
+                className="h-8"
+                onClick={showPlanTab}
+              >
+                계획 보기
+              </Button>
+            )}
+          </div>
         )}
 
         {state.changeset && state.phase === "changeset_review" && (
@@ -3348,35 +3612,28 @@ export default function App() {
           />
         )}
 
-        <InstructionBox
-          state={state}
-          onSend={handleSend}
-          onMentionSearch={handleMentionSearch}
-          projectIdentity={projectState.project}
-          scopeIdentity={selectedSlot?.id ?? `draft:${projectState.project}`}
-          onStageAttachment={stageAttachment}
-          onDiscardAttachment={discardAttachment}
-          onCancel={handleCancel}
-          autonomousRun={selectedSlot?.autonomousRun ?? null}
-          onAutonomousPause={handleAutonomousPause}
-          onAutonomousResume={handleAutonomousResume}
-          onAutonomousStop={handleAutonomousStop}
-          draft={editDraft}
-          actionBusy={selectedActionBusy}
-          modelSettings={promptModelSettings}
-          modelSettingsBusy={!projectPollEnabled || providerSettingsBusy}
-          onModelSettingsChange={handleSessionModelChange}
-          onModelSettingsReload={() => {
-            if (selectedSlot?.persisted) {
-              void sessionModelSettingsGet(selectedSlot.id).then(
-                setSessionModelSettings,
-              );
-            } else if (defaultProvider) {
-              void loadProviderCatalog(defaultProvider);
-            }
-          }}
-        />
         </div>
+
+        {planTabVisible && selectedPlan && (
+          <div
+            id={`document-panel-${PLAN_TAB_ID}`}
+            role="tabpanel"
+            aria-labelledby={`document-tab-${PLAN_TAB_ID}`}
+            className={
+              activeCenterTab === PLAN_TAB_ID
+                ? "flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden"
+                : "hidden"
+            }
+          >
+            <PlanView
+              plan={selectedPlan}
+              artifact={state.workflow?.plan}
+              reviewable={state.phase === "plan_review"}
+              pending={messageActionBusy}
+              onApprove={handlePlanApprove}
+            />
+          </div>
+        )}
 
         {activeCenterTab !== "chat" &&
           workspaceData &&
@@ -3409,11 +3666,43 @@ export default function App() {
                   content={documentState.content}
                   loading={documentState.loading}
                   error={documentState.error}
+                  notice={documentState.notice}
                   onSelect={openDocumentTab}
                 />
               </div>
             );
           })}
+
+        {/* The prompt is shared under every center tab: plan feedback, questions
+            about an open report, and ordinary chat all enter here. */}
+        <InstructionBox
+          state={state}
+          onSend={handleSend}
+          onMentionSearch={handleMentionSearch}
+          projectIdentity={projectState.project}
+          scopeIdentity={selectedSlot?.id ?? `draft:${projectState.project}`}
+          onStageAttachment={stageAttachment}
+          onDiscardAttachment={discardAttachment}
+          onCancel={handleCancel}
+          autonomousRun={selectedSlot?.autonomousRun ?? null}
+          onAutonomousPause={handleAutonomousPause}
+          onAutonomousResume={handleAutonomousResume}
+          onAutonomousStop={handleAutonomousStop}
+          draft={editDraft}
+          actionBusy={selectedActionBusy}
+          modelSettings={promptModelSettings}
+          modelSettingsBusy={!projectPollEnabled || providerSettingsBusy}
+          onModelSettingsChange={handleSessionModelChange}
+          onModelSettingsReload={() => {
+            if (selectedSlot?.persisted) {
+              void sessionModelSettingsGet(selectedSlot.id).then(
+                setSessionModelSettings,
+              );
+            } else if (defaultProvider) {
+              void loadProviderCatalog(defaultProvider);
+            }
+          }}
+        />
       </main>
 
       <ProjectSidebar
@@ -3424,7 +3713,9 @@ export default function App() {
         memory={projectState.memory}
         workspace={workspaceData}
         workspaceSelectedPath={
-          activeCenterTab !== "chat" ? activeCenterTab : null
+          activeCenterTab !== "chat" && activeCenterTab !== PLAN_TAB_ID
+            ? activeCenterTab
+            : null
         }
         workspaceLoading={workspaceLoading}
         workspaceError={workspaceError}

@@ -734,6 +734,8 @@ export interface PanelLogEntry {
   tools?: PanelLogTool[];
   attachments?: ChatAttachment[];
   mentions?: MentionInstance[];
+  /** Folded supporting text behind the row's "자세히" toggle. */
+  detail?: string;
 }
 
 /** Durable archived-tool row persisted in a {@link PanelLogEntry} (subset of AgentTool). */

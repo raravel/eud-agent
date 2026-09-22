@@ -176,12 +176,35 @@ describe("workflow snapshot lifecycle", () => {
         verdict: verdictFail,
       }),
     );
+    // The verdict row's text is the headline + summary (clamped in the UI);
+    // the unmet list and report path fold into `detail`, and the row never
+    // toasts (`silent`).
     const verdictRows = store
       .getState()
-      .log.filter((entry) => entry.text.includes(verdictFail.summary));
+      .log.filter((entry) => entry.text.startsWith("검증 실패"));
     expect(verdictRows).toHaveLength(1);
     expect(verdictRows[0].kind).toBe("warn");
-    expect(verdictRows[0].text).toContain(verdictFail.unmet[0]);
+    expect(verdictRows[0].text).toBe(`검증 실패 — 미충족 1건 · ${verdictFail.summary}`);
+    expect(verdictRows[0].silent).toBe(true);
+    expect(verdictRows[0].detail).toContain(`- ${verdictFail.unmet[0]}`);
+    expect(verdictRows[0].detail).toContain(verdictFail.path);
+  });
+
+  it("logs a passing verdict as an ok row without an unmet count", () => {
+    const store = readyWithProject();
+    store.chatSent();
+    store.workflowReceived(
+      workflow({
+        stage: "executing",
+        route: "pipeline",
+        verifyAttempts: 1,
+        verdict: { ...verdictFail, verdict: "pass", unmet: [] },
+      }),
+    );
+    const row = store.getState().log.find((entry) => entry.text.startsWith("검증"));
+    expect(row?.kind).toBe("ok");
+    expect(row?.text).toBe(`검증 통과 · ${verdictFail.summary}`);
+    expect(row?.detail).toBe(verdictFail.path);
   });
 
   it("does not re-log a hydrated research artifact (no turn in flight)", () => {

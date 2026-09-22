@@ -1078,7 +1078,7 @@ describe("App concurrent sessions", () => {
         ...snapshot,
         stage: "research",
         research: {
-          path: ".eud-agent/workspace/research/req-1.md",
+          path: "research/req-1.md",
           sha256: "a".repeat(64),
           summary: "트리거 3개를 확인했습니다.",
         },
@@ -1090,8 +1090,32 @@ describe("App concurrent sessions", () => {
       .find((item) => item.getAttribute("aria-current") === "step");
     expect(active).toHaveTextContent("조사");
     expect(within(strip).getByText("심층 계획")).toBeInTheDocument();
-    expect(screen.getByRole("region", { name: "조사 결과" })).toBeInTheDocument();
-    // A busy stage is send-gated like thinking and shows the turn status.
+    // The research report opens as its own center tab (not a card above the
+    // conversation) and reads the artifact from the workspace.
+    const researchTab = await screen.findByRole("tab", { name: "조사 보고 문서 탭" });
+    expect(researchTab).toHaveAttribute("aria-selected", "true");
+    await waitFor(() => {
+      expect(tauri.invoke).toHaveBeenCalledWith("workspace_read", {
+        workspaceId: "a".repeat(64),
+        path: ".eud-agent/workspace/research/req-1.md",
+      });
+    });
+    // The event names the artifact workspace-relative; the tab reads it by its
+    // project-relative path, renders Markdown, and survives a tree refresh.
+    const report = screen.getByRole("article", { name: "프로젝트 문서" });
+    expect(within(report).getByRole("heading", { name: "문서 제목" })).toBeInTheDocument();
+    expect(within(report).getByText("작업 보고서")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "워크스페이스 새로 고침" }));
+    await waitFor(() =>
+      expect(tauri.invoke.mock.calls.filter(([command]) => command === "workspace_list").length)
+        .toBeGreaterThanOrEqual(3),
+    );
+    expect(screen.getByRole("tab", { name: "조사 보고 문서 탭" })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+    // A busy stage is send-gated like thinking and shows the turn status; the
+    // prompt stays reachable under the report tab.
     expect(screen.getByRole("button", { name: "실행" })).toBeDisabled();
     expect(screen.getByTestId("active-turn-status")).toBeInTheDocument();
 
@@ -1196,7 +1220,7 @@ describe("App concurrent sessions", () => {
     );
   });
 
-  it("shows the verdict above the changeset and the plan artifact details", async () => {
+  it("opens the plan and verify reports as center tabs with the prompt underneath", async () => {
     render(<App />);
     await screen.findByRole("button", { name: "Session A, 유휴" });
     await waitFor(() => {
@@ -1213,7 +1237,7 @@ describe("App concurrent sessions", () => {
       verifyAttempts: 0,
       deepPlanning: false,
       plan: {
-        path: ".eud-agent/workspace/plans/req-3.md",
+        path: "plans/req-3.md",
         revision: 1,
         sha256: "d".repeat(64),
         title: "미네랄 지급 트리거",
@@ -1226,11 +1250,38 @@ describe("App concurrent sessions", () => {
     };
     act(() => {
       emit("workflow", { ...snapshot, stage: "plan_review" });
-      emit("plan", { sessionId: "session-a", markdown: "# 계획", revision: 1 });
+      emit("plan", { sessionId: "session-a", markdown: "# 계획\n\n계획 본문", revision: 1 });
     });
-    expect(await screen.findByText("미네랄 지급 트리거")).toBeInTheDocument();
-    expect(screen.getByRole("list", { name: "수용 기준" })).toHaveTextContent("빌드 통과");
-    expect(screen.getByText("비평 승인")).toBeInTheDocument();
+    // The plan is a virtual tab (store markdown, no workspace read) that
+    // activates on arrival; the approve control lives in the tab.
+    const planTab = await screen.findByRole("tab", { name: "계획 (rev 1) 문서 탭" });
+    expect(planTab).toHaveAttribute("aria-selected", "true");
+    const planPanel = screen.getByRole("region", { name: "계획 검토" });
+    expect(within(planPanel).getByText("계획 본문")).toBeInTheDocument();
+    expect(within(planPanel).getByText("미네랄 지급 트리거")).toBeInTheDocument();
+    expect(within(planPanel).getByRole("list", { name: "수용 기준" })).toHaveTextContent("빌드 통과");
+    expect(within(planPanel).getByText("비평 승인")).toBeInTheDocument();
+    expect(within(planPanel).getByRole("button", { name: "승인" })).toBeEnabled();
+    expect(tauri.invoke).not.toHaveBeenCalledWith(
+      "workspace_read",
+      expect.objectContaining({ path: ".eud-agent/workspace/plans/req-3.md" }),
+    );
+    // The conversation keeps a one-line notice; the prompt is shared under
+    // every tab so feedback is typed without leaving the plan.
+    expect(screen.getByTestId("plan-review-notice")).toHaveTextContent("계획안 (rev 1)");
+    expect(screen.getByRole("button", { name: "실행" })).toBeInTheDocument();
+
+    fireEvent.click(within(planPanel).getByRole("button", { name: "승인" }));
+    await waitFor(() => {
+      expect(tauri.invoke).toHaveBeenCalledWith("plan_approve", {
+        sessionId: "session-a",
+      });
+    });
+    // Approval keeps the tab as a read-only reference.
+    expect(screen.getByRole("tab", { name: "계획 (rev 1) 문서 탭" })).toBeInTheDocument();
+    expect(within(planPanel).queryByRole("button", { name: "승인" })).toBeNull();
+    expect(within(planPanel).getByText("읽기 전용")).toBeInTheDocument();
+    expect(screen.queryByTestId("plan-review-notice")).toBeNull();
 
     act(() => {
       emit("changeset", {
@@ -1245,21 +1296,84 @@ describe("App concurrent sessions", () => {
         verdict: {
           verdict: "pass",
           summary: "모든 수용 기준을 충족합니다.",
-          path: ".eud-agent/workspace/verify/req-3.md",
+          path: "verify/req-3.1.md",
           sha256: "e".repeat(64),
           unmet: [],
         },
       });
     });
-    const verdict = await screen.findByRole("region", { name: "검증 결과" });
-    expect(verdict).toHaveTextContent("검증 통과");
-    const changeset = screen.getByRole("region", { name: "변경사항 검토" });
-    expect(
-      verdict.compareDocumentPosition(changeset) & Node.DOCUMENT_POSITION_FOLLOWING,
-    ).toBeTruthy();
+    // The verify report opens as a tab but, because the changeset now awaits a
+    // decision in the conversation, it does not steal the active tab.
+    const verifyTab = await screen.findByRole("tab", { name: "검증 보고 문서 탭" });
+    expect(verifyTab).toHaveAttribute("aria-selected", "false");
+    expect(screen.getByRole("tab", { name: "계획 (rev 1) 문서 탭" })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+    await waitFor(() => {
+      expect(tauri.invoke).toHaveBeenCalledWith("workspace_read", {
+        workspaceId: "a".repeat(64),
+        path: ".eud-agent/workspace/verify/req-3.1.md",
+      });
+    });
+    expect(screen.queryByRole("region", { name: "검증 결과" })).toBeNull();
+    expect(screen.getByRole("region", { name: "변경사항 검토" })).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: "계획 (rev 1) 문서 탭" })).toBeInTheDocument();
   });
 
-  it("preserves a collapsed plan after switching session tabs", async () => {
+  it("activates the verify report for a failed verdict while the fix turn runs", async () => {
+    render(<App />);
+    await screen.findByRole("button", { name: "Session A, 유휴" });
+    await waitFor(() => expect(tauri.listeners.has("workflow")).toBe(true));
+    const snapshot = {
+      sessionId: "session-a",
+      requestId: "req-6",
+      route: "pipeline",
+      acceptanceCriteria: ["빌드 통과"],
+      critiqueRounds: 0,
+      deepPlanning: false,
+    };
+    // A busy stage puts the turn in flight so the verdict is archived as a row.
+    act(() => {
+      emit("workflow", { ...snapshot, stage: "verifying", verifyAttempts: 1 });
+    });
+    const summary = "빌드가 실패했습니다. ".repeat(40).trim();
+    act(() => {
+      emit("workflow", {
+        ...snapshot,
+        stage: "executing",
+        verifyAttempts: 1,
+        verdict: {
+          verdict: "fail",
+          summary,
+          path: "verify/req-6.1.md",
+          sha256: "c".repeat(64),
+          unmet: ["빌드 통과 (unmet: build_run errorCount=8)"],
+        },
+      });
+    });
+    const verifyTab = await screen.findByRole("tab", { name: "검증 보고 문서 탭" });
+    expect(verifyTab).toHaveAttribute("aria-selected", "true");
+    await waitFor(() => {
+      expect(tauri.invoke).toHaveBeenCalledWith("workspace_read", {
+        workspaceId: "a".repeat(64),
+        path: ".eud-agent/workspace/verify/req-6.1.md",
+      });
+    });
+    // The conversation keeps a clamped verdict row (headline + summary) with
+    // the unmet list folded behind 자세히; nothing pops as a toast.
+    const row = screen.getByTestId("log-entry-detailed");
+    expect(row).toHaveTextContent("검증 실패 — 미충족 1건 · 빌드가 실패했습니다.");
+    expect(within(row).getByTestId("log-entry-detailed-text").className).toContain(
+      "line-clamp-2",
+    );
+    expect(row).not.toHaveTextContent("errorCount=8");
+    fireEvent.click(within(row).getByRole("button", { name: "자세히" }));
+    expect(row).toHaveTextContent("errorCount=8");
+    expect(document.querySelector("[data-sonner-toast]")).toBeNull();
+  });
+
+  it("keeps a closed plan tab closed across session switches and reopens it for a new revision", async () => {
     render(<App />);
     await screen.findByRole("button", { name: "Session A, 유휴" });
     await waitFor(() => expect(tauri.listeners.has("plan")).toBe(true));
@@ -1267,28 +1381,102 @@ describe("App concurrent sessions", () => {
     act(() => {
       emit("plan", {
         sessionId: "session-a",
-        markdown: "# 계획\n\n세션 전환 뒤에도 접힌 상태여야 합니다.",
+        markdown: "# 계획\n\n세션 전환 뒤에도 닫힌 상태여야 합니다.",
         revision: 1,
       });
     });
+    const planTab = await screen.findByRole("tab", { name: "계획 (rev 1) 문서 탭" });
+    expect(planTab).toHaveAttribute("aria-selected", "true");
     expect(
-      await screen.findByText("세션 전환 뒤에도 접힌 상태여야 합니다."),
+      screen.getByText("세션 전환 뒤에도 닫힌 상태여야 합니다."),
     ).toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole("button", { name: "계획안 접기" }));
+    fireEvent.click(screen.getByRole("button", { name: "계획 (rev 1) 탭 닫기" }));
+    expect(screen.queryByRole("tab", { name: "계획 (rev 1) 문서 탭" })).toBeNull();
+    expect(screen.getByRole("tab", { name: "대화" })).toHaveAttribute("aria-selected", "true");
     expect(
-      screen.queryByText("세션 전환 뒤에도 접힌 상태여야 합니다."),
+      screen.queryByText("세션 전환 뒤에도 닫힌 상태여야 합니다."),
     ).not.toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "Session B, 유휴" }));
     fireEvent.click(screen.getByRole("button", { name: "Session A, 유휴" }));
+    expect(screen.queryByRole("tab", { name: "계획 (rev 1) 문서 탭" })).toBeNull();
 
-    expect(
-      screen.queryByText("세션 전환 뒤에도 접힌 상태여야 합니다."),
-    ).not.toBeInTheDocument();
-    expect(
-      screen.getByRole("button", { name: "계획안 펼치기" }),
-    ).toBeInTheDocument();
+    // The conversation notice reopens the closed tab on demand.
+    fireEvent.click(screen.getByRole("button", { name: "계획 보기" }));
+    expect(screen.getByRole("tab", { name: "계획 (rev 1) 문서 탭" })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+    fireEvent.click(screen.getByRole("button", { name: "계획 (rev 1) 탭 닫기" }));
+
+    // A new revision reopens and activates the tab.
+    act(() => {
+      emit("plan", {
+        sessionId: "session-a",
+        markdown: "# 계획\n\n수정된 계획입니다.",
+        revision: 2,
+      });
+    });
+    const revised = await screen.findByRole("tab", { name: "계획 (rev 2) 문서 탭" });
+    expect(revised).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByText("수정된 계획입니다.")).toBeInTheDocument();
+  });
+
+  it("turns the active plan tab into the plan file tab when the next request clears the plan", async () => {
+    render(<App />);
+    await screen.findByRole("button", { name: "Session A, 유휴" });
+    await waitFor(() => {
+      expect(tauri.listeners.has("workflow")).toBe(true);
+      expect(tauri.listeners.has("plan")).toBe(true);
+      expect(tauri.listeners.has("answer")).toBe(true);
+    });
+    act(() => {
+      emit("workflow", {
+        sessionId: "session-a",
+        requestId: "req-5",
+        stage: "plan_review",
+        route: "pipeline",
+        acceptanceCriteria: [],
+        critiqueRounds: 0,
+        verifyAttempts: 0,
+        deepPlanning: false,
+        plan: {
+          path: "plans/req-5.md",
+          revision: 1,
+          sha256: "f".repeat(64),
+          title: "",
+          acceptanceCriteria: [],
+          deep: false,
+          iterations: 1,
+        },
+      });
+      emit("plan", { sessionId: "session-a", markdown: "# 계획 5", revision: 1 });
+    });
+    expect(await screen.findByRole("tab", { name: "계획 (rev 1) 문서 탭" })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+    fireEvent.click(screen.getByRole("button", { name: "승인" }));
+    act(() => {
+      emit("answer", { sessionId: "session-a", text: "적용했습니다." });
+    });
+    const input = await screen.findByRole("combobox", { name: "지시 입력" });
+    await waitFor(() => expect(input).toBeEnabled());
+
+    // Sending the next request from the plan tab clears the store plan; the
+    // virtual tab becomes the plans/ file tab in place instead of vanishing.
+    fireEvent.change(input, { target: { value: "다음 작업" } });
+    fireEvent.click(screen.getByRole("button", { name: "실행" }));
+    const fileTab = await screen.findByRole("tab", { name: "계획 문서 탭" });
+    expect(fileTab).toHaveAttribute("aria-selected", "true");
+    expect(screen.queryByRole("tab", { name: "계획 (rev 1) 문서 탭" })).toBeNull();
+    await waitFor(() => {
+      expect(tauri.invoke).toHaveBeenCalledWith("workspace_read", {
+        workspaceId: "a".repeat(64),
+        path: ".eud-agent/workspace/plans/req-5.md",
+      });
+    });
   });
 
   it("keeps another session writable while the first session is in review", async () => {

@@ -164,7 +164,7 @@ export function InstructionBox({
     : ragLoading
       ? "RAG 모델 준비 중… 준비가 끝나면 입력할 수 있습니다"
       : state.phase === "plan_review"
-        ? "계획 수정 피드백을 입력하세요 (승인은 계획 카드에서)"
+        ? "계획 수정 피드백을 입력하세요 (승인은 계획 탭에서)"
         : "무엇을 만들까요? (예: 게임 시작 시 미네랄 +1000 트리거 추가)";
 
   async function stageFiles(source: FileList | readonly File[]) {

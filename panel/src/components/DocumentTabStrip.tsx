@@ -1,19 +1,23 @@
 /**
  * Center-column tab strip (Orca-style): a pinned "대화" tab plus one tab per
- * open workspace document. Tabs activate the center surface; document tabs can
- * be closed individually or all at once. The strip owns no document state —
- * App keeps open tabs and per-path contents so switching tabs never refetches.
+ * open workspace document and, while the selected session holds a plan, the
+ * virtual "계획 (rev N)" tab. Tabs activate the center surface; every tab but
+ * 대화 can be closed individually or all at once. The strip owns no document
+ * state — App keeps open tabs and per-path contents so switching tabs never
+ * refetches.
  */
-import { MessageSquare, X } from "lucide-react";
+import { MessageSquare, X, type LucideIcon } from "lucide-react";
 
 import { cn } from "@/lib/utils";
 
 export type DocumentTabId = "chat" | string;
 
 export interface DocumentTab {
-  /** "chat" or the workspace-relative file path. */
+  /** "chat", the workspace-relative file path, or the virtual plan tab id. */
   id: DocumentTabId;
   label: string;
+  /** Leading icon for stage artifacts (조사 보고 / 계획 / 검증 보고). */
+  icon?: LucideIcon;
 }
 
 export interface DocumentTabStripProps {
@@ -57,12 +61,14 @@ export function DocumentTabStrip({
               aria-selected={active}
               aria-controls={`document-panel-${tab.id}`}
               aria-label={tab.id === "chat" ? tab.label : `${tab.label} 문서 탭`}
-              title={tab.id === "chat" ? tab.label : tab.id}
+              title={tab.id.includes("/") ? tab.id : tab.label}
               className="flex min-w-0 flex-1 cursor-pointer items-center gap-1.5 px-2.5 outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
               onClick={() => onSelect(tab.id)}
             >
               {tab.id === "chat" ? (
                 <MessageSquare className="size-3.5 shrink-0" aria-hidden="true" />
+              ) : tab.icon ? (
+                <tab.icon className="size-3.5 shrink-0" aria-hidden="true" />
               ) : null}
               <span className="min-w-0 flex-1 truncate text-left">{tab.label}</span>
             </button>
