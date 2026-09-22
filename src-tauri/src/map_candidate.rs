@@ -3156,6 +3156,95 @@ mod tests {
         std::fs::remove_dir_all(root).ok();
     }
 
+    /// A tile rectangle painted with a semantic brush reaches the draft through the ordinary
+    /// patch/verify path, and the single-diamond form refuses off-lattice coordinates with the
+    /// rule the model must correct instead of a bare placement failure.
+    #[test]
+    fn semantic_isom_rect_paints_a_plateau_and_off_lattice_brush_names_the_rule() {
+        let root = unique_root();
+        let dirs = DataDirs::from_bases(&root.join("roaming"), &root.join("local"));
+        dirs.ensure_dirs().unwrap();
+        let source = root.join("source.scx");
+        std::fs::copy(fixture(), &source).unwrap();
+        let snapshot = context(&dirs, &source);
+        let store = CandidateStore::new(
+            (dirs.clone()).clone(),
+            crate::map_import::MapImportStore::new(dirs.clone()),
+        );
+        let view = store.create_session("map-session", &snapshot).unwrap();
+        store
+            .prepare_request("project", "map-session", "request", 0, &[])
+            .unwrap();
+        store
+            .draft_begin("project", "map-session", "request")
+            .unwrap();
+        let catalog = isom::catalog_query(
+            Path::new(r"C:\\Program Files (x86)\\StarCraft"),
+            json!({
+                "schema": "eud-map-catalog/1",
+                "kind": "brushes",
+                "tileset": view.baseline.tileset.era(),
+                "offset": 0,
+                "limit": 64
+            })
+            .to_string()
+            .as_bytes(),
+        )
+        .unwrap();
+        let catalog: Value = serde_json::from_str(&catalog).unwrap();
+        let brushes = catalog["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|entry| entry["graphicsValid"] == true)
+            .map(|entry| entry["id"].as_u64().unwrap() as u16)
+            .collect::<Vec<_>>();
+        // The Installation fixture: "Floor" (raised over "Substructure") stands in for a hill.
+        assert!(brushes.len() >= 2, "{catalog}");
+        let brush = brushes[1];
+
+        let odd = store
+            .draft_patch(
+                "project",
+                "map-session",
+                "request",
+                vec![MapOperation::TerrainIsomBrush {
+                    isom_x: 3,
+                    isom_y: 4,
+                    brush,
+                    extent: 1,
+                }],
+            )
+            .unwrap_err();
+        assert!(odd.contains("isomX + isomY must be even"), "{odd}");
+
+        let width = view.baseline.width.min(24);
+        let height = view.baseline.height.min(12);
+        let result = store
+            .draft_patch(
+                "project",
+                "map-session",
+                "request",
+                vec![MapOperation::TerrainIsomRect {
+                    x: 8,
+                    y: 8,
+                    width,
+                    height,
+                    brush,
+                }],
+            )
+            .unwrap();
+        let effect = &result["nativeReport"]["effects"][0];
+        assert_eq!(effect["op"], "terrain.isom_rect");
+        assert!(effect["diamonds"].as_u64().unwrap() >= 1);
+        let changed = effect["changedTiles"].as_u64().unwrap();
+        assert!(changed > 0);
+        assert_eq!(result["verification"]["valid"], true);
+        assert_eq!(result["verification"]["diff"]["terrainCells"], changed);
+        store.finish_request("map-session", "request").unwrap();
+        std::fs::remove_dir_all(root).ok();
+    }
+
     #[test]
     #[ignore = "requires installed StarCraft terrain and DAT assets"]
     fn no_target_request_mutates_every_supported_candidate_layer() {

@@ -312,6 +312,7 @@ The schema MUST match the existing Rust contract. Fields with serde defaults rem
 | `terrain.set` | `x`, `y`, `before`, `after` | none |
 | `terrain.rect` | `x`, `y`, `width`, `height`, `after` | none |
 | `terrain.blit` | `x`, `y`, `tiles` | none |
+| `terrain.isom_rect` | `x`, `y`, `width`, `height`, `brush` | none |
 | `terrain.isom_brush` | `isomX`, `isomY`, `brush` | `extent` (default 1) |
 
 `tiles` is a non-empty array of non-empty arrays of `u16`. Rectangular row width and graphics validity remain runtime/native validations.
@@ -502,12 +503,13 @@ Tests MUST distinguish:
 
 ### 11.5 MCP schema exhaustiveness
 
-The advertised `map_draft_patch.inputSchema.properties.operations.items.oneOf` MUST contain exactly these twenty discriminator constants:
+The advertised `map_draft_patch.inputSchema.properties.operations.items.oneOf` MUST contain exactly these twenty-one discriminator constants (`terrain.isom_rect` joined on 2026-09-22; the Codex-normalized schema guard moved from 5 000 B to 5 500 B for it):
 
 ```text
 terrain.set
 terrain.rect
 terrain.blit
+terrain.isom_rect
 terrain.isom_brush
 unit.add
 unit.set

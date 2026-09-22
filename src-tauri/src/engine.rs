@@ -4709,7 +4709,8 @@ pub fn build_map_system_prompt(project_state: &str, project_memory: Option<&str>
          Every map_draft_patch operation is a flat object with op plus exactly the listed keys; bracketed keys are optional and state{{...}} lists nested object keys. Never invent keys such as tileId.\n\
          {operations_guide}\n\
          - Every value is typed exactly as advertised: brush, after, tiles, and replacementTiles are numeric ids from map_palette_query, never names such as 'Dirt'.\n\
-         - terrain.set before must equal the current tile id at (x, y); when it is unknown use terrain.rect or terrain.blit, which need no expected-before value.\n\
+         - terrain.set before must equal the current tile id at (x, y). Read exact ids with map_terrain_read (visible candidate) or map_draft_terrain_read (request draft) — including when replicating an existing pattern — or use terrain.rect / terrain.blit, which need no expected-before value. Never guess before values or probe them through conflict errors.\n\
+         - Semantic terrain that must blend with its surroundings (a hill or plateau, a pool, a different ground type) is an ISOM brush job, exactly like SCMDraft's isometric brush: terrain.isom_rect fills a tile rectangle with one brush id from map_palette_query kind=brushes and generates the matching transition tiles (cliff edges, shorelines) itself: the rectangle interior becomes the brush terrain and a ring up to two diamonds wide (8 tiles sideways, 4 tiles up and down) on and outside the rectangle border is regenerated from the map's ISOM data, so where the surroundings were laid with exact tiles the ring shows the ISOM terrain rather than the visible tiles; render or analyze the draft after painting. A high brush (High Dirt, High Jungle, ...) painted on low ground is a hill with cliffs; ramps are separate doodads. Give terrain.isom_rect at least 5x3 tiles plus room for the ring; every map with an ISOM section supports it, and the error names the reason when it does not. terrain.isom_brush is the single-diamond form on ISOM grid coordinates: isomX is a tile x / 2 (0..width/2), isomY is a tile y (0..height), isomX + isomY must be even, one diamond covers tiles [2*isomX-2, 2*isomX+1] x [isomY-1, isomY], and extent N is an NxN diamond block. Never assemble cliff edges from exact tile ids with terrain.set/terrain.rect/terrain.blit unless the user asks for exact tiles, and never conclude a map lacks ISOM data from a rejected isom_brush call.\n\
          - ordinal and beforeFingerprint identify one existing object exactly as map_objects_read returned it for the current revision.\n\
          - tiles and replacementTiles are row-major matrices of exact tile ids whose top-left is (x, y) or the doodad footprint.\n\n\
          [selection stamps]\n\
@@ -9123,9 +9124,15 @@ mod tests {
         assert!(prompt.contains("[draft patch operations]"));
         assert!(prompt.contains("Never invent keys such as tileId"));
         assert!(prompt.contains("- terrain.set: x, y, before, after\n"));
+        assert!(prompt.contains("terrain.isom_rect fills a tile rectangle"));
+        assert!(prompt.contains("isomX + isomY must be even"));
+        assert!(prompt.contains("never conclude a map lacks ISOM data"));
         assert!(prompt.contains("- location.delete: locationId\n"));
         assert!(prompt.contains("before must equal the current tile id at (x, y)"));
-        assert!(prompt.contains("use terrain.rect or terrain.blit"));
+        assert!(prompt.contains("map_terrain_read (visible candidate)"));
+        assert!(prompt.contains("map_draft_terrain_read (request draft)"));
+        assert!(prompt.contains("use terrain.rect / terrain.blit"));
+        assert!(prompt.contains("Never guess before values or probe them through conflict errors"));
         assert!(prompt.contains("numeric ids from map_palette_query, never names"));
         assert!(
             prompt.contains("Never provide a filesystem path, palette, MTXM id, or tile matrix")

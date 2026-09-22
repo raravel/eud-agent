@@ -1720,6 +1720,37 @@ struct ScMap
         radiallyUpdateTerrain(true, diamondsToUpdate, cache);
         return true;
     }
+    // Brush an explicit set of valid in-bounds diamonds with one terrain type and regenerate the
+    // transition ring around the whole set once: the shape placeIsomTerrain gives its NxN block,
+    // for an arbitrary diamond set (e.g. every diamond whose footprint lies inside a tile rectangle).
+    inline bool placeIsomTerrainDiamonds(const std::vector<Chk::IsomDiamond> & diamonds, size_t terrainType, Chk::IsomCache & cache)
+    {
+        uint16_t isomValue = cache.getTerrainTypeIsomValue(terrainType);
+        if ( isomValue == 0 || size_t(isomValue) >= cache.isomLinks.size() || cache.isomLinks[size_t(isomValue)].terrainType == 0 || diamonds.empty() )
+            return false;
+        for ( const auto & diamond : diamonds )
+        {
+            if ( !diamond.isValid() || !isInBounds(diamond) )
+                return false;
+        }
+
+        cache.resetChangedArea();
+        for ( const auto & diamond : diamonds )
+            setDiamondIsomValues(diamond, isomValue, true, cache);
+
+        std::deque<Chk::IsomDiamond> diamondsToUpdate {};
+        for ( const auto & diamond : diamonds )
+        {
+            for ( auto i : Chk::IsomDiamond::neighbors )
+            {
+                Chk::IsomDiamond neighbor = diamond.getNeighbor(i);
+                if ( diamondNeedsUpdate(neighbor) ) // Diamonds set above are modified and skipped here
+                    diamondsToUpdate.push_back(Chk::IsomDiamond{neighbor.x, neighbor.y});
+            }
+        }
+        radiallyUpdateTerrain(true, diamondsToUpdate, cache);
+        return true;
+    }
     inline void copyIsomFrom(const ScMap & sourceMap, int32_t xTileOffset, int32_t yTileOffset, bool undoable, Chk::IsomCache & destCache)
     {
         size_t sourceIsomWidth = sourceMap.tileWidth/2 + 1;

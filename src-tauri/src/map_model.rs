@@ -615,6 +615,14 @@ pub enum MapOperation {
         y: u16,
         tiles: Vec<Vec<u16>>,
     },
+    #[serde(rename = "terrain.isom_rect")]
+    TerrainIsomRect {
+        x: u16,
+        y: u16,
+        width: u16,
+        height: u16,
+        brush: u16,
+    },
     #[serde(rename = "terrain.isom_brush")]
     TerrainIsomBrush {
         isom_x: u16,

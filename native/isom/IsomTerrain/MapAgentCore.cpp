@@ -497,6 +497,71 @@ void setExactTile(MapFile& map, std::size_t x, std::size_t y, std::uint16_t tile
     map.editorTiles[index] = tile;
 }
 
+// ISOM diamond grid: rect columns 0..=W/2 and rows 0..=H; diamond (x, y) exists only when x + y
+// is even and its four quadrant rects cover tiles [2x-2, 2x+1] x [y-1, y].
+void requireIsomSection(const MapFile& map, const std::string& context)
+{
+    const std::size_t expected = (map.getTileWidth() / 2 + 1) * (map.getTileHeight() + 1);
+    if ( map.isomRects.size() != expected )
+    {
+        fail(context + ": map has no usable ISOM section (" + std::to_string(map.isomRects.size()) + " of " +
+            std::to_string(expected) + " rects); semantic brushes need ISOM data, use exact tiles (terrain.rect/terrain.blit) or a stamp instead");
+    }
+}
+
+void requireIsomBrush(const Chk::IsomCache& cache, std::size_t brush, const std::string& context)
+{
+    const std::uint16_t isomValue = cache.getTerrainTypeIsomValue(brush);
+    if ( isomValue == 0 || std::size_t(isomValue) >= cache.isomLinks.size() || cache.isomLinks[std::size_t(isomValue)].terrainType == 0 )
+    {
+        fail(context + ": brush " + std::to_string(brush) +
+            " is not a semantic ISOM brush of this tileset; use an id returned by map_palette_query kind=brushes");
+    }
+}
+
+void requireIsomDiamond(const MapFile& map, std::size_t isomX, std::size_t isomY, const std::string& context)
+{
+    const std::size_t maxX = map.getTileWidth() / 2;
+    const std::size_t maxY = map.getTileHeight();
+    const std::string diamond = "ISOM diamond (" + std::to_string(isomX) + ", " + std::to_string(isomY) + ")";
+    if ( isomX > maxX || isomY > maxY )
+    {
+        fail(context + ": " + diamond + " is outside the ISOM grid isomX 0.." + std::to_string(maxX) + ", isomY 0.." +
+            std::to_string(maxY) + " (isomX is a tile x / 2, isomY is a tile y)");
+    }
+    if ( (isomX + isomY) % 2 != 0 )
+        fail(context + ": " + diamond + " is not on the diamond lattice: isomX + isomY must be even (shift isomX or isomY by 1)");
+}
+
+// Every diamond whose 4x2 tile footprint lies inside the rectangle; the transition ring the
+// brush generates around them lands on the rectangle border and just outside it.
+std::vector<Chk::IsomDiamond> isomDiamondsInside(std::size_t x, std::size_t y, std::size_t width, std::size_t height)
+{
+    std::vector<Chk::IsomDiamond> diamonds;
+    const std::size_t right = x + width;
+    const std::size_t bottom = y + height;
+    for ( std::size_t dy = y + 1; dy < bottom; ++dy )
+    {
+        for ( std::size_t dx = (x + 3) / 2; 2 * dx + 2 <= right; ++dx )
+        {
+            if ( (dx + dy) % 2 == 0 )
+                diamonds.push_back(Chk::IsomDiamond{dx, dy});
+        }
+    }
+    return diamonds;
+}
+
+std::size_t countTileChanges(const std::vector<u16>& before, const std::vector<u16>& after)
+{
+    std::size_t changed = 0;
+    for ( std::size_t i = 0; i < before.size() && i < after.size(); ++i )
+    {
+        if ( before[i] != after[i] )
+            ++changed;
+    }
+    return changed;
+}
+
 std::string unitFingerprint(const Chk::Unit& unit)
 {
     return sha256Bytes(&unit, sizeof(unit));
@@ -1846,16 +1911,51 @@ int mapEdit(const char* inputMapPath, const char* outputMapPath, const char* sta
         else if ( name == "terrain.isom_brush" )
         {
             exactFields(operation, {"op", "isomX", "isomY", "brush", "extent"}, context);
-            ScMap scMap = copyToScMap(map);
-            Chk::IsomCache cache(map.getTileset(), map.getTileWidth(), map.getTileHeight(), assets->isom.get(map.getTileset()));
             const std::size_t isomX = checkedSize(operation, "isomX", context);
             const std::size_t isomY = checkedSize(operation, "isomY", context);
             const std::size_t brush = checkedSize(operation, "brush", context, true);
             const std::size_t extent = checkedSize(operation, "extent", context, true);
+            requireIsomSection(map, context);
+            Chk::IsomCache cache(map.getTileset(), map.getTileWidth(), map.getTileHeight(), assets->isom.get(map.getTileset()));
+            requireIsomBrush(cache, brush, context);
+            requireIsomDiamond(map, isomX, isomY, context);
+            ScMap scMap = copyToScMap(map);
             if ( !scMap.placeIsomTerrain({isomX, isomY}, brush, extent, cache) ) fail(context + ": semantic ISOM brush placement failed");
             scMap.updateTilesFromIsom(cache);
+            const std::size_t changedTiles = countTileChanges(map.tiles, scMap.tiles);
             copyFromScMap(map, scMap);
-            effects.emplace_back(effect(name, "terrain", index));
+            Json::Object isomEffect = effect(name, "terrain", index);
+            isomEffect.insert_or_assign("diamonds", extent * extent);
+            isomEffect.insert_or_assign("changedTiles", changedTiles);
+            effects.emplace_back(std::move(isomEffect));
+        }
+        else if ( name == "terrain.isom_rect" )
+        {
+            exactFields(operation, {"op", "x", "y", "width", "height", "brush"}, context);
+            const std::size_t x = checkedSize(operation, "x", context);
+            const std::size_t y = checkedSize(operation, "y", context);
+            const std::size_t width = checkedSize(operation, "width", context, true);
+            const std::size_t height = checkedSize(operation, "height", context, true);
+            const std::size_t brush = checkedSize(operation, "brush", context, true);
+            if ( x + width > map.getTileWidth() || y + height > map.getTileHeight() ) fail(context + ": terrain rectangle is outside map");
+            requireIsomSection(map, context);
+            Chk::IsomCache cache(map.getTileset(), map.getTileWidth(), map.getTileHeight(), assets->isom.get(map.getTileset()));
+            requireIsomBrush(cache, brush, context);
+            const std::vector<Chk::IsomDiamond> diamonds = isomDiamondsInside(x, y, width, height);
+            if ( diamonds.empty() )
+            {
+                fail(context + ": terrain rectangle " + std::to_string(width) + "x" + std::to_string(height) + " at (" + std::to_string(x) + ", " +
+                    std::to_string(y) + ") holds no whole ISOM diamond (a 4x2 tile footprint on the diamond lattice); use at least 5x3 tiles");
+            }
+            ScMap scMap = copyToScMap(map);
+            if ( !scMap.placeIsomTerrainDiamonds(diamonds, brush, cache) ) fail(context + ": semantic ISOM brush placement failed");
+            scMap.updateTilesFromIsom(cache);
+            const std::size_t changedTiles = countTileChanges(map.tiles, scMap.tiles);
+            copyFromScMap(map, scMap);
+            Json::Object isomEffect = effect(name, "terrain", index);
+            isomEffect.insert_or_assign("diamonds", diamonds.size());
+            isomEffect.insert_or_assign("changedTiles", changedTiles);
+            effects.emplace_back(std::move(isomEffect));
         }
         else if ( name == "unit.add" )
         {

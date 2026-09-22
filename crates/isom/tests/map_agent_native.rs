@@ -1396,3 +1396,207 @@ fn map_new_rejects_invalid_specs_without_writing() {
     );
     assert!(!output.exists());
 }
+
+fn try_operations(input: &Path, tag: &str, operations: Value) -> Result<(PathBuf, Value), String> {
+    let (tileset, width, height, _) = map_header(input);
+    let output = temp_map(tag);
+    let batch = json!({
+        "schema": "eud-map-edit/1",
+        "expected": {
+            "inputFileSha256": file_hash(input),
+            "tileset": tileset,
+            "width": width,
+            "height": height
+        },
+        "operations": operations
+    });
+    match isom::mapedit(
+        input,
+        &output,
+        &starcraft_path(),
+        batch.to_string().as_bytes(),
+    ) {
+        Ok(report) => Ok((output, serde_json::from_str(&report).unwrap())),
+        Err(error) => {
+            assert!(
+                !output.exists(),
+                "{tag}: a refused batch must not write output"
+            );
+            Err(error.to_string())
+        }
+    }
+}
+
+fn mtxm_tiles(map: &Path) -> Vec<u16> {
+    sections(&isom::chk_extract(map).unwrap())["MTXM"]
+        .chunks_exact(2)
+        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+        .collect()
+}
+
+/// Every graphics-valid tile id of one terrain type, paged through the bounded catalog.
+fn tile_ids_of_terrain_type(starcraft: &Path, tileset: u8, terrain_type: u16) -> BTreeSet<u16> {
+    let mut ids = BTreeSet::new();
+    let mut offset = 0_u64;
+    loop {
+        let request = json!({
+            "schema": "eud-map-catalog/1",
+            "kind": "tiles",
+            "tileset": tileset,
+            "offset": offset,
+            "limit": 512,
+            "filter": {"terrainType": terrain_type, "graphicsValid": true}
+        });
+        let page: Value = serde_json::from_str(
+            &isom::catalog_query(starcraft, request.to_string().as_bytes()).unwrap(),
+        )
+        .unwrap();
+        let entries = page["entries"].as_array().unwrap();
+        ids.extend(
+            entries
+                .iter()
+                .map(|entry| entry["id"].as_u64().unwrap() as u16),
+        );
+        offset += entries.len() as u64;
+        if entries.is_empty() || offset >= page["total"].as_u64().unwrap() {
+            return ids;
+        }
+    }
+}
+
+#[test]
+#[ignore = "loads installed StarCraft terrain assets and paints semantic ISOM terrain on a new map"]
+fn semantic_isom_rect_paints_a_hill_and_isom_brush_names_every_refusal() {
+    let starcraft = starcraft_path();
+    let tileset = 4_u8; // jungle: low and high ground brushes
+    let (ground, ground_name) = first_brush(&starcraft, tileset);
+    let catalog: Value = serde_json::from_str(
+        &isom::catalog_query(
+            &starcraft,
+            json!({"schema": "eud-map-catalog/1", "kind": "brushes", "tileset": tileset, "offset": 0, "limit": 64})
+                .to_string()
+                .as_bytes(),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let high = catalog["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| {
+            entry["graphicsValid"] == true
+                && entry["name"].as_str().unwrap().starts_with("High")
+                && entry["terrainType"].as_u64().unwrap() as u16 != ground
+        })
+        .expect("jungle exposes a High brush");
+    let high_type = high["terrainType"].as_u64().unwrap() as u16;
+    let source = temp_map("isom-source");
+    isom::map_new(&source, &starcraft, &blank_spec(tileset, 64, 64, ground)).unwrap();
+    let base = mtxm_tiles(&source);
+
+    // Refusals name the exact rule the model must correct.
+    let odd = try_operations(
+        &source,
+        "isom-odd",
+        json!([{"op": "terrain.isom_brush", "isomX": 11, "isomY": 20, "brush": high_type, "extent": 1}]),
+    )
+    .unwrap_err();
+    assert!(odd.contains("isomX + isomY must be even"), "{odd}");
+    let outside = try_operations(
+        &source,
+        "isom-outside",
+        json!([{"op": "terrain.isom_brush", "isomX": 40, "isomY": 20, "brush": high_type, "extent": 1}]),
+    )
+    .unwrap_err();
+    assert!(
+        outside.contains("outside the ISOM grid isomX 0..32, isomY 0..64"),
+        "{outside}"
+    );
+    let foreign = try_operations(
+        &source,
+        "isom-foreign-brush",
+        json!([{"op": "terrain.isom_brush", "isomX": 10, "isomY": 20, "brush": 4000, "extent": 1}]),
+    )
+    .unwrap_err();
+    assert!(
+        foreign.contains("brush 4000 is not a semantic ISOM brush"),
+        "{foreign}"
+    );
+    let tiny = try_operations(
+        &source,
+        "isom-rect-tiny",
+        json!([{"op": "terrain.isom_rect", "x": 20, "y": 20, "width": 2, "height": 2, "brush": high_type}]),
+    )
+    .unwrap_err();
+    assert!(tiny.contains("holds no whole ISOM diamond"), "{tiny}");
+
+    // One valid diamond changes tiles and reports how many.
+    let (single, report) = try_operations(
+        &source,
+        "isom-single",
+        json!([{"op": "terrain.isom_brush", "isomX": 10, "isomY": 20, "brush": high_type, "extent": 1}]),
+    )
+    .unwrap();
+    let effect = &report["effects"][0];
+    assert_eq!(effect["op"], "terrain.isom_brush");
+    assert_eq!(effect["diamonds"], 1);
+    let single_changed = mtxm_tiles(&single)
+        .iter()
+        .zip(&base)
+        .filter(|(after, before)| after != before)
+        .count();
+    assert!(single_changed > 0, "a valid diamond must change tiles");
+    assert_eq!(effect["changedTiles"], single_changed);
+
+    // A tile rectangle becomes a plateau of the high brush with the transition ring around it.
+    let (x, y, width, height) = (16_usize, 16_usize, 16_usize, 12_usize);
+    let (hill, report) = try_operations(
+        &source,
+        "isom-rect",
+        json!([{"op": "terrain.isom_rect", "x": x, "y": y, "width": width, "height": height, "brush": high_type}]),
+    )
+    .unwrap();
+    let effect = &report["effects"][0];
+    assert_eq!(effect["op"], "terrain.isom_rect");
+    assert!(effect["diamonds"].as_u64().unwrap() > 1);
+    let tiles = mtxm_tiles(&hill);
+    let high_ids = tile_ids_of_terrain_type(&starcraft, tileset, high_type);
+    assert!(!high_ids.is_empty());
+    let mut changed = Vec::new();
+    for (index, (after, before)) in tiles.iter().zip(&base).enumerate() {
+        if after != before {
+            changed.push((index % 64, index / 64));
+        }
+    }
+    assert_eq!(effect["changedTiles"], changed.len());
+    // Jungle cliffs are two diamonds thick: the ring reaches 8 tiles sideways and 4 tiles up/down.
+    for (tx, ty) in &changed {
+        assert!(
+            *tx + 8 >= x && *tx < x + width + 8 && *ty + 4 >= y && *ty < y + height + 4,
+            "tile ({tx}, {ty}) changed far outside the {width}x{height} rectangle at ({x}, {y})"
+        );
+    }
+    let mut plateau = 0_usize;
+    for ty in y + 3..y + height - 3 {
+        for tx in x + 4..x + width - 4 {
+            let tile = tiles[ty * 64 + tx];
+            assert!(
+                high_ids.contains(&tile),
+                "interior tile ({tx}, {ty}) = {tile} is not {} (brush {high_type}) over {ground_name}",
+                high["name"]
+            );
+            plateau += 1;
+        }
+    }
+    assert!(plateau > 0);
+    assert!(
+        changed.len() > plateau,
+        "the transition ring must add tiles beyond the plateau ({} changed, {plateau} interior)",
+        changed.len()
+    );
+    for path in [source, single, hill] {
+        fs::remove_file(path).ok();
+    }
+}
+

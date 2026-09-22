@@ -1310,6 +1310,12 @@ fn map_operation_schema() -> Value {
             &["tiles"],
             &["x", "y"],
         ),
+        map_operation_leaf(
+            &["terrain.isom_rect"],
+            json!({"width": u16_schema(), "height": u16_schema(), "brush": u16_schema()}),
+            &["width", "height", "brush"],
+            &["x", "y"],
+        ),
     ]}]});
 
     let target_identity = json!({
@@ -1822,6 +1828,21 @@ fn map_stamp_destinations_schema() -> Value {
     })
 }
 
+/// Maximum tiles one `map_terrain_read`/`map_draft_terrain_read` call returns.
+pub const MAP_TERRAIN_READ_MAX_TILES: usize = 4096;
+
+fn map_terrain_read_schema() -> Value {
+    schema(
+        json!({
+            "x": u16_schema(),
+            "y": u16_schema(),
+            "width": positive_u16_schema(),
+            "height": positive_u16_schema(),
+        }),
+        &["x", "y", "width", "height"],
+    )
+}
+
 fn map_stamp_source_schema() -> Value {
     json!({
         "oneOf": [
@@ -1879,6 +1900,11 @@ pub fn map_tool_registry() -> Vec<ToolSpec> {
                 }),
                 &["x", "y", "width", "height"],
             ),
+        ),
+        read_tool(
+            "map_terrain_read",
+            "Read exact MTXM tile ids of the visible candidate in one bounded rectangle: row-major rows of ids whose top-left is (x, y); at most 4096 tiles per call. Read ids here before terrain.set or when replicating an existing pattern; never probe tile ids with terrain.set expected-before values.",
+            map_terrain_read_schema(),
         ),
         read_tool(
             "map_palette_query",
@@ -1959,6 +1985,11 @@ pub fn map_tool_registry() -> Vec<ToolSpec> {
                 }),
                 &["x", "y", "width", "height"],
             ),
+        ),
+        read_tool(
+            "map_draft_terrain_read",
+            "Read exact MTXM tile ids of the request draft (after map_draft_begin and any map_draft_patch) in one bounded rectangle: row-major rows, at most 4096 tiles per call.",
+            map_terrain_read_schema(),
         ),
         read_tool(
             "map_draft_analyze",
@@ -6608,6 +6639,11 @@ mod tests {
                 &["op", "x", "y", "tiles"],
             ),
             (
+                "terrain.isom_rect",
+                &["op", "x", "y", "width", "height", "brush"],
+                &["op", "x", "y", "width", "height", "brush"],
+            ),
+            (
                 "terrain.isom_brush",
                 &["op", "isomX", "isomY", "brush", "extent"],
                 &["op", "isomX", "isomY", "brush"],
@@ -6718,6 +6754,11 @@ mod tests {
             ("terrain.rect", "after"),
             ("terrain.blit", "x"),
             ("terrain.blit", "y"),
+            ("terrain.isom_rect", "x"),
+            ("terrain.isom_rect", "y"),
+            ("terrain.isom_rect", "width"),
+            ("terrain.isom_rect", "height"),
+            ("terrain.isom_rect", "brush"),
             ("terrain.isom_brush", "isomX"),
             ("terrain.isom_brush", "isomY"),
             ("terrain.isom_brush", "brush"),
@@ -7026,12 +7067,14 @@ mod tests {
         let normalized_bytes = serde_json::to_vec(&codex_normalized_map_schema(&schema))
             .expect("normalized Map schema must serialize")
             .len();
+        // terrain.isom_rect (the tile-rectangle semantic brush) added ~190 B on top of the
+        // original 5 000 B guard; the guard only bounds growth, no adapter enforces it.
         assert!(
-            normalized_bytes <= 5_000,
+            normalized_bytes <= 5_500,
             "Map schema exceeds the Codex normalized budget: {normalized_bytes}B"
         );
         let operations = materialized_map_operations(&schema);
-        assert_eq!(operations.len(), 20);
+        assert_eq!(operations.len(), 21);
         let validator = jsonschema::JSONSchema::options()
             .with_draft(jsonschema::Draft::Draft7)
             .compile(&schema)
@@ -7109,6 +7152,75 @@ mod tests {
     }
 
     #[test]
+    fn map_terrain_read_tools_are_read_only_and_require_a_bounded_rectangle() {
+        let registry = map_tool_registry();
+        for name in ["map_terrain_read", "map_draft_terrain_read"] {
+            let tool = registry
+                .iter()
+                .find(|tool| tool.name == name)
+                .unwrap_or_else(|| panic!("{name} must be registered"));
+            assert!(!tool.requires_write_workspace);
+            assert!(!tool.requires_project_transaction);
+            assert_object_contract(
+                &tool.input_schema,
+                &["x", "y", "width", "height"],
+                &["x", "y", "width", "height"],
+            );
+            assert!(tool.description.contains("4096"));
+
+            let rect = json!({"x": 0, "y": 0, "width": 8, "height": 8});
+            assert_eq!(validate_map_tool_call(name, &rect), Ok(()));
+            for missing in ["x", "y", "width", "height"] {
+                let mut args = rect.clone();
+                args.as_object_mut().unwrap().remove(missing);
+                assert!(
+                    matches!(
+                        validate_map_tool_call(name, &args),
+                        Err(ToolError::AdmissionRejected { .. })
+                    ),
+                    "{name} must require {missing}"
+                );
+            }
+            for (field, value) in [
+                ("x", json!(-1)),
+                ("y", json!(-1)),
+                ("width", json!(0)),
+                ("height", json!(-4)),
+                ("width", json!("8")),
+                ("x", json!(1.5)),
+            ] {
+                let mut args = rect.clone();
+                args[field] = value.clone();
+                assert!(
+                    matches!(
+                        validate_map_tool_call(name, &args),
+                        Err(ToolError::AdmissionRejected { .. })
+                    ),
+                    "{name} must reject {field}={value}"
+                );
+            }
+            let mut extra = rect.clone();
+            extra["scale"] = json!(4);
+            assert!(matches!(
+                validate_map_tool_call(name, &extra),
+                Err(ToolError::AdmissionRejected { .. })
+            ));
+        }
+        assert!(
+            map_mcp_tool_descriptors()
+                .iter()
+                .filter(|descriptor| {
+                    matches!(
+                        descriptor["name"].as_str(),
+                        Some("map_terrain_read" | "map_draft_terrain_read")
+                    )
+                })
+                .count()
+                == 2
+        );
+    }
+
+    #[test]
     fn map_draft_patch_operations_guide_mirrors_every_documented_operation() {
         let schema = map_tool_registry()
             .into_iter()
@@ -7130,13 +7242,14 @@ mod tests {
             .flat_map(|shape| shape.ops.iter().cloned())
             .collect::<BTreeSet<_>>();
         assert_eq!(guided_ops, documented_ops);
-        assert_eq!(guided_ops.len(), 20);
+        assert_eq!(guided_ops.len(), 21);
 
         let guide = map_draft_patch_operations_guide();
         for line in [
             "- terrain.set: x, y, before, after",
             "- terrain.rect: x, y, width, height, after",
             "- terrain.blit: x, y, tiles",
+            "- terrain.isom_rect: x, y, width, height, brush",
             "- terrain.isom_brush: isomX, isomY, brush, [extent]",
             "- unit.add: state{typeId, owner, x, y [",
             "- unit.set: ordinal, beforeFingerprint, state{[",
@@ -7312,7 +7425,7 @@ mod tests {
             .iter()
             .map(required_map_schema_example)
             .collect::<Vec<_>>();
-        assert_eq!(operations.len(), 20);
+        assert_eq!(operations.len(), 21);
         for operation in &operations {
             assert_eq!(
                 validate_map_tool_call("map_draft_patch", &json!({"operations": [operation]})),

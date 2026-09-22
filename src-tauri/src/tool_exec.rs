@@ -1658,6 +1658,11 @@ impl SessionToolRuntime {
                     candidates.context().starcraft_path()?.as_path(),
                 )
             }
+            "map_terrain_read" => {
+                let state = candidates.state(&project_id, &self.session_id)?;
+                let map = candidates.current_map(&project_id, &self.session_id)?;
+                terrain_read_tool(&map, &state, args)
+            }
             "map_palette_query" => {
                 let state = candidates.state(&project_id, &self.session_id)?;
                 let request = map_palette_catalog_request(args, state.baseline.tileset.era())?;
@@ -1823,6 +1828,11 @@ impl SessionToolRuntime {
                     args,
                     candidates.context().starcraft_path()?.as_path(),
                 )
+            }
+            "map_draft_terrain_read" => {
+                let state = candidates.state(&project_id, &self.session_id)?;
+                let map = candidates.draft_map(&self.session_id, request_id)?;
+                terrain_read_tool(&map, &state, args)
             }
             "map_draft_analyze" => serde_json::to_value(candidates.draft_analyze(
                 &project_id,
@@ -4386,6 +4396,78 @@ fn render_map_tool(
     crate::map_agent::mcp_image(&image)
 }
 
+/// Exact MTXM tile ids of one bounded rectangle of `map` (the visible
+/// candidate or the request draft), returned as row-major rows so the model
+/// reads ids instead of probing them through `terrain.set` conflicts.
+fn terrain_read_tool(
+    map: &std::path::Path,
+    state: &crate::map_candidate::CandidateStateView,
+    args: &Value,
+) -> Result<Value, String> {
+    let required = |name: &str| -> Result<usize, String> {
+        if args.get(name).is_none() {
+            return Err(format!("argument '{name}' is required"));
+        }
+        usize_arg_default(args, name, 0)
+    };
+    let x = required("x")?;
+    let y = required("y")?;
+    let width = required("width")?;
+    let height = required("height")?;
+    let map_width = usize::from(state.baseline.width);
+    let map_height = usize::from(state.baseline.height);
+    if width == 0 || height == 0 {
+        return Err("map terrain read rectangle must have a nonzero width and height".to_string());
+    }
+    let count = width.saturating_mul(height);
+    if count > tools::MAP_TERRAIN_READ_MAX_TILES {
+        return Err(format!(
+            "map terrain read covers {count} tiles; read at most {} tiles per call; split the rectangle",
+            tools::MAP_TERRAIN_READ_MAX_TILES
+        ));
+    }
+    if x >= map_width || y >= map_height || width > map_width - x || height > map_height - y {
+        return Err(format!(
+            "map terrain read rectangle ({x},{y},{width},{height}) is outside candidate dimensions {map_width}x{map_height}"
+        ));
+    }
+    let chk = isom::chk_extract(map).map_err(|error| error.to_string())?;
+    let digest = crate::chk::digest_chk(&chk);
+    let stride = usize::from(digest.map.width);
+    if stride != map_width || usize::from(digest.map.height) != map_height {
+        return Err(format!(
+            "map dimensions {}x{} do not match the candidate baseline {map_width}x{map_height}",
+            digest.map.width, digest.map.height
+        ));
+    }
+    if digest.tiles.len() < map_width * map_height {
+        return Err(format!(
+            "MTXM holds {} of {} expected tiles; the map terrain is incomplete",
+            digest.tiles.len(),
+            map_width * map_height
+        ));
+    }
+    let rows = (y..y + height)
+        .map(|row| {
+            let start = row * stride + x;
+            Value::Array(
+                digest.tiles[start..start + width]
+                    .iter()
+                    .map(|tile| json!(tile))
+                    .collect(),
+            )
+        })
+        .collect::<Vec<_>>();
+    Ok(json!({
+        "x": x,
+        "y": y,
+        "width": width,
+        "height": height,
+        "count": count,
+        "rows": rows,
+    }))
+}
+
 pub(crate) struct MapObjectSnapshot {
     layers: std::collections::BTreeMap<&'static str, Vec<Value>>,
 }
@@ -5914,6 +5996,240 @@ mod tests {
         candidates
             .finish_request("map-session", "request-2")
             .unwrap();
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// A candidate session on the rich fixture with one open request; returns
+    /// the store, the runtime, the context (dimensions) and the temp root.
+    fn open_map_fixture_session(
+        tag: &str,
+    ) -> (
+        crate::map_candidate::CandidateStore,
+        SessionToolRuntime,
+        crate::map_context::MapContextSnapshot,
+        PathBuf,
+    ) {
+        let root = std::env::temp_dir().join(format!("map-{tag}-{}", uuid::Uuid::new_v4()));
+        let dirs = DataDirs::from_bases(&root.join("roaming"), &root.join("local"));
+        dirs.ensure_dirs().unwrap();
+        let source = root.join("source.scx");
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("crates")
+            .join("isom")
+            .join("tests")
+            .join("fixtures")
+            .join("map_agent_rich.scx");
+        std::fs::copy(fixture, &source).unwrap();
+        let context_service = crate::map_context::MapContextService::new(dirs.clone());
+        let revision = context_service
+            .revision_for_path("project".to_string(), &source)
+            .unwrap();
+        let chk = isom::chk_extract(&source).unwrap();
+        let context = crate::map_context::MapContextSnapshot {
+            revision,
+            saved_source_notice: "saved".to_string(),
+            source_file_size: std::fs::metadata(&source).unwrap().len(),
+            starcraft_path: PathBuf::from(r"C:\Program Files (x86)\StarCraft"),
+            digest: crate::chk::digest_chk(&chk),
+        };
+        let candidates = crate::map_candidate::CandidateStore::new(
+            dirs.clone(),
+            crate::map_import::MapImportStore::new(dirs.clone()),
+        );
+        candidates.create_session("map-session", &context).unwrap();
+        candidates
+            .prepare_request("project", "map-session", "request", 0, &[])
+            .unwrap();
+        let services = ToolServices::new(
+            dirs,
+            candidates.clone(),
+            crate::write_coordinator::ProjectWriteCoordinator::silent(),
+        );
+        let runtime = services.map_session("map-session");
+        runtime.begin_request("request", "project").unwrap();
+        (candidates, runtime, context, root)
+    }
+
+    fn expected_terrain_rows(
+        digest: &crate::chk::Digest,
+        x: usize,
+        y: usize,
+        width: usize,
+        height: usize,
+    ) -> Value {
+        let stride = usize::from(digest.map.width);
+        json!((y..y + height)
+            .map(|row| digest.tiles[row * stride + x..row * stride + x + width].to_vec())
+            .collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn map_terrain_read_returns_row_major_candidate_tiles_within_bounds_and_cap() {
+        let (candidates, runtime, context, root) = open_map_fixture_session("terrain-read");
+        let width = usize::from(context.digest.map.width);
+        let height = usize::from(context.digest.map.height);
+        assert!(width >= 8 && height >= 8, "fixture is {width}x{height}");
+
+        let rect = runtime
+            .execute(
+                "map_terrain_read",
+                &json!({"x": 3, "y": 2, "width": 5, "height": 4}),
+            )
+            .unwrap();
+        assert_eq!(rect["x"], 3);
+        assert_eq!(rect["y"], 2);
+        assert_eq!(rect["width"], 5);
+        assert_eq!(rect["height"], 4);
+        assert_eq!(rect["count"], 20);
+        assert_eq!(
+            rect["rows"],
+            expected_terrain_rows(&context.digest, 3, 2, 5, 4)
+        );
+
+        // The bottom-right corner is readable exactly up to the map edge.
+        let corner = runtime
+            .execute(
+                "map_terrain_read",
+                &json!({"x": width - 2, "y": height - 3, "width": 2, "height": 3}),
+            )
+            .unwrap();
+        assert_eq!(
+            corner["rows"],
+            expected_terrain_rows(&context.digest, width - 2, height - 3, 2, 3)
+        );
+
+        for args in [
+            json!({"x": width - 1, "y": 0, "width": 2, "height": 1}),
+            json!({"x": 0, "y": height, "width": 1, "height": 1}),
+            json!({"x": width, "y": 0, "width": 1, "height": 1}),
+        ] {
+            let error = runtime.execute("map_terrain_read", &args).unwrap_err();
+            assert!(
+                error.contains("outside candidate dimensions"),
+                "{args}: {error}"
+            );
+        }
+        let capped = runtime
+            .execute(
+                "map_terrain_read",
+                &json!({"x": 0, "y": 0, "width": 4097, "height": 1}),
+            )
+            .unwrap_err();
+        assert!(
+            capped.contains("read at most 4096 tiles per call; split the rectangle"),
+            "got: {capped}"
+        );
+        // Admission rejects a missing field before the tool runs.
+        let missing = runtime
+            .execute("map_terrain_read", &json!({"x": 0, "y": 0, "width": 1}))
+            .unwrap_err();
+        assert!(missing.contains("height"), "got: {missing}");
+
+        // The draft reader needs a draft; a fresh draft equals the candidate.
+        let no_draft = runtime
+            .execute(
+                "map_draft_terrain_read",
+                &json!({"x": 0, "y": 0, "width": 1, "height": 1}),
+            )
+            .unwrap_err();
+        assert!(no_draft.contains("no draft"), "got: {no_draft}");
+        runtime.execute("map_draft_begin", &json!({})).unwrap();
+        let draft = runtime
+            .execute(
+                "map_draft_terrain_read",
+                &json!({"x": 3, "y": 2, "width": 5, "height": 4}),
+            )
+            .unwrap();
+        assert_eq!(draft["rows"], rect["rows"]);
+
+        candidates.finish_request("map-session", "request").unwrap();
+        runtime.clear_current();
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    #[ignore = "requires installed StarCraft terrain assets"]
+    fn map_draft_terrain_read_reflects_terrain_rect_patches_while_the_candidate_does_not() {
+        let (candidates, runtime, context, root) = open_map_fixture_session("draft-terrain-read");
+        let (x, y, width, height) = (4_usize, 5_usize, 3_usize, 2_usize);
+        let before = runtime
+            .execute(
+                "map_terrain_read",
+                &json!({"x": x, "y": y, "width": width, "height": height}),
+            )
+            .unwrap();
+        assert_eq!(
+            before["rows"],
+            expected_terrain_rows(&context.digest, x, y, width, height)
+        );
+        let current = before["rows"][0][0].as_u64().unwrap() as u16;
+        let catalog: Value = serde_json::from_str(
+            &isom::catalog_query(
+                &context.starcraft_path,
+                json!({
+                    "schema": "eud-map-catalog/1",
+                    "kind": "tiles",
+                    "tileset": context.revision.tileset.era(),
+                    "offset": 0,
+                    "limit": 512,
+                })
+                .to_string()
+                .as_bytes(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let after = catalog["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["graphicsValid"] == true && entry["id"] != current)
+            .and_then(|entry| entry["id"].as_u64())
+            .unwrap();
+
+        runtime.execute("map_draft_begin", &json!({})).unwrap();
+        runtime
+            .execute(
+                "map_draft_patch",
+                &json!({
+                    "operations": [{
+                        "op": "terrain.rect",
+                        "x": x,
+                        "y": y,
+                        "width": width,
+                        "height": height,
+                        "after": after,
+                    }]
+                }),
+            )
+            .unwrap();
+
+        let draft = runtime
+            .execute(
+                "map_draft_terrain_read",
+                &json!({"x": x, "y": y, "width": width, "height": height}),
+            )
+            .unwrap();
+        assert_eq!(draft["count"], width * height);
+        assert_eq!(
+            draft["rows"],
+            json!(vec![vec![after; width]; height]),
+            "draft must show the patched rectangle"
+        );
+        let candidate = runtime
+            .execute(
+                "map_terrain_read",
+                &json!({"x": x, "y": y, "width": width, "height": height}),
+            )
+            .unwrap();
+        assert_eq!(
+            candidate["rows"], before["rows"],
+            "the visible candidate is unchanged until finalize/commit"
+        );
+
+        candidates.finish_request("map-session", "request").unwrap();
+        runtime.clear_current();
         std::fs::remove_dir_all(root).ok();
     }
 
