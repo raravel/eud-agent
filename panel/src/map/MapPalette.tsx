@@ -14,6 +14,7 @@ import {
 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Spinner } from "@/components/ui/spinner";
 import { cn } from "@/lib/utils";
@@ -282,6 +283,7 @@ export function MapPalette({
 }: MapPaletteProps) {
   const [layer, setLayer] = useState<MapLayer>("terrain");
   const [terrainMode, setTerrainMode] = useState<"tiles" | "brushes">("tiles");
+  const [hideNullTiles, setHideNullTiles] = useState(false);
   const [query, setQuery] = useState("");
   const [entries, setEntries] = useState<PaletteEntry[]>([]);
   const [offset, setOffset] = useState(0);
@@ -295,7 +297,14 @@ export function MapPalette({
     let active = true;
     const timer = window.setTimeout(() => {
       setLoading(true);
-      void mapCatalog({ sessionId, kind, query, offset, limit: 100 })
+      void mapCatalog({
+        sessionId,
+        kind,
+        query,
+        offset,
+        limit: 100,
+        hideNullTiles: kind === "tiles" && hideNullTiles,
+      })
         .then((result) => {
           if (!active) return;
           setEntries(result.entries);
@@ -313,7 +322,7 @@ export function MapPalette({
       active = false;
       window.clearTimeout(timer);
     };
-  }, [kind, layer, offset, query, sessionId]);
+  }, [hideNullTiles, kind, layer, offset, query, sessionId]);
 
   const filteredLocations = useMemo(() => {
     const normalized = query.trim().toLocaleLowerCase();
@@ -440,6 +449,21 @@ export function MapPalette({
               지형 브러시
             </Button>
             <span className="ml-auto text-[10px] text-muted-foreground">{tileset}</span>
+          </div>
+        )}
+        {exactTerrain && (
+          <div className="flex min-h-11 items-center gap-2 text-xs">
+            <Checkbox
+              id="palette-hide-null-tiles"
+              checked={hideNullTiles}
+              onCheckedChange={(checked) => {
+                setHideNullTiles(checked === true);
+                setOffset(0);
+                setEntries([]);
+                setTotal(0);
+              }}
+            />
+            <label htmlFor="palette-hide-null-tiles">null 타일 제외</label>
           </div>
         )}
       </div>

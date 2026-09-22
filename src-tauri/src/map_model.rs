@@ -212,9 +212,13 @@ impl SelectionMask {
             })
     }
 
+    /// Hash of the authoritative selection content (id, label, role, layers,
+    /// bounds, cells). `source_revision` is excluded on purpose: the palette
+    /// rebinds every saved selection to each new candidate revision, and a
+    /// region mention must stay valid across that rebinding while any content
+    /// change still invalidates it.
     pub fn snapshot_hash(&self) -> String {
-        let bytes = serde_json::to_vec(self).expect("selection masks are serializable");
-        hex_sha256(&bytes)
+        crate::map_stamp::PersistentSelection::from_selection(self).snapshot_hash()
     }
 
     pub fn cells(&self) -> BTreeSet<(u16, u16)> {

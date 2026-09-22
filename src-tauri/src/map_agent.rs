@@ -144,6 +144,9 @@ pub struct MapCatalogCommand {
     pub offset: u32,
     #[serde(default = "catalog_limit")]
     pub limit: u16,
+    /// Tiles only: drop the null (megatile 0) variants from the page.
+    #[serde(default)]
+    pub hide_null_tiles: bool,
 }
 
 const fn catalog_limit() -> u16 {
@@ -730,7 +733,9 @@ impl MapAgentService {
             "offset": command.offset,
             "limit": command.limit,
             "query": command.query,
-            "filter": if command.kind == "tiles" {
+            "filter": if command.kind == "tiles" && command.hide_null_tiles {
+                json!({"graphicsValid": true, "nullTile": false})
+            } else if command.kind == "tiles" {
                 json!({"graphicsValid": true})
             } else {
                 json!({})

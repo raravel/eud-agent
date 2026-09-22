@@ -633,6 +633,7 @@ export function mapCatalog(command: {
   query?: string;
   offset?: number;
   limit?: number;
+  hideNullTiles?: boolean;
 }): Promise<CatalogResult> {
   return invoke("map_agent_catalog", { command });
 }

@@ -190,6 +190,70 @@ export function rowsToCells(rows: RowSpan[]): Set<string> {
   return cells;
 }
 
+export interface OutlineSegment {
+  x0: number;
+  y0: number;
+  x1: number;
+  y1: number;
+}
+
+function normalizeSpans(spans: [number, number][]): [number, number][] {
+  const sorted = spans
+    .filter(([left, right]) => right > left)
+    .map(([left, right]): [number, number] => [left, right])
+    .sort(([a], [b]) => a - b);
+  const merged: [number, number][] = [];
+  for (const [left, right] of sorted) {
+    const previous = merged.at(-1);
+    if (previous && left <= previous[1]) previous[1] = Math.max(previous[1], right);
+    else merged.push([left, right]);
+  }
+  return merged;
+}
+
+function subtractSpans(
+  [left, right]: [number, number],
+  spans: [number, number][],
+): [number, number][] {
+  const remaining: [number, number][] = [];
+  let cursor = left;
+  for (const [a, b] of spans) {
+    if (b <= cursor) continue;
+    if (a >= right) break;
+    if (a > cursor) remaining.push([cursor, a]);
+    cursor = Math.max(cursor, b);
+    if (cursor >= right) break;
+  }
+  if (cursor < right) remaining.push([cursor, right]);
+  return remaining;
+}
+
+/**
+ * Boundary edges of a row-span mask in tile units: an edge exists only where a
+ * selected tile meets an unselected one, so contiguous tiles share no line.
+ */
+export function rowSpanOutline(rows: RowSpan[]): OutlineSegment[] {
+  const byY = new Map<number, [number, number][]>();
+  for (const row of rows) {
+    byY.set(row.y, normalizeSpans([...(byY.get(row.y) ?? []), ...row.spans]));
+  }
+  const segments: OutlineSegment[] = [];
+  for (const [y, spans] of byY) {
+    const above = byY.get(y - 1) ?? [];
+    const below = byY.get(y + 1) ?? [];
+    for (const span of spans) {
+      const [left, right] = span;
+      segments.push({ x0: left, y0: y, x1: left, y1: y + 1 });
+      segments.push({ x0: right, y0: y, x1: right, y1: y + 1 });
+      for (const [a, b] of subtractSpans(span, above)) segments.push({ x0: a, y0: y, x1: b, y1: y });
+      for (const [a, b] of subtractSpans(span, below)) {
+        segments.push({ x0: a, y0: y + 1, x1: b, y1: y + 1 });
+      }
+    }
+  }
+  return segments;
+}
+
 export function selectionBounds(cells: Set<string>): TileRect | null {
   if (cells.size === 0) return null;
   const points = Array.from(cells, pointFromCellKey);

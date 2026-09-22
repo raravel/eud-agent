@@ -1346,6 +1346,7 @@ Json tileEntry(const Sc::Terrain::Tiles& tiles, Sc::Terrain::Tileset tileset, st
     result.emplace("groundHeight", static_cast<std::size_t>(record.groundHeight));
     const std::size_t mega = record.megaTileIndex[variant];
     result.emplace("megaTile", mega);
+    result.emplace("nullTile", mega == 0);
     result.emplace("graphicsValid", tileGraphicsValid(tiles, tile));
     if ( mega < tiles.tileFlags.size() )
     {
@@ -1384,6 +1385,7 @@ struct CatalogFilter {
     std::optional<std::size_t> group;
     std::optional<std::size_t> variant;
     std::optional<bool> graphicsValid;
+    std::optional<bool> nullTile;
     std::optional<std::string> walkability;
     std::optional<std::size_t> groundHeight;
     std::optional<std::size_t> buildability;
@@ -1420,7 +1422,7 @@ CatalogFilter parseCatalogFilter(const Json::Object& request, const std::string&
     const auto& input = objectValue(*value, "catalog filter");
     std::set<std::string> allowed{"id"};
     if ( kind == "tiles" )
-        allowed.insert({"terrainType", "group", "variant", "graphicsValid", "walkability", "groundHeight",
+        allowed.insert({"terrainType", "group", "variant", "graphicsValid", "nullTile", "walkability", "groundHeight",
             "buildability", "ramp", "blocksView"});
     else if ( kind == "brushes" )
         allowed.insert({"terrainType", "graphicsValid", "walkability", "groundHeight", "buildability", "ramp", "blocksView"});
@@ -1445,6 +1447,7 @@ CatalogFilter parseCatalogFilter(const Json::Object& request, const std::string&
     filter.group = catalogSizeFilter(input, "group", Sc::Terrain::Cv5Dat::MaxTileGroups - 1);
     filter.variant = catalogSizeFilter(input, "variant", 15);
     filter.graphicsValid = catalogBoolFilter(input, "graphicsValid");
+    filter.nullTile = catalogBoolFilter(input, "nullTile");
     if ( const Json* walkability = optionalField(input, "walkability"); walkability != nullptr )
     {
         const std::string& name = stringValue(*walkability, "catalog filter.walkability");
@@ -1499,6 +1502,7 @@ bool catalogFilterMatches(const Json::Object& entry, const CatalogFilter& filter
            catalogSizeMatches(entry, "group", filter.group) &&
            catalogSizeMatches(entry, "variant", filter.variant) &&
            catalogBoolMatches(entry, "graphicsValid", filter.graphicsValid) &&
+           catalogBoolMatches(entry, "nullTile", filter.nullTile) &&
            catalogStringMatches(entry, "walkability", filter.walkability) &&
            catalogSizeMatches(entry, "groundHeight", filter.groundHeight) &&
            catalogSizeMatches(entry, "buildability", filter.buildability) &&

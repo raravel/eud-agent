@@ -20,6 +20,7 @@ import {
 } from "./canvasTransform";
 import {
   cellsToRows,
+  rowSpanOutline,
   selectionCellsForGesture,
   type TilePoint,
 } from "./selectionMask";
@@ -107,6 +108,31 @@ const selectionStyle: Record<SelectionMask["role"], { fill: string; stroke: stri
   protect: { fill: "rgba(244,63,94,.13)", stroke: "#fb7185", dash: [3, 3] },
   anchor: { fill: "rgba(245,158,11,.12)", stroke: "#fbbf24", dash: [10, 4, 2, 4] },
 };
+
+function strokeRowOutline(
+  context: CanvasRenderingContext2D,
+  rows: RowSpan[],
+  transform: CanvasTransform,
+  crop?: { x: number; y: number; width: number; height: number },
+): void {
+  context.beginPath();
+  for (const segment of rowSpanOutline(rows)) {
+    if (
+      crop &&
+      (Math.max(segment.x0, segment.x1) < crop.x ||
+        Math.min(segment.x0, segment.x1) > crop.x + crop.width ||
+        Math.max(segment.y0, segment.y1) < crop.y ||
+        Math.min(segment.y0, segment.y1) > crop.y + crop.height)
+    ) {
+      continue;
+    }
+    const from = mapToScreen({ x: segment.x0 * 32, y: segment.y0 * 32 }, transform);
+    const to = mapToScreen({ x: segment.x1 * 32, y: segment.y1 * 32 }, transform);
+    context.moveTo(from.x, from.y);
+    context.lineTo(to.x, to.y);
+  }
+  context.stroke();
+}
 
 function nativeScaleForZoom(zoom: number): number {
   if (zoom >= 0.75) return 1;
@@ -598,9 +624,9 @@ export function MapCanvas({
           const screen = mapToScreen({ x: left * 32, y: row.y * 32 }, transform);
           const spanWidth = (right - left) * tileSize;
           context.fillRect(screen.x, screen.y, spanWidth, tileSize);
-          context.strokeRect(screen.x, screen.y, spanWidth, tileSize);
         }
       }
+      strokeRowOutline(context, selection.rows, transform);
       context.setLineDash([]);
       const labelPosition = mapToScreen(
         { x: selection.bounds.left * 32, y: selection.bounds.top * 32 },
@@ -626,9 +652,9 @@ export function MapCanvas({
         );
         const spanWidth = (visibleRight - visibleLeft) * tileSize;
         context.fillRect(screen.x, screen.y, spanWidth, tileSize);
-        if (tileSize >= 5) context.strokeRect(screen.x, screen.y, spanWidth, tileSize);
       }
     }
+    if (tileSize >= 5) strokeRowOutline(context, activeRows, transform, crop);
 
     for (const object of visibleSpatialObjects) {
       if (object.kind !== "location" && object.id !== highlightedObjectId) continue;

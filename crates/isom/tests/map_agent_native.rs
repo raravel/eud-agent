@@ -356,6 +356,51 @@ fn terrain_thumbnail_renders_one_exact_tile_and_space_parallax() {
 
 #[test]
 #[ignore = "loads installed StarCraft terrain assets"]
+fn catalog_null_tile_filter_drops_megatile_zero_variants() {
+    let starcraft = starcraft_path();
+    let query = |filter: Value| -> Value {
+        let request = json!({
+            "schema": "eud-map-catalog/1",
+            "kind": "tiles",
+            "tileset": 0,
+            "offset": 0,
+            "limit": 512,
+            "filter": filter,
+        });
+        serde_json::from_str(
+            &isom::catalog_query(&starcraft, request.to_string().as_bytes()).unwrap(),
+        )
+        .unwrap()
+    };
+    let broad = query(json!({"graphicsValid": true}));
+    let broad_entries = broad["entries"].as_array().unwrap();
+    assert!(broad_entries.iter().any(|entry| entry["nullTile"] == true));
+    assert!(broad_entries
+        .iter()
+        .all(|entry| (entry["nullTile"] == true) == (entry["megaTile"] == 0)));
+
+    let hidden = query(json!({"graphicsValid": true, "nullTile": false}));
+    let hidden_entries = hidden["entries"].as_array().unwrap();
+    assert!(!hidden_entries.is_empty());
+    assert!(hidden_entries
+        .iter()
+        .all(|entry| entry["nullTile"] == false && entry["megaTile"] != 0));
+    assert!(hidden["total"].as_u64().unwrap() < broad["total"].as_u64().unwrap());
+
+    let request = json!({
+        "schema": "eud-map-catalog/1",
+        "kind": "doodads",
+        "tileset": 0,
+        "filter": {"nullTile": false},
+    });
+    let error = isom::catalog_query(&starcraft, request.to_string().as_bytes()).unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("catalog filter.nullTile is not supported for doodads"));
+}
+
+#[test]
+#[ignore = "loads installed StarCraft terrain assets"]
 fn catalog_structured_filters_narrow_tiles_before_pagination() {
     let starcraft = starcraft_path();
     let broad_request = json!({

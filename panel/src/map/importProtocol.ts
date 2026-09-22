@@ -33,6 +33,14 @@ export interface MapImportSource {
   width: number;
   height: number;
   fileSize: number;
+  /** File name of this source's copy under the project `references/` folder. */
+  referenceName: string | null;
+}
+
+/** One `.scx`/`.scm` file under the project `references/` folder. */
+export interface MapImportReference {
+  name: string;
+  fileSize: number;
 }
 
 export interface ImportedStamp {
@@ -69,6 +77,14 @@ export function mapImportBootstrap(): Promise<MapImportBootstrap> {
 
 export function mapImportSourcePick(): Promise<MapImportSource | null> {
   return invoke("map_import_source_pick");
+}
+
+export function mapImportReferenceList(): Promise<MapImportReference[]> {
+  return invoke("map_import_reference_list");
+}
+
+export function mapImportReferencePick(name: string): Promise<MapImportSource> {
+  return invoke("map_import_reference_pick", { name });
 }
 
 export async function mapImportSourceRender(command: {

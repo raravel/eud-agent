@@ -21,6 +21,9 @@ use crate::map_stamp::{compile_stamp_placement, StampDestination};
 use crate::map_verify::MapRequestAuthority;
 
 pub const MAX_IMPORT_MAP_BYTES: u64 = 256 * 1024 * 1024;
+/// Project-root folder that keeps a copy of every map the importer has opened.
+pub const REFERENCES_DIR: &str = "references";
+const MAX_REFERENCE_NAME_ATTEMPTS: u32 = 1000;
 const IMPORT_PALETTE_SCHEMA: &str = "eud-map-import-palette/1";
 const MAP_IMPORT_WINDOW_LABEL: &str = "map-import";
 const MAP_AGENT_WINDOW_LABEL: &str = "map-agent";
@@ -52,6 +55,16 @@ pub struct MapImportSource {
     pub tileset: Tileset,
     pub width: u16,
     pub height: u16,
+    pub file_size: u64,
+    /// File name of this source's copy under the project `references/` folder.
+    pub reference_name: Option<String>,
+}
+
+/// One `.scx`/`.scm` file under the project `references/` folder.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MapImportReference {
+    pub name: String,
     pub file_size: u64,
 }
 
@@ -315,7 +328,65 @@ impl MapImportStore {
 
     pub fn stage_source_path(&self, source_path: &Path) -> Result<MapImportSource, String> {
         let destination = self.inner.context.current()?;
-        self.stage_source_for_destination(source_path, &destination, true)
+        let references = self.current_references_dir()?;
+        self.stage_source_with_reference(source_path, &destination, &references, true)
+    }
+
+    /// Stages one file from the project `references/` folder by its bare file name. The name
+    /// is confined to that folder before any filesystem access.
+    pub fn stage_reference(&self, name: &str) -> Result<MapImportSource, String> {
+        let references = self.current_references_dir()?;
+        let path = reference_file_path(&references, name)?;
+        self.stage_source_path(&path)
+    }
+
+    pub fn list_references(&self) -> Result<Vec<MapImportReference>, String> {
+        list_reference_files(&self.current_references_dir()?)
+    }
+
+    fn current_references_dir(&self) -> Result<PathBuf, String> {
+        Ok(self
+            .inner
+            .context
+            .current_project_root()?
+            .join(REFERENCES_DIR))
+    }
+
+    /// Stages a source, then keeps a verified copy of it under `references_dir`. A copy
+    /// failure unstages the source so the importer never shows a map the project did not keep.
+    fn stage_source_with_reference(
+        &self,
+        source_path: &Path,
+        destination: &MapContextSnapshot,
+        references_dir: &Path,
+        validate_render_surface: bool,
+    ) -> Result<MapImportSource, String> {
+        let mut source =
+            self.stage_source_for_destination(source_path, destination, validate_render_surface)?;
+        let copied = (|| {
+            let canonical = source_path
+                .canonicalize()
+                .map_err(|error| format!("selected import source is unreadable: {error}"))?;
+            pin_reference_copy(
+                references_dir,
+                &canonical,
+                &self.blob_path(&source.file_sha256),
+                &source.file_sha256,
+            )
+        })();
+        match copied {
+            Ok(reference_name) => {
+                source.reference_name = Some(reference_name);
+                if let Some(staged) = self.inner.staged.lock().get_mut(&source.source_id) {
+                    staged.source = source.clone();
+                }
+                Ok(source)
+            }
+            Err(error) => {
+                self.inner.staged.lock().remove(&source.source_id);
+                Err(error)
+            }
+        }
     }
 
     fn stage_source_for_destination(
@@ -400,6 +471,7 @@ impl MapImportStore {
                 width: parsed.width,
                 height: parsed.height,
                 file_size: copied.length,
+                reference_name: None,
             };
             self.inner.staged.lock().insert(
                 source_id,
@@ -983,6 +1055,145 @@ fn allowed_extension(path: &Path) -> Result<String, String> {
     }
 }
 
+/// Copies the verified blob into `references_dir` unless `canonical_source` already lives
+/// there. An existing file with the same name is reused only when its bytes hash to
+/// `file_sha256`; otherwise the copy gets a ` (n)` suffix. Returns the file name kept.
+fn pin_reference_copy(
+    references_dir: &Path,
+    canonical_source: &Path,
+    blob_path: &Path,
+    file_sha256: &str,
+) -> Result<String, String> {
+    std::fs::create_dir_all(references_dir)
+        .map_err(|error| format!("project references folder could not be created: {error}"))?;
+    let references = references_dir
+        .canonicalize()
+        .map_err(|error| format!("project references folder could not be resolved: {error}"))?;
+    let file_name = canonical_source
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| "selected import source filename is not valid Unicode".to_string())?
+        .to_string();
+    if canonical_source.parent() == Some(references.as_path()) {
+        return Ok(file_name);
+    }
+    let stem = Path::new(&file_name)
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or(&file_name)
+        .to_string();
+    let extension = Path::new(&file_name)
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_string();
+    for attempt in 1..=MAX_REFERENCE_NAME_ATTEMPTS {
+        let candidate_name = if attempt == 1 {
+            file_name.clone()
+        } else {
+            format!("{stem} ({attempt}).{extension}")
+        };
+        let candidate = references.join(&candidate_name);
+        match std::fs::metadata(&candidate) {
+            Ok(metadata) if metadata.is_file() => {
+                let existing = stream_hash(&candidate)?;
+                if existing.sha256 == file_sha256 {
+                    return Ok(candidate_name);
+                }
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let temporary =
+                    references.join(format!(".{candidate_name}.{}.tmp", uuid::Uuid::new_v4()));
+                let result = stream_copy_and_hash(blob_path, &temporary).and_then(|copied| {
+                    if copied.sha256 != file_sha256 {
+                        return Err("project references copy failed hash verification".to_string());
+                    }
+                    std::fs::rename(&temporary, &candidate).map_err(|error| {
+                        format!("project references copy could not be promoted: {error}")
+                    })
+                });
+                if result.is_err() {
+                    let _ = std::fs::remove_file(&temporary);
+                }
+                return result.map(|()| candidate_name);
+            }
+            Err(error) => {
+                return Err(format!(
+                    "project references folder could not be inspected: {error}"
+                ))
+            }
+        }
+    }
+    Err(format!(
+        "project references folder already holds {MAX_REFERENCE_NAME_ATTEMPTS} copies named {stem}; remove some before importing again"
+    ))
+}
+
+fn list_reference_files(references_dir: &Path) -> Result<Vec<MapImportReference>, String> {
+    let entries = match std::fs::read_dir(references_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(format!(
+                "project references folder could not be listed: {error}"
+            ))
+        }
+    };
+    let mut references = Vec::new();
+    for item in entries {
+        let item = item.map_err(|error| error.to_string())?;
+        let path = item.path();
+        if allowed_extension(&path).is_err() {
+            continue;
+        }
+        let metadata = item.metadata().map_err(|error| error.to_string())?;
+        if !metadata.is_file() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        references.push(MapImportReference {
+            name: name.to_string(),
+            file_size: metadata.len(),
+        });
+    }
+    references.sort_by(|a, b| {
+        a.name
+            .to_lowercase()
+            .cmp(&b.name.to_lowercase())
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    Ok(references)
+}
+
+/// Resolves a bare reference file name to a regular file directly inside `references_dir`.
+fn reference_file_path(references_dir: &Path, name: &str) -> Result<PathBuf, String> {
+    if name.is_empty()
+        || name == "."
+        || name == ".."
+        || name.contains(['/', '\\', ':', '\0'])
+        || name.trim() != name
+    {
+        return Err("reference map name must be a bare file name inside references/".to_string());
+    }
+    allowed_extension(Path::new(name))?;
+    let references = references_dir
+        .canonicalize()
+        .map_err(|error| format!("project references folder could not be resolved: {error}"))?;
+    let path = references
+        .join(name)
+        .canonicalize()
+        .map_err(|error| format!("reference map {name} could not be opened: {error}"))?;
+    if path.parent() != Some(references.as_path()) || !path.is_file() {
+        return Err(format!(
+            "reference map {name} is not a file inside references/"
+        ));
+    }
+    Ok(path)
+}
+
 struct StreamDigest {
     length: u64,
     sha256: String,
@@ -1220,6 +1431,17 @@ pub async fn map_agent_import_open(
     Ok(())
 }
 
+/// Close the Map Importer if it is open; the Map window's shutdown calls this
+/// so the importer never outlives the window that opened it. Saved stamps are
+/// durable in the import store, so closing loses nothing.
+pub(crate) fn close_import_window(app: &tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window(MAP_IMPORT_WINDOW_LABEL) {
+        if let Err(error) = window.close() {
+            eprintln!("eud-agent: map importer could not be closed with the Map window: {error}");
+        }
+    }
+}
+
 #[tauri::command]
 pub async fn map_import_bootstrap(
     window: tauri::WebviewWindow,
@@ -1254,6 +1476,31 @@ pub async fn map_import_source_pick(
     })
     .await
     .map_err(|error| format!("map import source task failed: {error}"))?
+}
+
+#[tauri::command]
+pub async fn map_import_reference_list(
+    window: tauri::WebviewWindow,
+    store: tauri::State<'_, MapImportStore>,
+) -> Result<Vec<MapImportReference>, String> {
+    require_window(&window, &[MAP_IMPORT_WINDOW_LABEL])?;
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || store.list_references())
+        .await
+        .map_err(|error| format!("map import reference list task failed: {error}"))?
+}
+
+#[tauri::command]
+pub async fn map_import_reference_pick(
+    window: tauri::WebviewWindow,
+    store: tauri::State<'_, MapImportStore>,
+    name: String,
+) -> Result<MapImportSource, String> {
+    require_window(&window, &[MAP_IMPORT_WINDOW_LABEL])?;
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || store.stage_reference(&name))
+        .await
+        .map_err(|error| format!("map import reference task failed: {error}"))?
 }
 
 #[tauri::command]
@@ -1449,6 +1696,121 @@ mod tests {
             .filter(|entry| entry.path().extension().is_some_and(|value| value == "map"))
             .count();
         assert_eq!(blobs, 1);
+        std::fs::remove_dir_all(dirs.app_data().parent().unwrap()).ok();
+    }
+
+    fn rich_fixture() -> PathBuf {
+        fixture().with_file_name("map_agent_rich.scx")
+    }
+
+    #[test]
+    fn picked_source_is_copied_into_project_references_and_listed_for_reuse() {
+        let dirs = dirs("references");
+        dirs.ensure_dirs().unwrap();
+        let references = dirs.app_data().join("project").join(REFERENCES_DIR);
+        let picked = dirs.app_data().join("picked").join("source.scx");
+        std::fs::create_dir_all(picked.parent().unwrap()).unwrap();
+        std::fs::copy(fixture(), &picked).unwrap();
+        let bytes = std::fs::read(&picked).unwrap();
+        let store = MapImportStore::new(dirs.clone());
+        let destination = fake_destination(&dirs);
+
+        let first = store
+            .stage_source_with_reference(&picked, &destination, &references, false)
+            .unwrap();
+        assert_eq!(first.reference_name.as_deref(), Some("source.scx"));
+        assert_eq!(std::fs::read(references.join("source.scx")).unwrap(), bytes);
+        assert_eq!(std::fs::read(&picked).unwrap(), bytes);
+
+        // Same name, same bytes: the existing copy is reused.
+        let again = store
+            .stage_source_with_reference(&picked, &destination, &references, false)
+            .unwrap();
+        assert_eq!(again.reference_name.as_deref(), Some("source.scx"));
+
+        // Same name, different bytes: the copy gets a numbered suffix and nothing is overwritten.
+        let other = dirs.app_data().join("other").join("source.scx");
+        std::fs::create_dir_all(other.parent().unwrap()).unwrap();
+        std::fs::copy(rich_fixture(), &other).unwrap();
+        let other_source = store
+            .stage_source_with_reference(&other, &destination, &references, false)
+            .unwrap();
+        assert_eq!(
+            other_source.reference_name.as_deref(),
+            Some("source (2).scx")
+        );
+        assert_eq!(std::fs::read(references.join("source.scx")).unwrap(), bytes);
+        assert_eq!(
+            std::fs::read(references.join("source (2).scx")).unwrap(),
+            std::fs::read(rich_fixture()).unwrap()
+        );
+
+        // A file already inside references/ is staged in place, never copied again.
+        let in_place = store
+            .stage_source_with_reference(
+                &references.join("source (2).scx"),
+                &destination,
+                &references,
+                false,
+            )
+            .unwrap();
+        assert_eq!(in_place.reference_name.as_deref(), Some("source (2).scx"));
+        assert_eq!(in_place.file_sha256, other_source.file_sha256);
+
+        let listed = list_reference_files(&references).unwrap();
+        assert_eq!(
+            listed
+                .iter()
+                .map(|item| item.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["source (2).scx", "source.scx"]
+        );
+        assert_eq!(listed[1].file_size, bytes.len() as u64);
+        assert!(!std::fs::read_dir(&references)
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|entry| entry.path().extension().is_some_and(|value| value == "tmp")));
+        assert!(list_reference_files(&dirs.app_data().join("missing"))
+            .unwrap()
+            .is_empty());
+        std::fs::remove_dir_all(dirs.app_data().parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn reference_pick_is_confined_to_bare_file_names_inside_references() {
+        let dirs = dirs("reference-pick");
+        dirs.ensure_dirs().unwrap();
+        let references = dirs.app_data().join("project").join(REFERENCES_DIR);
+        std::fs::create_dir_all(&references).unwrap();
+        std::fs::copy(fixture(), references.join("kept.scx")).unwrap();
+        std::fs::copy(
+            fixture(),
+            dirs.app_data().join("project").join("outside.scx"),
+        )
+        .unwrap();
+        std::fs::create_dir_all(references.join("folder.scx")).unwrap();
+
+        assert!(reference_file_path(&references, "kept.scx")
+            .unwrap()
+            .is_file());
+        for name in [
+            "",
+            ".",
+            "..",
+            "../outside.scx",
+            "..\\outside.scx",
+            "sub/kept.scx",
+            "C:kept.scx",
+            " kept.scx",
+            "kept.chk",
+            "missing.scx",
+            "folder.scx",
+        ] {
+            assert!(
+                reference_file_path(&references, name).is_err(),
+                "{name:?} must be refused"
+            );
+        }
         std::fs::remove_dir_all(dirs.app_data().parent().unwrap()).ok();
     }
 

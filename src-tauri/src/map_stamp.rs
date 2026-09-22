@@ -1855,5 +1855,11 @@ mod tests {
         assert_eq!(rebound.source_revision, "r7:new");
         assert_eq!(rebound.cells(), selection.cells());
         assert_eq!(rebound.layers, selection.layers);
+        assert_eq!(
+            rebound.snapshot_hash(),
+            selection.snapshot_hash(),
+            "an unchanged selection keeps its snapshot hash across revision rebinding"
+        );
+        assert_eq!(rebound.snapshot_hash(), persistent.snapshot_hash());
     }
 }
