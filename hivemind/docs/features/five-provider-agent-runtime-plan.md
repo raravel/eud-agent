@@ -358,8 +358,20 @@ Claude CLI는 machine-readable model discovery command를 제공하지 않지만
 `anthropic-beta: oauth-2025-04-20`)에서 그대로 받아들여진다. catalog는 이 응답의
 `id`/`display_name`/`max_input_tokens`/`capabilities`(effort 단계, image_input,
 structured_outputs)를 그대로 매핑하고 alias나 하드코딩 목록을 만들지 않는다. 첫 항목은 항상
-`provider-default`이며, token 부재·만료·HTTP 실패·schema 변경 시 catalog는 그 한 항목으로
+`provider-default`이며, token 부재·HTTP 실패·schema 변경 시 catalog는 그 한 항목으로
 degrade한다. token은 요청 동안만 메모리에 있고 로그·저장·UI에 노출되지 않는다.
+
+CLI는 turn이 실행되는 동안에만 access token을 갱신하므로, 유휴 profile은 turn 사이에 만료된
+token만 남긴다(access token 수명은 수 시간, refresh token은 수십 일). catalog 요청은 만료·5분
+내 만료 예정 token을 CLI와 같은 public client id·`POST https://platform.claude.com/v1/oauth/token`
+(`grant_type=refresh_token`, 저장된 `scopes`)으로 직접 갱신하고, 회전된 pair를
+`.credentials.json`에 atomic write-back하여 CLI의 다음 turn도 계속 동작하게 한다. 갱신은 CLI의
+`proper-lockfile` 규약(`.oauth_refresh.lock` → `.credentials.json.lock` 디렉터리, 60초 stale)을
+그대로 따르며 lock 획득 후 파일을 다시 읽어 sibling 프로세스가 이미 갱신했으면 네트워크 없이
+채택한다. write-back은 갱신에 사용한 refresh token이 디스크에 그대로 있을 때만 수행하고, 서비스는
+profile lock을 read+refresh 동안 잡아 동시 logout이 되살아나지 않게 한다. `invalid_grant`·401은
+`provider_not_authenticated`, refresh token 만료는 `provider_auth_expired`로 끝나며 저장된 파일은
+변경하지 않는다. 이 경우에도 catalog는 `provider-default` 한 항목으로 degrade한다.
 `provider-default` 선택은 `--model`/`--effort`를 전달하지 않아 현재 계정·배포에 맞는 모델
 선택을 Claude Code에 위임하고, catalog model 선택은 foreground/structured turn에
 `--model <id>`와(선택 시) `--effort <level>`을 그대로 전달한다. compaction/prepare는 session

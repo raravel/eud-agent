@@ -1,11 +1,13 @@
 mod adapter;
 mod catalog;
+mod credentials;
 
 pub use adapter::ProductionClaudeCodeAdapter;
+pub(crate) use catalog::fetch_catalog;
 #[cfg(test)]
 use catalog::CLAUDE_PROVIDER_DEFAULT;
 pub use catalog::{bound_model, provider_default_model};
-pub(crate) use catalog::{fetch_catalog, read_access_token};
+pub(crate) use credentials::access_token;
 
 use crate::provider::ProviderModel;
 

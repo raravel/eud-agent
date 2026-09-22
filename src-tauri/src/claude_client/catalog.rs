@@ -1,14 +1,12 @@
 //! Claude model catalog from the Anthropic Models API using the app-profile subscription token.
 //!
 //! The Claude CLI has no machine-readable model discovery command, but the same OAuth
-//! credential it stores in `.credentials.json` is accepted by `GET /v1/models` when sent as a
-//! bearer token with the `oauth-2025-04-20` beta header. The catalog always keeps the
-//! `provider-default` entry first so a fetch failure degrades to CLI-selected behavior.
-
-use std::path::Path;
+//! credential it stores in `.credentials.json` (see `credentials`) is accepted by
+//! `GET /v1/models` when sent as a bearer token with the `oauth-2025-04-20` beta header. The
+//! catalog always keeps the `provider-default` entry first so a fetch failure degrades to
+//! CLI-selected behavior.
 
 use serde_json::Value;
-use zeroize::Zeroizing;
 
 use crate::provider::{ModelCapabilities, ProviderId, ProviderModel, ReasoningLevel};
 
@@ -19,7 +17,6 @@ const OAUTH_BETA: &str = "oauth-2025-04-20";
 const PAGE_LIMIT: usize = 1000;
 const MAX_PAGES: usize = 4;
 const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
-const MAX_CREDENTIAL_BYTES: u64 = 1024 * 1024;
 const MAX_MODEL_ID_BYTES: usize = 256;
 
 pub fn provider_default_model(selected: Option<&str>) -> ProviderModel {
@@ -99,40 +96,6 @@ pub(crate) fn validate_model_id(model: &str) -> Result<(), String> {
     valid
         .then_some(())
         .ok_or_else(|| "provider_model_unavailable".to_string())
-}
-
-/// Reads the app-profile subscription access token. The value is never logged or persisted
-/// anywhere else; callers keep it only for the duration of one request.
-pub(crate) fn read_access_token(profile_dir: &Path) -> Result<Zeroizing<String>, String> {
-    let path = profile_dir.join(".credentials.json");
-    let metadata =
-        std::fs::metadata(&path).map_err(|_| "provider_not_authenticated".to_string())?;
-    if !metadata.is_file() || metadata.len() > MAX_CREDENTIAL_BYTES {
-        return Err("provider_not_authenticated".to_string());
-    }
-    let bytes =
-        Zeroizing::new(std::fs::read(&path).map_err(|_| "provider_not_authenticated".to_string())?);
-    let value: Value =
-        serde_json::from_slice(&bytes).map_err(|_| "provider_not_authenticated".to_string())?;
-    let oauth = value
-        .get("claudeAiOauth")
-        .and_then(Value::as_object)
-        .ok_or_else(|| "provider_not_authenticated".to_string())?;
-    if let Some(expires_at) = oauth.get("expiresAt").and_then(Value::as_u64) {
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|elapsed| elapsed.as_millis() as u64)
-            .unwrap_or(u64::MAX);
-        if expires_at <= now_ms {
-            return Err("provider_auth_expired".to_string());
-        }
-    }
-    oauth
-        .get("accessToken")
-        .and_then(Value::as_str)
-        .filter(|token| !token.is_empty() && !token.chars().any(char::is_control))
-        .map(|token| Zeroizing::new(token.to_string()))
-        .ok_or_else(|| "provider_not_authenticated".to_string())
 }
 
 pub(crate) async fn fetch_catalog(
@@ -400,38 +363,6 @@ mod tests {
         assert!(validate_model_id("-p").is_err());
         assert!(validate_model_id("opus 5").is_err());
         assert!(validate_model_id(&"a".repeat(257)).is_err());
-    }
-
-    #[test]
-    fn access_token_requires_unexpired_oauth_credential() {
-        let base = std::env::temp_dir().join(format!("eud-claude-token-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&base).unwrap();
-        let path = base.join(".credentials.json");
-        assert_eq!(
-            read_access_token(&base),
-            Err("provider_not_authenticated".to_string())
-        );
-        std::fs::write(
-            &path,
-            br#"{"claudeAiOauth":{"accessToken":"live","expiresAt":1}}"#,
-        )
-        .unwrap();
-        assert_eq!(
-            read_access_token(&base),
-            Err("provider_auth_expired".to_string())
-        );
-        std::fs::write(
-            &path,
-            br#"{"claudeAiOauth":{"accessToken":"live","expiresAt":32503680000000}}"#,
-        )
-        .unwrap();
-        assert_eq!(read_access_token(&base).unwrap().as_str(), "live");
-        std::fs::write(&path, br#"{"primaryApiKey":"sk"}"#).unwrap();
-        assert_eq!(
-            read_access_token(&base),
-            Err("provider_not_authenticated".to_string())
-        );
-        std::fs::remove_dir_all(base).ok();
     }
 
     #[tokio::test]

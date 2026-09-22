@@ -646,10 +646,15 @@ impl ProviderService {
                     .collect())
             }
             ProviderId::ClaudeCode => {
-                // Hold the profile lock only for the credential read, not the network round trip.
+                // Hold the profile lock across the credential read and any OAuth refresh
+                // write-back (so a concurrent logout is never resurrected), not the catalog fetch.
                 let token = {
                     let _guard = self.inner.claude_lock.lock().await;
-                    crate::claude_client::read_access_token(&self.inner.dirs.claude_config_dir())
+                    crate::claude_client::access_token(
+                        &self.inner.client,
+                        &self.inner.dirs.claude_config_dir(),
+                    )
+                    .await
                 };
                 let token = match token {
                     Ok(token) => token,
