@@ -2,8 +2,8 @@
  * Staged-workflow stage strip (features/staged-workflow-plan.md ## Phase 2
  * Panel): 파악 → 조사 → 계획 → 승인 → 실행 → 검증 → 검토 rendered above the
  * conversation while a pipeline request is active, under review, or
- * interrupted. The App decides visibility (answer/direct routes hide the
- * strip once triage resolves); this component is a thin renderer of the
+ * interrupted. The App decides visibility (answer/direct/scoped routes hide
+ * the strip once triage resolves); this component is a thin renderer of the
  * session's last `WorkflowEvent` plus the phase-derived controls:
  *   - a cancel control while a stage job is busy (reuses the turn cancel);
  *   - 이어서 진행 / 처음부터 for `interrupted` (workflow_resume / workflow_restart);

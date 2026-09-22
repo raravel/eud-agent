@@ -38,6 +38,7 @@ import { ChangesetView } from "@/components/ChangesetView";
 import { HarnessStatusCard } from "@/components/HarnessStatusCard";
 import { AskCard } from "@/components/AskCard";
 import { PlanView } from "@/components/PlanView";
+import { InterruptedRequestBar } from "@/components/InterruptedRequestBar";
 import { WorkflowStrip } from "@/components/WorkflowStrip";
 import { InstructionBox, type ChatPayload } from "@/components/InstructionBox";
 import { ConnectionNotice } from "@/components/ConnectionNotice";
@@ -1332,6 +1333,12 @@ export default function App() {
           target.workflowReceived(event);
           break;
         }
+        case "interrupted_request": {
+          const target = sessionStore();
+          if (!target) break;
+          target.interruptedRequestReceived(msg.request ?? null);
+          break;
+        }
         case "harness_job": {
           const slot = sessionsRef.current.get(msg.sessionId);
           if (!slot) break;
@@ -1935,16 +1942,22 @@ export default function App() {
     async (type: "workflow_resume" | "workflow_restart") => {
       const slot = selectedSlot;
       const snapshot = slot?.store.getState();
-      // Resume applies to an interrupted stage only; restart also accepts a
-      // cancelled (or failed) request whose artifacts were retained.
+      // The unresolved request is the live workflow while it is still this
+      // session's current one, and the set-aside snapshot once a later message
+      // took over. Restart also accepts a cancelled (or failed) request whose
+      // artifacts were retained.
+      const pending =
+        snapshot?.workflow?.stage === "interrupted"
+          ? snapshot.workflow
+          : (snapshot?.interruptedRequest ?? null);
       const restartable =
-        snapshot?.workflow?.stage === "interrupted" ||
+        pending !== null ||
         snapshot?.workflow?.stage === "cancelled" ||
         snapshot?.workflow?.stage === "failed";
       const allowed =
-        type === "workflow_resume"
-          ? snapshot?.phase === "interrupted"
-          : restartable && !isBusyPhase(snapshot.phase);
+        snapshot !== undefined &&
+        !isBusyPhase(snapshot.phase) &&
+        (type === "workflow_resume" ? pending !== null : restartable);
       if (!slot?.persisted || !allowed || messageActionBusyRef.current) {
         return;
       }
@@ -3204,10 +3217,10 @@ export default function App() {
     messageActionBusy ||
     selectedSlot?.activity === "running_write" ||
     state.phase === "changeset_review";
-  // The stage strip and stage cards are pipeline surfaces: answer/direct
-  // routes show 파악 during triage and then fall back to the ordinary
-  // answer/changeset flow; done/failed hide them, while a cancelled request
-  // stays visible as a terminal state offering 처음부터.
+  // The stage strip and stage cards are pipeline surfaces: the
+  // answer/direct/scoped routes show 파악 during triage and then fall back to
+  // the ordinary answer/changeset flow; done/failed hide them, while a
+  // cancelled request stays visible as a terminal state offering 처음부터.
   const workflowActive =
     state.workflow !== null &&
     state.workflow.stage !== "done" &&
@@ -3623,6 +3636,15 @@ export default function App() {
               <span className="text-amber-400">검토 필요</span>
             )}
           </div>
+        )}
+
+        {state.interruptedRequest && (
+          <InterruptedRequestBar
+            request={state.interruptedRequest}
+            actionBusy={messageActionBusy || isBusyPhase(state.phase)}
+            onResume={handleWorkflowResume}
+            onRestart={handleWorkflowRestart}
+          />
         )}
 
         {workflowActive && state.workflow && (

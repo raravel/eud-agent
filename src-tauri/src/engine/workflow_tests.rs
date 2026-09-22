@@ -285,6 +285,51 @@ async fn answer_route_runs_the_ordinary_foreground_with_a_route_note() {
 }
 
 #[tokio::test]
+async fn scoped_route_skips_research_and_planning_for_one_foreground_turn() {
+    let driver = FakeCodexDriver::scripted([AgentTurnResult::Answer {
+        text: "게임 속도 테이블에 21을 썼습니다.".to_string(),
+    }]);
+    let handle = driver.clone();
+    handle.script_delegated([result(json!({
+        "route": "scoped",
+        "goal": "맵 기본 속도를 2배속으로 만든다",
+        "acceptanceCriteria": ["게임 속도 테이블이 2배속 값으로 설정된다"],
+        "rationale": "one value once its address is known"
+    }))]);
+    let sink = CapturingEventSink::default();
+    let mut engine = test_engine(driver, sink.clone());
+    let dirs = engine.runtime.data_dirs();
+    dirs.ensure_dirs().unwrap();
+    native_workspace_snapshot(&dirs, "ExampleProject");
+
+    engine
+        .chat(chat("이 맵의 기본 속도를 2배속으로 해줘."))
+        .await
+        .unwrap();
+
+    // Triage is the only isolated run: no research, planner, or critic job.
+    let kinds = handle
+        .delegated_requests()
+        .into_iter()
+        .map(|(kind, _)| kind)
+        .collect::<Vec<_>>();
+    assert_eq!(kinds, [DelegatedRunKind::Triage]);
+    let prompts = handle.prompts();
+    assert_eq!(prompts.len(), 1, "one ordinary foreground turn");
+    assert!(prompts[0].contains("Triage classified this request as one scoped change"));
+    assert!(prompts[0].contains("smallest change that satisfies the request"));
+    // The request executes on the foreground and never reaches plan review.
+    let stages = stages(&sink);
+    assert!(stages.contains(&WorkflowStage::Executing));
+    assert!(!stages.contains(&WorkflowStage::Research));
+    assert!(!stages.contains(&WorkflowStage::Planning));
+    assert!(!stages.contains(&WorkflowStage::PlanReview));
+    assert!(plan_events(&sink).is_empty());
+    assert_eq!(engine.phase, Phase::Idle);
+    fs::remove_dir_all(dirs.app_data()).ok();
+}
+
+#[tokio::test]
 async fn clarify_asks_the_user_then_retriages_with_the_answer() {
     let driver = FakeCodexDriver::scripted([AgentTurnResult::Answer {
         text: "스폰 수를 줄였습니다.".to_string(),
@@ -762,6 +807,96 @@ async fn interrupted_research_resumes_and_restart_clears_the_request() {
     let text = restored.workflow_restart().unwrap();
     assert_eq!(text, "웨이브 시스템 만들어줘");
     assert!(sessions.load(&session_id).unwrap().workflow.is_none());
+    fs::remove_dir_all(dirs.app_data()).ok();
+}
+
+#[tokio::test]
+async fn a_later_message_sets_the_interrupted_request_aside_and_triage_is_told() {
+    let driver = FakeCodexDriver::scripted([]);
+    let handle = driver.clone();
+    handle.script_delegated([
+        triage("pipeline"),
+        research(),
+        plan("웨이브"),
+        critic("approve"),
+        // The follow-up message is triaged on its own.
+        triage("answer"),
+    ]);
+    let sink = CapturingEventSink::default();
+    let mut engine = test_engine(driver, sink.clone());
+    let dirs = engine.runtime.data_dirs();
+    dirs.ensure_dirs().unwrap();
+    let workspace = WorkspaceManager::new(dirs.clone())
+        .prepare_snapshot(&native_workspace_snapshot(&dirs, "ExampleProject"))
+        .unwrap();
+    handle.set_workspace(workspace.clone());
+    engine.chat(chat("웨이브 시스템 만들어줘")).await.unwrap();
+    let session_id = engine.session_id.clone();
+    let sessions = engine.session_store.clone();
+    let interrupted_request_id = sessions
+        .load(&session_id)
+        .unwrap()
+        .workflow
+        .unwrap()
+        .request_id;
+
+    // A shutdown during research, then the startup recovery.
+    let mut record = sessions.load(&session_id).unwrap();
+    let workflow = record.workflow.as_mut().unwrap();
+    workflow.stage = WorkflowStage::Research;
+    workflow.research = None;
+    workflow.plan = None;
+    sessions.save(&record).unwrap();
+    assert_eq!(sessions.recover_interrupted_workflows().unwrap(), 1);
+    engine.workflow = sessions.load(&session_id).unwrap().workflow;
+
+    // The next message does not discard the interrupted request: it is set
+    // aside, projected to the panel, and named in the triage prompt.
+    engine.chat(chat("continue")).await.unwrap();
+    let stashed = sessions
+        .load(&session_id)
+        .unwrap()
+        .interrupted_workflow
+        .expect("the interrupted request is kept");
+    assert_eq!(stashed.request_id, interrupted_request_id);
+    assert_eq!(stashed.stage, WorkflowStage::Interrupted);
+    assert_eq!(
+        sessions
+            .load(&session_id)
+            .unwrap()
+            .workflow
+            .map(|live| live.user_text),
+        Some("continue".to_string())
+    );
+    let triage_prompt = handle
+        .delegated_requests()
+        .into_iter()
+        .filter(|(kind, _)| *kind == DelegatedRunKind::Triage)
+        .map(|(_, prompt)| prompt)
+        .next_back()
+        .expect("the follow-up was triaged");
+    assert!(triage_prompt.contains("[interrupted request]"));
+    assert!(triage_prompt.contains("웨이브 시스템"));
+    assert!(triage_prompt.contains("[continuity]"));
+    assert_eq!(
+        sink.events()
+            .into_iter()
+            .filter(|event| matches!(event, EngineEvent::InterruptedRequest(_)))
+            .count(),
+        1
+    );
+
+    // Resume works on the set-aside request, which then stops being pending.
+    handle.script_delegated([research(), plan("재개된 웨이브"), critic("approve")]);
+    engine.phase = Phase::Idle;
+    engine.workflow_resume().await.unwrap();
+    assert_eq!(engine.phase, Phase::PlanReview);
+    let after = sessions.load(&session_id).unwrap();
+    assert!(after.interrupted_workflow.is_none());
+    assert_eq!(
+        after.workflow.map(|live| live.request_id),
+        Some(interrupted_request_id)
+    );
     fs::remove_dir_all(dirs.app_data()).ok();
 }
 

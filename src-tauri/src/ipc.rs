@@ -545,6 +545,16 @@ pub struct SessionLoadedEvent {
     pub id: String,
 }
 
+/// `interrupted_request` event payload: the request a shutdown or cancellation
+/// left unresolved, so the panel can offer resume/restart, or `null` once the
+/// user resolved it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InterruptedRequestEvent {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request: Option<crate::workflow::WorkflowEvent>,
+}
+
 /// `rollback_result` event payload.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RollbackResultEvent {

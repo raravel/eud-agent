@@ -251,6 +251,9 @@ pub enum EngineEvent {
     AutonomousRun(Box<crate::autonomous::AutonomousRunState>),
     /// Staged-workflow projection, emitted on every stage transition and on hydrate.
     Workflow(Box<crate::workflow::WorkflowEvent>),
+    /// The request an interruption left unresolved, or its absence once the
+    /// user resumed or restarted it.
+    InterruptedRequest(Box<ipc::InterruptedRequestEvent>),
 }
 
 pub(crate) trait EventSink {
@@ -430,6 +433,8 @@ pub(crate) struct AgentEngine<R: RuntimeExecutor, S: EventSink> {
     autonomous_pause_requested: Arc<AtomicBool>,
     /// In-memory mirror of the session's persisted staged-workflow state.
     workflow: Option<crate::workflow::WorkflowState>,
+    /// The request an interruption cut short that a later message set aside.
+    interrupted_workflow: Option<crate::workflow::WorkflowState>,
 }
 impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
     // Keep each injected runtime, persistence, session, and cancellation authority explicit.
@@ -496,6 +501,7 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
             execution_mode,
             autonomous_policy,
             workflow: session.workflow.clone(),
+            interrupted_workflow: session.interrupted_workflow.clone(),
             autonomous_pause_requested,
         }
     }
@@ -1356,7 +1362,24 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
         self.update_active_session().await;
         Ok(())
     }
+    /// A request never leaves the provider conversation behind: whichever way
+    /// the turn ends, the confirmed native session (or direct transcript
+    /// revision) the runtime holds is persisted before the result is returned.
+    /// Without this, a failed or cancelled turn kept its boundary only in
+    /// memory and the next launch had nothing to continue from.
     async fn chat_with_request_id(
+        &mut self,
+        req: ipc::ChatRequest,
+        fixed_request_id: Option<String>,
+    ) -> Result<(), AgentEngineError> {
+        let result = self.chat_turn(req, fixed_request_id).await;
+        if result.is_err() {
+            self.update_active_session().await;
+        }
+        result
+    }
+
+    async fn chat_turn(
         &mut self,
         req: ipc::ChatRequest,
         fixed_request_id: Option<String>,
@@ -3088,6 +3111,9 @@ impl EventSink for SessionEventSink {
             EngineEvent::Status(payload) => ipc::emit_status(&self.app, payload),
             EngineEvent::AutonomousRun(payload) => self.emit_scoped("autonomous_run", payload),
             EngineEvent::Workflow(payload) => self.emit_scoped("workflow", *payload),
+            EngineEvent::InterruptedRequest(payload) => {
+                self.emit_scoped("interrupted_request", *payload)
+            }
             EngineEvent::Wiki(payload) => ipc::emit_wiki(&self.app, payload),
             EngineEvent::SessionLoaded(payload) => ipc::emit_session_loaded(&self.app, payload),
         };
@@ -4943,6 +4969,7 @@ impl SessionEngineManager {
             task_state: Default::default(),
             autonomous_run: None,
             workflow: None,
+            interrupted_workflow: None,
             team_tasks: Vec::new(),
         };
         self.inner
@@ -5841,6 +5868,9 @@ fn auto_session_name(first_text: &str) -> String {
 
 /// Cap on the condensed replay transcript (chars), kept well under prompt limits.
 const CONDENSED_TRANSCRIPT_CAP_CHARS: usize = 8000;
+/// The same log for a stage job, which routes a request instead of
+/// continuing the work itself.
+const RECENT_TRANSCRIPT_CAP_CHARS: usize = 2500;
 
 /// Parse the native project name out of a `[project state]` prompt render.
 /// Returns `""` when absent or unavailable.
@@ -5863,13 +5893,28 @@ fn project_name_from_state(project_state: &str) -> String {
 /// prompt limits. The `panelLog` is opaque to Rust, so this reads it defensively:
 /// any missing/odd shape simply yields fewer lines (never panics).
 fn condense_transcript(panel_log: &serde_json::Value) -> String {
+    condense_transcript_with_cap(panel_log, CONDENSED_TRANSCRIPT_CAP_CHARS)
+}
+
+/// The conversation so far, condensed for a stage job that only needs to know
+/// what this session was doing. Bounded far tighter than a replay.
+fn recent_transcript(panel_log: &serde_json::Value) -> String {
+    condense_transcript_with_cap(panel_log, RECENT_TRANSCRIPT_CAP_CHARS)
+}
+
+/// The durable panel log rendered for the model under a character bound.
+///
+/// The bound drops the OLDEST rows: a turn that continues a conversation needs
+/// how it ended, and a head-first cut hands the model the opening of a long
+/// session and none of the work it is being asked to continue.
+fn condense_transcript_with_cap(panel_log: &serde_json::Value, cap: usize) -> String {
     let entries = panel_log
         .get("log")
         .and_then(serde_json::Value::as_array)
         .cloned()
         .unwrap_or_default();
 
-    let mut lines = vec!["[prior conversation]".to_string()];
+    let mut lines = Vec::new();
     for entry in &entries {
         let kind = entry.get("kind").and_then(serde_json::Value::as_str);
         let text = entry
@@ -5888,14 +5933,31 @@ fn condense_transcript(panel_log: &serde_json::Value) -> String {
         if text.is_empty() {
             continue;
         }
-        lines.push(format!("{label}: {text}"));
+        lines.push(format!("{label}: {}", take_chars(text, cap)));
     }
-    if lines.len() == 1 {
+    if lines.is_empty() {
         return String::new();
     }
 
-    let joined = lines.join("\n");
-    take_chars(&joined, CONDENSED_TRANSCRIPT_CAP_CHARS)
+    let mut kept = std::collections::VecDeque::new();
+    let mut used = 0_usize;
+    for line in lines.iter().rev() {
+        let length = line.chars().count().saturating_add(1);
+        if !kept.is_empty() && used.saturating_add(length) > cap {
+            break;
+        }
+        used = used.saturating_add(length);
+        kept.push_front(line.as_str());
+    }
+    let mut out = String::from("[prior conversation]");
+    if kept.len() < lines.len() {
+        out.push_str("\n(앞부분 생략)");
+    }
+    for line in kept {
+        out.push('\n');
+        out.push_str(line);
+    }
+    out
 }
 
 /// The `ids` echoed back to the panel in `rollback_result`. A per-item decision
@@ -7015,6 +7077,7 @@ mod tests {
             task_state: Default::default(),
             autonomous_run: None,
             workflow: None,
+            interrupted_workflow: None,
             team_tasks: Vec::new(),
         };
         store.save(&record).unwrap();
@@ -9514,6 +9577,7 @@ mod tests {
             task_state: Default::default(),
             autonomous_run: None,
             workflow: None,
+            interrupted_workflow: None,
             team_tasks: Vec::new(),
         };
         sessions.save(&record).unwrap();

@@ -356,7 +356,64 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
             project,
             user_text: &state.user_text,
             clarifications: &state.clarifications,
+            conversation: "",
+            interrupted: "",
         }
+    }
+
+    /// Triage alone sees the session's own history. It routes one message, and
+    /// a message like "continue" names work only the conversation and the
+    /// unresolved request can identify; every later stage works from the goal
+    /// triage produced.
+    fn triage_context<'a>(
+        &self,
+        guides: &'a str,
+        project: &'a str,
+        conversation: &'a str,
+        interrupted: &'a str,
+        state: &'a WorkflowState,
+    ) -> StageContext<'a> {
+        StageContext {
+            conversation,
+            interrupted,
+            ..self.stage_context(guides, project, state)
+        }
+    }
+
+    /// The condensed transcript of this session, as triage sees it.
+    fn session_transcript(&self) -> String {
+        match self.session_store.load(&self.session_id) {
+            Ok(record) => super::recent_transcript(&record.panel_log),
+            Err(error) => {
+                eprintln!("eud-agent: stage transcript unavailable: {error}");
+                String::new()
+            }
+        }
+    }
+
+    /// The request the user still has to resolve: the live workflow when it is
+    /// itself interrupted, otherwise the one a later message set aside.
+    pub(super) fn pending_interrupted_workflow(&self) -> Option<&WorkflowState> {
+        self.workflow
+            .as_ref()
+            .filter(|state| state.stage == WorkflowStage::Interrupted)
+            .or(self.interrupted_workflow.as_ref())
+    }
+
+    /// Persist and project the request an interruption left unresolved.
+    fn set_interrupted_request(
+        &mut self,
+        state: Option<WorkflowState>,
+    ) -> Result<(), AgentEngineError> {
+        self.session_store
+            .set_interrupted_workflow(&self.session_id, state.clone())
+            .map_err(|error| AgentEngineError::new(error.to_string()))?;
+        let request = state.as_ref().map(workflow::WorkflowEvent::from_state);
+        self.interrupted_workflow = state;
+        self.sink
+            .emit(EngineEvent::InterruptedRequest(Box::new(
+                crate::ipc::InterruptedRequestEvent { request },
+            )))
     }
 
     fn require_triage(&self) -> Result<TriageResult, AgentEngineError> {
@@ -390,6 +447,18 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
             self.deep_planning_setting(),
             now(),
         );
+        // A new message never discards a request an interruption cut short.
+        // It is set aside — with its research, its plan, and whether the user
+        // approved that plan — until the user resumes or restarts it, and
+        // triage below is told it exists.
+        if let Some(previous) = self
+            .workflow
+            .as_ref()
+            .filter(|previous| previous.stage == WorkflowStage::Interrupted)
+            .cloned()
+        {
+            self.set_interrupted_request(Some(previous))?;
+        }
         // The previous request ended by restating an unanswered clarify ask as
         // text: this message is its reply, so triage continues that request
         // (original text, earlier answers, spent rounds) instead of a fresh one.
@@ -402,12 +471,18 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
             });
         self.persist_workflow(state)?;
         let guides = String::new();
+        let conversation = self.session_transcript();
+        let interrupted = self
+            .interrupted_workflow
+            .as_ref()
+            .map(workflow::interrupted_request_section)
+            .unwrap_or_default();
         loop {
             let project = self.stage_project_context(user_text);
             let prompt = {
                 let state = self.workflow.as_ref().expect("workflow just persisted");
                 workflow::triage_prompt(
-                    &self.stage_context(&guides, &project, state),
+                    &self.triage_context(&guides, &project, &conversation, &interrupted, state),
                     MAX_CLARIFY_ROUNDS.saturating_sub(rounds),
                 )
             };
@@ -449,9 +524,9 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
                         self.workflow_pipeline().await?;
                         Ok(TriageDecision::Handled)
                     }
-                    WorkflowRoute::Direct => {
+                    WorkflowRoute::Direct | WorkflowRoute::Scoped => {
                         self.workflow_transition(WorkflowStage::Executing, |_| {})?;
-                        Ok(TriageDecision::Foreground(WorkflowRoute::Direct))
+                        Ok(TriageDecision::Foreground(route))
                     }
                     WorkflowRoute::Answer => Ok(TriageDecision::Foreground(WorkflowRoute::Answer)),
                 };
@@ -510,6 +585,11 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
         let decision = match route {
             WorkflowRoute::Answer => {
                 "Triage classified this request as answer-only: reply directly and use no write tools."
+            }
+            WorkflowRoute::Scoped => {
+                "Triage classified this request as one scoped change: no plan was written because the work is small once its site is known.\n\
+Locate the site first (source_search, read_file, and search_docs/docs_get only for facts the project cannot answer), then make the smallest change that satisfies the request, run the authoritative build, and answer.\n\
+Change only what the goal requires: do not add modules, files, or tests the request did not ask for, and do not refactor, rename, or clean up code you merely passed by. Report anything you noticed but left alone in your answer instead of fixing it."
             }
             _ => {
                 "Triage classified this request as one direct single-site change: apply it, run the authoritative build, and answer."
@@ -1066,6 +1146,16 @@ Answer with a per-step status list (step id — done/partial/skipped and why). A
         &mut self,
         record: &crate::session::SessionRecord,
     ) -> Result<(), AgentEngineError> {
+        if let Some(interrupted) = record.interrupted_workflow.clone() {
+            let request = workflow::WorkflowEvent::from_state(&interrupted);
+            self.interrupted_workflow = Some(interrupted);
+            self.sink
+                .emit(EngineEvent::InterruptedRequest(Box::new(
+                    crate::ipc::InterruptedRequestEvent {
+                        request: Some(request),
+                    },
+                )))?;
+        }
         let Some(mut state) = record.workflow.clone() else {
             return Ok(());
         };
@@ -1128,7 +1218,7 @@ Answer with a per-step status list (step id — done/partial/skipped and why). A
     /// verifying at verifying (with the changes still pending review).
     pub(super) async fn workflow_resume(&mut self) -> Result<(), AgentEngineError> {
         self.ensure_provider_conversation_ready()?;
-        let Some(state) = self.workflow.clone() else {
+        let Some(state) = self.pending_interrupted_workflow().cloned() else {
             return Err(AgentEngineError::new("이어서 진행할 단계 작업이 없습니다."));
         };
         if state.stage != WorkflowStage::Interrupted {
@@ -1136,6 +1226,13 @@ Answer with a per-step status list (step id — done/partial/skipped and why). A
                 "중단된 단계가 아니어서 이어서 진행할 수 없습니다.",
             ));
         }
+        // A request a later message set aside becomes the live one again.
+        if self.workflow.as_ref().map(|live| live.request_id.as_str())
+            != Some(state.request_id.as_str())
+        {
+            self.persist_workflow(state.clone())?;
+        }
+        self.set_interrupted_request(None)?;
         let revision = self
             .runtime
             .current_project_revision()
@@ -1212,7 +1309,11 @@ Answer with a per-step status list (step id — done/partial/skipped and why). A
     /// Discard the interrupted request's stage state and clear it; the panel
     /// resends the same user text as a fresh request.
     pub(super) fn workflow_restart(&mut self) -> Result<String, AgentEngineError> {
-        let Some(state) = self.workflow.clone() else {
+        let Some(state) = self
+            .pending_interrupted_workflow()
+            .cloned()
+            .or_else(|| self.workflow.clone())
+        else {
             return Err(AgentEngineError::new("다시 시작할 단계 작업이 없습니다."));
         };
         if !matches!(
@@ -1236,6 +1337,7 @@ Answer with a per-step status list (step id — done/partial/skipped and why). A
         self.session_store
             .set_workflow(&self.session_id, None)
             .map_err(|error| AgentEngineError::new(error.to_string()))?;
+        self.set_interrupted_request(None)?;
         self.phase = Phase::Idle;
         Ok(state.user_text)
     }

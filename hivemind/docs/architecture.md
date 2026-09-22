@@ -152,7 +152,7 @@ stateDiagram-v2
     [*] --> Triage: chat
     Triage --> Clarify: engine ASK
     Clarify --> Triage
-    Triage --> Foreground: answer / direct
+    Triage --> Foreground: answer / direct / scoped
     Triage --> Research: pipeline
     Research --> Planning
     Planning --> Critique
@@ -164,6 +164,15 @@ stateDiagram-v2
     Verifying --> Executing: fail (max 2)
     Verifying --> ChangesetReview
 ```
+
+Routing is by the lightest route that can finish the request. `answer` changes nothing and `direct`
+is one explicit single-site change (or a map-placement handoff); `scoped` is the middle route for a
+change that is small once its site is known — the ordinary foreground turn looks the target or value
+up itself and then edits and builds, with no research, plan, critique, or approval. Only work that
+genuinely needs design or investigation first takes `pipeline`. Triage states only the outcomes the
+user asked for as acceptance criteria, the research stage stops as soon as those criteria have their
+evidence, the planner writes the shortest plan that meets the goal, and the critic fails excess
+(steps, modules, tests, sweeps the goal did not ask for) as it fails a gap.
 
 `WorkflowState` is persisted on the session at every transition and projected to the panel as the
 `workflow` event; plan review survives reconnect and restart, in-flight stage jobs become

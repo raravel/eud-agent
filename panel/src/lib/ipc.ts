@@ -152,6 +152,7 @@ const PUSH_EVENT_TYPES = [
   "team_task",
   "changeset",
   "workflow",
+  "interrupted_request",
   "harness_job",
   "rollback_result",
   "progress",

@@ -441,8 +441,11 @@ export type WorkflowStage =
   | "done"
   | "failed";
 
-/** Triage route: answer-only, direct edit, or the full staged pipeline. */
-export type WorkflowRoute = "answer" | "direct" | "pipeline";
+/**
+ * Triage route: answer-only, direct edit, one scoped change the foreground
+ * finishes after looking its site up, or the full staged pipeline.
+ */
+export type WorkflowRoute = "answer" | "direct" | "scoped" | "pipeline";
 
 /** A durable stage artifact (research markdown) by project-relative path. */
 export interface WorkflowArtifactRef {
@@ -498,6 +501,16 @@ export interface WorkflowEvent {
 /** `workflow {sessionId, ...WorkflowEvent}` - staged workflow state. */
 export interface WorkflowMessage extends SessionScopedMessage, WorkflowEvent {
   type: "workflow";
+}
+
+/**
+ * `interrupted_request {sessionId, request?}` - the request a shutdown or a
+ * cancellation left unresolved, kept aside so a later message cannot discard
+ * it. Absent `request` means the user resolved it (resumed or restarted).
+ */
+export interface InterruptedRequestMessage extends SessionScopedMessage {
+  type: "interrupted_request";
+  request?: WorkflowEvent;
 }
 
 export type HarnessJobStatus =
@@ -917,6 +930,7 @@ export type ServerMessage =
   | PlanMessage
   | ChangesetMessage
   | WorkflowMessage
+  | InterruptedRequestMessage
   | HarnessJobMessage
   | RollbackResultMessage
   | ProgressMessage
@@ -941,6 +955,7 @@ export const SERVER_MESSAGE_TYPES = [
   "team_task",
   "changeset",
   "workflow",
+  "interrupted_request",
   "harness_job",
   "rollback_result",
   "progress",
@@ -1417,7 +1432,12 @@ const WORKFLOW_STAGES: readonly WorkflowStage[] = [
   "failed",
 ];
 
-const WORKFLOW_ROUTES: readonly WorkflowRoute[] = ["answer", "direct", "pipeline"];
+const WORKFLOW_ROUTES: readonly WorkflowRoute[] = [
+  "answer",
+  "direct",
+  "scoped",
+  "pipeline",
+];
 
 function isStringArray(value: unknown): value is string[] {
   return Array.isArray(value) && value.every((item) => typeof item === "string");
@@ -1467,12 +1487,10 @@ function isWorkflowVerifyResult(value: unknown): value is WorkflowVerifyResult {
   );
 }
 
-/** True if `value` is a session-scoped `workflow` stage snapshot. */
-export function isWorkflowMessage(value: unknown): value is WorkflowMessage {
+/** True if `value` carries every field of a workflow snapshot. */
+function isWorkflowEvent(value: unknown): value is WorkflowEvent {
   return (
     isObject(value) &&
-    value.type === "workflow" &&
-    hasSessionId(value) &&
     typeof value.requestId === "string" &&
     isWorkflowStage(value.stage) &&
     (value.interruptedStage === undefined ||
@@ -1488,6 +1506,28 @@ export function isWorkflowMessage(value: unknown): value is WorkflowMessage {
     (value.verdict === undefined || isWorkflowVerifyResult(value.verdict)) &&
     typeof value.deepPlanning === "boolean" &&
     (value.error === undefined || typeof value.error === "string")
+  );
+}
+
+/** True if `value` is a session-scoped `workflow` stage snapshot. */
+export function isWorkflowMessage(value: unknown): value is WorkflowMessage {
+  return (
+    isObject(value) &&
+    value.type === "workflow" &&
+    hasSessionId(value) &&
+    isWorkflowEvent(value)
+  );
+}
+
+/** True if `value` is a session-scoped unresolved-request snapshot. */
+export function isInterruptedRequestMessage(
+  value: unknown,
+): value is InterruptedRequestMessage {
+  return (
+    isObject(value) &&
+    value.type === "interrupted_request" &&
+    hasSessionId(value) &&
+    (value.request === undefined || isWorkflowEvent(value.request))
   );
 }
 
@@ -1722,6 +1762,7 @@ export function isServerMessage(value: unknown): value is ServerMessage {
     isTeamTaskMessage(value) ||
     isChangesetMessage(value) ||
     isWorkflowMessage(value) ||
+    isInterruptedRequestMessage(value) ||
     isHarnessJobMessage(value) ||
     isRollbackResultMessage(value) ||
     isProgressMessage(value) ||

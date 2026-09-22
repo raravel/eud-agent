@@ -378,6 +378,12 @@ export interface PanelState {
    * strip, research/verdict cards, and the interrupted controls.
    */
   workflow: WorkflowEvent | null;
+  /**
+   * The request a shutdown or a cancellation left unresolved, which a later
+   * message set aside instead of discarding (null when there is none). It
+   * survives across requests until the user resumes or restarts it.
+   */
+  interruptedRequest: WorkflowEvent | null;
   /** Every EPS → Map team task of this session, as last announced. */
   teamTasks: TeamTask[];
   /** Whether the project-memory overlay is open. */
@@ -473,6 +479,8 @@ export interface PanelStore {
    * verdict artifacts are archived into the log while a turn is in flight.
    */
   workflowReceived(event: WorkflowEvent): void;
+  /** `interrupted_request` — the unresolved request, or null once resolved. */
+  interruptedRequestReceived(event: WorkflowEvent | null): void;
   /** `rollback_result` — flip per-item decision state (rejected/failed). */
   rollbackResult(ids: string[], ok: boolean): void;
   /** `error` — return the flow to ready (and detect the no-project signal). */
@@ -678,6 +686,7 @@ export function createPanelStore(): PanelStore {
     ask: null as AskState | null,
     changeset: null as ChangesetState | null,
     workflow: null as WorkflowEvent | null,
+    interruptedRequest: null as WorkflowEvent | null,
     teamTasks: [] as TeamTask[],
     memoryOpen: false,
     memory: null as MemoryViewState | null,
@@ -730,6 +739,7 @@ export function createPanelStore(): PanelStore {
       ask: core.ask,
       changeset: core.changeset,
       workflow: core.workflow,
+      interruptedRequest: core.interruptedRequest,
       teamTasks: core.teamTasks,
       memoryOpen: core.memoryOpen,
       memory: core.memory,
@@ -1251,6 +1261,11 @@ export function createPanelStore(): PanelStore {
       emit();
     },
 
+    interruptedRequestReceived(event) {
+      core.interruptedRequest = event;
+      emit();
+    },
+
     workflowReceived(event) {
       const prior = core.workflow;
       core.workflow = event;
@@ -1553,9 +1568,13 @@ export function createPanelStore(): PanelStore {
       core.turn = emptyTurn();
       core.ask = null;
       nextTextBlockBreak = false;
-      const stage = core.workflow?.interruptedStage;
+      const stage = (core.workflow?.stage === "interrupted"
+        ? core.workflow
+        : core.interruptedRequest
+      )?.interruptedStage;
       const phase = stage === undefined ? "thinking" : phaseForWorkflowStage(stage);
       core.phase = isBusyPhase(phase) ? phase : "thinking";
+      core.interruptedRequest = null;
       emit();
     },
 
@@ -1567,6 +1586,7 @@ export function createPanelStore(): PanelStore {
       core.plan = null;
       core.ask = null;
       core.workflow = null;
+      core.interruptedRequest = null;
       core.turn = emptyTurn();
       nextTextBlockBreak = false;
       core.phase = "thinking";

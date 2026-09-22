@@ -114,7 +114,13 @@ Routes:
 - `direct`: one clearly specified, single-site change whose target and value are explicit in the
   message and the project (rename one thing, change one value, add one line). Ordinary foreground
   with write transition and changeset review, unchanged.
-- `pipeline`: everything else that writes.
+- `scoped` (added after the first live runs): a change that is small once its site is known — one
+  constant, address, call, guarded branch, or existing module — even when the exact value or file is
+  not in the message yet. The ordinary foreground turn looks it up, makes the smallest change that
+  satisfies the request, and builds; no research, plan, critique, or approval stage runs. Writes
+  journal and reach changeset review as on `direct`.
+- `pipeline`: work that needs design or investigation before anything can be changed. A look-up
+  alone is not investigation: that is `scoped`.
 - `clarify`: the goal, target, or acceptance is materially ambiguous. The engine emits an ASK with
   the triage questions; the answers are appended and triage runs again. At most two clarify rounds
   per request; a third ambiguity becomes an answer that states what is missing. An unanswered ask

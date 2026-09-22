@@ -75,6 +75,10 @@ impl WorkflowStage {
 pub enum WorkflowRoute {
     Answer,
     Direct,
+    /// A small change whose site or value the foreground settles by reading
+    /// the project or the documentation first: one foreground turn, no
+    /// research, plan, critique, or approval.
+    Scoped,
     Pipeline,
 }
 
@@ -435,7 +439,7 @@ pub fn triage_schema() -> Value {
     json!({
         "type": "object",
         "properties": {
-            "route": { "type": "string", "enum": ["answer", "direct", "pipeline", "clarify"] },
+            "route": { "type": "string", "enum": ["answer", "direct", "scoped", "pipeline", "clarify"] },
             "goal": { "type": "string" },
             "acceptanceCriteria": string_array(),
             "rationale": { "type": "string" },
@@ -982,6 +986,13 @@ pub struct StageContext<'a> {
     pub project: &'a str,
     pub user_text: &'a str,
     pub clarifications: &'a [String],
+    /// The condensed session transcript. Triage routes one message, and a
+    /// message like "continue" only means something against what came before;
+    /// the later stages work from the triage goal and leave this empty.
+    pub conversation: &'a str,
+    /// The `[interrupted request]` section, when this session still has a
+    /// request the user has not resolved.
+    pub interrupted: &'a str,
 }
 
 const SUBMIT_RULE: &str = "Finish by calling `submit_result` exactly once with a value that matches its schema. Write every user-facing text field in Korean. Only the tools offered to this run exist: `build_run` and every write tool are absent unless listed; never call a tool that is not offered; never edit files.";
@@ -1037,17 +1048,81 @@ pub fn triage_prompt(context: &StageContext<'_>, clarify_rounds_left: u8) -> Str
 - answer: a question or explanation that changes nothing.\n\
 - direct: one clearly specified single-site change whose target and value are explicit in the message and the project (rename one thing, change one value, add one line).\n\
 - direct also covers a request whose change is map placement only (terrain, units, buildings, doodads, sprites, or a drawn region): the foreground hands it to the Map Agent with map_task_request and the user applies the candidate in the Map window; choose pipeline only when it also needs EPS code.\n\
-- pipeline: any other change: new behavior, multiple files, unclear placement, a bug to diagnose, anything needing design or investigation.\n\
+- scoped: a small change the foreground can finish in one turn by looking the target or value up first — one constant, one address, one call, one guarded branch, one existing module. Choose scoped whenever the work is \"find the site, change it, build\", even when the exact value, address, or file is not in the message yet.\n\
+- pipeline: only when the work genuinely needs design or investigation before anything can be changed: new behavior spanning several modules, placement the project does not already decide, a bug whose cause is unknown, or a change whose blast radius the request cannot bound.\n\
 - clarify: the goal, target, or acceptance is materially ambiguous and a short question would change the work. {} clarify round(s) remain; when none remain, choose answer and state in `goal` what is missing.\n\n\
+[scope]\n\
+Route on the work the user's words actually require, not on everything that could be improved nearby. Choose the lightest route that can finish the request; a lighter route can still hand the work to a heavier one later, while a heavier route always costs the user several minutes.\n\
+`acceptanceCriteria` states only the outcomes the user asked for, one per outcome. Never add hardening, refactors, renames, new modules, new tests, documentation, or checks of untouched code: those become a contract every later stage must satisfy.\n\n\
+[continuity]\n\
+`[prior conversation]` is this session's own history and `[interrupted request]` is work it started and never finished. A message that points back at them (\"continue\", \"계속\", \"그거 해줘\", \"아까 그것부터\") is not a new request and is not ambiguous: resolve it against them, restate the work it refers to in `goal`, and route that work. Choose `clarify` only when they do not settle it. When an interrupted request already carries an approved plan and this message continues it, route `pipeline` so that plan is picked up instead of being designed again.\n\n\
 [output]\n\
 `goal` restates the request as one verifiable sentence. `acceptanceCriteria` lists what must be true when done (empty for answer). `rationale` explains the route in one or two sentences. For clarify, `questions` holds 1–4 questions with 2–5 options each where a choice exists.\n\
 Read the project only as far as the route decision needs (MainFile and the files the request names). {SUBMIT_RULE}\n\n\
-{}\n{}\n[user message]\n{}",
+{}\n{}{}{}\n[user message]\n{}",
         clarify_rounds_left,
         context.project,
+        section(context.interrupted),
+        section(context.conversation),
         clarification_section(context.clarifications),
         context.user_text
     )
+}
+
+/// The request an interruption left unresolved, rendered for triage so a
+/// message that continues it is read as that work and not as a new one.
+pub fn interrupted_request_section(state: &WorkflowState) -> String {
+    let stage = state.interrupted_stage.unwrap_or(state.stage);
+    let mut out = String::from(
+        "[interrupted request]\n이 세션에는 사용자가 아직 정리하지 않은 이전 요청이 남아 있습니다. 이번 메시지가 이 요청을 이어가려는 것이면 그 작업으로 라우팅하고, 관계없는 새 요청이면 이 절을 무시하세요.\n",
+    );
+    out.push_str(&format!("요청: {}\n", truncate_line(&state.user_text)));
+    out.push_str(&format!("중단된 단계: {stage:?}\n"));
+    if let Some(triage) = state.triage.as_ref() {
+        out.push_str(&format!("목표: {}\n", truncate_line(&triage.goal)));
+        if !triage.acceptance_criteria.is_empty() {
+            out.push_str("수용 조건:\n");
+            out.push_str(&bullets(&triage.acceptance_criteria));
+            out.push('\n');
+        }
+    }
+    if let Some(plan) = state.plan.as_ref() {
+        let approval = if plan.approved_sha256.as_deref() == Some(plan.sha256.as_str()) {
+            "사용자가 승인함"
+        } else {
+            "미승인"
+        };
+        out.push_str(&format!(
+            "계획: {} (rev {}, {approval}, {})\n",
+            truncate_line(&plan.title),
+            plan.revision,
+            plan.path
+        ));
+    }
+    if let Some(research) = state.research.as_ref() {
+        out.push_str(&format!("조사 결과: {}\n", research.path));
+    }
+    out
+}
+
+/// One prompt line from free-form text: no newlines, bounded length.
+fn truncate_line(text: &str) -> String {
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut out = flat.chars().take(240).collect::<String>();
+    if flat.chars().count() > 240 {
+        out.push('…');
+    }
+    out
+}
+
+/// One optional prompt section, or nothing at all when it is empty.
+fn section(text: &str) -> String {
+    let text = text.trim();
+    if text.is_empty() {
+        String::new()
+    } else {
+        format!("\n{text}\n")
+    }
 }
 
 /// The prompt of one model-invoked `delegate_read` child. It carries only the
@@ -1071,10 +1146,11 @@ pub fn research_prompt(context: &StageContext<'_>, triage: &TriageResult) -> Str
         "[role]\nYou research the native EUD project for one approved goal so a separate planner can write an exact plan. Do not propose the plan and do not change anything.\n\n\
 [goal]\n{}\n\n[acceptance criteria]\n{}\n\n\
 [method]\n\
-- Read MainFile and every module the goal touches; list each relevant file with why it matters and the functions/constants involved.\n\
+- Settle the goal with the fewest reads that answer it: start from MainFile and the files the goal names, follow only the references the goal depends on, and stop as soon as every acceptance criterion has its evidence. Do not survey the project.\n\
+- List each relevant file with why it matters and the functions/constants involved; a file the plan will not touch belongs in the list only when it constrains the change.\n\
 - For DAT-affecting goals, read the exact catalog entries with the dat tools and list them under datTargets.\n\
-- Search the documentation (Korean queries) for every unit of work and read the exact chunks; cite each claim with title and url. If nothing relevant exists, leave docEvidence empty rather than inventing a source.\n\
-- List constraints from [first principles] that apply, risks, and open questions the planner must decide.\n\
+- Search the documentation (Korean queries) only for facts the project itself cannot answer (memory addresses, engine behavior, euddraft/epScript semantics) and read only the chunks you cite; cite each claim with title and url. If nothing relevant exists, leave docEvidence empty rather than inventing a source.\n\
+- List constraints from [first principles] that apply, risks, and open questions the planner must decide. Adjacent defects, stale comments, and cleanups you noticed while reading belong in openQuestions as one line each — never as work the plan must absorb.\n\
 {SUBMIT_RULE}\n\n{}\n\n{}\n{}\n[user message]\n{}",
         triage.goal,
         bullets(&triage.acceptance_criteria),
@@ -1097,6 +1173,9 @@ pub fn planner_prompt(
         "[role]\nYou write the implementation plan for one goal in the native EUD project. A separate executor will follow it step by step and a separate verifier will judge the result against its acceptance criteria. Do not implement anything.\n\n\
 [goal]\n{}\n\n[acceptance criteria from triage]\n{}\n\n\
 [plan rules]\n\
+- Write the shortest plan that meets the goal. Change existing files in place; add a module, file, or test only when the goal cannot be met inside the files that already exist, and say in that step why not.\n\
+- Plan nothing the goal did not ask for: no refactors, renames, comment or wording sweeps, extra tests, or repairs of defects the goal does not depend on. Anything you noticed but are not asked to fix goes in outOfScope as one line.\n\
+- acceptanceCriteria restate the goal's criteria; do not add new ones the user did not ask for.\n\
 - Every step names its files, the exact change, and how that step is verified. Order steps by dependency.\n\
 - Keep MainFile as the composition root; place cohesive logic in focused modules; keep imports acyclic; batch mutually dependent edits into one step.\n\
 - Set buildRequired to true whenever source, DAT, plugins, or Python change.\n\
@@ -1141,6 +1220,7 @@ pub fn critic_prompt(
 [goal]\n{}\n\n[acceptance criteria]\n{}\n\n\
 [check]\n\
 - missing steps, wrong or nonexistent files, steps that cannot be verified, acceptance criteria without a verifying step;\n\
+- excess, which fails a plan as surely as a gap: steps, new files or modules, tests, renames, comment or wording changes, and acceptance criteria the goal did not ask for. Report each one as a major issue naming the step to drop, and never ask for work the goal does not require;\n\
 - violations of [first principles] and eps idioms;\n\
 - unsafe assumptions about locations, players, units, or DAT values that the research did not confirm.\n\
 Verdict `approve` only when no blocking or major issue remains. {SUBMIT_RULE}\n\n[plan]\n{}\n\n[research]\n{}\n\n{}\n\n{}",
@@ -1221,6 +1301,7 @@ pub fn parse_triage(value: &Value) -> Result<(TriageResult, Vec<crate::ipc::AskQ
     let route = match text(value, "route").as_str() {
         "answer" => Some(WorkflowRoute::Answer),
         "direct" => Some(WorkflowRoute::Direct),
+        "scoped" => Some(WorkflowRoute::Scoped),
         "pipeline" => Some(WorkflowRoute::Pipeline),
         "clarify" => None,
         other => return Err(format!("triage returned unknown route '{other}'")),
@@ -1348,11 +1429,113 @@ mod tests {
             project: "[project state]",
             user_text: &state.user_text,
             clarifications: &state.clarifications,
+            conversation: "",
+            interrupted: "",
         };
         let prompt = triage_prompt(&context, 2);
         assert!(prompt.contains("map placement only"));
         assert!(prompt.contains("map_task_request"));
         assert!(prompt.contains("choose pipeline only when it also needs EPS code"));
+    }
+
+    #[test]
+    fn triage_offers_a_scoped_route_between_direct_and_the_pipeline() {
+        let state = WorkflowState::new(
+            "req".into(),
+            "turn".into(),
+            "rev".into(),
+            "이 맵의 기본 속도를 2배속으로 해줘.".into(),
+            false,
+            0,
+        );
+        let context = StageContext {
+            guides: "",
+            project: "[project state]",
+            user_text: &state.user_text,
+            clarifications: &state.clarifications,
+            conversation: "",
+            interrupted: "",
+        };
+        let prompt = triage_prompt(&context, 2);
+        // A change whose value is not in the message yet still avoids the
+        // pipeline, and the criteria stay the user's own outcomes.
+        assert!(prompt.contains("- scoped:"));
+        assert!(prompt.contains("find the site, change it, build"));
+        assert!(prompt.contains("Choose the lightest route that can finish the request"));
+        assert!(prompt.contains("states only the outcomes the user asked for"));
+        let (triage, questions) = parse_triage(&json!({
+            "route": "scoped", "goal": "g", "acceptanceCriteria": ["a"], "rationale": "r"
+        }))
+        .expect("scoped is a route");
+        assert_eq!(triage.route, WorkflowRoute::Scoped);
+        assert!(questions.is_empty());
+    }
+
+    #[test]
+    fn planner_and_critic_hold_the_plan_to_the_requested_scope() {
+        let state = WorkflowState::new(
+            "req".into(),
+            "turn".into(),
+            "rev".into(),
+            "이 맵의 기본 속도를 2배속으로 해줘.".into(),
+            false,
+            0,
+        );
+        let context = StageContext {
+            guides: "[first principles]",
+            project: "[project state]",
+            user_text: &state.user_text,
+            clarifications: &state.clarifications,
+            conversation: "",
+            interrupted: "",
+        };
+        let triage = TriageResult {
+            route: WorkflowRoute::Pipeline,
+            goal: "g".into(),
+            acceptance_criteria: vec!["a".into()],
+            rationale: "r".into(),
+            clarify_rounds: 0,
+        };
+        let planner = planner_prompt(&context, &triage, "research", None, None, None);
+        assert!(planner.contains("Write the shortest plan that meets the goal"));
+        assert!(planner.contains("add a module, file, or test only when"));
+        assert!(planner.contains("Plan nothing the goal did not ask for"));
+        // The critic must be able to shrink a plan, not only grow it.
+        let critic = critic_prompt(&context, &triage, "research", "plan");
+        assert!(critic.contains("excess, which fails a plan as surely as a gap"));
+        assert!(critic.contains("major issue naming the step to drop"));
+    }
+
+    #[test]
+    fn research_reads_only_as_far_as_the_goal_needs() {
+        let state = WorkflowState::new(
+            "req".into(),
+            "turn".into(),
+            "rev".into(),
+            "이 맵의 기본 속도를 2배속으로 해줘.".into(),
+            false,
+            0,
+        );
+        let context = StageContext {
+            guides: "[first principles]",
+            project: "[project state]",
+            user_text: &state.user_text,
+            clarifications: &state.clarifications,
+            conversation: "",
+            interrupted: "",
+        };
+        let triage = TriageResult {
+            route: WorkflowRoute::Pipeline,
+            goal: "g".into(),
+            acceptance_criteria: vec!["a".into()],
+            rationale: "r".into(),
+            clarify_rounds: 0,
+        };
+        let prompt = research_prompt(&context, &triage);
+        assert!(prompt.contains("fewest reads that answer it"));
+        assert!(prompt.contains("Do not survey the project."));
+        assert!(prompt.contains("only for facts the project itself cannot answer"));
+        assert!(prompt.contains("never as work the plan must absorb"));
     }
 
     #[test]

@@ -110,6 +110,12 @@ pub struct SessionRecord {
     /// Durable stage state of the current staged request, when one exists.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workflow: Option<crate::workflow::WorkflowState>,
+    /// The request a shutdown or a cancellation cut short, kept aside so a
+    /// later message cannot silently discard work the user already approved.
+    /// The user resolves it explicitly (resume or restart); only then is it
+    /// cleared.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interrupted_workflow: Option<crate::workflow::WorkflowState>,
     /// EPS → Map team handoffs this (EPS) session created, oldest first.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub team_tasks: Vec<crate::team::TeamTask>,
@@ -138,6 +144,8 @@ struct SessionRecordWire {
     autonomous_run: Option<crate::autonomous::AutonomousRunState>,
     #[serde(default)]
     workflow: Option<crate::workflow::WorkflowState>,
+    #[serde(default)]
+    interrupted_workflow: Option<crate::workflow::WorkflowState>,
     #[serde(default)]
     team_tasks: Vec<crate::team::TeamTask>,
 }
@@ -469,6 +477,7 @@ impl SessionStore {
             source.task_state = Default::default();
             source.autonomous_run = None;
             source.workflow = None;
+            source.interrupted_workflow = None;
             source.meta.provider = source.provider_binding.provider;
             source.meta.model = source.provider_binding.model.clone();
             let bytes = match serde_json::to_vec_pretty(&source) {
@@ -591,6 +600,18 @@ impl SessionStore {
         let _guard = self.lock()?;
         let mut record = self.load_unlocked(id)?;
         record.workflow = workflow;
+        self.save_unlocked(&record)
+    }
+
+    /// Replace only the request an interruption left unresolved.
+    pub fn set_interrupted_workflow(
+        &self,
+        id: &str,
+        workflow: Option<crate::workflow::WorkflowState>,
+    ) -> anyhow::Result<()> {
+        let _guard = self.lock()?;
+        let mut record = self.load_unlocked(id)?;
+        record.interrupted_workflow = workflow;
         self.save_unlocked(&record)
     }
 
@@ -1312,6 +1333,7 @@ impl SessionStore {
             task_state: wire.task_state,
             autonomous_run: wire.autonomous_run,
             workflow: wire.workflow,
+            interrupted_workflow: wire.interrupted_workflow,
             team_tasks: wire.team_tasks,
         };
         if let Err(error) = record.task_state.repair_cache() {
@@ -1689,6 +1711,7 @@ mod tests {
             task_state: Default::default(),
             autonomous_run: None,
             workflow: None,
+            interrupted_workflow: None,
             team_tasks: Vec::new(),
         }
     }
@@ -2726,6 +2749,7 @@ mod team_task_tests {
             task_state: Default::default(),
             autonomous_run: None,
             workflow: None,
+            interrupted_workflow: None,
             team_tasks: Vec::new(),
         }
     }

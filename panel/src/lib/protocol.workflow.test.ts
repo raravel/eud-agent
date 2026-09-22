@@ -89,6 +89,12 @@ describe("workflow message guard", () => {
     expect(isWorkflowMessage({ ...base, stage: "cancelled" })).toBe(true);
   });
 
+  it("accepts the scoped route, which executes without a plan", () => {
+    expect(
+      isWorkflowMessage({ ...base, route: "scoped", stage: "executing" }),
+    ).toBe(true);
+  });
+
   it("rejects unknown stages, routes, and malformed artifacts", () => {
     expect(isWorkflowMessage({ ...base, stage: "reviewing" })).toBe(false);
     expect(isWorkflowMessage({ ...base, route: "auto" })).toBe(false);

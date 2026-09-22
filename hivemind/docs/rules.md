@@ -75,6 +75,24 @@
 - Prefer localized `file_edit`; use full `file_write` only for intentional replacement.
 - Preserve exact import paths and MainFile composition-root policy.
 
+## Staged request routing and scope
+
+- Triage picks the lightest route that can finish the request. `scoped` — the foreground turn
+  locates the site itself, makes the change, and builds — is the route for work that is small once
+  its target or value is known; a request does NOT take `pipeline` merely because a value, address,
+  or file has to be looked up first. `pipeline` is for work that needs design or investigation
+  before anything can be changed.
+- `scoped` runs one ordinary foreground turn with no research, plan, critique, or approval stage.
+  Writes still journal, build, and reach changeset review like every other route.
+- Acceptance criteria state only the outcomes the user asked for. Hardening, refactors, renames,
+  comment or wording sweeps, new modules, and new tests the user did not request are never added by
+  triage, research, or the planner; a stage that notices one reports it (research `openQuestions`,
+  plan `outOfScope`, or the turn's answer) instead of absorbing it into the work.
+- The research stage reads only as far as its acceptance criteria need and stops there; it consults
+  the documentation only for facts the project itself cannot answer.
+- The critic fails excess as it fails a gap: a step, file, module, test, or criterion the goal did
+  not ask for is a major issue naming the step to drop.
+
 ## Agent tool admission
 
 - Tool schemas are closed, typed, and validated before dispatch.
