@@ -7,6 +7,9 @@
 use tauri::path::BaseDirectory;
 use tauri::{Emitter, Manager};
 
+/// The label Tauri gives the configured main window.
+const MAIN_WINDOW_LABEL: &str = "main";
+
 pub mod antigravity_auth;
 pub mod antigravity_client;
 pub mod attachment;
@@ -196,6 +199,25 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
+        .on_window_event(|window, event| {
+            // The Map Agent Workbench is a companion of the main window: once
+            // the main window is gone, close it too so the process exits
+            // instead of lingering as a map-only window. The Map Importer is
+            // in turn a companion of the Map window and closes with it.
+            if !matches!(event, tauri::WindowEvent::Destroyed) {
+                return;
+            }
+            match window.label() {
+                MAIN_WINDOW_LABEL => {
+                    map_agent::close_map_window(window.app_handle());
+                    map_import::close_import_window(window.app_handle());
+                }
+                map_agent::MAP_WINDOW_LABEL => {
+                    map_import::close_import_window(window.app_handle());
+                }
+                _ => {}
+            }
+        })
         .setup(|app| {
             isom::assert_abi_version()?;
             let data_dirs = config::DataDirs::resolve(&*app)?;
@@ -391,6 +413,8 @@ pub fn run() {
             map_agent::map_agent_session_load,
             map_agent::map_agent_session_rename,
             map_agent::map_agent_session_delete,
+            map_agent::map_agent_conversation_reset,
+            map_agent::map_agent_conversation_rewind,
             map_agent::map_agent_source_state,
             map_agent::map_agent_render,
             map_agent::map_agent_thumbnail,

@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { SessionMeta, SessionRecord } from "@/lib/protocol";
+import type { PanelLog, SessionMeta, SessionRecord } from "@/lib/protocol";
 
 export type Tileset =
   | "badlands"
@@ -235,6 +235,47 @@ export interface MapBootstrapResponse {
   context: MapContextSnapshot;
   candidate: CandidateStateView;
   session: SessionRecord;
+  /** Set when the saved provider conversation could not be resumed; chat stays blocked until reset. */
+  conversationResumeError?: string | null;
+  /** The session's latest Map run, so the window shows it like a request typed here. */
+  pendingRun?: MapRunTranscript | null;
+}
+
+/** Who started a Map run: this window's user or an EPS session's `map_task_request`. */
+export type MapRunOrigin = "user" | "team";
+
+/** The request bubble of one Map run. */
+export interface MapRunPrompt {
+  text: string;
+  mentions: MapMentionSnapshot[];
+  origin: MapRunOrigin;
+  teamTaskId?: string;
+  parentSessionName?: string;
+}
+
+/** One scoped session event exactly as the window's listeners receive it. */
+export interface MapRunEvent {
+  name: string;
+  payload: Record<string, unknown>;
+}
+
+/** The latest Map run of a session: its prompt and every turn event so far. */
+export interface MapRunTranscript {
+  requestId: string;
+  candidateRevision: string;
+  inFlight: boolean;
+  prompt: MapRunPrompt;
+  events: MapRunEvent[];
+  /** Oldest events were dropped to stay within the transcript bounds. */
+  truncated: boolean;
+}
+
+/** Header of a run that just started (`map_run_started`). */
+export interface MapRunStartedPayload {
+  sessionId: string;
+  requestId: string;
+  candidateRevision: string;
+  prompt: MapRunPrompt;
 }
 
 export type MapObjectKind = "unit" | "building" | "doodad" | "sprite";
@@ -545,6 +586,18 @@ export function mapSessionDelete(sessionId: string): Promise<void> {
   return invoke("map_agent_session_delete", { sessionId });
 }
 
+export function mapConversationReset(sessionId: string): Promise<void> {
+  return invoke("map_agent_conversation_reset", { sessionId });
+}
+
+/** Rewind the model-visible conversation to the rows before an edited message. */
+export function mapConversationRewind(
+  sessionId: string,
+  panelLog: PanelLog,
+): Promise<void> {
+  return invoke("map_agent_conversation_rewind", { sessionId, panelLog });
+}
+
 
 export async function mapSourceState(): Promise<MapSourceProbe> {
   return invoke<MapSourceProbe>("map_agent_source_state");
@@ -683,6 +736,13 @@ export function mapChat(command: {
 
 export function mapCancel(sessionId: string): Promise<void> {
   return invoke("map_agent_cancel", { sessionId });
+}
+
+/** The session's latest run transcript, for adopting a run announced after bootstrap. */
+export function mapRunSnapshot(
+  sessionId: string,
+): Promise<MapRunTranscript | null> {
+  return invoke("map_agent_run_snapshot", { sessionId });
 }
 
 export function candidateRevert(

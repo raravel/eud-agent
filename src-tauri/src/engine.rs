@@ -831,6 +831,42 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
         }
     }
 
+    /// Why the persisted provider conversation could not be resumed at hydration,
+    /// while the session itself stays open for an explicit reset.
+    pub(crate) fn conversation_resume_error(&self) -> Option<&str> {
+        self.conversation_resume_error.as_deref()
+    }
+
+    /// Drop the persisted provider conversation (and any unresolved native receipt)
+    /// so the next turn starts a fresh native session. The panel log, candidate
+    /// state, and task state are untouched; only the model-side thread restarts.
+    pub async fn reset_conversation(&mut self) -> Result<(), AgentEngineError> {
+        if matches!(
+            self.phase,
+            Phase::PlanReview | Phase::Executing | Phase::ChangesetReview
+        ) {
+            return Err(AgentEngineError::new(
+                "현재 세션의 진행 중인 요청 또는 검토를 먼저 완료해 주세요.",
+            ));
+        }
+        self.executor
+            .reset()
+            .await
+            .map_err(|error| AgentEngineError::new(error.to_string()))?;
+        self.thread_active = false;
+        self.conversation_resume_error = None;
+        let record = self
+            .session_store
+            .load(&self.session_id)
+            .map_err(|error| AgentEngineError::new(error.to_string()))?;
+        let transcript = condense_transcript(&record.panel_log);
+        self.pending_resume_transcript = (!transcript.trim().is_empty()).then_some(transcript);
+        self.session_store
+            .reset_context_epoch(&self.session_id, &static_prompt_baseline(), true)
+            .map_err(|error| AgentEngineError::new(error.to_string()))?;
+        Ok(())
+    }
+
     fn foreground_request(
         &self,
         request_id: &str,
@@ -2726,11 +2762,176 @@ pub(crate) struct SessionEvent<T> {
     payload: T,
 }
 
+/// Who started a Map request: the Map window's user or an EPS session's
+/// `map_task_request`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MapRunOrigin {
+    User,
+    Team,
+}
+
+/// The request bubble of one Map run, as the Map window shows it: the raw
+/// user text (or the team task goal), the mentions it carried, and its origin.
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MapRunPrompt {
+    pub text: String,
+    pub mentions: Vec<crate::map_model::MapMentionSnapshot>,
+    pub origin: MapRunOrigin,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub team_task_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_session_name: Option<String>,
+}
+
+/// One scoped session event exactly as the Map window received (or missed) it.
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MapRunEvent {
+    pub name: String,
+    pub payload: serde_json::Value,
+}
+
+/// The latest Map request of one session: its prompt and every scoped event
+/// it emitted so far, so a Map window that opens (or switches) mid-run can
+/// show it exactly like a request typed there. Kept after the run ends until
+/// the next request replaces it.
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MapRunTranscript {
+    pub request_id: String,
+    pub candidate_revision: String,
+    pub in_flight: bool,
+    pub prompt: MapRunPrompt,
+    pub events: Vec<MapRunEvent>,
+    /// Oldest events were dropped to stay within the transcript bounds.
+    pub truncated: bool,
+}
+
+/// Header of a run that just started, emitted as `map_run_started` (the
+/// scoped wrapper adds `sessionId`/`requestId`/`candidateRevision`).
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MapRunStartedEvent {
+    prompt: MapRunPrompt,
+}
+
+const MAP_RUN_MAX_EVENTS: usize = 2000;
+const MAP_RUN_MAX_BYTES: usize = 4 * 1024 * 1024;
+/// The session events the Map window's turn listeners consume.
+const MAP_RUN_EVENT_NAMES: [&str; 5] = ["agent_event", "context_usage", "answer", "ask", "error"];
+
+/// The bounded event record behind [`MapRunTranscript`].
+struct MapRunRecord {
+    request_id: String,
+    candidate_revision: String,
+    in_flight: bool,
+    prompt: MapRunPrompt,
+    events: VecDeque<(MapRunEvent, usize)>,
+    bytes: usize,
+    truncated: bool,
+}
+
+impl MapRunRecord {
+    fn push(&mut self, name: &str, payload: serde_json::Value) {
+        let size = payload.to_string().len();
+        self.events.push_back((
+            MapRunEvent {
+                name: name.to_string(),
+                payload,
+            },
+            size,
+        ));
+        self.bytes += size;
+        while self.events.len() > MAP_RUN_MAX_EVENTS
+            || (self.bytes > MAP_RUN_MAX_BYTES && self.events.len() > 1)
+        {
+            if let Some((_, dropped)) = self.events.pop_front() {
+                self.bytes -= dropped;
+                self.truncated = true;
+            }
+        }
+    }
+
+    fn snapshot(&self) -> MapRunTranscript {
+        MapRunTranscript {
+            request_id: self.request_id.clone(),
+            candidate_revision: self.candidate_revision.clone(),
+            in_flight: self.in_flight,
+            prompt: self.prompt.clone(),
+            events: self.events.iter().map(|(event, _)| event.clone()).collect(),
+            truncated: self.truncated,
+        }
+    }
+}
+
+/// The latest Map run of one session, shared by every clone of its sink and
+/// readable without the engine lock.
+#[derive(Clone, Default)]
+struct MapRunRecorder(Arc<parking_lot::RwLock<Option<MapRunRecord>>>);
+
+impl MapRunRecorder {
+    /// Start a fresh in-flight transcript, replacing the previous run's.
+    fn start(&self, request_id: String, candidate_revision: String, prompt: MapRunPrompt) {
+        *self.0.write() = Some(MapRunRecord {
+            request_id,
+            candidate_revision,
+            in_flight: true,
+            prompt,
+            events: VecDeque::new(),
+            bytes: 0,
+            truncated: false,
+        });
+    }
+
+    /// Append one scoped turn event to the in-flight run it belongs to; other
+    /// event names, unscoped events, and events of another request are not
+    /// part of the transcript.
+    fn record<T: serde::Serialize>(
+        &self,
+        name: &str,
+        event: &SessionEvent<T>,
+    ) -> Result<(), serde_json::Error> {
+        if !MAP_RUN_EVENT_NAMES.contains(&name) {
+            return Ok(());
+        }
+        let Some(request_id) = event.request_id.as_deref() else {
+            return Ok(());
+        };
+        let mut run = self.0.write();
+        let Some(record) = run
+            .as_mut()
+            .filter(|record| record.in_flight && record.request_id == request_id)
+        else {
+            return Ok(());
+        };
+        record.push(name, serde_json::to_value(event)?);
+        Ok(())
+    }
+
+    /// The run ended; its transcript stays readable until the next start.
+    fn finish(&self, request_id: &str) {
+        let mut run = self.0.write();
+        if let Some(record) = run
+            .as_mut()
+            .filter(|record| record.request_id == request_id)
+        {
+            record.in_flight = false;
+        }
+    }
+
+    fn snapshot(&self) -> Option<MapRunTranscript> {
+        self.0.read().as_ref().map(MapRunRecord::snapshot)
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct SessionEventSink {
     app: tauri::AppHandle,
     session_id: String,
     map_context: Arc<parking_lot::RwLock<Option<MapEventContext>>>,
+    map_run: MapRunRecorder,
 }
 
 impl SessionEventSink {
@@ -2739,16 +2940,35 @@ impl SessionEventSink {
             app,
             session_id: session_id.into(),
             map_context: Arc::new(parking_lot::RwLock::new(None)),
+            map_run: MapRunRecorder::default(),
         }
     }
 
-    pub(crate) fn set_map_context(&self, request_id: String, candidate_revision: String) {
+    /// Scope the following events to one Map request, start its transcript
+    /// (replacing the previous run's), and announce the run's header so an
+    /// idle Map window can adopt it.
+    pub(crate) fn set_map_context(
+        &self,
+        request_id: String,
+        candidate_revision: String,
+        prompt: MapRunPrompt,
+    ) {
         *self.map_context.write() = Some(MapEventContext {
-            request_id,
-            candidate_revision,
+            request_id: request_id.clone(),
+            candidate_revision: candidate_revision.clone(),
         });
+        self.map_run
+            .start(request_id, candidate_revision, prompt.clone());
+        if let Err(error) = self.emit_scoped("map_run_started", MapRunStartedEvent { prompt }) {
+            eprintln!(
+                "eud-agent: map run start event failed: session={} error={error}",
+                self.session_id
+            );
+        }
     }
 
+    /// End the request's scope; its transcript stays readable, marked as no
+    /// longer in flight, until the next request starts.
     pub(crate) fn clear_map_context(&self, request_id: &str) {
         let mut context = self.map_context.write();
         if context
@@ -2757,6 +2977,12 @@ impl SessionEventSink {
         {
             *context = None;
         }
+        self.map_run.finish(request_id);
+    }
+
+    /// The latest Map run's transcript, without touching the engine.
+    pub(crate) fn map_run_snapshot(&self) -> Option<MapRunTranscript> {
+        self.map_run.snapshot()
     }
 
     fn scoped<T>(&self, payload: T) -> SessionEvent<T> {
@@ -2773,7 +2999,14 @@ impl SessionEventSink {
     where
         T: serde::Serialize + Clone,
     {
-        self.app.emit(name, self.scoped(payload))
+        let event = self.scoped(payload);
+        if let Err(error) = self.map_run.record(name, &event) {
+            eprintln!(
+                "eud-agent: map run event could not be recorded: session={} event={name} error={error}",
+                self.session_id
+            );
+        }
+        self.app.emit(name, event)
     }
 }
 
@@ -2798,6 +3031,294 @@ impl EventSink for SessionEventSink {
     }
 }
 
+#[cfg(test)]
+mod map_run_tests {
+    use super::*;
+
+    fn prompt(origin: MapRunOrigin) -> MapRunPrompt {
+        MapRunPrompt {
+            text: "Z1 테두리를 마을 패턴으로".to_string(),
+            mentions: Vec::new(),
+            origin,
+            team_task_id: (origin == MapRunOrigin::Team).then(|| "task-1".to_string()),
+            parent_session_name: (origin == MapRunOrigin::Team).then(|| "메인".to_string()),
+        }
+    }
+
+    /// The scoped event exactly as `SessionEventSink::scoped` builds it while
+    /// the map context is `request_id`.
+    fn scoped<T>(request_id: Option<&str>, payload: T) -> SessionEvent<T> {
+        SessionEvent {
+            session_id: "map-1".to_string(),
+            request_id: request_id.map(str::to_string),
+            candidate_revision: request_id.map(|_| "r0:aaa".to_string()),
+            payload,
+        }
+    }
+
+    fn agent_event(detail: &str) -> ipc::AgentEvent {
+        ipc::AgentEvent {
+            kind: "tool_call".to_string(),
+            detail: detail.to_string(),
+            data: None,
+        }
+    }
+
+    fn started(origin: MapRunOrigin) -> MapRunRecorder {
+        let recorder = MapRunRecorder::default();
+        recorder.start("map-a".to_string(), "r0:aaa".to_string(), prompt(origin));
+        recorder
+    }
+
+    #[test]
+    fn transcript_records_scoped_turn_events_of_the_matching_request_only() {
+        let recorder = MapRunRecorder::default();
+        assert!(recorder.snapshot().is_none());
+        recorder
+            .record(
+                "agent_event",
+                &scoped(None, agent_event("before any request")),
+            )
+            .unwrap();
+        assert!(recorder.snapshot().is_none());
+
+        recorder.start(
+            "map-a".to_string(),
+            "r0:aaa".to_string(),
+            prompt(MapRunOrigin::Team),
+        );
+        let header = recorder.snapshot().unwrap();
+        assert!(header.in_flight);
+        assert!(header.events.is_empty());
+        assert_eq!(header.prompt.origin, MapRunOrigin::Team);
+        assert_eq!(header.prompt.team_task_id.as_deref(), Some("task-1"));
+        assert_eq!(header.prompt.parent_session_name.as_deref(), Some("메인"));
+        assert_eq!(
+            serde_json::to_value(&header.prompt).unwrap(),
+            serde_json::json!({
+                "text": "Z1 테두리를 마을 패턴으로",
+                "mentions": [],
+                "origin": "team",
+                "teamTaskId": "task-1",
+                "parentSessionName": "메인",
+            })
+        );
+
+        recorder
+            .record(
+                "agent_event",
+                &scoped(Some("map-a"), agent_event("terrain.set")),
+            )
+            .unwrap();
+        recorder
+            .record(
+                "progress",
+                &scoped(
+                    Some("map-a"),
+                    ipc::ProgressEvent {
+                        stage: ipc::ProgressStage::Provider,
+                        detail: Some("not a turn event".to_string()),
+                        provider: None,
+                        model: None,
+                    },
+                ),
+            )
+            .unwrap();
+        recorder
+            .record("agent_event", &scoped(None, agent_event("unscoped")))
+            .unwrap();
+        recorder
+            .record(
+                "agent_event",
+                &scoped(Some("map-other"), agent_event("other request")),
+            )
+            .unwrap();
+        recorder
+            .record(
+                "answer",
+                &scoped(
+                    Some("map-a"),
+                    ipc::AnswerEvent {
+                        text: "done".to_string(),
+                    },
+                ),
+            )
+            .unwrap();
+
+        let run = recorder.snapshot().unwrap();
+        assert_eq!(run.request_id, "map-a");
+        assert_eq!(run.candidate_revision, "r0:aaa");
+        assert!(run.in_flight);
+        assert!(!run.truncated);
+        assert_eq!(
+            run.events
+                .iter()
+                .map(|event| event.name.as_str())
+                .collect::<Vec<_>>(),
+            ["agent_event", "answer"]
+        );
+        // The payload is the scoped event the panel receives.
+        assert_eq!(run.events[0].payload["sessionId"], "map-1");
+        assert_eq!(run.events[0].payload["requestId"], "map-a");
+        assert_eq!(run.events[0].payload["candidateRevision"], "r0:aaa");
+        assert_eq!(run.events[0].payload["detail"], "terrain.set");
+        assert_eq!(run.events[1].payload["text"], "done");
+        let serialized = serde_json::to_value(&run).unwrap();
+        assert_eq!(serialized["requestId"], "map-a");
+        assert_eq!(serialized["inFlight"], true);
+        assert_eq!(serialized["events"][1]["name"], "answer");
+
+        recorder.finish("map-a");
+        recorder
+            .record(
+                "agent_event",
+                &scoped(Some("map-a"), agent_event("after the run")),
+            )
+            .unwrap();
+        let ended = recorder.snapshot().unwrap();
+        assert!(!ended.in_flight, "finishing the request ends the run");
+        assert_eq!(
+            ended.events.len(),
+            2,
+            "events after the run are not recorded"
+        );
+        assert_eq!(
+            ended.prompt.text, run.prompt.text,
+            "the ended run stays readable"
+        );
+
+        recorder.start(
+            "map-b".to_string(),
+            "r0:aaa".to_string(),
+            prompt(MapRunOrigin::User),
+        );
+        let fresh = recorder.snapshot().unwrap();
+        assert_eq!(fresh.request_id, "map-b");
+        assert!(fresh.in_flight);
+        assert!(
+            fresh.events.is_empty(),
+            "a new request starts a fresh transcript"
+        );
+        assert_eq!(fresh.prompt.origin, MapRunOrigin::User);
+        assert_eq!(serde_json::to_value(fresh.prompt.origin).unwrap(), "user");
+    }
+
+    #[test]
+    fn finishing_another_request_keeps_the_current_run_in_flight() {
+        let recorder = started(MapRunOrigin::User);
+        recorder.finish("map-stale");
+        recorder
+            .record(
+                "agent_event",
+                &scoped(Some("map-a"), agent_event("still recorded")),
+            )
+            .unwrap();
+        let run = recorder.snapshot().unwrap();
+        assert!(run.in_flight);
+        assert_eq!(run.events.len(), 1);
+    }
+
+    #[test]
+    fn transcript_drops_the_oldest_events_beyond_its_bounds() {
+        let recorder = started(MapRunOrigin::User);
+        for index in 0..(MAP_RUN_MAX_EVENTS + 5) {
+            recorder
+                .record(
+                    "agent_event",
+                    &scoped(Some("map-a"), agent_event(&format!("event {index}"))),
+                )
+                .unwrap();
+        }
+        let run = recorder.snapshot().unwrap();
+        assert!(run.truncated);
+        assert_eq!(run.events.len(), MAP_RUN_MAX_EVENTS);
+        assert_eq!(run.events[0].payload["detail"], "event 5");
+        assert_eq!(
+            run.events[MAP_RUN_MAX_EVENTS - 1].payload["detail"],
+            format!("event {}", MAP_RUN_MAX_EVENTS + 4)
+        );
+
+        // Byte bound: three 1.5 MiB events keep only the newest two.
+        let recorder = started(MapRunOrigin::User);
+        let large = "x".repeat(3 * MAP_RUN_MAX_BYTES / 8);
+        for index in 0..3 {
+            recorder
+                .record(
+                    "agent_event",
+                    &scoped(Some("map-a"), agent_event(&format!("{index}{large}"))),
+                )
+                .unwrap();
+        }
+        let run = recorder.snapshot().unwrap();
+        assert!(run.truncated);
+        assert_eq!(run.events.len(), 2);
+        assert!(run.events[0].payload["detail"]
+            .as_str()
+            .unwrap()
+            .starts_with('1'));
+        assert!(run.events[1].payload["detail"]
+            .as_str()
+            .unwrap()
+            .starts_with('2'));
+    }
+
+    #[test]
+    fn the_run_header_carries_the_prompt_and_no_events() {
+        let header = serde_json::to_value(MapRunStartedEvent {
+            prompt: prompt(MapRunOrigin::Team),
+        })
+        .unwrap();
+        assert_eq!(header["prompt"]["origin"], "team");
+        assert_eq!(header["prompt"]["text"], "Z1 테두리를 마을 패턴으로");
+        assert_eq!(header["prompt"]["teamTaskId"], "task-1");
+        assert_eq!(header["prompt"]["parentSessionName"], "메인");
+        assert!(header.get("events").is_none());
+        let scoped_header = serde_json::to_value(scoped(
+            Some("map-a"),
+            MapRunStartedEvent {
+                prompt: prompt(MapRunOrigin::User),
+            },
+        ))
+        .unwrap();
+        assert_eq!(scoped_header["sessionId"], "map-1");
+        assert_eq!(scoped_header["requestId"], "map-a");
+        assert_eq!(scoped_header["candidateRevision"], "r0:aaa");
+        assert_eq!(scoped_header["prompt"]["origin"], "user");
+        assert!(scoped_header["prompt"].get("teamTaskId").is_none());
+        // The header is not itself part of the transcript.
+        let recorder = started(MapRunOrigin::User);
+        recorder
+            .record(
+                "map_run_started",
+                &scoped(
+                    Some("map-a"),
+                    MapRunStartedEvent {
+                        prompt: prompt(MapRunOrigin::User),
+                    },
+                ),
+            )
+            .unwrap();
+        assert!(recorder.snapshot().unwrap().events.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_busy_engine_reports_no_resume_error() {
+        let engine = tokio::sync::Mutex::new(Some("resume failed".to_string()));
+        assert_eq!(
+            idle_resume_error(&engine, |error| error.clone()),
+            Some("resume failed".to_string())
+        );
+        let running_turn = engine.lock().await;
+        assert_eq!(
+            idle_resume_error(&engine, |error| error.clone()),
+            None,
+            "a running turn proves the conversation is alive"
+        );
+        drop(running_turn);
+        assert!(idle_resume_error(&engine, |error| error.clone()).is_some());
+    }
+}
+
 pub(crate) struct SessionWorker {
     engine:
         tokio::sync::Mutex<AgentEngine<crate::provider_runtime::ProviderRuntime, SessionEventSink>>,
@@ -2806,6 +3327,19 @@ pub(crate) struct SessionWorker {
     autonomous_pause_requested: Arc<AtomicBool>,
     runtime: SessionToolRuntime,
     sink: SessionEventSink,
+}
+
+/// The engine's conversation resume error when it is idle; `None` while a
+/// turn holds the engine, because a running turn is a resumed conversation
+/// and a window bootstrap must never wait for it.
+fn idle_resume_error<E>(
+    engine: &tokio::sync::Mutex<E>,
+    resume_error: impl FnOnce(&E) -> Option<String>,
+) -> Option<String> {
+    match engine.try_lock() {
+        Ok(engine) => resume_error(&engine),
+        Err(_) => None,
+    }
 }
 
 fn cancel_worker_generation(
@@ -3725,17 +4259,90 @@ impl SessionEngineManager {
             .map_err(|error| error.message)
     }
 
-    pub(crate) async fn open_map_session(&self, session_id: &str) -> Result<(), String> {
-        let worker = self
-            .worker(session_id)
-            .await
-            .map_err(|error| error.message)?;
+    /// The Map worker, even when its first hydration failed only because the
+    /// persisted provider conversation could not be resumed: that worker stays
+    /// registered, and the Map window must open so the user can reset it.
+    /// Never waits on a running turn: a busy engine is a live conversation.
+    async fn map_worker(&self, session_id: &str) -> Result<Arc<SessionWorker>, String> {
+        let worker = match self.worker(session_id).await {
+            Ok(worker) => worker,
+            Err(error) => {
+                let registered = self.inner.workers.lock().await.get(session_id).cloned();
+                match registered {
+                    Some(worker)
+                        if worker
+                            .engine
+                            .try_lock()
+                            .map(|engine| engine.conversation_resume_error().is_some())
+                            .unwrap_or(true) =>
+                    {
+                        worker
+                    }
+                    _ => return Err(error.message),
+                }
+            }
+        };
         if worker.runtime.kind() != crate::session::SessionKind::Map {
             return Err("the requested session is not a Map session".to_string());
         }
-        Ok(())
+        Ok(worker)
     }
 
+    /// Open a Map session; returns the resume error the user must clear before
+    /// chatting, or `None` when the persisted conversation continues. A turn
+    /// running on the session (a team request, or one started before the
+    /// window reopened) proves the conversation is alive, so the bootstrap
+    /// never waits for it.
+    pub(crate) async fn open_map_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<String>, String> {
+        let worker = self.map_worker(session_id).await?;
+        Ok(idle_resume_error(&worker.engine, |engine| {
+            engine.conversation_resume_error().map(str::to_string)
+        }))
+    }
+
+    /// The latest Map run transcript of a session, without locking its engine;
+    /// `None` when the session has no worker or never ran a request.
+    pub(crate) async fn map_run_snapshot(&self, session_id: &str) -> Option<MapRunTranscript> {
+        let workers = self.inner.workers.lock().await;
+        workers
+            .get(session_id)
+            .and_then(|worker| worker.sink.map_run_snapshot())
+    }
+
+    pub(crate) async fn map_conversation_reset(&self, session_id: &str) -> Result<(), String> {
+        let worker = self.map_worker(session_id).await?;
+        let mut engine = worker.engine.lock().await;
+        engine
+            .reset_conversation()
+            .await
+            .map_err(|error| error.message)
+    }
+
+    /// Rewind a Map session's model-visible conversation to the panel-log
+    /// prefix before an edited message. The candidate map and its revisions
+    /// are untouched: only the provider thread and task branch move. A
+    /// running turn (the window's own or a team request) is a live
+    /// conversation, so the rewind refuses instead of waiting behind it.
+    pub(crate) async fn map_conversation_rewind(
+        &self,
+        session_id: &str,
+        panel_log: serde_json::Value,
+    ) -> Result<(), String> {
+        let worker = self.map_worker(session_id).await?;
+        let Ok(mut engine) = worker.engine.try_lock() else {
+            return Err("진행 중인 맵 요청을 먼저 중단한 뒤 메시지를 수정해 주세요.".to_string());
+        };
+        engine
+            .rewind(panel_log)
+            .await
+            .map_err(|error| error.message)
+    }
+
+    /// Run one Map request; `prompt` is the request bubble the Map window
+    /// shows for it, whether the window sent it or an EPS session's team task.
     pub(crate) async fn map_chat(
         &self,
         session_id: &str,
@@ -3743,6 +4350,7 @@ impl SessionEngineManager {
         candidate_revision: String,
         text: String,
         attachments: Vec<String>,
+        prompt: MapRunPrompt,
     ) -> Result<(), String> {
         let worker = self
             .worker(session_id)
@@ -3758,13 +4366,22 @@ impl SessionEngineManager {
         worker
             .runtime
             .emit_activity(crate::write_coordinator::SessionActivity::RunningRead);
+        let origin = prompt.origin;
         worker
             .sink
-            .set_map_context(request_id.clone(), candidate_revision);
+            .set_map_context(request_id.clone(), candidate_revision, prompt);
         let result = {
             let mut engine = worker.engine.lock().await;
             engine.map_chat(request_id.clone(), text, attachments).await
         };
+        if let (MapRunOrigin::Team, Err(error)) = (origin, &result) {
+            // A user-typed request reports its failure through the invoke
+            // result; a team run has no caller in the window, so its failure
+            // closes the run's transcript as the terminal event it replays.
+            let _ = worker.sink.emit(EngineEvent::Error(ipc::ErrorEvent {
+                message: error.message.clone(),
+            }));
+        }
         worker.sink.clear_map_context(&request_id);
         self.finish_read_command(&worker, result)
             .await
@@ -6768,6 +7385,60 @@ mod tests {
                 .conversation,
             record.provider_binding.conversation
         );
+    }
+
+    #[tokio::test]
+    async fn explicit_conversation_reset_clears_failed_resume_without_replay() {
+        let driver = FakeCodexDriver::scripted([]);
+        driver.reject_next_seed();
+        let driver_handle = driver.clone();
+        let mut engine = test_engine(driver, CapturingEventSink::default());
+        let mut record = engine
+            .session_store
+            .load(&engine.session_id)
+            .expect("session fixture should load");
+        record.provider_binding.conversation = crate::provider::ProviderConversationState::Codex {
+            thread_id: Some("thread-unsafe".to_string()),
+        };
+        record.panel_log = serde_json::json!({
+            "schemaVersion": 2,
+            "logSeq": 1,
+            "log": [{"seq": 1, "kind": "you", "text": "earlier map request"}]
+        });
+        engine
+            .session_store
+            .save(&record)
+            .expect("session fixture should save");
+
+        engine
+            .hydrate()
+            .await
+            .expect_err("unresumable conversation blocks the session");
+        assert!(engine.conversation_resume_error().is_some());
+
+        engine
+            .reset_conversation()
+            .await
+            .expect("explicit reset starts a fresh conversation");
+
+        assert!(engine.conversation_resume_error().is_none());
+        assert!(engine.ensure_provider_conversation_ready().is_ok());
+        assert_eq!(driver_handle.reset_count(), 1);
+        assert!(driver_handle.prompts().is_empty());
+        assert!(!engine.thread_active);
+        let saved = engine
+            .session_store
+            .load(&engine.session_id)
+            .expect("saved session remains present");
+        assert_eq!(
+            saved.provider_binding.conversation,
+            crate::provider::ProviderConversationState::Codex { thread_id: None }
+        );
+        assert_eq!(saved.panel_log, record.panel_log);
+        assert!(engine
+            .pending_resume_transcript
+            .as_deref()
+            .is_some_and(|transcript| transcript.contains("earlier map request")));
     }
 
     #[tokio::test]

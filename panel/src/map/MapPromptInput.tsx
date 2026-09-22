@@ -41,7 +41,21 @@ import type {
   ReasoningSelection,
   SessionModelSettings,
 } from "@/lib/ipc";
+import { cn } from "@/lib/utils";
 import type { TurnState } from "@/state/store";
+import {
+  mapMentionSuggestions,
+  type MapMentionSuggestion,
+} from "./mapMentionSuggest";
+import type { MapLocation, SavedSelection } from "./mapProtocol";
+
+const MENTION_LISTBOX_ID = "map-mention-listbox";
+
+/** A past user message restored into the prompt after a rewind. */
+export interface MapPromptDraft {
+  text: string;
+  attachments: ChatAttachment[];
+}
 
 export interface MapPromptInputProps {
   turn: TurnState;

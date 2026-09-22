@@ -917,7 +917,13 @@ impl SessionStore {
     ) -> anyhow::Result<Option<String>> {
         let _guard = self.lock()?;
         let mut record = self.load_unlocked(id)?;
-        let client_turn_id = last_client_turn_id(&panel_log);
+        let last_you = last_you_entry(&panel_log);
+        let client_turn_id = last_you
+            .and_then(|entry| uuid_field(entry, "clientTurnId"))
+            .or_else(|| {
+                let request_id = last_you.and_then(|entry| entry.get("requestId")?.as_str())?;
+                record.task_state.client_turn_for_request(request_id)
+            });
         record
             .task_state
             .move_leaf_to_client_turn(client_turn_id.as_deref())
@@ -1315,14 +1321,18 @@ fn validate_source_e3s(path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn last_client_turn_id(panel_log: &serde_json::Value) -> Option<String> {
+fn last_you_entry(panel_log: &serde_json::Value) -> Option<&serde_json::Value> {
     panel_log
         .get("log")
         .and_then(serde_json::Value::as_array)?
         .iter()
         .rev()
         .find(|entry| entry.get("kind").and_then(serde_json::Value::as_str) == Some("you"))
-        .and_then(|entry| entry.get("clientTurnId"))
+}
+
+fn uuid_field(entry: &serde_json::Value, field: &str) -> Option<String> {
+    entry
+        .get(field)
         .and_then(serde_json::Value::as_str)
         .filter(|id| uuid::Uuid::parse_str(id).is_ok())
         .map(str::to_string)
@@ -2266,6 +2276,68 @@ mod tests {
             crate::task_state::ActiveTaskProjection::default()
         );
         assert_eq!(legacy.task_state.events.len(), 2);
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn rewind_anchors_a_map_request_id_to_its_native_client_turn() {
+        let (base, store) = store("rewind-map-request");
+        let record = sample_record(&new_session_id(), "map rewind");
+        let id = record.meta.id.clone();
+        store.save(&record).unwrap();
+        let first_turn = "55555555-5555-4555-8555-555555555555";
+        let second_turn = "66666666-6666-4666-8666-666666666666";
+        let first = store
+            .append_task_event(
+                &id,
+                None,
+                semantic_goal_event(first_turn, "map-first", 0, "first"),
+            )
+            .unwrap();
+        store
+            .append_task_event(
+                &id,
+                first.leaf_id.as_deref(),
+                semantic_goal_event(second_turn, "map-second", 1, "second"),
+            )
+            .unwrap();
+
+        // Map "you" rows carry only the request id the run started with.
+        store
+            .move_task_leaf_for_rewind(
+                &id,
+                json!({"schemaVersion": 2, "logSeq": 1, "log": [{
+                    "id": 1,
+                    "kind": "you",
+                    "text": "first",
+                    "requestId": "map-first"
+                }]}),
+            )
+            .unwrap();
+        let rewound = store.load(&id).unwrap();
+        assert_eq!(rewound.task_state.events.len(), 2);
+        assert_eq!(rewound.task_state.projection.goals.len(), 1);
+        assert_eq!(rewound.task_state.projection.goals[0].id, "first");
+
+        // An unknown request id (a run that never compiled task state) fails
+        // closed like a legacy prefix instead of guessing a branch.
+        store
+            .move_task_leaf_for_rewind(
+                &id,
+                json!({"schemaVersion": 2, "logSeq": 1, "log": [{
+                    "id": 1,
+                    "kind": "you",
+                    "text": "first",
+                    "requestId": "map-unknown"
+                }]}),
+            )
+            .unwrap();
+        let unknown = store.load(&id).unwrap();
+        assert!(unknown.task_state.leaf_id.is_none());
+        assert_eq!(
+            unknown.task_state.projection,
+            crate::task_state::ActiveTaskProjection::default()
+        );
         fs::remove_dir_all(base).ok();
     }
 

@@ -38,17 +38,25 @@ import {
   type SessionModelSettings,
 } from "@/lib/ipc";
 import { MapAgentPanel, type MapConversationEntry } from "./MapAgentPanel";
+import type { MapPromptDraft } from "./MapPromptInput";
 import { MapCanvas } from "./MapCanvas";
 import { MapMinimap } from "./MapMinimap";
 import { MapPalette } from "./MapPalette";
 import { MapToolbar } from "./MapToolbar";
 import { MapWorkbench } from "./MapWorkbench";
+import { MapPropertiesDialog } from "./MapPropertiesDialog";
 import { MapSessionHistoryDialog } from "./MapSessionHistoryDialog";
 import { SelectionToolbar } from "./SelectionToolbar";
 import { ImagePlacementControls } from "./ImagePlacementControls";
 import { StampPlacementControls } from "./StampPlacementControls";
 import { CandidateControls } from "./CandidateControls";
 import { buildSelectionMask, cellsToRows, rowsToCells } from "./selectionMask";
+import {
+  runAdoptionEntries,
+  runAlreadyAdopted,
+  runHasTerminalEvent,
+  stampRunRequestId,
+} from "./mapRunAdoption";
 import {
   initialImagePlacement,
   sameImagePlacement,
@@ -71,12 +79,15 @@ import {
   mapBootstrap,
   mapSessionCreate,
   mapSessionDelete,
+  mapConversationReset,
+  mapConversationRewind,
   mapSessionList,
   mapSessionLoad,
   mapSessionRename,
   mapCancel,
   mapChat,
   mapDiffDetails,
+  mapRunSnapshot,
   mapImageConfirm,
   mapImageCancel,
   mapImagePreview,
@@ -96,6 +107,10 @@ import {
   type MapMentionSnapshot,
   type MapLocation,
   type MapObjectItem,
+  type MapPropertiesRequest,
+  type MapRunEvent,
+  type MapRunStartedPayload,
+  type MapRunTranscript,
   type MapView,
   type MapStampSourceRef,
   type MapSourceProbe,
@@ -244,7 +259,7 @@ function isMapLogKind(kind: string): kind is LogKind {
   return Object.prototype.hasOwnProperty.call(MAP_LOG_KINDS, kind);
 }
 
-function conversationFromSession(
+export function conversationFromSession(
   bootstrap: MapBootstrapResponse,
 ): MapConversationEntry[] {
   const log = bootstrap.session.panelLog?.log ?? [];
@@ -252,6 +267,7 @@ function conversationFromSession(
     if (!isMapLogKind(entry.kind)) return [];
     const persisted = entry as typeof entry & {
       mapMentions?: MapMentionSnapshot[];
+      requestId?: string;
     };
     const tools: AgentTool[] | undefined = entry.tools?.map((tool) => ({
       id: tool.id,
@@ -271,6 +287,9 @@ function conversationFromSession(
         kind: entry.kind,
         text: entry.text,
         mapMentions: persisted.mapMentions,
+        ...(typeof persisted.requestId === "string"
+          ? { requestId: persisted.requestId }
+          : {}),
         attachments: entry.attachments,
         ...(tools && tools.length > 0 ? { tools } : {}),
       },
@@ -278,16 +297,17 @@ function conversationFromSession(
   });
 }
 
-function panelLogFromConversation(
+export function panelLogFromConversation(
   conversation: MapConversationEntry[],
   logSeq: number,
 ) {
   return {
     schemaVersion: 2,
     logSeq,
-    log: conversation.map(({ mapMentions, ...entry }) => ({
+    log: conversation.map(({ mapMentions, requestId, ...entry }) => ({
       ...entry,
       mapMentions,
+      ...(requestId === undefined ? {} : { requestId }),
     })),
   };
 }
@@ -435,6 +455,68 @@ export function staleImportedMentions(
         entry.snapshotHash === mention.snapshotHash,
     );
     return { ...chip, stale: !stamp || !stamp.available || !stamp.compatible };
+  });
+}
+
+/**
+ * Rebuild tray chips from the mention snapshots a persisted "you" row kept, so
+ * an edited message returns with the mentions it was sent with. Labels follow
+ * the live chip builders when the referenced item still exists and fall back
+ * to the snapshot's own identity; `staleMentions`/`staleImportedMentions`
+ * decide afterwards whether each chip still matches the candidate.
+ */
+export function restoreMentionChips(
+  snapshots: readonly MapMentionSnapshot[],
+  context: {
+    selections: readonly SavedSelection[];
+    locations: readonly MapLocation[];
+    imported: readonly ImportedStampView[];
+  },
+): MentionChip[] {
+  return snapshots.map((mention) => {
+    let label: string;
+    switch (mention.kind) {
+      case "region": {
+        const selection = context.selections.find(
+          (item) => item.id === mention.selectionId,
+        );
+        label = selection
+          ? `${selection.role}:${selection.label}`
+          : `region:${mention.selectionId.slice(0, 8)}`;
+        break;
+      }
+      case "stamp": {
+        const selection = context.selections.find(
+          (item) => item.id === mention.selectionId,
+        );
+        label = `stamp:${selection?.label ?? mention.selectionId.slice(0, 8)}`;
+        break;
+      }
+      case "importedStamp": {
+        const stamp = context.imported.find((item) => item.id === mention.importId);
+        label = `imported:${stamp?.label ?? mention.importId.slice(0, 8)}`;
+        break;
+      }
+      case "object":
+        label = `instance:${mention.objectRef.kind} #${mention.objectRef.ordinal}`;
+        break;
+      case "palette":
+        label =
+          mention.entry.kind === "newLocation"
+            ? "type:새 로케이션"
+            : `type:${mention.entry.kind} #${mention.entry.entryId}`;
+        break;
+      case "location": {
+        const location = context.locations.find(
+          (item) => item.id === mention.locationId,
+        );
+        label = location
+          ? `location:#${location.id} ${location.name}`
+          : `location:#${mention.locationId}`;
+        break;
+      }
+    }
+    return { id: crypto.randomUUID(), label, mention: { ...mention } };
   });
 }
 
@@ -757,9 +839,17 @@ export default function MapAgentApp() {
   });
   const [importedEntries, setImportedEntries] = useState<ImportedStampView[]>([]);
   const [error, setError] = useState("");
+  const [conversationResumeError, setConversationResumeError] = useState<string | null>(null);
+  const [conversationResetBusy, setConversationResetBusy] = useState(false);
+  // Message edit flow: the core must finish the rewind before the prompt
+  // unlocks. `editDraft` is applied by MapPromptInput once per object.
+  const [editDraft, setEditDraft] = useState<MapPromptDraft | null>(null);
+  const [messageActionBusy, setMessageActionBusy] = useState(false);
+  const messageActionBusyRef = useRef(false);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
   const [sessionHistoryOpen, setSessionHistoryOpen] = useState(false);
+  const [propertiesOpen, setPropertiesOpen] = useState(false);
   const [sessionHistoryLoading, setSessionHistoryLoading] = useState(false);
   const [sessionActionBusy, setSessionActionBusy] = useState(false);
   const [mapSessions, setMapSessions] = useState<SessionMeta[]>([]);
@@ -826,6 +916,12 @@ export default function MapAgentApp() {
   const recoveredTurnRef = useRef(false);
   const notificationActivityRef = useRef<BackendSessionActivity>("idle");
   const notifiedAskRequestRef = useRef<string | undefined>(undefined);
+  // The conversation as the listeners see it: run adoption decides on the
+  // entries already shown, outside React's render cycle.
+  const conversationRef = useRef<MapConversationEntry[]>([]);
+  useEffect(() => {
+    conversationRef.current = conversation;
+  }, [conversation]);
 
   const markTurnInFlight = useCallback((active: boolean) => {
     turnInFlightRef.current = active;
@@ -1263,6 +1359,81 @@ export default function MapAgentApp() {
     }
   }, []);
 
+  const resetConversation = useCallback(async () => {
+    const sessionId = sessionIdRef.current;
+    if (!sessionId) return;
+    setConversationResetBusy(true);
+    try {
+      await mapConversationReset(sessionId);
+      setConversationResumeError(null);
+      setError("");
+    } catch (reason) {
+      setError(`대화를 초기화하지 못했습니다: ${String(reason)}`);
+    } finally {
+      setConversationResetBusy(false);
+    }
+  }, []);
+
+  const editMessage = useCallback(
+    async (entry: MapConversationEntry) => {
+      const current = bootstrapRef.current;
+      const candidateState = candidateRef.current;
+      if (
+        !current ||
+        !candidateState ||
+        entry.kind !== "you" ||
+        busy ||
+        turnInFlightRef.current ||
+        messageActionBusyRef.current
+      ) {
+        return;
+      }
+      messageActionBusyRef.current = true;
+      setMessageActionBusy(true);
+      try {
+        const currentLog = conversationRef.current;
+        const selected = currentLog.find(
+          (candidate) => candidate.id === entry.id && candidate.kind === "you",
+        );
+        if (selected === undefined) return;
+        const prefix = currentLog.filter((candidate) => candidate.id < entry.id);
+        await mapConversationRewind(
+          current.session.id,
+          panelLogFromConversation(prefix, logSequenceRef.current),
+        );
+        setConversation(prefix);
+        setConversationResumeError(null);
+        resetTurn();
+        setAsk(undefined);
+        const restoredChips = restoreMentionChips(selected.mapMentions ?? [], {
+          selections: candidateState.selections,
+          locations: objects.flatMap((item) =>
+            item.location ? [item.location] : [],
+          ),
+          imported: importedEntries,
+        });
+        setMentions(
+          staleImportedMentions(
+            staleMentions(restoredChips, candidateState),
+            importedEntries,
+          ),
+        );
+        setSelectedMentionId(undefined);
+        setEditDraft({
+          text: selected.text,
+          attachments: selected.attachments ?? [],
+        });
+        setError("");
+      } catch (reason) {
+        setError(`메시지 수정 지점으로 대화를 되돌리지 못했습니다: ${String(reason)}`);
+      } finally {
+        messageActionBusyRef.current = false;
+        setMessageActionBusy(false);
+      }
+    },
+    [busy, importedEntries, objects, resetTurn],
+  );
+
   const deleteSession = useCallback(async (sessionId: string) => {
     if (sessionId === sessionIdRef.current) return;
     try {
@@ -1282,6 +1453,216 @@ export default function MapAgentApp() {
     let disposed = false;
     notificationActivityRef.current = "idle";
     notifiedAskRequestRef.current = undefined;
+    // Live delivery and transcript replay share these handlers, so a run this
+    // window adopts mid-way renders exactly like one it watched from the start.
+    const applyAgentEvent = (payload: Record<string, unknown>) => {
+      if (payload.sessionId !== sessionId) return;
+      if (payload.candidateRevision !== eventRevisionRef.current) return;
+      if (!turnInFlightRef.current || turnEndedRef.current) return;
+      const kind = String(payload.kind ?? "");
+      const detail = String(payload.detail ?? "");
+      const rawData = (payload.data ?? {}) as Record<string, unknown>;
+      const data: AgentEventData = {
+        ...(typeof rawData.callId === "string"
+          ? { callId: rawData.callId }
+          : {}),
+        ...(typeof rawData.args === "string"
+          ? { args: rawData.args }
+          : {}),
+        ...(typeof rawData.result === "string"
+          ? { result: rawData.result }
+          : {}),
+        ...(typeof rawData.status === "string"
+          ? { status: rawData.status }
+          : {}),
+      };
+      const next = reduceMapTurnEvent(
+        turnRef.current,
+        turnCursorRef.current,
+        kind,
+        detail,
+        data,
+      );
+      if (next.unpairedToolStart !== undefined) {
+        logSequenceRef.current += 1;
+        const { name, args } = next.unpairedToolStart;
+        setConversation((entries) => [
+          ...entries,
+          {
+            id: logSequenceRef.current,
+            kind: "info",
+            text: args
+              ? `도구 호출 시작 — ${name}\n${args}`
+              : `도구 호출 시작 — ${name}`,
+          },
+        ]);
+      }
+      turnRef.current = next.turn;
+      turnCursorRef.current = next.cursor;
+      startTransition(() => {
+        setLiveDraft((current) =>
+          advanceLiveDraftPreview(current, {
+            kind,
+            detail,
+            status: data.status,
+            requestId:
+              typeof payload.requestId === "string"
+                ? payload.requestId
+                : undefined,
+            candidateRevision:
+              typeof payload.candidateRevision === "string"
+                ? payload.candidateRevision
+                : undefined,
+          }),
+        );
+        setTurn(next.turn);
+      });
+    };
+    const applyContextUsage = (payload: Record<string, unknown>) => {
+      if (payload.sessionId !== sessionId) return;
+      if (payload.candidateRevision !== eventRevisionRef.current) return;
+      setContextUsage((payload.tokenUsage ?? null) as ContextUsage | null);
+    };
+    const applyAnswer = (payload: Record<string, unknown>) => {
+      if (payload.sessionId !== sessionId) return;
+      if (payload.candidateRevision !== eventRevisionRef.current) return;
+      if (turnEndedRef.current) return;
+      turnEndedRef.current = true;
+      archiveCurrentTurn(String(payload.text ?? ""));
+      setAsk(undefined);
+      if (recoveredTurnRef.current) {
+        recoveredTurnRef.current = false;
+        eventRevisionRef.current = "";
+        markTurnInFlight(false);
+      }
+    };
+    const applyAsk = (payload: Record<string, unknown>) => {
+      if (payload.sessionId !== sessionId) return;
+      if (payload.candidateRevision !== eventRevisionRef.current) return;
+      if (!turnInFlightRef.current || turnEndedRef.current) return;
+      const requestId = String(payload.requestId);
+      if (payload.status === "expired") {
+        setAsk((current) =>
+          current?.requestId === requestId ? undefined : current,
+        );
+        return;
+      }
+      if (notifiedAskRequestRef.current !== requestId) {
+        notifiedAskRequestRef.current = requestId;
+        void attentionNotify(
+          "askResponseRequired",
+          !document.hasFocus(),
+          sessionId,
+        ).catch(() => {
+          // Delivery is best-effort and must not disturb the pending ASK.
+        });
+      }
+      const waitSeconds =
+        typeof payload.waitSeconds === "number" ? payload.waitSeconds : undefined;
+      setAsk({
+        requestId,
+        questions: (payload.questions ?? []) as AskQuestion[],
+        submitting: false,
+        ...(waitSeconds === undefined
+          ? {}
+          : { waitSeconds, receivedAt: Date.now() }),
+      });
+    };
+    const applyError = (payload: Record<string, unknown>) => {
+      if (payload.sessionId !== sessionId) return;
+      if (payload.candidateRevision !== eventRevisionRef.current) return;
+      if (turnEndedRef.current) return;
+      turnEndedRef.current = true;
+      archiveCurrentTurn();
+      logSequenceRef.current += 1;
+      setConversation((entries) => [
+        ...entries,
+        {
+          id: logSequenceRef.current,
+          kind: "error",
+          text: String(
+            payload.message ?? "Map Agent 요청이 실패했습니다.",
+          ),
+        },
+      ]);
+      setAsk(undefined);
+      if (recoveredTurnRef.current) {
+        recoveredTurnRef.current = false;
+        eventRevisionRef.current = "";
+        markTurnInFlight(false);
+      }
+    };
+    // ASK state is not replayed from the transcript: `ask_pending` is the
+    // authority on whether a question is still open.
+    const replayRunEvent = (event: MapRunEvent) => {
+      switch (event.name) {
+        case "agent_event":
+          applyAgentEvent(event.payload);
+          break;
+        case "context_usage":
+          applyContextUsage(event.payload);
+          break;
+        case "answer":
+          applyAnswer(event.payload);
+          break;
+        case "error":
+          applyError(event.payload);
+          break;
+        default:
+          break;
+      }
+    };
+    // Show a run this window did not start (a team task, or a request that
+    // outlived the previous window) exactly like one typed here: request
+    // bubble, then every recorded event through the live handlers.
+    const adoptRun = (run: MapRunTranscript) => {
+      if (runAlreadyAdopted(conversationRef.current, run.requestId)) return;
+      const adoption = runAdoptionEntries(run, logSequenceRef.current);
+      logSequenceRef.current = adoption.logSequence;
+      conversationRef.current = [...conversationRef.current, ...adoption.entries];
+      setConversation((entries) => [...entries, ...adoption.entries]);
+      resetTurn();
+      clearLiveDraftPreview();
+      eventRevisionRef.current = run.candidateRevision;
+      turnEndedRef.current = false;
+      recoveredTurnRef.current = true;
+      markTurnInFlight(true);
+      setAsk(undefined);
+      for (const event of run.events) replayRunEvent(event);
+      if (run.inFlight) return;
+      // The run ended before this window saw it: its answer or error already
+      // closed the turn above; otherwise close it now. Its draft is gone.
+      if (!runHasTerminalEvent(run)) {
+        turnEndedRef.current = true;
+        archiveCurrentTurn();
+        recoveredTurnRef.current = false;
+        eventRevisionRef.current = "";
+        markTurnInFlight(false);
+      }
+      clearLiveDraftPreview();
+    };
+    const restorePendingAsk = async () => {
+      const pending = await invoke<PendingAskSnapshot | null>("ask_pending", {
+        sessionId,
+      });
+      if (disposed || pending === null || pending.sessionId !== sessionId) return;
+      const candidateRevision =
+        pending.candidateRevision ?? bootstrap.candidate.revisionKey;
+      if (candidateRevision !== bootstrap.candidate.revisionKey) return;
+      eventRevisionRef.current = candidateRevision;
+      turnEndedRef.current = false;
+      recoveredTurnRef.current = true;
+      notifiedAskRequestRef.current = pending.requestId;
+      markTurnInFlight(true);
+      setAsk({
+        requestId: pending.requestId,
+        questions: pending.questions,
+        submitting: false,
+        ...(typeof pending.waitSeconds === "number"
+          ? { waitSeconds: pending.waitSeconds, receivedAt: Date.now() }
+          : {}),
+      });
+    };
     const register = async () => {
       unlisteners.push(
         await listen<Record<string, unknown>>(
@@ -1329,150 +1710,57 @@ export default function MapAgentApp() {
         ),
       );
       unlisteners.push(
-        await listen<Record<string, unknown>>("agent_event", ({ payload }) => {
-          if (payload.sessionId !== sessionId) return;
-          if (payload.candidateRevision !== eventRevisionRef.current) return;
-          if (!turnInFlightRef.current || turnEndedRef.current) return;
-          const kind = String(payload.kind ?? "");
-          const detail = String(payload.detail ?? "");
-          const rawData = (payload.data ?? {}) as Record<string, unknown>;
-          const data: AgentEventData = {
-            ...(typeof rawData.callId === "string"
-              ? { callId: rawData.callId }
-              : {}),
-            ...(typeof rawData.args === "string"
-              ? { args: rawData.args }
-              : {}),
-            ...(typeof rawData.result === "string"
-              ? { result: rawData.result }
-              : {}),
-            ...(typeof rawData.status === "string"
-              ? { status: rawData.status }
-              : {}),
-          };
-          const next = reduceMapTurnEvent(
-            turnRef.current,
-            turnCursorRef.current,
-            kind,
-            detail,
-            data,
-          );
-          if (next.unpairedToolStart !== undefined) {
-            logSequenceRef.current += 1;
-            const { name, args } = next.unpairedToolStart;
-            setConversation((entries) => [
-              ...entries,
-              {
-                id: logSequenceRef.current,
-                kind: "info",
-                text: args
-                  ? `도구 호출 시작 — ${name}\n${args}`
-                  : `도구 호출 시작 — ${name}`,
-              },
-            ]);
-          }
-          turnRef.current = next.turn;
-          turnCursorRef.current = next.cursor;
-          startTransition(() => {
-            setLiveDraft((current) =>
-              advanceLiveDraftPreview(current, {
-                kind,
-                detail,
-                status: data.status,
-                requestId:
-                  typeof payload.requestId === "string"
-                    ? payload.requestId
-                    : undefined,
-                candidateRevision:
-                  typeof payload.candidateRevision === "string"
-                    ? payload.candidateRevision
-                    : undefined,
-              }),
-            );
-            setTurn(next.turn);
-          });
-        }),
+        await listen<Record<string, unknown>>("agent_event", ({ payload }) =>
+          applyAgentEvent(payload),
+        ),
       );
       unlisteners.push(
-        await listen<Record<string, unknown>>("context_usage", ({ payload }) => {
-          if (payload.sessionId !== sessionId) return;
-          if (payload.candidateRevision !== eventRevisionRef.current) return;
-          setContextUsage((payload.tokenUsage ?? null) as ContextUsage | null);
-        }),
+        await listen<Record<string, unknown>>("context_usage", ({ payload }) =>
+          applyContextUsage(payload),
+        ),
       );
       unlisteners.push(
-        await listen<Record<string, unknown>>("answer", ({ payload }) => {
-          if (payload.sessionId !== sessionId) return;
-          if (payload.candidateRevision !== eventRevisionRef.current) return;
-          if (turnEndedRef.current) return;
-          turnEndedRef.current = true;
-          archiveCurrentTurn(String(payload.text ?? ""));
-          setAsk(undefined);
-          if (recoveredTurnRef.current) {
-            recoveredTurnRef.current = false;
-            eventRevisionRef.current = "";
-            markTurnInFlight(false);
-          }
-        }),
+        await listen<Record<string, unknown>>("answer", ({ payload }) =>
+          applyAnswer(payload),
+        ),
       );
       unlisteners.push(
-        await listen<Record<string, unknown>>("ask", ({ payload }) => {
+        await listen<Record<string, unknown>>("ask", ({ payload }) =>
+          applyAsk(payload),
+        ),
+      );
+      unlisteners.push(
+        await listen<Record<string, unknown>>("error", ({ payload }) =>
+          applyError(payload),
+        ),
+      );
+      unlisteners.push(
+        await listen<MapRunStartedPayload>("map_run_started", ({ payload }) => {
           if (payload.sessionId !== sessionId) return;
-          if (payload.candidateRevision !== eventRevisionRef.current) return;
-          if (!turnInFlightRef.current || turnEndedRef.current) return;
-          const requestId = String(payload.requestId);
-          if (payload.status === "expired") {
-            setAsk((current) =>
-              current?.requestId === requestId ? undefined : current,
+          if (turnInFlightRef.current) {
+            // This window sent the request: remember its id for later
+            // bootstraps, and follow the revision the run actually started
+            // on — the backend may have moved the candidate onto a source
+            // saved elsewhere while the prompt was being sent.
+            eventRevisionRef.current = payload.candidateRevision;
+            setConversation((entries) =>
+              stampRunRequestId(entries, payload.requestId),
             );
             return;
           }
-          if (notifiedAskRequestRef.current !== requestId) {
-            notifiedAskRequestRef.current = requestId;
-            void attentionNotify(
-              "askResponseRequired",
-              !document.hasFocus(),
-              sessionId,
-            ).catch(() => {
-              // Delivery is best-effort and must not disturb the pending ASK.
+          // A run started elsewhere (an EPS team task): adopt it from the
+          // transcript rather than from this header alone, so the events
+          // emitted before this listener ran are not lost.
+          void mapRunSnapshot(sessionId)
+            .then(async (run) => {
+              if (disposed || !run || run.requestId !== payload.requestId) return;
+              if (turnInFlightRef.current) return;
+              adoptRun(run);
+              await restorePendingAsk();
+            })
+            .catch((reason) => {
+              if (!disposed) setError(String(reason));
             });
-          }
-          const waitSeconds =
-            typeof payload.waitSeconds === "number" ? payload.waitSeconds : undefined;
-          setAsk({
-            requestId,
-            questions: (payload.questions ?? []) as AskQuestion[],
-            submitting: false,
-            ...(waitSeconds === undefined
-              ? {}
-              : { waitSeconds, receivedAt: Date.now() }),
-          });
-        }),
-      );
-      unlisteners.push(
-        await listen<Record<string, unknown>>("error", ({ payload }) => {
-          if (payload.sessionId !== sessionId) return;
-          if (payload.candidateRevision !== eventRevisionRef.current) return;
-          if (turnEndedRef.current) return;
-          turnEndedRef.current = true;
-          archiveCurrentTurn();
-          logSequenceRef.current += 1;
-          setConversation((entries) => [
-            ...entries,
-            {
-              id: logSequenceRef.current,
-              kind: "error",
-              text: String(
-                payload.message ?? "Map Agent 요청이 실패했습니다.",
-              ),
-            },
-          ]);
-          setAsk(undefined);
-          if (recoveredTurnRef.current) {
-            recoveredTurnRef.current = false;
-            eventRevisionRef.current = "";
-            markTurnInFlight(false);
-          }
         }),
       );
       unlisteners.push(
@@ -1485,26 +1773,9 @@ export default function MapAgentApp() {
           void refreshObjects(sessionId);
         }),
       );
-      const pending = await invoke<PendingAskSnapshot | null>("ask_pending", {
-        sessionId,
-      });
-      if (disposed || pending === null || pending.sessionId !== sessionId) return;
-      const candidateRevision =
-        pending.candidateRevision ?? bootstrap.candidate.revisionKey;
-      if (candidateRevision !== bootstrap.candidate.revisionKey) return;
-      eventRevisionRef.current = candidateRevision;
-      turnEndedRef.current = false;
-      recoveredTurnRef.current = true;
-      notifiedAskRequestRef.current = pending.requestId;
-      markTurnInFlight(true);
-      setAsk({
-        requestId: pending.requestId,
-        questions: pending.questions,
-        submitting: false,
-        ...(typeof pending.waitSeconds === "number"
-          ? { waitSeconds: pending.waitSeconds, receivedAt: Date.now() }
-          : {}),
-      });
+      if (disposed) return;
+      if (bootstrap.pendingRun) adoptRun(bootstrap.pendingRun);
+      await restorePendingAsk();
     };
     void register().catch((reason) => {
       if (!disposed) setError(String(reason));
@@ -1519,6 +1790,7 @@ export default function MapAgentApp() {
     clearLiveDraftPreview,
     markTurnInFlight,
     refreshObjects,
+    resetTurn,
   ]);
 
   useEffect(() => {
@@ -2793,7 +3065,12 @@ export default function MapAgentApp() {
           conversation={conversation}
           turn={turn}
           live={turnInFlight}
-          actionBusy={busy || imagePlacement !== null || stampPlacement !== null}
+          actionBusy={
+            busy ||
+            messageActionBusy ||
+            imagePlacement !== null ||
+            stampPlacement !== null
+          }
           contextUsage={contextUsage}
           modelSettings={modelSettings}
           modelSettingsBusy={modelSettingsBusy}
@@ -2801,9 +3078,16 @@ export default function MapAgentApp() {
           selectedMentionId={selectedMentionId}
           ask={ask}
           selections={candidate.selections}
+          locations={locations}
           mapWidth={candidate.baseline.width}
           mapHeight={candidate.baseline.height}
           draftScope={`${bootstrap.session.id}|${bootstrap.context.revision.projectId}|${bootstrap.context.revision.fileSha256}`}
+          conversationResumeError={conversationResumeError}
+          conversationResetBusy={conversationResetBusy}
+          onConversationReset={() => void resetConversation()}
+          onEditMessage={(entry) => void editMessage(entry)}
+          editDisabled={busy || turnInFlight || messageActionBusy}
+          editDraft={editDraft}
           onSend={(text, attachments) => void send(text, attachments)}
           onCancel={() => void cancelTurn()}
           onStageAttachment={stageAttachment}

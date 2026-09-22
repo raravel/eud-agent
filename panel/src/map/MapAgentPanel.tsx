@@ -1,7 +1,8 @@
-import { History } from "lucide-react";
+import { History, RotateCcw, TriangleAlert } from "lucide-react";
 
 import { AskCard } from "@/components/AskCard";
 import { ConversationLog } from "@/components/ConversationLog";
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import type {
   ChatAttachment,
@@ -20,10 +21,12 @@ import type {
 } from "./mapProtocol";
 import { MentionTray } from "./MentionTray";
 import { QualifierEditor } from "./QualifierEditor";
-import { MapPromptInput } from "./MapPromptInput";
+import { MapPromptInput, type MapPromptDraft } from "./MapPromptInput";
 
 export interface MapConversationEntry extends LogEntry {
   mapMentions?: MapMentionSnapshot[];
+  /** The Map request a "you" entry started; lets a re-opened window skip a run it already shows. */
+  requestId?: string;
 }
 
 export interface MapAgentPanelProps {
@@ -45,9 +48,21 @@ export interface MapAgentPanelProps {
     receivedAt?: number;
   };
   selections: SavedSelection[];
+  /** Candidate locations offered by the prompt's `@` completion. */
+  locations?: MapLocation[];
   mapWidth: number;
   mapHeight: number;
   draftScope: string;
+  /** Why the saved provider conversation could not be resumed; chat is blocked until reset. */
+  conversationResumeError?: string | null;
+  conversationResetBusy?: boolean;
+  onConversationReset?(): void;
+  /** Rewind from a user message and restore it into the prompt for editing. */
+  onEditMessage?(entry: MapConversationEntry): void;
+  /** Disable the edit actions while a rewind is settling in the core. */
+  editDisabled?: boolean;
+  /** A past user message restored for editing after a successful rewind. */
+  editDraft?: MapPromptDraft | null;
   onSend(text: string, attachments: ChatAttachment[]): void;
   onCancel(): void;
   onStageAttachment?(file: File): Promise<ChatAttachment>;
@@ -81,15 +96,24 @@ export function MapAgentPanel({
   selectedMentionId,
   ask,
   selections,
+  locations = [],
   mapWidth,
   mapHeight,
   draftScope,
+  conversationResumeError,
+  conversationResetBusy = false,
+  onConversationReset,
+  onEditMessage,
+  editDisabled = false,
+  editDraft,
   onSend,
   onCancel,
   onStageAttachment,
   onDiscardAttachment,
   onModelSettingsChange,
   onModelSettingsReload,
+  onLocationMention,
+  onRegionMention,
   onMentionSelect,
   onMentionRemove,
   onMentionFind,
@@ -127,6 +151,12 @@ export function MapAgentPanel({
         turn={turn}
         emptyTitle="맵에 무엇을 만들까요?"
         emptyDescription="영역 권한과 팔레트 항목을 멘션에 담아 후보 맵을 만들어 보세요."
+        onEditMessage={
+          onEditMessage
+            ? (entry) => onEditMessage(entry as MapConversationEntry)
+            : undefined
+        }
+        editDisabled={editDisabled}
         renderUserMeta={(entry) => {
           const count =
             (entry as MapConversationEntry).mapMentions?.length ?? 0;
@@ -149,6 +179,29 @@ export function MapAgentPanel({
           ) : undefined
         }
       />
+
+      {conversationResumeError && (
+        <Alert variant="destructive" className="mx-3 mb-2">
+          <TriangleAlert aria-hidden="true" />
+          <AlertTitle>이전 대화를 이어갈 수 없습니다</AlertTitle>
+          <AlertDescription>
+            <p>{conversationResumeError}</p>
+            <p>대화를 초기화하면 새 모델 세션으로 이어서 요청할 수 있습니다. 맵 후보와 리비전, 대화 기록은 그대로 유지됩니다.</p>
+            <Button
+              type="button"
+              size="sm"
+              variant="outline"
+              className="min-h-11"
+              disabled={conversationResetBusy || !onConversationReset}
+              aria-busy={conversationResetBusy || undefined}
+              onClick={() => onConversationReset?.()}
+            >
+              <RotateCcw className="size-4" aria-hidden="true" />
+              {conversationResetBusy ? "초기화 중…" : "대화 초기화"}
+            </Button>
+          </AlertDescription>
+        </Alert>
+      )}
 
       <div className="max-h-[42%] space-y-2 overflow-y-auto border-t border-border p-3">
         <MentionTray
@@ -175,9 +228,14 @@ export function MapAgentPanel({
         mentionCount={mentions.length}
         hasStaleMentions={mentions.some((chip) => chip.stale)}
         draftScope={draftScope}
+        draft={editDraft}
         contextUsage={contextUsage}
         modelSettings={modelSettings}
         modelSettingsBusy={modelSettingsBusy}
+        locations={locations}
+        selections={selections}
+        onLocationMention={onLocationMention}
+        onRegionMention={onRegionMention}
         onSend={onSend}
         onCancel={onCancel}
         onStageAttachment={onStageAttachment}

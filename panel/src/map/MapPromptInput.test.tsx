@@ -162,6 +162,38 @@ describe("MapPromptInput — AI Elements composer", () => {
     expect(input).toHaveValue("");
   });
 
+  it("restores an edited message's text and attachments into the prompt", async () => {
+    const onSend = vi.fn();
+    const attachment = {
+      id: "att-1",
+      name: "layout.png",
+      mime: "image/png",
+      kind: "image" as const,
+      size: 12,
+    };
+    const { rerender } = renderInput({ onSend });
+    const input = screen.getByRole("combobox", { name: "맵 요청 입력" });
+    expect(input).toHaveValue("");
+
+    rerender(
+      <MapPromptInput
+        turn={idleTurn}
+        live={false}
+        mentionCount={0}
+        hasStaleMentions={false}
+        draftScope="session-a|project-a|source-a"
+        draft={{ text: "언덕 위에 숲을 만들어줘", attachments: [attachment] }}
+        onSend={onSend}
+        onCancel={noop}
+      />,
+    );
+
+    expect(input).toHaveValue("언덕 위에 숲을 만들어줘");
+    expect(screen.getByText("layout.png")).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "전송" }));
+    expect(onSend).toHaveBeenCalledWith("언덕 위에 숲을 만들어줘", [attachment]);
+  });
+
   it("stages and sends an attachment-only request", async () => {
     const user = userEvent.setup();
     const attachment = {

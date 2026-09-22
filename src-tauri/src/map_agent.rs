@@ -91,6 +91,12 @@ pub struct MapBootstrapResponse {
     pub context: crate::map_context::MapContextSnapshot,
     pub candidate: CandidateStateView,
     pub session: crate::session::SessionRecord,
+    /// Set when the persisted provider conversation could not be resumed; the
+    /// window still opens, and chat stays blocked until an explicit reset.
+    pub conversation_resume_error: Option<String>,
+    /// The session's latest Map run (in flight, or ended after the window last
+    /// saw it) so the window shows it like a request typed there.
+    pub pending_run: Option<crate::engine::MapRunTranscript>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1405,6 +1411,35 @@ pub(crate) async fn map_agent_session_load(
 }
 
 #[tauri::command]
+pub(crate) async fn map_agent_conversation_reset(
+    window: tauri::WebviewWindow,
+    service: tauri::State<'_, MapAgentService>,
+    engines: tauri::State<'_, crate::engine::SessionEngineManager>,
+    session_id: String,
+) -> Result<(), String> {
+    require_map_window(&window)?;
+    let context = service.candidates.context().current()?;
+    service.session_for_context(&session_id, &context)?;
+    engines.map_conversation_reset(&session_id).await
+}
+
+#[tauri::command]
+pub(crate) async fn map_agent_conversation_rewind(
+    window: tauri::WebviewWindow,
+    service: tauri::State<'_, MapAgentService>,
+    engines: tauri::State<'_, crate::engine::SessionEngineManager>,
+    session_id: String,
+    panel_log: serde_json::Value,
+) -> Result<(), String> {
+    require_map_window(&window)?;
+    let context = service.candidates.context().current()?;
+    service.session_for_context(&session_id, &context)?;
+    engines
+        .map_conversation_rewind(&session_id, panel_log)
+        .await
+}
+
+#[tauri::command]
 pub fn map_agent_session_rename(
     window: tauri::WebviewWindow,
     service: tauri::State<'_, MapAgentService>,
@@ -1719,6 +1754,13 @@ pub(crate) async fn map_agent_chat(
             state_before.revision_key,
             text,
             command.attachments,
+            crate::engine::MapRunPrompt {
+                text: command.text,
+                mentions: command.mentions,
+                origin: crate::engine::MapRunOrigin::User,
+                team_task_id: None,
+                parent_session_name: None,
+            },
         )
         .await;
     if let Err(error) = outcome {
@@ -1758,6 +1800,21 @@ pub(crate) async fn map_agent_cancel(
     let result = engines.cancel_map_session(&session_id).await;
     service.candidates.cancel_session(&session_id)?;
     result
+}
+
+/// The session's latest Map run transcript, for a window that learned of a
+/// run from `map_run_started` after its bootstrap: the events emitted between
+/// that header and the window's listeners are only in the transcript.
+#[tauri::command]
+pub(crate) async fn map_agent_run_snapshot(
+    window: tauri::WebviewWindow,
+    service: tauri::State<'_, MapAgentService>,
+    engines: tauri::State<'_, crate::engine::SessionEngineManager>,
+    session_id: String,
+) -> Result<Option<crate::engine::MapRunTranscript>, String> {
+    require_map_window(&window)?;
+    service.session_record(&session_id)?;
+    Ok(engines.map_run_snapshot(&session_id).await)
 }
 
 fn compact_mentions(
