@@ -90,6 +90,8 @@ export interface AppSettings {
   codexLargeContextModels: string[];
   /** Deep planning (planner → architect → critic loop); captured at triage. */
   deepPlanning: boolean;
+  /** SCMDraft 2 executable used by the header's "SCMDraft 2로 열기"; empty when unset. */
+  scmdraftPath: string;
 }
 
 export interface EuddraftSettings {
@@ -960,11 +962,16 @@ function toAppSettings(value: unknown): AppSettings {
     !value.codexLargeContextModels.every(
       (model) => typeof model === "string" && model.trim().length > 0,
     ) ||
-    typeof value.deepPlanning !== "boolean"
+    typeof value.deepPlanning !== "boolean" ||
+    (value.scmdraftPath !== undefined && typeof value.scmdraftPath !== "string")
   ) {
     throw new Error("invalid app settings response");
   }
-  return value as unknown as AppSettings;
+  // Older backends omit the SCMDraft path; normalize so every save carries the field.
+  return {
+    ...(value as unknown as AppSettings),
+    scmdraftPath: typeof value.scmdraftPath === "string" ? value.scmdraftPath : "",
+  };
 }
 
 function toEuddraftSettings(value: unknown): EuddraftSettings {
@@ -1024,6 +1031,29 @@ export async function appSettingsSave(
   invoke: InvokeFn = tauriInvoke,
 ): Promise<AppSettings> {
   return toAppSettings(await invoke("app_settings_save", { settings }));
+}
+
+/** Open the SCMDraft 2 executable picker; the backend persists the choice. Null when cancelled. */
+export async function pickScmdraftPath(
+  invoke: InvokeFn = tauriInvoke,
+): Promise<string | null> {
+  const value = await invoke("settings_pick_scmdraft_path");
+  if (value === null || value === undefined) return null;
+  if (typeof value !== "string") throw new Error("invalid scmdraft path response");
+  return value;
+}
+
+/** Outcome of "SCMDraft 2로 열기": launched, or the executable is not configured yet. */
+export type ScmdraftLaunch = { kind: "launched" } | { kind: "unconfigured" };
+
+/** Launch the configured SCMDraft 2 on the current project's source map. */
+export async function openScmdraft(invoke: InvokeFn = tauriInvoke): Promise<ScmdraftLaunch> {
+  const value = await invoke("project_open_scmdraft");
+  const kind = isObject(value) ? value.kind : undefined;
+  if (kind !== "launched" && kind !== "unconfigured") {
+    throw new Error("invalid scmdraft launch response");
+  }
+  return { kind };
 }
 
 /** Play the native Windows sound used by attention notifications. */

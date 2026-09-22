@@ -16,6 +16,8 @@ import {
   isAgentTurnEndTransition,
   notificationSoundPreview,
   mentionSearch,
+  openScmdraft,
+  pickScmdraftPath,
   projectExportE3s,
   workspaceList,
   workspaceRead,
@@ -1003,6 +1005,7 @@ describe("App notification settings commands", () => {
     },
     codexLargeContextModels: ["gpt-5.5-codex"],
     deepPlanning: true,
+    scmdraftPath: String.raw`C:\Tools\ScmDraft 2\ScmDraft 2.exe`,
   };
 
   it("loads and saves the complete app settings payload", async () => {
@@ -1014,6 +1017,42 @@ describe("App notification settings commands", () => {
     invoke.mockClear();
     await expect(appSettingsSave(settings, invoke)).resolves.toEqual(settings);
     expect(invoke).toHaveBeenCalledWith("app_settings_save", { settings });
+  });
+
+  it("fills a missing SCMDraft path with an empty string and rejects a non-string one", async () => {
+    const { scmdraftPath: _omitted, ...legacy } = settings;
+    await expect(appSettingsGet(vi.fn().mockResolvedValue(legacy))).resolves.toEqual({
+      ...legacy,
+      scmdraftPath: "",
+    });
+    await expect(
+      appSettingsGet(vi.fn().mockResolvedValue({ ...legacy, scmdraftPath: 7 })),
+    ).rejects.toThrow("invalid app settings response");
+  });
+
+  it("reports whether SCMDraft 2 launched or still needs its executable", async () => {
+    const launched = vi.fn().mockResolvedValue({ kind: "launched" });
+    await expect(openScmdraft(launched)).resolves.toEqual({ kind: "launched" });
+    expect(launched).toHaveBeenCalledWith("project_open_scmdraft");
+    await expect(openScmdraft(vi.fn().mockResolvedValue({ kind: "unconfigured" }))).resolves.toEqual({
+      kind: "unconfigured",
+    });
+    await expect(openScmdraft(vi.fn().mockResolvedValue({ kind: "later" }))).rejects.toThrow(
+      "invalid scmdraft launch response",
+    );
+    await expect(openScmdraft(vi.fn().mockResolvedValue(null))).rejects.toThrow(
+      "invalid scmdraft launch response",
+    );
+  });
+
+  it("returns the picked SCMDraft path or null when the picker is cancelled", async () => {
+    const picked = vi.fn().mockResolvedValue(String.raw`C:\Tools\ScmDraft 2\ScmDraft 2.exe`);
+    await expect(pickScmdraftPath(picked)).resolves.toBe(String.raw`C:\Tools\ScmDraft 2\ScmDraft 2.exe`);
+    expect(picked).toHaveBeenCalledWith("settings_pick_scmdraft_path");
+    await expect(pickScmdraftPath(vi.fn().mockResolvedValue(null))).resolves.toBeNull();
+    await expect(pickScmdraftPath(vi.fn().mockResolvedValue(3))).rejects.toThrow(
+      "invalid scmdraft path response",
+    );
   });
 
   it("loads, checks, and updates the typed euddraft settings contract", async () => {

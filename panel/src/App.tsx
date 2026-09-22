@@ -30,7 +30,7 @@ import {
 import { toast } from "sonner";
 import { Toaster } from "@/components/ui/sonner";
 import { Header, type RagState } from "@/components/Header";
-import { SettingsDialog } from "@/components/SettingsDialog";
+import { SettingsDialog, type SettingsCategory } from "@/components/SettingsDialog";
 import { E3sImportDialog } from "@/setup/E3sImportDialog";
 import { NewMapWizard } from "@/setup/NewMapWizard";
 import { ConversationLog } from "@/components/ConversationLog";
@@ -66,6 +66,8 @@ import {
   euddraftSettingsGet,
   euddraftUpdate,
   attentionNotify,
+  openScmdraft,
+  pickScmdraftPath,
   compactSession,
   isAgentTurnEndTransition,
   mentionSearch,
@@ -545,6 +547,12 @@ export default function App() {
     useState<SessionModelSettings | null>(null);
   const [providerSettingsBusy, setProviderSettingsBusy] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  // Category a task asked the settings dialog to open on; cleared on close so the
+  // gear button keeps the dialog's own last category.
+  const [settingsCategory, setSettingsCategory] = useState<SettingsCategory>();
+  useEffect(() => {
+    if (!settingsOpen) setSettingsCategory(undefined);
+  }, [settingsOpen]);
   const [appSettings, setAppSettings] = useState<AppSettings | null>(null);
   const [appSettingsBusy, setAppSettingsBusy] = useState(false);
   const [euddraftSettings, setEuddraftSettings] =
@@ -553,6 +561,8 @@ export default function App() {
     "load" | "check" | "update" | null
   >(null);
   const [euddraftSettingsError, setEuddraftSettingsError] = useState<string>();
+  const [scmdraftPickBusy, setScmdraftPickBusy] = useState(false);
+  const [scmdraftPickError, setScmdraftPickError] = useState<string>();
   // Message undo/edit flow: the core must finish cancellation/rewind before the
   // input unlocks. `editDraft` is applied by InstructionBox without controlling
   // subsequent typing.
@@ -947,6 +957,38 @@ export default function App() {
     },
     [appSettings],
   );
+
+  const handleOpenScmdraft = useCallback(async () => {
+    try {
+      const launch = await openScmdraft();
+      if (launch.kind === "unconfigured") {
+        setSettingsCategory("compile");
+        setSettingsOpen(true);
+        toast.info("SCMDraft 2 실행 파일을 지정한 뒤 다시 \"SCMDraft 2로 열기\"를 눌러 주세요.");
+      }
+    } catch (reason) {
+      toast.error(String(reason));
+    }
+  }, []);
+
+  const handleScmdraftPick = useCallback(async () => {
+    setScmdraftPickBusy(true);
+    setScmdraftPickError(undefined);
+    try {
+      const picked = await pickScmdraftPath();
+      if (picked !== null) {
+        setAppSettings((current) =>
+          current ? { ...current, scmdraftPath: picked } : current,
+        );
+      }
+    } catch {
+      setScmdraftPickError(
+        "SCMDraft 2 실행 파일을 설정하지 못했습니다. ScmDraft 2.exe를 다시 선택해 주세요.",
+      );
+    } finally {
+      setScmdraftPickBusy(false);
+    }
+  }, []);
 
   const handleNotificationSoundPreview = useCallback(async () => {
     try {
@@ -3403,7 +3445,8 @@ export default function App() {
           rag={rag}
           projectAvailable={projectState.projectAvailable}
           hasProject={projectState.hasProject}
-          onOpenMapAgent={handleOpenMapAgent}
+          onOpenMapAgent={() => handleOpenMapAgent()}
+          onOpenScmdraft={() => void handleOpenScmdraft()}
           projectPanelOpen={projectSidebarOpen}
           onProjectPanelToggle={handleProjectPanelToggle}
           onSettingsOpen={() => setSettingsOpen(true)}
@@ -3423,6 +3466,7 @@ export default function App() {
         )}
         <SettingsDialog
           open={settingsOpen}
+          category={settingsCategory}
           settings={appSettings}
           providers={providerStatuses}
           providerModels={providerModels}
@@ -3440,6 +3484,8 @@ export default function App() {
           euddraft={euddraftSettings}
           euddraftBusy={euddraftSettingsBusy}
           euddraftError={euddraftSettingsError}
+          scmdraftBusy={scmdraftPickBusy}
+          scmdraftError={scmdraftPickError}
           onOpenChange={setSettingsOpen}
           onSettingsChange={handleAppSettingsChange}
           onReload={loadAppSettings}
@@ -3464,6 +3510,7 @@ export default function App() {
           onProjectExport={handleProjectExport}
           onEuddraftCheck={handleEuddraftCheck}
           onEuddraftUpdate={handleEuddraftUpdate}
+          onScmdraftPick={handleScmdraftPick}
         />
         <E3sImportDialog
           open={e3sImportOpen}

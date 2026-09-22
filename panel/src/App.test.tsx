@@ -1604,6 +1604,7 @@ describe("App notifications", () => {
           },
           codexLargeContextModels: [],
           deepPlanning: false,
+          scmdraftPath: "",
         },
       });
     });
@@ -1640,6 +1641,38 @@ describe("App notifications", () => {
     expect(screen.getByText("최신 버전을 사용 중입니다.")).toBeInTheDocument();
     expect(tauri.invoke).toHaveBeenCalledWith("euddraft_check_update");
     expect(tauri.invoke).toHaveBeenCalledWith("euddraft_update");
+  });
+
+  it("opens 설정 > 컴파일 when SCMDraft 2 has no executable yet, and launches once it does", async () => {
+    const baseInvoke = tauri.invoke.getMockImplementation();
+    let launch: { kind: "launched" | "unconfigured" } = { kind: "unconfigured" };
+    tauri.invoke.mockImplementation(async (command: string, args?: Record<string, unknown>) => {
+      if (command === "project_open_scmdraft") return launch;
+      return baseInvoke?.(command, args);
+    });
+    render(<App />);
+    const open = await screen.findByRole("button", { name: "SCMDraft 2로 열기" });
+    await waitFor(() => expect(open).toBeEnabled());
+    fireEvent.click(open);
+
+    const dialog = await screen.findByRole("dialog", { name: "설정" });
+    expect(within(dialog).getByRole("button", { name: "컴파일" })).toHaveAttribute(
+      "aria-current",
+      "page",
+    );
+    expect(within(dialog).getByRole("heading", { name: "SCMDraft 2" })).toBeInTheDocument();
+    expect(tauri.invoke).toHaveBeenCalledWith("project_open_scmdraft");
+
+    fireEvent.keyDown(dialog, { key: "Escape" });
+    await waitFor(() =>
+      expect(screen.queryByRole("dialog", { name: "설정" })).not.toBeInTheDocument(),
+    );
+    launch = { kind: "launched" };
+    fireEvent.click(screen.getByRole("button", { name: "SCMDraft 2로 열기" }));
+    await waitFor(() =>
+      expect(tauri.invoke.mock.calls.filter(([command]) => command === "project_open_scmdraft")).toHaveLength(2),
+    );
+    expect(screen.queryByRole("dialog", { name: "설정" })).not.toBeInTheDocument();
   });
 
   it("notifies once when each new review surface appears", async () => {

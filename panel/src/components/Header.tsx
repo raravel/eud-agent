@@ -6,6 +6,7 @@
  * labels throughout.
  */
 import {
+  ExternalLink,
   FolderKanban,
   MapIcon,
   PanelRightClose,
@@ -44,6 +45,8 @@ export interface HeaderProps {
   hasProject?: boolean;
   /** Open or focus the separate Map Agent workbench window. */
   onOpenMapAgent?: () => void;
+  /** Open the project's source map in the configured SCMDraft 2 (설정 → 컴파일). */
+  onOpenScmdraft?: () => void;
   /** Toggle the project tools sidebar. */
   onProjectPanelToggle?: () => void;
   /** Whether the project tools sidebar is currently visible. */
@@ -147,6 +150,7 @@ export function Header({
   projectAvailable = false,
   hasProject = true,
   onOpenMapAgent,
+  onOpenScmdraft,
   onProjectPanelToggle,
   projectPanelOpen = false,
   onSettingsOpen,
@@ -204,6 +208,20 @@ export function Header({
           >
             <MapIcon className="size-4" aria-hidden="true" />
             맵 에이전트
+          </Button>
+        )}
+        {onOpenScmdraft && (
+          <Button
+            type="button"
+            size="default"
+            variant="outline"
+            className="gap-1.5"
+            disabled={!projectAvailable || !hasProject}
+            title="설정 → 컴파일에서 지정한 SCMDraft 2로 원본 맵 열기"
+            onClick={onOpenScmdraft}
+          >
+            <ExternalLink className="size-4" aria-hidden="true" />
+            SCMDraft 2로 열기
           </Button>
         )}
         {ragInfo && <StatusPill pill={ragInfo} />}

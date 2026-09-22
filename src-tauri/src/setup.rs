@@ -1086,6 +1086,91 @@ fn create_project_from_map(source_map: &Path, destination: &Path) -> Result<(), 
     Ok(())
 }
 
+/// Pick the SCMDraft 2 executable for the Map window's "SCMDraft 2로 열기" and
+/// persist it. Returns the saved path, or the current one when the dialog is
+/// cancelled.
+#[tauri::command]
+pub async fn settings_pick_scmdraft_path(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppManaged>,
+) -> Result<String, String> {
+    let dirs = state.dirs().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut config = dirs.load_config().map_err(|error| error.to_string())?;
+        let Some(picked) = app
+            .dialog()
+            .file()
+            .set_title("SCMDraft 2 실행 파일 선택")
+            .add_filter("SCMDraft 2", &["exe"])
+            .blocking_pick_file()
+        else {
+            return Ok(config.scmdraft_path);
+        };
+        let picked = picked.into_path().map_err(|error| error.to_string())?;
+        if !picked.is_file() {
+            return Err(
+                "선택한 경로가 파일이 아닙니다. SCMDraft 2 실행 파일(.exe)을 선택해 주세요."
+                    .to_string(),
+            );
+        }
+        config.scmdraft_path = picked.to_string_lossy().into_owned();
+        dirs.save_config(&config)
+            .map_err(|error| error.to_string())?;
+        Ok(config.scmdraft_path)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+/// Outcome of the main window's "SCMDraft 2로 열기".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum ScmdraftLaunch {
+    /// SCMDraft 2 was started on the project's source map.
+    Launched,
+    /// `config.scmdraft_path` is empty or no longer a file; the panel opens
+    /// 설정 → 컴파일 so the user can pick the executable in place.
+    Unconfigured,
+}
+
+/// Launch the configured SCMDraft 2 on the current project's source map and
+/// return without waiting. No extra guard is taken: the MapSafe lock probe
+/// already refuses Map writes while SCMDraft holds the file open.
+pub(crate) fn launch_scmdraft(dirs: &DataDirs) -> Result<ScmdraftLaunch, String> {
+    let source_map =
+        crate::native_runtime::NativeProjectManager::new(dirs.clone()).source_map_path()?;
+    let config = dirs.load_config().map_err(|error| error.to_string())?;
+    let executable = PathBuf::from(config.scmdraft_path.trim());
+    if config.scmdraft_path.trim().is_empty() || !executable.is_file() {
+        return Ok(ScmdraftLaunch::Unconfigured);
+    }
+    let mut command = std::process::Command::new(&executable);
+    command.arg(&source_map);
+    if let Some(parent) = executable.parent() {
+        command.current_dir(parent);
+    }
+    command
+        .spawn()
+        .map(|_| ScmdraftLaunch::Launched)
+        .map_err(|error| {
+            format!(
+                "SCMDraft 2를 실행하지 못했습니다 ({}): {error}. 설정 > 컴파일에서 실행 파일 경로를 확인해 주세요.",
+                executable.display()
+            )
+        })
+}
+
+/// Open the current project's source map in the configured SCMDraft 2.
+#[tauri::command]
+pub async fn project_open_scmdraft(
+    state: tauri::State<'_, AppManaged>,
+) -> Result<ScmdraftLaunch, String> {
+    let dirs = state.dirs().clone();
+    tauri::async_runtime::spawn_blocking(move || launch_scmdraft(&dirs))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
 /// Pick an existing euddraft distribution folder or entrypoint.
 #[tauri::command]
 pub async fn setup_pick_euddraft_path(
@@ -1421,6 +1506,68 @@ mod tests {
         assert!(status.project_valid);
         assert!(status.euddraft_valid);
         assert!(!status.setup_required);
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn scmdraft_launch_reports_unconfigured_before_spawning_anything() {
+        let base = unique_temp_dir("scmdraft-launch");
+        let dirs = DataDirs::from_bases(&base.join("roaming"), &base.join("local"));
+        dirs.ensure_dirs().unwrap();
+        let project_root = base.join("project");
+        fs::create_dir_all(project_root.join("maps")).unwrap();
+        fs::write(project_root.join("maps/source.scx"), b"map").unwrap();
+        crate::native_project::NativeProject::create(
+            &project_root,
+            ProjectManifest {
+                schema_version: crate::native_project::PROJECT_SCHEMA_VERSION,
+                name: "Demo".to_string(),
+                source_map: "maps/source.scx".to_string(),
+                output_map: "build/output.scx".to_string(),
+                main_file: "src/main.eps".to_string(),
+                settings: ProjectSettings::default(),
+                plugins: Vec::new(),
+                python_entrypoints: Vec::new(),
+                python_dependencies: Vec::new(),
+                python_lock: None,
+                editor_compatibility: None,
+            },
+        )
+        .unwrap();
+        let mut config = Config {
+            project_path: project_root.to_string_lossy().into_owned(),
+            ..Default::default()
+        };
+        dirs.save_config(&config).unwrap();
+        assert_eq!(
+            launch_scmdraft(&dirs).unwrap(),
+            ScmdraftLaunch::Unconfigured
+        );
+
+        config.scmdraft_path = base
+            .join("missing/ScmDraft 2.exe")
+            .to_string_lossy()
+            .into_owned();
+        dirs.save_config(&config).unwrap();
+        assert_eq!(
+            launch_scmdraft(&dirs).unwrap(),
+            ScmdraftLaunch::Unconfigured
+        );
+
+        assert_eq!(
+            serde_json::to_value(ScmdraftLaunch::Unconfigured).unwrap(),
+            serde_json::json!({ "kind": "unconfigured" })
+        );
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn scmdraft_launch_requires_an_open_project_before_reading_the_executable() {
+        let base = unique_temp_dir("scmdraft-no-project");
+        let dirs = DataDirs::from_bases(&base.join("roaming"), &base.join("local"));
+        dirs.ensure_dirs().unwrap();
+        dirs.save_config(&Config::default()).unwrap();
+        assert!(launch_scmdraft(&dirs).is_err());
         fs::remove_dir_all(base).ok();
     }
 

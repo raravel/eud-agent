@@ -200,4 +200,33 @@ describe("Header — Map Agent window", () => {
     await userEvent.click(button);
     expect(onOpenMapAgent).toHaveBeenCalledTimes(1);
   });
+
+  it("hands the source map to SCMDraft 2 only when a native project is open", async () => {
+    const onOpenScmdraft = vi.fn();
+    const { rerender } = render(
+      <Header
+        project=""
+        connected={true}
+        phase="ready"
+        projectAvailable={false}
+        hasProject={false}
+        onOpenScmdraft={onOpenScmdraft}
+      />,
+    );
+    expect(screen.getByRole("button", { name: "SCMDraft 2로 열기" })).toBeDisabled();
+    rerender(
+      <Header
+        project="MyMap"
+        connected={true}
+        phase="ready"
+        projectAvailable={true}
+        hasProject={true}
+        onOpenScmdraft={onOpenScmdraft}
+      />,
+    );
+    const button = screen.getByRole("button", { name: "SCMDraft 2로 열기" });
+    expect(button).toBeEnabled();
+    await userEvent.click(button);
+    expect(onOpenScmdraft).toHaveBeenCalledTimes(1);
+  });
 });

@@ -39,6 +39,9 @@ pub struct AppSettings {
     /// "더 똑똑한 계획": planner + architect + critic consensus for staged requests.
     #[serde(default)]
     pub deep_planning: bool,
+    /// SCMDraft 2 executable for the Map window's "SCMDraft 2로 열기".
+    #[serde(default)]
+    pub scmdraft_path: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -670,6 +673,7 @@ pub fn app_settings_payload(dirs: &DataDirs) -> Result<AppSettings, String> {
         notifications: config.notifications,
         codex_large_context_models: config.providers.codex.large_context_models,
         deep_planning: config.deep_planning,
+        scmdraft_path: config.scmdraft_path,
     })
 }
 
@@ -681,6 +685,7 @@ pub fn app_settings_save_payload(
     config.notifications = settings.notifications;
     config.providers.codex.large_context_models = settings.codex_large_context_models.clone();
     config.deep_planning = settings.deep_planning;
+    config.scmdraft_path = settings.scmdraft_path.clone();
     dirs.save_config(&config)
         .map_err(|error| error.to_string())?;
     Ok(settings)
@@ -1865,6 +1870,7 @@ mod tests {
             },
             codex_large_context_models: BTreeSet::from(["gpt-test".to_string()]),
             deep_planning: true,
+            scmdraft_path: "C:\\Tools\\ScmDraft 2\\ScmDraft 2.exe".to_string(),
         };
         let saved = ipc::app_settings_save_payload(&dirs, settings.clone()).unwrap();
         assert_eq!(saved, settings);
@@ -1879,12 +1885,17 @@ mod tests {
                     "askResponseRequired": {"sound": true, "osNotification": false}
                 },
                 "codexLargeContextModels": ["gpt-test"],
-                "deepPlanning": true
+                "deepPlanning": true,
+                "scmdraftPath": "C:\\Tools\\ScmDraft 2\\ScmDraft 2.exe"
             }),
         );
 
         let config = dirs.load_config().unwrap();
         assert!(config.deep_planning);
+        assert_eq!(
+            config.scmdraft_path,
+            "C:\\Tools\\ScmDraft 2\\ScmDraft 2.exe"
+        );
         assert_eq!(config.project_path, "C:\\Maps\\NativeProject");
         assert_eq!(config.euddraft_path, "C:\\Tools\\euddraft.exe");
         assert_eq!(

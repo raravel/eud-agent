@@ -9,6 +9,7 @@ import {
   FileInput,
   FileOutput,
   FolderKanban,
+  FolderOpen,
   Hammer,
   LoaderCircle,
   Plus,
@@ -51,6 +52,8 @@ import type {
 
 export interface SettingsDialogProps {
   open: boolean;
+  /** Category to show when the dialog opens for a specific task (e.g. 컴파일 for SCMDraft 2). */
+  category?: SettingsCategory;
   settings: AppSettings | null;
   busy?: boolean;
   providerBusy?: ProviderId;
@@ -67,6 +70,8 @@ export interface SettingsDialogProps {
   euddraft: EuddraftSettings | null;
   euddraftBusy?: "load" | "check" | "update" | null;
   euddraftError?: string;
+  scmdraftBusy?: boolean;
+  scmdraftError?: string;
   onOpenChange(open: boolean): void;
   onSettingsChange(settings: AppSettings): void;
   onReload(): void;
@@ -92,9 +97,10 @@ export interface SettingsDialogProps {
   onProjectExport(): void;
   onEuddraftCheck(): void;
   onEuddraftUpdate(): void;
+  onScmdraftPick(): Promise<void> | void;
 }
 
-type SettingsCategory = "project" | "compile" | "providers" | "notifications";
+export type SettingsCategory = "project" | "compile" | "providers" | "notifications";
 
 const EVENT_COPY: Readonly<
   Record<NotificationEvent, { title: string; description: string }>
@@ -287,8 +293,63 @@ function EuddraftSettingsPanel({
   );
 }
 
+interface ScmdraftSettingsPanelProps {
+  path: string;
+  busy: boolean;
+  error?: string;
+  onPick(): Promise<void> | void;
+}
+
+function ScmdraftSettingsPanel({ path, busy, error, onPick }: ScmdraftSettingsPanelProps) {
+  return (
+    <section aria-labelledby="settings-scmdraft-heading" className="mt-8">
+      <h2 id="settings-scmdraft-heading" className="text-base font-semibold">SCMDraft 2</h2>
+      <p className="mt-1.5 text-sm leading-6 text-muted-foreground">
+        상단의 &quot;SCMDraft 2로 열기&quot;가 이 실행 파일로 원본 맵을 엽니다.
+      </p>
+      <dl className="mt-5 overflow-hidden rounded-xl border border-border bg-card/40">
+        <div className="grid gap-1.5 px-4 py-3.5">
+          <dt className="text-xs font-medium text-muted-foreground">실행 파일</dt>
+          <dd
+            className="break-all font-mono text-sm text-foreground"
+            title={formatPathForDisplay(path)}
+          >
+            {formatPathForDisplay(path) || "지정되지 않음"}
+          </dd>
+        </div>
+      </dl>
+      {error && (
+        <p
+          role="alert"
+          className="mt-3 rounded-lg border border-destructive/40 bg-destructive/10 px-4 py-3 text-sm text-destructive"
+        >
+          {error}
+        </p>
+      )}
+      <div className="mt-5 flex flex-col gap-3 sm:flex-row sm:justify-end">
+        <Button
+          type="button"
+          variant="outline"
+          className="h-11"
+          disabled={busy}
+          aria-busy={busy || undefined}
+          onClick={() => void onPick()}
+        >
+          {busy ? (
+            <LoaderCircle aria-hidden className="size-4 animate-spin motion-reduce:animate-none" />
+          ) : (
+            <FolderOpen aria-hidden className="size-4" />
+          )}
+          {busy ? "선택 중…" : "실행 파일 선택"}
+        </Button>
+      </div>
+    </section>
+  );
+}
+
 export function SettingsDialog({
   open,
+  category: requestedCategory,
   settings,
   busy = false,
   providerBusy,
@@ -305,6 +366,8 @@ export function SettingsDialog({
   euddraft,
   euddraftBusy = null,
   euddraftError,
+  scmdraftBusy = false,
+  scmdraftError,
   onOpenChange,
   onSettingsChange,
   onReload,
@@ -326,6 +389,7 @@ export function SettingsDialog({
   onProjectExport,
   onEuddraftCheck,
   onEuddraftUpdate,
+  onScmdraftPick,
 }: SettingsDialogProps) {
   const [category, setCategory] = useState<SettingsCategory>("providers");
   const [selectedProvider, setSelectedProvider] = useState<ProviderId>();
@@ -343,6 +407,12 @@ export function SettingsDialog({
     setSelectedProvider(undefined);
     providerToRestoreRef.current = undefined;
   }, [open]);
+
+  useEffect(() => {
+    if (!open || !requestedCategory) return;
+    setCategory(requestedCategory);
+    setSelectedProvider(undefined);
+  }, [open, requestedCategory]);
 
   useEffect(() => {
     if (!open || category !== "providers") return;
@@ -543,13 +613,21 @@ export function SettingsDialog({
                 </p>
               </div>
             ) : category === "compile" ? (
-              <EuddraftSettingsPanel
-                status={euddraft}
-                busy={euddraftBusy}
-                error={euddraftError}
-                onCheck={onEuddraftCheck}
-                onUpdate={onEuddraftUpdate}
-              />
+              <>
+                <EuddraftSettingsPanel
+                  status={euddraft}
+                  busy={euddraftBusy}
+                  error={euddraftError}
+                  onCheck={onEuddraftCheck}
+                  onUpdate={onEuddraftUpdate}
+                />
+                <ScmdraftSettingsPanel
+                  path={settings?.scmdraftPath ?? ""}
+                  busy={busy || scmdraftBusy}
+                  error={scmdraftError}
+                  onPick={onScmdraftPick}
+                />
+              </>
             ) : category === "providers" ? (
               selectedProviderStatus ? (
                 <div className="animate-in fade-in slide-in-from-right-2 duration-200 motion-reduce:animate-none">

@@ -15,6 +15,7 @@ const settings: AppSettings = {
   },
   codexLargeContextModels: [],
   deepPlanning: false,
+  scmdraftPath: "",
 };
 
 const euddraft: EuddraftSettings = {
@@ -89,6 +90,7 @@ function renderDialog(
     onProjectExport: vi.fn(),
     onEuddraftCheck: vi.fn(),
     onEuddraftUpdate: vi.fn(),
+    onScmdraftPick: vi.fn(),
     ...overrides,
   };
   return { ...render(<SettingsDialog {...props} />), props };
@@ -119,6 +121,31 @@ describe("SettingsDialog provider management", () => {
     expect(onProjectCreate).toHaveBeenCalledOnce();
     expect(onProjectImport).toHaveBeenCalledOnce();
     expect(onProjectExport).toHaveBeenCalledOnce();
+  });
+
+  it("shows the SCMDraft 2 executable under 컴파일 and lets the user pick it", async () => {
+    const onScmdraftPick = vi.fn();
+    const { rerender, props } = renderDialog({ onScmdraftPick });
+
+    await userEvent.click(screen.getByRole("button", { name: "컴파일" }));
+    const section = screen.getByRole("region", { name: "SCMDraft 2" });
+    expect(within(section).getByText("지정되지 않음")).toBeInTheDocument();
+    await userEvent.click(within(section).getByRole("button", { name: "실행 파일 선택" }));
+    expect(onScmdraftPick).toHaveBeenCalledOnce();
+
+    const scmdraftPath = String.raw`C:\Tools\ScmDraft 2\ScmDraft 2.exe`;
+    rerender(
+      <SettingsDialog
+        {...props}
+        settings={{ ...settings, scmdraftPath }}
+        scmdraftBusy
+        scmdraftError="SCMDraft 2 실행 파일을 설정하지 못했습니다. ScmDraft 2.exe를 다시 선택해 주세요."
+      />,
+    );
+    const updated = screen.getByRole("region", { name: "SCMDraft 2" });
+    expect(within(updated).getByText(scmdraftPath)).toBeInTheDocument();
+    expect(within(updated).getByRole("button", { name: "선택 중…" })).toBeDisabled();
+    expect(within(updated).getByRole("alert")).toHaveTextContent("다시 선택해 주세요");
   });
 
   it("shows managed euddraft versions and exposes check and update actions", async () => {
