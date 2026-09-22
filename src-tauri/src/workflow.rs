@@ -326,8 +326,7 @@ const VERIFIER_TOOLS: &[&str] = &[
     "map_info",
     "map_sound_list",
     "build_run",
-    "trace_suite_run",
-    "trace_test_run",
+    "build_log_read",
 ];
 
 /// Tool names a stage may execute. Every name is a registered EPS read tool

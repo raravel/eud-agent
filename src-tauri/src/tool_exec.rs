@@ -79,6 +79,17 @@ const SEARCH_DOCS_DEFAULT_K: i64 = 5;
 const SEARCH_DOCS_PREVIEW_CHARS: usize = 480;
 const DOCS_GET_MAX_IDS: usize = 10;
 const READ_FILE_DEFAULT_LINES: usize = 400;
+const BUILD_LOG_DEFAULT_LINES: usize = 200;
+const BUILD_LOG_MAX_LINES: usize = 400;
+const BUILD_LOG_MAX_MATCHES: usize = 200;
+/// A euddraft log line can list every map tile; a page never carries more than this per line.
+const BUILD_LOG_LINE_CHARS: usize = 1000;
+/// Budget for one build_log_read page, measured as the Claude adapter measures a native tool
+/// result: compact JSON embedded again as a JSON string (every `\` and `"` doubles).
+const BUILD_LOG_PAGE_BYTES: usize = 40 * 1024;
+/// Same double-escaped measure for the whole build_run observation; diagnostics beyond it are
+/// counted, not sent, and remain in the build log.
+const BUILD_RUN_OBSERVATION_BYTES: usize = 40 * 1024;
 const SOURCE_SEARCH_DEFAULT_LIMIT: usize = 20;
 const SOURCE_SEARCH_MAX_LIMIT: usize = 100;
 const SOURCE_SEARCH_MAX_CONTEXT_LINES: usize = 20;
@@ -1854,6 +1865,26 @@ impl SessionToolRuntime {
                 let path = str_arg(args, "path")?;
                 let content = self.services.native().read_source(path)?;
                 ranged_file_result(path, &content, args)
+            }
+            tools::BUILD_LOG_READ_TOOL => {
+                let project = self.services.native().open()?;
+                let path = crate::native_build::build_log_path(project.root());
+                let content = match std::fs::read(&path) {
+                    Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        return Err(format!(
+                            "이 프로젝트에는 아직 빌드 로그({})가 없습니다. build_run을 먼저 실행하세요.",
+                            crate::native_build::BUILD_LOG_RELATIVE_PATH
+                        ));
+                    }
+                    Err(error) => {
+                        return Err(format!(
+                            "빌드 로그({})를 읽지 못했습니다: {error}",
+                            crate::native_build::BUILD_LOG_RELATIVE_PATH
+                        ));
+                    }
+                };
+                build_log_page(&content, args)
             }
             tools::SOURCE_SEARCH_TOOL => self.source_search(args),
             tools::PYTHON_DEPENDENCIES_PREPARE_TOOL => {
@@ -3972,6 +4003,192 @@ fn optional_string_array_arg(args: &Value, name: &str) -> Result<Vec<String>, St
     Ok(result)
 }
 
+/// The model-facing `build_run` result: structured diagnostics plus a bounded output excerpt.
+/// The raw stdout/stderr stay in the project build log, which `build_log_read` pages, so the
+/// observation stays under every provider's tool-result ceiling even when euddraft prints one
+/// line per map tile.
+fn build_run_observation(result: crate::native_build::NativeBuildResult) -> Result<Value, String> {
+    let excerpt = crate::native_build::output_excerpt(&result.stdout, &result.stderr);
+    let log_written = !result.log_path.is_empty();
+    let mut value = serde_json::to_value(result)
+        .map_err(|error| format!("failed to serialize build result: {error}"))?;
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| "failed to serialize build result object".to_string())?;
+    object.remove("stdout");
+    object.remove("stderr");
+    let errors = object
+        .remove("errors")
+        .and_then(|value| value.as_array().cloned())
+        .unwrap_or_default();
+    let mut warnings = object
+        .remove("warnings")
+        .and_then(|value| value.as_array().cloned())
+        .unwrap_or_default();
+    for warning in &mut warnings {
+        // A warning's stack is context, not something to repair; the log keeps it.
+        if let Some(warning) = warning.as_object_mut() {
+            warning.remove("raw");
+        }
+    }
+    object.insert("outputExcerpt".to_string(), Value::String(excerpt));
+    object.insert(
+        "logPath".to_string(),
+        if log_written {
+            Value::String(crate::native_build::BUILD_LOG_RELATIVE_PATH.to_string())
+        } else {
+            Value::Null
+        },
+    );
+    let mut used = double_escaped_len(&Value::Object(object.clone()));
+    let mut take = |entries: Vec<Value>| -> (Vec<Value>, usize) {
+        let mut kept = Vec::new();
+        let mut omitted = 0usize;
+        for entry in entries {
+            let cost = double_escaped_len(&entry) + 1;
+            if used + cost > BUILD_RUN_OBSERVATION_BYTES {
+                omitted += 1;
+                continue;
+            }
+            used += cost;
+            kept.push(entry);
+        }
+        (kept, omitted)
+    };
+    let (errors, omitted_errors) = take(errors);
+    let (warnings, omitted_warnings) = take(warnings);
+    object.insert("errors".to_string(), Value::Array(errors));
+    object.insert("warnings".to_string(), Value::Array(warnings));
+    object.insert("omittedErrors".to_string(), json!(omitted_errors));
+    object.insert("omittedWarnings".to_string(), json!(omitted_warnings));
+    Ok(value)
+}
+
+/// Bytes of `value` once it is rendered as compact JSON and then embedded as a JSON string —
+/// how the Claude adapter measures the text block a native CLI echoes back for a tool result.
+fn double_escaped_len(value: &Value) -> usize {
+    serde_json::to_string(&Value::String(value.to_string()))
+        .map(|text| text.len())
+        .unwrap_or(usize::MAX)
+}
+
+/// One page of the build log: a 1-based line range, or the lines containing `query`.
+fn build_log_page(content: &str, args: &Value) -> Result<Value, String> {
+    let path = crate::native_build::BUILD_LOG_RELATIVE_PATH;
+    let lines: Vec<&str> = content.lines().collect();
+    let total_lines = lines.len();
+    let query = match args.get("query") {
+        None | Some(Value::Null) => None,
+        Some(value) => {
+            let query = value
+                .as_str()
+                .ok_or_else(|| "argument 'query' must be a string".to_string())?
+                .trim();
+            if query.is_empty() {
+                return Err("build_log_read query must not be blank".to_string());
+            }
+            Some(query.to_lowercase())
+        }
+    };
+    let start = usize_arg_default(args, "startLine", 1)?;
+    if start == 0 {
+        return Err("build_log_read startLine is 1-based and must be at least 1".to_string());
+    }
+    if total_lines == 0 {
+        return Ok(json!({
+            "path": path,
+            "totalLines": 0,
+            "startLine": Value::Null,
+            "endLine": 0,
+            "count": 0,
+            "hasMore": false,
+            "nextLine": Value::Null,
+            "lines": [],
+        }));
+    }
+    if start > total_lines {
+        return Err(format!(
+            "build_log_read startLine {start} exceeds {total_lines} total lines"
+        ));
+    }
+    let cut_line = |text: &str| -> String {
+        let length = text.chars().count();
+        if length <= BUILD_LOG_LINE_CHARS {
+            text.to_string()
+        } else {
+            let head: String = text.chars().take(BUILD_LOG_LINE_CHARS).collect();
+            format!(
+                "{head} [… line cut, {} more chars]",
+                length - BUILD_LOG_LINE_CHARS
+            )
+        }
+    };
+    let mut items = Vec::new();
+    let mut used_bytes = 256usize; // envelope fields
+    let mut last_scanned = start - 1;
+    let end = match &query {
+        None => {
+            let default_end = start
+                .saturating_add(BUILD_LOG_DEFAULT_LINES - 1)
+                .min(total_lines);
+            let end = usize_arg_default(args, "endLine", default_end)?
+                .min(total_lines)
+                .min(start.saturating_add(BUILD_LOG_MAX_LINES - 1));
+            if end < start {
+                return Err(format!(
+                    "build_log_read endLine {end} precedes startLine {start}"
+                ));
+            }
+            end
+        }
+        Some(_) => {
+            let end = usize_arg_default(args, "endLine", total_lines)?.min(total_lines);
+            if end < start {
+                return Err(format!(
+                    "build_log_read endLine {end} precedes startLine {start}"
+                ));
+            }
+            end
+        }
+    };
+    for line_number in start..=end {
+        let text = lines[line_number - 1];
+        let selected = match &query {
+            None => true,
+            Some(query) => text.to_lowercase().contains(query.as_str()),
+        };
+        if selected {
+            let item = json!({ "line": line_number, "text": cut_line(text) });
+            let cost = double_escaped_len(&item) + 1;
+            let at_limit = !items.is_empty()
+                && (used_bytes + cost > BUILD_LOG_PAGE_BYTES
+                    || items.len()
+                        >= query
+                            .as_ref()
+                            .map_or(BUILD_LOG_MAX_LINES, |_| BUILD_LOG_MAX_MATCHES));
+            if at_limit {
+                break;
+            }
+            used_bytes += cost;
+            items.push(item);
+        }
+        last_scanned = line_number;
+    }
+    let has_more = last_scanned < end || (query.is_none() && end < total_lines);
+    let next_line = has_more.then_some(last_scanned + 1);
+    Ok(json!({
+        "path": path,
+        "totalLines": total_lines,
+        "query": query.is_some().then(|| args["query"].clone()),
+        "startLine": start,
+        "endLine": last_scanned,
+        "count": items.len(),
+        "hasMore": has_more,
+        "nextLine": next_line,
+        "lines": items,
+    }))
+}
+
 fn ranged_file_result(path: &str, content: &str, args: &Value) -> Result<Value, String> {
     let total_lines = content.lines().count();
     if args.get("startLine").is_none() && args.get("endLine").is_none() {
@@ -4710,6 +4927,185 @@ mod tests {
             Some("// nested\n")
         );
         manager.finish_turn(&baseline).unwrap();
+    }
+
+    #[test]
+    fn build_run_observation_replaces_raw_streams_with_a_bounded_excerpt() {
+        let giant = format!(
+            "Null tiles at: {} - Allocating objects..",
+            (0..65_056)
+                .map(|i| format!("({}, {})", i % 256, i / 256))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        let result = crate::native_build::NativeBuildResult {
+            ok: true,
+            errors: Vec::new(),
+            warnings: Vec::new(),
+            raw_status: 0,
+            stdout: format!("Loading map\n{giant}\nOutput scenario.chk : 1.794MB\n"),
+            stderr: String::new(),
+            log_path: "E:/anywhere/build/euddraft/build.log".to_string(),
+            artifacts: crate::native_build::NativeBuildArtifacts {
+                build_dir: "build".to_string(),
+                wireframe_editor: None,
+                requirement_file: None,
+                eds_path: "build/main.eds".to_string(),
+                output_map: "build/output.scx".to_string(),
+                data_editor: None,
+                extra_data_editor: None,
+                custom_tbl: None,
+                python_path_bootstrap: None,
+            },
+        };
+        let value = build_run_observation(result).unwrap();
+        assert!(value.get("stdout").is_none());
+        assert!(value.get("stderr").is_none());
+        assert_eq!(value["logPath"], "build/euddraft/build.log");
+        assert_eq!(value["ok"], true);
+        assert_eq!(value["warnings"], json!([]));
+        let excerpt = value["outputExcerpt"].as_str().unwrap();
+        assert!(excerpt.contains("Loading map"));
+        assert!(excerpt.contains("Output scenario.chk : 1.794MB"));
+        assert!(excerpt.contains("[… line cut,"));
+        assert_eq!(value["omittedErrors"], 0);
+        assert_eq!(value["omittedWarnings"], 0);
+        // The whole observation stays far below the 64 KiB native tool-result ceiling.
+        assert!(double_escaped_len(&value) < 16 * 1024);
+    }
+
+    #[test]
+    fn build_run_observation_keeps_diagnostics_within_the_double_escaped_ceiling() {
+        let diagnostic = |index: usize| crate::native_build::NativeBuildError {
+            source: "euddraft".to_string(),
+            file: format!(
+                "D:\\a\\euddraft\\euddraft\\.venv\\Lib\\site-packages\\eudplib\\module{index}.py"
+            ),
+            line: index as u64,
+            message: format!("EPWarning: \"quoted\" warning {index} with C:\\paths\\inside"),
+            raw: format!("  File \"D:\\a\\euddraft\\frame{index}.py\", line 1, in f\n").repeat(60),
+            count: 1,
+        };
+        let result = crate::native_build::NativeBuildResult {
+            ok: false,
+            errors: (0..30).map(diagnostic).collect(),
+            warnings: (0..60).map(diagnostic).collect(),
+            raw_status: 1,
+            stdout: "x".repeat(100_000),
+            stderr: "y\\z\"".repeat(20_000),
+            log_path: String::new(),
+            artifacts: crate::native_build::NativeBuildArtifacts {
+                build_dir: "build".to_string(),
+                wireframe_editor: None,
+                requirement_file: None,
+                eds_path: "build/main.eds".to_string(),
+                output_map: "build/output.scx".to_string(),
+                data_editor: None,
+                extra_data_editor: None,
+                custom_tbl: None,
+                python_path_bootstrap: None,
+            },
+        };
+        let value = build_run_observation(result).unwrap();
+        assert!(double_escaped_len(&value) <= BUILD_RUN_OBSERVATION_BYTES);
+        assert!(double_escaped_len(&value) < 64 * 1024);
+        let kept_errors = value["errors"].as_array().unwrap().len();
+        let kept_warnings = value["warnings"].as_array().unwrap().len();
+        assert!(kept_errors > 0);
+        assert_eq!(value["omittedErrors"], 30 - kept_errors);
+        assert_eq!(value["omittedWarnings"], 60 - kept_warnings);
+        assert_eq!(
+            kept_errors + value["omittedErrors"].as_u64().unwrap() as usize,
+            30
+        );
+        // Warnings travel without their stacks; errors keep theirs.
+        assert!(value["errors"][0].get("raw").is_some());
+        assert!(value["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|warning| warning.get("raw").is_none()));
+        assert_eq!(value["logPath"], Value::Null);
+    }
+
+    #[test]
+    fn build_log_page_reads_ranges_and_queries_with_continuation() {
+        let content = (1..=1_000)
+            .map(|i| {
+                if i == 500 {
+                    format!("Null tiles at: {}", "(0, 0), ".repeat(2_000))
+                } else if i % 100 == 0 {
+                    format!("line {i} EPWarning: something")
+                } else {
+                    format!("line {i}")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let first = build_log_page(&content, &json!({})).unwrap();
+        assert_eq!(first["totalLines"], 1_000);
+        assert_eq!(first["startLine"], 1);
+        assert_eq!(first["endLine"], 200);
+        assert_eq!(first["count"], 200);
+        assert_eq!(first["hasMore"], true);
+        assert_eq!(first["nextLine"], 201);
+        assert_eq!(first["lines"][0], json!({"line": 1, "text": "line 1"}));
+
+        let middle = build_log_page(&content, &json!({"startLine": 499, "endLine": 501})).unwrap();
+        assert_eq!(middle["count"], 3);
+        let cut = middle["lines"][1]["text"].as_str().unwrap();
+        assert!(cut.starts_with("Null tiles at: (0, 0), "));
+        assert!(cut.ends_with("more chars]"));
+        assert!(cut.chars().count() < BUILD_LOG_LINE_CHARS + 64);
+
+        let capped = build_log_page(&content, &json!({"startLine": 1, "endLine": 1_000})).unwrap();
+        assert_eq!(capped["endLine"], 400);
+        assert_eq!(capped["nextLine"], 401);
+
+        let tail = build_log_page(&content, &json!({"startLine": 990})).unwrap();
+        assert_eq!(tail["endLine"], 1_000);
+        assert_eq!(tail["hasMore"], false);
+        assert_eq!(tail["nextLine"], Value::Null);
+
+        let matches = build_log_page(&content, &json!({"query": "epwarning"})).unwrap();
+        // Line 500 is the giant tile line, so nine of the ten hundreds match.
+        assert_eq!(matches["count"], 9);
+        assert_eq!(matches["hasMore"], false);
+        assert_eq!(matches["lines"][0]["line"], 100);
+        assert_eq!(matches["lines"][8]["line"], 1_000);
+        let resumed =
+            build_log_page(&content, &json!({"query": "EPWarning", "startLine": 301})).unwrap();
+        assert_eq!(resumed["count"], 6);
+        assert_eq!(resumed["lines"][0]["line"], 400);
+
+        assert!(build_log_page(&content, &json!({"startLine": 0})).is_err());
+        assert!(build_log_page(&content, &json!({"startLine": 1_001})).is_err());
+        assert!(build_log_page(&content, &json!({"query": "  "})).is_err());
+        let empty = build_log_page("", &json!({})).unwrap();
+        assert_eq!(empty["totalLines"], 0);
+        assert_eq!(empty["count"], 0);
+
+        // Backslash- and quote-heavy frames stop at the double-escaped byte budget, not at
+        // 400 lines, and the page says where to continue.
+        let frames = (0..1_000)
+            .map(|i| format!("  File \"D:\\a\\euddraft\\euddraft\\.venv\\Lib\\site-packages\\eudplib\\core\\mapdata\\fixmapdata{i}.py\", line {i}, in _fix_mtxm_0_0_null"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let page = build_log_page(&frames, &json!({"endLine": 1_000})).unwrap();
+        assert!(double_escaped_len(&page) <= BUILD_LOG_PAGE_BYTES);
+        let count = page["count"].as_u64().unwrap();
+        assert!(count < 400, "{count}");
+        assert_eq!(page["hasMore"], true);
+        assert_eq!(page["nextLine"], count + 1);
+        let query_page =
+            build_log_page(&frames, &json!({"query": "fixmapdata", "endLine": 1_000})).unwrap();
+        assert!(double_escaped_len(&query_page) <= BUILD_LOG_PAGE_BYTES);
+        assert_eq!(query_page["hasMore"], true);
+        assert_eq!(
+            query_page["nextLine"],
+            query_page["count"].as_u64().unwrap() + 1
+        );
     }
 
     #[test]

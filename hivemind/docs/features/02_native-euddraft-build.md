@@ -50,10 +50,10 @@ Requirement and TBL output follow the Editor's `WriteReqFile`/`tblReader`/`tblWr
 
 - explicit EDS argument and working directory;
 - bounded timeout;
-- captured stdout/stderr;
+- captured stdout/stderr, persisted completely as `build/euddraft/build.log`;
 - project-scoped build marker;
 - required fresh output map;
-- structured file/line diagnostics.
+- structured file/line diagnostics: one error per traceback (innermost project frame, final exception line as message), one epScript error per `[Error N] Module "m" Line n : text` line mapped through the `[epScript] Compiling` listing, and one warning per `warn_with_traceback` stack or `[Warning]` line (identical warnings merge with a `count`). Warnings never fail the build. euddraft's post-failure `input()` `EOFError` under the launcher's closed stdin is classified as a warning because it is the launcher's artifact. The log is removed before each run and a failed log write becomes a warning rather than a lost verdict.
 
 The sibling `../euddraft` repository is read-only. Missing private source modules are not patched; installed euddraft is a supported configured executable.
 

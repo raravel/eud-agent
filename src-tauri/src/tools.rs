@@ -14,11 +14,8 @@ use thiserror::Error;
 
 /// Build verification tool name, exempt from the evidence gate.
 pub const BUILD_RUN_TOOL: &str = "build_run";
-/// Isolated runtime trace test tool name.
-pub const TRACE_TEST_RUN_TOOL: &str = "trace_test_run";
-/// Source-controlled persistent runtime regression suite tool name.
-pub const TRACE_SUITE_RUN_TOOL: &str = "trace_suite_run";
-
+/// Bounded read of the complete log of the last `build_run`.
+pub const BUILD_LOG_READ_TOOL: &str = "build_log_read";
 /// Documentation search tool name.
 pub const SEARCH_DOCS_TOOL: &str = "search_docs";
 /// Exact documentation-chunk lookup tool name.
@@ -1036,48 +1033,17 @@ pub fn tool_registry() -> Vec<ToolSpec> {
         ),
         project_operation_tool(
             BUILD_RUN_TOOL,
-            "Generate deterministic native build artifacts, run configured euddraft, require a fresh output map, and return structured diagnostics.",
+            "Generate deterministic native build artifacts, run configured euddraft, require a fresh output map, and return structured diagnostics: errors and warnings with file/line/message, a bounded outputExcerpt, and logPath of the complete log.",
             empty_schema(),
         ),
         read_tool(
-            TRACE_TEST_RUN_TOOL,
-            "Build and run one isolated epScript runtime test after a successful build_run. The owned 32-bit client is created suspended; a bounded x86 helper validates StarCraft.exe and neutralizes only its foreground/focus/cursor user32 calls before resume. The minimized off-screen client then receives LAN/UDP CreateGame and Alt+O through background window messages, with no global input or focus fallback. The source project/map remain unchanged.",
+            BUILD_LOG_READ_TOOL,
+            "Read the complete stdout/stderr log of this project's last build_run (build/euddraft/build.log) by 1-based line range (default 200, at most 400 lines per call), or only the lines containing `query` (case-insensitive, at most 200 matches). Use it when the build_run outputExcerpt is not enough; continue from nextLine.",
             schema(
                 json!({
-                    "name": {"type": "string", "minLength": 1, "maxLength": 512},
-                    "code": {"type": "string", "minLength": 1, "maxLength": 131072},
-                    "symbols": {
-                        "type": "array",
-                        "maxItems": 256,
-                        "items": {
-                            "type": "object",
-                            "additionalProperties": false,
-                            "properties": {
-                                "eventId": {"type": "integer", "minimum": 0, "maximum": 4294967295_u64},
-                                "name": {"type": "string", "minLength": 1, "maxLength": 128},
-                                "source": {"type": "string", "maxLength": 512},
-                                "line": {"type": "integer", "minimum": 1, "maximum": 4294967295_u64}
-                            },
-                            "required": ["eventId", "name"]
-                        }
-                    },
-                    "timeoutMs": {"type": "integer", "minimum": 1000, "maximum": 120000}
-                }),
-                &["name", "code"],
-            ),
-        ),
-        read_tool(
-            TRACE_SUITE_RUN_TOOL,
-            "Discover and run up to 256 source-controlled src/tests/**/*.tests.eps after a successful build_run. Omit tests for the complete suite or provide exact logical project paths. Every owned 32-bit client is suspended until a bounded x86 helper neutralizes its foreground/focus/cursor user32 calls, then remains minimized and uses only background messages for LAN/UDP CreateGame and Alt+O. Results are diagnostic and the source project/map remain unchanged.",
-            schema(
-                json!({
-                    "tests": {
-                        "type": "array",
-                        "minItems": 1,
-                        "maxItems": 256,
-                        "items": {"type": "string", "minLength": 1, "maxLength": 512}
-                    },
-                    "timeoutMs": {"type": "integer", "minimum": 1000, "maximum": 120000}
+                    "startLine": integer_schema(),
+                    "endLine": integer_schema(),
+                    "query": string_schema(),
                 }),
                 &[],
             ),
@@ -4451,9 +4417,11 @@ mod tests {
         crate::native_build::NativeBuildResult {
             ok,
             errors,
+            warnings: Vec::new(),
             raw_status: u32::from(!ok),
             stdout: String::new(),
             stderr: String::new(),
+            log_path: "build/euddraft/build.log".to_string(),
             artifacts: crate::native_build::NativeBuildArtifacts {
                 build_dir: "build".to_string(),
                 wireframe_editor: None,
@@ -4475,6 +4443,7 @@ mod tests {
             line: 7,
             message: "undefined symbol".to_string(),
             raw: raw.to_string(),
+            count: 1,
         }
     }
 
@@ -5789,44 +5758,13 @@ mod tests {
             ),
             ("build_run", false, schema(serde_json::json!({}), &[])),
             (
-                "trace_test_run",
+                BUILD_LOG_READ_TOOL,
                 false,
                 schema(
                     serde_json::json!({
-                        "name": {"type": "string", "minLength": 1, "maxLength": 512},
-                        "code": {"type": "string", "minLength": 1, "maxLength": 131072},
-                        "symbols": {
-                            "type": "array",
-                            "maxItems": 256,
-                            "items": {
-                                "type": "object",
-                                "additionalProperties": false,
-                                "properties": {
-                                    "eventId": {"type": "integer", "minimum": 0, "maximum": 4294967295_u64},
-                                    "name": {"type": "string", "minLength": 1, "maxLength": 128},
-                                    "source": {"type": "string", "maxLength": 512},
-                                    "line": {"type": "integer", "minimum": 1, "maximum": 4294967295_u64}
-                                },
-                                "required": ["eventId", "name"]
-                            }
-                        },
-                        "timeoutMs": {"type": "integer", "minimum": 1000, "maximum": 120000}
-                    }),
-                    &["name", "code"],
-                ),
-            ),
-            (
-                "trace_suite_run",
-                false,
-                schema(
-                    serde_json::json!({
-                        "tests": {
-                            "type": "array",
-                            "minItems": 1,
-                            "maxItems": 256,
-                            "items": {"type": "string", "minLength": 1, "maxLength": 512}
-                        },
-                        "timeoutMs": {"type": "integer", "minimum": 1000, "maximum": 120000}
+                        "startLine": integer_schema(),
+                        "endLine": integer_schema(),
+                        "query": string_schema(),
                     }),
                     &[],
                 ),
