@@ -354,6 +354,129 @@ async fn clarify_asks_the_user_then_retriages_with_the_answer() {
 }
 
 #[tokio::test]
+async fn unanswered_clarify_ask_hands_off_as_text_and_the_next_message_answers_it() {
+    let driver = FakeCodexDriver::scripted([AgentTurnResult::Answer {
+        text: "스폰 수를 줄였습니다.".to_string(),
+    }]);
+    let handle = driver.clone();
+    handle.script_delegated([
+        result(json!({
+            "route": "clarify", "goal": "밸런스", "acceptanceCriteria": [], "rationale": "vague",
+            "questions": [{"id": "what", "question": "무엇을 조정할까요?", "options": [{"label": "스폰 수"}, {"label": "체력", "description": "유닛 HP"}]}]
+        })),
+        result(json!({
+            "route": "direct", "goal": "스폰 수 감소", "acceptanceCriteria": ["CreateUnit count decreases"], "rationale": "single site"
+        })),
+    ]);
+    let sink = CapturingEventSink::default();
+    let mut engine = test_engine(driver, sink.clone());
+    let dirs = engine.runtime.data_dirs();
+    dirs.ensure_dirs().unwrap();
+    native_workspace_snapshot(&dirs, "ExampleProject");
+    let runtime = engine.runtime.clone();
+    let asks = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen = asks.clone();
+    // Nobody answers the card: the bounded wait elapses.
+    runtime.set_ask_emitter(move |event: ipc::AskEvent| {
+        seen.lock().unwrap().push(event);
+        Ok(())
+    });
+    runtime.set_ask_wait_timeout(std::time::Duration::from_millis(30));
+
+    engine
+        .chat(chat("밸런스 좀 맞춰줘"))
+        .await
+        .expect("an unanswered clarify ask is a text handoff, not a failure");
+
+    let statuses = asks
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|event| event.status)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        statuses,
+        vec![ipc::AskEventStatus::Pending, ipc::AskEventStatus::Expired]
+    );
+    let answer = sink
+        .events()
+        .into_iter()
+        .find_map(|event| match event {
+            EngineEvent::Answer(answer) => Some(answer.text),
+            _ => None,
+        })
+        .expect("the turn ends with the questions as its answer");
+    assert!(answer.contains("1. 무엇을 조정할까요?"), "{answer}");
+    assert!(answer.contains("- 스폰 수"), "{answer}");
+    assert!(answer.contains("- 체력 — 유닛 HP"), "{answer}");
+    assert_eq!(stages(&sink).last(), Some(&WorkflowStage::Done));
+    assert!(!stages(&sink).contains(&WorkflowStage::Failed));
+    assert_eq!(engine.phase, Phase::Idle);
+    let state = engine
+        .session_store
+        .load(&engine.session_id)
+        .unwrap()
+        .workflow
+        .unwrap();
+    let pending = state
+        .pending_clarification
+        .expect("the handed-off questions persist for the next message");
+    assert_eq!(pending.questions[0].id, "what");
+    assert_eq!(pending.rounds, 0);
+    assert_eq!(handle.delegated_requests().len(), 1);
+    assert!(handle.prompts().is_empty());
+
+    // The next message is the reply: triage continues the original request
+    // with it, and the direct route reaches the foreground turn.
+    engine.chat(chat("스폰 수")).await.unwrap();
+
+    let requests = handle.delegated_requests();
+    assert_eq!(requests.len(), 2);
+    assert!(
+        requests[1].1.contains("[user message]\n밸런스 좀 맞춰줘"),
+        "{}",
+        requests[1].1
+    );
+    assert!(
+        requests[1]
+            .1
+            .contains("[clarification]\nround 1: 무엇을 조정할까요? → 스폰 수"),
+        "{}",
+        requests[1].1
+    );
+    assert!(
+        requests[1].1.contains("1 clarify round(s) remain"),
+        "{}",
+        requests[1].1
+    );
+    let prompts = handle.prompts();
+    assert_eq!(prompts.len(), 1);
+    assert!(
+        prompts[0].contains(
+            "[clarification]\noriginal request: 밸런스 좀 맞춰줘\nround 1: 무엇을 조정할까요? → 스폰 수"
+        ),
+        "{}",
+        prompts[0]
+    );
+    let state = engine
+        .session_store
+        .load(&engine.session_id)
+        .unwrap()
+        .workflow
+        .unwrap();
+    assert_eq!(state.route, Some(WorkflowRoute::Direct));
+    assert_eq!(state.user_text, "밸런스 좀 맞춰줘");
+    assert_eq!(state.clarifications.len(), 1);
+    assert!(state.pending_clarification.is_none());
+    assert_eq!(
+        asks.lock().unwrap().len(),
+        2,
+        "the reply never reopens an ask card"
+    );
+    fs::remove_dir_all(dirs.app_data()).ok();
+}
+
+#[tokio::test]
 async fn approval_executes_verifies_fixes_once_and_reaches_review() {
     let driver = FakeCodexDriver::scripted([
         AgentTurnResult::Answer {

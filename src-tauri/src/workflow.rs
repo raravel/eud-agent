@@ -173,8 +173,23 @@ pub struct WorkflowState {
     pub user_text: String,
     #[serde(default)]
     pub clarifications: Vec<String>,
+    /// A clarify ask whose bounded wait elapsed: the questions were restated
+    /// as the turn's text answer and the user's next message is the reply.
+    /// The next staged request continues this triage instead of starting
+    /// one of its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_clarification: Option<PendingClarification>,
     pub started_at: u64,
     pub updated_at: u64,
+}
+
+/// The triage questions handed off as plain text after an unanswered clarify
+/// ask, with the clarify rounds already spent on this request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingClarification {
+    pub questions: Vec<crate::ipc::AskQuestion>,
+    pub rounds: u8,
 }
 
 const fn schema_version() -> u32 {
@@ -208,9 +223,26 @@ impl WorkflowState {
             error: None,
             user_text,
             clarifications: Vec::new(),
+            pending_clarification: None,
             started_at: now,
             updated_at: now,
         }
+    }
+
+    /// Seed a new request from a workflow that ended with a handed-off
+    /// clarify ask: the original request text and earlier clarifications carry
+    /// over, `reply` (the user's next message) answers the pending questions,
+    /// and the rounds already spent are returned so the clarify budget stays
+    /// bounded across the handoff.
+    pub fn continue_clarification(&mut self, previous: &WorkflowState, reply: &str) -> u8 {
+        let Some(pending) = previous.pending_clarification.as_ref() else {
+            return 0;
+        };
+        self.user_text = previous.user_text.clone();
+        self.clarifications = previous.clarifications.clone();
+        self.clarifications
+            .push(render_text_clarification(&pending.questions, reply));
+        pending.rounds.saturating_add(1)
     }
 
     pub fn max_critique_rounds(&self) -> u8 {
@@ -930,12 +962,46 @@ fn clarification_section(clarifications: &[String]) -> String {
     out
 }
 
+/// One clarification round answered in free text (the user's next message
+/// after a handed-off ask) instead of through the ask card: every pending
+/// question shares the single reply.
+pub fn render_text_clarification(questions: &[crate::ipc::AskQuestion], reply: &str) -> String {
+    let questions = questions
+        .iter()
+        .map(|question| question.question.as_str())
+        .collect::<Vec<_>>()
+        .join(" / ");
+    format!("{questions} → {}", reply.trim())
+}
+
+/// The plain-text answer that ends a turn whose clarify ask went unanswered:
+/// the same questions, restated for the user to answer in the next message.
+pub fn clarification_handoff_text(
+    questions: &[crate::ipc::AskQuestion],
+    wait_seconds: u64,
+) -> String {
+    let mut out = format!(
+        "질문 답변 대기 시간({wait_seconds}초)이 지나 질문을 텍스트로 남깁니다. 다음 메시지로 답해 주시면 이어서 진행합니다.\n"
+    );
+    for (index, question) in questions.iter().enumerate() {
+        out.push_str(&format!("\n{}. {}", index + 1, question.question));
+        for option in &question.options {
+            out.push_str(&format!("\n   - {}", option.label));
+            if let Some(description) = option.description.as_deref() {
+                out.push_str(&format!(" — {description}"));
+            }
+        }
+    }
+    out
+}
+
 pub fn triage_prompt(context: &StageContext<'_>, clarify_rounds_left: u8) -> String {
     format!(
         "[role]\nYou triage one user request for the native EUD project agent. Decide how it must be handled; do not do the work.\n\n\
 [routes]\n\
 - answer: a question or explanation that changes nothing.\n\
 - direct: one clearly specified single-site change whose target and value are explicit in the message and the project (rename one thing, change one value, add one line).\n\
+- direct also covers a request whose change is map placement only (terrain, units, buildings, doodads, sprites, or a drawn region): the foreground hands it to the Map Agent with map_task_request and the user applies the candidate in the Map window; choose pipeline only when it also needs EPS code.\n\
 - pipeline: any other change: new behavior, multiple files, unclear placement, a bug to diagnose, anything needing design or investigation.\n\
 - clarify: the goal, target, or acceptance is materially ambiguous and a short question would change the work. {} clarify round(s) remain; when none remain, choose answer and state in `goal` what is missing.\n\n\
 [output]\n\

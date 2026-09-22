@@ -1351,8 +1351,10 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
             && execution_mode == crate::autonomous::ExecutionMode::Interactive;
         let mut route_note = None;
         if !staged {
-            // A leftover staged request never adopts an autonomous or Map turn.
+            // A leftover staged request never adopts an autonomous or Map turn,
+            // and a handed-off clarify question is not answered by one either.
             self.workflow_cancel_if_active()?;
+            self.workflow_drop_pending_clarification()?;
         }
         if staged {
             match self
@@ -1367,7 +1369,7 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
                     route_note = Some(self.workflow_route_note(route));
                 }
             }
-            if let Some(clarification) = self.workflow_clarification_text() {
+            if let Some(clarification) = self.workflow_clarification_text(&user_text) {
                 user_text.push_str("\n\n");
                 user_text.push_str(&clarification);
             }

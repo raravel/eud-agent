@@ -17,6 +17,7 @@ use crate::{
         RuntimeExecutor, WorkspaceAccess,
     },
     provider_tool_loop::DelegatedToolProfile,
+    tool_exec::EngineAskOutcome,
     workflow::{
         self, ArtifactRef, PlanArtifact, PlanReviewRecord, StageContext, TriageResult,
         VerifyResult, WorkflowRoute, WorkflowStage, WorkflowState, MAX_CLARIFY_ROUNDS,
@@ -117,6 +118,21 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
         Ok(())
     }
 
+    /// Forget a handed-off clarify ask when a non-staged request (autonomous,
+    /// Map) takes the session: the next interactive message is then an
+    /// ordinary new request, not the reply to those questions.
+    pub(super) fn workflow_drop_pending_clarification(&mut self) -> Result<(), AgentEngineError> {
+        let Some(stage) = self
+            .workflow
+            .as_ref()
+            .filter(|state| state.pending_clarification.is_some())
+            .map(|state| state.stage)
+        else {
+            return Ok(());
+        };
+        self.workflow_transition(stage, |state| state.pending_clarification = None)
+    }
+
     pub(super) fn workflow_fail_if_active(
         &mut self,
         message: &str,
@@ -192,8 +208,8 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
             .map_err(AgentEngineError::new)
     }
 
-    /// The static authoring guidance the read-only stages share. Build and
-    /// trace guidance describes tools only the verifier has; Map/audio/mention
+    /// The static authoring guidance the read-only stages share. Build
+    /// guidance describes a tool only the verifier has; Map/audio/mention
     /// guides are foreground-only.
     fn stage_guides() -> String {
         [
@@ -366,7 +382,7 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
         // Chat requires an open project; the revision is only resume
         // validation, so an unavailable one degrades to an empty token.
         let revision = self.runtime.current_project_revision().unwrap_or_default();
-        let state = WorkflowState::new(
+        let mut state = WorkflowState::new(
             request_id.to_string(),
             client_turn_id.to_string(),
             revision,
@@ -374,9 +390,18 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
             self.deep_planning_setting(),
             now(),
         );
+        // The previous request ended by restating an unanswered clarify ask as
+        // text: this message is its reply, so triage continues that request
+        // (original text, earlier answers, spent rounds) instead of a fresh one.
+        let mut rounds = self
+            .workflow
+            .take()
+            .filter(|previous| previous.pending_clarification.is_some())
+            .map_or(0_u8, |previous| {
+                state.continue_clarification(&previous, user_text)
+            });
         self.persist_workflow(state)?;
         let guides = String::new();
-        let mut rounds = 0_u8;
         loop {
             let project = self.stage_project_context(user_text);
             let prompt = {
@@ -437,7 +462,23 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
                 .ask_for_request(request_id, questions.clone())
                 .await
             {
-                Ok(answers) => answers,
+                Ok(EngineAskOutcome::Answered(answers)) => answers,
+                Ok(EngineAskOutcome::Unanswered { waited_seconds }) => {
+                    // The bounded wait elapsed. As with the `ask` tool, the
+                    // turn ends with the questions as its text answer and the
+                    // user's next message is the reply; nothing failed.
+                    let pending = workflow::PendingClarification {
+                        questions: questions.clone(),
+                        rounds,
+                    };
+                    self.workflow_transition(WorkflowStage::Done, |state| {
+                        state.pending_clarification = Some(pending);
+                    })?;
+                    self.handle_turn_result(AgentTurnResult::Answer {
+                        text: workflow::clarification_handoff_text(&questions, waited_seconds),
+                    })?;
+                    return Ok(TriageDecision::Handled);
+                }
                 Err(error) if error.contains("cancelled") => {
                     self.workflow_cancel()?;
                     self.phase = Phase::Idle;
@@ -477,13 +518,19 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
         format!("[route]\n{decision}\ngoal: {goal}\nrationale: {rationale}")
     }
 
-    /// The clarification answers, for the ordinary foreground routes.
-    pub(super) fn workflow_clarification_text(&self) -> Option<String> {
+    /// The clarification answers, for the ordinary foreground routes. When the
+    /// request continued a handed-off clarify ask, `user_text` is only the
+    /// reply, so the original request is restated first: no provider turn ran
+    /// for it.
+    pub(super) fn workflow_clarification_text(&self, user_text: &str) -> Option<String> {
         let state = self.current_workflow()?;
         if state.clarifications.is_empty() {
             return None;
         }
         let mut out = String::from("[clarification]\n");
+        if state.user_text != user_text {
+            out.push_str(&format!("original request: {}\n", state.user_text));
+        }
         for (index, answer) in state.clarifications.iter().enumerate() {
             out.push_str(&format!("round {}: {}\n", index + 1, answer));
         }

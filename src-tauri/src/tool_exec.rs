@@ -228,6 +228,16 @@ struct PendingAsk {
     response: tokio::sync::oneshot::Sender<Result<BTreeMap<String, crate::ipc::AskAnswer>, String>>,
 }
 
+/// Result of an engine-issued ask (`ask_for_request`).
+#[derive(Debug)]
+pub(crate) enum EngineAskOutcome {
+    Answered(BTreeMap<String, crate::ipc::AskAnswer>),
+    /// The bounded wait elapsed; the caller restates the questions as text.
+    Unanswered {
+        waited_seconds: u64,
+    },
+}
+
 /// The one ask of the current foreground run whose bounded wait elapsed.
 struct ExpiredAsk {
     ask_request_id: String,
