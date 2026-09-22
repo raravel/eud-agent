@@ -140,4 +140,43 @@ describe("SessionSidebar", () => {
     }).format(new Date(lastConversationAt));
     expect(screen.getByText(`· ${formatted}`)).toBeInTheDocument();
   });
+
+  it("shows each session's short id and copies the full id from the row", () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", {
+      value: { writeText },
+      configurable: true,
+    });
+    const fullId = "a3f9c2d1-7b1e-4c2a-9d0f-1234567890ab";
+    render(
+      <SessionSidebar
+        {...props({
+          rows: [
+            {
+              id: fullId,
+              name: "짧은 ID 확인",
+              lastConversationAt: 10_000,
+              activity: "idle",
+              persisted: true,
+            },
+          ],
+          selectedId: fullId,
+        })}
+      />,
+    );
+
+    expect(screen.getByText("a3f9c2d1")).toBeInTheDocument();
+    expect(screen.queryByText(fullId)).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "짧은 ID 확인 세션 ID 복사" }));
+    expect(writeText).toHaveBeenCalledWith(fullId);
+    Reflect.deleteProperty(navigator, "clipboard");
+  });
+
+  it("hides the copy action while collapsed", () => {
+    render(<SessionSidebar {...props({ collapsed: true })} />);
+
+    expect(
+      screen.queryByRole("button", { name: "트리거 수정 세션 ID 복사" }),
+    ).not.toBeInTheDocument();
+  });
 });

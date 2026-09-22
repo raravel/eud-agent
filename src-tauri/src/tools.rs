@@ -33,6 +33,46 @@ pub const ASK_TOOL: &str = "ask";
 /// progress notifications do not extend it (measured 2026-09-17, `verify.md`),
 /// so no single tool call may wait longer than this.
 pub const ASK_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(240);
+/// Flow-control tool that runs one isolated read-only child run and returns
+/// only its schema-validated summary to the calling foreground run.
+pub const DELEGATE_READ_TOOL: &str = "delegate_read";
+/// Bounded wait for one `delegate_read` child run; it shares the
+/// [`ASK_WAIT_TIMEOUT`] native MCP ceiling because the parent's tool call
+/// waits for the whole child.
+pub const DELEGATE_READ_TIMEOUT: std::time::Duration = ASK_WAIT_TIMEOUT;
+/// Soft per-foreground-run cap on `delegate_read` calls. Exceeding it is a
+/// correctable usage error, never a run boundary.
+pub const DELEGATE_READ_RUN_LIMIT: u8 = 8;
+/// EPS → Map team handoff: hand placement work to the session's team Map
+/// session and wait (bounded) for its candidate.
+pub const MAP_TASK_REQUEST_TOOL: &str = "map_task_request";
+/// Re-read one team task's durable status within the same turn.
+pub const MAP_TASK_STATUS_TOOL: &str = "map_task_status";
+/// Read a ready team candidate's diff and verification.
+pub const MAP_TASK_DIFF_TOOL: &str = "map_task_diff";
+/// Read one object layer of a ready team candidate.
+pub const MAP_TASK_OBJECTS_TOOL: &str = "map_task_objects";
+/// Render a crop of a ready team candidate.
+pub const MAP_TASK_RENDER_TOOL: &str = "map_task_render";
+/// Apply a ready team candidate to the source map after inspecting it.
+pub const MAP_TASK_APPLY_TOOL: &str = "map_task_apply";
+/// Discard a ready team candidate without changing the source map.
+pub const MAP_TASK_DISCARD_TOOL: &str = "map_task_discard";
+/// The reads that count as inspecting a team candidate before `map_task_apply`.
+pub const TEAM_CANDIDATE_READ_TOOLS: &[&str] = &[
+    MAP_TASK_DIFF_TOOL,
+    MAP_TASK_OBJECTS_TOOL,
+    MAP_TASK_RENDER_TOOL,
+];
+/// EPS map tools excluded while a team task is active for the request, so the
+/// EPS session and the Map candidate never overwrite the same layers.
+pub const TEAM_EXCLUDED_MAP_TOOLS: &[&str] = &[
+    "location_write",
+    SWITCH_WRITE_TOOL,
+    "player_setup",
+    MAP_SOUND_IMPORT_TOOL,
+    MAP_SOUND_EDIT_TOOL,
+];
 
 /// Soft action threshold for one foreground iteration.
 pub const ITERATION_TOOL_ACTION_THRESHOLD: usize = 300;
@@ -112,6 +152,15 @@ pub struct RequestState {
     /// Set once a `search_docs` call has run successfully, even with zero hits.
     pub docs_searched: bool,
 
+    /// Set once `map_info` ran successfully in this request: the evidence a
+    /// `map_task_request` needs before handing placement work to Map Agent.
+    pub map_inspected: bool,
+
+    /// The team task whose candidate this request inspected last
+    /// (`map_task_diff`/`map_task_objects`/`map_task_render`): the evidence
+    /// `map_task_apply` needs for that task.
+    pub candidate_inspected: Option<String>,
+
     /// Number of admitted tool actions across the request.
     pub action_count: usize,
 
@@ -164,6 +213,8 @@ impl RequestState {
         Self {
             request_id: id.to_string(),
             docs_searched: false,
+            map_inspected: false,
+            candidate_inspected: None,
             action_count: 0,
             iteration_action_count: 0,
             read_action_count: 0,
@@ -218,6 +269,21 @@ impl RequestState {
     /// Record that `search_docs` ran successfully for this request.
     pub fn record_search_docs(&mut self) {
         self.docs_searched = true;
+    }
+
+    /// Record that `map_info` ran successfully for this request.
+    pub fn record_map_inspection(&mut self) {
+        self.map_inspected = true;
+    }
+
+    /// Record that this request inspected team task `task_id`'s candidate.
+    pub fn record_candidate_inspection(&mut self, task_id: &str) {
+        self.candidate_inspected = Some(task_id.to_string());
+    }
+
+    /// Whether this request inspected team task `task_id`'s candidate.
+    pub fn candidate_inspected(&self, task_id: &str) -> bool {
+        self.candidate_inspected.as_deref() == Some(task_id)
     }
 
     pub fn search_identity(args: &Value) -> String {
@@ -1106,6 +1172,106 @@ pub fn tool_registry() -> Vec<ToolSpec> {
             "propose_plan",
             "Propose a plan for approval only when the user explicitly requested a plan in this turn; staged requests plan through their own stage.",
             schema(json!({"markdown": string_schema()}), &["markdown"]),
+        ),
+        read_tool(
+            MAP_TASK_REQUEST_TOOL,
+            "Hand terrain, unit, building, doodad, sprite, or location placement to this session's team Map Agent session, which drafts a candidate revision the user reviews and applies in the Map window; this session has no placement tools of its own. Call map_info first (required evidence), then give the goal (the user's own request and intent in the user's language plus only the constraints the code depends on: bounds, keep-clear cells, location ids, walkability; the Map Agent chooses the medium, palette entries, counts, and layout itself), the layers the Map Agent may change (every layer the look may need; narrow only when the user or the code requires it), optional persistent selection ids from [resolved mentions] as the target scope, and optional exact location ids as context. The call waits up to 240 seconds: candidate_ready returns the revision summary, running means the Map Agent is still working; on candidate_ready inspect the candidate (map_task_diff, map_task_objects, map_task_render) and then map_task_apply it, or map_task_discard it, or send another map_task_request with a corrected complete goal (allowed while a candidate is ready: the earlier task is superseded and its candidate dropped; the new task starts in a fresh team session from the saved map, so the goal must describe the whole result, not a delta); on running end the turn and continue when the next message reports the task. The app opens the Map window on the team session itself when the candidate is ready, so never ask the user to open it beforehand and never require an open window to call this tool. Until the task is applied nothing exists in the source map, so do not build code that references objects it creates. While a task is queued, running, or candidate_ready, location_write, switch_write, player_setup, and map sound tools are refused.",
+            schema(
+                json!({
+                    "goal": {"type": "string", "minLength": 1, "maxLength": 4000},
+                    "layers": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 6,
+                        "items": {"type": "string", "enum": ["terrain", "units", "buildings", "doodads", "sprites", "locations"]}
+                    },
+                    "selectionIds": {
+                        "type": "array",
+                        "maxItems": 8,
+                        "items": {"type": "string", "minLength": 1, "maxLength": 128}
+                    },
+                    "locationIds": {
+                        "type": "array",
+                        "maxItems": 16,
+                        "items": {"type": "integer", "minimum": 0, "maximum": 254}
+                    }
+                }),
+                &["goal", "layers"],
+            ),
+        ),
+        read_tool(
+            MAP_TASK_STATUS_TOOL,
+            "Read one team map task's current durable status ({taskId, status: queued|running|candidate_ready|applied|discarded|failed|cancelled|interrupted|superseded, candidate?, applied, appliedBy?}). Use it after map_task_request returned running; do not poll repeatedly within one turn.",
+            schema(
+                json!({ "taskId": {"type": "string", "minLength": 1, "maxLength": 128} }),
+                &["taskId"],
+            ),
+        ),
+        read_tool(
+            MAP_TASK_DIFF_TOOL,
+            "Read a candidate_ready team task's candidate: its revision, per-layer diff counts against the saved source map, and the verification report. This is candidate inspection evidence for map_task_apply.",
+            schema(
+                json!({ "taskId": {"type": "string", "minLength": 1, "maxLength": 128} }),
+                &["taskId"],
+            ),
+        ),
+        read_tool(
+            MAP_TASK_OBJECTS_TOOL,
+            "Read one object layer (units, buildings, doodads, sprites, or locations) of a candidate_ready team task's candidate map, paged, with each object's position and identity. Use it to check exactly what the Map Agent placed before applying; this is candidate inspection evidence for map_task_apply.",
+            schema(
+                json!({
+                    "taskId": {"type": "string", "minLength": 1, "maxLength": 128},
+                    "layer": enum_string_schema(&["units", "buildings", "doodads", "sprites", "locations"]),
+                    "offset": integer_schema(),
+                    "limit": integer_schema(),
+                }),
+                &["taskId", "layer"],
+            ),
+        ),
+        read_tool(
+            MAP_TASK_RENDER_TOOL,
+            "Render a bounded tile crop (x, y, width, height in tiles) of a candidate_ready team task's candidate map with actual terrain and object assets, as an image. Use it to see the placement before applying; this is candidate inspection evidence for map_task_apply.",
+            schema(
+                json!({
+                    "taskId": {"type": "string", "minLength": 1, "maxLength": 128},
+                    "x": integer_schema(), "y": integer_schema(),
+                    "width": integer_schema(), "height": integer_schema(),
+                    "scale": render_scale_schema(),
+                    "layers": {"type": "array", "items": string_schema()},
+                }),
+                &["taskId", "x", "y", "width", "height"],
+            ),
+        ),
+        canonical_tool(
+            MAP_TASK_APPLY_TOOL,
+            "Apply a candidate_ready team task's candidate to the source map. Allowed only after this request inspected that task's candidate with map_task_diff, map_task_objects, or map_task_render and you judged it to meet the goal; the apply runs the same backup, verification, and rollback as the Map window's Apply, and the user can undo it from the Map window. After it succeeds, re-read map_info before referencing what was placed.",
+            schema(
+                json!({ "taskId": {"type": "string", "minLength": 1, "maxLength": 128} }),
+                &["taskId"],
+            ),
+        ),
+        read_tool(
+            MAP_TASK_DISCARD_TOOL,
+            "Discard a candidate_ready team task's candidate: the source map stays unchanged and the team session returns to the saved map. Use it when the goal is no longer wanted; a corrected map_task_request also drops the candidate on its own.",
+            schema(
+                json!({ "taskId": {"type": "string", "minLength": 1, "maxLength": 128} }),
+                &["taskId"],
+            ),
+        ),
+        read_tool(
+            DELEGATE_READ_TOOL,
+            "Delegate one bounded exploration to an isolated read-only child run and receive only its structured summary ({summary, findings[{path,line,excerpt,note}], openQuestions, toolCalls}); the child's reads never enter your context. Use it for broad searches across sources, docs, DAT, or map data whose raw results you do not need verbatim. The child sees the project read tools except build, trace, dependency preparation, ask, and delegate_read; it cannot write and its findings are not mutation evidence: re-read a target yourself before editing it. The call waits up to 240 seconds; a failed, timed-out, or cancelled child returns a usage error, and at most 8 delegations are admitted per foreground run.",
+            schema(
+                json!({
+                    "goal": {"type": "string", "minLength": 1, "maxLength": 2000},
+                    "focus": {
+                        "type": "array",
+                        "maxItems": 16,
+                        "items": {"type": "string", "minLength": 1, "maxLength": 512}
+                    }
+                }),
+                &["goal"],
+            ),
         ),
     ]
 }
@@ -2169,7 +2335,8 @@ pub fn requires_project_transaction(tool_name: &str) -> bool {
 
 /// Return whether a tool is exempt from the EUD-090 evidence gate.
 pub fn is_evidence_gate_exempt(tool_name: &str) -> bool {
-    tool_name == BUILD_RUN_TOOL
+    // A team candidate apply is gated by candidate inspection instead of docs.
+    tool_name == BUILD_RUN_TOOL || tool_name == MAP_TASK_APPLY_TOOL
 }
 
 /// Check whether a tool call passes the EUD-090 evidence gate.
@@ -5884,6 +6051,106 @@ mod tests {
                 schema(
                     serde_json::json!({"markdown": string_schema()}),
                     &["markdown"],
+                ),
+            ),
+            (
+                MAP_TASK_REQUEST_TOOL,
+                false,
+                schema(
+                    serde_json::json!({
+                        "goal": {"type": "string", "minLength": 1, "maxLength": 4000},
+                        "layers": {
+                            "type": "array",
+                            "minItems": 1,
+                            "maxItems": 6,
+                            "items": {"type": "string", "enum": ["terrain", "units", "buildings", "doodads", "sprites", "locations"]}
+                        },
+                        "selectionIds": {
+                            "type": "array",
+                            "maxItems": 8,
+                            "items": {"type": "string", "minLength": 1, "maxLength": 128}
+                        },
+                        "locationIds": {
+                            "type": "array",
+                            "maxItems": 16,
+                            "items": {"type": "integer", "minimum": 0, "maximum": 254}
+                        }
+                    }),
+                    &["goal", "layers"],
+                ),
+            ),
+            (
+                MAP_TASK_STATUS_TOOL,
+                false,
+                schema(
+                    serde_json::json!({ "taskId": {"type": "string", "minLength": 1, "maxLength": 128} }),
+                    &["taskId"],
+                ),
+            ),
+            (
+                MAP_TASK_DIFF_TOOL,
+                false,
+                schema(
+                    serde_json::json!({ "taskId": {"type": "string", "minLength": 1, "maxLength": 128} }),
+                    &["taskId"],
+                ),
+            ),
+            (
+                MAP_TASK_OBJECTS_TOOL,
+                false,
+                schema(
+                    serde_json::json!({
+                        "taskId": {"type": "string", "minLength": 1, "maxLength": 128},
+                        "layer": {"type": "string", "enum": ["units", "buildings", "doodads", "sprites", "locations"]},
+                        "offset": {"type": "integer"},
+                        "limit": {"type": "integer"},
+                    }),
+                    &["taskId", "layer"],
+                ),
+            ),
+            (
+                MAP_TASK_RENDER_TOOL,
+                false,
+                schema(
+                    serde_json::json!({
+                        "taskId": {"type": "string", "minLength": 1, "maxLength": 128},
+                        "x": {"type": "integer"}, "y": {"type": "integer"},
+                        "width": {"type": "integer"}, "height": {"type": "integer"},
+                        "scale": render_scale_schema(),
+                        "layers": {"type": "array", "items": {"type": "string"}},
+                    }),
+                    &["taskId", "x", "y", "width", "height"],
+                ),
+            ),
+            (
+                MAP_TASK_APPLY_TOOL,
+                true,
+                schema(
+                    serde_json::json!({ "taskId": {"type": "string", "minLength": 1, "maxLength": 128} }),
+                    &["taskId"],
+                ),
+            ),
+            (
+                MAP_TASK_DISCARD_TOOL,
+                false,
+                schema(
+                    serde_json::json!({ "taskId": {"type": "string", "minLength": 1, "maxLength": 128} }),
+                    &["taskId"],
+                ),
+            ),
+            (
+                DELEGATE_READ_TOOL,
+                false,
+                schema(
+                    serde_json::json!({
+                        "goal": {"type": "string", "minLength": 1, "maxLength": 2000},
+                        "focus": {
+                            "type": "array",
+                            "maxItems": 16,
+                            "items": {"type": "string", "minLength": 1, "maxLength": 512}
+                        }
+                    }),
+                    &["goal"],
                 ),
             ),
         ]

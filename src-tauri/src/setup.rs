@@ -1885,6 +1885,7 @@ mod tests {
                 model: "gpt-test".to_string(),
                 created_at: 1_718_000_000,
                 last_conversation_at: 1_718_000_000_000,
+                team_parent: None,
             },
             provider_binding: crate::provider::ProviderBinding {
                 provider: crate::provider::ProviderId::Codex,
@@ -1908,6 +1909,7 @@ mod tests {
             task_state: Default::default(),
             autonomous_run: None,
             workflow: None,
+            team_tasks: Vec::new(),
         };
         sessions.save(&session).unwrap();
         let original_session_path = dirs

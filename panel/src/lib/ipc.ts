@@ -148,6 +148,8 @@ const PUSH_EVENT_TYPES = [
   "answer",
   "plan",
   "ask",
+  "delegation",
+  "team_task",
   "changeset",
   "workflow",
   "harness_job",

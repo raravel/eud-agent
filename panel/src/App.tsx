@@ -647,6 +647,7 @@ export default function App() {
         if (record.contextUsage !== undefined) {
           existing.store.contextUsageReceived(record.contextUsage);
         }
+        existing.store.setTeamTasks(record.teamTasks ?? []);
         existing.persisted = true;
         bumpSessions();
         void syncHarnessJobs(existing);
@@ -658,6 +659,7 @@ export default function App() {
       if (record.contextUsage !== undefined) {
         sessionStore.contextUsageReceived(record.contextUsage);
       }
+      sessionStore.setTeamTasks(record.teamTasks ?? []);
       const slot: SessionSlot = {
         id: record.id,
         meta: record,
@@ -1227,6 +1229,55 @@ export default function App() {
             });
           }
           targetSlot.store.askReceived(msg.requestId, msg.questions, msg.waitSeconds);
+          break;
+        }
+        case "delegation": {
+          const targetSlot = sessionsRef.current.get(msg.sessionId);
+          if (!targetSlot) break;
+          const { type: _type, sessionId: _sessionId, ...event } = msg;
+          targetSlot.store.delegationReceived(event);
+          break;
+        }
+        case "team_task": {
+          const targetSlot = sessionsRef.current.get(msg.sessionId);
+          if (!targetSlot) break;
+          const previous = targetSlot.store
+            .getState()
+            .teamTasks.find((task) => task.id === msg.task.id);
+          targetSlot.store.teamTaskReceived(msg.task);
+          if (previous?.status.kind !== msg.task.status.kind) {
+            if (msg.task.status.kind === "candidate_ready") {
+              targetSlot.store.log(
+                "agent",
+                `맵 에이전트가 후보 r${msg.task.candidate?.revision ?? "?"}을 만들었습니다. AI가 이어서 검토합니다. 맵 창에서 직접 적용하거나 폐기할 수도 있습니다.`,
+              );
+              void attentionNotify(
+                "changesetReview",
+                !document.hasFocus(),
+                targetSlot.id,
+              ).catch(() => {
+                // Delivery is best-effort and must not disturb the task state.
+              });
+            } else if (msg.task.status.kind === "applied") {
+              targetSlot.store.log("agent", "맵 후보가 적용되었습니다. 이어서 진행할 수 있습니다.");
+            } else if (msg.task.status.kind === "failed") {
+              targetSlot.store.log("warn", `맵 작업을 완료하지 못했습니다: ${msg.task.status.reason}`);
+            }
+          }
+          if (msg.continuation) {
+            // The engine started the continuation turn itself (the task
+            // settled after its tool call returned `running`): record it as
+            // the user turn it stands for, ahead of the turn's own stream.
+            targetSlot.store.log(
+              "you",
+              msg.continuation.text,
+              undefined,
+              [],
+              [],
+              msg.continuation.clientTurnId,
+            );
+            targetSlot.store.chatSent();
+          }
           break;
         }
         case "plan": {
@@ -3081,8 +3132,11 @@ export default function App() {
     return () => media.removeEventListener("change", adaptSessionSidebar);
   }, []);
 
-  const handleOpenMapAgent = useCallback(() => {
-    void invoke("map_agent_open").catch(() => {
+  const handleOpenMapAgent = useCallback((sessionId?: string) => {
+    void invoke(
+      "map_agent_open",
+      typeof sessionId === "string" ? { sessionId } : {},
+    ).catch(() => {
       toast.error("Map Agent 창을 열지 못했습니다.");
     });
   }, []);

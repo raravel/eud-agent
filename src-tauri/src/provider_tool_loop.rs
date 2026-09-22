@@ -21,7 +21,20 @@ pub use receipt::{
     acknowledge_native_run, clear_native_run_recovery, unresolved_native_runs,
     NativeRunReceiptState, UnresolvedNativeRun,
 };
-pub use run_gate::RunGate;
+pub use run_gate::{RunGate, SUBMISSION_ONLY_MESSAGE};
+
+/// Leave a `pending` native run receipt behind, as a process that died mid-turn
+/// would, so recovery paths outside this module can be tested against it.
+#[cfg(test)]
+pub(crate) fn leave_pending_native_receipt_for_tests(
+    journal_dir: &std::path::Path,
+    identity: &crate::provider_runtime::RunIdentity,
+    provider: crate::provider::ProviderId,
+    prior_native_id: Option<&str>,
+) -> Result<(), String> {
+    receipt::RunReceiptStore::new(journal_dir.to_path_buf(), identity)
+        .begin_native(provider, prior_native_id)
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -215,6 +228,66 @@ mod tests {
             .unwrap();
         assert!(late.is_error);
         assert!(late.result.as_str().unwrap().contains("already submitted"));
+        assert!(gate.fatal_admission_error().is_none());
+        assert!(!runtime.owns_write_registration());
+    }
+
+    #[tokio::test]
+    async fn delegated_submission_only_round_advertises_and_executes_submit_result_alone() {
+        let runtime = SessionToolRuntime::for_tests();
+        let (_cancel, cancellation) = tokio::sync::watch::channel(0_u64);
+        runtime.set_cancellation(cancellation);
+        runtime.begin_request("delegated-final", "project").unwrap();
+        let gate = delegated_gate(&runtime, "delegated-final");
+        let names = |descriptors: Vec<serde_json::Value>| {
+            descriptors
+                .iter()
+                .map(|descriptor| descriptor["name"].as_str().unwrap().to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            names(gate.advertised_descriptors()),
+            ["list_files", SUBMIT_RESULT_TOOL]
+        );
+
+        gate.enter_submission_only();
+
+        // The model is shown submit_result alone, while validation still
+        // knows the profile so a read is a correctable usage error.
+        assert_eq!(names(gate.advertised_descriptors()), [SUBMIT_RESULT_TOOL]);
+        assert_eq!(
+            names(gate.descriptors()),
+            ["list_files", SUBMIT_RESULT_TOOL]
+        );
+        let batch = gate
+            .dispatch_batch(
+                vec![
+                    DirectToolCall {
+                        id: "final-read".to_string(),
+                        name: "list_files".to_string(),
+                        arguments: serde_json::json!({}),
+                    },
+                    DirectToolCall {
+                        id: "final-submit".to_string(),
+                        name: SUBMIT_RESULT_TOOL.to_string(),
+                        arguments: serde_json::json!({"summary": "partial"}),
+                    },
+                ],
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(batch.results.len(), 2);
+        assert!(batch.results[0].is_error);
+        assert_eq!(
+            batch.results[0].result.as_str().unwrap(),
+            SUBMISSION_ONLY_MESSAGE
+        );
+        assert!(!batch.results[1].is_error);
+        assert_eq!(
+            gate.delegated_result(),
+            Some(serde_json::json!({"summary": "partial"}))
+        );
         assert!(gate.fatal_admission_error().is_none());
         assert!(!runtime.owns_write_registration());
     }

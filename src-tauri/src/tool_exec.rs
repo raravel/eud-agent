@@ -219,6 +219,98 @@ type AskEmitter = Arc<dyn Fn(crate::ipc::AskEvent) -> Result<(), String> + Send 
 type ProgressEmitter = Arc<dyn Fn(crate::ipc::ProgressEvent) -> Result<(), String> + Send + Sync>;
 type AutonomousEmitter =
     Arc<dyn Fn(crate::autonomous::AutonomousRunState) -> Result<(), String> + Send + Sync>;
+type DelegationEmitter =
+    Arc<dyn Fn(crate::ipc::DelegationEvent) -> Result<(), String> + Send + Sync>;
+pub type DelegationFuture = std::pin::Pin<
+    Box<dyn std::future::Future<Output = crate::provider_runtime::DelegatedRunOutcome> + Send>,
+>;
+/// Runs one `delegate_read` child for the tool runtime. The engine injects it
+/// (like the ask emitter) so the runtime never owns provider execution; the
+/// executor prepares the workspace, builds the delegated request, runs it, and
+/// folds the child's usage into the session.
+type DelegationExecutor = Arc<dyn Fn(ReadDelegation) -> DelegationFuture + Send + Sync>;
+
+/// One admitted `delegate_read` call: the child's identity inherits the
+/// parent's session, request, and cancellation generation with a fresh run id.
+#[derive(Debug, Clone)]
+pub struct ReadDelegation {
+    pub identity: crate::provider_runtime::RunIdentity,
+    pub parent_run_id: crate::provider_runtime::RunId,
+    pub goal: String,
+    pub focus: Vec<String>,
+}
+
+#[derive(Default)]
+struct DelegationState {
+    executor: Option<DelegationExecutor>,
+    emitter: Option<DelegationEmitter>,
+    /// Admitted delegations per parent foreground run (soft cap, usage error
+    /// beyond [`tools::DELEGATE_READ_RUN_LIMIT`]).
+    per_run: HashMap<u64, u8>,
+    /// Live child run ids, whose reads never become the parent's evidence.
+    children: HashSet<u64>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DelegateReadToolInput {
+    goal: String,
+    #[serde(default)]
+    focus: Vec<String>,
+}
+
+pub type TeamTaskFuture = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<crate::team::TeamTask, String>> + Send>,
+>;
+/// Runs one `map_task_request` for the tool runtime: creates the team Map
+/// session and task record, submits the Map request, and returns the task
+/// once its candidate is ready or the bounded wait elapses. Injected by the
+/// session manager, which owns the Map service and the engines.
+type TeamExecutor = Arc<dyn Fn(TeamTaskRequest) -> TeamTaskFuture + Send + Sync>;
+
+/// One admitted `map_task_request` call.
+#[derive(Debug, Clone)]
+pub struct TeamTaskRequest {
+    pub identity: crate::provider_runtime::RunIdentity,
+    pub goal: String,
+    pub layers: Vec<crate::map_model::MapLayer>,
+    pub selection_ids: Vec<String>,
+    pub location_ids: Vec<u16>,
+}
+
+/// What `map_task_apply` / `map_task_discard` do with a ready candidate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TeamTaskActionKind {
+    Apply,
+    Discard,
+}
+
+/// One admitted `map_task_apply` or `map_task_discard` call. The executor
+/// re-validates the task against the team session's live candidate.
+#[derive(Debug, Clone)]
+pub struct TeamTaskAction {
+    pub session_id: String,
+    pub request_id: String,
+    pub task_id: String,
+    pub kind: TeamTaskActionKind,
+}
+
+/// Applies or discards one team candidate for the tool runtime; injected by
+/// the session manager, which owns the Map service. Synchronous: the Map
+/// service's apply/discard are ordinary blocking file operations.
+type TeamActionExecutor =
+    Arc<dyn Fn(TeamTaskAction) -> Result<crate::team::TeamTask, String> + Send + Sync>;
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct MapTaskRequestToolInput {
+    goal: String,
+    layers: Vec<crate::map_model::MapLayer>,
+    #[serde(default)]
+    selection_ids: Vec<String>,
+    #[serde(default)]
+    location_ids: Vec<u16>,
+}
 
 struct PendingAsk {
     owner_request_id: String,
@@ -416,15 +508,17 @@ pub struct SessionToolRuntime {
     completion_barrier: Arc<Mutex<Option<ToolCompletionBarrier>>>,
     ask: Arc<Mutex<AskState>>,
     ask_waiting: tokio::sync::watch::Sender<bool>,
+    delegation: Arc<Mutex<DelegationState>>,
+    team_executor: Arc<Mutex<Option<TeamExecutor>>>,
+    team_action_executor: Arc<Mutex<Option<TeamActionExecutor>>>,
     cancellation: Arc<Mutex<Option<tokio::sync::watch::Receiver<u64>>>>,
     progress_emitter: Arc<Mutex<Option<ProgressEmitter>>>,
     autonomous_emitter: Arc<Mutex<Option<AutonomousEmitter>>>,
     provider_identity: Arc<Mutex<Option<(crate::provider::ProviderId, String)>>>,
     last_build: Arc<Mutex<Option<crate::harness::BuildEvidence>>>,
-    /// The complete JSON of the request's latest `build_run` and trace results,
-    /// retained as verifier evidence (file/line diagnostics, not only counts).
+    /// The complete JSON of the request's latest `build_run`, retained as
+    /// verifier evidence (file/line diagnostics, not only counts).
     last_build_result: Arc<Mutex<Option<Value>>>,
-    last_trace_result: Arc<Mutex<Option<Value>>>,
     sound_build_required: Arc<Mutex<bool>>,
     autonomous_pause_requested: Arc<AtomicBool>,
 }
@@ -466,13 +560,15 @@ impl SessionToolRuntime {
             completion_barrier: Arc::new(Mutex::new(None)),
             ask: Arc::new(Mutex::new(AskState::default())),
             ask_waiting,
+            delegation: Arc::new(Mutex::new(DelegationState::default())),
+            team_executor: Arc::new(Mutex::new(None)),
+            team_action_executor: Arc::new(Mutex::new(None)),
             cancellation: Arc::new(Mutex::new(None)),
             progress_emitter: Arc::new(Mutex::new(None)),
             autonomous_emitter: Arc::new(Mutex::new(None)),
             provider_identity: Arc::new(Mutex::new(None)),
             last_build: Arc::new(Mutex::new(None)),
             last_build_result: Arc::new(Mutex::new(None)),
-            last_trace_result: Arc::new(Mutex::new(None)),
             sound_build_required: Arc::new(Mutex::new(false)),
             autonomous_pause_requested: Arc::new(AtomicBool::new(false)),
         }
@@ -556,6 +652,36 @@ impl SessionToolRuntime {
         *self.autonomous_emitter.lock() = Some(Arc::new(emitter));
     }
 
+    pub fn set_delegation_executor(
+        &self,
+        executor: impl Fn(ReadDelegation) -> DelegationFuture + Send + Sync + 'static,
+    ) {
+        self.delegation.lock().executor = Some(Arc::new(executor));
+    }
+    pub fn set_delegation_emitter(
+        &self,
+        emitter: impl Fn(crate::ipc::DelegationEvent) -> Result<(), String> + Send + Sync + 'static,
+    ) {
+        self.delegation.lock().emitter = Some(Arc::new(emitter));
+    }
+
+    pub fn set_team_executor(
+        &self,
+        executor: impl Fn(TeamTaskRequest) -> TeamTaskFuture + Send + Sync + 'static,
+    ) {
+        *self.team_executor.lock() = Some(Arc::new(executor));
+    }
+
+    pub fn set_team_action_executor(
+        &self,
+        executor: impl Fn(TeamTaskAction) -> Result<crate::team::TeamTask, String>
+            + Send
+            + Sync
+            + 'static,
+    ) {
+        *self.team_action_executor.lock() = Some(Arc::new(executor));
+    }
+
     pub fn set_cancellation(&self, cancellation: tokio::sync::watch::Receiver<u64>) {
         *self.cancellation.lock() = Some(cancellation);
     }
@@ -631,23 +757,392 @@ impl SessionToolRuntime {
 
     /// Ask the user structured questions on behalf of the engine (not a model
     /// tool call), for example a triage clarification. Waits through the same
-    /// pending-ask path as the `ask` tool and returns the validated answers.
+    /// pending-ask path as the `ask` tool and returns the validated answers,
+    /// or [`EngineAskOutcome::Unanswered`] when the bounded wait elapsed: like
+    /// the `ask` tool, that is a text handoff for the caller, not a failure.
     pub(crate) async fn ask_for_request(
         &self,
         request_id: &str,
         questions: Vec<crate::ipc::AskQuestion>,
-    ) -> Result<BTreeMap<String, crate::ipc::AskAnswer>, String> {
+    ) -> Result<EngineAskOutcome, String> {
         let outcome = self
             .ask_scoped(request_id, None, &json!({ "questions": questions }))
             .await?;
         if outcome["status"] == "unanswered" {
-            return Err(format!(
-                "ask_unanswered: 질문 답변 대기 시간({}초)이 지났습니다.",
-                outcome["waitedSeconds"]
-            ));
+            return Ok(EngineAskOutcome::Unanswered {
+                waited_seconds: outcome["waitedSeconds"].as_u64().unwrap_or_default(),
+            });
         }
         serde_json::from_value(outcome["answers"].clone())
+            .map(EngineAskOutcome::Answered)
             .map_err(|error| format!("ask answers are malformed: {error}"))
+    }
+
+    /// Run one `delegate_read` child on behalf of the foreground run
+    /// `identity` and return the child's accepted result as the tool result.
+    /// Every failure short of a stale scope completes as a correctable usage
+    /// error, so the parent can rephrase or read directly.
+    pub(crate) async fn delegate_read_for_run(
+        &self,
+        identity: &crate::provider_runtime::RunIdentity,
+        args: &Value,
+    ) -> Result<Value, String> {
+        use crate::provider_runtime::DelegatedRunOutcome;
+
+        if self.session_id != identity.session_id || self.kind != identity.session_kind {
+            return Err("stale provider run cannot delegate".to_string());
+        }
+        if self.kind != crate::session::SessionKind::Eps {
+            return Err("delegate_read is available on EPS sessions only".to_string());
+        }
+        let input: DelegateReadToolInput = serde_json::from_value(args.clone())
+            .map_err(|error| format!("invalid delegate_read arguments: {error}"))?;
+        let goal = input.goal.trim().to_string();
+        if goal.is_empty() {
+            return Err("delegate_read requires a non-empty goal".to_string());
+        }
+        let focus = input
+            .focus
+            .into_iter()
+            .map(|item| item.trim().to_string())
+            .filter(|item| !item.is_empty())
+            .collect::<Vec<_>>();
+        if !self.matches_run_scope(identity) {
+            return Err("stale provider run cannot delegate".to_string());
+        }
+        let parent_run_id = identity.run_id;
+        let (executor, emitter, child) = {
+            let mut delegation = self.delegation.lock();
+            let executor = delegation.executor.clone().ok_or_else(|| {
+                "delegate_read is unavailable for this session; read the project directly"
+                    .to_string()
+            })?;
+            let emitter = delegation.emitter.clone();
+            let admitted = delegation.per_run.entry(parent_run_id.get()).or_insert(0);
+            if *admitted >= tools::DELEGATE_READ_RUN_LIMIT {
+                return Err(format!(
+                    "delegate_read limit: this run already delegated {} times; continue with direct reads",
+                    tools::DELEGATE_READ_RUN_LIMIT
+                ));
+            }
+            *admitted += 1;
+            let child = crate::provider_runtime::RunIdentity {
+                run_id: crate::provider_runtime::RunId::new(crate::engine::next_run_id()),
+                ..identity.clone()
+            };
+            delegation.children.insert(child.run_id.get());
+            (executor, emitter, child)
+        };
+        let started = std::time::Instant::now();
+        let emit = |status: crate::ipc::DelegationStatus,
+                    tool_calls: usize,
+                    error: Option<String>,
+                    usage: Option<crate::ipc::ContextUsage>| {
+            if let Some(emitter) = emitter.as_ref() {
+                if let Err(error) = emitter(crate::ipc::DelegationEvent {
+                    request_id: identity.request_id.clone(),
+                    parent_run_id: parent_run_id.get(),
+                    child_run_id: child.run_id.get(),
+                    goal: goal.clone(),
+                    status,
+                    tool_calls,
+                    elapsed_ms: started.elapsed().as_millis() as u64,
+                    error,
+                    usage,
+                }) {
+                    eprintln!("eud-agent: delegation event failed: {error}");
+                }
+            }
+        };
+        emit(crate::ipc::DelegationStatus::Running, 0, None, None);
+        let outcome = executor(ReadDelegation {
+            identity: child.clone(),
+            parent_run_id,
+            goal: goal.clone(),
+            focus,
+        })
+        .await;
+        self.delegation.lock().children.remove(&child.run_id.get());
+        match outcome {
+            DelegatedRunOutcome::Result {
+                value,
+                completions,
+                usage,
+            } => {
+                emit(
+                    crate::ipc::DelegationStatus::Completed,
+                    completions,
+                    None,
+                    usage,
+                );
+                Ok(value)
+            }
+            DelegatedRunOutcome::Cancelled => {
+                emit(crate::ipc::DelegationStatus::Cancelled, 0, None, None);
+                Err("delegation_cancelled: the delegated read was cancelled".to_string())
+            }
+            DelegatedRunOutcome::Failed(error) => {
+                let reason = error.to_string();
+                emit(
+                    crate::ipc::DelegationStatus::Failed,
+                    0,
+                    Some(format!("위임된 읽기 작업을 완료하지 못했습니다: {reason}")),
+                    None,
+                );
+                Err(format!(
+                    "delegation_failed: {reason}. Narrow the goal, or read the project directly."
+                ))
+            }
+        }
+    }
+
+    /// The session's team tasks from durable session state.
+    fn team_tasks(&self) -> Vec<crate::team::TeamTask> {
+        crate::session::SessionStore::new(&self.services.dirs)
+            .load(&self.session_id)
+            .map(|record| record.team_tasks)
+            .unwrap_or_default()
+    }
+
+    /// The one team task still excluding this session's own map writes.
+    pub(crate) fn active_team_task(&self) -> Option<crate::team::TeamTask> {
+        self.team_tasks()
+            .into_iter()
+            .find(|task| task.status.is_active())
+    }
+
+    /// Hand placement work to the team Map session on behalf of foreground
+    /// run `identity`. Every failure short of a stale scope completes as a
+    /// correctable usage error.
+    pub(crate) async fn map_task_request_for_run(
+        &self,
+        identity: &crate::provider_runtime::RunIdentity,
+        args: &Value,
+    ) -> Result<Value, String> {
+        if self.session_id != identity.session_id || self.kind != identity.session_kind {
+            return Err("stale provider run cannot request a map task".to_string());
+        }
+        if self.kind != crate::session::SessionKind::Eps {
+            return Err("map_task_request is available on EPS sessions only".to_string());
+        }
+        let input: MapTaskRequestToolInput = serde_json::from_value(args.clone())
+            .map_err(|error| format!("invalid map_task_request arguments: {error}"))?;
+        let goal = input.goal.trim().to_string();
+        if goal.is_empty() {
+            return Err("map_task_request requires a non-empty goal".to_string());
+        }
+        let mut layers = input.layers;
+        layers.sort();
+        layers.dedup();
+        if layers.is_empty() {
+            return Err("map_task_request requires at least one layer".to_string());
+        }
+        let mut selection_ids = input
+            .selection_ids
+            .into_iter()
+            .map(|id| id.trim().to_string())
+            .filter(|id| !id.is_empty())
+            .collect::<Vec<_>>();
+        selection_ids.dedup();
+        let mut location_ids = input.location_ids;
+        location_ids.sort_unstable();
+        location_ids.dedup();
+        if !self.matches_run_scope(identity) {
+            return Err("stale provider run cannot request a map task".to_string());
+        }
+        if self.is_delegated_child(identity) {
+            return Err("a delegated read cannot request a map task".to_string());
+        }
+        {
+            let state = self.request_state.lock();
+            let inspected = state
+                .as_ref()
+                .filter(|state| state.request_id == identity.request_id)
+                .is_some_and(|state| state.map_inspected);
+            if !inspected {
+                return Err(
+                    "evidence gate: call map_info (summary, then the layers the task touches) in this request before map_task_request, so the goal reflects the current saved map."
+                        .to_string(),
+                );
+            }
+        }
+        // A ready candidate may be replaced by a new request (the executor
+        // supersedes the earlier task and starts a fresh team session); a
+        // queued/running one may not.
+        if let Some(active) = self
+            .active_team_task()
+            .filter(|task| task.status != crate::team::TeamTaskStatus::CandidateReady)
+        {
+            return Err(format!(
+                "map_task_in_progress: task {} is still {}; read map_task_status and wait for its candidate before requesting another map task",
+                active.id,
+                active.status.label()
+            ));
+        }
+        let executor = self
+            .team_executor
+            .lock()
+            .clone()
+            .ok_or_else(|| "map_task_request is unavailable for this session".to_string())?;
+        let task = executor(TeamTaskRequest {
+            identity: identity.clone(),
+            goal,
+            layers,
+            selection_ids,
+            location_ids,
+        })
+        .await
+        .map_err(|error| format!("map_task_failed: {error}"))?;
+        Ok(task.to_tool_value())
+    }
+
+    fn map_task_status(&self, args: &Value) -> Result<Value, String> {
+        let task_id = str_arg(args, "taskId")?;
+        self.team_tasks()
+            .into_iter()
+            .find(|task| task.id == task_id)
+            .map(|task| task.to_tool_value())
+            .ok_or_else(|| format!("map task '{task_id}' does not exist on this session"))
+    }
+
+    /// The task named by `taskId` when its candidate is ready for inspection,
+    /// apply, or discard.
+    fn ready_team_task(&self, args: &Value) -> Result<crate::team::TeamTask, String> {
+        let task_id = str_arg(args, "taskId")?;
+        let task = self
+            .team_tasks()
+            .into_iter()
+            .find(|task| task.id == task_id)
+            .ok_or_else(|| format!("map task '{task_id}' does not exist on this session"))?;
+        if task.status != crate::team::TeamTaskStatus::CandidateReady {
+            return Err(format!(
+                "map task '{task_id}' is {}, not candidate_ready; only a ready candidate can be inspected, applied, or discarded",
+                task.status.label()
+            ));
+        }
+        if task.candidate.is_none() {
+            return Err(format!("map task '{task_id}' has no candidate summary"));
+        }
+        Ok(task)
+    }
+
+    /// `map_task_diff` / `map_task_objects` / `map_task_render`: read the team
+    /// session's live candidate for a ready task, refusing when the candidate
+    /// no longer is the revision the task announced.
+    fn map_task_candidate_read(&self, tool: &str, args: &Value) -> Result<Value, String> {
+        let task = self.ready_team_task(args)?;
+        let candidate = task.candidate.as_ref().expect("ready task has a candidate");
+        let team = crate::session::SessionStore::new(&self.services.dirs)
+            .load(&task.map_session_id)
+            .map_err(|error| format!("the team Map session could not be loaded: {error}"))?;
+        let project_id = team.meta.project;
+        let candidates = self.services.map_candidates();
+        let state = candidates.state(&project_id, &task.map_session_id)?;
+        // Revision numbers never repeat within a session; the announced hash
+        // legitimately changes when the session follows a changed source.
+        if state.stale || state.current_revision != candidate.revision {
+            return Err(format!(
+                "map task '{}' candidate changed since it was announced (team session is at r{}{}); read map_task_status and request the task again if needed",
+                task.id,
+                state.current_revision,
+                if state.stale { ", stale" } else { "" }
+            ));
+        }
+        match tool {
+            tools::MAP_TASK_DIFF_TOOL => {
+                let revision = state
+                    .revisions
+                    .iter()
+                    .find(|revision| revision.revision == state.current_revision);
+                Ok(json!({
+                    "taskId": task.id,
+                    "candidateRevision": state.current_revision,
+                    "sourceDiverged": state.source_diverged,
+                    "summary": candidate.summary,
+                    "diff": revision.map(|revision| &revision.diff),
+                    "verification": revision.map(|revision| &revision.verification),
+                }))
+            }
+            tools::MAP_TASK_OBJECTS_TOOL => {
+                let layer = str_arg(args, "layer")?;
+                let offset = usize_arg_default(args, "offset", 0)?;
+                let limit = usize_arg_default(args, "limit", 100)?.min(500);
+                let map = candidates.current_map(&project_id, &task.map_session_id)?;
+                let page = map_objects_page(
+                    &map,
+                    candidates.context().starcraft_path()?.as_path(),
+                    &state.revision_key,
+                    &state.baseline.file_sha256,
+                    layer,
+                    offset,
+                    limit,
+                )?;
+                candidates.annotate_object_page(&project_id, &task.map_session_id, page)
+            }
+            tools::MAP_TASK_RENDER_TOOL => {
+                let map = candidates.current_map(&project_id, &task.map_session_id)?;
+                render_map_tool(
+                    &map,
+                    &state,
+                    args,
+                    candidates.context().starcraft_path()?.as_path(),
+                )
+            }
+            _ => Err(format!("`{tool}` is not a team candidate read")),
+        }
+    }
+
+    /// `map_task_apply` / `map_task_discard` through the injected executor.
+    /// Apply additionally requires that this request inspected the candidate.
+    fn map_task_action(
+        &self,
+        request_id: &str,
+        kind: TeamTaskActionKind,
+        args: &Value,
+    ) -> Result<Value, String> {
+        let task = self.ready_team_task(args)?;
+        if kind == TeamTaskActionKind::Apply {
+            let inspected = self
+                .request_state
+                .lock()
+                .as_ref()
+                .filter(|state| state.request_id == request_id)
+                .is_some_and(|state| state.candidate_inspected(&task.id));
+            if !inspected {
+                return Err(format!(
+                    "evidence gate: inspect map task '{}' with map_task_diff, map_task_objects, or map_task_render in this request before map_task_apply",
+                    task.id
+                ));
+            }
+        }
+        let executor =
+            self.team_action_executor.lock().clone().ok_or_else(|| {
+                "team map task actions are unavailable for this session".to_string()
+            })?;
+        let task = executor(TeamTaskAction {
+            session_id: self.session_id.clone(),
+            request_id: request_id.to_string(),
+            task_id: task.id,
+            kind,
+        })
+        .map_err(|error| {
+            format!(
+                "map_task_{}_failed: {error}",
+                match kind {
+                    TeamTaskActionKind::Apply => "apply",
+                    TeamTaskActionKind::Discard => "discard",
+                }
+            )
+        })?;
+        Ok(task.to_tool_value())
+    }
+
+    /// Whether `identity` names a live `delegate_read` child of this session.
+    fn is_delegated_child(&self, identity: &crate::provider_runtime::RunIdentity) -> bool {
+        self.delegation
+            .lock()
+            .children
+            .contains(&identity.run_id.get())
     }
 
     async fn ask_scoped(
@@ -905,6 +1400,7 @@ impl SessionToolRuntime {
     }
     pub fn begin_request(&self, request_id: &str, project_id: &str) -> Result<(), String> {
         self.set_autonomous_pause_requested(false);
+        self.delegation.lock().per_run.clear();
         let _execution = self.execution_lock.try_lock().ok_or_else(|| {
             "a previously admitted tool is still running; wait for its completion before opening a new request"
                 .to_string()
@@ -1409,11 +1905,12 @@ impl SessionToolRuntime {
         if self.session_id != identity.session_id || self.kind != identity.session_kind {
             return Err("stale provider run cannot execute tools".to_string());
         }
-        self.execute_scoped(
+        self.execute_scoped_from(
             &identity.request_id,
             Some(identity.cancellation_generation),
             tool,
             args,
+            self.is_delegated_child(identity),
         )
     }
 
@@ -1423,6 +1920,20 @@ impl SessionToolRuntime {
         expected_generation: Option<u64>,
         tool: &str,
         args: &Value,
+    ) -> Result<Value, String> {
+        self.execute_scoped_from(expected_request_id, expected_generation, tool, args, false)
+    }
+
+    /// `delegated` marks a call made by a `delegate_read` child: it runs with
+    /// the parent's request scope but its reads are not the parent's mutation
+    /// evidence.
+    fn execute_scoped_from(
+        &self,
+        expected_request_id: &str,
+        expected_generation: Option<u64>,
+        tool: &str,
+        args: &Value,
+        delegated: bool,
     ) -> Result<Value, String> {
         if !self.ask.lock().pending.is_empty() {
             return Err(
@@ -1454,6 +1965,30 @@ impl SessionToolRuntime {
         }
 
         let effects = tools::tool_spec(tool).ok_or_else(|| format!("Unknown tool `{tool}`."))?;
+        if delegated
+            && matches!(
+                tool,
+                tools::MAP_TASK_APPLY_TOOL
+                    | tools::MAP_TASK_DISCARD_TOOL
+                    | tools::MAP_TASK_DIFF_TOOL
+                    | tools::MAP_TASK_OBJECTS_TOOL
+                    | tools::MAP_TASK_RENDER_TOOL
+                    | tools::MAP_TASK_STATUS_TOOL
+            )
+        {
+            return Err(format!(
+                "a delegated read cannot use `{tool}`; team map tasks belong to the foreground run"
+            ));
+        }
+        if tools::TEAM_EXCLUDED_MAP_TOOLS.contains(&tool) {
+            if let Some(active) = self.active_team_task() {
+                return Err(format!(
+                    "map_task_in_progress: {tool} is refused while team map task {} is {}; the Map candidate and this session must not write the same map. Apply it with map_task_apply after inspecting it, discard it with map_task_discard, or wait for it to settle.",
+                    active.id,
+                    active.status.label()
+                ));
+            }
+        }
         if effects.requires_write_workspace && !self.owns_write_registration() {
             return Err(
                 "WriteRegistrationRequired: canonical authoring requires runtime-managed write admission."
@@ -1498,8 +2033,29 @@ impl SessionToolRuntime {
             self.dispatch(&request_id, tool, args)
         };
         if let Ok(value) = result.as_mut() {
+            if tool == tools::MAP_INFO_TOOL && !delegated {
+                if let Some(state) = self
+                    .request_state
+                    .lock()
+                    .as_mut()
+                    .filter(|state| state.request_id == request_id)
+                {
+                    state.record_map_inspection();
+                }
+            }
+            if tools::TEAM_CANDIDATE_READ_TOOLS.contains(&tool) {
+                if let (Ok(task_id), Some(state)) = (
+                    str_arg(args, "taskId"),
+                    self.request_state
+                        .lock()
+                        .as_mut()
+                        .filter(|state| state.request_id == request_id),
+                ) {
+                    state.record_candidate_inspection(task_id);
+                }
+            }
             if tool == tools::SEARCH_DOCS_TOOL {
-                self.record_search_docs_result(&request_id, args, value)?;
+                self.record_search_docs_result(&request_id, args, value, delegated)?;
             } else if tool == tools::DOCS_GET_TOOL {
                 self.record_docs_get_result(&request_id, value)?;
             }
@@ -1525,6 +2081,7 @@ impl SessionToolRuntime {
         request_id: &str,
         args: &Value,
         value: &mut Value,
+        delegated: bool,
     ) -> Result<(), String> {
         let ids = value
             .get("hits")
@@ -1544,7 +2101,13 @@ impl SessionToolRuntime {
             .as_mut()
             .filter(|state| state.request_id == request_id)
             .ok_or_else(|| format!("request state for {request_id} is missing"))?;
+        let parent_docs_searched = state.docs_searched;
         let repeated = state.record_search_docs_hits(args, &ids);
+        if delegated {
+            // A child's search grounds the child's summary, not the parent's
+            // mutation rail: the parent must search before it writes.
+            state.docs_searched = parent_docs_searched;
+        }
         let repeated_count = repeated.iter().filter(|flag| **flag).count();
         let new_count = repeated.len() - repeated_count;
 
@@ -2208,8 +2771,7 @@ impl SessionToolRuntime {
                         .ok_or_else(|| format!("request state for {request_id} is missing"))?;
                     state.record_build(input_revision, &result)
                 };
-                let mut value = serde_json::to_value(result)
-                    .map_err(|error| format!("failed to serialize build result: {error}"))?;
+                let mut value = build_run_observation(result)?;
                 let (progress, no_progress_reason) = match progress {
                     tools::BuildProgressOutcome::Progress(progress) => (progress, None),
                     tools::BuildProgressOutcome::NoProgress { progress, reason } => {
@@ -2274,6 +2836,16 @@ impl SessionToolRuntime {
                     epoch_secs(),
                 )
                 .map_err(stringify)
+            }
+            tools::MAP_TASK_STATUS_TOOL => self.map_task_status(args),
+            tools::MAP_TASK_DIFF_TOOL
+            | tools::MAP_TASK_OBJECTS_TOOL
+            | tools::MAP_TASK_RENDER_TOOL => self.map_task_candidate_read(tool, args),
+            tools::MAP_TASK_APPLY_TOOL => {
+                self.map_task_action(request_id, TeamTaskActionKind::Apply, args)
+            }
+            tools::MAP_TASK_DISCARD_TOOL => {
+                self.map_task_action(request_id, TeamTaskActionKind::Discard, args)
             }
             "propose_plan" => {
                 let markdown = str_arg(args, "markdown")?.to_string();
@@ -5242,6 +5814,7 @@ mod tests {
                     model: binding.model.clone(),
                     created_at: now / 1_000,
                     last_conversation_at: now,
+                    team_parent: None,
                 },
                 provider_binding: binding,
                 pending_request_ids: Vec::new(),
@@ -5251,6 +5824,7 @@ mod tests {
                 task_state: Default::default(),
                 autonomous_run: Some(autonomous),
                 workflow: None,
+                team_tasks: Vec::new(),
             })
             .unwrap();
         runtime.begin_request("req-ask", "project").unwrap();
@@ -5474,6 +6048,679 @@ mod tests {
 
         runtime.begin_iteration("req-ask-expire").unwrap();
         assert!(!runtime.ask_expired_for_request("req-ask-expire"));
+    }
+
+    fn delegation_identity(
+        runtime: &SessionToolRuntime,
+        run: u64,
+    ) -> crate::provider_runtime::RunIdentity {
+        crate::provider_runtime::RunIdentity {
+            session_id: runtime.session_id().to_string(),
+            run_id: crate::provider_runtime::RunId::new(run),
+            request_id: "req-delegate".to_string(),
+            session_kind: crate::session::SessionKind::Eps,
+            cancellation_generation: 0,
+        }
+    }
+
+    fn delegation_runtime() -> (
+        SessionToolRuntime,
+        tokio::sync::mpsc::UnboundedReceiver<crate::ipc::DelegationEvent>,
+        Arc<Mutex<Vec<ReadDelegation>>>,
+    ) {
+        let runtime = SessionToolRuntime::for_tests();
+        runtime.begin_request("req-delegate", "project").unwrap();
+        let (_cancel, receiver) = tokio::sync::watch::channel(0_u64);
+        runtime.set_cancellation(receiver);
+        std::mem::forget(_cancel);
+        let (events, emitted) = tokio::sync::mpsc::unbounded_channel();
+        runtime.set_delegation_emitter(move |event| {
+            events
+                .send(event)
+                .map_err(|_| "delegation event receiver closed".to_string())
+        });
+        let seen: Arc<Mutex<Vec<ReadDelegation>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&seen);
+        runtime.set_delegation_executor(move |delegation| {
+            recorded.lock().push(delegation.clone());
+            Box::pin(async move {
+                match delegation.goal.as_str() {
+                    "fail" => crate::provider_runtime::DelegatedRunOutcome::Failed(
+                        crate::provider_runtime::ProviderRuntimeError::Protocol(
+                            "delegated run exhausted its tool rounds without submit_result".into(),
+                        ),
+                    ),
+                    "cancel" => crate::provider_runtime::DelegatedRunOutcome::Cancelled,
+                    _ => crate::provider_runtime::DelegatedRunOutcome::Result {
+                        value: json!({
+                            "summary": format!("done: {}", delegation.goal),
+                            "findings": [],
+                            "openQuestions": [],
+                            "toolCalls": 3
+                        }),
+                        completions: 4,
+                        usage: None,
+                    },
+                }
+            })
+        });
+        (runtime, emitted, seen)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn delegate_read_returns_the_child_result_and_reports_its_lifecycle() {
+        let (runtime, mut emitted, seen) = delegation_runtime();
+        let parent = delegation_identity(&runtime, 7);
+        let value = runtime
+            .delegate_read_for_run(
+                &parent,
+                &json!({ "goal": " where is P1 hp ", "focus": [" src/main.eps ", ""] }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(value["summary"], "done: where is P1 hp");
+
+        let delegation = seen.lock()[0].clone();
+        assert_eq!(delegation.parent_run_id.get(), 7);
+        assert_ne!(delegation.identity.run_id.get(), 7);
+        assert_eq!(delegation.identity.session_id, parent.session_id);
+        assert_eq!(delegation.identity.request_id, parent.request_id);
+        assert_eq!(delegation.identity.cancellation_generation, 0);
+        assert_eq!(delegation.goal, "where is P1 hp");
+        assert_eq!(delegation.focus, vec!["src/main.eps".to_string()]);
+
+        let running = emitted.recv().await.unwrap();
+        assert_eq!(running.status, crate::ipc::DelegationStatus::Running);
+        assert_eq!(running.parent_run_id, 7);
+        assert_eq!(running.child_run_id, delegation.identity.run_id.get());
+        assert_eq!(running.request_id, "req-delegate");
+        let completed = emitted.recv().await.unwrap();
+        assert_eq!(completed.status, crate::ipc::DelegationStatus::Completed);
+        assert_eq!(completed.child_run_id, running.child_run_id);
+        assert_eq!(completed.tool_calls, 4);
+        assert!(completed.error.is_none());
+        // The child is no longer live once its result is returned.
+        assert!(!runtime.is_delegated_child(&delegation.identity));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn delegate_read_failures_are_correctable_usage_errors() {
+        let (runtime, mut emitted, _seen) = delegation_runtime();
+        let parent = delegation_identity(&runtime, 1);
+
+        let failed = runtime
+            .delegate_read_for_run(&parent, &json!({ "goal": "fail" }))
+            .await
+            .unwrap_err();
+        assert!(failed.starts_with("delegation_failed:"), "{failed}");
+        assert!(failed.contains("submit_result"), "{failed}");
+        let _running = emitted.recv().await.unwrap();
+        let event = emitted.recv().await.unwrap();
+        assert_eq!(event.status, crate::ipc::DelegationStatus::Failed);
+        assert!(event.error.as_deref().unwrap().contains("submit_result"));
+
+        let cancelled = runtime
+            .delegate_read_for_run(&parent, &json!({ "goal": "cancel" }))
+            .await
+            .unwrap_err();
+        assert!(cancelled.starts_with("delegation_cancelled"), "{cancelled}");
+        let _running = emitted.recv().await.unwrap();
+        assert_eq!(
+            emitted.recv().await.unwrap().status,
+            crate::ipc::DelegationStatus::Cancelled
+        );
+
+        let malformed = runtime
+            .delegate_read_for_run(&parent, &json!({ "goal": "   " }))
+            .await
+            .unwrap_err();
+        assert!(malformed.contains("non-empty goal"), "{malformed}");
+        let unknown = runtime
+            .delegate_read_for_run(&parent, &json!({ "goal": "x", "extra": 1 }))
+            .await
+            .unwrap_err();
+        assert!(
+            unknown.contains("invalid delegate_read arguments"),
+            "{unknown}"
+        );
+
+        // A run from another request or generation is stale, which the gate
+        // treats as fatal rather than correctable.
+        let mut stale = delegation_identity(&runtime, 1);
+        stale.cancellation_generation = 9;
+        let stale = runtime
+            .delegate_read_for_run(&stale, &json!({ "goal": "x" }))
+            .await
+            .unwrap_err();
+        assert!(stale.starts_with("stale provider run"), "{stale}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn delegate_read_is_capped_per_foreground_run_and_reset_per_request() {
+        let (runtime, _emitted, seen) = delegation_runtime();
+        let parent = delegation_identity(&runtime, 3);
+        for _ in 0..tools::DELEGATE_READ_RUN_LIMIT {
+            runtime
+                .delegate_read_for_run(&parent, &json!({ "goal": "ok" }))
+                .await
+                .unwrap();
+        }
+        let over = runtime
+            .delegate_read_for_run(&parent, &json!({ "goal": "ok" }))
+            .await
+            .unwrap_err();
+        assert!(over.starts_with("delegate_read limit"), "{over}");
+        assert_eq!(
+            seen.lock().len(),
+            usize::from(tools::DELEGATE_READ_RUN_LIMIT)
+        );
+        // Another foreground run of the same request has its own budget.
+        let sibling = delegation_identity(&runtime, 4);
+        runtime
+            .delegate_read_for_run(&sibling, &json!({ "goal": "ok" }))
+            .await
+            .unwrap();
+        // A new request forgets every run budget.
+        runtime.begin_request("req-delegate", "project").unwrap();
+        runtime
+            .delegate_read_for_run(&parent, &json!({ "goal": "ok" }))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn delegate_read_without_an_executor_is_a_usage_error() {
+        let runtime = SessionToolRuntime::for_tests();
+        runtime.begin_request("req-delegate", "project").unwrap();
+        let (_cancel, receiver) = tokio::sync::watch::channel(0_u64);
+        runtime.set_cancellation(receiver);
+        let error = runtime
+            .delegate_read_for_run(&delegation_identity(&runtime, 1), &json!({ "goal": "x" }))
+            .await
+            .unwrap_err();
+        assert!(error.contains("unavailable"), "{error}");
+
+        let map_runtime = ToolServices::for_tests().map_session("map-session");
+        let mut identity = delegation_identity(&map_runtime, 1);
+        identity.session_kind = crate::session::SessionKind::Map;
+        let error = map_runtime
+            .delegate_read_for_run(&identity, &json!({ "goal": "x" }))
+            .await
+            .unwrap_err();
+        assert!(error.contains("EPS sessions only"), "{error}");
+    }
+
+    #[test]
+    fn a_delegated_child_search_does_not_lift_the_parent_evidence_gate() {
+        let runtime = SessionToolRuntime::for_tests();
+        runtime.begin_request("req-delegate", "project").unwrap();
+        let mut value = json!({ "hits": [{ "id": "0000000000000001" }] });
+        runtime
+            .record_search_docs_result(
+                "req-delegate",
+                &json!({ "query": "죽음 카운터" }),
+                &mut value,
+                true,
+            )
+            .unwrap();
+        let state = runtime.request_state_snapshot().unwrap();
+        assert!(
+            !state.docs_searched,
+            "a child's search is not parent evidence"
+        );
+        assert_eq!(state.search_docs_count, 1);
+
+        let mut value = json!({ "hits": [{ "id": "0000000000000002" }] });
+        runtime
+            .record_search_docs_result(
+                "req-delegate",
+                &json!({ "query": "죽음 카운터 2" }),
+                &mut value,
+                false,
+            )
+            .unwrap();
+        assert!(runtime.request_state_snapshot().unwrap().docs_searched);
+    }
+
+    fn save_eps_session(runtime: &SessionToolRuntime, tasks: Vec<crate::team::TeamTask>) {
+        let sessions = crate::session::SessionStore::new(&runtime.data_dirs());
+        let now = crate::session::now_unix_millis();
+        let binding = crate::provider::ProviderBinding::new(
+            crate::provider::ProviderId::Codex,
+            "gpt-test".to_string(),
+            None,
+        )
+        .unwrap();
+        sessions
+            .save(&crate::session::SessionRecord {
+                meta: crate::session::SessionMeta {
+                    id: runtime.session_id().to_string(),
+                    name: "team".to_string(),
+                    project: "project".to_string(),
+                    kind: crate::session::SessionKind::Eps,
+                    provider: binding.provider,
+                    model: binding.model.clone(),
+                    created_at: now / 1_000,
+                    last_conversation_at: now,
+                    team_parent: None,
+                },
+                provider_binding: binding,
+                pending_request_ids: Vec::new(),
+                context_usage: None,
+                panel_log: Value::Null,
+                context_state: Default::default(),
+                task_state: Default::default(),
+                autonomous_run: None,
+                workflow: None,
+                team_tasks: tasks,
+            })
+            .unwrap();
+    }
+
+    fn team_task(id: &str, status: crate::team::TeamTaskStatus) -> crate::team::TeamTask {
+        crate::team::TeamTask {
+            id: id.to_string(),
+            parent_request_id: "req-delegate".to_string(),
+            map_session_id: "map-team".to_string(),
+            map_request_id: None,
+            goal: "goal".to_string(),
+            layers: vec![crate::map_model::MapLayer::Terrain],
+            selection_ids: Vec::new(),
+            location_ids: Vec::new(),
+            source_map_sha256_at_create: "a".repeat(64),
+            status,
+            candidate: None,
+            applied_source_sha256: None,
+            applied_by: None,
+            created_at: 1,
+            updated_at: 1,
+        }
+    }
+
+    fn mark_map_inspected(runtime: &SessionToolRuntime) {
+        runtime
+            .request_state
+            .lock()
+            .as_mut()
+            .unwrap()
+            .record_map_inspection();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn map_task_request_needs_map_evidence_and_hands_off_once() {
+        let (runtime, _emitted, _seen) = delegation_runtime();
+        save_eps_session(&runtime, Vec::new());
+        let requests: Arc<Mutex<Vec<TeamTaskRequest>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&requests);
+        runtime.set_team_executor(move |request| {
+            recorded.lock().push(request.clone());
+            Box::pin(async move {
+                let mut task = team_task("task-1", crate::team::TeamTaskStatus::CandidateReady);
+                task.goal = request.goal;
+                task.layers = request.layers;
+                task.candidate = Some(crate::team::TeamCandidateSummary {
+                    revision: 1,
+                    revision_key: "r1:abc".to_string(),
+                    map_sha256: "b".repeat(64),
+                    summary: "지형 40칸".to_string(),
+                    terrain_cells: 40,
+                    units: 0,
+                    buildings: 0,
+                    doodads: 0,
+                    sprites: 0,
+                    locations: 0,
+                });
+                Ok(task)
+            })
+        });
+        let parent = delegation_identity(&runtime, 1);
+        let args = json!({
+            "goal": " 전부 공허로 ",
+            "layers": ["units", "terrain", "terrain"],
+            "selectionIds": ["sel-a", ""],
+            "locationIds": [5, 3, 5]
+        });
+
+        let gated = runtime
+            .map_task_request_for_run(&parent, &args)
+            .await
+            .unwrap_err();
+        assert!(gated.starts_with("evidence gate"), "{gated}");
+        assert!(requests.lock().is_empty());
+
+        mark_map_inspected(&runtime);
+        let value = runtime
+            .map_task_request_for_run(&parent, &args)
+            .await
+            .unwrap();
+        assert_eq!(value["status"], "candidate_ready");
+        assert_eq!(value["taskId"], "task-1");
+        assert_eq!(value["candidate"]["revision"], 1);
+        assert_eq!(value["applied"], false);
+        let request = requests.lock()[0].clone();
+        assert_eq!(request.goal, "전부 공허로");
+        assert_eq!(
+            request.layers,
+            vec![
+                crate::map_model::MapLayer::Terrain,
+                crate::map_model::MapLayer::Units
+            ]
+        );
+        assert_eq!(request.selection_ids, vec!["sel-a".to_string()]);
+        assert_eq!(request.location_ids, vec![3, 5]);
+        assert_eq!(request.identity, parent);
+
+        let malformed = runtime
+            .map_task_request_for_run(&parent, &json!({ "goal": "x", "layers": [] }))
+            .await
+            .unwrap_err();
+        assert!(malformed.contains("at least one layer"), "{malformed}");
+        let unknown = runtime
+            .map_task_request_for_run(
+                &parent,
+                &json!({ "goal": "x", "layers": ["terrain"], "region": 1 }),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            unknown.contains("invalid map_task_request arguments"),
+            "{unknown}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn active_team_task_excludes_a_second_task_and_the_eps_map_writers() {
+        let (runtime, _emitted, _seen) = delegation_runtime();
+        save_eps_session(
+            &runtime,
+            vec![team_task("task-live", crate::team::TeamTaskStatus::Running)],
+        );
+        runtime.set_team_executor(|_| Box::pin(async { panic!("never dispatched") }));
+        mark_map_inspected(&runtime);
+        let parent = delegation_identity(&runtime, 1);
+        let refused = runtime
+            .map_task_request_for_run(&parent, &json!({ "goal": "x", "layers": ["terrain"] }))
+            .await
+            .unwrap_err();
+        assert!(refused.starts_with("map_task_in_progress"), "{refused}");
+        assert!(refused.contains("task-live"));
+
+        for tool in tools::TEAM_EXCLUDED_MAP_TOOLS {
+            let error = runtime
+                .execute_for_run(&parent, tool, &json!({}))
+                .unwrap_err();
+            assert!(
+                error.starts_with("map_task_in_progress"),
+                "{tool} must be refused while a team task is active: {error}"
+            );
+        }
+        // Reads and unrelated tools are not excluded (no project is open in
+        // this fixture, so the read fails later for its own reason).
+        let unrelated = runtime
+            .execute_for_run(&parent, "list_files", &json!({}))
+            .unwrap_err();
+        assert!(
+            !unrelated.starts_with("map_task_in_progress"),
+            "{unrelated}"
+        );
+
+        let status = runtime
+            .execute_for_run(
+                &parent,
+                tools::MAP_TASK_STATUS_TOOL,
+                &json!({ "taskId": "task-live" }),
+            )
+            .unwrap();
+        assert_eq!(status["status"], "running");
+        let missing = runtime
+            .execute_for_run(
+                &parent,
+                tools::MAP_TASK_STATUS_TOOL,
+                &json!({ "taskId": "nope" }),
+            )
+            .unwrap_err();
+        assert!(missing.contains("does not exist"), "{missing}");
+
+        // A ready candidate still excludes the EPS map writers.
+        save_eps_session(
+            &runtime,
+            vec![team_task(
+                "task-live",
+                crate::team::TeamTaskStatus::CandidateReady,
+            )],
+        );
+        let error = runtime
+            .execute_for_run(&parent, "location_write", &json!({}))
+            .unwrap_err();
+        assert!(error.starts_with("map_task_in_progress"), "{error}");
+        assert!(error.contains("map_task_apply"), "{error}");
+
+        // A settled task lifts the exclusion.
+        save_eps_session(
+            &runtime,
+            vec![team_task("task-live", crate::team::TeamTaskStatus::Applied)],
+        );
+        assert!(runtime.active_team_task().is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn map_task_request_is_eps_only_and_never_from_a_delegated_child() {
+        let (runtime, _emitted, _seen) = delegation_runtime();
+        save_eps_session(&runtime, Vec::new());
+        mark_map_inspected(&runtime);
+        let unavailable = runtime
+            .map_task_request_for_run(
+                &delegation_identity(&runtime, 1),
+                &json!({ "goal": "x", "layers": ["terrain"] }),
+            )
+            .await
+            .unwrap_err();
+        assert!(unavailable.contains("unavailable"), "{unavailable}");
+
+        let map_runtime = ToolServices::for_tests().map_session("map-session");
+        let mut identity = delegation_identity(&map_runtime, 1);
+        identity.session_kind = crate::session::SessionKind::Map;
+        let error = map_runtime
+            .map_task_request_for_run(&identity, &json!({ "goal": "x", "layers": ["terrain"] }))
+            .await
+            .unwrap_err();
+        assert!(error.contains("EPS sessions only"), "{error}");
+    }
+
+    fn ready_summary() -> crate::team::TeamCandidateSummary {
+        crate::team::TeamCandidateSummary {
+            revision: 1,
+            revision_key: "r1:abc".to_string(),
+            map_sha256: "b".repeat(64),
+            summary: "지형 40칸".to_string(),
+            terrain_cells: 40,
+            units: 0,
+            buildings: 0,
+            doodads: 0,
+            sprites: 0,
+            locations: 0,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_ready_candidate_admits_a_follow_up_request_but_a_running_task_does_not() {
+        let (runtime, _emitted, _seen) = delegation_runtime();
+        let mut ready = team_task("task-ready", crate::team::TeamTaskStatus::CandidateReady);
+        ready.candidate = Some(ready_summary());
+        save_eps_session(&runtime, vec![ready]);
+        runtime.set_team_executor(|_| {
+            Box::pin(async {
+                Ok(team_task(
+                    "task-2",
+                    crate::team::TeamTaskStatus::CandidateReady,
+                ))
+            })
+        });
+        mark_map_inspected(&runtime);
+        let parent = delegation_identity(&runtime, 1);
+        let args = json!({ "goal": "왼쪽 벽을 더 두껍게", "layers": ["terrain"] });
+        let follow_up = runtime
+            .map_task_request_for_run(&parent, &args)
+            .await
+            .unwrap();
+        assert_eq!(follow_up["taskId"], "task-2");
+
+        save_eps_session(
+            &runtime,
+            vec![team_task("task-run", crate::team::TeamTaskStatus::Running)],
+        );
+        let refused = runtime
+            .map_task_request_for_run(&parent, &args)
+            .await
+            .unwrap_err();
+        assert!(refused.starts_with("map_task_in_progress"), "{refused}");
+        assert!(refused.contains("task-run"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn map_task_apply_needs_candidate_inspection_and_runs_the_action_executor() {
+        let (runtime, _emitted, _seen) = delegation_runtime();
+        let mut ready = team_task("task-ready", crate::team::TeamTaskStatus::CandidateReady);
+        ready.candidate = Some(ready_summary());
+        save_eps_session(
+            &runtime,
+            vec![
+                ready.clone(),
+                team_task("task-done", crate::team::TeamTaskStatus::Applied),
+            ],
+        );
+        let actions: Arc<Mutex<Vec<TeamTaskAction>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&actions);
+        runtime.set_team_action_executor(move |action| {
+            recorded.lock().push(action.clone());
+            let mut task = ready.clone();
+            match action.kind {
+                TeamTaskActionKind::Apply => {
+                    task.status = crate::team::TeamTaskStatus::Applied;
+                    task.applied_by = Some(crate::team::TeamApplyActor::Agent);
+                }
+                TeamTaskActionKind::Discard => {
+                    task.status = crate::team::TeamTaskStatus::Discarded;
+                }
+            }
+            Ok(task)
+        });
+        let parent = delegation_identity(&runtime, 1);
+        runtime.register_write_request("team apply").unwrap();
+
+        let settled = runtime
+            .execute_for_run(
+                &parent,
+                tools::MAP_TASK_APPLY_TOOL,
+                &json!({ "taskId": "task-done" }),
+            )
+            .unwrap_err();
+        assert!(settled.contains("not candidate_ready"), "{settled}");
+        let uninspected = runtime
+            .execute_for_run(
+                &parent,
+                tools::MAP_TASK_APPLY_TOOL,
+                &json!({ "taskId": "task-ready" }),
+            )
+            .unwrap_err();
+        assert!(uninspected.starts_with("evidence gate"), "{uninspected}");
+        assert!(actions.lock().is_empty());
+
+        // The candidate reads need the team session's candidate state, which
+        // this fixture does not have: they fail with a correctable error and
+        // never count as inspection.
+        let unreadable = runtime
+            .execute_for_run(
+                &parent,
+                tools::MAP_TASK_DIFF_TOOL,
+                &json!({ "taskId": "task-ready" }),
+            )
+            .unwrap_err();
+        assert!(
+            unreadable.contains("team Map session could not be loaded"),
+            "{unreadable}"
+        );
+        assert!(!runtime
+            .request_state_snapshot()
+            .unwrap()
+            .candidate_inspected("task-ready"));
+
+        runtime
+            .request_state
+            .lock()
+            .as_mut()
+            .unwrap()
+            .record_candidate_inspection("task-ready");
+        let applied = runtime
+            .execute_for_run(
+                &parent,
+                tools::MAP_TASK_APPLY_TOOL,
+                &json!({ "taskId": "task-ready" }),
+            )
+            .unwrap();
+        assert_eq!(applied["status"], "applied");
+        assert_eq!(applied["appliedBy"], "agent");
+        let action = actions.lock()[0].clone();
+        assert_eq!(action.kind, TeamTaskActionKind::Apply);
+        assert_eq!(action.task_id, "task-ready");
+        assert_eq!(action.session_id, runtime.session_id());
+        assert_eq!(action.request_id, "req-delegate");
+
+        // Discard needs no inspection.
+        let discarded = runtime
+            .execute_for_run(
+                &parent,
+                tools::MAP_TASK_DISCARD_TOOL,
+                &json!({ "taskId": "task-ready" }),
+            )
+            .unwrap();
+        assert_eq!(discarded["status"], "discarded");
+        assert_eq!(actions.lock()[1].kind, TeamTaskActionKind::Discard);
+
+        // Without an injected executor the action is a correctable error.
+        let bare = SessionToolRuntime::for_tests();
+        bare.begin_request("req-delegate", "project").unwrap();
+        let (_cancel, receiver) = tokio::sync::watch::channel(0_u64);
+        bare.set_cancellation(receiver);
+        let mut ready = team_task("task-ready", crate::team::TeamTaskStatus::CandidateReady);
+        ready.candidate = Some(ready_summary());
+        save_eps_session(&bare, vec![ready]);
+        let unavailable = bare
+            .execute_for_run(
+                &delegation_identity(&bare, 1),
+                tools::MAP_TASK_DISCARD_TOOL,
+                &json!({ "taskId": "task-ready" }),
+            )
+            .unwrap_err();
+        assert!(unavailable.contains("unavailable"), "{unavailable}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn team_task_tools_are_refused_for_a_delegated_child() {
+        let (runtime, _emitted, _seen) = delegation_runtime();
+        save_eps_session(&runtime, Vec::new());
+        let child = delegation_identity(&runtime, 7);
+        runtime
+            .delegation
+            .lock()
+            .children
+            .insert(child.run_id.get());
+        for tool in [
+            tools::MAP_TASK_STATUS_TOOL,
+            tools::MAP_TASK_DIFF_TOOL,
+            tools::MAP_TASK_OBJECTS_TOOL,
+            tools::MAP_TASK_RENDER_TOOL,
+            tools::MAP_TASK_APPLY_TOOL,
+            tools::MAP_TASK_DISCARD_TOOL,
+        ] {
+            let error = runtime
+                .execute_for_run(&child, tool, &json!({ "taskId": "t" }))
+                .unwrap_err();
+            assert!(
+                error.contains("delegated read cannot use"),
+                "{tool} must be refused for a delegated child: {error}"
+            );
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

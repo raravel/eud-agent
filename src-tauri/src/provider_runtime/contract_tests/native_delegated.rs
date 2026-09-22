@@ -27,6 +27,16 @@ fn schema() -> serde_json::Value {
 }
 
 async fn delegated(provider: ProviderId, tag: &str, run: u64, prompt: &str) -> DelegatedRunOutcome {
+    delegated_within(provider, tag, run, prompt, Duration::from_secs(30)).await
+}
+
+async fn delegated_within(
+    provider: ProviderId,
+    tag: &str,
+    run: u64,
+    prompt: &str,
+    active_deadline: Duration,
+) -> DelegatedRunOutcome {
     let fixture = RuntimeFixture::new(tag);
     let (binding, adapter) = native_adapter(provider, &fixture);
     let events = Arc::new(NativeEvents::default());
@@ -49,7 +59,7 @@ async fn delegated(provider: ProviderId, tag: &str, run: u64, prompt: &str) -> D
             profile: DelegatedToolProfile::new(["list_files", "read_file"], &schema()).unwrap(),
             allow_live_write_ticket: false,
             policy: RunPolicy {
-                active_deadline: Some(Duration::from_secs(30)),
+                active_deadline: Some(active_deadline),
                 shutdown_grace: Duration::from_secs(2),
                 max_output_bytes: 64 * 1024,
                 max_output_tokens: None,
@@ -97,6 +107,28 @@ async fn native_write_is_fatal(provider: ProviderId, run: u64) {
     );
 }
 
+/// A submission accepted before the deadline is the result even when the
+/// native CLI then keeps its turn open until the deadline cuts it.
+async fn native_submission_survives_the_deadline(provider: ProviderId, run: u64) {
+    let outcome = delegated_within(
+        provider,
+        "native-delegated-submit-hang",
+        run,
+        "delegated-submit-hang",
+        Duration::from_secs(5),
+    )
+    .await;
+    assert_eq!(
+        outcome,
+        DelegatedRunOutcome::Result {
+            value: json!({"summary": "submitted early", "files": []}),
+            completions: 1,
+            usage: None,
+        },
+        "{provider:?}"
+    );
+}
+
 async fn native_prose_fails(provider: ProviderId, run: u64) {
     let outcome = delegated(provider, "native-delegated-prose", run, "delegated-prose").await;
     assert_eq!(
@@ -126,6 +158,16 @@ async fn codex_delegated_write_is_a_fatal_unknown_tool() {
 #[tokio::test]
 async fn claude_delegated_write_is_a_fatal_unknown_tool() {
     native_write_is_fatal(ProviderId::ClaudeCode, 61_004).await;
+}
+
+#[tokio::test]
+async fn codex_delegated_submission_survives_a_deadline_on_the_open_turn() {
+    native_submission_survives_the_deadline(ProviderId::Codex, 61_007).await;
+}
+
+#[tokio::test]
+async fn claude_delegated_submission_survives_a_deadline_on_the_open_turn() {
+    native_submission_survives_the_deadline(ProviderId::ClaudeCode, 61_008).await;
 }
 
 #[tokio::test]

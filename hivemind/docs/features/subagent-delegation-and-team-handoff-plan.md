@@ -1,6 +1,8 @@
 # Subagent delegation and EPS–Map team handoff plan
 
-Status: Phase 0 implemented (2026-09-18); Phase 1–3 proposed. 이 문서는 3단계(위임 읽기 run →
+Status: Phase 0 implemented (2026-09-18); Phase 1 (`delegate_read`) and Phase 2 (`map_task_request`
+team handoff) implemented 2026-09-20 with the deviations listed under "Implemented result"; Phase 3
+proposed. 이 문서는 3단계(위임 읽기 run →
 EPS↔Map 팀 핸드오프 → 병렬 읽기/리뷰 워커) 전체의 설계 권위이며, 구현 후에는 `architecture.md`, `rules.md`,
 `features/05_agent-core.md`, `features/sessions.md`, `verify.md`가 동작 권위를 이어받는다.
 
@@ -32,7 +34,7 @@ EPS↔Map 팀 핸드오프 → 병렬 읽기/리뷰 워커) 전체의 설계 권
 | `ask_waiting` watch 채널 (`runtime/step.rs`, `runtime/tool_batch.rs`) | 부모 active deadline을 멈춘 채 외부 완료를 기다리는 검증된 메커니즘 (app37 native ASK) |
 | `ProjectWriteCoordinator` | 세션 간 canonical 쓰기 직렬화 — 팀 동시성 규칙의 기존 권위 |
 | `CandidateStore::save_selection`/`prepare_request` | EPS `MapRegion`/`MapLocation` 멘션과 같은 형태의 selection을 받는 Map 요청 입구 |
-| `map_agent_candidate_apply`/`apply_undo`, `verify_current_for_apply` | 신뢰된 사용자 Apply, stale source hash 거부, exact undo |
+| `map_agent_candidate_apply`/`apply_undo`, `verify_current_for_apply` | 신뢰된 사용자 Apply, 저장된 원본 따라가기(`follow_source`), exact undo |
 | actual39 C18 | Map 읽기와 OpenCode 읽기 병행이 세션 경계를 지키며 완료됨 |
 
 ## 2. 목표
@@ -72,8 +74,9 @@ EPS↔Map 팀 핸드오프 → 병렬 읽기/리뷰 워커) 전체의 설계 권
 - 하나의 툴 호출 안에서 기다리는 시간은 **240초를 넘지 않는다** (native CLI의 300초 MCP 호출 한도
   아래). ASK, 위임, 팀 후보 대기 모두 이 상한을 공유하며, 더 긴 기다림은 턴을 끝내고 다음 사용자
   메시지로 이어진다. 대기 중 부모 active deadline은 지금의 ASK처럼 멈춘다.
-- 팀 Map 세션의 candidate는 기존 stale source hash 검사를 그대로 받는다. EPS 쪽 map 도구와 Map
-  후보가 같은 레이어를 겹쳐 쓰지 않도록 팀 작업 중 상호 배제한다.
+- 팀 Map 세션의 candidate도 저장된 원본을 따라간다(`follow_source`): 사용자 Map 창이나 맵 속성이
+  원본을 바꾸면 팀 후보는 새 원본 위로 rebase되고 announced revision 번호는 유지된다. EPS 쪽 map
+  도구와 Map 후보가 같은 레이어를 겹쳐 쓰지 않도록 팀 작업 중 상호 배제한다.
 - Startup은 아무것도 재개하지 않는다. 진행 중이던 팀 작업은 `interrupted`로 매핑되고 후보는 Map
   창에서 여전히 사용자 검토가 가능하다.
 
@@ -257,7 +260,11 @@ run이다. 부모는 `delegate_read` usage error `{ code: "delegation_failed", r
 
 ### 팀 Map 세션
 
-EPS 세션 S마다 지연 생성되는 **팀 Map 세션** M을 둔다.
+EPS 세션 S의 **팀 Map 세션** M은 `map_task_request`마다 새로 만든다(2026-09-21 사용자 결정:
+이전 요청의 provider thread·transcript·미적용 후보가 다음 요청 아래에 쌓이지 않도록, 항상 저장된
+원본 맵의 r0에서 시작). S의 이전 팀 세션은 그 Apply를 Map 창에서 아직 undo할 수 있을 때만 남기고
+나머지는 후보와 함께 삭제(retire)한다; 실행 중인 턴이 있는 세션은 그대로 두고 다음 요청 때 다시
+시도한다. 삭제된 세션을 아직 보고 있던 Map 창의 늦은 로그 저장은 조용히 버려진다.
 
 - `SessionKind::Map`, 이름 `"<S 이름> · 맵 작업"`, provider binding은 S의 binding을 복사(전역
   기본값이 아님; 세션 binding 불변 규칙 유지).
@@ -308,7 +315,7 @@ map_task_request {
   읽은 증거를 요구한다.
 - 실행 순서:
   1. `TeamTask` 생성·영속(`Queued`), source map hash 기록.
-  2. 팀 Map 세션 M 확보(없으면 생성).
+  2. 새 팀 Map 세션 M 생성, 이전 팀 세션 retire(undo 가능한 것 제외).
   3. `regions`/`locations`를 M의 `CandidateStore::save_selection`으로 `target` 역할 selection으로
      저장. stale 스냅샷은 usage error.
   4. M에 정규 `map_chat(request_id = 새 ID, text = 고정 템플릿(goal + selection 참조 + layers))`를
@@ -319,8 +326,17 @@ map_task_request {
 - 대기 메커니즘은 Phase 1과 같은 `delegation_waiting` 채널이다. **Apply는 툴 안에서 기다리지
   않는다.** `candidate_ready` 또는 `running`을 받은 모델은 사용자에게 Map 창에서 후보를 검토·적용해
   달라는 텍스트로 턴을 끝낸다. Apply/폐기 결과는 `TeamTask` 상태로 영속되어 다음 turn의 task-state
-  projection에 들어가고, 패널의 팀 작업 카드는 Apply 뒤 "이어서 진행" 버튼으로 정해진 사용자
-  메시지를 보낸다.
+  projection에 들어가고, 패널의 팀 작업 카드는 `candidate_ready`부터 "이어서 진행" 버튼으로 정해진
+  사용자 메시지를 보낸다.
+- **백그라운드 정산의 자동 이어받기.** 툴이 `running`으로 반환한 뒤(`detached`) 태스크가
+  `candidate_ready`/`failed`로 정산되면 settler는 `TeamCommand::ContinueInteractive`를 보내고,
+  디스패처는 `SessionEngineManager::team_continue`로 EPS 세션에 "이어서 진행"과 같은 고정 메시지
+  (`TEAM_TASK_CONTINUE_TEXT`)의 정규 interactive turn을 시작한다. 엔진 lock을 기다려 `running`을
+  받은 턴이 끝난 뒤에만 시작하고, phase가 `Idle`이 아니거나(검토·계획 대기) autonomous run이
+  살아 있거나 태스크가 그 사이 다른 상태가 되면 시작하지 않는다 — 그 경우 다음 사용자 턴의
+  `[map tasks]`가 전달한다. 시작 직전 `team_task` 이벤트에 `continuation{clientTurnId, text}`를
+  실어 패널이 사용자 말풍선을 기록하고 `chatSent()`로 턴 진행 상태에 들어간다. `cancelled`는
+  이어받지 않는다(사용자가 멈춘 것).
 - 반환값:
 
 ```json
@@ -338,8 +354,9 @@ map_task_request {
 - S의 request에 `Running`/`CandidateReady` 팀 작업이 있으면 S의 `location_write`, `switch_write`,
   `map_sound_*` 호출은 usage error `map_task_in_progress`로 완료된다.
 - M의 Apply는 기존 `verify_current_for_apply`(source hash, build marker, no-share probe, 백업)를 그대로
-  받는다. S가 그 사이 map을 바꿨다면 후보는 stale이고 사용자는 폐기해야 한다; 팀 작업은
-  `Discarded`가 된다.
+  받는다. S가 그 사이 map을 바꿨다면 후보는 새 원본 위로 옮겨진 뒤 적용된다(옮길 수 없으면
+  `sourceDiverged`; `map_task_diff`가 이를 보고하고 `map_task_apply`는 거부하므로 사용자만 Map 창에서
+  덮어쓸 수 있다).
 - `build_run`(S)은 project transaction만 잡는다. M의 draft 작업은 후보 파일만 만지므로 병행 가능하고,
   M의 Apply는 build marker가 잡힌 동안 기존 규칙대로 거부된다.
 
@@ -374,10 +391,76 @@ map_task_request {
 - 240초 안에 후보가 나오면 `candidate_ready`, 아니면 `running`; 어느 쪽도 Apply를 기다리지 않는다.
   Apply 뒤 다음 turn의 task-state projection에 `Applied` + 새 source hash가 들어간다.
 - 폐기 → `discarded`; M 실패/취소 → 해당 상태; S 취소 → M 요청 취소 + 팀 작업 `Cancelled`.
-- 팀 작업 중 S `location_write` → usage error. S가 map을 바꾼 뒤 M Apply → stale 거부.
+- 팀 작업 중 S `location_write` → usage error. S가 map을 바꾼 뒤 M Apply → rebase 후 적용.
 - S changeset reject가 Map apply를 건드리지 않고 "맵 적용 취소" 동작이 별도로 동작한다.
 - restart 매핑이 표대로 되고 M 후보가 보존된다.
 - 팀 세션 binding이 S binding과 같고 전역 기본값 변경에 영향받지 않는다.
+
+## Implemented result (Phases 1–2, 2026-09-20)
+
+동작 권위는 `features/05_agent-core.md` "Read delegation and Map handoff"와 `features/sessions.md`
+"Team map tasks"로 넘어갔다. 계획과 다른 점:
+
+- `delegate_read`는 EPS 세션에만 광고된다. Map 세션용 읽기 분류(`DelegatedToolProfile`의 Map
+  registry 검증)가 없어 Map 세션 위임은 이후 작업이다.
+- 자식 툴 집합은 계획의 4개 제외에 더해 `propose_plan`(foreground 제어 툴)을 제외한다.
+  `trace_test_run`/`trace_suite_run`은 이제 어떤 세션에도 광고되지 않는다.
+- `delegation_waiting` 채널은 두지 않았다. foreground `active_deadline`은 `None`이라 멈출 deadline이
+  없고, 자식은 자기 240초 deadline을 그대로 갖는다. 대신 세션 활동은 `running_read`를 유지하고
+  패널은 `delegation` 이벤트와 중첩 카드로 대기 상태를 보여 준다.
+- 자식 usage는 세션 `context_usage.total`에만 합산되고 `last`는 부모 것이 유지된다(계획대로).
+- `map_task_request`의 입력은 mention 스냅샷 대신 `selectionIds`(영구 target selection id)와
+  `locationIds`(정확한 로케이션 id)다. 엔진이 팀 세션의 현재 후보 상태에서 검증된
+  `MapMentionSnapshot::Region`/`Location`으로 투영한다. `await: "apply"`는 두지 않았다: Apply는
+  툴 안에서 절대 기다리지 않는다.
+- evidence는 같은 request에서 `map_info`가 한 번 성공했는지(`RequestState.map_inspected`)로
+  판정한다. 상호 배제는 request가 아니라 **세션** 단위이며(팀 Map 세션의 후보 계보가 하나이므로),
+  제외 툴에 `player_setup`을 더했다(시작 위치도 맵 쓰기).
+- Map 요청은 `SessionEngineManager` 생성 시 스폰되는 팀 디스패처 태스크가 실행한다. `worker()`가
+  주입하는 실행기가 `map_chat`을 직접 await하면 두 opaque future가 서로를 정의해 컴파일되지
+  않으므로, 실행기는 디스패처에 명령만 보낸다.
+- 리뷰 연결(`linkedMapApplies`, 리뷰 패널의 "맵 적용 취소")과 Map 창 Apply 대화상자 문구, 세션
+  활동 `waiting_team_apply`/`delegating` 값은 아직 없다. Undo는 Map 창의 기존 동작이며 팀 작업을
+  `discarded`로 되돌린다.
+- 트리아지 프롬프트는 배치 전용 요청을 `direct`로 보내고 foreground가 `map_task_request`를
+  호출하도록 한다. 실제 5-provider 앱 검증(계획 "검증" 항목 1–5)은 아직 수행되지 않았다.
+- 2026-09-21 실제 `rpg` 프로젝트에서 첫 `map_task_request`가 "the current source map belongs to
+  another project"로 거부됐다. EPS 세션의 `meta.project`는 manifest 이름이고 Map 세션과
+  `MapRevision.project_id`는 프로젝트 루트 해시인데 둘을 직접 비교한 탓이다. 이제 부모는 열린
+  프로젝트의 manifest 이름으로, 팀 세션은 Map project id로 각각 검증·생성한다. 같은 사건에서
+  모델이 실패를 "Map 창을 열어 달라"는 지시로 바꿨으므로, `[map handoff]` 가이드와 툴 설명은
+  창을 요구하지 말라고 못박고, 후보가 준비되면 디스패처가 팀 세션으로 Map 창을 직접 연다
+  (`open_map_window`, `map_agent_open {sessionId?}`, `map-agent-open-session` 이벤트).
+
+## Phase 2b: 에이전트 주도 후보 검토·적용 (2026-09-21 구현)
+
+사용자 결정: EPS 에이전트가 후보를 **읽고**, **후속 수정·폐기**하고, **스스로 Apply**까지 한다
+(항상 에이전트 판단; 설정 토글 없음). 트리거 작업이 맵 배치를 전제로 하므로 배치 → 확인 →
+적용 → 코드 흐름이 사용자 클릭 없이 이어져야 한다는 요구에서 나왔다.
+
+- 읽기: `map_task_diff`, `map_task_objects`, `map_task_render`가 팀 세션의 현재 후보를 읽는다.
+  후보가 태스크가 알린 리비전·해시와 다르면 거부. 성공은 `RequestState.candidate_inspected`에
+  기록된다.
+- 적용: `map_task_apply`는 canonical write(쓰기 전환·프로젝트 트랜잭션)이며 docs 게이트 대신
+  같은 request의 후보 검사(inspection)를 요구한다. 실행은 Map 창 Apply와 동일한
+  `MapAgentService::apply`(백업·검증·롤백·MapSafe)이고, 태스크는 `applied` + `appliedBy: agent`.
+- 수정: 후보가 `candidate_ready`인 동안 후속 `map_task_request`를 허용한다. 같은 팀 세션 계보에
+  리비전을 더하고 이전 태스크는 `superseded`가 된다. `queued`/`running` 중에는 여전히 거부.
+- 폐기: `map_task_discard`는 팀 세션 후보를 버리고 태스크를 `discarded`로 만든다.
+- 되돌리기: 사용자는 Map 창 Undo 또는 EPS 패널 카드의 "맵 적용 취소"(`map_task_apply_undo`)로
+  에이전트의 적용을 되돌린다. 리뷰 패널 changeset 연결(`linkedMapApplies`)은 여전히 없다.
+- 자율 실행: 활성 태스크로 `team_apply` pause된 실행은 태스크가 정산되면 디스패처가
+  `autonomous_resume`으로 이어간다(`TeamCommand::ResumeAutonomous`). interactive 세션은 툴이
+  `running`으로 돌아간 태스크가 정산되면 `team_continue`가 고정 메시지 턴을 스스로 시작한다
+  (`TeamCommand::ContinueInteractive`); 240초 안에 정산된 태스크는 같은 턴에서 검토한다.
+- 안전 경계: 팀 후보 툴은 위임 자식에게 모두 거부된다. 적용은 원본 맵 해시가 후보 baseline과
+  일치할 때만 성공한다(MapSafe). `map_task_apply`는 journal에 기록되지 않으므로 changeset
+  reject로는 되돌릴 수 없고 Undo로만 되돌린다.
+- 검증: `map_task_apply_needs_candidate_inspection_and_runs_the_action_executor`,
+  `a_ready_candidate_admits_a_follow_up_request_but_a_running_task_does_not`,
+  `team_task_tools_are_refused_for_a_delegated_child`,
+  `team_task_action_validates_the_live_candidate_and_discards_it`, 패널 카드/프로토콜 테스트.
+  실제 프로바이더로 apply까지 완료한 실행은 아직 없다.
 
 ## Phase 3: 병렬 읽기 워커와 위임 리뷰
 
@@ -414,7 +497,9 @@ read 툴 `delegate_review`를 EPS registry에 추가한다.
 
 - EPS 대화: `delegate_read`/`delegate_review` 툴 항목 아래 nested 카드(상태, 툴 호출 수, 경과 시간,
   "위임 취소" — 자식만 취소). 팀 작업 카드(상태, 목표, "맵 창 열기", 후보 요약, Apply 결과).
-- 대기 상태 문구: "맵 창에서 후보 r3을 검토하고 적용 또는 폐기하면 이어서 진행합니다."
+- 대기 상태 문구: "맵 에이전트가 후보 r3을 만들었습니다. AI가 이어서 검토합니다. 맵 창에서 직접
+  적용하거나 폐기할 수도 있습니다." 카드 힌트는 자동 턴이 시작되지 않은 경우를 위해 "자동으로
+  이어지지 않으면 이어서 진행을 누르세요"를 덧붙인다.
 - 리뷰 패널: 연결된 Map apply 행 + "맵 적용 취소" 버튼(Undo 가능할 때만 활성).
 - Map 창: 팀 세션 배지 "EPS 세션 ○○의 작업", 읽기 전용 목표 텍스트, 정상 후보 UI. Apply 확인
   대화상자에 "적용하면 EPS 세션이 이어서 진행합니다"를 표시.

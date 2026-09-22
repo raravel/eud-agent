@@ -296,6 +296,75 @@ describe("AgentStream — tool args/result (EUD-068)", () => {
     );
     expect(screen.getByText("실패")).toBeInTheDocument();
   });
+
+  it("renders a delegate_read row with its goal, lifecycle, nested child rows, and summary", async () => {
+    render(
+      <AgentStream
+        reasoning=""
+        answerStarted={false}
+        live={true}
+        tools={[
+          {
+            id: "t1",
+            name: "delegate_read",
+            state: "done",
+            detail: '{"summary":"src/hp.eps:12에서 P1 체력을 씁니다"}',
+            delegation: {
+              goal: "P1 체력 저장 위치 찾기",
+              status: "completed",
+              toolCalls: 3,
+              elapsedMs: 4200,
+            },
+            children: [
+              { id: "c1", name: "source_search", state: "done", detail: "2 hits" },
+              { id: "c2", name: "read_file", state: "failed" },
+            ],
+          },
+        ]}
+      />,
+    );
+    // The stream counts only the parent row; the children nest inside it.
+    expect(screen.getByText("도구 호출 1건")).toBeInTheDocument();
+    await userEvent.click(screen.getByText("delegate_read"));
+    const block = screen.getByTestId("delegation-block");
+    expect(block).toHaveTextContent("위임된 읽기 작업");
+    expect(block).toHaveTextContent("P1 체력 저장 위치 찾기");
+    expect(screen.getByTestId("delegation-status")).toHaveTextContent("위임 완료");
+    expect(block).toHaveTextContent("도구 호출 3건");
+    expect(block).toHaveTextContent("4.2초");
+    expect(block).toHaveTextContent("자식 도구 호출 2건");
+    expect(screen.getByTestId("tool-c1")).toHaveTextContent("source_search");
+    expect(screen.getByTestId("tool-c2")).toHaveTextContent("read_file");
+    expect(block).toHaveTextContent("src/hp.eps:12에서 P1 체력을 씁니다");
+  });
+
+  it("shows a failed delegation's reason as an alert", async () => {
+    render(
+      <AgentStream
+        reasoning=""
+        answerStarted={false}
+        live={false}
+        tools={[
+          {
+            id: "t1",
+            name: "delegate_read",
+            state: "failed",
+            delegation: {
+              goal: "g",
+              status: "failed",
+              toolCalls: 0,
+              elapsedMs: 240_000,
+              error: "위임된 읽기 작업을 완료하지 못했습니다: 시간 초과",
+            },
+          },
+        ]}
+      />,
+    );
+    await userEvent.click(screen.getByText("delegate_read"));
+    expect(screen.getByRole("alert")).toHaveTextContent("시간 초과");
+    expect(screen.getByTestId("delegation-status")).toHaveTextContent("위임 실패");
+    expect(screen.getByTestId("delegation-block")).toHaveTextContent("4분 0초");
+  });
 });
 
 describe("AgentStream — no raw kind leak", () => {

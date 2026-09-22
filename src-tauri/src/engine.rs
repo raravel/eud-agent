@@ -5,7 +5,7 @@
 //! unit-testable without project I/O, RAG, or Codex I/O.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     fmt,
     path::PathBuf,
     sync::{
@@ -15,8 +15,12 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+mod delegation;
 pub(crate) mod runtime_events;
+mod team;
 mod workflow_stages;
+
+pub(crate) use team::emit_team_tasks;
 #[cfg(test)]
 mod workflow_tests;
 
@@ -149,6 +153,20 @@ const AUDIO_SOUND_GUIDE: &str = r#"[map sounds]
 - Looping BGM uses the durationMs returned by the latest import/edit plus the existing lifecycle/timer cadence and a bounded guard margin. Never call early enough to overlap. Disclose that default StarCraft music may overlap.
 - Volume and fade are offline file edits. Do not claim runtime stop, pause/resume, seek, volume automation, crossfade, gapless playback, or independent concurrent BGM control.
 - After any sound import/edit and required EPS path migration, run the complete-project build_run. A map sound mutation without a build attempt is incomplete."#;
+
+const MAP_HANDOFF_GUIDE: &str = r#"[map handoff]
+- This session cannot place or edit terrain, units, buildings, doodads, or sprites itself: those belong to the Map Agent, your team session with its own tools. When a request needs such a change, do not answer that it is impossible and never ask the user to open the Map window first: map_task_request needs no open window. Call map_info in this request, then map_task_request with the goal, the layers, and (from [resolved mentions]) any target selection ids.
+- The Map Agent is the designer, not a plotter: it has the palette, tile readers, renderer, and analyzer this session lacks, and a direct request in the Map window gets its full skill. A team task gets the same skill only through the goal you write, so relay the user's request instead of your own design: quote the user's wording and intent in the user's language ("시작마을처럼 예쁘게 꾸며줘", "몬스터 사냥터답게"), name any reference area on the map it should match ("the village at x=16..39, y=16..35"), and add only the constraints the code depends on — bounds, keep-clear cells and margins, location ids, walkability or reachability, layers to leave alone. Never choose the medium (doodads vs tiles vs units/buildings/sprites), counts, doodad ids, cluster coordinates, or a suggested layout, and never paste tile ids from map_info unless they are themselves a constraint: state a keep-clear rectangle, not a tile listing. Grant every layer the look may need (decoration usually needs terrain, doodads, and sprites, often units or buildings too) and narrow layers only when the user or the code requires it. The Map Agent reads tiles itself with map_terrain_read and has no map_info, so never instruct it to call map_info.
+- On candidate_ready, decide yourself in the same turn: inspect the candidate with map_task_diff (counts and verification), map_task_objects (exact placements per layer), and map_task_render (a picture of the area), then map_task_apply it when it meets the goal, send a corrected complete map_task_request to replace it (the earlier task is superseded; the new one starts in a fresh team session from the saved map, so describe the whole result, never a delta on the candidate), or map_task_discard it. After a successful apply re-read map_info and continue with the EPS-side work (triggers, locations, players, switches, sounds).
+- On running (the Map Agent needed more than the wait), end the turn with a short status; the conversation continues by itself once the task settles — the next message reports it through [map tasks] and you continue from there — so never ask the user to send a message or open a window to resume. While a task is queued, running, or candidate_ready, location_write, switch_write, player_setup, and map sound tools are refused, and code must not reference objects a pending candidate would create.
+- The user can also apply, discard, or undo in the Map window (the app opens it on the team session when a candidate is ready) ; an undone apply shows as discarded in [map tasks]. Never claim the map changed before [map tasks] or map_task_status shows the task as applied.
+- If a map task call fails, report the exact reason and stop; do not turn a failure into an instruction for the user to open, switch, or reload a window."#;
+
+const DELEGATION_GUIDE: &str = r#"[delegation]
+- delegate_read runs one isolated read-only child over the project read tools and returns only its structured summary; the child's raw reads never enter this context. Use it for broad exploration whose verbatim results you do not need: "find every module that writes P1 death counters", "which units have overridden DAT attack values", "summarize the location layout of the connected map".
+- Give the child one bounded goal and, when known, focus paths or object names. Do not delegate work that needs your own judgment, a build, a runtime test, a user decision, or a write.
+- A delegated summary is a hint, never mutation evidence: read the exact target yourself before editing it, and run search_docs yourself before a write. The child cannot write, ask, build, or delegate again.
+- The call waits up to 240 seconds and at most 8 delegations are admitted per run; a failed, cancelled, or timed-out child returns a usage error, after which you continue with direct reads."#;
 
 const EVIDENCE_GUIDE: &str = r#"[evidence]
 - EVERY unit of work (eps/Python code, Python dependencies, dat edits, map location/player/switch writes, settings) must be grounded in the docs: call search_docs (Korean query) BEFORE writing, inspect promising exact chunks with docs_get, and justify each item with WHY plus its source as a markdown link — `... (근거: [제목](url))`.
@@ -666,7 +684,7 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
             .unwrap_or_else(|| "없음".to_string());
         Ok(AgentTurnInput {
             text: format!(
-                "[autonomous continuation]\n원래 목표:\n{}\n\n수락 기준:\n{}\n\n현재 blocker:\n{}\n\n최근 build:\n{}\n\n경계 이유: {:?}\n\n확인된 체크포인트 이후의 미완료 작업만 계속하세요. 완료된 도구 호출을 재실행하거나 이전 대화 전체를 재진술하지 마세요.",
+                "[autonomous continuation]\n원래 목표:\n{}\n\n수락 기준:\n{}\n\n현재 blocker:\n{}\n\n최근 build:\n{}\n\n경계 이유: {:?}\n\n확인된 체크포인트 이후의 미완료 작업만 계속하세요. 완료된 도구 호출을 재실행하거나 이전 대화 전체를 재진술하지 마세요.{}",
                 run.goal,
                 if acceptance.is_empty() {
                     "- 명시된 원래 목표와 검증 기준".to_string()
@@ -676,6 +694,7 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
                 blocker.unwrap_or("없음"),
                 latest_build,
                 reason,
+                Self::continuation_delegation_hint(reason),
             ),
             image_paths: Vec::new(),
             workspace_root: previous.workspace_root.clone(),
@@ -686,16 +705,31 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
         })
     }
 
+    /// After a context-pressure boundary the next iteration is told to push
+    /// exploration into `delegate_read` children instead of its own context.
+    /// A fixed control phrase; the engine never auto-delegates.
+    fn continuation_delegation_hint(
+        reason: crate::provider_runtime::IterationBoundaryReason,
+    ) -> &'static str {
+        match reason {
+            crate::provider_runtime::IterationBoundaryReason::ContextPressure => {
+                " 컨텍스트 여유가 부족합니다: 넓은 탐색(source_search, docs_get, map_info 페이지 조회 등)은 delegate_read로 위임하고 요약만 받으세요. 편집 대상은 편집 직전에 직접 다시 읽어야 합니다."
+            }
+            _ => "",
+        }
+    }
+
     fn interactive_continuation_turn(
         previous: &AgentTurnInput,
         reason: crate::provider_runtime::IterationBoundaryReason,
     ) -> AgentTurnInput {
+        let hint = Self::continuation_delegation_hint(reason);
         AgentTurnInput {
             text: format!(
                 "[continuation]
 경계 이유: {reason:?}
 
-확인된 체크포인트 이후의 미완료 작업만 계속하세요. 완료된 도구 호출을 재실행하거나 이전 대화 전체를 재진술하지 마세요."
+확인된 체크포인트 이후의 미완료 작업만 계속하세요. 완료된 도구 호출을 재실행하거나 이전 대화 전체를 재진술하지 마세요.{hint}"
             ),
             image_paths: Vec::new(),
             workspace_root: previous.workspace_root.clone(),
@@ -727,6 +761,22 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
             }
             _ => None,
         };
+        run.active_started_at = None;
+        self.persist_autonomous_run(run).await
+    }
+
+    async fn pause_autonomous_for_team_apply(&mut self) -> Result<(), AgentEngineError> {
+        let mut run = self.autonomous_run()?;
+        if run.status.is_terminal() {
+            return Ok(());
+        }
+        self.update_autonomous_progress(&mut run, false)?;
+        run.status = crate::autonomous::AutonomousRunStatus::Paused;
+        run.pause_reason = Some(crate::autonomous::AutonomousPauseReason::TeamApply);
+        run.blocker = Some(
+            "팀 맵 작업이 아직 끝나지 않았습니다. 후보가 준비되면 자동으로 이어서 진행하며, 후보가 이미 준비된 경우 맵 창에서 적용·폐기하거나 계속을 누르면 AI가 후보를 검토합니다."
+                .to_string(),
+        );
         run.active_started_at = None;
         self.persist_autonomous_run(run).await
     }
@@ -917,6 +967,14 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
                             // reply arrives as an ordinary message, so the run
                             // pauses instead of completing or iterating.
                             self.pause_autonomous_for_unanswered_ask().await?;
+                            return Ok(AgentTurnResult::Answer { text });
+                        }
+                        if team::has_active_task(&self.session_store, &self.session_id) {
+                            // The Map Agent is still working, or the model
+                            // left a ready candidate undecided: pause; the
+                            // team dispatcher resumes the run when the task
+                            // settles, otherwise the user does.
+                            self.pause_autonomous_for_team_apply().await?;
                             return Ok(AgentTurnResult::Answer { text });
                         }
                         if let Some(blocker) = self.autonomous_completion_blocker()? {
@@ -1457,6 +1515,12 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
         if let Some(note) = route_note {
             turn_text.push_str("\n\n");
             turn_text.push_str(&note);
+        }
+        if self.session_kind == crate::session::SessionKind::Eps {
+            if let Some(note) = team::prompt_note(&self.session_store, &self.session_id) {
+                turn_text.push_str("\n\n");
+                turn_text.push_str(&note);
+            }
         }
         if execution_mode == crate::autonomous::ExecutionMode::Autonomous {
             turn_text.push_str(
@@ -3372,6 +3436,9 @@ struct SessionEngineManagerInner {
     harness_jobs: crate::harness::HarnessJobStore,
     running_harness: tokio::sync::Mutex<HashSet<String>>,
     recovered_projects: SyncMutex<HashMap<String, ProjectRecoveryResult>>,
+    /// Team Map requests run on a dispatcher spawned with the manager; see
+    /// `engine::team` for why the per-session executor only sends to it.
+    team_dispatcher: team::TeamDispatcher,
 }
 
 fn restore_pending_review(
@@ -3492,7 +3559,8 @@ impl SessionEngineManager {
         dirs: crate::config::DataDirs,
         fallback_cwd: PathBuf,
     ) -> Self {
-        Self {
+        let (team_dispatcher, team_commands) = tokio::sync::mpsc::unbounded_channel();
+        let manager = Self {
             inner: Arc::new(SessionEngineManagerInner {
                 workers: tokio::sync::Mutex::new(HashMap::new()),
                 sessions,
@@ -3506,8 +3574,11 @@ impl SessionEngineManager {
                 harness_jobs: crate::harness::HarnessJobStore::new(dirs.clone()),
                 running_harness: tokio::sync::Mutex::new(HashSet::new()),
                 recovered_projects: SyncMutex::new(HashMap::new()),
+                team_dispatcher,
             }),
-        }
+        };
+        tauri::async_runtime::spawn(team::dispatch(team_commands, manager.clone()));
+        manager
     }
 
     /// Hold admission closed until project configuration has atomically settled.
@@ -4096,6 +4167,37 @@ impl SessionEngineManager {
         runtime.set_cancellation(cancellation_rx.clone());
         let binding = BindingSnapshot::from_binding(&record.provider_binding, None)
             .map_err(|error| AgentEngineError::new(error.to_string()))?;
+        if record.meta.kind == crate::session::SessionKind::Eps {
+            let delegation_sink = sink.clone();
+            runtime.set_delegation_emitter(move |event| {
+                delegation_sink
+                    .emit_scoped("delegation", event)
+                    .map_err(|error| format!("failed to emit delegation event: {error}"))
+            });
+            let context = delegation::ReadDelegationContext {
+                dirs: self.inner.dirs.clone(),
+                fallback_cwd: self.inner.fallback_cwd.clone(),
+                binding: binding.clone(),
+                tools: runtime.clone(),
+                sink: sink.clone(),
+                sessions: self.inner.sessions.clone(),
+                session_id: session_id.to_string(),
+                cancellation: cancellation_rx.clone(),
+            };
+            runtime.set_delegation_executor(move |delegation| {
+                Box::pin(context.clone().run(delegation))
+            });
+            let team = team::TeamHandoffContext {
+                app: self.inner.app.clone(),
+                dispatcher: self.inner.team_dispatcher.clone(),
+                sessions: self.inner.sessions.clone(),
+                session_id: session_id.to_string(),
+                cancellation: cancellation_rx.clone(),
+            };
+            runtime.set_team_executor(move |request| Box::pin(team.clone().run(request)));
+            let app = self.inner.app.clone();
+            runtime.set_team_action_executor(move |action| team::run_action(&app, action));
+        }
         let adapter = crate::provider_runtime::production_adapter(
             &record.provider_binding,
             &self.inner.dirs,
@@ -4245,6 +4347,129 @@ impl SessionEngineManager {
         };
         self.finish_read_command(&worker, result).await
     }
+
+    /// Continue an EPS conversation after its team map task settled in the
+    /// background (the `map_task_request` had returned `running`): one
+    /// ordinary interactive turn on the fixed continuation text, exactly as if
+    /// the user had pressed "이어서 진행". The turn starts only once the
+    /// session is idle; an autonomous run, a pending review, or a task the
+    /// user already moved past leaves the settlement to `[map tasks]` on the
+    /// session's own next turn instead.
+    pub(crate) async fn team_continue(
+        &self,
+        session_id: &str,
+        task_id: &str,
+    ) -> Result<(), AgentEngineError> {
+        let record = self
+            .inner
+            .sessions
+            .load(session_id)
+            .map_err(|error| AgentEngineError::new(error.to_string()))?;
+        if record.meta.kind != crate::session::SessionKind::Eps {
+            return Err(AgentEngineError::new(
+                "only an EPS session continues after a team map task",
+            ));
+        }
+        if record
+            .autonomous_run
+            .as_ref()
+            .is_some_and(|run| !run.status.is_terminal())
+        {
+            return Ok(());
+        }
+        let worker = self.worker(session_id).await?;
+        let _provider_busy = self.inner.provider_service.enter_busy(worker.provider);
+        // Awaiting the engine waits out the turn that received `running`.
+        let mut engine = worker.engine.lock().await;
+        if engine.phase != Phase::Idle {
+            eprintln!(
+                "eud-agent: team map task {task_id} settled while session {session_id} is not idle; its next turn reports it"
+            );
+            return Ok(());
+        }
+        // The task the settler announced must still be the one to act on: the
+        // user may have applied, discarded, or replaced it meanwhile, in which
+        // case the next user turn sees the durable state.
+        let task = self
+            .inner
+            .sessions
+            .load(session_id)
+            .map_err(|error| AgentEngineError::new(error.to_string()))?
+            .team_tasks
+            .into_iter()
+            .find(|task| task.id == task_id);
+        let Some(task) = task.filter(|task| task.status.continues_interactively()) else {
+            return Ok(());
+        };
+        let client_turn_id = ipc::new_client_turn_id();
+        let text = crate::team::TEAM_TASK_CONTINUE_TEXT.to_string();
+        // The panel records the turn as sent from this event: it precedes the
+        // turn's own stream on the same session channel.
+        if let Err(error) = worker.sink.emit_scoped(
+            "team_task",
+            crate::team::TeamTaskEvent {
+                task,
+                continuation: Some(crate::team::TeamTaskContinuation {
+                    client_turn_id: client_turn_id.clone(),
+                    text: text.clone(),
+                }),
+            },
+        ) {
+            eprintln!(
+                "eud-agent: team continuation event failed: session={session_id} error={error}"
+            );
+        }
+        if let Err(error) = self.inner.sessions.touch_conversation(session_id) {
+            eprintln!("eud-agent: conversation timestamp update failed: {error}");
+        }
+        worker
+            .runtime
+            .emit_activity(crate::write_coordinator::SessionActivity::RunningRead);
+        let result = engine
+            .chat(ipc::ChatRequest {
+                client_turn_id,
+                text,
+                attachments: Vec::new(),
+                mentions: Vec::new(),
+                execution_mode: crate::autonomous::ExecutionMode::Interactive,
+                autonomous_policy: None,
+            })
+            .await;
+        drop(engine);
+        self.finish_read_command(&worker, result).await
+    }
+
+    /// Delete a retired team Map session (a fresh one replaced it for the next
+    /// task) together with its candidate files. Never waits on a running
+    /// turn: a session the user is chatting in stays, and is retired by a
+    /// later task once it is idle.
+    pub(crate) async fn retire_team_session(&self, session_id: &str) -> Result<(), String> {
+        let busy = match self.inner.workers.lock().await.get(session_id).cloned() {
+            Some(worker) => worker
+                .engine
+                .try_lock()
+                .map(|engine| engine.phase != Phase::Idle)
+                .unwrap_or(true),
+            None => false,
+        };
+        if busy {
+            return Err("the earlier team map session is still running a turn".to_string());
+        }
+        let project_id = self
+            .inner
+            .sessions
+            .load(session_id)
+            .map_err(|error| error.to_string())?
+            .meta
+            .project;
+        self.delete_map_session(session_id).await?;
+        let service = tauri::Manager::state::<crate::map_agent::MapAgentService>(&self.inner.app);
+        if let Err(error) = service.discard_session_candidate(&project_id, session_id) {
+            eprintln!("eud-agent: retired team Map session candidate cleanup failed: {error}");
+        }
+        Ok(())
+    }
+
     pub(crate) async fn delete_map_session(&self, session_id: &str) -> Result<(), String> {
         let record = self
             .inner
@@ -4708,6 +4933,7 @@ impl SessionEngineManager {
                 model: provider_binding.model.clone(),
                 created_at,
                 last_conversation_at: crate::session::now_unix_millis(),
+                team_parent: None,
             },
             provider_binding,
             pending_request_ids: Vec::new(),
@@ -4717,6 +4943,7 @@ impl SessionEngineManager {
             task_state: Default::default(),
             autonomous_run: None,
             workflow: None,
+            team_tasks: Vec::new(),
         };
         self.inner
             .sessions
@@ -4741,6 +4968,35 @@ impl SessionEngineManager {
                 return Err(AgentEngineError::new(
                     "실행 또는 검토 중인 세션은 삭제할 수 없습니다.",
                 ));
+            }
+        }
+        // Every team Map session goes with its EPS parent, but never while the
+        // user still has one of its candidates to settle.
+        let teams = self
+            .inner
+            .sessions
+            .team_sessions_of(id)
+            .map_err(|error| AgentEngineError::new(error.to_string()))?;
+        if !teams.is_empty() {
+            let record = self
+                .inner
+                .sessions
+                .load(id)
+                .map_err(|error| AgentEngineError::new(error.to_string()))?;
+            if record.team_tasks.iter().any(|task| task.status.is_active()) {
+                return Err(AgentEngineError::new(
+                    "맵 창에서 이 세션의 맵 작업 후보를 적용하거나 폐기한 뒤 세션을 삭제해 주세요.",
+                ));
+            }
+            for team in teams {
+                Box::pin(self.delete_map_session(&team.id))
+                    .await
+                    .map_err(AgentEngineError::new)?;
+                let service =
+                    tauri::Manager::state::<crate::map_agent::MapAgentService>(&self.inner.app);
+                if let Err(error) = service.discard_session_candidate(&team.project, &team.id) {
+                    eprintln!("eud-agent: team Map session candidate cleanup failed: {error}");
+                }
             }
         }
         let harness_jobs = self
@@ -5368,10 +5624,11 @@ fn static_prompt_baseline() -> String {
         DIRECT_PYTHON_GUIDE.to_string(),
         EPS_PROJECT_ARCHITECTURE_GUIDE.to_string(),
         BUILD_GUIDE.to_string(),
-        TRACE_TEST_GUIDE.to_string(),
         MAP_LOCATION_GUIDE.to_string(),
         RESOURCE_MENTION_GUIDE.to_string(),
         AUDIO_SOUND_GUIDE.to_string(),
+        MAP_HANDOFF_GUIDE.to_string(),
+        DELEGATION_GUIDE.to_string(),
         EVIDENCE_GUIDE.to_string(),
         MESSAGE_FORMAT_INSTRUCTIONS.to_string(),
         INTERACTION_GUIDE.to_string(),
@@ -5498,7 +5755,7 @@ fn next_request_id() -> String {
     format!("req-{value:08x}", value = value as u32)
 }
 
-fn next_run_id() -> u64 {
+pub(crate) fn next_run_id() -> u64 {
     static NEXT_RUN_ID: AtomicU64 = AtomicU64::new(1);
     NEXT_RUN_ID.fetch_add(1, Ordering::Relaxed)
 }
@@ -6741,6 +6998,7 @@ mod tests {
                 model: "gpt-test".to_string(),
                 created_at,
                 last_conversation_at: crate::session::now_unix_millis(),
+                team_parent: None,
             },
             provider_binding: crate::provider::ProviderBinding::new(
                 crate::provider::ProviderId::Codex,
@@ -6757,6 +7015,7 @@ mod tests {
             task_state: Default::default(),
             autonomous_run: None,
             workflow: None,
+            team_tasks: Vec::new(),
         };
         store.save(&record).unwrap();
         record
@@ -8731,6 +8990,8 @@ mod tests {
 
         for section in [
             "[first principles]",
+            "[map handoff]",
+            "[delegation]",
             "[evidence]",
             "[message format]",
             "[reference context]",
@@ -8743,6 +9004,102 @@ mod tests {
         assert!(prompt.contains("docs_get"));
         assert!(prompt.contains("zero `newCount`"));
         assert!(prompt.contains("source_search"));
+        // The registry advertises delegate_read as a read tool and the guide
+        // pins its limits: summaries are hints, never mutation evidence.
+        assert!(prompt.contains("- delegate_read — "));
+        assert!(prompt.contains("never mutation evidence"));
+        assert!(prompt.contains("at most 8 delegations"));
+        // Placement work is handed to the Map Agent, never declared impossible;
+        // the candidate is inspected before this session applies it.
+        assert!(prompt.contains("- map_task_request — "));
+        assert!(prompt.contains("- map_task_status — "));
+        assert!(prompt.contains("- map_task_apply — "));
+        assert!(prompt.contains("- map_task_diff — "));
+        assert!(prompt.contains("do not answer that it is impossible"));
+        assert!(prompt.contains("never ask the user to open the Map window first"));
+        assert!(prompt.contains("then map_task_apply it when it meets the goal"));
+        // The goal relays the user's request and code constraints; the Map
+        // Agent designs the look, so the EPS session never prescribes it.
+        assert!(prompt.contains("The Map Agent is the designer, not a plotter"));
+        assert!(prompt.contains("Never choose the medium"));
+        assert!(prompt.contains("Grant every layer the look may need"));
+        assert!(!prompt.contains("Put exact coordinates and tile/unit ids"));
+    }
+
+    #[test]
+    fn context_pressure_continuation_points_exploration_at_delegate_read() {
+        let previous = AgentTurnInput::text("x");
+        let pressured =
+            AgentEngine::<FakeCodexDriver, CapturingEventSink>::interactive_continuation_turn(
+                &previous,
+                crate::provider_runtime::IterationBoundaryReason::ContextPressure,
+            );
+        assert!(pressured.text.contains("delegate_read"));
+        assert!(pressured.text.contains("직접 다시 읽어야"));
+        let other =
+            AgentEngine::<FakeCodexDriver, CapturingEventSink>::interactive_continuation_turn(
+                &previous,
+                crate::provider_runtime::IterationBoundaryReason::ProviderContinuation,
+            );
+        assert!(!other.text.contains("delegate_read"));
+    }
+
+    #[test]
+    fn read_delegation_request_inherits_the_parent_and_never_holds_a_write_ticket() {
+        let parent = RunIdentity {
+            session_id: "s".to_string(),
+            run_id: RunId::new(5),
+            request_id: "req".to_string(),
+            session_kind: crate::session::SessionKind::Eps,
+            cancellation_generation: 2,
+        };
+        let child = RunIdentity {
+            run_id: RunId::new(6),
+            ..parent.clone()
+        };
+        let binding = BindingSnapshot::from_binding(
+            &crate::provider::ProviderBinding {
+                provider: crate::provider::ProviderId::Ollama,
+                model: "m".to_string(),
+                reasoning: None,
+                base_url: Some("http://127.0.0.1:11434".to_string()),
+                conversation: crate::provider::ProviderConversationState::empty(
+                    crate::provider::ProviderId::Ollama,
+                ),
+            },
+            None,
+        )
+        .unwrap();
+        let request = super::delegation::read_delegation_request(
+            &crate::tool_exec::ReadDelegation {
+                identity: child.clone(),
+                parent_run_id: parent.run_id,
+                goal: "goal".to_string(),
+                focus: vec!["src/a.eps".to_string()],
+            },
+            &binding,
+            PathBuf::from("root"),
+            Some(PathBuf::from("tmp")),
+        )
+        .unwrap();
+        assert_eq!(request.identity, child);
+        assert_eq!(request.parent_run_id, Some(parent.run_id));
+        assert_eq!(
+            request.kind,
+            crate::provider_runtime::DelegatedRunKind::Read
+        );
+        assert!(!request.allow_live_write_ticket);
+        assert_eq!(
+            request.policy.active_deadline,
+            Some(crate::tools::DELEGATE_READ_TIMEOUT)
+        );
+        assert!(request.profile.allows("read_file"));
+        assert!(!request.profile.allows(crate::tools::DELEGATE_READ_TOOL));
+        assert!(request.prompt.contains("[goal]\ngoal"));
+        assert_eq!(
+            request.binding.conversation,
+            crate::provider::ProviderConversationState::empty(binding.provider)
+        );
     }
 
     #[test]
@@ -9140,6 +9497,7 @@ mod tests {
                 model: "gpt-test".to_string(),
                 created_at: 1,
                 last_conversation_at: 1_000,
+                team_parent: None,
             },
             provider_binding: crate::provider::ProviderBinding::new(
                 crate::provider::ProviderId::Codex,
@@ -9156,6 +9514,7 @@ mod tests {
             task_state: Default::default(),
             autonomous_run: None,
             workflow: None,
+            team_tasks: Vec::new(),
         };
         sessions.save(&record).unwrap();
         let request_c = "req-c";

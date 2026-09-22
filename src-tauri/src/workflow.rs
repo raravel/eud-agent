@@ -22,9 +22,14 @@ pub const MAX_CRITIQUE_ROUNDS_DEFAULT: u8 = 1;
 pub const MAX_CRITIQUE_ROUNDS_DEEP: u8 = 3;
 /// Executing turns re-entered by a failing verification.
 pub const MAX_VERIFY_ATTEMPTS: u8 = 2;
-/// Every stage job shares the harness deadline class.
-pub const STAGE_DEADLINE: Duration = Duration::from_secs(300);
-pub const STAGE_MAX_OUTPUT_BYTES: usize = 256 * 1024;
+/// Active-time ceiling for an engine-owned stage job. A research stage on a
+/// native CLI reads sources, docs, and map state inside one step, which
+/// routinely outlives the harness 300-second class; the user's 중단 control
+/// remains the ordinary way to end a stage early.
+pub const STAGE_DEADLINE: Duration = Duration::from_secs(900);
+/// Same policy ceiling as the foreground turn: a native-session stage counts every MCP tool
+/// observation (file contents included) inside one step, so a small cap fails research runs.
+pub const STAGE_MAX_OUTPUT_BYTES: usize = 32 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -341,6 +346,28 @@ const RESEARCH_TOOLS: &[&str] = &[
     "map_info",
     "map_sound_list",
 ];
+/// The model-invoked `delegate_read` child: the research read set plus the
+/// minimap image. Build, dependency preparation, `ask`, `propose_plan`,
+/// and `delegate_read` itself stay out because they are not exploration.
+const DELEGATED_READ_TOOLS: &[&str] = &[
+    "project_status",
+    "list_files",
+    "read_file",
+    "source_search",
+    "search_docs",
+    "docs_get",
+    "dat_get",
+    "xdat_get",
+    "tbl_get",
+    "req_get",
+    "btn_get",
+    "settings_get",
+    "plugins_list",
+    "map_info",
+    "map_minimap",
+    "map_sound_list",
+    "build_log_read",
+];
 const VERIFIER_TOOLS: &[&str] = &[
     "project_status",
     "list_files",
@@ -369,8 +396,8 @@ pub fn stage_tools(kind: DelegatedRunKind) -> &'static [&'static str] {
         DelegatedRunKind::Research
         | DelegatedRunKind::Planner
         | DelegatedRunKind::Architect
-        | DelegatedRunKind::Critic
-        | DelegatedRunKind::Read => RESEARCH_TOOLS,
+        | DelegatedRunKind::Critic => RESEARCH_TOOLS,
+        DelegatedRunKind::Read => DELEGATED_READ_TOOLS,
         DelegatedRunKind::Verifier => VERIFIER_TOOLS,
     }
 }
@@ -383,8 +410,15 @@ pub fn stage_policy(kind: DelegatedRunKind) -> RunPolicy {
         DelegatedRunKind::Architect | DelegatedRunKind::Critic | DelegatedRunKind::Read => 16,
         DelegatedRunKind::Verifier => 24,
     };
+    // A model-invoked child is one parent tool call, so it must settle inside
+    // the native MCP call ceiling; engine-owned stages keep the harness class.
+    let active_deadline = if kind == DelegatedRunKind::Read {
+        crate::tools::DELEGATE_READ_TIMEOUT
+    } else {
+        STAGE_DEADLINE
+    };
     RunPolicy {
-        active_deadline: Some(STAGE_DEADLINE),
+        active_deadline: Some(active_deadline),
         shutdown_grace: Duration::from_secs(2),
         max_output_bytes: STAGE_MAX_OUTPUT_BYTES,
         max_output_tokens: None,
@@ -654,7 +688,8 @@ pub fn read_delegation_schema() -> Value {
 pub fn stage_schema(kind: DelegatedRunKind) -> Value {
     match kind {
         DelegatedRunKind::Triage => triage_schema(),
-        DelegatedRunKind::Research | DelegatedRunKind::Read => research_schema(),
+        DelegatedRunKind::Research => research_schema(),
+        DelegatedRunKind::Read => read_delegation_schema(),
         DelegatedRunKind::Planner => plan_schema(),
         DelegatedRunKind::Architect => architect_schema(),
         DelegatedRunKind::Critic => critic_schema(),
@@ -1012,6 +1047,22 @@ Read the project only as far as the route decision needs (MainFile and the files
         context.project,
         clarification_section(context.clarifications),
         context.user_text
+    )
+}
+
+/// The prompt of one model-invoked `delegate_read` child. It carries only the
+/// parent's goal and focus hints: the child reads the project itself.
+pub fn read_delegation_prompt(goal: &str, focus: &[String]) -> String {
+    let focus = bullets(focus);
+    format!(
+        "[role]\nYou are a read-only exploration child of the native EUD project agent. Answer one bounded goal for the parent run that delegated it; do not plan, decide, or change anything.\n\n\
+[goal]\n{goal}\n\n[focus]\n{focus}\n\n\
+[method]\n\
+- Read only as far as the goal needs, starting from the focus hints when given. Prefer source_search and list_files to locate, then read_file for the exact lines.\n\
+- `summary` answers the goal in a few sentences. Each finding cites the exact path and line where possible with a short excerpt and why it matters; leave out anything you did not verify.\n\
+- `openQuestions` lists what the parent must still decide or read itself. `toolCalls` is the number of tool calls you made.\n\
+- Your findings are hints for the parent, not mutation evidence: never claim a change is safe to apply.\n\
+{SUBMIT_RULE}"
     )
 }
 

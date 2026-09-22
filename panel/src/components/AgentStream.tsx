@@ -15,7 +15,12 @@
  * With no reasoning and no tools it renders nothing (null).
  */
 import { useEffect, useState } from "react";
-import { FileIcon, FilePenLineIcon, WrenchIcon } from "lucide-react";
+import {
+  FileIcon,
+  FilePenLineIcon,
+  GitBranchIcon,
+  WrenchIcon,
+} from "lucide-react";
 import {
   Reasoning,
   ReasoningContent,
@@ -43,6 +48,35 @@ export interface AgentTool {
   args?: string;
   /** Tool-result text (EUD-068). */
   detail?: string;
+  /** A `delegate_read` row's child-run lifecycle (from the `delegation` event). */
+  delegation?: {
+    goal: string;
+    status: "queued" | "running" | "completed" | "failed" | "cancelled";
+    toolCalls: number;
+    elapsedMs: number;
+    error?: string;
+  };
+  /** The child run's own tool rows, nested under the `delegate_read` row. */
+  children?: AgentTool[];
+}
+
+const DELEGATION_STATUS_LABEL: Record<
+  NonNullable<AgentTool["delegation"]>["status"],
+  string
+> = {
+  queued: "대기 중",
+  running: "위임 실행 중",
+  completed: "위임 완료",
+  failed: "위임 실패",
+  cancelled: "위임 취소됨",
+};
+
+function formatElapsed(ms: number): string {
+  if (ms < 1000) return `${ms}ms`;
+  const seconds = ms / 1000;
+  return seconds < 60
+    ? `${seconds.toFixed(seconds < 10 ? 1 : 0)}초`
+    : `${Math.floor(seconds / 60)}분 ${Math.round(seconds % 60)}초`;
 }
 
 export interface AgentStreamProps {
@@ -132,10 +166,15 @@ export function ToolList({ tools }: { tools: AgentTool[] }) {
         // File reads/writes render as code; exact file edits render as an
         // ordered colored diff instead of raw JSON.
         const fileView = parseFileTool(tool);
+        const delegated = tool.delegation !== undefined || tool.children !== undefined;
         return (
           <Tool key={tool.id} data-testid={`tool-${tool.id}`}>
             <ToolHeader title={tool.name} state={tool.state} />
-            {fileView ? (
+            {delegated ? (
+              <ToolContent>
+                <DelegationBlock tool={tool} />
+              </ToolContent>
+            ) : fileView ? (
               <ToolContent>
                 <div className="p-3">
                   <FileToolBlock view={fileView} />
@@ -169,6 +208,71 @@ export function ToolList({ tools }: { tools: AgentTool[] }) {
         );
       })}
     </>
+  );
+}
+
+/**
+ * A `delegate_read` row's body: the child's goal and lifecycle, its nested
+ * tool rows (so the parent's context stays a single summary), and finally the
+ * summary the parent received.
+ */
+function DelegationBlock({ tool }: { tool: AgentTool }) {
+  const delegation = tool.delegation;
+  const children = tool.children ?? [];
+  return (
+    <div
+      data-testid="delegation-block"
+      className="flex flex-col gap-2 p-3 text-xs text-muted-foreground"
+    >
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+        <span className="flex items-center gap-1.5 font-medium text-foreground">
+          <GitBranchIcon aria-hidden className="size-3.5 shrink-0" />
+          위임된 읽기 작업
+        </span>
+        {delegation && (
+          <>
+            <span
+              data-testid="delegation-status"
+              className={cn(
+                delegation.status === "failed" && "text-destructive",
+                delegation.status === "completed" && "text-emerald-400",
+              )}
+            >
+              {DELEGATION_STATUS_LABEL[delegation.status]}
+            </span>
+            <span>도구 호출 {delegation.toolCalls}건</span>
+            <span>{formatElapsed(delegation.elapsedMs)}</span>
+          </>
+        )}
+      </div>
+      {delegation?.goal && (
+        <div>
+          <div className="mb-1 font-medium">목표</div>
+          <p className="whitespace-pre-wrap break-words rounded bg-muted/40 p-2">
+            {delegation.goal}
+          </p>
+        </div>
+      )}
+      {delegation?.error && (
+        <p role="alert" className="text-destructive">
+          {delegation.error}
+        </p>
+      )}
+      {children.length > 0 && (
+        <div className="flex flex-col gap-1 border-l-2 border-border pl-2">
+          <span>자식 도구 호출 {children.length}건</span>
+          <ToolList tools={children} />
+        </div>
+      )}
+      {tool.detail && (
+        <div>
+          <div className="mb-1 font-medium">요약</div>
+          <pre className="overflow-x-auto whitespace-pre-wrap break-words rounded bg-muted/40 p-2">
+            {tool.detail}
+          </pre>
+        </div>
+      )}
+    </div>
   );
 }
 

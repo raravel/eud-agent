@@ -206,6 +206,11 @@ export interface AgentEventMessage extends SessionScopedMessage {
     args?: string;
     result?: string;
     status?: string;
+    /**
+     * Set on a `delegate_read` child run's tool events: the child run id,
+     * so the panel nests them under the parent's `delegate_read` row.
+     */
+    delegationRunId?: number;
   };
 }
 
@@ -274,6 +279,142 @@ export interface AskMessage extends SessionScopedMessage {
 
 export interface AskAnswer {
   answers: string[];
+}
+
+/** Lifecycle of one `delegate_read` child run. */
+export type DelegationStatus =
+  | "queued"
+  | "running"
+  | "completed"
+  | "failed"
+  | "cancelled";
+export const DELEGATION_STATUSES: readonly DelegationStatus[] = [
+  "queued",
+  "running",
+  "completed",
+  "failed",
+  "cancelled",
+] as const;
+
+/** `delegation` — a `delegate_read` child run's lifecycle, without session id. */
+export interface DelegationMessageBody {
+  requestId: string;
+  parentRunId: number;
+  childRunId: number;
+  goal: string;
+  status: DelegationStatus;
+  /** Admitted child tool completions so far (final on a terminal status). */
+  toolCalls: number;
+  elapsedMs: number;
+  /** Why a `failed` child ended (user-facing Korean). */
+  error?: string;
+  /** The child's own provider usage, when reported. */
+  usage?: ContextUsage;
+}
+
+/** Map layers a team map task may change. */
+export type MapTaskLayer =
+  | "terrain"
+  | "units"
+  | "buildings"
+  | "doodads"
+  | "sprites"
+  | "locations";
+export const MAP_TASK_LAYERS: readonly MapTaskLayer[] = [
+  "terrain",
+  "units",
+  "buildings",
+  "doodads",
+  "sprites",
+  "locations",
+] as const;
+
+/** Lifecycle of one EPS → Map team task (`{kind, reason?}` on the wire). */
+export type TeamTaskStatus =
+  | { kind: "queued" }
+  | { kind: "running" }
+  | { kind: "candidate_ready" }
+  | { kind: "applied" }
+  | { kind: "discarded" }
+  | { kind: "failed"; reason: string }
+  | { kind: "cancelled" }
+  | { kind: "interrupted" }
+  | { kind: "superseded" };
+export const TEAM_TASK_STATUS_KINDS = [
+  "queued",
+  "running",
+  "candidate_ready",
+  "applied",
+  "discarded",
+  "failed",
+  "cancelled",
+  "interrupted",
+  "superseded",
+] as const;
+export type TeamTaskStatusKind = (typeof TEAM_TASK_STATUS_KINDS)[number];
+
+/** The candidate revision a team task produced. */
+export interface TeamCandidateSummary {
+  revision: number;
+  revisionKey: string;
+  mapSha256: string;
+  summary: string;
+  terrainCells: number;
+  units: number;
+  buildings: number;
+  doodads: number;
+  sprites: number;
+  locations: number;
+}
+
+/** One EPS → Map team handoff, as persisted on the EPS session. */
+export interface TeamTask {
+  id: string;
+  parentRequestId: string;
+  mapSessionId: string;
+  mapRequestId?: string;
+  goal: string;
+  layers: MapTaskLayer[];
+  selectionIds?: string[];
+  locationIds?: number[];
+  sourceMapSha256AtCreate: string;
+  status: TeamTaskStatus;
+  candidate?: TeamCandidateSummary;
+  appliedSourceSha256?: string;
+  /** Who applied the candidate: the user in the Map window or the EPS agent. */
+  appliedBy?: TeamApplyActor;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export type TeamApplyActor = "user" | "agent";
+
+/**
+ * `team_task` — a team task changed (created, settled, applied, discarded).
+ * `continuation` is present when the engine itself started the session's
+ * continuation turn on that text (the task settled after `map_task_request`
+ * had returned `running`): the panel records the turn as sent.
+ */
+export interface TeamTaskMessage extends SessionScopedMessage {
+  type: "team_task";
+  task: TeamTask;
+  continuation?: TeamTaskContinuation;
+}
+
+export interface TeamTaskContinuation {
+  clientTurnId: string;
+  text: string;
+}
+
+/**
+ * `delegation` — a `delegate_read` child of the session's live foreground run.
+ * Its tool calls arrive as ordinary `agent_event`s carrying the same
+ * `childRunId` in `data.delegationRunId`; its text and reasoning never do.
+ */
+export interface DelegationMessage
+  extends SessionScopedMessage,
+    DelegationMessageBody {
+  type: "delegation";
 }
 
 
@@ -462,7 +603,8 @@ export type AutonomousPauseReason =
   | "restart"
   | "waiting_input"
   | "review"
-  | "unanswered_ask";
+  | "unanswered_ask"
+  | "team_apply";
 
 export interface AutonomousRunPolicy {
   maxWallTimeMillis?: number | null;
@@ -639,6 +781,8 @@ export interface SessionMeta {
   model: string;
   createdAt: number;
   lastConversationAt: number;
+  /** For a team Map session: the EPS session that owns it. */
+  teamParent?: string;
 }
 
 export type MentionKind = "map.region" | "map.location";
@@ -758,6 +902,8 @@ export interface SessionRecord extends SessionMeta {
   panelLog: PanelLog | null;
   contextUsage?: ContextUsage;
   autonomousRun?: AutonomousRunState;
+  /** EPS → Map team tasks (EPS sessions only). */
+  teamTasks?: TeamTask[];
 }
 
 /** Discriminated union of every documented core -> panel message. */
@@ -765,6 +911,8 @@ export type ServerMessage =
   | AgentEventMessage
   | ContextUsageMessage
   | AskMessage
+  | DelegationMessage
+  | TeamTaskMessage
   | AnswerMessage
   | PlanMessage
   | ChangesetMessage
@@ -789,6 +937,8 @@ export const SERVER_MESSAGE_TYPES = [
   "answer",
   "plan",
   "ask",
+  "delegation",
+  "team_task",
   "changeset",
   "workflow",
   "harness_job",
@@ -1158,6 +1308,88 @@ export function isAskMessage(value: unknown): value is AskMessage {
   );
 }
 
+/** True if `value` is a session-scoped `delegation` child-run lifecycle event. */
+export function isDelegationMessage(value: unknown): value is DelegationMessage {
+  return (
+    isObject(value) &&
+    value.type === "delegation" &&
+    hasSessionId(value) &&
+    typeof value.requestId === "string" &&
+    typeof value.parentRunId === "number" &&
+    typeof value.childRunId === "number" &&
+    typeof value.goal === "string" &&
+    DELEGATION_STATUSES.includes(value.status as DelegationStatus) &&
+    typeof value.toolCalls === "number" &&
+    typeof value.elapsedMs === "number" &&
+    (value.error === undefined || typeof value.error === "string") &&
+    (value.usage === undefined || isContextUsage(value.usage))
+  );
+}
+
+function isTeamTaskStatus(value: unknown): value is TeamTaskStatus {
+  return (
+    isObject(value) &&
+    TEAM_TASK_STATUS_KINDS.includes(value.kind as TeamTaskStatusKind) &&
+    (value.kind !== "failed" || typeof value.reason === "string")
+  );
+}
+
+function isTeamCandidateSummary(value: unknown): value is TeamCandidateSummary {
+  return (
+    isObject(value) &&
+    typeof value.revision === "number" &&
+    typeof value.revisionKey === "string" &&
+    typeof value.mapSha256 === "string" &&
+    typeof value.summary === "string" &&
+    ["terrainCells", "units", "buildings", "doodads", "sprites", "locations"].every(
+      (key) => typeof value[key] === "number",
+    )
+  );
+}
+
+/** True if `value` is a persisted team task. */
+export function isTeamTask(value: unknown): value is TeamTask {
+  return (
+    isObject(value) &&
+    typeof value.id === "string" &&
+    value.id.length > 0 &&
+    typeof value.parentRequestId === "string" &&
+    typeof value.mapSessionId === "string" &&
+    (value.mapRequestId === undefined || typeof value.mapRequestId === "string") &&
+    typeof value.goal === "string" &&
+    Array.isArray(value.layers) &&
+    value.layers.every((layer) => MAP_TASK_LAYERS.includes(layer as MapTaskLayer)) &&
+    (value.selectionIds === undefined || isStringArray(value.selectionIds)) &&
+    (value.locationIds === undefined ||
+      (Array.isArray(value.locationIds) &&
+        value.locationIds.every((id) => typeof id === "number"))) &&
+    typeof value.sourceMapSha256AtCreate === "string" &&
+    isTeamTaskStatus(value.status) &&
+    (value.candidate === undefined || isTeamCandidateSummary(value.candidate)) &&
+    (value.appliedSourceSha256 === undefined ||
+      typeof value.appliedSourceSha256 === "string") &&
+    (value.appliedBy === undefined ||
+      value.appliedBy === "user" ||
+      value.appliedBy === "agent") &&
+    typeof value.createdAt === "number" &&
+    typeof value.updatedAt === "number"
+  );
+}
+
+/** True if `value` is a session-scoped `team_task` event. */
+export function isTeamTaskMessage(value: unknown): value is TeamTaskMessage {
+  return (
+    isObject(value) &&
+    value.type === "team_task" &&
+    hasSessionId(value) &&
+    isTeamTask(value.task) &&
+    (value.continuation === undefined ||
+      (isObject(value.continuation) &&
+        typeof value.continuation.clientTurnId === "string" &&
+        typeof value.continuation.text === "string"))
+  );
+}
+
 /** True if `value` is a `changeset` message (request_id + items array). */
 export function isChangesetMessage(value: unknown): value is ChangesetMessage {
   return (
@@ -1486,6 +1718,8 @@ export function isServerMessage(value: unknown): value is ServerMessage {
     isAnswerMessage(value) ||
     isPlanMessage(value) ||
     isAskMessage(value) ||
+    isDelegationMessage(value) ||
+    isTeamTaskMessage(value) ||
     isChangesetMessage(value) ||
     isWorkflowMessage(value) ||
     isHarnessJobMessage(value) ||

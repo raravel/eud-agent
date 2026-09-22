@@ -24,6 +24,9 @@ pub(super) struct GateState {
     pub(super) iteration_boundary_requested: Option<IterationBoundaryReason>,
     /// The accepted `submit_result` payload of a delegated run, once captured.
     pub(super) delegated_result: Option<serde_json::Value>,
+    /// A delegated run has reached its final tool round: only `submit_result`
+    /// is advertised and profile reads complete with a usage error.
+    pub(super) submission_only: bool,
 }
 
 pub(super) struct RunGateInner {

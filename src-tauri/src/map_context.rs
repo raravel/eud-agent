@@ -127,6 +127,11 @@ impl MapContextService {
         self.current_source()
     }
 
+    pub fn current_project_root(&self) -> Result<PathBuf, String> {
+        let project = crate::native_runtime::NativeProjectManager::new(self.dirs.clone()).open()?;
+        Ok(project.root().to_path_buf())
+    }
+
     #[cfg_attr(test, allow(dead_code))]
     fn current_project_id(&self) -> Result<String, String> {
         self.current_source().map(|(project_id, _)| project_id)

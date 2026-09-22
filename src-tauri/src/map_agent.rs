@@ -22,7 +22,7 @@ use crate::map_stamp::{
 };
 use crate::mapsafe::{CandidateMapSafe, CompilingStatus, WindowsLockProbe};
 
-const MAP_WINDOW_LABEL: &str = "map-agent";
+pub(crate) const MAP_WINDOW_LABEL: &str = "map-agent";
 const OBJECT_SNAPSHOT_CACHE_CAPACITY: usize = 4;
 
 #[derive(Default)]
@@ -61,6 +61,9 @@ pub struct MapAgentService {
     object_snapshots: Arc<Mutex<ObjectSnapshotCache>>,
     attachments: AttachmentStore,
     images: MapImageService,
+    /// The Map session the next window bootstrap should load instead of the
+    /// default resolution; set by `open_map_window` when it creates the window.
+    pending_open_session: Arc<Mutex<Option<String>>>,
 }
 
 #[derive(Clone, Copy)]
@@ -300,6 +303,7 @@ impl MapAgentService {
             object_snapshots: Arc::new(Mutex::new(ObjectSnapshotCache::default())),
             attachments,
             images: MapImageService::new(),
+            pending_open_session: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -621,6 +625,7 @@ impl MapAgentService {
                 model: provider_binding.model.clone(),
                 created_at,
                 last_conversation_at: crate::session::now_unix_millis(),
+                team_parent: None,
             },
             provider_binding,
             pending_request_ids: Vec::new(),
@@ -630,6 +635,7 @@ impl MapAgentService {
             task_state: Default::default(),
             autonomous_run: None,
             workflow: None,
+            team_tasks: Vec::new(),
         };
         self.sessions
             .save(&record)
@@ -648,6 +654,31 @@ impl MapAgentService {
         Ok(record)
     }
 
+    /// The session the Map window should bootstrap: the one `open_map_window`
+    /// targeted when it is still a valid session of the current source map,
+    /// otherwise the ordinary resolution. A team session whose task is still
+    /// running is a valid target: the bootstrap never waits on that turn and
+    /// the window adopts the run from its transcript.
+    fn bootstrap_session(
+        &self,
+        context: &crate::map_context::MapContextSnapshot,
+    ) -> Result<MapSessionResolution, String> {
+        let requested = self.pending_open_session.lock().take();
+        if let Some(session_id) = requested {
+            match self.session_for_context(&session_id, context) {
+                Ok(resolution) => return Ok(resolution),
+                Err(error) => {
+                    eprintln!(
+                        "eud-agent: map window target {session_id} ignored: {error}; opening the default session"
+                    );
+                }
+            }
+        }
+        self.map_session(context)
+    }
+
+    /// Resolve a Map session the window may load: it must belong to the
+    /// current project and, when it has a candidate, to the current source map.
     fn session_for_context(
         &self,
         session_id: &str,
@@ -1013,7 +1044,7 @@ impl MapAgentService {
         Ok(())
     }
 
-    fn apply(&self, session_id: &str) -> Result<CandidateStateView, String> {
+    pub(crate) fn apply(&self, session_id: &str) -> Result<CandidateStateView, String> {
         self.require_editor_idle()?;
         let session = self.session_record(session_id)?;
         let project_id = session.meta.project;
@@ -1067,7 +1098,7 @@ impl MapAgentService {
         })?
     }
 
-    fn undo(&self, session_id: &str) -> Result<CandidateStateView, String> {
+    pub(crate) fn undo(&self, session_id: &str) -> Result<CandidateStateView, String> {
         self.require_editor_idle()?;
         let session = self.session_record(session_id)?;
         let project_id = session.meta.project;
@@ -1146,6 +1177,548 @@ impl MapAgentService {
                 (Ok(_), Err(error)) => Err(error),
             }
         })?
+    }
+}
+
+/// The Map side of one EPS → Map team handoff (plan Phase 2): the team Map
+/// session, the ordinary candidate request it runs for the EPS goal, and the
+/// task-status hooks behind the user's Apply/discard/undo.
+impl MapAgentService {
+    /// A fresh team Map session for one task of EPS session `parent`: every
+    /// map task starts a new session (new provider thread, empty transcript,
+    /// candidate r0 on the saved source) so earlier requests never stack.
+    /// Returns the session, its state, and the parent's earlier team sessions
+    /// that are now retired: the caller deletes them through the engine
+    /// manager. An earlier session survives only while the Map window can
+    /// still undo its Apply against the current source.
+    pub(crate) fn fresh_team_session(
+        &self,
+        parent: &crate::session::SessionRecord,
+    ) -> Result<
+        (
+            crate::session::SessionRecord,
+            CandidateStateView,
+            Vec<crate::session::SessionMeta>,
+        ),
+        String,
+    > {
+        let context = self.candidates.context().current().map_err(|error| {
+            format!("the source map is not available for a team map task: {error}")
+        })?;
+        let project = crate::native_runtime::NativeProjectManager::new(self.dirs.clone())
+            .open()
+            .map_err(|error| {
+                format!("the native project is not open for a team map task: {error}")
+            })?;
+        self.fresh_team_session_in(parent, &context, &project.manifest().name)
+    }
+
+    /// `fresh_team_session` against an explicit source-map context and the
+    /// open project's manifest name. EPS sessions are keyed by manifest name
+    /// while Map sessions and `MapRevision.project_id` are keyed by the
+    /// project-root hash, so the two identities are never compared directly.
+    pub(crate) fn fresh_team_session_in(
+        &self,
+        parent: &crate::session::SessionRecord,
+        context: &crate::map_context::MapContextSnapshot,
+        current_project_name: &str,
+    ) -> Result<
+        (
+            crate::session::SessionRecord,
+            CandidateStateView,
+            Vec<crate::session::SessionMeta>,
+        ),
+        String,
+    > {
+        if parent.meta.kind != crate::session::SessionKind::Eps {
+            return Err("only an EPS session owns a team Map session".to_string());
+        }
+        if parent.meta.project != current_project_name {
+            return Err(format!(
+                "EPS session '{}' belongs to project '{}', not the open project '{}'",
+                parent.meta.name, parent.meta.project, current_project_name
+            ));
+        }
+        let retired = self
+            .sessions
+            .team_sessions_of(&parent.meta.id)
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .filter(|meta| {
+                meta.project != context.revision.project_id
+                    || !self
+                        .candidates
+                        .apply_undoable_against(
+                            &meta.project,
+                            &meta.id,
+                            &context.revision.file_sha256,
+                        )
+                        .unwrap_or(false)
+            })
+            .collect::<Vec<_>>();
+        let mut provider_binding = parent.provider_binding.clone();
+        provider_binding.conversation =
+            crate::provider::ProviderConversationState::empty(provider_binding.provider);
+        let record = crate::session::SessionRecord {
+            meta: crate::session::SessionMeta {
+                id: crate::session::new_session_id(),
+                name: format!("{} · 맵 작업", parent.meta.name),
+                project: context.revision.project_id.clone(),
+                kind: crate::session::SessionKind::Map,
+                provider: provider_binding.provider,
+                model: provider_binding.model.clone(),
+                created_at: crate::session::now_unix_seconds(),
+                last_conversation_at: crate::session::now_unix_millis(),
+                team_parent: Some(parent.meta.id.clone()),
+            },
+            provider_binding,
+            pending_request_ids: Vec::new(),
+            context_usage: None,
+            panel_log: serde_json::Value::Null,
+            context_state: Default::default(),
+            task_state: Default::default(),
+            autonomous_run: None,
+            workflow: None,
+            team_tasks: Vec::new(),
+        };
+        self.sessions
+            .save(&record)
+            .map_err(|error| error.to_string())?;
+        let state = self.candidates.create_session(&record.meta.id, context)?;
+        Ok((record, state, retired))
+    }
+
+    /// Project the EPS task scope onto the team session's visible candidate:
+    /// persistent target selections become `target` mentions and exact
+    /// location ids become location mentions. Anything missing or not a target
+    /// is an error the EPS model can correct.
+    pub(crate) fn team_mentions(
+        state: &CandidateStateView,
+        selection_ids: &[String],
+        location_ids: &[u16],
+    ) -> Result<Vec<MapMentionSnapshot>, String> {
+        let mut mentions = Vec::new();
+        for selection_id in selection_ids {
+            let view = state
+                .selections
+                .iter()
+                .find(|view| &view.selection.id == selection_id)
+                .ok_or_else(|| {
+                    format!("selection '{selection_id}' does not exist on the current map")
+                })?;
+            if view.selection.role != crate::map_model::SelectionRole::Target {
+                return Err(format!(
+                    "selection '{selection_id}' is a {:?} selection, not a target; only target selections scope a map task",
+                    view.selection.role
+                ));
+            }
+            mentions.push(MapMentionSnapshot::Region {
+                selection_id: selection_id.clone(),
+                snapshot_hash: view.snapshot_hash.clone(),
+                source_revision: state.revision_key.clone(),
+            });
+        }
+        for location_id in location_ids {
+            mentions.push(MapMentionSnapshot::Location {
+                location_id: *location_id,
+                revision_key: state.revision_key.clone(),
+                baseline_hash: state.baseline.file_sha256.clone(),
+            });
+        }
+        Ok(mentions)
+    }
+
+    /// The fixed Map-side prompt for one team task. The Map Agent keeps its
+    /// own system prompt; this is the user message it receives.
+    pub(crate) fn team_request_text(
+        parent_name: &str,
+        parent_id: &str,
+        task: &crate::team::TeamTask,
+        mentions: &Value,
+    ) -> String {
+        let layers = task
+            .layers
+            .iter()
+            .map(|layer| format!("{layer:?}").to_lowercase())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let locations = if task.location_ids.is_empty() {
+            "(none)".to_string()
+        } else {
+            task.location_ids
+                .iter()
+                .map(|id| format!("#{id}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let parent_short_id = crate::session::short_session_id(parent_id);
+        format!(
+            "[map mention snapshots]\n{mentions}\n\n[team task]\nThis request comes from the EPS session \"{parent_name}\" (session id {parent_short_id}) as team task {}. Work the goal below exactly as you would a request the user typed in this window: explore the palette, draft, render and analyze, and iterate until it looks right, then finalize once; the user reviews and applies the candidate in this window, and the EPS session continues afterwards. The goal relays the user's request: its stated bounds, keep-clear areas, and constraints are binding, everything else is intent, and the choice of tiles, doodads, objects, and layout is yours. Change only these layers: {layers}. Location context: {locations}. Do not ask the EPS session questions; if the goal is impossible, answer with why and finalize nothing.\n\n[goal]\n{}",
+            task.id, task.goal
+        )
+    }
+
+    /// Run one team task's Map request on `map_session_id`: the same
+    /// prepare → chat → commit lifecycle as the Map window's own request. The
+    /// window, open or opened later, shows the run through its transcript
+    /// with the task goal as the request bubble. Returns the candidate state
+    /// after commit.
+    pub(crate) async fn run_team_request(
+        &self,
+        engines: &crate::engine::SessionEngineManager,
+        map_session_id: &str,
+        request_id: &str,
+        mentions: Vec<MapMentionSnapshot>,
+        parent_name: &str,
+        parent_id: &str,
+        task: &crate::team::TeamTask,
+    ) -> Result<CandidateStateView, String> {
+        let session = self.session_record(map_session_id)?;
+        let current = self.candidates.context().current()?;
+        let current_state = self
+            .candidates
+            .state(&session.meta.project, map_session_id)?;
+        require_current_source(
+            &current.revision.project_id,
+            &current.revision.source_path,
+            &session.meta.project,
+            &current_state.baseline.source_path,
+            "team map task",
+        )?;
+        self.candidates.prepare_request(
+            &session.meta.project,
+            map_session_id,
+            request_id,
+            current_state.current_revision,
+            &mentions,
+        )?;
+        let state_before = self
+            .candidates
+            .state(&session.meta.project, map_session_id)?;
+        let compact = match compact_mentions(
+            &self.candidates,
+            &session.meta.project,
+            &state_before,
+            &mentions,
+        ) {
+            Ok(value) => value,
+            Err(error) => {
+                self.candidates.finish_request(map_session_id, request_id)?;
+                return Err(error);
+            }
+        };
+        let outcome = engines
+            .map_chat(
+                map_session_id,
+                request_id.to_string(),
+                state_before.revision_key,
+                Self::team_request_text(parent_name, parent_id, task, &compact),
+                Vec::new(),
+                crate::engine::MapRunPrompt {
+                    text: task.goal.clone(),
+                    mentions,
+                    origin: crate::engine::MapRunOrigin::Team,
+                    team_task_id: Some(task.id.clone()),
+                    parent_session_name: Some(parent_name.to_string()),
+                },
+            )
+            .await;
+        if let Err(error) = outcome {
+            self.candidates.finish_request(map_session_id, request_id)?;
+            return Err(error);
+        }
+        let state =
+            match self
+                .candidates
+                .commit_request(&session.meta.project, map_session_id, request_id)
+            {
+                Ok(state) => state,
+                Err(error) => {
+                    self.candidates.finish_request(map_session_id, request_id)?;
+                    return Err(error);
+                }
+            };
+        self.candidates.finish_request(map_session_id, request_id)?;
+        Ok(state)
+    }
+
+    /// Summarize the candidate revision a team task produced, if the request
+    /// committed a new one.
+    pub(crate) fn team_candidate_summary(
+        before_revision: u32,
+        state: &CandidateStateView,
+    ) -> Option<crate::team::TeamCandidateSummary> {
+        if state.current_revision <= before_revision {
+            return None;
+        }
+        let revision = state
+            .revisions
+            .iter()
+            .find(|revision| revision.revision == state.current_revision)?;
+        let diff = &revision.diff;
+        let count = |layer: &crate::map_model::LayerDiffCount| {
+            layer.added + layer.removed + layer.moved + layer.changed
+        };
+        let mut parts = Vec::new();
+        if diff.terrain_cells > 0 {
+            parts.push(format!("지형 {}칸", diff.terrain_cells));
+        }
+        for (label, layer) in [
+            ("유닛", &diff.units),
+            ("건물", &diff.buildings),
+            ("두다드", &diff.doodads),
+            ("스프라이트", &diff.sprites),
+            ("로케이션", &diff.locations),
+        ] {
+            if count(layer) > 0 {
+                parts.push(format!("{label} {}건", count(layer)));
+            }
+        }
+        Some(crate::team::TeamCandidateSummary {
+            revision: state.current_revision,
+            revision_key: state.revision_key.clone(),
+            map_sha256: state.current_hash.clone(),
+            summary: if parts.is_empty() {
+                "변경 없음".to_string()
+            } else {
+                parts.join(", ")
+            },
+            terrain_cells: diff.terrain_cells,
+            units: count(&diff.units),
+            buildings: count(&diff.buildings),
+            doodads: count(&diff.doodads),
+            sprites: count(&diff.sprites),
+            locations: count(&diff.locations),
+        })
+    }
+
+    /// After the user's trusted Apply on `map_session_id`: every ready team
+    /// task targeting it becomes `applied` with the new source hash.
+    pub(crate) fn team_tasks_applied(
+        &self,
+        map_session_id: &str,
+        state: &CandidateStateView,
+        actor: crate::team::TeamApplyActor,
+    ) -> Vec<(String, crate::team::TeamTask)> {
+        self.settle_team_tasks(map_session_id, |task| {
+            if task.status != crate::team::TeamTaskStatus::CandidateReady {
+                return false;
+            }
+            task.status = crate::team::TeamTaskStatus::Applied;
+            task.applied_source_sha256 = Some(state.baseline.file_sha256.clone());
+            task.applied_by = Some(actor);
+            true
+        })
+    }
+
+    /// The EPS agent's `map_task_apply` / `map_task_discard` on one of its
+    /// tasks (plan Phase 2b). The task must still be `candidate_ready` and the
+    /// team session must still hold exactly the announced revision; apply then
+    /// runs the Map window's own apply path and discard drops the candidate.
+    /// Returns the updated task and every other task the action settled.
+    pub(crate) fn team_task_action(
+        &self,
+        action: &crate::tool_exec::TeamTaskAction,
+    ) -> Result<(crate::team::TeamTask, Vec<(String, crate::team::TeamTask)>), String> {
+        let parent = self
+            .sessions
+            .load(&action.session_id)
+            .map_err(|error| format!("the EPS session could not be loaded: {error}"))?;
+        let task = parent
+            .team_tasks
+            .iter()
+            .find(|task| task.id == action.task_id)
+            .cloned()
+            .ok_or_else(|| format!("map task '{}' does not exist", action.task_id))?;
+        if task.status != crate::team::TeamTaskStatus::CandidateReady {
+            return Err(format!(
+                "map task '{}' is {}, not candidate_ready",
+                task.id,
+                task.status.label()
+            ));
+        }
+        let candidate = task
+            .candidate
+            .as_ref()
+            .ok_or_else(|| format!("map task '{}' has no candidate", task.id))?;
+        let team = self.session_record(&task.map_session_id)?;
+        let state = self
+            .candidates
+            .state(&team.meta.project, &task.map_session_id)?;
+        // Revision numbers never repeat within a session; the announced hash
+        // legitimately changes when the session follows a changed source.
+        if state.stale || state.current_revision != candidate.revision {
+            return Err(format!(
+                "map task '{}' candidate changed since it was announced (team session is at r{}{})",
+                task.id,
+                state.current_revision,
+                if state.stale { ", stale" } else { "" }
+            ));
+        }
+        let settled = match action.kind {
+            crate::tool_exec::TeamTaskActionKind::Apply => {
+                if state.source_diverged {
+                    return Err(format!(
+                        "map task '{}' candidate could not be moved onto the saved source map (someone saved the same area differently); applying it would overwrite that save, so only the user can Apply it from the Map window",
+                        task.id
+                    ));
+                }
+                let state = self.apply(&task.map_session_id)?;
+                self.team_tasks_applied(
+                    &task.map_session_id,
+                    &state,
+                    crate::team::TeamApplyActor::Agent,
+                )
+            }
+            crate::tool_exec::TeamTaskActionKind::Discard => {
+                self.candidates
+                    .discard(&team.meta.project, &task.map_session_id)?;
+                self.team_tasks_withdrawn(&task.map_session_id, None)
+            }
+        };
+        let updated = settled
+            .iter()
+            .find(|(parent_id, updated)| parent_id == &action.session_id && updated.id == task.id)
+            .map(|(_, updated)| updated.clone())
+            .ok_or_else(|| {
+                format!(
+                    "map task '{}' did not settle after the {:?}",
+                    task.id, action.kind
+                )
+            })?;
+        Ok((updated, settled))
+    }
+
+    /// The team session's current candidate state, for refreshing an open Map
+    /// window after the EPS agent changed it.
+    pub(crate) fn team_session_state(
+        &self,
+        map_session_id: &str,
+    ) -> Result<CandidateStateView, String> {
+        let team = self.session_record(map_session_id)?;
+        self.candidates.state(&team.meta.project, map_session_id)
+    }
+
+    /// After discard, undo, or a revert below the candidate: ready tasks are
+    /// discarded and applied tasks whose apply was undone are discarded too.
+    pub(crate) fn team_tasks_withdrawn(
+        &self,
+        map_session_id: &str,
+        below_revision: Option<u32>,
+    ) -> Vec<(String, crate::team::TeamTask)> {
+        self.settle_team_tasks(map_session_id, |task| {
+            let withdrawn = match task.status {
+                crate::team::TeamTaskStatus::CandidateReady => {
+                    task.candidate.as_ref().map_or(true, |candidate| {
+                        below_revision.map_or(true, |revision| revision < candidate.revision)
+                    })
+                }
+                crate::team::TeamTaskStatus::Applied => below_revision.is_none(),
+                _ => false,
+            };
+            if withdrawn {
+                task.status = crate::team::TeamTaskStatus::Discarded;
+            }
+            withdrawn
+        })
+    }
+
+    /// Apply `update` to every task targeting `map_session_id` and return the
+    /// tasks that changed with their owning EPS session, for the caller to
+    /// announce to that session's panel.
+    fn settle_team_tasks(
+        &self,
+        map_session_id: &str,
+        update: impl Fn(&mut crate::team::TeamTask) -> bool,
+    ) -> Vec<(String, crate::team::TeamTask)> {
+        let tasks = match self.sessions.team_tasks_for_map_session(map_session_id) {
+            Ok(tasks) => tasks,
+            Err(error) => {
+                eprintln!("eud-agent: team task lookup failed: {error}");
+                return Vec::new();
+            }
+        };
+        let mut settled = Vec::new();
+        for (parent_id, task) in tasks {
+            match self
+                .sessions
+                .update_team_task(&parent_id, &task.id, &update)
+            {
+                Ok(Some(updated)) if updated != task => settled.push((parent_id, updated)),
+                Ok(_) => {}
+                Err(error) => eprintln!("eud-agent: team task update failed: {error}"),
+            }
+        }
+        settled
+    }
+
+    /// Remove a deleted team session's candidate files; `project_id` is the
+    /// map project the session belonged to, read before the record was deleted.
+    pub(crate) fn discard_session_candidate(
+        &self,
+        project_id: &str,
+        session_id: &str,
+    ) -> Result<(), String> {
+        self.candidates.discard(project_id, session_id)
+    }
+
+    /// Startup mapping: running tasks are interrupted; a ready candidate stays
+    /// only while the team session still holds exactly that revision.
+    ///
+    /// An interrupted task's team Map session also gets the window's
+    /// "대화 초기화" applied for it: the native run that died with the process
+    /// leaves an unconfirmed receipt that would refuse every later turn, and
+    /// nobody sits in that session to reset it by hand. Its candidate, draft
+    /// state, and panel log stay; only the model-side thread restarts.
+    pub(crate) fn recover_team_tasks(&self) -> Result<usize, String> {
+        let recovery = self
+            .sessions
+            .recover_interrupted_team_tasks(|task, session| {
+                let Some(candidate) = task.candidate.as_ref() else {
+                    return false;
+                };
+                // The store lock is held here: `session` is the task's Map
+                // session as loaded by the store; never re-read it.
+                if session.meta.kind != crate::session::SessionKind::Map {
+                    return false;
+                }
+                // Startup never follows the source; a changed map reads as stale here.
+                self.candidates
+                    .peek_state(&session.meta.project, &task.map_session_id)
+                    .is_ok_and(|state| !state.stale && state.current_revision == candidate.revision)
+            })
+            .map_err(|error| error.to_string())?;
+        let mut reset = std::collections::HashSet::new();
+        for task in &recovery.interrupted {
+            if !reset.insert(task.map_session_id.clone()) {
+                continue;
+            }
+            if let Err(error) = self.reset_team_session_conversation(&task.map_session_id) {
+                eprintln!(
+                    "eud-agent: interrupted team map session {} could not be reset: {error}",
+                    task.map_session_id
+                );
+            }
+        }
+        Ok(recovery.changed)
+    }
+
+    /// Clear every unconfirmed native run receipt of a team Map session and
+    /// forget its persisted provider conversation.
+    fn reset_team_session_conversation(&self, map_session_id: &str) -> Result<(), String> {
+        let journal = self.dirs.journal_dir();
+        for receipt in crate::provider_tool_loop::unresolved_native_runs(&journal, map_session_id)?
+        {
+            crate::provider_tool_loop::clear_native_run_recovery(
+                &journal,
+                map_session_id,
+                receipt.provider,
+                receipt.prior_native_id.as_deref(),
+            )?;
+        }
+        self.sessions
+            .reset_provider_conversation(map_session_id)
+            .map_err(|error| error.to_string())
     }
 }
 
@@ -1340,15 +1913,49 @@ fn append_location_diff(
     }
 }
 
-#[tauri::command]
-pub async fn map_agent_open(app: tauri::AppHandle) -> Result<(), String> {
+/// The event the Map window receives when it is already open and should
+/// switch to another session of the current source map.
+pub(crate) const MAP_OPEN_SESSION_EVENT: &str = "map-agent-open-session";
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MapOpenSessionEvent {
+    session_id: String,
+}
+
+/// Open or focus the Map window. With `session_id`, the window loads that
+/// session: a fresh window bootstraps it, an open window receives
+/// [`MAP_OPEN_SESSION_EVENT`] and switches when it is idle. A team session
+/// whose request is running is a valid target (the window adopts the run);
+/// an invalid target falls back to the ordinary session resolution.
+pub(crate) fn open_map_window(
+    app: &tauri::AppHandle,
+    session_id: Option<&str>,
+) -> Result<(), String> {
+    let service = app.state::<MapAgentService>();
+    let target = session_id.and_then(|session_id| {
+        let context = service.candidates.context().current().ok()?;
+        match service.session_for_context(session_id, &context) {
+            Ok(_) => Some(session_id.to_string()),
+            Err(error) => {
+                eprintln!("eud-agent: map window target {session_id} ignored: {error}");
+                None
+            }
+        }
+    });
     if let Some(window) = app.get_webview_window(MAP_WINDOW_LABEL) {
         window.show().map_err(|error| error.to_string())?;
         window.set_focus().map_err(|error| error.to_string())?;
+        if let Some(session_id) = target {
+            window
+                .emit(MAP_OPEN_SESSION_EVENT, MapOpenSessionEvent { session_id })
+                .map_err(|error| error.to_string())?;
+        }
         return Ok(());
     }
+    *service.pending_open_session.lock() = target;
     tauri::WebviewWindowBuilder::new(
-        &app,
+        app,
         MAP_WINDOW_LABEL,
         tauri::WebviewUrl::App("map-agent.html".into()),
     )
@@ -1358,8 +1965,30 @@ pub async fn map_agent_open(app: tauri::AppHandle) -> Result<(), String> {
     .resizable(true)
     .drag_and_drop(false)
     .build()
-    .map_err(|error| error.to_string())?;
+    .map_err(|error| {
+        *service.pending_open_session.lock() = None;
+        error.to_string()
+    })?;
     Ok(())
+}
+
+/// Close the Map window if it is open; the main window's shutdown calls this
+/// so a Map-only process never lingers. Closing does not touch candidate or
+/// session state, which the window reloads on its next open.
+pub(crate) fn close_map_window(app: &tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window(MAP_WINDOW_LABEL) {
+        if let Err(error) = window.close() {
+            eprintln!("eud-agent: map window could not be closed with the main window: {error}");
+        }
+    }
+}
+
+#[tauri::command]
+pub async fn map_agent_open(
+    app: tauri::AppHandle,
+    session_id: Option<String>,
+) -> Result<(), String> {
+    open_map_window(&app, session_id.as_deref())
 }
 
 #[tauri::command]
@@ -1368,7 +1997,7 @@ pub(crate) async fn map_agent_bootstrap(
     engines: tauri::State<'_, crate::engine::SessionEngineManager>,
 ) -> Result<MapBootstrapResponse, String> {
     let context = service.candidates.context().current()?;
-    let resolution = service.map_session(&context)?;
+    let resolution = service.bootstrap_session(&context)?;
     bootstrap_map_session(&service, &engines, context, resolution).await
 }
 
@@ -1480,6 +2109,12 @@ pub(crate) async fn map_agent_session_delete(
     {
         eprintln!("eud-agent: deleted Map session candidate cleanup failed: {error}");
     }
+    // A deleted team session can never deliver its candidate: its EPS parent
+    // must not stay excluded behind a task that no longer exists.
+    crate::engine::emit_team_tasks(
+        window.app_handle(),
+        service.team_tasks_withdrawn(&session_id, None),
+    );
     Ok(())
 }
 #[tauri::command]
@@ -1652,25 +2287,34 @@ pub fn map_agent_selection_delete(
 
 #[tauri::command]
 pub fn map_agent_candidate_revert(
+    app: tauri::AppHandle,
     service: tauri::State<'_, MapAgentService>,
     session_id: String,
     revision: u32,
 ) -> Result<CandidateStateView, String> {
     let session = service.session_record(&session_id)?;
-    service
+    let state = service
         .candidates
-        .revert(&session.meta.project, &session_id, revision)
+        .revert(&session.meta.project, &session_id, revision)?;
+    crate::engine::emit_team_tasks(
+        &app,
+        service.team_tasks_withdrawn(&session_id, Some(revision)),
+    );
+    Ok(state)
 }
 
 #[tauri::command]
 pub fn map_agent_candidate_discard(
+    app: tauri::AppHandle,
     service: tauri::State<'_, MapAgentService>,
     session_id: String,
 ) -> Result<(), String> {
     let session = service.session_record(&session_id)?;
     service
         .candidates
-        .discard(&session.meta.project, &session_id)
+        .discard(&session.meta.project, &session_id)?;
+    crate::engine::emit_team_tasks(&app, service.team_tasks_withdrawn(&session_id, None));
+    Ok(())
 }
 
 #[tauri::command]
@@ -1681,8 +2325,58 @@ pub fn map_agent_candidate_apply(
 ) -> Result<CandidateStateView, String> {
     require_map_window(&window)?;
     let state = service.apply(&session_id)?;
+    crate::engine::emit_team_tasks(
+        window.app_handle(),
+        service.team_tasks_applied(&session_id, &state, crate::team::TeamApplyActor::User),
+    );
     let _ = window.emit("map_apply_result", &state);
     Ok(state)
+}
+
+/// Save the "맵 속성" dialog straight to the source map (trusted Map window
+/// only). The resulting state is announced like a candidate Apply.
+#[tauri::command]
+pub async fn map_agent_properties_save(
+    window: tauri::WebviewWindow,
+    service: tauri::State<'_, MapAgentService>,
+    command: MapPropertiesSaveCommand,
+) -> Result<CandidateStateView, String> {
+    require_map_window(&window)?;
+    let service = service.inner().clone();
+    let state = run_map_blocking("map properties save", move || {
+        service.properties_save(&command)
+    })
+    .await?;
+    let _ = window.emit("map_apply_result", &state);
+    Ok(state)
+}
+
+/// Undo the last apply of a team Map session by its session id: the same
+/// undo as the Map window's, announced to the owning EPS session and to the
+/// Map window when it is open. The main window no longer shows a task card,
+/// so nothing in the panel calls this today.
+#[tauri::command]
+pub fn map_task_apply_undo(
+    app: tauri::AppHandle,
+    service: tauri::State<'_, MapAgentService>,
+    map_session_id: String,
+) -> Result<CandidateStateView, String> {
+    let team = service.session_record(&map_session_id)?;
+    if team.meta.team_parent.is_none() {
+        return Err("the requested session is not a team Map session".to_string());
+    }
+    let state = service.undo(&map_session_id)?;
+    crate::engine::emit_team_tasks(&app, service.team_tasks_withdrawn(&map_session_id, None));
+    notify_map_window_candidate(&app, &state);
+    Ok(state)
+}
+
+/// Push a team session's candidate state to the Map window when it is open,
+/// so an agent-driven request, apply, or discard shows there immediately.
+pub(crate) fn notify_map_window_candidate(app: &tauri::AppHandle, state: &CandidateStateView) {
+    if let Some(window) = app.get_webview_window(MAP_WINDOW_LABEL) {
+        let _ = window.emit("map_candidate_state", state);
+    }
 }
 
 #[tauri::command]
@@ -1693,6 +2387,10 @@ pub fn map_agent_apply_undo(
 ) -> Result<CandidateStateView, String> {
     require_map_window(&window)?;
     let state = service.undo(&session_id)?;
+    crate::engine::emit_team_tasks(
+        window.app_handle(),
+        service.team_tasks_withdrawn(&session_id, None),
+    );
     let _ = window.emit("map_apply_result", &state);
     Ok(state)
 }
@@ -1998,6 +2696,7 @@ mod tests {
             model: "gpt-test".to_string(),
             created_at: 1,
             last_conversation_at: 1,
+            team_parent: None,
         };
         assert_eq!(next_map_session_name(&[]), "Map Agent");
         assert_eq!(
@@ -2087,6 +2786,7 @@ mod tests {
                     model: "gpt-test".to_string(),
                     created_at: 1,
                     last_conversation_at: 1,
+                    team_parent: None,
                 },
                 provider_binding: crate::provider::ProviderBinding::new(
                     crate::provider::ProviderId::Codex,
@@ -2101,6 +2801,7 @@ mod tests {
                 task_state: Default::default(),
                 autonomous_run: None,
                 workflow: None,
+                team_tasks: Vec::new(),
             })
             .unwrap();
         let target = SelectionMask::canonical(
@@ -2232,6 +2933,7 @@ mod tests {
                     model: "gpt-test".to_string(),
                     created_at: 1,
                     last_conversation_at: 1,
+                    team_parent: None,
                 },
                 provider_binding: crate::provider::ProviderBinding::new(
                     crate::provider::ProviderId::Codex,
@@ -2246,6 +2948,7 @@ mod tests {
                 task_state: Default::default(),
                 autonomous_run: None,
                 workflow: None,
+                team_tasks: Vec::new(),
             })
             .unwrap();
 
@@ -2426,5 +3129,670 @@ mod tests {
         let replayed = candidates.revert("project", "map-session", 1).unwrap();
         assert_eq!(replayed.current_hash, confirmed.candidate.current_hash);
         std::fs::remove_dir_all(root).ok();
+    }
+}
+
+#[cfg(test)]
+mod team_handoff_tests {
+    use super::*;
+    use crate::map_candidate::{CandidateRevisionView, CandidateStateView, SelectionView};
+    use crate::map_model::{LayerDiffCount, MapDiff, MapLayer, SelectionRole, TileRect};
+
+    fn selection(id: &str, role: SelectionRole) -> SelectionView {
+        SelectionView {
+            selection: SelectionMask {
+                id: id.to_string(),
+                label: id.to_string(),
+                source_revision: "r0:hash".to_string(),
+                role,
+                layers: [MapLayer::Terrain].into_iter().collect(),
+                bounds: TileRect {
+                    left: 0,
+                    top: 0,
+                    right: 0,
+                    bottom: 0,
+                },
+                selected_cells: 1,
+                rows: vec![RowSpan {
+                    y: 0,
+                    spans: vec![(0, 0)],
+                }],
+            },
+            snapshot_hash: format!("snap-{id}"),
+        }
+    }
+
+    fn state(revision: u32, diff: Option<MapDiff>) -> CandidateStateView {
+        CandidateStateView {
+            session_id: "map-team".to_string(),
+            baseline: crate::map_model::MapRevision {
+                project_id: "project".to_string(),
+                source_path: std::path::PathBuf::from("maps/a.scx"),
+                file_sha256: "a".repeat(64),
+                chk_sha256: "c".repeat(64),
+                mtime_ns: 0,
+                tileset: crate::map_model::Tileset::Platform,
+                width: 64,
+                height: 64,
+            },
+            current_revision: revision,
+            current_hash: "b".repeat(64),
+            revision_key: format!("r{revision}:hash"),
+            revisions: diff
+                .map(|diff| {
+                    vec![CandidateRevisionView {
+                        revision,
+                        parent: revision.saturating_sub(1),
+                        request_id: "map-x".to_string(),
+                        map_sha256: "b".repeat(64),
+                        diff: diff.clone(),
+                        verification: crate::map_model::VerificationReport {
+                            valid: true,
+                            errors: Vec::new(),
+                            warnings: Vec::new(),
+                            diff,
+                            candidate_sha256: "b".repeat(64),
+                            canonical_digest: String::new(),
+                            extra_assets_digest: String::new(),
+                        },
+                    }]
+                })
+                .unwrap_or_default(),
+            selections: vec![
+                selection("target", SelectionRole::Target),
+                selection("protect", SelectionRole::Protect),
+            ],
+            stale: false,
+            source_diverged: false,
+            can_apply: revision > 0,
+            can_undo: false,
+        }
+    }
+
+    fn task() -> crate::team::TeamTask {
+        crate::team::TeamTask {
+            id: "task-1".to_string(),
+            parent_request_id: "req".to_string(),
+            map_session_id: "map-team".to_string(),
+            map_request_id: Some("map-1".to_string()),
+            goal: "전부 공허로".to_string(),
+            layers: vec![MapLayer::Terrain, MapLayer::Units],
+            selection_ids: vec!["target".to_string()],
+            location_ids: vec![3, 7],
+            source_map_sha256_at_create: "a".repeat(64),
+            status: crate::team::TeamTaskStatus::Queued,
+            candidate: None,
+            applied_source_sha256: None,
+            applied_by: None,
+            created_at: 1,
+            updated_at: 1,
+        }
+    }
+
+    #[test]
+    fn team_mentions_project_target_selections_and_locations_onto_the_candidate() {
+        let state = state(0, None);
+        let mentions =
+            MapAgentService::team_mentions(&state, &["target".to_string()], &[3]).unwrap();
+        assert_eq!(
+            mentions,
+            vec![
+                MapMentionSnapshot::Region {
+                    selection_id: "target".to_string(),
+                    snapshot_hash: "snap-target".to_string(),
+                    source_revision: "r0:hash".to_string(),
+                },
+                MapMentionSnapshot::Location {
+                    location_id: 3,
+                    revision_key: "r0:hash".to_string(),
+                    baseline_hash: "a".repeat(64),
+                },
+            ]
+        );
+        let protect =
+            MapAgentService::team_mentions(&state, &["protect".to_string()], &[]).unwrap_err();
+        assert!(protect.contains("not a target"), "{protect}");
+        let missing =
+            MapAgentService::team_mentions(&state, &["nope".to_string()], &[]).unwrap_err();
+        assert!(missing.contains("does not exist"), "{missing}");
+    }
+
+    #[test]
+    fn team_request_text_names_the_parent_layers_and_goal() {
+        let text = MapAgentService::team_request_text(
+            "메인 세션",
+            "a3f9c2d1-7b1e-4c2a-9d0f-1234567890ab",
+            &task(),
+            &json!([{"kind": "region"}]),
+        );
+        assert!(text.starts_with("[map mention snapshots]\n[{\"kind\":\"region\"}]"));
+        assert!(
+            text.contains("EPS session \"메인 세션\" (session id a3f9c2d1) as team task task-1")
+        );
+        assert!(text.contains("Change only these layers: terrain, units."));
+        assert!(text.contains("Location context: #3, #7."));
+        // The team session keeps the Map window's iterate-then-finalize way of
+        // working and owns the design; the goal's constraints alone bind it.
+        assert!(text.contains("exactly as you would a request the user typed in this window"));
+        assert!(text.contains("the choice of tiles, doodads, objects, and layout is yours"));
+        assert!(text.ends_with("[goal]\n전부 공허로"));
+    }
+
+    fn eps_parent(project: &str) -> crate::session::SessionRecord {
+        crate::session::SessionRecord {
+            meta: crate::session::SessionMeta {
+                id: "eps-1".to_string(),
+                name: "메인".to_string(),
+                project: project.to_string(),
+                kind: crate::session::SessionKind::Eps,
+                provider: crate::provider::ProviderId::Codex,
+                model: "gpt-test".to_string(),
+                created_at: 1,
+                last_conversation_at: 1,
+                team_parent: None,
+            },
+            provider_binding: crate::provider::ProviderBinding::new(
+                crate::provider::ProviderId::Codex,
+                "gpt-test".to_string(),
+                None,
+            )
+            .unwrap(),
+            pending_request_ids: Vec::new(),
+            context_usage: None,
+            panel_log: Value::Null,
+            context_state: Default::default(),
+            task_state: Default::default(),
+            autonomous_run: None,
+            workflow: None,
+            team_tasks: Vec::new(),
+        }
+    }
+
+    /// EPS sessions are keyed by manifest name and Map sessions by the
+    /// project-root hash: the live `rpg` project failed with "the current
+    /// source map belongs to another project" when the two were compared.
+    /// A temp-root Map service bound to a copy of the rich fixture map, with
+    /// the Map project id derived from the root like the live app does.
+    struct TeamFixture {
+        root: PathBuf,
+        source: PathBuf,
+        map_project_id: String,
+        context: crate::map_context::MapContextSnapshot,
+        service: MapAgentService,
+    }
+
+    impl Drop for TeamFixture {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.root).ok();
+        }
+    }
+
+    fn team_fixture() -> TeamFixture {
+        let root = std::env::temp_dir().join(format!("map-agent-team-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let dirs = DataDirs::from_bases(&root.join("roaming"), &root.join("local"));
+        dirs.ensure_dirs().unwrap();
+        let source = root.join("rpg.scx");
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("crates")
+            .join("isom")
+            .join("tests")
+            .join("fixtures")
+            .join("map_agent_rich.scx");
+        std::fs::copy(fixture, &source).unwrap();
+        let map_project_id = crate::map_context::project_id_for_path(root.clone());
+        let context_service = crate::map_context::MapContextService::new(dirs.clone());
+        let revision = context_service
+            .revision_for_path(map_project_id.clone(), &source)
+            .unwrap();
+        let chk = isom::chk_extract(&source).unwrap();
+        let context = crate::map_context::MapContextSnapshot {
+            revision,
+            saved_source_notice: "saved".to_string(),
+            source_file_size: std::fs::metadata(&source).unwrap().len(),
+            starcraft_path: PathBuf::from(r"C:\Program Files (x86)\StarCraft"),
+            digest: crate::chk::digest_chk(&chk),
+        };
+        let candidates = CandidateStore::new(
+            dirs.clone(),
+            crate::map_import::MapImportStore::new(dirs.clone()),
+        );
+        let service = MapAgentService::new(
+            dirs,
+            candidates,
+            crate::write_coordinator::ProjectWriteCoordinator::silent(),
+        );
+        TeamFixture {
+            root,
+            source,
+            map_project_id,
+            context,
+            service,
+        }
+    }
+
+    #[test]
+    fn team_session_is_keyed_by_the_map_project_id_not_the_eps_manifest_name() {
+        let fixture = team_fixture();
+        let TeamFixture {
+            source,
+            map_project_id,
+            context,
+            service,
+            ..
+        } = &fixture;
+        let (source, map_project_id, context, service) =
+            (source.clone(), map_project_id.clone(), context, service);
+        assert_ne!(map_project_id, "rpg");
+        let parent = eps_parent("rpg");
+
+        let other = service
+            .fresh_team_session_in(&parent, context, "other")
+            .unwrap_err();
+        assert!(other.contains("not the open project 'other'"), "{other}");
+        assert!(service.sessions.team_session_of("eps-1").unwrap().is_none());
+
+        let (record, state, retired) = service
+            .fresh_team_session_in(&parent, context, "rpg")
+            .unwrap();
+        assert!(retired.is_empty());
+        assert_eq!(record.meta.kind, crate::session::SessionKind::Map);
+        assert_eq!(record.meta.project, map_project_id);
+        assert_eq!(record.meta.team_parent.as_deref(), Some("eps-1"));
+        assert_eq!(record.meta.name, "메인 · 맵 작업");
+        assert_eq!(state.current_revision, 0);
+        assert_eq!(state.baseline.source_path, source);
+    }
+
+    /// Every map task runs in a fresh team session on the saved source map:
+    /// the earlier session is retired (its candidate would otherwise stack
+    /// under the next request) unless the Map window can still undo its
+    /// Apply against the current source.
+    #[test]
+    fn each_map_task_gets_a_fresh_team_session_and_retires_the_earlier_one() {
+        let fixture = team_fixture();
+        let TeamFixture {
+            source,
+            map_project_id,
+            context,
+            service,
+            root,
+        } = &fixture;
+        let parent = eps_parent("rpg");
+        service.sessions.save(&parent).unwrap();
+
+        let (first, _, retired) = service
+            .fresh_team_session_in(&parent, context, "rpg")
+            .unwrap();
+        assert!(retired.is_empty());
+        let (second, second_state, retired) = service
+            .fresh_team_session_in(&parent, context, "rpg")
+            .unwrap();
+        assert_ne!(
+            second.meta.id, first.meta.id,
+            "a task never reuses a team session"
+        );
+        assert_eq!(second_state.current_revision, 0);
+        assert_eq!(
+            retired
+                .iter()
+                .map(|meta| meta.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![first.meta.id.as_str()],
+            "an earlier session without an undoable apply is retired"
+        );
+        assert_eq!(
+            service
+                .sessions
+                .team_session_of("eps-1")
+                .unwrap()
+                .map(|meta| meta.id),
+            Some(second.meta.id.clone()),
+            "the newest team session is the parent's current one"
+        );
+        // The engine manager deletes retired sessions; until it has, they are
+        // reported again so a failed retirement is retried by the next task.
+        service.sessions.delete(&first.meta.id).unwrap();
+
+        // The second session applies its candidate: the saved source is now
+        // that Apply's output, so the window can still undo it.
+        let backup = root.join("second.backup.scx");
+        std::fs::copy(source, &backup).unwrap();
+        let source_sha256 = context.revision.file_sha256.clone();
+        service
+            .candidates
+            .complete_apply(
+                map_project_id,
+                &second.meta.id,
+                &crate::mapsafe::CandidateApplyRecord {
+                    source_path: source.clone(),
+                    backup_path: backup,
+                    before_sha256: "b".repeat(64),
+                    applied_sha256: source_sha256.clone(),
+                },
+            )
+            .unwrap();
+        assert!(service
+            .candidates
+            .apply_undoable_against(map_project_id, &second.meta.id, &source_sha256)
+            .unwrap());
+        let (third, _, retired) = service
+            .fresh_team_session_in(&parent, context, "rpg")
+            .unwrap();
+        assert_ne!(third.meta.id, second.meta.id);
+        assert!(
+            retired.is_empty(),
+            "a session whose Apply is still undoable survives: {retired:?}"
+        );
+
+        // Once the source moves on, that undo is retired with its session.
+        let mut moved = context.clone();
+        moved.revision.file_sha256 = "c".repeat(64);
+        let (_, _, retired) = service
+            .fresh_team_session_in(&parent, &moved, "rpg")
+            .unwrap();
+        let mut retired_ids = retired
+            .iter()
+            .map(|meta| meta.id.as_str())
+            .collect::<Vec<_>>();
+        retired_ids.sort();
+        let mut expected = vec![second.meta.id.as_str(), third.meta.id.as_str()];
+        expected.sort();
+        assert_eq!(retired_ids, expected);
+    }
+
+    /// The Map window opens on the team session the moment its task runs: a
+    /// queued or running task is not a reason to fall back to another session.
+    #[test]
+    fn a_team_session_with_a_running_task_is_a_valid_window_target() {
+        let fixture = team_fixture();
+        let service = &fixture.service;
+        let parent = eps_parent("rpg");
+        service.sessions.save(&parent).unwrap();
+        let (team, _, _) = service
+            .fresh_team_session_in(&parent, &fixture.context, "rpg")
+            .unwrap();
+        for status in [
+            crate::team::TeamTaskStatus::Queued,
+            crate::team::TeamTaskStatus::Running,
+        ] {
+            let mut task = task();
+            task.map_session_id = team.meta.id.clone();
+            task.status = status.clone();
+            service
+                .sessions
+                .upsert_team_task(&parent.meta.id, task)
+                .unwrap();
+            let resolution = service
+                .session_for_context(&team.meta.id, &fixture.context)
+                .unwrap_or_else(|error| panic!("{status:?} task blocked the window: {error}"));
+            assert_eq!(resolution.session.meta.id, team.meta.id);
+            assert!(matches!(
+                resolution.candidate_action,
+                CandidateSessionAction::Open
+            ));
+        }
+        *service.pending_open_session.lock() = Some(team.meta.id.clone());
+        let bootstrapped = service.bootstrap_session(&fixture.context).unwrap();
+        assert_eq!(
+            bootstrapped.session.meta.id, team.meta.id,
+            "the requested running team session is bootstrapped, not the default one"
+        );
+        assert!(service.pending_open_session.lock().is_none());
+    }
+
+    /// A team run that died with the process leaves a pending native receipt
+    /// that would refuse every later turn on the team session. Startup marks
+    /// the task interrupted and resets that session's conversation for the
+    /// user, so the EPS agent's next map request runs without a manual reset.
+    #[test]
+    fn startup_resets_the_team_session_whose_run_died_with_the_process() {
+        let fixture = team_fixture();
+        let service = &fixture.service;
+        let parent = eps_parent("rpg");
+        service.sessions.save(&parent).unwrap();
+        let (mut team, _, _) = service
+            .fresh_team_session_in(&parent, &fixture.context, "rpg")
+            .unwrap();
+        team.provider_binding.conversation = crate::provider::ProviderConversationState::Codex {
+            thread_id: Some("thread-before".to_string()),
+        };
+        service.sessions.save(&team).unwrap();
+        let mut running = task();
+        running.map_session_id = team.meta.id.clone();
+        running.status = crate::team::TeamTaskStatus::Running;
+        service
+            .sessions
+            .upsert_team_task(&parent.meta.id, running)
+            .unwrap();
+        let journal = service.dirs.journal_dir();
+        crate::provider_tool_loop::leave_pending_native_receipt_for_tests(
+            &journal,
+            &crate::provider_runtime::RunIdentity {
+                session_id: team.meta.id.clone(),
+                run_id: crate::provider_runtime::RunId::new(7),
+                request_id: "map-1".to_string(),
+                session_kind: crate::session::SessionKind::Map,
+                cancellation_generation: 0,
+            },
+            crate::provider::ProviderId::Codex,
+            Some("thread-before"),
+        )
+        .unwrap();
+        assert_eq!(
+            crate::provider_tool_loop::unresolved_native_runs(&journal, &team.meta.id)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        assert_eq!(service.recover_team_tasks().unwrap(), 1);
+
+        let tasks = service.sessions.load(&parent.meta.id).unwrap().team_tasks;
+        assert_eq!(tasks[0].status, crate::team::TeamTaskStatus::Interrupted);
+        assert!(
+            crate::provider_tool_loop::unresolved_native_runs(&journal, &team.meta.id)
+                .unwrap()
+                .is_empty(),
+            "the dead run's receipt no longer refuses the next turn"
+        );
+        let reset = service.sessions.load(&team.meta.id).unwrap();
+        assert_eq!(
+            reset.provider_binding.conversation,
+            crate::provider::ProviderConversationState::empty(team.provider_binding.provider)
+        );
+        assert_eq!(
+            reset.meta.team_parent.as_deref(),
+            Some(parent.meta.id.as_str())
+        );
+        // A second startup finds nothing to interrupt and resets nothing.
+        assert_eq!(service.recover_team_tasks().unwrap(), 0);
+    }
+
+    /// A `candidate_ready` task left over from the previous run used to hang
+    /// startup: the candidate check re-read the Map session through the
+    /// session store while the recovery pass already held its lock, so the
+    /// main thread never returned from `setup` ("응답 없음"). Recovery must
+    /// settle within a bound and keep exactly the candidate that still exists.
+    #[test]
+    fn startup_with_a_ready_team_candidate_settles_instead_of_deadlocking() {
+        let fixture = team_fixture();
+        let service = &fixture.service;
+        let parent = eps_parent("rpg");
+        service.sessions.save(&parent).unwrap();
+        let (team, state, _) = service
+            .fresh_team_session_in(&parent, &fixture.context, "rpg")
+            .unwrap();
+        let ready = |id: &str, revision: u32| {
+            let mut task = task();
+            task.id = id.to_string();
+            task.map_session_id = team.meta.id.clone();
+            task.status = crate::team::TeamTaskStatus::CandidateReady;
+            task.candidate = Some(crate::team::TeamCandidateSummary {
+                revision,
+                revision_key: format!("r{revision}"),
+                map_sha256: "b".repeat(64),
+                summary: "candidate".to_string(),
+                terrain_cells: 1,
+                units: 0,
+                buildings: 0,
+                doodads: 0,
+                sprites: 0,
+                locations: 0,
+            });
+            task
+        };
+        service
+            .sessions
+            .upsert_team_task(&parent.meta.id, ready("live", state.current_revision))
+            .unwrap();
+        service
+            .sessions
+            .upsert_team_task(&parent.meta.id, ready("gone", state.current_revision + 1))
+            .unwrap();
+
+        let (done, recovered) = std::sync::mpsc::channel();
+        let startup = service.clone();
+        std::thread::spawn(move || done.send(startup.recover_team_tasks()).ok());
+        let changed = recovered
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("team task recovery deadlocked on the session store lock")
+            .unwrap();
+        assert_eq!(changed, 1);
+
+        let tasks = service.sessions.load(&parent.meta.id).unwrap().team_tasks;
+        let status = |id: &str| {
+            tasks
+                .iter()
+                .find(|task| task.id == id)
+                .unwrap()
+                .status
+                .clone()
+        };
+        assert_eq!(status("live"), crate::team::TeamTaskStatus::CandidateReady);
+        assert_eq!(status("gone"), crate::team::TeamTaskStatus::Discarded);
+    }
+
+    /// `map_task_apply` / `map_task_discard` act only on the exact candidate
+    /// the task announced; discard settles the task and leaves the map alone.
+    #[test]
+    fn team_task_action_validates_the_live_candidate_and_discards_it() {
+        let fixture = team_fixture();
+        let service = &fixture.service;
+        let parent = eps_parent("rpg");
+        service.sessions.save(&parent).unwrap();
+        let (team, state, _) = service
+            .fresh_team_session_in(&parent, &fixture.context, "rpg")
+            .unwrap();
+        let mut task = task();
+        task.map_session_id = team.meta.id.clone();
+        task.status = crate::team::TeamTaskStatus::CandidateReady;
+        task.candidate = Some(crate::team::TeamCandidateSummary {
+            revision: 1,
+            revision_key: "r1:stale".to_string(),
+            map_sha256: "f".repeat(64),
+            summary: "지형 1칸".to_string(),
+            terrain_cells: 1,
+            units: 0,
+            buildings: 0,
+            doodads: 0,
+            sprites: 0,
+            locations: 0,
+        });
+        service
+            .sessions
+            .upsert_team_task(&parent.meta.id, task.clone())
+            .unwrap();
+        let action = crate::tool_exec::TeamTaskAction {
+            session_id: parent.meta.id.clone(),
+            request_id: "req".to_string(),
+            task_id: task.id.clone(),
+            kind: crate::tool_exec::TeamTaskActionKind::Discard,
+        };
+
+        // The team session is at r0, not the announced r1: refuse.
+        let changed = service.team_task_action(&action).unwrap_err();
+        assert!(
+            changed.contains("changed since it was announced"),
+            "{changed}"
+        );
+
+        // Announce the live candidate exactly and discard it.
+        task.candidate = Some(crate::team::TeamCandidateSummary {
+            revision: state.current_revision,
+            revision_key: state.revision_key.clone(),
+            map_sha256: state.current_hash.clone(),
+            summary: "변경 없음".to_string(),
+            terrain_cells: 0,
+            units: 0,
+            buildings: 0,
+            doodads: 0,
+            sprites: 0,
+            locations: 0,
+        });
+        service
+            .sessions
+            .upsert_team_task(&parent.meta.id, task.clone())
+            .unwrap();
+        let before = std::fs::read(&fixture.source).unwrap();
+        let (updated, settled) = service.team_task_action(&action).unwrap();
+        assert_eq!(updated.status, crate::team::TeamTaskStatus::Discarded);
+        assert_eq!(settled.len(), 1);
+        assert_eq!(settled[0].0, parent.meta.id);
+        assert_eq!(std::fs::read(&fixture.source).unwrap(), before);
+        let stored = service.sessions.load(&parent.meta.id).unwrap();
+        assert_eq!(
+            stored.team_tasks[0].status,
+            crate::team::TeamTaskStatus::Discarded
+        );
+
+        // A settled task can no longer be applied.
+        let apply = crate::tool_exec::TeamTaskAction {
+            kind: crate::tool_exec::TeamTaskActionKind::Apply,
+            ..action
+        };
+        let settled = service.team_task_action(&apply).unwrap_err();
+        assert!(settled.contains("not candidate_ready"), "{settled}");
+        assert_eq!(fixture.map_project_id, team.meta.project);
+    }
+
+    #[test]
+    fn team_candidate_summary_reports_only_a_new_revision() {
+        let diff = MapDiff {
+            terrain_cells: 40,
+            terrain_bounds: None,
+            units: LayerDiffCount {
+                added: 2,
+                removed: 0,
+                moved: 1,
+                changed: 0,
+            },
+            buildings: LayerDiffCount::default(),
+            doodads: LayerDiffCount::default(),
+            sprites: LayerDiffCount::default(),
+            locations: LayerDiffCount {
+                added: 1,
+                removed: 0,
+                moved: 0,
+                changed: 0,
+            },
+            outside_target: 0,
+            protected: 0,
+            unsupported_section_changes: Vec::new(),
+            properties: 0,
+        };
+        let summary = MapAgentService::team_candidate_summary(0, &state(1, Some(diff))).unwrap();
+        assert_eq!(summary.revision, 1);
+        assert_eq!(summary.summary, "지형 40칸, 유닛 3건, 로케이션 1건");
+        assert_eq!(summary.units, 3);
+        assert_eq!(summary.map_sha256, "b".repeat(64));
+        assert!(MapAgentService::team_candidate_summary(1, &state(1, None)).is_none());
+        assert_eq!(
+            MapAgentService::team_candidate_summary(0, &state(1, Some(MapDiff::default())))
+                .unwrap()
+                .summary,
+            "변경 없음"
+        );
     }
 }

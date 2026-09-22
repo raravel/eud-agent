@@ -77,6 +77,9 @@ pub enum AutonomousPauseReason {
     /// An `ask` expired and the turn ended with the question as plain text;
     /// the user's reply arrives as an ordinary message.
     UnansweredAsk,
+    /// A team map task's candidate waits for the user's Apply or discard in
+    /// the Map window; explicit resume continues the run.
+    TeamApply,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

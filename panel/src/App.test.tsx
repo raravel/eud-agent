@@ -703,6 +703,58 @@ describe("App concurrent sessions", () => {
   });
 
 
+  it("records the engine-started continuation turn after a team map task settled", async () => {
+    render(<App />);
+    const input = await screen.findByRole("combobox", { name: "지시 입력" });
+    await waitFor(() => expect(input).toBeEnabled());
+    await waitFor(() => expect(tauri.listeners.has("team_task")).toBe(true));
+    const task = {
+      id: "task-1",
+      parentRequestId: "req-1",
+      mapSessionId: "map-1",
+      goal: "사냥터를 꾸며줘",
+      layers: ["terrain", "doodads"],
+      sourceMapSha256AtCreate: "a".repeat(64),
+      status: { kind: "candidate_ready" },
+      candidate: {
+        revision: 1,
+        revisionKey: "r1:abc",
+        mapSha256: "b".repeat(64),
+        summary: "두다드 44건",
+        terrainCells: 0,
+        units: 0,
+        buildings: 0,
+        doodads: 44,
+        sprites: 0,
+        locations: 0,
+      },
+      createdAt: 1,
+      updatedAt: 2,
+    };
+    act(() => {
+      emit("team_task", {
+        sessionId: "session-a",
+        task,
+        continuation: {
+          clientTurnId: "turn-continue",
+          text: "맵 작업 결과를 확인했습니다. [map tasks] 상태를 기준으로 이어서 진행해 주세요.",
+        },
+      });
+    });
+
+    // The settlement notice and the turn's own user bubble both land, and the
+    // turn is in flight (send-gated) without the panel having sent anything.
+    expect(
+      await screen.findByText(/맵 에이전트가 후보 r1을 만들었습니다\. AI가 이어서 검토합니다/),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText("맵 작업 결과를 확인했습니다. [map tasks] 상태를 기준으로 이어서 진행해 주세요."),
+    ).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "실행" })).toBeDisabled();
+    expect(screen.getByTestId("active-turn-status")).toBeInTheDocument();
+    expect(tauri.invoke.mock.calls.filter(([command]) => command === "chat")).toHaveLength(0);
+  });
+
   it("does not autosave conversation logs for project-state refreshes", async () => {
     render(<App />);
     await screen.findByRole("button", { name: "Session A, 유휴" });

@@ -12,6 +12,9 @@ pub(crate) struct SessionRuntimeEventSink<S> {
     sessions: SessionStore,
     session_id: String,
     response_id: parking_lot::Mutex<Option<String>>,
+    /// Set for a `delegate_read` child: its tool events carry this run id so
+    /// the panel nests them, and its usage never replaces the session's `last`.
+    delegation_run_id: Option<u64>,
 }
 
 impl<S: EventSink> SessionRuntimeEventSink<S> {
@@ -21,10 +24,26 @@ impl<S: EventSink> SessionRuntimeEventSink<S> {
             sessions,
             session_id,
             response_id: parking_lot::Mutex::new(None),
+            delegation_run_id: None,
+        }
+    }
+
+    pub(crate) fn delegated(
+        sink: S,
+        sessions: SessionStore,
+        session_id: String,
+        child_run_id: u64,
+    ) -> Self {
+        Self {
+            delegation_run_id: Some(child_run_id),
+            ..Self::new(sink, sessions, session_id)
         }
     }
 
     fn emit_usage(&self, usage: &NormalizedUsage) -> Result<(), ProviderRuntimeError> {
+        if self.delegation_run_id.is_some() {
+            return Ok(());
+        }
         let Some(token_usage) = &usage.context_usage else {
             return Ok(());
         };
@@ -78,6 +97,7 @@ impl<S: EventSink + Send + Sync> RuntimeEventSink for SessionRuntimeEventSink<S>
                     args: Some(call.arguments.to_string()),
                     result: None,
                     status: None,
+                    delegation_run_id: self.delegation_run_id,
                 }),
             },
             AdapterEventKind::Block(NormalizedBlock::ToolResult { result, .. }) => {
@@ -96,6 +116,7 @@ impl<S: EventSink + Send + Sync> RuntimeEventSink for SessionRuntimeEventSink<S>
                             }
                             .to_string(),
                         ),
+                        delegation_run_id: self.delegation_run_id,
                     }),
                 }
             }
@@ -128,6 +149,7 @@ impl<S: EventSink + Send + Sync> RuntimeEventSink for SessionRuntimeEventSink<S>
                         } else {
                             None
                         },
+                        delegation_run_id: self.delegation_run_id,
                     }),
                 }
             }

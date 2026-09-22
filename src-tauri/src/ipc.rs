@@ -208,6 +208,39 @@ pub struct AskEvent {
     pub questions: Vec<AskQuestion>,
 }
 
+/// Lifecycle of one model-invoked `delegate_read` child run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DelegationStatus {
+    Queued,
+    Running,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+/// Core-to-panel `delegation` event: the child's identity, lifecycle, and
+/// usage. Its tool calls arrive as ordinary `agent_event`s tagged with the same
+/// `childRunId` in `data.delegationRunId`; its text and reasoning never do.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DelegationEvent {
+    pub request_id: String,
+    pub parent_run_id: u64,
+    pub child_run_id: u64,
+    pub goal: String,
+    pub status: DelegationStatus,
+    /// Admitted child tool completions so far (final on a terminal status).
+    pub tool_calls: usize,
+    pub elapsed_ms: u64,
+    /// Why a `failed` child ended, in user-facing Korean.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// The child's own provider usage when the provider reported it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<ContextUsage>,
+}
+
 /// Answers for one question. Multiple values are valid only for `multi`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AskAnswer {
@@ -415,6 +448,10 @@ pub struct AgentEventData {
     /// Tool result status.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<String>,
+    /// The `delegate_read` child run that made this call, so the panel nests it
+    /// under the parent's delegation card instead of the foreground stream.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delegation_run_id: Option<u64>,
 }
 
 /// `agent_event` payload.
@@ -430,7 +467,7 @@ pub struct AgentEvent {
 }
 
 /// Token counts reported by one Codex model response.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TokenUsageBreakdown {
     pub input_tokens: i64,
@@ -1655,6 +1692,7 @@ mod tests {
                 args: Some("{\"query\":\"countdown\"}".to_string()),
                 result: None,
                 status: None,
+                delegation_run_id: None,
             }),
         };
         assert_json(
@@ -1677,6 +1715,7 @@ mod tests {
                 args: None,
                 result: Some("2 hits".to_string()),
                 status: Some("completed".to_string()),
+                delegation_run_id: None,
             }),
         };
         assert_json(

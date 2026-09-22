@@ -20,6 +20,9 @@ use crate::{
     tool_exec::SessionToolRuntime,
 };
 
+/// The user message that opens a delegated run's final, submission-only round.
+const FINAL_ROUND_NOTICE: &str = "[tool budget]\nThis run has used its tool rounds. No further reads execute; only submit_result is available. Submit the result now from what you have already read, stating any gap in it.";
+
 /// Runs one isolated model context over a read-only tool profile until the
 /// model calls `submit_result`. Shared by engine-owned workflow stages and by
 /// model-invoked read delegation; only the caller and the profile differ.
@@ -158,7 +161,22 @@ impl DelegatedRunExecutor {
             }};
         }
 
-        for _ in 0..request.policy.max_tool_rounds {
+        let max_tool_rounds = request.policy.max_tool_rounds;
+        for round in 0..max_tool_rounds {
+            // Soft bound: the last round after at least one tool round is
+            // submission-only. The model is shown `submit_result` alone and
+            // told why, so whatever it has read so far still becomes the
+            // result instead of an exhausted run with nothing to show. Native
+            // runs settle inside their first step, so only direct steps ever
+            // reach this round.
+            if direct && round > 0 && round + 1 == max_tool_rounds {
+                gate.enter_submission_only();
+                history.push(ConversationItem::User {
+                    request_id: request.identity.request_id.clone(),
+                    text: FINAL_ROUND_NOTICE.to_string(),
+                    images: Vec::new(),
+                });
+            }
             active_remaining =
                 active_remaining.map(|remaining| remaining.saturating_sub(active_mark.elapsed()));
             let mut step_policy = request.policy.clone();
@@ -172,7 +190,7 @@ impl DelegatedRunExecutor {
                 history: Arc::from(history.clone()),
                 prior_tool_results: prior_results.clone(),
                 tool_descriptors: if direct {
-                    Arc::from(gate.descriptors())
+                    Arc::from(gate.advertised_descriptors())
                 } else {
                     Arc::from([])
                 },
@@ -190,6 +208,13 @@ impl DelegatedRunExecutor {
             let step = match step {
                 Ok(step) => step,
                 Err(ProviderRuntimeError::Cancelled) => stop_with!(DelegatedRunOutcome::Cancelled),
+                // The accepted submission is the run's result; a native CLI
+                // that then runs out its deadline while wrapping up its turn
+                // (final text, late reads) does not lose it.
+                Err(ProviderRuntimeError::TimedOut) if gate.delegated_result().is_some() => {
+                    let value = gate.delegated_result().expect("checked above");
+                    stop_with!(Self::accept(&request, value, &gate, &usage))
+                }
                 Err(error) => stop_with!(DelegatedRunOutcome::Failed(error)),
             };
             active_remaining = step.remaining_active;

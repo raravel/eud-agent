@@ -408,11 +408,81 @@ async fn delegated_submission_schema_violation_is_correctable() {
     assert_eq!(bodies.lock().unwrap().len(), 2);
 }
 
+/// The final round's user notice, as the Responses wire carries it.
+fn final_round_notice(body: &Value) -> Option<String> {
+    body["input"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|item| item["role"] == "user")
+        .filter_map(|item| {
+            let text = item["content"].as_str().map(str::to_string).or_else(|| {
+                item["content"]
+                    .as_array()?
+                    .iter()
+                    .find_map(|part| part["text"].as_str().map(str::to_string))
+            })?;
+            text.starts_with("[tool budget]").then_some(text)
+        })
+        .next()
+}
+
+#[tokio::test]
+async fn delegated_final_round_is_submission_only_and_keeps_the_partial_result() {
+    // Given: a model that would read forever, over a three-round budget.
+    let fixture = RuntimeFixture::new("delegated-soft-bound");
+    let (base, server, bodies) = serve(|round, body| match round {
+        0 | 1 => {
+            assert!(final_round_notice(body).is_none(), "round {round}");
+            function_call(&format!("call-{round}"), "list_files", &json!({}))
+        }
+        2 => {
+            // The final round shows submit_result alone and says why, so the
+            // model submits from what it has read.
+            assert_eq!(tool_names(body), [SUBMIT_RESULT_TOOL]);
+            assert!(final_round_notice(body).is_some());
+            function_call(
+                "call-submit",
+                SUBMIT_RESULT_TOOL,
+                &json!({"summary": "partial", "files": ["src/main.eps"]}),
+            )
+        }
+        other => panic!("unexpected round {other}"),
+    })
+    .await;
+    let mut executor = executor(&fixture, &base);
+
+    let outcome = executor.run(request(&fixture, 50_010, 3)).await;
+    server.abort();
+
+    assert_eq!(
+        outcome,
+        DelegatedRunOutcome::Result {
+            value: json!({"summary": "partial", "files": ["src/main.eps"]}),
+            completions: 3,
+            usage: None,
+        }
+    );
+    let bodies = bodies.lock().unwrap();
+    assert_eq!(bodies.len(), 3);
+    assert_eq!(
+        tool_names(&bodies[1]),
+        ["list_files", "read_file", SUBMIT_RESULT_TOOL],
+        "the round before the last still advertises the profile"
+    );
+}
+
 #[tokio::test]
 async fn delegated_round_exhaustion_fails_without_a_partial_result() {
+    // A model that ignores the submission-only round still ends exhausted:
+    // its final read completes with the usage error instead of executing.
     let fixture = RuntimeFixture::new("delegated-rounds");
-    let (base, server, bodies) = serve(|round, _| match round {
-        0 | 1 => function_call(&format!("call-{round}"), "list_files", &json!({})),
+    let (base, server, bodies) = serve(|round, body| match round {
+        0 => function_call("call-0", "list_files", &json!({})),
+        1 => {
+            assert_eq!(tool_names(body), [SUBMIT_RESULT_TOOL]);
+            function_call("call-1", "list_files", &json!({}))
+        }
         other => panic!("unexpected round {other}"),
     })
     .await;

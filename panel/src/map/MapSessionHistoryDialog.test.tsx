@@ -98,4 +98,26 @@ describe("MapSessionHistoryDialog", () => {
     );
     expect(onDelete).toHaveBeenCalledWith("session-previous");
   });
+
+  it("shows each history entry's short id and copies the full id", () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", {
+      value: { writeText },
+      configurable: true,
+    });
+    const fullId = "b7e2d9a4-1c3f-4e5a-8b6d-0f9e8d7c6b5a";
+    render(
+      <MapSessionHistoryDialog
+        {...baseProps}
+        sessions={[{ ...sessions[1], id: fullId }]}
+      />,
+    );
+
+    expect(screen.getByText("b7e2d9a4")).toBeInTheDocument();
+    fireEvent.click(
+      screen.getByRole("button", { name: "멀티 배치 검토 세션 ID 복사" }),
+    );
+    expect(writeText).toHaveBeenCalledWith(fullId);
+    Reflect.deleteProperty(navigator, "clipboard");
+  });
 });

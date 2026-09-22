@@ -96,6 +96,13 @@ function Run-DelegatedSequence($endpoint, $prompt) {
             if ($accepted -notmatch 'accepted') { throw 'submit_result was not accepted' }
             return 'submitted'
         }
+        'delegated-submit-hang' {
+            $accepted = Invoke-McpTool $endpoint $headers 1 'submit_result' @{summary='submitted early'; files=@()} $false
+            if ($accepted -notmatch 'accepted') { throw 'submit_result was not accepted' }
+            # The CLI keeps its turn open past the run deadline after submitting.
+            Start-Sleep -Seconds 300
+            throw 'Hanging delegated fixture was not terminated'
+        }
         'delegated-write' {
             $refusal = Invoke-McpTool $endpoint $headers 1 'file_create' @{path='src/x.eps'; ftype='CUIEps'; code="// x`n"} $true
             if ($refusal -notmatch 'unknown tool') { throw "write was not refused as unknown: $refusal" }

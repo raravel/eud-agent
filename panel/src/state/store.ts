@@ -38,7 +38,10 @@ import type {
   AskQuestion,
   ChatAttachment,
   ContextUsage,
+  DelegationMessageBody,
+  DelegationStatus,
   FileEntry,
+  TeamTask,
   LedgerEntry,
   MemoryFile,
   PanelLog,
@@ -56,6 +59,48 @@ import { itemIds } from "@/lib/changeset";
 
 /** Max conversation/event-log entries (features/06 ## Behaviors). */
 export const MAX_LOG_ENTRIES = 500;
+
+/**
+ * Rewrite the `delegate_read` row that owns child run `runId` in BOTH the flat
+ * tool list and the chronological blocks (they hold copies of the same rows).
+ * Before the child's run id is known, the owner is the latest running
+ * `delegate_read` row without one. A child whose parent row is absent (a
+ * hydrated or already archived turn) is dropped: it has nowhere to nest.
+ */
+function updateDelegationParent(
+  turn: TurnState,
+  runId: number,
+  update: (parent: AgentTool) => AgentTool,
+): TurnState {
+  const owns = (tool: AgentTool): boolean =>
+    tool.delegationRunId === runId;
+  const unclaimed = (tool: AgentTool): boolean =>
+    tool.name === DELEGATE_READ_TOOL &&
+    tool.state === "running" &&
+    tool.delegationRunId === undefined;
+  let index = turn.tools.findIndex(owns);
+  if (index < 0) {
+    for (let i = turn.tools.length - 1; i >= 0; i -= 1) {
+      if (unclaimed(turn.tools[i])) {
+        index = i;
+        break;
+      }
+    }
+  }
+  if (index < 0) return turn;
+  const parentId = turn.tools[index].id;
+  const tools = turn.tools.slice();
+  tools[index] = update(tools[index]);
+  const blocks = turn.blocks.map((block) => {
+    if (block.type !== "tools") return block;
+    const at = block.tools.findIndex((tool) => tool.id === parentId);
+    if (at < 0) return block;
+    const blockTools = block.tools.slice();
+    blockTools[at] = tools[index];
+    return { ...block, tools: blockTools };
+  });
+  return { ...turn, tools, blocks };
+}
 
 /**
  * Phases of the v2 panel state machine. `research` / `planning` / `verifying`
@@ -159,6 +204,24 @@ export interface AgentTool {
   args?: string;
   /** Tool-result text (agent_event.data.result, EUD-068). */
   detail?: string;
+  /**
+   * For a `delegate_read` row: the child run it started. Child tool events
+   * tagged with the same run id nest under this row instead of the stream.
+   */
+  delegationRunId?: number;
+  /** The child run's lifecycle from the `delegation` event. */
+  delegation?: DelegationSummary;
+  /** The child run's own tool rows, in arrival order. */
+  children?: AgentTool[];
+}
+
+/** The `delegation` event as kept on its parent tool row. */
+export interface DelegationSummary {
+  goal: string;
+  status: DelegationStatus;
+  toolCalls: number;
+  elapsedMs: number;
+  error?: string;
 }
 
 /** Optional payload on a streamed agent_event (EUD-068 tool args/result). */
@@ -167,7 +230,12 @@ export interface AgentEventData {
   args?: string;
   result?: string;
   status?: string;
+  /** Set on a `delegate_read` child's tool events (nests under the parent). */
+  delegationRunId?: number;
 }
+
+/** The `delegate_read` tool name, whose rows own nested child runs. */
+const DELEGATE_READ_TOOL = "delegate_read";
 
 /**
  * One chronological block of the current turn's activity. The codex turn is a
@@ -310,6 +378,8 @@ export interface PanelState {
    * strip, research/verdict cards, and the interrupted controls.
    */
   workflow: WorkflowEvent | null;
+  /** Every EPS → Map team task of this session, as last announced. */
+  teamTasks: TeamTask[];
   /** Whether the project-memory overlay is open. */
   memoryOpen: boolean;
   /** Project memory snapshot/drafts (null until `memory` arrives). */
@@ -366,6 +436,16 @@ export interface PanelStore {
    * `data` is the optional EUD-068 payload (tool args / result / status).
    */
   agentEvent(kind: string, detail: string, data?: AgentEventData): void;
+  /**
+   * `delegation` — a `delegate_read` child run's lifecycle, attached to the
+   * parent tool row (found by run id, or the latest running `delegate_read`
+   * row when the event precedes the child's first tool event).
+   */
+  delegationReceived(event: DelegationMessageBody): void;
+  /** `team_task` — replace or append the session's team map task by id. */
+  teamTaskReceived(task: TeamTask): void;
+  /** Hydrate the session's team map tasks from its record. */
+  setTeamTasks(tasks: TeamTask[]): void;
   /** Replace this session's latest typed Codex context snapshot. */
   contextUsageReceived(usage: ContextUsage): void;
   /** `answer` — answer-only turn; back to ready. */
@@ -598,6 +678,7 @@ export function createPanelStore(): PanelStore {
     ask: null as AskState | null,
     changeset: null as ChangesetState | null,
     workflow: null as WorkflowEvent | null,
+    teamTasks: [] as TeamTask[],
     memoryOpen: false,
     memory: null as MemoryViewState | null,
     // The dat-edit wiki ledger snapshot (null until the first `wiki` event /
@@ -649,6 +730,7 @@ export function createPanelStore(): PanelStore {
       ask: core.ask,
       changeset: core.changeset,
       workflow: core.workflow,
+      teamTasks: core.teamTasks,
       memoryOpen: core.memoryOpen,
       memory: core.memory,
       wikiData: core.wikiData,
@@ -897,6 +979,25 @@ export function createPanelStore(): PanelStore {
             data?.callId !== undefined && data.callId.trim().length > 0
               ? data.callId
               : undefined;
+          if (data?.delegationRunId !== undefined) {
+            // A child's call nests under its parent delegate_read row; it
+            // never opens a foreground row or breaks the prose flow.
+            toolSeq += 1;
+            const child: AgentTool = {
+              id: `tool-${toolSeq}`,
+              ...(callId !== undefined ? { callId } : {}),
+              name: detail || "tool",
+              state: "running",
+              ...(data.args ? { args: data.args } : {}),
+            };
+            const runId = data.delegationRunId;
+            core.turn = updateDelegationParent(core.turn, runId, (parent) => ({
+              ...parent,
+              delegationRunId: runId,
+              children: [...(parent.children ?? []), child],
+            }));
+            break;
+          }
           if (callId === undefined) {
             const name = detail || "tool";
             pushLog(
@@ -941,6 +1042,32 @@ export function createPanelStore(): PanelStore {
             state: failed ? "failed" : "done",
             ...(data?.result ? { detail: data.result } : {}),
           });
+          if (data?.delegationRunId !== undefined) {
+            const runId = data.delegationRunId;
+            core.turn = updateDelegationParent(core.turn, runId, (parent) => {
+              const children = (parent.children ?? []).slice();
+              const index = children.findIndex(
+                (child) => child.callId === callId && child.state === "running",
+              );
+              if (index >= 0) {
+                children[index] = flip(children[index]);
+              } else if (
+                callId === undefined ||
+                !children.some((child) => child.callId === callId)
+              ) {
+                toolSeq += 1;
+                children.push({
+                  id: `tool-${toolSeq}`,
+                  ...(callId !== undefined ? { callId } : {}),
+                  name: detail || "tool",
+                  state: failed ? "failed" : "done",
+                  ...(data.result ? { detail: data.result } : {}),
+                });
+              }
+              return { ...parent, delegationRunId: runId, children };
+            });
+            break;
+          }
           const matchingIndex =
             callId === undefined
               ? -1
@@ -1036,6 +1163,23 @@ export function createPanelStore(): PanelStore {
       emit();
     },
 
+    delegationReceived(event) {
+      // No live turn owns this child once the turn ended; nothing to attach.
+      if (!core.turnInFlight) return;
+      const summary: DelegationSummary = {
+        goal: event.goal,
+        status: event.status,
+        toolCalls: event.toolCalls,
+        elapsedMs: event.elapsedMs,
+        ...(event.error ? { error: event.error } : {}),
+      };
+      core.turn = updateDelegationParent(core.turn, event.childRunId, (parent) => ({
+        ...parent,
+        delegationRunId: event.childRunId,
+        delegation: summary,
+      }));
+      emit();
+    },
     askReceived(requestId, questions, waitSeconds) {
       if (core.ask?.requestId === requestId) return;
       core.turnInFlight = true;
@@ -1363,6 +1507,20 @@ export function createPanelStore(): PanelStore {
       core.turn = emptyTurn();
       nextTextBlockBreak = false;
       core.phase = "thinking";
+      emit();
+    },
+
+    teamTaskReceived(task) {
+      const index = core.teamTasks.findIndex((existing) => existing.id === task.id);
+      const next = core.teamTasks.slice();
+      if (index >= 0) next[index] = task;
+      else next.push(task);
+      core.teamTasks = next;
+      emit();
+    },
+
+    setTeamTasks(tasks) {
+      core.teamTasks = tasks.slice();
       emit();
     },
 

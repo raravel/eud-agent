@@ -1340,6 +1340,22 @@ export default function MapAgentApp() {
     ],
   );
 
+  // The EPS session asked this open window to show another session, e.g.
+  // the team session whose candidate is ready.
+  useEffect(() => {
+    let unlisten: UnlistenFn | undefined;
+    void listen<{ sessionId: string }>(
+      "map-agent-open-session",
+      ({ payload }) => {
+        if (typeof payload?.sessionId !== "string") return;
+        void loadSession(payload.sessionId);
+      },
+    ).then((dispose) => {
+      unlisten = dispose;
+    });
+    return () => unlisten?.();
+  }, [loadSession]);
+
   const renameSession = useCallback(async (sessionId: string, name: string) => {
     try {
       const meta = await mapSessionRename(sessionId, name);

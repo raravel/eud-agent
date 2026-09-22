@@ -62,6 +62,7 @@ pub mod session;
 pub mod setup;
 pub mod source_snapshot;
 pub mod task_state;
+pub mod team;
 pub mod tool_exec;
 pub mod tools;
 pub mod trace_test;
@@ -303,11 +304,15 @@ pub fn run() {
             if let Err(error) = candidates.cleanup_startup() {
                 eprintln!("eud-agent: candidate cache cleanup skipped: {error}");
             }
-            app.manage(map_agent::MapAgentService::new(
+            let map_service = map_agent::MapAgentService::new(
                 data_dirs.clone(),
                 candidates.clone(),
                 writes.clone(),
-            ));
+            );
+            if let Err(error) = map_service.recover_team_tasks() {
+                eprintln!("eud-agent: team map task restart recovery failed: {error}");
+            }
+            app.manage(map_service);
             let services = tool_exec::ToolServices::new(data_dirs.clone(), candidates, writes);
             let mentions = services.mentions();
             app.manage(mentions.clone());
@@ -398,9 +403,12 @@ pub fn run() {
             engine::engine_session_delete,
             mentions::mention_search,
             map_agent::map_agent_open,
+            map_agent::map_task_apply_undo,
             map_import::map_agent_import_open,
             map_import::map_import_bootstrap,
             map_import::map_import_source_pick,
+            map_import::map_import_reference_list,
+            map_import::map_import_reference_pick,
             map_import::map_import_source_render,
             map_import::map_import_source_objects,
             map_import::map_import_stamp_save,

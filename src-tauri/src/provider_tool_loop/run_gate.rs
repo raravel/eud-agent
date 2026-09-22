@@ -22,6 +22,10 @@ use super::{
 const ENDED_MESSAGE: &str =
     "delegated run already submitted its result; this call was not executed";
 
+/// Completion text for a profile read a delegated run makes on its final
+/// tool round, when only `submit_result` is still accepted.
+pub const SUBMISSION_ONLY_MESSAGE: &str = "delegated run has used its tool rounds; only submit_result is accepted now and this call was not executed";
+
 #[derive(Clone)]
 pub struct RunGate {
     pub(super) inner: Arc<RunGateInner>,
@@ -93,6 +97,7 @@ impl RunGate {
                     write_transition_requested: false,
                     iteration_boundary_requested: None,
                     delegated_result: None,
+                    submission_only: false,
                 }),
                 recording: Mutex::new(()),
                 event_sender,
@@ -109,12 +114,46 @@ impl RunGate {
         &self.inner.identity
     }
 
+    /// Every descriptor a call may validate against: the full profile, so a
+    /// read on the final round is still a known tool that completes with
+    /// [`SUBMISSION_ONLY_MESSAGE`] rather than a fatal unknown-tool error.
     pub fn descriptors(&self) -> Vec<Value> {
         let registry = self.inner.runtime.tool_descriptors();
         match &self.inner.profile {
             ToolProfile::Foreground => registry,
             ToolProfile::Delegated(profile) => profile.descriptors(registry),
         }
+    }
+
+    /// The descriptors the model is shown this round: the profile, or
+    /// `submit_result` alone once the delegated run is submission-only.
+    pub fn advertised_descriptors(&self) -> Vec<Value> {
+        match &self.inner.profile {
+            ToolProfile::Delegated(profile) if self.submission_only() => {
+                profile.submission_descriptors()
+            }
+            _ => self.descriptors(),
+        }
+    }
+
+    /// Enter the final tool round of a delegated run: from now on the model
+    /// sees only `submit_result`, and any profile read completes with a usage
+    /// error instead of executing. Foreground gates ignore it.
+    pub fn enter_submission_only(&self) {
+        if self.delegated_profile().is_some() {
+            self.inner.state.lock().submission_only = true;
+        }
+    }
+
+    pub fn submission_only(&self) -> bool {
+        self.inner.state.lock().submission_only
+    }
+
+    /// The usage error for a shape-valid call that the submission-only round
+    /// refuses to execute.
+    fn submission_only_violation(&self, call: &DirectToolCall) -> Option<String> {
+        (self.submission_only() && !self.is_submission(call))
+            .then(|| SUBMISSION_ONLY_MESSAGE.to_string())
     }
 
     fn delegated_profile(&self) -> Option<&DelegatedToolProfile> {
@@ -287,6 +326,10 @@ impl RunGate {
                     self.complete_usage_error(&call, ENDED_MESSAGE.to_string())
                         .await
                 }
+                CallAdmission::Valid if self.submission_only_violation(&call).is_some() => {
+                    self.complete_usage_error(&call, SUBMISSION_ONLY_MESSAGE.to_string())
+                        .await
+                }
                 CallAdmission::Valid if self.is_submission(&call) => {
                     self.complete_submission(&call).await
                 }
@@ -356,7 +399,7 @@ impl RunGate {
                     &call.name,
                     &call.arguments,
                 )? {
-                    CallAdmission::Valid => None,
+                    CallAdmission::Valid => self.submission_only_violation(call),
                     CallAdmission::SchemaViolation(message) => Some(message),
                 },
             );

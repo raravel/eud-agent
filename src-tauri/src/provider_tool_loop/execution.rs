@@ -12,25 +12,50 @@ impl RunGate {
     ) -> Result<DirectToolResult, String> {
         let admission = self.admit()?;
         self.publish_started(&call)?;
-        if call.name == crate::tools::ASK_TOOL {
+        // `ask` and `delegate_read` wait on the runtime asynchronously (a user
+        // answer, a child run) instead of blocking a worker thread.
+        let waiting = match call.name.as_str() {
+            crate::tools::ASK_TOOL => Some("ASK"),
+            crate::tools::DELEGATE_READ_TOOL => Some("delegate_read"),
+            crate::tools::MAP_TASK_REQUEST_TOOL => Some("map_task_request"),
+            _ => None,
+        };
+        if let Some(label) = waiting {
             let outcome = {
                 let mut closed = self.inner.closed.subscribe();
-                let ask = self
-                    .inner
-                    .runtime
-                    .ask_for_run(&self.inner.identity, &call.arguments);
-                tokio::pin!(ask);
+                let runtime = &self.inner.runtime;
+                let identity = &self.inner.identity;
+                let wait: std::pin::Pin<
+                    Box<
+                        dyn std::future::Future<Output = Result<serde_json::Value, String>>
+                            + Send
+                            + '_,
+                    >,
+                > = match call.name.as_str() {
+                    crate::tools::ASK_TOOL => {
+                        Box::pin(runtime.ask_for_run(identity, &call.arguments))
+                    }
+                    crate::tools::DELEGATE_READ_TOOL => {
+                        Box::pin(runtime.delegate_read_for_run(identity, &call.arguments))
+                    }
+                    _ => Box::pin(runtime.map_task_request_for_run(identity, &call.arguments)),
+                };
+                tokio::pin!(wait);
                 let already_closed = *closed.borrow();
                 if already_closed {
-                    return Err("provider tool gate closed while ASK was pending".to_string());
+                    return Err(format!(
+                        "provider tool gate closed while {label} was pending"
+                    ));
                 } else {
                     tokio::select! {
                         biased;
                         changed = closed.changed() => {
                             let _ = changed;
-                            return Err("provider tool gate closed while ASK was pending".to_string());
+                            return Err(format!(
+                                "provider tool gate closed while {label} was pending"
+                            ));
                         }
-                        outcome = &mut ask => outcome,
+                        outcome = &mut wait => outcome,
                     }
                 }
             };
@@ -49,7 +74,7 @@ impl RunGate {
                 published
             })
             .await
-            .map_err(|error| format!("provider ASK completion task failed: {error}"))??;
+            .map_err(|error| format!("provider {label} completion task failed: {error}"))??;
             return Ok(result);
         }
 

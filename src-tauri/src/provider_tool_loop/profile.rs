@@ -38,7 +38,11 @@ impl DelegatedToolProfile {
             .map(Into::into)
             .collect::<BTreeSet<String>>();
         for name in &allowed {
-            if name == SUBMIT_RESULT_TOOL || name == crate::tools::ASK_TOOL {
+            if name == SUBMIT_RESULT_TOOL
+                || name == crate::tools::ASK_TOOL
+                || name == crate::tools::DELEGATE_READ_TOOL
+                || name == crate::tools::MAP_TASK_REQUEST_TOOL
+            {
                 return Err(format!("delegated tool profile cannot include '{name}'"));
             }
             match crate::tools::tool_spec(name) {
@@ -76,6 +80,12 @@ impl DelegatedToolProfile {
         self.allowed.iter().map(String::as_str)
     }
 
+    /// The submission descriptor alone: what the model sees on the final
+    /// tool round, when reads are no longer executed.
+    pub(super) fn submission_descriptors(&self) -> Vec<Value> {
+        vec![self.result_descriptor.clone()]
+    }
+
     /// Filter the session registry to this profile and append the submission
     /// descriptor, so unknown-tool admission rejects everything else.
     pub(super) fn descriptors(&self, registry: Vec<Value>) -> Vec<Value> {
@@ -111,6 +121,8 @@ mod tests {
         assert!(DelegatedToolProfile::new(["file_write"], &schema()).is_err());
         assert!(DelegatedToolProfile::new(["dat_patch"], &schema()).is_err());
         assert!(DelegatedToolProfile::new([crate::tools::ASK_TOOL], &schema()).is_err());
+        // Delegation never nests.
+        assert!(DelegatedToolProfile::new([crate::tools::DELEGATE_READ_TOOL], &schema()).is_err());
         assert!(DelegatedToolProfile::new([SUBMIT_RESULT_TOOL], &schema()).is_err());
         assert!(DelegatedToolProfile::new(["read_file"], &json!("not-a-schema")).is_err());
         // A typo and Map-only candidate tools are all unregistered EPS tools.

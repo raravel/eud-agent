@@ -11,6 +11,7 @@ import {
   X,
 } from "lucide-react";
 
+import { SessionIdCopyButton } from "@/components/SessionIdCopyButton";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -215,11 +216,18 @@ export function MapSessionHistoryDialog({
                           </span>
                           <span className="mt-0.5 block truncate text-[11px] text-muted-foreground">
                             {active ? "현재 작업 · " : ""}
+                            {session.teamParent ? "EPS 세션의 팀 작업 · " : ""}
                             {PROVIDER_LABELS[session.provider]} ·{" "}
                             {formatConversationTime(session.lastConversationAt)}
                           </span>
                         </span>
                       </button>
+                      <SessionIdCopyButton
+                        id={session.id}
+                        name={session.name}
+                        className="h-7 shrink-0 px-1.5"
+                        disabled={busy}
+                      />
                       <Button
                         type="button"
                         size="icon"

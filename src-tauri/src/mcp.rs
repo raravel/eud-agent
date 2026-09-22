@@ -280,8 +280,11 @@ mod tests {
         assert!(!tools
             .iter()
             .any(|tool| tool.name == "request_write_workspace"));
-        // SCA is fully defunct — it must never appear as a tool.
-        assert!(!tools.iter().any(|tool| tool.name.contains("sca")));
+        // SCA is fully defunct — it must never appear as a tool (as a name
+        // segment: `map_task_discard` legitimately contains the letters).
+        assert!(!tools
+            .iter()
+            .any(|tool| tool.name.split('_').any(|segment| segment == "sca")));
     }
 
     #[test]
