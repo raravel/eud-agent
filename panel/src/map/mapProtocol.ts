@@ -223,7 +223,10 @@ export interface CandidateStateView {
   revisionKey: string;
   revisions: CandidateRevisionView[];
   selections: SavedSelection[];
+  /** The saved source changed under a live request; the session follows it once that request settles. */
   stale: boolean;
+  /** The candidate could not be replayed onto the changed source; Apply overwrites the saved bytes. */
+  sourceDiverged: boolean;
   canApply: boolean;
   canUndo: boolean;
 }

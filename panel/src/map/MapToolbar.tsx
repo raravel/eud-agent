@@ -22,20 +22,12 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import type {
-  CandidateStateView,
-  MapContextSnapshot,
-  MapSourceProbe,
-  MapView,
-} from "./mapProtocol";
+import type { CandidateStateView, MapView } from "./mapProtocol";
 
 export interface MapToolbarProps {
-  context: MapContextSnapshot;
   candidate: CandidateStateView;
-  changedSource: MapSourceProbe | null;
   view: MapView;
   busy: boolean;
-  reloadingSource: boolean;
   imagePlacementActive: boolean;
   liveDraftActive?: boolean;
   onView(view: MapView): void;
@@ -61,12 +53,9 @@ function savedTime(mtimeNs: string): string {
 }
 
 export function MapToolbar({
-  context,
   candidate,
-  changedSource,
   view,
   busy,
-  reloadingSource,
   imagePlacementActive,
   liveDraftActive = false,
   onView,
@@ -93,7 +82,7 @@ export function MapToolbar({
             <Badge variant="outline">{candidate.baseline.width}×{candidate.baseline.height}</Badge>
           </div>
           <div className="flex min-w-0 gap-2 text-[11px] text-muted-foreground">
-            <span className="shrink-0 font-medium text-foreground/80">후보 기준 원본</span>
+            <span className="shrink-0 font-medium text-foreground/80">원본</span>
             <span className="truncate" title={candidate.baseline.sourcePath}>
               {candidate.baseline.sourcePath}
             </span>
@@ -102,20 +91,6 @@ export function MapToolbar({
               SHA {candidate.baseline.fileSha256.slice(0, 10)}
             </code>
           </div>
-          {candidate.stale && (
-            <div className="flex min-w-0 gap-2 text-[11px] text-destructive">
-              <span className="shrink-0 font-medium">현재 OpenMapName</span>
-              <span className="truncate" title={currentSourcePath}>
-                {currentSourcePath}
-              </span>
-              <span className="shrink-0">저장 {savedTime(currentSourceMtime)}</span>
-              {currentSourceMatchesContext && (
-                <code className="shrink-0" title={context.revision.fileSha256}>
-                  SHA {context.revision.fileSha256.slice(0, 10)}
-                </code>
-              )}
-            </div>
-          )}
         </div>
       </div>
 
@@ -172,9 +147,22 @@ export function MapToolbar({
       )}
 
       {candidate.stale ? (
-        <Badge variant="destructive" className="gap-1">
+        <Badge
+          variant="outline"
+          className="gap-1"
+          title="원본 맵이 다시 저장되었습니다. 진행 중인 요청이 끝나면 후보를 저장된 원본 위로 옮깁니다."
+        >
+          <RefreshCw className="size-3.5" aria-hidden="true" />
+          원본 변경 감지 · 요청 후 반영
+        </Badge>
+      ) : candidate.sourceDiverged ? (
+        <Badge
+          variant="destructive"
+          className="gap-1"
+          title="원본 맵이 후보와 같은 자리를 다르게 저장해 후보를 그 위로 옮길 수 없습니다. Apply하면 이 후보가 저장된 원본을 덮어씁니다."
+        >
           <ShieldAlert className="size-3.5" aria-hidden="true" />
-          원본 변경됨 · Apply 차단
+          원본과 갈라짐 · Apply 시 후보가 덮어씀
         </Badge>
       ) : candidate.canApply ? (
         <Badge className="gap-1 bg-emerald-600 text-white">

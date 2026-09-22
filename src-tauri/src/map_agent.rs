@@ -811,7 +811,12 @@ impl MapAgentService {
         }
         let source = self.object_source(command)?;
         let snapshot = if source.cache {
-            let cache_key = format!("{}|{}", command.session_id, source.revision_key);
+            // The baseline hash is part of every object ref, and a diverged
+            // session changes it without changing the revision key.
+            let cache_key = format!(
+                "{}|{}|{}",
+                command.session_id, source.revision_key, source.baseline_hash
+            );
             let mut cache = self.object_snapshots.lock();
             if let Some(snapshot) = cache.get(&cache_key) {
                 snapshot
@@ -1161,21 +1166,27 @@ async fn bootstrap_map_session(
     context: crate::map_context::MapContextSnapshot,
     resolution: MapSessionResolution,
 ) -> Result<MapBootstrapResponse, String> {
-    let candidate = match resolution.candidate_action {
-        CandidateSessionAction::Create => service
-            .candidates
-            .create_session(&resolution.session.meta.id, &context)?,
-        CandidateSessionAction::Open => service
-            .candidates
-            .open_session(&resolution.session.meta.id, &context)?,
-    };
-    engines
+    let candidates = service.candidates.clone();
+    let session_id = resolution.session.meta.id.clone();
+    let open_context = context.clone();
+    let candidate_action = resolution.candidate_action;
+    // Opening may replay the candidate onto a changed source (seconds of isom
+    // work); keep that off the async runtime.
+    let candidate = run_map_blocking("map session open", move || match candidate_action {
+        CandidateSessionAction::Create => candidates.create_session(&session_id, &open_context),
+        CandidateSessionAction::Open => candidates.open_session(&session_id, &open_context),
+    })
+    .await?;
+    let conversation_resume_error = engines
         .open_map_session(&resolution.session.meta.id)
         .await?;
+    let pending_run = engines.map_run_snapshot(&resolution.session.meta.id).await;
     Ok(MapBootstrapResponse {
         context,
         candidate,
         session: resolution.session,
+        conversation_resume_error,
+        pending_run,
     })
 }
 

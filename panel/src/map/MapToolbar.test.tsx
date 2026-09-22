@@ -36,21 +36,6 @@ const revision = {
   width: 128,
   height: 128,
 };
-const context: MapContextSnapshot = {
-  revision,
-  savedSourceNotice: "saved",
-  sourceFileSize: 1024,
-  starcraftPath: "C:\\StarCraft",
-  digest: {
-    map: { width: 128, height: 128, tileset: "jungle" },
-    units: [],
-    doodads: [],
-    sprites: [],
-    locations: [],
-    startLocations: [],
-  },
-};
-
 function candidate(overrides: Partial<CandidateStateView> = {}): CandidateStateView {
   return {
     sessionId: "map-session",
@@ -70,6 +55,7 @@ function candidate(overrides: Partial<CandidateStateView> = {}): CandidateStateV
     ],
     selections: [],
     stale: false,
+    sourceDiverged: false,
     canApply: true,
     canUndo: false,
     ...overrides,
@@ -77,8 +63,6 @@ function candidate(overrides: Partial<CandidateStateView> = {}): CandidateStateV
 }
 
 const callbacks = {
-  changedSource: null,
-  reloadingSource: false,
   onView: vi.fn(),
   onRevert: vi.fn(),
   onDiscard: vi.fn(),
@@ -154,40 +138,37 @@ describe("MapToolbar candidate rails", () => {
     expect(callbacks.onRevert).toHaveBeenCalledWith(0);
   });
 
-  it("blocks Apply and offers a new preserved work item for a stale source", async () => {
-    callbacks.onReloadSource.mockClear();
-    render(
+  it("only defers a changed source while a request is live, never asking for new work", () => {
+    const { rerender } = render(
       <MapToolbar
-        context={context}
         candidate={candidate({ stale: true, canApply: false })}
         view="candidate"
         busy={false}
         imagePlacementActive={false}
         {...callbacks}
-        changedSource={{
-          projectId: "project",
-          sourcePath: "C:\\maps\\demo.scx",
-          mtimeNs: "1700000001000000000",
-          fileSize: 2048,
-        }}
       />,
     );
     expect(screen.getByRole("button", { name: "전체 Apply" })).toBeDisabled();
-    expect(screen.getByText(/원본 변경됨/)).toBeInTheDocument();
+    expect(screen.getByText(/원본 변경 감지/)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /새 작업/ })).not.toBeInTheDocument();
 
-    const reload = screen.getByRole("button", {
-      name: "변경된 원본으로 새 작업",
-    });
-    expect(reload).toBeEnabled();
-    await userEvent.click(reload);
-    expect(callbacks.onReloadSource).toHaveBeenCalledOnce();
+    rerender(
+      <MapToolbar
+        candidate={candidate({ sourceDiverged: true })}
+        view="candidate"
+        busy={false}
+        imagePlacementActive={false}
+        {...callbacks}
+      />,
+    );
+    expect(screen.getByRole("button", { name: "전체 Apply" })).toBeEnabled();
+    expect(screen.getByText(/원본과 갈라짐/)).toBeInTheDocument();
   });
 
   it("offers direct photo placement unless source or workbench state is unsafe", async () => {
     callbacks.onImagePlace.mockClear();
     const { rerender } = render(
       <MapToolbar
-        context={context}
         candidate={candidate()}
         view="candidate"
         busy={false}
@@ -205,7 +186,6 @@ describe("MapToolbar candidate rails", () => {
 
     rerender(
       <MapToolbar
-        context={context}
         candidate={candidate({ stale: true })}
         view="candidate"
         busy={false}

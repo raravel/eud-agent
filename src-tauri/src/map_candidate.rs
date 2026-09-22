@@ -32,6 +32,10 @@ struct CandidateStoreInner {
     verifier: MapVerificationService,
     active: Mutex<HashMap<String, ActiveRequest>>,
     selection_palette: Mutex<()>,
+    /// One lock per session around every load → follow → save window, so a
+    /// rebase (seconds of isom replay) cannot interleave with Apply, Undo,
+    /// commit, or another rebase of the same session.
+    session_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     imports: MapImportStore,
 }
 
@@ -55,6 +59,17 @@ struct ActiveRequest {
 struct PendingRevision {
     revision: CandidateRevision,
     object_ids: BTreeMap<String, String>,
+}
+
+/// Every revision replayed onto a fresh copy of the saved source, keyed by
+/// revision number (0 is the copied source itself).
+struct RebasedChain {
+    base: PathBuf,
+    revisions: Vec<CandidateRevision>,
+    /// Off-chain revisions the new source cannot reproduce.
+    dropped: Vec<CandidateRevision>,
+    outputs: BTreeMap<u32, PathBuf>,
+    object_ids: BTreeMap<u32, BTreeMap<String, String>>,
 }
 
 struct StampRequestContext {
@@ -218,6 +233,7 @@ impl CandidateStore {
                 verifier: MapVerificationService,
                 active: Mutex::new(HashMap::new()),
                 selection_palette: Mutex::new(()),
+                session_locks: Mutex::new(HashMap::new()),
                 imports,
             }),
         }
@@ -303,14 +319,18 @@ impl CandidateStore {
                     format!("candidate temporaries could not be inspected: {error}")
                 })? {
                     let entry = entry.map_err(|error| error.to_string())?;
-                    if !entry
-                        .file_type()
-                        .map_err(|error| error.to_string())?
-                        .is_file()
-                    {
+                    let file_type = entry.file_type().map_err(|error| error.to_string())?;
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    if file_type.is_dir() && name.starts_with("rebase-") {
+                        std::fs::remove_dir_all(entry.path()).map_err(|error| {
+                            format!("interrupted candidate rebase could not be removed: {error}")
+                        })?;
+                        removed += 1;
                         continue;
                     }
-                    let name = entry.file_name().to_string_lossy().to_string();
+                    if !file_type.is_file() {
+                        continue;
+                    }
                     if name.contains(".tmp.") || name.ends_with(".tmp") {
                         std::fs::remove_file(entry.path()).map_err(|error| {
                             format!("candidate temporary could not be removed: {error}")
@@ -340,6 +360,26 @@ impl CandidateStore {
         Ok(Some(
             self.load_state_path(&state_path)?.baseline.source_path,
         ))
+    }
+
+    /// Whether the session's last Apply is still undoable against the saved
+    /// source whose hash is `source_sha256`: what `canUndo` becomes once the
+    /// session follows that source, without replaying anything.
+    pub(crate) fn apply_undoable_against(
+        &self,
+        project_id: &str,
+        session_id: &str,
+        source_sha256: &str,
+    ) -> Result<bool, String> {
+        validate_component(project_id, "project id")?;
+        validate_component(session_id, "map session id")?;
+        let state_path = self.session_root(project_id, session_id).join("state.json");
+        if !candidate_state_exists(&state_path)? {
+            return Ok(false);
+        }
+        let state = self.load_state_path(&state_path)?;
+        Ok(state.last_apply_backup.is_some()
+            && state.last_apply_source_hash.as_deref() == Some(source_sha256))
     }
 
     pub fn create_session(
@@ -374,6 +414,7 @@ impl CandidateStore {
             persistent_protections: Default::default(),
             candidate_object_ids: BTreeMap::new(),
             stale: false,
+            source_diverged: false,
             last_apply_backup: None,
             last_apply_source_hash: None,
             last_apply_before_hash: None,
@@ -395,6 +436,8 @@ impl CandidateStore {
         if !candidate_state_exists(&state_path)? {
             return Err("candidate session does not exist".to_string());
         }
+        let lock = self.session_lock(session_id);
+        let _guard = lock.lock();
         let mut state = self.load_state_path(&state_path)?;
         if state.session_id != session_id
             || state.baseline.project_id != context.revision.project_id
@@ -427,18 +470,293 @@ impl CandidateStore {
                 revision.map_sha256 = replayed_hash;
             }
         }
-        state.stale = file_hash(&context.revision.source_path)? != state.baseline.file_sha256;
+        self.follow_source(&mut state)?;
         self.save_state(&state)?;
         self.view(&state)
     }
 
     pub fn state(&self, project_id: &str, session_id: &str) -> Result<CandidateStateView, String> {
+        let lock = self.session_lock(session_id);
+        let _guard = lock.lock();
         let mut state = self.load_state(project_id, session_id)?;
-        state.stale = file_hash(&state.baseline.source_path)? != state.baseline.file_sha256;
-        if state.stale {
+        if self.follow_source(&mut state)? {
             self.save_state(&state)?;
         }
         self.view(&state)
+    }
+
+    /// The persisted view without following the source: `stale` reports a
+    /// changed source, nothing is replayed or written. Startup recovery uses
+    /// it so a project is never rebased before it is explicitly opened.
+    pub fn peek_state(
+        &self,
+        project_id: &str,
+        session_id: &str,
+    ) -> Result<CandidateStateView, String> {
+        let lock = self.session_lock(session_id);
+        let _guard = lock.lock();
+        let mut state = self.load_state(project_id, session_id)?;
+        state.stale =
+            state.stale || file_hash(&state.baseline.source_path)? != state.baseline.file_sha256;
+        self.view(&state)
+    }
+
+    fn session_lock(&self, session_id: &str) -> Arc<Mutex<()>> {
+        self.inner
+            .session_locks
+            .lock()
+            .entry(session_id.to_string())
+            .or_default()
+            .clone()
+    }
+
+    /// The saved source map is the authority a session follows, never one it
+    /// owns. Whenever the bytes on disk differ from the recorded baseline, the
+    /// session re-reads the source and replays every candidate revision onto
+    /// it with fresh verification, so a save from another session, the
+    /// properties dialog, an Undo, or SCMDraft simply becomes the new base.
+    /// When a revision on the visible chain cannot be replayed (the map
+    /// changed shape, an operation's expected-before no longer holds, or the
+    /// replay fails verification) the candidate wins: it keeps descending from
+    /// the old snapshot, `baseline.file_sha256` names the source bytes Apply
+    /// will overwrite, and `source_diverged` tells the panel. Only a session
+    /// with an active request defers, marking `stale` until the request
+    /// settles. Returns whether `state` changed; the caller persists it.
+    fn follow_source(&self, state: &mut CandidateSession) -> Result<bool, String> {
+        self.follow_source_with(state, false)
+    }
+
+    /// `retry_diverged` re-attempts the replay of a diverged session whose
+    /// visible chain just changed (revert), where the source itself did not.
+    fn follow_source_with(
+        &self,
+        state: &mut CandidateSession,
+        retry_diverged: bool,
+    ) -> Result<bool, String> {
+        let disk_hash = file_hash(&state.baseline.source_path)?;
+        if disk_hash == state.baseline.file_sha256 && !(retry_diverged && state.source_diverged) {
+            let changed = state.stale;
+            state.stale = false;
+            return Ok(changed);
+        }
+        if self.inner.active.lock().contains_key(&state.session_id) {
+            let changed = !state.stale;
+            state.stale = true;
+            return Ok(changed);
+        }
+        let root = self
+            .session_root(&state.baseline.project_id, &state.session_id)
+            .join(format!("rebase-{}", uuid::Uuid::new_v4()));
+        let rebase = (|| {
+            std::fs::create_dir_all(&root).map_err(|error| {
+                format!("candidate rebase directory could not be created: {error}")
+            })?;
+            // Identity comes from the copied bytes, never from a second read
+            // of a source another writer may still be saving.
+            let base = root.join("r0000.scx");
+            copy_atomic(&state.baseline.source_path, &base)?;
+            let mut revision = self
+                .inner
+                .context
+                .revision_for_path(state.baseline.project_id.clone(), &base)?;
+            revision.source_path = state.baseline.source_path.clone();
+            revision.mtime_ns = source_mtime_ns(&state.baseline.source_path)?;
+            let rebased = self.rebase_revisions(state, &revision, &base, &root)?;
+            Ok::<_, String>((revision, rebased))
+        })();
+        let outcome = match rebase {
+            Ok((revision, Some(rebased))) => self.promote_rebase(state, revision, rebased),
+            Ok((revision, None)) => {
+                // Candidate wins: keep the snapshot chain, adopt the source identity.
+                state.baseline.file_sha256 = revision.file_sha256;
+                state.baseline.chk_sha256 = revision.chk_sha256;
+                state.baseline.mtime_ns = revision.mtime_ns;
+                state.source_diverged = true;
+                state.forget_last_apply();
+                Ok(())
+            }
+            Err(error) => Err(error),
+        };
+        let _ = std::fs::remove_dir_all(&root);
+        outcome?;
+        state.stale = false;
+        Ok(true)
+    }
+
+    /// Replay every revision (parents first) onto a copy of the saved source
+    /// and re-verify it. `None` means a revision on the visible chain could
+    /// not be reproduced; off-chain revisions that fail are dropped.
+    fn rebase_revisions(
+        &self,
+        state: &CandidateSession,
+        source: &crate::map_model::MapRevision,
+        base: &Path,
+        root: &Path,
+    ) -> Result<Option<RebasedChain>, String> {
+        let chain = revision_chain(state, state.current_revision)?;
+        let mut outputs: BTreeMap<u32, PathBuf> = BTreeMap::from([(0, base.to_path_buf())]);
+        let mut object_ids: BTreeMap<u32, BTreeMap<String, String>> =
+            BTreeMap::from([(0, BTreeMap::new())]);
+        let mut dropped = Vec::new();
+        if source.width != state.baseline.width
+            || source.height != state.baseline.height
+            || source.tileset != state.baseline.tileset
+        {
+            // A reshaped map reproduces no revision at all.
+            return Ok(chain.is_empty().then(|| RebasedChain {
+                base: base.to_path_buf(),
+                revisions: Vec::new(),
+                dropped: state.revisions.clone(),
+                outputs,
+                object_ids,
+            }));
+        }
+        let starcraft_path = self.inner.context.starcraft_path()?;
+        let mut revisions = state.revisions.clone();
+        revisions.sort_by_key(|revision| revision.revision);
+        let mut rebased = Vec::new();
+        for mut revision in revisions {
+            let Some(parent) = outputs.get(&revision.parent).cloned() else {
+                if chain.contains(&revision.revision) {
+                    return Ok(None);
+                }
+                dropped.push(revision);
+                continue;
+            };
+            let manifest: RevisionManifest = read_json(&revision.operation_manifest)?;
+            let output = root.join(format!("r{:04}.scx", revision.revision));
+            let replayed = self.replay_batches(
+                state,
+                &parent,
+                &output,
+                &manifest.batches,
+                &starcraft_path,
+                root,
+            )?;
+            let verification = replayed.then(|| {
+                self.inner.verifier.verify(
+                    &parent,
+                    &output,
+                    &manifest.authority,
+                    &starcraft_path,
+                    None,
+                )
+            });
+            let Some(verification) = verification.filter(|report| report.valid) else {
+                if chain.contains(&revision.revision) {
+                    return Ok(None);
+                }
+                dropped.push(revision);
+                continue;
+            };
+            let parent_ids = object_ids
+                .get(&revision.parent)
+                .cloned()
+                .unwrap_or_default();
+            let ids = update_candidate_object_ids(&parent_ids, &parent, &output)?;
+            revision.map_sha256 = file_hash(&output)?;
+            revision.diff = verification.diff.clone();
+            revision.verification = verification;
+            outputs.insert(revision.revision, output);
+            object_ids.insert(revision.revision, ids);
+            rebased.push(revision);
+        }
+        Ok(Some(RebasedChain {
+            base: base.to_path_buf(),
+            revisions: rebased,
+            dropped,
+            outputs,
+            object_ids,
+        }))
+    }
+
+    /// Replay one revision's batches from `parent` into `output`. A false
+    /// result is an operation the new base rejects, not an I/O failure.
+    fn replay_batches(
+        &self,
+        state: &CandidateSession,
+        parent: &Path,
+        output: &Path,
+        batches: &[Vec<MapOperation>],
+        starcraft_path: &Path,
+        root: &Path,
+    ) -> Result<bool, String> {
+        let work = root.join("replay.tmp.scx");
+        let next = root.join("replay.next.scx");
+        copy_atomic(parent, &work)?;
+        for operations in batches {
+            let batch = MapEditBatch {
+                schema: MAP_EDIT_SCHEMA.to_string(),
+                expected: MapEditExpected {
+                    input_file_sha256: file_hash(&work)?,
+                    tileset: state.baseline.tileset,
+                    width: state.baseline.width,
+                    height: state.baseline.height,
+                },
+                operations: operations.clone(),
+            };
+            let bytes = serde_json::to_vec(&batch)
+                .map_err(|error| format!("rebase batch could not be serialized: {error}"))?;
+            remove_if_exists(&next)?;
+            // The engine reports an operation the map rejects (expected-before
+            // conflict, missing object, failed invariant) as `Engine` with a
+            // report; everything else is an environment failure to surface.
+            match isom::mapedit(&work, &next, starcraft_path, &bytes) {
+                Ok(_) => {}
+                Err(error) if error.status == isom::IsomError::Engine => {
+                    remove_if_exists(&work)?;
+                    remove_if_exists(&next)?;
+                    return Ok(false);
+                }
+                Err(error) => return Err(format!("candidate rebase replay failed: {error}")),
+            }
+            copy_atomic(&next, &work)?;
+            remove_if_exists(&next)?;
+        }
+        copy_atomic(&work, output)?;
+        remove_if_exists(&work)?;
+        Ok(true)
+    }
+
+    fn promote_rebase(
+        &self,
+        state: &mut CandidateSession,
+        source: crate::map_model::MapRevision,
+        rebased: RebasedChain,
+    ) -> Result<(), String> {
+        let current = rebased
+            .outputs
+            .get(&state.current_revision)
+            .ok_or_else(|| "rebased candidate lost its visible revision".to_string())?;
+        copy_atomic(&rebased.base, &state.baseline_snapshot)?;
+        copy_atomic(current, &state.current_map)?;
+        for revision in &rebased.revisions {
+            let mut manifest: RevisionManifest = read_json(&revision.operation_manifest)?;
+            manifest.object_ids = rebased
+                .object_ids
+                .get(&revision.revision)
+                .cloned()
+                .unwrap_or_default();
+            write_json_atomic(&revision.operation_manifest, &manifest)?;
+        }
+        for revision in &rebased.dropped {
+            remove_if_exists(&revision.operation_manifest)?;
+        }
+        if state.baseline.file_sha256 != source.file_sha256 {
+            state.forget_last_apply();
+        }
+        state.baseline = source;
+        state.revisions = rebased.revisions;
+        state.candidate_object_ids = rebased
+            .object_ids
+            .get(&state.current_revision)
+            .cloned()
+            .unwrap_or_default();
+        state.selections.clear();
+        state.persistent_protections.clear();
+        state.source_diverged = false;
+        self.sync_selection_palette(state)?;
+        Ok(())
     }
 
     pub fn save_selection(
@@ -447,6 +765,8 @@ impl CandidateStore {
         session_id: &str,
         selection: SelectionMask,
     ) -> Result<CandidateStateView, String> {
+        let lock = self.session_lock(session_id);
+        let _guard = lock.lock();
         let mut state = self.load_state(project_id, session_id)?;
         if selection.source_revision
             != revision_key(state.current_revision, &file_hash(&state.current_map)?)
@@ -497,6 +817,8 @@ impl CandidateStore {
         session_id: &str,
         selection_id: &str,
     ) -> Result<CandidateStateView, String> {
+        let lock = self.session_lock(session_id);
+        let _guard = lock.lock();
         let mut state = self.load_state(project_id, session_id)?;
         let _palette = self.inner.selection_palette.lock();
         let mut library = self.read_selection_library(project_id)?;
@@ -521,12 +843,11 @@ impl CandidateStore {
         mentions: &[MapMentionSnapshot],
     ) -> Result<MapRequestAuthority, String> {
         validate_component(request_id, "request id")?;
-        let state = self.load_state(project_id, session_id)?;
-        if state.stale || file_hash(&state.baseline.source_path)? != state.baseline.file_sha256 {
-            return Err(
-                "candidate source is stale; discard it and reopen from the saved source"
-                    .to_string(),
-            );
+        let lock = self.session_lock(session_id);
+        let _guard = lock.lock();
+        let mut state = self.load_state(project_id, session_id)?;
+        if self.follow_source(&mut state)? {
+            self.save_state(&state)?;
         }
         if state.current_revision != parent_revision {
             return Err(format!(
@@ -717,12 +1038,11 @@ impl CandidateStore {
         request_id: &str,
         expected_revision_key: &str,
     ) -> Result<MapRequestAuthority, String> {
-        let state = self.load_state(project_id, session_id)?;
-        if state.stale || file_hash(&state.baseline.source_path)? != state.baseline.file_sha256 {
-            return Err(
-                "candidate source is stale; discard it and reopen from the saved source"
-                    .to_string(),
-            );
+        let lock = self.session_lock(session_id);
+        let _guard = lock.lock();
+        let mut state = self.load_state(project_id, session_id)?;
+        if self.follow_source(&mut state)? {
+            self.save_state(&state)?;
         }
         let current_hash = file_hash(&state.current_map)?;
         if revision_key(state.current_revision, &current_hash) != expected_revision_key {
@@ -1269,6 +1589,8 @@ impl CandidateStore {
         session_id: &str,
         request_id: &str,
     ) -> Result<CandidateStateView, String> {
+        let lock = self.session_lock(session_id);
+        let _guard = lock.lock();
         let mut state = self.load_state(project_id, session_id)?;
         let mut active = self.inner.active.lock();
         let request = active_request_mut(&mut active, session_id, request_id)?;
@@ -1348,6 +1670,8 @@ impl CandidateStore {
         if self.inner.active.lock().contains_key(session_id) {
             return Err("cannot revert while a map request is active".to_string());
         }
+        let lock = self.session_lock(session_id);
+        let _guard = lock.lock();
         let mut state = self.load_state(project_id, session_id)?;
         if revision != 0 && !state.revisions.iter().any(|item| item.revision == revision) {
             return Err(format!("candidate revision r{revision} does not exist"));
@@ -1364,6 +1688,8 @@ impl CandidateStore {
                 .ok_or_else(|| "candidate revision disappeared during revert".to_string())?;
             read_json::<RevisionManifest>(&revision.operation_manifest)?.object_ids
         };
+        // A shorter chain may replay onto the saved source after all.
+        self.follow_source_with(&mut state, true)?;
         self.sync_selection_palette(&mut state)?;
         self.save_state(&state)?;
         self.view(&state)
@@ -1456,12 +1782,17 @@ impl CandidateStore {
         project_id: &str,
         session_id: &str,
     ) -> Result<VerificationReport, String> {
-        let state = self.load_state(project_id, session_id)?;
+        let lock = self.session_lock(session_id);
+        let _guard = lock.lock();
+        let mut state = self.load_state(project_id, session_id)?;
+        if self.follow_source(&mut state)? {
+            self.save_state(&state)?;
+        }
         if state.current_revision == 0 {
             return Err("there is no candidate revision to Apply".to_string());
         }
-        if file_hash(&state.baseline.source_path)? != state.baseline.file_sha256 {
-            return Err("candidate source hash is stale".to_string());
+        if state.stale {
+            return Err("the saved source changed while a map request is active; Apply follows it once the request settles".to_string());
         }
         let root = self.session_root(project_id, session_id);
         let parent = root.join("apply-parent.tmp.scx");
@@ -1695,6 +2026,7 @@ impl CandidateStore {
         state.persistent_protections.clear();
         state.candidate_object_ids.clear();
         state.stale = false;
+        state.source_diverged = false;
         state.last_apply_backup = Some(record.backup_path.clone());
         state.last_apply_source_hash = Some(record.applied_sha256.clone());
         state.last_apply_before_hash = Some(record.before_sha256.clone());
@@ -1728,6 +2060,8 @@ impl CandidateStore {
         project_id: &str,
         session_id: &str,
     ) -> Result<CandidateStateView, String> {
+        let lock = self.session_lock(session_id);
+        let _guard = lock.lock();
         let mut state = self.load_state(project_id, session_id)?;
         let revision = self
             .inner
@@ -1742,6 +2076,7 @@ impl CandidateStore {
         state.persistent_protections.clear();
         state.candidate_object_ids.clear();
         state.stale = false;
+        state.source_diverged = false;
         state.last_apply_backup = None;
         state.last_apply_source_hash = None;
         state.last_apply_before_hash = None;
@@ -1956,8 +2291,11 @@ impl CandidateStore {
                 })
                 .collect(),
             stale: state.stale,
+            source_diverged: state.source_diverged,
             can_apply: state.current_revision > 0 && !state.stale && valid,
-            can_undo: state.last_apply_backup.is_some(),
+            can_undo: state.last_apply_backup.is_some()
+                && state.last_apply_source_hash.as_deref()
+                    == Some(state.baseline.file_sha256.as_str()),
         })
     }
 
@@ -2123,6 +2461,16 @@ fn file_hash(path: &Path) -> Result<String, String> {
     std::fs::read(path)
         .map(|bytes| hex_sha256(&bytes))
         .map_err(|error| format!("candidate map bytes could not be read: {error}"))
+}
+
+fn source_mtime_ns(path: &Path) -> Result<u128, String> {
+    let modified = std::fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .map_err(|error| format!("source map mtime could not be read: {error}"))?;
+    Ok(modified
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos())
 }
 
 fn revision_key(revision: u32, hash: &str) -> String {
@@ -3495,12 +3843,254 @@ mod tests {
         );
         assert!(!orphan.exists());
 
-        let mut source_bytes = std::fs::read(&source).unwrap();
-        source_bytes.push(0);
-        std::fs::write(&source, source_bytes).unwrap();
-        let stale = recovered.open_session("map-session", &snapshot).unwrap();
-        assert!(stale.stale);
-        assert!(!stale.can_apply);
+        // Another writer saves the source: the candidate follows it, keeping
+        // its own unit on top of the newly saved one.
+        let units_before = unit_count(&source);
+        edit_source(&dirs, &source, vec![add_unit(256, 256)]);
+        let followed = recovered.open_session("map-session", &snapshot).unwrap();
+        assert!(!followed.stale);
+        assert!(!followed.source_diverged);
+        assert!(followed.can_apply);
+        assert_eq!(followed.current_revision, 1);
+        assert_eq!(followed.baseline.file_sha256, file_hash(&source).unwrap());
+        assert_ne!(followed.current_hash, repaired_hash);
+        assert_eq!(followed.revisions[0].diff.units.added, 1);
+        assert_eq!(
+            unit_count(&recovered.current_map("project", "map-session").unwrap()),
+            units_before + 2
+        );
+        assert_eq!(
+            recovered
+                .object_ids("project", "map-session")
+                .unwrap()
+                .len(),
+            1,
+            "the rebased candidate keeps naming its own added unit"
+        );
+        let verification = recovered
+            .verify_current_for_apply("project", "map-session")
+            .unwrap();
+        assert!(verification.valid, "{:?}", verification.errors);
+        assert_eq!(verification.candidate_sha256, followed.current_hash);
+        assert!(!dirs
+            .map_candidates_dir()
+            .join("project")
+            .join("map-session")
+            .read_dir()
+            .unwrap()
+            .flatten()
+            .any(|entry| entry.file_name().to_string_lossy().starts_with("rebase-")));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn session_without_candidate_follows_the_saved_source() {
+        let root = unique_root();
+        let dirs = DataDirs::from_bases(&root.join("roaming"), &root.join("local"));
+        dirs.ensure_dirs().unwrap();
+        let source = root.join("source.scx");
+        std::fs::copy(fixture(), &source).unwrap();
+        let snapshot = context(&dirs, &source);
+        let store = CandidateStore::new(
+            (dirs.clone()).clone(),
+            crate::map_import::MapImportStore::new(dirs.clone()),
+        );
+        let created = store.create_session("map-session", &snapshot).unwrap();
+
+        edit_source(&dirs, &source, vec![add_unit(256, 256)]);
+        let saved_hash = file_hash(&source).unwrap();
+        assert_ne!(saved_hash, created.baseline.file_sha256);
+
+        let view = store.state("project", "map-session").unwrap();
+        assert!(!view.stale);
+        assert!(!view.source_diverged);
+        assert_eq!(view.current_revision, 0);
+        assert_eq!(view.baseline.file_sha256, saved_hash);
+        assert_eq!(view.current_hash, saved_hash);
+        assert_eq!(
+            file_hash(&store.baseline_map("project", "map-session").unwrap()).unwrap(),
+            saved_hash
+        );
+
+        // A new request starts from the saved map without any reopen.
+        store
+            .prepare_request("project", "map-session", "request", 0, &[])
+            .unwrap();
+        store.finish_request("map-session", "request").unwrap();
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn session_without_candidate_follows_a_reshaped_source() {
+        let root = unique_root();
+        let dirs = DataDirs::from_bases(&root.join("roaming"), &root.join("local"));
+        dirs.ensure_dirs().unwrap();
+        let source = root.join("source.scx");
+        std::fs::copy(fixture(), &source).unwrap();
+        let snapshot = context(&dirs, &source);
+        let store = CandidateStore::new(
+            (dirs.clone()).clone(),
+            crate::map_import::MapImportStore::new(dirs.clone()),
+        );
+        let created = store.create_session("map-session", &snapshot).unwrap();
+
+        // A blank map of another size is saved under the same path.
+        let starcraft = MapContextService::new(dirs.clone())
+            .starcraft_path()
+            .unwrap();
+        let reshaped = root.join("reshaped.scx");
+        let tileset = created.baseline.tileset as u8;
+        isom::map_new(
+            &reshaped,
+            &starcraft,
+            &blank_spec(tileset, 96, 64, first_brush(&starcraft, tileset)),
+        )
+        .unwrap();
+        copy_atomic(&reshaped, &source).unwrap();
+        let saved = MapContextService::new(dirs.clone())
+            .revision_for_path("project".to_string(), &source)
+            .unwrap();
+        assert_ne!(
+            (saved.width, saved.height),
+            (created.baseline.width, created.baseline.height)
+        );
+
+        let view = store.state("project", "map-session").unwrap();
+        assert!(!view.stale && !view.source_diverged);
+        assert_eq!(view.current_revision, 0);
+        assert_eq!(view.baseline.file_sha256, saved.file_sha256);
+        assert_eq!(
+            (view.baseline.width, view.baseline.height),
+            (saved.width, saved.height)
+        );
+        assert_eq!(view.current_hash, saved.file_sha256);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn active_request_defers_following_until_it_settles() {
+        let root = unique_root();
+        let dirs = DataDirs::from_bases(&root.join("roaming"), &root.join("local"));
+        dirs.ensure_dirs().unwrap();
+        let source = root.join("source.scx");
+        std::fs::copy(fixture(), &source).unwrap();
+        let snapshot = context(&dirs, &source);
+        let store = CandidateStore::new(
+            (dirs.clone()).clone(),
+            crate::map_import::MapImportStore::new(dirs.clone()),
+        );
+        let created = store.create_session("map-session", &snapshot).unwrap();
+        store
+            .prepare_request("project", "map-session", "request", 0, &[])
+            .unwrap();
+        store
+            .draft_begin("project", "map-session", "request")
+            .unwrap();
+
+        edit_source(&dirs, &source, vec![add_unit(256, 256)]);
+        let deferred = store.state("project", "map-session").unwrap();
+        assert!(
+            deferred.stale,
+            "a live draft keeps its parent until it settles"
+        );
+        assert_eq!(deferred.baseline.file_sha256, created.baseline.file_sha256);
+        assert!(store
+            .verify_current_for_apply("project", "map-session")
+            .is_err());
+
+        store.finish_request("map-session", "request").unwrap();
+        let followed = store.state("project", "map-session").unwrap();
+        assert!(!followed.stale);
+        assert_eq!(followed.baseline.file_sha256, file_hash(&source).unwrap());
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn candidate_wins_when_the_saved_source_rejects_its_replay() {
+        let root = unique_root();
+        let dirs = DataDirs::from_bases(&root.join("roaming"), &root.join("local"));
+        dirs.ensure_dirs().unwrap();
+        let source = root.join("source.scx");
+        std::fs::copy(fixture(), &source).unwrap();
+        let snapshot = context(&dirs, &source);
+        let store = CandidateStore::new(
+            (dirs.clone()).clone(),
+            crate::map_import::MapImportStore::new(dirs.clone()),
+        );
+        let view = store.create_session("map-session", &snapshot).unwrap();
+        let target = full_target(&view, "target");
+        store
+            .save_selection("project", "map-session", target.clone())
+            .unwrap();
+        let before = tile_at(&source, 3, 3);
+        store
+            .prepare_request(
+                "project",
+                "map-session",
+                "request",
+                0,
+                &[region_mention(&target)],
+            )
+            .unwrap();
+        store
+            .draft_begin("project", "map-session", "request")
+            .unwrap();
+        store
+            .draft_patch(
+                "project",
+                "map-session",
+                "request",
+                vec![MapOperation::TerrainSet {
+                    x: 3,
+                    y: 3,
+                    before,
+                    after: before ^ 1,
+                }],
+            )
+            .unwrap();
+        store.finalize("project", "map-session", "request").unwrap();
+        let view = store
+            .commit_request("project", "map-session", "request")
+            .unwrap();
+        store.finish_request("map-session", "request").unwrap();
+        let candidate_hash = view.current_hash.clone();
+
+        // Someone else changes the very tile the candidate edited: the replay
+        // conflicts, so the candidate keeps its bytes and wins on Apply.
+        edit_source(
+            &dirs,
+            &source,
+            vec![MapOperation::TerrainSet {
+                x: 3,
+                y: 3,
+                before,
+                after: before ^ 2,
+            }],
+        );
+        let saved_hash = file_hash(&source).unwrap();
+        let diverged = store.state("project", "map-session").unwrap();
+        assert!(!diverged.stale);
+        assert!(diverged.source_diverged);
+        assert!(diverged.can_apply);
+        assert_eq!(diverged.current_revision, 1);
+        assert_eq!(diverged.current_hash, candidate_hash);
+        assert_eq!(
+            diverged.baseline.file_sha256, saved_hash,
+            "Apply names the saved bytes it will overwrite"
+        );
+        let verification = store
+            .verify_current_for_apply("project", "map-session")
+            .unwrap();
+        assert!(verification.valid);
+        assert_eq!(verification.candidate_sha256, candidate_hash);
+
+        // Reverting below the conflicting revision lets the session follow
+        // the saved source again; the unreplayable revision is dropped.
+        let reverted = store.revert("project", "map-session", 0).unwrap();
+        assert!(!reverted.source_diverged);
+        assert_eq!(reverted.current_revision, 0);
+        assert_eq!(reverted.current_hash, saved_hash);
+        assert!(reverted.revisions.is_empty());
         std::fs::remove_dir_all(root).ok();
     }
 

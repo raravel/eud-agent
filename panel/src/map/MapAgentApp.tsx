@@ -749,7 +749,6 @@ export default function MapAgentApp() {
   const persisted = useMemo(loadSurfaceState, []);
   const [bootstrap, setBootstrap] = useState<MapBootstrapResponse | null>(null);
   const [candidate, setCandidate] = useState<CandidateStateView | null>(null);
-  const [changedSource, setChangedSource] = useState<MapSourceProbe | null>(null);
   const [draftObjects, setDraftObjects] = useState<MapObjectItem[]>([]);
   const [objects, setObjects] = useState<MapObjectItem[]>([]);
   const [diffDetails, setDiffDetails] = useState<MapDiffDetails>({
@@ -818,6 +817,7 @@ export default function MapAgentApp() {
   const draftOverlayRefreshRef = useRef(0);
   const overlayRefreshRef = useRef(0);
   const sourceProbeInFlightRef = useRef(false);
+  const failedSourceProbeRef = useRef<MapSourceProbe | null>(null);
   const eventRevisionRef = useRef("");
   const turnRef = useRef(turn);
   const turnCursorRef = useRef<MapTurnCursor>(createMapTurnCursor());
@@ -1073,9 +1073,7 @@ export default function MapAgentApp() {
       candidateRef.current = next.candidate;
       setBootstrap(next);
       setCandidate(next.candidate);
-      setChangedSource(
-        next.candidate.stale ? sourceProbeFromContext(next.context) : null,
-      );
+      setConversationResumeError(next.conversationResumeError ?? null);
       setContextUsage(next.session.contextUsage ?? null);
       setConversation(restoredConversation);
       logSequenceRef.current = Math.max(
@@ -1552,9 +1550,14 @@ export default function MapAgentApp() {
     };
   }, []);
 
+  // The saved source is the authority. When it changes, reopen the session so
+  // the backend moves the candidate onto it; a live turn keeps its parent (the
+  // backend defers too) and the next idle probe picks the change up.
   const probeSource = useCallback(async () => {
     const context = bootstrapRef.current?.context;
-    if (!context || sourceProbeInFlightRef.current) return;
+    const sessionId = sessionIdRef.current;
+    if (!context || !sessionId || sourceProbeInFlightRef.current) return;
+    if (busy || turnInFlight || loading || sessionActionBusy) return;
     sourceProbeInFlightRef.current = true;
     try {
       const current = await mapSourceState();
@@ -1564,19 +1567,32 @@ export default function MapAgentApp() {
       ) {
         return;
       }
-      setChangedSource((previous) =>
-        previous && sameSourceProbe(previous, current) ? previous : current,
-      );
-      setCandidate((value) =>
-        value === null || value.stale ? value : { ...value, stale: true },
-      );
+      const failed = failedSourceProbeRef.current;
+      if (failed && sameSourceProbe(failed, current)) return;
+      try {
+        await persistCurrentConversation();
+        await applyBootstrap(await mapSessionLoad(sessionId));
+        failedSourceProbeRef.current = null;
+      } catch (reason) {
+        // Remember this save so the probe does not retry it every 2 seconds;
+        // the next save (or a manual reload) tries again.
+        failedSourceProbeRef.current = current;
+        setError(`저장된 원본 맵을 반영하지 못했습니다: ${String(reason)}`);
+      }
     } catch {
       // A transient bridge failure must not tear down the usable workbench.
       // Original-file writes still verify the full source hash in the backend.
     } finally {
       sourceProbeInFlightRef.current = false;
     }
-  }, []);
+  }, [
+    applyBootstrap,
+    busy,
+    loading,
+    persistCurrentConversation,
+    sessionActionBusy,
+    turnInFlight,
+  ]);
 
   useEffect(() => {
     let unlisten: UnlistenFn | undefined;
@@ -2501,9 +2517,7 @@ export default function MapAgentApp() {
       selectionAnchor={imagePlacement ? null : selectionAnchor}
       toolbar={
         <MapToolbar
-          context={bootstrap.context}
           candidate={candidate}
-          changedSource={changedSource}
           view={view}
           busy={
             busy ||
@@ -2532,7 +2546,10 @@ export default function MapAgentApp() {
               .finally(() => setBusy(false));
           }}
           onApply={() => {
-            if (!window.confirm("검증된 mixed-layer 후보 전체를 원본 SCX에 원자적으로 Apply할까요?")) return;
+            const question = candidate.sourceDiverged
+              ? "원본 맵이 후보와 다르게 저장되어 후보를 그 위로 옮길 수 없었습니다. Apply하면 저장된 원본을 백업한 뒤 이 후보로 덮어씁니다. 계속할까요?"
+              : "검증된 mixed-layer 후보 전체를 원본 SCX에 원자적으로 Apply할까요?";
+            if (!window.confirm(question)) return;
             void mutateSourceAndReload(() => candidateApply(bootstrap.session.id));
           }}
           onUndo={() => {

@@ -10,6 +10,7 @@ import {
   mapSourceProbeChanged,
   nextSelectionLabel,
   reduceMapTurnEvent,
+  restoreMentionChips,
   staleImportedMentions,
   staleMentions,
   advanceLiveDraftPreview,
@@ -449,6 +450,73 @@ describe("Candidate mention freshness", () => {
   });
 });
 
+
+describe("Edited message mention restoration", () => {
+  it("rebuilds tray chips from persisted snapshots with live labels when the items still exist", () => {
+    const chips = restoreMentionChips(
+      [
+        { kind: "region", selectionId: "target", snapshotHash: "mask-a", sourceRevision: "r1:a" },
+        { kind: "stamp", selectionId: "missing-selection", snapshotHash: "mask-b" },
+        { kind: "importedStamp", importId: "import-a", snapshotHash: "snapshot-a" },
+        {
+          kind: "object",
+          objectRef: {
+            kind: "unit",
+            ordinal: 7,
+            semanticFingerprint: "fp",
+            revisionKey: "r1:a",
+            baselineHash: "baseline",
+          },
+          role: "subject",
+        },
+        {
+          kind: "palette",
+          entry: { layer: "locations", kind: "newLocation", entryId: 0, tileset: "jungle", fingerprint: "new-location/1" },
+          qualifiers: {},
+        },
+        {
+          kind: "palette",
+          entry: { layer: "units", kind: "unit", entryId: 0, tileset: "jungle", fingerprint: "unit/0" },
+          qualifiers: { owner: 1 },
+        },
+        { kind: "location", locationId: 3, revisionKey: "r1:a", baselineHash: "baseline" },
+        { kind: "location", locationId: 9, revisionKey: "r1:a", baselineHash: "baseline" },
+      ],
+      {
+        selections: [
+          {
+            id: "target",
+            label: "영역 A",
+            role: "target",
+            sourceRevision: "r1:a",
+            layers: ["terrain"],
+            bounds: { left: 0, top: 0, right: 1, bottom: 1 },
+            selectedCells: 4,
+            rows: [],
+            snapshotHash: "mask-a",
+          },
+        ],
+        locations: [
+          { id: 3, name: "Spawn", left: 0, top: 0, right: 32, bottom: 32, tileRect: [0, 0, 1, 1], elevationFlags: 0 },
+        ],
+        imported: [{ id: "import-a", label: "언덕", snapshotHash: "snapshot-a" } as ImportedStampView],
+      },
+    );
+
+    expect(chips.map((chip) => chip.label)).toEqual([
+      "target:영역 A",
+      "stamp:missing-",
+      "imported:언덕",
+      "instance:unit #7",
+      "type:새 로케이션",
+      "type:unit #0",
+      "location:#3 Spawn",
+      "location:#9",
+    ]);
+    expect(new Set(chips.map((chip) => chip.id)).size).toBe(chips.length);
+    expect(chips[5].mention).toMatchObject({ kind: "palette", qualifiers: { owner: 1 } });
+  });
+});
 
 describe("Imported stamp mention freshness", () => {
   it("marks deleted, unavailable, or snapshot-mismatched imported chips stale", () => {

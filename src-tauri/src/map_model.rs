@@ -841,14 +841,32 @@ pub struct CandidateSession {
     pub persistent_protections: BTreeSet<String>,
     #[serde(default)]
     pub candidate_object_ids: BTreeMap<String, String>,
+    /// The saved source changed while a request was active; the session
+    /// follows it as soon as that request settles.
     #[serde(default)]
     pub stale: bool,
+    /// The saved source changed under candidate revisions that could not be
+    /// replayed onto it, so the candidate still descends from
+    /// `baseline_snapshot` while `baseline.file_sha256` names the source
+    /// bytes Apply will overwrite (last writer wins).
+    #[serde(default)]
+    pub source_diverged: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_apply_backup: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_apply_source_hash: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_apply_before_hash: Option<String>,
+}
+
+impl CandidateSession {
+    /// The last Apply's backup only undoes the source bytes it produced; once
+    /// the source moved on, that undo is gone.
+    pub fn forget_last_apply(&mut self) {
+        self.last_apply_backup = None;
+        self.last_apply_source_hash = None;
+        self.last_apply_before_hash = None;
+    }
 }
 
 pub fn hex_sha256(bytes: &[u8]) -> String {
