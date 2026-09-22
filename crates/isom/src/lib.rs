@@ -400,12 +400,18 @@ pub struct MapNewStart {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct MapNewPlayer {
+    /// CHK slot 0..11; slots the spec omits become `inactive`.
     pub slot: u8,
     /// `human`, `computer`, `rescuable`, `neutral`, `inactive`, or `closed`.
     pub r#type: String,
-    /// `zerg`, `terran`, `protoss`, `userSelectable`, or `random`.
+    /// `zerg`, `terran`, `protoss`, `userSelectable`, `random`, `independent`,
+    /// `neutral`, or `inactive`.
     pub race: String,
-    pub force: u8,
+    /// Index into `forces`; required for slots 0..7 and absent for 8..11
+    /// (FORC has eight entries).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub force: Option<u8>,
+    /// Only slots 0..7 may carry a start location.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub start: Option<MapNewStart>,
 }
@@ -413,7 +419,9 @@ pub struct MapNewPlayer {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct MapNewForce {
-    pub name: String,
+    /// Force name already encoded for the map's string table, 1..256 bytes,
+    /// lowercase/uppercase hex; written verbatim by the engine.
+    pub name_bytes_hex: String,
     pub allied: bool,
     pub allied_victory: bool,
     pub shared_vision: bool,
@@ -421,7 +429,9 @@ pub struct MapNewForce {
 }
 
 /// Strict `eud-map-new/1` request. Serialized verbatim for the native engine,
-/// which re-validates every field before touching the filesystem.
+/// which re-validates every field before touching the filesystem. Text fields
+/// carry bytes the caller already encoded for the new map's legacy `STR `
+/// table (see `chk::encode_chk_text`); nothing is re-encoded here or in C.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct MapNewSpec {
@@ -431,8 +441,11 @@ pub struct MapNewSpec {
     pub width: u16,
     pub height: u16,
     pub terrain_type: u16,
-    pub title: String,
-    pub description: String,
+    /// Scenario title bytes as hex, 1..1024 bytes.
+    pub title_bytes_hex: String,
+    /// Scenario description bytes as hex, 0..4096 bytes.
+    pub description_bytes_hex: String,
+    /// Up to 12 entries with unique slots.
     pub players: Vec<MapNewPlayer>,
     pub forces: Vec<MapNewForce>,
 }
@@ -462,7 +475,7 @@ pub fn map_new(
         || !(64..=256).contains(&spec.height)
         || spec.tileset > 7
         || spec.terrain_type == 0
-        || spec.players.len() > 8
+        || spec.players.len() > 12
         || spec.forces.is_empty()
         || spec.forces.len() > 4
         || output_map_path.exists()

@@ -705,6 +705,40 @@ pub enum MapOperation {
     },
     #[serde(rename = "location.delete")]
     LocationDelete { location_id: u16 },
+    /// Scenario title/description bytes, already encoded for the map's string
+    /// table. Only the Map window's properties request emits the three
+    /// property operations; they are not advertised to the agent.
+    #[serde(rename = "scenario.set")]
+    ScenarioSet {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title_bytes_hex: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        description_bytes_hex: Option<String>,
+    },
+    #[serde(rename = "player.set")]
+    PlayerSet {
+        slot: u8,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        r#type: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        race: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        force: Option<u8>,
+    },
+    #[serde(rename = "force.set")]
+    ForceSet {
+        force: u8,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name_bytes_hex: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        allied: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        allied_victory: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        shared_vision: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        random_start: Option<bool>,
+    },
 }
 
 const fn one() -> u16 {
@@ -760,6 +794,10 @@ pub struct MapDiff {
     pub outside_target: u32,
     pub protected: u32,
     pub unsupported_section_changes: Vec<String>,
+    /// Changed scenario-property fields (title, description, slot owner/race/
+    /// force, force name/flags); counted only for a properties request.
+    #[serde(default)]
+    pub properties: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -986,6 +1024,50 @@ mod tests {
             "operations": [{"op": "fog.set", "x": 1, "y": 1}]
         });
         assert!(serde_json::from_value::<MapEditBatch>(unknown_operation).is_err());
+    }
+
+    #[test]
+    fn property_operations_use_native_field_names_and_omit_unset_fields() {
+        let operations = vec![
+            MapOperation::ScenarioSet {
+                title_bytes_hex: Some("41".to_string()),
+                description_bytes_hex: None,
+            },
+            MapOperation::PlayerSet {
+                slot: 9,
+                r#type: Some("neutral".to_string()),
+                race: None,
+                force: None,
+            },
+            MapOperation::ForceSet {
+                force: 2,
+                name_bytes_hex: None,
+                allied: Some(true),
+                allied_victory: None,
+                shared_vision: Some(false),
+                random_start: None,
+            },
+        ];
+        let encoded = serde_json::to_value(&operations).unwrap();
+        assert_eq!(
+            encoded,
+            json!([
+                {"op": "scenario.set", "titleBytesHex": "41"},
+                {"op": "player.set", "slot": 9, "type": "neutral"},
+                {"op": "force.set", "force": 2, "allied": true, "sharedVision": false}
+            ])
+        );
+        assert_eq!(
+            serde_json::from_value::<Vec<MapOperation>>(encoded).unwrap(),
+            operations
+        );
+        assert!(serde_json::from_value::<MapOperation>(json!({
+            "op": "player.set",
+            "slot": 0,
+            "type": "human",
+            "start": {"x": 1, "y": 1}
+        }))
+        .is_err());
     }
 
     #[test]

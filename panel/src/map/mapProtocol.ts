@@ -66,6 +66,32 @@ export interface MapHeader {
   width: number;
   height: number;
   tileset: string;
+  /** Scenario name (SPRP); absent from digests produced before map properties existed. */
+  title?: string;
+  description?: string;
+}
+
+/** One CHK slot as the digest reports it; `force` is 1-based and present for P1..P8 only. */
+export interface MapDigestPlayer {
+  player: string;
+  controller: string;
+  controllerId: number;
+  race: string;
+  raceId: number;
+  force?: number;
+}
+
+export interface MapDigestForce {
+  /** 1-based force number. */
+  force: number;
+  name: string;
+  players: string[];
+  flags: {
+    randomStartLocation: boolean;
+    allies: boolean;
+    alliedVictory: boolean;
+    sharedVision: boolean;
+  };
 }
 
 export interface MapUnit {
@@ -128,6 +154,9 @@ export interface MapDigest {
   sprites: MapSprite[];
   locations: MapLocation[];
   startLocations: Array<{ player: string; x: number; y: number; tileX: number; tileY: number }>;
+  /** Absent from digests produced before map properties existed. */
+  players?: MapDigestPlayer[];
+  forces?: MapDigestForce[];
 }
 
 export interface MapContextSnapshot {
@@ -163,6 +192,8 @@ export interface MapDiff {
   outsideTarget: number;
   protected: number;
   unsupportedSectionChanges: string[];
+  /** Changed title/description/slot/force fields; absent in older payloads. */
+  properties?: number;
 }
 
 export interface VerificationReport {
@@ -667,4 +698,47 @@ export function candidateApply(sessionId: string): Promise<CandidateStateView> {
 
 export function applyUndo(sessionId: string): Promise<CandidateStateView> {
   return invoke("map_agent_apply_undo", { sessionId });
+}
+
+export type MapPropertiesSlotType = "human" | "computer" | "rescuable" | "neutral" | "inactive" | "closed";
+export type MapPropertiesRace =
+  | "zerg"
+  | "terran"
+  | "protoss"
+  | "userSelectable"
+  | "random"
+  | "neutral"
+  | "inactive"
+  /** Legacy SIDE value 3; only echoed back unchanged, never chosen. */
+  | "independent";
+
+export interface MapPropertiesPlayer {
+  type: MapPropertiesSlotType;
+  race: MapPropertiesRace;
+  /** 0-based force; present for slots 0..7 only. */
+  force?: number;
+}
+
+export interface MapPropertiesForce {
+  name: string;
+  allied: boolean;
+  alliedVictory: boolean;
+  sharedVision: boolean;
+  randomStart: boolean;
+}
+
+/** Complete scenario properties: title, description, all 12 slots and all 4 forces. */
+export interface MapPropertiesRequest {
+  title: string;
+  description: string;
+  players: MapPropertiesPlayer[];
+  forces: MapPropertiesForce[];
+}
+
+/** Save scenario properties straight to the source map; the Map window's Undo reverts it. */
+export function saveMapProperties(command: {
+  sessionId: string;
+  properties: MapPropertiesRequest;
+}): Promise<CandidateStateView> {
+  return invoke("map_agent_properties_save", { command });
 }

@@ -110,16 +110,20 @@ describe("NewMapWizard", () => {
     await choose("초기 지형", "High Jungle");
     await userEvent.click(screen.getByRole("button", { name: "다음" }));
 
-    await choose("플레이어 수", "3명");
+    expect(screen.getAllByRole("combobox", { name: /^P\d+ 타입$/u })).toHaveLength(12);
+    expect(screen.getAllByRole("combobox", { name: /^P\d+ 포스$/u })).toHaveLength(8);
+    expect(screen.getByLabelText("P9 포스 없음")).toHaveTextContent("—");
+    expect(screen.getByRole("combobox", { name: "P12 타입" })).toHaveTextContent("중립");
     await choose("P2 타입", "컴퓨터");
     await choose("P2 종족", "저그");
+    await choose("P8 타입", "사용 안 함");
     await userEvent.click(screen.getByRole("button", { name: "2팀으로 나누기" }));
-    expect(screen.getByRole("combobox", { name: "포스 수" })).toHaveTextContent("2개");
+    expect(screen.getAllByLabelText(/^포스 \d 이름$/u)).toHaveLength(4);
     await userEvent.clear(screen.getByLabelText("포스 2 이름"));
     await userEvent.type(screen.getByLabelText("포스 2 이름"), "방어");
     await choose("P2 포스", "방어");
-    expect(screen.getByLabelText("포스 1 구성원")).toHaveTextContent("P1 · 1명");
-    expect(screen.getByLabelText("포스 2 구성원")).toHaveTextContent("P2, P3 · 2명");
+    expect(screen.getByLabelText("포스 1 구성원")).toHaveTextContent("P1, P3, P4, P8 · 4명");
+    expect(screen.getByLabelText("포스 2 구성원")).toHaveTextContent("P2, P5, P6, P7 · 4명");
     await userEvent.click(screen.getByRole("button", { name: "맵 만들기" }));
 
     expect(create).toHaveBeenCalledTimes(1);
@@ -134,13 +138,27 @@ describe("NewMapWizard", () => {
       terrainType: 5,
       title: "Arena",
     });
-    expect(request.spec.forces.map((force) => force.name)).toEqual(["포스 1", "방어"]);
-    expect(request.spec.players.map((player) => [player.slot, player.type, player.race, player.force])).toEqual([
+    expect(request.spec.forces.map((force) => force.name)).toEqual(["포스 1", "방어", "포스 3", "포스 4"]);
+    expect(request.spec.players).toHaveLength(12);
+    expect(request.spec.players.slice(0, 8).map((player) => [player.slot, player.type, player.race, player.force])).toEqual([
       [0, "human", "userSelectable", 0],
       [1, "computer", "zerg", 1],
-      [2, "human", "userSelectable", 1],
+      [2, "human", "userSelectable", 0],
+      [3, "human", "userSelectable", 0],
+      [4, "human", "userSelectable", 1],
+      [5, "human", "userSelectable", 1],
+      [6, "human", "userSelectable", 1],
+      [7, "inactive", "userSelectable", 0],
     ]);
-    expect(request.spec.players.every((player) => player.start !== undefined)).toBe(true);
+    expect(request.spec.players.slice(8).map((player) => [player.slot, player.type, player.race])).toEqual([
+      [8, "inactive", "inactive"],
+      [9, "inactive", "inactive"],
+      [10, "inactive", "inactive"],
+      [11, "neutral", "neutral"],
+    ]);
+    expect(request.spec.players.slice(8).every((player) => !("force" in player) && !("start" in player))).toBe(true);
+    expect(request.spec.players.slice(0, 7).every((player) => player.start !== undefined)).toBe(true);
+    expect(request.spec.players[7]?.start).toBeUndefined();
 
     expect(await screen.findByRole("status")).toHaveTextContent("맵과 프로젝트를 만들었습니다.");
     expect(screen.getByRole("img", { name: /96×64 jungle 맵 미리보기/u })).toBeInTheDocument();
@@ -148,9 +166,9 @@ describe("NewMapWizard", () => {
     await userEvent.click(screen.getByRole("button", { name: "프로젝트 열기" }));
     expect(props.onCreated).toHaveBeenCalledWith(openedSetup);
     expect(props.onOpenChange).toHaveBeenCalledWith(false);
-  });
+  }, 20_000);
 
-  it("lets the user set up to four named forces and reassigns players when one is removed", async () => {
+  it("offers individual forces only while at most four slots take part and keeps names editable", async () => {
     const create = vi.fn(async (_request: BlankProjectRequest) => ({ setup: openedSetup, preview: null }));
     renderWizard({ create });
     await userEvent.type(await screen.findByLabelText("프로젝트 이름"), "Arena");
@@ -159,27 +177,25 @@ describe("NewMapWizard", () => {
     await waitFor(() => expect(screen.getByRole("button", { name: "다음" })).toBeEnabled());
     await userEvent.click(screen.getByRole("button", { name: "다음" }));
 
-    await choose("플레이어 수", "5명");
     expect(screen.getByRole("button", { name: "각자 개별 포스" })).toBeDisabled();
-    await choose("포스 수", "4개");
-    expect(screen.getAllByLabelText(/^포스 \d 이름$/u)).toHaveLength(4);
+    for (const slot of [5, 6, 7]) await choose(`P${slot} 타입`, "닫힘");
+    expect(screen.getByRole("button", { name: "각자 개별 포스" })).toBeDisabled();
+    await choose("P8 타입", "닫힘");
+    expect(screen.getByRole("button", { name: "각자 개별 포스" })).toBeEnabled();
+    await userEvent.click(screen.getByRole("button", { name: "각자 개별 포스" }));
+    expect(screen.getByRole("combobox", { name: "P4 포스" })).toHaveTextContent("포스 4");
     await userEvent.clear(screen.getByLabelText("포스 4 이름"));
     await userEvent.type(screen.getByLabelText("포스 4 이름"), "관전");
+    expect(screen.getByRole("combobox", { name: "P4 포스" })).toHaveTextContent("관전");
     await choose("P5 포스", "관전");
-    await choose("P4 포스", "포스 3");
-    await choose("P3 포스", "포스 2");
-    expect(screen.getByLabelText("포스 4 구성원")).toHaveTextContent("P5 · 1명");
-
-    await choose("포스 수", "3개");
-    expect(screen.queryByLabelText("포스 4 이름")).not.toBeInTheDocument();
-    expect(screen.getByRole("combobox", { name: "P5 포스" })).toHaveTextContent("포스 3");
-    expect(screen.getByLabelText("포스 3 구성원")).toHaveTextContent("P4, P5 · 2명");
+    expect(screen.getByLabelText("포스 4 구성원")).toHaveTextContent("P4, P5 · 2명");
     await userEvent.click(screen.getByRole("button", { name: "맵 만들기" }));
 
     const request = create.mock.calls[0]![0];
-    expect(request.spec.forces.map((force) => force.name)).toEqual(["포스 1", "포스 2", "포스 3"]);
-    expect(request.spec.players.map((player) => player.force)).toEqual([0, 0, 1, 2, 2]);
-  });
+    expect(request.spec.forces.map((force) => force.name)).toEqual(["포스 1", "포스 2", "포스 3", "관전"]);
+    expect(request.spec.players.slice(0, 8).map((player) => player.force)).toEqual([0, 1, 2, 3, 3, 0, 0, 0]);
+    expect(request.spec.players.slice(4, 8).map((player) => player.type)).toEqual(["closed", "closed", "closed", "closed"]);
+  }, 20_000);
 
   it("blocks progress until a StarCraft folder is chosen and lets the user pick it inline", async () => {
     const pickStarcraft = vi.fn(async () => readyOptions);

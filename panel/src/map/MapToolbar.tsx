@@ -9,6 +9,7 @@ import {
   RefreshCw,
   RotateCcw,
   ShieldAlert,
+  SlidersHorizontal,
   X,
 } from "lucide-react";
 
@@ -44,7 +45,7 @@ export interface MapToolbarProps {
   onUndo(): void;
   onImagePlace(): void;
   onMapImport(): void;
-  onReloadSource(): void;
+  onProperties(): void;
 }
 
 function savedTime(mtimeNs: string): string {
@@ -75,18 +76,10 @@ export function MapToolbar({
   onUndo,
   onImagePlace,
   onMapImport,
-  onReloadSource,
+  onProperties,
 }: MapToolbarProps) {
   const sourceName =
     candidate.baseline.sourcePath.split(/[\\/]/).at(-1) ?? candidate.baseline.sourcePath;
-  const currentSourcePath = changedSource?.sourcePath ?? context.revision.sourcePath;
-  const currentSourceMtime = changedSource?.mtimeNs ?? context.revision.mtimeNs;
-  const currentSourceMatchesContext =
-    changedSource === null ||
-    (changedSource.projectId === context.revision.projectId &&
-      changedSource.sourcePath === context.revision.sourcePath &&
-      changedSource.mtimeNs === context.revision.mtimeNs &&
-      changedSource.fileSize === context.sourceFileSize);
   return (
     <header className="flex min-w-0 flex-wrap items-center gap-3 border-b border-border bg-card/80 px-3 py-2 backdrop-blur">
       <div className="flex min-w-[18rem] flex-1 items-center gap-2">
@@ -196,26 +189,18 @@ export function MapToolbar({
       )}
 
       <div className="ml-auto flex items-center gap-2">
-        {candidate.stale && (
-          <Button
-            type="button"
-            size="sm"
-            className="h-9 gap-1.5"
-            disabled={busy}
-            title="기존 작업은 히스토리에 보존됩니다."
-            onClick={onReloadSource}
-          >
-            {reloadingSource ? (
-              <LoaderCircle
-                className="size-4 animate-spin motion-reduce:animate-none"
-                aria-hidden="true"
-              />
-            ) : (
-              <RefreshCw className="size-4" aria-hidden="true" />
-            )}
-            {reloadingSource ? "새 작업 여는 중…" : "변경된 원본으로 새 작업"}
-          </Button>
-        )}
+        <Button
+          type="button"
+          size="sm"
+          variant="outline"
+          disabled={busy}
+          className="h-9"
+          title="제목·설명·플레이어 슬롯·포스를 원본 맵에 바로 저장"
+          onClick={onProperties}
+        >
+          <SlidersHorizontal className="size-4" aria-hidden="true" />
+          맵 속성
+        </Button>
         <Button
           type="button"
           size="sm"

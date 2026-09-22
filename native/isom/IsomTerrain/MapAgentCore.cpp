@@ -2147,6 +2147,67 @@ int mapEdit(const char* inputMapPath, const char* outputMapPath, const char* sta
             if ( !blankLocation(map.getLocation(id)) ) fail(context + ": location is referenced by a trigger and cannot be deleted");
             effects.emplace_back(effect(name, "location", id));
         }
+        else if ( name == "scenario.set" )
+        {
+            allowedFields(operation, {"op", "titleBytesHex", "descriptionBytesHex"}, context);
+            const Json* titleHex = optionalField(operation, "titleBytesHex");
+            const Json* descriptionHex = optionalField(operation, "descriptionBytesHex");
+            if ( titleHex == nullptr && descriptionHex == nullptr )
+                fail(context + ": scenario.set needs titleBytesHex or descriptionBytesHex");
+            if ( titleHex != nullptr )
+                map.setScenarioName<RawString>(RawString(mapTextFromHex(stringValue(*titleHex, context + ".titleBytesHex"), context + ".titleBytesHex", 1, 1024)));
+            if ( descriptionHex != nullptr )
+                map.setScenarioDescription<RawString>(RawString(mapTextFromHex(stringValue(*descriptionHex, context + ".descriptionBytesHex"), context + ".descriptionBytesHex", 0, 4096)));
+            effects.emplace_back(effect(name, "scenario", 0));
+        }
+        else if ( name == "player.set" )
+        {
+            allowedFields(operation, {"op", "slot", "type", "race", "force"}, context);
+            const std::size_t slot = checkedSize(operation, "slot", context);
+            if ( slot >= Sc::Player::Total ) fail(context + ".slot must be within 0..11");
+            const Json* type = optionalField(operation, "type");
+            const Json* race = optionalField(operation, "race");
+            const Json* force = optionalField(operation, "force");
+            if ( type == nullptr && race == nullptr && force == nullptr )
+                fail(context + ": player.set needs type, race, or force");
+            if ( force != nullptr && slot >= Sc::Player::TotalSlots )
+                fail(context + ".force is only valid for slots 0..7");
+            // Parse every field before the first mutation so a bad value leaves the map untouched.
+            std::optional<Sc::Player::SlotType> slotType;
+            std::optional<Chk::Race> playerRace;
+            std::optional<std::size_t> forceIndex;
+            if ( type != nullptr ) slotType = parseSlotType(stringValue(*type, context + ".type"), context + ".type");
+            if ( race != nullptr ) playerRace = parseRace(stringValue(*race, context + ".race"), context + ".race");
+            if ( force != nullptr )
+            {
+                forceIndex = checkedSize(operation, "force", context);
+                if ( *forceIndex >= Chk::TotalForces ) fail(context + ".force must be within 0..3");
+            }
+            if ( slotType.has_value() ) map.setSlotType(slot, *slotType);
+            if ( playerRace.has_value() ) map.setPlayerRace(slot, *playerRace);
+            if ( forceIndex.has_value() ) map.setPlayerForce(slot, Chk::Force(*forceIndex));
+            effects.emplace_back(effect(name, "players", slot));
+        }
+        else if ( name == "force.set" )
+        {
+            allowedFields(operation, {"op", "force", "nameBytesHex", "allied", "alliedVictory", "sharedVision", "randomStart"}, context);
+            const std::size_t forceIndex = checkedSize(operation, "force", context);
+            if ( forceIndex >= Chk::TotalForces ) fail(context + ".force must be within 0..3");
+            const Json* nameHex = optionalField(operation, "nameBytesHex");
+            if ( nameHex == nullptr && optionalField(operation, "allied") == nullptr && optionalField(operation, "alliedVictory") == nullptr &&
+                 optionalField(operation, "sharedVision") == nullptr && optionalField(operation, "randomStart") == nullptr )
+                fail(context + ": force.set needs nameBytesHex or at least one flag");
+            const auto force = Chk::Force(forceIndex);
+            std::uint8_t flags = map.getForceFlags(force);
+            applyForceFlag(flags, operation, "allied", Chk::ForceFlags::RandomAllies, context);
+            applyForceFlag(flags, operation, "alliedVictory", Chk::ForceFlags::AlliedVictory, context);
+            applyForceFlag(flags, operation, "sharedVision", Chk::ForceFlags::SharedVision, context);
+            applyForceFlag(flags, operation, "randomStart", Chk::ForceFlags::RandomizeStartLocation, context);
+            if ( nameHex != nullptr )
+                map.setForceName<RawString>(force, RawString(mapTextFromHex(stringValue(*nameHex, context + ".nameBytesHex"), context + ".nameBytesHex", 1, 256)));
+            map.setForceFlags(force, flags);
+            effects.emplace_back(effect(name, "forces", forceIndex));
+        }
         else
             fail(context + ": unsupported operation '" + name + "'");
     }
@@ -2188,31 +2249,6 @@ int mapEdit(const char* inputMapPath, const char* outputMapPath, const char* sta
     return 0;
 }
 
-namespace {
-
-Sc::Player::SlotType parseSlotType(const std::string& value, const std::string& context)
-{
-    if ( value == "human" ) return Sc::Player::SlotType::Human;
-    if ( value == "computer" ) return Sc::Player::SlotType::Computer;
-    if ( value == "rescuable" ) return Sc::Player::SlotType::RescuePassive;
-    if ( value == "neutral" ) return Sc::Player::SlotType::Neutral;
-    if ( value == "inactive" ) return Sc::Player::SlotType::Inactive;
-    if ( value == "closed" ) return Sc::Player::SlotType::GameClosed;
-    fail(context + ": unsupported slot type '" + value + "'");
-}
-
-Chk::Race parseRace(const std::string& value, const std::string& context)
-{
-    if ( value == "zerg" ) return Chk::Race::Zerg;
-    if ( value == "terran" ) return Chk::Race::Terran;
-    if ( value == "protoss" ) return Chk::Race::Protoss;
-    if ( value == "userSelectable" ) return Chk::Race::UserSelectable;
-    if ( value == "random" ) return Chk::Race::Random;
-    fail(context + ": unsupported race '" + value + "'");
-}
-
-} // namespace
-
 // Create a brand-new ISOM-consistent map in one call: fill the whole map with one
 // terrain brush, then set scenario title/description, slot types, races, forces and
 // start locations on the same in-memory MapFile before a single save. The output is
@@ -2231,7 +2267,7 @@ int mapNew(const char* outputMapPath, const char* starCraftPath,
 
     const Json root = parseJson(std::string(reinterpret_cast<const char*>(specJson), specLength), "map new spec");
     const auto& spec = objectValue(root, "map new spec");
-    allowedFields(spec, {"schema", "version", "tileset", "width", "height", "terrainType", "title", "description",
+    allowedFields(spec, {"schema", "version", "tileset", "width", "height", "terrainType", "titleBytesHex", "descriptionBytesHex",
         "players", "forces"}, "map new spec");
     if ( stringValue(requiredField(spec, "schema", "map new spec"), "map new spec.schema") != NewSchema )
         fail("unsupported map new schema");
@@ -2250,14 +2286,10 @@ int mapNew(const char* outputMapPath, const char* starCraftPath,
     if ( width < 64 || width > 256 || height < 64 || height > 256 )
         fail("map new spec width and height must be within 64..256");
     const std::size_t terrainType = checkedSize(spec, "terrainType", "map new spec", true);
-    const std::string title = optionalField(spec, "title") == nullptr
-        ? std::string("Untitled Scenario")
-        : stringValue(*optionalField(spec, "title"), "map new spec.title");
-    const std::string description = optionalField(spec, "description") == nullptr
-        ? std::string("Destroy all enemy buildings.")
-        : stringValue(*optionalField(spec, "description"), "map new spec.description");
-    if ( title.empty() || title.size() > 1024 || description.size() > 4096 )
-        fail("map new spec title/description length is out of range");
+    const std::string title = mapTextFromHex(stringValue(requiredField(spec, "titleBytesHex", "map new spec"), "map new spec.titleBytesHex"),
+        "map new spec.titleBytesHex", 1, 1024);
+    const std::string description = mapTextFromHex(stringValue(requiredField(spec, "descriptionBytesHex", "map new spec"), "map new spec.descriptionBytesHex"),
+        "map new spec.descriptionBytesHex", 0, 4096);
 
     struct ForceSpec { std::string name; std::uint8_t flags; };
     std::vector<ForceSpec> forces;
@@ -2270,9 +2302,9 @@ int mapNew(const char* outputMapPath, const char* starCraftPath,
         {
             const std::string context = "map new spec.forces[" + std::to_string(index) + "]";
             const auto& force = objectValue(forceArray[index], context);
-            exactFields(force, {"name", "allied", "alliedVictory", "sharedVision", "randomStart"}, context);
-            const std::string name = stringValue(requiredField(force, "name", context), context + ".name");
-            if ( name.empty() || name.size() > 256 ) fail(context + ".name length is out of range");
+            exactFields(force, {"nameBytesHex", "allied", "alliedVictory", "sharedVision", "randomStart"}, context);
+            const std::string name = mapTextFromHex(stringValue(requiredField(force, "nameBytesHex", context), context + ".nameBytesHex"),
+                context + ".nameBytesHex", 1, 256);
             std::uint8_t flags = 0;
             if ( boolValue(requiredField(force, "allied", context), context + ".allied") ) flags |= Chk::ForceFlags::RandomAllies;
             if ( boolValue(requiredField(force, "alliedVictory", context), context + ".alliedVictory") ) flags |= Chk::ForceFlags::AlliedVictory;
@@ -2289,6 +2321,7 @@ int mapNew(const char* outputMapPath, const char* starCraftPath,
         std::size_t slot;
         Sc::Player::SlotType type;
         Chk::Race race;
+        bool hasForce;
         std::size_t force;
         bool hasStart;
         std::uint16_t startX;
@@ -2298,7 +2331,7 @@ int mapNew(const char* outputMapPath, const char* starCraftPath,
     if ( const Json* playersJson = optionalField(spec, "players") )
     {
         const auto& playerArray = arrayValue(*playersJson, "map new spec.players");
-        if ( playerArray.size() > 8 ) fail("map new spec.players must contain at most 8 entries");
+        if ( playerArray.size() > Sc::Player::Total ) fail("map new spec.players must contain at most 12 entries");
         std::set<std::size_t> slots;
         for ( std::size_t index = 0; index < playerArray.size(); ++index )
         {
@@ -2307,15 +2340,25 @@ int mapNew(const char* outputMapPath, const char* starCraftPath,
             allowedFields(player, {"slot", "type", "race", "force", "start"}, context);
             PlayerSpec parsed {};
             parsed.slot = checkedSize(player, "slot", context);
-            if ( parsed.slot >= 8 ) fail(context + ".slot must be within 0..7");
+            if ( parsed.slot >= Sc::Player::Total ) fail(context + ".slot must be within 0..11");
             if ( !slots.insert(parsed.slot).second ) fail(context + ".slot is duplicated");
             parsed.type = parseSlotType(stringValue(requiredField(player, "type", context), context + ".type"), context + ".type");
             parsed.race = parseRace(stringValue(requiredField(player, "race", context), context + ".race"), context + ".race");
-            parsed.force = checkedSize(player, "force", context);
-            if ( parsed.force >= forces.size() ) fail(context + ".force does not name a declared force");
+            // FORC only covers the eight lobby slots: a force is mandatory there and
+            // has no storage for slots 8..11.
+            parsed.hasForce = optionalField(player, "force") != nullptr;
+            if ( parsed.slot < Sc::Player::TotalSlots )
+            {
+                if ( !parsed.hasForce ) fail(context + ".force is required for slots 0..7");
+                parsed.force = checkedSize(player, "force", context);
+                if ( parsed.force >= forces.size() ) fail(context + ".force does not name a declared force");
+            }
+            else if ( parsed.hasForce )
+                fail(context + ".force is only valid for slots 0..7");
             parsed.hasStart = false;
             if ( const Json* start = optionalField(player, "start") )
             {
+                if ( parsed.slot >= Sc::Player::TotalSlots ) fail(context + ".start is only valid for slots 0..7");
                 const auto& startObject = objectValue(*start, context + ".start");
                 exactFields(startObject, {"x", "y"}, context + ".start");
                 parsed.startX = checkedU16(startObject, "x", context + ".start");
@@ -2358,14 +2401,15 @@ int mapNew(const char* outputMapPath, const char* starCraftPath,
         map.setForceFlags(Chk::Force(index), forces[index].flags);
     }
     // Every slot the spec does not mention is Inactive so the lobby matches the wizard.
-    for ( std::size_t slot = 0; slot < 8; ++slot )
+    for ( std::size_t slot = 0; slot < Sc::Player::Total; ++slot )
         map.setSlotType(slot, Sc::Player::SlotType::Inactive);
     std::size_t startLocations = 0;
     for ( const auto& player : players )
     {
         map.setSlotType(player.slot, player.type);
         map.setPlayerRace(player.slot, player.race);
-        map.setPlayerForce(player.slot, Chk::Force(player.force));
+        if ( player.hasForce )
+            map.setPlayerForce(player.slot, Chk::Force(player.force));
         if ( player.hasStart )
         {
             Chk::Unit unit {};

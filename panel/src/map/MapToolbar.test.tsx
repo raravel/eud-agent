@@ -3,12 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 
 import { MapToolbar } from "./MapToolbar";
-import type {
-  CandidateStateView,
-  MapContextSnapshot,
-  MapDiff,
-  VerificationReport,
-} from "./mapProtocol";
+import type { CandidateStateView, MapDiff, VerificationReport } from "./mapProtocol";
 
 const emptyCounts = { added: 0, removed: 0, moved: 0, changed: 0 };
 const emptyDiff: MapDiff = {
@@ -91,7 +86,7 @@ const callbacks = {
   onUndo: vi.fn(),
   onImagePlace: vi.fn(),
   onMapImport: vi.fn(),
-  onReloadSource: vi.fn(),
+  onProperties: vi.fn(),
 };
 
 describe("MapToolbar candidate rails", () => {
@@ -99,7 +94,6 @@ describe("MapToolbar candidate rails", () => {
     callbacks.onApply.mockClear();
     render(
       <MapToolbar
-        context={context}
         candidate={candidate()}
         view="candidate"
         busy={false}
@@ -117,7 +111,6 @@ describe("MapToolbar candidate rails", () => {
     callbacks.onDiscard.mockClear();
     const { rerender } = render(
       <MapToolbar
-        context={context}
         candidate={candidate()}
         view="candidate"
         busy={false}
@@ -135,7 +128,6 @@ describe("MapToolbar candidate rails", () => {
 
     rerender(
       <MapToolbar
-        context={context}
         candidate={candidate({ currentRevision: 0, canApply: false })}
         view="candidate"
         busy={false}
@@ -150,7 +142,6 @@ describe("MapToolbar candidate rails", () => {
     callbacks.onRevert.mockClear();
     render(
       <MapToolbar
-        context={context}
         candidate={candidate()}
         view="candidate"
         busy={false}
@@ -225,10 +216,35 @@ describe("MapToolbar candidate rails", () => {
     expect(screen.getByRole("button", { name: "사진 배치" })).toBeDisabled();
   });
 
+  it("opens map properties only while idle", async () => {
+    callbacks.onProperties.mockClear();
+    const { rerender } = render(
+      <MapToolbar
+        candidate={candidate()}
+        view="candidate"
+        busy={false}
+        imagePlacementActive={false}
+        {...callbacks}
+      />,
+    );
+    await userEvent.click(screen.getByRole("button", { name: "맵 속성" }));
+    expect(callbacks.onProperties).toHaveBeenCalledOnce();
+
+    rerender(
+      <MapToolbar
+        candidate={candidate()}
+        view="candidate"
+        busy
+        imagePlacementActive={false}
+        {...callbacks}
+      />,
+    );
+    expect(screen.getByRole("button", { name: "맵 속성" })).toBeDisabled();
+  });
+
   it("marks a live draft as an uncommitted preview", () => {
     render(
       <MapToolbar
-        context={context}
         candidate={candidate()}
         view="candidate"
         busy

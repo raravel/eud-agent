@@ -10,7 +10,7 @@ use tauri::{Emitter, Manager};
 
 use crate::attachment::AttachmentStore;
 use crate::config::DataDirs;
-use crate::map_candidate::{CandidateStateView, CandidateStore};
+use crate::map_candidate::{CandidateStateView, CandidateStore, MapPropertiesInput};
 use crate::map_image::{
     MapImageConversionReport, MapImageDescriptor, MapImageMapContext, MapImagePlacement,
     MapImageService,
@@ -258,6 +258,15 @@ pub struct MapImageConfirmResponse {
     pub preview_sequence: u64,
     pub candidate: CandidateStateView,
     pub report: MapImageConversionReport,
+}
+
+/// The Map window's "맵 속성" save: the complete property set for the
+/// session's source map, written through the same MapSafe rails as Apply.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MapPropertiesSaveCommand {
+    pub session_id: String,
+    pub properties: MapPropertiesInput,
 }
 
 impl MapAgentService {
@@ -1060,6 +1069,66 @@ impl MapAgentService {
             )?;
             self.safe.undo(&record).map_err(|error| error.to_string())?;
             self.candidates.complete_undo(&project_id, session_id)
+        })?
+    }
+
+    /// Save scenario properties straight to the source map: stage only the
+    /// changed operations into a verified work file, then apply it through
+    /// MapSafe exactly like a candidate Apply so the Map window's Undo works.
+    pub(crate) fn properties_save(
+        &self,
+        command: &MapPropertiesSaveCommand,
+    ) -> Result<CandidateStateView, String> {
+        self.require_editor_idle()?;
+        let session = self.session_record(&command.session_id)?;
+        let project_id = session.meta.project;
+        let session_id = command.session_id.as_str();
+        self.writes.transaction(&project_id, || {
+            let state = self.candidates.state(&project_id, session_id)?;
+            let live = self.candidates.context().current().map_err(|error| {
+                format!("current OpenMapName could not be confirmed; properties save is blocked: {error}")
+            })?;
+            require_current_source(
+                &live.revision.project_id,
+                &live.revision.source_path,
+                &project_id,
+                &state.baseline.source_path,
+                "properties save",
+            )?;
+            let stage =
+                self.candidates
+                    .properties_stage(&project_id, session_id, &command.properties)?;
+            let result = (|| {
+                let record = self
+                    .safe
+                    .apply(
+                        &state.baseline.source_path,
+                        &stage.work,
+                        &state.baseline.file_sha256,
+                        &stage.work_sha256,
+                    )
+                    .map_err(|error| error.to_string())?;
+                match self.candidates.complete_apply(&project_id, session_id, &record) {
+                    Ok(state) => {
+                        self.safe
+                            .complete_pending(&record)
+                            .map_err(|error| error.to_string())?;
+                        Ok(state)
+                    }
+                    Err(error) => {
+                        self.safe.undo(&record).map_err(|rollback| {
+                            format!("candidate state persistence failed: {error}; backup restore failed: {rollback}")
+                        })?;
+                        Err(format!("candidate state persistence failed; original restored: {error}"))
+                    }
+                }
+            })();
+            let cleanup = self.candidates.discard_properties_stage(&stage);
+            match (result, cleanup) {
+                (Ok(state), Ok(())) => Ok(state),
+                (Err(error), _) => Err(error),
+                (Ok(_), Err(error)) => Err(error),
+            }
         })?
     }
 }

@@ -84,6 +84,7 @@ import {
   mapStampPreview,
   mapObjects,
   mapSourceState,
+  saveMapProperties,
   saveSelection,
   type CandidateStateView,
   type MapBootstrapResponse,
@@ -2381,6 +2382,22 @@ export default function MapAgentApp() {
     },
     [reload],
   );
+
+  // Save errors stay inside the properties dialog; `reload` reports its own failures.
+  const savePropertiesAndReload = useCallback(
+    async (properties: MapPropertiesRequest) => {
+      const sessionId = bootstrapRef.current?.session.id;
+      if (!sessionId) throw new Error("맵 작업이 열려 있지 않습니다. 창을 다시 연 뒤 시도해 주세요.");
+      setBusy(true);
+      try {
+        await saveMapProperties({ sessionId, properties });
+      } finally {
+        setBusy(false);
+      }
+      await reload();
+    },
+    [reload],
+  );
   const renderedMapSource = useMemo(() => {
     if (!bootstrap || !candidate) return null;
     const draftVisible =
@@ -2496,14 +2513,13 @@ export default function MapAgentApp() {
             imagePlacement !== null ||
             stampPlacement !== null
           }
-          reloadingSource={candidate.stale && sessionActionBusy}
           imagePlacementActive={imagePlacement !== null}
           liveDraftActive={liveDraft !== null}
           onImagePlace={() => imageFileInputRef.current?.click()}
           onMapImport={() => {
             void mapAgentImportOpen().catch((reason) => setError(String(reason)));
           }}
-          onReloadSource={() => void createSession()}
+          onProperties={() => setPropertiesOpen(true)}
           onView={setView}
           onRevert={(revision) =>
             void updateCandidate(() => candidateRevert(bootstrap.session.id, revision))
@@ -2891,6 +2907,14 @@ export default function MapAgentApp() {
           <LocateFixed className="size-4 shrink-0 text-muted-foreground" aria-hidden="true" />
         </div>
       }
+      />
+      <MapPropertiesDialog
+        open={propertiesOpen}
+        context={bootstrap.context}
+        candidate={candidate}
+        busy={busy || turnInFlight || sessionActionBusy}
+        onOpenChange={setPropertiesOpen}
+        onSave={savePropertiesAndReload}
       />
       <MapSessionHistoryDialog
         open={sessionHistoryOpen}

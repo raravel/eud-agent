@@ -29,18 +29,13 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
+import { ForcesEditor } from "@/components/map-properties/ForcesEditor";
+import { PlayerSlotsEditor } from "@/components/map-properties/PlayerSlotsEditor";
 import {
   applyForceLayout,
   buildMapNewSpec,
   defaultWizardForm,
-  FORCE_LAYOUT_OPTIONS,
-  forceLabel,
-  forceLayoutAvailable,
-  forceMembers,
-  MAX_FORCES,
   MAX_PLAYERS,
-  RACE_OPTIONS,
-  SLOT_TYPE_OPTIONS,
   slotNeedsStart,
   startLocationPreset,
   validateProjectName,
@@ -49,15 +44,14 @@ import {
   type BlankProjectRequest,
   type BlankProjectResult,
   type BrushOption,
+  type ForceForm,
   type ForceLayout,
   type MapNewOptions,
   type MapVersion,
-  type Race,
-  type SlotType,
+  type PlayerPatch,
   type WizardForm,
-  withForceCount,
-  withPlayerCount,
-  withPlayerForce,
+  withForcePatch,
+  withPlayerPatch,
 } from "@/lib/mapNew";
 import type { E3sDestinationSelection } from "@/lib/projectImport";
 import type { SetupMessage } from "@/lib/protocol";
@@ -227,9 +221,8 @@ export function NewMapWizard({
     updateForm({ [axis]: value });
   };
 
-  const setPlayerCount = (count: number) => setForm((current) => withPlayerCount(current, count));
-  const setForceCount = (count: number) => setForm((current) => withForceCount(current, count));
-  const setPlayerForce = (index: number, force: number) => setForm((current) => withPlayerForce(current, index, force));
+  const setPlayer = (index: number, patch: PlayerPatch) => setForm((current) => withPlayerPatch(current, index, patch));
+  const setForce = (index: number, patch: Partial<ForceForm>) => setForm((current) => withForcePatch(current, index, patch));
   const setLayout = (layout: ForceLayout) => setForm((current) => applyForceLayout(current, layout));
 
   const selectStarcraft = async () => {
@@ -311,7 +304,7 @@ export function NewMapWizard({
     if (!form.autoStart) return [];
     const playable = form.players
       .map((player, index) => ({ player, index }))
-      .filter(({ player }) => slotNeedsStart(player.type));
+      .filter(({ player, index }) => index < MAX_PLAYERS && slotNeedsStart(player.type));
     const preset = startLocationPreset(form.width, form.height, playable.length);
     return playable.map(({ index }, position) => ({ index, start: preset[position]! }));
   }, [form.autoStart, form.width, form.height, form.players]);
@@ -597,195 +590,17 @@ export function NewMapWizard({
 
           {options !== null && step === "players" && (
             <div className="grid gap-4">
-              <div className="grid gap-1.5">
-                <label htmlFor={`${idPrefix}-count`} className="text-sm font-medium">플레이어 수</label>
-                <Select
-                  value={String(form.players.length)}
-                  disabled={busy}
-                  onValueChange={(value) => setPlayerCount(Number(value))}
-                >
-                  <SelectTrigger id={`${idPrefix}-count`} className="w-full sm:w-40">
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {Array.from({ length: MAX_PLAYERS }, (_, index) => index + 1).map((count) => (
-                      <SelectItem key={count} value={String(count)}>{count}명</SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-              </div>
-              <table className="w-full text-sm" aria-label="플레이어 슬롯">
-                <thead>
-                  <tr className="text-left text-xs text-muted-foreground">
-                    <th scope="col" className="pb-2 pr-3 font-medium">슬롯</th>
-                    <th scope="col" className="pb-2 pr-3 font-medium">타입</th>
-                    <th scope="col" className="pb-2 pr-3 font-medium">종족</th>
-                    <th scope="col" className="pb-2 font-medium">포스</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {form.players.map((player, index) => (
-                    <tr key={index} className="border-t border-border">
-                      <th scope="row" className="py-2 pr-3 font-medium">P{index + 1}</th>
-                      <td className="py-2 pr-3">
-                        <Select
-                          value={player.type}
-                          disabled={busy}
-                          onValueChange={(value) => {
-                            const type = value as SlotType;
-                            setForm((current) => ({
-                              ...current,
-                              players: current.players.map((entry, position) => (position === index ? { ...entry, type } : entry)),
-                            }));
-                          }}
-                        >
-                          <SelectTrigger aria-label={`P${index + 1} 타입`} className="w-full">
-                            <SelectValue />
-                          </SelectTrigger>
-                          <SelectContent>
-                            {SLOT_TYPE_OPTIONS.map((entry) => (
-                              <SelectItem key={entry.value} value={entry.value}>{entry.label}</SelectItem>
-                            ))}
-                          </SelectContent>
-                        </Select>
-                      </td>
-                      <td className="py-2 pr-3">
-                        <Select
-                          value={player.race}
-                          disabled={busy}
-                          onValueChange={(value) => {
-                            const race = value as Race;
-                            setForm((current) => ({
-                              ...current,
-                              players: current.players.map((entry, position) => (position === index ? { ...entry, race } : entry)),
-                            }));
-                          }}
-                        >
-                          <SelectTrigger aria-label={`P${index + 1} 종족`} className="w-full">
-                            <SelectValue />
-                          </SelectTrigger>
-                          <SelectContent>
-                            {RACE_OPTIONS.map((entry) => (
-                              <SelectItem key={entry.value} value={entry.value}>{entry.label}</SelectItem>
-                            ))}
-                          </SelectContent>
-                        </Select>
-                      </td>
-                      <td className="py-2">
-                        <Select
-                          value={String(player.force)}
-                          disabled={busy}
-                          onValueChange={(value) => setPlayerForce(index, Number(value))}
-                        >
-                          <SelectTrigger aria-label={`P${index + 1} 포스`} className="w-full">
-                            <SelectValue />
-                          </SelectTrigger>
-                          <SelectContent>
-                            {form.forces.map((force, forceIndex) => (
-                              <SelectItem key={forceIndex} value={String(forceIndex)}>{forceLabel(force, forceIndex)}</SelectItem>
-                            ))}
-                          </SelectContent>
-                        </Select>
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-              <div className="grid gap-2">
-                <div className="flex flex-wrap items-end justify-between gap-3">
-                  <div className="grid gap-1.5">
-                    <label htmlFor={`${idPrefix}-force-count`} className="text-sm font-medium">포스 수</label>
-                    <Select
-                      value={String(form.forces.length)}
-                      disabled={busy}
-                      onValueChange={(value) => setForceCount(Number(value))}
-                    >
-                      <SelectTrigger id={`${idPrefix}-force-count`} className="w-full sm:w-40">
-                        <SelectValue />
-                      </SelectTrigger>
-                      <SelectContent>
-                        {Array.from({ length: MAX_FORCES }, (_, index) => index + 1).map((count) => (
-                          <SelectItem key={count} value={String(count)}>{count}개</SelectItem>
-                        ))}
-                      </SelectContent>
-                    </Select>
-                  </div>
-                  <div className="flex flex-wrap gap-2" role="group" aria-label="포스 빠른 구성">
-                    {FORCE_LAYOUT_OPTIONS.map((entry) => (
-                      <Button
-                        key={entry.value}
-                        type="button"
-                        variant="outline"
-                        size="sm"
-                        disabled={busy || !forceLayoutAvailable(entry.value, form.players.length)}
-                        title={entry.hint}
-                        onClick={() => setLayout(entry.value)}
-                      >
-                        {entry.label}
-                      </Button>
-                    ))}
-                  </div>
-                </div>
-                <p className="break-keep text-xs leading-5 text-muted-foreground">
-                  각 플레이어의 포스는 위 표에서 바꿉니다. 빠른 구성은 모든 플레이어의 포스를 한 번에 다시 배정합니다.
-                </p>
-              </div>
-              <div className="grid gap-3">
-                {form.forces.map((force, index) => {
-                  const members = forceMembers(form, index);
-                  return (
-                  <div key={index} className="grid gap-2 rounded-lg border border-border p-3">
-                    <div className="grid gap-1.5">
-                      <label htmlFor={`${idPrefix}-force-${index}`} className="text-xs font-medium text-muted-foreground">포스 {index + 1} 이름</label>
-                      <Input
-                        id={`${idPrefix}-force-${index}`}
-                        value={force.name}
-                        disabled={busy}
-                        maxLength={64}
-                        onChange={(event) => {
-                          const name = event.target.value;
-                          setForm((current) => ({
-                            ...current,
-                            forces: current.forces.map((entry, position) => (position === index ? { ...entry, name } : entry)),
-                          }));
-                        }}
-                      />
-                    </div>
-                    <p className="text-xs text-muted-foreground" aria-label={`포스 ${index + 1} 구성원`}>
-                      {members.length === 0
-                        ? "구성원 없음"
-                        : `${members.map((member) => `P${member + 1}`).join(", ")} · ${members.length}명`}
-                    </p>
-                    <div className="flex flex-wrap gap-x-5 gap-y-2 text-sm">
-                      {(
-                        [
-                          ["allied", "동맹"],
-                          ["alliedVictory", "동맹 승리"],
-                          ["sharedVision", "시야 공유"],
-                          ["randomStart", "시작 위치 무작위"],
-                        ] as const
-                      ).map(([key, label]) => (
-                        <label key={key} className="flex items-center gap-2">
-                          <Checkbox
-                            checked={force[key]}
-                            disabled={busy}
-                            aria-label={`포스 ${index + 1} ${label}`}
-                            onCheckedChange={(checked) => {
-                              const value = checked === true;
-                              setForm((current) => ({
-                                ...current,
-                                forces: current.forces.map((entry, position) => (position === index ? { ...entry, [key]: value } : entry)),
-                              }));
-                            }}
-                          />
-                          {label}
-                        </label>
-                      ))}
-                    </div>
-                  </div>
-                  );
-                })}
-              </div>
+              <p className="break-keep text-xs leading-5 text-muted-foreground">
+                CHK 슬롯 12개를 모두 설정합니다. 포스와 시작 위치는 P1~P8에만 적용됩니다.
+              </p>
+              <PlayerSlotsEditor players={form.players} forces={form.forces} disabled={busy} onPlayerChange={setPlayer} />
+              <ForcesEditor
+                forces={form.forces}
+                players={form.players}
+                disabled={busy}
+                onForceChange={setForce}
+                onLayout={setLayout}
+              />
               <label className="flex items-start gap-3 rounded-lg border border-border p-3 text-sm">
                 <Checkbox
                   checked={form.autoStart}

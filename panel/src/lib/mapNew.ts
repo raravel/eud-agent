@@ -1,13 +1,48 @@
 import { invoke as tauriInvoke } from "@tauri-apps/api/core";
 
 import type { InvokeFn } from "@/lib/ipc";
+import {
+  defaultForces,
+  defaultPlayers,
+  forceLabel,
+  MAX_FORCES,
+  MAX_PLAYERS,
+  slotNeedsStart,
+  TOTAL_SLOTS,
+  type ForceForm,
+  type PlayerForm,
+  type Race,
+  type SlotType,
+} from "@/lib/mapSlots";
 import { isServerMessage, type SetupMessage } from "@/lib/protocol";
+
+export {
+  applyForceLayout,
+  defaultForce,
+  defaultForces,
+  defaultPlayer,
+  defaultPlayers,
+  FORCE_LAYOUT_OPTIONS,
+  forceAssignment,
+  forceLabel,
+  forceLayoutAvailable,
+  forceMembers,
+  layoutSlots,
+  MAX_FORCES,
+  MAX_PLAYERS,
+  RACE_OPTIONS,
+  SLOT_TYPE_OPTIONS,
+  slotNeedsStart,
+  TOTAL_SLOTS,
+  withForcePatch,
+  withPlayerForce,
+  withPlayerPatch,
+} from "@/lib/mapSlots";
+export type { ForceForm, ForceLayout, PlayerForm, PlayerPatch, Race, SlotType } from "@/lib/mapSlots";
 
 // ---- wire types (mirror src-tauri/src/blank_project.rs + crates/isom MapNewSpec) ----
 
 export type MapVersion = "remastered" | "broodWar";
-export type SlotType = "human" | "computer" | "rescuable" | "neutral" | "inactive" | "closed";
-export type Race = "zerg" | "terran" | "protoss" | "userSelectable" | "random";
 
 export interface MapNewStart {
   readonly x: number;
@@ -18,7 +53,9 @@ export interface MapNewPlayer {
   readonly slot: number;
   readonly type: SlotType;
   readonly race: Race;
-  readonly force: number;
+  /** 0..3; present only for slots 0..7 (FORC has eight entries). */
+  readonly force?: number;
+  /** Only slots 0..7 may hold a start location. */
   readonly start?: MapNewStart;
 }
 
@@ -94,8 +131,6 @@ export interface BlankProjectResult {
 
 export const MAP_SIZE_MIN = 64;
 export const MAP_SIZE_MAX = 256;
-export const MAX_PLAYERS = 8;
-export const MAX_FORCES = 4;
 /** Tiles kept clear between the map edge and an auto-placed start location. */
 export const START_MARGIN_TILES = 4;
 /** Start location footprint is 4x3 tiles; the CHK stores its centre in pixels. */
@@ -105,34 +140,9 @@ const TILE_PX = 32;
 /** Auto-placed start locations are packed four per row in the top-left corner. */
 const START_CLUSTER_COLUMNS = 4;
 
-export const SLOT_TYPE_OPTIONS: readonly { value: SlotType; label: string }[] = [
-  { value: "human", label: "사람" },
-  { value: "computer", label: "컴퓨터" },
-  { value: "rescuable", label: "구출 가능" },
-  { value: "neutral", label: "중립" },
-  { value: "closed", label: "닫힘" },
-];
-
-export const RACE_OPTIONS: readonly { value: Race; label: string }[] = [
-  { value: "userSelectable", label: "선택 가능" },
-  { value: "terran", label: "테란" },
-  { value: "zerg", label: "저그" },
-  { value: "protoss", label: "프로토스" },
-  { value: "random", label: "랜덤" },
-];
-
 export const VERSION_OPTIONS: readonly { value: MapVersion; label: string; hint: string }[] = [
   { value: "remastered", label: "리마스터 (.scx)", hint: "StarCraft: Remastered 기본 형식" },
-  { value: "broodWar", label: "브루드 워 (.scx)", hint: "VER 205 형식 · 문자열은 SC:R 기준 UTF-8" },
-];
-
-export type ForceLayout = "single" | "individual" | "teams";
-
-/** Quick presets that rewrite every player's force; the result stays freely editable. */
-export const FORCE_LAYOUT_OPTIONS: readonly { value: ForceLayout; label: string; hint: string }[] = [
-  { value: "single", label: "모두 한 포스", hint: "전원이 포스 1에 속합니다" },
-  { value: "individual", label: "각자 개별 포스", hint: "플레이어마다 포스 하나 (최대 4명)" },
-  { value: "teams", label: "2팀으로 나누기", hint: "앞 절반은 포스 1, 뒤 절반은 포스 2" },
+  { value: "broodWar", label: "브루드 워 (.scx)", hint: "VER 205 형식 · 문자열 테이블 텍스트는 SCMDraft 2가 읽도록 CP949로 저장" },
 ];
 
 // ---- pure helpers ----
@@ -154,40 +164,6 @@ export function startLocationPreset(width: number, height: number, count: number
   }));
 }
 
-export function forceLayoutAvailable(layout: ForceLayout, playerCount: number): boolean {
-  if (layout === "individual") return playerCount <= MAX_FORCES;
-  if (layout === "teams") return playerCount >= 2;
-  return true;
-}
-
-/** Force index per player position (0-based) for a layout. */
-export function forceAssignment(layout: ForceLayout, playerCount: number): number[] {
-  const count = Math.max(0, Math.min(playerCount, MAX_PLAYERS));
-  if (layout === "individual" && count <= MAX_FORCES) {
-    return Array.from({ length: count }, (_, index) => index);
-  }
-  if (layout === "teams" && count >= 2) {
-    const firstTeam = Math.ceil(count / 2);
-    return Array.from({ length: count }, (_, index) => (index < firstTeam ? 0 : 1));
-  }
-  return Array.from({ length: count }, () => 0);
-}
-
-export interface PlayerForm {
-  readonly type: SlotType;
-  readonly race: Race;
-  /** 0-based index into `WizardForm.forces`. */
-  readonly force: number;
-}
-
-export interface ForceForm {
-  readonly name: string;
-  readonly allied: boolean;
-  readonly alliedVictory: boolean;
-  readonly sharedVision: boolean;
-  readonly randomStart: boolean;
-}
-
 export interface WizardForm {
   readonly name: string;
   readonly title: string;
@@ -197,24 +173,11 @@ export interface WizardForm {
   readonly width: number;
   readonly height: number;
   readonly terrainType: number;
+  /** Always all 12 CHK slots; P1..P8 index `forces`, P9..P12 keep force 0. */
   readonly players: readonly PlayerForm[];
-  /** 1..4 forces; every player's `force` indexes this list. */
+  /** Always the four CHK forces. */
   readonly forces: readonly ForceForm[];
   readonly autoStart: boolean;
-}
-
-export function defaultForce(index: number): ForceForm {
-  return {
-    name: `포스 ${index + 1}`,
-    allied: true,
-    alliedVictory: true,
-    sharedVision: false,
-    randomStart: false,
-  };
-}
-
-export function defaultPlayer(force = 0): PlayerForm {
-  return { type: "human", race: "userSelectable", force };
 }
 
 export function defaultWizardForm(): WizardForm {
@@ -227,60 +190,10 @@ export function defaultWizardForm(): WizardForm {
     width: 128,
     height: 128,
     terrainType: 0,
-    players: [defaultPlayer(), defaultPlayer()],
-    forces: [defaultForce(0)],
+    players: defaultPlayers(),
+    forces: defaultForces(),
     autoStart: true,
   };
-}
-
-/**
- * Resize the force list to `count` (1..4), keeping edited forces. Players that pointed at a
- * removed force move to the last remaining one so every slot still names a declared force.
- */
-export function withForceCount(form: WizardForm, count: number): WizardForm {
-  const needed = Math.max(1, Math.min(MAX_FORCES, Math.trunc(count)));
-  const forces = Array.from({ length: needed }, (_, index) => form.forces[index] ?? defaultForce(index));
-  const players = form.players.map((player) => (player.force < needed ? player : { ...player, force: needed - 1 }));
-  return { ...form, forces, players };
-}
-
-/** Resize the player list, adding new slots to force 1 and keeping existing assignments. */
-export function withPlayerCount(form: WizardForm, count: number): WizardForm {
-  const needed = Math.max(1, Math.min(MAX_PLAYERS, Math.trunc(count)));
-  const players = Array.from({ length: needed }, (_, index) => form.players[index] ?? defaultPlayer());
-  return { ...form, players };
-}
-
-/** Assign one player to a declared force. Out-of-range targets leave the form unchanged. */
-export function withPlayerForce(form: WizardForm, playerIndex: number, force: number): WizardForm {
-  if (!Number.isInteger(force) || force < 0 || force >= form.forces.length) return form;
-  return {
-    ...form,
-    players: form.players.map((player, index) => (index === playerIndex ? { ...player, force } : player)),
-  };
-}
-
-/** Apply a quick preset: grows the force list as needed and rewrites every player's force. */
-export function applyForceLayout(form: WizardForm, layout: ForceLayout): WizardForm {
-  if (!forceLayoutAvailable(layout, form.players.length)) return form;
-  const assignment = forceAssignment(layout, form.players.length);
-  const needed = assignment.length === 0 ? 1 : Math.max(...assignment) + 1;
-  const grown = withForceCount(form, Math.max(needed, form.forces.length));
-  return {
-    ...grown,
-    players: grown.players.map((player, index) => ({ ...player, force: assignment[index] ?? 0 })),
-  };
-}
-
-/** 0-based player indexes currently assigned to `force`. */
-export function forceMembers(form: WizardForm, force: number): number[] {
-  return form.players.flatMap((player, index) => (player.force === force ? [index] : []));
-}
-
-/** Display label for a force: its trimmed name, or the positional fallback when blank. */
-export function forceLabel(force: ForceForm, index: number): string {
-  const name = force.name.trim();
-  return name === "" ? `포스 ${index + 1}` : name;
 }
 
 export function validateProjectName(name: string): string | null {
@@ -304,14 +217,12 @@ export function validateSize(value: number, min = MAP_SIZE_MIN, max = MAP_SIZE_M
   return null;
 }
 
-/** Slot types that actually play and therefore receive a start location. */
-export function slotNeedsStart(type: SlotType): boolean {
-  return type === "human" || type === "computer" || type === "rescuable";
-}
-
 /** Build the strict engine spec from the wizard form. */
 export function buildMapNewSpec(form: WizardForm): MapNewSpec {
-  const startCount = form.autoStart ? form.players.filter((player) => slotNeedsStart(player.type)).length : 0;
+  const players12 = form.players.slice(0, TOTAL_SLOTS);
+  const startsAt = (index: number, player: PlayerForm) =>
+    form.autoStart && index < MAX_PLAYERS && slotNeedsStart(player.type);
+  const startCount = players12.filter((player, index) => startsAt(index, player)).length;
   const preset = startLocationPreset(form.width, form.height, startCount);
   let nextStart = 0;
   const forces = form.forces.slice(0, MAX_FORCES).map((force, index) => ({
@@ -321,15 +232,11 @@ export function buildMapNewSpec(form: WizardForm): MapNewSpec {
     sharedVision: force.sharedVision,
     randomStart: force.randomStart,
   }));
-  const players = form.players.map((player, index) => {
-    const start = form.autoStart && slotNeedsStart(player.type) ? preset[nextStart++] : undefined;
-    const base: MapNewPlayer = {
-      slot: index,
-      type: player.type,
-      race: player.race,
-      force: Math.max(0, Math.min(player.force, forces.length - 1)),
-    };
-    return start === undefined ? base : { ...base, start };
+  const players = players12.map((player, index): MapNewPlayer => {
+    const base: MapNewPlayer = { slot: index, type: player.type, race: player.race };
+    if (index >= MAX_PLAYERS) return base;
+    const withForce = { ...base, force: Math.max(0, Math.min(player.force, forces.length - 1)) };
+    return startsAt(index, player) ? { ...withForce, start: preset[nextStart++] } : withForce;
   });
   const name = form.name.trim();
   const title = form.title.trim() === "" ? name : form.title.trim();

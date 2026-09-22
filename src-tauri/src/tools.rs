@@ -5,7 +5,6 @@
 
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine;
-use encoding_rs::EUC_KR;
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -2826,14 +2825,7 @@ pub fn encode_locedit_ops(op: &LocWrite, name_bytes: &[u8]) -> Vec<u8> {
 }
 
 pub fn encode_location_name(name: &str, chk: &[u8]) -> Vec<u8> {
-    if name.is_ascii() {
-        return name.as_bytes().to_vec();
-    }
-    if chk.windows(4).any(|window| window == b"STRx") {
-        return name.as_bytes().to_vec();
-    }
-
-    EUC_KR.encode(name).0.into_owned()
+    crate::chk::encode_chk_text(name, chk.windows(4).any(|window| window == b"STRx"))
 }
 
 /// Parsed `player_setup` operation. Players are 1-based P1..P8 until encoded.
@@ -5340,24 +5332,32 @@ mod tests {
                 width: 64,
                 height: 128,
                 tileset: "jungle".to_string(),
+                title: String::new(),
+                description: String::new(),
             },
             players: vec![
                 crate::chk::Player {
                     player: "P1".to_string(),
                     controller: "Occupied by Human".to_string(),
+                    controller_id: 2,
                     race: "Terran".to_string(),
+                    race_id: 1,
                     force: Some(1),
                 },
                 crate::chk::Player {
                     player: "P2".to_string(),
                     controller: "Computer".to_string(),
+                    controller_id: 5,
                     race: "Protoss".to_string(),
+                    race_id: 2,
                     force: Some(1),
                 },
                 crate::chk::Player {
                     player: "P3".to_string(),
                     controller: "Inactive".to_string(),
+                    controller_id: 0,
                     race: "Zerg".to_string(),
+                    race_id: 0,
                     force: Some(2),
                 },
             ],

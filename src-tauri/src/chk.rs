@@ -23,6 +23,10 @@ pub const _START_LOCATION_TYPE: u16 = 214;
 pub const MAP_AGENT_MUTABLE_SECTIONS: &[&str] = &[
     "MTXM", "TILE", "ISOM", "UNIT", "DD2 ", "THG2", "MRGN", "STR ", "STRx",
 ];
+/// Scenario-property sections (title/description, slot owners, races, forces).
+/// They change only through an explicit map-properties request; ordinary Map
+/// Agent requests treat them as fixed authority like every other section.
+pub const MAP_PROPERTY_SECTIONS: &[&str] = &["SPRP", "OWNR", "IOWN", "SIDE", "FORC"];
 
 pub const _OWNR_NAMES: &[&str] = &[
     "Inactive",
@@ -322,13 +326,22 @@ pub struct MapHeader {
     pub width: u16,
     pub height: u16,
     pub tileset: String,
+    /// SPRP scenario name, decoded like every other CHK string.
+    pub title: String,
+    /// SPRP scenario description.
+    pub description: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Player {
     pub player: String,
     pub controller: String,
+    /// Raw OWNR byte (`Sc::Player::SlotType`), for editors that need the id.
+    pub controller_id: u8,
     pub race: String,
+    /// Raw SIDE byte (`Chk::Race`).
+    pub race_id: u8,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub force: Option<u8>,
 }
@@ -781,7 +794,9 @@ pub fn parse_players(
             Player {
                 player: format!("P{}", slot + 1),
                 controller: lookup_controller_name(controller_id),
+                controller_id,
                 race: lookup_race_name(race_id),
+                race_id,
                 force: if slot < 8 {
                     Some(force_of_slot[slot] + 1)
                 } else {
@@ -824,7 +839,7 @@ pub fn parse_players(
     (players, forces)
 }
 
-pub fn parse_map_header(dim: &[u8], era: &[u8]) -> MapHeader {
+pub fn parse_map_header(dim: &[u8], era: &[u8], sprp: &[u8], strings: &[String]) -> MapHeader {
     let (width, height) = if dim.len() >= 4 {
         (read_u16_le(dim, 0), read_u16_le(dim, 2))
     } else {
@@ -841,11 +856,43 @@ pub fn parse_map_header(dim: &[u8], era: &[u8]) -> MapHeader {
         String::new()
     };
 
+    // SPRP: two u16 string ids (scenario name, description); 0 means unset.
+    let (title, description) = if sprp.len() >= 4 {
+        (
+            _string_at(strings, u32::from(read_u16_le(sprp, 0))),
+            _string_at(strings, u32::from(read_u16_le(sprp, 2))),
+        )
+    } else {
+        (String::new(), String::new())
+    };
+
     MapHeader {
         width,
         height,
         tileset,
+        title,
+        description,
     }
+}
+
+/// Encode text for a CHK string table with the same rule every app writer uses:
+/// ASCII is written as-is, a map that already carries `STRx` is UTF-8 (SC:R),
+/// and a legacy `STR ` map is CP949 so SCMDraft 2 and the system code page read
+/// it; text CP949 cannot represent falls back to UTF-8, which SC:R still shows.
+pub fn encode_chk_text(text: &str, has_strx: bool) -> Vec<u8> {
+    if text.is_ascii() || has_strx {
+        return text.as_bytes().to_vec();
+    }
+    let (encoded, _, had_errors) = EUC_KR.encode(text);
+    if had_errors {
+        return text.as_bytes().to_vec();
+    }
+    encoded.into_owned()
+}
+
+/// Whether an extracted CHK carries the SC:R extended string table.
+pub fn chk_has_strx(chk: &[u8]) -> bool {
+    assemble_sections(&walk_sections(chk)).contains_key("STRx")
 }
 
 pub fn parse_tiles(mtxm: &[u8], width: u16, height: u16) -> Vec<u16> {
@@ -938,6 +985,8 @@ pub fn digest_chk(data: &[u8]) -> Digest {
     let map = parse_map_header(
         sections.get("DIM ").unwrap_or(&empty),
         sections.get("ERA ").unwrap_or(&empty),
+        sections.get("SPRP").unwrap_or(&empty),
+        &strings,
     );
     let (players, forces) = parse_players(
         sections.get("OWNR").unwrap_or(&empty),
@@ -1484,73 +1533,97 @@ mod tests {
                 Player {
                     player: "P1".to_string(),
                     controller: "Occupied by Human".to_string(),
+                    controller_id: 2,
                     race: "Zerg".to_string(),
+                    race_id: 0,
                     force: Some(1),
                 },
                 Player {
                     player: "P2".to_string(),
                     controller: "Computer".to_string(),
+                    controller_id: 5,
                     race: "Terran".to_string(),
+                    race_id: 1,
                     force: Some(1),
                 },
                 Player {
                     player: "P3".to_string(),
                     controller: "Inactive".to_string(),
+                    controller_id: 0,
                     race: "Protoss".to_string(),
+                    race_id: 2,
                     force: Some(2),
                 },
                 Player {
                     player: "P4".to_string(),
                     controller: "Human (Open Slot)".to_string(),
+                    controller_id: 6,
                     race: "Random".to_string(),
+                    race_id: 6,
                     force: Some(2),
                 },
                 Player {
                     player: "P5".to_string(),
                     controller: "Rescue Passive".to_string(),
+                    controller_id: 3,
                     race: "Inactive".to_string(),
+                    race_id: 7,
                     force: Some(3),
                 },
                 Player {
                     player: "P6".to_string(),
                     controller: "Neutral".to_string(),
+                    controller_id: 7,
                     race: "Independent".to_string(),
+                    race_id: 3,
                     force: Some(3),
                 },
                 Player {
                     player: "P7".to_string(),
                     controller: "Occupied by Human".to_string(),
+                    controller_id: 2,
                     race: "Neutral".to_string(),
+                    race_id: 4,
                     force: Some(1),
                 },
                 Player {
                     player: "P8".to_string(),
                     controller: "Inactive".to_string(),
+                    controller_id: 0,
                     race: "User Selectable".to_string(),
+                    race_id: 5,
                     force: Some(1),
                 },
                 Player {
                     player: "P9".to_string(),
                     controller: "Occupied by Human".to_string(),
+                    controller_id: 2,
                     race: "Terran".to_string(),
+                    race_id: 1,
                     force: None,
                 },
                 Player {
                     player: "P10".to_string(),
                     controller: "Computer".to_string(),
+                    controller_id: 5,
                     race: "Protoss".to_string(),
+                    race_id: 2,
                     force: None,
                 },
                 Player {
                     player: "P11".to_string(),
                     controller: "Human (Open Slot)".to_string(),
+                    controller_id: 6,
                     race: "Zerg".to_string(),
+                    race_id: 0,
                     force: None,
                 },
                 Player {
                     player: "P12".to_string(),
                     controller: "Inactive".to_string(),
+                    controller_id: 0,
                     race: "Inactive".to_string(),
+                    race_id: 7,
                     force: None,
                 },
             ]
@@ -1662,20 +1735,20 @@ mod tests {
         assert_eq!(
             value,
             json!({
-                "map": {"width": 64, "height": 128, "tileset": "jungle"},
+                "map": {"width": 64, "height": 128, "tileset": "jungle", "title": "", "description": ""},
                 "players": [
-                    {"player": "P1", "controller": "Occupied by Human", "race": "Terran", "force": 1},
-                    {"player": "P2", "controller": "Computer", "race": "Protoss", "force": 1},
-                    {"player": "P3", "controller": "Inactive", "race": "Inactive", "force": 2},
-                    {"player": "P4", "controller": "Inactive", "race": "Inactive", "force": 2},
-                    {"player": "P5", "controller": "Inactive", "race": "Inactive", "force": 3},
-                    {"player": "P6", "controller": "Inactive", "race": "Inactive", "force": 3},
-                    {"player": "P7", "controller": "Inactive", "race": "Inactive", "force": 4},
-                    {"player": "P8", "controller": "Inactive", "race": "Inactive", "force": 4},
-                    {"player": "P9", "controller": "Inactive", "race": "Inactive"},
-                    {"player": "P10", "controller": "Inactive", "race": "Inactive"},
-                    {"player": "P11", "controller": "Inactive", "race": "Inactive"},
-                    {"player": "P12", "controller": "Inactive", "race": "Inactive"}
+                    {"player": "P1", "controller": "Occupied by Human", "controllerId": 2, "race": "Terran", "raceId": 1, "force": 1},
+                    {"player": "P2", "controller": "Computer", "controllerId": 5, "race": "Protoss", "raceId": 2, "force": 1},
+                    {"player": "P3", "controller": "Inactive", "controllerId": 0, "race": "Inactive", "raceId": 7, "force": 2},
+                    {"player": "P4", "controller": "Inactive", "controllerId": 0, "race": "Inactive", "raceId": 7, "force": 2},
+                    {"player": "P5", "controller": "Inactive", "controllerId": 0, "race": "Inactive", "raceId": 7, "force": 3},
+                    {"player": "P6", "controller": "Inactive", "controllerId": 0, "race": "Inactive", "raceId": 7, "force": 3},
+                    {"player": "P7", "controller": "Inactive", "controllerId": 0, "race": "Inactive", "raceId": 7, "force": 4},
+                    {"player": "P8", "controller": "Inactive", "controllerId": 0, "race": "Inactive", "raceId": 7, "force": 4},
+                    {"player": "P9", "controller": "Inactive", "controllerId": 0, "race": "Inactive", "raceId": 7},
+                    {"player": "P10", "controller": "Inactive", "controllerId": 0, "race": "Inactive", "raceId": 7},
+                    {"player": "P11", "controller": "Inactive", "controllerId": 0, "race": "Inactive", "raceId": 7},
+                    {"player": "P12", "controller": "Inactive", "controllerId": 0, "race": "Inactive", "raceId": 7}
                 ],
                 "forces": [
                     {

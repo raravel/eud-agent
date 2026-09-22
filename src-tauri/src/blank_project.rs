@@ -36,7 +36,55 @@ pub struct BlankProjectRequest {
     pub destination: String,
     /// Project name; also the map file stem and the default scenario title.
     pub name: String,
-    pub spec: isom::MapNewSpec,
+    pub spec: BlankMapSpec,
+}
+
+/// Slot types that occupy a lobby seat; the preview reports how many the spec
+/// declares. Neutral/inactive/closed slots exist in the CHK but are not players.
+const PLAYABLE_SLOT_TYPES: [&str; 3] = ["human", "computer", "rescuable"];
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct BlankMapPlayer {
+    /// CHK slot 0..11.
+    pub slot: u8,
+    /// `human`, `computer`, `rescuable`, `neutral`, `inactive`, or `closed`.
+    pub r#type: String,
+    /// `zerg`, `terran`, `protoss`, `userSelectable`, `random`, `independent`,
+    /// `neutral`, or `inactive`.
+    pub race: String,
+    /// Index into `forces`; required for slots 0..7, absent for 8..11.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub force: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start: Option<isom::MapNewStart>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct BlankMapForce {
+    pub name: String,
+    pub allied: bool,
+    pub allied_victory: bool,
+    pub shared_vision: bool,
+    pub random_start: bool,
+}
+
+/// Panel-facing blank-map spec: the wizard sends plain strings and this module
+/// encodes them for the new map's legacy `STR ` table before the engine call.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct BlankMapSpec {
+    /// `remastered` or `broodWar`.
+    pub version: String,
+    pub tileset: u8,
+    pub width: u16,
+    pub height: u16,
+    pub terrain_type: u16,
+    pub title: String,
+    pub description: String,
+    pub players: Vec<BlankMapPlayer>,
+    pub forces: Vec<BlankMapForce>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -159,9 +207,20 @@ pub fn blank_manifest(name: &str) -> Result<crate::native_project::ProjectManife
     })
 }
 
+/// A new map has no `STRx`, so every text field is stored the legacy way
+/// (ASCII as-is, otherwise CP949 with a UTF-8 fallback).
+fn map_text_bytes(text: &str) -> Vec<u8> {
+    crate::chk::encode_chk_text(text, false)
+}
+
+fn hex_bytes(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
 /// Reject a spec before any native call so the wizard gets an actionable
-/// message instead of an engine status code.
-pub fn validate_spec(spec: &isom::MapNewSpec) -> Result<(), String> {
+/// message instead of an engine status code. Byte limits are measured on the
+/// encoded bytes the map will actually store.
+pub fn validate_spec(spec: &BlankMapSpec) -> Result<(), String> {
     if !(MAP_SIZE_MIN..=MAP_SIZE_MAX).contains(&spec.width)
         || !(MAP_SIZE_MIN..=MAP_SIZE_MAX).contains(&spec.height)
     {
@@ -178,33 +237,43 @@ pub fn validate_spec(spec: &isom::MapNewSpec) -> Result<(), String> {
     if !matches!(spec.version.as_str(), "remastered" | "broodWar") {
         return Err("맵 버전은 remastered 또는 broodWar여야 합니다.".to_string());
     }
-    if spec.title.trim().is_empty() || spec.title.len() > 1024 {
+    if spec.title.trim().is_empty() || map_text_bytes(&spec.title).len() > 1024 {
         return Err("맵 제목은 1자 이상 1024바이트 이하여야 합니다.".to_string());
     }
-    if spec.description.len() > 4096 {
+    if map_text_bytes(&spec.description).len() > 4096 {
         return Err("맵 설명은 4096바이트 이하여야 합니다.".to_string());
     }
     if spec.forces.is_empty() || spec.forces.len() > 4 {
         return Err("포스는 1~4개여야 합니다.".to_string());
     }
     for force in &spec.forces {
-        if force.name.trim().is_empty() || force.name.len() > 256 {
+        if force.name.trim().is_empty() || map_text_bytes(&force.name).len() > 256 {
             return Err("포스 이름은 1자 이상 256바이트 이하여야 합니다.".to_string());
         }
     }
-    if spec.players.len() > 8 {
-        return Err("플레이어는 최대 8명입니다.".to_string());
+    if spec.players.len() > 12 {
+        return Err("플레이어 슬롯은 최대 12개입니다.".to_string());
     }
     let mut slots = std::collections::BTreeSet::new();
     for player in &spec.players {
-        if player.slot > 7 {
-            return Err("플레이어 슬롯은 1~8 사이여야 합니다.".to_string());
+        if player.slot > 11 {
+            return Err("플레이어 슬롯은 1~12 사이여야 합니다.".to_string());
         }
         if !slots.insert(player.slot) {
             return Err("같은 플레이어 슬롯이 두 번 지정되었습니다.".to_string());
         }
-        if usize::from(player.force) >= spec.forces.len() {
-            return Err("플레이어가 존재하지 않는 포스를 가리킵니다.".to_string());
+        // FORC covers only P1..P8; P9..P12 have no force storage.
+        match (player.slot < 8, player.force) {
+            (true, None) => {
+                return Err("플레이어 1~8은 포스를 지정해야 합니다.".to_string());
+            }
+            (true, Some(force)) if usize::from(force) >= spec.forces.len() => {
+                return Err("플레이어가 존재하지 않는 포스를 가리킵니다.".to_string());
+            }
+            (false, Some(_)) => {
+                return Err("플레이어 9~12에는 포스를 지정할 수 없습니다.".to_string());
+            }
+            _ => {}
         }
         if !matches!(
             player.r#type.as_str(),
@@ -214,11 +283,21 @@ pub fn validate_spec(spec: &isom::MapNewSpec) -> Result<(), String> {
         }
         if !matches!(
             player.race.as_str(),
-            "zerg" | "terran" | "protoss" | "userSelectable" | "random"
+            "zerg"
+                | "terran"
+                | "protoss"
+                | "userSelectable"
+                | "random"
+                | "independent"
+                | "neutral"
+                | "inactive"
         ) {
             return Err("지원하지 않는 종족입니다.".to_string());
         }
         if let Some(start) = &player.start {
+            if player.slot >= 8 {
+                return Err("시작 위치는 플레이어 1~8에만 둘 수 있습니다.".to_string());
+            }
             if u32::from(start.x) >= u32::from(spec.width) * 32
                 || u32::from(start.y) >= u32::from(spec.height) * 32
             {
@@ -227,6 +306,49 @@ pub fn validate_spec(spec: &isom::MapNewSpec) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// Encode the panel spec into the exact `eud-map-new/1` request.
+pub fn map_new_spec(spec: &BlankMapSpec) -> isom::MapNewSpec {
+    isom::MapNewSpec {
+        version: spec.version.clone(),
+        tileset: spec.tileset,
+        width: spec.width,
+        height: spec.height,
+        terrain_type: spec.terrain_type,
+        title_bytes_hex: hex_bytes(&map_text_bytes(&spec.title)),
+        description_bytes_hex: hex_bytes(&map_text_bytes(&spec.description)),
+        players: spec
+            .players
+            .iter()
+            .map(|player| isom::MapNewPlayer {
+                slot: player.slot,
+                r#type: player.r#type.clone(),
+                race: player.race.clone(),
+                force: player.force,
+                start: player.start.clone(),
+            })
+            .collect(),
+        forces: spec
+            .forces
+            .iter()
+            .map(|force| isom::MapNewForce {
+                name_bytes_hex: hex_bytes(&map_text_bytes(&force.name)),
+                allied: force.allied,
+                allied_victory: force.allied_victory,
+                shared_vision: force.shared_vision,
+                random_start: force.random_start,
+            })
+            .collect(),
+    }
+}
+
+/// Number of lobby seats (human/computer/rescuable) the spec declares.
+pub fn playable_slots(spec: &BlankMapSpec) -> usize {
+    spec.players
+        .iter()
+        .filter(|player| PLAYABLE_SLOT_TYPES.contains(&player.r#type.as_str()))
+        .count()
 }
 
 /// Read the brush list for one tileset from the native catalog.
@@ -270,7 +392,7 @@ pub fn tileset_brushes(starcraft: &Path, tileset: u8) -> Result<Vec<BrushOption>
 /// Independent CHK re-read of the generated map against the spec.
 pub fn verify_created_map(
     map_path: &Path,
-    spec: &isom::MapNewSpec,
+    spec: &BlankMapSpec,
 ) -> Result<crate::chk::Digest, String> {
     let chk = isom::chk_extract(map_path)
         .map_err(|error| format!("생성된 맵의 CHK를 읽지 못했습니다: {error}"))?;
@@ -355,7 +477,7 @@ pub fn create_blank_project(
     if map_path.exists() {
         return Err("맵 파일이 이미 존재합니다.".to_string());
     }
-    isom::map_new(&map_path, starcraft, &request.spec)
+    isom::map_new(&map_path, starcraft, &map_new_spec(&request.spec))
         .map_err(|error| format!("맵을 생성하지 못했습니다: {error}"))?;
     let digest = verify_created_map(&map_path, &request.spec)?;
     let preview = render_preview_png(
@@ -371,7 +493,7 @@ pub fn create_blank_project(
         width: digest.map.width,
         height: digest.map.height,
         tileset: digest.map.tileset,
-        players: request.spec.players.len(),
+        players: playable_slots(&request.spec),
         start_locations: digest.start_locations.len(),
         preview_png: base64::engine::general_purpose::STANDARD.encode(preview),
     })
@@ -400,8 +522,8 @@ pub fn remove_generated_contents(destination: &Path) -> Result<(), String> {
 mod tests {
     use super::*;
 
-    fn spec() -> isom::MapNewSpec {
-        isom::MapNewSpec {
+    fn spec() -> BlankMapSpec {
+        BlankMapSpec {
             version: "remastered".to_string(),
             tileset: 4,
             width: 128,
@@ -409,15 +531,24 @@ mod tests {
             terrain_type: 3,
             title: "테스트".to_string(),
             description: String::new(),
-            players: vec![isom::MapNewPlayer {
-                slot: 0,
-                r#type: "human".to_string(),
-                race: "userSelectable".to_string(),
-                force: 0,
-                start: Some(isom::MapNewStart { x: 128, y: 128 }),
-            }],
-            forces: vec![isom::MapNewForce {
-                name: "Force 1".to_string(),
+            players: vec![
+                BlankMapPlayer {
+                    slot: 0,
+                    r#type: "human".to_string(),
+                    race: "userSelectable".to_string(),
+                    force: Some(0),
+                    start: Some(isom::MapNewStart { x: 128, y: 128 }),
+                },
+                BlankMapPlayer {
+                    slot: 11,
+                    r#type: "neutral".to_string(),
+                    race: "neutral".to_string(),
+                    force: None,
+                    start: None,
+                },
+            ],
+            forces: vec![BlankMapForce {
+                name: "공격".to_string(),
                 allied: true,
                 allied_victory: true,
                 shared_vision: false,
@@ -482,21 +613,62 @@ mod tests {
         dup.players.push(dup.players[0].clone());
         assert!(validate_spec(&dup).unwrap_err().contains("두 번"));
         let mut force_ref = spec();
-        force_ref.players[0].force = 1;
+        force_ref.players[0].force = Some(1);
         assert!(validate_spec(&force_ref).unwrap_err().contains("포스"));
+        let mut force_missing = spec();
+        force_missing.players[0].force = None;
+        assert!(validate_spec(&force_missing)
+            .unwrap_err()
+            .contains("포스를 지정해야"));
+        let mut force_high = spec();
+        force_high.players[1].force = Some(0);
+        assert!(validate_spec(&force_high)
+            .unwrap_err()
+            .contains("9~12에는 포스"));
         let mut outside = spec();
         outside.players[0].start = Some(isom::MapNewStart { x: 128 * 32, y: 0 });
         assert!(validate_spec(&outside).unwrap_err().contains("맵 밖"));
+        let mut high_start = spec();
+        high_start.players[1].start = Some(isom::MapNewStart { x: 0, y: 0 });
+        assert!(validate_spec(&high_start).unwrap_err().contains("1~8에만"));
         let mut race = spec();
         race.players[0].race = "xelnaga".to_string();
         assert!(validate_spec(&race).unwrap_err().contains("종족"));
-        let mut nine = spec();
-        for slot in 1..9 {
-            let mut player = nine.players[0].clone();
+        let mut slot = spec();
+        slot.players[1].slot = 12;
+        assert!(validate_spec(&slot).unwrap_err().contains("1~12"));
+        let mut thirteen = spec();
+        for slot in 1..12 {
+            let mut player = thirteen.players[0].clone();
             player.slot = slot;
-            nine.players.push(player);
+            player.force = (slot < 8).then_some(0);
+            player.start = None;
+            thirteen.players.push(player);
         }
-        assert!(validate_spec(&nine).unwrap_err().contains("최대 8명"));
+        assert!(validate_spec(&thirteen).unwrap_err().contains("최대 12개"));
+        // Limits apply to the CP949 bytes the map stores, not the UTF-8 length.
+        let mut long_force = spec();
+        long_force.forces[0].name = "가".repeat(129);
+        assert!(validate_spec(&long_force)
+            .unwrap_err()
+            .contains("256바이트"));
+        long_force.forces[0].name = "가".repeat(128);
+        validate_spec(&long_force).unwrap();
+    }
+
+    #[test]
+    fn map_new_spec_encodes_legacy_str_text_as_hex() {
+        let encoded = map_new_spec(&spec());
+        assert_eq!(encoded.title_bytes_hex, "c5d7bdbac6ae", "CP949 테스트");
+        assert_eq!(encoded.description_bytes_hex, "");
+        assert_eq!(encoded.forces[0].name_bytes_hex, "b0f8b0dd", "CP949 공격");
+        assert_eq!(encoded.players[0].force, Some(0));
+        assert_eq!(encoded.players[1].force, None);
+        assert_eq!(encoded.players[1].slot, 11);
+        let json = serde_json::to_value(&encoded).unwrap();
+        assert!(json["players"][1].get("force").is_none());
+        assert_eq!(json["forces"][0]["nameBytesHex"], "b0f8b0dd");
+        assert_eq!(playable_slots(&spec()), 1);
     }
 
     #[test]
