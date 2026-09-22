@@ -334,12 +334,17 @@ pub struct WorkspaceListResponse {
 }
 
 /// `workspace_read` command output.
+/// `workspace_read` command output. `content` is `None` when the file is
+/// listed but not viewable as text; `unreadable` then says why.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkspaceReadResponse {
     pub workspace_id: String,
     pub path: String,
-    pub content: String,
+    pub size: u64,
+    pub content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unreadable: Option<crate::workspace::ProjectFileUnreadable>,
 }
 
 /// `workspace_search` command output.
@@ -892,7 +897,7 @@ pub(crate) async fn wiki_save(
         .await
 }
 
-/// List the current project's accepted, project-local harness documents.
+/// List every file below the current project root for the panel's file tree.
 #[tauri::command]
 pub async fn workspace_list(
     state: tauri::State<'_, AppManaged>,
@@ -913,7 +918,8 @@ pub async fn workspace_list(
     .map_err(|error| error.to_string())?
 }
 
-/// Read one UTF-8 workspace file by opaque workspace id + confined relative path.
+/// Read one project file for the viewer by opaque workspace id + confined
+/// project-root-relative path.
 #[tauri::command]
 pub async fn workspace_read(
     state: tauri::State<'_, AppManaged>,
@@ -922,20 +928,22 @@ pub async fn workspace_read(
 ) -> Result<WorkspaceReadResponse, String> {
     let manager = crate::workspace::WorkspaceManager::new(state.dirs().clone());
     tauri::async_runtime::spawn_blocking(move || {
-        let content = manager
+        let file = manager
             .read_file(&workspace_id, &path)
             .map_err(|error| error.to_string())?;
         Ok(WorkspaceReadResponse {
             workspace_id,
             path,
-            content,
+            size: file.size,
+            content: file.content,
+            unreadable: file.unreadable,
         })
     })
     .await
     .map_err(|error| error.to_string())?
 }
 
-/// Search confined UTF-8 workspace files by path and content.
+/// Search project files by path, and viewable text files by content.
 #[tauri::command]
 pub async fn workspace_search(
     state: tauri::State<'_, AppManaged>,

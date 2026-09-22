@@ -574,7 +574,7 @@ export async function workspaceList(
   return toWorkspaceList(await invoke("workspace_list"));
 }
 
-/** Read one confined UTF-8 workspace file. */
+/** Read one confined project file for the viewer (text, or why it stays closed). */
 export async function workspaceRead(
   workspaceId: string,
   path: string,
@@ -585,7 +585,14 @@ export async function workspaceRead(
     !isObject(value) ||
     value.workspaceId !== workspaceId ||
     value.path !== path ||
-    typeof value.content !== "string"
+    typeof value.size !== "number" ||
+    !(typeof value.content === "string" || value.content === null) ||
+    !(
+      value.unreadable === undefined ||
+      value.unreadable === "binary" ||
+      value.unreadable === "too_large"
+    ) ||
+    (value.content === null) === (value.unreadable === undefined)
   ) {
     throw new Error("invalid workspace read response");
   }

@@ -1906,9 +1906,14 @@ mod tests {
         assert!(imported_workspace.root.starts_with(project.root()));
         assert_eq!(
             workspaces
-                .read_file(&imported_workspace.id, "specs/healthy.md")
-                .unwrap(),
-            "# 정상 문서"
+                .read_file(
+                    &imported_workspace.id,
+                    ".eud-agent/workspace/specs/healthy.md"
+                )
+                .unwrap()
+                .content
+                .as_deref(),
+            Some("# 정상 문서")
         );
         assert!(!imported_workspace
             .workspace_root
@@ -1916,15 +1921,20 @@ mod tests {
             .exists());
         assert_eq!(
             workspaces
-                .read_file(&imported_workspace.id, "plans/approved-before-import.md")
-                .unwrap(),
-            "# 기존 승인 계획"
+                .read_file(
+                    &imported_workspace.id,
+                    ".eud-agent/workspace/plans/approved-before-import.md",
+                )
+                .unwrap()
+                .content
+                .as_deref(),
+            Some("# 기존 승인 계획")
         );
         let approved = workspaces
             .list_files(&imported_workspace)
             .unwrap()
             .into_iter()
-            .find(|entry| entry.path == "plans/approved-before-import.md")
+            .find(|entry| entry.path == ".eud-agent/workspace/plans/approved-before-import.md")
             .unwrap();
         assert_eq!(approved.state.as_deref(), Some("approved"));
         assert_eq!(approved.revision, Some(2));

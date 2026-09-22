@@ -38,6 +38,10 @@ const MAX_TOTAL_BYTES: u64 = 32 * 1024 * 1024;
 
 const DOCUMENT_DIRS: [&str; 4] = ["specs", "plans", "decisions", "worklog"];
 pub const SPEC_INDEX_PATH: &str = "specs/index.md";
+/// Project-relative prefix of the accepted-document tree. The panel's project
+/// file tree lists the whole project root, so workspace-relative document
+/// paths (`specs/index.md`) appear there as `.eud-agent/workspace/specs/index.md`.
+pub const PROJECT_DOCUMENT_PREFIX: &str = ".eud-agent/workspace/";
 
 pub fn approved_plan_path(request_id: &str) -> io::Result<String> {
     let request_id = normalize_token(request_id, "request id")?;
@@ -90,6 +94,9 @@ pub struct WorkspaceChange {
     pub after: Option<String>,
 }
 
+/// One file of the project tree listed by the panel's "파일" tab. `path` is
+/// project-root-relative; `state`/`revision` are set only for accepted or
+/// approved documents under [`PROJECT_DOCUMENT_PREFIX`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkspaceFileEntry {
@@ -99,6 +106,24 @@ pub struct WorkspaceFileEntry {
     pub state: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub revision: Option<u64>,
+}
+
+/// Why a listed project file cannot be shown as text in the viewer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectFileUnreadable {
+    /// Not valid UTF-8 (maps, wheels, images, ...).
+    Binary,
+    /// Larger than the 1 MiB viewer cap; it is listed but never read.
+    TooLarge,
+}
+
+/// Viewer content of one project file: text, or the reason it stays closed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectFileContent {
+    pub size: u64,
+    pub content: Option<String>,
+    pub unreadable: Option<ProjectFileUnreadable>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1292,14 +1317,21 @@ impl WorkspaceManager {
         Ok(())
     }
 
+    /// List every regular file below the project root for the panel's file
+    /// tree. Build outputs, `.eud-agent` state and scratch are all listed; only
+    /// the generated `__epspy__`/`__pycache__` shadows are pruned and symlinks
+    /// are skipped, never followed. Accepted/approved documents keep
+    /// their trusted state through the [`PROJECT_DOCUMENT_PREFIX`] mapping.
     pub fn list_files(&self, workspace: &PreparedWorkspace) -> io::Result<Vec<WorkspaceFileEntry>> {
-        let files = scan_files(&workspace.workspace_root)?;
+        let files = scan_project_tree(&workspace.root)?;
         let state = self.load_state(&workspace.id)?;
         Ok(files
             .into_iter()
             .map(|(path, size)| {
-                let trusted = state.documents.get(&path);
-                let approved_plan = approved_plan_for_path(&state.approved_plans, &path);
+                let document = path.strip_prefix(PROJECT_DOCUMENT_PREFIX);
+                let trusted = document.and_then(|document| state.documents.get(document));
+                let approved_plan = document
+                    .and_then(|document| approved_plan_for_path(&state.approved_plans, document));
                 WorkspaceFileEntry {
                     state: approved_plan
                         .map(|_| "approved".to_string())
@@ -1524,26 +1556,35 @@ impl WorkspaceManager {
         }
 
         let query = query.to_lowercase();
-        let root = self.workspace_root(workspace_id)?;
-        let files = scan_files(&root)?;
+        let (root, _) = self.verified_roots(workspace_id)?;
+        let files = scan_project_tree(&root)?;
         let mut matches = Vec::new();
-        for relative in files.keys() {
-            let bytes = fs::read(confined_path(&root, relative, true)?)?;
-            let content = match decode_utf8(bytes, relative) {
-                Ok(content) => content,
-                Err(error) if error.kind() == io::ErrorKind::InvalidData => continue,
-                Err(error) => return Err(error),
+        for (relative, size) in &files {
+            if relative.to_lowercase().contains(&query) {
+                matches.push(relative.clone());
+                continue;
+            }
+            // Content matches only for files the viewer could show.
+            if *size > MAX_FILE_BYTES {
+                continue;
+            }
+            let bytes = fs::read(confined_project_path(&root, relative)?)?;
+            let Some(content) = decode_viewer_text(bytes) else {
+                continue;
             };
-            if relative.to_lowercase().contains(&query) || content.to_lowercase().contains(&query) {
+            if content.to_lowercase().contains(&query) {
                 matches.push(relative.clone());
             }
         }
         Ok(matches)
     }
 
-    pub fn read_file(&self, workspace_id: &str, relative: &str) -> io::Result<String> {
-        let root = self.workspace_root(workspace_id)?;
-        let path = confined_path(&root, relative, true)?;
+    /// Read one project file for the viewer by project-root-relative path.
+    /// Binary and oversized files are reported, not errors, so the tab can
+    /// explain why it stays closed.
+    pub fn read_file(&self, workspace_id: &str, relative: &str) -> io::Result<ProjectFileContent> {
+        let (root, _) = self.verified_roots(workspace_id)?;
+        let path = confined_project_path(&root, relative)?;
         let metadata = fs::symlink_metadata(&path)?;
         if metadata.file_type().is_symlink() || !metadata.is_file() {
             return Err(io::Error::new(
@@ -1551,14 +1592,27 @@ impl WorkspaceManager {
                 "workspace viewer only reads regular files",
             ));
         }
-        if metadata.len() > MAX_FILE_BYTES {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "workspace file exceeds the viewer size limit",
-            ));
+        let size = metadata.len();
+        if size > MAX_FILE_BYTES {
+            return Ok(ProjectFileContent {
+                size,
+                content: None,
+                unreadable: Some(ProjectFileUnreadable::TooLarge),
+            });
         }
         let bytes = fs::read(path)?;
-        decode_utf8(bytes, relative)
+        Ok(match decode_viewer_text(bytes) {
+            Some(content) => ProjectFileContent {
+                size,
+                content: Some(content),
+                unreadable: None,
+            },
+            None => ProjectFileContent {
+                size,
+                content: None,
+                unreadable: Some(ProjectFileUnreadable::Binary),
+            },
+        })
     }
 
     /// Restore or remove one canonical document during changeset rejection.
@@ -1660,6 +1714,13 @@ impl WorkspaceManager {
     }
 
     pub(crate) fn workspace_root(&self, workspace_id: &str) -> io::Result<PathBuf> {
+        self.verified_roots(workspace_id)
+            .map(|(_, workspace_root)| workspace_root)
+    }
+
+    /// `(project_root, workspace_root)` of the configured native project once
+    /// `workspace_id` is verified to be owned by it.
+    fn verified_roots(&self, workspace_id: &str) -> io::Result<(PathBuf, PathBuf)> {
         let workspace_id = normalize_workspace_id(workspace_id)?;
         let config = self
             .dirs
@@ -1693,7 +1754,7 @@ impl WorkspaceManager {
                 "workspace id is not owned by the configured native project",
             ));
         }
-        Ok(root)
+        Ok((project_root, root))
     }
 
     fn state_path(&self, workspace_id: &str) -> io::Result<PathBuf> {
@@ -2538,6 +2599,95 @@ fn scan_text_tree(root: &Path) -> io::Result<BTreeMap<String, String>> {
     Ok(output)
 }
 
+/// Confine a project-root-relative viewer path. Unlike [`confined_path`] it
+/// admits every normalized segment (`.eud-agent`, `.tmp`, `.codegraph`, build
+/// outputs): the viewer only reads, and the tree shows the real folder.
+fn confined_project_path(root: &Path, relative: &str) -> io::Result<PathBuf> {
+    if relative.is_empty() || relative.contains('\0') || relative.contains('\\') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "project path must be relative and use '/' separators",
+        ));
+    }
+    let mut target = root.to_path_buf();
+    for component in Path::new(relative).components() {
+        let Component::Normal(segment) = component else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "project path is not normalized",
+            ));
+        };
+        let segment = segment.to_str().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "project path is not UTF-8")
+        })?;
+        if segment.is_empty() || segment.contains(':') {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "project path contains an unsafe segment",
+            ));
+        }
+        target.push(segment);
+    }
+    if target == root || !target.starts_with(root) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "project path escapes its root",
+        ));
+    }
+    Ok(target)
+}
+
+/// Text for the viewer: UTF-8 with an optional BOM stripped, else `None`.
+/// User files under `src/` may carry a BOM; only app-written files are held to
+/// the no-BOM rule.
+fn decode_viewer_text(bytes: Vec<u8>) -> Option<String> {
+    let text = String::from_utf8(bytes).ok()?;
+    Some(
+        text.strip_prefix('\u{feff}')
+            .map(str::to_owned)
+            .unwrap_or(text),
+    )
+}
+
+/// Every regular file below `root` as `relative path -> size`, uncapped.
+/// Only the build-time generated shadows (`__epspy__`/`__pycache__`) are
+/// pruned, matching the native source snapshot; symlinks and reparse points
+/// are skipped rather than followed.
+fn scan_project_tree(root: &Path) -> io::Result<BTreeMap<String, u64>> {
+    ensure_plain_directory(root)?;
+    let mut files = BTreeMap::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(current) = pending.pop() {
+        let mut entries = fs::read_dir(&current)?.collect::<Result<Vec<_>, _>>()?;
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path)?;
+            if metadata.file_type().is_symlink() || crate::memory::is_reparse_point(&metadata) {
+                continue;
+            }
+            if metadata.is_dir() {
+                if crate::native_project::is_generated_artifact_dir(
+                    entry.file_name().to_string_lossy().as_ref(),
+                ) {
+                    continue;
+                }
+                pending.push(path);
+            } else if metadata.is_file() {
+                let relative = path
+                    .strip_prefix(root)
+                    .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "scan escaped root"))?
+                    .components()
+                    .map(|component| component.as_os_str().to_string_lossy())
+                    .collect::<Vec<_>>()
+                    .join("/");
+                files.insert(relative, metadata.len());
+            }
+        }
+    }
+    Ok(files)
+}
+
 fn scan_files(root: &Path) -> io::Result<BTreeMap<String, u64>> {
     if !root.is_dir() {
         return Ok(BTreeMap::new());
@@ -2865,30 +3015,134 @@ mod tests {
 
         assert_eq!(
             manager.search_files(&workspace.id, "COMBAT").unwrap(),
-            vec!["specs/combat.md"]
+            vec![".eud-agent/workspace/specs/combat.md"]
         );
         assert_eq!(
             manager
                 .search_files(&workspace.id, "confirmed behavior")
                 .unwrap(),
-            vec!["specs/combat.md"]
+            vec![".eud-agent/workspace/specs/combat.md"]
         );
-        assert!(manager
-            .search_files(&workspace.id, "PLUGINSTART")
-            .unwrap()
-            .is_empty());
+        // The tree covers the whole project root: EPS sources match by content.
+        assert_eq!(
+            manager.search_files(&workspace.id, "PLUGINSTART").unwrap(),
+            vec!["src/main.eps"]
+        );
         assert!(manager
             .search_files(&workspace.id, "eudvariable")
             .unwrap()
             .is_empty());
+        // Binary files match by path only, never by content.
+        assert_eq!(
+            manager.search_files(&workspace.id, "binary.dat").unwrap(),
+            vec![".eud-agent/workspace/decisions/binary.dat"]
+        );
         assert!(manager
-            .search_files(&workspace.id, "binary.dat")
+            .search_files(&workspace.id, "\u{ff}")
             .unwrap()
             .is_empty());
         assert!(manager
             .search_files(&workspace.id, "  ")
             .unwrap()
             .is_empty());
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn project_tree_lists_every_root_file_and_viewer_reports_binary_or_oversized() {
+        let (base, manager) = manager("project-tree");
+        let workspace = manager.prepare_snapshot(&snapshot(&manager)).unwrap();
+        fs::create_dir_all(workspace.root.join("build")).unwrap();
+        fs::write(workspace.root.join("build/output.scx"), [0xff, 0x00]).unwrap();
+        fs::File::create(workspace.root.join("maps/huge.scx"))
+            .unwrap()
+            .set_len(MAX_FILE_BYTES + 1)
+            .unwrap();
+        fs::write(workspace.root.join("src/bom.eps"), [0xef, 0xbb, 0xbf, b'x']).unwrap();
+        // eudplib writes these next to every compiled .eps during build.
+        fs::create_dir_all(workspace.root.join("src/__epspy__")).unwrap();
+        fs::write(workspace.root.join("src/__epspy__/main.py"), "# shadow").unwrap();
+        fs::create_dir_all(workspace.root.join("src/__pycache__")).unwrap();
+        fs::write(workspace.root.join("src/__pycache__/main.pyc"), [0x00]).unwrap();
+        fs::create_dir_all(workspace.workspace_root.join(TEMP_DIR).join("s1")).unwrap();
+        fs::write(
+            workspace.workspace_root.join(TEMP_DIR).join("s1/draft.md"),
+            "draft",
+        )
+        .unwrap();
+        write_atomic_bytes(&workspace.workspace_root.join("specs/index.md"), b"# idx").unwrap();
+
+        let listed = manager.list_files(&workspace).unwrap();
+        let paths = listed
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect::<Vec<_>>();
+        for expected in [
+            "project.eap",
+            "maps/source.scx",
+            "maps/huge.scx",
+            "src/main.eps",
+            "src/bom.eps",
+            "build/output.scx",
+            ".eud-agent/state/workspace.json",
+            ".eud-agent/workspace/.tmp/s1/draft.md",
+            ".eud-agent/workspace/specs/index.md",
+        ] {
+            assert!(paths.contains(&expected), "missing {expected} in {paths:?}");
+        }
+        assert!(
+            paths
+                .iter()
+                .all(|path| !path.contains("__epspy__") && !path.contains("__pycache__")),
+            "generated shadows leaked into {paths:?}"
+        );
+        assert!(manager
+            .search_files(&workspace.id, "shadow")
+            .unwrap()
+            .is_empty());
+        assert!(paths.iter().all(|path| !path.contains('\\')));
+        assert_eq!(
+            listed
+                .iter()
+                .find(|file| file.path == "maps/huge.scx")
+                .unwrap()
+                .size,
+            MAX_FILE_BYTES + 1
+        );
+
+        let text = manager.read_file(&workspace.id, "src/main.eps").unwrap();
+        assert_eq!(text.content.as_deref(), Some("function onPluginStart() {}"));
+        assert_eq!(text.unreadable, None);
+        let bom = manager.read_file(&workspace.id, "src/bom.eps").unwrap();
+        assert_eq!(bom.content.as_deref(), Some("x"));
+        let binary = manager
+            .read_file(&workspace.id, "build/output.scx")
+            .unwrap();
+        assert_eq!(binary.content, None);
+        assert_eq!(binary.unreadable, Some(ProjectFileUnreadable::Binary));
+        assert_eq!(binary.size, 2);
+        let huge = manager.read_file(&workspace.id, "maps/huge.scx").unwrap();
+        assert_eq!(huge.content, None);
+        assert_eq!(huge.unreadable, Some(ProjectFileUnreadable::TooLarge));
+        let scratch = manager
+            .read_file(&workspace.id, ".eud-agent/workspace/.tmp/s1/draft.md")
+            .unwrap();
+        assert_eq!(scratch.content.as_deref(), Some("draft"));
+
+        for escaped in [
+            "../outside.txt",
+            "src/../../x",
+            "E:/abs.txt",
+            "/abs",
+            "",
+            "src\\main.eps",
+        ] {
+            assert!(
+                manager.read_file(&workspace.id, escaped).is_err(),
+                "{escaped} must be refused"
+            );
+        }
+        assert!(manager.read_file(&workspace.id, "src").is_err());
         fs::remove_dir_all(base).ok();
     }
 
@@ -2980,11 +3234,13 @@ mod tests {
         let listed = manager.list_files(&workspace).unwrap();
         let accepted = listed
             .iter()
-            .find(|file| file.path == "specs/game.md")
+            .find(|file| file.path == ".eud-agent/workspace/specs/game.md")
             .unwrap();
         assert_eq!(accepted.state.as_deref(), Some("accepted"));
         assert_eq!(accepted.revision, Some(1));
-        assert!(listed.iter().all(|file| !file.path.starts_with("source/")));
+        assert!(listed
+            .iter()
+            .all(|file| !file.path.starts_with(".eud-agent/workspace/source/")));
 
         manager
             .record_plan_approval(&workspace.id, "req-journal", 2, "# Approved plan")
@@ -2997,7 +3253,7 @@ mod tests {
             .list_files(&workspace)
             .unwrap()
             .into_iter()
-            .find(|file| file.path == "plans/req-journal.md")
+            .find(|file| file.path == ".eud-agent/workspace/plans/req-journal.md")
             .unwrap();
         assert_eq!(approved_plan.state.as_deref(), Some("approved"));
         assert_eq!(approved_plan.revision, Some(2));
@@ -3056,9 +3312,15 @@ mod tests {
 
         let baseline = manager.begin_turn(&workspace, "req-allowlist").unwrap();
         assert!(manager.changes(&baseline).unwrap().is_empty());
+        // The project tree still lists unknown/oversized files; only the
+        // document scan prunes them.
         let files = manager.list_files(&workspace).unwrap();
-        assert_eq!(files.len(), 1);
-        assert_eq!(files[0].path, "specs/feature.md");
+        assert!(files
+            .iter()
+            .any(|file| file.path == ".eud-agent/workspace/specs/feature.md"));
+        assert!(files
+            .iter()
+            .any(|file| file.path == ".eud-agent/workspace/unknown/nested/oversized.dat"));
 
         fs::write(document, "after").unwrap();
         fs::write(workspace.workspace_root.join("unknown/extra.md"), "extra").unwrap();
@@ -3088,8 +3350,14 @@ mod tests {
                 io::ErrorKind::InvalidData
             );
             assert_eq!(
-                manager.list_files(&workspace).unwrap_err().kind(),
-                io::ErrorKind::InvalidData
+                manager
+                    .read_file(
+                        &workspace.id,
+                        &format!("{PROJECT_DOCUMENT_PREFIX}{directory}/large.md"),
+                    )
+                    .unwrap()
+                    .unreadable,
+                Some(ProjectFileUnreadable::TooLarge)
             );
             fs::remove_dir_all(base).ok();
         }
@@ -3108,11 +3376,6 @@ mod tests {
         .unwrap();
 
         assert!(manager.changes(&baseline).unwrap().is_empty());
-        assert!(manager
-            .list_files(&workspace)
-            .unwrap()
-            .iter()
-            .all(|file| file.path != CODEGRAPH_RUNTIME_PATH));
         assert!(manager
             .restore_file(&workspace.id, ".codegraph/index.db", Some("x"))
             .is_err());

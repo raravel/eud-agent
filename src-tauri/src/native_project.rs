@@ -2152,7 +2152,7 @@ fn matches_extension(path: &str, extensions: &[&str]) -> bool {
 /// Build-time generated shadows of the canonical source tree. They are
 /// outputs, never canonical state, so every source list/snapshot/revision/
 /// search/export surface skips them (plan D8).
-fn is_generated_artifact_dir(name: &str) -> bool {
+pub(crate) fn is_generated_artifact_dir(name: &str) -> bool {
     name.eq_ignore_ascii_case("__epspy__") || name.eq_ignore_ascii_case("__pycache__")
 }
 

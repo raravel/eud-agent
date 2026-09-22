@@ -1132,20 +1132,44 @@ describe("Workspace commands", () => {
     expect(invoke).toHaveBeenCalledWith("workspace_list");
   });
 
-  it("reads a confined workspace file by id and relative path", async () => {
+  it("reads a confined project file by id and project-relative path", async () => {
     const response = {
       workspaceId: workspace.workspaceId,
-      path: "specs/game.md",
+      path: "src/main.eps",
+      size: 6,
       content: "# Game",
     };
     const invoke = vi.fn().mockResolvedValue(response);
     await expect(
-      workspaceRead(workspace.workspaceId, "specs/game.md", invoke),
+      workspaceRead(workspace.workspaceId, "src/main.eps", invoke),
     ).resolves.toEqual(response);
     expect(invoke).toHaveBeenCalledWith("workspace_read", {
       workspaceId: workspace.workspaceId,
-      path: "specs/game.md",
+      path: "src/main.eps",
     });
+  });
+
+  it("accepts a closed binary/oversized file and rejects an inconsistent read", async () => {
+    const binary = {
+      workspaceId: workspace.workspaceId,
+      path: "maps/source.scx",
+      size: 2048,
+      content: null,
+      unreadable: "binary",
+    };
+    await expect(
+      workspaceRead(workspace.workspaceId, "maps/source.scx", vi.fn().mockResolvedValue(binary)),
+    ).resolves.toEqual(binary);
+    for (const broken of [
+      { ...binary, unreadable: undefined },
+      { ...binary, content: "x" },
+      { ...binary, unreadable: "encrypted" },
+      { ...binary, size: "2048" },
+    ]) {
+      await expect(
+        workspaceRead(workspace.workspaceId, "maps/source.scx", vi.fn().mockResolvedValue(broken)),
+      ).rejects.toThrow("invalid workspace read response");
+    }
   });
 
   it("searches workspace filenames and text content through one command", async () => {

@@ -2604,8 +2604,12 @@ mod tests {
         let workspaces = crate::workspace::WorkspaceManager::new(dirs.clone());
         let prepared = workspaces.prepare_current().unwrap();
         assert_eq!(
-            workspaces.read_file(&prepared.id, "specs/kept.md").unwrap(),
-            "승인된 동작"
+            workspaces
+                .read_file(&prepared.id, ".eud-agent/workspace/specs/kept.md")
+                .unwrap()
+                .content
+                .as_deref(),
+            Some("승인된 동작")
         );
         let memory = crate::memory::ProjectMemory::current(dirs).unwrap();
         assert_eq!(memory.read("resources"), "Switch 9 = phase");
@@ -2622,8 +2626,12 @@ mod tests {
         let moved = workspaces.prepare_current().unwrap();
         assert_eq!(moved.id, prepared.id);
         assert_eq!(
-            workspaces.read_file(&moved.id, "specs/kept.md").unwrap(),
-            "승인된 동작"
+            workspaces
+                .read_file(&moved.id, ".eud-agent/workspace/specs/kept.md")
+                .unwrap()
+                .content
+                .as_deref(),
+            Some("승인된 동작")
         );
         let moved_memory = crate::memory::ProjectMemory::current(dirs).unwrap();
         assert_eq!(moved_memory.read("resources"), "Switch 9 = phase");

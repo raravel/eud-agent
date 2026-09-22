@@ -11,15 +11,30 @@ Primary regions:
 - center tab strip: a pinned conversation tab plus one tab per open workspace
   document; the active document renders as a large center pane (tree right,
   document center), each tab keeps its own content/loading/error state, and
-  Ctrl+W closes the active document tab;
-- conversation/stream/ASK/plan/changeset review;
-- instruction composer with attachments, mentions, model controls, and cancel;
+  Ctrl+W closes the active document tab. Staged-workflow reports are tabs, not
+  cards above the conversation: `research/`, `plans/`, and `verify/` documents
+  are labelled 조사 보고 / 계획 / 검증 보고, research and verify reports open the
+  moment the workflow snapshot announces them (one auto-opened tab per kind,
+  replaced in place by the next request; a verify report arriving while the
+  changeset or an ASK awaits the user opens without taking the active tab).
+  Research/verify reports are readable but not part of the listed document tree,
+  so their tabs render from the tab path and survive a tree refresh. The selected session's
+  plan is a virtual "계획 (rev N)" tab holding the 승인 control that stays open
+  read-only after approval and turns into the plan file tab when the next
+  request clears the plan;
+- conversation/stream/ASK/changeset review, plus a one-line plan-review notice
+  with 계획 보기 while a plan awaits a decision;
+- instruction composer with attachments, mentions, model controls, and cancel,
+  shared under every center tab so plan feedback and questions about an open
+  report are typed without leaving the tab;
 - project sidebar whose default tab is a generic recursive IDE-style file tree
-  (파일) with a project-root node; folders start collapsed (only the root is
+  (파일) over the whole project root (`project.eap`, `src/`, `dat/`, `maps/`,
+  `build/`, `.eud-agent/`, ...); folders start collapsed (only the root is
   open) and expanded state persists per workspace; opening a document reveals
   its ancestor folders. The tree renders whatever project-relative paths the
-  backend lists (no hardcoded directory layout), with DAT wiki and memory as
-  secondary tabs; selecting a file opens a center document tab;
+  backend lists (nothing is pruned; no hardcoded directory layout), with DAT
+  wiki and memory as secondary tabs; selecting a file opens a center document
+  tab, and a binary or >1 MiB file opens as a notice instead of text;
 - first-run setup overlay;
 - settings categories for Project, Notifications, and Codex.
 

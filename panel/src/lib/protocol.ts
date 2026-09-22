@@ -85,17 +85,34 @@ export interface WorkspaceFileEntry {
 }
 
 /** `workspace_list` command output. */
+/**
+ * `workspace_list` command output: every file below the project root,
+ * project-root-relative. Accepted/approved harness documents live under
+ * {@link WORKSPACE_DOCUMENT_PREFIX} and carry `state`/`revision`.
+ */
 export interface WorkspaceListResponse {
   project: string;
   workspaceId: string;
   files: WorkspaceFileEntry[];
 }
 
-/** `workspace_read` command output. */
+/**
+ * Project-relative prefix of the agent's document tree. Workflow events name
+ * stage artifacts workspace-relative (`plans/<id>.md`); the file tree and
+ * document tabs use the project-relative form.
+ */
+export const WORKSPACE_DOCUMENT_PREFIX = ".eud-agent/workspace/";
+
+/**
+ * `workspace_read` command output. `content` is null when the file is listed
+ * but not viewable as text; `unreadable` then says why.
+ */
 export interface WorkspaceReadResponse {
   workspaceId: string;
   path: string;
-  content: string;
+  size: number;
+  content: string | null;
+  unreadable?: "binary" | "too_large";
 }
 
 /** `workspace_search` command output. */

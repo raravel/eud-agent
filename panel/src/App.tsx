@@ -95,6 +95,7 @@ import {
   workspaceList,
   workspaceRead,
   workspaceSearch,
+  WORKSPACE_DOCUMENT_PREFIX,
   type AskAnswer,
   type AutonomousRunState,
   type AppSettings,
@@ -167,6 +168,19 @@ interface DocumentTabState {
   content: string | null;
   loading: boolean;
   error: string | null;
+  /** Why a listed file stays closed (binary or oversized); not an error. */
+  notice: string | null;
+}
+
+/** Korean explanation for a file the viewer cannot show as text. */
+function unreadableNotice(
+  reason: "binary" | "too_large",
+  size: number,
+): string {
+  const formatted = formatAttachmentSize(size);
+  return reason === "too_large"
+    ? `파일이 너무 커서 표시하지 않습니다 (1 MB 초과 · ${formatted}). 다른 프로그램으로 여세요.`
+    : `텍스트로 표시할 수 없는 파일입니다 (바이너리 · ${formatted}). 맵은 Map 창이나 SCMDraft 2로 여세요.`;
 }
 
 interface BootstrapState {
@@ -2686,13 +2700,21 @@ export default function App() {
     async (workspaceId: string, path: string) => {
       setDocumentStates((current) => ({
         ...current,
-        [path]: { content: null, loading: true, error: null },
+        [path]: { content: null, loading: true, error: null, notice: null },
       }));
       try {
         const response = await workspaceRead(workspaceId, path);
         setDocumentStates((current) => ({
           ...current,
-          [path]: { content: response.content, loading: false, error: null },
+          [path]: {
+            content: response.content,
+            loading: false,
+            error: null,
+            notice:
+              response.unreadable === undefined
+                ? null
+                : unreadableNotice(response.unreadable, response.size),
+          },
         }));
       } catch (error) {
         setDocumentStates((current) => ({
@@ -2701,6 +2723,7 @@ export default function App() {
             content: null,
             loading: false,
             error: `파일을 열지 못했습니다: ${String(error)}`,
+            notice: null,
           },
         }));
       }
@@ -3362,6 +3385,7 @@ export default function App() {
               content: null,
               loading: false,
               error: "파일을 찾을 수 없습니다. 파일 트리에서 다시 열어 주세요.",
+              notice: null,
             };
             return (
               <div
@@ -3377,6 +3401,7 @@ export default function App() {
               >
                 <WorkspaceDocument
                   workspace={workspaceData}
+                  path={path}
                   file={
                     workspaceData.files.find((file) => file.path === path) ??
                     null

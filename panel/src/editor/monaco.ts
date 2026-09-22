@@ -9,6 +9,12 @@
 import * as monaco from "monaco-editor";
 import { loader } from "@monaco-editor/react";
 
+import {
+  EUD_AGENT_THEME,
+  buildEudAgentTheme,
+  documentTokenResolver,
+} from "@/editor/monacoTheme";
+
 import EditorWorker from "monaco-editor/esm/vs/editor/editor.worker?worker";
 import JsonWorker from "monaco-editor/esm/vs/language/json/json.worker?worker";
 import CssWorker from "monaco-editor/esm/vs/language/css/css.worker?worker";
@@ -39,5 +45,21 @@ self.MonacoEnvironment = {
 
 // Bind @monaco-editor/react to the local bundle (no CDN download).
 loader.config({ monaco });
+
+// The panel is always dark (main.tsx adds `.dark` before any surface mounts),
+// so the theme is resolved once from the live design tokens.
+monaco.editor.defineTheme(
+  EUD_AGENT_THEME,
+  buildEudAgentTheme(documentTokenResolver()),
+);
+
+// EPS source is highlighted with the TypeScript grammar for its C-like syntax
+// only; the TypeScript language service must never judge it (an EPS
+// `import lib.util;` is not a TypeScript error).
+monaco.typescript.typescriptDefaults.setDiagnosticsOptions({
+  noSemanticValidation: true,
+  noSyntaxValidation: true,
+  noSuggestionDiagnostics: true,
+});
 
 export { monaco };

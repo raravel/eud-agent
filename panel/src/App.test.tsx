@@ -17,6 +17,30 @@ vi.mock("@tauri-apps/api/event", () => ({
 }));
 vi.mock("@tauri-apps/plugin-updater", () => ({ check: vi.fn(async () => null) }));
 vi.mock("@tauri-apps/plugin-process", () => ({ relaunch: vi.fn(async () => undefined) }));
+// The EPS viewer lazy-loads Monaco; the textarea double stands in for it.
+vi.mock("@/components/MonacoEditor", async () => {
+  const React = await import("react");
+  function MonacoEditor({
+    value = "",
+    language,
+    readOnly,
+    ariaLabel,
+  }: {
+    value?: string;
+    language?: string;
+    readOnly?: boolean;
+    ariaLabel?: string;
+  }) {
+    return React.createElement("textarea", {
+      "aria-label": ariaLabel,
+      "data-language": language,
+      readOnly,
+      value,
+      onChange: () => {},
+    });
+  }
+  return { default: MonacoEditor, MonacoEditor };
+});
 
 import App from "./App";
 const providerStatuses = [
@@ -296,18 +320,32 @@ beforeEach(() => {
       case "notification_sound_preview":
         return undefined;
       case "workspace_list":
+        // The tree is the whole project root, not just the agent documents.
         return {
           project: "Project",
           workspaceId: "a".repeat(64),
           files: [
-            { path: "specs/index.md", size: 24 },
-            { path: "specs/combat.md", size: 32 },
+            { path: "project.eap", size: 120 },
+            { path: "src/main.eps", size: 40 },
+            { path: "maps/source.scx", size: 2048 },
+            { path: ".eud-agent/workspace/specs/index.md", size: 24 },
+            { path: ".eud-agent/workspace/specs/combat.md", size: 32 },
           ],
         };
       case "workspace_read":
+        if (typeof args?.path === "string" && args.path.endsWith(".scx")) {
+          return {
+            workspaceId: args?.workspaceId,
+            path: args?.path,
+            size: 2048,
+            content: null,
+            unreadable: "binary",
+          };
+        }
         return {
           workspaceId: args?.workspaceId,
           path: args?.path,
+          size: 24,
           content: "# 문서 제목\n\n문서 본문",
         };
       case "workspace_search":
@@ -1735,9 +1773,13 @@ describe("App center document tabs", () => {
       "aria-selected",
       "true",
     );
-    fireEvent.click(
-      await within(sidebar).findByRole("button", { name: "specs 폴더 펼치기" }),
-    );
+    // The root lists the real project layout, folders first.
+    expect(within(sidebar).getByRole("button", { name: /project\.eap/ })).toBeInTheDocument();
+    for (const folder of [".eud-agent", "workspace", "specs"]) {
+      fireEvent.click(
+        await within(sidebar).findByRole("button", { name: `${folder} 폴더 펼치기` }),
+      );
+    }
     fireEvent.click(
       await within(sidebar).findByRole("button", { name: /combat\.md/ }),
     );
@@ -1747,11 +1789,28 @@ describe("App center document tabs", () => {
       name: "combat.md 문서 탭",
     });
     expect(documentTab).toHaveAttribute("aria-selected", "true");
-    await screen.findByText("specs/combat.md");
+    await screen.findByText(".eud-agent/workspace/specs/combat.md");
     expect(screen.getByText(/문서 본문/)).toBeInTheDocument();
+    expect(screen.getByText("검토 대상 문서")).toBeInTheDocument();
     expect(
       within(sidebar).getByRole("button", { name: /combat\.md/ }),
     ).toHaveAttribute("aria-current", "page");
+
+    // An EPS source is a plain project file shown in the read-only Monaco
+    // viewer with the TypeScript grammar; a map opens as a notice, not text.
+    fireEvent.click(await within(sidebar).findByRole("button", { name: "src 폴더 펼치기" }));
+    fireEvent.click(await within(sidebar).findByRole("button", { name: /main\.eps/ }));
+    await screen.findByText("src/main.eps");
+    expect(screen.getByText("프로젝트 파일")).toBeInTheDocument();
+    const epsEditor = await screen.findByRole("textbox", { name: "src/main.eps 소스" });
+    expect(epsEditor).toHaveAttribute("data-language", "typescript");
+    expect(epsEditor).toHaveAttribute("readonly");
+    fireEvent.click(await within(sidebar).findByRole("button", { name: "maps 폴더 펼치기" }));
+    fireEvent.click(await within(sidebar).findByRole("button", { name: /source\.scx/ }));
+    await screen.findByRole("tab", { name: "source.scx 문서 탭" });
+    expect(await screen.findByRole("status")).toHaveTextContent(/바이너리 · 2 KB/);
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("tab", { name: "combat.md 문서 탭" }));
 
     // The conversation tab still exists and reactivates without refetching.
     fireEvent.click(screen.getByRole("tab", { name: "대화" }));
@@ -1779,9 +1838,11 @@ describe("App center document tabs", () => {
     const sidebar = await screen.findByRole("complementary", {
       name: "프로젝트 도구",
     });
-    fireEvent.click(
-      await within(sidebar).findByRole("button", { name: "specs 폴더 펼치기" }),
-    );
+    for (const folder of [".eud-agent", "workspace", "specs"]) {
+      fireEvent.click(
+        await within(sidebar).findByRole("button", { name: `${folder} 폴더 펼치기` }),
+      );
+    }
     fireEvent.click(
       await within(sidebar).findByRole("button", { name: "combat.md" }),
     );

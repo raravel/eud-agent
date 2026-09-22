@@ -1,11 +1,12 @@
 /**
- * Workspace file tree — the "파일" tab body of the project sidebar.
+ * Project file tree — the "파일" tab body of the project sidebar.
  *
- * A generic IDE-style explorer: one root node for the project root (the
- * directory holding the `.eap`), recursive folders/files below it, folders
- * first, chevron + indent per depth. No layout-specific grouping: whatever
- * relative paths the backend lists render as-is, so the tree keeps working
- * when document directories move under the project root.
+ * A generic IDE-style explorer over the whole project root (the directory
+ * holding the `.eap`): `src/`, `dat/`, `maps/`, `build/`, `.eud-agent/`, ...
+ * with recursive folders/files below it, folders first, chevron + indent per
+ * depth. No layout-specific grouping: whatever project-relative paths the
+ * backend lists render as-is; accepted/approved agent documents under
+ * `.eud-agent/workspace` keep their state badges.
  *
  * Selecting a file opens it as a document tab in the center column
  * (Orca-style split: tree right, document center). Search is the unified
