@@ -116,8 +116,8 @@ new writers.
   the existing scroll-to-bottom control without retaining all 500 capped rows in the DOM.
 - **Decision progress (EUD-070)**: while a `changeset_decision` awaits its `rollback_result`, ChangesetView shows a spinner notice (결정 처리 중…) — a rollback replays inverse ops over the 1s-tick file IPC, so the wait is visible, not just silently-disabled buttons.
 - **Answer prominence + Mermaid**: agent answers are the most visible text in the log (foreground Message bubbles, Streamdown-rendered). Both live and archived agent answers render fenced `mermaid` blocks as interactive bundled SVG diagrams; system/progress/info rows stay muted.
-- **Staged workflow strip**: while a pipeline request is active or in review/interrupted, a stage strip (파악 → 조사 → 계획 → 승인 → 실행 → 검증 → 검토) renders above the conversation with `aria-current="step"`, attempt counters, the 심층 계획 badge, cancel during busy stages, and 이어서 진행 / 처음부터 for `interrupted`. `research`, `planning`, and `verifying` are send-gated busy phases like `thinking`; `interrupted` is not. Research and verdict cards render inline and archive into the log; the verdict shows above the changeset. Plan review is restored from the re-emitted `plan` + `workflow` events after reconnect/restart. The plan card additionally shows the plan title, acceptance criteria, critic verdict/summary, and revision from `WorkflowEvent.plan`. Settings exposes the app-wide "더 똑똑한 계획" switch with its token warning.
-- **Plan review (EUD-074 — user decision 2026-06-05)**: ai-elements **Plan** component; plan markdown renders via Streamdown static mode with the same fenced-Mermaid support as agent answers. The embedded feedback textarea and the [수정요청] button are REMOVED: **the MAIN prompt input is the feedback channel** — during plan_review it stays ENABLED with a guidance placeholder, and a send routes to `plan_feedback{text}` (App routes by phase; the panel stays in plan_review until the next `plan{revision+1}` replaces the card). [승인] on the plan card sends `plan_approve`. `plan_review` is therefore NOT a send-gated busy phase (only `thinking` is).
+- **Staged workflow strip**: while a pipeline request is active or in review/interrupted, a stage strip (파악 → 조사 → 계획 → 승인 → 실행 → 검증 → 검토) renders above the conversation with `aria-current="step"`, attempt counters, the 심층 계획 badge, cancel during busy stages, and 이어서 진행 / 처음부터 for `interrupted`. `research`, `planning`, and `verifying` are send-gated busy phases like `thinking`; `interrupted` is not. Research and verify reports open as center document tabs (조사 보고 / 검증 보고) the moment the snapshot announces them and archive into the log; the changeset stays in the conversation. Plan review is restored from the re-emitted `plan` + `workflow` events after reconnect/restart. The plan tab additionally shows the plan title, acceptance criteria, critic verdict/summary, and revision from `WorkflowEvent.plan`. Settings exposes the app-wide "더 똑똑한 계획" switch with its token warning.
+- **Plan review (EUD-074 — user decision 2026-06-05; tab cutover 2026-09-21)**: the plan is the virtual center tab "계획 (rev N)" (`PlanView`), opened and activated on every new plan for the selected session and closable like a document tab (the conversation keeps a one-line notice with 계획 보기 while a decision is pending); plan markdown renders full-height via Streamdown static mode with the same fenced-Mermaid support as agent answers. The embedded feedback textarea and the [수정요청] button are REMOVED: **the MAIN prompt input is the feedback channel** — it sits under every center tab, during plan_review it stays ENABLED with a guidance placeholder, and a send routes to `plan_feedback{text}` (App routes by phase; the panel stays in plan_review until the next `plan{revision+1}` replaces the tab contents). [승인] in the plan tab header sends `plan_approve`; afterwards the tab stays open read-only (승인됨 badge when `approvedSha256` matches) and becomes the `plans/<id>.md` document tab once the next request clears the plan. `plan_review` is therefore NOT a send-gated busy phase (only `thinking` is).
   Plan expansion is UI-only state owned by each `SessionSlot`: switching session tabs preserves a
   manually collapsed plan, while a genuinely newer revision opens automatically. Clicking [승인]
   immediately collapses the approved revision while its execution turn runs; the accessible Plan
@@ -155,13 +155,23 @@ new writers.
   `bulkOnly` mode, hiding misleading per-item controls while retaining the fixed header, diff
   bodies, and whole-batch accept/reject actions. Harness updates route by immutable `sessionId`;
   snapshot hydration merges by `updatedAt`, and background status never disables the main input.
-- **Workspace explorer / project wiki**: the right project sidebar's Files tab opens the
-  viewer-only workspace explorer. `workspace_list` returns the durable documents under
-  `<project>/.eud-agent/workspace` (documents only — the EPS source mirror is gone now that
-  the CLI cwd is the project root); selecting a file calls confined
-  `workspace_read`. `specs/` sorts first, `specs/index.md` is the default wiki home, and
-  `workspace_search` scans that same confined, bounded tree and returns case-insensitive path or
-  UTF-8 content matches while skipping non-text files. The explorer groups files by top-level
+- **Project explorer / project wiki**: the right project sidebar's Files tab opens the
+  viewer-only project explorer. `workspace_list` returns every regular file below the project
+  root, project-relative (sources, DAT, maps, build outputs, `.eud-agent` state and scratch);
+  only the eudplib build shadows `__epspy__/` and `__pycache__/` are pruned, and symlinks are
+  skipped, never followed. Accepted/approved documents under
+  `.eud-agent/workspace/` keep their trusted `state`/`revision`. Selecting a file calls
+  confined `workspace_read`, which returns text for UTF-8 files (a BOM is stripped for
+  display) and `content: null` + `unreadable: binary | too_large` for the rest, rendered as a
+  notice. Markdown renders through the shared Response surface; `.eps` opens in a read-only
+  Monaco surface highlighted with the TypeScript grammar (the TypeScript language service is
+  muted so EPS never gets TypeScript diagnostics, and the read-only message is Korean); other
+  UTF-8 text renders as preformatted source. Every Monaco surface (this viewer and the memory
+  editor) uses the `eud-agent` theme that `panel/src/editor/monacoTheme.ts` derives at startup
+  from the panel's `.dark` oklch design tokens, so editor chrome, selection, cursor and syntax
+  colors follow index.css instead of Monaco's stock `vs-dark`; `workspace_search` matches every
+  path case-insensitively and the content of files the viewer could show. Document diffs, journals, and baselines still cover only the
+  workspace document tree. The explorer groups files by top-level
   directory, persists collapsed directories per workspace in browser storage, and temporarily
   expands matching groups while a debounced unified search filters the tree. Clearing the search
   restores the persisted collapsed state.
@@ -180,7 +190,7 @@ new writers.
   pre-turn snapshot without an editor connection.
 - **Diff/preview limits**: reuse v1 truncation (1 MiB UTF-16-consistent) for previews/diffs.
 - **Diagnostics**: epscript-lsp advisory strip retained for files the agent wrote (server includes diagnostics per modified/created eps in the changeset item).
-- **Removed**: TargetPicker, ApplyBar, ReviewTabs as apply-source, NEWEPS filename input, `canSendSet/canSendNewEps` gating, Monaco edit-buffer-as-apply-source. Monaco remains only as a lazy read-only viewer for file previews/diffs if needed by ChangesetView.
+- **Removed**: TargetPicker, ApplyBar, ReviewTabs as apply-source, NEWEPS filename input, `canSendSet/canSendNewEps` gating, Monaco edit-buffer-as-apply-source. Monaco remains a lazy surface: the memory editor and the read-only EPS viewer in the project explorer (TypeScript grammar, panel-derived `eud-agent` theme).
 - Korean labels throughout; log cap 500 retained.
 
 ## Verification contract
@@ -189,10 +199,14 @@ new writers.
   addressed `PanelStore`, review does not block another writer, and an acceptance conflict is
   logged as failure rather than success.
 - Sidebar tests pin `분석 중`, `변경 중`, review, splitter keyboard sizing, collapsed rail, and
-  long-name clipping. App tests also pin plan-collapse preservation across session switches.
-- PlanView/ChangesetView tests pin controlled collapse and the fixed header/footer layout
-  boundaries around their scrollable bodies. PlanView additionally pins splitter orientation,
-  keyboard sizing, pointer resizing, and persisted height.
+  long-name clipping. App tests also pin the report tabs: research/verify tabs open and
+  activate from workflow events with one `workspace_read` per artifact, the plan tab activates
+  on arrival with 승인 in the tab and the prompt underneath, a closed plan tab stays closed
+  across session switches until 계획 보기 or a new revision, and the active plan tab becomes
+  the plan file tab when the next request clears the plan.
+- ChangesetView tests pin controlled collapse and the fixed header/footer layout boundaries
+  around its scrollable body; PlanView tests pin the header-held 승인/read-only states outside
+  the scrollable plan body.
 - HarnessStatusCard tests pin runtime confirmation, cancellation by skip, retry, automatic
   completed/skipped closure, failed/rejected dismissal, suppression of older terminal cards, and
   atomic bulk-only document review; App integration pins immutable `harness_job` routing and exact

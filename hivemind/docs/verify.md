@@ -242,7 +242,22 @@ profiles, renderers, triage parsing, interruption mapping; engine tests for pipe
 plan review, critic-driven revision, answer route note, clarify ASK re-triage, approval → execute
 → verify fail → fix → verify pass → review → done, plan feedback through the planner, stage
 failure, cancellation, and hydrate/startup interruption. Panel: store stage → phase mapping, plan
-review restore, strip, interrupted controls, verdict card, and the deep-planning switch.
+review restore, strip, interrupted controls, report tabs, and the deep-planning switch.
+
+Report-tab cutover (2026-09-21, panel only): research/verify artifacts open as 조사 보고/검증 보고
+document tabs and the plan is the virtual "계획 (rev N)" tab with 승인 in its header; the prompt
+sits under every tab. Vitest pins tab opening and activation from workflow events with one
+`workspace_read` per artifact (an unlisted report still renders as Markdown and survives a tree
+refresh; a verdict arriving with changeset review opens without taking the active tab, a failed
+verdict in the fix loop activates), the plan tab with 승인/read-only states, closed-tab persistence
+across session switches with 계획 보기 and new-revision reopening, and the plan-tab →
+`plans/<id>.md` conversion when the next request clears the plan. Gate: Vitest 70 files / 654
+tests, `tsc -b`, and production build pass. Browser mock-Tauri surface run (vite dev +
+`__TAURI_INTERNALS__` stub, scripted `workflow`/`plan`/`changeset` events) confirms the research
+tab with the rendered report and the prompt underneath, the plan tab with badges/수용 기준/승인,
+the conversation notice with 계획 보기, the verify tab after `changeset_review`, the read-only
+승인됨 plan tab after approval, and the file-tab conversion after sending the next request from
+the plan tab. Native Tauri and live-provider behavior remain covered by the scenario rows above.
 
 Scenario run: `features/staged-workflow-scenarios.md` defines eight rows against a fixture EPS
 project. `pre` rows require a build from commit `c23f0b2` (before triage was enabled); `post` rows
@@ -257,6 +272,79 @@ strict all-target/all-feature Clippy pass with
 conflicts with the declared MSRV 1.77.2 under clippy 1.92), formatter passes, panel TypeScript,
 Vitest (63 files / 601 tests) and production build pass.
 
+## Read delegation and Map handoff
+
+Deterministic contracts (Rust): `delegate_read` registry entry and profile refusal of nested
+delegation; `DelegatedRunKind::Read` tool set, 240 s deadline, fixed result schema, and prompt;
+tool-runtime delegation (child identity inherits session/request/generation with a fresh run id,
+lifecycle events, correctable failure/cancel errors, malformed arguments, stale scope, per-run cap
+of 8 reset per request, EPS-only, unavailable executor); a child's `search_docs` never lifting the
+parent's evidence gate; engine `[delegation]` and `[map handoff]` prompt sections; the
+context-pressure continuation hint; the pure read-delegation request builder; `team` status
+labels, tool values, and `[map tasks]` note; session-store team task persistence, map-session
+lookup, parent lookup, and startup mapping; tool-runtime `map_task_request` (map_info evidence
+gate, argument normalization, single active task per session, EPS-only, never from a delegated
+child, `map_task_status`) and refusal of `location_write`/`switch_write`/`player_setup`/map sound
+tools while a task is active; Map-service team mentions, request text, and candidate summary;
+triage prompt routing placement-only requests direct; team-session identity (EPS parent by
+manifest name, team session keyed by the Map project id, reuse of the existing team session).
+Panel: `delegation` and `team_task` guards,
+nested delegate_read rows with lifecycle and summary, team task card states and continuation
+text, store card selection/acknowledgement/hydration, and the team badge in Map session history.
+
+Phase 2b (agent-driven candidate review, 2026-09-21) deterministic contracts: `map_task_diff`/
+`map_task_objects`/`map_task_render` registry entries and candidate-inspection recording,
+`map_task_apply` as a canonical write exempt from the docs gate but gated on inspection of that
+task, `map_task_discard`, follow-up `map_task_request` admitted only on `candidate_ready`,
+refusal of every team tool for a delegated child, the Map-service action path validating the
+announced revision/hash before apply/discard and settling the task (`superseded`, `appliedBy`),
+the `[map tasks]` note guidance, and the panel card's agent-apply hint, "맵 적용 취소", and
+`superseded` state. Not verified: a live agent apply, the automatic autonomous resume after a
+settled task, and `map_task_render` images through a real provider.
+
+Live evidence on 2026-09-21 (Codex, project `rpg`): the EPS session triaged a placement request
+direct, ran `map_info` and `search_docs`, and called `map_task_request` twice; both calls failed
+with `map_task_failed: the current source map belongs to another project` because the EPS
+manifest name was compared with the Map project-root hash, and the model then asked the user to
+open the Map window by hand. The identity fix is covered by
+`team_session_is_keyed_by_the_map_project_id_not_the_eps_manifest_name`; the prompt/tool text
+now forbids that instruction, and the dispatcher opens the Map window on the team session when a
+candidate is ready. Not verified: a live `map_task_request` completing after the fix, the automatic
+Map window open, the `map-agent-open-session` switch in an open window, `delegate_read` on any
+provider (plan "검증" rows 1–5), restart with a live team candidate, and the Map window UI after a
+team request. The changeset `linkedMapApplies` review link is not implemented.
+
+Gate status on 2026-09-21 for the delegation/handoff source (with the team-session identity fix,
+Map window targeting, and Phase 2b agent-driven review): Rust lib `cargo test` passes `879/0/35`,
+strict all-target/all-feature Clippy shows only the pre-existing MSRV warnings, the formatter
+passes; panel `tsc -b`, Vitest (71 files / 658 tests), and production build pass. The 2026-09-20 gate before that fix: Rust
+`cargo test -p eud-agent` passes `873/0/35` across lib, main, and doc targets; strict all-target/all-feature Clippy passes with only
+the pre-existing `clippy::incompatible_msrv` warnings (`tools.rs` `is_none_or`); formatter passes;
+panel `tsc -b`, Vitest (69 files / 644 tests), and production build pass with the existing chunk
+advisory.
+
+### Semantic ISOM brushes — 2026-09-22
+
+Root cause of the "언덕 타일을 못 깐다" report (Map session `4a1431ae`, project `rpg`): the
+model's three `terrain.isom_brush` calls used off-lattice (`85+160`, `85+80` odd) and off-grid
+(`isomX=170` on a 256-wide map, grid `0..128`) diamonds; the native error was the bare `semantic
+ISOM brush placement failed` and the off-grid call returned success with zero changed tiles, so the
+model concluded the map had no ISOM data. `rpg.scx` carries a complete `ISOM` section (265 224 B =
+129 × 257 × 8). Deterministic contracts: native (`crates/isom`, ignored, real StarCraft assets)
+`semantic_isom_rect_paints_a_hill_and_isom_brush_names_every_refusal` — odd-sum, off-grid, foreign
+brush, and too-small rectangle refusals name their rule and write nothing; one diamond reports
+`diamonds`/`changedTiles`; a 16 × 12 High Dirt `terrain.isom_rect` on a new 64 × 64 Jungle map
+yields interior tiles of the High Dirt terrain type with a ring within 8 × 4 tiles of the
+rectangle. Rust lib `semantic_isom_rect_paints_a_plateau_and_off_lattice_brush_names_the_rule`
+runs the same through `CandidateStore::draft_patch` and the verifier
+(`diff.terrainCells == changedTiles`). Schema/guide/prompt tests cover the twenty-first operation
+and the ISOM prompt bullet. Visual evidence (scratch, not retained): a High Dirt plateau, a Water
+pool, and a 3 × 3-diamond hill rendered on a blank Jungle map with correct cliff and shore pieces;
+the same rectangle on a copy of `rpg.scx` produced a High Dirt plateau whose ring came out as
+Dirt→Jungle from the map's retained ISOM values over null MTXM. Not verified: a live Map-window
+request through a provider, and `terrain.isom_rect` under a target mask (the existing
+outside-authority refusal applies unchanged).
+
 ## Native project and batch DAT
 
 Rust suite MUST cover:
@@ -267,7 +355,8 @@ Rust suite MUST cover:
 - duplicate/no-op/stale/malformed patch refusal;
 - semantic journal reject/rollback and restart persistence;
 - exact persisted state for 1, 50, and 200 changes.
-- native source-backed `trace_test_run`/`trace_suite_run` without Editor bridge access.
+- the runtime trace harness stays unregistered: no tool named `trace_test_run`/`trace_suite_run`
+  and no prompt that names them.
 
 Focused contract:
 
@@ -296,9 +385,14 @@ The test MUST:
 5. generate DataEditor/EDS through Rust;
 6. run configured euddraft for every source revision;
 7. require every `result.ok` and a fresh output SCX;
-8. validate the final generated EDS ordering.
+8. validate the final generated EDS ordering;
+9. find the complete run output in `build/euddraft/build.log` with every parsed warning present.
 
 A hand-written EDS smoke test is supplementary only; it does not replace this generator-path acceptance.
+
+### Build diagnostics shape — 2026-09-21
+
+Observed in an actual EPS session (`build_run` ×3 on a 256×256 map with 65,056 null tiles): euddraft exited 0 and wrote a fresh output map, but the result was `ok:false` with eleven `"euddraft source error"` entries because every `File "…", line N` frame of a `warn_with_traceback` stack counted as an error; the 727 KB `Null tiles at:` stdout line pushed the observation to 731 KB, the native CLI spilled it to a file the session could not read, and the agent asked the user to paste the build panel. Permanent unit contracts now cover: a warning stack under exit 0 + fresh output is `ok:true` with two warnings; epScript `[Error N] Module "main" Line n` lines become `src/main.eps` errors with the compile messages; a `[Error] … Traceback` block is one error at the innermost `.eps` frame; `output_excerpt` cuts long lines and elides the middle; `build_run_observation` drops the raw streams and stays under 16 KiB for the tile listing; `build_log_page` pages by range and query with `nextLine` continuation. A separate reviewer pass then found that the Claude adapter measures native tool results double-escaped, so budgets moved from characters to that byte measure: `build_run_observation` and `build_log_page` are both asserted ≤ 40 KiB double-escaped against 30 errors + 60 warnings with 4 KiB backslash-heavy stacks and against 1,000 eudplib frame lines; stale `build.log` removal, non-fatal log write, multi-line `[Error]` messages, launcher `EOFError` demotion, verbatim-root path classification, and identical-warning merging have unit contracts. The real acceptance (`real_euddraft_builds_generated_native_project`) additionally asserts the log file. Live evidence of an agent using `build_log_read` is still owed.
 
 ## Real E3S compatibility
 
@@ -368,6 +462,49 @@ E3S onboarding: at 960×640, 1280×800, and 1920×1080, the primary import actio
 
 E3S review and recovery: populate mixed workspace, memory/wiki, and session omissions, including missing ordinary documents/plans, corruption, and occupied histories. Verify the third numbered **가져올 부가 문서 확인** step, complete scoped path list, Korean reasons and expandable raw diagnostics, explicit consent, recheck, and cancel. Review has no error alert and cannot activate the project. Verify neutral keyboard focus, reachable fixed-footer controls, busy disabling, no authorization on ordinary recheck or changed inputs, renewed consent for changed issues, and successful import of remaining data with unchanged originals. At 960×640, 1280×800, and 1920×1080, keep list and controls reachable with dialog-only scrolling and no horizontal overflow. Genuine errors must scroll into view with reachable details. Successful native migration omissions must remain visible even if environment setup is incomplete. On Windows, keep the selected destination directory open without delete-sharing during review/failure; cleanup leaves it empty instead of deleting it. A locked output must report its path without losing the primary cause.
 
+Blank-map wizard (2026-09-20): the launcher's **빈 맵으로 새 프로젝트** opens the ordered
+기본 → 지형 → 플레이어 → 완료 dialog. Without a resolvable StarCraft folder the first step shows the
+Korean reason and an in-place **StarCraft 폴더 선택** that must unblock 다음 without reopening the
+dialog; a brush-load failure on the terrain step must disable 다음 and offer **StarCraft 폴더 다시
+선택**. Verify name validation copy, the `maps/<name>.scx` / `build/[EUD]<name>.scx` hint, size
+presets plus free 64..256 input with non-numeric rejection, tileset change re-picking the first
+graphics-valid brush, all 12 slots with type (사람/컴퓨터/구출 가능/중립/사용 안 함/닫힘), race
+(+중립/사용 안 함) and force (P1..P8 only; P9..P12 show "—"), the four fixed forces with per-force
+name, flags and member summary, the three quick presets over the active P1..P8 slots (개별
+disabled above four), the start-location preview line (all packed top-left, four per row), busy disabling during creation,
+the preview image/summary on 완료, and **프로젝트 열기** leaving the launcher for environment setup.
+At 960×640 and 1280×800 the dialog must scroll internally with no horizontal overflow.
+
+Current-source evidence (2026-09-21): real-engine `isom` tests create and re-verify all eight
+tilesets from a 12-slot spec (OWNR/SIDE bytes for every slot, CP949 title/force-name bytes in the
+legacy `STR ` table), reject ten invalid specs without writing (missing/forbidden force, start on
+P9+, empty title, odd hex), and `map_edit_rewrites_scenario_players_and_forces_on_a_new_map`
+applies `scenario.set`/`player.set`/`force.set` and re-reads SPRP/OWNR/IOWN/SIDE/FORC/STR;
+`blank_project::tests::creates_a_native_project_around_a_generated_map`
+creates a project under a non-ASCII folder with a Korean name and, with `EUDDRAFT_PATH` and
+`NATIVE_ASSETS_DIR` set, builds `build/[EUD]새 맵.scx` through the real frozen euddraft. Chromium
+with only the Tauri invoke/listen transport mocked walked every wizard step at 1280×800 and
+960×640 with no console errors from app code (2026-09-20 layout; the 12-slot editors were
+verified by Vitest only). The wizard has not been exercised in the actual Tauri binary, and a
+wizard map with a Korean force name has not yet been reopened in SCMDraft 2 after the CP949 fix;
+those remain open.
+
+Map properties and SCMDraft 2 (2026-09-21): the Map window toolbar's **맵 속성** opens a
+기본/플레이어/포스 dialog seeded from the digest (`map.title/description`, `players[].controllerId/
+raceId/force`, `forces[]`). Saving is refused with an in-place reason while a candidate revision
+exists or the source is stale; otherwise only changed fields become ops, the work file is
+verified under the properties authority, `MapSafe::apply` replaces the source, and the toolbar's
+Undo restores the backup. Legacy OWNR bytes 1/2/4 shown as computer/human/unused stay untouched
+when unchanged. **SCMDraft 2로 열기** in the main-window header launches `config.scmdraft_path`
+(set under 설정 → 컴파일 → SCMDraft 2) with the source map; a missing or vanished executable
+returns `unconfigured` and the panel opens 설정 → 컴파일 directly (`setup` launch tests, App
+flow test). Evidence: `map_verify`
+tests (property sections rejected without the flag, counted with it, DIM/ERA/TRIG still fixed,
+old manifests default to `properties=false`), `map_candidate` properties-stage tests (no-op
+detection, `independent` round trip, exact post-edit digest), `config`/`ipc` round trips, and
+panel Vitest for the dialog/toolbar/settings. Not yet done: a live Tauri walk-through of the
+dialog, an actual save/undo on a real project map, and launching the installed SCMDraft 2.
+
 Windows association verification: build an NSIS package and inspect the sole hook-owned `.eap` registration, dedicated installed icon path, and open command quoting both the executable and file argument. A disposable NSIS harness may redirect registry paths to an isolated HKCU subtree and exercise install/reinstall/uninstall, legacy restoration, and changed-owner preservation without touching real file associations. In an isolated installed environment, also double-click an `.eap` with the app closed and already running; use spaces/non-ASCII characters in both installation and project paths. Browser transport and redirected-registry smoke tests do not establish installed Explorer double-click/icon-cache behavior; report that boundary separately.
 
 ## Cutover residue gate
@@ -401,23 +538,3 @@ The unconditional static/unit commands at the top MUST cover strict schema-v2 pa
 Real acceptance additionally uses `EUD_AGENT_EUDDRAFT` and `EUD_AGENT_BUILD_MAP` to prove local helper imports and lifecycle hooks, entrypoints before exact EPS MainFile in one frozen process, fresh SCX generation, normalized Python traceback file/line, raw access-violation status, pure/native wheel compatibility where supported, source-repository rejection, online preparation followed by offline verified-cache build, and fail-closed corruption without changing `project.eap`. Python-bearing E3S export must fail explicitly while the existing EPS-only real fixture remains stable.
 
 The panel TypeScript build, complete Vitest suite, and production build are unconditional even when panel files are unchanged.
-Blank-map wizard (2026-09-20): the launcher's **빈 맵으로 새 프로젝트** opens the ordered
-기본 → 지형 → 플레이어 → 완료 dialog. Without a resolvable StarCraft folder the first step shows the
-Korean reason and an in-place **StarCraft 폴더 선택** that must unblock 다음 without reopening the
-dialog; a brush-load failure on the terrain step must disable 다음 and offer **StarCraft 폴더 다시
-선택**. Verify name validation copy, the `maps/<name>.scx` / `build/[EUD]<name>.scx` hint, size
-presets plus free 64..256 input with non-numeric rejection, tileset change re-picking the first
-graphics-valid brush, per-slot type/race/force, the 1..4 force count with per-force name, flags
-and member summary (shrinking moves orphaned slots to the last force), the three quick presets
-(개별 disabled above four players), the start-location preview line (all packed top-left, four per row), busy disabling during creation,
-the preview image/summary on 완료, and **프로젝트 열기** leaving the launcher for environment setup.
-At 960×640 and 1280×800 the dialog must scroll internally with no horizontal overflow.
-
-Current-source evidence: real-engine `isom` tests create and re-verify all eight tilesets and
-reject five invalid specs without writing; `blank_project::tests::creates_a_native_project_around_a_generated_map`
-creates a project under a non-ASCII folder with a Korean name and, with `EUDDRAFT_PATH` and
-`NATIVE_ASSETS_DIR` set, builds `build/[EUD]새 맵.scx` through the real frozen euddraft. Chromium
-with only the Tauri invoke/listen transport mocked walked every wizard step at 1280×800 and
-960×640 with no console errors from app code. The wizard has not been exercised in the actual
-Tauri binary, and the generated map has not been reopened in SCMDraft 2; those remain open.
-

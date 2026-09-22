@@ -69,7 +69,7 @@ Map Agent Workbench는 기존 채팅 화면에 추가되는 패널이 아니다.
 - 후보 diff/verification 요약
 - 전체 후보 원자 적용 및 적용 취소용 backup/journal
 - app restart 후 미적용 후보 복구
-- source 외부 변경 감지와 stale candidate 차단
+- source 외부 변경 감지와 저장된 원본 따라가기(자동 rebase)
 
 ### 3.2 제외
 
@@ -257,7 +257,9 @@ Operation: replace | add | subtract | invert | clear
   graphics/visibility/dimension metadata를 사용한다. 지원하지 않는 kind-field 조합은
   무시하지 않고 오류로 닫는다.
 - 사용자용 `map_agent_catalog`은 빈 검색과 `offset`/`limit`을 유지하여 palette browse를
-  계속 지원한다.
+  계속 지원한다. 개별 타일 보기의 "null 타일 제외" 체크박스는 `hideNullTiles`로 native
+  `filter.nullTile: false`(megatile 0 variant 제외)를 pagination 전에 적용하며, 브러시와
+  다른 kind에는 전달하지 않는다.
 
 #### Units/Buildings
 
@@ -274,13 +276,14 @@ Operation: replace | add | subtract | invert | clear
 
 #### Locations
 
-- 기존 location은 map click 또는 palette search로 instance mention한다.
+- 기존 location은 map click, palette search 또는 prompt `@` 검색으로 instance mention한다.
 - `새 로케이션` type mention은 name과 bounds/selection 관계 qualifier를 갖는다.
 - `#64 Anywhere`는 read mention만 가능하며 mutation qualifier를 비활성화한다.
 
 ### 5.6 Mention 상호작용
 
 - palette `+`는 즉시 type mention chip을 만든다.
+- prompt 입력의 `@`는 저장된 selection(region)과 candidate location만 제안하는 listbox를 연다. 선택하면 `@query` 텍스트를 지우고 같은 tray chip을 만들며, 본문에는 토큰을 남기지 않는다. 검색은 로컬 candidate 상태만 사용하고 backend `mention_search`를 호출하지 않는다.
 - canvas 개체 `프롬프트에 추가`는 candidate-revision-bound instance mention을 만든다.
 - chip click은 qualifier/details popover를 연다.
 - chip focus/hover는 canvas selection/object를 강조하고 필요 시 `맵에서 찾기`로 pan한다.
@@ -301,7 +304,7 @@ Operation: replace | add | subtract | invert | clear
   - protected mask 변경 수
   - unsupported section changes
   - validation status
-- 후보 Apply는 validation pass와 non-stale baseline에서만 활성화한다.
+- 후보 Apply는 validation pass에서만 활성화한다. 원본이 바뀌면 후보를 새 원본 위로 옮긴 뒤(rebase) 다시 검증하고, 옮길 수 없으면 `sourceDiverged`로 표시하되 Apply는 막지 않는다(후보가 이긴다).
 
 ## 6. 핵심 데이터 모델
 
@@ -454,7 +457,7 @@ native boundary에 전달하는 versioned UTF-8 JSON batch다. map text bytes는
 
 지원 operation families:
 
-- `terrain.set`, `terrain.rect`, `terrain.blit`, `terrain.isom_brush`
+- `terrain.set`, `terrain.rect`, `terrain.blit`, `terrain.isom_rect`, `terrain.isom_brush`
 - `unit.add`, `unit.set`, `unit.delete`, `unit.move`
 - `doodad.add`, `doodad.set`, `doodad.delete`, `doodad.move`
 - `sprite.add`, `sprite.set`, `sprite.delete`, `sprite.move`
@@ -632,6 +635,19 @@ Save invariants:
    - existing `Terrain_::Tiles.brushes` name/index 사용
    - `placeIsomTerrain`/`updateTilesFromIsom` 경로 재사용
    - ISOM이 transition을 위해 target 밖을 바꿀 수 있으므로 결과 diff가 allowed mask를 벗어나면 candidate finalize를 거부한다.
+   - `terrain.isom_rect {x, y, width, height, brush}`가 모델의 기본 형태다: 타일 사각형 안에
+     4×2 footprint가 완전히 들어가는 모든 ISOM diamond(`(dx+dy)` 짝수, tiles
+     `[2dx-2, 2dx+1] × [dy-1, dy]`)를 한 번에 칠하고 transition ring을 한 번만 재생성한다
+     (`ScMap::placeIsomTerrainDiamonds`). ring은 맵의 ISOM 데이터에서 다시 계산되며 사각형
+     둘레 최대 diamond 2개(가로 8타일·세로 4타일)까지 미친다. 2026-09-22 rpg.scx 실측: 기존
+     MTXM이 exact tile/null이어도 ISOM 값이 남아 있으면 ring은 ISOM 지형(Dirt→Jungle)으로
+     나온다. 5×3 미만이라 diamond가 하나도 안 들어가면 거부한다.
+   - `terrain.isom_brush {isomX, isomY, brush, [extent]}`는 단일 diamond 형태다. 네이티브는
+     ISOM 섹션 크기 불일치, tileset에 ISOM 값이 없는 brush, grid 밖 좌표, `isomX+isomY` 홀수를
+     각각 이유가 적힌 오류로 거부한다. 2026-09-22 이전에는 `semantic ISOM brush placement
+     failed` 하나뿐이었고 grid 밖 diamond는 0셀 변경 성공으로 보고되어, 모델이 이를 "맵에 ISOM
+     데이터가 없다"로 오진했다(실제 rpg.scx는 완전한 ISOM 섹션 보유). effect는 `diamonds`와
+     `changedTiles`를 함께 보고한다.
 2. **Exact tile patch**
    - POC set/rect/blit와 tile validation 사용
    - MTXM/TILE을 함께 기록
@@ -743,7 +759,7 @@ Apply:
 2. `ProjectWriteCoordinator` ticket 획득
 3. STATUS compiling guard
 4. source no-share lock probe
-5. current source file SHA-256 == candidate baseline SHA-256
+5. `follow_source`: current source file SHA-256 != candidate baseline SHA-256이면 후보를 원본 위로 rebase(또는 diverged 표시)하고 baseline을 갱신
 6. candidate current hash/state 확인
 7. candidate full verification 재실행
 8. timestamped full-file backup
@@ -798,6 +814,7 @@ Read tools:
 - `map_selection_read`
 - `map_objects_read`
 - `map_render`
+- `map_terrain_read` (visible candidate MTXM ids, row-major, ≤ 4096 tiles per call)
 - `map_palette_query`
 - `map_tile_info`
 - `map_analyze`
@@ -808,6 +825,7 @@ Draft tools:
 - `map_draft_begin`
 - `map_draft_patch`
 - `map_draft_render`
+- `map_draft_terrain_read` (request draft MTXM ids, same bound)
 - `map_draft_analyze`
 - `map_draft_reset`
 - `map_candidate_finalize`
@@ -904,7 +922,7 @@ map_error
 - startup은 state/current/map hashes를 검증한다.
 - orphan draft는 삭제한다.
 - baseline source hash가 여전히 같으면 후보를 복구한다.
-- source가 바뀌었으면 후보를 read-only stale 상태로 열고 Apply를 막는다. 사용자는 후보 diff를 볼 수 있지만 새 baseline으로 자동 replay하지 않는다.
+- source가 바뀌었으면 후보를 저장된 원본 위로 자동 replay·재검증한다(`follow_source`). 보이는 chain의 revision 하나라도 새 원본이 거부하면(크기/타일셋 변경, expected-before 불일치, verification 실패) 후보는 옛 snapshot에 남고 `sourceDiverged`가 켜지며, Apply는 저장된 원본을 백업한 뒤 덮어쓴다. chain 밖의 실패 revision은 버린다. 요청이 진행 중인 세션은 `stale`로 표시만 하고 요청이 끝난 뒤 따라간다. 사용자에게 폐기/새 작업을 요구하지 않는다.
 - Apply staging 중 crash 대비 source-directory temporary와 backup을 startup cleanup/repair 대상에 포함한다.
 
 ### 13.4 Object identity
@@ -1205,7 +1223,7 @@ cargo tauri build
 16. no-target은 전체 candidate 지원 레이어를 허용하고, 현재 target 밖 또는 unauthorized layer 변경은 finalize되지 않는다.
 17. unsupported map semantics와 extra MPQ assets가 보존된다.
 18. location IDs와 `#64 Anywhere`, trigger references가 보존된다.
-19. source hash가 바뀐 stale candidate는 적용되지 않는다.
+19. source hash가 바뀐 후보는 새 원본 위로 옮겨진 뒤(또는 diverged로) 적용된다; 요청 진행 중(stale)에는 적용되지 않는다.
 20. Apply는 compiling/lock/hash/backup/verification/coordinator rails를 모두 통과해야 한다.
 21. mixed-layer candidate는 전체가 원자 적용되거나 원본이 유지된다.
 22. post-apply source가 candidate와 canonical-equivalent하다.
@@ -1271,7 +1289,7 @@ panel/src/map/**
 | ISOM transition이 mask 밖을 변경 | draft 전체 diff 후 finalize 거부; 자동 clip 금지 |
 | doodad가 terrain과 sprite를 동시에 변경 | semantic doodad op와 multi-layer permission 요구 |
 | 실제 GRP object 렌더가 새 구현 | shared renderer, golden image, real-install visual smoke |
-| 후보 중 source가 외부 변경 | 장기 lease 대신 Apply hash compare와 stale refusal |
+| 후보 중 source가 외부 변경 | 장기 lease 대신 `follow_source` rebase(충돌 시 후보 승) + `MapSafe::apply`의 exact hash compare |
 | map object ordinal 재정렬 | revision-bound fingerprint + candidate-local UUID, ambiguous remap 금지 |
 | 후보 리비전이 disk를 과다 사용 | baseline/current SCX만 materialize하고 revisions는 operation manifest로 저장 |
 | map-agent 권한이 main 앱보다 넓어짐 | 별도 Tauri capability와 user-only Apply command |

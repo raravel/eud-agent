@@ -22,7 +22,7 @@ A run fixes session/request/job identity, target kind, cancellation generation, 
 
 Ordered text, reasoning, tool batches/results, signatures and encrypted/native continuation data retain their protocol meaning. Partial output followed by an error, incomplete response boundary, malformed tool-call framing (invalid id/name/non-object arguments, duplicate ids, unknown tools), or truncated structured result fails explicitly. Model arguments that violate an advertised schema are not framing failures: they complete as usage errors the model can correct. No model-name exceptions, reasoning-as-answer substitution, prose JSON extraction, or cross-provider/model fallback repairs such a failure.
 
-`RunPolicy.max_output_bytes` measures serialized normalized blocks and final semantic output in the common runtime. It does not shrink native/raw transport limits: OpenCode Go, Ollama, and Antigravity each retain a separate 16 MiB HTTP response ceiling; Claude Code retains a separate 32 MiB stdout ceiling and 1 MiB JSONL-line ceiling; Codex retains its existing common checks. Therefore a valid large wire envelope with small normalized content may continue, while normalized content over policy fails with the common byte-limit error.
+`RunPolicy.max_output_bytes` measures serialized normalized blocks and final semantic output in the common runtime. It does not shrink native/raw transport limits: OpenCode Go, Ollama, and Antigravity each retain a separate 16 MiB HTTP response ceiling; Claude Code retains a separate 32 MiB stdout ceiling that also bounds a single JSONL line (an echoed tool result carrying a rendered map image is limited only by that ceiling, not by the 64 KiB native observation limit); Codex retains its existing common checks. Therefore a valid large wire envelope with small normalized content may continue, while normalized content over policy fails with the common byte-limit error.
 
 Direct conversations retain validated generation/pointer storage. A committed head can repair lagging matching metadata; missing, corrupt, mismatched, or ahead-of-head state fails closed. Native continuation candidates are adopted only at confirmed boundaries, and durable execution receipts retire only after application metadata persistence is acknowledged. Late events must still match their captured identity. Unknown native state blocks resume while preserving review; explicit reset discards that unconfirmed continuation and starts a fresh one.
 
@@ -53,11 +53,76 @@ stream; tool calls do. The `answer` and `direct` routes keep the ordinary foregr
 `[route]` note; `pipeline` never runs a foreground turn before the user approves the plan file.
 
 Clarify emits the ASK event from the engine (no model tool call), appends the answers as
-`[clarification]`, and re-triages at most twice. Plan feedback re-runs the planner (and, in deep
+`[clarification]`, and re-triages at most twice. When the 240 s ask wait elapses the turn ends
+successfully with the questions as its text answer, the workflow settles as `done` with the
+questions retained as `pendingClarification`, and the next interactive message on that session
+continues the same triage (original request, earlier answers, spent rounds) as the reply instead
+of starting a new request; an autonomous or Map turn in between discards it. Plan feedback re-runs the planner (and, in deep
 mode, the reviewers). Verification runs after the executing turn while the request still holds
 its write ticket; a `fail` re-enters the executing turn with the unmet criteria once, and the
 verdict is rendered above the changeset. Cancellation at any stage returns the session to idle
 and retains completed artifacts. Map sessions and autonomous runs are unaffected.
+
+## Read delegation and Map handoff
+
+Two foreground tools reuse the delegated-run and Map-session machinery so the EPS agent can push
+work out of its own context without gaining any authority (plan: subagent delegation and team
+handoff, Phases 1–2).
+
+- `delegate_read {goal, focus[]}` runs one `DelegatedRunKind::Read` child over the exploration
+  reads (`project_status`, `list_files`, `read_file`, `source_search`, `search_docs`, `docs_get`,
+  DAT getters, `settings_get`, `plugins_list`, `map_info`, `map_minimap`, `map_sound_list`) with a
+  fixed `{summary, findings[{path?, line?, excerpt?, note}], openQuestions, toolCalls}` schema, a
+  240 s deadline, and 16 rounds. The child inherits the parent's session, request, and
+  cancellation generation with a fresh run id; it cannot write, ask, build, run traces, prepare
+  dependencies, request a map task, or delegate again, and a live write ticket refuses it. Its
+  `search_docs` never lifts the parent's evidence gate. At most 8 delegations are admitted per
+  foreground run; a failed, cancelled, or timed-out child completes as a `delegation_failed` /
+  `delegation_cancelled` usage error. The child's tool events reach the panel tagged with
+  `delegationRunId` and nest under the parent `delegate_read` row; a `delegation` event carries
+  the lifecycle, tool count, elapsed time, and usage, which is added to the session `total` only.
+  The context-pressure continuation prompt points exploration at `delegate_read`; the engine
+  never delegates on its own.
+- `map_task_request {goal, layers[], selectionIds[]?, locationIds[]?}` hands placement work to
+  the EPS session's team Map session (`SessionMeta.team_parent`, created lazily with the parent's
+  binding and named `<parent> · 맵 작업`). The EPS parent is matched by manifest name against the
+  open project and the team session is keyed by the Map project id (the project-root hash), the
+  same identity every other Map session uses; the two keys are never compared with each other.
+  It needs no open Map window. It requires a successful `map_info` in the same request,
+  refuses while any task of the session is `queued`/`running`/`candidate_ready`, and stores a
+  durable `TeamTask` on the EPS record before submitting an ordinary Map request (target selection
+  ids and location ids become validated Map mentions). The call waits up to 240 s: `candidate_ready`
+  returns the revision summary, `running` returns while the Map request continues on the manager's
+  team dispatcher and settles the task later. When a task settles as `candidate_ready` the
+  dispatcher opens (or focuses) the Map window on the team session (`open_map_window`): a fresh
+  window bootstraps that session, an open idle window switches to it through the
+  `map-agent-open-session` event, and a target whose task is still running or that no longer
+  belongs to the current source map falls back to the ordinary session resolution. The task
+  card's "맵 창 열기" targets the same session. The EPS agent then decides in the same turn
+  (Phase 2b): `map_task_diff {taskId}` (diff counts and verification), `map_task_objects {taskId,
+  layer, offset?, limit?}` (exact placements), and `map_task_render {taskId, x, y, width, height,
+  scale?, layers?}` (an image crop) read the team session's live candidate and refuse when it is
+  no longer the announced revision/hash; each success records `RequestState.candidate_inspected`.
+  `map_task_apply {taskId}` is a canonical write (write transition, project transaction, exempt
+  from the docs gate) that requires that inspection in the same request and runs
+  `MapAgentService::apply` on the team session, marking the task `applied` with
+  `appliedBy: agent`; `map_task_discard {taskId}` drops the candidate (`discarded`). A follow-up
+  `map_task_request` while a task is `candidate_ready` is admitted: it continues the same
+  candidate lineage and marks the earlier task `superseded`. Both actions go through an
+  engine-injected synchronous executor (`team::run_action`), announce every settled task, and push
+  `map_candidate_state` to an open Map window; a delegated child may use none of the team tools.
+  The user's Apply, discard, undo, and revert in the Map window map the task to `applied`
+  (`appliedBy: user`) or `discarded` (`map_task_apply_undo` performs the same undo by team
+  session id; the main window shows no task card); EPS
+  cancellation cancels the Map request (`cancelled`); startup maps `running` to `interrupted` and
+  keeps `candidate_ready` only while the team session still holds that exact revision. While a task
+  is active, `location_write`, `switch_write`, `player_setup`, and map sound tools are refused with
+  `map_task_in_progress`. `map_task_status {taskId}` re-reads one task. Every EPS turn receives a
+  `[map tasks]` note listing the newest five tasks with what to do next (inspect/apply/revise/
+  discard for a ready candidate, one status read for a running one). An autonomous turn that ends
+  with an active task pauses as `team_apply`; when the task later settles the team dispatcher
+  resumes that run (`TeamCommand::ResumeAutonomous`), so a candidate that took longer than the
+  240 s wait continues without the user.
 
 ## Structured jobs
 
@@ -80,6 +145,8 @@ Project state changes invalidate stale source/mention/workspace authority. A mis
 - `build_run` requires the project transaction but not write-workspace admission; generated EDS,
   Python, output maps, and other build artifacts never enter the semantic changeset.
 - `dat_patch` is the only model-facing DAT mutation boundary.
+- `ask`, `delegate_read`, and `map_task_request` are the only tools that wait asynchronously on
+  the run gate instead of a blocking worker; every one of them settles within the same 240 s bound.
 - `ask` waits at most `ASK_WAIT_TIMEOUT` (240 s) for `ask_response`. Native Codex/Claude CLIs abort
   a silent MCP call after 300 s and progress notifications do not extend it, so the wait is bounded
   below that. An unanswered ask completes as `{status: "unanswered", questionIds, waitedSeconds}`,
@@ -131,7 +198,10 @@ and repeated identical progress fingerprints are reported but never stop a run.
 ## Build and diagnostics
 
 `build_run` invokes the native generator and euddraft runner as a serialized project transaction.
-It returns `{ok, errors, stdout, stderr, outputMap}` with file/line diagnostics. Analyzer diagnostics
+It returns `{ok, errors, warnings, outputExcerpt, logPath, artifacts, buildProgress}` with file/line
+diagnostics; the raw streams live in `build/euddraft/build.log` and `build_log_read` pages that log
+by line range or query, so a euddraft run that lists every null tile never overflows a provider's
+tool-result ceiling. Warnings are reported but never fail a build. Analyzer diagnostics
 are advisory; a fresh euddraft output is final success authority. Stable normalized
 `(project revision, diagnostics)` fingerprints stop unchanged failures and short oscillation cycles;
 successful, changed-revision, and improving builds have no lifetime count. An autonomous
@@ -144,8 +214,10 @@ preparation fingerprints the complete normalized desired set and reuses a valid 
 without repeating environment probes, resolution, or downloads; expiry, ownership, single-use,
 hash, cache-integrity, timeout, and bounded-download checks remain mandatory.
 
-After a successful build, `trace_test_run` and `trace_suite_run` use the native source snapshot and
-generated EDS to run isolated runtime diagnostics. They never query an Editor project or bridge.
+The StarCraft runtime trace harness (`trace_test.rs`) is not an agent tool: `trace_test_run` and
+`trace_suite_run` are not registered, no prompt or stage profile names them, and the plan/verdict
+schemas carry no test list or test counts. Map selection does not yet commit on the hidden desktop,
+so a model-driven run could never reach gameplay; only the ignored live tests drive the module.
 
 ## Removed runtime
 

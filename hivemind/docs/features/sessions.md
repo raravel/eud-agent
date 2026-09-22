@@ -40,6 +40,14 @@ All writes use `memory::write_atomic_bytes` and UTF-8 without BOM. `index.json` 
 }
 ```
 
+`id` is minted by `session::new_session_id` (a v4-shaped UUID whose high word is mixed so the
+leading digits differ between sessions created seconds apart). Its first eight characters
+(`session::short_session_id`, panel `shortSessionId`) are the human handle: the EPS sidebar and
+the Map history dialog show the short id as a chip beside each session, clicking the chip copies
+the full id, and the team Map request text names the parent EPS session as
+`"<name>" (session id <short>)`, so a person or the Map session can refer to one session without
+its title.
+
 `createdAt` is Unix seconds; `lastConversationAt` is Unix milliseconds. First request admission
 copies the ready global default provider/model/reasoning into the record before worker creation.
 Subsequent global changes never mutate the row. Rename, panel-log autosave, context usage,
@@ -164,6 +172,16 @@ projection. Rewind is rejected while the session is running, waiting for write, 
 recoverable pending review. If every pending marker instead names a missing or empty journal,
 explicit rewind clears the unrecoverable markers and repairs the session so conversation can
 resume.
+
+The Map window offers the same "수정" action on its user rows through
+`map_agent_conversation_rewind`. Map `you` rows carry no `clientTurnId` (the engine mints the
+turn id for `map_agent_chat`), so the anchor is the row's `requestId`: the store resolves it to
+the client turn of the task event that request produced on the current branch, and an unknown
+request id selects the empty projection like a legacy prefix. The rewind refuses while a Map run
+(the window's own or a team request) holds the engine instead of waiting behind it. The
+candidate map and its revisions are not touched: only the provider thread, task branch, and
+persisted log move, and the edited text, attachments, and mention chips (rebuilt from the row's
+`mapMentions`, then re-checked for staleness against the current candidate) return to the prompt.
 
 `PanelLogEntry.mentions` is an optional additive schema-v2 field containing ordered generic
 `MentionInstance` records. The panel preserves exact backend-created snapshots through autosave,
@@ -330,11 +348,31 @@ Approved plan snapshots remain app-owned, immutable, and preserved after impleme
 `SessionRecord.workflow` holds the `WorkflowState` of the current staged request: stage, route,
 triage goal/acceptance criteria, research/plan/verdict artifact references (path + SHA-256), plan
 revision and approval hash, critique rounds, verify attempts, deep-planning capture, and the user
-text with clarification answers. It is replaced atomically at every transition. Startup maps an
+text with clarification answers, plus the questions of a clarify ask whose bounded wait elapsed
+(`pendingClarification`), which the next interactive request consumes as its reply. It is replaced
+atomically at every transition. Startup maps an
 in-flight stage (`triage`, `research`, `planning`, `critique`, `verifying`) to `interrupted`; plan
 review and changeset review survive as they are. `workflow_resume` restarts the interrupted stage
 from its persisted inputs after validating the project revision; `workflow_restart` clears the
 state and resends the same user text as a fresh request.
+
+## Team map tasks
+
+`SessionRecord.team_tasks` (EPS sessions only) holds every `map_task_request` handoff: id, parent
+request, team Map session and Map request ids, goal, layers, selection/location scope, the source
+hash at creation, `status` (`queued`, `running`, `candidate_ready`, `applied`, `discarded`,
+`failed{reason}`, `cancelled`, `interrupted`, `superseded`), the candidate summary, the applied
+source hash, and `appliedBy` (`user` or `agent`).
+`SessionMeta.team_parent` marks the one team Map session an EPS session owns; it lists in the Map
+window with an "EPS 세션의 팀 작업" badge, keeps the parent's provider binding, and is deleted with
+its parent (refused while a task is still active). Startup maps `queued`/`running` to
+`interrupted` and `candidate_ready` to `discarded` unless the team session still holds exactly
+that revision; nothing resumes automatically. The `team_task` event announces every change to the
+owning EPS session; the panel keeps the tasks in session state and records candidate-ready,
+applied, and failed transitions as conversation-log lines, with no fixed card above the input.
+The Map window opens on the team session by itself when a task's candidate becomes ready and is
+where the user applies, discards, or undoes (`map_task_apply_undo` is the same undo by team
+session id, announced to both windows).
 
 ## Autonomous run lifecycle
 

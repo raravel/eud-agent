@@ -62,6 +62,9 @@
 - Hold a project-scoped build marker for the full euddraft process.
 - Build success requires exit success and a fresh expected output map.
 - Surface structured file/line diagnostics; never suppress or special-case a compiler symptom.
+- One euddraft traceback or `warn_with_traceback` stack is one diagnostic located at its innermost project frame; epScript `[Error N] Module "m" Line n` lines keep their source file/line. Warnings are reported separately and never fail a build; `ok` depends only on errors, exit status, and a fresh output map.
+- `build_run` persists the complete stdout/stderr as `build/euddraft/build.log` (removed before each run so a timed-out or cancelled run never leaves a stale log; a stale log that cannot be removed is reported as a warning with `logPath: null`, never presented as this run's) and hands the model only structured diagnostics plus a bounded head/tail excerpt; `build_log_read` pages the log. Both the observation and every page are bounded by the double-escaped byte measure the Claude adapter applies (40 KiB), with omitted diagnostic counts reported. Raw euddraft output never enters a tool observation unbounded. A failed log write is a reported warning, never a discarded build verdict.
+- euddraft's own post-failure `input()` under the launcher's closed stdin (an `EOFError` traceback with no project frame ending in `euddraft.py`) is the launcher's artifact and is reported as a warning, not as a project error.
 - Map/sound writes refuse while the build marker is held.
 
 ## Source editing and build verification
@@ -77,10 +80,26 @@
 - Tool schemas are closed, typed, and validated before dispatch.
 - `const`, `enum`, `oneOf`, primitive, array, and object constraints MUST match the advertised schema. A violating call completes with a detailed usage error the model can correct within the run's tool-round budget; it never executes and never fails the run outright. Duplicate call ids, unknown tools, malformed call shape, and stale-run dispatch remain fatal admission errors.
 - Read tools never consume write budgets.
+- The Map Agent reads tile ids with `map_terrain_read`/`map_draft_terrain_read` (≤ 4096 tiles per call); probing ids through `terrain.set` expected-before conflicts is prohibited.
+- Semantic terrain that must blend with its surroundings (hills, plateaus, pools, ground-type
+  changes) is painted with the ISOM brushes: `terrain.isom_rect` on a tile rectangle (the model's
+  default form) or `terrain.isom_brush` on one ISOM diamond (`isomX` = tile x / 2, `isomY` = tile
+  y, `isomX + isomY` even, footprint `[2·isomX−2, 2·isomX+1] × [isomY−1, isomY]`). The transition
+  ring is regenerated from the map's ISOM data up to two diamonds (8 × 4 tiles) around the painted
+  area. Cliff edges are never assembled from exact tile ids unless the user asks for exact tiles.
+  The native engine refuses a missing/mis-sized ISOM section, a brush without an ISOM value, an
+  off-grid or off-lattice diamond, and a rectangle holding no whole diamond, each with the exact
+  reason; it never reports a no-op placement as success, and the model never concludes from a
+  refusal that the map lacks ISOM data.
 - No single tool call waits longer than 240 seconds: native CLIs abort a silent MCP call at 300
   seconds. `ask` expires into a plain-text handoff; any future delegation or team wait shares the
   bound and continues as a new user turn.
 - Mutations require evidence and a project write registration.
+- A `delegate_read` child never writes, asks, builds, delegates again, or lifts the parent's evidence gate; the parent re-reads a target before editing it.
+- The EPS session never places terrain, units, buildings, doodads, or sprites itself: it hands that work to its team Map session with `map_task_request`. A team candidate reaches the source map only through the Map window's Apply or the EPS session's `map_task_apply`, which is admitted only after that request inspected the exact announced candidate (`map_task_diff`/`map_task_objects`/`map_task_render`) and runs the Map window's own backup, verification, and rollback; the user can undo either apply from the Map window. Every `map_task_request` runs in a fresh team Map session on the saved source map; a ready candidate is never continued by a later request, and an earlier team session is retired unless its Apply is still undoable. While a team task is queued, running, or candidate_ready the EPS session's own map writers are refused.
+- A team task that settles after its `map_task_request` returned `running` continues the EPS conversation by itself: the engine starts one ordinary interactive turn on the fixed "이어서 진행" text once the session is idle (never over a pending review, plan, or live autonomous run, never for a cancelled task, never across a restart) and announces it through `team_task.continuation` so the panel records the user turn. A settlement the engine could not pick up reaches the model through `[map tasks]` on the next user turn.
+- A team task goal relays the user's request, never the EPS session's design: the user's wording and intent in the user's language, the reference area to match, and only the constraints the code depends on (bounds, keep-clear cells, location ids, walkability, layers to leave alone). The EPS session never chooses the medium, counts, palette ids, cluster coordinates, or a layout, never pastes `map_info` tile ids that are not themselves a constraint, and grants every layer the look may need. The team wrapper tells the Map Agent to work the goal exactly like a Map-window request (palette, draft, render, analyze, iterate, one finalize) and that the design is its own; a team session has the same engine, prompt, provider binding, and tools as the Map window.
+- A doodad is laid out as StarCraft's CV5 defines it: the DD2 id is the CV5 `ddDataIndex`, row `y` of the footprint is CV5 group `start + y`, cell `(x, y)` is tile `16 * (start + y) + x`, and a row cell whose `megaTileRef` is 0 leaves the terrain untouched. Footprint tiles are never derived from a single group, and `replacementTiles` restore only the cells the doodad owned.
 - Journal every accepted semantic mutation with exact before/after state.
 - Reject/rollback applies inverse operations in reverse sequence and persists exact canonical state.
 - Never advertise obsolete individual DAT setters or bridge commands.
@@ -96,12 +115,27 @@
 
 ## Map safety
 
-- The selected source-map hash is an authority token. Reject stale maps.
+- The saved source map is the authority every Map session follows; a session never owns it. When
+  the source hash differs from a session's baseline, the session re-reads the source and replays its
+  candidate revisions onto it with fresh verification (last writer wins). A revision the new source
+  cannot reproduce leaves the candidate on its old snapshot with `sourceDiverged`; Apply then
+  overwrites the saved bytes after backing them up — but only the user may Apply a diverged
+  candidate from the Map window; `map_task_apply` refuses it. A followed source also retires the
+  last Apply's undo (`canUndo` requires the source to still be that Apply's output). Only a session
+  with an active request defers (`stale`) until that request settles. Never ask the user to discard
+  or reopen because the source changed. Every load → follow → save window holds the session lock,
+  and `MapSafe::apply` still compares the exact source hash it was handed and refuses a race.
 - Before mutation: native build guard, Windows no-share probe, full backup, disk-capacity check, and candidate authority validation.
 - After mutation: re-extract CHK, verify the requested delta and invariants, then atomically replace.
 - If verification fails, restore exact backup; retain backup path when restoration also fails.
 - SCMDraft lock recovery text names the required save/close action.
 - Never write a Korean/non-ASCII managed MPQ sound path; managed paths are ASCII content-addressed.
+- Every CHK string the app writes (locations, wizard title/description/force names, scenario
+  properties) goes through `chk::encode_chk_text`: ASCII verbatim, `STRx` maps UTF-8, legacy
+  `STR ` maps CP949, UTF-8 only when CP949 cannot represent the text. Never write raw UTF-8 into
+  a legacy string table.
+- `SPRP/OWNR/IOWN/SIDE/FORC` change only through the Map window's properties request, verified
+  under a properties authority; every other Map request treats them as fixed sections.
 
 ## Panel UX
 
@@ -117,9 +151,9 @@
 - Refuse project switches during active work. Preserve forwarded requests for visible retry rather than dropping them or switching under a running agent/build.
 - Error text states a recovery action and never leaks raw protocol identifiers as the only explanation.
 - Use Lucide/vector icons, semantic theme tokens, and reduced-motion classes; no emoji structural icons.
+- Every panel control is a shadcn/ui primitive from `panel/components/ui` (Button, Input, Textarea, Select, RadioGroup, Checkbox, Switch, Dialog, Tabs, ...). Native `<select>`, `<input type="radio">`, `<input type="checkbox">`, or hand-styled equivalents are prohibited; a missing primitive is added with the shadcn CLI (`npx shadcn add <name>` in `panel/`), never hand-rolled.
 
 ## Verification
-- Every panel control is a shadcn/ui primitive from `panel/components/ui` (Button, Input, Textarea, Select, RadioGroup, Checkbox, Switch, Dialog, Tabs, ...). Native `<select>`, `<input type="radio">`, `<input type="checkbox">`, or hand-styled equivalents are prohibited; a missing primitive is added with the shadcn CLI (`npx shadcn add <name>` in `panel/`), never hand-rolled.
 
 - Bug fixes reproduce and then remove the observed failure.
 - Permanent contracts get behavior tests, not source-text tests.

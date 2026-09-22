@@ -40,6 +40,7 @@ src/**/*.eps
 dat/{standard,xdat,tbl,requirements,buttons}.json
 maps/<source>.scx
 build/
+references/<name>.scx       # verified copies of maps opened in the Map Importer, never canonical
 compat/editor-project.e3s   # only after E3S import
 ```
 
@@ -58,6 +59,23 @@ The manifest itself uses `.eap` (EUD Agent Project); there is no separate launch
 - `JournalStore`: durable semantic before/after records and reverse-order rollback through the native runtime.
 - `WorkspaceManager`: durable project-local agent documents and trusted turn baselines; the provider CLI cwd is the native project root, so there is no session mirror.
 - `MapSafe`: native build marker, Windows no-share probe, backup, isom mutation, verification, rollback.
+- `CandidateStore`: per-session baseline snapshot, operation-manifest revisions, and the current
+  candidate map. The saved source is the authority a session follows: `follow_source` runs at every
+  open/state/request/apply boundary and, when the source hash moved, replays the session's revisions
+  onto the new source with fresh verification, or marks `sourceDiverged` (candidate wins on Apply)
+  when the new source rejects a revision on the visible chain. The Map panel polls the source mtime
+  and reopens the session on change instead of asking for a new work item.
+- Map window scenario properties ("맵 속성": title, description, 12 slots, 4 forces) are a
+  UI-only request: `MapAgentService::properties_save` diffs the form against the current digest,
+  emits `scenario.set`/`player.set`/`force.set` into a session work file, verifies it under a
+  properties authority (the only authority allowed to change `SPRP/OWNR/IOWN/SIDE/FORC`), then
+  runs the ordinary `MapSafe::apply` + `complete_apply`, so the source map changes immediately
+  and the Map window's Undo restores the exact backup. It refuses while a candidate revision or
+  request exists.
+- "SCMDraft 2로 열기" is a main-window header action (`project_open_scmdraft`): it launches
+  `config.scmdraft_path` on the project's source map, and when the executable is unset or gone
+  it returns `unconfigured` so the panel opens 설정 → 컴파일 in place instead of showing a hint.
+  The share-lock probe keeps refusing Map writes while SCMDraft holds the file.
 
 No module reads an Editor heartbeat/status file, starts Editor, installs Lua, polls inbox/outbox, invokes BindingManager, or asks Editor to build.
 
@@ -71,11 +89,11 @@ Adapters preserve native authentication, protocol and session controls without o
 
 For OpenCode Go, ordinary function descriptors on the Responses and Chat Completions wires explicitly use non-strict schemas so optional tool fields remain representable; structured-job result descriptors remain strict. A parsed protocol or incomplete-stream failure remains that error class rather than being overwritten by a synthetic transport-close event. For Codex, native `context_usage` is published only after a nonempty official `turn/started` ID and only when the usage event names that active turn; unmatched prior or stale usage is ignored before it reaches the strict session sink.
 
-`RunPolicy.max_output_bytes` limits serialized normalized output in the common runtime. It is not an HTTP-body ceiling: OpenCode Go, Ollama, and Antigravity enforce their own 16 MiB raw-response limits, while Claude Code independently bounds total raw stdout at 32 MiB and one JSONL line at 1 MiB. Codex keeps its existing common-runtime checks. This separation admits harmless transport framing overhead but still rejects normalized semantic output beyond policy.
+`RunPolicy.max_output_bytes` limits serialized normalized output in the common runtime. It is not an HTTP-body ceiling: OpenCode Go, Ollama, and Antigravity enforce their own 16 MiB raw-response limits, while Claude Code independently bounds raw stdout at 32 MiB in total and per JSONL line, and exempts echoed MCP `image` blocks (rendered maps) from its 64 KiB native tool-observation limit. Codex keeps its existing common-runtime checks. This separation admits harmless transport framing overhead but still rejects normalized semantic output beyond policy.
 
-Direct batches and native MCP calls share a run-scoped tool gate over `SessionToolRuntime`. Each native endpoint/handler has a unique run URL and UUID identity, belongs to its creating run, and becomes invalid at shutdown. Native notifications are observations, not duplicate execution commands. Completed tools persist their journal/receipt independently of final-answer success. Cancellation blocks new admission while already-started operations settle; it never automatically replays or rolls back completed mutations.
+Direct batches and native MCP calls share a run-scoped tool gate over `SessionToolRuntime`. Each native endpoint/handler has a unique run URL and UUID identity, belongs to its creating run, and becomes invalid at shutdown. Native notifications are observations, not duplicate execution commands. Completed tools persist their journal/receipt independently of final-answer success; the receipt records each result verbatim up to 64 KiB and otherwise only its identity (an MCP image keeps `mimeType`/`width`/`height` with the PNG replaced by `dataBytes`/`dataSha256`; any other oversized result becomes `receiptOmitted`/`bytes`/`sha256`), so a long Map run of rendered candidates never exceeds the 64 MiB run-receipt bound. Cancellation blocks new admission while already-started operations settle; it never automatically replays or rolls back completed mutations.
 
-Direct transcript generation/pointer validation and native ID/receipt recovery remain distinct. Only confirmed boundaries advance continuation/context state; late events must still match their immutable run/session identity. Unknown native state and corrupt direct state fail closed with review intact; an explicit reset starts fresh rather than silently adopting a receipt. Application metadata acknowledgement retires native recovery receipts. This does not claim crash-atomic external side effects or universal exactly-once execution.
+Direct transcript generation/pointer validation and native ID/receipt recovery remain distinct. Only confirmed boundaries advance continuation/context state; late events must still match their immutable run/session identity. Unknown native state and corrupt direct state fail closed with review intact; an explicit reset starts fresh rather than silently adopting a receipt. A failed resume never blocks opening the session: the Map bootstrap returns `conversationResumeError`, the window opens with candidate/revision state intact, chat stays refused, and the panel's "대화 초기화" action (`map_agent_conversation_reset`) clears the receipt and starts a fresh native session. The Map window's per-message "수정" action (`map_agent_conversation_rewind`) rewinds the conversation to the rows before that message, anchored by the row's `requestId`, without touching the candidate map. Application metadata acknowledgement retires native recovery receipts. This does not claim crash-atomic external side effects or universal exactly-once execution.
 
 `AgentEngine` also owns the provider-independent autonomous controller. An autonomous run contains
 one durable request/journal and any number of soft-bounded foreground iterations. `RunOutcome`
@@ -84,6 +102,21 @@ provider-continuation boundaries. Direct adapters checkpoint their exact ordered
 completed tool results; Codex and Claude accept only official native continuation receipts. The
 engine persists each confirmed boundary, builds a minimal continuation from goal/task/blocker/build
 state, and never copies stale project contents into the next prompt.
+
+`SessionToolRuntime` also hosts two engine-injected executors, like the ask emitter: `delegate_read`
+runs one read-only `DelegatedRunKind::Read` child through `DelegatedRunExecutor` and returns only its
+schema result, and `map_task_request` records a durable `TeamTask` on the EPS session and submits an
+ordinary Map request to a **fresh** team Map session (new provider thread, empty transcript, candidate
+r0 on the saved source map) through the manager's team dispatcher; the parent's earlier team sessions
+are retired with their candidates unless the Map window can still undo their Apply against the current
+source. Both wait at most 240 seconds inside the tool call; the child's reads are never parent
+evidence. A Map request that outlives the wait returns `running`; when it later settles, the
+dispatcher's `team_continue` starts the EPS session's continuation turn itself (idle sessions only,
+announced as `team_task.continuation`), so the handoff completes without a user message. The EPS
+session then inspects the team candidate
+(`map_task_diff`/`map_task_objects`/`map_task_render`) and applies it with `map_task_apply` through
+the Map window's own apply path, replaces it with a corrected complete request (never a delta on the
+candidate), or discards it; the user can do the same in the Map window and undo an apply from either.
 
 `SessionToolRuntime` classifies tools on two axes: canonical write-workspace admission and shared
 project transaction. `build_run` uses only the latter, so an EPS read foreground builds in place
@@ -136,8 +169,8 @@ stateDiagram-v2
 `workflow` event; plan review survives reconnect and restart, in-flight stage jobs become
 `Interrupted` at startup and resume or restart only explicitly. Research, plan revisions, and
 verification verdicts are engine-rendered files under `.eud-agent/workspace/{research,plans,verify}`;
-the approved plan file instructs the executing turn and the verifier judges the changeset, build
-and trace evidence against its acceptance criteria. The default plan depth is planner + one critic
+the approved plan file instructs the executing turn and the verifier judges the changeset and
+build evidence against its acceptance criteria. The default plan depth is planner + one critic
 round; the app-wide "더 똑똑한 계획" setting runs planner → architect → critic up to three times.
 A `[project map]` section (source listing, entrypoints, plugins, DAT override counts, accepted spec
 index) is delivered through the context cursor like memory, so an unchanged tree costs nothing per
@@ -172,6 +205,8 @@ sequenceDiagram
 
 A project-scoped marker is held during build. Success requires a fresh output file. Generator inputs are version-matched compatibility assets copied from Tauri resources to LocalAppData.
 
+The runner writes the complete stdout/stderr to `build/euddraft/build.log`. The parser folds every Python traceback and every `warn_with_traceback` stack into one error or warning at its innermost project frame and reads epScript compile errors (`[Error N] Module "m" Line n : text`) as file/line errors; warnings never fail a build. Identical warnings merge with a `count`. The model's `build_run` observation carries `errors` (with `raw`), `warnings` (without stacks), `omittedErrors`/`omittedWarnings`, a bounded `outputExcerpt`, and `logPath`, never the raw streams (euddraft lists every null tile on one line); observation and `build_log_read` pages both stay under 40 KiB measured double-escaped, and `build_log_read` pages the log by line range or query with `nextLine` continuation.
+
 ## E3S boundary
 
 The independent NRBF reader/writer parses object graphs as data. Import semantically projects CUI EPS/MainFile/settings/plugins and all supported DAT families; unsupported GUI/RawText or Classic-as-main structures fail explicitly. Export updates the retained graph, copies referenced map assets, embeds an exact native payload, reparses, and writes atomically.
@@ -192,9 +227,12 @@ Environment setup after project selection:
 
 1. open/create/import a native project from the launcher or a direct file request. "Create"
    starts from an existing SCX/SCM or from the blank-map wizard (`NewMapWizard`): tileset,
-   64..256 size, initial ISOM terrain brush, title/description, map format, up to 8 slots with
-   type/race/force, 1..4 named forces with flags, start locations auto-placed as a packed top-left cluster, and a rendered
-   preview before the project opens. The wizard needs the StarCraft install folder
+   64..256 size, initial ISOM terrain brush, title/description, map format, all 12 CHK player
+   slots with type/race (force for P1..P8, like SCMDraft 2's player settings), 4 named forces with
+   flags, start locations auto-placed as a packed top-left cluster, and a rendered preview before
+   the project opens. Wizard text is encoded by `chk::encode_chk_text`: the new map has a legacy
+   `STR ` table, so non-ASCII title/description/force names are CP949 (SCMDraft 2 and the system
+   code page read them), with UTF-8 only as the unencodable fallback. The wizard needs the StarCraft install folder
    (`config.starcraft_path`, selectable in place and preferred over the default install folder)
    and generates `maps/<name>.scx` through `isom_map_new`, which saves via a same-directory
    temporary file and atomic promotion and re-opens the result before Rust re-reads the CHK;

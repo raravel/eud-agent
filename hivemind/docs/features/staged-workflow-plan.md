@@ -73,8 +73,8 @@ Users will not learn skill names. The pipeline must start from an ordinary chat 
 
 - Read-only stage jobs never take a write ticket, never register write intent, and never mutate
   canonical state. A write tool name in a job is a fatal admission error, not a transition.
-- `build_run` and `trace_suite_run` are admitted to the verifier only; they are project
-  transactions, not canonical writes, and run while the foreground is idle.
+- `build_run` is admitted to the verifier only; it is a project transaction, not a canonical
+  write, and runs while the foreground is idle. The runtime trace harness is not an agent tool.
 - Exactly one stage runs at a time per session. Stage jobs use the session's `SessionToolRuntime`
   under the request's identity and cancellation generation.
 - The plan file is the execution authority. Approval stores its SHA-256; execution and verification
@@ -117,7 +117,9 @@ Routes:
 - `pipeline`: everything else that writes.
 - `clarify`: the goal, target, or acceptance is materially ambiguous. The engine emits an ASK with
   the triage questions; the answers are appended and triage runs again. At most two clarify rounds
-  per request; a third ambiguity becomes an answer that states what is missing.
+  per request; a third ambiguity becomes an answer that states what is missing. An unanswered ask
+  (240 s) is the same text handoff as the `ask` tool, not a failure: the turn ends with the
+  questions as its answer and the user's next message continues that triage.
 
 ## Phase 0: Scenario set
 
@@ -171,7 +173,7 @@ Profiles:
 | triage | `project_status`, `list_files`, `read_file`, `source_search` |
 | research | triage set + `search_docs`, `docs_get`, `dat_get`, `xdat_get`, `tbl_get`, `req_get`, `btn_get`, `settings_get`, `plugins_list`, `map_info`, `map_status` |
 | planner, architect, critic | research set |
-| verifier | research set + `build_run`, `trace_suite_run`, `trace_test_run` |
+| verifier | research set + `build_run`, `build_log_read` |
 
 ### Executor
 
@@ -202,8 +204,20 @@ Profiles:
   through the gate's ordinary event path. Provider usage is captured on the outcome only.
 - `RuntimeExecutor` gains `run_delegated`. `SessionToolRuntime::begin_request` is called with the
   job request id; jobs run only while the session has no live write ticket.
-- Round budgets: triage 8, research 40, planner 24, architect 16, critic 16, verifier 24. Deadlines
-  follow the harness 300-second class. `max_output_bytes` 256 KiB.
+- Round budgets: triage 8, research 40, planner 24, architect 16, critic 16, verifier 24. Engine-owned
+  stages have a 900-second active deadline (`STAGE_DEADLINE`): a native research step reads sources,
+  docs, and map state inside one CLI turn and routinely outlives the harness 300-second class, while
+  the strip's 중단 control ends a stage early. `delegate_read` children keep the 240-second tool
+  bound. `max_output_bytes` matches the foreground turn (32 MiB); a native-session stage accumulates
+  every tool observation in one step, so a smaller cap fails research runs that read sources.
+- A `submit_result` accepted by the gate is the run's result even when the native CLI then keeps
+  its turn open (final text, late reads) until the deadline cuts it: the executor stops the
+  provider and returns the captured value instead of `TimedOut`.
+- The budget is a soft bound on direct adapters: the last round after at least one tool round is
+  submission-only. The gate advertises `submit_result` alone, a `[tool budget]` user notice opens
+  the round, and a profile read on it completes as a non-fatal usage error instead of executing,
+  so the model submits what it has read. A run that still does not submit fails as exhausted.
+  Native runs settle inside their first step and never reach the round.
 
 ### Acceptance
 
@@ -212,6 +226,9 @@ Profiles:
 - A job whose model returns prose without `submit_result` fails with a distinct error.
 - `submit_result` violating the schema completes as a correctable usage error within the round
   budget; a second violation after exhaustion fails the job.
+- On a direct adapter, the final round of a multi-round budget advertises only `submit_result`;
+  a submission there returns the result, while a read there completes with the submission-only
+  usage error and the run fails as exhausted.
 - The MCP `tools/list` for a job contains exactly the profile plus `submit_result`.
 - Cancellation during a job returns within `shutdown_grace` and retains no partial result.
 - Deterministic adapter fixtures for all five providers complete one job with two read rounds and a
@@ -242,8 +259,8 @@ retained write ticket, re-enters once on `fail` with the unmet items (unverifiab
 reported but never handed to a fix turn), and the rendered verdict reaches the harness job.
 Review rounds are recorded per iteration (`PlanArtifact.reviews`, `verify/<id>.plan.<n>.md`); a
 revision that was not re-reviewed shows no verdict. The `[project map]` section is delivered
-through a new context-cursor slot. Panel: stage strip, research/verdict cards, plan card
-extensions, interrupted controls, and the deep-planning switch. Deviations from the sections
+through a new context-cursor slot. Panel: stage strip, research/plan/verify report tabs
+(2026-09-21 cutover from inline cards), interrupted controls, and the deep-planning switch. Deviations from the sections
 below: the answer route stays at `triage` rather than `executing`; `workflow_restart` is refused
 while a review or write ticket is live; `clarify` counts as an in-flight stage.
 
@@ -295,8 +312,19 @@ engine becomes a projection of `WorkflowState.stage` for EPS sessions.
 - A stage strip above the conversation: 파악 → 조사 → 계획 → 승인 → 실행 → 검증 → 검토, with the
   active stage, attempt counters, and a cancel control; reduced-motion safe; aria-current on the
   active step.
-- Stage artifacts render as collapsible cards in the log: research summary, plan (existing
-  `PlanView` extended with acceptance criteria and critic summary), verification verdict.
+- Stage artifacts open as center document tabs (user decision 2026-09-21, replacing the
+  earlier inline cards): `research/<id>.md` as 조사 보고 and `verify/<id>.<n>.md` as 검증 보고
+  read through `workspace_read` once per artifact hash (the event's workspace-relative path
+  is prefixed with `.eud-agent/workspace/` for the project-relative tab, which renders from its
+  path even before the tree refresh lists it) and activated on arrival unless the changeset/ASK surface
+  is waiting in the conversation; the plan is
+  the virtual "계획 (rev N)" tab (`PlanView` with acceptance criteria, critic summary, and the
+  승인 control) that remains read-only after approval. The research summary still archives
+  into the log. The verdict archives as a row whose text (검증 통과 / 검증 실패 — 미충족 N건 ·
+  summary) is clamped to two lines while folded; a 자세히 toggle reveals the full text and the
+  unmet list + report path in a bounded scroll box (`LogEntry.detail`). It never pops a toast
+  (`LogEntry.silent`): the unmet list is the executor's fix ticket and can run to a screenful.
+  The prompt input sits under every tab.
 - `Interrupted` shows 이어서 진행 / 처음부터 buttons.
 
 ### Acceptance
@@ -418,7 +446,7 @@ engine becomes a projection of `WorkflowState.stage` for EPS sessions.
   iterations. Architect job schema `{ verdict, structure_issues: [{ step_id?, text }],
   suggested_modules: [string], summary }`, focused on MainFile composition-root policy, module
   placement, import cycles, and lifecycle hooks.
-- The plan card shows "심층 계획" and the iteration count when deep planning ran.
+- The plan tab shows "심층 계획" and the iteration count when deep planning ran.
 
 ### Plan review
 
@@ -428,7 +456,7 @@ engine becomes a projection of `WorkflowState.stage` for EPS sessions.
 
 ### Acceptance
 
-- Critic `revise` produces plan revision 2 before the card appears; `approve` produces revision 1.
+- Critic `revise` produces plan revision 2 before the tab appears; `approve` produces revision 1.
 - Deep mode runs at most three iterations and records each verdict in the workflow state.
 - Toggling the setting during PlanReview does not change the running request.
 - The plan file exists at revision 1 before approval; approval records its SHA-256.
@@ -439,22 +467,21 @@ engine becomes a projection of `WorkflowState.stage` for EPS sessions.
 
 `approved_plan_execution_instruction` becomes: read `plans/<request-id>.md` and
 `research/<request-id>.md`; implement the steps in dependency order; after source, DAT, plugin, or
-Python changes, run `build_run`; when the plan lists tests, create or update them under
-`src/tests/**` and run `trace_suite_run`; answer with a per-step status list. The interactive
-continuation already carries the turn across soft boundaries.
+Python changes, run `build_run`; answer with a per-step status list. The interactive continuation
+already carries the turn across soft boundaries.
 
 ### Verifier job
 
 - Runs after the executing turn answers and the request has a non-empty changeset. Inputs: plan
   markdown, acceptance criteria, changeset with unified diffs, the last `build_run` JSON captured
-  from the tool result, trace results, current revision.
-- The verifier may re-run `build_run` and `trace_suite_run`. Schema:
+  from the tool result, current revision.
+- The verifier may re-run `build_run`. Schema:
 
 ```text
 { verdict: pass|fail,
   criteria: [{ text, status: met|unmet|unverifiable, evidence }],
   step_status: [{ id, status: done|partial|missing, note }],
-  build: { ok, revision }, tests: { passed, failed, inconclusive },
+  build: { ok, revision },
   summary }
 ```
 
@@ -490,7 +517,7 @@ continuation already carries the turn across soft boundaries.
 | artifacts | `workspace.rs` (`research/` directory, plan draft revisions) |
 | verifier evidence | `tool_exec.rs` (retain last build result), `journal.rs` changeset |
 | settings | `ipc.rs` `AppSettings`, `config.rs`, `panel/src/components/SettingsDialog.tsx`, `panel/src/lib/ipc.ts` |
-| panel | `panel/src/state/store.ts`, `panel/src/App.tsx`, `panel/src/components/PlanView.tsx`, new `WorkflowStrip.tsx`, `ResearchCard.tsx`, `VerdictCard.tsx` |
+| panel | `panel/src/state/store.ts`, `panel/src/App.tsx`, `panel/src/components/PlanView.tsx` (plan tab body), `DocumentTabStrip.tsx`, new `WorkflowStrip.tsx` (`ResearchCard.tsx`/`VerdictCard.tsx` retired by the tab cutover) |
 
 ## Verification plan
 
