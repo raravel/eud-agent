@@ -351,6 +351,100 @@ fn native_tool_result_preserves_execution_failure_without_duplicate_start() {
     );
 }
 
+fn started_native_tool(parser: &mut ClaudeStreamParser, call_id: &str, name: &str) {
+    parser
+        .apply(&json!({"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":call_id,"name":name}}}))
+        .unwrap();
+    parser
+        .apply(&json!({"type":"stream_event","event":{"type":"content_block_stop","index":0}}))
+        .unwrap();
+}
+
+#[test]
+fn native_tool_result_image_blocks_are_exempt_from_observation_limit() {
+    let mut parser = ClaudeStreamParser::default();
+    started_native_tool(&mut parser, "call-1", "mcp__eud-tools__map_draft_render");
+    let oversized_png = "A".repeat(events::MAX_NATIVE_OBSERVATION_BYTES * 3);
+    let result = parser
+        .apply(&json!({"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"call-1","content":[
+            {"type":"text","text":"{\"image\":{\"mimeType\":\"image/png\",\"width\":704,\"height\":448}}"},
+            {"type":"image","source":{"type":"base64","media_type":"image/png","data":oversized_png}}
+        ]}]}}))
+        .unwrap();
+    assert!(
+        matches!(result.as_slice(), [ParsedEvent::ToolObservation { name, result: Some(value), status: Some(status), .. }]
+            if status == "completed" && name == "mcp__eud-tools__map_draft_render" && value[1]["type"] == "image")
+    );
+}
+
+#[test]
+fn native_tool_result_text_over_observation_limit_is_still_rejected() {
+    let mut parser = ClaudeStreamParser::default();
+    started_native_tool(&mut parser, "call-1", "mcp__eud-tools__read_file");
+    let oversized_text = "x".repeat(events::MAX_NATIVE_OBSERVATION_BYTES + 1);
+    let result = parser.apply(&json!({"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"call-1","content":[
+        {"type":"text","text":oversized_text},
+        {"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}}
+    ]}]}}));
+    assert!(matches!(result, Err(ProviderRuntimeError::Protocol(_))));
+}
+
+#[tokio::test]
+async fn native_image_tool_result_echo_over_one_mib_completes() {
+    let fixture = FixtureDir::new();
+    // Claude Code echoes the whole tool_result on one stream-json line, so a
+    // rendered map image is bounded only by the raw stdout ceiling.
+    let image_bytes = 2 * 1024 * 1024;
+    let script = write_script(
+        &fixture.0,
+        &format!(
+            r#"param([Parameter(ValueFromRemainingArguments=$true)][string[]]$Rest)
+$null = [Console]::In.ReadLine()
+[Console]::Out.WriteLine('{{"type":"system","subtype":"init","session_id":"native-session","tools":["mcp__eud-tools__map_draft_render"],"mcp_servers":[{{"name":"eud-tools","status":"connected"}}]}}')
+[Console]::Out.WriteLine('{{"type":"stream_event","event":{{"type":"content_block_start","index":0,"content_block":{{"type":"tool_use","id":"call-1","name":"mcp__eud-tools__map_draft_render"}}}}}}')
+[Console]::Out.WriteLine('{{"type":"stream_event","event":{{"type":"content_block_stop","index":0}}}}')
+$image = 'A' * {image_bytes}
+[Console]::Out.WriteLine('{{"type":"user","message":{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"call-1","content":[{{"type":"text","text":"{{\"image\":{{\"mimeType\":\"image/png\"}}}}"}},{{"type":"image","source":{{"type":"base64","media_type":"image/png","data":"' + $image + '"}}}}]}}]}}}}')
+[Console]::Out.WriteLine('{{"type":"stream_event","event":{{"type":"content_block_delta","index":1,"delta":{{"type":"text_delta","text":"looks right"}}}}}}')
+[Console]::Out.WriteLine('{{"type":"result","subtype":"success","session_id":"native-session","is_error":false,"result":"looks right","usage":{{"input_tokens":1,"output_tokens":1}}}}')
+exit 0
+"#
+        ),
+    );
+    let mut adapter = adapter(&fixture.0, &script);
+    let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(0_u64);
+    let (events_tx, mut events_rx) = tokio::sync::mpsc::channel(16);
+    let outcome = adapter
+        .run_step(
+            foreground_request(&fixture.0, 12, 0, Some("native-session"), cancel_rx),
+            events_tx,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(outcome, AdapterStepOutcome::Completed {
+        output: AdapterOutput::Text(ref text),
+        ..
+    } if text == "looks right"));
+    let mut observed_image = false;
+    while let Ok(event) = events_rx.try_recv() {
+        if let AdapterEventKind::NativeToolObservation {
+            result: Some(result),
+            status: Some(status),
+            ..
+        } = event.kind
+        {
+            assert_eq!(status, "completed");
+            assert_eq!(result[1]["type"], "image");
+            assert_eq!(
+                result[1]["source"]["data"].as_str().unwrap().len(),
+                image_bytes
+            );
+            observed_image = true;
+        }
+    }
+    assert!(observed_image);
+}
+
 #[tokio::test]
 async fn malformed_and_oversized_process_output_are_rejected() {
     let fixture = FixtureDir::new();
@@ -373,16 +467,21 @@ $null = [Console]::In.ReadLine()
         .unwrap_err();
     assert!(matches!(error, ProviderRuntimeError::Protocol(_)));
 
+    // A valid init line followed by one line just over the raw stdout ceiling.
+    let oversized_bytes = MAX_STDOUT_BYTES + 1;
     write_script(
         &fixture.0,
-        r#"param([Parameter(ValueFromRemainingArguments=$true)][string[]]$Rest)
+        &format!(
+            r#"param([Parameter(ValueFromRemainingArguments=$true)][string[]]$Rest)
 $null = [Console]::In.ReadLine()
-[Console]::Out.Write(('x' * 1048577))
-"#,
+[Console]::Out.WriteLine('{{"type":"system","subtype":"init","session_id":"native-session","tools":["mcp__eud-tools__read_file"],"mcp_servers":[{{"name":"eud-tools","status":"connected"}}]}}')
+[Console]::Out.Write(('x' * {oversized_bytes}))
+"#
+        ),
     );
     let mut oversized_adapter = adapter(&fixture.0, &script);
     let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(0_u64);
-    let (events_tx, _) = tokio::sync::mpsc::channel(1);
+    let (events_tx, _events_rx) = tokio::sync::mpsc::channel(16);
     let error = oversized_adapter
         .run_step(
             foreground_request(&fixture.0, 11, 0, None, cancel_rx),

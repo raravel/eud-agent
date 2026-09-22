@@ -5,8 +5,10 @@ use serde_json::{json, Value};
 
 use crate::provider::ReasoningLevel;
 
-pub(super) const MAX_JSONL_LINE_BYTES: usize = 1024 * 1024;
 pub(super) const MAX_STDOUT_BYTES: usize = 32 * 1024 * 1024;
+/// One stream-json line may carry a whole echoed tool result, including a rendered
+/// map image, so it shares the total stdout ceiling instead of a smaller one.
+pub(super) const MAX_JSONL_LINE_BYTES: usize = MAX_STDOUT_BYTES;
 pub(super) const MAX_STDERR_BYTES: u64 = 16 * 1024;
 const MAX_IMAGE_BYTES: usize = 5 * 1024 * 1024;
 
