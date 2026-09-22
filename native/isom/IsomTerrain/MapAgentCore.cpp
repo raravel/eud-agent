@@ -219,7 +219,11 @@ struct Assets {
     std::vector<std::vector<StarImage>> starLayers;
     std::vector<Sc::Sprite::DatEntry> spriteEntries;
     std::vector<Sc::Sprite::ImageDatEntry> imageEntries;
+    // CV5 entries past the 1024 tile groups, one per doodad *row*; a doodad's
+    // rows are consecutive entries starting at `doodadStartGroups[ddDataIndex]`.
     std::array<std::vector<Sc::Terrain::Doodad>, Sc::Terrain::NumTilesets> doodadsByTileset;
+    // DD2 doodad id (the CV5 `ddDataIndex`) -> absolute CV5 group index of its first row.
+    std::array<std::map<std::uint16_t, std::uint16_t>, Sc::Terrain::NumTilesets> doodadStartGroups;
     std::map<std::size_t, std::unique_ptr<Sc::Sprite::Grp>> grpCache;
     std::mutex grpMutex;
 
@@ -345,6 +349,20 @@ struct Assets {
             const std::size_t count = (data->size() - offset) / sizeof(Sc::Terrain::Doodad);
             const auto* records = reinterpret_cast<const Sc::Terrain::Doodad*>(data->data() + offset);
             doodadsByTileset[tileset].assign(records, records + count);
+            // Same rule as Chkdraft's doodadIdToTileGroup: the first named
+            // doodad entry carrying a ddDataIndex is that doodad's first row.
+            auto& starts = doodadStartGroups[tileset];
+            starts.clear();
+            for ( std::size_t row = 0; row < count; ++row )
+            {
+                const auto& record = records[row];
+                if ( record.index != 1 || record.doodadName == 0 )
+                    continue;
+                const std::size_t group = Sc::Terrain::Cv5Dat::MaxTileGroups + row;
+                if ( group > std::numeric_limits<std::uint16_t>::max() )
+                    break;
+                starts.try_emplace(record.ddDataIndex, static_cast<std::uint16_t>(group));
+            }
         }
         return true;
     }
@@ -352,6 +370,11 @@ struct Assets {
     const std::vector<Sc::Terrain::Doodad>& doodads(Sc::Terrain::Tileset tileset) const
     {
         return doodadsByTileset[static_cast<std::size_t>(tileset) % doodadsByTileset.size()];
+    }
+
+    const std::map<std::uint16_t, std::uint16_t>& doodadStarts(Sc::Terrain::Tileset tileset) const
+    {
+        return doodadStartGroups[static_cast<std::size_t>(tileset) % doodadStartGroups.size()];
     }
 
     const Sc::Sprite::DatEntry& sprite(std::size_t index) const
@@ -572,59 +595,145 @@ std::string rawStringFromHex(const std::string& text, const std::string& context
 {
     const auto bytes = decodeHex(text, context);
     if ( std::find(bytes.begin(), bytes.end(), 0) != bytes.end() )
-        fail(context + ": location names cannot contain NUL");
+        fail(context + ": map text cannot contain NUL");
+    if ( bytes.empty() )
+        return std::string();
     return std::string(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+}
+
+// Scenario title/description and force names arrive pre-encoded from Rust (CP949
+// or UTF-8 per the string table) and are written verbatim; only the byte-length
+// contract is enforced here.
+std::string mapTextFromHex(const std::string& text, const std::string& context, std::size_t minBytes, std::size_t maxBytes)
+{
+    const std::string raw = rawStringFromHex(text, context);
+    if ( raw.size() < minBytes || raw.size() > maxBytes )
+        fail(context + ": byte length must be within " + std::to_string(minBytes) + ".." + std::to_string(maxBytes));
+    return raw;
+}
+
+Sc::Player::SlotType parseSlotType(const std::string& value, const std::string& context)
+{
+    if ( value == "human" ) return Sc::Player::SlotType::Human;
+    if ( value == "computer" ) return Sc::Player::SlotType::Computer;
+    if ( value == "rescuable" ) return Sc::Player::SlotType::RescuePassive;
+    if ( value == "neutral" ) return Sc::Player::SlotType::Neutral;
+    if ( value == "inactive" ) return Sc::Player::SlotType::Inactive;
+    if ( value == "closed" ) return Sc::Player::SlotType::GameClosed;
+    fail(context + ": unsupported slot type '" + value + "'");
+}
+
+Chk::Race parseRace(const std::string& value, const std::string& context)
+{
+    if ( value == "zerg" ) return Chk::Race::Zerg;
+    if ( value == "terran" ) return Chk::Race::Terran;
+    if ( value == "protoss" ) return Chk::Race::Protoss;
+    if ( value == "userSelectable" ) return Chk::Race::UserSelectable;
+    if ( value == "random" ) return Chk::Race::Random;
+    if ( value == "independent" ) return Chk::Race::Independent;
+    if ( value == "neutral" ) return Chk::Race::Neutral;
+    if ( value == "inactive" ) return Chk::Race::Inactive;
+    fail(context + ": unsupported race '" + value + "'");
+}
+
+// Force flag bits as FORC stores them; each optional boolean rewrites one bit.
+void applyForceFlag(std::uint8_t& flags, const Json::Object& operation, const char* field, std::uint8_t bit, const std::string& context)
+{
+    const Json* value = optionalField(operation, field);
+    if ( value == nullptr )
+        return;
+    if ( boolValue(*value, context + "." + field) )
+        flags = static_cast<std::uint8_t>(flags | bit);
+    else
+        flags = static_cast<std::uint8_t>(flags & ~bit);
+}
+
+// One tileset doodad as StarCraft lays it out: the DD2 id is the CV5
+// `ddDataIndex`, `record` is the CV5 entry of its first row, and row `y`
+// of the footprint is CV5 group `startGroup + y`, whose `megaTileRef[x]` is
+// column `x` (0 = the doodad owns no tile there and the terrain stays).
+struct DoodadShape {
+    std::uint16_t id;
+    std::size_t startGroup;
+    const Sc::Terrain::Doodad* record;
+
+    std::size_t width() const { return record->doodadWidth; }
+    std::size_t height() const { return record->doodadHeight; }
+};
+
+DoodadShape resolveDoodad(const Assets& assets, Sc::Terrain::Tileset tileset, std::uint16_t id, const std::string& context)
+{
+    const auto& starts = assets.doodadStarts(tileset);
+    const auto found = starts.find(id);
+    if ( found == starts.end() ) fail(context + ": doodad id is not valid for this tileset");
+    const auto& doodads = assets.doodads(tileset);
+    const auto& tiles = assets.terrain.get(tileset);
+    const std::size_t startGroup = found->second;
+    const std::size_t startRow = startGroup - Sc::Terrain::Cv5Dat::MaxTileGroups;
+    if ( startRow >= doodads.size() ) fail(context + ": doodad id is not valid for this tileset");
+    const auto& record = doodads[startRow];
+    if ( record.doodadWidth == 0 || record.doodadHeight == 0 || record.doodadWidth > 16 || record.doodadHeight > 16 ||
+         startGroup + record.doodadHeight > tiles.tileGroups.size() )
+        fail(context + ": doodad footprint is invalid");
+    return DoodadShape{id, startGroup, &record};
+}
+
+// The MTXM tile the doodad places at footprint cell (x, y), or 0 when the
+// doodad leaves that cell alone.
+std::uint16_t doodadCellTile(const Sc::Terrain::Tiles& tiles, const DoodadShape& shape, std::size_t x, std::size_t y)
+{
+    const std::size_t group = shape.startGroup + y;
+    if ( x >= 16 || group >= tiles.tileGroups.size() || tiles.tileGroups[group].megaTileIndex[x] == 0 )
+        return 0;
+    return static_cast<std::uint16_t>(group * 16 + x);
+}
+
+// Top-left footprint tile of a doodad centered at (xc, yc); fails outside the map.
+std::pair<std::size_t, std::size_t> doodadFootprintOrigin(const MapFile& map, const Chk::Doodad& doodad,
+    const DoodadShape& shape, const std::string& context)
+{
+    const int centerX = static_cast<int>(doodad.xc / 32);
+    const int centerY = static_cast<int>(doodad.yc / 32);
+    const int left = centerX - static_cast<int>(shape.width() / 2);
+    const int top = centerY - static_cast<int>(shape.height() / 2);
+    if ( left < 0 || top < 0 || left + static_cast<int>(shape.width()) > static_cast<int>(map.getTileWidth()) ||
+         top + static_cast<int>(shape.height()) > static_cast<int>(map.getTileHeight()) )
+        fail(context + ": doodad footprint is outside map bounds");
+    return {static_cast<std::size_t>(left), static_cast<std::size_t>(top)};
 }
 
 void applyDoodadFootprint(MapFile& map, const Chk::Doodad& doodad, const Assets& assets, const std::string& context)
 {
     const auto& tiles = assets.terrain.get(map.getTileset());
-    const auto& doodads = assets.doodads(map.getTileset());
-    const std::size_t id = static_cast<std::size_t>(doodad.type);
-    if ( id >= doodads.size() ) fail(context + ": doodad id is not valid for this tileset");
-    const auto& record = doodads[id];
-    if ( record.doodadWidth == 0 || record.doodadHeight == 0 || record.doodadWidth * record.doodadHeight > 16 )
-        fail(context + ": doodad footprint is invalid");
-    const int centerX = static_cast<int>(doodad.xc / 32);
-    const int centerY = static_cast<int>(doodad.yc / 32);
-    const int left = centerX - static_cast<int>(record.doodadWidth / 2);
-    const int top = centerY - static_cast<int>(record.doodadHeight / 2);
-    if ( left < 0 || top < 0 || left + record.doodadWidth > static_cast<int>(map.getTileWidth()) ||
-         top + record.doodadHeight > static_cast<int>(map.getTileHeight()) )
-        fail(context + ": doodad footprint is outside map bounds");
-    for ( std::size_t y = 0; y < record.doodadHeight; ++y )
+    const DoodadShape shape = resolveDoodad(assets, map.getTileset(), doodad.type, context);
+    const auto [left, top] = doodadFootprintOrigin(map, doodad, shape, context);
+    for ( std::size_t y = 0; y < shape.height(); ++y )
     {
-        for ( std::size_t x = 0; x < record.doodadWidth; ++x )
+        for ( std::size_t x = 0; x < shape.width(); ++x )
         {
-            const std::uint16_t tile = static_cast<std::uint16_t>((Sc::Terrain::Cv5Dat::MaxTileGroups + id) * 16 + y * record.doodadWidth + x);
+            const std::uint16_t tile = doodadCellTile(tiles, shape, x, y);
+            if ( tile == 0 ) continue;
             if ( !tileGraphicsValid(tiles, tile) ) fail(context + ": doodad references invalid graphics");
-            setExactTile(map, static_cast<std::size_t>(left) + x, static_cast<std::size_t>(top) + y, tile);
+            setExactTile(map, left + x, top + y, tile);
         }
     }
 }
 
+// Restore the terrain under an old doodad footprint from `replacementTiles`,
+// a height x width matrix; cells the doodad never owned keep their tiles.
 void replaceDoodadFootprint(MapFile& map, const Chk::Doodad& doodad, const Json& replacement,
     const Assets& assets, const std::string& context)
 {
     const auto& tiles = assets.terrain.get(map.getTileset());
-    const auto& doodads = assets.doodads(map.getTileset());
-    const std::size_t id = static_cast<std::size_t>(doodad.type);
-    if ( id >= doodads.size() ) fail(context + ": doodad id is not valid for this tileset");
-    const auto& record = doodads[id];
+    const DoodadShape shape = resolveDoodad(assets, map.getTileset(), doodad.type, context);
     const auto& rows = arrayValue(replacement, context + ".replacementTiles");
-    if ( rows.size() != record.doodadHeight )
+    if ( rows.size() != shape.height() )
         fail(context + ": replacementTiles height must match the old doodad footprint");
-    const int centerX = static_cast<int>(doodad.xc / 32);
-    const int centerY = static_cast<int>(doodad.yc / 32);
-    const int left = centerX - static_cast<int>(record.doodadWidth / 2);
-    const int top = centerY - static_cast<int>(record.doodadHeight / 2);
-    if ( left < 0 || top < 0 || left + record.doodadWidth > static_cast<int>(map.getTileWidth()) ||
-         top + record.doodadHeight > static_cast<int>(map.getTileHeight()) )
-        fail(context + ": old doodad footprint is outside map bounds");
+    const auto [left, top] = doodadFootprintOrigin(map, doodad, shape, context + " (old doodad)");
     for ( std::size_t y = 0; y < rows.size(); ++y )
     {
         const auto& row = arrayValue(rows[y], context + ".replacementTiles[]");
-        if ( row.size() != record.doodadWidth )
+        if ( row.size() != shape.width() )
             fail(context + ": replacementTiles width must match the old doodad footprint");
         for ( std::size_t x = 0; x < row.size(); ++x )
         {
@@ -632,18 +741,14 @@ void replaceDoodadFootprint(MapFile& map, const Chk::Doodad& doodad, const Json&
             if ( value > std::numeric_limits<std::uint16_t>::max() ||
                  !tileGraphicsValid(tiles, static_cast<std::uint16_t>(value)) )
                 fail(context + ": replacementTiles contains invalid tile graphics");
-            setExactTile(map, static_cast<std::size_t>(left) + x,
-                static_cast<std::size_t>(top) + y, static_cast<std::uint16_t>(value));
+            if ( doodadCellTile(tiles, shape, x, y) == 0 ) continue;
+            setExactTile(map, left + x, top + y, static_cast<std::uint16_t>(value));
         }
     }
 }
 std::optional<Chk::Sprite> doodadOverlay(const MapFile& map, const Chk::Doodad& doodad, const Assets& assets, const std::string& context)
 {
-
-    const auto& doodads = assets.doodads(map.getTileset());
-    const std::size_t id = static_cast<std::size_t>(doodad.type);
-    if ( id >= doodads.size() ) fail(context + ": doodad id is not valid for this tileset");
-    const auto& record = doodads[id];
+    const auto& record = *resolveDoodad(assets, map.getTileset(), doodad.type, context).record;
     if ( (record.flags & 0x30) == 0 )
         return std::nullopt;
     Chk::Sprite sprite{};
@@ -1407,17 +1512,17 @@ void renderThumbnail(const Json::Object& request, Sc::Terrain::Tileset tileset, 
     }
     if ( layer == "doodads" )
     {
-        const auto& doodads = assets.doodads(tileset);
-        if ( id >= doodads.size() ) fail("thumbnail doodad is invalid");
-        const auto& record = doodads[id];
-        const std::size_t startX = (96 - std::min<std::size_t>(record.doodadWidth * 32, 96)) / 2;
-        const std::size_t startY = (96 - std::min<std::size_t>(record.doodadHeight * 32, 96)) / 2;
-        for ( std::size_t y = 0; y < record.doodadHeight && y < 3; ++y )
+        if ( id > std::numeric_limits<std::uint16_t>::max() ) fail("thumbnail doodad is invalid");
+        const DoodadShape shape = resolveDoodad(assets, tileset, static_cast<std::uint16_t>(id), "thumbnail doodad");
+        const auto& record = *shape.record;
+        const std::size_t startX = (96 - std::min<std::size_t>(shape.width() * 32, 96)) / 2;
+        const std::size_t startY = (96 - std::min<std::size_t>(shape.height() * 32, 96)) / 2;
+        for ( std::size_t y = 0; y < shape.height() && y < 3; ++y )
         {
-            for ( std::size_t x = 0; x < record.doodadWidth && x < 3; ++x )
+            for ( std::size_t x = 0; x < shape.width() && x < 3; ++x )
             {
-                const std::uint16_t tile = static_cast<std::uint16_t>((Sc::Terrain::Cv5Dat::MaxTileGroups + id) * 16 + y * record.doodadWidth + x);
-                if ( !tileGraphicsValid(tiles, tile) ) continue;
+                const std::uint16_t tile = doodadCellTile(tiles, shape, x, y);
+                if ( tile == 0 || !tileGraphicsValid(tiles, tile) ) continue;
                 for ( std::size_t py = 0; py < 32 && startY + y * 32 + py < height; ++py )
                     for ( std::size_t px = 0; px < 32 && startX + x * 32 + px < width; ++px )
                         putTerrainPixel(rgba, width, startX + x * 32 + px, startY + y * 32 + py, tile, px, py, tiles);
@@ -2448,20 +2553,29 @@ int catalogQuery(const char* starCraftPath, const std::uint8_t* requestJson, std
     }
     else if ( kind == "doodads" )
     {
-        const auto& doodads = assets->doodads(tileset);
-        for ( std::size_t id = 0; id < doodads.size(); ++id )
+        // One entry per DD2 doodad id (the CV5 ddDataIndex), not per CV5 row.
+        for ( const auto& [id, startGroup] : assets->doodadStarts(tileset) )
         {
-            const auto& doodad = doodads[id];
+            const auto& doodad = assets->doodads(tileset)[startGroup - Sc::Terrain::Cv5Dat::MaxTileGroups];
             bool graphicsValid = doodad.doodadWidth > 0 && doodad.doodadHeight > 0
-                && doodad.doodadWidth * doodad.doodadHeight <= 16;
-            for ( std::size_t cell = 0; graphicsValid && cell < doodad.doodadWidth * doodad.doodadHeight; ++cell )
+                && doodad.doodadWidth <= 16 && doodad.doodadHeight <= 16
+                && static_cast<std::size_t>(startGroup) + doodad.doodadHeight <= tiles.tileGroups.size();
+            const DoodadShape shape{id, startGroup, &doodad};
+            bool ownsTile = false;
+            for ( std::size_t y = 0; graphicsValid && y < shape.height(); ++y )
             {
-                const auto tile = static_cast<std::uint16_t>((Sc::Terrain::Cv5Dat::MaxTileGroups + id) * 16 + cell);
-                graphicsValid = tileGraphicsValid(tiles, tile);
+                for ( std::size_t x = 0; graphicsValid && x < shape.width(); ++x )
+                {
+                    const std::uint16_t tile = doodadCellTile(tiles, shape, x, y);
+                    if ( tile == 0 ) continue;
+                    ownsTile = true;
+                    graphicsValid = tileGraphicsValid(tiles, tile);
+                }
             }
+            graphicsValid = graphicsValid && (ownsTile || (doodad.flags & 0x30) != 0);
             std::string name;
             if ( !assets->statTxt.getString(doodad.doodadName, name) || name.empty() ) name = "Doodad " + std::to_string(id);
-            appendEntry(Json::Object{{"id", id}, {"name", name},
+            appendEntry(Json::Object{{"id", static_cast<std::size_t>(id)}, {"name", name},
                 {"width", static_cast<std::size_t>(doodad.doodadWidth)}, {"height", static_cast<std::size_t>(doodad.doodadHeight)},
                 {"buildability", static_cast<std::size_t>(doodad.buildability)}, {"graphicsValid", graphicsValid},
                 {"overlay", (doodad.flags & 0x30) != 0}, {"overlayId", static_cast<std::size_t>(doodad.overlayIndex)},

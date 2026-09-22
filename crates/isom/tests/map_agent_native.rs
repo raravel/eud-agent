@@ -545,11 +545,13 @@ fn every_layer_crud_and_semantic_brush_round_trip() {
         .unwrap(),
     )
     .unwrap();
+    // A multi-row doodad: every CV5 row past the first used to be laid out
+    // from the first row's group and came out as null (tile 0) terrain.
     let doodad_entry = doodads["entries"]
         .as_array()
         .unwrap()
         .iter()
-        .find(|entry| entry["graphicsValid"] == true)
+        .find(|entry| entry["graphicsValid"] == true && entry["height"].as_u64().unwrap() >= 2)
         .unwrap();
     let doodad_id = doodad_entry["id"].as_u64().unwrap();
     let doodad_width = doodad_entry["width"].as_u64().unwrap() as usize;
@@ -561,6 +563,37 @@ fn every_layer_crud_and_semantic_brush_round_trip() {
         json!([{"op": "doodad.add", "state": {"doodadId": doodad_id, "x": 640, "y": 640, "owner": 11}}]),
     );
     generated.push(doodad_add.clone());
+    let footprint_tiles = |map: &Path| -> Vec<u16> {
+        let mtxm = sections(&isom::chk_extract(map).unwrap())["MTXM"].clone();
+        let left = 640 / 32 - doodad_width / 2;
+        let top = 640 / 32 - doodad_height / 2;
+        (0..doodad_height)
+            .flat_map(|y| {
+                let mtxm = &mtxm;
+                (0..doodad_width).map(move |x| {
+                    let index = ((top + y) * width as usize + left + x) * 2;
+                    u16::from_le_bytes([mtxm[index], mtxm[index + 1]])
+                })
+            })
+            .collect()
+    };
+    let placed = footprint_tiles(&doodad_add);
+    assert!(
+        placed.iter().all(|&placed| placed != 0),
+        "doodad {doodad_id} footprint must never become null terrain: {placed:?}"
+    );
+    assert!(
+        placed.iter().any(|&placed| placed / 16 >= 1024),
+        "doodad {doodad_id} footprint must use its CV5 doodad groups: {placed:?}"
+    );
+    let owned_rows = placed
+        .chunks(doodad_width)
+        .filter(|row| row.iter().any(|&placed| placed / 16 >= 1024))
+        .count();
+    assert!(
+        owned_rows >= 2,
+        "doodad {doodad_id} ({doodad_width}x{doodad_height}) must place every row: {placed:?}"
+    );
     let doodad_bytes = sections(&isom::chk_extract(&doodad_add).unwrap())["DD2 "].clone();
     let doodad_ordinal = doodad_bytes.len() / 8 - 1;
     let doodad_before = fingerprint(&doodad_bytes[doodad_ordinal * 8..doodad_ordinal * 8 + 8]);
@@ -589,6 +622,21 @@ fn every_layer_crud_and_semantic_brush_round_trip() {
             "replacementTiles": replacement_tiles}]),
     );
     generated.push(doodad_delete.clone());
+    // Deleting the moved doodad restores its last footprint from replacementTiles;
+    // the earlier footprints were restored by doodad.set / doodad.move.
+    let restored = sections(&isom::chk_extract(&doodad_delete).unwrap())["MTXM"].clone();
+    let doodad_groups = restored
+        .chunks_exact(2)
+        .filter(|cell| u16::from_le_bytes([cell[0], cell[1]]) / 16 >= 1024)
+        .count();
+    let original_groups = sections(&isom::chk_extract(&unit_delete).unwrap())["MTXM"]
+        .chunks_exact(2)
+        .filter(|cell| u16::from_le_bytes([cell[0], cell[1]]) / 16 >= 1024)
+        .count();
+    assert_eq!(
+        doodad_groups, original_groups,
+        "doodad.set/move/delete must restore every footprint cell they vacate"
+    );
 
     let sprite_add = apply_operations(
         &doodad_delete,
