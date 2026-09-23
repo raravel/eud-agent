@@ -108,7 +108,14 @@
   The native engine refuses a missing/mis-sized ISOM section, a brush without an ISOM value, an
   off-grid or off-lattice diamond, and a rectangle holding no whole diamond, each with the exact
   reason; it never reports a no-op placement as success, and the model never concludes from a
-  refusal that the map lacks ISOM data.
+  refusal that the map lacks ISOM data. Every `mapedit` operation is deterministic: ISOM subtile
+  variation is drawn from a per-operation generator seeded by the operation's own parameters,
+  never from process-global `std::rand()`, because Apply replays the candidate's operation
+  manifest. The manifests are the candidate's authority and the snapshot is their cached
+  product: a snapshot the replay no longer reproduces is rebuilt from the manifests on the
+  session's baseline (fresh verification, revisions and object ids refreshed, selections
+  cleared) before Apply or revert continues; only a chain a revision of which does not replay
+  keeps the refusal.
 - No single tool call waits longer than 240 seconds: native CLIs abort a silent MCP call at 300
   seconds. `ask` expires into a plain-text handoff; any future delegation or team wait shares the
   bound and continues as a new user turn.

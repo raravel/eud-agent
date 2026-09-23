@@ -1741,6 +1741,73 @@ fn semantic_isom_rect_paints_a_hill_and_isom_brush_names_every_refusal() {
 }
 
 #[test]
+#[ignore = "loads installed StarCraft terrain assets and paints semantic ISOM terrain on a new map"]
+fn semantic_isom_paint_is_deterministic_across_replays() {
+    // Apply replays a candidate's operation manifest and refuses a candidate
+    // whose replay differs, so the same batch on the same input must produce
+    // byte-identical terrain every time, including the subtile variation.
+    let starcraft = starcraft_path();
+    let tileset = 4_u8;
+    let (ground, _) = first_brush(&starcraft, tileset);
+    let catalog: Value = serde_json::from_str(
+        &isom::catalog_query(
+            &starcraft,
+            json!({"schema": "eud-map-catalog/1", "kind": "brushes", "tileset": tileset, "offset": 0, "limit": 64})
+                .to_string()
+                .as_bytes(),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let high_type = catalog["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| {
+            entry["graphicsValid"] == true
+                && entry["name"].as_str().unwrap().starts_with("High")
+                && entry["terrainType"].as_u64().unwrap() as u16 != ground
+        })
+        .expect("jungle exposes a High brush")["terrainType"]
+        .as_u64()
+        .unwrap() as u16;
+    let source = temp_map("isom-determinism-source");
+    isom::map_new(&source, &starcraft, &blank_spec(tileset, 64, 64, ground)).unwrap();
+    let operations = json!([
+        {"op": "terrain.isom_rect", "x": 8, "y": 8, "width": 20, "height": 14, "brush": high_type},
+        {"op": "terrain.isom_brush", "isomX": 24, "isomY": 40, "brush": high_type, "extent": 3},
+        {"op": "terrain.isom_rect", "x": 30, "y": 30, "width": 24, "height": 20, "brush": ground},
+    ]);
+    let mut outputs = Vec::new();
+    for round in 0..3 {
+        let (map, _) = try_operations(
+            &source,
+            &format!("isom-determinism-{round}"),
+            operations.clone(),
+        )
+        .unwrap();
+        outputs.push(map);
+    }
+    let first = mtxm_tiles(&outputs[0]);
+    for (round, map) in outputs.iter().enumerate().skip(1) {
+        let tiles = mtxm_tiles(map);
+        let differing = tiles.iter().zip(&first).filter(|(a, b)| a != b).count();
+        assert_eq!(
+            differing, 0,
+            "replay {round} of the same ISOM batch changed {differing} tiles"
+        );
+    }
+    let first_chk = isom::chk_extract(&outputs[0]).unwrap();
+    for map in &outputs[1..] {
+        assert_eq!(isom::chk_extract(map).unwrap(), first_chk);
+    }
+    fs::remove_file(source).ok();
+    for map in outputs {
+        fs::remove_file(map).ok();
+    }
+}
+
+#[test]
 #[ignore = "loads installed StarCraft terrain assets and edits scenario properties natively"]
 fn map_edit_rewrites_scenario_players_and_forces_on_a_new_map() {
     let starcraft = starcraft_path();

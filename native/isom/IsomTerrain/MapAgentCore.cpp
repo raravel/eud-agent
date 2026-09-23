@@ -17,6 +17,7 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <initializer_list>
 #include <limits>
 #include <map>
 #include <memory>
@@ -507,6 +508,23 @@ void requireIsomSection(const MapFile& map, const std::string& context)
         fail(context + ": map has no usable ISOM section (" + std::to_string(map.isomRects.size()) + " of " +
             std::to_string(expected) + " rects); semantic brushes need ISOM data, use exact tiles (terrain.rect/terrain.blit) or a stamp instead");
     }
+}
+
+// Seed one ISOM operation's subtile variation from its own parameters so every
+// replay of the same operation reproduces the same tiles while distinct
+// placements still vary from each other.
+std::uint32_t isomVariationSeed(std::initializer_list<std::size_t> parts)
+{
+    std::uint32_t hash = 2166136261u; // FNV-1a over the little-endian parameter bytes
+    for ( std::size_t part : parts )
+    {
+        for ( std::size_t byte = 0; byte < sizeof(part); ++byte )
+        {
+            hash ^= static_cast<std::uint32_t>((part >> (8 * byte)) & 0xFFu);
+            hash *= 16777619u;
+        }
+    }
+    return hash;
 }
 
 void requireIsomBrush(const Chk::IsomCache& cache, std::size_t brush, const std::string& context)
@@ -1923,6 +1941,7 @@ int mapEdit(const char* inputMapPath, const char* outputMapPath, const char* sta
             Chk::IsomCache cache(map.getTileset(), map.getTileWidth(), map.getTileHeight(), assets->isom.get(map.getTileset()));
             requireIsomBrush(cache, brush, context);
             requireIsomDiamond(map, isomX, isomY, context);
+            cache.seedSubtileVariation(isomVariationSeed({isomX, isomY, brush, extent}));
             ScMap scMap = copyToScMap(map);
             if ( !scMap.placeIsomTerrain({isomX, isomY}, brush, extent, cache) ) fail(context + ": semantic ISOM brush placement failed");
             scMap.updateTilesFromIsom(cache);
@@ -1951,6 +1970,7 @@ int mapEdit(const char* inputMapPath, const char* outputMapPath, const char* sta
                 fail(context + ": terrain rectangle " + std::to_string(width) + "x" + std::to_string(height) + " at (" + std::to_string(x) + ", " +
                     std::to_string(y) + ") holds no whole ISOM diamond (a 4x2 tile footprint on the diamond lattice); use at least 5x3 tiles");
             }
+            cache.seedSubtileVariation(isomVariationSeed({x, y, width, height, brush}));
             ScMap scMap = copyToScMap(map);
             if ( !scMap.placeIsomTerrainDiamonds(diamonds, brush, cache) ) fail(context + ": semantic ISOM brush placement failed");
             scMap.updateTilesFromIsom(cache);
@@ -2388,6 +2408,7 @@ int mapNew(const char* outputMapPath, const char* starCraftPath,
     {
         ScMap scMap = copyToScMap(map);
         Chk::IsomCache cache(tileset, width, height, isomData);
+        cache.seedSubtileVariation(isomVariationSeed({std::size_t(tilesetIndex), width, height, terrainType}));
         const std::uint16_t isomValue = static_cast<std::uint16_t>(
             (cache.getTerrainTypeIsomValue(terrainType) << 4) | Chk::IsomRect::EditorFlag::Modified);
         scMap.isomRects.assign(scMap.getIsomWidth() * scMap.getIsomHeight(),

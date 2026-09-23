@@ -50,6 +50,7 @@ fn main() {
     let project = native_dir.join("isom_capi.vcxproj");
     let map_core_header = native_dir.join("IsomTerrain").join("MapAgentCore.h");
     let map_core_cpp = native_dir.join("IsomTerrain").join("MapAgentCore.cpp");
+    let isom_api_header = native_dir.join("IsomTerrain").join("IsomApi.h");
     let map_gen_cpp = native_dir.join("IsomTerrain").join("MapGenCli.cpp");
     let map_file_cpp = native_dir.join("MappingCoreLib").join("MapFile.cpp");
     let map_json_header = native_dir.join("IsomTerrain").join("MapAgentJson.h");
@@ -62,6 +63,7 @@ fn main() {
     println!("cargo:rerun-if-changed={}", project.display());
     println!("cargo:rerun-if-changed={}", map_core_header.display());
     println!("cargo:rerun-if-changed={}", map_core_cpp.display());
+    println!("cargo:rerun-if-changed={}", isom_api_header.display());
     println!("cargo:rerun-if-changed={}", map_gen_cpp.display());
     println!("cargo:rerun-if-changed={}", map_file_cpp.display());
     println!("cargo:rerun-if-changed={}", map_json_header.display());

@@ -72,6 +72,14 @@ struct RebasedChain {
     object_ids: BTreeMap<u32, BTreeMap<String, String>>,
 }
 
+const REPLAY_DIGEST_MISMATCH: &str = "candidate replay canonical digest mismatch";
+
+/// Outcome of replaying the visible chain against the current candidate.
+enum ChainReplay {
+    Verified(Box<VerificationReport>),
+    Mismatch(String),
+}
+
 struct StampRequestContext {
     source: PathBuf,
     draft: PathBuf,
@@ -724,11 +732,52 @@ impl CandidateStore {
         source: crate::map_model::MapRevision,
         rebased: RebasedChain,
     ) -> Result<(), String> {
+        copy_atomic(&rebased.base, &state.baseline_snapshot)?;
+        if state.baseline.file_sha256 != source.file_sha256 {
+            state.forget_last_apply();
+        }
+        state.baseline = source;
+        state.source_diverged = false;
+        self.adopt_rebased_chain(state, rebased)
+    }
+
+    /// Rebuild the candidate chain from its operation manifests on the
+    /// session's own baseline snapshot, without following the source. The
+    /// manifests are the candidate's authority; the snapshot is their cached
+    /// product, so a snapshot the engine no longer reproduces (an engine whose
+    /// replay changed under it) is regenerated rather than refused. Returns
+    /// false when a revision on the visible chain does not replay; the caller
+    /// keeps its original refusal.
+    fn rebuild_from_manifests(&self, state: &mut CandidateSession) -> Result<bool, String> {
+        let root = self
+            .session_root(&state.baseline.project_id, &state.session_id)
+            .join(format!("rebuild-{}", uuid::Uuid::new_v4()));
+        let rebuilt = (|| {
+            std::fs::create_dir_all(&root).map_err(|error| {
+                format!("candidate rebuild directory could not be created: {error}")
+            })?;
+            let base = root.join("r0000.scx");
+            copy_atomic(&state.baseline_snapshot, &base)?;
+            self.rebase_revisions(state, &state.baseline.clone(), &base, &root)
+        })();
+        let outcome = match rebuilt {
+            Ok(Some(rebased)) => self.adopt_rebased_chain(state, rebased).map(|()| true),
+            Ok(None) => Ok(false),
+            Err(error) => Err(error),
+        };
+        let _ = std::fs::remove_dir_all(&root);
+        outcome
+    }
+
+    fn adopt_rebased_chain(
+        &self,
+        state: &mut CandidateSession,
+        rebased: RebasedChain,
+    ) -> Result<(), String> {
         let current = rebased
             .outputs
             .get(&state.current_revision)
             .ok_or_else(|| "rebased candidate lost its visible revision".to_string())?;
-        copy_atomic(&rebased.base, &state.baseline_snapshot)?;
         copy_atomic(current, &state.current_map)?;
         for revision in &rebased.revisions {
             let mut manifest: RevisionManifest = read_json(&revision.operation_manifest)?;
@@ -742,10 +791,6 @@ impl CandidateStore {
         for revision in &rebased.dropped {
             remove_if_exists(&revision.operation_manifest)?;
         }
-        if state.baseline.file_sha256 != source.file_sha256 {
-            state.forget_last_apply();
-        }
-        state.baseline = source;
         state.revisions = rebased.revisions;
         state.candidate_object_ids = rebased
             .object_ids
@@ -754,7 +799,6 @@ impl CandidateStore {
             .unwrap_or_default();
         state.selections.clear();
         state.persistent_protections.clear();
-        state.source_diverged = false;
         self.sync_selection_palette(state)?;
         Ok(())
     }
@@ -1676,7 +1720,16 @@ impl CandidateStore {
         if revision != 0 && !state.revisions.iter().any(|item| item.revision == revision) {
             return Err(format!("candidate revision r{revision} does not exist"));
         }
-        self.replay_into(&state, revision, &state.current_map)?;
+        if let Err(error) = self.replay_into(&state, revision, &state.current_map) {
+            // A chain the engine no longer reproduces is rebuilt from its
+            // manifests first (see `verify_current_for_apply`).
+            if !error.contains(REPLAY_DIGEST_MISMATCH)
+                || !self.rebuild_from_manifests(&mut state)?
+            {
+                return Err(error);
+            }
+            self.replay_into(&state, revision, &state.current_map)?;
+        }
         state.current_revision = revision;
         state.candidate_object_ids = if revision == 0 {
             BTreeMap::new()
@@ -1794,14 +1847,38 @@ impl CandidateStore {
         if state.stale {
             return Err("the saved source changed while a map request is active; Apply follows it once the request settles".to_string());
         }
-        let root = self.session_root(project_id, session_id);
+        match self.replay_chain_for_apply(&state)? {
+            ChainReplay::Verified(report) => Ok(*report),
+            ChainReplay::Mismatch(reason) => {
+                // The snapshot no longer matches what its manifests produce
+                // (e.g. a revision painted by the pre-deterministic ISOM
+                // subtile picker). The manifests are the authority: rebuild
+                // the chain from them and verify that instead of refusing
+                // the user's work.
+                if !self.rebuild_from_manifests(&mut state)? {
+                    return Err(reason);
+                }
+                self.save_state(&state)?;
+                match self.replay_chain_for_apply(&state)? {
+                    ChainReplay::Verified(report) => Ok(*report),
+                    ChainReplay::Mismatch(reason) => Err(reason),
+                }
+            }
+        }
+    }
+
+    /// Replay the visible chain from the baseline snapshot and compare it
+    /// with the current candidate; `Mismatch` is a candidate the replay does
+    /// not reproduce, every other failure is an error.
+    fn replay_chain_for_apply(&self, state: &CandidateSession) -> Result<ChainReplay, String> {
+        let root = self.session_root(&state.baseline.project_id, &state.session_id);
         let parent = root.join("apply-parent.tmp.scx");
         let work = root.join("apply-work.tmp.scx");
         let next = root.join("apply-next.scx");
         let result = (|| {
             copy_atomic(&state.baseline_snapshot, &parent)?;
             let mut final_report = None;
-            for revision_id in revision_chain(&state, state.current_revision)? {
+            for revision_id in revision_chain(state, state.current_revision)? {
                 copy_atomic(&parent, &work)?;
                 let revision = state
                     .revisions
@@ -1859,9 +1936,9 @@ impl CandidateStore {
             if crate::chk::canonical_chk_digest(&replayed_chk)
                 != crate::chk::canonical_chk_digest(&current_chk)
             {
-                return Err(
+                return Ok(ChainReplay::Mismatch(
                     "current candidate differs from its deterministic manifest replay".to_string(),
-                );
+                ));
             }
             let replayed_assets: Value = serde_json::from_str(
                 &isom::map_digest(&parent)
@@ -1876,11 +1953,13 @@ impl CandidateStore {
             if replayed_assets.pointer("/extraAssets/digest")
                 != current_assets.pointer("/extraAssets/digest")
             {
-                return Err(
-                    "current candidate extra assets differ from manifest replay".to_string()
-                );
+                return Ok(ChainReplay::Mismatch(
+                    "current candidate extra assets differ from manifest replay".to_string(),
+                ));
             }
-            final_report.ok_or_else(|| "candidate verification chain is empty".to_string())
+            final_report
+                .map(|report| ChainReplay::Verified(Box::new(report)))
+                .ok_or_else(|| "candidate verification chain is empty".to_string())
         })();
         let _ = remove_if_exists(&parent);
         let _ = remove_if_exists(&work);
@@ -2242,9 +2321,7 @@ impl CandidateStore {
             let canonical = crate::chk::canonical_chk_digest(&chk).overall_sha256;
             if canonical != revision.verification.canonical_digest {
                 remove_if_exists(&replay)?;
-                return Err(format!(
-                    "candidate replay canonical digest mismatch at r{revision_id}"
-                ));
+                return Err(format!("{REPLAY_DIGEST_MISMATCH} at r{revision_id}"));
             }
         }
         copy_atomic(&replay, output)?;
@@ -4005,6 +4082,119 @@ mod tests {
         let followed = store.state("project", "map-session").unwrap();
         assert!(!followed.stale);
         assert_eq!(followed.baseline.file_sha256, file_hash(&source).unwrap());
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn apply_and_revert_rebuild_a_candidate_its_manifests_no_longer_reproduce() {
+        let root = unique_root();
+        let dirs = DataDirs::from_bases(&root.join("roaming"), &root.join("local"));
+        dirs.ensure_dirs().unwrap();
+        let source = root.join("source.scx");
+        std::fs::copy(fixture(), &source).unwrap();
+        let snapshot = context(&dirs, &source);
+        let store = CandidateStore::new(
+            dirs.clone(),
+            crate::map_import::MapImportStore::new(dirs.clone()),
+        );
+        store.create_session("map-session", &snapshot).unwrap();
+        let mut expected = Vec::new();
+        for (revision, (x, y)) in [(3_usize, 3_usize), (4, 4)].into_iter().enumerate() {
+            let request = format!("request-{revision}");
+            let before = tile_at(&source, x, y);
+            expected.push((x, y, before ^ 1));
+            store
+                .prepare_request("project", "map-session", &request, revision as u32, &[])
+                .unwrap();
+            store
+                .draft_begin("project", "map-session", &request)
+                .unwrap();
+            store
+                .draft_patch(
+                    "project",
+                    "map-session",
+                    &request,
+                    vec![MapOperation::TerrainSet {
+                        x: x as u16,
+                        y: y as u16,
+                        before,
+                        after: before ^ 1,
+                    }],
+                )
+                .unwrap();
+            store.finalize("project", "map-session", &request).unwrap();
+            store
+                .commit_request("project", "map-session", &request)
+                .unwrap();
+            store.finish_request("map-session", &request).unwrap();
+        }
+        let state = store.load_state("project", "map-session").unwrap();
+        assert_eq!(state.current_revision, 2);
+
+        // The snapshot drifts from its manifests, as candidates painted by the
+        // old non-deterministic ISOM subtile picker did: an unrecorded tile
+        // change lands in current.scx.
+        let stray = tile_at(&state.current_map, 5, 5);
+        edit_source(
+            &dirs,
+            &state.current_map,
+            vec![MapOperation::TerrainSet {
+                x: 5,
+                y: 5,
+                before: stray,
+                after: stray ^ 1,
+            }],
+        );
+        let drifted_hash = file_hash(&state.current_map).unwrap();
+
+        // Apply verification rebuilds the chain from the manifests instead of
+        // refusing, and the rebuilt candidate is exactly the recorded work.
+        let verification = store
+            .verify_current_for_apply("project", "map-session")
+            .unwrap();
+        assert!(verification.valid, "{:?}", verification.errors);
+        let rebuilt = store.state("project", "map-session").unwrap();
+        assert_eq!(rebuilt.current_revision, 2);
+        assert_ne!(rebuilt.current_hash, drifted_hash);
+        assert_eq!(verification.candidate_sha256, rebuilt.current_hash);
+        assert_eq!(rebuilt.revisions.len(), 2);
+        assert!(rebuilt.can_apply);
+        let current = store.load_state("project", "map-session").unwrap();
+        assert_eq!(tile_at(&current.current_map, 5, 5), stray);
+        for (x, y, after) in &expected {
+            assert_eq!(tile_at(&current.current_map, *x, *y), *after);
+        }
+        assert_eq!(
+            current.revisions[1].map_sha256, rebuilt.current_hash,
+            "the rebuilt revision records its regenerated map"
+        );
+        // A second verification finds nothing to rebuild.
+        store
+            .verify_current_for_apply("project", "map-session")
+            .unwrap();
+        assert_eq!(
+            store.state("project", "map-session").unwrap().current_hash,
+            rebuilt.current_hash
+        );
+
+        // Revert takes the same path when the drift happens before it.
+        let current = store.load_state("project", "map-session").unwrap();
+        edit_source(
+            &dirs,
+            &current.current_map,
+            vec![MapOperation::TerrainSet {
+                x: 5,
+                y: 5,
+                before: stray,
+                after: stray ^ 1,
+            }],
+        );
+        let reverted = store.revert("project", "map-session", 1).unwrap();
+        assert_eq!(reverted.current_revision, 1);
+        let current = store.load_state("project", "map-session").unwrap();
+        assert_eq!(tile_at(&current.current_map, 3, 3), expected[0].2);
+        assert_eq!(tile_at(&current.current_map, 4, 4), tile_at(&source, 4, 4));
+        assert_eq!(tile_at(&current.current_map, 5, 5), stray);
         std::fs::remove_dir_all(root).ok();
     }
 
