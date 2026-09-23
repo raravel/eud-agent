@@ -11,6 +11,12 @@ use std::{future::Future, path::PathBuf, pin::Pin, sync::Arc};
 
 #[derive(Debug)]
 pub enum AdapterEventKind {
+    /// A native provider published the session identity of the run it just
+    /// started. The runtime records it as the run's resumable boundary before
+    /// any output exists, so a process that dies mid-turn is still resumable.
+    NativeSessionStarted {
+        session_id: String,
+    },
     ResponseStarted {
         response_id: String,
     },
@@ -120,4 +126,13 @@ pub trait ProviderAdapter: Send + Sync {
         &mut self,
         state: ProviderConversationState,
     ) -> AdapterFuture<'_, Result<(), ProviderRuntimeError>>;
+
+    /// The native conversation the adapter observed for the run it just left,
+    /// even when that run did not complete. A native CLI publishes its session
+    /// identity before any output and keeps that session resumable, so an
+    /// interrupted run still names the boundary the next run must continue
+    /// from. Direct providers own a transcript instead and return `None`.
+    fn observed_conversation(&self) -> Option<ProviderConversationState> {
+        None
+    }
 }

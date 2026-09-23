@@ -32,6 +32,7 @@ struct EventSink {
 impl RuntimeEventSink for EventSink {
     fn emit(&self, event: &AdapterEventKind) -> Result<(), ProviderRuntimeError> {
         let observed = match event {
+            AdapterEventKind::NativeSessionStarted { .. } => None,
             AdapterEventKind::Block(NormalizedBlock::Text { text, .. }) => {
                 Some(ObservedEvent::Text(text.clone()))
             }

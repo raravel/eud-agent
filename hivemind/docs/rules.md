@@ -129,6 +129,19 @@
 - Reject/rollback applies inverse operations in reverse sequence and persists exact canonical state.
 - Never advertise obsolete individual DAT setters or bridge commands.
 
+## Continuity across an interruption
+
+- Model-facing transcripts are bounded by dropping the OLDEST rows and marking the cut. A
+  head-first cut hands the model the opening of a long session and none of the work it must
+  continue.
+- A chat turn persists the provider conversation it reached on every exit path, including failure
+  and cancellation. A boundary that exists only in memory is lost with the process.
+- A native provider publishes its resumable session identity before any output, and an interrupted
+  run keeps it as that run's boundary (receipt state `interrupted`). A session the run did not ask
+  to resume is a protocol deviation and is never adopted; without an observed session the
+  continuation stays unknown and fails closed. An interruption costs the unfinished turn, never
+  the conversation.
+
 ## Sessions and concurrency
 
 - Conversation events are session-owned.

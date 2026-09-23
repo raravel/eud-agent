@@ -40,6 +40,12 @@ impl RunToolEvents {
         self.gate.close_for_native_completion()
     }
 
+    /// Record the resumable native session of the run in progress, so an
+    /// interruption that never reaches a terminal boundary still leaves one.
+    pub(super) fn mark_native_session_started(&self, session_id: &str) -> Result<(), String> {
+        self.gate.mark_native_run_interrupted(session_id)
+    }
+
     pub(super) fn check_fatal(&self) -> Result<(), ProviderRuntimeError> {
         match self.fatal.borrow().as_ref() {
             Some(error) => Err(ProviderRuntimeError::Protocol(error.clone())),

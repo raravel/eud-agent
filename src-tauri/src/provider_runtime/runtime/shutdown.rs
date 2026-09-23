@@ -25,8 +25,26 @@ impl ProviderRuntime {
     ) {
         gate.cancel();
         if self.adapter.loop_kind() == AdapterLoopKind::NativeSession {
-            // A failed update leaves the durable Pending marker, which also blocks resume.
-            let _ = gate.mark_native_run_unknown();
+            match self
+                .adapter
+                .observed_conversation()
+                .filter(|conversation| conversation.is_started())
+            {
+                // The cut run still names a resumable native session: keep it as
+                // the boundary the next run continues from, so an interruption
+                // costs the unfinished turn and not the whole conversation.
+                Some(conversation) => {
+                    if let Some(session) = conversation.conversation_key() {
+                        let _ = gate.mark_native_run_interrupted(&session);
+                    }
+                    self.conversation = conversation.clone();
+                    self.binding.conversation = conversation;
+                }
+                // A failed update leaves the durable Pending marker, which also blocks resume.
+                None => {
+                    let _ = gate.mark_native_run_unknown();
+                }
+            }
         }
         let _ = tokio::time::timeout(grace, self.adapter.interrupt(identity)).await;
         if let Some(server) = mcp.as_mut() {

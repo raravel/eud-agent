@@ -71,6 +71,16 @@ pub(super) fn handle_event(
         ));
     }
     match event.kind {
+        AdapterEventKind::NativeSessionStarted { session_id } => {
+            // Bookkeeping only, and best effort like every other receipt
+            // lifecycle update: a run without a receipt (compaction, a
+            // delegated child) has nothing to carry the boundary, and a failed
+            // write leaves the durable Pending marker, which also blocks
+            // resume. Neither is a reason to fail the run.
+            if let Some(events) = native_tool_events {
+                let _ = events.mark_native_session_started(&session_id);
+            }
+        }
         AdapterEventKind::ResponseStarted { response_id } => {
             if response_id.is_empty() || started.replace(response_id.clone()).is_some() {
                 return Err(ProviderRuntimeError::Protocol(

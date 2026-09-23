@@ -129,6 +129,22 @@ impl ProductionClaudeCodeAdapter {
                             if parser.initialized && !started {
                                 parser.validate_init(require_mcp)?;
                                 started = true;
+                                // The CLI publishes its resumable session id before any
+                                // output; retaining it here is what lets an interrupted
+                                // run keep a native continuation boundary. A session that
+                                // is not the one the run asked to resume is a protocol
+                                // deviation and is never adopted as a boundary.
+                                let consistent = match (&self.resume_target, &parser.session_id) {
+                                    (Some(expected), Some(session)) => expected == session,
+                                    (Some(_), None) => false,
+                                    (None, _) => true,
+                                };
+                                if consistent {
+                                    self.observed_session_id.clone_from(&parser.session_id);
+                                    if let Some(session_id) = parser.session_id.clone() {
+                                        send_event(&events, identity, AdapterEventKind::NativeSessionStarted { session_id }).await?;
+                                    }
+                                }
                                 send_event(&events, identity, AdapterEventKind::ResponseStarted { response_id: response_id.clone() }).await?;
                             }
                             for event in parsed {
