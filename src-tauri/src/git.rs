@@ -1,0 +1,874 @@
+//! Project-root git: the app's rollback authority.
+//!
+//! Free CRUD at the project root removes the journal's reverse-order rollback,
+//! so the way back to a known state is a commit. The app initializes the
+//! repository when the project has none, commits at every turn boundary, and
+//! separates the user's own external edits (SCMDraft, an editor, another tool)
+//! into their own commit so a turn commit holds only what that turn did.
+//!
+//! A repository that was already here belongs to the user. The app never
+//! commits into it before the user says it may; until then the project works
+//! exactly as before and rolling back is the user's own business.
+//!
+//! Every command runs non-interactively. A credential prompt, a commit hook
+//! waiting on input, or a signing key with no agent would hang a windowless
+//! GUI app, so terminal prompts are off and hooks and signing are skipped for
+//! the app's own commits. The user's `git` in a terminal is unaffected.
+
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
+use std::sync::OnceLock;
+
+use serde::{Deserialize, Serialize};
+
+/// Where the per-project git decision is kept. The generated `.gitignore`
+/// excludes `.eud-agent/state/`, so the decision never becomes a commit.
+const SETTINGS_RELATIVE: &str = ".eud-agent/state/git.json";
+
+/// What the app's own `.gitignore` excludes: generated build output, the
+/// epScript Python cache, the app's project-local runtime state, and the E3S
+/// compatibility copy. Canonical authoring state and `maps/` stay committed —
+/// a map the user changed in SCMDraft has to be recoverable too.
+const IGNORED: &[&str] = &["build/", "**/__epspy__/", ".eud-agent/state/", "compat/"];
+
+/// The identity the app commits under when the repository has none configured.
+/// A repository that already names an author keeps it.
+const IDENTITY_NAME: &str = "eud-agent";
+const IDENTITY_EMAIL: &str = "eud-agent@localhost";
+
+/// The longest request summary a commit subject carries.
+const SUBJECT_LIMIT: usize = 72;
+
+/// Where a project's repository came from, which decides whose history it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RepoOrigin {
+    /// The app ran `git init` here, so the whole history is the app's.
+    App,
+    /// The repository was already here when the project was first opened.
+    Preexisting,
+}
+
+/// Whether the app may commit into this repository.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Consent {
+    /// The user has not answered yet. The app does not commit.
+    Pending,
+    Granted,
+    Declined,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Settings {
+    schema_version: u32,
+    origin: RepoOrigin,
+    consent: Consent,
+}
+
+impl Settings {
+    fn new(origin: RepoOrigin, consent: Consent) -> Self {
+        Self {
+            schema_version: 1,
+            origin,
+            consent,
+        }
+    }
+}
+
+/// What the app knows about one project's repository after preparing it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RepoState {
+    /// `git` is on PATH.
+    pub available: bool,
+    /// The project root is inside a git work tree.
+    pub tracked: bool,
+    /// The work tree's top level is above the project root — the project is a
+    /// folder inside a larger repository, so commits stay limited to the root.
+    pub nested: bool,
+    pub origin: Option<RepoOrigin>,
+    pub consent: Consent,
+    /// What the user has to be told once, in Korean, or nothing.
+    pub warning: Option<String>,
+}
+
+impl RepoState {
+    /// True when a turn boundary may commit.
+    pub fn auto_commit_allowed(&self) -> bool {
+        self.available && self.tracked && self.consent == Consent::Granted
+    }
+
+    fn unavailable(warning: String) -> Self {
+        Self {
+            available: false,
+            tracked: false,
+            nested: false,
+            origin: None,
+            consent: Consent::Pending,
+            warning: Some(warning),
+        }
+    }
+}
+
+/// One commit the app made.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommitRecord {
+    pub sha: String,
+    pub subject: String,
+    /// How many paths the commit changed.
+    pub files: usize,
+}
+
+/// One entry of the project's history, for the panel's diff view.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommitSummary {
+    pub sha: String,
+    pub subject: String,
+    /// Committer date, seconds since the epoch.
+    pub timestamp: i64,
+}
+
+/// The `git` executable, resolved once. `None` means git is not installed.
+fn git_binary() -> Option<&'static PathBuf> {
+    static BINARY: OnceLock<Option<PathBuf>> = OnceLock::new();
+    BINARY.get_or_init(|| which::which("git").ok()).as_ref()
+}
+
+/// True when this machine has git at all.
+pub fn available() -> bool {
+    git_binary().is_some()
+}
+
+/// Run one git command rooted at `root` and return its output, whatever the
+/// exit status. Only a failure to start the process is an error here; a
+/// non-zero status is the caller's to interpret.
+fn run(root: &Path, args: &[&str]) -> Result<Output, String> {
+    let binary = git_binary().ok_or_else(|| "git이 설치되어 있지 않습니다.".to_string())?;
+    let mut command = Command::new(binary);
+    command
+        .arg("-C")
+        .arg(root)
+        // Windows project paths are long (checkpoint 41's Map path work); a
+        // repository the app creates must not fail on one.
+        .args(["-c", "core.longpaths=true"])
+        .args(args)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .stdin(std::process::Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // The app is a windowless GUI process; without CREATE_NO_WINDOW every
+        // git call flashes a console.
+        command.creation_flags(0x0800_0000);
+    }
+    command
+        .output()
+        .map_err(|error| format!("git 실행에 실패했습니다: {error}"))
+}
+
+/// Run one git command and require success, returning its stdout.
+fn run_ok(root: &Path, args: &[&str]) -> Result<String, String> {
+    let output = run(root, args)?;
+    if !output.status.success() {
+        return Err(format!(
+            "git {} 실패: {}",
+            args.first().copied().unwrap_or(""),
+            message_of(&output)
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// The most useful line of a failed command's output.
+fn message_of(output: &Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let text = if stderr.trim().is_empty() {
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    } else {
+        stderr.into_owned()
+    };
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        "알 수 없는 오류".to_string()
+    } else {
+        trimmed.lines().take(3).collect::<Vec<_>>().join(" / ")
+    }
+}
+
+/// Prepare `root` for automatic commits and report what the user has to know.
+///
+/// A project with no repository gets one, with the app's `.gitignore` and an
+/// initial commit of the current state. A repository that was already here
+/// waits for the user's consent and is left untouched until then.
+pub fn prepare(root: &Path) -> RepoState {
+    if !available() {
+        return RepoState::unavailable(
+            "git이 설치되어 있지 않아 턴마다 자동 저장하지 못합니다. git을 설치하면 되돌리기가 켜집니다.".to_string(),
+        );
+    }
+    let toplevel = work_tree_toplevel(root);
+    let settings = load_settings(root);
+
+    match (settings, toplevel) {
+        // The app already decided for this project; keep that decision.
+        (Some(settings), Some(toplevel)) => RepoState {
+            available: true,
+            tracked: true,
+            nested: !same_dir(&toplevel, root),
+            origin: Some(settings.origin),
+            consent: settings.consent,
+            warning: None,
+        },
+        // Settings survived but the repository is gone (the user deleted
+        // `.git`). Start over rather than trusting a decision about a history
+        // that no longer exists.
+        (Some(_), None) => initialize(root),
+        (None, Some(toplevel)) => {
+            let nested = !same_dir(&toplevel, root);
+            let settings = Settings::new(RepoOrigin::Preexisting, Consent::Pending);
+            let warning = save_settings(root, &settings).err();
+            RepoState {
+                available: true,
+                tracked: true,
+                nested,
+                origin: Some(RepoOrigin::Preexisting),
+                consent: Consent::Pending,
+                warning: warning.or_else(|| {
+                    Some(if nested {
+                        "이 프로젝트는 이미 상위 폴더의 git 저장소 안에 있습니다. 턴마다 자동 커밋할지 확인이 필요합니다.".to_string()
+                    } else {
+                        "이 프로젝트는 이미 git으로 관리되고 있습니다. 턴마다 자동 커밋할지 확인이 필요합니다.".to_string()
+                    })
+                }),
+            }
+        }
+        (None, None) => initialize(root),
+    }
+}
+
+/// `git init` plus the app's `.gitignore` and an initial commit.
+fn initialize(root: &Path) -> RepoState {
+    if let Err(error) = run_ok(root, &["init"]) {
+        return RepoState::unavailable(format!(
+            "git 저장소를 만들지 못해 되돌리기를 켜지 못했습니다: {error}"
+        ));
+    }
+    if let Err(error) = write_gitignore(root) {
+        return RepoState::unavailable(format!(".gitignore를 쓰지 못했습니다: {error}"));
+    }
+    let settings = Settings::new(RepoOrigin::App, Consent::Granted);
+    let mut warning = save_settings(root, &settings).err();
+    if let Err(error) = commit_all(root, "프로젝트 초기 상태") {
+        warning.get_or_insert(format!("초기 상태를 커밋하지 못했습니다: {error}"));
+    }
+    RepoState {
+        available: true,
+        tracked: true,
+        nested: false,
+        origin: Some(RepoOrigin::App),
+        consent: Consent::Granted,
+        warning,
+    }
+}
+
+/// Record the user's answer to the "may I commit here?" question.
+pub fn set_consent(root: &Path, granted: bool) -> Result<RepoState, String> {
+    let mut settings = load_settings(root)
+        .ok_or_else(|| "이 프로젝트의 git 상태를 아직 확인하지 않았습니다.".to_string())?;
+    settings.consent = if granted {
+        Consent::Granted
+    } else {
+        Consent::Declined
+    };
+    save_settings(root, &settings)?;
+    Ok(prepare(root))
+}
+
+/// The work tree top level containing `root`, or `None` when `root` is not in
+/// a repository.
+fn work_tree_toplevel(root: &Path) -> Option<PathBuf> {
+    let output = run(root, &["rev-parse", "--show-toplevel"]).ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let trimmed = text.trim();
+    (!trimmed.is_empty()).then(|| PathBuf::from(trimmed))
+}
+
+/// Compare two directories by their canonical form so a short path, a symlink,
+/// or a different separator does not read as a different directory.
+fn same_dir(left: &Path, right: &Path) -> bool {
+    match (std::fs::canonicalize(left), std::fs::canonicalize(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => left == right,
+    }
+}
+
+/// Write the app's `.gitignore`, keeping whatever the file already says.
+fn write_gitignore(root: &Path) -> Result<(), String> {
+    let path = root.join(".gitignore");
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    let present: Vec<&str> = existing.lines().map(str::trim).collect();
+    let missing: Vec<&str> = IGNORED
+        .iter()
+        .copied()
+        .filter(|line| !present.contains(line))
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    let mut text = existing;
+    if !text.is_empty() && !text.ends_with('\n') {
+        text.push('\n');
+    }
+    if text.is_empty() {
+        text.push_str(
+            "# eud-agent가 생성한 목록입니다. 아래 경로는 다시 만들 수 있는 산출물입니다.\n",
+        );
+    }
+    for line in missing {
+        text.push_str(line);
+        text.push('\n');
+    }
+    std::fs::write(&path, text.as_bytes()).map_err(|error| format!("{}: {error}", path.display()))
+}
+
+fn settings_path(root: &Path) -> PathBuf {
+    root.join(SETTINGS_RELATIVE)
+}
+
+fn load_settings(root: &Path) -> Option<Settings> {
+    let text = std::fs::read_to_string(settings_path(root)).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+fn save_settings(root: &Path, settings: &Settings) -> Result<(), String> {
+    let path = settings_path(root);
+    let bytes = serde_json::to_vec_pretty(settings)
+        .map_err(|error| format!("git 설정을 직렬화하지 못했습니다: {error}"))?;
+    write_atomic(&path, &bytes).map_err(|error| format!("{}: {error}", path.display()))
+}
+
+/// Temp file plus rename, so a crash never leaves half a decision behind.
+fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension(format!("tmp-{}", uuid::Uuid::new_v4()));
+    if let Err(error) = std::fs::write(&tmp, bytes) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(error);
+    }
+    if let Err(error) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(error);
+    }
+    Ok(())
+}
+
+/// Whether this project's repository already accepts the app's automatic
+/// commits. A turn boundary asks this, so it prepares nothing and starts no
+/// process: a project that was never prepared, or whose user declined, simply
+/// does not commit.
+pub fn auto_commit_ready(root: &Path) -> bool {
+    available() && load_settings(root).is_some_and(|settings| settings.consent == Consent::Granted)
+}
+
+/// The project-relative paths that differ from the last commit, including
+/// files git does not track yet and excluding what `.gitignore` covers.
+pub fn dirty_paths(root: &Path) -> Result<Vec<String>, String> {
+    let stdout = run_ok(
+        root,
+        &[
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+            "--",
+            ".",
+        ],
+    )?;
+    let mut paths = Vec::new();
+    let mut records = stdout.split('\0').filter(|record| !record.is_empty());
+    while let Some(record) = records.next() {
+        // `XY <path>`; a rename or copy puts its source in the next record.
+        let Some((status, path)) = record.split_once(' ') else {
+            continue;
+        };
+        if status.starts_with('R') || status.starts_with('C') {
+            records.next();
+        }
+        paths.push(path.trim_start().to_string());
+    }
+    Ok(paths)
+}
+
+/// Commit everything that changed under `root`, or report that nothing did.
+///
+/// The pathspec keeps a project nested in a larger repository from committing
+/// its siblings, and keeps another tool's staged work out of the app's commit.
+fn commit_all(root: &Path, message: &str) -> Result<Option<CommitRecord>, String> {
+    let files = dirty_paths(root)?;
+    if files.is_empty() {
+        return Ok(None);
+    }
+    run_ok(root, &["add", "--all", "--", "."])?;
+
+    let mut args: Vec<String> = Vec::new();
+    if !has_identity(root) {
+        args.push("-c".into());
+        args.push(format!("user.name={IDENTITY_NAME}"));
+        args.push("-c".into());
+        args.push(format!("user.email={IDENTITY_EMAIL}"));
+    }
+    // A signing key with no agent, or a hook that runs a test suite, would
+    // block the turn. The app's own commits skip both; the user's do not.
+    args.push("-c".into());
+    args.push("commit.gpgsign=false".into());
+    args.extend(
+        ["commit", "--no-verify", "--message", message, "--", "."]
+            .iter()
+            .map(|arg| (*arg).to_string()),
+    );
+    let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
+    let output = run(root, &borrowed)?;
+    if !output.status.success() {
+        return Err(format!("커밋하지 못했습니다: {}", message_of(&output)));
+    }
+    let sha = run_ok(root, &["rev-parse", "HEAD"])?.trim().to_string();
+    Ok(Some(CommitRecord {
+        sha,
+        subject: subject_of(message),
+        files: files.len(),
+    }))
+}
+
+/// True when this repository has at least one commit. A repository the user
+/// just created has an unborn HEAD, which `log` and `revert` cannot read.
+fn has_commits(root: &Path) -> bool {
+    run(root, &["rev-parse", "--verify", "--quiet", "HEAD"])
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
+
+/// True when this repository already knows who commits here.
+fn has_identity(root: &Path) -> bool {
+    run(root, &["config", "user.email"])
+        .map(|output| output.status.success() && !output.stdout.is_empty())
+        .unwrap_or(false)
+}
+
+/// Commit whatever changed outside the app before a turn starts, so the turn's
+/// own commit holds only the turn's work.
+///
+/// This replaces the three-way merge the workspace used to run: the user's
+/// external edit is not merged into the agent's view, it is recorded as its
+/// own commit and the turn starts from it.
+pub fn commit_external_edits(root: &Path) -> Result<Option<CommitRecord>, String> {
+    commit_all(root, "외부 편집 — 에이전트 턴 밖에서 바뀐 파일")
+}
+
+/// Commit the work of one turn.
+pub fn commit_turn(root: &Path, message: &str) -> Result<Option<CommitRecord>, String> {
+    commit_all(root, message)
+}
+
+/// The commit message for one turn: what was asked, then which session and
+/// request produced it, so a history entry can be traced back to a
+/// conversation.
+pub fn turn_message(summary: &str, session_id: &str, request_id: &str) -> String {
+    let subject = subject_of(summary);
+    format!("{subject}\n\nsession: {session_id}\nrequest: {request_id}\n")
+}
+
+/// The first line of `text`, bounded and never empty.
+fn subject_of(text: &str) -> String {
+    let first = text
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("에이전트 턴");
+    if first.chars().count() <= SUBJECT_LIMIT {
+        return first.to_string();
+    }
+    let kept: String = first.chars().take(SUBJECT_LIMIT - 1).collect();
+    format!("{kept}…")
+}
+
+/// Undo one commit by recording its inverse, the way the user would.
+pub fn revert(root: &Path, sha: &str) -> Result<CommitRecord, String> {
+    if !dirty_paths(root)?.is_empty() {
+        return Err(
+            "저장하지 않은 변경이 남아 있어 되돌릴 수 없습니다. 먼저 현재 상태를 커밋하거나 되돌리세요."
+                .to_string(),
+        );
+    }
+    let mut args: Vec<String> = Vec::new();
+    if !has_identity(root) {
+        args.push("-c".into());
+        args.push(format!("user.name={IDENTITY_NAME}"));
+        args.push("-c".into());
+        args.push(format!("user.email={IDENTITY_EMAIL}"));
+    }
+    args.push("-c".into());
+    args.push("commit.gpgsign=false".into());
+    args.extend(
+        ["revert", "--no-edit", sha]
+            .iter()
+            .map(|arg| (*arg).to_string()),
+    );
+    let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
+    let output = run(root, &borrowed)?;
+    if !output.status.success() {
+        // A conflicted revert leaves the work tree mid-operation; put it back
+        // so the project is usable whatever the user does next.
+        let _ = run(root, &["revert", "--abort"]);
+        return Err(format!(
+            "되돌리지 못했습니다: {}. 이후 변경과 충돌하므로 직접 수정해야 합니다.",
+            message_of(&output)
+        ));
+    }
+    let head = run_ok(root, &["rev-parse", "HEAD"])?.trim().to_string();
+    let subject = run_ok(root, &["log", "-1", "--format=%s"])?
+        .trim()
+        .to_string();
+    let files = run_ok(root, &["show", "--name-only", "--format=", head.as_str()])?
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .count();
+    Ok(CommitRecord {
+        sha: head,
+        subject,
+        files,
+    })
+}
+
+/// The newest commits touching this project, newest first.
+pub fn log(root: &Path, limit: usize) -> Result<Vec<CommitSummary>, String> {
+    if !has_commits(root) {
+        return Ok(Vec::new());
+    }
+    let limit = limit.max(1).to_string();
+    let stdout = run_ok(
+        root,
+        &[
+            "log",
+            "--max-count",
+            limit.as_str(),
+            "--format=%H%x1f%ct%x1f%s",
+            "--",
+            ".",
+        ],
+    )?;
+    Ok(stdout
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.split('\u{1f}');
+            let sha = parts.next()?.trim().to_string();
+            let timestamp = parts.next()?.trim().parse().ok()?;
+            let subject = parts.next().unwrap_or_default().trim().to_string();
+            Some(CommitSummary {
+                sha,
+                subject,
+                timestamp,
+            })
+        })
+        .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A fresh directory for one test.
+    fn temp_root(tag: &str) -> PathBuf {
+        let root =
+            std::env::temp_dir().join(format!("eud-agent-git-{tag}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    /// git is required to run the app, but a machine without it must not fail
+    /// the suite — it reports the same way the product does.
+    fn git_present(test: &str) -> bool {
+        if available() {
+            return true;
+        }
+        eprintln!("skipping {test}: git is not installed on this machine");
+        false
+    }
+
+    fn write(root: &Path, relative: &str, text: &str) {
+        let path = root.join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+
+    #[test]
+    fn a_project_without_a_repository_gets_one_and_an_initial_commit() {
+        if !git_present("a_project_without_a_repository_gets_one_and_an_initial_commit") {
+            return;
+        }
+        let root = temp_root("init");
+        write(&root, "src/main.eps", "const a = 1;");
+
+        let state = prepare(&root);
+
+        assert!(state.available);
+        assert!(state.tracked);
+        assert!(!state.nested);
+        assert_eq!(state.origin, Some(RepoOrigin::App));
+        assert_eq!(state.consent, Consent::Granted);
+        assert!(state.auto_commit_allowed());
+        assert!(root.join(".gitignore").is_file());
+        assert_eq!(log(&root, 10).unwrap().len(), 1);
+        assert!(dirty_paths(&root).unwrap().is_empty());
+    }
+
+    #[test]
+    fn generated_output_and_app_state_stay_out_of_the_history() {
+        if !git_present("generated_output_and_app_state_stay_out_of_the_history") {
+            return;
+        }
+        let root = temp_root("ignore");
+        write(&root, "src/main.eps", "const a = 1;");
+        prepare(&root);
+
+        write(&root, "build/out.scx", "binary");
+        write(&root, "src/__epspy__/main.py", "generated");
+        write(&root, "compat/editor-project.e3s", "graph");
+
+        assert!(dirty_paths(&root).unwrap().is_empty());
+        assert!(commit_turn(&root, "아무 것도 바뀌지 않음")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn a_turn_commit_records_the_turn_and_carries_its_session_and_request() {
+        if !git_present("a_turn_commit_records_the_turn_and_carries_its_session_and_request") {
+            return;
+        }
+        let root = temp_root("turn");
+        write(&root, "src/main.eps", "const a = 1;");
+        prepare(&root);
+
+        write(&root, "src/main.eps", "const a = 2;");
+        let message = turn_message("체력을 200으로 올려줘", "session-7", "request-3");
+        let record = commit_turn(&root, &message).unwrap().expect("a commit");
+
+        assert_eq!(record.subject, "체력을 200으로 올려줘");
+        assert_eq!(record.files, 1);
+        let body = run_ok(&root, &["log", "-1", "--format=%B"]).unwrap();
+        assert!(body.contains("session: session-7"), "{body}");
+        assert!(body.contains("request: request-3"), "{body}");
+        assert!(dirty_paths(&root).unwrap().is_empty());
+    }
+
+    #[test]
+    fn an_external_edit_becomes_its_own_commit_before_the_turn() {
+        if !git_present("an_external_edit_becomes_its_own_commit_before_the_turn") {
+            return;
+        }
+        let root = temp_root("external");
+        write(&root, "src/main.eps", "const a = 1;");
+        write(&root, "maps/source.scx", "map v1");
+        prepare(&root);
+
+        // The user edits the map in SCMDraft while the app is open.
+        write(&root, "maps/source.scx", "map v2");
+        let external = commit_external_edits(&root).unwrap().expect("a commit");
+        assert_eq!(external.files, 1);
+
+        // Only then does the turn run and commit its own work.
+        write(&root, "src/main.eps", "const a = 2;");
+        let turn = commit_turn(&root, turn_message("소스 수정", "s", "r").as_str())
+            .unwrap()
+            .expect("a commit");
+
+        assert_ne!(external.sha, turn.sha);
+        let history = log(&root, 10).unwrap();
+        assert_eq!(history.len(), 3);
+        assert_eq!(history[0].subject, "소스 수정");
+        assert!(history[1].subject.starts_with("외부 편집"));
+        let files = run_ok(
+            &root,
+            &["show", "--name-only", "--format=", turn.sha.as_str()],
+        )
+        .unwrap();
+        assert!(files.contains("src/main.eps"), "{files}");
+        assert!(!files.contains("maps/source.scx"), "{files}");
+    }
+
+    #[test]
+    fn nothing_changed_means_no_commit() {
+        if !git_present("nothing_changed_means_no_commit") {
+            return;
+        }
+        let root = temp_root("clean");
+        write(&root, "src/main.eps", "const a = 1;");
+        prepare(&root);
+
+        assert!(commit_external_edits(&root).unwrap().is_none());
+        assert!(commit_turn(&root, "읽기만 한 턴").unwrap().is_none());
+        assert_eq!(log(&root, 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_preexisting_repository_is_not_committed_into_before_consent() {
+        if !git_present("a_preexisting_repository_is_not_committed_into_before_consent") {
+            return;
+        }
+        let root = temp_root("existing");
+        write(&root, "src/main.eps", "const a = 1;");
+        run_ok(&root, &["init"]).unwrap();
+
+        let state = prepare(&root);
+        assert_eq!(state.origin, Some(RepoOrigin::Preexisting));
+        assert_eq!(state.consent, Consent::Pending);
+        assert!(!state.auto_commit_allowed());
+        assert!(state.warning.is_some());
+        // Nothing was committed and no `.gitignore` was imposed.
+        assert!(log(&root, 10).unwrap().is_empty());
+        assert!(!root.join(".gitignore").exists());
+
+        let declined = set_consent(&root, false).unwrap();
+        assert_eq!(declined.consent, Consent::Declined);
+        assert!(!declined.auto_commit_allowed());
+
+        let granted = set_consent(&root, true).unwrap();
+        assert_eq!(granted.consent, Consent::Granted);
+        assert!(granted.auto_commit_allowed());
+        // The decision survives a later open.
+        assert!(prepare(&root).auto_commit_allowed());
+    }
+
+    #[test]
+    fn a_project_inside_a_larger_repository_is_reported_as_nested() {
+        if !git_present("a_project_inside_a_larger_repository_is_reported_as_nested") {
+            return;
+        }
+        let parent = temp_root("parent");
+        run_ok(&parent, &["init"]).unwrap();
+        let root = parent.join("projects/one");
+        std::fs::create_dir_all(&root).unwrap();
+        write(&root, "src/main.eps", "const a = 1;");
+
+        let state = prepare(&root);
+
+        assert!(state.tracked);
+        assert!(state.nested);
+        assert_eq!(state.origin, Some(RepoOrigin::Preexisting));
+        assert_eq!(state.consent, Consent::Pending);
+    }
+
+    #[test]
+    fn a_nested_project_commits_only_its_own_files() {
+        if !git_present("a_nested_project_commits_only_its_own_files") {
+            return;
+        }
+        let parent = temp_root("nested-commit");
+        run_ok(&parent, &["init"]).unwrap();
+        write(&parent, "sibling.txt", "not the project");
+        let root = parent.join("projects/one");
+        std::fs::create_dir_all(&root).unwrap();
+        write(&root, "src/main.eps", "const a = 1;");
+        prepare(&root);
+        set_consent(&root, true).unwrap();
+
+        let record = commit_turn(&root, "프로젝트만 커밋")
+            .unwrap()
+            .expect("a commit");
+
+        let files = run_ok(
+            &root,
+            &["show", "--name-only", "--format=", record.sha.as_str()],
+        )
+        .unwrap();
+        assert!(files.contains("src/main.eps"), "{files}");
+        assert!(!files.contains("sibling.txt"), "{files}");
+    }
+
+    #[test]
+    fn revert_restores_the_state_before_a_turn() {
+        if !git_present("revert_restores_the_state_before_a_turn") {
+            return;
+        }
+        let root = temp_root("revert");
+        write(&root, "src/main.eps", "const a = 1;");
+        prepare(&root);
+
+        write(&root, "src/main.eps", "const a = 2;");
+        write(&root, "src/added.eps", "const b = 1;");
+        let turn = commit_turn(&root, turn_message("두 파일 수정", "s", "r").as_str())
+            .unwrap()
+            .expect("a commit");
+
+        revert(&root, &turn.sha).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(root.join("src/main.eps")).unwrap(),
+            "const a = 1;"
+        );
+        assert!(!root.join("src/added.eps").exists());
+        assert!(dirty_paths(&root).unwrap().is_empty());
+    }
+
+    #[test]
+    fn revert_refuses_while_the_work_tree_has_uncommitted_changes() {
+        if !git_present("revert_refuses_while_the_work_tree_has_uncommitted_changes") {
+            return;
+        }
+        let root = temp_root("revert-dirty");
+        write(&root, "src/main.eps", "const a = 1;");
+        prepare(&root);
+        write(&root, "src/main.eps", "const a = 2;");
+        let turn = commit_turn(&root, "수정").unwrap().expect("a commit");
+        write(&root, "src/main.eps", "const a = 3;");
+
+        let error = revert(&root, &turn.sha).unwrap_err();
+
+        assert!(error.contains("저장하지 않은 변경"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(root.join("src/main.eps")).unwrap(),
+            "const a = 3;"
+        );
+    }
+
+    #[test]
+    fn a_long_request_is_shortened_into_one_subject_line() {
+        let summary = "가".repeat(200);
+        let message = turn_message(&summary, "s", "r");
+        let subject = message.lines().next().unwrap();
+
+        assert_eq!(subject.chars().count(), SUBJECT_LIMIT);
+        assert!(subject.ends_with('…'));
+        assert!(message.contains("session: s"));
+    }
+
+    #[test]
+    fn an_empty_request_still_produces_a_subject() {
+        let message = turn_message("  \n\n", "s", "r");
+        assert_eq!(message.lines().next().unwrap(), "에이전트 턴");
+    }
+
+    #[test]
+    fn the_generated_gitignore_keeps_what_the_project_already_ignored() {
+        let root = temp_root("gitignore");
+        std::fs::write(root.join(".gitignore"), "node_modules/\nbuild/\n").unwrap();
+
+        write_gitignore(&root).unwrap();
+
+        let text = std::fs::read_to_string(root.join(".gitignore")).unwrap();
+        assert!(text.starts_with("node_modules/\nbuild/\n"), "{text}");
+        assert_eq!(text.matches("build/").count(), 1, "{text}");
+        assert!(text.contains(".eud-agent/state/"), "{text}");
+        assert!(text.contains("compat/"), "{text}");
+    }
+}

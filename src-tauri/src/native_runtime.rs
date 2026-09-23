@@ -648,7 +648,20 @@ impl NativeProjectManager {
             }
             return Err(error);
         }
+        self.prepare_git(project);
         Ok(())
+    }
+
+    /// Give the opened project the repository that the app rolls back with.
+    ///
+    /// A git problem never fails an open: the project's authoring state is on
+    /// disk either way, and refusing to open it would cost the user more than
+    /// the missing history does.
+    fn prepare_git(&self, project: &NativeProject) {
+        let state = crate::git::prepare(project.root());
+        if let Some(warning) = state.warning.as_deref() {
+            eprintln!("eud-agent: {warning}");
+        }
     }
 
     fn archive_legacy_migration(
@@ -2559,6 +2572,29 @@ mod tests {
         config.project_path = project_root.to_string_lossy().into_owned();
         dirs.save_config(&config).unwrap();
         (base, manager)
+    }
+
+    #[test]
+    fn opening_a_project_gives_it_the_repository_the_app_rolls_back_with() {
+        if !crate::git::available() {
+            eprintln!("skipping: git is not installed on this machine");
+            return;
+        }
+        let (base, manager) = manager("git-prepare");
+        let root = manager.project_root().unwrap();
+
+        // Activation prepared the repository, so a turn boundary may commit.
+        assert!(crate::git::auto_commit_ready(&root));
+        assert!(root.join(".gitignore").is_file());
+        assert_eq!(crate::git::log(&root, 10).unwrap().len(), 1);
+
+        // Everything written after the open is work a boundary still records.
+        let record = crate::git::commit_turn(&root, "초기 소스")
+            .unwrap()
+            .expect("a commit");
+        assert!(record.files >= 1);
+        assert!(crate::git::dirty_paths(&root).unwrap().is_empty());
+        fs::remove_dir_all(base).ok();
     }
 
     #[test]

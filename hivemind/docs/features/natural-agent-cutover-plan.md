@@ -265,6 +265,24 @@ OpenCode Go / Ollama / Antigravity는 네이티브 도구가 원천적으로 없
 | 6 | §N7 `fs_*` 도구 (승인 시) | 다섯 프로바이더 동등 |
 | 7 | 문서 갱신 | §5 문서 목록 |
 
+### 진행
+
+- **Phase 0 — 완료 (2026-09-23).** 기록 커밋 `f83cfff`.
+- **Phase 1 — 백엔드 완료 (2026-09-23).** `src-tauri/src/git.rs`가 git 탐지, `prepare`
+  (`git init` + `.gitignore` + 초기 커밋), 사전 동의 상태, dirty 조회, 외부 편집 커밋,
+  턴 커밋, `revert`, `log`를 갖는다. `NativeProjectManager::activate_project`가 프로젝트
+  open마다 `prepare`를 부르고, 엔진이 턴 시작에서 `commit_external_edits_before_turn`을,
+  턴 종료와 자율 런 iteration 경계에서 `commit_boundary`를 부른다.
+  - `git revert`에는 `--no-verify`가 없다(지원 git 버전에서 usage 오류). revert는 훅을 탄다.
+  - 앱의 자동 커밋은 `--no-verify` + `commit.gpgsign=false`로 돈다. 턴마다 도는 커밋이
+    테스트를 돌리는 훅이나 에이전트 없는 서명 키에서 멈추면 앱이 멈추기 때문이다.
+  - 커밋은 항상 `-- .` 파스펙으로 프로젝트 루트에 한정한다. 상위 저장소 안의 프로젝트가
+    형제 폴더를 커밋하지 않는다.
+  - **남은 것:** 사전 존재 저장소의 동의 UI와 외부 편집 분리 알림은 패널 표면이라
+    Phase 5(§N9)에서 붙인다. 그때까지 사전 존재 저장소는 자동 커밋하지 않는다(안전 기본값).
+    턴 경계 커밋의 엔드투엔드 테스트도 턴 경로가 확정되는 Phase 4에서 쓴다 — 지금 쓰면
+    Phase 4가 지우는 staged 파이프라인 위에 쓰게 된다.
+
 Phase 1–2를 3보다 먼저 두는 이유: **되돌리기 수단과 경계 검증이 먼저 서 있어야** 자유 CRUD를
 열어도 안전하다. 어느 Phase에서 중단해도 제품은 동작 가능한 상태로 남는다.
 

@@ -626,6 +626,12 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
             run.iteration = run.iteration.saturating_add(1);
         }
         let should_continue = run.status == crate::autonomous::AutonomousRunStatus::Running;
+        // One long run is many commits, so a run that went wrong halfway can be
+        // reverted to the iteration that was still right.
+        self.commit_boundary(
+            &format!("[장시간 작업 {}회차] {}", run.iteration, run.goal),
+            &run.request_id,
+        );
         self.persist_autonomous_run(run).await?;
         Ok(should_continue)
     }
@@ -1412,6 +1418,7 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
         self.runtime
             .begin_request(&request_id, &self.project_id)
             .map_err(AgentEngineError::new)?;
+        self.commit_external_edits_before_turn();
         self.execution_mode = execution_mode;
         self.autonomous_policy = autonomous_policy.clone();
         self.autonomous_pause_requested
@@ -1606,6 +1613,7 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
         } else {
             self.workflow_settle_foreground()?;
         }
+        self.commit_boundary(&user_text, &request_id);
         self.update_active_session().await;
         Ok(())
     }
@@ -1673,6 +1681,54 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
             .await?;
         self.thread_active = true;
         Ok(result)
+    }
+
+    /// Record whatever changed outside the app before this turn touches
+    /// anything, so the turn's own commit holds only the turn's work.
+    ///
+    /// This is what replaces the workspace's three-way merge: the user's
+    /// SCMDraft or editor change is not folded into the agent's view, it
+    /// becomes its own commit that the turn then starts from.
+    fn commit_external_edits_before_turn(&self) {
+        let Ok(root) = self.runtime.project_root() else {
+            return;
+        };
+        if !crate::git::auto_commit_ready(&root) {
+            return;
+        }
+        match crate::git::commit_external_edits(&root) {
+            Ok(Some(record)) => eprintln!(
+                "eud-agent: 앱 밖에서 바뀐 파일 {}개를 별도 커밋 {}로 기록했습니다.",
+                record.files,
+                short_sha(&record.sha)
+            ),
+            Ok(None) => {}
+            Err(error) => eprintln!("eud-agent: 외부 편집을 커밋하지 못했습니다: {error}"),
+        }
+    }
+
+    /// Commit the work one boundary finished.
+    ///
+    /// A repository problem is reported, never raised: the work is already on
+    /// disk, and failing the turn over a missing history entry would cost the
+    /// user more than the entry is worth.
+    fn commit_boundary(&self, summary: &str, request_id: &str) {
+        let Ok(root) = self.runtime.project_root() else {
+            return;
+        };
+        if !crate::git::auto_commit_ready(&root) {
+            return;
+        }
+        let message = crate::git::turn_message(summary, &self.session_id, request_id);
+        match crate::git::commit_turn(&root, &message) {
+            Ok(Some(record)) => eprintln!(
+                "eud-agent: 턴 커밋 {} ({}개 파일)",
+                short_sha(&record.sha),
+                record.files
+            ),
+            Ok(None) => {}
+            Err(error) => eprintln!("eud-agent: 턴을 커밋하지 못했습니다: {error}"),
+        }
     }
 
     /// After a successful turn, persist the exact provider conversation and
@@ -5867,6 +5923,11 @@ fn auto_session_name(first_text: &str) -> String {
 }
 
 /// Cap on the condensed replay transcript (chars), kept well under prompt limits.
+/// The abbreviated commit id the app writes to its own log.
+fn short_sha(sha: &str) -> String {
+    sha.chars().take(8).collect()
+}
+
 const CONDENSED_TRANSCRIPT_CAP_CHARS: usize = 8000;
 /// The same log for a stage job, which routes a request instead of
 /// continuing the work itself.

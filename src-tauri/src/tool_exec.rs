@@ -1472,6 +1472,11 @@ impl SessionToolRuntime {
         })
     }
 
+    /// The configured project's root directory.
+    pub fn project_root(&self) -> Result<PathBuf, String> {
+        self.services.native().project_root()
+    }
+
     pub fn current_project_revision(&self) -> Result<String, String> {
         self.services.native().open()?.revision()
     }
@@ -5824,6 +5829,7 @@ mod tests {
                 task_state: Default::default(),
                 autonomous_run: Some(autonomous),
                 workflow: None,
+                interrupted_workflow: None,
                 team_tasks: Vec::new(),
             })
             .unwrap();
@@ -6312,6 +6318,7 @@ mod tests {
                 task_state: Default::default(),
                 autonomous_run: None,
                 workflow: None,
+                interrupted_workflow: None,
                 team_tasks: tasks,
             })
             .unwrap();
