@@ -354,6 +354,23 @@ fn native_detail(bytes: &[u8]) -> Option<String> {
         .or_else(|| Some(text.to_owned()))
 }
 
+/// The engine writes the edited map to a temporary path and promotes it only
+/// after verifying it. On Windows a scanner or indexer holding a handle on a
+/// file the engine just wrote makes that write fail, and the engine reports it
+/// as its own error rather than an OS one — this exact message.
+const SAVE_CONTENTION_DETAIL: &str = "map save failed before output promotion";
+const SAVE_CONTENTION_RETRIES: u32 = 4;
+
+/// True when the engine failed for a reason that a moment's wait clears.
+///
+/// Retrying is running the same operation, not a second one: the batch is
+/// deterministic, nothing has been promoted yet, and the engine deletes the
+/// temporary it could not write.
+fn is_save_contention(error: &NativeCallError) -> bool {
+    error.status == IsomError::Engine
+        && error.detail.as_deref() == Some(SAVE_CONTENTION_DETAIL)
+}
+
 pub fn mapedit(
     input_map_path: &Path,
     output_map_path: &Path,
@@ -366,6 +383,27 @@ pub fn mapedit(
         path_cstring(output_map_path).map_err(|error| NativeCallError::new(error, None))?;
     let starcraft =
         path_cstring(starcraft_path).map_err(|error| NativeCallError::new(error, None))?;
+    let mut backoff = std::time::Duration::from_millis(20);
+    for _ in 0..SAVE_CONTENTION_RETRIES {
+        match mapedit_once(&input, &output, &starcraft, batch_json) {
+            Err(error) if is_save_contention(&error) => {
+                std::thread::sleep(backoff);
+                backoff *= 2;
+            }
+            settled => return settled,
+        }
+    }
+    // The last attempt reports whatever it hits, so a save that is genuinely
+    // broken still fails with its own message.
+    mapedit_once(&input, &output, &starcraft, batch_json)
+}
+
+fn mapedit_once(
+    input: &CString,
+    output: &CString,
+    starcraft: &CString,
+    batch_json: &[u8],
+) -> Result<String, NativeCallError> {
     let mut report: *mut u8 = std::ptr::null_mut();
     let mut report_len = 0_usize;
     // SAFETY: both paths and `batch_json` outlive this synchronous call. The
@@ -999,6 +1037,28 @@ pub fn abi_version() -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Only the save race is waited out. Any other engine failure is the
+    /// engine telling us the edit is wrong, and repeating it would hide that.
+    #[test]
+    fn only_the_save_race_is_retried() {
+        assert!(is_save_contention(&NativeCallError::new(
+            IsomError::Engine,
+            Some(SAVE_CONTENTION_DETAIL.to_string())
+        )));
+        assert!(!is_save_contention(&NativeCallError::new(
+            IsomError::Engine,
+            Some("unsupported operation 'terrain.set'".to_string())
+        )));
+        assert!(!is_save_contention(&NativeCallError::new(
+            IsomError::Engine,
+            None
+        )));
+        assert!(!is_save_contention(&NativeCallError::new(
+            IsomError::Io,
+            Some(SAVE_CONTENTION_DETAIL.to_string())
+        )));
+    }
 
     #[test]
     fn status_maps_every_known_code() {

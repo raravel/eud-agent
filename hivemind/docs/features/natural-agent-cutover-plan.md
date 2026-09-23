@@ -335,6 +335,12 @@ OpenCode Go / Ollama / Antigravity는 네이티브 도구가 원천적으로 없
     `write_atomic_bytes`(앱의 모든 원자적 쓰기)와 `map_candidate::remove_if_exists`가 쓴다.
     마지막 시도는 원래 오류를 그대로 보고하므로 진짜 권한 문제는 여전히 실패한다.
   - 수정 후 같은 조합을 8회 반복해 8/8 통과.
+  - 그 뒤 남은 실패는 **네이티브 엔진 안쪽**으로 옮겨갔다: `MapAgentCore.cpp`의
+    `map.save(temporary, ...)`가 같은 경합으로 실패하며 `"map save failed before output
+    promotion"`을 낸다. C++을 고치면 정적 라이브러리를 다시 빌드해야 하므로,
+    `isom::mapedit`가 **그 정확한 메시지일 때만** 20ms부터 4회까지 다시 부른다. 배치는
+    결정적이고 임시 파일은 실패 시 엔진이 지우므로, 재시도는 같은 연산을 다시 하는 것이지
+    두 번 하는 것이 아니다. 다른 엔진 오류는 절대 재시도하지 않는다(테스트로 고정).
 
 - **Phase 4 — 파이프라인 제거 (2026-09-23).**
   - 파일째 삭제: `workflow.rs`(1,701), `engine/workflow_stages.rs`(1,275), `engine/workflow_tests.rs`,
