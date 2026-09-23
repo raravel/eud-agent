@@ -17,7 +17,7 @@ use crate::config::DataDirs;
 use crate::journal::{JournalEntry, JournalStore, JournalTarget, Snapshot, WriteTool};
 use crate::native_build::{
     probe_frozen_python, run_native_build_with_python_and_cancellation, DatCatalog, EuddraftLaunch,
-    FrozenPythonIdentity, NativeBuildResult,
+    FrozenPythonIdentity, NativeBuildArtifacts, NativeBuildError, NativeBuildResult,
 };
 use crate::native_project::{
     compute_python_lock_digest, discover_manifest_files, validate_python_dependencies,
@@ -960,6 +960,56 @@ revision={}
         self.open()?.plugin_move(from, to)
     }
 
+    /// What the build refuses before euddraft starts.
+    ///
+    /// The tool schemas used to be the only gate on these rules. An edit made
+    /// straight to the project tree goes around them, so the build checks them
+    /// again at the boundary where it still costs nothing to say no.
+    ///
+    /// `NativeProject::open` has already validated the manifest, the path
+    /// rules, and that MainFile and the source map exist; what is left is what
+    /// opening cannot see.
+    fn build_preflight(&self, project: &NativeProject) -> Result<Vec<NativeBuildError>, String> {
+        let mut refusals = Vec::new();
+        let catalog = DatCatalog::load(&self.dirs.native_assets_dir())?;
+        for entry in project.dat_overrides() {
+            match baseline_value(&catalog, &entry.target) {
+                Ok(stock) if stock == entry.before => {}
+                Ok(stock) => refusals.push(preflight_error(
+                    entry.file,
+                    format!(
+                        "{}의 before가 원본 값과 다릅니다 (원본 {}, 기록된 before {}). 생성기는 after - before를 런타임 델타로 내보내므로 이대로 빌드하면 맵이 잘못된 값으로 돕니다. before를 원본 값으로 고치거나 이 override를 지우세요.",
+                        entry.label,
+                        scalar_text(&stock),
+                        scalar_text(&entry.before)
+                    ),
+                )),
+                Err(reason) => refusals.push(preflight_error(
+                    entry.file,
+                    format!("{}를 원본 카탈로그에서 찾을 수 없습니다: {reason}", entry.label),
+                )),
+            }
+        }
+        for path in project.list_source_files()? {
+            if !Path::new(&path)
+                .extension()
+                .and_then(|value| value.to_str())
+                .is_some_and(|value| {
+                    value.eq_ignore_ascii_case("eps") || value.eq_ignore_ascii_case("py")
+                })
+            {
+                continue;
+            }
+            if let Err(reason) = crate::native_project::require_editable_source_path(&path) {
+                refusals.push(preflight_error(
+                    path.clone(),
+                    format!("이 소스 파일은 프로젝트가 쓸 수 없는 이름입니다: {reason}"),
+                ));
+            }
+        }
+        Ok(refusals)
+    }
+
     pub fn dat_values(
         &self,
         targets: &[DatTarget],
@@ -1650,6 +1700,10 @@ revision={}
         }
         let _transaction = self.transaction.lock();
         let project = self.open()?;
+        let refusals = self.build_preflight(&project)?;
+        if !refusals.is_empty() {
+            return Ok(preflight_refusal(refusals));
+        }
         let cache_key =
             python_project_cache_key(&fs::canonicalize(project.root()).map_err(stringify_io)?);
         let marker = project.root().join("build/.building");
@@ -2489,6 +2543,41 @@ impl Drop for BuildMarker {
     }
 }
 
+/// A build that never started, carrying only why it was refused. It is a build
+/// failure and not a tool error so the model reads it the way it reads a
+/// compiler error, and so a repeated identical refusal counts as no progress.
+fn preflight_refusal(errors: Vec<NativeBuildError>) -> NativeBuildResult {
+    NativeBuildResult {
+        ok: false,
+        errors,
+        warnings: Vec::new(),
+        raw_status: 0,
+        stdout: String::new(),
+        stderr: String::new(),
+        log_path: String::new(),
+        artifacts: NativeBuildArtifacts::default(),
+    }
+}
+
+fn preflight_error(file: impl Into<String>, message: String) -> NativeBuildError {
+    let file = file.into();
+    NativeBuildError {
+        source: "preflight".to_string(),
+        raw: format!("{file}: {message}"),
+        file,
+        line: 0,
+        message,
+        count: 1,
+    }
+}
+
+fn scalar_text(value: &DatScalar) -> String {
+    match value {
+        DatScalar::Number(number) => number.to_string(),
+        DatScalar::Text(text) => format!("\"{text}\""),
+    }
+}
+
 fn baseline_value(catalog: &DatCatalog, target: &DatTarget) -> Result<DatScalar, String> {
     match target {
         DatTarget::Dat {
@@ -2572,6 +2661,88 @@ mod tests {
         config.project_path = project_root.to_string_lossy().into_owned();
         dirs.save_config(&config).unwrap();
         (base, manager)
+    }
+
+    /// Free CRUD lets a model edit `dat/*.json` without passing `dat_patch`.
+    /// The generator emits `after - before` as a runtime delta, so a wrong
+    /// `before` would not fail anything — it would silently run the map on the
+    /// wrong numbers. The build has to be the one that says no.
+    #[test]
+    fn a_hand_edited_dat_override_with_a_wrong_before_fails_the_build() {
+        let (base, manager) = manager("preflight-dat");
+        manager
+            .apply_dat_patch(&NativeDatPatch {
+                changes: vec![NativeDatChange::Dat {
+                    dat: "units".to_string(),
+                    object_id: 15,
+                    field: "Hit Points".to_string(),
+                    before: 10240,
+                    after: 20480,
+                }],
+            })
+            .unwrap();
+        let document = manager.project_root().unwrap().join("dat/standard.json");
+        let text = fs::read_to_string(&document).unwrap();
+        fs::write(&document, text.replace("10240", "1")).unwrap();
+
+        let result = manager.build("project").unwrap();
+
+        assert!(!result.ok);
+        let error = result
+            .errors
+            .iter()
+            .find(|error| error.file == "dat/standard.json")
+            .unwrap_or_else(|| panic!("a preflight error names the document: {:?}", result.errors));
+        assert_eq!(error.source, "preflight");
+        assert!(error.message.contains("before"), "{}", error.message);
+        // The stock value and the claimed one are both named, so the model can
+        // repair the file without another read.
+        assert!(error.message.contains("10240"), "{}", error.message);
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn a_source_file_the_project_cannot_use_fails_the_build_instead_of_being_skipped() {
+        let (base, manager) = manager("preflight-source");
+        let root = manager.project_root().unwrap();
+        // `[`/`]` cannot appear in an EDS section header, so every source
+        // listing silently drops this file. Silence is the wrong answer once
+        // the model can create it directly.
+        fs::write(root.join("src/bad[1].eps"), "const a = 1;").unwrap();
+
+        let result = manager.build("project").unwrap();
+
+        assert!(!result.ok);
+        let error = result
+            .errors
+            .iter()
+            .find(|error| error.file.contains("bad[1].eps"))
+            .unwrap_or_else(|| panic!("a preflight error names the file: {:?}", result.errors));
+        assert_eq!(error.source, "preflight");
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn a_correct_project_passes_the_preflight_and_reaches_the_compiler() {
+        let (base, manager) = manager("preflight-clean");
+        manager
+            .apply_dat_patch(&NativeDatPatch {
+                changes: vec![NativeDatChange::Dat {
+                    dat: "units".to_string(),
+                    object_id: 15,
+                    field: "Hit Points".to_string(),
+                    before: 10240,
+                    after: 20480,
+                }],
+            })
+            .unwrap();
+
+        // No euddraft is configured in a test, so reaching that refusal is what
+        // proves the preflight let the build through.
+        let error = manager.build("project").unwrap_err();
+
+        assert_eq!(error, EUDDRAFT_NOT_CONFIGURED);
+        fs::remove_dir_all(base).ok();
     }
 
     #[test]

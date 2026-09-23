@@ -349,6 +349,17 @@ pub enum DatScalar {
     Text(String),
 }
 
+/// One sparse override exactly as the project stores it: which document holds
+/// it, how to name it to the user, which target it addresses, and the `before`
+/// value it claims is stock.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DatOverride {
+    pub file: &'static str,
+    pub label: String,
+    pub target: DatTarget,
+    pub before: DatScalar,
+}
+
 impl NativeDatChange {
     pub fn target(&self) -> DatTarget {
         match self {
@@ -997,6 +1008,78 @@ impl NativeProject {
                 .get(set_id)
                 .map(|value| DatScalar::Text(value.before.clone())),
         }
+    }
+
+    /// Every sparse override this project stores, with the `before` value it
+    /// claims is the stock catalog value.
+    ///
+    /// `dat_patch` checks that claim when it writes. An edit made straight to
+    /// `dat/*.json` does not pass through the patch, and a wrong `before` is
+    /// not a cosmetic error: the generator emits `SetMemory(offset, Add,
+    /// after - before)`, so the map silently runs on the wrong numbers. The
+    /// build checks the same rule again against this list.
+    pub fn dat_overrides(&self) -> Vec<DatOverride> {
+        let mut overrides = Vec::new();
+        for (file, document, numeric) in [
+            (STANDARD_DAT_FILE, &self.dat.standard, true),
+            (XDAT_FILE, &self.dat.xdat, false),
+        ] {
+            for (dat, objects) in &document.tables {
+                for (object_id, fields) in objects {
+                    for (field, change) in fields {
+                        let target = if numeric {
+                            DatTarget::Dat {
+                                dat: dat.clone(),
+                                object_id: *object_id,
+                                field: field.clone(),
+                            }
+                        } else {
+                            DatTarget::Xdat {
+                                dat: dat.clone(),
+                                object_id: *object_id,
+                                field: field.clone(),
+                            }
+                        };
+                        overrides.push(DatOverride {
+                            file,
+                            label: format!("{dat}[{object_id}].{field}"),
+                            target,
+                            before: DatScalar::Number(change.before),
+                        });
+                    }
+                }
+            }
+        }
+        for (index, change) in &self.dat.tbl.values {
+            overrides.push(DatOverride {
+                file: TBL_FILE,
+                label: format!("tbl[{index}]"),
+                target: DatTarget::Tbl(*index),
+                before: DatScalar::Text(change.before.clone()),
+            });
+        }
+        for (dat, objects) in &self.dat.requirements.tables {
+            for (object_id, change) in objects {
+                overrides.push(DatOverride {
+                    file: REQUIREMENTS_FILE,
+                    label: format!("{dat}[{object_id}]"),
+                    target: DatTarget::Requirement {
+                        dat: dat.clone(),
+                        object_id: *object_id,
+                    },
+                    before: DatScalar::Text(change.before.clone()),
+                });
+            }
+        }
+        for (set_id, change) in &self.dat.buttons.values {
+            overrides.push(DatOverride {
+                file: BUTTONS_FILE,
+                label: format!("buttons[{set_id}]"),
+                target: DatTarget::Button(*set_id),
+                before: DatScalar::Text(change.before.clone()),
+            });
+        }
+        overrides
     }
 
     pub fn current_dat_value(&self, target: &DatTarget) -> Option<DatScalar> {

@@ -214,7 +214,7 @@ impl DatCatalog {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NativeBuildArtifacts {
     pub build_dir: String,
