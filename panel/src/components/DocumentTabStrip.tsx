@@ -16,7 +16,7 @@ export interface DocumentTab {
   /** "chat", the workspace-relative file path, or the virtual plan tab id. */
   id: DocumentTabId;
   label: string;
-  /** Leading icon for stage artifacts (조사 보고 / 계획 / 검증 보고). */
+  /** Leading icon, used by the virtual plan tab. */
   icon?: LucideIcon;
 }
 

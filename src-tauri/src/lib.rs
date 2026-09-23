@@ -70,7 +70,6 @@ pub mod trace_test;
 pub mod wiki;
 #[cfg(windows)]
 pub mod windows_notification;
-pub mod workflow;
 pub mod workspace;
 pub mod write_coordinator;
 
@@ -341,9 +340,6 @@ pub fn run() {
             if let Err(error) = session_store.recover_interrupted_autonomous_runs() {
                 eprintln!("eud-agent: autonomous restart recovery failed: {error}");
             }
-            if let Err(error) = session_store.recover_interrupted_workflows() {
-                eprintln!("eud-agent: staged workflow restart recovery failed: {error}");
-            }
 
             let config =
                 engine::AgentEngineConfig::new("[project state]\n(unavailable)", None, Vec::new())
@@ -378,8 +374,6 @@ pub fn run() {
             engine::engine_chat,
             engine::engine_plan_feedback,
             engine::engine_plan_approve,
-            engine::engine_workflow_resume,
-            engine::engine_workflow_restart,
             engine::engine_changeset_decision,
             engine::engine_harness_jobs,
             engine::engine_harness_runtime_confirm,

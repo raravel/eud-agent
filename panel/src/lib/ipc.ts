@@ -148,11 +148,8 @@ const PUSH_EVENT_TYPES = [
   "answer",
   "plan",
   "ask",
-  "delegation",
   "team_task",
   "changeset",
-  "workflow",
-  "interrupted_request",
   "harness_job",
   "rollback_result",
   "progress",
@@ -359,9 +356,6 @@ export class IpcClient {
           mentions: msg.mentions ?? [],
         };
       case "plan_approve":
-        return { sessionId: msg.sessionId };
-      case "workflow_resume":
-      case "workflow_restart":
         return { sessionId: msg.sessionId };
       case "ask_response":
         return {

@@ -634,7 +634,6 @@ impl MapAgentService {
             context_state: Default::default(),
             task_state: Default::default(),
             autonomous_run: None,
-            workflow: None,
             team_tasks: Vec::new(),
         };
         self.sessions
@@ -1278,7 +1277,6 @@ impl MapAgentService {
             context_state: Default::default(),
             task_state: Default::default(),
             autonomous_run: None,
-            workflow: None,
             team_tasks: Vec::new(),
         };
         self.sessions
@@ -2800,7 +2798,6 @@ mod tests {
                 context_state: Default::default(),
                 task_state: Default::default(),
                 autonomous_run: None,
-                workflow: None,
                 team_tasks: Vec::new(),
             })
             .unwrap();
@@ -2947,7 +2944,6 @@ mod tests {
                 context_state: Default::default(),
                 task_state: Default::default(),
                 autonomous_run: None,
-                workflow: None,
                 team_tasks: Vec::new(),
             })
             .unwrap();
@@ -3303,7 +3299,6 @@ mod team_handoff_tests {
             context_state: Default::default(),
             task_state: Default::default(),
             autonomous_run: None,
-            workflow: None,
             team_tasks: Vec::new(),
         }
     }

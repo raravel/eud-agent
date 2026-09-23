@@ -33,16 +33,6 @@ pub const ASK_TOOL: &str = "ask";
 /// progress notifications do not extend it (measured 2026-09-17, `verify.md`),
 /// so no single tool call may wait longer than this.
 pub const ASK_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(240);
-/// Flow-control tool that runs one isolated read-only child run and returns
-/// only its schema-validated summary to the calling foreground run.
-pub const DELEGATE_READ_TOOL: &str = "delegate_read";
-/// Bounded wait for one `delegate_read` child run; it shares the
-/// [`ASK_WAIT_TIMEOUT`] native MCP ceiling because the parent's tool call
-/// waits for the whole child.
-pub const DELEGATE_READ_TIMEOUT: std::time::Duration = ASK_WAIT_TIMEOUT;
-/// Soft per-foreground-run cap on `delegate_read` calls. Exceeding it is a
-/// correctable usage error, never a run boundary.
-pub const DELEGATE_READ_RUN_LIMIT: u8 = 8;
 /// EPS → Map team handoff: hand placement work to the session's team Map
 /// session and wait (bounded) for its candidate.
 pub const MAP_TASK_REQUEST_TOOL: &str = "map_task_request";
@@ -106,10 +96,6 @@ pub type ToolResult<T> = Result<T, ToolError>;
 /// Tool-layer errors surfaced as correctable tool-call failures.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum ToolError {
-    /// A mutating tool was called before `search_docs` ran in this request.
-    #[error("{message}")]
-    EvidenceRequired { message: String },
-
     /// A `btn_set` CSV contains a disableable button with `disstr == 0`.
     #[error("{message}")]
     ButtonDisableStringRequired { message: String },
@@ -148,9 +134,6 @@ pub enum BuildProgressOutcome {
 pub struct RequestState {
     /// Stable id for the currently admitted request.
     pub request_id: String,
-
-    /// Set once a `search_docs` call has run successfully, even with zero hits.
-    pub docs_searched: bool,
 
     /// Set once `map_info` ran successfully in this request: the evidence a
     /// `map_task_request` needs before handing placement work to Map Agent.
@@ -212,7 +195,6 @@ impl RequestState {
     pub fn for_request(id: &str) -> Self {
         Self {
             request_id: id.to_string(),
-            docs_searched: false,
             map_inspected: false,
             candidate_inspected: None,
             action_count: 0,
@@ -266,11 +248,6 @@ impl RequestState {
         }
     }
 
-    /// Record that `search_docs` ran successfully for this request.
-    pub fn record_search_docs(&mut self) {
-        self.docs_searched = true;
-    }
-
     /// Record that `map_info` ran successfully for this request.
     pub fn record_map_inspection(&mut self) {
         self.map_inspected = true;
@@ -305,7 +282,6 @@ impl RequestState {
 
     /// Record discovery hits and return one repeated flag per id.
     pub fn record_search_docs_hits(&mut self, args: &Value, ids: &[u64]) -> Vec<bool> {
-        self.record_search_docs();
         self.search_docs_count = self.search_docs_count.saturating_add(1);
         self.search_docs_returned_hits = self.search_docs_returned_hits.saturating_add(ids.len());
         let repeated = ids
@@ -1256,21 +1232,6 @@ pub fn tool_registry() -> Vec<ToolSpec> {
             schema(
                 json!({ "taskId": {"type": "string", "minLength": 1, "maxLength": 128} }),
                 &["taskId"],
-            ),
-        ),
-        read_tool(
-            DELEGATE_READ_TOOL,
-            "Delegate one bounded exploration to an isolated read-only child run and receive only its structured summary ({summary, findings[{path,line,excerpt,note}], openQuestions, toolCalls}); the child's reads never enter your context. Use it for broad searches across sources, docs, DAT, or map data whose raw results you do not need verbatim. The child sees the project read tools except build, trace, dependency preparation, ask, and delegate_read; it cannot write and its findings are not mutation evidence: re-read a target yourself before editing it. The call waits up to 240 seconds; a failed, timed-out, or cancelled child returns a usage error, and at most 8 delegations are admitted per foreground run.",
-            schema(
-                json!({
-                    "goal": {"type": "string", "minLength": 1, "maxLength": 2000},
-                    "focus": {
-                        "type": "array",
-                        "maxItems": 16,
-                        "items": {"type": "string", "minLength": 1, "maxLength": 512}
-                    }
-                }),
-                &["goal"],
             ),
         ),
     ]
@@ -2333,38 +2294,6 @@ pub fn requires_project_transaction(tool_name: &str) -> bool {
     tool_spec(tool_name).is_some_and(|spec| spec.requires_project_transaction)
 }
 
-/// Return whether a tool is exempt from the EUD-090 evidence gate.
-pub fn is_evidence_gate_exempt(tool_name: &str) -> bool {
-    // A team candidate apply is gated by candidate inspection instead of docs.
-    tool_name == BUILD_RUN_TOOL || tool_name == MAP_TASK_APPLY_TOOL
-}
-
-/// Check whether a tool call passes the EUD-090 evidence gate.
-///
-/// Canonical authoring tools are blocked on RAG-wired layers until
-/// `search_docs` has run once in the request. A zero-hit search still lifts the gate.
-pub fn check_evidence_gate(
-    state: &RequestState,
-    tool: &ToolSpec,
-    rag_wired: bool,
-) -> ToolResult<()> {
-    if tool.requires_write_workspace
-        && !is_evidence_gate_exempt(tool.name)
-        && rag_wired
-        && !state.docs_searched
-    {
-        return Err(ToolError::EvidenceRequired {
-            message: "evidence gate: no search_docs has run in this request. Ground the change \
-first by calling search_docs with a Korean query, cite each work item's reason with its source \
-link, then retry this call. A search with zero hits still lifts the gate; mark such items as \
-근거 없음 instead of fabricating a source."
-                .to_string(),
-        });
-    }
-
-    Ok(())
-}
-
 /// Admit one tool call through argument, evidence, and budget gates.
 ///
 /// Admission does not execute tools. In particular, successful `search_docs`
@@ -2387,7 +2316,6 @@ pub fn admit_tool_call(state: &mut RequestState, tool: &str, args: &Value) -> To
         }
     }
 
-    check_evidence_gate(state, &spec, true)?;
 
     validate_first_principles(&spec, args)?;
     if spec.requires_write_workspace {
@@ -4596,10 +4524,6 @@ mod tests {
         chk
     }
 
-    fn write_tool(name: &'static str) -> ToolSpec {
-        ToolSpec::canonical_mutation(name)
-    }
-
     fn native_build_result(
         ok: bool,
         errors: Vec<crate::native_build::NativeBuildError>,
@@ -4635,61 +4559,6 @@ mod tests {
             raw: raw.to_string(),
             count: 1,
         }
-    }
-
-    fn assert_evidence_required(result: ToolResult<()>) {
-        match result {
-            Err(ToolError::EvidenceRequired { message }) => {
-                assert!(
-                    message.contains(SEARCH_DOCS_TOOL),
-                    "EvidenceRequired must direct the model to call search_docs first"
-                );
-            }
-            other => panic!("expected EvidenceRequired, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn evidence_gate_blocks_mutating_rag_wired_call_before_search() {
-        let state = RequestState::new();
-        let result = check_evidence_gate(&state, &write_tool("btn_set"), true);
-
-        assert_evidence_required(result);
-    }
-
-    #[test]
-    fn evidence_gate_allows_same_mutating_call_after_search_even_with_zero_hits() {
-        let mut state = RequestState::new();
-        state.record_search_docs();
-
-        assert!(
-            state.docs_searched,
-            "search_docs must lift the evidence gate"
-        );
-        assert_eq!(
-            check_evidence_gate(&state, &write_tool("btn_set"), true),
-            Ok(())
-        );
-    }
-
-    #[test]
-    fn evidence_gate_never_blocks_build_run() {
-        let state = RequestState::new();
-
-        assert_eq!(
-            check_evidence_gate(&state, &write_tool(BUILD_RUN_TOOL), true),
-            Ok(())
-        );
-    }
-
-    #[test]
-    fn evidence_gate_degrades_open_when_rag_is_not_wired() {
-        let state = RequestState::new();
-
-        assert_eq!(
-            check_evidence_gate(&state, &write_tool("btn_set"), false),
-            Ok(())
-        );
     }
 
     #[test]
@@ -6138,21 +6007,6 @@ mod tests {
                     &["taskId"],
                 ),
             ),
-            (
-                DELEGATE_READ_TOOL,
-                false,
-                schema(
-                    serde_json::json!({
-                        "goal": {"type": "string", "minLength": 1, "maxLength": 2000},
-                        "focus": {
-                            "type": "array",
-                            "maxItems": 16,
-                            "items": {"type": "string", "minLength": 1, "maxLength": 512}
-                        }
-                    }),
-                    &["goal"],
-                ),
-            ),
         ]
     }
 
@@ -6277,7 +6131,6 @@ mod tests {
             prepare_state.action_count, 0,
             "dependency preparation is request-local analysis, not a project action"
         );
-        assert!(!prepare_state.docs_searched);
 
         for invalid in [
             json!({"dependencies": ["eudplib==0.80.6"], "extra": true}),
@@ -6291,12 +6144,6 @@ mod tests {
         }
 
         let mut set_state = RequestState::for_request("req-python-set");
-        assert_evidence_required(admit_tool_call(
-            &mut set_state,
-            PYTHON_DEPENDENCIES_SET_TOOL,
-            &json!({"candidateToken": "opaque"}),
-        ));
-        set_state.record_search_docs();
         admit_tool_call(
             &mut set_state,
             PYTHON_DEPENDENCIES_SET_TOOL,
@@ -8094,7 +7941,6 @@ mod tests {
     #[test]
     fn admission_allows_repeated_file_writes_and_build_without_plan_approval() {
         let mut state = RequestState::for_request("req-mutate");
-        state.record_search_docs();
 
         for (path, code) in [("a.eps", "1"), ("b.eps", "2"), ("c.eps", "3")] {
             admit_tool_call(
@@ -8123,7 +7969,6 @@ mod tests {
         )
         .unwrap();
 
-        assert!(!state.docs_searched);
         assert_eq!(state.search_docs_count, 0);
         assert_eq!(state.action_count, 0);
         assert_eq!(state.read_action_count, 1);
@@ -8132,7 +7977,6 @@ mod tests {
     #[test]
     fn plugin_add_accepts_append_sentinel_but_remove_rejects_negative_index() {
         let mut state = RequestState::for_request("req-plugin");
-        state.record_search_docs();
 
         admit_tool_call(
             &mut state,
@@ -8320,7 +8164,6 @@ mod tests {
             &serde_json::json!({"query": "request-scoped evidence"}),
         )
         .unwrap();
-        state.record_search_docs();
         admit_tool_call(
             &mut state,
             "file_write",
@@ -8330,7 +8173,6 @@ mod tests {
         admit_tool_call(&mut state, BUILD_RUN_TOOL, &serde_json::json!({})).unwrap();
 
         assert_eq!(state.request_id, "req-A");
-        assert!(state.docs_searched);
         assert_eq!(state.search_docs_count, 0);
         assert_eq!(state.action_count, 2);
         assert_eq!(state.iteration_action_count, 2);
@@ -8340,23 +8182,19 @@ mod tests {
         state.start_request("req-B");
 
         assert_eq!(state.request_id, "req-B");
-        assert!(!state.docs_searched, "evidence gate is per-request");
         assert_eq!(state.search_docs_count, 0);
         assert_eq!(state.action_count, 0);
         assert_eq!(state.iteration_action_count, 0);
         assert_eq!(state.read_action_count, 0);
         assert_eq!(state.write_action_count, 0);
 
-        let error = admit_tool_call(
+        admit_tool_call(
             &mut state,
             "file_write",
             &serde_json::json!({"path": "b.eps", "code": "2"}),
         )
-        .unwrap_err();
-        assert!(
-            matches!(error, ToolError::EvidenceRequired { .. }),
-            "new request must require fresh search_docs evidence before writes"
-        );
+        .unwrap();
+        assert_eq!(state.write_action_count, 1);
     }
     #[test]
     fn sound_tools_are_main_eps_only_and_expose_bounded_offline_edits() {

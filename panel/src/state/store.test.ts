@@ -298,7 +298,7 @@ describe("reconnect during thinking resets to ready WITH a notice", () => {
     expect(last.text.length).toBeGreaterThan(0);
   });
 
-  it("a wsOpen mid-plan_review keeps the plan under review (durable workflow state)", () => {
+  it("a wsOpen mid-plan_review keeps the plan under review (durable review state)", () => {
     const store = readyWithProject();
     store.chatSent();
     store.planReceived("# plan", 1);

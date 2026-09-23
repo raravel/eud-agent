@@ -278,6 +278,72 @@ describe("AgentStream — tool args/result (EUD-068)", () => {
     expect(container.textContent).toContain("hello layout content");
   });
 
+  it("renders a map_draft_render image envelope as the picture, not its base64", async () => {
+    const user = userEvent.setup();
+    const data =
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+    const { container } = render(
+      <AgentStream
+        reasoning=""
+        answerStarted={false}
+        live={true}
+        tools={[
+          {
+            id: "t1",
+            name: "map_draft_render",
+            state: "done",
+            args: '{"x":0,"y":0,"width":12,"height":8}',
+            detail: JSON.stringify({
+              image: { mimeType: "image/png", width: 96, height: 64, data },
+            }),
+          },
+        ]}
+      />,
+    );
+    await user.click(screen.getByRole("button", { name: /map_draft_render/ }));
+    const image = screen.getByRole("img", { name: /map_draft_render 렌더링 결과/ });
+    expect(image).toHaveAttribute("src", `data:image/png;base64,${data}`);
+    expect(image).toHaveAttribute("width", "96");
+    expect(image).toHaveAttribute("height", "64");
+    expect(screen.getByText("96 × 64")).toBeInTheDocument();
+    expect(screen.getByText('{"x":0,"y":0,"width":12,"height":8}')).toBeInTheDocument();
+    expect(container.querySelector("pre")?.textContent).not.toContain(data);
+    expect(container.textContent).not.toContain(data);
+  });
+
+  it("shows a placeholder for a receipt image whose payload was dropped", async () => {
+    const user = userEvent.setup();
+    render(
+      <AgentStream
+        reasoning=""
+        answerStarted={false}
+        live={false}
+        tools={[
+          {
+            id: "t1",
+            name: "map_draft_render",
+            state: "done",
+            detail: JSON.stringify({
+              image: {
+                mimeType: "image/png",
+                width: 96,
+                height: 64,
+                dataBytes: 1234,
+                dataSha256: "ab".repeat(32),
+              },
+            }),
+          },
+        ]}
+      />,
+    );
+    await user.click(screen.getByRole("button", { name: /map_draft_render/ }));
+    expect(screen.queryByRole("img")).toBeNull();
+    expect(
+      screen.getByText("렌더링된 이미지는 기록에 남지 않았습니다."),
+    ).toBeInTheDocument();
+    expect(screen.getByText("1,234바이트 생략")).toBeInTheDocument();
+  });
+
   it("renders a 실패 badge for a failed tool row", () => {
     render(
       <AgentStream
@@ -295,75 +361,6 @@ describe("AgentStream — tool args/result (EUD-068)", () => {
       />,
     );
     expect(screen.getByText("실패")).toBeInTheDocument();
-  });
-
-  it("renders a delegate_read row with its goal, lifecycle, nested child rows, and summary", async () => {
-    render(
-      <AgentStream
-        reasoning=""
-        answerStarted={false}
-        live={true}
-        tools={[
-          {
-            id: "t1",
-            name: "delegate_read",
-            state: "done",
-            detail: '{"summary":"src/hp.eps:12에서 P1 체력을 씁니다"}',
-            delegation: {
-              goal: "P1 체력 저장 위치 찾기",
-              status: "completed",
-              toolCalls: 3,
-              elapsedMs: 4200,
-            },
-            children: [
-              { id: "c1", name: "source_search", state: "done", detail: "2 hits" },
-              { id: "c2", name: "read_file", state: "failed" },
-            ],
-          },
-        ]}
-      />,
-    );
-    // The stream counts only the parent row; the children nest inside it.
-    expect(screen.getByText("도구 호출 1건")).toBeInTheDocument();
-    await userEvent.click(screen.getByText("delegate_read"));
-    const block = screen.getByTestId("delegation-block");
-    expect(block).toHaveTextContent("위임된 읽기 작업");
-    expect(block).toHaveTextContent("P1 체력 저장 위치 찾기");
-    expect(screen.getByTestId("delegation-status")).toHaveTextContent("위임 완료");
-    expect(block).toHaveTextContent("도구 호출 3건");
-    expect(block).toHaveTextContent("4.2초");
-    expect(block).toHaveTextContent("자식 도구 호출 2건");
-    expect(screen.getByTestId("tool-c1")).toHaveTextContent("source_search");
-    expect(screen.getByTestId("tool-c2")).toHaveTextContent("read_file");
-    expect(block).toHaveTextContent("src/hp.eps:12에서 P1 체력을 씁니다");
-  });
-
-  it("shows a failed delegation's reason as an alert", async () => {
-    render(
-      <AgentStream
-        reasoning=""
-        answerStarted={false}
-        live={false}
-        tools={[
-          {
-            id: "t1",
-            name: "delegate_read",
-            state: "failed",
-            delegation: {
-              goal: "g",
-              status: "failed",
-              toolCalls: 0,
-              elapsedMs: 240_000,
-              error: "위임된 읽기 작업을 완료하지 못했습니다: 시간 초과",
-            },
-          },
-        ]}
-      />,
-    );
-    await userEvent.click(screen.getByText("delegate_read"));
-    expect(screen.getByRole("alert")).toHaveTextContent("시간 초과");
-    expect(screen.getByTestId("delegation-status")).toHaveTextContent("위임 실패");
-    expect(screen.getByTestId("delegation-block")).toHaveTextContent("4분 0초");
   });
 });
 

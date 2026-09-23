@@ -219,46 +219,6 @@ type AskEmitter = Arc<dyn Fn(crate::ipc::AskEvent) -> Result<(), String> + Send 
 type ProgressEmitter = Arc<dyn Fn(crate::ipc::ProgressEvent) -> Result<(), String> + Send + Sync>;
 type AutonomousEmitter =
     Arc<dyn Fn(crate::autonomous::AutonomousRunState) -> Result<(), String> + Send + Sync>;
-type DelegationEmitter =
-    Arc<dyn Fn(crate::ipc::DelegationEvent) -> Result<(), String> + Send + Sync>;
-pub type DelegationFuture = std::pin::Pin<
-    Box<dyn std::future::Future<Output = crate::provider_runtime::DelegatedRunOutcome> + Send>,
->;
-/// Runs one `delegate_read` child for the tool runtime. The engine injects it
-/// (like the ask emitter) so the runtime never owns provider execution; the
-/// executor prepares the workspace, builds the delegated request, runs it, and
-/// folds the child's usage into the session.
-type DelegationExecutor = Arc<dyn Fn(ReadDelegation) -> DelegationFuture + Send + Sync>;
-
-/// One admitted `delegate_read` call: the child's identity inherits the
-/// parent's session, request, and cancellation generation with a fresh run id.
-#[derive(Debug, Clone)]
-pub struct ReadDelegation {
-    pub identity: crate::provider_runtime::RunIdentity,
-    pub parent_run_id: crate::provider_runtime::RunId,
-    pub goal: String,
-    pub focus: Vec<String>,
-}
-
-#[derive(Default)]
-struct DelegationState {
-    executor: Option<DelegationExecutor>,
-    emitter: Option<DelegationEmitter>,
-    /// Admitted delegations per parent foreground run (soft cap, usage error
-    /// beyond [`tools::DELEGATE_READ_RUN_LIMIT`]).
-    per_run: HashMap<u64, u8>,
-    /// Live child run ids, whose reads never become the parent's evidence.
-    children: HashSet<u64>,
-}
-
-#[derive(serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct DelegateReadToolInput {
-    goal: String,
-    #[serde(default)]
-    focus: Vec<String>,
-}
-
 pub type TeamTaskFuture = std::pin::Pin<
     Box<dyn std::future::Future<Output = Result<crate::team::TeamTask, String>> + Send>,
 >;
@@ -318,16 +278,6 @@ struct PendingAsk {
     /// When the bounded wait started, so a restored card shows the real remainder.
     started_at: std::time::Instant,
     response: tokio::sync::oneshot::Sender<Result<BTreeMap<String, crate::ipc::AskAnswer>, String>>,
-}
-
-/// Result of an engine-issued ask (`ask_for_request`).
-#[derive(Debug)]
-pub(crate) enum EngineAskOutcome {
-    Answered(BTreeMap<String, crate::ipc::AskAnswer>),
-    /// The bounded wait elapsed; the caller restates the questions as text.
-    Unanswered {
-        waited_seconds: u64,
-    },
 }
 
 /// The one ask of the current foreground run whose bounded wait elapsed.
@@ -508,7 +458,6 @@ pub struct SessionToolRuntime {
     completion_barrier: Arc<Mutex<Option<ToolCompletionBarrier>>>,
     ask: Arc<Mutex<AskState>>,
     ask_waiting: tokio::sync::watch::Sender<bool>,
-    delegation: Arc<Mutex<DelegationState>>,
     team_executor: Arc<Mutex<Option<TeamExecutor>>>,
     team_action_executor: Arc<Mutex<Option<TeamActionExecutor>>>,
     cancellation: Arc<Mutex<Option<tokio::sync::watch::Receiver<u64>>>>,
@@ -560,7 +509,6 @@ impl SessionToolRuntime {
             completion_barrier: Arc::new(Mutex::new(None)),
             ask: Arc::new(Mutex::new(AskState::default())),
             ask_waiting,
-            delegation: Arc::new(Mutex::new(DelegationState::default())),
             team_executor: Arc::new(Mutex::new(None)),
             team_action_executor: Arc::new(Mutex::new(None)),
             cancellation: Arc::new(Mutex::new(None)),
@@ -652,18 +600,6 @@ impl SessionToolRuntime {
         *self.autonomous_emitter.lock() = Some(Arc::new(emitter));
     }
 
-    pub fn set_delegation_executor(
-        &self,
-        executor: impl Fn(ReadDelegation) -> DelegationFuture + Send + Sync + 'static,
-    ) {
-        self.delegation.lock().executor = Some(Arc::new(executor));
-    }
-    pub fn set_delegation_emitter(
-        &self,
-        emitter: impl Fn(crate::ipc::DelegationEvent) -> Result<(), String> + Send + Sync + 'static,
-    ) {
-        self.delegation.lock().emitter = Some(Arc::new(emitter));
-    }
 
     pub fn set_team_executor(
         &self,
@@ -755,147 +691,6 @@ impl SessionToolRuntime {
         .await
     }
 
-    /// Ask the user structured questions on behalf of the engine (not a model
-    /// tool call), for example a triage clarification. Waits through the same
-    /// pending-ask path as the `ask` tool and returns the validated answers,
-    /// or [`EngineAskOutcome::Unanswered`] when the bounded wait elapsed: like
-    /// the `ask` tool, that is a text handoff for the caller, not a failure.
-    pub(crate) async fn ask_for_request(
-        &self,
-        request_id: &str,
-        questions: Vec<crate::ipc::AskQuestion>,
-    ) -> Result<EngineAskOutcome, String> {
-        let outcome = self
-            .ask_scoped(request_id, None, &json!({ "questions": questions }))
-            .await?;
-        if outcome["status"] == "unanswered" {
-            return Ok(EngineAskOutcome::Unanswered {
-                waited_seconds: outcome["waitedSeconds"].as_u64().unwrap_or_default(),
-            });
-        }
-        serde_json::from_value(outcome["answers"].clone())
-            .map(EngineAskOutcome::Answered)
-            .map_err(|error| format!("ask answers are malformed: {error}"))
-    }
-
-    /// Run one `delegate_read` child on behalf of the foreground run
-    /// `identity` and return the child's accepted result as the tool result.
-    /// Every failure short of a stale scope completes as a correctable usage
-    /// error, so the parent can rephrase or read directly.
-    pub(crate) async fn delegate_read_for_run(
-        &self,
-        identity: &crate::provider_runtime::RunIdentity,
-        args: &Value,
-    ) -> Result<Value, String> {
-        use crate::provider_runtime::DelegatedRunOutcome;
-
-        if self.session_id != identity.session_id || self.kind != identity.session_kind {
-            return Err("stale provider run cannot delegate".to_string());
-        }
-        if self.kind != crate::session::SessionKind::Eps {
-            return Err("delegate_read is available on EPS sessions only".to_string());
-        }
-        let input: DelegateReadToolInput = serde_json::from_value(args.clone())
-            .map_err(|error| format!("invalid delegate_read arguments: {error}"))?;
-        let goal = input.goal.trim().to_string();
-        if goal.is_empty() {
-            return Err("delegate_read requires a non-empty goal".to_string());
-        }
-        let focus = input
-            .focus
-            .into_iter()
-            .map(|item| item.trim().to_string())
-            .filter(|item| !item.is_empty())
-            .collect::<Vec<_>>();
-        if !self.matches_run_scope(identity) {
-            return Err("stale provider run cannot delegate".to_string());
-        }
-        let parent_run_id = identity.run_id;
-        let (executor, emitter, child) = {
-            let mut delegation = self.delegation.lock();
-            let executor = delegation.executor.clone().ok_or_else(|| {
-                "delegate_read is unavailable for this session; read the project directly"
-                    .to_string()
-            })?;
-            let emitter = delegation.emitter.clone();
-            let admitted = delegation.per_run.entry(parent_run_id.get()).or_insert(0);
-            if *admitted >= tools::DELEGATE_READ_RUN_LIMIT {
-                return Err(format!(
-                    "delegate_read limit: this run already delegated {} times; continue with direct reads",
-                    tools::DELEGATE_READ_RUN_LIMIT
-                ));
-            }
-            *admitted += 1;
-            let child = crate::provider_runtime::RunIdentity {
-                run_id: crate::provider_runtime::RunId::new(crate::engine::next_run_id()),
-                ..identity.clone()
-            };
-            delegation.children.insert(child.run_id.get());
-            (executor, emitter, child)
-        };
-        let started = std::time::Instant::now();
-        let emit = |status: crate::ipc::DelegationStatus,
-                    tool_calls: usize,
-                    error: Option<String>,
-                    usage: Option<crate::ipc::ContextUsage>| {
-            if let Some(emitter) = emitter.as_ref() {
-                if let Err(error) = emitter(crate::ipc::DelegationEvent {
-                    request_id: identity.request_id.clone(),
-                    parent_run_id: parent_run_id.get(),
-                    child_run_id: child.run_id.get(),
-                    goal: goal.clone(),
-                    status,
-                    tool_calls,
-                    elapsed_ms: started.elapsed().as_millis() as u64,
-                    error,
-                    usage,
-                }) {
-                    eprintln!("eud-agent: delegation event failed: {error}");
-                }
-            }
-        };
-        emit(crate::ipc::DelegationStatus::Running, 0, None, None);
-        let outcome = executor(ReadDelegation {
-            identity: child.clone(),
-            parent_run_id,
-            goal: goal.clone(),
-            focus,
-        })
-        .await;
-        self.delegation.lock().children.remove(&child.run_id.get());
-        match outcome {
-            DelegatedRunOutcome::Result {
-                value,
-                completions,
-                usage,
-            } => {
-                emit(
-                    crate::ipc::DelegationStatus::Completed,
-                    completions,
-                    None,
-                    usage,
-                );
-                Ok(value)
-            }
-            DelegatedRunOutcome::Cancelled => {
-                emit(crate::ipc::DelegationStatus::Cancelled, 0, None, None);
-                Err("delegation_cancelled: the delegated read was cancelled".to_string())
-            }
-            DelegatedRunOutcome::Failed(error) => {
-                let reason = error.to_string();
-                emit(
-                    crate::ipc::DelegationStatus::Failed,
-                    0,
-                    Some(format!("위임된 읽기 작업을 완료하지 못했습니다: {reason}")),
-                    None,
-                );
-                Err(format!(
-                    "delegation_failed: {reason}. Narrow the goal, or read the project directly."
-                ))
-            }
-        }
-    }
-
     /// The session's team tasks from durable session state.
     fn team_tasks(&self) -> Vec<crate::team::TeamTask> {
         crate::session::SessionStore::new(&self.services.dirs)
@@ -949,9 +744,6 @@ impl SessionToolRuntime {
         location_ids.dedup();
         if !self.matches_run_scope(identity) {
             return Err("stale provider run cannot request a map task".to_string());
-        }
-        if self.is_delegated_child(identity) {
-            return Err("a delegated read cannot request a map task".to_string());
         }
         {
             let state = self.request_state.lock();
@@ -1135,14 +927,6 @@ impl SessionToolRuntime {
             )
         })?;
         Ok(task.to_tool_value())
-    }
-
-    /// Whether `identity` names a live `delegate_read` child of this session.
-    fn is_delegated_child(&self, identity: &crate::provider_runtime::RunIdentity) -> bool {
-        self.delegation
-            .lock()
-            .children
-            .contains(&identity.run_id.get())
     }
 
     async fn ask_scoped(
@@ -1400,7 +1184,6 @@ impl SessionToolRuntime {
     }
     pub fn begin_request(&self, request_id: &str, project_id: &str) -> Result<(), String> {
         self.set_autonomous_pause_requested(false);
-        self.delegation.lock().per_run.clear();
         let _execution = self.execution_lock.try_lock().ok_or_else(|| {
             "a previously admitted tool is still running; wait for its completion before opening a new request"
                 .to_string()
@@ -1910,12 +1693,11 @@ impl SessionToolRuntime {
         if self.session_id != identity.session_id || self.kind != identity.session_kind {
             return Err("stale provider run cannot execute tools".to_string());
         }
-        self.execute_scoped_from(
+        self.execute_scoped(
             &identity.request_id,
             Some(identity.cancellation_generation),
             tool,
             args,
-            self.is_delegated_child(identity),
         )
     }
 
@@ -1925,20 +1707,6 @@ impl SessionToolRuntime {
         expected_generation: Option<u64>,
         tool: &str,
         args: &Value,
-    ) -> Result<Value, String> {
-        self.execute_scoped_from(expected_request_id, expected_generation, tool, args, false)
-    }
-
-    /// `delegated` marks a call made by a `delegate_read` child: it runs with
-    /// the parent's request scope but its reads are not the parent's mutation
-    /// evidence.
-    fn execute_scoped_from(
-        &self,
-        expected_request_id: &str,
-        expected_generation: Option<u64>,
-        tool: &str,
-        args: &Value,
-        delegated: bool,
     ) -> Result<Value, String> {
         if !self.ask.lock().pending.is_empty() {
             return Err(
@@ -1970,21 +1738,6 @@ impl SessionToolRuntime {
         }
 
         let effects = tools::tool_spec(tool).ok_or_else(|| format!("Unknown tool `{tool}`."))?;
-        if delegated
-            && matches!(
-                tool,
-                tools::MAP_TASK_APPLY_TOOL
-                    | tools::MAP_TASK_DISCARD_TOOL
-                    | tools::MAP_TASK_DIFF_TOOL
-                    | tools::MAP_TASK_OBJECTS_TOOL
-                    | tools::MAP_TASK_RENDER_TOOL
-                    | tools::MAP_TASK_STATUS_TOOL
-            )
-        {
-            return Err(format!(
-                "a delegated read cannot use `{tool}`; team map tasks belong to the foreground run"
-            ));
-        }
         if tools::TEAM_EXCLUDED_MAP_TOOLS.contains(&tool) {
             if let Some(active) = self.active_team_task() {
                 return Err(format!(
@@ -2038,7 +1791,7 @@ impl SessionToolRuntime {
             self.dispatch(&request_id, tool, args)
         };
         if let Ok(value) = result.as_mut() {
-            if tool == tools::MAP_INFO_TOOL && !delegated {
+            if tool == tools::MAP_INFO_TOOL {
                 if let Some(state) = self
                     .request_state
                     .lock()
@@ -2060,7 +1813,7 @@ impl SessionToolRuntime {
                 }
             }
             if tool == tools::SEARCH_DOCS_TOOL {
-                self.record_search_docs_result(&request_id, args, value, delegated)?;
+                self.record_search_docs_result(&request_id, args, value)?;
             } else if tool == tools::DOCS_GET_TOOL {
                 self.record_docs_get_result(&request_id, value)?;
             }
@@ -2086,7 +1839,6 @@ impl SessionToolRuntime {
         request_id: &str,
         args: &Value,
         value: &mut Value,
-        delegated: bool,
     ) -> Result<(), String> {
         let ids = value
             .get("hits")
@@ -2106,13 +1858,7 @@ impl SessionToolRuntime {
             .as_mut()
             .filter(|state| state.request_id == request_id)
             .ok_or_else(|| format!("request state for {request_id} is missing"))?;
-        let parent_docs_searched = state.docs_searched;
         let repeated = state.record_search_docs_hits(args, &ids);
-        if delegated {
-            // A child's search grounds the child's summary, not the parent's
-            // mutation rail: the parent must search before it writes.
-            state.docs_searched = parent_docs_searched;
-        }
         let repeated_count = repeated.iter().filter(|flag| **flag).count();
         let new_count = repeated.len() - repeated_count;
 
@@ -5828,8 +5574,6 @@ mod tests {
                 context_state: Default::default(),
                 task_state: Default::default(),
                 autonomous_run: Some(autonomous),
-                workflow: None,
-                interrupted_workflow: None,
                 team_tasks: Vec::new(),
             })
             .unwrap();
@@ -6056,236 +5800,27 @@ mod tests {
         assert!(!runtime.ask_expired_for_request("req-ask-expire"));
     }
 
-    fn delegation_identity(
+
+    fn run_identity(
         runtime: &SessionToolRuntime,
         run: u64,
     ) -> crate::provider_runtime::RunIdentity {
         crate::provider_runtime::RunIdentity {
             session_id: runtime.session_id().to_string(),
             run_id: crate::provider_runtime::RunId::new(run),
-            request_id: "req-delegate".to_string(),
+            request_id: "req-team".to_string(),
             session_kind: crate::session::SessionKind::Eps,
             cancellation_generation: 0,
         }
     }
 
-    fn delegation_runtime() -> (
-        SessionToolRuntime,
-        tokio::sync::mpsc::UnboundedReceiver<crate::ipc::DelegationEvent>,
-        Arc<Mutex<Vec<ReadDelegation>>>,
-    ) {
+    fn scoped_runtime() -> SessionToolRuntime {
         let runtime = SessionToolRuntime::for_tests();
-        runtime.begin_request("req-delegate", "project").unwrap();
-        let (_cancel, receiver) = tokio::sync::watch::channel(0_u64);
+        runtime.begin_request("req-team", "project").unwrap();
+        let (cancel, receiver) = tokio::sync::watch::channel(0_u64);
         runtime.set_cancellation(receiver);
-        std::mem::forget(_cancel);
-        let (events, emitted) = tokio::sync::mpsc::unbounded_channel();
-        runtime.set_delegation_emitter(move |event| {
-            events
-                .send(event)
-                .map_err(|_| "delegation event receiver closed".to_string())
-        });
-        let seen: Arc<Mutex<Vec<ReadDelegation>>> = Arc::new(Mutex::new(Vec::new()));
-        let recorded = Arc::clone(&seen);
-        runtime.set_delegation_executor(move |delegation| {
-            recorded.lock().push(delegation.clone());
-            Box::pin(async move {
-                match delegation.goal.as_str() {
-                    "fail" => crate::provider_runtime::DelegatedRunOutcome::Failed(
-                        crate::provider_runtime::ProviderRuntimeError::Protocol(
-                            "delegated run exhausted its tool rounds without submit_result".into(),
-                        ),
-                    ),
-                    "cancel" => crate::provider_runtime::DelegatedRunOutcome::Cancelled,
-                    _ => crate::provider_runtime::DelegatedRunOutcome::Result {
-                        value: json!({
-                            "summary": format!("done: {}", delegation.goal),
-                            "findings": [],
-                            "openQuestions": [],
-                            "toolCalls": 3
-                        }),
-                        completions: 4,
-                        usage: None,
-                    },
-                }
-            })
-        });
-        (runtime, emitted, seen)
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn delegate_read_returns_the_child_result_and_reports_its_lifecycle() {
-        let (runtime, mut emitted, seen) = delegation_runtime();
-        let parent = delegation_identity(&runtime, 7);
-        let value = runtime
-            .delegate_read_for_run(
-                &parent,
-                &json!({ "goal": " where is P1 hp ", "focus": [" src/main.eps ", ""] }),
-            )
-            .await
-            .unwrap();
-        assert_eq!(value["summary"], "done: where is P1 hp");
-
-        let delegation = seen.lock()[0].clone();
-        assert_eq!(delegation.parent_run_id.get(), 7);
-        assert_ne!(delegation.identity.run_id.get(), 7);
-        assert_eq!(delegation.identity.session_id, parent.session_id);
-        assert_eq!(delegation.identity.request_id, parent.request_id);
-        assert_eq!(delegation.identity.cancellation_generation, 0);
-        assert_eq!(delegation.goal, "where is P1 hp");
-        assert_eq!(delegation.focus, vec!["src/main.eps".to_string()]);
-
-        let running = emitted.recv().await.unwrap();
-        assert_eq!(running.status, crate::ipc::DelegationStatus::Running);
-        assert_eq!(running.parent_run_id, 7);
-        assert_eq!(running.child_run_id, delegation.identity.run_id.get());
-        assert_eq!(running.request_id, "req-delegate");
-        let completed = emitted.recv().await.unwrap();
-        assert_eq!(completed.status, crate::ipc::DelegationStatus::Completed);
-        assert_eq!(completed.child_run_id, running.child_run_id);
-        assert_eq!(completed.tool_calls, 4);
-        assert!(completed.error.is_none());
-        // The child is no longer live once its result is returned.
-        assert!(!runtime.is_delegated_child(&delegation.identity));
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn delegate_read_failures_are_correctable_usage_errors() {
-        let (runtime, mut emitted, _seen) = delegation_runtime();
-        let parent = delegation_identity(&runtime, 1);
-
-        let failed = runtime
-            .delegate_read_for_run(&parent, &json!({ "goal": "fail" }))
-            .await
-            .unwrap_err();
-        assert!(failed.starts_with("delegation_failed:"), "{failed}");
-        assert!(failed.contains("submit_result"), "{failed}");
-        let _running = emitted.recv().await.unwrap();
-        let event = emitted.recv().await.unwrap();
-        assert_eq!(event.status, crate::ipc::DelegationStatus::Failed);
-        assert!(event.error.as_deref().unwrap().contains("submit_result"));
-
-        let cancelled = runtime
-            .delegate_read_for_run(&parent, &json!({ "goal": "cancel" }))
-            .await
-            .unwrap_err();
-        assert!(cancelled.starts_with("delegation_cancelled"), "{cancelled}");
-        let _running = emitted.recv().await.unwrap();
-        assert_eq!(
-            emitted.recv().await.unwrap().status,
-            crate::ipc::DelegationStatus::Cancelled
-        );
-
-        let malformed = runtime
-            .delegate_read_for_run(&parent, &json!({ "goal": "   " }))
-            .await
-            .unwrap_err();
-        assert!(malformed.contains("non-empty goal"), "{malformed}");
-        let unknown = runtime
-            .delegate_read_for_run(&parent, &json!({ "goal": "x", "extra": 1 }))
-            .await
-            .unwrap_err();
-        assert!(
-            unknown.contains("invalid delegate_read arguments"),
-            "{unknown}"
-        );
-
-        // A run from another request or generation is stale, which the gate
-        // treats as fatal rather than correctable.
-        let mut stale = delegation_identity(&runtime, 1);
-        stale.cancellation_generation = 9;
-        let stale = runtime
-            .delegate_read_for_run(&stale, &json!({ "goal": "x" }))
-            .await
-            .unwrap_err();
-        assert!(stale.starts_with("stale provider run"), "{stale}");
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn delegate_read_is_capped_per_foreground_run_and_reset_per_request() {
-        let (runtime, _emitted, seen) = delegation_runtime();
-        let parent = delegation_identity(&runtime, 3);
-        for _ in 0..tools::DELEGATE_READ_RUN_LIMIT {
-            runtime
-                .delegate_read_for_run(&parent, &json!({ "goal": "ok" }))
-                .await
-                .unwrap();
-        }
-        let over = runtime
-            .delegate_read_for_run(&parent, &json!({ "goal": "ok" }))
-            .await
-            .unwrap_err();
-        assert!(over.starts_with("delegate_read limit"), "{over}");
-        assert_eq!(
-            seen.lock().len(),
-            usize::from(tools::DELEGATE_READ_RUN_LIMIT)
-        );
-        // Another foreground run of the same request has its own budget.
-        let sibling = delegation_identity(&runtime, 4);
+        std::mem::forget(cancel);
         runtime
-            .delegate_read_for_run(&sibling, &json!({ "goal": "ok" }))
-            .await
-            .unwrap();
-        // A new request forgets every run budget.
-        runtime.begin_request("req-delegate", "project").unwrap();
-        runtime
-            .delegate_read_for_run(&parent, &json!({ "goal": "ok" }))
-            .await
-            .unwrap();
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn delegate_read_without_an_executor_is_a_usage_error() {
-        let runtime = SessionToolRuntime::for_tests();
-        runtime.begin_request("req-delegate", "project").unwrap();
-        let (_cancel, receiver) = tokio::sync::watch::channel(0_u64);
-        runtime.set_cancellation(receiver);
-        let error = runtime
-            .delegate_read_for_run(&delegation_identity(&runtime, 1), &json!({ "goal": "x" }))
-            .await
-            .unwrap_err();
-        assert!(error.contains("unavailable"), "{error}");
-
-        let map_runtime = ToolServices::for_tests().map_session("map-session");
-        let mut identity = delegation_identity(&map_runtime, 1);
-        identity.session_kind = crate::session::SessionKind::Map;
-        let error = map_runtime
-            .delegate_read_for_run(&identity, &json!({ "goal": "x" }))
-            .await
-            .unwrap_err();
-        assert!(error.contains("EPS sessions only"), "{error}");
-    }
-
-    #[test]
-    fn a_delegated_child_search_does_not_lift_the_parent_evidence_gate() {
-        let runtime = SessionToolRuntime::for_tests();
-        runtime.begin_request("req-delegate", "project").unwrap();
-        let mut value = json!({ "hits": [{ "id": "0000000000000001" }] });
-        runtime
-            .record_search_docs_result(
-                "req-delegate",
-                &json!({ "query": "죽음 카운터" }),
-                &mut value,
-                true,
-            )
-            .unwrap();
-        let state = runtime.request_state_snapshot().unwrap();
-        assert!(
-            !state.docs_searched,
-            "a child's search is not parent evidence"
-        );
-        assert_eq!(state.search_docs_count, 1);
-
-        let mut value = json!({ "hits": [{ "id": "0000000000000002" }] });
-        runtime
-            .record_search_docs_result(
-                "req-delegate",
-                &json!({ "query": "죽음 카운터 2" }),
-                &mut value,
-                false,
-            )
-            .unwrap();
-        assert!(runtime.request_state_snapshot().unwrap().docs_searched);
     }
 
     fn save_eps_session(runtime: &SessionToolRuntime, tasks: Vec<crate::team::TeamTask>) {
@@ -6317,8 +5852,6 @@ mod tests {
                 context_state: Default::default(),
                 task_state: Default::default(),
                 autonomous_run: None,
-                workflow: None,
-                interrupted_workflow: None,
                 team_tasks: tasks,
             })
             .unwrap();
@@ -6327,7 +5860,7 @@ mod tests {
     fn team_task(id: &str, status: crate::team::TeamTaskStatus) -> crate::team::TeamTask {
         crate::team::TeamTask {
             id: id.to_string(),
-            parent_request_id: "req-delegate".to_string(),
+            parent_request_id: "req-team".to_string(),
             map_session_id: "map-team".to_string(),
             map_request_id: None,
             goal: "goal".to_string(),
@@ -6355,7 +5888,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn map_task_request_needs_map_evidence_and_hands_off_once() {
-        let (runtime, _emitted, _seen) = delegation_runtime();
+        let runtime = scoped_runtime();
         save_eps_session(&runtime, Vec::new());
         let requests: Arc<Mutex<Vec<TeamTaskRequest>>> = Arc::new(Mutex::new(Vec::new()));
         let recorded = Arc::clone(&requests);
@@ -6380,7 +5913,7 @@ mod tests {
                 Ok(task)
             })
         });
-        let parent = delegation_identity(&runtime, 1);
+        let parent = run_identity(&runtime, 1);
         let args = json!({
             "goal": " 전부 공허로 ",
             "layers": ["units", "terrain", "terrain"],
@@ -6437,14 +5970,14 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn active_team_task_excludes_a_second_task_and_the_eps_map_writers() {
-        let (runtime, _emitted, _seen) = delegation_runtime();
+        let runtime = scoped_runtime();
         save_eps_session(
             &runtime,
             vec![team_task("task-live", crate::team::TeamTaskStatus::Running)],
         );
         runtime.set_team_executor(|_| Box::pin(async { panic!("never dispatched") }));
         mark_map_inspected(&runtime);
-        let parent = delegation_identity(&runtime, 1);
+        let parent = run_identity(&runtime, 1);
         let refused = runtime
             .map_task_request_for_run(&parent, &json!({ "goal": "x", "layers": ["terrain"] }))
             .await
@@ -6510,29 +6043,6 @@ mod tests {
         assert!(runtime.active_team_task().is_none());
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn map_task_request_is_eps_only_and_never_from_a_delegated_child() {
-        let (runtime, _emitted, _seen) = delegation_runtime();
-        save_eps_session(&runtime, Vec::new());
-        mark_map_inspected(&runtime);
-        let unavailable = runtime
-            .map_task_request_for_run(
-                &delegation_identity(&runtime, 1),
-                &json!({ "goal": "x", "layers": ["terrain"] }),
-            )
-            .await
-            .unwrap_err();
-        assert!(unavailable.contains("unavailable"), "{unavailable}");
-
-        let map_runtime = ToolServices::for_tests().map_session("map-session");
-        let mut identity = delegation_identity(&map_runtime, 1);
-        identity.session_kind = crate::session::SessionKind::Map;
-        let error = map_runtime
-            .map_task_request_for_run(&identity, &json!({ "goal": "x", "layers": ["terrain"] }))
-            .await
-            .unwrap_err();
-        assert!(error.contains("EPS sessions only"), "{error}");
-    }
 
     fn ready_summary() -> crate::team::TeamCandidateSummary {
         crate::team::TeamCandidateSummary {
@@ -6551,7 +6061,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_ready_candidate_admits_a_follow_up_request_but_a_running_task_does_not() {
-        let (runtime, _emitted, _seen) = delegation_runtime();
+        let runtime = scoped_runtime();
         let mut ready = team_task("task-ready", crate::team::TeamTaskStatus::CandidateReady);
         ready.candidate = Some(ready_summary());
         save_eps_session(&runtime, vec![ready]);
@@ -6564,7 +6074,7 @@ mod tests {
             })
         });
         mark_map_inspected(&runtime);
-        let parent = delegation_identity(&runtime, 1);
+        let parent = run_identity(&runtime, 1);
         let args = json!({ "goal": "왼쪽 벽을 더 두껍게", "layers": ["terrain"] });
         let follow_up = runtime
             .map_task_request_for_run(&parent, &args)
@@ -6586,7 +6096,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn map_task_apply_needs_candidate_inspection_and_runs_the_action_executor() {
-        let (runtime, _emitted, _seen) = delegation_runtime();
+        let runtime = scoped_runtime();
         let mut ready = team_task("task-ready", crate::team::TeamTaskStatus::CandidateReady);
         ready.candidate = Some(ready_summary());
         save_eps_session(
@@ -6612,7 +6122,7 @@ mod tests {
             }
             Ok(task)
         });
-        let parent = delegation_identity(&runtime, 1);
+        let parent = run_identity(&runtime, 1);
         runtime.register_write_request("team apply").unwrap();
 
         let settled = runtime
@@ -6671,7 +6181,7 @@ mod tests {
         assert_eq!(action.kind, TeamTaskActionKind::Apply);
         assert_eq!(action.task_id, "task-ready");
         assert_eq!(action.session_id, runtime.session_id());
-        assert_eq!(action.request_id, "req-delegate");
+        assert_eq!(action.request_id, "req-team");
 
         // Discard needs no inspection.
         let discarded = runtime
@@ -6686,7 +6196,7 @@ mod tests {
 
         // Without an injected executor the action is a correctable error.
         let bare = SessionToolRuntime::for_tests();
-        bare.begin_request("req-delegate", "project").unwrap();
+        bare.begin_request("req-team", "project").unwrap();
         let (_cancel, receiver) = tokio::sync::watch::channel(0_u64);
         bare.set_cancellation(receiver);
         let mut ready = team_task("task-ready", crate::team::TeamTaskStatus::CandidateReady);
@@ -6694,7 +6204,7 @@ mod tests {
         save_eps_session(&bare, vec![ready]);
         let unavailable = bare
             .execute_for_run(
-                &delegation_identity(&bare, 1),
+                &run_identity(&bare, 1),
                 tools::MAP_TASK_DISCARD_TOOL,
                 &json!({ "taskId": "task-ready" }),
             )
@@ -6702,33 +6212,6 @@ mod tests {
         assert!(unavailable.contains("unavailable"), "{unavailable}");
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn team_task_tools_are_refused_for_a_delegated_child() {
-        let (runtime, _emitted, _seen) = delegation_runtime();
-        save_eps_session(&runtime, Vec::new());
-        let child = delegation_identity(&runtime, 7);
-        runtime
-            .delegation
-            .lock()
-            .children
-            .insert(child.run_id.get());
-        for tool in [
-            tools::MAP_TASK_STATUS_TOOL,
-            tools::MAP_TASK_DIFF_TOOL,
-            tools::MAP_TASK_OBJECTS_TOOL,
-            tools::MAP_TASK_RENDER_TOOL,
-            tools::MAP_TASK_APPLY_TOOL,
-            tools::MAP_TASK_DISCARD_TOOL,
-        ] {
-            let error = runtime
-                .execute_for_run(&child, tool, &json!({ "taskId": "t" }))
-                .unwrap_err();
-            assert!(
-                error.contains("delegated read cannot use"),
-                "{tool} must be refused for a delegated child: {error}"
-            );
-        }
-    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn restored_pending_ask_reports_the_remaining_wait() {
@@ -6838,7 +6321,6 @@ mod tests {
         {
             let mut state = session_a.request_state.lock();
             let state = state.as_mut().expect("session A state");
-            state.record_search_docs();
             state.iteration_action_count = 7;
         }
 
@@ -6847,7 +6329,6 @@ mod tests {
         let state_a = session_a
             .request_state_snapshot()
             .expect("session B must not clear session A");
-        assert!(state_a.docs_searched);
         assert_eq!(state_a.iteration_action_count, 7);
         assert_eq!(
             session_b.request_state_snapshot().unwrap().request_id,
@@ -6856,29 +6337,17 @@ mod tests {
     }
 
     #[test]
-    fn search_docs_with_empty_index_returns_zero_hits_and_lifts_the_evidence_gate() {
+    fn search_docs_with_an_empty_index_answers_and_blocks_nothing() {
         let runtime = open_runtime("req-search");
 
-        // A mutating call BEFORE any search is blocked by the evidence gate.
-        let before = runtime
-            .execute(
-                "dat_patch",
-                &json!({"changes": [{
-                    "kind": "dat", "dat": "units", "objectId": 0,
-                    "field": "Hit Points", "before": 10240, "after": 20480
-                }]}),
-            )
-            .expect_err("dat_patch before search must hit the evidence gate");
-        assert!(before.contains("evidence gate"), "got: {before}");
-
-        // search_docs runs (zero hits on the empty test index) and lifts the gate.
         let result = runtime
             .execute("search_docs", &json!({"query": "마린 생성"}))
             .expect("search_docs should succeed even with an empty index");
         assert_eq!(result["count"], 0);
 
-        // The same mutation now passes admission and reaches native project resolution.
-        let after = runtime
+        // A mutation is admitted on its own merits: the only thing between it
+        // and the project is the project, not a search it has to run first.
+        let error = runtime
             .execute(
                 "dat_patch",
                 &json!({"changes": [{
@@ -6887,10 +6356,7 @@ mod tests {
                 }]}),
             )
             .expect_err("no native project is configured in the test runtime");
-        assert!(
-            !after.contains("evidence gate"),
-            "the gate must be lifted after search_docs, got: {after}"
-        );
+        assert!(error.contains("project"), "got: {error}");
     }
 
     #[test]

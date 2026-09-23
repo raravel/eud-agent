@@ -22,8 +22,6 @@ use native_mcp_events::{AuthoritativeToolEvent, NativeEvents};
 
 #[path = "native_compiler_workspace.rs"]
 mod compiler_workspace;
-#[path = "native_delegated.rs"]
-mod delegated;
 #[path = "native_gate_publication.rs"]
 mod gate_publication;
 #[path = "native_process_cases.rs"]

@@ -14,11 +14,11 @@
  *
  * With no reasoning and no tools it renders nothing (null).
  */
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   FileIcon,
   FilePenLineIcon,
-  GitBranchIcon,
+  ImageIcon,
   WrenchIcon,
 } from "lucide-react";
 import {
@@ -36,6 +36,7 @@ import {
   CodeBlockCopyButton,
 } from "@/components/ai-elements/code-block";
 import { parseFileTool, type FileToolView } from "@/lib/fileTool";
+import { parseImageTool, type ImageToolView } from "@/lib/imageTool";
 import { classifyDiff } from "@/lib/diff";
 import { cn } from "@/lib/utils";
 
@@ -48,35 +49,6 @@ export interface AgentTool {
   args?: string;
   /** Tool-result text (EUD-068). */
   detail?: string;
-  /** A `delegate_read` row's child-run lifecycle (from the `delegation` event). */
-  delegation?: {
-    goal: string;
-    status: "queued" | "running" | "completed" | "failed" | "cancelled";
-    toolCalls: number;
-    elapsedMs: number;
-    error?: string;
-  };
-  /** The child run's own tool rows, nested under the `delegate_read` row. */
-  children?: AgentTool[];
-}
-
-const DELEGATION_STATUS_LABEL: Record<
-  NonNullable<AgentTool["delegation"]>["status"],
-  string
-> = {
-  queued: "대기 중",
-  running: "위임 실행 중",
-  completed: "위임 완료",
-  failed: "위임 실패",
-  cancelled: "위임 취소됨",
-};
-
-function formatElapsed(ms: number): string {
-  if (ms < 1000) return `${ms}ms`;
-  const seconds = ms / 1000;
-  return seconds < 60
-    ? `${seconds.toFixed(seconds < 10 ? 1 : 0)}초`
-    : `${Math.floor(seconds / 60)}분 ${Math.round(seconds % 60)}초`;
 }
 
 export interface AgentStreamProps {
@@ -162,115 +134,110 @@ export function AgentStream({
 export function ToolList({ tools }: { tools: AgentTool[] }) {
   return (
     <>
-      {tools.map((tool) => {
-        // File reads/writes render as code; exact file edits render as an
-        // ordered colored diff instead of raw JSON.
-        const fileView = parseFileTool(tool);
-        const delegated = tool.delegation !== undefined || tool.children !== undefined;
-        return (
-          <Tool key={tool.id} data-testid={`tool-${tool.id}`}>
-            <ToolHeader title={tool.name} state={tool.state} />
-            {delegated ? (
-              <ToolContent>
-                <DelegationBlock tool={tool} />
-              </ToolContent>
-            ) : fileView ? (
-              <ToolContent>
-                <div className="p-3">
-                  <FileToolBlock view={fileView} />
-                </div>
-              </ToolContent>
-            ) : (
-              (tool.args || tool.detail) && (
-                <ToolContent>
-                  <div className="flex flex-col gap-2 p-3 text-xs text-muted-foreground">
-                    {tool.args && (
-                      <div>
-                        <div className="mb-1 font-medium">요청</div>
-                        <pre className="overflow-x-auto whitespace-pre-wrap break-words rounded bg-muted/40 p-2">
-                          {tool.args}
-                        </pre>
-                      </div>
-                    )}
-                    {tool.detail && (
-                      <div>
-                        <div className="mb-1 font-medium">결과</div>
-                        <pre className="overflow-x-auto whitespace-pre-wrap break-words rounded bg-muted/40 p-2">
-                          {tool.detail}
-                        </pre>
-                      </div>
-                    )}
-                  </div>
-                </ToolContent>
-              )
-            )}
-          </Tool>
-        );
-      })}
+      {tools.map((tool) => (
+        <ToolRow key={tool.id} tool={tool} />
+      ))}
     </>
   );
 }
 
-/**
- * A `delegate_read` row's body: the child's goal and lifecycle, its nested
- * tool rows (so the parent's context stays a single summary), and finally the
- * summary the parent received.
- */
-function DelegationBlock({ tool }: { tool: AgentTool }) {
-  const delegation = tool.delegation;
-  const children = tool.children ?? [];
+function ToolRow({ tool }: { tool: AgentTool }) {
+  // File reads/writes render as code; exact file edits render as an
+  // ordered colored diff instead of raw JSON.
+  const fileView = parseFileTool(tool);
+  // A rendered map (`map_draft_render` and friends) is shown as the image,
+  // not its base64. The envelope can be megabytes, so parse it once per row.
+  const imageView = useMemo(() => parseImageTool(tool), [tool.detail]);
   return (
-    <div
-      data-testid="delegation-block"
-      className="flex flex-col gap-2 p-3 text-xs text-muted-foreground"
-    >
-      <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
-        <span className="flex items-center gap-1.5 font-medium text-foreground">
-          <GitBranchIcon aria-hidden className="size-3.5 shrink-0" />
-          위임된 읽기 작업
-        </span>
-        {delegation && (
-          <>
-            <span
-              data-testid="delegation-status"
-              className={cn(
-                delegation.status === "failed" && "text-destructive",
-                delegation.status === "completed" && "text-emerald-400",
+    <Tool data-testid={`tool-${tool.id}`}>
+      <ToolHeader title={tool.name} state={tool.state} />
+      {fileView ? (
+        <ToolContent>
+          <div className="p-3">
+            <FileToolBlock view={fileView} />
+          </div>
+        </ToolContent>
+      ) : (
+        (tool.args || tool.detail) && (
+          <ToolContent>
+            <div className="flex flex-col gap-2 p-3 text-xs text-muted-foreground">
+              {tool.args && (
+                <div>
+                  <div className="mb-1 font-medium">요청</div>
+                  <pre className="overflow-x-auto whitespace-pre-wrap break-words rounded bg-muted/40 p-2">
+                    {tool.args}
+                  </pre>
+                </div>
               )}
-            >
-              {DELEGATION_STATUS_LABEL[delegation.status]}
-            </span>
-            <span>도구 호출 {delegation.toolCalls}건</span>
-            <span>{formatElapsed(delegation.elapsedMs)}</span>
-          </>
-        )}
-      </div>
-      {delegation?.goal && (
-        <div>
-          <div className="mb-1 font-medium">목표</div>
-          <p className="whitespace-pre-wrap break-words rounded bg-muted/40 p-2">
-            {delegation.goal}
-          </p>
-        </div>
+              {imageView ? (
+                <div>
+                  <div className="mb-1 font-medium">결과</div>
+                  <ImageToolBlock name={tool.name} view={imageView} />
+                </div>
+              ) : (
+                tool.detail && (
+                  <div>
+                    <div className="mb-1 font-medium">결과</div>
+                    <pre className="overflow-x-auto whitespace-pre-wrap break-words rounded bg-muted/40 p-2">
+                      {tool.detail}
+                    </pre>
+                  </div>
+                )
+              )}
+            </div>
+          </ToolContent>
+        )
       )}
-      {delegation?.error && (
-        <p role="alert" className="text-destructive">
-          {delegation.error}
+    </Tool>
+  );
+}
+
+/**
+ * A rendered map result: the picture itself (natural size, scaled down to the
+ * row when wider), its dimensions, and — for a result replayed from a run
+ * receipt that kept only the PNG's digest — a placeholder instead.
+ */
+function ImageToolBlock({
+  name,
+  view,
+}: {
+  name: string;
+  view: ImageToolView;
+}) {
+  const size =
+    view.width !== null && view.height !== null
+      ? `${view.width} × ${view.height}`
+      : null;
+  return (
+    <div data-testid="image-tool-block" className="flex flex-col gap-1">
+      {view.src ? (
+        <div className="rounded bg-muted/40 p-2">
+          <img
+            src={view.src}
+            alt={`${name} 렌더링 결과${size ? ` (${size})` : ""}`}
+            width={view.width ?? undefined}
+            height={view.height ?? undefined}
+            className="block h-auto max-w-full rounded"
+            style={{ imageRendering: "pixelated" }}
+          />
+        </div>
+      ) : (
+        <p className="flex items-center gap-1.5 rounded bg-muted/40 p-2">
+          <ImageIcon aria-hidden className="size-3.5 shrink-0" />
+          렌더링된 이미지는 기록에 남지 않았습니다.
         </p>
       )}
-      {children.length > 0 && (
-        <div className="flex flex-col gap-1 border-l-2 border-border pl-2">
-          <span>자식 도구 호출 {children.length}건</span>
-          <ToolList tools={children} />
-        </div>
-      )}
-      {tool.detail && (
-        <div>
-          <div className="mb-1 font-medium">요약</div>
-          <pre className="overflow-x-auto whitespace-pre-wrap break-words rounded bg-muted/40 p-2">
-            {tool.detail}
-          </pre>
-        </div>
+      <div className="flex flex-wrap gap-x-3">
+        {size && <span>{size}</span>}
+        <span>{view.mimeType}</span>
+        {view.dataBytes !== null && (
+          <span>{view.dataBytes.toLocaleString()}바이트 생략</span>
+        )}
+      </div>
+      {view.metadata && (
+        <pre className="overflow-x-auto whitespace-pre-wrap break-words rounded bg-muted/40 p-2">
+          {view.metadata}
+        </pre>
       )}
     </div>
   );

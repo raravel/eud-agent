@@ -12,11 +12,10 @@ impl RunGate {
     ) -> Result<DirectToolResult, String> {
         let admission = self.admit()?;
         self.publish_started(&call)?;
-        // `ask` and `delegate_read` wait on the runtime asynchronously (a user
-        // answer, a child run) instead of blocking a worker thread.
+        // `ask` and `map_task_request` wait on the runtime asynchronously (a
+        // user answer, a team session) instead of blocking a worker thread.
         let waiting = match call.name.as_str() {
             crate::tools::ASK_TOOL => Some("ASK"),
-            crate::tools::DELEGATE_READ_TOOL => Some("delegate_read"),
             crate::tools::MAP_TASK_REQUEST_TOOL => Some("map_task_request"),
             _ => None,
         };
@@ -34,9 +33,6 @@ impl RunGate {
                 > = match call.name.as_str() {
                     crate::tools::ASK_TOOL => {
                         Box::pin(runtime.ask_for_run(identity, &call.arguments))
-                    }
-                    crate::tools::DELEGATE_READ_TOOL => {
-                        Box::pin(runtime.delegate_read_for_run(identity, &call.arguments))
                     }
                     _ => Box::pin(runtime.map_task_request_for_run(identity, &call.arguments)),
                 };

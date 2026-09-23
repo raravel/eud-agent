@@ -1,5 +1,5 @@
 /**
- * Plan tab body (features/staged-workflow-plan.md ## Phase 2 Panel, EUD-074):
+ * Plan tab body (EUD-074):
  *   a full-height markdown plan (Streamdown) + a [승인] button (`plan_approve{}`)
  *   in the tab header while the plan awaits review. The feedback textarea and
  *   the [수정요청] button are REMOVED (user decision 2026-06-05): plan feedback
@@ -9,7 +9,6 @@
  * Contract (`@/components/PlanView`):
  *   export interface PlanViewProps {
  *     plan: PlanState;                // { markdown, revision }
- *     artifact?: WorkflowPlanArtifact;// staged-workflow plan details
  *     reviewable: boolean;            // phase === plan_review → 승인 shown
  *     pending: boolean;               // approve command in flight (disable 승인)
  *     onApprove(): void;              // App invokes plan_approve{}
@@ -19,7 +18,7 @@
  * controlled renderer of the selected session's active plan.
  */
 import { describe, it, expect, vi } from "vitest";
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { PlanView, type PlanViewProps } from "@/components/PlanView";
 import type { PlanState } from "@/state/store";
@@ -179,64 +178,5 @@ describe("PlanView — read-only after review", () => {
     expect(screen.queryByTestId("plan-actions")).not.toBeInTheDocument();
     expect(screen.getByText("읽기 전용")).toBeInTheDocument();
     expect(screen.getByText("계획 1")).toBeInTheDocument();
-  });
-
-  it("labels an approved artifact as 승인됨", () => {
-    render(
-      <PlanView
-        {...defaultPlanViewProps}
-        plan={rev1}
-        reviewable={false}
-        artifact={{
-          path: "plans/req-1.md",
-          revision: 1,
-          sha256: "d".repeat(64),
-          approvedSha256: "d".repeat(64),
-          title: "",
-          acceptanceCriteria: [],
-          deep: false,
-          iterations: 1,
-        }}
-      />,
-    );
-    expect(screen.getByText("승인됨 · 읽기 전용")).toBeInTheDocument();
-  });
-});
-
-describe("PlanView — staged-workflow plan artifact", () => {
-  it("renders acceptance criteria, critic verdict/summary, and the deep-planning badge", () => {
-    render(
-      <PlanView
-        {...defaultPlanViewProps}
-        plan={rev2}
-        artifact={{
-          path: "plans/req-1.md",
-          revision: 2,
-          sha256: "d".repeat(64),
-          title: "미네랄 지급 트리거 추가",
-          acceptanceCriteria: ["게임 시작 시 미네랄 1000 지급", "빌드 통과"],
-          criticVerdict: "revise",
-          criticSummary: "검증 단계가 없는 항목이 있습니다.",
-          deep: true,
-          iterations: 2,
-        }}
-      />,
-    );
-    expect(screen.getByText("계획안 (rev 2)")).toBeInTheDocument();
-    expect(screen.getByText("미네랄 지급 트리거 추가")).toBeInTheDocument();
-    const criteria = screen.getByRole("list", { name: "수용 기준" });
-    expect(within(criteria).getAllByRole("listitem").map((item) => item.textContent)).toEqual([
-      "게임 시작 시 미네랄 1000 지급",
-      "빌드 통과",
-    ]);
-    expect(screen.getByText("비평 수정 요청")).toBeInTheDocument();
-    expect(screen.getByText("검증 단계가 없는 항목이 있습니다.")).toBeInTheDocument();
-    expect(screen.getByText("심층 계획 · 2회")).toBeInTheDocument();
-  });
-
-  it("keeps the event-only path unchanged without an artifact", () => {
-    render(<PlanView {...defaultPlanViewProps} plan={rev1} />);
-    expect(screen.queryByRole("list", { name: "수용 기준" })).toBeNull();
-    expect(screen.queryByText("심층 계획")).toBeNull();
   });
 });

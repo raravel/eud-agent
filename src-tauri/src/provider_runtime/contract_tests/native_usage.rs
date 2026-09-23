@@ -47,7 +47,6 @@ fn save_session(fixture: &RuntimeFixture, binding: &ProviderBinding) -> SessionS
             context_state: Default::default(),
             task_state: Default::default(),
             autonomous_run: None,
-            workflow: None,
             team_tasks: Vec::new(),
         })
         .expect("save session consumed by production usage sink");

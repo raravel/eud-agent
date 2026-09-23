@@ -288,43 +288,6 @@ mod tests {
     }
 
     #[test]
-    fn delegated_gate_tool_list_is_exactly_the_profile_plus_submit_result() {
-        let runtime = SessionToolRuntime::for_tests();
-        let (_cancel, cancellation) = tokio::sync::watch::channel(0_u64);
-        runtime.set_cancellation(cancellation);
-        runtime.begin_request("delegated-list", "project").unwrap();
-        let schema = serde_json::json!({"type": "object", "properties": {"summary": {"type": "string"}}, "required": ["summary"]});
-        let gate = RunGate::delegated(
-            RunIdentity {
-                session_id: runtime.session_id().to_string(),
-                run_id: RunId::new(3),
-                request_id: "delegated-list".to_string(),
-                session_kind: runtime.kind(),
-                cancellation_generation: 0,
-            },
-            runtime,
-            crate::provider_tool_loop::DelegatedToolProfile::new(
-                ["read_file", "search_docs", "list_files"],
-                &schema,
-            )
-            .unwrap(),
-        );
-        let names = tool_list(gate.descriptors())
-            .into_iter()
-            .map(|tool| tool.name.to_string())
-            .collect::<Vec<_>>();
-        assert_eq!(
-            names,
-            [
-                "list_files",
-                "read_file",
-                "search_docs",
-                crate::provider_tool_loop::SUBMIT_RESULT_TOOL
-            ]
-        );
-    }
-
-    #[test]
     fn map_tool_list_excludes_original_apply_and_eps_mutations() {
         let tools = tool_list(crate::tools::map_mcp_tool_descriptors());
         let registry = crate::tools::map_tool_registry();

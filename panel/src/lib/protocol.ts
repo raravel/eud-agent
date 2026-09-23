@@ -96,11 +96,7 @@ export interface WorkspaceListResponse {
   files: WorkspaceFileEntry[];
 }
 
-/**
- * Project-relative prefix of the agent's document tree. Workflow events name
- * stage artifacts workspace-relative (`plans/<id>.md`); the file tree and
- * document tabs use the project-relative form.
- */
+/** Project-relative prefix of the agent's document tree. */
 export const WORKSPACE_DOCUMENT_PREFIX = ".eud-agent/workspace/";
 
 /**
@@ -206,11 +202,6 @@ export interface AgentEventMessage extends SessionScopedMessage {
     args?: string;
     result?: string;
     status?: string;
-    /**
-     * Set on a `delegate_read` child run's tool events: the child run id,
-     * so the panel nests them under the parent's `delegate_read` row.
-     */
-    delegationRunId?: number;
   };
 }
 
@@ -279,37 +270,6 @@ export interface AskMessage extends SessionScopedMessage {
 
 export interface AskAnswer {
   answers: string[];
-}
-
-/** Lifecycle of one `delegate_read` child run. */
-export type DelegationStatus =
-  | "queued"
-  | "running"
-  | "completed"
-  | "failed"
-  | "cancelled";
-export const DELEGATION_STATUSES: readonly DelegationStatus[] = [
-  "queued",
-  "running",
-  "completed",
-  "failed",
-  "cancelled",
-] as const;
-
-/** `delegation` — a `delegate_read` child run's lifecycle, without session id. */
-export interface DelegationMessageBody {
-  requestId: string;
-  parentRunId: number;
-  childRunId: number;
-  goal: string;
-  status: DelegationStatus;
-  /** Admitted child tool completions so far (final on a terminal status). */
-  toolCalls: number;
-  elapsedMs: number;
-  /** Why a `failed` child ended (user-facing Korean). */
-  error?: string;
-  /** The child's own provider usage, when reported. */
-  usage?: ContextUsage;
 }
 
 /** Map layers a team map task may change. */
@@ -406,18 +366,6 @@ export interface TeamTaskContinuation {
   text: string;
 }
 
-/**
- * `delegation` — a `delegate_read` child of the session's live foreground run.
- * Its tool calls arrive as ordinary `agent_event`s carrying the same
- * `childRunId` in `data.delegationRunId`; its text and reasoning never do.
- */
-export interface DelegationMessage
-  extends SessionScopedMessage,
-    DelegationMessageBody {
-  type: "delegation";
-}
-
-
 /** `changeset {request_id, items}` - journaled writes awaiting accept/reject. */
 export interface ChangesetMessage extends SessionScopedMessage {
   type: "changeset";
@@ -425,93 +373,6 @@ export interface ChangesetMessage extends SessionScopedMessage {
   items: ChangesetItem[];
 }
 
-/** Staged workflow stages (features/staged-workflow-plan.md ## Stage model). */
-export type WorkflowStage =
-  | "triage"
-  | "clarify"
-  | "research"
-  | "planning"
-  | "critique"
-  | "plan_review"
-  | "executing"
-  | "verifying"
-  | "changeset_review"
-  | "interrupted"
-  | "cancelled"
-  | "done"
-  | "failed";
-
-/**
- * Triage route: answer-only, direct edit, one scoped change the foreground
- * finishes after looking its site up, or the full staged pipeline.
- */
-export type WorkflowRoute = "answer" | "direct" | "scoped" | "pipeline";
-
-/** A durable stage artifact (research markdown) by project-relative path. */
-export interface WorkflowArtifactRef {
-  path: string;
-  sha256: string;
-  summary: string;
-}
-
-/** The rendered plan artifact under review or approved for execution. */
-export interface WorkflowPlanArtifact {
-  path: string;
-  revision: number;
-  sha256: string;
-  approvedSha256?: string;
-  title: string;
-  acceptanceCriteria: string[];
-  criticVerdict?: "approve" | "revise";
-  criticSummary?: string;
-  deep: boolean;
-  iterations: number;
-}
-
-/** The verifier verdict for the executed plan. */
-export interface WorkflowVerifyResult {
-  verdict: "pass" | "fail";
-  summary: string;
-  path: string;
-  sha256: string;
-  unmet: string[];
-}
-
-/**
- * One workflow snapshot, emitted on every stage transition and on hydrate.
- * `stage: "plan_review"` accompanies (or follows) an ordinary `plan` event;
- * `stage: "changeset_review"` arrives together with the `changeset` event.
- */
-export interface WorkflowEvent {
-  requestId: string;
-  stage: WorkflowStage;
-  interruptedStage?: WorkflowStage;
-  route?: WorkflowRoute;
-  goal?: string;
-  acceptanceCriteria: string[];
-  research?: WorkflowArtifactRef;
-  plan?: WorkflowPlanArtifact;
-  critiqueRounds: number;
-  verifyAttempts: number;
-  verdict?: WorkflowVerifyResult;
-  deepPlanning: boolean;
-  error?: string;
-}
-
-/** `workflow {sessionId, ...WorkflowEvent}` - staged workflow state. */
-export interface WorkflowMessage extends SessionScopedMessage, WorkflowEvent {
-  type: "workflow";
-}
-
-/**
- * `interrupted_request {sessionId, request?}` - the request a shutdown or a
- * cancellation left unresolved, kept aside so a later message cannot discard
- * it. Absent `request` means the user resolved it (resumed or restarted).
- */
-export interface InterruptedRequestMessage extends SessionScopedMessage {
-  type: "interrupted_request";
-  request?: WorkflowEvent;
-}
 
 export type HarnessJobStatus =
   | "waiting_runtime"
@@ -924,13 +785,10 @@ export type ServerMessage =
   | AgentEventMessage
   | ContextUsageMessage
   | AskMessage
-  | DelegationMessage
   | TeamTaskMessage
   | AnswerMessage
   | PlanMessage
   | ChangesetMessage
-  | WorkflowMessage
-  | InterruptedRequestMessage
   | HarnessJobMessage
   | RollbackResultMessage
   | ProgressMessage
@@ -951,11 +809,8 @@ export const SERVER_MESSAGE_TYPES = [
   "answer",
   "plan",
   "ask",
-  "delegation",
   "team_task",
   "changeset",
-  "workflow",
-  "interrupted_request",
   "harness_job",
   "rollback_result",
   "progress",
@@ -1000,14 +855,6 @@ export interface PlanFeedbackMessage extends SessionCommand {
 /** `plan_approve` resumes the plan owned by one active session. */
 export interface PlanApproveMessage extends SessionCommand {
   type: "plan_approve";
-}
-/** `workflow_resume` restarts the interrupted stage from its persisted inputs. */
-export interface WorkflowResumeMessage extends SessionCommand {
-  type: "workflow_resume";
-}
-/** `workflow_restart` discards the interrupted stage state and re-triages. */
-export interface WorkflowRestartMessage extends SessionCommand {
-  type: "workflow_restart";
 }
 /** Resolve one pending ASK tool call without starting a new chat turn. */
 export interface AskResponseMessage extends SessionCommand {
@@ -1119,8 +966,6 @@ export type ClientMessage =
   | ChatMessage
   | PlanFeedbackMessage
   | PlanApproveMessage
-  | WorkflowResumeMessage
-  | WorkflowRestartMessage
   | AskResponseMessage
   | ChangesetDecisionMessage
   | CancelMessage
@@ -1145,8 +990,6 @@ export const CLIENT_MESSAGE_TYPES = [
   "chat",
   "plan_feedback",
   "plan_approve",
-  "workflow_resume",
-  "workflow_restart",
   "ask_response",
   "changeset_decision",
   "cancel",
@@ -1323,24 +1166,6 @@ export function isAskMessage(value: unknown): value is AskMessage {
   );
 }
 
-/** True if `value` is a session-scoped `delegation` child-run lifecycle event. */
-export function isDelegationMessage(value: unknown): value is DelegationMessage {
-  return (
-    isObject(value) &&
-    value.type === "delegation" &&
-    hasSessionId(value) &&
-    typeof value.requestId === "string" &&
-    typeof value.parentRunId === "number" &&
-    typeof value.childRunId === "number" &&
-    typeof value.goal === "string" &&
-    DELEGATION_STATUSES.includes(value.status as DelegationStatus) &&
-    typeof value.toolCalls === "number" &&
-    typeof value.elapsedMs === "number" &&
-    (value.error === undefined || typeof value.error === "string") &&
-    (value.usage === undefined || isContextUsage(value.usage))
-  );
-}
-
 function isTeamTaskStatus(value: unknown): value is TeamTaskStatus {
   return (
     isObject(value) &&
@@ -1416,119 +1241,9 @@ export function isChangesetMessage(value: unknown): value is ChangesetMessage {
   );
 }
 
-const WORKFLOW_STAGES: readonly WorkflowStage[] = [
-  "triage",
-  "clarify",
-  "research",
-  "planning",
-  "critique",
-  "plan_review",
-  "executing",
-  "verifying",
-  "changeset_review",
-  "interrupted",
-  "cancelled",
-  "done",
-  "failed",
-];
-
-const WORKFLOW_ROUTES: readonly WorkflowRoute[] = [
-  "answer",
-  "direct",
-  "scoped",
-  "pipeline",
-];
 
 function isStringArray(value: unknown): value is string[] {
   return Array.isArray(value) && value.every((item) => typeof item === "string");
-}
-
-function isWorkflowStage(value: unknown): value is WorkflowStage {
-  return WORKFLOW_STAGES.includes(value as WorkflowStage);
-}
-
-function isWorkflowArtifactRef(value: unknown): value is WorkflowArtifactRef {
-  return (
-    isObject(value) &&
-    typeof value.path === "string" &&
-    typeof value.sha256 === "string" &&
-    typeof value.summary === "string"
-  );
-}
-
-function isWorkflowPlanArtifact(value: unknown): value is WorkflowPlanArtifact {
-  return (
-    isObject(value) &&
-    typeof value.path === "string" &&
-    typeof value.revision === "number" &&
-    typeof value.sha256 === "string" &&
-    (value.approvedSha256 === undefined ||
-      typeof value.approvedSha256 === "string") &&
-    typeof value.title === "string" &&
-    isStringArray(value.acceptanceCriteria) &&
-    (value.criticVerdict === undefined ||
-      value.criticVerdict === "approve" ||
-      value.criticVerdict === "revise") &&
-    (value.criticSummary === undefined ||
-      typeof value.criticSummary === "string") &&
-    typeof value.deep === "boolean" &&
-    typeof value.iterations === "number"
-  );
-}
-
-function isWorkflowVerifyResult(value: unknown): value is WorkflowVerifyResult {
-  return (
-    isObject(value) &&
-    (value.verdict === "pass" || value.verdict === "fail") &&
-    typeof value.summary === "string" &&
-    typeof value.path === "string" &&
-    typeof value.sha256 === "string" &&
-    isStringArray(value.unmet)
-  );
-}
-
-/** True if `value` carries every field of a workflow snapshot. */
-function isWorkflowEvent(value: unknown): value is WorkflowEvent {
-  return (
-    isObject(value) &&
-    typeof value.requestId === "string" &&
-    isWorkflowStage(value.stage) &&
-    (value.interruptedStage === undefined ||
-      isWorkflowStage(value.interruptedStage)) &&
-    (value.route === undefined ||
-      WORKFLOW_ROUTES.includes(value.route as WorkflowRoute)) &&
-    (value.goal === undefined || typeof value.goal === "string") &&
-    isStringArray(value.acceptanceCriteria) &&
-    (value.research === undefined || isWorkflowArtifactRef(value.research)) &&
-    (value.plan === undefined || isWorkflowPlanArtifact(value.plan)) &&
-    typeof value.critiqueRounds === "number" &&
-    typeof value.verifyAttempts === "number" &&
-    (value.verdict === undefined || isWorkflowVerifyResult(value.verdict)) &&
-    typeof value.deepPlanning === "boolean" &&
-    (value.error === undefined || typeof value.error === "string")
-  );
-}
-
-/** True if `value` is a session-scoped `workflow` stage snapshot. */
-export function isWorkflowMessage(value: unknown): value is WorkflowMessage {
-  return (
-    isObject(value) &&
-    value.type === "workflow" &&
-    hasSessionId(value) &&
-    isWorkflowEvent(value)
-  );
-}
-
-/** True if `value` is a session-scoped unresolved-request snapshot. */
-export function isInterruptedRequestMessage(
-  value: unknown,
-): value is InterruptedRequestMessage {
-  return (
-    isObject(value) &&
-    value.type === "interrupted_request" &&
-    hasSessionId(value) &&
-    (value.request === undefined || isWorkflowEvent(value.request))
-  );
 }
 
 export function isHarnessJobMessage(value: unknown): value is HarnessJobMessage {
@@ -1758,11 +1473,8 @@ export function isServerMessage(value: unknown): value is ServerMessage {
     isAnswerMessage(value) ||
     isPlanMessage(value) ||
     isAskMessage(value) ||
-    isDelegationMessage(value) ||
     isTeamTaskMessage(value) ||
     isChangesetMessage(value) ||
-    isWorkflowMessage(value) ||
-    isInterruptedRequestMessage(value) ||
     isHarnessJobMessage(value) ||
     isRollbackResultMessage(value) ||
     isProgressMessage(value) ||

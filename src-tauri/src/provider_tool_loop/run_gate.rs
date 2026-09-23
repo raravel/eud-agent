@@ -12,19 +12,10 @@ use crate::{
 
 use super::{
     gate_state::{Admission, GateState, RunGateInner},
-    profile::{DelegatedToolProfile, ToolProfile, SUBMIT_RESULT_TOOL},
     receipt::RunReceiptStore,
     validation::{validate_call_shape, CallAdmission},
     DirectDispatchBatch, DirectToolCall, DirectToolResult, DurableToolCompletion,
 };
-
-/// Completion text for any call a delegated run makes after its submission.
-const ENDED_MESSAGE: &str =
-    "delegated run already submitted its result; this call was not executed";
-
-/// Completion text for a profile read a delegated run makes on its final
-/// tool round, when only `submit_result` is still accepted.
-pub const SUBMISSION_ONLY_MESSAGE: &str = "delegated run has used its tool rounds; only submit_result is accepted now and this call was not executed";
 
 #[derive(Clone)]
 pub struct RunGate {
@@ -45,29 +36,8 @@ impl RunGate {
             identity,
             runtime,
             workspace_access,
-            ToolProfile::Foreground,
             checkpoint_writer,
             receipt_store,
-        )
-    }
-
-    /// A gate for an isolated read-only run. It advertises only the profile's
-    /// tools plus `submit_result`, never registers write intent, keeps no
-    /// transcript checkpoint, and persists no native recovery receipt: a
-    /// delegated run is never resumed, so its completions are not recoverable
-    /// state.
-    pub fn delegated(
-        identity: RunIdentity,
-        runtime: SessionToolRuntime,
-        profile: DelegatedToolProfile,
-    ) -> Self {
-        Self::build(
-            identity,
-            runtime,
-            WorkspaceAccess::Read,
-            ToolProfile::Delegated(profile),
-            None,
-            None,
         )
     }
 
@@ -75,7 +45,6 @@ impl RunGate {
         identity: RunIdentity,
         runtime: SessionToolRuntime,
         workspace_access: WorkspaceAccess,
-        profile: ToolProfile,
         checkpoint_writer: Option<Arc<RunCheckpointWriter>>,
         receipt_store: Option<RunReceiptStore>,
     ) -> Self {
@@ -84,7 +53,6 @@ impl RunGate {
             inner: Arc::new(RunGateInner {
                 identity,
                 workspace_access,
-                profile,
                 runtime,
                 checkpoint_writer,
                 receipt_store,
@@ -96,8 +64,6 @@ impl RunGate {
                     completed: Vec::new(),
                     write_transition_requested: false,
                     iteration_boundary_requested: None,
-                    delegated_result: None,
-                    submission_only: false,
                 }),
                 recording: Mutex::new(()),
                 event_sender,
@@ -114,59 +80,9 @@ impl RunGate {
         &self.inner.identity
     }
 
-    /// Every descriptor a call may validate against: the full profile, so a
-    /// read on the final round is still a known tool that completes with
-    /// [`SUBMISSION_ONLY_MESSAGE`] rather than a fatal unknown-tool error.
+    /// Every descriptor a call may validate against.
     pub fn descriptors(&self) -> Vec<Value> {
-        let registry = self.inner.runtime.tool_descriptors();
-        match &self.inner.profile {
-            ToolProfile::Foreground => registry,
-            ToolProfile::Delegated(profile) => profile.descriptors(registry),
-        }
-    }
-
-    /// The descriptors the model is shown this round: the profile, or
-    /// `submit_result` alone once the delegated run is submission-only.
-    pub fn advertised_descriptors(&self) -> Vec<Value> {
-        match &self.inner.profile {
-            ToolProfile::Delegated(profile) if self.submission_only() => {
-                profile.submission_descriptors()
-            }
-            _ => self.descriptors(),
-        }
-    }
-
-    /// Enter the final tool round of a delegated run: from now on the model
-    /// sees only `submit_result`, and any profile read completes with a usage
-    /// error instead of executing. Foreground gates ignore it.
-    pub fn enter_submission_only(&self) {
-        if self.delegated_profile().is_some() {
-            self.inner.state.lock().submission_only = true;
-        }
-    }
-
-    pub fn submission_only(&self) -> bool {
-        self.inner.state.lock().submission_only
-    }
-
-    /// The usage error for a shape-valid call that the submission-only round
-    /// refuses to execute.
-    fn submission_only_violation(&self, call: &DirectToolCall) -> Option<String> {
-        (self.submission_only() && !self.is_submission(call))
-            .then(|| SUBMISSION_ONLY_MESSAGE.to_string())
-    }
-
-    fn delegated_profile(&self) -> Option<&DelegatedToolProfile> {
-        match &self.inner.profile {
-            ToolProfile::Foreground => None,
-            ToolProfile::Delegated(profile) => Some(profile),
-        }
-    }
-
-    /// The accepted `submit_result` payload of a delegated run, if the model
-    /// has submitted one. Foreground gates never hold a result.
-    pub fn delegated_result(&self) -> Option<Value> {
-        self.inner.state.lock().delegated_result.clone()
+        self.inner.runtime.tool_descriptors()
     }
 
     pub fn completed(&self) -> Vec<DurableToolCompletion> {
@@ -188,6 +104,13 @@ impl RunGate {
 
     pub fn mark_native_run_unknown(&self) -> Result<(), String> {
         self.native_receipt_store()?.mark_unknown()
+    }
+
+    /// Record the resumable native session of a run that was cancelled or
+    /// failed after that session was observed.
+    pub fn mark_native_run_interrupted(&self, candidate_native_id: &str) -> Result<(), String> {
+        self.native_receipt_store()?
+            .mark_interrupted(candidate_native_id)
     }
 
     pub fn mark_native_run_completed(
@@ -283,11 +206,6 @@ impl RunGate {
         for (call, violation) in calls.into_iter().zip(violations) {
             let result = match violation {
                 Some(message) => self.complete_usage_error(&call, message).await?,
-                None if self.delegated_result().is_some() => {
-                    self.complete_usage_error(&call, ENDED_MESSAGE.to_string())
-                        .await?
-                }
-                None if self.is_submission(&call) => self.complete_submission(&call).await?,
                 None => self.execute_call(call).await?,
             };
             results.push(result);
@@ -322,17 +240,6 @@ impl RunGate {
             )?;
             self.reserve_ids(call_id.iter().map(String::as_str))?;
             match admission {
-                CallAdmission::Valid if self.delegated_result().is_some() => {
-                    self.complete_usage_error(&call, ENDED_MESSAGE.to_string())
-                        .await
-                }
-                CallAdmission::Valid if self.submission_only_violation(&call).is_some() => {
-                    self.complete_usage_error(&call, SUBMISSION_ONLY_MESSAGE.to_string())
-                        .await
-                }
-                CallAdmission::Valid if self.is_submission(&call) => {
-                    self.complete_submission(&call).await
-                }
                 CallAdmission::Valid => self.execute_call(call).await,
                 CallAdmission::SchemaViolation(message) => {
                     self.complete_usage_error(&call, message).await
@@ -343,38 +250,6 @@ impl RunGate {
         if let Err(error) = &result {
             self.record_fatal(error);
         }
-        result
-    }
-
-    fn is_submission(&self, call: &DirectToolCall) -> bool {
-        self.delegated_profile().is_some() && call.name == SUBMIT_RESULT_TOOL
-    }
-
-    /// Capture a schema-valid `submit_result` as the delegated run's result.
-    /// Later calls in the same run complete with [`ENDED_MESSAGE`] instead of
-    /// executing; the first submission stays the result. The completion is
-    /// published like any tool completion so transcripts stay paired, but
-    /// nothing is dispatched to the tool runtime.
-    async fn complete_submission(&self, call: &DirectToolCall) -> Result<DirectToolResult, String> {
-        let admission = self.admit()?;
-        self.publish_started(call)?;
-        // Set before the completion is recorded so a concurrent native call
-        // already sees the run as ended. A failed record is fatal for the gate
-        // and the executor never accepts the value, so nothing leaks.
-        self.inner.state.lock().delegated_result = Some(call.arguments.clone());
-        let completion_inner = Arc::clone(&self.inner);
-        let completion_gate = self.clone();
-        let call = call.clone();
-        let result = tokio::task::spawn_blocking(move || {
-            let result =
-                super::completion::tool_result(&call, Ok(serde_json::json!({"accepted": true})));
-            let recorded = super::gate_state::record_completion(&completion_inner, &call, &result);
-            let published = recorded.and_then(|()| completion_gate.publish_completed(&result));
-            drop(admission);
-            published.map(|()| result)
-        })
-        .await
-        .map_err(|error| format!("provider result submission task failed: {error}"))?;
         result
     }
 
@@ -399,7 +274,7 @@ impl RunGate {
                     &call.name,
                     &call.arguments,
                 )? {
-                    CallAdmission::Valid => self.submission_only_violation(call),
+                    CallAdmission::Valid => None,
                     CallAdmission::SchemaViolation(message) => Some(message),
                 },
             );
@@ -456,22 +331,6 @@ impl RunGate {
         call: &DirectToolCall,
         execute: impl FnOnce() -> Result<Value, String>,
     ) -> Result<Value, String> {
-        if let Some(profile) = self.delegated_profile() {
-            // Descriptor filtering already makes an unlisted name a fatal
-            // unknown-tool admission error; this guard keeps a delegated run
-            // from ever registering write intent even if a listed name were
-            // reclassified. Iteration boundaries belong to the foreground: the
-            // delegated executor observes them itself and stops the whole run.
-            if !profile.allows(&call.name) || crate::tools::requires_write_workspace(&call.name) {
-                let error = format!(
-                    "delegated run cannot execute '{}': read-only profile",
-                    call.name
-                );
-                self.record_fatal(&error);
-                return Err(error);
-            }
-            return execute();
-        }
         if let Some(reason) = self.iteration_boundary_reason() {
             return Err(match reason {
                 IterationBoundaryReason::ToolActions => {

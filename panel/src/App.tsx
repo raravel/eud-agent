@@ -5,12 +5,10 @@
  * Components: a status-rich Header (connection transitions + RAG state/elapsed),
  * the ConversationLog cards, a live AgentStream under the turn, the ChangesetView
  * accept/reject surface, and the regated InstructionBox shared under every
- * center tab. Staged-workflow artifacts leave the conversation column: research
- * and verify reports open as workspace document tabs the moment the workflow
- * snapshot announces them, and the selected session's plan is a virtual
- * "계획 (rev N)" tab hosting the PlanView approve surface. Plan cards are
- * archived into the conversation log as agent entries when a plan arrives, is
- * superseded by a higher revision, or is approved.
+ * center tab. The selected session's plan is a virtual "계획 (rev N)" tab
+ * hosting the PlanView approve surface. Plan cards are archived into the
+ * conversation log as agent entries when a plan arrives, is superseded by a
+ * higher revision, or is approved.
  *
  * Data flow: IpcClient (Tauri invoke + listen) -> store actions + log entries
  * -> React snapshot via useSyncExternalStore -> components -> user intents call
@@ -38,8 +36,6 @@ import { ChangesetView } from "@/components/ChangesetView";
 import { HarnessStatusCard } from "@/components/HarnessStatusCard";
 import { AskCard } from "@/components/AskCard";
 import { PlanView } from "@/components/PlanView";
-import { InterruptedRequestBar } from "@/components/InterruptedRequestBar";
-import { WorkflowStrip } from "@/components/WorkflowStrip";
 import { InstructionBox, type ChatPayload } from "@/components/InstructionBox";
 import { ConnectionNotice } from "@/components/ConnectionNotice";
 import {
@@ -99,7 +95,6 @@ import {
   workspaceList,
   workspaceRead,
   workspaceSearch,
-  WORKSPACE_DOCUMENT_PREFIX,
   type AskAnswer,
   type AutonomousRunState,
   type AppSettings,
@@ -150,12 +145,7 @@ import { createUpdater, type UpdateHandle } from "@/setup/update";
 import { PROVIDER_LABELS } from "@/providers/providerCopy";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import {
-  ClipboardCheck,
-  ClipboardList,
-  Search,
-  type LucideIcon,
-} from "lucide-react";
+import { ClipboardList } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
   discardAttachment,
@@ -180,56 +170,10 @@ const MAX_DOCUMENT_TABS = 8;
  * paths are confined relative paths and never contain `:`, so it cannot
  * collide with a document tab.
  */
-const PLAN_TAB_ID = "workflow:plan";
+const PLAN_TAB_ID = "virtual:plan";
 
-/** Staged-workflow artifact families that open as center tabs. */
-type StageArtifactKind = "research" | "plan" | "verify";
-
-/**
- * Stage artifact directories (engine-rendered `research/`, `plans/`,
- * `verify/` markdown under the workspace document tree) and their tab
- * presentation. `dir` is the project-relative form used by the file tree and
- * document tabs; workflow events name artifacts workspace-relative.
- */
-const STAGE_TABS: Record<
-  StageArtifactKind,
-  { dir: string; label: string; icon: LucideIcon }
-> = {
-  research: {
-    dir: `${WORKSPACE_DOCUMENT_PREFIX}research/`,
-    label: "조사 보고",
-    icon: Search,
-  },
-  plan: {
-    dir: `${WORKSPACE_DOCUMENT_PREFIX}plans/`,
-    label: "계획",
-    icon: ClipboardList,
-  },
-  verify: {
-    dir: `${WORKSPACE_DOCUMENT_PREFIX}verify/`,
-    label: "검증 보고",
-    icon: ClipboardCheck,
-  },
-};
-
-/** Project-relative tab path of a workspace-relative stage artifact path. */
-function stageArtifactTabPath(workspacePath: string): string {
-  return `${WORKSPACE_DOCUMENT_PREFIX}${workspacePath}`;
-}
-
-function stageArtifactKind(path: string): StageArtifactKind | null {
-  for (const kind of Object.keys(STAGE_TABS) as StageArtifactKind[]) {
-    if (path.startsWith(STAGE_TABS[kind].dir)) return kind;
-  }
-  return null;
-}
-
-/** Tab label/icon for a workspace document: stage reports get a Korean name. */
+/** Tab label for a workspace document: its file name. */
 function documentTabPresentation(path: string): Pick<DocumentTab, "label" | "icon"> {
-  const kind = stageArtifactKind(path);
-  if (kind !== null) {
-    return { label: STAGE_TABS[kind].label, icon: STAGE_TABS[kind].icon };
-  }
   return { label: path.slice(path.lastIndexOf("/") + 1) };
 }
 
@@ -523,10 +467,6 @@ export default function App() {
   const [planTabHidden, setPlanTabHidden] = useState<ReadonlySet<string>>(
     () => new Set(),
   );
-  // The document tab auto-opened for each stage kind; the next artifact of
-  // the same kind replaces it in place so pipeline requests do not pile up
-  // 조사 보고/검증 보고 tabs. Cleared with the project.
-  const autoOpenedStageTabs = useRef(new Map<StageArtifactKind, string>());
   // A read that completes after its tab was closed/replaced reinserts an
   // invisible entry; prune those so per-path contents cannot accumulate.
   useEffect(() => {
@@ -755,7 +695,6 @@ export default function App() {
     sessionsRef.current.clear();
     loadedProjectRef.current = null;
     setPlanTabHidden(new Set());
-    seenStageArtifacts.current.clear();
     setSelectedSessionId(null);
     selectedSessionIdRef.current = null;
     projectStore.applyStatus({ compiling: false, project: "" });
@@ -1232,13 +1171,6 @@ export default function App() {
           targetSlot.store.askReceived(msg.requestId, msg.questions, msg.waitSeconds);
           break;
         }
-        case "delegation": {
-          const targetSlot = sessionsRef.current.get(msg.sessionId);
-          if (!targetSlot) break;
-          const { type: _type, sessionId: _sessionId, ...event } = msg;
-          targetSlot.store.delegationReceived(event);
-          break;
-        }
         case "team_task": {
           const targetSlot = sessionsRef.current.get(msg.sessionId);
           if (!targetSlot) break;
@@ -1324,19 +1256,6 @@ export default function App() {
           }
           target.changesetReceived(msg.request_id, msg.items);
           target.log("agent", `변경사항 ${msg.items.length}건을 검토하세요.`);
-          break;
-        }
-        case "workflow": {
-          const target = sessionStore();
-          if (!target) break;
-          const { type: _type, sessionId: _sessionId, ...event } = msg;
-          target.workflowReceived(event);
-          break;
-        }
-        case "interrupted_request": {
-          const target = sessionStore();
-          if (!target) break;
-          target.interruptedRequestReceived(msg.request ?? null);
           break;
         }
         case "harness_job": {
@@ -1937,62 +1856,6 @@ export default function App() {
       setMessageActionBusy(false);
     }
   }, [selectedSlot]);
-
-  const sendWorkflowControl = useCallback(
-    async (type: "workflow_resume" | "workflow_restart") => {
-      const slot = selectedSlot;
-      const snapshot = slot?.store.getState();
-      // The unresolved request is the live workflow while it is still this
-      // session's current one, and the set-aside snapshot once a later message
-      // took over. Restart also accepts a cancelled (or failed) request whose
-      // artifacts were retained.
-      const pending =
-        snapshot?.workflow?.stage === "interrupted"
-          ? snapshot.workflow
-          : (snapshot?.interruptedRequest ?? null);
-      const restartable =
-        pending !== null ||
-        snapshot?.workflow?.stage === "cancelled" ||
-        snapshot?.workflow?.stage === "failed";
-      const allowed =
-        snapshot !== undefined &&
-        !isBusyPhase(snapshot.phase) &&
-        (type === "workflow_resume" ? pending !== null : restartable);
-      if (!slot?.persisted || !allowed || messageActionBusyRef.current) {
-        return;
-      }
-      messageActionBusyRef.current = true;
-      setMessageActionBusy(true);
-      try {
-        const sent = await clientRef.current?.send({ type, sessionId: slot.id });
-        if (sent) {
-          if (type === "workflow_resume") slot.store.workflowResumeSent();
-          else slot.store.workflowRestartSent();
-          markConversationStarted(slot);
-        } else {
-          slot.store.log(
-            "error",
-            type === "workflow_resume"
-              ? "중단된 작업을 이어서 진행하지 못했습니다."
-              : "작업을 처음부터 다시 시작하지 못했습니다.",
-          );
-        }
-      } finally {
-        messageActionBusyRef.current = false;
-        setMessageActionBusy(false);
-      }
-    },
-    [markConversationStarted, selectedSlot],
-  );
-
-  const handleWorkflowResume = useCallback(
-    () => void sendWorkflowControl("workflow_resume"),
-    [sendWorkflowControl],
-  );
-  const handleWorkflowRestart = useCallback(
-    () => void sendWorkflowControl("workflow_restart"),
-    [sendWorkflowControl],
-  );
 
   const sendAutonomousControl = useCallback(
     (type: "autonomous_pause" | "autonomous_resume" | "autonomous_stop") => {
@@ -2926,56 +2789,6 @@ export default function App() {
     [activeCenterTab, loadDocumentTab, workspaceData],
   );
 
-  // Stage artifacts (research / verify markdown, and the plan file once its
-  // virtual tab retires) open as document tabs the moment the workflow
-  // snapshot announces them. `workspacePath` is the event's workspace-relative
-  // path; the tab uses the project-relative form. The list is refreshed first
-  // so the new file gets its tree entry; the tab auto-opened for the same
-  // stage earlier is replaced in place. Returns whether the tab was opened.
-  const openStageArtifactTab = useCallback(
-    async (
-      kind: StageArtifactKind,
-      workspacePath: string,
-      activate = true,
-    ): Promise<boolean> => {
-      const path = stageArtifactTabPath(workspacePath);
-      let data = workspaceData;
-      try {
-        data = await workspaceList();
-        setWorkspaceData(data);
-      } catch (error) {
-        if (!data) {
-          store.log(
-            "warn",
-            `${STAGE_TABS[kind].label}를 열지 못했습니다: ${String(error)}`,
-          );
-          return false;
-        }
-      }
-      const previous = autoOpenedStageTabs.current.get(kind);
-      autoOpenedStageTabs.current.set(kind, path);
-      setOpenDocumentTabs((current) => {
-        if (current.includes(path)) return current;
-        const next = [...current];
-        const replaced =
-          previous === undefined ? -1 : current.indexOf(previous);
-        if (replaced !== -1) {
-          next[replaced] = path;
-        } else if (current.length < MAX_DOCUMENT_TABS) {
-          next.push(path);
-        } else {
-          const active = current.indexOf(activeCenterTab);
-          next[active === -1 ? 0 : active] = path;
-        }
-        return next;
-      });
-      if (activate) setActiveCenterTab(path);
-      void loadDocumentTab(data.workspaceId, path);
-      return true;
-    },
-    [activeCenterTab, loadDocumentTab, store, workspaceData],
-  );
-
   const closeDocumentTab = useCallback(
     (id: DocumentTabId) => {
       if (id === "chat") return;
@@ -3047,11 +2860,9 @@ export default function App() {
     try {
       const data = await workspaceList();
       setWorkspaceData(data);
-      // Research/verify reports are readable but never listed, so their tabs
-      // survive a refresh; the virtual plan tab is not a file at all.
+      // The virtual plan tab is not a file at all, so it is never pruned here.
       const available = new Set(data.files.map((file) => file.path));
-      const retained = (path: string) =>
-        available.has(path) || stageArtifactKind(path) !== null;
+      const retained = (path: string) => available.has(path);
       const nextTabs = openDocumentTabs.filter(retained);
       if (nextTabs.length !== openDocumentTabs.length) {
         setOpenDocumentTabs(nextTabs);
@@ -3126,7 +2937,6 @@ export default function App() {
       setWorkspaceError(null);
       setOpenDocumentTabs([]);
       setDocumentStates({});
-      autoOpenedStageTabs.current.clear();
       setActiveCenterTab("chat");
       if (!projectIdentity) return;
       // The file tree is the default project tab, so its data loads with the
@@ -3217,15 +3027,6 @@ export default function App() {
     messageActionBusy ||
     selectedSlot?.activity === "running_write" ||
     state.phase === "changeset_review";
-  // The stage strip and stage cards are pipeline surfaces: the
-  // answer/direct/scoped routes show 파악 during triage and then fall back to
-  // the ordinary answer/changeset flow; done/failed hide them, while a
-  // cancelled request stays visible as a terminal state offering 처음부터.
-  const workflowActive =
-    state.workflow !== null &&
-    state.workflow.stage !== "done" &&
-    state.workflow.stage !== "failed" &&
-    (state.workflow.route === undefined || state.workflow.route === "pipeline");
   // The selected session's plan is a virtual tab (no workspace fetch: the
   // markdown is store state) that stays open read-only after approval until
   // the next request clears the plan.
@@ -3246,7 +3047,7 @@ export default function App() {
             {
               id: PLAN_TAB_ID,
               label: `계획 (rev ${planRevision})`,
-              icon: STAGE_TABS.plan.icon,
+              icon: ClipboardList,
             },
           ]
         : []),
@@ -3282,87 +3083,13 @@ export default function App() {
     showPlanTab();
   }, [selectedPlan, selectedSessionId, showPlanTab]);
 
-  // Research and verify artifacts open as 조사 보고 / 검증 보고 tabs once per
-  // artifact hash while the pipeline is active (snapshots repeat the same
-  // artifact on every later stage; hydrated done/failed requests stay quiet).
-  const seenStageArtifacts = useRef(new Map<string, string>());
-  const workflowResearch = workflowActive ? state.workflow?.research : undefined;
-  const workflowVerdict = workflowActive ? state.workflow?.verdict : undefined;
-  const openSeenStageArtifact = useCallback(
-    (kind: "research" | "verify", sessionId: string, artifact: { path: string; sha256: string }, activate: boolean) => {
-      const key = `${sessionId}:${kind}`;
-      const identity = `${artifact.path}@${artifact.sha256}`;
-      if (seenStageArtifacts.current.get(key) === identity) return;
-      seenStageArtifacts.current.set(key, identity);
-      void openStageArtifactTab(kind, artifact.path, activate).then((opened) => {
-        // A failed open stays retryable on the next snapshot of the same artifact.
-        if (!opened && seenStageArtifacts.current.get(key) === identity) {
-          seenStageArtifacts.current.delete(key);
-        }
-      });
-    },
-    [openStageArtifactTab],
-  );
-  useEffect(() => {
-    if (selectedSessionId === null || !workflowResearch) return;
-    openSeenStageArtifact("research", selectedSessionId, workflowResearch, true);
-  }, [openSeenStageArtifact, selectedSessionId, workflowResearch]);
-  // The verdict arrives with changeset review (or a fix turn); when the
-  // conversation is waiting on the user, the report opens without stealing
-  // the tab so the changeset/ASK surface stays in view.
-  const conversationAwaitsUser =
-    state.phase === "changeset_review" || state.ask !== null;
-  useEffect(() => {
-    if (selectedSessionId === null || !workflowVerdict) return;
-    openSeenStageArtifact("verify", selectedSessionId, workflowVerdict, !conversationAwaitsUser);
-    // The activation choice belongs to the moment the verdict first appears,
-    // so the phase/ASK state is read here rather than listed as a dependency.
-  }, [openSeenStageArtifact, selectedSessionId, workflowVerdict]);
-
   // When the plan clears (the next request starts) while its tab is active,
-  // the tab turns into the plan file's document tab so the approved plan stays
-  // readable; without a known file, or after a session switch, fall back to
-  // the conversation.
-  const planTabRef = useRef<{
-    sessionId: string;
-    plan: PlanState;
-    path?: string;
-  } | null>(null);
-  const planPath = state.workflow?.plan?.path;
+  // fall back to the conversation.
   useEffect(() => {
-    if (planTabVisible && selectedSessionId !== null && selectedPlan !== null) {
-      const previous = planTabRef.current;
-      planTabRef.current = {
-        sessionId: selectedSessionId,
-        plan: selectedPlan,
-        path:
-          planPath ??
-          (previous?.sessionId === selectedSessionId && previous.plan === selectedPlan
-            ? previous.path
-            : undefined),
-      };
-      return;
-    }
+    if (planTabVisible) return;
     if (activeCenterTab !== PLAN_TAB_ID) return;
-    const previous = planTabRef.current;
-    planTabRef.current = null;
     setActiveCenterTab("chat");
-    if (
-      previous !== null &&
-      previous.sessionId === selectedSessionId &&
-      previous.path !== undefined &&
-      selectedPlan === null
-    ) {
-      void openStageArtifactTab("plan", previous.path);
-    }
-  }, [
-    activeCenterTab,
-    openStageArtifactTab,
-    planPath,
-    planTabVisible,
-    selectedPlan,
-    selectedSessionId,
-  ]);
+  }, [activeCenterTab, planTabVisible]);
   if (launcherVisible) {
     return (
       <>
@@ -3638,26 +3365,6 @@ export default function App() {
           </div>
         )}
 
-        {state.interruptedRequest && (
-          <InterruptedRequestBar
-            request={state.interruptedRequest}
-            actionBusy={messageActionBusy || isBusyPhase(state.phase)}
-            onResume={handleWorkflowResume}
-            onRestart={handleWorkflowRestart}
-          />
-        )}
-
-        {workflowActive && state.workflow && (
-          <WorkflowStrip
-            workflow={state.workflow}
-            phase={state.phase}
-            actionBusy={messageActionBusy}
-            onCancel={handleCancel}
-            onResume={handleWorkflowResume}
-            onRestart={handleWorkflowRestart}
-          />
-        )}
-
         <ConversationLog
           key={selectedSessionId ?? "no-session"}
           log={state.log}
@@ -3750,7 +3457,6 @@ export default function App() {
           >
             <PlanView
               plan={selectedPlan}
-              artifact={state.workflow?.plan}
               reviewable={state.phase === "plan_review"}
               pending={messageActionBusy}
               onApprove={handlePlanApprove}

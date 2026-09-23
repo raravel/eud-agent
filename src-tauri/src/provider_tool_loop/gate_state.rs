@@ -10,8 +10,7 @@ use crate::{
 };
 
 use super::{
-    completion::durable_completion, gate_events::GateEvent, profile::ToolProfile,
-    receipt::RunReceiptStore, DirectToolCall, DirectToolResult, DurableToolCompletion,
+    completion::durable_completion, gate_events::GateEvent, receipt::RunReceiptStore, DirectToolCall, DirectToolResult, DurableToolCompletion,
 };
 
 pub(super) struct GateState {
@@ -22,17 +21,11 @@ pub(super) struct GateState {
     pub(super) completed: Vec<DurableToolCompletion>,
     pub(super) write_transition_requested: bool,
     pub(super) iteration_boundary_requested: Option<IterationBoundaryReason>,
-    /// The accepted `submit_result` payload of a delegated run, once captured.
-    pub(super) delegated_result: Option<serde_json::Value>,
-    /// A delegated run has reached its final tool round: only `submit_result`
-    /// is advertised and profile reads complete with a usage error.
-    pub(super) submission_only: bool,
 }
 
 pub(super) struct RunGateInner {
     pub(super) identity: RunIdentity,
     pub(super) workspace_access: WorkspaceAccess,
-    pub(super) profile: ToolProfile,
     pub(super) runtime: SessionToolRuntime,
     pub(super) checkpoint_writer: Option<Arc<RunCheckpointWriter>>,
     pub(super) receipt_store: Option<RunReceiptStore>,

@@ -1908,7 +1908,6 @@ mod tests {
             context_state: Default::default(),
             task_state: Default::default(),
             autonomous_run: None,
-            workflow: None,
             team_tasks: Vec::new(),
         };
         sessions.save(&session).unwrap();

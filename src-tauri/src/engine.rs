@@ -15,14 +15,10 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-mod delegation;
 pub(crate) mod runtime_events;
 mod team;
-mod workflow_stages;
 
 pub(crate) use team::emit_team_tasks;
-#[cfg(test)]
-mod workflow_tests;
 
 use crate::{
     attachment::{AttachmentContext, AttachmentStore},
@@ -34,30 +30,28 @@ use crate::{
         HARNESS_DEADLINE, TASK_STATE_COMPILER_DEADLINE, TASK_STATE_COMPILER_OUTPUT_TOKENS,
     },
     tool_exec::SessionToolRuntime,
-    workspace::{approved_plan_path, WorkspaceManager},
+    workspace::{approved_plan_path, PreparedWorkspace, WorkspaceManager},
 };
 #[cfg(test)]
 use crate::{
     provider_runtime::{AdapterEventKind, NormalizedBlock},
-    workspace::PreparedWorkspace,
 };
 use parking_lot::Mutex as SyncMutex;
 use tauri::Emitter;
 
 const FIRST_PRINCIPLES: &str = include_str!("data/first_principles.md");
-const INTRO: &str = "You are the native EUD project agent. You work in a durable, sandboxed \
-project filesystem and edit the canonical StarCraft EUD project through eud-tools. The server \
-validates and journals every project/map mutation and every durable workspace change.";
+const INTRO: &str = "You are the native EUD project agent. You work in the real StarCraft EUD \
+project: read and edit its files directly, and use eud-tools for the operations that need the \
+server's authority. Every turn is committed to the project's git history, so a change you make is \
+recoverable, not irreversible.";
 
 const WORKSPACE_GUIDE: &str = r#"[project workspace]
-- Your cwd is the native project root that holds `project.eap`. Read the real project tree directly: `src/**/*.eps`, `dat/*.json`, `maps/`, `build/`, `compat/`, and the durable harness documents under `.eud-agent/workspace/{specs,plans,decisions,worklog}`.
-- The only filesystem path you may write is `.eud-agent/workspace/.tmp/**`. Every other path is read-only to native filesystem tools.
-- NEVER edit `specs/`, `plans/`, `decisions/`, `worklog/`, or project memory with native file tools during implementation. The foreground implementation workspace is read-only.
+- Your cwd is the native project root that holds `project.eap`. Read and edit the real tree directly with your own file tools: `src/**/*.eps`, `src/**/*.py`, `dat/*.json`, `project.eap`, and the durable documents under `.eud-agent/workspace/{specs,plans,decisions,worklog}`. Create, rename and delete files there as the work needs.
+- Three paths stay read-only and the sandbox refuses a write to them: `maps/**` and `references/**` (binary maps the app backs up, verifies and rolls back itself) and `.git/**` (the history that makes your changes recoverable). Map changes go through the map tools or the Map session, never through a file write.
+- `build_run` is the only way to run anything. There is no shell.
+- Editing `dat/*.json` by hand is allowed but exacting: each override's `before` must be the stock catalog value, because the generator emits `after - before` as a runtime delta. `dat_patch` checks that for you, and the build refuses a file that gets it wrong.
 - On plan approval, the app writes the exact approved plan to `.eud-agent/workspace/plans/<request-id>.md`; NEVER edit, replace, rename, or delete it.
-- After the code/map changes are accepted, the backend starts a separate post-acceptance harness job. That job generates one structured delta, a deterministic worklog, and a separately reviewable document changeset.
-- Live project changes (source, DAT, map, settings, plugins, build) always go through eud-tools, never through native file writes. `file_write`/`file_edit` take project-relative `src/...` paths — the same paths you read.
-- Use eud-tools for every editor, map, DAT, build, and RAG action. Native shell/file tools are read-only in implementation turns.
-- After the authoritative build and required verification, answer immediately. Do not perform harness/document cleanup; the accepted spec index and recent worklog names are already listed in `[project map]`."#;
+- The eud-tools writers (`file_write`, `file_edit`, `dat_patch`, the map and sound tools) still work and take project-relative paths. Prefer them when they do the job in one call; reach for your own file tools when they are simpler."#;
 
 const EPSCRIPT_GUIDE: &str = r#"[epscript]
 - epScript (*.eps) is the primary authoring language and the default for gameplay logic; use direct Python only when the requested change belongs in an existing or explicitly requested Python entrypoint.
@@ -162,19 +156,10 @@ const MAP_HANDOFF_GUIDE: &str = r#"[map handoff]
 - The user can also apply, discard, or undo in the Map window (the app opens it on the team session when a candidate is ready) ; an undone apply shows as discarded in [map tasks]. Never claim the map changed before [map tasks] or map_task_status shows the task as applied.
 - If a map task call fails, report the exact reason and stop; do not turn a failure into an instruction for the user to open, switch, or reload a window."#;
 
-const DELEGATION_GUIDE: &str = r#"[delegation]
-- delegate_read runs one isolated read-only child over the project read tools and returns only its structured summary; the child's raw reads never enter this context. Use it for broad exploration whose verbatim results you do not need: "find every module that writes P1 death counters", "which units have overridden DAT attack values", "summarize the location layout of the connected map".
-- Give the child one bounded goal and, when known, focus paths or object names. Do not delegate work that needs your own judgment, a build, a runtime test, a user decision, or a write.
-- A delegated summary is a hint, never mutation evidence: read the exact target yourself before editing it, and run search_docs yourself before a write. The child cannot write, ask, build, or delegate again.
-- The call waits up to 240 seconds and at most 8 delegations are admitted per run; a failed, cancelled, or timed-out child returns a usage error, after which you continue with direct reads."#;
-
 const EVIDENCE_GUIDE: &str = r#"[evidence]
-- EVERY unit of work (eps/Python code, Python dependencies, dat edits, map location/player/switch writes, settings) must be grounded in the docs: call search_docs (Korean query) BEFORE writing, inspect promising exact chunks with docs_get, and justify each item with WHY plus its source as a markdown link — `... (근거: [제목](url))`.
-- search_docs previews are exact discovery excerpts, not summaries. Search as broadly and repeatedly as unresolved claims require; use docs_get in batches for the specific full chunks needed to verify details. Reuse an already verified source across related plan steps instead of re-fetching it.
-- `repeated=true` and a zero `newCount` are novelty signals, never a forced stopping condition. Reformulate, seek a different source tier, or continue exact reads when material uncertainty remains.
-- Cite on BOTH review surfaces: when the user explicitly requests a plan, every propose_plan step carries its evidence link(s); the final answer always explains each applied change with its link(s). The reference-context chunks below carry their own `source:` links — cite those the same way.
-- The server enforces this: mutating tool calls are rejected until at least one search_docs has run in the request.
-- If searching finds NO relevant document for an item, mark it explicitly as 근거 없음 (일반 EUD 지식) and proceed — NEVER fabricate a source or url.
+- The project itself is your first source: read the tree before you change it. Use search_docs (Korean query) and docs_get for what the project cannot answer — an eudplib/euddraft API you are unsure of, a platform behavior, a symptom you have not seen.
+- search_docs previews are exact discovery excerpts, not summaries. Use docs_get for the full chunks you need to verify a detail. Reuse a source you already read instead of re-fetching it.
+- When a claim rests on a document, cite it as a markdown link — `... (근거: [제목](url))`. If nothing relevant exists, say 근거 없음 (일반 EUD 지식) and proceed. NEVER fabricate a source or url.
 - When the user reports a crash / EUD error / drop / freeze, FIRST match the symptom against the [first principles] list and cite the matching item number (or state explicitly that no item matches) BEFORE proposing or applying any fix. A speculative fix without a named suspected cause is forbidden.
 - [first principles] always outrank retrieved documents."#;
 
@@ -188,11 +173,11 @@ const INTERACTION_GUIDE: &str = r#"[interaction]
 - The user has 240 seconds to answer an ask. If the result is {"status":"unanswered"}, restate the same questions as your final plain-text answer and end the turn; the user's next message is the answer. Do not call ask again in that turn.
 - When explaining a flow, state transition, dependency, or component composition, prefer a fenced `mermaid` diagram over an ASCII/text-only flow. Use Mermaid only when relationships are genuinely clearer as a diagram; keep supporting prose brief."#;
 
-const TRIAGE_INSTRUCTIONS: &str = r#"[triage]
-- Every request is triaged before this turn. A `[route]` section, when present, states the decision: answer-only turns reply directly and use NO write tools; direct turns apply the one specified change, run the authoritative build, and answer.
-- Larger changes are researched, planned, reviewed, and verified in separate stages; the approved plan and research files then instruct the executing turn. Do not call propose_plan for them.
-- Call propose_plan(markdown) only when the user explicitly asks you to write a plan in this turn.
-- File writes and build_run never require plan approval within a routed turn."#;
+const COMPLETION_GUIDE: &str = r#"[completion]
+- You read, change and build in this one turn. There is no stage that researches or plans for you, and nothing reviews your work before the user sees it.
+- Call propose_plan(markdown) only when the user explicitly asks you to write a plan, or when the work is large enough that you want the user to agree with the shape before you start.
+- A green build means the project compiles. It does NOT mean the map plays correctly — only the user can know that by running it in StarCraft. Never claim a change works in game.
+- End every turn that changed something by naming what the user should check in game, concretely: what to do, and what should happen."#;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentTurnResult {
@@ -249,11 +234,6 @@ pub enum EngineEvent {
     /// (rules.md forbids raw kind identifiers as user-facing text).
     SessionLoaded(ipc::SessionLoadedEvent),
     AutonomousRun(Box<crate::autonomous::AutonomousRunState>),
-    /// Staged-workflow projection, emitted on every stage transition and on hydrate.
-    Workflow(Box<crate::workflow::WorkflowEvent>),
-    /// The request an interruption left unresolved, or its absence once the
-    /// user resumed or restarted it.
-    InterruptedRequest(Box<ipc::InterruptedRequestEvent>),
 }
 
 pub(crate) trait EventSink {
@@ -431,10 +411,6 @@ pub(crate) struct AgentEngine<R: RuntimeExecutor, S: EventSink> {
     execution_mode: crate::autonomous::ExecutionMode,
     autonomous_policy: crate::autonomous::AutonomousRunPolicy,
     autonomous_pause_requested: Arc<AtomicBool>,
-    /// In-memory mirror of the session's persisted staged-workflow state.
-    workflow: Option<crate::workflow::WorkflowState>,
-    /// The request an interruption cut short that a later message set aside.
-    interrupted_workflow: Option<crate::workflow::WorkflowState>,
 }
 impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
     // Keep each injected runtime, persistence, session, and cancellation authority explicit.
@@ -500,8 +476,6 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
             cancellation,
             execution_mode,
             autonomous_policy,
-            workflow: session.workflow.clone(),
-            interrupted_workflow: session.interrupted_workflow.clone(),
             autonomous_pause_requested,
         }
     }
@@ -717,15 +691,14 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
         })
     }
 
-    /// After a context-pressure boundary the next iteration is told to push
-    /// exploration into `delegate_read` children instead of its own context.
-    /// A fixed control phrase; the engine never auto-delegates.
+    /// After a context-pressure boundary the next iteration is told to stop
+    /// widening its search. A fixed control phrase; nothing is delegated.
     fn continuation_delegation_hint(
         reason: crate::provider_runtime::IterationBoundaryReason,
     ) -> &'static str {
         match reason {
             crate::provider_runtime::IterationBoundaryReason::ContextPressure => {
-                " 컨텍스트 여유가 부족합니다: 넓은 탐색(source_search, docs_get, map_info 페이지 조회 등)은 delegate_read로 위임하고 요약만 받으세요. 편집 대상은 편집 직전에 직접 다시 읽어야 합니다."
+                " 컨텍스트 여유가 부족합니다: 넓은 탐색을 더 벌이지 말고 지금까지 확인한 것으로 남은 작업을 끝내세요. 편집 대상은 편집 직전에 직접 다시 읽어야 합니다."
             }
             _ => "",
         }
@@ -1471,33 +1444,6 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
                 ))
             })?);
         }
-        let staged = self.session_kind == crate::session::SessionKind::Eps
-            && execution_mode == crate::autonomous::ExecutionMode::Interactive;
-        let mut route_note = None;
-        if !staged {
-            // A leftover staged request never adopts an autonomous or Map turn,
-            // and a handed-off clarify question is not answered by one either.
-            self.workflow_cancel_if_active()?;
-            self.workflow_drop_pending_clarification()?;
-        }
-        if staged {
-            match self
-                .workflow_start(&request_id, &req.client_turn_id, &user_text)
-                .await?
-            {
-                workflow_stages::TriageDecision::Handled => {
-                    self.update_active_session().await;
-                    return Ok(());
-                }
-                workflow_stages::TriageDecision::Foreground(route) => {
-                    route_note = Some(self.workflow_route_note(route));
-                }
-            }
-            if let Some(clarification) = self.workflow_clarification_text(&user_text) {
-                user_text.push_str("\n\n");
-                user_text.push_str(&clarification);
-            }
-        }
         if execution_mode == crate::autonomous::ExecutionMode::Autonomous {
             let revision = self
                 .runtime
@@ -1533,19 +1479,11 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
                 )
             }
         } else if !self.thread_active && self.pending_resume_transcript.is_some() {
-            if let Some(note) = route_note.take() {
-                user_text.push_str("\n\n");
-                user_text.push_str(&note);
-            }
             String::new()
         } else {
             self.prepare_eps_context(&user_text, resolved_mentions.as_deref(), None, false)
                 .await?
         };
-        if let Some(note) = route_note {
-            turn_text.push_str("\n\n");
-            turn_text.push_str(&note);
-        }
         if self.session_kind == crate::session::SessionKind::Eps {
             if let Some(note) = team::prompt_note(&self.session_store, &self.session_id) {
                 turn_text.push_str("\n\n");
@@ -1588,7 +1526,6 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
                 crate::write_coordinator::TicketState::Granted => Phase::Executing,
                 crate::write_coordinator::TicketState::Cancelled => Phase::Idle,
             };
-            self.workflow_settle_foreground()?;
             self.update_active_session().await;
             return Ok(());
         }
@@ -1598,7 +1535,6 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
             ));
         }
         let state_result = result.clone();
-        let cancelled = matches!(result, AgentTurnResult::Cancelled);
         self.handle_turn_result(result)?;
         if self.session_kind == crate::session::SessionKind::Eps {
             self.update_task_state_after_turn(
@@ -1607,11 +1543,6 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
                 resolved_mentions.as_deref(),
             )
             .await;
-        }
-        if cancelled {
-            self.workflow_cancel_if_active()?;
-        } else {
-            self.workflow_settle_foreground()?;
         }
         self.commit_boundary(&user_text, &request_id);
         self.update_active_session().await;
@@ -1731,6 +1662,21 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
         }
     }
 
+    /// The session workspace: the CLI cwd, temp dir, and artifact root. The
+    /// foreground prepares it on its first turn; a plan may be approved before
+    /// any foreground turn ran (or after a restart), so that path prepares it.
+    pub(crate) async fn prepared_workspace(&self) -> Result<PreparedWorkspace, AgentEngineError> {
+        if let Some(workspace) = self.executor.current_workspace() {
+            return Ok(workspace);
+        }
+        let manager = WorkspaceManager::new(self.runtime.data_dirs());
+        let session_id = self.session_id.clone();
+        tokio::task::spawn_blocking(move || manager.prepare_session_current(&session_id))
+            .await
+            .map_err(|error| AgentEngineError::new(error.to_string()))?
+            .map_err(AgentEngineError::new)
+    }
+
     /// After a successful turn, persist the exact provider conversation and
     /// still-pending changeset ownership. The panel log is saved separately.
     async fn update_active_session(&mut self) {
@@ -1791,17 +1737,6 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
         let resolved_mentions = self.resolve_mentions(&req.mentions)?;
         self.set_client_turn_id(&req.client_turn_id)?;
         self.phase = Phase::PlanReview;
-        if self.workflow_is_pipeline() {
-            // Staged plans revise through the planner job, not the foreground.
-            let feedback = if req.text.trim().is_empty() {
-                "첨부 또는 참조한 내용을 반영해 계획을 수정해 주세요.".to_string()
-            } else {
-                req.text.clone()
-            };
-            self.workflow_plan_round(Some(&feedback)).await?;
-            self.update_active_session().await;
-            return Ok(());
-        }
         let mut attachment_context = self.resolve_attachments(&req.attachments)?;
         let audio_files = std::mem::take(&mut attachment_context.audio_files);
         let request_id = self
@@ -1867,14 +1802,8 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
             .map_err(AgentEngineError::new)?;
         self.pending_write = Some(WriteContinuation::ApprovedPlan);
         self.phase = match ticket.state() {
-            crate::write_coordinator::TicketState::Granted => {
-                self.workflow_record_approval(&sha256)?;
-                Phase::Executing
-            }
-            crate::write_coordinator::TicketState::Cancelled => {
-                self.workflow_cancel_if_active()?;
-                Phase::Idle
-            }
+            crate::write_coordinator::TicketState::Granted => Phase::Executing,
+            crate::write_coordinator::TicketState::Cancelled => Phase::Idle,
         };
         Ok(())
     }
@@ -1912,16 +1841,13 @@ Continue the requested change now, run the mandatory build, and stop only after 
                     .current_plan_markdown
                     .clone()
                     .ok_or_else(|| AgentEngineError::new("no plan is awaiting approval"))?;
-                // A staged plan may be approved before any foreground turn
-                // prepared the session workspace (or after a restart).
+                // A plan may be approved before any foreground turn prepared
+                // the session workspace (or after a restart).
                 let workspace = self.prepared_workspace().await?;
                 WorkspaceManager::new(self.runtime.data_dirs())
                     .record_plan_approval(&workspace.id, &request_id, self.plan_revision, &markdown)
                     .map_err(|error| AgentEngineError::new(error.to_string()))?;
-                match self.workflow_execution_instruction(&request_id, &workspace) {
-                    Some(instruction) => instruction,
-                    None => approved_plan_execution_instruction(&request_id)?,
-                }
+                approved_plan_execution_instruction(&request_id)?
             }
         };
 
@@ -1935,19 +1861,9 @@ Continue the requested change now, run the mandatory build, and stop only after 
         self.thread_active = true;
         let result = self.reinterpret_plan(result);
         let state_result = result.clone();
-        let cancelled = matches!(result, AgentTurnResult::Cancelled);
         self.handle_turn_result(result)?;
-        if !cancelled {
-            // Staged requests are verified against their plan before review.
-            self.workflow_verify_loop().await?;
-        }
         self.pending_write = None;
         self.settle_write_lifecycle()?;
-        if cancelled {
-            self.workflow_cancel_if_active()?;
-        } else {
-            self.workflow_settle_foreground()?;
-        }
         let compiler_user_text = self.current_user_text.clone();
         self.update_task_state_after_turn(&state_result, &compiler_user_text, None)
             .await;
@@ -1957,13 +1873,11 @@ Continue the requested change now, run the mandatory build, and stop only after 
 
     pub fn recover_write_failure(&mut self) -> Result<(), AgentEngineError> {
         self.pending_write = None;
-        self.workflow_fail_if_active("실행 단계가 실패했습니다.")?;
         self.settle_write_lifecycle()
     }
 
     fn recover_read_failure(&mut self) -> Result<(), AgentEngineError> {
         self.pending_write = None;
-        self.workflow_fail_if_active("요청이 실패했습니다.")?;
         if self.emit_current_changeset_if_any()? {
             self.phase = Phase::ChangesetReview;
             self.runtime
@@ -2108,9 +2022,6 @@ Continue the requested change now, run the mandatory build, and stop only after 
         } else {
             None
         };
-        if let Some(job) = harness_job.as_mut() {
-            job.verify_verdict = self.workflow_verdict_markdown();
-        }
         if settled {
             let record = self.session_store.load(&self.session_id).ok();
             let journal_entry_ids = harness_job
@@ -2165,7 +2076,6 @@ Continue the requested change now, run the mandatory build, and stop only after 
                 .map_err(AgentEngineError::new)?;
             self.settle_autonomous_review().await?;
             self.phase = Phase::Idle;
-            self.workflow_mark_done()?;
             self.drop_pending_request_from_session(&request_id);
             self.current_request_id = None;
             self.current_client_turn_id = None;
@@ -2438,9 +2348,6 @@ Continue the requested change now, run the mandatory build, and stop only after 
                 .restore_review(&self.project_id, request_id)
                 .map_err(AgentEngineError::new)?;
             self.reconnect_pending_changeset(&record);
-        }
-        if let Err(error) = self.workflow_hydrate(&record).await {
-            eprintln!("eud-agent: staged workflow restore failed: {error}");
         }
         if let Some(run) = record.autonomous_run.as_ref() {
             self.execution_mode = crate::autonomous::ExecutionMode::Autonomous;
@@ -3166,10 +3073,6 @@ impl EventSink for SessionEventSink {
             EngineEvent::Error(payload) => self.emit_scoped("error", payload),
             EngineEvent::Status(payload) => ipc::emit_status(&self.app, payload),
             EngineEvent::AutonomousRun(payload) => self.emit_scoped("autonomous_run", payload),
-            EngineEvent::Workflow(payload) => self.emit_scoped("workflow", *payload),
-            EngineEvent::InterruptedRequest(payload) => {
-                self.emit_scoped("interrupted_request", *payload)
-            }
             EngineEvent::Wiki(payload) => ipc::emit_wiki(&self.app, payload),
             EngineEvent::SessionLoaded(payload) => ipc::emit_session_loaded(&self.app, payload),
         };
@@ -4250,25 +4153,6 @@ impl SessionEngineManager {
         let binding = BindingSnapshot::from_binding(&record.provider_binding, None)
             .map_err(|error| AgentEngineError::new(error.to_string()))?;
         if record.meta.kind == crate::session::SessionKind::Eps {
-            let delegation_sink = sink.clone();
-            runtime.set_delegation_emitter(move |event| {
-                delegation_sink
-                    .emit_scoped("delegation", event)
-                    .map_err(|error| format!("failed to emit delegation event: {error}"))
-            });
-            let context = delegation::ReadDelegationContext {
-                dirs: self.inner.dirs.clone(),
-                fallback_cwd: self.inner.fallback_cwd.clone(),
-                binding: binding.clone(),
-                tools: runtime.clone(),
-                sink: sink.clone(),
-                sessions: self.inner.sessions.clone(),
-                session_id: session_id.to_string(),
-                cancellation: cancellation_rx.clone(),
-            };
-            runtime.set_delegation_executor(move |delegation| {
-                Box::pin(context.clone().run(delegation))
-            });
             let team = team::TeamHandoffContext {
                 app: self.inner.app.clone(),
                 dispatcher: self.inner.team_dispatcher.clone(),
@@ -4741,41 +4625,6 @@ impl SessionEngineManager {
         self.drive_pending_write(worker).await
     }
 
-    async fn workflow_resume(&self, session_id: &str) -> Result<(), AgentEngineError> {
-        let worker = self.worker(session_id).await?;
-        let _provider_busy = self.inner.provider_service.enter_busy(worker.provider);
-        worker
-            .runtime
-            .emit_activity(crate::write_coordinator::SessionActivity::RunningRead);
-        let result = {
-            let mut engine = worker.engine.lock().await;
-            engine.workflow_resume().await
-        };
-        self.finish_read_command(&worker, result).await
-    }
-
-    async fn workflow_restart(&self, session_id: &str) -> Result<(), AgentEngineError> {
-        let worker = self.worker(session_id).await?;
-        let text = {
-            let mut engine = worker.engine.lock().await;
-            let text = engine.workflow_restart()?;
-            engine.update_active_session().await;
-            text
-        };
-        drop(worker);
-        self.chat(
-            session_id,
-            ipc::ChatRequest {
-                client_turn_id: ipc::new_client_turn_id(),
-                text,
-                attachments: Vec::new(),
-                mentions: Vec::new(),
-                execution_mode: crate::autonomous::ExecutionMode::Interactive,
-                autonomous_policy: None,
-            },
-        )
-        .await
-    }
 
     async fn changeset_decision(
         &self,
@@ -5024,8 +4873,6 @@ impl SessionEngineManager {
             context_state: Default::default(),
             task_state: Default::default(),
             autonomous_run: None,
-            workflow: None,
-            interrupted_workflow: None,
             team_tasks: Vec::new(),
         };
         self.inner
@@ -5352,27 +5199,6 @@ pub(crate) async fn engine_plan_approve(
         .map_err(|error| error.message)
 }
 
-#[tauri::command(rename = "workflow_resume")]
-pub(crate) async fn engine_workflow_resume(
-    state: tauri::State<'_, SessionEngineManager>,
-    session_id: String,
-) -> Result<(), String> {
-    state
-        .workflow_resume(&session_id)
-        .await
-        .map_err(|error| error.message)
-}
-
-#[tauri::command(rename = "workflow_restart")]
-pub(crate) async fn engine_workflow_restart(
-    state: tauri::State<'_, SessionEngineManager>,
-    session_id: String,
-) -> Result<(), String> {
-    state
-        .workflow_restart(&session_id)
-        .await
-        .map_err(|error| error.message)
-}
 
 #[tauri::command(rename = "changeset_decision")]
 pub(crate) async fn engine_changeset_decision(
@@ -5711,11 +5537,10 @@ fn static_prompt_baseline() -> String {
         RESOURCE_MENTION_GUIDE.to_string(),
         AUDIO_SOUND_GUIDE.to_string(),
         MAP_HANDOFF_GUIDE.to_string(),
-        DELEGATION_GUIDE.to_string(),
         EVIDENCE_GUIDE.to_string(),
         MESSAGE_FORMAT_INSTRUCTIONS.to_string(),
         INTERACTION_GUIDE.to_string(),
-        TRIAGE_INSTRUCTIONS.to_string(),
+        COMPLETION_GUIDE.to_string(),
     ]
     .join("\n\n")
 }
@@ -5929,9 +5754,6 @@ fn short_sha(sha: &str) -> String {
 }
 
 const CONDENSED_TRANSCRIPT_CAP_CHARS: usize = 8000;
-/// The same log for a stage job, which routes a request instead of
-/// continuing the work itself.
-const RECENT_TRANSCRIPT_CAP_CHARS: usize = 2500;
 
 /// Parse the native project name out of a `[project state]` prompt render.
 /// Returns `""` when absent or unavailable.
@@ -5955,12 +5777,6 @@ fn project_name_from_state(project_state: &str) -> String {
 /// any missing/odd shape simply yields fewer lines (never panics).
 fn condense_transcript(panel_log: &serde_json::Value) -> String {
     condense_transcript_with_cap(panel_log, CONDENSED_TRANSCRIPT_CAP_CHARS)
-}
-
-/// The conversation so far, condensed for a stage job that only needs to know
-/// what this session was doing. Bounded far tighter than a replay.
-fn recent_transcript(panel_log: &serde_json::Value) -> String {
-    condense_transcript_with_cap(panel_log, RECENT_TRANSCRIPT_CAP_CHARS)
 }
 
 /// The durable panel log rendered for the model under a character bound.
@@ -6330,10 +6146,6 @@ mod tests {
         thread_id: Arc<Mutex<Option<String>>>,
         seeded: Arc<Mutex<Vec<String>>>,
         workspace: Arc<Mutex<Option<PreparedWorkspace>>>,
-        /// Scripted stage-job results in order. When empty, triage defaults to
-        /// `direct` so ordinary foreground fixtures keep their pre-workflow shape.
-        scripted_delegated: Arc<Mutex<VecDeque<crate::provider_runtime::DelegatedRunOutcome>>>,
-        delegated_requests: Arc<Mutex<Vec<(crate::provider_runtime::DelegatedRunKind, String)>>>,
     }
 
     impl FakeCodexDriver {
@@ -6342,8 +6154,6 @@ mod tests {
                 prompts: Arc::new(Mutex::new(Vec::new())),
                 image_paths: Arc::new(Mutex::new(Vec::new())),
                 scripted_turns: Arc::new(Mutex::new(turns.into_iter().collect())),
-                scripted_delegated: Arc::new(Mutex::new(VecDeque::new())),
-                delegated_requests: Arc::new(Mutex::new(Vec::new())),
                 compiler_prompts: Arc::new(Mutex::new(Vec::new())),
                 compiler_workspaces: Arc::new(Mutex::new(Vec::new())),
                 scripted_compilers: Arc::new(Mutex::new(VecDeque::new())),
@@ -6367,25 +6177,6 @@ mod tests {
 
         pub(super) fn prompts(&self) -> Vec<String> {
             self.prompts.lock().expect("prompts lock").clone()
-        }
-
-        pub(super) fn script_delegated(
-            &self,
-            outcomes: impl IntoIterator<Item = crate::provider_runtime::DelegatedRunOutcome>,
-        ) {
-            self.scripted_delegated
-                .lock()
-                .expect("delegated queue lock")
-                .extend(outcomes);
-        }
-
-        pub(super) fn delegated_requests(
-            &self,
-        ) -> Vec<(crate::provider_runtime::DelegatedRunKind, String)> {
-            self.delegated_requests
-                .lock()
-                .expect("delegated requests lock")
-                .clone()
         }
 
         fn image_paths(&self) -> Vec<Vec<PathBuf>> {
@@ -6601,44 +6392,6 @@ mod tests {
                         RunOutcome::IterationBoundary {
                             reason,
                             conversation: self.conversation_state(),
-                        }
-                    }
-                }
-            })
-        }
-
-        fn run_delegated(
-            &mut self,
-            request: crate::provider_runtime::DelegatedRunRequest,
-        ) -> crate::provider_runtime::AdapterFuture<'_, crate::provider_runtime::DelegatedRunOutcome>
-        {
-            Box::pin(async move {
-                self.delegated_requests
-                    .lock()
-                    .expect("delegated requests lock")
-                    .push((request.kind, request.prompt.clone()));
-                let scripted = self
-                    .scripted_delegated
-                    .lock()
-                    .expect("delegated queue lock")
-                    .pop_front();
-                match scripted {
-                    Some(outcome) => outcome,
-                    None => {
-                        assert_eq!(
-                            request.kind,
-                            crate::provider_runtime::DelegatedRunKind::Triage,
-                            "only triage has a default fixture result"
-                        );
-                        crate::provider_runtime::DelegatedRunOutcome::Result {
-                            value: json!({
-                                "route": "direct",
-                                "goal": "fixture direct change",
-                                "acceptanceCriteria": [],
-                                "rationale": "fixture default"
-                            }),
-                            completions: 1,
-                            usage: None,
                         }
                     }
                 }
@@ -6872,27 +6625,6 @@ mod tests {
                 RunOutcome::Completed {
                     text: format!("{} done", self.label),
                     conversation: self.conversation_state(),
-                }
-            })
-        }
-
-        fn run_delegated(
-            &mut self,
-            _request: crate::provider_runtime::DelegatedRunRequest,
-        ) -> crate::provider_runtime::AdapterFuture<'_, crate::provider_runtime::DelegatedRunOutcome>
-        {
-            // Triage routes every gate fixture request directly so the
-            // foreground gate remains the serialization witness.
-            Box::pin(async {
-                crate::provider_runtime::DelegatedRunOutcome::Result {
-                    value: json!({
-                        "route": "direct",
-                        "goal": "gate fixture",
-                        "acceptanceCriteria": [],
-                        "rationale": "fixture"
-                    }),
-                    completions: 1,
-                    usage: None,
                 }
             })
         }
@@ -7137,8 +6869,6 @@ mod tests {
             context_state: Default::default(),
             task_state: Default::default(),
             autonomous_run: None,
-            workflow: None,
-            interrupted_workflow: None,
             team_tasks: Vec::new(),
         };
         store.save(&record).unwrap();
@@ -7705,6 +7435,39 @@ mod tests {
         assert_eq!(failed_handle.acknowledgement_count(), 0);
     }
 
+    #[test]
+    fn a_bounded_transcript_keeps_the_newest_rows_and_marks_the_cut() {
+        let log = serde_json::json!({
+            "schemaVersion": 2,
+            "log": (1..=40)
+                .map(|index| serde_json::json!({
+                    "seq": index,
+                    "kind": if index % 2 == 0 { "agent" } else { "you" },
+                    "text": format!("message {index:02} 내용")
+                }))
+                .collect::<Vec<_>>()
+        });
+
+        let condensed = super::condense_transcript_with_cap(&log, 120);
+
+        // A turn that continues a conversation needs how it ended. A head-first
+        // cut would hand the model the opening of a long session and none of
+        // the work it is being asked to continue.
+        assert!(condensed.starts_with("[prior conversation]\n(앞부분 생략)"));
+        assert!(condensed.contains("message 40"));
+        assert!(!condensed.contains("message 01"));
+        assert!(condensed.chars().count() <= 240);
+    }
+
+    #[test]
+    fn an_empty_or_toolonly_panel_log_condenses_to_nothing() {
+        assert!(super::condense_transcript(&serde_json::json!({"log": []})).is_empty());
+        assert!(super::condense_transcript(&serde_json::json!({
+            "log": [{"kind": "tool", "text": "read_file"}, {"kind": "you", "text": "   "}]
+        }))
+        .is_empty());
+    }
+
     #[tokio::test]
     async fn invalid_persisted_continuation_preserves_review_without_replay() {
         let driver = FakeCodexDriver::scripted([]);
@@ -7924,13 +7687,7 @@ mod tests {
             .await
             .expect("propose_plan turn should run");
 
-        // Workflow projections interleave with the v2 events; only the
-        // answer/plan events carry the turn outcome.
-        let events = sink_handle
-            .events()
-            .into_iter()
-            .filter(|event| !matches!(event, EngineEvent::Workflow(_)))
-            .collect::<Vec<_>>();
+        let events = sink_handle.events();
         assert!(
             matches!(
                 events.as_slice(),
@@ -9115,7 +8872,6 @@ mod tests {
         for section in [
             "[first principles]",
             "[map handoff]",
-            "[delegation]",
             "[evidence]",
             "[message format]",
             "[reference context]",
@@ -9126,13 +8882,7 @@ mod tests {
             );
         }
         assert!(prompt.contains("docs_get"));
-        assert!(prompt.contains("zero `newCount`"));
         assert!(prompt.contains("source_search"));
-        // The registry advertises delegate_read as a read tool and the guide
-        // pins its limits: summaries are hints, never mutation evidence.
-        assert!(prompt.contains("- delegate_read — "));
-        assert!(prompt.contains("never mutation evidence"));
-        assert!(prompt.contains("at most 8 delegations"));
         // Placement work is handed to the Map Agent, never declared impossible;
         // the candidate is inspected before this session applies it.
         assert!(prompt.contains("- map_task_request — "));
@@ -9151,79 +8901,21 @@ mod tests {
     }
 
     #[test]
-    fn context_pressure_continuation_points_exploration_at_delegate_read() {
+    fn context_pressure_continuation_tells_the_next_iteration_to_stop_widening() {
         let previous = AgentTurnInput::text("x");
         let pressured =
             AgentEngine::<FakeCodexDriver, CapturingEventSink>::interactive_continuation_turn(
                 &previous,
                 crate::provider_runtime::IterationBoundaryReason::ContextPressure,
             );
-        assert!(pressured.text.contains("delegate_read"));
+        assert!(pressured.text.contains("넓은 탐색을 더 벌이지 말고"));
         assert!(pressured.text.contains("직접 다시 읽어야"));
         let other =
             AgentEngine::<FakeCodexDriver, CapturingEventSink>::interactive_continuation_turn(
                 &previous,
                 crate::provider_runtime::IterationBoundaryReason::ProviderContinuation,
             );
-        assert!(!other.text.contains("delegate_read"));
-    }
-
-    #[test]
-    fn read_delegation_request_inherits_the_parent_and_never_holds_a_write_ticket() {
-        let parent = RunIdentity {
-            session_id: "s".to_string(),
-            run_id: RunId::new(5),
-            request_id: "req".to_string(),
-            session_kind: crate::session::SessionKind::Eps,
-            cancellation_generation: 2,
-        };
-        let child = RunIdentity {
-            run_id: RunId::new(6),
-            ..parent.clone()
-        };
-        let binding = BindingSnapshot::from_binding(
-            &crate::provider::ProviderBinding {
-                provider: crate::provider::ProviderId::Ollama,
-                model: "m".to_string(),
-                reasoning: None,
-                base_url: Some("http://127.0.0.1:11434".to_string()),
-                conversation: crate::provider::ProviderConversationState::empty(
-                    crate::provider::ProviderId::Ollama,
-                ),
-            },
-            None,
-        )
-        .unwrap();
-        let request = super::delegation::read_delegation_request(
-            &crate::tool_exec::ReadDelegation {
-                identity: child.clone(),
-                parent_run_id: parent.run_id,
-                goal: "goal".to_string(),
-                focus: vec!["src/a.eps".to_string()],
-            },
-            &binding,
-            PathBuf::from("root"),
-            Some(PathBuf::from("tmp")),
-        )
-        .unwrap();
-        assert_eq!(request.identity, child);
-        assert_eq!(request.parent_run_id, Some(parent.run_id));
-        assert_eq!(
-            request.kind,
-            crate::provider_runtime::DelegatedRunKind::Read
-        );
-        assert!(!request.allow_live_write_ticket);
-        assert_eq!(
-            request.policy.active_deadline,
-            Some(crate::tools::DELEGATE_READ_TIMEOUT)
-        );
-        assert!(request.profile.allows("read_file"));
-        assert!(!request.profile.allows(crate::tools::DELEGATE_READ_TOOL));
-        assert!(request.prompt.contains("[goal]\ngoal"));
-        assert_eq!(
-            request.binding.conversation,
-            crate::provider::ProviderConversationState::empty(binding.provider)
-        );
+        assert!(!other.text.contains("넓은 탐색"));
     }
 
     #[test]
@@ -9239,9 +8931,12 @@ mod tests {
         assert!(prompt.contains(
             "Call propose_plan(markdown) only when the user explicitly asks you to write a plan"
         ));
-        assert!(prompt.contains("Every request is triaged before this turn"));
-        assert!(!prompt.contains("regardless of its size"));
-        assert!(!prompt.contains("3+ mutations"));
+        // A green build is not gameplay: only the user can say the map works.
+        assert!(prompt.contains("It does NOT mean the map plays correctly"));
+        assert!(prompt.contains("naming what the user should check in game"));
+        // Nothing triages, researches or reviews for this turn any more.
+        assert!(!prompt.contains("triaged"));
+        assert!(!prompt.contains("separate stages"));
     }
 
     #[test]
@@ -9637,8 +9332,6 @@ mod tests {
             context_state: Default::default(),
             task_state: Default::default(),
             autonomous_run: None,
-            workflow: None,
-            interrupted_workflow: None,
             team_tasks: Vec::new(),
         };
         sessions.save(&record).unwrap();

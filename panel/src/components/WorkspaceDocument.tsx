@@ -46,11 +46,6 @@ export interface WorkspaceDocumentProps {
 // first time an EPS tab opens.
 const MonacoEditor = lazy(() => import("@/components/MonacoEditor"));
 
-const STAGE_REPORT_DIRS = [
-  `${WORKSPACE_DOCUMENT_PREFIX}research/`,
-  `${WORKSPACE_DOCUMENT_PREFIX}verify/`,
-];
-
 /** Header badge: trusted document state, else what kind of file this is. */
 function trustLabel(path: string, file: WorkspaceFileEntry | null): string {
   if (file?.state === "approved" && file.revision) {
@@ -58,9 +53,6 @@ function trustLabel(path: string, file: WorkspaceFileEntry | null): string {
   }
   if (file?.state === "accepted" && file.revision) {
     return `확정됨 · r${file.revision}`;
-  }
-  if (STAGE_REPORT_DIRS.some((dir) => path.startsWith(dir))) {
-    return "작업 보고서";
   }
   if (path.startsWith(WORKSPACE_DOCUMENT_PREFIX)) return "검토 대상 문서";
   return "프로젝트 파일";

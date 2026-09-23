@@ -101,16 +101,16 @@ describe("WorkspaceDocument", () => {
     expect(screen.getByText("승인된 계획 · r2")).toBeInTheDocument();
   });
 
-  it("renders a stage report as Markdown from its tab path even when unlisted", () => {
+  it("renders an unlisted workspace document as Markdown from its tab path", () => {
     const { view } = renderDocument({
-      path: `${D}research/req-1.md`,
+      path: `${D}decisions/req-1.md`,
       file: null,
       content: "# 조사 보고\n\n트리거 3개를 확인했습니다.",
     });
     expect(view.container.querySelector("pre")).toBeNull();
     expect(screen.getByRole("heading", { name: "조사 보고" })).toBeInTheDocument();
-    expect(screen.getByText(`${D}research/req-1.md`)).toBeInTheDocument();
-    expect(screen.getByText("작업 보고서")).toBeInTheDocument();
+    expect(screen.getByText(`${D}decisions/req-1.md`)).toBeInTheDocument();
+    expect(screen.getByText("검토 대상 문서")).toBeInTheDocument();
   });
 
   it("opens EPS source in a read-only Monaco surface with the TypeScript grammar", async () => {

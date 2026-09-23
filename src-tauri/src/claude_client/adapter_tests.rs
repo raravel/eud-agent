@@ -205,7 +205,10 @@ exit 0
     while let Ok(event) = events_rx.try_recv() {
         kinds.push(event.kind);
     }
+    // The resumable session is published before any output, so an interruption
+    // still leaves the run a native continuation boundary.
     assert!(matches!(kinds.as_slice(), [
+        AdapterEventKind::NativeSessionStarted { session_id },
         AdapterEventKind::ResponseStarted { .. },
         AdapterEventKind::Block(NormalizedBlock::Reasoning { text, .. }),
         AdapterEventKind::NativeToolObservation { mcp_server: Some(server), name, call_id: Some(completed_id), arguments: Some(arguments), status: Some(completed), .. },
@@ -213,7 +216,7 @@ exit 0
         AdapterEventKind::Block(NormalizedBlock::Text { text: answer, .. }),
         AdapterEventKind::Usage(_),
         AdapterEventKind::ResponseFinished { complete: true, .. },
-    ] if text == "reason" && name == "mcp__eud-tools__read_file" && server == "eud-tools" && result_server == "eud-tools" && completed_id == "call-1" && arguments == &json!({}) && completed == "started" && result_id == "call-1" && result == "ok" && result_status == "completed" && answer == "answer"));
+    ] if session_id == "native-session" && text == "reason" && name == "mcp__eud-tools__read_file" && server == "eud-tools" && result_server == "eud-tools" && completed_id == "call-1" && arguments == &json!({}) && completed == "started" && result_id == "call-1" && result == "ok" && result_status == "completed" && answer == "answer"));
     let context = kinds
         .iter()
         .find_map(|kind| match kind {
@@ -292,6 +295,11 @@ exit 0
     assert!(!args.iter().any(|value| value == "--mcp-config"));
     let tools_index = args.iter().position(|value| value == "--tools").unwrap();
     assert_eq!(args.get(tools_index + 1).and_then(Value::as_str), Some(""));
+    // Compaction runs in the same resumed session and publishes it too.
+    assert!(matches!(
+        compact_events_rx.recv().await.unwrap().kind,
+        AdapterEventKind::NativeSessionStarted { ref session_id } if session_id == "native-session"
+    ));
     assert!(matches!(
         compact_events_rx.recv().await.unwrap().kind,
         AdapterEventKind::ResponseStarted { .. }

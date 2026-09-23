@@ -336,6 +336,31 @@ OpenCode Go / Ollama / Antigravity는 네이티브 도구가 원천적으로 없
     마지막 시도는 원래 오류를 그대로 보고하므로 진짜 권한 문제는 여전히 실패한다.
   - 수정 후 같은 조합을 8회 반복해 8/8 통과.
 
+- **Phase 4 — 파이프라인 제거 (2026-09-23).**
+  - 파일째 삭제: `workflow.rs`(1,701), `engine/workflow_stages.rs`(1,275), `engine/workflow_tests.rs`,
+    `engine/delegation.rs`, `provider_runtime/runtime/delegated.rs`,
+    `contract_tests/{delegated_runs,native_delegated}.rs`, `provider_tool_loop/profile.rs`.
+  - 엔진에서 제거: triage/clarify/route-note, 계획 스테이지 경유, verify 루프, `workflow` 이벤트,
+    세션의 `workflow`/`interrupted_workflow` durable 상태, `workflow_resume`/`workflow_restart`
+    명령, `InterruptedRequest` 투영, 시작 시 `recover_interrupted_workflows`.
+  - 도구에서 제거: `delegate_read`와 그 런타임(`DelegationState`, `is_delegated_child`,
+    실행 경로의 `delegated` 플래그), `DelegatedRun{Kind,Request,Outcome}`,
+    `DelegatedRunExecutor`, `DelegatedToolProfile`/`ToolProfile::Delegated`/`RunGate::delegated`와
+    submission-only 라운드, `delegation` 패널 이벤트.
+  - **evidence gate 제거.** `search_docs`를 쓰기 전에 강제하던 규칙은 "모델이 프로젝트를
+    자연스럽게 못 본다"의 증상이었다. 자유 CRUD가 원인을 없앴으므로 게이트는 의식만 남는다.
+  - 존치 확인: `propose_plan`과 계획 승인 경로, `prepared_workspace`(승인 경로가 쓴다 —
+    `workflow_stages`에서 `engine.rs`로 옮겼다), 팀 핸드오프(`map_task_request`) 전체,
+    구조화 작업(`StructuredJobExecutor`), 리비전 해시, `ProjectWriteCoordinator`, MapSafe.
+  - **프롬프트 재작성.** `INTRO`에서 "journals every mutation"을, `WORKSPACE_GUIDE`에서
+    "쓸 수 있는 경로는 `.tmp` 뿐"·"구현 턴에는 문서를 건드리지 말라"를 걷고 §N2 경계와
+    손으로 `dat/*.json`을 고칠 때의 `before` 규칙을 넣었다. `[triage]` 섹션은
+    `[completion]`으로 대체했다: **녹색 빌드는 컴파일이지 게임 동작이 아니다**,
+    바뀐 턴은 사람이 게임에서 무엇을 확인해야 하는지 구체적으로 적고 끝낸다(§N5).
+    `DELEGATION_GUIDE`도 사라졌다 — 없는 도구의 사용법이었다.
+  - §8 미결 4는 **현행 유지**로 결정: `autonomous_completion_blocker`는 그대로
+    "런타임 변경이 있으면 현재 리비전의 성공한 빌드"만 요구한다.
+
 Phase 1–2를 3보다 먼저 두는 이유: **되돌리기 수단과 경계 검증이 먼저 서 있어야** 자유 CRUD를
 열어도 안전하다. 어느 Phase에서 중단해도 제품은 동작 가능한 상태로 남는다.
 

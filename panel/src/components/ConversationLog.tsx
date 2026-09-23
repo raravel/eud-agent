@@ -97,9 +97,6 @@ const SUGGESTIONS: readonly string[] = [
 /** Phases in which a live progress entry should still spin (v2: a turn in flight). */
 const BUSY_PHASES: ReadonlySet<Phase> = new Set<Phase>([
   "thinking",
-  "research",
-  "planning",
-  "verifying",
   "plan_review",
 ]);
 
