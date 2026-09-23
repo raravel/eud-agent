@@ -403,6 +403,7 @@ pub fn run() {
             rag_panel::rag_search,
             rag_panel::rag_article,
             map_agent::map_agent_open,
+            map_agent::map_agent_open_properties,
             map_agent::map_task_apply_undo,
             map_import::map_agent_import_open,
             map_import::map_import_bootstrap,

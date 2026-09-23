@@ -3054,6 +3054,12 @@ export default function App() {
     });
   }, []);
 
+  const handleOpenMapProperties = useCallback(() => {
+    void invoke("map_agent_open_properties").catch(() => {
+      toast.error("맵 속성 창을 열지 못했습니다.");
+    });
+  }, []);
+
   const handleMemorySave = useCallback(
     async ({ file, content }: { file: MemoryFile; content: string }) => {
       const sent = await clientRef.current?.send({
@@ -3333,6 +3339,7 @@ export default function App() {
           projectAvailable={projectState.projectAvailable}
           hasProject={projectState.hasProject}
           onOpenMapAgent={() => handleOpenMapAgent()}
+          onOpenMapProperties={handleOpenMapProperties}
           onOpenScmdraft={() => void handleOpenScmdraft()}
           projectPanelOpen={projectSidebarOpen}
           onProjectPanelToggle={handleProjectPanelToggle}

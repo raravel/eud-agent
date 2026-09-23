@@ -12,6 +12,7 @@ import {
   PanelRightClose,
   PanelRightOpen,
   Settings,
+  SlidersHorizontal,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
@@ -45,6 +46,8 @@ export interface HeaderProps {
   hasProject?: boolean;
   /** Open or focus the separate Map Agent workbench window. */
   onOpenMapAgent?: () => void;
+  /** Open the Map window on its "맵 속성" dialog (제목·설명·플레이어·포스). */
+  onOpenMapProperties?: () => void;
   /** Open the project's source map in the configured SCMDraft 2 (설정 → 컴파일). */
   onOpenScmdraft?: () => void;
   /** Toggle the project tools sidebar. */
@@ -150,6 +153,7 @@ export function Header({
   projectAvailable = false,
   hasProject = true,
   onOpenMapAgent,
+  onOpenMapProperties,
   onOpenScmdraft,
   onProjectPanelToggle,
   projectPanelOpen = false,
@@ -208,6 +212,20 @@ export function Header({
           >
             <MapIcon className="size-4" aria-hidden="true" />
             맵 에이전트
+          </Button>
+        )}
+        {onOpenMapProperties && (
+          <Button
+            type="button"
+            size="default"
+            variant="outline"
+            className="gap-1.5"
+            disabled={!projectAvailable || !hasProject}
+            title="맵 창에서 제목·설명·플레이어 슬롯·포스를 수정합니다"
+            onClick={onOpenMapProperties}
+          >
+            <SlidersHorizontal className="size-4" aria-hidden="true" />
+            맵 속성
           </Button>
         )}
         {onOpenScmdraft && (

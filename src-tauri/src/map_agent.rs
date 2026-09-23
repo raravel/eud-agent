@@ -64,6 +64,9 @@ pub struct MapAgentService {
     /// The Map session the next window bootstrap should load instead of the
     /// default resolution; set by `open_map_window` when it creates the window.
     pending_open_session: Arc<Mutex<Option<String>>>,
+    /// Set when the main window's header asked for the "맵 속성" dialog and the
+    /// Map window had to be created first; the next bootstrap takes it.
+    pending_open_properties: Arc<Mutex<bool>>,
 }
 
 #[derive(Clone, Copy)]
@@ -100,6 +103,9 @@ pub struct MapBootstrapResponse {
     /// The session's latest Map run (in flight, or ended after the window last
     /// saw it) so the window shows it like a request typed there.
     pub pending_run: Option<crate::engine::MapRunTranscript>,
+    /// Set when this window was opened by the main window's "맵 속성" header
+    /// action, so it shows the properties dialog as soon as it is ready.
+    pub open_properties: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -304,6 +310,7 @@ impl MapAgentService {
             attachments,
             images: MapImageService::new(),
             pending_open_session: Arc::new(Mutex::new(None)),
+            pending_open_properties: Arc::new(Mutex::new(false)),
         }
     }
 
@@ -1764,6 +1771,7 @@ async fn bootstrap_map_session(
         session: resolution.session,
         conversation_resume_error,
         pending_run,
+        open_properties: std::mem::take(&mut *service.pending_open_properties.lock()),
     })
 }
 
@@ -1987,6 +1995,31 @@ pub async fn map_agent_open(
     session_id: Option<String>,
 ) -> Result<(), String> {
     open_map_window(&app, session_id.as_deref())
+}
+
+/// The event an already-open Map window receives when the main window's
+/// header asked for the "맵 속성" dialog.
+pub(crate) const MAP_OPEN_PROPERTIES_EVENT: &str = "map-agent-open-properties";
+
+/// Open or focus the Map window on its "맵 속성" dialog. Scenario properties
+/// stay a Map-window request — the save still runs through that window's
+/// session, verification and Undo — so the main window's header only carries
+/// the intent there.
+#[tauri::command]
+pub async fn map_agent_open_properties(app: tauri::AppHandle) -> Result<(), String> {
+    if let Some(window) = app.get_webview_window(MAP_WINDOW_LABEL) {
+        window.show().map_err(|error| error.to_string())?;
+        window.set_focus().map_err(|error| error.to_string())?;
+        window
+            .emit(MAP_OPEN_PROPERTIES_EVENT, ())
+            .map_err(|error| error.to_string())?;
+        return Ok(());
+    }
+    let service = app.state::<MapAgentService>();
+    *service.pending_open_properties.lock() = true;
+    open_map_window(&app, None).inspect_err(|_| {
+        *service.pending_open_properties.lock() = false;
+    })
 }
 
 #[tauri::command]

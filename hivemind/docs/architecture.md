@@ -78,7 +78,12 @@ The manifest itself uses `.eap` (EUD Agent Project); there is no separate launch
   properties authority (the only authority allowed to change `SPRP/OWNR/IOWN/SIDE/FORC`), then
   runs the ordinary `MapSafe::apply` + `complete_apply`, so the source map changes immediately
   and the Map window's Undo restores the exact backup. It refuses while a candidate revision or
-  request exists.
+  request exists. The wizard's title/description/slot/force choices are therefore editable for the
+  life of the project. The main window's header carries the same request
+  (`map_agent_open_properties`): it focuses or creates the Map window and opens that dialog
+  there — through `MAP_OPEN_PROPERTIES_EVENT` when the window already exists, otherwise through
+  the bootstrap's `openProperties` — so the save keeps its one session, verification, and Undo
+  owner instead of gaining a second.
 - "SCMDraft 2로 열기" is a main-window header action (`project_open_scmdraft`): it launches
   `config.scmdraft_path` on the project's source map, and when the executable is unset or gone
   it returns `unconfigured` so the panel opens 설정 → 컴파일 in place instead of showing a hint.

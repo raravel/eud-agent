@@ -239,6 +239,8 @@ export interface MapBootstrapResponse {
   conversationResumeError?: string | null;
   /** The session's latest Map run, so the window shows it like a request typed here. */
   pendingRun?: MapRunTranscript | null;
+  /** Set when the main window's "맵 속성" header action opened this window. */
+  openProperties?: boolean;
 }
 
 /** Who started a Map run: this window's user or an EPS session's `map_task_request`. */

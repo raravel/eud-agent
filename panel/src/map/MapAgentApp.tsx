@@ -1234,6 +1234,7 @@ export default function MapAgentApp() {
         next = await mapBootstrap();
       }
       await applyBootstrap(next);
+      if (next.openProperties === true) setPropertiesOpen(true);
       setError("");
     } catch (reason) {
       overlayRefreshRef.current += 1;
@@ -1366,6 +1367,17 @@ export default function MapAgentApp() {
     });
     return () => unlisten?.();
   }, [loadSession]);
+
+  // The main window's header asked this already-open window for 맵 속성.
+  useEffect(() => {
+    let unlisten: UnlistenFn | undefined;
+    void listen("map-agent-open-properties", () => {
+      setPropertiesOpen(true);
+    }).then((dispose) => {
+      unlisten = dispose;
+    });
+    return () => unlisten?.();
+  }, []);
 
   const renameSession = useCallback(async (sessionId: string, name: string) => {
     try {
