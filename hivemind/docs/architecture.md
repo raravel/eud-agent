@@ -59,6 +59,13 @@ The manifest itself uses `.eap` (EUD Agent Project); there is no separate launch
 - `JournalStore`: durable semantic before/after records and reverse-order rollback through the native runtime.
 - `WorkspaceManager`: durable project-local agent documents and trusted turn baselines; the provider CLI cwd is the native project root, so there is no session mirror.
 - `MapSafe`: native build marker, Windows no-share probe, backup, isom mutation, verification, rollback.
+- `isom::game_asset`: one verbatim read of an installed StarCraft asset out of CASC/MPQ, uninterpreted
+  by the native shim. `iscript_info` builds on it in Rust: it parses `scripts\iscript.bin` for the
+  animation slots an existing iscript declares (slots `0..=type` padded to an even array length, so
+  most overlay scripts carry only Init and Death) and `arr\images.tbl` for the GRP name of each image
+  whose effective `Iscript ID` selects that script. The parse is strict — bad magic, a truncated
+  header, an out-of-range slot offset, or two headers whose slot arrays overlap are errors, never a
+  silently shortened slot list.
 - `CandidateStore`: per-session baseline snapshot, operation-manifest revisions, and the current
   candidate map. The saved source is the authority a session follows: `follow_source` runs at every
   open/state/request/apply boundary and, when the source hash moved, replays the session's revisions

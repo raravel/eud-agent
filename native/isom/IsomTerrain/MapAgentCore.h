@@ -37,6 +37,11 @@ int catalogQuery(
     std::size_t requestLength,
     std::string& resultJson);
 
+int gameAsset(
+    const char* starCraftPath,
+    const char* archivePath,
+    std::vector<std::uint8_t>& result);
+
 int imageQuantize(
     const char* starCraftPath,
     std::uint16_t tileset,

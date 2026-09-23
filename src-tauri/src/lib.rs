@@ -32,6 +32,7 @@ pub mod git;
 pub mod harness;
 pub mod harness_import;
 pub mod ipc;
+pub mod iscript;
 pub mod journal;
 pub mod map_agent;
 pub mod map_candidate;

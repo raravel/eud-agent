@@ -41,6 +41,13 @@
 - Maximum patch size is 300. Prefer one bounded batch over individual calls.
 - Standard DAT, XDAT, TBL, requirements, and buttons remain separate sparse documents.
 - Reset removes the sparse override and restores catalog behavior.
+- images.dat's `Iscript ID` selects an EXISTING script, and which animation slots
+  that script carries lives only in the installed `scripts\iscript.bin`. The model
+  reads them with `iscript_info`, never by inference from an ID→name list: a
+  script's header declares slots `0..=type` padded to an even length, so most
+  overlay scripts carry only Init and Death. Never present a slot the file does
+  not declare as available, and never repoint an image without checking the slots
+  it needs.
 
 ## E3S compatibility
 

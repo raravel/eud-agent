@@ -27,7 +27,7 @@ extern "C" {
 
 /* ABI version of this shim. Bump on any breaking change to the signatures or
  * the ops/buffer encoding below. The Rust side asserts this at startup. */
-#define ISOM_ABI_VERSION 7
+#define ISOM_ABI_VERSION 8
 
 /* Error codes returned by the isom_* functions. 0 == success. */
 enum IsomStatus {
@@ -127,6 +127,21 @@ int isom_catalog_query(
     size_t request_len,
     uint8_t** out_json,
     size_t* out_json_len);
+
+/* Read ONE raw asset out of the installed StarCraft data (CASC/MPQ), verbatim.
+ *   starcraft_path : UTF-8, NUL-terminated StarCraft install folder.
+ *   archive_path   : UTF-8, NUL-terminated archive-internal path using the
+ *                    archive's own separators, e.g. "scripts\\iscript.bin".
+ *   out            : receives a malloc'd buffer with the asset bytes (isom_free).
+ *   out_len        : receives the buffer length in bytes.
+ * The bytes are NOT interpreted here; the caller owns the format. Returns 0 on
+ * success, nonzero IsomStatus otherwise (a missing asset is ISOM_ERR_ENGINE with
+ * the reason in the returned buffer). */
+int isom_game_asset(
+    const char* starcraft_path,
+    const char* archive_path,
+    uint8_t** out,
+    size_t* out_len);
 
 /* Return the file/container digest including named extra MPQ asset hashes. */
 int isom_map_digest(

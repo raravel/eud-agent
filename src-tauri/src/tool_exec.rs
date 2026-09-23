@@ -9,7 +9,7 @@
 //! validation and safety gates, and journals every project write for review.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     mpsc, Arc,
@@ -95,6 +95,10 @@ const SOURCE_SEARCH_MAX_LIMIT: usize = 100;
 const SOURCE_SEARCH_MAX_CONTEXT_LINES: usize = 20;
 const SOURCE_SEARCH_MAX_QUERY_CHARS: usize = 256;
 const MAP_PALETTE_QUERY_MAX_MATCHES: usize = 256;
+/// images.dat field selecting an EXISTING iscript (`images.def` parameter 7).
+const IMAGE_ISCRIPT_FIELD: &str = "Iscript ID";
+/// images.dat field holding the 1-based images.tbl index of the image's GRP.
+const IMAGE_GRP_FIELD: &str = "GRP File";
 
 /// Native euddraft build-state probe used by map-write safety rails.
 #[derive(Clone)]
@@ -2413,6 +2417,88 @@ impl SessionToolRuntime {
                     .collect();
                 Ok(json!({"count": results.len(), "results": results}))
             }
+            crate::tools::ISCRIPT_INFO_TOOL => {
+                let ids = array_arg(args, "ids")?;
+                let mut script_ids = Vec::with_capacity(ids.len());
+                for value in ids {
+                    let raw = value
+                        .as_i64()
+                        .ok_or_else(|| "ids must be integers".to_string())?;
+                    script_ids.push(
+                        u16::try_from(raw)
+                            .map_err(|_| format!("iscript id {raw} is outside 0..65535"))?,
+                    );
+                }
+                let starcraft = crate::map_context::resolve_starcraft_path(&self.services.dirs)?;
+                let bytes = isom::game_asset(&starcraft, crate::iscript::ISCRIPT_ASSET).map_err(
+                    |error| format!("iscript.bin could not be read from StarCraft data: {error}"),
+                )?;
+                let iscript = crate::iscript::Iscript::parse(bytes)?;
+                let scripts: Vec<_> = script_ids
+                    .iter()
+                    .map(|id| iscript.script(*id))
+                    .collect::<Result<_, _>>()?;
+                let users = self.images_by_iscript()?;
+                // Name only the images actually listed, so one call reads the GRP
+                // table at most once and never for the whole 999-entry table.
+                let listed: Vec<u32> = scripts
+                    .iter()
+                    .flat_map(|script| {
+                        users
+                            .get(&i64::from(script.id))
+                            .map(Vec::as_slice)
+                            .unwrap_or_default()
+                            .iter()
+                            .take(crate::tools::ISCRIPT_INFO_MAX_IMAGES)
+                            .copied()
+                    })
+                    .collect();
+                let grp = self.image_grp_names(&starcraft, &listed)?;
+                let results: Vec<_> = scripts
+                    .iter()
+                    .map(|script| {
+                        let images = users
+                            .get(&i64::from(script.id))
+                            .map(Vec::as_slice)
+                            .unwrap_or_default();
+                        let shown: Vec<_> = images
+                            .iter()
+                            .take(crate::tools::ISCRIPT_INFO_MAX_IMAGES)
+                            .map(|image_id| {
+                                json!({
+                                    "imageId": image_id,
+                                    "grp": grp.get(image_id).cloned().unwrap_or_default(),
+                                })
+                            })
+                            .collect();
+                        json!({
+                            "id": script.id,
+                            "type": script.declared_type,
+                            "headerOffset": script.header_offset,
+                            "slotCount": script.slots.len(),
+                            "slots": script
+                                .slots
+                                .iter()
+                                .map(|slot| json!({
+                                    "index": slot.index,
+                                    "name": slot.name,
+                                    "present": slot.present,
+                                }))
+                                .collect::<Vec<_>>(),
+                            "usedBy": {
+                                "total": images.len(),
+                                "omitted": images.len().saturating_sub(shown.len()),
+                                "images": shown,
+                            },
+                        })
+                    })
+                    .collect();
+                Ok(json!({
+                    "schema": "eud-iscript/1",
+                    "count": results.len(),
+                    "scripts": results,
+                }))
+            }
             "settings_get" => {
                 let (scope, key) = (str_arg(args, "scope")?, str_arg(args, "key")?);
                 let config = self
@@ -2621,6 +2707,79 @@ impl SessionToolRuntime {
             }
             other => Err(format!("unknown tool '{other}'")),
         }
+    }
+
+    /// Which images currently point at each iscript, keyed by the script id.
+    ///
+    /// The values are the project's EFFECTIVE `Iscript ID` (catalog baseline plus
+    /// this project's sparse overrides), not stock StarCraft, so a script the
+    /// project already repointed an image at is reported as in use.
+    fn images_by_iscript(&self) -> Result<BTreeMap<i64, Vec<u32>>, String> {
+        let native = self.services.native();
+        let (first, last) = native.dat_field_range("images", IMAGE_ISCRIPT_FIELD)?;
+        let targets: Vec<DatTarget> = (first..=last)
+            .map(|object_id| DatTarget::Dat {
+                dat: "images".to_string(),
+                object_id,
+                field: IMAGE_ISCRIPT_FIELD.to_string(),
+            })
+            .collect();
+        let values = native.dat_values(&targets)?;
+        let mut users: BTreeMap<i64, Vec<u32>> = BTreeMap::new();
+        for target in &targets {
+            let DatTarget::Dat { object_id, .. } = target else {
+                continue;
+            };
+            if let Some(DatScalar::Number(script)) = values.get(target) {
+                users.entry(*script).or_default().push(*object_id);
+            }
+        }
+        Ok(users)
+    }
+
+    /// The GRP file name of each given image, from `images.dat`'s GRP index into
+    /// `images.tbl`. An image whose index is outside the table is left out rather
+    /// than reported under a guessed name.
+    fn image_grp_names(
+        &self,
+        starcraft: &Path,
+        image_ids: &[u32],
+    ) -> Result<BTreeMap<u32, String>, String> {
+        if image_ids.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+        let targets: Vec<DatTarget> = image_ids
+            .iter()
+            .map(|object_id| DatTarget::Dat {
+                dat: "images".to_string(),
+                object_id: *object_id,
+                field: IMAGE_GRP_FIELD.to_string(),
+            })
+            .collect();
+        let values = self.services.native().dat_values(&targets)?;
+        let table = crate::iscript::tbl_strings(
+            &isom::game_asset(starcraft, crate::iscript::IMAGES_TBL_ASSET).map_err(|error| {
+                format!("images.tbl could not be read from StarCraft data: {error}")
+            })?,
+        )?;
+        let mut names = BTreeMap::new();
+        for target in &targets {
+            let DatTarget::Dat { object_id, .. } = target else {
+                continue;
+            };
+            let Some(DatScalar::Number(index)) = values.get(target) else {
+                continue;
+            };
+            // images.tbl indices are 1-based and 0 means "no GRP", while
+            // `tbl_strings` returns the table 0-based.
+            let Ok(index) = usize::try_from(*index) else {
+                continue;
+            };
+            if let Some(name) = index.checked_sub(1).and_then(|entry| table.get(entry)) {
+                names.insert(*object_id, name.clone());
+            }
+        }
+        Ok(names)
     }
 
     // ---- write-tool helpers ----
@@ -6703,6 +6862,96 @@ mod tests {
         assert!(!crate::tools::map_tool_registry()
             .iter()
             .any(|tool| tool.name.contains("apply")));
+    }
+
+    /// End to end over the real game data: the slot table comes from
+    /// `scripts\iscript.bin`, the users from the project's effective images.dat,
+    /// and each user's name from `arr\images.tbl`. The script an image actually
+    /// points at is read from the project first, so the round trip is asserted
+    /// without hardcoding which retail image uses which script.
+    #[test]
+    #[ignore = "requires installed StarCraft data"]
+    fn iscript_info_reports_a_scripts_slots_and_the_images_pointing_at_it() {
+        let services = ToolServices::for_tests();
+        crate::native_build::sync_compat_assets(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("resources/eud-editor-compat"),
+            &services.dirs.native_assets_dir(),
+        )
+        .unwrap();
+        let root = services.dirs.app_data().join("iscript-info-project");
+        std::fs::create_dir_all(root.join("maps")).unwrap();
+        std::fs::write(root.join("maps/source.scx"), b"fixture map").unwrap();
+        let project = crate::native_project::NativeProject::create(
+            &root,
+            crate::native_project::ProjectManifest {
+                schema_version: crate::native_project::PROJECT_SCHEMA_VERSION,
+                name: "Iscript info project".to_string(),
+                source_map: "maps/source.scx".to_string(),
+                output_map: "build/output.scx".to_string(),
+                main_file: "src/main.eps".to_string(),
+                settings: Default::default(),
+                plugins: Vec::new(),
+                python_entrypoints: Vec::new(),
+                python_dependencies: Vec::new(),
+                python_lock: None,
+                editor_compatibility: None,
+            },
+        )
+        .unwrap();
+        services.native().activate_project(&project).unwrap();
+        let image_zero = DatTarget::Dat {
+            dat: "images".to_string(),
+            object_id: 0,
+            field: IMAGE_ISCRIPT_FIELD.to_string(),
+        };
+        let DatScalar::Number(used_script) = services
+            .native()
+            .dat_values(std::slice::from_ref(&image_zero))
+            .unwrap()[&image_zero]
+            .clone()
+        else {
+            panic!("images.dat Iscript ID must be numeric");
+        };
+
+        let runtime = services.session("iscript-session");
+        runtime.begin_request("request", "project").unwrap();
+        let result = runtime
+            .execute(
+                crate::tools::ISCRIPT_INFO_TOOL,
+                &json!({"ids": [225, used_script]}),
+            )
+            .unwrap();
+
+        // Retail script 225 is a two-slot overlay: Init and Death and nothing
+        // else, so an image repointed at it loses every attack, movement and
+        // spell animation. That is the fact a DAT edit cannot get anywhere else.
+        let overlay = &result["scripts"][0];
+        assert_eq!(overlay["id"], 225);
+        assert_eq!(overlay["slotCount"], 2);
+        let slots = overlay["slots"].as_array().unwrap();
+        assert_eq!(slots.len(), 2);
+        assert_eq!(slots[0]["name"], "Init");
+        assert_eq!(slots[0]["present"], true);
+        assert_eq!(slots[1]["name"], "Death");
+
+        let used = &result["scripts"][1];
+        assert_eq!(used["id"], used_script);
+        let images = used["usedBy"]["images"].as_array().unwrap();
+        let image_zero_entry = images
+            .iter()
+            .find(|image| image["imageId"] == 0)
+            .unwrap_or_else(|| panic!("image 0 must be listed as a user: {used}"));
+        assert!(
+            image_zero_entry["grp"]
+                .as_str()
+                .is_some_and(|grp| !grp.is_empty()),
+            "image 0 must carry its images.tbl GRP name: {image_zero_entry}"
+        );
+        assert!(
+            used["usedBy"]["total"].as_u64().unwrap() >= images.len() as u64,
+            "{used}"
+        );
+        std::fs::remove_dir_all(services.dirs.app_data()).ok();
     }
 
     #[test]

@@ -665,6 +665,38 @@ pub fn catalog_query(
         .map_err(|error| NativeCallError::new(IsomError::Engine, Some(error.to_string())))
 }
 
+/// Read one raw asset out of the installed StarCraft data (CASC/MPQ) verbatim.
+///
+/// `archive_path` is an ARCHIVE-internal path (e.g. `scripts\iscript.bin`), not
+/// a filesystem path: it is handed to C as-is and must NOT go through
+/// [`path_cstring`], whose Windows branch would resolve it against the current
+/// directory. The bytes are returned uninterpreted — the caller owns the format.
+pub fn game_asset(starcraft_path: &Path, archive_path: &str) -> Result<Vec<u8>, NativeCallError> {
+    let _native_call = native_call_guard();
+    let starcraft =
+        path_cstring(starcraft_path).map_err(|error| NativeCallError::new(error, None))?;
+    let asset = CString::new(archive_path)
+        .map_err(|_| NativeCallError::new(IsomError::InvalidArg, None))?;
+    let mut output: *mut u8 = std::ptr::null_mut();
+    let mut output_len = 0_usize;
+    // SAFETY: both C strings stay alive for the call and the output pointers
+    // satisfy the synchronous ABI; the buffer is released by the `CBuf` guard.
+    let code = unsafe {
+        isom_sys::isom_game_asset(
+            starcraft.as_ptr(),
+            asset.as_ptr(),
+            &mut output,
+            &mut output_len,
+        )
+    };
+    let output = CBuf(output);
+    let bytes = buffer_bytes(&output, output_len);
+    if let Err(error) = status(code) {
+        return Err(NativeCallError::new(error, native_detail(&bytes)));
+    }
+    Ok(bytes)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct MapSoundAddReport {
@@ -1015,7 +1047,7 @@ pub fn image_quantize(
     })
 }
 
-pub const EXPECTED_ABI_VERSION: i32 = 7;
+pub const EXPECTED_ABI_VERSION: i32 = 8;
 
 pub fn assert_abi_version() -> Result<(), IsomError> {
     let actual = abi_version();

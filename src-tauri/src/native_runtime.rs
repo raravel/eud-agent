@@ -1027,6 +1027,16 @@ revision={}
         Ok(values)
     }
 
+    /// The inclusive object-id range one DAT field covers in the version-matched
+    /// catalog. A caller that has to sweep a whole table (which images use an
+    /// iscript, say) takes the range from the catalog instead of hardcoding a
+    /// table size that the compatibility assets own.
+    pub fn dat_field_range(&self, dat: &str, field: &str) -> Result<(u32, u32), String> {
+        let catalog = DatCatalog::load(&self.dirs.native_assets_dir())?;
+        let meta = catalog.field(dat, field)?;
+        Ok((meta.var_start, meta.var_end))
+    }
+
     pub fn apply_dat_patch(&self, patch: &NativeDatPatch) -> Result<String, String> {
         let _transaction = self.transaction.lock();
         let mut project = self.open()?;

@@ -2760,6 +2760,21 @@ int catalogQuery(const char* starCraftPath, const std::uint8_t* requestJson, std
     return 0;
 }
 
+int gameAsset(const char* starCraftPath, const char* archivePath, std::vector<std::uint8_t>& result)
+{
+    if ( starCraftPath == nullptr || archivePath == nullptr || archivePath[0] == '\0' )
+        fail("game asset request received an invalid argument");
+    // The caller names one archive-internal path (e.g. "scripts\\iscript.bin");
+    // the bytes are handed back verbatim and parsed by the caller, so this adds
+    // no second interpretation of StarCraft data here.
+    const auto assets = loadAssets(starCraftPath);
+    auto bytes = Sc::Data::GetAsset(assets->archives, std::string(archivePath));
+    if ( !bytes )
+        fail(std::string("StarCraft data has no asset: ") + archivePath);
+    result = std::move(*bytes);
+    return 0;
+}
+
 int imageQuantize(
     const char* starCraftPath,
     std::uint16_t tileset,

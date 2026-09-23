@@ -8,12 +8,14 @@
 use std::fs;
 use std::path::PathBuf;
 
-/// The linked static lib reports ABI version 6 (and matches the -sys const).
+/// The linked static lib reports the current ABI version, and the bindings, the
+/// wrapper's expectation, and the header all agree on it. The literal is the
+/// tripwire: bumping `ISOM_ABI_VERSION` has to be deliberate.
 #[test]
-fn abi_version_is_seven() {
-    assert_eq!(isom::abi_version(), 7);
+fn abi_version_matches_the_bindings_and_the_wrapper() {
+    assert_eq!(isom::abi_version(), 8);
     assert_eq!(isom::abi_version(), isom_sys::ISOM_ABI_VERSION as i32);
-    isom::assert_abi_version().expect("ABI v6 startup assertion must pass");
+    isom::assert_abi_version().expect("ABI startup assertion must pass");
 }
 
 /// A NUL byte inside the path can never reach the C side — the CString build

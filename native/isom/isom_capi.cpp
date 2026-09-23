@@ -547,6 +547,44 @@ int isom_catalog_query(
     }
 }
 
+int isom_game_asset(
+    const char* starcraft_path,
+    const char* archive_path,
+    uint8_t** out,
+    size_t* out_len)
+{
+    if ( out == nullptr || out_len == nullptr )
+        return ISOM_ERR_INVALID_ARG;
+    *out = nullptr;
+    *out_len = 0;
+    if ( starcraft_path == nullptr || starcraft_path[0] == '\0'
+         || archive_path == nullptr || archive_path[0] == '\0' )
+        return ISOM_ERR_INVALID_ARG;
+    try
+    {
+        std::vector<std::uint8_t> result;
+        int engineResult = 1;
+        const int guard = guardSeh([&]() {
+            return mapagent::gameAsset(starcraft_path, archive_path, result);
+        }, engineResult);
+        if ( guard != ISOM_OK )
+            return guard;
+        if ( engineResult != 0 )
+            return ISOM_ERR_ENGINE;
+        return copyBuffer(result.data(), result.size(), out, out_len);
+    }
+    catch ( const std::exception& error )
+    {
+        const std::string report = errorReport(error.what());
+        const int copied = copyString(report, out, out_len);
+        return copied == ISOM_OK ? ISOM_ERR_ENGINE : copied;
+    }
+    catch ( ... )
+    {
+        return ISOM_ERR_EXCEPTION;
+    }
+}
+
 int isom_image_quantize(
     const char* starcraft_path,
     uint16_t tileset,

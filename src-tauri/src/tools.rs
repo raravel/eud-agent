@@ -22,6 +22,15 @@ pub const DOCS_GET_TOOL: &str = "docs_get";
 /// Bounded source search tool name.
 pub const SOURCE_SEARCH_TOOL: &str = "source_search";
 
+/// Existing-iscript slot reader tool name.
+pub const ISCRIPT_INFO_TOOL: &str = "iscript_info";
+/// Scripts per `iscript_info` call. Each script reports up to 28 slots plus the
+/// images using it, so the bound keeps one observation well inside the 40 KiB
+/// tool-observation ceiling.
+pub const ISCRIPT_INFO_MAX_IDS: usize = 8;
+/// Images listed per script before `iscript_info` reports only the total.
+pub const ISCRIPT_INFO_MAX_IMAGES: usize = 64;
+
 /// The pure-IO filesystem tools (plan §N7). They read and write the project
 /// root and nothing else: no journal, no evidence, no write registration. What
 /// makes them reversible is the turn commit, the same as a Codex or Claude
@@ -937,6 +946,24 @@ pub fn tool_registry() -> Vec<ToolSpec> {
                     ),
                 }),
                 &["items"],
+            ),
+        ),
+        read_tool(
+            ISCRIPT_INFO_TOOL,
+            "Read which animation slots an existing iscript defines, from the installed StarCraft data. \
+             images.dat's `Iscript ID` only selects a script; this reports that script's declared slots \
+             (Init, Death, CastSpell, ...), whether each one has a body, and which project images currently \
+             use it. Check the slots a repointed image needs before changing `Iscript ID`.",
+            schema(
+                json!({
+                    "ids": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": ISCRIPT_INFO_MAX_IDS,
+                        "items": integer_schema(),
+                    },
+                }),
+                &["ids"],
             ),
         ),
         read_tool(
@@ -5769,6 +5796,21 @@ mod tests {
                         ),
                     }),
                     &["items"],
+                ),
+            ),
+            (
+                ISCRIPT_INFO_TOOL,
+                false,
+                schema(
+                    serde_json::json!({
+                        "ids": {
+                            "type": "array",
+                            "minItems": 1,
+                            "maxItems": ISCRIPT_INFO_MAX_IDS,
+                            "items": integer_schema(),
+                        },
+                    }),
+                    &["ids"],
                 ),
             ),
             (
