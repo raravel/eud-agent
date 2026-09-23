@@ -148,6 +148,34 @@ describe("SettingsDialog provider management", () => {
     expect(within(updated).getByRole("alert")).toHaveTextContent("다시 선택해 주세요");
   });
 
+  it("shows the StarCraft install folder under 컴파일 and lets the user pick it", async () => {
+    const onStarcraftPick = vi.fn();
+    const reason = "StarCraft 설치 폴더를 찾지 못했습니다.";
+    const { rerender, props } = renderDialog({
+      onStarcraftPick,
+      starcraft: { available: false, path: "", reason },
+    });
+
+    await userEvent.click(screen.getByRole("button", { name: "컴파일" }));
+    const section = screen.getByRole("region", { name: "StarCraft" });
+    expect(within(section).getByText("찾지 못함")).toBeInTheDocument();
+    expect(within(section).getByText(reason)).toBeInTheDocument();
+    await userEvent.click(within(section).getByRole("button", { name: "폴더 선택" }));
+    expect(onStarcraftPick).toHaveBeenCalledOnce();
+
+    const starcraftPath = String.raw`D:\Games\StarCraft`;
+    rerender(
+      <SettingsDialog
+        {...props}
+        starcraft={{ available: true, path: starcraftPath }}
+        starcraftBusy
+      />,
+    );
+    const updated = screen.getByRole("region", { name: "StarCraft" });
+    expect(within(updated).getByText(starcraftPath)).toBeInTheDocument();
+    expect(within(updated).getByRole("button", { name: "선택 중…" })).toBeDisabled();
+  });
+
   it("shows managed euddraft versions and exposes check and update actions", async () => {
     const onEuddraftCheck = vi.fn();
     const onEuddraftUpdate = vi.fn();

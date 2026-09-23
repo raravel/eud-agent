@@ -145,6 +145,7 @@ import {
   mapNewBrushes,
   mapNewOptions,
   pickStarcraftPath,
+  type StarcraftAvailability,
 } from "@/lib/mapNew";
 import { progressLabel } from "@/lib/progress";
 import { useProjectIdentityEffect } from "@/lib/projectIdentity";
@@ -540,6 +541,9 @@ export default function App() {
   const [euddraftSettingsError, setEuddraftSettingsError] = useState<string>();
   const [scmdraftPickBusy, setScmdraftPickBusy] = useState(false);
   const [scmdraftPickError, setScmdraftPickError] = useState<string>();
+  const [starcraftSettings, setStarcraftSettings] = useState<StarcraftAvailability | null>(null);
+  const [starcraftPickBusy, setStarcraftPickBusy] = useState(false);
+  const [starcraftPickError, setStarcraftPickError] = useState<string>();
   // Message undo/edit flow: the core must finish cancellation/rewind before the
   // input unlocks. `editDraft` is applied by InstructionBox without controlling
   // subsequent typing.
@@ -921,6 +925,24 @@ export default function App() {
     if (settingsOpen) void loadEuddraftSettings();
   }, [loadEuddraftSettings, settingsOpen]);
 
+  useEffect(() => {
+    if (!settingsOpen) return;
+    let cancelled = false;
+    setStarcraftPickError(undefined);
+    mapNewOptions()
+      .then((options) => {
+        if (!cancelled) setStarcraftSettings(options.starcraft);
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setStarcraftSettings(null);
+        setStarcraftPickError("StarCraft 폴더 설정을 불러오지 못했습니다. 설정 창을 다시 열어 주세요.");
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [settingsOpen]);
+
   const handleAppSettingsChange = useCallback(
     async (next: AppSettings) => {
       const previous = appSettings;
@@ -967,6 +989,20 @@ export default function App() {
       );
     } finally {
       setScmdraftPickBusy(false);
+    }
+  }, []);
+
+  const handleStarcraftPick = useCallback(async () => {
+    setStarcraftPickBusy(true);
+    setStarcraftPickError(undefined);
+    try {
+      setStarcraftSettings((await pickStarcraftPath()).starcraft);
+    } catch {
+      setStarcraftPickError(
+        "StarCraft 폴더를 설정하지 못했습니다. StarCraft: Remastered 설치 폴더를 선택해 주세요.",
+      );
+    } finally {
+      setStarcraftPickBusy(false);
     }
   }, []);
 
@@ -3380,6 +3416,9 @@ export default function App() {
           euddraftError={euddraftSettingsError}
           scmdraftBusy={scmdraftPickBusy}
           scmdraftError={scmdraftPickError}
+          starcraft={starcraftSettings}
+          starcraftBusy={starcraftPickBusy}
+          starcraftError={starcraftPickError}
           onOpenChange={setSettingsOpen}
           onSettingsChange={handleAppSettingsChange}
           onReload={loadAppSettings}
@@ -3405,6 +3444,7 @@ export default function App() {
           onEuddraftCheck={handleEuddraftCheck}
           onEuddraftUpdate={handleEuddraftUpdate}
           onScmdraftPick={handleScmdraftPick}
+          onStarcraftPick={handleStarcraftPick}
         />
         <E3sImportDialog
           open={e3sImportOpen}

@@ -37,6 +37,7 @@ import type {
   NotificationChannelSettings,
   NotificationEvent,
 } from "@/lib/ipc";
+import type { StarcraftAvailability } from "@/lib/mapNew";
 import { cn, formatPathForDisplay } from "@/lib/utils";
 import {
   AVAILABILITY_LABELS,
@@ -72,6 +73,10 @@ export interface SettingsDialogProps {
   euddraftError?: string;
   scmdraftBusy?: boolean;
   scmdraftError?: string;
+  /** Resolved StarCraft data folder for map rendering; null while loading or unreadable. */
+  starcraft?: StarcraftAvailability | null;
+  starcraftBusy?: boolean;
+  starcraftError?: string;
   onOpenChange(open: boolean): void;
   onSettingsChange(settings: AppSettings): void;
   onReload(): void;
@@ -98,6 +103,7 @@ export interface SettingsDialogProps {
   onEuddraftCheck(): void;
   onEuddraftUpdate(): void;
   onScmdraftPick(): Promise<void> | void;
+  onStarcraftPick?(): Promise<void> | void;
 }
 
 export type SettingsCategory = "project" | "compile" | "providers" | "notifications";
@@ -347,6 +353,64 @@ function ScmdraftSettingsPanel({ path, busy, error, onPick }: ScmdraftSettingsPa
   );
 }
 
+interface StarcraftSettingsPanelProps {
+  availability: StarcraftAvailability | null;
+  busy: boolean;
+  error?: string;
+  onPick(): Promise<void> | void;
+}
+
+function StarcraftSettingsPanel({ availability, busy, error, onPick }: StarcraftSettingsPanelProps) {
+  const path = availability?.available ? availability.path : "";
+  return (
+    <section aria-labelledby="settings-starcraft-heading" className="mt-8">
+      <h2 id="settings-starcraft-heading" className="text-base font-semibold">StarCraft</h2>
+      <p className="mt-1.5 text-sm leading-6 text-muted-foreground">
+        맵 렌더링, 미니맵, 빈 맵 만들기가 이 설치 폴더의 타일셋 데이터를 읽습니다.
+      </p>
+      <dl className="mt-5 overflow-hidden rounded-xl border border-border bg-card/40">
+        <div className="grid gap-1.5 px-4 py-3.5">
+          <dt className="text-xs font-medium text-muted-foreground">설치 폴더</dt>
+          <dd
+            className="break-all font-mono text-sm text-foreground"
+            title={formatPathForDisplay(path)}
+          >
+            {formatPathForDisplay(path) || (availability ? "찾지 못함" : "확인 중…")}
+          </dd>
+        </div>
+      </dl>
+      {availability && !availability.available && availability.reason && !error && (
+        <p className="mt-3 text-sm leading-6 text-muted-foreground">{availability.reason}</p>
+      )}
+      {error && (
+        <p
+          role="alert"
+          className="mt-3 rounded-lg border border-destructive/40 bg-destructive/10 px-4 py-3 text-sm text-destructive"
+        >
+          {error}
+        </p>
+      )}
+      <div className="mt-5 flex flex-col gap-3 sm:flex-row sm:justify-end">
+        <Button
+          type="button"
+          variant="outline"
+          className="h-11"
+          disabled={busy}
+          aria-busy={busy || undefined}
+          onClick={() => void onPick()}
+        >
+          {busy ? (
+            <LoaderCircle aria-hidden className="size-4 animate-spin motion-reduce:animate-none" />
+          ) : (
+            <FolderOpen aria-hidden className="size-4" />
+          )}
+          {busy ? "선택 중…" : "폴더 선택"}
+        </Button>
+      </div>
+    </section>
+  );
+}
+
 export function SettingsDialog({
   open,
   category: requestedCategory,
@@ -368,6 +432,9 @@ export function SettingsDialog({
   euddraftError,
   scmdraftBusy = false,
   scmdraftError,
+  starcraft = null,
+  starcraftBusy = false,
+  starcraftError,
   onOpenChange,
   onSettingsChange,
   onReload,
@@ -390,6 +457,7 @@ export function SettingsDialog({
   onEuddraftCheck,
   onEuddraftUpdate,
   onScmdraftPick,
+  onStarcraftPick,
 }: SettingsDialogProps) {
   const [category, setCategory] = useState<SettingsCategory>("providers");
   const [selectedProvider, setSelectedProvider] = useState<ProviderId>();
@@ -627,6 +695,14 @@ export function SettingsDialog({
                   error={scmdraftError}
                   onPick={onScmdraftPick}
                 />
+                {onStarcraftPick && (
+                  <StarcraftSettingsPanel
+                    availability={starcraft}
+                    busy={busy || starcraftBusy}
+                    error={starcraftError}
+                    onPick={onStarcraftPick}
+                  />
+                )}
               </>
             ) : category === "providers" ? (
               selectedProviderStatus ? (

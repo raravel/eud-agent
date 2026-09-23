@@ -2529,20 +2529,8 @@ impl SessionToolRuntime {
             }
             tools::MAP_MINIMAP_TOOL => {
                 let map_path = self.services.native().source_map_path()?;
-                let configured = args
-                    .get("starcraftPath")
-                    .and_then(Value::as_str)
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|| {
-                        PathBuf::from(
-                            self.services
-                                .dirs
-                                .load_config()
-                                .map(|config| config.starcraft_path)
-                                .unwrap_or_default(),
-                        )
-                    });
-                tools::map_minimap_path(&map_path, &configured, args).map_err(stringify)
+                let starcraft = minimap_starcraft_path(&self.services.dirs, args)?;
+                tools::map_minimap_path(&map_path, &starcraft, args).map_err(stringify)
             }
             tools::MAP_SOUND_LIST_TOOL => self.map_sound_list(request_id),
             tools::SEARCH_DOCS_TOOL => Ok(self.search_docs(args)),
@@ -4576,6 +4564,17 @@ pub(crate) fn tier_label(tier_level: u8) -> &'static str {
         _ => "qa",
     }
 }
+/// An explicit non-empty `starcraftPath` wins; otherwise the minimap resolves the
+/// StarCraft folder exactly like every other Map renderer, so an unset config
+/// falls back to the default install folder instead of reaching the native
+/// renderer as an empty path.
+fn minimap_starcraft_path(dirs: &DataDirs, args: &Value) -> Result<PathBuf, String> {
+    match args.get("starcraftPath").and_then(Value::as_str) {
+        Some(explicit) if !explicit.trim().is_empty() => Ok(PathBuf::from(explicit)),
+        _ => crate::map_context::resolve_starcraft_path(dirs),
+    }
+}
+
 fn render_scale_arg(args: &Value) -> Result<usize, String> {
     let scale = usize_arg_default(args, "scale", 4)?;
     if !matches!(scale, 1 | 2 | 4 | 8) {
@@ -5127,6 +5126,38 @@ mod tests {
         runtime.begin_request(request_id, "test-project").unwrap();
         runtime.register_write_request("test mutation").unwrap();
         runtime
+    }
+
+    #[test]
+    fn minimap_starcraft_path_never_hands_the_renderer_an_empty_path() {
+        // Given: a configured StarCraft folder and a model call that passes an
+        // empty `starcraftPath` (the config previously leaked through as "").
+        let services = ToolServices::for_tests();
+        let configured = services.dirs.app_data().join("StarCraft");
+        std::fs::create_dir_all(&configured).unwrap();
+        services
+            .dirs
+            .save_config(&crate::config::Config {
+                starcraft_path: configured.display().to_string(),
+                ..crate::config::Config::default()
+            })
+            .unwrap();
+
+        // Then: an empty or absent argument resolves the configured folder,
+        // and only a non-empty argument overrides it.
+        if std::env::var_os("STARCRAFT_PATH").is_none() {
+            for args in [json!({}), json!({ "starcraftPath": "" })] {
+                assert_eq!(
+                    minimap_starcraft_path(&services.dirs, &args).unwrap(),
+                    configured
+                );
+            }
+        }
+        let explicit = json!({ "starcraftPath": r"D:\Games\StarCraft" });
+        assert_eq!(
+            minimap_starcraft_path(&services.dirs, &explicit).unwrap(),
+            PathBuf::from(r"D:\Games\StarCraft")
+        );
     }
 
     #[test]
