@@ -138,9 +138,16 @@
 
 ## Continuity across an interruption
 
+- A session's own conversation reaches triage. Triage routes one message, and a message that points
+  back at earlier work ("continue", "계속", "그거 해줘") names work only the transcript and the
+  unresolved request can identify; routing it as ambiguous is a defect, not a clarification.
 - Model-facing transcripts are bounded by dropping the OLDEST rows and marking the cut. A
   head-first cut hands the model the opening of a long session and none of the work it must
   continue.
+- A request that a shutdown or a cancellation left unresolved is set aside on the session record
+  and projected as `interrupted_request`, with its research, its plan, and whether the user
+  approved that plan. A later message never discards it; only the user resolves it, by resuming or
+  restarting it.
 - A chat turn persists the provider conversation it reached on every exit path, including failure
   and cancellation. A boundary that exists only in memory is lost with the process.
 - A native provider publishes its resumable session identity before any output, and an interrupted

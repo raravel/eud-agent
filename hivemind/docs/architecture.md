@@ -190,7 +190,11 @@ evidence, the planner writes the shortest plan that meets the goal, and the crit
 
 `WorkflowState` is persisted on the session at every transition and projected to the panel as the
 `workflow` event; plan review survives reconnect and restart, in-flight stage jobs become
-`Interrupted` at startup and resume or restart only explicitly. Research, plan revisions, and
+`Interrupted` at startup and resume or restart only explicitly. A later message never discards an
+interrupted request: it is set aside on the session record, projected as `interrupted_request`, and
+resolved only by the user (`workflow_resume` / `workflow_restart`). Triage also receives the
+session's condensed transcript and an `[interrupted request]` section, so a message that continues
+earlier work is routed as that work instead of as an ambiguous new one. Research, plan revisions, and
 verification verdicts are engine-rendered files under `.eud-agent/workspace/{research,plans,verify}`;
 the approved plan file instructs the executing turn and the verifier judges the changeset and
 build evidence against its acceptance criteria. The default plan depth is planner + one critic
