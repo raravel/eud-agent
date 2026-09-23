@@ -331,6 +331,60 @@ mod tests {
         assert_eq!(gate.completed()[0].call_id.as_deref(), Some("call-write"));
     }
 
+    #[test]
+    fn fs_tools_reach_only_runs_without_their_own_file_tools() {
+        let advertised = |gate: &RunGate| {
+            gate.descriptors()
+                .iter()
+                .filter_map(|descriptor| descriptor["name"].as_str().map(str::to_string))
+                .collect::<Vec<_>>()
+        };
+        let identity = |runtime: &SessionToolRuntime| crate::provider_runtime::RunIdentity {
+            session_id: runtime.session_id().to_string(),
+            run_id: crate::provider_runtime::RunId::new(15),
+            request_id: "request-fs".to_string(),
+            session_kind: runtime.kind(),
+            cancellation_generation: 0,
+        };
+
+        // A native run (Codex / Claude Code) keeps a receipt, not a transcript.
+        let runtime = SessionToolRuntime::for_tests();
+        let native = RunGate::new(
+            identity(&runtime),
+            runtime,
+            crate::provider_runtime::WorkspaceAccess::Read,
+            None,
+        );
+        let names = advertised(&native);
+        assert!(names.iter().all(|name| !crate::tools::is_fs_tool(name)));
+        assert!(names.iter().any(|name| name == crate::tools::ASK_TOOL));
+
+        // A direct run has no other way to reach the root.
+        let runtime = SessionToolRuntime::for_tests();
+        let store = crate::provider_transcript::ProviderTranscriptStore::new(&runtime.data_dirs());
+        let writer = std::sync::Arc::new(
+            store
+                .checkpoint_writer(
+                    crate::provider::ProviderId::OpencodeGo,
+                    runtime.session_id(),
+                    0,
+                    crate::provider_transcript::TranscriptBranch::legacy(),
+                    Vec::new(),
+                )
+                .unwrap(),
+        );
+        let direct = RunGate::new(
+            identity(&runtime),
+            runtime,
+            crate::provider_runtime::WorkspaceAccess::Read,
+            Some(writer),
+        );
+        let names = advertised(&direct);
+        for tool in crate::tools::FS_TOOLS {
+            assert!(names.iter().any(|name| name == tool), "{tool} missing");
+        }
+    }
+
     #[tokio::test]
     async fn completed_tool_is_checkpointed_before_batch_returns() {
         // Given: a direct run with a transcript checkpoint writer and active batch.

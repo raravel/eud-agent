@@ -32,6 +32,13 @@ impl ProviderId {
             Self::Ollama => "Ollama",
         }
     }
+
+    /// Codex and Claude Code read, search and edit the project root with
+    /// their own CLI file tools, so they are never handed `fs_*` as well: two
+    /// tools for one job only make the model choose between them.
+    pub const fn has_native_file_tools(self) -> bool {
+        matches!(self, Self::Codex | Self::ClaudeCode)
+    }
 }
 
 impl std::fmt::Display for ProviderId {

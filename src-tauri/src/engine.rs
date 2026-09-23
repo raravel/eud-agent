@@ -891,7 +891,11 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
         let transcript = condense_transcript(&record.panel_log);
         self.pending_resume_transcript = (!transcript.trim().is_empty()).then_some(transcript);
         self.session_store
-            .reset_context_epoch(&self.session_id, &static_prompt_baseline(), true)
+            .reset_context_epoch(
+                &self.session_id,
+                &static_prompt_baseline(self.provider_binding.provider),
+                true,
+            )
             .map_err(|error| AgentEngineError::new(error.to_string()))?;
         Ok(())
     }
@@ -1069,7 +1073,7 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
         replay_transcript: Option<&str>,
         mut force_full: bool,
     ) -> Result<String, AgentEngineError> {
-        let static_baseline = static_prompt_baseline();
+        let static_baseline = static_prompt_baseline(self.provider_binding.provider);
         let project_state = project_state_section(&self.config.project_state_for_prompt());
         let project_map = self.config.project_map_for_prompt();
         let memory = self
@@ -1584,7 +1588,11 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
         self.thread_active = false;
         if reset_epoch {
             self.session_store
-                .reset_context_epoch(&self.session_id, &static_prompt_baseline(), true)
+                .reset_context_epoch(
+                    &self.session_id,
+                    &static_prompt_baseline(self.provider_binding.provider),
+                    true,
+                )
                 .map_err(|error| AgentEngineError::new(error.to_string()))?;
         }
         let turn_text = self
@@ -2162,7 +2170,10 @@ Continue the requested change now, run the mandatory build, and stop only after 
             .map_err(|error| AgentEngineError::new(error.to_string()))?;
         let committed_epoch = self
             .session_store
-            .record_compaction_boundary(&self.session_id, &static_prompt_baseline())
+            .record_compaction_boundary(
+                &self.session_id,
+                &static_prompt_baseline(self.provider_binding.provider),
+            )
             .map_err(|error| AgentEngineError::new(error.to_string()))?;
         if committed_epoch != next_instruction_epoch {
             return Err(AgentEngineError::new(
@@ -5352,10 +5363,10 @@ pub fn build_map_system_prompt(project_state: &str, project_memory: Option<&str>
     )
 }
 
-fn static_prompt_baseline() -> String {
+fn static_prompt_baseline(provider: crate::provider::ProviderId) -> String {
     [
         INTRO.to_string(),
-        tool_catalog_section(),
+        tool_catalog_section(provider),
         WORKSPACE_GUIDE.to_string(),
         first_principles_section(),
         EPS_IDIOMS.to_string(),
@@ -5386,7 +5397,7 @@ pub fn build_system_prompt(
 ) -> String {
     let _ = request_text;
     let mut parts = vec![
-        static_prompt_baseline(),
+        static_prompt_baseline(crate::provider::ProviderId::OpencodeGo),
         project_state_section(project_state),
     ];
     if let Some(memory) = project_memory_section(project_memory) {
@@ -5404,30 +5415,43 @@ pub fn build_system_prompt(
 /// Render the `[tools]` catalog from the live registry so the system prompt
 /// always matches what the eud-tools MCP server actually exposes. Three
 /// groups, because they differ in what they cost: reads, plain file I/O, and
-/// the validated project writers.
-fn tool_catalog_section() -> String {
+/// the validated project writers. A provider with its own CLI file tools is
+/// not offered `fs_*` (the run gate does not advertise them to it either).
+fn tool_catalog_section(provider: crate::provider::ProviderId) -> String {
+    let native_files = provider.has_native_file_tools();
     let mut read = Vec::new();
     let mut files = Vec::new();
     let mut write = Vec::new();
     for spec in crate::tools::tool_registry() {
         let line = format!("- {} — {}", spec.name, spec.description);
         if crate::tools::is_fs_tool(spec.name) {
-            files.push(line);
+            if !native_files {
+                files.push(line);
+            }
         } else if spec.requires_write_workspace {
             write.push(line);
         } else {
             read.push(line);
         }
     }
+    let files = if native_files {
+        "Project files: read, search and edit them with your own native file tools (plain \
+filesystem, no validation; the turn's git commit is what makes them reversible).\n"
+            .to_string()
+    } else {
+        format!(
+            "Project files (plain filesystem, no validation; the turn's git commit is what \
+makes them reversible):\n{}\n",
+            files.join("\n")
+        )
+    };
     format!(
         "[tools]\nThese eud-tools (exposed over the eud-tools MCP server) are the only \
 way to reach the map, the build, and the sparse DAT documents; every call and result is \
-shown to the user. Project files you may also edit with your own native file tools.\n\
-Read-only:\n{}\nProject files (plain filesystem, no validation; the turn's git commit is \
-what makes them reversible):\n{}\nValidated project state (schema-checked and recorded \
+shown to the user.\nRead-only:\n{}\n{}Validated project state (schema-checked and recorded \
 before it is written):\n{}",
         read.join("\n"),
-        files.join("\n"),
+        files,
         write.join("\n")
     )
 }
@@ -5872,7 +5896,7 @@ mod tests {
         current_memory: Option<&str>,
         current_wiki: Option<&str>,
     ) -> String {
-        let baseline = static_prompt_baseline();
+        let baseline = static_prompt_baseline(crate::provider::ProviderId::OpencodeGo);
         let mut context = crate::context_state::SessionContextState::default();
         context.adopt_legacy_thread(
             &baseline,
@@ -8574,6 +8598,25 @@ mod tests {
         assert!(!prompt.contains("eudAgentTestSetup"));
         assert!(!prompt.contains("eps_check"));
         assert!(!prompt.contains("build_errors"));
+    }
+
+    #[test]
+    fn only_providers_without_native_file_tools_are_offered_fs_tools() {
+        use crate::provider::ProviderId;
+        for provider in ProviderId::ALL {
+            let catalog = tool_catalog_section(provider);
+            let offered = crate::tools::FS_TOOLS
+                .iter()
+                .filter(|tool| catalog.contains(&format!("- {tool} — ")))
+                .count();
+            if provider.has_native_file_tools() {
+                assert_eq!(offered, 0, "{provider:?}");
+                assert!(catalog.contains("your own native file tools"));
+            } else {
+                assert_eq!(offered, crate::tools::FS_TOOLS.len(), "{provider:?}");
+                assert!(!catalog.contains("native file tools"));
+            }
+        }
     }
 
     #[test]
