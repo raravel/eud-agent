@@ -367,8 +367,7 @@ const SAVE_CONTENTION_RETRIES: u32 = 4;
 /// deterministic, nothing has been promoted yet, and the engine deletes the
 /// temporary it could not write.
 fn is_save_contention(error: &NativeCallError) -> bool {
-    error.status == IsomError::Engine
-        && error.detail.as_deref() == Some(SAVE_CONTENTION_DETAIL)
+    error.status == IsomError::Engine && error.detail.as_deref() == Some(SAVE_CONTENTION_DETAIL)
 }
 
 pub fn mapedit(

@@ -1,5 +1,6 @@
 /**
- * Parse `read_file`, `file_write`, and `file_edit` payloads (EUD-068 tool_call
+ * Parse `read_file`, `file_write`, `file_edit` and their pure-IO `fs_*`
+ * counterparts (EUD-068 tool_call
  * args + tool_result text) into file-focused views. Reads and full writes show
  * syntax-highlighted content; exact edits show the ordered old/new replacements
  * as a diff. Every other tool keeps the JSON request/result rows.
@@ -179,23 +180,29 @@ function parseFileEditTool(tool: AgentTool): FileEditToolView | null {
  * file tool or its display payload cannot be recovered safely.
  */
 export function parseFileTool(tool: AgentTool): FileToolView | null {
-  if (tool.name === "file_edit") return parseFileEditTool(tool);
+  if (tool.name === "file_edit" || tool.name === "fs_edit") {
+    return parseFileEditTool(tool);
+  }
 
-  const mode =
-    tool.name === "read_file"
-      ? "read"
+  // `file_write` alone names the new text `code`; the others name it
+  // `content`, on the call for a write and on the result for a read.
+  const shape =
+    tool.name === "read_file" || tool.name === "fs_read"
+      ? { mode: "read" as const, field: "content" }
       : tool.name === "file_write"
-        ? "write"
-        : null;
-  if (!mode) return null;
+        ? { mode: "write" as const, field: "code" }
+        : tool.name === "fs_write"
+          ? { mode: "write" as const, field: "content" }
+          : null;
+  if (!shape) return null;
 
   const path = decodeJsonField(tool.args, "path") ?? "";
-  const source = mode === "write" ? tool.args : tool.detail;
-  const code = decodeJsonField(source, mode === "write" ? "code" : "content");
+  const source = shape.mode === "write" ? tool.args : tool.detail;
+  const code = decodeJsonField(source, shape.field);
   if (code === null) return null;
 
   return {
-    mode,
+    mode: shape.mode,
     path,
     code,
     language: languageForPath(path),

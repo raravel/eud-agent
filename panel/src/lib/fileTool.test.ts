@@ -80,6 +80,47 @@ describe("parseFileTool", () => {
     expect(view?.code).toBe("longcode");
   });
 
+  it("parses the fs_* tools the direct providers author with", () => {
+    // fs_write names the new text `content`, not `code`.
+    const written = parseFileTool({
+      id: "1",
+      name: "fs_write",
+      state: "done",
+      args: '{"path":"src/main.eps","content":"foo()"}',
+      detail: '{"ok":true,"path":"src/main.eps","created":true,"bytes":5}',
+    });
+    expect(written).toEqual({
+      mode: "write",
+      path: "src/main.eps",
+      code: "foo()",
+      language: "javascript",
+      truncated: false,
+    });
+
+    const read = parseFileTool({
+      id: "2",
+      name: "fs_read",
+      state: "done",
+      args: '{"path":"src/a.py"}',
+      detail: '{"path":"src/a.py","content":"print(1)","totalLines":1}',
+    });
+    expect(read?.mode).toBe("read");
+    expect(read?.code).toBe("print(1)");
+    expect(read?.language).toBe("python");
+
+    const edited = parseFileTool({
+      id: "3",
+      name: "fs_edit",
+      state: "running",
+      args: JSON.stringify({
+        path: "src/main.eps",
+        edits: [{ old_text: "oldCall();", new_text: "newCall();" }],
+      }),
+    });
+    expect(edited?.mode).toBe("edit");
+    expect(edited?.path).toBe("src/main.eps");
+  });
+
   it("parses file_edit exact replacements into an ordered diff", () => {
     const view = parseFileTool({
       id: "1",

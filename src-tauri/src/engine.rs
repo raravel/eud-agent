@@ -20,6 +20,8 @@ mod team;
 
 pub(crate) use team::emit_team_tasks;
 
+#[cfg(test)]
+use crate::provider_runtime::{AdapterEventKind, NormalizedBlock};
 use crate::{
     attachment::{AttachmentContext, AttachmentStore},
     ipc, journal,
@@ -31,10 +33,6 @@ use crate::{
     },
     tool_exec::SessionToolRuntime,
     workspace::{approved_plan_path, PreparedWorkspace, WorkspaceManager},
-};
-#[cfg(test)]
-use crate::{
-    provider_runtime::{AdapterEventKind, NormalizedBlock},
 };
 use parking_lot::Mutex as SyncMutex;
 use tauri::Emitter;
@@ -875,10 +873,7 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
     /// so the next turn starts a fresh native session. The panel log, candidate
     /// state, and task state are untouched; only the model-side thread restarts.
     pub async fn reset_conversation(&mut self) -> Result<(), AgentEngineError> {
-        if matches!(
-            self.phase,
-            Phase::PlanReview | Phase::Executing
-        ) {
+        if matches!(self.phase, Phase::PlanReview | Phase::Executing) {
             return Err(AgentEngineError::new(
                 "현재 세션의 진행 중인 요청 또는 검토를 먼저 완료해 주세요.",
             ));
@@ -1376,10 +1371,7 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
                 .validate()
                 .map_err(AgentEngineError::new)?;
         }
-        if matches!(
-            self.phase,
-            Phase::PlanReview | Phase::Executing
-        ) {
+        if matches!(self.phase, Phase::PlanReview | Phase::Executing) {
             return Err(AgentEngineError::new(
                 "현재 세션의 진행 중인 요청 또는 검토를 먼저 완료해 주세요.",
             ));
@@ -1636,7 +1628,9 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
             Err(error) => ipc::GitTurnEvent {
                 external: None,
                 turn: None,
-                warning: Some(format!("앱 밖에서 바뀐 파일을 기록하지 못했습니다: {error}")),
+                warning: Some(format!(
+                    "앱 밖에서 바뀐 파일을 기록하지 못했습니다: {error}"
+                )),
             },
         };
         let _ = self.sink.emit(EngineEvent::Git(event));
@@ -2183,10 +2177,7 @@ Continue the requested change now, run the mandatory build, and stop only after 
     /// selected by a message edit. The active saved session is retained, while
     /// the next chat starts a fresh Codex thread seeded from that prefix.
     pub async fn rewind(&mut self, panel_log: serde_json::Value) -> Result<(), AgentEngineError> {
-        if matches!(
-            self.phase,
-            Phase::PlanReview | Phase::Executing
-        ) {
+        if matches!(self.phase, Phase::PlanReview | Phase::Executing) {
             return Err(AgentEngineError::new(
                 "현재 세션의 진행 중인 요청 또는 검토를 먼저 완료해 주세요.",
             ));
@@ -2669,7 +2660,6 @@ Continue the requested change now, run the mandatory build, and stop only after 
         }
         Ok(())
     }
-
 }
 
 #[derive(Clone)]
@@ -4157,9 +4147,7 @@ impl SessionEngineManager {
         }
         let phase = worker.engine.lock().await.phase;
         let activity = match phase {
-            Phase::PlanReview => {
-                crate::write_coordinator::SessionActivity::Review
-            }
+            Phase::PlanReview => crate::write_coordinator::SessionActivity::Review,
             _ => crate::write_coordinator::SessionActivity::Idle,
         };
         worker.runtime.emit_activity(activity);
@@ -4501,7 +4489,6 @@ impl SessionEngineManager {
         }
         self.drive_pending_write(worker).await
     }
-
 
     async fn compact(&self, session_id: &str) -> Result<(), AgentEngineError> {
         let worker = self.worker(session_id).await?;
@@ -5056,7 +5043,6 @@ pub(crate) async fn engine_plan_approve(
         .map_err(|error| error.message)
 }
 
-
 #[tauri::command(rename = "harness_jobs")]
 pub(crate) async fn engine_harness_jobs(
     state: tauri::State<'_, SessionEngineManager>,
@@ -5416,25 +5402,32 @@ pub fn build_system_prompt(
 }
 
 /// Render the `[tools]` catalog from the live registry so the system prompt
-/// always matches what the eud-tools MCP server actually exposes (read vs
-/// journaled-write split). The agent invokes these through that MCP server.
+/// always matches what the eud-tools MCP server actually exposes. Three
+/// groups, because they differ in what they cost: reads, plain file I/O, and
+/// the validated project writers.
 fn tool_catalog_section() -> String {
     let mut read = Vec::new();
+    let mut files = Vec::new();
     let mut write = Vec::new();
     for spec in crate::tools::tool_registry() {
         let line = format!("- {} — {}", spec.name, spec.description);
-        if spec.requires_write_workspace {
+        if crate::tools::is_fs_tool(spec.name) {
+            files.push(line);
+        } else if spec.requires_write_workspace {
             write.push(line);
         } else {
             read.push(line);
         }
     }
     format!(
-        "[tools]\nThese eud-tools (exposed over the eud-tools MCP server) are the ONLY \
-way to read or mutate the live editor/map; every call and result is shown to the user. \
-Native filesystem tools are separately allowed only in the project workspace described \
-above.\nRead-only:\n{}\nWrite (validated, journaled, and reviewable/reversible as a changeset):\n{}",
+        "[tools]\nThese eud-tools (exposed over the eud-tools MCP server) are the only \
+way to reach the map, the build, and the sparse DAT documents; every call and result is \
+shown to the user. Project files you may also edit with your own native file tools.\n\
+Read-only:\n{}\nProject files (plain filesystem, no validation; the turn's git commit is \
+what makes them reversible):\n{}\nValidated project state (schema-checked and recorded \
+before it is written):\n{}",
         read.join("\n"),
+        files.join("\n"),
         write.join("\n")
     )
 }
@@ -9764,10 +9757,7 @@ mod tests {
                 .set_autonomous_run(&engine.session_id, Some(run))
                 .unwrap();
 
-            engine
-                .settle_request(None)
-                .await
-                .unwrap();
+            engine.settle_request(None).await.unwrap();
 
             let persisted = engine
                 .session_store

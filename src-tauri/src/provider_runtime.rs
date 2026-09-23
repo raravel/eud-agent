@@ -26,9 +26,8 @@ pub use conversation::{
 pub(crate) use factory::production_adapter;
 pub use identity::{BindingSnapshot, RunId, RunIdentity};
 pub use requests::{
-    AgentTurnInput, CompactionRequest,
-    ForegroundRequest, JobBase, RunPolicy, StructuredJobKind, StructuredJobRequest,
-    WorkspaceAccess,
+    AgentTurnInput, CompactionRequest, ForegroundRequest, JobBase, RunPolicy, StructuredJobKind,
+    StructuredJobRequest, WorkspaceAccess,
 };
 pub use runtime::{ProviderRuntime, RuntimeEventSink, StructuredJobExecutor};
 pub const TASK_STATE_COMPILER_DEADLINE: Duration = Duration::from_secs(60);

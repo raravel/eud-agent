@@ -10,7 +10,8 @@ use crate::{
 };
 
 use super::{
-    completion::durable_completion, gate_events::GateEvent, receipt::RunReceiptStore, DirectToolCall, DirectToolResult, DurableToolCompletion,
+    completion::durable_completion, gate_events::GateEvent, receipt::RunReceiptStore,
+    DirectToolCall, DirectToolResult, DurableToolCompletion,
 };
 
 pub(super) struct GateState {

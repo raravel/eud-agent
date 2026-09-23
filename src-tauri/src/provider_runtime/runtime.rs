@@ -8,9 +8,8 @@ use crate::{
 };
 
 use super::{
-    AdapterEventKind, AdapterLoopKind, BindingSnapshot, CompactionRequest,
-    ForegroundRequest, ProviderAdapter, ProviderRuntimeError, RunOutcome,
-    RuntimeExecutor, StructuredJobRequest,
+    AdapterEventKind, AdapterLoopKind, BindingSnapshot, CompactionRequest, ForegroundRequest,
+    ProviderAdapter, ProviderRuntimeError, RunOutcome, RuntimeExecutor, StructuredJobRequest,
 };
 
 mod compaction;

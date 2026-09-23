@@ -107,6 +107,3 @@ pub struct CompactionRequest {
     pub next_instruction_epoch: u64,
     pub policy: RunPolicy,
 }
-
-
-

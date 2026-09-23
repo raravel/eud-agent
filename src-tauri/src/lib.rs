@@ -27,6 +27,7 @@ pub mod config;
 pub mod context_state;
 pub mod e3s_nrbf;
 pub mod engine;
+pub mod fs_tools;
 pub mod git;
 pub mod harness;
 pub mod harness_import;

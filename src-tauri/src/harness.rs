@@ -794,7 +794,7 @@ fn stage_delta_inner(
         } else {
             let current = current
                 .ok_or_else(|| format!("harness document `{}` does not exist", document.path))?;
-            apply_exact_text_edits(&document.path, &current, &document.edits)
+            apply_exact_text_edits("file_edit", &document.path, &current, &document.edits)
                 .map_err(|error| error.to_string())?
         };
         updates.push(WorkspaceDocumentUpdate {

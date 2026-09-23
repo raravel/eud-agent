@@ -245,7 +245,8 @@ function ImageToolBlock({
 
 /**
  * A file-tool payload as an editor-style block: filename header plus either
- * syntax-highlighted content (`read_file` / `file_write`) or an ordered colored
+ * syntax-highlighted content (`read_file` / `file_write` / `fs_read` /
+ * `fs_write`) or an ordered colored
  * replacement diff (`file_edit`).
  */
 function FileToolBlock({ view }: { view: FileToolView }) {

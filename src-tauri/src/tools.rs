@@ -21,6 +21,29 @@ pub const SEARCH_DOCS_TOOL: &str = "search_docs";
 pub const DOCS_GET_TOOL: &str = "docs_get";
 /// Bounded source search tool name.
 pub const SOURCE_SEARCH_TOOL: &str = "source_search";
+
+/// The pure-IO filesystem tools (plan §N7). They read and write the project
+/// root and nothing else: no journal, no evidence, no write registration. What
+/// makes them reversible is the turn commit, the same as a Codex or Claude
+/// Code native edit. `maps/**`, `references/**`, `.git/**` and this session's
+/// own permission files stay read-only (§N2).
+pub const FS_READ_TOOL: &str = "fs_read";
+pub const FS_WRITE_TOOL: &str = "fs_write";
+pub const FS_EDIT_TOOL: &str = "fs_edit";
+pub const FS_GLOB_TOOL: &str = "fs_glob";
+pub const FS_GREP_TOOL: &str = "fs_grep";
+
+pub const FS_TOOLS: &[&str] = &[
+    FS_READ_TOOL,
+    FS_WRITE_TOOL,
+    FS_EDIT_TOOL,
+    FS_GLOB_TOOL,
+    FS_GREP_TOOL,
+];
+
+pub fn is_fs_tool(name: &str) -> bool {
+    FS_TOOLS.contains(&name)
+}
 /// Resolve one complete exact direct-Python dependency list into a bounded candidate.
 pub const PYTHON_DEPENDENCIES_PREPARE_TOOL: &str = "python_dependencies_prepare";
 /// Commit a previously prepared direct-Python dependency candidate.
@@ -432,6 +455,16 @@ fn read_tool(name: &'static str, description: &'static str, input_schema: Value)
     }
 }
 
+fn fs_tool(name: &'static str, description: &'static str, input_schema: Value) -> ToolSpec {
+    ToolSpec {
+        name,
+        description,
+        requires_write_workspace: false,
+        requires_project_transaction: false,
+        input_schema,
+    }
+}
+
 fn canonical_tool(name: &'static str, description: &'static str, input_schema: Value) -> ToolSpec {
     ToolSpec {
         name,
@@ -563,6 +596,10 @@ fn string_array_schema(max_items: usize) -> Value {
 
 fn string_schema() -> Value {
     json!({"type": "string"})
+}
+
+fn boolean_schema() -> Value {
+    json!({"type": "boolean"})
 }
 
 fn integer_schema() -> Value {
@@ -753,6 +790,69 @@ pub fn tool_registry() -> Vec<ToolSpec> {
                     "limit": integer_schema(),
                 }),
                 &["query"],
+            ),
+        ),
+        fs_tool(
+            FS_READ_TOOL,
+            "Read any project file as text, optionally by inclusive 1-based line range.",
+            schema(
+                json!({
+                    "path": string_schema(),
+                    "startLine": integer_schema(),
+                    "endLine": integer_schema(),
+                }),
+                &["path"],
+            ),
+        ),
+        fs_tool(
+            FS_GLOB_TOOL,
+            "List project files matching a '/'-separated glob; '**' spans folders and a pattern without '/' matches the file name at any depth.",
+            schema(
+                json!({
+                    "pattern": string_schema(),
+                    "offset": integer_schema(),
+                    "limit": integer_schema(),
+                    "includeGenerated": boolean_schema(),
+                }),
+                &["pattern"],
+            ),
+        ),
+        fs_tool(
+            FS_GREP_TOOL,
+            "Search project file contents with a regular expression, optionally scoped by a file glob.",
+            schema(
+                json!({
+                    "pattern": string_schema(),
+                    "glob": string_schema(),
+                    "caseSensitive": boolean_schema(),
+                    "contextLines": integer_schema(),
+                    "offset": integer_schema(),
+                    "limit": integer_schema(),
+                    "includeGenerated": boolean_schema(),
+                }),
+                &["pattern"],
+            ),
+        ),
+        fs_tool(
+            FS_WRITE_TOOL,
+            "Create or overwrite any project file; maps, references, .git and this session's permission files stay read-only.",
+            schema(
+                json!({
+                    "path": string_schema(),
+                    "content": string_schema(),
+                }),
+                &["path", "content"],
+            ),
+        ),
+        fs_tool(
+            FS_EDIT_TOOL,
+            "Apply ordered exact-text edits to any project file; the same paths stay read-only.",
+            schema(
+                json!({
+                    "path": string_schema(),
+                    "edits": exact_text_edits_schema(),
+                }),
+                &["path", "edits"],
             ),
         ),
         read_tool(
@@ -2316,7 +2416,6 @@ pub fn admit_tool_call(state: &mut RequestState, tool: &str, args: &Value) -> To
         }
     }
 
-
     validate_first_principles(&spec, args)?;
     if spec.requires_write_workspace {
         state.write_action_count = state.write_action_count.saturating_add(1);
@@ -2392,10 +2491,10 @@ fn validate_tool_args(spec: &ToolSpec, args: &Value) -> ToolResult<()> {
 }
 
 fn validate_tool_arg_semantics(spec: &ToolSpec, args: &Map<String, Value>) -> ToolResult<()> {
-    if spec.name == "file_edit" {
+    if spec.name == "file_edit" || spec.name == FS_EDIT_TOOL {
         let edits = args
             .get("edits")
-            .expect("generic schema validation guarantees file_edit.edits");
+            .expect("generic schema validation guarantees exact-edit tools carry edits");
         validate_nonempty_old_texts(spec, "edits", edits)?;
     }
     Ok(())
@@ -5526,6 +5625,69 @@ mod tests {
                 ),
             ),
             (
+                FS_READ_TOOL,
+                false,
+                schema(
+                    serde_json::json!({
+                        "path": string_schema(),
+                        "startLine": integer_schema(),
+                        "endLine": integer_schema(),
+                    }),
+                    &["path"],
+                ),
+            ),
+            (
+                FS_GLOB_TOOL,
+                false,
+                schema(
+                    serde_json::json!({
+                        "pattern": string_schema(),
+                        "offset": integer_schema(),
+                        "limit": integer_schema(),
+                        "includeGenerated": boolean_schema(),
+                    }),
+                    &["pattern"],
+                ),
+            ),
+            (
+                FS_GREP_TOOL,
+                false,
+                schema(
+                    serde_json::json!({
+                        "pattern": string_schema(),
+                        "glob": string_schema(),
+                        "caseSensitive": boolean_schema(),
+                        "contextLines": integer_schema(),
+                        "offset": integer_schema(),
+                        "limit": integer_schema(),
+                        "includeGenerated": boolean_schema(),
+                    }),
+                    &["pattern"],
+                ),
+            ),
+            (
+                FS_WRITE_TOOL,
+                false,
+                schema(
+                    serde_json::json!({
+                        "path": string_schema(),
+                        "content": string_schema(),
+                    }),
+                    &["path", "content"],
+                ),
+            ),
+            (
+                FS_EDIT_TOOL,
+                false,
+                schema(
+                    serde_json::json!({
+                        "path": string_schema(),
+                        "edits": exact_text_edits_schema(),
+                    }),
+                    &["path", "edits"],
+                ),
+            ),
+            (
                 PYTHON_DEPENDENCIES_PREPARE_TOOL,
                 false,
                 schema(
@@ -6219,6 +6381,31 @@ mod tests {
             &serde_json::json!({"dat": "units", "param": "HitPoints", "objId": 0}),
         )
         .is_err());
+    }
+
+    #[test]
+    fn fs_tools_are_pure_io_with_no_write_admission() {
+        for name in crate::tools::FS_TOOLS {
+            let spec = tool_spec(name).unwrap_or_else(|| panic!("missing tool {name}"));
+            assert!(
+                !spec.requires_write_workspace && !spec.requires_project_transaction,
+                "{name} must not carry journal or write-registration effects"
+            );
+        }
+    }
+
+    #[test]
+    fn fs_edit_rejects_an_empty_old_text_before_it_runs() {
+        let error = admit_tool_call(
+            &mut RequestState::for_request("request"),
+            FS_EDIT_TOOL,
+            &serde_json::json!({
+                "path": "src/main.eps",
+                "edits": [{"old_text": "", "new_text": "x"}],
+            }),
+        )
+        .expect_err("an empty old_text matches everywhere and must be refused");
+        assert!(error.to_string().contains("old_text"), "{error}");
     }
 
     #[test]

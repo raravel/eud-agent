@@ -1175,7 +1175,9 @@ fn configured_project_root(dirs: &DataDirs) -> Result<std::path::PathBuf, String
 /// The panel asks on open: a repository the app created commits every turn, one
 /// that was already here waits for the user to say it may.
 #[tauri::command]
-pub async fn git_state(state: tauri::State<'_, AppManaged>) -> Result<crate::git::RepoState, String> {
+pub async fn git_state(
+    state: tauri::State<'_, AppManaged>,
+) -> Result<crate::git::RepoState, String> {
     let dirs = state.dirs().clone();
     tauri::async_runtime::spawn_blocking(move || {
         let root = configured_project_root(&dirs)?;

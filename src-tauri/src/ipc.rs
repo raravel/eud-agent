@@ -1150,7 +1150,6 @@ mod tests {
 
         assert_json(&ipc::Decision::Accept, json!("accept"));
         assert_json(&ipc::Decision::Reject, json!("reject"));
-
     }
 
     #[test]
@@ -1784,11 +1783,13 @@ mod tests {
         assert_eq!(review.title, "검토할 변경이 있습니다");
         assert!(!review.body.contains("계획"));
 
-        let turn_complete = ipc::attention_notification_text(ipc::AttentionNotificationKind::AgentTurnComplete);
+        let turn_complete =
+            ipc::attention_notification_text(ipc::AttentionNotificationKind::AgentTurnComplete);
         assert_eq!(turn_complete.title, "에이전트 턴이 종료되었습니다");
         assert_eq!(turn_complete.body, "에이전트의 응답을 확인해 주세요.");
 
-        let ask = ipc::attention_notification_text(ipc::AttentionNotificationKind::AskResponseRequired);
+        let ask =
+            ipc::attention_notification_text(ipc::AttentionNotificationKind::AskResponseRequired);
         assert_eq!(ask.title, "에이전트가 응답을 기다리고 있습니다");
         assert_eq!(ask.body, "질문을 확인하고 답변해 주세요.");
     }

@@ -1639,7 +1639,6 @@ mod tests {
             task_state: Default::default(),
             autonomous_run: None,
 
-
             team_tasks: Vec::new(),
         }
     }
@@ -2676,7 +2675,6 @@ mod team_task_tests {
             context_state: Default::default(),
             task_state: Default::default(),
             autonomous_run: None,
-
 
             team_tasks: Vec::new(),
         }

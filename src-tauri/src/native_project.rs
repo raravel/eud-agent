@@ -2193,6 +2193,13 @@ pub fn normalize_output_map_relative(value: &str) -> Result<String, String> {
     normalize_relative_with(value, true)
 }
 
+/// Normalize an arbitrary path under the project root for the `fs_*` tools.
+/// They address the whole root, where `build/[EUD]name.scx` is a real file
+/// name, so brackets are allowed; everything `rules.md` rejects still is.
+pub(crate) fn normalize_relative_path(value: &str) -> Result<String, String> {
+    normalize_relative_with(value, true)
+}
+
 fn normalize_relative_with(value: &str, allow_brackets: bool) -> Result<String, String> {
     if value.is_empty()
         || value.contains(['\0', '\\', '\r', '\n'])

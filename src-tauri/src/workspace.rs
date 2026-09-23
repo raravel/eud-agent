@@ -2271,6 +2271,7 @@ pub struct ExactTextEdit {
 }
 
 pub(crate) fn apply_exact_text_edits(
+    tool: &str,
     path: &str,
     content: &str,
     edits: &[ExactTextEdit],
@@ -2278,7 +2279,7 @@ pub(crate) fn apply_exact_text_edits(
     if edits.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!("file_edit requires at least one edit for `{path}`"),
+            format!("{tool} requires at least one edit for `{path}`"),
         ));
     }
 
@@ -2287,7 +2288,7 @@ pub(crate) fn apply_exact_text_edits(
         if edit.old_text.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("file_edit edit {index} for `{path}` has empty old_text"),
+                format!("{tool} edit {index} for `{path}` has empty old_text"),
             ));
         }
 
@@ -2297,14 +2298,14 @@ pub(crate) fn apply_exact_text_edits(
         let Some(offset) = matches.next() else {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("file_edit edit {index} old_text was not found in `{path}`"),
+                format!("{tool} edit {index} old_text was not found in `{path}`"),
             ));
         };
         if matches.next().is_some() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!(
-                    "file_edit edit {index} old_text occurs more than once in `{path}`; include more surrounding context"
+                    "{tool} edit {index} old_text occurs more than once in `{path}`; include more surrounding context"
                 ),
             ));
         }
@@ -2859,6 +2860,7 @@ mod tests {
         let source =
             "function first() {\n    oldCall();\n}\n\nfunction second() {\n    keep();\n}\n";
         let edited = apply_exact_text_edits(
+            "file_edit",
             "main.eps",
             source,
             &[
@@ -2897,9 +2899,9 @@ mod tests {
                 new_text: "replacement".into(),
             },
         ] {
-            assert!(apply_exact_text_edits("main.eps", source, &[edit]).is_err());
+            assert!(apply_exact_text_edits("file_edit", "main.eps", source, &[edit]).is_err());
         }
-        assert!(apply_exact_text_edits("main.eps", source, &[]).is_err());
+        assert!(apply_exact_text_edits("file_edit", "main.eps", source, &[]).is_err());
     }
 
     #[test]

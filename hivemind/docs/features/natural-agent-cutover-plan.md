@@ -421,6 +421,52 @@ OpenCode Go / Ollama / Antigravity는 네이티브 도구가 원천적으로 없
     이 화면들은 아직 `tsc` + Vitest 증거뿐이다. 실제 `git_state`/`git_log`를 상대로
     렌더링된 적이 없다.
 
+- **Phase 6 — `fs_*` 순수 IO 도구 (2026-09-23).** `src-tauri/src/fs_tools.rs`가
+  `fs_read`/`fs_write`/`fs_edit`/`fs_glob`/`fs_grep`을 갖는다. 저널·evidence·쓰기 등록이
+  전혀 없다(`requires_write_workspace: false`, `requires_project_transaction: false`) —
+  Codex/Claude의 네이티브 편집과 동등하며, 되돌리기는 턴 커밋이다.
+  - 경로는 `native_project::normalize_relative_path`(절대·`..`·NUL·빈 컴포넌트 거부)를 거친
+    뒤 심볼릭 링크/재분석 지점을 거부하고 canonical 결과가 루트 안인지 확인한다. `\`는
+    `/`로 정규화한다 — 모델은 Windows에서 둘 다 쓴다.
+  - §N2 쓰기 금지는 `write_refusal` 하나가 판정하고 **이유를 말한다**. "안 된다"만 들은
+    모델은 같은 일을 다른 방법으로 시도한다.
+  - `fs_glob`/`fs_grep`은 `.git/`을 항상 건너뛰고, 앱의 `.gitignore`가 제외하는 것
+    (`build/`, `**/__epspy__/`, `compat/`, `.eud-agent/state/`)은 `includeGenerated`로만
+    본다. 생성된 그림자 파일을 반환하면 모델이 **틀린 파일을 고친다**.
+  - `fs_grep`은 `regex` 크레이트(이미 lock에 있다)를 쓴다. `source_search`의 한계였던
+    대소문자 무시 리터럴 substring·glob 없음이 사라졌다. 바이너리(NUL 탐지)와 2 MiB 초과
+    파일은 건너뛰고 그 수를 보고한다.
+  - 글로브는 직접 구현했다: `*`/`?`는 한 컴포넌트 안, `**`는 컴포넌트를 넘고, `/`가 없는
+    패턴은 **파일 이름을 아무 깊이에서나** 맞춘다(`fs_glob("*.eps")`가 모델의 의도대로 된다).
+    `**`는 4개까지.
+  - `apply_exact_text_edits`가 도구 이름을 받는다. `fs_edit` 실패가 "file_edit …"라고
+    말하면 모델이 없는 도구를 고치려 든다.
+  - 프롬프트의 `[tools]` 카탈로그가 세 묶음이 됐다(읽기 / 순수 파일 IO / 검증되는 프로젝트
+    상태). 기존 문구 "journaled, and reviewable/reversible as a changeset"은 Phase 5 이후
+    **거짓**이었다.
+  - 패널의 `parseFileTool`이 `fs_read`/`fs_write`/`fs_edit`도 코드·diff 뷰로 렌더링한다.
+    세 프로바이더에게는 이게 주 편집 도구가 된다.
+
+- **첫 실사용이 찾아낸 결함 2개 (2026-09-23).** 사용자가 `E:/proj/eud/rpg`에서 실제 턴을
+  돌렸고, 둘 다 내 Phase 1/3 결함이었다.
+  1. **git "dubious ownership".** 소유권을 기록하지 않는 볼륨(exFAT, 네트워크 공유)에서는
+     git이 **모든** 저장소를 거부한다. `prepare`의 `git init`은 통과하지만 이후 모든 명령이
+     실패해, 앱은 `auto_commit_ready = true`인 채로 턴마다 "기록하지 못했습니다"를 냈다.
+     이제 `run`이 명령마다 `-c safe.directory=`를 루트와 **그 상위 폴더들**(= `-C root`가
+     발견할 수 있는 저장소 집합, 그 이상은 아니다)에 붙인다. 사용자 config에는 쓰지 않는다.
+     - **실측:** `-c`(command scope)는 protected configuration이라 `safe.directory`에
+       적용된다(git 2.43.0, `GIT_TEST_ASSUME_DIFFERENT_OWNER=1`로 확인). 다만 git은
+       **자기 철자법**(슬래시, `\\?\` 접두사 없음)으로만 대조한다 — 역슬래시 형태는 조용히
+       무시된다. 이 한 가지가 "git이 고장난 것처럼" 보이게 하던 부분이다.
+  2. **`provider process boundary validation failed`.** Phase 3이 Claude Code의 네이티브
+     파일 도구를 열었는데, 프로세스 경계 검증은 CLI가 보고하는 **모든** 도구가
+     `mcp__eud-tools__*`이기를 요구한 채로 남아 있었다. 이제 CLI가 `Read`/`Edit`/`Write`/
+     `Glob`/`Grep`도 정직하게 보고하므로 **모든 인터랙티브 턴이 init 검증에서 죽었다.**
+     `request::tool_is_authorized`가 `--tools`에 보내는 바로 그 목록을 권위로 삼고,
+     `validate_init`과 `tool_use`/observation 검사 세 곳이 같이 쓴다. `Bash`, `Task`,
+     다른 MCP 서버는 여전히 런을 끝낸다. 테스트의 가짜 CLI도 실제 CLI처럼 보고하도록 고쳤다 —
+     이 결함이 통과한 이유가 바로 가짜 CLI가 MCP 도구만 보고했기 때문이다.
+
 Phase 1–2를 3보다 먼저 두는 이유: **되돌리기 수단과 경계 검증이 먼저 서 있어야** 자유 CRUD를
 열어도 안전하다. 어느 Phase에서 중단해도 제품은 동작 가능한 상태로 남는다.
 
@@ -447,8 +493,8 @@ Phase 1–2를 3보다 먼저 두는 이유: **되돌리기 수단과 경계 검
 
 해결된 항목은 결정과 날짜를 남긴다.
 
-1. **§N7 `fs_*` 도구 추가 여부** — **결정 (2026-09-23): 추가한다.** 다섯 프로바이더를 동등하게
-   만들고 `source_search`의 한계를 없앤다. Phase 6에서 구현한다.
+1. **§N7 `fs_*` 도구 추가 여부** — **완료 (2026-09-23).** Phase 6에서 구현했다. 다섯
+   프로바이더가 동등해졌고 `source_search`의 한계가 사라졌다.
 2. **턴 커밋의 "턴" 경계** — **결정 (2026-09-23): 둘 다 커밋한다.** 포그라운드 턴 종료
    (`chat_turn`)와 자율 런의 iteration 경계(`checkpoint_autonomous_boundary`) 모두가 커밋
    지점이다. 긴 자율 런을 중간 지점으로 되돌릴 수 있어야 한다. squash는 하지 않는다 —

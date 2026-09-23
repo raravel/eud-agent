@@ -600,7 +600,6 @@ impl SessionToolRuntime {
         *self.autonomous_emitter.lock() = Some(Arc::new(emitter));
     }
 
-
     pub fn set_team_executor(
         &self,
         executor: impl Fn(TeamTaskRequest) -> TeamTaskFuture + Send + Sync + 'static,
@@ -2221,6 +2220,20 @@ impl SessionToolRuntime {
                 build_log_page(&content, args)
             }
             tools::SOURCE_SEARCH_TOOL => self.source_search(args),
+            // The pure-IO tools need the root, not the manifest: they are the
+            // same filesystem Codex and Claude Code already edit natively.
+            name if tools::is_fs_tool(name) => {
+                let root = self.services.native().project_root()?;
+                let root = std::fs::canonicalize(&root)
+                    .map_err(|error| format!("프로젝트 루트를 확인하지 못했습니다: {error}"))?;
+                match name {
+                    tools::FS_READ_TOOL => crate::fs_tools::read(&root, args),
+                    tools::FS_WRITE_TOOL => crate::fs_tools::write(&root, args),
+                    tools::FS_EDIT_TOOL => crate::fs_tools::edit(&root, args),
+                    tools::FS_GLOB_TOOL => crate::fs_tools::glob(&root, args),
+                    _ => crate::fs_tools::grep(&root, args),
+                }
+            }
             tools::PYTHON_DEPENDENCIES_PREPARE_TOOL => {
                 let values = array_arg(args, "dependencies")?;
                 let dependencies = values
@@ -3318,13 +3331,14 @@ impl SessionToolRuntime {
                 let edit_base = self
                     .latest_file_content(request_id, &path)
                     .unwrap_or_else(|| base.clone());
-                let ours = apply_exact_text_edits(&path, &edit_base, &edits)
+                let ours = apply_exact_text_edits("file_edit", &path, &edit_base, &edits)
                     .map_err(|error| error.to_string())?;
                 crate::workspace::merge_concurrent_text(&path, &edit_base, &ours, &old)
                     .map_err(|error| error.to_string())?
             }
             None if self.source_created_by_request(request_id, &path) => {
-                apply_exact_text_edits(&path, &old, &edits).map_err(|error| error.to_string())?
+                apply_exact_text_edits("file_edit", &path, &old, &edits)
+                    .map_err(|error| error.to_string())?
             }
             None => {
                 return Err(concurrent_source_conflict(
@@ -5520,7 +5534,6 @@ mod tests {
         assert!(!runtime.ask_expired_for_request("req-ask-expire"));
     }
 
-
     fn run_identity(
         runtime: &SessionToolRuntime,
         run: u64,
@@ -5763,7 +5776,6 @@ mod tests {
         assert!(runtime.active_team_task().is_none());
     }
 
-
     fn ready_summary() -> crate::team::TeamCandidateSummary {
         crate::team::TeamCandidateSummary {
             revision: 1,
@@ -5931,7 +5943,6 @@ mod tests {
             .unwrap_err();
         assert!(unavailable.contains("unavailable"), "{unavailable}");
     }
-
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn restored_pending_ask_reports_the_remaining_wait() {
