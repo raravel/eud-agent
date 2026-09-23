@@ -2497,7 +2497,10 @@ fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T, String> {
 }
 
 fn remove_if_exists(path: &Path) -> Result<(), String> {
-    match std::fs::remove_file(path) {
+    // The same Windows contention that stalls the promotion rename also stalls
+    // deleting the file it left behind, and a scanner's handle is not a reason
+    // to fail a finalize.
+    match crate::memory::retry_transient(|| std::fs::remove_file(path)) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(format!(
