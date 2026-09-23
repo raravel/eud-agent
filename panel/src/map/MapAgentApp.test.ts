@@ -448,6 +448,32 @@ describe("Candidate mention freshness", () => {
 
     expect(stale.stale).toBe(true);
   });
+
+  it("drops region and stamp chips whose saved selection was deleted", () => {
+    const stampChip: MentionChip = {
+      id: "stamp-chip",
+      label: "stamp:영역 A",
+      mention: { kind: "stamp", selectionId: "target", snapshotHash: "mask-a" },
+    };
+    const locationChip: MentionChip = {
+      id: "location-chip",
+      label: "location:#3",
+      mention: {
+        kind: "location",
+        locationId: 3,
+        revisionKey: "r2:candidate",
+        baselineHash: "baseline",
+      },
+    };
+
+    const remaining = staleMentions([chip, stampChip, locationChip], {
+      ...candidate,
+      selections: [],
+    });
+
+    expect(remaining.map((item) => item.id)).toEqual(["location-chip"]);
+    expect(remaining[0].stale).toBe(false);
+  });
 });
 
 
@@ -519,7 +545,7 @@ describe("Edited message mention restoration", () => {
 });
 
 describe("Imported stamp mention freshness", () => {
-  it("marks deleted, unavailable, or snapshot-mismatched imported chips stale", () => {
+  it("drops deleted imported chips and marks unavailable or snapshot-mismatched ones stale", () => {
     const chip = {
       id: "chip",
       label: "imported:언덕",
@@ -536,7 +562,7 @@ describe("Imported stamp mention freshness", () => {
       compatible: true,
     } as ImportedStampView;
     expect(staleImportedMentions([chip], [stamp])[0].stale).toBe(false);
-    expect(staleImportedMentions([chip], [])[0].stale).toBe(true);
+    expect(staleImportedMentions([chip], [])).toEqual([]);
     expect(
       staleImportedMentions(
         [chip],

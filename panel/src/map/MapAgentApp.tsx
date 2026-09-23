@@ -19,6 +19,7 @@ import type {
   TurnState,
 } from "@/state/store";
 import { Button } from "@/components/ui/button";
+import { Switch } from "@/components/ui/switch";
 import type {
   AskAnswer,
   AskQuestion,
@@ -221,6 +222,8 @@ interface PersistedSurfaceState {
   view?: MapView;
   layers?: MapLayer[];
   interactionMode?: "select" | "inspect" | "pan";
+  /** Saved selections keep their translucent fill (default) or show outlines only. */
+  selectionFill?: boolean;
 }
 
 function loadSurfaceState(): PersistedSurfaceState {
@@ -398,36 +401,40 @@ async function loadAllObjects(
   return pages.flat();
 }
 
+/**
+ * Re-evaluate tray chips against the candidate. A chip whose saved selection no
+ * longer exists has nothing left to point at, so it is dropped instead of kept
+ * as a stale chip the user would have to remove by hand; a chip whose target
+ * still exists but changed stays as a stale chip.
+ */
 export function staleMentions(chips: MentionChip[], candidate: CandidateStateView): MentionChip[] {
-  return chips.map((chip) => {
+  return chips.flatMap((chip) => {
     let stale = false;
     const mention = chip.mention;
     if (mention.kind === "region") {
       const selection = candidate.selections.find(
         (item) => item.id === mention.selectionId,
       );
+      if (!selection) return [];
       stale =
-        !selection ||
         selection.snapshotHash !== mention.snapshotHash ||
         selection.sourceRevision !== candidate.revisionKey;
       return {
         ...chip,
         stale,
-        mention:
-          !stale && selection
-            ? { ...mention, sourceRevision: selection.sourceRevision }
-            : mention,
+        mention: stale
+          ? mention
+          : { ...mention, sourceRevision: selection.sourceRevision },
       };
     } else if (mention.kind === "stamp") {
       const selection = candidate.selections.find(
         (item) => item.id === mention.selectionId,
       );
+      if (!selection) return [];
       return {
         ...chip,
-        stale: !selection,
-        mention: selection
-          ? { ...mention, snapshotHash: selection.snapshotHash }
-          : mention,
+        stale: false,
+        mention: { ...mention, snapshotHash: selection.snapshotHash },
       };
     } else if (mention.kind === "object") {
       stale =
@@ -446,15 +453,18 @@ export function staleImportedMentions(
   chips: MentionChip[],
   imported: ImportedStampView[],
 ): MentionChip[] {
-  return chips.map((chip) => {
+  return chips.flatMap((chip) => {
     const mention = chip.mention;
     if (mention.kind !== "importedStamp") return chip;
-    const stamp = imported.find(
-      (entry) =>
-        entry.id === mention.importId &&
-        entry.snapshotHash === mention.snapshotHash,
-    );
-    return { ...chip, stale: !stamp || !stamp.available || !stamp.compatible };
+    const stamp = imported.find((entry) => entry.id === mention.importId);
+    if (!stamp) return [];
+    return {
+      ...chip,
+      stale:
+        stamp.snapshotHash !== mention.snapshotHash ||
+        !stamp.available ||
+        !stamp.compatible,
+    };
   });
 }
 
@@ -859,6 +869,7 @@ export default function MapAgentApp() {
   const [contextUsage, setContextUsage] = useState<ContextUsage | null>(null);
   const [view, setView] = useState<MapView>(persisted.view ?? "candidate");
   const [layers, setLayers] = useState<MapLayer[]>(persisted.layers ?? allLayers);
+  const [selectionFill, setSelectionFill] = useState(persisted.selectionFill ?? true);
   const [interactionMode, setInteractionMode] = useState<"select" | "inspect" | "pan">(
     persisted.interactionMode ?? "select",
   );
@@ -866,7 +877,7 @@ export default function MapAgentApp() {
   const [selectionShape, setSelectionShape] = useState<SelectionShape>("rectangle");
   const [selectionOperation, setSelectionOperation] = useState<SelectionOperation>("replace");
   const [selectionRole, setSelectionRole] = useState<SelectionRole>("target");
-  const [selectionLayers, setSelectionLayers] = useState<MapLayer[]>(["terrain"]);
+  const [selectionLayers, setSelectionLayers] = useState<MapLayer[]>(allLayers);
   const [selectionLabel, setSelectionLabel] = useState("영역 A");
   const [cursor, setCursor] = useState<{ x: number; y: number } | null>(null);
   const [zoom, setZoom] = useState(0.25);
@@ -1248,9 +1259,9 @@ export default function MapAgentApp() {
   useEffect(() => {
     localStorage.setItem(
       "map-agent.surface/1",
-      JSON.stringify({ view, layers, interactionMode }),
+      JSON.stringify({ view, layers, interactionMode, selectionFill }),
     );
-  }, [interactionMode, layers, view]);
+  }, [interactionMode, layers, selectionFill, view]);
 
   useEffect(() => {
     if (!bootstrap || conversation.length === 0) return;
@@ -1927,6 +1938,14 @@ export default function MapAgentApp() {
     selectionLayers,
     selectionRole,
   ]);
+
+  /** Enter a saved selection's edit mode: its mask becomes the active selection with its label/role/layers. */
+  const loadSelection = useCallback((selection: SavedSelection) => {
+    setActiveCells(rowsToCells(selection.rows));
+    setSelectionLabel(selection.label);
+    setSelectionRole(selection.role);
+    setSelectionLayers(selection.layers);
+  }, []);
 
   const addRegionMention = useCallback((selection: SavedSelection) => {
     const chip: MentionChip = {
@@ -2872,6 +2891,7 @@ export default function MapAgentApp() {
           view={renderedView}
           layers={layers}
           selections={candidate.selections}
+          selectionFill={selectionFill}
           activeRows={minimapActiveRows}
           objects={renderedObjects}
           diffRows={diffDetails.terrainRows}
@@ -2895,6 +2915,7 @@ export default function MapAgentApp() {
           view={renderedView}
           layers={layers}
           selections={candidate.selections}
+          selectionFill={selectionFill}
           activeCells={activeCells}
           selectionShape={selectionShape}
           selectionOperation={selectionOperation}
@@ -3028,12 +3049,7 @@ export default function MapAgentApp() {
               setActiveCells(new Set());
             }).catch((reason) => setError(String(reason)))}
             onClear={() => setActiveCells(new Set())}
-            onLoadSelection={(selection) => {
-              setActiveCells(rowsToCells(selection.rows));
-              setSelectionLabel(selection.label);
-              setSelectionRole(selection.role);
-              setSelectionLayers(selection.layers);
-            }}
+            onLoadSelection={loadSelection}
             onDeleteSelection={(selection) => {
               if (stampPlacementRef.current?.selection.id === selection.id) {
                 clearStampPlacement();
@@ -3114,7 +3130,17 @@ export default function MapAgentApp() {
           onModelSettingsReload={() => void loadModelSettings()}
           onLocationMention={handleLocationMention}
           onRegionMention={addRegionMention}
-          onMentionSelect={setSelectedMentionId}
+          onMentionSelect={(id) => {
+            setSelectedMentionId(id);
+            const chip = mentions.find((item) => item.id === id);
+            if (chip?.mention.kind === "region" || chip?.mention.kind === "stamp") {
+              const selectionId = chip.mention.selectionId;
+              const selection = candidate.selections.find(
+                (item) => item.id === selectionId,
+              );
+              if (selection) loadSelection(selection);
+            }
+          }}
           onMentionRemove={(id) => {
             setMentions((chips) => chips.filter((chip) => chip.id !== id));
             if (selectedMentionId === id) setSelectedMentionId(undefined);
@@ -3217,6 +3243,18 @@ export default function MapAgentApp() {
               </button>
             ))}
           </div>
+          <label
+            className="flex shrink-0 cursor-pointer items-center gap-1.5 text-[11px] text-muted-foreground"
+            title="켜면 저장된 영역의 색 채우기를 없애고 테두리만 남겨 원본 지형이 보입니다"
+          >
+            <Switch
+              checked={!selectionFill}
+              aria-label="영역 투명"
+              className="scale-90"
+              onCheckedChange={(checked) => setSelectionFill(!checked)}
+            />
+            영역 투명
+          </label>
           <div className="min-w-0 flex-1 overflow-hidden">
             <CandidateControls candidate={candidate} details={diffDetails} />
           </div>
