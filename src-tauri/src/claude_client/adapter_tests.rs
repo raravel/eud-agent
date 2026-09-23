@@ -526,6 +526,65 @@ $null = [Console]::In.ReadLine()
     assert!(matches!(error, ProviderRuntimeError::Protocol(_)));
 }
 
+/// A harness prompt carries up to 192 KiB of accepted context. Windows caps a whole
+/// command line at 32,767 characters, so an argument prompt fails the spawn itself and
+/// every attempt reports `provider_transport_closed`.
+#[tokio::test]
+async fn structured_prompt_over_the_command_line_limit_reaches_the_cli() {
+    let fixture = FixtureDir::new();
+    let stdin_file = fixture.0.join("structured-stdin.txt");
+    let args_file = fixture.0.join("structured-args.json");
+    let escaped_stdin = stdin_file.display().to_string().replace('\'', "''");
+    let escaped_args = args_file.display().to_string().replace('\'', "''");
+    let script = write_script(
+        &fixture.0,
+        &format!(
+            r#"param([Parameter(ValueFromRemainingArguments=$true)][string[]]$Rest)
+[IO.File]::WriteAllText('{escaped_stdin}', [Console]::In.ReadToEnd())
+[IO.File]::WriteAllText('{escaped_args}', ($Rest | ConvertTo-Json -Compress))
+[Console]::Out.Write('{{"type":"result","subtype":"success","is_error":false,"structured_output":{{"ok":true}}}}')
+exit 0
+"#
+        ),
+    );
+    let mut adapter = adapter(&fixture.0, &script);
+    let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(0_u64);
+    let prompt = format!("{}END", "accepted journal entry. ".repeat(8 * 1024));
+    assert!(prompt.len() > 32 * 1024);
+    let mut request = structured_request(
+        &fixture.0,
+        13,
+        json!({"type":"object","properties":{"ok":{"type":"boolean"}},"required":["ok"],"additionalProperties":false}),
+        cancel_rx,
+    );
+    let AdapterRequestKind::Structured {
+        prompt: ref mut slot,
+        ..
+    } = request.kind
+    else {
+        unreachable!("structured request");
+    };
+    slot.clone_from(&prompt);
+
+    let (events_tx, _events_rx) = tokio::sync::mpsc::channel(8);
+    let outcome = adapter.run_step(request, events_tx).await.unwrap();
+
+    assert!(matches!(outcome, AdapterStepOutcome::Completed {
+        output: AdapterOutput::Structured(ref value),
+        ..
+    } if value == &json!({"ok":true})));
+    assert_eq!(
+        std::fs::read_to_string(&stdin_file).unwrap().trim_end(),
+        prompt
+    );
+    let args: Value = serde_json::from_slice(&std::fs::read(args_file).unwrap()).unwrap();
+    assert!(!args
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|value| value.as_str() == Some(prompt.as_str())));
+}
+
 #[tokio::test]
 async fn structured_process_isolated_and_schema_strict() {
     let fixture = FixtureDir::new();

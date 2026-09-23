@@ -118,8 +118,7 @@ function Run-DelegatedSequence($endpoint, $prompt) {
 
 if ($Mode -eq 'claude') {
     if ($Rest -contains '--json-schema') {
-        $promptIndex = [Array]::IndexOf($Rest, '-p')
-        $prompt = $Rest[$promptIndex + 1]
+        $prompt = [Console]::In.ReadToEnd()
         $result = @{type='result'; subtype='success'; is_error=$false; structured_output=@{ok=$true}}
         switch ($prompt) {
             'structured-hang' { Hold-StructuredProcess }

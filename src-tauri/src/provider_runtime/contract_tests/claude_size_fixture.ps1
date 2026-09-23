@@ -3,8 +3,7 @@ $Rest = @($args)
 
 $schemaIndex = [Array]::IndexOf($Rest, '--json-schema')
 if ($schemaIndex -ge 0) {
-    $promptIndex = [Array]::IndexOf($Rest, '-p')
-    $prompt = $Rest[$promptIndex + 1]
+    $prompt = [Console]::In.ReadToEnd()
     $structured = if ($prompt -eq 'structured-semantic-over-limit') {
         @{value=('x' * 70000)}
     } else {
