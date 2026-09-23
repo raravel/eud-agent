@@ -105,7 +105,21 @@ pub(super) fn model_args(model: &str, effort: Option<&str>) -> Result<Vec<String
 /// The built-in tools an interactive turn may use. Reading and editing the
 /// project directly is the point of the cutover; `Bash` and every other
 /// built-in stay out, so running anything is still `build_run` alone.
-const NATIVE_FILE_TOOLS: &str = "Read,Edit,Write,Glob,Grep";
+pub(super) const NATIVE_FILE_TOOL_NAMES: &[&str] = &["Read", "Edit", "Write", "Glob", "Grep"];
+
+/// A tool name this run authorized: an eud-tools MCP tool, or one of the
+/// native file tools above. The process boundary checks every tool the CLI
+/// announces and every observation it reports against this, so a CLI that ran
+/// something nobody allowed — `Bash` above all — ends the run instead of
+/// being trusted. It is the same list `--tools` sends, so opening a tool and
+/// authorizing it cannot drift apart.
+pub(super) fn tool_is_authorized(name: &str) -> bool {
+    name.starts_with("mcp__eud-tools__") || NATIVE_FILE_TOOL_NAMES.contains(&name)
+}
+
+fn native_file_tools() -> String {
+    NATIVE_FILE_TOOL_NAMES.join(",")
+}
 
 /// Paths no turn writes, whatever tool it reaches for. `maps/` and
 /// `references/` are binary and belong to MapSafe's backup, verification and
@@ -155,9 +169,9 @@ pub(super) fn stream_args(
             mcp_config.to_string(),
             "--strict-mcp-config".to_string(),
             "--tools".to_string(),
-            NATIVE_FILE_TOOLS.to_string(),
+            native_file_tools(),
             "--allowedTools".to_string(),
-            format!("{NATIVE_FILE_TOOLS},mcp__eud-tools__*"),
+            format!("{},mcp__eud-tools__*", native_file_tools()),
             "--disallowedTools".to_string(),
             PROTECTED_PATH_RULES.to_string(),
             "--permission-mode".to_string(),
@@ -214,6 +228,31 @@ pub(super) async fn terminate_child(
 #[cfg(test)]
 mod tests {
     use super::{model_args, stream_args, validate_workspace_boundary};
+
+    #[test]
+    fn authorization_covers_exactly_the_tools_this_run_opens() {
+        for opened in super::NATIVE_FILE_TOOL_NAMES {
+            assert!(super::tool_is_authorized(opened), "{opened}");
+        }
+        assert!(super::tool_is_authorized("mcp__eud-tools__build_run"));
+        // Running anything is `build_run` alone, and another server's tools
+        // are not this app's to admit.
+        assert!(!super::tool_is_authorized("Bash"));
+        assert!(!super::tool_is_authorized("Task"));
+        assert!(!super::tool_is_authorized("mcp__other__read_file"));
+    }
+
+    #[test]
+    fn the_opened_tools_and_the_advertised_tools_are_one_list() {
+        let args = stream_args(Some("{}"), Some("s1"), false, "provider-default", None).unwrap();
+        let index = args.iter().position(|arg| arg == "--tools").unwrap();
+        for tool in args[index + 1].split(',') {
+            assert!(
+                super::tool_is_authorized(tool),
+                "{tool} is opened but not authorized"
+            );
+        }
+    }
 
     #[test]
     fn provider_default_delegates_model_and_effort_to_the_cli() {

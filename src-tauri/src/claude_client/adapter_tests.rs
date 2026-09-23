@@ -168,7 +168,7 @@ async fn production_process_preserves_stream_order_native_tools_and_resume() {
 [IO.File]::WriteAllText('{escaped_args}', ($Rest | ConvertTo-Json -Compress))
 $null = [Console]::In.ReadLine()
 if ($Rest -contains '--mcp-config') {{
-  [Console]::Out.WriteLine('{{"type":"system","subtype":"init","session_id":"native-session","tools":["mcp__eud-tools__read_file"],"mcp_servers":[{{"name":"eud-tools","status":"connected"}}]}}')
+  [Console]::Out.WriteLine('{{"type":"system","subtype":"init","session_id":"native-session","tools":["Read","Edit","Write","Glob","Grep","mcp__eud-tools__read_file"],"mcp_servers":[{{"name":"eud-tools","status":"connected"}}]}}')
 }} else {{
   [Console]::Out.WriteLine('{{"type":"system","subtype":"init","session_id":"native-session","tools":[],"mcp_servers":[]}}')
 }}

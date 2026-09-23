@@ -143,15 +143,43 @@ pub fn available() -> bool {
     git_binary().is_some()
 }
 
+/// git refuses to touch a repository it decides belongs to someone else. On a
+/// volume that records no ownership at all — exFAT, a network share — that is
+/// every repository on it, so an ordinary project on an ordinary drive stops
+/// the app with "detected dubious ownership" before it can commit anything.
+///
+/// The exception is passed per command and never written to the user's config,
+/// and it covers only the project root and the folders above it: exactly the
+/// repositories `-C root` could discover, and nothing else on the machine.
+/// git matches these against its own spelling of the path — forward-slashed,
+/// with no `\\?\` prefix — and silently ignores any other form.
+fn safe_directory_args(root: &Path) -> Vec<String> {
+    root.ancestors()
+        .map(git_path)
+        .filter(|path| !path.is_empty())
+        .map(|path| format!("safe.directory={path}"))
+        .collect()
+}
+
+/// A path as git spells it.
+fn git_path(path: &Path) -> String {
+    let text = path.to_string_lossy();
+    text.strip_prefix("\\\\?\\")
+        .unwrap_or(&text)
+        .replace('\\', "/")
+}
+
 /// Run one git command rooted at `root` and return its output, whatever the
 /// exit status. Only a failure to start the process is an error here; a
 /// non-zero status is the caller's to interpret.
 fn run(root: &Path, args: &[&str]) -> Result<Output, String> {
     let binary = git_binary().ok_or_else(|| "git이 설치되어 있지 않습니다.".to_string())?;
     let mut command = Command::new(binary);
+    command.arg("-C").arg(root);
+    for exception in safe_directory_args(root) {
+        command.arg("-c").arg(exception);
+    }
     command
-        .arg("-C")
-        .arg(root)
         // Windows project paths are long (checkpoint 41's Map path work); a
         // repository the app creates must not fail on one.
         .args(["-c", "core.longpaths=true"])
@@ -622,12 +650,7 @@ pub struct CommitDetail {
 pub fn commit_detail(root: &Path, sha: &str) -> Result<CommitDetail, String> {
     let header = run_ok(
         root,
-        &[
-            "show",
-            "--no-patch",
-            "--format=%H%x1f%ct%x1f%s%x1f%b",
-            sha,
-        ],
+        &["show", "--no-patch", "--format=%H%x1f%ct%x1f%s%x1f%b", sha],
     )?;
     let mut parts = header.splitn(4, '\u{1f}');
     let resolved = parts.next().unwrap_or_default().trim().to_string();
@@ -645,7 +668,13 @@ pub fn commit_detail(root: &Path, sha: &str) -> Result<CommitDetail, String> {
 
     let stats = run_ok(
         root,
-        &["show", "--numstat", "--format=", "--find-renames", &resolved],
+        &[
+            "show",
+            "--numstat",
+            "--format=",
+            "--find-renames",
+            &resolved,
+        ],
     )?;
     let mut budget = MAX_COMMIT_PATCH_BYTES;
     let mut files = Vec::new();
@@ -660,7 +689,10 @@ pub fn commit_detail(root: &Path, sha: &str) -> Result<CommitDetail, String> {
         let path = path.rsplit(" => ").next().unwrap_or(path).trim_matches('"');
         let binary = added == "-" || removed == "-";
         let (patch, omitted) = if binary {
-            (None, Some("바이너리 파일이라 내용 비교를 표시하지 않습니다.".to_string()))
+            (
+                None,
+                Some("바이너리 파일이라 내용 비교를 표시하지 않습니다.".to_string()),
+            )
         } else {
             file_patch(root, &resolved, path, &mut budget)
         };
@@ -719,6 +751,31 @@ fn file_patch(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_volume_without_ownership_still_gets_its_exception() {
+        // The first live run failed here: git refuses "dubious ownership" on a
+        // volume that records none, which is every repository on it.
+        let exceptions = super::safe_directory_args(Path::new(r"E:\proj\eud\rpg"));
+        // git matches its own spelling of the path; a backslash form is
+        // silently ignored, which is how this looked like git being broken.
+        assert!(exceptions.contains(&"safe.directory=E:/proj/eud/rpg".to_string()));
+        // A project inside a larger repository is covered by the ancestor that
+        // actually holds the work tree.
+        assert!(exceptions.contains(&"safe.directory=E:/proj/eud".to_string()));
+        assert!(
+            exceptions.iter().all(|entry| !entry.contains('\\')),
+            "{exceptions:?}"
+        );
+    }
+
+    #[test]
+    fn the_extended_length_prefix_never_reaches_git() {
+        assert_eq!(
+            super::git_path(Path::new(r"\\?\E:\proj\eud\rpg")),
+            "E:/proj/eud/rpg"
+        );
+    }
 
     /// A fresh directory for one test.
     fn temp_root(tag: &str) -> PathBuf {
@@ -964,7 +1021,10 @@ mod tests {
             .unwrap();
         assert_eq!((edited.insertions, edited.deletions), (1, 1));
         assert!(!edited.binary);
-        let patch = edited.patch.as_deref().expect("a text file carries a patch");
+        let patch = edited
+            .patch
+            .as_deref()
+            .expect("a text file carries a patch");
         assert!(patch.contains("-const a = 1;"), "{patch}");
         assert!(patch.contains("+const a = 2;"), "{patch}");
         assert!(edited.omitted.is_none());

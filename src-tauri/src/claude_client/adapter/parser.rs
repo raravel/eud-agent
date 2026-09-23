@@ -213,7 +213,7 @@ impl ClaudeStreamParser {
                 && self
                     .tools
                     .iter()
-                    .all(|tool| tool.starts_with("mcp__eud-tools__"))
+                    .all(|tool| super::request::tool_is_authorized(tool))
         } else {
             self.tools.is_empty()
         };
@@ -223,5 +223,72 @@ impl ClaudeStreamParser {
             ));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ClaudeStreamParser;
+    use serde_json::json;
+
+    fn parse_init(tools: &[&str]) -> ClaudeStreamParser {
+        let mut parser = ClaudeStreamParser::default();
+        parser
+            .apply(&json!({
+                "type": "system",
+                "subtype": "init",
+                "session_id": "native-session",
+                "tools": tools,
+                "mcp_servers": [{"name": "eud-tools", "status": "connected"}],
+            }))
+            .expect("an init line parses");
+        parser
+    }
+
+    #[test]
+    fn an_interactive_init_may_list_the_native_file_tools() {
+        // What the real CLI reports once `--tools Read,Edit,...` is passed.
+        // Requiring every tool to be an eud-tools MCP tool failed every
+        // interactive turn with "provider process boundary validation failed".
+        parse_init(&[
+            "Read",
+            "Edit",
+            "Write",
+            "Glob",
+            "Grep",
+            "mcp__eud-tools__read_file",
+        ])
+        .validate_init(true)
+        .expect("the tools this run opened are authorized");
+    }
+
+    #[test]
+    fn an_init_that_lists_an_unopened_tool_still_ends_the_run() {
+        for unopened in ["Bash", "WebFetch", "mcp__other__read"] {
+            assert!(
+                parse_init(&["mcp__eud-tools__read_file", unopened])
+                    .validate_init(true)
+                    .is_err(),
+                "{unopened} was never opened and must end the run"
+            );
+        }
+    }
+
+    #[test]
+    fn compaction_still_runs_with_no_tools_at_all() {
+        let mut parser = ClaudeStreamParser::default();
+        parser
+            .apply(&json!({
+                "type": "system",
+                "subtype": "init",
+                "session_id": "native-session",
+                "tools": [],
+                "mcp_servers": [],
+            }))
+            .expect("an init line parses");
+        parser
+            .validate_init(false)
+            .expect("compaction has no tools");
+        assert!(parser.validate_init(true).is_err());
     }
 }
