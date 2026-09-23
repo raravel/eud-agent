@@ -51,6 +51,33 @@ export function resolveWorkspaceLink(
   );
 }
 
+/** Project-relative prefix of the agent's workspace documents. */
+const WORKSPACE_DOCUMENT_PREFIX = ".eud-agent/workspace/";
+
+/**
+ * Resolve a file path the agent wrote as text (typically inline code in a chat
+ * answer) to a workspace file. Accepts `./` prefixes, `\` separators, and a
+ * trailing `:line` or `:line:col`; a path relative to the agent workspace
+ * (`specs/opening.md`) also matches its project-relative document. Anything
+ * that is not exactly a listed file resolves to null.
+ */
+export function resolveMentionedWorkspacePath(
+  files: WorkspaceFileEntry[],
+  text: string,
+): WorkspaceFileEntry | null {
+  const path = text
+    .trim()
+    .replace(/\\/g, "/")
+    .replace(/:\d+(?::\d+)?$/, "")
+    .replace(/^(?:\.\/)+/, "");
+  if (!path || path.startsWith("/") || /^[a-z]:/i.test(path)) return null;
+  for (const candidate of [path, `${WORKSPACE_DOCUMENT_PREFIX}${path}`]) {
+    const file = files.find((entry) => entry.path === candidate);
+    if (file) return file;
+  }
+  return null;
+}
+
 /**
  * Rewrite every relative Markdown link that resolves to a workspace file into
  * the internal prefix form handled by {@link resolveWorkspaceLink} on click.

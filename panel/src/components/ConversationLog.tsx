@@ -46,6 +46,7 @@ import { Spinner } from "@/components/ui/spinner";
 import { cn } from "@/lib/utils";
 import { AgentStream, ToolList } from "@/components/AgentStream";
 import { AgentAnswer } from "@/components/AgentAnswer";
+import { CHAT_MARKDOWN_COMPONENTS } from "@/components/WorkspacePathCode";
 import { isBusyPhase } from "@/state/store";
 import type { LogEntry, LogKind, Phase, TurnState } from "@/state/store";
 import { formatAttachmentSize } from "@/lib/attachments";
@@ -328,7 +329,9 @@ function renderLogEntry(entry: LogEntry, context: RowRenderContext) {
     return (
       <Message from="assistant" className="text-foreground">
         <MessageContent>
-          <DiagramResponse mode="static">{entry.text}</DiagramResponse>
+          <DiagramResponse mode="static" components={CHAT_MARKDOWN_COMPONENTS}>
+            {entry.text}
+          </DiagramResponse>
         </MessageContent>
       </Message>
     );

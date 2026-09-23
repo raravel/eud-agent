@@ -33,6 +33,7 @@ import { SettingsDialog, type SettingsCategory } from "@/components/SettingsDial
 import { E3sImportDialog } from "@/setup/E3sImportDialog";
 import { NewMapWizard } from "@/setup/NewMapWizard";
 import { ConversationLog } from "@/components/ConversationLog";
+import { WorkspacePathProvider } from "@/components/WorkspacePathCode";
 import { GitConsentDialog } from "@/components/GitConsentDialog";
 import { GitHistoryView } from "@/components/GitHistoryView";
 import { HarnessStatusCard } from "@/components/HarnessStatusCard";
@@ -172,6 +173,7 @@ const PROJECT_REFRESH_MS = 2000;
 
 /** Maximum simultaneously open workspace document tabs in the center column. */
 const MAX_DOCUMENT_TABS = 8;
+const NO_WORKSPACE_FILES: WorkspaceFileEntry[] = [];
 
 /**
  * Virtual center tab id for the selected session's active plan. Workspace
@@ -2877,6 +2879,19 @@ export default function App() {
     }
   }, [activeCenterTab, loadDocumentTab, openDocumentTabs]);
 
+  // A finished agent turn may have created the files its answer names; relist
+  // so those paths resolve (chat links, tree) without a manual refresh.
+  const workspaceRefreshRef = useRef(handleWorkspaceRefresh);
+  workspaceRefreshRef.current = handleWorkspaceRefresh;
+  const previousPhaseRef = useRef(state.phase);
+  useEffect(() => {
+    const wasBusy = isBusyPhase(previousPhaseRef.current);
+    previousPhaseRef.current = state.phase;
+    if (wasBusy && !isBusyPhase(state.phase) && workspaceData) {
+      void workspaceRefreshRef.current();
+    }
+  }, [state.phase, workspaceData]);
+
   const handleProjectPanelTab = useCallback(
     async (tab: ProjectPanelTab) => {
       setProjectSidebarOpen(true);
@@ -3360,22 +3375,27 @@ export default function App() {
           </div>
         )}
 
-        <ConversationLog
-          key={selectedSessionId ?? "no-session"}
-          log={state.log}
-          phase={state.phase}
-          turn={state.turn}
-          ragLoading={state.rag === "loading"}
-          onSuggestion={handleSuggestion}
-          suggestionsEnabled={state.canSend && !selectedActionBusy}
-          onEditMessage={handleEditMessage}
-          editDisabled={
-            messageActionBusy ||
-            !selectedSlot ||
-            (selectedSlot.activity !== "idle" &&
-              selectedSlot.activity !== "error")
-          }
-        />
+        <WorkspacePathProvider
+          files={workspaceData?.files ?? NO_WORKSPACE_FILES}
+          onOpen={openDocumentTab}
+        >
+          <ConversationLog
+            key={selectedSessionId ?? "no-session"}
+            log={state.log}
+            phase={state.phase}
+            turn={state.turn}
+            ragLoading={state.rag === "loading"}
+            onSuggestion={handleSuggestion}
+            suggestionsEnabled={state.canSend && !selectedActionBusy}
+            onEditMessage={handleEditMessage}
+            editDisabled={
+              messageActionBusy ||
+              !selectedSlot ||
+              (selectedSlot.activity !== "idle" &&
+                selectedSlot.activity !== "error")
+            }
+          />
+        </WorkspacePathProvider>
 
         {state.ask && (
           <AskCard
