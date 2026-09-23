@@ -239,13 +239,39 @@ exit 0
     assert!(args.iter().any(|value| value == "--resume"));
     assert!(args.iter().any(|value| value == "native-session"));
     assert!(args.iter().any(|value| value == "--strict-mcp-config"));
-    assert!(args.iter().any(|value| value == "mcp__eud-tools__*"));
     assert!(args.iter().any(|value| value
         .as_str()
         .is_some_and(|arg| arg.contains("/mcp/run-token"))));
+    // An interactive turn edits the project tree with the built-in file tools.
     let tools_index = args.iter().position(|value| value == "--tools").unwrap();
-    assert_eq!(args.get(tools_index + 1).and_then(Value::as_str), Some(""));
-    assert!(!args.iter().any(|value| value == "Read"));
+    let tools = args.get(tools_index + 1).and_then(Value::as_str).unwrap();
+    for tool in ["Read", "Edit", "Write", "Glob", "Grep"] {
+        assert!(tools.contains(tool), "{tool} must be available: {tools}");
+    }
+    // `build_run` stays the only way to run anything.
+    assert!(!tools.contains("Bash"), "{tools}");
+    let allowed_index = args
+        .iter()
+        .position(|value| value == "--allowedTools")
+        .unwrap();
+    let allowed = args.get(allowed_index + 1).and_then(Value::as_str).unwrap();
+    assert!(allowed.contains("mcp__eud-tools__*"), "{allowed}");
+    assert!(allowed.contains("Edit"), "{allowed}");
+    // The map, the verified references and the history itself are never written.
+    let denied_index = args
+        .iter()
+        .position(|value| value == "--disallowedTools")
+        .unwrap();
+    let denied = args.get(denied_index + 1).and_then(Value::as_str).unwrap();
+    for rule in [
+        "Edit(maps/**)",
+        "Edit(references/**)",
+        "Edit(.git/**)",
+        "Edit(.claude/**)",
+        "Edit(.mcp.json)",
+    ] {
+        assert!(denied.contains(rule), "{rule} must be denied: {denied}");
+    }
 
     let (_compact_cancel_tx, compact_cancel_rx) = tokio::sync::watch::channel(0_u64);
     let (compact_events_tx, mut compact_events_rx) = tokio::sync::mpsc::channel(16);

@@ -904,7 +904,7 @@ pub(crate) const APP_SERVER_CONFIG_OVERRIDES: [&str; 8] = [
     "web_search=\"live\"",
     "windows.sandbox=\"elevated\"",
     "permissions.eud_workspace_read={description=\"eud-agent read-only project root\",filesystem={\":minimal\"=\"read\",\":workspace_roots\"={\".\"=\"read\"}},network={enabled=false}}",
-    "permissions.eud_workspace_write={description=\"eud-agent live-project writer with a session scratch area\",filesystem={\":minimal\"=\"read\",\":workspace_roots\"={\".\"=\"read\",\".eud-agent/workspace/.tmp/**\"=\"write\"}},network={enabled=false}}",
+    "permissions.eud_workspace_write={description=\"eud-agent live-project writer\",filesystem={\":minimal\"=\"read\",\":workspace_roots\"={\".\"=\"write\",\"maps\"=\"read\",\"maps/**\"=\"read\",\"references\"=\"read\",\"references/**\"=\"read\",\".git\"=\"read\",\".git/**\"=\"read\",\".claude\"=\"read\",\".claude/**\"=\"read\",\".mcp.json\"=\"read\"}},network={enabled=false}}",
 ];
 
 const STRUCTURED_APP_SERVER_CONFIG_OVERRIDES: [&str; 12] = [
@@ -1698,9 +1698,23 @@ mod app_server_override_tests {
             .iter()
             .find(|value| value.starts_with("permissions.eud_workspace_write="))
             .unwrap();
-        assert!(implementation_profile.contains("\".\"=\"read\""));
-        assert!(implementation_profile.contains("\".eud-agent/workspace/.tmp/**\"=\"write\""));
-        assert!(!implementation_profile.contains("\".\"=\"write\""));
+        // The project root is writable, and the three paths the app owns are
+        // narrowed back to read: a more specific entry overrides `.`, which is
+        // how the scratch area used to be carved out of a read-only root.
+        assert!(implementation_profile.contains("\".\"=\"write\""));
+        // `.claude/` and `.mcp.json` decide what a Claude session in this same
+        // project may do. No session writes its own permissions.
+        assert!(implementation_profile.contains("\".mcp.json\"=\"read\""));
+        for protected in ["maps", "references", ".git", ".claude"] {
+            assert!(
+                implementation_profile.contains(&format!("\"{protected}\"=\"read\"")),
+                "{protected} must stay read-only"
+            );
+            assert!(
+                implementation_profile.contains(&format!("\"{protected}/**\"=\"read\"")),
+                "{protected} contents must stay read-only"
+            );
+        }
     }
 
     #[test]

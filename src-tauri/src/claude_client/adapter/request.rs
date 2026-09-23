@@ -48,13 +48,14 @@ fn encoded_image(path: &Path) -> Result<(&'static str, String), String> {
     ))
 }
 
-/// Project-root cwd boundary (decision D7).
+/// Project-root cwd boundary.
 ///
-/// `CLAUDE.md`/`CLAUDE.local.md` are user-authored prose rules: with
-/// `--tools ""` they cannot add tools, so the project root may carry them.
-/// Everything that can change tools, permissions, or hooks is still refused:
-/// `.claude/settings*.json`, any other `.claude/` entry (agents, commands,
-/// plugins), and `.mcp.json` registration attempts.
+/// `CLAUDE.md`/`CLAUDE.local.md` are user-authored prose rules; prose cannot
+/// add a tool, so the project root may carry them. Everything that can change
+/// tools, permissions, or hooks is still refused: `.claude/settings*.json`,
+/// any other `.claude/` entry (agents, commands, plugins), and `.mcp.json`
+/// registration attempts. That refusal is what keeps `--tools` and
+/// `--disallowedTools` the only word on what this session may do.
 pub(super) fn validate_workspace_boundary(root: &Path) -> Result<(), String> {
     if root.join(".mcp.json").exists() {
         return Err(
@@ -101,6 +102,27 @@ pub(super) fn model_args(model: &str, effort: Option<&str>) -> Result<Vec<String
     Ok(args)
 }
 
+/// The built-in tools an interactive turn may use. Reading and editing the
+/// project directly is the point of the cutover; `Bash` and every other
+/// built-in stay out, so running anything is still `build_run` alone.
+const NATIVE_FILE_TOOLS: &str = "Read,Edit,Write,Glob,Grep";
+
+/// Paths no turn writes, whatever tool it reaches for. `maps/` and
+/// `references/` are binary and belong to MapSafe's backup, verification and
+/// rollback path; `.git/` is the rollback authority itself; `.claude/` and
+/// `.mcp.json` decide what this session is allowed to do, which is not a
+/// decision the session gets to make about itself.
+/// [`validate_workspace_boundary`] already refuses those two at turn start —
+/// these rules are what stops a turn from writing one in the first place, so
+/// the refusal never has to strand the project.
+///
+/// The rules name `Edit`, which covers the whole write family: Claude Code
+/// accepts a path rule on `Write` but never consults it, and warns at startup.
+const PROTECTED_PATH_RULES: &str = concat!(
+    "Edit(maps/**) Edit(references/**) Edit(.git/**) ",
+    "Edit(.claude/**) Edit(.mcp.json)"
+);
+
 pub(super) fn stream_args(
     mcp_config: Option<&str>,
     conversation_id: Option<&str>,
@@ -133,9 +155,11 @@ pub(super) fn stream_args(
             mcp_config.to_string(),
             "--strict-mcp-config".to_string(),
             "--tools".to_string(),
-            String::new(),
+            NATIVE_FILE_TOOLS.to_string(),
             "--allowedTools".to_string(),
-            "mcp__eud-tools__*".to_string(),
+            format!("{NATIVE_FILE_TOOLS},mcp__eud-tools__*"),
+            "--disallowedTools".to_string(),
+            PROTECTED_PATH_RULES.to_string(),
             "--permission-mode".to_string(),
             "dontAsk".to_string(),
             "--disable-slash-commands".to_string(),

@@ -283,6 +283,59 @@ OpenCode Go / Ollama / Antigravity는 네이티브 도구가 원천적으로 없
     턴 경계 커밋의 엔드투엔드 테스트도 턴 경로가 확정되는 Phase 4에서 쓴다 — 지금 쓰면
     Phase 4가 지우는 staged 파이프라인 위에 쓰게 된다.
 
+- **Phase 2 — 완료 (2026-09-23).** §N4의 세 항목을 실제 코드에 맞춰 확인하고 빠진 것만 채웠다.
+  - §N4.1 경로 규칙·MainFile 존재·소스/출력 맵 별칭, §N4.3 `project.eap` 전체 검증은
+    **이미 `NativeProject::open`이 하고 있었다.** `build_with_cancellation`이 매번 `open`을
+    부르므로 빌드 경계에서도 이미 걸린다. 새로 만들 필요가 없었다.
+  - 실제로 비어 있던 것은 둘이다. (a) 스파스 DAT `before` == 카탈로그 원본 검사는 `dat_patch`
+    쓰기 시점에만 있었다. (b) `src/` 아래에 프로젝트가 쓸 수 없는 이름(`[`/`]` 등)의
+    `.eps`/`.py`가 생기면 모든 소스 목록이 **조용히 건너뛰었다**.
+  - `NativeProjectManager::build_preflight`가 빌드 시작 전에 둘 다 본다. 위반은 `Err`가 아니라
+    `ok: false` + `source: "preflight"` 진단을 단 `NativeBuildResult`로 돌려준다. 모델이
+    컴파일 오류와 같은 모양으로 읽고, 같은 위반이 반복되면 no-progress 판정에도 걸린다.
+  - **계획과 다른 점:** §N4.2는 "`dat/*.json` 로드 경로로 옮긴다"였지만 로드 경로
+    (`NativeProject::open`)에는 `DatCatalog`가 없다 — 카탈로그는 compat 자산 루트를 받는
+    빌드 쪽 물건이다. 그래서 로드가 아니라 **빌드 경계**에 뒀다. `dat_patch`의 쓰기 시점
+    검사는 §N4의 "기존 도구는 제거하지 않는다"에 따라 그대로 남겼다(즉시 피드백).
+
+- **Phase 3 — 코드 완료 (2026-09-23), 실사용 확인 대기.**
+  - **Codex** (`codex_client.rs`): `eud_workspace_write`의 `:workspace_roots`를
+    `{"."="write", "maps"/"maps/**"="read", "references"/"references/**"="read",
+    ".git"/".git/**"="read", ".claude"/".claude/**"="read", ".mcp.json"="read"}`로.
+    `codex sandbox -P`로 **실측 확인**(codex-cli 0.156.1): `src/`·`dat/`·`project.eap` 쓰기 성공,
+    `maps/`·`references/`·`.claude/` 쓰기와 `maps/` 재귀 삭제는 `UnauthorizedAccessException`.
+    더 구체적인 항목이 `"."`를 덮는다는 것도 같은 probe로 확인했다.
+  - **Claude Code** (`adapter/request.rs`): 인터랙티브 턴만 `--tools ""`를 걷고
+    `--tools "Read,Edit,Write,Glob,Grep"` + `--allowedTools "…,mcp__eud-tools__*"` +
+    `--disallowedTools "Edit(maps/**) Edit(references/**) Edit(.git/**) Edit(.claude/**)
+    Edit(.mcp.json)"`. `Bash`는 **열지 않는다**(§N1). compaction과 structured job은
+    `--tools ""` 그대로다 — 도구가 있으면 안 되는 경로다.
+    경로 규칙은 `Edit(...)`로만 쓴다: Claude Code는 `Write(...)` 경로 규칙을 받아들이지만
+    **참조하지 않고** 시작 시 경고한다(2.1.280 permissions 문서).
+  - **계획에 없던 추가:** `.claude/**`와 `.mcp.json`도 쓰기 금지에 넣었다. 자유 CRUD 전에는
+    `validate_workspace_boundary`가 턴 시작에서 둘의 존재를 거부하는 것으로 충분했지만,
+    이제는 턴이 그 파일을 **만들 수** 있다. 세션이 자기 권한을 스스로 정하게 두지 않는다.
+  - **알려진 한계 (실측):** Codex의 Windows 샌드박스는 **이미 존재하는** 경로만 막는다.
+    `.claude/`가 없는 상태에서 Codex 턴이 `.claude/settings.json`을 새로 만드는 것은 막히지
+    않았다(생긴 다음부터는 거부). 파급은 한정적이다 — Claude 쪽은 도구 단위 deny라 존재 여부와
+    무관하게 막히고, Codex가 만든 `.claude/`는 다음 Claude 턴이 기존 경계 검사로 거부하며,
+    턴 커밋에 남아 `git revert`로 되돌릴 수 있다. 권한 상승이 아니라 가시적인 고장이다.
+  - **아직 안 한 것:** §7 수용 1~3(네이티브 편집 → `build_run` 성공, Claude `Write`/`Grep`,
+    `maps/**`·`.git/**` 거부)은 **실제 앱 런이 필요하다.** `verify.md` 기준으로 Claude는
+    로그아웃 상태라 Claude 경로는 지금 확인할 수 없다.
+
+- **Phase 1이 드러낸 것 — Windows 공유 위반 (2026-09-23).** 턴/open마다 git 프로세스가 도는
+  순간 `map_candidate`의 원자적 승격이 `os error 5`(액세스 거부)와 `os error 32`(공유 위반)로
+  깨졌다. 측정: git 준비를 켜면 4/4 실패, 끄면 0/3 실패. 같은 시그니처가 `verify.md`에
+  checkpoint41의 실사용 Map finalize/revert WATCH로 이미 적혀 있었다 — 테스트가 그 경합을
+  재현하기 쉽게 만들었을 뿐, 새 결함이 아니다.
+  - 원인은 소유권 충돌이 아니라 경합이다. 방금 쓴 파일을 백신·인덱서가 몇 밀리초 잡고 있으면
+    Windows가 다음 open/rename/delete를 거부한다. 파일이 잘못된 것이 아니므로 기다리면 된다.
+  - `memory::retry_transient`가 5/32/33을 20ms부터 배수 백오프로 7회까지 기다린다.
+    `write_atomic_bytes`(앱의 모든 원자적 쓰기)와 `map_candidate::remove_if_exists`가 쓴다.
+    마지막 시도는 원래 오류를 그대로 보고하므로 진짜 권한 문제는 여전히 실패한다.
+  - 수정 후 같은 조합을 8회 반복해 8/8 통과.
+
 Phase 1–2를 3보다 먼저 두는 이유: **되돌리기 수단과 경계 검증이 먼저 서 있어야** 자유 CRUD를
 열어도 안전하다. 어느 Phase에서 중단해도 제품은 동작 가능한 상태로 남는다.
 
