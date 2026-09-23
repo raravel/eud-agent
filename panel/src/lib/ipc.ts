@@ -39,7 +39,12 @@ import {
   isServerMessage,
   isSetupMessage,
   type ClientMessage,
+  type CommitDetail,
+  type CommitFile,
+  type CommitRecord,
+  type CommitSummary,
   type LedgerEntry,
+  type RepoState,
   type BackendSessionActivity,
   type MentionSearchRequest,
   type MentionSearchResponse,
@@ -74,13 +79,13 @@ export interface NotificationChannelSettings {
 
 export type NotificationEvent =
   | "planApproval"
-  | "changesetReview"
+  | "reviewRequired"
   | "agentTurnComplete"
   | "askResponseRequired";
 
 export interface NotificationSettings {
   planApproval: NotificationChannelSettings;
-  changesetReview: NotificationChannelSettings;
+  reviewRequired: NotificationChannelSettings;
   agentTurnComplete: NotificationChannelSettings;
   askResponseRequired: NotificationChannelSettings;
 }
@@ -149,9 +154,8 @@ const PUSH_EVENT_TYPES = [
   "plan",
   "ask",
   "team_task",
-  "changeset",
+  "git",
   "harness_job",
-  "rollback_result",
   "progress",
   "error",
   "session_activity",
@@ -362,12 +366,6 @@ export class IpcClient {
           sessionId: msg.sessionId,
           requestId: msg.requestId,
           answers: msg.answers,
-        };
-      case "changeset_decision":
-        return {
-          sessionId: msg.sessionId,
-          decision: msg.decision,
-          ids: msg.ids,
         };
       case "cancel":
         return { sessionId: msg.sessionId };
@@ -952,7 +950,7 @@ function toAppSettings(value: unknown): AppSettings {
     !isObject(value) ||
     !isObject(value.notifications) ||
     !isNotificationChannelSettings(value.notifications.planApproval) ||
-    !isNotificationChannelSettings(value.notifications.changesetReview) ||
+    !isNotificationChannelSettings(value.notifications.reviewRequired) ||
     !isNotificationChannelSettings(value.notifications.agentTurnComplete) ||
     !isNotificationChannelSettings(value.notifications.askResponseRequired) ||
     !Array.isArray(value.codexLargeContextModels) ||
@@ -1075,13 +1073,133 @@ export async function attentionNotify(
   kind: AttentionNotificationKind,
   showOs: boolean,
   sessionId: string,
-  itemCount?: number,
   invoke: InvokeFn = tauriInvoke,
 ): Promise<void> {
-  await invoke("attention_notify", {
-    kind,
-    showOs,
-    sessionId,
-    ...(itemCount === undefined ? {} : { itemCount }),
+  await invoke("attention_notify", { kind, showOs, sessionId });
+}
+
+// ---- project history (git) ---------------------------------------------
+// The turn boundary commits the project; "되돌리기" is `git revert`. These act
+// on the OPEN project, so none of them carries a session id. The backend owns
+// the shapes; the panel validates only the fields it renders, so a field added
+// core-side never breaks the view.
+
+function toRepoState(value: unknown): RepoState {
+  if (
+    !isObject(value) ||
+    typeof value.available !== "boolean" ||
+    typeof value.tracked !== "boolean" ||
+    typeof value.nested !== "boolean" ||
+    (value.consent !== "pending" &&
+      value.consent !== "granted" &&
+      value.consent !== "declined")
+  ) {
+    throw new Error("invalid git state response");
+  }
+  const origin =
+    value.origin === "app" || value.origin === "preexisting" ? value.origin : null;
+  return {
+    available: value.available,
+    tracked: value.tracked,
+    nested: value.nested,
+    origin,
+    consent: value.consent,
+    warning: typeof value.warning === "string" ? value.warning : null,
+  };
+}
+
+/** What the app knows about the open project's repository. */
+export async function gitState(invoke: InvokeFn = tauriInvoke): Promise<RepoState> {
+  return toRepoState(await invoke("git_state"));
+}
+
+/** Record whether the app may commit into a repository the user already had. */
+export async function gitConsentSet(
+  granted: boolean,
+  invoke: InvokeFn = tauriInvoke,
+): Promise<RepoState> {
+  return toRepoState(await invoke("git_consent_set", { granted }));
+}
+
+/** The project's recent commits, newest first. */
+export async function gitLog(
+  limit?: number,
+  invoke: InvokeFn = tauriInvoke,
+): Promise<CommitSummary[]> {
+  const value = await invoke("git_log", limit === undefined ? {} : { limit });
+  if (!Array.isArray(value)) throw new Error("invalid git log response");
+  return value.map((row) => {
+    if (
+      !isObject(row) ||
+      typeof row.sha !== "string" ||
+      typeof row.subject !== "string" ||
+      typeof row.timestamp !== "number"
+    ) {
+      throw new Error("invalid git log response");
+    }
+    return { sha: row.sha, subject: row.subject, timestamp: row.timestamp };
   });
+}
+
+function toCommitFile(value: unknown): CommitFile {
+  if (
+    !isObject(value) ||
+    typeof value.path !== "string" ||
+    typeof value.insertions !== "number" ||
+    typeof value.deletions !== "number" ||
+    typeof value.binary !== "boolean"
+  ) {
+    throw new Error("invalid git commit detail response");
+  }
+  const file: CommitFile = {
+    path: value.path,
+    insertions: value.insertions,
+    deletions: value.deletions,
+    binary: value.binary,
+  };
+  if (typeof value.patch === "string") file.patch = value.patch;
+  if (typeof value.omitted === "string") file.omitted = value.omitted;
+  return file;
+}
+
+/** Everything one commit changed, with each file's patch bounded core-side. */
+export async function gitCommitDetail(
+  sha: string,
+  invoke: InvokeFn = tauriInvoke,
+): Promise<CommitDetail> {
+  const value = await invoke("git_commit_detail", { sha });
+  if (
+    !isObject(value) ||
+    typeof value.sha !== "string" ||
+    typeof value.subject !== "string" ||
+    typeof value.body !== "string" ||
+    typeof value.timestamp !== "number" ||
+    !Array.isArray(value.files)
+  ) {
+    throw new Error("invalid git commit detail response");
+  }
+  return {
+    sha: value.sha,
+    subject: value.subject,
+    body: value.body,
+    timestamp: value.timestamp,
+    files: value.files.map(toCommitFile),
+  };
+}
+
+/** Undo one commit by recording its inverse. This is what replaced Reject. */
+export async function gitRevert(
+  sha: string,
+  invoke: InvokeFn = tauriInvoke,
+): Promise<CommitRecord> {
+  const value = await invoke("git_revert", { sha });
+  if (
+    !isObject(value) ||
+    typeof value.sha !== "string" ||
+    typeof value.subject !== "string" ||
+    typeof value.files !== "number"
+  ) {
+    throw new Error("invalid git revert response");
+  }
+  return { sha: value.sha, subject: value.subject, files: value.files };
 }

@@ -6,6 +6,16 @@ const tauri = vi.hoisted(() => ({
   listeners: new Map<string, (event: { payload: unknown }) => void>(),
   resolveLongChat: undefined as (() => void) | undefined,
   pendingAsk: undefined as Record<string, unknown> | undefined,
+  repoState: {
+    available: true,
+    tracked: true,
+    nested: false,
+    origin: "app",
+    consent: "granted",
+    warning: null,
+  } as Record<string, unknown>,
+  commits: [] as Array<Record<string, unknown>>,
+  commitDetail: undefined as Record<string, unknown> | undefined,
 }));
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: tauri.invoke }));
@@ -172,6 +182,32 @@ beforeEach(() => {
   tauri.listeners.clear();
   tauri.resolveLongChat = undefined;
   tauri.pendingAsk = undefined;
+  tauri.repoState = {
+    available: true,
+    tracked: true,
+    nested: false,
+    origin: "app",
+    consent: "granted",
+    warning: null,
+  };
+  tauri.commits = [
+    { sha: "a".repeat(40), subject: "마린 체력 조정", timestamp: 1_700_000_000 },
+  ];
+  tauri.commitDetail = {
+    sha: "a".repeat(40),
+    subject: "마린 체력 조정",
+    body: "session: session-a\nrequest: req-1",
+    timestamp: 1_700_000_000,
+    files: [
+      {
+        path: "src/main.eps",
+        insertions: 1,
+        deletions: 1,
+        binary: false,
+        patch: ["@@ -1 +1 @@", "-old", "+new"].join("\n"),
+      },
+    ],
+  };
   tauri.invoke.mockReset();
   let launchPending = true;
   tauri.invoke.mockImplementation(async (command: string, args?: Record<string, unknown>) => {
@@ -272,11 +308,25 @@ beforeEach(() => {
         return undefined;
       case "harness_jobs":
         return [];
+      case "git_state":
+        return tauri.repoState;
+      case "git_consent_set":
+        tauri.repoState = {
+          ...tauri.repoState,
+          consent: args?.granted === true ? "granted" : "declined",
+        };
+        return tauri.repoState;
+      case "git_log":
+        return tauri.commits;
+      case "git_commit_detail":
+        return tauri.commitDetail;
+      case "git_revert":
+        return { sha: "c".repeat(40), subject: "Revert", files: 1 };
       case "app_settings":
         return {
           notifications: {
             planApproval: { sound: true, osNotification: true },
-            changesetReview: { sound: true, osNotification: true },
+            reviewRequired: { sound: true, osNotification: true },
             agentTurnComplete: { sound: true, osNotification: true },
             askResponseRequired: { sound: true, osNotification: true },
           },
@@ -1116,7 +1166,7 @@ describe("App concurrent sessions", () => {
     await screen.findByRole("button", { name: "Session A, 유휴" });
     await waitFor(() => {
       expect(tauri.listeners.has("plan")).toBe(true);
-      expect(tauri.listeners.has("changeset")).toBe(true);
+      expect(tauri.listeners.has("git")).toBe(true);
     });
     act(() => {
       emit("plan", { sessionId: "session-a", markdown: "# 계획\n\n계획 본문", revision: 1 });
@@ -1146,15 +1196,13 @@ describe("App concurrent sessions", () => {
     expect(screen.queryByTestId("plan-review-notice")).toBeNull();
 
     act(() => {
-      emit("changeset", {
+      emit("git", {
         sessionId: "session-a",
-        request_id: "req-3",
-        items: [{ category: "file", id: "file-1", seq: 1, path: "main.eps", diff: "" }],
+        turn: { sha: "b".repeat(40), subject: "계획대로 적용", files: 1 },
       });
     });
-    expect(
-      await screen.findByRole("region", { name: "변경사항 검토" }),
-    ).toBeInTheDocument();
+    // The turn's commit is a quiet conversation row, not a review surface.
+    expect(await screen.findByText(/계획대로 적용/)).toBeInTheDocument();
     expect(screen.getByRole("tab", { name: "계획 (rev 1) 문서 탭" })).toBeInTheDocument();
   });
 
@@ -1238,49 +1286,86 @@ describe("App concurrent sessions", () => {
     ).toBeInTheDocument();
   });
 
-  it("surfaces an accept conflict instead of logging success", async () => {
+  it("announces a commit of edits made outside the app", async () => {
     render(<App />);
     await screen.findByRole("button", { name: "Session A, 유휴" });
-    await waitFor(() => expect(tauri.listeners.has("changeset")).toBe(true));
+    await waitFor(() => expect(tauri.listeners.has("git")).toBe(true));
 
     act(() => {
-      emit("changeset", {
+      emit("git", {
         sessionId: "session-a",
-        request_id: "req-conflict",
-        items: [
-          {
-            category: "file",
-            id: "workspace-1",
-            seq: 1,
-            path: "specs/game.md",
-            diff: "@@ -1 +1 @@\n-old\n+new",
-          },
-        ],
+        external: { sha: "a".repeat(40), subject: "앱 밖 편집", files: 3 },
+        turn: { sha: "b".repeat(40), subject: "마린 체력 조정", files: 1 },
       });
     });
-    fireEvent.click(await screen.findByRole("button", { name: "적용 유지" }));
-    await waitFor(() =>
-      expect(tauri.invoke).toHaveBeenCalledWith("changeset_decision", {
-        sessionId: "session-a",
-        decision: "accept",
-        ids: ["workspace-1"],
-      }),
-    );
+
+    // A commit the user did not ask for gets a sentence naming the file count.
+    expect(
+      await screen.findByText(/앱 밖에서 바뀐 파일 3개/),
+    ).toBeInTheDocument();
+  });
+
+  it("reports a failed record without claiming the turn failed", async () => {
+    render(<App />);
+    await screen.findByRole("button", { name: "Session A, 유휴" });
+    await waitFor(() => expect(tauri.listeners.has("git")).toBe(true));
 
     act(() => {
-      emit("rollback_result", {
+      emit("git", {
         sessionId: "session-a",
-        ids: ["workspace-1"],
-        ok: false,
-        error: "ConcurrentWriteConflict: `specs/game.md` changed",
+        warning: "이 턴을 기록하지 못했습니다: 저장소가 잠겼습니다.",
       });
     });
 
     expect(
-      await screen.findByText(
-        "적용 실패: ConcurrentWriteConflict: `specs/game.md` changed",
-      ),
+      await screen.findByText("이 턴을 기록하지 못했습니다: 저장소가 잠겼습니다."),
     ).toBeInTheDocument();
+  });
+});
+
+describe("App project history", () => {
+  it("lists the project's commits where request review used to sit", async () => {
+    render(<App />);
+    const history = await screen.findByRole("region", { name: "변경 기록" });
+    expect(tauri.invoke).toHaveBeenCalledWith("git_state");
+    // The record is collapsed by default: it is history, not a demand for a
+    // decision, so it never takes the conversation's room unasked.
+    fireEvent.click(
+      within(history).getByRole("button", { name: "변경 기록 펼치기" }),
+    );
+    // The row and the opened commit's heading both carry the subject.
+    expect(
+      await within(history).findAllByText("마린 체력 조정"),
+    ).not.toHaveLength(0);
+    expect(
+      within(history).getByTestId("commit-file-src/main.eps"),
+    ).toHaveTextContent("+new");
+  });
+
+  it("asks once before committing into a repository the user already had", async () => {
+    tauri.repoState = {
+      available: true,
+      tracked: true,
+      nested: false,
+      origin: "preexisting",
+      consent: "pending",
+      warning: null,
+    };
+    render(<App />);
+
+    const dialog = await screen.findByRole("dialog", {
+      name: /git 기록에 커밋해도 될까요/,
+    });
+    fireEvent.click(
+      within(dialog).getByRole("button", { name: "커밋을 허용합니다" }),
+    );
+
+    await waitFor(() =>
+      expect(tauri.invoke).toHaveBeenCalledWith("git_consent_set", {
+        granted: true,
+      }),
+    );
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
   });
 });
 
@@ -1327,7 +1412,7 @@ describe("App notifications", () => {
         settings: {
           notifications: {
             planApproval: { sound: false, osNotification: true },
-            changesetReview: { sound: true, osNotification: true },
+            reviewRequired: { sound: true, osNotification: true },
             agentTurnComplete: { sound: true, osNotification: true },
             askResponseRequired: { sound: true, osNotification: true },
           },
@@ -1404,22 +1489,12 @@ describe("App notifications", () => {
     expect(screen.queryByRole("dialog", { name: "설정" })).not.toBeInTheDocument();
   });
 
-  it("notifies once when each new review surface appears", async () => {
+  it("notifies once when a new plan arrives", async () => {
     const focus = vi.spyOn(document, "hasFocus").mockReturnValue(false);
     render(<App />);
     await screen.findByRole("button", { name: "Session A, 유휴" });
-    await waitFor(() => {
-      expect(tauri.listeners.has("plan")).toBe(true);
-      expect(tauri.listeners.has("changeset")).toBe(true);
-    });
+    await waitFor(() => expect(tauri.listeners.has("plan")).toBe(true));
 
-    const item = {
-      category: "file",
-      id: "file-1",
-      seq: 1,
-      path: "main.eps",
-      diff: "@@ -1 +1 @@\\n-old\\n+new",
-    };
     act(() => {
       emit("plan", {
         sessionId: "session-a",
@@ -1436,16 +1511,6 @@ describe("App notifications", () => {
         markdown: "# 수정 계획",
         revision: 2,
       });
-      emit("changeset", {
-        sessionId: "session-a",
-        request_id: "request-1",
-        items: [item],
-      });
-      emit("changeset", {
-        sessionId: "session-a",
-        request_id: "request-1",
-        items: [item],
-      });
     });
 
     await waitFor(() => {
@@ -1460,15 +1525,6 @@ describe("App notifications", () => {
         [
           "attention_notify",
           { kind: "planApproval", showOs: true, sessionId: "session-a" },
-        ],
-        [
-          "attention_notify",
-          {
-            kind: "changesetReview",
-            showOs: true,
-            sessionId: "session-a",
-            itemCount: 1,
-          },
         ],
       ]);
     });

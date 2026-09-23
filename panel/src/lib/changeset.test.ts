@@ -1,24 +1,15 @@
 /**
- * Pure changeset rendering/decision helpers (features/06 ## Behaviors →
- * Changeset review). The SERVER already groups items (dat per objId, files by
- * kind, flat for the rest); these helpers only derive, per rendered item:
- *   - the decision-target ids (the `changeset_decision{ids}` payload) — a dat
- *     group's ids live on its `properties[]`, every other item carries a single
- *     item-level `id`;
- *   - the aggregate decision STATE of an item from the per-id decisions map
- *     (accepted / rejected / failed / undecided / mixed).
+ * Pure rendering helpers for the harness document review. The CORE already
+ * groups items (dat per objId, files by kind, flat for the rest); these helpers
+ * only read a dat group's `properties[]` and derive a stable per-item key, since
+ * a dat group carries NO item-level id.
  *
- * Contract (Step B implements `@/lib/changeset`):
- *   export function itemIds(item: ChangesetItem): string[];
- *   export type ItemState =
- *     "undecided" | "accepted" | "rejected" | "failed" | "mixed";
- *   export function itemState(
- *     item: ChangesetItem,
- *     decisions: Record<string, ItemDecision>,
- *   ): ItemState;
+ * Contract (`@/lib/changeset`):
+ *   export function datProperties(item: ChangesetItem): DatProperty[];
+ *   export function itemKey(item: ChangesetItem): string;
  */
 import { describe, it, expect } from "vitest";
-import { itemIds, itemKey, itemState } from "./changeset";
+import { datProperties, itemKey } from "./changeset";
 import type { ChangesetItem } from "@/lib/ipc";
 
 const fileItem: ChangesetItem = {
@@ -30,7 +21,7 @@ const fileItem: ChangesetItem = {
   diff: "--- a/main.eps\n+++ b/main.eps\n@@\n-old\n+new\n",
 };
 
-// REPRESENTATIVE: the server NEVER puts an item-level id/seq on a dat group —
+// REPRESENTATIVE: the core NEVER puts an item-level id/seq on a dat group —
 // only on its properties[] (journal.changeset()). The ChangesetItem type
 // requires id/seq, so the fixture casts to mirror the real id-less shape.
 const datItem = {
@@ -43,26 +34,26 @@ const datItem = {
   ],
 } as unknown as ChangesetItem;
 
-describe("itemIds", () => {
-  it("returns the single item-level id for a file item", () => {
-    expect(itemIds(fileItem)).toEqual(["f1"]);
+describe("datProperties", () => {
+  it("reads every property row of a grouped dat item", () => {
+    expect(datProperties(datItem).map((p) => p.property)).toEqual([
+      "MaxHp",
+      "GasCost",
+    ]);
   });
 
-  it("returns every property id for a grouped dat item", () => {
-    expect(itemIds(datItem)).toEqual(["p1", "p2"]);
+  it("is empty for an item with no properties[]", () => {
+    expect(datProperties(fileItem)).toEqual([]);
   });
 
-  it("returns the single id for a flat item (settings/plugin/main)", () => {
-    const flat: ChangesetItem = {
-      category: "settings",
-      tool: "settings_set",
-      target: "trigger_editor",
-      old: { value: "a" },
-      new: { value: "b" },
-      id: "s1",
-      seq: 5,
-    };
-    expect(itemIds(flat)).toEqual(["s1"]);
+  it("drops malformed property rows instead of rendering them", () => {
+    const malformed = {
+      category: "dat",
+      dat: "unit",
+      objId: 1,
+      properties: [{ property: "MaxHp", old: 1, new: 2 }, null, "nope"],
+    } as unknown as ChangesetItem;
+    expect(datProperties(malformed)).toEqual([]);
   });
 });
 
@@ -72,7 +63,7 @@ describe("itemKey", () => {
   });
 
   it("falls back to the joined property ids for an id-less dat group", () => {
-    // The server sends no item-level id; the key must be stable + non-undefined.
+    // The core sends no item-level id; the key must be stable + non-undefined.
     expect(itemKey(datItem)).toBe("p1,p2");
   });
 
@@ -86,42 +77,13 @@ describe("itemKey", () => {
     expect(itemKey(datItem)).not.toBe(itemKey(other));
     expect(itemKey(other)).toBe("q1");
   });
-});
 
-describe("itemState", () => {
-  it("is undecided when no id is decided", () => {
-    expect(itemState(fileItem, {})).toBe("undecided");
-  });
-
-  it("is accepted when the file id is accepted", () => {
-    expect(itemState(fileItem, { f1: "accepted" })).toBe("accepted");
-  });
-
-  it("is rejected when the file id is rejected (되돌림)", () => {
-    expect(itemState(fileItem, { f1: "rejected" })).toBe("rejected");
-  });
-
-  it("is failed when the file id failed (rollback failure)", () => {
-    expect(itemState(fileItem, { f1: "failed" })).toBe("failed");
-  });
-
-  it("is accepted only when EVERY dat property is accepted", () => {
-    expect(itemState(datItem, { p1: "accepted", p2: "accepted" })).toBe(
-      "accepted",
-    );
-  });
-
-  it("is undecided when a dat group has a still-undecided property", () => {
-    expect(itemState(datItem, { p1: "accepted" })).toBe("undecided");
-  });
-
-  it("surfaces failure across a dat group (failed dominates)", () => {
-    expect(itemState(datItem, { p1: "accepted", p2: "failed" })).toBe("failed");
-  });
-
-  it("is mixed when a dat group has both accepted and rejected (no failure)", () => {
-    expect(itemState(datItem, { p1: "accepted", p2: "rejected" })).toBe(
-      "mixed",
-    );
+  it("falls back to category/dat/objId when nothing carries an id", () => {
+    const bare = {
+      category: "dat",
+      dat: "unit",
+      objId: 7,
+    } as unknown as ChangesetItem;
+    expect(itemKey(bare)).toBe("dat-unit-7");
   });
 });

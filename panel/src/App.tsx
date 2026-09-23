@@ -3,8 +3,9 @@
  * chat-first review UI (features/06_changeset-review-panel.md).
  *
  * Components: a status-rich Header (connection transitions + RAG state/elapsed),
- * the ConversationLog cards, a live AgentStream under the turn, the ChangesetView
- * accept/reject surface, and the regated InstructionBox shared under every
+ * the ConversationLog cards, a live AgentStream under the turn, the
+ * GitHistoryView record of what each turn committed, and the regated
+ * InstructionBox shared under every
  * center tab. The selected session's plan is a virtual "계획 (rev N)" tab
  * hosting the PlanView approve surface. Plan cards are archived into the
  * conversation log as agent entries when a plan arrives, is superseded by a
@@ -32,7 +33,8 @@ import { SettingsDialog, type SettingsCategory } from "@/components/SettingsDial
 import { E3sImportDialog } from "@/setup/E3sImportDialog";
 import { NewMapWizard } from "@/setup/NewMapWizard";
 import { ConversationLog } from "@/components/ConversationLog";
-import { ChangesetView } from "@/components/ChangesetView";
+import { GitConsentDialog } from "@/components/GitConsentDialog";
+import { GitHistoryView } from "@/components/GitHistoryView";
 import { HarnessStatusCard } from "@/components/HarnessStatusCard";
 import { AskCard } from "@/components/AskCard";
 import { PlanView } from "@/components/PlanView";
@@ -63,6 +65,11 @@ import {
   euddraftSettingsGet,
   euddraftUpdate,
   attentionNotify,
+  gitCommitDetail,
+  gitConsentSet,
+  gitLog,
+  gitRevert,
+  gitState,
   openScmdraft,
   pickScmdraftPath,
   compactSession,
@@ -111,6 +118,7 @@ import {
   type ProviderStatus,
   type ReasoningSelection,
   type RecentProject,
+  type RepoState,
   type ServerMessage,
   type SessionMeta,
   type SessionModelSettings,
@@ -265,7 +273,6 @@ interface SessionSlot {
   unsubscribe?: () => void;
   saveTimer?: number;
   observedLog: readonly LogEntry[];
-  changesetOpen: boolean;
   harnessJobs: HarnessJobView[];
 }
 
@@ -369,6 +376,12 @@ export default function App() {
   const [launcherBusy, setLauncherBusy] = useState(false);
   const [launcherError, setLauncherError] = useState<string | null>(null);
   const [activeProjectPath, setActiveProjectPath] = useState<string | null>(null);
+  // Project history (git). `repoState` decides whether the history view and the
+  // consent question apply at all; `historyRevision` is the view's cue to
+  // re-read the log after a turn committed or a revert landed.
+  const [repoState, setRepoState] = useState<RepoState | null>(null);
+  const [historyRevision, setHistoryRevision] = useState(0);
+  const [historyOpen, setHistoryOpen] = useState(false);
   const [pendingLaunchPath, setPendingLaunchPath] = useState<string | null>(null);
   const [launchInitializing, setLaunchInitializing] = useState(true);
   const launchQueueRef = useRef<string[]>([]);
@@ -520,6 +533,10 @@ export default function App() {
     setSessionRevision((revision) => revision + 1);
   }, []);
 
+  const bumpHistory = useCallback(() => {
+    setHistoryRevision((revision) => revision + 1);
+  }, []);
+
   const markConversationStarted = useCallback(
     (slot: SessionSlot) => {
       const newest = Array.from(sessionsRef.current.values()).reduce(
@@ -609,7 +626,6 @@ export default function App() {
         observedLog: sessionStore.getState().log,
         activity: record.pendingRequestIds.length > 0 ? "review" : "idle",
         autonomousRun: record.autonomousRun ?? null,
-        changesetOpen: true,
         harnessJobs: [],
       };
       sessionsRef.current.set(slot.id, slot);
@@ -668,7 +684,6 @@ export default function App() {
       observedLog: sessionStore.getState().log,
       activity: "idle",
       autonomousRun: null,
-      changesetOpen: true,
       harnessJobs: [],
     };
 
@@ -1185,7 +1200,7 @@ export default function App() {
                 `맵 에이전트가 후보 r${msg.task.candidate?.revision ?? "?"}을 만들었습니다. AI가 이어서 검토합니다. 맵 창에서 직접 적용하거나 폐기할 수도 있습니다.`,
               );
               void attentionNotify(
-                "changesetReview",
+                "reviewRequired",
                 !document.hasFocus(),
                 targetSlot.id,
               ).catch(() => {
@@ -1236,26 +1251,14 @@ export default function App() {
           target.log("agent", `계획안(rev ${msg.revision})이 도착했습니다.`);
           break;
         }
-        case "changeset": {
-          const targetSlot = scopedId
-            ? sessionsRef.current.get(scopedId)
+        case "git": {
+          const target = scopedId
+            ? sessionsRef.current.get(scopedId)?.store
             : undefined;
-          if (!targetSlot) break;
-          const target = targetSlot.store;
-          const prior = target.getState().changeset;
-          if (prior === null || prior.request_id !== msg.request_id) {
-            targetSlot.changesetOpen = true;
-            void attentionNotify(
-              "changesetReview",
-              !document.hasFocus(),
-              targetSlot.id,
-              msg.items.length,
-            ).catch(() => {
-              // Delivery is best-effort and must not disturb review state.
-            });
-          }
-          target.changesetReceived(msg.request_id, msg.items);
-          target.log("agent", `변경사항 ${msg.items.length}건을 검토하세요.`);
+          if (!target) break;
+          target.gitCommitted(msg);
+          // A commit moved the project's history, so the view must re-read it.
+          if (msg.external || msg.turn) bumpHistory();
           break;
         }
         case "harness_job": {
@@ -1272,10 +1275,9 @@ export default function App() {
             } else if (msg.status === "review") {
               slot.store.log("agent", "하네스 문서 변경사항을 검토하세요.");
               void attentionNotify(
-                "changesetReview",
+                "reviewRequired",
                 !document.hasFocus(),
                 slot.id,
-                msg.changeset?.items.length,
               ).catch(() => {
                 // Attention delivery is best-effort.
               });
@@ -1286,22 +1288,6 @@ export default function App() {
             }
           }
           bumpSessions();
-          break;
-        }
-        case "rollback_result": {
-          const target = sessionStore();
-          if (!target) break;
-          const decision = target.getState().pendingDecision?.decision;
-          const count = msg.ids.length;
-          target.rollbackResult(msg.ids, msg.ok);
-          if (!msg.ok) {
-            const label = decision === "accept" ? "적용 실패" : "되돌리기 실패";
-            target.log("warn", msg.error ? `${label}: ${msg.error}` : `${label} (${count}건)`);
-          } else if (decision === "accept") {
-            target.log("ok", count > 0 ? `적용 유지 (${count}건)` : "적용 유지");
-          } else {
-            target.log("ok", `되돌림 (${count}건)`);
-          }
           break;
         }
         case "error": {
@@ -1335,12 +1321,12 @@ export default function App() {
           break;
       }
     },
-    [bumpSessions, clearProjectSessions, projectStore],
+    [bumpHistory, bumpSessions, clearProjectSessions, projectStore],
   );
 
   const projectSwitchBlocked = useCallback(() => {
     if (projectCompilingRef.current) return "빌드 또는 맵 작업이 진행 중입니다. 작업이 끝난 뒤 프로젝트를 전환해 주세요.";
-    if (isBusyPhase(selectedPhaseRef.current) || selectedPhaseRef.current === "plan_review" || selectedPhaseRef.current === "changeset_review") {
+    if (isBusyPhase(selectedPhaseRef.current) || selectedPhaseRef.current === "plan_review") {
       return "현재 세션이 작업 중이거나 검토를 기다리고 있습니다. 세션을 마친 뒤 프로젝트를 전환해 주세요.";
     }
     for (const slot of sessionsRef.current.values()) {
@@ -1527,6 +1513,44 @@ export default function App() {
     setProjectPollEnabled(activeProjectPath !== null && setup !== null && !setup.setupRequired);
   }, [activeProjectPath, setup]);
 
+  // Read the project's repository once it is open. `consent: "pending"` means
+  // the project was ALREADY a repository, so the app has not committed anything
+  // yet and must ask first; a warning (git missing, a nested work tree) is told
+  // once per opened project, not on every refresh.
+  useEffect(() => {
+    if (!projectPollEnabled || activeProjectPath === null) {
+      setRepoState(null);
+      return;
+    }
+    let cancelled = false;
+    void gitState()
+      .then((next) => {
+        if (cancelled) return;
+        setRepoState(next);
+        if (next.warning) toast.warning(next.warning);
+        setHistoryRevision((revision) => revision + 1);
+      })
+      .catch((error: unknown) => {
+        if (cancelled) return;
+        setRepoState(null);
+        toast.warning(`변경 기록 상태를 읽지 못했습니다: ${String(error)}`);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [activeProjectPath, projectPollEnabled]);
+
+  const handleGitConsent = useCallback(async (granted: boolean) => {
+    const next = await gitConsentSet(granted);
+    setRepoState(next);
+    setHistoryRevision((revision) => revision + 1);
+  }, []);
+
+  // The history view owns its own loading state; these are only the commands.
+  const loadGitLog = useCallback(() => gitLog(50), []);
+  const loadGitCommitDetail = useCallback((sha: string) => gitCommitDetail(sha), []);
+  const runGitRevert = useCallback((sha: string) => gitRevert(sha), []);
+
   // Refresh native project status after setup. The in-process transport remains
   // open if the project path disappears, and availability recovers automatically.
   useEffect(() => {
@@ -1691,7 +1715,6 @@ export default function App() {
         if (
           messageActionBusyRef.current ||
           isBusyPhase(snapshot.phase) ||
-          snapshot.phase === "changeset_review" ||
           (slot.activity !== "idle" &&
             slot.activity !== "error" &&
             slot.activity !== "review")
@@ -1720,10 +1743,6 @@ export default function App() {
 
       const slot = selectedSlot ?? createDraftSlot();
       setEditDraft(null);
-      if (slot.store.getState().phase === "changeset_review") {
-        slot.store.log("warn", "변경사항 검토를 완료한 뒤 새 요청을 보내세요.");
-        return;
-      }
       const clientTurnId = payload.clientTurnId ?? crypto.randomUUID();
 
       try {
@@ -2618,16 +2637,6 @@ export default function App() {
     [],
   );
 
-  const handleChangesetOpenChange = useCallback(
-    (open: boolean) => {
-      const slot = selectedSlot;
-      if (!slot || slot.changesetOpen === open) return;
-      slot.changesetOpen = open;
-      bumpSessions();
-    },
-    [bumpSessions, selectedSlot],
-  );
-
   const handlePlanApprove = useCallback(async () => {
     const slot = selectedSlot;
     if (!slot || slot.store.getState().phase !== "plan_review") return;
@@ -2663,22 +2672,6 @@ export default function App() {
       } else {
         slot.store.askSubmitFailed();
       }
-    },
-    [selectedSlot],
-  );
-
-  const handleDecide = useCallback(
-    async (decision: "accept" | "reject", ids: "all" | string[]) => {
-      const slot = selectedSlot;
-      if (!slot || slot.store.getState().phase !== "changeset_review") return;
-      slot.store.decisionSent(decision, ids);
-      const sent = await clientRef.current?.send({
-        type: "changeset_decision",
-        sessionId: slot.id,
-        decision,
-        ids,
-      });
-      if (!sent) slot.store.decisionFailed();
     },
     [selectedSlot],
   );
@@ -3024,9 +3017,7 @@ export default function App() {
           }
         : null;
   const selectedActionBusy =
-    messageActionBusy ||
-    selectedSlot?.activity === "running_write" ||
-    state.phase === "changeset_review";
+    messageActionBusy || selectedSlot?.activity === "running_write";
   // The selected session's plan is a virtual tab (no workspace fetch: the
   // markdown is store state) that stays open read-only after approval until
   // the next request clears the plan.
@@ -3314,6 +3305,10 @@ export default function App() {
           importProject={importE3sProject}
           onImported={handleE3sImported}
         />
+        <GitConsentDialog
+          open={repoState?.consent === "pending"}
+          onDecide={handleGitConsent}
+        />
 
         {update && !updateDismissed && (
           <UpdateNotice
@@ -3421,13 +3416,14 @@ export default function App() {
           </div>
         )}
 
-        {state.changeset && state.phase === "changeset_review" && (
-          <ChangesetView
-            changeset={state.changeset}
-            open={selectedSlot?.changesetOpen ?? true}
-            onOpenChange={handleChangesetOpenChange}
-            pending={state.pendingDecision !== null}
-            onDecide={handleDecide}
+        {projectState.hasProject && repoState?.tracked === true && (
+          <GitHistoryView
+            revision={historyRevision}
+            open={historyOpen}
+            onOpenChange={setHistoryOpen}
+            loadLog={loadGitLog}
+            loadDetail={loadGitCommitDetail}
+            revert={runGitRevert}
           />
         )}
         {selectedSlot && (

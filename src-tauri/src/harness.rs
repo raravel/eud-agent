@@ -130,6 +130,11 @@ pub struct HarnessJob {
     pub approved_plan: Option<String>,
     pub final_answer: String,
     pub accepted_entries: Vec<JournalEntry>,
+    /// The turn commit that recorded this work in the project's history, when
+    /// the project has one. The worklog cites it so a spec can be traced back
+    /// to the exact state of the tree it was written from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_commit: Option<String>,
     /// Facts pinned at source changeset acceptance; absent on legacy jobs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_state_promotion: Option<crate::task_state::TaskStatePromotionInput>,
@@ -192,6 +197,7 @@ impl HarnessJob {
             approved_plan,
             final_answer,
             accepted_entries,
+            turn_commit: None,
             task_state_promotion: None,
             build,
             verify_verdict: None,
@@ -944,6 +950,10 @@ fn render_worklog(job: &HarnessJob, delta: &HarnessDelta) -> String {
         .map(|target| format!("- `{target}`"))
         .collect::<Vec<_>>()
         .join("\n");
+    let commit = match job.turn_commit.as_deref() {
+        Some(sha) => format!("\n- Recorded as commit `{sha}`"),
+        None => String::new(),
+    };
     let build = match &job.build {
         Some(build) if build.ok => "- Complete project build: passed".to_string(),
         Some(build) => format!(
@@ -975,8 +985,8 @@ fn render_worklog(job: &HarnessJob, delta: &HarnessDelta) -> String {
         spec_links.join("\n")
     };
     format!(
-        "# {} worklog\n\n## Actual result\n\n{}\n\n## Accepted targets\n\n{}\n\n## Verification\n\n{}\n{}\n\n## Canonical specifications\n\n{}\n",
-        job.source_request_id, delta.summary, target_lines, build, runtime, spec_links
+        "# {} worklog\n\n## Actual result\n\n{}\n\n## Accepted targets\n\n{}{}\n\n## Verification\n\n{}\n{}\n\n## Canonical specifications\n\n{}\n",
+        job.source_request_id, delta.summary, target_lines, commit, build, runtime, spec_links
     )
 }
 
@@ -1362,6 +1372,7 @@ mod tests {
             }),
         );
         job.runtime_verification = RuntimeVerification::Confirmed;
+        job.turn_commit = Some("c0ffee1234567890".to_string());
         let delta = HarnessDelta {
             summary: "Changed gameplay behavior.".to_string(),
             documents: vec![HarnessDocumentPatch {
@@ -1389,6 +1400,8 @@ mod tests {
         let worklog = fs::read_to_string(workspace_root.join("worklog/req-code.md")).unwrap();
         assert!(worklog.contains("confirmed by the user"));
         assert!(worklog.contains("../specs/game.md"));
+        // A spec must be traceable to the exact tree it was written from.
+        assert!(worklog.contains("commit `c0ffee1234567890`"), "{worklog}");
 
         fs::remove_dir_all(base).ok();
     }

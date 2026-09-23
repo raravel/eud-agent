@@ -9,7 +9,7 @@ import { SettingsDialog } from "./SettingsDialog";
 const settings: AppSettings = {
   notifications: {
     planApproval: { sound: true, osNotification: true },
-    changesetReview: { sound: true, osNotification: true },
+    reviewRequired: { sound: true, osNotification: true },
     agentTurnComplete: { sound: true, osNotification: true },
     askResponseRequired: { sound: true, osNotification: true },
   },
@@ -278,6 +278,11 @@ describe("SettingsDialog provider management", () => {
     const onSettingsChange = vi.fn();
     renderDialog({ onSettingsChange });
     await userEvent.click(screen.getByRole("button", { name: "알림" }));
+    // The changeset-review channel is gone with request review; the remaining
+    // three are the only rows.
+    expect(
+      screen.queryByRole("switch", { name: "변경사항 검토 필요 알림음" }),
+    ).not.toBeInTheDocument();
     await userEvent.click(screen.getByRole("switch", { name: "에이전트 턴 종료 알림음" }));
     expect(onSettingsChange).toHaveBeenCalledWith({
       ...settings,

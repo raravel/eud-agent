@@ -367,6 +367,60 @@ OpenCode Go / Ollama / Antigravity는 네이티브 도구가 원천적으로 없
   - §8 미결 4는 **현행 유지**로 결정: `autonomous_completion_blocker`는 그대로
     "런타임 변경이 있으면 현재 리비전의 성공한 빌드"만 요구한다.
 
+- **Phase 5 — 진행 중 (2026-09-23).**
+  - **요청 changeset 리뷰 제거.** `changeset_decision`이 `settle_request`가 됐다. 사용자가
+    Accept를 누를 때 하던 일(위키 원장 기록, 워크스페이스 문서 리비전 확정, harness 작업 예약,
+    task-state 이벤트, 쓰기 등록 해제)을 턴이 끝날 때 스스로 한다. Reject와 부분 수락 계약은
+    사라졌다 — 되돌리기는 `git revert`다.
+  - `Phase::ChangesetReview` 제거. 실패한 턴은 리뷰로 되돌아가지 않고 오류로 끝난다.
+    `ipc`의 `ChangesetDecisionRequest`/`DecisionIds`/`AllLiteral`/`RollbackResultEvent`와
+    `changeset_decision` 커맨드, `ChangesetReview` 알림 채널도 함께 갔다.
+  - 위키 원장은 `accepted_ledger_entries(changeset, journal, scope)` →
+    `applied_ledger_entries(changeset, journal)`. 고를 것이 없으므로 `AcceptedScope`도 없다.
+  - 사운드 가드는 정산 **앞**으로 옮겼다. 빌드 없이 들어온 사운드 임포트는 정산 자체를 거부한다.
+  - **계획과 다른 점 (중요):** §5는 "`journal.rs`의 changeset 공급 경로" 제거를 적었지만,
+    **harness 문서 리뷰가 같은 changeset 기계를 계속 쓴다**(`ipc::ChangesetEvent`,
+    `ipc_changeset_item`, `journal.changeset`). 문자 그대로 지우면 harness가 깨진다.
+    실제로 죽은 것은 **역순 롤백**(`JournalRollbackTarget`, `ChangesetDecision`,
+    `JournalStore::decide`, `apply_inverse`)뿐이고 그것만 걷어낸다.
+  - `git.rs`에 `commit_detail`을 추가했다: 커밋 하나의 메시지와 파일별 유니파이드 diff를
+    파일당 64 KiB / 커밋당 256 KiB로 묶어 돌려준다. 바이너리(맵)는 바뀌었다고만 보고하고
+    내용 비교는 하지 않는다 — 맵은 diff가 가장 할 말이 없는 파일이다.
+
+- **Phase 5 마무리 — 검증한 것과 하지 않기로 한 것 (2026-09-23).**
+  - **역순 롤백 제거 완료.** `journal.rs` 3,125 → 1,596줄. `JournalRollbackTarget`,
+    `ChangesetDecision`, `JournalStore::decide`, `apply_inverse`와 역연산 헬퍼 전부.
+    `tool_exec.rs`의 트레이트 구현도 함께(−280줄). changeset 매핑 자체는 harness 문서 리뷰가
+    계속 쓰므로 남겼다. `rejected_entries`는 reject와 무관해졌으므로 `selected_by_ids`로 개명.
+  - **Phase 1의 결함 수정.** 커밋 경계가 `chat_turn`과 자율 iteration에만 있었고 정작 파일을
+    쓰는 `continue_pending_write`에는 없었다. 그대로면 쓰기 턴의 변경을 다음 턴이 "외부 편집"으로
+    기록한다 — 에이전트 자기 작업을 사용자가 한 것처럼. 쓰기 턴이 자기 작업을 커밋한다.
+  - **§N8 harness:** 트리거는 턴 커밋, 입력은 **저널 엔트리 유지 + 커밋 해시 추가**로 결정했다
+    (2026-09-23 사용자). diff로 갈아끼우면 `classify_runtime_verification`이 쓰는 도구 종류
+    신호를 잃고, 저널은 어차피 위키 원장·task_state provenance·harness 문서 리뷰 때문에
+    남는다. `HarnessJob.turn_commit`이 생겼고 worklog가 `` commit `<sha>` ``를 인용한다.
+  - **§3.4 baseline 스캔은 제거하지 않는다 — 전제가 코드와 다르다.** §3.4는 "루트 전체가
+    writable이 되면 이 스캔이 성립하지 않는다"고 적었지만, 스캔 대상은
+    `workspace_root = <project>/.eud-agent/workspace`이지 프로젝트 루트가 아니다(`workspace.rs`
+    `PROJECT_WORKSPACE_DIR`). specs/plans/decisions/worklog만 도는 작은 트리이고,
+    `WorkspaceTurnRecorder::finish`가 이걸로 "이 턴이 어떤 durable 문서를 건드렸나"를 알아내
+    문서 리비전 메타데이터를 기록한다(rules.md가 요구하는 것). 지우려면 그 메타데이터를 git
+    커밋에서 끌어오는 별도 설계가 필요하고, 계획도 이걸 "부수 이득"이라고만 적었다.
+
+- **Phase 5 패널 (2026-09-23).** `ChangesetView`가 `GitHistoryView`로 바뀌었다: 턴 커밋 목록 →
+  선택한 커밋의 파일별 diff → "되돌리기"(확인 대화 뒤 `git_revert`). diff는 색뿐 아니라
+  `+`/`-` 거터로도 구분되므로 흑백·색각이상에서도 읽힌다. 바이너리와 한도 초과는 이유 문장으로
+  대체된다. 기존 저장소 동의 대화(`GitConsentDialog`)와 외부 편집 알림도 붙었다.
+  - `ChangesetView`는 지울 수 없었다 — **harness 문서 리뷰가 쓰고 있다.**
+    `HarnessChangesetView`로 옮기고 per-item 결정 기계(harness는 쓰지 않았다)만 걷어냈다.
+  - **알림 채널 하나를 되살렸다.** 요청 changeset을 지우면서 `ChangesetReview` 종류까지
+    지웠더니, 남은 두 표면(harness 문서 리뷰, 팀 후보 ready)이 "계획 승인이 필요합니다"라는
+    **거짓 문구**로 알림을 띄우게 됐다. `ReviewRequired`("검토할 변경이 있습니다")를 추가하고
+    설정에도 자기 행을 줬다.
+  - **미검증:** rules.md는 UI 변경을 실제 브라우저/Tauri 표면에서 확인하라고 요구하는데,
+    이 화면들은 아직 `tsc` + Vitest 증거뿐이다. 실제 `git_state`/`git_log`를 상대로
+    렌더링된 적이 없다.
+
 Phase 1–2를 3보다 먼저 두는 이유: **되돌리기 수단과 경계 검증이 먼저 서 있어야** 자유 CRUD를
 열어도 안전하다. 어느 Phase에서 중단해도 제품은 동작 가능한 상태로 남는다.
 

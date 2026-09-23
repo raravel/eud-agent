@@ -48,7 +48,7 @@ pub struct AppSettings {
 #[serde(rename_all = "camelCase")]
 pub enum AttentionNotificationKind {
     PlanApproval,
-    ChangesetReview,
+    ReviewRequired,
     AgentTurnComplete,
     AskResponseRequired,
 }
@@ -59,21 +59,15 @@ struct AttentionNotificationText {
     body: String,
 }
 
-fn attention_notification_text(
-    kind: AttentionNotificationKind,
-    item_count: Option<usize>,
-) -> AttentionNotificationText {
+fn attention_notification_text(kind: AttentionNotificationKind) -> AttentionNotificationText {
     match kind {
         AttentionNotificationKind::PlanApproval => AttentionNotificationText {
             title: "계획 승인이 필요합니다",
             body: "새 계획안을 검토하고 승인해 주세요.".to_string(),
         },
-        AttentionNotificationKind::ChangesetReview => AttentionNotificationText {
-            title: "변경사항 검토가 필요합니다",
-            body: item_count.map_or_else(
-                || "적용하거나 되돌릴 변경사항을 검토해 주세요.".to_string(),
-                |count| format!("변경사항 {count}건을 적용하거나 되돌릴지 검토해 주세요."),
-            ),
+        AttentionNotificationKind::ReviewRequired => AttentionNotificationText {
+            title: "검토할 변경이 있습니다",
+            body: "에이전트가 만든 변경을 확인해 주세요.".to_string(),
         },
         AttentionNotificationKind::AgentTurnComplete => AttentionNotificationText {
             title: "에이전트 턴이 종료되었습니다",
@@ -92,7 +86,7 @@ fn notification_channels(
 ) -> NotificationChannelSettings {
     match kind {
         AttentionNotificationKind::PlanApproval => settings.plan_approval,
-        AttentionNotificationKind::ChangesetReview => settings.changeset_review,
+        AttentionNotificationKind::ReviewRequired => settings.review_required,
         AttentionNotificationKind::AgentTurnComplete => settings.agent_turn_complete,
         AttentionNotificationKind::AskResponseRequired => settings.ask_response_required,
     }
@@ -208,8 +202,6 @@ pub struct AskEvent {
     pub questions: Vec<AskQuestion>,
 }
 
-
-
 /// Answers for one question. Multiple values are valid only for `multi`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AskAnswer {
@@ -233,46 +225,6 @@ pub enum Decision {
     /// Reject and roll back the targeted changeset items.
     #[serde(rename = "reject")]
     Reject,
-}
-
-/// Marker that (de)serializes only as the exact literal `all`.
-#[derive(Debug, Clone)]
-pub struct AllLiteral;
-
-impl Serialize for AllLiteral {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str("all")
-    }
-}
-
-impl<'de> Deserialize<'de> for AllLiteral {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let value = String::deserialize(deserializer)?;
-        if value == "all" {
-            Ok(AllLiteral)
-        } else {
-            Err(serde::de::Error::custom("expected the literal \"all\""))
-        }
-    }
-}
-
-/// `changeset_decision.ids` wire values.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum DecisionIds {
-    /// The literal `all` for every pending changeset item.
-    All(AllLiteral),
-    /// Specific changeset item ids.
-    List(Vec<String>),
-}
-
-/// `changeset_decision` command input.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ChangesetDecisionRequest {
-    /// Accept or reject the targeted changeset items.
-    pub decision: Decision,
-    /// Target all items or a specific list of item ids.
-    pub ids: DecisionIds,
 }
 
 /// `status` command output and push event payload.
@@ -510,16 +462,21 @@ pub struct SessionLoadedEvent {
     pub id: String,
 }
 
-/// `rollback_result` event payload.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RollbackResultEvent {
-    /// Item ids accepted or rolled back.
-    pub ids: Vec<String>,
-    /// True when the requested rollback/decision succeeded.
-    pub ok: bool,
-    /// Conflict or rollback failure detail when `ok` is false.
+/// `git` event payload: what this turn put into the project's history.
+///
+/// `external` is the separate commit that captured what changed outside the app
+/// before the turn ran — the user's own SCMDraft or editor edit. The panel says
+/// so, because a commit the user did not expect is worth a sentence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitTurnEvent {
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
+    pub external: Option<crate::git::CommitRecord>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub turn: Option<crate::git::CommitRecord>,
+    /// Why nothing was recorded, in Korean, when something went wrong.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
 }
 
 /// `progress` event payload.
@@ -647,12 +604,6 @@ pub async fn plan_approve() -> Result<(), String> {
 /// Accept or reject pending changeset items.
 ///
 /// The engine task replaces this placeholder body with the real orchestration.
-#[tauri::command]
-pub async fn changeset_decision(decision: Decision, ids: DecisionIds) -> Result<(), String> {
-    let _request = ChangesetDecisionRequest { decision, ids };
-    Ok(())
-}
-
 /// Cancel the in-flight turn.
 ///
 /// The engine task replaces this placeholder body with the real orchestration.
@@ -725,7 +676,6 @@ pub async fn attention_notify(
     kind: AttentionNotificationKind,
     show_os: bool,
     session_id: String,
-    item_count: Option<usize>,
 ) -> Result<(), String> {
     let settings = app_settings_payload(state.dirs())?.notifications;
     let channels = notification_channels(settings, kind);
@@ -736,7 +686,7 @@ pub async fn attention_notify(
         .err();
 
     let os_error = if channels.os_notification && show_os {
-        let text = attention_notification_text(kind, item_count);
+        let text = attention_notification_text(kind);
         #[cfg(windows)]
         {
             crate::windows_notification::show(&app, text.title, &text.body, &session_id).err()
@@ -1025,14 +975,6 @@ pub fn emit_wiki<R: tauri::Runtime>(
     emitter.emit("wiki", payload)
 }
 
-/// Emit a `rollback_result` event.
-pub fn emit_rollback_result<R: tauri::Runtime>(
-    emitter: &impl Emitter<R>,
-    payload: RollbackResultEvent,
-) -> tauri::Result<()> {
-    emitter.emit("rollback_result", payload)
-}
-
 /// Emit a `progress` event.
 pub fn emit_progress<R: tauri::Runtime>(
     emitter: &impl Emitter<R>,
@@ -1209,45 +1151,6 @@ mod tests {
         assert_json(&ipc::Decision::Accept, json!("accept"));
         assert_json(&ipc::Decision::Reject, json!("reject"));
 
-        let all_ids: ipc::DecisionIds = serde_json::from_value(json!("all")).unwrap();
-        assert_json(&all_ids, json!("all"));
-
-        let selected_ids: ipc::DecisionIds = serde_json::from_value(json!(["a", "b"])).unwrap();
-        assert_json(&selected_ids, json!(["a", "b"]));
-
-        let accept_all: ipc::ChangesetDecisionRequest =
-            serde_json::from_value(json!({ "decision": "accept", "ids": "all" })).unwrap();
-        assert_json(
-            &accept_all,
-            json!({
-                "decision": "accept",
-                "ids": "all"
-            }),
-        );
-
-        let reject_selected: ipc::ChangesetDecisionRequest =
-            serde_json::from_value(json!({ "decision": "reject", "ids": ["a", "b"] })).unwrap();
-        assert_json(
-            &reject_selected,
-            json!({
-                "decision": "reject",
-                "ids": ["a", "b"]
-            }),
-        );
-    }
-
-    #[test]
-    fn changeset_decision_ids_reject_non_all_bare_strings() {
-        assert!(serde_json::from_value::<ipc::DecisionIds>(json!("a")).is_err());
-        assert!(serde_json::from_value::<ipc::DecisionIds>(json!("")).is_err());
-        assert!(serde_json::from_value::<ipc::DecisionIds>(json!("All")).is_err());
-        assert!(
-            serde_json::from_value::<ipc::ChangesetDecisionRequest>(json!({
-                "decision": "accept",
-                "ids": "nope"
-            }))
-            .is_err()
-        );
     }
 
     #[test]
@@ -1610,32 +1513,6 @@ mod tests {
         assert_json(&ipc::Decision::Accept, json!("accept"));
         assert_json(&ipc::Decision::Reject, json!("reject"));
 
-        let all_ids: ipc::DecisionIds = serde_json::from_value(json!("all")).unwrap();
-        assert_json(&all_ids, json!("all"));
-
-        let selected_ids: ipc::DecisionIds = serde_json::from_value(json!(["a", "b"])).unwrap();
-        assert_json(&selected_ids, json!(["a", "b"]));
-
-        let accept_all: ipc::ChangesetDecisionRequest =
-            serde_json::from_value(json!({ "decision": "accept", "ids": "all" })).unwrap();
-        assert_json(
-            &accept_all,
-            json!({
-                "decision": "accept",
-                "ids": "all"
-            }),
-        );
-
-        let reject_selected: ipc::ChangesetDecisionRequest =
-            serde_json::from_value(json!({ "decision": "reject", "ids": ["a", "b"] })).unwrap();
-        assert_json(
-            &reject_selected,
-            json!({
-                "decision": "reject",
-                "ids": ["a", "b"]
-            }),
-        );
-
         let agent_event_without_data = ipc::AgentEvent {
             kind: "thinking".to_string(),
             detail: "Checking context".to_string(),
@@ -1790,19 +1667,6 @@ mod tests {
             }),
         );
 
-        let rollback = ipc::RollbackResultEvent {
-            ids: vec!["a".to_string(), "b".to_string()],
-            ok: true,
-            error: None,
-        };
-        assert_json(
-            &rollback,
-            json!({
-                "ids": ["a", "b"],
-                "ok": true
-            }),
-        );
-
         let progress_with_detail = ipc::ProgressEvent {
             stage: ipc::ProgressStage::Codex,
             detail: Some("Generating patch".to_string()),
@@ -1857,10 +1721,7 @@ mod tests {
                     sound: false,
                     os_notification: true,
                 },
-                changeset_review: NotificationChannelSettings {
-                    sound: true,
-                    os_notification: false,
-                },
+                review_required: NotificationChannelSettings::default(),
                 agent_turn_complete: NotificationChannelSettings {
                     sound: false,
                     os_notification: false,
@@ -1882,7 +1743,7 @@ mod tests {
             json!({
                 "notifications": {
                     "planApproval": {"sound": false, "osNotification": true},
-                    "changesetReview": {"sound": true, "osNotification": false},
+                    "reviewRequired": {"sound": true, "osNotification": true},
                     "agentTurnComplete": {"sound": false, "osNotification": false},
                     "askResponseRequired": {"sound": true, "osNotification": false}
                 },
@@ -1913,32 +1774,21 @@ mod tests {
 
     #[test]
     fn attention_notification_copy_matches_each_event() {
-        let plan =
-            ipc::attention_notification_text(ipc::AttentionNotificationKind::PlanApproval, None);
+        let plan = ipc::attention_notification_text(ipc::AttentionNotificationKind::PlanApproval);
         assert_eq!(plan.title, "계획 승인이 필요합니다");
         assert_eq!(plan.body, "새 계획안을 검토하고 승인해 주세요.");
 
-        let changeset = ipc::attention_notification_text(
-            ipc::AttentionNotificationKind::ChangesetReview,
-            Some(3),
-        );
-        assert_eq!(changeset.title, "변경사항 검토가 필요합니다");
-        assert_eq!(
-            changeset.body,
-            "변경사항 3건을 적용하거나 되돌릴지 검토해 주세요."
-        );
+        // A harness document review is not a plan, and must not say it is.
+        let review =
+            ipc::attention_notification_text(ipc::AttentionNotificationKind::ReviewRequired);
+        assert_eq!(review.title, "검토할 변경이 있습니다");
+        assert!(!review.body.contains("계획"));
 
-        let turn_complete = ipc::attention_notification_text(
-            ipc::AttentionNotificationKind::AgentTurnComplete,
-            None,
-        );
+        let turn_complete = ipc::attention_notification_text(ipc::AttentionNotificationKind::AgentTurnComplete);
         assert_eq!(turn_complete.title, "에이전트 턴이 종료되었습니다");
         assert_eq!(turn_complete.body, "에이전트의 응답을 확인해 주세요.");
 
-        let ask = ipc::attention_notification_text(
-            ipc::AttentionNotificationKind::AskResponseRequired,
-            None,
-        );
+        let ask = ipc::attention_notification_text(ipc::AttentionNotificationKind::AskResponseRequired);
         assert_eq!(ask.title, "에이전트가 응답을 기다리고 있습니다");
         assert_eq!(ask.body, "질문을 확인하고 답변해 주세요.");
     }

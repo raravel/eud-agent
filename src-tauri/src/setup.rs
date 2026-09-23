@@ -1160,6 +1160,91 @@ pub(crate) fn launch_scmdraft(dirs: &DataDirs) -> Result<ScmdraftLaunch, String>
         })
 }
 
+/// The configured project's root, or the reason there is none.
+fn configured_project_root(dirs: &DataDirs) -> Result<std::path::PathBuf, String> {
+    let config = dirs.load_config().map_err(|error| error.to_string())?;
+    let path = config.project_path.trim();
+    if path.is_empty() {
+        return Err("열린 프로젝트가 없습니다. 먼저 프로젝트를 여세요.".to_string());
+    }
+    Ok(std::path::PathBuf::from(path))
+}
+
+/// What the app knows about this project's repository.
+///
+/// The panel asks on open: a repository the app created commits every turn, one
+/// that was already here waits for the user to say it may.
+#[tauri::command]
+pub async fn git_state(state: tauri::State<'_, AppManaged>) -> Result<crate::git::RepoState, String> {
+    let dirs = state.dirs().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let root = configured_project_root(&dirs)?;
+        Ok(crate::git::prepare(&root))
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+/// Record whether the app may commit into a repository the user already had.
+#[tauri::command]
+pub async fn git_consent_set(
+    state: tauri::State<'_, AppManaged>,
+    granted: bool,
+) -> Result<crate::git::RepoState, String> {
+    let dirs = state.dirs().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let root = configured_project_root(&dirs)?;
+        crate::git::set_consent(&root, granted)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+/// The project's recent turn commits, newest first.
+#[tauri::command]
+pub async fn git_log(
+    state: tauri::State<'_, AppManaged>,
+    limit: Option<usize>,
+) -> Result<Vec<crate::git::CommitSummary>, String> {
+    let dirs = state.dirs().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let root = configured_project_root(&dirs)?;
+        crate::git::log(&root, limit.unwrap_or(50))
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+/// Everything one commit changed, with each file's patch bounded.
+#[tauri::command]
+pub async fn git_commit_detail(
+    state: tauri::State<'_, AppManaged>,
+    sha: String,
+) -> Result<crate::git::CommitDetail, String> {
+    let dirs = state.dirs().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let root = configured_project_root(&dirs)?;
+        crate::git::commit_detail(&root, &sha)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+/// Undo one commit by recording its inverse. This is what replaced Reject.
+#[tauri::command]
+pub async fn git_revert(
+    state: tauri::State<'_, AppManaged>,
+    sha: String,
+) -> Result<crate::git::CommitRecord, String> {
+    let dirs = state.dirs().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let root = configured_project_root(&dirs)?;
+        crate::git::revert(&root, &sha)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
 /// Open the current project's source map in the configured SCMDraft 2.
 #[tauri::command]
 pub async fn project_open_scmdraft(

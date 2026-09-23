@@ -11,12 +11,11 @@ import {
   X,
 } from "lucide-react";
 
-import { ChangesetView } from "@/components/ChangesetView";
+import { HarnessChangesetView } from "@/components/HarnessChangesetView";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import type { HarnessJobView } from "@/lib/protocol";
-import type { ChangesetState } from "@/state/store";
 
 export interface HarnessStatusCardProps {
   jobs: HarnessJobView[];
@@ -131,9 +130,7 @@ function HarnessJobCard({
   const [open, setOpen] = useState(true);
   const presentation = statusPresentation(job);
   const Icon = presentation.icon;
-  const changeset: ChangesetState | null = job.changeset
-    ? { request_id: job.changeset.request_id, items: job.changeset.items, decisions: {} }
-    : null;
+  const items = job.changeset?.items ?? null;
 
   return (
     <Card className="gap-0 overflow-hidden border-border bg-card/60 py-0 shadow-none">
@@ -208,14 +205,13 @@ function HarnessJobCard({
         </CardContent>
       )}
 
-      {job.status === "review" && changeset && (
-        <ChangesetView
-          changeset={changeset}
+      {job.status === "review" && items && (
+        <HarnessChangesetView
+          items={items}
           open={open}
           onOpenChange={setOpen}
           pending={pending}
           title="하네스 문서 적용"
-          bulkOnly
           onDecide={(decision) => onDecide(job.id, decision)}
         />
       )}

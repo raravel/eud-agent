@@ -11,15 +11,14 @@
  *   thinking   --> ready          : answer (no edits)
  *   thinking   --> plan_review    : plan{}
  *   plan_review --> thinking      : plan_feedback / plan_approve
- *   thinking   --> changeset_review : changeset{}
- *   changeset_review --> ready    : decisions done (accept/reject applied)
- *   changeset_review --> thinking : follow-up chat (undecided auto-accept server-side)
+ *
+ * A turn no longer stops for accept/reject: it applies its work and settles,
+ * and the app commits the project at the turn boundary (`git{}`). The way back
+ * is the history view's 되돌리기, not a phase.
  *
  * features/06 ## Behaviors (encoded here):
  *   - A transport re-open during thinking/plan_review resets to ready WITH a
- *     notice — the core cancels the thread turn. The LAST changeset stays
- *     reviewable across a transport re-open (the journal is core-persisted), so
- *     a re-open must NOT drop `changeset`; it only resets an in-flight TURN.
+ *     notice — the core cancels the thread turn.
  *   - Send gating v2: `connected && hasProject && !busy` — the settable-target
  *     requirement is GONE (the agent creates files itself). No `canSendSet` /
  *     `canSendNewEps`. `busy` = a turn is in flight (thinking) OR a plan awaits a
@@ -27,16 +26,15 @@
  *     is compiling.
  *   - Plan revision replacement: a later `plan{revision+1}` replaces the active
  *     plan card.
- *   - `rollback_result` flips per-item decision state (rejected / failed).
  *   - Event log capped at 500 — drop oldest.
  *
  * Subscribe/listener pattern — no runtime dependency, no framework coupling.
  */
 
 import type {
-  ChangesetItem,
   AskQuestion,
   ChatAttachment,
+  CommitRecord,
   ContextUsage,
   FileEntry,
   TeamTask,
@@ -46,13 +44,6 @@ import type {
   MentionInstance,
   ProgressStage,
 } from "@/lib/ipc";
-// itemIds maps an item to its decision-target ids (a dat group has NO
-// item-level id — its ids live on each property; see lib/changeset). The store
-// MUST use the same id-shape helper as ChangesetView so "fully decided" agrees
-// with what the view renders. Value import; the reverse `import type
-// { ItemDecision }` in lib/changeset is type-only, so there is no runtime cycle.
-import { itemIds } from "@/lib/changeset";
-
 /** Max conversation/event-log entries (features/06 ## Behaviors). */
 export const MAX_LOG_ENTRIES = 500;
 
@@ -62,8 +53,7 @@ export type Phase =
   | "retry"
   | "ready"
   | "thinking"
-  | "plan_review"
-  | "changeset_review";
+  | "plan_review";
 
 /**
  * RAG warmup gate state. The server replays the current `rag_warmup` progress
@@ -198,44 +188,6 @@ function emptyTurn(): TurnState {
   return { reasoning: "", answer: "", answerStarted: false, tools: [], blocks: [] };
 }
 
-/** Per-item decision outcome (driven by `rollback_result` + the recorded send). */
-export type ItemDecision = "accepted" | "rejected" | "failed";
-
-/**
- * The changeset_decision the store last SENT, recorded so the matching inbound
- * `rollback_result` can be labelled correctly.
- *
- * The server's `rollback_result{ids, ok}` carries NO accept/reject discriminator:
- * engine.py routes BOTH accept and reject through it (accept → `ids:[]`,`ok:true`;
- * reject → the real journal ids,`ok:true|false`). So the inbound message alone
- * cannot tell a KEPT item from a 되돌림 one, and accept-all sends an EMPTY ids
- * array. The store records what it sent (it is the SOLE decision sender, the
- * transport is ordered, and exactly one decision is in flight at a time) and
- * reconciles on the reply. `ids:"all"` is kept verbatim so an empty inbound ids
- * array on accept-all still resolves to "apply to all undecided items".
- *
- * Candidate server-side amendment (later task): have `rollback_result` echo the
- * decision (or the accepted ids) so the panel need not infer it. Until then the
- * recorded-decision approach is correct precisely because the store is the only
- * sender.
- */
-export interface PendingDecision {
-  decision: "accept" | "reject";
-  ids: "all" | string[];
-}
-
-/**
- * The active changeset under review. Persisted in the store ACROSS a reconnect
- * (the journal is server-persisted; features/06 line 52) — only an in-flight TURN
- * resets on reconnect, never the changeset. `decisions` maps item id → outcome;
- * an absent id is still undecided.
- */
-export interface ChangesetState {
-  request_id: string;
-  items: ChangesetItem[];
-  decisions: Record<string, ItemDecision>;
-}
-
 /**
  * The dat-edit wiki ledger snapshot (last-value entries the agent applied and
  * the user accepted). Mirrors the Rust `WikiResponse` (`{version, entries}`);
@@ -292,8 +244,6 @@ export interface PanelState {
   plan: PlanState | null;
   /** Structured user input currently blocking the AI turn. */
   ask: AskState | null;
-  /** Active changeset under review (null until a `changeset`; survives reconnect). */
-  changeset: ChangesetState | null;
   /** Every EPS → Map team task of this session, as last announced. */
   teamTasks: TeamTask[];
   /** Whether the project-memory overlay is open. */
@@ -305,12 +255,6 @@ export interface PanelState {
    * Kept in sync by the server's push after every accept that records a dat edit.
    */
   wikiData: WikiState | null;
-  /**
-   * The changeset_decision in flight (recorded on send, cleared when its
-   * `rollback_result` lands). Exposed so the UI can label the result per the
-   * accept/reject the user chose — the inbound reply carries no discriminator.
-   */
-  pendingDecision: PendingDecision | null;
   /** Per-turn streaming buffers (reasoning / answer / tools); reset per turn. */
   turn: TurnState;
   /** Latest active-context and cumulative token snapshot for this session. */
@@ -375,10 +319,17 @@ export interface PanelStore {
   askSubmitFailed(): void;
   /** Remove the ASK card after the backend accepted its answers. */
   askAnswered(): void;
-  /** `changeset` — enter changeset_review with the journaled items. */
-  changesetReceived(requestId: string, items: ChangesetItem[]): void;
-  /** `rollback_result` — flip per-item decision state (rejected/failed). */
-  rollbackResult(ids: string[], ok: boolean): void;
+  /**
+   * `git` — record what the turn boundary committed. The turn's own commit is
+   * a quiet row; a commit of edits made OUTSIDE the app is announced, because a
+   * commit the user did not ask for is surprising. A failure to record is a
+   * warning: the work itself already happened.
+   */
+  gitCommitted(event: {
+    external?: CommitRecord;
+    turn?: CommitRecord;
+    warning?: string;
+  }): void;
   /** `error` — return the flow to ready (and detect the no-project signal). */
   errorReceived(message: string): void;
   /** `progress` — logged only; no phase change in v2. */
@@ -401,24 +352,12 @@ export interface PanelStore {
   wikiReceived(version: number, entries: Record<string, LedgerEntry>): void;
 
   // ---- user intents (UI drives these after a successful send) ----
-  /** A chat was sent → thinking (from ready or changeset_review). */
+  /** A chat was sent → thinking. */
   chatSent(): void;
   /** plan_feedback was sent → thinking. */
   planFeedbackSent(): void;
   /** plan_approve was sent → thinking. */
   planApproveSent(): void;
-  /**
-   * A changeset_decision was sent (per-item or bulk) — RECORD it so the matching
-   * `rollback_result` can be labelled per the recorded accept/reject (the inbound
-   * message carries no discriminator). Awaits `rollback_result`.
-   */
-  decisionSent(decision: "accept" | "reject", ids: "all" | string[]): void;
-  /**
-   * The changeset_decision command never reached the core (send failed) — clear
-   * the optimistic pending decision so the review controls unlock again (no
-   * `rollback_result` will arrive to clear it).
-   */
-  decisionFailed(): void;
   /** cancel was sent — return to ready. */
   cancelSent(): void;
   /**
@@ -451,7 +390,7 @@ export interface PanelStore {
    * Session restore: seed `core.log` from a saved {@link PanelLog} and ADVANCE
    * the closure-private id counters (`logSeq`/`toolSeq`/`blockSeq`) past every
    * restored id so freshly minted ids never collide with restored React keys.
-   * Transient state (turn/plan/changeset/pendingDecision/wiki + connection
+   * Transient state (turn/plan/wiki + connection
    * flags) is left UNTOUCHED — it re-arrives from the core on reconnect; the
    * phase stays `connecting`. Returns the max restored log id (the App seeds
    * `lastToastedLogId` with it to avoid re-toasting historical warn/error rows).
@@ -463,10 +402,8 @@ export interface PanelStore {
  * Phases in which sending is blocked because a turn is in flight.
  * `plan_review` is NOT busy (EUD-074): the MAIN prompt input is the plan
  * feedback channel — typing there sends `plan_feedback{}` (App routes by
- * phase; the PlanView feedback textarea is removed). `changeset_review` is NOT
- * busy — a follow-up chat is allowed (the server auto-accepts undecided
- * items). `compiling` is an orthogonal busy signal layered on top in
- * {@link PanelState.canSend}.
+ * phase; the PlanView feedback textarea is removed). `compiling` is an
+ * orthogonal busy signal layered on top in {@link PanelState.canSend}.
  */
 const BUSY_PHASES: ReadonlySet<Phase> = new Set<Phase>(["thinking"]);
 
@@ -492,27 +429,6 @@ const PROJECT_UNAVAILABLE_MARKERS = [
 /** Notice shown when a reconnect cancels an in-flight turn (features/06 line 52). */
 const RECONNECT_TURN_NOTICE = "재연결로 진행 중이던 작업이 취소되었습니다.";
 
-/**
- * True when every changeset item has a decision (accepted/rejected/failed).
- *
- * An item is decided when ALL of its decision-target ids are decided — derived
- * from {@link itemIds}, the SAME id-shape helper ChangesetView uses. This is
- * load-bearing for dat groups: a dat group carries NO item-level `id` (the ids
- * live on each property), so the old `decisions[it.id]` test was permanently
- * undefined for any dat group and a changeset containing one could NEVER reach
- * "fully decided" — stranding changeset_review and re-opening it on reconnect.
- * An item with zero ids (defensive) is treated as already decided so it never
- * blocks completion.
- */
-function isChangesetFullyDecided(cs: ChangesetState): boolean {
-  return (
-    cs.items.length > 0 &&
-    cs.items.every((it) =>
-      itemIds(it).every((id) => cs.decisions[id] !== undefined),
-    )
-  );
-}
-
 /** Create a fresh panel store. */
 export function createPanelStore(): PanelStore {
   let logSeq = 0;
@@ -534,7 +450,6 @@ export function createPanelStore(): PanelStore {
     projectAvailable: true,
     plan: null as PlanState | null,
     ask: null as AskState | null,
-    changeset: null as ChangesetState | null,
     teamTasks: [] as TeamTask[],
     memoryOpen: false,
     memory: null as MemoryViewState | null,
@@ -557,11 +472,6 @@ export function createPanelStore(): PanelStore {
     // disconnect/cancel, so wsOpen uses this flag (not the transient phase) to
     // decide whether to emit the re-open notice (features/06 line 52).
     turnInFlight: false,
-    // The changeset_decision last sent, awaiting its rollback_result. The inbound
-    // reply carries no accept/reject discriminator, so this is how the store knows
-    // whether to label items 적용 유지 (accepted) or 되돌림 (rejected). Cleared on
-    // apply. null when no decision is in flight.
-    pendingDecision: null as PendingDecision | null,
   };
 
   let snapshot: PanelState = computeSnapshot();
@@ -585,12 +495,10 @@ export function createPanelStore(): PanelStore {
       projectAvailable: core.projectAvailable,
       plan: core.plan,
       ask: core.ask,
-      changeset: core.changeset,
       teamTasks: core.teamTasks,
       memoryOpen: core.memoryOpen,
       memory: core.memory,
       wikiData: core.wikiData,
-      pendingDecision: core.pendingDecision,
       turn: core.turn,
       contextUsage: core.contextUsage,
       rag: core.rag,
@@ -730,15 +638,9 @@ export function createPanelStore(): PanelStore {
         core.ask = null;
         pushLog("warn", RECONNECT_TURN_NOTICE);
       }
-      // The last changeset STAYS reviewable across a transport re-open (journal is
-      // server-persisted; features/06 line 52): if an undecided changeset is
-      // present, restore changeset_review even though the intermediate
-      // connecting/retry phases passed through. A plan awaiting a decision is
-      // likewise durable: keep it under review instead of dropping it.
-      // Otherwise land on ready.
-      if (core.changeset !== null && !isChangesetFullyDecided(core.changeset)) {
-        core.phase = "changeset_review";
-      } else if (core.plan !== null) {
+      // A plan awaiting a decision is durable across a transport re-open: keep
+      // it under review instead of dropping it. Otherwise land on ready.
+      if (core.plan !== null) {
         core.phase = "plan_review";
       } else {
         core.phase = "ready";
@@ -1029,90 +931,42 @@ export function createPanelStore(): PanelStore {
       emit();
     },
 
-    changesetReceived(requestId, items) {
-      // thinking --> changeset_review. Fresh decisions map (no item decided yet).
-      // EUD-069 + F2: archive the turn blocks in stream order (tools + prose).
-      clearLiveProgress();
-      archiveTurnBlocks();
-      core.turnInFlight = false;
-      core.changeset = { request_id: requestId, items, decisions: {} };
-      core.phase = "changeset_review";
-      core.ask = null;
-      emit();
-    },
-
-    rollbackResult(ids, ok) {
-      // Label items per the RECORDED decision — the inbound rollback_result has no
-      // accept/reject discriminator (engine.py routes BOTH through it). accept →
-      // "accepted" (적용 유지); reject → ok ? "rejected" (되돌림) : "failed".
-      if (core.changeset === null) {
-        core.pendingDecision = null;
-        emit();
-        return;
+    gitCommitted({ external, turn, warning }) {
+      // An external commit is the one the user did not ask for — the app found
+      // edits made outside it and recorded them before the turn ran — so it gets
+      // a visible row. The turn's own commit is bookkeeping: a muted row, and
+      // silent so it never pops a toast on every single turn.
+      if (external) {
+        pushLog(
+          "ok",
+          `앱 밖에서 바뀐 파일 ${external.files}개를 먼저 별도 커밋으로 기록했습니다: ${external.subject}`,
+        );
       }
-      const pending = core.pendingDecision;
-      // Which items did this reply decide?
-      //  - bulk accept echoes an EMPTY ids array (the server does not return the
-      //    accepted ids), so resolve it against ALL currently-undecided items.
-      //  - reject (and per-item accept) carry the real ids.
-      let targetIds: string[];
-      if (pending?.ids === "all" && ids.length === 0) {
-        // Resolve against ALL currently-undecided ids. Derive ids per item via
-        // itemIds (a dat group's ids live on its properties, NOT on it.id), then
-        // keep only the still-undecided ones.
-        targetIds = core.changeset.items
-          .flatMap((it) => itemIds(it))
-          .filter((id) => core.changeset!.decisions[id] === undefined);
-      } else {
-        targetIds = ids;
+      if (turn) {
+        pushLog(
+          "info",
+          `변경 기록 · ${turn.subject} (파일 ${turn.files}개)`,
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          { silent: true },
+        );
       }
-      const outcome: ItemDecision = pending
-        ? pending.decision === "accept"
-          ? "accepted"
-          : ok
-            ? "rejected"
-            : "failed"
-        : // Defensive fallback: a rollback_result with no recorded decision (the
-          // store is normally the sole sender, so this should not happen). Treat
-          // it as the legacy reject-shaped reply rather than dropping the update.
-          ok
-          ? "rejected"
-          : "failed";
-      const decisions = { ...core.changeset.decisions };
-      for (const id of targetIds) {
-        decisions[id] = outcome;
-      }
-      core.changeset = { ...core.changeset, decisions };
-      core.pendingDecision = null;
-      // When every item is decided, the review is done → ready (features/06:
-      // changeset_review --> ready when decisions are applied). Failed items keep
-      // the panel open so the user can retry.
-      const anyFailed = Object.values(core.changeset.decisions).some(
-        (d) => d === "failed",
-      );
-      if (
-        isChangesetFullyDecided(core.changeset) &&
-        !anyFailed &&
-        core.phase === "changeset_review"
-      ) {
-        core.phase = "ready";
-      }
+      if (warning) pushLog("warn", warning);
       emit();
     },
 
     errorReceived(message) {
       // A turn error returns the flow to ready (thinking/plan_review --> ready).
-      // changeset_review keeps its reviewable changeset (an error there is about a
-      // failed decision, surfaced via rollback_result/log, not a phase reset).
       // EUD-069 + F2: archive the turn blocks in stream order (tools + prose).
       clearLiveProgress();
       archiveTurnBlocks();
       core.ask = null;
-      if (core.phase !== "changeset_review") {
-        core.turnInFlight = false;
-        core.phase = "ready";
-        core.plan = null;
-      }
+      core.turnInFlight = false;
+      core.phase = "ready";
+      core.plan = null;
       // No-project signal: the server has NO list{error} path — the bridge's
       // "ERROR: no project" surfaces as an error{message}. Treat the contractual
       // literal as the project-closed signal so the placeholder + send gating
@@ -1194,10 +1048,8 @@ export function createPanelStore(): PanelStore {
 
     // ---- user intents ----
     chatSent() {
-      // ready --> thinking, and changeset_review --> thinking (follow-up chat;
-      // the server auto-accepts undecided items). Starting a new turn clears the
-      // prior plan card and the per-turn streaming buffers; the changeset is left
-      // intact (server archives it).
+      // ready --> thinking. Starting a new turn clears the prior plan card and
+      // the per-turn streaming buffers.
       core.turnInFlight = true;
       core.plan = null;
       core.ask = null;
@@ -1243,30 +1095,14 @@ export function createPanelStore(): PanelStore {
       emit();
     },
 
-    decisionSent(decision, ids) {
-      // Record the decision so the matching rollback_result can be labelled
-      // correctly (the inbound reply carries no accept/reject discriminator, and
-      // accept-all echoes an empty ids array). The phase change waits on
-      // rollback_result (so a slow bridge does not strand the UI mid-review).
-      core.pendingDecision = { decision, ids };
-      emit();
-    },
-
-    decisionFailed() {
-      core.pendingDecision = null;
-      emit();
-    },
-
     cancelSent() {
       clearLiveProgress();
       core.ask = null;
       core.turnInFlight = false;
       archiveTurnBlocks();
       pushLog("info", "작업을 중단했습니다.");
-      if (core.phase !== "changeset_review") {
-        core.phase = "ready";
-        core.plan = null;
-      }
+      core.phase = "ready";
+      core.plan = null;
       emit();
     },
 
@@ -1280,8 +1116,6 @@ export function createPanelStore(): PanelStore {
       core.log = core.log.slice(0, index);
       core.turnInFlight = false;
       core.plan = null;
-      core.changeset = null;
-      core.pendingDecision = null;
       core.turn = emptyTurn();
       core.contextUsage = null;
       nextTextBlockBreak = false;
@@ -1412,7 +1246,7 @@ export function createPanelStore(): PanelStore {
       if (maxTool > toolSeq) toolSeq = maxTool;
       blockSeq += restoredToolBlocks;
 
-      // Transient state (turn/plan/changeset/pendingDecision/wiki + connection
+      // Transient state (turn/plan/wiki + connection
       // flags) is deliberately untouched — it re-arrives from the core; phase
       // stays connecting (the connect flow drives it onward).
       emit();

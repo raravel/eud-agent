@@ -113,7 +113,7 @@ impl RepoState {
 }
 
 /// One commit the app made.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CommitRecord {
     pub sha: String,
@@ -582,6 +582,140 @@ pub fn log(root: &Path, limit: usize) -> Result<Vec<CommitSummary>, String> {
         .collect())
 }
 
+/// How far a single file's patch is rendered before the view stops carrying it.
+/// A source edit is a few KiB; a regenerated file can be megabytes, and the
+/// panel does not need to show one to say it changed.
+const MAX_FILE_PATCH_BYTES: usize = 64 * 1024;
+/// And how much of one commit is carried in total.
+const MAX_COMMIT_PATCH_BYTES: usize = 256 * 1024;
+
+/// What happened to one file in a commit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommitFile {
+    pub path: String,
+    pub insertions: usize,
+    pub deletions: usize,
+    /// Git could not diff this file as text (a map, an image, a wheel).
+    pub binary: bool,
+    /// The unified diff, when it is carried.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub patch: Option<String>,
+    /// Why the patch is absent, in Korean, when it is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub omitted: Option<String>,
+}
+
+/// One commit as the panel shows it: what was asked, and what changed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommitDetail {
+    pub sha: String,
+    pub subject: String,
+    /// The rest of the message — the session and request the turn belonged to.
+    pub body: String,
+    pub timestamp: i64,
+    pub files: Vec<CommitFile>,
+}
+
+/// Everything one commit changed, with each file's patch bounded.
+pub fn commit_detail(root: &Path, sha: &str) -> Result<CommitDetail, String> {
+    let header = run_ok(
+        root,
+        &[
+            "show",
+            "--no-patch",
+            "--format=%H%x1f%ct%x1f%s%x1f%b",
+            sha,
+        ],
+    )?;
+    let mut parts = header.splitn(4, '\u{1f}');
+    let resolved = parts.next().unwrap_or_default().trim().to_string();
+    let timestamp = parts
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .parse()
+        .unwrap_or_default();
+    let subject = parts.next().unwrap_or_default().trim().to_string();
+    let body = parts.next().unwrap_or_default().trim().to_string();
+    if resolved.is_empty() {
+        return Err(format!("커밋 {sha}을(를) 찾을 수 없습니다."));
+    }
+
+    let stats = run_ok(
+        root,
+        &["show", "--numstat", "--format=", "--find-renames", &resolved],
+    )?;
+    let mut budget = MAX_COMMIT_PATCH_BYTES;
+    let mut files = Vec::new();
+    for line in stats.lines().filter(|line| !line.trim().is_empty()) {
+        let mut columns = line.split('\t');
+        let added = columns.next().unwrap_or("-");
+        let removed = columns.next().unwrap_or("-");
+        let Some(path) = columns.next() else {
+            continue;
+        };
+        // A rename prints `old => new`; the new name is what the user looks for.
+        let path = path.rsplit(" => ").next().unwrap_or(path).trim_matches('"');
+        let binary = added == "-" || removed == "-";
+        let (patch, omitted) = if binary {
+            (None, Some("바이너리 파일이라 내용 비교를 표시하지 않습니다.".to_string()))
+        } else {
+            file_patch(root, &resolved, path, &mut budget)
+        };
+        files.push(CommitFile {
+            path: path.to_string(),
+            insertions: added.parse().unwrap_or_default(),
+            deletions: removed.parse().unwrap_or_default(),
+            binary,
+            patch,
+            omitted,
+        });
+    }
+
+    Ok(CommitDetail {
+        sha: resolved,
+        subject,
+        body,
+        timestamp,
+        files,
+    })
+}
+
+/// One file's unified diff, or the reason it is not carried.
+fn file_patch(
+    root: &Path,
+    sha: &str,
+    path: &str,
+    budget: &mut usize,
+) -> (Option<String>, Option<String>) {
+    if *budget == 0 {
+        return (
+            None,
+            Some("이 커밋의 표시 한도를 넘어 생략했습니다.".to_string()),
+        );
+    }
+    let patch = match run_ok(
+        root,
+        &["show", "--format=", "--find-renames", sha, "--", path],
+    ) {
+        Ok(patch) => patch,
+        Err(error) => return (None, Some(error)),
+    };
+    if patch.len() > MAX_FILE_PATCH_BYTES {
+        return (
+            None,
+            Some(format!(
+                "변경이 너무 커서 생략했습니다 ({} KiB). 필요하면 git으로 직접 보세요.",
+                patch.len() / 1024
+            )),
+        );
+    }
+    *budget = budget.saturating_sub(patch.len());
+    (Some(patch), None)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -793,6 +927,112 @@ mod tests {
         .unwrap();
         assert!(files.contains("src/main.eps"), "{files}");
         assert!(!files.contains("sibling.txt"), "{files}");
+    }
+
+    #[test]
+    fn a_commit_carries_its_message_and_one_patch_per_file() {
+        if !git_present("a_commit_carries_its_message_and_one_patch_per_file") {
+            return;
+        }
+        let root = temp_root("detail");
+        write(&root, "src/main.eps", "const a = 1;\n");
+        prepare(&root);
+
+        write(&root, "src/main.eps", "const a = 2;\n");
+        write(&root, "src/added.eps", "const b = 1;\n");
+        let record = commit_turn(&root, turn_message("체력 수정", "s-1", "r-1").as_str())
+            .unwrap()
+            .expect("a commit");
+
+        let detail = commit_detail(&root, &record.sha).unwrap();
+
+        assert_eq!(detail.sha, record.sha);
+        assert_eq!(detail.subject, "체력 수정");
+        assert!(detail.body.contains("session: s-1"), "{}", detail.body);
+        assert!(detail.timestamp > 0);
+        let mut paths = detail
+            .files
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect::<Vec<_>>();
+        paths.sort_unstable();
+        assert_eq!(paths, ["src/added.eps", "src/main.eps"]);
+        let edited = detail
+            .files
+            .iter()
+            .find(|file| file.path == "src/main.eps")
+            .unwrap();
+        assert_eq!((edited.insertions, edited.deletions), (1, 1));
+        assert!(!edited.binary);
+        let patch = edited.patch.as_deref().expect("a text file carries a patch");
+        assert!(patch.contains("-const a = 1;"), "{patch}");
+        assert!(patch.contains("+const a = 2;"), "{patch}");
+        assert!(edited.omitted.is_none());
+    }
+
+    /// A map is the thing the user most wants to see changed and the thing a
+    /// text diff says least about, so it is reported as changed and not shown.
+    #[test]
+    fn a_binary_file_is_reported_as_changed_without_a_patch() {
+        if !git_present("a_binary_file_is_reported_as_changed_without_a_patch") {
+            return;
+        }
+        let root = temp_root("binary");
+        std::fs::create_dir_all(root.join("maps")).unwrap();
+        std::fs::write(root.join("maps/source.scx"), [0_u8, 1, 2, 0, 255]).unwrap();
+        prepare(&root);
+
+        std::fs::write(root.join("maps/source.scx"), [0_u8, 9, 9, 0, 1]).unwrap();
+        let record = commit_turn(&root, "맵 변경").unwrap().expect("a commit");
+
+        let detail = commit_detail(&root, &record.sha).unwrap();
+        let map = detail
+            .files
+            .iter()
+            .find(|file| file.path == "maps/source.scx")
+            .unwrap();
+
+        assert!(map.binary);
+        assert!(map.patch.is_none());
+        assert!(map.omitted.as_deref().unwrap().contains("바이너리"));
+    }
+
+    #[test]
+    fn a_file_whose_diff_is_too_large_says_so_instead_of_carrying_it() {
+        if !git_present("a_file_whose_diff_is_too_large_says_so_instead_of_carrying_it") {
+            return;
+        }
+        let root = temp_root("huge");
+        write(&root, "src/main.eps", "const a = 1;\n");
+        prepare(&root);
+
+        let huge = (0..20_000)
+            .map(|index| format!("const v{index} = {index};\n"))
+            .collect::<String>();
+        write(&root, "src/main.eps", &huge);
+        let record = commit_turn(&root, "대량 생성").unwrap().expect("a commit");
+
+        let detail = commit_detail(&root, &record.sha).unwrap();
+        let file = &detail.files[0];
+
+        assert!(file.patch.is_none());
+        assert!(file.omitted.as_deref().unwrap().contains("너무 커서"));
+        // The counts still tell the user how much moved.
+        assert!(file.insertions >= 20_000, "{}", file.insertions);
+    }
+
+    #[test]
+    fn an_unknown_commit_is_refused_by_name() {
+        if !git_present("an_unknown_commit_is_refused_by_name") {
+            return;
+        }
+        let root = temp_root("unknown");
+        write(&root, "src/main.eps", "const a = 1;\n");
+        prepare(&root);
+
+        let error = commit_detail(&root, "0000000000000000000000000000000000000000").unwrap_err();
+
+        assert!(!error.is_empty());
     }
 
     #[test]

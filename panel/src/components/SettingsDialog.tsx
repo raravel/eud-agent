@@ -107,7 +107,7 @@ const EVENT_COPY: Readonly<
 > = {
   agentTurnComplete: {
     title: "에이전트 턴 종료",
-    description: "계획·변경사항 검토를 제외한 에이전트 턴이 종료됐을 때",
+    description: "계획 검토를 제외한 에이전트 턴이 종료됐을 때",
   },
   askResponseRequired: {
     title: "ASK 응답 필요",
@@ -117,9 +117,9 @@ const EVENT_COPY: Readonly<
     title: "계획 승인 필요",
     description: "새 계획안이나 수정된 계획안이 도착했을 때",
   },
-  changesetReview: {
-    title: "변경사항 검토 필요",
-    description: "적용 또는 되돌리기를 결정할 변경사항이 도착했을 때",
+  reviewRequired: {
+    title: "검토할 변경 도착",
+    description: "하네스가 정리한 문서 변경이나 맵 후보가 검토를 기다릴 때",
   },
 };
 

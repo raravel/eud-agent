@@ -223,8 +223,6 @@ pub enum EngineEvent {
     ContextUsage(ipc::ContextUsageEvent),
     Answer(ipc::AnswerEvent),
     Plan(ipc::PlanEvent),
-    Changeset(ipc::ChangesetEvent),
-    RollbackResult(ipc::RollbackResultEvent),
     Progress(ipc::ProgressEvent),
     Error(ipc::ErrorEvent),
     Status(ipc::StatusResponse),
@@ -234,6 +232,8 @@ pub enum EngineEvent {
     /// (rules.md forbids raw kind identifiers as user-facing text).
     SessionLoaded(ipc::SessionLoadedEvent),
     AutonomousRun(Box<crate::autonomous::AutonomousRunState>),
+    /// What a turn boundary recorded in the project's git history.
+    Git(ipc::GitTurnEvent),
 }
 
 pub(crate) trait EventSink {
@@ -370,7 +370,6 @@ enum Phase {
     Answer,
     PlanReview,
     Executing,
-    ChangesetReview,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -602,7 +601,7 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
         let should_continue = run.status == crate::autonomous::AutonomousRunStatus::Running;
         // One long run is many commits, so a run that went wrong halfway can be
         // reverted to the iteration that was still right.
-        self.commit_boundary(
+        let _ = self.commit_boundary(
             &format!("[장시간 작업 {}회차] {}", run.iteration, run.goal),
             &run.request_id,
         );
@@ -878,7 +877,7 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
     pub async fn reset_conversation(&mut self) -> Result<(), AgentEngineError> {
         if matches!(
             self.phase,
-            Phase::PlanReview | Phase::Executing | Phase::ChangesetReview
+            Phase::PlanReview | Phase::Executing
         ) {
             return Err(AgentEngineError::new(
                 "현재 세션의 진행 중인 요청 또는 검토를 먼저 완료해 주세요.",
@@ -1379,7 +1378,7 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
         }
         if matches!(
             self.phase,
-            Phase::PlanReview | Phase::Executing | Phase::ChangesetReview
+            Phase::PlanReview | Phase::Executing
         ) {
             return Err(AgentEngineError::new(
                 "현재 세션의 진행 중인 요청 또는 검토를 먼저 완료해 주세요.",
@@ -1544,7 +1543,7 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
             )
             .await;
         }
-        self.commit_boundary(&user_text, &request_id);
+        let _ = self.commit_boundary(&user_text, &request_id);
         self.update_active_session().await;
         Ok(())
     }
@@ -1627,39 +1626,56 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
         if !crate::git::auto_commit_ready(&root) {
             return;
         }
-        match crate::git::commit_external_edits(&root) {
-            Ok(Some(record)) => eprintln!(
-                "eud-agent: 앱 밖에서 바뀐 파일 {}개를 별도 커밋 {}로 기록했습니다.",
-                record.files,
-                short_sha(&record.sha)
-            ),
-            Ok(None) => {}
-            Err(error) => eprintln!("eud-agent: 외부 편집을 커밋하지 못했습니다: {error}"),
-        }
+        let event = match crate::git::commit_external_edits(&root) {
+            Ok(None) => return,
+            Ok(external) => ipc::GitTurnEvent {
+                external,
+                turn: None,
+                warning: None,
+            },
+            Err(error) => ipc::GitTurnEvent {
+                external: None,
+                turn: None,
+                warning: Some(format!("앱 밖에서 바뀐 파일을 기록하지 못했습니다: {error}")),
+            },
+        };
+        let _ = self.sink.emit(EngineEvent::Git(event));
     }
 
-    /// Commit the work one boundary finished.
+    /// Commit the work one boundary finished, and report what was recorded.
     ///
     /// A repository problem is reported, never raised: the work is already on
     /// disk, and failing the turn over a missing history entry would cost the
     /// user more than the entry is worth.
-    fn commit_boundary(&self, summary: &str, request_id: &str) {
+    fn commit_boundary(&self, summary: &str, request_id: &str) -> Option<crate::git::CommitRecord> {
         let Ok(root) = self.runtime.project_root() else {
-            return;
+            return None;
         };
         if !crate::git::auto_commit_ready(&root) {
-            return;
+            return None;
         }
         let message = crate::git::turn_message(summary, &self.session_id, request_id);
-        match crate::git::commit_turn(&root, &message) {
-            Ok(Some(record)) => eprintln!(
-                "eud-agent: 턴 커밋 {} ({}개 파일)",
-                short_sha(&record.sha),
-                record.files
+        let (record, event) = match crate::git::commit_turn(&root, &message) {
+            Ok(None) => return None,
+            Ok(turn) => (
+                turn.clone(),
+                ipc::GitTurnEvent {
+                    external: None,
+                    turn,
+                    warning: None,
+                },
             ),
-            Ok(None) => {}
-            Err(error) => eprintln!("eud-agent: 턴을 커밋하지 못했습니다: {error}"),
-        }
+            Err(error) => (
+                None,
+                ipc::GitTurnEvent {
+                    external: None,
+                    turn: None,
+                    warning: Some(format!("이 턴을 기록하지 못했습니다: {error}")),
+                },
+            ),
+        };
+        let _ = self.sink.emit(EngineEvent::Git(event));
+        record
     }
 
     /// The session workspace: the CLI cwd, temp dir, and artifact root. The
@@ -1808,7 +1824,9 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
         Ok(())
     }
 
-    pub async fn continue_pending_write(&mut self) -> Result<(), AgentEngineError> {
+    pub async fn continue_pending_write(
+        &mut self,
+    ) -> Result<Option<crate::harness::HarnessJob>, AgentEngineError> {
         self.ensure_provider_conversation_ready()?;
         let ticket = self
             .runtime
@@ -1863,12 +1881,18 @@ Continue the requested change now, run the mandatory build, and stop only after 
         let state_result = result.clone();
         self.handle_turn_result(result)?;
         self.pending_write = None;
-        self.settle_write_lifecycle()?;
         let compiler_user_text = self.current_user_text.clone();
+        // This turn applied the change, so this turn records it. Leaving it for
+        // the next turn's external-edit sweep would file the agent's own work
+        // as something the user did outside the app.
+        let turn_commit = self.commit_boundary(&compiler_user_text, &request_id);
+        let job = self.settle_request(turn_commit).await?;
+        self.settle_write_lifecycle()?;
+        self.current_request_id = None;
         self.update_task_state_after_turn(&state_result, &compiler_user_text, None)
             .await;
         self.update_active_session().await;
-        Ok(())
+        Ok(job)
     }
 
     pub fn recover_write_failure(&mut self) -> Result<(), AgentEngineError> {
@@ -1878,12 +1902,6 @@ Continue the requested change now, run the mandatory build, and stop only after 
 
     fn recover_read_failure(&mut self) -> Result<(), AgentEngineError> {
         self.pending_write = None;
-        if self.emit_current_changeset_if_any()? {
-            self.phase = Phase::ChangesetReview;
-            self.runtime
-                .emit_activity(crate::write_coordinator::SessionActivity::Review);
-            return Ok(());
-        }
         self.runtime
             .abort_unmutated_write_intent()
             .map_err(AgentEngineError::new)?;
@@ -1894,43 +1912,40 @@ Continue the requested change now, run the mandatory build, and stop only after 
     }
 
     fn settle_write_lifecycle(&mut self) -> Result<(), AgentEngineError> {
-        let sound_build_required = self.runtime.sound_build_required();
-        if self.emit_current_changeset_if_any()? {
-            self.phase = Phase::ChangesetReview;
-            self.runtime
-                .emit_activity(crate::write_coordinator::SessionActivity::Review);
-        } else if sound_build_required {
-            return Err(AgentEngineError::new(
-                "map sound import requires one complete build_run attempt",
-            ));
-        } else {
-            self.runtime
-                .release_write_registration()
-                .map_err(AgentEngineError::new)?;
-            self.phase = Phase::Idle;
-        }
+        self.runtime
+            .release_write_registration()
+            .map_err(AgentEngineError::new)?;
+        self.phase = Phase::Idle;
         Ok(())
     }
 
-    // Foreground implementation completion intentionally has no project-document
-    // repair loop. Accepted changes schedule a separate durable harness job.
-
-    pub async fn changeset_decision(
+    /// Settle the request this turn finished.
+    ///
+    /// Review used to do this when the user pressed Accept. Nothing reviews a
+    /// turn now: the work is already on disk, the turn commit records it, and
+    /// `git revert` is the way back. So the turn settles itself — the ledger
+    /// takes the DAT edits, the durable documents take their revision, and the
+    /// harness job is scheduled.
+    pub async fn settle_request(
         &mut self,
-        req: ipc::ChangesetDecisionRequest,
+        turn_commit: Option<crate::git::CommitRecord>,
     ) -> Result<Option<crate::harness::HarnessJob>, AgentEngineError> {
-        self.phase = Phase::ChangesetReview;
-        let request_id = self
-            .current_request_id
-            .clone()
-            .ok_or_else(|| AgentEngineError::new("no active request has a changeset"))?;
-        let ids = rollback_ids(&req.ids);
-        let decision_ids = match &req.ids {
-            ipc::DecisionIds::All(_) => journal::DecisionIds::All,
-            ipc::DecisionIds::List(ids) => journal::DecisionIds::Items(ids.clone()),
+        let Some(request_id) = self.current_request_id.clone() else {
+            return Ok(None);
         };
-        let accepted_entries = self.collect_accepted_entries(&request_id, &req);
-        let accepted_wiki_entries = self.collect_accepted_wiki_entries(&request_id, &req);
+        // A sound import that was never built is not a finished turn: the map
+        // carries the new wav but no plugin references it yet.
+        if self.runtime.sound_build_required() {
+            return Err(AgentEngineError::new(
+                "map sound import requires one complete build_run attempt",
+            ));
+        }
+        let decision_ids = journal::DecisionIds::All;
+        let accepted_entries = self.collect_applied_entries(&request_id);
+        if accepted_entries.is_empty() {
+            return Ok(None);
+        }
+        let accepted_wiki_entries = self.collect_applied_wiki_entries(&request_id);
         let accepted_workspace_entries = accepted_entries
             .iter()
             .filter(|entry| matches!(entry.target, journal::JournalTarget::WorkspacePath { .. }))
@@ -1938,66 +1953,23 @@ Continue the requested change now, run the mandatory build, and stop only after 
             .collect::<Vec<_>>();
 
         let runtime = self.runtime.clone();
-        let outcome: Result<bool, AgentEngineError> = runtime
+        let settled: bool = runtime
             .project_transaction(|| {
-                (|| match req.decision {
-                    ipc::Decision::Accept => {
-                        if self.runtime.sound_build_required() {
-                            return Err(AgentEngineError::new(
-                                "map sound changes cannot be accepted before complete build_run",
-                            ));
-                        }
-                        WorkspaceManager::new(self.runtime.data_dirs())
-                            .record_accepted_entries(&request_id, &accepted_workspace_entries)
-                            .map_err(|error| AgentEngineError::new(error.to_string()))?;
-                        if let Some(payload) =
-                            self.record_accepted_wiki_edits(accepted_wiki_entries)
-                        {
-                            self.sink.emit(EngineEvent::Wiki(payload))?;
-                        }
-                        self.journal_store
-                            .accept_entries(&request_id, &decision_ids)
-                            .map_err(|error| AgentEngineError::new(error.to_string()))
+                (|| {
+                    WorkspaceManager::new(self.runtime.data_dirs())
+                        .record_accepted_entries(&request_id, &accepted_workspace_entries)
+                        .map_err(|error| AgentEngineError::new(error.to_string()))?;
+                    if let Some(payload) = self.record_applied_wiki_edits(accepted_wiki_entries) {
+                        self.sink.emit(EngineEvent::Wiki(payload))?;
                     }
-                    ipc::Decision::Reject => {
-                        self.journal_store
-                            .decide(
-                                &request_id,
-                                journal::ChangesetDecision::Reject(decision_ids.clone()),
-                                &self.runtime,
-                            )
-                            .map_err(|error| AgentEngineError::new(error.to_string()))?;
-                        if matches!(decision_ids, journal::DecisionIds::All) {
-                            Ok(true)
-                        } else {
-                            self.journal_store
-                                .archive_if_empty(&request_id)
-                                .map_err(|error| AgentEngineError::new(error.to_string()))
-                        }
-                    }
+                    self.journal_store
+                        .accept_entries(&request_id, &decision_ids)
+                        .map_err(|error| AgentEngineError::new(error.to_string()))
                 })()
             })
-            .map_err(AgentEngineError::new)?;
-        let settled = outcome.as_ref().copied().unwrap_or(false);
-        let ok = outcome.is_ok();
+            .map_err(AgentEngineError::new)??;
 
-        self.sink
-            .emit(EngineEvent::RollbackResult(ipc::RollbackResultEvent {
-                ids,
-                ok,
-                error: outcome.as_ref().err().map(|error| error.message.clone()),
-            }))?;
-        if outcome.is_err() {
-            self.phase = Phase::ChangesetReview;
-            self.runtime
-                .emit_activity(crate::write_coordinator::SessionActivity::Review);
-            self.update_active_session().await;
-            return Ok(None);
-        }
-
-        if matches!(req.decision, ipc::Decision::Accept) {
-            self.accepted_for_harness.extend(accepted_entries);
-        }
+        self.accepted_for_harness.extend(accepted_entries);
 
         let mut harness_job = if settled && !self.accepted_for_harness.is_empty() {
             self.executor.current_workspace().map(|workspace| {
@@ -2022,6 +1994,9 @@ Continue the requested change now, run the mandatory build, and stop only after 
         } else {
             None
         };
+        if let Some(job) = harness_job.as_mut() {
+            job.turn_commit = turn_commit.map(|record| record.sha);
+        }
         if settled {
             let record = self.session_store.load(&self.session_id).ok();
             let journal_entry_ids = harness_job
@@ -2071,20 +2046,11 @@ Continue the requested change now, run the mandatory build, and stop only after 
         }
 
         if settled {
-            self.runtime
-                .release_write_registration()
-                .map_err(AgentEngineError::new)?;
             self.settle_autonomous_review().await?;
-            self.phase = Phase::Idle;
             self.drop_pending_request_from_session(&request_id);
-            self.current_request_id = None;
             self.current_client_turn_id = None;
             self.approved_plan_sha256 = None;
             self.runtime.clear_audio_cache();
-        } else {
-            self.phase = Phase::ChangesetReview;
-            self.runtime
-                .emit_activity(crate::write_coordinator::SessionActivity::Review);
         }
         self.update_active_session().await;
         Ok(harness_job)
@@ -2106,42 +2072,19 @@ Continue the requested change now, run the mandatory build, and stop only after 
     /// ledger entries. Returns an empty vec when there is no journal/changeset, no
     /// dat edits, or the decision is a reject (the wiki records accepted dat edits
     /// only). Must be called BEFORE a full-accept archives the journal.
-    fn collect_accepted_wiki_entries(
-        &self,
-        request_id: &str,
-        req: &ipc::ChangesetDecisionRequest,
-    ) -> Vec<crate::wiki::LedgerEntry> {
-        let scope = match (&req.decision, &req.ids) {
-            (ipc::Decision::Accept, ipc::DecisionIds::All(_)) => crate::wiki::AcceptedScope::All,
-            (ipc::Decision::Accept, ipc::DecisionIds::List(ids)) => {
-                crate::wiki::AcceptedScope::Ids(ids.clone())
-            }
-            // A reject records nothing.
-            (ipc::Decision::Reject, _) => return Vec::new(),
-        };
+    fn collect_applied_wiki_entries(&self, request_id: &str) -> Vec<crate::wiki::LedgerEntry> {
         let Ok(changeset) = self.journal_store.changeset(request_id) else {
             return Vec::new();
         };
         let Some(journal) = self.load_journal(request_id) else {
             return Vec::new();
         };
-        crate::wiki::accepted_ledger_entries(&changeset, &journal, &scope)
+        crate::wiki::applied_ledger_entries(&changeset, &journal)
     }
 
-    fn collect_accepted_entries(
-        &self,
-        request_id: &str,
-        req: &ipc::ChangesetDecisionRequest,
-    ) -> Vec<journal::JournalEntry> {
-        let ids = match (&req.decision, &req.ids) {
-            (ipc::Decision::Accept, ipc::DecisionIds::All(_)) => journal::DecisionIds::All,
-            (ipc::Decision::Accept, ipc::DecisionIds::List(ids)) => {
-                journal::DecisionIds::Items(ids.clone())
-            }
-            (ipc::Decision::Reject, _) => return Vec::new(),
-        };
+    fn collect_applied_entries(&self, request_id: &str) -> Vec<journal::JournalEntry> {
         self.journal_store
-            .selected_entries(request_id, &ids)
+            .selected_entries(request_id, &journal::DecisionIds::All)
             .unwrap_or_default()
     }
 
@@ -2154,10 +2097,10 @@ Continue the requested change now, run the mandatory build, and stop only after 
         journal::JournalStore::load(&self.journal_data_dir, request_id).ok()
     }
 
-    /// Upsert the collected accepted dat edits to the project ledger via the wiki
+    /// Upsert the applied dat edits to the project ledger via the wiki
     /// provider, returning the updated ledger for emission (or `None` when nothing
     /// was recorded / no provider is wired).
-    fn record_accepted_wiki_edits(
+    fn record_applied_wiki_edits(
         &self,
         entries: Vec<crate::wiki::LedgerEntry>,
     ) -> Option<ipc::WikiResponse> {
@@ -2242,7 +2185,7 @@ Continue the requested change now, run the mandatory build, and stop only after 
     pub async fn rewind(&mut self, panel_log: serde_json::Value) -> Result<(), AgentEngineError> {
         if matches!(
             self.phase,
-            Phase::PlanReview | Phase::Executing | Phase::ChangesetReview
+            Phase::PlanReview | Phase::Executing
         ) {
             return Err(AgentEngineError::new(
                 "현재 세션의 진행 중인 요청 또는 검토를 먼저 완료해 주세요.",
@@ -2347,7 +2290,6 @@ Continue the requested change now, run the mandatory build, and stop only after 
             self.runtime
                 .restore_review(&self.project_id, request_id)
                 .map_err(AgentEngineError::new)?;
-            self.reconnect_pending_changeset(&record);
         }
         if let Some(run) = record.autonomous_run.as_ref() {
             self.execution_mode = crate::autonomous::ExecutionMode::Autonomous;
@@ -2390,44 +2332,6 @@ Continue the requested change now, run the mandatory build, and stop only after 
     /// (so a later `changeset_decision` guard passes), and re-emits the existing
     /// `changeset` event. A missing journal / empty changeset degrades gracefully
     /// (skip + log), never panics.
-    fn reconnect_pending_changeset(&mut self, record: &crate::session::SessionRecord) {
-        let Some(request_id) = record.pending_request_ids.first().cloned() else {
-            return;
-        };
-        let journal = match journal::JournalStore::load(&self.journal_data_dir, &request_id) {
-            Ok(journal) => journal,
-            Err(error) => {
-                eprintln!("eud-agent: pending changeset journal '{request_id}' missing: {error}");
-                return;
-            }
-        };
-        // Reseat the journal into the live store so a decision can finalize it.
-        for entry in journal.entries {
-            if let Err(error) = self.journal_store.record(&request_id, entry) {
-                eprintln!("eud-agent: changeset reconnect record failed: {error}");
-                return;
-            }
-        }
-        let changeset = match self.journal_store.changeset(&request_id) {
-            Ok(changeset) if !changeset.items.is_empty() => changeset,
-            _ => return,
-        };
-
-        self.current_request_id = Some(request_id);
-        self.phase = Phase::ChangesetReview;
-        if let Err(error) = self.sink.emit(EngineEvent::Changeset(ipc::ChangesetEvent {
-            request_id: changeset.request_id,
-            items: changeset
-                .items
-                .into_iter()
-                .enumerate()
-                .map(|(index, item)| ipc_changeset_item(index, item))
-                .collect(),
-        })) {
-            eprintln!("eud-agent: changeset reconnect emit failed: {error}");
-        }
-    }
-
     fn resolve_mentions(
         &self,
         mentions: &[crate::mentions::MentionInstance],
@@ -2766,32 +2670,6 @@ Continue the requested change now, run the mandatory build, and stop only after 
         Ok(())
     }
 
-    fn emit_current_changeset_if_any(&mut self) -> Result<bool, AgentEngineError> {
-        if self.phase == Phase::PlanReview {
-            return Ok(false);
-        }
-        let Some(request_id) = self.current_request_id.as_deref() else {
-            return Ok(false);
-        };
-        let Ok(changeset) = self.journal_store.changeset(request_id) else {
-            return Ok(false);
-        };
-        if changeset.items.is_empty() {
-            return Ok(false);
-        }
-
-        self.phase = Phase::ChangesetReview;
-        self.sink.emit(EngineEvent::Changeset(ipc::ChangesetEvent {
-            request_id: changeset.request_id,
-            items: changeset
-                .items
-                .into_iter()
-                .enumerate()
-                .map(|(index, item)| ipc_changeset_item(index, item))
-                .collect(),
-        }))?;
-        Ok(true)
-    }
 }
 
 #[derive(Clone)]
@@ -3067,12 +2945,11 @@ impl EventSink for SessionEventSink {
             EngineEvent::ContextUsage(payload) => self.emit_scoped("context_usage", payload),
             EngineEvent::Answer(payload) => self.emit_scoped("answer", payload),
             EngineEvent::Plan(payload) => self.emit_scoped("plan", payload),
-            EngineEvent::Changeset(payload) => self.emit_scoped("changeset", payload),
-            EngineEvent::RollbackResult(payload) => self.emit_scoped("rollback_result", payload),
             EngineEvent::Progress(payload) => self.emit_scoped("progress", payload),
             EngineEvent::Error(payload) => self.emit_scoped("error", payload),
             EngineEvent::Status(payload) => ipc::emit_status(&self.app, payload),
             EngineEvent::AutonomousRun(payload) => self.emit_scoped("autonomous_run", payload),
+            EngineEvent::Git(payload) => self.emit_scoped("git", payload),
             EngineEvent::Wiki(payload) => ipc::emit_wiki(&self.app, payload),
             EngineEvent::SessionLoaded(payload) => ipc::emit_session_loaded(&self.app, payload),
         };
@@ -4215,15 +4092,18 @@ impl SessionEngineManager {
     ) -> Result<(), AgentEngineError> {
         let mut engine = worker.engine.lock().await;
         match engine.continue_pending_write().await {
-            Ok(()) => Ok(()),
+            Ok(job) => {
+                drop(engine);
+                if let Some(job) = job {
+                    self.enqueue_harness_job(job)?;
+                }
+                Ok(())
+            }
             Err(error) => {
                 let _ = engine.recover_write_failure();
-                let activity = if engine.phase == Phase::ChangesetReview {
-                    crate::write_coordinator::SessionActivity::Review
-                } else {
-                    crate::write_coordinator::SessionActivity::Error
-                };
-                worker.runtime.emit_activity(activity);
+                worker
+                    .runtime
+                    .emit_activity(crate::write_coordinator::SessionActivity::Error);
                 let _ = engine.sink.emit(EngineEvent::Error(ipc::ErrorEvent {
                     message: error.message.clone(),
                 }));
@@ -4256,12 +4136,9 @@ impl SessionEngineManager {
         if let Err(error) = result {
             let mut engine = worker.engine.lock().await;
             let cleanup = engine.recover_read_failure();
-            let activity = if engine.phase == Phase::ChangesetReview {
-                crate::write_coordinator::SessionActivity::Review
-            } else {
-                crate::write_coordinator::SessionActivity::Error
-            };
-            worker.runtime.emit_activity(activity);
+            worker
+                .runtime
+                .emit_activity(crate::write_coordinator::SessionActivity::Error);
             let message = match cleanup {
                 Ok(()) => error.message.clone(),
                 Err(cleanup_error) => format!(
@@ -4280,7 +4157,7 @@ impl SessionEngineManager {
         }
         let phase = worker.engine.lock().await.phase;
         let activity = match phase {
-            Phase::PlanReview | Phase::ChangesetReview => {
+            Phase::PlanReview => {
                 crate::write_coordinator::SessionActivity::Review
             }
             _ => crate::write_coordinator::SessionActivity::Idle,
@@ -4626,24 +4503,6 @@ impl SessionEngineManager {
     }
 
 
-    async fn changeset_decision(
-        &self,
-        session_id: &str,
-        request: ipc::ChangesetDecisionRequest,
-    ) -> Result<(), AgentEngineError> {
-        let worker = self.worker(session_id).await?;
-        let job = worker
-            .engine
-            .lock()
-            .await
-            .changeset_decision(request)
-            .await?;
-        if let Some(job) = job {
-            self.enqueue_harness_job(job)?;
-        }
-        Ok(())
-    }
-
     async fn compact(&self, session_id: &str) -> Result<(), AgentEngineError> {
         let worker = self.worker(session_id).await?;
         let _provider_busy = self.inner.provider_service.enter_busy(worker.provider);
@@ -4655,7 +4514,7 @@ impl SessionEngineManager {
             let result = engine.compact().await;
             (result, engine.phase)
         };
-        let activity = if matches!(phase, Phase::PlanReview | Phase::ChangesetReview) {
+        let activity = if matches!(phase, Phase::PlanReview) {
             crate::write_coordinator::SessionActivity::Review
         } else {
             crate::write_coordinator::SessionActivity::Idle
@@ -4804,9 +4663,9 @@ impl SessionEngineManager {
             .map_err(|error| AgentEngineError::new(error.to_string()))?;
         cancel_worker_generation(&worker.cancellation)?;
         let mut engine = worker.engine.lock().await;
-        if worker.runtime.write_ticket().is_some() && engine.phase != Phase::ChangesetReview {
+        if worker.runtime.write_ticket().is_some() {
             engine.recover_write_failure()?;
-        } else if engine.phase != Phase::ChangesetReview {
+        } else {
             engine.phase = Phase::Idle;
             worker
                 .runtime
@@ -4820,18 +4679,16 @@ impl SessionEngineManager {
         let worker = self.worker(session_id).await?;
         worker.runtime.cancel_pending_ask();
         if let Ok(engine) = worker.engine.try_lock() {
-            if matches!(engine.phase, Phase::PlanReview | Phase::ChangesetReview) {
+            if engine.phase == Phase::PlanReview {
                 return Err(AgentEngineError::new(
-                    "검토 중인 변경사항은 accept 또는 reject로 결정해 주세요.",
+                    "검토 중인 계획을 먼저 승인하거나 수정 요청해 주세요.",
                 ));
             }
         }
         cancel_worker_generation(&worker.cancellation)?;
         let mut engine = worker.engine.lock().await;
         if worker.runtime.write_ticket().is_some() {
-            if engine.phase != Phase::ChangesetReview {
-                engine.recover_write_failure()?;
-            }
+            engine.recover_write_failure()?;
         } else {
             engine.phase = Phase::Idle;
             worker
@@ -5199,19 +5056,6 @@ pub(crate) async fn engine_plan_approve(
         .map_err(|error| error.message)
 }
 
-
-#[tauri::command(rename = "changeset_decision")]
-pub(crate) async fn engine_changeset_decision(
-    state: tauri::State<'_, SessionEngineManager>,
-    session_id: String,
-    decision: ipc::Decision,
-    ids: ipc::DecisionIds,
-) -> Result<(), String> {
-    state
-        .changeset_decision(&session_id, ipc::ChangesetDecisionRequest { decision, ids })
-        .await
-        .map_err(|error| error.message)
-}
 
 #[tauri::command(rename = "harness_jobs")]
 pub(crate) async fn engine_harness_jobs(
@@ -5748,11 +5592,6 @@ fn auto_session_name(first_text: &str) -> String {
 }
 
 /// Cap on the condensed replay transcript (chars), kept well under prompt limits.
-/// The abbreviated commit id the app writes to its own log.
-fn short_sha(sha: &str) -> String {
-    sha.chars().take(8).collect()
-}
-
 const CONDENSED_TRANSCRIPT_CAP_CHARS: usize = 8000;
 
 /// Parse the native project name out of a `[project state]` prompt render.
@@ -5842,13 +5681,6 @@ fn condense_transcript_with_cap(panel_log: &serde_json::Value, cap: usize) -> St
 /// the panel resolves against its OWN still-undecided item ids (a dat group's ids
 /// live on its properties, NOT on a single group id — so the server must not echo
 /// group ids here or dat groups would never mark as decided under bulk).
-fn rollback_ids(ids: &ipc::DecisionIds) -> Vec<String> {
-    match ids {
-        ipc::DecisionIds::List(ids) => ids.clone(),
-        ipc::DecisionIds::All(_) => Vec::new(),
-    }
-}
-
 /// Lowercase family slug for the panel's dat type badge.
 fn dat_table_slug(table: journal::DatTable) -> &'static str {
     match table {
@@ -7511,13 +7343,13 @@ mod tests {
         assert!(driver_handle.prompts().is_empty());
         assert!(engine.pending_resume_transcript.is_none());
         assert!(engine.ensure_provider_conversation_ready().is_err());
-        assert_eq!(engine.current_request_id.as_deref(), Some(request_id));
-        assert_eq!(engine.phase, Phase::ChangesetReview);
+        // The completed tool's journal survives the refusal, so the work it did
+        // is still on record even though the conversation cannot continue.
         assert_eq!(
             engine
                 .journal_store
                 .changeset(request_id)
-                .expect("completed tool remains reviewable")
+                .expect("a completed tool keeps its journal")
                 .items
                 .len(),
             1
@@ -7792,13 +7624,9 @@ mod tests {
             1,
             "survivor_projectiles",
         );
-        engine.phase = Phase::ChangesetReview;
 
         let job = engine
-            .changeset_decision(ipc::ChangesetDecisionRequest {
-                decision: ipc::Decision::Accept,
-                ids: ipc::DecisionIds::All(ipc::AllLiteral),
-            })
+            .settle_request(None)
             .await
             .unwrap()
             .expect("accepted live changes schedule one harness job");
@@ -8458,13 +8286,9 @@ mod tests {
             2,
             "scripts/main.eps",
         );
-        engine.phase = Phase::ChangesetReview;
 
         engine
-            .changeset_decision(crate::ipc::ChangesetDecisionRequest {
-                decision: crate::ipc::Decision::Accept,
-                ids: crate::ipc::DecisionIds::All(crate::ipc::AllLiteral),
-            })
+            .settle_request(None)
             .await
             .expect("accept-all decision should finalize");
 
@@ -8493,239 +8317,6 @@ mod tests {
             })
             .expect("accept should emit a wiki event");
         assert!(wiki_event.entries.contains_key("dat:units:0:HP"));
-
-        fs::remove_dir_all(base).ok();
-    }
-
-    #[tokio::test]
-    async fn reject_does_not_record_dat_edits_to_wiki() {
-        let base = unique_temp_dir("wiki-reject");
-        let memory = ProjectMemory::new(base.join("memory"), "ExampleProject");
-        let wiki_dir = base.join("wiki");
-        let driver = FakeCodexDriver::scripted([AgentTurnResult::Plan {
-            markdown: "- Buff the marine".to_string(),
-        }]);
-        let sink = CapturingEventSink::default();
-        let sink_handle = sink.clone();
-        let mut engine = test_engine_with_wiki(driver, sink, memory, &base.join("data"), &wiki_dir);
-        engine.executor.plan_runtime = Some(engine.runtime.clone());
-
-        engine
-            .chat(crate::ipc::ChatRequest {
-                client_turn_id: crate::ipc::new_client_turn_id(),
-                text: "set marine HP to 80".to_string(),
-                attachments: Vec::new(),
-                mentions: Vec::new(),
-                execution_mode: Default::default(),
-                autonomous_policy: None,
-            })
-            .await
-            .expect("chat should run");
-        let request_id = engine
-            .current_request_id
-            .clone()
-            .expect("chat should create a request id");
-        record_dat_set_in_memory(
-            &engine.journal_store,
-            &request_id,
-            "dat-hp",
-            1,
-            ("units", 0, "HP"),
-            json!(80),
-        );
-        engine.phase = Phase::ChangesetReview;
-
-        engine
-            .changeset_decision(crate::ipc::ChangesetDecisionRequest {
-                decision: crate::ipc::Decision::Reject,
-                ids: crate::ipc::DecisionIds::All(crate::ipc::AllLiteral),
-            })
-            .await
-            .expect("reject decision should run");
-
-        // Rejected edits never reach the ledger, and no wiki event is emitted.
-        let store = crate::wiki::WikiStore::load(Some(wiki_dir));
-        assert!(
-            store.ledger().is_empty(),
-            "rejected dat edit must not record"
-        );
-        assert!(
-            !sink_handle
-                .events()
-                .iter()
-                .any(|event| matches!(event, EngineEvent::Wiki(_))),
-            "reject must not emit a wiki event"
-        );
-
-        fs::remove_dir_all(base).ok();
-    }
-
-    #[tokio::test]
-    async fn partial_reject_then_accept_all_keeps_rejected_value_out_of_wiki() {
-        let base = unique_temp_dir("wiki-reject-then-accept");
-        let memory = ProjectMemory::new(base.join("memory"), "ExampleProject");
-        let wiki_dir = base.join("wiki");
-        let driver = FakeCodexDriver::scripted([AgentTurnResult::Plan {
-            markdown: "- Tune two stats".to_string(),
-        }]);
-        let sink = CapturingEventSink::default();
-        let mut engine = test_engine_with_wiki(driver, sink, memory, &base.join("data"), &wiki_dir);
-        engine.executor.plan_runtime = Some(engine.runtime.clone());
-
-        engine
-            .chat(crate::ipc::ChatRequest {
-                client_turn_id: crate::ipc::new_client_turn_id(),
-                text: "set marine HP to 80 and weapon damage to 6".to_string(),
-                attachments: Vec::new(),
-                mentions: Vec::new(),
-                execution_mode: Default::default(),
-                autonomous_policy: None,
-            })
-            .await
-            .expect("chat should run");
-        let request_id = engine
-            .current_request_id
-            .clone()
-            .expect("chat should create a request id");
-        // Two dat edits on distinct objIds: HP (will be rejected) and Damage (kept).
-        record_dat_set_in_memory(
-            &engine.journal_store,
-            &request_id,
-            "dat-hp",
-            1,
-            ("units", 0, "HP"),
-            json!(80),
-        );
-        record_dat_set_in_memory(
-            &engine.journal_store,
-            &request_id,
-            "dat-dmg",
-            2,
-            ("weapons", 5, "Damage"),
-            json!(6),
-        );
-        engine
-            .journal_store
-            .persist(&request_id)
-            .expect("journal should persist");
-
-        // Drive the partial reject through a no-op native rollback target so the
-        // test remains focused on the wiki contract.
-        struct NoopRollbackTarget;
-        impl journal::JournalRollbackTarget for NoopRollbackTarget {
-            type Error = AgentEngineError;
-            fn set_dat_value(
-                &self,
-                _table: journal::DatTable,
-                _dat: &str,
-                _obj_id: u32,
-                _property: &str,
-                _value: Value,
-            ) -> Result<(), Self::Error> {
-                Ok(())
-            }
-            fn reset_dat_value(
-                &self,
-                _table: journal::DatTable,
-                _dat: &str,
-                _obj_id: u32,
-                _property: &str,
-            ) -> Result<(), Self::Error> {
-                Ok(())
-            }
-            fn write_file(&self, _path: &str, _content: &str) -> Result<(), Self::Error> {
-                Ok(())
-            }
-            fn delete_file(&self, _path: &str) -> Result<(), Self::Error> {
-                Ok(())
-            }
-            fn create_file(
-                &self,
-                _path: &str,
-                _content: &str,
-                _position: Option<usize>,
-            ) -> Result<(), Self::Error> {
-                Ok(())
-            }
-            fn rename_path(&self, _from: &str, _to: &str) -> Result<(), Self::Error> {
-                Ok(())
-            }
-            fn set_main(&self, _path: Option<&str>) -> Result<(), Self::Error> {
-                Ok(())
-            }
-            fn set_setting(&self, _key: &str, _value: Value) -> Result<(), Self::Error> {
-                Ok(())
-            }
-            fn plugin_add(
-                &self,
-                _plugin_id: &str,
-                _texts: Vec<String>,
-                _index: usize,
-            ) -> Result<(), Self::Error> {
-                Ok(())
-            }
-            fn plugin_edit(
-                &self,
-                _plugin_id: &str,
-                _texts: Vec<String>,
-                _index: usize,
-            ) -> Result<(), Self::Error> {
-                Ok(())
-            }
-            fn plugin_remove(&self, _plugin_id: &str) -> Result<(), Self::Error> {
-                Ok(())
-            }
-            fn plugin_move(&self, _from_index: usize, _to_index: usize) -> Result<(), Self::Error> {
-                Ok(())
-            }
-            fn restore_project_manifest(
-                &self,
-                _expected_revision: &str,
-                _bytes: &[u8],
-            ) -> Result<(), Self::Error> {
-                Ok(())
-            }
-            fn restore_map_backup(
-                &self,
-                _map_path: &str,
-                _backup_path: &str,
-                _expected_sha256: Option<&str>,
-            ) -> Result<(), Self::Error> {
-                Ok(())
-            }
-        }
-        engine
-            .journal_store
-            .decide(
-                &request_id,
-                journal::ChangesetDecision::reject(journal::DecisionIds::Items(vec![
-                    "dat-hp".to_string()
-                ])),
-                &NoopRollbackTarget,
-            )
-            .expect("partial reject should roll back and forget the HP edit");
-
-        // Then accept everything still pending (panel sends "all").
-        engine.phase = Phase::ChangesetReview;
-        engine
-            .changeset_decision(crate::ipc::ChangesetDecisionRequest {
-                decision: crate::ipc::Decision::Accept,
-                ids: crate::ipc::DecisionIds::All(crate::ipc::AllLiteral),
-            })
-            .await
-            .expect("accept-all decision should finalize");
-
-        let store = crate::wiki::WikiStore::load(Some(wiki_dir));
-        assert!(
-            !store.ledger().entries.contains_key("dat:units:0:HP"),
-            "rolled-back HP must never enter the ledger via a later accept-all"
-        );
-        let kept = store
-            .ledger()
-            .entries
-            .get("dat:weapons:5:Damage")
-            .expect("the kept dat edit is recorded");
-        assert_eq!(kept.value, json!(6));
 
         fs::remove_dir_all(base).ok();
     }
@@ -9244,164 +8835,6 @@ mod tests {
         assert_eq!(next.state(), crate::write_coordinator::TicketState::Granted);
     }
 
-    #[tokio::test]
-    async fn partial_decision_keeps_write_registration_until_every_item_settles() {
-        let mut engine = test_engine(FakeCodexDriver::scripted([]), CapturingEventSink::default());
-        let request_id = "req-partial";
-        engine.runtime.begin_request(request_id, "Sample").unwrap();
-        engine
-            .runtime
-            .register_write_request("test review")
-            .unwrap();
-        engine.current_request_id = Some(request_id.to_string());
-        engine.phase = Phase::ChangesetReview;
-        record_file_write_in_memory(&engine.journal_store, request_id, "write-1", 1, "one.eps");
-        record_file_write_in_memory(&engine.journal_store, request_id, "write-2", 2, "two.eps");
-
-        engine
-            .changeset_decision(ipc::ChangesetDecisionRequest {
-                decision: ipc::Decision::Accept,
-                ids: ipc::DecisionIds::List(vec!["write-1".to_string()]),
-            })
-            .await
-            .unwrap();
-        assert_eq!(engine.phase, Phase::ChangesetReview);
-        assert!(engine.runtime.owns_write_registration());
-        assert_eq!(
-            engine.journal_store.entry_count(request_id),
-            1,
-            "only the undecided item remains live"
-        );
-        engine
-            .changeset_decision(ipc::ChangesetDecisionRequest {
-                decision: ipc::Decision::Accept,
-                ids: ipc::DecisionIds::All(ipc::AllLiteral),
-            })
-            .await
-            .unwrap();
-        assert_eq!(engine.phase, Phase::Idle);
-        assert!(!engine.runtime.owns_write_registration());
-    }
-
-    #[tokio::test]
-    async fn reject_restores_one_session_while_another_writer_remains_active() {
-        let services = crate::tool_exec::ToolServices::for_tests();
-        let runtime_c = services.session("session-c");
-        let runtime_e = services.session("session-e");
-        let dirs = runtime_c.data_dirs();
-        dirs.ensure_dirs().unwrap();
-        let workspace_manager = WorkspaceManager::new(dirs.clone());
-        let snapshot = native_workspace_snapshot(&dirs, "Sample");
-        let canonical = workspace_manager.prepare_snapshot(&snapshot).unwrap();
-        fs::write(canonical.workspace_root.join("specs/state.md"), b"accepted").unwrap();
-        let session_workspace = workspace_manager
-            .prepare_session_snapshot(&snapshot, "session-c")
-            .unwrap();
-        assert_eq!(session_workspace.workspace_root, canonical.workspace_root);
-        // The staged change lands directly on the single canonical copy.
-        fs::write(
-            session_workspace.workspace_root.join("specs/state.md"),
-            b"pending change",
-        )
-        .unwrap();
-
-        let sessions = crate::session::SessionStore::new(&dirs);
-        let record = crate::session::SessionRecord {
-            meta: crate::session::SessionMeta {
-                id: "session-c".to_string(),
-                name: "C".to_string(),
-                project: "Sample".to_string(),
-                kind: crate::session::SessionKind::Eps,
-                provider: crate::provider::ProviderId::Codex,
-                model: "gpt-test".to_string(),
-                created_at: 1,
-                last_conversation_at: 1_000,
-                team_parent: None,
-            },
-            provider_binding: crate::provider::ProviderBinding::new(
-                crate::provider::ProviderId::Codex,
-                "gpt-test".to_string(),
-                Some(crate::provider::ReasoningSelection {
-                    level: "medium".to_string(),
-                }),
-            )
-            .unwrap(),
-            pending_request_ids: Vec::new(),
-            context_usage: None,
-            panel_log: serde_json::Value::Null,
-            context_state: Default::default(),
-            task_state: Default::default(),
-            autonomous_run: None,
-            team_tasks: Vec::new(),
-        };
-        sessions.save(&record).unwrap();
-        let request_c = "req-c";
-        runtime_c.begin_request(request_c, "Sample").unwrap();
-        runtime_c.register_write_request("C mutation").unwrap();
-        runtime_c
-            .journal()
-            .record(
-                request_c,
-                journal::JournalEntry {
-                    id: "workspace-1".to_string(),
-                    seq: 1,
-                    tool: journal::WriteTool::WorkspaceWrite,
-                    target: journal::JournalTarget::WorkspacePath {
-                        workspace_id: session_workspace.id.clone(),
-                        path: "specs/state.md".to_string(),
-                    },
-                    before: journal::Snapshot::FileContent {
-                        content: "accepted".to_string(),
-                    },
-                    after: journal::Snapshot::FileContent {
-                        content: "pending change".to_string(),
-                    },
-                    ts: 1,
-                },
-            )
-            .unwrap();
-        runtime_c.journal().persist(request_c).unwrap();
-
-        let (_cancellation_tx, cancellation_rx) = tokio::sync::watch::channel(0_u64);
-        let mut engine = AgentEngine::new(
-            FakeCodexDriver::scripted([]),
-            CapturingEventSink::default(),
-            AgentEngineConfig::for_tests(
-                "[project state]\nproject=Sample compiling=false",
-                None,
-                sample_hits(),
-            ),
-            runtime_c,
-            sessions,
-            AttachmentStore::new(dirs.attachments_dir()),
-            record,
-            cancellation_rx,
-        );
-        engine.current_request_id = Some(request_c.to_string());
-        engine.phase = Phase::Executing;
-        engine.settle_write_lifecycle().unwrap();
-        assert_eq!(engine.phase, Phase::ChangesetReview);
-        assert!(engine.runtime.owns_write_registration());
-
-        runtime_e.begin_request("req-e", "Sample").unwrap();
-        let next = runtime_e.register_write_request("E mutation").unwrap();
-        assert_eq!(next.state(), crate::write_coordinator::TicketState::Granted);
-
-        engine
-            .changeset_decision(ipc::ChangesetDecisionRequest {
-                decision: ipc::Decision::Reject,
-                ids: ipc::DecisionIds::All(ipc::AllLiteral),
-            })
-            .await
-            .unwrap();
-
-        assert_eq!(next.state(), crate::write_coordinator::TicketState::Granted);
-        assert_eq!(
-            fs::read_to_string(canonical.workspace_root.join("specs/state.md")).unwrap(),
-            "accepted"
-        );
-        fs::remove_dir_all(dirs.app_data()).ok();
-    }
     #[test]
     fn pending_review_recovery_coexists_with_new_writer_ticket() {
         let base = unique_temp_dir("pending-review-recovery");
@@ -9558,40 +8991,6 @@ mod tests {
         fs::remove_dir_all(base).ok();
     }
 
-    #[tokio::test]
-    async fn rollback_failure_keeps_review_owner_and_live_journal() {
-        let sink = CapturingEventSink::default();
-        let sink_handle = sink.clone();
-        // No native project: the journaled write cannot be reverted.
-        let mut engine = test_engine_on(
-            FakeCodexDriver::scripted([]),
-            sink,
-            SessionToolRuntime::for_tests(),
-        );
-        let request_id = "req-rollback-failure";
-        engine.runtime.begin_request(request_id, "Sample").unwrap();
-        engine
-            .runtime
-            .register_write_request("test rollback")
-            .unwrap();
-        engine.current_request_id = Some(request_id.to_string());
-        record_file_write_in_memory(&engine.journal_store, request_id, "write-1", 1, "one.eps");
-
-        engine
-            .changeset_decision(ipc::ChangesetDecisionRequest {
-                decision: ipc::Decision::Reject,
-                ids: ipc::DecisionIds::All(ipc::AllLiteral),
-            })
-            .await
-            .expect("rollback failure is reported through scoped events");
-        assert!(sink_handle.events().iter().any(|event| matches!(
-            event,
-            EngineEvent::RollbackResult(ipc::RollbackResultEvent { ok: false, .. })
-        )));
-        assert_eq!(engine.phase, Phase::ChangesetReview);
-        assert!(engine.runtime.owns_write_registration());
-        assert_eq!(engine.journal_store.entry_count(request_id), 1);
-    }
     #[tokio::test]
     async fn chat_injects_text_attachments_and_forwards_images_to_codex() {
         let base = unique_temp_dir("chat-attachments");
@@ -9918,19 +9317,14 @@ mod tests {
             .unwrap();
         engine.current_request_id = Some(request_id.to_string());
         engine.phase = Phase::Executing;
-        engine.settle_write_lifecycle().unwrap();
-        assert_eq!(engine.phase, Phase::ChangesetReview);
-        assert!(engine.runtime.owns_write_registration());
 
-        let job = engine
-            .changeset_decision(ipc::ChangesetDecisionRequest {
-                decision: ipc::Decision::Accept,
-                ids: ipc::DecisionIds::All(ipc::AllLiteral),
-            })
+        let error = engine
+            .settle_request(None)
             .await
-            .unwrap();
-        assert!(job.is_none());
-        assert_eq!(engine.phase, Phase::ChangesetReview);
+            .expect_err("a sound import that was never built cannot settle");
+
+        assert!(error.message.contains("build_run"), "{}", error.message);
+        assert_eq!(engine.phase, Phase::Executing);
         assert!(engine.runtime.owns_write_registration());
         assert_eq!(
             engine
@@ -10371,10 +9765,7 @@ mod tests {
                 .unwrap();
 
             engine
-                .changeset_decision(crate::ipc::ChangesetDecisionRequest {
-                    decision: crate::ipc::Decision::Accept,
-                    ids: crate::ipc::DecisionIds::All(crate::ipc::AllLiteral),
-                })
+                .settle_request(None)
                 .await
                 .unwrap();
 

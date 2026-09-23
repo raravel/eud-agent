@@ -39,7 +39,7 @@ const regionMention = {
 } satisfies MentionInstance;
 
 describe("initial state", () => {
-  it("starts in connecting with an empty log, no project, no plan/changeset", () => {
+  it("starts in connecting with an empty log, no project, no plan", () => {
     const s = freshStore().getState();
     expect(s.phase).toBe("connecting");
     expect(s.log).toEqual([]);
@@ -47,7 +47,6 @@ describe("initial state", () => {
     expect(s.files).toEqual([]);
     expect(s.plan).toBeNull();
     expect(s.ask).toBeNull();
-    expect(s.changeset).toBeNull();
     expect(s.contextUsage).toBeNull();
     expect(s.connected).toBe(false);
   });
@@ -76,7 +75,7 @@ describe("connection lifecycle transitions (features/06 mermaid)", () => {
   });
 });
 
-describe("turn transitions (ready <-> thinking -> plan_review|changeset_review)", () => {
+describe("turn transitions (ready <-> thinking -> plan_review)", () => {
   it("ready -> thinking on chatSent", () => {
     const store = readyWithProject();
     store.chatSent();
@@ -115,40 +114,33 @@ describe("turn transitions (ready <-> thinking -> plan_review|changeset_review)"
     expect(store.getState().phase).toBe("thinking");
   });
 
-  it("thinking -> changeset_review on changeset", () => {
+  it("records the turn's commit quietly and announces an external one", () => {
     const store = readyWithProject();
     store.chatSent();
-    store.changesetReceived("req-1", [
-      { category: "file", kind: "created", path: "x.eps", id: "e1", seq: 0 },
-    ]);
-    const s = store.getState();
-    expect(s.phase).toBe("changeset_review");
-    expect(s.changeset?.request_id).toBe("req-1");
-    expect(s.changeset?.items.length).toBe(1);
+    store.gitCommitted({
+      external: { sha: "aaa1111", subject: "앱 밖 변경", files: 2 },
+      turn: { sha: "bbb2222", subject: "마린 체력 조정", files: 1 },
+    });
+    const log = store.getState().log;
+    const outside = log.find((entry) => entry.text.includes("앱 밖에서 바뀐 파일"));
+    const turn = log.find((entry) => entry.text.includes("마린 체력 조정"));
+    // The external commit is the surprising one, so it is neither muted nor
+    // suppressed; the turn's own commit is a quiet, toast-free row.
+    expect(outside?.kind).toBe("ok");
+    expect(outside?.text).toContain("2개");
+    expect(outside?.silent).toBeUndefined();
+    expect(turn?.kind).toBe("info");
+    expect(turn?.silent).toBe(true);
+    // Recording is bookkeeping: it never moves the turn out of thinking.
+    expect(store.getState().phase).toBe("thinking");
   });
 
-  it("changeset_review -> ready after a full accept decision", () => {
+  it("reports a failed record as a warning without losing the turn", () => {
     const store = readyWithProject();
     store.chatSent();
-    store.changesetReceived("req-1", [
-      { category: "file", kind: "created", path: "x.eps", id: "e1", seq: 0 },
-    ]);
-    // Bulk accept: the server echoes an EMPTY ids array (it does not return the
-    // accepted ids); the recorded decision resolves it against all undecided.
-    store.decisionSent("accept", "all");
-    store.rollbackResult([], true);
-    const s = store.getState();
-    expect(s.changeset?.decisions["e1"]).toBe("accepted");
-    expect(s.phase).toBe("ready");
-  });
-
-  it("changeset_review -> thinking on follow-up chat", () => {
-    const store = readyWithProject();
-    store.chatSent();
-    store.changesetReceived("req-1", [
-      { category: "file", kind: "created", path: "x.eps", id: "e1", seq: 0 },
-    ]);
-    store.chatSent();
+    store.gitCommitted({ warning: "이 턴을 기록하지 못했습니다: 잠김" });
+    const warn = store.getState().log.find((entry) => entry.kind === "warn");
+    expect(warn?.text).toBe("이 턴을 기록하지 못했습니다: 잠김");
     expect(store.getState().phase).toBe("thinking");
   });
 });
@@ -312,233 +304,6 @@ describe("reconnect during thinking resets to ready WITH a notice", () => {
   });
 });
 
-describe("changeset stays reviewable across reconnect (server-persisted journal)", () => {
-  it("keeps the changeset and stays in changeset_review after a reconnect", () => {
-    const store = readyWithProject();
-    store.chatSent();
-    store.changesetReceived("req-1", [
-      { category: "file", kind: "created", path: "x.eps", id: "e1", seq: 0 },
-    ]);
-    store.wsConnecting();
-    store.wsOpen();
-    const s = store.getState();
-    expect(s.phase).toBe("changeset_review");
-    expect(s.changeset?.request_id).toBe("req-1");
-  });
-});
-
-describe("rollback_result labels items per the RECORDED decision", () => {
-  /** Drive to changeset_review with the given items. */
-  function reviewing(items: Array<{ id: string; seq: number }>) {
-    const store = readyWithProject();
-    store.chatSent();
-    store.changesetReceived(
-      "req-1",
-      items.map((it) => ({
-        category: "file",
-        kind: "modified",
-        path: `${it.id}.eps`,
-        id: it.id,
-        seq: it.seq,
-      })),
-    );
-    return store;
-  }
-
-  it("per-item ACCEPT → 'accepted' (NOT 'rejected'); fully decided → ready", () => {
-    const store = reviewing([{ id: "e1", seq: 0 }]);
-    // The server routes accept through rollback_result too (ids echoed, ok:true).
-    store.decisionSent("accept", ["e1"]);
-    store.rollbackResult(["e1"], true);
-    const s = store.getState();
-    expect(s.changeset?.decisions["e1"]).toBe("accepted");
-    expect(s.pendingDecision).toBeNull();
-    expect(s.phase).toBe("ready");
-  });
-
-  it("per-item REJECT (ok=true) → 'rejected'; mixed keeps changeset_review", () => {
-    const store = reviewing([
-      { id: "e1", seq: 0 },
-      { id: "e2", seq: 1 },
-    ]);
-    store.decisionSent("reject", ["e1"]);
-    store.rollbackResult(["e1"], true);
-    const s = store.getState();
-    expect(s.changeset?.decisions["e1"]).toBe("rejected");
-    expect(s.changeset?.decisions["e2"]).toBeUndefined(); // still undecided
-    expect(s.phase).toBe("changeset_review");
-  });
-
-  it("per-item REJECT (ok=false) → 'failed'; failure keeps the panel open", () => {
-    const store = reviewing([{ id: "e1", seq: 0 }]);
-    store.decisionSent("reject", ["e1"]);
-    store.rollbackResult(["e1"], false);
-    const s = store.getState();
-    expect(s.changeset?.decisions["e1"]).toBe("failed");
-    // A failure does NOT advance to ready even when all items are "decided".
-    expect(s.phase).toBe("changeset_review");
-  });
-
-  it("BULK accept (server ids:[]) → ALL undecided become 'accepted'; ready", () => {
-    const store = reviewing([
-      { id: "e1", seq: 0 },
-      { id: "e2", seq: 1 },
-    ]);
-    // Accept-all: the server does NOT echo the accepted ids — it sends ids:[].
-    store.decisionSent("accept", "all");
-    store.rollbackResult([], true);
-    const s = store.getState();
-    expect(s.changeset?.decisions["e1"]).toBe("accepted");
-    expect(s.changeset?.decisions["e2"]).toBe("accepted");
-    expect(s.phase).toBe("ready");
-  });
-
-  it("BULK accept applies only to UNDECIDED items (prior decisions kept)", () => {
-    const store = reviewing([
-      { id: "e1", seq: 0 },
-      { id: "e2", seq: 1 },
-    ]);
-    // First reject e1...
-    store.decisionSent("reject", ["e1"]);
-    store.rollbackResult(["e1"], true);
-    expect(store.getState().changeset?.decisions["e1"]).toBe("rejected");
-    // ...then accept-all the rest (server ids:[]).
-    store.decisionSent("accept", "all");
-    store.rollbackResult([], true);
-    const s = store.getState();
-    expect(s.changeset?.decisions["e1"]).toBe("rejected"); // untouched
-    expect(s.changeset?.decisions["e2"]).toBe("accepted");
-    expect(s.phase).toBe("ready");
-  });
-
-  it("BULK reject (server echoes the real ids) → all 'rejected'; ready", () => {
-    const store = reviewing([
-      { id: "e1", seq: 0 },
-      { id: "e2", seq: 1 },
-    ]);
-    store.decisionSent("reject", "all");
-    // reject DOES return the real journal ids (unlike accept-all).
-    store.rollbackResult(["e2", "e1"], true);
-    const s = store.getState();
-    expect(s.changeset?.decisions["e1"]).toBe("rejected");
-    expect(s.changeset?.decisions["e2"]).toBe("rejected");
-    expect(s.phase).toBe("ready");
-  });
-
-  it("defensive fallback: rollback_result with NO recorded decision", () => {
-    const store = reviewing([{ id: "e1", seq: 0 }]);
-    // No decisionSent() first (should not happen — the store is the sole sender).
-    // The fallback treats it as the legacy reject-shaped reply.
-    store.rollbackResult(["e1"], true);
-    expect(store.getState().changeset?.decisions["e1"]).toBe("rejected");
-    store.rollbackResult(["e1"], false);
-    // ok=false fallback → failed.
-    const store2 = reviewing([{ id: "z1", seq: 0 }]);
-    store2.rollbackResult(["z1"], false);
-    expect(store2.getState().changeset?.decisions["z1"]).toBe("failed");
-  });
-});
-
-describe("dat-group changeset (NO item-level id — completion via property ids)", () => {
-  // REPRESENTATIVE: a server dat group carries no item-level id; its ids live on
-  // properties[]. The store must derive completion via itemIds (lib/changeset),
-  // NOT decisions[it.id] (permanently undefined → never "fully decided").
-  function datGroup(objId: number, propIds: string[]) {
-    return {
-      category: "dat",
-      dat: "unit",
-      objId,
-      properties: propIds.map((id, i) => ({
-        property: `p${i}`,
-        old: "0",
-        new: "1",
-        id,
-        seq: i,
-      })),
-    };
-  }
-
-  /** Drive to changeset_review with the given (id-less) dat groups. */
-  function reviewingDat(groups: Array<ReturnType<typeof datGroup>>) {
-    const store = readyWithProject();
-    store.chatSent();
-    // The ChangesetItem type wants id/seq; production dat groups omit them.
-    store.changesetReceived("req-dat", groups as unknown as Parameters<
-      typeof store.changesetReceived
-    >[1]);
-    return store;
-  }
-
-  it("per-PROPERTY decisions complete a dat group → ready (was unreachable)", () => {
-    const store = reviewingDat([datGroup(76, ["p1", "p2"])]);
-    expect(store.getState().phase).toBe("changeset_review");
-    // Accept the whole group (ChangesetView dispatches BOTH property ids).
-    store.decisionSent("accept", ["p1", "p2"]);
-    store.rollbackResult(["p1", "p2"], true);
-    const s = store.getState();
-    expect(s.changeset?.decisions["p1"]).toBe("accepted");
-    expect(s.changeset?.decisions["p2"]).toBe("accepted");
-    // Critical: a dat-only changeset now reaches "fully decided".
-    expect(s.phase).toBe("ready");
-  });
-
-  it("stays in changeset_review until EVERY property of a dat group is decided", () => {
-    const store = reviewingDat([datGroup(76, ["p1", "p2"])]);
-    store.decisionSent("accept", ["p1"]);
-    store.rollbackResult(["p1"], true);
-    // p2 still undecided → the group (and changeset) is NOT fully decided.
-    expect(store.getState().phase).toBe("changeset_review");
-  });
-
-  it("BULK accept (server ids:[]) resolves an id-less dat group → ready", () => {
-    const store = reviewingDat([
-      datGroup(76, ["p1", "p2"]),
-      datGroup(0, ["q1"]),
-    ]);
-    store.decisionSent("accept", "all");
-    // accept-all echoes EMPTY ids; the store resolves against all undecided
-    // PROPERTY ids (via itemIds), not it.id.
-    store.rollbackResult([], true);
-    const s = store.getState();
-    expect(s.changeset?.decisions["p1"]).toBe("accepted");
-    expect(s.changeset?.decisions["p2"]).toBe("accepted");
-    expect(s.changeset?.decisions["q1"]).toBe("accepted");
-    expect(s.phase).toBe("ready");
-  });
-
-  it("an UNDECIDED dat group stays reviewable across a reconnect", () => {
-    const store = reviewingDat([datGroup(76, ["p1", "p2"])]);
-    store.wsConnecting(); // drop
-    store.wsOpen(); // reconnect: undecided dat group must re-open review
-    const s = store.getState();
-    expect(s.phase).toBe("changeset_review");
-    expect(s.changeset?.request_id).toBe("req-dat");
-  });
-
-  it("a FULLY-DECIDED dat group does NOT re-open review on reconnect", () => {
-    const store = reviewingDat([datGroup(76, ["p1", "p2"])]);
-    store.decisionSent("accept", ["p1", "p2"]);
-    store.rollbackResult(["p1", "p2"], true);
-    expect(store.getState().phase).toBe("ready");
-    store.wsConnecting();
-    store.wsOpen();
-    // Already fully decided → lands on ready, not changeset_review.
-    expect(store.getState().phase).toBe("ready");
-  });
-
-  it("decisionFailed clears the pending decision so the controls unlock", () => {
-    const store = reviewingDat([datGroup(76, ["p1", "p2"])]);
-    store.decisionSent("accept", "all");
-    expect(store.getState().pendingDecision).not.toBeNull();
-    // The command never reached the core (send failed): no rollback_result will
-    // arrive, so the optimistic pending decision must be cleared explicitly.
-    store.decisionFailed();
-    expect(store.getState().pendingDecision).toBeNull();
-    // The changeset stays reviewable (still undecided) — controls are usable.
-    expect(store.getState().phase).toBe("changeset_review");
-  });
-});
-
 describe("send gating v2 = connected && hasProject && !busy (no settable target req.)", () => {
   it("allows send when connected with a project, even with zero files", () => {
     const store = freshStore();
@@ -577,15 +342,6 @@ describe("send gating v2 = connected && hasProject && !busy (no settable target 
     const store = readyWithProject();
     store.chatSent();
     store.planReceived("# plan", 1);
-    expect(store.getState().canSend).toBe(true);
-  });
-
-  it("allows send during changeset_review (follow-up chat auto-accepts)", () => {
-    const store = readyWithProject();
-    store.chatSent();
-    store.changesetReceived("req-1", [
-      { category: "file", kind: "created", path: "x.eps", id: "e1", seq: 0 },
-    ]);
     expect(store.getState().canSend).toBe(true);
   });
 
@@ -707,7 +463,6 @@ describe("v1 protocol literals are absent (no compat shim)", () => {
         "plan_feedback",
         "plan_approve",
         "ask_response",
-        "changeset_decision",
         "cancel",
         "conversation_rewind",
         "status",
@@ -721,8 +476,7 @@ describe("v1 protocol literals are absent (no compat shim)", () => {
         "answer",
         "plan",
         "ask",
-        "changeset",
-        "rollback_result",
+        "git",
         "error",
         "status",
         "progress",
@@ -850,10 +604,8 @@ describe("agentEvent streaming buffers (EUD-065 / features/06)", () => {
     store.agentEvent("reasoning", "이전 추론");
     store.agentEvent("delta", "이전 답변");
     store.agentEvent("tool_call", "dat_set");
-    // a new turn (the changeset auto-accepts server-side; follow-up chat)
-    store.changesetReceived("r1", [
-      { category: "file", id: "e1", seq: 0, kind: "created", path: "a.eps" },
-    ]);
+    // a new turn
+    store.answerReceived("끝");
     store.chatSent();
     const turn = store.getState().turn;
     expect(turn.reasoning).toBe("");
@@ -1061,17 +813,6 @@ describe("turn-end tool archiving (EUD-069)", () => {
     expect(archivedEntry(store)).toBeDefined();
   });
 
-  it("archives tool rows when a changeset ends the turn", () => {
-    const store = readyWithProject();
-    store.chatSent();
-    runTools(store);
-    store.changesetReceived("r1", [
-      { category: "file", id: "e1", seq: 0, kind: "created", path: "a.eps" },
-    ]);
-    expect(store.getState().turn.tools).toEqual([]);
-    expect(archivedEntry(store)).toBeDefined();
-  });
-
   it("archives tool rows when the turn errors out", () => {
     const store = readyWithProject();
     store.chatSent();
@@ -1104,8 +845,8 @@ describe("turn-end tool archiving (EUD-069)", () => {
 });
 
 
-// F2: prose streamed via `delta` before a non-answer turn-end (plan/changeset/
-// error) is archived as a prominent agent log entry — otherwise the live
+// F2: prose streamed via `delta` before a non-answer turn-end (plan/error)
+// is archived as a prominent agent log entry — otherwise the live
 // AgentAnswer bubble's text vanishes at the transition. The answer{} path is
 // authoritative and does NOT double-log.
 describe("streamed-prose archival on turn-end (F2)", () => {
@@ -1125,16 +866,6 @@ describe("streamed-prose archival on turn-end (F2)", () => {
     expect(logTexts(store)).toContain("먼저 계획을 세웁니다.");
     // The buffer is cleared after archiving (no re-archive on a later transition).
     expect(store.getState().turn.answer).toBe("");
-  });
-
-  it("archives streamed prose when the turn ends with changeset{}", () => {
-    const store = readyWithProject();
-    store.chatSent();
-    store.agentEvent("delta", "변경을 적용했습니다.");
-    store.changesetReceived("r1", [
-      { category: "file", id: "e1", seq: 0, kind: "created", path: "a.eps" },
-    ]);
-    expect(logTexts(store)).toContain("변경을 적용했습니다.");
   });
 
   it("archives streamed prose when the turn ends with error{}", () => {

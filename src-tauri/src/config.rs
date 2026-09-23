@@ -96,7 +96,7 @@ pub struct NotificationSettings {
     #[serde(default)]
     pub plan_approval: NotificationChannelSettings,
     #[serde(default)]
-    pub changeset_review: NotificationChannelSettings,
+    pub review_required: NotificationChannelSettings,
     #[serde(default)]
     pub agent_turn_complete: NotificationChannelSettings,
     #[serde(default)]
@@ -783,10 +783,6 @@ mod tests {
             serde_json::from_str(r#"{"notifications":{"planApproval":{"sound":false}}}"#).unwrap();
         assert!(!back.notifications.plan_approval.sound);
         assert!(back.notifications.plan_approval.os_notification);
-        assert_eq!(
-            back.notifications.changeset_review,
-            NotificationChannelSettings::default()
-        );
         assert_eq!(
             back.notifications.agent_turn_complete,
             NotificationChannelSettings::default()

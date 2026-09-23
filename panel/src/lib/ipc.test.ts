@@ -5,6 +5,11 @@ import {
   appSettingsSave,
   attentionNotify,
   euddraftCheckUpdate,
+  gitCommitDetail,
+  gitConsentSet,
+  gitLog,
+  gitRevert,
+  gitState,
   euddraftSettingsGet,
   euddraftUpdate,
   providerBaseUrlSave,
@@ -207,30 +212,6 @@ describe("send", () => {
     });
   });
 
-  it("sends changeset_decision via invoke", async () => {
-    const { invoke, listen } = makeHarness();
-    invoke.mockResolvedValue(undefined);
-    const client = new IpcClient({
-      invoke,
-      listen,
-      onMessage: () => {},
-    });
-    const msg: ClientMessage = {
-      type: "changeset_decision",
-      sessionId: "session-a",
-      decision: "reject",
-      ids: ["a", "b"],
-    };
-
-    await client.send(msg);
-
-    expect(invoke).toHaveBeenCalledWith("changeset_decision", {
-      sessionId: "session-a",
-      decision: "reject",
-      ids: ["a", "b"],
-    });
-  });
-
   it("sends conversation_rewind with the durable log prefix", async () => {
     const { invoke, listen } = makeHarness();
     invoke.mockResolvedValue(undefined);
@@ -336,6 +317,33 @@ describe("inbound events", () => {
       sessionId: "session-a",
       kind: "reasoning",
       detail: "checking",
+    });
+  });
+
+  it("dispatches a git turn-boundary commit for the addressed session", async () => {
+    const { invoke, listen, listeners } = makeHarness();
+    invoke.mockResolvedValue(undefined);
+    const received: ServerMessage[] = [];
+    const client = new IpcClient({
+      invoke,
+      listen,
+      onMessage: (message) => received.push(message),
+    });
+
+    await client.connect();
+    listeners.get("git")?.({
+      payload: {
+        sessionId: "session-a",
+        external: { sha: "a".repeat(40), subject: "앱 밖 변경", files: 2 },
+        turn: { sha: "b".repeat(40), subject: "마린 체력 조정", files: 1 },
+      },
+    });
+
+    expect(received).toContainEqual({
+      type: "git",
+      sessionId: "session-a",
+      external: { sha: "a".repeat(40), subject: "앱 밖 변경", files: 2 },
+      turn: { sha: "b".repeat(40), subject: "마린 체력 조정", files: 1 },
     });
   });
 
@@ -999,7 +1007,7 @@ describe("App notification settings commands", () => {
   const settings = {
     notifications: {
       planApproval: { sound: true, osNotification: true },
-      changesetReview: { sound: false, osNotification: true },
+      reviewRequired: { sound: true, osNotification: true },
       agentTurnComplete: { sound: true, osNotification: false },
       askResponseRequired: { sound: false, osNotification: true },
     },
@@ -1078,7 +1086,6 @@ describe("App notification settings commands", () => {
     const invoke = vi.fn().mockResolvedValue({
       notifications: {
         planApproval: { sound: true },
-        changesetReview: { sound: true, osNotification: true },
         agentTurnComplete: { sound: true, osNotification: true },
         askResponseRequired: { sound: true, osNotification: true },
       },
@@ -1101,44 +1108,24 @@ describe("App notification settings commands", () => {
     });
   });
 
-  it("delivers attention events with focus, session, and item-count context", async () => {
+  it("delivers attention events with focus and session context", async () => {
     const invoke = vi.fn().mockResolvedValue(undefined);
 
-    await attentionNotify("planApproval", false, "session-a", undefined, invoke);
+    await attentionNotify("planApproval", false, "session-a", invoke);
     expect(invoke).toHaveBeenCalledWith("attention_notify", {
       kind: "planApproval",
       showOs: false,
       sessionId: "session-a",
     });
 
-    await attentionNotify("changesetReview", true, "session-b", 3, invoke);
-    expect(invoke).toHaveBeenLastCalledWith("attention_notify", {
-      kind: "changesetReview",
-      showOs: true,
-      sessionId: "session-b",
-      itemCount: 3,
-    });
-
-    await attentionNotify(
-      "agentTurnComplete",
-      true,
-      "session-a",
-      undefined,
-      invoke,
-    );
+    await attentionNotify("agentTurnComplete", true, "session-a", invoke);
     expect(invoke).toHaveBeenLastCalledWith("attention_notify", {
       kind: "agentTurnComplete",
       showOs: true,
       sessionId: "session-a",
     });
 
-    await attentionNotify(
-      "askResponseRequired",
-      false,
-      "session-b",
-      undefined,
-      invoke,
-    );
+    await attentionNotify("askResponseRequired", false, "session-b", invoke);
     expect(invoke).toHaveBeenLastCalledWith("attention_notify", {
       kind: "askResponseRequired",
       showOs: false,
@@ -1236,5 +1223,108 @@ describe("Workspace commands", () => {
     await expect(workspaceList(invoke)).rejects.toThrow(
       "invalid workspace file entry",
     );
+  });
+});
+
+describe("project history commands", () => {
+  it("normalizes the repository state, including a missing origin", async () => {
+    const invoke = vi.fn().mockResolvedValue({
+      available: true,
+      tracked: true,
+      nested: false,
+      origin: null,
+      consent: "pending",
+      warning: null,
+    });
+
+    await expect(gitState(invoke)).resolves.toEqual({
+      available: true,
+      tracked: true,
+      nested: false,
+      origin: null,
+      consent: "pending",
+      warning: null,
+    });
+    expect(invoke).toHaveBeenCalledWith("git_state");
+  });
+
+  it("rejects a repository state with an unknown consent value", async () => {
+    const invoke = vi.fn().mockResolvedValue({
+      available: true,
+      tracked: true,
+      nested: false,
+      origin: "app",
+      consent: "maybe",
+    });
+
+    await expect(gitState(invoke)).rejects.toThrow("invalid git state response");
+  });
+
+  it("records consent and returns the updated state", async () => {
+    const invoke = vi.fn().mockResolvedValue({
+      available: true,
+      tracked: true,
+      nested: false,
+      origin: "preexisting",
+      consent: "granted",
+      warning: null,
+    });
+
+    await expect(gitConsentSet(true, invoke)).resolves.toMatchObject({
+      consent: "granted",
+      origin: "preexisting",
+    });
+    expect(invoke).toHaveBeenCalledWith("git_consent_set", { granted: true });
+  });
+
+  it("reads the log, a commit detail, and a revert", async () => {
+    const invoke = vi.fn().mockImplementation(async (command: string) => {
+      if (command === "git_log") {
+        return [{ sha: "a".repeat(40), subject: "첫 변경", timestamp: 1_700_000_000 }];
+      }
+      if (command === "git_commit_detail") {
+        return {
+          sha: "a".repeat(40),
+          subject: "첫 변경",
+          body: ["session: s-1", "request: r-1"].join("\n"),
+          timestamp: 1_700_000_000,
+          files: [
+            {
+              path: "src/main.eps",
+              insertions: 2,
+              deletions: 1,
+              binary: false,
+              patch: ["@@ -1 +1 @@", "-old", "+new"].join("\n"),
+            },
+            {
+              path: "maps/source.scx",
+              insertions: 0,
+              deletions: 0,
+              binary: true,
+              omitted: "바이너리 파일이라 내용 비교를 표시하지 않습니다.",
+            },
+          ],
+        };
+      }
+      return { sha: "c".repeat(40), subject: 'Revert "첫 변경"', files: 1 };
+    });
+
+    await expect(gitLog(10, invoke)).resolves.toEqual([
+      { sha: "a".repeat(40), subject: "첫 변경", timestamp: 1_700_000_000 },
+    ]);
+    expect(invoke).toHaveBeenLastCalledWith("git_log", { limit: 10 });
+
+    const detail = await gitCommitDetail("a".repeat(40), invoke);
+    expect(detail.files[0]?.patch).toContain("+new");
+    // An omitted patch stays absent rather than becoming an empty diff.
+    expect(detail.files[1]?.patch).toBeUndefined();
+    expect(detail.files[1]?.omitted).toContain("바이너리");
+
+    await expect(gitRevert("a".repeat(40), invoke)).resolves.toEqual({
+      sha: "c".repeat(40),
+      subject: 'Revert "첫 변경"',
+      files: 1,
+    });
+    expect(invoke).toHaveBeenLastCalledWith("git_revert", { sha: "a".repeat(40) });
   });
 });
