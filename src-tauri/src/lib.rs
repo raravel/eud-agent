@@ -61,6 +61,7 @@ pub mod provider_service;
 pub mod provider_tool_loop;
 pub mod provider_transcript;
 pub mod rag;
+pub mod rag_panel;
 pub mod session;
 pub mod setup;
 pub mod source_snapshot;
@@ -328,6 +329,7 @@ pub fn run() {
             // gates startup (search_docs returns zero hits until it is ready,
             // which still lifts the evidence gate).
             let warm_rag = services.rag();
+            app.manage(rag_panel::RagManaged(services.rag()));
             let warm_handle = app_handle.clone();
             tauri::async_runtime::spawn_blocking(move || {
                 if let Err(error) = warm_rag.warmup(&bootstrap::TauriEmitter(warm_handle)) {
@@ -398,6 +400,8 @@ pub fn run() {
             engine::engine_session_rename,
             engine::engine_session_delete,
             mentions::mention_search,
+            rag_panel::rag_search,
+            rag_panel::rag_article,
             map_agent::map_agent_open,
             map_agent::map_task_apply_undo,
             map_import::map_agent_import_open,

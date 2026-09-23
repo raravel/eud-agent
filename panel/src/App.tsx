@@ -46,6 +46,7 @@ import {
   type DocumentTab,
   type DocumentTabId,
 } from "@/components/DocumentTabStrip";
+import { ReferenceDocument } from "@/components/ReferenceDocument";
 import { WorkspaceDocument } from "@/components/WorkspaceDocument";
 import {
   SessionSidebar,
@@ -76,6 +77,9 @@ import {
   compactSession,
   isAgentTurnEndTransition,
   mentionSearch,
+  openExternalUrl,
+  ragArticle,
+  ragSearch,
   notificationSoundPreview,
   projectRecentList,
   projectRecentRemove,
@@ -125,6 +129,8 @@ import {
   type SessionModelSettings,
   type SessionRecord,
   type SetupMessage,
+  type RagArticle,
+  type RagSearchHit,
   type WorkspaceFileEntry,
   type WorkspaceListResponse,
 } from "@/lib/ipc";
@@ -154,7 +160,7 @@ import { createUpdater, type UpdateHandle } from "@/setup/update";
 import { PROVIDER_LABELS } from "@/providers/providerCopy";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { ClipboardList } from "lucide-react";
+import { ClipboardList, Library } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
   discardAttachment,
@@ -174,6 +180,8 @@ const PROJECT_REFRESH_MS = 2000;
 /** Maximum simultaneously open workspace document tabs in the center column. */
 const MAX_DOCUMENT_TABS = 8;
 const NO_WORKSPACE_FILES: WorkspaceFileEntry[] = [];
+/** Center tab ids of reference (RAG) articles opened from the sidebar. */
+const REFERENCE_TAB_PREFIX = "reference:";
 
 /**
  * Virtual center tab id for the selected session's active plan. Workspace
@@ -185,6 +193,15 @@ const PLAN_TAB_ID = "virtual:plan";
 /** Tab label for a workspace document: its file name. */
 function documentTabPresentation(path: string): Pick<DocumentTab, "label" | "icon"> {
   return { label: path.slice(path.lastIndexOf("/") + 1) };
+}
+
+/** One reference tab: the title from its search hit, then the loaded article. */
+interface ReferenceTabState {
+  hitId: string;
+  title: string;
+  article: RagArticle | null;
+  loading: boolean;
+  error: string | null;
 }
 
 /** Per-tab fetch state; contents persist across tab switches. */
@@ -473,6 +490,10 @@ export default function App() {
   // tab list and per-path contents live here so switching tabs never refetches
   // and each tab keeps its own loading/error state.
   const [openDocumentTabs, setOpenDocumentTabs] = useState<string[]>([]);
+  // Reference articles are global (not project files), so they survive
+  // workspace refreshes and project switches until the user closes them.
+  const [referenceTabs, setReferenceTabs] = useState<string[]>([]);
+  const [referenceStates, setReferenceStates] = useState<Record<string, ReferenceTabState>>({});
   const [activeCenterTab, setActiveCenterTab] = useState<DocumentTabId>("chat");
   const [documentStates, setDocumentStates] = useState<
     Record<string, DocumentTabState>
@@ -2784,9 +2805,66 @@ export default function App() {
     [activeCenterTab, loadDocumentTab, workspaceData],
   );
 
+  const openExternalLink = useCallback(
+    (url: string) => {
+      openExternalUrl(url).catch((error) =>
+        store.log("warn", `원문 링크를 열지 못했습니다. 브라우저에서 직접 열어 주세요: ${url} (${String(error)})`),
+      );
+    },
+    [store],
+  );
+
+  // Every part of one split article opens the same tab (the backend joins them).
+  const openReferenceTab = useCallback(
+    (hit: RagSearchHit) => {
+      const id = `${REFERENCE_TAB_PREFIX}${hit.part && hit.url ? hit.url : hit.id}`;
+      setActiveCenterTab(id);
+      setReferenceTabs((current) => {
+        if (current.includes(id)) return current;
+        if (current.length < MAX_DOCUMENT_TABS) return [...current, id];
+        return [...current.slice(1), id];
+      });
+      const existing = referenceStates[id];
+      if (existing && (existing.loading || existing.article)) return;
+      setReferenceStates((current) => ({
+        ...current,
+        [id]: { hitId: hit.id, title: hit.title, article: null, loading: true, error: null },
+      }));
+      const settle = (patch: Partial<ReferenceTabState>) =>
+        setReferenceStates((current) =>
+          id in current ? { ...current, [id]: { ...current[id], ...patch, loading: false } } : current,
+        );
+      ragArticle(hit.id).then(
+        (article) => settle({ article, error: null }),
+        (error) =>
+          settle({
+            error: `참고 문서를 열지 못했습니다. 검색 결과에서 다시 열어 주세요. (${String(error)})`,
+          }),
+      );
+    },
+    [referenceStates],
+  );
+
   const closeDocumentTab = useCallback(
     (id: DocumentTabId) => {
       if (id === "chat") return;
+      if (id.startsWith(REFERENCE_TAB_PREFIX)) {
+        const index = referenceTabs.indexOf(id);
+        const next = referenceTabs.filter((tab) => tab !== id);
+        setReferenceTabs(next);
+        setReferenceStates((current) => {
+          if (!(id in current)) return current;
+          const rest = { ...current };
+          delete rest[id];
+          return rest;
+        });
+        if (activeCenterTab === id) {
+          setActiveCenterTab(
+            next[index] ?? next[index - 1] ?? openDocumentTabs[openDocumentTabs.length - 1] ?? "chat",
+          );
+        }
+        return;
+      }
       if (id === PLAN_TAB_ID) {
         const sessionId = selectedSessionIdRef.current;
         if (sessionId !== null) {
@@ -2812,12 +2890,14 @@ export default function App() {
         return next;
       });
     },
-    [activeCenterTab, openDocumentTabs],
+    [activeCenterTab, openDocumentTabs, referenceTabs],
   );
 
   const closeAllDocumentTabs = useCallback(() => {
     setOpenDocumentTabs([]);
     setDocumentStates({});
+    setReferenceTabs([]);
+    setReferenceStates({});
     const sessionId = selectedSessionIdRef.current;
     if (sessionId !== null) {
       setPlanTabHidden((current) => new Set(current).add(sessionId));
@@ -2864,6 +2944,7 @@ export default function App() {
         if (
           activeCenterTab !== "chat" &&
           activeCenterTab !== PLAN_TAB_ID &&
+          !activeCenterTab.startsWith(REFERENCE_TAB_PREFIX) &&
           !retained(activeCenterTab)
         ) {
           setActiveCenterTab(nextTabs[0] ?? "chat");
@@ -2905,6 +2986,7 @@ export default function App() {
         await clientRef.current?.send({ type: "memory_get" });
         return;
       }
+      if (tab === "rag") return;
       try {
         const msg = await wikiGet();
         projectStore.wikiReceived(msg.version, msg.entries);
@@ -3057,8 +3139,13 @@ export default function App() {
             },
           ]
         : []),
+      ...referenceTabs.map((id) => ({
+        id,
+        label: referenceStates[id]?.article?.title ?? referenceStates[id]?.title ?? "참고 문서",
+        icon: Library,
+      })),
     ],
-    [openDocumentTabs, planRevision, planTabVisible],
+    [openDocumentTabs, planRevision, planTabVisible, referenceStates, referenceTabs],
   );
   const handleCenterTabSelect = useCallback((id: DocumentTabId) => {
     setActiveCenterTab(id);
@@ -3518,6 +3605,35 @@ export default function App() {
             );
           })}
 
+        {referenceTabs.map((id) => {
+          const reference = referenceStates[id];
+          return (
+            <div
+              key={id}
+              id={`document-panel-${id}`}
+              role="tabpanel"
+              aria-labelledby={`document-tab-${id}`}
+              className={
+                activeCenterTab === id
+                  ? "flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden"
+                  : "hidden"
+              }
+            >
+              <ReferenceDocument
+                title={reference?.title ?? "참고 문서"}
+                article={reference?.article ?? null}
+                loading={reference?.loading ?? false}
+                error={
+                  reference
+                    ? reference.error
+                    : "참고 문서를 찾을 수 없습니다. 검색 결과에서 다시 열어 주세요."
+                }
+                onOpenLink={openExternalLink}
+              />
+            </div>
+          );
+        })}
+
         {/* The prompt is shared under every center tab: plan feedback, questions
             about an open report, and ordinary chat all enter here. */}
         <InstructionBox
@@ -3558,7 +3674,9 @@ export default function App() {
         memory={projectState.memory}
         workspace={workspaceData}
         workspaceSelectedPath={
-          activeCenterTab !== "chat" && activeCenterTab !== PLAN_TAB_ID
+          activeCenterTab !== "chat" &&
+          activeCenterTab !== PLAN_TAB_ID &&
+          !activeCenterTab.startsWith(REFERENCE_TAB_PREFIX)
             ? activeCenterTab
             : null
         }
@@ -3573,6 +3691,13 @@ export default function App() {
         onWorkspaceSelect={openDocumentTab}
         onWorkspaceSearch={handleWorkspaceSearch}
         onWorkspaceRefresh={handleWorkspaceRefresh}
+        onRagSearch={(query) => ragSearch(query)}
+        onRagOpen={openReferenceTab}
+        activeRagId={
+          activeCenterTab.startsWith(REFERENCE_TAB_PREFIX)
+            ? (referenceStates[activeCenterTab]?.hitId ?? null)
+            : null
+        }
       />
     </div>
   );

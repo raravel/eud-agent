@@ -501,6 +501,92 @@ export async function mentionSearch(
   return toMentionSearchResponse(await invoke("mention_search", { request }));
 }
 
+export type RagTier = "primary" | "lecture" | "general" | "qa";
+
+/** One reference chunk from `rag_search` — the agent's `search_docs` hit with full text. */
+export interface RagSearchHit {
+  id: string;
+  title: string;
+  /** The citation link; null when the chunk has no http(s) source. */
+  url: string | null;
+  /** `[index, total]` when the chunk is one part of a split article. */
+  part: [number, number] | null;
+  tier: RagTier;
+  matchKind: "lexical" | "semantic";
+  score: number;
+  text: string;
+}
+
+export interface RagSearchResponse {
+  query: string;
+  indexSize: number;
+  semanticReady: boolean;
+  hits: RagSearchHit[];
+}
+
+function toRagSearchResponse(value: unknown): RagSearchResponse {
+  if (
+    !isObject(value) ||
+    typeof value.query !== "string" ||
+    typeof value.indexSize !== "number" ||
+    typeof value.semanticReady !== "boolean" ||
+    !Array.isArray(value.hits)
+  ) {
+    throw new Error("invalid reference search response");
+  }
+  return value as unknown as RagSearchResponse;
+}
+
+/** Search the reference (RAG) index exactly as the agent's `search_docs` does. */
+export async function ragSearch(
+  query: string,
+  invoke: InvokeFn = tauriInvoke,
+): Promise<RagSearchResponse> {
+  return toRagSearchResponse(await invoke("rag_search", { query }));
+}
+
+/** The whole article a search hit belongs to, its overlapping parts joined. */
+export interface RagArticle {
+  id: string;
+  title: string;
+  url: string | null;
+  tier: RagTier;
+  parts: number;
+  /** False when the index holds the article's parts ambiguously; `text` is then one chunk. */
+  complete: boolean;
+  text: string;
+}
+
+function toRagArticle(value: unknown): RagArticle {
+  if (
+    !isObject(value) ||
+    typeof value.id !== "string" ||
+    typeof value.title !== "string" ||
+    typeof value.text !== "string" ||
+    typeof value.parts !== "number" ||
+    typeof value.complete !== "boolean"
+  ) {
+    throw new Error("invalid reference document response");
+  }
+  return value as unknown as RagArticle;
+}
+
+/** Open the reference article a `rag_search` hit belongs to. */
+export async function ragArticle(
+  id: string,
+  invoke: InvokeFn = tauriInvoke,
+): Promise<RagArticle> {
+  return toRagArticle(await invoke("rag_article", { id }));
+}
+
+/** Open an http(s) URL in the system browser through the shell plugin. */
+export async function openExternalUrl(
+  url: string,
+  invoke: InvokeFn = tauriInvoke,
+): Promise<void> {
+  await invoke("plugin:shell|open", { path: url });
+}
+
 /**
  * Normalize a `WikiResponse` (`{version, entries}`) into a `WikiMessage` (adds
  * the `type` discriminant). The Rust `wiki_get`/`wiki_save` commands and the

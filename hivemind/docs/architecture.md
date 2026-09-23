@@ -258,6 +258,8 @@ Environment setup after project selection:
 3. verify/download managed RAG/model assets;
 4. select and connect at least one supported AI provider.
 
+The project sidebar's "참고 문서" tab runs `rag_search` (`rag_panel.rs`), the same hybrid lexical-then-semantic search `search_docs` gives the model, and lists each hit's tier, match kind, score, and preview; it is read-only and never gates on model warmup. Selecting a hit opens a center "참고 문서" tab through `rag_article`, which joins every `(part i/n)` chunk sharing the hit's link (dropping the indexer's overlaps; an ambiguous part set shows only the hit's chunk) and renders it as escaped markdown with cafe page chrome removed. The original and body links open through the shell plugin.
+
 The workspace header returns to the project launcher. Settings retains open/create/import/export and exposes euddraft path, managed version, explicit latest-release checking, and checksum-verified update under Compile. Native switch admission protects active work and invalidates idle workers on a root change; the panel clears project-scoped views and ignores late refresh results from the previous root.
 
 One active project remains an intentional safety boundary: runtime services reload the shared `config.project_path`, and project memory/wiki/session ownership is not window-scoped. Removing the single-instance guard alone could redirect an existing operation to another project's files. Independent project windows require isolated project contexts and event/storage routing; this file-format cutover does not enable them.

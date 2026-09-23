@@ -4549,7 +4549,7 @@ fn search_docs_preview(text: &str, query: &str) -> (String, usize, bool) {
     (preview, start, true)
 }
 
-fn format_doc_id(id: u64) -> String {
+pub(crate) fn format_doc_id(id: u64) -> String {
     format!("{id:016x}")
 }
 
@@ -4568,7 +4568,7 @@ fn parse_doc_id(text: &str) -> Result<u64, String> {
         .map_err(|error| format!("invalid documentation id '{text}': {error}"))
 }
 
-fn tier_label(tier_level: u8) -> &'static str {
+pub(crate) fn tier_label(tier_level: u8) -> &'static str {
     match tier_level {
         3 => "primary",
         2 => "lecture",
