@@ -222,6 +222,35 @@ fn extra_assets(path: &Path) -> BTreeMap<String, String> {
         .collect()
 }
 
+#[cfg(windows)]
+#[test]
+fn real_scx_adds_a_sound_through_an_extended_length_project_path() {
+    // Given: a map addressed the way a canonicalized native project root is,
+    // with the `\\?\` extended-length prefix on input and output alike.
+    let plain = temp_map("verbatim-input");
+    fs::copy(fixture(), &plain).unwrap();
+    let verbatim = |path: &Path| PathBuf::from(format!(r"\\?\{}", path.display()));
+    let input = verbatim(&plain);
+    let output_plain = temp_map("verbatim-output");
+    let output = verbatim(&output_plain);
+    let ogg_hash = format!("{:x}", Sha256::digest(OGG));
+    let mpq_path = format!("staredit\\wav\\ea_{}.ogg", &ogg_hash[..16]);
+
+    // When: the sound is added.
+    let report = isom::map_sound_add(&input, &output, &file_hash(&plain), &mpq_path, OGG);
+
+    // Then: the asset, string, and WAV slot land exactly as with a plain path.
+    let report = report.unwrap();
+    assert!(!report.reused);
+    let (string_id, sound_index) = sound_path_and_slot(&output_plain, &mpq_path);
+    assert_eq!(report.sound_string_id, string_id as u64);
+    assert_eq!(report.sound_index, sound_index as u64);
+    assert_eq!(extra_assets(&output_plain).get(&mpq_path), Some(&ogg_hash));
+
+    fs::remove_file(plain).ok();
+    fs::remove_file(output_plain).ok();
+}
+
 #[test]
 fn real_scx_adds_exact_mpq_string_wav_and_reuses_without_duplication() {
     let input = fixture();
