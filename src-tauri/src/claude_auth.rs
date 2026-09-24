@@ -39,7 +39,11 @@ struct ClaudeAuthStatus {
 }
 
 pub fn resolve_claude_cmd(dirs: &DataDirs, config: &Config) -> Result<PathBuf, String> {
-    let user_home = std::env::var_os("USERPROFILE")
+    #[cfg(windows)]
+    const HOME_VAR: &str = "USERPROFILE";
+    #[cfg(not(windows))]
+    const HOME_VAR: &str = "HOME";
+    let user_home = std::env::var_os(HOME_VAR)
         .filter(|value| !value.is_empty())
         .map(PathBuf::from);
     resolve_claude_cmd_with(dirs, config, user_home.as_deref(), || {

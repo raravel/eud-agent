@@ -201,9 +201,18 @@ impl ProviderService {
                         .await
                         .ok();
                 match state {
+                    Some(state) if !state.resolved => (
+                        ProviderAvailability::NeedsInstall,
+                        Some(ProviderStatusCode::ProviderNotInstalled),
+                    ),
+                    // A version below the supported floor is a protocol change; any other
+                    // incompatible state is a probe failure that keeps its own cause.
                     Some(state) if !state.compatible => (
                         ProviderAvailability::Unavailable,
-                        Some(ProviderStatusCode::ProviderProtocolChanged),
+                        Some(match (&state.version, state.detail_code.as_deref()) {
+                            (None, Some(code)) => status_code(code),
+                            _ => ProviderStatusCode::ProviderProtocolChanged,
+                        }),
                     ),
                     Some(state) if state.authenticated => (ProviderAvailability::Ready, None),
                     Some(state) if state.resolved => (
@@ -317,9 +326,18 @@ impl ProviderService {
                 impl crate::bootstrap::ProgressEmitter for Emitter {
                     fn emit(&self, _stage: &str, _pct: u8, _detail: &str) {}
                 }
+                // Outside Windows there is no managed download: a failure means Codex is
+                // not on `PATH`, not a transport fault.
                 crate::bootstrap::ensure_codex(&self.inner.dirs, &Emitter)
                     .await
-                    .map_err(|_| "provider_transport_closed".to_string())?;
+                    .map_err(|_| {
+                        if cfg!(windows) {
+                            "provider_transport_closed"
+                        } else {
+                            "provider_not_installed"
+                        }
+                        .to_string()
+                    })?;
                 crate::codex_client::ensure_codex_profile(&self.inner.dirs)?;
             }
             ProviderId::ClaudeCode => {

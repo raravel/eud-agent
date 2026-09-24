@@ -186,12 +186,67 @@ fn finish_background_ffmpeg_bootstrap(
     emitter.emit("bootstrap", 100, "done");
 }
 
+/// A Finder-launched macOS app inherits launchd's `/usr/bin:/bin:/usr/sbin:/sbin`, so
+/// user-installed CLIs (`~/.local/bin/claude`, `codex`, Homebrew) are invisible to
+/// `PATH` lookup. Adopt the login shell's `PATH` before any thread starts; a shell that
+/// fails or stalls leaves the inherited value untouched.
+#[cfg(target_os = "macos")]
+fn adopt_login_shell_path() {
+    use std::io::Read as _;
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    const MARKER: &str = "__EUD_AGENT_PATH__";
+    let shell = std::env::var_os("SHELL")
+        .filter(|shell| !shell.is_empty())
+        .unwrap_or_else(|| "/bin/zsh".into());
+    let Ok(mut child) = Command::new(shell)
+        .arg("-ilc")
+        .arg(format!("printf '{MARKER}%s{MARKER}' \"$PATH\""))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return;
+    };
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return;
+            }
+        }
+    }
+    let mut output = String::new();
+    let Some(mut stdout) = child.stdout.take() else {
+        return;
+    };
+    if stdout.read_to_string(&mut output).is_err() {
+        return;
+    }
+    let path = output
+        .split(MARKER)
+        .nth(1)
+        .map(str::trim)
+        .filter(|path| !path.is_empty());
+    if let Some(path) = path {
+        std::env::set_var("PATH", path);
+    }
+}
+
 /// Build and run the Tauri application.
 ///
 /// Kept out of `main.rs` so the same setup is reusable by mobile targets and
 /// integration tests (idiomatic Tauri 2 lib/bin split).
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    #[cfg(target_os = "macos")]
+    adopt_login_shell_path();
     tauri::Builder::default()
         .manage(project_launch::PendingProjectLaunch::from_args(
             std::env::args_os().map(|arg| arg.to_string_lossy().into_owned()),
