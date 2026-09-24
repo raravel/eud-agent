@@ -13,6 +13,7 @@ const workspace: WorkspaceListResponse = {
   project: "Example",
   workspaceId: "a".repeat(64),
   files: [
+    { path: "project.eap", size: 8 },
     { path: "plans/req-1.md", size: 16 },
     { path: "specs/combat.md", size: 32 },
     { path: "specs/notes/balance.md", size: 24 },
@@ -49,14 +50,15 @@ describe("WorkspaceFileTree", () => {
     localStorage.clear();
   });
 
-  it("renders the project root open with every other folder collapsed", () => {
+  it("lists the project root's entries at the top level with folders collapsed", () => {
     const { handlers } = renderTree();
 
     expect(
       screen.getByRole("navigation", { name: "워크스페이스 파일" }),
     ).toBeInTheDocument();
-    // Root open: its direct children are visible.
-    expect(screen.getByRole("button", { name: "Example 폴더 접기" })).toBeInTheDocument();
+    // No row for the root folder itself: its entries are the top level.
+    expect(screen.queryByRole("button", { name: /^Example 폴더/ })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /project\.eap/ })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "plans 폴더 펼치기" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "specs 폴더 펼치기" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "worklog 폴더 펼치기" })).toBeInTheDocument();
@@ -72,31 +74,22 @@ describe("WorkspaceFileTree", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "worklog 폴더 펼치기" }));
     fireEvent.click(screen.getByRole("button", { name: /summary\.md/ }));
-    expect(handlers.onSelect).toHaveBeenCalledWith(workspace.files[3]);
+    expect(handlers.onSelect).toHaveBeenCalledWith(workspace.files[4]);
   });
 
-  it("collapses the root and restores persisted expanded folders", () => {
+  it("restores persisted expanded folders", () => {
     const firstView = renderTree();
     fireEvent.click(screen.getByRole("button", { name: "specs 폴더 펼치기" }));
-    fireEvent.click(screen.getByRole("button", { name: "Example 폴더 접기" }));
-    expect(
-      screen.queryByRole("button", { name: "plans 폴더 펼치기" }),
-    ).not.toBeInTheDocument();
     firstView.view.unmount();
 
     renderTree();
     expect(
-      screen.getByRole("button", { name: "Example 폴더 펼치기" }),
-    ).toHaveAttribute("aria-expanded", "false");
-    // Reopening the root shows specs still expanded from the previous mount.
-    fireEvent.click(screen.getByRole("button", { name: "Example 폴더 펼치기" }));
-    expect(
-      screen.getByRole("button", { name: "plans 폴더 펼치기" }),
-    ).toBeInTheDocument();
-    expect(
       screen.getByRole("button", { name: "specs 폴더 접기" }),
     ).toHaveAttribute("aria-expanded", "true");
     expect(screen.getByText("combat.md")).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "plans 폴더 펼치기" }),
+    ).toHaveAttribute("aria-expanded", "false");
   });
 
   it("reveals the active document by expanding its ancestor folders", () => {
