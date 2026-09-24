@@ -46,6 +46,7 @@ import {
   type DocumentTab,
   type DocumentTabId,
 } from "@/components/DocumentTabStrip";
+import { DatWikiView, type DatWikiFocus } from "@/components/DatWikiView";
 import { ReferenceDocument } from "@/components/ReferenceDocument";
 import { WorkspaceDocument } from "@/components/WorkspaceDocument";
 import {
@@ -102,8 +103,7 @@ import {
   setupProjectOpen,
   setupProviderSelect,
   projectExportE3s,
-  wikiGet,
-  wikiSave,
+  datWikiSchema,
   workspaceList,
   workspaceRead,
   workspaceSearch,
@@ -112,7 +112,7 @@ import {
   type AppSettings,
   type EuddraftSettings,
   type HarnessJobView,
-  type LedgerEntry,
+  type DatWikiSchema,
   type MemoryFile,
   type MentionSearchRequest,
   type PanelLog,
@@ -161,7 +161,7 @@ import { createUpdater, type UpdateHandle } from "@/setup/update";
 import { PROVIDER_LABELS } from "@/providers/providerCopy";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { ClipboardList, Library } from "lucide-react";
+import { ClipboardList, Database, Library } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
   discardAttachment,
@@ -190,6 +190,9 @@ const REFERENCE_TAB_PREFIX = "reference:";
  * collide with a document tab.
  */
 const PLAN_TAB_ID = "virtual:plan";
+
+/** Virtual center tab id for the DAT wiki, which is one tab per window. */
+const DAT_WIKI_TAB_ID = "virtual:dat-wiki";
 
 /** Tab label for a workspace document: its file name. */
 function documentTabPresentation(path: string): Pick<DocumentTab, "label" | "icon"> {
@@ -493,6 +496,17 @@ export default function App() {
   const [openDocumentTabs, setOpenDocumentTabs] = useState<string[]>([]);
   // Reference articles are global (not project files), so they survive
   // workspace refreshes and project switches until the user closes them.
+  // The DAT catalog is app-wide reference data, not project state: one fetch
+  // serves both the sidebar's search and the center tab's browser.
+  const [datWiki, setDatWiki] = useState<DatWikiSchema | null>(null);
+  const [datWikiLoading, setDatWikiLoading] = useState(false);
+  const [datWikiError, setDatWikiError] = useState<string | null>(null);
+  const [datWikiTabOpen, setDatWikiTabOpen] = useState(false);
+  const [datWikiFocus, setDatWikiFocus] = useState<DatWikiFocus | null>(null);
+  // Refs, not state, so the loader can guard itself without re-creating its
+  // callback (the sidebar tab and the center tab both call it).
+  const datWikiRef = useRef<DatWikiSchema | null>(null);
+  const datWikiLoadingRef = useRef(false);
   const [referenceTabs, setReferenceTabs] = useState<string[]>([]);
   const [referenceStates, setReferenceStates] = useState<Record<string, ReferenceTabState>>({});
   const [activeCenterTab, setActiveCenterTab] = useState<DocumentTabId>("chat");
@@ -2901,6 +2915,13 @@ export default function App() {
         }
         return;
       }
+      if (id === DAT_WIKI_TAB_ID) {
+        setDatWikiTabOpen(false);
+        if (activeCenterTab === DAT_WIKI_TAB_ID) {
+          setActiveCenterTab(openDocumentTabs[openDocumentTabs.length - 1] ?? "chat");
+        }
+        return;
+      }
       if (id === PLAN_TAB_ID) {
         const sessionId = selectedSessionIdRef.current;
         if (sessionId !== null) {
@@ -3009,6 +3030,44 @@ export default function App() {
     }
   }, [state.phase, workspaceData]);
 
+  // Loaded once and kept: the catalog is the version-matched compatibility
+  // assets, which do not change while the app runs. A failed load leaves the
+  // error visible for the explicit retry rather than refetching on every open.
+  const loadDatWikiSchema = useCallback(async () => {
+    if (datWikiLoadingRef.current) return;
+    if (datWikiRef.current !== null) return;
+    datWikiLoadingRef.current = true;
+    setDatWikiLoading(true);
+    setDatWikiError(null);
+    try {
+      const schema = await datWikiSchema();
+      datWikiRef.current = schema;
+      setDatWiki(schema);
+    } catch (error) {
+      setDatWikiError(
+        `DAT 카탈로그를 읽지 못했습니다. 설정 → 컴파일에서 호환 자산이 설치되어 있는지 확인한 뒤 다시 시도하세요. (${String(error)})`,
+      );
+    } finally {
+      datWikiLoadingRef.current = false;
+      setDatWikiLoading(false);
+    }
+  }, []);
+
+  // Open (or focus) the DAT wiki tab on one object.
+  const openDatWikiTab = useCallback(
+    (table: string, objectId: number) => {
+      setDatWikiTabOpen(true);
+      setActiveCenterTab(DAT_WIKI_TAB_ID);
+      setDatWikiFocus((current) => ({
+        table,
+        objectId,
+        nonce: (current?.nonce ?? 0) + 1,
+      }));
+      void loadDatWikiSchema();
+    },
+    [loadDatWikiSchema],
+  );
+
   const handleProjectPanelTab = useCallback(
     async (tab: ProjectPanelTab) => {
       setProjectSidebarOpen(true);
@@ -3023,38 +3082,14 @@ export default function App() {
         return;
       }
       if (tab === "rag") return;
-      try {
-        const msg = await wikiGet();
-        projectStore.wikiReceived(msg.version, msg.entries);
-        for (const slot of sessionsRef.current.values()) {
-          slot.store.wikiReceived(msg.version, msg.entries);
-        }
-      } catch (error) {
-        store.log("warn", `위키를 불러오지 못했습니다: ${String(error)}`);
-      }
+      await loadDatWikiSchema();
     },
-    [handleWorkspaceRefresh, projectStore, store],
+    [handleWorkspaceRefresh, loadDatWikiSchema, projectStore],
   );
 
   const handleProjectPanelToggle = useCallback(() => {
     setProjectSidebarOpen((open) => !open);
   }, []);
-
-  const handleWikiSave = useCallback(
-    async (entries: Record<string, LedgerEntry>) => {
-      try {
-        const msg = await wikiSave(entries);
-        projectStore.wikiReceived(msg.version, msg.entries);
-        for (const slot of sessionsRef.current.values()) {
-          slot.store.wikiReceived(msg.version, msg.entries);
-        }
-        store.log("ok", "위키를 저장했습니다.");
-      } catch (error) {
-        store.log("error", `위키 저장에 실패했습니다: ${String(error)}`);
-      }
-    },
-    [projectStore, store],
-  );
 
   useProjectIdentityEffect(
     projectState.hasProject ? activeProjectPath : null,
@@ -3186,8 +3221,18 @@ export default function App() {
         label: referenceStates[id]?.article?.title ?? referenceStates[id]?.title ?? "참고 문서",
         icon: Library,
       })),
+      ...(datWikiTabOpen
+        ? [{ id: DAT_WIKI_TAB_ID, label: "DAT 위키", icon: Database }]
+        : []),
     ],
-    [openDocumentTabs, planRevision, planTabVisible, referenceStates, referenceTabs],
+    [
+      datWikiTabOpen,
+      openDocumentTabs,
+      planRevision,
+      planTabVisible,
+      referenceStates,
+      referenceTabs,
+    ],
   );
   const handleCenterTabSelect = useCallback((id: DocumentTabId) => {
     setActiveCenterTab(id);
@@ -3681,6 +3726,27 @@ export default function App() {
           );
         })}
 
+        {datWikiTabOpen && (
+          <div
+            id={`document-panel-${DAT_WIKI_TAB_ID}`}
+            role="tabpanel"
+            aria-labelledby={`document-tab-${DAT_WIKI_TAB_ID}`}
+            className={
+              activeCenterTab === DAT_WIKI_TAB_ID
+                ? "flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden"
+                : "hidden"
+            }
+          >
+            <DatWikiView
+              schema={datWiki}
+              loading={datWikiLoading}
+              error={datWikiError}
+              onRetry={() => void loadDatWikiSchema()}
+              focus={datWikiFocus}
+            />
+          </div>
+        )}
+
         {/* The prompt is shared under every center tab: plan feedback, questions
             about an open report, and ordinary chat all enter here. */}
         <InstructionBox
@@ -3717,7 +3783,9 @@ export default function App() {
         open={projectSidebarOpen}
         project={projectState.project}
         activeTab={projectPanelTab}
-        wiki={projectState.wikiData ?? { version: 1, entries: {} }}
+        datWiki={datWiki}
+        datWikiLoading={datWikiLoading}
+        datWikiError={datWikiError}
         memory={projectState.memory}
         workspace={workspaceData}
         workspaceSelectedPath={
@@ -3731,7 +3799,8 @@ export default function App() {
         workspaceError={workspaceError}
         onTabChange={(tab) => void handleProjectPanelTab(tab)}
         onClose={() => setProjectSidebarOpen(false)}
-        onWikiSave={handleWikiSave}
+        onDatWikiRetry={() => void loadDatWikiSchema()}
+        onDatWikiOpen={openDatWikiTab}
         onMemoryTabSelected={projectStore.memoryTabSelected}
         onMemoryEdited={projectStore.memoryEdited}
         onMemorySave={handleMemorySave}

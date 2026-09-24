@@ -1,21 +1,21 @@
 import { useEffect, useRef, useState } from "react";
 import { Database, FileText, FolderTree, Library, RefreshCw } from "lucide-react";
 
+import { DatWikiNav } from "@/components/DatWikiNav";
 import { MemoryView } from "@/components/MemoryView";
 import { RagView } from "@/components/RagView";
-import { WikiView } from "@/components/WikiView";
 import { WorkspaceFileTree } from "@/components/WorkspaceFileTree";
 import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
 import type {
-  LedgerEntry,
+  DatWikiSchema,
   RagSearchHit,
   RagSearchResponse,
   WorkspaceFileEntry,
   WorkspaceListResponse,
 } from "@/lib/ipc";
 import { cn } from "@/lib/utils";
-import type { MemoryViewState, WikiState } from "@/state/store";
+import type { MemoryViewState } from "@/state/store";
 
 export type ProjectPanelTab = "wiki" | "memory" | "workspace" | "rag";
 
@@ -23,7 +23,10 @@ export interface ProjectSidebarProps {
   open: boolean;
   project: string;
   activeTab: ProjectPanelTab;
-  wiki: WikiState;
+  /** The DAT catalog the wiki tab searches; App owns the one fetch. */
+  datWiki: DatWikiSchema | null;
+  datWikiLoading: boolean;
+  datWikiError: string | null;
   memory: MemoryViewState | null;
   workspace: WorkspaceListResponse | null;
   workspaceSelectedPath: string | null;
@@ -31,7 +34,8 @@ export interface ProjectSidebarProps {
   workspaceError: string | null;
   onTabChange(tab: ProjectPanelTab): void;
   onClose(): void;
-  onWikiSave(entries: Record<string, LedgerEntry>): void;
+  onDatWikiRetry(): void;
+  onDatWikiOpen(table: string, objectId: number): void;
   onMemoryTabSelected(file: MemoryViewState["activeTab"]): void;
   onMemoryEdited(file: MemoryViewState["activeTab"], content: string): void;
   onMemorySave(payload: { file: MemoryViewState["activeTab"]; content: string }): void;
@@ -70,7 +74,9 @@ export function ProjectSidebar({
   open,
   project,
   activeTab,
-  wiki,
+  datWiki,
+  datWikiLoading,
+  datWikiError,
   memory,
   workspace,
   workspaceSelectedPath,
@@ -78,7 +84,8 @@ export function ProjectSidebar({
   workspaceError,
   onTabChange,
   onClose,
-  onWikiSave,
+  onDatWikiRetry,
+  onDatWikiOpen,
   onMemoryTabSelected,
   onMemoryEdited,
   onMemorySave,
@@ -147,7 +154,13 @@ export function ProjectSidebar({
 
       <div className="flex min-h-0 flex-1 overflow-hidden">
         {activeTab === "wiki" && (
-          <WikiView wiki={wiki} embedded onClose={onClose} onSave={onWikiSave} />
+          <DatWikiNav
+            schema={datWiki}
+            loading={datWikiLoading}
+            error={datWikiError}
+            onRetry={onDatWikiRetry}
+            onOpen={onDatWikiOpen}
+          />
         )}
         {activeTab === "memory" && memory && (
           <MemoryView

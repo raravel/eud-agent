@@ -25,6 +25,7 @@ pub mod codex_auth;
 pub mod codex_client;
 pub mod config;
 pub mod context_state;
+pub mod dat_wiki;
 pub mod e3s_nrbf;
 pub mod engine;
 pub mod fs_tools;
@@ -402,6 +403,8 @@ pub fn run() {
             mentions::mention_search,
             rag_panel::rag_search,
             rag_panel::rag_article,
+            dat_wiki::dat_wiki_schema,
+            dat_wiki::dat_wiki_object,
             map_agent::map_agent_open,
             map_agent::map_agent_open_properties,
             map_agent::map_task_apply_undo,

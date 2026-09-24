@@ -2588,7 +2588,10 @@ fn scalar_text(value: &DatScalar) -> String {
     }
 }
 
-fn baseline_value(catalog: &DatCatalog, target: &DatTarget) -> Result<DatScalar, String> {
+pub(crate) fn baseline_value(
+    catalog: &DatCatalog,
+    target: &DatTarget,
+) -> Result<DatScalar, String> {
     match target {
         DatTarget::Dat {
             dat,

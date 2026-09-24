@@ -35,6 +35,9 @@ const EXCERPT_LINE_LIMIT: usize = 400;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DatFieldMeta {
     pub name: String,
+    /// The `.def` `[FORMAT]` field index — the order the DAT Editor lists fields
+    /// in, which the name-keyed map no longer carries.
+    pub index: u32,
     pub size: u8,
     pub var_start: u32,
     pub var_end: u32,
@@ -42,10 +45,27 @@ pub struct DatFieldMeta {
     pub var_index: u32,
     pub init_var: i64,
     pub offset: u32,
+    /// The `.def` `Type=` value: which catalog the number points at. `None` is a
+    /// plain number. See `dat_wiki::DatReference` for the mapping.
+    pub value_type: Option<u32>,
+    /// One label per bit, from the `Name=...:a,b,"c,d"` suffix; empty when the
+    /// field is not a flag field.
+    pub flags: Vec<String>,
     pub baseline: Vec<i64>,
 }
 
 impl DatFieldMeta {
+    /// The inclusive value range this field's width admits, `init_var` included
+    /// (the baseline already carries it).
+    pub fn value_range(&self) -> (i64, i64) {
+        let width = match self.size {
+            1 => u8::MAX as i64,
+            2 => u16::MAX as i64,
+            _ => u32::MAX as i64,
+        };
+        (self.init_var, width + self.init_var)
+    }
+
     fn local_index(&self, object_id: u32) -> Result<u32, String> {
         if object_id < self.var_start || object_id > self.var_end {
             return Err(format!(
@@ -65,9 +85,18 @@ impl DatFieldMeta {
     }
 }
 
+/// The DAT tables the catalog carries, in the order EUD Editor 3's DAT Editor
+/// lists them.
+pub const DAT_TABLES: [&str; 10] = [
+    "units", "weapons", "flingy", "sprites", "images", "upgrades", "techdata", "orders",
+    "portdata", "sfxdata",
+];
+
 #[derive(Debug, Clone)]
 pub struct DatCatalog {
     fields: BTreeMap<String, BTreeMap<String, DatFieldMeta>>,
+    /// `InputEntrycount` per table: how many objects the table holds.
+    entries: BTreeMap<String, u32>,
     button_defaults: Vec<ButtonSetDefault>,
     tbl: Vec<String>,
     status: Vec<(i64, i64)>,
@@ -103,21 +132,18 @@ impl DatCatalog {
     pub fn load(compat_root: &Path) -> Result<Self, String> {
         let offsets = parse_offsets(&read_text(&compat_root.join("Offset.txt"))?)?;
         let mut fields = BTreeMap::new();
-        for table in [
-            "units", "weapons", "flingy", "sprites", "images", "upgrades", "techdata", "orders",
-            "portdata", "sfxdata",
-        ] {
+        let mut entries = BTreeMap::new();
+        for table in DAT_TABLES {
             let definition = compat_root.join("DatFiles").join(format!("{table}.def"));
             let data_path = compat_root.join("DatFiles").join(format!("{table}.dat"));
-            fields.insert(
-                table.to_string(),
-                parse_dat_definition(
-                    table,
-                    &read_text(&definition)?,
-                    &fs::read(&data_path).map_err(stringify_io)?,
-                    &offsets,
-                )?,
-            );
+            let (count, metas) = parse_dat_definition(
+                table,
+                &read_text(&definition)?,
+                &fs::read(&data_path).map_err(stringify_io)?,
+                &offsets,
+            )?;
+            fields.insert(table.to_string(), metas);
+            entries.insert(table.to_string(), count);
         }
         let button_defaults = parse_button_defaults(
             &fs::read(compat_root.join("DatFiles/btnset.dat")).map_err(stringify_io)?,
@@ -132,11 +158,48 @@ impl DatCatalog {
         )?;
         Ok(Self {
             fields,
+            entries,
             button_defaults,
             tbl,
             status,
             requirements,
         })
+    }
+
+    /// Every field of one DAT table, keyed by field name. The DAT wiki orders
+    /// them by `DatFieldMeta::index`, not by this map's alphabetical keys.
+    pub fn table_fields(&self, table: &str) -> Option<&BTreeMap<String, DatFieldMeta>> {
+        self.fields.get(table)
+    }
+
+    /// How many objects a DAT table holds (`InputEntrycount`).
+    pub fn table_entries(&self, table: &str) -> Option<u32> {
+        self.entries.get(table).copied()
+    }
+
+    /// Every decoded `stat_txt.tbl` string, in index order. A DAT label field
+    /// stores a ONE-based string id, so its text is `tbl_strings()[value - 1]`;
+    /// the sparse TBL document addresses the same strings zero-based.
+    pub fn tbl_strings(&self) -> &[String] {
+        &self.tbl
+    }
+
+    /// How many button sets `btnset.dat` defines.
+    pub fn button_set_count(&self) -> usize {
+        self.button_defaults.len()
+    }
+
+    /// How many `statusInfor.dat` objects the catalog carries.
+    pub fn status_count(&self) -> usize {
+        self.status.len()
+    }
+
+    /// Requirement tables and how many objects each covers.
+    pub fn requirement_tables(&self) -> Vec<(&str, usize)> {
+        self.requirements
+            .iter()
+            .map(|(table, objects)| (table.as_str(), objects.len()))
+            .collect()
     }
 
     pub fn field(&self, table: &str, field: &str) -> Result<&DatFieldMeta, String> {
@@ -970,13 +1033,7 @@ fn validate_numeric_override(
     change: &NumericOverride,
 ) -> Result<(), String> {
     meta.local_index(object_id)?;
-    let max = match meta.size {
-        1 => u8::MAX as i64,
-        2 => u16::MAX as i64,
-        4 => u32::MAX as i64,
-        other => return Err(format!("unsupported DAT field width {other}")),
-    } + meta.init_var;
-    let min = meta.init_var;
+    let (min, max) = meta.value_range();
     if change.before < min || change.before > max || change.after < min || change.after > max {
         return Err(format!(
             "{} value must be in {min}..{max} (before={}, after={})",
@@ -1495,7 +1552,7 @@ fn parse_dat_definition(
     source: &str,
     data: &[u8],
     offsets: &BTreeMap<String, u32>,
-) -> Result<BTreeMap<String, DatFieldMeta>, String> {
+) -> Result<(u32, BTreeMap<String, DatFieldMeta>), String> {
     let mut header = BTreeMap::new();
     let mut raw_fields: BTreeMap<u32, BTreeMap<String, String>> = BTreeMap::new();
     let mut section = "";
@@ -1535,15 +1592,18 @@ fn parse_dat_definition(
         .map_err(|_| format!("{table}.def InputEntrycount is invalid"))?;
     let mut fields = BTreeMap::new();
     let mut data_cursor = 0_usize;
-    for properties in raw_fields.into_values() {
-        let name = properties
+    for (index, properties) in raw_fields {
+        // `Name=Special Ability Flags:Building,Addon,...` — the text after the
+        // first colon is one label per bit, which the DAT wiki shows instead of
+        // a raw bitmask.
+        let raw_name = properties
             .get("Name")
-            .ok_or_else(|| format!("{table}.def field is missing Name"))?
-            .split(':')
-            .next()
-            .unwrap()
-            .trim()
-            .to_string();
+            .ok_or_else(|| format!("{table}.def field is missing Name"))?;
+        let (name, flag_suffix) = match raw_name.split_once(':') {
+            Some((name, flags)) => (name.trim().to_string(), flags),
+            None => (raw_name.trim().to_string(), ""),
+        };
+        let flags = parse_flag_labels(flag_suffix);
         let parse = |key: &str, default: u32| -> Result<u32, String> {
             properties
                 .get(key)
@@ -1591,10 +1651,16 @@ fn parse_dat_definition(
             .get(&format!("{table}_{name}"))
             .copied()
             .ok_or_else(|| format!("Offset.txt is missing {table}_{name}"))?;
+        let value_type = properties
+            .get("Type")
+            .map(|value| value.parse::<u32>())
+            .transpose()
+            .map_err(|_| format!("{table}.{name} Type is invalid"))?;
         fields.insert(
             name.clone(),
             DatFieldMeta {
                 name,
+                index,
                 size,
                 var_start,
                 var_end,
@@ -1602,11 +1668,37 @@ fn parse_dat_definition(
                 var_index,
                 init_var,
                 offset,
+                value_type,
+                flags,
                 baseline,
             },
         );
     }
-    Ok(fields)
+    Ok((entries, fields))
+}
+
+/// Split a `.def` flag-label list into one label per bit. Labels are
+/// comma-separated, a label holding a comma is `"quoted"`, and `&&` is the
+/// Editor form's escape for a literal `&`.
+fn parse_flag_labels(suffix: &str) -> Vec<String> {
+    if suffix.trim().is_empty() {
+        return Vec::new();
+    }
+    let mut labels = Vec::new();
+    let mut current = String::new();
+    let mut quoted = false;
+    for character in suffix.chars() {
+        match character {
+            '"' => quoted = !quoted,
+            ',' if !quoted => labels.push(std::mem::take(&mut current)),
+            _ => current.push(character),
+        }
+    }
+    labels.push(current);
+    labels
+        .into_iter()
+        .map(|label| label.trim().replace("&&", "&"))
+        .collect()
 }
 
 fn parse_button_defaults(bytes: &[u8]) -> Result<Vec<ButtonSetDefault>, String> {

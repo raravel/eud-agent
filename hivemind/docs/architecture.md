@@ -269,6 +269,25 @@ Environment setup after project selection:
 
 The project sidebar's "참고 문서" tab runs `rag_search` (`rag_panel.rs`), the same hybrid lexical-then-semantic search `search_docs` gives the model, and lists each hit's tier, match kind, score, and preview; it is read-only and never gates on model warmup. Selecting a hit opens a center "참고 문서" tab through `rag_article`, which joins every `(part i/n)` chunk sharing the hit's link (dropping the indexer's overlaps; an ambiguous part set shows only the hit's chunk) and renders it as escaped markdown with cafe page chrome removed. The original and body links open through the shell plugin.
 
+The sidebar's "DAT 위키" tab is the way into the WHOLE version-matched DAT
+catalog, read-only. `dat_wiki.rs` serves it from `DatCatalog`: `dat_wiki_schema`
+returns every table (the ten DAT tables, wireframe/statusinfor/ButtonSet,
+`stat_txt`, the five requirement tables and the button sets) with its object
+names and its field metadata — `.def` order, width, value range, runtime
+offset, which catalog the number indexes, and one label per flag bit — and
+`dat_wiki_object` returns one object's stock values plus whatever `dat/*.json`
+overrides. The sidebar tab searches names across every table and opens the
+center "DAT 위키" tab on the hit, where objects sit on the left and the selected
+object's properties on the right, laid out the way EUD Editor 3's DAT Editor
+lays them out. Nothing in the view writes: an override is created only by
+`dat_patch` through the ordinary journal/review path, so no row can go around
+the `before == stock` rule the build enforces. Object names come from
+`chk::unit_name` (units), each table's own one-based `Label` string id
+(weapons/upgrades/techdata/orders) and `arr\images.tbl` out of the installed
+StarCraft (images, and sprites/flingy through it); without a resolvable install
+those three tables carry a notice and their objects keep bare ids. Requirement
+tables reuse the DAT table names, so the wiki gives them `requirements:` ids.
+
 The workspace header returns to the project launcher. Settings retains open/create/import/export and exposes euddraft path, managed version, explicit latest-release checking, and checksum-verified update under Compile. Compile also shows the resolved StarCraft data folder (the same `resolve_starcraft_path` every Map renderer, `map_minimap` included, uses) and picks it through `setup_pick_starcraft_path`. Native switch admission protects active work and invalidates idle workers on a root change; the panel clears project-scoped views and ignores late refresh results from the previous root.
 
 One active project remains an intentional safety boundary: runtime services reload the shared `config.project_path`, and project memory/wiki/session ownership is not window-scoped. Removing the single-instance guard alone could redirect an existing operation to another project's files. Independent project windows require isolated project contexts and event/storage routing; this file-format cutover does not enable them.

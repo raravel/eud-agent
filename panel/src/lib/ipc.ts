@@ -579,6 +579,104 @@ export async function ragArticle(
   return toRagArticle(await invoke("rag_article", { id }));
 }
 
+/**
+ * The DAT wiki: the whole version-matched catalog, read-only.
+ *
+ * `reference` says what a number points at, so the panel can show the object's
+ * name beside the id. `text` is a ONE-based `stat_txt` string id — its text is
+ * the `tbl` table's object `value - 1`, a convention the Rust side documents
+ * and the panel must not re-derive.
+ */
+export type DatReference =
+  | { table: string }
+  | "text"
+  | "icon"
+  | "iscript";
+
+export type DatWikiKind = "dat" | "xdat" | "tbl" | "requirements" | "buttons";
+
+export interface DatWikiField {
+  name: string;
+  /** Inclusive object-id range; the field does not exist outside it. */
+  varStart: number;
+  varEnd: number;
+  size: number;
+  min: number;
+  max: number;
+  /** The runtime address the generator patches. */
+  offset: number;
+  reference?: DatReference;
+  /** One label per bit; absent when the field is not a flag field. */
+  flags?: string[];
+}
+
+export interface DatWikiObject {
+  id: number;
+  name?: string;
+}
+
+export interface DatWikiTable {
+  id: string;
+  kind: DatWikiKind;
+  label: string;
+  objects: DatWikiObject[];
+  fields: DatWikiField[];
+  /** Why some objects show no name, when that is the case. */
+  notice?: string;
+}
+
+export interface DatWikiSchema {
+  tables: DatWikiTable[];
+}
+
+export interface DatWikiValue {
+  field: string;
+  stock: number | string;
+  /** Present only when `dat/*.json` overrides this field. */
+  current?: number | string;
+}
+
+export interface DatWikiObjectValues {
+  table: string;
+  objectId: number;
+  values: DatWikiValue[];
+}
+
+function toDatWikiSchema(value: unknown): DatWikiSchema {
+  if (!isObject(value) || !Array.isArray(value.tables)) {
+    throw new Error("invalid DAT wiki schema response");
+  }
+  return value as unknown as DatWikiSchema;
+}
+
+function toDatWikiObjectValues(value: unknown): DatWikiObjectValues {
+  if (
+    !isObject(value) ||
+    typeof value.table !== "string" ||
+    typeof value.objectId !== "number" ||
+    !Array.isArray(value.values)
+  ) {
+    throw new Error("invalid DAT wiki object response");
+  }
+  return value as unknown as DatWikiObjectValues;
+}
+
+/** Every table, object name and field of the version-matched DAT catalog. */
+export async function datWikiSchema(
+  invoke: InvokeFn = tauriInvoke,
+): Promise<DatWikiSchema> {
+  return toDatWikiSchema(await invoke("dat_wiki_schema", {}));
+}
+
+/** One object's stock values plus whatever `dat/*.json` overrides. */
+export async function datWikiObject(
+  table: string,
+  objectId: number,
+  invoke: InvokeFn = tauriInvoke,
+): Promise<DatWikiObjectValues> {
+  return toDatWikiObjectValues(await invoke("dat_wiki_object", { table, objectId }));
+}
+
 /** Open an http(s) URL in the system browser through the shell plugin. */
 export async function openExternalUrl(
   url: string,
