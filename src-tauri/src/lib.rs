@@ -527,6 +527,7 @@ pub fn run() {
             ipc::memory_save,
             ipc::workspace_list,
             ipc::workspace_read,
+            ipc::workspace_read_bytes,
             ipc::workspace_search,
             ipc::wiki_get,
             ipc::wiki_save,

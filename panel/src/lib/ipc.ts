@@ -780,6 +780,23 @@ export async function workspaceRead(
   return value as unknown as WorkspaceReadResponse;
 }
 
+/** Raw bytes of one confined project file, for attaching it to a turn. */
+export async function workspaceReadBytes(
+  workspaceId: string,
+  path: string,
+  invoke: InvokeFn = tauriInvoke,
+): Promise<Uint8Array> {
+  const value = await invoke("workspace_read_bytes", { workspaceId, path });
+  if (value instanceof ArrayBuffer) return new Uint8Array(value);
+  if (ArrayBuffer.isView(value)) {
+    return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+  }
+  if (Array.isArray(value) && value.every((byte) => typeof byte === "number")) {
+    return Uint8Array.from(value);
+  }
+  throw new Error("invalid workspace bytes response");
+}
+
 /** Search confined UTF-8 workspace files by path and content. */
 export async function workspaceSearch(
   workspaceId: string,

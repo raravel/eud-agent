@@ -1,7 +1,8 @@
 /**
  * Main chat/plan-feedback input:
  *   - generic ordered mentions plus text and session-owned attachments;
- *   - file picker, HTML5 drag-and-drop, and pasted clipboard images;
+ *   - file picker, HTML5 drag-and-drop, pasted clipboard images, and project
+ *     files picked from `@` search;
  *   - removable attachment and resource-mention chips;
  *   - Send is gated by the store's `canSend`; attachment-only and mention-only messages are valid.
  *
@@ -51,9 +52,11 @@ import {
   attachmentErrorMessage,
   formatAttachmentSize,
   MAX_ATTACHMENTS_PER_TURN,
+  MAX_AUDIO_BYTES,
   MAX_AUDIO_BYTES_PER_TURN,
   MAX_TEXT_BYTES,
 } from "@/lib/attachments";
+import type { ProjectFileSuggestion } from "@/lib/projectFiles";
 
 
 
@@ -84,6 +87,10 @@ export interface InstructionBoxProps {
   draft?: ChatPayload | null;
   /** Backend-owned bounded resource search used by the generic composer. */
   onMentionSearch?(request: MentionSearchRequest): Promise<MentionSearchResponse>;
+  /** Project-root files offered by `@` search next to the map resources. */
+  onProjectFileSearch?(query: string): Promise<ProjectFileSuggestion[]>;
+  /** Read one offered project file so it can be staged like a picked file. */
+  onReadProjectFile?(file: ProjectFileSuggestion): Promise<File>;
   /** Current native project identity; a change invalidates unsent mention snapshots. */
   projectIdentity?: string;
   /** Selected session/draft identity; mention drafts never cross this boundary. */
@@ -115,6 +122,8 @@ export function InstructionBox({
   onAutonomousStop,
   draft,
   onMentionSearch,
+  onProjectFileSearch,
+  onReadProjectFile,
   projectIdentity = state.project,
   scopeIdentity = "default",
   actionBusy = false,
@@ -226,6 +235,21 @@ export function InstructionBox({
       stagingRef.current = false;
       setStaging(false);
       if (fileInput.current !== null) fileInput.current.value = "";
+    }
+  }
+
+  async function attachProjectFile(file: ProjectFileSuggestion) {
+    if (onReadProjectFile === undefined || attachmentInputDisabled) return;
+    if (file.size > MAX_AUDIO_BYTES) {
+      setAttachmentError(`첨부할 수 없는 큰 파일입니다: ${file.path}`);
+      return;
+    }
+    try {
+      await stageFiles([await onReadProjectFile(file)]);
+    } catch (error) {
+      setAttachmentError(
+        `${file.path} 파일을 첨부하지 못했습니다: ${attachmentErrorMessage(error)}`,
+      );
     }
   }
 
@@ -387,6 +411,12 @@ export function InstructionBox({
           mentions={mentions}
           onMentionsChange={setMentions}
           search={onMentionSearch}
+          fileSearch={
+            onReadProjectFile !== undefined && onStageAttachment !== undefined
+              ? onProjectFileSearch
+              : undefined
+          }
+          onAttachFile={(file) => void attachProjectFile(file)}
           projectIdentity={projectIdentity}
           scopeIdentity={scopeIdentity}
           disabled={ragLoading || actionBusy}

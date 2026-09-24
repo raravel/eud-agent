@@ -1,5 +1,6 @@
 import { History, RotateCcw, TriangleAlert } from "lucide-react";
 
+import type { ProjectFileSuggestion } from "@/lib/projectFiles";
 import { AskCard } from "@/components/AskCard";
 import { ConversationLog } from "@/components/ConversationLog";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
@@ -66,6 +67,8 @@ export interface MapAgentPanelProps {
   onSend(text: string, attachments: ChatAttachment[]): void;
   onCancel(): void;
   onStageAttachment?(file: File): Promise<ChatAttachment>;
+  onProjectFileSearch?(query: string): Promise<ProjectFileSuggestion[]>;
+  onReadProjectFile?(file: ProjectFileSuggestion): Promise<File>;
   onDiscardAttachment?(id: string): Promise<void>;
   onModelSettingsChange?(
     model: string,
@@ -109,6 +112,8 @@ export function MapAgentPanel({
   onSend,
   onCancel,
   onStageAttachment,
+  onProjectFileSearch,
+  onReadProjectFile,
   onDiscardAttachment,
   onModelSettingsChange,
   onModelSettingsReload,
@@ -239,6 +244,8 @@ export function MapAgentPanel({
         onSend={onSend}
         onCancel={onCancel}
         onStageAttachment={onStageAttachment}
+        onProjectFileSearch={onProjectFileSearch}
+        onReadProjectFile={onReadProjectFile}
         onDiscardAttachment={onDiscardAttachment}
         onModelSettingsChange={onModelSettingsChange}
         onModelSettingsReload={onModelSettingsReload}

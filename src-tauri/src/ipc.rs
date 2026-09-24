@@ -944,6 +944,29 @@ pub async fn workspace_read(
     .map_err(|error| error.to_string())?
 }
 
+/// Raw bytes of one confined project file, so the composer can attach it
+/// through the ordinary attachment staging path.
+#[tauri::command]
+pub async fn workspace_read_bytes(
+    state: tauri::State<'_, AppManaged>,
+    workspace_id: String,
+    path: String,
+) -> Result<tauri::ipc::Response, String> {
+    let manager = crate::workspace::WorkspaceManager::new(state.dirs().clone());
+    tauri::async_runtime::spawn_blocking(move || {
+        manager
+            .read_file_bytes(
+                &workspace_id,
+                &path,
+                crate::attachment::MAX_AUDIO_BYTES as u64,
+            )
+            .map(tauri::ipc::Response::new)
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
 /// Search project files by path, and viewable text files by content.
 #[tauri::command]
 pub async fn workspace_search(

@@ -1574,6 +1574,39 @@ impl WorkspaceManager {
         })
     }
 
+    /// Raw bytes of one confined regular project file, for attaching it to a
+    /// chat turn. The canonical path must stay under the canonical root, so a
+    /// symlinked parent cannot reach outside the project.
+    pub fn read_file_bytes(
+        &self,
+        workspace_id: &str,
+        relative: &str,
+        max_bytes: u64,
+    ) -> io::Result<Vec<u8>> {
+        let (root, _) = self.verified_roots(workspace_id)?;
+        let path = confined_project_path(&root, relative)?;
+        let metadata = fs::symlink_metadata(&path)?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "only regular project files can be attached",
+            ));
+        }
+        if !fs::canonicalize(&path)?.starts_with(&root) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "project path escapes its root",
+            ));
+        }
+        if metadata.len() > max_bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("project file exceeds {max_bytes} bytes"),
+            ));
+        }
+        read_bounded_regular_file(&path, max_bytes)
+    }
+
     /// Restore or remove one canonical document during changeset rejection.
     pub fn restore_file(
         &self,
@@ -3104,6 +3137,22 @@ mod tests {
             );
         }
         assert!(manager.read_file(&workspace.id, "src").is_err());
+
+        assert_eq!(
+            manager
+                .read_file_bytes(&workspace.id, "build/output.scx", 16)
+                .unwrap(),
+            vec![0xff, 0x00]
+        );
+        assert!(manager
+            .read_file_bytes(&workspace.id, "maps/huge.scx", MAX_FILE_BYTES)
+            .is_err());
+        for refused in ["../outside.txt", "src", "src\\main.eps", ""] {
+            assert!(
+                manager.read_file_bytes(&workspace.id, refused, 16).is_err(),
+                "{refused} must be refused"
+            );
+        }
         fs::remove_dir_all(base).ok();
     }
 
