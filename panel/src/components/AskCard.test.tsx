@@ -130,4 +130,32 @@ describe("AskCard", () => {
       mode: { answers: ["설정을 직접 지정"] },
     });
   });
+
+  it("collapses to its header and keeps the draft answer when expanded again", () => {
+    const onSubmit = vi.fn();
+    render(
+      <AskCard
+        requestId="ask-3"
+        questions={[questions[0]]}
+        submitting={false}
+        onSubmit={onSubmit}
+      />,
+    );
+
+    fireEvent.change(screen.getByLabelText("기타 입력"), {
+      target: { value: "직접 답변" },
+    });
+    const collapse = screen.getByRole("button", { name: "질문 접기" });
+    expect(collapse).toHaveAttribute("aria-expanded", "true");
+    fireEvent.click(collapse);
+
+    expect(screen.queryByLabelText("기타 입력")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "답변 전달" })).not.toBeInTheDocument();
+    expect(screen.getByText("어떤 방식을 사용할까요?")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "질문 펼치기" }));
+    expect(screen.getByLabelText("기타 입력")).toHaveValue("직접 답변");
+    fireEvent.click(screen.getByRole("button", { name: "답변 전달" }));
+    expect(onSubmit).toHaveBeenCalledWith({ mode: { answers: ["직접 답변"] } });
+  });
 });
