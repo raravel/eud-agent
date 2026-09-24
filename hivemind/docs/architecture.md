@@ -151,6 +151,14 @@ while still excluding concurrent source/Map/sound operations for the native proc
 Build no-progress uses bounded stable revision/diagnostic history. Search and Python dependency
 preparation use input/result identity rather than request-lifetime attempt caps.
 
+An EPS chat turn registers its write request before the turn starts and runs with write access from
+its first call, then settles itself (commit, journal, release) without a second foreground turn. The
+registration is not exclusive — `ProjectWriteCoordinator` grants it at once and serializes only the
+individual project transactions — so a read-first turn bought no concurrency and cost a refused
+call, a restarted turn, and a re-read of every target. The automatic first-mutation transition
+remains for turns that still start read-only (plan feedback, autonomous continuation). A plan
+proposed by a turn that changed nothing returns the registration until approval.
+
 Autonomous lifecycle is durable session state, separate from live read/write activity. ASK, review,
 pause, restart pause, safety stop, cancellation, failure, and completion remain explicit. Startup
 never resumes. Explicit resume validates project identity/revision, pending review, and the exact

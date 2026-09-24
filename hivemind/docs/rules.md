@@ -170,7 +170,7 @@
 ## Sessions and concurrency
 
 - Conversation events are session-owned.
-- Read turns may overlap; writes serialize through `ProjectWriteCoordinator`.
+- Turns may overlap; individual project writes serialize through `ProjectWriteCoordinator`. An EPS chat turn runs with write access from its first call; never reintroduce a refused-mutation read→write restart for it.
 - Loading or renaming a session never steals another session's execution lane.
 - ASK/plan/changeset state survives the documented reconnect/session restore boundary.
 - Tauri listener readiness and native project availability are independent states.
