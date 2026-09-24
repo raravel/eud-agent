@@ -19,6 +19,7 @@ import type {
   TurnState,
 } from "@/state/store";
 import { Button } from "@/components/ui/button";
+import { Switch } from "@/components/ui/switch";
 import type {
   AskAnswer,
   AskQuestion,
@@ -38,17 +39,25 @@ import {
   type SessionModelSettings,
 } from "@/lib/ipc";
 import { MapAgentPanel, type MapConversationEntry } from "./MapAgentPanel";
+import type { MapPromptDraft } from "./MapPromptInput";
 import { MapCanvas } from "./MapCanvas";
 import { MapMinimap } from "./MapMinimap";
 import { MapPalette } from "./MapPalette";
 import { MapToolbar } from "./MapToolbar";
 import { MapWorkbench } from "./MapWorkbench";
+import { MapPropertiesDialog } from "./MapPropertiesDialog";
 import { MapSessionHistoryDialog } from "./MapSessionHistoryDialog";
 import { SelectionToolbar } from "./SelectionToolbar";
 import { ImagePlacementControls } from "./ImagePlacementControls";
 import { StampPlacementControls } from "./StampPlacementControls";
 import { CandidateControls } from "./CandidateControls";
 import { buildSelectionMask, cellsToRows, rowsToCells } from "./selectionMask";
+import {
+  runAdoptionEntries,
+  runAlreadyAdopted,
+  runHasTerminalEvent,
+  stampRunRequestId,
+} from "./mapRunAdoption";
 import {
   initialImagePlacement,
   sameImagePlacement,
@@ -71,12 +80,15 @@ import {
   mapBootstrap,
   mapSessionCreate,
   mapSessionDelete,
+  mapConversationReset,
+  mapConversationRewind,
   mapSessionList,
   mapSessionLoad,
   mapSessionRename,
   mapCancel,
   mapChat,
   mapDiffDetails,
+  mapRunSnapshot,
   mapImageConfirm,
   mapImageCancel,
   mapImagePreview,
@@ -84,6 +96,7 @@ import {
   mapStampPreview,
   mapObjects,
   mapSourceState,
+  saveMapProperties,
   saveSelection,
   type CandidateStateView,
   type MapBootstrapResponse,
@@ -95,6 +108,10 @@ import {
   type MapMentionSnapshot,
   type MapLocation,
   type MapObjectItem,
+  type MapPropertiesRequest,
+  type MapRunEvent,
+  type MapRunStartedPayload,
+  type MapRunTranscript,
   type MapView,
   type MapStampSourceRef,
   type MapSourceProbe,
@@ -129,6 +146,8 @@ interface AskState {
   requestId: string;
   questions: AskQuestion[];
   submitting: boolean;
+  waitSeconds?: number;
+  receivedAt?: number;
 }
 
 interface DirectImagePlacement {
@@ -203,6 +222,8 @@ interface PersistedSurfaceState {
   view?: MapView;
   layers?: MapLayer[];
   interactionMode?: "select" | "inspect" | "pan";
+  /** Saved selections keep their translucent fill (default) or show outlines only. */
+  selectionFill?: boolean;
 }
 
 function loadSurfaceState(): PersistedSurfaceState {
@@ -241,7 +262,7 @@ function isMapLogKind(kind: string): kind is LogKind {
   return Object.prototype.hasOwnProperty.call(MAP_LOG_KINDS, kind);
 }
 
-function conversationFromSession(
+export function conversationFromSession(
   bootstrap: MapBootstrapResponse,
 ): MapConversationEntry[] {
   const log = bootstrap.session.panelLog?.log ?? [];
@@ -249,6 +270,7 @@ function conversationFromSession(
     if (!isMapLogKind(entry.kind)) return [];
     const persisted = entry as typeof entry & {
       mapMentions?: MapMentionSnapshot[];
+      requestId?: string;
     };
     const tools: AgentTool[] | undefined = entry.tools?.map((tool) => ({
       id: tool.id,
@@ -268,6 +290,9 @@ function conversationFromSession(
         kind: entry.kind,
         text: entry.text,
         mapMentions: persisted.mapMentions,
+        ...(typeof persisted.requestId === "string"
+          ? { requestId: persisted.requestId }
+          : {}),
         attachments: entry.attachments,
         ...(tools && tools.length > 0 ? { tools } : {}),
       },
@@ -275,16 +300,17 @@ function conversationFromSession(
   });
 }
 
-function panelLogFromConversation(
+export function panelLogFromConversation(
   conversation: MapConversationEntry[],
   logSeq: number,
 ) {
   return {
     schemaVersion: 2,
     logSeq,
-    log: conversation.map(({ mapMentions, ...entry }) => ({
+    log: conversation.map(({ mapMentions, requestId, ...entry }) => ({
       ...entry,
       mapMentions,
+      ...(requestId === undefined ? {} : { requestId }),
     })),
   };
 }
@@ -375,36 +401,40 @@ async function loadAllObjects(
   return pages.flat();
 }
 
+/**
+ * Re-evaluate tray chips against the candidate. A chip whose saved selection no
+ * longer exists has nothing left to point at, so it is dropped instead of kept
+ * as a stale chip the user would have to remove by hand; a chip whose target
+ * still exists but changed stays as a stale chip.
+ */
 export function staleMentions(chips: MentionChip[], candidate: CandidateStateView): MentionChip[] {
-  return chips.map((chip) => {
+  return chips.flatMap((chip) => {
     let stale = false;
     const mention = chip.mention;
     if (mention.kind === "region") {
       const selection = candidate.selections.find(
         (item) => item.id === mention.selectionId,
       );
+      if (!selection) return [];
       stale =
-        !selection ||
         selection.snapshotHash !== mention.snapshotHash ||
         selection.sourceRevision !== candidate.revisionKey;
       return {
         ...chip,
         stale,
-        mention:
-          !stale && selection
-            ? { ...mention, sourceRevision: selection.sourceRevision }
-            : mention,
+        mention: stale
+          ? mention
+          : { ...mention, sourceRevision: selection.sourceRevision },
       };
     } else if (mention.kind === "stamp") {
       const selection = candidate.selections.find(
         (item) => item.id === mention.selectionId,
       );
+      if (!selection) return [];
       return {
         ...chip,
-        stale: !selection,
-        mention: selection
-          ? { ...mention, snapshotHash: selection.snapshotHash }
-          : mention,
+        stale: false,
+        mention: { ...mention, snapshotHash: selection.snapshotHash },
       };
     } else if (mention.kind === "object") {
       stale =
@@ -423,15 +453,80 @@ export function staleImportedMentions(
   chips: MentionChip[],
   imported: ImportedStampView[],
 ): MentionChip[] {
-  return chips.map((chip) => {
+  return chips.flatMap((chip) => {
     const mention = chip.mention;
     if (mention.kind !== "importedStamp") return chip;
-    const stamp = imported.find(
-      (entry) =>
-        entry.id === mention.importId &&
-        entry.snapshotHash === mention.snapshotHash,
-    );
-    return { ...chip, stale: !stamp || !stamp.available || !stamp.compatible };
+    const stamp = imported.find((entry) => entry.id === mention.importId);
+    if (!stamp) return [];
+    return {
+      ...chip,
+      stale:
+        stamp.snapshotHash !== mention.snapshotHash ||
+        !stamp.available ||
+        !stamp.compatible,
+    };
+  });
+}
+
+/**
+ * Rebuild tray chips from the mention snapshots a persisted "you" row kept, so
+ * an edited message returns with the mentions it was sent with. Labels follow
+ * the live chip builders when the referenced item still exists and fall back
+ * to the snapshot's own identity; `staleMentions`/`staleImportedMentions`
+ * decide afterwards whether each chip still matches the candidate.
+ */
+export function restoreMentionChips(
+  snapshots: readonly MapMentionSnapshot[],
+  context: {
+    selections: readonly SavedSelection[];
+    locations: readonly MapLocation[];
+    imported: readonly ImportedStampView[];
+  },
+): MentionChip[] {
+  return snapshots.map((mention) => {
+    let label: string;
+    switch (mention.kind) {
+      case "region": {
+        const selection = context.selections.find(
+          (item) => item.id === mention.selectionId,
+        );
+        label = selection
+          ? `${selection.role}:${selection.label}`
+          : `region:${mention.selectionId.slice(0, 8)}`;
+        break;
+      }
+      case "stamp": {
+        const selection = context.selections.find(
+          (item) => item.id === mention.selectionId,
+        );
+        label = `stamp:${selection?.label ?? mention.selectionId.slice(0, 8)}`;
+        break;
+      }
+      case "importedStamp": {
+        const stamp = context.imported.find((item) => item.id === mention.importId);
+        label = `imported:${stamp?.label ?? mention.importId.slice(0, 8)}`;
+        break;
+      }
+      case "object":
+        label = `instance:${mention.objectRef.kind} #${mention.objectRef.ordinal}`;
+        break;
+      case "palette":
+        label =
+          mention.entry.kind === "newLocation"
+            ? "type:새 로케이션"
+            : `type:${mention.entry.kind} #${mention.entry.entryId}`;
+        break;
+      case "location": {
+        const location = context.locations.find(
+          (item) => item.id === mention.locationId,
+        );
+        label = location
+          ? `location:#${location.id} ${location.name}`
+          : `location:#${mention.locationId}`;
+        break;
+      }
+    }
+    return { id: crypto.randomUUID(), label, mention: { ...mention } };
   });
 }
 
@@ -523,7 +618,11 @@ export function reduceMapTurnEvent(
   kind: string,
   detail: string,
   data: AgentEventData = {},
-): { turn: TurnState; cursor: MapTurnCursor } {
+): {
+  turn: TurnState;
+  cursor: MapTurnCursor;
+  unpairedToolStart?: { name: string; args?: string };
+} {
   const nextCursor = { ...cursor };
   if (kind === "reasoning") {
     return {
@@ -560,9 +659,27 @@ export function reduceMapTurnEvent(
     };
   }
   if (kind === "tool_call") {
+    const callId =
+      data.callId !== undefined && data.callId.trim().length > 0
+        ? data.callId
+        : undefined;
+    if (callId === undefined) {
+      return {
+        turn,
+        cursor: nextCursor,
+        unpairedToolStart: {
+          name: detail || "tool",
+          ...(data.args ? { args: data.args } : {}),
+        },
+      };
+    }
+    if (turn.tools.some((tool) => tool.callId === callId)) {
+      return { turn, cursor: nextCursor };
+    }
     nextCursor.toolSequence += 1;
     const tool: AgentTool = {
       id: `map-tool-${nextCursor.toolSequence}`,
+      callId,
       name: detail || "tool",
       state: "running",
       ...(data.args ? { args: data.args } : {}),
@@ -590,18 +707,61 @@ export function reduceMapTurnEvent(
   }
   if (kind === "tool_result") {
     const failed = data.status !== undefined && data.status !== "completed";
+    const callId =
+      data.callId !== undefined && data.callId.trim().length > 0
+        ? data.callId
+        : undefined;
     const complete = (tool: AgentTool): AgentTool => ({
       ...tool,
       state: failed ? "failed" : "done",
       ...(data.result ? { detail: data.result } : {}),
     });
-    const tools = turn.tools.slice();
-    for (let index = tools.length - 1; index >= 0; index -= 1) {
-      if (tools[index].state === "running") {
-        tools[index] = complete(tools[index]);
-        break;
-      }
+    const matchingIndex =
+      callId === undefined
+        ? -1
+        : turn.tools.findIndex(
+            (tool) =>
+              tool.callId === callId && tool.state === "running",
+          );
+    if (
+      matchingIndex < 0 &&
+      callId !== undefined &&
+      turn.tools.some((tool) => tool.callId === callId)
+    ) {
+      return { turn, cursor: nextCursor };
     }
+    if (matchingIndex < 0) {
+      nextCursor.toolSequence += 1;
+      const terminal: AgentTool = {
+        id: `map-tool-${nextCursor.toolSequence}`,
+        ...(callId !== undefined ? { callId } : {}),
+        name: detail || "tool",
+        state: failed ? "failed" : "done",
+        ...(data.result ? { detail: data.result } : {}),
+      };
+      const blocks = turn.blocks.slice();
+      const last = blocks[blocks.length - 1];
+      if (last !== undefined && last.type === "tools") {
+        blocks[blocks.length - 1] = {
+          ...last,
+          tools: [...last.tools, terminal],
+        };
+      } else {
+        nextCursor.blockSequence += 1;
+        blocks.push({
+          id: nextCursor.blockSequence,
+          type: "tools",
+          tools: [terminal],
+        });
+      }
+      return {
+        turn: { ...turn, tools: [...turn.tools, terminal], blocks },
+        cursor: nextCursor,
+      };
+    }
+    const tools = turn.tools.slice();
+    const matchingTool = tools[matchingIndex];
+    tools[matchingIndex] = complete(matchingTool);
     const blocks = turn.blocks.slice();
     let completed = false;
     for (
@@ -616,7 +776,7 @@ export function reduceMapTurnEvent(
         toolIndex >= 0;
         toolIndex -= 1
       ) {
-        if (block.tools[toolIndex].state !== "running") continue;
+        if (block.tools[toolIndex].id !== matchingTool.id) continue;
         const blockTools = block.tools.slice();
         blockTools[toolIndex] = complete(blockTools[toolIndex]);
         blocks[blockIndex] = { ...block, tools: blockTools };
@@ -681,7 +841,6 @@ export default function MapAgentApp() {
   const persisted = useMemo(loadSurfaceState, []);
   const [bootstrap, setBootstrap] = useState<MapBootstrapResponse | null>(null);
   const [candidate, setCandidate] = useState<CandidateStateView | null>(null);
-  const [changedSource, setChangedSource] = useState<MapSourceProbe | null>(null);
   const [draftObjects, setDraftObjects] = useState<MapObjectItem[]>([]);
   const [objects, setObjects] = useState<MapObjectItem[]>([]);
   const [diffDetails, setDiffDetails] = useState<MapDiffDetails>({
@@ -690,9 +849,17 @@ export default function MapAgentApp() {
   });
   const [importedEntries, setImportedEntries] = useState<ImportedStampView[]>([]);
   const [error, setError] = useState("");
+  const [conversationResumeError, setConversationResumeError] = useState<string | null>(null);
+  const [conversationResetBusy, setConversationResetBusy] = useState(false);
+  // Message edit flow: the core must finish the rewind before the prompt
+  // unlocks. `editDraft` is applied by MapPromptInput once per object.
+  const [editDraft, setEditDraft] = useState<MapPromptDraft | null>(null);
+  const [messageActionBusy, setMessageActionBusy] = useState(false);
+  const messageActionBusyRef = useRef(false);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
   const [sessionHistoryOpen, setSessionHistoryOpen] = useState(false);
+  const [propertiesOpen, setPropertiesOpen] = useState(false);
   const [sessionHistoryLoading, setSessionHistoryLoading] = useState(false);
   const [sessionActionBusy, setSessionActionBusy] = useState(false);
   const [mapSessions, setMapSessions] = useState<SessionMeta[]>([]);
@@ -702,6 +869,7 @@ export default function MapAgentApp() {
   const [contextUsage, setContextUsage] = useState<ContextUsage | null>(null);
   const [view, setView] = useState<MapView>(persisted.view ?? "candidate");
   const [layers, setLayers] = useState<MapLayer[]>(persisted.layers ?? allLayers);
+  const [selectionFill, setSelectionFill] = useState(persisted.selectionFill ?? true);
   const [interactionMode, setInteractionMode] = useState<"select" | "inspect" | "pan">(
     persisted.interactionMode ?? "select",
   );
@@ -709,7 +877,7 @@ export default function MapAgentApp() {
   const [selectionShape, setSelectionShape] = useState<SelectionShape>("rectangle");
   const [selectionOperation, setSelectionOperation] = useState<SelectionOperation>("replace");
   const [selectionRole, setSelectionRole] = useState<SelectionRole>("target");
-  const [selectionLayers, setSelectionLayers] = useState<MapLayer[]>(["terrain"]);
+  const [selectionLayers, setSelectionLayers] = useState<MapLayer[]>(allLayers);
   const [selectionLabel, setSelectionLabel] = useState("영역 A");
   const [cursor, setCursor] = useState<{ x: number; y: number } | null>(null);
   const [zoom, setZoom] = useState(0.25);
@@ -750,6 +918,7 @@ export default function MapAgentApp() {
   const draftOverlayRefreshRef = useRef(0);
   const overlayRefreshRef = useRef(0);
   const sourceProbeInFlightRef = useRef(false);
+  const failedSourceProbeRef = useRef<MapSourceProbe | null>(null);
   const eventRevisionRef = useRef("");
   const turnRef = useRef(turn);
   const turnCursorRef = useRef<MapTurnCursor>(createMapTurnCursor());
@@ -758,6 +927,12 @@ export default function MapAgentApp() {
   const recoveredTurnRef = useRef(false);
   const notificationActivityRef = useRef<BackendSessionActivity>("idle");
   const notifiedAskRequestRef = useRef<string | undefined>(undefined);
+  // The conversation as the listeners see it: run adoption decides on the
+  // entries already shown, outside React's render cycle.
+  const conversationRef = useRef<MapConversationEntry[]>([]);
+  useEffect(() => {
+    conversationRef.current = conversation;
+  }, [conversation]);
 
   const markTurnInFlight = useCallback((active: boolean) => {
     turnInFlightRef.current = active;
@@ -1005,9 +1180,7 @@ export default function MapAgentApp() {
       candidateRef.current = next.candidate;
       setBootstrap(next);
       setCandidate(next.candidate);
-      setChangedSource(
-        next.candidate.stale ? sourceProbeFromContext(next.context) : null,
-      );
+      setConversationResumeError(next.conversationResumeError ?? null);
       setContextUsage(next.session.contextUsage ?? null);
       setConversation(restoredConversation);
       logSequenceRef.current = Math.max(
@@ -1061,6 +1234,7 @@ export default function MapAgentApp() {
         next = await mapBootstrap();
       }
       await applyBootstrap(next);
+      if (next.openProperties === true) setPropertiesOpen(true);
       setError("");
     } catch (reason) {
       overlayRefreshRef.current += 1;
@@ -1086,9 +1260,9 @@ export default function MapAgentApp() {
   useEffect(() => {
     localStorage.setItem(
       "map-agent.surface/1",
-      JSON.stringify({ view, layers, interactionMode }),
+      JSON.stringify({ view, layers, interactionMode, selectionFill }),
     );
-  }, [interactionMode, layers, view]);
+  }, [interactionMode, layers, selectionFill, view]);
 
   useEffect(() => {
     if (!bootstrap || conversation.length === 0) return;
@@ -1178,6 +1352,33 @@ export default function MapAgentApp() {
     ],
   );
 
+  // The EPS session asked this open window to show another session, e.g.
+  // the team session whose candidate is ready.
+  useEffect(() => {
+    let unlisten: UnlistenFn | undefined;
+    void listen<{ sessionId: string }>(
+      "map-agent-open-session",
+      ({ payload }) => {
+        if (typeof payload?.sessionId !== "string") return;
+        void loadSession(payload.sessionId);
+      },
+    ).then((dispose) => {
+      unlisten = dispose;
+    });
+    return () => unlisten?.();
+  }, [loadSession]);
+
+  // The main window's header asked this already-open window for 맵 속성.
+  useEffect(() => {
+    let unlisten: UnlistenFn | undefined;
+    void listen("map-agent-open-properties", () => {
+      setPropertiesOpen(true);
+    }).then((dispose) => {
+      unlisten = dispose;
+    });
+    return () => unlisten?.();
+  }, []);
+
   const renameSession = useCallback(async (sessionId: string, name: string) => {
     try {
       const meta = await mapSessionRename(sessionId, name);
@@ -1196,6 +1397,81 @@ export default function MapAgentApp() {
       setError(`맵 작업 이름을 바꾸지 못했습니다: ${String(reason)}`);
     }
   }, []);
+
+  const resetConversation = useCallback(async () => {
+    const sessionId = sessionIdRef.current;
+    if (!sessionId) return;
+    setConversationResetBusy(true);
+    try {
+      await mapConversationReset(sessionId);
+      setConversationResumeError(null);
+      setError("");
+    } catch (reason) {
+      setError(`대화를 초기화하지 못했습니다: ${String(reason)}`);
+    } finally {
+      setConversationResetBusy(false);
+    }
+  }, []);
+
+  const editMessage = useCallback(
+    async (entry: MapConversationEntry) => {
+      const current = bootstrapRef.current;
+      const candidateState = candidateRef.current;
+      if (
+        !current ||
+        !candidateState ||
+        entry.kind !== "you" ||
+        busy ||
+        turnInFlightRef.current ||
+        messageActionBusyRef.current
+      ) {
+        return;
+      }
+      messageActionBusyRef.current = true;
+      setMessageActionBusy(true);
+      try {
+        const currentLog = conversationRef.current;
+        const selected = currentLog.find(
+          (candidate) => candidate.id === entry.id && candidate.kind === "you",
+        );
+        if (selected === undefined) return;
+        const prefix = currentLog.filter((candidate) => candidate.id < entry.id);
+        await mapConversationRewind(
+          current.session.id,
+          panelLogFromConversation(prefix, logSequenceRef.current),
+        );
+        setConversation(prefix);
+        setConversationResumeError(null);
+        resetTurn();
+        setAsk(undefined);
+        const restoredChips = restoreMentionChips(selected.mapMentions ?? [], {
+          selections: candidateState.selections,
+          locations: objects.flatMap((item) =>
+            item.location ? [item.location] : [],
+          ),
+          imported: importedEntries,
+        });
+        setMentions(
+          staleImportedMentions(
+            staleMentions(restoredChips, candidateState),
+            importedEntries,
+          ),
+        );
+        setSelectedMentionId(undefined);
+        setEditDraft({
+          text: selected.text,
+          attachments: selected.attachments ?? [],
+        });
+        setError("");
+      } catch (reason) {
+        setError(`메시지 수정 지점으로 대화를 되돌리지 못했습니다: ${String(reason)}`);
+      } finally {
+        messageActionBusyRef.current = false;
+        setMessageActionBusy(false);
+      }
+    },
+    [busy, importedEntries, objects, resetTurn],
+  );
 
   const deleteSession = useCallback(async (sessionId: string) => {
     if (sessionId === sessionIdRef.current) return;
@@ -1216,6 +1492,216 @@ export default function MapAgentApp() {
     let disposed = false;
     notificationActivityRef.current = "idle";
     notifiedAskRequestRef.current = undefined;
+    // Live delivery and transcript replay share these handlers, so a run this
+    // window adopts mid-way renders exactly like one it watched from the start.
+    const applyAgentEvent = (payload: Record<string, unknown>) => {
+      if (payload.sessionId !== sessionId) return;
+      if (payload.candidateRevision !== eventRevisionRef.current) return;
+      if (!turnInFlightRef.current || turnEndedRef.current) return;
+      const kind = String(payload.kind ?? "");
+      const detail = String(payload.detail ?? "");
+      const rawData = (payload.data ?? {}) as Record<string, unknown>;
+      const data: AgentEventData = {
+        ...(typeof rawData.callId === "string"
+          ? { callId: rawData.callId }
+          : {}),
+        ...(typeof rawData.args === "string"
+          ? { args: rawData.args }
+          : {}),
+        ...(typeof rawData.result === "string"
+          ? { result: rawData.result }
+          : {}),
+        ...(typeof rawData.status === "string"
+          ? { status: rawData.status }
+          : {}),
+      };
+      const next = reduceMapTurnEvent(
+        turnRef.current,
+        turnCursorRef.current,
+        kind,
+        detail,
+        data,
+      );
+      if (next.unpairedToolStart !== undefined) {
+        logSequenceRef.current += 1;
+        const { name, args } = next.unpairedToolStart;
+        setConversation((entries) => [
+          ...entries,
+          {
+            id: logSequenceRef.current,
+            kind: "info",
+            text: args
+              ? `도구 호출 시작 — ${name}\n${args}`
+              : `도구 호출 시작 — ${name}`,
+          },
+        ]);
+      }
+      turnRef.current = next.turn;
+      turnCursorRef.current = next.cursor;
+      startTransition(() => {
+        setLiveDraft((current) =>
+          advanceLiveDraftPreview(current, {
+            kind,
+            detail,
+            status: data.status,
+            requestId:
+              typeof payload.requestId === "string"
+                ? payload.requestId
+                : undefined,
+            candidateRevision:
+              typeof payload.candidateRevision === "string"
+                ? payload.candidateRevision
+                : undefined,
+          }),
+        );
+        setTurn(next.turn);
+      });
+    };
+    const applyContextUsage = (payload: Record<string, unknown>) => {
+      if (payload.sessionId !== sessionId) return;
+      if (payload.candidateRevision !== eventRevisionRef.current) return;
+      setContextUsage((payload.tokenUsage ?? null) as ContextUsage | null);
+    };
+    const applyAnswer = (payload: Record<string, unknown>) => {
+      if (payload.sessionId !== sessionId) return;
+      if (payload.candidateRevision !== eventRevisionRef.current) return;
+      if (turnEndedRef.current) return;
+      turnEndedRef.current = true;
+      archiveCurrentTurn(String(payload.text ?? ""));
+      setAsk(undefined);
+      if (recoveredTurnRef.current) {
+        recoveredTurnRef.current = false;
+        eventRevisionRef.current = "";
+        markTurnInFlight(false);
+      }
+    };
+    const applyAsk = (payload: Record<string, unknown>) => {
+      if (payload.sessionId !== sessionId) return;
+      if (payload.candidateRevision !== eventRevisionRef.current) return;
+      if (!turnInFlightRef.current || turnEndedRef.current) return;
+      const requestId = String(payload.requestId);
+      if (payload.status === "expired") {
+        setAsk((current) =>
+          current?.requestId === requestId ? undefined : current,
+        );
+        return;
+      }
+      if (notifiedAskRequestRef.current !== requestId) {
+        notifiedAskRequestRef.current = requestId;
+        void attentionNotify(
+          "askResponseRequired",
+          !document.hasFocus(),
+          sessionId,
+        ).catch(() => {
+          // Delivery is best-effort and must not disturb the pending ASK.
+        });
+      }
+      const waitSeconds =
+        typeof payload.waitSeconds === "number" ? payload.waitSeconds : undefined;
+      setAsk({
+        requestId,
+        questions: (payload.questions ?? []) as AskQuestion[],
+        submitting: false,
+        ...(waitSeconds === undefined
+          ? {}
+          : { waitSeconds, receivedAt: Date.now() }),
+      });
+    };
+    const applyError = (payload: Record<string, unknown>) => {
+      if (payload.sessionId !== sessionId) return;
+      if (payload.candidateRevision !== eventRevisionRef.current) return;
+      if (turnEndedRef.current) return;
+      turnEndedRef.current = true;
+      archiveCurrentTurn();
+      logSequenceRef.current += 1;
+      setConversation((entries) => [
+        ...entries,
+        {
+          id: logSequenceRef.current,
+          kind: "error",
+          text: String(
+            payload.message ?? "Map Agent 요청이 실패했습니다.",
+          ),
+        },
+      ]);
+      setAsk(undefined);
+      if (recoveredTurnRef.current) {
+        recoveredTurnRef.current = false;
+        eventRevisionRef.current = "";
+        markTurnInFlight(false);
+      }
+    };
+    // ASK state is not replayed from the transcript: `ask_pending` is the
+    // authority on whether a question is still open.
+    const replayRunEvent = (event: MapRunEvent) => {
+      switch (event.name) {
+        case "agent_event":
+          applyAgentEvent(event.payload);
+          break;
+        case "context_usage":
+          applyContextUsage(event.payload);
+          break;
+        case "answer":
+          applyAnswer(event.payload);
+          break;
+        case "error":
+          applyError(event.payload);
+          break;
+        default:
+          break;
+      }
+    };
+    // Show a run this window did not start (a team task, or a request that
+    // outlived the previous window) exactly like one typed here: request
+    // bubble, then every recorded event through the live handlers.
+    const adoptRun = (run: MapRunTranscript) => {
+      if (runAlreadyAdopted(conversationRef.current, run.requestId)) return;
+      const adoption = runAdoptionEntries(run, logSequenceRef.current);
+      logSequenceRef.current = adoption.logSequence;
+      conversationRef.current = [...conversationRef.current, ...adoption.entries];
+      setConversation((entries) => [...entries, ...adoption.entries]);
+      resetTurn();
+      clearLiveDraftPreview();
+      eventRevisionRef.current = run.candidateRevision;
+      turnEndedRef.current = false;
+      recoveredTurnRef.current = true;
+      markTurnInFlight(true);
+      setAsk(undefined);
+      for (const event of run.events) replayRunEvent(event);
+      if (run.inFlight) return;
+      // The run ended before this window saw it: its answer or error already
+      // closed the turn above; otherwise close it now. Its draft is gone.
+      if (!runHasTerminalEvent(run)) {
+        turnEndedRef.current = true;
+        archiveCurrentTurn();
+        recoveredTurnRef.current = false;
+        eventRevisionRef.current = "";
+        markTurnInFlight(false);
+      }
+      clearLiveDraftPreview();
+    };
+    const restorePendingAsk = async () => {
+      const pending = await invoke<PendingAskSnapshot | null>("ask_pending", {
+        sessionId,
+      });
+      if (disposed || pending === null || pending.sessionId !== sessionId) return;
+      const candidateRevision =
+        pending.candidateRevision ?? bootstrap.candidate.revisionKey;
+      if (candidateRevision !== bootstrap.candidate.revisionKey) return;
+      eventRevisionRef.current = candidateRevision;
+      turnEndedRef.current = false;
+      recoveredTurnRef.current = true;
+      notifiedAskRequestRef.current = pending.requestId;
+      markTurnInFlight(true);
+      setAsk({
+        requestId: pending.requestId,
+        questions: pending.questions,
+        submitting: false,
+        ...(typeof pending.waitSeconds === "number"
+          ? { waitSeconds: pending.waitSeconds, receivedAt: Date.now() }
+          : {}),
+      });
+    };
     const register = async () => {
       unlisteners.push(
         await listen<Record<string, unknown>>(
@@ -1263,122 +1749,57 @@ export default function MapAgentApp() {
         ),
       );
       unlisteners.push(
-        await listen<Record<string, unknown>>("agent_event", ({ payload }) => {
+        await listen<Record<string, unknown>>("agent_event", ({ payload }) =>
+          applyAgentEvent(payload),
+        ),
+      );
+      unlisteners.push(
+        await listen<Record<string, unknown>>("context_usage", ({ payload }) =>
+          applyContextUsage(payload),
+        ),
+      );
+      unlisteners.push(
+        await listen<Record<string, unknown>>("answer", ({ payload }) =>
+          applyAnswer(payload),
+        ),
+      );
+      unlisteners.push(
+        await listen<Record<string, unknown>>("ask", ({ payload }) =>
+          applyAsk(payload),
+        ),
+      );
+      unlisteners.push(
+        await listen<Record<string, unknown>>("error", ({ payload }) =>
+          applyError(payload),
+        ),
+      );
+      unlisteners.push(
+        await listen<MapRunStartedPayload>("map_run_started", ({ payload }) => {
           if (payload.sessionId !== sessionId) return;
-          if (payload.candidateRevision !== eventRevisionRef.current) return;
-          if (!turnInFlightRef.current || turnEndedRef.current) return;
-          const kind = String(payload.kind ?? "");
-          const detail = String(payload.detail ?? "");
-          const rawData = (payload.data ?? {}) as Record<string, unknown>;
-          const data: AgentEventData = {
-            ...(typeof rawData.args === "string"
-              ? { args: rawData.args }
-              : {}),
-            ...(typeof rawData.result === "string"
-              ? { result: rawData.result }
-              : {}),
-            ...(typeof rawData.status === "string"
-              ? { status: rawData.status }
-              : {}),
-          };
-          const next = reduceMapTurnEvent(
-            turnRef.current,
-            turnCursorRef.current,
-            kind,
-            detail,
-            data,
-          );
-          turnRef.current = next.turn;
-          turnCursorRef.current = next.cursor;
-          startTransition(() => {
-            setLiveDraft((current) =>
-              advanceLiveDraftPreview(current, {
-                kind,
-                detail,
-                status: data.status,
-                requestId:
-                  typeof payload.requestId === "string"
-                    ? payload.requestId
-                    : undefined,
-                candidateRevision:
-                  typeof payload.candidateRevision === "string"
-                    ? payload.candidateRevision
-                    : undefined,
-              }),
+          if (turnInFlightRef.current) {
+            // This window sent the request: remember its id for later
+            // bootstraps, and follow the revision the run actually started
+            // on — the backend may have moved the candidate onto a source
+            // saved elsewhere while the prompt was being sent.
+            eventRevisionRef.current = payload.candidateRevision;
+            setConversation((entries) =>
+              stampRunRequestId(entries, payload.requestId),
             );
-            setTurn(next.turn);
-          });
-        }),
-      );
-      unlisteners.push(
-        await listen<Record<string, unknown>>("context_usage", ({ payload }) => {
-          if (payload.sessionId !== sessionId) return;
-          if (payload.candidateRevision !== eventRevisionRef.current) return;
-          setContextUsage((payload.tokenUsage ?? null) as ContextUsage | null);
-        }),
-      );
-      unlisteners.push(
-        await listen<Record<string, unknown>>("answer", ({ payload }) => {
-          if (payload.sessionId !== sessionId) return;
-          if (payload.candidateRevision !== eventRevisionRef.current) return;
-          if (turnEndedRef.current) return;
-          turnEndedRef.current = true;
-          archiveCurrentTurn(String(payload.text ?? ""));
-          setAsk(undefined);
-          if (recoveredTurnRef.current) {
-            recoveredTurnRef.current = false;
-            eventRevisionRef.current = "";
-            markTurnInFlight(false);
+            return;
           }
-        }),
-      );
-      unlisteners.push(
-        await listen<Record<string, unknown>>("ask", ({ payload }) => {
-          if (payload.sessionId !== sessionId) return;
-          if (payload.candidateRevision !== eventRevisionRef.current) return;
-          if (!turnInFlightRef.current || turnEndedRef.current) return;
-          const requestId = String(payload.requestId);
-          if (notifiedAskRequestRef.current !== requestId) {
-            notifiedAskRequestRef.current = requestId;
-            void attentionNotify(
-              "askResponseRequired",
-              !document.hasFocus(),
-              sessionId,
-            ).catch(() => {
-              // Delivery is best-effort and must not disturb the pending ASK.
+          // A run started elsewhere (an EPS team task): adopt it from the
+          // transcript rather than from this header alone, so the events
+          // emitted before this listener ran are not lost.
+          void mapRunSnapshot(sessionId)
+            .then(async (run) => {
+              if (disposed || !run || run.requestId !== payload.requestId) return;
+              if (turnInFlightRef.current) return;
+              adoptRun(run);
+              await restorePendingAsk();
+            })
+            .catch((reason) => {
+              if (!disposed) setError(String(reason));
             });
-          }
-          setAsk({
-            requestId,
-            questions: (payload.questions ?? []) as AskQuestion[],
-            submitting: false,
-          });
-        }),
-      );
-      unlisteners.push(
-        await listen<Record<string, unknown>>("error", ({ payload }) => {
-          if (payload.sessionId !== sessionId) return;
-          if (payload.candidateRevision !== eventRevisionRef.current) return;
-          if (turnEndedRef.current) return;
-          turnEndedRef.current = true;
-          archiveCurrentTurn();
-          logSequenceRef.current += 1;
-          setConversation((entries) => [
-            ...entries,
-            {
-              id: logSequenceRef.current,
-              kind: "error",
-              text: String(
-                payload.message ?? "Map Agent 요청이 실패했습니다.",
-              ),
-            },
-          ]);
-          setAsk(undefined);
-          if (recoveredTurnRef.current) {
-            recoveredTurnRef.current = false;
-            eventRevisionRef.current = "";
-            markTurnInFlight(false);
-          }
         }),
       );
       unlisteners.push(
@@ -1391,23 +1812,9 @@ export default function MapAgentApp() {
           void refreshObjects(sessionId);
         }),
       );
-      const pending = await invoke<PendingAskSnapshot | null>("ask_pending", {
-        sessionId,
-      });
-      if (disposed || pending === null || pending.sessionId !== sessionId) return;
-      const candidateRevision =
-        pending.candidateRevision ?? bootstrap.candidate.revisionKey;
-      if (candidateRevision !== bootstrap.candidate.revisionKey) return;
-      eventRevisionRef.current = candidateRevision;
-      turnEndedRef.current = false;
-      recoveredTurnRef.current = true;
-      notifiedAskRequestRef.current = pending.requestId;
-      markTurnInFlight(true);
-      setAsk({
-        requestId: pending.requestId,
-        questions: pending.questions,
-        submitting: false,
-      });
+      if (disposed) return;
+      if (bootstrap.pendingRun) adoptRun(bootstrap.pendingRun);
+      await restorePendingAsk();
     };
     void register().catch((reason) => {
       if (!disposed) setError(String(reason));
@@ -1422,6 +1829,7 @@ export default function MapAgentApp() {
     clearLiveDraftPreview,
     markTurnInFlight,
     refreshObjects,
+    resetTurn,
   ]);
 
   useEffect(() => {
@@ -1453,9 +1861,14 @@ export default function MapAgentApp() {
     };
   }, []);
 
+  // The saved source is the authority. When it changes, reopen the session so
+  // the backend moves the candidate onto it; a live turn keeps its parent (the
+  // backend defers too) and the next idle probe picks the change up.
   const probeSource = useCallback(async () => {
     const context = bootstrapRef.current?.context;
-    if (!context || sourceProbeInFlightRef.current) return;
+    const sessionId = sessionIdRef.current;
+    if (!context || !sessionId || sourceProbeInFlightRef.current) return;
+    if (busy || turnInFlight || loading || sessionActionBusy) return;
     sourceProbeInFlightRef.current = true;
     try {
       const current = await mapSourceState();
@@ -1465,19 +1878,32 @@ export default function MapAgentApp() {
       ) {
         return;
       }
-      setChangedSource((previous) =>
-        previous && sameSourceProbe(previous, current) ? previous : current,
-      );
-      setCandidate((value) =>
-        value === null || value.stale ? value : { ...value, stale: true },
-      );
+      const failed = failedSourceProbeRef.current;
+      if (failed && sameSourceProbe(failed, current)) return;
+      try {
+        await persistCurrentConversation();
+        await applyBootstrap(await mapSessionLoad(sessionId));
+        failedSourceProbeRef.current = null;
+      } catch (reason) {
+        // Remember this save so the probe does not retry it every 2 seconds;
+        // the next save (or a manual reload) tries again.
+        failedSourceProbeRef.current = current;
+        setError(`저장된 원본 맵을 반영하지 못했습니다: ${String(reason)}`);
+      }
     } catch {
       // A transient bridge failure must not tear down the usable workbench.
       // Original-file writes still verify the full source hash in the backend.
     } finally {
       sourceProbeInFlightRef.current = false;
     }
-  }, []);
+  }, [
+    applyBootstrap,
+    busy,
+    loading,
+    persistCurrentConversation,
+    sessionActionBusy,
+    turnInFlight,
+  ]);
 
   useEffect(() => {
     let unlisten: UnlistenFn | undefined;
@@ -1524,6 +1950,14 @@ export default function MapAgentApp() {
     selectionLayers,
     selectionRole,
   ]);
+
+  /** Enter a saved selection's edit mode: its mask becomes the active selection with its label/role/layers. */
+  const loadSelection = useCallback((selection: SavedSelection) => {
+    setActiveCells(rowsToCells(selection.rows));
+    setSelectionLabel(selection.label);
+    setSelectionRole(selection.role);
+    setSelectionLayers(selection.layers);
+  }, []);
 
   const addRegionMention = useCallback((selection: SavedSelection) => {
     const chip: MentionChip = {
@@ -2283,6 +2717,22 @@ export default function MapAgentApp() {
     },
     [reload],
   );
+
+  // Save errors stay inside the properties dialog; `reload` reports its own failures.
+  const savePropertiesAndReload = useCallback(
+    async (properties: MapPropertiesRequest) => {
+      const sessionId = bootstrapRef.current?.session.id;
+      if (!sessionId) throw new Error("맵 작업이 열려 있지 않습니다. 창을 다시 연 뒤 시도해 주세요.");
+      setBusy(true);
+      try {
+        await saveMapProperties({ sessionId, properties });
+      } finally {
+        setBusy(false);
+      }
+      await reload();
+    },
+    [reload],
+  );
   const renderedMapSource = useMemo(() => {
     if (!bootstrap || !candidate) return null;
     const draftVisible =
@@ -2386,9 +2836,7 @@ export default function MapAgentApp() {
       selectionAnchor={imagePlacement ? null : selectionAnchor}
       toolbar={
         <MapToolbar
-          context={bootstrap.context}
           candidate={candidate}
-          changedSource={changedSource}
           view={view}
           busy={
             busy ||
@@ -2398,14 +2846,13 @@ export default function MapAgentApp() {
             imagePlacement !== null ||
             stampPlacement !== null
           }
-          reloadingSource={candidate.stale && sessionActionBusy}
           imagePlacementActive={imagePlacement !== null}
           liveDraftActive={liveDraft !== null}
           onImagePlace={() => imageFileInputRef.current?.click()}
           onMapImport={() => {
             void mapAgentImportOpen().catch((reason) => setError(String(reason)));
           }}
-          onReloadSource={() => void createSession()}
+          onProperties={() => setPropertiesOpen(true)}
           onView={setView}
           onRevert={(revision) =>
             void updateCandidate(() => candidateRevert(bootstrap.session.id, revision))
@@ -2418,7 +2865,10 @@ export default function MapAgentApp() {
               .finally(() => setBusy(false));
           }}
           onApply={() => {
-            if (!window.confirm("검증된 mixed-layer 후보 전체를 원본 SCX에 원자적으로 Apply할까요?")) return;
+            const question = candidate.sourceDiverged
+              ? "원본 맵이 후보와 다르게 저장되어 후보를 그 위로 옮길 수 없었습니다. Apply하면 저장된 원본을 백업한 뒤 이 후보로 덮어씁니다. 계속할까요?"
+              : "검증된 mixed-layer 후보 전체를 원본 SCX에 원자적으로 Apply할까요?";
+            if (!window.confirm(question)) return;
             void mutateSourceAndReload(() => candidateApply(bootstrap.session.id));
           }}
           onUndo={() => {
@@ -2453,6 +2903,7 @@ export default function MapAgentApp() {
           view={renderedView}
           layers={layers}
           selections={candidate.selections}
+          selectionFill={selectionFill}
           activeRows={minimapActiveRows}
           objects={renderedObjects}
           diffRows={diffDetails.terrainRows}
@@ -2476,6 +2927,7 @@ export default function MapAgentApp() {
           view={renderedView}
           layers={layers}
           selections={candidate.selections}
+          selectionFill={selectionFill}
           activeCells={activeCells}
           selectionShape={selectionShape}
           selectionOperation={selectionOperation}
@@ -2609,12 +3061,7 @@ export default function MapAgentApp() {
               setActiveCells(new Set());
             }).catch((reason) => setError(String(reason)))}
             onClear={() => setActiveCells(new Set())}
-            onLoadSelection={(selection) => {
-              setActiveCells(rowsToCells(selection.rows));
-              setSelectionLabel(selection.label);
-              setSelectionRole(selection.role);
-              setSelectionLayers(selection.layers);
-            }}
+            onLoadSelection={loadSelection}
             onDeleteSelection={(selection) => {
               if (stampPlacementRef.current?.selection.id === selection.id) {
                 clearStampPlacement();
@@ -2662,7 +3109,12 @@ export default function MapAgentApp() {
           conversation={conversation}
           turn={turn}
           live={turnInFlight}
-          actionBusy={busy || imagePlacement !== null || stampPlacement !== null}
+          actionBusy={
+            busy ||
+            messageActionBusy ||
+            imagePlacement !== null ||
+            stampPlacement !== null
+          }
           contextUsage={contextUsage}
           modelSettings={modelSettings}
           modelSettingsBusy={modelSettingsBusy}
@@ -2670,9 +3122,16 @@ export default function MapAgentApp() {
           selectedMentionId={selectedMentionId}
           ask={ask}
           selections={candidate.selections}
+          locations={locations}
           mapWidth={candidate.baseline.width}
           mapHeight={candidate.baseline.height}
           draftScope={`${bootstrap.session.id}|${bootstrap.context.revision.projectId}|${bootstrap.context.revision.fileSha256}`}
+          conversationResumeError={conversationResumeError}
+          conversationResetBusy={conversationResetBusy}
+          onConversationReset={() => void resetConversation()}
+          onEditMessage={(entry) => void editMessage(entry)}
+          editDisabled={busy || turnInFlight || messageActionBusy}
+          editDraft={editDraft}
           onSend={(text, attachments) => void send(text, attachments)}
           onCancel={() => void cancelTurn()}
           onStageAttachment={stageAttachment}
@@ -2681,7 +3140,19 @@ export default function MapAgentApp() {
             void handleModelSettingsChange(model, reasoning);
           }}
           onModelSettingsReload={() => void loadModelSettings()}
-          onMentionSelect={setSelectedMentionId}
+          onLocationMention={handleLocationMention}
+          onRegionMention={addRegionMention}
+          onMentionSelect={(id) => {
+            setSelectedMentionId(id);
+            const chip = mentions.find((item) => item.id === id);
+            if (chip?.mention.kind === "region" || chip?.mention.kind === "stamp") {
+              const selectionId = chip.mention.selectionId;
+              const selection = candidate.selections.find(
+                (item) => item.id === selectionId,
+              );
+              if (selection) loadSelection(selection);
+            }
+          }}
           onMentionRemove={(id) => {
             setMentions((chips) => chips.filter((chip) => chip.id !== id));
             if (selectedMentionId === id) setSelectedMentionId(undefined);
@@ -2784,6 +3255,18 @@ export default function MapAgentApp() {
               </button>
             ))}
           </div>
+          <label
+            className="flex shrink-0 cursor-pointer items-center gap-1.5 text-[11px] text-muted-foreground"
+            title="켜면 저장된 영역의 색 채우기를 없애고 테두리만 남겨 원본 지형이 보입니다"
+          >
+            <Switch
+              checked={!selectionFill}
+              aria-label="영역 투명"
+              className="scale-90"
+              onCheckedChange={(checked) => setSelectionFill(!checked)}
+            />
+            영역 투명
+          </label>
           <div className="min-w-0 flex-1 overflow-hidden">
             <CandidateControls candidate={candidate} details={diffDetails} />
           </div>
@@ -2793,6 +3276,14 @@ export default function MapAgentApp() {
           <LocateFixed className="size-4 shrink-0 text-muted-foreground" aria-hidden="true" />
         </div>
       }
+      />
+      <MapPropertiesDialog
+        open={propertiesOpen}
+        context={bootstrap.context}
+        candidate={candidate}
+        busy={busy || turnInFlight || sessionActionBusy}
+        onOpenChange={setPropertiesOpen}
+        onSave={savePropertiesAndReload}
       />
       <MapSessionHistoryDialog
         open={sessionHistoryOpen}

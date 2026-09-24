@@ -121,7 +121,7 @@ impl ProductionClaudeCodeAdapter {
                             let value: Value = serde_json::from_slice(&line)
                                 .map_err(|_| ProviderRuntimeError::Protocol("provider_protocol_changed".to_string()))?;
                             if value.pointer("/event/content_block/type").and_then(Value::as_str) == Some("tool_use")
-                                && (!require_mcp || !value.pointer("/event/content_block/name").and_then(Value::as_str).is_some_and(|name| name.starts_with("mcp__eud-tools__")))
+                                && (!require_mcp || !value.pointer("/event/content_block/name").and_then(Value::as_str).is_some_and(super::request::tool_is_authorized))
                             {
                                 return Err(ProviderRuntimeError::Protocol("provider process boundary validation failed".into()));
                             }
@@ -129,11 +129,27 @@ impl ProductionClaudeCodeAdapter {
                             if parser.initialized && !started {
                                 parser.validate_init(require_mcp)?;
                                 started = true;
+                                // The CLI publishes its resumable session id before any
+                                // output; retaining it here is what lets an interrupted
+                                // run keep a native continuation boundary. A session that
+                                // is not the one the run asked to resume is a protocol
+                                // deviation and is never adopted as a boundary.
+                                let consistent = match (&self.resume_target, &parser.session_id) {
+                                    (Some(expected), Some(session)) => expected == session,
+                                    (Some(_), None) => false,
+                                    (None, _) => true,
+                                };
+                                if consistent {
+                                    self.observed_session_id.clone_from(&parser.session_id);
+                                    if let Some(session_id) = parser.session_id.clone() {
+                                        send_event(&events, identity, AdapterEventKind::NativeSessionStarted { session_id }).await?;
+                                    }
+                                }
                                 send_event(&events, identity, AdapterEventKind::ResponseStarted { response_id: response_id.clone() }).await?;
                             }
                             for event in parsed {
                                 if let ParsedEvent::ToolObservation { name, .. } = &event {
-                                    if !require_mcp || !name.starts_with("mcp__eud-tools__") {
+                                    if !require_mcp || !super::request::tool_is_authorized(name) {
                                         return Err(ProviderRuntimeError::Protocol(
                                             "provider process boundary validation failed".to_string(),
                                         ));

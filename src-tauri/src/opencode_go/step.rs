@@ -117,9 +117,10 @@ impl OpenCodeGoAdapter {
                 return Err(ProviderRuntimeError::Cancelled);
             }
         };
-        let status = response.status();
-        if !status.is_success() {
-            return Err(ProviderRuntimeError::Transport(status_error(status)));
+        if !response.status().is_success() {
+            return Err(ProviderRuntimeError::Transport(
+                inference_status_error(response).await,
+            ));
         }
         let parsed = match parse_stream_events(
             response,

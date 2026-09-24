@@ -10,6 +10,7 @@ import {
   mapSourceProbeChanged,
   nextSelectionLabel,
   reduceMapTurnEvent,
+  restoreMentionChips,
   staleImportedMentions,
   staleMentions,
   advanceLiveDraftPreview,
@@ -208,13 +209,125 @@ describe("Map Agent live draft preview", () => {
 });
 
 describe("Map Agent conversation timeline", () => {
+  it("matches interleaved same-name tool results by call id", () => {
+    // Given: two overlapping calls with the same display name and distinct IDs.
+    let turn = createMapTurn();
+    let cursor = createMapTurnCursor();
+    const apply = (
+      kind: string,
+      detail: string,
+      data?: {
+        callId?: string;
+        args?: string;
+        result?: string;
+        status?: string;
+      },
+    ) => {
+      const next = reduceMapTurnEvent(turn, cursor, kind, detail, data);
+      turn = next.turn;
+      cursor = next.cursor;
+    };
+    apply("tool_call", "map_status", {
+      callId: "map-call-a",
+      args: '{"scope":"a"}',
+    });
+    apply("tool_call", "map_status", {
+      callId: "map-call-b",
+      args: '{"scope":"b"}',
+    });
+
+    // When: their results arrive in start order rather than stack order.
+    apply("tool_result", "map_status", {
+      callId: "map-call-a",
+      result: "alpha",
+      status: "completed",
+    });
+    apply("tool_result", "map_status", {
+      callId: "map-call-b",
+      result: "beta-error",
+      status: "failed",
+    });
+
+    // Then: each result and terminal state stays with its originating call.
+    expect(turn.tools).toMatchObject([
+      {
+        callId: "map-call-a",
+        args: '{"scope":"a"}',
+        detail: "alpha",
+        state: "done",
+      },
+      {
+        callId: "map-call-b",
+        args: '{"scope":"b"}',
+        detail: "beta-error",
+        state: "failed",
+      },
+    ]);
+  });
+
+  it("preserves current-run orphan terminals without changing a keyed call", () => {
+    let turn = createMapTurn();
+    let cursor = createMapTurnCursor();
+    for (const [kind, callId, result, status] of [
+      ["tool_call", "known", undefined, undefined],
+      ["tool_result", "unknown", "orphan-error", "failed"],
+      ["tool_result", "known", "known-result", "completed"],
+      ["tool_result", "known", "duplicate-error", "failed"],
+    ] as const) {
+      const next = reduceMapTurnEvent(turn, cursor, kind, "map_status", {
+        callId,
+        ...(result !== undefined ? { result } : {}),
+        ...(status !== undefined ? { status } : {}),
+      });
+      turn = next.turn;
+      cursor = next.cursor;
+    }
+
+    expect(turn.tools).toMatchObject([
+      { callId: "known", state: "done", detail: "known-result" },
+      { callId: "unknown", state: "failed", detail: "orphan-error" },
+    ]);
+  });
+
+  it("reports id-less starts as information and keeps id-less terminals standalone", () => {
+    const initial = createMapTurn();
+    const start = reduceMapTurnEvent(
+      initial,
+      createMapTurnCursor(),
+      "tool_call",
+      "command",
+      { callId: "", args: "cargo test" },
+    );
+    expect(start.turn.tools).toEqual([]);
+    expect(start.unpairedToolStart).toEqual({
+      name: "command",
+      args: "cargo test",
+    });
+
+    const terminal = reduceMapTurnEvent(
+      start.turn,
+      start.cursor,
+      "tool_result",
+      "command",
+      { result: "12 passed", status: "completed" },
+    );
+    expect(terminal.turn.tools).toMatchObject([
+      { name: "command", state: "done", detail: "12 passed" },
+    ]);
+  });
+
   it("archives streamed prose and tools in their arrival order", () => {
     let turn = createMapTurn();
     let cursor = createMapTurnCursor();
     const apply = (
       kind: string,
       detail: string,
-      data?: { args?: string; result?: string; status?: string },
+      data?: {
+        callId?: string;
+        args?: string;
+        result?: string;
+        status?: string;
+      },
     ) => {
       const next = reduceMapTurnEvent(turn, cursor, kind, detail, data);
       turn = next.turn;
@@ -223,8 +336,9 @@ describe("Map Agent conversation timeline", () => {
 
     apply("reasoning", "요청을 분석합니다.");
     apply("delta", "먼저 맵을 확인합니다.");
-    apply("tool_call", "map_status", { args: "{}" });
+    apply("tool_call", "map_status", { callId: "map-status", args: "{}" });
     apply("tool_result", "map_status", {
+      callId: "map-status",
       result: "loaded",
       status: "completed",
     });
@@ -334,11 +448,104 @@ describe("Candidate mention freshness", () => {
 
     expect(stale.stale).toBe(true);
   });
+
+  it("drops region and stamp chips whose saved selection was deleted", () => {
+    const stampChip: MentionChip = {
+      id: "stamp-chip",
+      label: "stamp:영역 A",
+      mention: { kind: "stamp", selectionId: "target", snapshotHash: "mask-a" },
+    };
+    const locationChip: MentionChip = {
+      id: "location-chip",
+      label: "location:#3",
+      mention: {
+        kind: "location",
+        locationId: 3,
+        revisionKey: "r2:candidate",
+        baselineHash: "baseline",
+      },
+    };
+
+    const remaining = staleMentions([chip, stampChip, locationChip], {
+      ...candidate,
+      selections: [],
+    });
+
+    expect(remaining.map((item) => item.id)).toEqual(["location-chip"]);
+    expect(remaining[0].stale).toBe(false);
+  });
 });
 
 
+describe("Edited message mention restoration", () => {
+  it("rebuilds tray chips from persisted snapshots with live labels when the items still exist", () => {
+    const chips = restoreMentionChips(
+      [
+        { kind: "region", selectionId: "target", snapshotHash: "mask-a", sourceRevision: "r1:a" },
+        { kind: "stamp", selectionId: "missing-selection", snapshotHash: "mask-b" },
+        { kind: "importedStamp", importId: "import-a", snapshotHash: "snapshot-a" },
+        {
+          kind: "object",
+          objectRef: {
+            kind: "unit",
+            ordinal: 7,
+            semanticFingerprint: "fp",
+            revisionKey: "r1:a",
+            baselineHash: "baseline",
+          },
+          role: "subject",
+        },
+        {
+          kind: "palette",
+          entry: { layer: "locations", kind: "newLocation", entryId: 0, tileset: "jungle", fingerprint: "new-location/1" },
+          qualifiers: {},
+        },
+        {
+          kind: "palette",
+          entry: { layer: "units", kind: "unit", entryId: 0, tileset: "jungle", fingerprint: "unit/0" },
+          qualifiers: { owner: 1 },
+        },
+        { kind: "location", locationId: 3, revisionKey: "r1:a", baselineHash: "baseline" },
+        { kind: "location", locationId: 9, revisionKey: "r1:a", baselineHash: "baseline" },
+      ],
+      {
+        selections: [
+          {
+            id: "target",
+            label: "영역 A",
+            role: "target",
+            sourceRevision: "r1:a",
+            layers: ["terrain"],
+            bounds: { left: 0, top: 0, right: 1, bottom: 1 },
+            selectedCells: 4,
+            rows: [],
+            snapshotHash: "mask-a",
+          },
+        ],
+        locations: [
+          { id: 3, name: "Spawn", left: 0, top: 0, right: 32, bottom: 32, tileRect: [0, 0, 1, 1], elevationFlags: 0 },
+        ],
+        imported: [{ id: "import-a", label: "언덕", snapshotHash: "snapshot-a" } as ImportedStampView],
+      },
+    );
+
+    expect(chips.map((chip) => chip.label)).toEqual([
+      "target:영역 A",
+      "stamp:missing-",
+      "imported:언덕",
+      "instance:unit #7",
+      "type:새 로케이션",
+      "type:unit #0",
+      "location:#3 Spawn",
+      "location:#9",
+    ]);
+    expect(new Set(chips.map((chip) => chip.id)).size).toBe(chips.length);
+    expect(chips[5].mention).toMatchObject({ kind: "palette", qualifiers: { owner: 1 } });
+  });
+});
+
 describe("Imported stamp mention freshness", () => {
-  it("marks deleted, unavailable, or snapshot-mismatched imported chips stale", () => {
+  it("drops deleted imported chips and marks unavailable or snapshot-mismatched ones stale", () => {
     const chip = {
       id: "chip",
       label: "imported:언덕",
@@ -355,7 +562,7 @@ describe("Imported stamp mention freshness", () => {
       compatible: true,
     } as ImportedStampView;
     expect(staleImportedMentions([chip], [stamp])[0].stale).toBe(false);
-    expect(staleImportedMentions([chip], [])[0].stale).toBe(true);
+    expect(staleImportedMentions([chip], [])).toEqual([]);
     expect(
       staleImportedMentions(
         [chip],

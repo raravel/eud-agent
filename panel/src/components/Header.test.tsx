@@ -200,4 +200,62 @@ describe("Header — Map Agent window", () => {
     await userEvent.click(button);
     expect(onOpenMapAgent).toHaveBeenCalledTimes(1);
   });
+
+  it("hands the source map to SCMDraft 2 only when a native project is open", async () => {
+    const onOpenScmdraft = vi.fn();
+    const { rerender } = render(
+      <Header
+        project=""
+        connected={true}
+        phase="ready"
+        projectAvailable={false}
+        hasProject={false}
+        onOpenScmdraft={onOpenScmdraft}
+      />,
+    );
+    expect(screen.getByRole("button", { name: "SCMDraft 2로 열기" })).toBeDisabled();
+    rerender(
+      <Header
+        project="MyMap"
+        connected={true}
+        phase="ready"
+        projectAvailable={true}
+        hasProject={true}
+        onOpenScmdraft={onOpenScmdraft}
+      />,
+    );
+    const button = screen.getByRole("button", { name: "SCMDraft 2로 열기" });
+    expect(button).toBeEnabled();
+    await userEvent.click(button);
+    expect(onOpenScmdraft).toHaveBeenCalledTimes(1);
+  });
+
+  it("opens 맵 속성 only when a native project is open", async () => {
+    const onOpenMapProperties = vi.fn();
+    const { rerender } = render(
+      <Header
+        project=""
+        connected={true}
+        phase="ready"
+        projectAvailable={false}
+        hasProject={false}
+        onOpenMapProperties={onOpenMapProperties}
+      />,
+    );
+    expect(screen.getByRole("button", { name: "맵 속성" })).toBeDisabled();
+    rerender(
+      <Header
+        project="MyMap"
+        connected={true}
+        phase="ready"
+        projectAvailable={true}
+        hasProject={true}
+        onOpenMapProperties={onOpenMapProperties}
+      />,
+    );
+    const button = screen.getByRole("button", { name: "맵 속성" });
+    expect(button).toBeEnabled();
+    await userEvent.click(button);
+    expect(onOpenMapProperties).toHaveBeenCalledTimes(1);
+  });
 });

@@ -10,6 +10,7 @@
  */
 import { Message, MessageContent } from "@/components/ai-elements/message";
 import { DiagramResponse } from "@/components/ai-elements/response";
+import { CHAT_MARKDOWN_COMPONENTS } from "@/components/WorkspacePathCode";
 
 export interface AgentAnswerProps {
   /** The accumulated answer text (store turn.answer or a final answer{}). */
@@ -21,7 +22,9 @@ export function AgentAnswer({ text }: AgentAnswerProps) {
   return (
     <Message from="assistant" className="text-foreground">
       <MessageContent>
-        <DiagramResponse>{text}</DiagramResponse>
+        <DiagramResponse components={CHAT_MARKDOWN_COMPONENTS}>
+          {text}
+        </DiagramResponse>
       </MessageContent>
     </Message>
   );

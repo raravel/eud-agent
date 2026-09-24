@@ -130,10 +130,18 @@ pub struct HarnessJob {
     pub approved_plan: Option<String>,
     pub final_answer: String,
     pub accepted_entries: Vec<JournalEntry>,
+    /// The turn commit that recorded this work in the project's history, when
+    /// the project has one. The worklog cites it so a spec can be traced back
+    /// to the exact state of the tree it was written from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_commit: Option<String>,
     /// Facts pinned at source changeset acceptance; absent on legacy jobs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_state_promotion: Option<crate::task_state::TaskStatePromotionInput>,
     pub build: Option<BuildEvidence>,
+    /// The staged verifier's rendered verdict, when the request was verified.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verify_verdict: Option<String>,
     pub delta: Option<HarnessDelta>,
     pub error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -189,8 +197,10 @@ impl HarnessJob {
             approved_plan,
             final_answer,
             accepted_entries,
+            turn_commit: None,
             task_state_promotion: None,
             build,
+            verify_verdict: None,
             delta: None,
             error: None,
             retry_feedback: None,
@@ -671,6 +681,9 @@ The code/map changes below are already accepted. Update only durable current-beh
 [build evidence]
 {}
 
+[verification verdict]
+{}
+
 [runtime verification]
 {:?}
 
@@ -691,6 +704,9 @@ The code/map changes below are already accepted. Update only durable current-beh
         job.approved_plan.as_deref().unwrap_or("(direct change; no approved plan)"),
         job.final_answer,
         serde_json::to_string(&job.build).map_err(|error| error.to_string())?,
+        job.verify_verdict
+            .as_deref()
+            .unwrap_or("(not verified by a staged verifier)"),
         job.runtime_verification,
         promotion,
         accepted,
@@ -778,7 +794,7 @@ fn stage_delta_inner(
         } else {
             let current = current
                 .ok_or_else(|| format!("harness document `{}` does not exist", document.path))?;
-            apply_exact_text_edits(&document.path, &current, &document.edits)
+            apply_exact_text_edits("file_edit", &document.path, &current, &document.edits)
                 .map_err(|error| error.to_string())?
         };
         updates.push(WorkspaceDocumentUpdate {
@@ -914,11 +930,14 @@ fn promoted_ref(relative: &str, path: &Path) -> Result<crate::task_state::Promot
 }
 
 pub fn cleanup_job_workspace(dirs: &DataDirs, job: &HarnessJob) {
-    let root = dirs
-        .session_workspaces_dir()
-        .join(&job.workspace_id)
-        .join(&job.workspace_session_id);
-    let _ = fs::remove_dir_all(root);
+    // The harness stages directly against canonical documents; only its
+    // per-session `.tmp` scratch directory is job-owned.
+    if let Ok(root) = WorkspaceManager::new(dirs.clone()).workspace_root(&job.workspace_id) {
+        let temp = root
+            .join(crate::workspace::TEMP_DIR)
+            .join(&job.workspace_session_id);
+        let _ = fs::remove_dir_all(temp);
+    }
 }
 
 fn render_worklog(job: &HarnessJob, delta: &HarnessDelta) -> String {
@@ -931,6 +950,10 @@ fn render_worklog(job: &HarnessJob, delta: &HarnessDelta) -> String {
         .map(|target| format!("- `{target}`"))
         .collect::<Vec<_>>()
         .join("\n");
+    let commit = match job.turn_commit.as_deref() {
+        Some(sha) => format!("\n- Recorded as commit `{sha}`"),
+        None => String::new(),
+    };
     let build = match &job.build {
         Some(build) if build.ok => "- Complete project build: passed".to_string(),
         Some(build) => format!(
@@ -962,8 +985,8 @@ fn render_worklog(job: &HarnessJob, delta: &HarnessDelta) -> String {
         spec_links.join("\n")
     };
     format!(
-        "# {} worklog\n\n## Actual result\n\n{}\n\n## Accepted targets\n\n{}\n\n## Verification\n\n{}\n{}\n\n## Canonical specifications\n\n{}\n",
-        job.source_request_id, delta.summary, target_lines, build, runtime, spec_links
+        "# {} worklog\n\n## Actual result\n\n{}\n\n## Accepted targets\n\n{}{}\n\n## Verification\n\n{}\n{}\n\n## Canonical specifications\n\n{}\n",
+        job.source_request_id, delta.summary, target_lines, commit, build, runtime, spec_links
     )
 }
 
@@ -1235,7 +1258,7 @@ mod tests {
         dirs.ensure_dirs().unwrap();
         let workspace = prepare_project(&dirs, &base);
         let workspace_id = workspace.id;
-        let document = workspace.root.join("specs/gameplay.md");
+        let document = workspace.workspace_root.join("specs/gameplay.md");
         fs::create_dir_all(document.parent().unwrap()).unwrap();
         fs::write(&document, "# Gameplay\n\nCurrent behavior.\n").unwrap();
         let mut job = HarnessJob::new(
@@ -1330,7 +1353,7 @@ mod tests {
         dirs.ensure_dirs().unwrap();
         let canonical = prepare_project(&dirs, &base);
         fs::write(
-            canonical.root.join("specs/game.md"),
+            canonical.workspace_root.join("specs/game.md"),
             "# Gameplay\n\nOld behavior.\n",
         )
         .unwrap();
@@ -1349,6 +1372,7 @@ mod tests {
             }),
         );
         job.runtime_verification = RuntimeVerification::Confirmed;
+        job.turn_commit = Some("c0ffee1234567890".to_string());
         let delta = HarnessDelta {
             summary: "Changed gameplay behavior.".to_string(),
             documents: vec![HarnessDocumentPatch {
@@ -1369,16 +1393,15 @@ mod tests {
         let request_id = job.harness_request_id.as_deref().unwrap();
         let changeset = journal.changeset(request_id).unwrap();
         assert_eq!(changeset.items.len(), 2);
-        let workspace_root = dirs
-            .session_workspaces_dir()
-            .join(&canonical.id)
-            .join(&job.workspace_session_id);
+        let workspace_root = canonical.workspace_root.clone();
         assert!(fs::read_to_string(workspace_root.join("specs/game.md"))
             .unwrap()
             .contains("Accepted behavior."));
         let worklog = fs::read_to_string(workspace_root.join("worklog/req-code.md")).unwrap();
         assert!(worklog.contains("confirmed by the user"));
         assert!(worklog.contains("../specs/game.md"));
+        // A spec must be traceable to the exact tree it was written from.
+        assert!(worklog.contains("commit `c0ffee1234567890`"), "{worklog}");
 
         fs::remove_dir_all(base).ok();
     }
@@ -1390,7 +1413,7 @@ mod tests {
         dirs.ensure_dirs().unwrap();
         let workspace = prepare_project(&dirs, &base);
         let workspace_id = workspace.id;
-        let document = workspace.root.join("specs/game.md");
+        let document = workspace.workspace_root.join("specs/game.md");
         fs::create_dir_all(document.parent().unwrap()).unwrap();
         fs::write(&document, "Accepted behavior.").unwrap();
         let memory = ProjectMemory::current(&dirs).unwrap();

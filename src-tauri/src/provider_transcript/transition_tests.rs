@@ -21,8 +21,11 @@ fn write_transition_replays_completed_prefix_and_keeps_unexecuted_audit_tail() {
         .unwrap();
     let write_call = crate::provider_tool_loop::DirectToolCall {
         id: "call-write".to_string(),
-        name: crate::tools::REQUEST_WRITE_WORKSPACE_TOOL.to_string(),
-        arguments: serde_json::json!({"reason":"edit"}),
+        name: "file_edit".to_string(),
+        arguments: serde_json::json!({
+            "path": "src/main.eps",
+            "edits": [{"old_text":"old","new_text":"new"}],
+        }),
     };
     writer
         .begin_tool_batch(
@@ -68,9 +71,9 @@ fn write_transition_replays_completed_prefix_and_keeps_unexecuted_audit_tail() {
             &write_call,
             &crate::provider_tool_loop::DirectToolResult {
                 id: "call-write".to_string(),
-                name: crate::tools::REQUEST_WRITE_WORKSPACE_TOOL.to_string(),
-                result: serde_json::json!({"granted":true}),
-                is_error: false,
+                name: "file_edit".to_string(),
+                result: serde_json::json!("WriteWorkspaceTransition: mutation was not executed"),
+                is_error: true,
             },
         )
         .unwrap();

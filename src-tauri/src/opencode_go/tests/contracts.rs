@@ -143,6 +143,7 @@ struct TextSink {
 impl RuntimeEventSink for TextSink {
     fn emit(&self, event: &AdapterEventKind) -> Result<(), ProviderRuntimeError> {
         match event {
+            AdapterEventKind::NativeSessionStarted { .. } => {}
             AdapterEventKind::Block(NormalizedBlock::Text { text, .. }) => {
                 self.text.lock().push_str(text);
                 self.ready.notify_one();

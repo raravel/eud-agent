@@ -447,7 +447,8 @@ async fn preserves_the_production_palette_query_union_and_local_gate_contract() 
     assert_eq!(calls[0].name, "map_palette_query");
     assert_eq!(calls[0].arguments, call_arguments);
 
-    // And: the common RunGate rejects the captured invalid legacy field before execution.
+    // And: the common RunGate rejects the captured invalid legacy field before execution,
+    // returning a model-correctable usage error instead of a fatal admission failure.
     let runtime = ToolServices::for_tests().map_session("palette-gate-session");
     let (_cancel, cancellation) = tokio::sync::watch::channel(9_u64);
     runtime.set_cancellation(cancellation);
@@ -466,16 +467,20 @@ async fn preserves_the_production_palette_query_union_and_local_gate_contract() 
         crate::provider_runtime::WorkspaceAccess::Read,
         None,
     );
-    let error = gate
+    let result = gate
         .dispatch_native(
             Some("invalid-palette-call".to_string()),
             "map_palette_query".to_string(),
             json!({"kind":"tiles","filter":{"tileId":0}}),
         )
         .await
-        .expect_err("the local gate must reject tileId before tool execution");
-    assert!(error.contains("arguments do not match its input schema"));
-    assert!(gate.completed().is_empty());
+        .expect("schema violation is recoverable, not a dispatch failure");
+    assert!(result.is_error);
+    assert!(result.result.as_str().is_some_and(
+        |message| message.contains("arguments do not match the documented input schema")
+    ));
+    assert!(gate.fatal_admission_error().is_none());
+    assert_eq!(gate.completed().len(), 1);
 }
 
 #[tokio::test]

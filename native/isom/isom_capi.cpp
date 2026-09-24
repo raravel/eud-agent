@@ -504,6 +504,47 @@ int isom_mapedit(
     }
 }
 
+int isom_map_new(
+    const char* output_map_path,
+    const char* starcraft_path,
+    const uint8_t* spec_json,
+    size_t spec_len,
+    uint8_t** out_report_json,
+    size_t* out_report_len)
+{
+    if ( out_report_json == nullptr || out_report_len == nullptr )
+        return ISOM_ERR_INVALID_ARG;
+    *out_report_json = nullptr;
+    *out_report_len = 0;
+    if ( output_map_path == nullptr || output_map_path[0] == '\0'
+         || starcraft_path == nullptr || starcraft_path[0] == '\0'
+         || spec_json == nullptr || spec_len == 0 )
+        return ISOM_ERR_INVALID_ARG;
+    try
+    {
+        std::string report;
+        int engineResult = 1;
+        const int guard = guardSeh([&]() {
+            return mapagent::mapNew(output_map_path, starcraft_path, spec_json, spec_len, report);
+        }, engineResult);
+        if ( guard != ISOM_OK )
+            return guard;
+        if ( engineResult != 0 )
+            return ISOM_ERR_ENGINE;
+        return copyString(report, out_report_json, out_report_len);
+    }
+    catch ( const std::exception& error )
+    {
+        const std::string report = errorReport(error.what());
+        const int copied = copyString(report, out_report_json, out_report_len);
+        return copied == ISOM_OK ? ISOM_ERR_ENGINE : copied;
+    }
+    catch ( ... )
+    {
+        return ISOM_ERR_EXCEPTION;
+    }
+}
+
 int isom_render_region(
     const char* map_path,
     const char* starcraft_path,
@@ -599,6 +640,44 @@ int isom_catalog_query(
     {
         const std::string report = errorReport(error.what());
         const int copied = copyString(report, out_json, out_json_len);
+        return copied == ISOM_OK ? ISOM_ERR_ENGINE : copied;
+    }
+    catch ( ... )
+    {
+        return ISOM_ERR_EXCEPTION;
+    }
+}
+
+int isom_game_asset(
+    const char* starcraft_path,
+    const char* archive_path,
+    uint8_t** out,
+    size_t* out_len)
+{
+    if ( out == nullptr || out_len == nullptr )
+        return ISOM_ERR_INVALID_ARG;
+    *out = nullptr;
+    *out_len = 0;
+    if ( starcraft_path == nullptr || starcraft_path[0] == '\0'
+         || archive_path == nullptr || archive_path[0] == '\0' )
+        return ISOM_ERR_INVALID_ARG;
+    try
+    {
+        std::vector<std::uint8_t> result;
+        int engineResult = 1;
+        const int guard = guardSeh([&]() {
+            return mapagent::gameAsset(starcraft_path, archive_path, result);
+        }, engineResult);
+        if ( guard != ISOM_OK )
+            return guard;
+        if ( engineResult != 0 )
+            return ISOM_ERR_ENGINE;
+        return copyBuffer(result.data(), result.size(), out, out_len);
+    }
+    catch ( const std::exception& error )
+    {
+        const std::string report = errorReport(error.what());
+        const int copied = copyString(report, out, out_len);
         return copied == ISOM_OK ? ISOM_ERR_ENGINE : copied;
     }
     catch ( ... )

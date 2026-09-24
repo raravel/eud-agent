@@ -127,6 +127,7 @@ impl RuntimeEventSink for EventCollector {
         event: &AdapterEventKind,
     ) -> Result<(), crate::provider_runtime::ProviderRuntimeError> {
         let summary = match event {
+            AdapterEventKind::NativeSessionStarted { .. } => None,
             AdapterEventKind::ResponseStarted { response_id } => {
                 if let Some(sender) = self.cancel_on_start.lock().take() {
                     let next = sender.borrow().saturating_add(1);

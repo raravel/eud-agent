@@ -7,10 +7,15 @@
 use tauri::path::BaseDirectory;
 use tauri::{Emitter, Manager};
 
+/// The label Tauri gives the configured main window.
+const MAIN_WINDOW_LABEL: &str = "main";
+
 pub mod antigravity_auth;
 pub mod antigravity_client;
 pub mod attachment;
 pub mod audio;
+pub mod autonomous;
+pub mod blank_project;
 pub mod bootstrap;
 pub mod chk;
 pub mod claude_auth;
@@ -20,11 +25,15 @@ pub mod codex_auth;
 pub mod codex_client;
 pub mod config;
 pub mod context_state;
+pub mod dat_wiki;
 pub mod e3s_nrbf;
 pub mod engine;
+pub mod fs_tools;
+pub mod git;
 pub mod harness;
 pub mod harness_import;
 pub mod ipc;
+pub mod iscript;
 pub mod journal;
 pub mod map_agent;
 pub mod map_candidate;
@@ -44,6 +53,7 @@ pub mod native_runtime;
 mod nrbf;
 pub mod ollama;
 pub mod opencode_go;
+pub mod project_launch;
 pub mod provider;
 pub(crate) mod provider_process;
 pub mod provider_runtime;
@@ -52,10 +62,12 @@ pub mod provider_service;
 pub mod provider_tool_loop;
 pub mod provider_transcript;
 pub mod rag;
+pub mod rag_panel;
 pub mod session;
 pub mod setup;
 pub mod source_snapshot;
 pub mod task_state;
+pub mod team;
 pub mod tool_exec;
 pub mod tools;
 pub mod trace_test;
@@ -72,10 +84,8 @@ struct AppMemoryProvider {
 
 impl AppMemoryProvider {
     fn current_memory(&self) -> memory::ProjectMemory {
-        match native_runtime::NativeProjectManager::new(self.dirs.clone()).status() {
-            Ok(status) => memory::ProjectMemory::new(self.dirs.memory_dir(), status.name),
-            Err(_) => memory::ProjectMemory::new(self.dirs.memory_dir(), ""),
-        }
+        memory::ProjectMemory::current(&self.dirs)
+            .unwrap_or_else(|_| memory::ProjectMemory::disabled())
     }
 }
 
@@ -92,15 +102,16 @@ struct AppWikiProvider {
 }
 
 impl AppWikiProvider {
-    fn current_project(&self) -> String {
-        native_runtime::NativeProjectManager::new(self.dirs.clone())
-            .status()
-            .map(|status| status.name)
-            .unwrap_or_default()
+    fn current_memory(&self) -> Option<memory::ProjectMemory> {
+        memory::ProjectMemory::current(&self.dirs).ok()
     }
 
     fn current_store(&self) -> wiki::WikiStore {
-        wiki::WikiStore::load(self.dirs.wiki_dir(&self.current_project()))
+        let dir = self
+            .current_memory()
+            .and_then(|memory| memory.store_dir())
+            .map(|dir| dir.join("wiki"));
+        wiki::WikiStore::load(dir)
     }
 }
 
@@ -129,6 +140,18 @@ impl engine::WikiProvider for AppWikiProvider {
 #[derive(Clone)]
 struct AppProjectStateProvider {
     dirs: config::DataDirs,
+}
+
+impl engine::ProjectMapProvider for AppProjectStateProvider {
+    fn render_section(&self) -> Option<String> {
+        match native_runtime::NativeProjectManager::new(self.dirs.clone()).render_project_map() {
+            Ok(section) => Some(section),
+            Err(error) => {
+                eprintln!("eud-agent: project map unavailable: {error}");
+                None
+            }
+        }
+    }
 }
 
 impl engine::ProjectStateProvider for AppProjectStateProvider {
@@ -170,16 +193,49 @@ fn finish_background_ffmpeg_bootstrap(
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .manage(project_launch::PendingProjectLaunch::from_args(
+            std::env::args_os().map(|arg| arg.to_string_lossy().into_owned()),
+            &std::env::current_dir().unwrap_or_default(),
+        ))
+        .plugin(tauri_plugin_single_instance::init(
+            project_launch::receive_launch,
+        ))
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
+        .on_window_event(|window, event| {
+            // The Map Agent Workbench is a companion of the main window: once
+            // the main window is gone, close it too so the process exits
+            // instead of lingering as a map-only window. The Map Importer is
+            // in turn a companion of the Map window and closes with it.
+            if !matches!(event, tauri::WindowEvent::Destroyed) {
+                return;
+            }
+            match window.label() {
+                MAIN_WINDOW_LABEL => {
+                    map_agent::close_map_window(window.app_handle());
+                    map_import::close_import_window(window.app_handle());
+                }
+                map_agent::MAP_WINDOW_LABEL => {
+                    map_import::close_import_window(window.app_handle());
+                }
+                _ => {}
+            }
+        })
         .setup(|app| {
             isom::assert_abi_version()?;
             let data_dirs = config::DataDirs::resolve(&*app)?;
             // Non-fatal: a failed dir create resurfaces on first write with context.
             if let Err(error) = data_dirs.ensure_dirs() {
                 eprintln!("eud-agent: cannot create data dirs: {error}");
+            }
+            // One-time cutover: legacy per-session document copies and source
+            // mirrors are obsolete now that the CLI cwd is the project root.
+            if let Err(error) =
+                workspace::WorkspaceManager::new(data_dirs.clone()).discard_legacy_session_mirrors()
+            {
+                eprintln!("eud-agent: legacy session workspace cleanup failed: {error}");
             }
             match app
                 .path()
@@ -209,28 +265,15 @@ pub fn run() {
             app.manage(ipc::AppManaged::new(data_dirs.clone()));
             app.manage(attachment::AttachmentManaged::new(attachment_store.clone()));
 
-            // On later launches, restore missing/corrupt managed assets in the
-            // background. First-run setup remains panel-driven and progress or
-            // retry state is emitted through the typed bootstrap channel.
+            // Audio tools are process-wide. Project-dependent setup starts only
+            // after the launcher explicitly accepts a project in this run.
             let boot_handle = app.handle().clone();
             let boot_dirs = data_dirs.clone();
             tauri::async_runtime::spawn(async move {
-                let check_dirs = boot_dirs.clone();
-                // The manifest check hashes the RAG index; keep it off the runtime.
-                let auto = tauri::async_runtime::spawn_blocking(move || {
-                    setup::should_auto_bootstrap(&check_dirs)
-                })
-                .await
-                .unwrap_or(false);
-                if auto {
-                    // run_bootstrap already emitted the failure to the panel.
-                    let _ = setup::run_bootstrap(&boot_handle, &boot_dirs).await;
-                } else {
-                    let emitter = bootstrap::TauriEmitter(boot_handle.clone());
-                    if !bootstrap::managed_ffmpeg_ready(&boot_dirs) {
-                        let result = bootstrap::ensure_ffmpeg(&boot_dirs, &emitter).await;
-                        finish_background_ffmpeg_bootstrap(&emitter, result);
-                    }
+                let emitter = bootstrap::TauriEmitter(boot_handle.clone());
+                if !bootstrap::managed_ffmpeg_ready(&boot_dirs) {
+                    let result = bootstrap::ensure_ffmpeg(&boot_dirs, &emitter).await;
+                    finish_background_ffmpeg_bootstrap(&emitter, result);
                 }
             });
 
@@ -265,11 +308,15 @@ pub fn run() {
             if let Err(error) = candidates.cleanup_startup() {
                 eprintln!("eud-agent: candidate cache cleanup skipped: {error}");
             }
-            app.manage(map_agent::MapAgentService::new(
+            let map_service = map_agent::MapAgentService::new(
                 data_dirs.clone(),
                 candidates.clone(),
                 writes.clone(),
-            ));
+            );
+            if let Err(error) = map_service.recover_team_tasks() {
+                eprintln!("eud-agent: team map task restart recovery failed: {error}");
+            }
+            app.manage(map_service);
             let services = tool_exec::ToolServices::new(data_dirs.clone(), candidates, writes);
             let mentions = services.mentions();
             app.manage(mentions.clone());
@@ -283,6 +330,7 @@ pub fn run() {
             // gates startup (search_docs returns zero hits until it is ready,
             // which still lifts the evidence gate).
             let warm_rag = services.rag();
+            app.manage(rag_panel::RagManaged(services.rag()));
             let warm_handle = app_handle.clone();
             tauri::async_runtime::spawn_blocking(move || {
                 if let Err(error) = warm_rag.warmup(&bootstrap::TauriEmitter(warm_handle)) {
@@ -294,6 +342,9 @@ pub fn run() {
             // `%appdata%\eud-agent\sessions\` (decision A/D). Built before the
             // config builder moves `data_dirs` into the project-state provider.
             let session_store = session::SessionStore::new(&data_dirs);
+            if let Err(error) = session_store.recover_interrupted_autonomous_runs() {
+                eprintln!("eud-agent: autonomous restart recovery failed: {error}");
+            }
 
             let config =
                 engine::AgentEngineConfig::new("[project state]\n(unavailable)", None, Vec::new())
@@ -304,6 +355,9 @@ pub fn run() {
                         dirs: data_dirs.clone(),
                     }))
                     .with_project_state_provider(std::sync::Arc::new(AppProjectStateProvider {
+                        dirs: data_dirs.clone(),
+                    }))
+                    .with_project_map_provider(std::sync::Arc::new(AppProjectStateProvider {
                         dirs: data_dirs.clone(),
                     }));
 
@@ -325,7 +379,6 @@ pub fn run() {
             engine::engine_chat,
             engine::engine_plan_feedback,
             engine::engine_plan_approve,
-            engine::engine_changeset_decision,
             engine::engine_harness_jobs,
             engine::engine_harness_runtime_confirm,
             engine::engine_harness_skip,
@@ -334,6 +387,9 @@ pub fn run() {
             engine::engine_harness_decision,
             engine::engine_ask_response,
             engine::engine_ask_pending,
+            engine::engine_autonomous_pause,
+            engine::engine_autonomous_resume,
+            engine::engine_autonomous_stop,
             engine::engine_cancel,
             engine::engine_compact,
             engine::engine_conversation_rewind,
@@ -345,10 +401,18 @@ pub fn run() {
             engine::engine_session_rename,
             engine::engine_session_delete,
             mentions::mention_search,
+            rag_panel::rag_search,
+            rag_panel::rag_article,
+            dat_wiki::dat_wiki_schema,
+            dat_wiki::dat_wiki_object,
             map_agent::map_agent_open,
+            map_agent::map_agent_open_properties,
+            map_agent::map_task_apply_undo,
             map_import::map_agent_import_open,
             map_import::map_import_bootstrap,
             map_import::map_import_source_pick,
+            map_import::map_import_reference_list,
+            map_import::map_import_reference_pick,
             map_import::map_import_source_render,
             map_import::map_import_source_objects,
             map_import::map_import_stamp_save,
@@ -361,6 +425,8 @@ pub fn run() {
             map_agent::map_agent_session_load,
             map_agent::map_agent_session_rename,
             map_agent::map_agent_session_delete,
+            map_agent::map_agent_conversation_reset,
+            map_agent::map_agent_conversation_rewind,
             map_agent::map_agent_source_state,
             map_agent::map_agent_render,
             map_agent::map_agent_thumbnail,
@@ -378,8 +444,10 @@ pub fn run() {
             map_agent::map_agent_candidate_discard,
             map_agent::map_agent_candidate_apply,
             map_agent::map_agent_apply_undo,
+            map_agent::map_agent_properties_save,
             map_agent::map_agent_chat,
             map_agent::map_agent_cancel,
+            map_agent::map_agent_run_snapshot,
             attachment::stage_attachment,
             attachment::discard_attachment,
             ipc::app_settings,
@@ -411,11 +479,29 @@ pub fn run() {
             setup::euddraft_settings,
             setup::euddraft_check_update,
             setup::euddraft_update,
+            project_launch::project_take_launch_request,
+            setup::project_open,
+            setup::project_recent_list,
+            setup::project_recent_remove,
             setup::setup_pick_project_path,
             setup::setup_create_project,
+            setup::setup_map_new_options,
+            setup::setup_map_new_brushes,
+            setup::setup_pick_starcraft_path,
+            setup::setup_create_blank_project,
+            setup::setup_pick_e3s_source,
+            setup::setup_pick_import_destination,
             setup::setup_import_e3s,
             setup::project_export_e3s,
             setup::setup_pick_euddraft_path,
+            setup::settings_pick_scmdraft_path,
+            setup::project_open_scmdraft,
+            setup::git_state,
+            setup::git_consent_set,
+            setup::git_log,
+            setup::git_commit_detail,
+            setup::git_revert,
+            setup::setup_install_euddraft,
             setup::setup_provider_select,
             setup::bootstrap_run,
         ])

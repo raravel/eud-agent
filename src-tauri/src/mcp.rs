@@ -28,7 +28,6 @@ use rmcp::{ErrorData as McpError, RoleServer, ServerHandler};
 use serde_json::Value;
 
 use crate::provider_tool_loop::RunGate;
-use crate::tools::{map_mcp_tool_descriptors, mcp_tool_descriptors};
 
 /// The MCP server name codex registers (matched by the approval handler).
 pub const SERVER_NAME: &str = "eud-tools";
@@ -68,7 +67,7 @@ impl ServerHandler for EudToolHandler {
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
         Ok(ListToolsResult::with_all_items(tool_list(
-            self.gate.identity().session_kind,
+            self.gate.descriptors(),
         )))
     }
 
@@ -90,14 +89,9 @@ impl ServerHandler for EudToolHandler {
     }
 }
 
-/// Build the MCP `Tool` list from the registry's MCP descriptors (verbatim
-/// inputSchema per tool).
-fn tool_list(kind: crate::session::SessionKind) -> Vec<Tool> {
-    let descriptors = if kind == crate::session::SessionKind::Map {
-        map_mcp_tool_descriptors()
-    } else {
-        mcp_tool_descriptors()
-    };
+/// Build the MCP `Tool` list from the gate's advertised descriptors (verbatim
+/// inputSchema per tool), so a native CLI sees exactly what the gate admits.
+fn tool_list(descriptors: Vec<Value>) -> Vec<Tool> {
     descriptors
         .into_iter()
         .filter_map(|descriptor| {
@@ -269,7 +263,7 @@ mod tests {
 
     #[test]
     fn tool_list_exposes_every_registry_tool_with_its_schema() {
-        let tools = tool_list(crate::session::SessionKind::Eps);
+        let tools = tool_list(crate::tools::mcp_tool_descriptors());
         let registry = crate::tools::tool_registry();
         assert_eq!(tools.len(), registry.len());
 
@@ -283,13 +277,19 @@ mod tests {
         assert!(tools.iter().any(|tool| tool.name == "map_minimap"));
         assert!(tools.iter().any(|tool| tool.name == "switch_write"));
         assert!(tools.iter().any(|tool| tool.name == crate::tools::ASK_TOOL));
-        // SCA is fully defunct — it must never appear as a tool.
-        assert!(!tools.iter().any(|tool| tool.name.contains("sca")));
+        assert!(!tools
+            .iter()
+            .any(|tool| tool.name == "request_write_workspace"));
+        // SCA is fully defunct — it must never appear as a tool (as a name
+        // segment: `map_task_discard` legitimately contains the letters).
+        assert!(!tools
+            .iter()
+            .any(|tool| tool.name.split('_').any(|segment| segment == "sca")));
     }
 
     #[test]
     fn map_tool_list_excludes_original_apply_and_eps_mutations() {
-        let tools = tool_list(crate::session::SessionKind::Map);
+        let tools = tool_list(crate::tools::map_mcp_tool_descriptors());
         let registry = crate::tools::map_tool_registry();
         assert_eq!(tools.len(), registry.len());
         assert!(tools

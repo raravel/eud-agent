@@ -1,5 +1,5 @@
 import { Check, ChevronLeft, ChevronRight, CircleHelp, LoaderCircle, Send } from "lucide-react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
@@ -10,15 +10,55 @@ export interface AskCardProps {
   requestId: string;
   questions: AskQuestion[];
   submitting: boolean;
+  /** Bounded wait in seconds; with `receivedAt` the header counts down. */
+  waitSeconds?: number;
+  receivedAt?: number;
   onSubmit(answers: Record<string, AskAnswer>): void;
+}
+
+function formatRemaining(seconds: number): string {
+  const minutes = Math.floor(seconds / 60);
+  const rest = seconds % 60;
+  return `${minutes}:${rest.toString().padStart(2, "0")}`;
+}
+
+/** Whole seconds left before the core closes the request, or `null` when unbounded. */
+function useRemainingSeconds(
+  waitSeconds: number | undefined,
+  receivedAt: number | undefined,
+): number | null {
+  const compute = useCallback(
+    () =>
+      waitSeconds !== undefined && receivedAt !== undefined
+        ? Math.max(0, waitSeconds - Math.floor((Date.now() - receivedAt) / 1000))
+        : null,
+    [waitSeconds, receivedAt],
+  );
+  const [remaining, setRemaining] = useState<number | null>(compute);
+  useEffect(() => {
+    const initial = compute();
+    setRemaining(initial);
+    if (initial === null || initial === 0) return;
+    const timer = window.setInterval(() => {
+      const next = compute();
+      setRemaining(next);
+      // Stop ticking once the wait is over; the core's expired event closes the card.
+      if (next === null || next === 0) window.clearInterval(timer);
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, [compute]);
+  return remaining;
 }
 
 export function AskCard({
   requestId,
   questions,
   submitting,
+  waitSeconds,
+  receivedAt,
   onSubmit,
 }: AskCardProps) {
+  const remaining = useRemainingSeconds(waitSeconds, receivedAt);
   const cardRef = useRef<HTMLElement>(null);
   const tabRefs = useRef<Array<HTMLButtonElement | null>>([]);
   const [selected, setSelected] = useState<Record<string, string[]>>({});
@@ -139,12 +179,35 @@ export function AskCard({
           <div className="min-w-0 flex-1">
             <h2 className="text-sm font-semibold text-foreground">확인이 필요합니다</h2>
             <p className="mt-0.5 text-xs leading-5 text-muted-foreground">
-              답변하면 AI가 같은 작업을 이어서 진행합니다.
+              {remaining === null
+                ? "답변하면 AI가 같은 작업을 이어서 진행합니다."
+                : "답변하면 AI가 같은 작업을 이어서 진행합니다. 시간이 지나면 AI가 질문을 글로 남기고, 다음 메시지로 답할 수 있습니다."}
             </p>
           </div>
-          <span className="rounded-full bg-muted px-2 py-1 text-[11px] tabular-nums text-muted-foreground">
-            {questions.length}개 질문
-          </span>
+          <div className="flex shrink-0 flex-col items-end gap-1">
+            <span className="rounded-full bg-muted px-2 py-1 text-[11px] tabular-nums text-muted-foreground">
+              {questions.length}개 질문
+            </span>
+            {remaining !== null && (
+              <span
+                role="timer"
+                aria-live="off"
+                aria-label={
+                  remaining > 0
+                    ? `답변 남은 시간 ${formatRemaining(remaining)}`
+                    : "답변 시간 초과"
+                }
+                className={cn(
+                  "rounded-full px-2 py-1 text-[11px] tabular-nums",
+                  remaining > 0
+                    ? "bg-muted text-muted-foreground"
+                    : "bg-destructive/10 text-destructive",
+                )}
+              >
+                {remaining > 0 ? `남은 시간 ${formatRemaining(remaining)}` : "시간 초과"}
+              </span>
+            )}
+          </div>
         </header>
 
         {questions.length > 1 && (

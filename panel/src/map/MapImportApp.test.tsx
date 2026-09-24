@@ -5,6 +5,8 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 const api = vi.hoisted(() => ({
   bootstrap: vi.fn(),
   pick: vi.fn(),
+  referenceList: vi.fn(),
+  referencePick: vi.fn(),
   objects: vi.fn(),
   list: vi.fn(),
   save: vi.fn(),
@@ -16,6 +18,8 @@ const api = vi.hoisted(() => ({
 vi.mock("./importProtocol", () => ({
   mapImportBootstrap: api.bootstrap,
   mapImportSourcePick: api.pick,
+  mapImportReferenceList: api.referenceList,
+  mapImportReferencePick: api.referencePick,
   mapImportSourceObjects: api.objects,
   mapImportStampList: api.list,
   mapImportStampSave: api.save,
@@ -62,6 +66,7 @@ const source = {
   width: 128,
   height: 64,
   fileSize: 1024,
+  referenceName: null,
 };
 
 describe("Map Importer", () => {
@@ -69,6 +74,8 @@ describe("Map Importer", () => {
     vi.clearAllMocks();
     api.bootstrap.mockResolvedValue({ destination });
     api.pick.mockResolvedValue(source);
+    api.referenceList.mockResolvedValue([]);
+    api.referencePick.mockResolvedValue({ ...source, referenceName: "old.scx" });
     api.objects.mockResolvedValue({ layer: "units", offset: 0, total: 0, items: [] });
     api.list.mockResolvedValue([]);
     api.save.mockResolvedValue({ id: "import-a" });
@@ -113,5 +120,36 @@ describe("Map Importer", () => {
       screen.getByRole("button", { name: "프로젝트 팔레트에 추가" }),
     ).toBeDisabled();
     await waitFor(() => expect(api.save).not.toHaveBeenCalled());
+  });
+
+  it("lists references/ maps for a quick pick and refreshes the list after a picker copy", async () => {
+    api.referenceList
+      .mockResolvedValueOnce([{ name: "old.scx", fileSize: 2048 }])
+      .mockResolvedValue([
+        { name: "old.scx", fileSize: 2048 },
+        { name: "source.scx", fileSize: 1024 },
+      ]);
+    api.pick.mockResolvedValue({ ...source, referenceName: "source.scx" });
+    render(<MapImportApp />);
+
+    expect(await screen.findByText("references/ · 1")).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: /^old\.scx/ }));
+    expect(api.referencePick).toHaveBeenCalledWith("old.scx");
+    expect(api.pick).not.toHaveBeenCalled();
+    expect(await screen.findByText(/references\/old\.scx/)).toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: "SCX/SCM 선택" }));
+    expect(await screen.findByText(/references\/source\.scx/)).toBeInTheDocument();
+    expect(api.referenceList).toHaveBeenCalledTimes(3);
+
+    await userEvent.click(screen.getByLabelText("references 맵"));
+    await userEvent.click(screen.getByRole("option", { name: "old.scx" }));
+    expect(api.referencePick).toHaveBeenLastCalledWith("old.scx");
+  });
+
+  it("disables the references picker when the folder holds no map", async () => {
+    render(<MapImportApp />);
+    expect(await screen.findByLabelText("references 맵")).toBeDisabled();
+    expect(screen.queryByText(/references\/ ·/)).not.toBeInTheDocument();
   });
 });

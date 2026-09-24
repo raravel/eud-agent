@@ -175,6 +175,11 @@ pub struct EditorCompatibility {
     pub source_sha256: String,
     #[serde(default)]
     pub opaque_records: Vec<OpaqueEditorRecord>,
+    /// epScript import prefixes stripped when this project was imported from an E3S
+    /// (`import TriggerEditor.leaf` -> `import leaf`). Export restores them; the field
+    /// is additive so manifests written before it stay readable.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub editor_import_prefixes: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -342,6 +347,17 @@ pub enum DatTarget {
 pub enum DatScalar {
     Number(i64),
     Text(String),
+}
+
+/// One sparse override exactly as the project stores it: which document holds
+/// it, how to name it to the user, which target it addresses, and the `before`
+/// value it claims is stock.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DatOverride {
+    pub file: &'static str,
+    pub label: String,
+    pub target: DatTarget,
+    pub before: DatScalar,
 }
 
 impl NativeDatChange {
@@ -638,7 +654,7 @@ impl NativeProject {
     }
 
     pub fn output_map_path(&self) -> Result<PathBuf, String> {
-        self.require_path(&self.manifest.output_map, false)
+        self.require_path_with(&self.manifest.output_map, false, true)
     }
 
     pub fn list_source_files(&self) -> Result<Vec<String>, String> {
@@ -764,7 +780,7 @@ impl NativeProject {
     pub fn set_project_setting(&mut self, key: &str, value: &str) -> Result<(), String> {
         match key {
             "OpenMapName" => self.manifest.source_map = normalize_relative(value)?,
-            "SaveMapName" => self.manifest.output_map = normalize_relative(value)?,
+            "SaveMapName" => self.manifest.output_map = normalize_output_map_relative(value)?,
             "UseCustomtbl" => {
                 self.manifest.settings.use_custom_tbl = value
                     .parse::<bool>()
@@ -994,6 +1010,78 @@ impl NativeProject {
         }
     }
 
+    /// Every sparse override this project stores, with the `before` value it
+    /// claims is the stock catalog value.
+    ///
+    /// `dat_patch` checks that claim when it writes. An edit made straight to
+    /// `dat/*.json` does not pass through the patch, and a wrong `before` is
+    /// not a cosmetic error: the generator emits `SetMemory(offset, Add,
+    /// after - before)`, so the map silently runs on the wrong numbers. The
+    /// build checks the same rule again against this list.
+    pub fn dat_overrides(&self) -> Vec<DatOverride> {
+        let mut overrides = Vec::new();
+        for (file, document, numeric) in [
+            (STANDARD_DAT_FILE, &self.dat.standard, true),
+            (XDAT_FILE, &self.dat.xdat, false),
+        ] {
+            for (dat, objects) in &document.tables {
+                for (object_id, fields) in objects {
+                    for (field, change) in fields {
+                        let target = if numeric {
+                            DatTarget::Dat {
+                                dat: dat.clone(),
+                                object_id: *object_id,
+                                field: field.clone(),
+                            }
+                        } else {
+                            DatTarget::Xdat {
+                                dat: dat.clone(),
+                                object_id: *object_id,
+                                field: field.clone(),
+                            }
+                        };
+                        overrides.push(DatOverride {
+                            file,
+                            label: format!("{dat}[{object_id}].{field}"),
+                            target,
+                            before: DatScalar::Number(change.before),
+                        });
+                    }
+                }
+            }
+        }
+        for (index, change) in &self.dat.tbl.values {
+            overrides.push(DatOverride {
+                file: TBL_FILE,
+                label: format!("tbl[{index}]"),
+                target: DatTarget::Tbl(*index),
+                before: DatScalar::Text(change.before.clone()),
+            });
+        }
+        for (dat, objects) in &self.dat.requirements.tables {
+            for (object_id, change) in objects {
+                overrides.push(DatOverride {
+                    file: REQUIREMENTS_FILE,
+                    label: format!("{dat}[{object_id}]"),
+                    target: DatTarget::Requirement {
+                        dat: dat.clone(),
+                        object_id: *object_id,
+                    },
+                    before: DatScalar::Text(change.before.clone()),
+                });
+            }
+        }
+        for (set_id, change) in &self.dat.buttons.values {
+            overrides.push(DatOverride {
+                file: BUTTONS_FILE,
+                label: format!("buttons[{set_id}]"),
+                target: DatTarget::Button(*set_id),
+                before: DatScalar::Text(change.before.clone()),
+            });
+        }
+        overrides
+    }
+
     pub fn current_dat_value(&self, target: &DatTarget) -> Option<DatScalar> {
         match target {
             DatTarget::Dat {
@@ -1192,7 +1280,16 @@ impl NativeProject {
     }
 
     fn require_path(&self, relative: &str, must_exist: bool) -> Result<PathBuf, String> {
-        let relative = normalize_relative(relative)?;
+        self.require_path_with(relative, must_exist, false)
+    }
+
+    fn require_path_with(
+        &self,
+        relative: &str,
+        must_exist: bool,
+        allow_brackets: bool,
+    ) -> Result<PathBuf, String> {
+        let relative = normalize_relative_with(relative, allow_brackets)?;
         let path = self
             .root
             .join(relative.replace('/', std::path::MAIN_SEPARATOR_STR));
@@ -1752,7 +1849,14 @@ fn validate_manifest_source_paths(project: &NativeProject) -> Result<(), String>
     Ok(())
 }
 
-fn validate_manifest(manifest: &ProjectManifest) -> Result<(), String> {
+/// Canonical build output name for a project: `build/[EUD]<name>.<ext>`.
+/// `[`/`]` are safe here because the output map only ever appears as the
+/// `[main]` `output:` value in the generated EDS, never as a section header.
+pub fn default_output_map(name: &str, extension: &str) -> String {
+    format!("build/[EUD]{name}.{extension}")
+}
+
+pub fn validate_manifest(manifest: &ProjectManifest) -> Result<(), String> {
     if manifest.schema_version != PROJECT_SCHEMA_VERSION {
         return Err(format!(
             "project schemaVersion {} is unsupported (expected {PROJECT_SCHEMA_VERSION})",
@@ -1763,7 +1867,7 @@ fn validate_manifest(manifest: &ProjectManifest) -> Result<(), String> {
         return Err("project name must contain 1..128 characters".to_string());
     }
     let source = normalize_relative(&manifest.source_map)?;
-    let output = normalize_relative(&manifest.output_map)?;
+    let output = normalize_output_map_relative(&manifest.output_map)?;
     let main = normalize_relative(&manifest.main_file)?;
     if !matches_extension(&source, &["scx", "scm"]) {
         return Err("sourceMap must end in .scx or .scm".to_string());
@@ -2077,8 +2181,30 @@ fn windows_case_fold(value: &str) -> String {
     value.to_lowercase()
 }
 
+/// Normalize a project-relative path that may appear as an EDS section header
+/// (`[src/plugin.eps]`), so `[` and `]` are rejected outright.
 pub fn normalize_relative(value: &str) -> Result<String, String> {
-    if value.is_empty() || value.contains(['\0', '\\', '\r', '\n', '[', ']']) {
+    normalize_relative_with(value, false)
+}
+
+/// Normalize the output map path. It is only ever emitted as the `[main]`
+/// `output:` value, never as a section header, so `[EUD]name.scx` is allowed.
+pub fn normalize_output_map_relative(value: &str) -> Result<String, String> {
+    normalize_relative_with(value, true)
+}
+
+/// Normalize an arbitrary path under the project root for the `fs_*` tools.
+/// They address the whole root, where `build/[EUD]name.scx` is a real file
+/// name, so brackets are allowed; everything `rules.md` rejects still is.
+pub(crate) fn normalize_relative_path(value: &str) -> Result<String, String> {
+    normalize_relative_with(value, true)
+}
+
+fn normalize_relative_with(value: &str, allow_brackets: bool) -> Result<String, String> {
+    if value.is_empty()
+        || value.contains(['\0', '\\', '\r', '\n'])
+        || (!allow_brackets && value.contains(['[', ']']))
+    {
         return Err("path must be non-empty and use '/' separators".to_string());
     }
     let path = Path::new(value);
@@ -2113,6 +2239,13 @@ fn matches_extension(path: &str, extensions: &[&str]) -> bool {
         .is_some_and(|value| extensions.iter().any(|ext| value.eq_ignore_ascii_case(ext)))
 }
 
+/// Build-time generated shadows of the canonical source tree. They are
+/// outputs, never canonical state, so every source list/snapshot/revision/
+/// search/export surface skips them (plan D8).
+pub(crate) fn is_generated_artifact_dir(name: &str) -> bool {
+    name.eq_ignore_ascii_case("__epspy__") || name.eq_ignore_ascii_case("__pycache__")
+}
+
 fn collect_text_files(
     root: &Path,
     project_root: &Path,
@@ -2128,6 +2261,11 @@ fn collect_text_files(
     entries.sort_by_key(|entry| entry.file_name().to_string_lossy().to_lowercase());
     for entry in entries {
         let file_type = entry.file_type().map_err(stringify_io)?;
+        if file_type.is_dir()
+            && is_generated_artifact_dir(entry.file_name().to_string_lossy().as_ref())
+        {
+            continue;
+        }
         let metadata = fs::symlink_metadata(entry.path()).map_err(stringify_io)?;
         if file_type.is_symlink() || crate::memory::is_reparse_point(&metadata) {
             return Err(format!(
@@ -2370,6 +2508,25 @@ mod tests {
     }
 
     #[test]
+    fn generated_artifact_dirs_stay_out_of_the_canonical_source_tree() {
+        let (root, project) = project("artifacts");
+        fs::create_dir_all(root.join("src/__epspy__")).unwrap();
+        fs::write(root.join("src/__epspy__/main.py"), b"# generated shadow\n").unwrap();
+        fs::create_dir_all(root.join("src/sub/__pycache__")).unwrap();
+        fs::write(root.join("src/sub/__pycache__/x.pyc"), b"\x00\x01").unwrap();
+
+        let reopened = NativeProject::open(&root).unwrap();
+        assert_eq!(
+            reopened.list_source_files().unwrap(),
+            vec!["src/main.eps".to_string()]
+        );
+        assert!(!reopened.has_direct_python().unwrap());
+        // Build artifacts must not perturb the project revision.
+        assert_eq!(reopened.revision().unwrap(), project.revision().unwrap());
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
     fn source_mutations_stay_confined_and_track_main() {
         let (root, mut project) = project("source");
         assert!(project.write_source("../escape.eps", "x").is_err());
@@ -2448,6 +2605,48 @@ mod tests {
         let persisted: ProjectManifest =
             serde_json::from_slice(&fs::read(&renamed).unwrap()).unwrap();
         assert_eq!(persisted.main_file, "src/alternate.eps");
+        drop(project);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn brackets_are_allowed_only_in_the_output_map() {
+        assert_eq!(default_output_map("Arena", "scx"), "build/[EUD]Arena.scx");
+        assert_eq!(
+            normalize_output_map_relative("build/[EUD]Arena.scx").unwrap(),
+            "build/[EUD]Arena.scx"
+        );
+        assert!(normalize_relative("build/[EUD]Arena.scx").is_err());
+
+        let mut bracketed = manifest();
+        bracketed.output_map = "build/[EUD]Arena.scx".to_string();
+        validate_manifest(&bracketed).unwrap();
+
+        let mut source = manifest();
+        source.source_map = "maps/[EUD]source.scx".to_string();
+        assert!(validate_manifest(&source).is_err());
+        let mut main = manifest();
+        main.main_file = "src/[main].eps".to_string();
+        assert!(validate_manifest(&main).is_err());
+
+        let (root, mut project) = project("bracketed-output");
+        project
+            .set_project_setting("SaveMapName", "build/[EUD]Arena.scx")
+            .unwrap();
+        assert!(project
+            .set_project_setting("OpenMapName", "maps/[EUD]source.scx")
+            .is_err());
+        let output = project.output_map_path().unwrap();
+        assert!(output.starts_with(project.root()));
+        assert!(output.ends_with(Path::new("build").join("[EUD]Arena.scx")));
+        // The EDS `[main]` value keeps the brackets verbatim and stays a value line.
+        let eds = format!(
+            "[main]\ninput: maps/source.scx\noutput: {}\n",
+            project.manifest().output_map
+        );
+        assert!(eds
+            .lines()
+            .all(|line| !(line.starts_with('[') && line.ends_with(']')) || line == "[main]"));
         drop(project);
         fs::remove_dir_all(root).ok();
     }

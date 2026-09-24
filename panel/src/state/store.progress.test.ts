@@ -2,7 +2,7 @@
  * Live progress rows are transient turn indicators, not history.
  *
  * "codex 실행 중…" (kind "progress") lines logged during a turn must disappear
- * when the turn ends (answer / plan / changeset / error / cancel) — leaving
+ * when the turn ends (answer / plan / error / cancel) — leaving
  * them reads as a still-running stage after the answer already arrived.
  * Completion records (kind ok/warn, e.g. "RAG 모델 준비 완료") are kept.
  */
@@ -35,18 +35,11 @@ describe("live progress rows clear when the turn ends", () => {
     expect(store.getState().phase).toBe("ready");
   });
 
-  it("plan/changeset turn-ends clear the in-flight progress rows too", () => {
+  it("a plan turn-end clears the in-flight progress rows too", () => {
     const store = createPanelStore();
     store.chatSent();
     store.log("progress", "RAG 컨텍스트 검색 중…", "rag");
     store.planReceived("# plan", 1);
-    expect(logTexts(store)).toEqual([]);
-
-    store.planApproveSent();
-    store.log("progress", "codex 실행 중…", "codex");
-    store.changesetReceived("req-1", [
-      { category: "file", id: "a", seq: 1 },
-    ]);
     expect(logTexts(store)).toEqual([]);
   });
 

@@ -12,7 +12,7 @@ use super::foreground::ensure_expected_session;
 use super::process::StreamProcessRequest;
 use super::request::{stream_args, validate_workspace_boundary, MAX_STDOUT_BYTES};
 
-pub(super) const CLAUDE_PROVIDER_DEFAULT: &str = "provider-default";
+pub(super) use crate::claude_client::catalog::CLAUDE_PROVIDER_DEFAULT;
 
 pub(super) struct PreparedClaudeProcess {
     pub(super) child: tokio::process::Child,
@@ -25,6 +25,14 @@ pub struct ProductionClaudeCodeAdapter {
     pub(super) executable_prefix_args: Vec<String>,
     pub(super) profile_dir: PathBuf,
     pub(super) conversation_id: Option<String>,
+    /// The session id the running CLI published in its `init` line. The CLI
+    /// keeps that session resumable after an interruption, so a cancelled or
+    /// failed run still has a confirmed native continuation boundary.
+    pub(super) observed_session_id: Option<String>,
+    /// The session the run in progress asked to resume. A CLI that answers
+    /// with a different session deviated from its protocol, and neither its
+    /// id nor the prior one is a boundary this adapter may adopt.
+    pub(super) resume_target: Option<String>,
     pub(super) last_cwd: Option<PathBuf>,
     pub(super) continuation_unknown: bool,
     pub(super) prepared_compaction: Option<PreparedClaudeProcess>,
@@ -36,17 +44,16 @@ impl ProductionClaudeCodeAdapter {
         executable: PathBuf,
         profile_dir: PathBuf,
     ) -> Result<Self, ProviderRuntimeError> {
-        if model != CLAUDE_PROVIDER_DEFAULT {
-            return Err(ProviderRuntimeError::Protocol(
-                "provider_model_unavailable".to_string(),
-            ));
-        }
+        crate::claude_client::catalog::validate_model_id(&model)
+            .map_err(ProviderRuntimeError::Protocol)?;
         Ok(Self {
             model,
             executable,
             executable_prefix_args: Vec::new(),
             profile_dir,
             conversation_id: None,
+            observed_session_id: None,
+            resume_target: None,
             last_cwd: None,
             continuation_unknown: false,
             prepared_compaction: None,
@@ -96,10 +103,20 @@ impl ProviderAdapter for ProductionClaudeCodeAdapter {
     fn reset(&mut self) -> AdapterFuture<'_, Result<(), ProviderRuntimeError>> {
         Box::pin(async move {
             self.conversation_id = None;
+            self.observed_session_id = None;
+            self.resume_target = None;
             self.continuation_unknown = false;
             self.prepared_compaction = None;
             Ok(())
         })
+    }
+
+    fn observed_conversation(&self) -> Option<ProviderConversationState> {
+        self.observed_session_id
+            .clone()
+            .map(|session_id| ProviderConversationState::ClaudeCode {
+                session_id: Some(session_id),
+            })
     }
 
     fn compact<'a>(
@@ -121,11 +138,14 @@ impl ProviderAdapter for ProductionClaudeCodeAdapter {
                 ProviderRuntimeError::Protocol("provider workspace is unavailable".to_string())
             })?;
             self.continuation_unknown = true;
+            self.observed_session_id = None;
+            self.resume_target = Some(session_id.clone());
             let result = self
                 .run_stream_process(StreamProcessRequest {
                     identity: &identity,
                     cwd: &cwd,
-                    args: stream_args(None, Some(&session_id), true),
+                    args: stream_args(None, Some(&session_id), true, &self.model, None)
+                        .map_err(ProviderRuntimeError::Protocol)?,
                     message: json!({"type":"user","message":{"role":"user","content":[{"type":"text","text":"/compact"}]},"parent_tool_use_id":Value::Null}),
                     require_mcp: false,
                     max_output_bytes: MAX_STDOUT_BYTES,
@@ -165,6 +185,7 @@ impl ProviderAdapter for ProductionClaudeCodeAdapter {
                 ));
             };
             self.conversation_id = session_id;
+            self.observed_session_id = None;
             self.continuation_unknown = false;
             self.prepared_compaction = None;
             Ok(())
@@ -194,7 +215,8 @@ impl ProviderAdapter for ProductionClaudeCodeAdapter {
                 .map_err(ProviderRuntimeError::Protocol)?;
             let prepared = self.spawn_stream_process(
                 &request.workspace_root,
-                stream_args(None, Some(session_id), true),
+                stream_args(None, Some(session_id), true, &self.model, None)
+                    .map_err(ProviderRuntimeError::Protocol)?,
             )?;
             self.last_cwd = Some(request.workspace_root.clone());
             self.prepared_compaction = Some(prepared);

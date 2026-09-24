@@ -10,13 +10,14 @@ publish = false
 # Tauri 2 idiomatic split: the app entry lives in a lib so the same code can be
 # reused by mobile targets / integration tests; main.rs is a thin shim.
 name = "eud_agent_lib"
-crate-type = ["staticlib", "cdylib", "rlib"]
+crate-type = ["rlib"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
 tauri = { version = "2", features = [] }
+tauri-plugin-single-instance = "2"
 tauri-plugin-shell = "2"
 tauri-plugin-dialog = "2"
 # Self-update (Decision 04): the updater downloads + verifies + installs the signed
@@ -39,6 +40,9 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 sha2 = "0.10"
 base64 = "0.22"
 png = "0.18"
+# fs_grep is a real search tool, not a substring scan; the regex crate is
+# already in the lock through fastembed, so this adds no new build.
+regex = "1"
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
 zip = { version = "2", default-features = false, features = ["deflate"] }
 uuid = { version = "1", features = ["v4"] }
@@ -74,12 +78,15 @@ windows-sys = { version = "0.59", features = [
     "Win32_Security_Cryptography_Catalog",
     "Win32_Security_Cryptography_Sip",
     "Win32_Storage_FileSystem",
+    "Win32_Storage_Xps",
     "Win32_System_Diagnostics_Debug",
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_JobObjects",
     "Win32_System_Memory",
     "Win32_System_Com",
+    "Win32_System_StationsAndDesktops",
     "Win32_System_Threading",
+    "Win32_Graphics_Gdi",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Shell",

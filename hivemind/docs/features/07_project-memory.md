@@ -10,7 +10,7 @@ foreground Codex turn.
 
 ## Storage
 
-Rust owns `%appdata%\eud-agent\memory\<sanitized-project-name>\`:
+Rust owns `<project>/.eud-agent/memory/`:
 
 | File | Content |
 |---|---|
@@ -19,10 +19,17 @@ Rust owns `%appdata%\eud-agent\memory\<sanitized-project-name>\`:
 | `conventions.md` | Stable naming and trigger conventions |
 | `lessons.md` | Durable user corrections and their application rule |
 | `meta.json` | Store metadata and source-list hash |
+| `wiki/ledger.json` | Accepted DAT edits and user corrections |
 
-Project names come from native project status. Windows-invalid filename characters are replaced
-with `_`; trailing dots/spaces are stripped. An unavailable project disables memory. Writes are
-atomic UTF-8 without BOM, each Markdown file has an 8 KiB cap, and absent files read as empty.
+Live stores resolve from a validated native project root; project names are display/request labels,
+not storage keys. Sanitized names are used only to locate preserved legacy import sources.
+An unavailable project disables memory. Writes are atomic UTF-8 without BOM, each Markdown file
+has an 8 KiB cap, and absent files read as empty. Same-name projects have separate local stores,
+and moving the entire project preserves its memory/wiki.
+
+E3S setup import recognizes the original full-path key, historical quoted/unquoted names, and Windows aliases. It reports ambiguous stores and unavailable/corrupt/conflicting items for explicit exclusion, copying healthy independent items without replacing local files. The old source-list hash and originals remain unchanged. Workspace documents/approvals, memory/wiki, and copied AppData conversation histories share the setup review/rollback boundary; see [E3S compatibility](01_e3s-compatibility.md#local-harness-migration).
+
+On the first open of an existing native project, migrate old AppData workspace/memory only when validated legacy state establishes unique ownership. Name-only memory that cannot be bound safely is reported and preserved. `.eud-agent/state/appdata-migration.json` records completion/omissions; reopening does not replay old files after local deletion. Fresh project creation/import does not attach another project's same-name store. Conversations, jobs, sessions, credentials, and caches are not relocated into the project.
 
 ## Foreground boundary
 

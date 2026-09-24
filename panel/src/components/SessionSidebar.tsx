@@ -12,6 +12,7 @@ import {
   Trash2,
 } from "lucide-react";
 
+import { SessionIdCopyButton } from "@/components/SessionIdCopyButton";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { cn } from "@/lib/utils";
@@ -288,7 +289,7 @@ export function SessionSidebar({
                       "flex max-w-full overflow-hidden rounded-md text-left outline-none transition-colors focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring",
                       collapsed
                         ? "size-11 items-center justify-center"
-                        : "min-h-[58px] w-full min-w-0 items-start gap-2.5 px-2.5 py-2 pr-[5.5rem]",
+                        : "min-h-[58px] w-full min-w-0 items-start gap-2.5 px-2.5 py-2 pr-[4.75rem]",
                       selected
                         ? "bg-primary/10 text-foreground shadow-[inset_2px_0_0_var(--primary)]"
                         : "text-muted-foreground hover:bg-muted/65 hover:text-foreground",
@@ -352,11 +353,16 @@ export function SessionSidebar({
 
                   {!collapsed && (
                     <>
+                      <SessionIdCopyButton
+                        id={row.id}
+                        name={row.name}
+                        className="absolute right-2 top-2"
+                      />
                       <Button
                         type="button"
                         size="icon"
                         variant="ghost"
-                        className="absolute right-10 top-[11px] size-9 opacity-0 focus-visible:opacity-100 group-hover:opacity-100"
+                        className="absolute right-9 top-[23px] size-8 opacity-0 focus-visible:opacity-100 group-hover:opacity-100"
                         aria-label={`${row.name} 이름 변경`}
                         onClick={() => handleRename(row)}
                       >
@@ -366,7 +372,7 @@ export function SessionSidebar({
                         type="button"
                         size="icon"
                         variant="ghost"
-                        className="absolute right-1 top-[11px] size-9 opacity-0 focus-visible:opacity-100 group-hover:opacity-100"
+                        className="absolute right-1 top-[23px] size-8 opacity-0 focus-visible:opacity-100 group-hover:opacity-100"
                         aria-label={`${row.name} 삭제`}
                         disabled={
                           row.activity === "running_read" ||

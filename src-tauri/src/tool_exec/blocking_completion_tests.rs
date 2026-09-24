@@ -32,7 +32,7 @@ async fn cancelled_mutation_future_keeps_real_file_journal_and_old_run_receipt()
         .execute("search_docs", &json!({"query": "파일 생성"}))
         .unwrap();
     runtime
-        .request_write_workspace("create source fixture")
+        .register_write_request("create source fixture")
         .unwrap();
     let identity = RunIdentity {
         session_id: runtime.session_id().to_string(),

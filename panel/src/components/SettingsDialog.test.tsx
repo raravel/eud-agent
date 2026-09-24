@@ -9,11 +9,13 @@ import { SettingsDialog } from "./SettingsDialog";
 const settings: AppSettings = {
   notifications: {
     planApproval: { sound: true, osNotification: true },
-    changesetReview: { sound: true, osNotification: true },
+    reviewRequired: { sound: true, osNotification: true },
     agentTurnComplete: { sound: true, osNotification: true },
     askResponseRequired: { sound: true, osNotification: true },
   },
   codexLargeContextModels: [],
+  deepPlanning: false,
+  scmdraftPath: "",
 };
 
 const euddraft: EuddraftSettings = {
@@ -88,6 +90,7 @@ function renderDialog(
     onProjectExport: vi.fn(),
     onEuddraftCheck: vi.fn(),
     onEuddraftUpdate: vi.fn(),
+    onScmdraftPick: vi.fn(),
     ...overrides,
   };
   return { ...render(<SettingsDialog {...props} />), props };
@@ -118,6 +121,59 @@ describe("SettingsDialog provider management", () => {
     expect(onProjectCreate).toHaveBeenCalledOnce();
     expect(onProjectImport).toHaveBeenCalledOnce();
     expect(onProjectExport).toHaveBeenCalledOnce();
+  });
+
+  it("shows the SCMDraft 2 executable under 컴파일 and lets the user pick it", async () => {
+    const onScmdraftPick = vi.fn();
+    const { rerender, props } = renderDialog({ onScmdraftPick });
+
+    await userEvent.click(screen.getByRole("button", { name: "컴파일" }));
+    const section = screen.getByRole("region", { name: "SCMDraft 2" });
+    expect(within(section).getByText("지정되지 않음")).toBeInTheDocument();
+    await userEvent.click(within(section).getByRole("button", { name: "실행 파일 선택" }));
+    expect(onScmdraftPick).toHaveBeenCalledOnce();
+
+    const scmdraftPath = String.raw`C:\Tools\ScmDraft 2\ScmDraft 2.exe`;
+    rerender(
+      <SettingsDialog
+        {...props}
+        settings={{ ...settings, scmdraftPath }}
+        scmdraftBusy
+        scmdraftError="SCMDraft 2 실행 파일을 설정하지 못했습니다. ScmDraft 2.exe를 다시 선택해 주세요."
+      />,
+    );
+    const updated = screen.getByRole("region", { name: "SCMDraft 2" });
+    expect(within(updated).getByText(scmdraftPath)).toBeInTheDocument();
+    expect(within(updated).getByRole("button", { name: "선택 중…" })).toBeDisabled();
+    expect(within(updated).getByRole("alert")).toHaveTextContent("다시 선택해 주세요");
+  });
+
+  it("shows the StarCraft install folder under 컴파일 and lets the user pick it", async () => {
+    const onStarcraftPick = vi.fn();
+    const reason = "StarCraft 설치 폴더를 찾지 못했습니다.";
+    const { rerender, props } = renderDialog({
+      onStarcraftPick,
+      starcraft: { available: false, path: "", reason },
+    });
+
+    await userEvent.click(screen.getByRole("button", { name: "컴파일" }));
+    const section = screen.getByRole("region", { name: "StarCraft" });
+    expect(within(section).getByText("찾지 못함")).toBeInTheDocument();
+    expect(within(section).getByText(reason)).toBeInTheDocument();
+    await userEvent.click(within(section).getByRole("button", { name: "폴더 선택" }));
+    expect(onStarcraftPick).toHaveBeenCalledOnce();
+
+    const starcraftPath = String.raw`D:\Games\StarCraft`;
+    rerender(
+      <SettingsDialog
+        {...props}
+        starcraft={{ available: true, path: starcraftPath }}
+        starcraftBusy
+      />,
+    );
+    const updated = screen.getByRole("region", { name: "StarCraft" });
+    expect(within(updated).getByText(starcraftPath)).toBeInTheDocument();
+    expect(within(updated).getByRole("button", { name: "선택 중…" })).toBeDisabled();
   });
 
   it("shows managed euddraft versions and exposes check and update actions", async () => {
@@ -218,10 +274,43 @@ describe("SettingsDialog provider management", () => {
     });
   });
 
+  it("round-trips the deep-planning switch under the AI provider section", async () => {
+    const onSettingsChange = vi.fn();
+    const { rerender, props } = renderDialog({ onSettingsChange });
+    const toggle = screen.getByRole("switch", { name: "더 똑똑한 계획" });
+    expect(toggle).not.toBeChecked();
+    expect(
+      screen.getByText(
+        "계획마다 모델 호출이 여러 번 추가되어 토큰 사용량이 크게 늘어납니다.",
+      ),
+    ).toBeInTheDocument();
+    await userEvent.click(toggle);
+    expect(onSettingsChange).toHaveBeenCalledWith({
+      ...settings,
+      deepPlanning: true,
+    });
+
+    rerender(
+      <SettingsDialog {...props} settings={{ ...settings, deepPlanning: true }} />,
+    );
+    const enabled = screen.getByRole("switch", { name: "더 똑똑한 계획" });
+    expect(enabled).toBeChecked();
+    await userEvent.click(enabled);
+    expect(onSettingsChange).toHaveBeenLastCalledWith({
+      ...settings,
+      deepPlanning: false,
+    });
+  });
+
   it("keeps notification controls available in their own category", async () => {
     const onSettingsChange = vi.fn();
     renderDialog({ onSettingsChange });
     await userEvent.click(screen.getByRole("button", { name: "알림" }));
+    // The changeset-review channel is gone with request review; the remaining
+    // three are the only rows.
+    expect(
+      screen.queryByRole("switch", { name: "변경사항 검토 필요 알림음" }),
+    ).not.toBeInTheDocument();
     await userEvent.click(screen.getByRole("switch", { name: "에이전트 턴 종료 알림음" }));
     expect(onSettingsChange).toHaveBeenCalledWith({
       ...settings,

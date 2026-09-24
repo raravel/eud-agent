@@ -28,11 +28,7 @@ impl ClaudeStreamParser {
                 .remove(&call_id)
                 .ok_or_else(protocol_changed)?;
             let result = block.get("content").cloned().ok_or_else(protocol_changed)?;
-            if serde_json::to_vec(&result)
-                .map_err(|_| protocol_changed())?
-                .len()
-                > MAX_NATIVE_OBSERVATION_BYTES
-            {
+            if non_image_observation_bytes(&result)? > MAX_NATIVE_OBSERVATION_BYTES {
                 return Err(protocol_changed());
             }
             events.push(ParsedEvent::ToolObservation {
@@ -52,4 +48,25 @@ impl ClaudeStreamParser {
         }
         Ok(())
     }
+}
+
+/// Size of an echoed tool result excluding MCP `image` content blocks. Rendered
+/// map images are bounded only by the raw stdout ceiling: their base64 payload
+/// scales with the requested crop, not with anything the observation limit is
+/// meant to catch, and the `eud-tools` observation is never forwarded anyway.
+fn non_image_observation_bytes(result: &Value) -> Result<usize, ProviderRuntimeError> {
+    let serialized_len = |value: &Value| {
+        serde_json::to_vec(value)
+            .map(|bytes| bytes.len())
+            .map_err(|_| protocol_changed())
+    };
+    let Some(blocks) = result.as_array() else {
+        return serialized_len(result);
+    };
+    blocks
+        .iter()
+        .filter(|block| block.get("type").and_then(Value::as_str) != Some("image"))
+        .try_fold(0_usize, |total, block| {
+            serialized_len(block).map(|len| total.saturating_add(len))
+        })
 }

@@ -20,6 +20,10 @@ pub struct ModelContextCursor {
     pub epoch: u64,
     pub memory_sha256: Option<String>,
     pub wiki_sha256: Option<String>,
+    /// Hash of the delivered `[project map]` section; absent for sessions
+    /// persisted before the section existed, which forces one replacement.
+    #[serde(default)]
+    pub project_map_sha256: Option<String>,
     pub task_revision: u64,
 }
 
@@ -35,6 +39,7 @@ impl Default for ModelContextCursor {
             epoch: 0,
             memory_sha256: None,
             wiki_sha256: None,
+            project_map_sha256: None,
             task_revision: 0,
         }
     }
@@ -105,6 +110,7 @@ impl SessionContextState {
                 epoch: self.instruction_epoch,
                 memory_sha256: section_hash(memory),
                 wiki_sha256: section_hash(wiki),
+                project_map_sha256: None,
                 task_revision,
             };
         }
@@ -129,6 +135,9 @@ pub struct ContextAssemblyInput<'a> {
     pub project_state: &'a str,
     pub project_memory: Option<&'a str>,
     pub wiki_facts: Option<&'a str>,
+    /// The `[project map]` section (file listing, spec index); delta-delivered
+    /// like memory so an unchanged tree costs nothing per turn.
+    pub project_map: Option<&'a str>,
     pub reference_context: Option<&'a str>,
     pub task_revision: u64,
     pub task_snapshot: &'a str,
@@ -163,11 +172,15 @@ pub fn assemble_context(
         || state.delivered.conversation_key.as_deref() != input.current_conversation_key;
     let memory_hash = section_hash(input.project_memory);
     let wiki_hash = section_hash(input.wiki_facts);
+    let project_map_hash = section_hash(input.project_map);
     let mut parts = Vec::new();
 
     if full {
         push_nonempty(&mut parts, input.static_baseline);
         push_nonempty(&mut parts, input.project_state);
+        if let Some(map) = normalized(input.project_map) {
+            parts.push(map.to_string());
+        }
         if let Some(memory) = normalized(input.project_memory) {
             parts.push(memory.to_string());
         }
@@ -183,6 +196,14 @@ pub fn assemble_context(
         }
     } else {
         push_nonempty(&mut parts, input.project_state);
+        if state.delivered.project_map_sha256 != project_map_hash {
+            parts.push(replacement_section(
+                "project map",
+                state.instruction_epoch,
+                project_map_hash.as_deref(),
+                input.project_map,
+            ));
+        }
         if state.delivered.memory_sha256 != memory_hash {
             parts.push(replacement_section(
                 "project memory",
@@ -225,6 +246,7 @@ pub fn assemble_context(
             epoch: state.instruction_epoch,
             memory_sha256: memory_hash,
             wiki_sha256: wiki_hash,
+            project_map_sha256: project_map_hash,
             task_revision: input.task_revision,
         },
     })
@@ -280,6 +302,7 @@ mod tests {
             project_state: "[project state]\nproject=Sample",
             project_memory: memory,
             wiki_facts: wiki,
+            project_map: None,
             reference_context: Some("[reference context]\nsource hit"),
             task_revision,
             task_snapshot: "[active task state]\nfull",

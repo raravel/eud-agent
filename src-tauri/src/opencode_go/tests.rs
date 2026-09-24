@@ -45,6 +45,7 @@ fn fixture_request(
             text: "inspect".to_string(),
             image_paths: Vec::new(),
             workspace_root: None,
+            workspace_temp: None,
             workspace_access: WorkspaceAccess::Read,
             output_schema: None,
             forbid_tools: false,

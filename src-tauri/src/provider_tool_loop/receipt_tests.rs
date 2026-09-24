@@ -201,3 +201,92 @@ fn completion() -> DurableToolCompletion {
         is_error: false,
     }
 }
+
+#[test]
+fn long_map_run_of_rendered_images_stays_within_the_receipt_bound() {
+    // Given: a Map run renders the candidate dozens of times; each render is a
+    // multi-megabyte MCP image block the model must see in full.
+    let root = TestRoot::new();
+    let store = RunReceiptStore::new(root.path().to_path_buf(), &identity());
+    store
+        .begin_native(ProviderId::ClaudeCode, Some("thread"))
+        .unwrap();
+    let data = "A".repeat(2 * 1024 * 1024);
+    let completions: Vec<DurableToolCompletion> = (1..=40)
+        .map(|sequence| {
+            let call = crate::provider_tool_loop::DirectToolCall {
+                id: format!("render-{sequence}"),
+                name: "map_draft_render".to_string(),
+                arguments: serde_json::json!({}),
+            };
+            let result = crate::provider_tool_loop::DirectToolResult {
+                id: call.id.clone(),
+                name: call.name.clone(),
+                result: serde_json::json!({
+                    "image": {
+                        "mimeType": "image/png",
+                        "width": 1024,
+                        "height": 1024,
+                        "data": data,
+                    }
+                }),
+                is_error: false,
+            };
+            crate::provider_tool_loop::completion::durable_completion(
+                sequence,
+                &identity(),
+                &call,
+                &result,
+            )
+        })
+        .collect();
+
+    // When: every completion is recorded on the receipt (80 MiB of raw image data).
+    store.persist(&completions).unwrap();
+
+    // Then: the receipt keeps the image identity, not its bytes, and stays bounded.
+    let receipt = read_receipt(&store.path()).unwrap();
+    assert_eq!(receipt.completions.len(), 40);
+    let image = &receipt.completions[39].result["image"];
+    assert_eq!(image["mimeType"], "image/png");
+    assert_eq!(image["width"], 1024);
+    assert_eq!(image["height"], 1024);
+    assert!(image.get("data").is_none());
+    assert_eq!(image["dataBytes"], 2 * 1024 * 1024);
+    assert_eq!(image["dataSha256"].as_str().unwrap().len(), 64);
+    assert!(fs::metadata(store.path()).unwrap().len() < 1024 * 1024);
+}
+
+#[test]
+fn oversized_text_result_is_digested_on_the_receipt_and_small_results_stay_exact() {
+    let call = crate::provider_tool_loop::DirectToolCall {
+        id: "call".to_string(),
+        name: "file_read".to_string(),
+        arguments: serde_json::json!({}),
+    };
+    let small = crate::provider_tool_loop::DirectToolResult {
+        id: call.id.clone(),
+        name: call.name.clone(),
+        result: serde_json::json!({"content": "short"}),
+        is_error: false,
+    };
+    assert_eq!(
+        crate::provider_tool_loop::completion::durable_completion(1, &identity(), &call, &small)
+            .result,
+        serde_json::json!({"content": "short"})
+    );
+
+    let large = crate::provider_tool_loop::DirectToolResult {
+        id: call.id.clone(),
+        name: call.name.clone(),
+        result: serde_json::json!({"content": "B".repeat(200 * 1024)}),
+        is_error: false,
+    };
+    let bounded =
+        crate::provider_tool_loop::completion::durable_completion(2, &identity(), &call, &large)
+            .result;
+    assert_eq!(bounded["receiptOmitted"], true);
+    assert_eq!(bounded["sha256"].as_str().unwrap().len(), 64);
+    assert!(bounded["bytes"].as_u64().unwrap() > 200 * 1024);
+    assert!(serde_json::to_vec(&bounded).unwrap().len() < 4096);
+}

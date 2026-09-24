@@ -357,35 +357,16 @@ impl WikiStore {
 
 /// Which properties of an accepted changeset are recorded to the ledger.
 ///
-/// `All` records every dat property (accept-all); `Ids` records only the dat
-/// properties whose changeset item id OR per-property journal entry id is listed
-/// (per-property accept granularity — EUD changeset decision contract).
-#[derive(Debug, Clone)]
-pub enum AcceptedScope {
-    All,
-    Ids(Vec<String>),
-}
-
-impl AcceptedScope {
-    fn includes(&self, item_id: &str, property_id: &str) -> bool {
-        match self {
-            Self::All => true,
-            Self::Ids(ids) => ids.iter().any(|id| id == item_id || id == property_id),
-        }
-    }
-}
-
-/// Build the ledger entries for the ACCEPTED dat property changes of a changeset.
+/// Build the ledger entries for the dat property changes a turn applied.
 ///
 /// Only `JournalTarget::Dat`-derived items (`dat_ref.is_some()`) are recorded — file,
 /// settings, plugin, and map items are skipped (wiki scope is dat-editor tables only).
-/// Each accepted [`crate::journal::PropertyChange`] becomes one [`LedgerEntry`] with
+/// Each [`crate::journal::PropertyChange`] becomes one [`LedgerEntry`] with
 /// `value = new`. `applied_at` is taken from the matching journal entry's `ts` (never
 /// `Date::now`); `item_name` is `chk::unit_name(objId)` for `table=dat`/`dat=units`.
-pub fn accepted_ledger_entries(
+pub fn applied_ledger_entries(
     changeset: &crate::journal::Changeset,
     journal: &crate::journal::Journal,
-    scope: &AcceptedScope,
 ) -> Vec<LedgerEntry> {
     let mut entries = Vec::new();
     for item in &changeset.items {
@@ -397,9 +378,6 @@ pub fn accepted_ledger_entries(
             matches!(dat_ref.table, crate::journal::DatTable::Dat) && dat_ref.dat == "units";
 
         for property in &item.properties {
-            if !scope.includes(&item.id, &property.id) {
-                continue;
-            }
             // A reset-to-default records `after = Value::Null` (no meaningful last
             // applied value). Skip it: the contract says `value` is the last APPLIED
             // new value (number or string), and a null entry would fail the panel's
@@ -863,9 +841,9 @@ mod tests {
     }
 
     #[test]
-    fn accepted_all_records_every_dat_property_with_journal_ts_and_unit_name() {
+    fn the_ledger_records_every_applied_dat_property_with_its_journal_ts_and_unit_name() {
         let (changeset, journal) = dat_changeset();
-        let entries = accepted_ledger_entries(&changeset, &journal, &AcceptedScope::All);
+        let entries = applied_ledger_entries(&changeset, &journal);
 
         assert_eq!(entries.len(), 2, "two dat items, file item skipped");
         let hp = entries
@@ -886,7 +864,7 @@ mod tests {
     }
 
     #[test]
-    fn accepted_skips_reset_to_default_null_valued_property() {
+    fn a_reset_to_default_records_no_ledger_entry() {
         use crate::journal::{
             Changeset, ChangesetItem, ChangesetItemKind, DatRef, DatTable, Journal, JournalEntry,
             JournalTarget, PropertyChange, Snapshot, WriteTool,
@@ -940,34 +918,11 @@ mod tests {
             }],
         };
 
-        let entries = accepted_ledger_entries(&changeset, &journal, &AcceptedScope::All);
+        let entries = applied_ledger_entries(&changeset, &journal);
         assert!(
             entries.is_empty(),
             "a reset-to-default (null new value) records no ledger entry"
         );
-    }
-
-    #[test]
-    fn accepted_ids_record_only_listed_items_or_property_ids() {
-        let (changeset, journal) = dat_changeset();
-
-        // Accept only the units item (by its changeset item id).
-        let by_item = accepted_ledger_entries(
-            &changeset,
-            &journal,
-            &AcceptedScope::Ids(vec!["dat:Dat:units:0".to_string()]),
-        );
-        assert_eq!(by_item.len(), 1);
-        assert_eq!(by_item[0].key(), "dat:units:0:HP");
-
-        // Accept only the weapons property (by its per-property journal entry id).
-        let by_property = accepted_ledger_entries(
-            &changeset,
-            &journal,
-            &AcceptedScope::Ids(vec!["e-dmg".to_string()]),
-        );
-        assert_eq!(by_property.len(), 1);
-        assert_eq!(by_property[0].key(), "dat:weapons:5:Damage");
     }
 
     #[test]

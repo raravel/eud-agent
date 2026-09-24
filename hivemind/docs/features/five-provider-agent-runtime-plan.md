@@ -1,6 +1,6 @@
 # Five-Provider Agent Runtime — Authoritative Implementation Plan
 
-Status: implementation integrated; release acceptance remains blocked until §21 live account matrix passes.
+Status: provider/auth integration retained. Checkpoint41 source/build gates pass, with the first full41 Map finalize/revert OS5 failure retained as a non-causal WATCH and an unchanged full repeat passing. Actual33 verifies scoped EPS read/compiler/write/review/cancel behavior; actual37 adds ASK/restart passes; actual39 adds read-only C18 overlap; actual41 completes candidate/Apply/undo and independent post-Undo QA, but not stale-fork validation. The source41 shared long-path Map correction is selector-green. Ollama service verification is policy-blocked before launch, leaving catalog/model presence and compatibility unknown. Gameplay-backed harness, Messages, blocked providers, and remaining provider compatibility prevent an all-provider or whole-UI completion claim. Current execution authority: [provider-runtime-unification-plan.md](provider-runtime-unification-plan.md).
 
 ## 1. 목표
 
@@ -35,11 +35,11 @@ Status: implementation integrated; release acceptance remains blocked until §21
 11. **provider별 capability**: 모든 제공자에 존재하지 않는 web search, 1M context, vision, native compaction, reasoning level을 가짜로 평준화하지 않는다. UI와 engine이 capability를 명시적으로 반영한다.
 12. **main/Map 공통**: 다섯 제공자는 메인 EPS 세션과 Map Agent 세션 모두에서 작동해야 한다.
 
-## 3. 현재 문제와 기반
+## 3. 최초 provider 도입 전 문제와 기반 (역사적 맥락)
 
-### 3.1 현재 Codex 결합
+### 3.1 전환 전 Codex 결합
 
-현재 구현은 다음 경계에서 Codex를 제품 자체와 동일시한다.
+최초 계획 작성 시 구현은 다음 경계에서 Codex를 제품 자체와 동일시했다. 이 목록의 과거 타입·생성 경로는 현재 실행 API가 아니다. 현재 구조는 §7을 따른다.
 
 - `src-tauri/src/setup.rs`는 `codex login status`를 정상 화면 진입 gate로 사용한다.
 - `src-tauri/src/config.rs`는 `codex_cmd`, `codex_model`, `codex_reasoning_effort`, `codex_large_context_models`를 최상위 설정으로 저장한다.
@@ -50,7 +50,7 @@ Status: implementation integrated; release acceptance remains blocked until §21
 - background harness는 새 `ProductionCodexDriver`를 직접 생성한다.
 - panel IPC와 `CodexPromptControls`, `SettingsDialog`, `SetupScreen`, Map Agent model control이 Codex catalog shape를 직접 사용한다.
 
-`CODEX_CMD`를 다른 executable로 바꾸는 것은 provider abstraction이 아니다. 현재 backend는 Codex app-server method/event shape를 요구하므로 Claude/OpenCode/Antigravity CLI 또는 endpoint를 대입할 수 없다.
+`CODEX_CMD`를 다른 executable로 바꾸는 것은 provider abstraction이 아니다. 당시 backend는 Codex app-server method/event shape를 요구했으므로 Claude/OpenCode/Antigravity CLI 또는 endpoint를 대입할 수 없다.
 
 ### 3.2 재사용할 기존 권한
 
@@ -60,9 +60,9 @@ Status: implementation integrated; release acceptance remains blocked until §21
 - `tool_registry()`, `mcp_tool_descriptors()`, `map_mcp_tool_descriptors()`
 - `project_status`, `list_files`, `read_file`, `source_search`
 - `file_create`, `file_write`, `file_edit`, `file_rename`
-- `search_docs`, `docs_get`, `eps_check`, `build_run`
+- `search_docs`, `docs_get`, `build_run`
 - Map read/write/draft 도구
-- `request_write_workspace`, `ask`
+- automatic mutation-to-write transition, `ask`
 - evidence/action/build-fix budget
 - `WorkspaceManager`, strict session workspace, baseline recorder
 - journal, write coordinator, review, rollback
@@ -84,7 +84,7 @@ Status: implementation integrated; release acceptance remains blocked until §21
 ### 4.1 포함
 
 - 다섯 provider의 strict Rust enum과 공통 capability/model/status 계약
-- 기존 Codex app-server driver의 보존 및 generic driver 경계로의 이동
+- 기존 Codex app-server native 기능을 보존하고 공통 runtime/adapter 경계로 이동
 - Claude Code CLI 설치, 전용 profile, 구독 OAuth, import, status, stream, resume, cancel, compact, structured output, MCP 연결
 - Antigravity Google OAuth state/loopback callback, token refresh, Cloud Code Assist onboarding/catalog/inference, Gemini-style streaming/tool loop
 - OpenCode Go API key, live model list, 세 wire adapter, streaming/tool loop
@@ -102,7 +102,7 @@ Status: implementation integrated; release acceptance remains blocked until §21
 ### 4.2 제외
 
 - OMP, OpenCode server, Claude Agent SDK sidecar를 앱 프로세스로 포함하거나 실행하는 것
-- OpenRouter, Anthropic API key, Gemini API key, Ollama 등 다섯 번째 provider
+- OpenRouter, Anthropic API key, Gemini API key 등 고정 다섯 제공자 밖의 추가 provider
 - provider plugin API, dynamic shared library, runtime script provider
 - 기존 세션에서 provider를 전환하거나 transcript를 다른 provider로 재전송하는 것
 - quota 소진 시 다른 provider/model로 fallback하는 것
@@ -113,7 +113,7 @@ Status: implementation integrated; release acceptance remains blocked until §21
 
 ## 5. 용어와 stable ids
 
-- **Provider**: 인증, 모델 catalog 또는 직접 model id, turn transport, conversation persistence, capability를 소유하는 다섯 개의 고정 backend 중 하나.
+- **Provider**: 인증, 모델 catalog 또는 직접 model id, transport와 capability를 제공하는 다섯 고정 backend 중 하나. 앱 conversation persistence와 실행 정책은 공통 runtime이 소유하며 native session 자체는 공식 CLI가 관리한다.
 - **Provider binding**: 한 세션에 고정된 provider/model/thinking/conversation state.
 - **Default provider**: 새 세션이 첫 요청을 수락할 때 복사하는 전역 기본값.
 - **Provider profile**: app-owned executable/config/credential root. 개인 CLI root와 분리된다.
@@ -152,7 +152,7 @@ UI label은 각각 `Codex`, `Claude Code`, `Antigravity`, `OpenCode Go`, `Ollama
 9. background task-state compiler와 harness job은 source session의 provider/model snapshot을 사용한다.
 10. job retry는 생성 당시 provider/model을 유지한다. 현재 global default를 다시 읽지 않는다.
 11. provider 장애는 다른 provider에 prompt, source, attachments, tool result를 보내지 않는다.
-12. 모든 model-visible project mutation은 기존 Rust tool admission, write lease, journal, changeset, review를 통과한다.
+12. 모든 model-visible project mutation은 기존 Rust tool admission, write registration, 짧은 project transaction, journal, changeset, review를 통과한다.
 13. Direct provider는 임의 path, shell, editor IPC, CHK bytes를 받지 않는다.
 14. Claude Code built-in tools는 `--tools ""`로 제거한다. `eud-tools` MCP만 model-visible이어야 한다.
 15. Claude Code는 `CLAUDE_CONFIG_DIR` app profile과 app-owned session cwd만 사용한다. ambient `CLAUDE.md`, hooks, plugins, MCP, settings를 읽지 않는다.
@@ -169,85 +169,56 @@ UI label은 각각 `Codex`, `Claude Code`, `Antigravity`, `OpenCode Go`, `Ollama
 26. setup/settings/prompt/map UI는 raw provider error code를 사용자에게 그대로 렌더링하지 않는다.
 27. Antigravity login은 build-time OAuth override가 없어도 열려야 한다. 실제 endpoint/protocol 실패는 명시적으로 표시하고 다른 provider로 fallback하지 않는다.
 
-## 7. 목표 구조
+## 7. 현재 실행 구조
+
+이 절과 §10·§16은 공통 런타임 전환 이후의 현재 구조다. 최초 provider 도입 시의 드라이버 계획은 대체됐으며, 구현 단계와 C01–C18의 최종 판정은 [공통 실행 런타임 전환 계획](provider-runtime-unification-plan.md)이 소유한다.
 
 ```mermaid
 flowchart TD
     Panel[React panel / Map Agent] --> IPC[Tauri IPC]
     IPC --> Manager[SessionEngineManager]
-    Manager --> Engine[AgentEngine]
-    Engine --> Driver[ProductionProviderDriver]
-
-    Driver --> Codex[Codex app-server driver]
-    Driver --> Claude[Claude Code CLI driver]
-    Driver --> AGV[Antigravity Rust HTTP driver]
-    Driver --> Go[OpenCode Go Rust HTTP driver]
-
-    Codex --> MCP[eud-tools MCP]
-    Claude --> MCP
-    AGV --> Dispatch[ProviderToolDispatcher]
-    Go --> Dispatch
-    MCP --> Runtime[SessionToolRuntime]
-    Dispatch --> Runtime
-
-    Runtime --> Workspace[Workspace / preflight / build]
-    Runtime --> Journal[Journal / changeset / review]
-    Runtime --> Map[Map candidate / MapSafe]
-
-    Secrets[ProviderSecretStore] --> Codex
-    Secrets --> Claude
-    Secrets --> AGV
-    Secrets --> Go
+    Manager --> Engine["AgentEngine&lt;R: RuntimeExecutor&gt;"]
+    Engine --> Runtime[ProviderRuntime]
+    Engine --> Jobs[StructuredJobExecutor]
+    Runtime --> Factory[고정 production adapter factory]
+    Jobs --> Factory
+    Factory --> Codex[Codex app-server adapter]
+    Factory --> Claude[Claude Code CLI adapter]
+    Factory --> AGV[Antigravity Cloud Code adapter]
+    Factory --> Go[OpenCode Go 3-wire adapter]
+    Factory --> Ollama[Ollama OpenAI 호환 adapter]
+    Runtime --> Gate[run-scoped tool gate]
+    Codex -. native MCP .-> Gate
+    Claude -. native MCP .-> Gate
+    Gate --> Tools[SessionToolRuntime]
+    Tools --> Domain[workspace / evidence / journal / build / review / Map candidate]
+    Runtime --> Store[validated transcript / native recovery]
+    Runtime --> Events[foreground model events]
 ```
 
-### 7.1 Closed production enum
+### 7.1 고정 adapter factory
 
-`AgentEngine`는 provider를 매 turn 조회하지 않는다. worker 생성 시 persisted binding으로 정확한 variant를 만든다.
+`provider_runtime/factory.rs::production_adapter`는 검증된 session/job binding으로 다섯 `ProviderId`를 exhaustive match한다. 동적 plugin registry나 문자열 dispatch를 추가하지 않는다. `ProviderService`는 설치·인증·catalog·settings를 별도로 소유하며 임시 conversation worker를 만들지 않는다.
 
-```rust
-pub enum ProductionProviderDriver {
-    Codex(ProductionCodexDriver),
-    ClaudeCode(ProductionClaudeCodeDriver),
-    Antigravity(ProductionAntigravityDriver),
-    OpencodeGo(ProductionOpenCodeGoDriver),
-}
-```
+### 7.2 실행과 전송의 경계
 
-`AgentDriver` 구현은 exhaustive `match`로 위임한다. trait object plugin registry와 string dispatch를 추가하지 않는다.
+`AgentEngine<R: RuntimeExecutor>`는 요청·context·승인·review·task provenance를 소유하고 `ProviderRuntime`에 foreground/structured/reset/seed/compact 실행을 요청한다. 런타임은 run 수명, active deadline, 도구 admission, workspace 준비, 모델 이벤트, checkpoint와 recovery를 소유한다. 직접 HTTP의 model step → tool result 반복도 공통층에 있다.
 
-### 7.2 Generic engine contract
+`ProviderAdapter`는 credential/profile 접근, wire encoding/decoding, capability 제약, native process/session 제어만 소유한다. 앱 저장소 writer, UI sink, workspace manager, 범위 없는 tool runtime을 전달하지 않는다. Codex/Claude의 공식 native 내부 루프는 유지한다.
 
-기존 타입을 다음 의미로 clean cutover한다.
+Compiler와 harness는 독립 `StructuredJobExecutor`를 사용한다. 이 실행기는 adapter와 cancellation receiver만 갖고 본 대화의 store/workspace/UI/tool authority를 갖지 않는다. 기존 foreground 실행의 revision/persistence/workspace 값을 임시 변경하는 경로는 없다.
 
-```text
-CodexDriver       -> AgentDriver
-CodexTurnInput    -> AgentTurnInput
-CodexTurnResult   -> AgentTurnResult
-CodexModel        -> ProviderModel
-CodexModelSettings -> SessionModelSettings / ProviderSettingsView
-AppServerEvent    -> Codex 내부 transport event로 유지
-```
+Compiler는 매 실행마다 비어 있는 고유 input/cwd를 받고 60초/8192-token 정책을 사용한다. Harness는 별도 300초 deadline을 유지한다. Direct adapter는 text/reasoning/tool/signature block의 순서를 보존하고, native adapter는 공식 인증·내부 loop·session 제어를 유지한다. MCP endpoint와 handler는 run에 묶인 고유 URL/UUID를 사용하며, 도구 완료 receipt/journal은 답변 성공과 별도로 내구화한다. Unknown native receipt는 resume을 막고 명시적 reset만 새 continuation을 시작한다.
 
-`AgentDriver`의 최소 계약:
+2026-09-12 final-19 evidence: source SHA-256 `E87CBE71073107CD79A2E620E160DFE42E11C676FB2603EAEBE344E7D850E9A0`, test executable SHA-256 `6E81FE1C8B04CDFEE2C6E43DC9E72D58E6761F001B946241192FB7E541D6CB43`; all five repository gates, strict Clippy, and scoped formatter checks passed. The embedded debug app and five native-domain contracts also passed; the Codex lifecycle passed. Antigravity was blocked by an unconfigured OAuth client, OpenCode's three live rows failed under investigation, and actual native UI/Ollama acceptance remained open.
 
-```rust
-trait AgentDriver {
-    async fn run_turn(&mut self, input: AgentTurnInput)
-        -> Result<AgentTurnResult, AgentEngineError>;
-    async fn compile_structured(&mut self, input: StructuredTurnInput)
-        -> Result<serde_json::Value, AgentEngineError>;
-    async fn compact_conversation(&mut self) -> Result<(), AgentEngineError>;
-    async fn reset_conversation(&mut self) -> Result<(), AgentEngineError>;
-    async fn conversation_state(&self) -> ProviderConversationState;
-    async fn seed_conversation(
-        &mut self,
-        state: ProviderConversationState,
-    ) -> Result<(), AgentEngineError>;
-    fn current_workspace(&self) -> Option<PreparedWorkspace>;
-}
-```
+Checkpoint 20 observed Responses/`gpt-5.6-luna` HTTP 400 at `tools[2].parameters`; Chat Completions/`kimi-k3` completed tools, resume, and structured work with the existing budgets; Anthropic Messages/`qwen3.8-flash` completed tools/resume but returned HTTP 500 before SSE for structured work, with no established leaf cause. Checkpoint 21 then captured the native usage correlation RED and three OpenCode REDs for ordinary optional-schema rejection and protocol classification. The source correction makes ordinary Responses/Chat tool definitions explicitly non-strict, preserves strict structured definitions, preserves parsed protocol/incomplete errors, and filters Codex usage by the authoritative active native turn ID. Checkpoint 22 source `1308`/`E0763CEEA9A1D1FFBFC842A91F942E693DF171F84DD55AD4A1C5B136963FAF8E` retains its historical `726 passed; 1 failed; 30 ignored` Map cleanup result; the holder was not captured. Checkpoint 23 establishes the non-inheritable `rbN` reader mechanism (`rb`=32, `rbN`=0). Checkpoint 24 establishes HTTP RED23→GREEN24 for all three OpenCode wires and both direct adapters: raw limits are independent 16 MiB transport ceilings, while `RunPolicy.max_output_bytes` applies to serialized normalized output. Claude uses independent 32 MiB stdout and 1 MiB JSONL-line bounds; corrected numeric witnesses led to four qualified REDs before the Claude fix. Checkpoint 25 source `1312`/`DBAEEA1566AD3EE7B9373B801862E4D0B9DDEDE7531AC1E8B2F43CD3F58D28F1`, immutable binary `BE27F9CBD6366C45C264DFAA16A68B5130935BCA5218AF578641CB0781899CCA`, passes all five repository gates, strict Clippy, and formatter; the format-only manifest `4285974FE0054B6E6008BFE00F9951BBC719A8B46282EBA5E5989015E06BF652` differs only by `lib.rs` module order. The debug app and all five native-domain contracts pass with original fixtures unchanged. Actual Codex completes its lifecycle in 45.19s. Actual OpenCode Responses/`gpt-5.6-luna` and Chat/`kimi-k3` complete tools/resume/structured work; Messages/`qwen3.8-flash` completes tools/resume then fails structured transport. A one-shot diagnostic observed HTTP 500/75 bytes/no SSE, supporting but not retroactively attributing a service-rejection hypothesis. Native UI passes project/session setup, four EPS tools, compiler semantic delta `0→1`, follow-up, and cancellation; a new-session EPS write fails before response start on isolated SQLite initialization, and Map schema reporting is opaque after bad `filter.tileId` rejection. Checkpoint 26's test-only source `39FBA5DA612343EFA8CE6870658AB29CEB980F58BCC96D0F2A18D880AF2B0D19` and binary `5368D687A394AE4C8B3D83BD230DD50F7C1B4B544855D7222CAB2C274830FEB5` isolate that open Map event contract: its standalone native-visible filter arm accepts the captured invalid `tileId` call, although the complete validator refuses it. Checkpoint 27 applies the generic complete `anyOf`-arm correction: source `80E9A7C63A1172BA27D3B435F62CE7CB5E1A5F82666CA001D5AABA88FE2AED34` and immutable binary `69B2811D3A84957F82484D3796FF914165EFF7ED5679BFD4E50E07A2209D4714` pass four exact Map schema/dispatch/publication selectors (`1 passed; 0 failed; 766 filtered` each) and the unfiltered Rust suite (`737 passed; 0 failed; 30 ignored` in 140.81s). This is a qualified RED26→GREEN27 Map contract result only: native rendering, Map/UI27, and the SQLite startup probe remain pending, and no fresh application or broader gate conclusion is implied. No retry/reset/global lock was introduced. Ollama is resource-blocked, Claude is logged out, and Antigravity lacks its OAuth client. Harness/review/build/Map Apply/mixed/restart UI flows and actual Messages recovery remain open. No fallback, budget, deadline, or production sink relaxation was introduced. This status does not change the authoritative A–G/C01–C18 checklist or claim all-provider completion.
 
-Provider install/auth/catalog/settings는 session driver와 분리된 `ProviderService`가 소유한다. Settings dialog가 임시 conversation worker를 생성하지 않게 한다.
+Checkpoint28 replaces only the currently superseded deterministic/UI status: frozen source `3E686C91EB900996CE735DE8A58D09FBA3D39F6715A7CEA375F09122DAA23CAD` passes Rust `737/0/30`, library check, all-target/all-feature strict Clippy, and formatter. The panel source/dist is unchanged, so its checkpoint25 58-file/539-test evidence is reused rather than rerun. In the native app, exact OpenCode Go/`glm-5.3` binding completes two foreground reads and an answer, while the compiler exceeds its local 16 KiB normalized-output limit and preserves a warning; Chat is inferred, without a retained exact route witness. Actual Map palette query verifies the corrected `filter.id` call, but C12 EPS write fails for missing native baseline plus a redundant write-transition terminal error, reopening phase C. The independent Map draft-patch/compaction explanation is provisional and no enum correction is attributed. Probe3 after normal app PID54196 closure does not reproduce SQLite initialization failure across S1/O1/O2/Q1 and does not resolve the historical actual25 failure. Review28 quality/security/context scoped audits pass, goal and QA fail, and overall completion remains false. Checkpoint29 baseline-fixture failure is not a qualified RED; its Map enum causal claim is withdrawn. Checkpoint30 remains test-only in progress with no fix/gate conclusion. Existing Messages failure, Claude/Antigravity/Ollama limits, and unverified review/Apply/restart/mixed-provider paths remain unchanged.
+
+Current supersession: checkpoint41 source `078F460095E965AEB7B3E7FE04F8FACF494DD9D23917FD78458F78F8C78C330D` and immutable binary `0C161936695EEEA3CEA91A2B677FCF3AA5FDC28B607906F77106EA96BE44E84A` bind the long-path Map selector GREEN, `isom` `12/0/7`, full-repeat Rust `749/0/30` including main/doc targets, library check, strict Clippy, and formatter. The first unchanged full41 `748/1/30` Map finalize/revert Access-denied result remains a WATCH; its exact diagnostic and repeat do not establish a cause. Panel36 TypeScript, 58-file/539-test, and production build remain product-equivalent; app41 SHA `C8CCB48B0ABBBFC93EB65626BB0668895BF2D0F22FBB979CF9216968F66B8DE2` builds successfully. Actual33 establishes scoped EPS read/compiler/write/build/reject/accept and active-response-before-output cancellation. Actual37 passes native ASK answer/cancel and restart persistence. Actual39 passes read-only C18 Map/OpenCode overlap; OpenCode foreground succeeds but its compiler `runtime_error` cause and exact wire are unknown. Actual41 preserves two expected-before conflicts, then finalizes a candidate, applies its trusted UI change, and restores the exact source baseline through undo; stale-fork validation is not run. Source41's shared Windows long-path correction follows the numeric Draft7 Map admission fix and is not a model-specific workaround. Messages structured recovery, Claude login, Antigravity OAuth access, Ollama resource qualification, gameplay-backed harness, fresh reviews, and cleanup remain open.
+
+Final external-status boundary: independent QA41 passes the post-Undo Map surface at r0 with no candidate, disabled Apply/Undo, and retained history; app41 closes normally with recorded baseline hashes preserved. Ollama `serve` is policy-rejected before launch, with no retry or alternate route. Its server/catalog/model presence, generation, configuration, and compatibility remain unknown. The 12-entry and separate eight-entry cleanup attempts are policy holds with zero removal; final review remains pending.
 
 ## 8. 공통 provider/domain model
 
@@ -381,25 +352,46 @@ claude -p
   [--resume <binding.session_id>]
 ```
 
-Claude CLI는 machine-readable model discovery command를 제공하지 않는다. 따라서 eud-agent는
-`sonnet`/`opus`/`haiku` alias나 reasoning tier를 catalog로 만들지 않는다. UI에는
-`provider-default` 동작 하나만 표시하고 turn에는 `--model`/`--effort`를 전달하지 않아
-현재 계정·배포에 맞는 모델 선택을 Claude Code에 위임한다.
+Claude CLI는 machine-readable model discovery command를 제공하지 않지만, app profile의
+`.credentials.json`에 저장된 같은 구독 OAuth access token은 Anthropic Models API
+(`GET https://api.anthropic.com/v1/models`, `Authorization: Bearer` +
+`anthropic-beta: oauth-2025-04-20`)에서 그대로 받아들여진다. catalog는 이 응답의
+`id`/`display_name`/`max_input_tokens`/`capabilities`(effort 단계, image_input,
+structured_outputs)를 그대로 매핑하고 alias나 하드코딩 목록을 만들지 않는다. 첫 항목은 항상
+`provider-default`이며, token 부재·HTTP 실패·schema 변경 시 catalog는 그 한 항목으로
+degrade한다. token은 요청 동안만 메모리에 있고 로그·저장·UI에 노출되지 않는다.
 
-- request-owned MCP config에는 현재 worker의 `eud-tools` loopback URL 하나만 있다.
+CLI는 turn이 실행되는 동안에만 access token을 갱신하므로, 유휴 profile은 turn 사이에 만료된
+token만 남긴다(access token 수명은 수 시간, refresh token은 수십 일). catalog 요청은 만료·5분
+내 만료 예정 token을 CLI와 같은 public client id·`POST https://platform.claude.com/v1/oauth/token`
+(`grant_type=refresh_token`, 저장된 `scopes`)으로 직접 갱신하고, 회전된 pair를
+`.credentials.json`에 atomic write-back하여 CLI의 다음 turn도 계속 동작하게 한다. 갱신은 CLI의
+`proper-lockfile` 규약(`.oauth_refresh.lock` → `.credentials.json.lock` 디렉터리, 60초 stale)을
+그대로 따르며 lock 획득 후 파일을 다시 읽어 sibling 프로세스가 이미 갱신했으면 네트워크 없이
+채택한다. write-back은 갱신에 사용한 refresh token이 디스크에 그대로 있을 때만 수행하고, 서비스는
+profile lock을 read+refresh 동안 잡아 동시 logout이 되살아나지 않게 한다. `invalid_grant`·401은
+`provider_not_authenticated`, refresh token 만료는 `provider_auth_expired`로 끝나며 저장된 파일은
+변경하지 않는다. 이 경우에도 catalog는 `provider-default` 한 항목으로 degrade한다.
+`provider-default` 선택은 `--model`/`--effort`를 전달하지 않아 현재 계정·배포에 맞는 모델
+선택을 Claude Code에 위임하고, catalog model 선택은 foreground/structured turn에
+`--model <id>`와(선택 시) `--effort <level>`을 그대로 전달한다. compaction/prepare는 session
+model만 전달한다. Models API 목록은 조직 catalog이므로 구독 플랜에서 Claude Code가 거부하는
+모델은 turn 시작 시 CLI 오류로 표면화되며 catalog가 이를 사전 보장하지 않는다.
+
+- run-owned MCP config에는 생성 run만을 위한 고유 `eud-tools` loopback URL 하나만 있다. 이전 run의 handler/URL은 새 도구 권한을 얻지 못한다.
 - `--tools ""`는 built-in Bash/PowerShell/Read/Edit/Write/Search/Agent tool을 model context에서 제거하지만 MCP tool에는 영향을 주지 않는다.
 - app profile과 session cwd에 ambient project configuration이 없음을 시작 전 검증한다.
 - first turn result의 `session_id`를 persist하고 이후 `--resume`으로 재개한다.
 - stdout은 line-bounded strict JSONL parser로 읽고 text/reasoning/tool/usage/result를 generic event로 변환한다.
 - stderr는 bounded tail만 보관하며 credential과 raw body를 redaction한다.
 - cancellation은 graceful interrupt 후 bounded process-tree termination을 사용한다.
-- CLI가 unexpected exit하면 turn을 replay하지 않고 session id를 유지한다.
+- CLI가 unexpected exit하면 turn을 replay하지 않는다. 마지막 저장 ID는 보존하되 remote continuation이 불명확하면 runtime이 확인 없는 재개를 거부한다.
 
 #### 9.2.4 structured output와 compaction
 
 - tools-disabled compiler/harness turn은 `--tools ""`, MCP 없음, `--json-schema <schema>`, `--output-format json`, `--no-session-persistence`를 사용한다.
 - Rust가 `structured_output`을 같은 schema로 다시 검증한다.
-- `/compact`는 Claude Code의 supported compact command를 `--resume` session에 실행하고 성공 event 이후에만 context delivery cursor를 reset한다.
+- `/compact`는 Claude Code의 supported compact command를 준비된 `--resume` session에 실행한다. runtime이 성공 경계를 확인한 뒤 engine이 context delivery cursor를 갱신한다.
 - CLI version이 required structured/stream/capability behavior를 지원하지 않으면 provider status는 `Degraded`가 아니라 `Unavailable`이다.
 
 #### 9.2.5 attachments
@@ -466,8 +458,8 @@ loadCodeAssist
   reasoning tier 표, fixed output profile, model enum, denylist를 소유하지 않는다.
 - Google/Gemini content, thought, function call, function response, usage, finish reason을 generic direct-provider event로 변환한다.
 - request metadata와 User-Agent는 Antigravity 호환 protocol identity를 사용한다.
-- direct tool loop는 §10의 `ProviderToolDispatcher`를 사용한다.
-- conversation history는 app-owned normalized transcript에 저장한다.
+- model step과 tool-result 반복은 §10의 공통 runtime과 run-scoped tool gate가 소유한다.
+- conversation history는 runtime이 app-owned normalized transcript에 publish한다.
 - 401은 한 번 refresh 후 동일 HTTP request만 재시도할 수 있다. 완성되지 않은 turn 전체를 새 conversation으로 replay하지 않는다.
 - unpublished protocol schema drift는 fail closed하며 raw payload를 panel에 노출하지 않는다.
 
@@ -508,7 +500,7 @@ enum OpenCodeGoWire {
 - `@ai-sdk/openai` → `/responses`
 - `@ai-sdk/openai-compatible` → `/chat/completions`
 - `@ai-sdk/anthropic` → `/messages`
-- 세 inference endpoint의 최초 request와 이후 tool-loop round는 모두 driver의 안정적인
+- 세 inference endpoint의 최초 request와 이후 공통 runtime model step은 모두 adapter의 안정적인
   conversation id를 `x-opencode-session`으로 전달한다. request나 round마다 새 id를 만들지
   않으며 catalog probe를 conversation id로 취급하지 않는다.
 
@@ -546,86 +538,54 @@ machine-readable provider metadata에 privacy가 없으므로 UI에 retention/tr
 - 선택적 proxy API key는 Windows Credential Manager에만 저장하고 config/session/panel에
   노출하지 않는다.
 
-## 10. Provider-neutral turn과 tool loop
+## 10. 공통 실행·이벤트·도구 계약
 
-### 10.1 공통 input
+### 10.1 입력과 결과
 
-```rust
-pub struct AgentTurnInput {
-    pub text: String,
-    pub images: Vec<ProviderImage>,
-    pub workspace_access: WorkspaceAccess,
-    pub tools: ToolPolicy,
-    pub output_schema: Option<serde_json::Value>,
-    pub persistence: ConversationPersistence,
-}
-```
+`RunIdentity`는 session/run/request 또는 job/target/cancellation generation을 고정한다. `BindingSnapshot`은 provider/model/reasoning/base URL/capability와 continuation을 고정한다. `ForegroundRequest`와 `StructuredJobRequest`는 별도 입력이며, `RunPolicy`가 active deadline·출력 크기·tool round·종료 정리 한계를 소유한다.
 
-`ProviderImage`는 bounded decoded bytes, MIME, dimensions, opaque attachment id만 가진다. 원본 사용자 path는 direct provider에 전달하지 않는다.
+`AdapterEvent`는 생성 run의 정체성과 ordered text/reasoning/tool/usage/continuation 의미를 보존한다. 응답 경계와 최종 `RunOutcome`을 구분한다. 결과는 완료, 구조화 결과, 취소, 실패, write transition으로 나뉜다. 중간 도구 요청이나 write transition을 답변 성공으로 표시하지 않는다.
 
-### 10.2 공통 event
+### 10.2 모델 이벤트
 
-```rust
-pub enum ProviderTurnEvent {
-    ConversationStarted { key: String },
-    TurnStarted,
-    ReasoningDelta(String),
-    AnswerDelta(String),
-    ToolCallStarted { id: String, name: String, args: Value },
-    ToolCallCompleted { id: String, name: String, result: ToolOutcome },
-    Usage(ContextUsage),
-    CompactionStarted,
-    CompactionCompleted,
-    RetryScheduled { attempt: u32, delay_ms: u64 },
-    TurnCompleted,
-}
-```
+Foreground 모델 콘텐츠와 usage는 공통 runtime에서 해당 세션으로만 발행한다. 상위 엔진의 domain workflow 이벤트는 기존 경계를 유지한다. Structured job의 reasoning/answer/usage는 본 대화로 발행하지 않는다. job 상태나 task-state warning은 의도된 domain 결과로 별도 표시한다.
 
-Panel event에는 provider id/model을 typed metadata로 포함한다. 사용자에게 raw event name을 렌더링하지 않는다.
+오류 프레임, 비정상 CLI 종료, 잘린 출력, 불완전한 종료 경계는 앞서 나온 텍스트를 성공으로 바꾸지 않는다. reasoning은 답변으로 대체하지 않으며 서명·encrypted continuation을 다른 provider로 보내지 않는다.
 
-### 10.3 Tool dispatcher
+### 10.3 실행 범위 도구 게이트
 
-`ProviderToolDispatcher`는 direct provider 호출과 CLI MCP 호출이 동일한 admission path를 공유하게 한다.
+Direct batch와 native MCP 요청은 `provider_tool_loop`의 동일한 run-scoped admission을 통과한다. descriptor와 도구 의미의 권위는 기존 registry와 `SessionToolRuntime`에 있다.
 
-- descriptor source는 기존 `tool_registry`/Map registry 하나뿐이다.
-- argument는 기존 strict schema로 검증한다.
-- `ask`는 `AskCoordinator`로 보낸다.
-- `request_write_workspace`는 engine lane transition을 일으킨다.
-- 나머지는 `SessionToolRuntime::execute`를 호출한다.
-- result rendering cap은 현재 MCP/panel cap을 재사용한다.
-- unknown tool, duplicate tool-call id, invalid JSON, over-budget action은 correctable tool error다.
-- tools-disabled structured turn에서 tool call이 오면 즉시 실패한다.
+- 완성된 인자만 strict schema로 검증한다. 중복 ID, unknown tool, 잘못된 call shape(빈/초장문 id, 빈/초장문 이름, 비객체 인자), 무단 호출, 잘못된 실행 수명은 fatal admission으로 run을 중단한다. 스키마 불일치는 모델이 스스로 정정할 수 있는 recoverable usage completion이다: 해당 호출은 실행하지 않고 상세 usage 오류(`Usage: <tool>(<required>). arguments do not match the documented input schema: <필드 경로별 상세>`)를 durable completion으로 기록해 모델에 반송하며, run은 `max_tool_rounds` 예산 안에서 계속된다. 레지스트리 스키마 자체가 컴파일되지 않는 경우는 우리 결함이므로 fatal로 남는다.
+- 같은 response의 도구는 순서대로 실행한다.
+- `ask`는 session/request/run에 결합된 대기를 사용한다.
+- read run의 첫 mutation 호출은 실행하지 않고 내부 write registration을 만든 뒤 같은
+  conversation을 write mode로 재개한다. 모델-facing write-intent 도구는 노출하지 않는다.
+- evidence, mutation budget, write registration, project transaction, journal, build, review와 Map candidate 권위는 기존 서비스에 남는다.
+- 정상적인 도구 실행 실패와 모델 인자의 스키마 불일치는 모델에 실패 결과로 돌려줄 수 있지만 transport/protocol 오류(잘린 스트림, 경계 위반, 중복 ID, stale run)를 정상 도구 결과로 감추지 않는다.
+- native MCP handler/endpoint는 생성 run에 결합한다. native tool 알림은 관찰 정보이며 재실행하지 않는다.
 
-### 10.4 ASK
+완료 도구의 journal·receipt·checkpoint는 최종 답변 성공과 별도로 보존한다. 취소는 새 admission을 닫고 transport를 정리하지만 이미 시작한 blocking 작업의 완료 기록은 버리지 않는다. 완료 도구의 자동 재실행이나 자동 rollback은 없다.
 
-현재 Codex MCP elicitation에 결합된 ASK ownership을 `AskCoordinator`로 분리한다.
+### 10.4 ASK와 종료
 
-- owner session/request/tool-call id를 등록한다.
-- panel `ask` event를 emit하고 `ask_response`를 기다린다.
-- engine mutex를 잡지 않는다.
-- user wait 동안 provider active deadline을 멈춘다.
-- cancellation, session close, provider process exit 시 pending ASK를 정확히 한 번 취소한다.
-- Codex는 기존 elicitation pause semantics를 유지하는 adapter를 사용한다.
-- Claude MCP와 direct provider는 같은 coordinator future를 await한다.
+사용자 ASK 대기는 provider active-time deadline에서 제외한다. 취소·세션 닫기·transport 종료 시 대기는 한 번만 해제한다. 종료 run의 늦은 모델 이벤트는 차단하며, in-flight 도구가 정리되기 전에 새 요청이 그 결과를 인수하지 못한다. 같은 세션 직렬화와 서로 다른 세션 overlap을 유지한다.
 
 ### 10.5 Structured output
 
-Provider별 native schema support가 달라도 harness contract는 동일해야 한다.
+Codex schema turn, Claude `--json-schema`, Antigravity schema/result function, OpenCode Go wire별 native schema/required result function, Ollama JSON schema는 하나의 전체 결과 계약으로 수렴한다. required result function은 응답 wire일 뿐 EUD 도구가 아니다.
 
-1. Codex: 기존 output schema turn
-2. Claude Code: `--json-schema`
-3. Antigravity: required function/tool schema 또는 지원되는 response schema
-4. OpenCode Go: wire가 strict schema를 지원하면 native; 아니면 required `submit_structured_result` tool
+`StructuredJobExecutor`는 fresh conversation, empty history/tools, MCP 없음, isolated cwd/input을 사용한다. 정확히 하나의 전체 결과를 Rust schema와 기존 domain validator로 검증한다. 금지 도구, 중복 제출, 잘린 JSON, unsupported capability는 실패하며 prose에서 JSON을 찾아내거나 다른 model로 보내지 않는다.
 
-모든 경우 Rust가 최종 JSON을 같은 schema로 다시 검증한다. required tool path는 정확히 한 번의 validated result만 허용하고 다른 EUD tool은 등록하지 않는다.
+Compiler는 60초와 요청 output budget 8192를 유지한다. 지원 wire에서는 알려진 model limit과 최솟값을 적용한다. Harness는 기존 300초와 별도 출력 계약을 유지한다. CLI가 제공하지 않는 token flag는 만들지 않는다.
 
-### 10.6 Compaction
+### 10.6 저장·재개·Compaction
 
-- Codex/Claude Code는 검증된 native compaction을 사용한다.
-- Antigravity/OpenCode Go는 tools-disabled summary turn으로 normalized transcript를 compact한다.
-- summary는 system/developer invariants, accepted plan, current task state, unresolved ASK/review를 삭제할 수 없다.
-- compaction은 새 transcript generation을 atomic publish하고 이전 generation을 crash rollback용으로 보존한 뒤 정리한다.
-- 성공 후에만 `CompactionBoundary`와 context delivery cursor를 갱신한다.
+Direct provider는 기존 generation/pointer 저장을 유지한다. matching committed head가 뒤처진 metadata를 복구할 수 있지만 손상 hash, 없는 generation, provider/branch 불일치, 앞선 metadata는 빈 대화로 초기화하지 않는다. 미완성 assistant/tool entry를 재생하지 않되 완료된 도구 증거는 보존한다.
+
+Codex/Claude native session과 ID는 유지한다. runtime은 확인된 continuation만 채택하고 앱 metadata 저장 acknowledgement 뒤 receipt를 정리한다. Pending/Unknown 상태는 확인 없는 resume을 막고 review를 보존한다.
+
+Native compaction 제어는 adapter에 남고, direct summary는 도구 없는 격리 실행을 사용한다. 성공이 확인된 뒤 runtime이 checkpoint/generation을 반영하고 engine이 context epoch/cursor를 갱신한다. rewind 전 branch의 늦은 compiler/harness 결과는 적용하지 않는다.
 
 ## 11. Credential와 profile 저장
 
@@ -684,7 +644,7 @@ Source candidate:
 - provider별 logout은 app-owned credential만 제거한다.
 - ambient CLI credential은 건드리지 않는다.
 - active provider turn/harness가 있으면 logout을 거절하고 stable busy error를 반환한다.
-- logout 후 session binding/history는 유지한다. 재로그인하면 같은 conversation id/transcript로 resume할 수 있다.
+- logout 후 session binding/history는 유지한다. 재로그인 후에도 runtime이 확인한 conversation id/transcript 경계에서만 resume한다.
 - default provider가 logout되면 새 session send는 provider reconnect를 요구한다.
 
 ## 12. 부트스트랩 UX와 gate
@@ -887,7 +847,7 @@ model = migrated Codex default or explicit legacy session snapshot
 
 ### 14.4 Direct transcript store
 
-OpenCode Go, Antigravity, Ollama는 client-owned history가 필요하다.
+OpenCode Go, Antigravity, Ollama의 history는 공통 runtime이 소유하고 adapter에는 불변 요청으로 전달한다.
 
 ```text
 %APPDATA%\eud-agent\provider-sessions\<session-id>\
@@ -915,7 +875,7 @@ pub struct ModelContextCursor {
 }
 ```
 
-legacy thread id는 Codex conversation key로 adopt한다. provider mismatch는 fresh conversation fallback과 condensed transcript를 사용하되 provider 자체를 바꾸지 않는다.
+legacy thread id는 검증 후 Codex conversation key로 adopt한다. provider mismatch나 손상 continuation은 원본 기록과 review를 보존하며 명시적으로 거부한다. fresh conversation이나 condensed replay로 무음 복구하지 않는다.
 
 ## 15. IPC와 backend service
 
@@ -972,7 +932,7 @@ Raw URL, token endpoint body, CLI stdout 전체를 event로 보내지 않는다.
 
 ### 16.1 Worker creation
 
-`SessionEngineManager`는 session record의 binding을 읽어 exact `ProductionProviderDriver` variant를 만든다. 새 draft의 첫 send는 config default를 읽고 binding을 먼저 persist한 뒤 worker를 만든다.
+`SessionEngineManager`는 session record의 binding을 읽어 `ProviderRuntime`과 고정 factory의 production adapter를 만든다. 새 draft의 첫 send는 config default를 읽고 binding을 먼저 persist한 뒤 worker를 만든다. 메인 EPS/Python과 Map worker가 같은 실행 경계를 사용한다.
 
 ### 16.2 Model change
 
@@ -984,12 +944,14 @@ Raw URL, token endpoint body, CLI stdout 전체를 event로 보내지 않는다.
 
 ### 16.3 Task-state compiler
 
-Foreground 성공 후 compiler는 source session provider/model을 사용한다.
+Foreground 성공 후 compiler는 source session binding과 기준 revision/branch를 담은 `StructuredJobRequest`를 독립 `StructuredJobExecutor`로 실행한다.
 
 - fresh nonpersistent conversation
 - no EUD tools
 - strict output schema
-- existing timeout/size/revision validation
+- 기존 60초·크기 한계, Rust schema, returned/current revision·branch·provenance 검증
+- 본 workspace 재바인딩 없이 준비한 isolated cwd
+- foreground store/UI/tool authority 없음
 - compiler failure가 foreground answer/changeset을 되돌리지 않음
 
 ### 16.4 Harness job
@@ -1005,23 +967,25 @@ pub struct HarnessProviderBinding {
 }
 ```
 
-retry/restart/recovery는 이 snapshot을 사용한다. 설정 default/model이 바뀌어도 job provider는 변하지 않는다. Credential unavailable이면 job은 failed/retryable 상태가 되고 다른 provider로 실행하지 않는다.
+retry/restart/recovery는 이 snapshot으로 fresh `StructuredJobExecutor`를 만든다. 설정 default/model/base URL이 바뀌어도 job binding은 변하지 않는다. 기존 300초와 독립 출력 계약을 유지하며 검증된 delta만 기존 staging/review에 반영한다. Credential unavailable이면 job은 failed/retryable 상태가 되고 다른 provider로 실행하지 않는다.
 
 ### 16.5 Cancellation과 process recovery
 
 - Codex: 기존 app-server interrupt
 - Claude Code: stdin/control interrupt 또는 SIGINT, bounded process tree cleanup
 - Direct provider: request cancellation token으로 HTTP stream abort
-- cancelled direct turn의 미완성 assistant/tool entry는 committed transcript generation에 publish하지 않는다.
+- 새 admission과 늦은 모델 이벤트는 닫지만, 이미 완료된 도구 결과·journal·receipt는 최종 답변 실패와 별도로 보존한다. 미완성 인자나 존재하지 않는 결과는 transcript에 만들어 넣지 않는다.
 - journaled write는 기존 review/reject path에 남는다.
 - unexpected transport exit는 자동 full-turn replay하지 않는다.
+- unknown native continuation과 손상 receipt는 review를 보존하면서 명시적 복구를 요구한다. 빈 대화로 무음 reset하지 않는다.
+- native compaction은 저장된 continuation의 준비/seed와 확인된 성공 경계 뒤에만 앱 state를 갱신한다.
 
 ### 16.6 Session overlap
 
 - 같은 session command는 기존처럼 serialized
 - 서로 다른 session의 read turn은 provider가 달라도 overlap 가능
 - direct provider catalog/token refresh single-flight는 inference turn을 global queue로 만들지 않음
-- write coordinator가 provider와 무관하게 project writer ownership을 유지
+- write coordinator는 concurrent request registration을 유지하고 공유 변경 동안만 짧은 project transaction을 직렬화한다. review가 다른 세션의 전체 실행을 막지 않는다.
 
 ## 17. 오류, 보안, privacy
 
@@ -1088,11 +1052,14 @@ Settings/model picker는 model별 알려진 retention/training 정책을 표시�
 
 ### 18.1 새 Rust 파일
 
-- `src-tauri/src/provider.rs` — enums, model/capability/status/binding, `AgentDriver`, production enum
+- `src-tauri/src/provider.rs` — enums, model/capability/status/binding
+- `src-tauri/src/provider_runtime.rs` 및 private modules — RuntimeExecutor, run/request/policy/event 계약, fixed factory, foreground/structured/compaction/recovery
+- `src-tauri/src/codex_adapter.rs` — 공식 app-server의 ProviderAdapter 경계
+- `src-tauri/src/ollama.rs` 및 private modules — 저장된 endpoint/model의 OpenAI 호환 adapter
 - `src-tauri/src/provider_service.rs` — install/auth/catalog/default operations and locks
 - `src-tauri/src/provider_secrets.rs` — Windows Credential Manager + CLI credential import rails
 - `src-tauri/src/provider_transcript.rs` — direct-provider normalized transcript generations
-- `src-tauri/src/provider_tool_loop.rs` — direct stream/tool loop and structured result tool
+- `src-tauri/src/provider_tool_loop.rs` — run-scoped admission, ordered tool dispatch, ASK, durable receipts와 structured result validation
 - `src-tauri/src/claude_auth.rs` — Claude install/login/status/import/logout
 - `src-tauri/src/claude_client.rs` — CLI args/env/stream-json/resume/structured/compact
 - `src-tauri/src/antigravity_auth.rs` — desktop OAuth/token/onboarding/status/cancellation
@@ -1108,11 +1075,11 @@ Settings/model picker는 model별 알려진 retention/training 정책을 표시�
 - `bootstrap.rs` — provider-specific optional CLI installers; model/RAG bootstrap 분리
 - `codex_auth.rs` — generic service 뒤 Codex implementation, app-owned CODEX_HOME
 - `codex_client.rs` — Codex transport 내부화; public generic types 제거
-- `engine.rs` — AgentDriver cutover, provider binding, generic events/model settings, compiler/harness
+- `engine.rs` — AgentEngine<RuntimeExecutor>, provider binding, domain events/model settings, isolated compiler/harness caller와 persistence acknowledgement
 - `session.rs` — provider/model metadata, binding migration, transcript cleanup
 - `context_state.rs` — provider-neutral conversation cursor
 - `harness.rs` — provider binding snapshot
-- `mcp.rs` — provider-neutral instructions/ASK coordinator integration
+- `mcp.rs` — run-bound endpoint/handler, gate admission, native notification correlation과 ASK integration
 - `tool_exec.rs` — direct-provider dispatcher-compatible outcome boundary
 - `attachment.rs` — provider-neutral image payload
 - `ipc.rs` — provider commands/settings/status/events
@@ -1148,9 +1115,9 @@ Settings/model picker는 model별 알려진 retention/training 정책을 표시�
 - `hivemind/docs/features/sessions.md`
 - bootstrap/settings feature docs
 
-## 19. 구현 순서
+## 19. 최초 provider 도입 순서 (역사적 계획)
 
-각 단계는 중간 제품 범위를 의미하지 않는다. §22 acceptance까지 feature는 미완료다.
+아래는 최초 provider 도입의 단계 기록이며 현재 실행 구조를 재도입하는 지시가 아니다. 드라이버 전환 단계는 §7의 공통 runtime 구조로 대체됐다. 현재 실행 작업·잔여 결함·최종 판정은 [공통 런타임 계획](provider-runtime-unification-plan.md)의 A–G/C01–C18과 [verify.md](../verify.md)를 따른다.
 
 ### 단계 A — Domain과 migration
 
@@ -1282,7 +1249,7 @@ Tests는 source text나 단순 wiring이 아니라 observable contract와 plausi
 - live web search config
 - strict read/write sandbox
 - model catalog/1M override
-- thread resume fallback/compaction/cancel
+- confirmed thread resume/compaction/cancel, unknown/corrupt state의 review 보존과 무음 replay 거부
 - app-owned CODEX_HOME and no ambient instructions
 
 ### 20.5 Claude fake CLI
@@ -1320,7 +1287,7 @@ Assertions:
 - malformed SSE/JSON refusal
 - 401, 429 retry-after, quota, 5xx, disconnect
 - catalog removal/no silent fallback
-- model id -> exact static wire mapping
+- model catalog metadata -> exact wire mapping; model-name pattern 예외 없음
 
 ### 20.7 Antigravity fixtures
 
@@ -1339,10 +1306,10 @@ Assertions:
 
 ### 20.8 Generic engine/tool/harness
 
-각 provider fake driver에 대해 동일 contract suite를 실행한다.
+공통 runtime 계약과 실제 production adapter의 로컬 HTTP/CLI 상대편 fixture를 구분해 실행한다. 완성된 fake 답변만 반환하는 driver로 codec·도구·수명 경계의 검증을 대신하지 않는다. 일곱 wire/native 대상의 C01–C18 증거와 실제 서비스/UI 결과를 별도 기록한다.
 
 - read turn
-- request_write_workspace transition
+- automatic first-mutation write transition
 - evidence-required mutation
 - ASK wait/resume/cancel
 - journaled changeset/review
@@ -1467,7 +1434,7 @@ Automated fixture 통과 후 실제 계정/서비스로 검증한다.
 
 구현과 live acceptance 후 다음을 `rules.md`와 architecture 문서에 승격한다.
 
-- Provider id는 closed enum이며 exactly four다.
+- Provider id는 closed enum이며 exactly five다.
 - Session provider는 immutable하다.
 - Global provider settings는 새 session default일 뿐 existing session authority가 아니다.
 - No silent cross-provider/model fallback.

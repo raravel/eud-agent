@@ -842,6 +842,8 @@ mod tests {
                     width: 64,
                     height: 64,
                     tileset: "Jungle".to_string(),
+                    title: String::new(),
+                    description: String::new(),
                 },
                 players: Vec::new(),
                 forces: Vec::new(),

@@ -9,6 +9,7 @@ import { LoaderCircle, Map as MapIcon } from "lucide-react";
 
 import { Badge } from "@/components/ui/badge";
 import type { TileViewport } from "./canvasTransform";
+import { rowSpanOutline } from "./selectionMask";
 import {
   type MapDiffMarker,
   type MapLayer,
@@ -77,6 +78,8 @@ export interface MapMinimapProps {
   view: MapView;
   layers: MapLayer[];
   selections: SelectionMask[];
+  /** Mirrors the canvas: `false` draws saved selections as outlines only. */
+  selectionFill?: boolean;
   activeRows: RowSpan[];
   objects: MapObjectItem[];
   diffRows: RowSpan[];
@@ -92,6 +95,7 @@ export function MapMinimap({
   view,
   layers,
   selections,
+  selectionFill = true,
   activeRows,
   objects,
   diffRows,
@@ -257,29 +261,63 @@ export function MapMinimap({
       context.fillStyle = style.fill;
       context.strokeStyle = style.stroke;
       context.lineWidth = selection.role === "protect" ? 1.5 : 1;
-      for (const row of selection.rows) {
-        for (const [left, right] of row.spans) {
-          const x = geometry.left + left * geometry.scale;
-          const y = geometry.top + row.y * geometry.scale;
-          const spanWidth = (right - left) * geometry.scale;
-          context.fillRect(x, y, spanWidth, Math.max(1, geometry.scale));
-          if (geometry.scale >= 1) {
-            context.strokeRect(x, y, spanWidth, Math.max(1, geometry.scale));
+      if (selectionFill) {
+        for (const row of selection.rows) {
+          for (const [left, right] of row.spans) {
+            const x = geometry.left + left * geometry.scale;
+            const y = geometry.top + row.y * geometry.scale;
+            const spanWidth = (right - left) * geometry.scale;
+            context.fillRect(x, y, spanWidth, Math.max(1, geometry.scale));
+            if (geometry.scale >= 1) {
+              context.strokeRect(x, y, spanWidth, Math.max(1, geometry.scale));
+            }
           }
         }
+      } else {
+        // Per-row rectangles would read as a solid block at minimap scale, so
+        // stroke only the mask boundary — the same edges the canvas draws.
+        context.beginPath();
+        for (const segment of rowSpanOutline(selection.rows)) {
+          context.moveTo(
+            geometry.left + segment.x0 * geometry.scale,
+            geometry.top + segment.y0 * geometry.scale,
+          );
+          context.lineTo(
+            geometry.left + segment.x1 * geometry.scale,
+            geometry.top + segment.y1 * geometry.scale,
+          );
+        }
+        context.stroke();
       }
     }
 
     context.fillStyle = "rgba(250,204,21,.34)";
-    for (const row of activeRows) {
-      for (const [left, right] of row.spans) {
-        context.fillRect(
-          geometry.left + left * geometry.scale,
-          geometry.top + row.y * geometry.scale,
-          (right - left) * geometry.scale,
-          Math.max(1, geometry.scale),
+    if (selectionFill) {
+      for (const row of activeRows) {
+        for (const [left, right] of row.spans) {
+          context.fillRect(
+            geometry.left + left * geometry.scale,
+            geometry.top + row.y * geometry.scale,
+            (right - left) * geometry.scale,
+            Math.max(1, geometry.scale),
+          );
+        }
+      }
+    } else {
+      context.strokeStyle = "#fde047";
+      context.lineWidth = 1;
+      context.beginPath();
+      for (const segment of rowSpanOutline(activeRows)) {
+        context.moveTo(
+          geometry.left + segment.x0 * geometry.scale,
+          geometry.top + segment.y0 * geometry.scale,
+        );
+        context.lineTo(
+          geometry.left + segment.x1 * geometry.scale,
+          geometry.top + segment.y1 * geometry.scale,
         );
       }
+      context.stroke();
     }
 
     if (viewport) {
@@ -301,6 +339,7 @@ export function MapMinimap({
     geometry,
     layers,
     objects,
+    selectionFill,
     selections,
     size,
     view,

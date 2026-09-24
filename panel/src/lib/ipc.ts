@@ -37,13 +37,21 @@ export type {
 
 import {
   isServerMessage,
+  isSetupMessage,
   type ClientMessage,
+  type CommitDetail,
+  type CommitFile,
+  type CommitRecord,
+  type CommitSummary,
   type LedgerEntry,
+  type RepoState,
   type BackendSessionActivity,
   type MentionSearchRequest,
   type MentionSearchResponse,
+  type RecentProject,
   type ServerMessage,
   type ServerMessageType,
+  type SetupMessage,
   type WikiMessage,
   type WorkspaceFileEntry,
   type WorkspaceListResponse,
@@ -71,13 +79,13 @@ export interface NotificationChannelSettings {
 
 export type NotificationEvent =
   | "planApproval"
-  | "changesetReview"
+  | "reviewRequired"
   | "agentTurnComplete"
   | "askResponseRequired";
 
 export interface NotificationSettings {
   planApproval: NotificationChannelSettings;
-  changesetReview: NotificationChannelSettings;
+  reviewRequired: NotificationChannelSettings;
   agentTurnComplete: NotificationChannelSettings;
   askResponseRequired: NotificationChannelSettings;
 }
@@ -85,6 +93,10 @@ export interface NotificationSettings {
 export interface AppSettings {
   notifications: NotificationSettings;
   codexLargeContextModels: string[];
+  /** Deep planning (planner → architect → critic loop); captured at triage. */
+  deepPlanning: boolean;
+  /** SCMDraft 2 executable used by the header's "SCMDraft 2로 열기"; empty when unset. */
+  scmdraftPath: string;
 }
 
 export interface EuddraftSettings {
@@ -141,12 +153,13 @@ const PUSH_EVENT_TYPES = [
   "answer",
   "plan",
   "ask",
-  "changeset",
+  "team_task",
+  "git",
   "harness_job",
-  "rollback_result",
   "progress",
   "error",
   "session_activity",
+  "autonomous_run",
   "status",
   "memory",
   "memory_saved",
@@ -193,6 +206,7 @@ export class IpcClient {
   private projectUp = false;
   private projectProbed = false;
   private lastProject: string | undefined;
+  private projectGeneration = 0;
 
   constructor(options: IpcClientOptions) {
     this.invoke =
@@ -236,10 +250,12 @@ export class IpcClient {
    */
   async refresh(): Promise<boolean> {
     if (!this.active) return false;
+    const generation = this.projectGeneration;
     let status: unknown;
     try {
       status = await this.invoke("status");
     } catch (error) {
+      if (generation !== this.projectGeneration) return false;
       if (!this.active) return false;
       const wasUp = this.projectUp;
       this.projectUp = false;
@@ -251,6 +267,7 @@ export class IpcClient {
       return false;
     }
     if (!this.active) return false;
+    if (generation !== this.projectGeneration) return false;
     this.dispatchPayload("status", status);
     const project =
       isObject(status) && typeof status.project === "string"
@@ -263,8 +280,10 @@ export class IpcClient {
     if (needList) {
       try {
         const list = await this.invoke("list");
+        if (generation !== this.projectGeneration) return false;
         if (this.active) this.dispatchPayload("list", list);
       } catch (error) {
+        if (generation !== this.projectGeneration) return false;
         if (this.active) {
           const detail = formatError(error);
           if (detail.toLowerCase().includes(NO_PROJECT_MARKER)) {
@@ -327,6 +346,10 @@ export class IpcClient {
           text: msg.text,
           attachments: msg.attachments,
           mentions: msg.mentions ?? [],
+          executionMode: msg.executionMode ?? "interactive",
+          ...(msg.autonomousPolicy
+            ? { autonomousPolicy: msg.autonomousPolicy }
+            : {}),
         };
       case "plan_feedback":
         return {
@@ -344,13 +367,11 @@ export class IpcClient {
           requestId: msg.requestId,
           answers: msg.answers,
         };
-      case "changeset_decision":
-        return {
-          sessionId: msg.sessionId,
-          decision: msg.decision,
-          ids: msg.ids,
-        };
       case "cancel":
+        return { sessionId: msg.sessionId };
+      case "autonomous_pause":
+      case "autonomous_resume":
+      case "autonomous_stop":
         return { sessionId: msg.sessionId };
       case "conversation_rewind":
         return { sessionId: msg.sessionId, panelLog: msg.panelLog };
@@ -365,12 +386,22 @@ export class IpcClient {
       case "setup_status":
         return {};
       case "setup_pick_project_path":
-        return {};
+        return msg.directory === undefined ? {} : { directory: msg.directory };
       case "setup_create_project":
         return {};
-      case "setup_import_e3s":
-        return {};
+      case "setup_import_e3s": {
+        const request: Record<string, unknown> = {
+          sourceE3s: msg.sourceE3s,
+          destination: msg.destination,
+        };
+        if (msg.excludedImportItems !== undefined) {
+          request.excludedImportItems = msg.excludedImportItems;
+        }
+        return { request };
+      }
       case "setup_pick_euddraft_path":
+        return msg.directory === undefined ? {} : { directory: msg.directory };
+      case "setup_install_euddraft":
         return {};
       case "bootstrap_run":
         return {};
@@ -400,7 +431,8 @@ export class IpcClient {
         msg.type === "setup_pick_project_path" ||
         msg.type === "setup_create_project" ||
         msg.type === "setup_import_e3s" ||
-        msg.type === "setup_pick_euddraft_path"
+        msg.type === "setup_pick_euddraft_path" ||
+        msg.type === "setup_install_euddraft"
       ) {
         this.dispatchPayload("setup", result);
       }
@@ -440,6 +472,13 @@ export class IpcClient {
       }
     }
   }
+  /** Force the next refresh to reload status and source data after a project switch. */
+  invalidateProject(): void {
+    this.projectGeneration += 1;
+    this.projectUp = false;
+    this.projectProbed = false;
+    this.lastProject = undefined;
+  }
 }
 
 function toMentionSearchResponse(value: unknown): MentionSearchResponse {
@@ -460,6 +499,190 @@ export async function mentionSearch(
   invoke: InvokeFn = tauriInvoke,
 ): Promise<MentionSearchResponse> {
   return toMentionSearchResponse(await invoke("mention_search", { request }));
+}
+
+export type RagTier = "primary" | "lecture" | "general" | "qa";
+
+/** One reference chunk from `rag_search` — the agent's `search_docs` hit with full text. */
+export interface RagSearchHit {
+  id: string;
+  title: string;
+  /** The citation link; null when the chunk has no http(s) source. */
+  url: string | null;
+  /** `[index, total]` when the chunk is one part of a split article. */
+  part: [number, number] | null;
+  tier: RagTier;
+  matchKind: "lexical" | "semantic";
+  score: number;
+  text: string;
+}
+
+export interface RagSearchResponse {
+  query: string;
+  indexSize: number;
+  semanticReady: boolean;
+  hits: RagSearchHit[];
+}
+
+function toRagSearchResponse(value: unknown): RagSearchResponse {
+  if (
+    !isObject(value) ||
+    typeof value.query !== "string" ||
+    typeof value.indexSize !== "number" ||
+    typeof value.semanticReady !== "boolean" ||
+    !Array.isArray(value.hits)
+  ) {
+    throw new Error("invalid reference search response");
+  }
+  return value as unknown as RagSearchResponse;
+}
+
+/** Search the reference (RAG) index exactly as the agent's `search_docs` does. */
+export async function ragSearch(
+  query: string,
+  invoke: InvokeFn = tauriInvoke,
+): Promise<RagSearchResponse> {
+  return toRagSearchResponse(await invoke("rag_search", { query }));
+}
+
+/** The whole article a search hit belongs to, its overlapping parts joined. */
+export interface RagArticle {
+  id: string;
+  title: string;
+  url: string | null;
+  tier: RagTier;
+  parts: number;
+  /** False when the index holds the article's parts ambiguously; `text` is then one chunk. */
+  complete: boolean;
+  text: string;
+}
+
+function toRagArticle(value: unknown): RagArticle {
+  if (
+    !isObject(value) ||
+    typeof value.id !== "string" ||
+    typeof value.title !== "string" ||
+    typeof value.text !== "string" ||
+    typeof value.parts !== "number" ||
+    typeof value.complete !== "boolean"
+  ) {
+    throw new Error("invalid reference document response");
+  }
+  return value as unknown as RagArticle;
+}
+
+/** Open the reference article a `rag_search` hit belongs to. */
+export async function ragArticle(
+  id: string,
+  invoke: InvokeFn = tauriInvoke,
+): Promise<RagArticle> {
+  return toRagArticle(await invoke("rag_article", { id }));
+}
+
+/**
+ * The DAT wiki: the whole version-matched catalog, read-only.
+ *
+ * `reference` says what a number points at, so the panel can show the object's
+ * name beside the id. `text` is a ONE-based `stat_txt` string id — its text is
+ * the `tbl` table's object `value - 1`, a convention the Rust side documents
+ * and the panel must not re-derive.
+ */
+export type DatReference =
+  | { table: string }
+  | "text"
+  | "icon"
+  | "iscript";
+
+export type DatWikiKind = "dat" | "xdat" | "tbl" | "requirements" | "buttons";
+
+export interface DatWikiField {
+  name: string;
+  /** Inclusive object-id range; the field does not exist outside it. */
+  varStart: number;
+  varEnd: number;
+  size: number;
+  min: number;
+  max: number;
+  /** The runtime address the generator patches. */
+  offset: number;
+  reference?: DatReference;
+  /** One label per bit; absent when the field is not a flag field. */
+  flags?: string[];
+}
+
+export interface DatWikiObject {
+  id: number;
+  name?: string;
+}
+
+export interface DatWikiTable {
+  id: string;
+  kind: DatWikiKind;
+  label: string;
+  objects: DatWikiObject[];
+  fields: DatWikiField[];
+  /** Why some objects show no name, when that is the case. */
+  notice?: string;
+}
+
+export interface DatWikiSchema {
+  tables: DatWikiTable[];
+}
+
+export interface DatWikiValue {
+  field: string;
+  stock: number | string;
+  /** Present only when `dat/*.json` overrides this field. */
+  current?: number | string;
+}
+
+export interface DatWikiObjectValues {
+  table: string;
+  objectId: number;
+  values: DatWikiValue[];
+}
+
+function toDatWikiSchema(value: unknown): DatWikiSchema {
+  if (!isObject(value) || !Array.isArray(value.tables)) {
+    throw new Error("invalid DAT wiki schema response");
+  }
+  return value as unknown as DatWikiSchema;
+}
+
+function toDatWikiObjectValues(value: unknown): DatWikiObjectValues {
+  if (
+    !isObject(value) ||
+    typeof value.table !== "string" ||
+    typeof value.objectId !== "number" ||
+    !Array.isArray(value.values)
+  ) {
+    throw new Error("invalid DAT wiki object response");
+  }
+  return value as unknown as DatWikiObjectValues;
+}
+
+/** Every table, object name and field of the version-matched DAT catalog. */
+export async function datWikiSchema(
+  invoke: InvokeFn = tauriInvoke,
+): Promise<DatWikiSchema> {
+  return toDatWikiSchema(await invoke("dat_wiki_schema", {}));
+}
+
+/** One object's stock values plus whatever `dat/*.json` overrides. */
+export async function datWikiObject(
+  table: string,
+  objectId: number,
+  invoke: InvokeFn = tauriInvoke,
+): Promise<DatWikiObjectValues> {
+  return toDatWikiObjectValues(await invoke("dat_wiki_object", { table, objectId }));
+}
+
+/** Open an http(s) URL in the system browser through the shell plugin. */
+export async function openExternalUrl(
+  url: string,
+  invoke: InvokeFn = tauriInvoke,
+): Promise<void> {
+  await invoke("plugin:shell|open", { path: url });
 }
 
 /**
@@ -511,7 +734,6 @@ function toWorkspaceList(value: unknown): WorkspaceListResponse {
     (entry): entry is WorkspaceFileEntry =>
       isObject(entry) &&
       typeof entry.path === "string" &&
-      typeof entry.source === "boolean" &&
       typeof entry.size === "number" &&
       (entry.state === undefined || typeof entry.state === "string") &&
       (entry.revision === undefined || typeof entry.revision === "number"),
@@ -526,14 +748,14 @@ function toWorkspaceList(value: unknown): WorkspaceListResponse {
   };
 }
 
-/** Refresh the source mirror and list the current project's real Codex workspace. */
+/** List the current project's accepted, project-local harness documents. */
 export async function workspaceList(
   invoke: InvokeFn = tauriInvoke,
 ): Promise<WorkspaceListResponse> {
   return toWorkspaceList(await invoke("workspace_list"));
 }
 
-/** Read one confined UTF-8 workspace file. */
+/** Read one confined project file for the viewer (text, or why it stays closed). */
 export async function workspaceRead(
   workspaceId: string,
   path: string,
@@ -544,8 +766,14 @@ export async function workspaceRead(
     !isObject(value) ||
     value.workspaceId !== workspaceId ||
     value.path !== path ||
-    typeof value.source !== "boolean" ||
-    typeof value.content !== "string"
+    typeof value.size !== "number" ||
+    !(typeof value.content === "string" || value.content === null) ||
+    !(
+      value.unreadable === undefined ||
+      value.unreadable === "binary" ||
+      value.unreadable === "too_large"
+    ) ||
+    (value.content === null) === (value.unreadable === undefined)
   ) {
     throw new Error("invalid workspace read response");
   }
@@ -644,6 +872,84 @@ function toSessionModelSettings(value: unknown): SessionModelSettings {
         : (value.selectedReasoning as unknown as ReasoningSelection),
   };
 }
+
+function parseSetupResponse(value: unknown, command: string): SetupMessage {
+  if (isObject(value)) {
+    const candidate = { ...value, type: "setup" };
+    if (isSetupMessage(candidate)) return candidate;
+  }
+  throw new Error(`invalid response from ${command}`);
+}
+
+function parseRecentProject(value: unknown): RecentProject {
+  if (
+    !isObject(value) ||
+    typeof value.name !== "string" ||
+    typeof value.path !== "string" ||
+    typeof value.lastOpenedAt !== "number" ||
+    typeof value.available !== "boolean"
+  ) {
+    throw new Error("invalid response from project_recent_list");
+  }
+  return {
+    name: value.name,
+    path: value.path,
+    lastOpenedAt: value.lastOpenedAt,
+    available: value.available,
+  };
+}
+
+export async function setupProjectOpen(
+  path: string,
+  invoke: InvokeFn = tauriInvoke,
+): Promise<SetupMessage> {
+  return parseSetupResponse(await invoke("project_open", { path }), "project_open");
+}
+
+export async function setupPickProjectPath(
+  directory = false,
+  invoke: InvokeFn = tauriInvoke,
+): Promise<SetupMessage> {
+  return parseSetupResponse(
+    await invoke("setup_pick_project_path", directory ? { directory: true } : {}),
+    "setup_pick_project_path",
+  );
+}
+export async function setupCreateProject(
+  invoke: InvokeFn = tauriInvoke,
+): Promise<SetupMessage> {
+  return parseSetupResponse(await invoke("setup_create_project"), "setup_create_project");
+}
+
+export async function projectRecentList(
+  invoke: InvokeFn = tauriInvoke,
+): Promise<RecentProject[]> {
+  const value = await invoke("project_recent_list");
+  if (!Array.isArray(value)) throw new Error("invalid response from project_recent_list");
+  return value.map(parseRecentProject);
+}
+
+export async function projectRecentRemove(
+  path: string,
+  invoke: InvokeFn = tauriInvoke,
+): Promise<RecentProject[]> {
+  const value = await invoke("project_recent_remove", { path });
+  if (!Array.isArray(value)) throw new Error("invalid response from project_recent_remove");
+  return value.map(parseRecentProject);
+}
+
+export async function projectTakeLaunchRequest(
+  invoke: InvokeFn = tauriInvoke,
+): Promise<string | null> {
+  const value = await invoke("project_take_launch_request");
+  if (value === null) return null;
+  if (isObject(value) && typeof value.path === "string" && value.path.trim() !== "") {
+    return value.path;
+  }
+  throw new Error("invalid response from project_take_launch_request");
+}
+
+
 
 export interface E3sExportResponse {
   path: string;
@@ -828,32 +1134,23 @@ function toAppSettings(value: unknown): AppSettings {
     !isObject(value) ||
     !isObject(value.notifications) ||
     !isNotificationChannelSettings(value.notifications.planApproval) ||
-    !isNotificationChannelSettings(value.notifications.changesetReview) ||
+    !isNotificationChannelSettings(value.notifications.reviewRequired) ||
     !isNotificationChannelSettings(value.notifications.agentTurnComplete) ||
     !isNotificationChannelSettings(value.notifications.askResponseRequired) ||
     !Array.isArray(value.codexLargeContextModels) ||
     !value.codexLargeContextModels.every(
       (model) => typeof model === "string" && model.trim().length > 0,
-    )
+    ) ||
+    typeof value.deepPlanning !== "boolean" ||
+    (value.scmdraftPath !== undefined && typeof value.scmdraftPath !== "string")
   ) {
     throw new Error("invalid app settings response");
   }
-  return value as unknown as AppSettings;
-}
-
-/** Fetch app-owned preferences for the extensible settings dialog. */
-export async function appSettingsGet(
-  invoke: InvokeFn = tauriInvoke,
-): Promise<AppSettings> {
-  return toAppSettings(await invoke("app_settings"));
-}
-
-/** Persist app-owned preferences without replacing unrelated core config. */
-export async function appSettingsSave(
-  settings: AppSettings,
-  invoke: InvokeFn = tauriInvoke,
-): Promise<AppSettings> {
-  return toAppSettings(await invoke("app_settings_save", { settings }));
+  // Older backends omit the SCMDraft path; normalize so every save carries the field.
+  return {
+    ...(value as unknown as AppSettings),
+    scmdraftPath: typeof value.scmdraftPath === "string" ? value.scmdraftPath : "",
+  };
 }
 
 function toEuddraftSettings(value: unknown): EuddraftSettings {
@@ -900,6 +1197,44 @@ export async function euddraftUpdate(
   return toEuddraftSettings(await invoke("euddraft_update"));
 }
 
+/** Fetch app-owned preferences for the extensible settings dialog. */
+export async function appSettingsGet(
+  invoke: InvokeFn = tauriInvoke,
+): Promise<AppSettings> {
+  return toAppSettings(await invoke("app_settings"));
+}
+
+/** Persist app-owned preferences without replacing unrelated core config. */
+export async function appSettingsSave(
+  settings: AppSettings,
+  invoke: InvokeFn = tauriInvoke,
+): Promise<AppSettings> {
+  return toAppSettings(await invoke("app_settings_save", { settings }));
+}
+
+/** Open the SCMDraft 2 executable picker; the backend persists the choice. Null when cancelled. */
+export async function pickScmdraftPath(
+  invoke: InvokeFn = tauriInvoke,
+): Promise<string | null> {
+  const value = await invoke("settings_pick_scmdraft_path");
+  if (value === null || value === undefined) return null;
+  if (typeof value !== "string") throw new Error("invalid scmdraft path response");
+  return value;
+}
+
+/** Outcome of "SCMDraft 2로 열기": launched, or the executable is not configured yet. */
+export type ScmdraftLaunch = { kind: "launched" } | { kind: "unconfigured" };
+
+/** Launch the configured SCMDraft 2 on the current project's source map. */
+export async function openScmdraft(invoke: InvokeFn = tauriInvoke): Promise<ScmdraftLaunch> {
+  const value = await invoke("project_open_scmdraft");
+  const kind = isObject(value) ? value.kind : undefined;
+  if (kind !== "launched" && kind !== "unconfigured") {
+    throw new Error("invalid scmdraft launch response");
+  }
+  return { kind };
+}
+
 /** Play the native OS sound used by attention notifications. */
 export async function notificationSoundPreview(
   invoke: InvokeFn = tauriInvoke,
@@ -922,13 +1257,133 @@ export async function attentionNotify(
   kind: AttentionNotificationKind,
   showOs: boolean,
   sessionId: string,
-  itemCount?: number,
   invoke: InvokeFn = tauriInvoke,
 ): Promise<void> {
-  await invoke("attention_notify", {
-    kind,
-    showOs,
-    sessionId,
-    ...(itemCount === undefined ? {} : { itemCount }),
+  await invoke("attention_notify", { kind, showOs, sessionId });
+}
+
+// ---- project history (git) ---------------------------------------------
+// The turn boundary commits the project; "되돌리기" is `git revert`. These act
+// on the OPEN project, so none of them carries a session id. The backend owns
+// the shapes; the panel validates only the fields it renders, so a field added
+// core-side never breaks the view.
+
+function toRepoState(value: unknown): RepoState {
+  if (
+    !isObject(value) ||
+    typeof value.available !== "boolean" ||
+    typeof value.tracked !== "boolean" ||
+    typeof value.nested !== "boolean" ||
+    (value.consent !== "pending" &&
+      value.consent !== "granted" &&
+      value.consent !== "declined")
+  ) {
+    throw new Error("invalid git state response");
+  }
+  const origin =
+    value.origin === "app" || value.origin === "preexisting" ? value.origin : null;
+  return {
+    available: value.available,
+    tracked: value.tracked,
+    nested: value.nested,
+    origin,
+    consent: value.consent,
+    warning: typeof value.warning === "string" ? value.warning : null,
+  };
+}
+
+/** What the app knows about the open project's repository. */
+export async function gitState(invoke: InvokeFn = tauriInvoke): Promise<RepoState> {
+  return toRepoState(await invoke("git_state"));
+}
+
+/** Record whether the app may commit into a repository the user already had. */
+export async function gitConsentSet(
+  granted: boolean,
+  invoke: InvokeFn = tauriInvoke,
+): Promise<RepoState> {
+  return toRepoState(await invoke("git_consent_set", { granted }));
+}
+
+/** The project's recent commits, newest first. */
+export async function gitLog(
+  limit?: number,
+  invoke: InvokeFn = tauriInvoke,
+): Promise<CommitSummary[]> {
+  const value = await invoke("git_log", limit === undefined ? {} : { limit });
+  if (!Array.isArray(value)) throw new Error("invalid git log response");
+  return value.map((row) => {
+    if (
+      !isObject(row) ||
+      typeof row.sha !== "string" ||
+      typeof row.subject !== "string" ||
+      typeof row.timestamp !== "number"
+    ) {
+      throw new Error("invalid git log response");
+    }
+    return { sha: row.sha, subject: row.subject, timestamp: row.timestamp };
   });
+}
+
+function toCommitFile(value: unknown): CommitFile {
+  if (
+    !isObject(value) ||
+    typeof value.path !== "string" ||
+    typeof value.insertions !== "number" ||
+    typeof value.deletions !== "number" ||
+    typeof value.binary !== "boolean"
+  ) {
+    throw new Error("invalid git commit detail response");
+  }
+  const file: CommitFile = {
+    path: value.path,
+    insertions: value.insertions,
+    deletions: value.deletions,
+    binary: value.binary,
+  };
+  if (typeof value.patch === "string") file.patch = value.patch;
+  if (typeof value.omitted === "string") file.omitted = value.omitted;
+  return file;
+}
+
+/** Everything one commit changed, with each file's patch bounded core-side. */
+export async function gitCommitDetail(
+  sha: string,
+  invoke: InvokeFn = tauriInvoke,
+): Promise<CommitDetail> {
+  const value = await invoke("git_commit_detail", { sha });
+  if (
+    !isObject(value) ||
+    typeof value.sha !== "string" ||
+    typeof value.subject !== "string" ||
+    typeof value.body !== "string" ||
+    typeof value.timestamp !== "number" ||
+    !Array.isArray(value.files)
+  ) {
+    throw new Error("invalid git commit detail response");
+  }
+  return {
+    sha: value.sha,
+    subject: value.subject,
+    body: value.body,
+    timestamp: value.timestamp,
+    files: value.files.map(toCommitFile),
+  };
+}
+
+/** Undo one commit by recording its inverse. This is what replaced Reject. */
+export async function gitRevert(
+  sha: string,
+  invoke: InvokeFn = tauriInvoke,
+): Promise<CommitRecord> {
+  const value = await invoke("git_revert", { sha });
+  if (
+    !isObject(value) ||
+    typeof value.sha !== "string" ||
+    typeof value.subject !== "string" ||
+    typeof value.files !== "number"
+  ) {
+    throw new Error("invalid git revert response");
+  }
+  return { sha: value.sha, subject: value.subject, files: value.files };
 }

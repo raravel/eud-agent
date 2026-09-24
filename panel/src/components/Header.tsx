@@ -6,12 +6,14 @@
  * labels throughout.
  */
 import {
+  ExternalLink,
+  FolderKanban,
   MapIcon,
   PanelRightClose,
   PanelRightOpen,
   Settings,
+  SlidersHorizontal,
 } from "lucide-react";
-
 import { Button } from "@/components/ui/button";
 import {
   Tooltip,
@@ -44,14 +46,20 @@ export interface HeaderProps {
   hasProject?: boolean;
   /** Open or focus the separate Map Agent workbench window. */
   onOpenMapAgent?: () => void;
+  /** Open the Map window on its "맵 속성" dialog (제목·설명·플레이어·포스). */
+  onOpenMapProperties?: () => void;
+  /** Open the project's source map in the configured SCMDraft 2 (설정 → 컴파일). */
+  onOpenScmdraft?: () => void;
   /** Toggle the project tools sidebar. */
   onProjectPanelToggle?: () => void;
   /** Whether the project tools sidebar is currently visible. */
   projectPanelOpen?: boolean;
   /** Open the general app settings dialog. */
   onSettingsOpen?: () => void;
-}
+  /** Return to the project launcher without changing project until a choice succeeds. */
+  onProjectSwitch?: () => void;
 
+}
 /** One status pill descriptor: label + tone classes + whether it is in flight. */
 interface Pill {
   label: string;
@@ -145,9 +153,12 @@ export function Header({
   projectAvailable = false,
   hasProject = true,
   onOpenMapAgent,
+  onOpenMapProperties,
+  onOpenScmdraft,
   onProjectPanelToggle,
   projectPanelOpen = false,
   onSettingsOpen,
+  onProjectSwitch,
 }: HeaderProps) {
   const conn = connState(connected, phase, projectAvailable, hasProject);
   const ragInfo = ragPill(rag);
@@ -178,6 +189,17 @@ export function Header({
           )}
         </div>
       </div>
+        {onProjectSwitch && (
+          <Button
+            type="button"
+            variant="outline"
+            className="gap-1.5"
+            onClick={onProjectSwitch}
+          >
+            <FolderKanban className="size-4" aria-hidden="true" />
+            프로젝트 전환
+          </Button>
+        )}
       <div className="flex shrink-0 items-center gap-2">
         {onOpenMapAgent && (
           <Button
@@ -190,6 +212,34 @@ export function Header({
           >
             <MapIcon className="size-4" aria-hidden="true" />
             맵 에이전트
+          </Button>
+        )}
+        {onOpenMapProperties && (
+          <Button
+            type="button"
+            size="default"
+            variant="outline"
+            className="gap-1.5"
+            disabled={!projectAvailable || !hasProject}
+            title="맵 창에서 제목·설명·플레이어 슬롯·포스를 수정합니다"
+            onClick={onOpenMapProperties}
+          >
+            <SlidersHorizontal className="size-4" aria-hidden="true" />
+            맵 속성
+          </Button>
+        )}
+        {onOpenScmdraft && (
+          <Button
+            type="button"
+            size="default"
+            variant="outline"
+            className="gap-1.5"
+            disabled={!projectAvailable || !hasProject}
+            title="설정 → 컴파일에서 지정한 SCMDraft 2로 원본 맵 열기"
+            onClick={onOpenScmdraft}
+          >
+            <ExternalLink className="size-4" aria-hidden="true" />
+            SCMDraft 2로 열기
           </Button>
         )}
         {ragInfo && <StatusPill pill={ragInfo} />}

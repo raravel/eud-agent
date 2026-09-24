@@ -14,6 +14,7 @@ import {
   mapSessionList,
   mapSessionLoad,
   mapSessionRename,
+  saveMapProperties,
 } from "./mapProtocol";
 
 beforeEach(() => {
@@ -179,6 +180,31 @@ describe("Map image placement IPC", () => {
     await mapImageCancel("map-session-7");
     expect(tauri.invoke).toHaveBeenCalledWith("map_agent_image_cancel", {
       sessionId: "map-session-7",
+    });
+  });
+});
+
+describe("Map properties and SCMDraft IPC", () => {
+  it("sends the complete 12-slot / 4-force properties document under the session", async () => {
+    const properties = {
+      title: "협동 방어전",
+      description: "",
+      players: [
+        ...Array.from({ length: 8 }, () => ({ type: "human" as const, race: "userSelectable" as const, force: 0 })),
+        ...Array.from({ length: 3 }, () => ({ type: "inactive" as const, race: "inactive" as const })),
+        { type: "neutral" as const, race: "neutral" as const },
+      ],
+      forces: Array.from({ length: 4 }, (_, index) => ({
+        name: `포스 ${index + 1}`,
+        allied: true,
+        alliedVictory: true,
+        sharedVision: false,
+        randomStart: false,
+      })),
+    };
+    await saveMapProperties({ sessionId: "map-session-3", properties });
+    expect(tauri.invoke).toHaveBeenCalledWith("map_agent_properties_save", {
+      command: { sessionId: "map-session-3", properties },
     });
   });
 });

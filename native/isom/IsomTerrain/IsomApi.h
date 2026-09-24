@@ -1624,6 +1624,27 @@ namespace Chk {
             return terrainType < terrainTypes.size() ? terrainTypes[terrainType].isomValue : 0;
         }
 
+        // Subtile variation is drawn from this per-cache generator, never from the
+        // process-global std::rand(): eud-agent replays a candidate's operation
+        // manifest at Apply and refuses a candidate whose replay differs, so the
+        // same operation on the same map must pick the same subtiles every time.
+        mutable uint32_t subtileRandomState = 0x9E3779B9u;
+
+        inline void seedSubtileVariation(uint32_t seed)
+        {
+            subtileRandomState = seed != 0 ? seed : 0x9E3779B9u; // xorshift must never sit at zero
+        }
+
+        inline uint32_t nextSubtileRandom() const // xorshift32
+        {
+            uint32_t x = subtileRandomState;
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            subtileRandomState = x;
+            return x;
+        }
+
         inline uint16_t getRandomSubtile(uint16_t tileGroup) const
         {
             if ( tileGroup < tileGroups.size() )
@@ -1633,10 +1654,10 @@ namespace Chk {
                 for ( ; totalCommon < 16 && tileGroups[tileGroup].megaTileIndex[totalCommon] != 0; ++totalCommon );
                 for ( ; totalCommon+totalRare+1 < 16 && tileGroups[tileGroup].megaTileIndex[totalCommon+totalRare+1] != 0; ++totalRare );
 
-                if ( totalRare != 0 && std::rand() <= RAND_MAX / 20 ) // 1 in 20 chance of using a rare tile
-                    return 16*tileGroup + uint16_t(totalCommon + 1 + (std::rand() % totalRare)); // Select particular rare tile
+                if ( totalRare != 0 && nextSubtileRandom() % 20 == 0 ) // 1 in 20 chance of using a rare tile
+                    return 16*tileGroup + uint16_t(totalCommon + 1 + (nextSubtileRandom() % totalRare)); // Select particular rare tile
                 else if ( totalCommon != 0 ) // Use a common tile
-                    return 16*tileGroup + uint16_t(std::rand() % totalCommon); // Select particular common tile
+                    return 16*tileGroup + uint16_t(nextSubtileRandom() % totalCommon); // Select particular common tile
             }
             return 16*tileGroup; // Default/fall-back to first tile in group
         }
@@ -1715,6 +1736,37 @@ struct ScMap
                         }
                     }
                 }
+            }
+        }
+        radiallyUpdateTerrain(true, diamondsToUpdate, cache);
+        return true;
+    }
+    // Brush an explicit set of valid in-bounds diamonds with one terrain type and regenerate the
+    // transition ring around the whole set once: the shape placeIsomTerrain gives its NxN block,
+    // for an arbitrary diamond set (e.g. every diamond whose footprint lies inside a tile rectangle).
+    inline bool placeIsomTerrainDiamonds(const std::vector<Chk::IsomDiamond> & diamonds, size_t terrainType, Chk::IsomCache & cache)
+    {
+        uint16_t isomValue = cache.getTerrainTypeIsomValue(terrainType);
+        if ( isomValue == 0 || size_t(isomValue) >= cache.isomLinks.size() || cache.isomLinks[size_t(isomValue)].terrainType == 0 || diamonds.empty() )
+            return false;
+        for ( const auto & diamond : diamonds )
+        {
+            if ( !diamond.isValid() || !isInBounds(diamond) )
+                return false;
+        }
+
+        cache.resetChangedArea();
+        for ( const auto & diamond : diamonds )
+            setDiamondIsomValues(diamond, isomValue, true, cache);
+
+        std::deque<Chk::IsomDiamond> diamondsToUpdate {};
+        for ( const auto & diamond : diamonds )
+        {
+            for ( auto i : Chk::IsomDiamond::neighbors )
+            {
+                Chk::IsomDiamond neighbor = diamond.getNeighbor(i);
+                if ( diamondNeedsUpdate(neighbor) ) // Diamonds set above are modified and skipped here
+                    diamondsToUpdate.push_back(Chk::IsomDiamond{neighbor.x, neighbor.y});
             }
         }
         radiallyUpdateTerrain(true, diamondsToUpdate, cache);

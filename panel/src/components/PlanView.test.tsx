@@ -1,24 +1,24 @@
 /**
- * Plan review card (features/06 ## UI layout + Behaviors → Plan review, EUD-074):
- *   a markdown plan card (Streamdown) + a [승인] button (`plan_approve{}`).
- *   The feedback textarea and the [수정요청] button are REMOVED (user decision
- *   2026-06-05): plan feedback flows through the MAIN prompt input — typing in
- *   the prompt during plan_review sends `plan_feedback{text}` (App routes it).
+ * Plan tab body (EUD-074):
+ *   a full-height markdown plan (Streamdown) + a [승인] button (`plan_approve{}`)
+ *   in the tab header while the plan awaits review. The feedback textarea and
+ *   the [수정요청] button are REMOVED (user decision 2026-06-05): plan feedback
+ *   flows through the MAIN prompt input — typing in the prompt during
+ *   plan_review sends `plan_feedback{text}` (App routes it).
  *
  * Contract (`@/components/PlanView`):
  *   export interface PlanViewProps {
  *     plan: PlanState;                // { markdown, revision }
- *     open: boolean;                  // selected session's expansion state
- *     onOpenChange(open): void;       // App persists expansion per session
- *     pending: boolean;               // a turn is in flight (disable 승인)
+ *     reviewable: boolean;            // phase === plan_review → 승인 shown
+ *     pending: boolean;               // approve command in flight (disable 승인)
  *     onApprove(): void;              // App invokes plan_approve{}
  *   }
  *
- * Revision replacement and expansion state are App-owned, so the component is
- * a controlled renderer of the selected session's active plan.
+ * Revision replacement and tab lifecycle are App-owned, so the component is a
+ * controlled renderer of the selected session's active plan.
  */
-import { beforeEach, describe, it, expect, vi } from "vitest";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { describe, it, expect, vi } from "vitest";
+import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { PlanView, type PlanViewProps } from "@/components/PlanView";
 import type { PlanState } from "@/state/store";
@@ -34,8 +34,7 @@ const rev2: PlanState = {
 };
 
 const defaultPlanViewProps: Omit<PlanViewProps, "plan"> = {
-  open: true,
-  onOpenChange: () => {},
+  reviewable: true,
   pending: false,
   onApprove: () => {},
 };
@@ -80,14 +79,6 @@ describe("PlanView — markdown render", () => {
       <PlanView {...defaultPlanViewProps} plan={plan} />,
     );
     expect(container.querySelector("script")).toBeNull();
-    expect(screen.getByText(/텍스트/)).toBeInTheDocument();
-  });
-
-  it("renders via the AI-Elements Plan component (data-slot=plan)", () => {
-    const { container } = render(
-      <PlanView {...defaultPlanViewProps} plan={rev1} />,
-    );
-    expect(container.querySelector('[data-slot="plan"]')).not.toBeNull();
   });
 
   it("renders evidence citation links as real anchors with href (EUD-090)", () => {
@@ -124,9 +115,11 @@ describe("PlanView — revision replacement (store-driven)", () => {
       <PlanView {...defaultPlanViewProps} plan={rev1} />,
     );
     expect(screen.getByText("계획 1")).toBeInTheDocument();
+    expect(screen.getByText("계획안 (rev 1)")).toBeInTheDocument();
 
     rerender(<PlanView {...defaultPlanViewProps} plan={rev2} />);
     expect(screen.getByText("계획 2")).toBeInTheDocument();
+    expect(screen.getByText("계획안 (rev 2)")).toBeInTheDocument();
     expect(screen.getByText("수정된 내용입니다.")).toBeInTheDocument();
     expect(screen.queryByText("계획 1")).not.toBeInTheDocument();
     expect(screen.queryByText("첫 번째 단계")).not.toBeInTheDocument();
@@ -142,135 +135,48 @@ describe("PlanView — no embedded feedback input (EUD-074)", () => {
     expect(
       screen.queryByRole("button", { name: "수정요청" }),
     ).not.toBeInTheDocument();
+    expect(
+      screen.getByText("수정하려면 아래 입력창에 피드백을 입력하세요."),
+    ).toBeInTheDocument();
   });
 });
 
-describe("PlanView — approve dispatch and collapse", () => {
-  it("[승인] requests collapse, calls onApprove, and allows manual re-open", async () => {
+describe("PlanView — approve dispatch", () => {
+  it("[승인] calls onApprove", async () => {
     const onApprove = vi.fn();
-    const onOpenChange = vi.fn();
-    const { rerender } = render(
-      <PlanView
-        plan={rev1}
-        open={true}
-        onOpenChange={onOpenChange}
-        pending={false}
-        onApprove={onApprove}
-      />,
+    render(
+      <PlanView {...defaultPlanViewProps} plan={rev1} onApprove={onApprove} />,
     );
-    expect(screen.getByText("첫 번째 단계")).toBeInTheDocument();
-
     await userEvent.click(screen.getByRole("button", { name: "승인" }));
-
-    expect(onOpenChange).toHaveBeenCalledWith(false);
-    expect(onApprove).toHaveBeenCalledWith();
-    rerender(
-      <PlanView
-        plan={rev1}
-        open={false}
-        onOpenChange={onOpenChange}
-        pending={false}
-        onApprove={onApprove}
-      />,
-    );
-    expect(screen.queryByText("첫 번째 단계")).not.toBeInTheDocument();
-
-    await userEvent.click(
-      screen.getByRole("button", { name: "계획안 펼치기" }),
-    );
-    expect(onOpenChange).toHaveBeenLastCalledWith(true);
-    rerender(
-      <PlanView
-        plan={rev1}
-        open={true}
-        onOpenChange={onOpenChange}
-        pending={false}
-        onApprove={onApprove}
-      />,
-    );
-    expect(screen.getByText("첫 번째 단계")).toBeInTheDocument();
+    expect(onApprove).toHaveBeenCalledTimes(1);
   });
 
-  it("renders a new revision open when the parent resets its expansion state", () => {
-    const { rerender } = render(
-      <PlanView
-        plan={rev1}
-        open={false}
-        onOpenChange={() => {}}
-        pending={false}
-        onApprove={() => {}}
-      />,
-    );
-    expect(screen.queryByText("첫 번째 단계")).not.toBeInTheDocument();
-
-    rerender(
-      <PlanView {...defaultPlanViewProps} plan={rev2} />,
-    );
-
-    expect(screen.getByText("수정된 내용입니다.")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "계획안 접기" })).toBeInTheDocument();
-  });
-});
-
-describe("PlanView — fixed approval action", () => {
-  it("keeps approval outside the scrollable plan body", () => {
-    const { container } = render(
-      <PlanView {...defaultPlanViewProps} plan={rev1} />,
-    );
-    const plan = container.querySelector('[data-slot="plan"]');
-    const content = container.querySelector('[data-slot="plan-content"]');
+  it("keeps approval in the tab header, outside the scrollable plan body", () => {
+    render(<PlanView {...defaultPlanViewProps} plan={rev1} />);
+    const section = screen.getByRole("region", { name: "계획 검토" });
     const actions = screen.getByTestId("plan-actions");
+    const body = screen.getByText("첫 번째 단계").closest(".overflow-y-auto");
 
-    expect(plan).not.toContainElement(actions);
-    expect(actions.parentElement).toBe(plan?.parentElement);
-    expect(content).toHaveClass("overflow-y-auto");
+    expect(section).toContainElement(actions);
+    expect(body).not.toBeNull();
+    expect(body).not.toContainElement(actions);
     expect(actions).toHaveClass("shrink-0");
   });
 });
 
 describe("PlanView — pending state", () => {
-  it("disables 승인 while a turn is in flight", () => {
+  it("disables 승인 while the approve command is in flight", () => {
     render(<PlanView {...defaultPlanViewProps} plan={rev1} pending={true} />);
     expect(screen.getByRole("button", { name: "승인" })).toBeDisabled();
   });
 });
 
-describe("PlanView — resizable height", () => {
-  beforeEach(() => {
-    localStorage.removeItem("eud.plan-view.height");
-  });
-
-  it("exposes a keyboard-accessible horizontal splitter and persists height", () => {
-    render(<PlanView {...defaultPlanViewProps} plan={rev1} />);
-    const splitter = screen.getByRole("separator", {
-      name: "계획 패널 높이 조절",
-    });
-
-    expect(splitter).toHaveAttribute("aria-orientation", "horizontal");
-    expect(splitter).toHaveAttribute("aria-valuenow", "320");
-
-    fireEvent.keyDown(splitter, { key: "ArrowUp" });
-
-    expect(splitter).toHaveAttribute("aria-valuenow", "336");
-    expect(localStorage.getItem("eud.plan-view.height")).toBe("336");
-    expect(screen.getByLabelText("계획 검토")).toHaveStyle({
-      height: "336px",
-    });
-  });
-
-  it("resizes upward by dragging the splitter", () => {
-    render(<PlanView {...defaultPlanViewProps} plan={rev1} />);
-    const splitter = screen.getByRole("separator", {
-      name: "계획 패널 높이 조절",
-    });
-
-    fireEvent.pointerDown(splitter, { pointerId: 1, clientY: 300 });
-    fireEvent.pointerMove(splitter, { pointerId: 1, clientY: 260 });
-    fireEvent.pointerUp(splitter, { pointerId: 1, clientY: 260 });
-
-    expect(splitter).toHaveAttribute("aria-valuenow", "360");
-    expect(screen.getByLabelText("계획 검토")).toHaveStyle({
-      height: "360px",
-    });
+describe("PlanView — read-only after review", () => {
+  it("hides 승인 and shows the read-only badge once the plan left review", () => {
+    render(<PlanView {...defaultPlanViewProps} plan={rev1} reviewable={false} />);
+    expect(screen.queryByRole("button", { name: "승인" })).not.toBeInTheDocument();
+    expect(screen.queryByTestId("plan-actions")).not.toBeInTheDocument();
+    expect(screen.getByText("읽기 전용")).toBeInTheDocument();
+    expect(screen.getByText("계획 1")).toBeInTheDocument();
   });
 });

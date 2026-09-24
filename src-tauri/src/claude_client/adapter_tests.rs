@@ -169,7 +169,7 @@ async fn production_process_preserves_stream_order_native_tools_and_resume() {
 [IO.File]::WriteAllText('{escaped_args}', ($Rest | ConvertTo-Json -Compress))
 $null = [Console]::In.ReadLine()
 if ($Rest -contains '--mcp-config') {{
-  [Console]::Out.WriteLine('{{"type":"system","subtype":"init","session_id":"native-session","tools":["mcp__eud-tools__read_file"],"mcp_servers":[{{"name":"eud-tools","status":"connected"}}]}}')
+  [Console]::Out.WriteLine('{{"type":"system","subtype":"init","session_id":"native-session","tools":["Read","Edit","Write","Glob","Grep","mcp__eud-tools__read_file"],"mcp_servers":[{{"name":"eud-tools","status":"connected"}}]}}')
 }} else {{
   [Console]::Out.WriteLine('{{"type":"system","subtype":"init","session_id":"native-session","tools":[],"mcp_servers":[]}}')
 }}
@@ -206,7 +206,10 @@ exit 0
     while let Ok(event) = events_rx.try_recv() {
         kinds.push(event.kind);
     }
+    // The resumable session is published before any output, so an interruption
+    // still leaves the run a native continuation boundary.
     assert!(matches!(kinds.as_slice(), [
+        AdapterEventKind::NativeSessionStarted { session_id },
         AdapterEventKind::ResponseStarted { .. },
         AdapterEventKind::Block(NormalizedBlock::Reasoning { text, .. }),
         AdapterEventKind::NativeToolObservation { mcp_server: Some(server), name, call_id: Some(completed_id), arguments: Some(arguments), status: Some(completed), .. },
@@ -214,7 +217,7 @@ exit 0
         AdapterEventKind::Block(NormalizedBlock::Text { text: answer, .. }),
         AdapterEventKind::Usage(_),
         AdapterEventKind::ResponseFinished { complete: true, .. },
-    ] if text == "reason" && name == "mcp__eud-tools__read_file" && server == "eud-tools" && result_server == "eud-tools" && completed_id == "call-1" && arguments == &json!({}) && completed == "started" && result_id == "call-1" && result == "ok" && result_status == "completed" && answer == "answer"));
+    ] if session_id == "native-session" && text == "reason" && name == "mcp__eud-tools__read_file" && server == "eud-tools" && result_server == "eud-tools" && completed_id == "call-1" && arguments == &json!({}) && completed == "started" && result_id == "call-1" && result == "ok" && result_status == "completed" && answer == "answer"));
     let context = kinds
         .iter()
         .find_map(|kind| match kind {
@@ -240,13 +243,39 @@ exit 0
     assert!(args.iter().any(|value| value == "--resume"));
     assert!(args.iter().any(|value| value == "native-session"));
     assert!(args.iter().any(|value| value == "--strict-mcp-config"));
-    assert!(args.iter().any(|value| value == "mcp__eud-tools__*"));
     assert!(args.iter().any(|value| value
         .as_str()
         .is_some_and(|arg| arg.contains("/mcp/run-token"))));
+    // An interactive turn edits the project tree with the built-in file tools.
     let tools_index = args.iter().position(|value| value == "--tools").unwrap();
-    assert_eq!(args.get(tools_index + 1).and_then(Value::as_str), Some(""));
-    assert!(!args.iter().any(|value| value == "Read"));
+    let tools = args.get(tools_index + 1).and_then(Value::as_str).unwrap();
+    for tool in ["Read", "Edit", "Write", "Glob", "Grep"] {
+        assert!(tools.contains(tool), "{tool} must be available: {tools}");
+    }
+    // `build_run` stays the only way to run anything.
+    assert!(!tools.contains("Bash"), "{tools}");
+    let allowed_index = args
+        .iter()
+        .position(|value| value == "--allowedTools")
+        .unwrap();
+    let allowed = args.get(allowed_index + 1).and_then(Value::as_str).unwrap();
+    assert!(allowed.contains("mcp__eud-tools__*"), "{allowed}");
+    assert!(allowed.contains("Edit"), "{allowed}");
+    // The map, the verified references and the history itself are never written.
+    let denied_index = args
+        .iter()
+        .position(|value| value == "--disallowedTools")
+        .unwrap();
+    let denied = args.get(denied_index + 1).and_then(Value::as_str).unwrap();
+    for rule in [
+        "Edit(maps/**)",
+        "Edit(references/**)",
+        "Edit(.git/**)",
+        "Edit(.claude/**)",
+        "Edit(.mcp.json)",
+    ] {
+        assert!(denied.contains(rule), "{rule} must be denied: {denied}");
+    }
 
     let (_compact_cancel_tx, compact_cancel_rx) = tokio::sync::watch::channel(0_u64);
     let (compact_events_tx, mut compact_events_rx) = tokio::sync::mpsc::channel(16);
@@ -267,6 +296,11 @@ exit 0
     assert!(!args.iter().any(|value| value == "--mcp-config"));
     let tools_index = args.iter().position(|value| value == "--tools").unwrap();
     assert_eq!(args.get(tools_index + 1).and_then(Value::as_str), Some(""));
+    // Compaction runs in the same resumed session and publishes it too.
+    assert!(matches!(
+        compact_events_rx.recv().await.unwrap().kind,
+        AdapterEventKind::NativeSessionStarted { ref session_id } if session_id == "native-session"
+    ));
     assert!(matches!(
         compact_events_rx.recv().await.unwrap().kind,
         AdapterEventKind::ResponseStarted { .. }
@@ -353,6 +387,101 @@ fn native_tool_result_preserves_execution_failure_without_duplicate_start() {
     );
 }
 
+fn started_native_tool(parser: &mut ClaudeStreamParser, call_id: &str, name: &str) {
+    parser
+        .apply(&json!({"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":call_id,"name":name}}}))
+        .unwrap();
+    parser
+        .apply(&json!({"type":"stream_event","event":{"type":"content_block_stop","index":0}}))
+        .unwrap();
+}
+
+#[test]
+fn native_tool_result_image_blocks_are_exempt_from_observation_limit() {
+    let mut parser = ClaudeStreamParser::default();
+    started_native_tool(&mut parser, "call-1", "mcp__eud-tools__map_draft_render");
+    let oversized_png = "A".repeat(events::MAX_NATIVE_OBSERVATION_BYTES * 3);
+    let result = parser
+        .apply(&json!({"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"call-1","content":[
+            {"type":"text","text":"{\"image\":{\"mimeType\":\"image/png\",\"width\":704,\"height\":448}}"},
+            {"type":"image","source":{"type":"base64","media_type":"image/png","data":oversized_png}}
+        ]}]}}))
+        .unwrap();
+    assert!(
+        matches!(result.as_slice(), [ParsedEvent::ToolObservation { name, result: Some(value), status: Some(status), .. }]
+            if status == "completed" && name == "mcp__eud-tools__map_draft_render" && value[1]["type"] == "image")
+    );
+}
+
+#[test]
+fn native_tool_result_text_over_observation_limit_is_still_rejected() {
+    let mut parser = ClaudeStreamParser::default();
+    started_native_tool(&mut parser, "call-1", "mcp__eud-tools__read_file");
+    let oversized_text = "x".repeat(events::MAX_NATIVE_OBSERVATION_BYTES + 1);
+    let result = parser.apply(&json!({"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"call-1","content":[
+        {"type":"text","text":oversized_text},
+        {"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}}
+    ]}]}}));
+    assert!(matches!(result, Err(ProviderRuntimeError::Protocol(_))));
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn native_image_tool_result_echo_over_one_mib_completes() {
+    let fixture = FixtureDir::new();
+    // Claude Code echoes the whole tool_result on one stream-json line, so a
+    // rendered map image is bounded only by the raw stdout ceiling.
+    let image_bytes = 2 * 1024 * 1024;
+    let script = write_script(
+        &fixture.0,
+        &format!(
+            r#"param([Parameter(ValueFromRemainingArguments=$true)][string[]]$Rest)
+$null = [Console]::In.ReadLine()
+[Console]::Out.WriteLine('{{"type":"system","subtype":"init","session_id":"native-session","tools":["mcp__eud-tools__map_draft_render"],"mcp_servers":[{{"name":"eud-tools","status":"connected"}}]}}')
+[Console]::Out.WriteLine('{{"type":"stream_event","event":{{"type":"content_block_start","index":0,"content_block":{{"type":"tool_use","id":"call-1","name":"mcp__eud-tools__map_draft_render"}}}}}}')
+[Console]::Out.WriteLine('{{"type":"stream_event","event":{{"type":"content_block_stop","index":0}}}}')
+$image = 'A' * {image_bytes}
+[Console]::Out.WriteLine('{{"type":"user","message":{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"call-1","content":[{{"type":"text","text":"{{\"image\":{{\"mimeType\":\"image/png\"}}}}"}},{{"type":"image","source":{{"type":"base64","media_type":"image/png","data":"' + $image + '"}}}}]}}]}}}}')
+[Console]::Out.WriteLine('{{"type":"stream_event","event":{{"type":"content_block_delta","index":1,"delta":{{"type":"text_delta","text":"looks right"}}}}}}')
+[Console]::Out.WriteLine('{{"type":"result","subtype":"success","session_id":"native-session","is_error":false,"result":"looks right","usage":{{"input_tokens":1,"output_tokens":1}}}}')
+exit 0
+"#
+        ),
+    );
+    let mut adapter = adapter(&fixture.0, &script);
+    let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(0_u64);
+    let (events_tx, mut events_rx) = tokio::sync::mpsc::channel(16);
+    let outcome = adapter
+        .run_step(
+            foreground_request(&fixture.0, 12, 0, Some("native-session"), cancel_rx),
+            events_tx,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(outcome, AdapterStepOutcome::Completed {
+        output: AdapterOutput::Text(ref text),
+        ..
+    } if text == "looks right"));
+    let mut observed_image = false;
+    while let Ok(event) = events_rx.try_recv() {
+        if let AdapterEventKind::NativeToolObservation {
+            result: Some(result),
+            status: Some(status),
+            ..
+        } = event.kind
+        {
+            assert_eq!(status, "completed");
+            assert_eq!(result[1]["type"], "image");
+            assert_eq!(
+                result[1]["source"]["data"].as_str().unwrap().len(),
+                image_bytes
+            );
+            observed_image = true;
+        }
+    }
+    assert!(observed_image);
+}
+
 #[cfg(windows)]
 #[tokio::test]
 async fn malformed_and_oversized_process_output_are_rejected() {
@@ -376,16 +505,21 @@ $null = [Console]::In.ReadLine()
         .unwrap_err();
     assert!(matches!(error, ProviderRuntimeError::Protocol(_)));
 
+    // A valid init line followed by one line just over the raw stdout ceiling.
+    let oversized_bytes = MAX_STDOUT_BYTES + 1;
     write_script(
         &fixture.0,
-        r#"param([Parameter(ValueFromRemainingArguments=$true)][string[]]$Rest)
+        &format!(
+            r#"param([Parameter(ValueFromRemainingArguments=$true)][string[]]$Rest)
 $null = [Console]::In.ReadLine()
-[Console]::Out.Write(('x' * 1048577))
-"#,
+[Console]::Out.WriteLine('{{"type":"system","subtype":"init","session_id":"native-session","tools":["mcp__eud-tools__read_file"],"mcp_servers":[{{"name":"eud-tools","status":"connected"}}]}}')
+[Console]::Out.Write(('x' * {oversized_bytes}))
+"#
+        ),
     );
     let mut oversized_adapter = adapter(&fixture.0, &script);
     let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(0_u64);
-    let (events_tx, _) = tokio::sync::mpsc::channel(1);
+    let (events_tx, _events_rx) = tokio::sync::mpsc::channel(16);
     let error = oversized_adapter
         .run_step(
             foreground_request(&fixture.0, 11, 0, None, cancel_rx),
@@ -394,6 +528,66 @@ $null = [Console]::In.ReadLine()
         .await
         .unwrap_err();
     assert!(matches!(error, ProviderRuntimeError::Protocol(_)));
+}
+
+/// A harness prompt carries up to 192 KiB of accepted context. Windows caps a whole
+/// command line at 32,767 characters, so an argument prompt fails the spawn itself and
+/// every attempt reports `provider_transport_closed`.
+#[cfg(windows)]
+#[tokio::test]
+async fn structured_prompt_over_the_command_line_limit_reaches_the_cli() {
+    let fixture = FixtureDir::new();
+    let stdin_file = fixture.0.join("structured-stdin.txt");
+    let args_file = fixture.0.join("structured-args.json");
+    let escaped_stdin = stdin_file.display().to_string().replace('\'', "''");
+    let escaped_args = args_file.display().to_string().replace('\'', "''");
+    let script = write_script(
+        &fixture.0,
+        &format!(
+            r#"param([Parameter(ValueFromRemainingArguments=$true)][string[]]$Rest)
+[IO.File]::WriteAllText('{escaped_stdin}', [Console]::In.ReadToEnd())
+[IO.File]::WriteAllText('{escaped_args}', ($Rest | ConvertTo-Json -Compress))
+[Console]::Out.Write('{{"type":"result","subtype":"success","is_error":false,"structured_output":{{"ok":true}}}}')
+exit 0
+"#
+        ),
+    );
+    let mut adapter = adapter(&fixture.0, &script);
+    let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(0_u64);
+    let prompt = format!("{}END", "accepted journal entry. ".repeat(8 * 1024));
+    assert!(prompt.len() > 32 * 1024);
+    let mut request = structured_request(
+        &fixture.0,
+        13,
+        json!({"type":"object","properties":{"ok":{"type":"boolean"}},"required":["ok"],"additionalProperties":false}),
+        cancel_rx,
+    );
+    let AdapterRequestKind::Structured {
+        prompt: ref mut slot,
+        ..
+    } = request.kind
+    else {
+        unreachable!("structured request");
+    };
+    slot.clone_from(&prompt);
+
+    let (events_tx, _events_rx) = tokio::sync::mpsc::channel(8);
+    let outcome = adapter.run_step(request, events_tx).await.unwrap();
+
+    assert!(matches!(outcome, AdapterStepOutcome::Completed {
+        output: AdapterOutput::Structured(ref value),
+        ..
+    } if value == &json!({"ok":true})));
+    assert_eq!(
+        std::fs::read_to_string(&stdin_file).unwrap().trim_end(),
+        prompt
+    );
+    let args: Value = serde_json::from_slice(&std::fs::read(args_file).unwrap()).unwrap();
+    assert!(!args
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|value| value.as_str() == Some(prompt.as_str())));
 }
 
 #[cfg(windows)]

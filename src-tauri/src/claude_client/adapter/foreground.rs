@@ -66,13 +66,27 @@ impl ProductionClaudeCodeAdapter {
         })
         .to_string();
         let message = claude_user_message(turn).map_err(ProviderRuntimeError::Protocol)?;
+        let args = stream_args(
+            Some(&mcp_config),
+            resume,
+            false,
+            &self.model,
+            request
+                .binding
+                .reasoning
+                .as_ref()
+                .map(|selection| selection.level.as_str()),
+        )
+        .map_err(ProviderRuntimeError::Protocol)?;
         self.last_cwd = Some(workspace_root.to_path_buf());
+        self.observed_session_id = None;
+        self.resume_target = resume.map(str::to_string);
         self.continuation_unknown = true;
         let result = self
             .run_stream_process(StreamProcessRequest {
                 identity: &request.identity,
                 cwd: workspace_root,
-                args: stream_args(Some(&mcp_config), resume, false),
+                args,
                 message,
                 require_mcp: true,
                 max_output_bytes: MAX_STDOUT_BYTES,
@@ -102,14 +116,17 @@ impl ProductionClaudeCodeAdapter {
                     }),
                 })
             }
+            // An interrupted or failed run keeps the session the CLI published:
+            // that session is resumable and is the only boundary the next run can
+            // continue from. Without an observed id the continuation stays unknown.
             Ok(NativeRunResult::Cancelled) => {
-                self.conversation_id = None;
-                self.continuation_unknown = true;
+                self.conversation_id = self.observed_session_id.clone();
+                self.continuation_unknown = self.observed_session_id.is_none();
                 Ok(AdapterStepOutcome::Cancelled)
             }
             Err(error) => {
-                self.conversation_id = None;
-                self.continuation_unknown = true;
+                self.conversation_id = self.observed_session_id.clone();
+                self.continuation_unknown = self.observed_session_id.is_none();
                 Err(error)
             }
         }

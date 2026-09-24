@@ -10,9 +10,9 @@
  * REMOVED ENTIRELY (no compat shim - features/05 line 58).
  *
  *   panel -> core: chat / plan_feedback / plan_approve /
- *                  changeset_decision / cancel / reset / status / list
- *   core -> panel: agent_event / answer / plan / changeset /
- *                  rollback_result / error / status / progress / list
+ *                  cancel / reset / status / list
+ *   core -> panel: agent_event / answer / plan / git /
+ *                  error / status / progress / list
  *
  * Discriminated unions (on the `type` field) drive narrowing; the runtime type
  * guards below are the gate for inbound dispatch. Anything that fails
@@ -75,30 +75,40 @@ export interface FileEntry {
   settable: boolean;
 }
 
-/** One file in the real per-project Codex workspace. */
+/** One durable document in the project's `.eud-agent/workspace` tree. */
 export interface WorkspaceFileEntry {
   path: string;
-  /** True for the generated, read-only `source/` EPS mirror. */
-  source: boolean;
   size: number;
-  /** Parent-owned authoritative acceptance state; absent for unreviewed/source files. */
+  /** Parent-owned authoritative acceptance state; absent for unreviewed files. */
   state?: string;
   revision?: number;
 }
 
 /** `workspace_list` command output. */
+/**
+ * `workspace_list` command output: every file below the project root,
+ * project-root-relative. Accepted/approved harness documents live under
+ * {@link WORKSPACE_DOCUMENT_PREFIX} and carry `state`/`revision`.
+ */
 export interface WorkspaceListResponse {
   project: string;
   workspaceId: string;
   files: WorkspaceFileEntry[];
 }
 
-/** `workspace_read` command output. */
+/** Project-relative prefix of the agent's document tree. */
+export const WORKSPACE_DOCUMENT_PREFIX = ".eud-agent/workspace/";
+
+/**
+ * `workspace_read` command output. `content` is null when the file is listed
+ * but not viewable as text; `unreadable` then says why.
+ */
 export interface WorkspaceReadResponse {
   workspaceId: string;
   path: string;
-  source: boolean;
-  content: string;
+  size: number;
+  content: string | null;
+  unreadable?: "binary" | "too_large";
 }
 
 /** `workspace_search` command output. */
@@ -109,10 +119,8 @@ export interface WorkspaceSearchResponse {
 }
 
 /**
- * Advisory diagnostic from the epscript-lsp gate (rules.md: advisory only). In
- * v2 the core attaches diagnostics per modified/created eps changeset item
- * (features/06 ## Behaviors -> Diagnostics). Free-form by design; rendered
- * best-effort and never blocks a decision.
+ * Advisory diagnostic from the epscript-lsp gate (rules.md: advisory only).
+ * Free-form by design; rendered best-effort and never blocks anything.
  */
 export type Diagnostic =
   | string
@@ -125,15 +133,15 @@ export type Diagnostic =
     };
 
 /**
- * One changeset item (core journal.changeset() shape). The category drives
- * rendering (ChangesetView is a LATER task); the panel keeps the raw shape so a
- * field addition core-side does not break parsing. Every item carries an `id`
- * + `seq` so per-item accept/reject can target it.
+ * One changeset item (core journal.changeset() shape). Request review is gone —
+ * git records a turn instead — but the HARNESS document review still carries a
+ * changeset of its own, so the shape survives for {@link HarnessChangeset}. The
+ * panel keeps the raw fields so a core-side addition does not break parsing.
  */
 export interface ChangesetItem {
   /** "file" | "dat" | tbl/req/btn/settings/plugin/main (flat). */
   category: string;
-  /** Stable per-item id (journal entry id) - the decision target. */
+  /** Stable per-item id (journal entry id). */
   id: string;
   /** Journal sequence (reverse-seq rollback order, render order hint). */
   seq: number;
@@ -187,7 +195,12 @@ export interface AgentEventMessage extends SessionScopedMessage {
    * argument text, core-truncated); `tool_result` carries `result` (the
    * result/error text) + `status` ("completed" | "failed" | "declined").
    */
-  data?: { args?: string; result?: string; status?: string };
+  data?: {
+    callId?: string;
+    args?: string;
+    result?: string;
+    status?: string;
+  };
 }
 
 /** Token counts from one Codex model response. */
@@ -240,9 +253,16 @@ export interface AskQuestion {
 }
 
 /** `ask` pauses the current tool call until the user submits every answer. */
+/** Lifecycle of one `ask` request: answerable, or closed because its bounded wait elapsed. */
+export type AskEventStatus = "pending" | "expired";
+
 export interface AskMessage extends SessionScopedMessage {
   type: "ask";
   requestId: string;
+  /** Absent means `pending` (older cores). */
+  status?: AskEventStatus;
+  /** Bounded wait in whole seconds before the request expires. */
+  waitSeconds?: number;
   questions: AskQuestion[];
 }
 
@@ -250,12 +270,172 @@ export interface AskAnswer {
   answers: string[];
 }
 
+/** Map layers a team map task may change. */
+export type MapTaskLayer =
+  | "terrain"
+  | "units"
+  | "buildings"
+  | "doodads"
+  | "sprites"
+  | "locations";
+export const MAP_TASK_LAYERS: readonly MapTaskLayer[] = [
+  "terrain",
+  "units",
+  "buildings",
+  "doodads",
+  "sprites",
+  "locations",
+] as const;
 
-/** `changeset {request_id, items}` - journaled writes awaiting accept/reject. */
-export interface ChangesetMessage extends SessionScopedMessage {
-  type: "changeset";
-  request_id: string;
-  items: ChangesetItem[];
+/** Lifecycle of one EPS → Map team task (`{kind, reason?}` on the wire). */
+export type TeamTaskStatus =
+  | { kind: "queued" }
+  | { kind: "running" }
+  | { kind: "candidate_ready" }
+  | { kind: "applied" }
+  | { kind: "discarded" }
+  | { kind: "failed"; reason: string }
+  | { kind: "cancelled" }
+  | { kind: "interrupted" }
+  | { kind: "superseded" };
+export const TEAM_TASK_STATUS_KINDS = [
+  "queued",
+  "running",
+  "candidate_ready",
+  "applied",
+  "discarded",
+  "failed",
+  "cancelled",
+  "interrupted",
+  "superseded",
+] as const;
+export type TeamTaskStatusKind = (typeof TEAM_TASK_STATUS_KINDS)[number];
+
+/** The candidate revision a team task produced. */
+export interface TeamCandidateSummary {
+  revision: number;
+  revisionKey: string;
+  mapSha256: string;
+  summary: string;
+  terrainCells: number;
+  units: number;
+  buildings: number;
+  doodads: number;
+  sprites: number;
+  locations: number;
+}
+
+/** One EPS → Map team handoff, as persisted on the EPS session. */
+export interface TeamTask {
+  id: string;
+  parentRequestId: string;
+  mapSessionId: string;
+  mapRequestId?: string;
+  goal: string;
+  layers: MapTaskLayer[];
+  selectionIds?: string[];
+  locationIds?: number[];
+  sourceMapSha256AtCreate: string;
+  status: TeamTaskStatus;
+  candidate?: TeamCandidateSummary;
+  appliedSourceSha256?: string;
+  /** Who applied the candidate: the user in the Map window or the EPS agent. */
+  appliedBy?: TeamApplyActor;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export type TeamApplyActor = "user" | "agent";
+
+/**
+ * `team_task` — a team task changed (created, settled, applied, discarded).
+ * `continuation` is present when the engine itself started the session's
+ * continuation turn on that text (the task settled after `map_task_request`
+ * had returned `running`): the panel records the turn as sent.
+ */
+export interface TeamTaskMessage extends SessionScopedMessage {
+  type: "team_task";
+  task: TeamTask;
+  continuation?: TeamTaskContinuation;
+}
+
+export interface TeamTaskContinuation {
+  clientTurnId: string;
+  text: string;
+}
+
+/** One commit the app recorded, as the `git` event reports it. */
+export interface CommitRecord {
+  sha: string;
+  subject: string;
+  /** How many paths the commit changed. */
+  files: number;
+}
+
+/**
+ * `git {external?, turn?, warning?}` - what the turn boundary recorded.
+ *
+ * `turn` is the commit this turn produced. `external` is the separate commit
+ * that captured what changed OUTSIDE the app (the user's own SCMDraft or editor
+ * edit) before the turn ran, which is why the panel says so out loud. `warning`
+ * means the work happened but the record did not.
+ */
+export interface GitMessage extends SessionScopedMessage {
+  type: "git";
+  external?: CommitRecord;
+  turn?: CommitRecord;
+  warning?: string;
+}
+
+/** Where a project's repository came from, which decides whose history it is. */
+export type RepoOrigin = "app" | "preexisting";
+
+/** Whether the app may commit into this repository. */
+export type RepoConsent = "pending" | "granted" | "declined";
+
+/** `git_state` / `git_consent_set` result. */
+export interface RepoState {
+  /** `git` is on PATH. */
+  available: boolean;
+  /** The project root is inside a git work tree. */
+  tracked: boolean;
+  /** The work tree's top level is above the project root. */
+  nested: boolean;
+  origin: RepoOrigin | null;
+  consent: RepoConsent;
+  /** What the user has to be told once, in Korean, or nothing. */
+  warning: string | null;
+}
+
+/** One entry of the project's history. */
+export interface CommitSummary {
+  sha: string;
+  subject: string;
+  /** Committer date, SECONDS since the epoch (not milliseconds). */
+  timestamp: number;
+}
+
+/** What happened to one file in a commit. */
+export interface CommitFile {
+  path: string;
+  insertions: number;
+  deletions: number;
+  /** Git could not diff this file as text (a map, an image, a wheel). */
+  binary: boolean;
+  /** The unified diff, when it is carried. */
+  patch?: string;
+  /** Why the patch is absent, in Korean, when it is. */
+  omitted?: string;
+}
+
+/** One commit as the history view shows it. */
+export interface CommitDetail {
+  sha: string;
+  subject: string;
+  /** The rest of the message — the session and request the turn belonged to. */
+  body: string;
+  timestamp: number;
+  files: CommitFile[];
 }
 
 export type HarnessJobStatus =
@@ -296,14 +476,6 @@ export interface HarnessJobMessage extends SessionScopedMessage, HarnessJobView 
   type: "harness_job";
 }
 
-/** `rollback_result {ids, ok, error?}` - outcome of a changeset_decision. */
-export interface RollbackResultMessage extends SessionScopedMessage {
-  type: "rollback_result";
-  ids: string[];
-  ok: boolean;
-  error?: string;
-}
-
 /** `progress {stage, detail?, pct?}` - render as a conversation entry. */
 export interface ProgressMessage extends OptionalSessionScopedMessage {
   type: "progress";
@@ -337,6 +509,81 @@ export type BackendSessionActivity =
 export interface SessionActivityMessage extends SessionScopedMessage {
   type: "session_activity";
   activity: BackendSessionActivity;
+}
+
+export type ExecutionMode = "interactive" | "autonomous";
+export type IterationBoundaryReason =
+  | "tool_actions"
+  | "tool_rounds"
+  | "context_pressure"
+  | "provider_continuation";
+export type AutonomousRunStatus =
+  | "running"
+  | "pausing"
+  | "paused"
+  | "paused_after_restart"
+  | "waiting_input"
+  | "review"
+  | "safety_stopped"
+  | "cancelled"
+  | "failed"
+  | "completed";
+export type AutonomousPauseReason =
+  | "user"
+  | "restart"
+  | "waiting_input"
+  | "review"
+  | "unanswered_ask"
+  | "team_apply";
+
+export interface AutonomousRunPolicy {
+  maxWallTimeMillis?: number | null;
+  maxObservedTokens?: number | null;
+}
+
+export interface AutonomousBuildStatus {
+  inputRevision: string;
+  diagnosticsFingerprint: string;
+  errorCount: number;
+  success: boolean;
+  consecutiveNoProgress: number;
+}
+
+export interface AutonomousRunProgress {
+  elapsedActiveMillis: number;
+  observedTokens?: number;
+  readActions: number;
+  writeActions: number;
+  latestBuild?: AutonomousBuildStatus;
+  consecutiveNoProgress: number;
+  recentFingerprints?: string[];
+}
+
+export interface AutonomousRunState {
+  schemaVersion: number;
+  id: string;
+  status: AutonomousRunStatus;
+  startedAt: number;
+  updatedAt: number;
+  iteration: number;
+  goal: string;
+  requestId: string;
+  clientTurnId: string;
+  projectId: string;
+  projectRevision: string;
+  policy: AutonomousRunPolicy;
+  progress: AutonomousRunProgress;
+  activeStartedAt?: number;
+  lastCheckpoint?: unknown;
+  boundaryReason?: IterationBoundaryReason;
+  pauseReason?: AutonomousPauseReason;
+  blocker?: string;
+}
+
+export interface AutonomousRunMessage
+  extends SessionScopedMessage,
+    AutonomousRunState {
+  type: "autonomous_run";
 }
 
 /** `status {compiling, project}` - editor state for the header. */
@@ -399,7 +646,7 @@ export interface LedgerEntry {
 
 /**
  * `wiki {version, entries}` - the dat-edit ledger snapshot. Pushed after every
- * changeset accept that records >= 1 dat edit (engine accept-hook), and also the
+ * turn that records >= 1 dat edit, and also the
  * resolved value of the `wiki_get`/`wiki_save` commands. `entries` is a
  * key -> entry map mirroring the on-disk `ledger.json`.
  */
@@ -409,10 +656,29 @@ export interface WikiMessage {
   entries: Record<string, LedgerEntry>;
 }
 
+export interface RecentProject {
+  name: string;
+  path: string;
+  lastOpenedAt: number;
+  available: boolean;
+}
+
+export type HarnessImportIssueScope = "workspace" | "memory" | "sessions";
+
+/** One optional harness item that could not be safely imported. */
+export interface HarnessImportIssue {
+  readonly id: string;
+  readonly scope: HarnessImportIssueScope;
+  readonly path: string;
+  readonly reason: string;
+}
+
 export interface SetupMessage {
   type: "setup";
   projectPath: string;
   projectValid: boolean;
+  /** True only when this response came from a successful explicit project open/create/import. */
+  projectOpened: boolean;
   euddraftPath: string;
   euddraftValid: boolean;
   assetsReady: boolean;
@@ -420,7 +686,11 @@ export interface SetupMessage {
   providers: ProviderStatus[];
   setupRequired: boolean;
   error?: string | null;
+  /** Optional harness items that require explicit review before import can complete. */
+  importIssues?: HarnessImportIssue[];
 }
+
+
 
 // ---- sessions (session restore feature) ------------------------------
 /**
@@ -441,6 +711,8 @@ export interface SessionMeta {
   model: string;
   createdAt: number;
   lastConversationAt: number;
+  /** For a team Map session: the EPS session that owns it. */
+  teamParent?: string;
 }
 
 export type MentionKind = "map.region" | "map.location";
@@ -517,7 +789,7 @@ export interface ChatAttachment extends AttachmentDescriptor {
  * `logSeq` is the closure-private monotonic id high-water mark the store must
  * advance past on hydrate so restored ids never collide with fresh ones. Each
  * `log` entry is the DURABLE {@link LogEntry} subset (id/kind/text + optional
- * stage/tools); transient turn/plan/changeset state is NOT persisted.
+ * stage/tools); transient turn/plan state is NOT persisted.
  */
 export interface PanelLog {
   schemaVersion: number;
@@ -536,6 +808,8 @@ export interface PanelLogEntry {
   tools?: PanelLogTool[];
   attachments?: ChatAttachment[];
   mentions?: MentionInstance[];
+  /** Folded supporting text behind the row's "자세히" toggle. */
+  detail?: string;
 }
 
 /** Durable archived-tool row persisted in a {@link PanelLogEntry} (subset of AgentTool). */
@@ -557,6 +831,9 @@ export interface SessionRecord extends SessionMeta {
   pendingRequestIds: string[];
   panelLog: PanelLog | null;
   contextUsage?: ContextUsage;
+  autonomousRun?: AutonomousRunState;
+  /** EPS → Map team tasks (EPS sessions only). */
+  teamTasks?: TeamTask[];
 }
 
 /** Discriminated union of every documented core -> panel message. */
@@ -564,14 +841,15 @@ export type ServerMessage =
   | AgentEventMessage
   | ContextUsageMessage
   | AskMessage
+  | TeamTaskMessage
   | AnswerMessage
   | PlanMessage
-  | ChangesetMessage
+  | GitMessage
   | HarnessJobMessage
-  | RollbackResultMessage
   | ProgressMessage
   | ErrorMessage
   | SessionActivityMessage
+  | AutonomousRunMessage
   | StatusMessage
   | ListMessage
   | MemoryMessage
@@ -586,12 +864,13 @@ export const SERVER_MESSAGE_TYPES = [
   "answer",
   "plan",
   "ask",
-  "changeset",
+  "team_task",
+  "git",
   "harness_job",
-  "rollback_result",
   "progress",
   "error",
   "session_activity",
+  "autonomous_run",
   "status",
   "list",
   "memory",
@@ -614,6 +893,8 @@ export interface ChatMessage extends SessionCommand {
   text: string;
   attachments: string[];
   mentions?: MentionInstance[];
+  executionMode?: ExecutionMode;
+  autonomousPolicy?: AutonomousRunPolicy;
 }
 
 /** `plan_feedback` iterates the plan owned by one active session. */
@@ -637,16 +918,21 @@ export interface AskResponseMessage extends SessionCommand {
 }
 
 
-/** Accept or reject changeset items belonging to one session. */
-export interface ChangesetDecisionMessage extends SessionCommand {
-  type: "changeset_decision";
-  decision: "accept" | "reject";
-  ids: "all" | string[];
-}
-
 /** Interrupt the in-flight turn for one session. */
 export interface CancelMessage extends SessionCommand {
   type: "cancel";
+}
+
+export interface AutonomousPauseMessage extends SessionCommand {
+  type: "autonomous_pause";
+}
+
+export interface AutonomousResumeMessage extends SessionCommand {
+  type: "autonomous_resume";
+}
+
+export interface AutonomousStopMessage extends SessionCommand {
+  type: "autonomous_stop";
 }
 
 /** Replace one session's model-visible history with a panel-log prefix. */
@@ -686,6 +972,8 @@ export interface SetupStatusRequest {
 /** Pick and configure an existing native project root. */
 export interface SetupPickProjectPathMessage {
   type: "setup_pick_project_path";
+  /** When true, use a folder picker; otherwise pick an .eap manifest or legacy project to migrate. */
+  directory?: boolean;
 }
 /** Create a native project from a selected source map and empty destination. */
 export interface SetupCreateProjectMessage {
@@ -695,12 +983,21 @@ export interface SetupCreateProjectMessage {
 /** Import a legacy `.e3s` into a selected empty native destination. */
 export interface SetupImportE3sMessage {
   type: "setup_import_e3s";
+  sourceE3s: string;
+  destination: string;
+  /** Issue ids explicitly reviewed and authorized for omission. */
+  excludedImportItems?: readonly string[];
 }
-
-
-/** Pick the frozen euddraft launcher (`euddraft.exe` / macOS `euddraft`) or `euddraft.py`. */
+/** Pick an existing euddraft launcher (`euddraft.exe` / macOS `euddraft`) or `euddraft.py`, or its containing folder. */
 export interface SetupPickEuddraftPathMessage {
   type: "setup_pick_euddraft_path";
+  /** When true, open a folder picker and resolve euddraft within that folder. */
+  directory?: boolean;
+}
+
+/** Install the latest managed euddraft release into the app-local directory. */
+export interface SetupInstallEuddraftMessage {
+  type: "setup_install_euddraft";
 }
 
 /**
@@ -717,8 +1014,10 @@ export type ClientMessage =
   | PlanFeedbackMessage
   | PlanApproveMessage
   | AskResponseMessage
-  | ChangesetDecisionMessage
   | CancelMessage
+  | AutonomousPauseMessage
+  | AutonomousResumeMessage
+  | AutonomousStopMessage
   | ConversationRewindMessage
   | StatusRequest
   | ListRequest
@@ -729,6 +1028,7 @@ export type ClientMessage =
   | SetupCreateProjectMessage
   | SetupImportE3sMessage
   | SetupPickEuddraftPathMessage
+  | SetupInstallEuddraftMessage
   | BootstrapRunMessage;
 
 /** All client message `type` discriminants (closed set). */
@@ -737,8 +1037,10 @@ export const CLIENT_MESSAGE_TYPES = [
   "plan_feedback",
   "plan_approve",
   "ask_response",
-  "changeset_decision",
   "cancel",
+  "autonomous_pause",
+  "autonomous_resume",
+  "autonomous_stop",
   "conversation_rewind",
   "status",
   "list",
@@ -749,6 +1051,7 @@ export const CLIENT_MESSAGE_TYPES = [
   "setup_create_project",
   "setup_import_e3s",
   "setup_pick_euddraft_path",
+  "setup_install_euddraft",
   "bootstrap_run",
 ] as const;
 export type ClientMessageType = (typeof CLIENT_MESSAGE_TYPES)[number];
@@ -756,6 +1059,32 @@ export type ClientMessageType = (typeof CLIENT_MESSAGE_TYPES)[number];
 // ---- runtime type guards (inbound dispatch gate) -----------------------
 function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
+}
+
+const HARNESS_IMPORT_ISSUE_SCOPES: readonly HarnessImportIssueScope[] = [
+  "workspace",
+  "memory",
+  "sessions",
+];
+
+function isHarnessImportIssueScope(value: unknown): value is HarnessImportIssueScope {
+  return (
+    typeof value === "string" &&
+    HARNESS_IMPORT_ISSUE_SCOPES.includes(value as HarnessImportIssueScope)
+  );
+}
+
+export function isHarnessImportIssue(value: unknown): value is HarnessImportIssue {
+  return (
+    isObject(value) &&
+    typeof value.id === "string" &&
+    value.id.trim() !== "" &&
+    isHarnessImportIssueScope(value.scope) &&
+    typeof value.path === "string" &&
+    value.path.trim() !== "" &&
+    typeof value.reason === "string" &&
+    value.reason.trim() !== ""
+  );
 }
 
 function isMemoryFile(value: unknown): value is MemoryFile {
@@ -871,21 +1200,105 @@ export function isAskMessage(value: unknown): value is AskMessage {
     hasSessionId(value) &&
     typeof value.requestId === "string" &&
     value.requestId.length > 0 &&
+    (value.status === undefined ||
+      value.status === "pending" ||
+      value.status === "expired") &&
+    (value.waitSeconds === undefined ||
+      (typeof value.waitSeconds === "number" && value.waitSeconds >= 0)) &&
     Array.isArray(value.questions) &&
     value.questions.length > 0 &&
     value.questions.every(isAskQuestion)
   );
 }
 
-/** True if `value` is a `changeset` message (request_id + items array). */
-export function isChangesetMessage(value: unknown): value is ChangesetMessage {
+function isTeamTaskStatus(value: unknown): value is TeamTaskStatus {
   return (
     isObject(value) &&
-    value.type === "changeset" &&
-    hasSessionId(value) &&
-    typeof value.request_id === "string" &&
-    Array.isArray(value.items)
+    TEAM_TASK_STATUS_KINDS.includes(value.kind as TeamTaskStatusKind) &&
+    (value.kind !== "failed" || typeof value.reason === "string")
   );
+}
+
+function isTeamCandidateSummary(value: unknown): value is TeamCandidateSummary {
+  return (
+    isObject(value) &&
+    typeof value.revision === "number" &&
+    typeof value.revisionKey === "string" &&
+    typeof value.mapSha256 === "string" &&
+    typeof value.summary === "string" &&
+    ["terrainCells", "units", "buildings", "doodads", "sprites", "locations"].every(
+      (key) => typeof value[key] === "number",
+    )
+  );
+}
+
+/** True if `value` is a persisted team task. */
+export function isTeamTask(value: unknown): value is TeamTask {
+  return (
+    isObject(value) &&
+    typeof value.id === "string" &&
+    value.id.length > 0 &&
+    typeof value.parentRequestId === "string" &&
+    typeof value.mapSessionId === "string" &&
+    (value.mapRequestId === undefined || typeof value.mapRequestId === "string") &&
+    typeof value.goal === "string" &&
+    Array.isArray(value.layers) &&
+    value.layers.every((layer) => MAP_TASK_LAYERS.includes(layer as MapTaskLayer)) &&
+    (value.selectionIds === undefined || isStringArray(value.selectionIds)) &&
+    (value.locationIds === undefined ||
+      (Array.isArray(value.locationIds) &&
+        value.locationIds.every((id) => typeof id === "number"))) &&
+    typeof value.sourceMapSha256AtCreate === "string" &&
+    isTeamTaskStatus(value.status) &&
+    (value.candidate === undefined || isTeamCandidateSummary(value.candidate)) &&
+    (value.appliedSourceSha256 === undefined ||
+      typeof value.appliedSourceSha256 === "string") &&
+    (value.appliedBy === undefined ||
+      value.appliedBy === "user" ||
+      value.appliedBy === "agent") &&
+    typeof value.createdAt === "number" &&
+    typeof value.updatedAt === "number"
+  );
+}
+
+/** True if `value` is a session-scoped `team_task` event. */
+export function isTeamTaskMessage(value: unknown): value is TeamTaskMessage {
+  return (
+    isObject(value) &&
+    value.type === "team_task" &&
+    hasSessionId(value) &&
+    isTeamTask(value.task) &&
+    (value.continuation === undefined ||
+      (isObject(value.continuation) &&
+        typeof value.continuation.clientTurnId === "string" &&
+        typeof value.continuation.text === "string"))
+  );
+}
+
+function isCommitRecord(value: unknown): value is CommitRecord {
+  return (
+    isObject(value) &&
+    typeof value.sha === "string" &&
+    typeof value.subject === "string" &&
+    typeof value.files === "number"
+  );
+}
+
+/** True if `value` is a `git` message. Every field is optional core-side. */
+export function isGitMessage(value: unknown): value is GitMessage {
+  return (
+    isObject(value) &&
+    value.type === "git" &&
+    hasSessionId(value) &&
+    (value.external === undefined || isCommitRecord(value.external)) &&
+    (value.turn === undefined || isCommitRecord(value.turn)) &&
+    (value.warning === undefined || typeof value.warning === "string")
+  );
+}
+
+
+function isStringArray(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every((item) => typeof item === "string");
 }
 
 export function isHarnessJobMessage(value: unknown): value is HarnessJobMessage {
@@ -906,20 +1319,6 @@ export function isHarnessJobMessage(value: unknown): value is HarnessJobMessage 
       (isObject(value.changeset) &&
         typeof value.changeset.request_id === "string" &&
         Array.isArray(value.changeset.items)))
-  );
-}
-
-/** True if `value` is a `rollback_result` message. */
-export function isRollbackResultMessage(
-  value: unknown,
-): value is RollbackResultMessage {
-  return (
-    isObject(value) &&
-    value.type === "rollback_result" &&
-    hasSessionId(value) &&
-    Array.isArray(value.ids) &&
-    typeof value.ok === "boolean" &&
-    (value.error === undefined || typeof value.error === "string")
   );
 }
 
@@ -959,6 +1358,46 @@ export function isSessionActivityMessage(
       "review",
       "error",
     ].includes(String(value.activity))
+  );
+}
+
+const AUTONOMOUS_STATUSES: readonly AutonomousRunStatus[] = [
+  "running",
+  "pausing",
+  "paused",
+  "paused_after_restart",
+  "waiting_input",
+  "review",
+  "safety_stopped",
+  "cancelled",
+  "failed",
+  "completed",
+];
+
+export function isAutonomousRunMessage(
+  value: unknown,
+): value is AutonomousRunMessage {
+  return (
+    isObject(value) &&
+    value.type === "autonomous_run" &&
+    hasSessionId(value) &&
+    typeof value.schemaVersion === "number" &&
+    typeof value.id === "string" &&
+    AUTONOMOUS_STATUSES.includes(value.status as AutonomousRunStatus) &&
+    typeof value.startedAt === "number" &&
+    typeof value.updatedAt === "number" &&
+    typeof value.iteration === "number" &&
+    typeof value.goal === "string" &&
+    typeof value.requestId === "string" &&
+    typeof value.clientTurnId === "string" &&
+    typeof value.projectId === "string" &&
+    typeof value.projectRevision === "string" &&
+    isObject(value.policy) &&
+    isObject(value.progress) &&
+    typeof value.progress.elapsedActiveMillis === "number" &&
+    typeof value.progress.readActions === "number" &&
+    typeof value.progress.writeActions === "number" &&
+    typeof value.progress.consecutiveNoProgress === "number"
   );
 }
 
@@ -1035,6 +1474,7 @@ export function isSetupMessage(value: unknown): value is SetupMessage {
     value.type === "setup" &&
     typeof value.projectPath === "string" &&
     typeof value.projectValid === "boolean" &&
+    typeof value.projectOpened === "boolean" &&
     typeof value.euddraftPath === "string" &&
     typeof value.euddraftValid === "boolean" &&
     typeof value.assetsReady === "boolean" &&
@@ -1055,7 +1495,10 @@ export function isSetupMessage(value: unknown): value is SetupMessage {
     typeof value.setupRequired === "boolean" &&
     (value.error === undefined ||
       value.error === null ||
-      typeof value.error === "string")
+      typeof value.error === "string") &&
+    (value.importIssues === undefined ||
+      (Array.isArray(value.importIssues) &&
+        value.importIssues.every(isHarnessImportIssue)))
   );
 }
 
@@ -1071,12 +1514,13 @@ export function isServerMessage(value: unknown): value is ServerMessage {
     isAnswerMessage(value) ||
     isPlanMessage(value) ||
     isAskMessage(value) ||
-    isChangesetMessage(value) ||
+    isTeamTaskMessage(value) ||
+    isGitMessage(value) ||
     isHarnessJobMessage(value) ||
-    isRollbackResultMessage(value) ||
     isProgressMessage(value) ||
     isErrorMessage(value) ||
     isSessionActivityMessage(value) ||
+    isAutonomousRunMessage(value) ||
     isStatusMessage(value) ||
     isListMessage(value) ||
     isMemoryMessage(value) ||

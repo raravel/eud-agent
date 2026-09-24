@@ -32,7 +32,7 @@ export function MentionTray({
   if (chips.length === 0) {
     return (
       <div className="rounded-lg border border-dashed border-border p-3 text-xs text-muted-foreground">
-        선택 영역, 캔버스 개체, 팔레트 타입을 멘션으로 추가하세요.
+        선택 영역, 캔버스 개체, 팔레트 타입을 멘션으로 추가하세요. 입력창에서 @를 입력하면 저장 영역과 로케이션을 검색할 수 있습니다.
       </div>
     );
   }

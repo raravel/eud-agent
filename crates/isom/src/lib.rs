@@ -19,6 +19,13 @@ use std::ffi::{CString, NulError};
 use std::os::raw::c_int;
 use std::path::Path;
 
+#[cfg(windows)]
+use std::ffi::OsString;
+#[cfg(windows)]
+use std::os::windows::ffi::OsStringExt;
+#[cfg(windows)]
+use std::path::{Component, Prefix};
+
 static NATIVE_CALL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn native_call_guard() -> std::sync::MutexGuard<'static, ()> {
@@ -125,7 +132,87 @@ fn status(code: c_int) -> Result<(), IsomError> {
 /// `const char*` (UTF-8); on Windows `Path::to_str` yields the UTF-8 form.
 fn path_cstring(map_path: &Path) -> Result<CString, IsomError> {
     let s = map_path.to_str().ok_or(IsomError::InvalidArg)?;
-    Ok(CString::new(s)?)
+    if s.is_empty() {
+        return Err(IsomError::InvalidArg);
+    }
+    let validated = CString::new(s)?;
+    #[cfg(windows)]
+    {
+        drop(validated);
+        CString::new(windows_native_path(map_path, s)?).map_err(IsomError::from)
+    }
+    #[cfg(not(windows))]
+    Ok(validated)
+}
+
+#[cfg(windows)]
+fn windows_native_path(path: &Path, utf8: &str) -> Result<String, IsomError> {
+    let prefix = path.components().next();
+    if matches!(
+        prefix,
+        Some(Component::Prefix(prefix))
+            if matches!(
+                prefix.kind(),
+                Prefix::Verbatim(_)
+                    | Prefix::VerbatimUNC(_, _)
+                    | Prefix::VerbatimDisk(_)
+                    | Prefix::DeviceNS(_)
+            )
+    ) {
+        return Ok(utf8.to_owned());
+    }
+
+    let input = utf8
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let mut output = vec![0_u16; 260];
+    loop {
+        // SAFETY: [Category 8 — FFI boundary] `input` is NUL-terminated and remains
+        // alive for the call. `output` is initialized writable memory whose element
+        // count is passed exactly; the optional file-part pointer is intentionally null.
+        let written = unsafe {
+            windows_sys::Win32::Storage::FileSystem::GetFullPathNameW(
+                input.as_ptr(),
+                u32::try_from(output.len()).map_err(|_| IsomError::InvalidArg)?,
+                output.as_mut_ptr(),
+                std::ptr::null_mut(),
+            )
+        };
+        if written == 0 {
+            return Err(IsomError::InvalidArg);
+        }
+        let written = usize::try_from(written).map_err(|_| IsomError::InvalidArg)?;
+        if written < output.len() {
+            output.truncate(written);
+            break;
+        }
+        if written <= output.len() {
+            return Err(IsomError::InvalidArg);
+        }
+        output.resize(written, 0);
+    }
+
+    let normalized = OsString::from_wide(&output);
+    let normalized_path = Path::new(&normalized);
+    let normalized_utf8 = normalized_path.to_str().ok_or(IsomError::InvalidArg)?;
+    if output.len() < 260 {
+        return Ok(normalized_utf8.to_owned());
+    }
+    match normalized_path.components().next() {
+        Some(Component::Prefix(prefix)) => match prefix.kind() {
+            Prefix::Disk(_) => Ok(format!(r"\\?\{normalized_utf8}")),
+            Prefix::UNC(_, _) => normalized_utf8
+                .strip_prefix(r"\\")
+                .map(|suffix| format!(r"\\?\UNC\{suffix}"))
+                .ok_or(IsomError::InvalidArg),
+            Prefix::Verbatim(_)
+            | Prefix::VerbatimUNC(_, _)
+            | Prefix::VerbatimDisk(_)
+            | Prefix::DeviceNS(_) => Ok(normalized_utf8.to_owned()),
+        },
+        _ => Err(IsomError::InvalidArg),
+    }
 }
 
 /// RAII guard that frees a C-allocated `out` buffer via `isom_free` exactly once
@@ -267,6 +354,22 @@ fn native_detail(bytes: &[u8]) -> Option<String> {
         .or_else(|| Some(text.to_owned()))
 }
 
+/// The engine writes the edited map to a temporary path and promotes it only
+/// after verifying it. On Windows a scanner or indexer holding a handle on a
+/// file the engine just wrote makes that write fail, and the engine reports it
+/// as its own error rather than an OS one — this exact message.
+const SAVE_CONTENTION_DETAIL: &str = "map save failed before output promotion";
+const SAVE_CONTENTION_RETRIES: u32 = 4;
+
+/// True when the engine failed for a reason that a moment's wait clears.
+///
+/// Retrying is running the same operation, not a second one: the batch is
+/// deterministic, nothing has been promoted yet, and the engine deletes the
+/// temporary it could not write.
+fn is_save_contention(error: &NativeCallError) -> bool {
+    error.status == IsomError::Engine && error.detail.as_deref() == Some(SAVE_CONTENTION_DETAIL)
+}
+
 pub fn mapedit(
     input_map_path: &Path,
     output_map_path: &Path,
@@ -279,6 +382,27 @@ pub fn mapedit(
         path_cstring(output_map_path).map_err(|error| NativeCallError::new(error, None))?;
     let starcraft =
         path_cstring(starcraft_path).map_err(|error| NativeCallError::new(error, None))?;
+    let mut backoff = std::time::Duration::from_millis(20);
+    for _ in 0..SAVE_CONTENTION_RETRIES {
+        match mapedit_once(&input, &output, &starcraft, batch_json) {
+            Err(error) if is_save_contention(&error) => {
+                std::thread::sleep(backoff);
+                backoff *= 2;
+            }
+            settled => return settled,
+        }
+    }
+    // The last attempt reports whatever it hits, so a save that is genuinely
+    // broken still fails with its own message.
+    mapedit_once(&input, &output, &starcraft, batch_json)
+}
+
+fn mapedit_once(
+    input: &CString,
+    output: &CString,
+    starcraft: &CString,
+    batch_json: &[u8],
+) -> Result<String, NativeCallError> {
     let mut report: *mut u8 = std::ptr::null_mut();
     let mut report_len = 0_usize;
     // SAFETY: both paths and `batch_json` outlive this synchronous call. The
@@ -301,6 +425,155 @@ pub fn mapedit(
     }
     String::from_utf8(bytes)
         .map_err(|error| NativeCallError::new(IsomError::Engine, Some(error.to_string())))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MapNewStart {
+    pub x: u16,
+    pub y: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MapNewPlayer {
+    /// CHK slot 0..11; slots the spec omits become `inactive`.
+    pub slot: u8,
+    /// `human`, `computer`, `rescuable`, `neutral`, `inactive`, or `closed`.
+    pub r#type: String,
+    /// `zerg`, `terran`, `protoss`, `userSelectable`, `random`, `independent`,
+    /// `neutral`, or `inactive`.
+    pub race: String,
+    /// Index into `forces`; required for slots 0..7 and absent for 8..11
+    /// (FORC has eight entries).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub force: Option<u8>,
+    /// Only slots 0..7 may carry a start location.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start: Option<MapNewStart>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MapNewForce {
+    /// Force name already encoded for the map's string table, 1..256 bytes,
+    /// lowercase/uppercase hex; written verbatim by the engine.
+    pub name_bytes_hex: String,
+    pub allied: bool,
+    pub allied_victory: bool,
+    pub shared_vision: bool,
+    pub random_start: bool,
+}
+
+/// Strict `eud-map-new/1` request. Serialized verbatim for the native engine,
+/// which re-validates every field before touching the filesystem. Text fields
+/// carry bytes the caller already encoded for the new map's legacy `STR `
+/// table (see `chk::encode_chk_text`); nothing is re-encoded here or in C.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MapNewSpec {
+    /// `remastered` (default) or `broodWar`.
+    pub version: String,
+    pub tileset: u8,
+    pub width: u16,
+    pub height: u16,
+    pub terrain_type: u16,
+    /// Scenario title bytes as hex, 1..1024 bytes.
+    pub title_bytes_hex: String,
+    /// Scenario description bytes as hex, 0..4096 bytes.
+    pub description_bytes_hex: String,
+    /// Up to 12 entries with unique slots.
+    pub players: Vec<MapNewPlayer>,
+    pub forces: Vec<MapNewForce>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MapNewReport {
+    pub schema: String,
+    pub ok: bool,
+    pub tileset: String,
+    pub width: u16,
+    pub height: u16,
+    pub terrain_type: u16,
+    pub players: u64,
+    pub start_locations: u64,
+    pub output_sha256: String,
+}
+
+/// Create a brand-new map at `output_map_path` from `spec`. The path must not
+/// exist; the engine promotes the file only after save and re-open verification.
+pub fn map_new(
+    output_map_path: &Path,
+    starcraft_path: &Path,
+    spec: &MapNewSpec,
+) -> Result<MapNewReport, NativeCallError> {
+    if !(64..=256).contains(&spec.width)
+        || !(64..=256).contains(&spec.height)
+        || spec.tileset > 7
+        || spec.terrain_type == 0
+        || spec.players.len() > 12
+        || spec.forces.is_empty()
+        || spec.forces.len() > 4
+        || output_map_path.exists()
+    {
+        return Err(NativeCallError::new(IsomError::InvalidArg, None));
+    }
+    let mut request = serde_json::to_value(spec)
+        .map_err(|error| NativeCallError::new(IsomError::InvalidArg, Some(error.to_string())))?;
+    request["schema"] = serde_json::Value::String("eud-map-new/1".to_string());
+    let request = serde_json::to_vec(&request)
+        .map_err(|error| NativeCallError::new(IsomError::InvalidArg, Some(error.to_string())))?;
+    let _native_call = native_call_guard();
+    let output =
+        path_cstring(output_map_path).map_err(|error| NativeCallError::new(error, None))?;
+    let starcraft =
+        path_cstring(starcraft_path).map_err(|error| NativeCallError::new(error, None))?;
+    let mut report: *mut u8 = std::ptr::null_mut();
+    let mut report_len = 0_usize;
+    // SAFETY: both paths and the request buffer outlive this synchronous call.
+    // The report is allocated by the C ABI and released by `CBuf` on every path.
+    let code = unsafe {
+        isom_sys::isom_map_new(
+            output.as_ptr(),
+            starcraft.as_ptr(),
+            request.as_ptr(),
+            request.len(),
+            &mut report,
+            &mut report_len,
+        )
+    };
+    let report = CBuf(report);
+    let bytes = buffer_bytes(&report, report_len);
+    if let Err(error) = status(code) {
+        return Err(NativeCallError::new(error, native_detail(&bytes)));
+    }
+    let parsed: MapNewReport = serde_json::from_slice(&bytes).map_err(|error| {
+        NativeCallError::new(
+            IsomError::Engine,
+            Some(format!("invalid map-new report: {error}")),
+        )
+    })?;
+    let expected_starts = spec
+        .players
+        .iter()
+        .filter(|player| player.start.is_some())
+        .count() as u64;
+    let valid = parsed.schema == "eud-map-new-report/1"
+        && parsed.ok
+        && parsed.width == spec.width
+        && parsed.height == spec.height
+        && parsed.terrain_type == spec.terrain_type
+        && parsed.players == spec.players.len() as u64
+        && parsed.start_locations == expected_starts
+        && exact_lower_hex(&parsed.output_sha256, 64);
+    if !valid {
+        return Err(NativeCallError::new(
+            IsomError::Engine,
+            Some("map-new report invariant mismatch".to_string()),
+        ));
+    }
+    Ok(parsed)
 }
 
 pub fn render_region(
@@ -390,6 +663,38 @@ pub fn catalog_query(
     }
     String::from_utf8(bytes)
         .map_err(|error| NativeCallError::new(IsomError::Engine, Some(error.to_string())))
+}
+
+/// Read one raw asset out of the installed StarCraft data (CASC/MPQ) verbatim.
+///
+/// `archive_path` is an ARCHIVE-internal path (e.g. `scripts\iscript.bin`), not
+/// a filesystem path: it is handed to C as-is and must NOT go through
+/// [`path_cstring`], whose Windows branch would resolve it against the current
+/// directory. The bytes are returned uninterpreted — the caller owns the format.
+pub fn game_asset(starcraft_path: &Path, archive_path: &str) -> Result<Vec<u8>, NativeCallError> {
+    let _native_call = native_call_guard();
+    let starcraft =
+        path_cstring(starcraft_path).map_err(|error| NativeCallError::new(error, None))?;
+    let asset = CString::new(archive_path)
+        .map_err(|_| NativeCallError::new(IsomError::InvalidArg, None))?;
+    let mut output: *mut u8 = std::ptr::null_mut();
+    let mut output_len = 0_usize;
+    // SAFETY: both C strings stay alive for the call and the output pointers
+    // satisfy the synchronous ABI; the buffer is released by the `CBuf` guard.
+    let code = unsafe {
+        isom_sys::isom_game_asset(
+            starcraft.as_ptr(),
+            asset.as_ptr(),
+            &mut output,
+            &mut output_len,
+        )
+    };
+    let output = CBuf(output);
+    let bytes = buffer_bytes(&output, output_len);
+    if let Err(error) = status(code) {
+        return Err(NativeCallError::new(error, native_detail(&bytes)));
+    }
+    Ok(bytes)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -742,7 +1047,7 @@ pub fn image_quantize(
     })
 }
 
-pub const EXPECTED_ABI_VERSION: i32 = 6;
+pub const EXPECTED_ABI_VERSION: i32 = 8;
 
 pub fn assert_abi_version() -> Result<(), IsomError> {
     let actual = abi_version();
@@ -763,6 +1068,28 @@ pub fn abi_version() -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Only the save race is waited out. Any other engine failure is the
+    /// engine telling us the edit is wrong, and repeating it would hide that.
+    #[test]
+    fn only_the_save_race_is_retried() {
+        assert!(is_save_contention(&NativeCallError::new(
+            IsomError::Engine,
+            Some(SAVE_CONTENTION_DETAIL.to_string())
+        )));
+        assert!(!is_save_contention(&NativeCallError::new(
+            IsomError::Engine,
+            Some("unsupported operation 'terrain.set'".to_string())
+        )));
+        assert!(!is_save_contention(&NativeCallError::new(
+            IsomError::Engine,
+            None
+        )));
+        assert!(!is_save_contention(&NativeCallError::new(
+            IsomError::Io,
+            Some(SAVE_CONTENTION_DETAIL.to_string())
+        )));
+    }
 
     #[test]
     fn status_maps_every_known_code() {
@@ -794,5 +1121,78 @@ mod tests {
     fn embedded_nul_path_maps_to_invalid_arg() {
         let err = chk_extract(Path::new("a\0b.scx")).expect_err("NUL path must error");
         assert!(matches!(err, IsomError::InvalidArg));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_windows_paths_apply_extended_prefix_only_when_needed() {
+        use std::path::PathBuf;
+
+        let relative = path_cstring(Path::new(r".\nested\..\output.scx")).unwrap();
+        let relative = relative.to_str().unwrap();
+        assert!(Path::new(relative).is_absolute());
+        assert!(relative.ends_with(r"\output.scx"));
+        assert!(!relative.contains(r"\nested\..\"));
+
+        let short_nonexistent = Path::new(r"C:\isom-path-control\folder\..\output.scx");
+        assert!(!short_nonexistent.exists());
+        let short_nonexistent = path_cstring(short_nonexistent).unwrap();
+        assert_eq!(
+            short_nonexistent.to_str().unwrap(),
+            r"C:\isom-path-control\output.scx"
+        );
+
+        let unc = path_cstring(Path::new(r"\\server\share\folder\..\output.scx")).unwrap();
+        assert_eq!(unc.to_str().unwrap(), r"\\server\share\output.scx");
+
+        let long_relative = PathBuf::from(r".\nested\..")
+            .join("r".repeat(140))
+            .join("s".repeat(140))
+            .join("missing.scx");
+        let long_relative = path_cstring(&long_relative).unwrap();
+        let long_relative = long_relative.to_str().unwrap();
+        assert!(long_relative.starts_with(r"\\?\"));
+        assert!(!long_relative.contains(r"\nested\..\"));
+
+        let long_nonexistent = std::env::temp_dir()
+            .join("d".repeat(140))
+            .join("e".repeat(140))
+            .join("missing.scx");
+        assert!(!long_nonexistent.exists());
+        let long_nonexistent = path_cstring(&long_nonexistent).unwrap();
+        assert!(long_nonexistent.to_str().unwrap().starts_with(r"\\?\"));
+
+        let long_unc = format!(
+            r"\\server\share\{}\{}\output.scx",
+            "u".repeat(120),
+            "v".repeat(120)
+        );
+        let long_unc = path_cstring(Path::new(&long_unc)).unwrap();
+        assert!(long_unc
+            .to_str()
+            .unwrap()
+            .starts_with(r"\\?\UNC\server\share\"));
+
+        for namespaced in [
+            r"\\?\C:\already\extended.scx",
+            r"\\?\UNC\server\share\already.scx",
+            r"\\.\pipe\already-device",
+        ] {
+            assert_eq!(
+                path_cstring(Path::new(namespaced))
+                    .unwrap()
+                    .to_str()
+                    .unwrap(),
+                namespaced
+            );
+        }
+        assert!(matches!(
+            path_cstring(Path::new("")),
+            Err(IsomError::InvalidArg)
+        ));
+        assert!(matches!(
+            path_cstring(Path::new("a\0b.scx")),
+            Err(IsomError::InvalidArg)
+        ));
     }
 }

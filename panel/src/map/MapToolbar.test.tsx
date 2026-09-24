@@ -3,12 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 
 import { MapToolbar } from "./MapToolbar";
-import type {
-  CandidateStateView,
-  MapContextSnapshot,
-  MapDiff,
-  VerificationReport,
-} from "./mapProtocol";
+import type { CandidateStateView, MapDiff, VerificationReport } from "./mapProtocol";
 
 const emptyCounts = { added: 0, removed: 0, moved: 0, changed: 0 };
 const emptyDiff: MapDiff = {
@@ -41,21 +36,6 @@ const revision = {
   width: 128,
   height: 128,
 };
-const context: MapContextSnapshot = {
-  revision,
-  savedSourceNotice: "saved",
-  sourceFileSize: 1024,
-  starcraftPath: "C:\\StarCraft",
-  digest: {
-    map: { width: 128, height: 128, tileset: "jungle" },
-    units: [],
-    doodads: [],
-    sprites: [],
-    locations: [],
-    startLocations: [],
-  },
-};
-
 function candidate(overrides: Partial<CandidateStateView> = {}): CandidateStateView {
   return {
     sessionId: "map-session",
@@ -75,6 +55,7 @@ function candidate(overrides: Partial<CandidateStateView> = {}): CandidateStateV
     ],
     selections: [],
     stale: false,
+    sourceDiverged: false,
     canApply: true,
     canUndo: false,
     ...overrides,
@@ -82,8 +63,6 @@ function candidate(overrides: Partial<CandidateStateView> = {}): CandidateStateV
 }
 
 const callbacks = {
-  changedSource: null,
-  reloadingSource: false,
   onView: vi.fn(),
   onRevert: vi.fn(),
   onDiscard: vi.fn(),
@@ -91,7 +70,7 @@ const callbacks = {
   onUndo: vi.fn(),
   onImagePlace: vi.fn(),
   onMapImport: vi.fn(),
-  onReloadSource: vi.fn(),
+  onProperties: vi.fn(),
 };
 
 describe("MapToolbar candidate rails", () => {
@@ -99,7 +78,6 @@ describe("MapToolbar candidate rails", () => {
     callbacks.onApply.mockClear();
     render(
       <MapToolbar
-        context={context}
         candidate={candidate()}
         view="candidate"
         busy={false}
@@ -117,7 +95,6 @@ describe("MapToolbar candidate rails", () => {
     callbacks.onDiscard.mockClear();
     const { rerender } = render(
       <MapToolbar
-        context={context}
         candidate={candidate()}
         view="candidate"
         busy={false}
@@ -135,7 +112,6 @@ describe("MapToolbar candidate rails", () => {
 
     rerender(
       <MapToolbar
-        context={context}
         candidate={candidate({ currentRevision: 0, canApply: false })}
         view="candidate"
         busy={false}
@@ -150,7 +126,6 @@ describe("MapToolbar candidate rails", () => {
     callbacks.onRevert.mockClear();
     render(
       <MapToolbar
-        context={context}
         candidate={candidate()}
         view="candidate"
         busy={false}
@@ -163,40 +138,37 @@ describe("MapToolbar candidate rails", () => {
     expect(callbacks.onRevert).toHaveBeenCalledWith(0);
   });
 
-  it("blocks Apply and offers a new preserved work item for a stale source", async () => {
-    callbacks.onReloadSource.mockClear();
-    render(
+  it("only defers a changed source while a request is live, never asking for new work", () => {
+    const { rerender } = render(
       <MapToolbar
-        context={context}
         candidate={candidate({ stale: true, canApply: false })}
         view="candidate"
         busy={false}
         imagePlacementActive={false}
         {...callbacks}
-        changedSource={{
-          projectId: "project",
-          sourcePath: "C:\\maps\\demo.scx",
-          mtimeNs: "1700000001000000000",
-          fileSize: 2048,
-        }}
       />,
     );
     expect(screen.getByRole("button", { name: "전체 Apply" })).toBeDisabled();
-    expect(screen.getByText(/원본 변경됨/)).toBeInTheDocument();
+    expect(screen.getByText(/원본 변경 감지/)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /새 작업/ })).not.toBeInTheDocument();
 
-    const reload = screen.getByRole("button", {
-      name: "변경된 원본으로 새 작업",
-    });
-    expect(reload).toBeEnabled();
-    await userEvent.click(reload);
-    expect(callbacks.onReloadSource).toHaveBeenCalledOnce();
+    rerender(
+      <MapToolbar
+        candidate={candidate({ sourceDiverged: true })}
+        view="candidate"
+        busy={false}
+        imagePlacementActive={false}
+        {...callbacks}
+      />,
+    );
+    expect(screen.getByRole("button", { name: "전체 Apply" })).toBeEnabled();
+    expect(screen.getByText(/원본과 갈라짐/)).toBeInTheDocument();
   });
 
   it("offers direct photo placement unless source or workbench state is unsafe", async () => {
     callbacks.onImagePlace.mockClear();
     const { rerender } = render(
       <MapToolbar
-        context={context}
         candidate={candidate()}
         view="candidate"
         busy={false}
@@ -214,7 +186,6 @@ describe("MapToolbar candidate rails", () => {
 
     rerender(
       <MapToolbar
-        context={context}
         candidate={candidate({ stale: true })}
         view="candidate"
         busy={false}
@@ -225,10 +196,35 @@ describe("MapToolbar candidate rails", () => {
     expect(screen.getByRole("button", { name: "사진 배치" })).toBeDisabled();
   });
 
+  it("opens map properties only while idle", async () => {
+    callbacks.onProperties.mockClear();
+    const { rerender } = render(
+      <MapToolbar
+        candidate={candidate()}
+        view="candidate"
+        busy={false}
+        imagePlacementActive={false}
+        {...callbacks}
+      />,
+    );
+    await userEvent.click(screen.getByRole("button", { name: "맵 속성" }));
+    expect(callbacks.onProperties).toHaveBeenCalledOnce();
+
+    rerender(
+      <MapToolbar
+        candidate={candidate()}
+        view="candidate"
+        busy
+        imagePlacementActive={false}
+        {...callbacks}
+      />,
+    );
+    expect(screen.getByRole("button", { name: "맵 속성" })).toBeDisabled();
+  });
+
   it("marks a live draft as an uncommitted preview", () => {
     render(
       <MapToolbar
-        context={context}
         candidate={candidate()}
         view="candidate"
         busy

@@ -212,9 +212,13 @@ impl SelectionMask {
             })
     }
 
+    /// Hash of the authoritative selection content (id, label, role, layers,
+    /// bounds, cells). `source_revision` is excluded on purpose: the palette
+    /// rebinds every saved selection to each new candidate revision, and a
+    /// region mention must stay valid across that rebinding while any content
+    /// change still invalidates it.
     pub fn snapshot_hash(&self) -> String {
-        let bytes = serde_json::to_vec(self).expect("selection masks are serializable");
-        hex_sha256(&bytes)
+        crate::map_stamp::PersistentSelection::from_selection(self).snapshot_hash()
     }
 
     pub fn cells(&self) -> BTreeSet<(u16, u16)> {
@@ -615,6 +619,14 @@ pub enum MapOperation {
         y: u16,
         tiles: Vec<Vec<u16>>,
     },
+    #[serde(rename = "terrain.isom_rect")]
+    TerrainIsomRect {
+        x: u16,
+        y: u16,
+        width: u16,
+        height: u16,
+        brush: u16,
+    },
     #[serde(rename = "terrain.isom_brush")]
     TerrainIsomBrush {
         isom_x: u16,
@@ -697,6 +709,40 @@ pub enum MapOperation {
     },
     #[serde(rename = "location.delete")]
     LocationDelete { location_id: u16 },
+    /// Scenario title/description bytes, already encoded for the map's string
+    /// table. Only the Map window's properties request emits the three
+    /// property operations; they are not advertised to the agent.
+    #[serde(rename = "scenario.set")]
+    ScenarioSet {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title_bytes_hex: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        description_bytes_hex: Option<String>,
+    },
+    #[serde(rename = "player.set")]
+    PlayerSet {
+        slot: u8,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        r#type: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        race: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        force: Option<u8>,
+    },
+    #[serde(rename = "force.set")]
+    ForceSet {
+        force: u8,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name_bytes_hex: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        allied: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        allied_victory: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        shared_vision: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        random_start: Option<bool>,
+    },
 }
 
 const fn one() -> u16 {
@@ -752,6 +798,10 @@ pub struct MapDiff {
     pub outside_target: u32,
     pub protected: u32,
     pub unsupported_section_changes: Vec<String>,
+    /// Changed scenario-property fields (title, description, slot owner/race/
+    /// force, force name/flags); counted only for a properties request.
+    #[serde(default)]
+    pub properties: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -791,14 +841,32 @@ pub struct CandidateSession {
     pub persistent_protections: BTreeSet<String>,
     #[serde(default)]
     pub candidate_object_ids: BTreeMap<String, String>,
+    /// The saved source changed while a request was active; the session
+    /// follows it as soon as that request settles.
     #[serde(default)]
     pub stale: bool,
+    /// The saved source changed under candidate revisions that could not be
+    /// replayed onto it, so the candidate still descends from
+    /// `baseline_snapshot` while `baseline.file_sha256` names the source
+    /// bytes Apply will overwrite (last writer wins).
+    #[serde(default)]
+    pub source_diverged: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_apply_backup: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_apply_source_hash: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_apply_before_hash: Option<String>,
+}
+
+impl CandidateSession {
+    /// The last Apply's backup only undoes the source bytes it produced; once
+    /// the source moved on, that undo is gone.
+    pub fn forget_last_apply(&mut self) {
+        self.last_apply_backup = None;
+        self.last_apply_source_hash = None;
+        self.last_apply_before_hash = None;
+    }
 }
 
 pub fn hex_sha256(bytes: &[u8]) -> String {
@@ -978,6 +1046,50 @@ mod tests {
             "operations": [{"op": "fog.set", "x": 1, "y": 1}]
         });
         assert!(serde_json::from_value::<MapEditBatch>(unknown_operation).is_err());
+    }
+
+    #[test]
+    fn property_operations_use_native_field_names_and_omit_unset_fields() {
+        let operations = vec![
+            MapOperation::ScenarioSet {
+                title_bytes_hex: Some("41".to_string()),
+                description_bytes_hex: None,
+            },
+            MapOperation::PlayerSet {
+                slot: 9,
+                r#type: Some("neutral".to_string()),
+                race: None,
+                force: None,
+            },
+            MapOperation::ForceSet {
+                force: 2,
+                name_bytes_hex: None,
+                allied: Some(true),
+                allied_victory: None,
+                shared_vision: Some(false),
+                random_start: None,
+            },
+        ];
+        let encoded = serde_json::to_value(&operations).unwrap();
+        assert_eq!(
+            encoded,
+            json!([
+                {"op": "scenario.set", "titleBytesHex": "41"},
+                {"op": "player.set", "slot": 9, "type": "neutral"},
+                {"op": "force.set", "force": 2, "allied": true, "sharedVision": false}
+            ])
+        );
+        assert_eq!(
+            serde_json::from_value::<Vec<MapOperation>>(encoded).unwrap(),
+            operations
+        );
+        assert!(serde_json::from_value::<MapOperation>(json!({
+            "op": "player.set",
+            "slot": 0,
+            "type": "human",
+            "start": {"x": 1, "y": 1}
+        }))
+        .is_err());
     }
 
     #[test]

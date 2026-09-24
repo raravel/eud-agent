@@ -8,7 +8,8 @@ use crate::{
     mcp,
     provider_runtime::{
         AdapterLoopKind, AdapterOutput, AdapterRequestKind, AdapterStepOutcome, AdapterStepRequest,
-        ConversationItem, ForegroundRequest, ProviderRuntimeError, RunOutcome,
+        ConversationItem, ForegroundRequest, IterationBoundaryReason, ProviderRuntimeError,
+        RunOutcome,
     },
     provider_tool_loop::RunGate,
 };
@@ -53,11 +54,21 @@ impl ProviderRuntime {
                     .workspace
                     .begin_turn(&workspace, &request.identity.request_id)
                 {
-                    Ok(baseline) => Some(crate::workspace::WorkspaceTurnRecorder::new(
-                        self.workspace.clone(),
-                        baseline,
-                        self.tools.journal().clone(),
-                    )),
+                    Ok(baseline) => {
+                        // The trusted source baseline backs every source stale
+                        // check and 3-way merge for this request's write tools.
+                        if let Err(error) = self.tools.bind_source_baseline(
+                            &request.identity.request_id,
+                            baseline.baseline_root.clone(),
+                        ) {
+                            return RunOutcome::Failed(ProviderRuntimeError::Protocol(error));
+                        }
+                        Some(crate::workspace::WorkspaceTurnRecorder::new(
+                            self.workspace.clone(),
+                            baseline,
+                            self.tools.journal().clone(),
+                        ))
+                    }
                     Err(error) => {
                         return RunOutcome::Failed(ProviderRuntimeError::Transport(
                             error.to_string(),
@@ -343,6 +354,33 @@ impl ProviderRuntime {
                         }
                         prior_results = Arc::from(batch.results);
                         continuation = next;
+                        if let Some(reason) = gate.iteration_boundary_reason() {
+                            if let Err(error) = Self::finish_run(
+                                &gate,
+                                &mut mcp,
+                                &mut tool_events,
+                                request.policy.shutdown_grace,
+                                None,
+                            )
+                            .await
+                            {
+                                stop_failed!(error);
+                            }
+                            let conversation = self.direct_conversation(writer.revision());
+                            self.conversation = conversation.clone();
+                            self.binding.conversation = conversation.clone();
+                            if let Some(recorder) = recorder.as_mut() {
+                                if let Err(error) = recorder.finish() {
+                                    return RunOutcome::Failed(ProviderRuntimeError::Transport(
+                                        error.to_string(),
+                                    ));
+                                }
+                            }
+                            return RunOutcome::IterationBoundary {
+                                reason,
+                                conversation,
+                            };
+                        }
                     }
                     AdapterStepOutcome::Completed {
                         output,
@@ -413,9 +451,15 @@ impl ProviderRuntime {
                                 return RunOutcome::Failed(ProviderRuntimeError::Transport(error));
                             }
                             self.pending_acknowledgements.push(request.identity.clone());
-                            if gate.has_granted_write_transition() {
+                            if gate.has_requested_write_transition() {
                                 return RunOutcome::WriteTransition;
                             }
+                        }
+                        if let Some(reason) = gate.iteration_boundary_reason() {
+                            return RunOutcome::IterationBoundary {
+                                reason,
+                                conversation,
+                            };
                         }
                         return RunOutcome::Completed { text, conversation };
                     }
@@ -432,15 +476,43 @@ impl ProviderRuntime {
                     }
                 }
             }
-            self.stop_run(
-                &request.identity,
+            if !direct {
+                self.stop_run(
+                    &request.identity,
+                    &gate,
+                    &mut mcp,
+                    &mut tool_events,
+                    request.policy.shutdown_grace,
+                )
+                .await;
+                return RunOutcome::Failed(ProviderRuntimeError::IterationBoundaryNotResumable);
+            }
+            if let Err(error) = Self::finish_run(
                 &gate,
                 &mut mcp,
                 &mut tool_events,
                 request.policy.shutdown_grace,
+                None,
             )
-            .await;
-            RunOutcome::Failed(ProviderRuntimeError::ToolRoundLimit)
+            .await
+            {
+                return RunOutcome::Failed(error);
+            }
+            let Some(writer) = writer.as_ref() else {
+                return RunOutcome::Failed(ProviderRuntimeError::IterationBoundaryNotResumable);
+            };
+            let conversation = self.direct_conversation(writer.revision());
+            self.conversation = conversation.clone();
+            self.binding.conversation = conversation.clone();
+            if let Some(recorder) = recorder.as_mut() {
+                if let Err(error) = recorder.finish() {
+                    return RunOutcome::Failed(ProviderRuntimeError::Transport(error.to_string()));
+                }
+            }
+            RunOutcome::IterationBoundary {
+                reason: IterationBoundaryReason::ToolRounds,
+                conversation,
+            }
         })
     }
 }

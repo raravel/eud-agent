@@ -51,10 +51,8 @@ impl ProviderRuntime {
                 .await
                 .map_err(|error| ProviderRuntimeError::Transport(error.to_string()))?
                 .map_err(ProviderRuntimeError::Transport)?;
-        self.tools
-            .bind_workspace_root(&request.identity.request_id, prepared.root.clone())
-            .map_err(ProviderRuntimeError::Protocol)?;
         request.turn.workspace_root = Some(prepared.root.clone());
+        request.turn.workspace_temp = Some(prepared.temp_dir.clone());
         self.active_workspace = Some(prepared.clone());
         Ok(prepared)
     }

@@ -26,58 +26,99 @@ function Hold-StructuredProcess {
     throw 'Structured fixture was not terminated'
 }
 
-function Run-McpSequence($endpoint) {
+function Start-McpSession($endpoint) {
     $headers = @{ Accept='application/json, text/event-stream' }
     $init = Post-Mcp $endpoint $headers @{jsonrpc='2.0'; id=1; method='initialize'; params=@{protocolVersion='2025-06-18'; capabilities=@{}; clientInfo=@{name='native-process-fixture'; version='1'}}}
     if (!$init.Headers) { throw 'MCP initialize returned no HTTP headers' }
     $headers['mcp-session-id'] = [string]$init.Headers['mcp-session-id']
     if (!$headers['mcp-session-id']) { throw 'MCP session was not established' }
     $null = Post-Mcp $endpoint $headers @{jsonrpc='2.0'; method='notifications/initialized'}
-    $sourcePath = $null
-    $lastText = $null
-    foreach ($index in @(1, 2)) {
-        if ($index -eq 1) { $name = 'list_files'; $arguments = @{} }
-        else { $name = 'read_file'; $arguments = @{path=$sourcePath} }
-        $callId = "native-call-$index"
-        if ($Mode -eq 'codex') {
-            Write-Wire @{jsonrpc='2.0'; method='item/started'; params=@{item=@{id=$callId; type='mcpToolCall'; server='eud-tools'; tool=$name; arguments=$arguments}}}
-        } else {
-            Write-Wire @{type='stream_event'; event=@{type='content_block_start'; index=$index; content_block=@{type='tool_use'; id=$callId; name="mcp__eud-tools__$name"}}}
-            Write-Wire @{type='stream_event'; event=@{type='content_block_delta'; index=$index; delta=@{type='input_json_delta'; partial_json=($arguments | ConvertTo-Json -Compress)}}}
-            Write-Wire @{type='stream_event'; event=@{type='content_block_stop'; index=$index}}
-        }
-        $response = Post-Mcp $endpoint $headers @{jsonrpc='2.0'; id="native-mcp-request-$index"; method='tools/call'; params=@{name=$name; arguments=$arguments}}
-        $body = [string]$response.Content
-        if ([string]$response.Headers['Content-Type'] -like 'text/event-stream*') {
-            $replies = @($body -split "`r?`n" |
-                Where-Object { $_ -match '^data:\s*\S' } |
-                ForEach-Object { ($_ -replace '^data:\s*', '') | ConvertFrom-Json } |
-                Where-Object { $_.id -eq "native-mcp-request-$index" })
-            if ($replies.Count -ne 1) { throw 'MCP stream must contain exactly one matching response' }
-            $payload = $replies[0]
-        } else {
-            $payload = $body | ConvertFrom-Json
-        }
-        if ($payload.error -or $payload.result.isError) { throw 'MCP tool request failed' }
-        if (!$payload.result.content) { throw 'MCP tool response returned no content blocks' }
-        $lastText = [string]$payload.result.content[0].text
-        if ($index -eq 1) {
-            if ($lastText -notmatch 'src/main\.eps') { throw 'list_files result did not select the expected source' }
-            $sourcePath = $Matches[0]
-        } elseif ($lastText -notmatch 'onPluginStart') { throw 'read_file result did not contain the source' }
-        if ($Mode -eq 'codex') {
-            Write-Wire @{jsonrpc='2.0'; method='item/completed'; params=@{item=@{id=$callId; type='mcpToolCall'; server='eud-tools'; tool=$name; result=$payload.result; status='completed'}}}
-        } else {
-            Write-Wire @{type='user'; message=@{role='user'; content=@(@{type='tool_result'; tool_use_id=$callId; content=$lastText})}}
-        }
+    return $headers
+}
+
+# One native tool call over MCP with its provider wire events. Returns the
+# first content text; a tool error is returned as text only when $allowError.
+function Invoke-McpTool($endpoint, $headers, $index, $name, $arguments, $allowError) {
+    $callId = "native-call-$index"
+    if ($Mode -eq 'codex') {
+        Write-Wire @{jsonrpc='2.0'; method='item/started'; params=@{item=@{id=$callId; type='mcpToolCall'; server='eud-tools'; tool=$name; arguments=$arguments}}}
+    } else {
+        Write-Wire @{type='stream_event'; event=@{type='content_block_start'; index=$index; content_block=@{type='tool_use'; id=$callId; name="mcp__eud-tools__$name"}}}
+        Write-Wire @{type='stream_event'; event=@{type='content_block_delta'; index=$index; delta=@{type='input_json_delta'; partial_json=($arguments | ConvertTo-Json -Compress)}}}
+        Write-Wire @{type='stream_event'; event=@{type='content_block_stop'; index=$index}}
     }
-    return $lastText
+    $response = Post-Mcp $endpoint $headers @{jsonrpc='2.0'; id="native-mcp-request-$index"; method='tools/call'; params=@{name=$name; arguments=$arguments}}
+    $body = [string]$response.Content
+    if ([string]$response.Headers['Content-Type'] -like 'text/event-stream*') {
+        $replies = @($body -split "`r?`n" |
+            Where-Object { $_ -match '^data:\s*\S' } |
+            ForEach-Object { ($_ -replace '^data:\s*', '') | ConvertFrom-Json } |
+            Where-Object { $_.id -eq "native-mcp-request-$index" })
+        if ($replies.Count -ne 1) { throw 'MCP stream must contain exactly one matching response' }
+        $payload = $replies[0]
+    } else {
+        $payload = $body | ConvertFrom-Json
+    }
+    if ($payload.error) { throw 'MCP tool request failed' }
+    if ($payload.result.isError -and -not $allowError) { throw 'MCP tool request failed' }
+    if (!$payload.result.content) { throw 'MCP tool response returned no content blocks' }
+    $text = [string]$payload.result.content[0].text
+    if ($Mode -eq 'codex') {
+        $status = if ($payload.result.isError) { 'failed' } else { 'completed' }
+        Write-Wire @{jsonrpc='2.0'; method='item/completed'; params=@{item=@{id=$callId; type='mcpToolCall'; server='eud-tools'; tool=$name; result=$payload.result; status=$status}}}
+    } else {
+        Write-Wire @{type='user'; message=@{role='user'; content=@(@{type='tool_result'; tool_use_id=$callId; content=$text; is_error=[bool]$payload.result.isError})}}
+    }
+    return $text
+}
+
+function Run-McpSequence($endpoint) {
+    $headers = Start-McpSession $endpoint
+    $listing = Invoke-McpTool $endpoint $headers 1 'list_files' @{} $false
+    if ($listing -notmatch 'src/main\.eps') { throw 'list_files result did not select the expected source' }
+    $sourcePath = $Matches[0]
+    $source = Invoke-McpTool $endpoint $headers 2 'read_file' @{path=$sourcePath} $false
+    if ($source -notmatch 'onPluginStart') { throw 'read_file result did not contain the source' }
+    return $source
+}
+
+# Delegated-run prompts: the CLI reads, then either submits its result,
+# attempts a write, or ends in prose without submitting.
+function Run-DelegatedSequence($endpoint, $prompt) {
+    $headers = Start-McpSession $endpoint
+    switch ($prompt) {
+        'delegated-submit' {
+            $listing = Invoke-McpTool $endpoint $headers 1 'list_files' @{} $false
+            if ($listing -notmatch 'src/main\.eps') { throw 'list_files result did not select the expected source' }
+            $source = Invoke-McpTool $endpoint $headers 2 'read_file' @{path=$Matches[0]} $false
+            if ($source -notmatch 'onPluginStart') { throw 'read_file result did not contain the source' }
+            $accepted = Invoke-McpTool $endpoint $headers 3 'submit_result' @{summary='one entry module'; files=@('src/main.eps')} $false
+            if ($accepted -notmatch 'accepted') { throw 'submit_result was not accepted' }
+            return 'submitted'
+        }
+        'delegated-submit-hang' {
+            $accepted = Invoke-McpTool $endpoint $headers 1 'submit_result' @{summary='submitted early'; files=@()} $false
+            if ($accepted -notmatch 'accepted') { throw 'submit_result was not accepted' }
+            # The CLI keeps its turn open past the run deadline after submitting.
+            Start-Sleep -Seconds 300
+            throw 'Hanging delegated fixture was not terminated'
+        }
+        'delegated-write' {
+            $refusal = Invoke-McpTool $endpoint $headers 1 'file_create' @{path='src/x.eps'; ftype='CUIEps'; code="// x`n"} $true
+            if ($refusal -notmatch 'unknown tool') { throw "write was not refused as unknown: $refusal" }
+            return 'wrote'
+        }
+        'delegated-prose' {
+            $null = Invoke-McpTool $endpoint $headers 1 'list_files' @{} $false
+            return 'prose only'
+        }
+        default { throw "unknown delegated prompt $prompt" }
+    }
 }
 
 if ($Mode -eq 'claude') {
     if ($Rest -contains '--json-schema') {
-        $promptIndex = [Array]::IndexOf($Rest, '-p')
-        $prompt = $Rest[$promptIndex + 1]
+        $prompt = [Console]::In.ReadToEnd()
         $result = @{type='result'; subtype='success'; is_error=$false; structured_output=@{ok=$true}}
         switch ($prompt) {
             'structured-hang' { Hold-StructuredProcess }
@@ -104,7 +145,9 @@ if ($Mode -eq 'claude') {
     if ($configIndex -lt 0) { throw 'Claude was not granted its run MCP endpoint' }
     $endpoint = ($Rest[$configIndex + 1] | ConvertFrom-Json).mcpServers.'eud-tools'.url
     Write-Wire @{type='system'; subtype='init'; session_id=$nativeSession; tools=@('mcp__eud-tools__list_files', 'mcp__eud-tools__read_file'); mcp_servers=@(@{name='eud-tools'; status='connected'})}
-    $answer = Run-McpSequence $endpoint
+    $claudePrompt = [string]$inputMessage.message.content[0].text
+    if ($claudePrompt -like 'delegated-*') { $answer = Run-DelegatedSequence $endpoint $claudePrompt }
+    else { $answer = Run-McpSequence $endpoint }
     Write-Wire @{type='stream_event'; event=@{type='content_block_delta'; index=3; delta=@{type='text_delta'; text=$answer}}}
     Write-Wire @{type='result'; subtype='success'; session_id=$nativeSession; is_error=$false; result=$answer}
     exit 0
@@ -161,6 +204,7 @@ while (($line = [Console]::In.ReadLine()) -ne $null) {
                     Write-Wire @{jsonrpc='2.0'; method='item/started'; params=@{item=@{id='forbidden'; type='mcpToolCall'; tool='list_files'; arguments=@{}}}}
                     $answer = '{"ok":true}'
                 }
+                { $_ -like 'delegated-*' } { $answer = Run-DelegatedSequence $endpoint $prompt }
                 default { $answer = Run-McpSequence $endpoint }
             }
             Write-Wire @{jsonrpc='2.0'; method='item/agentMessage/delta'; params=@{delta=$answer}}

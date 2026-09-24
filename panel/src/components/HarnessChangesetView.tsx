@@ -1,21 +1,20 @@
 /**
- * Changeset review (features/06 ## UI layout + Behaviors). Renders the
- * server-assembled `changeset.items[]`:
- *   - dat per objId: "{dat} [{objId}] {name?}" header + property old → new rows;
+ * Harness document review — the ONE review surface that survived the git
+ * cutover. A request's own changes are no longer accepted or rejected (the turn
+ * applies its work and the app commits it), but a harness job still stages the
+ * documents it generated and waits for one atomic decision on all of them.
+ *
+ * Renders the job's `changeset.items[]` the way the core assembles them:
+ *   - dat per objId: a header bar + property old → new rows;
  *   - files by kind render as a file-editing card — a filename title bar
  *     ({@link FileTitleBar}) on top of the code: created → content preview,
- *     modified → the SERVER unified diff with +/- coloring (NEVER Monaco
+ *     modified → the CORE unified diff with +/- coloring (NEVER Monaco
  *     DiffEditor — rules.md), deleted/body-less → the title bar alone;
  *   - settings/plugins/main and any other flat item → old → new rows.
  *
- * Each item exposes [✓ 적용]/[✗ 되돌리기]; bulk [전체 적용 유지]/[전체 되돌리기]
- * dispatch the literal "all". Decisions flow through `onDecide(decision, ids)`
- * (the App invokes `changeset_decision`; the store records it so the
- * inbound `rollback_result` is labelled per accept/reject). The per-item ids
- * come from {@link itemIds} (a dat group targets every property id). Resolved
- * rows show 적용 유지 / 되돌림 / 실패 (inline failure) from the store decisions.
- *
- * Diff/preview limits reuse lib/truncate (1 MiB UTF-16-consistent). Korean labels.
+ * The decision is bulk-only: [전체 적용 유지] / [전체 되돌리기] call `onDecide`,
+ * and the App invokes the harness command. Diff/preview limits reuse
+ * lib/truncate (1 MiB UTF-16-consistent). Korean labels.
  */
 import type { ReactNode } from "react";
 import {
@@ -32,43 +31,23 @@ import { cn } from "@/lib/utils";
 import { classifyDiff } from "@/lib/diff";
 import { truncateForDisplay } from "@/lib/truncate";
 import { formatAttachmentSize } from "@/lib/attachments";
-import {
-  datProperties,
-  itemIds,
-  itemKey,
-  itemState,
-  type ItemState,
-} from "@/lib/changeset";
-import type { ChangesetState } from "@/state/store";
+import { datProperties, itemKey } from "@/lib/changeset";
 import type { ChangesetItem } from "@/lib/ipc";
 
-export interface ChangesetViewProps {
-  /** The active changeset under review (items + per-id decisions). */
-  changeset: ChangesetState;
-  /** Whether the review body is expanded for the selected session. */
+export interface HarnessChangesetViewProps {
+  /** The harness job's staged document changes. */
+  items: ChangesetItem[];
+  /** Whether the review body is expanded. */
   open: boolean;
-  /** Persist expansion changes in the selected session slot. */
+  /** Persist expansion changes in the owning card. */
   onOpenChange(open: boolean): void;
-  /** A decision is in flight (disable the controls until rollback_result). */
+  /** A decision is in flight — disable the controls. */
   pending: boolean;
-  /** Fire the changeset_decision; ids "all" for bulk, else the item's ids. */
-  onDecide(decision: "accept" | "reject", ids: "all" | string[]): void;
-  /** Optional review title for secondary document changesets. */
+  /** Fire the harness decision; the whole job is accepted or rejected at once. */
+  onDecide(decision: "accept" | "reject"): void;
+  /** Review title. */
   title?: string;
-  /** Hide per-item decisions when the backend accepts only an atomic batch. */
-  bulkOnly?: boolean;
 }
-
-/** Per-state Korean label + tone for the resolved row badge. */
-const STATE_BADGE: Record<
-  Exclude<ItemState, "undecided">,
-  { label: string; tone: string }
-> = {
-  accepted: { label: "적용 유지", tone: "text-emerald-400" },
-  rejected: { label: "되돌림", tone: "text-muted-foreground" },
-  failed: { label: "되돌리기 실패", tone: "text-destructive" },
-  mixed: { label: "일부 적용", tone: "text-amber-400" },
-};
 
 function asText(value: unknown): string {
   if (value === null || value === undefined) return "";
@@ -362,17 +341,14 @@ function ItemBody({ item }: { item: ChangesetItem }) {
   );
 }
 
-export function ChangesetView({
-  changeset,
+export function HarnessChangesetView({
+  items,
   open,
   onOpenChange,
   pending,
   onDecide,
-  title = "수정 적용",
-  bulkOnly = false,
-}: ChangesetViewProps) {
-  const { items, decisions } = changeset;
-
+  title = "하네스 문서 적용",
+}: HarnessChangesetViewProps) {
   return (
     <section
       aria-label="변경사항 검토"
@@ -391,7 +367,7 @@ export function ChangesetView({
           variant="ghost"
           className="size-8 shrink-0"
           aria-expanded={open}
-          aria-label={open ? "수정 적용 접기" : "수정 적용 펼치기"}
+          aria-label={open ? "문서 적용 접기" : "문서 적용 펼치기"}
           onClick={() => onOpenChange(!open)}
         >
           <ChevronsUpDownIcon className="size-4" />
@@ -406,11 +382,8 @@ export function ChangesetView({
           >
             <div className="flex flex-col gap-3">
               {items.map((item) => {
-                const state = itemState(item, decisions);
-                const ids = itemIds(item);
-                const decided = state !== "undecided";
-                // Stable identity for keying + testid. A dat group has no item-level
-                // id, so itemKey falls back to the joined property ids (NEVER undefined).
+                // A dat group carries NO item-level id (the core puts ids on its
+                // properties), so itemKey falls back to the joined property ids.
                 const key = itemKey(item);
                 return (
                   <Card
@@ -421,59 +394,19 @@ export function ChangesetView({
                     <CardContent className="flex flex-col gap-2 px-3">
                       <ItemBody item={item} />
                       <div className="flex items-center justify-end gap-2">
-                        {decided ? (
-                          <Badge
-                            variant="outline"
-                            className={cn(
-                              "text-xs font-medium",
-                              STATE_BADGE[state].tone,
-                            )}
-                          >
-                            {STATE_BADGE[state].label}
-                          </Badge>
-                        ) : bulkOnly ? (
-                          <Badge variant="outline" className="text-xs font-medium">
-                            일괄 검토
-                          </Badge>
-                        ) : (
-                          <>
-                            <Button
-                              type="button"
-                              size="xs"
-                              variant="outline"
-                              disabled={pending}
-                              aria-label="적용 유지"
-                              onClick={() => onDecide("accept", ids)}
-                            >
-                              ✓ 적용
-                            </Button>
-                            <Button
-                              type="button"
-                              size="xs"
-                              variant="outline"
-                              disabled={pending}
-                              aria-label="되돌리기"
-                              onClick={() => onDecide("reject", ids)}
-                            >
-                              ✗ 되돌리기
-                            </Button>
-                          </>
-                        )}
+                        <Badge variant="outline" className="text-xs font-medium">
+                          일괄 검토
+                        </Badge>
                       </div>
                     </CardContent>
                   </Card>
                 );
               })}
 
-              {/* EUD-070: in-flight notice — a rollback waits on the 1s bridge tick per
-                  inverse op (2-4s for a dat group), so the wait must be visible, not
-                  just silently-disabled buttons. */}
               {pending && (
                 <div className="flex items-center gap-2 text-sm text-muted-foreground">
                   <Spinner className="size-3.5 shrink-0" />
-                  <span>
-                    결정 처리 중… (변경사항을 한 건씩 되돌리고 있습니다)
-                  </span>
+                  <span>결정 처리 중…</span>
                 </div>
               )}
             </div>
@@ -487,7 +420,7 @@ export function ChangesetView({
               type="button"
               size="sm"
               disabled={pending}
-              onClick={() => onDecide("accept", "all")}
+              onClick={() => onDecide("accept")}
             >
               전체 적용 유지
             </Button>
@@ -496,7 +429,7 @@ export function ChangesetView({
               size="sm"
               variant="outline"
               disabled={pending}
-              onClick={() => onDecide("reject", "all")}
+              onClick={() => onDecide("reject")}
             >
               전체 되돌리기
             </Button>

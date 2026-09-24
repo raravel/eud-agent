@@ -32,6 +32,7 @@ struct EventSink {
 impl RuntimeEventSink for EventSink {
     fn emit(&self, event: &AdapterEventKind) -> Result<(), ProviderRuntimeError> {
         let observed = match event {
+            AdapterEventKind::NativeSessionStarted { .. } => None,
             AdapterEventKind::Block(NormalizedBlock::Text { text, .. }) => {
                 Some(ObservedEvent::Text(text.clone()))
             }
@@ -168,8 +169,8 @@ fn normalized_over_limit_stream(provider: DirectProvider) -> String {
             concat!(
                 "data: {{\"choices\":[{{\"delta\":{{\"content\":\"partial\"}}}}]}}\n\n",
                 "data: {{\"choices\":[{{\"delta\":{{\"content\":\"{}\",\"tool_calls\":[",
-                "{{\"index\":0,\"id\":\"write-call\",\"function\":{{\"name\":\"request_write_workspace\",",
-                "\"arguments\":\"{{\\\"reason\\\":\\\"must not run\\\"}}\"}}}}]}},\"finish_reason\":\"tool_calls\"}}]}}\n\n",
+                "{{\"index\":0,\"id\":\"read-call\",\"function\":{{\"name\":\"list_files\",",
+                "\"arguments\":\"{{}}\"}}}}]}},\"finish_reason\":\"tool_calls\"}}]}}\n\n",
                 "data: [DONE]\n\n"
             ),
             oversized
@@ -178,8 +179,8 @@ fn normalized_over_limit_stream(provider: DirectProvider) -> String {
             concat!(
                 "data: {{\"response\":{{\"candidates\":[{{\"content\":{{\"parts\":[{{\"text\":\"partial\"}}]}}}}]}}}}\n\n",
                 "data: {{\"response\":{{\"candidates\":[{{\"content\":{{\"parts\":[",
-                "{{\"text\":\"{}\"}},{{\"functionCall\":{{\"id\":\"write-call\",",
-                "\"name\":\"request_write_workspace\",\"args\":{{\"reason\":\"must not run\"}}}}}}]}} ,",
+                "{{\"text\":\"{}\"}},{{\"functionCall\":{{\"id\":\"read-call\",",
+                "\"name\":\"list_files\",\"args\":{{}}}}}}]}} ,",
                 "\"finishReason\":\"STOP\"}}]}}}}\n\n"
             ),
             oversized

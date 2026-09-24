@@ -1,8 +1,9 @@
 use std::process::Stdio;
 
 use serde_json::Value;
-use tokio::io::AsyncReadExt as _;
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
+use crate::provider::ProviderId;
 use crate::provider_runtime::{
     AdapterEvent, AdapterEventKind, AdapterRequestKind, AdapterStepOutcome, AdapterStepRequest,
     NormalizedBlock, ProviderRuntimeError,
@@ -10,7 +11,8 @@ use crate::provider_runtime::{
 use crate::provider_tool_loop::validate_structured_output;
 
 use super::request::{
-    hide_console, terminate_child, validate_workspace_boundary, MAX_STDERR_BYTES, MAX_STDOUT_BYTES,
+    hide_console, model_args, terminate_child, validate_workspace_boundary, MAX_STDERR_BYTES,
+    MAX_STDOUT_BYTES,
 };
 use super::state::ProductionClaudeCodeAdapter;
 
@@ -43,10 +45,30 @@ impl ProductionClaudeCodeAdapter {
             ));
         }
         validate_workspace_boundary(workspace_root).map_err(ProviderRuntimeError::Protocol)?;
+        if request.binding.model != self.model || request.binding.provider != ProviderId::ClaudeCode
+        {
+            return Err(ProviderRuntimeError::Protocol(
+                "provider_model_unavailable".to_string(),
+            ));
+        }
+        let model_args = model_args(
+            &self.model,
+            request
+                .binding
+                .reasoning
+                .as_ref()
+                .map(|selection| selection.level.as_str()),
+        )
+        .map_err(ProviderRuntimeError::Protocol)?;
+        // Windows caps a whole command line at 32,767 characters while a harness prompt
+        // carries up to 192 KiB of accepted context, so an argument prompt makes the spawn
+        // itself fail. The prompt travels on stdin like the foreground stream's message
+        // does; `-p` with no argument reads it from there.
+        let prompt = prompt.clone().into_bytes();
         let mut command = self.command();
         command
             .arg("-p")
-            .arg(prompt)
+            .args(model_args)
             .args(["--output-format", "json"])
             .arg("--json-schema")
             .arg(output_schema.to_string())
@@ -58,7 +80,7 @@ impl ProductionClaudeCodeAdapter {
             .arg("--disable-slash-commands")
             .arg("--no-chrome")
             .current_dir(workspace_root)
-            .stdin(Stdio::null())
+            .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
@@ -73,6 +95,9 @@ impl ProductionClaudeCodeAdapter {
                 )
             })?,
         );
+        let mut stdin = child.stdin.take().ok_or_else(|| {
+            ProviderRuntimeError::Transport("provider_transport_closed".to_string())
+        })?;
         let stdout = child.stdout.take().ok_or_else(|| {
             ProviderRuntimeError::Transport("provider_transport_closed".to_string())
         })?;
@@ -93,6 +118,25 @@ impl ProductionClaudeCodeAdapter {
             let _ = stderr.take(MAX_STDERR_BYTES).read_to_end(&mut bytes).await;
             bytes
         });
+        // Both readers are already draining, so a prompt larger than the stdin pipe buffer
+        // cannot deadlock against a CLI that writes before it has consumed all of its input.
+        let written = async {
+            stdin.write_all(&prompt).await?;
+            stdin.shutdown().await
+        }
+        .await;
+        drop(stdin);
+        if written.is_err() {
+            if let Some(job) = job.take() {
+                terminate_child(&mut child, job).await;
+            }
+            stdout_task.abort();
+            let _ = stdout_task.await;
+            let _ = stderr_task.await;
+            return Err(ProviderRuntimeError::Transport(
+                "provider_transport_closed".to_string(),
+            ));
+        }
         let generation = request.identity.cancellation_generation;
         let mut status = None;
         let mut stdout_bytes = None;

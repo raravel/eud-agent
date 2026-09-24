@@ -4,7 +4,7 @@ use parking_lot::Mutex;
 use tokio::sync::{mpsc, watch, Notify};
 
 use crate::{
-    provider_runtime::{RunIdentity, WorkspaceAccess},
+    provider_runtime::{IterationBoundaryReason, RunIdentity, WorkspaceAccess},
     provider_transcript::RunCheckpointWriter,
     tool_exec::SessionToolRuntime,
 };
@@ -20,6 +20,8 @@ pub(super) struct GateState {
     pub(super) in_flight: usize,
     pub(super) next_sequence: u64,
     pub(super) completed: Vec<DurableToolCompletion>,
+    pub(super) write_transition_requested: bool,
+    pub(super) iteration_boundary_requested: Option<IterationBoundaryReason>,
 }
 
 pub(super) struct RunGateInner {
@@ -82,6 +84,18 @@ pub(super) fn record_completion(
         state
             .completed
             .push(durable_completion(sequence, &inner.identity, call, result));
+        if state.iteration_boundary_requested.is_none() {
+            state.iteration_boundary_requested = if inner.runtime.autonomous_pause_requested() {
+                Some(IterationBoundaryReason::ProviderContinuation)
+            } else if inner
+                .runtime
+                .iteration_action_boundary_reached(&inner.identity.request_id)
+            {
+                Some(IterationBoundaryReason::ToolActions)
+            } else {
+                None
+            };
+        }
         state.completed.clone()
     };
     let receipt = inner

@@ -903,8 +903,8 @@ pub(crate) const APP_SERVER_CONFIG_OVERRIDES: [&str; 8] = [
     "model_reasoning_summary=\"detailed\"",
     "web_search=\"live\"",
     "windows.sandbox=\"elevated\"",
-    "permissions.eud_workspace_read={description=\"eud-agent read-only session workspace\",filesystem={\":minimal\"=\"read\",\":workspace_roots\"={\".\"=\"read\"}},network={enabled=false}}",
-    "permissions.eud_workspace_write={description=\"eud-agent live-project writer with read-only documents\",filesystem={\":minimal\"=\"read\",\":workspace_roots\"={\".\"=\"read\",\".tmp/**\"=\"write\"}},network={enabled=false}}",
+    "permissions.eud_workspace_read={description=\"eud-agent read-only project root\",filesystem={\":minimal\"=\"read\",\":workspace_roots\"={\".\"=\"read\"}},network={enabled=false}}",
+    "permissions.eud_workspace_write={description=\"eud-agent live-project writer\",filesystem={\":minimal\"=\"read\",\":workspace_roots\"={\".\"=\"write\",\"maps\"=\"read\",\"maps/**\"=\"read\",\"references\"=\"read\",\"references/**\"=\"read\",\".git\"=\"read\",\".git/**\"=\"read\",\".claude\"=\"read\",\".claude/**\"=\"read\",\".mcp.json\"=\"read\"}},network={enabled=false}}",
 ];
 
 const STRUCTURED_APP_SERVER_CONFIG_OVERRIDES: [&str; 12] = [
@@ -1028,6 +1028,7 @@ impl CodexAppServerClient<tokio::process::ChildStdout, tokio::process::ChildStdi
         mcp_server_url: Option<&str>,
         access: WorkspaceAccess,
         native_tools_enabled: bool,
+        temp_dir: Option<&std::path::Path>,
     ) -> Result<(Self, tokio::sync::mpsc::Receiver<AppServerEvent>), AppServerError> {
         let mcp_server_url = mcp_server_url.map(str::to_string);
         let mut command = tokio::process::Command::new(&launch.executable);
@@ -1047,9 +1048,8 @@ impl CodexAppServerClient<tokio::process::ChildStdout, tokio::process::ChildStdi
         if let Some(url) = mcp_server_url.as_deref() {
             command.arg("-c").arg(mcp_server_override(url));
         }
-        let private_tmp = cwd.as_ref().join(crate::workspace::TEMP_DIR);
-        if private_tmp.is_dir() {
-            command.env("TEMP", &private_tmp).env("TMP", &private_tmp);
+        if let Some(temp_dir) = temp_dir.filter(|path| path.is_dir()) {
+            command.env("TEMP", temp_dir).env("TMP", temp_dir);
         }
         command
             .current_dir(cwd.as_ref())
@@ -1698,9 +1698,23 @@ mod app_server_override_tests {
             .iter()
             .find(|value| value.starts_with("permissions.eud_workspace_write="))
             .unwrap();
-        assert!(implementation_profile.contains("\".\"=\"read\""));
-        assert!(implementation_profile.contains("\".tmp/**\"=\"write\""));
-        assert!(!implementation_profile.contains("\".\"=\"write\""));
+        // The project root is writable, and the three paths the app owns are
+        // narrowed back to read: a more specific entry overrides `.`, which is
+        // how the scratch area used to be carved out of a read-only root.
+        assert!(implementation_profile.contains("\".\"=\"write\""));
+        // `.claude/` and `.mcp.json` decide what a Claude session in this same
+        // project may do. No session writes its own permissions.
+        assert!(implementation_profile.contains("\".mcp.json\"=\"read\""));
+        for protected in ["maps", "references", ".git", ".claude"] {
+            assert!(
+                implementation_profile.contains(&format!("\"{protected}\"=\"read\"")),
+                "{protected} must stay read-only"
+            );
+            assert!(
+                implementation_profile.contains(&format!("\"{protected}/**\"=\"read\"")),
+                "{protected} contents must stay read-only"
+            );
+        }
     }
 
     #[test]
@@ -2661,6 +2675,7 @@ mod appserver_tests {
                 text: "first prompt".to_string(),
                 image_paths: vec![PathBuf::from("C:/tmp/screenshot.png")],
                 workspace_root: None,
+                workspace_temp: None,
                 workspace_access: WorkspaceAccess::Read,
                 output_schema: Some(json!({"type": "object"})),
                 forbid_tools: false,

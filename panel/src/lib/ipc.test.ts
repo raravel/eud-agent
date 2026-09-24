@@ -4,18 +4,25 @@ import {
   appSettingsGet,
   appSettingsSave,
   attentionNotify,
+  euddraftCheckUpdate,
+  gitCommitDetail,
+  gitConsentSet,
+  gitLog,
+  gitRevert,
+  gitState,
+  euddraftSettingsGet,
+  euddraftUpdate,
   providerBaseUrlSave,
   providerDefaultsSave,
   providerSettingsGet,
   sessionModelSettingsGet,
   sessionModelSettingsSave,
   compactSession,
-  euddraftCheckUpdate,
-  euddraftSettingsGet,
-  euddraftUpdate,
   isAgentTurnEndTransition,
   notificationSoundPreview,
   mentionSearch,
+  openScmdraft,
+  pickScmdraftPath,
   projectExportE3s,
   workspaceList,
   workspaceRead,
@@ -61,6 +68,40 @@ afterEach(() => {
   vi.useRealTimers();
 });
 
+describe("project refresh invalidation", () => {
+  it("never publishes an old source list after a same-name project switch", async () => {
+    const { invoke, listen } = makeHarness();
+    const oldList = deferred<unknown>();
+    const listStarted = deferred<void>();
+    let firstList = true;
+    const newFile = { path: "src/new.eps", ftype: "CUIEps", settable: true };
+    invoke.mockImplementation(async (command: string) => {
+      if (command === "status") return { project: "Same name", compiling: false };
+      if (command === "list") {
+        if (firstList) {
+          firstList = false;
+          listStarted.resolve();
+          return oldList.promise;
+        }
+        return { files: [newFile] };
+      }
+    });
+    const messages: ServerMessage[] = [];
+    const client = new IpcClient({ invoke, listen, onMessage: (message) => messages.push(message) });
+    await client.connect();
+    const stale = client.refresh();
+    await listStarted.promise;
+    client.invalidateProject();
+    await client.refresh();
+    oldList.resolve({ files: [{ path: "src/old.eps", ftype: "CUIEps", settable: true }] });
+    await stale;
+    expect(messages.filter((message) => message.type === "list")).toEqual([
+      { type: "list", files: [newFile] },
+    ]);
+    client.stop();
+  });
+});
+
 describe("send", () => {
   it("sends chat via invoke", async () => {
     const { invoke, listen } = makeHarness();
@@ -101,6 +142,7 @@ describe("send", () => {
       text: "hello",
       attachments: ["image-1"],
       mentions: [mention],
+      executionMode: "interactive",
     });
   });
 
@@ -170,30 +212,6 @@ describe("send", () => {
     });
   });
 
-  it("sends changeset_decision via invoke", async () => {
-    const { invoke, listen } = makeHarness();
-    invoke.mockResolvedValue(undefined);
-    const client = new IpcClient({
-      invoke,
-      listen,
-      onMessage: () => {},
-    });
-    const msg: ClientMessage = {
-      type: "changeset_decision",
-      sessionId: "session-a",
-      decision: "reject",
-      ids: ["a", "b"],
-    };
-
-    await client.send(msg);
-
-    expect(invoke).toHaveBeenCalledWith("changeset_decision", {
-      sessionId: "session-a",
-      decision: "reject",
-      ids: ["a", "b"],
-    });
-  });
-
   it("sends conversation_rewind with the durable log prefix", async () => {
     const { invoke, listen } = makeHarness();
     invoke.mockResolvedValue(undefined);
@@ -219,6 +237,27 @@ describe("send", () => {
       panelLog,
     });
   });
+  it("sends reviewed harness issue ids without legacy fields", async () => {
+    const { invoke, listen } = makeHarness();
+    invoke.mockResolvedValue(undefined);
+    const client = new IpcClient({ invoke, listen, onMessage: () => {} });
+
+    await client.send({
+      type: "setup_import_e3s",
+      sourceE3s: "C:\\Legacy\\sample.e3s",
+      destination: "C:\\Work\\ImportedProject",
+      excludedImportItems: ["workspace-1", "memory-1"],
+    });
+
+    expect(invoke).toHaveBeenCalledWith("setup_import_e3s", {
+      request: {
+        sourceE3s: "C:\\Legacy\\sample.e3s",
+        destination: "C:\\Work\\ImportedProject",
+        excludedImportItems: ["workspace-1", "memory-1"],
+      },
+    });
+  });
+
 });
 
 describe("mention search", () => {
@@ -278,6 +317,33 @@ describe("inbound events", () => {
       sessionId: "session-a",
       kind: "reasoning",
       detail: "checking",
+    });
+  });
+
+  it("dispatches a git turn-boundary commit for the addressed session", async () => {
+    const { invoke, listen, listeners } = makeHarness();
+    invoke.mockResolvedValue(undefined);
+    const received: ServerMessage[] = [];
+    const client = new IpcClient({
+      invoke,
+      listen,
+      onMessage: (message) => received.push(message),
+    });
+
+    await client.connect();
+    listeners.get("git")?.({
+      payload: {
+        sessionId: "session-a",
+        external: { sha: "a".repeat(40), subject: "앱 밖 변경", files: 2 },
+        turn: { sha: "b".repeat(40), subject: "마린 체력 조정", files: 1 },
+      },
+    });
+
+    expect(received).toContainEqual({
+      type: "git",
+      sessionId: "session-a",
+      external: { sha: "a".repeat(40), subject: "앱 밖 변경", files: 2 },
+      turn: { sha: "b".repeat(40), subject: "마린 체력 조정", files: 1 },
     });
   });
 
@@ -608,6 +674,7 @@ describe("setup commands", () => {
           assetsReady: false,
           defaultProvider: null,
           providers: nullableProviders,
+          projectOpened: false,
           setupRequired: true,
           error: null,
         };
@@ -633,6 +700,7 @@ describe("setup commands", () => {
       assetsReady: false,
       defaultProvider: null,
       providers: nullableProviders,
+      projectOpened: false,
       setupRequired: true,
       error: null,
     });
@@ -649,6 +717,7 @@ describe("setup commands", () => {
           euddraftValid: false,
           assetsReady: false,
           providers: setupProviders,
+          projectOpened: false,
           setupRequired: true,
           error: "invalid_project_folder",
         };
@@ -672,14 +741,13 @@ describe("setup commands", () => {
       euddraftValid: false,
       assetsReady: false,
       providers: setupProviders,
+      projectOpened: false,
       setupRequired: true,
       error: "invalid_project_folder",
     });
   });
 
-  it.each(["setup_create_project", "setup_import_e3s"] as const)(
-    "dispatches the %s response as a setup message",
-    async (command) => {
+  it("dispatches the project creation response as a setup message", async () => {
       const response = {
         projectPath: "C:\\Projects\\Native",
         projectValid: true,
@@ -688,6 +756,7 @@ describe("setup commands", () => {
         assetsReady: true,
         defaultProvider: "codex",
         providers: setupProviders,
+        projectOpened: true,
         setupRequired: false,
       };
       const { invoke, listen } = makeHarness();
@@ -699,12 +768,13 @@ describe("setup commands", () => {
         onMessage: (message) => received.push(message),
       });
 
-      await client.send({ type: command });
+      await client.send({ type: "setup_create_project" });
 
-      expect(invoke).toHaveBeenCalledWith(command, {});
+      expect(invoke).toHaveBeenCalledWith("setup_create_project", {});
       expect(received).toContainEqual({ type: "setup", ...response });
-    },
-  );
+  });
+
+
 
   it("dispatches the euddraft picker response as a setup message", async () => {
     const { invoke, listen } = makeHarness();
@@ -717,6 +787,7 @@ describe("setup commands", () => {
           euddraftValid: false,
           assetsReady: false,
           providers: setupProviders,
+          projectOpened: false,
           setupRequired: true,
           error: "invalid_euddraft_path",
         };
@@ -741,6 +812,7 @@ describe("setup commands", () => {
       euddraftValid: false,
       assetsReady: false,
       providers: setupProviders,
+      projectOpened: false,
       setupRequired: true,
       error: "invalid_euddraft_path",
     });
@@ -757,6 +829,37 @@ describe("setup commands", () => {
     await expect(projectExportE3s(invoke)).resolves.toBeNull();
     expect(invoke).toHaveBeenNthCalledWith(1, "project_export_e3s");
     expect(invoke).toHaveBeenNthCalledWith(2, "project_export_e3s");
+  });
+
+  it("sends folder selection intent and dispatches latest install snapshots", async () => {
+    const response = {
+      projectPath: "C:\\Projects\\Native",
+      projectValid: true,
+      euddraftPath: "C:\\euddraft\\euddraft.exe",
+      euddraftValid: true,
+      assetsReady: true,
+      providers: setupProviders,
+      projectOpened: false,
+      setupRequired: true,
+    };
+    const { invoke, listen } = makeHarness();
+    invoke.mockResolvedValue(response);
+    const received: ServerMessage[] = [];
+    const client = new IpcClient({
+      invoke,
+      listen,
+      onMessage: (message) => received.push(message),
+    });
+
+    await client.send({ type: "setup_pick_euddraft_path", directory: true });
+    await client.send({ type: "setup_install_euddraft" });
+
+    expect(invoke).toHaveBeenNthCalledWith(1, "setup_pick_euddraft_path", {
+      directory: true,
+    });
+    expect(invoke).toHaveBeenNthCalledWith(2, "setup_install_euddraft", {});
+    expect(received).toHaveLength(2);
+    expect(received[1]).toEqual({ type: "setup", ...response });
   });
 
   it("sends bootstrap_run without expecting a response payload", async () => {
@@ -904,12 +1007,61 @@ describe("App notification settings commands", () => {
   const settings = {
     notifications: {
       planApproval: { sound: true, osNotification: true },
-      changesetReview: { sound: false, osNotification: true },
+      reviewRequired: { sound: true, osNotification: true },
       agentTurnComplete: { sound: true, osNotification: false },
       askResponseRequired: { sound: false, osNotification: true },
     },
     codexLargeContextModels: ["gpt-5.5-codex"],
+    deepPlanning: true,
+    scmdraftPath: String.raw`C:\Tools\ScmDraft 2\ScmDraft 2.exe`,
   };
+
+  it("loads and saves the complete app settings payload", async () => {
+    const invoke = vi.fn().mockResolvedValue(settings);
+
+    await expect(appSettingsGet(invoke)).resolves.toEqual(settings);
+    expect(invoke).toHaveBeenCalledWith("app_settings");
+
+    invoke.mockClear();
+    await expect(appSettingsSave(settings, invoke)).resolves.toEqual(settings);
+    expect(invoke).toHaveBeenCalledWith("app_settings_save", { settings });
+  });
+
+  it("fills a missing SCMDraft path with an empty string and rejects a non-string one", async () => {
+    const { scmdraftPath: _omitted, ...legacy } = settings;
+    await expect(appSettingsGet(vi.fn().mockResolvedValue(legacy))).resolves.toEqual({
+      ...legacy,
+      scmdraftPath: "",
+    });
+    await expect(
+      appSettingsGet(vi.fn().mockResolvedValue({ ...legacy, scmdraftPath: 7 })),
+    ).rejects.toThrow("invalid app settings response");
+  });
+
+  it("reports whether SCMDraft 2 launched or still needs its executable", async () => {
+    const launched = vi.fn().mockResolvedValue({ kind: "launched" });
+    await expect(openScmdraft(launched)).resolves.toEqual({ kind: "launched" });
+    expect(launched).toHaveBeenCalledWith("project_open_scmdraft");
+    await expect(openScmdraft(vi.fn().mockResolvedValue({ kind: "unconfigured" }))).resolves.toEqual({
+      kind: "unconfigured",
+    });
+    await expect(openScmdraft(vi.fn().mockResolvedValue({ kind: "later" }))).rejects.toThrow(
+      "invalid scmdraft launch response",
+    );
+    await expect(openScmdraft(vi.fn().mockResolvedValue(null))).rejects.toThrow(
+      "invalid scmdraft launch response",
+    );
+  });
+
+  it("returns the picked SCMDraft path or null when the picker is cancelled", async () => {
+    const picked = vi.fn().mockResolvedValue(String.raw`C:\Tools\ScmDraft 2\ScmDraft 2.exe`);
+    await expect(pickScmdraftPath(picked)).resolves.toBe(String.raw`C:\Tools\ScmDraft 2\ScmDraft 2.exe`);
+    expect(picked).toHaveBeenCalledWith("settings_pick_scmdraft_path");
+    await expect(pickScmdraftPath(vi.fn().mockResolvedValue(null))).resolves.toBeNull();
+    await expect(pickScmdraftPath(vi.fn().mockResolvedValue(3))).rejects.toThrow(
+      "invalid scmdraft path response",
+    );
+  });
 
   it("loads, checks, and updates the typed euddraft settings contract", async () => {
     const response = {
@@ -930,26 +1082,15 @@ describe("App notification settings commands", () => {
     expect(invoke).toHaveBeenLastCalledWith("euddraft_update");
   });
 
-  it("loads and saves the complete app settings payload", async () => {
-    const invoke = vi.fn().mockResolvedValue(settings);
-
-    await expect(appSettingsGet(invoke)).resolves.toEqual(settings);
-    expect(invoke).toHaveBeenCalledWith("app_settings");
-
-    invoke.mockClear();
-    await expect(appSettingsSave(settings, invoke)).resolves.toEqual(settings);
-    expect(invoke).toHaveBeenCalledWith("app_settings_save", { settings });
-  });
-
   it("rejects malformed notification channel settings", async () => {
     const invoke = vi.fn().mockResolvedValue({
       notifications: {
         planApproval: { sound: true },
-        changesetReview: { sound: true, osNotification: true },
         agentTurnComplete: { sound: true, osNotification: true },
         askResponseRequired: { sound: true, osNotification: true },
       },
       codexLargeContextModels: [],
+      deepPlanning: false,
     });
 
     await expect(appSettingsGet(invoke)).rejects.toThrow(
@@ -967,44 +1108,24 @@ describe("App notification settings commands", () => {
     });
   });
 
-  it("delivers attention events with focus, session, and item-count context", async () => {
+  it("delivers attention events with focus and session context", async () => {
     const invoke = vi.fn().mockResolvedValue(undefined);
 
-    await attentionNotify("planApproval", false, "session-a", undefined, invoke);
+    await attentionNotify("planApproval", false, "session-a", invoke);
     expect(invoke).toHaveBeenCalledWith("attention_notify", {
       kind: "planApproval",
       showOs: false,
       sessionId: "session-a",
     });
 
-    await attentionNotify("changesetReview", true, "session-b", 3, invoke);
-    expect(invoke).toHaveBeenLastCalledWith("attention_notify", {
-      kind: "changesetReview",
-      showOs: true,
-      sessionId: "session-b",
-      itemCount: 3,
-    });
-
-    await attentionNotify(
-      "agentTurnComplete",
-      true,
-      "session-a",
-      undefined,
-      invoke,
-    );
+    await attentionNotify("agentTurnComplete", true, "session-a", invoke);
     expect(invoke).toHaveBeenLastCalledWith("attention_notify", {
       kind: "agentTurnComplete",
       showOs: true,
       sessionId: "session-a",
     });
 
-    await attentionNotify(
-      "askResponseRequired",
-      false,
-      "session-b",
-      undefined,
-      invoke,
-    );
+    await attentionNotify("askResponseRequired", false, "session-b", invoke);
     expect(invoke).toHaveBeenLastCalledWith("attention_notify", {
       kind: "askResponseRequired",
       showOs: false,
@@ -1028,7 +1149,7 @@ describe("Workspace commands", () => {
   const workspace = {
     project: "Example",
     workspaceId: "a".repeat(64),
-    files: [{ path: "specs/game.md", source: false, size: 12 }],
+    files: [{ path: "specs/game.md", size: 12 }],
   };
 
   it("lists the current project workspace", async () => {
@@ -1037,21 +1158,44 @@ describe("Workspace commands", () => {
     expect(invoke).toHaveBeenCalledWith("workspace_list");
   });
 
-  it("reads a confined workspace file by id and relative path", async () => {
+  it("reads a confined project file by id and project-relative path", async () => {
     const response = {
       workspaceId: workspace.workspaceId,
-      path: "specs/game.md",
-      source: false,
+      path: "src/main.eps",
+      size: 6,
       content: "# Game",
     };
     const invoke = vi.fn().mockResolvedValue(response);
     await expect(
-      workspaceRead(workspace.workspaceId, "specs/game.md", invoke),
+      workspaceRead(workspace.workspaceId, "src/main.eps", invoke),
     ).resolves.toEqual(response);
     expect(invoke).toHaveBeenCalledWith("workspace_read", {
       workspaceId: workspace.workspaceId,
-      path: "specs/game.md",
+      path: "src/main.eps",
     });
+  });
+
+  it("accepts a closed binary/oversized file and rejects an inconsistent read", async () => {
+    const binary = {
+      workspaceId: workspace.workspaceId,
+      path: "maps/source.scx",
+      size: 2048,
+      content: null,
+      unreadable: "binary",
+    };
+    await expect(
+      workspaceRead(workspace.workspaceId, "maps/source.scx", vi.fn().mockResolvedValue(binary)),
+    ).resolves.toEqual(binary);
+    for (const broken of [
+      { ...binary, unreadable: undefined },
+      { ...binary, content: "x" },
+      { ...binary, unreadable: "encrypted" },
+      { ...binary, size: "2048" },
+    ]) {
+      await expect(
+        workspaceRead(workspace.workspaceId, "maps/source.scx", vi.fn().mockResolvedValue(broken)),
+      ).rejects.toThrow("invalid workspace read response");
+    }
   });
 
   it("searches workspace filenames and text content through one command", async () => {
@@ -1074,10 +1218,113 @@ describe("Workspace commands", () => {
   it("rejects malformed file entries", async () => {
     const invoke = vi.fn().mockResolvedValue({
       ...workspace,
-      files: [{ path: "source/main.eps", source: "yes", size: 1 }],
+      files: [{ path: "specs/game.md", size: "twelve" }],
     });
     await expect(workspaceList(invoke)).rejects.toThrow(
       "invalid workspace file entry",
     );
+  });
+});
+
+describe("project history commands", () => {
+  it("normalizes the repository state, including a missing origin", async () => {
+    const invoke = vi.fn().mockResolvedValue({
+      available: true,
+      tracked: true,
+      nested: false,
+      origin: null,
+      consent: "pending",
+      warning: null,
+    });
+
+    await expect(gitState(invoke)).resolves.toEqual({
+      available: true,
+      tracked: true,
+      nested: false,
+      origin: null,
+      consent: "pending",
+      warning: null,
+    });
+    expect(invoke).toHaveBeenCalledWith("git_state");
+  });
+
+  it("rejects a repository state with an unknown consent value", async () => {
+    const invoke = vi.fn().mockResolvedValue({
+      available: true,
+      tracked: true,
+      nested: false,
+      origin: "app",
+      consent: "maybe",
+    });
+
+    await expect(gitState(invoke)).rejects.toThrow("invalid git state response");
+  });
+
+  it("records consent and returns the updated state", async () => {
+    const invoke = vi.fn().mockResolvedValue({
+      available: true,
+      tracked: true,
+      nested: false,
+      origin: "preexisting",
+      consent: "granted",
+      warning: null,
+    });
+
+    await expect(gitConsentSet(true, invoke)).resolves.toMatchObject({
+      consent: "granted",
+      origin: "preexisting",
+    });
+    expect(invoke).toHaveBeenCalledWith("git_consent_set", { granted: true });
+  });
+
+  it("reads the log, a commit detail, and a revert", async () => {
+    const invoke = vi.fn().mockImplementation(async (command: string) => {
+      if (command === "git_log") {
+        return [{ sha: "a".repeat(40), subject: "첫 변경", timestamp: 1_700_000_000 }];
+      }
+      if (command === "git_commit_detail") {
+        return {
+          sha: "a".repeat(40),
+          subject: "첫 변경",
+          body: ["session: s-1", "request: r-1"].join("\n"),
+          timestamp: 1_700_000_000,
+          files: [
+            {
+              path: "src/main.eps",
+              insertions: 2,
+              deletions: 1,
+              binary: false,
+              patch: ["@@ -1 +1 @@", "-old", "+new"].join("\n"),
+            },
+            {
+              path: "maps/source.scx",
+              insertions: 0,
+              deletions: 0,
+              binary: true,
+              omitted: "바이너리 파일이라 내용 비교를 표시하지 않습니다.",
+            },
+          ],
+        };
+      }
+      return { sha: "c".repeat(40), subject: 'Revert "첫 변경"', files: 1 };
+    });
+
+    await expect(gitLog(10, invoke)).resolves.toEqual([
+      { sha: "a".repeat(40), subject: "첫 변경", timestamp: 1_700_000_000 },
+    ]);
+    expect(invoke).toHaveBeenLastCalledWith("git_log", { limit: 10 });
+
+    const detail = await gitCommitDetail("a".repeat(40), invoke);
+    expect(detail.files[0]?.patch).toContain("+new");
+    // An omitted patch stays absent rather than becoming an empty diff.
+    expect(detail.files[1]?.patch).toBeUndefined();
+    expect(detail.files[1]?.omitted).toContain("바이너리");
+
+    await expect(gitRevert("a".repeat(40), invoke)).resolves.toEqual({
+      sha: "c".repeat(40),
+      subject: 'Revert "첫 변경"',
+      files: 1,
+    });
+    expect(invoke).toHaveBeenLastCalledWith("git_revert", { sha: "a".repeat(40) });
   });
 });

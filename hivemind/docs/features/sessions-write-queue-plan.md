@@ -198,72 +198,66 @@ enum WorkspaceAccess {
 - Both modes retain minimal runtime reads, disabled network access, and exact-root elevated Windows sandbox requirements.
 - Transitioning to write mode respawns the app-server when necessary, retains the thread ID, and resumes the same conversation.
 
-A direct small edit requests the lease through a new flow tool:
+A direct mutation call requests write admission implicitly:
 
 ```text
-request_write_lane(reason)
+file_edit(...) / dat_patch(...) / another mutating tool
 ```
 
-This tool:
-
-- is not a mutation and consumes no mutation budget;
-- ends/parks the current read turn like `propose_plan` ends a planning turn;
-- records write intent without holding the MCP request open;
-- causes the manager to resume the same thread automatically in write mode after grant;
-- is mechanically required before any mutating tool in read mode.
-
-If Codex attempts a mutating tool without a lease, the runtime returns a stable `WriteLeaseRequired` error directing it to `request_write_lane`. Native writes are independently denied by the read-only sandbox.
+The read-run gate validates the completed call shape, registers write intent without executing
+the mutation, ends/parks the current turn, and causes the manager to resume the same conversation
+in write mode. The resumed agent must re-read the target and issue a fresh mutation so arguments
+captured before the latest session snapshot are never replayed automatically. No model-facing
+write-intent tool is exposed.
 
 `plan_approve` does not require a model tool round trip. The backend submits a write ticket directly, persists the exact approved plan only after grant and before the execution baseline, switches the worker to write mode, and resumes approved-plan execution.
 
 ### Session workspaces
 
-Concurrent turns require stable source snapshots and isolated native filesystem changes. Keep the existing canonical project workspace as the accepted, panel-visible state and add session working roots outside it:
+(Updated by the project-root cwd cutover, which supersedes the session-mirror model
+below its original form.) Concurrent turns share one canonical project tree; the CLI cwd
+is the native project root and there are no per-session document copies or `source/`
+mirrors:
 
 ```text
-%appdata%\eud-agent\workspaces\<project-id>\
-    specs\
-    plans\
-    decisions\
-    worklog\
-    source\
+<project>\                              ← CLI cwd (project.eap, src\, dat\, maps\, build\, compat\)
+    .eud-agent\workspace\
+        specs\  plans\  decisions\  worklog\
+        .tmp\<session-id>\              ← only filesystem write area, per session
+    .eud-agent\state\workspace.json
 
-%appdata%\eud-agent\workspaces\.sessions\<project-id>\<session-id>\
-    specs\
-    plans\
-    decisions\
-    worklog\
-    source\
-
-%appdata%\eud-agent\workspaces\.state\
+%appdata%\eud-agent\workspaces\.state\baselines\<request-id>\<workspace-id>\
+    documents\                          ← canonical document baseline
+    source\                             ← canonical src/ baseline (no src/ prefix)
 ```
 
-The canonical root remains compatible with existing data and continues to drive the panel workspace explorer.
+The project-local canonical root drives the panel workspace explorer. Unambiguously
+associated legacy AppData documents/approvals are copied once without changing originals.
+Accepted metadata stays in the project's `state/`; AppData `.state` retains runtime
+baselines and legacy migration sources. The legacy `.sessions/` tree is discarded at boot.
 
 Before a read turn:
 
-1. delta-sync accepted canonical documents into the session root;
-2. refresh a coherent session-owned `source/` snapshot;
-3. run Codex with the session root read-only.
+1. prepare the project root as cwd (no copies, no sync);
+2. run the CLI with the read profile: whole root read-only.
 
 Before a granted write continuation:
 
-1. rebase the session root from the latest accepted canonical documents;
-2. refresh its coherent source snapshot;
-3. instruct Codex to re-read mutation targets because project state may have changed while it waited;
-4. capture the trusted baseline;
-5. enable write mode.
+1. instruct the CLI to re-read mutation targets because project state may have changed while it waited;
+2. capture the trusted documents+source baseline outside the cwd;
+3. enable the write profile: root read-only plus `.eud-agent/workspace/.tmp/**` writable.
 
 At review:
 
 - live editor/map mutations have already been journaled and remain protected by the held lease;
-- native workspace changes remain in the session root;
+- document changes were staged directly against the canonical tree and journaled with exact before/after bytes;
 - workspace changes are rendered against the trusted baseline;
-- accepting a workspace item promotes it to the canonical root under the lease;
-- rejecting it restores/discards the session copy without modifying accepted canonical content;
+- accepting a workspace item runs the 3-way merge against current canonical bytes under the lease;
+- rejecting it restores the exact journaled canonical bytes without modifying other accepted content;
 - the exact app-owned approved plan remains canonical and survives implementation rejection.
 
-Synchronization must be delta-based using existing baseline/hash information; do not blindly recopy unchanged documents. Session roots with no pending review may be refreshed or reclaimed after the thread ID and panel log are safely persisted.
+Concurrency comes from the write lease and the optimistic source baseline, not from
+per-session copies; read turns never write.
 
 ## Implementation Phases
 
@@ -334,7 +328,7 @@ Target files:
 
 Implement the coordinator and wire every project-scoped mutation through it:
 
-- register direct write intent through `request_write_lane`;
+- register direct write intent automatically when the read-run gate sees the first mutation;
 - submit approved-plan execution directly from `plan_approve`;
 - reject all mutating MCP tools without ownership;
 - require ownership for `build_run`, project memory writes, map writes, and writable workspace mode;
@@ -419,7 +413,7 @@ Add deterministic barrier-based tests for:
 
 1. Session A remains in `run_turn` while session B enters and completes a read-only turn.
 2. Interleaved A/B progress, tool, answer, plan, and error events carry the correct immutable session IDs.
-3. A and B keep independent request IDs, evidence flags, mutation counts, build budgets, pending plans, and preflight suppression state.
+3. A and B keep independent request IDs, evidence flags, mutation counts, build progress, and pending plans.
 4. A owns the write lease while B continues read tools.
 5. B reaches `waiting_write` and cannot invoke any mutation while A owns or reviews.
 6. FIFO queue order is based on write-intent arrival.

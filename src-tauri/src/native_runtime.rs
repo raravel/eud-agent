@@ -17,7 +17,7 @@ use crate::config::DataDirs;
 use crate::journal::{JournalEntry, JournalStore, JournalTarget, Snapshot, WriteTool};
 use crate::native_build::{
     probe_frozen_python, run_native_build_with_python_and_cancellation, DatCatalog, EuddraftLaunch,
-    FrozenPythonIdentity, NativeBuildResult,
+    FrozenPythonIdentity, NativeBuildArtifacts, NativeBuildError, NativeBuildResult,
 };
 use crate::native_project::{
     compute_python_lock_digest, discover_manifest_files, validate_python_dependencies,
@@ -648,7 +648,20 @@ impl NativeProjectManager {
             }
             return Err(error);
         }
+        self.prepare_git(project);
         Ok(())
+    }
+
+    /// Give the opened project the repository that the app rolls back with.
+    ///
+    /// A git problem never fails an open: the project's authoring state is on
+    /// disk either way, and refusing to open it would cost the user more than
+    /// the missing history does.
+    fn prepare_git(&self, project: &NativeProject) {
+        let state = crate::git::prepare(project.root());
+        if let Some(warning) = state.warning.as_deref() {
+            eprintln!("eud-agent: {warning}");
+        }
     }
 
     fn archive_legacy_migration(
@@ -755,6 +768,143 @@ impl NativeProjectManager {
         self.open()?.read_source(path)
     }
 
+    /// Render the `[project map]` prompt section: MainFile, ordered Python
+    /// entrypoints, every `src/**` file with its byte length and first
+    /// meaningful line, plugin sections, sparse DAT override counts, and the
+    /// accepted spec index. It is hashed by the context cursor, so it costs a
+    /// turn only when something in it changes.
+    pub fn render_project_map(&self) -> Result<String, String> {
+        const MAX_SPEC_INDEX_BYTES: usize = 8 * 1024;
+        const MAX_FILES: usize = 400;
+        let project = self.open()?;
+        let manifest = project.manifest();
+        let snapshot = project.source_snapshot()?;
+        let mut out = format!(
+            "[project map]
+mainFile={}
+sourceMap={}
+revision={}
+",
+            manifest.main_file, manifest.source_map, snapshot.revision
+        );
+        if !manifest.python_entrypoints.is_empty() {
+            out.push_str(&format!(
+                "pythonEntrypoints={}
+",
+                manifest.python_entrypoints.join(", ")
+            ));
+        }
+        out.push_str(&format!(
+            "files ({}):
+",
+            snapshot.files.len()
+        ));
+        for file in snapshot.files.iter().take(MAX_FILES) {
+            let first_line = file
+                .content
+                .lines()
+                .map(str::trim)
+                .find(|line| !line.is_empty())
+                .unwrap_or_default();
+            let first_line = first_line.chars().take(96).collect::<String>();
+            out.push_str(&format!(
+                "- {} ({} bytes) {}
+",
+                file.path,
+                file.content.len(),
+                first_line
+            ));
+        }
+        if snapshot.files.len() > MAX_FILES {
+            out.push_str(&format!(
+                "- … {} more files
+",
+                snapshot.files.len() - MAX_FILES
+            ));
+        }
+        if !manifest.plugins.is_empty() {
+            out.push_str(&format!(
+                "plugins: {}
+",
+                manifest
+                    .plugins
+                    .iter()
+                    .map(|plugin| plugin.section.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        let dat = project.dat();
+        let numeric = |tables: &crate::native_project::NumericTables| -> usize {
+            tables
+                .values()
+                .map(|objects| objects.values().map(|fields| fields.len()).sum::<usize>())
+                .sum()
+        };
+        let overrides = [
+            ("standard", numeric(&dat.standard.tables)),
+            ("xdat", numeric(&dat.xdat.tables)),
+            ("tbl", dat.tbl.values.len()),
+            (
+                "requirements",
+                dat.requirements
+                    .tables
+                    .values()
+                    .map(|objects| objects.len())
+                    .sum::<usize>(),
+            ),
+            ("buttons", dat.buttons.values.len()),
+        ];
+        out.push_str(&format!(
+            "dat overrides: {}
+",
+            overrides
+                .iter()
+                .map(|(family, count)| format!("{family}={count}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+        let workspace_root = project.root().join(".eud-agent").join("workspace");
+        if let Ok(index) = std::fs::read_to_string(workspace_root.join("specs").join("index.md")) {
+            let mut index = index.trim().to_string();
+            if index.len() > MAX_SPEC_INDEX_BYTES {
+                let mut cut = MAX_SPEC_INDEX_BYTES;
+                while !index.is_char_boundary(cut) {
+                    cut -= 1;
+                }
+                index.truncate(cut);
+                index.push_str(
+                    "
+…",
+                );
+            }
+            if !index.is_empty() {
+                out.push_str(&format!(
+                    "specs/index.md:
+{index}
+"
+                ));
+            }
+        }
+        if let Ok(entries) = std::fs::read_dir(workspace_root.join("worklog")) {
+            let mut worklogs = entries
+                .filter_map(Result::ok)
+                .filter_map(|entry| entry.file_name().into_string().ok())
+                .filter(|name| name.ends_with(".md"))
+                .collect::<Vec<_>>();
+            worklogs.sort();
+            if !worklogs.is_empty() {
+                let recent = worklogs.iter().rev().take(10).cloned().collect::<Vec<_>>();
+                out.push_str(&format!(
+                    "worklog: {}
+",
+                    recent.join(", ")
+                ));
+            }
+        }
+        Ok(out)
+    }
+
     pub fn write_source(&self, path: &str, content: &str) -> Result<(), String> {
         let _transaction = self.transaction.lock();
         self.open()?.write_source(path, content)
@@ -810,6 +960,56 @@ impl NativeProjectManager {
         self.open()?.plugin_move(from, to)
     }
 
+    /// What the build refuses before euddraft starts.
+    ///
+    /// The tool schemas used to be the only gate on these rules. An edit made
+    /// straight to the project tree goes around them, so the build checks them
+    /// again at the boundary where it still costs nothing to say no.
+    ///
+    /// `NativeProject::open` has already validated the manifest, the path
+    /// rules, and that MainFile and the source map exist; what is left is what
+    /// opening cannot see.
+    fn build_preflight(&self, project: &NativeProject) -> Result<Vec<NativeBuildError>, String> {
+        let mut refusals = Vec::new();
+        let catalog = DatCatalog::load(&self.dirs.native_assets_dir())?;
+        for entry in project.dat_overrides() {
+            match baseline_value(&catalog, &entry.target) {
+                Ok(stock) if stock == entry.before => {}
+                Ok(stock) => refusals.push(preflight_error(
+                    entry.file,
+                    format!(
+                        "{}의 before가 원본 값과 다릅니다 (원본 {}, 기록된 before {}). 생성기는 after - before를 런타임 델타로 내보내므로 이대로 빌드하면 맵이 잘못된 값으로 돕니다. before를 원본 값으로 고치거나 이 override를 지우세요.",
+                        entry.label,
+                        scalar_text(&stock),
+                        scalar_text(&entry.before)
+                    ),
+                )),
+                Err(reason) => refusals.push(preflight_error(
+                    entry.file,
+                    format!("{}를 원본 카탈로그에서 찾을 수 없습니다: {reason}", entry.label),
+                )),
+            }
+        }
+        for path in project.list_source_files()? {
+            if !Path::new(&path)
+                .extension()
+                .and_then(|value| value.to_str())
+                .is_some_and(|value| {
+                    value.eq_ignore_ascii_case("eps") || value.eq_ignore_ascii_case("py")
+                })
+            {
+                continue;
+            }
+            if let Err(reason) = crate::native_project::require_editable_source_path(&path) {
+                refusals.push(preflight_error(
+                    path.clone(),
+                    format!("이 소스 파일은 프로젝트가 쓸 수 없는 이름입니다: {reason}"),
+                ));
+            }
+        }
+        Ok(refusals)
+    }
+
     pub fn dat_values(
         &self,
         targets: &[DatTarget],
@@ -825,6 +1025,16 @@ impl NativeProjectManager {
             values.insert(target.clone(), value);
         }
         Ok(values)
+    }
+
+    /// The inclusive object-id range one DAT field covers in the version-matched
+    /// catalog. A caller that has to sweep a whole table (which images use an
+    /// iscript, say) takes the range from the catalog instead of hardcoding a
+    /// table size that the compatibility assets own.
+    pub fn dat_field_range(&self, dat: &str, field: &str) -> Result<(u32, u32), String> {
+        let catalog = DatCatalog::load(&self.dirs.native_assets_dir())?;
+        let meta = catalog.field(dat, field)?;
+        Ok((meta.var_start, meta.var_end))
     }
 
     pub fn apply_dat_patch(&self, patch: &NativeDatPatch) -> Result<String, String> {
@@ -909,10 +1119,54 @@ impl NativeProjectManager {
         if !cfg!(windows) {
             return Err("Python 의존성 준비는 현재 Windows에서만 지원됩니다.".to_string());
         }
+        let euddraft = self.frozen_euddraft()?;
+        let current_euddraft_fingerprint = euddraft.frozen_fingerprint()?;
+        {
+            let mut candidates = self.python_candidates.lock();
+            let now = unix_millis();
+            candidates.retain(|_, candidate| candidate.expires_at >= now);
+            if let Some((token, candidate)) = candidates.iter().find(|(_, candidate)| {
+                candidate.session_id == session_id
+                    && candidate.project_id == project_id
+                    && candidate.project_root == project_root
+                    && candidate.base_revision == base_revision
+                    && candidate.manifest_sha256 == manifest_sha256
+                    && candidate.input_digest == input_digest
+                    && candidate.euddraft_fingerprint == current_euddraft_fingerprint
+            }) {
+                let resolved_packages = candidate
+                    .python_lock
+                    .as_ref()
+                    .map(|lock| {
+                        lock.packages
+                            .iter()
+                            .map(|package| PythonResolvedPackageSummary {
+                                name: package.name.clone(),
+                                version: package.version.clone(),
+                                wheel_filename: package.wheel_filename.clone(),
+                                sha256: package.sha256.clone(),
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let result = PythonDependenciesPrepareResult {
+                    candidate_token: token.clone(),
+                    normalized_dependencies: candidate.dependencies.clone(),
+                    resolved_packages,
+                    lock_digest: candidate.lock_digest.clone(),
+                    input_digest: candidate.input_digest.clone(),
+                    cache_identity: candidate.cache_identity.clone(),
+                    base_revision: candidate.base_revision.clone(),
+                    manifest_sha256: candidate.manifest_sha256.clone(),
+                    euddraft_fingerprint: candidate.euddraft_fingerprint.clone(),
+                    expires_at: candidate.expires_at,
+                };
+                return Ok(result);
+            }
+        }
         let uv = crate::bootstrap::managed_uv_path(&self.dirs).map_err(|error| {
             format!("검증된 관리형 uv {MANAGED_UV_VERSION}을 찾지 못했습니다: {error}")
         })?;
-        let euddraft = self.frozen_euddraft()?;
         let project_env_root = self.dirs.python_envs_dir().join(&cache_key);
         ensure_plain_directory_path(&self.dirs.python_envs_dir(), &project_env_root)?;
 
@@ -1464,6 +1718,10 @@ impl NativeProjectManager {
         }
         let _transaction = self.transaction.lock();
         let project = self.open()?;
+        let refusals = self.build_preflight(&project)?;
+        if !refusals.is_empty() {
+            return Ok(preflight_refusal(refusals));
+        }
         let cache_key =
             python_project_cache_key(&fs::canonicalize(project.root()).map_err(stringify_io)?);
         let marker = project.root().join("build/.building");
@@ -2303,7 +2561,45 @@ impl Drop for BuildMarker {
     }
 }
 
-fn baseline_value(catalog: &DatCatalog, target: &DatTarget) -> Result<DatScalar, String> {
+/// A build that never started, carrying only why it was refused. It is a build
+/// failure and not a tool error so the model reads it the way it reads a
+/// compiler error, and so a repeated identical refusal counts as no progress.
+fn preflight_refusal(errors: Vec<NativeBuildError>) -> NativeBuildResult {
+    NativeBuildResult {
+        ok: false,
+        errors,
+        warnings: Vec::new(),
+        raw_status: 0,
+        stdout: String::new(),
+        stderr: String::new(),
+        log_path: String::new(),
+        artifacts: NativeBuildArtifacts::default(),
+    }
+}
+
+fn preflight_error(file: impl Into<String>, message: String) -> NativeBuildError {
+    let file = file.into();
+    NativeBuildError {
+        source: "preflight".to_string(),
+        raw: format!("{file}: {message}"),
+        file,
+        line: 0,
+        message,
+        count: 1,
+    }
+}
+
+fn scalar_text(value: &DatScalar) -> String {
+    match value {
+        DatScalar::Number(number) => number.to_string(),
+        DatScalar::Text(text) => format!("\"{text}\""),
+    }
+}
+
+pub(crate) fn baseline_value(
+    catalog: &DatCatalog,
+    target: &DatTarget,
+) -> Result<DatScalar, String> {
     match target {
         DatTarget::Dat {
             dat,
@@ -2388,6 +2684,111 @@ mod tests {
         (base, manager)
     }
 
+    /// Free CRUD lets a model edit `dat/*.json` without passing `dat_patch`.
+    /// The generator emits `after - before` as a runtime delta, so a wrong
+    /// `before` would not fail anything — it would silently run the map on the
+    /// wrong numbers. The build has to be the one that says no.
+    #[test]
+    fn a_hand_edited_dat_override_with_a_wrong_before_fails_the_build() {
+        let (base, manager) = manager("preflight-dat");
+        manager
+            .apply_dat_patch(&NativeDatPatch {
+                changes: vec![NativeDatChange::Dat {
+                    dat: "units".to_string(),
+                    object_id: 15,
+                    field: "Hit Points".to_string(),
+                    before: 10240,
+                    after: 20480,
+                }],
+            })
+            .unwrap();
+        let document = manager.project_root().unwrap().join("dat/standard.json");
+        let text = fs::read_to_string(&document).unwrap();
+        fs::write(&document, text.replace("10240", "1")).unwrap();
+
+        let result = manager.build("project").unwrap();
+
+        assert!(!result.ok);
+        let error = result
+            .errors
+            .iter()
+            .find(|error| error.file == "dat/standard.json")
+            .unwrap_or_else(|| panic!("a preflight error names the document: {:?}", result.errors));
+        assert_eq!(error.source, "preflight");
+        assert!(error.message.contains("before"), "{}", error.message);
+        // The stock value and the claimed one are both named, so the model can
+        // repair the file without another read.
+        assert!(error.message.contains("10240"), "{}", error.message);
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn a_source_file_the_project_cannot_use_fails_the_build_instead_of_being_skipped() {
+        let (base, manager) = manager("preflight-source");
+        let root = manager.project_root().unwrap();
+        // `[`/`]` cannot appear in an EDS section header, so every source
+        // listing silently drops this file. Silence is the wrong answer once
+        // the model can create it directly.
+        fs::write(root.join("src/bad[1].eps"), "const a = 1;").unwrap();
+
+        let result = manager.build("project").unwrap();
+
+        assert!(!result.ok);
+        let error = result
+            .errors
+            .iter()
+            .find(|error| error.file.contains("bad[1].eps"))
+            .unwrap_or_else(|| panic!("a preflight error names the file: {:?}", result.errors));
+        assert_eq!(error.source, "preflight");
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn a_correct_project_passes_the_preflight_and_reaches_the_compiler() {
+        let (base, manager) = manager("preflight-clean");
+        manager
+            .apply_dat_patch(&NativeDatPatch {
+                changes: vec![NativeDatChange::Dat {
+                    dat: "units".to_string(),
+                    object_id: 15,
+                    field: "Hit Points".to_string(),
+                    before: 10240,
+                    after: 20480,
+                }],
+            })
+            .unwrap();
+
+        // No euddraft is configured in a test, so reaching that refusal is what
+        // proves the preflight let the build through.
+        let error = manager.build("project").unwrap_err();
+
+        assert_eq!(error, EUDDRAFT_NOT_CONFIGURED);
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn opening_a_project_gives_it_the_repository_the_app_rolls_back_with() {
+        if !crate::git::available() {
+            eprintln!("skipping: git is not installed on this machine");
+            return;
+        }
+        let (base, manager) = manager("git-prepare");
+        let root = manager.project_root().unwrap();
+
+        // Activation prepared the repository, so a turn boundary may commit.
+        assert!(crate::git::auto_commit_ready(&root));
+        assert!(root.join(".gitignore").is_file());
+        assert_eq!(crate::git::log(&root, 10).unwrap().len(), 1);
+
+        // Everything written after the open is work a boundary still records.
+        let record = crate::git::commit_turn(&root, "초기 소스")
+            .unwrap()
+            .expect("a commit");
+        assert!(record.files >= 1);
+        assert!(crate::git::dirty_paths(&root).unwrap().is_empty());
+        fs::remove_dir_all(base).ok();
+    }
+
     #[test]
     fn native_harness_migration_is_local_portable_and_never_replays_old_data() {
         use sha2::{Digest, Sha256};
@@ -2431,8 +2832,12 @@ mod tests {
         let workspaces = crate::workspace::WorkspaceManager::new(dirs.clone());
         let prepared = workspaces.prepare_current().unwrap();
         assert_eq!(
-            workspaces.read_file(&prepared.id, "specs/kept.md").unwrap(),
-            "승인된 동작"
+            workspaces
+                .read_file(&prepared.id, ".eud-agent/workspace/specs/kept.md")
+                .unwrap()
+                .content
+                .as_deref(),
+            Some("승인된 동작")
         );
         let memory = crate::memory::ProjectMemory::current(dirs).unwrap();
         assert_eq!(memory.read("resources"), "Switch 9 = phase");
@@ -2449,8 +2854,12 @@ mod tests {
         let moved = workspaces.prepare_current().unwrap();
         assert_eq!(moved.id, prepared.id);
         assert_eq!(
-            workspaces.read_file(&moved.id, "specs/kept.md").unwrap(),
-            "승인된 동작"
+            workspaces
+                .read_file(&moved.id, ".eud-agent/workspace/specs/kept.md")
+                .unwrap()
+                .content
+                .as_deref(),
+            Some("승인된 동작")
         );
         let moved_memory = crate::memory::ProjectMemory::current(dirs).unwrap();
         assert_eq!(moved_memory.read("resources"), "Switch 9 = phase");
@@ -2569,6 +2978,11 @@ mod tests {
         assert_eq!(prepared.normalized_dependencies, vec!["six==1.17.0"]);
         assert_eq!(prepared.lock_digest, concurrent.lock_digest);
         assert_eq!(prepared.cache_identity, concurrent.cache_identity);
+        assert_eq!(
+            prepared.candidate_token, concurrent.candidate_token,
+            "identical normalized dependency input must reuse the active prepared candidate"
+        );
+        assert_eq!(prepared.input_digest, concurrent.input_digest);
         let cache_key = python_project_cache_key(&fs::canonicalize(&root).unwrap());
         let completed = fs::read_dir(manager.data_dirs().python_envs_dir().join(&cache_key))
             .unwrap()
@@ -2599,6 +3013,10 @@ mod tests {
                 vec!["six==1.17.0".to_string()],
             )
             .unwrap();
+        assert_ne!(
+            prepared.candidate_token, concurrent.candidate_token,
+            "a changed project revision must not reuse a stale candidate"
+        );
         let claimed = manager
             .claim_python_dependencies(
                 &prepared.candidate_token,
@@ -2945,6 +3363,7 @@ wheels = [{ url = "https://packages.example/demo-1.0-py3-none-any.whl", hashes =
         assert!(parse_pylock(alternate).unwrap_err().contains("PyPI"));
 
         let sdist_only = r#"
+
 lock-version = "1.0"
 [[packages]]
 name = "demo"
@@ -2952,6 +3371,33 @@ version = "1.0"
 sdist = { url = "https://files.pythonhosted.org/packages/demo-1.0.tar.gz", hashes = { sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" } }
 "#;
         assert!(parse_pylock(sdist_only).unwrap_err().contains("wheel"));
+    }
+    #[test]
+    fn dependency_input_digest_covers_the_complete_normalized_set() {
+        let a = validate_python_dependencies(&[
+            "Requests==2.32.0".to_string(),
+            "typing_extensions==4.12.2".to_string(),
+        ])
+        .unwrap();
+        let same = validate_python_dependencies(&[
+            "requests==2.32.0".to_string(),
+            "typing-extensions==4.12.2".to_string(),
+        ])
+        .unwrap();
+        let different = validate_python_dependencies(&[
+            "requests==2.32.1".to_string(),
+            "typing-extensions==4.12.2".to_string(),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            python_input_digest(&a).unwrap(),
+            python_input_digest(&same).unwrap()
+        );
+        assert_ne!(
+            python_input_digest(&a).unwrap(),
+            python_input_digest(&different).unwrap()
+        );
     }
 
     #[test]

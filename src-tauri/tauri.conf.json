@@ -6,8 +6,8 @@
   "build": {
     "frontendDist": "../panel/dist",
     "devUrl": "http://localhost:6173",
-    "beforeDevCommand": "npm run dev",
-    "beforeBuildCommand": "npm run build"
+    "beforeDevCommand": { "script": "npm run dev", "cwd": "../panel" },
+    "beforeBuildCommand": { "script": "npm run build", "cwd": "../panel" }
   },
   "app": {
     "windows": [
@@ -34,7 +34,8 @@
       "resources/eud-editor-compat": "native/eud-editor-compat",
       "../vendor/ffmpeg/manifest.json": "vendor/ffmpeg/manifest.json",
       "../vendor/ffmpeg/LICENSE.txt": "vendor/ffmpeg/LICENSE.txt",
-      "icons/128x128.png": "icons/notification.png"
+      "icons/128x128.png": "icons/notification.png",
+      "icons/project.ico": "icons/project.ico"
     },
     "icon": [
       "icons/32x32.png",

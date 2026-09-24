@@ -40,7 +40,17 @@ impl ProviderRuntime {
                         "이전 네이티브 실행의 완료를 확인할 수 없습니다. 대화를 초기화한 뒤 다시 요청해 주세요.".into(),
                     ));
                 }
-                NativeRunReceiptState::Completed => completed.push(receipt),
+                // An interrupted run did not finish its turn, but the session it
+                // named stays resumable: continue from it instead of refusing the
+                // conversation. Without a candidate it is no better than unknown.
+                NativeRunReceiptState::Interrupted if receipt.candidate_native_id.is_none() => {
+                    return Err(ProviderRuntimeError::Protocol(
+                        "이전 네이티브 실행의 완료를 확인할 수 없습니다. 대화를 초기화한 뒤 다시 요청해 주세요.".into(),
+                    ));
+                }
+                NativeRunReceiptState::Completed | NativeRunReceiptState::Interrupted => {
+                    completed.push(receipt);
+                }
                 NativeRunReceiptState::Cleared => {}
             }
         }
@@ -57,7 +67,11 @@ impl ProviderRuntime {
                 ));
             };
             let receipt = completed.remove(index);
-            if Some(receipt.identity.request_id.as_str()) == request_id {
+            // Re-running a settled request would replay it; resuming the request
+            // an interruption cut short is exactly what the next run is for.
+            if receipt.state == NativeRunReceiptState::Completed
+                && Some(receipt.identity.request_id.as_str()) == request_id
+            {
                 return Err(ProviderRuntimeError::Protocol(
                     "이미 완료된 요청의 저장 복구가 필요합니다. 같은 요청을 자동으로 재실행할 수 없습니다.".into(),
                 ));

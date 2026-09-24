@@ -4,6 +4,13 @@
 //! request-owned epScript plugin, builds into the user's StarCraft Maps folder,
 //! launches a dedicated 32-bit client, and reads a structured ring buffer from
 //! that exact process. The connected source map and editor project are read-only.
+//! The x86 helper renames the client's single-instance object per test PID, so
+//! the harness runs beside the user's own game without touching that process.
+//!
+//! The harness is not an agent tool: `trace_test_run`/`trace_suite_run` are not
+//! registered in `tools`, no prompt names them, and only the ignored live tests
+//! drive this module until map selection works on the hidden desktop.
+//!
 //! The client launch and ring-buffer reader are Windows-only; other platforms
 //! report `windows_runtime_required` after the build phase.
 #![cfg_attr(not(windows), allow(dead_code))]
@@ -39,7 +46,7 @@ const DEFAULT_TEST_TIMEOUT_MS: u64 = 30_000;
 const MIN_TEST_TIMEOUT_MS: u64 = 1_000;
 const MAX_TEST_TIMEOUT_MS: u64 = 120_000;
 const TEST_MAP_PREFIX: &str = "zzzz-eud-agent-";
-const PERSISTENT_TEST_ROOT: &str = "tests/";
+const PERSISTENT_TEST_ROOT: &str = "src/tests/";
 const PERSISTENT_TEST_SUFFIX: &str = ".tests.eps";
 const MAX_PERSISTENT_TESTS: usize = 256;
 const INTERNAL_BEGIN_EVENT: u32 = 0xffff_ff00;
@@ -67,13 +74,13 @@ pub struct TraceSuiteInput {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct PersistentTraceTest {
+pub struct PersistentTraceTest {
     pub path: String,
     pub code: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct PersistentTraceSelection {
+pub struct PersistentTraceSelection {
     pub discovered: Vec<String>,
     pub tests: Vec<PersistentTraceTest>,
 }
@@ -292,7 +299,7 @@ pub fn validate_input(input: &TraceTestInput) -> Result<(), String> {
     Ok(())
 }
 
-pub(crate) fn select_persistent_tests(
+pub fn select_persistent_tests(
     snapshot: &NativeSourceSnapshot,
     input: &TraceSuiteInput,
 ) -> Result<PersistentTraceSelection, String> {
@@ -336,7 +343,7 @@ pub(crate) fn select_persistent_tests(
                 let path = normalize_relative(raw_path)?;
                 if !is_persistent_test_path(&path) {
                     return Err(format!(
-                        "persistent test path must match tests/**/*.tests.eps: {raw_path}"
+                        "persistent test path must match src/tests/**/*.tests.eps: {raw_path}"
                     ));
                 }
                 let key = path.to_lowercase();
@@ -383,7 +390,7 @@ fn is_persistent_test_path(path: &str) -> bool {
     path.starts_with(PERSISTENT_TEST_ROOT) && path.ends_with(PERSISTENT_TEST_SUFFIX)
 }
 
-pub(crate) fn run_suite(
+pub fn run_suite(
     dirs: &DataDirs,
     source_eds: &Path,
     euddraft: &EuddraftLaunch,
@@ -596,6 +603,7 @@ pub fn run(
     };
     write_json(&run_root.join("result.json"), &result)?;
     let _ = fs::remove_dir_all(run_root.join("build"));
+    let _ = fs::remove_dir_all(run_root.join("src"));
     Ok(result)
 }
 
@@ -684,6 +692,12 @@ fn prepare_build(
         )?;
     }
 
+    // The EDS main section references `../../src/<main>.eps` relative to `<run>/build/euddraft`,
+    // so the isolated tree must also carry `<run>/src` or the build fails with FileNotFoundError
+    // (plan §6 Phase 8 defect 1, option b). Copying the canonical source — never rewriting the
+    // relative section to an absolute path — keeps the run isolated from concurrent live edits.
+    copy_project_src(source_build_root, run_root, &mut budget)?;
+
     let copied_parent = copied_build_root.join(
         source_parent
             .file_name()
@@ -755,11 +769,9 @@ fn copy_tree(source: &Path, destination: &Path, budget: &mut CopyBudget) -> Resu
         fs::create_dir_all(destination).map_err(|error| error.to_string())?;
         for entry in fs::read_dir(source).map_err(|error| error.to_string())? {
             let entry = entry.map_err(|error| error.to_string())?;
-            if entry
-                .file_name()
-                .to_string_lossy()
-                .eq_ignore_ascii_case("__pycache__")
-            {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.eq_ignore_ascii_case("__pycache__") || name.eq_ignore_ascii_case("__epspy__") {
                 continue;
             }
             copy_tree(&entry.path(), &destination.join(entry.file_name()), budget)?;
@@ -775,10 +787,34 @@ fn copy_tree(source: &Path, destination: &Path, budget: &mut CopyBudget) -> Resu
     budget.files += 1;
     budget.bytes = budget.bytes.saturating_add(metadata.len());
     if budget.files > MAX_BUILD_COPY_FILES || budget.bytes > MAX_BUILD_COPY_BYTES {
-        return Err("generated EDS build directory exceeds trace-copy limits".to_string());
+        return Err("trace-build copy exceeds limits".to_string());
     }
     fs::copy(source, destination).map_err(|error| error.to_string())?;
     Ok(())
+}
+
+/// Copy `<project>/src` into `<run>/src` so the EDS main section's relative
+/// `../../src/<main>.eps` resolves inside the isolated run tree. `source_build_root` is
+/// `<project>/build` (the EDS build directory's parent), so its parent is the project root.
+fn copy_project_src(
+    source_build_root: &Path,
+    run_root: &Path,
+    budget: &mut CopyBudget,
+) -> Result<(), String> {
+    let project_root = source_build_root.parent().ok_or_else(|| {
+        format!(
+            "EDS build root has no parent: '{}'",
+            source_build_root.display()
+        )
+    })?;
+    let source_src = project_root.join("src");
+    if !source_src.is_dir() {
+        return Err(format!(
+            "project source directory is missing for trace build: '{}'",
+            source_src.display()
+        ));
+    }
+    copy_tree(&source_src, &run_root.join("src"), budget)
 }
 
 fn resolve_eds_input(eds_parent: &Path, text: &str) -> Result<PathBuf, String> {
@@ -1072,12 +1108,22 @@ fn resolve_x86_starcraft(setting: &Path) -> Result<PathBuf, String> {
     {
         return Ok(setting.to_path_buf());
     }
-    let root = setting.parent().ok_or_else(|| {
-        format!(
-            "StarCraft setting has no install root: '{}'",
-            setting.display()
-        )
-    })?;
+    // A directory setting is the install root itself (e.g. `map_context::resolve_starcraft_path`
+    // returns `C:\Program Files (x86)\StarCraft`); a file setting is the root `StarCraft.exe`
+    // whose parent is the install root. Either way the 32-bit client lives in `<root>\x86`.
+    let root = if setting.is_dir() {
+        setting.to_path_buf()
+    } else {
+        setting
+            .parent()
+            .ok_or_else(|| {
+                format!(
+                    "StarCraft setting has no install root: '{}'",
+                    setting.display()
+                )
+            })?
+            .to_path_buf()
+    };
     let candidate = root.join("x86").join("StarCraft.exe");
     if candidate.is_file() {
         Ok(candidate)
@@ -1221,6 +1267,86 @@ fn documents_dir() -> Result<PathBuf, String> {
     Err("Windows Documents folder is unavailable".to_string())
 }
 
+/// SC:R ignores command-line window switches and instead reads `WindowMode`
+/// from the shared `Documents/StarCraft/CSettings.json`. A borderless-fullscreen
+/// client (the default on this machine) covers the screen, so the off-screen
+/// minimized harness client never reaches gameplay. `WINDOWED_WINDOW_MODE` is
+/// the `WindowMode` value that yields an ordinary bordered window.
+#[cfg(windows)]
+const WINDOWED_WINDOW_MODE: i64 = 1;
+
+/// A borrowed override of the shared StarCraft settings. The desired
+/// `WindowMode` is written before the isolated client starts and the exact
+/// original bytes are restored the moment the client has read them, so the
+/// user's own settings and any concurrently running game are left untouched.
+#[cfg(windows)]
+struct BorrowedWindowMode {
+    path: PathBuf,
+    original: Vec<u8>,
+}
+
+#[cfg(windows)]
+impl BorrowedWindowMode {
+    /// Temporarily force windowed mode. Returns `Ok(None)` when no override is
+    /// needed (settings absent or already windowed).
+    fn force_windowed() -> Result<Option<Self>, String> {
+        let path = documents_dir()?.join("StarCraft").join("CSettings.json");
+        let original = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(format!("failed to read StarCraft settings: {error}")),
+        };
+        let mut settings: serde_json::Value = serde_json::from_slice(&original)
+            .map_err(|error| format!("StarCraft settings are not valid JSON: {error}"))?;
+        let object = settings
+            .as_object_mut()
+            .ok_or_else(|| "StarCraft settings root is not a JSON object".to_string())?;
+        if object.get("WindowMode").and_then(serde_json::Value::as_i64)
+            == Some(WINDOWED_WINDOW_MODE)
+        {
+            return Ok(None);
+        }
+        object.insert(
+            "WindowMode".to_string(),
+            serde_json::Value::from(WINDOWED_WINDOW_MODE),
+        );
+        let desired = serde_json::to_vec_pretty(&settings)
+            .map_err(|error| format!("failed to encode windowed StarCraft settings: {error}"))?;
+        write_settings_atomically(&path, &desired)?;
+        Ok(Some(Self { path, original }))
+    }
+}
+
+#[cfg(windows)]
+impl Drop for BorrowedWindowMode {
+    fn drop(&mut self) {
+        // Best-effort exact restore; the client has already consumed the value.
+        let _ = write_settings_atomically(&self.path, &self.original);
+    }
+}
+
+/// Replace a settings file through a same-directory temp file so a concurrent
+/// reader never observes a torn write.
+#[cfg(windows)]
+fn write_settings_atomically(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let directory = path
+        .parent()
+        .ok_or_else(|| "StarCraft settings path has no parent".to_string())?;
+    let temp = directory.join(format!(
+        "CSettings.json.eud-agent-{}.tmp",
+        std::process::id()
+    ));
+    fs::write(&temp, bytes)
+        .map_err(|error| format!("failed to stage StarCraft settings: {error}"))?;
+    match fs::rename(&temp, path) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let _ = fs::remove_file(&temp);
+            Err(format!("failed to replace StarCraft settings: {error}"))
+        }
+    }
+}
+
 #[cfg(windows)]
 mod windows {
     use super::*;
@@ -1234,6 +1360,12 @@ mod windows {
         WAIT_TIMEOUT,
     };
 
+    use windows_sys::Win32::Foundation::RECT;
+    use windows_sys::Win32::Graphics::Gdi::{
+        CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC, GetDIBits,
+        ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS,
+    };
+    use windows_sys::Win32::Storage::Xps::PrintWindow;
     use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
     use windows_sys::Win32::System::Diagnostics::ToolHelp::{
         CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
@@ -1242,6 +1374,9 @@ mod windows {
     use windows_sys::Win32::System::Memory::{
         VirtualQueryEx, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_GUARD, PAGE_NOACCESS,
     };
+    use windows_sys::Win32::System::StationsAndDesktops::{
+        CloseDesktop, CreateDesktopW, EnumDesktopWindows, SetThreadDesktop, HDESK,
+    };
     use windows_sys::Win32::System::Threading::{
         CreateProcessW, OpenProcess, ResumeThread, TerminateProcess, WaitForSingleObject,
         CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, INFINITE,
@@ -1249,16 +1384,67 @@ mod windows {
         STARTUPINFOW,
     };
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-        VK_E, VK_END, VK_G, VK_M, VK_MENU, VK_O, VK_RETURN,
+        mouse_event, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, VK_E, VK_END, VK_G, VK_M, VK_MENU,
+        VK_O, VK_RETURN,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        EnumWindows, GetForegroundWindow, GetWindowThreadProcessId, IsIconic, IsWindowVisible,
-        PostMessageW, ShowWindow, SW_MINIMIZE, WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
+        GetWindowRect, GetWindowThreadProcessId, IsWindowVisible, PostMessageW, SetCursorPos,
+        SetForegroundWindow, WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
     };
+    /// `PW_RENDERFULLCONTENT` (absent from this windows-sys version): print the
+    /// full window content, including DWM/compositor-backed surfaces.
+    const PW_RENDERFULLCONTENT: u32 = 2;
 
     const PROCESS_SCAN_MAX_X86: usize = 0x8000_0000;
     const MEMORY_CHUNK_BYTES: usize = 1024 * 1024;
     const MAX_MARKER_MATCHES: usize = 32;
+    /// Full access to the private desktop we create and enumerate
+    /// (`STANDARD_RIGHTS_REQUIRED | all desktop-specific rights`).
+    const DESKTOP_FULL_ACCESS: u32 = 0x000F_01FF;
+    /// Show the client without activating it (harmless on a hidden desktop, and
+    /// it must be shown, not minimized, so the renderer and game logic run).
+    const SW_SHOWNOACTIVATE: u16 = 4;
+
+    /// A private, non-visible desktop the isolated client lives on, so it never
+    /// appears on the user's screen regardless of its window mode.
+    struct DesktopGuard {
+        handle: HDESK,
+        name: Vec<u16>,
+    }
+
+    impl DesktopGuard {
+        fn create() -> Result<Self, String> {
+            let name = format!("eud-agent-trace-{}", std::process::id());
+            let name: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+            let handle = unsafe {
+                CreateDesktopW(
+                    name.as_ptr(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    0,
+                    DESKTOP_FULL_ACCESS,
+                    std::ptr::null(),
+                )
+            };
+            if handle.is_null() {
+                return Err(last_error("failed to create the isolated trace desktop"));
+            }
+            Ok(Self { handle, name })
+        }
+
+        /// Null-terminated wide desktop name for `STARTUPINFOW.lpDesktop`.
+        fn name_ptr(&mut self) -> *mut u16 {
+            self.name.as_mut_ptr()
+        }
+    }
+
+    impl Drop for DesktopGuard {
+        fn drop(&mut self) {
+            if !self.handle.is_null() {
+                unsafe { CloseDesktop(self.handle) };
+            }
+        }
+    }
 
     struct OwnedChild {
         process: HandleGuard,
@@ -1297,17 +1483,21 @@ mod windows {
         }
     }
 
-    fn minimized_startup_info() -> STARTUPINFOW {
+    fn hidden_desktop_startup_info(desktop_name: *mut u16) -> STARTUPINFOW {
         let mut startup: STARTUPINFOW = unsafe { zeroed() };
         startup.cb = size_of::<STARTUPINFOW>() as u32;
         startup.dwFlags = STARTF_USESHOWWINDOW;
-        startup.wShowWindow = 7;
+        // Shown (not minimized) so rendering and game logic run; the private
+        // desktop keeps it off the user's screen.
+        startup.wShowWindow = SW_SHOWNOACTIVATE;
+        startup.lpDesktop = desktop_name;
         startup
     }
 
     fn launch_guarded_client(
         executable: &Path,
         injector_path: &Path,
+        desktop_name: *mut u16,
     ) -> Result<OwnedChild, String> {
         let current_dir = executable.parent().and_then(Path::parent).ok_or_else(|| {
             format!(
@@ -1321,14 +1511,13 @@ mod windows {
         command_line.push(b'\"' as u16);
         command_line.extend(executable.as_os_str().encode_wide());
         command_line.push(b'\"' as u16);
-        command_line.extend(
-            " -launch -uid s1 -displayMode 0 -windowwidth 1024 -windowheight 768 -windowx 32000 -windowy 32000"
-                .encode_utf16(),
-        );
+        // SC:R honors only these switches; window placement comes from
+        // CSettings.json (see BorrowedWindowMode), not from command-line size flags.
+        command_line.extend(" -launch -uid s1".encode_utf16());
         command_line.push(0);
         let mut current_dir = current_dir.as_os_str().encode_wide().collect::<Vec<_>>();
         current_dir.push(0);
-        let startup = minimized_startup_info();
+        let startup = hidden_desktop_startup_info(desktop_name);
         let mut process_info: PROCESS_INFORMATION = unsafe { zeroed() };
         let created = unsafe {
             CreateProcessW(
@@ -1382,33 +1571,31 @@ mod windows {
         input: &TraceTestInput,
         injector_path: &Path,
     ) -> Result<TraceOutcome, String> {
-        if starcraft_running()? {
-            return Ok(TraceOutcome::inconclusive("starcraft_already_running"));
-        }
-        let child = launch_guarded_client(executable, injector_path)?;
+        let other_instance_running = starcraft_running()?;
+        // Force windowed mode and hold it for the whole run: SC:R re-reads
+        // WindowMode during renderer init, after its first window appears, so an
+        // early restore would let the client fall back to borderless fullscreen.
+        // The user's already-running game keeps its loaded settings; the exact
+        // original bytes are restored when this scope ends.
+        let _borrowed_window_mode = BorrowedWindowMode::force_windowed()?;
+        // The client runs on a private, non-visible desktop, so it never appears
+        // on the user's screen and is left shown (not minimized) so its renderer
+        // and game logic actually run.
+        let mut desktop = DesktopGuard::create()?;
+        let child = launch_guarded_client(executable, injector_path, desktop.name_ptr())?;
         let pid = child.pid;
-        let hwnd = wait_for_window(pid, &child, WINDOW_TIMEOUT)?;
-        if unsafe { GetForegroundWindow() } == hwnd {
-            unsafe {
-                ShowWindow(hwnd, SW_MINIMIZE);
-            }
-            return Ok(TraceOutcome::inconclusive(
-                "test_client_activated_foreground",
-            ));
-        }
-        if unsafe { IsIconic(hwnd) } == 0 {
-            unsafe {
-                ShowWindow(hwnd, SW_MINIMIZE);
-            }
-            thread::sleep(Duration::from_millis(100));
-            if unsafe { IsIconic(hwnd) } == 0 {
-                return Ok(TraceOutcome::inconclusive(
-                    "test_client_could_not_be_minimized",
-                ));
-            }
-        }
+        let Some(hwnd) = wait_for_window(&desktop, pid, &child, WINDOW_TIMEOUT)? else {
+            return Ok(TraceOutcome::inconclusive(if other_instance_running {
+                "isolated_client_exited_beside_running_game"
+            } else {
+                "game_exited_before_window"
+            }));
+        };
+        maybe_capture(hwnd, "01-window");
         thread::sleep(Duration::from_secs(10));
-        automate_to_test_map(hwnd)?;
+        maybe_capture(hwnd, "02-menu-ready");
+        automate_to_test_map(&desktop, hwnd)?;
+        maybe_capture(hwnd, "03-after-menu");
         let process = open_process(pid)?;
         let mut active = None;
         let mut last_marker_matches = 0usize;
@@ -1432,6 +1619,7 @@ mod windows {
             }
         }
         let Some(address) = active else {
+            maybe_capture(hwnd, "04-not-activated");
             return Ok(TraceOutcome::inconclusive(format!(
                 "trace_buffer_not_activated:marker_matches={last_marker_matches}"
             )));
@@ -1463,26 +1651,42 @@ mod windows {
         }
     }
 
-    fn automate_to_test_map(hwnd: HWND) -> Result<(), String> {
+    fn automate_to_test_map(desktop: &DesktopGuard, hwnd: HWND) -> Result<(), String> {
         // Supported LAN/UDP glue path: post directly to the minimized owned
         // window. Never activate it, synthesize global input, or move the cursor.
         // G invokes the game's CreateGame binding from the UDP game list.
         post_window_key(hwnd, VK_M as u8)?;
         thread::sleep(Duration::from_millis(1_500));
+        maybe_capture(hwnd, "m1-after-M");
         post_window_key(hwnd, VK_E as u8)?;
         thread::sleep(Duration::from_secs(2));
+        maybe_capture(hwnd, "m2-after-E");
         post_window_key(hwnd, VK_END as u8)?;
         thread::sleep(Duration::from_millis(300));
+        maybe_capture(hwnd, "m3-after-END");
         post_window_key(hwnd, VK_RETURN as u8)?;
         thread::sleep(Duration::from_secs(2));
+        maybe_capture(hwnd, "m4-after-RETURN");
         post_window_key(hwnd, VK_O as u8)?;
         thread::sleep(Duration::from_secs(2));
+        maybe_capture(hwnd, "m5-after-O");
         post_window_key(hwnd, VK_G as u8)?;
         thread::sleep(Duration::from_secs(2));
+        maybe_capture(hwnd, "m6-after-G");
+        // Scroll the uniquely `zzzz-`prefixed test map to the bottom row (END is
+        // a keyboard message the list honors), then select+confirm it with a real
+        // double-click. The list has no letter hotkey and ignores posted mouse
+        // messages, so a genuine click on the trace desktop is required.
         post_window_key(hwnd, VK_END as u8)?;
-        thread::sleep(Duration::from_millis(500));
+        thread::sleep(Duration::from_secs(1));
+        maybe_capture(hwnd, "m7-after-END");
+        double_click_fraction(desktop, hwnd, 0.30, 0.503)?;
+        thread::sleep(Duration::from_secs(2));
+        maybe_capture(hwnd, "m8-after-click");
+        // Confirm in case the double-click only selected the row.
         post_window_key(hwnd, VK_O as u8)?;
         thread::sleep(Duration::from_secs(4));
+        maybe_capture(hwnd, "m9-lobby");
         Ok(())
     }
 
@@ -1538,7 +1742,142 @@ mod windows {
         }
     }
 
-    fn wait_for_window(pid: u32, child: &OwnedChild, timeout: Duration) -> Result<HWND, String> {
+    /// Diagnostic: when `EUD_TRACE_CAPTURE` names a directory, snapshot the
+    /// hidden-desktop client window (by handle, cross-desktop) into a BMP so a
+    /// run can be visually inspected without the window ever being on screen.
+    fn maybe_capture(hwnd: HWND, step: &str) {
+        let Ok(dir) = std::env::var("EUD_TRACE_CAPTURE") else {
+            return;
+        };
+        let path = std::path::Path::new(&dir).join(format!("trace-{step}.bmp"));
+        match unsafe { capture_window_bmp(hwnd) } {
+            Ok(bytes) => match fs::write(&path, &bytes) {
+                Ok(()) => eprintln!("capture {step} -> {}", path.display()),
+                Err(error) => eprintln!("capture {step} write failed: {error}"),
+            },
+            Err(error) => eprintln!("capture {step} failed: {error}"),
+        }
+    }
+
+    /// Double-click a point in the client (given as window-rect fractions) using
+    /// real input, on a thread bound to the private trace desktop. SC:R reads the
+    /// mouse via raw input and ignores posted mouse messages, so the map row can
+    /// only be selected with a genuine click; keeping the thread on the trace
+    /// desktop confines it to that desktop. Coordinates come from the captured
+    /// create-dialog layout.
+    fn double_click_fraction(
+        desktop: &DesktopGuard,
+        hwnd: HWND,
+        fx: f32,
+        fy: f32,
+    ) -> Result<(), String> {
+        let desktop_handle = desktop.handle as isize;
+        let hwnd_value = hwnd as isize;
+        std::thread::spawn(move || -> Result<(), String> {
+            unsafe {
+                if SetThreadDesktop(desktop_handle as HDESK) == 0 {
+                    return Err(last_error("SetThreadDesktop to trace desktop"));
+                }
+                let window = hwnd_value as HWND;
+                // Raw-input games deliver clicks to the foreground window; on this
+                // private desktop that never touches the user's screen.
+                SetForegroundWindow(window);
+                let mut rect: RECT = zeroed();
+                if GetWindowRect(window, &mut rect) == 0 {
+                    return Err(last_error("GetWindowRect for click"));
+                }
+                let x = rect.left + ((rect.right - rect.left) as f32 * fx) as i32;
+                let y = rect.top + ((rect.bottom - rect.top) as f32 * fy) as i32;
+                if SetCursorPos(x, y) == 0 {
+                    return Err(last_error("SetCursorPos on trace desktop"));
+                }
+                thread::sleep(Duration::from_millis(80));
+                for _ in 0..2 {
+                    mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0);
+                    thread::sleep(Duration::from_millis(30));
+                    mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0);
+                    thread::sleep(Duration::from_millis(70));
+                }
+                Ok(())
+            }
+        })
+        .join()
+        .map_err(|_| "trace desktop click thread panicked".to_string())?
+    }
+
+    /// Render a window into a bottom-up 32bpp BMP via `PrintWindow`. DirectX
+    /// back buffers may print black; GDI/menu content is captured.
+    unsafe fn capture_window_bmp(hwnd: HWND) -> Result<Vec<u8>, String> {
+        let mut rect: RECT = zeroed();
+        if GetWindowRect(hwnd, &mut rect) == 0 {
+            return Err(last_error("GetWindowRect for capture"));
+        }
+        let width = rect.right - rect.left;
+        let height = rect.bottom - rect.top;
+        if width <= 0 || height <= 0 {
+            return Err(format!("capture window has no area ({width}x{height})"));
+        }
+        let screen = GetDC(std::ptr::null_mut());
+        if screen.is_null() {
+            return Err("GetDC failed for capture".to_string());
+        }
+        let mem = CreateCompatibleDC(screen);
+        let bitmap = CreateCompatibleBitmap(screen, width, height);
+        let previous = SelectObject(mem, bitmap as _);
+        PrintWindow(hwnd, mem, PW_RENDERFULLCONTENT);
+        let mut info: BITMAPINFO = zeroed();
+        info.bmiHeader.biSize = size_of::<BITMAPINFOHEADER>() as u32;
+        info.bmiHeader.biWidth = width;
+        info.bmiHeader.biHeight = height; // bottom-up
+        info.bmiHeader.biPlanes = 1;
+        info.bmiHeader.biBitCount = 32;
+        info.bmiHeader.biCompression = 0; // BI_RGB
+        let mut pixels = vec![0u8; width as usize * height as usize * 4];
+        let scanned = GetDIBits(
+            mem,
+            bitmap,
+            0,
+            height as u32,
+            pixels.as_mut_ptr().cast(),
+            &mut info,
+            DIB_RGB_COLORS,
+        );
+        SelectObject(mem, previous);
+        DeleteObject(bitmap as _);
+        DeleteDC(mem);
+        ReleaseDC(std::ptr::null_mut(), screen);
+        if scanned == 0 {
+            return Err("GetDIBits returned no scanlines".to_string());
+        }
+        let data_len = pixels.len() as u32;
+        let mut out = Vec::with_capacity(54 + pixels.len());
+        out.extend_from_slice(b"BM");
+        out.extend_from_slice(&(54 + data_len).to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&54u32.to_le_bytes());
+        out.extend_from_slice(&40u32.to_le_bytes());
+        out.extend_from_slice(&width.to_le_bytes());
+        out.extend_from_slice(&height.to_le_bytes());
+        out.extend_from_slice(&1u16.to_le_bytes());
+        out.extend_from_slice(&32u16.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&data_len.to_le_bytes());
+        out.extend_from_slice(&0i32.to_le_bytes());
+        out.extend_from_slice(&0i32.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&pixels);
+        Ok(out)
+    }
+
+    /// `Ok(None)` means the owned client exited before showing a window. Windows
+    /// are enumerated on the private trace desktop, not the caller's visible one.
+    fn wait_for_window(
+        desktop: &DesktopGuard,
+        pid: u32,
+        child: &OwnedChild,
+        timeout: Duration,
+    ) -> Result<Option<HWND>, String> {
         let started = Instant::now();
         loop {
             let mut context = WindowSearch {
@@ -1546,16 +1885,17 @@ mod windows {
                 hwnd: std::ptr::null_mut(),
             };
             unsafe {
-                EnumWindows(
+                EnumDesktopWindows(
+                    desktop.handle,
                     Some(enum_window),
                     (&mut context as *mut WindowSearch) as LPARAM,
                 );
             }
             if !context.hwnd.is_null() {
-                return Ok(context.hwnd);
+                return Ok(Some(context.hwnd));
             }
             if child.has_exited()? {
-                return Err("StarCraft exited before creating its main window".to_string());
+                return Ok(None);
             }
             if started.elapsed() >= timeout {
                 return Err("StarCraft did not create a visible window within 20s".to_string());
@@ -1801,12 +2141,12 @@ mod tests {
             revision: "revision".to_string(),
             files: vec![
                 NativeSourceFile {
-                    path: "tests/wave.tests.eps".to_string(),
+                    path: "src/tests/wave.tests.eps".to_string(),
                     content: input().code,
                     sha256: "wave".to_string(),
                 },
                 NativeSourceFile {
-                    path: "tests/nested/reward.tests.eps".to_string(),
+                    path: "src/tests/nested/reward.tests.eps".to_string(),
                     content: "function eudAgentTestSetup() {}\nfunction eudAgentTestStep(tick) { eudAgentPass(3); }"
                         .to_string(),
                     sha256: "reward".to_string(),
@@ -1909,6 +2249,15 @@ mod tests {
                 .windows(name.len())
                 .any(|window| window == name));
         }
+        // The single-instance object name it rewrites is embedded verbatim; the
+        // replacement is derived from the test PID at run time, never a fixed name.
+        let instance_name = "Starcraft Check For Other Instances";
+        assert!(TRACE_INJECTOR_EXE
+            .windows(instance_name.len())
+            .any(|window| window == instance_name.as_bytes()));
+        assert!(TRACE_INJECTOR_EXE
+            .windows(b"NtQueryInformationProcess\0".len())
+            .any(|window| window == b"NtQueryInformationProcess\0"));
     }
 
     #[test]
@@ -1924,8 +2273,8 @@ mod tests {
         assert_eq!(
             all.discovered,
             vec![
-                "tests/nested/reward.tests.eps".to_string(),
-                "tests/wave.tests.eps".to_string(),
+                "src/tests/nested/reward.tests.eps".to_string(),
+                "src/tests/wave.tests.eps".to_string(),
             ]
         );
         assert_eq!(
@@ -1933,15 +2282,18 @@ mod tests {
                 .iter()
                 .map(|test| test.path.as_str())
                 .collect::<Vec<_>>(),
-            vec!["tests/nested/reward.tests.eps", "tests/wave.tests.eps",]
+            vec![
+                "src/tests/nested/reward.tests.eps",
+                "src/tests/wave.tests.eps",
+            ]
         );
 
         let selected = select_persistent_tests(
             &persistent_snapshot(),
             &TraceSuiteInput {
                 tests: Some(vec![
-                    "tests/wave.tests.eps".to_string(),
-                    "tests/nested/reward.tests.eps".to_string(),
+                    "src/tests/wave.tests.eps".to_string(),
+                    "src/tests/nested/reward.tests.eps".to_string(),
                 ]),
                 timeout_ms: 5_000,
             },
@@ -1953,18 +2305,21 @@ mod tests {
                 .iter()
                 .map(|test| test.path.as_str())
                 .collect::<Vec<_>>(),
-            vec!["tests/wave.tests.eps", "tests/nested/reward.tests.eps",]
+            vec![
+                "src/tests/wave.tests.eps",
+                "src/tests/nested/reward.tests.eps",
+            ]
         );
     }
 
     #[test]
     fn persistent_selection_rejects_missing_outside_and_duplicate_paths() {
         for tests in [
-            vec!["tests/missing.tests.eps".to_string()],
+            vec!["src/tests/missing.tests.eps".to_string()],
             vec!["feature.tests.eps".to_string()],
             vec![
-                "tests/wave.tests.eps".to_string(),
-                "TESTS/WAVE.TESTS.EPS".to_string(),
+                "src/tests/wave.tests.eps".to_string(),
+                "SRC/TESTS/WAVE.TESTS.EPS".to_string(),
             ],
         ] {
             assert!(select_persistent_tests(
@@ -1983,7 +2338,7 @@ mod tests {
         let base =
             std::env::temp_dir().join(format!("eud-agent-trace-suite-{}", uuid::Uuid::new_v4()));
         let dirs = DataDirs::from_bases(&base.join("roaming"), &base.join("local"));
-        let path = "tests/invalid.tests.eps".to_string();
+        let path = "src/tests/invalid.tests.eps".to_string();
         let result = run_suite(
             &dirs,
             Path::new("missing.eds"),
@@ -2051,6 +2406,75 @@ mod tests {
         assert!(result.selected.is_empty());
         assert!(result.tests.is_empty());
         let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn copy_project_src_mirrors_source_and_skips_generated_artifacts() {
+        let base =
+            std::env::temp_dir().join(format!("eud-agent-trace-src-copy-{}", uuid::Uuid::new_v4()));
+        let project = base.join("project");
+        let build_root = project.join("build");
+        fs::create_dir_all(build_root.join("euddraft")).unwrap();
+        fs::create_dir_all(project.join("src/nested")).unwrap();
+        fs::write(
+            project.join("src/main.eps"),
+            b"function onPluginStart() {}\n",
+        )
+        .unwrap();
+        fs::write(project.join("src/nested/feature.eps"), b"// feature\n").unwrap();
+        // Build-time generated shadows must never enter the isolated run tree.
+        fs::create_dir_all(project.join("src/__epspy__")).unwrap();
+        fs::write(project.join("src/__epspy__/main.py"), b"# generated\n").unwrap();
+        fs::create_dir_all(project.join("src/nested/__pycache__")).unwrap();
+        fs::write(project.join("src/nested/__pycache__/x.pyc"), b"\x00\x01").unwrap();
+
+        let run_root = base.join("run");
+        fs::create_dir_all(&run_root).unwrap();
+        let mut budget = CopyBudget::default();
+        copy_project_src(&build_root, &run_root, &mut budget).unwrap();
+
+        let copied = run_root.join("src");
+        assert!(copied.join("main.eps").is_file());
+        assert!(copied.join("nested/feature.eps").is_file());
+        assert!(!copied.join("__epspy__").exists());
+        assert!(!copied.join("nested/__pycache__").exists());
+        assert_eq!(budget.files, 2);
+
+        // The project source directory is mandatory: a missing `<project>/src` is a hard error.
+        let bare_build = base.join("bare/build");
+        fs::create_dir_all(&bare_build).unwrap();
+        let bare_run = base.join("bare-run");
+        fs::create_dir_all(&bare_run).unwrap();
+        assert!(copy_project_src(&bare_build, &bare_run, &mut CopyBudget::default()).is_err());
+
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn resolve_x86_starcraft_accepts_install_root_directory_and_exe_file() {
+        let base =
+            std::env::temp_dir().join(format!("eud-agent-trace-sc-{}", uuid::Uuid::new_v4()));
+        let x86 = base.join("x86");
+        fs::create_dir_all(&x86).unwrap();
+        let client = x86.join("StarCraft.exe");
+        fs::write(&client, b"MZ").unwrap();
+
+        // Directory setting = install root (`map_context::resolve_starcraft_path` contract).
+        assert_eq!(resolve_x86_starcraft(&base).unwrap(), client);
+        // File setting naming StarCraft.exe is returned directly.
+        assert_eq!(resolve_x86_starcraft(&client).unwrap(), client);
+
+        // A root with no 32-bit client fails clearly and names the expected path.
+        let bare = base.join("bare-root");
+        fs::create_dir_all(&bare).unwrap();
+        let error = resolve_x86_starcraft(&bare).unwrap_err();
+        assert!(
+            error.contains("32-bit StarCraft client is missing"),
+            "{error}"
+        );
+        assert!(error.contains("StarCraft.exe"), "{error}");
+
+        fs::remove_dir_all(base).ok();
     }
 
     #[test]
@@ -2193,7 +2617,7 @@ mod tests {
             main_file: "src/main.eps".to_string(),
             revision: "live".to_string(),
             files: vec![NativeSourceFile {
-                path: "tests/protocol.tests.eps".to_string(),
+                path: "src/tests/protocol.tests.eps".to_string(),
                 content: "function eudAgentTestSetup() {}\nfunction eudAgentTestStep(tick) {\n    if (tick == 8) {\n        if (eudAgentAssertEq(100, 42, 42)) {\n            eudAgentPass(101);\n        }\n    }\n}"
                     .to_string(),
                 sha256: "live".to_string(),
@@ -2218,7 +2642,7 @@ mod tests {
         eprintln!("{}", serde_json::to_string_pretty(&result).unwrap());
         assert_eq!(result.status, TraceTestStatus::Passed, "{result:?}");
         assert_eq!(result.passed, 1);
-        assert_eq!(result.tests[0].path, "tests/protocol.tests.eps");
+        assert_eq!(result.tests[0].path, "src/tests/protocol.tests.eps");
         assert_eq!(result.tests[0].source_map_unchanged, Some(true));
         assert!(result.tests[0].summary.contains("3 event(s)"));
         assert!(Path::new(&result.log_dir).join("suite.json").is_file());

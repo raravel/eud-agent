@@ -493,6 +493,18 @@ impl SessionTaskState {
         self.rebuild_projection()
     }
 
+    /// The client turn that produced `request_id` on the current branch. Map
+    /// sessions mint their client turn ids natively and expose only the
+    /// request id to the window, so a Map rewind anchors through it.
+    pub fn client_turn_for_request(&self, request_id: &str) -> Option<String> {
+        self.branch_path()
+            .ok()?
+            .into_iter()
+            .rev()
+            .find(|event| event.request_id.as_deref() == Some(request_id))
+            .and_then(|event| event.client_turn_id.clone())
+    }
+
     pub fn is_current_ancestor(&self, event_id: &str) -> bool {
         self.branch_path()
             .map(|path| path.iter().any(|event| event.id == event_id))

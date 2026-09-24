@@ -6,6 +6,9 @@ __pycache__/
 *.pyc
 *.pyo
 
+# eudplib epScript→Python shadows written next to every compiled .eps at build time
+__epspy__/
+
 # Tooling caches
 .ruff_cache/
 .pytest_cache/
@@ -56,3 +59,22 @@ ci/target/
 /rag-index.bin
 /rag-index.bin.sha256
 /rag-index.manifest.json
+# Local GJC/agent runtime state and per-file mutation locks
+/.gjc/
+/.omo/
+/src-tauri/src/*.rs.lock/
+
+# Legacy in-tree Cargo target output
+/src-tauri/target/
+
+# oh-my-claudecode per-directory runtime state (sessions, notepad, plans); never committed
+.omc/
+
+# Cargo output of the isom crate when built standalone (root /target/ rule is anchored)
+crates/isom/target/
+
+# Git Bash crash dumps
+*.stackdump
+
+# graft's local graph cache — regenerable, not committed (run `graft build`).
+/graft/

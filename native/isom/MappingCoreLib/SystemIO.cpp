@@ -38,11 +38,13 @@ std::string fixSystemPathSeparators(const std::string & systemFilePath)
     const std::string doubleSeparator = defaultSystemPathSeparator + defaultSystemPathSeparator;
     const std::regex altSeparatorRegex = std::regex(defaultSystemPathSeparator.compare("\\") == 0 ? "\\/" : "\\\\");
     std::string fixedPath = std::regex_replace(systemFilePath, altSeparatorRegex, defaultSystemPathSeparator);
-    size_t found = fixedPath.find(doubleSeparator);
+    // A leading double separator is part of an extended-length (\\?\) or UNC (\\server) prefix, not a duplicate
+    const size_t prefixLength = fixedPath.compare(0, doubleSeparator.size(), doubleSeparator) == 0 ? doubleSeparator.size() : 0;
+    size_t found = fixedPath.find(doubleSeparator, prefixLength);
     while ( found != std::string::npos )
     {
         fixedPath.replace(found, doubleSeparator.size(), defaultSystemPathSeparator);
-        found = fixedPath.find(doubleSeparator);
+        found = fixedPath.find(doubleSeparator, prefixLength);
     }
     return fixedPath;
 }

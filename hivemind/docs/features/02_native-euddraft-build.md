@@ -6,7 +6,7 @@
 
 Input authority:
 
-- `project.json`
+- the sole `.eap` manifest (new projects use `project.eap`)
 - `src/**/*.eps`
 - sparse `dat/*.json`
 - bundled version-matched compatibility metadata under `native/eud-editor-compat`
@@ -38,18 +38,26 @@ These assets are copied into `%LOCALAPPDATA%/eud-agent/native_assets` at startup
 
 Unchanged sparse families emit no plugin. Standard DAT address/delta math follows the source-verified Editor generator contract.
 
+Requirement and TBL output follow the Editor's `WriteReqFile`/`tblReader`/`tblWriter` byte contract, verified against a real Editor build folder of the same project:
+
+- an `orders` requirement pointer addresses the word after the leading order-id word, matching stock `require.dat`; a pointer at the id word makes the game read that id as a must-own-unit opcode, which drops MSQC queue commands and other orders;
+- a TBL entry ends at the first NUL after at least two bytes, so hotkey strings such as `o<00>Tank Mode` keep their text;
+- `custom_txt.tbl` always dumps the complete 1547-entry table because `dataDumper` copies it over the in-game header in place.
+
 ## euddraft process
 
-`EuddraftLaunch` accepts `euddraft.exe` or `euddraft.py`, normalizes argv, and runs with:
+`EuddraftLaunch` accepts `euddraft.exe`, `euddraft.py`, or their containing folder, normalizes argv, and runs with:
 
 - explicit EDS argument and working directory;
 - bounded timeout;
-- captured stdout/stderr;
+- captured stdout/stderr, persisted completely as `build/euddraft/build.log`;
 - project-scoped build marker;
 - required fresh output map;
-- structured file/line diagnostics.
+- structured file/line diagnostics: one error per traceback (innermost project frame, final exception line as message), one epScript error per `[Error N] Module "m" Line n : text` line mapped through the `[epScript] Compiling` listing, and one warning per `warn_with_traceback` stack or `[Warning]` line (identical warnings merge with a `count`). Warnings never fail the build. euddraft's post-failure `input()` `EOFError` under the launcher's closed stdin is classified as a warning because it is the launcher's artifact. The log is removed before each run and a failed log write becomes a warning rather than a lost verdict.
 
 The sibling `../euddraft` repository is read-only. Missing private source modules are not patched; installed euddraft is a supported configured executable.
+
+First-run bootstrap downloads and SHA-256 verifies the latest official [armoha/euddraft](https://github.com/armoha/euddraft) release when no path is configured. The complete unmodified distribution is installed under LocalAppData and its executable is passed to the same native launcher. Explicit local paths remain supported and are never replaced by automatic installation.
 
 The Settings **Compile** category reads the configured path and, for managed
 installs, the persisted release tag. An explicit check compares that tag with

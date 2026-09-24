@@ -20,11 +20,10 @@ use crate::harness_import::HarnessImportIssue;
 use crate::journal::{JournalEntry, JournalStore, JournalTarget, Snapshot, WriteTool};
 use crate::memory::write_atomic_bytes;
 use crate::native_project::NativeProject;
-use crate::source_snapshot::{
-    ProjectSnapshot as EpsSnapshot, ProjectSnapshotFile as EpsSnapshotFile,
-};
+use crate::source_snapshot::ProjectSnapshot as EpsSnapshot;
 
-pub const SOURCE_DIR: &str = "source";
+const BASELINE_DOCUMENTS_DIR: &str = "documents";
+const BASELINE_SOURCE_DIR: &str = "source";
 pub const TEMP_DIR: &str = ".tmp";
 const PROJECT_AGENT_DIR: &str = ".eud-agent";
 const PROJECT_WORKSPACE_DIR: &str = "workspace";
@@ -39,6 +38,10 @@ const MAX_TOTAL_BYTES: u64 = 32 * 1024 * 1024;
 
 const DOCUMENT_DIRS: [&str; 4] = ["specs", "plans", "decisions", "worklog"];
 pub const SPEC_INDEX_PATH: &str = "specs/index.md";
+/// Project-relative prefix of the accepted-document tree. The panel's project
+/// file tree lists the whole project root, so workspace-relative document
+/// paths (`specs/index.md`) appear there as `.eud-agent/workspace/specs/index.md`.
+pub const PROJECT_DOCUMENT_PREFIX: &str = ".eud-agent/workspace/";
 
 pub fn approved_plan_path(request_id: &str) -> io::Result<String> {
     let request_id = normalize_token(request_id, "request id")?;
@@ -54,7 +57,17 @@ pub fn completion_worklog_path(request_id: &str) -> io::Result<String> {
 pub struct PreparedWorkspace {
     pub id: String,
     pub project: String,
+    /// The native project root (`project.eap` directory). This is the provider
+    /// CLI cwd: the agent reads the real project tree (`src/`, `dat/`, `maps/`,
+    /// `build/`, `compat/`) directly here.
     pub root: PathBuf,
+    /// `<project>/.eud-agent/workspace` — the canonical accepted-document tree
+    /// (`specs/`, `plans/`, `decisions/`, `worklog/`). Baseline scans, diffs,
+    /// journals, and the panel operate on this subtree only, never on `root`.
+    pub workspace_root: PathBuf,
+    /// `<project>/.eud-agent/workspace/.tmp/<session-id>` — the only filesystem
+    /// write area exposed to the CLI sandbox, isolated per session.
+    pub temp_dir: PathBuf,
     pub session_id: Option<String>,
 }
 
@@ -62,7 +75,6 @@ pub struct PreparedWorkspace {
 pub struct WorkspaceBaseline {
     pub request_id: String,
     pub workspace_id: String,
-    pub session_id: Option<String>,
     pub workspace_root: PathBuf,
     pub baseline_root: PathBuf,
 }
@@ -82,16 +94,36 @@ pub struct WorkspaceChange {
     pub after: Option<String>,
 }
 
+/// One file of the project tree listed by the panel's "파일" tab. `path` is
+/// project-root-relative; `state`/`revision` are set only for accepted or
+/// approved documents under [`PROJECT_DOCUMENT_PREFIX`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkspaceFileEntry {
     pub path: String,
-    pub source: bool,
     pub size: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub state: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub revision: Option<u64>,
+}
+
+/// Why a listed project file cannot be shown as text in the viewer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectFileUnreadable {
+    /// Not valid UTF-8 (maps, wheels, images, ...).
+    Binary,
+    /// Larger than the 1 MiB viewer cap; it is listed but never read.
+    TooLarge,
+}
+
+/// Viewer content of one project file: text, or the reason it stays closed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectFileContent {
+    pub size: u64,
+    pub content: Option<String>,
+    pub unreadable: Option<ProjectFileUnreadable>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -136,26 +168,6 @@ fn native_eps_snapshot(dirs: &DataDirs) -> Result<EpsSnapshot, String> {
     Ok(EpsSnapshot {
         project: snapshot.project,
         identity: snapshot.identity,
-        files: snapshot
-            .files
-            .into_iter()
-            .map(|file| {
-                let ftype = if file.path.to_lowercase().ends_with(".py") {
-                    "CUIPy"
-                } else {
-                    "CUIEps"
-                };
-                EpsSnapshotFile {
-                    path: file
-                        .path
-                        .strip_prefix("src/")
-                        .unwrap_or(&file.path)
-                        .to_string(),
-                    ftype: ftype.to_string(),
-                    content: Some(file.content),
-                }
-            })
-            .collect(),
     })
 }
 
@@ -1058,7 +1070,6 @@ impl WorkspaceManager {
             Err(error) if error.kind() == io::ErrorKind::NotFound => fs::create_dir(&agent_root)?,
             Err(error) => return Err(error),
         }
-        let root = agent_root.join(PROJECT_WORKSPACE_DIR);
         let state_path = agent_root.join(PROJECT_STATE_DIR).join(PROJECT_STATE_FILE);
         let state_parent = state_path.parent().ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "workspace state has no parent")
@@ -1102,10 +1113,11 @@ impl WorkspaceManager {
             .map(|state| state.id.clone())
             .unwrap_or_else(|| project_id(&project_root.to_string_lossy()));
         normalize_workspace_id(&id)?;
-        fs::create_dir_all(&root)?;
-        ensure_plain_directory(&root)?;
+        let workspace_root = agent_root.join(PROJECT_WORKSPACE_DIR);
+        fs::create_dir_all(&workspace_root)?;
+        ensure_plain_directory(&workspace_root)?;
         for directory in DOCUMENT_DIRS {
-            let path = root.join(directory);
+            let path = workspace_root.join(directory);
             fs::create_dir_all(&path)?;
             ensure_plain_directory(&path)?;
         }
@@ -1120,16 +1132,23 @@ impl WorkspaceManager {
         ensure_plain_directory_chain(&agent_root, state_parent)?;
         self.save_state_at(&state_path, &trusted)?;
 
+        let temp_dir = workspace_root.join(TEMP_DIR);
         Ok(PreparedWorkspace {
             id,
             project: snapshot.project.clone(),
-            root,
+            root: project_root,
+            workspace_root,
+            temp_dir,
             session_id: None,
         })
     }
 
-    /// Prepare one session-owned Codex cwd from the latest coherent native snapshot and the
-    /// canonical accepted document tree.
+    /// Prepare the provider CLI workspace for one session.
+    ///
+    /// The CLI cwd is the native project root itself: documents and sources are
+    /// the single canonical copies, so there is no session mirror and nothing to
+    /// sync. The session id only scopes the `.tmp` scratch directory, the one
+    /// filesystem area the sandbox profile may write.
     pub fn prepare_session_current(&self, session_id: &str) -> Result<PreparedWorkspace, String> {
         let snapshot = native_eps_snapshot(&self.dirs)?;
         self.prepare_session_snapshot(&snapshot, session_id)
@@ -1143,32 +1162,21 @@ impl WorkspaceManager {
     ) -> io::Result<PreparedWorkspace> {
         let canonical = self.prepare_snapshot(snapshot)?;
         let session_id = normalize_token(session_id, "session id")?;
-        let root = self.session_workspace_root(&canonical.id, &session_id)?;
-        fs::create_dir_all(&root)?;
-        ensure_plain_directory(&root)?;
-        for directory in DOCUMENT_DIRS {
-            let path = root.join(directory);
-            fs::create_dir_all(&path)?;
-            ensure_plain_directory(&path)?;
-        }
-        let temp = root.join(TEMP_DIR);
-        fs::create_dir_all(&temp)?;
-        ensure_plain_directory(&temp)?;
-        sync_documents(&canonical.root, &root)?;
-        self.refresh_source(&root, &canonical.id, snapshot)?;
+        let temp_dir = canonical.workspace_root.join(TEMP_DIR).join(&session_id);
+        fs::create_dir_all(&temp_dir)?;
+        ensure_plain_directory(&temp_dir)?;
         Ok(PreparedWorkspace {
-            id: canonical.id,
-            project: canonical.project,
-            root,
             session_id: Some(session_id),
+            temp_dir,
+            ..canonical
         })
     }
 
-    /// Prepare an isolated document-only workspace from canonical accepted files.
+    /// Prepare the document workspace for a post-acceptance harness job.
     ///
-    /// Background harness generation never needs a live editor snapshot. It receives
-    /// accepted source changes inline and stages only `specs/`, `decisions/`, and
-    /// `worklog/` updates in this isolated root.
+    /// The harness stages its delta directly against the canonical documents and
+    /// journals the exact change; review reject/accept operates on the canonical
+    /// bytes through the same journal contract as every other write.
     pub(crate) fn prepare_document_session(
         &self,
         workspace_id: &str,
@@ -1184,27 +1192,30 @@ impl WorkspaceManager {
                 format!("canonical workspace `{workspace_id}` does not exist"),
             ));
         }
-        let root = self.session_workspace_root(&workspace_id, &session_id)?;
-        fs::create_dir_all(&root)?;
-        ensure_plain_directory(&root)?;
-        for directory in DOCUMENT_DIRS {
-            let path = root.join(directory);
-            fs::create_dir_all(&path)?;
-            ensure_plain_directory(&path)?;
-        }
-        let temp = root.join(TEMP_DIR);
-        fs::create_dir_all(&temp)?;
-        ensure_plain_directory(&temp)?;
-        sync_documents(&canonical_root, &root)?;
+        let project_root = canonical_root
+            .parent()
+            .and_then(Path::parent)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "canonical workspace has no project",
+                )
+            })?
+            .to_path_buf();
+        let temp_dir = canonical_root.join(TEMP_DIR).join(&session_id);
+        fs::create_dir_all(&temp_dir)?;
+        ensure_plain_directory(&temp_dir)?;
         Ok(PreparedWorkspace {
             id: workspace_id,
             project: project.to_string(),
-            root,
+            root: project_root,
+            workspace_root: canonical_root,
+            temp_dir,
             session_id: Some(session_id),
         })
     }
 
-    /// Capture a crash-safe baseline outside the writable Codex cwd.
+    /// Capture a crash-safe documents+source baseline outside the CLI cwd.
     ///
     /// Re-entering the same request (session-resume fallback) reuses the original baseline,
     /// so changes from a timed-out first attempt do not silently become accepted state.
@@ -1229,9 +1240,12 @@ impl WorkspaceManager {
             })?;
             fs::create_dir_all(parent)?;
             let staged = parent.join(format!(".stage-{}", uuid::Uuid::new_v4()));
-            fs::create_dir(&staged)?;
-            let snapshot = scan_text_tree(&workspace.root, ScanMode::Writable)?;
-            write_tree(&staged, &snapshot)?;
+            fs::create_dir_all(staged.join(BASELINE_DOCUMENTS_DIR))?;
+            fs::create_dir_all(staged.join(BASELINE_SOURCE_DIR))?;
+            let documents = scan_text_tree(&workspace.workspace_root)?;
+            write_tree(&staged.join(BASELINE_DOCUMENTS_DIR), &documents)?;
+            let source = self.source_baseline_snapshot()?;
+            write_tree(&staged.join(BASELINE_SOURCE_DIR), &source)?;
             atomic_write(&staged.join(BASELINE_MARKER), b"1")?;
             fs::rename(staged, &baseline_root)?;
         }
@@ -1239,16 +1253,34 @@ impl WorkspaceManager {
         Ok(WorkspaceBaseline {
             request_id,
             workspace_id: workspace.id.clone(),
-            session_id: workspace.session_id.clone(),
-            workspace_root: workspace.root.clone(),
+            workspace_root: workspace.workspace_root.clone(),
             baseline_root,
         })
     }
 
-    /// Diff the current writable tree against the trusted turn baseline.
+    /// The canonical `src/` tree as baseline-relative paths (no `src/` prefix).
+    ///
+    /// Generated shadows (`__epspy__`/`__pycache__`) are already excluded by the
+    /// native source snapshot.
+    fn source_baseline_snapshot(&self) -> io::Result<BTreeMap<String, String>> {
+        let snapshot = crate::native_runtime::NativeProjectManager::new(self.dirs.clone())
+            .source_snapshot()
+            .map_err(io::Error::other)?;
+        let mut files = BTreeMap::new();
+        for file in snapshot.files {
+            let relative = file.path.strip_prefix("src/").unwrap_or(&file.path);
+            files.insert(relative.to_string(), file.content);
+        }
+        Ok(files)
+    }
+
+    /// Diff the canonical document tree against the trusted turn baseline.
+    ///
+    /// Source changes are journaled by the native file tools; this covers the
+    /// app-owned document writes staged inside the turn.
     pub fn changes(&self, baseline: &WorkspaceBaseline) -> io::Result<Vec<WorkspaceChange>> {
-        let before = scan_text_tree(&baseline.baseline_root, ScanMode::Baseline)?;
-        let after = scan_text_tree(&baseline.workspace_root, ScanMode::Writable)?;
+        let before = scan_text_tree(&baseline.baseline_root.join(BASELINE_DOCUMENTS_DIR))?;
+        let after = scan_text_tree(&baseline.workspace_root)?;
         let paths: BTreeSet<_> = before.keys().chain(after.keys()).cloned().collect();
         let mut changes = Vec::new();
         for path in paths {
@@ -1285,17 +1317,22 @@ impl WorkspaceManager {
         Ok(())
     }
 
+    /// List every regular file below the project root for the panel's file
+    /// tree. Build outputs, `.eud-agent` state and scratch are all listed; only
+    /// the generated `__epspy__`/`__pycache__` shadows are pruned and symlinks
+    /// are skipped, never followed. Accepted/approved documents keep
+    /// their trusted state through the [`PROJECT_DOCUMENT_PREFIX`] mapping.
     pub fn list_files(&self, workspace: &PreparedWorkspace) -> io::Result<Vec<WorkspaceFileEntry>> {
-        let files = scan_files(&workspace.root, ScanMode::All)?;
+        let files = scan_project_tree(&workspace.root)?;
         let state = self.load_state(&workspace.id)?;
         Ok(files
             .into_iter()
             .map(|(path, size)| {
-                let source = path == SOURCE_DIR || path.starts_with("source/");
-                let trusted = (!source).then(|| state.documents.get(&path)).flatten();
-                let approved_plan = approved_plan_for_path(&state.approved_plans, &path);
+                let document = path.strip_prefix(PROJECT_DOCUMENT_PREFIX);
+                let trusted = document.and_then(|document| state.documents.get(document));
+                let approved_plan = document
+                    .and_then(|document| approved_plan_for_path(&state.approved_plans, document));
                 WorkspaceFileEntry {
-                    source,
                     state: approved_plan
                         .map(|_| "approved".to_string())
                         .or_else(|| trusted.map(|entry| entry.state.clone())),
@@ -1315,7 +1352,7 @@ impl WorkspaceManager {
         relative: &str,
     ) -> io::Result<Option<String>> {
         validate_mutable_document_path(relative)?;
-        let path = confined_path(&workspace.root, relative, false)?;
+        let path = confined_path(&workspace.workspace_root, relative, false)?;
         optional_regular_file_bytes(&path)?
             .map(|bytes| decode_utf8(bytes, relative))
             .transpose()
@@ -1349,7 +1386,7 @@ impl WorkspaceManager {
                     ),
                 ));
             }
-            let path = confined_path(&workspace.root, &update.path, true)?;
+            let path = confined_path(&workspace.workspace_root, &update.path, true)?;
             let previous = optional_regular_file_bytes(&path)?;
             prepared.push((path, previous, update.content.as_bytes().to_vec()));
         }
@@ -1478,26 +1515,35 @@ impl WorkspaceManager {
         }
 
         let query = query.to_lowercase();
-        let root = self.workspace_root(workspace_id)?;
-        let files = scan_files(&root, ScanMode::All)?;
+        let (root, _) = self.verified_roots(workspace_id)?;
+        let files = scan_project_tree(&root)?;
         let mut matches = Vec::new();
-        for relative in files.keys() {
-            let bytes = fs::read(confined_path(&root, relative, true)?)?;
-            let content = match decode_utf8(bytes, relative) {
-                Ok(content) => content,
-                Err(error) if error.kind() == io::ErrorKind::InvalidData => continue,
-                Err(error) => return Err(error),
+        for (relative, size) in &files {
+            if relative.to_lowercase().contains(&query) {
+                matches.push(relative.clone());
+                continue;
+            }
+            // Content matches only for files the viewer could show.
+            if *size > MAX_FILE_BYTES {
+                continue;
+            }
+            let bytes = fs::read(confined_project_path(&root, relative)?)?;
+            let Some(content) = decode_viewer_text(bytes) else {
+                continue;
             };
-            if relative.to_lowercase().contains(&query) || content.to_lowercase().contains(&query) {
+            if content.to_lowercase().contains(&query) {
                 matches.push(relative.clone());
             }
         }
         Ok(matches)
     }
 
-    pub fn read_file(&self, workspace_id: &str, relative: &str) -> io::Result<String> {
-        let root = self.workspace_root(workspace_id)?;
-        let path = confined_path(&root, relative, true)?;
+    /// Read one project file for the viewer by project-root-relative path.
+    /// Binary and oversized files are reported, not errors, so the tab can
+    /// explain why it stays closed.
+    pub fn read_file(&self, workspace_id: &str, relative: &str) -> io::Result<ProjectFileContent> {
+        let (root, _) = self.verified_roots(workspace_id)?;
+        let path = confined_project_path(&root, relative)?;
         let metadata = fs::symlink_metadata(&path)?;
         if metadata.file_type().is_symlink() || !metadata.is_file() {
             return Err(io::Error::new(
@@ -1505,28 +1551,37 @@ impl WorkspaceManager {
                 "workspace viewer only reads regular files",
             ));
         }
-        if metadata.len() > MAX_FILE_BYTES {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "workspace file exceeds the viewer size limit",
-            ));
+        let size = metadata.len();
+        if size > MAX_FILE_BYTES {
+            return Ok(ProjectFileContent {
+                size,
+                content: None,
+                unreadable: Some(ProjectFileUnreadable::TooLarge),
+            });
         }
         let bytes = fs::read(path)?;
-        decode_utf8(bytes, relative)
+        Ok(match decode_viewer_text(bytes) {
+            Some(content) => ProjectFileContent {
+                size,
+                content: Some(content),
+                unreadable: None,
+            },
+            None => ProjectFileContent {
+                size,
+                content: None,
+                unreadable: Some(ProjectFileUnreadable::Binary),
+            },
+        })
     }
 
-    /// Restore or remove one writable file during changeset rejection.
+    /// Restore or remove one canonical document during changeset rejection.
     pub fn restore_file(
         &self,
         workspace_id: &str,
-        session_id: Option<&str>,
         relative: &str,
         content: Option<&str>,
     ) -> io::Result<()> {
-        let root = match session_id {
-            Some(session_id) => self.session_workspace_root(workspace_id, session_id)?,
-            None => self.workspace_root(workspace_id)?,
-        };
+        let root = self.workspace_root(workspace_id)?;
         let path = confined_path(&root, relative, false)?;
         match content {
             Some(content) => atomic_write(&path, content.as_bytes()),
@@ -1546,12 +1601,7 @@ impl WorkspaceManager {
         let mut ordered = entries.iter().collect::<Vec<_>>();
         ordered.sort_by_key(|entry| entry.seq);
         for entry in ordered {
-            let JournalTarget::WorkspacePath {
-                workspace_id,
-                session_id: Some(_),
-                path,
-            } = &entry.target
-            else {
+            let JournalTarget::WorkspacePath { workspace_id, path } = &entry.target else {
                 continue;
             };
             let canonical_root = self.workspace_root(workspace_id)?;
@@ -1623,6 +1673,13 @@ impl WorkspaceManager {
     }
 
     pub(crate) fn workspace_root(&self, workspace_id: &str) -> io::Result<PathBuf> {
+        self.verified_roots(workspace_id)
+            .map(|(_, workspace_root)| workspace_root)
+    }
+
+    /// `(project_root, workspace_root)` of the configured native project once
+    /// `workspace_id` is verified to be owned by it.
+    fn verified_roots(&self, workspace_id: &str) -> io::Result<(PathBuf, PathBuf)> {
         let workspace_id = normalize_workspace_id(workspace_id)?;
         let config = self
             .dirs
@@ -1656,17 +1713,7 @@ impl WorkspaceManager {
                 "workspace id is not owned by the configured native project",
             ));
         }
-        Ok(root)
-    }
-
-    fn session_workspace_root(&self, workspace_id: &str, session_id: &str) -> io::Result<PathBuf> {
-        let workspace_id = normalize_workspace_id(workspace_id)?;
-        let session_id = normalize_token(session_id, "session id")?;
-        Ok(self
-            .dirs
-            .session_workspaces_dir()
-            .join(workspace_id)
-            .join(session_id))
+        Ok((project_root, root))
     }
 
     fn state_path(&self, workspace_id: &str) -> io::Result<PathBuf> {
@@ -1718,52 +1765,24 @@ impl WorkspaceManager {
         atomic_write(path, &bytes)
     }
 
-    fn refresh_source(
-        &self,
-        workspace_root: &Path,
-        workspace_id: &str,
-        snapshot: &EpsSnapshot,
-    ) -> io::Result<()> {
-        let stage_parent = self
-            .dirs
-            .workspace_state_dir()
-            .join("source-staging")
-            .join(workspace_id);
-        fs::create_dir_all(&stage_parent)?;
-        let staged = stage_parent.join(uuid::Uuid::new_v4().to_string());
-        fs::create_dir(&staged)?;
-
-        let populate = (|| -> io::Result<()> {
-            let mut seen = BTreeSet::new();
-            for file in &snapshot.files {
-                let relative = normalize_relative_path(&file.path, true)?;
-                let key = relative.to_lowercase();
-                if !seen.insert(key) {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("source mirror path collision: {relative}"),
-                    ));
-                }
-                let Some(content) = &file.content else {
-                    continue;
-                };
-                let target = confined_path(&staged, &relative, true)?;
-                atomic_write(&target, content.as_bytes())?;
+    /// Discard the legacy machine-local session mirrors (Phase 6 cutover).
+    ///
+    /// `<workspaces>/.sessions/**` held per-session document copies and the
+    /// generated `source/` mirror. Canonical documents already live in the
+    /// project's `.eud-agent/workspace`, so the copies are unaccepted drafts
+    /// and are discarded. Turn baselines of pending reviews live under
+    /// `<workspaces>/.state/baselines/<request_id>` — outside this tree — and
+    /// are preserved until their review settles.
+    pub fn discard_legacy_session_mirrors(&self) -> io::Result<()> {
+        let legacy = self.dirs.workspaces_dir().join(".sessions");
+        match fs::symlink_metadata(&legacy) {
+            Ok(_) => {
+                ensure_plain_directory(&legacy)?;
+                fs::remove_dir_all(&legacy)
             }
-            Ok(())
-        })();
-        if let Err(error) = populate {
-            let _ = fs::remove_dir_all(&staged);
-            return Err(error);
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
         }
-
-        let source = workspace_root.join(SOURCE_DIR);
-        if source.exists() {
-            ensure_plain_directory(&source)?;
-            fs::remove_dir_all(&source)?;
-        }
-        fs::rename(&staged, &source)?;
-        ensure_plain_directory(&source)
     }
 }
 
@@ -1837,7 +1856,6 @@ impl WorkspaceTurnRecorder {
                         tool,
                         target: JournalTarget::WorkspacePath {
                             workspace_id: baseline.workspace_id.clone(),
-                            session_id: baseline.session_id.clone(),
                             path: change.path.clone(),
                         },
                         before,
@@ -2227,11 +2245,16 @@ fn merge_workspace_content(
     }
 }
 
+/// Read one canonical source file's pre-turn baseline bytes.
+///
+/// `baseline_root` is the trusted turn baseline (`…/baselines/<request>/<wsid>`);
+/// the source subtree stores canonical `src/` contents without the `src/` prefix,
+/// so callers may pass either `src/foo.eps` or `foo.eps`.
 pub(crate) fn read_source_baseline(
-    workspace_root: &Path,
+    baseline_root: &Path,
     relative: &str,
 ) -> io::Result<Option<String>> {
-    let source_root = workspace_root.join(SOURCE_DIR);
+    let source_root = baseline_root.join(BASELINE_SOURCE_DIR);
     ensure_plain_directory(&source_root)?;
     let relative = relative.strip_prefix("src/").unwrap_or(relative);
     let path = confined_path(&source_root, relative, true)?;
@@ -2248,6 +2271,7 @@ pub struct ExactTextEdit {
 }
 
 pub(crate) fn apply_exact_text_edits(
+    tool: &str,
     path: &str,
     content: &str,
     edits: &[ExactTextEdit],
@@ -2255,7 +2279,7 @@ pub(crate) fn apply_exact_text_edits(
     if edits.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!("file_edit requires at least one edit for `{path}`"),
+            format!("{tool} requires at least one edit for `{path}`"),
         ));
     }
 
@@ -2264,7 +2288,7 @@ pub(crate) fn apply_exact_text_edits(
         if edit.old_text.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("file_edit edit {index} for `{path}` has empty old_text"),
+                format!("{tool} edit {index} for `{path}` has empty old_text"),
             ));
         }
 
@@ -2274,14 +2298,14 @@ pub(crate) fn apply_exact_text_edits(
         let Some(offset) = matches.next() else {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("file_edit edit {index} old_text was not found in `{path}`"),
+                format!("{tool} edit {index} old_text was not found in `{path}`"),
             ));
         };
         if matches.next().is_some() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!(
-                    "file_edit edit {index} old_text occurs more than once in `{path}`; include more surrounding context"
+                    "{tool} edit {index} old_text occurs more than once in `{path}`; include more surrounding context"
                 ),
             ));
         }
@@ -2415,7 +2439,7 @@ fn restore_promotions(promoted: &[(PathBuf, Option<Vec<u8>>)]) -> io::Result<()>
     Ok(())
 }
 
-fn normalize_relative_path(value: &str, allow_source: bool) -> io::Result<String> {
+fn normalize_relative_path(value: &str, allow_temp: bool) -> io::Result<String> {
     if value.is_empty() || value.contains('\0') || value.contains('\\') {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -2469,11 +2493,7 @@ fn normalize_relative_path(value: &str, allow_source: bool) -> io::Result<String
             "runtime workspace paths are internal",
         ));
     }
-    if !allow_source
-        && segments
-            .first()
-            .is_some_and(|segment| *segment == SOURCE_DIR || *segment == TEMP_DIR)
-    {
+    if !allow_temp && segments.first().is_some_and(|segment| *segment == TEMP_DIR) {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "generated workspace paths are read-only",
@@ -2496,8 +2516,8 @@ fn validate_mutable_document_path(relative: &str) -> io::Result<String> {
     Ok(normalized)
 }
 
-fn confined_path(root: &Path, relative: &str, allow_source: bool) -> io::Result<PathBuf> {
-    let relative = normalize_relative_path(relative, allow_source)?;
+fn confined_path(root: &Path, relative: &str, allow_temp: bool) -> io::Result<PathBuf> {
+    let relative = normalize_relative_path(relative, allow_temp)?;
     let target = relative
         .split('/')
         .fold(root.to_path_buf(), |path, segment| path.join(segment));
@@ -2528,15 +2548,8 @@ fn ensure_plain_directory(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ScanMode {
-    All,
-    Writable,
-    Baseline,
-}
-
-fn scan_text_tree(root: &Path, mode: ScanMode) -> io::Result<BTreeMap<String, String>> {
-    let files = scan_files(root, mode)?;
+fn scan_text_tree(root: &Path) -> io::Result<BTreeMap<String, String>> {
+    let files = scan_files(root)?;
     let mut output = BTreeMap::new();
     for (relative, _) in files {
         let bytes = fs::read(confined_path(root, &relative, true)?)?;
@@ -2546,21 +2559,109 @@ fn scan_text_tree(root: &Path, mode: ScanMode) -> io::Result<BTreeMap<String, St
     Ok(output)
 }
 
-fn scan_files(root: &Path, mode: ScanMode) -> io::Result<BTreeMap<String, u64>> {
+/// Confine a project-root-relative viewer path. Unlike [`confined_path`] it
+/// admits every normalized segment (`.eud-agent`, `.tmp`, `.codegraph`, build
+/// outputs): the viewer only reads, and the tree shows the real folder.
+fn confined_project_path(root: &Path, relative: &str) -> io::Result<PathBuf> {
+    if relative.is_empty() || relative.contains('\0') || relative.contains('\\') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "project path must be relative and use '/' separators",
+        ));
+    }
+    let mut target = root.to_path_buf();
+    for component in Path::new(relative).components() {
+        let Component::Normal(segment) = component else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "project path is not normalized",
+            ));
+        };
+        let segment = segment.to_str().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "project path is not UTF-8")
+        })?;
+        if segment.is_empty() || segment.contains(':') {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "project path contains an unsafe segment",
+            ));
+        }
+        target.push(segment);
+    }
+    if target == root || !target.starts_with(root) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "project path escapes its root",
+        ));
+    }
+    Ok(target)
+}
+
+/// Text for the viewer: UTF-8 with an optional BOM stripped, else `None`.
+/// User files under `src/` may carry a BOM; only app-written files are held to
+/// the no-BOM rule.
+fn decode_viewer_text(bytes: Vec<u8>) -> Option<String> {
+    let text = String::from_utf8(bytes).ok()?;
+    Some(
+        text.strip_prefix('\u{feff}')
+            .map(str::to_owned)
+            .unwrap_or(text),
+    )
+}
+
+/// Every regular file below `root` as `relative path -> size`, uncapped.
+/// Only the build-time generated shadows (`__epspy__`/`__pycache__`) are
+/// pruned, matching the native source snapshot; symlinks and reparse points
+/// are skipped rather than followed.
+fn scan_project_tree(root: &Path) -> io::Result<BTreeMap<String, u64>> {
+    ensure_plain_directory(root)?;
+    let mut files = BTreeMap::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(current) = pending.pop() {
+        let mut entries = fs::read_dir(&current)?.collect::<Result<Vec<_>, _>>()?;
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path)?;
+            if metadata.file_type().is_symlink() || crate::memory::is_reparse_point(&metadata) {
+                continue;
+            }
+            if metadata.is_dir() {
+                if crate::native_project::is_generated_artifact_dir(
+                    entry.file_name().to_string_lossy().as_ref(),
+                ) {
+                    continue;
+                }
+                pending.push(path);
+            } else if metadata.is_file() {
+                let relative = path
+                    .strip_prefix(root)
+                    .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "scan escaped root"))?
+                    .components()
+                    .map(|component| component.as_os_str().to_string_lossy())
+                    .collect::<Vec<_>>()
+                    .join("/");
+                files.insert(relative, metadata.len());
+            }
+        }
+    }
+    Ok(files)
+}
+
+fn scan_files(root: &Path) -> io::Result<BTreeMap<String, u64>> {
     if !root.is_dir() {
         return Ok(BTreeMap::new());
     }
     ensure_plain_directory(root)?;
     let mut files = BTreeMap::new();
     let mut total = 0_u64;
-    scan_directory(root, root, mode, &mut files, &mut total)?;
+    scan_directory(root, root, &mut files, &mut total)?;
     Ok(files)
 }
 
 fn scan_directory(
     root: &Path,
     current: &Path,
-    mode: ScanMode,
     files: &mut BTreeMap<String, u64>,
     total: &mut u64,
 ) -> io::Result<()> {
@@ -2576,10 +2677,8 @@ fn scan_directory(
             .collect::<Vec<_>>()
             .join("/");
         let top = relative.split('/').next().unwrap_or_default();
-        // Codex CodeGraph creates this top-level link to its external index. It is runtime
-        // metadata, never a project document; skip it before symlink validation so normal
-        // anti-escape checks remain strict for every user-visible workspace path.
-        if top == CODEGRAPH_RUNTIME_PATH {
+        // Prune scratch, runtime metadata, and unknown trees before inspecting files.
+        if !DOCUMENT_DIRS.contains(&top) {
             continue;
         }
         let metadata = fs::symlink_metadata(entry.path())?;
@@ -2592,16 +2691,8 @@ fn scan_directory(
                 ),
             ));
         }
-        let skip = match mode {
-            ScanMode::All => top == TEMP_DIR,
-            ScanMode::Writable => top == SOURCE_DIR || top == TEMP_DIR,
-            ScanMode::Baseline => relative == BASELINE_MARKER,
-        };
-        if skip {
-            continue;
-        }
         if metadata.is_dir() {
-            scan_directory(root, &entry.path(), mode, files, total)?;
+            scan_directory(root, &entry.path(), files, total)?;
         } else if metadata.is_file() {
             if metadata.len() > MAX_FILE_BYTES {
                 return Err(io::Error::new(
@@ -2658,34 +2749,10 @@ fn write_tree(root: &Path, files: &BTreeMap<String, String>) -> io::Result<()> {
     Ok(())
 }
 
-/// Delta-sync accepted canonical documents into a session root. Generated
-/// `source/` is refreshed separately from one coherent editor snapshot.
-fn sync_documents(canonical_root: &Path, session_root: &Path) -> io::Result<()> {
-    let canonical = scan_text_tree(canonical_root, ScanMode::Writable)?;
-    let current = scan_text_tree(session_root, ScanMode::Writable)?;
-    for relative in current.keys().filter(|path| !canonical.contains_key(*path)) {
-        let target = confined_path(session_root, relative, false)?;
-        match fs::remove_file(target) {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error),
-        }
-    }
-    for (relative, content) in canonical {
-        if current.get(&relative) == Some(&content) {
-            continue;
-        }
-        let target = confined_path(session_root, &relative, false)?;
-        atomic_write(&target, content.as_bytes())?;
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::native_project::{NativeProject, ProjectManifest};
-    use crate::source_snapshot::ProjectSnapshotFile as EpsSnapshotFile;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn unique_temp_dir(tag: &str) -> PathBuf {
@@ -2696,12 +2763,35 @@ mod tests {
         std::env::temp_dir().join(format!("eud-agent-workspace-{tag}-{nanos}"))
     }
 
+    fn manifest() -> ProjectManifest {
+        ProjectManifest {
+            schema_version: crate::native_project::PROJECT_SCHEMA_VERSION,
+            name: "Native".to_string(),
+            source_map: "maps/source.scx".to_string(),
+            output_map: "build/output.scx".to_string(),
+            main_file: "src/main.eps".to_string(),
+            settings: Default::default(),
+            plugins: Vec::new(),
+            python_entrypoints: Vec::new(),
+            python_dependencies: Vec::new(),
+            python_lock: None,
+            editor_compatibility: None,
+        }
+    }
+
+    /// A real configured native project under `<base>/project`. Turn baselines
+    /// capture the canonical source tree, so tests exercise the production path.
     fn manager(tag: &str) -> (PathBuf, WorkspaceManager) {
         let base = unique_temp_dir(tag);
         let dirs = DataDirs::from_bases(&base.join("roaming"), &base.join("local"));
         dirs.ensure_dirs().unwrap();
         let project_root = base.join("project");
-        fs::create_dir_all(&project_root).unwrap();
+        fs::create_dir_all(project_root.join("maps")).unwrap();
+        fs::write(project_root.join("maps/source.scx"), b"map").unwrap();
+        let project = NativeProject::create(&project_root, manifest()).unwrap();
+        project
+            .write_source("src/main.eps", "function onPluginStart() {}")
+            .unwrap();
         let mut config = dirs.load_config().unwrap();
         config.project_path = project_root.to_string_lossy().into_owned();
         dirs.save_config(&config).unwrap();
@@ -2711,25 +2801,8 @@ mod tests {
     fn snapshot(manager: &WorkspaceManager) -> EpsSnapshot {
         let identity = manager.dirs.load_config().unwrap().project_path;
         EpsSnapshot {
-            project: "Example".to_string(),
+            project: "Native".to_string(),
             identity,
-            files: vec![
-                EpsSnapshotFile {
-                    path: "main.eps".to_string(),
-                    ftype: "CUIEps".to_string(),
-                    content: Some("function onPluginStart() {}".to_string()),
-                },
-                EpsSnapshotFile {
-                    path: "lib/util.eps".to_string(),
-                    ftype: "CUIEps".to_string(),
-                    content: Some("function util() {}".to_string()),
-                },
-                EpsSnapshotFile {
-                    path: "python/boot.py".to_string(),
-                    ftype: "CUIPy".to_string(),
-                    content: Some("from eudplib import EUDVariable".to_string()),
-                },
-            ],
         }
     }
 
@@ -2787,6 +2860,7 @@ mod tests {
         let source =
             "function first() {\n    oldCall();\n}\n\nfunction second() {\n    keep();\n}\n";
         let edited = apply_exact_text_edits(
+            "file_edit",
             "main.eps",
             source,
             &[
@@ -2825,31 +2899,63 @@ mod tests {
                 new_text: "replacement".into(),
             },
         ] {
-            assert!(apply_exact_text_edits("main.eps", source, &[edit]).is_err());
+            assert!(apply_exact_text_edits("file_edit", "main.eps", source, &[edit]).is_err());
         }
-        assert!(apply_exact_text_edits("main.eps", source, &[]).is_err());
+        assert!(apply_exact_text_edits("file_edit", "main.eps", source, &[]).is_err());
     }
 
     #[test]
-    fn prepare_keeps_canonical_documents_project_local_and_session_source_machine_local() {
+    fn prepare_exposes_project_root_as_cwd_without_a_session_mirror() {
         let (base, manager) = manager("prepare");
         let initial = snapshot(&manager);
         let workspace = manager.prepare_snapshot(&initial).unwrap();
 
-        for directory in DOCUMENT_DIRS {
-            assert!(workspace.root.join(directory).is_dir());
-        }
-        assert!(!workspace.root.join(SOURCE_DIR).exists());
-        let session = manager
-            .prepare_session_snapshot(&initial, "source-check")
-            .unwrap();
+        // The CLI cwd is the real project root; documents stay under .eud-agent.
+        assert!(workspace.root.join("project.eap").is_file());
         assert_eq!(
-            fs::read_to_string(session.root.join("source/main.eps")).unwrap(),
-            "function onPluginStart() {}"
+            workspace.workspace_root,
+            workspace
+                .root
+                .join(PROJECT_AGENT_DIR)
+                .join(PROJECT_WORKSPACE_DIR)
         );
-        assert!(session
-            .root
-            .starts_with(manager.dirs.session_workspaces_dir()));
+        for directory in DOCUMENT_DIRS {
+            assert!(workspace.workspace_root.join(directory).is_dir());
+        }
+        assert!(!workspace.workspace_root.join("source").exists());
+
+        let session = manager
+            .prepare_session_snapshot(&initial, "session-check")
+            .unwrap();
+        assert_eq!(session.root, workspace.root);
+        assert_eq!(session.workspace_root, workspace.workspace_root);
+        assert_eq!(
+            session.temp_dir,
+            workspace
+                .workspace_root
+                .join(TEMP_DIR)
+                .join("session-check")
+        );
+        assert!(session.temp_dir.is_dir());
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn legacy_session_mirrors_are_discarded_while_pending_baselines_survive() {
+        let (base, manager) = manager("legacy-discard");
+        let workspace = manager.prepare_snapshot(&snapshot(&manager)).unwrap();
+        let baseline = manager.begin_turn(&workspace, "req-pending").unwrap();
+
+        let legacy = manager.dirs.workspaces_dir().join(".sessions");
+        fs::create_dir_all(legacy.join("project/session")).unwrap();
+        fs::write(legacy.join("project/session/spec.md"), b"stale draft").unwrap();
+
+        manager.discard_legacy_session_mirrors().unwrap();
+
+        assert!(!legacy.exists());
+        // The pending review's trusted baseline lives outside the legacy tree.
+        assert!(baseline.baseline_root.is_dir());
+        assert!(baseline.baseline_root.join(BASELINE_MARKER).is_file());
         fs::remove_dir_all(base).ok();
     }
 
@@ -2858,32 +2964,42 @@ mod tests {
         let (base, manager) = manager("search");
         let workspace = manager.prepare_snapshot(&snapshot(&manager)).unwrap();
         write_atomic_bytes(
-            &workspace.root.join("specs/combat.md"),
+            &workspace.workspace_root.join("specs/combat.md"),
             b"Confirmed behavior.",
         )
         .unwrap();
-        fs::write(workspace.root.join("decisions/binary.dat"), [0xff, 0x00]).unwrap();
+        fs::write(
+            workspace.workspace_root.join("decisions/binary.dat"),
+            [0xff, 0x00],
+        )
+        .unwrap();
 
         assert_eq!(
             manager.search_files(&workspace.id, "COMBAT").unwrap(),
-            vec!["specs/combat.md"]
+            vec![".eud-agent/workspace/specs/combat.md"]
         );
         assert_eq!(
             manager
                 .search_files(&workspace.id, "confirmed behavior")
                 .unwrap(),
-            vec!["specs/combat.md"]
+            vec![".eud-agent/workspace/specs/combat.md"]
         );
-        assert!(manager
-            .search_files(&workspace.id, "PLUGINSTART")
-            .unwrap()
-            .is_empty());
+        // The tree covers the whole project root: EPS sources match by content.
+        assert_eq!(
+            manager.search_files(&workspace.id, "PLUGINSTART").unwrap(),
+            vec!["src/main.eps"]
+        );
         assert!(manager
             .search_files(&workspace.id, "eudvariable")
             .unwrap()
             .is_empty());
+        // Binary files match by path only, never by content.
+        assert_eq!(
+            manager.search_files(&workspace.id, "binary.dat").unwrap(),
+            vec![".eud-agent/workspace/decisions/binary.dat"]
+        );
         assert!(manager
-            .search_files(&workspace.id, "binary.dat")
+            .search_files(&workspace.id, "\u{ff}")
             .unwrap()
             .is_empty());
         assert!(manager
@@ -2894,15 +3010,112 @@ mod tests {
     }
 
     #[test]
-    fn baseline_diff_excludes_source_and_restores_writable_files() {
+    fn project_tree_lists_every_root_file_and_viewer_reports_binary_or_oversized() {
+        let (base, manager) = manager("project-tree");
+        let workspace = manager.prepare_snapshot(&snapshot(&manager)).unwrap();
+        fs::create_dir_all(workspace.root.join("build")).unwrap();
+        fs::write(workspace.root.join("build/output.scx"), [0xff, 0x00]).unwrap();
+        fs::File::create(workspace.root.join("maps/huge.scx"))
+            .unwrap()
+            .set_len(MAX_FILE_BYTES + 1)
+            .unwrap();
+        fs::write(workspace.root.join("src/bom.eps"), [0xef, 0xbb, 0xbf, b'x']).unwrap();
+        // eudplib writes these next to every compiled .eps during build.
+        fs::create_dir_all(workspace.root.join("src/__epspy__")).unwrap();
+        fs::write(workspace.root.join("src/__epspy__/main.py"), "# shadow").unwrap();
+        fs::create_dir_all(workspace.root.join("src/__pycache__")).unwrap();
+        fs::write(workspace.root.join("src/__pycache__/main.pyc"), [0x00]).unwrap();
+        fs::create_dir_all(workspace.workspace_root.join(TEMP_DIR).join("s1")).unwrap();
+        fs::write(
+            workspace.workspace_root.join(TEMP_DIR).join("s1/draft.md"),
+            "draft",
+        )
+        .unwrap();
+        write_atomic_bytes(&workspace.workspace_root.join("specs/index.md"), b"# idx").unwrap();
+
+        let listed = manager.list_files(&workspace).unwrap();
+        let paths = listed
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect::<Vec<_>>();
+        for expected in [
+            "project.eap",
+            "maps/source.scx",
+            "maps/huge.scx",
+            "src/main.eps",
+            "src/bom.eps",
+            "build/output.scx",
+            ".eud-agent/state/workspace.json",
+            ".eud-agent/workspace/.tmp/s1/draft.md",
+            ".eud-agent/workspace/specs/index.md",
+        ] {
+            assert!(paths.contains(&expected), "missing {expected} in {paths:?}");
+        }
+        assert!(
+            paths
+                .iter()
+                .all(|path| !path.contains("__epspy__") && !path.contains("__pycache__")),
+            "generated shadows leaked into {paths:?}"
+        );
+        assert!(manager
+            .search_files(&workspace.id, "shadow")
+            .unwrap()
+            .is_empty());
+        assert!(paths.iter().all(|path| !path.contains('\\')));
+        assert_eq!(
+            listed
+                .iter()
+                .find(|file| file.path == "maps/huge.scx")
+                .unwrap()
+                .size,
+            MAX_FILE_BYTES + 1
+        );
+
+        let text = manager.read_file(&workspace.id, "src/main.eps").unwrap();
+        assert_eq!(text.content.as_deref(), Some("function onPluginStart() {}"));
+        assert_eq!(text.unreadable, None);
+        let bom = manager.read_file(&workspace.id, "src/bom.eps").unwrap();
+        assert_eq!(bom.content.as_deref(), Some("x"));
+        let binary = manager
+            .read_file(&workspace.id, "build/output.scx")
+            .unwrap();
+        assert_eq!(binary.content, None);
+        assert_eq!(binary.unreadable, Some(ProjectFileUnreadable::Binary));
+        assert_eq!(binary.size, 2);
+        let huge = manager.read_file(&workspace.id, "maps/huge.scx").unwrap();
+        assert_eq!(huge.content, None);
+        assert_eq!(huge.unreadable, Some(ProjectFileUnreadable::TooLarge));
+        let scratch = manager
+            .read_file(&workspace.id, ".eud-agent/workspace/.tmp/s1/draft.md")
+            .unwrap();
+        assert_eq!(scratch.content.as_deref(), Some("draft"));
+
+        for escaped in [
+            "../outside.txt",
+            "src/../../x",
+            "E:/abs.txt",
+            "/abs",
+            "",
+            "src\\main.eps",
+        ] {
+            assert!(
+                manager.read_file(&workspace.id, escaped).is_err(),
+                "{escaped} must be refused"
+            );
+        }
+        assert!(manager.read_file(&workspace.id, "src").is_err());
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn baseline_diff_covers_documents_and_source_baseline_is_captured() {
         let (base, manager) = manager("diff");
         let workspace = manager.prepare_snapshot(&snapshot(&manager)).unwrap();
-        write_atomic_bytes(&workspace.root.join("specs/game.md"), b"old").unwrap();
+        write_atomic_bytes(&workspace.workspace_root.join("specs/game.md"), b"old").unwrap();
         let baseline = manager.begin_turn(&workspace, "req-1").unwrap();
 
-        write_atomic_bytes(&workspace.root.join("specs/game.md"), b"new").unwrap();
-        write_atomic_bytes(&workspace.root.join("plans/next.md"), b"plan").unwrap();
-        write_atomic_bytes(&workspace.root.join("source/main.eps"), b"tampered").unwrap();
+        write_atomic_bytes(&workspace.workspace_root.join("specs/game.md"), b"new").unwrap();
+        write_atomic_bytes(&workspace.workspace_root.join("plans/next.md"), b"plan").unwrap();
         let changes = manager.changes(&baseline).unwrap();
 
         assert_eq!(changes.len(), 2);
@@ -2912,17 +3125,34 @@ mod tests {
         assert!(changes.iter().any(|change| {
             change.path == "plans/next.md" && change.kind == WorkspaceChangeKind::Created
         }));
+        // The source baseline holds canonical src/ bytes without the src/ prefix.
+        assert_eq!(
+            read_source_baseline(&baseline.baseline_root, "src/main.eps")
+                .unwrap()
+                .as_deref(),
+            Some("function onPluginStart() {}")
+        );
+        assert_eq!(
+            read_source_baseline(&baseline.baseline_root, "main.eps")
+                .unwrap()
+                .as_deref(),
+            Some("function onPluginStart() {}")
+        );
+        assert_eq!(
+            read_source_baseline(&baseline.baseline_root, "src/missing.eps").unwrap(),
+            None
+        );
         manager
-            .restore_file(&workspace.id, None, "specs/game.md", Some("old"))
+            .restore_file(&workspace.id, "specs/game.md", Some("old"))
             .unwrap();
         manager
-            .restore_file(&workspace.id, None, "plans/next.md", None)
+            .restore_file(&workspace.id, "plans/next.md", None)
             .unwrap();
         assert_eq!(
-            fs::read_to_string(workspace.root.join("specs/game.md")).unwrap(),
+            fs::read_to_string(workspace.workspace_root.join("specs/game.md")).unwrap(),
             "old"
         );
-        assert!(!workspace.root.join("plans/next.md").exists());
+        assert!(!workspace.workspace_root.join("plans/next.md").exists());
         fs::remove_dir_all(base).ok();
     }
 
@@ -2930,13 +3160,17 @@ mod tests {
     fn turn_recorder_journals_workspace_file_kinds() {
         let (base, manager) = manager("journal");
         let workspace = manager.prepare_snapshot(&snapshot(&manager)).unwrap();
-        atomic_write(&workspace.root.join("specs/game.md"), b"old").unwrap();
-        atomic_write(&workspace.root.join("decisions/remove.md"), b"obsolete").unwrap();
+        atomic_write(&workspace.workspace_root.join("specs/game.md"), b"old").unwrap();
+        atomic_write(
+            &workspace.workspace_root.join("decisions/remove.md"),
+            b"obsolete",
+        )
+        .unwrap();
         let baseline = manager.begin_turn(&workspace, "req-journal").unwrap();
 
-        atomic_write(&workspace.root.join("specs/game.md"), b"new").unwrap();
-        atomic_write(&workspace.root.join("plans/next.md"), b"plan").unwrap();
-        fs::remove_file(workspace.root.join("decisions/remove.md")).unwrap();
+        atomic_write(&workspace.workspace_root.join("specs/game.md"), b"new").unwrap();
+        atomic_write(&workspace.workspace_root.join("plans/next.md"), b"plan").unwrap();
+        fs::remove_file(workspace.workspace_root.join("decisions/remove.md")).unwrap();
 
         let journal = JournalStore::new(base.join("roaming/eud-agent"));
         let mut recorder = WorkspaceTurnRecorder::new(manager.clone(), baseline, journal.clone());
@@ -2961,24 +3195,26 @@ mod tests {
         let listed = manager.list_files(&workspace).unwrap();
         let accepted = listed
             .iter()
-            .find(|file| file.path == "specs/game.md")
+            .find(|file| file.path == ".eud-agent/workspace/specs/game.md")
             .unwrap();
         assert_eq!(accepted.state.as_deref(), Some("accepted"));
         assert_eq!(accepted.revision, Some(1));
-        assert!(listed.iter().all(|file| !file.path.starts_with("source/")));
+        assert!(listed
+            .iter()
+            .all(|file| !file.path.starts_with(".eud-agent/workspace/source/")));
 
         manager
             .record_plan_approval(&workspace.id, "req-journal", 2, "# Approved plan")
             .unwrap();
         assert_eq!(
-            fs::read_to_string(workspace.root.join("plans/req-journal.md")).unwrap(),
+            fs::read_to_string(workspace.workspace_root.join("plans/req-journal.md")).unwrap(),
             "# Approved plan"
         );
         let approved_plan = manager
             .list_files(&workspace)
             .unwrap()
             .into_iter()
-            .find(|file| file.path == "plans/req-journal.md")
+            .find(|file| file.path == ".eud-agent/workspace/plans/req-journal.md")
             .unwrap();
         assert_eq!(approved_plan.state.as_deref(), Some("approved"));
         assert_eq!(approved_plan.revision, Some(2));
@@ -3007,15 +3243,85 @@ mod tests {
         let workspace = manager.prepare_snapshot(&snapshot(&manager)).unwrap();
 
         assert!(manager
-            .restore_file(&workspace.id, None, "../outside.md", Some("x"))
+            .restore_file(&workspace.id, "../outside.md", Some("x"))
             .is_err());
         assert!(manager
-            .restore_file(&workspace.id, None, "source/main.eps", Some("x"))
+            .restore_file(&workspace.id, ".tmp/scratch.md", Some("x"))
             .is_err());
         assert!(manager
-            .restore_file(&workspace.id, None, "C:/outside.md", Some("x"))
+            .restore_file(&workspace.id, "C:/outside.md", Some("x"))
             .is_err());
         fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn document_scans_prune_unknown_paths_before_reading_files() {
+        let (base, manager) = manager("document-allowlist");
+        let workspace = manager.prepare_snapshot(&snapshot(&manager)).unwrap();
+        let document = workspace.workspace_root.join("specs/feature.md");
+        fs::write(&document, "before").unwrap();
+        fs::create_dir_all(workspace.workspace_root.join("unknown/nested")).unwrap();
+        for relative in ["binary.dat", "unknown/nested/binary.dat"] {
+            fs::write(workspace.workspace_root.join(relative), [0xff]).unwrap();
+        }
+        for relative in ["oversized.dat", "unknown/nested/oversized.dat"] {
+            fs::File::create(workspace.workspace_root.join(relative))
+                .unwrap()
+                .set_len(MAX_FILE_BYTES + 1)
+                .unwrap();
+        }
+
+        let baseline = manager.begin_turn(&workspace, "req-allowlist").unwrap();
+        assert!(manager.changes(&baseline).unwrap().is_empty());
+        // The project tree still lists unknown/oversized files; only the
+        // document scan prunes them.
+        let files = manager.list_files(&workspace).unwrap();
+        assert!(files
+            .iter()
+            .any(|file| file.path == ".eud-agent/workspace/specs/feature.md"));
+        assert!(files
+            .iter()
+            .any(|file| file.path == ".eud-agent/workspace/unknown/nested/oversized.dat"));
+
+        fs::write(document, "after").unwrap();
+        fs::write(workspace.workspace_root.join("unknown/extra.md"), "extra").unwrap();
+        let changes = manager.changes(&baseline).unwrap();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].path, "specs/feature.md");
+        assert_eq!(changes[0].before.as_deref(), Some("before"));
+        assert_eq!(changes[0].after.as_deref(), Some("after"));
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn document_scans_keep_file_size_limits_in_allowed_directories() {
+        for directory in DOCUMENT_DIRS {
+            let (base, manager) = manager("document-size-limit");
+            let workspace = manager.prepare_snapshot(&snapshot(&manager)).unwrap();
+            fs::File::create(workspace.workspace_root.join(directory).join("large.md"))
+                .unwrap()
+                .set_len(MAX_FILE_BYTES + 1)
+                .unwrap();
+
+            assert_eq!(
+                manager
+                    .begin_turn(&workspace, "req-limit")
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::InvalidData
+            );
+            assert_eq!(
+                manager
+                    .read_file(
+                        &workspace.id,
+                        &format!("{PROJECT_DOCUMENT_PREFIX}{directory}/large.md"),
+                    )
+                    .unwrap()
+                    .unreadable,
+                Some(ProjectFileUnreadable::TooLarge)
+            );
+            fs::remove_dir_all(base).ok();
+        }
     }
 
     #[test]
@@ -3024,46 +3330,32 @@ mod tests {
         let workspace = manager.prepare_snapshot(&snapshot(&manager)).unwrap();
         let baseline = manager.begin_turn(&workspace, "req-codegraph").unwrap();
 
-        fs::write(workspace.root.join(CODEGRAPH_RUNTIME_PATH), [0xff]).unwrap();
+        fs::write(
+            workspace.workspace_root.join(CODEGRAPH_RUNTIME_PATH),
+            [0xff],
+        )
+        .unwrap();
 
         assert!(manager.changes(&baseline).unwrap().is_empty());
         assert!(manager
-            .list_files(&workspace)
-            .unwrap()
-            .iter()
-            .all(|file| file.path != CODEGRAPH_RUNTIME_PATH));
-        assert!(manager
-            .restore_file(&workspace.id, None, ".codegraph/index.db", Some("x"))
+            .restore_file(&workspace.id, ".codegraph/index.db", Some("x"))
             .is_err());
         fs::remove_dir_all(base).ok();
     }
 
     #[test]
-    fn session_snapshots_stay_independent_and_accept_promotes_to_canonical() {
+    fn turn_writes_journal_canonical_paths_and_accept_records_metadata() {
         let (base, manager) = manager("session-promote");
         let initial = snapshot(&manager);
-        let canonical = manager.prepare_snapshot(&initial).unwrap();
-        write_atomic_bytes(&canonical.root.join("specs/game.md"), b"accepted").unwrap();
-
-        let session_a = manager
+        let session = manager
             .prepare_session_snapshot(&initial, "session-a")
             .unwrap();
-        let baseline = manager.begin_turn(&session_a, "req-session-a").unwrap();
-        write_atomic_bytes(&session_a.root.join("specs/game.md"), b"session-a change").unwrap();
-
-        let mut changed_snapshot = initial.clone();
-        changed_snapshot.files[0].content = Some("function changed() {}".to_string());
-        let session_b = manager
-            .prepare_session_snapshot(&changed_snapshot, "session-b")
-            .unwrap();
-        assert_eq!(
-            fs::read_to_string(session_a.root.join("source/main.eps")).unwrap(),
-            "function onPluginStart() {}"
-        );
-        assert_eq!(
-            fs::read_to_string(session_b.root.join("source/main.eps")).unwrap(),
-            "function changed() {}"
-        );
+        let baseline = manager.begin_turn(&session, "req-session-a").unwrap();
+        write_atomic_bytes(
+            &session.workspace_root.join("specs/game.md"),
+            b"session-a change",
+        )
+        .unwrap();
 
         let journal = JournalStore::new(base.join("roaming"));
         let mut recorder = WorkspaceTurnRecorder::new(manager.clone(), baseline, journal.clone());
@@ -3071,105 +3363,121 @@ mod tests {
         let entries = JournalStore::load(base.join("roaming"), "req-session-a")
             .unwrap()
             .entries;
+        // Documents are canonical-relative; the journal carries no session scope.
         assert!(entries.iter().all(|entry| matches!(
             &entry.target,
             JournalTarget::WorkspacePath {
-                session_id: Some(session_id),
-                ..
-            } if session_id == "session-a"
+                workspace_id,
+                path,
+            } if workspace_id == &session.id && path == "specs/game.md"
         )));
         manager
             .record_accepted_entries("req-session-a", &entries)
             .unwrap();
         assert_eq!(
-            fs::read_to_string(canonical.root.join("specs/game.md")).unwrap(),
+            fs::read_to_string(session.workspace_root.join("specs/game.md")).unwrap(),
             "session-a change"
         );
+        let trusted = manager.load_state(&session.id).unwrap();
+        assert_eq!(trusted.documents["specs/game.md"].state, "accepted");
         fs::remove_dir_all(base).ok();
     }
 
     #[test]
-    fn session_reject_leaves_canonical_bytes_and_approved_plan_unchanged() {
+    fn reject_restores_exact_canonical_bytes_and_keeps_approved_plan() {
         let (base, manager) = manager("session-reject");
         let canonical = manager.prepare_snapshot(&snapshot(&manager)).unwrap();
-        write_atomic_bytes(&canonical.root.join("specs/game.md"), b"accepted").unwrap();
+        write_atomic_bytes(&canonical.workspace_root.join("specs/game.md"), b"accepted").unwrap();
         manager
             .record_plan_approval(&canonical.id, "req-approved", 1, "# Approved")
             .unwrap();
-        let session = manager
-            .prepare_session_snapshot(&snapshot(&manager), "session-c")
-            .unwrap();
 
+        // A staged change lands on canonical; reject restores the exact bytes.
+        write_atomic_bytes(
+            &canonical.workspace_root.join("specs/game.md"),
+            b"rejected change",
+        )
+        .unwrap();
         manager
-            .restore_file(
-                &session.id,
-                session.session_id.as_deref(),
-                "specs/game.md",
-                Some("rejected change"),
-            )
-            .unwrap();
-        manager
-            .restore_file(
-                &session.id,
-                session.session_id.as_deref(),
-                "specs/game.md",
-                Some("accepted"),
-            )
+            .restore_file(&canonical.id, "specs/game.md", Some("accepted"))
             .unwrap();
 
         assert_eq!(
-            fs::read_to_string(canonical.root.join("specs/game.md")).unwrap(),
+            fs::read_to_string(canonical.workspace_root.join("specs/game.md")).unwrap(),
             "accepted"
         );
         assert_eq!(
-            fs::read_to_string(canonical.root.join("plans/req-approved.md")).unwrap(),
+            fs::read_to_string(canonical.workspace_root.join("plans/req-approved.md")).unwrap(),
             "# Approved"
         );
         fs::remove_dir_all(base).ok();
     }
 
-    #[test]
-    fn concurrent_session_accepts_merge_non_overlapping_changes() {
-        let (base, manager) = manager("session-merge");
-        let initial = snapshot(&manager);
-        let canonical = manager.prepare_snapshot(&initial).unwrap();
-        write_atomic_bytes(
-            &canonical.root.join("specs/game.md"),
-            b"# Game\n\nalpha: old\nbeta: old\n",
-        )
-        .unwrap();
-        let session_a = manager
-            .prepare_session_snapshot(&initial, "session-a")
-            .unwrap();
-        let session_b = manager
-            .prepare_session_snapshot(&initial, "session-b")
-            .unwrap();
-        let baseline_a = manager.begin_turn(&session_a, "req-merge-a").unwrap();
-        let baseline_b = manager.begin_turn(&session_b, "req-merge-b").unwrap();
-        write_atomic_bytes(
-            &session_a.root.join("specs/game.md"),
-            b"# Game\n\nalpha: session-a\nbeta: old\n",
-        )
-        .unwrap();
-        write_atomic_bytes(
-            &session_b.root.join("specs/game.md"),
-            b"# Game\n\nalpha: old\nbeta: session-b\n",
-        )
-        .unwrap();
-
+    /// Build one journaled document change against a shared base, the shape two
+    /// concurrent requests leave behind when both stage from the same canonical
+    /// bytes.
+    fn stage_journaled_change(
+        base: &Path,
+        workspace_id: &str,
+        request_id: &str,
+        document: &str,
+        before: &str,
+        after: &str,
+    ) -> Vec<JournalEntry> {
         let journal = JournalStore::new(base.join("roaming"));
-        WorkspaceTurnRecorder::new(manager.clone(), baseline_a, journal.clone())
-            .finish()
+        journal
+            .record(
+                request_id,
+                JournalEntry {
+                    id: format!("{request_id}-1"),
+                    seq: 1,
+                    tool: WriteTool::WorkspaceWrite,
+                    target: JournalTarget::WorkspacePath {
+                        workspace_id: workspace_id.to_string(),
+                        path: document.to_string(),
+                    },
+                    before: Snapshot::FileContent {
+                        content: before.to_string(),
+                    },
+                    after: Snapshot::FileContent {
+                        content: after.to_string(),
+                    },
+                    ts: epoch_seconds(),
+                },
+            )
             .unwrap();
-        WorkspaceTurnRecorder::new(manager.clone(), baseline_b, journal.clone())
-            .finish()
-            .unwrap();
-        let entries_a = JournalStore::load(base.join("roaming"), "req-merge-a")
+        journal.persist(request_id).unwrap();
+        JournalStore::load(base.join("roaming"), request_id)
             .unwrap()
-            .entries;
-        let entries_b = JournalStore::load(base.join("roaming"), "req-merge-b")
-            .unwrap()
-            .entries;
+            .entries
+    }
+
+    #[test]
+    fn concurrent_requests_merge_non_overlapping_changes_on_accept() {
+        let (base, manager) = manager("session-merge");
+        let canonical = manager.prepare_snapshot(&snapshot(&manager)).unwrap();
+        let document = "# Game\n\nalpha: old\nbeta: old\n";
+        write_atomic_bytes(
+            &canonical.workspace_root.join("specs/game.md"),
+            document.as_bytes(),
+        )
+        .unwrap();
+        let entries_a = stage_journaled_change(
+            &base,
+            &canonical.id,
+            "req-merge-a",
+            "specs/game.md",
+            document,
+            "# Game\n\nalpha: session-a\nbeta: old\n",
+        );
+        let entries_b = stage_journaled_change(
+            &base,
+            &canonical.id,
+            "req-merge-b",
+            "specs/game.md",
+            document,
+            "# Game\n\nalpha: old\nbeta: session-b\n",
+        );
 
         manager
             .record_accepted_entries("req-merge-a", &entries_a)
@@ -3179,50 +3487,38 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            fs::read_to_string(canonical.root.join("specs/game.md")).unwrap(),
+            fs::read_to_string(canonical.workspace_root.join("specs/game.md")).unwrap(),
             "# Game\n\nalpha: session-a\nbeta: session-b\n"
         );
         fs::remove_dir_all(base).ok();
     }
 
     #[test]
-    fn concurrent_session_accept_reports_overlapping_change_without_overwrite() {
+    fn concurrent_accept_reports_overlapping_change_without_overwrite() {
         let (base, manager) = manager("session-conflict");
-        let initial = snapshot(&manager);
-        let canonical = manager.prepare_snapshot(&initial).unwrap();
-        write_atomic_bytes(&canonical.root.join("specs/game.md"), b"# Game\n").unwrap();
-        let session_a = manager
-            .prepare_session_snapshot(&initial, "session-a")
-            .unwrap();
-        let session_b = manager
-            .prepare_session_snapshot(&initial, "session-b")
-            .unwrap();
-        let baseline_a = manager.begin_turn(&session_a, "req-conflict-a").unwrap();
-        let baseline_b = manager.begin_turn(&session_b, "req-conflict-b").unwrap();
+        let canonical = manager.prepare_snapshot(&snapshot(&manager)).unwrap();
+        let document = "# Game\n";
         write_atomic_bytes(
-            &session_a.root.join("specs/game.md"),
-            b"# Game\n\nalpha: session-a\n",
+            &canonical.workspace_root.join("specs/game.md"),
+            document.as_bytes(),
         )
         .unwrap();
-        write_atomic_bytes(
-            &session_b.root.join("specs/game.md"),
-            b"# Game\n\nalpha: session-b\n",
-        )
-        .unwrap();
-
-        let journal = JournalStore::new(base.join("roaming"));
-        WorkspaceTurnRecorder::new(manager.clone(), baseline_a, journal.clone())
-            .finish()
-            .unwrap();
-        WorkspaceTurnRecorder::new(manager.clone(), baseline_b, journal.clone())
-            .finish()
-            .unwrap();
-        let entries_a = JournalStore::load(base.join("roaming"), "req-conflict-a")
-            .unwrap()
-            .entries;
-        let entries_b = JournalStore::load(base.join("roaming"), "req-conflict-b")
-            .unwrap()
-            .entries;
+        let entries_a = stage_journaled_change(
+            &base,
+            &canonical.id,
+            "req-conflict-a",
+            "specs/game.md",
+            document,
+            "# Game\n\nalpha: session-a\n",
+        );
+        let entries_b = stage_journaled_change(
+            &base,
+            &canonical.id,
+            "req-conflict-b",
+            "specs/game.md",
+            document,
+            "# Game\n\nalpha: session-b\n",
+        );
 
         manager
             .record_accepted_entries("req-conflict-a", &entries_a)
@@ -3233,7 +3529,7 @@ mod tests {
 
         assert!(error.to_string().contains("specs/game.md"));
         assert_eq!(
-            fs::read_to_string(canonical.root.join("specs/game.md")).unwrap(),
+            fs::read_to_string(canonical.workspace_root.join("specs/game.md")).unwrap(),
             "# Game\n\nalpha: session-a\n"
         );
         fs::remove_dir_all(base).ok();
@@ -3247,22 +3543,23 @@ mod tests {
             .prepare_snapshot(&EpsSnapshot {
                 project: target.manifest().name.clone(),
                 identity: original_root.to_string_lossy().into_owned(),
-                files: Vec::new(),
             })
             .unwrap();
         let id = prepared.id.clone();
-        fs::write(prepared.root.join("specs/keep.md"), b"keep").unwrap();
+        fs::write(prepared.workspace_root.join("specs/keep.md"), b"keep").unwrap();
         let moved_root = base.join("moved-native");
         fs::rename(&original_root, &moved_root).unwrap();
         let moved = manager
             .prepare_snapshot(&EpsSnapshot {
                 project: target.manifest().name.clone(),
                 identity: moved_root.to_string_lossy().into_owned(),
-                files: Vec::new(),
             })
             .unwrap();
         assert_eq!(moved.id, id);
-        assert_eq!(fs::read(moved.root.join("specs/keep.md")).unwrap(), b"keep");
+        assert_eq!(
+            fs::read(moved.workspace_root.join("specs/keep.md")).unwrap(),
+            b"keep"
+        );
         fs::remove_dir_all(base).ok();
     }
 

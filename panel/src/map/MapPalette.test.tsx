@@ -86,6 +86,54 @@ describe("Map palette paging", () => {
     expect(screen.getByRole("button", { name: "이전" })).toBeEnabled();
   });
 
+  it("hides null tiles through the catalog filter and restarts paging", async () => {
+    render(
+      <MapPalette
+        sessionId="map-session"
+        tileset="jungle"
+        locations={[]}
+        selections={[]}
+        importedEntries={[]}
+        onMention={vi.fn()}
+        onStampMention={vi.fn()}
+        onStampPlace={vi.fn()}
+        onImportedMention={vi.fn()}
+        onImportedPlace={vi.fn()}
+        onImportedDelete={vi.fn()}
+        onLocation={vi.fn()}
+        onNewLocation={vi.fn()}
+      />,
+    );
+
+    expect(
+      await screen.findByRole("button", { name: /Entry 0, 그룹 0, 변형 0 프롬프트에 추가/ }),
+    ).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "다음" }));
+    await waitFor(() =>
+      expect(api.mapCatalog).toHaveBeenLastCalledWith(
+        expect.objectContaining({ kind: "tiles", offset: 100, hideNullTiles: false }),
+      ),
+    );
+
+    const toggle = screen.getByRole("checkbox", { name: "null 타일 제외" });
+    expect(toggle).not.toBeChecked();
+    await userEvent.click(toggle);
+    expect(toggle).toBeChecked();
+    await waitFor(() =>
+      expect(api.mapCatalog).toHaveBeenLastCalledWith(
+        expect.objectContaining({ kind: "tiles", offset: 0, hideNullTiles: true }),
+      ),
+    );
+
+    await userEvent.click(screen.getByRole("button", { name: "지형 브러시" }));
+    expect(screen.queryByRole("checkbox", { name: "null 타일 제외" })).not.toBeInTheDocument();
+    await waitFor(() =>
+      expect(api.mapCatalog).toHaveBeenLastCalledWith(
+        expect.objectContaining({ kind: "brushes", hideNullTiles: false }),
+      ),
+    );
+  });
+
   it("runs at most one visible thumbnail render at a time", async () => {
     const first = Promise.withResolvers<Blob>();
     const second = Promise.withResolvers<Blob>();

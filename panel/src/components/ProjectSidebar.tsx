@@ -1,37 +1,51 @@
 import { useEffect, useRef, useState } from "react";
-import { Database, FileText, FolderTree, RefreshCw } from "lucide-react";
+import { Database, FileText, FolderTree, Library, RefreshCw } from "lucide-react";
 
+import { DatWikiNav } from "@/components/DatWikiNav";
 import { MemoryView } from "@/components/MemoryView";
-import { WikiView } from "@/components/WikiView";
-import { WorkspaceView } from "@/components/WorkspaceView";
+import { RagView } from "@/components/RagView";
+import { WorkspaceFileTree } from "@/components/WorkspaceFileTree";
 import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
-import type { LedgerEntry, WorkspaceFileEntry, WorkspaceListResponse } from "@/lib/ipc";
+import type {
+  DatWikiSchema,
+  RagSearchHit,
+  RagSearchResponse,
+  WorkspaceFileEntry,
+  WorkspaceListResponse,
+} from "@/lib/ipc";
 import { cn } from "@/lib/utils";
-import type { MemoryViewState, WikiState } from "@/state/store";
+import type { MemoryViewState } from "@/state/store";
 
-export type ProjectPanelTab = "wiki" | "memory" | "workspace";
+export type ProjectPanelTab = "wiki" | "memory" | "workspace" | "rag";
 
 export interface ProjectSidebarProps {
   open: boolean;
   project: string;
   activeTab: ProjectPanelTab;
-  wiki: WikiState;
+  /** The DAT catalog the wiki tab searches; App owns the one fetch. */
+  datWiki: DatWikiSchema | null;
+  datWikiLoading: boolean;
+  datWikiError: string | null;
   memory: MemoryViewState | null;
   workspace: WorkspaceListResponse | null;
-  workspacePath: string | null;
-  workspaceContent: string | null;
+  workspaceSelectedPath: string | null;
   workspaceLoading: boolean;
   workspaceError: string | null;
   onTabChange(tab: ProjectPanelTab): void;
   onClose(): void;
-  onWikiSave(entries: Record<string, LedgerEntry>): void;
+  onDatWikiRetry(): void;
+  onDatWikiOpen(table: string, objectId: number): void;
   onMemoryTabSelected(file: MemoryViewState["activeTab"]): void;
   onMemoryEdited(file: MemoryViewState["activeTab"], content: string): void;
   onMemorySave(payload: { file: MemoryViewState["activeTab"]; content: string }): void;
   onWorkspaceSelect(file: WorkspaceFileEntry): void;
   onWorkspaceSearch(query: string): Promise<string[]>;
   onWorkspaceRefresh(): void;
+  onRagSearch(query: string): Promise<RagSearchResponse>;
+  onRagOpen(hit: RagSearchHit): void;
+  /** Search-hit id of the reference tab active in the center column. */
+  activeRagId: string | null;
 }
 
 const WIDTH_KEY = "eud.project-sidebar.width";
@@ -50,31 +64,37 @@ function storedWidth(): number {
 }
 
 const TABS: ReadonlyArray<{ id: ProjectPanelTab; label: string; icon: typeof Database }> = [
+  { id: "workspace", label: "파일", icon: FolderTree },
   { id: "wiki", label: "DAT 위키", icon: Database },
   { id: "memory", label: "메모리", icon: FileText },
-  { id: "workspace", label: "파일", icon: FolderTree },
+  { id: "rag", label: "참고 문서", icon: Library },
 ];
 
 export function ProjectSidebar({
   open,
   project,
   activeTab,
-  wiki,
+  datWiki,
+  datWikiLoading,
+  datWikiError,
   memory,
   workspace,
-  workspacePath,
-  workspaceContent,
+  workspaceSelectedPath,
   workspaceLoading,
   workspaceError,
   onTabChange,
   onClose,
-  onWikiSave,
+  onDatWikiRetry,
+  onDatWikiOpen,
   onMemoryTabSelected,
   onMemoryEdited,
   onMemorySave,
   onWorkspaceSelect,
   onWorkspaceSearch,
   onWorkspaceRefresh,
+  onRagSearch,
+  onRagOpen,
+  activeRagId,
 }: ProjectSidebarProps) {
   const [width, setWidth] = useState(storedWidth);
   const dragRef = useRef<{ startX: number; startWidth: number } | null>(null);
@@ -110,7 +130,7 @@ export function ProjectSidebar({
             <p className="truncate text-[11px] text-muted-foreground" title={project}>{project || "프로젝트 없음"}</p>
           </div>
         </div>
-        <div role="tablist" aria-label="프로젝트 도구" className="grid grid-cols-3 px-2">
+        <div role="tablist" aria-label="프로젝트 도구" className="grid grid-cols-4 px-2">
           {TABS.map(({ id, label, icon: Icon }) => (
             <button
               key={id}
@@ -119,7 +139,7 @@ export function ProjectSidebar({
               aria-selected={activeTab === id}
               onClick={() => onTabChange(id)}
               className={cn(
-                "flex min-h-10 items-center justify-center gap-1.5 border-b-2 px-2 text-xs outline-none transition-colors focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring",
+                "flex min-h-10 items-center justify-center gap-1 whitespace-nowrap border-b-2 px-1 text-xs outline-none transition-colors focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring",
                 activeTab === id
                   ? "border-primary text-foreground"
                   : "border-transparent text-muted-foreground hover:text-foreground",
@@ -134,7 +154,13 @@ export function ProjectSidebar({
 
       <div className="flex min-h-0 flex-1 overflow-hidden">
         {activeTab === "wiki" && (
-          <WikiView wiki={wiki} embedded onClose={onClose} onSave={onWikiSave} />
+          <DatWikiNav
+            schema={datWiki}
+            loading={datWikiLoading}
+            error={datWikiError}
+            onRetry={onDatWikiRetry}
+            onOpen={onDatWikiOpen}
+          />
         )}
         {activeTab === "memory" && memory && (
           <MemoryView
@@ -151,19 +177,18 @@ export function ProjectSidebar({
             <Spinner className="size-4" /> 메모리를 여는 중…
           </div>
         )}
+        {activeTab === "rag" && (
+          <RagView onSearch={onRagSearch} onOpen={onRagOpen} activeId={activeRagId} />
+        )}
         {activeTab === "workspace" && workspace && (
-          <WorkspaceView
+          <WorkspaceFileTree
             key={workspace.workspaceId}
             workspace={workspace}
-            selectedPath={workspacePath}
-            selectedContent={workspaceContent}
+            selectedPath={workspaceSelectedPath}
             loading={workspaceLoading}
-            error={workspaceError}
-            embedded
             onSelect={onWorkspaceSelect}
             onSearch={onWorkspaceSearch}
             onRefresh={onWorkspaceRefresh}
-            onClose={onClose}
           />
         )}
         {activeTab === "workspace" && !workspace && (

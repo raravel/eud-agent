@@ -52,6 +52,8 @@ impl<S: EventSink> SessionRuntimeEventSink<S> {
 impl<S: EventSink + Send + Sync> RuntimeEventSink for SessionRuntimeEventSink<S> {
     fn emit(&self, event: &AdapterEventKind) -> Result<(), ProviderRuntimeError> {
         let agent = match event {
+            // The native session identity is run bookkeeping, not transcript.
+            AdapterEventKind::NativeSessionStarted { .. } => return Ok(()),
             AdapterEventKind::ResponseStarted { response_id } => {
                 *self.response_id.lock() = Some(response_id.clone());
                 ipc::AgentEvent {

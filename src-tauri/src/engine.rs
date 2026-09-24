@@ -5,18 +5,23 @@
 //! unit-testable without project I/O, RAG, or Codex I/O.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     fmt,
     path::PathBuf,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
     },
     time::{SystemTime, UNIX_EPOCH},
 };
 
 pub(crate) mod runtime_events;
+mod team;
 
+pub(crate) use team::emit_team_tasks;
+
+#[cfg(test)]
+use crate::provider_runtime::{AdapterEventKind, NormalizedBlock};
 use crate::{
     attachment::{AttachmentContext, AttachmentStore},
     ipc, journal,
@@ -27,29 +32,24 @@ use crate::{
         HARNESS_DEADLINE, TASK_STATE_COMPILER_DEADLINE, TASK_STATE_COMPILER_OUTPUT_TOKENS,
     },
     tool_exec::SessionToolRuntime,
-    workspace::{approved_plan_path, WorkspaceManager},
-};
-#[cfg(test)]
-use crate::{
-    provider_runtime::{AdapterEventKind, NormalizedBlock},
-    workspace::PreparedWorkspace,
+    workspace::{approved_plan_path, PreparedWorkspace, WorkspaceManager},
 };
 use parking_lot::Mutex as SyncMutex;
 use tauri::Emitter;
 
 const FIRST_PRINCIPLES: &str = include_str!("data/first_principles.md");
-const INTRO: &str = "You are the native EUD project agent. You work in a durable, sandboxed \
-project filesystem and edit the canonical StarCraft EUD project through eud-tools. The server \
-validates and journals every project/map mutation and every durable workspace change.";
+const INTRO: &str = "You are the native EUD project agent. You work in the real StarCraft EUD \
+project: read and edit its files directly, and use eud-tools for the operations that need the \
+server's authority. Every turn is committed to the project's git history, so a change you make is \
+recoverable, not irreversible.";
 
 const WORKSPACE_GUIDE: &str = r#"[project workspace]
-- Your cwd is the current project's durable filesystem workspace. Use native filesystem tools only for reading accepted `specs/`, immutable `plans/`, historical `decisions/`, `worklog/`, and the coherent `source/` mirror.
-- The foreground implementation workspace is read-only. NEVER edit `specs/`, `plans/`, `decisions/`, `worklog/`, or project memory during implementation.
-- On plan approval, the app writes the exact approved plan to `plans/<request-id>.md`; NEVER edit, replace, rename, or delete it.
-- After the code/map changes are accepted, the backend starts a separate post-acceptance harness job. That job generates one structured delta, a deterministic worklog, and a separately reviewable document changeset.
-- `source/` is a coherent read-only mirror of the editor's current epScript files. Prefer source_search and ranged read_file for bounded exact excerpts; native glob/grep/read remains available when broader inspection is required. NEVER try to modify `source/`; live editor changes still go through eud-tools.
-- Use eud-tools for every editor, map, DAT, build, and RAG action. Native shell/file tools are read-only in implementation turns.
-- After the authoritative build and required verification, answer immediately. Do not search for prior worklogs or perform harness/document cleanup."#;
+- Your cwd is the native project root that holds `project.eap`. Read and edit the real tree directly with your own file tools: `src/**/*.eps`, `src/**/*.py`, `dat/*.json`, `project.eap`, and the durable documents under `.eud-agent/workspace/{specs,plans,decisions,worklog}`. Create, rename and delete files there as the work needs.
+- Three paths stay read-only and the sandbox refuses a write to them: `maps/**` and `references/**` (binary maps the app backs up, verifies and rolls back itself) and `.git/**` (the history that makes your changes recoverable). Map changes go through the map tools or the Map session, never through a file write.
+- `build_run` is the only way to run anything. There is no shell.
+- Editing `dat/*.json` by hand is allowed but exacting: each override's `before` must be the stock catalog value, because the generator emits `after - before` as a runtime delta. `dat_patch` checks that for you, and the build refuses a file that gets it wrong.
+- On plan approval, the app writes the exact approved plan to `.eud-agent/workspace/plans/<request-id>.md`; NEVER edit, replace, rename, or delete it.
+- The eud-tools writers (`file_write`, `file_edit`, `dat_patch`, the map and sound tools) still work and take project-relative paths. Prefer them when they do the job in one call; reach for your own file tools when they are simpler."#;
 
 const EPSCRIPT_GUIDE: &str = r#"[epscript]
 - epScript (*.eps) is the primary authoring language and the default for gameplay logic; use direct Python only when the requested change belongs in an existing or explicitly requested Python entrypoint.
@@ -111,15 +111,8 @@ The correct eps way to write the constructs people most often miscode. These are
 
 const BUILD_GUIDE: &str = r#"[build]
 - After you APPLY source, plugin, or Python dependency changes, ALWAYS run build_run in the SAME turn to verify the complete project. Code or dependency state you never built is NOT done.
-- build_run returns the complete structured result ({ok, errors with source/file/line/message/raw}); read it directly, fix the code, and build again on failure. The server enforces a 3-attempt self-fix budget per request; when it is spent, STOP and report the remaining errors to the user verbatim.
+- build_run returns the structured result ({ok, errors with source/file/line/message/raw, warnings with source/file/line/message/count, outputExcerpt, logPath, omittedErrors/omittedWarnings}); read it directly, fix the code, and build again on failure. `ok` depends only on errors: warnings (for example euddraft null-tile replacement) never fail a build, but report them. outputExcerpt is a bounded head/tail of euddraft output; when you need more, page the complete log with build_log_read (line range or query) instead of asking the user to paste build output. The server tracks progress by project revision plus stable diagnostic fingerprint and blocks repeated identical or short cyclic no-progress failures until the project input changes.
 - A failure whose message says no matching player exists (e.g. "연결맵에 조건에 맞는 플레이어가 없습니다") is a MAP setup problem, not an eps bug — fix it with player_setup (a Human controller AND a start location for at least one player), then rebuild."#;
-
-const TRACE_TEST_GUIDE: &str = r#"[runtime trace tests]
-- Runtime trace results are diagnostic: failed/inconclusive never blocks review and never justifies changing correct project code to silence the harness. Use them only after the current request's build_run succeeds.
-- Permanent regression tests live only under `tests/**/*.tests.eps`, one scenario per file. Each file MUST define `function eudAgentTestSetup() {}` and `function eudAgentTestStep(tick) {}` and finish with exactly one `eudAgentPass(eventId)`. Keep these modules outside the configured MainFile's production import graph; use root-qualified project imports such as `TriggerEditor.feature` so the isolated harness can load them.
-- Run `trace_suite_run({tests:[...]})` for selected files while iterating and `trace_suite_run({})` for the complete persistent suite before review. When a repeatable deterministic contract changes, create or update its permanent test instead of regenerating the same temporary test on every request. `trace_test_run` remains available only for genuinely one-off diagnosis and takes the same callbacks as one temporary epScript module.
-- Tests may call `eudAgentTrace(eventId, severity, v0, v1, v2, v3)`, `eudAgentAssertEq(eventId, actual, expected)`, `eudAgentFail(eventId, actual, expected)`, and `eudAgentPass(eventId)`. Return immediately after a failed assertion.
-- Each test builds and runs an isolated map copy in one fresh 32-bit StarCraft process. Create the owned client suspended; before resume, the bundled x86 isolation helper MUST validate `StarCraft.exe` and neutralize only its foreground/focus/cursor user32 entrypoints. The client then remains minimized and off-screen. Targeted `PostMessageW` messages invoke LAN/UDP `CreateGame` and `Alt+O`; global keyboard/mouse synthesis and focus fallback are forbidden. Any isolation failure is inconclusive and terminates the owned process."#;
 
 const MAP_LOCATION_GUIDE: &str = r#"[map inspection]
 - Use map_info summary first, then page/filter terrain, units, locations, players, or switches instead of guessing from the connected map.
@@ -153,13 +146,18 @@ const AUDIO_SOUND_GUIDE: &str = r#"[map sounds]
 - Volume and fade are offline file edits. Do not claim runtime stop, pause/resume, seek, volume automation, crossfade, gapless playback, or independent concurrent BGM control.
 - After any sound import/edit and required EPS path migration, run the complete-project build_run. A map sound mutation without a build attempt is incomplete."#;
 
+const MAP_HANDOFF_GUIDE: &str = r#"[map handoff]
+- This session cannot place or edit terrain, units, buildings, doodads, or sprites itself: those belong to the Map Agent, your team session with its own tools. When a request needs such a change, do not answer that it is impossible and never ask the user to open the Map window first: map_task_request needs no open window. Call map_info in this request, then map_task_request with the goal, the layers, the target rectangles of the area (or target selection ids from [resolved mentions]), and protect rectangles for cells inside it that must stay unchanged.
+- The Map Agent is the designer, not a plotter: it has the palette, tile readers, renderer, and analyzer this session lacks, and a direct request in the Map window gets its full skill. A team task gets the same skill only when it receives what the user would send in the Map window: a target area plus a short request. So write the goal in a few sentences, as the user would type it: the user's wording and intent in the user's language ("시작마을처럼 예쁘게 꾸며줘", "몬스터 사냥터답게"), any reference area it should match ("the village at x=16..39, y=16..35"), and only the constraints the code depends on — keep-clear cells, location ids, walkability or reachability. Put bounds in target/protect, not in the goal: the verifier enforces them. Give one area or feature per task and hand a larger piece of work over as a sequence of tasks, each applied before the next. Never choose the medium (doodads vs tiles vs units/buildings/sprites), counts, doodad ids, cluster coordinates, or a suggested layout, and never paste tile ids from map_info unless they are themselves a constraint: state a keep-clear rectangle, not a tile listing. Grant every layer the look may need (decoration usually needs terrain, doodads, and sprites, often units or buildings too) and narrow layers only when the user or the code requires it. The Map Agent reads tiles itself with map_terrain_read and has no map_info, so never instruct it to call map_info.
+- On candidate_ready, decide yourself in the same turn: inspect the candidate with map_task_diff (counts and verification), map_task_objects (exact placements per layer), and map_task_render (a picture of the area), then map_task_apply it when it meets the goal, send a map_task_request with revisesTaskId set to that task and a goal stating only the change (the same team session continues on that candidate), or map_task_discard it. A later user request that edits a task's result (candidate_ready or applied) likewise sets revisesTaskId; an unrelated request omits it and starts a fresh team session from the saved map. After a successful apply re-read map_info and continue with the EPS-side work (triggers, locations, players, switches, sounds).
+- On running (the Map Agent needed more than the wait), end the turn with a short status; the conversation continues by itself once the task settles — the next message reports it through [map tasks] and you continue from there — so never ask the user to send a message or open a window to resume. While a task is queued, running, or candidate_ready, location_write, switch_write, player_setup, and map sound tools are refused, and code must not reference objects a pending candidate would create.
+- The user can also apply, discard, or undo in the Map window (the app opens it on the team session when a candidate is ready) ; an undone apply shows as discarded in [map tasks]. Never claim the map changed before [map tasks] or map_task_status shows the task as applied.
+- If a map task call fails, report the exact reason and stop; do not turn a failure into an instruction for the user to open, switch, or reload a window."#;
+
 const EVIDENCE_GUIDE: &str = r#"[evidence]
-- EVERY unit of work (eps/Python code, Python dependencies, dat edits, map location/player/switch writes, settings) must be grounded in the docs: call search_docs (Korean query) BEFORE writing, inspect promising exact chunks with docs_get, and justify each item with WHY plus its source as a markdown link — `... (근거: [제목](url))`.
-- search_docs previews are exact discovery excerpts, not summaries. Search as broadly and repeatedly as unresolved claims require; use docs_get in batches for the specific full chunks needed to verify details. Reuse an already verified source across related plan steps instead of re-fetching it.
-- `repeated=true` and a zero `newCount` are novelty signals, never a forced stopping condition. Reformulate, seek a different source tier, or continue exact reads when material uncertainty remains.
-- Cite on BOTH review surfaces: when the user explicitly requests a plan, every propose_plan step carries its evidence link(s); the final answer always explains each applied change with its link(s). The reference-context chunks below carry their own `source:` links — cite those the same way.
-- The server enforces this: mutating tool calls are rejected until at least one search_docs has run in the request.
-- If searching finds NO relevant document for an item, mark it explicitly as 근거 없음 (일반 EUD 지식) and proceed — NEVER fabricate a source or url.
+- The project itself is your first source: read the tree before you change it. Use search_docs (Korean query) and docs_get for what the project cannot answer — an eudplib/euddraft API you are unsure of, a platform behavior, a symptom you have not seen.
+- search_docs previews are exact discovery excerpts, not summaries. Use docs_get for the full chunks you need to verify a detail. Reuse a source you already read instead of re-fetching it.
+- When a claim rests on a document, cite it as a markdown link — `... (근거: [제목](url))`. If nothing relevant exists, say 근거 없음 (일반 EUD 지식) and proceed. NEVER fabricate a source or url.
 - When the user reports a crash / EUD error / drop / freeze, FIRST match the symptom against the [first principles] list and cite the matching item number (or state explicitly that no item matches) BEFORE proposing or applying any fix. A speculative fix without a named suspected cause is forbidden.
 - [first principles] always outrank retrieved documents."#;
 
@@ -170,12 +168,14 @@ const MESSAGE_FORMAT_INSTRUCTIONS: &str = r#"[message format]
 const INTERACTION_GUIDE: &str = r#"[interaction]
 - Use ask only when a user decision or missing input materially changes the result. Never ask for facts available from project files, memory, or tools.
 - Group up to four related questions in one ask call. Use 2-5 concise options for a choice, set multi only when selections can be combined, and rely on the panel's Other input for free-form answers. Explain tradeoffs in option descriptions.
+- The user has 240 seconds to answer an ask. If the result is {"status":"unanswered"}, restate the same questions as your final plain-text answer and end the turn; the user's next message is the answer. Do not call ask again in that turn.
 - When explaining a flow, state transition, dependency, or component composition, prefer a fenced `mermaid` diagram over an ASCII/text-only flow. Use Mermaid only when relationships are genuinely clearer as a diagram; keep supporting prose brief."#;
 
-const TRIAGE_INSTRUCTIONS: &str = r#"[triage]
-- Answer-only requests (questions, explanations): reply directly and use NO write tools.
-- Call propose_plan(markdown) ONLY when the user explicitly asks you to write or propose a plan.
-- Otherwise, execute the requested change directly regardless of its size. File writes and build_run never require plan approval."#;
+const COMPLETION_GUIDE: &str = r#"[completion]
+- You read, change and build in this one turn. There is no stage that researches or plans for you, and nothing reviews your work before the user sees it.
+- Call propose_plan(markdown) only when the user explicitly asks you to write a plan, or when the work is large enough that you want the user to agree with the shape before you start.
+- A green build means the project compiles. It does NOT mean the map plays correctly — only the user can know that by running it in StarCraft. Never claim a change works in game.
+- End every turn that changed something by naming what the user should check in game, concretely: what to do, and what should happen."#;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentTurnResult {
@@ -189,6 +189,9 @@ pub enum AgentTurnResult {
     /// reviewable, but no answer or plan event is emitted.
     Cancelled,
     WriteTransition,
+    IterationBoundary {
+        reason: crate::provider_runtime::IterationBoundaryReason,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -218,8 +221,6 @@ pub enum EngineEvent {
     ContextUsage(ipc::ContextUsageEvent),
     Answer(ipc::AnswerEvent),
     Plan(ipc::PlanEvent),
-    Changeset(ipc::ChangesetEvent),
-    RollbackResult(ipc::RollbackResultEvent),
     Progress(ipc::ProgressEvent),
     Error(ipc::ErrorEvent),
     Status(ipc::StatusResponse),
@@ -228,6 +229,9 @@ pub enum EngineEvent {
     /// panel can flip out of its connecting state. Carries nothing rendered raw
     /// (rules.md forbids raw kind identifiers as user-facing text).
     SessionLoaded(ipc::SessionLoadedEvent),
+    AutonomousRun(Box<crate::autonomous::AutonomousRunState>),
+    /// What a turn boundary recorded in the project's git history.
+    Git(ipc::GitTurnEvent),
 }
 
 pub(crate) trait EventSink {
@@ -244,6 +248,13 @@ pub trait MemoryProvider: Send + Sync {
 /// state from the editor), so a resumed thread never carries a stale snapshot.
 pub trait ProjectStateProvider: Send + Sync {
     fn render_section(&self) -> String;
+}
+
+/// Renders the `[project map]` section (source listing, entrypoints, plugins,
+/// DAT override counts, accepted spec index) fresh each turn; the context
+/// cursor hashes it so it is re-sent only when it changes.
+pub trait ProjectMapProvider: Send + Sync {
+    fn render_section(&self) -> Option<String>;
 }
 
 /// Provides the dat-edit WIKI `[wiki facts]` prompt section and records accepted
@@ -268,6 +279,7 @@ pub struct AgentEngineConfig {
     rag_hits: Vec<crate::rag::Hit>,
     memory_provider: Option<Arc<dyn MemoryProvider>>,
     project_state_provider: Option<Arc<dyn ProjectStateProvider>>,
+    project_map_provider: Option<Arc<dyn ProjectMapProvider>>,
     wiki_provider: Option<Arc<dyn WikiProvider>>,
 }
 
@@ -283,6 +295,7 @@ impl AgentEngineConfig {
             rag_hits,
             memory_provider: None,
             project_state_provider: None,
+            project_map_provider: None,
             wiki_provider: None,
         }
     }
@@ -308,6 +321,18 @@ impl AgentEngineConfig {
     pub fn with_wiki_provider(mut self, provider: Arc<dyn WikiProvider>) -> Self {
         self.wiki_provider = Some(provider);
         self
+    }
+
+    pub fn with_project_map_provider(mut self, provider: Arc<dyn ProjectMapProvider>) -> Self {
+        self.project_map_provider = Some(provider);
+        self
+    }
+
+    /// The `[project map]` section for the prompt, when a provider is wired.
+    fn project_map_for_prompt(&self) -> Option<String> {
+        self.project_map_provider
+            .as_ref()
+            .and_then(|provider| provider.render_section())
     }
 
     /// The `[wiki facts]` section for the prompt, when a provider is wired and the
@@ -343,7 +368,6 @@ enum Phase {
     Answer,
     PlanReview,
     Executing,
-    ChangesetReview,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -358,6 +382,8 @@ pub(crate) struct AgentEngine<R: RuntimeExecutor, S: EventSink> {
     config: AgentEngineConfig,
     phase: Phase,
     thread_active: bool,
+    /// Whether the last chat turn ended cancelled rather than answered.
+    last_turn_cancelled: bool,
     hydrated: bool,
     plan_revision: u32,
     current_plan_markdown: Option<String>,
@@ -381,6 +407,9 @@ pub(crate) struct AgentEngine<R: RuntimeExecutor, S: EventSink> {
     journal_data_dir: PathBuf,
     runtime: SessionToolRuntime,
     cancellation: tokio::sync::watch::Receiver<u64>,
+    execution_mode: crate::autonomous::ExecutionMode,
+    autonomous_policy: crate::autonomous::AutonomousRunPolicy,
+    autonomous_pause_requested: Arc<AtomicBool>,
 }
 impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
     // Keep each injected runtime, persistence, session, and cancellation authority explicit.
@@ -398,12 +427,30 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
         let journal_store = runtime.journal().clone();
         let journal_data_dir = runtime.app_data_dir();
         let provider_binding = session.provider_binding.clone();
+        let autonomous_run = session.autonomous_run.clone();
+        let execution_mode = if autonomous_run.is_some() {
+            crate::autonomous::ExecutionMode::Autonomous
+        } else {
+            crate::autonomous::ExecutionMode::Interactive
+        };
+        let autonomous_policy = autonomous_run
+            .as_ref()
+            .map(|run| run.policy.clone())
+            .unwrap_or_default();
+        let autonomous_pause_requested = runtime.autonomous_pause_handle();
+        autonomous_pause_requested.store(
+            autonomous_run
+                .as_ref()
+                .is_some_and(|run| run.status.can_resume()),
+            Ordering::SeqCst,
+        );
         Self {
             executor,
             sink,
             config,
             phase: Phase::Idle,
             thread_active: false,
+            last_turn_cancelled: false,
             hydrated: false,
             plan_revision: 0,
             current_plan_markdown: None,
@@ -427,7 +474,369 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
             journal_data_dir,
             runtime,
             cancellation,
+            execution_mode,
+            autonomous_policy,
+            autonomous_pause_requested,
         }
+    }
+
+    pub fn autonomous_pause_handle(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.autonomous_pause_requested)
+    }
+
+    fn autonomous_run(&self) -> Result<crate::autonomous::AutonomousRunState, AgentEngineError> {
+        self.session_store
+            .load(&self.session_id)
+            .map_err(|error| AgentEngineError::new(error.to_string()))?
+            .autonomous_run
+            .ok_or_else(|| AgentEngineError::new("장시간 작업 상태가 없습니다."))
+    }
+
+    async fn persist_autonomous_run(
+        &mut self,
+        mut run: crate::autonomous::AutonomousRunState,
+    ) -> Result<(), AgentEngineError> {
+        let conversation = self.executor.conversation_state();
+        run.last_checkpoint = Some(conversation.clone());
+        run.updated_at = crate::session::now_unix_millis();
+        self.session_store
+            .set_autonomous_checkpoint(&self.session_id, conversation, run.clone())
+            .map_err(|error| AgentEngineError::new(error.to_string()))?;
+        self.executor
+            .acknowledge_persisted()
+            .await
+            .map_err(|error| AgentEngineError::new(error.to_string()))?;
+        self.sink.emit(EngineEvent::AutonomousRun(Box::new(run)))
+    }
+
+    fn update_autonomous_progress(
+        &self,
+        run: &mut crate::autonomous::AutonomousRunState,
+        record_fingerprint: bool,
+    ) -> Result<(), AgentEngineError> {
+        let now = crate::session::now_unix_millis();
+        if let Some(active_started_at) = run.active_started_at.replace(now) {
+            run.progress.elapsed_active_millis = run
+                .progress
+                .elapsed_active_millis
+                .saturating_add(now.saturating_sub(active_started_at));
+        }
+        let (read_actions, write_actions) = self.runtime.request_action_counts();
+        run.progress.read_actions = read_actions;
+        run.progress.write_actions = write_actions;
+        run.progress.latest_build = self.runtime.latest_build_progress().map(Into::into);
+        run.project_revision = self
+            .runtime
+            .current_project_revision()
+            .map_err(AgentEngineError::new)?;
+        let record = self
+            .session_store
+            .load(&self.session_id)
+            .map_err(|error| AgentEngineError::new(error.to_string()))?;
+        if let Some(observed) = record
+            .context_usage
+            .as_ref()
+            .map(|usage| usage.total.total_tokens.max(0) as u64)
+        {
+            run.progress.observed_tokens = Some(
+                run.progress
+                    .observed_tokens
+                    .unwrap_or_default()
+                    .max(observed),
+            );
+        }
+        if record_fingerprint {
+            let journal_count = self
+                .journal_store
+                .changeset(&run.request_id)
+                .map(|changeset| changeset.items.len())
+                .unwrap_or_default();
+            let build = run
+                .progress
+                .latest_build
+                .as_ref()
+                .map(|build| {
+                    format!(
+                        "{}:{}:{}:{}",
+                        build.input_revision,
+                        build.diagnostics_fingerprint,
+                        build.error_count,
+                        build.success
+                    )
+                })
+                .unwrap_or_else(|| "none".to_string());
+            run.record_progress_fingerprint(format!(
+                "{}|{}|{}|{}",
+                run.project_revision, build, journal_count, record.task_state.projection.revision
+            ));
+        }
+        Ok(())
+    }
+
+    async fn checkpoint_autonomous_boundary(
+        &mut self,
+        reason: crate::provider_runtime::IterationBoundaryReason,
+        blocker: Option<String>,
+    ) -> Result<bool, AgentEngineError> {
+        let mut run = self.autonomous_run()?;
+        if run.status.is_terminal() {
+            return Ok(false);
+        }
+        self.update_autonomous_progress(&mut run, true)?;
+        run.boundary_reason = Some(reason);
+        run.blocker = blocker;
+        if self.autonomous_pause_requested.load(Ordering::SeqCst) {
+            run.status = crate::autonomous::AutonomousRunStatus::Paused;
+            run.pause_reason = Some(crate::autonomous::AutonomousPauseReason::User);
+            run.active_started_at = None;
+        } else if let Some(limit_reason) = run.run_limit_reason() {
+            run.status = crate::autonomous::AutonomousRunStatus::SafetyStopped;
+            run.pause_reason = None;
+            run.blocker = Some(limit_reason);
+            run.active_started_at = None;
+        } else {
+            run.status = crate::autonomous::AutonomousRunStatus::Running;
+            run.pause_reason = None;
+            run.iteration = run.iteration.saturating_add(1);
+        }
+        let should_continue = run.status == crate::autonomous::AutonomousRunStatus::Running;
+        // One long run is many commits, so a run that went wrong halfway can be
+        // reverted to the iteration that was still right.
+        let _ = self.commit_boundary(
+            &format!("[장시간 작업 {}회차] {}", run.iteration, run.goal),
+            &run.request_id,
+        );
+        self.persist_autonomous_run(run).await?;
+        Ok(should_continue)
+    }
+
+    fn autonomous_completion_blocker(&self) -> Result<Option<String>, AgentEngineError> {
+        let Some(request_id) = self.current_request_id.as_deref() else {
+            return Err(AgentEngineError::new("foreground run has no request id"));
+        };
+        let has_runtime_changes = self
+            .journal_store
+            .changeset(request_id)
+            .map(|changeset| !changeset.items.is_empty())
+            .unwrap_or(false);
+        if !has_runtime_changes {
+            return Ok(None);
+        }
+        let revision = self
+            .runtime
+            .current_project_revision()
+            .map_err(AgentEngineError::new)?;
+        let built = self
+            .runtime
+            .latest_build_progress()
+            .is_some_and(|build| build.success && build.input_revision == revision);
+        Ok((!built).then(|| {
+            "현재 runtime revision의 성공한 build_run이 없어 장시간 작업을 완료할 수 없습니다."
+                .to_string()
+        }))
+    }
+
+    fn autonomous_continuation_turn(
+        &self,
+        previous: &AgentTurnInput,
+        reason: crate::provider_runtime::IterationBoundaryReason,
+        blocker: Option<&str>,
+    ) -> Result<AgentTurnInput, AgentEngineError> {
+        let run = self.autonomous_run()?;
+        let record = self
+            .session_store
+            .load(&self.session_id)
+            .map_err(|error| AgentEngineError::new(error.to_string()))?;
+        let acceptance = record
+            .task_state
+            .projection
+            .acceptance_criteria
+            .iter()
+            .map(|fact| format!("- {}", fact.text))
+            .collect::<Vec<_>>();
+        let latest_build = run
+            .progress
+            .latest_build
+            .as_ref()
+            .map(|build| {
+                format!(
+                    "revision={}, success={}, errors={}, fingerprint={}",
+                    build.input_revision,
+                    build.success,
+                    build.error_count,
+                    build.diagnostics_fingerprint
+                )
+            })
+            .unwrap_or_else(|| "없음".to_string());
+        Ok(AgentTurnInput {
+            text: format!(
+                "[autonomous continuation]\n원래 목표:\n{}\n\n수락 기준:\n{}\n\n현재 blocker:\n{}\n\n최근 build:\n{}\n\n경계 이유: {:?}\n\n확인된 체크포인트 이후의 미완료 작업만 계속하세요. 완료된 도구 호출을 재실행하거나 이전 대화 전체를 재진술하지 마세요.{}",
+                run.goal,
+                if acceptance.is_empty() {
+                    "- 명시된 원래 목표와 검증 기준".to_string()
+                } else {
+                    acceptance.join("\n")
+                },
+                blocker.unwrap_or("없음"),
+                latest_build,
+                reason,
+                Self::continuation_delegation_hint(reason),
+            ),
+            image_paths: Vec::new(),
+            workspace_root: previous.workspace_root.clone(),
+            workspace_temp: previous.workspace_temp.clone(),
+            workspace_access: previous.workspace_access,
+            output_schema: None,
+            forbid_tools: false,
+        })
+    }
+
+    /// After a context-pressure boundary the next iteration is told to stop
+    /// widening its search. A fixed control phrase; nothing is delegated.
+    fn continuation_delegation_hint(
+        reason: crate::provider_runtime::IterationBoundaryReason,
+    ) -> &'static str {
+        match reason {
+            crate::provider_runtime::IterationBoundaryReason::ContextPressure => {
+                " 컨텍스트 여유가 부족합니다: 넓은 탐색을 더 벌이지 말고 지금까지 확인한 것으로 남은 작업을 끝내세요. 편집 대상은 편집 직전에 직접 다시 읽어야 합니다."
+            }
+            _ => "",
+        }
+    }
+
+    fn interactive_continuation_turn(
+        previous: &AgentTurnInput,
+        reason: crate::provider_runtime::IterationBoundaryReason,
+    ) -> AgentTurnInput {
+        let hint = Self::continuation_delegation_hint(reason);
+        AgentTurnInput {
+            text: format!(
+                "[continuation]
+경계 이유: {reason:?}
+
+확인된 체크포인트 이후의 미완료 작업만 계속하세요. 완료된 도구 호출을 재실행하거나 이전 대화 전체를 재진술하지 마세요.{hint}"
+            ),
+            image_paths: Vec::new(),
+            workspace_root: previous.workspace_root.clone(),
+            workspace_temp: previous.workspace_temp.clone(),
+            workspace_access: previous.workspace_access,
+            output_schema: None,
+            forbid_tools: false,
+        }
+    }
+
+    async fn finish_autonomous_run(
+        &mut self,
+        status: crate::autonomous::AutonomousRunStatus,
+        blocker: Option<String>,
+    ) -> Result<(), AgentEngineError> {
+        let mut run = self.autonomous_run()?;
+        if run.status.is_terminal() {
+            return Ok(());
+        }
+        self.update_autonomous_progress(&mut run, false)?;
+        run.status = status;
+        run.blocker = blocker;
+        run.pause_reason = match status {
+            crate::autonomous::AutonomousRunStatus::Review => {
+                Some(crate::autonomous::AutonomousPauseReason::Review)
+            }
+            crate::autonomous::AutonomousRunStatus::WaitingInput => {
+                Some(crate::autonomous::AutonomousPauseReason::WaitingInput)
+            }
+            _ => None,
+        };
+        run.active_started_at = None;
+        self.persist_autonomous_run(run).await
+    }
+
+    async fn pause_autonomous_for_team_apply(&mut self) -> Result<(), AgentEngineError> {
+        let mut run = self.autonomous_run()?;
+        if run.status.is_terminal() {
+            return Ok(());
+        }
+        self.update_autonomous_progress(&mut run, false)?;
+        run.status = crate::autonomous::AutonomousRunStatus::Paused;
+        run.pause_reason = Some(crate::autonomous::AutonomousPauseReason::TeamApply);
+        run.blocker = Some(
+            "팀 맵 작업이 아직 끝나지 않았습니다. 후보가 준비되면 자동으로 이어서 진행하며, 후보가 이미 준비된 경우 맵 창에서 적용·폐기하거나 계속을 누르면 AI가 후보를 검토합니다."
+                .to_string(),
+        );
+        run.active_started_at = None;
+        self.persist_autonomous_run(run).await
+    }
+
+    async fn pause_autonomous_for_unanswered_ask(&mut self) -> Result<(), AgentEngineError> {
+        let mut run = self.autonomous_run()?;
+        if run.status.is_terminal() {
+            return Ok(());
+        }
+        self.update_autonomous_progress(&mut run, false)?;
+        run.status = crate::autonomous::AutonomousRunStatus::Paused;
+        run.pause_reason = Some(crate::autonomous::AutonomousPauseReason::UnansweredAsk);
+        run.blocker = Some(
+            "질문에 대한 답을 기다리는 시간이 지나 텍스트로 질문했습니다. 계속을 누르면 AI가 같은 질문을 다시 합니다."
+                .to_string(),
+        );
+        run.active_started_at = None;
+        self.persist_autonomous_run(run).await
+    }
+
+    async fn settle_autonomous_review(&mut self) -> Result<(), AgentEngineError> {
+        if self.execution_mode != crate::autonomous::ExecutionMode::Autonomous {
+            return Ok(());
+        }
+        let mut run = self.autonomous_run()?;
+        self.update_autonomous_progress(&mut run, false)?;
+        match run.status {
+            crate::autonomous::AutonomousRunStatus::Review => {
+                run.status = crate::autonomous::AutonomousRunStatus::Completed;
+                run.pause_reason = None;
+                run.blocker = None;
+                run.active_started_at = None;
+            }
+            crate::autonomous::AutonomousRunStatus::Paused => {
+                run.pause_reason
+                    .get_or_insert(crate::autonomous::AutonomousPauseReason::User);
+                run.active_started_at = None;
+            }
+            _ => return Ok(()),
+        }
+        self.persist_autonomous_run(run).await
+    }
+
+    fn boundary_context_pressure(&self) -> Result<bool, AgentEngineError> {
+        if self.autonomous_pause_requested.load(Ordering::SeqCst) {
+            return Ok(false);
+        }
+        let record = self
+            .session_store
+            .load(&self.session_id)
+            .map_err(|error| AgentEngineError::new(error.to_string()))?;
+        Ok(record.context_usage.is_some_and(|usage| {
+            usage
+                .model_context_window
+                .filter(|window| *window > 0)
+                .is_some_and(|window| {
+                    usage.last.total_tokens.saturating_mul(100) >= window.saturating_mul(85)
+                })
+        }))
+    }
+
+    /// Compact at a confirmed iteration boundary when the provider context is under pressure.
+    /// The boundary already checkpointed a started provider conversation, so the thread counts
+    /// as active even inside the first turn of a session.
+    async fn compact_at_boundary(&mut self) -> Result<bool, AgentEngineError> {
+        if !self.boundary_context_pressure()? {
+            return Ok(false);
+        }
+        let previous_phase = self.phase;
+        self.phase = Phase::Idle;
+        self.thread_active = true;
+        let result = self.compact().await;
+        self.phase = previous_phase;
+        result?;
+        Ok(true)
     }
 
     fn run_identity(&self, request_id: &str) -> RunIdentity {
@@ -457,6 +866,43 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
         }
     }
 
+    /// Why the persisted provider conversation could not be resumed at hydration,
+    /// while the session itself stays open for an explicit reset.
+    pub(crate) fn conversation_resume_error(&self) -> Option<&str> {
+        self.conversation_resume_error.as_deref()
+    }
+
+    /// Drop the persisted provider conversation (and any unresolved native receipt)
+    /// so the next turn starts a fresh native session. The panel log, candidate
+    /// state, and task state are untouched; only the model-side thread restarts.
+    pub async fn reset_conversation(&mut self) -> Result<(), AgentEngineError> {
+        if matches!(self.phase, Phase::PlanReview | Phase::Executing) {
+            return Err(AgentEngineError::new(
+                "현재 세션의 진행 중인 요청 또는 검토를 먼저 완료해 주세요.",
+            ));
+        }
+        self.executor
+            .reset()
+            .await
+            .map_err(|error| AgentEngineError::new(error.to_string()))?;
+        self.thread_active = false;
+        self.conversation_resume_error = None;
+        let record = self
+            .session_store
+            .load(&self.session_id)
+            .map_err(|error| AgentEngineError::new(error.to_string()))?;
+        let transcript = condense_transcript(&record.panel_log);
+        self.pending_resume_transcript = (!transcript.trim().is_empty()).then_some(transcript);
+        self.session_store
+            .reset_context_epoch(
+                &self.session_id,
+                &static_prompt_baseline(self.provider_binding.provider),
+                true,
+            )
+            .map_err(|error| AgentEngineError::new(error.to_string()))?;
+        Ok(())
+    }
+
     fn foreground_request(
         &self,
         request_id: &str,
@@ -466,6 +912,8 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
             .session_store
             .load(&self.session_id)
             .map_err(|error| AgentEngineError::new(error.to_string()))?;
+        // Every foreground run starts without an inherited unanswered-ask mark.
+        self.runtime.clear_expired_ask();
         Ok(ForegroundRequest {
             identity: self.run_identity(request_id),
             binding: self.binding_snapshot(false)?,
@@ -494,15 +942,131 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
             .current_request_id
             .clone()
             .ok_or_else(|| AgentEngineError::new("foreground run has no request id"))?;
-        let request = self.foreground_request(&request_id, turn)?;
-        match self.executor.run_foreground(request).await {
-            RunOutcome::Completed { text, .. } => Ok(AgentTurnResult::Answer { text }),
-            RunOutcome::Cancelled => Ok(AgentTurnResult::Cancelled),
-            RunOutcome::WriteTransition => Ok(AgentTurnResult::WriteTransition),
-            RunOutcome::Structured { .. } => Err(AgentEngineError::new(
-                "foreground provider run returned a structured job result",
-            )),
-            RunOutcome::Failed(error) => Err(AgentEngineError::new(error.to_string())),
+        let mut turn = turn;
+        loop {
+            let request = self.foreground_request(&request_id, turn.clone())?;
+            match self.executor.run_foreground(request).await {
+                RunOutcome::Completed { text, .. } => {
+                    if self.execution_mode == crate::autonomous::ExecutionMode::Autonomous {
+                        if self.runtime.ask_expired_for_request(&request_id) {
+                            // The model restated an unanswered ask as text; the
+                            // reply arrives as an ordinary message, so the run
+                            // pauses instead of completing or iterating.
+                            self.pause_autonomous_for_unanswered_ask().await?;
+                            return Ok(AgentTurnResult::Answer { text });
+                        }
+                        if team::has_active_task(&self.session_store, &self.session_id) {
+                            // The Map Agent is still working, or the model
+                            // left a ready candidate undecided: pause; the
+                            // team dispatcher resumes the run when the task
+                            // settles, otherwise the user does.
+                            self.pause_autonomous_for_team_apply().await?;
+                            return Ok(AgentTurnResult::Answer { text });
+                        }
+                        if let Some(blocker) = self.autonomous_completion_blocker()? {
+                            let reason = if self.compact_at_boundary().await? {
+                                crate::provider_runtime::IterationBoundaryReason::ContextPressure
+                            } else {
+                                crate::provider_runtime::IterationBoundaryReason::ProviderContinuation
+                            };
+                            if self
+                                .checkpoint_autonomous_boundary(reason, Some(blocker.clone()))
+                                .await?
+                            {
+                                self.runtime
+                                    .begin_iteration(&request_id)
+                                    .map_err(AgentEngineError::new)?;
+                                turn = self.autonomous_continuation_turn(
+                                    &turn,
+                                    reason,
+                                    Some(&blocker),
+                                )?;
+                                continue;
+                            }
+                            return Ok(AgentTurnResult::IterationBoundary { reason });
+                        }
+                        let status = if self
+                            .journal_store
+                            .changeset(&request_id)
+                            .map(|changeset| !changeset.items.is_empty())
+                            .unwrap_or(false)
+                        {
+                            crate::autonomous::AutonomousRunStatus::Review
+                        } else {
+                            crate::autonomous::AutonomousRunStatus::Completed
+                        };
+                        self.finish_autonomous_run(status, None).await?;
+                    }
+                    return Ok(AgentTurnResult::Answer { text });
+                }
+                RunOutcome::Cancelled => {
+                    if self.execution_mode == crate::autonomous::ExecutionMode::Autonomous {
+                        self.finish_autonomous_run(
+                            crate::autonomous::AutonomousRunStatus::Cancelled,
+                            Some("사용자가 장시간 작업을 중단했습니다.".to_string()),
+                        )
+                        .await?;
+                    }
+                    return Ok(AgentTurnResult::Cancelled);
+                }
+                RunOutcome::WriteTransition => {
+                    if self.execution_mode == crate::autonomous::ExecutionMode::Autonomous {
+                        let mut run = self.autonomous_run()?;
+                        self.update_autonomous_progress(&mut run, false)?;
+                        run.status = crate::autonomous::AutonomousRunStatus::Running;
+                        run.boundary_reason = None;
+                        self.persist_autonomous_run(run).await?;
+                    }
+                    return Ok(AgentTurnResult::WriteTransition);
+                }
+                RunOutcome::IterationBoundary { reason, .. } => {
+                    let reason = if self.compact_at_boundary().await? {
+                        crate::provider_runtime::IterationBoundaryReason::ContextPressure
+                    } else {
+                        reason
+                    };
+                    if self.execution_mode != crate::autonomous::ExecutionMode::Autonomous {
+                        // Ordinary turns never stop at a soft action/round boundary: persist the
+                        // confirmed checkpoint and continue the same request in place.
+                        self.update_active_session().await;
+                        self.runtime
+                            .begin_iteration(&request_id)
+                            .map_err(AgentEngineError::new)?;
+                        turn = Self::interactive_continuation_turn(&turn, reason);
+                        continue;
+                    }
+                    if !self.checkpoint_autonomous_boundary(reason, None).await? {
+                        return Ok(AgentTurnResult::IterationBoundary { reason });
+                    }
+                    self.runtime
+                        .begin_iteration(&request_id)
+                        .map_err(AgentEngineError::new)?;
+                    turn = self.autonomous_continuation_turn(&turn, reason, None)?;
+                }
+                RunOutcome::Structured { .. } => {
+                    let detail =
+                        "foreground provider run returned a structured job result".to_string();
+                    if self.execution_mode == crate::autonomous::ExecutionMode::Autonomous {
+                        self.finish_autonomous_run(
+                            crate::autonomous::AutonomousRunStatus::Failed,
+                            Some(detail.clone()),
+                        )
+                        .await?;
+                    }
+                    return Err(AgentEngineError::new(detail));
+                }
+                RunOutcome::Failed(error) => {
+                    let detail = error.to_string();
+                    if self.execution_mode == crate::autonomous::ExecutionMode::Autonomous {
+                        self.finish_autonomous_run(
+                            crate::autonomous::AutonomousRunStatus::Failed,
+                            Some(detail.clone()),
+                        )
+                        .await?;
+                    }
+                    return Err(AgentEngineError::new(detail));
+                }
+            }
         }
     }
     async fn prepare_eps_context(
@@ -512,8 +1076,9 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
         replay_transcript: Option<&str>,
         mut force_full: bool,
     ) -> Result<String, AgentEngineError> {
-        let static_baseline = static_prompt_baseline();
+        let static_baseline = static_prompt_baseline(self.provider_binding.provider);
         let project_state = project_state_section(&self.config.project_state_for_prompt());
+        let project_map = self.config.project_map_for_prompt();
         let memory = self
             .config
             .project_memory_for_prompt()
@@ -588,6 +1153,7 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
                 project_state: &project_state,
                 project_memory: memory.as_deref(),
                 wiki_facts: wiki.as_deref(),
+                project_map: project_map.as_deref(),
                 reference_context: reference_context.as_deref(),
                 task_revision: record.task_state.projection.revision,
                 task_snapshot: &task_snapshot,
@@ -655,7 +1221,7 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
         request_id: String,
         text: String,
         attachments: Vec<String>,
-    ) -> Result<(), AgentEngineError> {
+    ) -> Result<MapTurnEnd, AgentEngineError> {
         if self.session_kind != crate::session::SessionKind::Map {
             return Err(AgentEngineError::new(
                 "the requested session is not a Map session",
@@ -667,22 +1233,158 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
                 client_turn_id: crate::ipc::new_client_turn_id(),
                 attachments,
                 mentions: Vec::new(),
+                execution_mode: crate::autonomous::ExecutionMode::Interactive,
+                autonomous_policy: None,
             },
             Some(request_id),
         )
-        .await
+        .await?;
+        Ok(if self.last_turn_cancelled {
+            MapTurnEnd::Cancelled
+        } else {
+            MapTurnEnd::Completed
+        })
     }
 
+    pub async fn autonomous_resume(&mut self) -> Result<(), AgentEngineError> {
+        self.ensure_provider_conversation_ready()?;
+        let record = self
+            .session_store
+            .load(&self.session_id)
+            .map_err(|error| AgentEngineError::new(error.to_string()))?;
+        let mut run = record
+            .autonomous_run
+            .clone()
+            .ok_or_else(|| AgentEngineError::new("계속할 장시간 작업이 없습니다."))?;
+        if !run.status.can_resume() {
+            return Err(AgentEngineError::new(
+                "현재 장시간 작업 상태에서는 계속할 수 없습니다.",
+            ));
+        }
+        if !record.pending_request_ids.is_empty() {
+            return Err(AgentEngineError::new(
+                "변경사항 검토를 먼저 완료한 뒤 장시간 작업을 계속하세요.",
+            ));
+        }
+        let current_revision = self
+            .runtime
+            .current_project_revision()
+            .map_err(AgentEngineError::new)?;
+        if run.project_id != self.project_id || run.project_revision != current_revision {
+            run.status = crate::autonomous::AutonomousRunStatus::SafetyStopped;
+            run.blocker = Some(
+                "프로젝트 identity 또는 revision이 체크포인트 이후 변경되었습니다.".to_string(),
+            );
+            run.active_started_at = None;
+            self.persist_autonomous_run(run).await?;
+            return Err(AgentEngineError::new(
+                "프로젝트가 체크포인트 이후 변경되어 장시간 작업을 계속하지 않았습니다.",
+            ));
+        }
+        if run.last_checkpoint.as_ref() != Some(&record.provider_binding.conversation)
+            || self.executor.conversation_state() != record.provider_binding.conversation
+        {
+            run.status = crate::autonomous::AutonomousRunStatus::SafetyStopped;
+            run.blocker = Some("확인된 공급자 체크포인트가 현재 세션과 다릅니다.".to_string());
+            run.active_started_at = None;
+            self.persist_autonomous_run(run).await?;
+            return Err(AgentEngineError::new(
+                "확인된 공급자 체크포인트가 달라 장시간 작업을 계속하지 않았습니다.",
+            ));
+        }
+        if self.current_request_id.as_deref() != Some(run.request_id.as_str()) {
+            self.runtime
+                .begin_request(&run.request_id, &self.project_id)
+                .map_err(AgentEngineError::new)?;
+            self.runtime
+                .restore_autonomous_progress(&run.request_id, &run.progress)
+                .map_err(AgentEngineError::new)?;
+            self.current_request_id = Some(run.request_id.clone());
+            self.current_client_turn_id = Some(run.client_turn_id.clone());
+            self.current_user_text = run.goal.clone();
+        }
+        self.execution_mode = crate::autonomous::ExecutionMode::Autonomous;
+        self.autonomous_policy = run.policy.clone();
+        self.autonomous_pause_requested
+            .store(false, Ordering::SeqCst);
+        self.runtime
+            .begin_iteration(&run.request_id)
+            .map_err(AgentEngineError::new)?;
+        let reason = run
+            .boundary_reason
+            .unwrap_or(crate::provider_runtime::IterationBoundaryReason::ProviderContinuation);
+        // The pause blocker (for example an unanswered ask) is the one thing the
+        // resumed run must know about; it is consumed here, not persisted.
+        let blocker = run.blocker.take();
+        run.status = crate::autonomous::AutonomousRunStatus::Running;
+        run.pause_reason = None;
+        run.active_started_at = Some(crate::session::now_unix_millis());
+        self.persist_autonomous_run(run).await?;
+        self.phase = Phase::Triage;
+        let base = AgentTurnInput::text(String::new()).with_access(WorkspaceAccess::Read);
+        let turn = self.autonomous_continuation_turn(&base, reason, blocker.as_deref())?;
+        let result = self.run_foreground(turn).await?;
+        self.thread_active = true;
+        if let Some(ticket) = self.runtime.write_ticket() {
+            self.pending_write = Some(WriteContinuation::Direct);
+            self.phase = match ticket.state() {
+                crate::write_coordinator::TicketState::Granted => Phase::Executing,
+                crate::write_coordinator::TicketState::Cancelled => Phase::Idle,
+            };
+            self.update_active_session().await;
+            return Ok(());
+        }
+        if matches!(result, AgentTurnResult::WriteTransition) {
+            return Err(AgentEngineError::new(
+                "provider requested a write transition without a write ticket",
+            ));
+        }
+        let state_result = result.clone();
+        self.handle_turn_result(result)?;
+        let goal = self.current_user_text.clone();
+        self.update_task_state_after_turn(&state_result, &goal, None)
+            .await;
+        self.update_active_session().await;
+        Ok(())
+    }
+    /// A request never leaves the provider conversation behind: whichever way
+    /// the turn ends, the confirmed native session (or direct transcript
+    /// revision) the runtime holds is persisted before the result is returned.
+    /// Without this, a failed or cancelled turn kept its boundary only in
+    /// memory and the next launch had nothing to continue from.
     async fn chat_with_request_id(
         &mut self,
         req: ipc::ChatRequest,
         fixed_request_id: Option<String>,
     ) -> Result<(), AgentEngineError> {
+        self.last_turn_cancelled = false;
+        let result = self.chat_turn(req, fixed_request_id).await;
+        if result.is_err() {
+            self.update_active_session().await;
+        }
+        result
+    }
+
+    async fn chat_turn(
+        &mut self,
+        req: ipc::ChatRequest,
+        fixed_request_id: Option<String>,
+    ) -> Result<(), AgentEngineError> {
         self.ensure_provider_conversation_ready()?;
-        if matches!(
-            self.phase,
-            Phase::PlanReview | Phase::Executing | Phase::ChangesetReview
-        ) {
+
+        let execution_mode = req.execution_mode;
+        let autonomous_policy = req.autonomous_policy.clone().unwrap_or_default();
+        if execution_mode == crate::autonomous::ExecutionMode::Autonomous {
+            if self.session_kind != crate::session::SessionKind::Eps {
+                return Err(AgentEngineError::new(
+                    "장시간 작업은 현재 메인 EPS 세션에서만 실행할 수 있습니다.",
+                ));
+            }
+            autonomous_policy
+                .validate()
+                .map_err(AgentEngineError::new)?;
+        }
+        if matches!(self.phase, Phase::PlanReview | Phase::Executing) {
             return Err(AgentEngineError::new(
                 "현재 세션의 진행 중인 요청 또는 검토를 먼저 완료해 주세요.",
             ));
@@ -693,8 +1395,14 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
         self.runtime
             .begin_request(&request_id, &self.project_id)
             .map_err(AgentEngineError::new)?;
+        self.commit_external_edits_before_turn();
+        self.execution_mode = execution_mode;
+        self.autonomous_policy = autonomous_policy.clone();
+        self.autonomous_pause_requested
+            .store(false, Ordering::SeqCst);
         self.current_plan_markdown = None;
         self.approved_plan_sha256 = None;
+        self.plan_revision = 0;
         self.current_request_id = Some(request_id.clone());
         self.current_user_text = req.text.clone();
         self.last_answer.clear();
@@ -740,8 +1448,24 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
                 ))
             })?);
         }
+        if execution_mode == crate::autonomous::ExecutionMode::Autonomous {
+            let revision = self
+                .runtime
+                .current_project_revision()
+                .map_err(AgentEngineError::new)?;
+            let run = crate::autonomous::AutonomousRunState::new(
+                user_text.clone(),
+                req.client_turn_id.clone(),
+                request_id.clone(),
+                self.project_id.clone(),
+                revision,
+                autonomous_policy,
+                crate::session::now_unix_millis(),
+            );
+            self.persist_autonomous_run(run).await?;
+        }
 
-        let turn_text = if self.session_kind == crate::session::SessionKind::Map {
+        let mut turn_text = if self.session_kind == crate::session::SessionKind::Map {
             let memory = self.config.project_memory_for_prompt();
             let project_state = self.config.project_state_for_prompt();
             if self.thread_active {
@@ -764,6 +1488,17 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
             self.prepare_eps_context(&user_text, resolved_mentions.as_deref(), None, false)
                 .await?
         };
+        if self.session_kind == crate::session::SessionKind::Eps {
+            if let Some(note) = team::prompt_note(&self.session_store, &self.session_id) {
+                turn_text.push_str("\n\n");
+                turn_text.push_str(&note);
+            }
+        }
+        if execution_mode == crate::autonomous::ExecutionMode::Autonomous {
+            turn_text.push_str(
+                "\n\n[autonomous execution]\n이 요청은 사용자가 명시적으로 장시간 작업으로 시작했습니다. iteration 경계에서는 확인된 상태에서 계속하고, 완료된 도구 호출은 반복하지 마세요. canonical runtime 변경 후에는 현재 revision의 build_run 성공을 확인한 뒤에만 완료하세요. ASK 또는 변경사항 검토는 사용자의 결정을 기다리세요.",
+            );
+        }
 
         let result = self
             .run_first_turn_with_resume_fallback(
@@ -771,6 +1506,7 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
                     text: turn_text,
                     image_paths: attachment_context.image_paths,
                     workspace_root: None,
+                    workspace_temp: None,
                     workspace_access: WorkspaceAccess::Read,
                     output_schema: None,
                     forbid_tools: false,
@@ -782,7 +1518,8 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
         if self.session_kind == crate::session::SessionKind::Eps {
             self.commit_context_delivery(&result).await;
         }
-        self.thread_active = if matches!(&result, AgentTurnResult::Cancelled) {
+        self.last_turn_cancelled = matches!(&result, AgentTurnResult::Cancelled);
+        self.thread_active = if self.last_turn_cancelled {
             self.executor.conversation_state().is_started()
         } else {
             true
@@ -812,6 +1549,7 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
             )
             .await;
         }
+        let _ = self.commit_boundary(&user_text, &request_id);
         self.update_active_session().await;
         Ok(())
     }
@@ -860,7 +1598,11 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
         self.thread_active = false;
         if reset_epoch {
             self.session_store
-                .reset_context_epoch(&self.session_id, &static_prompt_baseline(), true)
+                .reset_context_epoch(
+                    &self.session_id,
+                    &static_prompt_baseline(self.provider_binding.provider),
+                    true,
+                )
                 .map_err(|error| AgentEngineError::new(error.to_string()))?;
         }
         let turn_text = self
@@ -871,6 +1613,7 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
                 text: turn_text,
                 image_paths,
                 workspace_root: None,
+                workspace_temp: None,
                 workspace_access: WorkspaceAccess::Read,
                 output_schema: None,
                 forbid_tools: false,
@@ -878,6 +1621,88 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
             .await?;
         self.thread_active = true;
         Ok(result)
+    }
+
+    /// Record whatever changed outside the app before this turn touches
+    /// anything, so the turn's own commit holds only the turn's work.
+    ///
+    /// This is what replaces the workspace's three-way merge: the user's
+    /// SCMDraft or editor change is not folded into the agent's view, it
+    /// becomes its own commit that the turn then starts from.
+    fn commit_external_edits_before_turn(&self) {
+        let Ok(root) = self.runtime.project_root() else {
+            return;
+        };
+        if !crate::git::auto_commit_ready(&root) {
+            return;
+        }
+        let event = match crate::git::commit_external_edits(&root) {
+            Ok(None) => return,
+            Ok(external) => ipc::GitTurnEvent {
+                external,
+                turn: None,
+                warning: None,
+            },
+            Err(error) => ipc::GitTurnEvent {
+                external: None,
+                turn: None,
+                warning: Some(format!(
+                    "앱 밖에서 바뀐 파일을 기록하지 못했습니다: {error}"
+                )),
+            },
+        };
+        let _ = self.sink.emit(EngineEvent::Git(event));
+    }
+
+    /// Commit the work one boundary finished, and report what was recorded.
+    ///
+    /// A repository problem is reported, never raised: the work is already on
+    /// disk, and failing the turn over a missing history entry would cost the
+    /// user more than the entry is worth.
+    fn commit_boundary(&self, summary: &str, request_id: &str) -> Option<crate::git::CommitRecord> {
+        let Ok(root) = self.runtime.project_root() else {
+            return None;
+        };
+        if !crate::git::auto_commit_ready(&root) {
+            return None;
+        }
+        let message = crate::git::turn_message(summary, &self.session_id, request_id);
+        let (record, event) = match crate::git::commit_turn(&root, &message) {
+            Ok(None) => return None,
+            Ok(turn) => (
+                turn.clone(),
+                ipc::GitTurnEvent {
+                    external: None,
+                    turn,
+                    warning: None,
+                },
+            ),
+            Err(error) => (
+                None,
+                ipc::GitTurnEvent {
+                    external: None,
+                    turn: None,
+                    warning: Some(format!("이 턴을 기록하지 못했습니다: {error}")),
+                },
+            ),
+        };
+        let _ = self.sink.emit(EngineEvent::Git(event));
+        record
+    }
+
+    /// The session workspace: the CLI cwd, temp dir, and artifact root. The
+    /// foreground prepares it on its first turn; a plan may be approved before
+    /// any foreground turn ran (or after a restart), so that path prepares it.
+    pub(crate) async fn prepared_workspace(&self) -> Result<PreparedWorkspace, AgentEngineError> {
+        if let Some(workspace) = self.executor.current_workspace() {
+            return Ok(workspace);
+        }
+        let manager = WorkspaceManager::new(self.runtime.data_dirs());
+        let session_id = self.session_id.clone();
+        tokio::task::spawn_blocking(move || manager.prepare_session_current(&session_id))
+            .await
+            .map_err(|error| AgentEngineError::new(error.to_string()))?
+            .map_err(AgentEngineError::new)
     }
 
     /// After a successful turn, persist the exact provider conversation and
@@ -972,6 +1797,7 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
                 text: turn_text,
                 image_paths: attachment_context.image_paths,
                 workspace_root: None,
+                workspace_temp: None,
                 workspace_access: WorkspaceAccess::Read,
                 output_schema: None,
                 forbid_tools: false,
@@ -996,10 +1822,11 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
             ));
         }
         let plan = self.current_plan_markdown.as_deref().unwrap_or_default();
-        self.approved_plan_sha256 = Some(crate::task_state::sha256_bytes(plan.as_bytes()));
+        let sha256 = crate::task_state::sha256_bytes(plan.as_bytes());
+        self.approved_plan_sha256 = Some(sha256.clone());
         let ticket = self
             .runtime
-            .request_write_workspace("approved plan execution")
+            .register_write_request("approved plan execution")
             .map_err(AgentEngineError::new)?;
         self.pending_write = Some(WriteContinuation::ApprovedPlan);
         self.phase = match ticket.state() {
@@ -1009,7 +1836,9 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
         Ok(())
     }
 
-    pub async fn continue_pending_write(&mut self) -> Result<(), AgentEngineError> {
+    pub async fn continue_pending_write(
+        &mut self,
+    ) -> Result<Option<crate::harness::HarnessJob>, AgentEngineError> {
         self.ensure_provider_conversation_ready()?;
         let ticket = self
             .runtime
@@ -1042,9 +1871,9 @@ Continue the requested change now, run the mandatory build, and stop only after 
                     .current_plan_markdown
                     .clone()
                     .ok_or_else(|| AgentEngineError::new("no plan is awaiting approval"))?;
-                let workspace = self.executor.current_workspace().ok_or_else(|| {
-                    AgentEngineError::new("the approved plan has no prepared project workspace")
-                })?;
+                // A plan may be approved before any foreground turn prepared
+                // the session workspace (or after a restart).
+                let workspace = self.prepared_workspace().await?;
                 WorkspaceManager::new(self.runtime.data_dirs())
                     .record_plan_approval(&workspace.id, &request_id, self.plan_revision, &markdown)
                     .map_err(|error| AgentEngineError::new(error.to_string()))?;
@@ -1064,12 +1893,18 @@ Continue the requested change now, run the mandatory build, and stop only after 
         let state_result = result.clone();
         self.handle_turn_result(result)?;
         self.pending_write = None;
-        self.settle_write_lifecycle()?;
         let compiler_user_text = self.current_user_text.clone();
+        // This turn applied the change, so this turn records it. Leaving it for
+        // the next turn's external-edit sweep would file the agent's own work
+        // as something the user did outside the app.
+        let turn_commit = self.commit_boundary(&compiler_user_text, &request_id);
+        let job = self.settle_request(turn_commit).await?;
+        self.settle_write_lifecycle()?;
+        self.current_request_id = None;
         self.update_task_state_after_turn(&state_result, &compiler_user_text, None)
             .await;
         self.update_active_session().await;
-        Ok(())
+        Ok(job)
     }
 
     pub fn recover_write_failure(&mut self) -> Result<(), AgentEngineError> {
@@ -1079,12 +1914,6 @@ Continue the requested change now, run the mandatory build, and stop only after 
 
     fn recover_read_failure(&mut self) -> Result<(), AgentEngineError> {
         self.pending_write = None;
-        if self.emit_current_changeset_if_any()? {
-            self.phase = Phase::ChangesetReview;
-            self.runtime
-                .emit_activity(crate::write_coordinator::SessionActivity::Review);
-            return Ok(());
-        }
         self.runtime
             .abort_unmutated_write_intent()
             .map_err(AgentEngineError::new)?;
@@ -1095,43 +1924,40 @@ Continue the requested change now, run the mandatory build, and stop only after 
     }
 
     fn settle_write_lifecycle(&mut self) -> Result<(), AgentEngineError> {
-        let sound_build_required = self.runtime.sound_build_required();
-        if self.emit_current_changeset_if_any()? {
-            self.phase = Phase::ChangesetReview;
-            self.runtime
-                .emit_activity(crate::write_coordinator::SessionActivity::Review);
-        } else if sound_build_required {
-            return Err(AgentEngineError::new(
-                "map sound import requires one complete build_run attempt",
-            ));
-        } else {
-            self.runtime
-                .release_write_registration()
-                .map_err(AgentEngineError::new)?;
-            self.phase = Phase::Idle;
-        }
+        self.runtime
+            .release_write_registration()
+            .map_err(AgentEngineError::new)?;
+        self.phase = Phase::Idle;
         Ok(())
     }
 
-    // Foreground implementation completion intentionally has no project-document
-    // repair loop. Accepted changes schedule a separate durable harness job.
-
-    pub async fn changeset_decision(
+    /// Settle the request this turn finished.
+    ///
+    /// Review used to do this when the user pressed Accept. Nothing reviews a
+    /// turn now: the work is already on disk, the turn commit records it, and
+    /// `git revert` is the way back. So the turn settles itself — the ledger
+    /// takes the DAT edits, the durable documents take their revision, and the
+    /// harness job is scheduled.
+    pub async fn settle_request(
         &mut self,
-        req: ipc::ChangesetDecisionRequest,
+        turn_commit: Option<crate::git::CommitRecord>,
     ) -> Result<Option<crate::harness::HarnessJob>, AgentEngineError> {
-        self.phase = Phase::ChangesetReview;
-        let request_id = self
-            .current_request_id
-            .clone()
-            .ok_or_else(|| AgentEngineError::new("no active request has a changeset"))?;
-        let ids = rollback_ids(&req.ids);
-        let decision_ids = match &req.ids {
-            ipc::DecisionIds::All(_) => journal::DecisionIds::All,
-            ipc::DecisionIds::List(ids) => journal::DecisionIds::Items(ids.clone()),
+        let Some(request_id) = self.current_request_id.clone() else {
+            return Ok(None);
         };
-        let accepted_entries = self.collect_accepted_entries(&request_id, &req);
-        let accepted_wiki_entries = self.collect_accepted_wiki_entries(&request_id, &req);
+        // A sound import that was never built is not a finished turn: the map
+        // carries the new wav but no plugin references it yet.
+        if self.runtime.sound_build_required() {
+            return Err(AgentEngineError::new(
+                "map sound import requires one complete build_run attempt",
+            ));
+        }
+        let decision_ids = journal::DecisionIds::All;
+        let accepted_entries = self.collect_applied_entries(&request_id);
+        if accepted_entries.is_empty() {
+            return Ok(None);
+        }
+        let accepted_wiki_entries = self.collect_applied_wiki_entries(&request_id);
         let accepted_workspace_entries = accepted_entries
             .iter()
             .filter(|entry| matches!(entry.target, journal::JournalTarget::WorkspacePath { .. }))
@@ -1139,66 +1965,23 @@ Continue the requested change now, run the mandatory build, and stop only after 
             .collect::<Vec<_>>();
 
         let runtime = self.runtime.clone();
-        let outcome: Result<bool, AgentEngineError> = runtime
+        let settled: bool = runtime
             .project_transaction(|| {
-                (|| match req.decision {
-                    ipc::Decision::Accept => {
-                        if self.runtime.sound_build_required() {
-                            return Err(AgentEngineError::new(
-                                "map sound changes cannot be accepted before complete build_run",
-                            ));
-                        }
-                        WorkspaceManager::new(self.runtime.data_dirs())
-                            .record_accepted_entries(&request_id, &accepted_workspace_entries)
-                            .map_err(|error| AgentEngineError::new(error.to_string()))?;
-                        if let Some(payload) =
-                            self.record_accepted_wiki_edits(accepted_wiki_entries)
-                        {
-                            self.sink.emit(EngineEvent::Wiki(payload))?;
-                        }
-                        self.journal_store
-                            .accept_entries(&request_id, &decision_ids)
-                            .map_err(|error| AgentEngineError::new(error.to_string()))
+                (|| {
+                    WorkspaceManager::new(self.runtime.data_dirs())
+                        .record_accepted_entries(&request_id, &accepted_workspace_entries)
+                        .map_err(|error| AgentEngineError::new(error.to_string()))?;
+                    if let Some(payload) = self.record_applied_wiki_edits(accepted_wiki_entries) {
+                        self.sink.emit(EngineEvent::Wiki(payload))?;
                     }
-                    ipc::Decision::Reject => {
-                        self.journal_store
-                            .decide(
-                                &request_id,
-                                journal::ChangesetDecision::Reject(decision_ids.clone()),
-                                &self.runtime,
-                            )
-                            .map_err(|error| AgentEngineError::new(error.to_string()))?;
-                        if matches!(decision_ids, journal::DecisionIds::All) {
-                            Ok(true)
-                        } else {
-                            self.journal_store
-                                .archive_if_empty(&request_id)
-                                .map_err(|error| AgentEngineError::new(error.to_string()))
-                        }
-                    }
+                    self.journal_store
+                        .accept_entries(&request_id, &decision_ids)
+                        .map_err(|error| AgentEngineError::new(error.to_string()))
                 })()
             })
-            .map_err(AgentEngineError::new)?;
-        let settled = outcome.as_ref().copied().unwrap_or(false);
-        let ok = outcome.is_ok();
+            .map_err(AgentEngineError::new)??;
 
-        self.sink
-            .emit(EngineEvent::RollbackResult(ipc::RollbackResultEvent {
-                ids,
-                ok,
-                error: outcome.as_ref().err().map(|error| error.message.clone()),
-            }))?;
-        if outcome.is_err() {
-            self.phase = Phase::ChangesetReview;
-            self.runtime
-                .emit_activity(crate::write_coordinator::SessionActivity::Review);
-            self.update_active_session().await;
-            return Ok(None);
-        }
-
-        if matches!(req.decision, ipc::Decision::Accept) {
-            self.accepted_for_harness.extend(accepted_entries);
-        }
+        self.accepted_for_harness.extend(accepted_entries);
 
         let mut harness_job = if settled && !self.accepted_for_harness.is_empty() {
             self.executor.current_workspace().map(|workspace| {
@@ -1223,6 +2006,9 @@ Continue the requested change now, run the mandatory build, and stop only after 
         } else {
             None
         };
+        if let Some(job) = harness_job.as_mut() {
+            job.turn_commit = turn_commit.map(|record| record.sha);
+        }
         if settled {
             let record = self.session_store.load(&self.session_id).ok();
             let journal_entry_ids = harness_job
@@ -1272,19 +2058,11 @@ Continue the requested change now, run the mandatory build, and stop only after 
         }
 
         if settled {
-            self.runtime
-                .release_write_registration()
-                .map_err(AgentEngineError::new)?;
-            self.phase = Phase::Idle;
+            self.settle_autonomous_review().await?;
             self.drop_pending_request_from_session(&request_id);
-            self.current_request_id = None;
             self.current_client_turn_id = None;
             self.approved_plan_sha256 = None;
             self.runtime.clear_audio_cache();
-        } else {
-            self.phase = Phase::ChangesetReview;
-            self.runtime
-                .emit_activity(crate::write_coordinator::SessionActivity::Review);
         }
         self.update_active_session().await;
         Ok(harness_job)
@@ -1306,42 +2084,19 @@ Continue the requested change now, run the mandatory build, and stop only after 
     /// ledger entries. Returns an empty vec when there is no journal/changeset, no
     /// dat edits, or the decision is a reject (the wiki records accepted dat edits
     /// only). Must be called BEFORE a full-accept archives the journal.
-    fn collect_accepted_wiki_entries(
-        &self,
-        request_id: &str,
-        req: &ipc::ChangesetDecisionRequest,
-    ) -> Vec<crate::wiki::LedgerEntry> {
-        let scope = match (&req.decision, &req.ids) {
-            (ipc::Decision::Accept, ipc::DecisionIds::All(_)) => crate::wiki::AcceptedScope::All,
-            (ipc::Decision::Accept, ipc::DecisionIds::List(ids)) => {
-                crate::wiki::AcceptedScope::Ids(ids.clone())
-            }
-            // A reject records nothing.
-            (ipc::Decision::Reject, _) => return Vec::new(),
-        };
+    fn collect_applied_wiki_entries(&self, request_id: &str) -> Vec<crate::wiki::LedgerEntry> {
         let Ok(changeset) = self.journal_store.changeset(request_id) else {
             return Vec::new();
         };
         let Some(journal) = self.load_journal(request_id) else {
             return Vec::new();
         };
-        crate::wiki::accepted_ledger_entries(&changeset, &journal, &scope)
+        crate::wiki::applied_ledger_entries(&changeset, &journal)
     }
 
-    fn collect_accepted_entries(
-        &self,
-        request_id: &str,
-        req: &ipc::ChangesetDecisionRequest,
-    ) -> Vec<journal::JournalEntry> {
-        let ids = match (&req.decision, &req.ids) {
-            (ipc::Decision::Accept, ipc::DecisionIds::All(_)) => journal::DecisionIds::All,
-            (ipc::Decision::Accept, ipc::DecisionIds::List(ids)) => {
-                journal::DecisionIds::Items(ids.clone())
-            }
-            (ipc::Decision::Reject, _) => return Vec::new(),
-        };
+    fn collect_applied_entries(&self, request_id: &str) -> Vec<journal::JournalEntry> {
         self.journal_store
-            .selected_entries(request_id, &ids)
+            .selected_entries(request_id, &journal::DecisionIds::All)
             .unwrap_or_default()
     }
 
@@ -1354,10 +2109,10 @@ Continue the requested change now, run the mandatory build, and stop only after 
         journal::JournalStore::load(&self.journal_data_dir, request_id).ok()
     }
 
-    /// Upsert the collected accepted dat edits to the project ledger via the wiki
+    /// Upsert the applied dat edits to the project ledger via the wiki
     /// provider, returning the updated ledger for emission (or `None` when nothing
     /// was recorded / no provider is wired).
-    fn record_accepted_wiki_edits(
+    fn record_applied_wiki_edits(
         &self,
         entries: Vec<crate::wiki::LedgerEntry>,
     ) -> Option<ipc::WikiResponse> {
@@ -1425,7 +2180,10 @@ Continue the requested change now, run the mandatory build, and stop only after 
             .map_err(|error| AgentEngineError::new(error.to_string()))?;
         let committed_epoch = self
             .session_store
-            .record_compaction_boundary(&self.session_id, &static_prompt_baseline())
+            .record_compaction_boundary(
+                &self.session_id,
+                &static_prompt_baseline(self.provider_binding.provider),
+            )
             .map_err(|error| AgentEngineError::new(error.to_string()))?;
         if committed_epoch != next_instruction_epoch {
             return Err(AgentEngineError::new(
@@ -1440,10 +2198,7 @@ Continue the requested change now, run the mandatory build, and stop only after 
     /// selected by a message edit. The active saved session is retained, while
     /// the next chat starts a fresh Codex thread seeded from that prefix.
     pub async fn rewind(&mut self, panel_log: serde_json::Value) -> Result<(), AgentEngineError> {
-        if matches!(
-            self.phase,
-            Phase::PlanReview | Phase::Executing | Phase::ChangesetReview
-        ) {
+        if matches!(self.phase, Phase::PlanReview | Phase::Executing) {
             return Err(AgentEngineError::new(
                 "현재 세션의 진행 중인 요청 또는 검토를 먼저 완료해 주세요.",
             ));
@@ -1547,7 +2302,25 @@ Continue the requested change now, run the mandatory build, and stop only after 
             self.runtime
                 .restore_review(&self.project_id, request_id)
                 .map_err(AgentEngineError::new)?;
-            self.reconnect_pending_changeset(&record);
+        }
+        if let Some(run) = record.autonomous_run.as_ref() {
+            self.execution_mode = crate::autonomous::ExecutionMode::Autonomous;
+            self.autonomous_policy = run.policy.clone();
+            self.current_user_text = run.goal.clone();
+            self.current_client_turn_id = Some(run.client_turn_id.clone());
+            self.autonomous_pause_requested
+                .store(run.status.can_resume(), Ordering::SeqCst);
+            if record.pending_request_ids.is_empty() && run.status.can_resume() {
+                self.runtime
+                    .begin_request(&run.request_id, &self.project_id)
+                    .map_err(AgentEngineError::new)?;
+                self.runtime
+                    .restore_autonomous_progress(&run.request_id, &run.progress)
+                    .map_err(AgentEngineError::new)?;
+                self.current_request_id = Some(run.request_id.clone());
+            }
+            self.sink
+                .emit(EngineEvent::AutonomousRun(Box::new(run.clone())))?;
         }
         self.hydrated = true;
         self.sink
@@ -1571,44 +2344,6 @@ Continue the requested change now, run the mandatory build, and stop only after 
     /// (so a later `changeset_decision` guard passes), and re-emits the existing
     /// `changeset` event. A missing journal / empty changeset degrades gracefully
     /// (skip + log), never panics.
-    fn reconnect_pending_changeset(&mut self, record: &crate::session::SessionRecord) {
-        let Some(request_id) = record.pending_request_ids.first().cloned() else {
-            return;
-        };
-        let journal = match journal::JournalStore::load(&self.journal_data_dir, &request_id) {
-            Ok(journal) => journal,
-            Err(error) => {
-                eprintln!("eud-agent: pending changeset journal '{request_id}' missing: {error}");
-                return;
-            }
-        };
-        // Reseat the journal into the live store so a decision can finalize it.
-        for entry in journal.entries {
-            if let Err(error) = self.journal_store.record(&request_id, entry) {
-                eprintln!("eud-agent: changeset reconnect record failed: {error}");
-                return;
-            }
-        }
-        let changeset = match self.journal_store.changeset(&request_id) {
-            Ok(changeset) if !changeset.items.is_empty() => changeset,
-            _ => return,
-        };
-
-        self.current_request_id = Some(request_id);
-        self.phase = Phase::ChangesetReview;
-        if let Err(error) = self.sink.emit(EngineEvent::Changeset(ipc::ChangesetEvent {
-            request_id: changeset.request_id,
-            items: changeset
-                .items
-                .into_iter()
-                .enumerate()
-                .map(|(index, item)| ipc_changeset_item(index, item))
-                .collect(),
-        })) {
-            eprintln!("eud-agent: changeset reconnect emit failed: {error}");
-        }
-    }
-
     fn resolve_mentions(
         &self,
         mentions: &[crate::mentions::MentionInstance],
@@ -1663,12 +2398,14 @@ Continue the requested change now, run the mandatory build, and stop only after 
         let foreground_result = match result {
             AgentTurnResult::Answer { text } => text.as_str(),
             AgentTurnResult::Plan { markdown } => markdown.as_str(),
-            AgentTurnResult::Cancelled | AgentTurnResult::WriteTransition => return,
+            AgentTurnResult::Cancelled
+            | AgentTurnResult::WriteTransition
+            | AgentTurnResult::IterationBoundary { .. } => return,
         };
         let workspace_root = self
             .executor
             .current_workspace()
-            .map(|workspace| workspace.root);
+            .map(|workspace| workspace.workspace_root);
         let artifact_candidates = match workspace_root.as_deref() {
             Some(root) => match crate::task_state::collect_artifact_candidates(root) {
                 Ok(candidates) => candidates,
@@ -1785,7 +2522,9 @@ Continue the requested change now, run the mandatory build, and stop only after 
                 self.record_task_compilation_failure("cancelled", "task-state compiler cancelled");
                 return;
             }
-            RunOutcome::Completed { .. } | RunOutcome::WriteTransition => {
+            RunOutcome::Completed { .. }
+            | RunOutcome::IterationBoundary { .. }
+            | RunOutcome::WriteTransition => {
                 self.record_task_compilation_failure(
                     "invalid_outcome",
                     "task-state compiler returned a foreground outcome",
@@ -1936,35 +2675,11 @@ Continue the requested change now, run the mandatory build, and stop only after 
                     "write transition reached answer handling",
                 ));
             }
+            AgentTurnResult::IterationBoundary { .. } => {
+                self.phase = Phase::Idle;
+            }
         }
         Ok(())
-    }
-
-    fn emit_current_changeset_if_any(&mut self) -> Result<bool, AgentEngineError> {
-        if self.phase == Phase::PlanReview {
-            return Ok(false);
-        }
-        let Some(request_id) = self.current_request_id.as_deref() else {
-            return Ok(false);
-        };
-        let Ok(changeset) = self.journal_store.changeset(request_id) else {
-            return Ok(false);
-        };
-        if changeset.items.is_empty() {
-            return Ok(false);
-        }
-
-        self.phase = Phase::ChangesetReview;
-        self.sink.emit(EngineEvent::Changeset(ipc::ChangesetEvent {
-            request_id: changeset.request_id,
-            items: changeset
-                .items
-                .into_iter()
-                .enumerate()
-                .map(|(index, item)| ipc_changeset_item(index, item))
-                .collect(),
-        }))?;
-        Ok(true)
     }
 }
 
@@ -1986,11 +2701,184 @@ pub(crate) struct SessionEvent<T> {
     payload: T,
 }
 
+/// Who started a Map request: the Map window's user or an EPS session's
+/// `map_task_request`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MapRunOrigin {
+    User,
+    Team,
+}
+
+/// How a Map request's turn ended without an error: answered, or stopped by a
+/// cancellation (which the engine does not report as a failure).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MapTurnEnd {
+    Completed,
+    Cancelled,
+}
+
+/// The request bubble of one Map run, as the Map window shows it: the raw
+/// user text (or the team task goal), the mentions it carried, and its origin.
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MapRunPrompt {
+    pub text: String,
+    pub mentions: Vec<crate::map_model::MapMentionSnapshot>,
+    pub origin: MapRunOrigin,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub team_task_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_session_name: Option<String>,
+}
+
+/// One scoped session event exactly as the Map window received (or missed) it.
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MapRunEvent {
+    pub name: String,
+    pub payload: serde_json::Value,
+}
+
+/// The latest Map request of one session: its prompt and every scoped event
+/// it emitted so far, so a Map window that opens (or switches) mid-run can
+/// show it exactly like a request typed there. Kept after the run ends until
+/// the next request replaces it.
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MapRunTranscript {
+    pub request_id: String,
+    pub candidate_revision: String,
+    pub in_flight: bool,
+    pub prompt: MapRunPrompt,
+    pub events: Vec<MapRunEvent>,
+    /// Oldest events were dropped to stay within the transcript bounds.
+    pub truncated: bool,
+}
+
+/// Header of a run that just started, emitted as `map_run_started` (the
+/// scoped wrapper adds `sessionId`/`requestId`/`candidateRevision`).
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MapRunStartedEvent {
+    prompt: MapRunPrompt,
+}
+
+const MAP_RUN_MAX_EVENTS: usize = 2000;
+const MAP_RUN_MAX_BYTES: usize = 4 * 1024 * 1024;
+/// The session events the Map window's turn listeners consume.
+const MAP_RUN_EVENT_NAMES: [&str; 5] = ["agent_event", "context_usage", "answer", "ask", "error"];
+
+/// The bounded event record behind [`MapRunTranscript`].
+struct MapRunRecord {
+    request_id: String,
+    candidate_revision: String,
+    in_flight: bool,
+    prompt: MapRunPrompt,
+    events: VecDeque<(MapRunEvent, usize)>,
+    bytes: usize,
+    truncated: bool,
+}
+
+impl MapRunRecord {
+    fn push(&mut self, name: &str, payload: serde_json::Value) {
+        let size = payload.to_string().len();
+        self.events.push_back((
+            MapRunEvent {
+                name: name.to_string(),
+                payload,
+            },
+            size,
+        ));
+        self.bytes += size;
+        while self.events.len() > MAP_RUN_MAX_EVENTS
+            || (self.bytes > MAP_RUN_MAX_BYTES && self.events.len() > 1)
+        {
+            if let Some((_, dropped)) = self.events.pop_front() {
+                self.bytes -= dropped;
+                self.truncated = true;
+            }
+        }
+    }
+
+    fn snapshot(&self) -> MapRunTranscript {
+        MapRunTranscript {
+            request_id: self.request_id.clone(),
+            candidate_revision: self.candidate_revision.clone(),
+            in_flight: self.in_flight,
+            prompt: self.prompt.clone(),
+            events: self.events.iter().map(|(event, _)| event.clone()).collect(),
+            truncated: self.truncated,
+        }
+    }
+}
+
+/// The latest Map run of one session, shared by every clone of its sink and
+/// readable without the engine lock.
+#[derive(Clone, Default)]
+struct MapRunRecorder(Arc<parking_lot::RwLock<Option<MapRunRecord>>>);
+
+impl MapRunRecorder {
+    /// Start a fresh in-flight transcript, replacing the previous run's.
+    fn start(&self, request_id: String, candidate_revision: String, prompt: MapRunPrompt) {
+        *self.0.write() = Some(MapRunRecord {
+            request_id,
+            candidate_revision,
+            in_flight: true,
+            prompt,
+            events: VecDeque::new(),
+            bytes: 0,
+            truncated: false,
+        });
+    }
+
+    /// Append one scoped turn event to the in-flight run it belongs to; other
+    /// event names, unscoped events, and events of another request are not
+    /// part of the transcript.
+    fn record<T: serde::Serialize>(
+        &self,
+        name: &str,
+        event: &SessionEvent<T>,
+    ) -> Result<(), serde_json::Error> {
+        if !MAP_RUN_EVENT_NAMES.contains(&name) {
+            return Ok(());
+        }
+        let Some(request_id) = event.request_id.as_deref() else {
+            return Ok(());
+        };
+        let mut run = self.0.write();
+        let Some(record) = run
+            .as_mut()
+            .filter(|record| record.in_flight && record.request_id == request_id)
+        else {
+            return Ok(());
+        };
+        record.push(name, serde_json::to_value(event)?);
+        Ok(())
+    }
+
+    /// The run ended; its transcript stays readable until the next start.
+    fn finish(&self, request_id: &str) {
+        let mut run = self.0.write();
+        if let Some(record) = run
+            .as_mut()
+            .filter(|record| record.request_id == request_id)
+        {
+            record.in_flight = false;
+        }
+    }
+
+    fn snapshot(&self) -> Option<MapRunTranscript> {
+        self.0.read().as_ref().map(MapRunRecord::snapshot)
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct SessionEventSink {
     app: tauri::AppHandle,
     session_id: String,
     map_context: Arc<parking_lot::RwLock<Option<MapEventContext>>>,
+    map_run: MapRunRecorder,
 }
 
 impl SessionEventSink {
@@ -1999,16 +2887,35 @@ impl SessionEventSink {
             app,
             session_id: session_id.into(),
             map_context: Arc::new(parking_lot::RwLock::new(None)),
+            map_run: MapRunRecorder::default(),
         }
     }
 
-    pub(crate) fn set_map_context(&self, request_id: String, candidate_revision: String) {
+    /// Scope the following events to one Map request, start its transcript
+    /// (replacing the previous run's), and announce the run's header so an
+    /// idle Map window can adopt it.
+    pub(crate) fn set_map_context(
+        &self,
+        request_id: String,
+        candidate_revision: String,
+        prompt: MapRunPrompt,
+    ) {
         *self.map_context.write() = Some(MapEventContext {
-            request_id,
-            candidate_revision,
+            request_id: request_id.clone(),
+            candidate_revision: candidate_revision.clone(),
         });
+        self.map_run
+            .start(request_id, candidate_revision, prompt.clone());
+        if let Err(error) = self.emit_scoped("map_run_started", MapRunStartedEvent { prompt }) {
+            eprintln!(
+                "eud-agent: map run start event failed: session={} error={error}",
+                self.session_id
+            );
+        }
     }
 
+    /// End the request's scope; its transcript stays readable, marked as no
+    /// longer in flight, until the next request starts.
     pub(crate) fn clear_map_context(&self, request_id: &str) {
         let mut context = self.map_context.write();
         if context
@@ -2017,6 +2924,12 @@ impl SessionEventSink {
         {
             *context = None;
         }
+        self.map_run.finish(request_id);
+    }
+
+    /// The latest Map run's transcript, without touching the engine.
+    pub(crate) fn map_run_snapshot(&self) -> Option<MapRunTranscript> {
+        self.map_run.snapshot()
     }
 
     fn scoped<T>(&self, payload: T) -> SessionEvent<T> {
@@ -2033,7 +2946,14 @@ impl SessionEventSink {
     where
         T: serde::Serialize + Clone,
     {
-        self.app.emit(name, self.scoped(payload))
+        let event = self.scoped(payload);
+        if let Err(error) = self.map_run.record(name, &event) {
+            eprintln!(
+                "eud-agent: map run event could not be recorded: session={} event={name} error={error}",
+                self.session_id
+            );
+        }
+        self.app.emit(name, event)
     }
 }
 
@@ -2044,15 +2964,303 @@ impl EventSink for SessionEventSink {
             EngineEvent::ContextUsage(payload) => self.emit_scoped("context_usage", payload),
             EngineEvent::Answer(payload) => self.emit_scoped("answer", payload),
             EngineEvent::Plan(payload) => self.emit_scoped("plan", payload),
-            EngineEvent::Changeset(payload) => self.emit_scoped("changeset", payload),
-            EngineEvent::RollbackResult(payload) => self.emit_scoped("rollback_result", payload),
             EngineEvent::Progress(payload) => self.emit_scoped("progress", payload),
             EngineEvent::Error(payload) => self.emit_scoped("error", payload),
             EngineEvent::Status(payload) => ipc::emit_status(&self.app, payload),
+            EngineEvent::AutonomousRun(payload) => self.emit_scoped("autonomous_run", payload),
+            EngineEvent::Git(payload) => self.emit_scoped("git", payload),
             EngineEvent::Wiki(payload) => ipc::emit_wiki(&self.app, payload),
             EngineEvent::SessionLoaded(payload) => ipc::emit_session_loaded(&self.app, payload),
         };
         result.map_err(|err| AgentEngineError::new(format!("failed to emit event: {err}")))
+    }
+}
+
+#[cfg(test)]
+mod map_run_tests {
+    use super::*;
+
+    fn prompt(origin: MapRunOrigin) -> MapRunPrompt {
+        MapRunPrompt {
+            text: "Z1 테두리를 마을 패턴으로".to_string(),
+            mentions: Vec::new(),
+            origin,
+            team_task_id: (origin == MapRunOrigin::Team).then(|| "task-1".to_string()),
+            parent_session_name: (origin == MapRunOrigin::Team).then(|| "메인".to_string()),
+        }
+    }
+
+    /// The scoped event exactly as `SessionEventSink::scoped` builds it while
+    /// the map context is `request_id`.
+    fn scoped<T>(request_id: Option<&str>, payload: T) -> SessionEvent<T> {
+        SessionEvent {
+            session_id: "map-1".to_string(),
+            request_id: request_id.map(str::to_string),
+            candidate_revision: request_id.map(|_| "r0:aaa".to_string()),
+            payload,
+        }
+    }
+
+    fn agent_event(detail: &str) -> ipc::AgentEvent {
+        ipc::AgentEvent {
+            kind: "tool_call".to_string(),
+            detail: detail.to_string(),
+            data: None,
+        }
+    }
+
+    fn started(origin: MapRunOrigin) -> MapRunRecorder {
+        let recorder = MapRunRecorder::default();
+        recorder.start("map-a".to_string(), "r0:aaa".to_string(), prompt(origin));
+        recorder
+    }
+
+    #[test]
+    fn transcript_records_scoped_turn_events_of_the_matching_request_only() {
+        let recorder = MapRunRecorder::default();
+        assert!(recorder.snapshot().is_none());
+        recorder
+            .record(
+                "agent_event",
+                &scoped(None, agent_event("before any request")),
+            )
+            .unwrap();
+        assert!(recorder.snapshot().is_none());
+
+        recorder.start(
+            "map-a".to_string(),
+            "r0:aaa".to_string(),
+            prompt(MapRunOrigin::Team),
+        );
+        let header = recorder.snapshot().unwrap();
+        assert!(header.in_flight);
+        assert!(header.events.is_empty());
+        assert_eq!(header.prompt.origin, MapRunOrigin::Team);
+        assert_eq!(header.prompt.team_task_id.as_deref(), Some("task-1"));
+        assert_eq!(header.prompt.parent_session_name.as_deref(), Some("메인"));
+        assert_eq!(
+            serde_json::to_value(&header.prompt).unwrap(),
+            serde_json::json!({
+                "text": "Z1 테두리를 마을 패턴으로",
+                "mentions": [],
+                "origin": "team",
+                "teamTaskId": "task-1",
+                "parentSessionName": "메인",
+            })
+        );
+
+        recorder
+            .record(
+                "agent_event",
+                &scoped(Some("map-a"), agent_event("terrain.set")),
+            )
+            .unwrap();
+        recorder
+            .record(
+                "progress",
+                &scoped(
+                    Some("map-a"),
+                    ipc::ProgressEvent {
+                        stage: ipc::ProgressStage::Provider,
+                        detail: Some("not a turn event".to_string()),
+                        provider: None,
+                        model: None,
+                    },
+                ),
+            )
+            .unwrap();
+        recorder
+            .record("agent_event", &scoped(None, agent_event("unscoped")))
+            .unwrap();
+        recorder
+            .record(
+                "agent_event",
+                &scoped(Some("map-other"), agent_event("other request")),
+            )
+            .unwrap();
+        recorder
+            .record(
+                "answer",
+                &scoped(
+                    Some("map-a"),
+                    ipc::AnswerEvent {
+                        text: "done".to_string(),
+                    },
+                ),
+            )
+            .unwrap();
+
+        let run = recorder.snapshot().unwrap();
+        assert_eq!(run.request_id, "map-a");
+        assert_eq!(run.candidate_revision, "r0:aaa");
+        assert!(run.in_flight);
+        assert!(!run.truncated);
+        assert_eq!(
+            run.events
+                .iter()
+                .map(|event| event.name.as_str())
+                .collect::<Vec<_>>(),
+            ["agent_event", "answer"]
+        );
+        // The payload is the scoped event the panel receives.
+        assert_eq!(run.events[0].payload["sessionId"], "map-1");
+        assert_eq!(run.events[0].payload["requestId"], "map-a");
+        assert_eq!(run.events[0].payload["candidateRevision"], "r0:aaa");
+        assert_eq!(run.events[0].payload["detail"], "terrain.set");
+        assert_eq!(run.events[1].payload["text"], "done");
+        let serialized = serde_json::to_value(&run).unwrap();
+        assert_eq!(serialized["requestId"], "map-a");
+        assert_eq!(serialized["inFlight"], true);
+        assert_eq!(serialized["events"][1]["name"], "answer");
+
+        recorder.finish("map-a");
+        recorder
+            .record(
+                "agent_event",
+                &scoped(Some("map-a"), agent_event("after the run")),
+            )
+            .unwrap();
+        let ended = recorder.snapshot().unwrap();
+        assert!(!ended.in_flight, "finishing the request ends the run");
+        assert_eq!(
+            ended.events.len(),
+            2,
+            "events after the run are not recorded"
+        );
+        assert_eq!(
+            ended.prompt.text, run.prompt.text,
+            "the ended run stays readable"
+        );
+
+        recorder.start(
+            "map-b".to_string(),
+            "r0:aaa".to_string(),
+            prompt(MapRunOrigin::User),
+        );
+        let fresh = recorder.snapshot().unwrap();
+        assert_eq!(fresh.request_id, "map-b");
+        assert!(fresh.in_flight);
+        assert!(
+            fresh.events.is_empty(),
+            "a new request starts a fresh transcript"
+        );
+        assert_eq!(fresh.prompt.origin, MapRunOrigin::User);
+        assert_eq!(serde_json::to_value(fresh.prompt.origin).unwrap(), "user");
+    }
+
+    #[test]
+    fn finishing_another_request_keeps_the_current_run_in_flight() {
+        let recorder = started(MapRunOrigin::User);
+        recorder.finish("map-stale");
+        recorder
+            .record(
+                "agent_event",
+                &scoped(Some("map-a"), agent_event("still recorded")),
+            )
+            .unwrap();
+        let run = recorder.snapshot().unwrap();
+        assert!(run.in_flight);
+        assert_eq!(run.events.len(), 1);
+    }
+
+    #[test]
+    fn transcript_drops_the_oldest_events_beyond_its_bounds() {
+        let recorder = started(MapRunOrigin::User);
+        for index in 0..(MAP_RUN_MAX_EVENTS + 5) {
+            recorder
+                .record(
+                    "agent_event",
+                    &scoped(Some("map-a"), agent_event(&format!("event {index}"))),
+                )
+                .unwrap();
+        }
+        let run = recorder.snapshot().unwrap();
+        assert!(run.truncated);
+        assert_eq!(run.events.len(), MAP_RUN_MAX_EVENTS);
+        assert_eq!(run.events[0].payload["detail"], "event 5");
+        assert_eq!(
+            run.events[MAP_RUN_MAX_EVENTS - 1].payload["detail"],
+            format!("event {}", MAP_RUN_MAX_EVENTS + 4)
+        );
+
+        // Byte bound: three 1.5 MiB events keep only the newest two.
+        let recorder = started(MapRunOrigin::User);
+        let large = "x".repeat(3 * MAP_RUN_MAX_BYTES / 8);
+        for index in 0..3 {
+            recorder
+                .record(
+                    "agent_event",
+                    &scoped(Some("map-a"), agent_event(&format!("{index}{large}"))),
+                )
+                .unwrap();
+        }
+        let run = recorder.snapshot().unwrap();
+        assert!(run.truncated);
+        assert_eq!(run.events.len(), 2);
+        assert!(run.events[0].payload["detail"]
+            .as_str()
+            .unwrap()
+            .starts_with('1'));
+        assert!(run.events[1].payload["detail"]
+            .as_str()
+            .unwrap()
+            .starts_with('2'));
+    }
+
+    #[test]
+    fn the_run_header_carries_the_prompt_and_no_events() {
+        let header = serde_json::to_value(MapRunStartedEvent {
+            prompt: prompt(MapRunOrigin::Team),
+        })
+        .unwrap();
+        assert_eq!(header["prompt"]["origin"], "team");
+        assert_eq!(header["prompt"]["text"], "Z1 테두리를 마을 패턴으로");
+        assert_eq!(header["prompt"]["teamTaskId"], "task-1");
+        assert_eq!(header["prompt"]["parentSessionName"], "메인");
+        assert!(header.get("events").is_none());
+        let scoped_header = serde_json::to_value(scoped(
+            Some("map-a"),
+            MapRunStartedEvent {
+                prompt: prompt(MapRunOrigin::User),
+            },
+        ))
+        .unwrap();
+        assert_eq!(scoped_header["sessionId"], "map-1");
+        assert_eq!(scoped_header["requestId"], "map-a");
+        assert_eq!(scoped_header["candidateRevision"], "r0:aaa");
+        assert_eq!(scoped_header["prompt"]["origin"], "user");
+        assert!(scoped_header["prompt"].get("teamTaskId").is_none());
+        // The header is not itself part of the transcript.
+        let recorder = started(MapRunOrigin::User);
+        recorder
+            .record(
+                "map_run_started",
+                &scoped(
+                    Some("map-a"),
+                    MapRunStartedEvent {
+                        prompt: prompt(MapRunOrigin::User),
+                    },
+                ),
+            )
+            .unwrap();
+        assert!(recorder.snapshot().unwrap().events.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_busy_engine_reports_no_resume_error() {
+        let engine = tokio::sync::Mutex::new(Some("resume failed".to_string()));
+        assert_eq!(
+            idle_resume_error(&engine, |error| error.clone()),
+            Some("resume failed".to_string())
+        );
+        let running_turn = engine.lock().await;
+        assert_eq!(
+            idle_resume_error(&engine, |error| error.clone()),
+            None,
+            "a running turn proves the conversation is alive"
+        );
+        drop(running_turn);
+        assert!(idle_resume_error(&engine, |error| error.clone()).is_some());
     }
 }
 
@@ -2061,8 +3269,22 @@ pub(crate) struct SessionWorker {
         tokio::sync::Mutex<AgentEngine<crate::provider_runtime::ProviderRuntime, SessionEventSink>>,
     provider: crate::provider::ProviderId,
     cancellation: tokio::sync::watch::Sender<u64>,
+    autonomous_pause_requested: Arc<AtomicBool>,
     runtime: SessionToolRuntime,
     sink: SessionEventSink,
+}
+
+/// The engine's conversation resume error when it is idle; `None` while a
+/// turn holds the engine, because a running turn is a resumed conversation
+/// and a window bootstrap must never wait for it.
+fn idle_resume_error<E>(
+    engine: &tokio::sync::Mutex<E>,
+    resume_error: impl FnOnce(&E) -> Option<String>,
+) -> Option<String> {
+    match engine.try_lock() {
+        Ok(engine) => resume_error(&engine),
+        Err(_) => None,
+    }
 }
 
 fn cancel_worker_generation(
@@ -2095,6 +3317,9 @@ struct SessionEngineManagerInner {
     harness_jobs: crate::harness::HarnessJobStore,
     running_harness: tokio::sync::Mutex<HashSet<String>>,
     recovered_projects: SyncMutex<HashMap<String, ProjectRecoveryResult>>,
+    /// Team Map requests run on a dispatcher spawned with the manager; see
+    /// `engine::team` for why the per-session executor only sends to it.
+    team_dispatcher: team::TeamDispatcher,
 }
 
 fn restore_pending_review(
@@ -2215,7 +3440,8 @@ impl SessionEngineManager {
         dirs: crate::config::DataDirs,
         fallback_cwd: PathBuf,
     ) -> Self {
-        Self {
+        let (team_dispatcher, team_commands) = tokio::sync::mpsc::unbounded_channel();
+        let manager = Self {
             inner: Arc::new(SessionEngineManagerInner {
                 workers: tokio::sync::Mutex::new(HashMap::new()),
                 sessions,
@@ -2229,8 +3455,11 @@ impl SessionEngineManager {
                 harness_jobs: crate::harness::HarnessJobStore::new(dirs.clone()),
                 running_harness: tokio::sync::Mutex::new(HashSet::new()),
                 recovered_projects: SyncMutex::new(HashMap::new()),
+                team_dispatcher,
             }),
-        }
+        };
+        tauri::async_runtime::spawn(team::dispatch(team_commands, manager.clone()));
+        manager
     }
 
     /// Hold admission closed until project configuration has atomically settled.
@@ -2496,7 +3725,9 @@ impl SessionEngineManager {
                     "harness generation returned a stale base",
                 ));
             }
-            RunOutcome::Completed { .. } | RunOutcome::WriteTransition => {
+            RunOutcome::Completed { .. }
+            | RunOutcome::IterationBoundary { .. }
+            | RunOutcome::WriteTransition => {
                 return Err(AgentEngineError::new(
                     "harness generation returned a foreground outcome",
                 ));
@@ -2807,10 +4038,28 @@ impl SessionEngineManager {
                 .emit_scoped("progress", event)
                 .map_err(|error| format!("failed to emit progress event: {error}"))
         });
+        let autonomous_sink = sink.clone();
+        runtime.set_autonomous_emitter(move |event| {
+            autonomous_sink
+                .emit_scoped("autonomous_run", event)
+                .map_err(|error| format!("failed to emit autonomous run event: {error}"))
+        });
         let (cancellation, cancellation_rx) = tokio::sync::watch::channel(0_u64);
         runtime.set_cancellation(cancellation_rx.clone());
         let binding = BindingSnapshot::from_binding(&record.provider_binding, None)
             .map_err(|error| AgentEngineError::new(error.to_string()))?;
+        if record.meta.kind == crate::session::SessionKind::Eps {
+            let team = team::TeamHandoffContext {
+                app: self.inner.app.clone(),
+                dispatcher: self.inner.team_dispatcher.clone(),
+                sessions: self.inner.sessions.clone(),
+                session_id: session_id.to_string(),
+                cancellation: cancellation_rx.clone(),
+            };
+            runtime.set_team_executor(move |request| Box::pin(team.clone().run(request)));
+            let app = self.inner.app.clone();
+            runtime.set_team_action_executor(move |action| team::run_action(&app, action));
+        }
         let adapter = crate::provider_runtime::production_adapter(
             &record.provider_binding,
             &self.inner.dirs,
@@ -2831,19 +4080,22 @@ impl SessionEngineManager {
             )),
         )
         .map_err(|error| AgentEngineError::new(error.to_string()))?;
+        let engine = AgentEngine::new(
+            executor,
+            sink.clone(),
+            self.inner.config.clone(),
+            runtime.clone(),
+            self.inner.sessions.clone(),
+            self.inner.attachments.clone(),
+            record,
+            cancellation_rx,
+        );
+        let autonomous_pause_requested = engine.autonomous_pause_handle();
         let worker = Arc::new(SessionWorker {
-            provider: record.provider_binding.provider,
-            engine: tokio::sync::Mutex::new(AgentEngine::new(
-                executor,
-                sink.clone(),
-                self.inner.config.clone(),
-                runtime.clone(),
-                self.inner.sessions.clone(),
-                self.inner.attachments.clone(),
-                record,
-                cancellation_rx,
-            )),
+            provider: engine.provider_binding.provider,
+            engine: tokio::sync::Mutex::new(engine),
             cancellation,
+            autonomous_pause_requested,
             runtime,
             sink: sink.clone(),
         });
@@ -2859,15 +4111,18 @@ impl SessionEngineManager {
     ) -> Result<(), AgentEngineError> {
         let mut engine = worker.engine.lock().await;
         match engine.continue_pending_write().await {
-            Ok(()) => Ok(()),
+            Ok(job) => {
+                drop(engine);
+                if let Some(job) = job {
+                    self.enqueue_harness_job(job)?;
+                }
+                Ok(())
+            }
             Err(error) => {
                 let _ = engine.recover_write_failure();
-                let activity = if engine.phase == Phase::ChangesetReview {
-                    crate::write_coordinator::SessionActivity::Review
-                } else {
-                    crate::write_coordinator::SessionActivity::Error
-                };
-                worker.runtime.emit_activity(activity);
+                worker
+                    .runtime
+                    .emit_activity(crate::write_coordinator::SessionActivity::Error);
                 let _ = engine.sink.emit(EngineEvent::Error(ipc::ErrorEvent {
                     message: error.message.clone(),
                 }));
@@ -2900,12 +4155,9 @@ impl SessionEngineManager {
         if let Err(error) = result {
             let mut engine = worker.engine.lock().await;
             let cleanup = engine.recover_read_failure();
-            let activity = if engine.phase == Phase::ChangesetReview {
-                crate::write_coordinator::SessionActivity::Review
-            } else {
-                crate::write_coordinator::SessionActivity::Error
-            };
-            worker.runtime.emit_activity(activity);
+            worker
+                .runtime
+                .emit_activity(crate::write_coordinator::SessionActivity::Error);
             let message = match cleanup {
                 Ok(()) => error.message.clone(),
                 Err(cleanup_error) => format!(
@@ -2924,9 +4176,7 @@ impl SessionEngineManager {
         }
         let phase = worker.engine.lock().await.phase;
         let activity = match phase {
-            Phase::PlanReview | Phase::ChangesetReview => {
-                crate::write_coordinator::SessionActivity::Review
-            }
+            Phase::PlanReview => crate::write_coordinator::SessionActivity::Review,
             _ => crate::write_coordinator::SessionActivity::Idle,
         };
         worker.runtime.emit_activity(activity);
@@ -2957,6 +4207,129 @@ impl SessionEngineManager {
         };
         self.finish_read_command(&worker, result).await
     }
+
+    /// Continue an EPS conversation after its team map task settled in the
+    /// background (the `map_task_request` had returned `running`): one
+    /// ordinary interactive turn on the fixed continuation text, exactly as if
+    /// the user had pressed "이어서 진행". The turn starts only once the
+    /// session is idle; an autonomous run, a pending review, or a task the
+    /// user already moved past leaves the settlement to `[map tasks]` on the
+    /// session's own next turn instead.
+    pub(crate) async fn team_continue(
+        &self,
+        session_id: &str,
+        task_id: &str,
+    ) -> Result<(), AgentEngineError> {
+        let record = self
+            .inner
+            .sessions
+            .load(session_id)
+            .map_err(|error| AgentEngineError::new(error.to_string()))?;
+        if record.meta.kind != crate::session::SessionKind::Eps {
+            return Err(AgentEngineError::new(
+                "only an EPS session continues after a team map task",
+            ));
+        }
+        if record
+            .autonomous_run
+            .as_ref()
+            .is_some_and(|run| !run.status.is_terminal())
+        {
+            return Ok(());
+        }
+        let worker = self.worker(session_id).await?;
+        let _provider_busy = self.inner.provider_service.enter_busy(worker.provider);
+        // Awaiting the engine waits out the turn that received `running`.
+        let mut engine = worker.engine.lock().await;
+        if engine.phase != Phase::Idle {
+            eprintln!(
+                "eud-agent: team map task {task_id} settled while session {session_id} is not idle; its next turn reports it"
+            );
+            return Ok(());
+        }
+        // The task the settler announced must still be the one to act on: the
+        // user may have applied, discarded, or replaced it meanwhile, in which
+        // case the next user turn sees the durable state.
+        let task = self
+            .inner
+            .sessions
+            .load(session_id)
+            .map_err(|error| AgentEngineError::new(error.to_string()))?
+            .team_tasks
+            .into_iter()
+            .find(|task| task.id == task_id);
+        let Some(task) = task.filter(|task| task.status.continues_interactively()) else {
+            return Ok(());
+        };
+        let client_turn_id = ipc::new_client_turn_id();
+        let text = crate::team::TEAM_TASK_CONTINUE_TEXT.to_string();
+        // The panel records the turn as sent from this event: it precedes the
+        // turn's own stream on the same session channel.
+        if let Err(error) = worker.sink.emit_scoped(
+            "team_task",
+            crate::team::TeamTaskEvent {
+                task,
+                continuation: Some(crate::team::TeamTaskContinuation {
+                    client_turn_id: client_turn_id.clone(),
+                    text: text.clone(),
+                }),
+            },
+        ) {
+            eprintln!(
+                "eud-agent: team continuation event failed: session={session_id} error={error}"
+            );
+        }
+        if let Err(error) = self.inner.sessions.touch_conversation(session_id) {
+            eprintln!("eud-agent: conversation timestamp update failed: {error}");
+        }
+        worker
+            .runtime
+            .emit_activity(crate::write_coordinator::SessionActivity::RunningRead);
+        let result = engine
+            .chat(ipc::ChatRequest {
+                client_turn_id,
+                text,
+                attachments: Vec::new(),
+                mentions: Vec::new(),
+                execution_mode: crate::autonomous::ExecutionMode::Interactive,
+                autonomous_policy: None,
+            })
+            .await;
+        drop(engine);
+        self.finish_read_command(&worker, result).await
+    }
+
+    /// Delete a retired team Map session (a fresh one replaced it for the next
+    /// task) together with its candidate files. Never waits on a running
+    /// turn: a session the user is chatting in stays, and is retired by a
+    /// later task once it is idle.
+    pub(crate) async fn retire_team_session(&self, session_id: &str) -> Result<(), String> {
+        let busy = match self.inner.workers.lock().await.get(session_id).cloned() {
+            Some(worker) => worker
+                .engine
+                .try_lock()
+                .map(|engine| engine.phase != Phase::Idle)
+                .unwrap_or(true),
+            None => false,
+        };
+        if busy {
+            return Err("the earlier team map session is still running a turn".to_string());
+        }
+        let project_id = self
+            .inner
+            .sessions
+            .load(session_id)
+            .map_err(|error| error.to_string())?
+            .meta
+            .project;
+        self.delete_map_session(session_id).await?;
+        let service = tauri::Manager::state::<crate::map_agent::MapAgentService>(&self.inner.app);
+        if let Err(error) = service.discard_session_candidate(&project_id, session_id) {
+            eprintln!("eud-agent: retired team Map session candidate cleanup failed: {error}");
+        }
+        Ok(())
+    }
+
     pub(crate) async fn delete_map_session(&self, session_id: &str) -> Result<(), String> {
         let record = self
             .inner
@@ -2971,17 +4344,90 @@ impl SessionEngineManager {
             .map_err(|error| error.message)
     }
 
-    pub(crate) async fn open_map_session(&self, session_id: &str) -> Result<(), String> {
-        let worker = self
-            .worker(session_id)
-            .await
-            .map_err(|error| error.message)?;
+    /// The Map worker, even when its first hydration failed only because the
+    /// persisted provider conversation could not be resumed: that worker stays
+    /// registered, and the Map window must open so the user can reset it.
+    /// Never waits on a running turn: a busy engine is a live conversation.
+    async fn map_worker(&self, session_id: &str) -> Result<Arc<SessionWorker>, String> {
+        let worker = match self.worker(session_id).await {
+            Ok(worker) => worker,
+            Err(error) => {
+                let registered = self.inner.workers.lock().await.get(session_id).cloned();
+                match registered {
+                    Some(worker)
+                        if worker
+                            .engine
+                            .try_lock()
+                            .map(|engine| engine.conversation_resume_error().is_some())
+                            .unwrap_or(true) =>
+                    {
+                        worker
+                    }
+                    _ => return Err(error.message),
+                }
+            }
+        };
         if worker.runtime.kind() != crate::session::SessionKind::Map {
             return Err("the requested session is not a Map session".to_string());
         }
-        Ok(())
+        Ok(worker)
     }
 
+    /// Open a Map session; returns the resume error the user must clear before
+    /// chatting, or `None` when the persisted conversation continues. A turn
+    /// running on the session (a team request, or one started before the
+    /// window reopened) proves the conversation is alive, so the bootstrap
+    /// never waits for it.
+    pub(crate) async fn open_map_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<String>, String> {
+        let worker = self.map_worker(session_id).await?;
+        Ok(idle_resume_error(&worker.engine, |engine| {
+            engine.conversation_resume_error().map(str::to_string)
+        }))
+    }
+
+    /// The latest Map run transcript of a session, without locking its engine;
+    /// `None` when the session has no worker or never ran a request.
+    pub(crate) async fn map_run_snapshot(&self, session_id: &str) -> Option<MapRunTranscript> {
+        let workers = self.inner.workers.lock().await;
+        workers
+            .get(session_id)
+            .and_then(|worker| worker.sink.map_run_snapshot())
+    }
+
+    pub(crate) async fn map_conversation_reset(&self, session_id: &str) -> Result<(), String> {
+        let worker = self.map_worker(session_id).await?;
+        let mut engine = worker.engine.lock().await;
+        engine
+            .reset_conversation()
+            .await
+            .map_err(|error| error.message)
+    }
+
+    /// Rewind a Map session's model-visible conversation to the panel-log
+    /// prefix before an edited message. The candidate map and its revisions
+    /// are untouched: only the provider thread and task branch move. A
+    /// running turn (the window's own or a team request) is a live
+    /// conversation, so the rewind refuses instead of waiting behind it.
+    pub(crate) async fn map_conversation_rewind(
+        &self,
+        session_id: &str,
+        panel_log: serde_json::Value,
+    ) -> Result<(), String> {
+        let worker = self.map_worker(session_id).await?;
+        let Ok(mut engine) = worker.engine.try_lock() else {
+            return Err("진행 중인 맵 요청을 먼저 중단한 뒤 메시지를 수정해 주세요.".to_string());
+        };
+        engine
+            .rewind(panel_log)
+            .await
+            .map_err(|error| error.message)
+    }
+
+    /// Run one Map request; `prompt` is the request bubble the Map window
+    /// shows for it, whether the window sent it or an EPS session's team task.
     pub(crate) async fn map_chat(
         &self,
         session_id: &str,
@@ -2989,7 +4435,8 @@ impl SessionEngineManager {
         candidate_revision: String,
         text: String,
         attachments: Vec<String>,
-    ) -> Result<(), String> {
+        prompt: MapRunPrompt,
+    ) -> Result<MapTurnEnd, String> {
         let worker = self
             .worker(session_id)
             .await
@@ -3004,17 +4451,28 @@ impl SessionEngineManager {
         worker
             .runtime
             .emit_activity(crate::write_coordinator::SessionActivity::RunningRead);
+        let origin = prompt.origin;
         worker
             .sink
-            .set_map_context(request_id.clone(), candidate_revision);
+            .set_map_context(request_id.clone(), candidate_revision, prompt);
         let result = {
             let mut engine = worker.engine.lock().await;
             engine.map_chat(request_id.clone(), text, attachments).await
         };
+        if let (MapRunOrigin::Team, Err(error)) = (origin, &result) {
+            // A user-typed request reports its failure through the invoke
+            // result; a team run has no caller in the window, so its failure
+            // closes the run's transcript as the terminal event it replays.
+            let _ = worker.sink.emit(EngineEvent::Error(ipc::ErrorEvent {
+                message: error.message.clone(),
+            }));
+        }
         worker.sink.clear_map_context(&request_id);
-        self.finish_read_command(&worker, result)
+        let end = result.as_ref().map_or(MapTurnEnd::Completed, |end| *end);
+        self.finish_read_command(&worker, result.map(|_| ()))
             .await
-            .map_err(|error| error.message)
+            .map_err(|error| error.message)?;
+        Ok(end)
     }
 
     pub(crate) async fn cancel_map_session(&self, session_id: &str) -> Result<(), String> {
@@ -3063,24 +4521,6 @@ impl SessionEngineManager {
         self.drive_pending_write(worker).await
     }
 
-    async fn changeset_decision(
-        &self,
-        session_id: &str,
-        request: ipc::ChangesetDecisionRequest,
-    ) -> Result<(), AgentEngineError> {
-        let worker = self.worker(session_id).await?;
-        let job = worker
-            .engine
-            .lock()
-            .await
-            .changeset_decision(request)
-            .await?;
-        if let Some(job) = job {
-            self.enqueue_harness_job(job)?;
-        }
-        Ok(())
-    }
-
     async fn compact(&self, session_id: &str) -> Result<(), AgentEngineError> {
         let worker = self.worker(session_id).await?;
         let _provider_busy = self.inner.provider_service.enter_busy(worker.provider);
@@ -3092,7 +4532,7 @@ impl SessionEngineManager {
             let result = engine.compact().await;
             (result, engine.phase)
         };
-        let activity = if matches!(phase, Phase::PlanReview | Phase::ChangesetReview) {
+        let activity = if matches!(phase, Phase::PlanReview) {
             crate::write_coordinator::SessionActivity::Review
         } else {
             crate::write_coordinator::SessionActivity::Idle
@@ -3160,22 +4600,113 @@ impl SessionEngineManager {
             .map_err(AgentEngineError::new)
     }
 
+    async fn autonomous_pause(&self, session_id: &str) -> Result<(), AgentEngineError> {
+        let worker = self.worker(session_id).await?;
+        let mut record = self
+            .inner
+            .sessions
+            .load(session_id)
+            .map_err(|error| AgentEngineError::new(error.to_string()))?;
+        let run = record
+            .autonomous_run
+            .as_mut()
+            .ok_or_else(|| AgentEngineError::new("일시 중지할 장시간 작업이 없습니다."))?;
+        if run.status != crate::autonomous::AutonomousRunStatus::Running {
+            return Err(AgentEngineError::new(
+                "현재 장시간 작업은 실행 중 상태가 아닙니다.",
+            ));
+        }
+        worker
+            .autonomous_pause_requested
+            .store(true, Ordering::SeqCst);
+        run.status = crate::autonomous::AutonomousRunStatus::Pausing;
+        run.pause_reason = Some(crate::autonomous::AutonomousPauseReason::User);
+        run.updated_at = crate::session::now_unix_millis();
+        let run_payload = run.clone();
+        self.inner
+            .sessions
+            .save(&record)
+            .map_err(|error| AgentEngineError::new(error.to_string()))?;
+        worker
+            .sink
+            .emit_scoped("autonomous_run", run_payload)
+            .map_err(|error| AgentEngineError::new(error.to_string()))
+    }
+
+    async fn autonomous_resume(&self, session_id: &str) -> Result<(), AgentEngineError> {
+        let worker = self.worker(session_id).await?;
+        let _provider_busy = self.inner.provider_service.enter_busy(worker.provider);
+        worker
+            .runtime
+            .emit_activity(crate::write_coordinator::SessionActivity::RunningRead);
+        let result = {
+            let mut engine = worker.engine.lock().await;
+            engine.autonomous_resume().await
+        };
+        self.finish_read_command(&worker, result).await
+    }
+
+    async fn autonomous_stop(&self, session_id: &str) -> Result<(), AgentEngineError> {
+        let worker = self.worker(session_id).await?;
+        worker
+            .autonomous_pause_requested
+            .store(true, Ordering::SeqCst);
+        worker.runtime.cancel_pending_ask();
+        let record = self
+            .inner
+            .sessions
+            .load(session_id)
+            .map_err(|error| AgentEngineError::new(error.to_string()))?;
+        let run = record
+            .autonomous_run
+            .as_ref()
+            .ok_or_else(|| AgentEngineError::new("중단할 장시간 작업이 없습니다."))?;
+        if run.status.is_terminal() {
+            return Err(AgentEngineError::new("장시간 작업이 이미 종료되었습니다."));
+        }
+        let run_payload = self
+            .inner
+            .sessions
+            .update_autonomous_status(
+                session_id,
+                crate::autonomous::AutonomousRunStatus::Cancelled,
+                None,
+                Some("사용자가 장시간 작업을 중단했습니다.".to_string()),
+            )
+            .map_err(|error| AgentEngineError::new(error.to_string()))?
+            .ok_or_else(|| AgentEngineError::new("중단할 장시간 작업이 없습니다."))?;
+        worker
+            .sink
+            .emit_scoped("autonomous_run", run_payload)
+            .map_err(|error| AgentEngineError::new(error.to_string()))?;
+        cancel_worker_generation(&worker.cancellation)?;
+        let mut engine = worker.engine.lock().await;
+        if worker.runtime.write_ticket().is_some() {
+            engine.recover_write_failure()?;
+        } else {
+            engine.phase = Phase::Idle;
+            worker
+                .runtime
+                .emit_activity(crate::write_coordinator::SessionActivity::Idle);
+        }
+        engine.update_active_session().await;
+        Ok(())
+    }
+
     async fn cancel(&self, session_id: &str) -> Result<(), AgentEngineError> {
         let worker = self.worker(session_id).await?;
         worker.runtime.cancel_pending_ask();
         if let Ok(engine) = worker.engine.try_lock() {
-            if matches!(engine.phase, Phase::PlanReview | Phase::ChangesetReview) {
+            if engine.phase == Phase::PlanReview {
                 return Err(AgentEngineError::new(
-                    "검토 중인 변경사항은 accept 또는 reject로 결정해 주세요.",
+                    "검토 중인 계획을 먼저 승인하거나 수정 요청해 주세요.",
                 ));
             }
         }
         cancel_worker_generation(&worker.cancellation)?;
         let mut engine = worker.engine.lock().await;
         if worker.runtime.write_ticket().is_some() {
-            if engine.phase != Phase::ChangesetReview {
-                engine.recover_write_failure()?;
-            }
+            engine.recover_write_failure()?;
         } else {
             engine.phase = Phase::Idle;
             worker
@@ -3208,6 +4739,7 @@ impl SessionEngineManager {
                 model: provider_binding.model.clone(),
                 created_at,
                 last_conversation_at: crate::session::now_unix_millis(),
+                team_parent: None,
             },
             provider_binding,
             pending_request_ids: Vec::new(),
@@ -3215,6 +4747,8 @@ impl SessionEngineManager {
             panel_log: serde_json::Value::Null,
             context_state: Default::default(),
             task_state: Default::default(),
+            autonomous_run: None,
+            team_tasks: Vec::new(),
         };
         self.inner
             .sessions
@@ -3239,6 +4773,35 @@ impl SessionEngineManager {
                 return Err(AgentEngineError::new(
                     "실행 또는 검토 중인 세션은 삭제할 수 없습니다.",
                 ));
+            }
+        }
+        // Every team Map session goes with its EPS parent, but never while the
+        // user still has one of its candidates to settle.
+        let teams = self
+            .inner
+            .sessions
+            .team_sessions_of(id)
+            .map_err(|error| AgentEngineError::new(error.to_string()))?;
+        if !teams.is_empty() {
+            let record = self
+                .inner
+                .sessions
+                .load(id)
+                .map_err(|error| AgentEngineError::new(error.to_string()))?;
+            if record.team_tasks.iter().any(|task| task.status.is_active()) {
+                return Err(AgentEngineError::new(
+                    "맵 창에서 이 세션의 맵 작업 후보를 적용하거나 폐기한 뒤 세션을 삭제해 주세요.",
+                ));
+            }
+            for team in teams {
+                Box::pin(self.delete_map_session(&team.id))
+                    .await
+                    .map_err(AgentEngineError::new)?;
+                let service =
+                    tauri::Manager::state::<crate::map_agent::MapAgentService>(&self.inner.app);
+                if let Err(error) = service.discard_session_candidate(&team.project, &team.id) {
+                    eprintln!("eud-agent: team Map session candidate cleanup failed: {error}");
+                }
             }
         }
         let harness_jobs = self
@@ -3318,6 +4881,21 @@ impl SessionEngineManager {
                 crate::ollama::provider_model(
                     &record.provider_binding.model,
                     Some(&record.provider_binding.model),
+                )
+                .map_err(AgentEngineError::new)?,
+            );
+        }
+        // A degraded Claude catalog (expired token, offline) must not blank a session that is
+        // still bound to a valid catalog model; keep the bound id selectable with its saved level.
+        if record.provider_binding.provider == crate::provider::ProviderId::ClaudeCode
+            && !models
+                .iter()
+                .any(|model| model.model == record.provider_binding.model)
+        {
+            models.push(
+                crate::claude_client::bound_model(
+                    &record.provider_binding.model,
+                    record.provider_binding.reasoning.as_ref(),
                 )
                 .map_err(AgentEngineError::new)?,
             );
@@ -3431,6 +5009,10 @@ pub(crate) async fn session_model_settings_save(
         .map_err(|error| error.message)
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "Tauri exposes each chat request field as a named command argument"
+)]
 #[tauri::command(rename = "chat")]
 pub(crate) async fn engine_chat(
     state: tauri::State<'_, SessionEngineManager>,
@@ -3439,6 +5021,8 @@ pub(crate) async fn engine_chat(
     attachments: Vec<String>,
     client_turn_id: String,
     mentions: Option<Vec<crate::mentions::MentionInstance>>,
+    execution_mode: Option<crate::autonomous::ExecutionMode>,
+    autonomous_policy: Option<crate::autonomous::AutonomousRunPolicy>,
 ) -> Result<(), String> {
     state
         .chat(
@@ -3448,6 +5032,8 @@ pub(crate) async fn engine_chat(
                 text,
                 attachments,
                 mentions: mentions.unwrap_or_default(),
+                execution_mode: execution_mode.unwrap_or_default(),
+                autonomous_policy,
             },
         )
         .await
@@ -3484,19 +5070,6 @@ pub(crate) async fn engine_plan_approve(
 ) -> Result<(), String> {
     state
         .plan_approve(&session_id)
-        .await
-        .map_err(|error| error.message)
-}
-
-#[tauri::command(rename = "changeset_decision")]
-pub(crate) async fn engine_changeset_decision(
-    state: tauri::State<'_, SessionEngineManager>,
-    session_id: String,
-    decision: ipc::Decision,
-    ids: ipc::DecisionIds,
-) -> Result<(), String> {
-    state
-        .changeset_decision(&session_id, ipc::ChangesetDecisionRequest { decision, ids })
         .await
         .map_err(|error| error.message)
 }
@@ -3593,6 +5166,39 @@ pub(crate) async fn engine_ask_response(
                 answers,
             },
         )
+        .await
+        .map_err(|error| error.message)
+}
+
+#[tauri::command(rename = "autonomous_pause")]
+pub(crate) async fn engine_autonomous_pause(
+    state: tauri::State<'_, SessionEngineManager>,
+    session_id: String,
+) -> Result<(), String> {
+    state
+        .autonomous_pause(&session_id)
+        .await
+        .map_err(|error| error.message)
+}
+
+#[tauri::command(rename = "autonomous_resume")]
+pub(crate) async fn engine_autonomous_resume(
+    state: tauri::State<'_, SessionEngineManager>,
+    session_id: String,
+) -> Result<(), String> {
+    state
+        .autonomous_resume(&session_id)
+        .await
+        .map_err(|error| error.message)
+}
+
+#[tauri::command(rename = "autonomous_stop")]
+pub(crate) async fn engine_autonomous_stop(
+    state: tauri::State<'_, SessionEngineManager>,
+    session_id: String,
+) -> Result<(), String> {
+    state
+        .autonomous_stop(&session_id)
         .await
         .map_err(|error| error.message)
 }
@@ -3742,6 +5348,14 @@ pub fn build_map_system_prompt(project_state: &str, project_memory: Option<&str>
          - Semantic ISOM transitions outside the current request scope make finalize fail. Do not clip, hide, or substitute them; ask the user to expand a supplied target only when that target blocks the requested transition.\n\
          - A doodad that changes terrain plus a sprite overlay requires terrain, doodads, and sprites authority.\n\
          - Materially ambiguous owner, count, state, or location bounds require the ask tool.\n\n\
+         [draft patch operations]\n\
+         Every map_draft_patch operation is a flat object with op plus exactly the listed keys; bracketed keys are optional and state{{...}} lists nested object keys. Never invent keys such as tileId.\n\
+         {operations_guide}\n\
+         - Every value is typed exactly as advertised: brush, after, tiles, and replacementTiles are numeric ids from map_palette_query, never names such as 'Dirt'.\n\
+         - terrain.set before must equal the current tile id at (x, y). Read exact ids with map_terrain_read (visible candidate) or map_draft_terrain_read (request draft) — including when replicating an existing pattern — or use terrain.rect / terrain.blit, which need no expected-before value. Never guess before values or probe them through conflict errors.\n\
+         - Semantic terrain that must blend with its surroundings (a hill or plateau, a pool, a different ground type) is an ISOM brush job, exactly like SCMDraft's isometric brush: terrain.isom_rect fills a tile rectangle with one brush id from map_palette_query kind=brushes and generates the matching transition tiles (cliff edges, shorelines) itself: the rectangle interior becomes the brush terrain and a ring up to two diamonds wide (8 tiles sideways, 4 tiles up and down) on and outside the rectangle border is regenerated from the map's ISOM data, so where the surroundings were laid with exact tiles the ring shows the ISOM terrain rather than the visible tiles; render or analyze the draft after painting. A high brush (High Dirt, High Jungle, ...) painted on low ground is a hill with cliffs; ramps are separate doodads. Give terrain.isom_rect at least 5x3 tiles plus room for the ring; every map with an ISOM section supports it, and the error names the reason when it does not. terrain.isom_brush is the single-diamond form on ISOM grid coordinates: isomX is a tile x / 2 (0..width/2), isomY is a tile y (0..height), isomX + isomY must be even, one diamond covers tiles [2*isomX-2, 2*isomX+1] x [isomY-1, isomY], and extent N is an NxN diamond block. Never assemble cliff edges from exact tile ids with terrain.set/terrain.rect/terrain.blit unless the user asks for exact tiles, and never conclude a map lacks ISOM data from a rejected isom_brush call.\n\
+         - ordinal and beforeFingerprint identify one existing object exactly as map_objects_read returned it for the current revision.\n\
+         - tiles and replacementTiles are row-major matrices of exact tile ids whose top-left is (x, y) or the doodad footprint.\n\n\
          [selection stamps]\n\
          - A candidateSelection source is an exact reusable stamp whose content is read from the visible candidate when placed. An imported source is a pinned external-map snapshot authorized only by an importedStamp mention in the current request. Empty layers mean all six supported layers.\n\
          - For exact copy/duplicate/replicate requests, use map_stamp_preview and map_stamp_place. Never reconstruct either source through map_render, tile catalog enumeration, terrain.set probes, terrain.blit matrices, expected-before probes, or semantic ISOM brushes.\n\
@@ -3764,14 +5378,15 @@ pub fn build_map_system_prompt(project_state: &str, project_memory: Option<&str>
          Original Apply and backup restore are intentionally absent from your tools. Only the user's trusted Map Agent window command can Apply or undo.\n\
          Never request, infer, or expose SCX/candidate filesystem paths; all access uses typed map tools.\n\n\
          [project state]\n{project_state}\n\n{}",
-        project_memory.unwrap_or("[project memory]\n(none)")
+        project_memory.unwrap_or("[project memory]\n(none)"),
+        operations_guide = crate::tools::map_draft_patch_operations_guide(),
     )
 }
 
-fn static_prompt_baseline() -> String {
+fn static_prompt_baseline(provider: crate::provider::ProviderId) -> String {
     [
         INTRO.to_string(),
-        tool_catalog_section(),
+        tool_catalog_section(provider),
         WORKSPACE_GUIDE.to_string(),
         first_principles_section(),
         EPS_IDIOMS.to_string(),
@@ -3779,14 +5394,14 @@ fn static_prompt_baseline() -> String {
         DIRECT_PYTHON_GUIDE.to_string(),
         EPS_PROJECT_ARCHITECTURE_GUIDE.to_string(),
         BUILD_GUIDE.to_string(),
-        TRACE_TEST_GUIDE.to_string(),
         MAP_LOCATION_GUIDE.to_string(),
         RESOURCE_MENTION_GUIDE.to_string(),
         AUDIO_SOUND_GUIDE.to_string(),
+        MAP_HANDOFF_GUIDE.to_string(),
         EVIDENCE_GUIDE.to_string(),
         MESSAGE_FORMAT_INSTRUCTIONS.to_string(),
         INTERACTION_GUIDE.to_string(),
-        TRIAGE_INSTRUCTIONS.to_string(),
+        COMPLETION_GUIDE.to_string(),
     ]
     .join("\n\n")
 }
@@ -3802,7 +5417,7 @@ pub fn build_system_prompt(
 ) -> String {
     let _ = request_text;
     let mut parts = vec![
-        static_prompt_baseline(),
+        static_prompt_baseline(crate::provider::ProviderId::OpencodeGo),
         project_state_section(project_state),
     ];
     if let Some(memory) = project_memory_section(project_memory) {
@@ -3818,25 +5433,45 @@ pub fn build_system_prompt(
 }
 
 /// Render the `[tools]` catalog from the live registry so the system prompt
-/// always matches what the eud-tools MCP server actually exposes (read vs
-/// journaled-write split). The agent invokes these through that MCP server.
-fn tool_catalog_section() -> String {
+/// always matches what the eud-tools MCP server actually exposes. Three
+/// groups, because they differ in what they cost: reads, plain file I/O, and
+/// the validated project writers. A provider with its own CLI file tools is
+/// not offered `fs_*` (the run gate does not advertise them to it either).
+fn tool_catalog_section(provider: crate::provider::ProviderId) -> String {
+    let native_files = provider.has_native_file_tools();
     let mut read = Vec::new();
+    let mut files = Vec::new();
     let mut write = Vec::new();
     for spec in crate::tools::tool_registry() {
         let line = format!("- {} — {}", spec.name, spec.description);
-        if spec.mutating {
+        if crate::tools::is_fs_tool(spec.name) {
+            if !native_files {
+                files.push(line);
+            }
+        } else if spec.requires_write_workspace {
             write.push(line);
         } else {
             read.push(line);
         }
     }
+    let files = if native_files {
+        "Project files: read, search and edit them with your own native file tools (plain \
+filesystem, no validation; the turn's git commit is what makes them reversible).\n"
+            .to_string()
+    } else {
+        format!(
+            "Project files (plain filesystem, no validation; the turn's git commit is what \
+makes them reversible):\n{}\n",
+            files.join("\n")
+        )
+    };
     format!(
-        "[tools]\nThese eud-tools (exposed over the eud-tools MCP server) are the ONLY \
-way to read or mutate the live editor/map; every call and result is shown to the user. \
-Native filesystem tools are separately allowed only in the project workspace described \
-above.\nRead-only:\n{}\nWrite (validated, journaled, and reviewable/reversible as a changeset):\n{}",
+        "[tools]\nThese eud-tools (exposed over the eud-tools MCP server) are the only \
+way to reach the map, the build, and the sparse DAT documents; every call and result is \
+shown to the user.\nRead-only:\n{}\n{}Validated project state (schema-checked and recorded \
+before it is written):\n{}",
         read.join("\n"),
+        files,
         write.join("\n")
     )
 }
@@ -3909,7 +5544,7 @@ fn next_request_id() -> String {
     format!("req-{value:08x}", value = value as u32)
 }
 
-fn next_run_id() -> u64 {
+pub(crate) fn next_run_id() -> u64 {
     static NEXT_RUN_ID: AtomicU64 = AtomicU64::new(1);
     NEXT_RUN_ID.fetch_add(1, Ordering::Relaxed)
 }
@@ -4017,13 +5652,22 @@ fn project_name_from_state(project_state: &str) -> String {
 /// prompt limits. The `panelLog` is opaque to Rust, so this reads it defensively:
 /// any missing/odd shape simply yields fewer lines (never panics).
 fn condense_transcript(panel_log: &serde_json::Value) -> String {
+    condense_transcript_with_cap(panel_log, CONDENSED_TRANSCRIPT_CAP_CHARS)
+}
+
+/// The durable panel log rendered for the model under a character bound.
+///
+/// The bound drops the OLDEST rows: a turn that continues a conversation needs
+/// how it ended, and a head-first cut hands the model the opening of a long
+/// session and none of the work it is being asked to continue.
+fn condense_transcript_with_cap(panel_log: &serde_json::Value, cap: usize) -> String {
     let entries = panel_log
         .get("log")
         .and_then(serde_json::Value::as_array)
         .cloned()
         .unwrap_or_default();
 
-    let mut lines = vec!["[prior conversation]".to_string()];
+    let mut lines = Vec::new();
     for entry in &entries {
         let kind = entry.get("kind").and_then(serde_json::Value::as_str);
         let text = entry
@@ -4042,14 +5686,31 @@ fn condense_transcript(panel_log: &serde_json::Value) -> String {
         if text.is_empty() {
             continue;
         }
-        lines.push(format!("{label}: {text}"));
+        lines.push(format!("{label}: {}", take_chars(text, cap)));
     }
-    if lines.len() == 1 {
+    if lines.is_empty() {
         return String::new();
     }
 
-    let joined = lines.join("\n");
-    take_chars(&joined, CONDENSED_TRANSCRIPT_CAP_CHARS)
+    let mut kept = std::collections::VecDeque::new();
+    let mut used = 0_usize;
+    for line in lines.iter().rev() {
+        let length = line.chars().count().saturating_add(1);
+        if !kept.is_empty() && used.saturating_add(length) > cap {
+            break;
+        }
+        used = used.saturating_add(length);
+        kept.push_front(line.as_str());
+    }
+    let mut out = String::from("[prior conversation]");
+    if kept.len() < lines.len() {
+        out.push_str("\n(앞부분 생략)");
+    }
+    for line in kept {
+        out.push('\n');
+        out.push_str(line);
+    }
+    out
 }
 
 /// The `ids` echoed back to the panel in `rollback_result`. A per-item decision
@@ -4057,13 +5718,6 @@ fn condense_transcript(panel_log: &serde_json::Value) -> String {
 /// the panel resolves against its OWN still-undecided item ids (a dat group's ids
 /// live on its properties, NOT on a single group id — so the server must not echo
 /// group ids here or dat groups would never mark as decided under bulk).
-fn rollback_ids(ids: &ipc::DecisionIds) -> Vec<String> {
-    match ids {
-        ipc::DecisionIds::List(ids) => ids.clone(),
-        ipc::DecisionIds::All(_) => Vec::new(),
-    }
-}
-
 /// Lowercase family slug for the panel's dat type badge.
 fn dat_table_slug(table: journal::DatTable) -> &'static str {
     match table {
@@ -4262,7 +5916,7 @@ mod tests {
         current_memory: Option<&str>,
         current_wiki: Option<&str>,
     ) -> String {
-        let baseline = static_prompt_baseline();
+        let baseline = static_prompt_baseline(crate::provider::ProviderId::OpencodeGo);
         let mut context = crate::context_state::SessionContextState::default();
         context.adopt_legacy_thread(
             &baseline,
@@ -4278,6 +5932,7 @@ mod tests {
                 project_state: "[project state]\nproject=Sample",
                 project_memory: current_memory,
                 wiki_facts: current_wiki,
+                project_map: None,
                 reference_context: Some("[reference context]\nshould not repeat"),
                 task_revision: 0,
                 task_snapshot: "[active task state]\n{}",
@@ -4331,7 +5986,7 @@ mod tests {
     );
 
     #[derive(Clone, Default)]
-    struct FakeCodexDriver {
+    pub(super) struct FakeCodexDriver {
         prompts: Arc<Mutex<Vec<String>>>,
         image_paths: Arc<Mutex<Vec<Vec<PathBuf>>>>,
         scripted_turns: Arc<Mutex<VecDeque<AgentTurnResult>>>,
@@ -4344,8 +5999,16 @@ mod tests {
         foreground_error: Arc<Mutex<Option<String>>>,
         reject_seed: Arc<Mutex<bool>>,
         write_runtime: Arc<Mutex<Option<SessionToolRuntime>>>,
-        plan_runtime: Option<SessionToolRuntime>,
+        /// When set, the next foreground run issues one real `ask` through the
+        /// engine tool runtime before returning its scripted result.
+        ask_runtime: Arc<Mutex<Option<SessionToolRuntime>>>,
+        pub(super) plan_runtime: Option<SessionToolRuntime>,
         acknowledgement_count: Arc<Mutex<usize>>,
+        /// The request whose last native run completed but was not yet
+        /// acknowledged through `acknowledge_persisted`. The production
+        /// runtime refuses to start that request again (its completed receipt
+        /// would look like an unrecovered crash), so the fake does too.
+        unacknowledged_request: Arc<Mutex<Option<String>>>,
         reset_count: Arc<Mutex<usize>>,
         /// The mock's live thread id; `reset_thread` clears it, `seed_thread_id`
         /// sets it, mirroring the production client's thread_id mutex.
@@ -4355,7 +6018,7 @@ mod tests {
     }
 
     impl FakeCodexDriver {
-        fn scripted(turns: impl IntoIterator<Item = AgentTurnResult>) -> Self {
+        pub(super) fn scripted(turns: impl IntoIterator<Item = AgentTurnResult>) -> Self {
             Self {
                 prompts: Arc::new(Mutex::new(Vec::new())),
                 image_paths: Arc::new(Mutex::new(Vec::new())),
@@ -4368,8 +6031,10 @@ mod tests {
                 foreground_error: Arc::new(Mutex::new(None)),
                 reject_seed: Arc::new(Mutex::new(false)),
                 write_runtime: Arc::new(Mutex::new(None)),
+                ask_runtime: Arc::new(Mutex::new(None)),
                 plan_runtime: None,
                 acknowledgement_count: Arc::new(Mutex::new(0)),
+                unacknowledged_request: Arc::new(Mutex::new(None)),
 
                 compiler_contracts: Arc::new(Mutex::new(Vec::new())),
                 reset_count: Arc::new(Mutex::new(0)),
@@ -4379,7 +6044,7 @@ mod tests {
             }
         }
 
-        fn prompts(&self) -> Vec<String> {
+        pub(super) fn prompts(&self) -> Vec<String> {
             self.prompts.lock().expect("prompts lock").clone()
         }
 
@@ -4391,7 +6056,7 @@ mod tests {
             self.seeded.lock().expect("seeded lock").clone()
         }
 
-        fn set_workspace(&self, workspace: PreparedWorkspace) {
+        pub(super) fn set_workspace(&self, workspace: PreparedWorkspace) {
             *self.workspace.lock().expect("workspace lock") = Some(workspace);
         }
 
@@ -4426,7 +6091,7 @@ mod tests {
             *self.foreground_error.lock().expect("foreground error lock") = Some(message.into());
         }
 
-        fn request_write_on_run(&self, runtime: SessionToolRuntime) {
+        fn trigger_write_transition_on_run(&self, runtime: SessionToolRuntime) {
             *self.write_runtime.lock().expect("write runtime lock") = Some(runtime);
         }
 
@@ -4474,6 +6139,21 @@ mod tests {
         ) -> crate::provider_runtime::AdapterFuture<'_, RunOutcome> {
             Box::pin(async move {
                 let runtime_session_id = request.identity.session_id.clone();
+                let request_id = request.identity.request_id.clone();
+                if self
+                    .unacknowledged_request
+                    .lock()
+                    .expect("unacknowledged request lock")
+                    .as_deref()
+                    == Some(request_id.as_str())
+                {
+                    // Same refusal as `ProviderRuntime::resolve_native_conversation`.
+                    return RunOutcome::Failed(
+                        crate::provider_runtime::ProviderRuntimeError::Protocol(
+                            "이미 완료된 요청의 저장 복구가 필요합니다. 같은 요청을 자동으로 재실행할 수 없습니다.".into(),
+                        ),
+                    );
+                }
                 let input = request.turn;
                 self.prompts.lock().expect("prompts lock").push(input.text);
                 self.image_paths
@@ -4486,7 +6166,7 @@ mod tests {
                     .expect("write runtime lock")
                     .take()
                 {
-                    if let Err(error) = runtime.request_write_workspace("test transition") {
+                    if let Err(error) = runtime.register_write_request("test transition") {
                         return RunOutcome::Failed(
                             crate::provider_runtime::ProviderRuntimeError::Protocol(error),
                         );
@@ -4501,6 +6181,23 @@ mod tests {
                     return RunOutcome::Failed(
                         crate::provider_runtime::ProviderRuntimeError::Transport(message),
                     );
+                }
+                let ask_runtime = self.ask_runtime.lock().expect("ask runtime lock").take();
+                if let Some(runtime) = ask_runtime {
+                    // The test runtime carries a fixture session id, so the ask
+                    // enters through the request-scoped path rather than the
+                    // run-identity path; expiry handling is identical.
+                    let outcome = runtime
+                        .ask(&json!({
+                            "questions": [{
+                                "id": "mode",
+                                "question": "방식을 고르세요.",
+                                "options": [{"label": "A"}, {"label": "B"}]
+                            }]
+                        }))
+                        .await
+                        .expect("scripted ask must be admitted");
+                    assert_eq!(outcome["status"], "unanswered");
                 }
                 {
                     let mut thread = self.thread_id.lock().expect("thread id lock");
@@ -4517,9 +6214,12 @@ mod tests {
                     let mut workspace = self.workspace.lock().expect("workspace lock");
                     if workspace.is_none() && compiler_requested {
                         let root = unique_temp_dir("runtime-workspace");
+                        let workspace_root = root.join(".eud-agent/workspace");
                         *workspace = Some(PreparedWorkspace {
                             id: "runtime-workspace".to_string(),
                             project: "Sample".to_string(),
+                            temp_dir: workspace_root.join(".tmp"),
+                            workspace_root,
                             root,
                             session_id: Some(runtime_session_id),
                         });
@@ -4531,6 +6231,14 @@ mod tests {
                     .expect("scripted turns lock")
                     .pop_front()
                     .expect("fake codex driver needs one scripted result per turn");
+                if !matches!(result, AgentTurnResult::Cancelled) {
+                    // A completed native run persists its receipt; only
+                    // `acknowledge_persisted` retires it.
+                    *self
+                        .unacknowledged_request
+                        .lock()
+                        .expect("unacknowledged request lock") = Some(request_id);
+                }
                 match result {
                     AgentTurnResult::Answer { text } => RunOutcome::Completed {
                         text,
@@ -4549,6 +6257,12 @@ mod tests {
                     }
                     AgentTurnResult::Cancelled => RunOutcome::Cancelled,
                     AgentTurnResult::WriteTransition => RunOutcome::WriteTransition,
+                    AgentTurnResult::IterationBoundary { reason } => {
+                        RunOutcome::IterationBoundary {
+                            reason,
+                            conversation: self.conversation_state(),
+                        }
+                    }
                 }
             })
         }
@@ -4693,6 +6407,10 @@ mod tests {
                     .acknowledgement_count
                     .lock()
                     .expect("acknowledgement count lock") += 1;
+                *self
+                    .unacknowledged_request
+                    .lock()
+                    .expect("unacknowledged request lock") = None;
                 Ok(())
             })
         }
@@ -4860,12 +6578,12 @@ mod tests {
     }
 
     #[derive(Clone, Default)]
-    struct CapturingEventSink {
+    pub(super) struct CapturingEventSink {
         events: Arc<Mutex<Vec<EngineEvent>>>,
     }
 
     impl CapturingEventSink {
-        fn events(&self) -> Vec<EngineEvent> {
+        pub(super) fn events(&self) -> Vec<EngineEvent> {
             self.events.lock().expect("events lock").clone()
         }
     }
@@ -4922,7 +6640,7 @@ mod tests {
         }
     }
 
-    fn unique_temp_dir(tag: &str) -> PathBuf {
+    pub(super) fn unique_temp_dir(tag: &str) -> PathBuf {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -4938,7 +6656,7 @@ mod tests {
         (base, memory)
     }
 
-    fn native_workspace_snapshot(
+    pub(super) fn native_workspace_snapshot(
         dirs: &crate::config::DataDirs,
         name: &str,
     ) -> crate::source_snapshot::ProjectSnapshot {
@@ -4968,7 +6686,6 @@ mod tests {
         crate::source_snapshot::ProjectSnapshot {
             project: name.to_string(),
             identity: project.root().to_string_lossy().into_owned(),
-            files: Vec::new(),
         }
     }
 
@@ -4989,7 +6706,7 @@ mod tests {
         crate::session::SessionStore::new(&dirs)
     }
 
-    fn attachment_store_at(data_dir: &std::path::Path) -> AttachmentStore {
+    pub(super) fn attachment_store_at(data_dir: &std::path::Path) -> AttachmentStore {
         AttachmentStore::new(data_dir.join("attachments"))
     }
 
@@ -5005,6 +6722,7 @@ mod tests {
                 model: "gpt-test".to_string(),
                 created_at,
                 last_conversation_at: crate::session::now_unix_millis(),
+                team_parent: None,
             },
             provider_binding: crate::provider::ProviderBinding::new(
                 crate::provider::ProviderId::Codex,
@@ -5019,6 +6737,8 @@ mod tests {
             panel_log: serde_json::Value::Null,
             context_state: Default::default(),
             task_state: Default::default(),
+            autonomous_run: None,
+            team_tasks: Vec::new(),
         };
         store.save(&record).unwrap();
         record
@@ -5037,7 +6757,7 @@ mod tests {
             executor,
             sink,
             config_with_memory(memory),
-            SessionToolRuntime::for_tests(),
+            test_tool_runtime(),
             sessions,
             attachment_store_at(data_dir),
             session,
@@ -5061,7 +6781,7 @@ mod tests {
             .expect("journal entry should persist");
     }
 
-    fn record_file_write_in_memory(
+    pub(super) fn record_file_write_in_memory(
         store: &journal::JournalStore,
         request_id: &str,
         id: &str,
@@ -5146,7 +6866,7 @@ mod tests {
             executor,
             sink,
             config,
-            SessionToolRuntime::for_tests(),
+            test_tool_runtime(),
             sessions,
             attachment_store_at(data_dir),
             session,
@@ -5157,7 +6877,52 @@ mod tests {
         engine
     }
 
-    fn test_engine<R: RuntimeExecutor, S: EventSink>(executor: R, sink: S) -> AgentEngine<R, S> {
+    /// A session tool runtime with an activated native project, so stage jobs
+    /// and approvals can prepare the session workspace as production does.
+    fn test_tool_runtime() -> SessionToolRuntime {
+        let runtime = SessionToolRuntime::for_tests();
+        let dirs = runtime.data_dirs();
+        dirs.ensure_dirs().expect("test data dirs");
+        // A separate root from `native_workspace_snapshot`, which tests may
+        // still call to activate their own fixture project afterwards.
+        let root = dirs.app_data().join("base-project");
+        fs::create_dir_all(root.join("maps")).unwrap();
+        fs::write(root.join("maps/source.scx"), b"map").unwrap();
+        let project = crate::native_project::NativeProject::create(
+            &root,
+            crate::native_project::ProjectManifest {
+                schema_version: crate::native_project::PROJECT_SCHEMA_VERSION,
+                name: "Sample".to_string(),
+                source_map: "maps/source.scx".to_string(),
+                output_map: "build/output.scx".to_string(),
+                main_file: "src/main.eps".to_string(),
+                settings: Default::default(),
+                plugins: Vec::new(),
+                python_entrypoints: Vec::new(),
+                python_dependencies: Vec::new(),
+                python_lock: None,
+                editor_compatibility: None,
+            },
+        )
+        .unwrap();
+        crate::native_runtime::NativeProjectManager::new(dirs)
+            .activate_project(&project)
+            .unwrap();
+        runtime
+    }
+
+    pub(super) fn test_engine<R: RuntimeExecutor, S: EventSink>(
+        executor: R,
+        sink: S,
+    ) -> AgentEngine<R, S> {
+        test_engine_on(executor, sink, test_tool_runtime())
+    }
+
+    fn test_engine_on<R: RuntimeExecutor, S: EventSink>(
+        executor: R,
+        sink: S,
+        runtime: SessionToolRuntime,
+    ) -> AgentEngine<R, S> {
         let data_dir = unique_temp_dir("engine-sessions");
         let sessions = session_store_at(&data_dir);
         let session = test_session(&sessions);
@@ -5170,7 +6935,7 @@ mod tests {
                 None,
                 sample_hits(),
             ),
-            SessionToolRuntime::for_tests(),
+            runtime,
             sessions,
             attachment_store_at(&unique_temp_dir("engine-attachments")),
             session,
@@ -5202,6 +6967,8 @@ mod tests {
                     text: "continue".to_string(),
                     attachments: Vec::new(),
                     mentions: Vec::new(),
+                    execution_mode: Default::default(),
+                    autonomous_policy: None,
                 },
                 Some("req-resume-failure".to_string()),
             )
@@ -5220,6 +6987,39 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_turn_is_recorded_apart_from_an_answered_one() {
+        // `map_chat` reports `MapTurnEnd` from this record: a cancelled turn
+        // is not an error, so without it a stopped team Map request would
+        // settle as a failure and continue the EPS conversation.
+        let driver = FakeCodexDriver::scripted([
+            AgentTurnResult::Cancelled,
+            AgentTurnResult::Answer {
+                text: "Done.".to_string(),
+            },
+        ]);
+        let mut engine = test_engine(driver, CapturingEventSink::default());
+        let request = |text: &str| crate::ipc::ChatRequest {
+            client_turn_id: crate::ipc::new_client_turn_id(),
+            text: text.to_string(),
+            attachments: Vec::new(),
+            mentions: Vec::new(),
+            execution_mode: Default::default(),
+            autonomous_policy: None,
+        };
+
+        engine
+            .chat_with_request_id(request("stop me"), Some("req-cancelled".to_string()))
+            .await
+            .unwrap();
+        assert!(engine.last_turn_cancelled);
+        engine
+            .chat_with_request_id(request("again"), Some("req-answered".to_string()))
+            .await
+            .unwrap();
+        assert!(!engine.last_turn_cancelled);
     }
 
     #[test]
@@ -5483,7 +7283,7 @@ mod tests {
         let sink = CapturingEventSink::default();
         let sink_handle = sink.clone();
         let mut engine = test_engine(driver, sink);
-        driver_handle.request_write_on_run(engine.runtime.clone());
+        driver_handle.trigger_write_transition_on_run(engine.runtime.clone());
 
         engine
             .chat(crate::ipc::ChatRequest {
@@ -5491,6 +7291,8 @@ mod tests {
                 text: "change the project".to_string(),
                 attachments: Vec::new(),
                 mentions: Vec::new(),
+                execution_mode: Default::default(),
+                autonomous_policy: None,
             })
             .await
             .expect("write transition should park the foreground turn");
@@ -5517,6 +7319,8 @@ mod tests {
                 text: "save this turn".to_string(),
                 attachments: Vec::new(),
                 mentions: Vec::new(),
+                execution_mode: Default::default(),
+                autonomous_policy: None,
             })
             .await
             .expect("foreground turn should persist");
@@ -5531,6 +7335,39 @@ mod tests {
             .expect("session fixture should delete");
         failed_engine.update_active_session().await;
         assert_eq!(failed_handle.acknowledgement_count(), 0);
+    }
+
+    #[test]
+    fn a_bounded_transcript_keeps_the_newest_rows_and_marks_the_cut() {
+        let log = serde_json::json!({
+            "schemaVersion": 2,
+            "log": (1..=40)
+                .map(|index| serde_json::json!({
+                    "seq": index,
+                    "kind": if index % 2 == 0 { "agent" } else { "you" },
+                    "text": format!("message {index:02} 내용")
+                }))
+                .collect::<Vec<_>>()
+        });
+
+        let condensed = super::condense_transcript_with_cap(&log, 120);
+
+        // A turn that continues a conversation needs how it ended. A head-first
+        // cut would hand the model the opening of a long session and none of
+        // the work it is being asked to continue.
+        assert!(condensed.starts_with("[prior conversation]\n(앞부분 생략)"));
+        assert!(condensed.contains("message 40"));
+        assert!(!condensed.contains("message 01"));
+        assert!(condensed.chars().count() <= 240);
+    }
+
+    #[test]
+    fn an_empty_or_toolonly_panel_log_condenses_to_nothing() {
+        assert!(super::condense_transcript(&serde_json::json!({"log": []})).is_empty());
+        assert!(super::condense_transcript(&serde_json::json!({
+            "log": [{"kind": "tool", "text": "read_file"}, {"kind": "you", "text": "   "}]
+        }))
+        .is_empty());
     }
 
     #[tokio::test]
@@ -5576,13 +7413,13 @@ mod tests {
         assert!(driver_handle.prompts().is_empty());
         assert!(engine.pending_resume_transcript.is_none());
         assert!(engine.ensure_provider_conversation_ready().is_err());
-        assert_eq!(engine.current_request_id.as_deref(), Some(request_id));
-        assert_eq!(engine.phase, Phase::ChangesetReview);
+        // The completed tool's journal survives the refusal, so the work it did
+        // is still on record even though the conversation cannot continue.
         assert_eq!(
             engine
                 .journal_store
                 .changeset(request_id)
-                .expect("completed tool remains reviewable")
+                .expect("a completed tool keeps its journal")
                 .items
                 .len(),
             1
@@ -5596,6 +7433,60 @@ mod tests {
                 .conversation,
             record.provider_binding.conversation
         );
+    }
+
+    #[tokio::test]
+    async fn explicit_conversation_reset_clears_failed_resume_without_replay() {
+        let driver = FakeCodexDriver::scripted([]);
+        driver.reject_next_seed();
+        let driver_handle = driver.clone();
+        let mut engine = test_engine(driver, CapturingEventSink::default());
+        let mut record = engine
+            .session_store
+            .load(&engine.session_id)
+            .expect("session fixture should load");
+        record.provider_binding.conversation = crate::provider::ProviderConversationState::Codex {
+            thread_id: Some("thread-unsafe".to_string()),
+        };
+        record.panel_log = serde_json::json!({
+            "schemaVersion": 2,
+            "logSeq": 1,
+            "log": [{"seq": 1, "kind": "you", "text": "earlier map request"}]
+        });
+        engine
+            .session_store
+            .save(&record)
+            .expect("session fixture should save");
+
+        engine
+            .hydrate()
+            .await
+            .expect_err("unresumable conversation blocks the session");
+        assert!(engine.conversation_resume_error().is_some());
+
+        engine
+            .reset_conversation()
+            .await
+            .expect("explicit reset starts a fresh conversation");
+
+        assert!(engine.conversation_resume_error().is_none());
+        assert!(engine.ensure_provider_conversation_ready().is_ok());
+        assert_eq!(driver_handle.reset_count(), 1);
+        assert!(driver_handle.prompts().is_empty());
+        assert!(!engine.thread_active);
+        let saved = engine
+            .session_store
+            .load(&engine.session_id)
+            .expect("saved session remains present");
+        assert_eq!(
+            saved.provider_binding.conversation,
+            crate::provider::ProviderConversationState::Codex { thread_id: None }
+        );
+        assert_eq!(saved.panel_log, record.panel_log);
+        assert!(engine
+            .pending_resume_transcript
+            .as_deref()
+            .is_some_and(|transcript| transcript.contains("earlier map request")));
     }
 
     #[tokio::test]
@@ -5622,6 +7513,8 @@ mod tests {
                 text: "first user message".to_string(),
                 attachments: Vec::new(),
                 mentions: Vec::new(),
+                execution_mode: Default::default(),
+                autonomous_policy: None,
             })
             .await
             .unwrap();
@@ -5631,6 +7524,8 @@ mod tests {
                 text: "follow-up user message".to_string(),
                 attachments: Vec::new(),
                 mentions: Vec::new(),
+                execution_mode: Default::default(),
+                autonomous_policy: None,
             })
             .await
             .unwrap();
@@ -5640,6 +7535,8 @@ mod tests {
                 text: "fresh user message".to_string(),
                 attachments: Vec::new(),
                 mentions: Vec::new(),
+                execution_mode: Default::default(),
+                autonomous_policy: None,
             })
             .await
             .unwrap();
@@ -5675,6 +7572,8 @@ mod tests {
                 text: "Explain the current behavior.".to_string(),
                 attachments: Vec::new(),
                 mentions: Vec::new(),
+                execution_mode: Default::default(),
+                autonomous_policy: None,
             })
             .await
             .expect("answer-only turn should run");
@@ -5684,6 +7583,8 @@ mod tests {
                 text: "Make a larger change.".to_string(),
                 attachments: Vec::new(),
                 mentions: Vec::new(),
+                execution_mode: Default::default(),
+                autonomous_policy: None,
             })
             .await
             .expect("propose_plan turn should run");
@@ -5730,6 +7631,8 @@ mod tests {
                 text: "Make a planned change.".to_string(),
                 attachments: Vec::new(),
                 mentions: Vec::new(),
+                execution_mode: Default::default(),
+                autonomous_policy: None,
             })
             .await
             .expect("plan turn should run");
@@ -5744,7 +7647,12 @@ mod tests {
             .expect("implementation answer must complete without document repair turns");
 
         assert_eq!(
-            fs::read_to_string(workspace.root.join(format!("plans/{request_id}.md"))).unwrap(),
+            fs::read_to_string(
+                workspace
+                    .workspace_root
+                    .join(format!("plans/{request_id}.md")),
+            )
+            .unwrap(),
             approved_markdown
         );
         let prompts = driver_handle.prompts();
@@ -5773,6 +7681,8 @@ mod tests {
                 text: "Change live projectile behavior.".to_string(),
                 attachments: Vec::new(),
                 mentions: Vec::new(),
+                execution_mode: Default::default(),
+                autonomous_policy: None,
             })
             .await
             .unwrap();
@@ -5784,13 +7694,9 @@ mod tests {
             1,
             "survivor_projectiles",
         );
-        engine.phase = Phase::ChangesetReview;
 
         let job = engine
-            .changeset_decision(ipc::ChangesetDecisionRequest {
-                decision: ipc::Decision::Accept,
-                ids: ipc::DecisionIds::All(ipc::AllLiteral),
-            })
+            .settle_request(None)
             .await
             .unwrap()
             .expect("accepted live changes schedule one harness job");
@@ -5893,6 +7799,8 @@ mod tests {
                 text: "first request".to_string(),
                 attachments: Vec::new(),
                 mentions: Vec::new(),
+                execution_mode: Default::default(),
+                autonomous_policy: None,
             })
             .await
             .expect("first chat should run");
@@ -5903,6 +7811,8 @@ mod tests {
                 text: "second request".to_string(),
                 attachments: Vec::new(),
                 mentions: Vec::new(),
+                execution_mode: Default::default(),
+                autonomous_policy: None,
             })
             .await
             .expect("second chat should run");
@@ -5967,6 +7877,8 @@ mod tests {
                 text: "all ten enemies".to_string(),
                 attachments: Vec::new(),
                 mentions: Vec::new(),
+                execution_mode: Default::default(),
+                autonomous_policy: None,
             })
             .await
             .unwrap();
@@ -6052,6 +7964,8 @@ mod tests {
             text: "foreground goal".to_string(),
             attachments: Vec::new(),
             mentions: Vec::new(),
+            execution_mode: Default::default(),
+            autonomous_policy: None,
         });
 
         let (chat_result, ()) = tokio::join!(chat, concurrent_update);
@@ -6098,6 +8012,8 @@ mod tests {
                 text: "retain this goal".to_string(),
                 attachments: Vec::new(),
                 mentions: Vec::new(),
+                execution_mode: Default::default(),
+                autonomous_policy: None,
             })
             .await
             .unwrap();
@@ -6137,6 +8053,8 @@ mod tests {
                 text: "driver error fixture".to_string(),
                 attachments: Vec::new(),
                 mentions: Vec::new(),
+                execution_mode: Default::default(),
+                autonomous_policy: None,
             })
             .await
             .unwrap();
@@ -6178,6 +8096,8 @@ mod tests {
                 text: "timeout fixture".to_string(),
                 attachments: Vec::new(),
                 mentions: Vec::new(),
+                execution_mode: Default::default(),
+                autonomous_policy: None,
             })
             .await
             .unwrap();
@@ -6220,6 +8140,8 @@ mod tests {
                 text: "first".to_string(),
                 attachments: Vec::new(),
                 mentions: Vec::new(),
+                execution_mode: Default::default(),
+                autonomous_policy: None,
             })
             .await
             .unwrap();
@@ -6242,6 +8164,8 @@ mod tests {
                 text: "second".to_string(),
                 attachments: Vec::new(),
                 mentions: Vec::new(),
+                execution_mode: Default::default(),
+                autonomous_policy: None,
             })
             .await
             .unwrap();
@@ -6274,6 +8198,8 @@ mod tests {
                 text: "stable goal".to_string(),
                 attachments: Vec::new(),
                 mentions: Vec::new(),
+                execution_mode: Default::default(),
+                autonomous_policy: None,
             })
             .await
             .unwrap();
@@ -6305,6 +8231,8 @@ mod tests {
                 text: "continue".to_string(),
                 attachments: Vec::new(),
                 mentions: Vec::new(),
+                execution_mode: Default::default(),
+                autonomous_policy: None,
             })
             .await
             .unwrap();
@@ -6370,6 +8298,8 @@ mod tests {
                 text: "new branch".to_string(),
                 attachments: Vec::new(),
                 mentions: Vec::new(),
+                execution_mode: Default::default(),
+                autonomous_policy: None,
             })
             .await
             .unwrap();
@@ -6401,6 +8331,8 @@ mod tests {
                 text: "set marine HP to 80".to_string(),
                 attachments: Vec::new(),
                 mentions: Vec::new(),
+                execution_mode: Default::default(),
+                autonomous_policy: None,
             })
             .await
             .expect("chat should run");
@@ -6424,13 +8356,9 @@ mod tests {
             2,
             "scripts/main.eps",
         );
-        engine.phase = Phase::ChangesetReview;
 
         engine
-            .changeset_decision(crate::ipc::ChangesetDecisionRequest {
-                decision: crate::ipc::Decision::Accept,
-                ids: crate::ipc::DecisionIds::All(crate::ipc::AllLiteral),
-            })
+            .settle_request(None)
             .await
             .expect("accept-all decision should finalize");
 
@@ -6459,235 +8387,6 @@ mod tests {
             })
             .expect("accept should emit a wiki event");
         assert!(wiki_event.entries.contains_key("dat:units:0:HP"));
-
-        fs::remove_dir_all(base).ok();
-    }
-
-    #[tokio::test]
-    async fn reject_does_not_record_dat_edits_to_wiki() {
-        let base = unique_temp_dir("wiki-reject");
-        let memory = ProjectMemory::new(base.join("memory"), "ExampleProject");
-        let wiki_dir = base.join("wiki");
-        let driver = FakeCodexDriver::scripted([AgentTurnResult::Plan {
-            markdown: "- Buff the marine".to_string(),
-        }]);
-        let sink = CapturingEventSink::default();
-        let sink_handle = sink.clone();
-        let mut engine = test_engine_with_wiki(driver, sink, memory, &base.join("data"), &wiki_dir);
-        engine.executor.plan_runtime = Some(engine.runtime.clone());
-
-        engine
-            .chat(crate::ipc::ChatRequest {
-                client_turn_id: crate::ipc::new_client_turn_id(),
-                text: "set marine HP to 80".to_string(),
-                attachments: Vec::new(),
-                mentions: Vec::new(),
-            })
-            .await
-            .expect("chat should run");
-        let request_id = engine
-            .current_request_id
-            .clone()
-            .expect("chat should create a request id");
-        record_dat_set_in_memory(
-            &engine.journal_store,
-            &request_id,
-            "dat-hp",
-            1,
-            ("units", 0, "HP"),
-            json!(80),
-        );
-        engine.phase = Phase::ChangesetReview;
-
-        engine
-            .changeset_decision(crate::ipc::ChangesetDecisionRequest {
-                decision: crate::ipc::Decision::Reject,
-                ids: crate::ipc::DecisionIds::All(crate::ipc::AllLiteral),
-            })
-            .await
-            .expect("reject decision should run");
-
-        // Rejected edits never reach the ledger, and no wiki event is emitted.
-        let store = crate::wiki::WikiStore::load(Some(wiki_dir));
-        assert!(
-            store.ledger().is_empty(),
-            "rejected dat edit must not record"
-        );
-        assert!(
-            !sink_handle
-                .events()
-                .iter()
-                .any(|event| matches!(event, EngineEvent::Wiki(_))),
-            "reject must not emit a wiki event"
-        );
-
-        fs::remove_dir_all(base).ok();
-    }
-
-    #[tokio::test]
-    async fn partial_reject_then_accept_all_keeps_rejected_value_out_of_wiki() {
-        let base = unique_temp_dir("wiki-reject-then-accept");
-        let memory = ProjectMemory::new(base.join("memory"), "ExampleProject");
-        let wiki_dir = base.join("wiki");
-        let driver = FakeCodexDriver::scripted([AgentTurnResult::Plan {
-            markdown: "- Tune two stats".to_string(),
-        }]);
-        let sink = CapturingEventSink::default();
-        let mut engine = test_engine_with_wiki(driver, sink, memory, &base.join("data"), &wiki_dir);
-        engine.executor.plan_runtime = Some(engine.runtime.clone());
-
-        engine
-            .chat(crate::ipc::ChatRequest {
-                client_turn_id: crate::ipc::new_client_turn_id(),
-                text: "set marine HP to 80 and weapon damage to 6".to_string(),
-                attachments: Vec::new(),
-                mentions: Vec::new(),
-            })
-            .await
-            .expect("chat should run");
-        let request_id = engine
-            .current_request_id
-            .clone()
-            .expect("chat should create a request id");
-        // Two dat edits on distinct objIds: HP (will be rejected) and Damage (kept).
-        record_dat_set_in_memory(
-            &engine.journal_store,
-            &request_id,
-            "dat-hp",
-            1,
-            ("units", 0, "HP"),
-            json!(80),
-        );
-        record_dat_set_in_memory(
-            &engine.journal_store,
-            &request_id,
-            "dat-dmg",
-            2,
-            ("weapons", 5, "Damage"),
-            json!(6),
-        );
-        engine
-            .journal_store
-            .persist(&request_id)
-            .expect("journal should persist");
-
-        // Drive the partial reject through a no-op native rollback target so the
-        // test remains focused on the wiki contract.
-        struct NoopRollbackTarget;
-        impl journal::JournalRollbackTarget for NoopRollbackTarget {
-            type Error = AgentEngineError;
-            fn set_dat_value(
-                &self,
-                _table: journal::DatTable,
-                _dat: &str,
-                _obj_id: u32,
-                _property: &str,
-                _value: Value,
-            ) -> Result<(), Self::Error> {
-                Ok(())
-            }
-            fn reset_dat_value(
-                &self,
-                _table: journal::DatTable,
-                _dat: &str,
-                _obj_id: u32,
-                _property: &str,
-            ) -> Result<(), Self::Error> {
-                Ok(())
-            }
-            fn write_file(&self, _path: &str, _content: &str) -> Result<(), Self::Error> {
-                Ok(())
-            }
-            fn delete_file(&self, _path: &str) -> Result<(), Self::Error> {
-                Ok(())
-            }
-            fn create_file(
-                &self,
-                _path: &str,
-                _content: &str,
-                _position: Option<usize>,
-            ) -> Result<(), Self::Error> {
-                Ok(())
-            }
-            fn rename_path(&self, _from: &str, _to: &str) -> Result<(), Self::Error> {
-                Ok(())
-            }
-            fn set_main(&self, _path: Option<&str>) -> Result<(), Self::Error> {
-                Ok(())
-            }
-            fn set_setting(&self, _key: &str, _value: Value) -> Result<(), Self::Error> {
-                Ok(())
-            }
-            fn plugin_add(
-                &self,
-                _plugin_id: &str,
-                _texts: Vec<String>,
-                _index: usize,
-            ) -> Result<(), Self::Error> {
-                Ok(())
-            }
-            fn plugin_edit(
-                &self,
-                _plugin_id: &str,
-                _texts: Vec<String>,
-                _index: usize,
-            ) -> Result<(), Self::Error> {
-                Ok(())
-            }
-            fn plugin_remove(&self, _plugin_id: &str) -> Result<(), Self::Error> {
-                Ok(())
-            }
-            fn plugin_move(&self, _from_index: usize, _to_index: usize) -> Result<(), Self::Error> {
-                Ok(())
-            }
-            fn restore_project_manifest(
-                &self,
-                _expected_revision: &str,
-                _bytes: &[u8],
-            ) -> Result<(), Self::Error> {
-                Ok(())
-            }
-            fn restore_map_backup(
-                &self,
-                _map_path: &str,
-                _backup_path: &str,
-                _expected_sha256: Option<&str>,
-            ) -> Result<(), Self::Error> {
-                Ok(())
-            }
-        }
-        engine
-            .journal_store
-            .decide(
-                &request_id,
-                journal::ChangesetDecision::reject(journal::DecisionIds::Items(vec![
-                    "dat-hp".to_string()
-                ])),
-                &NoopRollbackTarget,
-            )
-            .expect("partial reject should roll back and forget the HP edit");
-
-        // Then accept everything still pending (panel sends "all").
-        engine.phase = Phase::ChangesetReview;
-        engine
-            .changeset_decision(crate::ipc::ChangesetDecisionRequest {
-                decision: crate::ipc::Decision::Accept,
-                ids: crate::ipc::DecisionIds::All(crate::ipc::AllLiteral),
-            })
-            .await
-            .expect("accept-all decision should finalize");
-
-        let store = crate::wiki::WikiStore::load(Some(wiki_dir));
-        assert!(
-            !store.ledger().entries.contains_key("dat:units:0:HP"),
-            "rolled-back HP must never enter the ledger via a later accept-all"
-        );
-        let kept = store
-            .ledger()
-            .entries
-            .get("dat:weapons:5:Damage")
-            .expect("the kept dat edit is recorded");
-        assert_eq!(kept.value, json!(6));
 
         fs::remove_dir_all(base).ok();
     }
@@ -6833,6 +8532,7 @@ mod tests {
 
         for section in [
             "[first principles]",
+            "[map handoff]",
             "[evidence]",
             "[message format]",
             "[reference context]",
@@ -6843,8 +8543,40 @@ mod tests {
             );
         }
         assert!(prompt.contains("docs_get"));
-        assert!(prompt.contains("zero `newCount`"));
         assert!(prompt.contains("source_search"));
+        // Placement work is handed to the Map Agent, never declared impossible;
+        // the candidate is inspected before this session applies it.
+        assert!(prompt.contains("- map_task_request — "));
+        assert!(prompt.contains("- map_task_status — "));
+        assert!(prompt.contains("- map_task_apply — "));
+        assert!(prompt.contains("- map_task_diff — "));
+        assert!(prompt.contains("do not answer that it is impossible"));
+        assert!(prompt.contains("never ask the user to open the Map window first"));
+        assert!(prompt.contains("then map_task_apply it when it meets the goal"));
+        // The goal relays the user's request and code constraints; the Map
+        // Agent designs the look, so the EPS session never prescribes it.
+        assert!(prompt.contains("The Map Agent is the designer, not a plotter"));
+        assert!(prompt.contains("Never choose the medium"));
+        assert!(prompt.contains("Grant every layer the look may need"));
+        assert!(!prompt.contains("Put exact coordinates and tile/unit ids"));
+    }
+
+    #[test]
+    fn context_pressure_continuation_tells_the_next_iteration_to_stop_widening() {
+        let previous = AgentTurnInput::text("x");
+        let pressured =
+            AgentEngine::<FakeCodexDriver, CapturingEventSink>::interactive_continuation_turn(
+                &previous,
+                crate::provider_runtime::IterationBoundaryReason::ContextPressure,
+            );
+        assert!(pressured.text.contains("넓은 탐색을 더 벌이지 말고"));
+        assert!(pressured.text.contains("직접 다시 읽어야"));
+        let other =
+            AgentEngine::<FakeCodexDriver, CapturingEventSink>::interactive_continuation_turn(
+                &previous,
+                crate::provider_runtime::IterationBoundaryReason::ProviderContinuation,
+            );
+        assert!(!other.text.contains("넓은 탐색"));
     }
 
     #[test]
@@ -6858,10 +8590,14 @@ mod tests {
         );
 
         assert!(prompt.contains(
-            "Call propose_plan(markdown) ONLY when the user explicitly asks you to write or propose a plan"
+            "Call propose_plan(markdown) only when the user explicitly asks you to write a plan"
         ));
-        assert!(prompt.contains("Otherwise, execute the requested change directly"));
-        assert!(!prompt.contains("3+ mutations"));
+        // A green build is not gameplay: only the user can say the map works.
+        assert!(prompt.contains("It does NOT mean the map plays correctly"));
+        assert!(prompt.contains("naming what the user should check in game"));
+        // Nothing triages, researches or reviews for this turn any more.
+        assert!(!prompt.contains("triaged"));
+        assert!(!prompt.contains("separate stages"));
     }
 
     #[test]
@@ -6895,7 +8631,7 @@ mod tests {
         );
     }
     #[test]
-    fn system_prompt_places_authoritative_build_before_runtime_tests() {
+    fn system_prompt_keeps_build_authoritative_without_runtime_trace_tools() {
         let prompt = build_system_prompt(
             "Change mutually dependent eps files",
             &sample_hits(),
@@ -6903,22 +8639,37 @@ mod tests {
             None,
             None,
         );
-        let build = prompt.find("[build]").unwrap();
-        let trace_test = prompt.find("[runtime trace tests]").unwrap();
-        assert!(build < trace_test);
-        assert!(prompt.contains("eudAgentTestSetup"));
-        assert!(prompt.contains("failed/inconclusive never blocks review"));
-        assert!(prompt.contains("tests/**/*.tests.eps"));
-        assert!(prompt.contains("trace_suite_run({})"));
-        assert!(prompt.contains("outside the configured MainFile's production import graph"));
-        assert!(prompt.contains("trace_test_run` remains available only"));
-        assert!(prompt.contains("Create the owned client suspended"));
-        assert!(prompt.contains("foreground/focus/cursor user32 entrypoints"));
-        assert!(prompt.contains("Targeted `PostMessageW`"));
-        assert!(prompt.contains("focus fallback are forbidden"));
-        assert!(prompt.contains("complete structured result"));
+        assert!(prompt.contains("[build]"));
+        assert!(prompt
+            .contains("warnings (for example euddraft null-tile replacement) never fail a build"));
+        assert!(prompt.contains("page the complete log with build_log_read"));
+        // The StarCraft trace harness is not a model tool: the prompt never
+        // names it, so the model never calls an unregistered tool.
+        assert!(!prompt.contains("[runtime trace tests]"));
+        assert!(!prompt.contains("trace_suite_run"));
+        assert!(!prompt.contains("trace_test_run"));
+        assert!(!prompt.contains("eudAgentTestSetup"));
         assert!(!prompt.contains("eps_check"));
         assert!(!prompt.contains("build_errors"));
+    }
+
+    #[test]
+    fn only_providers_without_native_file_tools_are_offered_fs_tools() {
+        use crate::provider::ProviderId;
+        for provider in ProviderId::ALL {
+            let catalog = tool_catalog_section(provider);
+            let offered = crate::tools::FS_TOOLS
+                .iter()
+                .filter(|tool| catalog.contains(&format!("- {tool} — ")))
+                .count();
+            if provider.has_native_file_tools() {
+                assert_eq!(offered, 0, "{provider:?}");
+                assert!(catalog.contains("your own native file tools"));
+            } else {
+                assert_eq!(offered, crate::tools::FS_TOOLS.len(), "{provider:?}");
+                assert!(!catalog.contains("native file tools"));
+            }
+        }
     }
 
     #[test]
@@ -6939,13 +8690,11 @@ mod tests {
         let epscript = cold.find("[epscript]").unwrap();
         let architecture = cold.find("[eps project architecture]").unwrap();
         let build = cold.find("[build]").unwrap();
-        let trace_test = cold.find("[runtime trace tests]").unwrap();
         let reference = cold.find("[reference context]").unwrap();
         assert!(first_principles < epscript);
         assert!(epscript < architecture);
         assert!(architecture < build);
-        assert!(build < trace_test);
-        assert!(trace_test < reference);
+        assert!(build < reference);
         assert!(architecture < reference);
 
         assert!(!resumed.contains(EPS_PROJECT_ARCHITECTURE_GUIDE));
@@ -7049,6 +8798,8 @@ mod tests {
                     text: "long read".to_string(),
                     attachments: Vec::new(),
                     mentions: Vec::new(),
+                    execution_mode: Default::default(),
+                    autonomous_policy: None,
                 })
                 .await
         });
@@ -7061,6 +8812,8 @@ mod tests {
                     text: "short read".to_string(),
                     attachments: Vec::new(),
                     mentions: Vec::new(),
+                    execution_mode: Default::default(),
+                    autonomous_policy: None,
                 })
                 .await
         });
@@ -7094,6 +8847,8 @@ mod tests {
                     text: "first".to_string(),
                     attachments: Vec::new(),
                     mentions: Vec::new(),
+                    execution_mode: Default::default(),
+                    autonomous_policy: None,
                 })
                 .await
         });
@@ -7109,6 +8864,8 @@ mod tests {
                     text: "second".to_string(),
                     attachments: Vec::new(),
                     mentions: Vec::new(),
+                    execution_mode: Default::default(),
+                    autonomous_policy: None,
                 })
                 .await
         });
@@ -7147,7 +8904,7 @@ mod tests {
             .unwrap();
         engine
             .runtime
-            .request_write_workspace("write after read")
+            .register_write_request("write after read")
             .unwrap();
         engine.current_request_id = Some("request-old".to_string());
         engine.phase = Phase::Triage;
@@ -7162,169 +8919,11 @@ mod tests {
             .unwrap();
         let next = engine
             .runtime
-            .request_write_workspace("retry write")
+            .register_write_request("retry write")
             .unwrap();
         assert_eq!(next.state(), crate::write_coordinator::TicketState::Granted);
     }
 
-    #[tokio::test]
-    async fn partial_decision_keeps_write_registration_until_every_item_settles() {
-        let mut engine = test_engine(FakeCodexDriver::scripted([]), CapturingEventSink::default());
-        let request_id = "req-partial";
-        engine.runtime.begin_request(request_id, "Sample").unwrap();
-        engine
-            .runtime
-            .request_write_workspace("test review")
-            .unwrap();
-        engine.current_request_id = Some(request_id.to_string());
-        engine.phase = Phase::ChangesetReview;
-        record_file_write_in_memory(&engine.journal_store, request_id, "write-1", 1, "one.eps");
-        record_file_write_in_memory(&engine.journal_store, request_id, "write-2", 2, "two.eps");
-
-        engine
-            .changeset_decision(ipc::ChangesetDecisionRequest {
-                decision: ipc::Decision::Accept,
-                ids: ipc::DecisionIds::List(vec!["write-1".to_string()]),
-            })
-            .await
-            .unwrap();
-        assert_eq!(engine.phase, Phase::ChangesetReview);
-        assert!(engine.runtime.owns_write_registration());
-        assert_eq!(
-            engine.journal_store.entry_count(request_id),
-            1,
-            "only the undecided item remains live"
-        );
-        engine
-            .changeset_decision(ipc::ChangesetDecisionRequest {
-                decision: ipc::Decision::Accept,
-                ids: ipc::DecisionIds::All(ipc::AllLiteral),
-            })
-            .await
-            .unwrap();
-        assert_eq!(engine.phase, Phase::Idle);
-        assert!(!engine.runtime.owns_write_registration());
-    }
-
-    #[tokio::test]
-    async fn reject_restores_one_session_while_another_writer_remains_active() {
-        let services = crate::tool_exec::ToolServices::for_tests();
-        let runtime_c = services.session("session-c");
-        let runtime_e = services.session("session-e");
-        let dirs = runtime_c.data_dirs();
-        dirs.ensure_dirs().unwrap();
-        let workspace_manager = WorkspaceManager::new(dirs.clone());
-        let snapshot = native_workspace_snapshot(&dirs, "Sample");
-        let canonical = workspace_manager.prepare_snapshot(&snapshot).unwrap();
-        fs::write(canonical.root.join("specs/state.md"), b"accepted").unwrap();
-        let session_workspace = workspace_manager
-            .prepare_session_snapshot(&snapshot, "session-c")
-            .unwrap();
-        fs::write(
-            session_workspace.root.join("specs/state.md"),
-            b"pending change",
-        )
-        .unwrap();
-
-        let sessions = crate::session::SessionStore::new(&dirs);
-        let record = crate::session::SessionRecord {
-            meta: crate::session::SessionMeta {
-                id: "session-c".to_string(),
-                name: "C".to_string(),
-                project: "Sample".to_string(),
-                kind: crate::session::SessionKind::Eps,
-                provider: crate::provider::ProviderId::Codex,
-                model: "gpt-test".to_string(),
-                created_at: 1,
-                last_conversation_at: 1_000,
-            },
-            provider_binding: crate::provider::ProviderBinding::new(
-                crate::provider::ProviderId::Codex,
-                "gpt-test".to_string(),
-                Some(crate::provider::ReasoningSelection {
-                    level: "medium".to_string(),
-                }),
-            )
-            .unwrap(),
-            pending_request_ids: Vec::new(),
-            context_usage: None,
-            panel_log: serde_json::Value::Null,
-            context_state: Default::default(),
-            task_state: Default::default(),
-        };
-        sessions.save(&record).unwrap();
-        let request_c = "req-c";
-        runtime_c.begin_request(request_c, "Sample").unwrap();
-        runtime_c.request_write_workspace("C mutation").unwrap();
-        runtime_c
-            .journal()
-            .record(
-                request_c,
-                journal::JournalEntry {
-                    id: "workspace-1".to_string(),
-                    seq: 1,
-                    tool: journal::WriteTool::WorkspaceWrite,
-                    target: journal::JournalTarget::WorkspacePath {
-                        workspace_id: session_workspace.id.clone(),
-                        session_id: Some("session-c".to_string()),
-                        path: "specs/state.md".to_string(),
-                    },
-                    before: journal::Snapshot::FileContent {
-                        content: "accepted".to_string(),
-                    },
-                    after: journal::Snapshot::FileContent {
-                        content: "pending change".to_string(),
-                    },
-                    ts: 1,
-                },
-            )
-            .unwrap();
-        runtime_c.journal().persist(request_c).unwrap();
-
-        let (_cancellation_tx, cancellation_rx) = tokio::sync::watch::channel(0_u64);
-        let mut engine = AgentEngine::new(
-            FakeCodexDriver::scripted([]),
-            CapturingEventSink::default(),
-            AgentEngineConfig::for_tests(
-                "[project state]\nproject=Sample compiling=false",
-                None,
-                sample_hits(),
-            ),
-            runtime_c,
-            sessions,
-            AttachmentStore::new(dirs.attachments_dir()),
-            record,
-            cancellation_rx,
-        );
-        engine.current_request_id = Some(request_c.to_string());
-        engine.phase = Phase::Executing;
-        engine.settle_write_lifecycle().unwrap();
-        assert_eq!(engine.phase, Phase::ChangesetReview);
-        assert!(engine.runtime.owns_write_registration());
-
-        runtime_e.begin_request("req-e", "Sample").unwrap();
-        let next = runtime_e.request_write_workspace("E mutation").unwrap();
-        assert_eq!(next.state(), crate::write_coordinator::TicketState::Granted);
-
-        engine
-            .changeset_decision(ipc::ChangesetDecisionRequest {
-                decision: ipc::Decision::Reject,
-                ids: ipc::DecisionIds::All(ipc::AllLiteral),
-            })
-            .await
-            .unwrap();
-
-        assert_eq!(next.state(), crate::write_coordinator::TicketState::Granted);
-        assert_eq!(
-            fs::read_to_string(session_workspace.root.join("specs/state.md")).unwrap(),
-            "accepted"
-        );
-        assert_eq!(
-            fs::read_to_string(canonical.root.join("specs/state.md")).unwrap(),
-            "accepted"
-        );
-        fs::remove_dir_all(dirs.app_data()).ok();
-    }
     #[test]
     fn pending_review_recovery_coexists_with_new_writer_ticket() {
         let base = unique_temp_dir("pending-review-recovery");
@@ -7482,35 +9081,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rollback_failure_keeps_review_owner_and_live_journal() {
-        let sink = CapturingEventSink::default();
-        let sink_handle = sink.clone();
-        let mut engine = test_engine(FakeCodexDriver::scripted([]), sink);
-        let request_id = "req-rollback-failure";
-        engine.runtime.begin_request(request_id, "Sample").unwrap();
-        engine
-            .runtime
-            .request_write_workspace("test rollback")
-            .unwrap();
-        engine.current_request_id = Some(request_id.to_string());
-        record_file_write_in_memory(&engine.journal_store, request_id, "write-1", 1, "one.eps");
-
-        engine
-            .changeset_decision(ipc::ChangesetDecisionRequest {
-                decision: ipc::Decision::Reject,
-                ids: ipc::DecisionIds::All(ipc::AllLiteral),
-            })
-            .await
-            .expect("rollback failure is reported through scoped events");
-        assert!(sink_handle.events().iter().any(|event| matches!(
-            event,
-            EngineEvent::RollbackResult(ipc::RollbackResultEvent { ok: false, .. })
-        )));
-        assert_eq!(engine.phase, Phase::ChangesetReview);
-        assert!(engine.runtime.owns_write_registration());
-        assert_eq!(engine.journal_store.entry_count(request_id), 1);
-    }
-    #[tokio::test]
     async fn chat_injects_text_attachments_and_forwards_images_to_codex() {
         let base = unique_temp_dir("chat-attachments");
         let attachment_store = attachment_store_at(&base);
@@ -7536,7 +9106,7 @@ mod tests {
                 None,
                 sample_hits(),
             ),
-            SessionToolRuntime::for_tests(),
+            test_tool_runtime(),
             sessions,
             attachment_store.clone(),
             session,
@@ -7549,6 +9119,8 @@ mod tests {
                 text: "첨부 내용을 검토해 줘".to_string(),
                 attachments: vec![text.id.clone(), image.id.clone()],
                 mentions: Vec::new(),
+                execution_mode: Default::default(),
+                autonomous_policy: None,
             })
             .await
             .expect("attachment turn should complete");
@@ -7590,6 +9162,8 @@ mod tests {
                     width: 64,
                     height: 64,
                     tileset: "Jungle".to_string(),
+                    title: String::new(),
+                    description: String::new(),
                 },
                 players: Vec::new(),
                 forces: Vec::new(),
@@ -7667,6 +9241,8 @@ mod tests {
                 text: String::new(),
                 attachments: Vec::new(),
                 mentions: vec![mention.clone()],
+                execution_mode: Default::default(),
+                autonomous_policy: None,
             })
             .await
             .unwrap();
@@ -7676,6 +9252,8 @@ mod tests {
                 text: "후속 요청".to_string(),
                 attachments: Vec::new(),
                 mentions: vec![mention.clone()],
+                execution_mode: Default::default(),
+                autonomous_policy: None,
             })
             .await
             .unwrap();
@@ -7705,6 +9283,8 @@ mod tests {
                 text: "계획해 줘".to_string(),
                 attachments: Vec::new(),
                 mentions: Vec::new(),
+                execution_mode: Default::default(),
+                autonomous_policy: None,
             })
             .await
             .unwrap();
@@ -7740,6 +9320,8 @@ mod tests {
                 text: "@회복 지점에서 치료해 줘".to_string(),
                 attachments: Vec::new(),
                 mentions: vec![mention],
+                execution_mode: Default::default(),
+                autonomous_policy: None,
             })
             .await
             .unwrap_err();
@@ -7757,6 +9339,8 @@ mod tests {
                 text: "@회복 지점에서 치료해 줘".to_string(),
                 attachments: Vec::new(),
                 mentions: Vec::new(),
+                execution_mode: Default::default(),
+                autonomous_policy: None,
             })
             .await
             .unwrap();
@@ -7770,7 +9354,7 @@ mod tests {
         engine.runtime.begin_request(request_id, "Sample").unwrap();
         engine
             .runtime
-            .request_write_workspace("sound import")
+            .register_write_request("sound import")
             .unwrap();
         engine.runtime.require_sound_build_for_tests();
         let before_hash = "1".repeat(64);
@@ -7822,19 +9406,14 @@ mod tests {
             .unwrap();
         engine.current_request_id = Some(request_id.to_string());
         engine.phase = Phase::Executing;
-        engine.settle_write_lifecycle().unwrap();
-        assert_eq!(engine.phase, Phase::ChangesetReview);
-        assert!(engine.runtime.owns_write_registration());
 
-        let job = engine
-            .changeset_decision(ipc::ChangesetDecisionRequest {
-                decision: ipc::Decision::Accept,
-                ids: ipc::DecisionIds::All(ipc::AllLiteral),
-            })
+        let error = engine
+            .settle_request(None)
             .await
-            .unwrap();
-        assert!(job.is_none());
-        assert_eq!(engine.phase, Phase::ChangesetReview);
+            .expect_err("a sound import that was never built cannot settle");
+
+        assert!(error.message.contains("build_run"), "{}", error.message);
+        assert_eq!(engine.phase, Phase::Executing);
         assert!(engine.runtime.owns_write_registration());
         assert_eq!(
             engine
@@ -7875,6 +9454,19 @@ mod tests {
         assert!(prompt.contains("imageRef is an input binding, never extra write authority"));
         assert!(prompt.contains("When the user asks only to inspect, compare, or analyze an image"));
         assert!(prompt.contains("Multiple photos and ordinary terrain patches"));
+        assert!(prompt.contains("[draft patch operations]"));
+        assert!(prompt.contains("Never invent keys such as tileId"));
+        assert!(prompt.contains("- terrain.set: x, y, before, after\n"));
+        assert!(prompt.contains("terrain.isom_rect fills a tile rectangle"));
+        assert!(prompt.contains("isomX + isomY must be even"));
+        assert!(prompt.contains("never conclude a map lacks ISOM data"));
+        assert!(prompt.contains("- location.delete: locationId\n"));
+        assert!(prompt.contains("before must equal the current tile id at (x, y)"));
+        assert!(prompt.contains("map_terrain_read (visible candidate)"));
+        assert!(prompt.contains("map_draft_terrain_read (request draft)"));
+        assert!(prompt.contains("use terrain.rect / terrain.blit"));
+        assert!(prompt.contains("Never guess before values or probe them through conflict errors"));
+        assert!(prompt.contains("numeric ids from map_palette_query, never names"));
         assert!(
             prompt.contains("Never provide a filesystem path, palette, MTXM id, or tile matrix")
         );
@@ -7906,5 +9498,382 @@ mod tests {
         let map = build_map_system_prompt("[project state]", None);
         assert!(!map.contains("map_sound_import"));
         assert!(map.contains("sounds are unsupported"));
+    }
+    #[tokio::test]
+    async fn autonomous_mode_continues_typed_boundaries_with_minimal_context() {
+        let (base, memory) = memory_store("autonomous-boundary");
+        let driver = FakeCodexDriver::scripted([
+            AgentTurnResult::IterationBoundary {
+                reason: crate::provider_runtime::IterationBoundaryReason::ToolRounds,
+            },
+            AgentTurnResult::Answer {
+                text: "완료".to_string(),
+            },
+        ]);
+        let driver_handle = driver.clone();
+        let sink = CapturingEventSink::default();
+        let mut engine = test_engine_with_memory(driver, sink, memory, &base.join("data"));
+        native_workspace_snapshot(&engine.runtime.data_dirs(), "Sample");
+
+        engine
+            .chat(crate::ipc::ChatRequest {
+                client_turn_id: crate::ipc::new_client_turn_id(),
+                text: "여러 반복이 필요한 목표".to_string(),
+                attachments: Vec::new(),
+                mentions: Vec::new(),
+                execution_mode: crate::autonomous::ExecutionMode::Autonomous,
+                autonomous_policy: None,
+            })
+            .await
+            .unwrap();
+
+        let prompts = driver_handle.prompts();
+        assert_eq!(prompts.len(), 2);
+        assert!(prompts[0].contains("[autonomous execution]"));
+        assert!(prompts[1].contains("[autonomous continuation]"));
+        assert!(prompts[1].contains("여러 반복이 필요한 목표"));
+        assert!(!prompts[1].contains(EPS_PROJECT_ARCHITECTURE_GUIDE));
+        let run = engine
+            .session_store
+            .load(&engine.session_id)
+            .unwrap()
+            .autonomous_run
+            .unwrap();
+        assert_eq!(
+            run.status,
+            crate::autonomous::AutonomousRunStatus::Completed
+        );
+        assert_eq!(run.iteration, 2);
+        assert!(run.last_checkpoint.unwrap().is_started());
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[tokio::test]
+    async fn autonomous_turn_after_an_unanswered_ask_pauses_and_resume_carries_the_blocker() {
+        let (base, memory) = memory_store("autonomous-unanswered-ask");
+        let driver = FakeCodexDriver::scripted([
+            AgentTurnResult::Answer {
+                text: "어떤 방식을 사용할까요? A 또는 B".to_string(),
+            },
+            AgentTurnResult::Answer {
+                text: "완료".to_string(),
+            },
+        ]);
+        let driver_handle = driver.clone();
+        let sink = CapturingEventSink::default();
+        let mut engine = test_engine_with_memory(driver, sink, memory, &base.join("data"));
+        native_workspace_snapshot(&engine.runtime.data_dirs(), "Sample");
+        engine.runtime.set_ask_emitter(|_| Ok(()));
+        engine
+            .runtime
+            .set_ask_wait_timeout(std::time::Duration::from_millis(30));
+        *driver_handle.ask_runtime.lock().unwrap() = Some(engine.runtime.clone());
+
+        engine
+            .chat(crate::ipc::ChatRequest {
+                client_turn_id: crate::ipc::new_client_turn_id(),
+                text: "사용자 선택이 필요한 목표".to_string(),
+                attachments: Vec::new(),
+                mentions: Vec::new(),
+                execution_mode: crate::autonomous::ExecutionMode::Autonomous,
+                autonomous_policy: None,
+            })
+            .await
+            .unwrap();
+
+        let run = engine
+            .session_store
+            .load(&engine.session_id)
+            .unwrap()
+            .autonomous_run
+            .unwrap();
+        assert_eq!(run.status, crate::autonomous::AutonomousRunStatus::Paused);
+        assert_eq!(
+            run.pause_reason,
+            Some(crate::autonomous::AutonomousPauseReason::UnansweredAsk)
+        );
+        assert!(run.active_started_at.is_none());
+        let blocker = run
+            .blocker
+            .clone()
+            .expect("pause blocker names the unanswered ask");
+        assert!(blocker.contains("같은 질문을 다시"));
+        assert!(run.status.can_resume());
+        assert!(engine.runtime.pending_ask().is_none());
+
+        engine.autonomous_resume().await.unwrap();
+
+        let prompts = driver_handle.prompts();
+        assert_eq!(prompts.len(), 2);
+        assert!(prompts[1].contains("[autonomous continuation]"));
+        assert!(prompts[1].contains(&blocker));
+        let run = engine
+            .session_store
+            .load(&engine.session_id)
+            .unwrap()
+            .autonomous_run
+            .unwrap();
+        assert_eq!(
+            run.status,
+            crate::autonomous::AutonomousRunStatus::Completed
+        );
+        assert_eq!(run.pause_reason, None);
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn ask_wait_copy_matches_the_shared_timeout_constant() {
+        let seconds = format!("{} seconds", crate::tools::ASK_WAIT_TIMEOUT.as_secs());
+        assert!(INTERACTION_GUIDE.contains(&seconds));
+        let ask = crate::tools::tool_spec(crate::tools::ASK_TOOL).unwrap();
+        assert!(ask.description.contains(&seconds));
+    }
+
+    #[tokio::test]
+    async fn interactive_mode_continues_at_a_typed_boundary_without_creating_autonomous_state() {
+        let (base, memory) = memory_store("interactive-boundary");
+        let driver = FakeCodexDriver::scripted([
+            AgentTurnResult::IterationBoundary {
+                reason: crate::provider_runtime::IterationBoundaryReason::ToolRounds,
+            },
+            AgentTurnResult::IterationBoundary {
+                reason: crate::provider_runtime::IterationBoundaryReason::ToolActions,
+            },
+            AgentTurnResult::Answer {
+                text: "일반 완료".to_string(),
+            },
+        ]);
+        let driver_handle = driver.clone();
+        let sink = CapturingEventSink::default();
+        let sink_handle = sink.clone();
+        let mut engine = test_engine_with_memory(driver, sink, memory, &base.join("data"));
+
+        engine
+            .chat(crate::ipc::ChatRequest {
+                client_turn_id: crate::ipc::new_client_turn_id(),
+                text: "일반 실행".to_string(),
+                attachments: Vec::new(),
+                mentions: Vec::new(),
+                execution_mode: crate::autonomous::ExecutionMode::Interactive,
+                autonomous_policy: None,
+            })
+            .await
+            .unwrap();
+
+        let prompts = driver_handle.prompts();
+        assert_eq!(prompts.len(), 3);
+        assert!(prompts[0].contains("일반 실행"));
+        assert!(!prompts[0].contains("[autonomous execution]"));
+        assert!(prompts[1].starts_with("[continuation]"));
+        assert!(prompts[1].contains("ToolRounds"));
+        assert!(prompts[2].starts_with("[continuation]"));
+        assert!(prompts[2].contains("ToolActions"));
+        assert!(engine
+            .session_store
+            .load(&engine.session_id)
+            .unwrap()
+            .autonomous_run
+            .is_none());
+        let events = sink_handle.events();
+        assert!(events.iter().any(
+            |event| matches!(event, EngineEvent::Answer(answer) if answer.text == "일반 완료")
+        ));
+        assert!(!events.iter().any(
+            |event| matches!(event, EngineEvent::Answer(answer) if answer.text.contains("일시 중지"))
+        ));
+        fs::remove_dir_all(base).ok();
+    }
+    #[tokio::test]
+    async fn autonomous_resume_requires_exact_checkpoint_and_project_revision() {
+        for (tag, revision_matches) in [
+            ("autonomous-resume-valid", true),
+            ("autonomous-resume-stale", false),
+        ] {
+            let (base, memory) = memory_store(tag);
+            let driver = FakeCodexDriver::scripted([AgentTurnResult::Answer {
+                text: "재개 완료".to_string(),
+            }]);
+            let driver_handle = driver.clone();
+            let sink = CapturingEventSink::default();
+            let mut engine = test_engine_with_memory(driver, sink, memory, &base.join("data"));
+            native_workspace_snapshot(&engine.runtime.data_dirs(), "Sample");
+            let checkpoint = engine.executor.conversation_state();
+            let current_revision = engine.runtime.current_project_revision().unwrap();
+            let mut run = crate::autonomous::AutonomousRunState::new(
+                "재개할 목표".to_string(),
+                crate::ipc::new_client_turn_id(),
+                format!("req-{tag}"),
+                engine.project_id.clone(),
+                if revision_matches {
+                    current_revision
+                } else {
+                    "stale-revision".to_string()
+                },
+                Default::default(),
+                crate::session::now_unix_millis(),
+            );
+            run.status = crate::autonomous::AutonomousRunStatus::PausedAfterRestart;
+            run.pause_reason = Some(crate::autonomous::AutonomousPauseReason::Restart);
+            run.active_started_at = None;
+            run.last_checkpoint = Some(checkpoint);
+            engine
+                .session_store
+                .set_autonomous_run(&engine.session_id, Some(run))
+                .unwrap();
+
+            let result = engine.autonomous_resume().await;
+            let persisted = engine
+                .session_store
+                .load(&engine.session_id)
+                .unwrap()
+                .autonomous_run
+                .unwrap();
+            if revision_matches {
+                result.unwrap();
+                assert_eq!(
+                    persisted.status,
+                    crate::autonomous::AutonomousRunStatus::Completed
+                );
+                assert_eq!(driver_handle.prompts().len(), 1);
+                assert!(driver_handle.prompts()[0].contains("[autonomous continuation]"));
+                assert!(driver_handle.prompts()[0].contains("재개할 목표"));
+            } else {
+                assert!(result.unwrap_err().message.contains("프로젝트"));
+                assert_eq!(
+                    persisted.status,
+                    crate::autonomous::AutonomousRunStatus::SafetyStopped
+                );
+                assert!(driver_handle.prompts().is_empty());
+            }
+            fs::remove_dir_all(base).ok();
+        }
+    }
+
+    #[test]
+    fn autonomous_completion_requires_a_successful_build_for_current_revision() {
+        let (base, memory) = memory_store("autonomous-build-gate");
+        let driver = FakeCodexDriver::scripted([]);
+        let sink = CapturingEventSink::default();
+        let mut engine = test_engine_with_memory(driver, sink, memory, &base.join("data"));
+        native_workspace_snapshot(&engine.runtime.data_dirs(), "Sample");
+        let request_id = "req-autonomous-build";
+        engine.current_request_id = Some(request_id.to_string());
+        engine
+            .runtime
+            .begin_request(request_id, &engine.project_id)
+            .unwrap();
+        record_file_write_in_memory(
+            &engine.journal_store,
+            request_id,
+            "write-build",
+            1,
+            "src/main.eps",
+        );
+
+        assert!(engine
+            .autonomous_completion_blocker()
+            .unwrap()
+            .unwrap()
+            .contains("build_run"));
+
+        let revision = engine.runtime.current_project_revision().unwrap();
+        engine
+            .runtime
+            .restore_autonomous_progress(
+                request_id,
+                &crate::autonomous::AutonomousRunProgress {
+                    latest_build: Some(crate::autonomous::AutonomousBuildStatus {
+                        input_revision: revision,
+                        diagnostics_fingerprint: "success".to_string(),
+                        error_count: 0,
+                        success: true,
+                        consecutive_no_progress: 0,
+                    }),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(engine.autonomous_completion_blocker().unwrap(), None);
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[tokio::test]
+    async fn accepted_autonomous_review_completes_while_paused_review_stays_resumable() {
+        for (tag, initial_status, expected_status) in [
+            (
+                "autonomous-review",
+                crate::autonomous::AutonomousRunStatus::Review,
+                crate::autonomous::AutonomousRunStatus::Completed,
+            ),
+            (
+                "autonomous-paused-review",
+                crate::autonomous::AutonomousRunStatus::Paused,
+                crate::autonomous::AutonomousRunStatus::Paused,
+            ),
+        ] {
+            let (base, memory) = memory_store(tag);
+            let driver = FakeCodexDriver::scripted([]);
+            let sink = CapturingEventSink::default();
+            let mut engine = test_engine_with_memory(driver, sink, memory, &base.join("data"));
+            native_workspace_snapshot(&engine.runtime.data_dirs(), "Sample");
+            let request_id = format!("req-{tag}");
+            engine.execution_mode = crate::autonomous::ExecutionMode::Autonomous;
+            engine.current_request_id = Some(request_id.clone());
+            engine.current_client_turn_id = Some(crate::ipc::new_client_turn_id());
+            engine
+                .runtime
+                .begin_request(&request_id, &engine.project_id)
+                .unwrap();
+            engine
+                .runtime
+                .register_write_request("review fixture")
+                .unwrap();
+            record_file_write(
+                &engine.journal_store,
+                &request_id,
+                "review-write",
+                1,
+                "src/main.eps",
+            );
+            let mut run = crate::autonomous::AutonomousRunState::new(
+                "검토할 목표".to_string(),
+                engine.current_client_turn_id.clone().unwrap(),
+                request_id.clone(),
+                engine.project_id.clone(),
+                engine.runtime.current_project_revision().unwrap(),
+                Default::default(),
+                crate::session::now_unix_millis(),
+            );
+            run.status = initial_status;
+            if initial_status == crate::autonomous::AutonomousRunStatus::Paused {
+                run.pause_reason = Some(crate::autonomous::AutonomousPauseReason::User);
+            }
+            engine
+                .session_store
+                .set_autonomous_run(&engine.session_id, Some(run))
+                .unwrap();
+
+            engine.settle_request(None).await.unwrap();
+
+            let persisted = engine
+                .session_store
+                .load(&engine.session_id)
+                .unwrap()
+                .autonomous_run
+                .unwrap();
+            assert_eq!(persisted.status, expected_status);
+            assert_eq!(
+                persisted.project_revision,
+                engine.runtime.current_project_revision().unwrap()
+            );
+            if expected_status == crate::autonomous::AutonomousRunStatus::Paused {
+                assert!(persisted.status.can_resume());
+                assert_eq!(
+                    persisted.pause_reason,
+                    Some(crate::autonomous::AutonomousPauseReason::User)
+                );
+            }
+            fs::remove_dir_all(base).ok();
+        }
     }
 }

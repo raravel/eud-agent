@@ -23,10 +23,21 @@ use crate::native_project::{
 const EUDDRAFT_TIMEOUT: Duration = Duration::from_secs(300);
 const PYTHON_PROBE_TIMEOUT: Duration = Duration::from_secs(120);
 const TRACEBACK_MARKER: &str = "Traceback (most recent call last):";
+/// Characters kept per diagnostic `raw` block in a build result.
+const DIAGNOSTIC_RAW_LIMIT: usize = 4096;
+/// Project-relative path of the complete stdout/stderr log of the last euddraft run.
+pub const BUILD_LOG_RELATIVE_PATH: &str = "build/euddraft/build.log";
+/// Characters kept per stream in the model-facing build output excerpt.
+const EXCERPT_STREAM_LIMIT: usize = 6144;
+/// Characters kept per line in the excerpt; euddraft prints every null tile on one line.
+const EXCERPT_LINE_LIMIT: usize = 400;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DatFieldMeta {
     pub name: String,
+    /// The `.def` `[FORMAT]` field index — the order the DAT Editor lists fields
+    /// in, which the name-keyed map no longer carries.
+    pub index: u32,
     pub size: u8,
     pub var_start: u32,
     pub var_end: u32,
@@ -34,10 +45,27 @@ pub struct DatFieldMeta {
     pub var_index: u32,
     pub init_var: i64,
     pub offset: u32,
+    /// The `.def` `Type=` value: which catalog the number points at. `None` is a
+    /// plain number. See `dat_wiki::DatReference` for the mapping.
+    pub value_type: Option<u32>,
+    /// One label per bit, from the `Name=...:a,b,"c,d"` suffix; empty when the
+    /// field is not a flag field.
+    pub flags: Vec<String>,
     pub baseline: Vec<i64>,
 }
 
 impl DatFieldMeta {
+    /// The inclusive value range this field's width admits, `init_var` included
+    /// (the baseline already carries it).
+    pub fn value_range(&self) -> (i64, i64) {
+        let width = match self.size {
+            1 => u8::MAX as i64,
+            2 => u16::MAX as i64,
+            _ => u32::MAX as i64,
+        };
+        (self.init_var, width + self.init_var)
+    }
+
     fn local_index(&self, object_id: u32) -> Result<u32, String> {
         if object_id < self.var_start || object_id > self.var_end {
             return Err(format!(
@@ -57,9 +85,18 @@ impl DatFieldMeta {
     }
 }
 
+/// The DAT tables the catalog carries, in the order EUD Editor 3's DAT Editor
+/// lists them.
+pub const DAT_TABLES: [&str; 10] = [
+    "units", "weapons", "flingy", "sprites", "images", "upgrades", "techdata", "orders",
+    "portdata", "sfxdata",
+];
+
 #[derive(Debug, Clone)]
 pub struct DatCatalog {
     fields: BTreeMap<String, BTreeMap<String, DatFieldMeta>>,
+    /// `InputEntrycount` per table: how many objects the table holds.
+    entries: BTreeMap<String, u32>,
     button_defaults: Vec<ButtonSetDefault>,
     tbl: Vec<String>,
     status: Vec<(i64, i64)>,
@@ -95,21 +132,18 @@ impl DatCatalog {
     pub fn load(compat_root: &Path) -> Result<Self, String> {
         let offsets = parse_offsets(&read_text(&compat_root.join("Offset.txt"))?)?;
         let mut fields = BTreeMap::new();
-        for table in [
-            "units", "weapons", "flingy", "sprites", "images", "upgrades", "techdata", "orders",
-            "portdata", "sfxdata",
-        ] {
+        let mut entries = BTreeMap::new();
+        for table in DAT_TABLES {
             let definition = compat_root.join("DatFiles").join(format!("{table}.def"));
             let data_path = compat_root.join("DatFiles").join(format!("{table}.dat"));
-            fields.insert(
-                table.to_string(),
-                parse_dat_definition(
-                    table,
-                    &read_text(&definition)?,
-                    &fs::read(&data_path).map_err(stringify_io)?,
-                    &offsets,
-                )?,
-            );
+            let (count, metas) = parse_dat_definition(
+                table,
+                &read_text(&definition)?,
+                &fs::read(&data_path).map_err(stringify_io)?,
+                &offsets,
+            )?;
+            fields.insert(table.to_string(), metas);
+            entries.insert(table.to_string(), count);
         }
         let button_defaults = parse_button_defaults(
             &fs::read(compat_root.join("DatFiles/btnset.dat")).map_err(stringify_io)?,
@@ -124,11 +158,48 @@ impl DatCatalog {
         )?;
         Ok(Self {
             fields,
+            entries,
             button_defaults,
             tbl,
             status,
             requirements,
         })
+    }
+
+    /// Every field of one DAT table, keyed by field name. The DAT wiki orders
+    /// them by `DatFieldMeta::index`, not by this map's alphabetical keys.
+    pub fn table_fields(&self, table: &str) -> Option<&BTreeMap<String, DatFieldMeta>> {
+        self.fields.get(table)
+    }
+
+    /// How many objects a DAT table holds (`InputEntrycount`).
+    pub fn table_entries(&self, table: &str) -> Option<u32> {
+        self.entries.get(table).copied()
+    }
+
+    /// Every decoded `stat_txt.tbl` string, in index order. A DAT label field
+    /// stores a ONE-based string id, so its text is `tbl_strings()[value - 1]`;
+    /// the sparse TBL document addresses the same strings zero-based.
+    pub fn tbl_strings(&self) -> &[String] {
+        &self.tbl
+    }
+
+    /// How many button sets `btnset.dat` defines.
+    pub fn button_set_count(&self) -> usize {
+        self.button_defaults.len()
+    }
+
+    /// How many `statusInfor.dat` objects the catalog carries.
+    pub fn status_count(&self) -> usize {
+        self.status.len()
+    }
+
+    /// Requirement tables and how many objects each covers.
+    pub fn requirement_tables(&self) -> Vec<(&str, usize)> {
+        self.requirements
+            .iter()
+            .map(|(table, objects)| (table.as_str(), objects.len()))
+            .collect()
     }
 
     pub fn field(&self, table: &str, field: &str) -> Result<&DatFieldMeta, String> {
@@ -206,7 +277,7 @@ impl DatCatalog {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NativeBuildArtifacts {
     pub build_dir: String,
@@ -228,6 +299,8 @@ pub struct NativeBuildError {
     pub line: u64,
     pub message: String,
     pub raw: String,
+    /// How many identical diagnostics this entry stands for (warnings merge).
+    pub count: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -235,9 +308,15 @@ pub struct NativeBuildError {
 pub struct NativeBuildResult {
     pub ok: bool,
     pub errors: Vec<NativeBuildError>,
+    /// euddraft warnings (`warn_with_traceback` stacks, `[Warning]` lines); never fail a build.
+    pub warnings: Vec<NativeBuildError>,
     pub raw_status: u32,
     pub stdout: String,
     pub stderr: String,
+    /// Absolute path of the complete stdout/stderr log written for this run; empty when the
+    /// log could not be written (then `warnings` says why). The tool observation exposes the
+    /// project-relative `BUILD_LOG_RELATIVE_PATH` instead.
+    pub log_path: String,
     pub artifacts: NativeBuildArtifacts,
 }
 
@@ -280,6 +359,7 @@ impl EuddraftLaunch {
                     script: configured.to_path_buf(),
                 });
             }
+            crate::bootstrap::validate_managed_install(configured)?;
             return Ok(Self::Executable(configured.to_path_buf()));
         }
         if configured.is_dir() {
@@ -296,6 +376,7 @@ impl EuddraftLaunch {
             }
             let executable = configured.join(EUDDRAFT_EXECUTABLE_NAME);
             if executable.is_file() {
+                crate::bootstrap::validate_managed_install(&executable)?;
                 return Ok(Self::Executable(executable));
             }
         }
@@ -735,18 +816,121 @@ pub fn run_native_build_with_python_and_cancellation(
     let eds_path = PathBuf::from(&artifacts.eds_path);
     let output_map = PathBuf::from(&artifacts.output_map);
     let before_output = modified_time(&output_map)?;
+    // A run that times out, is cancelled, or fails to spawn must not leave the previous
+    // run's log behind for build_log_read to page as if it were this build's.
+    let stale_log = remove_stale_build_log(project.root()).err();
     let captured = euddraft.run_with_cancellation(&eds_path, EUDDRAFT_TIMEOUT, cancellation)?;
     let fresh_output = is_fresh_output(before_output, modified_time(&output_map)?);
     let eds_dir = eds_path
         .parent()
         .ok_or_else(|| "EDS path has no parent".to_string())?;
+    let log = match stale_log {
+        // A stale log that could not be removed must not be presented as this run's.
+        Some(error) => Err(error),
+        None => write_build_log(project.root(), &captured),
+    };
     Ok(assemble_build_result(
         captured,
         fresh_output,
         artifacts,
         project.root(),
         eds_dir,
+        log,
     ))
+}
+
+fn remove_stale_build_log(project_root: &Path) -> Result<(), String> {
+    match fs::remove_file(build_log_path(project_root)) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("이전 빌드 로그를 지우지 못했습니다: {error}")),
+    }
+}
+
+/// Path of the complete build log inside the project `build/` tree.
+pub fn build_log_path(project_root: &Path) -> PathBuf {
+    project_root.join(BUILD_LOG_RELATIVE_PATH)
+}
+
+/// Persist the raw euddraft stdout/stderr so a bounded tool observation can point at it.
+fn write_build_log(project_root: &Path, captured: &CapturedProcess) -> Result<String, String> {
+    let path = build_log_path(project_root);
+    let content = format!(
+        "# euddraft build log\n# exit status: 0x{:08X}\n# ===== stdout =====\n{}\n# ===== stderr =====\n{}\n",
+        captured.raw_status, captured.stdout, captured.stderr
+    );
+    write_atomic_bytes(&path, content.as_bytes())
+        .map_err(|error| format!("빌드 로그를 쓰지 못했습니다 ({}): {error}", path.display()))?;
+    Ok(path_text(&path))
+}
+
+/// Bounded, model-facing view of one run's stdout/stderr: long lines are cut and each
+/// stream keeps its head and tail. The complete text stays in `BUILD_LOG_RELATIVE_PATH`.
+pub fn output_excerpt(stdout: &str, stderr: &str) -> String {
+    let mut excerpt = String::new();
+    for (name, text) in [("stdout", stdout), ("stderr", stderr)] {
+        let text = text.trim_end();
+        let line_count = text.lines().count();
+        excerpt.push_str(&format!(
+            "[{name}: {} lines, {} chars]\n",
+            line_count,
+            text.chars().count()
+        ));
+        if text.is_empty() {
+            continue;
+        }
+        let cut: Vec<String> = text
+            .lines()
+            .map(|line| {
+                let length = line.chars().count();
+                if length <= EXCERPT_LINE_LIMIT {
+                    line.to_string()
+                } else {
+                    let head: String = line.chars().take(EXCERPT_LINE_LIMIT).collect();
+                    format!(
+                        "{head} [… line cut, {} more chars]",
+                        length - EXCERPT_LINE_LIMIT
+                    )
+                }
+            })
+            .collect();
+        let joined = cut.join("\n");
+        if joined.chars().count() <= EXCERPT_STREAM_LIMIT {
+            excerpt.push_str(&joined);
+            excerpt.push('\n');
+            continue;
+        }
+        let head_budget = EXCERPT_STREAM_LIMIT * 2 / 3;
+        let tail_budget = EXCERPT_STREAM_LIMIT - head_budget;
+        let mut head_end = 0;
+        let mut used = 0;
+        for (index, line) in cut.iter().enumerate() {
+            let cost = line.chars().count() + 1;
+            if used + cost > head_budget {
+                break;
+            }
+            used += cost;
+            head_end = index + 1;
+        }
+        let mut tail_start = cut.len();
+        used = 0;
+        while tail_start > head_end {
+            let cost = cut[tail_start - 1].chars().count() + 1;
+            if used + cost > tail_budget {
+                break;
+            }
+            used += cost;
+            tail_start -= 1;
+        }
+        excerpt.push_str(&cut[..head_end].join("\n"));
+        excerpt.push_str(&format!(
+            "\n[… {} lines elided; full text in {BUILD_LOG_RELATIVE_PATH} via build_log_read …]\n",
+            tail_start - head_end
+        ));
+        excerpt.push_str(&cut[tail_start..].join("\n"));
+        excerpt.push('\n');
+    }
+    excerpt
 }
 
 fn assemble_build_result(
@@ -755,9 +939,28 @@ fn assemble_build_result(
     artifacts: NativeBuildArtifacts,
     project_root: &Path,
     eds_dir: &Path,
+    log: Result<String, String>,
 ) -> NativeBuildResult {
-    let mut errors =
-        parse_euddraft_output(&captured.stdout, &captured.stderr, project_root, eds_dir);
+    let EuddraftDiagnostics {
+        mut errors,
+        mut warnings,
+    } = parse_euddraft_output(&captured.stdout, &captured.stderr, project_root, eds_dir);
+    // The log is a convenience copy, never build authority: a failed write is reported,
+    // not allowed to discard euddraft's verdict.
+    let log_path = match log {
+        Ok(path) => path,
+        Err(error) => {
+            warnings.push(NativeBuildError {
+                source: "eud-agent".to_string(),
+                file: BUILD_LOG_RELATIVE_PATH.to_string(),
+                line: 0,
+                message: error,
+                raw: String::new(),
+                count: 1,
+            });
+            String::new()
+        }
+    };
     let ok = captured.success && fresh_output && errors.is_empty();
     if !ok && errors.is_empty() {
         let raw = joined_output(&captured.stdout, &captured.stderr);
@@ -778,15 +981,18 @@ fn assemble_build_result(
                     captured.raw_status
                 )
             },
-            raw,
+            raw: bound_text(&raw, DIAGNOSTIC_RAW_LIMIT),
+            count: 1,
         });
     }
     NativeBuildResult {
         ok,
         errors,
+        warnings,
         raw_status: captured.raw_status,
         stdout: captured.stdout,
         stderr: captured.stderr,
+        log_path,
         artifacts,
     }
 }
@@ -842,13 +1048,7 @@ fn validate_numeric_override(
     change: &NumericOverride,
 ) -> Result<(), String> {
     meta.local_index(object_id)?;
-    let max = match meta.size {
-        1 => u8::MAX as i64,
-        2 => u16::MAX as i64,
-        4 => u32::MAX as i64,
-        other => return Err(format!("unsupported DAT field width {other}")),
-    } + meta.init_var;
-    let min = meta.init_var;
+    let (min, max) = meta.value_range();
     if change.before < min || change.before > max || change.after < min || change.after > max {
         return Err(format!(
             "{} value must be in {min}..{max} (before={}, after={})",
@@ -890,12 +1090,14 @@ fn generate_requirement_artifacts(
             if !resolved.allocated {
                 continue;
             }
+            if writes_object_id {
+                // Editor records StartPos after the order id word; stock require.dat
+                // points every order past its id as well.
+                section.extend_from_slice(&(object_id as u16).to_le_bytes());
+            }
             let pointer = u16::try_from(section.len() / 2)
                 .map_err(|_| format!("{table} requirement pointer overflow"))?;
             pointers[object_id] = pointer;
-            if writes_object_id {
-                section.extend_from_slice(&(object_id as u16).to_le_bytes());
-            }
             for block in &resolved.blocks {
                 write_requirement_block(&mut section, block)?;
             }
@@ -1365,7 +1567,7 @@ fn parse_dat_definition(
     source: &str,
     data: &[u8],
     offsets: &BTreeMap<String, u32>,
-) -> Result<BTreeMap<String, DatFieldMeta>, String> {
+) -> Result<(u32, BTreeMap<String, DatFieldMeta>), String> {
     let mut header = BTreeMap::new();
     let mut raw_fields: BTreeMap<u32, BTreeMap<String, String>> = BTreeMap::new();
     let mut section = "";
@@ -1405,15 +1607,18 @@ fn parse_dat_definition(
         .map_err(|_| format!("{table}.def InputEntrycount is invalid"))?;
     let mut fields = BTreeMap::new();
     let mut data_cursor = 0_usize;
-    for properties in raw_fields.into_values() {
-        let name = properties
+    for (index, properties) in raw_fields {
+        // `Name=Special Ability Flags:Building,Addon,...` — the text after the
+        // first colon is one label per bit, which the DAT wiki shows instead of
+        // a raw bitmask.
+        let raw_name = properties
             .get("Name")
-            .ok_or_else(|| format!("{table}.def field is missing Name"))?
-            .split(':')
-            .next()
-            .unwrap()
-            .trim()
-            .to_string();
+            .ok_or_else(|| format!("{table}.def field is missing Name"))?;
+        let (name, flag_suffix) = match raw_name.split_once(':') {
+            Some((name, flags)) => (name.trim().to_string(), flags),
+            None => (raw_name.trim().to_string(), ""),
+        };
+        let flags = parse_flag_labels(flag_suffix);
         let parse = |key: &str, default: u32| -> Result<u32, String> {
             properties
                 .get(key)
@@ -1461,10 +1666,16 @@ fn parse_dat_definition(
             .get(&format!("{table}_{name}"))
             .copied()
             .ok_or_else(|| format!("Offset.txt is missing {table}_{name}"))?;
+        let value_type = properties
+            .get("Type")
+            .map(|value| value.parse::<u32>())
+            .transpose()
+            .map_err(|_| format!("{table}.{name} Type is invalid"))?;
         fields.insert(
             name.clone(),
             DatFieldMeta {
                 name,
+                index,
                 size,
                 var_start,
                 var_end,
@@ -1472,11 +1683,37 @@ fn parse_dat_definition(
                 var_index,
                 init_var,
                 offset,
+                value_type,
+                flags,
                 baseline,
             },
         );
     }
-    Ok(fields)
+    Ok((entries, fields))
+}
+
+/// Split a `.def` flag-label list into one label per bit. Labels are
+/// comma-separated, a label holding a comma is `"quoted"`, and `&&` is the
+/// Editor form's escape for a literal `&`.
+fn parse_flag_labels(suffix: &str) -> Vec<String> {
+    if suffix.trim().is_empty() {
+        return Vec::new();
+    }
+    let mut labels = Vec::new();
+    let mut current = String::new();
+    let mut quoted = false;
+    for character in suffix.chars() {
+        match character {
+            '"' => quoted = !quoted,
+            ',' if !quoted => labels.push(std::mem::take(&mut current)),
+            _ => current.push(character),
+        }
+    }
+    labels.push(current);
+    labels
+        .into_iter()
+        .map(|label| label.trim().replace("&&", "&"))
+        .collect()
 }
 
 fn parse_button_defaults(bytes: &[u8]) -> Result<Vec<ButtonSetDefault>, String> {
@@ -1615,9 +1852,12 @@ fn decode_tbl(bytes: &[u8]) -> Result<Vec<String>, String> {
         if start >= bytes.len() {
             return Err(format!("stat_txt.tbl offset {index} is invalid"));
         }
+        // Editor's tblReader only treats a NUL after at least two bytes as the terminator,
+        // so hotkey strings such as "o<00>Tank Mode" keep their text past the separator.
         let end = bytes[start..]
             .iter()
-            .position(|value| *value == 0)
+            .enumerate()
+            .position(|(relative, value)| *value == 0 && relative >= 2)
             .map(|relative| start + relative)
             .unwrap_or(bytes.len());
         let slice = &bytes[start..end];
@@ -1652,7 +1892,9 @@ fn encode_custom_tbl(
             baseline.len()
         ));
     }
-    let mut values = baseline[..=last].to_vec();
+    // Editor always dumps the complete table: the game keeps indexing the original
+    // 1547-entry header, so a shorter copy leaves the tail reading string bytes as offsets.
+    let mut values = baseline.to_vec();
     for (index, change) in overrides {
         values[*index as usize] = change.after.clone();
     }
@@ -1813,63 +2055,476 @@ fn run_process(
     })
 }
 
+/// Errors and warnings recovered from one euddraft run.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct EuddraftDiagnostics {
+    errors: Vec<NativeBuildError>,
+    warnings: Vec<NativeBuildError>,
+}
+
+/// One `File "<path>", line <n>, in <name>` frame of a Python stack.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TracebackFrame {
+    file: String,
+    line: u64,
+    in_project: bool,
+}
+
+/// A traceback block whose exception line has not arrived yet.
+struct OpenTraceback<'a> {
+    frames: Vec<TracebackFrame>,
+    raw: Vec<&'a str>,
+    /// Text of the `[Error] …` prefix, used when the block never reaches an exception line.
+    fallback: Option<String>,
+}
+
+/// `<file>:<line>: <Category>Warning: <text>` (Python `warnings.formatwarning`) or a plain
+/// `[Warning] <text>` line.
+struct WarningLine {
+    site: Option<(String, u64)>,
+    category: String,
+    text: String,
+}
+
+/// Line-oriented state for one euddraft output.
+struct OutputParser<'a> {
+    project_root: &'a Path,
+    eds_dir: &'a Path,
+    compiled_modules: BTreeMap<String, Vec<String>>,
+    diagnostics: EuddraftDiagnostics,
+    /// Stack frames printed without a traceback header (`warn_with_traceback`).
+    pending_frames: Vec<TracebackFrame>,
+    pending_raw: Vec<&'a str>,
+    traceback: Option<OpenTraceback<'a>>,
+    /// `[Error] <message>` lines seen before their traceback header; the message may span
+    /// several lines because euddraft prints `f"[Error] {err}"` followed by the traceback.
+    error_prefix: Vec<&'a str>,
+}
+
+/// Parse euddraft's stdout/stderr into structured errors and warnings.
+///
+/// euddraft prints three diagnostic shapes:
+/// - epScript compile errors: `[Error <code>] Module "<name>" Line <n> : <message>`;
+/// - a failed run: `[Error] <message> Traceback (most recent call last):` (or a bare
+///   traceback header), indented frames, then the `<Type>: <message>` exception line, possibly
+///   chained through "During handling of the above exception";
+/// - warnings via `warn_with_traceback`: indented stack frames WITHOUT a traceback header,
+///   terminated by `<file>:<line>: <Category>Warning: <message>`.
+///
+/// Every traceback block or warning becomes exactly one diagnostic whose file/line is the
+/// innermost frame inside the project, so a warning's stack never counts as errors and a
+/// compile error keeps its epScript file and line. Identical warnings merge into one entry
+/// with a `count`.
 fn parse_euddraft_output(
     stdout: &str,
     stderr: &str,
     project_root: &Path,
     eds_dir: &Path,
-) -> Vec<NativeBuildError> {
+) -> EuddraftDiagnostics {
     let combined = joined_output(stdout, stderr);
-    let mut errors = Vec::new();
-    for line in combined.lines() {
-        let trimmed = line.trim();
-        if let Some((file, rest)) = parse_python_file_line(trimmed) {
-            errors.push(NativeBuildError {
-                source: "euddraft".to_string(),
-                file: normalize_traceback_file(&file, project_root, eds_dir),
-                line: rest.0,
-                message: rest.1.clone(),
-                raw: trimmed.to_string(),
-            });
-        }
+    let lines: Vec<&str> = combined.lines().collect();
+    let mut parser = OutputParser {
+        project_root,
+        eds_dir,
+        compiled_modules: compiled_module_paths(&combined, project_root, eds_dir),
+        diagnostics: EuddraftDiagnostics::default(),
+        pending_frames: Vec::new(),
+        pending_raw: Vec::new(),
+        traceback: None,
+        error_prefix: Vec::new(),
+    };
+    let mut index = 0;
+    while index < lines.len() {
+        let line = lines[index];
+        index += 1;
+        parser.feed(&lines, &mut index, line);
     }
-    if errors.is_empty() && combined.contains(TRACEBACK_MARKER) {
-        let message = combined
-            .lines()
-            .rev()
-            .find(|line| !line.trim().is_empty())
-            .unwrap_or("euddraft traceback")
-            .trim()
-            .to_string();
-        errors.push(NativeBuildError {
-            source: "euddraft".to_string(),
-            file: String::new(),
-            line: 0,
-            message,
-            raw: combined,
-        });
-    }
-    errors
-}
-fn read_le_value(bytes: &[u8], position: usize, size: u8) -> Result<u32, String> {
-    let end = position
-        .checked_add(size as usize)
-        .ok_or_else(|| "DAT value offset overflow".to_string())?;
-    let slice = bytes
-        .get(position..end)
-        .ok_or_else(|| "DAT file is truncated".to_string())?;
-    Ok(match size {
-        1 => slice[0] as u32,
-        2 => u16::from_le_bytes([slice[0], slice[1]]) as u32,
-        4 => u32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]),
-        _ => return Err(format!("unsupported DAT width {size}")),
-    })
+    parser.finish(&combined)
 }
 
-fn parse_python_file_line(line: &str) -> Option<(String, (u64, String))> {
-    let marker = "File \"";
-    let start = line.find(marker)? + marker.len();
-    let rest = &line[start..];
+impl<'a> OutputParser<'a> {
+    fn feed(&mut self, lines: &[&'a str], index: &mut usize, line: &'a str) {
+        let trimmed = line.trim();
+        let indented = line.starts_with(char::is_whitespace);
+        if let Some(prefix) = split_traceback_header(trimmed, !self.error_prefix.is_empty()) {
+            self.close_traceback(None);
+            self.flush_pending_frames("a traceback header");
+            let mut fallback = std::mem::take(&mut self.error_prefix)
+                .iter()
+                .map(|line| line.trim())
+                .collect::<Vec<_>>();
+            if !prefix.is_empty() {
+                fallback.push(prefix);
+            }
+            let fallback = fallback
+                .join("\n")
+                .strip_prefix("[Error]")
+                .map(str::trim)
+                .filter(|message| !message.is_empty())
+                .map(str::to_string);
+            self.traceback = Some(OpenTraceback {
+                frames: Vec::new(),
+                raw: vec![line],
+                fallback,
+            });
+            return;
+        }
+        if let Some((file, line_number)) = parse_python_file_line(trimmed) {
+            let frame = traceback_frame(&file, line_number, self.project_root, self.eds_dir);
+            self.error_prefix.clear();
+            match self.traceback.as_mut() {
+                Some(open) => {
+                    open.frames.push(frame);
+                    open.raw.push(line);
+                }
+                None => {
+                    self.pending_frames.push(frame);
+                    self.pending_raw.push(line);
+                }
+            }
+            return;
+        }
+        if let Some(open) = self.traceback.as_mut() {
+            if trimmed.is_empty() {
+                return;
+            }
+            if indented {
+                // Source excerpt or caret line under a frame.
+                open.raw.push(line);
+                return;
+            }
+            // The exception line ends the block; keep its own continuation lines.
+            let mut message = trimmed.to_string();
+            open.raw.push(line);
+            take_continuation(lines, index, &mut message, &mut open.raw);
+            self.close_traceback(Some(message));
+            return;
+        }
+        if let Some((module, line_number, message)) = parse_compile_error_line(trimmed) {
+            self.flush_pending_frames("an epScript compile error");
+            self.error_prefix.clear();
+            let (file, message) = match self.compiled_modules.get(&module) {
+                Some(paths) if paths.len() == 1 => (paths[0].clone(), message),
+                Some(paths) => (
+                    paths[0].clone(),
+                    format!("{message} (module name matches: {})", paths.join(", ")),
+                ),
+                None => (format!("{module}.eps"), message),
+            };
+            self.diagnostics.errors.push(NativeBuildError {
+                source: "epScript".to_string(),
+                file,
+                line: line_number,
+                message,
+                raw: bound_text(trimmed, DIAGNOSTIC_RAW_LIMIT),
+                count: 1,
+            });
+            return;
+        }
+        if let Some(warning) = parse_warning_line(trimmed) {
+            self.error_prefix.clear();
+            let mut message = format!("{}: {}", warning.category, warning.text);
+            let mut raw = std::mem::take(&mut self.pending_raw);
+            raw.push(line);
+            if warning.site.is_some() {
+                // Only Python `formatwarning` output continues onto further lines; a plain
+                // `[Warning]` line is complete in itself.
+                take_continuation(lines, index, &mut message, &mut raw);
+            }
+            let frames = std::mem::take(&mut self.pending_frames);
+            let (file, line_number) = innermost_project_frame(&frames)
+                .map(|frame| (frame.file.clone(), frame.line))
+                .or_else(|| {
+                    warning.site.map(|(file, line_number)| {
+                        (
+                            normalize_traceback_file(&file, self.project_root, self.eds_dir),
+                            line_number,
+                        )
+                    })
+                })
+                .unwrap_or_default();
+            self.diagnostics.warnings.push(NativeBuildError {
+                source: "euddraft".to_string(),
+                file,
+                line: line_number,
+                message,
+                raw: bound_text(&raw.join("\n"), DIAGNOSTIC_RAW_LIMIT),
+                count: 1,
+            });
+            return;
+        }
+        if !indented && trimmed.starts_with("[Error]") {
+            self.flush_pending_frames("an [Error] line");
+            self.error_prefix = vec![line];
+            return;
+        }
+        if indented || trimmed.is_empty() {
+            return;
+        }
+        if !self.error_prefix.is_empty() {
+            // Continuation of a multi-line `[Error] {err}` message before its header.
+            self.error_prefix.push(line);
+            return;
+        }
+        self.flush_pending_frames(trimmed);
+    }
+
+    /// Frames that end without a warning or exception line stay errors: the output is not a
+    /// shape this parser vouches for.
+    fn flush_pending_frames(&mut self, before: &str) {
+        if self.pending_frames.is_empty() {
+            return;
+        }
+        let frames = std::mem::take(&mut self.pending_frames);
+        let raw = std::mem::take(&mut self.pending_raw);
+        self.diagnostics.errors.push(traceback_error(
+            frames,
+            raw,
+            Some(format!("unterminated euddraft stack before: {before}")),
+            self.project_root,
+            self.eds_dir,
+        ));
+    }
+
+    fn close_traceback(&mut self, message: Option<String>) {
+        let Some(open) = self.traceback.take() else {
+            return;
+        };
+        let message = message.or(open.fallback);
+        let has_project_frame = open.frames.iter().any(|frame| frame.in_project);
+        let error = traceback_error(
+            open.frames,
+            open.raw,
+            message,
+            self.project_root,
+            self.eds_dir,
+        );
+        if is_launcher_stdin_eof(&error, has_project_frame) {
+            // The bounded launcher runs euddraft with a closed stdin; euddraft's own
+            // `input("Press Enter to continue...")` after a failed run then raises EOFError.
+            // That is the launcher's artifact, never a project error, so it must not inflate
+            // the error count the model repairs against.
+            self.diagnostics.warnings.push(NativeBuildError {
+                message: format!(
+                    "{} — euddraft's post-failure console prompt under the launcher's closed stdin, not a project error",
+                    error.message
+                ),
+                ..error
+            });
+        } else {
+            self.diagnostics.errors.push(error);
+        }
+    }
+
+    fn finish(mut self, combined: &str) -> EuddraftDiagnostics {
+        self.close_traceback(None);
+        self.flush_pending_frames("end of output");
+        if !self.error_prefix.is_empty() {
+            let raw = std::mem::take(&mut self.error_prefix);
+            let message = raw
+                .iter()
+                .map(|line| line.trim())
+                .collect::<Vec<_>>()
+                .join("\n");
+            self.diagnostics.errors.push(NativeBuildError {
+                source: "euddraft".to_string(),
+                file: String::new(),
+                line: 0,
+                message: bound_text(
+                    message
+                        .strip_prefix("[Error]")
+                        .map(str::trim)
+                        .unwrap_or(&message),
+                    DIAGNOSTIC_RAW_LIMIT,
+                ),
+                raw: bound_text(&raw.join("\n"), DIAGNOSTIC_RAW_LIMIT),
+                count: 1,
+            });
+        }
+        if self.diagnostics.errors.is_empty() && combined.contains(TRACEBACK_MARKER) {
+            let message = combined
+                .lines()
+                .rev()
+                .find(|line| !line.trim().is_empty())
+                .unwrap_or("euddraft traceback")
+                .trim()
+                .to_string();
+            self.diagnostics.errors.push(NativeBuildError {
+                source: "euddraft".to_string(),
+                file: String::new(),
+                line: 0,
+                message,
+                raw: bound_text(combined, DIAGNOSTIC_RAW_LIMIT),
+                count: 1,
+            });
+        }
+        self.diagnostics.warnings = merge_identical(std::mem::take(&mut self.diagnostics.warnings));
+        self.diagnostics
+    }
+}
+
+/// Append the non-indented, non-marker lines that continue an exception or warning message.
+fn take_continuation<'a>(
+    lines: &[&'a str],
+    index: &mut usize,
+    message: &mut String,
+    raw: &mut Vec<&'a str>,
+) {
+    while *index < lines.len() {
+        let next = lines[*index];
+        let next_trimmed = next.trim();
+        if next_trimmed.is_empty()
+            || next.starts_with(char::is_whitespace)
+            || is_diagnostic_marker(next_trimmed)
+        {
+            break;
+        }
+        message.push('\n');
+        message.push_str(next_trimmed);
+        raw.push(next);
+        *index += 1;
+    }
+}
+
+/// Collapse diagnostics with the same file, line, and message into one entry with a count.
+fn merge_identical(entries: Vec<NativeBuildError>) -> Vec<NativeBuildError> {
+    let mut merged: Vec<NativeBuildError> = Vec::new();
+    for entry in entries {
+        match merged.iter_mut().find(|existing| {
+            existing.file == entry.file
+                && existing.line == entry.line
+                && existing.message == entry.message
+        }) {
+            Some(existing) => existing.count += entry.count,
+            None => merged.push(entry),
+        }
+    }
+    merged
+}
+
+fn is_launcher_stdin_eof(error: &NativeBuildError, has_project_frame: bool) -> bool {
+    !has_project_frame
+        && error.message.starts_with("EOFError:")
+        && error.file.ends_with("euddraft.py")
+}
+
+/// `[epScript] Compiling "<path>"...` lines map a compile-error module name (the file stem)
+/// to every source that produced it.
+fn compiled_module_paths(
+    combined: &str,
+    project_root: &Path,
+    eds_dir: &Path,
+) -> BTreeMap<String, Vec<String>> {
+    let marker = "[epScript] Compiling \"";
+    let mut modules: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for line in combined.lines() {
+        let trimmed = line.trim();
+        let Some(rest) = trimmed.strip_prefix(marker) else {
+            continue;
+        };
+        let Some(end) = rest.find('"') else {
+            continue;
+        };
+        let path = &rest[..end];
+        let stem = Path::new(path)
+            .file_stem()
+            .map(|stem| stem.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if stem.is_empty() {
+            continue;
+        }
+        let normalized = normalize_traceback_file(path, project_root, eds_dir);
+        let paths = modules.entry(stem).or_default();
+        if !paths.contains(&normalized) {
+            paths.push(normalized);
+        }
+    }
+    modules
+}
+
+/// Recognize a traceback header line and return the text before it. A bare header or one
+/// prefixed by `[Error] …` always counts; an arbitrary prefix counts only while a multi-line
+/// `[Error]` message is open, because euddraft prints the header at the end of that message.
+fn split_traceback_header(trimmed: &str, error_prefix_open: bool) -> Option<&str> {
+    let start = trimmed.find(TRACEBACK_MARKER)?;
+    if !trimmed[start + TRACEBACK_MARKER.len()..].trim().is_empty() {
+        return None;
+    }
+    let prefix = trimmed[..start].trim();
+    (prefix.is_empty() || prefix.starts_with("[Error]") || error_prefix_open).then_some(prefix)
+}
+
+/// `[Error <code>] Module "<name>" Line <n> : <message>` from the epScript compiler.
+fn parse_compile_error_line(trimmed: &str) -> Option<(String, u64, String)> {
+    let rest = trimmed.strip_prefix("[Error ")?;
+    let close = rest.find("] Module \"")?;
+    let code = &rest[..close];
+    if code.is_empty() || !code.chars().all(|ch| ch.is_ascii_digit() || ch == '-') {
+        return None;
+    }
+    let rest = &rest[close + "] Module \"".len()..];
+    let end = rest.find('"')?;
+    let module = rest[..end].to_string();
+    let rest = rest[end + 1..].trim_start().strip_prefix("Line ")?;
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    let line_number = digits.parse().ok()?;
+    let message = rest[digits.len()..]
+        .trim()
+        .strip_prefix(':')
+        .map(str::trim)
+        .unwrap_or("")
+        .to_string();
+    Some((module, line_number, message))
+}
+
+fn parse_warning_line(trimmed: &str) -> Option<WarningLine> {
+    if let Some(text) = trimmed.strip_prefix("[Warning]") {
+        return Some(WarningLine {
+            site: None,
+            category: "Warning".to_string(),
+            text: text.trim().to_string(),
+        });
+    }
+    let marker = "Warning: ";
+    let mut search_from = 0;
+    while let Some(found) = trimmed[search_from..].find(marker) {
+        let position = search_from + found;
+        let prefix = &trimmed[..position];
+        if let Some((site, category_start)) = prefix.rsplit_once(": ") {
+            let is_category = !category_start.is_empty()
+                && category_start
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '.');
+            if is_category {
+                if let Some((file, digits)) = site.rsplit_once(':') {
+                    if let Ok(line_number) = digits.parse::<u64>() {
+                        return Some(WarningLine {
+                            site: Some((file.to_string(), line_number)),
+                            category: format!("{category_start}Warning"),
+                            text: trimmed[position + marker.len()..].trim().to_string(),
+                        });
+                    }
+                }
+            }
+        }
+        search_from = position + marker.len();
+    }
+    None
+}
+
+fn is_diagnostic_marker(trimmed: &str) -> bool {
+    trimmed.starts_with("[Error")
+        || trimmed.starts_with("[Warning]")
+        || trimmed.contains(TRACEBACK_MARKER)
+        || trimmed.starts_with("During handling of the above exception")
+        || trimmed.starts_with("The above exception was the direct cause")
+        || trimmed.starts_with("File \"")
+        || parse_warning_line(trimmed).is_some()
+}
+
+/// A Python stack frame line: `File "<path>", line <n>, in <name>` (already trimmed).
+fn parse_python_file_line(trimmed: &str) -> Option<(String, u64)> {
+    let rest = trimmed.strip_prefix("File \"")?;
     let end = rest.find('"')?;
     let file = rest[..end].to_string();
     let after = &rest[end + 1..];
@@ -1880,10 +2535,65 @@ fn parse_python_file_line(line: &str) -> Option<(String, (u64, String))> {
         .take_while(char::is_ascii_digit)
         .collect();
     let line_number = digits.parse().ok()?;
-    Some((file, (line_number, "euddraft source error".to_string())))
+    Some((file, line_number))
+}
+
+fn traceback_frame(file: &str, line: u64, project_root: &Path, eds_dir: &Path) -> TracebackFrame {
+    let (file, in_project) = resolve_traceback_file(file, project_root, eds_dir);
+    TracebackFrame {
+        file,
+        line,
+        in_project,
+    }
+}
+
+fn innermost_project_frame(frames: &[TracebackFrame]) -> Option<&TracebackFrame> {
+    frames.iter().rev().find(|frame| frame.in_project)
+}
+
+fn traceback_error(
+    frames: Vec<TracebackFrame>,
+    raw: Vec<&str>,
+    message: Option<String>,
+    project_root: &Path,
+    eds_dir: &Path,
+) -> NativeBuildError {
+    let message = message.unwrap_or_else(|| "euddraft traceback".to_string());
+    let (file, line) = innermost_project_frame(&frames)
+        .or_else(|| frames.last())
+        .map(|frame| (frame.file.clone(), frame.line))
+        .or_else(|| {
+            // `EPError:  - Compiled failed for <path>` carries no frames; keep its file.
+            message
+                .lines()
+                .find_map(|line| line.split("Compiled failed for ").nth(1))
+                .map(|path| {
+                    (
+                        normalize_traceback_file(path.trim(), project_root, eds_dir),
+                        0,
+                    )
+                })
+        })
+        .unwrap_or_default();
+    NativeBuildError {
+        source: "euddraft".to_string(),
+        file,
+        line,
+        message,
+        raw: bound_text(&raw.join("\n"), DIAGNOSTIC_RAW_LIMIT),
+        count: 1,
+    }
 }
 
 fn normalize_traceback_file(file: &str, project_root: &Path, eds_dir: &Path) -> String {
+    resolve_traceback_file(file, project_root, eds_dir).0
+}
+
+/// Project-relative `/` path when `file` resolves under the project root (and `true`), else
+/// the original text (and `false`). Relative traceback paths are relative to the EDS
+/// directory because euddraft changes cwd there. A file that no longer exists is still
+/// classified by text, with Windows verbatim (`\\?\`) prefixes ignored on both sides.
+fn resolve_traceback_file(file: &str, project_root: &Path, eds_dir: &Path) -> (String, bool) {
     let original = Path::new(file);
     let resolved = if original.is_relative() {
         fs::canonicalize(eds_dir.join(original)).ok()
@@ -1891,16 +2601,16 @@ fn normalize_traceback_file(file: &str, project_root: &Path, eds_dir: &Path) -> 
         fs::canonicalize(original).ok()
     };
     let canonical_root = fs::canonicalize(project_root).ok();
-    let path = resolved.as_deref().unwrap_or(original);
-    let root = canonical_root.as_deref().unwrap_or(project_root);
-    if let Ok(relative) = path.strip_prefix(root) {
+    let path = without_verbatim_prefix(resolved.as_deref().unwrap_or(original));
+    let root = without_verbatim_prefix(canonical_root.as_deref().unwrap_or(project_root));
+    if let Ok(relative) = path.strip_prefix(&root) {
         let components = relative.components().collect::<Vec<_>>();
         if !components.is_empty()
             && components
                 .iter()
                 .all(|component| matches!(component, Component::Normal(_)))
         {
-            return components
+            let relative = components
                 .iter()
                 .filter_map(|component| match component {
                     Component::Normal(value) => Some(value.to_string_lossy().into_owned()),
@@ -1908,6 +2618,7 @@ fn normalize_traceback_file(file: &str, project_root: &Path, eds_dir: &Path) -> 
                 })
                 .collect::<Vec<_>>()
                 .join("/");
+            return (relative, true);
         }
     }
     let root_components = root.components().collect::<Vec<_>>();
@@ -1931,10 +2642,54 @@ fn normalize_traceback_file(file: &str, project_root: &Path, eds_dir: &Path) -> 
             .collect::<Vec<_>>()
             .join("/");
         if !relative.is_empty() {
-            return relative;
+            return (relative, true);
         }
     }
-    file.to_string()
+    (file.to_string(), false)
+}
+
+/// `\\?\C:\x` → `C:\x` and `\\?\UNC\server\share` → `\\server\share`, so a canonical root and
+/// a plain absolute path compare component by component.
+fn without_verbatim_prefix(path: &Path) -> PathBuf {
+    let text = path.to_string_lossy();
+    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+        PathBuf::from(format!(r"\\{rest}"))
+    } else if let Some(rest) = text.strip_prefix(r"\\?\") {
+        PathBuf::from(rest)
+    } else {
+        path.to_path_buf()
+    }
+}
+
+/// Keep the head and tail of `text` within `limit` characters, marking what was elided.
+pub fn bound_text(text: &str, limit: usize) -> String {
+    let total = text.chars().count();
+    if total <= limit {
+        return text.to_string();
+    }
+    let head_len = limit * 3 / 4;
+    let tail_len = limit - head_len;
+    let head: String = text.chars().take(head_len).collect();
+    let tail: String = text.chars().skip(total - tail_len).collect();
+    format!(
+        "{head}\n[… {} characters elided …]\n{tail}",
+        total - head_len - tail_len
+    )
+}
+
+fn read_le_value(bytes: &[u8], position: usize, size: u8) -> Result<u32, String> {
+    let end = position
+        .checked_add(size as usize)
+        .ok_or_else(|| "DAT value offset overflow".to_string())?;
+    let slice = bytes
+        .get(position..end)
+        .ok_or_else(|| "DAT file is truncated".to_string())?;
+    Ok(match size {
+        1 => slice[0] as u32,
+        2 => u16::from_le_bytes([slice[0], slice[1]]) as u32,
+        4 => u32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]),
+        _ => return Err(format!("unsupported DAT width {size}")),
+    })
 }
 
 fn joined_output(stdout: &str, stderr: &str) -> String {
@@ -1974,8 +2729,8 @@ fn stringify_io(error: std::io::Error) -> String {
 mod tests {
     use super::*;
     use crate::native_project::{
-        DatScalar, DatTarget, EdsPlugin, NativeDatChange, NativeDatPatch, ProjectManifest,
-        ProjectSettings,
+        DatScalar, DatTarget, EdsPlugin, NativeDatChange, NativeDatPatch, NativeDatState,
+        ProjectManifest, ProjectSettings,
     };
     use std::collections::HashMap;
 
@@ -2038,6 +2793,44 @@ mod tests {
     }
 
     #[test]
+    fn order_requirement_pointers_skip_the_order_id_word_like_editor() {
+        // Editor's WriteRequireData writes the order id before recording StartPos, and
+        // the stock require.dat points every order at the word after its id. A pointer
+        // at the id word makes the game read that id as a "must own unit" opcode.
+        let catalog = DatCatalog::load(&compat_root()).unwrap();
+        let mut dat = NativeDatState::default();
+        dat.requirements.tables.insert(
+            "orders".to_string(),
+            BTreeMap::from([(
+                6_u32,
+                crate::native_project::TextOverride {
+                    before: catalog.requirement_payload("orders", 6).unwrap(),
+                    after: "2".to_string(),
+                },
+            )]),
+        );
+        let artifacts = generate_requirement_artifacts(&dat, &catalog)
+            .unwrap()
+            .unwrap();
+        let orders_base = 1096 + 840 + 320 + 688;
+        let orders = &artifacts.bytes[orders_base..orders_base + 1316];
+        let word = |index: usize| u16::from_le_bytes([orders[index * 2], orders[index * 2 + 1]]);
+        for (order_id, pointer) in artifacts.pointers["orders"].iter().enumerate() {
+            if *pointer == 0 {
+                continue;
+            }
+            assert_eq!(
+                word(*pointer as usize - 1),
+                order_id as u16,
+                "order {order_id} pointer {pointer} must follow its id word"
+            );
+        }
+        assert_eq!(artifacts.pointers["orders"][0], 2);
+        assert_eq!(word(artifacts.pointers["orders"][6] as usize), 0xffff);
+        assert_eq!(artifacts.pointers["units"][0], 1);
+    }
+
+    #[test]
     fn standard_dat_plugin_matches_editor_address_math() {
         let (root, mut project) = project("dat");
         let target = DatTarget::Dat {
@@ -2090,6 +2883,11 @@ mod tests {
         let encoded = encode_custom_tbl(&baseline, &overrides).unwrap();
         let decoded = decode_tbl(&encoded).unwrap();
         assert!(decoded[0].starts_with("정예 해병"));
+        assert_eq!(decoded.len(), baseline.len());
+        assert_eq!(decoded[1..], baseline[1..]);
+        // Hotkey strings separate the key from the text with a NUL in the second byte.
+        assert_eq!(baseline[338], "o\u{0}Tank M\u{3}o\u{1}de");
+        assert_eq!(baseline[0], "Terran Marine");
     }
     fn synthetic_artifacts(root: &Path) -> NativeBuildArtifacts {
         NativeBuildArtifacts {
@@ -2124,6 +2922,7 @@ mod tests {
             synthetic_artifacts(&root),
             &root,
             &eds_dir,
+            Ok(String::new()),
         );
         assert!(!result.ok);
         assert!(!result.errors.is_empty());
@@ -2147,6 +2946,7 @@ mod tests {
             synthetic_artifacts(&root),
             &root,
             &eds_dir,
+            Ok(String::new()),
         );
         assert!(!result.ok);
         assert!(result.errors[0].message.contains("fresh output"));
@@ -2192,16 +2992,284 @@ mod tests {
         fs::write(&internal, b"pass\n").unwrap();
         let external = std::env::temp_dir().join("external-package/module.py");
         let stderr = format!(
-            "  File \"{}\", line 17, in feature\n  File \"../../src/feature.py\", line 18, in feature\n  File \"{}\", line 4, in helper\n",
+            "Traceback (most recent call last):\n  File \"{}\", line 17, in feature\n  File \"../../src/feature.py\", line 18, in feature\n  File \"{}\", line 4, in helper\nRuntimeError: boom\n",
             internal.display(),
             external.display(),
         );
-        let errors = parse_euddraft_output("", &stderr, &root, &eds_dir);
-        assert_eq!(errors.len(), 3);
-        assert_eq!(errors[0].file, "src/feature.py");
-        assert_eq!(errors[1].file, "src/feature.py");
-        assert_eq!(errors[2].file, external.to_string_lossy().as_ref());
+        let diagnostics = parse_euddraft_output("", &stderr, &root, &eds_dir);
+        // One traceback is one error, located at the innermost project frame.
+        assert_eq!(diagnostics.errors.len(), 1);
+        assert!(diagnostics.warnings.is_empty());
+        let error = &diagnostics.errors[0];
+        assert_eq!(error.file, "src/feature.py");
+        assert_eq!(error.line, 18);
+        assert_eq!(error.message, "RuntimeError: boom");
+        assert!(error.raw.contains(external.to_string_lossy().as_ref()));
         fs::remove_dir_all(root).ok();
+    }
+
+    const NULL_TILE_WARNING_STACK: &str = "  File \"src/freeze_core/initscripts/__startup__.py\", line 147, in run\n  File \"D:\\a\\euddraft\\euddraft\\applyeuddraft.py\", line 227, in applyEUDDraft\n  File \"D:\\a\\euddraft\\euddraft\\.venv\\Lib\\site-packages\\eudplib\\core\\mapdata\\fixmapdata.py\", line 98, in _fix_mtxm_0_0_null\n  File \"D:\\a\\euddraft\\euddraft\\.venv\\Lib\\site-packages\\eudplib\\utils\\eperror.py\", line 41, in ep_warn\n  File \"D:\\a\\euddraft\\euddraft\\applyeuddraft.py\", line 114, in warn_with_traceback\nD:\\a\\euddraft\\euddraft\\.venv\\Lib\\site-packages\\eudplib\\utils\\eperror.py:41: EPWarning: [Warning] Input map has 0000.00 null tiles\nReplaced them to 0000.01, because they cause desync.\n";
+
+    #[test]
+    fn warning_stacks_are_warnings_and_a_fresh_zero_exit_build_stays_ok() {
+        let root = std::env::temp_dir().join("eud-agent-build-warning-stack");
+        let eds_dir = root.join("build/euddraft");
+        fs::create_dir_all(&eds_dir).unwrap();
+        let stdout = format!(
+            "Saving to ../[EUD]rpg.scx...\nNull tiles at: {} - Allocating objects..\nOutput scenario.chk : 1.794MB\n",
+            (0..65_056).map(|i| format!("({}, {})", i % 256, i / 256)).collect::<Vec<_>>().join(", ")
+        );
+        let stderr = format!("{NULL_TILE_WARNING_STACK}{NULL_TILE_WARNING_STACK}");
+        let result = assemble_build_result(
+            CapturedProcess {
+                success: true,
+                raw_status: 0,
+                stdout,
+                stderr,
+            },
+            true,
+            synthetic_artifacts(&root),
+            &root,
+            &eds_dir,
+            Ok(String::new()),
+        );
+        assert!(result.ok, "{:?}", result.errors);
+        assert!(result.errors.is_empty());
+        // Two identical stacks merge into one warning that counts both.
+        assert_eq!(result.warnings.len(), 1);
+        let warning = &result.warnings[0];
+        assert_eq!(warning.count, 2);
+        assert_eq!(warning.source, "euddraft");
+        assert_eq!(
+            warning.message,
+            "EPWarning: [Warning] Input map has 0000.00 null tiles\nReplaced them to 0000.01, because they cause desync."
+        );
+        for warning in &result.warnings {
+            assert!(warning
+                .raw
+                .trim_start()
+                .starts_with("File \"src/freeze_core"));
+        }
+        assert!(warning.raw.chars().count() <= DIAGNOSTIC_RAW_LIMIT + 64);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn epscript_compile_errors_keep_their_source_file_and_line() {
+        let root = std::env::temp_dir().join("eud-agent-build-compile-errors");
+        let eds_dir = root.join("build/euddraft");
+        fs::create_dir_all(&eds_dir).unwrap();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/main.eps"), b"function onPluginStart() {\n").unwrap();
+        let stdout = "Loading plugin ../../src/main.eps...\n[epScript] Compiling \"..\\..\\src\\main.eps\"...\n==========================================\nPress Enter to continue...\n";
+        let stderr = format!(
+            "[Error -2] Module \"main\" Line 2 : General syntax error\n[Error 6298] Module \"main\" Line 4 : Block not terminated properly.\n[Error] Error loading plugin \"../../src/main.eps\" Traceback (most recent call last):\neudplib.utils.eperror.EPError:  - Compiled failed for {}\n\nDuring handling of the above exception, another exception occurred:\n\nTraceback (most recent call last):\n  File \"D:\\a\\euddraft\\euddraft\\applyeuddraft.py\", line 209, in applyEUDDraft\n  File \"D:\\a\\euddraft\\euddraft\\pluginLoader.py\", line 225, in loadPluginsFromConfig\nRuntimeError: Error loading plugin \"../../src/main.eps\"\n",
+            root.join("src/main.eps").display()
+        );
+        let diagnostics = parse_euddraft_output(stdout, &stderr, &root, &eds_dir);
+        assert!(diagnostics.warnings.is_empty());
+        let compile: Vec<_> = diagnostics
+            .errors
+            .iter()
+            .filter(|error| error.source == "epScript")
+            .collect();
+        assert_eq!(compile.len(), 2);
+        assert_eq!(compile[0].file, "src/main.eps");
+        assert_eq!(compile[0].line, 2);
+        assert_eq!(compile[0].message, "General syntax error");
+        assert_eq!(compile[1].line, 4);
+        assert_eq!(compile[1].message, "Block not terminated properly.");
+        let tracebacks: Vec<_> = diagnostics
+            .errors
+            .iter()
+            .filter(|error| error.source == "euddraft")
+            .collect();
+        assert_eq!(tracebacks.len(), 2);
+        assert!(tracebacks[0]
+            .message
+            .starts_with("eudplib.utils.eperror.EPError:  - Compiled failed for"));
+        assert_eq!(tracebacks[0].file, "src/main.eps");
+        assert_eq!(
+            tracebacks[1].message,
+            "RuntimeError: Error loading plugin \"../../src/main.eps\""
+        );
+        assert_eq!(tracebacks[1].line, 225);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn epscript_runtime_errors_point_at_the_innermost_eps_frame() {
+        let root = std::env::temp_dir().join("eud-agent-build-runtime-error");
+        let eds_dir = root.join("build/euddraft");
+        fs::create_dir_all(&eds_dir).unwrap();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("src/zones.eps"),
+            b"const A = $L(\"Spawn Point\");\n",
+        )
+        .unwrap();
+        let stderr = format!(
+            "[Error] Cannot encode string Spawn Point as location. Traceback (most recent call last):\n  File \"D:\\a\\euddraft\\euddraft\\pluginLoader.py\", line 200, in loadPluginsFromConfig\n  File \"{}\", line 4, in <module>\n  File \"D:\\a\\euddraft\\euddraft\\.venv\\Lib\\site-packages\\eudplib\\core\\mapdata\\stringmap.py\", line 90, in EncodeLocation\neudplib.utils.eperror.EPError: Cannot encode string Spawn Point as location.\n",
+            root.join("src/zones.eps").display()
+        );
+        let diagnostics = parse_euddraft_output("", &stderr, &root, &eds_dir);
+        assert_eq!(diagnostics.errors.len(), 1);
+        let error = &diagnostics.errors[0];
+        assert_eq!(error.file, "src/zones.eps");
+        assert_eq!(error.line, 4);
+        assert_eq!(
+            error.message,
+            "eudplib.utils.eperror.EPError: Cannot encode string Spawn Point as location."
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn output_excerpt_cuts_long_lines_and_keeps_head_and_tail() {
+        let short = output_excerpt("hello\nworld", "");
+        assert_eq!(
+            short,
+            "[stdout: 2 lines, 11 chars]\nhello\nworld\n[stderr: 0 lines, 0 chars]\n"
+        );
+
+        let giant_line = "x".repeat(700_000);
+        let many_lines = (0..2_000)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let excerpt = output_excerpt(&format!("head\n{giant_line}\n{many_lines}\ntail"), "warn");
+        assert!(excerpt.chars().count() < 2 * EXCERPT_STREAM_LIMIT);
+        assert!(excerpt.contains("head\n"));
+        assert!(excerpt.contains("[… line cut, 699600 more chars]"));
+        assert!(excerpt
+            .contains("lines elided; full text in build/euddraft/build.log via build_log_read"));
+        assert!(excerpt.ends_with("line 1999\ntail\n[stderr: 1 lines, 4 chars]\nwarn\n"));
+    }
+
+    #[test]
+    fn warnings_never_rescue_a_nonzero_exit_and_plain_shapes_parse() {
+        let root = std::env::temp_dir().join("eud-agent-build-warning-nonzero");
+        let eds_dir = root.join("build/euddraft");
+        fs::create_dir_all(&eds_dir).unwrap();
+        // Only warnings, exit 1, no fresh output: the build fails with a synthetic error.
+        let result = assemble_build_result(
+            CapturedProcess {
+                success: false,
+                raw_status: 1,
+                stdout: String::new(),
+                stderr: NULL_TILE_WARNING_STACK.to_string(),
+            },
+            false,
+            synthetic_artifacts(&root),
+            &root,
+            &eds_dir,
+            Ok(String::new()),
+        );
+        assert!(!result.ok);
+        assert_eq!(result.errors.len(), 1);
+        assert!(result.errors[0].message.contains("0x00000001"));
+        assert_eq!(result.warnings.len(), 1);
+
+        // Empty output with exit 0 and no fresh map is still a failure, with nothing parsed.
+        let empty = parse_euddraft_output("", "", &root, &eds_dir);
+        assert_eq!(empty, EuddraftDiagnostics::default());
+
+        // A plain `[Warning]` line, CRLF endings, and a failed log write are all reported.
+        let result = assemble_build_result(
+            CapturedProcess {
+                success: true,
+                raw_status: 0,
+                stdout:
+                    "Loading plugin\r\n[Warning] Unused manifest keys in [main]: foo\r\nDone\r\n"
+                        .to_string(),
+                stderr: String::new(),
+            },
+            true,
+            synthetic_artifacts(&root),
+            &root,
+            &eds_dir,
+            Err("disk full".to_string()),
+        );
+        assert!(result.ok);
+        assert_eq!(result.warnings.len(), 2);
+        assert_eq!(
+            result.warnings[0].message,
+            "Warning: Unused manifest keys in [main]: foo"
+        );
+        assert_eq!(result.warnings[1].source, "eud-agent");
+        assert_eq!(result.warnings[1].message, "disk full");
+        assert_eq!(result.log_path, "");
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn multi_line_error_prefix_and_launcher_eof_are_classified() {
+        let root = std::env::temp_dir().join("eud-agent-build-multiline-error");
+        let eds_dir = root.join("build/euddraft");
+        fs::create_dir_all(&eds_dir).unwrap();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/main.eps"), b"// main\n").unwrap();
+        // euddraft prints `[Error] {err}` where err spans two lines, then the header on the
+        // second line, then the traceback; finally its `input()` fails on the closed stdin.
+        let stderr = format!(
+            "[Error] first line of the message\nsecond line of the message Traceback (most recent call last):\n  File \"{}\", line 9, in <module>\neudplib.utils.eperror.EPError: first line of the message\nsecond line of the message\nTraceback (most recent call last):\n  File \"D:\\a\\euddraft\\euddraft\\euddraft.py\", line 138, in <module>\nEOFError: EOF when reading a line\n",
+            root.join("src/main.eps").display()
+        );
+        let diagnostics = parse_euddraft_output("", &stderr, &root, &eds_dir);
+        assert_eq!(diagnostics.errors.len(), 1, "{:?}", diagnostics.errors);
+        let error = &diagnostics.errors[0];
+        assert_eq!(error.file, "src/main.eps");
+        assert_eq!(error.line, 9);
+        assert_eq!(
+            error.message,
+            "eudplib.utils.eperror.EPError: first line of the message\nsecond line of the message"
+        );
+        assert_eq!(diagnostics.warnings.len(), 1);
+        assert!(diagnostics.warnings[0].message.starts_with(
+            "EOFError: EOF when reading a line — euddraft's post-failure console prompt"
+        ));
+
+        // The same EOFError with a project frame stays an error.
+        let stderr = format!(
+            "Traceback (most recent call last):\n  File \"{}\", line 3, in <module>\nEOFError: EOF when reading a line\n",
+            root.join("src/main.eps").display()
+        );
+        let diagnostics = parse_euddraft_output("", &stderr, &root, &eds_dir);
+        assert_eq!(diagnostics.errors.len(), 1);
+        assert!(diagnostics.warnings.is_empty());
+
+        // A traceback header while frames are pending flushes them as an unterminated error.
+        let stderr = "  File \"D:\\x\\y.py\", line 1, in f\nTraceback (most recent call last):\n  File \"D:\\x\\z.py\", line 2, in g\nRuntimeError: boom\n";
+        let diagnostics = parse_euddraft_output("", stderr, &root, &eds_dir);
+        assert_eq!(diagnostics.errors.len(), 2);
+        assert!(diagnostics.errors[0]
+            .message
+            .starts_with("unterminated euddraft stack"));
+        assert_eq!(diagnostics.errors[1].message, "RuntimeError: boom");
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn verbatim_root_prefix_does_not_hide_project_files_that_no_longer_exist() {
+        let root = std::env::temp_dir().join("eud-agent-build-verbatim-root");
+        let eds_dir = root.join("build/euddraft");
+        fs::create_dir_all(&eds_dir).unwrap();
+        let canonical_root = fs::canonicalize(&root).unwrap();
+        let missing = root.join("src/gone.eps");
+        let (file, in_project) =
+            resolve_traceback_file(&missing.to_string_lossy(), &canonical_root, &eds_dir);
+        assert_eq!(file, "src/gone.eps");
+        assert!(in_project);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn bound_text_keeps_head_and_tail_within_limit() {
+        assert_eq!(bound_text("short", 100), "short");
+        let bounded = bound_text(&"ab".repeat(1_000), 100);
+        assert!(bounded.starts_with("abab"));
+        assert!(bounded.ends_with("abab"));
+        assert!(bounded.contains("[… 1900 characters elided …]"));
     }
 
     #[test]
@@ -2314,15 +3382,121 @@ mod tests {
             EuddraftLaunch::resolve(Path::new(&std::env::var("EUD_AGENT_EUDDRAFT").unwrap()))
                 .unwrap();
 
-        let result = run_native_build(&project, &compat_root(), &euddraft).unwrap();
-
-        assert!(result.ok, "{:?}", result.errors);
-        assert!(root.join("build/output.scx").is_file());
+        let mut revisions = std::collections::BTreeSet::new();
+        let mut final_result = None;
+        for cycle in 1..=4 {
+            project
+                .write_source(
+                    "src/main.eps",
+                    &format!(
+                        "// autonomous real-build cycle {cycle}\nfunction onPluginStart() {{}}\n"
+                    ),
+                )
+                .unwrap();
+            revisions.insert(project.revision().unwrap());
+            let result = run_native_build(&project, &compat_root(), &euddraft).unwrap();
+            assert!(result.ok, "cycle {cycle}: {:?}", result.errors);
+            assert!(root.join("build/output.scx").is_file());
+            final_result = Some(result);
+        }
+        assert_eq!(revisions.len(), 4);
+        let result = final_result.unwrap();
+        // The complete run output is persisted next to the EDS for build_log_read.
+        assert_eq!(result.log_path, path_text(&build_log_path(project.root())));
+        let log = fs::read_to_string(&result.log_path).unwrap();
+        eprintln!(
+            "real build: {} errors, {} warnings, log {} bytes",
+            result.errors.len(),
+            result.warnings.len(),
+            log.len()
+        );
+        assert!(log.starts_with("# euddraft build log\n# exit status: 0x00000000\n"));
+        assert!(log.contains("# ===== stdout =====\n"));
+        assert!(log.contains("# ===== stderr =====\n"));
+        assert!(log.contains(&result.stdout));
+        for warning in &result.warnings {
+            assert!(!warning.message.is_empty());
+            assert!(log.contains(warning.message.lines().next().unwrap()));
+        }
         let eds = fs::read_to_string(&result.artifacts.eds_path).unwrap();
         assert!(
             eds.find("[../../src/direct.py]").unwrap() < eds.find("[../../src/main.eps]").unwrap()
         );
         assert!(!eds.contains("helper.py]"));
         fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn resolve_rejects_a_corrupt_managed_install_and_accepts_an_intact_one() {
+        let base = std::env::temp_dir().join(format!(
+            "eud-agent-resolve-integrity-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let exe_sha = crate::bootstrap::sha256_hex_bytes(b"managed");
+
+        // App-managed install: nearest ancestor marker drives full manifest re-validation.
+        let managed = base.join("sha256-managed");
+        fs::create_dir_all(&managed).unwrap();
+        let managed_exe = managed.join("euddraft.exe");
+        fs::write(&managed_exe, b"managed").unwrap();
+        let marker = |files: serde_json::Value| {
+            serde_json::json!({
+                "version": "v0.10.2.5",
+                "archive_sha256": exe_sha,
+                "executable": "euddraft.exe",
+                "files": files,
+            })
+        };
+        let intact = serde_json::json!([
+            { "path": "euddraft.exe", "sha256": exe_sha, "bytes": 7 }
+        ]);
+        let damaged = serde_json::json!([
+            { "path": "euddraft.exe", "sha256": exe_sha, "bytes": 7 },
+            { "path": "python3.dll", "sha256": exe_sha, "bytes": 7 },
+        ]);
+
+        // Corrupt: a declared dependency is missing → resolve refuses and names the file.
+        fs::write(
+            managed.join(".euddraft-install.json"),
+            marker(damaged).to_string(),
+        )
+        .unwrap();
+        let corrupt_error = EuddraftLaunch::resolve(&managed_exe).unwrap_err();
+        assert!(
+            corrupt_error.contains("corrupt"),
+            "expected a corrupt-install error, got: {corrupt_error}"
+        );
+        assert!(
+            corrupt_error.contains("python3.dll"),
+            "error must name the missing file, got: {corrupt_error}"
+        );
+        assert!(EuddraftLaunch::resolve(&managed).is_err());
+
+        // Intact: every declared file present with exact size/sha → resolve succeeds.
+        fs::write(
+            managed.join(".euddraft-install.json"),
+            marker(intact).to_string(),
+        )
+        .unwrap();
+        assert!(matches!(
+            EuddraftLaunch::resolve(&managed_exe).unwrap(),
+            EuddraftLaunch::Executable(path) if path == managed_exe
+        ));
+        assert!(matches!(
+            EuddraftLaunch::resolve(&managed).unwrap(),
+            EuddraftLaunch::Executable(_)
+        ));
+
+        // Manual distribution: no ancestor marker → validation is skipped, resolve succeeds.
+        let manual = base.join("manual");
+        fs::create_dir_all(&manual).unwrap();
+        let manual_exe = manual.join("euddraft.exe");
+        fs::write(&manual_exe, b"managed").unwrap();
+        assert!(matches!(
+            EuddraftLaunch::resolve(&manual_exe).unwrap(),
+            EuddraftLaunch::Executable(path) if path == manual_exe
+        ));
+
+        fs::remove_dir_all(base).ok();
     }
 }

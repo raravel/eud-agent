@@ -133,6 +133,39 @@ describe("ConversationLog — entries", () => {
     expect(screen.getByText("오류: editor busy")).toBeInTheDocument();
   });
 
+  it("clamps a detailed row's text and folds its detail behind a 자세히 toggle", () => {
+    const detail = ["- 기준 A (unmet: 증거)", "- step S2 is missing"].join("\n");
+    const log = [
+      {
+        id: 1,
+        kind: "warn" as const,
+        text: "검증 실패 — 미충족 2건 · 요약 문장",
+        detail,
+      },
+    ];
+    render(<ConversationLog log={log} phase="ready" />);
+    const text = screen.getByTestId("log-entry-detailed-text");
+    expect(text).toHaveTextContent("검증 실패 — 미충족 2건 · 요약 문장");
+    expect(text.className).toContain("line-clamp-2");
+    expect(screen.queryByText(/기준 A/)).not.toBeInTheDocument();
+
+    const toggle = screen.getByRole("button", { name: "자세히" });
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+    fireEvent.click(toggle);
+    expect(toggle).toHaveAttribute("aria-expanded", "true");
+    expect(toggle).toHaveTextContent("접기");
+    expect(text.className).not.toContain("line-clamp-2");
+    const box = document.getElementById("log-detail-1");
+    expect(box).toHaveTextContent("기준 A");
+    expect(box).toHaveTextContent("step S2 is missing");
+    expect(box?.className).toContain("max-h-64");
+    expect(box?.className).toContain("overflow-y-auto");
+
+    fireEvent.click(toggle);
+    expect(text.className).toContain("line-clamp-2");
+    expect(screen.queryByText(/기준 A/)).not.toBeInTheDocument();
+  });
+
   it("offers an edit action for user messages", () => {
     const store = createPanelStore();
     store.log("you", "수정할 요청");
@@ -235,7 +268,10 @@ describe("ConversationLog — inline agent stream (EUD-069)", () => {
     store.chatSent();
     store.agentEvent("item_started", "item_1");
     store.agentEvent("delta", "먼저 확인합니다.");
-    store.agentEvent("tool_call", "search_docs", { args: "{}" });
+    store.agentEvent("tool_call", "search_docs", {
+      callId: "search-call",
+      args: "{}",
+    });
     store.agentEvent("item_started", "item_3");
     store.agentEvent("delta", "적용했습니다.");
     const { container } = render(
@@ -258,8 +294,12 @@ describe("ConversationLog — inline agent stream (EUD-069)", () => {
   it("renders an archived tools entry as expandable Tool cards", () => {
     const store = createPanelStore();
     store.chatSent();
-    store.agentEvent("tool_call", "dat_set", { args: "{}" });
+    store.agentEvent("tool_call", "dat_set", {
+      callId: "dat-set-call",
+      args: "{}",
+    });
     store.agentEvent("tool_result", "dat_set", {
+      callId: "dat-set-call",
       result: "OK",
       status: "completed",
     });

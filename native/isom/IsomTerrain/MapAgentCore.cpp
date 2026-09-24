@@ -50,10 +50,14 @@ static unsigned long GetFileAttributesA(const char* path)
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <initializer_list>
 #include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
+#ifdef _WIN32
+#include <share.h>
+#endif
 #include <set>
 #include <optional>
 #include <sstream>
@@ -66,6 +70,7 @@ namespace {
 constexpr const char* EditSchema = "eud-map-edit/1";
 constexpr const char* RenderSchema = "eud-map-render/1";
 constexpr const char* CatalogSchema = "eud-map-catalog/1";
+constexpr const char* NewSchema = "eud-map-new/1";
 constexpr std::size_t MaxOperations = 4096;
 
 [[noreturn]] void fail(const std::string& message)
@@ -155,9 +160,22 @@ std::string sha256Bytes(const void* data, std::size_t size)
     return sha(data, size);
 }
 
+#ifdef _WIN32
+std::wstring utf8Wide(const std::string& text);
+#endif
+
 std::string readFileSha256(const std::string& path)
 {
+#ifdef _WIN32
+    const std::wstring widePath = utf8Wide(path);
+    std::unique_ptr<FILE, decltype(&std::fclose)> inputFile(
+        _wfsopen(widePath.c_str(), L"rbN", _SH_DENYNO), &std::fclose);
+    if ( inputFile == nullptr )
+        fail("cannot open input map: " + path);
+    std::ifstream input(inputFile.get());
+#else // POSIX paths are UTF-8 bytes already
     std::ifstream input(path, std::ios::binary);
+#endif
     if ( !input )
         fail("cannot open input map: " + path);
     SHA256 sha;
@@ -243,7 +261,11 @@ struct Assets {
     std::vector<std::vector<StarImage>> starLayers;
     std::vector<Sc::Sprite::DatEntry> spriteEntries;
     std::vector<Sc::Sprite::ImageDatEntry> imageEntries;
+    // CV5 entries past the 1024 tile groups, one per doodad *row*; a doodad's
+    // rows are consecutive entries starting at `doodadStartGroups[ddDataIndex]`.
     std::array<std::vector<Sc::Terrain::Doodad>, Sc::Terrain::NumTilesets> doodadsByTileset;
+    // DD2 doodad id (the CV5 `ddDataIndex`) -> absolute CV5 group index of its first row.
+    std::array<std::map<std::uint16_t, std::uint16_t>, Sc::Terrain::NumTilesets> doodadStartGroups;
     std::map<std::size_t, std::unique_ptr<Sc::Sprite::Grp>> grpCache;
     std::mutex grpMutex;
 
@@ -369,6 +391,20 @@ struct Assets {
             const std::size_t count = (data->size() - offset) / sizeof(Sc::Terrain::Doodad);
             const auto* records = reinterpret_cast<const Sc::Terrain::Doodad*>(data->data() + offset);
             doodadsByTileset[tileset].assign(records, records + count);
+            // Same rule as Chkdraft's doodadIdToTileGroup: the first named
+            // doodad entry carrying a ddDataIndex is that doodad's first row.
+            auto& starts = doodadStartGroups[tileset];
+            starts.clear();
+            for ( std::size_t row = 0; row < count; ++row )
+            {
+                const auto& record = records[row];
+                if ( record.index != 1 || record.doodadName == 0 )
+                    continue;
+                const std::size_t group = Sc::Terrain::Cv5Dat::MaxTileGroups + row;
+                if ( group > std::numeric_limits<std::uint16_t>::max() )
+                    break;
+                starts.try_emplace(record.ddDataIndex, static_cast<std::uint16_t>(group));
+            }
         }
         return true;
     }
@@ -376,6 +412,11 @@ struct Assets {
     const std::vector<Sc::Terrain::Doodad>& doodads(Sc::Terrain::Tileset tileset) const
     {
         return doodadsByTileset[static_cast<std::size_t>(tileset) % doodadsByTileset.size()];
+    }
+
+    const std::map<std::uint16_t, std::uint16_t>& doodadStarts(Sc::Terrain::Tileset tileset) const
+    {
+        return doodadStartGroups[static_cast<std::size_t>(tileset) % doodadStartGroups.size()];
     }
 
     const Sc::Sprite::DatEntry& sprite(std::size_t index) const
@@ -498,6 +539,88 @@ void setExactTile(MapFile& map, std::size_t x, std::size_t y, std::uint16_t tile
     map.editorTiles[index] = tile;
 }
 
+// ISOM diamond grid: rect columns 0..=W/2 and rows 0..=H; diamond (x, y) exists only when x + y
+// is even and its four quadrant rects cover tiles [2x-2, 2x+1] x [y-1, y].
+void requireIsomSection(const MapFile& map, const std::string& context)
+{
+    const std::size_t expected = (map.getTileWidth() / 2 + 1) * (map.getTileHeight() + 1);
+    if ( map.isomRects.size() != expected )
+    {
+        fail(context + ": map has no usable ISOM section (" + std::to_string(map.isomRects.size()) + " of " +
+            std::to_string(expected) + " rects); semantic brushes need ISOM data, use exact tiles (terrain.rect/terrain.blit) or a stamp instead");
+    }
+}
+
+// Seed one ISOM operation's subtile variation from its own parameters so every
+// replay of the same operation reproduces the same tiles while distinct
+// placements still vary from each other.
+std::uint32_t isomVariationSeed(std::initializer_list<std::size_t> parts)
+{
+    std::uint32_t hash = 2166136261u; // FNV-1a over the little-endian parameter bytes
+    for ( std::size_t part : parts )
+    {
+        for ( std::size_t byte = 0; byte < sizeof(part); ++byte )
+        {
+            hash ^= static_cast<std::uint32_t>((part >> (8 * byte)) & 0xFFu);
+            hash *= 16777619u;
+        }
+    }
+    return hash;
+}
+
+void requireIsomBrush(const Chk::IsomCache& cache, std::size_t brush, const std::string& context)
+{
+    const std::uint16_t isomValue = cache.getTerrainTypeIsomValue(brush);
+    if ( isomValue == 0 || std::size_t(isomValue) >= cache.isomLinks.size() || cache.isomLinks[std::size_t(isomValue)].terrainType == 0 )
+    {
+        fail(context + ": brush " + std::to_string(brush) +
+            " is not a semantic ISOM brush of this tileset; use an id returned by map_palette_query kind=brushes");
+    }
+}
+
+void requireIsomDiamond(const MapFile& map, std::size_t isomX, std::size_t isomY, const std::string& context)
+{
+    const std::size_t maxX = map.getTileWidth() / 2;
+    const std::size_t maxY = map.getTileHeight();
+    const std::string diamond = "ISOM diamond (" + std::to_string(isomX) + ", " + std::to_string(isomY) + ")";
+    if ( isomX > maxX || isomY > maxY )
+    {
+        fail(context + ": " + diamond + " is outside the ISOM grid isomX 0.." + std::to_string(maxX) + ", isomY 0.." +
+            std::to_string(maxY) + " (isomX is a tile x / 2, isomY is a tile y)");
+    }
+    if ( (isomX + isomY) % 2 != 0 )
+        fail(context + ": " + diamond + " is not on the diamond lattice: isomX + isomY must be even (shift isomX or isomY by 1)");
+}
+
+// Every diamond whose 4x2 tile footprint lies inside the rectangle; the transition ring the
+// brush generates around them lands on the rectangle border and just outside it.
+std::vector<Chk::IsomDiamond> isomDiamondsInside(std::size_t x, std::size_t y, std::size_t width, std::size_t height)
+{
+    std::vector<Chk::IsomDiamond> diamonds;
+    const std::size_t right = x + width;
+    const std::size_t bottom = y + height;
+    for ( std::size_t dy = y + 1; dy < bottom; ++dy )
+    {
+        for ( std::size_t dx = (x + 3) / 2; 2 * dx + 2 <= right; ++dx )
+        {
+            if ( (dx + dy) % 2 == 0 )
+                diamonds.push_back(Chk::IsomDiamond{dx, dy});
+        }
+    }
+    return diamonds;
+}
+
+std::size_t countTileChanges(const std::vector<u16>& before, const std::vector<u16>& after)
+{
+    std::size_t changed = 0;
+    for ( std::size_t i = 0; i < before.size() && i < after.size(); ++i )
+    {
+        if ( before[i] != after[i] )
+            ++changed;
+    }
+    return changed;
+}
+
 std::string unitFingerprint(const Chk::Unit& unit)
 {
     return sha256Bytes(&unit, sizeof(unit));
@@ -596,59 +719,145 @@ std::string rawStringFromHex(const std::string& text, const std::string& context
 {
     const auto bytes = decodeHex(text, context);
     if ( std::find(bytes.begin(), bytes.end(), 0) != bytes.end() )
-        fail(context + ": location names cannot contain NUL");
+        fail(context + ": map text cannot contain NUL");
+    if ( bytes.empty() )
+        return std::string();
     return std::string(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+}
+
+// Scenario title/description and force names arrive pre-encoded from Rust (CP949
+// or UTF-8 per the string table) and are written verbatim; only the byte-length
+// contract is enforced here.
+std::string mapTextFromHex(const std::string& text, const std::string& context, std::size_t minBytes, std::size_t maxBytes)
+{
+    const std::string raw = rawStringFromHex(text, context);
+    if ( raw.size() < minBytes || raw.size() > maxBytes )
+        fail(context + ": byte length must be within " + std::to_string(minBytes) + ".." + std::to_string(maxBytes));
+    return raw;
+}
+
+Sc::Player::SlotType parseSlotType(const std::string& value, const std::string& context)
+{
+    if ( value == "human" ) return Sc::Player::SlotType::Human;
+    if ( value == "computer" ) return Sc::Player::SlotType::Computer;
+    if ( value == "rescuable" ) return Sc::Player::SlotType::RescuePassive;
+    if ( value == "neutral" ) return Sc::Player::SlotType::Neutral;
+    if ( value == "inactive" ) return Sc::Player::SlotType::Inactive;
+    if ( value == "closed" ) return Sc::Player::SlotType::GameClosed;
+    fail(context + ": unsupported slot type '" + value + "'");
+}
+
+Chk::Race parseRace(const std::string& value, const std::string& context)
+{
+    if ( value == "zerg" ) return Chk::Race::Zerg;
+    if ( value == "terran" ) return Chk::Race::Terran;
+    if ( value == "protoss" ) return Chk::Race::Protoss;
+    if ( value == "userSelectable" ) return Chk::Race::UserSelectable;
+    if ( value == "random" ) return Chk::Race::Random;
+    if ( value == "independent" ) return Chk::Race::Independent;
+    if ( value == "neutral" ) return Chk::Race::Neutral;
+    if ( value == "inactive" ) return Chk::Race::Inactive;
+    fail(context + ": unsupported race '" + value + "'");
+}
+
+// Force flag bits as FORC stores them; each optional boolean rewrites one bit.
+void applyForceFlag(std::uint8_t& flags, const Json::Object& operation, const char* field, std::uint8_t bit, const std::string& context)
+{
+    const Json* value = optionalField(operation, field);
+    if ( value == nullptr )
+        return;
+    if ( boolValue(*value, context + "." + field) )
+        flags = static_cast<std::uint8_t>(flags | bit);
+    else
+        flags = static_cast<std::uint8_t>(flags & ~bit);
+}
+
+// One tileset doodad as StarCraft lays it out: the DD2 id is the CV5
+// `ddDataIndex`, `record` is the CV5 entry of its first row, and row `y`
+// of the footprint is CV5 group `startGroup + y`, whose `megaTileRef[x]` is
+// column `x` (0 = the doodad owns no tile there and the terrain stays).
+struct DoodadShape {
+    std::uint16_t id;
+    std::size_t startGroup;
+    const Sc::Terrain::Doodad* record;
+
+    std::size_t width() const { return record->doodadWidth; }
+    std::size_t height() const { return record->doodadHeight; }
+};
+
+DoodadShape resolveDoodad(const Assets& assets, Sc::Terrain::Tileset tileset, std::uint16_t id, const std::string& context)
+{
+    const auto& starts = assets.doodadStarts(tileset);
+    const auto found = starts.find(id);
+    if ( found == starts.end() ) fail(context + ": doodad id is not valid for this tileset");
+    const auto& doodads = assets.doodads(tileset);
+    const auto& tiles = assets.terrain.get(tileset);
+    const std::size_t startGroup = found->second;
+    const std::size_t startRow = startGroup - Sc::Terrain::Cv5Dat::MaxTileGroups;
+    if ( startRow >= doodads.size() ) fail(context + ": doodad id is not valid for this tileset");
+    const auto& record = doodads[startRow];
+    if ( record.doodadWidth == 0 || record.doodadHeight == 0 || record.doodadWidth > 16 || record.doodadHeight > 16 ||
+         startGroup + record.doodadHeight > tiles.tileGroups.size() )
+        fail(context + ": doodad footprint is invalid");
+    return DoodadShape{id, startGroup, &record};
+}
+
+// The MTXM tile the doodad places at footprint cell (x, y), or 0 when the
+// doodad leaves that cell alone.
+std::uint16_t doodadCellTile(const Sc::Terrain::Tiles& tiles, const DoodadShape& shape, std::size_t x, std::size_t y)
+{
+    const std::size_t group = shape.startGroup + y;
+    if ( x >= 16 || group >= tiles.tileGroups.size() || tiles.tileGroups[group].megaTileIndex[x] == 0 )
+        return 0;
+    return static_cast<std::uint16_t>(group * 16 + x);
+}
+
+// Top-left footprint tile of a doodad centered at (xc, yc); fails outside the map.
+std::pair<std::size_t, std::size_t> doodadFootprintOrigin(const MapFile& map, const Chk::Doodad& doodad,
+    const DoodadShape& shape, const std::string& context)
+{
+    const int centerX = static_cast<int>(doodad.xc / 32);
+    const int centerY = static_cast<int>(doodad.yc / 32);
+    const int left = centerX - static_cast<int>(shape.width() / 2);
+    const int top = centerY - static_cast<int>(shape.height() / 2);
+    if ( left < 0 || top < 0 || left + static_cast<int>(shape.width()) > static_cast<int>(map.getTileWidth()) ||
+         top + static_cast<int>(shape.height()) > static_cast<int>(map.getTileHeight()) )
+        fail(context + ": doodad footprint is outside map bounds");
+    return {static_cast<std::size_t>(left), static_cast<std::size_t>(top)};
 }
 
 void applyDoodadFootprint(MapFile& map, const Chk::Doodad& doodad, const Assets& assets, const std::string& context)
 {
     const auto& tiles = assets.terrain.get(map.getTileset());
-    const auto& doodads = assets.doodads(map.getTileset());
-    const std::size_t id = static_cast<std::size_t>(doodad.type);
-    if ( id >= doodads.size() ) fail(context + ": doodad id is not valid for this tileset");
-    const auto& record = doodads[id];
-    if ( record.doodadWidth == 0 || record.doodadHeight == 0 || record.doodadWidth * record.doodadHeight > 16 )
-        fail(context + ": doodad footprint is invalid");
-    const int centerX = static_cast<int>(doodad.xc / 32);
-    const int centerY = static_cast<int>(doodad.yc / 32);
-    const int left = centerX - static_cast<int>(record.doodadWidth / 2);
-    const int top = centerY - static_cast<int>(record.doodadHeight / 2);
-    if ( left < 0 || top < 0 || left + record.doodadWidth > static_cast<int>(map.getTileWidth()) ||
-         top + record.doodadHeight > static_cast<int>(map.getTileHeight()) )
-        fail(context + ": doodad footprint is outside map bounds");
-    for ( std::size_t y = 0; y < record.doodadHeight; ++y )
+    const DoodadShape shape = resolveDoodad(assets, map.getTileset(), doodad.type, context);
+    const auto [left, top] = doodadFootprintOrigin(map, doodad, shape, context);
+    for ( std::size_t y = 0; y < shape.height(); ++y )
     {
-        for ( std::size_t x = 0; x < record.doodadWidth; ++x )
+        for ( std::size_t x = 0; x < shape.width(); ++x )
         {
-            const std::uint16_t tile = static_cast<std::uint16_t>((Sc::Terrain::Cv5Dat::MaxTileGroups + id) * 16 + y * record.doodadWidth + x);
+            const std::uint16_t tile = doodadCellTile(tiles, shape, x, y);
+            if ( tile == 0 ) continue;
             if ( !tileGraphicsValid(tiles, tile) ) fail(context + ": doodad references invalid graphics");
-            setExactTile(map, static_cast<std::size_t>(left) + x, static_cast<std::size_t>(top) + y, tile);
+            setExactTile(map, left + x, top + y, tile);
         }
     }
 }
 
+// Restore the terrain under an old doodad footprint from `replacementTiles`,
+// a height x width matrix; cells the doodad never owned keep their tiles.
 void replaceDoodadFootprint(MapFile& map, const Chk::Doodad& doodad, const Json& replacement,
     const Assets& assets, const std::string& context)
 {
     const auto& tiles = assets.terrain.get(map.getTileset());
-    const auto& doodads = assets.doodads(map.getTileset());
-    const std::size_t id = static_cast<std::size_t>(doodad.type);
-    if ( id >= doodads.size() ) fail(context + ": doodad id is not valid for this tileset");
-    const auto& record = doodads[id];
+    const DoodadShape shape = resolveDoodad(assets, map.getTileset(), doodad.type, context);
     const auto& rows = arrayValue(replacement, context + ".replacementTiles");
-    if ( rows.size() != record.doodadHeight )
+    if ( rows.size() != shape.height() )
         fail(context + ": replacementTiles height must match the old doodad footprint");
-    const int centerX = static_cast<int>(doodad.xc / 32);
-    const int centerY = static_cast<int>(doodad.yc / 32);
-    const int left = centerX - static_cast<int>(record.doodadWidth / 2);
-    const int top = centerY - static_cast<int>(record.doodadHeight / 2);
-    if ( left < 0 || top < 0 || left + record.doodadWidth > static_cast<int>(map.getTileWidth()) ||
-         top + record.doodadHeight > static_cast<int>(map.getTileHeight()) )
-        fail(context + ": old doodad footprint is outside map bounds");
+    const auto [left, top] = doodadFootprintOrigin(map, doodad, shape, context + " (old doodad)");
     for ( std::size_t y = 0; y < rows.size(); ++y )
     {
         const auto& row = arrayValue(rows[y], context + ".replacementTiles[]");
-        if ( row.size() != record.doodadWidth )
+        if ( row.size() != shape.width() )
             fail(context + ": replacementTiles width must match the old doodad footprint");
         for ( std::size_t x = 0; x < row.size(); ++x )
         {
@@ -656,18 +865,14 @@ void replaceDoodadFootprint(MapFile& map, const Chk::Doodad& doodad, const Json&
             if ( value > std::numeric_limits<std::uint16_t>::max() ||
                  !tileGraphicsValid(tiles, static_cast<std::uint16_t>(value)) )
                 fail(context + ": replacementTiles contains invalid tile graphics");
-            setExactTile(map, static_cast<std::size_t>(left) + x,
-                static_cast<std::size_t>(top) + y, static_cast<std::uint16_t>(value));
+            if ( doodadCellTile(tiles, shape, x, y) == 0 ) continue;
+            setExactTile(map, left + x, top + y, static_cast<std::uint16_t>(value));
         }
     }
 }
 std::optional<Chk::Sprite> doodadOverlay(const MapFile& map, const Chk::Doodad& doodad, const Assets& assets, const std::string& context)
 {
-
-    const auto& doodads = assets.doodads(map.getTileset());
-    const std::size_t id = static_cast<std::size_t>(doodad.type);
-    if ( id >= doodads.size() ) fail(context + ": doodad id is not valid for this tileset");
-    const auto& record = doodads[id];
+    const auto& record = *resolveDoodad(assets, map.getTileset(), doodad.type, context).record;
     if ( (record.flags & 0x30) == 0 )
         return std::nullopt;
     Chk::Sprite sprite{};
@@ -716,12 +921,43 @@ std::string temporaryOutputPath(const std::string& output)
     return output + ".native-" + std::to_string(GetCurrentProcessId()) + "-" + std::to_string(GetTickCount64()) + ".tmp";
 }
 
+// Every path that crosses the C ABI is UTF-8 (the Rust side never re-encodes),
+// so filesystem calls must go through the wide APIs; the ANSI variants would
+// interpret those bytes in the system code page and miss non-ASCII folders.
 bool replaceFile(const std::string& source, const std::string& destination)
 {
 #ifdef _WIN32
-    return ::MoveFileExA(source.c_str(), destination.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != FALSE;
+    return ::MoveFileExW(utf8Wide(source).c_str(), utf8Wide(destination).c_str(),
+        MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != FALSE;
 #else // rename(2) atomically replaces an existing destination
     return std::rename(source.c_str(), destination.c_str()) == 0;
+#endif
+}
+
+bool fileExists(const std::string& path)
+{
+#ifdef _WIN32
+    return ::GetFileAttributesW(utf8Wide(path).c_str()) != INVALID_FILE_ATTRIBUTES;
+#else
+    return GetFileAttributesA(path.c_str()) != INVALID_FILE_ATTRIBUTES;
+#endif
+}
+
+void deleteFile(const std::string& path)
+{
+#ifdef _WIN32
+    ::DeleteFileW(utf8Wide(path).c_str());
+#else
+    DeleteFileA(path.c_str());
+#endif
+}
+
+bool copyFileNoOverwrite(const std::string& source, const std::string& destination)
+{
+#ifdef _WIN32
+    return ::CopyFileW(utf8Wide(source).c_str(), utf8Wide(destination).c_str(), TRUE) != FALSE;
+#else
+    return CopyFileA(source.c_str(), destination.c_str(), true);
 #endif
 }
 
@@ -1191,6 +1427,7 @@ Json tileEntry(const Sc::Terrain::Tiles& tiles, Sc::Terrain::Tileset tileset, st
     result.emplace("groundHeight", static_cast<std::size_t>(record.groundHeight));
     const std::size_t mega = record.megaTileIndex[variant];
     result.emplace("megaTile", mega);
+    result.emplace("nullTile", mega == 0);
     result.emplace("graphicsValid", tileGraphicsValid(tiles, tile));
     if ( mega < tiles.tileFlags.size() )
     {
@@ -1229,6 +1466,7 @@ struct CatalogFilter {
     std::optional<std::size_t> group;
     std::optional<std::size_t> variant;
     std::optional<bool> graphicsValid;
+    std::optional<bool> nullTile;
     std::optional<std::string> walkability;
     std::optional<std::size_t> groundHeight;
     std::optional<std::size_t> buildability;
@@ -1265,7 +1503,7 @@ CatalogFilter parseCatalogFilter(const Json::Object& request, const std::string&
     const auto& input = objectValue(*value, "catalog filter");
     std::set<std::string> allowed{"id"};
     if ( kind == "tiles" )
-        allowed.insert({"terrainType", "group", "variant", "graphicsValid", "walkability", "groundHeight",
+        allowed.insert({"terrainType", "group", "variant", "graphicsValid", "nullTile", "walkability", "groundHeight",
             "buildability", "ramp", "blocksView"});
     else if ( kind == "brushes" )
         allowed.insert({"terrainType", "graphicsValid", "walkability", "groundHeight", "buildability", "ramp", "blocksView"});
@@ -1290,6 +1528,7 @@ CatalogFilter parseCatalogFilter(const Json::Object& request, const std::string&
     filter.group = catalogSizeFilter(input, "group", Sc::Terrain::Cv5Dat::MaxTileGroups - 1);
     filter.variant = catalogSizeFilter(input, "variant", 15);
     filter.graphicsValid = catalogBoolFilter(input, "graphicsValid");
+    filter.nullTile = catalogBoolFilter(input, "nullTile");
     if ( const Json* walkability = optionalField(input, "walkability"); walkability != nullptr )
     {
         const std::string& name = stringValue(*walkability, "catalog filter.walkability");
@@ -1344,6 +1583,7 @@ bool catalogFilterMatches(const Json::Object& entry, const CatalogFilter& filter
            catalogSizeMatches(entry, "group", filter.group) &&
            catalogSizeMatches(entry, "variant", filter.variant) &&
            catalogBoolMatches(entry, "graphicsValid", filter.graphicsValid) &&
+           catalogBoolMatches(entry, "nullTile", filter.nullTile) &&
            catalogStringMatches(entry, "walkability", filter.walkability) &&
            catalogSizeMatches(entry, "groundHeight", filter.groundHeight) &&
            catalogSizeMatches(entry, "buildability", filter.buildability) &&
@@ -1422,17 +1662,17 @@ void renderThumbnail(const Json::Object& request, Sc::Terrain::Tileset tileset, 
     }
     if ( layer == "doodads" )
     {
-        const auto& doodads = assets.doodads(tileset);
-        if ( id >= doodads.size() ) fail("thumbnail doodad is invalid");
-        const auto& record = doodads[id];
-        const std::size_t startX = (96 - std::min<std::size_t>(record.doodadWidth * 32, 96)) / 2;
-        const std::size_t startY = (96 - std::min<std::size_t>(record.doodadHeight * 32, 96)) / 2;
-        for ( std::size_t y = 0; y < record.doodadHeight && y < 3; ++y )
+        if ( id > std::numeric_limits<std::uint16_t>::max() ) fail("thumbnail doodad is invalid");
+        const DoodadShape shape = resolveDoodad(assets, tileset, static_cast<std::uint16_t>(id), "thumbnail doodad");
+        const auto& record = *shape.record;
+        const std::size_t startX = (96 - std::min<std::size_t>(shape.width() * 32, 96)) / 2;
+        const std::size_t startY = (96 - std::min<std::size_t>(shape.height() * 32, 96)) / 2;
+        for ( std::size_t y = 0; y < shape.height() && y < 3; ++y )
         {
-            for ( std::size_t x = 0; x < record.doodadWidth && x < 3; ++x )
+            for ( std::size_t x = 0; x < shape.width() && x < 3; ++x )
             {
-                const std::uint16_t tile = static_cast<std::uint16_t>((Sc::Terrain::Cv5Dat::MaxTileGroups + id) * 16 + y * record.doodadWidth + x);
-                if ( !tileGraphicsValid(tiles, tile) ) continue;
+                const std::uint16_t tile = doodadCellTile(tiles, shape, x, y);
+                if ( tile == 0 || !tileGraphicsValid(tiles, tile) ) continue;
                 for ( std::size_t py = 0; py < 32 && startY + y * 32 + py < height; ++py )
                     for ( std::size_t px = 0; px < 32 && startX + x * 32 + px < width; ++px )
                         putTerrainPixel(rgba, width, startX + x * 32 + px, startY + y * 32 + py, tile, px, py, tiles);
@@ -1663,7 +1903,7 @@ int mapEdit(const char* inputMapPath, const char* outputMapPath, const char* sta
     const std::string outputPath(outputMapPath);
     if ( inputPath.empty() || outputPath.empty() || lowerAscii(inputPath) == lowerAscii(outputPath) )
         fail("mapedit requires distinct non-empty input and output paths");
-    ::DeleteFileA(outputPath.c_str());
+    deleteFile(outputPath);
 
     const Json root = parseJson(std::string(reinterpret_cast<const char*>(batchJson), batchLength), "map edit batch");
     const auto& object = objectValue(root, "map edit batch");
@@ -1756,16 +1996,53 @@ int mapEdit(const char* inputMapPath, const char* outputMapPath, const char* sta
         else if ( name == "terrain.isom_brush" )
         {
             exactFields(operation, {"op", "isomX", "isomY", "brush", "extent"}, context);
-            ScMap scMap = copyToScMap(map);
-            Chk::IsomCache cache(map.getTileset(), map.getTileWidth(), map.getTileHeight(), assets->isom.get(map.getTileset()));
             const std::size_t isomX = checkedSize(operation, "isomX", context);
             const std::size_t isomY = checkedSize(operation, "isomY", context);
             const std::size_t brush = checkedSize(operation, "brush", context, true);
             const std::size_t extent = checkedSize(operation, "extent", context, true);
+            requireIsomSection(map, context);
+            Chk::IsomCache cache(map.getTileset(), map.getTileWidth(), map.getTileHeight(), assets->isom.get(map.getTileset()));
+            requireIsomBrush(cache, brush, context);
+            requireIsomDiamond(map, isomX, isomY, context);
+            cache.seedSubtileVariation(isomVariationSeed({isomX, isomY, brush, extent}));
+            ScMap scMap = copyToScMap(map);
             if ( !scMap.placeIsomTerrain({isomX, isomY}, brush, extent, cache) ) fail(context + ": semantic ISOM brush placement failed");
             scMap.updateTilesFromIsom(cache);
+            const std::size_t changedTiles = countTileChanges(map.tiles, scMap.tiles);
             copyFromScMap(map, scMap);
-            effects.emplace_back(effect(name, "terrain", index));
+            Json::Object isomEffect = effect(name, "terrain", index);
+            isomEffect.insert_or_assign("diamonds", extent * extent);
+            isomEffect.insert_or_assign("changedTiles", changedTiles);
+            effects.emplace_back(std::move(isomEffect));
+        }
+        else if ( name == "terrain.isom_rect" )
+        {
+            exactFields(operation, {"op", "x", "y", "width", "height", "brush"}, context);
+            const std::size_t x = checkedSize(operation, "x", context);
+            const std::size_t y = checkedSize(operation, "y", context);
+            const std::size_t width = checkedSize(operation, "width", context, true);
+            const std::size_t height = checkedSize(operation, "height", context, true);
+            const std::size_t brush = checkedSize(operation, "brush", context, true);
+            if ( x + width > map.getTileWidth() || y + height > map.getTileHeight() ) fail(context + ": terrain rectangle is outside map");
+            requireIsomSection(map, context);
+            Chk::IsomCache cache(map.getTileset(), map.getTileWidth(), map.getTileHeight(), assets->isom.get(map.getTileset()));
+            requireIsomBrush(cache, brush, context);
+            const std::vector<Chk::IsomDiamond> diamonds = isomDiamondsInside(x, y, width, height);
+            if ( diamonds.empty() )
+            {
+                fail(context + ": terrain rectangle " + std::to_string(width) + "x" + std::to_string(height) + " at (" + std::to_string(x) + ", " +
+                    std::to_string(y) + ") holds no whole ISOM diamond (a 4x2 tile footprint on the diamond lattice); use at least 5x3 tiles");
+            }
+            cache.seedSubtileVariation(isomVariationSeed({x, y, width, height, brush}));
+            ScMap scMap = copyToScMap(map);
+            if ( !scMap.placeIsomTerrainDiamonds(diamonds, brush, cache) ) fail(context + ": semantic ISOM brush placement failed");
+            scMap.updateTilesFromIsom(cache);
+            const std::size_t changedTiles = countTileChanges(map.tiles, scMap.tiles);
+            copyFromScMap(map, scMap);
+            Json::Object isomEffect = effect(name, "terrain", index);
+            isomEffect.insert_or_assign("diamonds", diamonds.size());
+            isomEffect.insert_or_assign("changedTiles", changedTiles);
+            effects.emplace_back(std::move(isomEffect));
         }
         else if ( name == "unit.add" )
         {
@@ -1957,33 +2234,94 @@ int mapEdit(const char* inputMapPath, const char* outputMapPath, const char* sta
             if ( !blankLocation(map.getLocation(id)) ) fail(context + ": location is referenced by a trigger and cannot be deleted");
             effects.emplace_back(effect(name, "location", id));
         }
+        else if ( name == "scenario.set" )
+        {
+            allowedFields(operation, {"op", "titleBytesHex", "descriptionBytesHex"}, context);
+            const Json* titleHex = optionalField(operation, "titleBytesHex");
+            const Json* descriptionHex = optionalField(operation, "descriptionBytesHex");
+            if ( titleHex == nullptr && descriptionHex == nullptr )
+                fail(context + ": scenario.set needs titleBytesHex or descriptionBytesHex");
+            if ( titleHex != nullptr )
+                map.setScenarioName<RawString>(RawString(mapTextFromHex(stringValue(*titleHex, context + ".titleBytesHex"), context + ".titleBytesHex", 1, 1024)));
+            if ( descriptionHex != nullptr )
+                map.setScenarioDescription<RawString>(RawString(mapTextFromHex(stringValue(*descriptionHex, context + ".descriptionBytesHex"), context + ".descriptionBytesHex", 0, 4096)));
+            effects.emplace_back(effect(name, "scenario", 0));
+        }
+        else if ( name == "player.set" )
+        {
+            allowedFields(operation, {"op", "slot", "type", "race", "force"}, context);
+            const std::size_t slot = checkedSize(operation, "slot", context);
+            if ( slot >= Sc::Player::Total ) fail(context + ".slot must be within 0..11");
+            const Json* type = optionalField(operation, "type");
+            const Json* race = optionalField(operation, "race");
+            const Json* force = optionalField(operation, "force");
+            if ( type == nullptr && race == nullptr && force == nullptr )
+                fail(context + ": player.set needs type, race, or force");
+            if ( force != nullptr && slot >= Sc::Player::TotalSlots )
+                fail(context + ".force is only valid for slots 0..7");
+            // Parse every field before the first mutation so a bad value leaves the map untouched.
+            std::optional<Sc::Player::SlotType> slotType;
+            std::optional<Chk::Race> playerRace;
+            std::optional<std::size_t> forceIndex;
+            if ( type != nullptr ) slotType = parseSlotType(stringValue(*type, context + ".type"), context + ".type");
+            if ( race != nullptr ) playerRace = parseRace(stringValue(*race, context + ".race"), context + ".race");
+            if ( force != nullptr )
+            {
+                forceIndex = checkedSize(operation, "force", context);
+                if ( *forceIndex >= Chk::TotalForces ) fail(context + ".force must be within 0..3");
+            }
+            if ( slotType.has_value() ) map.setSlotType(slot, *slotType);
+            if ( playerRace.has_value() ) map.setPlayerRace(slot, *playerRace);
+            if ( forceIndex.has_value() ) map.setPlayerForce(slot, Chk::Force(*forceIndex));
+            effects.emplace_back(effect(name, "players", slot));
+        }
+        else if ( name == "force.set" )
+        {
+            allowedFields(operation, {"op", "force", "nameBytesHex", "allied", "alliedVictory", "sharedVision", "randomStart"}, context);
+            const std::size_t forceIndex = checkedSize(operation, "force", context);
+            if ( forceIndex >= Chk::TotalForces ) fail(context + ".force must be within 0..3");
+            const Json* nameHex = optionalField(operation, "nameBytesHex");
+            if ( nameHex == nullptr && optionalField(operation, "allied") == nullptr && optionalField(operation, "alliedVictory") == nullptr &&
+                 optionalField(operation, "sharedVision") == nullptr && optionalField(operation, "randomStart") == nullptr )
+                fail(context + ": force.set needs nameBytesHex or at least one flag");
+            const auto force = Chk::Force(forceIndex);
+            std::uint8_t flags = map.getForceFlags(force);
+            applyForceFlag(flags, operation, "allied", Chk::ForceFlags::RandomAllies, context);
+            applyForceFlag(flags, operation, "alliedVictory", Chk::ForceFlags::AlliedVictory, context);
+            applyForceFlag(flags, operation, "sharedVision", Chk::ForceFlags::SharedVision, context);
+            applyForceFlag(flags, operation, "randomStart", Chk::ForceFlags::RandomizeStartLocation, context);
+            if ( nameHex != nullptr )
+                map.setForceName<RawString>(force, RawString(mapTextFromHex(stringValue(*nameHex, context + ".nameBytesHex"), context + ".nameBytesHex", 1, 256)));
+            map.setForceFlags(force, flags);
+            effects.emplace_back(effect(name, "forces", forceIndex));
+        }
         else
             fail(context + ": unsupported operation '" + name + "'");
     }
 
     const AssetInventory beforeAssets = inventoryMpq(inputPath);
     const std::string temporary = temporaryOutputPath(outputPath);
-    ::DeleteFileA(temporary.c_str());
+    deleteFile(temporary);
     if ( !map.save(temporary, true, true, true, false) )
     {
-        ::DeleteFileA(temporary.c_str());
+        deleteFile(temporary);
         fail("map save failed before output promotion");
     }
     const AssetInventory afterAssets = inventoryMpq(temporary);
     if ( beforeAssets != afterAssets )
     {
-        ::DeleteFileA(temporary.c_str());
+        deleteFile(temporary);
         fail("map save changed unrelated MPQ assets");
     }
     if ( !replaceFile(temporary, outputPath) )
     {
-        ::DeleteFileA(temporary.c_str());
+        deleteFile(temporary);
         fail("map output atomic promotion failed");
     }
     MapFile verified(outputPath);
     if ( verified.empty() )
     {
-        ::DeleteFileA(outputPath.c_str());
+        deleteFile(outputPath);
         fail("saved map failed native re-open verification");
     }
     reportJson = serializeJson(Json::Object{
@@ -1994,6 +2332,231 @@ int mapEdit(const char* inputMapPath, const char* outputMapPath, const char* sta
         {"inputSha256", expectedHash},
         {"outputSha256", readFileSha256(outputPath)},
         {"extraAssetsDigest", inventoryDigest(afterAssets)}
+    });
+    return 0;
+}
+
+// Create a brand-new ISOM-consistent map in one call: fill the whole map with one
+// terrain brush, then set scenario title/description, slot types, races, forces and
+// start locations on the same in-memory MapFile before a single save. The output is
+// promoted only after native re-open verification, matching mapEdit.
+int mapNew(const char* outputMapPath, const char* starCraftPath,
+    const std::uint8_t* specJson, std::size_t specLength, std::string& reportJson)
+{
+    if ( outputMapPath == nullptr || outputMapPath[0] == '\0' || starCraftPath == nullptr ||
+         starCraftPath[0] == '\0' || specJson == nullptr || specLength == 0 )
+        fail("map new received an invalid argument");
+    const std::string outputPath(outputMapPath);
+    if ( !validMapContainerPath(outputPath) )
+        fail("map new accepts only SCX/SCM output paths");
+    if ( fileExists(outputPath) )
+        fail("map new output path must not already exist");
+
+    const Json root = parseJson(std::string(reinterpret_cast<const char*>(specJson), specLength), "map new spec");
+    const auto& spec = objectValue(root, "map new spec");
+    allowedFields(spec, {"schema", "version", "tileset", "width", "height", "terrainType", "titleBytesHex", "descriptionBytesHex",
+        "players", "forces"}, "map new spec");
+    if ( stringValue(requiredField(spec, "schema", "map new spec"), "map new spec.schema") != NewSchema )
+        fail("unsupported map new schema");
+    const std::string version = optionalField(spec, "version") == nullptr
+        ? std::string("remastered")
+        : stringValue(*optionalField(spec, "version"), "map new spec.version");
+    SaveType saveType = SaveType::RemasteredScx;
+    if ( version == "broodWar" ) saveType = SaveType::ExpansionScx;
+    else if ( version != "remastered" ) fail("map new spec.version must be remastered or broodWar");
+
+    const std::size_t tilesetIndex = checkedSize(spec, "tileset", "map new spec");
+    if ( tilesetIndex >= Sc::Terrain::NumTilesets ) fail("map new spec.tileset is out of range");
+    const auto tileset = Sc::Terrain::Tileset(tilesetIndex);
+    const std::size_t width = checkedSize(spec, "width", "map new spec", true);
+    const std::size_t height = checkedSize(spec, "height", "map new spec", true);
+    if ( width < 64 || width > 256 || height < 64 || height > 256 )
+        fail("map new spec width and height must be within 64..256");
+    const std::size_t terrainType = checkedSize(spec, "terrainType", "map new spec", true);
+    const std::string title = mapTextFromHex(stringValue(requiredField(spec, "titleBytesHex", "map new spec"), "map new spec.titleBytesHex"),
+        "map new spec.titleBytesHex", 1, 1024);
+    const std::string description = mapTextFromHex(stringValue(requiredField(spec, "descriptionBytesHex", "map new spec"), "map new spec.descriptionBytesHex"),
+        "map new spec.descriptionBytesHex", 0, 4096);
+
+    struct ForceSpec { std::string name; std::uint8_t flags; };
+    std::vector<ForceSpec> forces;
+    if ( const Json* forcesJson = optionalField(spec, "forces") )
+    {
+        const auto& forceArray = arrayValue(*forcesJson, "map new spec.forces");
+        if ( forceArray.empty() || forceArray.size() > Chk::TotalForces )
+            fail("map new spec.forces must contain 1..4 entries");
+        for ( std::size_t index = 0; index < forceArray.size(); ++index )
+        {
+            const std::string context = "map new spec.forces[" + std::to_string(index) + "]";
+            const auto& force = objectValue(forceArray[index], context);
+            exactFields(force, {"nameBytesHex", "allied", "alliedVictory", "sharedVision", "randomStart"}, context);
+            const std::string name = mapTextFromHex(stringValue(requiredField(force, "nameBytesHex", context), context + ".nameBytesHex"),
+                context + ".nameBytesHex", 1, 256);
+            std::uint8_t flags = 0;
+            if ( boolValue(requiredField(force, "allied", context), context + ".allied") ) flags |= Chk::ForceFlags::RandomAllies;
+            if ( boolValue(requiredField(force, "alliedVictory", context), context + ".alliedVictory") ) flags |= Chk::ForceFlags::AlliedVictory;
+            if ( boolValue(requiredField(force, "sharedVision", context), context + ".sharedVision") ) flags |= Chk::ForceFlags::SharedVision;
+            if ( boolValue(requiredField(force, "randomStart", context), context + ".randomStart") ) flags |= Chk::ForceFlags::RandomizeStartLocation;
+            forces.push_back({name, flags});
+        }
+    }
+    else
+        forces.push_back({"Force 1", Chk::ForceFlags::All});
+
+    struct PlayerSpec
+    {
+        std::size_t slot;
+        Sc::Player::SlotType type;
+        Chk::Race race;
+        bool hasForce;
+        std::size_t force;
+        bool hasStart;
+        std::uint16_t startX;
+        std::uint16_t startY;
+    };
+    std::vector<PlayerSpec> players;
+    if ( const Json* playersJson = optionalField(spec, "players") )
+    {
+        const auto& playerArray = arrayValue(*playersJson, "map new spec.players");
+        if ( playerArray.size() > Sc::Player::Total ) fail("map new spec.players must contain at most 12 entries");
+        std::set<std::size_t> slots;
+        for ( std::size_t index = 0; index < playerArray.size(); ++index )
+        {
+            const std::string context = "map new spec.players[" + std::to_string(index) + "]";
+            const auto& player = objectValue(playerArray[index], context);
+            allowedFields(player, {"slot", "type", "race", "force", "start"}, context);
+            PlayerSpec parsed {};
+            parsed.slot = checkedSize(player, "slot", context);
+            if ( parsed.slot >= Sc::Player::Total ) fail(context + ".slot must be within 0..11");
+            if ( !slots.insert(parsed.slot).second ) fail(context + ".slot is duplicated");
+            parsed.type = parseSlotType(stringValue(requiredField(player, "type", context), context + ".type"), context + ".type");
+            parsed.race = parseRace(stringValue(requiredField(player, "race", context), context + ".race"), context + ".race");
+            // FORC only covers the eight lobby slots: a force is mandatory there and
+            // has no storage for slots 8..11.
+            parsed.hasForce = optionalField(player, "force") != nullptr;
+            if ( parsed.slot < Sc::Player::TotalSlots )
+            {
+                if ( !parsed.hasForce ) fail(context + ".force is required for slots 0..7");
+                parsed.force = checkedSize(player, "force", context);
+                if ( parsed.force >= forces.size() ) fail(context + ".force does not name a declared force");
+            }
+            else if ( parsed.hasForce )
+                fail(context + ".force is only valid for slots 0..7");
+            parsed.hasStart = false;
+            if ( const Json* start = optionalField(player, "start") )
+            {
+                if ( parsed.slot >= Sc::Player::TotalSlots ) fail(context + ".start is only valid for slots 0..7");
+                const auto& startObject = objectValue(*start, context + ".start");
+                exactFields(startObject, {"x", "y"}, context + ".start");
+                parsed.startX = checkedU16(startObject, "x", context + ".start");
+                parsed.startY = checkedU16(startObject, "y", context + ".start");
+                if ( parsed.startX >= width * 32 || parsed.startY >= height * 32 )
+                    fail(context + ".start is outside the map");
+                parsed.hasStart = true;
+            }
+            players.push_back(parsed);
+        }
+    }
+
+    const auto assets = loadAssets(starCraftPath);
+    const auto& isomData = assets->isom.get(tileset);
+    bool brushKnown = false;
+    for ( const auto& brush : isomData.brushes )
+        brushKnown = brushKnown || brush.index == terrainType;
+    if ( !brushKnown )
+        fail("map new spec.terrainType is not a terrain brush of the selected tileset");
+
+    MapFile map(tileset, static_cast<u16>(width), static_cast<u16>(height));
+    map.setSaveType(saveType);
+    {
+        ScMap scMap = copyToScMap(map);
+        Chk::IsomCache cache(tileset, width, height, isomData);
+        cache.seedSubtileVariation(isomVariationSeed({std::size_t(tilesetIndex), width, height, terrainType}));
+        const std::uint16_t isomValue = static_cast<std::uint16_t>(
+            (cache.getTerrainTypeIsomValue(terrainType) << 4) | Chk::IsomRect::EditorFlag::Modified);
+        scMap.isomRects.assign(scMap.getIsomWidth() * scMap.getIsomHeight(),
+            Chk::IsomRect{isomValue, isomValue, isomValue, isomValue});
+        cache.setAllChanged();
+        scMap.updateTilesFromIsom(cache);
+        copyFromScMap(map, scMap);
+    }
+
+    map.setScenarioName<RawString>(RawString(title));
+    map.setScenarioDescription<RawString>(RawString(description));
+    for ( std::size_t index = 0; index < forces.size(); ++index )
+    {
+        map.setForceName<RawString>(Chk::Force(index), RawString(forces[index].name));
+        map.setForceFlags(Chk::Force(index), forces[index].flags);
+    }
+    // Every slot the spec does not mention is Inactive so the lobby matches the wizard.
+    for ( std::size_t slot = 0; slot < Sc::Player::Total; ++slot )
+        map.setSlotType(slot, Sc::Player::SlotType::Inactive);
+    std::size_t startLocations = 0;
+    for ( const auto& player : players )
+    {
+        map.setSlotType(player.slot, player.type);
+        map.setPlayerRace(player.slot, player.race);
+        if ( player.hasForce )
+            map.setPlayerForce(player.slot, Chk::Force(player.force));
+        if ( player.hasStart )
+        {
+            Chk::Unit unit {};
+            unit.type = Sc::Unit::Type::StartLocation;
+            unit.owner = static_cast<u8>(player.slot);
+            unit.xc = player.startX;
+            unit.yc = player.startY;
+            unit.hitpointPercent = 100;
+            unit.shieldPercent = 100;
+            unit.energyPercent = 100;
+            map.addUnit(unit);
+            ++startLocations;
+        }
+    }
+
+    const std::string temporary = temporaryOutputPath(outputPath);
+    deleteFile(temporary);
+    if ( !map.save(temporary, true, true, true, false) )
+    {
+        deleteFile(temporary);
+        fail("map save failed before output promotion");
+    }
+    if ( !replaceFile(temporary, outputPath) )
+    {
+        deleteFile(temporary);
+        fail("map output atomic promotion failed");
+    }
+    MapFile verified(outputPath);
+    if ( verified.empty() )
+    {
+        deleteFile(outputPath);
+        fail("saved map failed native re-open verification");
+    }
+    if ( verified.getTileset() != tileset || verified.getTileWidth() != width || verified.getTileHeight() != height )
+    {
+        deleteFile(outputPath);
+        fail("saved map header does not match the requested spec");
+    }
+    std::size_t verifiedStarts = 0;
+    for ( std::size_t index = 0; index < verified.numUnits(); ++index )
+    {
+        if ( verified.getUnit(index).type == Sc::Unit::Type::StartLocation )
+            ++verifiedStarts;
+    }
+    if ( verifiedStarts != startLocations )
+    {
+        deleteFile(outputPath);
+        fail("saved map start locations do not match the requested spec");
+    }
+    reportJson = serializeJson(Json::Object{
+        {"schema", "eud-map-new-report/1"},
+        {"ok", true},
+        {"tileset", tilesetName(tileset)},
+        {"width", width},
+        {"height", height},
+        {"terrainType", terrainType},
+        {"players", players.size()},
+        {"startLocations", startLocations},
+        {"outputSha256", readFileSha256(outputPath)}
     });
     return 0;
 }
@@ -2222,20 +2785,29 @@ int catalogQuery(const char* starCraftPath, const std::uint8_t* requestJson, std
     }
     else if ( kind == "doodads" )
     {
-        const auto& doodads = assets->doodads(tileset);
-        for ( std::size_t id = 0; id < doodads.size(); ++id )
+        // One entry per DD2 doodad id (the CV5 ddDataIndex), not per CV5 row.
+        for ( const auto& [id, startGroup] : assets->doodadStarts(tileset) )
         {
-            const auto& doodad = doodads[id];
+            const auto& doodad = assets->doodads(tileset)[startGroup - Sc::Terrain::Cv5Dat::MaxTileGroups];
             bool graphicsValid = doodad.doodadWidth > 0 && doodad.doodadHeight > 0
-                && doodad.doodadWidth * doodad.doodadHeight <= 16;
-            for ( std::size_t cell = 0; graphicsValid && cell < doodad.doodadWidth * doodad.doodadHeight; ++cell )
+                && doodad.doodadWidth <= 16 && doodad.doodadHeight <= 16
+                && static_cast<std::size_t>(startGroup) + doodad.doodadHeight <= tiles.tileGroups.size();
+            const DoodadShape shape{id, startGroup, &doodad};
+            bool ownsTile = false;
+            for ( std::size_t y = 0; graphicsValid && y < shape.height(); ++y )
             {
-                const auto tile = static_cast<std::uint16_t>((Sc::Terrain::Cv5Dat::MaxTileGroups + id) * 16 + cell);
-                graphicsValid = tileGraphicsValid(tiles, tile);
+                for ( std::size_t x = 0; graphicsValid && x < shape.width(); ++x )
+                {
+                    const std::uint16_t tile = doodadCellTile(tiles, shape, x, y);
+                    if ( tile == 0 ) continue;
+                    ownsTile = true;
+                    graphicsValid = tileGraphicsValid(tiles, tile);
+                }
             }
+            graphicsValid = graphicsValid && (ownsTile || (doodad.flags & 0x30) != 0);
             std::string name;
             if ( !assets->statTxt.getString(doodad.doodadName, name) || name.empty() ) name = "Doodad " + std::to_string(id);
-            appendEntry(Json::Object{{"id", id}, {"name", name},
+            appendEntry(Json::Object{{"id", static_cast<std::size_t>(id)}, {"name", name},
                 {"width", static_cast<std::size_t>(doodad.doodadWidth)}, {"height", static_cast<std::size_t>(doodad.doodadHeight)},
                 {"buildability", static_cast<std::size_t>(doodad.buildability)}, {"graphicsValid", graphicsValid},
                 {"overlay", (doodad.flags & 0x30) != 0}, {"overlayId", static_cast<std::size_t>(doodad.overlayIndex)},
@@ -2248,6 +2820,21 @@ int catalogQuery(const char* starCraftPath, const std::uint8_t* requestJson, std
 
     resultJson = serializeJson(Json::Object{{"schema", "eud-map-catalog-result/1"}, {"kind", kind},
         {"tileset", tilesetName(tileset)}, {"total", totalMatches}, {"offset", offset}, {"entries", std::move(page)}});
+    return 0;
+}
+
+int gameAsset(const char* starCraftPath, const char* archivePath, std::vector<std::uint8_t>& result)
+{
+    if ( starCraftPath == nullptr || archivePath == nullptr || archivePath[0] == '\0' )
+        fail("game asset request received an invalid argument");
+    // The caller names one archive-internal path (e.g. "scripts\\iscript.bin");
+    // the bytes are handed back verbatim and parsed by the caller, so this adds
+    // no second interpretation of StarCraft data here.
+    const auto assets = loadAssets(starCraftPath);
+    auto bytes = Sc::Data::GetAsset(assets->archives, std::string(archivePath));
+    if ( !bytes )
+        fail(std::string("StarCraft data has no asset: ") + archivePath);
+    result = std::move(*bytes);
     return 0;
 }
 
@@ -2403,7 +2990,7 @@ int mapSoundAdd(
         fail("destination MPQ path is not an exact managed sound path");
     if ( oggLength < 4 || std::memcmp(oggBytes, "OggS", 4) != 0 )
         fail("map sound bytes are not OGG");
-    if ( ::GetFileAttributesA(outputPath.c_str()) != INVALID_FILE_ATTRIBUTES )
+    if ( fileExists(outputPath) )
         fail("map sound output path must not already exist");
 
     const std::string inputHash = readFileSha256(inputPath);
@@ -2438,12 +3025,12 @@ int mapSoundAdd(
     std::size_t soundIndex = existingSound.first;
     std::size_t soundStringId = existingStringId;
     const std::string temporary = temporaryOutputPath(outputPath);
-    ::DeleteFileA(temporary.c_str());
+    deleteFile(temporary);
     try
     {
         if ( reused )
         {
-            if ( !::CopyFileA(inputPath.c_str(), temporary.c_str(), TRUE) )
+            if ( !copyFileNoOverwrite(inputPath, temporary) )
                 fail("cannot stage idempotent sound output");
         }
         else
@@ -2517,7 +3104,7 @@ int mapSoundAdd(
         const std::string outputHash = readFileSha256(outputPath);
         if ( outputHash != stagedOutputHash )
         {
-            ::DeleteFileA(outputPath.c_str());
+            deleteFile(outputPath);
             fail("promoted sound map output hash changed");
         }
         reportJson = serializeJson(Json::Object{
@@ -2540,8 +3127,8 @@ int mapSoundAdd(
     }
     catch ( ... )
     {
-        ::DeleteFileA(temporary.c_str());
-        ::DeleteFileA(outputPath.c_str());
+        deleteFile(temporary);
+        deleteFile(outputPath);
         throw;
     }
 }
@@ -2579,7 +3166,7 @@ int mapSoundReplace(
         fail("replacement MPQ path is not an exact managed sound path");
     if ( oggLength < 4 || std::memcmp(oggBytes, "OggS", 4) != 0 )
         fail("map sound bytes are not OGG");
-    if ( ::GetFileAttributesA(outputPath.c_str()) != INVALID_FILE_ATTRIBUTES )
+    if ( fileExists(outputPath) )
         fail("map sound output path must not already exist");
 
     const std::string inputHash = readFileSha256(inputPath);
@@ -2615,7 +3202,7 @@ int mapSoundReplace(
     const std::string beforeUnrelatedAssetDigest = inventoryDigest(beforeUnrelatedAssets);
     const std::size_t soundIndex = oldSound.first;
     const std::string temporary = temporaryOutputPath(outputPath);
-    ::DeleteFileA(temporary.c_str());
+    deleteFile(temporary);
     try
     {
         if ( !map.removeSoundBySoundIndex(static_cast<u16>(soundIndex), true) )
@@ -2686,7 +3273,7 @@ int mapSoundReplace(
         const std::string outputHash = readFileSha256(outputPath);
         if ( outputHash != stagedOutputHash )
         {
-            ::DeleteFileA(outputPath.c_str());
+            deleteFile(outputPath);
             fail("promoted sound replacement output hash changed");
         }
         reportJson = serializeJson(Json::Object{
@@ -2709,8 +3296,8 @@ int mapSoundReplace(
     }
     catch ( ... )
     {
-        ::DeleteFileA(temporary.c_str());
-        ::DeleteFileA(outputPath.c_str());
+        deleteFile(temporary);
+        deleteFile(outputPath);
         throw;
     }
 }

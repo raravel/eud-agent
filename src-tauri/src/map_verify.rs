@@ -21,6 +21,11 @@ pub struct MapRequestAuthority {
     pub map_height: u16,
     pub target_masks: Vec<SelectionMask>,
     pub forbidden_masks: Vec<SelectionMask>,
+    /// Only the Map window's properties request may change the scenario-
+    /// property sections (`chk::MAP_PROPERTY_SECTIONS`); ordinary requests
+    /// keep them as fixed authority.
+    #[serde(default)]
+    pub properties: bool,
 }
 
 pub const SUPPORTED_MAP_LAYERS: [MapLayer; 6] = [
@@ -65,7 +70,30 @@ impl MapRequestAuthority {
             map_height,
             target_masks,
             forbidden_masks,
+            properties: false,
         })
+    }
+
+    /// Authority for a Map window properties save: no target or protection
+    /// masks, and the scenario-property sections may change.
+    pub fn properties_only(
+        session_id: String,
+        request_id: String,
+        parent_revision: u32,
+        map_width: u16,
+        map_height: u16,
+    ) -> Result<Self, String> {
+        let mut authority = Self::calculate(
+            session_id,
+            request_id,
+            parent_revision,
+            map_width,
+            map_height,
+            Vec::new(),
+            Vec::new(),
+        )?;
+        authority.properties = true;
+        Ok(authority)
     }
 
     pub fn allows(&self, layer: MapLayer, x: u16, y: u16) -> bool {
@@ -194,276 +222,25 @@ impl MapVerificationService {
                 }))
             }
         };
-        let baseline_sections =
-            crate::chk::assemble_sections(&crate::chk::walk_sections(&baseline_chk));
-        let candidate_sections =
-            crate::chk::assemble_sections(&crate::chk::walk_sections(&candidate_chk));
         let canonical = crate::chk::canonical_chk_digest(&candidate_chk);
         let mut errors = Vec::<String>::new();
         let mut diff = MapDiff::default();
-
-        for section in ["DIM ", "ERA "] {
-            if baseline_sections.get(section) != candidate_sections.get(section) {
-                errors.push(format!(
-                    "{section} changed; map dimensions and tileset are immutable"
-                ));
-            }
-        }
-        let candidate_mtxm = candidate_sections
-            .get("MTXM")
-            .map(Vec::as_slice)
-            .unwrap_or(&[]);
-        let candidate_tile = candidate_sections
-            .get("TILE")
-            .map(Vec::as_slice)
-            .unwrap_or(&[]);
-        if candidate_mtxm.len() % 2 != 0 || candidate_mtxm.is_empty() {
-            errors.push("candidate MTXM is missing or truncated".to_string());
-        }
-        if candidate_mtxm != candidate_tile {
-            errors.push("candidate MTXM and TILE are not identical".to_string());
-        }
-
-        let baseline_digest = crate::chk::digest_chk(&baseline_chk);
-        let candidate_digest = crate::chk::digest_chk(&candidate_chk);
-        let width = candidate_digest.map.width;
-        let height = candidate_digest.map.height;
-        if width == 0 || height == 0 {
-            errors.push("candidate dimensions are empty".to_string());
-        }
-
-        let baseline_tiles = &baseline_digest.tiles;
-        let candidate_tiles = &candidate_digest.tiles;
-        let mut terrain_cells = Vec::<(u16, u16)>::new();
-        if baseline_tiles.len() != candidate_tiles.len() {
-            errors.push("candidate terrain cell count changed".to_string());
-        } else {
-            for (index, (&before, &after)) in baseline_tiles.iter().zip(candidate_tiles).enumerate()
-            {
-                if before == after {
-                    continue;
-                }
-                let x = (index % usize::from(width)) as u16;
-                let y = (index / usize::from(width)) as u16;
-                terrain_cells.push((x, y));
-                self.check_cell(&mut errors, &mut diff, authority, MapLayer::Terrain, x, y);
-            }
-        }
-        diff.terrain_cells = terrain_cells.len() as u32;
-        diff.terrain_bounds = bounds(&terrain_cells);
-
-        let (building_ids, extents) =
-            unit_catalog(starcraft_path, candidate_digest.map.tileset.as_str()).map_err(
-                |error| {
-                    Box::new(VerificationFailure {
-                        errors: vec![error],
-                        diff: diff.clone(),
-                        candidate_sha256: candidate_sha256.clone(),
-                        canonical_digest: canonical.overall_sha256.clone(),
-                        extra_assets_digest: String::new(),
-                    })
-                },
-            )?;
-        let baseline_units = raw_entries(&baseline_sections, "UNIT", crate::chk::UNIT_ENTRY_SIZE);
-        let candidate_units = raw_entries(&candidate_sections, "UNIT", crate::chk::UNIT_ENTRY_SIZE);
-        let unit_changes = compare_objects(
-            &baseline_units,
-            &candidate_units,
-            &mut diff.units,
-            &mut diff.buildings,
-            |bytes| {
-                let class_id = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
-                if class_id != 0 {
-                    format!("class:{class_id}")
-                } else {
-                    format!(
-                        "unit:{}:{}:{}",
-                        u16::from_le_bytes([bytes[8], bytes[9]]),
-                        bytes[16],
-                        u32::from_le_bytes(bytes[32..36].try_into().unwrap())
-                    )
-                }
-            },
-            |bytes| {
-                let placement = unit_placement(bytes);
-                let building = building_ids.contains(&placement.type_id);
-                let layer = if building {
-                    MapLayer::Buildings
-                } else {
-                    MapLayer::Units
-                };
-                let extent = extents
-                    .get(&placement.type_id)
-                    .copied()
-                    .unwrap_or(UnitExtent {
-                        left: 16,
-                        up: 16,
-                        right: 16,
-                        down: 16,
-                    });
-                let cells = pixel_rect_cells(
-                    i32::from(placement.x) - i32::from(extent.left),
-                    i32::from(placement.y) - i32::from(extent.up),
-                    i32::from(placement.x) + i32::from(extent.right),
-                    i32::from(placement.y) + i32::from(extent.down),
-                    width,
-                    height,
-                );
-                (layer, cells)
-            },
-        );
-        for (layer, cells) in unit_changes {
-            for (x, y) in cells {
-                self.check_cell(&mut errors, &mut diff, authority, layer, x, y);
-            }
-        }
-
-        let baseline_doodads = raw_entries(&baseline_sections, "DD2 ", crate::chk::DD2_ENTRY_SIZE);
-        let candidate_doodads =
-            raw_entries(&candidate_sections, "DD2 ", crate::chk::DD2_ENTRY_SIZE);
-        let mut unused = LayerDiffCount::default();
-        let doodad_changes = compare_objects(
-            &baseline_doodads,
-            &candidate_doodads,
-            &mut diff.doodads,
-            &mut unused,
-            |bytes| {
-                format!(
-                    "doodad:{}:{}",
-                    u16::from_le_bytes([bytes[0], bytes[1]]),
-                    bytes[6]
-                )
-            },
-            |bytes| {
-                let x = u16::from_le_bytes([bytes[2], bytes[3]]);
-                let y = u16::from_le_bytes([bytes[4], bytes[5]]);
-                (MapLayer::Doodads, vec![(x / 32, y / 32)])
-            },
-        );
-        for (layer, cells) in doodad_changes {
-            for (x, y) in cells {
-                self.check_cell(&mut errors, &mut diff, authority, layer, x, y);
-            }
-        }
-
-        let baseline_sprites = raw_entries(&baseline_sections, "THG2", crate::chk::THG2_ENTRY_SIZE);
-        let candidate_sprites =
-            raw_entries(&candidate_sections, "THG2", crate::chk::THG2_ENTRY_SIZE);
-        let sprite_changes = compare_objects(
-            &baseline_sprites,
-            &candidate_sprites,
-            &mut diff.sprites,
-            &mut unused,
-            |bytes| {
-                format!(
-                    "sprite:{}:{}:{}",
-                    u16::from_le_bytes([bytes[0], bytes[1]]),
-                    bytes[6],
-                    u16::from_le_bytes([bytes[8], bytes[9]]) & 0x1000
-                )
-            },
-            |bytes| {
-                let x = u16::from_le_bytes([bytes[2], bytes[3]]);
-                let y = u16::from_le_bytes([bytes[4], bytes[5]]);
-                (MapLayer::Sprites, vec![(x / 32, y / 32)])
-            },
-        );
-        for (layer, cells) in sprite_changes {
-            for (x, y) in cells {
-                self.check_cell(&mut errors, &mut diff, authority, layer, x, y);
-            }
-        }
-
-        let baseline_locations =
-            raw_entries(&baseline_sections, "MRGN", crate::chk::MRGN_ENTRY_SIZE);
-        let candidate_locations =
-            raw_entries(&candidate_sections, "MRGN", crate::chk::MRGN_ENTRY_SIZE);
-        if baseline_locations.len() != candidate_locations.len() {
-            errors
-                .push("MRGN slot count changed; location IDs would not remain stable".to_string());
-        }
-        for index in 0..baseline_locations.len().max(candidate_locations.len()) {
-            let before = baseline_locations.get(index);
-            let after = candidate_locations.get(index);
-            if before == after {
-                continue;
-            }
-            if index == 63 {
-                errors.push("location #64 Anywhere changed".to_string());
-            }
-            match (before, after) {
-                (Some(before), Some(after)) => {
-                    let before_blank = location_blank(before);
-                    let after_blank = location_blank(after);
-                    if before_blank && !after_blank {
-                        diff.locations.added += 1;
-                    } else if !before_blank && after_blank {
-                        diff.locations.removed += 1;
-                    } else {
-                        diff.locations.changed += 1;
-                    }
-                    for (x, y) in location_cells(after, width, height)
-                        .into_iter()
-                        .chain(location_cells(before, width, height))
-                    {
-                        self.check_cell(
-                            &mut errors,
-                            &mut diff,
-                            authority,
-                            MapLayer::Locations,
-                            x,
-                            y,
-                        );
-                    }
-                }
-                (None, Some(after)) => {
-                    diff.locations.added += 1;
-                    for (x, y) in location_cells(after, width, height) {
-                        self.check_cell(
-                            &mut errors,
-                            &mut diff,
-                            authority,
-                            MapLayer::Locations,
-                            x,
-                            y,
-                        );
-                    }
-                }
-                (Some(before), None) => {
-                    diff.locations.removed += 1;
-                    for (x, y) in location_cells(before, width, height) {
-                        self.check_cell(
-                            &mut errors,
-                            &mut diff,
-                            authority,
-                            MapLayer::Locations,
-                            x,
-                            y,
-                        );
-                    }
-                }
-                (None, None) => {}
-            }
-        }
-
-        let baseline_canonical = crate::chk::canonical_chk_digest(&baseline_chk);
-        for (name, baseline_hash) in &baseline_canonical.unsupported_hashes {
-            if canonical.unsupported_hashes.get(name) != Some(baseline_hash) {
-                diff.unsupported_section_changes.push(name.clone());
-            }
-        }
-        for name in canonical.unsupported_hashes.keys() {
-            if !baseline_canonical.unsupported_hashes.contains_key(name) {
-                diff.unsupported_section_changes.push(name.clone());
-            }
-        }
-        diff.unsupported_section_changes.sort();
-        diff.unsupported_section_changes.dedup();
-        if !diff.unsupported_section_changes.is_empty() {
-            errors.push(format!(
-                "unsupported CHK sections changed: {}",
-                diff.unsupported_section_changes.join(", ")
-            ));
+        if let Err(error) = self.compare_chk(
+            &baseline_chk,
+            &candidate_chk,
+            &canonical,
+            authority,
+            |tileset| unit_catalog(starcraft_path, tileset),
+            &mut errors,
+            &mut diff,
+        ) {
+            return Err(Box::new(VerificationFailure {
+                errors: vec![error],
+                diff,
+                candidate_sha256,
+                canonical_digest: canonical.overall_sha256,
+                extra_assets_digest: String::new(),
+            }));
         }
 
         let baseline_container = container_digest(baseline_path);
@@ -523,6 +300,271 @@ impl MapVerificationService {
         }
     }
 
+    /// Compare two extracted CHKs under `authority`, appending violations to
+    /// `errors` and counts to `diff`. `catalog` loads the unit DAT catalog for
+    /// the candidate tileset; its failure is the only hard error, because
+    /// unit/building extents cannot be checked without it.
+    #[allow(clippy::too_many_arguments)]
+    fn compare_chk<C>(
+        &self,
+        baseline_chk: &[u8],
+        candidate_chk: &[u8],
+        canonical: &crate::chk::CanonicalChkDigest,
+        authority: &MapRequestAuthority,
+        catalog: C,
+        errors: &mut Vec<String>,
+        diff: &mut MapDiff,
+    ) -> Result<(), String>
+    where
+        C: FnOnce(&str) -> Result<(BTreeSet<u16>, BTreeMap<u16, UnitExtent>), String>,
+    {
+        let baseline_sections =
+            crate::chk::assemble_sections(&crate::chk::walk_sections(baseline_chk));
+        let candidate_sections =
+            crate::chk::assemble_sections(&crate::chk::walk_sections(candidate_chk));
+
+        for section in ["DIM ", "ERA "] {
+            if baseline_sections.get(section) != candidate_sections.get(section) {
+                errors.push(format!(
+                    "{section} changed; map dimensions and tileset are immutable"
+                ));
+            }
+        }
+        let candidate_mtxm = candidate_sections
+            .get("MTXM")
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let candidate_tile = candidate_sections
+            .get("TILE")
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        if candidate_mtxm.len() % 2 != 0 || candidate_mtxm.is_empty() {
+            errors.push("candidate MTXM is missing or truncated".to_string());
+        }
+        if candidate_mtxm != candidate_tile {
+            errors.push("candidate MTXM and TILE are not identical".to_string());
+        }
+
+        let baseline_digest = crate::chk::digest_chk(baseline_chk);
+        let candidate_digest = crate::chk::digest_chk(candidate_chk);
+        let width = candidate_digest.map.width;
+        let height = candidate_digest.map.height;
+        if width == 0 || height == 0 {
+            errors.push("candidate dimensions are empty".to_string());
+        }
+
+        let baseline_tiles = &baseline_digest.tiles;
+        let candidate_tiles = &candidate_digest.tiles;
+        let mut terrain_cells = Vec::<(u16, u16)>::new();
+        if baseline_tiles.len() != candidate_tiles.len() {
+            errors.push("candidate terrain cell count changed".to_string());
+        } else {
+            for (index, (&before, &after)) in baseline_tiles.iter().zip(candidate_tiles).enumerate()
+            {
+                if before == after {
+                    continue;
+                }
+                let x = (index % usize::from(width)) as u16;
+                let y = (index / usize::from(width)) as u16;
+                terrain_cells.push((x, y));
+                self.check_cell(errors, diff, authority, MapLayer::Terrain, x, y);
+            }
+        }
+        diff.terrain_cells = terrain_cells.len() as u32;
+        diff.terrain_bounds = bounds(&terrain_cells);
+
+        let (building_ids, extents) = catalog(candidate_digest.map.tileset.as_str())?;
+        let baseline_units = raw_entries(&baseline_sections, "UNIT", crate::chk::UNIT_ENTRY_SIZE);
+        let candidate_units = raw_entries(&candidate_sections, "UNIT", crate::chk::UNIT_ENTRY_SIZE);
+        let unit_changes = compare_objects(
+            &baseline_units,
+            &candidate_units,
+            &mut diff.units,
+            &mut diff.buildings,
+            |bytes| {
+                let class_id = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
+                if class_id != 0 {
+                    format!("class:{class_id}")
+                } else {
+                    format!(
+                        "unit:{}:{}:{}",
+                        u16::from_le_bytes([bytes[8], bytes[9]]),
+                        bytes[16],
+                        u32::from_le_bytes(bytes[32..36].try_into().unwrap())
+                    )
+                }
+            },
+            |bytes| {
+                let placement = unit_placement(bytes);
+                let building = building_ids.contains(&placement.type_id);
+                let layer = if building {
+                    MapLayer::Buildings
+                } else {
+                    MapLayer::Units
+                };
+                let extent = extents
+                    .get(&placement.type_id)
+                    .copied()
+                    .unwrap_or(UnitExtent {
+                        left: 16,
+                        up: 16,
+                        right: 16,
+                        down: 16,
+                    });
+                let cells = pixel_rect_cells(
+                    i32::from(placement.x) - i32::from(extent.left),
+                    i32::from(placement.y) - i32::from(extent.up),
+                    i32::from(placement.x) + i32::from(extent.right),
+                    i32::from(placement.y) + i32::from(extent.down),
+                    width,
+                    height,
+                );
+                (layer, cells)
+            },
+        );
+        for (layer, cells) in unit_changes {
+            for (x, y) in cells {
+                self.check_cell(errors, diff, authority, layer, x, y);
+            }
+        }
+
+        let baseline_doodads = raw_entries(&baseline_sections, "DD2 ", crate::chk::DD2_ENTRY_SIZE);
+        let candidate_doodads =
+            raw_entries(&candidate_sections, "DD2 ", crate::chk::DD2_ENTRY_SIZE);
+        let mut unused = LayerDiffCount::default();
+        let doodad_changes = compare_objects(
+            &baseline_doodads,
+            &candidate_doodads,
+            &mut diff.doodads,
+            &mut unused,
+            |bytes| {
+                format!(
+                    "doodad:{}:{}",
+                    u16::from_le_bytes([bytes[0], bytes[1]]),
+                    bytes[6]
+                )
+            },
+            |bytes| {
+                let x = u16::from_le_bytes([bytes[2], bytes[3]]);
+                let y = u16::from_le_bytes([bytes[4], bytes[5]]);
+                (MapLayer::Doodads, vec![(x / 32, y / 32)])
+            },
+        );
+        for (layer, cells) in doodad_changes {
+            for (x, y) in cells {
+                self.check_cell(errors, diff, authority, layer, x, y);
+            }
+        }
+
+        let baseline_sprites = raw_entries(&baseline_sections, "THG2", crate::chk::THG2_ENTRY_SIZE);
+        let candidate_sprites =
+            raw_entries(&candidate_sections, "THG2", crate::chk::THG2_ENTRY_SIZE);
+        let sprite_changes = compare_objects(
+            &baseline_sprites,
+            &candidate_sprites,
+            &mut diff.sprites,
+            &mut unused,
+            |bytes| {
+                format!(
+                    "sprite:{}:{}:{}",
+                    u16::from_le_bytes([bytes[0], bytes[1]]),
+                    bytes[6],
+                    u16::from_le_bytes([bytes[8], bytes[9]]) & 0x1000
+                )
+            },
+            |bytes| {
+                let x = u16::from_le_bytes([bytes[2], bytes[3]]);
+                let y = u16::from_le_bytes([bytes[4], bytes[5]]);
+                (MapLayer::Sprites, vec![(x / 32, y / 32)])
+            },
+        );
+        for (layer, cells) in sprite_changes {
+            for (x, y) in cells {
+                self.check_cell(errors, diff, authority, layer, x, y);
+            }
+        }
+
+        let baseline_locations =
+            raw_entries(&baseline_sections, "MRGN", crate::chk::MRGN_ENTRY_SIZE);
+        let candidate_locations =
+            raw_entries(&candidate_sections, "MRGN", crate::chk::MRGN_ENTRY_SIZE);
+        if baseline_locations.len() != candidate_locations.len() {
+            errors
+                .push("MRGN slot count changed; location IDs would not remain stable".to_string());
+        }
+        for index in 0..baseline_locations.len().max(candidate_locations.len()) {
+            let before = baseline_locations.get(index);
+            let after = candidate_locations.get(index);
+            if before == after {
+                continue;
+            }
+            if index == 63 {
+                errors.push("location #64 Anywhere changed".to_string());
+            }
+            match (before, after) {
+                (Some(before), Some(after)) => {
+                    let before_blank = location_blank(before);
+                    let after_blank = location_blank(after);
+                    if before_blank && !after_blank {
+                        diff.locations.added += 1;
+                    } else if !before_blank && after_blank {
+                        diff.locations.removed += 1;
+                    } else {
+                        diff.locations.changed += 1;
+                    }
+                    for (x, y) in location_cells(after, width, height)
+                        .into_iter()
+                        .chain(location_cells(before, width, height))
+                    {
+                        self.check_cell(errors, diff, authority, MapLayer::Locations, x, y);
+                    }
+                }
+                (None, Some(after)) => {
+                    diff.locations.added += 1;
+                    for (x, y) in location_cells(after, width, height) {
+                        self.check_cell(errors, diff, authority, MapLayer::Locations, x, y);
+                    }
+                }
+                (Some(before), None) => {
+                    diff.locations.removed += 1;
+                    for (x, y) in location_cells(before, width, height) {
+                        self.check_cell(errors, diff, authority, MapLayer::Locations, x, y);
+                    }
+                }
+                (None, None) => {}
+            }
+        }
+
+        let baseline_canonical = crate::chk::canonical_chk_digest(baseline_chk);
+        let property_section =
+            |name: &str| authority.properties && crate::chk::MAP_PROPERTY_SECTIONS.contains(&name);
+        for (name, baseline_hash) in &baseline_canonical.unsupported_hashes {
+            if canonical.unsupported_hashes.get(name) != Some(baseline_hash)
+                && !property_section(name)
+            {
+                diff.unsupported_section_changes.push(name.clone());
+            }
+        }
+        for name in canonical.unsupported_hashes.keys() {
+            if !baseline_canonical.unsupported_hashes.contains_key(name) && !property_section(name)
+            {
+                diff.unsupported_section_changes.push(name.clone());
+            }
+        }
+        diff.unsupported_section_changes.sort();
+        diff.unsupported_section_changes.dedup();
+        if !diff.unsupported_section_changes.is_empty() {
+            errors.push(format!(
+                "unsupported CHK sections changed: {}",
+                diff.unsupported_section_changes.join(", ")
+            ));
+        }
+        if authority.properties {
+            diff.properties = property_changes(&baseline_digest, &candidate_digest);
+        }
+        Ok(())
+    }
+
     fn check_cell(
         &self,
         errors: &mut Vec<String>,
@@ -554,6 +596,49 @@ fn bounds(cells: &[(u16, u16)]) -> Option<TileRect> {
         right: cells.iter().map(|cell| cell.0).max()?.saturating_add(1),
         bottom: cells.iter().map(|cell| cell.1).max()?.saturating_add(1),
     })
+}
+
+/// Count changed scenario-property fields between two digests: title,
+/// description, each slot's controller/race/force, and each force's name and
+/// four flags. One count per changed field.
+pub(crate) fn property_changes(
+    baseline: &crate::chk::Digest,
+    candidate: &crate::chk::Digest,
+) -> u32 {
+    let mut changed = 0_u32;
+    changed += u32::from(baseline.map.title != candidate.map.title);
+    changed += u32::from(baseline.map.description != candidate.map.description);
+    for slot in 0..12 {
+        let before = baseline.players.get(slot);
+        let after = candidate.players.get(slot);
+        changed += u32::from(
+            before.map(|player| player.controller_id) != after.map(|player| player.controller_id),
+        );
+        changed +=
+            u32::from(before.map(|player| player.race_id) != after.map(|player| player.race_id));
+        changed += u32::from(
+            before.and_then(|player| player.force) != after.and_then(|player| player.force),
+        );
+    }
+    for index in 0..4 {
+        let before = baseline.forces.get(index);
+        let after = candidate.forces.get(index);
+        changed += u32::from(
+            before.map(|force| force.name.as_str()) != after.map(|force| force.name.as_str()),
+        );
+        let flags: [fn(&crate::chk::ForceFlags) -> bool; 4] = [
+            |flags| flags.allies,
+            |flags| flags.allied_victory,
+            |flags| flags.shared_vision,
+            |flags| flags.random_start_location,
+        ];
+        for flag in flags {
+            changed += u32::from(
+                before.map(|force| flag(&force.flags)) != after.map(|force| flag(&force.flags)),
+            );
+        }
+    }
+    changed
 }
 
 fn raw_entries<'a>(
@@ -886,6 +971,211 @@ mod tests {
         );
         assert!(authority.forbids(MapLayer::Terrain, 8, 7));
         assert!(!authority.forbids(MapLayer::Units, 8, 7));
+    }
+
+    fn section(name: &str, body: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(name.as_bytes());
+        out.extend_from_slice(&(body.len() as i32).to_le_bytes());
+        out.extend_from_slice(body);
+        out
+    }
+
+    fn str_section(values: &[&[u8]]) -> Vec<u8> {
+        let count = values.len();
+        let table_len = 2 * (count + 1);
+        let mut out = vec![0; table_len];
+        out[0..2].copy_from_slice(&(count as u16).to_le_bytes());
+        let mut cursor = table_len;
+        for (idx, value) in values.iter().enumerate() {
+            out[2 * (idx + 1)..2 * (idx + 2)].copy_from_slice(&(cursor as u16).to_le_bytes());
+            out.extend_from_slice(value);
+            out.push(0);
+            cursor = out.len();
+        }
+        out
+    }
+
+    /// A 2x2 synthetic CHK whose scenario properties come from the arguments:
+    /// strings 1..=3 are title, description, and force 1 name.
+    struct PropertyMap {
+        era: u16,
+        title: &'static [u8],
+        description: &'static [u8],
+        ownr: [u8; 12],
+        side: [u8; 12],
+        force_of_slot: [u8; 8],
+        force_name: &'static [u8],
+        force_flags: [u8; 4],
+    }
+
+    impl PropertyMap {
+        fn base() -> Self {
+            Self {
+                era: 4,
+                title: b"Untitled",
+                description: b"Nothing",
+                ownr: [6, 6, 5, 5, 0, 0, 0, 0, 0, 0, 0, 7],
+                side: [5, 5, 1, 2, 7, 7, 7, 7, 7, 7, 7, 4],
+                force_of_slot: [0, 0, 1, 1, 0, 0, 0, 0],
+                force_name: b"Alpha",
+                force_flags: [0x0E, 0x00, 0x00, 0x00],
+            }
+        }
+
+        fn bytes(&self) -> Vec<u8> {
+            let tiles = [1u8, 0, 2, 0, 3, 0, 4, 0];
+            let mut forc = Vec::new();
+            forc.extend_from_slice(&self.force_of_slot);
+            for string_id in [3u16, 0, 0, 0] {
+                forc.extend_from_slice(&string_id.to_le_bytes());
+            }
+            forc.extend_from_slice(&self.force_flags);
+            let mut sprp = Vec::new();
+            sprp.extend_from_slice(&1u16.to_le_bytes());
+            sprp.extend_from_slice(&2u16.to_le_bytes());
+            let mut chk = Vec::new();
+            chk.extend(section("DIM ", &[2, 0, 2, 0]));
+            chk.extend(section("ERA ", &self.era.to_le_bytes()));
+            chk.extend(section("MTXM", &tiles));
+            chk.extend(section("TILE", &tiles));
+            chk.extend(section("SPRP", &sprp));
+            chk.extend(section("OWNR", &self.ownr));
+            chk.extend(section("SIDE", &self.side));
+            chk.extend(section("FORC", &forc));
+            chk.extend(section(
+                "STR ",
+                &str_section(&[self.title, self.description, self.force_name]),
+            ));
+            chk
+        }
+    }
+
+    fn compare(baseline: &[u8], candidate: &[u8], properties: bool) -> (Vec<String>, MapDiff) {
+        let authority = if properties {
+            MapRequestAuthority::properties_only("map".to_string(), "request".to_string(), 0, 2, 2)
+                .unwrap()
+        } else {
+            MapRequestAuthority::calculate(
+                "map".to_string(),
+                "request".to_string(),
+                0,
+                2,
+                2,
+                Vec::new(),
+                Vec::new(),
+            )
+            .unwrap()
+        };
+        let canonical = crate::chk::canonical_chk_digest(candidate);
+        let mut errors = Vec::new();
+        let mut diff = MapDiff::default();
+        MapVerificationService
+            .compare_chk(
+                baseline,
+                candidate,
+                &canonical,
+                &authority,
+                |_| Ok((BTreeSet::new(), BTreeMap::new())),
+                &mut errors,
+                &mut diff,
+            )
+            .unwrap();
+        (errors, diff)
+    }
+
+    #[test]
+    fn property_sections_stay_fixed_authority_for_ordinary_requests() {
+        let baseline = PropertyMap::base().bytes();
+        let (errors, diff) = compare(&baseline, &baseline, false);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(diff, MapDiff::default());
+
+        let mut changed = PropertyMap::base();
+        changed.title = b"Renamed";
+        changed.ownr[4] = 6;
+        changed.force_flags[1] = 0x02;
+        let (errors, diff) = compare(&baseline, &changed.bytes(), false);
+        assert_eq!(
+            diff.unsupported_section_changes,
+            vec!["FORC".to_string(), "OWNR".to_string()]
+        );
+        assert_eq!(
+            errors,
+            vec!["unsupported CHK sections changed: FORC, OWNR".to_string()]
+        );
+        assert_eq!(diff.properties, 0);
+    }
+
+    #[test]
+    fn properties_authority_admits_property_sections_and_counts_changed_fields() {
+        let baseline = PropertyMap::base().bytes();
+        let mut changed = PropertyMap::base();
+        changed.title = b"Renamed";
+        changed.description = b"Described";
+        changed.ownr[4] = 6;
+        changed.side[4] = 5;
+        changed.force_of_slot[4] = 3;
+        changed.force_name = b"Bravo";
+        changed.force_flags[0] = 0x0F;
+        changed.force_flags[1] = 0x02;
+        let (errors, diff) = compare(&baseline, &changed.bytes(), true);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(diff.unsupported_section_changes.is_empty());
+        // title, description, P5 controller/race/force, force 1 name + random
+        // start, force 2 allies.
+        assert_eq!(diff.properties, 8);
+        assert_eq!(diff.terrain_cells, 0);
+
+        let (errors, diff) = compare(&baseline, &baseline, true);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(diff.properties, 0);
+    }
+
+    #[test]
+    fn properties_authority_keeps_dimensions_tileset_and_other_sections_immutable() {
+        let baseline = PropertyMap::base().bytes();
+        let mut retiled = PropertyMap::base();
+        retiled.era = 5;
+        let (errors, diff) = compare(&baseline, &retiled.bytes(), true);
+        assert_eq!(
+            errors[0],
+            "ERA  changed; map dimensions and tileset are immutable"
+        );
+        assert_eq!(diff.unsupported_section_changes, vec!["ERA ".to_string()]);
+
+        let mut with_trigger = baseline.clone();
+        with_trigger.extend(section("TRIG", &[0; 2_400]));
+        let (errors, diff) = compare(&baseline, &with_trigger, true);
+        assert_eq!(diff.unsupported_section_changes, vec!["TRIG".to_string()]);
+        assert_eq!(
+            errors,
+            vec!["unsupported CHK sections changed: TRIG".to_string()]
+        );
+    }
+
+    #[test]
+    fn request_authority_manifest_without_properties_flag_stays_ordinary() {
+        let authority: MapRequestAuthority = serde_json::from_value(serde_json::json!({
+            "sessionId": "map",
+            "requestId": "request",
+            "parentRevision": 0,
+            "mapWidth": 2,
+            "mapHeight": 2,
+            "targetMasks": [],
+            "forbiddenMasks": []
+        }))
+        .unwrap();
+        assert!(!authority.properties);
+        let properties =
+            MapRequestAuthority::properties_only("map".to_string(), "request".to_string(), 0, 2, 2)
+                .unwrap();
+        assert!(properties.properties);
+        assert!(properties.allows(MapLayer::Terrain, 1, 1));
+        assert!(
+            MapRequestAuthority::properties_only("map".to_string(), "r".to_string(), 0, 0, 2)
+                .is_err()
+        );
     }
 
     #[test]

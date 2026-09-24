@@ -4,6 +4,9 @@ use crate::provider_tool_loop::{unresolved_native_runs, NativeRunReceiptState, R
 struct NativeAdapter {
     started: Option<tokio::sync::oneshot::Sender<()>>,
     observed: Arc<parking_lot::Mutex<Vec<ProviderConversationState>>>,
+    /// The resumable session a real native CLI publishes before any output.
+    /// `None` reproduces an adapter that never learned one.
+    session: Option<String>,
 }
 
 impl ProviderAdapter for NativeAdapter {
@@ -78,6 +81,13 @@ impl ProviderAdapter for NativeAdapter {
     ) -> AdapterFuture<'_, Result<(), ProviderRuntimeError>> {
         Box::pin(async { Ok(()) })
     }
+    fn observed_conversation(&self) -> Option<ProviderConversationState> {
+        self.session
+            .clone()
+            .map(|thread_id| ProviderConversationState::Codex {
+                thread_id: Some(thread_id),
+            })
+    }
 }
 
 fn binding(fixture: &RuntimeFixture) -> crate::provider_runtime::BindingSnapshot {
@@ -112,6 +122,7 @@ async fn unsafe_run_blocks_reconstruction_until_explicit_reset(drop_future: bool
         NativeAdapter {
             started: Some(started),
             observed: observed.clone(),
+            session: None,
         },
     );
     let request = fixture.foreground(binding(&fixture), 40_001);
@@ -151,6 +162,7 @@ async fn unsafe_run_blocks_reconstruction_until_explicit_reset(drop_future: bool
         NativeAdapter {
             started: None,
             observed: observed.clone(),
+            session: None,
         },
     );
     assert!(matches!(
@@ -197,6 +209,69 @@ async fn unsafe_run_blocks_reconstruction_until_explicit_reset(drop_future: bool
 }
 
 #[tokio::test]
+async fn an_interrupted_run_that_named_its_session_is_resumed_not_refused() {
+    // A native CLI publishes its resumable session before any output. A run
+    // that is cancelled (or dies with the process) after that point did not
+    // finish its turn, but the session it named is still the boundary the next
+    // run continues from — losing it costs the whole conversation.
+    let fixture = RuntimeFixture::new("native-interrupted-resume");
+    let observed = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let (started, running) = tokio::sync::oneshot::channel();
+    let mut first = native_runtime(
+        &fixture,
+        NativeAdapter {
+            started: Some(started),
+            observed: observed.clone(),
+            session: Some("persisted-old-thread".to_string()),
+        },
+    );
+    let request = fixture.foreground(binding(&fixture), 41_001);
+    let (outcome, ()) = tokio::join!(first.run_foreground(request), async {
+        running.await.expect("native request started");
+        fixture.cancellation.send(1).expect("cancel native request");
+    });
+    assert_eq!(outcome, RunOutcome::Cancelled);
+    drop(first);
+
+    let receipts = unresolved_native_runs(&fixture.dirs.journal_dir(), &fixture.session_id)
+        .expect("read the interrupted native receipt");
+    assert_eq!(receipts.len(), 1);
+    assert_eq!(receipts[0].state, NativeRunReceiptState::Interrupted);
+    assert_eq!(
+        receipts[0].candidate_native_id.as_deref(),
+        Some("persisted-old-thread")
+    );
+
+    let project_id = fixture.root.join("project").to_string_lossy().into_owned();
+    fixture
+        .tools
+        .begin_request("native-after-interrupt", &project_id)
+        .expect("begin the request after the interruption");
+    let mut recovered = native_runtime(
+        &fixture,
+        NativeAdapter {
+            started: None,
+            observed: observed.clone(),
+            session: Some("persisted-old-thread".to_string()),
+        },
+    );
+    let mut retry = fixture.foreground(binding(&fixture), 41_002);
+    retry.identity.request_id = "native-after-interrupt".to_string();
+    retry.identity.cancellation_generation = *fixture.cancellation.borrow();
+    assert!(matches!(
+        recovered.run_foreground(retry).await,
+        RunOutcome::Completed { .. }
+    ));
+    assert_eq!(
+        observed.lock()[1],
+        ProviderConversationState::Codex {
+            thread_id: Some("persisted-old-thread".to_string())
+        },
+        "the interrupted session must be the one the next run continues"
+    );
+}
+
+#[tokio::test]
 async fn c05_c14_cancelled_native_run_rejects_persisted_old_id_after_reconstruction() {
     unsafe_run_blocks_reconstruction_until_explicit_reset(false).await;
 }
@@ -231,6 +306,7 @@ async fn c14_confirmed_native_checkpoint_is_recovered_and_retained_until_metadat
         NativeAdapter {
             started: None,
             observed: observed.clone(),
+            session: None,
         },
     );
     let mut next = fixture.foreground(binding(&fixture), 40_012);
@@ -297,6 +373,7 @@ async fn c14_explicit_reset_archives_corrupt_claim_before_fresh_native_run() {
         NativeAdapter {
             started: None,
             observed: observed.clone(),
+            session: None,
         },
     );
     assert!(matches!(
@@ -343,5 +420,34 @@ async fn c14_explicit_reset_archives_corrupt_claim_before_fresh_native_run() {
     assert_eq!(
         observed.lock().as_slice(),
         [ProviderConversationState::Codex { thread_id: None }]
+    );
+}
+
+#[tokio::test]
+async fn native_round_exhaustion_fails_closed_without_synthesizing_a_checkpoint() {
+    let fixture = RuntimeFixture::new("native-round-boundary");
+    let observed = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let initial = binding(&fixture).conversation;
+    let mut runtime = native_runtime(
+        &fixture,
+        NativeAdapter {
+            started: None,
+            observed: observed.clone(),
+            session: None,
+        },
+    );
+    let mut request = fixture.foreground(binding(&fixture), 40_024);
+    request.policy.max_tool_rounds = 0;
+
+    let outcome = runtime.run_foreground(request).await;
+
+    assert_eq!(
+        outcome,
+        RunOutcome::Failed(ProviderRuntimeError::IterationBoundaryNotResumable)
+    );
+    assert_eq!(runtime.conversation_state(), initial);
+    assert!(
+        observed.lock().is_empty(),
+        "native adapter must not run when no confirmed boundary can be obtained"
     );
 }

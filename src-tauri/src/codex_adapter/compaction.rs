@@ -126,6 +126,7 @@ impl CodexAdapter {
                 access: WorkspaceAccess::Read,
                 mcp_endpoint: None,
                 native_tools_enabled: false,
+                temp_dir: None,
             };
             let model = CodexModelSelection {
                 model: request.binding.model.clone(),

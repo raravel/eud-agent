@@ -34,13 +34,16 @@ int isom_catalog_query(const char* starcraft_path,
                        const uint8_t* request, size_t request_len,
                        uint8_t** result, size_t* result_len);
 int isom_map_digest(const char* map_path, uint8_t** result, size_t* result_len);
+int isom_map_new(const char* output_map_path, const char* starcraft_path,
+                 const uint8_t* spec, size_t spec_len,
+                 uint8_t** report, size_t* report_len);
 int isom_image_quantize(const char* starcraft_path, uint16_t tileset,
                         const uint8_t* rgba, size_t rgba_len,
                         uint16_t width, uint16_t height,
                         const uint16_t* before_tiles, size_t before_tile_count,
                         uint8_t** result, size_t* result_len);
 void isom_free(uint8_t* p);
-int isom_abi_version(void); // ABI v5
+int isom_abi_version(void); // ABI v7
 ```
 - Legacy save paths keep `autoDefragmentLocations=false`, `lockAnywhere=true` (rules.md).
 - Location/switch NAME bytes pass through operation buffers as raw map-encoding bytes.
@@ -50,6 +53,19 @@ int isom_abi_version(void); // ABI v5
 - `isom_mapedit` loads one existing SCX and saves one output SCX. It supports exact/semantic
   terrain, unit/building, doodad+overlay, sprite, and location operations; it never calls rawgen
   or creates a new map.
+- `isom_map_new` is the only entry that creates a map. It takes a strict `eud-map-new/1` spec
+  (remastered/broodWar save type, tileset, 64..256 dimensions, one ISOM terrain brush of that
+  tileset, title/description, up to 8 player slots with type/race/force/start location, 1..4
+  forces with flags), fills the whole map through the ISOM cache, sets SPRP/OWNR/SIDE/FORC and
+  Start Location units on the same in-memory `MapFile`, saves once to a same-directory temporary
+  file, promotes atomically, and re-opens the output to check header and start-location count
+  before returning `eud-map-new-report/1`. The output path must not exist. Slots the spec omits
+  are `Inactive`.
+- Every path crossing the C ABI is UTF-8 bytes. `MapFile`, StormLib and `readFileSha256` already
+  widen them; ABI v7 also routes the shim's own exists/delete/replace/copy calls through
+  `GetFileAttributesW`/`DeleteFileW`/`MoveFileExW`/`CopyFileW`, so non-ASCII project folders and
+  user names work for map creation, editing and sound import alike. ABI v7 is additive
+  (`isom_map_new`); the version constant is bumped for every exported-surface change.
 - `unit.set` patches only fields present in the request and preserves the remaining 36-byte UNIT
   state. Doodad set/move/delete requires exact `replacementTiles` for the old footprint so the
   semantic terrain+overlay operation cannot leave stale doodad graphics.
@@ -98,13 +114,13 @@ Location #64 remains protected, location ids stay stable, and trigger-used locat
 - msbuild/MSVC absent in dev -> build.rs fails fast with a setup hint.
 
 ## Implementation
-- `native/isom/isom_capi.h`, `native/isom/isom_capi.cpp` — ABI v5 shim with native error detail
+- `native/isom/isom_capi.h`, `native/isom/isom_capi.cpp` — ABI v7 shim with native error detail
 - `native/isom/IsomTerrain/MapAgentJson.{h,cpp}` — strict duplicate-key-rejecting JSON
 - `native/isom/IsomTerrain/MapAgentCore.{h,cpp}` — existing-map writer, renderer, catalog,
   digest, photo palette, and deterministic quantizer
 - `native/isom/IsomTerrain/MapGenCli.cpp` — retained legacy chk/locedit/playeredit/switchedit/render paths
 - `crates/isom-sys/build.rs`, `crates/isom-sys/src/lib.rs` — bindgen + static link
-- `crates/isom/src/lib.rs` — ABI v5 assertion and safe owned-buffer/image-envelope wrappers
+- `crates/isom/src/lib.rs` — ABI v7 assertion and safe owned-buffer/image-envelope wrappers
 - `src-tauri/src/chk.rs` — CHK parse plus terrain/unit/doodad/sprite/location digests
 - `src-tauri/src/map_candidate.rs`, `map_verify.rs`, `mapsafe.rs` — candidate authority,
   replay, verification, Apply/rollback/undo rails

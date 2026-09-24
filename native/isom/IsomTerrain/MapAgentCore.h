@@ -15,6 +15,13 @@ int mapEdit(
     std::size_t batchLength,
     std::string& reportJson);
 
+int mapNew(
+    const char* outputMapPath,
+    const char* starCraftPath,
+    const std::uint8_t* specJson,
+    std::size_t specLength,
+    std::string& reportJson);
+
 int renderRegion(
     const char* mapPath,
     const char* starCraftPath,
@@ -29,6 +36,11 @@ int catalogQuery(
     const std::uint8_t* requestJson,
     std::size_t requestLength,
     std::string& resultJson);
+
+int gameAsset(
+    const char* starCraftPath,
+    const char* archivePath,
+    std::vector<std::uint8_t>& result);
 
 int imageQuantize(
     const char* starCraftPath,

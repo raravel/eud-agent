@@ -356,6 +356,51 @@ fn terrain_thumbnail_renders_one_exact_tile_and_space_parallax() {
 
 #[test]
 #[ignore = "loads installed StarCraft terrain assets"]
+fn catalog_null_tile_filter_drops_megatile_zero_variants() {
+    let starcraft = starcraft_path();
+    let query = |filter: Value| -> Value {
+        let request = json!({
+            "schema": "eud-map-catalog/1",
+            "kind": "tiles",
+            "tileset": 0,
+            "offset": 0,
+            "limit": 512,
+            "filter": filter,
+        });
+        serde_json::from_str(
+            &isom::catalog_query(&starcraft, request.to_string().as_bytes()).unwrap(),
+        )
+        .unwrap()
+    };
+    let broad = query(json!({"graphicsValid": true}));
+    let broad_entries = broad["entries"].as_array().unwrap();
+    assert!(broad_entries.iter().any(|entry| entry["nullTile"] == true));
+    assert!(broad_entries
+        .iter()
+        .all(|entry| (entry["nullTile"] == true) == (entry["megaTile"] == 0)));
+
+    let hidden = query(json!({"graphicsValid": true, "nullTile": false}));
+    let hidden_entries = hidden["entries"].as_array().unwrap();
+    assert!(!hidden_entries.is_empty());
+    assert!(hidden_entries
+        .iter()
+        .all(|entry| entry["nullTile"] == false && entry["megaTile"] != 0));
+    assert!(hidden["total"].as_u64().unwrap() < broad["total"].as_u64().unwrap());
+
+    let request = json!({
+        "schema": "eud-map-catalog/1",
+        "kind": "doodads",
+        "tileset": 0,
+        "filter": {"nullTile": false},
+    });
+    let error = isom::catalog_query(&starcraft, request.to_string().as_bytes()).unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("catalog filter.nullTile is not supported for doodads"));
+}
+
+#[test]
+#[ignore = "loads installed StarCraft terrain assets"]
 fn catalog_structured_filters_narrow_tiles_before_pagination() {
     let starcraft = starcraft_path();
     let broad_request = json!({
@@ -545,11 +590,13 @@ fn every_layer_crud_and_semantic_brush_round_trip() {
         .unwrap(),
     )
     .unwrap();
+    // A multi-row doodad: every CV5 row past the first used to be laid out
+    // from the first row's group and came out as null (tile 0) terrain.
     let doodad_entry = doodads["entries"]
         .as_array()
         .unwrap()
         .iter()
-        .find(|entry| entry["graphicsValid"] == true)
+        .find(|entry| entry["graphicsValid"] == true && entry["height"].as_u64().unwrap() >= 2)
         .unwrap();
     let doodad_id = doodad_entry["id"].as_u64().unwrap();
     let doodad_width = doodad_entry["width"].as_u64().unwrap() as usize;
@@ -561,6 +608,37 @@ fn every_layer_crud_and_semantic_brush_round_trip() {
         json!([{"op": "doodad.add", "state": {"doodadId": doodad_id, "x": 640, "y": 640, "owner": 11}}]),
     );
     generated.push(doodad_add.clone());
+    let footprint_tiles = |map: &Path| -> Vec<u16> {
+        let mtxm = sections(&isom::chk_extract(map).unwrap())["MTXM"].clone();
+        let left = 640 / 32 - doodad_width / 2;
+        let top = 640 / 32 - doodad_height / 2;
+        (0..doodad_height)
+            .flat_map(|y| {
+                let mtxm = &mtxm;
+                (0..doodad_width).map(move |x| {
+                    let index = ((top + y) * width as usize + left + x) * 2;
+                    u16::from_le_bytes([mtxm[index], mtxm[index + 1]])
+                })
+            })
+            .collect()
+    };
+    let placed = footprint_tiles(&doodad_add);
+    assert!(
+        placed.iter().all(|&placed| placed != 0),
+        "doodad {doodad_id} footprint must never become null terrain: {placed:?}"
+    );
+    assert!(
+        placed.iter().any(|&placed| placed / 16 >= 1024),
+        "doodad {doodad_id} footprint must use its CV5 doodad groups: {placed:?}"
+    );
+    let owned_rows = placed
+        .chunks(doodad_width)
+        .filter(|row| row.iter().any(|&placed| placed / 16 >= 1024))
+        .count();
+    assert!(
+        owned_rows >= 2,
+        "doodad {doodad_id} ({doodad_width}x{doodad_height}) must place every row: {placed:?}"
+    );
     let doodad_bytes = sections(&isom::chk_extract(&doodad_add).unwrap())["DD2 "].clone();
     let doodad_ordinal = doodad_bytes.len() / 8 - 1;
     let doodad_before = fingerprint(&doodad_bytes[doodad_ordinal * 8..doodad_ordinal * 8 + 8]);
@@ -589,6 +667,21 @@ fn every_layer_crud_and_semantic_brush_round_trip() {
             "replacementTiles": replacement_tiles}]),
     );
     generated.push(doodad_delete.clone());
+    // Deleting the moved doodad restores its last footprint from replacementTiles;
+    // the earlier footprints were restored by doodad.set / doodad.move.
+    let restored = sections(&isom::chk_extract(&doodad_delete).unwrap())["MTXM"].clone();
+    let doodad_groups = restored
+        .chunks_exact(2)
+        .filter(|cell| u16::from_le_bytes([cell[0], cell[1]]) / 16 >= 1024)
+        .count();
+    let original_groups = sections(&isom::chk_extract(&unit_delete).unwrap())["MTXM"]
+        .chunks_exact(2)
+        .filter(|cell| u16::from_le_bytes([cell[0], cell[1]]) / 16 >= 1024)
+        .count();
+    assert_eq!(
+        doodad_groups, original_groups,
+        "doodad.set/move/delete must restore every footprint cell they vacate"
+    );
 
     let sprite_add = apply_operations(
         &doodad_delete,
@@ -1134,4 +1227,732 @@ fn image_quantizer_uses_only_stable_graphics_valid_tiles_for_every_tileset() {
             );
         }
     }
+}
+
+fn first_brush(starcraft: &Path, tileset: u8) -> (u16, String) {
+    let request = json!({
+        "schema": "eud-map-catalog/1",
+        "kind": "brushes",
+        "tileset": tileset,
+        "offset": 0,
+        "limit": 64,
+    });
+    let catalog: Value = serde_json::from_str(
+        &isom::catalog_query(starcraft, request.to_string().as_bytes()).unwrap(),
+    )
+    .unwrap();
+    let entry = catalog["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["graphicsValid"] == true)
+        .expect("installed tileset must expose a graphics-valid brush");
+    (
+        entry["terrainType"].as_u64().unwrap() as u16,
+        entry["name"].as_str().unwrap().to_string(),
+    )
+}
+
+/// Legacy `STR ` encoding the wizard uses for a new map: CP949 for Hangul.
+fn cp949_hex(text: &str) -> String {
+    let (bytes, _, had_errors) = encoding_rs::EUC_KR.encode(text);
+    assert!(!had_errors, "{text} is representable in CP949");
+    hex(&bytes)
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// Bytes of one 1-based entry in a legacy `STR ` section.
+fn str_entry(str_section: &[u8], id: u16) -> Vec<u8> {
+    if id == 0 {
+        return Vec::new();
+    }
+    let offset = usize::from(u16::from_le_bytes([
+        str_section[usize::from(id) * 2],
+        str_section[usize::from(id) * 2 + 1],
+    ]));
+    let end = str_section[offset..]
+        .iter()
+        .position(|byte| *byte == 0)
+        .map_or(str_section.len(), |length| offset + length);
+    str_section[offset..end].to_vec()
+}
+
+fn blank_spec(tileset: u8, width: u16, height: u16, terrain_type: u16) -> isom::MapNewSpec {
+    isom::MapNewSpec {
+        version: "remastered".to_string(),
+        tileset,
+        width,
+        height,
+        terrain_type,
+        title_bytes_hex: cp949_hex("새 맵 마법사"),
+        description_bytes_hex: hex(b"generated by eud-agent"),
+        players: vec![
+            isom::MapNewPlayer {
+                slot: 0,
+                r#type: "human".to_string(),
+                race: "userSelectable".to_string(),
+                force: Some(0),
+                start: Some(isom::MapNewStart { x: 128, y: 128 }),
+            },
+            isom::MapNewPlayer {
+                slot: 1,
+                r#type: "computer".to_string(),
+                race: "zerg".to_string(),
+                force: Some(1),
+                start: Some(isom::MapNewStart {
+                    x: width * 32 - 128,
+                    y: height * 32 - 128,
+                }),
+            },
+            isom::MapNewPlayer {
+                slot: 2,
+                r#type: "human".to_string(),
+                race: "protoss".to_string(),
+                force: Some(1),
+                start: None,
+            },
+            isom::MapNewPlayer {
+                slot: 8,
+                r#type: "neutral".to_string(),
+                race: "neutral".to_string(),
+                force: None,
+                start: None,
+            },
+            isom::MapNewPlayer {
+                slot: 11,
+                r#type: "inactive".to_string(),
+                race: "inactive".to_string(),
+                force: None,
+                start: None,
+            },
+        ],
+        forces: vec![
+            isom::MapNewForce {
+                name_bytes_hex: cp949_hex("공격"),
+                allied: true,
+                allied_victory: true,
+                shared_vision: false,
+                random_start: false,
+            },
+            isom::MapNewForce {
+                name_bytes_hex: cp949_hex("방어"),
+                allied: false,
+                allied_victory: false,
+                shared_vision: true,
+                random_start: true,
+            },
+        ],
+    }
+}
+
+#[test]
+#[ignore = "loads installed StarCraft terrain assets for all eight tilesets and writes new maps"]
+fn map_new_creates_a_verified_blank_map_for_every_tileset() {
+    let starcraft = starcraft_path();
+    for tileset in 0_u8..8 {
+        let (terrain_type, brush_name) = first_brush(&starcraft, tileset);
+        let (width, height) =
+            [(64, 64), (96, 128), (128, 96), (192, 64), (256, 256)][tileset as usize % 5];
+        let output = temp_map(&format!("new-{tileset}"));
+        let spec = blank_spec(tileset, width, height, terrain_type);
+        let report = isom::map_new(&output, &starcraft, &spec)
+            .unwrap_or_else(|error| panic!("tileset {tileset} brush {brush_name}: {error}"));
+        assert_eq!(report.width, width);
+        assert_eq!(report.height, height);
+        assert_eq!(report.players, 5);
+        assert_eq!(report.start_locations, 2);
+        assert_eq!(report.output_sha256, file_hash(&output));
+
+        let (name, chk_width, chk_height, _) = map_header(&output);
+        let expected_name = [
+            "badlands",
+            "platform",
+            "installation",
+            "ashworld",
+            "jungle",
+            "desert",
+            "arctic",
+            "twilight",
+        ][tileset as usize];
+        assert_eq!(name, expected_name);
+        assert_eq!((chk_width, chk_height), (width, height));
+
+        let chk = isom::chk_extract(&output).unwrap();
+        let sections = sections(&chk);
+        let ver = sections.get("VER ").unwrap();
+        assert_eq!(
+            u16::from_le_bytes([ver[0], ver[1]]),
+            206,
+            "remastered version"
+        );
+        let ownr = sections.get("OWNR").unwrap();
+        assert_eq!(
+            ownr.as_slice(),
+            &[6, 5, 6, 0, 0, 0, 0, 0, 7, 0, 0, 0],
+            "human/computer/human, neutral at P9, every other slot inactive"
+        );
+        let side = sections.get("SIDE").unwrap();
+        assert_eq!(
+            side.as_slice(),
+            &[5, 0, 2, 1, 0, 2, 1, 0, 4, 7, 7, 7],
+            "userSelectable/zerg/protoss, engine defaults, neutral at P9, inactive at P12"
+        );
+        let forc = sections.get("FORC").unwrap();
+        assert_eq!(&forc[..3], &[0, 1, 1], "player forces");
+        assert_eq!(forc[16] & 0b1111, 0b0110, "force 1 allied + allied victory");
+        assert_eq!(
+            forc[17] & 0b1111,
+            0b1001,
+            "force 2 shared vision + random start"
+        );
+        let strings = sections.get("STR ").unwrap();
+        assert!(!sections.contains_key("STRx"), "a new map has no STRx");
+        let force_string = u16::from_le_bytes([forc[8], forc[9]]);
+        assert_eq!(
+            hex(&str_entry(strings, force_string)),
+            cp949_hex("공격"),
+            "force name is stored as the CP949 bytes the spec carried"
+        );
+        let sprp = sections.get("SPRP").unwrap();
+        let title_string = u16::from_le_bytes([sprp[0], sprp[1]]);
+        assert_eq!(
+            hex(&str_entry(strings, title_string)),
+            cp949_hex("새 맵 마법사")
+        );
+        let unit = sections.get("UNIT").unwrap();
+        let starts: Vec<(u16, u16, u8)> = unit
+            .chunks_exact(36)
+            .filter(|record| u16::from_le_bytes([record[8], record[9]]) == 214)
+            .map(|record| {
+                (
+                    u16::from_le_bytes([record[4], record[5]]),
+                    u16::from_le_bytes([record[6], record[7]]),
+                    record[16],
+                )
+            })
+            .collect();
+        assert_eq!(
+            starts,
+            vec![(128, 128, 0), (width * 32 - 128, height * 32 - 128, 1)]
+        );
+        let mtxm = sections.get("MTXM").unwrap();
+        assert_eq!(mtxm.len(), usize::from(width) * usize::from(height) * 2);
+        let tiles: BTreeSet<u16> = mtxm
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect();
+        assert!(!tiles.contains(&0), "every tile is filled by the brush");
+
+        assert!(
+            isom::map_new(&output, &starcraft, &spec).is_err(),
+            "existing output must be refused"
+        );
+        fs::remove_file(&output).unwrap();
+    }
+}
+
+#[test]
+#[ignore = "loads installed StarCraft terrain assets"]
+fn map_new_rejects_invalid_specs_without_writing() {
+    let starcraft = starcraft_path();
+    let (terrain_type, _) = first_brush(&starcraft, 0);
+    let output = temp_map("new-invalid");
+
+    let mut foreign_brush = blank_spec(0, 64, 64, terrain_type);
+    foreign_brush.terrain_type = 4000;
+    let error = isom::map_new(&output, &starcraft, &foreign_brush).unwrap_err();
+    assert!(error.to_string().contains("terrain brush"), "{error}");
+    assert!(!output.exists());
+
+    let mut duplicate_slot = blank_spec(0, 64, 64, terrain_type);
+    duplicate_slot.players[1].slot = 0;
+    let error = isom::map_new(&output, &starcraft, &duplicate_slot).unwrap_err();
+    assert!(error.to_string().contains("slot is duplicated"), "{error}");
+    assert!(!output.exists());
+
+    let mut outside = blank_spec(0, 64, 64, terrain_type);
+    outside.players[0].start = Some(isom::MapNewStart { x: 64 * 32, y: 0 });
+    let error = isom::map_new(&output, &starcraft, &outside).unwrap_err();
+    assert!(error.to_string().contains("outside the map"), "{error}");
+    assert!(!output.exists());
+
+    let mut unknown_force = blank_spec(0, 64, 64, terrain_type);
+    unknown_force.players[0].force = Some(3);
+    let error = isom::map_new(&output, &starcraft, &unknown_force).unwrap_err();
+    assert!(error.to_string().contains("declared force"), "{error}");
+    assert!(!output.exists());
+
+    let mut missing_force = blank_spec(0, 64, 64, terrain_type);
+    missing_force.players[0].force = None;
+    let error = isom::map_new(&output, &starcraft, &missing_force).unwrap_err();
+    assert!(
+        error.to_string().contains("required for slots 0..7"),
+        "{error}"
+    );
+    assert!(!output.exists());
+
+    let mut high_force = blank_spec(0, 64, 64, terrain_type);
+    high_force.players[3].force = Some(0);
+    let error = isom::map_new(&output, &starcraft, &high_force).unwrap_err();
+    assert!(
+        error.to_string().contains("only valid for slots 0..7"),
+        "{error}"
+    );
+    assert!(!output.exists());
+
+    let mut high_start = blank_spec(0, 64, 64, terrain_type);
+    high_start.players[3].start = Some(isom::MapNewStart { x: 64, y: 64 });
+    let error = isom::map_new(&output, &starcraft, &high_start).unwrap_err();
+    assert!(error.to_string().contains("start is only valid"), "{error}");
+    assert!(!output.exists());
+
+    let mut empty_title = blank_spec(0, 64, 64, terrain_type);
+    empty_title.title_bytes_hex = String::new();
+    let error = isom::map_new(&output, &starcraft, &empty_title).unwrap_err();
+    assert!(error.to_string().contains("titleBytesHex"), "{error}");
+    assert!(!output.exists());
+
+    let mut odd_hex = blank_spec(0, 64, 64, terrain_type);
+    odd_hex.forces[0].name_bytes_hex = "abc".to_string();
+    let error = isom::map_new(&output, &starcraft, &odd_hex).unwrap_err();
+    assert!(error.to_string().contains("even number"), "{error}");
+    assert!(!output.exists());
+
+    let mut bad_version = blank_spec(0, 64, 64, terrain_type);
+    bad_version.version = "hybrid".to_string();
+    let error = isom::map_new(&output, &starcraft, &bad_version).unwrap_err();
+    assert!(error.to_string().contains("version"), "{error}");
+    assert!(!output.exists());
+
+    let too_small = blank_spec(0, 32, 64, terrain_type);
+    assert_eq!(
+        isom::map_new(&output, &starcraft, &too_small)
+            .unwrap_err()
+            .status,
+        isom::IsomError::InvalidArg
+    );
+    assert!(!output.exists());
+}
+
+fn try_operations(input: &Path, tag: &str, operations: Value) -> Result<(PathBuf, Value), String> {
+    let (tileset, width, height, _) = map_header(input);
+    let output = temp_map(tag);
+    let batch = json!({
+        "schema": "eud-map-edit/1",
+        "expected": {
+            "inputFileSha256": file_hash(input),
+            "tileset": tileset,
+            "width": width,
+            "height": height
+        },
+        "operations": operations
+    });
+    match isom::mapedit(
+        input,
+        &output,
+        &starcraft_path(),
+        batch.to_string().as_bytes(),
+    ) {
+        Ok(report) => Ok((output, serde_json::from_str(&report).unwrap())),
+        Err(error) => {
+            assert!(
+                !output.exists(),
+                "{tag}: a refused batch must not write output"
+            );
+            Err(error.to_string())
+        }
+    }
+}
+
+fn mtxm_tiles(map: &Path) -> Vec<u16> {
+    sections(&isom::chk_extract(map).unwrap())["MTXM"]
+        .chunks_exact(2)
+        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+        .collect()
+}
+
+/// Every graphics-valid tile id of one terrain type, paged through the bounded catalog.
+fn tile_ids_of_terrain_type(starcraft: &Path, tileset: u8, terrain_type: u16) -> BTreeSet<u16> {
+    let mut ids = BTreeSet::new();
+    let mut offset = 0_u64;
+    loop {
+        let request = json!({
+            "schema": "eud-map-catalog/1",
+            "kind": "tiles",
+            "tileset": tileset,
+            "offset": offset,
+            "limit": 512,
+            "filter": {"terrainType": terrain_type, "graphicsValid": true}
+        });
+        let page: Value = serde_json::from_str(
+            &isom::catalog_query(starcraft, request.to_string().as_bytes()).unwrap(),
+        )
+        .unwrap();
+        let entries = page["entries"].as_array().unwrap();
+        ids.extend(
+            entries
+                .iter()
+                .map(|entry| entry["id"].as_u64().unwrap() as u16),
+        );
+        offset += entries.len() as u64;
+        if entries.is_empty() || offset >= page["total"].as_u64().unwrap() {
+            return ids;
+        }
+    }
+}
+
+#[test]
+#[ignore = "loads installed StarCraft terrain assets and paints semantic ISOM terrain on a new map"]
+fn semantic_isom_rect_paints_a_hill_and_isom_brush_names_every_refusal() {
+    let starcraft = starcraft_path();
+    let tileset = 4_u8; // jungle: low and high ground brushes
+    let (ground, ground_name) = first_brush(&starcraft, tileset);
+    let catalog: Value = serde_json::from_str(
+        &isom::catalog_query(
+            &starcraft,
+            json!({"schema": "eud-map-catalog/1", "kind": "brushes", "tileset": tileset, "offset": 0, "limit": 64})
+                .to_string()
+                .as_bytes(),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let high = catalog["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| {
+            entry["graphicsValid"] == true
+                && entry["name"].as_str().unwrap().starts_with("High")
+                && entry["terrainType"].as_u64().unwrap() as u16 != ground
+        })
+        .expect("jungle exposes a High brush");
+    let high_type = high["terrainType"].as_u64().unwrap() as u16;
+    let source = temp_map("isom-source");
+    isom::map_new(&source, &starcraft, &blank_spec(tileset, 64, 64, ground)).unwrap();
+    let base = mtxm_tiles(&source);
+
+    // Refusals name the exact rule the model must correct.
+    let odd = try_operations(
+        &source,
+        "isom-odd",
+        json!([{"op": "terrain.isom_brush", "isomX": 11, "isomY": 20, "brush": high_type, "extent": 1}]),
+    )
+    .unwrap_err();
+    assert!(odd.contains("isomX + isomY must be even"), "{odd}");
+    let outside = try_operations(
+        &source,
+        "isom-outside",
+        json!([{"op": "terrain.isom_brush", "isomX": 40, "isomY": 20, "brush": high_type, "extent": 1}]),
+    )
+    .unwrap_err();
+    assert!(
+        outside.contains("outside the ISOM grid isomX 0..32, isomY 0..64"),
+        "{outside}"
+    );
+    let foreign = try_operations(
+        &source,
+        "isom-foreign-brush",
+        json!([{"op": "terrain.isom_brush", "isomX": 10, "isomY": 20, "brush": 4000, "extent": 1}]),
+    )
+    .unwrap_err();
+    assert!(
+        foreign.contains("brush 4000 is not a semantic ISOM brush"),
+        "{foreign}"
+    );
+    let tiny = try_operations(
+        &source,
+        "isom-rect-tiny",
+        json!([{"op": "terrain.isom_rect", "x": 20, "y": 20, "width": 2, "height": 2, "brush": high_type}]),
+    )
+    .unwrap_err();
+    assert!(tiny.contains("holds no whole ISOM diamond"), "{tiny}");
+
+    // One valid diamond changes tiles and reports how many.
+    let (single, report) = try_operations(
+        &source,
+        "isom-single",
+        json!([{"op": "terrain.isom_brush", "isomX": 10, "isomY": 20, "brush": high_type, "extent": 1}]),
+    )
+    .unwrap();
+    let effect = &report["effects"][0];
+    assert_eq!(effect["op"], "terrain.isom_brush");
+    assert_eq!(effect["diamonds"], 1);
+    let single_changed = mtxm_tiles(&single)
+        .iter()
+        .zip(&base)
+        .filter(|(after, before)| after != before)
+        .count();
+    assert!(single_changed > 0, "a valid diamond must change tiles");
+    assert_eq!(effect["changedTiles"], single_changed);
+
+    // A tile rectangle becomes a plateau of the high brush with the transition ring around it.
+    let (x, y, width, height) = (16_usize, 16_usize, 16_usize, 12_usize);
+    let (hill, report) = try_operations(
+        &source,
+        "isom-rect",
+        json!([{"op": "terrain.isom_rect", "x": x, "y": y, "width": width, "height": height, "brush": high_type}]),
+    )
+    .unwrap();
+    let effect = &report["effects"][0];
+    assert_eq!(effect["op"], "terrain.isom_rect");
+    assert!(effect["diamonds"].as_u64().unwrap() > 1);
+    let tiles = mtxm_tiles(&hill);
+    let high_ids = tile_ids_of_terrain_type(&starcraft, tileset, high_type);
+    assert!(!high_ids.is_empty());
+    let mut changed = Vec::new();
+    for (index, (after, before)) in tiles.iter().zip(&base).enumerate() {
+        if after != before {
+            changed.push((index % 64, index / 64));
+        }
+    }
+    assert_eq!(effect["changedTiles"], changed.len());
+    // Jungle cliffs are two diamonds thick: the ring reaches 8 tiles sideways and 4 tiles up/down.
+    for (tx, ty) in &changed {
+        assert!(
+            *tx + 8 >= x && *tx < x + width + 8 && *ty + 4 >= y && *ty < y + height + 4,
+            "tile ({tx}, {ty}) changed far outside the {width}x{height} rectangle at ({x}, {y})"
+        );
+    }
+    let mut plateau = 0_usize;
+    for ty in y + 3..y + height - 3 {
+        for tx in x + 4..x + width - 4 {
+            let tile = tiles[ty * 64 + tx];
+            assert!(
+                high_ids.contains(&tile),
+                "interior tile ({tx}, {ty}) = {tile} is not {} (brush {high_type}) over {ground_name}",
+                high["name"]
+            );
+            plateau += 1;
+        }
+    }
+    assert!(plateau > 0);
+    assert!(
+        changed.len() > plateau,
+        "the transition ring must add tiles beyond the plateau ({} changed, {plateau} interior)",
+        changed.len()
+    );
+    for path in [source, single, hill] {
+        fs::remove_file(path).ok();
+    }
+}
+
+#[test]
+#[ignore = "loads installed StarCraft terrain assets and paints semantic ISOM terrain on a new map"]
+fn semantic_isom_paint_is_deterministic_across_replays() {
+    // Apply replays a candidate's operation manifest and refuses a candidate
+    // whose replay differs, so the same batch on the same input must produce
+    // byte-identical terrain every time, including the subtile variation.
+    let starcraft = starcraft_path();
+    let tileset = 4_u8;
+    let (ground, _) = first_brush(&starcraft, tileset);
+    let catalog: Value = serde_json::from_str(
+        &isom::catalog_query(
+            &starcraft,
+            json!({"schema": "eud-map-catalog/1", "kind": "brushes", "tileset": tileset, "offset": 0, "limit": 64})
+                .to_string()
+                .as_bytes(),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let high_type = catalog["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| {
+            entry["graphicsValid"] == true
+                && entry["name"].as_str().unwrap().starts_with("High")
+                && entry["terrainType"].as_u64().unwrap() as u16 != ground
+        })
+        .expect("jungle exposes a High brush")["terrainType"]
+        .as_u64()
+        .unwrap() as u16;
+    let source = temp_map("isom-determinism-source");
+    isom::map_new(&source, &starcraft, &blank_spec(tileset, 64, 64, ground)).unwrap();
+    let operations = json!([
+        {"op": "terrain.isom_rect", "x": 8, "y": 8, "width": 20, "height": 14, "brush": high_type},
+        {"op": "terrain.isom_brush", "isomX": 24, "isomY": 40, "brush": high_type, "extent": 3},
+        {"op": "terrain.isom_rect", "x": 30, "y": 30, "width": 24, "height": 20, "brush": ground},
+    ]);
+    let mut outputs = Vec::new();
+    for round in 0..3 {
+        let (map, _) = try_operations(
+            &source,
+            &format!("isom-determinism-{round}"),
+            operations.clone(),
+        )
+        .unwrap();
+        outputs.push(map);
+    }
+    let first = mtxm_tiles(&outputs[0]);
+    for (round, map) in outputs.iter().enumerate().skip(1) {
+        let tiles = mtxm_tiles(map);
+        let differing = tiles.iter().zip(&first).filter(|(a, b)| a != b).count();
+        assert_eq!(
+            differing, 0,
+            "replay {round} of the same ISOM batch changed {differing} tiles"
+        );
+    }
+    let first_chk = isom::chk_extract(&outputs[0]).unwrap();
+    for map in &outputs[1..] {
+        assert_eq!(isom::chk_extract(map).unwrap(), first_chk);
+    }
+    fs::remove_file(source).ok();
+    for map in outputs {
+        fs::remove_file(map).ok();
+    }
+}
+
+#[test]
+#[ignore = "loads installed StarCraft terrain assets and edits scenario properties natively"]
+fn map_edit_rewrites_scenario_players_and_forces_on_a_new_map() {
+    let starcraft = starcraft_path();
+    let (terrain_type, _) = first_brush(&starcraft, 0);
+    let source = temp_map("props-source");
+    isom::map_new(&source, &starcraft, &blank_spec(0, 64, 64, terrain_type)).unwrap();
+
+    let edited = apply_operations(
+        &source,
+        "props-edit",
+        json!([
+            {"op": "scenario.set", "titleBytesHex": cp949_hex("속성 편집"), "descriptionBytesHex": ""},
+            {"op": "player.set", "slot": 2, "type": "computer", "race": "terran", "force": 0},
+            {"op": "player.set", "slot": 5, "type": "rescuable"},
+            {"op": "player.set", "slot": 9, "race": "random"},
+            {"op": "player.set", "slot": 10, "race": "independent"},
+            {"op": "force.set", "force": 1, "nameBytesHex": cp949_hex("수비"), "allied": true, "randomStart": false},
+            {"op": "force.set", "force": 3, "sharedVision": true}
+        ]),
+    );
+    let chk = sections(&isom::chk_extract(&edited).unwrap());
+    let strings = chk.get("STR ").unwrap();
+    let sprp = chk.get("SPRP").unwrap();
+    assert_eq!(
+        hex(&str_entry(strings, u16::from_le_bytes([sprp[0], sprp[1]]))),
+        cp949_hex("속성 편집")
+    );
+    assert_eq!(
+        str_entry(strings, u16::from_le_bytes([sprp[2], sprp[3]])),
+        Vec::<u8>::new(),
+        "description cleared"
+    );
+    assert_eq!(
+        chk.get("OWNR").unwrap().as_slice(),
+        &[6, 5, 5, 0, 0, 3, 0, 0, 7, 0, 0, 0]
+    );
+    assert_eq!(
+        chk.get("IOWN").unwrap().as_slice(),
+        &[6, 5, 5, 0, 0, 3, 0, 0, 7, 0, 0, 0],
+        "editor slot types follow OWNR"
+    );
+    assert_eq!(
+        chk.get("SIDE").unwrap().as_slice(),
+        &[5, 0, 1, 1, 0, 2, 1, 0, 4, 6, 3, 7]
+    );
+    let forc = chk.get("FORC").unwrap();
+    assert_eq!(&forc[..8], &[0, 1, 0, 0, 0, 0, 0, 0], "P3 moved to force 1");
+    assert_eq!(forc[16] & 0b1111, 0b0110, "force 1 untouched");
+    assert_eq!(
+        forc[17] & 0b1111,
+        0b1010,
+        "force 2 gained allies, lost random start, kept shared vision"
+    );
+    assert_eq!(
+        forc[19] & 0b1111,
+        0b1111,
+        "force 4 default flags keep shared vision"
+    );
+    assert_eq!(
+        hex(&str_entry(
+            strings,
+            u16::from_le_bytes([forc[10], forc[11]])
+        )),
+        cp949_hex("수비")
+    );
+    let report_output = temp_map("props-report");
+    let report: Value = serde_json::from_str(
+        &isom::mapedit(
+            &source,
+            &report_output,
+            &starcraft,
+            json!({
+                "schema": "eud-map-edit/1",
+                "expected": {
+                    "inputFileSha256": file_hash(&source),
+                    "tileset": "badlands",
+                    "width": 64,
+                    "height": 64
+                },
+                "operations": [{"op": "force.set", "force": 0, "alliedVictory": false}]
+            })
+            .to_string()
+            .as_bytes(),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        report["effects"],
+        json!([{"op": "force.set", "layer": "forces", "ordinal": 0}])
+    );
+
+    for (operations, expected) in [
+        (json!([{"op": "scenario.set"}]), "needs titleBytesHex"),
+        (
+            json!([{"op": "scenario.set", "titleBytesHex": ""}]),
+            "1..1024",
+        ),
+        (
+            json!([{"op": "player.set", "slot": 12, "type": "human"}]),
+            "0..11",
+        ),
+        (
+            json!([{"op": "player.set", "slot": 1}]),
+            "needs type, race, or force",
+        ),
+        (
+            json!([{"op": "player.set", "slot": 8, "force": 0}]),
+            "only valid for slots 0..7",
+        ),
+        (json!([{"op": "player.set", "slot": 1, "force": 4}]), "0..3"),
+        (
+            json!([{"op": "player.set", "slot": 1, "race": "xelnaga"}]),
+            "unsupported race",
+        ),
+        (
+            json!([{"op": "force.set", "force": 4, "allied": true}]),
+            "0..3",
+        ),
+        (
+            json!([{"op": "force.set", "force": 0}]),
+            "at least one flag",
+        ),
+        (
+            json!([{"op": "force.set", "force": 0, "nameBytesHex": "00"}]),
+            "cannot contain NUL",
+        ),
+    ] {
+        let output = temp_map("props-invalid");
+        let batch = json!({
+            "schema": "eud-map-edit/1",
+            "expected": {
+                "inputFileSha256": file_hash(&source),
+                "tileset": "badlands",
+                "width": 64,
+                "height": 64
+            },
+            "operations": operations
+        });
+        let error =
+            isom::mapedit(&source, &output, &starcraft, batch.to_string().as_bytes()).unwrap_err();
+        assert!(error.to_string().contains(expected), "{error}");
+        assert!(!output.exists(), "{expected}: invalid batch must not write");
+    }
+    fs::remove_file(&source).unwrap();
+    fs::remove_file(&edited).unwrap();
+    fs::remove_file(&report_output).unwrap();
 }

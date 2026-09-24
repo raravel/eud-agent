@@ -183,3 +183,52 @@ pub(super) fn status_error(status: reqwest::StatusCode) -> String {
     }
     .to_string()
 }
+
+const MAX_ERROR_DETAIL_CHARS: usize = 300;
+
+/// Maps a failed inference response to its status code and keeps the provider's own
+/// error message so the user can tell a per-model window limit from a dead key.
+pub(super) async fn inference_status_error(response: reqwest::Response) -> String {
+    let status = response.status();
+    let code = status_error(status);
+    let detail = bounded_body(response)
+        .await
+        .ok()
+        .and_then(|bytes| error_detail(&bytes));
+    match detail {
+        Some(detail) => format!("{code} (HTTP {}): {detail}", status.as_u16()),
+        None => format!("{code} (HTTP {})", status.as_u16()),
+    }
+}
+
+fn error_detail(bytes: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(bytes).ok()?;
+    let message = serde_json::from_str::<Value>(text)
+        .ok()
+        .and_then(|value| {
+            value
+                .pointer("/error/message")
+                .or_else(|| value.get("message"))
+                .or_else(|| value.get("error"))
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| text.to_string());
+    let detail: String = message
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(MAX_ERROR_DETAIL_CHARS)
+        .collect();
+    (!detail.is_empty()).then_some(detail)
+}

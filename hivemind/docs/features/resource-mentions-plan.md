@@ -225,7 +225,7 @@ Add a stable persistent-selection hash over the complete serialized `PersistentS
 - selected cell count;
 - canonical rows.
 
-Unlike `SelectionMask::snapshot_hash`, this hash excludes a candidate `source_revision`; it describes the shared saved definition. The `map.region` snapshot separately binds it to the current source-map file hash and dimensions.
+This hash excludes a candidate `source_revision`; it describes the shared saved definition, and `SelectionMask::snapshot_hash` delegates to it so a Map-window region mention survives the palette rebinding every candidate revision performs (a mention on a rebound, unchanged selection is not stale; any content change still is). The `map.region` snapshot separately binds it to the current source-map file hash and dimensions.
 
 ### D7 — Bind location snapshots to the exact saved CHK record
 

@@ -9,6 +9,7 @@ import {
   FileInput,
   FileOutput,
   FolderKanban,
+  FolderOpen,
   Hammer,
   LoaderCircle,
   Plus,
@@ -37,6 +38,7 @@ import type {
   NotificationEvent,
 } from "@/lib/ipc";
 import { isMacOS } from "@/lib/platform";
+import type { StarcraftAvailability } from "@/lib/mapNew";
 import { cn, formatPathForDisplay } from "@/lib/utils";
 import {
   AVAILABILITY_LABELS,
@@ -52,6 +54,8 @@ import type {
 
 export interface SettingsDialogProps {
   open: boolean;
+  /** Category to show when the dialog opens for a specific task (e.g. 컴파일 for SCMDraft 2). */
+  category?: SettingsCategory;
   settings: AppSettings | null;
   busy?: boolean;
   providerBusy?: ProviderId;
@@ -68,6 +72,12 @@ export interface SettingsDialogProps {
   euddraft: EuddraftSettings | null;
   euddraftBusy?: "load" | "check" | "update" | null;
   euddraftError?: string;
+  scmdraftBusy?: boolean;
+  scmdraftError?: string;
+  /** Resolved StarCraft data folder for map rendering; null while loading or unreadable. */
+  starcraft?: StarcraftAvailability | null;
+  starcraftBusy?: boolean;
+  starcraftError?: string;
   onOpenChange(open: boolean): void;
   onSettingsChange(settings: AppSettings): void;
   onReload(): void;
@@ -93,16 +103,18 @@ export interface SettingsDialogProps {
   onProjectExport(): void;
   onEuddraftCheck(): void;
   onEuddraftUpdate(): void;
+  onScmdraftPick(): Promise<void> | void;
+  onStarcraftPick?(): Promise<void> | void;
 }
 
-type SettingsCategory = "project" | "compile" | "providers" | "notifications";
+export type SettingsCategory = "project" | "compile" | "providers" | "notifications";
 
 const EVENT_COPY: Readonly<
   Record<NotificationEvent, { title: string; description: string }>
 > = {
   agentTurnComplete: {
     title: "에이전트 턴 종료",
-    description: "계획·변경사항 검토를 제외한 에이전트 턴이 종료됐을 때",
+    description: "계획 검토를 제외한 에이전트 턴이 종료됐을 때",
   },
   askResponseRequired: {
     title: "ASK 응답 필요",
@@ -112,9 +124,9 @@ const EVENT_COPY: Readonly<
     title: "계획 승인 필요",
     description: "새 계획안이나 수정된 계획안이 도착했을 때",
   },
-  changesetReview: {
-    title: "변경사항 검토 필요",
-    description: "적용 또는 되돌리기를 결정할 변경사항이 도착했을 때",
+  reviewRequired: {
+    title: "검토할 변경 도착",
+    description: "하네스가 정리한 문서 변경이나 맵 후보가 검토를 기다릴 때",
   },
 };
 
@@ -288,8 +300,121 @@ function EuddraftSettingsPanel({
   );
 }
 
+interface ScmdraftSettingsPanelProps {
+  path: string;
+  busy: boolean;
+  error?: string;
+  onPick(): Promise<void> | void;
+}
+
+function ScmdraftSettingsPanel({ path, busy, error, onPick }: ScmdraftSettingsPanelProps) {
+  return (
+    <section aria-labelledby="settings-scmdraft-heading" className="mt-8">
+      <h2 id="settings-scmdraft-heading" className="text-base font-semibold">SCMDraft 2</h2>
+      <p className="mt-1.5 text-sm leading-6 text-muted-foreground">
+        상단의 &quot;SCMDraft 2로 열기&quot;가 이 실행 파일로 원본 맵을 엽니다.
+      </p>
+      <dl className="mt-5 overflow-hidden rounded-xl border border-border bg-card/40">
+        <div className="grid gap-1.5 px-4 py-3.5">
+          <dt className="text-xs font-medium text-muted-foreground">실행 파일</dt>
+          <dd
+            className="break-all font-mono text-sm text-foreground"
+            title={formatPathForDisplay(path)}
+          >
+            {formatPathForDisplay(path) || "지정되지 않음"}
+          </dd>
+        </div>
+      </dl>
+      {error && (
+        <p
+          role="alert"
+          className="mt-3 rounded-lg border border-destructive/40 bg-destructive/10 px-4 py-3 text-sm text-destructive"
+        >
+          {error}
+        </p>
+      )}
+      <div className="mt-5 flex flex-col gap-3 sm:flex-row sm:justify-end">
+        <Button
+          type="button"
+          variant="outline"
+          className="h-11"
+          disabled={busy}
+          aria-busy={busy || undefined}
+          onClick={() => void onPick()}
+        >
+          {busy ? (
+            <LoaderCircle aria-hidden className="size-4 animate-spin motion-reduce:animate-none" />
+          ) : (
+            <FolderOpen aria-hidden className="size-4" />
+          )}
+          {busy ? "선택 중…" : "실행 파일 선택"}
+        </Button>
+      </div>
+    </section>
+  );
+}
+
+interface StarcraftSettingsPanelProps {
+  availability: StarcraftAvailability | null;
+  busy: boolean;
+  error?: string;
+  onPick(): Promise<void> | void;
+}
+
+function StarcraftSettingsPanel({ availability, busy, error, onPick }: StarcraftSettingsPanelProps) {
+  const path = availability?.available ? availability.path : "";
+  return (
+    <section aria-labelledby="settings-starcraft-heading" className="mt-8">
+      <h2 id="settings-starcraft-heading" className="text-base font-semibold">StarCraft</h2>
+      <p className="mt-1.5 text-sm leading-6 text-muted-foreground">
+        맵 렌더링, 미니맵, 빈 맵 만들기가 이 설치 폴더의 타일셋 데이터를 읽습니다.
+      </p>
+      <dl className="mt-5 overflow-hidden rounded-xl border border-border bg-card/40">
+        <div className="grid gap-1.5 px-4 py-3.5">
+          <dt className="text-xs font-medium text-muted-foreground">설치 폴더</dt>
+          <dd
+            className="break-all font-mono text-sm text-foreground"
+            title={formatPathForDisplay(path)}
+          >
+            {formatPathForDisplay(path) || (availability ? "찾지 못함" : "확인 중…")}
+          </dd>
+        </div>
+      </dl>
+      {availability && !availability.available && availability.reason && !error && (
+        <p className="mt-3 text-sm leading-6 text-muted-foreground">{availability.reason}</p>
+      )}
+      {error && (
+        <p
+          role="alert"
+          className="mt-3 rounded-lg border border-destructive/40 bg-destructive/10 px-4 py-3 text-sm text-destructive"
+        >
+          {error}
+        </p>
+      )}
+      <div className="mt-5 flex flex-col gap-3 sm:flex-row sm:justify-end">
+        <Button
+          type="button"
+          variant="outline"
+          className="h-11"
+          disabled={busy}
+          aria-busy={busy || undefined}
+          onClick={() => void onPick()}
+        >
+          {busy ? (
+            <LoaderCircle aria-hidden className="size-4 animate-spin motion-reduce:animate-none" />
+          ) : (
+            <FolderOpen aria-hidden className="size-4" />
+          )}
+          {busy ? "선택 중…" : "폴더 선택"}
+        </Button>
+      </div>
+    </section>
+  );
+}
+
 export function SettingsDialog({
   open,
+  category: requestedCategory,
   settings,
   busy = false,
   providerBusy,
@@ -306,6 +431,11 @@ export function SettingsDialog({
   euddraft,
   euddraftBusy = null,
   euddraftError,
+  scmdraftBusy = false,
+  scmdraftError,
+  starcraft = null,
+  starcraftBusy = false,
+  starcraftError,
   onOpenChange,
   onSettingsChange,
   onReload,
@@ -327,6 +457,8 @@ export function SettingsDialog({
   onProjectExport,
   onEuddraftCheck,
   onEuddraftUpdate,
+  onScmdraftPick,
+  onStarcraftPick,
 }: SettingsDialogProps) {
   const [category, setCategory] = useState<SettingsCategory>("providers");
   const [selectedProvider, setSelectedProvider] = useState<ProviderId>();
@@ -344,6 +476,12 @@ export function SettingsDialog({
     setSelectedProvider(undefined);
     providerToRestoreRef.current = undefined;
   }, [open]);
+
+  useEffect(() => {
+    if (!open || !requestedCategory) return;
+    setCategory(requestedCategory);
+    setSelectedProvider(undefined);
+  }, [open, requestedCategory]);
 
   useEffect(() => {
     if (!open || category !== "providers") return;
@@ -382,6 +520,11 @@ export function SettingsDialog({
         },
       },
     });
+  };
+
+  const updateDeepPlanning = (checked: boolean) => {
+    if (!settings) return;
+    onSettingsChange({ ...settings, deepPlanning: checked });
   };
 
   const updateLargeContext = (model: string, checked: boolean) => {
@@ -539,13 +682,29 @@ export function SettingsDialog({
                 </p>
               </div>
             ) : category === "compile" ? (
-              <EuddraftSettingsPanel
-                status={euddraft}
-                busy={euddraftBusy}
-                error={euddraftError}
-                onCheck={onEuddraftCheck}
-                onUpdate={onEuddraftUpdate}
-              />
+              <>
+                <EuddraftSettingsPanel
+                  status={euddraft}
+                  busy={euddraftBusy}
+                  error={euddraftError}
+                  onCheck={onEuddraftCheck}
+                  onUpdate={onEuddraftUpdate}
+                />
+                <ScmdraftSettingsPanel
+                  path={settings?.scmdraftPath ?? ""}
+                  busy={busy || scmdraftBusy}
+                  error={scmdraftError}
+                  onPick={onScmdraftPick}
+                />
+                {onStarcraftPick && (
+                  <StarcraftSettingsPanel
+                    availability={starcraft}
+                    busy={busy || starcraftBusy}
+                    error={starcraftError}
+                    onPick={onStarcraftPick}
+                  />
+                )}
+              </>
             ) : category === "providers" ? (
               selectedProviderStatus ? (
                 <div className="animate-in fade-in slide-in-from-right-2 duration-200 motion-reduce:animate-none">
@@ -744,6 +903,24 @@ export function SettingsDialog({
                       세션과 하네스 작업의 제공자는 바뀌지 않습니다.
                     </p>
                   </div>
+                  {settings && (
+                    <label className="mt-4 flex min-h-11 items-center justify-between gap-4 rounded-xl border border-border bg-card/40 px-4 py-3.5">
+                      <span className="min-w-0">
+                        <span className="block text-sm font-medium text-foreground">
+                          더 똑똑한 계획
+                        </span>
+                        <span className="mt-0.5 block text-xs leading-5 text-muted-foreground">
+                          계획마다 모델 호출이 여러 번 추가되어 토큰 사용량이 크게 늘어납니다.
+                        </span>
+                      </span>
+                      <Switch
+                        checked={settings.deepPlanning}
+                        disabled={busy}
+                        aria-label="더 똑똑한 계획"
+                        onCheckedChange={updateDeepPlanning}
+                      />
+                    </label>
+                  )}
                 </div>
               )
             ) : (

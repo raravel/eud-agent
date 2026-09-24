@@ -9,6 +9,7 @@ import { fireEvent, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { createPanelStore, type PanelState } from "@/state/store";
 import { InstructionBox, type ChatPayload } from "@/components/InstructionBox";
+import type { AutonomousRunState } from "@/lib/ipc";
 
 function readyState(): PanelState {
   const store = createPanelStore();
@@ -21,6 +22,42 @@ function readyState(): PanelState {
 }
 
 const noop = () => {};
+
+function autonomousRun(
+  status: AutonomousRunState["status"],
+  overrides: Partial<AutonomousRunState> = {},
+): AutonomousRunState {
+  return {
+    schemaVersion: 1,
+    id: "auto-1",
+    status,
+    startedAt: Date.now() - 60_000,
+    updatedAt: Date.now(),
+    iteration: 3,
+    goal: "대규모 트리거 작업",
+    requestId: "req-auto",
+    clientTurnId: "11111111-1111-4111-8111-111111111111",
+    projectId: "MyMap",
+    projectRevision: "revision-3",
+    policy: {
+      maxWallTimeMillis: 14_400_000,
+    },
+    progress: {
+      elapsedActiveMillis: 60_000,
+      readActions: 17,
+      writeActions: 9,
+      consecutiveNoProgress: 1,
+      latestBuild: {
+        inputRevision: "revision-3",
+        diagnosticsFingerprint: "build-fingerprint",
+        errorCount: 2,
+        success: false,
+        consecutiveNoProgress: 1,
+      },
+    },
+    ...overrides,
+  };
+}
 const modelSettings = {
   provider: "codex" as const,
   models: [
@@ -86,7 +123,7 @@ describe("InstructionBox — textarea sizing", () => {
 describe("InstructionBox — send gating (v2)", () => {
   it("enables Send when connected with an open project (ready)", () => {
     render(<InstructionBox state={readyState()} onSend={noop} />);
-    expect(screen.getByRole("button", { name: "전송" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "실행" })).toBeEnabled();
   });
 
   it("enables Send for an empty-but-open project (no settable-target gate)", () => {
@@ -95,7 +132,7 @@ describe("InstructionBox — send gating (v2)", () => {
     store.applyStatus({ compiling: false, project: "MyMap" });
     store.applyList({ files: [] }); // zero files, still open
     render(<InstructionBox state={store.getState()} onSend={noop} />);
-    expect(screen.getByRole("button", { name: "전송" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "실행" })).toBeEnabled();
   });
 
   it("disables Send when no project is open", () => {
@@ -103,7 +140,7 @@ describe("InstructionBox — send gating (v2)", () => {
     store.wsOpen();
     store.applyList({ error: "no project" });
     render(<InstructionBox state={store.getState()} onSend={noop} />);
-    expect(screen.getByRole("button", { name: "전송" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "실행" })).toBeDisabled();
   });
 
   it("disables Send while busy (thinking)", () => {
@@ -114,7 +151,7 @@ describe("InstructionBox — send gating (v2)", () => {
     });
     store.chatSent(); // thinking
     render(<InstructionBox state={store.getState()} onSend={noop} />);
-    expect(screen.getByRole("button", { name: "전송" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "실행" })).toBeDisabled();
   });
 
   it("disables Send while the editor is compiling", () => {
@@ -125,7 +162,7 @@ describe("InstructionBox — send gating (v2)", () => {
     });
     store.applyStatus({ compiling: true, project: "MyMap" });
     render(<InstructionBox state={store.getState()} onSend={noop} />);
-    expect(screen.getByRole("button", { name: "전송" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "실행" })).toBeDisabled();
   });
 });
 
@@ -160,7 +197,7 @@ describe("InstructionBox — persistent active-turn feedback", () => {
     );
     expect(screen.getByTestId("active-turn-status")).toHaveTextContent("추론 중");
 
-    store.agentEvent("tool_call", "search_docs");
+    store.agentEvent("tool_call", "search_docs", { callId: "search-call" });
     view.rerender(
       <InstructionBox
         state={store.getState()}
@@ -234,7 +271,7 @@ describe("InstructionBox — plan_review feedback channel (EUD-074)", () => {
 
   it("keeps Send ENABLED during plan_review (the input is the feedback channel)", () => {
     render(<InstructionBox state={planReviewState()} onSend={noop} />);
-    expect(screen.getByRole("button", { name: "전송" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "실행" })).toBeEnabled();
   });
 
   it("switches the placeholder to the plan-feedback guidance", () => {
@@ -253,11 +290,12 @@ describe("InstructionBox — chat payload (v2)", () => {
     const onSend = vi.fn<(p: ChatPayload) => void>();
     render(<InstructionBox state={readyState()} onSend={onSend} />);
     await user.type(screen.getByRole("combobox", { name: "지시 입력" }), "트리거 추가");
-    await user.click(screen.getByRole("button", { name: "전송" }));
+    await user.click(screen.getByRole("button", { name: "실행" }));
     expect(onSend).toHaveBeenCalledWith({
       text: "트리거 추가",
       attachments: [],
       mentions: [],
+      executionMode: "interactive",
     });
   });
 
@@ -266,7 +304,7 @@ describe("InstructionBox — chat payload (v2)", () => {
     const onSend = vi.fn<(p: ChatPayload) => void>();
     render(<InstructionBox state={readyState()} onSend={onSend} />);
     await user.type(screen.getByRole("combobox", { name: "지시 입력" }), "   ");
-    await user.click(screen.getByRole("button", { name: "전송" }));
+    await user.click(screen.getByRole("button", { name: "실행" }));
     expect(onSend).not.toHaveBeenCalled();
   });
   it("sends a mention-only request with the opaque backend snapshot", async () => {
@@ -302,7 +340,7 @@ describe("InstructionBox — chat payload (v2)", () => {
 
     await user.type(screen.getByRole("combobox", { name: "지시 입력" }), "@");
     await user.click(await screen.findByRole("option", { name: /@영역 A/ }));
-    await user.click(screen.getByRole("button", { name: "전송" }));
+    await user.click(screen.getByRole("button", { name: "실행" }));
 
     expect(onSend).toHaveBeenCalledWith({
       text: "",
@@ -313,6 +351,7 @@ describe("InstructionBox — chat payload (v2)", () => {
           mention: mention.mention,
         }),
       ],
+      executionMode: "interactive",
     });
   });
 });
@@ -356,11 +395,12 @@ describe("InstructionBox — attachments", () => {
     expect(screen.getByText("screenshot.png")).toBeInTheDocument();
 
     await user.type(screen.getByRole("combobox", { name: "지시 입력" }), "이 화면을 봐줘");
-    await user.click(screen.getByRole("button", { name: "전송" }));
+    await user.click(screen.getByRole("button", { name: "실행" }));
     expect(onSend).toHaveBeenCalledWith({
       text: "이 화면을 봐줘",
       attachments: [imageAttachment],
       mentions: [],
+      executionMode: "interactive",
     });
   });
 
@@ -379,12 +419,13 @@ describe("InstructionBox — attachments", () => {
       screen.getByLabelText("파일 첨부"),
       new File(["png!"], "screenshot.png", { type: "image/png" }),
     );
-    await user.click(screen.getByRole("button", { name: "전송" }));
+    await user.click(screen.getByRole("button", { name: "실행" }));
 
     expect(onSend).toHaveBeenCalledWith({
       text: "",
       attachments: [imageAttachment],
       mentions: [],
+      executionMode: "interactive",
     });
   });
 
@@ -406,11 +447,12 @@ describe("InstructionBox — attachments", () => {
     );
     expect(screen.getByText("battle-theme.flac")).toBeInTheDocument();
     expect(screen.queryByRole("img")).not.toBeInTheDocument();
-    await user.click(screen.getByRole("button", { name: "전송" }));
+    await user.click(screen.getByRole("button", { name: "실행" }));
     expect(onSend).toHaveBeenCalledWith({
       text: "",
       attachments: [audioAttachment],
       mentions: [],
+      executionMode: "interactive",
     });
   });
 
@@ -646,6 +688,95 @@ describe("InstructionBox — provider-bound model settings", () => {
   });
 });
 
+describe("InstructionBox — 장시간 작업", () => {
+  it("offers only the ordinary run action in the composer", async () => {
+    const user = userEvent.setup();
+    const onSend = vi.fn<(payload: ChatPayload) => void>();
+    render(<InstructionBox state={readyState()} onSend={onSend} />);
+    const input = screen.getByRole("combobox", { name: "지시 입력" });
+
+    expect(
+      screen.queryByRole("button", { name: "장시간 작업 실행" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("combobox", { name: "장시간 작업 실행 한도" }),
+    ).not.toBeInTheDocument();
+
+    await user.type(input, "일반 작업");
+    await user.click(screen.getByRole("button", { name: "실행" }));
+    expect(onSend).toHaveBeenLastCalledWith({
+      text: "일반 작업",
+      attachments: [],
+      mentions: [],
+      executionMode: "interactive",
+    });
+  });
+
+  it("shows live progress and exposes pause and stop without conflating turn cancel", async () => {
+    const onPause = vi.fn();
+    const onStop = vi.fn();
+    const { container } = render(
+      <InstructionBox
+        state={readyState()}
+        onSend={noop}
+        autonomousRun={autonomousRun("running", {
+          blocker: "현재 revision의 build_run이 필요합니다.",
+        })}
+        onAutonomousPause={onPause}
+        onAutonomousStop={onStop}
+      />,
+    );
+
+    expect(screen.getByText("장시간 작업 실행 중")).toBeInTheDocument();
+    expect(screen.getByText("반복 3")).toBeInTheDocument();
+    expect(screen.getByText(/읽기 17 · 쓰기 9/)).toBeInTheDocument();
+    expect(screen.getByText(/최근 빌드 오류 2개/)).toBeInTheDocument();
+    expect(screen.getByText(/현재 revision의 build_run/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "실행" })).toBeDisabled();
+    expect(
+      screen.queryByRole("button", { name: "작업 중단" }),
+    ).not.toBeInTheDocument();
+    expect(container.querySelector('[data-testid="active-turn-status"]')).toHaveClass(
+      "sm:flex-row",
+    );
+
+    await userEvent.click(
+      screen.getByRole("button", { name: "장시간 작업 일시 중지" }),
+    );
+    await userEvent.click(
+      screen.getByRole("button", { name: "장시간 작업 중단" }),
+    );
+    expect(onPause).toHaveBeenCalledOnce();
+    expect(onStop).toHaveBeenCalledOnce();
+  });
+
+  it("offers explicit resume after restart and retains the stop action", async () => {
+    const onResume = vi.fn();
+    const onStop = vi.fn();
+    render(
+      <InstructionBox
+        state={readyState()}
+        onSend={noop}
+        autonomousRun={autonomousRun("paused_after_restart", {
+          pauseReason: "restart",
+          blocker: "앱 재시작 후 명시적으로 계속해야 합니다.",
+        })}
+        onAutonomousResume={onResume}
+        onAutonomousStop={onStop}
+      />,
+    );
+
+    expect(screen.getByText("앱 재시작 후 일시 중지")).toBeInTheDocument();
+    await userEvent.click(
+      screen.getByRole("button", { name: "장시간 작업 계속" }),
+    );
+    expect(onResume).toHaveBeenCalledOnce();
+    expect(
+      screen.getByRole("button", { name: "장시간 작업 중단" }),
+    ).toBeEnabled();
+  });
+});
+
 describe("InstructionBox — session context usage", () => {
   it("shows current context and cumulative usage through the Context hover card", async () => {
     const user = userEvent.setup();
@@ -755,7 +886,7 @@ describe("InstructionBox — RAG warmup gate", () => {
 
   it("disables Send + the textarea with a guide placeholder while loading", () => {
     render(<InstructionBox state={loadingState()} onSend={noop} />);
-    expect(screen.getByRole("button", { name: "전송" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "실행" })).toBeDisabled();
     const textarea = screen.getByRole("combobox", { name: "지시 입력" });
     expect(textarea).toBeDisabled();
     expect(textarea).toHaveAttribute(
@@ -773,7 +904,7 @@ describe("InstructionBox — RAG warmup gate", () => {
     store.ragWarmupChanged("loading");
     store.ragWarmupChanged("ready");
     render(<InstructionBox state={store.getState()} onSend={noop} />);
-    expect(screen.getByRole("button", { name: "전송" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "실행" })).toBeEnabled();
     expect(screen.getByRole("combobox", { name: "지시 입력" })).toBeEnabled();
   });
 });

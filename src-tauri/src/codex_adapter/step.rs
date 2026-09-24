@@ -44,6 +44,7 @@ impl CodexAdapter {
                         access: turn.workspace_access,
                         mcp_endpoint: request.native_mcp_endpoint.clone(),
                         native_tools_enabled: true,
+                        temp_dir: turn.workspace_temp.clone(),
                     };
                     self.ensure_foreground_client(key.clone(), model, large_context)
                         .await?;
@@ -107,6 +108,7 @@ impl CodexAdapter {
                         None,
                         WorkspaceAccess::Read,
                         false,
+                        None,
                     )
                     .await
                     .map_err(transport_error)?;

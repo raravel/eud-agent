@@ -6,11 +6,55 @@ import {
   connectGridCells,
   freeMaskCells,
   rectangleCells,
+  rowSpanOutline,
   rowsToCells,
   selectionCellsForGesture,
 } from "./selectionMask";
 
+const sortSegments = (segments: ReturnType<typeof rowSpanOutline>) =>
+  segments
+    .map(({ x0, y0, x1, y1 }) => `${x0},${y0}-${x1},${y1}`)
+    .sort();
+
 describe("Map Agent selection masks", () => {
+  it("outlines a rectangle with only its four outer edges", () => {
+    const rows = cellsToRows(rectangleCells({ x: 1, y: 1 }, { x: 3, y: 2 }, 16, 16));
+    expect(sortSegments(rowSpanOutline(rows))).toEqual(
+      sortSegments([
+        { x0: 1, y0: 1, x1: 1, y1: 2 },
+        { x0: 1, y0: 2, x1: 1, y1: 3 },
+        { x0: 4, y0: 1, x1: 4, y1: 2 },
+        { x0: 4, y0: 2, x1: 4, y1: 3 },
+        { x0: 1, y0: 1, x1: 4, y1: 1 },
+        { x0: 1, y0: 3, x1: 4, y1: 3 },
+      ]),
+    );
+  });
+
+  it("draws no edge between vertically or horizontally adjacent selected tiles", () => {
+    // L shape: (0,0) (1,0) (0,1)
+    const rows = cellsToRows(new Set(["0,0", "1,0", "0,1"]));
+    const segments = sortSegments(rowSpanOutline(rows));
+    expect(segments).not.toContain("1,0-1,1"); // between (0,0) and (1,0)
+    expect(segments).not.toContain("0,1-1,1"); // between (0,0) and (0,1)
+    expect(segments).toEqual(
+      sortSegments([
+        { x0: 0, y0: 0, x1: 2, y1: 0 }, // top of both row-0 tiles, one line
+        { x0: 0, y0: 0, x1: 0, y1: 1 },
+        { x0: 2, y0: 0, x1: 2, y1: 1 },
+        { x0: 1, y0: 1, x1: 2, y1: 1 }, // under (1,0), where (1,1) is unselected
+        { x0: 0, y0: 1, x1: 0, y1: 2 },
+        { x0: 1, y0: 1, x1: 1, y1: 2 }, // right of (0,1)
+        { x0: 0, y0: 2, x1: 1, y1: 2 },
+      ]),
+    );
+  });
+
+  it("outlines disjoint spans on one row separately", () => {
+    const rows = cellsToRows(new Set(["0,0", "2,0"]));
+    expect(rowSpanOutline(rows)).toHaveLength(8);
+  });
+
   it("connects high-speed pointer samples without tile gaps", () => {
     const cells = connectGridCells({ x: 1, y: 1 }, { x: 17, y: 9 });
     expect(cells[0]).toEqual({ x: 1, y: 1 });

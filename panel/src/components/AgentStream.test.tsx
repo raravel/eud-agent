@@ -278,6 +278,72 @@ describe("AgentStream — tool args/result (EUD-068)", () => {
     expect(container.textContent).toContain("hello layout content");
   });
 
+  it("renders a map_draft_render image envelope as the picture, not its base64", async () => {
+    const user = userEvent.setup();
+    const data =
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+    const { container } = render(
+      <AgentStream
+        reasoning=""
+        answerStarted={false}
+        live={true}
+        tools={[
+          {
+            id: "t1",
+            name: "map_draft_render",
+            state: "done",
+            args: '{"x":0,"y":0,"width":12,"height":8}',
+            detail: JSON.stringify({
+              image: { mimeType: "image/png", width: 96, height: 64, data },
+            }),
+          },
+        ]}
+      />,
+    );
+    await user.click(screen.getByRole("button", { name: /map_draft_render/ }));
+    const image = screen.getByRole("img", { name: /map_draft_render 렌더링 결과/ });
+    expect(image).toHaveAttribute("src", `data:image/png;base64,${data}`);
+    expect(image).toHaveAttribute("width", "96");
+    expect(image).toHaveAttribute("height", "64");
+    expect(screen.getByText("96 × 64")).toBeInTheDocument();
+    expect(screen.getByText('{"x":0,"y":0,"width":12,"height":8}')).toBeInTheDocument();
+    expect(container.querySelector("pre")?.textContent).not.toContain(data);
+    expect(container.textContent).not.toContain(data);
+  });
+
+  it("shows a placeholder for a receipt image whose payload was dropped", async () => {
+    const user = userEvent.setup();
+    render(
+      <AgentStream
+        reasoning=""
+        answerStarted={false}
+        live={false}
+        tools={[
+          {
+            id: "t1",
+            name: "map_draft_render",
+            state: "done",
+            detail: JSON.stringify({
+              image: {
+                mimeType: "image/png",
+                width: 96,
+                height: 64,
+                dataBytes: 1234,
+                dataSha256: "ab".repeat(32),
+              },
+            }),
+          },
+        ]}
+      />,
+    );
+    await user.click(screen.getByRole("button", { name: /map_draft_render/ }));
+    expect(screen.queryByRole("img")).toBeNull();
+    expect(
+      screen.getByText("렌더링된 이미지는 기록에 남지 않았습니다."),
+    ).toBeInTheDocument();
+    expect(screen.getByText("1,234바이트 생략")).toBeInTheDocument();
+  });
+
   it("renders a 실패 badge for a failed tool row", () => {
     render(
       <AgentStream

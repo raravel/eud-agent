@@ -90,9 +90,8 @@ async fn c16_actual_harness_retry_pins_binding_and_only_stages_validated_delta()
     let canonical = manager
         .prepare_current()
         .expect("prepare canonical documents");
-    let document = canonical.root.join("specs/game.md");
+    let document = canonical.workspace_root.join("specs/game.md");
     std::fs::write(&document, "# Gameplay\n\nOld behavior.\n").expect("seed canonical document");
-    let original_document = std::fs::read(&document).expect("read canonical document");
     let source_path = fixture.root.join("project/src/main.eps");
     let source = std::fs::read(&source_path).expect("read source");
     let pointer = transcript_root(&fixture.dirs, &fixture.session_id).join("current.json");
@@ -111,10 +110,6 @@ async fn c16_actual_harness_retry_pins_binding_and_only_stages_validated_delta()
             checkpoint
         );
         assert_eq!(std::fs::read(&source_path).expect("source remains"), source);
-        assert_eq!(
-            std::fs::read(&document).expect("canonical document remains"),
-            original_document
-        );
     };
     let mut job = HarnessJob::new_with_provider(
         fixture.session_id.clone(),
@@ -194,15 +189,15 @@ async fn c16_actual_harness_retry_pins_binding_and_only_stages_validated_delta()
             .len(),
         2
     );
-    let staged_root = fixture
-        .dirs
-        .session_workspaces_dir()
-        .join(&canonical.id)
-        .join(&reviewed.workspace_session_id);
-    assert!(std::fs::read_to_string(staged_root.join("specs/game.md"))
+    // Staging writes the reviewable documents directly onto the canonical tree;
+    // a later reject restores the exact pre-stage bytes from the journal.
+    assert!(std::fs::read_to_string(&document)
         .expect("read staged documentation")
         .contains("Accepted behavior."));
-    assert!(staged_root.join("worklog/req-c16-source.md").is_file());
+    assert!(canonical
+        .workspace_root
+        .join("worklog/req-c16-source.md")
+        .is_file());
     assert!(!transcript_root(&fixture.dirs, &format!("{}-generator", job.id)).exists());
     assert_main();
 
@@ -234,16 +229,15 @@ async fn c16_actual_harness_retry_pins_binding_and_only_stages_validated_delta()
     assert!(journal
         .changeset(&format!("req-{}-{}", rejected.id, rejected.attempts))
         .is_err());
-    let rejected_root = fixture
-        .dirs
-        .session_workspaces_dir()
-        .join(canonical.id)
-        .join(&rejected.workspace_session_id);
-    assert_eq!(
-        std::fs::read(rejected_root.join("specs/game.md")).expect("rejected document baseline"),
-        original_document
-    );
-    assert!(!rejected_root.join("worklog/req-c16-unapproved.md").exists());
+    // The unapproved delta fails before staging, so the staged review state is
+    // untouched and no worklog appears for the rejected request.
+    assert!(std::fs::read_to_string(&document)
+        .expect("staged document remains under review")
+        .contains("Accepted behavior."));
+    assert!(!canonical
+        .workspace_root
+        .join("worklog/req-c16-unapproved.md")
+        .exists());
     assert_main();
     http.join();
 }

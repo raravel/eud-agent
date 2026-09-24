@@ -454,11 +454,9 @@ impl ProviderService {
                 let _guard = self.inner.claude_lock.lock().await;
                 let dirs = self.inner.dirs.clone();
                 self.inner.secrets.import_cli_credential(provider, || {
-                    let state = crate::claude_auth::login_status(&dirs);
-                    state
-                        .authenticated
-                        .then_some(())
-                        .ok_or_else(|| "provider_not_authenticated".to_string())
+                    crate::claude_auth::require_authenticated(&crate::claude_auth::login_status(
+                        &dirs,
+                    ))
                 })?;
             }
             _ => return Err("unsupported_operation".to_string()),
@@ -609,6 +607,7 @@ impl ProviderService {
                         None,
                         crate::provider_runtime::WorkspaceAccess::Read,
                         true,
+                        None,
                     )
                     .await
                     .map_err(|_| "provider_catalog_unavailable".to_string())?;
@@ -646,7 +645,31 @@ impl ProviderService {
                     })
                     .collect())
             }
-            ProviderId::ClaudeCode => Ok(crate::claude_client::provider_managed_models(selected)),
+            ProviderId::ClaudeCode => {
+                // Hold the profile lock across the credential read and any OAuth refresh
+                // write-back (so a concurrent logout is never resurrected), not the catalog fetch.
+                let token = {
+                    let _guard = self.inner.claude_lock.lock().await;
+                    crate::claude_client::access_token(
+                        &self.inner.client,
+                        &self.inner.dirs.claude_config_dir(),
+                    )
+                    .await
+                };
+                let token = match token {
+                    Ok(token) => token,
+                    Err(_) => return Ok(crate::claude_client::provider_managed_models(selected)),
+                };
+                let live =
+                    crate::claude_client::fetch_catalog(&self.inner.client, &token, selected).await;
+                drop(token);
+                // Live discovery is an enrichment: any failure degrades to CLI-selected default.
+                Ok(
+                    live.unwrap_or_else(|_| {
+                        crate::claude_client::provider_managed_models(selected)
+                    }),
+                )
+            }
             ProviderId::Antigravity => {
                 let credential =
                     crate::antigravity_auth::access_credential(&self.inner.dirs).await?;

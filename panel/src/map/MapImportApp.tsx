@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { Layers3, LoaderCircle, MapPinned, X } from "lucide-react";
+import { FolderOpen, Layers3, LoaderCircle, MapPinned, X } from "lucide-react";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -9,6 +9,8 @@ import { MapImportToolbar } from "./MapImportToolbar";
 import { MapMinimap } from "./MapMinimap";
 import {
   mapImportBootstrap,
+  mapImportReferenceList,
+  mapImportReferencePick,
   mapImportRenderSource,
   mapImportSourceObjects,
   mapImportSourcePick,
@@ -16,6 +18,7 @@ import {
   mapImportStampSave,
   type ImportedStampView,
   type MapImportBootstrap,
+  type MapImportReference,
   type MapImportSource,
 } from "./importProtocol";
 import {
@@ -70,6 +73,7 @@ export default function MapImportApp() {
   const [source, setSource] = useState<MapImportSource | null>(null);
   const [objects, setObjects] = useState<MapObjectItem[]>([]);
   const [entries, setEntries] = useState<ImportedStampView[]>([]);
+  const [references, setReferences] = useState<MapImportReference[]>([]);
   const [activeCells, setActiveCells] = useState<Set<string>>(new Set());
   const [shape, setShape] = useState<SelectionShape>("rectangle");
   const [operation, setOperation] = useState<SelectionOperation>("replace");
@@ -95,11 +99,16 @@ export default function MapImportApp() {
 
   useEffect(() => {
     let disposed = false;
-    void Promise.all([mapImportBootstrap(), mapImportStampList()])
-      .then(([nextBootstrap, nextEntries]) => {
+    void Promise.all([
+      mapImportBootstrap(),
+      mapImportStampList(),
+      mapImportReferenceList(),
+    ])
+      .then(([nextBootstrap, nextEntries, nextReferences]) => {
         if (disposed) return;
         setBootstrap(nextBootstrap);
         setEntries(nextEntries);
+        setReferences(nextReferences);
       })
       .catch((reason) => {
         if (!disposed) setError(String(reason));
@@ -155,23 +164,36 @@ export default function MapImportApp() {
     return counts;
   }, [objects]);
 
-  const pickSource = useCallback(async () => {
-    setPicking(true);
-    setError("");
-    try {
-      const picked = await mapImportSourcePick();
-      if (!picked) return;
-      setSource(picked);
-      setActiveCells(new Set());
-      setViewport(null);
-      setStale(false);
-      setObjects(await loadAllSourceObjects(picked.sourceId));
-    } catch (reason) {
-      setError(String(reason));
-    } finally {
-      setPicking(false);
-    }
-  }, []);
+  const stageSource = useCallback(
+    async (pick: () => Promise<MapImportSource | null>) => {
+      setPicking(true);
+      setError("");
+      try {
+        const picked = await pick();
+        if (!picked) return;
+        setSource(picked);
+        setActiveCells(new Set());
+        setViewport(null);
+        setStale(false);
+        // The pick copied the map into references/, so the quick list may have grown.
+        setReferences(await mapImportReferenceList());
+        setObjects(await loadAllSourceObjects(picked.sourceId));
+      } catch (reason) {
+        setError(String(reason));
+      } finally {
+        setPicking(false);
+      }
+    },
+    [],
+  );
+  const pickSource = useCallback(
+    () => stageSource(mapImportSourcePick),
+    [stageSource],
+  );
+  const pickReference = useCallback(
+    (name: string) => stageSource(() => mapImportReferencePick(name)),
+    [stageSource],
+  );
 
   const save = useCallback(async () => {
     if (!source || !compatible || stale || activeCells.size === 0) return;
@@ -209,9 +231,11 @@ export default function MapImportApp() {
       <MapImportToolbar
         destination={bootstrap.destination}
         source={source}
+        references={references}
         picking={picking}
         stale={stale}
         onPick={() => void pickSource()}
+        onPickReference={(name) => void pickReference(name)}
       />
       {error && (
         <div role="alert" className="flex min-w-0 items-center gap-2 border-b border-destructive/50 bg-destructive/10 px-4 py-2 text-sm text-destructive">
@@ -232,6 +256,32 @@ export default function MapImportApp() {
             <Button type="button" className="mt-4" onClick={() => void pickSource()}>
               SCX/SCM 선택
             </Button>
+            {references.length > 0 && (
+              <div className="mx-auto mt-6 w-full max-w-md text-left">
+                <p className="flex items-center gap-2 text-sm font-semibold">
+                  <FolderOpen className="size-4 text-muted-foreground" aria-hidden="true" />
+                  references/ · {references.length}
+                </p>
+                <ul className="mt-2 flex flex-col gap-1">
+                  {references.map((reference) => (
+                    <li key={reference.name}>
+                      <Button
+                        type="button"
+                        variant="outline"
+                        className="w-full justify-between"
+                        disabled={picking}
+                        onClick={() => void pickReference(reference.name)}
+                      >
+                        <span className="truncate">{reference.name}</span>
+                        <span className="text-xs text-muted-foreground">
+                          {(reference.fileSize / 1024).toFixed(0)} KiB
+                        </span>
+                      </Button>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
           </div>
         </section>
       ) : (

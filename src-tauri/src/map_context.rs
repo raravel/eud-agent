@@ -127,6 +127,11 @@ impl MapContextService {
         self.current_source()
     }
 
+    pub fn current_project_root(&self) -> Result<PathBuf, String> {
+        let project = crate::native_runtime::NativeProjectManager::new(self.dirs.clone()).open()?;
+        Ok(project.root().to_path_buf())
+    }
+
     #[cfg_attr(test, allow(dead_code))]
     fn current_project_id(&self) -> Result<String, String> {
         self.current_source().map(|(project_id, _)| project_id)
@@ -206,12 +211,22 @@ fn revision_from_parts(
     })
 }
 
-fn resolve_starcraft_path(dirs: &DataDirs) -> Result<PathBuf, String> {
+pub(crate) fn resolve_starcraft_path(dirs: &DataDirs) -> Result<PathBuf, String> {
     if let Some(path) = std::env::var_os("STARCRAFT_PATH").map(PathBuf::from) {
         if path.is_dir() {
             return Ok(path);
         }
         return Err("STARCRAFT_PATH does not name an installed StarCraft directory".to_string());
+    }
+    // An explicitly configured folder wins over the default install location so
+    // the wizard's "StarCraft 폴더 선택" can override a stale default directory.
+    let configured = dirs
+        .load_config()
+        .map_err(|error| format!("app config could not be read: {error}"))?
+        .starcraft_path;
+    let configured = PathBuf::from(configured);
+    if configured.is_dir() {
+        return Ok(configured);
     }
     // Default Battle.net install location for this platform.
     let standard = PathBuf::from(if cfg!(windows) {
@@ -221,14 +236,6 @@ fn resolve_starcraft_path(dirs: &DataDirs) -> Result<PathBuf, String> {
     });
     if standard.is_dir() {
         return Ok(standard);
-    }
-    let configured = dirs
-        .load_config()
-        .map_err(|error| format!("app config could not be read: {error}"))?
-        .starcraft_path;
-    let configured = PathBuf::from(configured);
-    if configured.is_dir() {
-        return Ok(configured);
     }
     Err("StarCraft data directory could not be resolved".to_string())
 }

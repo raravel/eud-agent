@@ -96,7 +96,7 @@ pub struct NotificationSettings {
     #[serde(default)]
     pub plan_approval: NotificationChannelSettings,
     #[serde(default)]
-    pub changeset_review: NotificationChannelSettings,
+    pub review_required: NotificationChannelSettings,
     #[serde(default)]
     pub agent_turn_complete: NotificationChannelSettings,
     #[serde(default)]
@@ -124,6 +124,9 @@ pub struct Config {
     /// Optional StarCraft install root used for map rendering/catalog assets.
     #[serde(default)]
     pub starcraft_path: String,
+    /// Optional SCMDraft 2 executable for "SCMDraft 2로 열기" in the Map window.
+    #[serde(default)]
+    pub scmdraft_path: String,
     #[serde(default)]
     pub default_provider: Option<crate::provider::ProviderId>,
     #[serde(default)]
@@ -140,6 +143,10 @@ pub struct Config {
     /// Distinguishes first-run migration from an intentionally emptied history.
     #[serde(default)]
     pub project_recents_initialized: bool,
+    /// Planner + architect + critic consensus iteration for staged requests.
+    /// Off by default because it multiplies model calls per plan.
+    #[serde(default)]
+    pub deep_planning: bool,
 }
 
 impl Default for Config {
@@ -149,6 +156,7 @@ impl Default for Config {
             project_path: String::new(),
             euddraft_path: String::new(),
             starcraft_path: String::new(),
+            scmdraft_path: String::new(),
             default_provider: None,
             providers: crate::provider::ProviderSettings::default(),
             notifications: NotificationSettings::default(),
@@ -156,6 +164,7 @@ impl Default for Config {
             rag_index: AssetSpec::default(),
             project_recents: Vec::new(),
             project_recents_initialized: false,
+            deep_planning: false,
         }
     }
 }
@@ -361,17 +370,12 @@ impl DataDirs {
         self.app_data.join("memory")
     }
 
-    /// `%appdata%\eud-agent\workspaces` — preserved legacy import sources and
-    /// machine-local session working roots. Accepted documents now live under
-    /// the selected project's `.eud-agent/workspace`.
+    /// `%appdata%\eud-agent\workspaces` — preserved legacy import sources.
+    /// Accepted documents live under the selected project's `.eud-agent/workspace`;
+    /// the provider CLI cwd is the project root itself, so there are no
+    /// machine-local session working roots anymore.
     pub fn workspaces_dir(&self) -> PathBuf {
         self.app_data.join("workspaces")
-    }
-
-    /// Session-owned Codex working roots. Generated source mirrors and writable
-    /// turn copies stay machine-local, separate from accepted project documents.
-    pub fn session_workspaces_dir(&self) -> PathBuf {
-        self.workspaces_dir().join(".sessions")
     }
 
     /// Parent-owned turn baselines and preserved legacy trusted-state sources.
@@ -545,7 +549,6 @@ impl DataDirs {
             self.memory_dir(),
             self.workspaces_dir(),
             self.workspace_state_dir(),
-            self.session_workspaces_dir(),
             self.map_backups_dir(),
             self.map_candidates_dir(),
             self.journal_dir(),
@@ -699,6 +702,7 @@ mod tests {
             project_path: "C:\\Maps\\NativeProject".to_string(),
             euddraft_path: "C:\\Tools\\euddraft.exe".to_string(),
             starcraft_path: "C:\\Games\\StarCraft".to_string(),
+            scmdraft_path: "C:\\Tools\\ScmDraft 2\\ScmDraft 2.exe".to_string(),
             default_provider: Some(crate::provider::ProviderId::Codex),
             providers: crate::provider::ProviderSettings {
                 codex: crate::provider::CodexProviderSettings {
@@ -736,10 +740,35 @@ mod tests {
         assert_eq!(back.schema_version, CONFIG_SCHEMA_VERSION);
         assert_eq!(back.project_path, "");
         assert_eq!(back.euddraft_path, "");
+        assert_eq!(back.scmdraft_path, "");
         assert_eq!(back.default_provider, None);
         assert!(back.providers.codex.large_context_models.is_empty());
         assert_eq!(back.model, AssetSpec::default());
         assert_eq!(back.notifications, NotificationSettings::default());
+    }
+
+    #[test]
+    fn scmdraft_path_round_trips_and_defaults_empty_for_older_config_files() {
+        let base = unique_temp_dir("scmdraft-path");
+        let dirs = DataDirs::from_bases(&base.join("roaming"), &base.join("local"));
+        dirs.ensure_dirs().unwrap();
+        let mut without = serde_json::to_value(Config::default()).unwrap();
+        without.as_object_mut().unwrap().remove("scmdraft_path");
+        fs::write(dirs.config_path(), serde_json::to_vec(&without).unwrap()).unwrap();
+        assert_eq!(dirs.load_config().unwrap().scmdraft_path, "");
+
+        let exe = base.join("ScmDraft 2.exe");
+        dirs.save_config(&Config {
+            scmdraft_path: exe.display().to_string(),
+            ..Config::default()
+        })
+        .unwrap();
+        let loaded = dirs.load_config().unwrap();
+        assert_eq!(loaded.scmdraft_path, exe.display().to_string());
+        let saved: serde_json::Value =
+            serde_json::from_slice(&fs::read(dirs.config_path()).unwrap()).unwrap();
+        assert_eq!(saved["scmdraft_path"], exe.display().to_string());
+        fs::remove_dir_all(base).ok();
     }
 
     #[test]
@@ -760,10 +789,6 @@ mod tests {
             serde_json::from_str(r#"{"notifications":{"planApproval":{"sound":false}}}"#).unwrap();
         assert!(!back.notifications.plan_approval.sound);
         assert!(back.notifications.plan_approval.os_notification);
-        assert_eq!(
-            back.notifications.changeset_review,
-            NotificationChannelSettings::default()
-        );
         assert_eq!(
             back.notifications.agent_turn_complete,
             NotificationChannelSettings::default()
@@ -861,8 +886,10 @@ mod tests {
         object.remove("project_path");
         object.remove("euddraft_path");
         object.remove("starcraft_path");
+        object.remove("scmdraft_path");
         object.remove("project_recents");
         object.remove("project_recents_initialized");
+        object.remove("deep_planning");
         fs::write(dirs.config_path(), serde_json::to_vec(&legacy).unwrap()).unwrap();
 
         let migrated = dirs.load_config().unwrap();

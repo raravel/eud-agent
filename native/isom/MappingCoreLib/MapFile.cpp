@@ -7,6 +7,10 @@
 #include <cstdio>
 #include <cstdarg>
 #include <fstream>
+#include <memory>
+#ifdef _WIN32
+#include <share.h>
+#endif
 #include <sstream>
 #include <iterator>
 #include <chrono>
@@ -150,11 +154,33 @@ bool MapFile::save(const std::string & saveFilePath, bool overwriting, bool upda
         {
             if ( ::removeFile(saveFilePath) ) // Remove any existing files of the same name
             {
-                std::ofstream outFile(icux::toFilestring(saveFilePath).c_str(), std::ios_base::out|std::ios_base::binary);
+                icux::filestring outputPath = icux::toFilestring(saveFilePath);
+#ifdef WINDOWS_UTF16
+                std::unique_ptr<FILE, decltype(&std::fclose)> outputFile(
+                    _wfsopen(outputPath.c_str(), L"wbN", _SH_DENYNO), &std::fclose);
+#elif defined(_WIN32)
+                std::unique_ptr<FILE, decltype(&std::fclose)> outputFile(
+                    _fsopen(outputPath.c_str(), "wbN", _SH_DENYNO), &std::fclose);
+#endif
+#ifdef _WIN32
+                if ( outputFile != nullptr )
+                {
+                    bool wroteScenario = false;
+                    {
+                        std::ofstream outFile(outputFile.get());
+                        Scenario::write(outFile);
+                        outFile.flush();
+                        wroteScenario = outFile.good();
+                    }
+                    if ( wroteScenario && std::fclose(outputFile.release()) == 0 )
+#else // POSIX has no share modes; a plain binary stream writes the CHK
+                std::ofstream outFile(outputPath.c_str(), std::ios_base::out|std::ios_base::binary);
                 if ( outFile.is_open() )
                 {
                     Scenario::write(outFile);
+                    outFile.close();
                     if ( outFile.good() )
+#endif
                     {
                         mapFilePath = saveFilePath;
                         auto finish = std::chrono::high_resolution_clock::now();

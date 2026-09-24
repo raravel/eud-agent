@@ -501,14 +501,23 @@ impl Rag {
         self.index.is_empty()
     }
 
+    /// Every indexed chunk, in index order.
+    pub(crate) fn entries(&self) -> &[IndexEntry] {
+        &self.index
+    }
+
     /// Look up one exact indexed chunk by its stable id.
     pub(crate) fn document(&self, id: u64) -> Option<&IndexEntry> {
         self.index.iter().find(|entry| entry.id == id)
     }
 
     /// True once the embedding model is loaded (after a successful [`Self::warmup`]).
+    /// Never blocks: an in-flight warmup holding the lock reads as not ready.
     pub fn is_ready(&self) -> bool {
-        self.embedder.lock().map(|g| g.is_some()).unwrap_or(false)
+        self.embedder
+            .try_lock()
+            .map(|g| g.is_some())
+            .unwrap_or(false)
     }
 
     /// Initialize the embedder (blocking ONNX load ~570MB on first run). Emits

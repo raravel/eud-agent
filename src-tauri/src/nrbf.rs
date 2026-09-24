@@ -477,7 +477,7 @@ impl Document {
         for record in records {
             match record {
                 Record::NullMultiple { count, .. } => {
-                    expanded.extend(std::iter::repeat_n(Record::Null, *count));
+                    expanded.extend(std::iter::repeat(Record::Null).take(*count));
                 }
                 other => expanded.push(other.clone()),
             }
@@ -773,7 +773,7 @@ impl Document {
                 let metadata = self.class_metadata(class)?;
                 match class.record_type {
                     1 => put_i32(output, class.metadata_id),
-                    2 | 3 | 4 | 5 => {
+                    2..=5 => {
                         put_string(output, &metadata.name)?;
                         put_i32(
                             output,
@@ -884,7 +884,7 @@ impl Document {
                 for length in lengths {
                     put_i32(output, *length);
                 }
-                if matches!(*array_type, 3 | 4 | 5) {
+                if matches!(*array_type, 3..=5) {
                     if lower_bounds.len() != lengths.len() {
                         return Err("NRBF array lower-bound count mismatch".to_string());
                     }
@@ -1059,7 +1059,7 @@ impl<'a> Reader<'a> {
                 minor_version: self.i32()?,
             }),
             1 => self.read_class_with_id(),
-            2 | 3 | 4 | 5 => self.read_class(record_type),
+            2..=5 => self.read_class(record_type),
             6 => {
                 let id = self.i32()?;
                 let value = self.string()?;
@@ -1216,7 +1216,7 @@ impl<'a> Reader<'a> {
         let lengths = (0..rank)
             .map(|_| self.i32())
             .collect::<Result<Vec<_>, _>>()?;
-        let lower_bounds = if matches!(array_type, 3 | 4 | 5) {
+        let lower_bounds = if matches!(array_type, 3..=5) {
             (0..rank)
                 .map(|_| self.i32())
                 .collect::<Result<Vec<_>, _>>()?

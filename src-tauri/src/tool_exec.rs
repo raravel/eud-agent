@@ -9,8 +9,11 @@
 //! validation and safety gates, and journals every project write for review.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::PathBuf;
-use std::sync::{mpsc, Arc};
+use std::path::{Path, PathBuf};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    mpsc, Arc,
+};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use parking_lot::Mutex;
@@ -76,11 +79,26 @@ const SEARCH_DOCS_DEFAULT_K: i64 = 5;
 const SEARCH_DOCS_PREVIEW_CHARS: usize = 480;
 const DOCS_GET_MAX_IDS: usize = 10;
 const READ_FILE_DEFAULT_LINES: usize = 400;
+const BUILD_LOG_DEFAULT_LINES: usize = 200;
+const BUILD_LOG_MAX_LINES: usize = 400;
+const BUILD_LOG_MAX_MATCHES: usize = 200;
+/// A euddraft log line can list every map tile; a page never carries more than this per line.
+const BUILD_LOG_LINE_CHARS: usize = 1000;
+/// Budget for one build_log_read page, measured as the Claude adapter measures a native tool
+/// result: compact JSON embedded again as a JSON string (every `\` and `"` doubles).
+const BUILD_LOG_PAGE_BYTES: usize = 40 * 1024;
+/// Same double-escaped measure for the whole build_run observation; diagnostics beyond it are
+/// counted, not sent, and remain in the build log.
+const BUILD_RUN_OBSERVATION_BYTES: usize = 40 * 1024;
 const SOURCE_SEARCH_DEFAULT_LIMIT: usize = 20;
 const SOURCE_SEARCH_MAX_LIMIT: usize = 100;
 const SOURCE_SEARCH_MAX_CONTEXT_LINES: usize = 20;
 const SOURCE_SEARCH_MAX_QUERY_CHARS: usize = 256;
 const MAP_PALETTE_QUERY_MAX_MATCHES: usize = 256;
+/// images.dat field selecting an EXISTING iscript (`images.def` parameter 7).
+const IMAGE_ISCRIPT_FIELD: &str = "Iscript ID";
+/// images.dat field holding the 1-based images.tbl index of the image's GRP.
+const IMAGE_GRP_FIELD: &str = "GRP File";
 
 /// Native euddraft build-state probe used by map-write safety rails.
 #[derive(Clone)]
@@ -188,7 +206,7 @@ impl ToolServices {
 struct SessionRequest {
     request_id: String,
     project_id: String,
-    workspace_root: Option<PathBuf>,
+    source_baseline_root: Option<PathBuf>,
     image_refs: BTreeMap<String, crate::map_image::MapImageBinding>,
     sound_results: usize,
     audio_refs: BTreeMap<String, crate::audio::AudioBinding>,
@@ -203,18 +221,107 @@ struct SessionWriteState {
 }
 type AskEmitter = Arc<dyn Fn(crate::ipc::AskEvent) -> Result<(), String> + Send + Sync>;
 type ProgressEmitter = Arc<dyn Fn(crate::ipc::ProgressEvent) -> Result<(), String> + Send + Sync>;
+type AutonomousEmitter =
+    Arc<dyn Fn(crate::autonomous::AutonomousRunState) -> Result<(), String> + Send + Sync>;
+pub type TeamTaskFuture = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<crate::team::TeamTask, String>> + Send>,
+>;
+/// Runs one `map_task_request` for the tool runtime: creates the team Map
+/// session and task record, submits the Map request, and returns the task
+/// once its candidate is ready or the bounded wait elapses. Injected by the
+/// session manager, which owns the Map service and the engines.
+type TeamExecutor = Arc<dyn Fn(TeamTaskRequest) -> TeamTaskFuture + Send + Sync>;
+
+/// One admitted `map_task_request` call.
+#[derive(Debug, Clone)]
+pub struct TeamTaskRequest {
+    pub identity: crate::provider_runtime::RunIdentity,
+    pub goal: String,
+    pub layers: Vec<crate::map_model::MapLayer>,
+    pub selection_ids: Vec<String>,
+    pub location_ids: Vec<u16>,
+    /// The earlier task whose result this request edits: its team session
+    /// continues instead of a fresh one.
+    pub revises_task_id: Option<String>,
+    /// Tile rectangles the Map Agent may change (none: the whole map).
+    pub target: Vec<crate::team::TeamTileRect>,
+    /// Tile rectangles removed from the target.
+    pub protect: Vec<crate::team::TeamTileRect>,
+}
+
+/// What `map_task_apply` / `map_task_discard` do with a ready candidate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TeamTaskActionKind {
+    Apply,
+    Discard,
+}
+
+/// One admitted `map_task_apply` or `map_task_discard` call. The executor
+/// re-validates the task against the team session's live candidate.
+#[derive(Debug, Clone)]
+pub struct TeamTaskAction {
+    pub session_id: String,
+    pub request_id: String,
+    pub task_id: String,
+    pub kind: TeamTaskActionKind,
+}
+
+/// Applies or discards one team candidate for the tool runtime; injected by
+/// the session manager, which owns the Map service. Synchronous: the Map
+/// service's apply/discard are ordinary blocking file operations.
+type TeamActionExecutor =
+    Arc<dyn Fn(TeamTaskAction) -> Result<crate::team::TeamTask, String> + Send + Sync>;
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct MapTaskRequestToolInput {
+    goal: String,
+    layers: Vec<crate::map_model::MapLayer>,
+    #[serde(default)]
+    selection_ids: Vec<String>,
+    #[serde(default)]
+    location_ids: Vec<u16>,
+    #[serde(default)]
+    revises_task_id: Option<String>,
+    #[serde(default)]
+    target: Vec<crate::team::TeamTileRect>,
+    #[serde(default)]
+    protect: Vec<crate::team::TeamTileRect>,
+}
 
 struct PendingAsk {
     owner_request_id: String,
     questions: Vec<crate::ipc::AskQuestion>,
+    /// When the bounded wait started, so a restored card shows the real remainder.
+    started_at: std::time::Instant,
     response: tokio::sync::oneshot::Sender<Result<BTreeMap<String, crate::ipc::AskAnswer>, String>>,
 }
 
-#[derive(Default)]
+/// The one ask of the current foreground run whose bounded wait elapsed.
+struct ExpiredAsk {
+    ask_request_id: String,
+    owner_request_id: String,
+}
+
 struct AskState {
     next_id: u64,
     emitter: Option<AskEmitter>,
     pending: HashMap<String, PendingAsk>,
+    /// Bounded wait before a pending ask expires; tests inject shorter values.
+    wait_timeout: Duration,
+    expired: Option<ExpiredAsk>,
+}
+
+impl Default for AskState {
+    fn default() -> Self {
+        Self {
+            next_id: 0,
+            emitter: None,
+            pending: HashMap::new(),
+            wait_timeout: tools::ASK_WAIT_TIMEOUT,
+            expired: None,
+        }
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -368,11 +475,18 @@ pub struct SessionToolRuntime {
     completion_barrier: Arc<Mutex<Option<ToolCompletionBarrier>>>,
     ask: Arc<Mutex<AskState>>,
     ask_waiting: tokio::sync::watch::Sender<bool>,
+    team_executor: Arc<Mutex<Option<TeamExecutor>>>,
+    team_action_executor: Arc<Mutex<Option<TeamActionExecutor>>>,
     cancellation: Arc<Mutex<Option<tokio::sync::watch::Receiver<u64>>>>,
     progress_emitter: Arc<Mutex<Option<ProgressEmitter>>>,
+    autonomous_emitter: Arc<Mutex<Option<AutonomousEmitter>>>,
     provider_identity: Arc<Mutex<Option<(crate::provider::ProviderId, String)>>>,
     last_build: Arc<Mutex<Option<crate::harness::BuildEvidence>>>,
+    /// The complete JSON of the request's latest `build_run`, retained as
+    /// verifier evidence (file/line diagnostics, not only counts).
+    last_build_result: Arc<Mutex<Option<Value>>>,
     sound_build_required: Arc<Mutex<bool>>,
+    autonomous_pause_requested: Arc<AtomicBool>,
 }
 
 struct PendingAskLease {
@@ -412,11 +526,16 @@ impl SessionToolRuntime {
             completion_barrier: Arc::new(Mutex::new(None)),
             ask: Arc::new(Mutex::new(AskState::default())),
             ask_waiting,
+            team_executor: Arc::new(Mutex::new(None)),
+            team_action_executor: Arc::new(Mutex::new(None)),
             cancellation: Arc::new(Mutex::new(None)),
             progress_emitter: Arc::new(Mutex::new(None)),
+            autonomous_emitter: Arc::new(Mutex::new(None)),
             provider_identity: Arc::new(Mutex::new(None)),
             last_build: Arc::new(Mutex::new(None)),
+            last_build_result: Arc::new(Mutex::new(None)),
             sound_build_required: Arc::new(Mutex::new(false)),
+            autonomous_pause_requested: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -425,6 +544,18 @@ impl SessionToolRuntime {
     }
     pub fn kind(&self) -> crate::session::SessionKind {
         self.kind
+    }
+    pub fn autonomous_pause_handle(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.autonomous_pause_requested)
+    }
+
+    pub fn autonomous_pause_requested(&self) -> bool {
+        self.autonomous_pause_requested.load(Ordering::SeqCst)
+    }
+
+    pub fn set_autonomous_pause_requested(&self, requested: bool) {
+        self.autonomous_pause_requested
+            .store(requested, Ordering::SeqCst);
     }
 
     pub(crate) fn tool_descriptors(&self) -> Vec<Value> {
@@ -476,6 +607,32 @@ impl SessionToolRuntime {
     ) {
         *self.progress_emitter.lock() = Some(Arc::new(emitter));
     }
+    pub fn set_autonomous_emitter(
+        &self,
+        emitter: impl Fn(crate::autonomous::AutonomousRunState) -> Result<(), String>
+            + Send
+            + Sync
+            + 'static,
+    ) {
+        *self.autonomous_emitter.lock() = Some(Arc::new(emitter));
+    }
+
+    pub fn set_team_executor(
+        &self,
+        executor: impl Fn(TeamTaskRequest) -> TeamTaskFuture + Send + Sync + 'static,
+    ) {
+        *self.team_executor.lock() = Some(Arc::new(executor));
+    }
+
+    pub fn set_team_action_executor(
+        &self,
+        executor: impl Fn(TeamTaskAction) -> Result<crate::team::TeamTask, String>
+            + Send
+            + Sync
+            + 'static,
+    ) {
+        *self.team_action_executor.lock() = Some(Arc::new(executor));
+    }
 
     pub fn set_cancellation(&self, cancellation: tokio::sync::watch::Receiver<u64>) {
         *self.cancellation.lock() = Some(cancellation);
@@ -489,6 +646,30 @@ impl SessionToolRuntime {
     }
     pub fn subscribe_ask_waiting(&self) -> tokio::sync::watch::Receiver<bool> {
         self.ask_waiting.subscribe()
+    }
+
+    /// Override the bounded ask wait (tests only; production keeps
+    /// [`tools::ASK_WAIT_TIMEOUT`]).
+    #[cfg(test)]
+    pub(crate) fn set_ask_wait_timeout(&self, timeout: Duration) {
+        self.ask.lock().wait_timeout = timeout;
+    }
+
+    /// Whether an ask of `request_id` expired in the current foreground run, so
+    /// the turn is ending with the question restated as text.
+    pub(crate) fn ask_expired_for_request(&self, request_id: &str) -> bool {
+        self.ask
+            .lock()
+            .expired
+            .as_ref()
+            .is_some_and(|expired| expired.owner_request_id == request_id)
+    }
+
+    /// Forget an expired ask. The engine calls this whenever it starts a new
+    /// foreground run for the same request (continuation, plan feedback, write
+    /// transition), so the "do not ask again" rule covers exactly one run.
+    pub(crate) fn clear_expired_ask(&self) {
+        self.ask.lock().expired = None;
     }
 
     fn emit_progress(&self, stage: crate::ipc::ProgressStage, detail: &str) {
@@ -526,6 +707,257 @@ impl SessionToolRuntime {
         .await
     }
 
+    /// The session's team tasks from durable session state.
+    fn team_tasks(&self) -> Vec<crate::team::TeamTask> {
+        crate::session::SessionStore::new(&self.services.dirs)
+            .load(&self.session_id)
+            .map(|record| record.team_tasks)
+            .unwrap_or_default()
+    }
+
+    /// The one team task still excluding this session's own map writes.
+    pub(crate) fn active_team_task(&self) -> Option<crate::team::TeamTask> {
+        self.team_tasks()
+            .into_iter()
+            .find(|task| task.status.is_active())
+    }
+
+    /// Hand placement work to the team Map session on behalf of foreground
+    /// run `identity`. Every failure short of a stale scope completes as a
+    /// correctable usage error.
+    pub(crate) async fn map_task_request_for_run(
+        &self,
+        identity: &crate::provider_runtime::RunIdentity,
+        args: &Value,
+    ) -> Result<Value, String> {
+        if self.session_id != identity.session_id || self.kind != identity.session_kind {
+            return Err("stale provider run cannot request a map task".to_string());
+        }
+        if self.kind != crate::session::SessionKind::Eps {
+            return Err("map_task_request is available on EPS sessions only".to_string());
+        }
+        let input: MapTaskRequestToolInput = serde_json::from_value(args.clone())
+            .map_err(|error| format!("invalid map_task_request arguments: {error}"))?;
+        let goal = input.goal.trim().to_string();
+        if goal.is_empty() {
+            return Err("map_task_request requires a non-empty goal".to_string());
+        }
+        let mut layers = input.layers;
+        layers.sort();
+        layers.dedup();
+        if layers.is_empty() {
+            return Err("map_task_request requires at least one layer".to_string());
+        }
+        let mut selection_ids = input
+            .selection_ids
+            .into_iter()
+            .map(|id| id.trim().to_string())
+            .filter(|id| !id.is_empty())
+            .collect::<Vec<_>>();
+        selection_ids.dedup();
+        let mut location_ids = input.location_ids;
+        location_ids.sort_unstable();
+        location_ids.dedup();
+        // Target selections are united with the scope, so a protect cut out
+        // of the scope could not hold inside a selection.
+        if !input.protect.is_empty() && !selection_ids.is_empty() {
+            return Err(
+                "map_task_request protect cannot be combined with selectionIds; give the area as target rectangles instead"
+                    .to_string(),
+            );
+        }
+        if !self.matches_run_scope(identity) {
+            return Err("stale provider run cannot request a map task".to_string());
+        }
+        {
+            let state = self.request_state.lock();
+            let inspected = state
+                .as_ref()
+                .filter(|state| state.request_id == identity.request_id)
+                .is_some_and(|state| state.map_inspected);
+            if !inspected {
+                return Err(
+                    "evidence gate: call map_info (summary, then the layers the task touches) in this request before map_task_request, so the goal reflects the current saved map."
+                        .to_string(),
+                );
+            }
+        }
+        // A ready candidate may be replaced or revised by a new request (the
+        // executor supersedes the earlier task); a queued/running one may not.
+        if let Some(active) = self
+            .active_team_task()
+            .filter(|task| task.status != crate::team::TeamTaskStatus::CandidateReady)
+        {
+            return Err(format!(
+                "map_task_in_progress: task {} is still {}; read map_task_status and wait for its candidate before requesting another map task",
+                active.id,
+                active.status.label()
+            ));
+        }
+        let executor = self
+            .team_executor
+            .lock()
+            .clone()
+            .ok_or_else(|| "map_task_request is unavailable for this session".to_string())?;
+        let task = executor(TeamTaskRequest {
+            identity: identity.clone(),
+            goal,
+            layers,
+            selection_ids,
+            location_ids,
+            revises_task_id: input
+                .revises_task_id
+                .map(|id| id.trim().to_string())
+                .filter(|id| !id.is_empty()),
+            target: input.target,
+            protect: input.protect,
+        })
+        .await
+        .map_err(|error| format!("map_task_failed: {error}"))?;
+        Ok(task.to_tool_value())
+    }
+
+    fn map_task_status(&self, args: &Value) -> Result<Value, String> {
+        let task_id = str_arg(args, "taskId")?;
+        self.team_tasks()
+            .into_iter()
+            .find(|task| task.id == task_id)
+            .map(|task| task.to_tool_value())
+            .ok_or_else(|| format!("map task '{task_id}' does not exist on this session"))
+    }
+
+    /// The task named by `taskId` when its candidate is ready for inspection,
+    /// apply, or discard.
+    fn ready_team_task(&self, args: &Value) -> Result<crate::team::TeamTask, String> {
+        let task_id = str_arg(args, "taskId")?;
+        let task = self
+            .team_tasks()
+            .into_iter()
+            .find(|task| task.id == task_id)
+            .ok_or_else(|| format!("map task '{task_id}' does not exist on this session"))?;
+        if task.status != crate::team::TeamTaskStatus::CandidateReady {
+            return Err(format!(
+                "map task '{task_id}' is {}, not candidate_ready; only a ready candidate can be inspected, applied, or discarded",
+                task.status.label()
+            ));
+        }
+        if task.candidate.is_none() {
+            return Err(format!("map task '{task_id}' has no candidate summary"));
+        }
+        Ok(task)
+    }
+
+    /// `map_task_diff` / `map_task_objects` / `map_task_render`: read the team
+    /// session's live candidate for a ready task, refusing when the candidate
+    /// no longer is the revision the task announced.
+    fn map_task_candidate_read(&self, tool: &str, args: &Value) -> Result<Value, String> {
+        let task = self.ready_team_task(args)?;
+        let candidate = task.candidate.as_ref().expect("ready task has a candidate");
+        let team = crate::session::SessionStore::new(&self.services.dirs)
+            .load(&task.map_session_id)
+            .map_err(|error| format!("the team Map session could not be loaded: {error}"))?;
+        let project_id = team.meta.project;
+        let candidates = self.services.map_candidates();
+        let state = candidates.state(&project_id, &task.map_session_id)?;
+        // Revision numbers never repeat within a session; the announced hash
+        // legitimately changes when the session follows a changed source.
+        if state.stale || state.current_revision != candidate.revision {
+            return Err(format!(
+                "map task '{}' candidate changed since it was announced (team session is at r{}{}); read map_task_status and request the task again if needed",
+                task.id,
+                state.current_revision,
+                if state.stale { ", stale" } else { "" }
+            ));
+        }
+        match tool {
+            tools::MAP_TASK_DIFF_TOOL => {
+                let revision = state
+                    .revisions
+                    .iter()
+                    .find(|revision| revision.revision == state.current_revision);
+                Ok(json!({
+                    "taskId": task.id,
+                    "candidateRevision": state.current_revision,
+                    "sourceDiverged": state.source_diverged,
+                    "summary": candidate.summary,
+                    "diff": revision.map(|revision| &revision.diff),
+                    "verification": revision.map(|revision| &revision.verification),
+                }))
+            }
+            tools::MAP_TASK_OBJECTS_TOOL => {
+                let layer = str_arg(args, "layer")?;
+                let offset = usize_arg_default(args, "offset", 0)?;
+                let limit = usize_arg_default(args, "limit", 100)?.min(500);
+                let map = candidates.current_map(&project_id, &task.map_session_id)?;
+                let page = map_objects_page(
+                    &map,
+                    candidates.context().starcraft_path()?.as_path(),
+                    &state.revision_key,
+                    &state.baseline.file_sha256,
+                    layer,
+                    offset,
+                    limit,
+                )?;
+                candidates.annotate_object_page(&project_id, &task.map_session_id, page)
+            }
+            tools::MAP_TASK_RENDER_TOOL => {
+                let map = candidates.current_map(&project_id, &task.map_session_id)?;
+                render_map_tool(
+                    &map,
+                    &state,
+                    args,
+                    candidates.context().starcraft_path()?.as_path(),
+                )
+            }
+            _ => Err(format!("`{tool}` is not a team candidate read")),
+        }
+    }
+
+    /// `map_task_apply` / `map_task_discard` through the injected executor.
+    /// Apply additionally requires that this request inspected the candidate.
+    fn map_task_action(
+        &self,
+        request_id: &str,
+        kind: TeamTaskActionKind,
+        args: &Value,
+    ) -> Result<Value, String> {
+        let task = self.ready_team_task(args)?;
+        if kind == TeamTaskActionKind::Apply {
+            let inspected = self
+                .request_state
+                .lock()
+                .as_ref()
+                .filter(|state| state.request_id == request_id)
+                .is_some_and(|state| state.candidate_inspected(&task.id));
+            if !inspected {
+                return Err(format!(
+                    "evidence gate: inspect map task '{}' with map_task_diff, map_task_objects, or map_task_render in this request before map_task_apply",
+                    task.id
+                ));
+            }
+        }
+        let executor =
+            self.team_action_executor.lock().clone().ok_or_else(|| {
+                "team map task actions are unavailable for this session".to_string()
+            })?;
+        let task = executor(TeamTaskAction {
+            session_id: self.session_id.clone(),
+            request_id: request_id.to_string(),
+            task_id: task.id,
+            kind,
+        })
+        .map_err(|error| {
+            format!(
+                "map_task_{}_failed: {error}",
+                match kind {
+                    TeamTaskActionKind::Apply => "apply",
+                    TeamTaskActionKind::Discard => "discard",
+                }
+            )
+        })?;
+        Ok(task.to_tool_value())
+    }
+
     async fn ask_scoped(
         &self,
         expected_request_id: &str,
@@ -547,10 +979,20 @@ impl SessionToolRuntime {
         {
             return Err("stale provider run cannot create an ask request".to_string());
         }
-        let (request_id, response, emitter) = {
+        let (request_id, response, emitter, wait_timeout) = {
             let mut ask = self.ask.lock();
             if !ask.pending.is_empty() {
                 return Err("another ask request is already waiting for this session".to_string());
+            }
+            if ask
+                .expired
+                .as_ref()
+                .is_some_and(|expired| expired.owner_request_id == expected_request_id)
+            {
+                return Err(
+                    "a previous ask in this turn went unanswered; restate the questions as your final text answer and end the turn instead of calling ask again"
+                        .to_string(),
+                );
             }
             let emitter = ask
                 .emitter
@@ -567,11 +1009,13 @@ impl SessionToolRuntime {
                 PendingAsk {
                     owner_request_id: expected_request_id.to_string(),
                     questions: input.questions.clone(),
+                    started_at: std::time::Instant::now(),
                     response: send,
                 },
             );
             self.ask_waiting.send_replace(true);
-            (request_id, response, emitter)
+            let wait_timeout = ask.wait_timeout;
+            (request_id, response, emitter, wait_timeout)
         };
         drop(request_guard);
         let _lease = PendingAskLease {
@@ -580,14 +1024,78 @@ impl SessionToolRuntime {
         };
 
         self.emit_activity(crate::write_coordinator::SessionActivity::WaitingInput);
+        self.update_autonomous_status(
+            crate::autonomous::AutonomousRunStatus::WaitingInput,
+            Some(crate::autonomous::AutonomousPauseReason::WaitingInput),
+        )?;
+        let wait_seconds = wait_timeout.as_secs();
         emitter(crate::ipc::AskEvent {
-            request_id,
-            questions: input.questions,
+            request_id: request_id.clone(),
+            status: crate::ipc::AskEventStatus::Pending,
+            wait_seconds: Some(wait_seconds),
+            questions: input.questions.clone(),
         })?;
 
-        let answers = response
-            .await
-            .map_err(|_| "ask response channel closed".to_string())??;
+        tokio::pin!(response);
+        let deadline = tokio::time::sleep(wait_timeout);
+        tokio::pin!(deadline);
+        let answers = tokio::select! {
+            biased;
+            answered = &mut response => Some(answered),
+            _ = &mut deadline => None,
+        };
+        let answers = match answers {
+            Some(answered) => answered,
+            None => {
+                // The wait elapsed. If `answer_ask` removed the pending entry in
+                // the meantime its answer already sits in the channel and wins;
+                // otherwise this ask expires and the turn continues as text.
+                let expired = {
+                    let mut ask = self.ask.lock();
+                    let removed = ask.pending.remove(&request_id).is_some();
+                    if removed {
+                        self.ask_waiting.send_replace(!ask.pending.is_empty());
+                        ask.expired = Some(ExpiredAsk {
+                            ask_request_id: request_id.clone(),
+                            owner_request_id: expected_request_id.to_string(),
+                        });
+                    }
+                    removed
+                };
+                if !expired {
+                    response.await
+                } else {
+                    // The expiry is already recorded; status/UI publication
+                    // failures must not turn it into a tool error.
+                    self.emit_activity_after_ask();
+                    if let Err(error) = self.update_autonomous_status(
+                        crate::autonomous::AutonomousRunStatus::Running,
+                        None,
+                    ) {
+                        eprintln!("eud-agent: ask expiry status update failed: {error}");
+                    }
+                    if let Err(error) = emitter(crate::ipc::AskEvent {
+                        request_id,
+                        status: crate::ipc::AskEventStatus::Expired,
+                        wait_seconds: Some(wait_seconds),
+                        questions: input.questions.clone(),
+                    }) {
+                        eprintln!("eud-agent: ask expiry event failed: {error}");
+                    }
+                    return Ok(json!({
+                        "status": "unanswered",
+                        "questionIds": input
+                            .questions
+                            .iter()
+                            .map(|question| question.id.as_str())
+                            .collect::<Vec<_>>(),
+                        "waitedSeconds": wait_seconds,
+                    }));
+                }
+            }
+        };
+        let answers = answers.map_err(|_| "ask response channel closed".to_string())??;
+        self.update_autonomous_status(crate::autonomous::AutonomousRunStatus::Running, None)?;
         Ok(json!({ "answers": answers }))
     }
 
@@ -597,6 +1105,12 @@ impl SessionToolRuntime {
         ask.pending.iter().find_map(|(request_id, pending)| {
             (pending.owner_request_id == owner_request_id).then(|| crate::ipc::AskEvent {
                 request_id: request_id.clone(),
+                status: crate::ipc::AskEventStatus::Pending,
+                wait_seconds: Some(
+                    ask.wait_timeout
+                        .saturating_sub(pending.started_at.elapsed())
+                        .as_secs(),
+                ),
                 questions: pending.questions.clone(),
             })
         })
@@ -625,6 +1139,16 @@ impl SessionToolRuntime {
         answers: BTreeMap<String, crate::ipc::AskAnswer>,
     ) -> Result<(), String> {
         let mut ask = self.ask.lock();
+        if ask
+            .expired
+            .as_ref()
+            .is_some_and(|expired| expired.ask_request_id == request_id)
+        {
+            return Err(format!(
+                "ask_expired: 답변 대기 시간({}초)이 지나 접수되지 않았습니다. 대화에 답을 입력해 주세요.",
+                ask.wait_timeout.as_secs()
+            ));
+        }
         let pending = ask
             .pending
             .get(request_id)
@@ -658,6 +1182,27 @@ impl SessionToolRuntime {
         }
     }
 
+    fn update_autonomous_status(
+        &self,
+        status: crate::autonomous::AutonomousRunStatus,
+        pause_reason: Option<crate::autonomous::AutonomousPauseReason>,
+    ) -> Result<(), String> {
+        let sessions = crate::session::SessionStore::new(&self.services.dirs);
+        let Ok(record) = sessions.load(&self.session_id) else {
+            return Ok(());
+        };
+        if record.autonomous_run.is_none() {
+            return Ok(());
+        }
+        let updated = sessions
+            .update_autonomous_status(&self.session_id, status, pause_reason, None)
+            .map_err(|error| format!("장시간 작업 상태를 저장하지 못했습니다: {error}"))?;
+        if let (Some(run), Some(emitter)) = (updated, self.autonomous_emitter.lock().clone()) {
+            emitter(run)?;
+        }
+        Ok(())
+    }
+
     fn emit_activity_after_ask(&self) {
         let activity = if self.write_ticket().is_some() {
             crate::write_coordinator::SessionActivity::RunningWrite
@@ -667,6 +1212,7 @@ impl SessionToolRuntime {
         self.emit_activity(activity);
     }
     pub fn begin_request(&self, request_id: &str, project_id: &str) -> Result<(), String> {
+        self.set_autonomous_pause_requested(false);
         let _execution = self.execution_lock.try_lock().ok_or_else(|| {
             "a previously admitted tool is still running; wait for its completion before opening a new request"
                 .to_string()
@@ -688,15 +1234,80 @@ impl SessionToolRuntime {
             request_id: request_id.to_owned(),
             project_id: project_id.to_owned(),
             sound_results: 0,
-            workspace_root: None,
+            source_baseline_root: None,
             image_refs: BTreeMap::new(),
             audio_refs: BTreeMap::new(),
             audio_temp: None,
         });
         *self.request_state.lock() = Some(RequestState::for_request(request_id));
+        self.ask.lock().expired = None;
         *self.pending_plan.lock() = None;
         *self.last_build.lock() = None;
+        *self.last_build_result.lock() = None;
         *self.sound_build_required.lock() = false;
+        Ok(())
+    }
+
+    /// Reset only the soft iteration action counter for a continuing request.
+    pub fn begin_iteration(&self, request_id: &str) -> Result<(), String> {
+        {
+            let mut state = self.request_state.lock();
+            let state = state
+                .as_mut()
+                .filter(|state| state.request_id == request_id)
+                .ok_or_else(|| format!("request state for {request_id} is missing"))?;
+            state.begin_iteration();
+        }
+        self.ask.lock().expired = None;
+        Ok(())
+    }
+
+    pub fn iteration_action_boundary_reached(&self, request_id: &str) -> bool {
+        self.request_state
+            .lock()
+            .as_ref()
+            .filter(|state| state.request_id == request_id)
+            .is_some_and(RequestState::iteration_action_boundary_reached)
+    }
+
+    pub fn latest_build_progress(&self) -> Option<tools::BuildProgress> {
+        self.request_state
+            .lock()
+            .as_ref()
+            .and_then(RequestState::latest_build)
+            .cloned()
+    }
+
+    pub fn request_action_counts(&self) -> (u64, u64) {
+        self.request_state.lock().as_ref().map_or((0, 0), |state| {
+            (state.read_action_count, state.write_action_count)
+        })
+    }
+
+    /// The configured project's root directory.
+    pub fn project_root(&self) -> Result<PathBuf, String> {
+        self.services.native().project_root()
+    }
+
+    pub fn current_project_revision(&self) -> Result<String, String> {
+        self.services.native().open()?.revision()
+    }
+
+    pub fn restore_autonomous_progress(
+        &self,
+        request_id: &str,
+        progress: &crate::autonomous::AutonomousRunProgress,
+    ) -> Result<(), String> {
+        let mut state = self.request_state.lock();
+        let state = state
+            .as_mut()
+            .filter(|state| state.request_id == request_id)
+            .ok_or_else(|| format!("request state for {request_id} is missing"))?;
+        state.restore_autonomous_progress(
+            progress.read_actions,
+            progress.write_actions,
+            progress.latest_build.clone().map(Into::into),
+        );
         Ok(())
     }
 
@@ -886,32 +1497,41 @@ impl SessionToolRuntime {
         self.last_build.lock().clone()
     }
 
+    /// The latest complete `build_run` result JSON of this request.
+    pub fn last_build_result(&self) -> Option<Value> {
+        self.last_build_result.lock().clone()
+    }
+
     pub fn sound_build_required(&self) -> bool {
         *self.sound_build_required.lock()
     }
 
-    pub fn bind_workspace_root(
+    /// Bind the trusted turn baseline captured by [`WorkspaceManager::begin_turn`].
+    ///
+    /// Only write turns capture a baseline; mutating tools run exclusively in
+    /// write turns, so the stale-check reference is always present when needed.
+    pub fn bind_source_baseline(
         &self,
         request_id: &str,
-        workspace_root: PathBuf,
+        baseline_root: PathBuf,
     ) -> Result<(), String> {
         let mut request = self.request.lock();
         let active = request
             .as_mut()
             .filter(|request| request.request_id == request_id)
             .ok_or_else(|| format!("request {request_id} is not active"))?;
-        active.workspace_root = Some(workspace_root);
+        active.source_baseline_root = Some(baseline_root);
         Ok(())
     }
 
     fn source_baseline(&self, path: &str) -> Result<Option<String>, String> {
-        let workspace_root = self
+        let baseline_root = self
             .request
             .lock()
             .as_ref()
-            .and_then(|request| request.workspace_root.clone())
-            .ok_or_else(|| "the current request has no prepared session workspace".to_string())?;
-        crate::workspace::read_source_baseline(&workspace_root, path)
+            .and_then(|request| request.source_baseline_root.clone())
+            .ok_or_else(|| "the current request has no captured source baseline".to_string())?;
+        crate::workspace::read_source_baseline(&baseline_root, path)
             .map_err(|error| error.to_string())
     }
 
@@ -965,7 +1585,7 @@ impl SessionToolRuntime {
         }
     }
 
-    pub fn request_write_workspace(
+    pub(crate) fn register_write_request(
         &self,
         reason: impl Into<String>,
     ) -> Result<crate::write_coordinator::WriteTicket, String> {
@@ -1146,10 +1766,19 @@ impl SessionToolRuntime {
             );
         }
 
-        if tools::is_mutating_tool(tool) && !self.owns_write_registration() {
+        let effects = tools::tool_spec(tool).ok_or_else(|| format!("Unknown tool `{tool}`."))?;
+        if tools::TEAM_EXCLUDED_MAP_TOOLS.contains(&tool) {
+            if let Some(active) = self.active_team_task() {
+                return Err(format!(
+                    "map_task_in_progress: {tool} is refused while team map task {} is {}; the Map candidate and this session must not write the same map. Apply it with map_task_apply after inspecting it, discard it with map_task_discard, or wait for it to settle.",
+                    active.id,
+                    active.status.label()
+                ));
+            }
+        }
+        if effects.requires_write_workspace && !self.owns_write_registration() {
             return Err(
-                "WriteRegistrationRequired: call request_write_workspace with the reason for the change, \
-stop this turn so the backend can resume the same thread in its isolated writable workspace."
+                "WriteRegistrationRequired: canonical authoring requires runtime-managed write admission."
                     .to_string(),
             );
         }
@@ -1185,20 +1814,41 @@ stop this turn so the backend can resume the same thread in its isolated writabl
             } else {
                 self.map_sound_edit(&request_id, args)
             }
-        } else if tools::is_mutating_tool(tool) {
+        } else if effects.requires_project_transaction {
             self.project_transaction(|| self.dispatch(&request_id, tool, args))?
         } else {
             self.dispatch(&request_id, tool, args)
         };
         if let Ok(value) = result.as_mut() {
+            if tool == tools::MAP_INFO_TOOL {
+                if let Some(state) = self
+                    .request_state
+                    .lock()
+                    .as_mut()
+                    .filter(|state| state.request_id == request_id)
+                {
+                    state.record_map_inspection();
+                }
+            }
+            if tools::TEAM_CANDIDATE_READ_TOOLS.contains(&tool) {
+                if let (Ok(task_id), Some(state)) = (
+                    str_arg(args, "taskId"),
+                    self.request_state
+                        .lock()
+                        .as_mut()
+                        .filter(|state| state.request_id == request_id),
+                ) {
+                    state.record_candidate_inspection(task_id);
+                }
+            }
             if tool == tools::SEARCH_DOCS_TOOL {
-                self.record_search_docs_result(&request_id, value)?;
+                self.record_search_docs_result(&request_id, args, value)?;
             } else if tool == tools::DOCS_GET_TOOL {
                 self.record_docs_get_result(&request_id, value)?;
             }
         }
         #[cfg(test)]
-        if result.is_ok() && tools::is_mutating_tool(tool) {
+        if result.is_ok() && effects.requires_write_workspace {
             if let Some(barrier) = self.completion_barrier.lock().take() {
                 barrier
                     .reached
@@ -1213,7 +1863,12 @@ stop this turn so the backend can resume the same thread in its isolated writabl
         result
     }
 
-    fn record_search_docs_result(&self, request_id: &str, value: &mut Value) -> Result<(), String> {
+    fn record_search_docs_result(
+        &self,
+        request_id: &str,
+        args: &Value,
+        value: &mut Value,
+    ) -> Result<(), String> {
         let ids = value
             .get("hits")
             .and_then(Value::as_array)
@@ -1232,7 +1887,7 @@ stop this turn so the backend can resume the same thread in its isolated writabl
             .as_mut()
             .filter(|state| state.request_id == request_id)
             .ok_or_else(|| format!("request state for {request_id} is missing"))?;
-        let repeated = state.record_search_docs_hits(&ids);
+        let repeated = state.record_search_docs_hits(args, &ids);
         let repeated_count = repeated.iter().filter(|flag| **flag).count();
         let new_count = repeated.len() - repeated_count;
 
@@ -1265,6 +1920,12 @@ stop this turn so the backend can resume the same thread in its isolated writabl
             repeated_count,
             bytes,
         );
+        if state.search_docs_count > 1 && new_count == 0 {
+            return Err(
+                "search_docs no-progress: this normalized search produced no new stable document ids. Reuse the existing evidence or change the query and filters."
+                    .to_string(),
+            );
+        }
         Ok(())
     }
 
@@ -1339,6 +2000,11 @@ stop this turn so the backend can resume the same thread in its isolated writabl
                     args,
                     candidates.context().starcraft_path()?.as_path(),
                 )
+            }
+            "map_terrain_read" => {
+                let state = candidates.state(&project_id, &self.session_id)?;
+                let map = candidates.current_map(&project_id, &self.session_id)?;
+                terrain_read_tool(&map, &state, args)
             }
             "map_palette_query" => {
                 let state = candidates.state(&project_id, &self.session_id)?;
@@ -1506,6 +2172,11 @@ stop this turn so the backend can resume the same thread in its isolated writabl
                     candidates.context().starcraft_path()?.as_path(),
                 )
             }
+            "map_draft_terrain_read" => {
+                let state = candidates.state(&project_id, &self.session_id)?;
+                let map = candidates.draft_map(&self.session_id, request_id)?;
+                terrain_read_tool(&map, &state, args)
+            }
             "map_draft_analyze" => serde_json::to_value(candidates.draft_analyze(
                 &project_id,
                 &self.session_id,
@@ -1558,7 +2229,41 @@ stop this turn so the backend can resume the same thread in its isolated writabl
                 let content = self.services.native().read_source(path)?;
                 ranged_file_result(path, &content, args)
             }
+            tools::BUILD_LOG_READ_TOOL => {
+                let project = self.services.native().open()?;
+                let path = crate::native_build::build_log_path(project.root());
+                let content = match std::fs::read(&path) {
+                    Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        return Err(format!(
+                            "이 프로젝트에는 아직 빌드 로그({})가 없습니다. build_run을 먼저 실행하세요.",
+                            crate::native_build::BUILD_LOG_RELATIVE_PATH
+                        ));
+                    }
+                    Err(error) => {
+                        return Err(format!(
+                            "빌드 로그({})를 읽지 못했습니다: {error}",
+                            crate::native_build::BUILD_LOG_RELATIVE_PATH
+                        ));
+                    }
+                };
+                build_log_page(&content, args)
+            }
             tools::SOURCE_SEARCH_TOOL => self.source_search(args),
+            // The pure-IO tools need the root, not the manifest: they are the
+            // same filesystem Codex and Claude Code already edit natively.
+            name if tools::is_fs_tool(name) => {
+                let root = self.services.native().project_root()?;
+                let root = std::fs::canonicalize(&root)
+                    .map_err(|error| format!("프로젝트 루트를 확인하지 못했습니다: {error}"))?;
+                match name {
+                    tools::FS_READ_TOOL => crate::fs_tools::read(&root, args),
+                    tools::FS_WRITE_TOOL => crate::fs_tools::write(&root, args),
+                    tools::FS_EDIT_TOOL => crate::fs_tools::edit(&root, args),
+                    tools::FS_GLOB_TOOL => crate::fs_tools::glob(&root, args),
+                    _ => crate::fs_tools::grep(&root, args),
+                }
+            }
             tools::PYTHON_DEPENDENCIES_PREPARE_TOOL => {
                 let values = array_arg(args, "dependencies")?;
                 let dependencies = values
@@ -1738,6 +2443,88 @@ stop this turn so the backend can resume the same thread in its isolated writabl
                     .collect();
                 Ok(json!({"count": results.len(), "results": results}))
             }
+            crate::tools::ISCRIPT_INFO_TOOL => {
+                let ids = array_arg(args, "ids")?;
+                let mut script_ids = Vec::with_capacity(ids.len());
+                for value in ids {
+                    let raw = value
+                        .as_i64()
+                        .ok_or_else(|| "ids must be integers".to_string())?;
+                    script_ids.push(
+                        u16::try_from(raw)
+                            .map_err(|_| format!("iscript id {raw} is outside 0..65535"))?,
+                    );
+                }
+                let starcraft = crate::map_context::resolve_starcraft_path(&self.services.dirs)?;
+                let bytes = isom::game_asset(&starcraft, crate::iscript::ISCRIPT_ASSET).map_err(
+                    |error| format!("iscript.bin could not be read from StarCraft data: {error}"),
+                )?;
+                let iscript = crate::iscript::Iscript::parse(bytes)?;
+                let scripts: Vec<_> = script_ids
+                    .iter()
+                    .map(|id| iscript.script(*id))
+                    .collect::<Result<_, _>>()?;
+                let users = self.images_by_iscript()?;
+                // Name only the images actually listed, so one call reads the GRP
+                // table at most once and never for the whole 999-entry table.
+                let listed: Vec<u32> = scripts
+                    .iter()
+                    .flat_map(|script| {
+                        users
+                            .get(&i64::from(script.id))
+                            .map(Vec::as_slice)
+                            .unwrap_or_default()
+                            .iter()
+                            .take(crate::tools::ISCRIPT_INFO_MAX_IMAGES)
+                            .copied()
+                    })
+                    .collect();
+                let grp = self.image_grp_names(&starcraft, &listed)?;
+                let results: Vec<_> = scripts
+                    .iter()
+                    .map(|script| {
+                        let images = users
+                            .get(&i64::from(script.id))
+                            .map(Vec::as_slice)
+                            .unwrap_or_default();
+                        let shown: Vec<_> = images
+                            .iter()
+                            .take(crate::tools::ISCRIPT_INFO_MAX_IMAGES)
+                            .map(|image_id| {
+                                json!({
+                                    "imageId": image_id,
+                                    "grp": grp.get(image_id).cloned().unwrap_or_default(),
+                                })
+                            })
+                            .collect();
+                        json!({
+                            "id": script.id,
+                            "type": script.declared_type,
+                            "headerOffset": script.header_offset,
+                            "slotCount": script.slots.len(),
+                            "slots": script
+                                .slots
+                                .iter()
+                                .map(|slot| json!({
+                                    "index": slot.index,
+                                    "name": slot.name,
+                                    "present": slot.present,
+                                }))
+                                .collect::<Vec<_>>(),
+                            "usedBy": {
+                                "total": images.len(),
+                                "omitted": images.len().saturating_sub(shown.len()),
+                                "images": shown,
+                            },
+                        })
+                    })
+                    .collect();
+                Ok(json!({
+                    "schema": "eud-iscript/1",
+                    "count": results.len(),
+                    "scripts": results,
+                }))
+            }
             "settings_get" => {
                 let (scope, key) = (str_arg(args, "scope")?, str_arg(args, "key")?);
                 let config = self
@@ -1768,33 +2555,12 @@ stop this turn so the backend can resume the same thread in its isolated writabl
             }
             tools::MAP_MINIMAP_TOOL => {
                 let map_path = self.services.native().source_map_path()?;
-                let configured = args
-                    .get("starcraftPath")
-                    .and_then(Value::as_str)
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|| {
-                        PathBuf::from(
-                            self.services
-                                .dirs
-                                .load_config()
-                                .map(|config| config.starcraft_path)
-                                .unwrap_or_default(),
-                        )
-                    });
-                tools::map_minimap_path(&map_path, &configured, args).map_err(stringify)
+                let starcraft = minimap_starcraft_path(&self.services.dirs, args)?;
+                tools::map_minimap_path(&map_path, &starcraft, args).map_err(stringify)
             }
             tools::MAP_SOUND_LIST_TOOL => self.map_sound_list(request_id),
             tools::SEARCH_DOCS_TOOL => Ok(self.search_docs(args)),
             tools::DOCS_GET_TOOL => self.docs_get(args),
-            tools::REQUEST_WRITE_WORKSPACE_TOOL => {
-                let reason = str_arg(args, "reason")?;
-                self.request_write_workspace(reason)?;
-                Ok(json!({
-                    "ok": true,
-                    "status": "granted",
-                    "note": "Write intent recorded. Stop this turn now; the backend will resume this thread immediately in its isolated writable workspace."
-                }))
-            }
 
             // ---- write tools (journaled) ----
             "dat_patch" => {
@@ -1834,6 +2600,19 @@ stop this turn so the backend can resume the same thread in its isolated writabl
                 let project_id = self
                     .current_project_id()
                     .ok_or_else(|| "현재 에이전트 프로젝트가 열려 있지 않습니다.".to_string())?;
+                let input_revision = self.services.native().open()?.revision()?;
+                {
+                    let state = self.request_state.lock();
+                    let state = state
+                        .as_ref()
+                        .filter(|state| state.request_id == request_id)
+                        .ok_or_else(|| format!("request state for {request_id} is missing"))?;
+                    if state.build_blocked_for_revision(&input_revision) {
+                        return Err(format!(
+                            "build_run no-progress: revision `{input_revision}` is blocked until a canonical input change produces a new revision."
+                        ));
+                    }
+                }
                 let bridge = self
                     .cancellation
                     .lock()
@@ -1848,75 +2627,39 @@ stop this turn so the backend can resume the same thread in its isolated writabl
                     ok: result.ok,
                     error_count: result.errors.len(),
                 });
-                serde_json::to_value(result)
-                    .map_err(|error| format!("failed to serialize build result: {error}"))
-            }
-            tools::TRACE_TEST_RUN_TOOL => {
-                let Some(build) = self.last_build.lock().clone() else {
-                    return Err(
-                        "trace_test_run requires build_run in the current request".to_string()
-                    );
+                let progress = {
+                    let mut state = self.request_state.lock();
+                    let state = state
+                        .as_mut()
+                        .filter(|state| state.request_id == request_id)
+                        .ok_or_else(|| format!("request state for {request_id} is missing"))?;
+                    state.record_build(input_revision, &result)
                 };
-                if !build.ok {
-                    return Err(
-                        "trace_test_run requires the current request's latest build_run to succeed"
-                            .to_string(),
-                    );
-                }
-                let input: crate::trace_test::TraceTestInput = serde_json::from_value(args.clone())
-                    .map_err(|error| format!("invalid trace_test_run arguments: {error}"))?;
-                let (eds_path, euddraft, starcraft_setting, _) =
-                    native_trace_runtime(&self.services)?;
-                let result = crate::trace_test::run(
-                    &self.services.dirs,
-                    &eds_path,
-                    &euddraft,
-                    &starcraft_setting,
-                    input,
-                    |phase| {
-                        self.emit_progress(crate::ipc::ProgressStage::TraceTest, phase.as_str());
-                    },
-                )?;
-                let detail = format!("done:{}", result.status.as_str());
-                self.emit_progress(crate::ipc::ProgressStage::TraceTest, &detail);
-                serde_json::to_value(result)
-                    .map_err(|error| format!("failed to serialize trace test result: {error}"))
-            }
-            tools::TRACE_SUITE_RUN_TOOL => {
-                let Some(build) = self.last_build.lock().clone() else {
-                    return Err(
-                        "trace_suite_run requires build_run in the current request".to_string()
-                    );
+                let mut value = build_run_observation(result)?;
+                let (progress, no_progress_reason) = match progress {
+                    tools::BuildProgressOutcome::Progress(progress) => (progress, None),
+                    tools::BuildProgressOutcome::NoProgress { progress, reason } => {
+                        (progress, Some(reason))
+                    }
                 };
-                if !build.ok {
-                    return Err(
-                        "trace_suite_run requires the current request's latest build_run to succeed"
-                            .to_string(),
+                value
+                    .as_object_mut()
+                    .ok_or_else(|| "failed to serialize build result object".to_string())?
+                    .insert(
+                        "buildProgress".to_string(),
+                        json!({
+                            "inputRevision": progress.input_revision,
+                            "diagnosticsFingerprint": progress.diagnostics_fingerprint,
+                            "errorCount": progress.error_count,
+                            "success": progress.success,
+                            "consecutiveNoProgress": progress.consecutive_no_progress,
+                        }),
                     );
+                *self.last_build_result.lock() = Some(value.clone());
+                if let Some(reason) = no_progress_reason {
+                    return Err(reason);
                 }
-                let input: crate::trace_test::TraceSuiteInput =
-                    serde_json::from_value(args.clone())
-                        .map_err(|error| format!("invalid trace_suite_run arguments: {error}"))?;
-                self.emit_progress(crate::ipc::ProgressStage::TraceTest, "discover");
-                let (eds_path, euddraft, starcraft_setting, snapshot) =
-                    native_trace_runtime(&self.services)?;
-                let timeout_ms = input.timeout_ms;
-                let selection = crate::trace_test::select_persistent_tests(&snapshot, &input)?;
-                let result = crate::trace_test::run_suite(
-                    &self.services.dirs,
-                    &eds_path,
-                    &euddraft,
-                    &starcraft_setting,
-                    selection,
-                    timeout_ms,
-                    |phase| {
-                        self.emit_progress(crate::ipc::ProgressStage::TraceTest, phase.as_str());
-                    },
-                )?;
-                let detail = format!("done:{}", result.status.as_str());
-                self.emit_progress(crate::ipc::ProgressStage::TraceTest, &detail);
-                serde_json::to_value(result)
-                    .map_err(|error| format!("failed to serialize trace suite result: {error}"))
+                Ok(value)
             }
             "location_write" => {
                 let map_path = self.services.native().source_map_path()?;
@@ -1958,6 +2701,16 @@ stop this turn so the backend can resume the same thread in its isolated writabl
                 )
                 .map_err(stringify)
             }
+            tools::MAP_TASK_STATUS_TOOL => self.map_task_status(args),
+            tools::MAP_TASK_DIFF_TOOL
+            | tools::MAP_TASK_OBJECTS_TOOL
+            | tools::MAP_TASK_RENDER_TOOL => self.map_task_candidate_read(tool, args),
+            tools::MAP_TASK_APPLY_TOOL => {
+                self.map_task_action(request_id, TeamTaskActionKind::Apply, args)
+            }
+            tools::MAP_TASK_DISCARD_TOOL => {
+                self.map_task_action(request_id, TeamTaskActionKind::Discard, args)
+            }
             "propose_plan" => {
                 let markdown = str_arg(args, "markdown")?.to_string();
                 *self.pending_plan.lock() = Some((request_id.to_owned(), markdown));
@@ -1970,15 +2723,101 @@ stop this turn so the backend can resume the same thread in its isolated writabl
         }
     }
 
+    /// Which images currently point at each iscript, keyed by the script id.
+    ///
+    /// The values are the project's EFFECTIVE `Iscript ID` (catalog baseline plus
+    /// this project's sparse overrides), not stock StarCraft, so a script the
+    /// project already repointed an image at is reported as in use.
+    fn images_by_iscript(&self) -> Result<BTreeMap<i64, Vec<u32>>, String> {
+        let native = self.services.native();
+        let (first, last) = native.dat_field_range("images", IMAGE_ISCRIPT_FIELD)?;
+        let targets: Vec<DatTarget> = (first..=last)
+            .map(|object_id| DatTarget::Dat {
+                dat: "images".to_string(),
+                object_id,
+                field: IMAGE_ISCRIPT_FIELD.to_string(),
+            })
+            .collect();
+        let values = native.dat_values(&targets)?;
+        let mut users: BTreeMap<i64, Vec<u32>> = BTreeMap::new();
+        for target in &targets {
+            let DatTarget::Dat { object_id, .. } = target else {
+                continue;
+            };
+            if let Some(DatScalar::Number(script)) = values.get(target) {
+                users.entry(*script).or_default().push(*object_id);
+            }
+        }
+        Ok(users)
+    }
+
+    /// The GRP file name of each given image, from `images.dat`'s GRP index into
+    /// `images.tbl`. An image whose index is outside the table is left out rather
+    /// than reported under a guessed name.
+    fn image_grp_names(
+        &self,
+        starcraft: &Path,
+        image_ids: &[u32],
+    ) -> Result<BTreeMap<u32, String>, String> {
+        if image_ids.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+        let targets: Vec<DatTarget> = image_ids
+            .iter()
+            .map(|object_id| DatTarget::Dat {
+                dat: "images".to_string(),
+                object_id: *object_id,
+                field: IMAGE_GRP_FIELD.to_string(),
+            })
+            .collect();
+        let values = self.services.native().dat_values(&targets)?;
+        let table = crate::iscript::tbl_strings(
+            &isom::game_asset(starcraft, crate::iscript::IMAGES_TBL_ASSET).map_err(|error| {
+                format!("images.tbl could not be read from StarCraft data: {error}")
+            })?,
+        )?;
+        let mut names = BTreeMap::new();
+        for target in &targets {
+            let DatTarget::Dat { object_id, .. } = target else {
+                continue;
+            };
+            let Some(DatScalar::Number(index)) = values.get(target) else {
+                continue;
+            };
+            // images.tbl indices are 1-based and 0 means "no GRP", while
+            // `tbl_strings` returns the table 0-based.
+            let Ok(index) = usize::try_from(*index) else {
+                continue;
+            };
+            if let Some(name) = index.checked_sub(1).and_then(|entry| table.get(entry)) {
+                names.insert(*object_id, name.clone());
+            }
+        }
+        Ok(names)
+    }
+
     // ---- write-tool helpers ----
-    fn map_sound_list(&self, request_id: &str) -> Result<Value, String> {
-        let project_id = self
+    /// The project audio store is keyed by the project's local workspace id,
+    /// a stable digest that survives folder moves; the request's project is
+    /// only the display name and is never a valid store id.
+    fn audio_project_id(&self, request_id: &str) -> Result<String, String> {
+        if !self
             .request
             .lock()
             .as_ref()
-            .filter(|request| request.request_id == request_id)
-            .map(|request| request.project_id.clone())
-            .ok_or_else(|| format!("request {request_id} is not active"))?;
+            .is_some_and(|request| request.request_id == request_id)
+        {
+            return Err(format!("request {request_id} is not active"));
+        }
+        Ok(
+            crate::workspace::WorkspaceManager::new(self.services.dirs.clone())
+                .prepare_current()?
+                .id,
+        )
+    }
+
+    fn map_sound_list(&self, request_id: &str) -> Result<Value, String> {
+        let project_id = self.audio_project_id(request_id)?;
         let map_path = self.services.native().source_map_path()?;
         let chk = isom::chk_extract(&map_path)
             .map_err(|_| "저장된 맵의 사운드 목록을 읽을 수 없습니다.".to_string())?;
@@ -2015,13 +2854,7 @@ stop this turn so the backend can resume the same thread in its isolated writabl
     }
 
     fn map_sound_import(&self, request_id: &str, args: &Value) -> Result<Value, String> {
-        let project_id = self
-            .request
-            .lock()
-            .as_ref()
-            .filter(|request| request.request_id == request_id)
-            .map(|request| request.project_id.clone())
-            .ok_or_else(|| format!("request {request_id} is not active"))?;
+        let project_id = self.audio_project_id(request_id)?;
         let audio_ref = str_arg(args, "audioRef")?;
         let binding = self.audio_binding(request_id, audio_ref)?;
         let map_path = self.services.native().source_map_path()?;
@@ -2202,13 +3035,7 @@ stop this turn so the backend can resume the same thread in its isolated writabl
     }
 
     fn map_sound_edit(&self, request_id: &str, args: &Value) -> Result<Value, String> {
-        let project_id = self
-            .request
-            .lock()
-            .as_ref()
-            .filter(|request| request.request_id == request_id)
-            .map(|request| request.project_id.clone())
-            .ok_or_else(|| format!("request {request_id} is not active"))?;
+        let project_id = self.audio_project_id(request_id)?;
         let old_mpq_path = str_arg(args, "mpqPath")?;
         if managed_sound_hash(old_mpq_path).is_none() {
             return Err("eud-agent가 관리하는 MPQ 사운드 경로만 편집할 수 있습니다.".to_string());
@@ -2678,13 +3505,14 @@ stop this turn so the backend can resume the same thread in its isolated writabl
                 let edit_base = self
                     .latest_file_content(request_id, &path)
                     .unwrap_or_else(|| base.clone());
-                let ours = apply_exact_text_edits(&path, &edit_base, &edits)
+                let ours = apply_exact_text_edits("file_edit", &path, &edit_base, &edits)
                     .map_err(|error| error.to_string())?;
                 crate::workspace::merge_concurrent_text(&path, &edit_base, &ours, &old)
                     .map_err(|error| error.to_string())?
             }
             None if self.source_created_by_request(request_id, &path) => {
-                apply_exact_text_edits(&path, &old, &edits).map_err(|error| error.to_string())?
+                apply_exact_text_edits("file_edit", &path, &old, &edits)
+                    .map_err(|error| error.to_string())?
             }
             None => {
                 return Err(concurrent_source_conflict(
@@ -3289,274 +4117,6 @@ stop this turn so the backend can resume the same thread in its isolated writabl
     }
 }
 
-impl crate::journal::JournalRollbackTarget for SessionToolRuntime {
-    type Error = String;
-
-    fn set_dat_value(
-        &self,
-        table: DatTable,
-        dat: &str,
-        obj_id: u32,
-        property: &str,
-        value: Value,
-    ) -> Result<(), Self::Error> {
-        let target = match table {
-            DatTable::Dat => DatTarget::Dat {
-                dat: dat.to_string(),
-                object_id: obj_id,
-                field: property.to_string(),
-            },
-            DatTable::Xdat => DatTarget::Xdat {
-                dat: dat.to_string(),
-                object_id: obj_id,
-                field: property.to_string(),
-            },
-            DatTable::Tbl => DatTarget::Tbl(obj_id),
-            DatTable::Req => DatTarget::Requirement {
-                dat: dat.to_string(),
-                object_id: obj_id,
-            },
-            DatTable::Btn => DatTarget::Button(obj_id),
-        };
-        let current = self
-            .services
-            .native()
-            .dat_values(std::slice::from_ref(&target))?;
-        let before = current[&target].clone();
-        let change = match (table, before, value) {
-            (DatTable::Dat, DatScalar::Number(before), value) => NativeDatChange::Dat {
-                dat: dat.to_string(),
-                object_id: obj_id,
-                field: property.to_string(),
-                before,
-                after: numeric_json_value(&value)?,
-            },
-            (DatTable::Xdat, DatScalar::Number(before), value) => NativeDatChange::Xdat {
-                dat: dat.to_string(),
-                object_id: obj_id,
-                field: property.to_string(),
-                before,
-                after: numeric_json_value(&value)?,
-            },
-            (DatTable::Tbl, DatScalar::Text(before), value) => NativeDatChange::Tbl {
-                index: obj_id,
-                before,
-                after: value_to_text(&value),
-            },
-            (DatTable::Req, DatScalar::Text(before), value) => NativeDatChange::Requirement {
-                dat: dat.to_string(),
-                object_id: obj_id,
-                before,
-                after: value_to_text(&value),
-            },
-            (DatTable::Btn, DatScalar::Text(before), value) => NativeDatChange::Button {
-                set_id: obj_id,
-                before,
-                after: value_to_text(&value),
-            },
-            _ => return Err("journal DAT value type mismatch".to_string()),
-        };
-        self.services
-            .native()
-            .apply_dat_patch(&NativeDatPatch {
-                changes: vec![change],
-            })
-            .map(|_| ())
-    }
-
-    fn reset_dat_value(
-        &self,
-        table: DatTable,
-        dat: &str,
-        obj_id: u32,
-        property: &str,
-    ) -> Result<(), Self::Error> {
-        let target = match table {
-            DatTable::Dat => DatTarget::Dat {
-                dat: dat.to_string(),
-                object_id: obj_id,
-                field: property.to_string(),
-            },
-            DatTable::Xdat => DatTarget::Xdat {
-                dat: dat.to_string(),
-                object_id: obj_id,
-                field: property.to_string(),
-            },
-            DatTable::Tbl => DatTarget::Tbl(obj_id),
-            DatTable::Req => DatTarget::Requirement {
-                dat: dat.to_string(),
-                object_id: obj_id,
-            },
-            DatTable::Btn => DatTarget::Button(obj_id),
-        };
-        let original = self
-            .services
-            .native()
-            .open()?
-            .original_dat_value(&target)
-            .ok_or_else(|| format!("target {target:?} has no sparse override to reset"))?;
-        self.set_dat_value(table, dat, obj_id, property, dat_scalar_json(&original))
-    }
-
-    fn write_file(&self, path: &str, content: &str) -> Result<(), Self::Error> {
-        self.services
-            .native()
-            .write_source(&native_source_path(path), content)
-    }
-
-    fn delete_file(&self, path: &str) -> Result<(), Self::Error> {
-        self.services
-            .native()
-            .delete_source(&native_source_path(path))
-    }
-
-    fn write_workspace_file(
-        &self,
-        workspace_id: &str,
-        session_id: Option<&str>,
-        path: &str,
-        content: &str,
-    ) -> Result<(), Self::Error> {
-        crate::workspace::WorkspaceManager::new(self.data_dirs())
-            .restore_file(workspace_id, session_id, path, Some(content))
-            .map_err(stringify)
-    }
-
-    fn delete_workspace_file(
-        &self,
-        workspace_id: &str,
-        session_id: Option<&str>,
-        path: &str,
-    ) -> Result<(), Self::Error> {
-        crate::workspace::WorkspaceManager::new(self.data_dirs())
-            .restore_file(workspace_id, session_id, path, None)
-            .map_err(stringify)
-    }
-
-    fn create_file(
-        &self,
-        path: &str,
-        content: &str,
-        _position: Option<usize>,
-    ) -> Result<(), Self::Error> {
-        self.services
-            .native()
-            .create_source(&native_source_path(path), content)
-    }
-
-    fn rename_path(&self, from: &str, to: &str) -> Result<(), Self::Error> {
-        if from == to {
-            return Ok(());
-        }
-        self.services
-            .native()
-            .move_source(&native_source_path(from), &native_source_path(to))
-    }
-
-    fn set_main(&self, path: Option<&str>) -> Result<(), Self::Error> {
-        let path = path.ok_or_else(|| "native MainFile cannot be empty".to_string())?;
-        self.services
-            .native()
-            .set_main_file(&native_source_path(path))
-    }
-
-    fn set_setting(&self, key: &str, value: Value) -> Result<(), Self::Error> {
-        let (scope, name) = key
-            .split_once('|')
-            .ok_or_else(|| format!("invalid journal setting key '{key}'"))?;
-        let value = value_to_text(&value);
-        if scope == "project" {
-            self.services.native().set_project_setting(name, &value)
-        } else {
-            let mut config = self
-                .services
-                .dirs
-                .load_config()
-                .map_err(|error| error.to_string())?;
-            match name {
-                "euddraft" => config.euddraft_path = value,
-                "starcraft" => config.starcraft_path = value,
-                _ => return Err(format!("unsupported native program setting {name}")),
-            }
-            self.services
-                .dirs
-                .save_config(&config)
-                .map_err(|error| error.to_string())
-        }
-    }
-
-    fn plugin_add(
-        &self,
-        _plugin_id: &str,
-        texts: Vec<String>,
-        index: usize,
-    ) -> Result<(), Self::Error> {
-        self.services
-            .native()
-            .plugin_add(index as i64, &texts.join("\n"))
-            .map(|_| ())
-    }
-
-    fn plugin_edit(
-        &self,
-        _plugin_id: &str,
-        texts: Vec<String>,
-        index: usize,
-    ) -> Result<(), Self::Error> {
-        self.services.native().plugin_edit(index, &texts.join("\n"))
-    }
-
-    fn plugin_remove(&self, plugin_id: &str) -> Result<(), Self::Error> {
-        let index = rollback_plugin_index(plugin_id)?;
-        self.services.native().plugin_remove(index).map(|_| ())
-    }
-
-    fn plugin_move(&self, from_index: usize, to_index: usize) -> Result<(), Self::Error> {
-        self.services.native().plugin_move(from_index, to_index)
-    }
-
-    fn restore_project_manifest(
-        &self,
-        expected_revision: &str,
-        bytes: &[u8],
-    ) -> Result<(), Self::Error> {
-        self.services
-            .native()
-            .restore_manifest_bytes(expected_revision, bytes)
-            .map(|_| ())
-    }
-
-    fn restore_map_backup(
-        &self,
-        map_path: &str,
-        backup_path: &str,
-        expected_sha256: Option<&str>,
-    ) -> Result<(), Self::Error> {
-        let map_path = PathBuf::from(map_path);
-        self.services
-            .map_safe
-            .restore(&crate::mapsafe::JournalEntry {
-                map_path: map_path.clone(),
-                backup_path: PathBuf::from(backup_path),
-            })
-            .map_err(stringify)?;
-        if let Some(expected_sha256) = expected_sha256 {
-            let actual = crate::bootstrap::sha256_file(&map_path)
-                .map_err(|error| format!("restored map hash failed: {error}"))?;
-            if actual != expected_sha256 {
-                return Err("restored map SHA-256 does not match exact before state".to_string());
-            }
-        }
-        Ok(())
-    }
-}
-
-fn rollback_plugin_index(plugin_id: &str) -> Result<usize, String> {
-    plugin_id
-        .parse()
-        .map_err(|_| format!("invalid plugin journal index '{plugin_id}'"))
-}
-
 #[cfg(test)]
 impl ToolServices {
     pub fn for_tests() -> Self {
@@ -3564,7 +4124,12 @@ impl ToolServices {
             .duration_since(UNIX_EPOCH)
             .map(|duration| duration.as_nanos())
             .unwrap_or_default();
-        let base = std::env::temp_dir().join(format!("eud-agent-runtime-test-{nanos}"));
+        // Nanoseconds alone collide when parallel tests construct runtimes in
+        // the same tick; the UUID keeps every runtime's data dirs private.
+        let base = std::env::temp_dir().join(format!(
+            "eud-agent-runtime-test-{nanos}-{}",
+            uuid::Uuid::new_v4()
+        ));
         let dirs = DataDirs::from_bases(&base, &base);
         let candidates = crate::map_candidate::CandidateStore::new(
             (dirs.clone()).clone(),
@@ -3707,6 +4272,192 @@ fn optional_string_array_arg(args: &Value, name: &str) -> Result<Vec<String>, St
     Ok(result)
 }
 
+/// The model-facing `build_run` result: structured diagnostics plus a bounded output excerpt.
+/// The raw stdout/stderr stay in the project build log, which `build_log_read` pages, so the
+/// observation stays under every provider's tool-result ceiling even when euddraft prints one
+/// line per map tile.
+fn build_run_observation(result: crate::native_build::NativeBuildResult) -> Result<Value, String> {
+    let excerpt = crate::native_build::output_excerpt(&result.stdout, &result.stderr);
+    let log_written = !result.log_path.is_empty();
+    let mut value = serde_json::to_value(result)
+        .map_err(|error| format!("failed to serialize build result: {error}"))?;
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| "failed to serialize build result object".to_string())?;
+    object.remove("stdout");
+    object.remove("stderr");
+    let errors = object
+        .remove("errors")
+        .and_then(|value| value.as_array().cloned())
+        .unwrap_or_default();
+    let mut warnings = object
+        .remove("warnings")
+        .and_then(|value| value.as_array().cloned())
+        .unwrap_or_default();
+    for warning in &mut warnings {
+        // A warning's stack is context, not something to repair; the log keeps it.
+        if let Some(warning) = warning.as_object_mut() {
+            warning.remove("raw");
+        }
+    }
+    object.insert("outputExcerpt".to_string(), Value::String(excerpt));
+    object.insert(
+        "logPath".to_string(),
+        if log_written {
+            Value::String(crate::native_build::BUILD_LOG_RELATIVE_PATH.to_string())
+        } else {
+            Value::Null
+        },
+    );
+    let mut used = double_escaped_len(&Value::Object(object.clone()));
+    let mut take = |entries: Vec<Value>| -> (Vec<Value>, usize) {
+        let mut kept = Vec::new();
+        let mut omitted = 0usize;
+        for entry in entries {
+            let cost = double_escaped_len(&entry) + 1;
+            if used + cost > BUILD_RUN_OBSERVATION_BYTES {
+                omitted += 1;
+                continue;
+            }
+            used += cost;
+            kept.push(entry);
+        }
+        (kept, omitted)
+    };
+    let (errors, omitted_errors) = take(errors);
+    let (warnings, omitted_warnings) = take(warnings);
+    object.insert("errors".to_string(), Value::Array(errors));
+    object.insert("warnings".to_string(), Value::Array(warnings));
+    object.insert("omittedErrors".to_string(), json!(omitted_errors));
+    object.insert("omittedWarnings".to_string(), json!(omitted_warnings));
+    Ok(value)
+}
+
+/// Bytes of `value` once it is rendered as compact JSON and then embedded as a JSON string —
+/// how the Claude adapter measures the text block a native CLI echoes back for a tool result.
+fn double_escaped_len(value: &Value) -> usize {
+    serde_json::to_string(&Value::String(value.to_string()))
+        .map(|text| text.len())
+        .unwrap_or(usize::MAX)
+}
+
+/// One page of the build log: a 1-based line range, or the lines containing `query`.
+fn build_log_page(content: &str, args: &Value) -> Result<Value, String> {
+    let path = crate::native_build::BUILD_LOG_RELATIVE_PATH;
+    let lines: Vec<&str> = content.lines().collect();
+    let total_lines = lines.len();
+    let query = match args.get("query") {
+        None | Some(Value::Null) => None,
+        Some(value) => {
+            let query = value
+                .as_str()
+                .ok_or_else(|| "argument 'query' must be a string".to_string())?
+                .trim();
+            if query.is_empty() {
+                return Err("build_log_read query must not be blank".to_string());
+            }
+            Some(query.to_lowercase())
+        }
+    };
+    let start = usize_arg_default(args, "startLine", 1)?;
+    if start == 0 {
+        return Err("build_log_read startLine is 1-based and must be at least 1".to_string());
+    }
+    if total_lines == 0 {
+        return Ok(json!({
+            "path": path,
+            "totalLines": 0,
+            "startLine": Value::Null,
+            "endLine": 0,
+            "count": 0,
+            "hasMore": false,
+            "nextLine": Value::Null,
+            "lines": [],
+        }));
+    }
+    if start > total_lines {
+        return Err(format!(
+            "build_log_read startLine {start} exceeds {total_lines} total lines"
+        ));
+    }
+    let cut_line = |text: &str| -> String {
+        let length = text.chars().count();
+        if length <= BUILD_LOG_LINE_CHARS {
+            text.to_string()
+        } else {
+            let head: String = text.chars().take(BUILD_LOG_LINE_CHARS).collect();
+            format!(
+                "{head} [… line cut, {} more chars]",
+                length - BUILD_LOG_LINE_CHARS
+            )
+        }
+    };
+    let mut items = Vec::new();
+    let mut used_bytes = 256usize; // envelope fields
+    let mut last_scanned = start - 1;
+    let end = match &query {
+        None => {
+            let default_end = start
+                .saturating_add(BUILD_LOG_DEFAULT_LINES - 1)
+                .min(total_lines);
+            let end = usize_arg_default(args, "endLine", default_end)?
+                .min(total_lines)
+                .min(start.saturating_add(BUILD_LOG_MAX_LINES - 1));
+            if end < start {
+                return Err(format!(
+                    "build_log_read endLine {end} precedes startLine {start}"
+                ));
+            }
+            end
+        }
+        Some(_) => {
+            let end = usize_arg_default(args, "endLine", total_lines)?.min(total_lines);
+            if end < start {
+                return Err(format!(
+                    "build_log_read endLine {end} precedes startLine {start}"
+                ));
+            }
+            end
+        }
+    };
+    for line_number in start..=end {
+        let text = lines[line_number - 1];
+        let selected = match &query {
+            None => true,
+            Some(query) => text.to_lowercase().contains(query.as_str()),
+        };
+        if selected {
+            let item = json!({ "line": line_number, "text": cut_line(text) });
+            let cost = double_escaped_len(&item) + 1;
+            let at_limit = !items.is_empty()
+                && (used_bytes + cost > BUILD_LOG_PAGE_BYTES
+                    || items.len()
+                        >= query
+                            .as_ref()
+                            .map_or(BUILD_LOG_MAX_LINES, |_| BUILD_LOG_MAX_MATCHES));
+            if at_limit {
+                break;
+            }
+            used_bytes += cost;
+            items.push(item);
+        }
+        last_scanned = line_number;
+    }
+    let has_more = last_scanned < end || (query.is_none() && end < total_lines);
+    let next_line = has_more.then_some(last_scanned + 1);
+    Ok(json!({
+        "path": path,
+        "totalLines": total_lines,
+        "query": query.is_some().then(|| args["query"].clone()),
+        "startLine": start,
+        "endLine": last_scanned,
+        "count": items.len(),
+        "hasMore": has_more,
+        "nextLine": next_line,
+        "lines": items,
+    }))
+}
+
 fn ranged_file_result(path: &str, content: &str, args: &Value) -> Result<Value, String> {
     let total_lines = content.lines().count();
     if args.get("startLine").is_none() && args.get("endLine").is_none() {
@@ -3813,7 +4564,7 @@ fn search_docs_preview(text: &str, query: &str) -> (String, usize, bool) {
     (preview, start, true)
 }
 
-fn format_doc_id(id: u64) -> String {
+pub(crate) fn format_doc_id(id: u64) -> String {
     format!("{id:016x}")
 }
 
@@ -3832,7 +4583,7 @@ fn parse_doc_id(text: &str) -> Result<u64, String> {
         .map_err(|error| format!("invalid documentation id '{text}': {error}"))
 }
 
-fn tier_label(tier_level: u8) -> &'static str {
+pub(crate) fn tier_label(tier_level: u8) -> &'static str {
     match tier_level {
         3 => "primary",
         2 => "lecture",
@@ -3840,6 +4591,17 @@ fn tier_label(tier_level: u8) -> &'static str {
         _ => "qa",
     }
 }
+/// An explicit non-empty `starcraftPath` wins; otherwise the minimap resolves the
+/// StarCraft folder exactly like every other Map renderer, so an unset config
+/// falls back to the default install folder instead of reaching the native
+/// renderer as an empty path.
+fn minimap_starcraft_path(dirs: &DataDirs, args: &Value) -> Result<PathBuf, String> {
+    match args.get("starcraftPath").and_then(Value::as_str) {
+        Some(explicit) if !explicit.trim().is_empty() => Ok(PathBuf::from(explicit)),
+        _ => crate::map_context::resolve_starcraft_path(dirs),
+    }
+}
+
 fn render_scale_arg(args: &Value) -> Result<usize, String> {
     let scale = usize_arg_default(args, "scale", 4)?;
     if !matches!(scale, 1 | 2 | 4 | 8) {
@@ -3892,6 +4654,78 @@ fn render_map_tool(
     let image = isom::render_region(map, starcraft_path, request.to_string().as_bytes())
         .map_err(|error| format!("map render failed: {error}"))?;
     crate::map_agent::mcp_image(&image)
+}
+
+/// Exact MTXM tile ids of one bounded rectangle of `map` (the visible
+/// candidate or the request draft), returned as row-major rows so the model
+/// reads ids instead of probing them through `terrain.set` conflicts.
+fn terrain_read_tool(
+    map: &std::path::Path,
+    state: &crate::map_candidate::CandidateStateView,
+    args: &Value,
+) -> Result<Value, String> {
+    let required = |name: &str| -> Result<usize, String> {
+        if args.get(name).is_none() {
+            return Err(format!("argument '{name}' is required"));
+        }
+        usize_arg_default(args, name, 0)
+    };
+    let x = required("x")?;
+    let y = required("y")?;
+    let width = required("width")?;
+    let height = required("height")?;
+    let map_width = usize::from(state.baseline.width);
+    let map_height = usize::from(state.baseline.height);
+    if width == 0 || height == 0 {
+        return Err("map terrain read rectangle must have a nonzero width and height".to_string());
+    }
+    let count = width.saturating_mul(height);
+    if count > tools::MAP_TERRAIN_READ_MAX_TILES {
+        return Err(format!(
+            "map terrain read covers {count} tiles; read at most {} tiles per call; split the rectangle",
+            tools::MAP_TERRAIN_READ_MAX_TILES
+        ));
+    }
+    if x >= map_width || y >= map_height || width > map_width - x || height > map_height - y {
+        return Err(format!(
+            "map terrain read rectangle ({x},{y},{width},{height}) is outside candidate dimensions {map_width}x{map_height}"
+        ));
+    }
+    let chk = isom::chk_extract(map).map_err(|error| error.to_string())?;
+    let digest = crate::chk::digest_chk(&chk);
+    let stride = usize::from(digest.map.width);
+    if stride != map_width || usize::from(digest.map.height) != map_height {
+        return Err(format!(
+            "map dimensions {}x{} do not match the candidate baseline {map_width}x{map_height}",
+            digest.map.width, digest.map.height
+        ));
+    }
+    if digest.tiles.len() < map_width * map_height {
+        return Err(format!(
+            "MTXM holds {} of {} expected tiles; the map terrain is incomplete",
+            digest.tiles.len(),
+            map_width * map_height
+        ));
+    }
+    let rows = (y..y + height)
+        .map(|row| {
+            let start = row * stride + x;
+            Value::Array(
+                digest.tiles[start..start + width]
+                    .iter()
+                    .map(|tile| json!(tile))
+                    .collect(),
+            )
+        })
+        .collect::<Vec<_>>();
+    Ok(json!({
+        "x": x,
+        "y": y,
+        "width": width,
+        "height": height,
+        "count": count,
+        "rows": rows,
+    }))
 }
 
 pub(crate) struct MapObjectSnapshot {
@@ -4168,42 +5002,6 @@ fn select_managed_sound_replacement_path_from_inventory(
     Err("편집본용 관리형 MPQ sound path checksum prefix가 모두 사용 중입니다.".to_string())
 }
 
-fn numeric_json_value(value: &Value) -> Result<i64, String> {
-    value
-        .as_i64()
-        .or_else(|| value.as_str().and_then(|text| text.parse().ok()))
-        .ok_or_else(|| "DAT value must be an integer or numeric string".to_string())
-}
-
-fn native_trace_runtime(
-    services: &ToolServices,
-) -> Result<
-    (
-        PathBuf,
-        crate::native_build::EuddraftLaunch,
-        PathBuf,
-        crate::native_project::NativeSourceSnapshot,
-    ),
-    String,
-> {
-    let project = services.native.open()?;
-    let snapshot = project.source_snapshot()?;
-    let artifacts =
-        crate::native_build::generate_native_build(&project, &services.dirs.native_assets_dir())?;
-    let config = services
-        .dirs
-        .load_config()
-        .map_err(|error| format!("failed to load native trace settings: {error}"))?;
-    let euddraft_path = PathBuf::from(config.euddraft_path.trim());
-    let euddraft = crate::native_build::EuddraftLaunch::resolve(&euddraft_path)?;
-    Ok((
-        PathBuf::from(artifacts.eds_path),
-        euddraft,
-        PathBuf::from(config.starcraft_path.trim()),
-        snapshot,
-    ))
-}
-
 fn load_rag(dirs: &DataDirs) -> Rag {
     let index_path = dirs.rag_dir().join(crate::bootstrap::RAG_INDEX_FILENAME);
     let cache_dir = Some(dirs.models_dir());
@@ -4258,17 +5056,6 @@ fn dat_scalar_json(value: &DatScalar) -> Value {
     match value {
         DatScalar::Number(value) => Value::from(*value),
         DatScalar::Text(value) => Value::String(value.clone()),
-    }
-}
-
-/// Convert a validated DAT JSON scalar to its canonical text representation.
-fn value_to_text(value: &Value) -> String {
-    match value {
-        Value::String(text) => text.clone(),
-        Value::Number(number) => number.to_string(),
-        Value::Bool(flag) => flag.to_string(),
-        Value::Null => String::new(),
-        other => other.to_string(),
     }
 }
 
@@ -4366,13 +5153,106 @@ mod tests {
     fn open_runtime(request_id: &str) -> SessionToolRuntime {
         let runtime = SessionToolRuntime::for_tests();
         runtime.begin_request(request_id, "test-project").unwrap();
-        runtime.request_write_workspace("test mutation").unwrap();
+        runtime.register_write_request("test mutation").unwrap();
         runtime
     }
 
     #[test]
+    fn map_sound_tools_key_the_audio_store_by_the_project_workspace_id() {
+        // Given: a native project named like a real one ("rpg", not a digest)
+        // whose source map already carries a managed sound, and a request that
+        // begins with that display name, exactly as a session does.
+        let services = ToolServices::for_tests();
+        let root = services.dirs.app_data().join("rpg");
+        std::fs::create_dir_all(root.join("maps")).unwrap();
+        let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("crates")
+            .join("isom")
+            .join("tests")
+            .join("fixtures");
+        let plain = root.join("maps/plain.scx");
+        std::fs::copy(fixtures.join("map_agent_rich.scx"), &plain).unwrap();
+        let ogg = std::fs::read(fixtures.join("tone.ogg")).unwrap();
+        let ogg_sha256 = format!("{:x}", Sha256::digest(&ogg));
+        let mpq_path = format!("staredit\\wav\\ea_{}.ogg", &ogg_sha256[..16]);
+        isom::map_sound_add(
+            &plain,
+            &root.join("maps/source.scx"),
+            &crate::bootstrap::sha256_file(&plain).unwrap(),
+            &mpq_path,
+            &ogg,
+        )
+        .unwrap();
+        let project = crate::native_project::NativeProject::create(
+            &root,
+            crate::native_project::ProjectManifest {
+                schema_version: crate::native_project::PROJECT_SCHEMA_VERSION,
+                name: "rpg".to_string(),
+                source_map: "maps/source.scx".to_string(),
+                output_map: "build/output.scx".to_string(),
+                main_file: "src/main.eps".to_string(),
+                settings: Default::default(),
+                plugins: Vec::new(),
+                python_entrypoints: Vec::new(),
+                python_dependencies: Vec::new(),
+                python_lock: None,
+                editor_compatibility: None,
+            },
+        )
+        .unwrap();
+        services.native().activate_project(&project).unwrap();
+        let runtime = services.session("sound-session");
+        runtime.begin_request("sound-request", "rpg").unwrap();
+
+        // When: the model lists the map's sounds.
+        let listed = runtime.execute(tools::MAP_SOUND_LIST_TOOL, &json!({}));
+
+        // Then: the managed sound's project-source lookup succeeds instead of
+        // rejecting the display name as an audio store id.
+        let listed = listed.unwrap();
+        let sounds = listed["sounds"].as_array().unwrap();
+        assert!(sounds
+            .iter()
+            .any(|sound| sound["mpqPath"] == json!(mpq_path) && sound["managed"] == json!(true)));
+    }
+
+    #[test]
+    fn minimap_starcraft_path_never_hands_the_renderer_an_empty_path() {
+        // Given: a configured StarCraft folder and a model call that passes an
+        // empty `starcraftPath` (the config previously leaked through as "").
+        let services = ToolServices::for_tests();
+        let configured = services.dirs.app_data().join("StarCraft");
+        std::fs::create_dir_all(&configured).unwrap();
+        services
+            .dirs
+            .save_config(&crate::config::Config {
+                starcraft_path: configured.display().to_string(),
+                ..crate::config::Config::default()
+            })
+            .unwrap();
+
+        // Then: an empty or absent argument resolves the configured folder,
+        // and only a non-empty argument overrides it.
+        if std::env::var_os("STARCRAFT_PATH").is_none() {
+            for args in [json!({}), json!({ "starcraftPath": "" })] {
+                assert_eq!(
+                    minimap_starcraft_path(&services.dirs, &args).unwrap(),
+                    configured
+                );
+            }
+        }
+        let explicit = json!({ "starcraftPath": r"D:\Games\StarCraft" });
+        assert_eq!(
+            minimap_starcraft_path(&services.dirs, &explicit).unwrap(),
+            PathBuf::from(r"D:\Games\StarCraft")
+        );
+    }
+
+    #[test]
     fn prepared_native_source_baseline_admits_an_exact_file_edit() {
-        // Given: a real native project is mirrored into the session workspace used by writes.
+        // Given: a real native project whose canonical src/ is captured into the
+        // trusted turn baseline that write tools use for stale checks.
         let services = ToolServices::for_tests();
         let root = services.dirs.app_data().join("source-baseline-project");
         std::fs::create_dir_all(root.join("maps")).unwrap();
@@ -4404,24 +5284,23 @@ mod tests {
             .native()
             .write_source("src/nested/helper.eps", "// nested\n")
             .unwrap();
-        let workspace = crate::workspace::WorkspaceManager::new(services.dirs.clone())
+        let manager = crate::workspace::WorkspaceManager::new(services.dirs.clone());
+        let workspace = manager
             .prepare_session_current("source-baseline-session")
             .unwrap();
-        assert_eq!(
-            std::fs::read_to_string(workspace.root.join("source/main.eps")).unwrap(),
-            "// baseline\n"
-        );
-        assert!(!workspace.root.join("source/src/main.eps").exists());
+        let baseline = manager
+            .begin_turn(&workspace, "source-baseline-request")
+            .unwrap();
 
         let runtime = services.session("source-baseline-session");
         runtime
             .begin_request("source-baseline-request", "source-baseline-project")
             .unwrap();
         runtime
-            .request_write_workspace("edit the existing source")
+            .register_write_request("edit the existing source")
             .unwrap();
         runtime
-            .bind_workspace_root("source-baseline-request", workspace.root.clone())
+            .bind_source_baseline("source-baseline-request", baseline.baseline_root.clone())
             .unwrap();
         runtime
             .execute("search_docs", &json!({"query": "epScript comment"}))
@@ -4456,20 +5335,204 @@ mod tests {
             }
         );
         assert_eq!(
-            crate::workspace::read_source_baseline(&workspace.root, "src/missing.eps").unwrap(),
+            crate::workspace::read_source_baseline(&baseline.baseline_root, "src/missing.eps")
+                .unwrap(),
             None
         );
         assert_eq!(
-            crate::workspace::read_source_baseline(&workspace.root, "src/nested/helper.eps")
+            crate::workspace::read_source_baseline(
+                &baseline.baseline_root,
+                "src/nested/helper.eps"
+            )
+            .unwrap()
+            .as_deref(),
+            Some("// nested\n")
+        );
+        assert_eq!(
+            crate::workspace::read_source_baseline(&baseline.baseline_root, "nested/helper.eps")
                 .unwrap()
                 .as_deref(),
             Some("// nested\n")
         );
+        manager.finish_turn(&baseline).unwrap();
+    }
+
+    #[test]
+    fn build_run_observation_replaces_raw_streams_with_a_bounded_excerpt() {
+        let giant = format!(
+            "Null tiles at: {} - Allocating objects..",
+            (0..65_056)
+                .map(|i| format!("({}, {})", i % 256, i / 256))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        let result = crate::native_build::NativeBuildResult {
+            ok: true,
+            errors: Vec::new(),
+            warnings: Vec::new(),
+            raw_status: 0,
+            stdout: format!("Loading map\n{giant}\nOutput scenario.chk : 1.794MB\n"),
+            stderr: String::new(),
+            log_path: "E:/anywhere/build/euddraft/build.log".to_string(),
+            artifacts: crate::native_build::NativeBuildArtifacts {
+                build_dir: "build".to_string(),
+                wireframe_editor: None,
+                requirement_file: None,
+                eds_path: "build/main.eds".to_string(),
+                output_map: "build/output.scx".to_string(),
+                data_editor: None,
+                extra_data_editor: None,
+                custom_tbl: None,
+                python_path_bootstrap: None,
+            },
+        };
+        let value = build_run_observation(result).unwrap();
+        assert!(value.get("stdout").is_none());
+        assert!(value.get("stderr").is_none());
+        assert_eq!(value["logPath"], "build/euddraft/build.log");
+        assert_eq!(value["ok"], true);
+        assert_eq!(value["warnings"], json!([]));
+        let excerpt = value["outputExcerpt"].as_str().unwrap();
+        assert!(excerpt.contains("Loading map"));
+        assert!(excerpt.contains("Output scenario.chk : 1.794MB"));
+        assert!(excerpt.contains("[… line cut,"));
+        assert_eq!(value["omittedErrors"], 0);
+        assert_eq!(value["omittedWarnings"], 0);
+        // The whole observation stays far below the 64 KiB native tool-result ceiling.
+        assert!(double_escaped_len(&value) < 16 * 1024);
+    }
+
+    #[test]
+    fn build_run_observation_keeps_diagnostics_within_the_double_escaped_ceiling() {
+        let diagnostic = |index: usize| crate::native_build::NativeBuildError {
+            source: "euddraft".to_string(),
+            file: format!(
+                "D:\\a\\euddraft\\euddraft\\.venv\\Lib\\site-packages\\eudplib\\module{index}.py"
+            ),
+            line: index as u64,
+            message: format!("EPWarning: \"quoted\" warning {index} with C:\\paths\\inside"),
+            raw: format!("  File \"D:\\a\\euddraft\\frame{index}.py\", line 1, in f\n").repeat(60),
+            count: 1,
+        };
+        let result = crate::native_build::NativeBuildResult {
+            ok: false,
+            errors: (0..30).map(diagnostic).collect(),
+            warnings: (0..60).map(diagnostic).collect(),
+            raw_status: 1,
+            stdout: "x".repeat(100_000),
+            stderr: "y\\z\"".repeat(20_000),
+            log_path: String::new(),
+            artifacts: crate::native_build::NativeBuildArtifacts {
+                build_dir: "build".to_string(),
+                wireframe_editor: None,
+                requirement_file: None,
+                eds_path: "build/main.eds".to_string(),
+                output_map: "build/output.scx".to_string(),
+                data_editor: None,
+                extra_data_editor: None,
+                custom_tbl: None,
+                python_path_bootstrap: None,
+            },
+        };
+        let value = build_run_observation(result).unwrap();
+        assert!(double_escaped_len(&value) <= BUILD_RUN_OBSERVATION_BYTES);
+        assert!(double_escaped_len(&value) < 64 * 1024);
+        let kept_errors = value["errors"].as_array().unwrap().len();
+        let kept_warnings = value["warnings"].as_array().unwrap().len();
+        assert!(kept_errors > 0);
+        assert_eq!(value["omittedErrors"], 30 - kept_errors);
+        assert_eq!(value["omittedWarnings"], 60 - kept_warnings);
         assert_eq!(
-            crate::workspace::read_source_baseline(&workspace.root, "nested/helper.eps")
-                .unwrap()
-                .as_deref(),
-            Some("// nested\n")
+            kept_errors + value["omittedErrors"].as_u64().unwrap() as usize,
+            30
+        );
+        // Warnings travel without their stacks; errors keep theirs.
+        assert!(value["errors"][0].get("raw").is_some());
+        assert!(value["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|warning| warning.get("raw").is_none()));
+        assert_eq!(value["logPath"], Value::Null);
+    }
+
+    #[test]
+    fn build_log_page_reads_ranges_and_queries_with_continuation() {
+        let content = (1..=1_000)
+            .map(|i| {
+                if i == 500 {
+                    format!("Null tiles at: {}", "(0, 0), ".repeat(2_000))
+                } else if i % 100 == 0 {
+                    format!("line {i} EPWarning: something")
+                } else {
+                    format!("line {i}")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let first = build_log_page(&content, &json!({})).unwrap();
+        assert_eq!(first["totalLines"], 1_000);
+        assert_eq!(first["startLine"], 1);
+        assert_eq!(first["endLine"], 200);
+        assert_eq!(first["count"], 200);
+        assert_eq!(first["hasMore"], true);
+        assert_eq!(first["nextLine"], 201);
+        assert_eq!(first["lines"][0], json!({"line": 1, "text": "line 1"}));
+
+        let middle = build_log_page(&content, &json!({"startLine": 499, "endLine": 501})).unwrap();
+        assert_eq!(middle["count"], 3);
+        let cut = middle["lines"][1]["text"].as_str().unwrap();
+        assert!(cut.starts_with("Null tiles at: (0, 0), "));
+        assert!(cut.ends_with("more chars]"));
+        assert!(cut.chars().count() < BUILD_LOG_LINE_CHARS + 64);
+
+        let capped = build_log_page(&content, &json!({"startLine": 1, "endLine": 1_000})).unwrap();
+        assert_eq!(capped["endLine"], 400);
+        assert_eq!(capped["nextLine"], 401);
+
+        let tail = build_log_page(&content, &json!({"startLine": 990})).unwrap();
+        assert_eq!(tail["endLine"], 1_000);
+        assert_eq!(tail["hasMore"], false);
+        assert_eq!(tail["nextLine"], Value::Null);
+
+        let matches = build_log_page(&content, &json!({"query": "epwarning"})).unwrap();
+        // Line 500 is the giant tile line, so nine of the ten hundreds match.
+        assert_eq!(matches["count"], 9);
+        assert_eq!(matches["hasMore"], false);
+        assert_eq!(matches["lines"][0]["line"], 100);
+        assert_eq!(matches["lines"][8]["line"], 1_000);
+        let resumed =
+            build_log_page(&content, &json!({"query": "EPWarning", "startLine": 301})).unwrap();
+        assert_eq!(resumed["count"], 6);
+        assert_eq!(resumed["lines"][0]["line"], 400);
+
+        assert!(build_log_page(&content, &json!({"startLine": 0})).is_err());
+        assert!(build_log_page(&content, &json!({"startLine": 1_001})).is_err());
+        assert!(build_log_page(&content, &json!({"query": "  "})).is_err());
+        let empty = build_log_page("", &json!({})).unwrap();
+        assert_eq!(empty["totalLines"], 0);
+        assert_eq!(empty["count"], 0);
+
+        // Backslash- and quote-heavy frames stop at the double-escaped byte budget, not at
+        // 400 lines, and the page says where to continue.
+        let frames = (0..1_000)
+            .map(|i| format!("  File \"D:\\a\\euddraft\\euddraft\\.venv\\Lib\\site-packages\\eudplib\\core\\mapdata\\fixmapdata{i}.py\", line {i}, in _fix_mtxm_0_0_null"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let page = build_log_page(&frames, &json!({"endLine": 1_000})).unwrap();
+        assert!(double_escaped_len(&page) <= BUILD_LOG_PAGE_BYTES);
+        let count = page["count"].as_u64().unwrap();
+        assert!(count < 400, "{count}");
+        assert_eq!(page["hasMore"], true);
+        assert_eq!(page["nextLine"], count + 1);
+        let query_page =
+            build_log_page(&frames, &json!({"query": "fixmapdata", "endLine": 1_000})).unwrap();
+        assert!(double_escaped_len(&query_page) <= BUILD_LOG_PAGE_BYTES);
+        assert_eq!(query_page["hasMore"], true);
+        assert_eq!(
+            query_page["nextLine"],
+            query_page["count"].as_u64().unwrap() + 1
         );
     }
 
@@ -4483,51 +5546,62 @@ mod tests {
         assert!(error.contains("no agent request is open"), "got: {error}");
     }
 
-    #[test]
-    fn trace_runtime_tools_require_current_successful_build_before_launch() {
-        let runtime = open_runtime("req-trace-prerequisite");
-        let args = json!({
-            "name": "smoke",
-            "code": "function eudAgentTestSetup() { eudAgentPass(1); }\nfunction eudAgentTestStep(tick) {}"
-        });
-        let error = runtime
-            .execute(tools::TRACE_TEST_RUN_TOOL, &args)
-            .expect_err("trace test without build evidence must fail before bridge access");
-        assert!(error.contains("requires build_run"), "got: {error}");
-        let error = runtime
-            .execute(tools::TRACE_SUITE_RUN_TOOL, &json!({}))
-            .expect_err("trace suite without build evidence must fail before bridge access");
-        assert!(error.contains("requires build_run"), "got: {error}");
-
-        *runtime.last_build.lock() = Some(crate::harness::BuildEvidence {
-            ok: false,
-            error_count: 1,
-        });
-        let error = runtime
-            .execute(tools::TRACE_TEST_RUN_TOOL, &args)
-            .expect_err("failed build evidence must reject trace launch");
-        assert!(
-            error.contains("latest build_run to succeed"),
-            "got: {error}"
-        );
-        let error = runtime
-            .execute(tools::TRACE_SUITE_RUN_TOOL, &json!({}))
-            .expect_err("failed build evidence must reject trace suite launch");
-        assert!(
-            error.contains("latest build_run to succeed"),
-            "got: {error}"
-        );
-    }
-
     #[tokio::test]
     async fn ask_waits_for_all_answers_and_resumes_the_same_tool_call() {
         let runtime = SessionToolRuntime::for_tests();
+        let sessions = crate::session::SessionStore::new(&runtime.data_dirs());
+        let now = crate::session::now_unix_millis();
+        let mut autonomous = crate::autonomous::AutonomousRunState::new(
+            "사용자 선택이 필요한 작업".to_string(),
+            "turn-ask".to_string(),
+            "req-ask".to_string(),
+            "project".to_string(),
+            "revision".to_string(),
+            Default::default(),
+            now,
+        );
+        let binding = crate::provider::ProviderBinding::new(
+            crate::provider::ProviderId::Codex,
+            "gpt-test".to_string(),
+            None,
+        )
+        .unwrap();
+        autonomous.last_checkpoint = Some(binding.conversation.clone());
+        sessions
+            .save(&crate::session::SessionRecord {
+                meta: crate::session::SessionMeta {
+                    id: runtime.session_id().to_string(),
+                    name: "ask lifecycle".to_string(),
+                    project: "project".to_string(),
+                    kind: crate::session::SessionKind::Eps,
+                    provider: binding.provider,
+                    model: binding.model.clone(),
+                    created_at: now / 1_000,
+                    last_conversation_at: now,
+                    team_parent: None,
+                },
+                provider_binding: binding,
+                pending_request_ids: Vec::new(),
+                context_usage: None,
+                panel_log: Value::Null,
+                context_state: Default::default(),
+                task_state: Default::default(),
+                autonomous_run: Some(autonomous),
+                team_tasks: Vec::new(),
+            })
+            .unwrap();
         runtime.begin_request("req-ask", "project").unwrap();
         let (events, mut emitted) = tokio::sync::mpsc::unbounded_channel();
         runtime.set_ask_emitter(move |event| {
             events
                 .send(event)
                 .map_err(|_| "ask event receiver closed".to_string())
+        });
+        let (autonomous_events, mut emitted_autonomous) = tokio::sync::mpsc::unbounded_channel();
+        runtime.set_autonomous_emitter(move |event| {
+            autonomous_events
+                .send(event)
+                .map_err(|_| "autonomous event receiver closed".to_string())
         });
 
         let asking = runtime.clone();
@@ -4561,7 +5635,24 @@ mod tests {
         let event = emitted.recv().await.expect("ask event must be emitted");
         assert_eq!(event.questions.len(), 2);
         assert_eq!(event.questions[0].id, "mode");
-        assert_eq!(runtime.pending_ask(), Some(event.clone()));
+        let restored = runtime.pending_ask().expect("ask is pending");
+        assert_eq!(restored.request_id, event.request_id);
+        assert_eq!(restored.questions, event.questions);
+        assert_eq!(restored.status, crate::ipc::AskEventStatus::Pending);
+        assert!(restored.wait_seconds.unwrap() <= event.wait_seconds.unwrap());
+        assert_eq!(
+            sessions
+                .load(runtime.session_id())
+                .unwrap()
+                .autonomous_run
+                .unwrap()
+                .status,
+            crate::autonomous::AutonomousRunStatus::WaitingInput
+        );
+        assert_eq!(
+            emitted_autonomous.recv().await.unwrap().status,
+            crate::autonomous::AutonomousRunStatus::WaitingInput
+        );
 
         let incomplete = runtime
             .answer_ask(
@@ -4603,6 +5694,19 @@ mod tests {
             json!(["로그", "직접 입력"])
         );
         assert!(runtime.pending_ask().is_none());
+        assert_eq!(
+            sessions
+                .load(runtime.session_id())
+                .unwrap()
+                .autonomous_run
+                .unwrap()
+                .status,
+            crate::autonomous::AutonomousRunStatus::Running
+        );
+        assert_eq!(
+            emitted_autonomous.recv().await.unwrap().status,
+            crate::autonomous::AutonomousRunStatus::Running
+        );
     }
 
     #[tokio::test]
@@ -4644,12 +5748,575 @@ mod tests {
         assert_eq!(second.await.unwrap().unwrap_err(), "ask request cancelled");
     }
 
+    fn ask_args() -> Value {
+        json!({
+            "questions": [{
+                "id": "mode",
+                "question": "방식을 고르세요.",
+                "options": [{"label": "A"}, {"label": "B"}]
+            }]
+        })
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unanswered_ask_expires_into_a_text_handoff() {
+        // Native CLIs abort a silent MCP call after 300s, so the wait is bounded
+        // and the model continues by restating the question as plain text.
+        let runtime = SessionToolRuntime::for_tests();
+        runtime.set_ask_wait_timeout(Duration::from_millis(50));
+        runtime.begin_request("req-ask-expire", "project").unwrap();
+        let (events, mut emitted) = tokio::sync::mpsc::unbounded_channel();
+        runtime.set_ask_emitter(move |event| {
+            events
+                .send(event)
+                .map_err(|_| "ask event receiver closed".to_string())
+        });
+        let identity = crate::provider_runtime::RunIdentity {
+            session_id: runtime.session_id().to_string(),
+            run_id: crate::provider_runtime::RunId::new(1),
+            request_id: "req-ask-expire".to_string(),
+            session_kind: crate::session::SessionKind::Eps,
+            cancellation_generation: 0,
+        };
+        let (_cancel, receiver) = tokio::sync::watch::channel(0_u64);
+        runtime.set_cancellation(receiver);
+        let mut waiting = runtime.subscribe_ask_waiting();
+
+        let outcome = runtime.ask_for_run(&identity, &ask_args()).await.unwrap();
+        assert_eq!(outcome["status"], "unanswered");
+        assert_eq!(outcome["questionIds"], json!(["mode"]));
+        assert_eq!(outcome["waitedSeconds"], json!(0));
+        let pending = emitted.recv().await.unwrap();
+        assert_eq!(pending.status, crate::ipc::AskEventStatus::Pending);
+        assert_eq!(pending.wait_seconds, Some(0));
+        assert!(pending.questions[0].id == "mode");
+        let expired = emitted.recv().await.unwrap();
+        assert_eq!(expired.request_id, pending.request_id);
+        assert_eq!(expired.status, crate::ipc::AskEventStatus::Expired);
+        assert_eq!(expired.questions, pending.questions);
+        assert!(runtime.pending_ask().is_none());
+        assert!(!*waiting.borrow_and_update());
+        assert!(runtime.ask_expired_for_request("req-ask-expire"));
+
+        let late = runtime
+            .answer_ask(&pending.request_id, BTreeMap::new())
+            .expect_err("an expired ask cannot be answered");
+        assert!(late.starts_with("ask_expired"), "{late}");
+
+        let again = runtime
+            .ask_for_run(&identity, &ask_args())
+            .await
+            .expect_err("the same run cannot ask again after an expiry");
+        assert!(again.contains("unanswered"), "{again}");
+
+        runtime.begin_iteration("req-ask-expire").unwrap();
+        assert!(!runtime.ask_expired_for_request("req-ask-expire"));
+    }
+
+    fn run_identity(
+        runtime: &SessionToolRuntime,
+        run: u64,
+    ) -> crate::provider_runtime::RunIdentity {
+        crate::provider_runtime::RunIdentity {
+            session_id: runtime.session_id().to_string(),
+            run_id: crate::provider_runtime::RunId::new(run),
+            request_id: "req-team".to_string(),
+            session_kind: crate::session::SessionKind::Eps,
+            cancellation_generation: 0,
+        }
+    }
+
+    fn scoped_runtime() -> SessionToolRuntime {
+        let runtime = SessionToolRuntime::for_tests();
+        runtime.begin_request("req-team", "project").unwrap();
+        let (cancel, receiver) = tokio::sync::watch::channel(0_u64);
+        runtime.set_cancellation(receiver);
+        std::mem::forget(cancel);
+        runtime
+    }
+
+    fn save_eps_session(runtime: &SessionToolRuntime, tasks: Vec<crate::team::TeamTask>) {
+        let sessions = crate::session::SessionStore::new(&runtime.data_dirs());
+        let now = crate::session::now_unix_millis();
+        let binding = crate::provider::ProviderBinding::new(
+            crate::provider::ProviderId::Codex,
+            "gpt-test".to_string(),
+            None,
+        )
+        .unwrap();
+        sessions
+            .save(&crate::session::SessionRecord {
+                meta: crate::session::SessionMeta {
+                    id: runtime.session_id().to_string(),
+                    name: "team".to_string(),
+                    project: "project".to_string(),
+                    kind: crate::session::SessionKind::Eps,
+                    provider: binding.provider,
+                    model: binding.model.clone(),
+                    created_at: now / 1_000,
+                    last_conversation_at: now,
+                    team_parent: None,
+                },
+                provider_binding: binding,
+                pending_request_ids: Vec::new(),
+                context_usage: None,
+                panel_log: Value::Null,
+                context_state: Default::default(),
+                task_state: Default::default(),
+                autonomous_run: None,
+                team_tasks: tasks,
+            })
+            .unwrap();
+    }
+
+    fn team_task(id: &str, status: crate::team::TeamTaskStatus) -> crate::team::TeamTask {
+        crate::team::TeamTask {
+            id: id.to_string(),
+            parent_request_id: "req-team".to_string(),
+            map_session_id: "map-team".to_string(),
+            map_request_id: None,
+            goal: "goal".to_string(),
+            layers: vec![crate::map_model::MapLayer::Terrain],
+            selection_ids: Vec::new(),
+            location_ids: Vec::new(),
+            source_map_sha256_at_create: "a".repeat(64),
+            status,
+            candidate: None,
+            applied_source_sha256: None,
+            applied_by: None,
+            created_at: 1,
+            updated_at: 1,
+        }
+    }
+
+    fn mark_map_inspected(runtime: &SessionToolRuntime) {
+        runtime
+            .request_state
+            .lock()
+            .as_mut()
+            .unwrap()
+            .record_map_inspection();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn map_task_request_needs_map_evidence_and_hands_off_once() {
+        let runtime = scoped_runtime();
+        save_eps_session(&runtime, Vec::new());
+        let requests: Arc<Mutex<Vec<TeamTaskRequest>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&requests);
+        runtime.set_team_executor(move |request| {
+            recorded.lock().push(request.clone());
+            Box::pin(async move {
+                let mut task = team_task("task-1", crate::team::TeamTaskStatus::CandidateReady);
+                task.goal = request.goal;
+                task.layers = request.layers;
+                task.candidate = Some(crate::team::TeamCandidateSummary {
+                    revision: 1,
+                    revision_key: "r1:abc".to_string(),
+                    map_sha256: "b".repeat(64),
+                    summary: "지형 40칸".to_string(),
+                    terrain_cells: 40,
+                    units: 0,
+                    buildings: 0,
+                    doodads: 0,
+                    sprites: 0,
+                    locations: 0,
+                });
+                Ok(task)
+            })
+        });
+        let parent = run_identity(&runtime, 1);
+        let args = json!({
+            "goal": " 전부 공허로 ",
+            "layers": ["units", "terrain", "terrain"],
+            "selectionIds": ["sel-a", ""],
+            "locationIds": [5, 3, 5],
+            "revisesTaskId": " task-0 ",
+            "target": [{"x": 4, "y": 6, "width": 10, "height": 8}]
+        });
+
+        let gated = runtime
+            .map_task_request_for_run(&parent, &args)
+            .await
+            .unwrap_err();
+        assert!(gated.starts_with("evidence gate"), "{gated}");
+        assert!(requests.lock().is_empty());
+
+        mark_map_inspected(&runtime);
+        let value = runtime
+            .map_task_request_for_run(&parent, &args)
+            .await
+            .unwrap();
+        assert_eq!(value["status"], "candidate_ready");
+        assert_eq!(value["taskId"], "task-1");
+        assert_eq!(value["candidate"]["revision"], 1);
+        assert_eq!(value["applied"], false);
+        let request = requests.lock()[0].clone();
+        assert_eq!(request.goal, "전부 공허로");
+        assert_eq!(
+            request.layers,
+            vec![
+                crate::map_model::MapLayer::Terrain,
+                crate::map_model::MapLayer::Units
+            ]
+        );
+        assert_eq!(request.selection_ids, vec!["sel-a".to_string()]);
+        assert_eq!(request.location_ids, vec![3, 5]);
+        assert_eq!(request.revises_task_id.as_deref(), Some("task-0"));
+        let rect = |x, y, width, height| crate::team::TeamTileRect {
+            x,
+            y,
+            width,
+            height,
+        };
+        assert_eq!(request.target, vec![rect(4, 6, 10, 8)]);
+        assert!(request.protect.is_empty());
+        assert_eq!(request.identity, parent);
+
+        // A protect cut could not hold inside a united target selection.
+        let mut combined = args.clone();
+        combined["protect"] = json!([{"x": 5, "y": 7, "width": 2, "height": 2}]);
+        let refused = runtime
+            .map_task_request_for_run(&parent, &combined)
+            .await
+            .unwrap_err();
+        assert!(
+            refused.contains("protect cannot be combined with selectionIds"),
+            "{refused}"
+        );
+        let mut protected = combined.clone();
+        protected.as_object_mut().unwrap().remove("selectionIds");
+        runtime
+            .map_task_request_for_run(&parent, &protected)
+            .await
+            .unwrap();
+        assert_eq!(
+            requests.lock().last().unwrap().protect,
+            vec![rect(5, 7, 2, 2)]
+        );
+
+        let malformed = runtime
+            .map_task_request_for_run(&parent, &json!({ "goal": "x", "layers": [] }))
+            .await
+            .unwrap_err();
+        assert!(malformed.contains("at least one layer"), "{malformed}");
+        let unknown = runtime
+            .map_task_request_for_run(
+                &parent,
+                &json!({ "goal": "x", "layers": ["terrain"], "region": 1 }),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            unknown.contains("invalid map_task_request arguments"),
+            "{unknown}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn active_team_task_excludes_a_second_task_and_the_eps_map_writers() {
+        let runtime = scoped_runtime();
+        save_eps_session(
+            &runtime,
+            vec![team_task("task-live", crate::team::TeamTaskStatus::Running)],
+        );
+        runtime.set_team_executor(|_| Box::pin(async { panic!("never dispatched") }));
+        mark_map_inspected(&runtime);
+        let parent = run_identity(&runtime, 1);
+        let refused = runtime
+            .map_task_request_for_run(&parent, &json!({ "goal": "x", "layers": ["terrain"] }))
+            .await
+            .unwrap_err();
+        assert!(refused.starts_with("map_task_in_progress"), "{refused}");
+        assert!(refused.contains("task-live"));
+
+        for tool in tools::TEAM_EXCLUDED_MAP_TOOLS {
+            let error = runtime
+                .execute_for_run(&parent, tool, &json!({}))
+                .unwrap_err();
+            assert!(
+                error.starts_with("map_task_in_progress"),
+                "{tool} must be refused while a team task is active: {error}"
+            );
+        }
+        // Reads and unrelated tools are not excluded (no project is open in
+        // this fixture, so the read fails later for its own reason).
+        let unrelated = runtime
+            .execute_for_run(&parent, "list_files", &json!({}))
+            .unwrap_err();
+        assert!(
+            !unrelated.starts_with("map_task_in_progress"),
+            "{unrelated}"
+        );
+
+        let status = runtime
+            .execute_for_run(
+                &parent,
+                tools::MAP_TASK_STATUS_TOOL,
+                &json!({ "taskId": "task-live" }),
+            )
+            .unwrap();
+        assert_eq!(status["status"], "running");
+        let missing = runtime
+            .execute_for_run(
+                &parent,
+                tools::MAP_TASK_STATUS_TOOL,
+                &json!({ "taskId": "nope" }),
+            )
+            .unwrap_err();
+        assert!(missing.contains("does not exist"), "{missing}");
+
+        // A ready candidate still excludes the EPS map writers.
+        save_eps_session(
+            &runtime,
+            vec![team_task(
+                "task-live",
+                crate::team::TeamTaskStatus::CandidateReady,
+            )],
+        );
+        let error = runtime
+            .execute_for_run(&parent, "location_write", &json!({}))
+            .unwrap_err();
+        assert!(error.starts_with("map_task_in_progress"), "{error}");
+        assert!(error.contains("map_task_apply"), "{error}");
+
+        // A settled task lifts the exclusion.
+        save_eps_session(
+            &runtime,
+            vec![team_task("task-live", crate::team::TeamTaskStatus::Applied)],
+        );
+        assert!(runtime.active_team_task().is_none());
+    }
+
+    fn ready_summary() -> crate::team::TeamCandidateSummary {
+        crate::team::TeamCandidateSummary {
+            revision: 1,
+            revision_key: "r1:abc".to_string(),
+            map_sha256: "b".repeat(64),
+            summary: "지형 40칸".to_string(),
+            terrain_cells: 40,
+            units: 0,
+            buildings: 0,
+            doodads: 0,
+            sprites: 0,
+            locations: 0,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_ready_candidate_admits_a_follow_up_request_but_a_running_task_does_not() {
+        let runtime = scoped_runtime();
+        let mut ready = team_task("task-ready", crate::team::TeamTaskStatus::CandidateReady);
+        ready.candidate = Some(ready_summary());
+        save_eps_session(&runtime, vec![ready]);
+        runtime.set_team_executor(|_| {
+            Box::pin(async {
+                Ok(team_task(
+                    "task-2",
+                    crate::team::TeamTaskStatus::CandidateReady,
+                ))
+            })
+        });
+        mark_map_inspected(&runtime);
+        let parent = run_identity(&runtime, 1);
+        let args = json!({ "goal": "왼쪽 벽을 더 두껍게", "layers": ["terrain"] });
+        let follow_up = runtime
+            .map_task_request_for_run(&parent, &args)
+            .await
+            .unwrap();
+        assert_eq!(follow_up["taskId"], "task-2");
+
+        save_eps_session(
+            &runtime,
+            vec![team_task("task-run", crate::team::TeamTaskStatus::Running)],
+        );
+        let refused = runtime
+            .map_task_request_for_run(&parent, &args)
+            .await
+            .unwrap_err();
+        assert!(refused.starts_with("map_task_in_progress"), "{refused}");
+        assert!(refused.contains("task-run"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn map_task_apply_needs_candidate_inspection_and_runs_the_action_executor() {
+        let runtime = scoped_runtime();
+        let mut ready = team_task("task-ready", crate::team::TeamTaskStatus::CandidateReady);
+        ready.candidate = Some(ready_summary());
+        save_eps_session(
+            &runtime,
+            vec![
+                ready.clone(),
+                team_task("task-done", crate::team::TeamTaskStatus::Applied),
+            ],
+        );
+        let actions: Arc<Mutex<Vec<TeamTaskAction>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&actions);
+        runtime.set_team_action_executor(move |action| {
+            recorded.lock().push(action.clone());
+            let mut task = ready.clone();
+            match action.kind {
+                TeamTaskActionKind::Apply => {
+                    task.status = crate::team::TeamTaskStatus::Applied;
+                    task.applied_by = Some(crate::team::TeamApplyActor::Agent);
+                }
+                TeamTaskActionKind::Discard => {
+                    task.status = crate::team::TeamTaskStatus::Discarded;
+                }
+            }
+            Ok(task)
+        });
+        let parent = run_identity(&runtime, 1);
+        runtime.register_write_request("team apply").unwrap();
+
+        let settled = runtime
+            .execute_for_run(
+                &parent,
+                tools::MAP_TASK_APPLY_TOOL,
+                &json!({ "taskId": "task-done" }),
+            )
+            .unwrap_err();
+        assert!(settled.contains("not candidate_ready"), "{settled}");
+        let uninspected = runtime
+            .execute_for_run(
+                &parent,
+                tools::MAP_TASK_APPLY_TOOL,
+                &json!({ "taskId": "task-ready" }),
+            )
+            .unwrap_err();
+        assert!(uninspected.starts_with("evidence gate"), "{uninspected}");
+        assert!(actions.lock().is_empty());
+
+        // The candidate reads need the team session's candidate state, which
+        // this fixture does not have: they fail with a correctable error and
+        // never count as inspection.
+        let unreadable = runtime
+            .execute_for_run(
+                &parent,
+                tools::MAP_TASK_DIFF_TOOL,
+                &json!({ "taskId": "task-ready" }),
+            )
+            .unwrap_err();
+        assert!(
+            unreadable.contains("team Map session could not be loaded"),
+            "{unreadable}"
+        );
+        assert!(!runtime
+            .request_state_snapshot()
+            .unwrap()
+            .candidate_inspected("task-ready"));
+
+        runtime
+            .request_state
+            .lock()
+            .as_mut()
+            .unwrap()
+            .record_candidate_inspection("task-ready");
+        let applied = runtime
+            .execute_for_run(
+                &parent,
+                tools::MAP_TASK_APPLY_TOOL,
+                &json!({ "taskId": "task-ready" }),
+            )
+            .unwrap();
+        assert_eq!(applied["status"], "applied");
+        assert_eq!(applied["appliedBy"], "agent");
+        let action = actions.lock()[0].clone();
+        assert_eq!(action.kind, TeamTaskActionKind::Apply);
+        assert_eq!(action.task_id, "task-ready");
+        assert_eq!(action.session_id, runtime.session_id());
+        assert_eq!(action.request_id, "req-team");
+
+        // Discard needs no inspection.
+        let discarded = runtime
+            .execute_for_run(
+                &parent,
+                tools::MAP_TASK_DISCARD_TOOL,
+                &json!({ "taskId": "task-ready" }),
+            )
+            .unwrap();
+        assert_eq!(discarded["status"], "discarded");
+        assert_eq!(actions.lock()[1].kind, TeamTaskActionKind::Discard);
+
+        // Without an injected executor the action is a correctable error.
+        let bare = SessionToolRuntime::for_tests();
+        bare.begin_request("req-team", "project").unwrap();
+        let (_cancel, receiver) = tokio::sync::watch::channel(0_u64);
+        bare.set_cancellation(receiver);
+        let mut ready = team_task("task-ready", crate::team::TeamTaskStatus::CandidateReady);
+        ready.candidate = Some(ready_summary());
+        save_eps_session(&bare, vec![ready]);
+        let unavailable = bare
+            .execute_for_run(
+                &run_identity(&bare, 1),
+                tools::MAP_TASK_DISCARD_TOOL,
+                &json!({ "taskId": "task-ready" }),
+            )
+            .unwrap_err();
+        assert!(unavailable.contains("unavailable"), "{unavailable}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restored_pending_ask_reports_the_remaining_wait() {
+        let runtime = SessionToolRuntime::for_tests();
+        runtime.set_ask_wait_timeout(Duration::from_secs(30));
+        runtime.begin_request("req-ask-restore", "project").unwrap();
+        runtime.set_ask_emitter(|_| Ok(()));
+        let asking = runtime.clone();
+        let task = tokio::spawn(async move { asking.ask(&ask_args()).await });
+        tokio::time::sleep(Duration::from_millis(1_100)).await;
+        let restored = runtime.pending_ask().expect("ask is still pending");
+        let remaining = restored.wait_seconds.unwrap();
+        assert!(
+            (25..=29).contains(&remaining),
+            "restored wait must be the remainder, got {remaining}"
+        );
+        runtime.clear_expired_ask();
+        runtime.cancel_pending_ask();
+        assert_eq!(task.await.unwrap().unwrap_err(), "ask request cancelled");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ask_answered_before_expiry_keeps_the_answer_and_emits_no_expiry() {
+        let runtime = SessionToolRuntime::for_tests();
+        runtime.set_ask_wait_timeout(Duration::from_millis(80));
+        runtime.begin_request("req-ask-race", "project").unwrap();
+        let (events, mut emitted) = tokio::sync::mpsc::unbounded_channel();
+        runtime.set_ask_emitter(move |event| {
+            events
+                .send(event)
+                .map_err(|_| "ask event receiver closed".to_string())
+        });
+        let asking = runtime.clone();
+        let task = tokio::spawn(async move { asking.ask(&ask_args()).await });
+        let event = emitted.recv().await.unwrap();
+        runtime
+            .answer_ask(
+                &event.request_id,
+                BTreeMap::from([(
+                    "mode".to_string(),
+                    crate::ipc::AskAnswer {
+                        answers: vec!["B".to_string()],
+                    },
+                )]),
+            )
+            .unwrap();
+        let outcome = task.await.unwrap().unwrap();
+        assert_eq!(outcome["answers"]["mode"]["answers"], json!(["B"]));
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            emitted.try_recv().is_err(),
+            "an answered ask must not also expire"
+        );
+        assert!(!runtime.ask_expired_for_request("req-ask-race"));
+    }
+
     #[test]
     fn failed_read_write_intent_cannot_become_a_ghost_owner() {
         let services = ToolServices::for_tests();
         let runtime = services.session("only-session");
         runtime.begin_request("request-old", "project").unwrap();
-        let old = runtime.request_write_workspace("write after read").unwrap();
+        let old = runtime.register_write_request("write after read").unwrap();
         assert_eq!(old.state(), crate::write_coordinator::TicketState::Granted);
 
         let error = runtime
@@ -4660,7 +6327,7 @@ mod tests {
         runtime.abort_unmutated_write_intent().unwrap();
         runtime.clear_current();
         runtime.begin_request("request-new", "project").unwrap();
-        let next = runtime.request_write_workspace("retry write").unwrap();
+        let next = runtime.register_write_request("retry write").unwrap();
         assert_eq!(
             next.state(),
             crate::write_coordinator::TicketState::Granted,
@@ -4669,13 +6336,13 @@ mod tests {
     }
 
     #[test]
-    fn every_mutating_tool_requires_the_exact_session_write_lease() {
+    fn every_write_workspace_tool_requires_the_exact_session_write_lease() {
         let runtime = SessionToolRuntime::for_tests();
         runtime.begin_request("req-read-only", "project").unwrap();
 
         for spec in tools::tool_registry()
             .into_iter()
-            .filter(|spec| spec.mutating)
+            .filter(|spec| spec.requires_write_workspace)
         {
             let error = runtime
                 .execute(spec.name, &json!({}))
@@ -4697,8 +6364,7 @@ mod tests {
         {
             let mut state = session_a.request_state.lock();
             let state = state.as_mut().expect("session A state");
-            state.record_search_docs();
-            state.build_fix_attempts = 1;
+            state.iteration_action_count = 7;
         }
 
         session_b.begin_request("request-b", "project").unwrap();
@@ -4706,8 +6372,7 @@ mod tests {
         let state_a = session_a
             .request_state_snapshot()
             .expect("session B must not clear session A");
-        assert!(state_a.docs_searched);
-        assert_eq!(state_a.build_fix_attempts, 1);
+        assert_eq!(state_a.iteration_action_count, 7);
         assert_eq!(
             session_b.request_state_snapshot().unwrap().request_id,
             "request-b"
@@ -4715,29 +6380,17 @@ mod tests {
     }
 
     #[test]
-    fn search_docs_with_empty_index_returns_zero_hits_and_lifts_the_evidence_gate() {
+    fn search_docs_with_an_empty_index_answers_and_blocks_nothing() {
         let runtime = open_runtime("req-search");
 
-        // A mutating call BEFORE any search is blocked by the evidence gate.
-        let before = runtime
-            .execute(
-                "dat_patch",
-                &json!({"changes": [{
-                    "kind": "dat", "dat": "units", "objectId": 0,
-                    "field": "Hit Points", "before": 10240, "after": 20480
-                }]}),
-            )
-            .expect_err("dat_patch before search must hit the evidence gate");
-        assert!(before.contains("evidence gate"), "got: {before}");
-
-        // search_docs runs (zero hits on the empty test index) and lifts the gate.
         let result = runtime
             .execute("search_docs", &json!({"query": "마린 생성"}))
             .expect("search_docs should succeed even with an empty index");
         assert_eq!(result["count"], 0);
 
-        // The same mutation now passes admission and reaches native project resolution.
-        let after = runtime
+        // A mutation is admitted on its own merits: the only thing between it
+        // and the project is the project, not a search it has to run first.
+        let error = runtime
             .execute(
                 "dat_patch",
                 &json!({"changes": [{
@@ -4746,14 +6399,11 @@ mod tests {
                 }]}),
             )
             .expect_err("no native project is configured in the test runtime");
-        assert!(
-            !after.contains("evidence gate"),
-            "the gate must be lifted after search_docs, got: {after}"
-        );
+        assert!(error.contains("project"), "got: {error}");
     }
 
     #[test]
-    fn progressive_docs_discovery_preserves_exact_reads_and_reports_repeats() {
+    fn progressive_docs_discovery_preserves_exact_reads_and_rejects_no_progress() {
         let full_text = format!("{} SelectionCircle {}", "앞".repeat(600), "뒤".repeat(600));
         let mut services = ToolServices::for_tests();
         services.rag = Arc::new(Rag::new(
@@ -4794,15 +6444,21 @@ mod tests {
             "discovery must not inject the complete chunk"
         );
 
-        let second = runtime
+        let exact_repeat = runtime
             .execute(
                 tools::SEARCH_DOCS_TOOL,
-                &json!({"query": "SelectionCircle", "k": 1}),
+                &json!({"query": "  selectioncircle  ", "k": 1}),
             )
-            .unwrap();
-        assert_eq!(second["newCount"], 0);
-        assert_eq!(second["repeatedCount"], 1);
-        assert_eq!(second["hits"][0]["repeated"], true);
+            .unwrap_err();
+        assert!(exact_repeat.contains("no-progress"));
+
+        let no_novel_ids = runtime
+            .execute(
+                tools::SEARCH_DOCS_TOOL,
+                &json!({"query": "Circle Selection", "k": 1}),
+            )
+            .unwrap_err();
+        assert!(no_novel_ids.contains("no new stable"));
 
         let exact = runtime
             .execute(tools::DOCS_GET_TOOL, &json!({"ids": ["0000000000000123"]}))
@@ -4848,7 +6504,7 @@ mod tests {
         let error = runtime
             .execute("teleport", &json!({}))
             .expect_err("an unregistered tool must be rejected");
-        assert!(error.contains("unknown tool"), "got: {error}");
+        assert!(error.contains("Unknown tool"), "got: {error}");
     }
 
     #[test]
@@ -5106,6 +6762,240 @@ mod tests {
         std::fs::remove_dir_all(root).ok();
     }
 
+    /// A candidate session on the rich fixture with one open request; returns
+    /// the store, the runtime, the context (dimensions) and the temp root.
+    fn open_map_fixture_session(
+        tag: &str,
+    ) -> (
+        crate::map_candidate::CandidateStore,
+        SessionToolRuntime,
+        crate::map_context::MapContextSnapshot,
+        PathBuf,
+    ) {
+        let root = std::env::temp_dir().join(format!("map-{tag}-{}", uuid::Uuid::new_v4()));
+        let dirs = DataDirs::from_bases(&root.join("roaming"), &root.join("local"));
+        dirs.ensure_dirs().unwrap();
+        let source = root.join("source.scx");
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("crates")
+            .join("isom")
+            .join("tests")
+            .join("fixtures")
+            .join("map_agent_rich.scx");
+        std::fs::copy(fixture, &source).unwrap();
+        let context_service = crate::map_context::MapContextService::new(dirs.clone());
+        let revision = context_service
+            .revision_for_path("project".to_string(), &source)
+            .unwrap();
+        let chk = isom::chk_extract(&source).unwrap();
+        let context = crate::map_context::MapContextSnapshot {
+            revision,
+            saved_source_notice: "saved".to_string(),
+            source_file_size: std::fs::metadata(&source).unwrap().len(),
+            starcraft_path: PathBuf::from(r"C:\Program Files (x86)\StarCraft"),
+            digest: crate::chk::digest_chk(&chk),
+        };
+        let candidates = crate::map_candidate::CandidateStore::new(
+            dirs.clone(),
+            crate::map_import::MapImportStore::new(dirs.clone()),
+        );
+        candidates.create_session("map-session", &context).unwrap();
+        candidates
+            .prepare_request("project", "map-session", "request", 0, &[])
+            .unwrap();
+        let services = ToolServices::new(
+            dirs,
+            candidates.clone(),
+            crate::write_coordinator::ProjectWriteCoordinator::silent(),
+        );
+        let runtime = services.map_session("map-session");
+        runtime.begin_request("request", "project").unwrap();
+        (candidates, runtime, context, root)
+    }
+
+    fn expected_terrain_rows(
+        digest: &crate::chk::Digest,
+        x: usize,
+        y: usize,
+        width: usize,
+        height: usize,
+    ) -> Value {
+        let stride = usize::from(digest.map.width);
+        json!((y..y + height)
+            .map(|row| digest.tiles[row * stride + x..row * stride + x + width].to_vec())
+            .collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn map_terrain_read_returns_row_major_candidate_tiles_within_bounds_and_cap() {
+        let (candidates, runtime, context, root) = open_map_fixture_session("terrain-read");
+        let width = usize::from(context.digest.map.width);
+        let height = usize::from(context.digest.map.height);
+        assert!(width >= 8 && height >= 8, "fixture is {width}x{height}");
+
+        let rect = runtime
+            .execute(
+                "map_terrain_read",
+                &json!({"x": 3, "y": 2, "width": 5, "height": 4}),
+            )
+            .unwrap();
+        assert_eq!(rect["x"], 3);
+        assert_eq!(rect["y"], 2);
+        assert_eq!(rect["width"], 5);
+        assert_eq!(rect["height"], 4);
+        assert_eq!(rect["count"], 20);
+        assert_eq!(
+            rect["rows"],
+            expected_terrain_rows(&context.digest, 3, 2, 5, 4)
+        );
+
+        // The bottom-right corner is readable exactly up to the map edge.
+        let corner = runtime
+            .execute(
+                "map_terrain_read",
+                &json!({"x": width - 2, "y": height - 3, "width": 2, "height": 3}),
+            )
+            .unwrap();
+        assert_eq!(
+            corner["rows"],
+            expected_terrain_rows(&context.digest, width - 2, height - 3, 2, 3)
+        );
+
+        for args in [
+            json!({"x": width - 1, "y": 0, "width": 2, "height": 1}),
+            json!({"x": 0, "y": height, "width": 1, "height": 1}),
+            json!({"x": width, "y": 0, "width": 1, "height": 1}),
+        ] {
+            let error = runtime.execute("map_terrain_read", &args).unwrap_err();
+            assert!(
+                error.contains("outside candidate dimensions"),
+                "{args}: {error}"
+            );
+        }
+        let capped = runtime
+            .execute(
+                "map_terrain_read",
+                &json!({"x": 0, "y": 0, "width": 4097, "height": 1}),
+            )
+            .unwrap_err();
+        assert!(
+            capped.contains("read at most 4096 tiles per call; split the rectangle"),
+            "got: {capped}"
+        );
+        // Admission rejects a missing field before the tool runs.
+        let missing = runtime
+            .execute("map_terrain_read", &json!({"x": 0, "y": 0, "width": 1}))
+            .unwrap_err();
+        assert!(missing.contains("height"), "got: {missing}");
+
+        // The draft reader needs a draft; a fresh draft equals the candidate.
+        let no_draft = runtime
+            .execute(
+                "map_draft_terrain_read",
+                &json!({"x": 0, "y": 0, "width": 1, "height": 1}),
+            )
+            .unwrap_err();
+        assert!(no_draft.contains("no draft"), "got: {no_draft}");
+        runtime.execute("map_draft_begin", &json!({})).unwrap();
+        let draft = runtime
+            .execute(
+                "map_draft_terrain_read",
+                &json!({"x": 3, "y": 2, "width": 5, "height": 4}),
+            )
+            .unwrap();
+        assert_eq!(draft["rows"], rect["rows"]);
+
+        candidates.finish_request("map-session", "request").unwrap();
+        runtime.clear_current();
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    #[ignore = "requires installed StarCraft terrain assets"]
+    fn map_draft_terrain_read_reflects_terrain_rect_patches_while_the_candidate_does_not() {
+        let (candidates, runtime, context, root) = open_map_fixture_session("draft-terrain-read");
+        let (x, y, width, height) = (4_usize, 5_usize, 3_usize, 2_usize);
+        let before = runtime
+            .execute(
+                "map_terrain_read",
+                &json!({"x": x, "y": y, "width": width, "height": height}),
+            )
+            .unwrap();
+        assert_eq!(
+            before["rows"],
+            expected_terrain_rows(&context.digest, x, y, width, height)
+        );
+        let current = before["rows"][0][0].as_u64().unwrap() as u16;
+        let catalog: Value = serde_json::from_str(
+            &isom::catalog_query(
+                &context.starcraft_path,
+                json!({
+                    "schema": "eud-map-catalog/1",
+                    "kind": "tiles",
+                    "tileset": context.revision.tileset.era(),
+                    "offset": 0,
+                    "limit": 512,
+                })
+                .to_string()
+                .as_bytes(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let after = catalog["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["graphicsValid"] == true && entry["id"] != current)
+            .and_then(|entry| entry["id"].as_u64())
+            .unwrap();
+
+        runtime.execute("map_draft_begin", &json!({})).unwrap();
+        runtime
+            .execute(
+                "map_draft_patch",
+                &json!({
+                    "operations": [{
+                        "op": "terrain.rect",
+                        "x": x,
+                        "y": y,
+                        "width": width,
+                        "height": height,
+                        "after": after,
+                    }]
+                }),
+            )
+            .unwrap();
+
+        let draft = runtime
+            .execute(
+                "map_draft_terrain_read",
+                &json!({"x": x, "y": y, "width": width, "height": height}),
+            )
+            .unwrap();
+        assert_eq!(draft["count"], width * height);
+        assert_eq!(
+            draft["rows"],
+            json!(vec![vec![after; width]; height]),
+            "draft must show the patched rectangle"
+        );
+        let candidate = runtime
+            .execute(
+                "map_terrain_read",
+                &json!({"x": x, "y": y, "width": width, "height": height}),
+            )
+            .unwrap();
+        assert_eq!(
+            candidate["rows"], before["rows"],
+            "the visible candidate is unchanged until finalize/commit"
+        );
+
+        candidates.finish_request("map-session", "request").unwrap();
+        runtime.clear_current();
+        std::fs::remove_dir_all(root).ok();
+    }
+
     #[test]
     fn eps_and_map_runtimes_keep_requests_and_tool_surfaces_isolated() {
         let services = ToolServices::for_tests();
@@ -5125,6 +7015,96 @@ mod tests {
         assert!(!crate::tools::map_tool_registry()
             .iter()
             .any(|tool| tool.name.contains("apply")));
+    }
+
+    /// End to end over the real game data: the slot table comes from
+    /// `scripts\iscript.bin`, the users from the project's effective images.dat,
+    /// and each user's name from `arr\images.tbl`. The script an image actually
+    /// points at is read from the project first, so the round trip is asserted
+    /// without hardcoding which retail image uses which script.
+    #[test]
+    #[ignore = "requires installed StarCraft data"]
+    fn iscript_info_reports_a_scripts_slots_and_the_images_pointing_at_it() {
+        let services = ToolServices::for_tests();
+        crate::native_build::sync_compat_assets(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("resources/eud-editor-compat"),
+            &services.dirs.native_assets_dir(),
+        )
+        .unwrap();
+        let root = services.dirs.app_data().join("iscript-info-project");
+        std::fs::create_dir_all(root.join("maps")).unwrap();
+        std::fs::write(root.join("maps/source.scx"), b"fixture map").unwrap();
+        let project = crate::native_project::NativeProject::create(
+            &root,
+            crate::native_project::ProjectManifest {
+                schema_version: crate::native_project::PROJECT_SCHEMA_VERSION,
+                name: "Iscript info project".to_string(),
+                source_map: "maps/source.scx".to_string(),
+                output_map: "build/output.scx".to_string(),
+                main_file: "src/main.eps".to_string(),
+                settings: Default::default(),
+                plugins: Vec::new(),
+                python_entrypoints: Vec::new(),
+                python_dependencies: Vec::new(),
+                python_lock: None,
+                editor_compatibility: None,
+            },
+        )
+        .unwrap();
+        services.native().activate_project(&project).unwrap();
+        let image_zero = DatTarget::Dat {
+            dat: "images".to_string(),
+            object_id: 0,
+            field: IMAGE_ISCRIPT_FIELD.to_string(),
+        };
+        let DatScalar::Number(used_script) = services
+            .native()
+            .dat_values(std::slice::from_ref(&image_zero))
+            .unwrap()[&image_zero]
+            .clone()
+        else {
+            panic!("images.dat Iscript ID must be numeric");
+        };
+
+        let runtime = services.session("iscript-session");
+        runtime.begin_request("request", "project").unwrap();
+        let result = runtime
+            .execute(
+                crate::tools::ISCRIPT_INFO_TOOL,
+                &json!({"ids": [225, used_script]}),
+            )
+            .unwrap();
+
+        // Retail script 225 is a two-slot overlay: Init and Death and nothing
+        // else, so an image repointed at it loses every attack, movement and
+        // spell animation. That is the fact a DAT edit cannot get anywhere else.
+        let overlay = &result["scripts"][0];
+        assert_eq!(overlay["id"], 225);
+        assert_eq!(overlay["slotCount"], 2);
+        let slots = overlay["slots"].as_array().unwrap();
+        assert_eq!(slots.len(), 2);
+        assert_eq!(slots[0]["name"], "Init");
+        assert_eq!(slots[0]["present"], true);
+        assert_eq!(slots[1]["name"], "Death");
+
+        let used = &result["scripts"][1];
+        assert_eq!(used["id"], used_script);
+        let images = used["usedBy"]["images"].as_array().unwrap();
+        let image_zero_entry = images
+            .iter()
+            .find(|image| image["imageId"] == 0)
+            .unwrap_or_else(|| panic!("image 0 must be listed as a user: {used}"));
+        assert!(
+            image_zero_entry["grp"]
+                .as_str()
+                .is_some_and(|grp| !grp.is_empty()),
+            "image 0 must carry its images.tbl GRP name: {image_zero_entry}"
+        );
+        assert!(
+            used["usedBy"]["total"].as_u64().unwrap() >= images.len() as u64,
+            "{used}"
+        );
+        std::fs::remove_dir_all(services.dirs.app_data()).ok();
     }
 
     #[test]

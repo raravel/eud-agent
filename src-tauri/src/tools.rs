@@ -5,40 +5,100 @@
 
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine;
-use encoding_rs::EUC_KR;
 use serde_json::{json, Map, Value};
-use std::collections::{BTreeMap, BTreeSet};
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::Path;
 use thiserror::Error;
 
 /// Build verification tool name, exempt from the evidence gate.
 pub const BUILD_RUN_TOOL: &str = "build_run";
-/// Isolated runtime trace test tool name.
-pub const TRACE_TEST_RUN_TOOL: &str = "trace_test_run";
-/// Source-controlled persistent runtime regression suite tool name.
-pub const TRACE_SUITE_RUN_TOOL: &str = "trace_suite_run";
-
+/// Bounded read of the complete log of the last `build_run`.
+pub const BUILD_LOG_READ_TOOL: &str = "build_log_read";
 /// Documentation search tool name.
 pub const SEARCH_DOCS_TOOL: &str = "search_docs";
 /// Exact documentation-chunk lookup tool name.
 pub const DOCS_GET_TOOL: &str = "docs_get";
 /// Bounded source search tool name.
 pub const SOURCE_SEARCH_TOOL: &str = "source_search";
+
+/// Existing-iscript slot reader tool name.
+pub const ISCRIPT_INFO_TOOL: &str = "iscript_info";
+/// Scripts per `iscript_info` call. Each script reports up to 28 slots plus the
+/// images using it, so the bound keeps one observation well inside the 40 KiB
+/// tool-observation ceiling.
+pub const ISCRIPT_INFO_MAX_IDS: usize = 8;
+/// Images listed per script before `iscript_info` reports only the total.
+pub const ISCRIPT_INFO_MAX_IMAGES: usize = 64;
+
+/// The pure-IO filesystem tools (plan §N7). They read and write the project
+/// root and nothing else: no journal, no evidence, no write registration. What
+/// makes them reversible is the turn commit, the same as a Codex or Claude
+/// Code native edit. `maps/**`, `references/**`, `.git/**` and this session's
+/// own permission files stay read-only (§N2).
+pub const FS_READ_TOOL: &str = "fs_read";
+pub const FS_WRITE_TOOL: &str = "fs_write";
+pub const FS_EDIT_TOOL: &str = "fs_edit";
+pub const FS_GLOB_TOOL: &str = "fs_glob";
+pub const FS_GREP_TOOL: &str = "fs_grep";
+
+pub const FS_TOOLS: &[&str] = &[
+    FS_READ_TOOL,
+    FS_WRITE_TOOL,
+    FS_EDIT_TOOL,
+    FS_GLOB_TOOL,
+    FS_GREP_TOOL,
+];
+
+pub fn is_fs_tool(name: &str) -> bool {
+    FS_TOOLS.contains(&name)
+}
 /// Resolve one complete exact direct-Python dependency list into a bounded candidate.
 pub const PYTHON_DEPENDENCIES_PREPARE_TOOL: &str = "python_dependencies_prepare";
 /// Commit a previously prepared direct-Python dependency candidate.
 pub const PYTHON_DEPENDENCIES_SET_TOOL: &str = "python_dependencies_set";
-/// Flow-control tool that records write intent without mutating the project.
-pub const REQUEST_WRITE_WORKSPACE_TOOL: &str = "request_write_workspace";
 /// Flow-control tool that pauses the current turn for structured user input.
 pub const ASK_TOOL: &str = "ask";
+/// Bounded wait for one `ask` before it expires into a plain-text handoff.
+///
+/// Native Codex/Claude CLIs abort a silent MCP call after 300 seconds and
+/// progress notifications do not extend it (measured 2026-09-17, `verify.md`),
+/// so no single tool call may wait longer than this.
+pub const ASK_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(240);
+/// EPS → Map team handoff: hand placement work to the session's team Map
+/// session and wait (bounded) for its candidate.
+pub const MAP_TASK_REQUEST_TOOL: &str = "map_task_request";
+/// Re-read one team task's durable status within the same turn.
+pub const MAP_TASK_STATUS_TOOL: &str = "map_task_status";
+/// Read a ready team candidate's diff and verification.
+pub const MAP_TASK_DIFF_TOOL: &str = "map_task_diff";
+/// Read one object layer of a ready team candidate.
+pub const MAP_TASK_OBJECTS_TOOL: &str = "map_task_objects";
+/// Render a crop of a ready team candidate.
+pub const MAP_TASK_RENDER_TOOL: &str = "map_task_render";
+/// Apply a ready team candidate to the source map after inspecting it.
+pub const MAP_TASK_APPLY_TOOL: &str = "map_task_apply";
+/// Discard a ready team candidate without changing the source map.
+pub const MAP_TASK_DISCARD_TOOL: &str = "map_task_discard";
+/// The reads that count as inspecting a team candidate before `map_task_apply`.
+pub const TEAM_CANDIDATE_READ_TOOLS: &[&str] = &[
+    MAP_TASK_DIFF_TOOL,
+    MAP_TASK_OBJECTS_TOOL,
+    MAP_TASK_RENDER_TOOL,
+];
+/// EPS map tools excluded while a team task is active for the request, so the
+/// EPS session and the Map candidate never overwrite the same layers.
+pub const TEAM_EXCLUDED_MAP_TOOLS: &[&str] = &[
+    "location_write",
+    SWITCH_WRITE_TOOL,
+    "player_setup",
+    MAP_SOUND_IMPORT_TOOL,
+    MAP_SOUND_EDIT_TOOL,
+];
 
-/// Maximum admitted non-search tool actions in one user request.
-const MAX_TOOL_ACTIONS: usize = 300;
-const MAX_PYTHON_DEPENDENCY_PREPARATIONS: usize = 4;
-
-/// Maximum admitted documentation searches in one user request.
-const MAX_SEARCH_DOCS_CALLS: usize = 120;
+/// Soft action threshold for one foreground iteration.
+pub const ITERATION_TOOL_ACTION_THRESHOLD: usize = 300;
+const BUILD_PROGRESS_HISTORY: usize = 8;
 
 /// Connected source-map digest tool name.
 pub const MAP_INFO_TOOL: &str = "map_info";
@@ -68,10 +128,6 @@ pub type ToolResult<T> = Result<T, ToolError>;
 /// Tool-layer errors surfaced as correctable tool-call failures.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum ToolError {
-    /// A mutating tool was called before `search_docs` ran in this request.
-    #[error("{message}")]
-    EvidenceRequired { message: String },
-
     /// A `btn_set` CSV contains a disableable button with `disstr == 0`.
     #[error("{message}")]
     ButtonDisableStringRequired { message: String },
@@ -85,17 +141,51 @@ pub enum ToolError {
     AdmissionRejected { message: String },
 }
 
+/// Stable post-execution build observation used for progress detection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuildProgress {
+    pub input_revision: String,
+    pub diagnostics_fingerprint: String,
+    pub error_count: usize,
+    pub success: bool,
+    pub consecutive_no_progress: u32,
+}
+
+/// Result of recording one completed build.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BuildProgressOutcome {
+    Progress(BuildProgress),
+    NoProgress {
+        progress: BuildProgress,
+        reason: String,
+    },
+}
+
 /// Mutable state carried for one agent request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RequestState {
     /// Stable id for the currently admitted request.
     pub request_id: String,
 
-    /// Set once a `search_docs` call has run successfully, even with zero hits.
-    pub docs_searched: bool,
+    /// Set once `map_info` ran successfully in this request: the evidence a
+    /// `map_task_request` needs before handing placement work to Map Agent.
+    pub map_inspected: bool,
 
-    /// Number of admitted tool actions in this request.
+    /// The team task whose candidate this request inspected last
+    /// (`map_task_diff`/`map_task_objects`/`map_task_render`): the evidence
+    /// `map_task_apply` needs for that task.
+    pub candidate_inspected: Option<String>,
+
+    /// Number of admitted tool actions across the request.
     pub action_count: usize,
+
+    /// Number of admitted actions in the current foreground iteration.
+    pub iteration_action_count: usize,
+    /// Total admitted read/project-operation calls for lifecycle reporting.
+    pub read_action_count: u64,
+
+    /// Total admitted canonical authoring calls for lifecycle reporting.
+    pub write_action_count: u64,
 
     /// Number of admitted `search_docs` calls in this request.
     pub search_docs_count: usize,
@@ -109,7 +199,7 @@ pub struct RequestState {
     /// Number of already-seen documentation hits returned again.
     pub search_docs_repeated_hits: usize,
 
-    /// Serialized discovery-result bytes returned to Codex.
+    /// Serialized discovery-result bytes returned to the provider.
     pub search_docs_result_bytes: usize,
 
     /// Number of exact `docs_get` calls in this request.
@@ -118,16 +208,13 @@ pub struct RequestState {
     /// Number of exact documentation chunks returned by `docs_get`.
     pub docs_get_documents: usize,
 
-    /// Serialized exact-document bytes returned to Codex.
+    /// Serialized exact-document bytes returned to the provider.
     pub docs_get_result_bytes: usize,
 
-    /// Number of admitted build self-fix attempts in this request.
-    pub build_fix_attempts: usize,
-
-    /// Number of admitted derived-cache Python dependency preparations.
-    pub python_dependency_prepare_count: usize,
-
     seen_doc_ids: BTreeSet<u64>,
+    completed_searches: BTreeMap<String, BTreeSet<u64>>,
+    build_history: VecDeque<BuildProgress>,
+    blocked_build_revision: Option<String>,
 }
 
 impl RequestState {
@@ -136,12 +223,16 @@ impl RequestState {
         Self::for_request("")
     }
 
-    /// Create clean request state for a specific request id.
+    /// Create clean state for a specific request id.
     pub fn for_request(id: &str) -> Self {
         Self {
             request_id: id.to_string(),
-            docs_searched: false,
+            map_inspected: false,
+            candidate_inspected: None,
             action_count: 0,
+            iteration_action_count: 0,
+            read_action_count: 0,
+            write_action_count: 0,
             search_docs_count: 0,
             search_docs_returned_hits: 0,
             search_docs_unique_hits: 0,
@@ -150,52 +241,178 @@ impl RequestState {
             docs_get_count: 0,
             docs_get_documents: 0,
             docs_get_result_bytes: 0,
-            build_fix_attempts: 0,
-            python_dependency_prepare_count: 0,
             seen_doc_ids: BTreeSet::new(),
+            completed_searches: BTreeMap::new(),
+            build_history: VecDeque::with_capacity(BUILD_PROGRESS_HISTORY),
+            blocked_build_revision: None,
         }
     }
 
-    /// Start a fresh request, resetting all per-request gates and budgets.
+    /// Start a fresh request, resetting all request-scoped authority and progress.
     pub fn start_request(&mut self, id: &str) {
         *self = Self::for_request(id);
     }
 
-    /// Record that `search_docs` ran successfully for this request.
-    ///
-    /// The execution layer calls this after a successful search; admission only
-    /// validates the call and must not mark the evidence gate satisfied.
-    pub fn record_search_docs(&mut self) {
-        self.docs_searched = true;
+    /// Start one soft-bounded foreground iteration without resetting request state.
+    pub fn begin_iteration(&mut self) {
+        self.iteration_action_count = 0;
+    }
+
+    pub fn iteration_action_boundary_reached(&self) -> bool {
+        self.iteration_action_count >= ITERATION_TOOL_ACTION_THRESHOLD
+    }
+
+    pub fn restore_autonomous_progress(
+        &mut self,
+        read_actions: u64,
+        write_actions: u64,
+        latest_build: Option<BuildProgress>,
+    ) {
+        self.read_action_count = read_actions;
+        self.write_action_count = write_actions;
+        self.action_count =
+            usize::try_from(read_actions.saturating_add(write_actions)).unwrap_or(usize::MAX);
+        if let Some(build) = latest_build {
+            if build.consecutive_no_progress > 0 && !build.success {
+                self.blocked_build_revision = Some(build.input_revision.clone());
+            }
+            self.build_history.push_back(build);
+        }
+    }
+
+    /// Record that `map_info` ran successfully for this request.
+    pub fn record_map_inspection(&mut self) {
+        self.map_inspected = true;
+    }
+
+    /// Record that this request inspected team task `task_id`'s candidate.
+    pub fn record_candidate_inspection(&mut self, task_id: &str) {
+        self.candidate_inspected = Some(task_id.to_string());
+    }
+
+    /// Whether this request inspected team task `task_id`'s candidate.
+    pub fn candidate_inspected(&self, task_id: &str) -> bool {
+        self.candidate_inspected.as_deref() == Some(task_id)
+    }
+
+    pub fn search_identity(args: &Value) -> String {
+        let query = args
+            .get("query")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .split_whitespace()
+            .map(str::to_lowercase)
+            .collect::<Vec<_>>()
+            .join(" ");
+        let k = args.get("k").and_then(Value::as_i64).unwrap_or(5);
+        format!("{query}\u{1f}{k}")
+    }
+
+    pub fn repeated_search_ids(&self, args: &Value) -> Option<&BTreeSet<u64>> {
+        self.completed_searches.get(&Self::search_identity(args))
     }
 
     /// Record discovery hits and return one repeated flag per id.
-    pub fn record_search_docs_hits(&mut self, ids: &[u64]) -> Vec<bool> {
-        self.record_search_docs();
-        self.search_docs_returned_hits += ids.len();
-        ids.iter()
+    pub fn record_search_docs_hits(&mut self, args: &Value, ids: &[u64]) -> Vec<bool> {
+        self.search_docs_count = self.search_docs_count.saturating_add(1);
+        self.search_docs_returned_hits = self.search_docs_returned_hits.saturating_add(ids.len());
+        let repeated = ids
+            .iter()
             .map(|id| {
                 let repeated = !self.seen_doc_ids.insert(*id);
                 if repeated {
-                    self.search_docs_repeated_hits += 1;
+                    self.search_docs_repeated_hits =
+                        self.search_docs_repeated_hits.saturating_add(1);
                 } else {
-                    self.search_docs_unique_hits += 1;
+                    self.search_docs_unique_hits = self.search_docs_unique_hits.saturating_add(1);
                 }
                 repeated
             })
-            .collect()
+            .collect();
+        self.completed_searches
+            .insert(Self::search_identity(args), ids.iter().copied().collect());
+        repeated
     }
 
     /// Record the final serialized discovery payload size.
     pub fn record_search_docs_payload(&mut self, bytes: usize) {
-        self.search_docs_result_bytes += bytes;
+        self.search_docs_result_bytes = self.search_docs_result_bytes.saturating_add(bytes);
     }
 
     /// Record an exact-document response.
     pub fn record_docs_get(&mut self, documents: usize, bytes: usize) {
-        self.docs_get_count += 1;
-        self.docs_get_documents += documents;
-        self.docs_get_result_bytes += bytes;
+        self.docs_get_count = self.docs_get_count.saturating_add(1);
+        self.docs_get_documents = self.docs_get_documents.saturating_add(documents);
+        self.docs_get_result_bytes = self.docs_get_result_bytes.saturating_add(bytes);
+    }
+
+    pub fn build_blocked_for_revision(&self, revision: &str) -> bool {
+        self.blocked_build_revision.as_deref() == Some(revision)
+    }
+
+    pub fn latest_build(&self) -> Option<&BuildProgress> {
+        self.build_history.back()
+    }
+
+    pub fn record_build(
+        &mut self,
+        input_revision: String,
+        result: &crate::native_build::NativeBuildResult,
+    ) -> BuildProgressOutcome {
+        let diagnostics_fingerprint = build_diagnostics_fingerprint(&result.errors);
+        let error_count = result.errors.len();
+        let pair_repeated = self.build_history.back().is_some_and(|previous| {
+            previous.input_revision == input_revision
+                && previous.diagnostics_fingerprint == diagnostics_fingerprint
+                && !result.ok
+        });
+        let oscillating = self.build_history.len() >= 3
+            && self.build_history[self.build_history.len() - 3].input_revision
+                == self.build_history[self.build_history.len() - 1].input_revision
+            && self.build_history[self.build_history.len() - 3].diagnostics_fingerprint
+                == self.build_history[self.build_history.len() - 1].diagnostics_fingerprint
+            && self.build_history[self.build_history.len() - 2].input_revision == input_revision
+            && self.build_history[self.build_history.len() - 2].diagnostics_fingerprint
+                == diagnostics_fingerprint
+            && !result.ok;
+        let previous_no_progress = self
+            .build_history
+            .back()
+            .map_or(0, |previous| previous.consecutive_no_progress);
+        let no_progress = pair_repeated || oscillating;
+        let progress = BuildProgress {
+            input_revision: input_revision.clone(),
+            diagnostics_fingerprint,
+            error_count,
+            success: result.ok,
+            consecutive_no_progress: if result.ok {
+                0
+            } else if no_progress {
+                previous_no_progress.saturating_add(1)
+            } else {
+                0
+            },
+        };
+        if self.build_history.len() == BUILD_PROGRESS_HISTORY {
+            self.build_history.pop_front();
+        }
+        self.build_history.push_back(progress.clone());
+        if no_progress {
+            self.blocked_build_revision = Some(input_revision);
+            BuildProgressOutcome::NoProgress {
+                progress,
+                reason: if oscillating {
+                    "최근 빌드 상태가 A → B → A → B 형태로 반복되었습니다. 입력을 실제로 진전시킨 뒤 다시 빌드하세요."
+                        .to_string()
+                } else {
+                    "같은 프로젝트 revision에서 같은 빌드 진단이 반복되었습니다. 진단을 확인하고 입력을 변경한 뒤 다시 빌드하세요."
+                        .to_string()
+                },
+            }
+        } else {
+            self.blocked_build_revision = None;
+            BuildProgressOutcome::Progress(progress)
+        }
     }
 }
 
@@ -205,49 +422,142 @@ impl Default for RequestState {
     }
 }
 
-/// Minimal tool metadata needed by the evidence gate.
+/// Minimal tool metadata needed by workspace and project-operation admission.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolSpec {
     pub name: &'static str,
     pub description: &'static str,
-    pub mutating: bool,
+    pub requires_write_workspace: bool,
+    pub requires_project_transaction: bool,
     pub input_schema: Value,
 }
 
 impl ToolSpec {
-    /// Construct a tool spec for a mutating tool.
-    pub fn mutating(name: &'static str) -> Self {
+    pub fn canonical_mutation(name: &'static str) -> Self {
         Self {
             name,
             description: "",
-            mutating: true,
+            requires_write_workspace: true,
+            requires_project_transaction: true,
             input_schema: empty_schema(),
         }
     }
 
-    /// Construct a tool spec for a read-only tool.
     pub fn read_only(name: &'static str) -> Self {
         Self {
             name,
             description: "",
-            mutating: false,
+            requires_write_workspace: false,
+            requires_project_transaction: false,
             input_schema: empty_schema(),
         }
     }
 }
 
-fn tool_spec(
+fn read_tool(name: &'static str, description: &'static str, input_schema: Value) -> ToolSpec {
+    ToolSpec {
+        name,
+        description,
+        requires_write_workspace: false,
+        requires_project_transaction: false,
+        input_schema,
+    }
+}
+
+fn fs_tool(name: &'static str, description: &'static str, input_schema: Value) -> ToolSpec {
+    ToolSpec {
+        name,
+        description,
+        requires_write_workspace: false,
+        requires_project_transaction: false,
+        input_schema,
+    }
+}
+
+fn canonical_tool(name: &'static str, description: &'static str, input_schema: Value) -> ToolSpec {
+    ToolSpec {
+        name,
+        description,
+        requires_write_workspace: true,
+        requires_project_transaction: true,
+        input_schema,
+    }
+}
+
+fn project_operation_tool(
     name: &'static str,
     description: &'static str,
-    mutating: bool,
     input_schema: Value,
 ) -> ToolSpec {
     ToolSpec {
         name,
         description,
-        mutating,
+        requires_write_workspace: false,
+        requires_project_transaction: true,
         input_schema,
     }
+}
+
+fn build_diagnostics_fingerprint(errors: &[crate::native_build::NativeBuildError]) -> String {
+    let mut diagnostics = errors
+        .iter()
+        .map(|error| {
+            format!(
+                "{}\u{1f}{}\u{1f}{}\u{1f}{}",
+                normalize_build_path(&error.source),
+                normalize_build_path(&error.file),
+                error.line,
+                normalize_build_message(&error.message),
+            )
+        })
+        .collect::<Vec<_>>();
+    diagnostics.sort_unstable();
+    let digest = Sha256::digest(diagnostics.join("\u{1e}").as_bytes());
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn normalize_build_path(path: &str) -> String {
+    let normalized = path.trim().replace('\\', "/");
+    let parts = normalized
+        .split('/')
+        .filter(|part| !part.is_empty() && *part != ".")
+        .collect::<Vec<_>>();
+    let logical_start = parts
+        .iter()
+        .position(|part| matches!(part.to_ascii_lowercase().as_str(), "src" | "tests"));
+    let logical = logical_start
+        .map(|index| parts[index..].join("/"))
+        .or_else(|| parts.last().map(|part| (*part).to_string()))
+        .unwrap_or_default();
+    logical.to_ascii_lowercase()
+}
+
+fn normalize_build_message(message: &str) -> String {
+    message
+        .split_whitespace()
+        .map(|token| {
+            let slash = token.replace('\\', "/");
+            let unwrapped = slash.trim_matches(|character: char| {
+                matches!(character, '"' | '\'' | '(' | ')' | '[' | ']' | ',' | ';')
+            });
+            let lower = unwrapped.to_ascii_lowercase();
+            let digit_count = lower.bytes().filter(u8::is_ascii_digit).count();
+            if lower.starts_with('/')
+                || lower.get(1..3) == Some(":/")
+                || lower.contains("/appdata/local/temp/")
+            {
+                "<path>".to_string()
+            } else if digit_count >= 6
+                && lower.contains(':')
+                && (lower.contains('-') || lower.contains('t'))
+            {
+                "<time>".to_string()
+            } else {
+                lower
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn empty_schema() -> Value {
@@ -297,8 +607,31 @@ fn string_schema() -> Value {
     json!({"type": "string"})
 }
 
+fn boolean_schema() -> Value {
+    json!({"type": "boolean"})
+}
+
 fn integer_schema() -> Value {
     json!({"type": "integer"})
+}
+
+/// `map_task_request` scope rectangles, in tiles.
+fn team_rects_schema() -> Value {
+    json!({
+        "type": "array",
+        "maxItems": 8,
+        "items": {
+            "type": "object",
+            "properties": {
+                "x": {"type": "integer", "minimum": 0, "maximum": 255},
+                "y": {"type": "integer", "minimum": 0, "maximum": 255},
+                "width": {"type": "integer", "minimum": 1, "maximum": 256},
+                "height": {"type": "integer", "minimum": 1, "maximum": 256}
+            },
+            "required": ["x", "y", "width", "height"],
+            "additionalProperties": false
+        }
+    })
 }
 fn render_scale_schema() -> Value {
     json!({
@@ -451,22 +784,19 @@ fn map_info_owner_schema() -> Value {
 /// Registry of the EUD tool API exposed to Codex and MCP.
 pub fn tool_registry() -> Vec<ToolSpec> {
     vec![
-        tool_spec(
+        read_tool(
             "project_status",
             "Read current native project status and the exact configured mainFile path.",
-            false,
             empty_schema(),
         ),
-        tool_spec(
+        read_tool(
             "list_files",
             "List editable project files.",
-            false,
             empty_schema(),
         ),
-        tool_spec(
+        read_tool(
             "read_file",
             "Read an editable project file, optionally by inclusive 1-based line range.",
-            false,
             schema(
                 json!({
                     "path": string_schema(),
@@ -476,10 +806,9 @@ pub fn tool_registry() -> Vec<ToolSpec> {
                 &["path"],
             ),
         ),
-        tool_spec(
+        read_tool(
             SOURCE_SEARCH_TOOL,
             "Search editable project source with exact paged excerpts; native read-only shell remains available as a fallback.",
-            false,
             schema(
                 json!({
                     "query": string_schema(),
@@ -491,19 +820,80 @@ pub fn tool_registry() -> Vec<ToolSpec> {
                 &["query"],
             ),
         ),
-        tool_spec(
+        fs_tool(
+            FS_READ_TOOL,
+            "Read any project file as text, optionally by inclusive 1-based line range.",
+            schema(
+                json!({
+                    "path": string_schema(),
+                    "startLine": integer_schema(),
+                    "endLine": integer_schema(),
+                }),
+                &["path"],
+            ),
+        ),
+        fs_tool(
+            FS_GLOB_TOOL,
+            "List project files matching a '/'-separated glob; '**' spans folders and a pattern without '/' matches the file name at any depth.",
+            schema(
+                json!({
+                    "pattern": string_schema(),
+                    "offset": integer_schema(),
+                    "limit": integer_schema(),
+                    "includeGenerated": boolean_schema(),
+                }),
+                &["pattern"],
+            ),
+        ),
+        fs_tool(
+            FS_GREP_TOOL,
+            "Search project file contents with a regular expression, optionally scoped by a file glob.",
+            schema(
+                json!({
+                    "pattern": string_schema(),
+                    "glob": string_schema(),
+                    "caseSensitive": boolean_schema(),
+                    "contextLines": integer_schema(),
+                    "offset": integer_schema(),
+                    "limit": integer_schema(),
+                    "includeGenerated": boolean_schema(),
+                }),
+                &["pattern"],
+            ),
+        ),
+        fs_tool(
+            FS_WRITE_TOOL,
+            "Create or overwrite any project file; maps, references, .git and this session's permission files stay read-only.",
+            schema(
+                json!({
+                    "path": string_schema(),
+                    "content": string_schema(),
+                }),
+                &["path", "content"],
+            ),
+        ),
+        fs_tool(
+            FS_EDIT_TOOL,
+            "Apply ordered exact-text edits to any project file; the same paths stay read-only.",
+            schema(
+                json!({
+                    "path": string_schema(),
+                    "edits": exact_text_edits_schema(),
+                }),
+                &["path", "edits"],
+            ),
+        ),
+        read_tool(
             PYTHON_DEPENDENCIES_PREPARE_TOOL,
             "Resolve a complete exact direct-Python dependency list without changing project state.",
-            false,
             schema(
                 json!({"dependencies": optional_string_array_schema(128)}),
                 &["dependencies"],
             ),
         ),
-        tool_spec(
+        read_tool(
             "dat_get",
             "Read one or more DAT field values.",
-            false,
             schema(
                 json!({
                     "items": object_array_schema(
@@ -518,10 +908,9 @@ pub fn tool_registry() -> Vec<ToolSpec> {
                 &["items"],
             ),
         ),
-        tool_spec(
+        read_tool(
             "xdat_get",
             "Read one or more extended DAT field values.",
-            false,
             schema(
                 json!({
                     "items": object_array_schema(
@@ -536,10 +925,9 @@ pub fn tool_registry() -> Vec<ToolSpec> {
                 &["items"],
             ),
         ),
-        tool_spec(
+        read_tool(
             "tbl_get",
             "Read one or more TBL strings by index.",
-            false,
             schema(
                 json!({
                     "items": object_array_schema(
@@ -550,10 +938,9 @@ pub fn tool_registry() -> Vec<ToolSpec> {
                 &["items"],
             ),
         ),
-        tool_spec(
+        read_tool(
             "req_get",
             "Read one or more requirements payloads.",
-            false,
             schema(
                 json!({
                     "items": object_array_schema(
@@ -567,10 +954,9 @@ pub fn tool_registry() -> Vec<ToolSpec> {
                 &["items"],
             ),
         ),
-        tool_spec(
+        read_tool(
             "btn_get",
             "Read one or more button set CSV payloads.",
-            false,
             schema(
                 json!({
                     "items": object_array_schema(
@@ -581,10 +967,27 @@ pub fn tool_registry() -> Vec<ToolSpec> {
                 &["items"],
             ),
         ),
-        tool_spec(
+        read_tool(
+            ISCRIPT_INFO_TOOL,
+            "Read which animation slots an existing iscript defines, from the installed StarCraft data. \
+             images.dat's `Iscript ID` only selects a script; this reports that script's declared slots \
+             (Init, Death, CastSpell, ...), whether each one has a body, and which project images currently \
+             use it. Check the slots a repointed image needs before changing `Iscript ID`.",
+            schema(
+                json!({
+                    "ids": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": ISCRIPT_INFO_MAX_IDS,
+                        "items": integer_schema(),
+                    },
+                }),
+                &["ids"],
+            ),
+        ),
+        read_tool(
             "settings_get",
             "Read an agent setting.",
-            false,
             schema(
                 json!({
                     "scope": settings_scopes_schema(),
@@ -593,10 +996,9 @@ pub fn tool_registry() -> Vec<ToolSpec> {
                 &["scope", "key"],
             ),
         ),
-        tool_spec(
+        read_tool(
             MAP_INFO_TOOL,
             "Read paged connected-map terrain, placements, switches, players, and forces.",
-            false,
             schema(
                 json!({
                     "mode": enum_string_schema(&[
@@ -620,16 +1022,14 @@ pub fn tool_registry() -> Vec<ToolSpec> {
                 &[],
             ),
         ),
-        tool_spec(
+        read_tool(
             MAP_SOUND_LIST_TOOL,
             "List registered map WAV slots and exact MPQ paths from the connected saved SCX.",
-            false,
             empty_schema(),
         ),
-        tool_spec(
+        read_tool(
             MAP_MINIMAP_TOOL,
             "Render the connected map as PNG terrain with an optional unit overlay.",
-            false,
             schema(
                 json!({
                     "maxSize": integer_schema(),
@@ -639,16 +1039,14 @@ pub fn tool_registry() -> Vec<ToolSpec> {
                 &[],
             ),
         ),
-        tool_spec(
+        read_tool(
             "plugins_list",
             "List configured plugins.",
-            false,
             empty_schema(),
         ),
-        tool_spec(
+        read_tool(
             SEARCH_DOCS_TOOL,
-            "Discover ranked reference chunks as compact exact previews. Inspect promising ids with docs_get; searches and exact reads remain repeatable.",
-            false,
+            "Discover ranked reference chunks as compact exact previews. Inspect promising ids with docs_get; repeat only when the normalized query or returned stable ids can add new evidence.",
             schema(
                 json!({
                     "query": string_schema(),
@@ -657,43 +1055,32 @@ pub fn tool_registry() -> Vec<ToolSpec> {
                 &["query"],
             ),
         ),
-        tool_spec(
+        read_tool(
             DOCS_GET_TOOL,
             "Read selected search_docs chunks exactly by stable hexadecimal id.",
-            false,
             schema(json!({"ids": string_array_schema(10)}), &["ids"]),
         ),
-        tool_spec(
+        read_tool(
             ASK_TOOL,
-            "Pause this turn to ask the user up to four related questions. Each question supports single or multiple choice and always allows direct input.",
-            false,
+            "Pause this turn to ask the user up to four related questions. Each question supports single or multiple choice and always allows direct input. The user has 240 seconds to answer in the panel. A result with status \"unanswered\" means no answer arrived in time: restate the same questions as your final plain-text answer, end the turn, and treat the user's next message as the answer. Never call ask again after an unanswered result in the same turn.",
             schema(json!({"questions": ask_questions_schema()}), &["questions"]),
         ),
-        tool_spec(
-            REQUEST_WRITE_WORKSPACE_TOOL,
-            "Declare write intent, park this read-only turn, and resume immediately in the session's isolated writable workspace.",
-            false,
-            schema(json!({"reason": string_schema()}), &["reason"]),
-        ),
-        tool_spec(
+        canonical_tool(
             PYTHON_DEPENDENCIES_SET_TOOL,
             "Commit one prepared direct-Python dependency candidate by its opaque token.",
-            true,
             schema(
                 json!({"candidateToken": string_schema()}),
                 &["candidateToken"],
             ),
         ),
-        tool_spec(
+        canonical_tool(
             MAP_SOUND_IMPORT_TOOL,
             "Import one request-local audioRef as canonical OGG into the connected saved SCX.",
-            true,
             schema(json!({"audioRef": string_schema()}), &["audioRef"]),
         ),
-        tool_spec(
+        canonical_tool(
             MAP_SOUND_EDIT_TOOL,
             "Apply persistent volume/fade settings to one managed sound, replace its SCX registration, and return the new exact MPQ path.",
-            true,
             schema(
                 json!({
                     "mpqPath": string_schema(),
@@ -705,16 +1092,14 @@ pub fn tool_registry() -> Vec<ToolSpec> {
                 &["mpqPath"],
             ),
         ),
-        tool_spec(
+        canonical_tool(
             "dat_patch",
             "Atomically validate and stage one complete native DAT/XDAT/TBL/requirements/buttons changeset.",
-            true,
             schema(json!({"changes": dat_patch_changes_schema()}), &["changes"]),
         ),
-        tool_spec(
+        canonical_tool(
             "file_create",
             "Create a project file.",
-            true,
             schema(
                 json!({
                     "path": string_schema(),
@@ -724,10 +1109,9 @@ pub fn tool_registry() -> Vec<ToolSpec> {
                 &["path", "ftype"],
             ),
         ),
-        tool_spec(
+        canonical_tool(
             "file_write",
             "Overwrite a project file.",
-            true,
             schema(
                 json!({
                     "path": string_schema(),
@@ -736,10 +1120,9 @@ pub fn tool_registry() -> Vec<ToolSpec> {
                 &["path", "code"],
             ),
         ),
-        tool_spec(
+        canonical_tool(
             "file_edit",
             "Apply ordered exact-text edits to an existing project file.",
-            true,
             schema(
                 json!({
                     "path": string_schema(),
@@ -748,10 +1131,9 @@ pub fn tool_registry() -> Vec<ToolSpec> {
                 &["path", "edits"],
             ),
         ),
-        tool_spec(
+        canonical_tool(
             "file_rename",
             "Rename a project file.",
-            true,
             schema(
                 json!({
                     "path": string_schema(),
@@ -760,16 +1142,14 @@ pub fn tool_registry() -> Vec<ToolSpec> {
                 &["path", "newname"],
             ),
         ),
-        tool_spec(
+        canonical_tool(
             "file_delete",
             "Delete a project file.",
-            true,
             schema(json!({"path": string_schema()}), &["path"]),
         ),
-        tool_spec(
+        canonical_tool(
             "file_move",
             "Move a project file to another folder.",
-            true,
             schema(
                 json!({
                     "path": string_schema(),
@@ -778,22 +1158,19 @@ pub fn tool_registry() -> Vec<ToolSpec> {
                 &["path"],
             ),
         ),
-        tool_spec(
+        canonical_tool(
             "mkdir",
             "Create a project folder.",
-            true,
             schema(json!({"path": string_schema()}), &["path"]),
         ),
-        tool_spec(
+        canonical_tool(
             "set_main",
             "Set the main project file.",
-            true,
             schema(json!({"path": string_schema()}), &["path"]),
         ),
-        tool_spec(
+        canonical_tool(
             "settings_set",
             "Write an agent setting.",
-            true,
             schema(
                 json!({
                     "scope": settings_scopes_schema(),
@@ -803,10 +1180,9 @@ pub fn tool_registry() -> Vec<ToolSpec> {
                 &["scope", "key", "value"],
             ),
         ),
-        tool_spec(
+        canonical_tool(
             "plugin_add",
             "Add a plugin entry.",
-            true,
             schema(
                 json!({
                     "index": integer_schema(),
@@ -815,10 +1191,9 @@ pub fn tool_registry() -> Vec<ToolSpec> {
                 &[],
             ),
         ),
-        tool_spec(
+        canonical_tool(
             "plugin_edit",
             "Edit a plugin entry.",
-            true,
             schema(
                 json!({
                     "index": integer_schema(),
@@ -827,16 +1202,14 @@ pub fn tool_registry() -> Vec<ToolSpec> {
                 &["index"],
             ),
         ),
-        tool_spec(
+        canonical_tool(
             "plugin_remove",
             "Remove a plugin entry.",
-            true,
             schema(json!({"index": integer_schema()}), &["index"]),
         ),
-        tool_spec(
+        canonical_tool(
             "plugin_move",
             "Move a plugin entry.",
-            true,
             schema(
                 json!({
                     "from": integer_schema(),
@@ -845,61 +1218,26 @@ pub fn tool_registry() -> Vec<ToolSpec> {
                 &["from", "to"],
             ),
         ),
-        tool_spec(
+        project_operation_tool(
             BUILD_RUN_TOOL,
-            "Generate deterministic native build artifacts, run configured euddraft, require a fresh output map, and return structured diagnostics.",
-            true,
+            "Generate deterministic native build artifacts, run configured euddraft, require a fresh output map, and return structured diagnostics: errors and warnings with file/line/message, a bounded outputExcerpt, and logPath of the complete log.",
             empty_schema(),
         ),
-        tool_spec(
-            TRACE_TEST_RUN_TOOL,
-            "Build and run one isolated epScript runtime test after a successful build_run. The owned 32-bit client is created suspended; a bounded x86 helper validates StarCraft.exe and neutralizes only its foreground/focus/cursor user32 calls before resume. The minimized off-screen client then receives LAN/UDP CreateGame and Alt+O through background window messages, with no global input or focus fallback. The source project/map remain unchanged.",
-            false,
+        read_tool(
+            BUILD_LOG_READ_TOOL,
+            "Read the complete stdout/stderr log of this project's last build_run (build/euddraft/build.log) by 1-based line range (default 200, at most 400 lines per call), or only the lines containing `query` (case-insensitive, at most 200 matches). Use it when the build_run outputExcerpt is not enough; continue from nextLine.",
             schema(
                 json!({
-                    "name": {"type": "string", "minLength": 1, "maxLength": 512},
-                    "code": {"type": "string", "minLength": 1, "maxLength": 131072},
-                    "symbols": {
-                        "type": "array",
-                        "maxItems": 256,
-                        "items": {
-                            "type": "object",
-                            "additionalProperties": false,
-                            "properties": {
-                                "eventId": {"type": "integer", "minimum": 0, "maximum": 4294967295_u64},
-                                "name": {"type": "string", "minLength": 1, "maxLength": 128},
-                                "source": {"type": "string", "maxLength": 512},
-                                "line": {"type": "integer", "minimum": 1, "maximum": 4294967295_u64}
-                            },
-                            "required": ["eventId", "name"]
-                        }
-                    },
-                    "timeoutMs": {"type": "integer", "minimum": 1000, "maximum": 120000}
-                }),
-                &["name", "code"],
-            ),
-        ),
-        tool_spec(
-            TRACE_SUITE_RUN_TOOL,
-            "Discover and run up to 256 source-controlled tests/**/*.tests.eps after a successful build_run. Omit tests for the complete suite or provide exact logical project paths. Every owned 32-bit client is suspended until a bounded x86 helper neutralizes its foreground/focus/cursor user32 calls, then remains minimized and uses only background messages for LAN/UDP CreateGame and Alt+O. Results are diagnostic and the source project/map remain unchanged.",
-            false,
-            schema(
-                json!({
-                    "tests": {
-                        "type": "array",
-                        "minItems": 1,
-                        "maxItems": 256,
-                        "items": {"type": "string", "minLength": 1, "maxLength": 512}
-                    },
-                    "timeoutMs": {"type": "integer", "minimum": 1000, "maximum": 120000}
+                    "startLine": integer_schema(),
+                    "endLine": integer_schema(),
+                    "query": string_schema(),
                 }),
                 &[],
             ),
         ),
-        tool_spec(
+        canonical_tool(
             "location_write",
             "Write map location data.",
-            true,
             schema(
                 json!({
                     "action": enum_string_schema(&["add", "set", "rename", "delete"]),
@@ -915,10 +1253,9 @@ pub fn tool_registry() -> Vec<ToolSpec> {
                 &["action"],
             ),
         ),
-        tool_spec(
+        canonical_tool(
             "player_setup",
             "Write player start or controller data.",
-            true,
             schema(
                 json!({
                     "action": enum_string_schema(&[
@@ -941,10 +1278,9 @@ pub fn tool_registry() -> Vec<ToolSpec> {
                 &["action", "player"],
             ),
         ),
-        tool_spec(
+        canonical_tool(
             SWITCH_WRITE_TOOL,
             "Rename one connected-map switch in place without changing numeric trigger references.",
-            true,
             schema(
                 json!({
                     "action": enum_string_schema(&["rename"]),
@@ -954,11 +1290,98 @@ pub fn tool_registry() -> Vec<ToolSpec> {
                 &["action", "switchId", "name"],
             ),
         ),
-        tool_spec(
+        read_tool(
             "propose_plan",
-            "Propose a plan for approval only when the user explicitly requested a plan.",
-            false,
+            "Propose a plan for approval only when the user explicitly requested a plan in this turn; staged requests plan through their own stage.",
             schema(json!({"markdown": string_schema()}), &["markdown"]),
+        ),
+        read_tool(
+            MAP_TASK_REQUEST_TOOL,
+            "Hand terrain, unit, building, doodad, sprite, or location placement to this session's team Map Agent session, which drafts a candidate revision the user reviews and applies in the Map window; this session has no placement tools of its own. Call map_info first (required evidence). The goal is a short request, written as the user would type it in the Map window: the user's own wording and intent in the user's language, one area or feature per task, plus only the constraints the code depends on (keep-clear cells, location ids, walkability); the Map Agent chooses the medium, palette entries, counts, and layout itself, so never write tile ids, group numbers, doodad ids, or steps. Put the area in target (tile rectangles the Map Agent may change, exactly like a region the user selects; with a target or protect the verifier refuses any change outside the scope and on any layer not in layers) instead of describing bounds in the goal, and protect (rectangles cut out of the target, or out of the whole map without one; not combinable with selectionIds) for cells that must stay unchanged; terrain blends through an ISOM transition ring up to 8 tiles wide and 4 tall, so make a terrain target that much larger than the painted area. layers lists every layer the look may need; narrow it only when the user or the code requires it. selectionIds are persistent target selections from [resolved mentions]; locationIds are exact location ids as context. A follow-up that changes the result of an earlier task (\"왼쪽 위를 더 채워줘\", \"나무를 줄여줘\") sets revisesTaskId to that task: its team session continues with its conversation, on its candidate while it is candidate_ready, so the goal states only the change; any other request omits it and starts a fresh team session from the saved map, superseding a ready candidate. The call waits up to 240 seconds: candidate_ready returns the revision summary, running means the Map Agent is still working; on candidate_ready inspect the candidate (map_task_diff, map_task_objects, map_task_render) and then map_task_apply it, map_task_discard it, or send a revising map_task_request; on running end the turn and continue when the next message reports the task. The app opens the Map window on the team session itself, so never ask the user to open it and never require an open window to call this tool. Until the task is applied nothing exists in the source map, so do not build code that references objects it creates. While a task is queued, running, or candidate_ready, location_write, switch_write, player_setup, and map sound tools are refused.",
+            schema(
+                json!({
+                    "goal": {"type": "string", "minLength": 1, "maxLength": 1500},
+                    "layers": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 6,
+                        "items": {"type": "string", "enum": ["terrain", "units", "buildings", "doodads", "sprites", "locations"]}
+                    },
+                    "target": team_rects_schema(),
+                    "protect": team_rects_schema(),
+                    "revisesTaskId": {"type": "string", "minLength": 1, "maxLength": 128},
+                    "selectionIds": {
+                        "type": "array",
+                        "maxItems": 8,
+                        "items": {"type": "string", "minLength": 1, "maxLength": 128}
+                    },
+                    "locationIds": {
+                        "type": "array",
+                        "maxItems": 16,
+                        "items": {"type": "integer", "minimum": 0, "maximum": 254}
+                    }
+                }),
+                &["goal", "layers"],
+            ),
+        ),
+        read_tool(
+            MAP_TASK_STATUS_TOOL,
+            "Read one team map task's current durable status ({taskId, status: queued|running|candidate_ready|applied|discarded|failed|cancelled|interrupted|superseded, candidate?, applied, appliedBy?}). Use it after map_task_request returned running; do not poll repeatedly within one turn.",
+            schema(
+                json!({ "taskId": {"type": "string", "minLength": 1, "maxLength": 128} }),
+                &["taskId"],
+            ),
+        ),
+        read_tool(
+            MAP_TASK_DIFF_TOOL,
+            "Read a candidate_ready team task's candidate: its revision, per-layer diff counts against the saved source map, and the verification report. This is candidate inspection evidence for map_task_apply.",
+            schema(
+                json!({ "taskId": {"type": "string", "minLength": 1, "maxLength": 128} }),
+                &["taskId"],
+            ),
+        ),
+        read_tool(
+            MAP_TASK_OBJECTS_TOOL,
+            "Read one object layer (units, buildings, doodads, sprites, or locations) of a candidate_ready team task's candidate map, paged, with each object's position and identity. Use it to check exactly what the Map Agent placed before applying; this is candidate inspection evidence for map_task_apply.",
+            schema(
+                json!({
+                    "taskId": {"type": "string", "minLength": 1, "maxLength": 128},
+                    "layer": enum_string_schema(&["units", "buildings", "doodads", "sprites", "locations"]),
+                    "offset": integer_schema(),
+                    "limit": integer_schema(),
+                }),
+                &["taskId", "layer"],
+            ),
+        ),
+        read_tool(
+            MAP_TASK_RENDER_TOOL,
+            "Render a bounded tile crop (x, y, width, height in tiles) of a candidate_ready team task's candidate map with actual terrain and object assets, as an image. Use it to see the placement before applying; this is candidate inspection evidence for map_task_apply.",
+            schema(
+                json!({
+                    "taskId": {"type": "string", "minLength": 1, "maxLength": 128},
+                    "x": integer_schema(), "y": integer_schema(),
+                    "width": integer_schema(), "height": integer_schema(),
+                    "scale": render_scale_schema(),
+                    "layers": {"type": "array", "items": string_schema()},
+                }),
+                &["taskId", "x", "y", "width", "height"],
+            ),
+        ),
+        canonical_tool(
+            MAP_TASK_APPLY_TOOL,
+            "Apply a candidate_ready team task's candidate to the source map. Allowed only after this request inspected that task's candidate with map_task_diff, map_task_objects, or map_task_render and you judged it to meet the goal; the apply runs the same backup, verification, and rollback as the Map window's Apply, and the user can undo it from the Map window. After it succeeds, re-read map_info before referencing what was placed.",
+            schema(
+                json!({ "taskId": {"type": "string", "minLength": 1, "maxLength": 128} }),
+                &["taskId"],
+            ),
+        ),
+        read_tool(
+            MAP_TASK_DISCARD_TOOL,
+            "Discard a candidate_ready team task's candidate: the source map stays unchanged and the team session returns to the saved map. Use it when the goal is no longer wanted; a corrected map_task_request also drops the candidate on its own.",
+            schema(
+                json!({ "taskId": {"type": "string", "minLength": 1, "maxLength": 128} }),
+                &["taskId"],
+            ),
         ),
     ]
 }
@@ -1162,6 +1585,12 @@ fn map_operation_schema() -> Value {
             &["tiles"],
             &["x", "y"],
         ),
+        map_operation_leaf(
+            &["terrain.isom_rect"],
+            json!({"width": u16_schema(), "height": u16_schema(), "brush": u16_schema()}),
+            &["width", "height", "brush"],
+            &["x", "y"],
+        ),
     ]}]});
 
     let target_identity = json!({
@@ -1293,6 +1722,314 @@ fn map_operations_schema() -> Value {
     })
 }
 
+/// One documented `map_draft_patch` operation family: its discriminator
+/// values and the exact top-level keys the closed leaf schema admits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MapOperationShape {
+    pub ops: Vec<String>,
+    pub fields: Vec<MapOperationField>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MapOperationField {
+    pub name: String,
+    pub required: bool,
+    /// Advertised JSON type plus integer bounds when the schema declares them.
+    pub kind: Option<String>,
+    pub minimum: Option<i64>,
+    pub maximum: Option<i64>,
+    /// Required and optional keys of a closed nested object such as `state`.
+    pub nested: Option<(Vec<String>, Vec<String>)>,
+}
+
+impl MapOperationField {
+    /// Describe a value that cannot satisfy this field's advertised type or
+    /// integer bounds; `None` when the value is acceptable at this level.
+    fn mismatch(&self, value: &Value) -> Option<String> {
+        let kind = self.kind.as_deref()?;
+        let actual = match value {
+            Value::Null => "null",
+            Value::Bool(_) => "boolean",
+            Value::Number(_) => "number",
+            Value::String(_) => "string",
+            Value::Array(_) => "array",
+            Value::Object(_) => "object",
+        };
+        let expected = match (kind, self.minimum, self.maximum) {
+            ("integer", Some(minimum), Some(maximum)) => {
+                format!("integer {minimum}..={maximum}")
+            }
+            ("integer", Some(minimum), None) => format!("integer >= {minimum}"),
+            _ => kind.to_string(),
+        };
+        let acceptable = match kind {
+            "integer" => value.as_i64().is_some_and(|integer| {
+                self.minimum.is_none_or(|minimum| integer >= minimum)
+                    && self.maximum.is_none_or(|maximum| integer <= maximum)
+            }),
+            "string" => value.is_string(),
+            "boolean" => value.is_boolean(),
+            "array" => value.is_array(),
+            "object" => value.is_object(),
+            _ => true,
+        };
+        if acceptable {
+            return None;
+        }
+        Some(format!(
+            "{} expects {expected}, got {actual} {}",
+            self.name,
+            bounded_schema_value(value)
+        ))
+    }
+}
+
+impl MapOperationShape {
+    fn required_names(&self) -> Vec<&str> {
+        self.fields
+            .iter()
+            .filter(|field| field.required)
+            .map(|field| field.name.as_str())
+            .collect()
+    }
+
+    fn allowed_names(&self) -> Vec<&str> {
+        self.fields
+            .iter()
+            .map(|field| field.name.as_str())
+            .collect()
+    }
+
+    fn describe_fields(&self) -> String {
+        self.fields
+            .iter()
+            .map(|field| {
+                let mut text = field.name.clone();
+                if let Some((required, optional)) = &field.nested {
+                    text.push('{');
+                    text.push_str(&required.join(", "));
+                    if !optional.is_empty() {
+                        if !required.is_empty() {
+                            text.push(' ');
+                        }
+                        text.push_str(&format!("[{}]", optional.join(", ")));
+                    }
+                    text.push('}');
+                }
+                if field.required {
+                    text
+                } else {
+                    format!("[{text}]")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    fn describe(&self) -> String {
+        format!("{}: {}", self.ops.join(" | "), self.describe_fields())
+    }
+}
+
+fn schema_string_list(value: &Value) -> Vec<String> {
+    value
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_string)
+        .collect()
+}
+
+fn resolve_schema_ref<'a>(root: &'a Value, schema: &'a Value) -> &'a Value {
+    schema
+        .get("$ref")
+        .and_then(Value::as_str)
+        .and_then(|reference| reference.strip_prefix("#/$defs/"))
+        .and_then(|name| root.get("$defs").and_then(|defs| defs.get(name)))
+        .unwrap_or(schema)
+}
+
+fn nested_object_shape(root: &Value, schema: &Value) -> Option<(Vec<String>, Vec<String>)> {
+    let schema = resolve_schema_ref(root, schema);
+    let properties = schema.get("properties")?.as_object()?;
+    let required = schema_string_list(&schema["required"]);
+    let optional = properties
+        .keys()
+        .filter(|name| !required.contains(name))
+        .cloned()
+        .collect();
+    Some((required, optional))
+}
+
+/// Enumerate every documented operation family from the advertised
+/// `map_draft_patch` schema so prompts and usage errors never drift from it.
+pub(crate) fn map_operation_shapes() -> Vec<MapOperationShape> {
+    fn collect(
+        root: &Value,
+        schema: &Value,
+        inherited_required: &[String],
+        shapes: &mut Vec<MapOperationShape>,
+    ) {
+        if let Some(parts) = schema["allOf"].as_array() {
+            let mut required = inherited_required.to_vec();
+            let mut composition = None;
+            for part in parts {
+                if part["oneOf"].is_array() || part["allOf"].is_array() {
+                    composition = Some(part);
+                } else {
+                    required.extend(schema_string_list(&part["required"]));
+                }
+            }
+            if let Some(composition) = composition {
+                collect(root, composition, &required, shapes);
+            }
+            return;
+        }
+        if let Some(alternatives) = schema["oneOf"].as_array() {
+            for alternative in alternatives {
+                collect(root, alternative, inherited_required, shapes);
+            }
+            return;
+        }
+        let Some(properties) = schema["properties"].as_object() else {
+            return;
+        };
+        let ops = properties
+            .get("op")
+            .map(|op| match op.get("const") {
+                Some(Value::String(name)) => vec![name.clone()],
+                _ => schema_string_list(&op["enum"]),
+            })
+            .unwrap_or_default();
+        if ops.is_empty() {
+            return;
+        }
+        let required = inherited_required
+            .iter()
+            .cloned()
+            .chain(schema_string_list(&schema["required"]))
+            .filter(|name| name != "op")
+            .collect::<Vec<_>>();
+        let mut order = required.clone();
+        for name in schema_string_list(&schema["propertyNames"]["enum"]) {
+            if name != "op" && !order.contains(&name) {
+                order.push(name);
+            }
+        }
+        let fields = order
+            .into_iter()
+            .map(|name| {
+                let property = properties
+                    .get(&name)
+                    .map(|property| resolve_schema_ref(root, property));
+                MapOperationField {
+                    required: required.contains(&name),
+                    kind: property
+                        .and_then(|property| property.get("type"))
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                    minimum: property
+                        .and_then(|property| property.get("minimum"))
+                        .and_then(Value::as_i64),
+                    maximum: property
+                        .and_then(|property| property.get("maximum"))
+                        .and_then(Value::as_i64),
+                    nested: property.and_then(|property| nested_object_shape(root, property)),
+                    name,
+                }
+            })
+            .collect();
+        shapes.push(MapOperationShape { ops, fields });
+    }
+
+    let root = map_draft_patch_schema();
+    let mut shapes = Vec::new();
+    collect(
+        &root,
+        &root["properties"]["operations"]["items"],
+        &[],
+        &mut shapes,
+    );
+    shapes
+}
+
+/// Model-facing list of every `map_draft_patch` operation and its exact keys.
+/// Optional keys are bracketed; `state{...}` lists the nested object keys.
+pub fn map_draft_patch_operations_guide() -> String {
+    map_operation_shapes()
+        .iter()
+        .map(|shape| format!("- {}", shape.describe()))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Explain why one `operations[index]` value matches no documented operation:
+/// the unknown `op`, or the missing/unexpected keys for the named `op`.
+fn map_operation_shape_hint(instance: &Value, index: usize) -> Option<String> {
+    let shapes = map_operation_shapes();
+    let object = instance.as_object()?;
+    let all_ops = shapes
+        .iter()
+        .flat_map(|shape| shape.ops.iter().map(String::as_str))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let Some(op) = object.get("op").and_then(Value::as_str) else {
+        return Some(format!(
+            "operations[{index}] must declare a string 'op'; documented ops: {all_ops}"
+        ));
+    };
+    let Some(shape) = shapes
+        .iter()
+        .find(|shape| shape.ops.iter().any(|name| name == op))
+    else {
+        return Some(format!(
+            "operations[{index}].op '{op}' is not a documented op; documented ops: {all_ops}"
+        ));
+    };
+    let allowed = shape.allowed_names();
+    let missing = shape
+        .required_names()
+        .into_iter()
+        .filter(|name| !object.contains_key(*name))
+        .collect::<Vec<_>>();
+    let unexpected = object
+        .keys()
+        .filter(|key| key.as_str() != "op" && !allowed.contains(&key.as_str()))
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    let mut hint = format!(
+        "operations[{index}] with op '{op}' takes exactly {{op, {}}}",
+        shape.describe_fields()
+    );
+    if !missing.is_empty() {
+        hint.push_str(&format!(
+            "; missing required key(s): {}",
+            missing.join(", ")
+        ));
+    }
+    if !unexpected.is_empty() {
+        hint.push_str(&format!("; unexpected key(s): {}", unexpected.join(", ")));
+    }
+    if missing.is_empty() && unexpected.is_empty() {
+        let mismatches = shape
+            .fields
+            .iter()
+            .filter_map(|field| {
+                object
+                    .get(&field.name)
+                    .and_then(|value| field.mismatch(value))
+            })
+            .collect::<Vec<_>>();
+        if mismatches.is_empty() {
+            hint.push_str("; check each nested value's type and range");
+        } else {
+            hint.push_str(&format!("; invalid value(s): {}", mismatches.join(", ")));
+        }
+    }
+    Some(hint)
+}
+
 fn map_draft_patch_schema() -> Value {
     let mut doodad = doodad_state_schema();
     let mut sprite = sprite_state_schema();
@@ -1366,6 +2103,21 @@ fn map_stamp_destinations_schema() -> Value {
     })
 }
 
+/// Maximum tiles one `map_terrain_read`/`map_draft_terrain_read` call returns.
+pub const MAP_TERRAIN_READ_MAX_TILES: usize = 4096;
+
+fn map_terrain_read_schema() -> Value {
+    schema(
+        json!({
+            "x": u16_schema(),
+            "y": u16_schema(),
+            "width": positive_u16_schema(),
+            "height": positive_u16_schema(),
+        }),
+        &["x", "y", "width", "height"],
+    )
+}
+
 fn map_stamp_source_schema() -> Value {
     json!({
         "oneOf": [
@@ -1389,22 +2141,19 @@ fn map_stamp_source_schema() -> Value {
 
 pub fn map_tool_registry() -> Vec<ToolSpec> {
     vec![
-        tool_spec(
+        read_tool(
             "map_status",
             "Read the saved source and visible candidate revision.",
-            false,
             empty_schema(),
         ),
-        tool_spec(
+        read_tool(
             "map_selection_read",
             "Read exact canonical row spans, role, and layer capabilities for one saved selection.",
-            false,
             schema(json!({"selectionId": string_schema()}), &["selectionId"]),
         ),
-        tool_spec(
+        read_tool(
             "map_objects_read",
             "Read structured candidate objects and locations; object identity is revision-bound.",
-            false,
             schema(
                 json!({
                     "layer": enum_string_schema(&["units", "buildings", "doodads", "sprites", "locations"]),
@@ -1414,10 +2163,9 @@ pub fn map_tool_registry() -> Vec<ToolSpec> {
                 &["layer"],
             ),
         ),
-        tool_spec(
+        read_tool(
             "map_render",
             "Render a bounded candidate crop using actual terrain and GRP assets.",
-            false,
             schema(
                 json!({
                     "x": integer_schema(), "y": integer_schema(),
@@ -1428,40 +2176,39 @@ pub fn map_tool_registry() -> Vec<ToolSpec> {
                 &["x", "y", "width", "height"],
             ),
         ),
-        tool_spec(
+        read_tool(
+            "map_terrain_read",
+            "Read exact MTXM tile ids of the visible candidate in one bounded rectangle: row-major rows of ids whose top-left is (x, y); at most 4096 tiles per call. Read ids here before terrain.set or when replicating an existing pattern; never probe tile ids with terrain.set expected-before values.",
+            map_terrain_read_schema(),
+        ),
+        read_tool(
             "map_palette_query",
             "Search one bounded current-tileset catalog family. kind must be brushes, tiles, units, buildings, doodads, or sprites; semanticTerrain palette mentions use brushes and exactTile mentions use tiles. Results are complete up to 256 matches; refine query/filter when broader. Never enumerate exact-tile pages.",
-            false,
             map_palette_query_schema(),
         ),
-        tool_spec(
+        read_tool(
             "map_tile_info",
             "Read exact CV5/VF4 metadata for one current-tileset tile.",
-            false,
             schema(json!({"tileId": integer_schema()}), &["tileId"]),
         ),
-        tool_spec(
+        read_tool(
             "map_analyze",
             "Analyze the visible candidate and its verification state.",
-            false,
             empty_schema(),
         ),
-        tool_spec(
+        read_tool(
             "map_candidate_diff",
             "Read the visible revision's layer diff and validation report.",
-            false,
             empty_schema(),
         ),
-        tool_spec(
+        read_tool(
             "map_draft_begin",
             "Create the request-owned draft from the visible candidate.",
-            false,
             empty_schema(),
         ),
-        tool_spec(
+        read_tool(
             "map_stamp_preview",
             "Inspect an exact current-candidate or current-request imported stamp at one or more top-left destinations. Reports object/location collisions without mutating the draft.",
-            false,
             schema(
                 json!({
                     "source": map_stamp_source_schema(),
@@ -1470,10 +2217,9 @@ pub fn map_tool_registry() -> Vec<ToolSpec> {
                 &["source", "destinations"],
             ),
         ),
-        tool_spec(
+        read_tool(
             "map_stamp_place",
             "Place an exact current-candidate or current-request imported stamp on the request draft. Never substitutes semantic ISOM. Preview first and ask the user before choosing merge or replace when collisions exist.",
-            false,
             schema(
                 json!({
                     "source": map_stamp_source_schema(),
@@ -1483,16 +2229,14 @@ pub fn map_tool_registry() -> Vec<ToolSpec> {
                 &["source", "destinations", "collisionPolicy"],
             ),
         ),
-        tool_spec(
+        read_tool(
             "map_draft_patch",
-            "Apply one strict all-or-nothing operation batch to the request draft only.",
-            false,
+            "Apply one strict all-or-nothing operation batch to the request draft only. Each operation is a flat object discriminated by op with exactly the keys listed under [draft patch operations] in the system prompt, e.g. {\"op\":\"terrain.set\",\"x\":0,\"y\":0,\"before\":<current tile id>,\"after\":<tile id>} or {\"op\":\"terrain.rect\",\"x\":0,\"y\":0,\"width\":1,\"height\":1,\"after\":<tile id>}.",
             map_draft_patch_schema(),
         ),
-        tool_spec(
+        read_tool(
             "map_image_place",
             "Convert one current-request imageRef into a server-generated TerrainBlit on the request draft.",
-            false,
             schema(
                 json!({
                     "imageRef": string_schema(),
@@ -1504,10 +2248,9 @@ pub fn map_tool_registry() -> Vec<ToolSpec> {
                 &["imageRef", "x", "y", "width", "height"],
             ),
         ),
-        tool_spec(
+        read_tool(
             "map_draft_render",
             "Render the request draft with actual map assets.",
-            false,
             schema(
                 json!({
                     "x": integer_schema(), "y": integer_schema(),
@@ -1518,28 +2261,29 @@ pub fn map_tool_registry() -> Vec<ToolSpec> {
                 &["x", "y", "width", "height"],
             ),
         ),
-        tool_spec(
+        read_tool(
+            "map_draft_terrain_read",
+            "Read exact MTXM tile ids of the request draft (after map_draft_begin and any map_draft_patch) in one bounded rectangle: row-major rows, at most 4096 tiles per call.",
+            map_terrain_read_schema(),
+        ),
+        read_tool(
             "map_draft_analyze",
             "Verify draft masks, protections, layers, CHK semantics, and MPQ assets.",
-            false,
             empty_schema(),
         ),
-        tool_spec(
+        read_tool(
             "map_draft_reset",
             "Reset only this request's draft to its parent candidate.",
-            false,
             empty_schema(),
         ),
-        tool_spec(
+        read_tool(
             "map_candidate_finalize",
             "Finalize at most one verified visible revision for this request.",
-            false,
             empty_schema(),
         ),
-        tool_spec(
+        read_tool(
             ASK_TOOL,
             "Pause this map turn for materially ambiguous owner, count, state, or authority input.",
-            false,
             schema(json!({"questions": ask_questions_schema()}), &["questions"]),
         ),
     ]
@@ -1607,34 +2351,74 @@ pub fn validate_map_tool_call(tool_name: &str, args: &Value) -> ToolResult<()> {
                 "tool '{tool_name}' is not available to Map Agent; original Apply is intentionally absent"
             ),
         })?;
+    match schema_violation_message(spec.name, &spec.input_schema, args) {
+        Ok(None) => Ok(()),
+        Ok(Some(message)) => Err(ToolError::AdmissionRejected { message }),
+        Err(error) => Err(ToolError::AdmissionRejected {
+            message: format!("tool schema for {} is invalid: {error}", spec.name),
+        }),
+    }
+}
+
+/// Build the model-facing usage message for arguments that violate a tool's
+/// advertised input schema. `Ok(None)` means the arguments are valid; `Err`
+/// means the schema itself failed to compile.
+pub(crate) fn schema_violation_message(
+    tool_name: &str,
+    schema: &Value,
+    args: &Value,
+) -> Result<Option<String>, String> {
     let validator = jsonschema::JSONSchema::options()
         .with_draft(jsonschema::Draft::Draft7)
-        .compile(&spec.input_schema)
-        .map_err(|error| ToolError::AdmissionRejected {
-            message: format!("tool schema for {} is invalid: {error}", spec.name),
-        })?;
-    if let Err(errors) = validator.validate(args) {
-        let mut errors = errors.take(3).collect::<Vec<_>>();
-        errors.sort_by_key(|error| {
-            !matches!(
-                &error.kind,
-                jsonschema::error::ValidationErrorKind::Enum { .. }
-            )
-        });
-        let details = errors
-            .iter()
-            .map(map_validation_error_detail)
-            .collect::<Vec<_>>()
-            .join("; ");
-        return Err(ToolError::AdmissionRejected {
-            message: format!(
+        .compile(schema)
+        .map_err(|error| error.to_string())?;
+    let violation = match validator.validate(args) {
+        Ok(()) => None,
+        Err(errors) => {
+            let mut errors = errors.take(3).collect::<Vec<_>>();
+            errors.sort_by_key(|error| {
+                !matches!(
+                    &error.kind,
+                    jsonschema::error::ValidationErrorKind::Enum { .. }
+                )
+            });
+            let mut details = errors
+                .iter()
+                .map(map_validation_error_detail)
+                .collect::<Vec<_>>();
+            if let Some(hint) = errors
+                .iter()
+                .find_map(|error| map_operation_violation_hint(schema, args, error))
+            {
+                details.push(hint);
+            }
+            let details = details.join("; ");
+            Some(format!(
                 "Usage: {}({}). arguments do not match the documented input schema: {details}",
-                spec.name,
-                required_args(&spec).join(", ")
-            ),
-        });
-    }
-    Ok(())
+                tool_name,
+                required_arg_names(schema).join(", ")
+            ))
+        }
+    };
+    Ok(violation)
+}
+
+/// For a `map_draft_patch`-shaped schema, name the exact documented keys of the
+/// operation the model attempted so it can correct the call on the next round.
+fn map_operation_violation_hint(
+    schema: &Value,
+    args: &Value,
+    error: &jsonschema::ValidationError<'_>,
+) -> Option<String> {
+    schema["properties"]["operations"]["items"]["allOf"].as_array()?;
+    let instance_path = error.instance_path.to_string();
+    let rest = instance_path.strip_prefix("/operations/")?;
+    let index = rest
+        .split('/')
+        .next()
+        .and_then(|segment| segment.parse::<usize>().ok())?;
+    let operation = args.get("operations")?.get(index)?;
+    map_operation_shape_hint(operation, index)
 }
 
 /// Return MCP tool descriptors using each registry tool's verbatim inputSchema.
@@ -1642,39 +2426,21 @@ pub fn mcp_tool_descriptors() -> Vec<Value> {
     descriptors(tool_registry())
 }
 
-/// Whether a registered tool can mutate project-owned state.
-pub fn is_mutating_tool(tool_name: &str) -> bool {
+/// Look up the registered effects for one tool.
+pub fn tool_spec(tool_name: &str) -> Option<ToolSpec> {
     tool_registry()
         .into_iter()
         .find(|spec| spec.name == tool_name)
-        .is_some_and(|spec| spec.mutating)
 }
 
-/// Return whether a tool is exempt from the EUD-090 evidence gate.
-pub fn is_evidence_gate_exempt(tool_name: &str) -> bool {
-    tool_name == BUILD_RUN_TOOL
+/// Whether a registered tool requires the canonical write workspace.
+pub fn requires_write_workspace(tool_name: &str) -> bool {
+    tool_spec(tool_name).is_some_and(|spec| spec.requires_write_workspace)
 }
 
-/// Check whether a tool call passes the EUD-090 evidence gate.
-///
-/// Mutating tools are blocked on RAG-wired layers until `search_docs` has run
-/// once in the request. A search with zero hits still lifts the gate.
-pub fn check_evidence_gate(
-    state: &RequestState,
-    tool: &ToolSpec,
-    rag_wired: bool,
-) -> ToolResult<()> {
-    if tool.mutating && !is_evidence_gate_exempt(tool.name) && rag_wired && !state.docs_searched {
-        return Err(ToolError::EvidenceRequired {
-            message: "evidence gate: no search_docs has run in this request. Ground the change \
-first by calling search_docs with a Korean query, cite each work item's reason with its source \
-link, then retry this call. A search with zero hits still lifts the gate; mark such items as \
-근거 없음 instead of fabricating a source."
-                .to_string(),
-        });
-    }
-
-    Ok(())
+/// Whether a registered tool requires serialized project transaction authority.
+pub fn requires_project_transaction(tool_name: &str) -> bool {
+    tool_spec(tool_name).is_some_and(|spec| spec.requires_project_transaction)
 }
 
 /// Admit one tool call through argument, evidence, and budget gates.
@@ -1687,48 +2453,31 @@ pub fn admit_tool_call(state: &mut RequestState, tool: &str, args: &Value) -> To
     validate_tool_args(&spec, args)?;
 
     if spec.name == SEARCH_DOCS_TOOL {
-        if state.search_docs_count >= MAX_SEARCH_DOCS_CALLS {
+        if let Some(ids) = state.repeated_search_ids(args) {
+            let ids = ids
+                .iter()
+                .map(|id| format!("{id:016x}"))
+                .collect::<Vec<_>>()
+                .join(", ");
             return admission_error(&format!(
-                "search_docs budget exhausted: this request is limited to \
-{MAX_SEARCH_DOCS_CALLS} documentation searches. Wrap up with the current findings instead of \
-continuing to search."
+                "search_docs no-progress: the normalized query and filters already returned the same stable ids [{ids}]. Change the query or inspect an existing id with docs_get."
             ));
         }
-    } else if spec.name == PYTHON_DEPENDENCIES_PREPARE_TOOL
-        && state.python_dependency_prepare_count >= MAX_PYTHON_DEPENDENCY_PREPARATIONS
-    {
-        return admission_error(&format!(
-            "python_dependencies_prepare budget exhausted: this request is limited to {MAX_PYTHON_DEPENDENCY_PREPARATIONS} preparations."
-        ));
-    } else if state.action_count >= MAX_TOOL_ACTIONS
-        && spec.name != PYTHON_DEPENDENCIES_PREPARE_TOOL
-    {
-        return admission_error(&format!(
-            "action budget exhausted: this request is limited to {MAX_TOOL_ACTIONS} non-search \
-tool calls. Wrap up with the current findings instead of continuing to call tools."
-        ));
-    }
-
-    check_evidence_gate(state, &spec, true)?;
-
-    if spec.name == BUILD_RUN_TOOL && state.build_fix_attempts >= 3 {
-        return admission_error(
-            "build_run budget exhausted: this request is limited to 3 build self-fix attempts. \
-Summarize the remaining build issue instead of running build again.",
-        );
     }
 
     validate_first_principles(&spec, args)?;
-
-    if spec.name == SEARCH_DOCS_TOOL {
-        state.search_docs_count += 1;
-    } else if spec.name == PYTHON_DEPENDENCIES_PREPARE_TOOL {
-        state.python_dependency_prepare_count += 1;
+    if spec.requires_write_workspace {
+        state.write_action_count = state.write_action_count.saturating_add(1);
     } else {
-        state.action_count += 1;
+        state.read_action_count = state.read_action_count.saturating_add(1);
     }
-    if spec.name == BUILD_RUN_TOOL {
-        state.build_fix_attempts += 1;
+
+    if !matches!(
+        spec.name,
+        SEARCH_DOCS_TOOL | PYTHON_DEPENDENCIES_PREPARE_TOOL
+    ) {
+        state.action_count = state.action_count.saturating_add(1);
+        state.iteration_action_count = state.iteration_action_count.saturating_add(1);
     }
 
     Ok(())
@@ -1791,14 +2540,11 @@ fn validate_tool_args(spec: &ToolSpec, args: &Value) -> ToolResult<()> {
 }
 
 fn validate_tool_arg_semantics(spec: &ToolSpec, args: &Map<String, Value>) -> ToolResult<()> {
-    match spec.name {
-        "file_edit" => {
-            let edits = args
-                .get("edits")
-                .expect("generic schema validation guarantees file_edit.edits");
-            validate_nonempty_old_texts(spec, "edits", edits)?;
-        }
-        _ => {}
+    if spec.name == "file_edit" || spec.name == FS_EDIT_TOOL {
+        let edits = args
+            .get("edits")
+            .expect("generic schema validation guarantees exact-edit tools carry edits");
+        validate_nonempty_old_texts(spec, "edits", edits)?;
     }
     Ok(())
 }
@@ -1824,7 +2570,11 @@ fn validate_nonempty_old_texts(spec: &ToolSpec, name: &str, edits: &Value) -> To
 }
 
 fn required_args(spec: &ToolSpec) -> Vec<&str> {
-    spec.input_schema
+    required_arg_names(&spec.input_schema)
+}
+
+fn required_arg_names(schema: &Value) -> Vec<&str> {
+    schema
         .get("required")
         .and_then(Value::as_array)
         .into_iter()
@@ -2318,14 +3068,7 @@ pub fn encode_locedit_ops(op: &LocWrite, name_bytes: &[u8]) -> Vec<u8> {
 }
 
 pub fn encode_location_name(name: &str, chk: &[u8]) -> Vec<u8> {
-    if name.is_ascii() {
-        return name.as_bytes().to_vec();
-    }
-    if chk.windows(4).any(|window| window == b"STRx") {
-        return name.as_bytes().to_vec();
-    }
-
-    EUC_KR.encode(name).0.into_owned()
+    crate::chk::encode_chk_text(name, chk.windows(4).any(|window| window == b"STRx"))
 }
 
 /// Parsed `player_setup` operation. Players are 1-based P1..P8 until encoded.
@@ -3929,63 +4672,41 @@ mod tests {
         chk
     }
 
-    fn write_tool(name: &'static str) -> ToolSpec {
-        ToolSpec::mutating(name)
-    }
-
-    fn assert_evidence_required(result: ToolResult<()>) {
-        match result {
-            Err(ToolError::EvidenceRequired { message }) => {
-                assert!(
-                    message.contains(SEARCH_DOCS_TOOL),
-                    "EvidenceRequired must direct the model to call search_docs first"
-                );
-            }
-            other => panic!("expected EvidenceRequired, got {other:?}"),
+    fn native_build_result(
+        ok: bool,
+        errors: Vec<crate::native_build::NativeBuildError>,
+    ) -> crate::native_build::NativeBuildResult {
+        crate::native_build::NativeBuildResult {
+            ok,
+            errors,
+            warnings: Vec::new(),
+            raw_status: u32::from(!ok),
+            stdout: String::new(),
+            stderr: String::new(),
+            log_path: "build/euddraft/build.log".to_string(),
+            artifacts: crate::native_build::NativeBuildArtifacts {
+                build_dir: "build".to_string(),
+                wireframe_editor: None,
+                requirement_file: None,
+                eds_path: "build/main.eds".to_string(),
+                output_map: "build/output.scx".to_string(),
+                data_editor: None,
+                extra_data_editor: None,
+                custom_tbl: None,
+                python_path_bootstrap: None,
+            },
         }
     }
 
-    #[test]
-    fn evidence_gate_blocks_mutating_rag_wired_call_before_search() {
-        let state = RequestState::new();
-        let result = check_evidence_gate(&state, &write_tool("btn_set"), true);
-
-        assert_evidence_required(result);
-    }
-
-    #[test]
-    fn evidence_gate_allows_same_mutating_call_after_search_even_with_zero_hits() {
-        let mut state = RequestState::new();
-        state.record_search_docs();
-
-        assert!(
-            state.docs_searched,
-            "search_docs must lift the evidence gate"
-        );
-        assert_eq!(
-            check_evidence_gate(&state, &write_tool("btn_set"), true),
-            Ok(())
-        );
-    }
-
-    #[test]
-    fn evidence_gate_never_blocks_build_run() {
-        let state = RequestState::new();
-
-        assert_eq!(
-            check_evidence_gate(&state, &write_tool(BUILD_RUN_TOOL), true),
-            Ok(())
-        );
-    }
-
-    #[test]
-    fn evidence_gate_degrades_open_when_rag_is_not_wired() {
-        let state = RequestState::new();
-
-        assert_eq!(
-            check_evidence_gate(&state, &write_tool("btn_set"), false),
-            Ok(())
-        );
+    fn native_build_error(raw: &str) -> crate::native_build::NativeBuildError {
+        crate::native_build::NativeBuildError {
+            source: "eudplib".to_string(),
+            file: "main.eps".to_string(),
+            line: 7,
+            message: "undefined symbol".to_string(),
+            raw: raw.to_string(),
+            count: 1,
+        }
     }
 
     #[test]
@@ -4795,24 +5516,32 @@ mod tests {
                 width: 64,
                 height: 128,
                 tileset: "jungle".to_string(),
+                title: String::new(),
+                description: String::new(),
             },
             players: vec![
                 crate::chk::Player {
                     player: "P1".to_string(),
                     controller: "Occupied by Human".to_string(),
+                    controller_id: 2,
                     race: "Terran".to_string(),
+                    race_id: 1,
                     force: Some(1),
                 },
                 crate::chk::Player {
                     player: "P2".to_string(),
                     controller: "Computer".to_string(),
+                    controller_id: 5,
                     race: "Protoss".to_string(),
+                    race_id: 2,
                     force: Some(1),
                 },
                 crate::chk::Player {
                     player: "P3".to_string(),
                     controller: "Inactive".to_string(),
+                    controller_id: 0,
                     race: "Zerg".to_string(),
+                    race_id: 0,
                     force: Some(2),
                 },
             ],
@@ -4915,6 +5644,21 @@ mod tests {
     }
 
     fn expected_registry_contract() -> Vec<(&'static str, bool, serde_json::Value)> {
+        let expected_team_rects = serde_json::json!({
+            "type": "array",
+            "maxItems": 8,
+            "items": {
+                "type": "object",
+                "properties": {
+                    "x": {"type": "integer", "minimum": 0, "maximum": 255},
+                    "y": {"type": "integer", "minimum": 0, "maximum": 255},
+                    "width": {"type": "integer", "minimum": 1, "maximum": 256},
+                    "height": {"type": "integer", "minimum": 1, "maximum": 256}
+                },
+                "required": ["x", "y", "width", "height"],
+                "additionalProperties": false
+            }
+        });
         vec![
             ("project_status", false, schema(serde_json::json!({}), &[])),
             ("list_files", false, schema(serde_json::json!({}), &[])),
@@ -4942,6 +5686,69 @@ mod tests {
                         "limit": integer_schema(),
                     }),
                     &["query"],
+                ),
+            ),
+            (
+                FS_READ_TOOL,
+                false,
+                schema(
+                    serde_json::json!({
+                        "path": string_schema(),
+                        "startLine": integer_schema(),
+                        "endLine": integer_schema(),
+                    }),
+                    &["path"],
+                ),
+            ),
+            (
+                FS_GLOB_TOOL,
+                false,
+                schema(
+                    serde_json::json!({
+                        "pattern": string_schema(),
+                        "offset": integer_schema(),
+                        "limit": integer_schema(),
+                        "includeGenerated": boolean_schema(),
+                    }),
+                    &["pattern"],
+                ),
+            ),
+            (
+                FS_GREP_TOOL,
+                false,
+                schema(
+                    serde_json::json!({
+                        "pattern": string_schema(),
+                        "glob": string_schema(),
+                        "caseSensitive": boolean_schema(),
+                        "contextLines": integer_schema(),
+                        "offset": integer_schema(),
+                        "limit": integer_schema(),
+                        "includeGenerated": boolean_schema(),
+                    }),
+                    &["pattern"],
+                ),
+            ),
+            (
+                FS_WRITE_TOOL,
+                false,
+                schema(
+                    serde_json::json!({
+                        "path": string_schema(),
+                        "content": string_schema(),
+                    }),
+                    &["path", "content"],
+                ),
+            ),
+            (
+                FS_EDIT_TOOL,
+                false,
+                schema(
+                    serde_json::json!({
+                        "path": string_schema(),
+                        "edits": exact_text_edits_schema(),
+                    }),
+                    &["path", "edits"],
                 ),
             ),
             (
@@ -5029,6 +5836,21 @@ mod tests {
                 ),
             ),
             (
+                ISCRIPT_INFO_TOOL,
+                false,
+                schema(
+                    serde_json::json!({
+                        "ids": {
+                            "type": "array",
+                            "minItems": 1,
+                            "maxItems": ISCRIPT_INFO_MAX_IDS,
+                            "items": integer_schema(),
+                        },
+                    }),
+                    &["ids"],
+                ),
+            ),
+            (
                 "settings_get",
                 false,
                 schema(
@@ -5104,11 +5926,6 @@ mod tests {
                     serde_json::json!({"questions": ask_questions_schema()}),
                     &["questions"],
                 ),
-            ),
-            (
-                REQUEST_WRITE_WORKSPACE_TOOL,
-                false,
-                schema(serde_json::json!({"reason": string_schema()}), &["reason"]),
             ),
             (
                 PYTHON_DEPENDENCIES_SET_TOOL,
@@ -5247,46 +6064,15 @@ mod tests {
                     &["from", "to"],
                 ),
             ),
-            ("build_run", true, schema(serde_json::json!({}), &[])),
+            ("build_run", false, schema(serde_json::json!({}), &[])),
             (
-                "trace_test_run",
+                BUILD_LOG_READ_TOOL,
                 false,
                 schema(
                     serde_json::json!({
-                        "name": {"type": "string", "minLength": 1, "maxLength": 512},
-                        "code": {"type": "string", "minLength": 1, "maxLength": 131072},
-                        "symbols": {
-                            "type": "array",
-                            "maxItems": 256,
-                            "items": {
-                                "type": "object",
-                                "additionalProperties": false,
-                                "properties": {
-                                    "eventId": {"type": "integer", "minimum": 0, "maximum": 4294967295_u64},
-                                    "name": {"type": "string", "minLength": 1, "maxLength": 128},
-                                    "source": {"type": "string", "maxLength": 512},
-                                    "line": {"type": "integer", "minimum": 1, "maximum": 4294967295_u64}
-                                },
-                                "required": ["eventId", "name"]
-                            }
-                        },
-                        "timeoutMs": {"type": "integer", "minimum": 1000, "maximum": 120000}
-                    }),
-                    &["name", "code"],
-                ),
-            ),
-            (
-                "trace_suite_run",
-                false,
-                schema(
-                    serde_json::json!({
-                        "tests": {
-                            "type": "array",
-                            "minItems": 1,
-                            "maxItems": 256,
-                            "items": {"type": "string", "minLength": 1, "maxLength": 512}
-                        },
-                        "timeoutMs": {"type": "integer", "minimum": 1000, "maximum": 120000}
+                        "startLine": integer_schema(),
+                        "endLine": integer_schema(),
+                        "query": string_schema(),
                     }),
                     &[],
                 ),
@@ -5377,6 +6163,94 @@ mod tests {
                     &["markdown"],
                 ),
             ),
+            (
+                MAP_TASK_REQUEST_TOOL,
+                false,
+                schema(
+                    serde_json::json!({
+                        "goal": {"type": "string", "minLength": 1, "maxLength": 1500},
+                        "layers": {
+                            "type": "array",
+                            "minItems": 1,
+                            "maxItems": 6,
+                            "items": {"type": "string", "enum": ["terrain", "units", "buildings", "doodads", "sprites", "locations"]}
+                        },
+                        "target": expected_team_rects,
+                        "protect": expected_team_rects,
+                        "revisesTaskId": {"type": "string", "minLength": 1, "maxLength": 128},
+                        "selectionIds": {
+                            "type": "array",
+                            "maxItems": 8,
+                            "items": {"type": "string", "minLength": 1, "maxLength": 128}
+                        },
+                        "locationIds": {
+                            "type": "array",
+                            "maxItems": 16,
+                            "items": {"type": "integer", "minimum": 0, "maximum": 254}
+                        }
+                    }),
+                    &["goal", "layers"],
+                ),
+            ),
+            (
+                MAP_TASK_STATUS_TOOL,
+                false,
+                schema(
+                    serde_json::json!({ "taskId": {"type": "string", "minLength": 1, "maxLength": 128} }),
+                    &["taskId"],
+                ),
+            ),
+            (
+                MAP_TASK_DIFF_TOOL,
+                false,
+                schema(
+                    serde_json::json!({ "taskId": {"type": "string", "minLength": 1, "maxLength": 128} }),
+                    &["taskId"],
+                ),
+            ),
+            (
+                MAP_TASK_OBJECTS_TOOL,
+                false,
+                schema(
+                    serde_json::json!({
+                        "taskId": {"type": "string", "minLength": 1, "maxLength": 128},
+                        "layer": {"type": "string", "enum": ["units", "buildings", "doodads", "sprites", "locations"]},
+                        "offset": {"type": "integer"},
+                        "limit": {"type": "integer"},
+                    }),
+                    &["taskId", "layer"],
+                ),
+            ),
+            (
+                MAP_TASK_RENDER_TOOL,
+                false,
+                schema(
+                    serde_json::json!({
+                        "taskId": {"type": "string", "minLength": 1, "maxLength": 128},
+                        "x": {"type": "integer"}, "y": {"type": "integer"},
+                        "width": {"type": "integer"}, "height": {"type": "integer"},
+                        "scale": render_scale_schema(),
+                        "layers": {"type": "array", "items": {"type": "string"}},
+                    }),
+                    &["taskId", "x", "y", "width", "height"],
+                ),
+            ),
+            (
+                MAP_TASK_APPLY_TOOL,
+                true,
+                schema(
+                    serde_json::json!({ "taskId": {"type": "string", "minLength": 1, "maxLength": 128} }),
+                    &["taskId"],
+                ),
+            ),
+            (
+                MAP_TASK_DISCARD_TOOL,
+                false,
+                schema(
+                    serde_json::json!({ "taskId": {"type": "string", "minLength": 1, "maxLength": 128} }),
+                    &["taskId"],
+                ),
+            ),
         ]
     }
 
@@ -5391,13 +6265,16 @@ mod tests {
             "registry must expose exactly the EUD-124 target tools"
         );
 
-        for (name, mutating, input_schema) in expected {
+        for (name, requires_write_workspace, input_schema) in expected {
             let spec = registry
                 .iter()
                 .find(|spec| spec.name == name)
                 .unwrap_or_else(|| panic!("missing tool {name}"));
 
-            assert_eq!(spec.mutating, mutating, "{name} mutating flag mismatch");
+            assert_eq!(
+                spec.requires_write_workspace, requires_write_workspace,
+                "{name} write-workspace effect mismatch"
+            );
             assert!(
                 !spec.description.trim().is_empty() && !spec.description.contains('\n'),
                 "{name} must have a one-line description"
@@ -5421,12 +6298,30 @@ mod tests {
     }
 
     #[test]
+    fn build_is_a_read_workspace_project_operation() {
+        let build = tool_spec(BUILD_RUN_TOOL).expect("build_run registry entry");
+        assert!(!build.requires_write_workspace);
+        assert!(build.requires_project_transaction);
+
+        let read = tool_spec("read_file").expect("read_file registry entry");
+        assert!(!read.requires_write_workspace);
+        assert!(!read.requires_project_transaction);
+
+        let write = tool_spec("file_write").expect("file_write registry entry");
+        assert!(write.requires_write_workspace);
+        assert!(write.requires_project_transaction);
+    }
+
+    #[test]
     fn map_info_is_registered_read_only_and_invalid_mode_rejects_before_counting() {
         let spec = tool_registry()
             .into_iter()
             .find(|spec| spec.name == MAP_INFO_TOOL)
             .expect("map_info must be registered");
-        assert!(!spec.mutating, "map_info must be read-only");
+        assert!(
+            !spec.requires_write_workspace && !spec.requires_project_transaction,
+            "map_info must be read-only"
+        );
 
         let mut state = RequestState::for_request("req-map-info");
         let error = admit_tool_call(
@@ -5450,7 +6345,8 @@ mod tests {
             .iter()
             .find(|spec| spec.name == PYTHON_DEPENDENCIES_PREPARE_TOOL)
             .expect("python dependency preparation must be registered");
-        assert!(!prepare.mutating);
+        assert!(!prepare.requires_write_workspace);
+        assert!(!prepare.requires_project_transaction);
         assert_eq!(prepare.input_schema["additionalProperties"], json!(false));
         assert_eq!(
             prepare.input_schema["properties"]["dependencies"]["maxItems"],
@@ -5461,28 +6357,24 @@ mod tests {
             .iter()
             .find(|spec| spec.name == PYTHON_DEPENDENCIES_SET_TOOL)
             .expect("python dependency commit must be registered");
-        assert!(set.mutating);
+        assert!(set.requires_write_workspace);
+        assert!(set.requires_project_transaction);
         assert_eq!(set.input_schema["additionalProperties"], json!(false));
         assert_eq!(set.input_schema["required"], json!(["candidateToken"]));
 
         let mut prepare_state = RequestState::for_request("req-python-prepare");
-        prepare_state.action_count = MAX_TOOL_ACTIONS;
-        admit_tool_call(
-            &mut prepare_state,
-            PYTHON_DEPENDENCIES_PREPARE_TOOL,
-            &json!({"dependencies": ["eudplib==0.80.6"]}),
-        )
-        .unwrap();
-        assert_eq!(prepare_state.action_count, MAX_TOOL_ACTIONS);
-        assert_eq!(prepare_state.python_dependency_prepare_count, 1);
-        assert!(!prepare_state.docs_searched);
-        admit_tool_call(
-            &mut prepare_state,
-            PYTHON_DEPENDENCIES_PREPARE_TOOL,
-            &json!({"dependencies": []}),
-        )
-        .unwrap();
-        assert_eq!(prepare_state.python_dependency_prepare_count, 2);
+        for index in 0..5 {
+            admit_tool_call(
+                &mut prepare_state,
+                PYTHON_DEPENDENCIES_PREPARE_TOOL,
+                &json!({"dependencies": [format!("package-{index}==1.0")]}),
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            prepare_state.action_count, 0,
+            "dependency preparation is request-local analysis, not a project action"
+        );
 
         for invalid in [
             json!({"dependencies": ["eudplib==0.80.6"], "extra": true}),
@@ -5490,34 +6382,12 @@ mod tests {
         ] {
             let mut state = RequestState::for_request("req-invalid-python-prepare");
             assert!(
-                admit_tool_call(&mut state, PYTHON_DEPENDENCIES_PREPARE_TOOL, &invalid,).is_err()
+                admit_tool_call(&mut state, PYTHON_DEPENDENCIES_PREPARE_TOOL, &invalid).is_err()
             );
             assert_eq!(state.action_count, 0);
         }
 
-        let mut bounded = RequestState::for_request("req-python-prepare-budget");
-        for _ in 0..MAX_PYTHON_DEPENDENCY_PREPARATIONS {
-            admit_tool_call(
-                &mut bounded,
-                PYTHON_DEPENDENCIES_PREPARE_TOOL,
-                &json!({"dependencies": []}),
-            )
-            .unwrap();
-        }
-        assert!(admit_tool_call(
-            &mut bounded,
-            PYTHON_DEPENDENCIES_PREPARE_TOOL,
-            &json!({"dependencies": []}),
-        )
-        .is_err());
-
         let mut set_state = RequestState::for_request("req-python-set");
-        assert_evidence_required(admit_tool_call(
-            &mut set_state,
-            PYTHON_DEPENDENCIES_SET_TOOL,
-            &json!({"candidateToken": "opaque"}),
-        ));
-        set_state.record_search_docs();
         admit_tool_call(
             &mut set_state,
             PYTHON_DEPENDENCIES_SET_TOOL,
@@ -5593,6 +6463,31 @@ mod tests {
             &serde_json::json!({"dat": "units", "param": "HitPoints", "objId": 0}),
         )
         .is_err());
+    }
+
+    #[test]
+    fn fs_tools_are_pure_io_with_no_write_admission() {
+        for name in crate::tools::FS_TOOLS {
+            let spec = tool_spec(name).unwrap_or_else(|| panic!("missing tool {name}"));
+            assert!(
+                !spec.requires_write_workspace && !spec.requires_project_transaction,
+                "{name} must not carry journal or write-registration effects"
+            );
+        }
+    }
+
+    #[test]
+    fn fs_edit_rejects_an_empty_old_text_before_it_runs() {
+        let error = admit_tool_call(
+            &mut RequestState::for_request("request"),
+            FS_EDIT_TOOL,
+            &serde_json::json!({
+                "path": "src/main.eps",
+                "edits": [{"old_text": "", "new_text": "x"}],
+            }),
+        )
+        .expect_err("an empty old_text matches everywhere and must be refused");
+        assert!(error.to_string().contains("old_text"), "{error}");
     }
 
     #[test]
@@ -6127,6 +7022,11 @@ mod tests {
                 &["op", "x", "y", "tiles"],
             ),
             (
+                "terrain.isom_rect",
+                &["op", "x", "y", "width", "height", "brush"],
+                &["op", "x", "y", "width", "height", "brush"],
+            ),
+            (
                 "terrain.isom_brush",
                 &["op", "isomX", "isomY", "brush", "extent"],
                 &["op", "isomX", "isomY", "brush"],
@@ -6237,6 +7137,11 @@ mod tests {
             ("terrain.rect", "after"),
             ("terrain.blit", "x"),
             ("terrain.blit", "y"),
+            ("terrain.isom_rect", "x"),
+            ("terrain.isom_rect", "y"),
+            ("terrain.isom_rect", "width"),
+            ("terrain.isom_rect", "height"),
+            ("terrain.isom_rect", "brush"),
             ("terrain.isom_brush", "isomX"),
             ("terrain.isom_brush", "isomY"),
             ("terrain.isom_brush", "brush"),
@@ -6536,6 +7441,36 @@ mod tests {
     }
 
     #[test]
+    fn map_task_request_schema_takes_scope_rectangles_and_a_revised_task() {
+        let schema = tool_registry()
+            .into_iter()
+            .find(|tool| tool.name == MAP_TASK_REQUEST_TOOL)
+            .expect("map_task_request must be registered")
+            .input_schema;
+        let validator = jsonschema::JSONSchema::options()
+            .with_draft(jsonschema::Draft::Draft7)
+            .compile(&schema)
+            .expect("map_task_request schema must compile as Draft 7");
+        let rect = json!({"x": 57, "y": 17, "width": 38, "height": 30});
+        assert!(validator.is_valid(&json!({
+            "goal": "초보자용 사냥터로 꾸며줘",
+            "layers": ["terrain", "doodads"],
+            "target": [rect],
+            "protect": [{"x": 60, "y": 30, "width": 4, "height": 4}],
+            "revisesTaskId": "task-1",
+        })));
+        let mut extra = rect.clone();
+        extra["depth"] = json!(1);
+        for invalid in [
+            json!({"goal": "x", "layers": ["terrain"], "target": [extra]}),
+            json!({"goal": "x", "layers": ["terrain"], "target": [{"x": 0, "y": 0, "width": 0, "height": 1}]}),
+            json!({"goal": "x".repeat(1501), "layers": ["terrain"]}),
+        ] {
+            assert!(!validator.is_valid(&invalid), "{invalid}");
+        }
+    }
+
+    #[test]
     fn map_draft_patch_schema_stays_within_codex_normalized_budget() {
         let schema = map_tool_registry()
             .into_iter()
@@ -6545,12 +7480,14 @@ mod tests {
         let normalized_bytes = serde_json::to_vec(&codex_normalized_map_schema(&schema))
             .expect("normalized Map schema must serialize")
             .len();
+        // terrain.isom_rect (the tile-rectangle semantic brush) added ~190 B on top of the
+        // original 5 000 B guard; the guard only bounds growth, no adapter enforces it.
         assert!(
-            normalized_bytes <= 5_000,
+            normalized_bytes <= 5_500,
             "Map schema exceeds the Codex normalized budget: {normalized_bytes}B"
         );
         let operations = materialized_map_operations(&schema);
-        assert_eq!(operations.len(), 20);
+        assert_eq!(operations.len(), 21);
         let validator = jsonschema::JSONSchema::options()
             .with_draft(jsonschema::Draft::Draft7)
             .compile(&schema)
@@ -6628,6 +7565,269 @@ mod tests {
     }
 
     #[test]
+    fn map_terrain_read_tools_are_read_only_and_require_a_bounded_rectangle() {
+        let registry = map_tool_registry();
+        for name in ["map_terrain_read", "map_draft_terrain_read"] {
+            let tool = registry
+                .iter()
+                .find(|tool| tool.name == name)
+                .unwrap_or_else(|| panic!("{name} must be registered"));
+            assert!(!tool.requires_write_workspace);
+            assert!(!tool.requires_project_transaction);
+            assert_object_contract(
+                &tool.input_schema,
+                &["x", "y", "width", "height"],
+                &["x", "y", "width", "height"],
+            );
+            assert!(tool.description.contains("4096"));
+
+            let rect = json!({"x": 0, "y": 0, "width": 8, "height": 8});
+            assert_eq!(validate_map_tool_call(name, &rect), Ok(()));
+            for missing in ["x", "y", "width", "height"] {
+                let mut args = rect.clone();
+                args.as_object_mut().unwrap().remove(missing);
+                assert!(
+                    matches!(
+                        validate_map_tool_call(name, &args),
+                        Err(ToolError::AdmissionRejected { .. })
+                    ),
+                    "{name} must require {missing}"
+                );
+            }
+            for (field, value) in [
+                ("x", json!(-1)),
+                ("y", json!(-1)),
+                ("width", json!(0)),
+                ("height", json!(-4)),
+                ("width", json!("8")),
+                ("x", json!(1.5)),
+            ] {
+                let mut args = rect.clone();
+                args[field] = value.clone();
+                assert!(
+                    matches!(
+                        validate_map_tool_call(name, &args),
+                        Err(ToolError::AdmissionRejected { .. })
+                    ),
+                    "{name} must reject {field}={value}"
+                );
+            }
+            let mut extra = rect.clone();
+            extra["scale"] = json!(4);
+            assert!(matches!(
+                validate_map_tool_call(name, &extra),
+                Err(ToolError::AdmissionRejected { .. })
+            ));
+        }
+        assert!(
+            map_mcp_tool_descriptors()
+                .iter()
+                .filter(|descriptor| {
+                    matches!(
+                        descriptor["name"].as_str(),
+                        Some("map_terrain_read" | "map_draft_terrain_read")
+                    )
+                })
+                .count()
+                == 2
+        );
+    }
+
+    #[test]
+    fn map_draft_patch_operations_guide_mirrors_every_documented_operation() {
+        let schema = map_tool_registry()
+            .into_iter()
+            .find(|tool| tool.name == "map_draft_patch")
+            .expect("map_draft_patch must be registered")
+            .input_schema;
+        let documented_ops = materialized_map_operations(&schema)
+            .iter()
+            .map(|operation| {
+                operation["properties"]["op"]["const"]
+                    .as_str()
+                    .expect("materialized operations pin one op")
+                    .to_string()
+            })
+            .collect::<BTreeSet<_>>();
+        let shapes = map_operation_shapes();
+        let guided_ops = shapes
+            .iter()
+            .flat_map(|shape| shape.ops.iter().cloned())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(guided_ops, documented_ops);
+        assert_eq!(guided_ops.len(), 21);
+
+        let guide = map_draft_patch_operations_guide();
+        for line in [
+            "- terrain.set: x, y, before, after",
+            "- terrain.rect: x, y, width, height, after",
+            "- terrain.blit: x, y, tiles",
+            "- terrain.isom_rect: x, y, width, height, brush",
+            "- terrain.isom_brush: isomX, isomY, brush, [extent]",
+            "- unit.add: state{typeId, owner, x, y [",
+            "- unit.set: ordinal, beforeFingerprint, state{[",
+            "- unit.delete | sprite.delete: ordinal, beforeFingerprint",
+            "- unit.move | sprite.move: ordinal, beforeFingerprint, x, y",
+            "- doodad.add: state{doodadId, x, y [disabled, owner]}",
+            "- doodad.set: ordinal, beforeFingerprint, state{doodadId, x, y [disabled, owner]}, replacementTiles",
+            "- doodad.delete: ordinal, beforeFingerprint, replacementTiles",
+            "- doodad.move: ordinal, beforeFingerprint, x, y, replacementTiles",
+            "- sprite.add: state{spriteId, x, y [flags, owner]}",
+            "- sprite.set: ordinal, beforeFingerprint, state{spriteId, x, y [flags, owner]}",
+            "- location.add | location.set: state{locationId, left, top, right, bottom [elevationFlags, nameBytesHex]}",
+            "- location.rename: locationId, nameBytesHex",
+            "- location.delete: locationId",
+        ] {
+            assert!(guide.contains(line), "guide is missing {line:?}:\n{guide}");
+        }
+        for shape in &shapes {
+            for field in &shape.fields {
+                let example = required_map_schema_example(
+                    materialized_map_operations(&schema)
+                        .iter()
+                        .find(|operation| {
+                            operation["properties"]["op"]["const"].as_str() == Some(&shape.ops[0])
+                        })
+                        .expect("every guided op is materialized"),
+                );
+                assert_eq!(
+                    example.get(&field.name).is_some(),
+                    field.required,
+                    "{}.{} required flag must match the schema",
+                    shape.ops[0],
+                    field.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn map_draft_patch_usage_error_names_the_documented_keys_of_the_attempted_op() {
+        let invented_key = validate_map_tool_call(
+            "map_draft_patch",
+            &json!({"operations": [{"op": "terrain.set", "tileId": 128, "x": 20, "y": 248}]}),
+        )
+        .expect_err("terrain.set without before/after must be rejected");
+        let ToolError::AdmissionRejected { message } = &invented_key else {
+            panic!("expected an admission rejection, got {invented_key:?}");
+        };
+        assert!(
+            message.starts_with("Usage: map_draft_patch(operations)."),
+            "{message}"
+        );
+        assert!(
+            message.contains(
+                "operations[0] with op 'terrain.set' takes exactly {op, x, y, before, after}"
+            ),
+            "{message}"
+        );
+        assert!(
+            message.contains("missing required key(s): before, after"),
+            "{message}"
+        );
+        assert!(message.contains("unexpected key(s): tileId"), "{message}");
+
+        let unknown_op = validate_map_tool_call(
+            "map_draft_patch",
+            &json!({"operations": [
+                {"op": "terrain.rect", "x": 0, "y": 0, "width": 1, "height": 1, "after": 1},
+                {"op": "terrain.paint", "x": 0, "y": 0},
+            ]}),
+        )
+        .expect_err("an undocumented op must be rejected");
+        let ToolError::AdmissionRejected { message } = &unknown_op else {
+            panic!("expected an admission rejection, got {unknown_op:?}");
+        };
+        assert!(
+            message.contains("operations[1].op 'terrain.paint' is not a documented op"),
+            "{message}"
+        );
+        assert!(
+            message.contains("documented ops: terrain.set, terrain.rect"),
+            "{message}"
+        );
+
+        let missing_op = validate_map_tool_call(
+            "map_draft_patch",
+            &json!({"operations": [{"x": 0, "y": 0, "before": 0, "after": 1}]}),
+        )
+        .expect_err("an operation without op must be rejected");
+        let ToolError::AdmissionRejected { message } = &missing_op else {
+            panic!("expected an admission rejection, got {missing_op:?}");
+        };
+        assert!(
+            message.contains("operations[0] must declare a string 'op'"),
+            "{message}"
+        );
+
+        let bad_value = validate_map_tool_call(
+            "map_draft_patch",
+            &json!({"operations": [{"op": "terrain.set", "x": 0, "y": 0, "before": -1, "after": 1}]}),
+        )
+        .expect_err("an out-of-range value must be rejected");
+        let ToolError::AdmissionRejected { message } = &bad_value else {
+            panic!("expected an admission rejection, got {bad_value:?}");
+        };
+        assert!(
+            message.contains("invalid value(s): before expects integer 0..=65535, got number -1"),
+            "{message}"
+        );
+
+        assert_eq!(
+            validate_map_tool_call(
+                "map_draft_patch",
+                &json!({"operations": [
+                    {"op": "terrain.isom_brush", "isomX": 7, "isomY": 249, "brush": 2},
+                    {"op": "terrain.rect", "x": 20, "y": 248, "width": 1, "height": 1, "after": 128},
+                ]}),
+            ),
+            Ok(())
+        );
+
+        let named_brush = validate_map_tool_call(
+            "map_draft_patch",
+            &json!({"operations": [
+                {"brush": "Dirt", "isomX": 7, "isomY": 249, "op": "terrain.isom_brush"},
+            ]}),
+        )
+        .expect_err("a brush name instead of its numeric id must be rejected");
+        let ToolError::AdmissionRejected { message } = &named_brush else {
+            panic!("expected an admission rejection, got {named_brush:?}");
+        };
+        assert!(
+            message.contains("operations[0] with op 'terrain.isom_brush' takes exactly {op, isomX, isomY, brush, [extent]}"),
+            "{message}"
+        );
+        assert!(
+            message
+                .contains("invalid value(s): brush expects integer 0..=65535, got string \"Dirt\""),
+            "{message}"
+        );
+
+        let nested_value = validate_map_tool_call(
+            "map_draft_patch",
+            &json!({"operations": [
+                {"op": "unit.add", "state": {"typeId": "marine", "owner": 0, "x": 1, "y": 1}},
+            ]}),
+        )
+        .expect_err("a nested string typeId must be rejected");
+        let ToolError::AdmissionRejected { message } = &nested_value else {
+            panic!("expected an admission rejection, got {nested_value:?}");
+        };
+        assert!(
+            message.contains("check each nested value's type and range"),
+            "{message}"
+        );
+
+        let other_tool = validate_map_tool_call("map_tile_info", &json!({"tileId": "1"}))
+            .expect_err("map_tile_info with a string id must be rejected");
+        let ToolError::AdmissionRejected { message } = &other_tool else {
+            panic!("expected an admission rejection, got {other_tool:?}");
+        };
+        assert!(!message.contains("documented ops"), "{message}");
+    }
+
+    #[test]
     fn map_draft_patch_public_admission_accepts_all_documented_operations() {
         let schema = map_tool_registry()
             .into_iter()
@@ -6638,7 +7838,7 @@ mod tests {
             .iter()
             .map(required_map_schema_example)
             .collect::<Vec<_>>();
-        assert_eq!(operations.len(), 20);
+        assert_eq!(operations.len(), 21);
         for operation in &operations {
             assert_eq!(
                 validate_map_tool_call("map_draft_patch", &json!({"operations": [operation]})),
@@ -6995,6 +8195,22 @@ mod tests {
     }
 
     #[test]
+    fn runtime_trace_harness_is_not_an_advertised_tool() {
+        // The StarCraft trace harness cannot reach gameplay on the hidden
+        // desktop yet, so neither the EPS nor the Map registry offers it.
+        for descriptor in mcp_tool_descriptors()
+            .iter()
+            .chain(map_mcp_tool_descriptors().iter())
+        {
+            let name = descriptor["name"].as_str().unwrap_or_default();
+            assert!(
+                !name.starts_with("trace_"),
+                "{name} must not be advertised to the model"
+            );
+        }
+    }
+
+    #[test]
     fn mcp_advertisement_uses_real_input_schema_names_verbatim() {
         let descriptors = mcp_tool_descriptors();
         let dat_patch = descriptors
@@ -7024,7 +8240,6 @@ mod tests {
     #[test]
     fn admission_allows_repeated_file_writes_and_build_without_plan_approval() {
         let mut state = RequestState::for_request("req-mutate");
-        state.record_search_docs();
 
         for (path, code) in [("a.eps", "1"), ("b.eps", "2"), ("c.eps", "3")] {
             admit_tool_call(
@@ -7035,9 +8250,11 @@ mod tests {
             .unwrap();
         }
         admit_tool_call(&mut state, BUILD_RUN_TOOL, &serde_json::json!({})).unwrap();
+        assert_eq!(state.iteration_action_count, 4);
+        assert_eq!(state.write_action_count, 3);
+        assert_eq!(state.read_action_count, 1);
 
         assert_eq!(state.action_count, 4);
-        assert_eq!(state.build_fix_attempts, 1);
     }
 
     #[test]
@@ -7051,15 +8268,14 @@ mod tests {
         )
         .unwrap();
 
-        assert!(!state.docs_searched);
-        assert_eq!(state.search_docs_count, 1);
+        assert_eq!(state.search_docs_count, 0);
         assert_eq!(state.action_count, 0);
+        assert_eq!(state.read_action_count, 1);
     }
 
     #[test]
     fn plugin_add_accepts_append_sentinel_but_remove_rejects_negative_index() {
         let mut state = RequestState::for_request("req-plugin");
-        state.record_search_docs();
 
         admit_tool_call(
             &mut state,
@@ -7080,84 +8296,149 @@ mod tests {
     }
 
     #[test]
-    fn admission_rejects_301st_action_with_wrapup_message() {
-        let mut state = RequestState::for_request("req-budget");
+    fn action_threshold_requests_an_iteration_boundary_without_refusing_future_work() {
+        let mut state = RequestState::for_request("req-boundary");
 
-        for _ in 0..MAX_TOOL_ACTIONS {
+        for _ in 0..ITERATION_TOOL_ACTION_THRESHOLD {
             admit_tool_call(&mut state, "project_status", &serde_json::json!({})).unwrap();
         }
+        assert!(state.iteration_action_boundary_reached());
+        assert_eq!(state.action_count, ITERATION_TOOL_ACTION_THRESHOLD);
 
-        let error =
-            admit_tool_call(&mut state, "project_status", &serde_json::json!({})).unwrap_err();
-        let message = error.to_string().to_lowercase();
-        assert!(
-            message.contains("300"),
-            "budget error should state the limit"
-        );
-        assert!(
-            message.contains("wrap"),
-            "301st action should tell codex to wrap up"
-        );
-        assert_eq!(
-            state.action_count, MAX_TOOL_ACTIONS,
-            "rejected action must not count"
-        );
-        admit_tool_call(
-            &mut state,
-            SEARCH_DOCS_TOOL,
-            &serde_json::json!({"query": "search budget remains independent"}),
-        )
-        .unwrap();
-        assert_eq!(state.action_count, MAX_TOOL_ACTIONS);
-        assert_eq!(state.search_docs_count, 1);
+        state.begin_iteration();
+        assert!(!state.iteration_action_boundary_reached());
+        admit_tool_call(&mut state, "project_status", &serde_json::json!({})).unwrap();
+        assert_eq!(state.action_count, ITERATION_TOOL_ACTION_THRESHOLD + 1);
+        assert_eq!(state.iteration_action_count, 1);
     }
 
     #[test]
-    fn admission_allows_120_searches_without_spending_general_actions_then_rejects_121st() {
-        let mut state = RequestState::for_request("req-search-budget");
+    fn search_progress_allows_more_than_120_queries_and_rejects_exact_repeats() {
+        let mut state = RequestState::for_request("req-search-progress");
 
-        for _ in 0..MAX_SEARCH_DOCS_CALLS {
+        for index in 0_u64..121 {
+            let args = serde_json::json!({"query": format!("wave growth {index}"), "k": 5});
+            admit_tool_call(&mut state, SEARCH_DOCS_TOOL, &args).unwrap();
+            state.record_search_docs_hits(&args, &[index]);
+        }
+        assert_eq!(state.search_docs_count, 121);
+        assert_eq!(state.search_docs_unique_hits, 121);
+        assert_eq!(state.action_count, 0);
+
+        let repeated = serde_json::json!({"query": "  WAVE   GROWTH 120 ", "k": 5});
+        let error = admit_tool_call(&mut state, SEARCH_DOCS_TOOL, &repeated).unwrap_err();
+        assert!(error.to_string().contains("no-progress"));
+
+        let novel = serde_json::json!({"query": "wave growth next", "k": 5});
+        admit_tool_call(&mut state, SEARCH_DOCS_TOOL, &novel).unwrap();
+    }
+
+    #[test]
+    fn build_admission_allows_ten_iterations() {
+        let mut state = RequestState::for_request("req-build-admission");
+        for _ in 0..10 {
+            admit_tool_call(&mut state, BUILD_RUN_TOOL, &serde_json::json!({})).unwrap();
+        }
+        assert_eq!(state.action_count, 10);
+    }
+    #[test]
+    fn dependency_preparation_admits_more_than_four_distinct_sets() {
+        let mut state = RequestState::for_request("req-dependency-admission");
+        for index in 0..5 {
             admit_tool_call(
                 &mut state,
-                SEARCH_DOCS_TOOL,
-                &serde_json::json!({"query": "wave growth boss"}),
+                PYTHON_DEPENDENCIES_PREPARE_TOOL,
+                &serde_json::json!({
+                    "dependencies": [format!("example-{index}==1.0.0")]
+                }),
             )
             .unwrap();
         }
-
-        let error = admit_tool_call(
-            &mut state,
-            SEARCH_DOCS_TOOL,
-            &serde_json::json!({"query": "one search too many"}),
-        )
-        .unwrap_err();
-        let message = error.to_string().to_lowercase();
-        assert!(message.contains("search_docs"));
-        assert!(message.contains("120"));
-        assert!(message.contains("wrap"));
-        assert_eq!(state.search_docs_count, MAX_SEARCH_DOCS_CALLS);
         assert_eq!(state.action_count, 0);
-        admit_tool_call(&mut state, "project_status", &serde_json::json!({})).unwrap();
-        assert_eq!(state.search_docs_count, MAX_SEARCH_DOCS_CALLS);
-        assert_eq!(state.action_count, 1);
     }
 
     #[test]
-    fn admission_rejects_fourth_build_run_attempt() {
-        let mut state = RequestState::for_request("req-build");
+    fn build_progress_uses_revision_and_stable_diagnostics() {
+        let mut state = RequestState::for_request("req-build-progress");
+        let first = native_build_result(
+            false,
+            vec![native_build_error(
+                "C:\\temp\\one\\main.eps:7 timestamp=100",
+            )],
+        );
+        let noisy_repeat = native_build_result(
+            false,
+            vec![native_build_error("D:\\other\\main.eps:7 timestamp=999")],
+        );
+        assert_eq!(
+            build_diagnostics_fingerprint(&first.errors),
+            build_diagnostics_fingerprint(&noisy_repeat.errors),
+            "raw output paths and timestamps must not affect progress identity"
+        );
 
-        for _ in 0..3 {
-            admit_tool_call(&mut state, BUILD_RUN_TOOL, &serde_json::json!({})).unwrap();
-        }
+        assert!(matches!(
+            state.record_build("revision-a".to_string(), &first),
+            BuildProgressOutcome::Progress(_)
+        ));
+        let repeated = state.record_build("revision-a".to_string(), &noisy_repeat);
+        assert!(matches!(repeated, BuildProgressOutcome::NoProgress { .. }));
+        assert!(state.build_blocked_for_revision("revision-a"));
 
-        let error =
-            admit_tool_call(&mut state, BUILD_RUN_TOOL, &serde_json::json!({})).unwrap_err();
-        let message = error.to_string().to_lowercase();
-        assert!(message.contains("build_run") || message.contains("build"));
-        assert!(message.contains("3"), "build self-fix budget is 3 attempts");
-        assert_eq!(state.build_fix_attempts, 3);
+        assert!(matches!(
+            state.record_build("revision-b".to_string(), &noisy_repeat),
+            BuildProgressOutcome::Progress(_)
+        ));
+        let success = native_build_result(true, Vec::new());
+        assert!(matches!(
+            state.record_build("revision-b".to_string(), &success),
+            BuildProgressOutcome::Progress(BuildProgress { success: true, .. })
+        ));
+        assert!(matches!(
+            state.record_build("revision-b".to_string(), &success),
+            BuildProgressOutcome::Progress(BuildProgress { success: true, .. })
+        ));
+        assert!(!state.build_blocked_for_revision("revision-b"));
     }
 
+    #[test]
+    fn build_progress_accepts_improving_diagnostics() {
+        let mut state = RequestState::for_request("req-build-improving");
+        let mut second_error = native_build_error("raw-second");
+        second_error.line = 12;
+        second_error.message = "second error".to_string();
+        let two_errors =
+            native_build_result(false, vec![native_build_error("raw-first"), second_error]);
+        let one_error = native_build_result(false, vec![native_build_error("raw-first")]);
+
+        assert!(matches!(
+            state.record_build("revision-a".to_string(), &two_errors),
+            BuildProgressOutcome::Progress(_)
+        ));
+        assert!(matches!(
+            state.record_build("revision-a".to_string(), &one_error),
+            BuildProgressOutcome::Progress(BuildProgress { error_count: 1, .. })
+        ));
+        assert!(!state.build_blocked_for_revision("revision-a"));
+    }
+
+    #[test]
+    fn build_progress_detects_short_abab_cycles() {
+        let mut state = RequestState::for_request("req-build-cycle");
+        let failed = native_build_result(false, vec![native_build_error("raw")]);
+        for revision in ["a", "b", "a"] {
+            assert!(matches!(
+                state.record_build(revision.to_string(), &failed),
+                BuildProgressOutcome::Progress(_)
+            ));
+        }
+        let outcome = state.record_build("b".to_string(), &failed);
+        assert!(matches!(
+            outcome,
+            BuildProgressOutcome::NoProgress { ref reason, .. }
+                if reason.contains("A → B → A → B")
+        ));
+        assert!(state.build_blocked_for_revision("b"));
+    }
     #[test]
     fn missing_required_arg_error_carries_self_correcting_usage_line() {
         let mut state = RequestState::for_request("req-args");
@@ -7174,7 +8455,7 @@ mod tests {
     }
 
     #[test]
-    fn fresh_request_id_resets_per_request_evidence_and_budgets() {
+    fn fresh_request_id_resets_per_request_evidence_and_progress() {
         let mut state = RequestState::for_request("req-A");
         admit_tool_call(
             &mut state,
@@ -7182,7 +8463,6 @@ mod tests {
             &serde_json::json!({"query": "request-scoped evidence"}),
         )
         .unwrap();
-        state.record_search_docs();
         admit_tool_call(
             &mut state,
             "file_write",
@@ -7192,29 +8472,28 @@ mod tests {
         admit_tool_call(&mut state, BUILD_RUN_TOOL, &serde_json::json!({})).unwrap();
 
         assert_eq!(state.request_id, "req-A");
-        assert!(state.docs_searched);
-        assert_eq!(state.search_docs_count, 1);
+        assert_eq!(state.search_docs_count, 0);
         assert_eq!(state.action_count, 2);
-        assert_eq!(state.build_fix_attempts, 1);
+        assert_eq!(state.iteration_action_count, 2);
+        assert_eq!(state.read_action_count, 2);
+        assert_eq!(state.write_action_count, 1);
 
         state.start_request("req-B");
 
         assert_eq!(state.request_id, "req-B");
-        assert!(!state.docs_searched, "evidence gate is per-request");
         assert_eq!(state.search_docs_count, 0);
         assert_eq!(state.action_count, 0);
-        assert_eq!(state.build_fix_attempts, 0);
+        assert_eq!(state.iteration_action_count, 0);
+        assert_eq!(state.read_action_count, 0);
+        assert_eq!(state.write_action_count, 0);
 
-        let error = admit_tool_call(
+        admit_tool_call(
             &mut state,
             "file_write",
             &serde_json::json!({"path": "b.eps", "code": "2"}),
         )
-        .unwrap_err();
-        assert!(
-            matches!(error, ToolError::EvidenceRequired { .. }),
-            "new request must require fresh search_docs evidence before writes"
-        );
+        .unwrap();
+        assert_eq!(state.write_action_count, 1);
     }
     #[test]
     fn sound_tools_are_main_eps_only_and_expose_bounded_offline_edits() {
@@ -7223,14 +8502,16 @@ mod tests {
             .iter()
             .find(|spec| spec.name == MAP_SOUND_LIST_TOOL)
             .expect("main EPS registry must expose map_sound_list");
-        assert!(!list.mutating);
+        assert!(!list.requires_write_workspace);
+        assert!(!list.requires_project_transaction);
         assert_eq!(list.input_schema["properties"], json!({}));
 
         let import = registry
             .iter()
             .find(|spec| spec.name == MAP_SOUND_IMPORT_TOOL)
             .expect("main EPS registry must expose map_sound_import");
-        assert!(import.mutating);
+        assert!(import.requires_write_workspace);
+        assert!(import.requires_project_transaction);
         assert_eq!(import.input_schema["required"], json!(["audioRef"]));
         assert_eq!(
             import.input_schema["properties"]
@@ -7246,7 +8527,8 @@ mod tests {
             .iter()
             .find(|spec| spec.name == MAP_SOUND_EDIT_TOOL)
             .expect("main EPS registry must expose map_sound_edit");
-        assert!(edit.mutating);
+        assert!(edit.requires_write_workspace);
+        assert!(edit.requires_project_transaction);
         assert_eq!(edit.input_schema["required"], json!(["mpqPath"]));
         assert_eq!(
             edit.input_schema["properties"]["volumePercent"]["maximum"],

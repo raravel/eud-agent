@@ -9,6 +9,7 @@ import {
   RefreshCw,
   RotateCcw,
   ShieldAlert,
+  SlidersHorizontal,
   X,
 } from "lucide-react";
 
@@ -21,20 +22,12 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import type {
-  CandidateStateView,
-  MapContextSnapshot,
-  MapSourceProbe,
-  MapView,
-} from "./mapProtocol";
+import type { CandidateStateView, MapView } from "./mapProtocol";
 
 export interface MapToolbarProps {
-  context: MapContextSnapshot;
   candidate: CandidateStateView;
-  changedSource: MapSourceProbe | null;
   view: MapView;
   busy: boolean;
-  reloadingSource: boolean;
   imagePlacementActive: boolean;
   liveDraftActive?: boolean;
   onView(view: MapView): void;
@@ -44,7 +37,7 @@ export interface MapToolbarProps {
   onUndo(): void;
   onImagePlace(): void;
   onMapImport(): void;
-  onReloadSource(): void;
+  onProperties(): void;
 }
 
 function savedTime(mtimeNs: string): string {
@@ -60,12 +53,9 @@ function savedTime(mtimeNs: string): string {
 }
 
 export function MapToolbar({
-  context,
   candidate,
-  changedSource,
   view,
   busy,
-  reloadingSource,
   imagePlacementActive,
   liveDraftActive = false,
   onView,
@@ -75,18 +65,10 @@ export function MapToolbar({
   onUndo,
   onImagePlace,
   onMapImport,
-  onReloadSource,
+  onProperties,
 }: MapToolbarProps) {
   const sourceName =
     candidate.baseline.sourcePath.split(/[\\/]/).at(-1) ?? candidate.baseline.sourcePath;
-  const currentSourcePath = changedSource?.sourcePath ?? context.revision.sourcePath;
-  const currentSourceMtime = changedSource?.mtimeNs ?? context.revision.mtimeNs;
-  const currentSourceMatchesContext =
-    changedSource === null ||
-    (changedSource.projectId === context.revision.projectId &&
-      changedSource.sourcePath === context.revision.sourcePath &&
-      changedSource.mtimeNs === context.revision.mtimeNs &&
-      changedSource.fileSize === context.sourceFileSize);
   return (
     <header className="flex min-w-0 flex-wrap items-center gap-3 border-b border-border bg-card/80 px-3 py-2 backdrop-blur">
       <div className="flex min-w-[18rem] flex-1 items-center gap-2">
@@ -100,7 +82,7 @@ export function MapToolbar({
             <Badge variant="outline">{candidate.baseline.width}×{candidate.baseline.height}</Badge>
           </div>
           <div className="flex min-w-0 gap-2 text-[11px] text-muted-foreground">
-            <span className="shrink-0 font-medium text-foreground/80">후보 기준 원본</span>
+            <span className="shrink-0 font-medium text-foreground/80">원본</span>
             <span className="truncate" title={candidate.baseline.sourcePath}>
               {candidate.baseline.sourcePath}
             </span>
@@ -109,20 +91,6 @@ export function MapToolbar({
               SHA {candidate.baseline.fileSha256.slice(0, 10)}
             </code>
           </div>
-          {candidate.stale && (
-            <div className="flex min-w-0 gap-2 text-[11px] text-destructive">
-              <span className="shrink-0 font-medium">현재 OpenMapName</span>
-              <span className="truncate" title={currentSourcePath}>
-                {currentSourcePath}
-              </span>
-              <span className="shrink-0">저장 {savedTime(currentSourceMtime)}</span>
-              {currentSourceMatchesContext && (
-                <code className="shrink-0" title={context.revision.fileSha256}>
-                  SHA {context.revision.fileSha256.slice(0, 10)}
-                </code>
-              )}
-            </div>
-          )}
         </div>
       </div>
 
@@ -179,9 +147,22 @@ export function MapToolbar({
       )}
 
       {candidate.stale ? (
-        <Badge variant="destructive" className="gap-1">
+        <Badge
+          variant="outline"
+          className="gap-1"
+          title="원본 맵이 다시 저장되었습니다. 진행 중인 요청이 끝나면 후보를 저장된 원본 위로 옮깁니다."
+        >
+          <RefreshCw className="size-3.5" aria-hidden="true" />
+          원본 변경 감지 · 요청 후 반영
+        </Badge>
+      ) : candidate.sourceDiverged ? (
+        <Badge
+          variant="destructive"
+          className="gap-1"
+          title="원본 맵이 후보와 같은 자리를 다르게 저장해 후보를 그 위로 옮길 수 없습니다. Apply하면 이 후보가 저장된 원본을 덮어씁니다."
+        >
           <ShieldAlert className="size-3.5" aria-hidden="true" />
-          원본 변경됨 · Apply 차단
+          원본과 갈라짐 · Apply 시 후보가 덮어씀
         </Badge>
       ) : candidate.canApply ? (
         <Badge className="gap-1 bg-emerald-600 text-white">
@@ -196,26 +177,18 @@ export function MapToolbar({
       )}
 
       <div className="ml-auto flex items-center gap-2">
-        {candidate.stale && (
-          <Button
-            type="button"
-            size="sm"
-            className="h-9 gap-1.5"
-            disabled={busy}
-            title="기존 작업은 히스토리에 보존됩니다."
-            onClick={onReloadSource}
-          >
-            {reloadingSource ? (
-              <LoaderCircle
-                className="size-4 animate-spin motion-reduce:animate-none"
-                aria-hidden="true"
-              />
-            ) : (
-              <RefreshCw className="size-4" aria-hidden="true" />
-            )}
-            {reloadingSource ? "새 작업 여는 중…" : "변경된 원본으로 새 작업"}
-          </Button>
-        )}
+        <Button
+          type="button"
+          size="sm"
+          variant="outline"
+          disabled={busy}
+          className="h-9"
+          title="제목·설명·플레이어 슬롯·포스를 원본 맵에 바로 저장"
+          onClick={onProperties}
+        >
+          <SlidersHorizontal className="size-4" aria-hidden="true" />
+          맵 속성
+        </Button>
         <Button
           type="button"
           size="sm"

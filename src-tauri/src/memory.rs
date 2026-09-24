@@ -1004,21 +1004,57 @@ pub(crate) fn write_atomic_bytes(path: &Path, bytes: &[u8]) -> anyhow::Result<()
     }
 
     let tmp = tmp_path(path);
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&tmp)?;
+    let mut file = retry_transient(|| {
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+    })?;
     use std::io::Write;
     if let Err(error) = file.write_all(bytes) {
         let _ = fs::remove_file(&tmp);
         return Err(error.into());
     }
     drop(file);
-    if let Err(err) = fs::rename(&tmp, path) {
+    if let Err(err) = retry_transient(|| fs::rename(&tmp, path)) {
         let _ = fs::remove_file(&tmp);
         return Err(err.into());
     }
     Ok(())
+}
+
+/// Windows refuses an open or a rename while any other process holds the file
+/// open, and an antivirus scanner or a search indexer takes that handle for a
+/// few milliseconds on any file that was just written. The refusal says
+/// nothing about the file being wrong — a moment later the same call succeeds.
+///
+/// Every atomic write in the app goes through here, including the Map
+/// candidate's promotion onto the source map, where a lost race looked like a
+/// failed apply.
+const TRANSIENT_RETRIES: u32 = 7;
+
+/// `ERROR_ACCESS_DENIED`, `ERROR_SHARING_VIOLATION`, `ERROR_LOCK_VIOLATION`.
+/// A real permission problem returns the same code, which is why the retries
+/// are few and short: the last attempt still reports the original error.
+const TRANSIENT_OS_ERRORS: [i32; 3] = [5, 32, 33];
+
+pub(crate) fn retry_transient<T>(mut attempt: impl FnMut() -> io::Result<T>) -> io::Result<T> {
+    let mut backoff = std::time::Duration::from_millis(20);
+    for _ in 0..TRANSIENT_RETRIES {
+        match attempt() {
+            Ok(value) => return Ok(value),
+            Err(error)
+                if error
+                    .raw_os_error()
+                    .is_some_and(|code| TRANSIENT_OS_ERRORS.contains(&code)) =>
+            {
+                std::thread::sleep(backoff);
+                backoff *= 2;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    attempt()
 }
 
 fn tmp_path(path: &Path) -> PathBuf {
@@ -1171,6 +1207,51 @@ mod tests {
             "Switch 12 = boss phase"
         );
         fs::remove_dir_all(base).ok();
+    }
+
+    /// A scanner's handle on a file the app just wrote makes Windows refuse the
+    /// next open, rename or delete for a few milliseconds. That refusal used to
+    /// surface as a failed Map apply.
+    #[test]
+    fn a_windows_sharing_violation_is_waited_out_rather_than_reported() {
+        for code in TRANSIENT_OS_ERRORS {
+            let mut left = 3;
+            let result = retry_transient(|| {
+                if left > 0 {
+                    left -= 1;
+                    return Err(io::Error::from_raw_os_error(code));
+                }
+                Ok(code)
+            });
+            assert_eq!(result.unwrap(), code);
+            assert_eq!(left, 0);
+        }
+    }
+
+    #[test]
+    fn a_refusal_that_never_clears_is_reported_with_its_original_error() {
+        let mut attempts = 0;
+        let error = retry_transient(|| {
+            attempts += 1;
+            Err::<(), _>(io::Error::from_raw_os_error(32))
+        })
+        .unwrap_err();
+
+        assert_eq!(error.raw_os_error(), Some(32));
+        assert_eq!(attempts, TRANSIENT_RETRIES as usize + 1);
+    }
+
+    #[test]
+    fn an_error_that_is_not_contention_is_returned_at_once() {
+        let mut attempts = 0;
+        let error = retry_transient(|| {
+            attempts += 1;
+            Err::<(), _>(io::Error::new(io::ErrorKind::NotFound, "gone"))
+        })
+        .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert_eq!(attempts, 1);
     }
 
     #[test]

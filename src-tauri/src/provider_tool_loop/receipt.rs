@@ -21,6 +21,11 @@ const MAX_NATIVE_ID_BYTES: usize = 4096;
 pub enum NativeRunReceiptState {
     Pending,
     Unknown,
+    /// The run was cancelled or failed after the native session identity was
+    /// observed. The turn itself did not settle, but that session stays
+    /// resumable, so the next run continues from its candidate id instead of
+    /// refusing the conversation.
+    Interrupted,
     Completed,
     Cleared,
 }
@@ -97,6 +102,14 @@ impl RunReceiptStore {
 
     pub(super) fn mark_unknown(&self) -> Result<(), String> {
         self.update_lifecycle(NativeRunReceiptState::Unknown, None)
+    }
+
+    pub(super) fn mark_interrupted(&self, candidate_native_id: &str) -> Result<(), String> {
+        validate_native_id(Some(candidate_native_id))?;
+        self.update_lifecycle(
+            NativeRunReceiptState::Interrupted,
+            Some(candidate_native_id),
+        )
     }
 
     pub(super) fn mark_completed(&self, candidate_native_id: Option<&str>) -> Result<(), String> {

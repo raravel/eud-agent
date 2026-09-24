@@ -17,7 +17,7 @@ use crate::{
 
 use super::fixtures::{EventCollector, RuntimeFixture};
 
-const REDUNDANT_WRITE_SCRIPT: &str = r#"
+const WRITE_TRANSITION_SCRIPT: &str = r#"
 param([string]$Mode = 'write')
 $ErrorActionPreference = 'Stop'
 function Wire($value) { [Console]::Out.WriteLine(($value | ConvertTo-Json -Depth 20 -Compress)) }
@@ -39,42 +39,36 @@ while (($line = [Console]::In.ReadLine()) -ne $null) {
         'thread/start' {
             $endpoint = $message.params.config.mcp_servers.'eud-tools'.url
             Wire @{jsonrpc='2.0'; id=$message.id; result=@{}}
-            Wire @{jsonrpc='2.0'; method='thread/started'; params=@{thread=@{id='redundant-write-thread'}}}
+            Wire @{jsonrpc='2.0'; method='thread/started'; params=@{thread=@{id='write-transition-thread'}}}
         }
         'turn/start' {
-            Wire @{jsonrpc='2.0'; id=$message.id; result=@{turn=@{id='redundant-write-turn'}}}
-            Wire @{jsonrpc='2.0'; method='turn/started'; params=@{threadId='redundant-write-thread'; turn=@{id='redundant-write-turn'; items=@(); status='inProgress'}}}
+            Wire @{jsonrpc='2.0'; id=$message.id; result=@{turn=@{id='write-transition-turn'}}}
+            Wire @{jsonrpc='2.0'; method='turn/started'; params=@{threadId='write-transition-thread'; turn=@{id='write-transition-turn'; items=@(); status='inProgress'}}}
             $headers = @{Accept='application/json, text/event-stream'}
-            $init = Invoke-WebRequest -UseBasicParsing -Method Post -Uri $endpoint -Headers $headers -ContentType 'application/json' -Body '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"redundant-write-fixture","version":"1"}}}' -TimeoutSec 10
+            $init = Invoke-WebRequest -UseBasicParsing -Method Post -Uri $endpoint -Headers $headers -ContentType 'application/json' -Body '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"write-transition-fixture","version":"1"}}}' -TimeoutSec 10
             $headers['mcp-session-id'] = [string]$init.Headers['mcp-session-id']
             $null = Invoke-WebRequest -UseBasicParsing -Method Post -Uri $endpoint -Headers $headers -ContentType 'application/json' -Body '{"jsonrpc":"2.0","method":"notifications/initialized"}' -TimeoutSec 10
-            $write = Post-Mcp $endpoint $headers 'write-again' 'request_write_workspace' @{reason='retry the same edit'}
-            if ($write.error -or $write.result.isError) { throw 'redundant write intent failed' }
-            if ($Mode -in @('write', 'read-mutate')) {
-                $create = Post-Mcp $endpoint $headers 'create-after-intent' 'file_create' @{path='src/native-after-intent.eps'; ftype='CUIEps'; code="const native_after_intent = 1;`n"}
-                if ($Mode -eq 'write') {
-                    if ($create.error -or $create.result.isError) { throw 'mutation after redundant intent failed' }
-                    $answer = 'mutation completed'
-                } else {
-                    $answer = 'read mutation observed'
-                }
+            $create = Post-Mcp $endpoint $headers 'create-directly' 'file_create' @{path='src/native-direct-write.eps'; ftype='CUIEps'; code="const native_direct_write = 1;`n"}
+            if ($Mode -eq 'write') {
+                if ($create.error -or $create.result.isError) { throw 'direct mutation failed' }
+                $answer = 'mutation completed'
             } else {
-                $answer = 'read run parked'
+                $answer = 'read mutation observed'
             }
             Wire @{jsonrpc='2.0'; method='item/agentMessage/delta'; params=@{delta=$answer}}
-            Wire @{jsonrpc='2.0'; method='turn/completed'; params=@{turn=@{id='redundant-write-turn'; status='completed'}}}
+            Wire @{jsonrpc='2.0'; method='turn/completed'; params=@{turn=@{id='write-transition-turn'; status='completed'}}}
         }
         'turn/interrupt' { Wire @{jsonrpc='2.0'; id=$message.id; result=@{}} }
     }
 }
 "#;
 
-fn redundant_write_runtime(
+fn write_transition_runtime(
     fixture: &RuntimeFixture,
     mode: &str,
 ) -> (crate::provider_runtime::BindingSnapshot, ProviderRuntime) {
-    let script = fixture.root.join("redundant-write.ps1");
-    std::fs::write(&script, REDUNDANT_WRITE_SCRIPT).unwrap();
+    let script = fixture.root.join("write-transition.ps1");
+    std::fs::write(&script, WRITE_TRANSITION_SCRIPT).unwrap();
     let adapter = CodexAdapter::new(
         fixture.root.clone(),
         CodexLaunchConfig {
@@ -147,7 +141,7 @@ async fn native_success_before_mcp_mutation_returns_preserves_unconfirmed_result
         .unwrap();
     fixture
         .tools
-        .request_write_workspace("create source fixture")
+        .register_write_request("create source fixture")
         .unwrap();
     assert!(fixture.tools.owns_write_registration());
     let (mutated, release) = fixture.tools.pause_mutation_completion();
@@ -282,34 +276,34 @@ async fn native_success_before_mcp_mutation_returns_preserves_unconfirmed_result
 }
 
 #[tokio::test]
-async fn writable_native_run_keeps_redundant_intent_and_real_mutation_in_one_run() {
+async fn writable_native_run_executes_mutation_without_an_intent_tool() {
     // Given: a production native adapter is already executing with write access.
-    let fixture = RuntimeFixture::new("native-redundant-write");
+    let fixture = RuntimeFixture::new("native-direct-write");
     fixture
         .tools
         .execute("search_docs", &json!({"query": "file creation"}))
         .unwrap();
     fixture
         .tools
-        .request_write_workspace("prepare writable fixture")
+        .register_write_request("prepare writable fixture")
         .unwrap();
-    let (binding, mut runtime) = redundant_write_runtime(&fixture, "write");
+    let (binding, mut runtime) = write_transition_runtime(&fixture, "write");
     let run_id = 71_003;
     let mut request = fixture.foreground(binding, run_id);
     request.turn.workspace_access = WorkspaceAccess::Write;
     request.policy.active_deadline = Some(Duration::from_secs(30));
 
-    // When: the native CLI repeats write intent, then performs a real mutation and answers.
+    // When: the native CLI calls the mutation directly.
     let outcome = runtime.run_foreground(request).await;
 
-    // Then: the two completions are durable in order and no second transition is emitted.
+    // Then: the mutation completes without a model-facing write-intent call.
     assert!(
         matches!(outcome, RunOutcome::Completed { ref text, .. } if text == "mutation completed"),
-        "redundant write intent terminated the writable run: {outcome:?}"
+        "direct native mutation failed: {outcome:?}"
     );
     assert_eq!(
-        std::fs::read(fixture.root.join("project/src/native-after-intent.eps")).unwrap(),
-        b"const native_after_intent = 1;\n"
+        std::fs::read(fixture.root.join("project/src/native-direct-write.eps")).unwrap(),
+        b"const native_direct_write = 1;\n"
     );
     let receipt_path = RunGate::new(
         fixture.identity(run_id),
@@ -322,80 +316,32 @@ async fn writable_native_run_keeps_redundant_intent_and_real_mutation_in_one_run
     let receipt: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&receipt_path).unwrap()).unwrap();
     let completions = receipt["completions"].as_array().unwrap();
-    assert_eq!(completions.len(), 2);
-    assert_eq!(completions[0]["name"], "request_write_workspace");
-    assert_eq!(completions[0]["result"]["status"], "already_granted");
-    assert!(completions[0]["result"]["note"]
-        .as_str()
-        .is_some_and(|note| note.contains("Continue this turn")));
-    assert_eq!(completions[1]["name"], "file_create");
+    assert_eq!(completions.len(), 1);
+    assert_eq!(completions[0]["name"], "file_create");
     assert_eq!(
-        completions[1]["result"],
-        json!({"ok": true, "path": "src/native-after-intent.eps"})
+        completions[0]["result"],
+        json!({"ok": true, "path": "src/native-direct-write.eps"})
     );
 }
 
 #[tokio::test]
-async fn read_native_run_keeps_transition_even_when_write_ticket_already_exists() {
-    // Given: a ticket exists, but the native foreground run still has read access.
-    let fixture = RuntimeFixture::new("native-read-duplicate-write");
-    fixture
-        .tools
-        .request_write_workspace("ticket exists before read fixture")
-        .unwrap();
-    let (binding, mut runtime) = redundant_write_runtime(&fixture, "read");
-    let run_id = 71_004;
-    let mut request = fixture.foreground(binding, run_id);
-    request.policy.active_deadline = Some(Duration::from_secs(30));
-
-    // When: that read run repeats the write intent and reaches its native boundary.
-    let outcome = runtime.run_foreground(request).await;
-
-    // Then: it still parks for the one required read-to-write transition.
-    assert_eq!(outcome, RunOutcome::WriteTransition);
-    let receipt_path = RunGate::new(
-        fixture.identity(run_id),
-        fixture.tools.clone(),
-        WorkspaceAccess::Read,
-        None,
-    )
-    .receipt_path()
-    .unwrap();
-    let receipt: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&receipt_path).unwrap()).unwrap();
-    let completions = receipt["completions"].as_array().unwrap();
-    assert_eq!(completions.len(), 1);
-    assert_eq!(completions[0]["result"]["status"], "granted");
-    assert!(completions[0]["result"]["note"]
-        .as_str()
-        .is_some_and(|note| note.contains("Stop this turn")));
-}
-
-#[tokio::test]
-async fn read_native_run_records_mutation_denial_before_write_transition() {
-    // Given: an evidence-qualified Read run already has the ticket created by write intent.
-    let fixture = RuntimeFixture::new("native-read-mutation-denial");
-    fixture
-        .tools
-        .execute("search_docs", &json!({"query": "file creation"}))
-        .unwrap();
-    fixture
-        .tools
-        .request_write_workspace("ticket exists before read fixture")
-        .unwrap();
-    let (binding, mut runtime) = redundant_write_runtime(&fixture, "read-mutate");
+async fn read_native_run_requests_write_transition_on_first_mutation() {
+    // Given: a read-only native run with no prior write registration.
+    let fixture = RuntimeFixture::new("native-automatic-write-transition");
+    let (binding, mut runtime) = write_transition_runtime(&fixture, "read-mutate");
     let run_id = 71_005;
     let mut request = fixture.foreground(binding, run_id);
     request.policy.active_deadline = Some(Duration::from_secs(30));
 
-    // When: the native Read run ignores the stop instruction and attempts file creation.
+    // When: the native agent directly attempts a mutation.
     let outcome = runtime.run_foreground(request).await;
 
-    // Then: the denial is durable, no mutation is journaled, and the ticket still transitions once.
+    // Then: admission is registered, the mutation is parked, and no project bytes change.
     assert_eq!(outcome, RunOutcome::WriteTransition);
+    assert!(fixture.tools.owns_write_registration());
     assert!(!fixture
         .root
-        .join("project/src/native-after-intent.eps")
+        .join("project/src/native-direct-write.eps")
         .exists());
     match JournalStore::new(fixture.dirs.app_data())
         .selected_entries(&fixture.request_id, &DecisionIds::All)
@@ -404,7 +350,7 @@ async fn read_native_run_records_mutation_denial_before_write_transition() {
         Err(JournalError::MissingJournal { request_id }) => {
             assert_eq!(request_id, fixture.request_id)
         }
-        Err(error) => panic!("unexpected journal error after denied mutation: {error}"),
+        Err(error) => panic!("unexpected journal error after parked mutation: {error}"),
     }
     let receipt_path = RunGate::new(
         fixture.identity(run_id),
@@ -417,11 +363,10 @@ async fn read_native_run_records_mutation_denial_before_write_transition() {
     let receipt: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&receipt_path).unwrap()).unwrap();
     let completions = receipt["completions"].as_array().unwrap();
-    assert_eq!(completions.len(), 2);
-    assert_eq!(completions[0]["result"]["status"], "granted");
-    assert_eq!(completions[1]["name"], "file_create");
-    assert_eq!(completions[1]["isError"], true);
-    assert!(completions[1]["result"]
+    assert_eq!(completions.len(), 1);
+    assert_eq!(completions[0]["name"], "file_create");
+    assert_eq!(completions[0]["isError"], true);
+    assert!(completions[0]["result"]
         .as_str()
-        .is_some_and(|error| error.contains("write transition")));
+        .is_some_and(|error| error.starts_with("WriteWorkspaceTransition:")));
 }

@@ -28,7 +28,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use crate::config::DataDirs;
 use crate::memory::write_atomic_bytes;
 
-const SCHEMA_VERSION: u32 = 4;
+const SCHEMA_VERSION: u32 = 5;
 const INDEX_FILE: &str = "index.json";
 static SESSION_WRITE_LOCK: Mutex<()> = Mutex::new(());
 
@@ -38,6 +38,16 @@ pub enum SessionKind {
     #[default]
     Eps,
     Map,
+}
+
+/// What startup team-task recovery changed.
+#[derive(Debug, Default)]
+pub struct TeamTaskRecovery {
+    /// Tasks whose status changed (interrupted or discarded).
+    pub changed: usize,
+    /// The tasks that became `interrupted`; their team Map sessions hold a
+    /// native run that died with the process.
+    pub interrupted: Vec<crate::team::TeamTask>,
 }
 
 /// Session list-entry metadata (drives the list UI).
@@ -59,6 +69,10 @@ pub struct SessionMeta {
         deserialize_with = "deserialize_last_conversation_at"
     )]
     pub last_conversation_at: u64,
+    /// For a team Map session: the EPS session that owns it. Team sessions are
+    /// listed with a parent badge and are deleted with their parent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub team_parent: Option<String>,
 }
 
 fn deserialize_last_conversation_at<'de, D>(deserializer: D) -> Result<u64, D::Error>
@@ -91,6 +105,11 @@ pub struct SessionRecord {
     pub context_state: crate::context_state::SessionContextState,
     #[serde(default)]
     pub task_state: crate::task_state::SessionTaskState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub autonomous_run: Option<crate::autonomous::AutonomousRunState>,
+    /// EPS → Map team handoffs this (EPS) session created, oldest first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub team_tasks: Vec<crate::team::TeamTask>,
 }
 
 #[derive(Deserialize)]
@@ -112,6 +131,10 @@ struct SessionRecordWire {
     context_state: crate::context_state::SessionContextState,
     #[serde(default)]
     task_state: crate::task_state::SessionTaskState,
+    #[serde(default)]
+    autonomous_run: Option<crate::autonomous::AutonomousRunState>,
+    #[serde(default)]
+    team_tasks: Vec<crate::team::TeamTask>,
 }
 
 /// The on-disk `index.json` shape: latest-conversation-first metadata rows.
@@ -439,6 +462,7 @@ impl SessionStore {
             source.context_usage = None;
             source.context_state = Default::default();
             source.task_state = Default::default();
+            source.autonomous_run = None;
             source.meta.provider = source.provider_binding.provider;
             source.meta.model = source.provider_binding.model.clone();
             let bytes = match serde_json::to_vec_pretty(&source) {
@@ -552,6 +576,262 @@ impl SessionStore {
         self.save_unlocked(rec)
     }
 
+    /// Append or replace one team task on its EPS session (matched by id).
+    pub fn upsert_team_task(&self, id: &str, task: crate::team::TeamTask) -> anyhow::Result<()> {
+        let _guard = self.lock()?;
+        let mut record = self.load_unlocked(id)?;
+        if record.meta.kind != SessionKind::Eps {
+            anyhow::bail!("team tasks belong to EPS sessions only");
+        }
+        match record
+            .team_tasks
+            .iter_mut()
+            .find(|existing| existing.id == task.id)
+        {
+            Some(existing) => *existing = task,
+            None => record.team_tasks.push(task),
+        }
+        self.save_unlocked(&record)
+    }
+
+    /// Update one team task in place and return the new record. `update`
+    /// returns whether it changed anything; an unchanged task is not rewritten.
+    pub fn update_team_task(
+        &self,
+        id: &str,
+        task_id: &str,
+        update: impl FnOnce(&mut crate::team::TeamTask) -> bool,
+    ) -> anyhow::Result<Option<crate::team::TeamTask>> {
+        let _guard = self.lock()?;
+        let mut record = self.load_unlocked(id)?;
+        let Some(task) = record
+            .team_tasks
+            .iter_mut()
+            .find(|existing| existing.id == task_id)
+        else {
+            return Ok(None);
+        };
+        if !update(task) {
+            return Ok(Some(task.clone()));
+        }
+        task.updated_at = now_unix_millis();
+        let updated = task.clone();
+        self.save_unlocked(&record)?;
+        Ok(Some(updated))
+    }
+
+    /// Every EPS session task that targets `map_session_id`, with its owning
+    /// session id. Used by the Map window's Apply/discard/undo hooks.
+    pub fn team_tasks_for_map_session(
+        &self,
+        map_session_id: &str,
+    ) -> anyhow::Result<Vec<(String, crate::team::TeamTask)>> {
+        let _guard = self.lock()?;
+        let mut found = Vec::new();
+        for meta in self.read_index().sessions {
+            if meta.kind != SessionKind::Eps {
+                continue;
+            }
+            let record = self.load_unlocked(&meta.id)?;
+            for task in record.team_tasks {
+                if task.map_session_id == map_session_id {
+                    found.push((meta.id.clone(), task));
+                }
+            }
+        }
+        Ok(found)
+    }
+
+    /// The newest team Map session owned by EPS session `parent`, if one exists.
+    pub fn team_session_of(&self, parent: &str) -> anyhow::Result<Option<SessionMeta>> {
+        Ok(self.team_sessions_of(parent)?.into_iter().next())
+    }
+
+    /// Every team Map session owned by EPS session `parent`, newest first.
+    /// A map task runs in a fresh team session unless it revises an earlier
+    /// task; a fresh task retires the earlier sessions except one whose apply
+    /// the Map window can still undo.
+    pub fn team_sessions_of(&self, parent: &str) -> anyhow::Result<Vec<SessionMeta>> {
+        let mut sessions = self
+            .read_index()
+            .sessions
+            .into_iter()
+            .filter(|meta| {
+                meta.kind == SessionKind::Map && meta.team_parent.as_deref() == Some(parent)
+            })
+            .collect::<Vec<_>>();
+        sessions.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        Ok(sessions)
+    }
+
+    /// Startup mapping for team tasks: a running Map request died with the
+    /// process, so it is `interrupted`; a ready candidate stays only when
+    /// `candidate_valid` confirms the Map session still holds that revision.
+    /// Returns every task that changed and, separately, the interrupted ones
+    /// so the caller can reset their team Map sessions.
+    ///
+    /// The store lock is held for the whole pass, so the task's Map session
+    /// record is loaded here and handed to `candidate_valid`; the callback
+    /// must not read the store itself (the lock is not re-entrant). A task
+    /// whose Map session no longer loads is discarded without a callback.
+    pub fn recover_interrupted_team_tasks(
+        &self,
+        candidate_valid: impl Fn(&crate::team::TeamTask, &SessionRecord) -> bool,
+    ) -> anyhow::Result<TeamTaskRecovery> {
+        use crate::team::TeamTaskStatus;
+        let _guard = self.lock()?;
+        let now = now_unix_millis();
+        let mut recovery = TeamTaskRecovery::default();
+        for meta in self.read_index().sessions {
+            if meta.kind != SessionKind::Eps {
+                continue;
+            }
+            let mut record = self.load_unlocked(&meta.id)?;
+            let mut changed = false;
+            for task in &mut record.team_tasks {
+                let next = match task.status {
+                    TeamTaskStatus::Queued | TeamTaskStatus::Running => {
+                        Some(TeamTaskStatus::Interrupted)
+                    }
+                    TeamTaskStatus::CandidateReady => {
+                        let valid = self
+                            .load_unlocked(&task.map_session_id)
+                            .is_ok_and(|map_session| candidate_valid(task, &map_session));
+                        (!valid).then_some(TeamTaskStatus::Discarded)
+                    }
+                    _ => None,
+                };
+                if let Some(next) = next {
+                    task.status = next;
+                    task.updated_at = now;
+                    changed = true;
+                    recovery.changed += 1;
+                    if task.status == TeamTaskStatus::Interrupted {
+                        recovery.interrupted.push(task.clone());
+                    }
+                }
+            }
+            if changed {
+                self.save_unlocked(&record)?;
+            }
+        }
+        Ok(recovery)
+    }
+
+    /// Forget a session's persisted provider conversation so its next turn
+    /// starts a fresh native thread; the panel log, candidate, and task state
+    /// are untouched. Startup uses it for a team Map session whose request
+    /// died with the process, mirroring the window's "대화 초기화".
+    pub fn reset_provider_conversation(&self, id: &str) -> anyhow::Result<()> {
+        let _guard = self.lock()?;
+        let mut record = self.load_unlocked(id)?;
+        let provider = record.provider_binding.provider;
+        record.provider_binding.conversation =
+            crate::provider::ProviderConversationState::empty(provider);
+        self.save_unlocked(&record)
+    }
+
+    /// Atomically replace only the durable autonomous lifecycle projection.
+    pub fn set_autonomous_run(
+        &self,
+        id: &str,
+        run: Option<crate::autonomous::AutonomousRunState>,
+    ) -> anyhow::Result<()> {
+        let _guard = self.lock()?;
+        let mut record = self.load_unlocked(id)?;
+        record.autonomous_run = run;
+        self.save_unlocked(&record)
+    }
+
+    pub fn update_autonomous_status(
+        &self,
+        id: &str,
+        status: crate::autonomous::AutonomousRunStatus,
+        pause_reason: Option<crate::autonomous::AutonomousPauseReason>,
+        blocker: Option<String>,
+    ) -> anyhow::Result<Option<crate::autonomous::AutonomousRunState>> {
+        let _guard = self.lock()?;
+        let mut record = self.load_unlocked(id)?;
+        let Some(run) = record.autonomous_run.as_mut() else {
+            return Ok(None);
+        };
+        let now = now_unix_millis();
+        if matches!(
+            status,
+            crate::autonomous::AutonomousRunStatus::Running
+                | crate::autonomous::AutonomousRunStatus::Pausing
+        ) {
+            run.active_started_at.get_or_insert(now);
+        } else if let Some(active_started_at) = run.active_started_at.take() {
+            run.progress.elapsed_active_millis = run
+                .progress
+                .elapsed_active_millis
+                .saturating_add(now.saturating_sub(active_started_at));
+        }
+        run.status = status;
+        run.pause_reason = pause_reason;
+        run.blocker = blocker;
+        run.updated_at = now;
+        let run = run.clone();
+        self.save_unlocked(&record)?;
+        Ok(Some(run))
+    }
+
+    /// Persist an autonomous checkpoint and its provider continuation atomically.
+    pub fn set_autonomous_checkpoint(
+        &self,
+        id: &str,
+        conversation: crate::provider::ProviderConversationState,
+        run: crate::autonomous::AutonomousRunState,
+    ) -> anyhow::Result<()> {
+        let _guard = self.lock()?;
+        let mut record = self.load_unlocked(id)?;
+        if conversation.provider() != record.provider_binding.provider {
+            anyhow::bail!("autonomous checkpoint provider does not match the session binding");
+        }
+        record.provider_binding.conversation = conversation;
+        record.autonomous_run = Some(run);
+        self.save_unlocked(&record)
+    }
+    /// Convert interrupted active work into an explicit restart pause.
+    ///
+    /// This is called once by application startup, never by ordinary store construction.
+    pub fn recover_interrupted_autonomous_runs(&self) -> anyhow::Result<usize> {
+        let _guard = self.lock()?;
+        let sessions = self.read_index().sessions;
+        let mut recovered = 0_usize;
+        for meta in sessions {
+            let mut record = self.load_unlocked(&meta.id)?;
+            let Some(run) = record.autonomous_run.as_mut() else {
+                continue;
+            };
+            if matches!(
+                run.status,
+                crate::autonomous::AutonomousRunStatus::Running
+                    | crate::autonomous::AutonomousRunStatus::Pausing
+                    | crate::autonomous::AutonomousRunStatus::WaitingInput
+            ) {
+                let now = now_unix_millis();
+                if let Some(active_started_at) = run.active_started_at.take() {
+                    run.progress.elapsed_active_millis = run
+                        .progress
+                        .elapsed_active_millis
+                        .saturating_add(now.saturating_sub(active_started_at));
+                }
+                run.status = crate::autonomous::AutonomousRunStatus::PausedAfterRestart;
+                run.pause_reason = Some(crate::autonomous::AutonomousPauseReason::Restart);
+                run.updated_at = now;
+                if run.blocker.is_none() {
+                    run.blocker =
+                        Some("앱 재시작 후 자동 변경은 명시적으로 계속해야 합니다.".to_string());
+                }
+                self.save_unlocked(&record)?;
+                recovered = recovered.saturating_add(1);
+            }
+        }
+        Ok(recovered)
+    }
+
     /// Delete the record file and remove it from the index. A missing record file is
     /// tolerated (the index entry is still dropped).
     pub fn delete(&self, id: &str) -> anyhow::Result<()> {
@@ -577,8 +857,16 @@ impl SessionStore {
 
     /// Replace one session's opaque panel log without changing its conversation
     /// recency. Multi-session tabs autosave independently while another turn runs.
+    /// A session deleted underneath a window (a retired team session the Map
+    /// window still shows) drops its late log instead of failing the window's
+    /// switch away from it; a log write never resurrects a deleted session.
     pub fn update_panel_log(&self, id: &str, panel_log: serde_json::Value) -> anyhow::Result<()> {
         let _guard = self.lock()?;
+        if !self.record_path(id).exists()
+            && !self.read_index().sessions.iter().any(|meta| meta.id == id)
+        {
+            return Ok(());
+        }
         let mut record = self.load_unlocked(id)?;
         record.panel_log = panel_log;
         self.save_unlocked(&record)
@@ -614,6 +902,42 @@ impl SessionStore {
         let mut record = self.load_unlocked(id)?;
         record.context_usage = Some(context_usage);
         self.save_unlocked(&record)
+    }
+    /// Fold a `delegate_read` child's provider usage into the session's
+    /// cumulative `total` without touching `last`, which stays the parent's own
+    /// latest context. Returns the persisted usage so the panel can be told.
+    pub fn add_delegated_context_usage(
+        &self,
+        id: &str,
+        child: &crate::ipc::ContextUsage,
+    ) -> anyhow::Result<crate::ipc::ContextUsage> {
+        let _guard = self.lock()?;
+        let mut record = self.load_unlocked(id)?;
+        let mut usage = record
+            .context_usage
+            .take()
+            .unwrap_or_else(|| crate::ipc::ContextUsage {
+                last: crate::ipc::TokenUsageBreakdown::default(),
+                total: crate::ipc::TokenUsageBreakdown::default(),
+                model_context_window: child.model_context_window,
+            });
+        let total = &mut usage.total;
+        let add = &child.total;
+        total.input_tokens = total.input_tokens.saturating_add(add.input_tokens);
+        total.cached_input_tokens = total
+            .cached_input_tokens
+            .saturating_add(add.cached_input_tokens);
+        total.cache_write_input_tokens = total
+            .cache_write_input_tokens
+            .saturating_add(add.cache_write_input_tokens);
+        total.output_tokens = total.output_tokens.saturating_add(add.output_tokens);
+        total.reasoning_output_tokens = total
+            .reasoning_output_tokens
+            .saturating_add(add.reasoning_output_tokens);
+        total.total_tokens = total.total_tokens.saturating_add(add.total_tokens);
+        record.context_usage = Some(usage.clone());
+        self.save_unlocked(&record)?;
+        Ok(usage)
     }
     /// Atomically persist provider conversation state and pending review ownership.
     pub fn update_runtime_state(
@@ -762,7 +1086,13 @@ impl SessionStore {
     ) -> anyhow::Result<Option<String>> {
         let _guard = self.lock()?;
         let mut record = self.load_unlocked(id)?;
-        let client_turn_id = last_client_turn_id(&panel_log);
+        let last_you = last_you_entry(&panel_log);
+        let client_turn_id = last_you
+            .and_then(|entry| uuid_field(entry, "clientTurnId"))
+            .or_else(|| {
+                let request_id = last_you.and_then(|entry| entry.get("requestId")?.as_str())?;
+                record.task_state.client_turn_for_request(request_id)
+            });
         record
             .task_state
             .move_leaf_to_client_turn(client_turn_id.as_deref())
@@ -932,6 +1262,8 @@ impl SessionStore {
             panel_log: wire.panel_log,
             context_state: wire.context_state,
             task_state: wire.task_state,
+            autonomous_run: wire.autonomous_run,
+            team_tasks: wire.team_tasks,
         };
         if let Err(error) = record.task_state.repair_cache() {
             if !repair_task_state {
@@ -1158,14 +1490,18 @@ fn validate_source_e3s(path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn last_client_turn_id(panel_log: &serde_json::Value) -> Option<String> {
+fn last_you_entry(panel_log: &serde_json::Value) -> Option<&serde_json::Value> {
     panel_log
         .get("log")
         .and_then(serde_json::Value::as_array)?
         .iter()
         .rev()
         .find(|entry| entry.get("kind").and_then(serde_json::Value::as_str) == Some("you"))
-        .and_then(|entry| entry.get("clientTurnId"))
+}
+
+fn uuid_field(entry: &serde_json::Value, field: &str) -> Option<String> {
+    entry
+        .get(field)
         .and_then(serde_json::Value::as_str)
         .filter(|id| uuid::Uuid::parse_str(id).is_ok())
         .map(str::to_string)
@@ -1186,6 +1522,11 @@ fn sort_sessions(sessions: &mut [SessionMeta]) {
 /// The project carries no `uuid` crate; this composes 128 bits from the wall clock,
 /// the process id, and a monotonic counter, then formats them with the version-4 +
 /// RFC-4122 variant nibbles set so the id is a well-formed v4 UUID string.
+///
+/// The high word is multiplied by an odd constant so the clock's fast-changing
+/// low bits and the counter reach the leading hex digits: the panel and team
+/// prompts quote only [`short_session_id`], which must differ between sessions
+/// created seconds apart.
 pub fn new_session_id() -> String {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -1196,7 +1537,8 @@ pub fn new_session_id() -> String {
     let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
     let pid = std::process::id() as u64;
 
-    let hi = nanos ^ (pid.rotate_left(32));
+    let hi =
+        (nanos ^ pid.rotate_left(32) ^ counter.rotate_left(40)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
     let lo = counter.wrapping_mul(0x9E37_79B9_7F4A_7C15).rotate_left(17) ^ nanos.rotate_right(13);
 
     // version 4 (nibble 13) and RFC-4122 variant (nibble 17).
@@ -1211,6 +1553,13 @@ pub fn new_session_id() -> String {
         clock_seq,
         lo & 0x0000_FFFF_FFFF_FFFF,
     )
+}
+
+/// The leading eight characters of a session id: the handle the panel shows
+/// beside each session and team prompts quote for the parent EPS session, so
+/// a person can name one session unambiguously without the full UUID.
+pub fn short_session_id(id: &str) -> &str {
+    id.get(..8).unwrap_or(id)
 }
 
 /// Current Unix time in seconds (0 if the clock is before the epoch).
@@ -1264,6 +1613,7 @@ mod tests {
                 model: "gpt-test".to_string(),
                 created_at: 1_718_000_000,
                 last_conversation_at: 1_718_000_000_000,
+                team_parent: None,
             },
             provider_binding: crate::provider::ProviderBinding {
                 provider: crate::provider::ProviderId::Codex,
@@ -1288,6 +1638,9 @@ mod tests {
             }),
             context_state: Default::default(),
             task_state: Default::default(),
+            autonomous_run: None,
+
+            team_tasks: Vec::new(),
         }
     }
     fn import_fixture(
@@ -1676,6 +2029,13 @@ mod tests {
         let after = store.list().unwrap();
         assert_eq!(after.len(), 1);
         assert_eq!(after[0].id, second.meta.id);
+        // A late autosave from a window still showing the deleted session is
+        // dropped: it neither fails the window nor resurrects the session.
+        store
+            .update_panel_log(&first.meta.id, json!({ "schemaVersion": 2, "log": [] }))
+            .unwrap();
+        assert!(store.load(&first.meta.id).is_err());
+        assert_eq!(store.list().unwrap().len(), 1);
 
         fs::remove_dir_all(base).ok();
     }
@@ -1827,13 +2187,9 @@ mod tests {
             b"accepted",
         )
         .unwrap();
-        fs::create_dir_all(dirs.session_workspaces_dir().join("project/session")).unwrap();
-        fs::write(
-            dirs.session_workspaces_dir()
-                .join("project/session/spec.md"),
-            b"stale",
-        )
-        .unwrap();
+        let legacy_sessions = dirs.workspaces_dir().join(".sessions");
+        fs::create_dir_all(legacy_sessions.join("project/session")).unwrap();
+        fs::write(legacy_sessions.join("project/session/spec.md"), b"stale").unwrap();
 
         let migrated = SessionStore::new(&dirs);
         let loaded = migrated.load(&record.meta.id).unwrap();
@@ -1853,10 +2209,7 @@ mod tests {
             .join("accepted")
             .join("req-accepted.json")
             .is_file());
-        assert!(dirs
-            .session_workspaces_dir()
-            .join("project/session/spec.md")
-            .is_file());
+        assert!(legacy_sessions.join("project/session/spec.md").is_file());
         let migrated_index: serde_json::Value =
             serde_json::from_slice(&fs::read(dirs.sessions_dir().join(INDEX_FILE)).unwrap())
                 .unwrap();
@@ -2118,6 +2471,134 @@ mod tests {
     }
 
     #[test]
+    fn rewind_anchors_a_map_request_id_to_its_native_client_turn() {
+        let (base, store) = store("rewind-map-request");
+        let record = sample_record(&new_session_id(), "map rewind");
+        let id = record.meta.id.clone();
+        store.save(&record).unwrap();
+        let first_turn = "55555555-5555-4555-8555-555555555555";
+        let second_turn = "66666666-6666-4666-8666-666666666666";
+        let first = store
+            .append_task_event(
+                &id,
+                None,
+                semantic_goal_event(first_turn, "map-first", 0, "first"),
+            )
+            .unwrap();
+        store
+            .append_task_event(
+                &id,
+                first.leaf_id.as_deref(),
+                semantic_goal_event(second_turn, "map-second", 1, "second"),
+            )
+            .unwrap();
+
+        // Map "you" rows carry only the request id the run started with.
+        store
+            .move_task_leaf_for_rewind(
+                &id,
+                json!({"schemaVersion": 2, "logSeq": 1, "log": [{
+                    "id": 1,
+                    "kind": "you",
+                    "text": "first",
+                    "requestId": "map-first"
+                }]}),
+            )
+            .unwrap();
+        let rewound = store.load(&id).unwrap();
+        assert_eq!(rewound.task_state.events.len(), 2);
+        assert_eq!(rewound.task_state.projection.goals.len(), 1);
+        assert_eq!(rewound.task_state.projection.goals[0].id, "first");
+
+        // An unknown request id (a run that never compiled task state) fails
+        // closed like a legacy prefix instead of guessing a branch.
+        store
+            .move_task_leaf_for_rewind(
+                &id,
+                json!({"schemaVersion": 2, "logSeq": 1, "log": [{
+                    "id": 1,
+                    "kind": "you",
+                    "text": "first",
+                    "requestId": "map-unknown"
+                }]}),
+            )
+            .unwrap();
+        let unknown = store.load(&id).unwrap();
+        assert!(unknown.task_state.leaf_id.is_none());
+        assert_eq!(
+            unknown.task_state.projection,
+            crate::task_state::ActiveTaskProjection::default()
+        );
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn restart_recovery_pauses_active_autonomous_runs_without_changing_checkpoint() {
+        let (base, store) = store("autonomous-restart");
+        let mut record = sample_record(&new_session_id(), "장시간 작업");
+        let checkpoint = crate::provider::ProviderConversationState::Codex {
+            thread_id: Some("thread-confirmed".to_string()),
+        };
+        record.provider_binding.conversation = checkpoint.clone();
+        let mut run = crate::autonomous::AutonomousRunState::new(
+            "긴 작업".to_string(),
+            "turn-1".to_string(),
+            "req-auto".to_string(),
+            record.meta.project.clone(),
+            "revision-1".to_string(),
+            Default::default(),
+            now_unix_millis(),
+        );
+        run.last_checkpoint = Some(checkpoint.clone());
+        record.autonomous_run = Some(run);
+        store.save(&record).unwrap();
+
+        assert_eq!(store.recover_interrupted_autonomous_runs().unwrap(), 1);
+
+        let recovered = store.load(&record.meta.id).unwrap();
+        let run = recovered.autonomous_run.unwrap();
+        assert_eq!(
+            run.status,
+            crate::autonomous::AutonomousRunStatus::PausedAfterRestart
+        );
+        assert_eq!(
+            run.pause_reason,
+            Some(crate::autonomous::AutonomousPauseReason::Restart)
+        );
+        assert_eq!(run.last_checkpoint, Some(checkpoint.clone()));
+        assert_eq!(recovered.provider_binding.conversation, checkpoint);
+        assert!(run.active_started_at.is_none());
+        assert!(run.blocker.unwrap().contains("명시적으로 계속"));
+        assert_eq!(store.recover_interrupted_autonomous_runs().unwrap(), 0);
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn restart_recovery_leaves_terminal_autonomous_runs_unchanged() {
+        let (base, store) = store("autonomous-terminal");
+        let mut record = sample_record(&new_session_id(), "완료 작업");
+        let mut run = crate::autonomous::AutonomousRunState::new(
+            "완료 목표".to_string(),
+            "turn-2".to_string(),
+            "req-done".to_string(),
+            record.meta.project.clone(),
+            "revision-2".to_string(),
+            Default::default(),
+            now_unix_millis(),
+        );
+        run.status = crate::autonomous::AutonomousRunStatus::Completed;
+        record.autonomous_run = Some(run.clone());
+        store.save(&record).unwrap();
+
+        assert_eq!(store.recover_interrupted_autonomous_runs().unwrap(), 0);
+        assert_eq!(
+            store.load(&record.meta.id).unwrap().autonomous_run,
+            Some(run)
+        );
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
     fn new_session_id_is_a_well_formed_unique_v4_uuid() {
         let a = new_session_id();
         let b = new_session_id();
@@ -2135,5 +2616,235 @@ mod tests {
             matches!(parts[3].as_bytes()[0], b'8' | b'9' | b'a' | b'b'),
             "variant nibble must be RFC-4122"
         );
+    }
+
+    #[test]
+    fn short_session_ids_differ_between_sessions_created_back_to_back() {
+        let ids: Vec<String> = (0..64).map(|_| new_session_id()).collect();
+        let prefixes: BTreeSet<&str> = ids.iter().map(|id| short_session_id(id)).collect();
+        assert_eq!(prefixes.len(), ids.len(), "{ids:?}");
+        assert!(prefixes.iter().all(|prefix| prefix.len() == 8));
+    }
+
+    #[test]
+    fn short_session_id_keeps_a_shorter_id_whole() {
+        assert_eq!(short_session_id("eps-1"), "eps-1");
+        assert_eq!(short_session_id(""), "");
+        assert_eq!(short_session_id("세션-아이디-한글"), "세션-아이디-한글");
+    }
+}
+
+#[cfg(test)]
+mod team_task_tests {
+    use super::*;
+    use crate::team::{TeamTask, TeamTaskStatus};
+
+    fn store(tag: &str) -> (PathBuf, SessionStore) {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!("eud-agent-team-test-{tag}-{nanos}"));
+        fs::create_dir_all(&base).unwrap();
+        let dirs = DataDirs::from_bases(&base.join("roaming"), &base.join("local"));
+        (base, SessionStore::new(&dirs))
+    }
+
+    fn record(id: &str, kind: SessionKind, team_parent: Option<&str>) -> SessionRecord {
+        let binding = crate::provider::ProviderBinding::new(
+            crate::provider::ProviderId::Codex,
+            "gpt-test".to_string(),
+            None,
+        )
+        .unwrap();
+        SessionRecord {
+            meta: SessionMeta {
+                id: id.to_string(),
+                name: id.to_string(),
+                project: "project".to_string(),
+                kind,
+                provider: binding.provider,
+                model: binding.model.clone(),
+                created_at: 1,
+                last_conversation_at: 1_000,
+                team_parent: team_parent.map(str::to_string),
+            },
+            provider_binding: binding,
+            pending_request_ids: Vec::new(),
+            context_usage: None,
+            panel_log: serde_json::Value::Null,
+            context_state: Default::default(),
+            task_state: Default::default(),
+            autonomous_run: None,
+
+            team_tasks: Vec::new(),
+        }
+    }
+
+    fn task(id: &str, map_session_id: &str, status: TeamTaskStatus) -> TeamTask {
+        TeamTask {
+            id: id.to_string(),
+            parent_request_id: "req".to_string(),
+            map_session_id: map_session_id.to_string(),
+            map_request_id: Some(format!("map-{id}")),
+            goal: "goal".to_string(),
+            layers: vec![crate::map_model::MapLayer::Terrain],
+            selection_ids: vec!["sel".to_string()],
+            location_ids: vec![3],
+            source_map_sha256_at_create: "a".repeat(64),
+            status,
+            candidate: None,
+            applied_source_sha256: None,
+            applied_by: None,
+            created_at: 1,
+            updated_at: 1,
+        }
+    }
+
+    #[test]
+    fn team_tasks_persist_on_eps_sessions_and_resolve_by_map_session() {
+        let (base, sessions) = store("persist");
+        sessions
+            .save(&record("eps", SessionKind::Eps, None))
+            .unwrap();
+        sessions
+            .save(&record("map-team", SessionKind::Map, Some("eps")))
+            .unwrap();
+        sessions
+            .upsert_team_task("eps", task("t1", "map-team", TeamTaskStatus::Queued))
+            .unwrap();
+        sessions
+            .upsert_team_task("eps", task("t1", "map-team", TeamTaskStatus::Running))
+            .unwrap();
+        let loaded = sessions.load("eps").unwrap();
+        assert_eq!(loaded.team_tasks.len(), 1);
+        assert_eq!(loaded.team_tasks[0].status, TeamTaskStatus::Running);
+        assert!(sessions
+            .upsert_team_task("map-team", task("t2", "map-team", TeamTaskStatus::Queued))
+            .is_err());
+
+        let updated = sessions
+            .update_team_task("eps", "t1", |task| {
+                task.status = TeamTaskStatus::CandidateReady;
+                true
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.status, TeamTaskStatus::CandidateReady);
+        assert!(updated.updated_at >= 1);
+        assert!(sessions
+            .update_team_task("eps", "missing", |_| true)
+            .unwrap()
+            .is_none());
+
+        let by_map = sessions.team_tasks_for_map_session("map-team").unwrap();
+        assert_eq!(by_map.len(), 1);
+        assert_eq!(by_map[0].0, "eps");
+        assert_eq!(
+            sessions.team_session_of("eps").unwrap().map(|meta| meta.id),
+            Some("map-team".to_string())
+        );
+        assert!(sessions.team_session_of("map-team").unwrap().is_none());
+        assert_eq!(
+            sessions
+                .load("map-team")
+                .unwrap()
+                .meta
+                .team_parent
+                .as_deref(),
+            Some("eps")
+        );
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn startup_interrupts_running_tasks_and_keeps_only_valid_candidates() {
+        let (base, sessions) = store("restart");
+        sessions
+            .save(&record("eps", SessionKind::Eps, None))
+            .unwrap();
+        sessions
+            .save(&record("map-team", SessionKind::Map, Some("eps")))
+            .unwrap();
+        for (id, status) in [
+            ("queued", TeamTaskStatus::Queued),
+            ("running", TeamTaskStatus::Running),
+            ("ready-valid", TeamTaskStatus::CandidateReady),
+            ("ready-stale", TeamTaskStatus::CandidateReady),
+            ("applied", TeamTaskStatus::Applied),
+        ] {
+            sessions
+                .upsert_team_task("eps", task(id, "map-team", status))
+                .unwrap();
+        }
+        // Its Map session was deleted: discarded without asking the callback.
+        sessions
+            .upsert_team_task(
+                "eps",
+                task("ready-orphan", "map-gone", TeamTaskStatus::CandidateReady),
+            )
+            .unwrap();
+        let asked = std::sync::Mutex::new(Vec::new());
+        let recovered = sessions
+            .recover_interrupted_team_tasks(|task, map_session| {
+                // The store lock is held: the callback gets the Map session
+                // record instead of loading it (which deadlocked startup).
+                assert_eq!(map_session.meta.id, task.map_session_id);
+                assert_eq!(map_session.meta.kind, SessionKind::Map);
+                asked.lock().unwrap().push(task.id.clone());
+                task.id == "ready-valid"
+            })
+            .unwrap();
+        assert_eq!(asked.into_inner().unwrap(), ["ready-valid", "ready-stale"]);
+        assert_eq!(recovered.changed, 4);
+        assert_eq!(
+            recovered
+                .interrupted
+                .iter()
+                .map(|task| task.id.as_str())
+                .collect::<Vec<_>>(),
+            ["queued", "running"]
+        );
+        let tasks = sessions.load("eps").unwrap().team_tasks;
+        let status = |id: &str| {
+            tasks
+                .iter()
+                .find(|task| task.id == id)
+                .unwrap()
+                .status
+                .clone()
+        };
+        assert_eq!(status("queued"), TeamTaskStatus::Interrupted);
+        assert_eq!(status("running"), TeamTaskStatus::Interrupted);
+        assert_eq!(status("ready-valid"), TeamTaskStatus::CandidateReady);
+        assert_eq!(status("ready-stale"), TeamTaskStatus::Discarded);
+        assert_eq!(status("ready-orphan"), TeamTaskStatus::Discarded);
+        assert_eq!(status("applied"), TeamTaskStatus::Applied);
+        let repeat = sessions
+            .recover_interrupted_team_tasks(|_, _| true)
+            .unwrap();
+        assert_eq!(repeat.changed, 0);
+        assert!(repeat.interrupted.is_empty());
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn resetting_a_provider_conversation_keeps_everything_but_the_thread() {
+        let (base, sessions) = store("conversation-reset");
+        let mut map = record("map-team", SessionKind::Map, Some("eps"));
+        map.provider_binding.conversation = crate::provider::ProviderConversationState::Codex {
+            thread_id: Some("thread-1".to_string()),
+        };
+        map.panel_log = serde_json::json!({"log": [{"id": 1, "kind": "you", "text": "hi"}]});
+        sessions.save(&map).unwrap();
+        sessions.reset_provider_conversation("map-team").unwrap();
+        let loaded = sessions.load("map-team").unwrap();
+        assert_eq!(
+            loaded.provider_binding.conversation,
+            crate::provider::ProviderConversationState::empty(map.provider_binding.provider)
+        );
+        assert_eq!(loaded.panel_log, map.panel_log);
+        assert_eq!(loaded.meta.team_parent.as_deref(), Some("eps"));
+        let _ = fs::remove_dir_all(base);
     }
 }

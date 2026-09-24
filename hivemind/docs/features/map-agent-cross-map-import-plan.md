@@ -311,6 +311,9 @@ Persistent metadata와 큰 pinned map bytes를 분리한다.
 9. 현재 destination tileset과 비교한다.
 10. content-addressed blob path로 same-directory atomic promote한다. 같은 hash blob이 있으면 bytes/hash 검증 후 dedupe한다.
 11. original source path는 이후 render/save/place에 사용하지 않는다.
+12. 검증된 blob을 프로젝트 루트 `references/<파일명>`으로 same-directory temp + atomic rename 복사한다. 같은 이름의 파일이 이미 있고 hash가 같으면 재사용하고, 다르면 `<stem> (n).<ext>` 이름을 쓴다. 복사에 실패하면 staged source를 제거하고 오류를 반환한다. 이미 `references/` 안에 있는 파일을 고르면 복사하지 않는다. `references/`는 canonical state가 아니며 blob이 계속 render/save/place의 authority다.
+
+`map_import_reference_list`는 `references/` 안의 `.scx`/`.scm` regular file을 이름순으로 반환하고, `map_import_reference_pick { name }`은 bare file name(구분자·`..`·`:`·NUL·앞뒤 공백 거부, canonical parent가 `references/`와 같아야 함)만 받아 같은 staging 경로로 고정한다. Importer toolbar의 `references` Select와 빈 화면의 목록이 이 두 command로 이전에 가져온 맵을 클릭 한 번으로 다시 연다.
 
 Frontend response:
 
@@ -324,6 +327,7 @@ interface MapImportSource {
   width: number;
   height: number;
   fileSize: number;
+  referenceName: string | null; // references/ 아래 복사본 이름
 }
 ```
 
@@ -578,6 +582,8 @@ Authoritative command surface:
 map_agent_import_open
 map_import_bootstrap
 map_import_source_pick
+map_import_reference_list
+map_import_reference_pick
 map_import_source_render
 map_import_source_objects
 map_import_stamp_save
@@ -589,7 +595,7 @@ map_import_stamp_delete
 Trust boundary:
 
 - `map_agent_import_open`: `map-agent` label only
-- `map_import_bootstrap`, `map_import_source_pick`, `map_import_source_render`, `map_import_source_objects`, `map_import_stamp_save`: `map-import` label only
+- `map_import_bootstrap`, `map_import_source_pick`, `map_import_reference_list`, `map_import_reference_pick`, `map_import_source_render`, `map_import_source_objects`, `map_import_stamp_save`: `map-import` label only
 - `map_import_stamp_list`, `map_import_stamp_thumbnail`, `map_import_stamp_delete`: `map-agent`와 `map-import` labels only
 - direct placement는 기존 `map_agent_stamp_preview`/`map_agent_stamp_confirm`을 사용하며 `map-agent` label only
 - original Apply/undo commands remain `map-agent` only
