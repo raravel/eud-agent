@@ -215,7 +215,11 @@ async fn run_bootstrap_inner(
     }
     crate::native_build::EuddraftLaunch::resolve(Path::new(config.euddraft_path.trim()))
         .map_err(anyhow::Error::msg)?;
-    bootstrap::ensure_managed_uv(dirs, emitter).await?;
+    // Managed uv only serves direct-Python dependency preparation, which is
+    // Windows-only; other platforms would fail the whole bootstrap here.
+    if cfg!(windows) {
+        bootstrap::ensure_managed_uv(dirs, emitter).await?;
+    }
     if config.model.name.trim().is_empty() {
         config.model.name = bootstrap::DEFAULT_MODEL_NAME.to_string();
     }
