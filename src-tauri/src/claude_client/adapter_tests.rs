@@ -156,6 +156,7 @@ async fn assert_cli_process_stopped(pid: u32) {
     .expect("dropped Claude process tree must terminate");
 }
 
+#[cfg(windows)]
 #[tokio::test]
 async fn production_process_preserves_stream_order_native_tools_and_resume() {
     let fixture = FixtureDir::new();
@@ -288,6 +289,7 @@ exit 0
     ));
 }
 
+#[cfg(windows)]
 #[tokio::test]
 async fn partial_nonzero_exit_poisoned_native_continuation() {
     let fixture = FixtureDir::new();
@@ -351,6 +353,7 @@ fn native_tool_result_preserves_execution_failure_without_duplicate_start() {
     );
 }
 
+#[cfg(windows)]
 #[tokio::test]
 async fn malformed_and_oversized_process_output_are_rejected() {
     let fixture = FixtureDir::new();
@@ -393,6 +396,7 @@ $null = [Console]::In.ReadLine()
     assert!(matches!(error, ProviderRuntimeError::Protocol(_)));
 }
 
+#[cfg(windows)]
 #[tokio::test]
 async fn structured_process_isolated_and_schema_strict() {
     let fixture = FixtureDir::new();
@@ -520,6 +524,7 @@ exit 0
     assert_eq!(error, ProviderRuntimeError::StructuredOutputInvalid);
 }
 
+#[cfg(windows)]
 #[tokio::test]
 async fn cancellation_terminates_hung_cli_and_rejects_late_events() {
     let fixture = FixtureDir::new();
@@ -596,6 +601,7 @@ Start-Sleep -Seconds 60
     .unwrap();
 }
 
+#[cfg(windows)]
 #[tokio::test]
 async fn dropping_inflight_future_poisoned_native_continuation() {
     let fixture = FixtureDir::new();

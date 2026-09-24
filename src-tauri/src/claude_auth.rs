@@ -11,7 +11,10 @@ use sha2::{Digest, Sha256};
 use crate::config::{Config, DataDirs};
 
 const RELEASE_BASE: &str = "https://downloads.claude.ai/claude-code-releases";
+#[cfg(windows)]
 const CLAUDE_BIN_FILENAME: &str = "claude.exe";
+#[cfg(not(windows))]
+const CLAUDE_BIN_FILENAME: &str = "claude";
 const MAX_MANIFEST_BYTES: usize = 2 * 1024 * 1024;
 const MAX_BINARY_BYTES: u64 = 350 * 1024 * 1024;
 
@@ -196,7 +199,7 @@ pub async fn install(dirs: &DataDirs) -> Result<ClaudeAuthState, String> {
         MAX_MANIFEST_BYTES as u64,
     )
     .await?;
-    let checksum = manifest_checksum(&manifest_bytes, windows_platform())?;
+    let checksum = manifest_checksum(&manifest_bytes, release_platform())?;
     let destination = dirs.claude_bin_dir().join(CLAUDE_BIN_FILENAME);
     fs::create_dir_all(dirs.claude_bin_dir())
         .map_err(|_| "provider install directory cannot be created".to_string())?;
@@ -205,8 +208,8 @@ pub async fn install(dirs: &DataDirs) -> Result<ClaudeAuthState, String> {
         .join(format!("claude-{version}-{}.tmp", uuid::Uuid::new_v4()));
     let response = client
         .get(format!(
-            "{RELEASE_BASE}/{version}/{}/claude.exe",
-            windows_platform()
+            "{RELEASE_BASE}/{version}/{}/{CLAUDE_BIN_FILENAME}",
+            release_platform()
         ))
         .send()
         .await
@@ -249,6 +252,13 @@ pub async fn install(dirs: &DataDirs) -> Result<ClaudeAuthState, String> {
         if actual != checksum {
             return Err("provider binary checksum mismatch".to_string());
         }
+        #[cfg(unix)]
+        {
+            drop(file);
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(&temp, fs::Permissions::from_mode(0o755))
+                .map_err(|_| "provider binary cannot be written".to_string())?;
+        }
         verify_anthropic_signature(&temp)?;
         if destination.exists() {
             fs::remove_file(&destination)
@@ -279,11 +289,19 @@ fn manifest_checksum(bytes: &[u8], platform: &str) -> Result<String, String> {
     Ok(checksum.to_ascii_lowercase())
 }
 
-fn windows_platform() -> &'static str {
-    if cfg!(target_arch = "aarch64") {
-        "win32-arm64"
-    } else {
-        "win32-x64"
+/// Claude Code release-manifest platform key for this build target.
+fn release_platform() -> &'static str {
+    match (
+        cfg!(windows),
+        cfg!(target_os = "macos"),
+        cfg!(target_arch = "aarch64"),
+    ) {
+        (true, _, true) => "win32-arm64",
+        (true, _, false) => "win32-x64",
+        (false, true, true) => "darwin-arm64",
+        (false, true, false) => "darwin-x64",
+        (false, false, true) => "linux-arm64",
+        (false, false, false) => "linux-x64",
     }
 }
 
@@ -507,9 +525,33 @@ fn verify_anthropic_signature(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(not(windows))]
+/// Anthropic's Apple Developer ID team; the requirement pins an Apple-anchored
+/// leaf certificate issued to that team.
+#[cfg(target_os = "macos")]
+const ANTHROPIC_CODE_REQUIREMENT: &str =
+    "=anchor apple generic and certificate leaf[subject.OU] = \"Q6L2SF6YDW\"";
+
+#[cfg(target_os = "macos")]
+fn verify_anthropic_signature(path: &Path) -> Result<(), String> {
+    let status = Command::new("/usr/bin/codesign")
+        .arg("--verify")
+        .arg("--strict")
+        .arg(format!("-R{ANTHROPIC_CODE_REQUIREMENT}"))
+        .arg(path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|_| "provider binary signature verification failed".to_string())?;
+    if !status.success() {
+        return Err("provider binary signature verification failed".to_string());
+    }
+    Ok(())
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 fn verify_anthropic_signature(_path: &Path) -> Result<(), String> {
-    Err("provider binary signature verification requires Windows".to_string())
+    Err("provider binary signature verification is unavailable on this platform".to_string())
 }
 
 #[cfg(test)]

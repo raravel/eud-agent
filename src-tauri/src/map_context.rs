@@ -213,7 +213,12 @@ fn resolve_starcraft_path(dirs: &DataDirs) -> Result<PathBuf, String> {
         }
         return Err("STARCRAFT_PATH does not name an installed StarCraft directory".to_string());
     }
-    let standard = PathBuf::from(r"C:\Program Files (x86)\StarCraft");
+    // Default Battle.net install location for this platform.
+    let standard = PathBuf::from(if cfg!(windows) {
+        r"C:\Program Files (x86)\StarCraft"
+    } else {
+        "/Applications/StarCraft"
+    });
     if standard.is_dir() {
         return Ok(standard);
     }

@@ -1,3 +1,4 @@
+#[cfg(windows)] // PowerShell process fixtures
 mod claude_size;
 mod codex_live;
 mod concurrency;
@@ -6,10 +7,14 @@ mod direct_write_transition;
 mod fixtures;
 mod harness_retry;
 mod live;
+#[cfg(windows)] // PowerShell process fixtures
 mod native_ask;
+#[cfg(windows)] // PowerShell process fixtures
 mod native_mcp;
+#[cfg(windows)] // PowerShell process fixtures
 mod native_pending_mutation;
 mod native_recovery;
+#[cfg(windows)] // PowerShell process fixtures
 mod native_usage;
 mod opencode_delta_coalescing;
 mod opencode_live;

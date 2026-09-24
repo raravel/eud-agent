@@ -2266,10 +2266,7 @@ fn ensure_no_symlink_components(path: &Path) -> Result<(), String> {
     };
     for ancestor in absolute.ancestors() {
         match fs::symlink_metadata(ancestor) {
-            Ok(metadata)
-                if metadata.file_type().is_symlink()
-                    || crate::memory::is_reparse_point(&metadata) =>
-            {
+            Ok(metadata) if crate::memory::is_untrusted_link(&metadata) => {
                 return Err(format!(
                     "프로젝트 경로에 심볼릭 링크 또는 재분석 지점이 있습니다: {}",
                     ancestor.display()

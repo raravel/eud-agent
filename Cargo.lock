@@ -1297,10 +1297,12 @@ dependencies = [
  "image",
  "isom",
  "jsonschema",
+ "libc",
  "parking_lot",
  "png 0.18.1",
  "reqwest 0.12.28",
  "rmcp",
+ "security-framework",
  "serde",
  "serde_json",
  "sha2",
@@ -2436,6 +2438,7 @@ name = "isom-sys"
 version = "0.1.0"
 dependencies = [
  "bindgen",
+ "cc",
 ]
 
 [[package]]

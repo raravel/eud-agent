@@ -5,6 +5,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
+#[cfg(windows)]
 use zeroize::Zeroize;
 
 use crate::config::DataDirs;
@@ -21,7 +22,11 @@ pub struct ProviderSecretStore {
 
 impl ProviderSecretStore {
     pub fn new(dirs: DataDirs) -> Result<Self, String> {
-        let user_home = std::env::var_os("USERPROFILE")
+        #[cfg(windows)]
+        const HOME_VAR: &str = "USERPROFILE";
+        #[cfg(not(windows))]
+        const HOME_VAR: &str = "HOME";
+        let user_home = std::env::var_os(HOME_VAR)
             .filter(|value| !value.is_empty())
             .map(PathBuf::from)
             .ok_or_else(|| "provider credential profile is unavailable".to_string())?;
@@ -225,7 +230,7 @@ fn is_reparse_point(metadata: &fs::Metadata) -> bool {
 
 #[cfg(not(windows))]
 fn is_reparse_point(metadata: &fs::Metadata) -> bool {
-    metadata.file_type().is_symlink()
+    crate::memory::is_untrusted_link(metadata)
 }
 
 pub fn harden_private_path(path: &Path) -> Result<(), String> {
@@ -319,9 +324,23 @@ fn harden_private_path_impl(path: &Path) -> Result<(), String> {
     result
 }
 
-#[cfg(not(windows))]
+/// Owner-only POSIX mode: 0700 for directories, 0600 for files.
+#[cfg(unix)]
+fn harden_private_path_impl(path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|_| "provider credential path cannot be inspected".to_string())?;
+    if metadata.file_type().is_symlink() {
+        return Err("provider credential path is a symbolic link".to_string());
+    }
+    let mode = if metadata.is_dir() { 0o700 } else { 0o600 };
+    fs::set_permissions(path, fs::Permissions::from_mode(mode))
+        .map_err(|_| "provider credential permissions cannot be restricted".to_string())
+}
+
+#[cfg(not(any(windows, unix)))]
 fn harden_private_path_impl(_path: &Path) -> Result<(), String> {
-    Err("provider credential profiles require Windows ACLs".to_string())
+    Err("provider credential profiles require owner-only permissions".to_string())
 }
 
 fn ensure_private_file(path: &Path) -> Result<(), String> {
@@ -426,17 +445,49 @@ fn delete_os_secret(target: &str) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(not(windows))]
+/// macOS keeps provider API keys in the login Keychain as generic passwords
+/// (service = credential target, account = `eud-agent`).
+#[cfg(target_os = "macos")]
+const KEYCHAIN_ACCOUNT: &str = "eud-agent";
+
+#[cfg(target_os = "macos")]
+const ERR_SEC_ITEM_NOT_FOUND: i32 = -25300;
+
+#[cfg(target_os = "macos")]
+fn write_os_secret(target: &str, secret: &[u8]) -> Result<(), String> {
+    security_framework::passwords::set_generic_password(target, KEYCHAIN_ACCOUNT, secret)
+        .map_err(|_| "provider credential store write failed".to_string())
+}
+
+#[cfg(target_os = "macos")]
+fn read_os_secret(target: &str) -> Result<Option<Vec<u8>>, String> {
+    match security_framework::passwords::get_generic_password(target, KEYCHAIN_ACCOUNT) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if error.code() == ERR_SEC_ITEM_NOT_FOUND => Ok(None),
+        Err(_) => Err("provider credential store read failed".to_string()),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn delete_os_secret(target: &str) -> Result<(), String> {
+    match security_framework::passwords::delete_generic_password(target, KEYCHAIN_ACCOUNT) {
+        Ok(()) => Ok(()),
+        Err(error) if error.code() == ERR_SEC_ITEM_NOT_FOUND => Ok(()),
+        Err(_) => Err("provider credential store delete failed".to_string()),
+    }
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 fn write_os_secret(_target: &str, _secret: &[u8]) -> Result<(), String> {
     Err("provider credential store is unavailable".to_string())
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 fn read_os_secret(_target: &str) -> Result<Option<Vec<u8>>, String> {
     Err("provider credential store is unavailable".to_string())
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 fn delete_os_secret(_target: &str) -> Result<(), String> {
     Err("provider credential store is unavailable".to_string())
 }

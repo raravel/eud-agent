@@ -1254,7 +1254,7 @@ pub async fn map_agent_open(app: tauri::AppHandle) -> Result<(), String> {
         window.set_focus().map_err(|error| error.to_string())?;
         return Ok(());
     }
-    tauri::WebviewWindowBuilder::new(
+    let builder = tauri::WebviewWindowBuilder::new(
         &app,
         MAP_WINDOW_LABEL,
         tauri::WebviewUrl::App("map-agent.html".into()),
@@ -1262,10 +1262,14 @@ pub async fn map_agent_open(app: tauri::AppHandle) -> Result<(), String> {
     .title("Map Agent Workbench")
     .inner_size(1600.0, 960.0)
     .min_inner_size(1100.0, 700.0)
-    .resizable(true)
-    .drag_and_drop(false)
-    .build()
-    .map_err(|error| error.to_string())?;
+    .resizable(true);
+    // Window-level OLE drag/drop is a Windows-only builder option; other platforms
+    // disable the webview drag/drop handler so HTML5 drag/drop reaches the page.
+    #[cfg(windows)]
+    let builder = builder.drag_and_drop(false);
+    #[cfg(not(windows))]
+    let builder = builder.disable_drag_drop_handler();
+    builder.build().map_err(|error| error.to_string())?;
     Ok(())
 }
 

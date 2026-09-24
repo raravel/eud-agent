@@ -905,6 +905,10 @@ impl NativeProjectManager {
         let manifest_path = project.manifest_path().to_path_buf();
         let manifest_bytes = fs::read(&manifest_path).map_err(stringify_io)?;
         let manifest_sha256 = sha256_bytes(&manifest_bytes);
+        // Managed uv and the win_amd64 wheel policy target the Windows frozen runtime.
+        if !cfg!(windows) {
+            return Err("Python 의존성 준비는 현재 Windows에서만 지원됩니다.".to_string());
+        }
         let uv = crate::bootstrap::managed_uv_path(&self.dirs).map_err(|error| {
             format!("검증된 관리형 uv {MANAGED_UV_VERSION}을 찾지 못했습니다: {error}")
         })?;
@@ -1174,13 +1178,17 @@ impl NativeProjectManager {
         }
         let path = Path::new(configured);
         let executable = if path.is_file()
-            && path
-                .file_name()
-                .is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case("euddraft.exe"))
-        {
+            && path.file_name().is_some_and(|name| {
+                name.to_string_lossy()
+                    .eq_ignore_ascii_case(crate::native_build::EUDDRAFT_EXECUTABLE_NAME)
+            }) {
             path.to_path_buf()
-        } else if path.is_dir() && path.join("euddraft.exe").is_file() {
-            path.join("euddraft.exe")
+        } else if path.is_dir()
+            && path
+                .join(crate::native_build::EUDDRAFT_EXECUTABLE_NAME)
+                .is_file()
+        {
+            path.join(crate::native_build::EUDDRAFT_EXECUTABLE_NAME)
         } else {
             return Err(
                 "직접 Python 실행에는 설정된 frozen euddraft.exe가 필요합니다.".to_string(),

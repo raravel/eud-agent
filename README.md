@@ -97,6 +97,25 @@ npm --prefix panel run build
 
 Real build and E3S acceptance commands are documented in [`hivemind/docs/verify.md`](./hivemind/docs/verify.md).
 
+### macOS (local development)
+
+Windows is the release platform. macOS (Apple silicon) builds and runs for development with Xcode command-line tools, Rust, Node.js/npm, and the Tauri CLI:
+
+```sh
+cargo install tauri-cli --locked
+(cd panel && npm ci)
+scripts/dev_run.sh                 # cargo tauri dev; merges src-tauri/tauri.macos.conf.json
+cargo test -p eud-agent
+```
+
+Platform differences on macOS:
+
+- euddraft: select the extensionless `euddraft` launcher from the official `euddraft<version>-macos.zip` (or `euddraft.py`); the in-app update downloads the `-macos` release asset.
+- App data: `~/Library/Application Support/eud-agent` (Roaming equivalent) and `~/Library/Caches/eud-agent` (LocalAppData equivalent).
+- Provider API keys live in the login Keychain; provider profiles use owner-only (0700/0600) permissions.
+- Codex resolves from the executable override or `PATH` (no managed download); Claude Code installs the signed `darwin` build.
+- Windows-only: managed FFmpeg (sound import), managed uv / Python package dependencies, runtime trace tests (StarCraft x86 client), and the SCMDraft no-share map-lock probe.
+
 ## Architecture
 
 ```mermaid

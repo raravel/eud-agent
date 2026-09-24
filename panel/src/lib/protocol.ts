@@ -698,7 +698,7 @@ export interface SetupImportE3sMessage {
 }
 
 
-/** Pick `euddraft.exe` or `euddraft.py`. */
+/** Pick the frozen euddraft launcher (`euddraft.exe` / macOS `euddraft`) or `euddraft.py`. */
 export interface SetupPickEuddraftPathMessage {
   type: "setup_pick_euddraft_path";
 }

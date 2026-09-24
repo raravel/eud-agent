@@ -95,6 +95,25 @@ npm --prefix panel run build
 
 실제 euddraft와 E3S 검증 절차는 [`hivemind/docs/verify.md`](./hivemind/docs/verify.md)에 있습니다.
 
+### macOS (로컬 개발)
+
+배포 플랫폼은 Windows입니다. macOS(Apple silicon)에서는 Xcode command-line tools, Rust, Node.js/npm, Tauri CLI로 개발용 빌드/실행이 가능합니다.
+
+```sh
+cargo install tauri-cli --locked
+(cd panel && npm ci)
+scripts/dev_run.sh                 # cargo tauri dev, src-tauri/tauri.macos.conf.json 자동 병합
+cargo test -p eud-agent
+```
+
+macOS 차이점:
+
+- euddraft: 공식 `euddraft<버전>-macos.zip`의 확장자 없는 `euddraft` 실행 파일(또는 `euddraft.py`)을 선택합니다. 앱 내 업데이트는 `-macos` 릴리스를 받습니다.
+- 앱 데이터: `~/Library/Application Support/eud-agent`(Roaming 대응), `~/Library/Caches/eud-agent`(LocalAppData 대응).
+- 제공자 API 키는 로그인 키체인에 저장되고, 제공자 프로필은 소유자 전용(0700/0600) 권한을 사용합니다.
+- Codex는 실행 파일 지정 또는 `PATH`에서 찾습니다(관리형 다운로드 없음). Claude Code는 서명된 `darwin` 빌드를 설치합니다.
+- Windows 전용: 관리형 FFmpeg(사운드 가져오기), 관리형 uv/Python 패키지 의존성, 런타임 trace 테스트(StarCraft x86 클라이언트), SCMDraft 공유 잠금 검사.
+
 ## 구조
 
 ```mermaid

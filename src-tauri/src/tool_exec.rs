@@ -4338,6 +4338,8 @@ struct ToolCompletionBarrier {
 
 #[cfg(test)]
 impl SessionToolRuntime {
+    // Used by the Windows-only PowerShell process contracts.
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub(crate) fn pause_mutation_completion(
         &self,
     ) -> (

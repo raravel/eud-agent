@@ -633,13 +633,19 @@ pub(crate) fn validate_existing_components(path: &Path) -> io::Result<()> {
         }
         match fs::symlink_metadata(&current) {
             Ok(metadata) => {
-                if metadata.file_type().is_symlink() || is_reparse_point(&metadata) {
+                if is_untrusted_link(&metadata) {
                     return Err(io::Error::new(
                         io::ErrorKind::PermissionDenied,
                         "memory path contains a symlink/reparse point",
                     ));
                 }
-                if !metadata.is_dir() {
+                // A trusted system link must still resolve to a directory.
+                let is_dir = if metadata.file_type().is_symlink() {
+                    fs::metadata(&current).is_ok_and(|target| target.is_dir())
+                } else {
+                    metadata.is_dir()
+                };
+                if !is_dir {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidInput,
                         "memory path contains a non-directory component",
@@ -681,6 +687,20 @@ pub(crate) fn is_reparse_point(metadata: &fs::Metadata) -> bool {
 #[cfg(not(windows))]
 pub(crate) fn is_reparse_point(_metadata: &fs::Metadata) -> bool {
     false
+}
+
+/// A path-ancestor link an unprivileged user could have planted. Root-owned Unix
+/// system links (macOS `/var` -> `/private/var`, `/tmp`) are trusted ancestors;
+/// on Windows every symlink or reparse point is rejected.
+#[cfg(unix)]
+pub(crate) fn is_untrusted_link(metadata: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    metadata.file_type().is_symlink() && metadata.uid() != 0
+}
+
+#[cfg(not(unix))]
+pub(crate) fn is_untrusted_link(metadata: &fs::Metadata) -> bool {
+    metadata.file_type().is_symlink() || is_reparse_point(metadata)
 }
 
 fn invalid_source(message: &str) -> io::Error {
@@ -1479,6 +1499,21 @@ mod tests {
             .iter()
             .any(|issue| issue.path.ends_with("resources.md")));
         guard.commit();
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ancestors_trust_root_owned_system_links_but_reject_user_links() {
+        let base = std::env::temp_dir().join(format!("eud-memory-links-{}", uuid::Uuid::new_v4()));
+        let real = base.join("real");
+        fs::create_dir_all(&real).unwrap();
+        // macOS temp dirs live under the root-owned `/var` -> `/private/var` link.
+        validate_existing_components(&real.join("child")).unwrap();
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let error = validate_existing_components(&link.join("child")).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
         fs::remove_dir_all(base).ok();
     }
 }

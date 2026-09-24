@@ -4,6 +4,9 @@
 //! request-owned epScript plugin, builds into the user's StarCraft Maps folder,
 //! launches a dedicated 32-bit client, and reads a structured ring buffer from
 //! that exact process. The connected source map and editor project are read-only.
+//! The client launch and ring-buffer reader are Windows-only; other platforms
+//! report `windows_runtime_required` after the build phase.
+#![cfg_attr(not(windows), allow(dead_code))]
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};

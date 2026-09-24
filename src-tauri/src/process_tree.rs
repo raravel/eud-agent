@@ -1,9 +1,10 @@
-//! Windows process-tree runner used by managed Python tooling and euddraft.
+//! Process-tree runner used by managed Python tooling and euddraft.
 //!
 //! Windows children are created suspended, assigned to a non-breakaway Job Object
 //! configured with kill-on-close, and resumed only after stdout/stderr drainers are
 //! active. This closes the spawn/assignment race and guarantees timeout/cancellation
-//! terminates descendants as one unit.
+//! terminates descendants as one unit. Unix children lead a new process group that
+//! is signalled as one unit on timeout, cancellation, and root exit.
 
 use std::io::Read;
 use std::process::{Command, Stdio};
@@ -129,8 +130,8 @@ pub fn run_process_tree(
             break ProcessEnd::TimedOut;
         }
         match child.try_wait() {
-            Ok(Some(_)) => {
-                let raw = platform::raw_exit_code(&child)?;
+            Ok(Some(status)) => {
+                let raw = platform::raw_exit_code(&child, status)?;
                 break ProcessEnd::Exited(raw);
             }
             Ok(None) => thread::sleep(PROCESS_POLL_INTERVAL),
@@ -171,7 +172,7 @@ mod platform {
     use std::mem::size_of;
     use std::os::windows::io::AsRawHandle;
     use std::os::windows::process::CommandExt;
-    use std::process::{Child, Command};
+    use std::process::{Child, Command, ExitStatus};
 
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::System::Diagnostics::ToolHelp::{
@@ -264,7 +265,7 @@ mod platform {
         }
     }
 
-    pub(super) fn raw_exit_code(child: &Child) -> Result<u32, String> {
+    pub(super) fn raw_exit_code(child: &Child, _status: ExitStatus) -> Result<u32, String> {
         let mut code = 0_u32;
         let ok = unsafe { GetExitCodeProcess(child.as_raw_handle() as HANDLE, &mut code) };
         if ok == 0 {
@@ -301,33 +302,53 @@ mod platform {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(unix)]
 mod platform {
-    use std::process::{Child, Command};
+    use std::os::unix::process::{CommandExt, ExitStatusExt};
+    use std::process::{Child, Command, ExitStatus};
 
-    pub(super) fn configure_suspended(_command: &mut Command) {}
+    /// Unix has no Job Object; the child leads a fresh process group instead so
+    /// timeout, cancellation, and root exit can signal every descendant that did
+    /// not deliberately leave the group (`setsid`/`setpgid`).
+    pub(super) fn configure_suspended(command: &mut Command) {
+        command.process_group(0);
+    }
 
-    pub(super) struct ProcessTreeGuard;
+    pub(super) struct ProcessTreeGuard {
+        group: libc::pid_t,
+    }
 
     impl ProcessTreeGuard {
-        pub(super) fn attach(_child: &Child) -> Result<Self, String> {
-            Ok(Self)
+        pub(super) fn attach(child: &Child) -> Result<Self, String> {
+            let group = libc::pid_t::try_from(child.id())
+                .map_err(|_| "프로세스 그룹 ID가 올바르지 않습니다.".to_string())?;
+            Ok(Self { group })
         }
 
         pub(super) fn resume(&self) -> Result<(), String> {
             Ok(())
         }
 
-        pub(super) fn terminate(&self, _code: u32) {}
+        pub(super) fn terminate(&self, _code: u32) {
+            // ESRCH (group already empty) is the expected success case after exit.
+            unsafe { libc::killpg(self.group, libc::SIGKILL) };
+        }
     }
 
-    pub(super) fn raw_exit_code(child: &Child) -> Result<u32, String> {
-        child
-            .try_wait()
-            .map_err(|error| format!("프로세스 종료 코드를 읽지 못했습니다: {error}"))?
-            .and_then(|status| status.code())
+    /// Mirror the Job Object's kill-on-close: an early return never leaks the group.
+    impl Drop for ProcessTreeGuard {
+        fn drop(&mut self) {
+            self.terminate(1);
+        }
+    }
+
+    /// Signal deaths map to the shell convention `128 + signal`.
+    pub(super) fn raw_exit_code(_child: &Child, status: ExitStatus) -> Result<u32, String> {
+        status
+            .code()
             .map(|code| code as u32)
-            .ok_or_else(|| "프로세스가 종료되지 않았거나 종료 코드가 없습니다.".to_string())
+            .or_else(|| status.signal().map(|signal| 128 + signal as u32))
+            .ok_or_else(|| "프로세스 종료 코드를 읽지 못했습니다.".to_string())
     }
 }
 
@@ -425,6 +446,82 @@ mod tests {
             Some(&cancellation),
         )
         .unwrap();
+        cancel_thread.join().unwrap();
+        assert_eq!(output.end, ProcessEnd::Cancelled);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod unix_tests {
+    use super::*;
+    use std::fs;
+
+    fn sh(script: &str) -> Command {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", script]);
+        command
+    }
+
+    fn marker(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "eud-agent-process-tree-{tag}-{}.txt",
+            uuid::Uuid::new_v4().simple()
+        ))
+    }
+
+    #[test]
+    fn drains_large_stdout_and_stderr_without_deadlock() {
+        let output = run_process_tree(
+            sh("i=0; while [ $i -lt 12000 ]; do echo stdout-$i; echo stderr-$i 1>&2; i=$((i+1)); done"),
+            Duration::from_secs(20),
+            None,
+        )
+        .unwrap();
+        assert_eq!(output.end, ProcessEnd::Exited(0));
+        assert!(output.stdout.len() > 64 * 1024);
+        assert!(output.stderr.len() > 64 * 1024);
+    }
+
+    #[test]
+    fn signal_death_reports_shell_style_exit_code() {
+        let output = run_process_tree(sh("kill -9 $$"), Duration::from_secs(5), None).unwrap();
+        assert_eq!(output.end, ProcessEnd::Exited(128 + 9));
+    }
+
+    #[test]
+    fn timeout_kills_grandchild_before_it_can_write() {
+        let marker = marker("timeout");
+        let script = format!("(sleep 2; echo leaked > '{}') & sleep 30", marker.display());
+        let output = run_process_tree(sh(&script), Duration::from_millis(250), None).unwrap();
+        assert_eq!(output.end, ProcessEnd::TimedOut);
+        thread::sleep(Duration::from_secs(3));
+        assert!(!marker.exists());
+        fs::remove_file(marker).ok();
+    }
+
+    #[test]
+    fn root_exit_terminates_pipe_inheriting_grandchild() {
+        let marker = marker("root-exit");
+        let script = format!("(sleep 2; echo leaked > '{}') &", marker.display());
+        let started = Instant::now();
+        let output = run_process_tree(sh(&script), Duration::from_secs(10), None).unwrap();
+        assert_eq!(output.end, ProcessEnd::Exited(0));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        thread::sleep(Duration::from_secs(3));
+        assert!(!marker.exists());
+        fs::remove_file(marker).ok();
+    }
+
+    #[test]
+    fn cancellation_terminates_process_tree() {
+        let cancellation = ProcessCancellation::default();
+        let trigger = cancellation.clone();
+        let cancel_thread = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(100));
+            trigger.cancel();
+        });
+        let output =
+            run_process_tree(sh("sleep 30"), Duration::from_secs(10), Some(&cancellation)).unwrap();
         cancel_thread.join().unwrap();
         assert_eq!(output.end, ProcessEnd::Cancelled);
     }

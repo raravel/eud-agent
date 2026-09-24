@@ -105,9 +105,48 @@ fn play_notification_sound() -> Result<(), String> {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
 fn play_notification_sound() -> Result<(), String> {
-    Err("notification sounds are only supported on Windows".to_string())
+    spawn_detached(
+        std::process::Command::new("/usr/bin/afplay").arg("/System/Library/Sounds/Glass.aiff"),
+    )
+    .map_err(|error| format!("failed to play the macOS notification sound: {error}"))
+}
+
+#[cfg(target_os = "macos")]
+fn show_macos_notification(title: &str, body: &str) -> Result<(), String> {
+    // Text is passed as argv, never interpolated into the AppleScript source.
+    spawn_detached(
+        std::process::Command::new("/usr/bin/osascript")
+            .args([
+                "-e",
+                "on run argv",
+                "-e",
+                "display notification (item 2 of argv) with title (item 1 of argv)",
+                "-e",
+                "end run",
+            ])
+            .arg(title)
+            .arg(body),
+    )
+    .map_err(|error| format!("failed to show the macOS notification: {error}"))
+}
+
+/// Start a short-lived helper and reap it off the async runtime.
+#[cfg(target_os = "macos")]
+fn spawn_detached(command: &mut std::process::Command) -> std::io::Result<()> {
+    let mut child = command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
+    std::thread::spawn(move || child.wait());
+    Ok(())
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+fn play_notification_sound() -> Result<(), String> {
+    Err("notification sounds are only supported on Windows and macOS".to_string())
 }
 
 /// `chat` command input.
@@ -698,10 +737,15 @@ pub async fn attention_notify(
         {
             crate::windows_notification::show(&app, text.title, &text.body, &session_id).err()
         }
-        #[cfg(not(windows))]
+        #[cfg(target_os = "macos")]
+        {
+            let _ = (app, session_id);
+            show_macos_notification(text.title, &text.body).err()
+        }
+        #[cfg(not(any(windows, target_os = "macos")))]
         {
             let _ = (app, text, session_id);
-            Some("OS notifications are only supported on Windows".to_string())
+            Some("OS notifications are only supported on Windows and macOS".to_string())
         }
     } else {
         None

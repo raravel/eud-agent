@@ -841,7 +841,22 @@ fn open_system_browser(url: &str) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+fn open_system_browser(url: &str) -> Result<(), String> {
+    let status = std::process::Command::new("/usr/bin/open")
+        .arg(url)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map_err(|_| "provider_transport_closed".to_string())?;
+    if !status.success() {
+        return Err("provider_transport_closed".to_string());
+    }
+    Ok(())
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 fn open_system_browser(_url: &str) -> Result<(), String> {
     Err("provider_transport_closed".to_string())
 }

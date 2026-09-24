@@ -36,6 +36,7 @@ import type {
   NotificationChannelSettings,
   NotificationEvent,
 } from "@/lib/ipc";
+import { isMacOS } from "@/lib/platform";
 import { cn, formatPathForDisplay } from "@/lib/utils";
 import {
   AVAILABILITY_LABELS,
@@ -801,7 +802,7 @@ export function SettingsDialog({
                         <Volume2 aria-hidden className="size-4 text-primary" />
                         <div>
                           <p className="text-sm font-medium">기본 알림음</p>
-                          <p className="mt-0.5 text-xs text-muted-foreground">Windows 기본 알림음을 사용합니다.</p>
+                          <p className="mt-0.5 text-xs text-muted-foreground">{isMacOS() ? "macOS" : "Windows"} 기본 알림음을 사용합니다.</p>
                         </div>
                       </div>
                       <Button type="button" variant="outline" size="sm" onClick={onPreviewSound}>

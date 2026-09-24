@@ -241,6 +241,14 @@ pub struct NativeBuildResult {
     pub artifacts: NativeBuildArtifacts,
 }
 
+/// File name of the frozen euddraft distribution's launcher on this platform.
+/// Official releases ship `euddraft.exe` on Windows and an extensionless
+/// Mach-O/ELF `euddraft` on macOS/Linux.
+#[cfg(windows)]
+pub const EUDDRAFT_EXECUTABLE_NAME: &str = "euddraft.exe";
+#[cfg(not(windows))]
+pub const EUDDRAFT_EXECUTABLE_NAME: &str = "euddraft";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EuddraftLaunch {
     Executable(PathBuf),
@@ -286,13 +294,13 @@ impl EuddraftLaunch {
                     script,
                 });
             }
-            let executable = configured.join("euddraft.exe");
+            let executable = configured.join(EUDDRAFT_EXECUTABLE_NAME);
             if executable.is_file() {
                 return Ok(Self::Executable(executable));
             }
         }
         Err(format!(
-            "euddraft path does not identify euddraft.exe, euddraft.py, or a source root: {}",
+            "euddraft path does not identify {EUDDRAFT_EXECUTABLE_NAME}, euddraft.py, or a source root: {}",
             configured.display()
         ))
     }
@@ -302,7 +310,8 @@ impl EuddraftLaunch {
             Self::Executable(path)
                 if path.is_file()
                     && path.file_name().is_some_and(|name| {
-                        name.to_string_lossy().eq_ignore_ascii_case("euddraft.exe")
+                        name.to_string_lossy()
+                            .eq_ignore_ascii_case(EUDDRAFT_EXECUTABLE_NAME)
                     }) =>
             {
                 Ok(path)
@@ -365,7 +374,13 @@ impl EuddraftLaunch {
 
 fn configure_frozen_euddraft_environment(command: &mut Command) {
     command.env_clear();
-    for key in ["SystemRoot", "WINDIR", "TEMP", "TMP"] {
+    // Windows needs its system root and temp dirs; Unix frozen builds need the
+    // temp dir and home the bundled CPython resolves at startup.
+    #[cfg(windows)]
+    const INHERITED: &[&str] = &["SystemRoot", "WINDIR", "TEMP", "TMP"];
+    #[cfg(not(windows))]
+    const INHERITED: &[&str] = &["TMPDIR", "HOME"];
+    for key in INHERITED {
         if let Some(value) = std::env::var_os(key) {
             command.env(key, value);
         }

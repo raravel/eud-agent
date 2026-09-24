@@ -3,6 +3,7 @@ import { BotIcon, CheckIcon, CircleAlertIcon, FolderOpenIcon, Loader2Icon } from
 
 import { ProviderCard } from "@/components/ProviderCard";
 import { Button } from "@/components/ui/button";
+import { euddraftExecutableName } from "@/lib/platform";
 import { cn } from "@/lib/utils";
 import type { BootstrapView } from "@/setup/bootstrap";
 import {
@@ -19,7 +20,7 @@ import type {
 const PICK_ERROR_TEXT: Readonly<Record<string, string>> = {
   invalid_project_folder:
     "project.json이 있는 Native EUD 프로젝트 폴더를 선택해 주세요.",
-  invalid_euddraft_path: "euddraft.exe 또는 euddraft.py를 선택해 주세요.",
+  invalid_euddraft_path: `${euddraftExecutableName()} 또는 euddraft.py를 선택해 주세요.`,
 };
 
 function projectErrorText(error: string): string {
@@ -243,7 +244,7 @@ export function SetupScreen({
           <section className="mx-auto mt-6 max-w-xl rounded-xl border border-border bg-card p-6 shadow-sm">
             <h2 className="text-lg font-semibold">euddraft 실행 파일</h2>
             <p className="mt-2 text-sm leading-6 text-muted-foreground">
-              프로젝트를 직접 빌드할 euddraft.exe 또는 euddraft.py를 선택해 주세요.
+              프로젝트를 직접 빌드할 {euddraftExecutableName()} 또는 euddraft.py를 선택해 주세요.
             </p>
             {pickError && (
               <p role="alert" className="mt-4 flex gap-2 rounded-md border border-destructive/40 bg-destructive/10 p-3 text-sm text-destructive">

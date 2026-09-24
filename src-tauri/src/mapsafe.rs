@@ -423,8 +423,9 @@ impl LockProbe for WindowsLockProbe {
         false
     }
 
-    /// On non-Windows the probe reports unlocked (the apply still fails safely if
-    /// the underlying engine can't open the map).
+    /// Unix has no mandatory share modes, so an editor holding the map open cannot
+    /// be detected here; the probe reports unlocked and the stale-hash authority,
+    /// post-write CHK verification, and exact-backup rollback remain the guards.
     #[cfg(not(windows))]
     fn is_locked(&self, _path: &Path) -> bool {
         false
@@ -1211,7 +1212,38 @@ fn ensure_sound_disk_space(
             });
         }
     }
-    #[cfg(not(windows))]
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let parent = map_path.parent().ok_or_else(|| {
+            MapSafeError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "map path has no parent directory",
+            ))
+        })?;
+        let directory = std::ffi::CString::new(parent.as_os_str().as_bytes()).map_err(|_| {
+            MapSafeError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "map path contains NUL",
+            ))
+        })?;
+        let mut stats = std::mem::MaybeUninit::<libc::statvfs>::zeroed();
+        // SAFETY: `directory` is NUL-terminated and `stats` is a valid out pointer.
+        if unsafe { libc::statvfs(directory.as_ptr(), stats.as_mut_ptr()) } != 0 {
+            return Err(MapSafeError::Io(std::io::Error::last_os_error()));
+        }
+        // SAFETY: statvfs succeeded and initialized the struct.
+        let stats = unsafe { stats.assume_init() };
+        #[allow(clippy::unnecessary_cast)]
+        let available = (stats.f_bavail as u64).saturating_mul(stats.f_frsize as u64);
+        if available < required {
+            return Err(MapSafeError::InsufficientDisk {
+                required,
+                available,
+            });
+        }
+    }
+    #[cfg(not(any(windows, unix)))]
     {
         let _ = (map_path, required);
     }

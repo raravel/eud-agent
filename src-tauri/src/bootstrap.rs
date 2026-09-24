@@ -392,6 +392,10 @@ pub async fn ensure_ffmpeg(
     if let Ok(paths) = resolve_managed_ffmpeg(dirs) {
         return Ok(paths);
     }
+    // The pinned distribution is a Windows x64 build; never download it elsewhere.
+    if !cfg!(windows) {
+        bail!("the managed audio converter is only available on Windows");
+    }
     let manifest = managed_ffmpeg_manifest()?;
     fs::create_dir_all(dirs.bin_dir())?;
     let archive_tmp = dirs.bin_dir().join("ffmpeg-distribution.zip.tmp");
@@ -603,6 +607,12 @@ pub async fn ensure_codex(
     dirs: &DataDirs,
     emitter: &(dyn ProgressEmitter + Send + Sync),
 ) -> anyhow::Result<PathBuf> {
+    // The managed distribution is the Windows x64 release set. Other platforms use
+    // the user's own Codex install (executable override or PATH).
+    if !cfg!(windows) {
+        emitter.emit("codex_install", 100, "using codex from PATH");
+        return which::which("codex").context("Codex is not installed on PATH");
+    }
     let bin_dir = dirs.codex_bin_dir();
     fs::create_dir_all(&bin_dir)
         .with_context(|| format!("cannot create bin dir {}", bin_dir.display()))?;
@@ -1117,6 +1127,10 @@ pub async fn ensure_managed_uv(
     dirs: &DataDirs,
     emitter: &(dyn ProgressEmitter + Send + Sync),
 ) -> anyhow::Result<PathBuf> {
+    // The pinned archive is the Windows x64 build.
+    if !cfg!(windows) {
+        bail!("managed uv is only available on Windows");
+    }
     let root = dirs.uv_dir();
     fs::create_dir_all(&root)?;
     require_plain_directory(&root)?;
@@ -1159,7 +1173,15 @@ pub async fn ensure_managed_uv(
 const EUDDRAFT_RELEASE_API_URL: &str =
     "https://api.github.com/repos/armoha/euddraft/releases/latest";
 const EUDDRAFT_INSTALL_MARKER: &str = ".euddraft-install.json";
-const EUDDRAFT_EXE_FILENAME: &str = "euddraft.exe";
+const EUDDRAFT_EXE_FILENAME: &str = crate::native_build::EUDDRAFT_EXECUTABLE_NAME;
+/// Release asset suffix: Windows keeps the historical `euddraft<v>.zip`; other
+/// platforms use the official `-macos` / `-linux` distributions.
+#[cfg(windows)]
+const EUDDRAFT_ASSET_SUFFIX: &str = "";
+#[cfg(target_os = "macos")]
+const EUDDRAFT_ASSET_SUFFIX: &str = "-macos";
+#[cfg(all(not(windows), not(target_os = "macos")))]
+const EUDDRAFT_ASSET_SUFFIX: &str = "-linux";
 
 #[derive(Debug)]
 struct EuddraftReleaseSpec {
@@ -1197,7 +1219,7 @@ fn parse_euddraft_release(bytes: &[u8]) -> anyhow::Result<EuddraftReleaseSpec> {
         bail!("euddraft release metadata has an invalid tag_name");
     }
     let version_number = version.strip_prefix('v').unwrap_or(version);
-    let expected_name = format!("euddraft{version_number}.zip");
+    let expected_name = format!("euddraft{version_number}{EUDDRAFT_ASSET_SUFFIX}.zip");
     let asset = release
         .assets
         .iter()
@@ -1326,12 +1348,13 @@ fn euddraft_install_path(
                 .eq_ignore_ascii_case(EUDDRAFT_EXE_FILENAME)
         }) {
             if executable.is_some() {
-                bail!("euddraft install marker contains multiple euddraft.exe files");
+                bail!("euddraft install marker contains multiple {EUDDRAFT_EXE_FILENAME} files");
             }
             executable = Some(path);
         }
     }
-    let executable = executable.context("euddraft archive has no euddraft.exe")?;
+    let executable =
+        executable.with_context(|| format!("euddraft archive has no {EUDDRAFT_EXE_FILENAME}"))?;
     let declared = safe_euddraft_zip_path(&marker.executable)?;
     if declared != executable.strip_prefix(install_dir)? {
         bail!("euddraft install marker executable is invalid");
@@ -1384,6 +1407,13 @@ fn extract_euddraft_archive(
         let mut destination = File::create_new(&output)?;
         std::io::copy(&mut source, &mut destination)?;
         destination.flush()?;
+        // Unix distributions carry the launcher, dylibs, and extension modules as
+        // executable members; keep only the permission bits of the archived mode.
+        #[cfg(unix)]
+        if let Some(mode) = source.unix_mode() {
+            use std::os::unix::fs::PermissionsExt as _;
+            destination.set_permissions(fs::Permissions::from_mode(mode & 0o755))?;
+        }
         destination.sync_all()?;
         let bytes = destination.metadata()?.len();
         let sha256 = sha256_file(&output)?;
@@ -1392,7 +1422,7 @@ fn extract_euddraft_archive(
                 .eq_ignore_ascii_case(EUDDRAFT_EXE_FILENAME)
         }) {
             if executable.is_some() {
-                bail!("euddraft archive contains multiple euddraft.exe files");
+                bail!("euddraft archive contains multiple {EUDDRAFT_EXE_FILENAME} files");
             }
             executable = Some(relative.clone());
         }
@@ -1402,7 +1432,8 @@ fn extract_euddraft_archive(
             bytes,
         });
     }
-    let executable = executable.context("euddraft archive has no euddraft.exe")?;
+    let executable =
+        executable.with_context(|| format!("euddraft archive has no {EUDDRAFT_EXE_FILENAME}"))?;
     let marker = EuddraftInstallMarker {
         version: version.to_string(),
         archive_sha256: archive_sha256.to_string(),
@@ -1831,13 +1862,17 @@ mod manifest {
         let base = unique_temp_dir("euddraft-extract");
         let archive_path = base.join("release.zip");
         let mut archive = zip::ZipWriter::new(File::create(&archive_path).unwrap());
-        for (name, contents) in [
-            ("euddraft/euddraft.exe", "executable"),
-            ("euddraft/lib/python.dll", "runtime"),
-            ("euddraft/plugins/example.py", "plugin"),
+        let launcher = format!("euddraft/{EUDDRAFT_EXE_FILENAME}");
+        for (name, contents, mode) in [
+            (launcher.as_str(), "executable", 0o755),
+            ("euddraft/lib/python.dll", "runtime", 0o644),
+            ("euddraft/plugins/example.py", "plugin", 0o644),
         ] {
             archive
-                .start_file(name, zip::write::SimpleFileOptions::default())
+                .start_file(
+                    name,
+                    zip::write::SimpleFileOptions::default().unix_permissions(mode),
+                )
                 .unwrap();
             archive.write_all(contents.as_bytes()).unwrap();
         }
@@ -1846,6 +1881,13 @@ mod manifest {
         fs::create_dir(&staging).unwrap();
         let executable =
             extract_euddraft_archive(&archive_path, &staging, "v1", HELLO_SHA).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode(&executable), 0o755);
+            assert_eq!(mode(&staging.join("euddraft/plugins/example.py")), 0o644);
+        }
         assert_eq!(fs::read(executable).unwrap(), b"executable");
         assert_eq!(
             fs::read(staging.join("euddraft/plugins/example.py")).unwrap(),
@@ -1855,7 +1897,7 @@ mod manifest {
         fs::rename(staging, &installed).unwrap();
         assert_eq!(
             validate_euddraft_install(&installed, "v1", HELLO_SHA).unwrap(),
-            installed.join("euddraft/euddraft.exe")
+            installed.join(&launcher)
         );
         fs::write(installed.join("euddraft/lib/python.dll"), b"damaged").unwrap();
         assert!(validate_euddraft_install(&installed, "v1", HELLO_SHA).is_err());
@@ -2116,12 +2158,13 @@ mod manifest {
 
     #[test]
     fn euddraft_release_requires_pinned_official_zip_and_digest() {
+        let asset = format!("euddraft0.10.2.5{EUDDRAFT_ASSET_SUFFIX}.zip");
         let json = format!(
             r#"{{
                 "tag_name": "v0.10.2.5",
                 "assets": [{{
-                    "name": "euddraft0.10.2.5.zip",
-                    "browser_download_url": "https://github.com/armoha/euddraft/releases/download/v0.10.2.5/euddraft0.10.2.5.zip",
+                    "name": "{asset}",
+                    "browser_download_url": "https://github.com/armoha/euddraft/releases/download/v0.10.2.5/{asset}",
                     "digest": "sha256:{HELLO_SHA}",
                     "size": 15108674
                 }}]
@@ -2129,7 +2172,7 @@ mod manifest {
         );
         let release = parse_euddraft_release(json.as_bytes()).unwrap();
         assert_eq!(release.version, "v0.10.2.5");
-        assert_eq!(release.archive_name, "euddraft0.10.2.5.zip");
+        assert_eq!(release.archive_name, asset);
         assert_eq!(release.archive.sha256, HELLO_SHA);
         assert!(parse_euddraft_release(
             json.replace(
@@ -2140,7 +2183,7 @@ mod manifest {
         )
         .is_err());
         assert!(parse_euddraft_release(
-            json.replace("euddraft0.10.2.5.zip", "euddraft0.10.2.5-source.zip")
+            json.replace(&asset, "euddraft0.10.2.5-source.zip")
                 .as_bytes()
         )
         .is_err());

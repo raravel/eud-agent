@@ -900,7 +900,7 @@ export async function euddraftUpdate(
   return toEuddraftSettings(await invoke("euddraft_update"));
 }
 
-/** Play the native Windows sound used by attention notifications. */
+/** Play the native OS sound used by attention notifications. */
 export async function notificationSoundPreview(
   invoke: InvokeFn = tauriInvoke,
 ): Promise<void> {

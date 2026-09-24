@@ -315,7 +315,13 @@ impl DataDirs {
             return Ok(Self::from_test_data_root(Path::new(&root))?);
         }
         let roaming = manager.path().data_dir()?;
+        // Outside Windows `local_data_dir()` aliases `data_dir()` (macOS
+        // `~/Library/Application Support`), so large/regenerable state goes to the
+        // platform cache dir (`~/Library/Caches`) to keep the two roots distinct.
+        #[cfg(windows)]
         let local = manager.path().local_data_dir()?;
+        #[cfg(not(windows))]
+        let local = manager.path().cache_dir()?;
         Ok(Self::from_bases(&roaming, &local))
     }
 
@@ -970,29 +976,21 @@ mod tests {
 
     #[test]
     fn data_dirs_append_eud_agent_to_bases() {
-        let dirs = DataDirs::from_bases(&PathBuf::from("C:\\roam"), &PathBuf::from("C:\\loc"));
-        assert_eq!(dirs.app_data(), &PathBuf::from("C:\\roam\\eud-agent"));
-        assert_eq!(dirs.app_local_data(), &PathBuf::from("C:\\loc\\eud-agent"));
-        assert_eq!(
-            dirs.config_path(),
-            PathBuf::from("C:\\roam\\eud-agent\\config.json")
-        );
-        assert_eq!(
-            dirs.map_imports_dir(),
-            PathBuf::from("C:\\loc\\eud-agent\\map_imports")
-        );
+        let roam = PathBuf::from("C:\\roam");
+        let loc = PathBuf::from("C:\\loc");
+        let dirs = DataDirs::from_bases(&roam, &loc);
+        let app = roam.join("eud-agent");
+        let local = loc.join("eud-agent");
+        assert_eq!(dirs.app_data(), &app);
+        assert_eq!(dirs.app_local_data(), &local);
+        assert_eq!(dirs.config_path(), app.join("config.json"));
+        assert_eq!(dirs.map_imports_dir(), local.join("map_imports"));
         assert_eq!(
             dirs.managed_uv_dir("0.11.3"),
-            PathBuf::from("C:\\loc\\eud-agent\\uv\\0.11.3")
+            local.join("uv").join("0.11.3")
         );
-        assert_eq!(
-            dirs.python_downloads_dir(),
-            PathBuf::from("C:\\loc\\eud-agent\\python-downloads")
-        );
-        assert_eq!(
-            dirs.python_envs_dir(),
-            PathBuf::from("C:\\loc\\eud-agent\\python-envs")
-        );
+        assert_eq!(dirs.python_downloads_dir(), local.join("python-downloads"));
+        assert_eq!(dirs.python_envs_dir(), local.join("python-envs"));
     }
 
     #[test]
