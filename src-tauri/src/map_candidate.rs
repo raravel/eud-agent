@@ -21,6 +21,10 @@ use crate::map_stamp::{
 };
 use crate::map_verify::{MapRequestAuthority, MapVerificationService};
 
+const SELECTION_PALETTE_FILE: &str = "selection-palette.json";
+/// Project-relative; outside `.eud-agent/state/`, which the app's `.gitignore` excludes.
+const PROJECT_SELECTION_PALETTE: &str = ".eud-agent/map/selection-palette.json";
+
 #[derive(Clone)]
 pub struct CandidateStore {
     inner: Arc<CandidateStoreInner>,
@@ -2402,7 +2406,7 @@ impl CandidateStore {
 
     fn sync_selection_palette(&self, state: &mut CandidateSession) -> Result<bool, String> {
         let _palette = self.inner.selection_palette.lock();
-        let path = self.selection_library_path(&state.baseline.project_id);
+        let path = self.selection_library_path(&state.baseline.project_id)?;
         let existed = path.is_file();
         let mut library = self.read_selection_library(&state.baseline.project_id)?;
         if !existed && !state.selections.is_empty() {
@@ -2449,7 +2453,7 @@ impl CandidateStore {
         &self,
         project_id: &str,
     ) -> Result<PersistentSelectionLibrary, String> {
-        let path = self.selection_library_path(project_id);
+        let path = self.selection_library_path(project_id)?;
         if !path.is_file() {
             return Ok(PersistentSelectionLibrary::empty());
         }
@@ -2466,15 +2470,37 @@ impl CandidateStore {
         project_id: &str,
         library: &PersistentSelectionLibrary,
     ) -> Result<(), String> {
-        write_json_atomic(&self.selection_library_path(project_id), library)
+        write_json_atomic(&self.selection_library_path(project_id)?, library)
     }
 
-    fn selection_library_path(&self, project_id: &str) -> PathBuf {
-        self.inner
+    /// The selection palette (the Map window's saved target/protect/reference
+    /// areas) is authoring state, so it lives in the open project's
+    /// `.eud-agent/map/` and is committed with the map. A palette still in the
+    /// AppData candidate cache moves there once; the old file is renamed, not
+    /// deleted, so a palette the user later removes is never resurrected. An
+    /// id that is not the open project's keeps the AppData location.
+    fn selection_library_path(&self, project_id: &str) -> Result<PathBuf, String> {
+        let legacy = self
+            .inner
             .dirs
             .map_candidates_dir()
             .join(project_id)
-            .join("selection-palette.json")
+            .join(SELECTION_PALETTE_FILE);
+        let root = match self.inner.context.current_project_root() {
+            Ok(root) if crate::map_context::project_id_for_path(root.clone()) == project_id => root,
+            _ => return Ok(legacy),
+        };
+        let path = root.join(PROJECT_SELECTION_PALETTE);
+        if !path.exists() && legacy.is_file() {
+            let bytes = std::fs::read(&legacy)
+                .map_err(|error| format!("map selection palette could not be migrated: {error}"))?;
+            crate::memory::write_atomic_bytes(&path, &bytes)
+                .map_err(|error| format!("map selection palette could not be migrated: {error}"))?;
+            std::fs::rename(&legacy, legacy.with_extension("migrated.json")).map_err(|error| {
+                format!("migrated map selection palette could not be retired: {error}")
+            })?;
+        }
+        Ok(path)
     }
 
     fn session_root(&self, project_id: &str, session_id: &str) -> PathBuf {
@@ -5120,6 +5146,90 @@ mod tests {
             destination_before
         );
         store.discard(&project_id, "cross-map-session").unwrap();
+    }
+
+    /// The open project's palette is authoring state committed with the map:
+    /// it lives under the project root, an AppData palette moves there once,
+    /// and deleting the project copy never resurrects the retired one.
+    #[test]
+    fn selection_palette_lives_in_the_open_project_and_migrates_once() {
+        let base = unique_root();
+        let dirs = DataDirs::from_bases(&base.join("roaming"), &base.join("local"));
+        dirs.ensure_dirs().unwrap();
+        let root = base.join("project");
+        let manager = crate::native_runtime::NativeProjectManager::new(dirs.clone());
+        manager
+            .create_project(
+                &root,
+                crate::native_project::ProjectManifest {
+                    schema_version: crate::native_project::PROJECT_SCHEMA_VERSION,
+                    name: "Palette".to_string(),
+                    source_map: "maps/source.scx".to_string(),
+                    output_map: "build/output.scx".to_string(),
+                    main_file: "src/main.eps".to_string(),
+                    settings: Default::default(),
+                    plugins: Vec::new(),
+                    python_entrypoints: Vec::new(),
+                    python_dependencies: Vec::new(),
+                    python_lock: None,
+                    editor_compatibility: None,
+                },
+            )
+            .unwrap();
+        std::fs::create_dir_all(root.join("maps")).unwrap();
+        let source = root.join("maps/source.scx");
+        std::fs::copy(fixture(), &source).unwrap();
+        manager
+            .write_source("src/main.eps", "function onPluginStart() {}\n")
+            .unwrap();
+        let mut config = dirs.load_config().unwrap_or_default();
+        config.project_path = root.to_string_lossy().into_owned();
+        dirs.save_config(&config).unwrap();
+
+        let root = manager.open().unwrap().root().to_path_buf();
+        let project_id = crate::map_context::project_id_for_path(root.clone());
+        let mut snapshot = context(&dirs, &source);
+        snapshot.revision.project_id = project_id.clone();
+        let store = CandidateStore::new(
+            dirs.clone(),
+            crate::map_import::MapImportStore::new(dirs.clone()),
+        );
+        let view = store.create_session("map-session", &snapshot).unwrap();
+
+        let legacy = dirs
+            .map_candidates_dir()
+            .join(&project_id)
+            .join(SELECTION_PALETTE_FILE);
+        let mut library = PersistentSelectionLibrary::empty();
+        let earlier = full_target(&view, "earlier");
+        library.selections.insert(
+            earlier.id.clone(),
+            PersistentSelection::from_selection(&earlier),
+        );
+        write_json_atomic(&legacy, &library).unwrap();
+
+        let project_palette = root.join(PROJECT_SELECTION_PALETTE);
+        let migrated = store.persistent_selections(&project_id).unwrap();
+        assert_eq!(migrated.len(), 1);
+        assert_eq!(migrated[0].id, "earlier");
+        assert!(project_palette.is_file());
+        assert!(!legacy.exists());
+        assert!(legacy.with_extension("migrated.json").is_file());
+
+        store
+            .save_selection(&project_id, "map-session", full_target(&view, "target"))
+            .unwrap();
+        let saved: PersistentSelectionLibrary = read_json(&project_palette).unwrap();
+        assert_eq!(
+            saved.selections.keys().cloned().collect::<Vec<_>>(),
+            ["earlier", "target"]
+        );
+        assert!(!legacy.exists());
+
+        std::fs::remove_file(&project_palette).unwrap();
+        assert!(store.persistent_selections(&project_id).unwrap().is_empty());
+        assert!(!project_palette.exists());
+        std::fs::remove_dir_all(base).ok();
     }
 
     #[test]

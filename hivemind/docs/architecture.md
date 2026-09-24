@@ -86,7 +86,10 @@ The manifest itself uses `.eap` (EUD Agent Project); there is no separate launch
   open/state/request/apply boundary and, when the source hash moved, replays the session's revisions
   onto the new source with fresh verification, or marks `sourceDiverged` (candidate wins on Apply)
   when the new source rejects a revision on the visible chain. The Map panel polls the source mtime
-  and reopens the session on change instead of asking for a new work item.
+  and reopens the session on change instead of asking for a new work item. The selection palette
+  (saved target/protect/reference/anchor areas) is authoring state in the project's
+  `.eud-agent/map/selection-palette.json`, committed with the map; an AppData palette moves there
+  once and is kept as `selection-palette.migrated.json`.
 - Map window scenario properties ("맵 속성": title, description, 12 slots, 4 forces) are a
   UI-only request: `MapAgentService::properties_save` diffs the form against the current digest,
   emits `scenario.set`/`player.set`/`force.set` into a session work file, verifies it under a
