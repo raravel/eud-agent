@@ -16,6 +16,8 @@ use crate::bootstrap;
 use crate::config::DataDirs;
 use crate::memory::write_atomic_bytes;
 
+pub mod ffmpeg;
+
 pub const MAX_AUDIO_DURATION_MS: u64 = 3_600_000;
 pub const MAX_PROBE_STDOUT: usize = 256 * 1024;
 pub const MAX_NORMALIZED_AUDIO_BYTES: usize = 64 * 1024 * 1024;
@@ -25,6 +27,9 @@ const MAX_SAMPLE_RATE: u32 = 384_000;
 const PROBE_DEADLINE: Duration = Duration::from_secs(30);
 const TRANSCODE_DEADLINE: Duration = Duration::from_secs(5 * 60);
 const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(25);
+/// Poll interval while an [`OutputGuard`] watches a model-authored run, so a
+/// fast writer overshoots its limits by milliseconds of output, not tenths.
+const GUARDED_POLL_INTERVAL: Duration = Duration::from_millis(5);
 const FORMAT_ALLOWLIST: &[&str] = &[
     "wav", "ogg", "flac", "mp3", "aac", "mov", "mp4", "m4a", "aiff", "asf",
 ];
@@ -159,6 +164,12 @@ pub struct AudioBinding {
 }
 
 impl AudioBinding {
+    /// The bound source file, re-checked against its staged size and checksum.
+    pub fn verified_source_path(&self) -> Result<PathBuf, String> {
+        validate_bound_source(self)?;
+        Ok(self.source_path.clone())
+    }
+
     pub fn trusted_ref(&self) -> TrustedAudioRef {
         TrustedAudioRef {
             audio_ref: self.audio_ref.clone(),
@@ -248,6 +259,127 @@ impl AudioService {
             .map_err(|_| "오디오 변환 cache lock이 손상되었습니다.".to_string())? =
             Some(normalized.clone());
         Ok(normalized)
+    }
+
+    /// Write one input's bytes (e.g. a map MPQ sound) into the request temp.
+    pub fn stage_request_input(
+        &self,
+        request_temp: &RequestAudioTemp,
+        extension: &str,
+        bytes: &[u8],
+    ) -> Result<PathBuf, String> {
+        if bytes.is_empty() || bytes.len() > MAX_AUDIO_BYTES {
+            return Err("오디오 입력 크기 제한을 초과했습니다.".to_string());
+        }
+        let extension = if matches!(extension, "ogg" | "wav" | "flac" | "mp3") {
+            extension
+        } else {
+            "bin"
+        };
+        let path = request_temp
+            .path()
+            .join(format!("input-{}.{extension}", uuid::Uuid::new_v4()));
+        fs::write(&path, bytes)
+            .map_err(|error| format!("오디오 입력을 임시 폴더에 쓸 수 없습니다: {error}"))?;
+        Ok(path)
+    }
+
+    /// Run one validated `audio_ffmpeg` plan in a fresh output directory inside
+    /// the request temp and bind every file it wrote as a request audio source.
+    /// The returned bindings carry an empty `audio_ref`; the caller numbers them.
+    pub fn run_ffmpeg(
+        &self,
+        plan: &ffmpeg::FfmpegPlan,
+        input_paths: &[PathBuf],
+        request_temp: Arc<RequestAudioTemp>,
+        cancellation: Option<&tokio::sync::watch::Receiver<u64>>,
+    ) -> Result<Vec<AudioBinding>, String> {
+        if input_paths.len() != plan.inputs.len() {
+            return Err("audio_ffmpeg 입력 수가 계획과 다릅니다.".to_string());
+        }
+        let _single_job = match ffmpeg::FFMPEG_JOB.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                return Err(
+                    "다른 audio_ffmpeg 작업이 실행 중입니다. 앞 작업이 끝난 뒤 한 번에 하나씩 호출하세요."
+                        .to_string(),
+                )
+            }
+        };
+        let started = Instant::now();
+        let tools = bootstrap::resolve_managed_ffmpeg(&self.dirs)
+            .map_err(|_| "관리되는 오디오 변환기 자산이 없거나 손상되었습니다.".to_string())?;
+        let output_dir = request_temp
+            .path()
+            .join(format!("ffmpeg-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&output_dir)
+            .map_err(|error| format!("audio_ffmpeg 출력 폴더를 만들 수 없습니다: {error}"))?;
+        let result = (|| {
+            let args = plan.command_args(input_paths, &output_dir);
+            let process = run_managed_process_in(
+                &tools.ffmpeg,
+                &args,
+                Some(OutputGuard {
+                    dir: &output_dir,
+                    max_bytes: ffmpeg::MAX_FFMPEG_OUTPUT_TOTAL_BYTES,
+                    max_files: ffmpeg::MAX_FFMPEG_OUTPUTS,
+                    max_file_bytes: MAX_AUDIO_BYTES as u64,
+                    max_memory: ffmpeg::MAX_FFMPEG_MEMORY_BYTES,
+                    cpu_seconds: ffmpeg::FFMPEG_CPU_SECONDS,
+                }),
+                ffmpeg::FFMPEG_TOOL_DEADLINE,
+                1,
+                MAX_PROCESS_STDERR,
+                cancellation,
+            )?;
+            if !process.success {
+                return Err(format!(
+                    "ffmpeg가 실패했습니다. 인자를 고쳐 다시 호출하세요. stderr: {}",
+                    ffmpeg::stderr_excerpt(&process.stderr, input_paths, &output_dir)
+                ));
+            }
+            let outputs = ffmpeg::collect_outputs(&output_dir, MAX_AUDIO_BYTES as u64)?;
+            let mut bindings = Vec::with_capacity(outputs.len());
+            for output in outputs {
+                let remaining = ffmpeg::FFMPEG_TOOL_BUDGET.saturating_sub(started.elapsed());
+                if remaining.is_zero() {
+                    return Err("audio_ffmpeg 출력 검증 시간이 초과되었습니다.".to_string());
+                }
+                let probe = probe_file_within(
+                    &tools.ffprobe,
+                    &output.path,
+                    remaining.min(PROBE_DEADLINE),
+                    cancellation,
+                )
+                .map_err(|error| format!("audio_ffmpeg 출력 '{}': {error}", output.name))?;
+                let mime = match output.name.rsplit_once('.').map(|(_, extension)| extension) {
+                    Some("flac") => "audio/flac",
+                    Some("wav") => "audio/wav",
+                    _ => "audio/ogg",
+                };
+                bindings.push(AudioBinding {
+                    descriptor: AttachmentDescriptor {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        name: output.name,
+                        mime: mime.to_string(),
+                        kind: crate::attachment::AttachmentKind::Audio,
+                        size: output.bytes,
+                    },
+                    source_sha256: sha256_file(&output.path)?,
+                    source_path: output.path,
+                    probe,
+                    audio_ref: String::new(),
+                    request_temp: request_temp.clone(),
+                    normalized: Arc::new(Mutex::new(None)),
+                });
+            }
+            Ok(bindings)
+        })();
+        if result.is_err() {
+            let _ = fs::remove_dir_all(&output_dir);
+        }
+        result
     }
 
     pub fn remember_import(
@@ -537,6 +669,8 @@ fn canonical_transcode_args(
         "error".to_string(),
         "-protocol_whitelist".to_string(),
         "file".to_string(),
+        "-format_whitelist".to_string(),
+        ffmpeg::INPUT_FORMAT_WHITELIST.to_string(),
         "-i".to_string(),
         source.to_string_lossy().into_owned(),
         "-map".to_string(),
@@ -717,11 +851,22 @@ fn probe_file(
     path: &Path,
     cancellation: Option<&tokio::sync::watch::Receiver<u64>>,
 ) -> Result<AudioProbe, String> {
+    probe_file_within(ffprobe, path, PROBE_DEADLINE, cancellation)
+}
+
+fn probe_file_within(
+    ffprobe: &Path,
+    path: &Path,
+    deadline: Duration,
+    cancellation: Option<&tokio::sync::watch::Receiver<u64>>,
+) -> Result<AudioProbe, String> {
     let args = vec![
         "-v".to_string(),
         "error".to_string(),
         "-protocol_whitelist".to_string(),
         "file".to_string(),
+        "-format_whitelist".to_string(),
+        ffmpeg::INPUT_FORMAT_WHITELIST.to_string(),
         "-show_entries".to_string(),
         "stream=codec_type,codec_name,channels,sample_rate,duration:format=format_name,duration"
             .to_string(),
@@ -733,7 +878,7 @@ fn probe_file(
     let output = run_managed_process(
         ffprobe,
         &args,
-        PROBE_DEADLINE,
+        deadline,
         MAX_PROBE_STDOUT,
         MAX_PROCESS_STDERR,
         cancellation,
@@ -831,7 +976,6 @@ fn parse_probe_json(bytes: &[u8]) -> Result<AudioProbe, String> {
 struct ProcessOutput {
     success: bool,
     stdout: Vec<u8>,
-    #[allow(dead_code)]
     stderr: Vec<u8>,
 }
 
@@ -843,12 +987,137 @@ fn run_managed_process(
     stderr_cap: usize,
     cancellation: Option<&tokio::sync::watch::Receiver<u64>>,
 ) -> Result<ProcessOutput, String> {
+    run_managed_process_in(
+        executable,
+        args,
+        None,
+        deadline,
+        stdout_cap,
+        stderr_cap,
+        cancellation,
+    )
+}
+
+/// Limits for a process that runs model-authored arguments: the output
+/// directory it runs in, the entries and bytes it may write there, the memory
+/// it may hold, and the CPU seconds it may use. The directory and resident
+/// memory are re-measured on every poll; the OS limits below back them up.
+struct OutputGuard<'a> {
+    dir: &'a Path,
+    max_bytes: u64,
+    max_files: usize,
+    max_file_bytes: u64,
+    max_memory: u64,
+    cpu_seconds: u64,
+}
+
+/// Resident memory of a running child, where the platform exposes it without
+/// extra privileges. Windows bounds memory through the job object instead.
+fn child_resident_bytes(pid: u32) -> Option<u64> {
+    #[cfg(target_os = "macos")]
+    {
+        let mut info: libc::proc_taskinfo = unsafe { std::mem::zeroed() };
+        let size = std::mem::size_of::<libc::proc_taskinfo>() as libc::c_int;
+        // SAFETY: `info` is a writable, correctly sized proc_taskinfo buffer
+        // that outlives this synchronous call.
+        let written = unsafe {
+            libc::proc_pidinfo(
+                pid as libc::c_int,
+                libc::PROC_PIDTASKINFO,
+                0,
+                (&raw mut info).cast(),
+                size,
+            )
+        };
+        (written == size).then_some(info.pti_resident_size)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let statm = fs::read_to_string(format!("/proc/{pid}/statm")).ok()?;
+        let pages = statm.split_whitespace().nth(1)?.parse::<u64>().ok()?;
+        // SAFETY: sysconf has no memory-safety preconditions.
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        u64::try_from(page)
+            .ok()
+            .map(|page| pages.saturating_mul(page))
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
+/// Unix child setup, run between fork and exec (async-signal-safe calls only):
+/// a new session so the child never shares the app's terminal signals, a CPU
+/// limit so a child orphaned by an app crash still ends, Linux parent-death
+/// SIGKILL, and for guarded runs a per-file size limit and a memory limit
+/// (`RLIMIT_AS` on Linux; `RLIMIT_DATA` on macOS is best effort because macOS
+/// does not enforce it for mmap allocations, so the poll-loop resident-memory
+/// check is the macOS bound).
+#[cfg(unix)]
+fn limit_child(command: &mut Command, cpu_seconds: u64, guard: Option<(u64, u64)>) {
+    use std::os::unix::process::CommandExt;
+    let set = |resource, value: u64| {
+        let limit = libc::rlimit {
+            rlim_cur: value as libc::rlim_t,
+            rlim_max: value as libc::rlim_t,
+        };
+        // SAFETY: setrlimit reads a valid rlimit value; failure is ignored
+        // because the poll-loop checks remain in force.
+        unsafe { libc::setrlimit(resource, &limit) };
+    };
+    // SAFETY: the closure only calls setsid, setrlimit, and prctl, which are
+    // async-signal-safe and touch no parent-process state.
+    unsafe {
+        command.pre_exec(move || {
+            libc::setsid();
+            set(libc::RLIMIT_CPU, cpu_seconds);
+            #[cfg(target_os = "linux")]
+            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+            if let Some((file_bytes, memory)) = guard {
+                set(libc::RLIMIT_FSIZE, file_bytes);
+                #[cfg(target_os = "linux")]
+                set(libc::RLIMIT_AS, memory);
+                #[cfg(not(target_os = "linux"))]
+                set(libc::RLIMIT_DATA, memory);
+            }
+            Ok(())
+        });
+    }
+}
+
+fn run_managed_process_in(
+    executable: &Path,
+    args: &[String],
+    output_guard: Option<OutputGuard<'_>>,
+    deadline: Duration,
+    stdout_cap: usize,
+    stderr_cap: usize,
+    cancellation: Option<&tokio::sync::watch::Receiver<u64>>,
+) -> Result<ProcessOutput, String> {
     let mut command = Command::new(executable);
     command
         .args(args)
+        .env_remove("FFREPORT")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    if let Some(guard) = &output_guard {
+        command.current_dir(guard.dir);
+    }
+    #[cfg(unix)]
+    limit_child(
+        &mut command,
+        output_guard
+            .as_ref()
+            .map_or(deadline.as_secs().saturating_mul(2).max(10), |guard| {
+                guard.cpu_seconds
+            }),
+        output_guard
+            .as_ref()
+            .map(|guard| (guard.max_file_bytes, guard.max_memory)),
+    );
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -858,7 +1127,10 @@ fn run_managed_process(
         .spawn()
         .map_err(|_| "관리되는 오디오 변환기를 실행할 수 없습니다.".to_string())?;
     #[cfg(windows)]
-    let mut job = match crate::provider_process::WindowsJob::assign_std(&child) {
+    let mut job = match crate::provider_process::WindowsJob::assign_std_with_memory_limit(
+        &child,
+        output_guard.as_ref().map(|guard| guard.max_memory as usize),
+    ) {
         Ok(job) => Some(job),
         Err(_) => {
             let _ = child.kill();
@@ -879,6 +1151,39 @@ fn run_managed_process(
     let started = Instant::now();
     let cancel_generation = cancellation.map(|receiver| *receiver.borrow());
     let status = loop {
+        if let Some(guard) = output_guard.as_ref() {
+            let (files, bytes) = ffmpeg::directory_usage(guard.dir);
+            let memory = child_resident_bytes(child.id()).unwrap_or(0);
+            let exceeded = if files > guard.max_files {
+                Some(format!(
+                    "출력 파일이 {}개를 넘어 중단했습니다. 조각 길이를 늘리세요.",
+                    guard.max_files
+                ))
+            } else if bytes > guard.max_bytes {
+                Some(format!(
+                    "출력이 {} bytes를 넘어 중단했습니다.",
+                    guard.max_bytes
+                ))
+            } else if memory > guard.max_memory {
+                Some(format!(
+                    "메모리 사용이 {} bytes를 넘어 중단했습니다. 필터나 길이를 줄이세요.",
+                    guard.max_memory
+                ))
+            } else {
+                None
+            };
+            if let Some(reason) = exceeded {
+                #[cfg(windows)]
+                if let Some(job) = job.take() {
+                    job.terminate();
+                }
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
+                return Err(format!("오디오 변환 {reason}"));
+            }
+        }
         if cancellation
             .zip(cancel_generation)
             .is_some_and(|(receiver, generation)| *receiver.borrow() != generation)
@@ -906,7 +1211,11 @@ fn run_managed_process(
         }
         match child.try_wait() {
             Ok(Some(status)) => break status,
-            Ok(None) => thread::sleep(PROCESS_POLL_INTERVAL),
+            Ok(None) => thread::sleep(if output_guard.is_some() {
+                GUARDED_POLL_INTERVAL
+            } else {
+                PROCESS_POLL_INTERVAL
+            }),
             Err(_) => {
                 #[cfg(windows)]
                 if let Some(job) = job.take() {
@@ -1028,8 +1337,9 @@ mod tests {
         let dirs = DataDirs::from_bases(&root.join("roaming"), &root.join("local"));
         dirs.ensure_dirs().unwrap();
         assert!(bootstrap::resolve_managed_ffmpeg(&dirs).is_err());
-        fs::write(dirs.bin_dir().join("ffmpeg.exe"), b"corrupt").unwrap();
-        fs::write(dirs.bin_dir().join("ffprobe.exe"), b"corrupt").unwrap();
+        for member in bootstrap::managed_ffmpeg_manifest().unwrap().members() {
+            fs::write(dirs.bin_dir().join(&member.name), b"corrupt").unwrap();
+        }
         assert!(bootstrap::resolve_managed_ffmpeg(&dirs).is_err());
         fs::remove_dir_all(root).ok();
     }
@@ -1205,8 +1515,8 @@ mod tests {
     #[test]
     fn bundled_manifest_pins_both_tools_and_vorbis() {
         let manifest = bootstrap::managed_ffmpeg_manifest().unwrap();
-        assert_eq!(manifest.schema, "eud-managed-ffmpeg/1");
-        assert_eq!(manifest.members.len(), 2);
+        assert_eq!(manifest.schema, "eud-managed-ffmpeg/2");
+        assert_eq!(manifest.members().count(), 2);
         assert!(manifest
             .configuration
             .iter()
@@ -1214,7 +1524,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires checksum-pinned managed FFmpeg/FFprobe in LocalAppData"]
+    #[ignore = "requires the checksum-pinned managed FFmpeg/FFprobe in <$LOCALAPPDATA>/eud-agent/bin (APPDATA and LOCALAPPDATA env vars set)"]
     fn pinned_ffmpeg_transcodes_every_supported_input_to_canonical_profile() {
         let dirs = installed_dirs();
         let tools = bootstrap::resolve_managed_ffmpeg(&dirs).unwrap();
@@ -1265,7 +1575,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires checksum-pinned managed FFmpeg/FFprobe in LocalAppData"]
+    #[ignore = "requires the checksum-pinned managed FFmpeg/FFprobe in <$LOCALAPPDATA>/eud-agent/bin (APPDATA and LOCALAPPDATA env vars set)"]
     fn pinned_process_rejects_corruption_timeout_cancel_and_output_overflow() {
         let dirs = installed_dirs();
         let tools = bootstrap::resolve_managed_ffmpeg(&dirs).unwrap();
@@ -1396,6 +1706,233 @@ mod tests {
         )
         .unwrap_err()
         .contains("크기 제한"));
+        fs::remove_dir_all(root).ok();
+    }
+
+    fn guard(dir: &Path) -> OutputGuard<'_> {
+        OutputGuard {
+            dir,
+            max_bytes: ffmpeg::MAX_FFMPEG_OUTPUT_TOTAL_BYTES,
+            max_files: ffmpeg::MAX_FFMPEG_OUTPUTS,
+            max_file_bytes: MAX_AUDIO_BYTES as u64,
+            max_memory: ffmpeg::MAX_FFMPEG_MEMORY_BYTES,
+            cpu_seconds: ffmpeg::FFMPEG_CPU_SECONDS,
+        }
+    }
+
+    fn plan(args: &[&str]) -> ffmpeg::FfmpegPlan {
+        ffmpeg::parse_request(
+            &serde_json::json!({"inputs": [{"audioRef": "audio-1"}], "args": args}),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    #[ignore = "requires the checksum-pinned managed FFmpeg/FFprobe in <$LOCALAPPDATA>/eud-agent/bin (APPDATA and LOCALAPPDATA env vars set)"]
+    fn pinned_ffmpeg_refuses_a_dash_manifest_that_opens_another_local_file() {
+        // Given: a local secret and a ".wav" input whose bytes are a DASH
+        // manifest pointing at it, which content probing would open.
+        let dirs = installed_dirs();
+        let tools = bootstrap::resolve_managed_ffmpeg(&dirs).unwrap();
+        let service = AudioService::new(dirs);
+        let root = integration_root("dash");
+        let secret = root.join("secret.m4a");
+        generate_audio(&tools, &secret, "aac");
+        let manifest = root.join("input-manifest.wav");
+        fs::write(
+            &manifest,
+            format!(
+                r#"<?xml version="1.0" encoding="utf-8"?>
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="static" mediaPresentationDuration="PT1S" minBufferTime="PT1S" profiles="urn:mpeg:dash:profile:isoff-on-demand:2011">
+ <Period duration="PT1S"><AdaptationSet mimeType="audio/mp4">
+  <Representation id="a" bandwidth="128000" codecs="mp4a.40.2" audioSamplingRate="44100">
+   <BaseURL>file:{}</BaseURL>
+  </Representation>
+ </AdaptationSet></Period>
+</MPD>
+"#,
+                secret.display()
+            ),
+        )
+        .unwrap();
+        // The manifest really is an attack without the format whitelist.
+        let leaked = root.join("control.wav");
+        let control = run_managed_process(
+            &tools.ffmpeg,
+            &[
+                "-nostdin".to_string(),
+                "-v".to_string(),
+                "error".to_string(),
+                "-protocol_whitelist".to_string(),
+                "file".to_string(),
+                "-i".to_string(),
+                manifest.to_string_lossy().into_owned(),
+                leaked.to_string_lossy().into_owned(),
+            ],
+            Duration::from_secs(30),
+            1,
+            MAX_PROCESS_STDERR,
+            None,
+        )
+        .unwrap();
+        assert!(control.success && leaked.is_file());
+
+        // When / Then: the tool path, the probe, and the canonical transcode
+        // all refuse it with the whitelist reason.
+        let temp = service.request_temp().unwrap();
+        let error = service
+            .run_ffmpeg(
+                &plan(&["-i", "{in0}", "-c:a", "pcm_s16le", "{out}/leak.wav"]),
+                std::slice::from_ref(&manifest),
+                temp,
+                None,
+            )
+            .unwrap_err();
+        assert!(error.contains("whitelist"), "{error}");
+        assert!(probe_file(&tools.ffprobe, &manifest, None).is_err());
+        let args = canonical_transcode_args(
+            &manifest,
+            &root.join("canonical.ogg"),
+            AudioEffects::default(),
+            1_000,
+        );
+        let canonical = run_managed_process(
+            &tools.ffmpeg,
+            &args,
+            Duration::from_secs(30),
+            1,
+            MAX_PROCESS_STDERR,
+            None,
+        )
+        .unwrap();
+        assert!(!canonical.success);
+        assert!(!root.join("canonical.ogg").exists());
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    #[ignore = "requires the checksum-pinned managed FFmpeg/FFprobe in <$LOCALAPPDATA>/eud-agent/bin (APPDATA and LOCALAPPDATA env vars set)"]
+    fn pinned_ffmpeg_guard_stops_memory_file_count_and_byte_floods() {
+        let dirs = installed_dirs();
+        let tools = bootstrap::resolve_managed_ffmpeg(&dirs).unwrap();
+        let root = integration_root("floods");
+        let run = |dir: &Path, args: &[&str]| {
+            fs::create_dir_all(dir).unwrap();
+            let started = Instant::now();
+            let result = run_managed_process_in(
+                &tools.ffmpeg,
+                &args.iter().map(|arg| arg.to_string()).collect::<Vec<_>>(),
+                Some(guard(dir)),
+                ffmpeg::FFMPEG_TOOL_DEADLINE,
+                1,
+                MAX_PROCESS_STDERR,
+                None,
+            );
+            (result, started.elapsed(), ffmpeg::directory_usage(dir))
+        };
+        let quiet = ["-nostdin", "-v", "error", "-f", "lavfi"];
+
+        // A whole-stream buffer of 7.1 192 kHz silence is stopped at the
+        // memory limit (the filters themselves are no longer admitted).
+        let memory_dir = root.join("memory");
+        let (memory, elapsed, _) = run(
+            &memory_dir,
+            &[
+                &quiet[..],
+                &[
+                    "-i",
+                    "anullsrc=r=192000:cl=7.1",
+                    "-af",
+                    "areverse",
+                    "-f",
+                    "null",
+                    "-",
+                ],
+            ]
+            .concat(),
+        );
+        let memory = memory.unwrap_err();
+        assert!(memory.contains("메모리"), "{memory}");
+        assert!(elapsed < Duration::from_secs(20), "{elapsed:?}");
+
+        // A 1 ms segment flood is stopped just past the file-count limit.
+        let flood_dir = root.join("flood");
+        let flood_pattern = flood_dir.join("p%06d.wav");
+        let (flood, _, (files, _)) = run(
+            &flood_dir,
+            &[
+                &quiet[..],
+                &[
+                    "-i",
+                    "sine=duration=30",
+                    "-f",
+                    "segment",
+                    "-segment_time",
+                    "0.001",
+                    "-c:a",
+                    "pcm_s16le",
+                    flood_pattern.to_str().unwrap(),
+                ],
+            ]
+            .concat(),
+        );
+        assert!(flood.unwrap_err().contains("출력 파일"));
+        assert!(files <= ffmpeg::MAX_FFMPEG_OUTPUTS + 256, "{files} files");
+
+        // Fast PCM writes: one file stops at the per-file size limit on Unix
+        // (RLIMIT_FSIZE), and segments stop near the total-bytes limit.
+        let big_dir = root.join("big");
+        let big_file = big_dir.join("big.wav");
+        let (big, _, (_, big_bytes)) = run(
+            &big_dir,
+            &[
+                &quiet[..],
+                &[
+                    "-i",
+                    "anullsrc=r=192000:cl=7.1",
+                    "-t",
+                    "600",
+                    "-c:a",
+                    "pcm_s32le",
+                    big_file.to_str().unwrap(),
+                ],
+            ]
+            .concat(),
+        );
+        assert!(big.map_or(true, |output| !output.success));
+        assert!(
+            big_bytes <= ffmpeg::MAX_FFMPEG_OUTPUT_TOTAL_BYTES + 128 * 1024 * 1024,
+            "{big_bytes} bytes"
+        );
+        #[cfg(unix)]
+        assert!(big_bytes <= MAX_AUDIO_BYTES as u64, "{big_bytes} bytes");
+        let total_dir = root.join("total");
+        let total_pattern = total_dir.join("s%03d.wav");
+        let (total, _, (_, total_bytes)) = run(
+            &total_dir,
+            &[
+                &quiet[..],
+                &[
+                    "-i",
+                    "anullsrc=r=192000:cl=7.1",
+                    "-t",
+                    "600",
+                    "-f",
+                    "segment",
+                    "-segment_time",
+                    "5",
+                    "-c:a",
+                    "pcm_s32le",
+                    total_pattern.to_str().unwrap(),
+                ],
+            ]
+            .concat(),
+        );
+        assert!(total.unwrap_err().contains("bytes"));
+        assert!(
+            total_bytes <= ffmpeg::MAX_FFMPEG_OUTPUT_TOTAL_BYTES + 128 * 1024 * 1024,
+            "{total_bytes} bytes"
+        );
         fs::remove_dir_all(root).ok();
     }
 }

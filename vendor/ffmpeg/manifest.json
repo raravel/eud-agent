@@ -1,100 +1,266 @@
 {
-  "schema": "eud-managed-ffmpeg/1",
-  "distribution": "Gyan FFmpeg release essentials",
-  "version": "8.1.2-essentials_build-www.gyan.dev",
-  "platform": "x86_64-w64-mingw32-static",
-  "archive": {
-    "url": "https://www.gyan.dev/ffmpeg/builds/packages/ffmpeg-8.1.2-essentials_build.zip",
-    "sha256": "db580001caa24ac104c8cb856cd113a87b0a443f7bdf47d8c12b1d740584a2ec",
-    "bytes": 109728040
-  },
-  "members": [
-    {
-      "name": "ffmpeg.exe",
-      "archivePath": "ffmpeg-8.1.2-essentials_build/bin/ffmpeg.exe",
-      "sha256": "1326dde4c84ff1f96fe6b8916c5bed29e163e9b5dccf995f6f3db069d143ec5e",
-      "bytes": 101897728
-    },
-    {
-      "name": "ffprobe.exe",
-      "archivePath": "ffmpeg-8.1.2-essentials_build/bin/ffprobe.exe",
-      "sha256": "b49ccc7c6547b141ad5a2f6ec69cc04323d7133d7704d70b331b904c63eecb07",
-      "bytes": 101692928
-    }
-  ],
+  "schema": "eud-managed-ffmpeg/2",
   "license": "GPL-3.0-only",
   "licenseResource": "LICENSE.txt",
-  "source": {
-    "repository": "https://github.com/FFmpeg/FFmpeg",
-    "tag": "n8.1.2",
-    "commit": "38b88335f99e76ed89ff3c93f877fdefce736c13",
-    "buildProvider": "https://www.gyan.dev/ffmpeg/builds/"
-  },
-  "compiler": "gcc 16.1.0 (Rev2, Built by MSYS2 project)",
-  "configuration": [
-    "--enable-gpl",
-    "--enable-version3",
-    "--enable-static",
-    "--disable-w32threads",
-    "--disable-autodetect",
-    "--enable-cairo",
-    "--enable-fontconfig",
-    "--enable-iconv",
-    "--enable-gnutls",
-    "--enable-libxml2",
-    "--enable-gmp",
-    "--enable-bzlib",
-    "--enable-lzma",
-    "--enable-zlib",
-    "--enable-libsrt",
-    "--enable-libssh",
-    "--enable-libzmq",
-    "--enable-avisynth",
-    "--enable-sdl2",
-    "--enable-libwebp",
-    "--enable-libx264",
-    "--enable-libx265",
-    "--enable-libxvid",
-    "--enable-libaom",
-    "--enable-libopenjpeg",
-    "--enable-libvpx",
-    "--enable-mediafoundation",
-    "--enable-libass",
-    "--enable-libfreetype",
-    "--enable-libfribidi",
-    "--enable-libharfbuzz",
-    "--enable-libvidstab",
-    "--enable-libvmaf",
-    "--enable-libzimg",
-    "--enable-amf",
-    "--enable-cuda-llvm",
-    "--enable-cuvid",
-    "--enable-dxva2",
-    "--enable-d3d11va",
-    "--enable-d3d12va",
-    "--enable-ffnvcodec",
-    "--enable-libvpl",
-    "--enable-nvdec",
-    "--enable-nvenc",
-    "--enable-vaapi",
-    "--enable-openal",
-    "--enable-libgme",
-    "--enable-libopenmpt",
-    "--enable-libopencore-amrwb",
-    "--enable-libmp3lame",
-    "--enable-libtheora",
-    "--enable-libvo-amrwbenc",
-    "--enable-libgsm",
-    "--enable-libopencore-amrnb",
-    "--enable-libopus",
-    "--enable-libspeex",
-    "--enable-libvorbis",
-    "--enable-librubberband"
-  ],
-  "requiredCapabilities": {
-    "probe": ["wav", "ogg", "flac", "mp3", "aac", "mov/mp4/m4a", "aiff", "asf"],
-    "decoder": ["pcm", "vorbis", "flac", "mp3", "aac", "wmav1", "wmav2", "opus"],
-    "encoder": ["libvorbis"],
-    "muxer": ["ogg"]
+  "platforms": {
+    "windows-x86_64": {
+      "distribution": "Gyan FFmpeg release essentials",
+      "version": "8.1.2-essentials_build-www.gyan.dev",
+      "target": "x86_64-w64-mingw32-static",
+      "archives": [
+        {
+          "url": "https://www.gyan.dev/ffmpeg/builds/packages/ffmpeg-8.1.2-essentials_build.zip",
+          "sha256": "db580001caa24ac104c8cb856cd113a87b0a443f7bdf47d8c12b1d740584a2ec",
+          "bytes": 109728040,
+          "members": [
+            {
+              "name": "ffmpeg.exe",
+              "archivePath": "ffmpeg-8.1.2-essentials_build/bin/ffmpeg.exe",
+              "sha256": "1326dde4c84ff1f96fe6b8916c5bed29e163e9b5dccf995f6f3db069d143ec5e",
+              "bytes": 101897728
+            },
+            {
+              "name": "ffprobe.exe",
+              "archivePath": "ffmpeg-8.1.2-essentials_build/bin/ffprobe.exe",
+              "sha256": "b49ccc7c6547b141ad5a2f6ec69cc04323d7133d7704d70b331b904c63eecb07",
+              "bytes": 101692928
+            }
+          ]
+        }
+      ],
+      "source": {
+        "repository": "https://github.com/FFmpeg/FFmpeg",
+        "tag": "n8.1.2",
+        "commit": "38b88335f99e76ed89ff3c93f877fdefce736c13",
+        "buildProvider": "https://www.gyan.dev/ffmpeg/builds/"
+      },
+      "compiler": "gcc 16.1.0 (Rev2, Built by MSYS2 project)",
+      "configuration": [
+        "--enable-gpl",
+        "--enable-version3",
+        "--enable-static",
+        "--disable-w32threads",
+        "--disable-autodetect",
+        "--enable-cairo",
+        "--enable-fontconfig",
+        "--enable-iconv",
+        "--enable-gnutls",
+        "--enable-libxml2",
+        "--enable-gmp",
+        "--enable-bzlib",
+        "--enable-lzma",
+        "--enable-zlib",
+        "--enable-libsrt",
+        "--enable-libssh",
+        "--enable-libzmq",
+        "--enable-avisynth",
+        "--enable-sdl2",
+        "--enable-libwebp",
+        "--enable-libx264",
+        "--enable-libx265",
+        "--enable-libxvid",
+        "--enable-libaom",
+        "--enable-libopenjpeg",
+        "--enable-libvpx",
+        "--enable-mediafoundation",
+        "--enable-libass",
+        "--enable-libfreetype",
+        "--enable-libfribidi",
+        "--enable-libharfbuzz",
+        "--enable-libvidstab",
+        "--enable-libvmaf",
+        "--enable-libzimg",
+        "--enable-amf",
+        "--enable-cuda-llvm",
+        "--enable-cuvid",
+        "--enable-dxva2",
+        "--enable-d3d11va",
+        "--enable-d3d12va",
+        "--enable-ffnvcodec",
+        "--enable-libvpl",
+        "--enable-nvdec",
+        "--enable-nvenc",
+        "--enable-vaapi",
+        "--enable-openal",
+        "--enable-libgme",
+        "--enable-libopenmpt",
+        "--enable-libopencore-amrwb",
+        "--enable-libmp3lame",
+        "--enable-libtheora",
+        "--enable-libvo-amrwbenc",
+        "--enable-libgsm",
+        "--enable-libopencore-amrnb",
+        "--enable-libopus",
+        "--enable-libspeex",
+        "--enable-libvorbis",
+        "--enable-librubberband"
+      ],
+      "requiredCapabilities": {
+        "probe": ["wav", "ogg", "flac", "mp3", "aac", "mov/mp4/m4a", "aiff", "asf"],
+        "decoder": ["pcm", "vorbis", "flac", "mp3", "aac", "wmav1", "wmav2", "opus"],
+        "encoder": ["libvorbis"],
+        "muxer": ["ogg"]
+      }
+    },
+    "macos-aarch64": {
+      "distribution": "Martin Riedl FFmpeg static release build",
+      "version": "8.1.2-https://www.martin-riedl.de",
+      "target": "aarch64-apple-darwin",
+      "archives": [
+        {
+          "url": "https://ffmpeg.martin-riedl.de/download/macos/arm64/1783011502_8.1.2/ffmpeg.zip",
+          "sha256": "ef1aa60006c7b77ce170c1608c08d8e4ba1c30c5746f2ac986ded932d0ac2c3c",
+          "bytes": 28196358,
+          "members": [
+            {
+              "name": "ffmpeg",
+              "archivePath": "ffmpeg",
+              "sha256": "eaf91238e104dd0e262bc6510e25061855cc99a6955a721b0ac99660d58c473d",
+              "bytes": 65637248
+            }
+          ]
+        },
+        {
+          "url": "https://ffmpeg.martin-riedl.de/download/macos/arm64/1783011502_8.1.2/ffprobe.zip",
+          "sha256": "c39787f4af7a3932502d2d48db6f6feaaa836b48a73ef78c32cc3285df61dfaf",
+          "bytes": 28118222,
+          "members": [
+            {
+              "name": "ffprobe",
+              "archivePath": "ffprobe",
+              "sha256": "ed9dc5871914b466b96b402c9ec0ba68ce4f836e72faa464b1b4e279835bd4a6",
+              "bytes": 65445840
+            }
+          ]
+        }
+      ],
+      "source": {
+        "repository": "https://github.com/FFmpeg/FFmpeg",
+        "tag": "n8.1.2",
+        "commit": "38b88335f99e76ed89ff3c93f877fdefce736c13",
+        "buildProvider": "https://ffmpeg.martin-riedl.de/",
+        "buildScript": "https://git.martin-riedl.de/ffmpeg/build-script",
+        "codeSigningTeam": "KU3N25YGLU"
+      },
+      "compiler": "Apple clang version 14.0.0 (clang-1400.0.29.102)",
+      "configuration": [
+        "--enable-gray",
+        "--enable-libxml2",
+        "--enable-version3",
+        "--enable-gpl",
+        "--enable-openssl",
+        "--enable-libfreetype",
+        "--enable-fontconfig",
+        "--enable-libharfbuzz",
+        "--enable-libsnappy",
+        "--enable-libsrt",
+        "--enable-libvmaf",
+        "--enable-libass",
+        "--enable-libklvanc",
+        "--enable-libzimg",
+        "--enable-libzvbi",
+        "--enable-libaom",
+        "--enable-libdav1d",
+        "--enable-libopenh264",
+        "--enable-libopenjpeg",
+        "--enable-librav1e",
+        "--enable-libsvtav1",
+        "--enable-libvpx",
+        "--enable-libvvenc",
+        "--enable-libwebp",
+        "--enable-libx264",
+        "--enable-libx265",
+        "--enable-libmp3lame",
+        "--enable-libopus",
+        "--enable-libvorbis",
+        "--enable-libtheora"
+      ],
+      "requiredCapabilities": {
+        "probe": ["wav", "ogg", "flac", "mp3", "aac", "mov/mp4/m4a", "aiff", "asf", "matroska/webm"],
+        "decoder": ["pcm", "vorbis", "flac", "mp3", "aac", "wmav1", "wmav2", "opus"],
+        "encoder": ["libvorbis", "flac", "pcm_s16le"],
+        "muxer": ["ogg", "flac", "wav", "segment"]
+      }
+    },
+    "macos-x86_64": {
+      "distribution": "Martin Riedl FFmpeg static release build",
+      "version": "8.1.2-https://www.martin-riedl.de",
+      "target": "x86_64-apple-darwin",
+      "archives": [
+        {
+          "url": "https://ffmpeg.martin-riedl.de/download/macos/amd64/1783018342_8.1.2/ffmpeg.zip",
+          "sha256": "a52ef43883f44c219766d4b3bdde4e635b35465d0b704c01c3a0566b59775df9",
+          "bytes": 33586778,
+          "members": [
+            {
+              "name": "ffmpeg",
+              "archivePath": "ffmpeg",
+              "sha256": "1ca59dda73668c59898a0b305afd8a88817a989187f222ec62d64e775d614d23",
+              "bytes": 93980912
+            }
+          ]
+        },
+        {
+          "url": "https://ffmpeg.martin-riedl.de/download/macos/amd64/1783018342_8.1.2/ffprobe.zip",
+          "sha256": "5408ca588c8c72b0dde3afe676d0a7acf25ef97e55ae6eba5c7bede1cda42695",
+          "bytes": 33477267,
+          "members": [
+            {
+              "name": "ffprobe",
+              "archivePath": "ffprobe",
+              "sha256": "bdb6aff0f1f414382effd97040f7862dc85e67996ac296cb4288beed0e06498f",
+              "bytes": 93772560
+            }
+          ]
+        }
+      ],
+      "source": {
+        "repository": "https://github.com/FFmpeg/FFmpeg",
+        "tag": "n8.1.2",
+        "commit": "38b88335f99e76ed89ff3c93f877fdefce736c13",
+        "buildProvider": "https://ffmpeg.martin-riedl.de/",
+        "buildScript": "https://git.martin-riedl.de/ffmpeg/build-script",
+        "codeSigningTeam": "KU3N25YGLU"
+      },
+      "compiler": "Apple clang version 14.0.0 (clang-1400.0.29.202)",
+      "configuration": [
+        "--enable-gray",
+        "--enable-libxml2",
+        "--enable-version3",
+        "--enable-gpl",
+        "--enable-openssl",
+        "--enable-libfreetype",
+        "--enable-fontconfig",
+        "--enable-libharfbuzz",
+        "--enable-libsnappy",
+        "--enable-libsrt",
+        "--enable-libvmaf",
+        "--enable-libass",
+        "--enable-libklvanc",
+        "--enable-libzimg",
+        "--enable-libzvbi",
+        "--enable-libaom",
+        "--enable-libdav1d",
+        "--enable-libopenh264",
+        "--enable-libopenjpeg",
+        "--enable-librav1e",
+        "--enable-libsvtav1",
+        "--enable-libvpx",
+        "--enable-libvvenc",
+        "--enable-libwebp",
+        "--enable-libx264",
+        "--enable-libx265",
+        "--enable-libmp3lame",
+        "--enable-libopus",
+        "--enable-libvorbis",
+        "--enable-libtheora"
+      ],
+      "requiredCapabilities": {
+        "probe": ["wav", "ogg", "flac", "mp3", "aac", "mov/mp4/m4a", "aiff", "asf", "matroska/webm"],
+        "decoder": ["pcm", "vorbis", "flac", "mp3", "aac", "wmav1", "wmav2", "opus"],
+        "encoder": ["libvorbis", "flac", "pcm_s16le"],
+        "muxer": ["ogg", "flac", "wav", "segment"]
+      }
+    }
   }
 }

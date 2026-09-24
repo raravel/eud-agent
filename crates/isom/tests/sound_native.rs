@@ -303,6 +303,38 @@ fn real_scx_adds_exact_mpq_string_wav_and_reuses_without_duplication() {
 }
 
 #[test]
+fn real_scx_reads_one_named_asset_back_exactly_as_the_digest_hashes_it() {
+    // Given: a real map carrying one added sound asset.
+    let input = fixture();
+    let ogg_hash = format!("{:x}", Sha256::digest(OGG));
+    let mpq_path = format!("staredit\\wav\\ea_{}.ogg", &ogg_hash[..16]);
+    let output = temp_map("asset-read");
+    isom::map_sound_add(&input, &output, &file_hash(&input), &mpq_path, OGG).unwrap();
+
+    // When: that asset is read back by its MPQ path.
+    let bytes = isom::map_asset(&output, &mpq_path, OGG.len()).unwrap();
+
+    // Then: the bytes are the ones stored, and their hash is the digest's.
+    assert_eq!(bytes, OGG);
+    assert_eq!(
+        extra_assets(&output).get(&mpq_path),
+        Some(&format!("{:x}", Sha256::digest(&bytes)))
+    );
+    // A missing asset, an asset over the limit, and the reserved scenario
+    // entry are refused with a native reason instead of empty bytes.
+    let missing = isom::map_asset(&output, "staredit\\wav\\missing.ogg", OGG.len()).unwrap_err();
+    assert!(missing.to_string().contains("no MPQ asset"), "{missing}");
+    let oversized = isom::map_asset(&output, &mpq_path, OGG.len() - 1).unwrap_err();
+    assert!(oversized.to_string().contains("size limit"), "{oversized}");
+    let reserved =
+        isom::map_asset(&output, "staredit\\scenario.chk", 64 * 1024 * 1024).unwrap_err();
+    assert!(reserved.to_string().contains("reserved"), "{reserved}");
+    assert!(isom::map_asset(&output, &mpq_path, 0).is_err());
+
+    fs::remove_file(output).ok();
+}
+
+#[test]
 fn real_scx_replaces_managed_sound_without_leaving_the_old_registration() {
     let input = fixture();
     let old_hash = format!("{:x}", Sha256::digest(OGG));
@@ -389,6 +421,155 @@ fn sound_conflicts_and_invalid_inputs_leave_real_scx_unchanged() {
     assert_eq!(fs::read(&input).unwrap(), before);
 
     fs::remove_file(output).ok();
+}
+
+/// `count` distinct OGG byte strings (the native side checks only the OggS
+/// magic and hashes the bytes) with their content-addressed managed paths.
+fn distinct_oggs(count: usize) -> Vec<(String, Vec<u8>)> {
+    (0..count)
+        .map(|index| {
+            let mut ogg = OGG.to_vec();
+            ogg.extend_from_slice(format!("piece{index:03}").as_bytes());
+            let hash = format!("{:x}", Sha256::digest(&ogg));
+            (format!("staredit\\wav\\ea_{}.ogg", &hash[..16]), ogg)
+        })
+        .collect()
+}
+
+fn batch_items(oggs: &[(String, Vec<u8>)]) -> Vec<(&str, &[u8])> {
+    oggs.iter()
+        .map(|(path, ogg)| (path.as_str(), ogg.as_slice()))
+        .collect()
+}
+
+#[test]
+fn real_scx_batch_adds_every_sound_in_one_save_and_reports_input_order() {
+    // Given: a real map and three new sounds plus one already registered.
+    let input = fixture();
+    let existing_hash = format!("{:x}", Sha256::digest(OGG));
+    let existing_path = format!("staredit\\wav\\ea_{}.ogg", &existing_hash[..16]);
+    let with_one = temp_map("batch-base");
+    isom::map_sound_add(&input, &with_one, &file_hash(&input), &existing_path, OGG).unwrap();
+    let before_bytes = fs::read(&with_one).unwrap();
+    let before_sections = sections(&isom::chk_extract(&with_one).unwrap());
+    let before_assets = extra_assets(&with_one);
+    let fresh = distinct_oggs(3);
+    let mut items = batch_items(&fresh);
+    items.insert(1, (existing_path.as_str(), OGG));
+    let output = temp_map("batch-output");
+
+    // When: the batch is added in one native call.
+    let report =
+        isom::map_sound_add_batch(&with_one, &output, &file_hash(&with_one), &items).unwrap();
+
+    // Then: the report follows input order, the registered sound is reused,
+    // each new sound owns one new slot and string, and nothing else changed.
+    assert_eq!(
+        report
+            .sounds
+            .iter()
+            .map(|sound| (sound.mpq_path.as_str(), sound.reused))
+            .collect::<Vec<_>>(),
+        items
+            .iter()
+            .map(|(path, _)| (*path, *path == existing_path))
+            .collect::<Vec<_>>()
+    );
+    let mut expected_assets = before_assets.clone();
+    for (path, ogg) in &fresh {
+        expected_assets.insert(path.clone(), format!("{:x}", Sha256::digest(ogg)));
+        let (string_id, sound_index) = sound_path_and_slot(&output, path);
+        let sound = report
+            .sounds
+            .iter()
+            .find(|sound| &sound.mpq_path == path)
+            .unwrap();
+        assert_eq!(sound.sound_index, sound_index as u64);
+        assert_eq!(sound.sound_string_id, string_id as u64);
+        assert_eq!(isom::map_asset(&output, path, ogg.len()).unwrap(), *ogg);
+    }
+    assert_eq!(extra_assets(&output), expected_assets);
+    sound_path_and_slot(&output, &existing_path);
+    let after_sections = sections(&isom::chk_extract(&output).unwrap());
+    for (name, body) in &before_sections {
+        if !matches!(name.as_str(), "STR " | "STRx" | "WAV ") {
+            assert_eq!(
+                after_sections.get(name),
+                Some(body),
+                "section {name} changed"
+            );
+        }
+    }
+    assert_eq!(report.output_sha256, file_hash(&output));
+    assert_eq!(fs::read(&with_one).unwrap(), before_bytes);
+
+    // And: a batch of only registered sounds is an exact idempotent copy.
+    let reused_output = temp_map("batch-reused");
+    let reused = isom::map_sound_add_batch(
+        &output,
+        &reused_output,
+        &file_hash(&output),
+        &batch_items(&fresh),
+    )
+    .unwrap();
+    assert!(reused.sounds.iter().all(|sound| sound.reused));
+    assert_eq!(
+        fs::read(&reused_output).unwrap(),
+        fs::read(&output).unwrap()
+    );
+
+    fs::remove_file(with_one).ok();
+    fs::remove_file(output).ok();
+    fs::remove_file(reused_output).ok();
+}
+
+#[test]
+fn real_scx_batch_is_all_or_nothing_on_one_bad_item() {
+    // Given: a map with one registered sound and a batch whose last item
+    // names that path with different bytes.
+    let input = fixture();
+    let existing_hash = format!("{:x}", Sha256::digest(OGG));
+    let existing_path = format!("staredit\\wav\\ea_{}.ogg", &existing_hash[..16]);
+    let with_one = temp_map("batch-conflict-base");
+    isom::map_sound_add(&input, &with_one, &file_hash(&input), &existing_path, OGG).unwrap();
+    let before = fs::read(&with_one).unwrap();
+    let fresh = distinct_oggs(2);
+    let mut other = OGG.to_vec();
+    *other.last_mut().unwrap() ^= 1;
+    let mut items = batch_items(&fresh);
+    items.push((existing_path.as_str(), other.as_slice()));
+    let output = temp_map("batch-conflict-output");
+
+    // When / Then: the whole batch is refused, no output exists, the input is
+    // untouched, and a repeated destination is refused the same way.
+    let error =
+        isom::map_sound_add_batch(&with_one, &output, &file_hash(&with_one), &items).unwrap_err();
+    assert!(error.to_string().contains("different bytes"), "{error}");
+    assert!(!output.exists());
+    assert_eq!(fs::read(&with_one).unwrap(), before);
+    let repeated = [items[0], items[0]];
+    assert!(
+        isom::map_sound_add_batch(&with_one, &output, &file_hash(&with_one), &repeated).is_err()
+    );
+    assert!(!output.exists());
+    assert_eq!(fs::read(&with_one).unwrap(), before);
+
+    fs::remove_file(with_one).ok();
+}
+
+#[cfg(windows)]
+#[test]
+fn real_scx_batch_refuses_more_sounds_than_free_wav_slots_before_any_write() {
+    let used = map_with_used_wav_slots(510, "batch-slots");
+    let before = fs::read(&used).unwrap();
+    let fresh = distinct_oggs(3);
+    let output = temp_map("batch-slots-output");
+    let error = isom::map_sound_add_batch(&used, &output, &file_hash(&used), &batch_items(&fresh))
+        .unwrap_err();
+    assert!(error.to_string().contains("512 WAV"), "{error}");
+    assert!(!output.exists());
+    assert_eq!(fs::read(&used).unwrap(), before);
+    fs::remove_file(used).ok();
 }
 
 #[cfg(windows)]

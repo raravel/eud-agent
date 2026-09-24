@@ -13,17 +13,23 @@ impl WindowsJob {
         let child_handle = child
             .raw_handle()
             .ok_or_else(std::io::Error::last_os_error)?;
-        Self::assign_handle(child_handle as HANDLE)
+        Self::assign_handle(child_handle as HANDLE, None)
     }
 
-    pub(crate) fn assign_std(child: &std::process::Child) -> std::io::Result<Self> {
+    /// Contain a std child; `process_memory_limit` additionally caps the
+    /// committed memory of each process in the job.
+    pub(crate) fn assign_std_with_memory_limit(
+        child: &std::process::Child,
+        process_memory_limit: Option<usize>,
+    ) -> std::io::Result<Self> {
         use std::os::windows::io::AsRawHandle;
         use windows_sys::Win32::Foundation::HANDLE;
-        Self::assign_handle(child.as_raw_handle() as HANDLE)
+        Self::assign_handle(child.as_raw_handle() as HANDLE, process_memory_limit)
     }
 
     fn assign_handle(
         child_handle: windows_sys::Win32::Foundation::HANDLE,
+        process_memory_limit: Option<usize>,
     ) -> std::io::Result<Self> {
         use std::mem::size_of;
         use windows_sys::Win32::Foundation::{
@@ -32,7 +38,7 @@ impl WindowsJob {
         use windows_sys::Win32::System::JobObjects::{
             AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
             SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_LIMIT_PROCESS_MEMORY,
         };
         use windows_sys::Win32::System::Threading::GetCurrentProcess;
         // SAFETY: Category 8 (FFI). Null names are accepted by CreateJobObjectW, and
@@ -45,6 +51,10 @@ impl WindowsJob {
         // zero initialization and every field read by this call is initialized below.
         let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
         info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        if let Some(limit) = process_memory_limit {
+            info.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_PROCESS_MEMORY;
+            info.ProcessMemoryLimit = limit;
+        }
         // SAFETY: Category 8 (FFI). `handle` is valid and `info` remains alive with
         // the exact Windows-declared byte size for the duration of the call.
         let configured = unsafe {

@@ -66,6 +66,21 @@ The manifest itself uses `.eap` (EUD Agent Project); there is no separate launch
   whose effective `Iscript ID` selects that script. The parse is strict — bad magic, a truncated
   header, an out-of-range slot offset, or two headers whose slot arrays overlap are errors, never a
   silently shortened slot list.
+- `isom::map_asset`: one verbatim read of a named extra asset out of a map's MPQ (the bytes
+  `map_digest` hashes; reserved `scenario.chk`/listfile entries refused, size-capped natively).
+  `isom::map_sound_add_batch` registers up to 128 managed OGG sounds in one load/mutate/save of a
+  copied map with one reopen verification; `MapSafe::write_sound_batch` wraps it in one backup and
+  one post-verify, and `map_sound_import({audioRefs})` records one journal entry per new sound, all
+  sharing that backup.
+- `audio_ffmpeg` (EPS only): the model writes FFmpeg arguments, the app owns every file.
+  `audio::ffmpeg` validates inputs (`{audioRef}` or WAV-registered `{mpqPath}` read through
+  `isom::map_asset`), the `-i {inN}` / last-argument `{out}/<name>` placeholder contract, and an
+  option/value/filter allowlist before anything runs; `AudioService::run_ffmpeg` runs the pinned
+  FFmpeg (one job at a time) with `-nostdin -hide_banner -v error`, `-protocol_whitelist file` and
+  an audio `-format_whitelist` per input, cwd in a fresh request-temp directory, a per-poll guard on
+  output entries/bytes and resident memory, OS memory/file-size/CPU limits and the managed process
+  bounds, then probes and binds
+  every output as a new request audioRef that `map_sound_import`/`map_sound_edit` accept unchanged.
 - `CandidateStore`: per-session baseline snapshot, operation-manifest revisions, and the current
   candidate map. The saved source is the authority a session follows: `follow_source` runs at every
   open/state/request/apply boundary and, when the source hash moved, replays the session's revisions
@@ -317,6 +332,7 @@ One active project remains an intentional safety boundary: runtime services relo
 
 - Roaming `%APPDATA%/eud-agent`: config, conversations, journals, runtime jobs, session workspaces/turn baselines, and preserved legacy harness sources.
 - Local `%LOCALAPPDATA%/eud-agent`: model/RAG cache, native compatibility assets, audio tools, managed euddraft/uv distributions, content-addressed Python wheels/environments, temporary work.
+  The audio tools are the per-platform build pinned in `vendor/ffmpeg/manifest.json` (`eud-managed-ffmpeg/2`): Gyan essentials on Windows, Martin Riedl's signed static release builds on macOS arm64/x86_64 (one ZIP per tool, installed `0755` without quarantine and run once with `-version`). Every archive and member is sha256/size-pinned and published only after both tools verify; a system or Homebrew FFmpeg is never used.
 - Project root: canonical authoring state, build outputs, and portable durable harness data under `.eud-agent/workspace`, `.eud-agent/state`, and `.eud-agent/memory` (including the wiki).
 
 The local trusted workspace ID is initialized from the canonical root's SHA-256 identity and then retained across folder moves. Existing native AppData harnesses migrate only from validated project bindings; name-only memory with uncertain ownership is reported and left untouched. `.eud-agent/state/appdata-migration.json` records the one-time cutover, so reopening cannot resurrect deliberately deleted local files. Fresh create/E3S import marks its own cutover without attaching an unrelated same-name native store. Source files are never removed; local data takes precedence.

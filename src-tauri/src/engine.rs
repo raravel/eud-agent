@@ -143,6 +143,7 @@ const AUDIO_SOUND_GUIDE: &str = r#"[map sounds]
 - Current-player playback uses PlayWAV. Playback for all players and observers uses PlayWAVAll, called once outside any human-player loop. Never multiply PlayWAVAll across clients.
 - Put playback in the existing file that owns the triggering event and mutable lifecycle state. Keep the configured MainFile as composition root and keep imports acyclic.
 - Looping BGM uses the durationMs returned by the latest import/edit plus the existing lifecycle/timer cadence and a bounded guard margin. Never call early enough to overlap. Disclose that default StarCraft music may overlap.
+- Cutting, splitting, trimming, concatenating, or filtering audio is possible: audio_ffmpeg({inputs,args}) runs allowlisted FFmpeg audio arguments on request audioRefs or on sounds already in the saved map by their exact mpqPath from map_sound_list (sourceAvailable=false is fine), and returns new audio-N refs with exact durationMs. Import several refs with ONE map_sound_import({audioRefs:[...]}) call (one map write, results in input order), never one call per piece. Never tell the user audio cannot be cut or ask for pre-cut files. To let BGM stop when a condition changes, split it into short pieces (e.g. -f segment -segment_time 4.032), import them in one batch, and play the next piece only while the condition holds. Pieces cut on packet boundaries (about ±55 ms from segment_time), so time each piece's playback with its own returned durationMs, never with segment_time.
 - Volume and fade are offline file edits. Do not claim runtime stop, pause/resume, seek, volume automation, crossfade, gapless playback, or independent concurrent BGM control.
 - After any sound import/edit and required EPS path migration, run the complete-project build_run. A map sound mutation without a build attempt is incomplete."#;
 
@@ -9539,6 +9540,10 @@ mod tests {
             "sourceAvailable",
             "migrate every exact oldMpqPath",
             "immutable project source",
+            "audio_ffmpeg({inputs,args})",
+            "Never tell the user audio cannot be cut",
+            "map_sound_import({audioRefs:[...]})",
+            "time each piece's playback with its own returned durationMs",
         ] {
             assert!(cold.contains(required));
         }

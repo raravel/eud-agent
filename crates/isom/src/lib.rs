@@ -716,6 +716,134 @@ pub struct MapSoundAddReport {
     pub unrelated_asset_digest_after: String,
 }
 
+/// One sound of a [`map_sound_add_batch`] report, in input order.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MapSoundBatchItemReport {
+    pub reused: bool,
+    pub sound_index: u64,
+    pub sound_string_id: u64,
+    pub mpq_path: String,
+    pub asset_sha256: String,
+    pub asset_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MapSoundAddBatchReport {
+    pub schema: String,
+    pub ok: bool,
+    pub sounds: Vec<MapSoundBatchItemReport>,
+    pub input_sha256: String,
+    pub output_sha256: String,
+    pub unrelated_chk_digest_before: String,
+    pub unrelated_chk_digest_after: String,
+    pub unrelated_asset_digest_before: String,
+    pub unrelated_asset_digest_after: String,
+}
+
+/// Most sounds one [`map_sound_add_batch`] call registers.
+pub const MAX_SOUND_BATCH_ITEMS: usize = 128;
+
+/// Add or exactly reuse several canonical managed OGG sounds in one copied map:
+/// one native load, mutation, save, and reopen verification for the batch.
+/// `items` are `(destination MPQ path, OGG bytes)` with distinct destinations.
+pub fn map_sound_add_batch(
+    input_map_path: &Path,
+    output_map_path: &Path,
+    expected_input_sha256: &str,
+    items: &[(&str, &[u8])],
+) -> Result<MapSoundAddBatchReport, NativeCallError> {
+    const MAX_OGG_BYTES: usize = 64 * 1024 * 1024;
+    let mut destinations = std::collections::BTreeSet::new();
+    if !exact_lower_hex(expected_input_sha256, 64)
+        || items.is_empty()
+        || items.len() > MAX_SOUND_BATCH_ITEMS
+        || input_map_path == output_map_path
+        || items.iter().any(|(path, ogg)| {
+            !valid_managed_sound_path(path)
+                || !destinations.insert(path.to_ascii_lowercase())
+                || ogg.len() < 4
+                || ogg.len() > MAX_OGG_BYTES
+                || !ogg.starts_with(b"OggS")
+        })
+    {
+        return Err(NativeCallError::new(IsomError::InvalidArg, None));
+    }
+    let _native_call = native_call_guard();
+    let input = path_cstring(input_map_path).map_err(|error| NativeCallError::new(error, None))?;
+    let output =
+        path_cstring(output_map_path).map_err(|error| NativeCallError::new(error, None))?;
+    let expected = CString::new(expected_input_sha256)
+        .map_err(|_| NativeCallError::new(IsomError::InvalidArg, None))?;
+    let paths = items
+        .iter()
+        .map(|(path, _)| CString::new(*path))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| NativeCallError::new(IsomError::InvalidArg, None))?;
+    let path_pointers = paths.iter().map(|path| path.as_ptr()).collect::<Vec<_>>();
+    let ogg_pointers = items
+        .iter()
+        .map(|(_, ogg)| ogg.as_ptr())
+        .collect::<Vec<_>>();
+    let ogg_lengths = items.iter().map(|(_, ogg)| ogg.len()).collect::<Vec<_>>();
+    let mut report: *mut u8 = std::ptr::null_mut();
+    let mut report_len = 0_usize;
+    // SAFETY: every C string, pointer array, and OGG buffer outlives this
+    // synchronous call and the three arrays hold exactly `items.len()` entries.
+    // The report is allocated by the C ABI and released by `CBuf` on every path.
+    let code = unsafe {
+        isom_sys::isom_map_sound_add_batch(
+            input.as_ptr(),
+            output.as_ptr(),
+            expected.as_ptr(),
+            path_pointers.as_ptr(),
+            ogg_pointers.as_ptr(),
+            ogg_lengths.as_ptr(),
+            items.len(),
+            &mut report,
+            &mut report_len,
+        )
+    };
+    let report = CBuf(report);
+    let bytes = buffer_bytes(&report, report_len);
+    if let Err(error) = status(code) {
+        return Err(NativeCallError::new(error, native_detail(&bytes)));
+    }
+    let parsed: MapSoundAddBatchReport = serde_json::from_slice(&bytes).map_err(|error| {
+        NativeCallError::new(
+            IsomError::Engine,
+            Some(format!("invalid sound-batch report: {error}")),
+        )
+    })?;
+    let sounds_valid = parsed.sounds.len() == items.len()
+        && parsed.sounds.iter().zip(items).all(|(sound, (path, ogg))| {
+            sound.sound_index < 512
+                && sound.sound_string_id > 0
+                && sound.mpq_path == *path
+                && sound.asset_sha256 == format!("{:x}", Sha256::digest(ogg))
+                && sound.asset_bytes == ogg.len() as u64
+        });
+    let all_reused = parsed.sounds.iter().all(|sound| sound.reused);
+    let valid = parsed.schema == "eud-map-sound-add-batch-report/1"
+        && parsed.ok
+        && sounds_valid
+        && parsed.input_sha256 == expected_input_sha256
+        && exact_lower_hex(&parsed.output_sha256, 64)
+        && exact_lower_hex(&parsed.unrelated_chk_digest_before, 64)
+        && parsed.unrelated_chk_digest_before == parsed.unrelated_chk_digest_after
+        && exact_lower_hex(&parsed.unrelated_asset_digest_before, 64)
+        && parsed.unrelated_asset_digest_before == parsed.unrelated_asset_digest_after
+        && (!all_reused || parsed.output_sha256 == parsed.input_sha256);
+    if !valid {
+        return Err(NativeCallError::new(
+            IsomError::Engine,
+            Some("sound-batch report invariant mismatch".to_string()),
+        ));
+    }
+    Ok(parsed)
+}
+
 pub fn map_sound_add(
     input_map_path: &Path,
     output_map_path: &Path,
@@ -932,6 +1060,51 @@ pub fn map_digest(map_path: &Path) -> Result<String, NativeCallError> {
         .map_err(|error| NativeCallError::new(IsomError::Engine, Some(error.to_string())))
 }
 
+/// Read one named extra asset out of a map's MPQ, verbatim.
+///
+/// `mpq_path` is an MPQ-internal name (e.g. `staredit\wav\a.ogg`), handed to C
+/// as-is like [`game_asset`]'s archive path. The bytes are exactly what
+/// [`map_digest`] hashes for that path; an asset larger than `max_bytes` is
+/// refused natively before it is read.
+pub fn map_asset(
+    map_path: &Path,
+    mpq_path: &str,
+    max_bytes: usize,
+) -> Result<Vec<u8>, NativeCallError> {
+    if max_bytes == 0 {
+        return Err(NativeCallError::new(IsomError::InvalidArg, None));
+    }
+    let _native_call = native_call_guard();
+    let map = path_cstring(map_path).map_err(|error| NativeCallError::new(error, None))?;
+    let asset =
+        CString::new(mpq_path).map_err(|_| NativeCallError::new(IsomError::InvalidArg, None))?;
+    let mut output: *mut u8 = std::ptr::null_mut();
+    let mut output_len = 0_usize;
+    // SAFETY: both C strings stay alive for the call and the output pointers
+    // satisfy the synchronous ABI; the buffer is released by the `CBuf` guard.
+    let code = unsafe {
+        isom_sys::isom_map_asset(
+            map.as_ptr(),
+            asset.as_ptr(),
+            max_bytes,
+            &mut output,
+            &mut output_len,
+        )
+    };
+    let output = CBuf(output);
+    let bytes = buffer_bytes(&output, output_len);
+    if let Err(error) = status(code) {
+        return Err(NativeCallError::new(error, native_detail(&bytes)));
+    }
+    if bytes.len() > max_bytes {
+        return Err(NativeCallError::new(
+            IsomError::Engine,
+            Some("native map asset exceeded the requested size limit".to_string()),
+        ));
+    }
+    Ok(bytes)
+}
+
 pub fn image_quantize(
     starcraft_path: &Path,
     tileset: u16,
@@ -1047,7 +1220,7 @@ pub fn image_quantize(
     })
 }
 
-pub const EXPECTED_ABI_VERSION: i32 = 8;
+pub const EXPECTED_ABI_VERSION: i32 = 9;
 
 pub fn assert_abi_version() -> Result<(), IsomError> {
     let actual = abi_version();
