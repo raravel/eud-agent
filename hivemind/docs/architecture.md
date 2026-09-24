@@ -251,7 +251,7 @@ sequenceDiagram
     G-->>T: fresh output or structured diagnostics
 ```
 
-A project-scoped marker is held during build. Success requires a fresh output file. Generator inputs are version-matched compatibility assets copied from Tauri resources to LocalAppData.
+A project-scoped marker is held during build. Success requires a fresh output file. A successful build then copies that output map to `<StarCraft>/Maps/eud-agent/` (the same `resolve_starcraft_path` the Map renderers use) and reports it as `deployedMap`; no resolvable install means no copy, and a failed copy (e.g. the game holding the file) is a warning, not a build failure. Generator inputs are version-matched compatibility assets copied from Tauri resources to LocalAppData.
 
 The runner writes the complete stdout/stderr to `build/euddraft/build.log`. The parser folds every Python traceback and every `warn_with_traceback` stack into one error or warning at its innermost project frame and reads epScript compile errors (`[Error N] Module "m" Line n : text`) as file/line errors; warnings never fail a build. Identical warnings merge with a `count`. The model's `build_run` observation carries `errors` (with `raw`), `warnings` (without stacks), `omittedErrors`/`omittedWarnings`, a bounded `outputExcerpt`, and `logPath`, never the raw streams (euddraft lists every null tile on one line); observation and `build_log_read` pages both stay under 40 KiB measured double-escaped, and `build_log_read` pages the log by line range or query with `nextLine` continuation.
 

@@ -31,6 +31,7 @@
 - Optional E3S harness omissions MUST return scoped paths/reasons and stable consent IDs. Explicit approval applies only to the current issues; recheck never authorizes exclusions. Core import and cleanup/rollback failures remain errors.
 - New import files MUST be published without replacing concurrent destination files. Windows publication MUST work without hard-link support, including exFAT project volumes.
 - Generated build outputs stay inside the project `build/` tree.
+- A successful build also copies its output map to the resolved StarCraft install's `Maps/eud-agent/<output file name>` (temporary file + rename). The copy is a convenience, never build authority: without a resolvable install nothing is copied, and a failed copy is a warning that never changes `ok`.
 
 ## Sparse DAT
 

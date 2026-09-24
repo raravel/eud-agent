@@ -5374,6 +5374,7 @@ mod tests {
             stdout: format!("Loading map\n{giant}\nOutput scenario.chk : 1.794MB\n"),
             stderr: String::new(),
             log_path: "E:/anywhere/build/euddraft/build.log".to_string(),
+            deployed_map: None,
             artifacts: crate::native_build::NativeBuildArtifacts {
                 build_dir: "build".to_string(),
                 wireframe_editor: None,
@@ -5422,6 +5423,7 @@ mod tests {
             stdout: "x".repeat(100_000),
             stderr: "y\\z\"".repeat(20_000),
             log_path: String::new(),
+            deployed_map: None,
             artifacts: crate::native_build::NativeBuildArtifacts {
                 build_dir: "build".to_string(),
                 wireframe_editor: None,

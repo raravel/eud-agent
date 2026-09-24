@@ -4684,6 +4684,7 @@ mod tests {
             stdout: String::new(),
             stderr: String::new(),
             log_path: "build/euddraft/build.log".to_string(),
+            deployed_map: None,
             artifacts: crate::native_build::NativeBuildArtifacts {
                 build_dir: "build".to_string(),
                 wireframe_editor: None,
