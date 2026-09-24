@@ -141,12 +141,10 @@ pub fn login_status(dirs: &DataDirs) -> ClaudeAuthState {
         .unwrap_or_default()
         .to_ascii_lowercase();
     let subscription_login = !subscription.contains("api") || subscription.contains("oauth");
-    let credential = dirs.claude_config_dir().join(".credentials.json");
     let authenticated = compatible
         && status.logged_in
         && subscription_login
-        && credential.is_file()
-        && crate::provider_secrets::harden_private_path(&credential).is_ok();
+        && crate::claude_client::stored_credential_present(&dirs.claude_config_dir());
     ClaudeAuthState {
         resolved: true,
         compatible,

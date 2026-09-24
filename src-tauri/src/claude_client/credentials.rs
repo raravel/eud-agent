@@ -5,6 +5,9 @@
 //! therefore refreshes the pair itself with the same public client id, token endpoint, and
 //! `.oauth_refresh.lock` directory protocol the CLI uses, and writes the rotated pair back so
 //! the CLI's next turn keeps working. Tokens are never logged or persisted anywhere else.
+//!
+//! On macOS the CLI keeps the pair in the login Keychain instead of the file (see
+//! `keychain`); the file remains the fallback it uses when the Keychain is unavailable.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -143,10 +146,7 @@ pub(crate) async fn access_token_at(
         serde_json::to_vec(&document).map_err(|_| "provider_protocol_changed".to_string())?,
     );
     drop(document);
-    let path = credential_path(profile_dir);
-    crate::memory::write_atomic_bytes(&path, &bytes)
-        .map_err(|_| "provider_catalog_unavailable".to_string())?;
-    crate::provider_secrets::harden_private_path(&path)?;
+    write_credential(profile_dir, &bytes)?;
     Ok(refreshed.access_token)
 }
 
@@ -298,7 +298,34 @@ fn credential_path(profile_dir: &Path) -> PathBuf {
     profile_dir.join(CREDENTIALS_FILENAME)
 }
 
+/// Whether the profile holds a stored subscription credential, without reading the secret
+/// itself (a Keychain attribute query never raises an access prompt).
+pub(crate) fn stored_credential_present(profile_dir: &Path) -> bool {
+    #[cfg(target_os = "macos")]
+    if keychain::present(profile_dir) {
+        return true;
+    }
+    let path = credential_path(profile_dir);
+    path.is_file() && crate::provider_secrets::harden_private_path(&path).is_ok()
+}
+
+/// Write a refreshed document back to the store the CLI reads first.
+fn write_credential(profile_dir: &Path, bytes: &[u8]) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    if keychain::present(profile_dir) {
+        return keychain::write(profile_dir, bytes);
+    }
+    let path = credential_path(profile_dir);
+    crate::memory::write_atomic_bytes(&path, bytes)
+        .map_err(|_| "provider_catalog_unavailable".to_string())?;
+    crate::provider_secrets::harden_private_path(&path)
+}
+
 fn read_document(profile_dir: &Path) -> Result<Value, String> {
+    #[cfg(target_os = "macos")]
+    if let Some(bytes) = keychain::read(profile_dir)? {
+        return serde_json::from_slice(&bytes).map_err(|_| "provider_not_authenticated".to_string());
+    }
     let path = credential_path(profile_dir);
     let metadata =
         std::fs::metadata(&path).map_err(|_| "provider_not_authenticated".to_string())?;
@@ -308,6 +335,69 @@ fn read_document(profile_dir: &Path) -> Result<Value, String> {
     let bytes =
         Zeroizing::new(std::fs::read(&path).map_err(|_| "provider_not_authenticated".to_string())?);
     serde_json::from_slice(&bytes).map_err(|_| "provider_not_authenticated".to_string())
+}
+
+/// The CLI's macOS credential store: one login-Keychain generic password per config
+/// directory, service `Claude Code-credentials-<first 8 hex of sha256(CLAUDE_CONFIG_DIR)>`,
+/// account the login user name. The account is taken from the stored item so a write-back
+/// always updates the CLI's own entry instead of creating a sibling.
+#[cfg(target_os = "macos")]
+mod keychain {
+    use std::path::Path;
+
+    use security_framework::item::{ItemClass, ItemSearchOptions, Limit};
+    use security_framework::passwords;
+    use sha2::{Digest, Sha256};
+    use zeroize::Zeroizing;
+
+    const ERR_SEC_ITEM_NOT_FOUND: i32 = -25300;
+
+    fn service(profile_dir: &Path) -> String {
+        let digest = format!("{:x}", Sha256::digest(profile_dir.to_string_lossy().as_bytes()));
+        format!("Claude Code-credentials-{}", &digest[..8])
+    }
+
+    /// The stored item's account, read from attributes only.
+    fn account(service: &str) -> Option<String> {
+        let results = ItemSearchOptions::new()
+            .class(ItemClass::generic_password())
+            .service(service)
+            .load_attributes(true)
+            .limit(Limit::Max(1))
+            .search()
+            .ok()?;
+        results
+            .first()?
+            .simplify_dict()?
+            .remove("acct")
+            .filter(|account| !account.is_empty())
+    }
+
+    pub(super) fn present(profile_dir: &Path) -> bool {
+        account(&service(profile_dir)).is_some()
+    }
+
+    pub(super) fn read(profile_dir: &Path) -> Result<Option<Zeroizing<Vec<u8>>>, String> {
+        let service = service(profile_dir);
+        let Some(account) = account(&service) else {
+            return Ok(None);
+        };
+        match passwords::get_generic_password(&service, &account) {
+            Ok(bytes) if bytes.len() as u64 <= super::MAX_CREDENTIAL_BYTES => {
+                Ok(Some(Zeroizing::new(bytes)))
+            }
+            Ok(_) => Err("provider_not_authenticated".to_string()),
+            Err(error) if error.code() == ERR_SEC_ITEM_NOT_FOUND => Ok(None),
+            Err(_) => Err("provider_not_authenticated".to_string()),
+        }
+    }
+
+    pub(super) fn write(profile_dir: &Path, bytes: &[u8]) -> Result<(), String> {
+        let service = service(profile_dir);
+        let account = account(&service).ok_or_else(|| "provider_not_authenticated".to_string())?;
+        passwords::set_generic_password(&service, &account, bytes)
+            .map_err(|_| "provider_catalog_unavailable".to_string())
+    }
 }
 
 fn oauth_object(document: &Value) -> Result<&Map<String, Value>, String> {

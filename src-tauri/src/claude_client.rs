@@ -7,7 +7,7 @@ pub(crate) use catalog::fetch_catalog;
 #[cfg(test)]
 use catalog::CLAUDE_PROVIDER_DEFAULT;
 pub use catalog::{bound_model, provider_default_model};
-pub(crate) use credentials::access_token;
+pub(crate) use credentials::{access_token, stored_credential_present};
 
 use crate::provider::ProviderModel;
 
